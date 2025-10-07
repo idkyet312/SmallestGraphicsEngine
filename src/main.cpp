@@ -80,6 +80,12 @@ float lightLinear = 0.09f;
 float lightQuadratic = 0.032f;
 glm::vec3 lightColor(1.0f, 1.0f, 1.0f);
 
+// Second light
+bool enableSecondLight = true;
+glm::vec3 light2Pos(5.0f, 8.0f, 5.0f);
+glm::vec3 light2Color(0.5f, 0.5f, 1.0f); // Blueish light
+float light2Intensity = 0.8f;
+
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
 }
@@ -337,12 +343,33 @@ int main() {
     glReadBuffer(GL_NONE);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+    // Second shadow map for light 2
+    unsigned int depthMapFBO2;
+    glGenFramebuffers(1, &depthMapFBO2);
+
+    unsigned int depthMap2;
+    glGenTextures(1, &depthMap2);
+    glBindTexture(GL_TEXTURE_2D, depthMap2);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, SHADOW_WIDTH, SHADOW_HEIGHT, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, borderColor);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, depthMapFBO2);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depthMap2, 0);
+    glDrawBuffer(GL_NONE);
+    glReadBuffer(GL_NONE);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
     unsigned int cubeVAO = loadCubeVAO();
     unsigned int planeVAO = loadPlaneVAO();
     unsigned int quadVAO = loadQuadVAO();
 
     shadowShader.use();
     shadowShader.setInt("shadowMap", 0);
+    shadowShader.setInt("shadowMap2", 1);
     
     // Set default light attenuation values
     shadowShader.setFloat("constant", lightConstant);
@@ -475,6 +502,16 @@ int main() {
                     ImGui::SameLine();
                     ImGui::DragFloat("Speed##light", &animationSpeed, 0.1f, 0.1f, 10.0f);
                 }
+                
+                // Second light controls
+                ImGui::Separator();
+                ImGui::Text("Second Light");
+                ImGui::Checkbox("Enable Second Light", &enableSecondLight);
+                if (enableSecondLight) {
+                    ImGui::DragFloat3("Light 2 Position", &light2Pos.x, 0.1f);
+                    ImGui::ColorEdit3("Light 2 Color", &light2Color.x);
+                    ImGui::SliderFloat("Light 2 Intensity", &light2Intensity, 0.0f, 2.0f);
+                }
             }
             
             if (ImGui::CollapsingHeader("Cube 1 Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -565,6 +602,7 @@ int main() {
         glm::mat4 lightProjection = glm::ortho(-lightOrthoSize, lightOrthoSize, -lightOrthoSize, lightOrthoSize, lightNear, lightFar);
         glm::mat4 lightView = glm::lookAt(lightPos, lightTarget, lightUp);
         glm::mat4 lightSpaceMatrix = lightProjection * lightView;
+        glm::mat4 light2SpaceMatrix = glm::mat4(1.0f); // Initialize here
 
         depthShader.use();
         depthShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
@@ -603,6 +641,50 @@ int main() {
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+        // 1b. Render depth of scene for second light (if enabled)
+        if (enableSecondLight) {
+            glm::mat4 light2Projection = glm::ortho(-lightOrthoSize, lightOrthoSize, -lightOrthoSize, lightOrthoSize, lightNear, lightFar);
+            glm::mat4 light2View = glm::lookAt(light2Pos, glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+            light2SpaceMatrix = light2Projection * light2View;
+
+            depthShader.use();
+            depthShader.setMat4("lightSpaceMatrix", light2SpaceMatrix);
+
+            glViewport(0, 0, SHADOW_WIDTH, SHADOW_HEIGHT);
+            glBindFramebuffer(GL_FRAMEBUFFER, depthMapFBO2);
+            glClear(GL_DEPTH_BUFFER_BIT);
+
+            // Render scene for second depth map
+            glm::mat4 model = glm::mat4(1.0f);
+            depthShader.setMat4("model", model);
+            glBindVertexArray(planeVAO);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+
+            model = glm::mat4(1.0f);
+            model = glm::translate(model, cubePosition);
+            model = glm::rotate(model, glm::radians(cubeRotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
+            model = glm::rotate(model, glm::radians(cubeRotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
+            model = glm::rotate(model, glm::radians(cubeRotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
+            model = glm::scale(model, cubeScale);
+            depthShader.setMat4("model", model);
+            glBindVertexArray(cubeVAO);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+
+            // Render second cube for depth map
+            if (showSecondCube) {
+                model = glm::mat4(1.0f);
+                model = glm::translate(model, cube2Position);
+                model = glm::rotate(model, glm::radians(cube2Rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
+                model = glm::rotate(model, glm::radians(cube2Rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
+                model = glm::rotate(model, glm::radians(cube2Rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
+                model = glm::scale(model, cube2Scale);
+                depthShader.setMat4("model", model);
+                glDrawArrays(GL_TRIANGLES, 0, 36);
+            }
+
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
+
         // 2. Render scene as normal using the generated depth/shadow map
         glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
         glClearColor(clearColor.r, clearColor.g, clearColor.b, 1.0f);
@@ -622,6 +704,7 @@ int main() {
         shadowShader.setMat4("projection", projection);
         shadowShader.setMat4("view", view);
         shadowShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
+        shadowShader.setMat4("light2SpaceMatrix", light2SpaceMatrix);
         shadowShader.setVec3("viewPos", camera.Position);
         shadowShader.setVec3("lightPos", lightPos);
         
@@ -636,12 +719,20 @@ int main() {
         shadowShader.setFloat("shadowBias", shadowBias);
         shadowShader.setBool("enableShadows", enableShadows);
         
+        // Second light properties
+        shadowShader.setBool("enableSecondLight", enableSecondLight);
+        shadowShader.setVec3("light2Pos", light2Pos);
+        shadowShader.setVec3("light2Color", light2Color);
+        shadowShader.setFloat("light2Intensity", light2Intensity);
+        
         // Floor
         model = glm::mat4(1.0f);
         shadowShader.setMat4("model", model);
         shadowShader.setVec3("objectColor", floorColor);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, depthMap);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, depthMap2);
         glBindVertexArray(planeVAO);
         glDrawArrays(GL_TRIANGLES, 0, 6);
 

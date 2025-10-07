@@ -5,9 +5,11 @@ in VS_OUT {
     vec3 FragPos;
     vec3 Normal;
     vec4 FragPosLightSpace;
+    vec4 FragPosLight2Space;
 } fs_in;
 
 uniform sampler2D shadowMap;
+uniform sampler2D shadowMap2;
 
 uniform vec3 lightPos;
 uniform vec3 viewPos;
@@ -18,6 +20,12 @@ uniform int lightType; // 0 = directional, 1 = point
 uniform float constant;
 uniform float linear;
 uniform float quadratic;
+
+// Second light
+uniform bool enableSecondLight;
+uniform vec3 light2Pos;
+uniform vec3 light2Color;
+uniform float light2Intensity;
 
 // Lighting parameters
 uniform float ambientStrength;
@@ -40,6 +48,20 @@ float ShadowCalculation(vec4 fragPosLightSpace)
     return shadow;
 }
 
+float ShadowCalculation2(vec4 fragPosLightSpace)
+{
+    if (!enableShadows || !enableSecondLight) return 0.0;
+    
+    vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
+    projCoords = projCoords * 0.5 + 0.5;
+    float closestDepth = texture(shadowMap2, projCoords.xy).r; 
+    float currentDepth = projCoords.z;
+    float shadow = currentDepth - shadowBias > closestDepth  ? 1.0 : 0.0;
+    if(projCoords.z > 1.0)
+        shadow = 0.0;
+    return shadow;
+}
+
 void main()
 {           
     vec3 color = objectColor;
@@ -49,7 +71,7 @@ void main()
     // Ambient
     vec3 ambient = ambientStrength * lightColor;
     
-    // Diffuse
+    // === FIRST LIGHT ===
     vec3 lightDir;
     float attenuation = 1.0;
     
@@ -72,9 +94,30 @@ void main()
     float spec = pow(max(dot(normal, halfwayDir), 0.0), shininess);
     vec3 specular = specularStrength * spec * lightColor;
     
-    // Calculate shadow
+    // Calculate shadow for first light
     float shadow = ShadowCalculation(fs_in.FragPosLightSpace);       
-    vec3 lighting = (ambient + (1.0 - shadow) * (diffuse + specular)) * color * attenuation;
+    vec3 lighting = (ambient + (1.0 - shadow) * (diffuse + specular)) * attenuation;
     
-    FragColor = vec4(lighting, 1.0);
+    // === SECOND LIGHT (with shadows) ===
+    if (enableSecondLight) {
+        vec3 light2Dir = normalize(light2Pos - fs_in.FragPos);
+        float light2Distance = length(light2Pos - fs_in.FragPos);
+        float light2Attenuation = 1.0 / (1.0 + 0.09 * light2Distance + 0.032 * (light2Distance * light2Distance));
+        
+        // Diffuse
+        float light2Diff = max(dot(light2Dir, normal), 0.0);
+        vec3 light2Diffuse = light2Diff * light2Color * light2Intensity;
+        
+        // Specular
+        vec3 light2HalfwayDir = normalize(light2Dir + viewDir);
+        float light2Spec = pow(max(dot(normal, light2HalfwayDir), 0.0), shininess);
+        vec3 light2Specular = specularStrength * light2Spec * light2Color * light2Intensity;
+        
+        // Calculate shadow for second light
+        float shadow2 = ShadowCalculation2(fs_in.FragPosLight2Space);
+        
+        lighting += (1.0 - shadow2) * (light2Diffuse + light2Specular) * light2Attenuation;
+    }
+    
+    FragColor = vec4(lighting * color, 1.0);
 }
