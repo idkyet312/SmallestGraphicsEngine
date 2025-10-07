@@ -23,6 +23,7 @@ bool firstMouse = true;
 float deltaTime = 0.0f;
 float lastFrame = 0.0f;
 bool showUI = true;
+bool cameraLocked = false;
 
 // Editable scene parameters
 glm::vec3 lightPos(-5.0f, 10.0f, -5.0f);
@@ -43,7 +44,7 @@ void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
 }
 
 void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
-    if (showUI && ImGui::GetIO().WantCaptureMouse)
+    if (cameraLocked || (showUI && ImGui::GetIO().WantCaptureMouse))
         return;
     
     if (firstMouse) {
@@ -73,7 +74,22 @@ void processInput(GLFWwindow *window) {
         tabPressed = false;
     }
     
-    if (!showUI || !ImGui::GetIO().WantCaptureKeyboard) {
+    // Toggle camera lock with C key
+    static bool cPressed = false;
+    if (glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS && !cPressed) {
+        cameraLocked = !cameraLocked;
+        if (cameraLocked) {
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        } else if (!showUI) {
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        }
+        cPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_C) == GLFW_RELEASE) {
+        cPressed = false;
+    }
+    
+    if (!cameraLocked && (!showUI || !ImGui::GetIO().WantCaptureKeyboard)) {
         if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
             camera.ProcessKeyboard('W', deltaTime);
         if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
@@ -252,7 +268,25 @@ int main() {
         if (showUI) {
             ImGui::Begin("Scene Controls", &showUI);
             
-            ImGui::Text("Press TAB to toggle UI");
+            ImGui::Text("Controls:");
+            ImGui::BulletText("TAB: Toggle UI");
+            ImGui::BulletText("C: Lock/Unlock Camera");
+            
+            // Camera lock status button
+            if (cameraLocked) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+                if (ImGui::Button("Camera LOCKED (Press C to unlock)")) {
+                    cameraLocked = false;
+                }
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
+                if (ImGui::Button("Camera UNLOCKED (Press C to lock)")) {
+                    cameraLocked = true;
+                }
+                ImGui::PopStyleColor();
+            }
+            
             ImGui::Separator();
             
             if (ImGui::CollapsingHeader("Camera Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
