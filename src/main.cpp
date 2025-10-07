@@ -27,8 +27,11 @@ bool cameraLocked = false;
 
 // Editable scene parameters
 glm::vec3 lightPos(-5.0f, 10.0f, -5.0f);
+glm::vec3 lightTarget(0.0f, 0.0f, 0.0f);  // Where the light looks at
+glm::vec3 lightUp(0.0f, 1.0f, 0.0f);      // Light's up vector
 glm::vec3 cubePosition(0.0f, 1.5f, 0.0f);
 glm::vec3 cubeScale(1.0f, 1.0f, 1.0f);
+glm::vec3 cubeRotation(0.0f, 0.0f, 0.0f); // Rotation in degrees (X, Y, Z)
 glm::vec3 cubeColor(0.8f, 0.2f, 0.2f);
 glm::vec3 floorColor(0.5f, 0.5f, 0.5f);
 glm::vec3 clearColor(0.1f, 0.1f, 0.1f);
@@ -38,6 +41,30 @@ float cameraFar = 100.0f;
 float lightOrthoSize = 15.0f;
 float lightNear = 1.0f;
 float lightFar = 25.0f;
+
+// Projection type (0 = perspective, 1 = orthographic)
+int projectionType = 0;
+float orthoSize = 10.0f;
+
+// Shadow and rendering settings
+float shadowBias = 0.005f;
+bool enableShadows = true;
+bool wireframeMode = false;
+float ambientStrength = 0.3f;
+float specularStrength = 0.5f;
+int specularShininess = 32;
+
+// Additional objects
+bool showSecondCube = true;
+glm::vec3 cube2Position(-3.0f, 0.5f, 2.0f);
+glm::vec3 cube2Scale(0.5f, 0.5f, 0.5f);
+glm::vec3 cube2Rotation(0.0f, 45.0f, 0.0f);
+glm::vec3 cube2Color(0.2f, 0.8f, 0.2f);
+
+// Animation
+bool animateLight = false;
+bool animateCube = false;
+float animationSpeed = 1.0f;
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
@@ -296,24 +323,66 @@ int main() {
                 ImGui::DragFloat("Far Plane", &cameraFar, 1.0f, 10.0f, 500.0f);
                 ImGui::DragFloat("Movement Speed", &camera.MovementSpeed, 0.1f, 0.1f, 50.0f);
                 ImGui::DragFloat("Mouse Sensitivity", &camera.MouseSensitivity, 0.001f, 0.001f, 1.0f);
+                ImGui::Separator();
+                ImGui::Text("Camera Projection");
+                const char* projTypes[] = { "Perspective", "Orthographic" };
+                ImGui::Combo("Projection Type", &projectionType, projTypes, 2);
+                if (projectionType == 1) {
+                    ImGui::DragFloat("Ortho Size", &orthoSize, 0.5f, 0.1f, 50.0f);
+                }
             }
             
             if (ImGui::CollapsingHeader("Light Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Text("Light Transform");
                 ImGui::DragFloat3("Light Position", &lightPos.x, 0.1f);
+                ImGui::DragFloat3("Light Target", &lightTarget.x, 0.1f);
+                ImGui::DragFloat3("Light Up Vector", &lightUp.x, 0.01f);
+                ImGui::Separator();
+                ImGui::Text("Light Projection (Ortho)");
                 ImGui::DragFloat("Light Ortho Size", &lightOrthoSize, 0.5f, 1.0f, 50.0f);
                 ImGui::DragFloat("Light Near", &lightNear, 0.1f, 0.1f, 20.0f);
                 ImGui::DragFloat("Light Far", &lightFar, 0.5f, 1.0f, 100.0f);
+                ImGui::Separator();
+                ImGui::Text("Animation");
+                ImGui::Checkbox("Animate Light", &animateLight);
+                if (animateLight) {
+                    ImGui::SameLine();
+                    ImGui::DragFloat("Speed##light", &animationSpeed, 0.1f, 0.1f, 10.0f);
+                }
             }
             
-            if (ImGui::CollapsingHeader("Cube Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
-                ImGui::DragFloat3("Cube Position", &cubePosition.x, 0.1f);
-                ImGui::DragFloat3("Cube Scale", &cubeScale.x, 0.1f, 0.1f, 10.0f);
-                ImGui::ColorEdit3("Cube Color", &cubeColor.x);
+            if (ImGui::CollapsingHeader("Cube 1 Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::DragFloat3("Position##cube1", &cubePosition.x, 0.1f);
+                ImGui::DragFloat3("Rotation (deg)##cube1", &cubeRotation.x, 1.0f, -360.0f, 360.0f);
+                ImGui::DragFloat3("Scale##cube1", &cubeScale.x, 0.1f, 0.1f, 10.0f);
+                ImGui::ColorEdit3("Color##cube1", &cubeColor.x);
+                ImGui::Checkbox("Animate##cube1", &animateCube);
             }
             
-            if (ImGui::CollapsingHeader("Scene Settings")) {
+            if (ImGui::CollapsingHeader("Cube 2 Settings")) {
+                ImGui::Checkbox("Show Second Cube", &showSecondCube);
+                if (showSecondCube) {
+                    ImGui::DragFloat3("Position##cube2", &cube2Position.x, 0.1f);
+                    ImGui::DragFloat3("Rotation (deg)##cube2", &cube2Rotation.x, 1.0f, -360.0f, 360.0f);
+                    ImGui::DragFloat3("Scale##cube2", &cube2Scale.x, 0.1f, 0.1f, 10.0f);
+                    ImGui::ColorEdit3("Color##cube2", &cube2Color.x);
+                }
+            }
+            
+            if (ImGui::CollapsingHeader("Rendering Settings")) {
                 ImGui::ColorEdit3("Floor Color", &floorColor.x);
                 ImGui::ColorEdit3("Clear Color", &clearColor.x);
+                ImGui::Separator();
+                ImGui::Text("Lighting");
+                ImGui::DragFloat("Ambient Strength", &ambientStrength, 0.01f, 0.0f, 1.0f);
+                ImGui::DragFloat("Specular Strength", &specularStrength, 0.01f, 0.0f, 1.0f);
+                ImGui::SliderInt("Specular Shininess", &specularShininess, 1, 256);
+                ImGui::Separator();
+                ImGui::Text("Shadows");
+                ImGui::Checkbox("Enable Shadows", &enableShadows);
+                ImGui::DragFloat("Shadow Bias", &shadowBias, 0.0001f, 0.0f, 0.1f, "%.4f");
+                ImGui::Separator();
+                ImGui::Checkbox("Wireframe Mode", &wireframeMode);
             }
             
             ImGui::Separator();
@@ -335,9 +404,27 @@ int main() {
             ImGui::End();
         }
 
+        // Apply animations
+        if (animateLight) {
+            float time = glfwGetTime() * animationSpeed;
+            lightPos.x = cos(time) * 10.0f;
+            lightPos.z = sin(time) * 10.0f;
+        }
+        
+        if (animateCube) {
+            cubeRotation.y = fmod(glfwGetTime() * 30.0f * animationSpeed, 360.0f);
+        }
+
+        // Enable/disable wireframe
+        if (wireframeMode) {
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+        } else {
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        }
+
         // 1. Render depth of scene to texture (from light's perspective)
         glm::mat4 lightProjection = glm::ortho(-lightOrthoSize, lightOrthoSize, -lightOrthoSize, lightOrthoSize, lightNear, lightFar);
-        glm::mat4 lightView = glm::lookAt(lightPos, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+        glm::mat4 lightView = glm::lookAt(lightPos, lightTarget, lightUp);
         glm::mat4 lightSpaceMatrix = lightProjection * lightView;
 
         depthShader.use();
@@ -353,11 +440,27 @@ int main() {
         glBindVertexArray(planeVAO);
         glDrawArrays(GL_TRIANGLES, 0, 6);
 
-        model = glm::translate(glm::mat4(1.0f), cubePosition);
+        model = glm::mat4(1.0f);
+        model = glm::translate(model, cubePosition);
+        model = glm::rotate(model, glm::radians(cubeRotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
+        model = glm::rotate(model, glm::radians(cubeRotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
+        model = glm::rotate(model, glm::radians(cubeRotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
         model = glm::scale(model, cubeScale);
         depthShader.setMat4("model", model);
         glBindVertexArray(cubeVAO);
         glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        // Render second cube for depth map
+        if (showSecondCube) {
+            model = glm::mat4(1.0f);
+            model = glm::translate(model, cube2Position);
+            model = glm::rotate(model, glm::radians(cube2Rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
+            model = glm::rotate(model, glm::radians(cube2Rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
+            model = glm::rotate(model, glm::radians(cube2Rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
+            model = glm::scale(model, cube2Scale);
+            depthShader.setMat4("model", model);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+        }
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -367,7 +470,15 @@ int main() {
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         shadowShader.use();
-        glm::mat4 projection = glm::perspective(glm::radians(cameraFOV), (float)SCR_WIDTH / (float)SCR_HEIGHT, cameraNear, cameraFar);
+        glm::mat4 projection;
+        if (projectionType == 0) {
+            // Perspective projection
+            projection = glm::perspective(glm::radians(cameraFOV), (float)SCR_WIDTH / (float)SCR_HEIGHT, cameraNear, cameraFar);
+        } else {
+            // Orthographic projection
+            float aspect = (float)SCR_WIDTH / (float)SCR_HEIGHT;
+            projection = glm::ortho(-orthoSize * aspect, orthoSize * aspect, -orthoSize, orthoSize, cameraNear, cameraFar);
+        }
         glm::mat4 view = camera.GetViewMatrix();
         shadowShader.setMat4("projection", projection);
         shadowShader.setMat4("view", view);
@@ -385,12 +496,29 @@ int main() {
         glDrawArrays(GL_TRIANGLES, 0, 6);
 
         // Cube
-        model = glm::translate(glm::mat4(1.0f), cubePosition);
+        model = glm::mat4(1.0f);
+        model = glm::translate(model, cubePosition);
+        model = glm::rotate(model, glm::radians(cubeRotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
+        model = glm::rotate(model, glm::radians(cubeRotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
+        model = glm::rotate(model, glm::radians(cubeRotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
         model = glm::scale(model, cubeScale);
         shadowShader.setMat4("model", model);
         shadowShader.setVec3("objectColor", cubeColor);
         glBindVertexArray(cubeVAO);
         glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        // Second Cube
+        if (showSecondCube) {
+            model = glm::mat4(1.0f);
+            model = glm::translate(model, cube2Position);
+            model = glm::rotate(model, glm::radians(cube2Rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
+            model = glm::rotate(model, glm::radians(cube2Rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
+            model = glm::rotate(model, glm::radians(cube2Rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
+            model = glm::scale(model, cube2Scale);
+            shadowShader.setMat4("model", model);
+            shadowShader.setVec3("objectColor", cube2Color);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+        }
 
         // Render ImGui
         ImGui::Render();
