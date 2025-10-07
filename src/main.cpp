@@ -3,15 +3,18 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
 #include <iostream>
 #include "Shader.h"
 #include "Camera.h"
 
 // Settings
-const unsigned int SCR_WIDTH = 1280;
-const unsigned int SCR_HEIGHT = 720;
-const unsigned int SHADOW_WIDTH = 2048;
-const unsigned int SHADOW_HEIGHT = 2048;
+unsigned int SCR_WIDTH = 1280;
+unsigned int SCR_HEIGHT = 720;
+unsigned int SHADOW_WIDTH = 2048;
+unsigned int SHADOW_HEIGHT = 2048;
 
 Camera camera(glm::vec3(0.0f, 5.0f, 10.0f));
 float lastX = SCR_WIDTH / 2.0f;
@@ -19,12 +22,30 @@ float lastY = SCR_HEIGHT / 2.0f;
 bool firstMouse = true;
 float deltaTime = 0.0f;
 float lastFrame = 0.0f;
+bool showUI = true;
+
+// Editable scene parameters
+glm::vec3 lightPos(-5.0f, 10.0f, -5.0f);
+glm::vec3 cubePosition(0.0f, 1.5f, 0.0f);
+glm::vec3 cubeScale(1.0f, 1.0f, 1.0f);
+glm::vec3 cubeColor(0.8f, 0.2f, 0.2f);
+glm::vec3 floorColor(0.5f, 0.5f, 0.5f);
+glm::vec3 clearColor(0.1f, 0.1f, 0.1f);
+float cameraFOV = 45.0f;
+float cameraNear = 0.1f;
+float cameraFar = 100.0f;
+float lightOrthoSize = 15.0f;
+float lightNear = 1.0f;
+float lightFar = 25.0f;
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
 }
 
 void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
+    if (showUI && ImGui::GetIO().WantCaptureMouse)
+        return;
+    
     if (firstMouse) {
         lastX = (float)xpos;
         lastY = (float)ypos;
@@ -40,14 +61,28 @@ void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
 void processInput(GLFWwindow *window) {
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, true);
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
-        camera.ProcessKeyboard('W', deltaTime);
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
-        camera.ProcessKeyboard('S', deltaTime);
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
-        camera.ProcessKeyboard('A', deltaTime);
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
-        camera.ProcessKeyboard('D', deltaTime);
+    
+    // Toggle UI with Tab key
+    static bool tabPressed = false;
+    if (glfwGetKey(window, GLFW_KEY_TAB) == GLFW_PRESS && !tabPressed) {
+        showUI = !showUI;
+        glfwSetInputMode(window, GLFW_CURSOR, showUI ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_DISABLED);
+        tabPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_TAB) == GLFW_RELEASE) {
+        tabPressed = false;
+    }
+    
+    if (!showUI || !ImGui::GetIO().WantCaptureKeyboard) {
+        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+            camera.ProcessKeyboard('W', deltaTime);
+        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+            camera.ProcessKeyboard('S', deltaTime);
+        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+            camera.ProcessKeyboard('A', deltaTime);
+        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+            camera.ProcessKeyboard('D', deltaTime);
+    }
 }
 
 unsigned int loadCubeVAO() {
@@ -150,12 +185,25 @@ int main() {
     glfwMakeContextCurrent(window);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glfwSetCursorPosCallback(window, mouse_callback);
-    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
 
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         std::cout << "Failed to initialize GLAD" << std::endl;
         return -1;
     }
+
+    // Setup Dear ImGui context
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    
+    // Setup Dear ImGui style
+    ImGui::StyleColorsDark();
+    
+    // Setup Platform/Renderer backends
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
 
     glEnable(GL_DEPTH_TEST);
 
@@ -185,8 +233,6 @@ int main() {
     unsigned int cubeVAO = loadCubeVAO();
     unsigned int planeVAO = loadPlaneVAO();
 
-    glm::vec3 lightPos(-5.0f, 10.0f, -5.0f);
-
     shadowShader.use();
     shadowShader.setInt("shadowMap", 0);
 
@@ -197,8 +243,66 @@ int main() {
 
         processInput(window);
 
+        // Start the Dear ImGui frame
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        // Create ImGui UI
+        if (showUI) {
+            ImGui::Begin("Scene Controls", &showUI);
+            
+            ImGui::Text("Press TAB to toggle UI");
+            ImGui::Separator();
+            
+            if (ImGui::CollapsingHeader("Camera Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::DragFloat3("Camera Position", &camera.Position.x, 0.1f);
+                ImGui::DragFloat("FOV", &cameraFOV, 0.5f, 1.0f, 120.0f);
+                ImGui::DragFloat("Near Plane", &cameraNear, 0.01f, 0.01f, 10.0f);
+                ImGui::DragFloat("Far Plane", &cameraFar, 1.0f, 10.0f, 500.0f);
+                ImGui::DragFloat("Movement Speed", &camera.MovementSpeed, 0.1f, 0.1f, 50.0f);
+                ImGui::DragFloat("Mouse Sensitivity", &camera.MouseSensitivity, 0.001f, 0.001f, 1.0f);
+            }
+            
+            if (ImGui::CollapsingHeader("Light Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::DragFloat3("Light Position", &lightPos.x, 0.1f);
+                ImGui::DragFloat("Light Ortho Size", &lightOrthoSize, 0.5f, 1.0f, 50.0f);
+                ImGui::DragFloat("Light Near", &lightNear, 0.1f, 0.1f, 20.0f);
+                ImGui::DragFloat("Light Far", &lightFar, 0.5f, 1.0f, 100.0f);
+            }
+            
+            if (ImGui::CollapsingHeader("Cube Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::DragFloat3("Cube Position", &cubePosition.x, 0.1f);
+                ImGui::DragFloat3("Cube Scale", &cubeScale.x, 0.1f, 0.1f, 10.0f);
+                ImGui::ColorEdit3("Cube Color", &cubeColor.x);
+            }
+            
+            if (ImGui::CollapsingHeader("Scene Settings")) {
+                ImGui::ColorEdit3("Floor Color", &floorColor.x);
+                ImGui::ColorEdit3("Clear Color", &clearColor.x);
+            }
+            
+            ImGui::Separator();
+            if (ImGui::Button("Reload Shaders")) {
+                try {
+                    depthShader = Shader("shaders/depth.vert", "shaders/depth.frag");
+                    shadowShader = Shader("shaders/shadow.vert", "shaders/shadow.frag");
+                    shadowShader.use();
+                    shadowShader.setInt("shadowMap", 0);
+                    ImGui::Text("Shaders reloaded successfully!");
+                } catch (const std::exception& e) {
+                    ImGui::Text("Error reloading shaders!");
+                }
+            }
+            
+            ImGui::Separator();
+            ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+            
+            ImGui::End();
+        }
+
         // 1. Render depth of scene to texture (from light's perspective)
-        glm::mat4 lightProjection = glm::ortho(-15.0f, 15.0f, -15.0f, 15.0f, 1.0f, 25.0f);
+        glm::mat4 lightProjection = glm::ortho(-lightOrthoSize, lightOrthoSize, -lightOrthoSize, lightOrthoSize, lightNear, lightFar);
         glm::mat4 lightView = glm::lookAt(lightPos, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
         glm::mat4 lightSpaceMatrix = lightProjection * lightView;
 
@@ -215,8 +319,8 @@ int main() {
         glBindVertexArray(planeVAO);
         glDrawArrays(GL_TRIANGLES, 0, 6);
 
-        model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 1.5f, 0.0f));
-        model = glm::scale(model, glm::vec3(1.0f));
+        model = glm::translate(glm::mat4(1.0f), cubePosition);
+        model = glm::scale(model, cubeScale);
         depthShader.setMat4("model", model);
         glBindVertexArray(cubeVAO);
         glDrawArrays(GL_TRIANGLES, 0, 36);
@@ -225,11 +329,11 @@ int main() {
 
         // 2. Render scene as normal using the generated depth/shadow map
         glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
-        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+        glClearColor(clearColor.r, clearColor.g, clearColor.b, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         shadowShader.use();
-        glm::mat4 projection = glm::perspective(glm::radians(45.0f), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 100.0f);
+        glm::mat4 projection = glm::perspective(glm::radians(cameraFOV), (float)SCR_WIDTH / (float)SCR_HEIGHT, cameraNear, cameraFar);
         glm::mat4 view = camera.GetViewMatrix();
         shadowShader.setMat4("projection", projection);
         shadowShader.setMat4("view", view);
@@ -240,22 +344,32 @@ int main() {
         // Floor
         model = glm::mat4(1.0f);
         shadowShader.setMat4("model", model);
-        shadowShader.setVec3("objectColor", glm::vec3(0.5f, 0.5f, 0.5f));
+        shadowShader.setVec3("objectColor", floorColor);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, depthMap);
         glBindVertexArray(planeVAO);
         glDrawArrays(GL_TRIANGLES, 0, 6);
 
         // Cube
-        model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 1.5f, 0.0f));
+        model = glm::translate(glm::mat4(1.0f), cubePosition);
+        model = glm::scale(model, cubeScale);
         shadowShader.setMat4("model", model);
-        shadowShader.setVec3("objectColor", glm::vec3(0.8f, 0.2f, 0.2f));
+        shadowShader.setVec3("objectColor", cubeColor);
         glBindVertexArray(cubeVAO);
         glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        // Render ImGui
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
+
+    // Cleanup
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
 
     glfwTerminate();
     return 0;

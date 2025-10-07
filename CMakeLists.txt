@@ -9,13 +9,14 @@ find_package(OpenGL REQUIRED)
 find_package(glfw3 CONFIG)
 find_package(glm CONFIG)
 find_package(glad CONFIG)
+find_package(imgui CONFIG)
 
 # If not found, provide helpful message
-if(NOT glfw3_FOUND OR NOT glm_FOUND OR NOT glad_FOUND)
+if(NOT glfw3_FOUND OR NOT glm_FOUND OR NOT glad_FOUND OR NOT imgui_FOUND)
     message(STATUS "========================================")
     message(STATUS "Some dependencies not found via find_package.")
     message(STATUS "Install via vcpkg:")
-    message(STATUS "  vcpkg install glfw3 glm glad")
+    message(STATUS "  vcpkg install glfw3 glm glad imgui[glfw-binding,opengl3-binding]")
     message(STATUS "Then configure with:")
     message(STATUS "  cmake .. -DCMAKE_TOOLCHAIN_FILE=[vcpkg-root]/scripts/buildsystems/vcpkg.cmake")
     message(STATUS "========================================")
@@ -27,6 +28,9 @@ if(NOT glfw3_FOUND OR NOT glm_FOUND OR NOT glad_FOUND)
     endif()
     if(NOT glad_FOUND)
         message(FATAL_ERROR "glad not found")
+    endif()
+    if(NOT imgui_FOUND)
+        message(FATAL_ERROR "imgui not found")
     endif()
 endif()
 
@@ -41,6 +45,7 @@ target_link_libraries(GraphicEngine
     OpenGL::GL
     glfw
     glad::glad
+    imgui::imgui
 )
 
 # Set output directory so exe is near shaders folder
