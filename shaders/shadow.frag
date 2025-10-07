@@ -32,6 +32,11 @@ uniform float light2Intensity;
 uniform bool enableSkyboxLighting;
 uniform float skyboxLightIntensity;
 
+// Ambient Occlusion
+uniform bool enableAO;
+uniform float aoStrength;
+uniform float aoPower;
+
 // Lighting parameters
 uniform float ambientStrength;
 uniform float specularStrength;
@@ -81,6 +86,24 @@ void main()
         vec3 skyColor = texture(skybox, normal).rgb;
         ambient += skyColor * skyboxLightIntensity;
     }
+    
+    // === AMBIENT OCCLUSION (angle-based) ===
+    float ao = 1.0;
+    if (enableAO) {
+        // Calculate AO based on angle between normal and view direction
+        vec3 viewDir = normalize(viewPos - fs_in.FragPos);
+        float ndotv = max(dot(normal, viewDir), 0.0);
+        
+        // Surfaces facing away from camera are more occluded
+        // Use power function to control falloff
+        ao = pow(ndotv, aoPower);
+        
+        // Mix between full AO and no AO based on strength
+        ao = mix(1.0, ao, aoStrength);
+    }
+    
+    // Apply AO to ambient
+    ambient *= ao;
     
     // === FIRST LIGHT ===
     vec3 lightDir;

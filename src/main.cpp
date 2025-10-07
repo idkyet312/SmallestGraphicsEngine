@@ -11,6 +11,7 @@
 #include <string>
 #include "Shader.h"
 #include "Camera.h"
+#include "Model.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -99,6 +100,20 @@ float skyboxLightIntensity = 0.3f;
 int skyboxMode = 0; // 0 = procedural gradient, 1 = load cubemap files, 2 = load HDR
 char skyboxPath[256] = "skybox/";
 bool skyboxNeedsReload = false;
+
+// Ambient Occlusion settings
+bool enableAO = true;
+float aoStrength = 0.5f;
+float aoPower = 2.0f;
+
+// Model loading
+Model loadedModel;
+bool showModel = false;
+char modelPath[256] = "models/";
+glm::vec3 modelPosition(0.0f, 0.0f, 0.0f);
+glm::vec3 modelRotation(0.0f, 0.0f, 0.0f);
+glm::vec3 modelScale(1.0f, 1.0f, 1.0f);
+glm::vec3 modelColor(1.0f, 1.0f, 1.0f);
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
@@ -914,6 +929,48 @@ int main() {
                         ImGui::SliderFloat("Sky Light Intensity", &skyboxLightIntensity, 0.0f, 1.0f);
                     }
                 }
+                
+                ImGui::Separator();
+                ImGui::Text("Ambient Occlusion");
+                ImGui::Checkbox("Enable AO", &enableAO);
+                if (enableAO) {
+                    ImGui::SliderFloat("AO Strength", &aoStrength, 0.0f, 1.0f);
+                    ImGui::SliderFloat("AO Power", &aoPower, 0.5f, 5.0f);
+                    ImGui::TextWrapped("AO darkens surfaces based on viewing angle. Higher power = sharper falloff.");
+                }
+                
+                ImGui::Separator();
+                ImGui::Text("Model Loading");
+                ImGui::Checkbox("Show Model", &showModel);
+                if (showModel) {
+                    ImGui::InputText("Model Path", modelPath, 256);
+                    if (ImGui::Button("Load GLB/GLTF")) {
+                        if (loadedModel.loadModel(modelPath)) {
+                            loadedModel.position = modelPosition;
+                            loadedModel.rotation = modelRotation;
+                            loadedModel.scale = modelScale;
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Clear Model")) {
+                        loadedModel.clear();
+                    }
+                    
+                    if (loadedModel.loaded) {
+                        ImGui::Text("Model loaded: %d meshes", (int)loadedModel.meshes.size());
+                        ImGui::DragFloat3("Position", &modelPosition.x, 0.1f);
+                        ImGui::DragFloat3("Rotation", &modelRotation.x, 1.0f);
+                        ImGui::DragFloat3("Scale", &modelScale.x, 0.1f, 0.01f, 10.0f);
+                        ImGui::ColorEdit3("Model Color", &modelColor.x);
+                        
+                        // Update model transform
+                        loadedModel.position = modelPosition;
+                        loadedModel.rotation = modelRotation;
+                        loadedModel.scale = modelScale;
+                    } else {
+                        ImGui::TextWrapped("Place .glb or .gltf files in the models/ folder");
+                    }
+                }
             }
             
             ImGui::Separator();
@@ -993,6 +1050,13 @@ int main() {
             depthShader.setMat4("model", model);
             glDrawArrays(GL_TRIANGLES, 0, 36);
         }
+        
+        // Render loaded model for depth map
+        if (showModel && loadedModel.loaded) {
+            model = loadedModel.getModelMatrix();
+            depthShader.setMat4("model", model);
+            loadedModel.Draw();
+        }
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -1035,6 +1099,13 @@ int main() {
                 model = glm::scale(model, cube2Scale);
                 depthShader.setMat4("model", model);
                 glDrawArrays(GL_TRIANGLES, 0, 36);
+            }
+            
+            // Render loaded model for depth map (second light)
+            if (showModel && loadedModel.loaded) {
+                model = loadedModel.getModelMatrix();
+                depthShader.setMat4("model", model);
+                loadedModel.Draw();
             }
 
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1084,6 +1155,11 @@ int main() {
         shadowShader.setBool("enableSkyboxLighting", enableSkyboxLighting);
         shadowShader.setFloat("skyboxLightIntensity", skyboxLightIntensity);
         
+        // Ambient Occlusion properties
+        shadowShader.setBool("enableAO", enableAO);
+        shadowShader.setFloat("aoStrength", aoStrength);
+        shadowShader.setFloat("aoPower", aoPower);
+        
         // Floor
         model = glm::mat4(1.0f);
         shadowShader.setMat4("model", model);
@@ -1132,6 +1208,20 @@ int main() {
             glActiveTexture(GL_TEXTURE2);
             glBindTexture(GL_TEXTURE_CUBE_MAP, skyboxTexture);
             glDrawArrays(GL_TRIANGLES, 0, 36);
+        }
+        
+        // Loaded Model
+        if (showModel && loadedModel.loaded) {
+            model = loadedModel.getModelMatrix();
+            shadowShader.setMat4("model", model);
+            shadowShader.setVec3("objectColor", modelColor);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, depthMap);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, depthMap2);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, skyboxTexture);
+            loadedModel.Draw();
         }
 
         // Debug depth visualization
