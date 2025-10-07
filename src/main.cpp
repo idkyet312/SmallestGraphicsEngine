@@ -106,6 +106,12 @@ bool enableAO = true;
 float aoStrength = 0.5f;
 float aoPower = 2.0f;
 
+// PBR settings
+bool usePBR = true;
+float metallic = 0.0f;
+float roughness = 0.5f;
+float pbrAO = 1.0f;
+
 // Model loading
 Model loadedModel;
 bool showModel = false;
@@ -620,6 +626,7 @@ int main() {
 
     Shader depthShader("shaders/depth.vert", "shaders/depth.frag");
     Shader shadowShader("shaders/shadow.vert", "shaders/shadow.frag");
+    Shader pbrShader("shaders/pbr.vert", "shaders/pbr.frag");
     Shader debugDepthShader("shaders/debug_depth.vert", "shaders/debug_depth.frag");
     Shader skyboxShader("shaders/skybox.vert", "shaders/skybox.frag");
 
@@ -669,15 +676,15 @@ int main() {
     unsigned int skyboxVAO = loadSkyboxVAO();
     unsigned int skyboxTexture = createGradientSkyboxTexture();
 
-    shadowShader.use();
-    shadowShader.setInt("shadowMap", 0);
-    shadowShader.setInt("shadowMap2", 1);
-    shadowShader.setInt("skybox", 2);
+    pbrShader.use();
+    pbrShader.setInt("shadowMap", 0);
+    pbrShader.setInt("shadowMap2", 1);
+    pbrShader.setInt("skybox", 2);
     
     // Set default light attenuation values
-    shadowShader.setFloat("constant", lightConstant);
-    shadowShader.setFloat("linear", lightLinear);
-    shadowShader.setFloat("quadratic", lightQuadratic);
+    pbrShader.setFloat("constant", lightConstant);
+    pbrShader.setFloat("linear", lightLinear);
+    pbrShader.setFloat("quadratic", lightQuadratic);
     
     debugDepthShader.use();
     debugDepthShader.setInt("depthMap", 0);
@@ -940,6 +947,18 @@ int main() {
                 }
                 
                 ImGui::Separator();
+                ImGui::Text("PBR Materials");
+                ImGui::Checkbox("Use PBR", &usePBR);
+                if (usePBR) {
+                    ImGui::SliderFloat("Metallic", &metallic, 0.0f, 1.0f);
+                    ImGui::SliderFloat("Roughness", &roughness, 0.0f, 1.0f);
+                    ImGui::SliderFloat("AO", &pbrAO, 0.0f, 1.0f);
+                    ImGui::TextWrapped("PBR: Physically Based Rendering. Metallic=0 is dielectric, =1 is metal. Roughness=0 is smooth/shiny, =1 is rough/matte.");
+                } else {
+                    ImGui::TextWrapped("Using Blinn-Phong lighting (legacy)");
+                }
+                
+                ImGui::Separator();
                 ImGui::Text("Model Loading");
                 ImGui::Checkbox("Show Model", &showModel);
                 if (showModel) {
@@ -977,9 +996,11 @@ int main() {
             if (ImGui::Button("Reload Shaders")) {
                 try {
                     depthShader = Shader("shaders/depth.vert", "shaders/depth.frag");
-                    shadowShader = Shader("shaders/shadow.vert", "shaders/shadow.frag");
-                    shadowShader.use();
-                    shadowShader.setInt("shadowMap", 0);
+                    pbrShader = Shader("shaders/pbr.vert", "shaders/pbr.frag");
+                    pbrShader.use();
+                    pbrShader.setInt("shadowMap", 0);
+                    pbrShader.setInt("shadowMap2", 1);
+                    pbrShader.setInt("skybox", 2);
                     ImGui::Text("Shaders reloaded successfully!");
                 } catch (const std::exception& e) {
                     ImGui::Text("Error reloading shaders!");
@@ -1116,7 +1137,8 @@ int main() {
         glClearColor(clearColor.r, clearColor.g, clearColor.b, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        shadowShader.use();
+        // Use PBR shader
+        pbrShader.use();
         glm::mat4 projection;
         if (projectionType == 0) {
             // Perspective projection
@@ -1127,43 +1149,51 @@ int main() {
             projection = glm::ortho(-orthoSize * aspect, orthoSize * aspect, -orthoSize, orthoSize, cameraNear, cameraFar);
         }
         glm::mat4 view = camera.GetViewMatrix();
-        shadowShader.setMat4("projection", projection);
-        shadowShader.setMat4("view", view);
-        shadowShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
-        shadowShader.setMat4("light2SpaceMatrix", light2SpaceMatrix);
-        shadowShader.setVec3("viewPos", camera.Position);
-        shadowShader.setVec3("lightPos", lightPos);
+        pbrShader.setMat4("projection", projection);
+        pbrShader.setMat4("view", view);
+        pbrShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
+        pbrShader.setMat4("light2SpaceMatrix", light2SpaceMatrix);
+        pbrShader.setVec3("viewPos", camera.Position);
+        pbrShader.setVec3("lightPos", lightPos);
         
         // Set light properties
-        shadowShader.setInt("lightType", lightType);
-        shadowShader.setFloat("constant", lightConstant);
-        shadowShader.setFloat("linear", lightLinear);
-        shadowShader.setFloat("quadratic", lightQuadratic);
-        shadowShader.setFloat("ambientStrength", ambientStrength);
-        shadowShader.setFloat("specularStrength", specularStrength);
-        shadowShader.setInt("shininess", specularShininess);
-        shadowShader.setFloat("shadowBias", shadowBias);
-        shadowShader.setBool("enableShadows", enableShadows);
+        pbrShader.setInt("lightType", lightType);
+        pbrShader.setFloat("constant", lightConstant);
+        pbrShader.setFloat("linear", lightLinear);
+        pbrShader.setFloat("quadratic", lightQuadratic);
+        pbrShader.setFloat("shadowBias", shadowBias);
+        pbrShader.setBool("enableShadows", enableShadows);
         
         // Second light properties
-        shadowShader.setBool("enableSecondLight", enableSecondLight);
-        shadowShader.setVec3("light2Pos", light2Pos);
-        shadowShader.setVec3("light2Color", light2Color);
-        shadowShader.setFloat("light2Intensity", light2Intensity);
+        pbrShader.setBool("enableSecondLight", enableSecondLight);
+        pbrShader.setVec3("light2Pos", light2Pos);
+        pbrShader.setVec3("light2Color", light2Color);
+        pbrShader.setFloat("light2Intensity", light2Intensity);
         
         // Skybox lighting properties
-        shadowShader.setBool("enableSkyboxLighting", enableSkyboxLighting);
-        shadowShader.setFloat("skyboxLightIntensity", skyboxLightIntensity);
+        pbrShader.setBool("enableSkyboxLighting", enableSkyboxLighting);
+        pbrShader.setFloat("skyboxLightIntensity", skyboxLightIntensity);
         
         // Ambient Occlusion properties
-        shadowShader.setBool("enableAO", enableAO);
-        shadowShader.setFloat("aoStrength", aoStrength);
-        shadowShader.setFloat("aoPower", aoPower);
+        pbrShader.setBool("enableAO", enableAO);
+        pbrShader.setFloat("aoStrength", aoStrength);
+        pbrShader.setFloat("aoPower", aoPower);
+        
+        // PBR Material properties
+        pbrShader.setBool("usePBR", usePBR);
+        pbrShader.setFloat("metallic", metallic);
+        pbrShader.setFloat("roughness", roughness);
+        pbrShader.setFloat("ao", pbrAO);
+        
+        // Set texture samplers
+        pbrShader.setInt("shadowMap", 0);
+        pbrShader.setInt("shadowMap2", 1);
+        pbrShader.setInt("skybox", 2);
         
         // Floor
         model = glm::mat4(1.0f);
-        shadowShader.setMat4("model", model);
-        shadowShader.setVec3("objectColor", floorColor);
+        pbrShader.setMat4("model", model);
+        pbrShader.setVec3("objectColor", floorColor);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, depthMap);
     glActiveTexture(GL_TEXTURE1);
@@ -1180,8 +1210,8 @@ int main() {
         model = glm::rotate(model, glm::radians(cubeRotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
         model = glm::rotate(model, glm::radians(cubeRotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
         model = glm::scale(model, cubeScale);
-        shadowShader.setMat4("model", model);
-        shadowShader.setVec3("objectColor", cubeColor);
+        pbrShader.setMat4("model", model);
+        pbrShader.setVec3("objectColor", cubeColor);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, depthMap);
     glActiveTexture(GL_TEXTURE1);
@@ -1199,8 +1229,8 @@ int main() {
             model = glm::rotate(model, glm::radians(cube2Rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
             model = glm::rotate(model, glm::radians(cube2Rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
             model = glm::scale(model, cube2Scale);
-            shadowShader.setMat4("model", model);
-            shadowShader.setVec3("objectColor", cube2Color);
+            pbrShader.setMat4("model", model);
+            pbrShader.setVec3("objectColor", cube2Color);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, depthMap);
             glActiveTexture(GL_TEXTURE1);
@@ -1213,8 +1243,8 @@ int main() {
         // Loaded Model
         if (showModel && loadedModel.loaded) {
             model = loadedModel.getModelMatrix();
-            shadowShader.setMat4("model", model);
-            shadowShader.setVec3("objectColor", modelColor);
+            pbrShader.setMat4("model", model);
+            pbrShader.setVec3("objectColor", modelColor);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, depthMap);
             glActiveTexture(GL_TEXTURE1);
