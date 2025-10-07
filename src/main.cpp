@@ -54,6 +54,11 @@ float ambientStrength = 0.3f;
 float specularStrength = 0.5f;
 int specularShininess = 32;
 
+// Debug visualization
+int renderMode = 0; // 0 = normal, 1 = shadow map depth, 2 = camera depth
+float depthNear = 0.1f;
+float depthFar = 100.0f;
+
 // Additional objects
 bool showSecondCube = true;
 glm::vec3 cube2Position(-3.0f, 0.5f, 2.0f);
@@ -212,6 +217,28 @@ unsigned int loadPlaneVAO() {
     return VAO;
 }
 
+unsigned int loadQuadVAO() {
+    float quadVertices[] = {
+        // positions        // texture Coords
+        -1.0f,  1.0f, 0.0f, 0.0f, 1.0f,
+        -1.0f, -1.0f, 0.0f, 0.0f, 0.0f,
+         1.0f,  1.0f, 0.0f, 1.0f, 1.0f,
+         1.0f, -1.0f, 0.0f, 1.0f, 0.0f,
+    };
+    unsigned int VAO, VBO;
+    glGenVertexArrays(1, &VAO);
+    glGenBuffers(1, &VBO);
+    glBindVertexArray(VAO);
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), &quadVertices, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+    glBindVertexArray(0);
+    return VAO;
+}
+
 int main() {
     // Initialize GLFW
     glfwInit();
@@ -252,6 +279,7 @@ int main() {
 
     Shader depthShader("shaders/depth.vert", "shaders/depth.frag");
     Shader shadowShader("shaders/shadow.vert", "shaders/shadow.frag");
+    Shader debugDepthShader("shaders/debug_depth.vert", "shaders/debug_depth.frag");
 
     unsigned int depthMapFBO;
     glGenFramebuffers(1, &depthMapFBO);
@@ -275,9 +303,13 @@ int main() {
 
     unsigned int cubeVAO = loadCubeVAO();
     unsigned int planeVAO = loadPlaneVAO();
+    unsigned int quadVAO = loadQuadVAO();
 
     shadowShader.use();
     shadowShader.setInt("shadowMap", 0);
+    
+    debugDepthShader.use();
+    debugDepthShader.setInt("depthMap", 0);
 
     while (!glfwWindowShouldClose(window)) {
         float currentFrame = glfwGetTime();
@@ -383,6 +415,13 @@ int main() {
                 ImGui::DragFloat("Shadow Bias", &shadowBias, 0.0001f, 0.0f, 0.1f, "%.4f");
                 ImGui::Separator();
                 ImGui::Checkbox("Wireframe Mode", &wireframeMode);
+                ImGui::Separator();
+                ImGui::Text("Debug Visualization");
+                const char* renderModes[] = { "Normal", "Light Depth Map", "Camera Depth" };
+                ImGui::Combo("Render Mode", &renderMode, renderModes, 3);
+                if (renderMode > 0) {
+                    ImGui::Text("Depth range visualization");
+                }
             }
             
             ImGui::Separator();
@@ -518,6 +557,20 @@ int main() {
             shadowShader.setMat4("model", model);
             shadowShader.setVec3("objectColor", cube2Color);
             glDrawArrays(GL_TRIANGLES, 0, 36);
+        }
+
+        // Debug depth visualization
+        if (renderMode == 1) {
+            // Render shadow map depth as overlay or full screen
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            debugDepthShader.use();
+            debugDepthShader.setFloat("near_plane", lightNear);
+            debugDepthShader.setFloat("far_plane", lightFar);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, depthMap);
+            glBindVertexArray(quadVAO);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glBindVertexArray(0);
         }
 
         // Render ImGui
