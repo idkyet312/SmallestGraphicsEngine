@@ -16,6 +16,10 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+// Windows file dialog
+#include <windows.h>
+#include <commdlg.h>
+
 // Settings
 unsigned int SCR_WIDTH = 1280;
 unsigned int SCR_HEIGHT = 720;
@@ -120,6 +124,35 @@ glm::vec3 modelPosition(0.0f, 0.0f, 0.0f);
 glm::vec3 modelRotation(0.0f, 0.0f, 0.0f);
 glm::vec3 modelScale(1.0f, 1.0f, 1.0f);
 glm::vec3 modelColor(1.0f, 1.0f, 1.0f);
+
+// Material texture paths
+char albedoTexturePath[256] = "textures/";
+char normalTexturePath[256] = "textures/";
+char metallicTexturePath[256] = "textures/";
+char roughnessTexturePath[256] = "textures/";
+char aoTexturePath[256] = "textures/";
+int selectedMeshIndex = 0;
+
+// Function to open file dialog and return selected file path
+std::string OpenFileDialog(const char* filter = "Image Files\0*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.hdr\0All Files\0*.*\0") {
+    OPENFILENAMEA ofn;
+    char fileName[MAX_PATH] = "";
+    ZeroMemory(&ofn, sizeof(ofn));
+    
+    ofn.lStructSize = sizeof(OPENFILENAMEA);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = fileName;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+    ofn.lpstrDefExt = "";
+    
+    if (GetOpenFileNameA(&ofn)) {
+        return std::string(fileName);
+    }
+    
+    return "";
+}
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
@@ -986,6 +1019,135 @@ int main() {
                         loadedModel.position = modelPosition;
                         loadedModel.rotation = modelRotation;
                         loadedModel.scale = modelScale;
+                        
+                        // Material Texture Loading
+                        ImGui::Separator();
+                        ImGui::Text("Material Textures");
+                        if (loadedModel.meshes.size() > 1) {
+                            ImGui::SliderInt("Mesh", &selectedMeshIndex, 0, (int)loadedModel.meshes.size() - 1);
+                        }
+                        
+                        if (selectedMeshIndex >= 0 && selectedMeshIndex < (int)loadedModel.meshes.size()) {
+                            Material& mat = loadedModel.meshes[selectedMeshIndex].material;
+                            
+                            // Albedo texture
+                            ImGui::Text("Albedo Texture:");
+                            ImGui::InputText("##albedo", albedoTexturePath, 256);
+                            ImGui::SameLine();
+                            if (ImGui::Button("Browse##albedo")) {
+                                std::string path = OpenFileDialog();
+                                if (!path.empty()) {
+                                    strcpy_s(albedoTexturePath, path.c_str());
+                                }
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Load##albedo")) {
+                                if (loadedModel.loadMeshTexture(selectedMeshIndex, albedoTexturePath, 0)) {
+                                    strcpy_s(albedoTexturePath, "textures/");
+                                }
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Clear##albedo")) {
+                                loadedModel.clearMeshTexture(selectedMeshIndex, 0);
+                            }
+                            ImGui::SameLine();
+                            ImGui::Text(mat.hasAlbedo ? "[Loaded]" : "[None]");
+                            
+                            // Normal texture
+                            ImGui::Text("Normal Map:");
+                            ImGui::InputText("##normal", normalTexturePath, 256);
+                            ImGui::SameLine();
+                            if (ImGui::Button("Browse##normal")) {
+                                std::string path = OpenFileDialog();
+                                if (!path.empty()) {
+                                    strcpy_s(normalTexturePath, path.c_str());
+                                }
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Load##normal")) {
+                                if (loadedModel.loadMeshTexture(selectedMeshIndex, normalTexturePath, 1)) {
+                                    strcpy_s(normalTexturePath, "textures/");
+                                }
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Clear##normal")) {
+                                loadedModel.clearMeshTexture(selectedMeshIndex, 1);
+                            }
+                            ImGui::SameLine();
+                            ImGui::Text(mat.hasNormal ? "[Loaded]" : "[None]");
+                            
+                            // Metallic texture
+                            ImGui::Text("Metallic Map:");
+                            ImGui::InputText("##metallic", metallicTexturePath, 256);
+                            ImGui::SameLine();
+                            if (ImGui::Button("Browse##metallic")) {
+                                std::string path = OpenFileDialog();
+                                if (!path.empty()) {
+                                    strcpy_s(metallicTexturePath, path.c_str());
+                                }
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Load##metallic")) {
+                                if (loadedModel.loadMeshTexture(selectedMeshIndex, metallicTexturePath, 2)) {
+                                    strcpy_s(metallicTexturePath, "textures/");
+                                }
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Clear##metallic")) {
+                                loadedModel.clearMeshTexture(selectedMeshIndex, 2);
+                            }
+                            ImGui::SameLine();
+                            ImGui::Text(mat.hasMetallic ? "[Loaded]" : "[None]");
+                            
+                            // Roughness texture
+                            ImGui::Text("Roughness Map:");
+                            ImGui::InputText("##roughness", roughnessTexturePath, 256);
+                            ImGui::SameLine();
+                            if (ImGui::Button("Browse##roughness")) {
+                                std::string path = OpenFileDialog();
+                                if (!path.empty()) {
+                                    strcpy_s(roughnessTexturePath, path.c_str());
+                                }
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Load##roughness")) {
+                                if (loadedModel.loadMeshTexture(selectedMeshIndex, roughnessTexturePath, 3)) {
+                                    strcpy_s(roughnessTexturePath, "textures/");
+                                }
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Clear##roughness")) {
+                                loadedModel.clearMeshTexture(selectedMeshIndex, 3);
+                            }
+                            ImGui::SameLine();
+                            ImGui::Text(mat.hasRoughness ? "[Loaded]" : "[None]");
+                            
+                            // AO texture
+                            ImGui::Text("AO Map:");
+                            ImGui::InputText("##ao", aoTexturePath, 256);
+                            ImGui::SameLine();
+                            if (ImGui::Button("Browse##ao")) {
+                                std::string path = OpenFileDialog();
+                                if (!path.empty()) {
+                                    strcpy_s(aoTexturePath, path.c_str());
+                                }
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Load##ao")) {
+                                if (loadedModel.loadMeshTexture(selectedMeshIndex, aoTexturePath, 4)) {
+                                    strcpy_s(aoTexturePath, "textures/");
+                                }
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Clear##ao")) {
+                                loadedModel.clearMeshTexture(selectedMeshIndex, 4);
+                            }
+                            ImGui::SameLine();
+                            ImGui::Text(mat.hasAO ? "[Loaded]" : "[None]");
+                            
+                            ImGui::Separator();
+                            ImGui::TextWrapped("Place texture files in the textures/ folder or use absolute paths");
+                        }
                     } else {
                         ImGui::TextWrapped("Place .glb or .gltf files in the models/ folder");
                     }
@@ -1076,7 +1238,7 @@ int main() {
         if (showModel && loadedModel.loaded) {
             model = loadedModel.getModelMatrix();
             depthShader.setMat4("model", model);
-            loadedModel.Draw();
+            loadedModel.DrawSimple();
         }
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1126,7 +1288,7 @@ int main() {
             if (showModel && loadedModel.loaded) {
                 model = loadedModel.getModelMatrix();
                 depthShader.setMat4("model", model);
-                loadedModel.Draw();
+                loadedModel.DrawSimple();
             }
 
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1251,7 +1413,7 @@ int main() {
             glBindTexture(GL_TEXTURE_2D, depthMap2);
             glActiveTexture(GL_TEXTURE2);
             glBindTexture(GL_TEXTURE_CUBE_MAP, skyboxTexture);
-            loadedModel.Draw();
+            loadedModel.Draw(pbrShader);
         }
 
         // Debug depth visualization

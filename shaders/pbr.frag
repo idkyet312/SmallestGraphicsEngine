@@ -7,11 +7,28 @@ in VS_OUT {
     vec2 TexCoords;
     vec4 FragPosLightSpace;
     vec4 FragPosLight2Space;
+    mat3 TBN;
 } fs_in;
 
 uniform sampler2D shadowMap;
 uniform sampler2D shadowMap2;
 uniform samplerCube skybox;
+
+// Material textures
+struct MaterialMaps {
+    sampler2D albedoMap;
+    sampler2D normalMap;
+    sampler2D metallicMap;
+    sampler2D roughnessMap;
+    sampler2D aoMap;
+    
+    bool hasAlbedoMap;
+    bool hasNormalMap;
+    bool hasMetallicMap;
+    bool hasRoughnessMap;
+    bool hasAOMap;
+};
+uniform MaterialMaps material;
 
 uniform vec3 lightPos;
 uniform vec3 viewPos;
@@ -122,8 +139,22 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0)
 
 void main()
 {           
-    vec3 color = objectColor;
-    vec3 normal = normalize(fs_in.Normal);
+    // Sample material textures
+    vec3 albedo = material.hasAlbedoMap ? texture(material.albedoMap, fs_in.TexCoords).rgb : objectColor;
+    float metallicValue = material.hasMetallicMap ? texture(material.metallicMap, fs_in.TexCoords).r : metallic;
+    float roughnessValue = material.hasRoughnessMap ? texture(material.roughnessMap, fs_in.TexCoords).r : roughness;
+    float aoValue = material.hasAOMap ? texture(material.aoMap, fs_in.TexCoords).r : ao;
+    
+    // Get normal from normal map or use vertex normal
+    vec3 normal;
+    if (material.hasNormalMap) {
+        normal = texture(material.normalMap, fs_in.TexCoords).rgb;
+        normal = normal * 2.0 - 1.0;  // Transform from [0,1] to [-1,1]
+        normal = normalize(fs_in.TBN * normal);
+    } else {
+        normal = normalize(fs_in.Normal);
+    }
+    
     vec3 viewDir = normalize(viewPos - fs_in.FragPos);
     
     // Ambient Occlusion (angle-based)
@@ -138,11 +169,9 @@ void main()
     
     if (usePBR) {
         // PBR Workflow
-        vec3 albedo = color;
-        
         // Calculate reflectance at normal incidence
         vec3 F0 = vec3(0.04); 
-        F0 = mix(F0, albedo, metallic);
+        F0 = mix(F0, albedo, metallicValue);
         
         // === FIRST LIGHT (PBR) ===
         vec3 L = normalize(lightPos - fs_in.FragPos);
@@ -158,8 +187,8 @@ void main()
         vec3 radiance = vec3(1.0) * attenuation;
         
         // Cook-Torrance BRDF
-        float NDF = DistributionGGX(normal, H, roughness);
-        float G = GeometrySmith(normal, viewDir, L, roughness);
+        float NDF = DistributionGGX(normal, H, roughnessValue);
+        float G = GeometrySmith(normal, viewDir, L, roughnessValue);
         vec3 F = fresnelSchlick(max(dot(H, viewDir), 0.0), F0);
         
         vec3 numerator = NDF * G * F;
@@ -168,7 +197,7 @@ void main()
         
         vec3 kS = F;
         vec3 kD = vec3(1.0) - kS;
-        kD *= 1.0 - metallic;
+        kD *= 1.0 - metallicValue;
         
         float NdotL = max(dot(normal, L), 0.0);
         
@@ -186,8 +215,8 @@ void main()
             
             radiance = light2Color * light2Intensity * attenuation;
             
-            NDF = DistributionGGX(normal, H, roughness);
-            G = GeometrySmith(normal, viewDir, L, roughness);
+            NDF = DistributionGGX(normal, H, roughnessValue);
+            G = GeometrySmith(normal, viewDir, L, roughnessValue);
             F = fresnelSchlick(max(dot(H, viewDir), 0.0), F0);
             
             numerator = NDF * G * F;
@@ -196,7 +225,7 @@ void main()
             
             kS = F;
             kD = vec3(1.0) - kS;
-            kD *= 1.0 - metallic;
+            kD *= 1.0 - metallicValue;
             
             NdotL = max(dot(normal, L), 0.0);
             
@@ -206,12 +235,12 @@ void main()
         }
         
         // Ambient lighting
-        vec3 ambient = vec3(0.03) * albedo * ao;
+        vec3 ambient = vec3(0.03) * albedo * aoValue;
         
         // Skybox ambient
         if (enableSkyboxLighting) {
             vec3 skyColor = texture(skybox, normal).rgb;
-            ambient += skyColor * skyboxLightIntensity * albedo * ao;
+            ambient += skyColor * skyboxLightIntensity * albedo * aoValue;
         }
         
         ambient *= aoFactor;
@@ -229,7 +258,7 @@ void main()
     } else {
         // Original Blinn-Phong lighting (fallback)
         vec3 lightColor = vec3(1.0);
-        vec3 ambient = vec3(0.15) * color;
+        vec3 ambient = vec3(0.15) * albedo;
         
         if (enableSkyboxLighting) {
             vec3 skyColor = texture(skybox, normal).rgb;
@@ -278,6 +307,6 @@ void main()
             lighting += (1.0 - shadow2) * (light2Diffuse + light2Specular) * light2Attenuation;
         }
         
-        FragColor = vec4(lighting * color, 1.0);
+        FragColor = vec4(lighting * albedo, 1.0);
     }
 }
