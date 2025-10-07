@@ -11,10 +11,12 @@ public:
     glm::vec3 Up;
     float Yaw;
     float Pitch;
+    float MovementSpeed;
+    float MouseSensitivity;
 
     Camera(glm::vec3 position = glm::vec3(0.0f, 5.0f, 10.0f))
         : Position(position), Front(glm::vec3(0.0f, 0.0f, -1.0f)), Up(glm::vec3(0.0f, 1.0f, 0.0f)),
-          Yaw(-90.0f), Pitch(-20.0f) {
+          Yaw(-90.0f), Pitch(-20.0f), MovementSpeed(2.5f), MouseSensitivity(0.1f) {
         updateCameraVectors();
     }
 
@@ -23,7 +25,7 @@ public:
     }
 
     void ProcessKeyboard(char direction, float deltaTime) {
-        float velocity = 2.5f * deltaTime;
+        float velocity = MovementSpeed * deltaTime;
         if (direction == 'W') Position += Front * velocity;
         if (direction == 'S') Position -= Front * velocity;
         if (direction == 'A') Position -= glm::normalize(glm::cross(Front, Up)) * velocity;
@@ -31,8 +33,8 @@ public:
     }
 
     void ProcessMouseMovement(float xoffset, float yoffset) {
-        xoffset *= 0.1f;
-        yoffset *= 0.1f;
+        xoffset *= MouseSensitivity;
+        yoffset *= MouseSensitivity;
         Yaw += xoffset;
         Pitch += yoffset;
         if (Pitch > 89.0f) Pitch = 89.0f;
