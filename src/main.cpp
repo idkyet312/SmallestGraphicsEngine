@@ -58,6 +58,8 @@ int specularShininess = 32;
 int renderMode = 0; // 0 = normal, 1 = shadow map depth, 2 = camera depth
 float depthNear = 0.1f;
 float depthFar = 100.0f;
+bool showShadowMapOverlay = false;
+float overlaySize = 0.25f; // Size of overlay (0.0 to 1.0)
 
 // Additional objects
 bool showSecondCube = true;
@@ -70,6 +72,13 @@ glm::vec3 cube2Color(0.2f, 0.8f, 0.2f);
 bool animateLight = false;
 bool animateCube = false;
 float animationSpeed = 1.0f;
+
+// Light properties (add after existing light variables)
+int lightType = 0; // 0 = directional, 1 = point
+float lightConstant = 1.0f;
+float lightLinear = 0.09f;
+float lightQuadratic = 0.032f;
+glm::vec3 lightColor(1.0f, 1.0f, 1.0f);
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
@@ -256,6 +265,9 @@ int main() {
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glfwSetCursorPosCallback(window, mouse_callback);
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    
+    // Disable VSync to uncap frame rate
+    glfwSwapInterval(0);
 
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         std::cout << "Failed to initialize GLAD" << std::endl;
@@ -307,6 +319,11 @@ int main() {
 
     shadowShader.use();
     shadowShader.setInt("shadowMap", 0);
+    
+    // Set default light attenuation values
+    shadowShader.setFloat("constant", lightConstant);
+    shadowShader.setFloat("linear", lightLinear);
+    shadowShader.setFloat("quadratic", lightQuadratic);
     
     debugDepthShader.use();
     debugDepthShader.setInt("depthMap", 0);
@@ -365,10 +382,63 @@ int main() {
             }
             
             if (ImGui::CollapsingHeader("Light Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Text("Light Type");
+                const char* lightTypes[] = { "Directional", "Point Light" };
+                ImGui::Combo("Light Type", &lightType, lightTypes, 2);
+                
+                ImGui::Separator();
                 ImGui::Text("Light Transform");
                 ImGui::DragFloat3("Light Position", &lightPos.x, 0.1f);
-                ImGui::DragFloat3("Light Target", &lightTarget.x, 0.1f);
-                ImGui::DragFloat3("Light Up Vector", &lightUp.x, 0.01f);
+                ImGui::ColorEdit3("Light Color", &lightColor.x);
+                
+                if (lightType == 0) {
+                    // Directional light settings
+                    ImGui::DragFloat3("Light Target", &lightTarget.x, 0.1f);
+                    ImGui::DragFloat3("Light Up Vector", &lightUp.x, 0.01f);
+                } else {
+                    // Point light attenuation
+                    ImGui::Separator();
+                    ImGui::Text("Point Light Attenuation");
+                    ImGui::DragFloat("Constant", &lightConstant, 0.01f, 0.0f, 10.0f);
+                    ImGui::DragFloat("Linear", &lightLinear, 0.001f, 0.0f, 1.0f, "%.4f");
+                    ImGui::DragFloat("Quadratic", &lightQuadratic, 0.001f, 0.0f, 1.0f, "%.4f");
+                    
+                    // Presets
+                    if (ImGui::Button("Distance 7")) {
+                        lightConstant = 1.0f; lightLinear = 0.7f; lightQuadratic = 1.8f;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Distance 13")) {
+                        lightConstant = 1.0f; lightLinear = 0.35f; lightQuadratic = 0.44f;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Distance 20")) {
+                        lightConstant = 1.0f; lightLinear = 0.22f; lightQuadratic = 0.20f;
+                    }
+                    if (ImGui::Button("Distance 32")) {
+                        lightConstant = 1.0f; lightLinear = 0.14f; lightQuadratic = 0.07f;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Distance 50")) {
+                        lightConstant = 1.0f; lightLinear = 0.09f; lightQuadratic = 0.032f;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Distance 100")) {
+                        lightConstant = 1.0f; lightLinear = 0.045f; lightQuadratic = 0.0075f;
+                    }
+                    if (ImGui::Button("Distance 200")) {
+                        lightConstant = 1.0f; lightLinear = 0.022f; lightQuadratic = 0.0019f;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Distance 325")) {
+                        lightConstant = 1.0f; lightLinear = 0.014f; lightQuadratic = 0.0007f;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Distance 600")) {
+                        lightConstant = 1.0f; lightLinear = 0.007f; lightQuadratic = 0.0002f;
+                    }
+                }
+                
                 ImGui::Separator();
                 ImGui::Text("Light Projection (Ortho)");
                 ImGui::DragFloat("Light Ortho Size", &lightOrthoSize, 0.5f, 1.0f, 50.0f);
@@ -421,6 +491,12 @@ int main() {
                 ImGui::Combo("Render Mode", &renderMode, renderModes, 3);
                 if (renderMode > 0) {
                     ImGui::Text("Depth range visualization");
+                }
+                ImGui::Separator();
+                ImGui::Text("Shadow Map Debug");
+                ImGui::Checkbox("Show Shadow Map Overlay", &showShadowMapOverlay);
+                if (showShadowMapOverlay) {
+                    ImGui::SliderFloat("Overlay Size", &overlaySize, 0.1f, 0.5f);
                 }
             }
             
@@ -524,7 +600,18 @@ int main() {
         shadowShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
         shadowShader.setVec3("viewPos", camera.Position);
         shadowShader.setVec3("lightPos", lightPos);
-
+        
+        // Set light properties
+        shadowShader.setInt("lightType", lightType);
+        shadowShader.setFloat("constant", lightConstant);
+        shadowShader.setFloat("linear", lightLinear);
+        shadowShader.setFloat("quadratic", lightQuadratic);
+        shadowShader.setFloat("ambientStrength", ambientStrength);
+        shadowShader.setFloat("specularStrength", specularStrength);
+        shadowShader.setInt("shininess", specularShininess);
+        shadowShader.setFloat("shadowBias", shadowBias);
+        shadowShader.setBool("enableShadows", enableShadows);
+        
         // Floor
         model = glm::mat4(1.0f);
         shadowShader.setMat4("model", model);
@@ -561,7 +648,7 @@ int main() {
 
         // Debug depth visualization
         if (renderMode == 1) {
-            // Render shadow map depth as overlay or full screen
+            // Render shadow map depth as full screen
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             debugDepthShader.use();
             debugDepthShader.setFloat("near_plane", lightNear);
@@ -571,6 +658,36 @@ int main() {
             glBindVertexArray(quadVAO);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             glBindVertexArray(0);
+        }
+        
+        // Shadow map overlay (bottom-right corner)
+        if (showShadowMapOverlay && renderMode == 0) {
+            // Disable depth test for overlay
+            glDisable(GL_DEPTH_TEST);
+            
+            // Calculate overlay position and size
+            float overlayWidth = overlaySize;
+            float overlayHeight = overlaySize * ((float)SCR_WIDTH / (float)SCR_HEIGHT);
+            float xPos = 1.0f - overlayWidth - 0.02f;  // 2% margin from right
+            float yPos = -1.0f + overlayHeight + 0.02f; // 2% margin from bottom
+            
+            // Set viewport for overlay (bottom-right corner)
+            int overlayPixelWidth = (int)(SCR_WIDTH * overlaySize);
+            int overlayPixelHeight = (int)(SCR_HEIGHT * overlaySize);
+            glViewport(SCR_WIDTH - overlayPixelWidth, 0, overlayPixelWidth, overlayPixelHeight);
+            
+            debugDepthShader.use();
+            debugDepthShader.setFloat("near_plane", lightNear);
+            debugDepthShader.setFloat("far_plane", lightFar);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, depthMap);
+            glBindVertexArray(quadVAO);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glBindVertexArray(0);
+            
+            // Restore viewport and depth test
+            glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
+            glEnable(GL_DEPTH_TEST);
         }
 
         // Render ImGui
