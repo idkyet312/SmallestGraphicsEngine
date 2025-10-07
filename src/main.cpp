@@ -92,12 +92,31 @@ void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
         lastX = (float)xpos;
         lastY = (float)ypos;
         firstMouse = false;
+        return; // Skip first frame to avoid jump
     }
+    
     float xoffset = (float)xpos - lastX;
     float yoffset = lastY - (float)ypos; // reversed
+    
     lastX = (float)xpos;
     lastY = (float)ypos;
+    
     camera.ProcessMouseMovement(xoffset, yoffset);
+}
+
+void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
+    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+        if (!ImGui::GetIO().WantCaptureMouse) {
+            // Lock cursor to window
+            cameraLocked = false;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            // Reset cursor position to center
+            glfwSetCursorPos(window, SCR_WIDTH / 2.0, SCR_HEIGHT / 2.0);
+            lastX = SCR_WIDTH / 2.0f;
+            lastY = SCR_HEIGHT / 2.0f;
+            firstMouse = true;
+        }
+    }
 }
 
 void processInput(GLFWwindow *window) {
@@ -108,22 +127,23 @@ void processInput(GLFWwindow *window) {
     static bool tabPressed = false;
     if (glfwGetKey(window, GLFW_KEY_TAB) == GLFW_PRESS && !tabPressed) {
         showUI = !showUI;
-        glfwSetInputMode(window, GLFW_CURSOR, showUI ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_DISABLED);
+        if (showUI) {
+            // Show UI - release cursor
+            cameraLocked = true;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        }
         tabPressed = true;
     }
     if (glfwGetKey(window, GLFW_KEY_TAB) == GLFW_RELEASE) {
         tabPressed = false;
     }
     
-    // Toggle camera lock with C key
+    // Release cursor with C key
     static bool cPressed = false;
     if (glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS && !cPressed) {
-        cameraLocked = !cameraLocked;
-        if (cameraLocked) {
-            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-        } else if (!showUI) {
-            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-        }
+        // Release cursor lock
+        cameraLocked = true;
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
         cPressed = true;
     }
     if (glfwGetKey(window, GLFW_KEY_C) == GLFW_RELEASE) {
@@ -264,7 +284,11 @@ int main() {
     glfwMakeContextCurrent(window);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glfwSetCursorPosCallback(window, mouse_callback);
+    glfwSetMouseButtonCallback(window, mouse_button_callback);
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    
+    // Start with camera locked (cursor visible)
+    cameraLocked = true;
     
     // Disable VSync to uncap frame rate
     glfwSwapInterval(0);
