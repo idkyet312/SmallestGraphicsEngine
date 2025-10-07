@@ -10,6 +10,7 @@ in VS_OUT {
 
 uniform sampler2D shadowMap;
 uniform sampler2D shadowMap2;
+uniform samplerCube skybox;
 
 uniform vec3 lightPos;
 uniform vec3 viewPos;
@@ -26,6 +27,10 @@ uniform bool enableSecondLight;
 uniform vec3 light2Pos;
 uniform vec3 light2Color;
 uniform float light2Intensity;
+
+// Skybox lighting
+uniform bool enableSkyboxLighting;
+uniform float skyboxLightIntensity;
 
 // Lighting parameters
 uniform float ambientStrength;
@@ -68,8 +73,14 @@ void main()
     vec3 normal = normalize(fs_in.Normal);
     vec3 lightColor = vec3(1.0);
     
-    // Ambient
+    // Ambient - can be enhanced by skybox
     vec3 ambient = ambientStrength * lightColor;
+    
+    // Add skybox ambient lighting (sample skybox in normal direction)
+    if (enableSkyboxLighting) {
+        vec3 skyColor = texture(skybox, normal).rgb;
+        ambient += skyColor * skyboxLightIntensity;
+    }
     
     // === FIRST LIGHT ===
     vec3 lightDir;

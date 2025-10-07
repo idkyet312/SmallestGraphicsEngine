@@ -7,8 +7,13 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 #include <iostream>
+#include <vector>
+#include <string>
 #include "Shader.h"
 #include "Camera.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 // Settings
 unsigned int SCR_WIDTH = 1280;
@@ -85,6 +90,15 @@ bool enableSecondLight = true;
 glm::vec3 light2Pos(5.0f, 8.0f, 5.0f);
 glm::vec3 light2Color(0.5f, 0.5f, 1.0f); // Blueish light
 float light2Intensity = 0.8f;
+
+// Skybox settings
+bool enableSkybox = true;
+glm::vec3 skyboxTint(1.0f, 1.0f, 1.0f);
+bool enableSkyboxLighting = true;
+float skyboxLightIntensity = 0.3f;
+int skyboxMode = 0; // 0 = procedural gradient, 1 = load cubemap files, 2 = load HDR
+char skyboxPath[256] = "skybox/";
+bool skyboxNeedsReload = false;
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
@@ -274,6 +288,276 @@ unsigned int loadQuadVAO() {
     return VAO;
 }
 
+unsigned int loadSkyboxVAO() {
+    float skyboxVertices[] = {
+        // positions          
+        -1.0f,  1.0f, -1.0f,
+        -1.0f, -1.0f, -1.0f,
+         1.0f, -1.0f, -1.0f,
+         1.0f, -1.0f, -1.0f,
+         1.0f,  1.0f, -1.0f,
+        -1.0f,  1.0f, -1.0f,
+
+        -1.0f, -1.0f,  1.0f,
+        -1.0f, -1.0f, -1.0f,
+        -1.0f,  1.0f, -1.0f,
+        -1.0f,  1.0f, -1.0f,
+        -1.0f,  1.0f,  1.0f,
+        -1.0f, -1.0f,  1.0f,
+
+         1.0f, -1.0f, -1.0f,
+         1.0f, -1.0f,  1.0f,
+         1.0f,  1.0f,  1.0f,
+         1.0f,  1.0f,  1.0f,
+         1.0f,  1.0f, -1.0f,
+         1.0f, -1.0f, -1.0f,
+
+        -1.0f, -1.0f,  1.0f,
+        -1.0f,  1.0f,  1.0f,
+         1.0f,  1.0f,  1.0f,
+         1.0f,  1.0f,  1.0f,
+         1.0f, -1.0f,  1.0f,
+        -1.0f, -1.0f,  1.0f,
+
+        -1.0f,  1.0f, -1.0f,
+         1.0f,  1.0f, -1.0f,
+         1.0f,  1.0f,  1.0f,
+         1.0f,  1.0f,  1.0f,
+        -1.0f,  1.0f,  1.0f,
+        -1.0f,  1.0f, -1.0f,
+
+        -1.0f, -1.0f, -1.0f,
+        -1.0f, -1.0f,  1.0f,
+         1.0f, -1.0f, -1.0f,
+         1.0f, -1.0f, -1.0f,
+        -1.0f, -1.0f,  1.0f,
+         1.0f, -1.0f,  1.0f
+    };
+    unsigned int VAO, VBO;
+    glGenVertexArrays(1, &VAO);
+    glGenBuffers(1, &VBO);
+    glBindVertexArray(VAO);
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(skyboxVertices), &skyboxVertices, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glBindVertexArray(0);
+    return VAO;
+}
+
+unsigned int createGradientSkyboxTexture() {
+    unsigned int textureID;
+    glGenTextures(1, &textureID);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, textureID);
+
+    const int size = 512;
+    unsigned char* data = new unsigned char[size * size * 3];
+
+    // Colors for gradient (top to bottom)
+    glm::vec3 skyTop(0.3f, 0.5f, 0.9f);      // Darker blue at top
+    glm::vec3 skyHorizon(0.7f, 0.8f, 1.0f);  // Lighter blue at horizon
+    glm::vec3 skyBottom(0.4f, 0.4f, 0.45f);  // Darker at bottom
+
+    // Create each face with proper gradient based on direction
+    for (int face = 0; face < 6; face++) {
+        for (int y = 0; y < size; y++) {
+            for (int x = 0; x < size; x++) {
+                // Convert pixel to normalized cubemap coordinates [-1, 1]
+                float u = (float)x / (float)(size - 1) * 2.0f - 1.0f;
+                float v = (float)y / (float)(size - 1) * 2.0f - 1.0f;
+                
+                // Get direction vector for this face
+                glm::vec3 dir;
+                switch (face) {
+                    case 0: dir = glm::normalize(glm::vec3( 1.0f, -v, -u)); break; // +X
+                    case 1: dir = glm::normalize(glm::vec3(-1.0f, -v,  u)); break; // -X
+                    case 2: dir = glm::normalize(glm::vec3( u,  1.0f,  v)); break; // +Y
+                    case 3: dir = glm::normalize(glm::vec3( u, -1.0f, -v)); break; // -Y
+                    case 4: dir = glm::normalize(glm::vec3( u, -v,  1.0f)); break; // +Z
+                    case 5: dir = glm::normalize(glm::vec3(-u, -v, -1.0f)); break; // -Z
+                }
+                
+                // Use Y component to determine gradient
+                float height = dir.y; // -1 to 1
+                glm::vec3 color;
+                if (height > 0.0f) {
+                    // Upper hemisphere - blend from horizon to sky top
+                    color = glm::mix(skyHorizon, skyTop, height);
+                } else {
+                    // Lower hemisphere - blend from horizon to bottom
+                    color = glm::mix(skyHorizon, skyBottom, -height);
+                }
+                
+                int index = (y * size + x) * 3;
+                data[index + 0] = (unsigned char)(glm::clamp(color.r, 0.0f, 1.0f) * 255);
+                data[index + 1] = (unsigned char)(glm::clamp(color.g, 0.0f, 1.0f) * 255);
+                data[index + 2] = (unsigned char)(glm::clamp(color.b, 0.0f, 1.0f) * 255);
+            }
+        }
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RGB, size, size, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
+    }
+
+    delete[] data;
+
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+
+    return textureID;
+}
+
+unsigned int loadCubemapFromFiles(std::vector<std::string> faces) {
+    unsigned int textureID;
+    glGenTextures(1, &textureID);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, textureID);
+
+    int width, height, nrChannels;
+    for (unsigned int i = 0; i < faces.size(); i++) {
+        unsigned char *data = stbi_load(faces[i].c_str(), &width, &height, &nrChannels, 0);
+        if (data) {
+            GLenum format = GL_RGB;
+            if (nrChannels == 1)
+                format = GL_RED;
+            else if (nrChannels == 3)
+                format = GL_RGB;
+            else if (nrChannels == 4)
+                format = GL_RGBA;
+
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
+            stbi_image_free(data);
+            std::cout << "Loaded cubemap face: " << faces[i] << std::endl;
+        } else {
+            std::cout << "Cubemap texture failed to load at path: " << faces[i] << std::endl;
+            stbi_image_free(data);
+            // Return generated gradient if loading fails
+            return createGradientSkyboxTexture();
+        }
+    }
+
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+
+    return textureID;
+}
+
+unsigned int loadHDREnvironment(const char* filepath) {
+    stbi_set_flip_vertically_on_load(true);
+    int width, height, nrComponents;
+    float *data = stbi_loadf(filepath, &width, &height, &nrComponents, 0);
+    
+    if (!data) {
+        std::cout << "Failed to load HDR image: " << filepath << std::endl;
+        return createGradientSkyboxTexture();
+    }
+
+    std::cout << "HDR loaded: " << width << "x" << height << " with " << nrComponents << " components" << std::endl;
+    std::cout << "Converting equirectangular to cubemap..." << std::endl;
+
+    // Create cubemap
+    unsigned int cubemap;
+    glGenTextures(1, &cubemap);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cubemap);
+    
+    // Allocate cubemap faces (1024x1024 for each face)
+    int cubemapSize = 1024;
+    for (unsigned int i = 0; i < 6; i++) {
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGB16F,
+                     cubemapSize, cubemapSize, 0, GL_RGB, GL_FLOAT, nullptr);
+    }
+    
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    // CPU-based equirectangular to cubemap conversion
+    std::vector<glm::vec3> faceData(cubemapSize * cubemapSize);
+    const float PI = 3.14159265359f;
+    
+    for (int face = 0; face < 6; face++) {
+        for (int y = 0; y < cubemapSize; y++) {
+            for (int x = 0; x < cubemapSize; x++) {
+                // Calculate direction for this cubemap texel
+                float u = (x + 0.5f) / cubemapSize * 2.0f - 1.0f;
+                float v = (y + 0.5f) / cubemapSize * 2.0f - 1.0f;
+                
+                glm::vec3 dir;
+                switch (face) {
+                    case 0: dir = glm::normalize(glm::vec3( 1.0f, -v, -u)); break; // +X (right)
+                    case 1: dir = glm::normalize(glm::vec3(-1.0f, -v,  u)); break; // -X (left)
+                    case 2: dir = glm::normalize(glm::vec3( u,  1.0f,  v)); break; // +Y (top)
+                    case 3: dir = glm::normalize(glm::vec3( u, -1.0f, -v)); break; // -Y (bottom)
+                    case 4: dir = glm::normalize(glm::vec3( u, -v,  1.0f)); break; // +Z (front)
+                    case 5: dir = glm::normalize(glm::vec3(-u, -v, -1.0f)); break; // -Z (back)
+                }
+                
+                // Convert direction to equirectangular coordinates (longitude/latitude)
+                float phi = atan2(dir.z, dir.x);
+                float theta = asin(glm::clamp(dir.y, -1.0f, 1.0f));
+                
+                // Map to texture coordinates
+                float equiU = (phi / (2.0f * PI)) + 0.5f;
+                float equiV = (theta / PI) + 0.5f;
+                
+                // Sample from HDR data (bilinear interpolation)
+                equiU = glm::clamp(equiU, 0.0f, 1.0f);
+                equiV = glm::clamp(equiV, 0.0f, 1.0f);
+                
+                float px = equiU * (width - 1);
+                float py = equiV * (height - 1);
+                
+                int x0 = (int)floor(px);
+                int x1 = (int)ceil(px);
+                int y0 = (int)floor(py);
+                int y1 = (int)ceil(py);
+                
+                float fx = px - x0;
+                float fy = py - y0;
+                
+                // Clamp indices
+                x0 = glm::clamp(x0, 0, width - 1);
+                x1 = glm::clamp(x1, 0, width - 1);
+                y0 = glm::clamp(y0, 0, height - 1);
+                y1 = glm::clamp(y1, 0, height - 1);
+                
+                // Get pixel indices
+                int idx00 = (y0 * width + x0) * nrComponents;
+                int idx10 = (y0 * width + x1) * nrComponents;
+                int idx01 = (y1 * width + x0) * nrComponents;
+                int idx11 = (y1 * width + x1) * nrComponents;
+                
+                // Bilinear interpolation
+                glm::vec3 color00(data[idx00], data[idx00 + 1], data[idx00 + 2]);
+                glm::vec3 color10(data[idx10], data[idx10 + 1], data[idx10 + 2]);
+                glm::vec3 color01(data[idx01], data[idx01 + 1], data[idx01 + 2]);
+                glm::vec3 color11(data[idx11], data[idx11 + 1], data[idx11 + 2]);
+                
+                glm::vec3 color0 = glm::mix(color00, color10, fx);
+                glm::vec3 color1 = glm::mix(color01, color11, fx);
+                glm::vec3 finalColor = glm::mix(color0, color1, fy);
+                
+                faceData[y * cubemapSize + x] = finalColor;
+            }
+        }
+        
+        glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, 0, 0,
+                       cubemapSize, cubemapSize, GL_RGB, GL_FLOAT, faceData.data());
+        
+        std::cout << "  Face " << face << "/6 converted" << std::endl;
+    }
+    
+    stbi_image_free(data);
+    
+    std::cout << "HDR converted to cubemap successfully!" << std::endl;
+    return cubemap;
+}
+
 int main() {
     // Initialize GLFW
     glfwInit();
@@ -322,6 +606,7 @@ int main() {
     Shader depthShader("shaders/depth.vert", "shaders/depth.frag");
     Shader shadowShader("shaders/shadow.vert", "shaders/shadow.frag");
     Shader debugDepthShader("shaders/debug_depth.vert", "shaders/debug_depth.frag");
+    Shader skyboxShader("shaders/skybox.vert", "shaders/skybox.frag");
 
     unsigned int depthMapFBO;
     glGenFramebuffers(1, &depthMapFBO);
@@ -366,10 +651,13 @@ int main() {
     unsigned int cubeVAO = loadCubeVAO();
     unsigned int planeVAO = loadPlaneVAO();
     unsigned int quadVAO = loadQuadVAO();
+    unsigned int skyboxVAO = loadSkyboxVAO();
+    unsigned int skyboxTexture = createGradientSkyboxTexture();
 
     shadowShader.use();
     shadowShader.setInt("shadowMap", 0);
     shadowShader.setInt("shadowMap2", 1);
+    shadowShader.setInt("skybox", 2);
     
     // Set default light attenuation values
     shadowShader.setFloat("constant", lightConstant);
@@ -379,12 +667,44 @@ int main() {
     debugDepthShader.use();
     debugDepthShader.setInt("depthMap", 0);
 
+    skyboxShader.use();
+    skyboxShader.setInt("skybox", 0);
+
     while (!glfwWindowShouldClose(window)) {
         float currentFrame = glfwGetTime();
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
 
         processInput(window);
+
+        // Reload skybox if needed
+        if (skyboxNeedsReload) {
+            glDeleteTextures(1, &skyboxTexture);
+            
+            if (skyboxMode == 0) {
+                // Procedural gradient
+                skyboxTexture = createGradientSkyboxTexture();
+            } else if (skyboxMode == 1) {
+                // Load cubemap from files
+                std::string path = std::string(skyboxPath);
+                if (path.back() != '/' && path.back() != '\\') path += "/";
+                
+                std::vector<std::string> faces = {
+                    path + "right.jpg",
+                    path + "left.jpg",
+                    path + "top.jpg",
+                    path + "bottom.jpg",
+                    path + "front.jpg",
+                    path + "back.jpg"
+                };
+                skyboxTexture = loadCubemapFromFiles(faces);
+            } else if (skyboxMode == 2) {
+                // Load HDR
+                skyboxTexture = loadHDREnvironment(skyboxPath);
+            }
+            
+            skyboxNeedsReload = false;
+        }
 
         // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
@@ -559,6 +879,41 @@ int main() {
                 if (showShadowMapOverlay) {
                     ImGui::SliderFloat("Overlay Size", &overlaySize, 0.1f, 0.5f);
                 }
+                ImGui::Separator();
+                ImGui::Text("Skybox");
+                ImGui::Checkbox("Enable Skybox", &enableSkybox);
+                if (enableSkybox) {
+                    ImGui::ColorEdit3("Skybox Tint", &skyboxTint.x);
+                    ImGui::Separator();
+                    
+                    ImGui::Text("Skybox Source");
+                    const char* skyboxModes[] = { "Procedural Gradient", "Load Cubemap", "Load HDR" };
+                    if (ImGui::Combo("Skybox Mode", &skyboxMode, skyboxModes, 3)) {
+                        skyboxNeedsReload = true;
+                    }
+                    
+                    if (skyboxMode == 1) {
+                        ImGui::Text("Place 6 images named:");
+                        ImGui::BulletText("right.jpg, left.jpg, top.jpg");
+                        ImGui::BulletText("bottom.jpg, front.jpg, back.jpg");
+                        ImGui::InputText("Folder Path", skyboxPath, 256);
+                        if (ImGui::Button("Load Cubemap")) {
+                            skyboxNeedsReload = true;
+                        }
+                    } else if (skyboxMode == 2) {
+                        ImGui::InputText("HDR File", skyboxPath, 256);
+                        if (ImGui::Button("Load HDR")) {
+                            skyboxNeedsReload = true;
+                        }
+                    }
+                    
+                    ImGui::Separator();
+                    ImGui::Text("Skybox Lighting");
+                    ImGui::Checkbox("Enable Skybox Lighting", &enableSkyboxLighting);
+                    if (enableSkyboxLighting) {
+                        ImGui::SliderFloat("Sky Light Intensity", &skyboxLightIntensity, 0.0f, 1.0f);
+                    }
+                }
             }
             
             ImGui::Separator();
@@ -725,16 +1080,22 @@ int main() {
         shadowShader.setVec3("light2Color", light2Color);
         shadowShader.setFloat("light2Intensity", light2Intensity);
         
+        // Skybox lighting properties
+        shadowShader.setBool("enableSkyboxLighting", enableSkyboxLighting);
+        shadowShader.setFloat("skyboxLightIntensity", skyboxLightIntensity);
+        
         // Floor
         model = glm::mat4(1.0f);
         shadowShader.setMat4("model", model);
         shadowShader.setVec3("objectColor", floorColor);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, depthMap);
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, depthMap2);
-        glBindVertexArray(planeVAO);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, depthMap);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, depthMap2);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, skyboxTexture);
+    glBindVertexArray(planeVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
 
         // Cube
         model = glm::mat4(1.0f);
@@ -745,8 +1106,14 @@ int main() {
         model = glm::scale(model, cubeScale);
         shadowShader.setMat4("model", model);
         shadowShader.setVec3("objectColor", cubeColor);
-        glBindVertexArray(cubeVAO);
-        glDrawArrays(GL_TRIANGLES, 0, 36);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, depthMap);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, depthMap2);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, skyboxTexture);
+    glBindVertexArray(cubeVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 36);
 
         // Second Cube
         if (showSecondCube) {
@@ -758,6 +1125,12 @@ int main() {
             model = glm::scale(model, cube2Scale);
             shadowShader.setMat4("model", model);
             shadowShader.setVec3("objectColor", cube2Color);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, depthMap);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, depthMap2);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, skyboxTexture);
             glDrawArrays(GL_TRIANGLES, 0, 36);
         }
 
@@ -803,6 +1176,29 @@ int main() {
             // Restore viewport and depth test
             glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
             glEnable(GL_DEPTH_TEST);
+        }
+
+        // Render skybox (last, with depth function LEQUAL)
+        if (enableSkybox && renderMode == 0) {
+            glDepthFunc(GL_LEQUAL);
+            skyboxShader.use();
+            glm::mat4 view = glm::mat4(glm::mat3(camera.GetViewMatrix())); // Remove translation
+            glm::mat4 projection;
+            if (projectionType == 0) {
+                projection = glm::perspective(glm::radians(cameraFOV), (float)SCR_WIDTH / (float)SCR_HEIGHT, cameraNear, cameraFar);
+            } else {
+                float aspect = (float)SCR_WIDTH / (float)SCR_HEIGHT;
+                projection = glm::ortho(-orthoSize * aspect, orthoSize * aspect, -orthoSize, orthoSize, cameraNear, cameraFar);
+            }
+            skyboxShader.setMat4("view", view);
+            skyboxShader.setMat4("projection", projection);
+            skyboxShader.setVec3("skyboxTint", skyboxTint);
+            glBindVertexArray(skyboxVAO);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, skyboxTexture);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+            glBindVertexArray(0);
+            glDepthFunc(GL_LESS);
         }
 
         // Render ImGui
