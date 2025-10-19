@@ -14,6 +14,11 @@ uniform sampler2D shadowMap;
 uniform sampler2D shadowMap2;
 uniform samplerCube skybox;
 
+// IBL textures
+uniform samplerCube irradianceMap;
+uniform samplerCube prefilterMap;
+uniform sampler2D brdfLUT;
+
 // Material textures
 struct MaterialMaps {
     sampler2D albedoMap;
@@ -60,6 +65,10 @@ uniform bool usePBR;
 uniform float metallic;
 uniform float roughness;
 uniform float ao;
+
+// IBL properties
+uniform bool enableIBL;
+uniform float iblIntensity;
 
 // Shadow parameters
 uniform float shadowBias;
@@ -135,6 +144,11 @@ float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
 vec3 fresnelSchlick(float cosTheta, vec3 F0)
 {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
+{
+    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
 void main()
@@ -235,12 +249,36 @@ void main()
         }
         
         // Ambient lighting
-        vec3 ambient = vec3(0.03) * albedo * aoValue;
+        vec3 ambient = vec3(0.0);
         
-        // Skybox ambient
-        if (enableSkyboxLighting) {
-            vec3 skyColor = texture(skybox, normal).rgb;
-            ambient += skyColor * skyboxLightIntensity * albedo * aoValue;
+        if (enableIBL) {
+            // IBL ambient
+            vec3 F = fresnelSchlickRoughness(max(dot(normal, viewDir), 0.0), F0, roughnessValue);
+            
+            vec3 kS = F;
+            vec3 kD = 1.0 - kS;
+            kD *= 1.0 - metallicValue;
+            
+            vec3 irradiance = texture(irradianceMap, normal).rgb;
+            vec3 diffuse = irradiance * albedo;
+            
+            // Sample prefilter map at correct mip level based on roughness
+            vec3 R = reflect(-viewDir, normal);
+            const float MAX_REFLECTION_LOD = 4.0;
+            vec3 prefilteredColor = textureLod(prefilterMap, R, roughnessValue * MAX_REFLECTION_LOD).rgb;
+            vec2 brdf = texture(brdfLUT, vec2(max(dot(normal, viewDir), 0.0), roughnessValue)).rg;
+            vec3 specular = prefilteredColor * (F * brdf.x + brdf.y);
+            
+            ambient = (kD * diffuse + specular) * aoValue * iblIntensity;
+        } else {
+            // Fallback simple ambient
+            ambient = vec3(0.03) * albedo * aoValue;
+            
+            // Skybox ambient (fallback)
+            if (enableSkyboxLighting) {
+                vec3 skyColor = texture(skybox, normal).rgb;
+                ambient += skyColor * skyboxLightIntensity * albedo * aoValue;
+            }
         }
         
         ambient *= aoFactor;
