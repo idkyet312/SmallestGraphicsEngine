@@ -61,37 +61,44 @@ struct Mesh {
         setupMesh();
     }
 
-    void Draw(Shader& shader, unsigned int textureOffset = 3) {
+    void Draw(Shader& shader) {
         // Set material properties
         shader.setVec3("objectColor", material.albedoColor);
         shader.setFloat("metallic", material.metallicValue);
         shader.setFloat("roughness", material.roughnessValue);
         
-        // Bind textures
+        // Bind textures (start from a higher texture unit to avoid conflicts with IBL/shadow maps)
+        unsigned int textureUnit = 6; 
+        
         if (material.hasAlbedo) {
-            glActiveTexture(GL_TEXTURE0 + textureOffset);
+            glActiveTexture(GL_TEXTURE0 + textureUnit);
             glBindTexture(GL_TEXTURE_2D, material.albedoMap);
-            shader.setInt("material.albedoMap", textureOffset);
+            shader.setInt("material.albedoMap", textureUnit);
+            textureUnit++;
         }
         if (material.hasNormal) {
-            glActiveTexture(GL_TEXTURE0 + textureOffset + 1);
+            glActiveTexture(GL_TEXTURE0 + textureUnit);
             glBindTexture(GL_TEXTURE_2D, material.normalMap);
-            shader.setInt("material.normalMap", textureOffset + 1);
+            shader.setInt("material.normalMap", textureUnit);
+            textureUnit++;
         }
         if (material.hasMetallic) {
-            glActiveTexture(GL_TEXTURE0 + textureOffset + 2);
+            glActiveTexture(GL_TEXTURE0 + textureUnit);
             glBindTexture(GL_TEXTURE_2D, material.metallicMap);
-            shader.setInt("material.metallicMap", textureOffset + 2);
+            shader.setInt("material.metallicMap", textureUnit);
+            textureUnit++;
         }
         if (material.hasRoughness) {
-            glActiveTexture(GL_TEXTURE0 + textureOffset + 3);
+            glActiveTexture(GL_TEXTURE0 + textureUnit);
             glBindTexture(GL_TEXTURE_2D, material.roughnessMap);
-            shader.setInt("material.roughnessMap", textureOffset + 3);
+            shader.setInt("material.roughnessMap", textureUnit);
+            textureUnit++;
         }
         if (material.hasAO) {
-            glActiveTexture(GL_TEXTURE0 + textureOffset + 4);
+            glActiveTexture(GL_TEXTURE0 + textureUnit);
             glBindTexture(GL_TEXTURE_2D, material.aoMap);
-            shader.setInt("material.aoMap", textureOffset + 4);
+            shader.setInt("material.aoMap", textureUnit);
+            textureUnit++;
         }
         
         shader.setBool("material.hasAlbedoMap", material.hasAlbedo);
@@ -101,7 +108,7 @@ struct Mesh {
         shader.setBool("material.hasAOMap", material.hasAO);
         
         glBindVertexArray(VAO);
-        glDrawElements(GL_TRIANGLES, indices.size(), GL_UNSIGNED_INT, 0);
+        glDrawElements(GL_TRIANGLES, (GLsizei)indices.size(), GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
         glActiveTexture(GL_TEXTURE0);
     }
@@ -109,7 +116,7 @@ struct Mesh {
     // Simple draw for shadow passes (no materials)
     void DrawSimple() {
         glBindVertexArray(VAO);
-        glDrawElements(GL_TRIANGLES, indices.size(), GL_UNSIGNED_INT, 0);
+        glDrawElements(GL_TRIANGLES, (GLsizei)indices.size(), GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
     }
 
@@ -198,7 +205,7 @@ public:
     void Draw(Shader& shader) {
         if (!loaded) return;
         for (unsigned int i = 0; i < meshes.size(); i++) {
-            meshes[i].Draw(shader, 3);
+            meshes[i].Draw(shader);
         }
     }
     

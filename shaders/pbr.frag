@@ -181,11 +181,12 @@ void main()
     
     vec3 Lo = vec3(0.0);
     
+    // Calculate reflectance at normal incidence (for PBR)
+    vec3 F0 = vec3(0.04); 
+    F0 = mix(F0, albedo, metallicValue);
+    
     if (usePBR) {
         // PBR Workflow
-        // Calculate reflectance at normal incidence
-        vec3 F0 = vec3(0.04); 
-        F0 = mix(F0, albedo, metallicValue);
         
         // === FIRST LIGHT (PBR) ===
         vec3 L = normalize(lightPos - fs_in.FragPos);
