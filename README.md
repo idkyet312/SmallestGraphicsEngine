@@ -13,20 +13,26 @@ A minimal 3D graphics engine demonstrating shadow mapping with OpenGL, written i
 
 ## Project Structure
 ```
-GraphicEngine/
-├── src/
+SmallestGraphicsEngine/
+├── src/                   # Source code directory
 │   ├── main.cpp           # Main application loop with ImGui
 │   ├── Shader.h           # Shader compilation and uniform helpers
 │   └── Camera.h           # Camera movement and view matrix
-├── shaders/
+├── shaders/               # GLSL shader files
 │   ├── depth.vert         # Depth pass vertex shader
 │   ├── depth.frag         # Depth pass fragment shader
 │   ├── shadow.vert        # Scene vertex shader with shadow coords
-│   └── shadow.frag        # Scene fragment shader with shadow mapping
+│   ├── shadow.frag        # Scene fragment shader with shadow mapping
+│   ├── debug_depth.vert   # Debug depth visualization vertex shader
+│   └── debug_depth.frag   # Debug depth visualization fragment shader
+├── build/                 # Build output directory (auto-generated, ignored)
 ├── CMakeLists.txt         # CMake build configuration
+├── build.ps1              # Build script
 ├── build_and_run.ps1      # Full build and run script
 ├── quick_build.ps1        # Fast rebuild for code changes
-└── README.md
+├── .gitignore             # Git ignore rules
+├── TUTORIAL.md            # Tutorial documentation
+└── README.md              # This file
 ```
 
 ## Controls
