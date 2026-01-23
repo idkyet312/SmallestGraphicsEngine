@@ -150,6 +150,20 @@ void processInput(GLFWwindow *window) {
         cPressed = false;
     }
     
+    // Toggle FPS walking mode with F key
+    static bool fPressed = false;
+    if (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS && !fPressed) {
+        camera.FPSMode = !camera.FPSMode;
+        if (camera.FPSMode) {
+            // Snap camera to floor height when entering FPS mode
+            camera.Position.y = camera.FloorY + camera.PlayerHeight;
+        }
+        fPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_F) == GLFW_RELEASE) {
+        fPressed = false;
+    }
+    
     if (!cameraLocked && (!showUI || !ImGui::GetIO().WantCaptureKeyboard)) {
         if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
             camera.ProcessKeyboard('W', deltaTime);
@@ -159,6 +173,16 @@ void processInput(GLFWwindow *window) {
             camera.ProcessKeyboard('A', deltaTime);
         if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
             camera.ProcessKeyboard('D', deltaTime);
+        
+        // Jump with Space bar
+        static bool spacePressed = false;
+        if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS && !spacePressed) {
+            camera.Jump();
+            spacePressed = true;
+        }
+        if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_RELEASE) {
+            spacePressed = false;
+        }
     }
 }
 
@@ -358,6 +382,9 @@ int main() {
         lastFrame = currentFrame;
 
         processInput(window);
+        
+        // Update camera physics (gravity, ground collision) every frame
+        camera.Update(deltaTime);
 
         // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
@@ -371,6 +398,7 @@ int main() {
             ImGui::Text("Controls:");
             ImGui::BulletText("TAB: Toggle UI");
             ImGui::BulletText("C: Lock/Unlock Camera");
+            ImGui::BulletText("F: Toggle FPS Walking Mode");
             
             // Camera lock status button
             if (cameraLocked) {
@@ -396,6 +424,21 @@ int main() {
                 ImGui::DragFloat("Far Plane", &cameraFar, 1.0f, 10.0f, 500.0f);
                 ImGui::DragFloat("Movement Speed", &camera.MovementSpeed, 0.1f, 0.1f, 50.0f);
                 ImGui::DragFloat("Mouse Sensitivity", &camera.MouseSensitivity, 0.001f, 0.001f, 1.0f);
+                ImGui::Separator();
+                ImGui::Text("Camera Mode");
+                if (ImGui::Checkbox("FPS Walking Mode", &camera.FPSMode)) {
+                    if (camera.FPSMode) {
+                        // When entering FPS mode, snap camera to floor height
+                        camera.Position.y = camera.FloorY + camera.PlayerHeight;
+                    }
+                }
+                if (camera.FPSMode) {
+                    ImGui::DragFloat("Player Height", &camera.PlayerHeight, 0.05f, 0.5f, 3.0f);
+                    ImGui::DragFloat("Floor Y", &camera.FloorY, 0.1f, -10.0f, 10.0f);
+                    ImGui::Text("Movement: WASD (locked to floor)");
+                } else {
+                    ImGui::Text("Movement: WASD (free fly)");
+                }
                 ImGui::Separator();
                 ImGui::Text("Camera Projection");
                 const char* projTypes[] = { "Perspective", "Orthographic" };
