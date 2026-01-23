@@ -61,3 +61,12 @@ add_custom_command(TARGET GraphicEngine POST_BUILD
     $<TARGET_FILE_DIR:GraphicEngine>/shaders
     COMMENT "Copying shaders to build directory"
 )
+
+# Copy models to build directory
+add_custom_command(TARGET GraphicEngine POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/models
+    $<TARGET_FILE_DIR:GraphicEngine>/models
+    COMMENT "Copying models to build directory"
+)
+

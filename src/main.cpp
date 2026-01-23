@@ -7,8 +7,11 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 #include <iostream>
+#include <algorithm>
+#include <vector>
 #include "Shader.h"
 #include "Camera.h"
+#include "Model.h"
 
 // Settings
 unsigned int SCR_WIDTH = 1280;
@@ -80,6 +83,23 @@ float lightLinear = 0.09f;
 float lightQuadratic = 0.032f;
 glm::vec3 lightColor(1.0f, 1.0f, 1.0f);
 
+// Viewmodel (gun attached to camera)
+Model gunModel;
+
+// Projectile system
+struct Projectile {
+    glm::vec3 position;
+    glm::vec3 direction;
+    float speed;
+    float lifetime;
+    bool active;
+};
+std::vector<Projectile> projectiles;
+float projectileSpeed = 50.0f;
+float projectileLifetime = 3.0f;
+glm::vec3 projectileColor(1.0f, 0.8f, 0.0f);
+float projectileScale = 0.1f;
+
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
 }
@@ -107,14 +127,25 @@ void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
     if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
         if (!ImGui::GetIO().WantCaptureMouse) {
-            // Lock cursor to window
-            cameraLocked = false;
-            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-            // Reset cursor position to center
-            glfwSetCursorPos(window, SCR_WIDTH / 2.0, SCR_HEIGHT / 2.0);
-            lastX = SCR_WIDTH / 2.0f;
-            lastY = SCR_HEIGHT / 2.0f;
-            firstMouse = true;
+            if (cameraLocked) {
+                // Lock cursor to window
+                cameraLocked = false;
+                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                // Reset cursor position to center
+                glfwSetCursorPos(window, SCR_WIDTH / 2.0, SCR_HEIGHT / 2.0);
+                lastX = SCR_WIDTH / 2.0f;
+                lastY = SCR_HEIGHT / 2.0f;
+                firstMouse = true;
+            } else {
+                // Shoot a projectile
+                Projectile proj;
+                proj.position = camera.Position + camera.Front * 0.5f; // Start slightly in front of camera
+                proj.direction = glm::normalize(camera.Front);
+                proj.speed = projectileSpeed;
+                proj.lifetime = projectileLifetime;
+                proj.active = true;
+                projectiles.push_back(proj);
+            }
         }
     }
 }
@@ -364,6 +395,13 @@ int main() {
     unsigned int cubeVAO = loadCubeVAO();
     unsigned int planeVAO = loadPlaneVAO();
     unsigned int quadVAO = loadQuadVAO();
+    
+    // Load gun model
+    gunModel.loadOBJ("models/gun.obj");
+    gunModel.offset = glm::vec3(0.170f, -0.140f, 0.490f);
+    gunModel.scale = glm::vec3(0.5f);
+    gunModel.rotation = glm::vec3(0.0f, 180.0f, 0.0f);
+    gunModel.color = glm::vec3(0.2f, 0.2f, 0.25f);
 
     shadowShader.use();
     shadowShader.setInt("shadowMap", 0);
@@ -386,6 +424,22 @@ int main() {
         // Update camera physics (gravity, ground collision) every frame
         camera.Update(deltaTime);
 
+        // Update projectiles
+        for (auto& proj : projectiles) {
+            if (proj.active) {
+                proj.position += proj.direction * proj.speed * deltaTime;
+                proj.lifetime -= deltaTime;
+                if (proj.lifetime <= 0.0f) {
+                    proj.active = false;
+                }
+            }
+        }
+        // Remove inactive projectiles
+        projectiles.erase(
+            std::remove_if(projectiles.begin(), projectiles.end(),
+                [](const Projectile& p) { return !p.active; }),
+            projectiles.end());
+
         // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
@@ -399,6 +453,7 @@ int main() {
             ImGui::BulletText("TAB: Toggle UI");
             ImGui::BulletText("C: Lock/Unlock Camera");
             ImGui::BulletText("F: Toggle FPS Walking Mode");
+            ImGui::BulletText("Left Click: Lock camera / Shoot");
             
             // Camera lock status button
             if (cameraLocked) {
@@ -568,6 +623,33 @@ int main() {
             }
             
             ImGui::Separator();
+            // Viewmodel (Gun) settings
+            if (ImGui::CollapsingHeader("Viewmodel (Gun)")) {
+                ImGui::Checkbox("Show Gun", &gunModel.visible);
+                ImGui::ColorEdit3("Gun Color", &gunModel.color[0]);
+                ImGui::DragFloat3("Gun Offset", &gunModel.offset[0], 0.01f, -2.0f, 2.0f);
+                ImGui::DragFloat3("Gun Scale", &gunModel.scale[0], 0.01f, 0.01f, 5.0f);
+                ImGui::DragFloat3("Gun Rotation", &gunModel.rotation[0], 1.0f, -180.0f, 180.0f);
+                
+                ImGui::Separator();
+                ImGui::Text("Projectile Settings");
+                ImGui::ColorEdit3("Projectile Color", &projectileColor[0]);
+                ImGui::DragFloat("Projectile Speed", &projectileSpeed, 1.0f, 1.0f, 200.0f);
+                ImGui::DragFloat("Projectile Lifetime", &projectileLifetime, 0.1f, 0.1f, 10.0f);
+                ImGui::DragFloat("Projectile Size", &projectileScale, 0.01f, 0.01f, 1.0f);
+                ImGui::Text("Active Projectiles: %d", (int)projectiles.size());
+                if (ImGui::Button("Clear Projectiles")) {
+                    projectiles.clear();
+                }
+                
+                ImGui::Separator();
+                static char modelPathBuffer[256] = "models/gun.obj";
+                ImGui::InputText("Model Path", modelPathBuffer, sizeof(modelPathBuffer));
+                if (ImGui::Button("Load Model")) {
+                    gunModel.loadOBJ(modelPathBuffer);
+                }
+            }
+
             if (ImGui::Button("Reload Shaders")) {
                 try {
                     depthShader = Shader("shaders/depth.vert", "shaders/depth.frag");
@@ -711,6 +793,28 @@ int main() {
             shadowShader.setMat4("model", model);
             shadowShader.setVec3("objectColor", cube2Color);
             glDrawArrays(GL_TRIANGLES, 0, 36);
+        }
+
+        // Render projectiles
+        for (const auto& proj : projectiles) {
+            if (proj.active) {
+                model = glm::mat4(1.0f);
+                model = glm::translate(model, proj.position);
+                model = glm::scale(model, glm::vec3(projectileScale));
+                shadowShader.setMat4("model", model);
+                shadowShader.setVec3("objectColor", projectileColor);
+                glBindVertexArray(cubeVAO);
+                glDrawArrays(GL_TRIANGLES, 0, 36);
+            }
+        }
+
+        // Render gun viewmodel (attached to camera)
+        if (gunModel.loaded && gunModel.visible) {
+            glClear(GL_DEPTH_BUFFER_BIT);  // Clear depth so gun renders on top
+            model = gunModel.getModelMatrix(camera.Position, camera.Front, camera.Up);
+            shadowShader.setMat4("model", model);
+            shadowShader.setVec3("objectColor", gunModel.color);
+            gunModel.draw();
         }
 
         // Debug depth visualization
