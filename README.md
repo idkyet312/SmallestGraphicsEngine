@@ -19,13 +19,16 @@ SmallestGraphicsEngine/
 ├── src/                          # Source code directory
 │   ├── main_dx12.cpp             # Main DX12 application with clustered rendering
 │   ├── main_dx11.cpp             # Legacy DX11 version
+│   ├── main.cpp                  # Entry point / shared main
 │   ├── DX12Core.h                # DirectX 12 initialization and device management
 │   ├── DX11Core.h                # DirectX 11 core (legacy)
 │   ├── CameraDX12.h              # FPS camera with mouse lock
 │   ├── ShaderDX12.h              # DX12 shader compilation and root signatures
 │   ├── ShaderDX11.h              # DX11 shader wrapper (legacy)
+│   ├── Shader.h                  # Shared shader utilities
 │   ├── ClusteredRendererDX12.h   # Clustered forward rendering implementation
 │   ├── ClusteredRendererDX11.h   # DX11 clustered renderer (legacy)
+│   ├── ClusteredRenderer.h       # Shared clustered renderer interface
 │   ├── DDGI_DX11.h               # Dynamic Diffuse Global Illumination
 │   ├── Model.h                   # OBJ model loader
 │   └── ModelDX11.h               # DX11 model renderer
@@ -41,6 +44,9 @@ SmallestGraphicsEngine/
 ├── models/                       # 3D model assets
 │   └── gun.obj                   # FPS gun model
 ├── build/                        # Build output directory
+├── GraphicEngine.sln             # Visual Studio solution file
+├── GraphicEngine.vcxproj         # Visual Studio project file
+├── GraphicEngine.vcxproj.filters # VS project filters (folder organization)
 ├── CMakeLists.txt                # CMake build configuration (DX11/DX12 option)
 ├── build.ps1                     # Build script
 ├── build_and_run.ps1             # Full build and run script
