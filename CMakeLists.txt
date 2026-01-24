@@ -2,49 +2,32 @@ cmake_minimum_required(VERSION 3.10)
 project(GraphicEngine)
 set(CMAKE_CXX_STANDARD 17)
 
-# Find OpenGL (standard on Windows)
-find_package(OpenGL REQUIRED)
-
-# Try to find packages (works with vcpkg or system installations)
-find_package(glfw3 CONFIG)
-find_package(glm CONFIG)
-find_package(glad CONFIG)
+# Find imgui package (for ImGui)
 find_package(imgui CONFIG)
 
-# If not found, provide helpful message
-if(NOT glfw3_FOUND OR NOT glm_FOUND OR NOT glad_FOUND OR NOT imgui_FOUND)
+# If imgui not found, provide helpful message
+if(NOT imgui_FOUND)
     message(STATUS "========================================")
-    message(STATUS "Some dependencies not found via find_package.")
+    message(STATUS "imgui not found via find_package.")
     message(STATUS "Install via vcpkg:")
-    message(STATUS "  vcpkg install glfw3 glm glad imgui[glfw-binding,opengl3-binding]")
+    message(STATUS "  vcpkg install imgui[win32-binding,dx11-binding]")
     message(STATUS "Then configure with:")
     message(STATUS "  cmake .. -DCMAKE_TOOLCHAIN_FILE=[vcpkg-root]/scripts/buildsystems/vcpkg.cmake")
     message(STATUS "========================================")
-    if(NOT glfw3_FOUND)
-        message(FATAL_ERROR "glfw3 not found")
-    endif()
-    if(NOT glm_FOUND)
-        message(FATAL_ERROR "glm not found")
-    endif()
-    if(NOT glad_FOUND)
-        message(FATAL_ERROR "glad not found")
-    endif()
-    if(NOT imgui_FOUND)
-        message(FATAL_ERROR "imgui not found")
-    endif()
+    message(FATAL_ERROR "imgui not found")
 endif()
 
 # Include directories
 include_directories(${CMAKE_SOURCE_DIR}/src)
 
-# Create executable
-add_executable(GraphicEngine src/main.cpp)
+# Create executable (WIN32 for Windows application without console by default, but we create console in code)
+add_executable(GraphicEngine WIN32 src/main_dx11.cpp)
 
-# Link libraries
+# Link libraries for DirectX 11
 target_link_libraries(GraphicEngine 
-    OpenGL::GL
-    glfw
-    glad::glad
+    d3d11
+    d3dcompiler
+    dxgi
     imgui::imgui
 )
 
@@ -62,11 +45,27 @@ add_custom_command(TARGET GraphicEngine POST_BUILD
     COMMENT "Copying shaders to build directory"
 )
 
+# Also copy to build/shaders for convenience
+add_custom_command(TARGET GraphicEngine POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/shaders
+    ${CMAKE_SOURCE_DIR}/build/shaders
+    COMMENT "Copying shaders to build root"
+)
+
 # Copy models to build directory
 add_custom_command(TARGET GraphicEngine POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
     ${CMAKE_SOURCE_DIR}/models
     $<TARGET_FILE_DIR:GraphicEngine>/models
     COMMENT "Copying models to build directory"
+)
+
+# Also copy to build/models for convenience
+add_custom_command(TARGET GraphicEngine POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/models
+    ${CMAKE_SOURCE_DIR}/build/models
+    COMMENT "Copying models to build root"
 )
 
