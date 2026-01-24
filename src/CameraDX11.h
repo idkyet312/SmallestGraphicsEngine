@@ -82,11 +82,11 @@ public:
                 Position.x -= frontXZ.x * velocity;
                 Position.z -= frontXZ.z * velocity;
             }
-            if (direction == 'A') {
+            if (direction == 'D') {
                 Position.x -= rightXZ.x * velocity;
                 Position.z -= rightXZ.z * velocity;
             }
-            if (direction == 'D') {
+            if (direction == 'A') {
                 Position.x += rightXZ.x * velocity;
                 Position.z += rightXZ.z * velocity;
             }
@@ -99,8 +99,8 @@ public:
             
             if (direction == 'W') pos = XMVectorAdd(pos, XMVectorScale(front, velocity));
             if (direction == 'S') pos = XMVectorSubtract(pos, XMVectorScale(front, velocity));
-            if (direction == 'A') pos = XMVectorSubtract(pos, XMVectorScale(right, velocity));
-            if (direction == 'D') pos = XMVectorAdd(pos, XMVectorScale(right, velocity));
+            if (direction == 'D') pos = XMVectorSubtract(pos, XMVectorScale(right, velocity));
+            if (direction == 'A') pos = XMVectorAdd(pos, XMVectorScale(right, velocity));
             
             XMStoreFloat3(&Position, pos);
         }
@@ -109,7 +109,7 @@ public:
     void ProcessMouseMovement(float xoffset, float yoffset) {
         xoffset *= MouseSensitivity;
         yoffset *= MouseSensitivity;
-        Yaw += xoffset;
+        Yaw -= xoffset;
         Pitch += yoffset;
         if (Pitch > 89.0f) Pitch = 89.0f;
         if (Pitch < -89.0f) Pitch = -89.0f;
