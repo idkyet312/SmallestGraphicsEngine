@@ -363,14 +363,15 @@ bool CreateShadowMap() {
     
     // Create SRV
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.Texture2D.MipLevels = 1;
-    g_dx12.device->CreateShaderResourceView(shadowMap.Get(), &srvDesc,
+    g_dx12.device->CreateShaderResourceView(shadowMap.Get(), &srvDesc, 
         shadowSrvHeap->GetCPUDescriptorHandleForHeapStart());
+        
+    std::cout << "Shadow map created successfully" << std::endl;
     
-    std::cout << "Shadow map created: " << SHADOW_WIDTH << "x" << SHADOW_HEIGHT << std::endl;
     return true;
 }
 
@@ -1054,6 +1055,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         useDDGI = false;
     } else {
         std::cout << "DDGI initialized (DX12)" << std::endl;
+        // Register shadow map with DDGI now that srvHeap exists
+        if (enableShadows && shadowMap) {
+            ddgiRenderer.RegisterShadowMap(shadowMap.Get());
+        }
     }
     
     // Initialize clustered renderer and demo lights
@@ -1149,49 +1154,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             break;
         }
         
-        // Update DDGI Probes (Simulated GI)
-        if (useDDGI) {
-            float totalR = 0.0f, totalG = 0.0f, totalB = 0.0f;
-            float totalIntensity = 0.0f;
-            
-            // Add main directional light proxy
-            totalR += lightColor.x * 0.5f;
-            totalG += lightColor.y * 0.5f;
-            totalB += lightColor.z * 0.5f;
-            totalIntensity += 0.5f;
+        // Update DDGI Probes
+        // Logic moved to after shadow pass (Compute Shader)
 
-            // Calculate average light color from active lights
-            for (int i = 0; i < clusteredRenderer.getTotalLightCount(); i++) {
-                PointLightDX12* light = clusteredRenderer.getLight(i);
-                if (light && light->active) {
-                    float intensity = light->intensity;
-                    // Cap intensity contribution to avoid explosion
-                    intensity = std::min(intensity, 2.0f);
-                    
-                    totalR += light->color.x * intensity;
-                    totalG += light->color.y * intensity;
-                    totalB += light->color.z * intensity;
-                    totalIntensity += intensity;
-                }
-            }
-            
-            XMFLOAT3 ambientColor = XMFLOAT3(0.0f, 0.0f, 0.0f);
-            if (totalIntensity > 0.0f) {
-                // Normalize and apply GI intensity
-                float factor = giIntensity * 0.2f;
-                // Average color weighted
-                ambientColor.x = (totalR / totalIntensity) * factor * (1.0f + totalIntensity * 0.05f);
-                ambientColor.y = (totalG / totalIntensity) * factor * (1.0f + totalIntensity * 0.05f);
-                ambientColor.z = (totalB / totalIntensity) * factor * (1.0f + totalIntensity * 0.05f);
-                
-                // Add base ambient
-                ambientColor.x += 0.02f * giIntensity;
-                ambientColor.y += 0.02f * giIntensity;
-                ambientColor.z += 0.03f * giIntensity;
-            }
-            
-            ddgiRenderer.UpdateProbes(g_dx12.commandList.Get(), ambientColor);
-        }
         
 
         // Clear
@@ -1303,6 +1268,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize, g_dx12.frameIndex);
             D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
             g_dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+        }
+
+        // --- DDGI Update (Compute) ---
+        if (useDDGI && ddgiRenderer.computeInitialized) {
+             std::vector<PointLightDataDX12> lightData = clusteredRenderer.getPointLightData();
+             mainShader.SetPointLights((int)lightData.size(), lightData);
+             mainShader.SetDDGI(useDDGI, giIntensity, normalBias, probeSpacing);
+             
+             // Prepare Main Light Data
+             DDGIMainLightData mainLightData = {};
+             mainLightData.lightPos = lightPos;
+             mainLightData.lightType = lightType;
+             mainLightData.lightColor = lightColor;
+             mainLightData.intensity = 1.0f; // Assuming lightColor carries intensity or multiply if needed
+             mainLightData.lightSpaceMatrix = lightSpaceMatrix;
+             mainLightData.shadowBias = shadowBias;
+             mainLightData.enableShadows = enableShadows ? 1 : 0;
+             
+             ddgiRenderer.UpdateProbes(
+                 g_dx12.commandList.Get(), 
+                 mainShader.pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex),
+                 (int)lightData.size(),
+                 mainShader.ddgiBuffer.GetGPUAddress(g_dx12.frameIndex),
+                 mainLightData
+             );
         }
         
         // Use shader
