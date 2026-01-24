@@ -118,10 +118,18 @@ bool animateDemoLights = true;
 
 // DX12 resources
 ShaderDX12 mainShader;
+ShaderDX12 depthShader;  // For shadow map rendering
 ComPtr<ID3D12Resource> cubeVertexBuffer;
 ComPtr<ID3D12Resource> planeVertexBuffer;
 D3D12_VERTEX_BUFFER_VIEW cubeVBV = {};
 D3D12_VERTEX_BUFFER_VIEW planeVBV = {};
+
+// Shadow map resources
+const UINT SHADOW_WIDTH = 2048;
+const UINT SHADOW_HEIGHT = 2048;
+ComPtr<ID3D12Resource> shadowMap;
+ComPtr<ID3D12DescriptorHeap> shadowDsvHeap;
+ComPtr<ID3D12DescriptorHeap> shadowSrvHeap;
 
 // Vertex structure
 struct Vertex {
@@ -273,6 +281,75 @@ void DrawPlane() {
     g_dx12.commandList->IASetVertexBuffers(0, 1, &planeVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_dx12.commandList->DrawInstanced(6, 1, 0, 0);
+}
+
+bool CreateShadowMap() {
+    // Create shadow map depth texture
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+    
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = SHADOW_WIDTH;
+    texDesc.Height = SHADOW_HEIGHT;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R32_TYPELESS;  // Typeless for both DSV and SRV
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    
+    D3D12_CLEAR_VALUE clearValue = {};
+    clearValue.Format = DXGI_FORMAT_D32_FLOAT;
+    clearValue.DepthStencil.Depth = 1.0f;
+    
+    HRESULT hr = g_dx12.device->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &texDesc,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clearValue,
+        IID_PPV_ARGS(&shadowMap));
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create shadow map texture" << std::endl;
+        return false;
+    }
+    
+    // Create DSV heap for shadow map
+    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
+    dsvHeapDesc.NumDescriptors = 1;
+    dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    hr = g_dx12.device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&shadowDsvHeap));
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create shadow DSV heap" << std::endl;
+        return false;
+    }
+    
+    // Create DSV
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+    dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
+    dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    g_dx12.device->CreateDepthStencilView(shadowMap.Get(), &dsvDesc, 
+        shadowDsvHeap->GetCPUDescriptorHandleForHeapStart());
+    
+    // Create SRV heap for shadow map (shader visible)
+    D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
+    srvHeapDesc.NumDescriptors = 1;
+    srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = g_dx12.device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&shadowSrvHeap));
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create shadow SRV heap" << std::endl;
+        return false;
+    }
+    
+    // Create SRV
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MipLevels = 1;
+    g_dx12.device->CreateShaderResourceView(shadowMap.Get(), &srvDesc,
+        shadowSrvHeap->GetCPUDescriptorHandleForHeapStart());
+    
+    std::cout << "Shadow map created: " << SHADOW_WIDTH << "x" << SHADOW_HEIGHT << std::endl;
+    return true;
 }
 
 void ToggleFullscreen(HWND hwnd) {
@@ -509,6 +586,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
     std::cout << "Clustered Forward shaders loaded successfully" << std::endl;
     
+    // Load depth shader for shadow mapping
+    if (!depthShader.Load("shaders/depth_vs.hlsl", "shaders/depth_ps.hlsl")) {
+        std::cerr << "Failed to load depth shader - shadows will be disabled" << std::endl;
+        enableShadows = false;
+    } else {
+        std::cout << "Depth shader loaded successfully" << std::endl;
+    }
+    
+    // Create shadow map
+    if (enableShadows && !CreateShadowMap()) {
+        std::cerr << "Failed to create shadow map - shadows will be disabled" << std::endl;
+        enableShadows = false;
+    }
+    
     // Initialize clustered renderer and demo lights
     clusteredRenderer.init();
     for (int i = 0; i < numDemoLights; i++) {
@@ -608,6 +699,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         
         // Reset shader draw call counter at start of each frame
         mainShader.BeginFrame();
+        depthShader.BeginFrame();
         
         // Setup matrices
         XMMATRIX view = camera.GetViewMatrix();
@@ -615,10 +707,100 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             XMConvertToRadians(cameraFOV),
             (float)SCR_WIDTH / (float)SCR_HEIGHT,
             cameraNear, cameraFar);
-        XMMATRIX lightSpaceMatrix = XMMatrixIdentity(); // TODO: Shadow mapping
+        
+        // Calculate light space matrix for shadows
+        XMVECTOR lightPosVec = XMLoadFloat3(&lightPos);
+        XMVECTOR lightTargetVec = XMLoadFloat3(&lightTarget);
+        XMVECTOR lightUpVec = XMLoadFloat3(&lightUp);
+        XMMATRIX lightView = XMMatrixLookAtLH(lightPosVec, lightTargetVec, lightUpVec);
+        XMMATRIX lightProj = XMMatrixOrthographicLH(lightOrthoSize * 2.0f, lightOrthoSize * 2.0f, lightNear, lightFar);
+        XMMATRIX lightSpaceMatrix = lightView * lightProj;
+        
+        // =====================
+        // Shadow Pass
+        // =====================
+        if (enableShadows && shadowMap) {
+            // Transition shadow map to depth write
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = shadowMap.Get();
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            g_dx12.commandList->ResourceBarrier(1, &barrier);
+            
+            // Set shadow map viewport
+            D3D12_VIEWPORT shadowViewport = {};
+            shadowViewport.Width = (float)SHADOW_WIDTH;
+            shadowViewport.Height = (float)SHADOW_HEIGHT;
+            shadowViewport.MinDepth = 0.0f;
+            shadowViewport.MaxDepth = 1.0f;
+            g_dx12.commandList->RSSetViewports(1, &shadowViewport);
+            
+            D3D12_RECT shadowScissor = { 0, 0, (LONG)SHADOW_WIDTH, (LONG)SHADOW_HEIGHT };
+            g_dx12.commandList->RSSetScissorRects(1, &shadowScissor);
+            
+            // Clear and set shadow map as render target (depth only)
+            D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv = shadowDsvHeap->GetCPUDescriptorHandleForHeapStart();
+            g_dx12.commandList->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            g_dx12.commandList->OMSetRenderTargets(0, nullptr, FALSE, &shadowDsv);
+            
+            // Use depth shader
+            depthShader.Use(false);
+            
+            // Render floor shadow
+            XMMATRIX model = XMMatrixIdentity();
+            depthShader.SetMatrices(model, XMMatrixIdentity(), XMMatrixIdentity(), lightSpaceMatrix);
+            DrawPlane();
+            depthShader.NextDrawCall();
+            
+            // Render cube 1 shadow
+            model = XMMatrixScaling(cubeScale.x, cubeScale.y, cubeScale.z);
+            model = model * XMMatrixRotationX(XMConvertToRadians(cubeRotation.x));
+            model = model * XMMatrixRotationY(XMConvertToRadians(cubeRotation.y));
+            model = model * XMMatrixRotationZ(XMConvertToRadians(cubeRotation.z));
+            model = model * XMMatrixTranslation(cubePosition.x, cubePosition.y, cubePosition.z);
+            depthShader.SetMatrices(model, XMMatrixIdentity(), XMMatrixIdentity(), lightSpaceMatrix);
+            DrawCube();
+            depthShader.NextDrawCall();
+            
+            // Render cube 2 shadow
+            if (showSecondCube) {
+                model = XMMatrixScaling(cube2Scale.x, cube2Scale.y, cube2Scale.z);
+                model = model * XMMatrixRotationX(XMConvertToRadians(cube2Rotation.x));
+                model = model * XMMatrixRotationY(XMConvertToRadians(cube2Rotation.y));
+                model = model * XMMatrixRotationZ(XMConvertToRadians(cube2Rotation.z));
+                model = model * XMMatrixTranslation(cube2Position.x, cube2Position.y, cube2Position.z);
+                depthShader.SetMatrices(model, XMMatrixIdentity(), XMMatrixIdentity(), lightSpaceMatrix);
+                DrawCube();
+                depthShader.NextDrawCall();
+            }
+            
+            // Transition shadow map to shader resource
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            g_dx12.commandList->ResourceBarrier(1, &barrier);
+            
+            // Restore main viewport
+            g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
+            g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+            
+            // Restore render target
+            D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = GetCPUDescriptorHandle(
+                g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize, g_dx12.frameIndex);
+            D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            g_dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+        }
         
         // Use shader
         mainShader.Use(wireframeMode);
+        
+        // Bind shadow map SRV if shadows are enabled
+        if (enableShadows && shadowSrvHeap) {
+            ID3D12DescriptorHeap* heaps[] = { shadowSrvHeap.Get() };
+            g_dx12.commandList->SetDescriptorHeaps(1, heaps);
+            g_dx12.commandList->SetGraphicsRootDescriptorTable(6, shadowSrvHeap->GetGPUDescriptorHandleForHeapStart());
+        }
         
         // Set common uniforms
         mainShader.SetLight(lightPos, lightType, lightColor, lightConstant, lightLinear, lightQuadratic,

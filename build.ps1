@@ -140,3 +140,5 @@ try {
     Pop-Location
 }
 
+& ".\build\GraphicEngine.exe"
+
