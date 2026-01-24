@@ -32,7 +32,7 @@ class ClusteredRendererDX12 {
 public:
     static const int CLUSTER_X = 16;
     static const int CLUSTER_Y = 9;
-    static const int CLUSTER_Z = 24;
+    static const int CLUSTER_Z = 10;
     static const int MAX_LIGHTS_PER_CLUSTER = 32;
     static const int MAX_LIGHTS = 128;
     

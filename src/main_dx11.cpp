@@ -17,7 +17,7 @@
 #include "DX11Core.h"
 #include "ClusteredRendererDX11.h"
 #include "ShaderDX11.h"
-#include "CameraDX11.h"
+#include "CameraDX12.h"
 #include "ModelDX11.h"
 #include "DDGI_DX11.h"
 

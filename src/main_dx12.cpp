@@ -12,7 +12,7 @@
 
 #include "DX12Core.h"
 #include "ShaderDX12.h"
-#include "CameraDX11.h" // Camera logic is API-agnostic
+#include "CameraDX12.h" // Camera logic is API-agnostic
 #include "ClusteredRendererDX12.h"
 
 using namespace DirectX;
@@ -381,6 +381,17 @@ void ToggleFullscreen(HWND hwnd) {
     }
 }
 
+void ClipCursorToWindow(HWND hwnd) {
+    RECT rect;
+    GetClientRect(hwnd, &rect);
+    POINT topLeft = { rect.left, rect.top };
+    POINT bottomRight = { rect.right, rect.bottom };
+    ClientToScreen(hwnd, &topLeft);
+    ClientToScreen(hwnd, &bottomRight);
+    RECT clipRect = { topLeft.x, topLeft.y, bottomRight.x, bottomRight.y };
+    ClipCursor(&clipRect);
+}
+
 void ProcessInput(HWND hwnd) {
     if (!cameraLocked && !(showUI && ImGui::GetIO().WantCaptureKeyboard)) {
         if (GetAsyncKeyState('W') & 0x8000) camera.ProcessKeyboard('W', deltaTime);
@@ -416,27 +427,47 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SCR_WIDTH = newWidth;
                 SCR_HEIGHT = newHeight;
                 ResizeDX12(SCR_WIDTH, SCR_HEIGHT);
+                // Re-clip cursor if camera is unlocked
+                if (!cameraLocked) {
+                    ClipCursorToWindow(hwnd);
+                }
             }
+        }
+        return 0;
+    
+    case WM_MOVE:
+        // Re-clip cursor when window moves if camera is unlocked
+        if (!cameraLocked) {
+            ClipCursorToWindow(hwnd);
         }
         return 0;
         
     case WM_MOUSEMOVE:
         if (!cameraLocked && !(showUI && ImGui::GetIO().WantCaptureMouse)) {
+            RECT rect;
+            GetClientRect(hwnd, &rect);
+            int centerX = (rect.right - rect.left) / 2;
+            int centerY = (rect.bottom - rect.top) / 2;
+            
             float xpos = (float)GET_X_LPARAM(lParam);
             float ypos = (float)GET_Y_LPARAM(lParam);
             
             if (firstMouse) {
-                lastX = xpos;
-                lastY = ypos;
+                lastX = (float)centerX;
+                lastY = (float)centerY;
                 firstMouse = false;
             }
             
-            float xoffset = xpos - lastX;
-            float yoffset = lastY - ypos;
-            lastX = xpos;
-            lastY = ypos;
+            // Calculate offset from center
+            float xoffset = xpos - (float)centerX;
+            float yoffset = (float)centerY - ypos;
             
             camera.ProcessMouseMovement(xoffset, yoffset);
+            
+            // Reset cursor to center for infinite mouse movement
+            POINT center = { centerX, centerY };
+            ClientToScreen(hwnd, &center);
+            SetCursorPos(center.x, center.y);
         }
         return 0;
         
@@ -446,6 +477,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 cameraLocked = false;
                 SetCapture(hwnd);
                 ShowCursor(FALSE);
+                ClipCursorToWindow(hwnd);  // Lock mouse to window
                 RECT rect;
                 GetClientRect(hwnd, &rect);
                 POINT center = { (rect.right - rect.left) / 2, (rect.bottom - rect.top) / 2 };
@@ -475,11 +507,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (showUI) {
                 cameraLocked = true;
                 ReleaseCapture();
+                ClipCursor(nullptr);  // Release cursor clip
                 ShowCursor(TRUE);
             }
         } else if (wParam == 'C') {
             cameraLocked = true;
             ReleaseCapture();
+            ClipCursor(nullptr);  // Release cursor clip
             ShowCursor(TRUE);
         } else if (wParam == 'F') {
             camera.FPSMode = !camera.FPSMode;
@@ -492,6 +526,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
         
     case WM_DESTROY:
+        ClipCursor(nullptr);  // Release cursor clip on exit
         PostQuitMessage(0);
         return 0;
     }
@@ -575,10 +610,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         return -1;
     }
     
-    // Load shaders - using the real clustered shaders
-    if (!mainShader.Load("shaders/clustered_vs.hlsl", "shaders/clustered_ps.hlsl")) {
-        std::cerr << "Failed to load clustered shaders, trying DX12 specific shaders..." << std::endl;
-        if (!mainShader.Load("shaders/clustered_dx12_vs.hlsl", "shaders/clustered_dx12_ps.hlsl")) {
+    // Load shaders - trying DX12 specific shaders first
+    if (!mainShader.Load("shaders/clustered_dx12_vs.hlsl", "shaders/clustered_dx12_ps.hlsl")) {
+        std::cerr << "Failed to load DX12 specific shaders, trying general clustered shaders..." << std::endl;
+        if (!mainShader.Load("shaders/clustered_vs.hlsl", "shaders/clustered_ps.hlsl")) {
             std::cerr << "Failed to load any shaders" << std::endl;
             MessageBoxA(hwnd, "Failed to load shaders.\nCheck console for details.", "Shader Error", MB_OK | MB_ICONERROR);
             return -1;
