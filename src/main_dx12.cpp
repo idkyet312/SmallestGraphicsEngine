@@ -76,7 +76,7 @@ XMFLOAT3 lightColor(1.0f, 1.0f, 1.0f);
 
 // Gun viewmodel
 struct GunModel {
-    bool visible = true;
+    bool visible = false;
     bool loaded = false;
     XMFLOAT3 color = XMFLOAT3(0.2f, 0.2f, 0.25f);
     XMFLOAT3 offset = XMFLOAT3(0.170f, -0.140f, 0.490f);
