@@ -41,7 +41,12 @@ set(HEADER_FILES
     src/Shader.h
     src/ShaderDX11.h
     src/ShaderDX12.h
+    src/SceneGraph.h
+    src/GLBImporter.h
 )
+
+# Find tinygltf
+find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h")
 
 # Shader files (for IDE support)
 file(GLOB SHADER_FILES "shaders/*.hlsl" "shaders/*.vert" "shaders/*.frag")
@@ -57,6 +62,7 @@ if(USE_DX12)
     message(STATUS "Building with DirectX 12")
     add_executable(GraphicEngine WIN32 
         src/main_dx12.cpp
+        src/GLBImporter.cpp
         ${HEADER_FILES}
         ${SHADER_FILES}
     )
@@ -66,6 +72,7 @@ if(USE_DX12)
         dxgi
         imgui::imgui
     )
+    target_include_directories(GraphicEngine PRIVATE ${TINYGLTF_INCLUDE_DIRS})
     target_compile_definitions(GraphicEngine PRIVATE USE_DX12=1)
 else()
     message(STATUS "Building with DirectX 11")
@@ -80,6 +87,7 @@ else()
         dxgi
         imgui::imgui
     )
+    target_include_directories(GraphicEngine PRIVATE ${TINYGLTF_INCLUDE_DIRS})
 endif()
 
 # Group files in IDE

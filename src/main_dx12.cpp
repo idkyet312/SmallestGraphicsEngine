@@ -14,6 +14,8 @@
 #include "ShaderDX12.h"
 #include "CameraDX12.h" // Camera logic is API-agnostic
 #include "ClusteredRendererDX12.h"
+#include "SceneGraph.h"
+#include "GLBImporter.h"
 
 using namespace DirectX;
 
@@ -166,6 +168,9 @@ Timer gameTimer;
 
 // ImGui descriptor heap for DX12
 ComPtr<ID3D12DescriptorHeap> imguiSrvHeap;
+
+// Use scene graph for loaded models
+std::shared_ptr<SceneNode> loadedModelNode;
 
 // Forward declarations
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -757,6 +762,101 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// Helper to display recursive scene graph in ImGui
+void ShowSceneGraphNode(SceneNode* node) {
+    if (!node) return;
+    
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick | ImGuiTreeNodeFlags_DefaultOpen;
+    if (node->children.empty()) {
+        flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_Bullet;
+    }
+    
+    // Node name and properties
+    bool nodeOpen = ImGui::TreeNodeEx((void*)node, flags, "%s", node->name.c_str());
+    
+    if (nodeOpen) {
+        // Transform controls
+        ImGui::PushID(node);
+        ImGui::DragFloat3("Position", &node->translation.x, 0.1f);
+        
+        // Convert quaternion to Euler angles for editing - this is simplified, proper implementation needs conversion
+        // For now just expose as 4 floats or assume euler if we change SceneNode to use Euler
+        // Assuming quaternion for now, let's just show it but maybe not edit it easily without conversion
+        // ImGui::DragFloat4("Rotation (Quat)", &node->rotation.x, 0.01f);
+        
+        ImGui::DragFloat3("Scale", &node->scale.x, 0.1f);
+        ImGui::PopID();
+        
+        // Children
+        for (auto& child : node->children) {
+            ShowSceneGraphNode(child.get());
+        }
+        
+        ImGui::TreePop();
+    }
+}
+
+// Recursive draw function for Shadow Pass
+void RecursiveDrawShadow(std::shared_ptr<SceneNode> node, const XMMATRIX& lightSpaceMatrix) {
+    if (!node) return;
+    
+    if (node->mesh) {
+        XMMATRIX model = XMLoadFloat4x4(&node->globalTransform);
+        depthShader.SetMatrices(model, XMMatrixIdentity(), XMMatrixIdentity(), lightSpaceMatrix);
+        
+        for (const auto& prim : node->mesh->primitives) {
+             if (prim.vbv.BufferLocation != 0) {
+                 g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
+                 g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                 
+                 if (prim.ibv.BufferLocation != 0) {
+                     g_dx12.commandList->IASetIndexBuffer(&prim.ibv);
+                     g_dx12.commandList->DrawIndexedInstanced(prim.indexCount, 1, 0, 0, 0);
+                 } else {
+                     g_dx12.commandList->DrawInstanced((UINT)(prim.vertices.size() / 8), 1, 0, 0);
+                 }
+             }
+        }
+    }
+    
+    for (auto& child : node->children) {
+        RecursiveDrawShadow(child, lightSpaceMatrix);
+    }
+}
+
+// Recursive draw function for SceneGraph
+void RecursiveDraw(std::shared_ptr<SceneNode> node, const XMMATRIX& view, const XMMATRIX& projection, const XMMATRIX& lightSpaceMatrix) {
+    if (!node) return;
+    
+    // Draw mesh if exists
+    if (node->mesh) {
+        XMMATRIX model = XMLoadFloat4x4(&node->globalTransform);
+        mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
+        
+        // For each primitive
+        for (const auto& prim : node->mesh->primitives) {
+             if (prim.vbv.BufferLocation != 0) {
+                 // Set material/color (default white for now)
+                 mainShader.SetObjectColor(XMFLOAT3(1.0f, 1.0f, 1.0f)); 
+                 
+                 g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
+                 g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                 
+                 if (prim.ibv.BufferLocation != 0) {
+                     g_dx12.commandList->IASetIndexBuffer(&prim.ibv);
+                     g_dx12.commandList->DrawIndexedInstanced(prim.indexCount, 1, 0, 0, 0);
+                 } else {
+                     g_dx12.commandList->DrawInstanced((UINT)(prim.vertices.size() / 8), 1, 0, 0);
+                 }
+             }
+        }
+    }
+    
+    for (auto& child : node->children) {
+        RecursiveDraw(child, view, projection, lightSpaceMatrix);
+    }
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // Create console
     AllocConsole();
@@ -843,6 +943,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
     }
     std::cout << "Clustered Forward shaders loaded successfully" << std::endl;
+    
+    // Load model
+    std::cout << "Attempting to load models/gun.glb..." << std::endl;
+    loadedModelNode = GLBImporter::LoadGLB("models/gun.glb", g_dx12.device, g_dx12.commandList);
+    if (loadedModelNode) {
+        std::cout << "Model loaded successfully!" << std::endl;
+        // Adjust model transform if needed (e.g. scale down)
+        // loadedModelNode->scale = XMFLOAT3(0.1f, 0.1f, 0.1f);
+        loadedModelNode->UpdateGlobalTransform(loadedModelNode->localTransform);
+        gunModel.loaded = true;
+    } else {
+        std::cout << "Failed to load model or file not found." << std::endl;
+    }
+
     
     // Load depth shader for shadow mapping
     if (!depthShader.Load("shaders/depth_vs.hlsl", "shaders/depth_ps.hlsl")) {
@@ -1033,6 +1147,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 DrawCube();
                 depthShader.NextDrawCall();
             }
+
+            // Render loaded model shadow (scene prop mode)
+            if (loadedModelNode && !gunModel.loaded) {
+                 DirectX::XMFLOAT4X4 identity;
+                 DirectX::XMStoreFloat4x4(&identity, DirectX::XMMatrixIdentity());
+                 
+                 // Update transforms for shadow pass
+                 loadedModelNode->UpdateLocalTransform();
+                 loadedModelNode->UpdateGlobalTransform(identity);
+                 
+                 RecursiveDrawShadow(loadedModelNode, lightSpaceMatrix);
+            }
             
             // Transition shadow map to shader resource
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
@@ -1108,6 +1234,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             mainShader.NextDrawCall();
         }
         
+        // Render loaded model if it exists and is NOT the gun (scene prop mode)
+        if (loadedModelNode && !gunModel.loaded) {
+             // Ensure transforms are up to date (e.g. if modified in ImGui)
+             // We assume root node, so parent transform is identity
+             DirectX::XMFLOAT4X4 identity;
+             DirectX::XMStoreFloat4x4(&identity, DirectX::XMMatrixIdentity());
+             
+             loadedModelNode->UpdateLocalTransform();
+             loadedModelNode->UpdateGlobalTransform(identity);
+             
+             RecursiveDraw(loadedModelNode, view, projection, lightSpaceMatrix);
+        }
+        
         // Render projectiles
         for (auto& proj : projectiles) {
             if (proj.active) {
@@ -1159,10 +1298,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             model = model * XMMatrixRotationZ(XMConvertToRadians(gunModel.rotation.z));
             model = model * cameraRotation;
             model = model * XMMatrixTranslation(gunPosition.x, gunPosition.y, gunPosition.z);
-            mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
-            mainShader.SetObjectColor(gunModel.color);
-            DrawCube();
-            mainShader.NextDrawCall();
+            
+            if (gunModel.loaded && loadedModelNode) {
+                 XMFLOAT4X4 gunWorldTransform;
+                 XMStoreFloat4x4(&gunWorldTransform, model);
+                 loadedModelNode->UpdateGlobalTransform(gunWorldTransform);
+                 RecursiveDraw(loadedModelNode, view, projection, lightSpaceMatrix);
+                 // Note: RecursiveDraw sets matrices and draw calls internally
+                 // We assume shader state (texture/constants) is compatible
+            } else {
+                mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
+                mainShader.SetObjectColor(gunModel.color);
+                DrawCube();
+                mainShader.NextDrawCall();
+            }
         }
         
         // Render light spheres
@@ -1414,6 +1563,40 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 ImGui::DragFloat3("Gun Offset", &gunModel.offset.x, 0.01f);
                 ImGui::DragFloat3("Gun Scale", &gunModel.scale.x, 0.01f);
                 ImGui::DragFloat3("Gun Rotation", &gunModel.rotation.x, 1.0f);
+            }
+            
+            if (ImGui::CollapsingHeader("Scene Graph & Models")) {
+                static char modelPath[128] = "models/gun.glb";
+                ImGui::InputText("Model Path", modelPath, IM_ARRAYSIZE(modelPath));
+                if (ImGui::Button("Load Model")) {
+                    std::cout << "Loading model: " << modelPath << std::endl;
+                    // Reset model node
+                    loadedModelNode = nullptr;
+                    // Attempt load
+                    loadedModelNode = GLBImporter::LoadGLB(modelPath, g_dx12.device, g_dx12.commandList);
+                    if (loadedModelNode) {
+                        std::cout << "Model loaded successfully!" << std::endl;
+                        
+                        // Set to center of scene
+                        loadedModelNode->translation = XMFLOAT3(0.0f, 2.0f, 0.0f);
+                        loadedModelNode->UpdateLocalTransform();
+                        loadedModelNode->UpdateGlobalTransform(loadedModelNode->localTransform);
+                        
+                        // Detach from gun logic so it stays in scene
+                        gunModel.loaded = false;
+                    } else {
+                        std::cout << "Failed to load model." << std::endl;
+                    }
+                }
+                
+                ImGui::Separator();
+                ImGui::Text("Scene Graph:");
+                
+                if (loadedModelNode) {
+                     ShowSceneGraphNode(loadedModelNode.get());
+                } else {
+                    ImGui::Text("No model loaded");
+                }
             }
             
             ImGui::Separator();
