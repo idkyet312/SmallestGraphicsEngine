@@ -27,10 +27,39 @@ endif()
 # Include directories
 include_directories(${CMAKE_SOURCE_DIR}/src)
 
+# Header files (for IDE support)
+set(HEADER_FILES
+    src/CameraDX12.h
+    src/ClusteredRenderer.h
+    src/ClusteredRendererDX11.h
+    src/ClusteredRendererDX12.h
+    src/DDGI_DX11.h
+    src/DX11Core.h
+    src/DX12Core.h
+    src/Model.h
+    src/ModelDX11.h
+    src/Shader.h
+    src/ShaderDX11.h
+    src/ShaderDX12.h
+)
+
+# Shader files (for IDE support)
+file(GLOB SHADER_FILES "shaders/*.hlsl" "shaders/*.vert" "shaders/*.frag")
+
+# Mark shader files as non-compiled BEFORE adding to target
+set_source_files_properties(${SHADER_FILES} PROPERTIES
+    HEADER_FILE_ONLY TRUE
+    VS_TOOL_OVERRIDE "None"
+)
+
 # Create executable based on selected graphics API
 if(USE_DX12)
     message(STATUS "Building with DirectX 12")
-    add_executable(GraphicEngine WIN32 src/main_dx12.cpp)
+    add_executable(GraphicEngine WIN32 
+        src/main_dx12.cpp
+        ${HEADER_FILES}
+        ${SHADER_FILES}
+    )
     target_link_libraries(GraphicEngine 
         d3d12
         d3dcompiler
@@ -40,7 +69,11 @@ if(USE_DX12)
     target_compile_definitions(GraphicEngine PRIVATE USE_DX12=1)
 else()
     message(STATUS "Building with DirectX 11")
-    add_executable(GraphicEngine WIN32 src/main_dx11.cpp)
+    add_executable(GraphicEngine WIN32 
+        src/main_dx11.cpp
+        ${HEADER_FILES}
+        ${SHADER_FILES}
+    )
     target_link_libraries(GraphicEngine 
         d3d11
         d3dcompiler
@@ -48,6 +81,10 @@ else()
         imgui::imgui
     )
 endif()
+
+# Group files in IDE
+source_group("Header Files" FILES ${HEADER_FILES})
+source_group("Shader Files" FILES ${SHADER_FILES})
 
 # Set output directory so exe is near shaders folder
 set_target_properties(GraphicEngine PROPERTIES
