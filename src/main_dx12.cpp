@@ -76,11 +76,11 @@ XMFLOAT3 lightColor(1.0f, 1.0f, 1.0f);
 
 // Gun viewmodel
 struct GunModel {
-    bool visible = false;
+    bool visible = true;
     bool loaded = false;
     XMFLOAT3 color = XMFLOAT3(0.2f, 0.2f, 0.25f);
-    XMFLOAT3 offset = XMFLOAT3(0.170f, -0.140f, 0.490f);
-    XMFLOAT3 scale = XMFLOAT3(0.5f, 0.5f, 0.5f);
+    XMFLOAT3 offset = XMFLOAT3(0.12f, -0.2f, 0.5f);  // x=right, y=down, z=forward
+    XMFLOAT3 scale = XMFLOAT3(0.08f, 0.08f, 0.3f);
     XMFLOAT3 rotation = XMFLOAT3(0.0f, 180.0f, 0.0f);
 };
 GunModel gunModel;
@@ -98,6 +98,20 @@ float projectileSpeed = 50.0f;
 float projectileLifetime = 3.0f;
 XMFLOAT3 projectileColor(1.0f, 0.8f, 0.0f);
 float projectileScale = 0.1f;
+
+// Light Editor Mode
+bool lightEditorMode = false;
+int selectedLightIndex = -1;
+XMFLOAT3 newLightColor(1.0f, 1.0f, 1.0f);
+float newLightRadius = 8.0f;
+float newLightIntensity = 1.5f;
+
+// Gizmo for moving lights
+enum GizmoAxis { GIZMO_NONE = 0, GIZMO_X, GIZMO_Y, GIZMO_Z };
+GizmoAxis activeGizmoAxis = GIZMO_NONE;
+bool isDraggingGizmo = false;
+XMFLOAT3 dragStartPos;
+float gizmoSize = 1.0f;
 
 // Clustered rendering
 ClusteredRendererDX12 clusteredRenderer;
@@ -392,6 +406,127 @@ void ClipCursorToWindow(HWND hwnd) {
     ClipCursor(&clipRect);
 }
 
+// Ray-sphere intersection for picking lights
+bool RaySphereIntersect(XMFLOAT3 rayOrigin, XMFLOAT3 rayDir, XMFLOAT3 sphereCenter, float sphereRadius, float& t) {
+    XMVECTOR o = XMLoadFloat3(&rayOrigin);
+    XMVECTOR d = XMVector3Normalize(XMLoadFloat3(&rayDir));
+    XMVECTOR c = XMLoadFloat3(&sphereCenter);
+    XMVECTOR oc = XMVectorSubtract(o, c);
+    
+    float a = XMVectorGetX(XMVector3Dot(d, d));
+    float b = 2.0f * XMVectorGetX(XMVector3Dot(oc, d));
+    XMFLOAT3 ocf;
+    XMStoreFloat3(&ocf, oc);
+    float c_val = ocf.x * ocf.x + ocf.y * ocf.y + ocf.z * ocf.z - sphereRadius * sphereRadius;
+    float discriminant = b * b - 4 * a * c_val;
+    
+    if (discriminant < 0) return false;
+    
+    t = (-b - sqrtf(discriminant)) / (2.0f * a);
+    return t > 0;
+}
+
+// Get ray from screen position
+void ScreenToWorldRay(float screenX, float screenY, XMFLOAT3& rayOrigin, XMFLOAT3& rayDir) {
+    // Convert to normalized device coordinates
+    float ndcX = (2.0f * screenX / SCR_WIDTH) - 1.0f;
+    float ndcY = 1.0f - (2.0f * screenY / SCR_HEIGHT);
+    
+    XMMATRIX view = camera.GetViewMatrix();
+    XMMATRIX proj = XMMatrixPerspectiveFovLH(XMConvertToRadians(cameraFOV), 
+        (float)SCR_WIDTH / (float)SCR_HEIGHT, cameraNear, cameraFar);
+    XMMATRIX invView = XMMatrixInverse(nullptr, view);
+    XMMATRIX invProj = XMMatrixInverse(nullptr, proj);
+    
+    // Near point in clip space
+    XMVECTOR nearPoint = XMVectorSet(ndcX, ndcY, 0.0f, 1.0f);
+    // Far point in clip space
+    XMVECTOR farPoint = XMVectorSet(ndcX, ndcY, 1.0f, 1.0f);
+    
+    // Transform to world space
+    nearPoint = XMVector4Transform(nearPoint, invProj);
+    nearPoint = XMVectorDivide(nearPoint, XMVectorSplatW(nearPoint));
+    nearPoint = XMVector4Transform(nearPoint, invView);
+    
+    farPoint = XMVector4Transform(farPoint, invProj);
+    farPoint = XMVectorDivide(farPoint, XMVectorSplatW(farPoint));
+    farPoint = XMVector4Transform(farPoint, invView);
+    
+    XMStoreFloat3(&rayOrigin, nearPoint);
+    XMVECTOR dir = XMVector3Normalize(XMVectorSubtract(farPoint, nearPoint));
+    XMStoreFloat3(&rayDir, dir);
+}
+
+// Pick a light with mouse click
+int PickLight(float screenX, float screenY) {
+    XMFLOAT3 rayOrigin, rayDir;
+    ScreenToWorldRay(screenX, screenY, rayOrigin, rayDir);
+    
+    int closestLight = -1;
+    float closestT = FLT_MAX;
+    
+    for (int i = 0; i < clusteredRenderer.getTotalLightCount(); i++) {
+        PointLightDX12* light = clusteredRenderer.getLight(i);
+        if (!light || !light->active) continue;
+        
+        float t;
+        if (RaySphereIntersect(rayOrigin, rayDir, light->position, 0.3f, t)) {
+            if (t < closestT) {
+                closestT = t;
+                closestLight = i;
+            }
+        }
+    }
+    return closestLight;
+}
+
+// Check gizmo axis intersection
+GizmoAxis PickGizmoAxis(float screenX, float screenY, XMFLOAT3 gizmoCenter) {
+    XMFLOAT3 rayOrigin, rayDir;
+    ScreenToWorldRay(screenX, screenY, rayOrigin, rayDir);
+    
+    // Check each axis (represented as thin cylinders/boxes)
+    float closestT = FLT_MAX;
+    GizmoAxis closest = GIZMO_NONE;
+    float t;
+    
+    // X axis (red)
+    XMFLOAT3 xEnd = XMFLOAT3(gizmoCenter.x + gizmoSize, gizmoCenter.y, gizmoCenter.z);
+    if (RaySphereIntersect(rayOrigin, rayDir, XMFLOAT3(gizmoCenter.x + gizmoSize * 0.5f, gizmoCenter.y, gizmoCenter.z), 0.15f, t)) {
+        if (t < closestT) { closestT = t; closest = GIZMO_X; }
+    }
+    
+    // Y axis (green)
+    if (RaySphereIntersect(rayOrigin, rayDir, XMFLOAT3(gizmoCenter.x, gizmoCenter.y + gizmoSize * 0.5f, gizmoCenter.z), 0.15f, t)) {
+        if (t < closestT) { closestT = t; closest = GIZMO_Y; }
+    }
+    
+    // Z axis (blue)
+    if (RaySphereIntersect(rayOrigin, rayDir, XMFLOAT3(gizmoCenter.x, gizmoCenter.y, gizmoCenter.z + gizmoSize * 0.5f), 0.15f, t)) {
+        if (t < closestT) { closestT = t; closest = GIZMO_Z; }
+    }
+    
+    return closest;
+}
+
+// Place a new light at world position
+void PlaceLightAtScreenPos(float screenX, float screenY) {
+    XMFLOAT3 rayOrigin, rayDir;
+    ScreenToWorldRay(screenX, screenY, rayOrigin, rayDir);
+    
+    // Place light 5 units in front of camera
+    float distance = 5.0f;
+    XMFLOAT3 newPos;
+    newPos.x = rayOrigin.x + rayDir.x * distance;
+    newPos.y = rayOrigin.y + rayDir.y * distance;
+    newPos.z = rayOrigin.z + rayDir.z * distance;
+    
+    int newIdx = clusteredRenderer.addLight(newPos, newLightColor, newLightRadius, newLightIntensity);
+    if (newIdx >= 0) {
+        selectedLightIndex = newIdx;
+    }
+}
+
 void ProcessInput(HWND hwnd) {
     if (!cameraLocked && !(showUI && ImGui::GetIO().WantCaptureKeyboard)) {
         if (GetAsyncKeyState('W') & 0x8000) camera.ProcessKeyboard('W', deltaTime);
@@ -443,37 +578,92 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
         
     case WM_MOUSEMOVE:
-        if (!cameraLocked && !(showUI && ImGui::GetIO().WantCaptureMouse)) {
-            RECT rect;
-            GetClientRect(hwnd, &rect);
-            int centerX = (rect.right - rect.left) / 2;
-            int centerY = (rect.bottom - rect.top) / 2;
-            
+        if (!ImGui::GetIO().WantCaptureMouse) {
             float xpos = (float)GET_X_LPARAM(lParam);
             float ypos = (float)GET_Y_LPARAM(lParam);
             
-            if (firstMouse) {
-                lastX = (float)centerX;
-                lastY = (float)centerY;
-                firstMouse = false;
+            // Handle gizmo dragging in light editor mode
+            if (lightEditorMode && isDraggingGizmo && selectedLightIndex >= 0) {
+                PointLightDX12* light = clusteredRenderer.getLight(selectedLightIndex);
+                if (light) {
+                    float dragSpeed = 0.02f;
+                    float dx = xpos - lastX;
+                    float dy = lastY - ypos;
+                    
+                    XMFLOAT3 pos = light->position;
+                    if (activeGizmoAxis == GIZMO_X) {
+                        pos.x += dx * dragSpeed;
+                    } else if (activeGizmoAxis == GIZMO_Y) {
+                        pos.y += dy * dragSpeed;
+                    } else if (activeGizmoAxis == GIZMO_Z) {
+                        pos.z += dx * dragSpeed;
+                    }
+                    clusteredRenderer.updateLight(selectedLightIndex, pos);
+                }
+                lastX = xpos;
+                lastY = ypos;
             }
-            
-            // Calculate offset from center
-            float xoffset = xpos - (float)centerX;
-            float yoffset = (float)centerY - ypos;
-            
-            camera.ProcessMouseMovement(xoffset, yoffset);
-            
-            // Reset cursor to center for infinite mouse movement
-            POINT center = { centerX, centerY };
-            ClientToScreen(hwnd, &center);
-            SetCursorPos(center.x, center.y);
+            // Normal camera control when not in editor mode
+            else if (!cameraLocked && !lightEditorMode) {
+                RECT rect;
+                GetClientRect(hwnd, &rect);
+                int centerX = (rect.right - rect.left) / 2;
+                int centerY = (rect.bottom - rect.top) / 2;
+                
+                if (firstMouse) {
+                    lastX = (float)centerX;
+                    lastY = (float)centerY;
+                    firstMouse = false;
+                }
+                
+                // Calculate offset from center
+                float xoffset = xpos - (float)centerX;
+                float yoffset = (float)centerY - ypos;
+                
+                camera.ProcessMouseMovement(xoffset, yoffset);
+                
+                // Reset cursor to center for infinite mouse movement
+                POINT center = { centerX, centerY };
+                ClientToScreen(hwnd, &center);
+                SetCursorPos(center.x, center.y);
+            }
         }
         return 0;
         
     case WM_LBUTTONDOWN:
         if (!ImGui::GetIO().WantCaptureMouse) {
-            if (cameraLocked) {
+            float xpos = (float)GET_X_LPARAM(lParam);
+            float ypos = (float)GET_Y_LPARAM(lParam);
+            
+            // Light editor mode - pick lights or gizmo
+            if (lightEditorMode) {
+                // Check if clicking on gizmo first
+                if (selectedLightIndex >= 0) {
+                    PointLightDX12* light = clusteredRenderer.getLight(selectedLightIndex);
+                    if (light) {
+                        GizmoAxis axis = PickGizmoAxis(xpos, ypos, light->position);
+                        if (axis != GIZMO_NONE) {
+                            activeGizmoAxis = axis;
+                            isDraggingGizmo = true;
+                            lastX = xpos;
+                            lastY = ypos;
+                            SetCapture(hwnd);
+                            return 0;
+                        }
+                    }
+                }
+                
+                // Check if clicking on a light
+                int pickedLight = PickLight(xpos, ypos);
+                if (pickedLight >= 0) {
+                    selectedLightIndex = pickedLight;
+                } else {
+                    // Deselect if clicking on empty space
+                    selectedLightIndex = -1;
+                }
+            }
+            // Normal mode
+            else if (cameraLocked) {
                 cameraLocked = false;
                 SetCapture(hwnd);
                 ShowCursor(FALSE);
@@ -496,6 +686,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 proj.active = true;
                 projectiles.push_back(proj);
             }
+        }
+        return 0;
+        
+    case WM_LBUTTONUP:
+        if (isDraggingGizmo) {
+            isDraggingGizmo = false;
+            activeGizmoAxis = GIZMO_NONE;
+            ReleaseCapture();
+        }
+        return 0;
+        
+    case WM_RBUTTONDOWN:
+        if (!ImGui::GetIO().WantCaptureMouse && lightEditorMode) {
+            float xpos = (float)GET_X_LPARAM(lParam);
+            float ypos = (float)GET_Y_LPARAM(lParam);
+            // Right click to place a new light
+            PlaceLightAtScreenPos(xpos, ypos);
         }
         return 0;
         
@@ -522,6 +729,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
         } else if (wParam == VK_F11) {
             ToggleFullscreen(hwnd);
+        } else if (wParam == 'L') {
+            // Toggle light editor mode
+            lightEditorMode = !lightEditorMode;
+            if (lightEditorMode) {
+                cameraLocked = true;
+                ReleaseCapture();
+                ClipCursor(nullptr);
+                ShowCursor(TRUE);
+            }
+            selectedLightIndex = -1;
+        } else if (wParam == VK_DELETE) {
+            // Delete selected light
+            if (lightEditorMode && selectedLightIndex >= 0) {
+                clusteredRenderer.removeLight(selectedLightIndex);
+                selectedLightIndex = -1;
+            }
         }
         return 0;
         
@@ -899,18 +1122,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         
         // Render gun viewmodel (simplified - just a cube for now)
         if (gunModel.visible) {
-            // Position gun in front of camera
+            // Position gun in front of camera using camera's coordinate system
             XMVECTOR camPos = XMLoadFloat3(&camera.Position);
-            XMVECTOR camFront = XMLoadFloat3(&camera.Front);
-            XMVECTOR camRight = XMVector3Cross(XMLoadFloat3(&camera.Up), camFront);
-            XMVECTOR camUp = XMLoadFloat3(&camera.Up);
+            XMVECTOR camFront = XMVector3Normalize(XMLoadFloat3(&camera.Front));
+            XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+            XMVECTOR camRight = XMVector3Normalize(XMVector3Cross(worldUp, camFront));
+            XMVECTOR camUp = XMVector3Cross(camFront, camRight);
             
-            XMVECTOR gunPos = camPos + camFront * gunModel.offset.z + camRight * gunModel.offset.x + camUp * gunModel.offset.y;
+            // Calculate gun position relative to camera
+            XMVECTOR gunPos = camPos 
+                + camFront * gunModel.offset.z 
+                + camRight * gunModel.offset.x 
+                + camUp * gunModel.offset.y;
             XMFLOAT3 gunPosition;
             XMStoreFloat3(&gunPosition, gunPos);
             
+            // Build rotation matrix from camera orientation
+            // This makes the gun follow the camera's view direction
+            XMFLOAT3 right, up, front;
+            XMStoreFloat3(&right, camRight);
+            XMStoreFloat3(&up, camUp);
+            XMStoreFloat3(&front, camFront);
+            
+            // Create rotation matrix from camera basis vectors
+            XMMATRIX cameraRotation = XMMATRIX(
+                right.x, right.y, right.z, 0.0f,
+                up.x, up.y, up.z, 0.0f,
+                front.x, front.y, front.z, 0.0f,
+                0.0f, 0.0f, 0.0f, 1.0f
+            );
+            
+            // Apply gun's local rotation offset, then camera rotation, then position
             model = XMMatrixScaling(gunModel.scale.x, gunModel.scale.y * 2.0f, gunModel.scale.z * 3.0f);
-            model = model * XMMatrixRotationY(XMConvertToRadians(gunModel.rotation.y) + camera.Yaw * 0.0174533f);
+            model = model * XMMatrixRotationX(XMConvertToRadians(gunModel.rotation.x));
+            model = model * XMMatrixRotationY(XMConvertToRadians(gunModel.rotation.y));
+            model = model * XMMatrixRotationZ(XMConvertToRadians(gunModel.rotation.z));
+            model = model * cameraRotation;
             model = model * XMMatrixTranslation(gunPosition.x, gunPosition.y, gunPosition.z);
             mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
             mainShader.SetObjectColor(gunModel.color);
@@ -922,13 +1169,72 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         for (int i = 0; i < clusteredRenderer.getTotalLightCount(); i++) {
             PointLightDX12* light = clusteredRenderer.getLight(i);
             if (!light || !light->active) continue;
-            model = XMMatrixScaling(0.2f, 0.2f, 0.2f);
+            
+            // Make selected light bigger
+            float lightSize = (lightEditorMode && i == selectedLightIndex) ? 0.35f : 0.2f;
+            model = XMMatrixScaling(lightSize, lightSize, lightSize);
             model = model * XMMatrixTranslation(light->position.x, light->position.y, light->position.z);
             mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
             XMFLOAT3 lightCol(light->color.x * light->intensity, light->color.y * light->intensity, light->color.z * light->intensity);
             mainShader.SetObjectColor(lightCol);
             DrawCube();
             mainShader.NextDrawCall();
+        }
+        
+        // Render gizmo for selected light in editor mode
+        if (lightEditorMode && selectedLightIndex >= 0) {
+            PointLightDX12* light = clusteredRenderer.getLight(selectedLightIndex);
+            if (light && light->active) {
+                XMFLOAT3 pos = light->position;
+                
+                // X axis (red) - horizontal bar
+                model = XMMatrixScaling(gizmoSize, 0.05f, 0.05f);
+                model = model * XMMatrixTranslation(pos.x + gizmoSize * 0.5f, pos.y, pos.z);
+                mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
+                mainShader.SetObjectColor(XMFLOAT3(1.0f, 0.0f, 0.0f));
+                DrawCube();
+                mainShader.NextDrawCall();
+                
+                // X axis arrow head
+                model = XMMatrixScaling(0.15f, 0.15f, 0.15f);
+                model = model * XMMatrixTranslation(pos.x + gizmoSize, pos.y, pos.z);
+                mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
+                mainShader.SetObjectColor(XMFLOAT3(1.0f, 0.0f, 0.0f));
+                DrawCube();
+                mainShader.NextDrawCall();
+                
+                // Y axis (green) - vertical bar
+                model = XMMatrixScaling(0.05f, gizmoSize, 0.05f);
+                model = model * XMMatrixTranslation(pos.x, pos.y + gizmoSize * 0.5f, pos.z);
+                mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
+                mainShader.SetObjectColor(XMFLOAT3(0.0f, 1.0f, 0.0f));
+                DrawCube();
+                mainShader.NextDrawCall();
+                
+                // Y axis arrow head
+                model = XMMatrixScaling(0.15f, 0.15f, 0.15f);
+                model = model * XMMatrixTranslation(pos.x, pos.y + gizmoSize, pos.z);
+                mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
+                mainShader.SetObjectColor(XMFLOAT3(0.0f, 1.0f, 0.0f));
+                DrawCube();
+                mainShader.NextDrawCall();
+                
+                // Z axis (blue) - depth bar
+                model = XMMatrixScaling(0.05f, 0.05f, gizmoSize);
+                model = model * XMMatrixTranslation(pos.x, pos.y, pos.z + gizmoSize * 0.5f);
+                mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
+                mainShader.SetObjectColor(XMFLOAT3(0.0f, 0.0f, 1.0f));
+                DrawCube();
+                mainShader.NextDrawCall();
+                
+                // Z axis arrow head
+                model = XMMatrixScaling(0.15f, 0.15f, 0.15f);
+                model = model * XMMatrixTranslation(pos.x, pos.y, pos.z + gizmoSize);
+                mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
+                mainShader.SetObjectColor(XMFLOAT3(0.0f, 0.0f, 1.0f));
+                DrawCube();
+                mainShader.NextDrawCall();
+            }
         }
         
         // Render ImGui
@@ -943,7 +1249,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ImGui::BulletText("TAB: Toggle UI");
             ImGui::BulletText("C: Lock/Unlock Camera");
             ImGui::BulletText("F: Toggle FPS Walking Mode");
+            ImGui::BulletText("L: Toggle Light Editor");
             ImGui::BulletText("Left Click: Lock camera / Shoot");
+            if (lightEditorMode) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 0.0f, 1.0f));
+                ImGui::Text("LIGHT EDITOR MODE ACTIVE");
+                ImGui::PopStyleColor();
+            }
             if (cameraLocked) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.5f, 0.0f, 1.0f));
                 if (ImGui::Button("Camera LOCKED (Click to unlock)")) cameraLocked = false;
@@ -996,9 +1308,70 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 ImGui::Checkbox("Wireframe Mode", &wireframeMode);
                 ImGui::DragFloat("Ambient", &ambientStrength, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Specular", &specularStrength, 0.01f, 0.0f, 1.0f);
+            }
+            
+            if (ImGui::CollapsingHeader("Light Editor", ImGuiTreeNodeFlags_DefaultOpen)) {
+                // Toggle light editor mode
+                if (lightEditorMode) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.8f, 0.0f, 1.0f));
+                    if (ImGui::Button("Light Editor: ON (Click to disable)")) {
+                        lightEditorMode = false;
+                        selectedLightIndex = -1;
+                    }
+                    ImGui::PopStyleColor();
+                    
+                    ImGui::Text("Controls:");
+                    ImGui::BulletText("Left Click: Select light");
+                    ImGui::BulletText("Right Click: Place new light");
+                    ImGui::BulletText("Drag Gizmo: Move selected light");
+                    ImGui::BulletText("DELETE: Remove selected light");
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+                    if (ImGui::Button("Light Editor: OFF (Click to enable)")) {
+                        lightEditorMode = true;
+                        cameraLocked = true;
+                        ReleaseCapture();
+                        ClipCursor(nullptr);
+                        ShowCursor(TRUE);
+                    }
+                    ImGui::PopStyleColor();
+                }
                 
-                // DDGI Settings
                 ImGui::Separator();
+                ImGui::Text("New Light Settings:");
+                ImGui::ColorEdit3("New Light Color", &newLightColor.x);
+                ImGui::DragFloat("New Light Radius", &newLightRadius, 0.5f, 1.0f, 50.0f);
+                ImGui::DragFloat("New Light Intensity", &newLightIntensity, 0.1f, 0.1f, 10.0f);
+                ImGui::DragFloat("Gizmo Size", &gizmoSize, 0.1f, 0.5f, 5.0f);
+                
+                if (selectedLightIndex >= 0) {
+                    ImGui::Separator();
+                    ImGui::Text("Selected Light: %d", selectedLightIndex);
+                    PointLightDX12* light = clusteredRenderer.getLight(selectedLightIndex);
+                    if (light) {
+                        ImGui::DragFloat3("Position##selected", &light->position.x, 0.1f);
+                        ImGui::ColorEdit3("Color##selected", &light->color.x);
+                        ImGui::DragFloat("Radius##selected", &light->radius, 0.5f, 1.0f, 50.0f);
+                        ImGui::DragFloat("Intensity##selected", &light->intensity, 0.1f, 0.1f, 10.0f);
+                        
+                        if (ImGui::Button("Delete Selected Light")) {
+                            clusteredRenderer.removeLight(selectedLightIndex);
+                            selectedLightIndex = -1;
+                        }
+                    }
+                } else {
+                    ImGui::Text("No light selected");
+                }
+                
+                ImGui::Separator();
+                ImGui::Text("Total Lights: %d", clusteredRenderer.getLightCount());
+                if (ImGui::Button("Clear All Lights")) {
+                    clusteredRenderer.clearLights();
+                    selectedLightIndex = -1;
+                }
+            }
+            
+            if (ImGui::CollapsingHeader("DDGI Settings")) {
                 ImGui::Text("DDGI Global Illumination");
                 ImGui::Checkbox("Enable DDGI", &useDDGI);
                 if (useDDGI) {
