@@ -88,30 +88,121 @@ struct PS_INPUT {
     float2 texCoord : TEXCOORD2;
 };
 
-// Simple GI approximation based on probe grid position
-float3 sampleDDGIIrradiance(float3 worldPos, float3 normal) {
-    if (!ddgiEnabled) return float3(0,0,0);
+// Octahedral encoding helper (direction to UV)
+float2 OctEncode(float3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    if (n.y < 0) {
+        float2 signN = float2(n.x >= 0 ? 1 : -1, n.z >= 0 ? 1 : -1);
+        n.xz = (1.0 - abs(n.zx)) * signN;
+    }
+    return n.xz * 0.5 + 0.5;
+}
 
-    // Calculate which probe cell we're in
-    float3 offset = worldPos - probeGridOrigin;
-    float3 gridPos = offset / probeSpacing;
+// Sample irradiance from a single probe
+float3 sampleProbeIrradiance(int probeIndex, float3 direction) {
+    // Calculate atlas dimensions
+    int totalProbes = probeCountX * probeCountY * probeCountZ;
+    int atlasWidthProbes = (int)sqrt((float)totalProbes);
+    if (atlasWidthProbes < 1) atlasWidthProbes = 1;
+    int atlasHeightProbes = (totalProbes + atlasWidthProbes - 1) / atlasWidthProbes;
     
-    // Clamp to grid bounds for simple lookup
-    gridPos = clamp(gridPos, float3(0,0,0), float3(probeCountX-1, probeCountY-1, probeCountZ-1));
+    // Calculate probe position in atlas
+    int probeX = probeIndex % atlasWidthProbes;
+    int probeY = probeIndex / atlasWidthProbes;
     
-    // Sample from the irradiance texture
-    // Since we are using a simplified update that clears the texture to a single color,
-    // we can sample anywhere. For robustness, sample center.
-    float3 gi = irradianceMap.Sample(texSampler, float2(0.5, 0.5)).rgb;
+    // Each probe tile size (with border)
+    int tileWidth = irradianceTexWidth + 2;
+    int tileHeight = irradianceTexHeight + 2;
     
-    // Simple ambient occlusion approximation based on height
-    float heightFactor = saturate(worldPos.y / 5.0);
+    // Full atlas texture size
+    int atlasWidth = atlasWidthProbes * tileWidth;
+    int atlasHeight = atlasHeightProbes * tileHeight;
     
-    // Hemisphere lighting approximation
-    float skyFactor = saturate(normal.y * 0.5 + 0.5);
+    // Get octahedral UV for direction
+    float2 octUV = OctEncode(direction);
     
-    // Mix sampled GI with some geometric factors for better look
-    return gi * (0.5 + 0.5 * skyFactor) * (0.5 + 0.5 * heightFactor) * giIntensity;
+    // Map to probe's tile area (excluding border)
+    float2 probeUV;
+    probeUV.x = (probeX * tileWidth + 1 + octUV.x * irradianceTexWidth) / (float)atlasWidth;
+    probeUV.y = (probeY * tileHeight + 1 + octUV.y * irradianceTexHeight) / (float)atlasHeight;
+    
+    return irradianceMap.SampleLevel(texSampler, probeUV, 0).rgb;
+}
+
+// Calculate probe index from grid coordinates
+int getProbeIndex(int3 gridCoord) {
+    return gridCoord.x + gridCoord.y * probeCountX + gridCoord.z * probeCountX * probeCountY;
+}
+
+// Sample GI from probe grid with trilinear interpolation
+float3 sampleDDGIIrradiance(float3 worldPos, float3 normal) {
+    if (!ddgiEnabled) return float3(0, 0, 0);
+
+    // Apply normal bias to avoid self-shadowing
+    float3 biasedPos = worldPos + normal * normalBias;
+    
+    // Calculate grid-relative position
+    float3 offset = biasedPos - probeGridOrigin;
+    float3 gridPosF = offset / probeSpacing;
+    
+    // Check if outside grid
+    if (gridPosF.x < 0 || gridPosF.y < 0 || gridPosF.z < 0 ||
+        gridPosF.x >= probeCountX || gridPosF.y >= probeCountY || gridPosF.z >= probeCountZ) {
+        // Outside grid - return small ambient based on normal
+        float skyFactor = saturate(normal.y * 0.5 + 0.5);
+        return float3(0.02, 0.025, 0.03) * skyFactor * giIntensity;
+    }
+    
+    // Get base probe indices for trilinear interpolation
+    int3 baseProbe = int3(floor(gridPosF));
+    baseProbe = clamp(baseProbe, int3(0, 0, 0), int3(probeCountX - 2, probeCountY - 2, probeCountZ - 2));
+    
+    // Interpolation weights
+    float3 weights = frac(gridPosF);
+    
+    // Sample 8 surrounding probes and interpolate
+    float3 irradiance = float3(0, 0, 0);
+    float totalWeight = 0.0;
+    
+    for (int dz = 0; dz <= 1; dz++) {
+        for (int dy = 0; dy <= 1; dy++) {
+            for (int dx = 0; dx <= 1; dx++) {
+                int3 probeCoord = baseProbe + int3(dx, dy, dz);
+                
+                // Clamp to valid range
+                probeCoord = clamp(probeCoord, int3(0, 0, 0), int3(probeCountX - 1, probeCountY - 1, probeCountZ - 1));
+                
+                int probeIndex = getProbeIndex(probeCoord);
+                
+                // Calculate trilinear weight
+                float wx = dx == 0 ? (1.0 - weights.x) : weights.x;
+                float wy = dy == 0 ? (1.0 - weights.y) : weights.y;
+                float wz = dz == 0 ? (1.0 - weights.z) : weights.z;
+                float weight = wx * wy * wz;
+                
+                // Apply cosine weighting (prefer probes in the direction we're sampling)
+                float3 probePos = probeGridOrigin + float3(probeCoord) * probeSpacing;
+                float3 dirToProbe = normalize(probePos - biasedPos);
+                float cosWeight = saturate(dot(dirToProbe, normal) * 0.5 + 0.5);
+                weight *= cosWeight;
+                
+                if (weight > 0.0001) {
+                    float3 probeSample = sampleProbeIrradiance(probeIndex, normal);
+                    irradiance += probeSample * weight;
+                    totalWeight += weight;
+                }
+            }
+        }
+    }
+    
+    if (totalWeight > 0.0001) {
+        irradiance /= totalWeight;
+    }
+    
+    // Apply gamma correction (probes store linear, but we apply a gamma to brighten)
+    irradiance = pow(max(irradiance, 0.0), 1.0 / irradianceGamma);
+    
+    return irradiance * giIntensity;
 }
 
 float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 viewDir) {

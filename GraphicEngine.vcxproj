@@ -87,6 +87,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="shaders\ddgi_update_cs.hlsl" />
     <ClCompile Include="src\GLBImporter.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\main_dx11.cpp" />
