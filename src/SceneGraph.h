@@ -8,11 +8,27 @@
 
 using Microsoft::WRL::ComPtr;
 
+struct SceneMaterial {
+    std::string name;
+    
+    DirectX::XMFLOAT4 baseColorFactor = { 1.0f, 1.0f, 1.0f, 1.0f };
+    float metallicFactor = 1.0f;
+    float roughnessFactor = 1.0f;
+    
+    ComPtr<ID3D12Resource> baseColorTexture;
+    ComPtr<ID3D12Resource> metallicRoughnessTexture;
+    ComPtr<ID3D12Resource> normalTexture;
+
+    // Keep upload heaps alive until GPU finishes
+    std::vector<ComPtr<ID3D12Resource>> uploadHeaps;
+};
+
 // Represents a mesh part (subset) with its own material/texture
 struct MeshPrimitive {
     std::vector<float> vertices; // Interleaved: Pos(3), Normal(3), Tex(2) -> 8 floats per vertex
     std::vector<unsigned int> indices;
     int materialIndex = -1;
+    std::shared_ptr<SceneMaterial> material;
     
     // DX12 Resources (to be filled by the renderer/loader)
     ComPtr<ID3D12Resource> vertexBuffer;
@@ -94,4 +110,3 @@ public:
         root->UpdateGlobalTransform(identity);
     }
 };
-

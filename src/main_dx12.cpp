@@ -836,8 +836,32 @@ void RecursiveDraw(std::shared_ptr<SceneNode> node, const XMMATRIX& view, const 
         // For each primitive
         for (const auto& prim : node->mesh->primitives) {
              if (prim.vbv.BufferLocation != 0) {
-                 // Set material/color (default white for now)
-                 mainShader.SetObjectColor(XMFLOAT3(1.0f, 1.0f, 1.0f)); 
+                 // Set material
+                 if (prim.material) {
+                     XMFLOAT3 color = XMFLOAT3(
+                         prim.material->baseColorFactor.x,
+                         prim.material->baseColorFactor.y,
+                         prim.material->baseColorFactor.z
+                     );
+                     
+                     mainShader.SetObjectMaterial(
+                         color,
+                         prim.material->baseColorTexture != nullptr,
+                         prim.material->normalTexture != nullptr,
+                         prim.material->metallicFactor,
+                         prim.material->roughnessFactor,
+                         prim.material->baseColorTexture.Get(),
+                         prim.material->normalTexture.Get(),
+                         prim.material->metallicRoughnessTexture.Get()
+                     );
+                 } else {
+                     // Default material
+                     mainShader.SetObjectMaterial(
+                         XMFLOAT3(1.0f, 1.0f, 1.0f),
+                         false, false, 0.0f, 0.5f,
+                         nullptr, nullptr, nullptr
+                     );
+                 }
                  
                  g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
                  g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -848,6 +872,8 @@ void RecursiveDraw(std::shared_ptr<SceneNode> node, const XMMATRIX& view, const 
                  } else {
                      g_dx12.commandList->DrawInstanced((UINT)(prim.vertices.size() / 8), 1, 0, 0);
                  }
+                 
+                 mainShader.NextDrawCall();
              }
         }
     }
@@ -1178,12 +1204,47 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         
         // Use shader
         mainShader.Use(wireframeMode);
+        mainShader.BeginFrame(); // Reset draw call and SRV counters
+        
+        // Bind heaps. We need both shadow heap and the main CBV_SRV_UAV heap for materials.
+        // DX12 only allows one descriptor heap of each type to be bound at a time.
+        // We merged shadow heap into the main heap? Or we have separate heaps.
+        // If we have separate heaps, we have a problem.
+        // main_dx12.cpp uses shadowSrvHeap separately.
+        // AND imguiSrvHeap.
+        // We need a single global heap (g_dx12.cbvSrvUavHeap) for everything during the main pass.
+        // Shadow map SRV needs to be in that heap too.
+        
+        // Let's assume for now we use the main heap.
+        // We need to copy the shadow SRV to the main heap if it's not there.
+        // But shadowSrvHeap is created separately in CreateShadowMap().
         
         // Bind shadow map SRV if shadows are enabled
         if (enableShadows && shadowSrvHeap) {
-            ID3D12DescriptorHeap* heaps[] = { shadowSrvHeap.Get() };
+            // Problem: We can't bind shadowSrvHeap AND materials from g_dx12.cbvSrvUavHeap.
+            // We must use one heap.
+            // Let's rely on g_dx12.cbvSrvUavHeap being the main one.
+            // We need to copy shadow descriptor to it. 
+            // Or assume SetObjectMaterial uses the currently bound heap.
+            
+            // For this fix, let's just bind the main heap and put shadow map there.
+            // But I don't want to rewrite the whole heap management now.
+            
+            // Temporary fix: If we are drawing the GLB (which uses materials), we bind the main heap.
+            // If we assume the shadow map is just T0, we can put it at start of main heap.
+            
+            ID3D12DescriptorHeap* heaps[] = { g_dx12.cbvSrvUavHeap.Get() };
             g_dx12.commandList->SetDescriptorHeaps(1, heaps);
-            g_dx12.commandList->SetGraphicsRootDescriptorTable(6, shadowSrvHeap->GetGPUDescriptorHandleForHeapStart());
+            
+            // We need to ensure Shadow Map SRV is at the start of this heap (index 0).
+            // This requires copying the descriptor.
+            if (shadowMap) {
+                 D3D12_CPU_DESCRIPTOR_HANDLE srcHandle = shadowSrvHeap->GetCPUDescriptorHandleForHeapStart();
+                 D3D12_CPU_DESCRIPTOR_HANDLE dstHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
+                 g_dx12.device->CopyDescriptorsSimple(1, dstHandle, srcHandle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                 
+                 g_dx12.commandList->SetGraphicsRootDescriptorTable(6, g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart());
+            }
         }
         
         // Set common uniforms

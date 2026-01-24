@@ -17,6 +17,7 @@ struct VS_OUTPUT {
     float4 position : SV_POSITION;
     float3 fragPos : TEXCOORD0;
     float3 normal : TEXCOORD1;
+    float2 texCoord : TEXCOORD2;
 };
 
 VS_OUTPUT main(VS_INPUT input) {
@@ -27,6 +28,8 @@ VS_OUTPUT main(VS_INPUT input) {
     
     // Transform normal to world space
     output.normal = normalize(mul(input.normal, (float3x3)model));
+    
+    output.texCoord = input.texCoord;
     
     float4 viewPos = mul(worldPos, view);
     output.position = mul(viewPos, projection);
