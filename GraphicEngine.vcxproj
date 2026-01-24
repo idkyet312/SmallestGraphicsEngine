@@ -59,7 +59,7 @@
       <PreprocessorDefinitions>_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;C:\vcpkg\installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -76,7 +76,7 @@
       <PreprocessorDefinitions>NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;C:\vcpkg\installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -87,9 +87,11 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\GLBImporter.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\main_dx11.cpp" />
     <ClCompile Include="src\main_dx12.cpp" />
+    <ClCompile Include="src\GLBImporter.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\CameraDX12.h" />
@@ -99,11 +101,15 @@
     <ClInclude Include="src\DDGI_DX11.h" />
     <ClInclude Include="src\DX11Core.h" />
     <ClInclude Include="src\DX12Core.h" />
+    <ClInclude Include="src\GLBImporter.h" />
     <ClInclude Include="src\Model.h" />
     <ClInclude Include="src\ModelDX11.h" />
+    <ClInclude Include="src\SceneGraph.h" />
     <ClInclude Include="src\Shader.h" />
     <ClInclude Include="src\ShaderDX11.h" />
     <ClInclude Include="src\ShaderDX12.h" />
+    <ClInclude Include="src\SceneGraph.h" />
+    <ClInclude Include="src\GLBImporter.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="shaders\clustered_dx12_ps.hlsl" />
