@@ -12,21 +12,46 @@ using namespace DirectX;
 
 extern DX12Context g_dx12;
 
-// PointLightDataDX12 is defined in ShaderDX12.h
+// SpotLightDataDX12 is defined in ShaderDX12.h
 
-struct PointLightDX12 {
+struct SpotLightDX12 {
     XMFLOAT3 position;
     float radius;
     XMFLOAT3 color;
     float intensity;
-    float constant;
-    float linear;
-    float quadratic;
+    XMFLOAT3 direction;      // Normalized direction
+    float innerConeAngle;    // Inner cone angle in degrees
+    float outerConeAngle;    // Outer cone angle in degrees
+    XMFLOAT3 rotation;       // Euler angles for UI editing (pitch, yaw, roll)
     bool active;
+    bool castsShadow;
     
-    PointLightDX12() : position(XMFLOAT3(0,0,0)), radius(10.0f), color(XMFLOAT3(1,1,1)), intensity(1.0f),
-                       constant(1.0f), linear(0.09f), quadratic(0.032f), active(true) {}
+    SpotLightDX12() : position(XMFLOAT3(0,0,0)), radius(10.0f), color(XMFLOAT3(1,1,1)), intensity(1.0f),
+                      direction(XMFLOAT3(0,-1,0)), innerConeAngle(25.0f), outerConeAngle(35.0f),
+                      rotation(XMFLOAT3(-90, 0, 0)), active(true), castsShadow(true) {}
+    
+    // Update direction from rotation euler angles
+    void UpdateDirectionFromRotation() {
+        float pitch = XMConvertToRadians(rotation.x);
+        float yaw = XMConvertToRadians(rotation.y);
+        
+        // Calculate direction from pitch and yaw
+        direction.x = cosf(pitch) * sinf(yaw);
+        direction.y = sinf(pitch);
+        direction.z = cosf(pitch) * cosf(yaw);
+        
+        // Normalize
+        float len = sqrtf(direction.x * direction.x + direction.y * direction.y + direction.z * direction.z);
+        if (len > 0.0001f) {
+            direction.x /= len;
+            direction.y /= len;
+            direction.z /= len;
+        }
+    }
 };
+
+// Keep old name as alias
+typedef SpotLightDX12 PointLightDX12;
 
 class ClusteredRendererDX12 {
 public:
@@ -92,15 +117,17 @@ public:
     int addLight(const XMFLOAT3& position, const XMFLOAT3& color, float radius, float intensity = 1.0f) {
         if (lights.size() >= MAX_LIGHTS) return -1;
         
-        PointLightDX12 light;
+        SpotLightDX12 light;
         light.position = position;
         light.color = color;
         light.radius = radius;
         light.intensity = intensity;
         light.active = true;
-        light.constant = 1.0f;
-        light.linear = 4.5f / radius;
-        light.quadratic = 75.0f / (radius * radius);
+        light.castsShadow = true;
+        light.direction = XMFLOAT3(0, -1, 0);  // Default pointing down
+        light.innerConeAngle = 25.0f;
+        light.outerConeAngle = 35.0f;
+        light.rotation = XMFLOAT3(-90, 0, 0);  // Pointing down
         
         lights.push_back(light);
         return (int)lights.size() - 1;
@@ -128,8 +155,6 @@ public:
             lights[index].color = color;
             lights[index].radius = radius;
             lights[index].intensity = intensity;
-            lights[index].linear = 4.5f / radius;
-            lights[index].quadratic = 75.0f / (radius * radius);
         }
     }
     
@@ -249,16 +274,22 @@ public:
         }
     }
     
-    std::vector<PointLightDataDX12> getPointLightData() {
-        std::vector<PointLightDataDX12> data;
+    std::vector<SpotLightDataDX12> getPointLightData() {
+        std::vector<SpotLightDataDX12> data;
         for (const auto& light : lights) {
             if (!light.active) continue;
-            PointLightDataDX12 pld;
-            pld.position = light.position;
-            pld.radius = light.radius;
-            pld.color = light.color;
-            pld.intensity = light.intensity;
-            data.push_back(pld);
+            SpotLightDataDX12 sld;
+            sld.position = light.position;
+            sld.radius = light.radius;
+            sld.color = light.color;
+            sld.intensity = light.intensity;
+            sld.direction = light.direction;
+            sld.innerConeAngle = XMConvertToRadians(light.innerConeAngle);
+            sld.outerConeAngle = XMConvertToRadians(light.outerConeAngle);
+            sld.castsShadow = light.castsShadow ? 1 : 0;
+            sld.padding1 = 0;
+            sld.padding2 = 0;
+            data.push_back(sld);
         }
         return data;
     }

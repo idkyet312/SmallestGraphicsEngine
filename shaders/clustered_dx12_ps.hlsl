@@ -36,11 +36,18 @@ cbuffer ObjectBuffer : register(b3) {
     float obPadding;
 };
 
-struct PointLightData {
+// Spot light data structure (must match C++ SpotLightDataDX12)
+struct SpotLightData {
     float3 position;
     float radius;
     float3 color;
     float intensity;
+    float3 direction;
+    float innerConeAngle;  // In radians
+    float outerConeAngle;  // In radians
+    int castsShadow;
+    float padding1;
+    float padding2;
 };
 
 cbuffer PointLightsBuffer : register(b4) {
@@ -48,7 +55,7 @@ cbuffer PointLightsBuffer : register(b4) {
     float plPadding1;
     float plPadding2;
     float plPadding3;
-    PointLightData pointLights[64];
+    SpotLightData spotLights[64];
 };
 
 cbuffer DDGIBuffer : register(b5) {
@@ -74,12 +81,23 @@ cbuffer DDGIBuffer : register(b5) {
     float3 ddgiPadding;
 };
 
+// Shadow map (slot t0)
+Texture2D shadowMap : register(t0);
+SamplerComparisonState shadowSampler : register(s0);
+
 Texture2D albedoMap : register(t1);
 Texture2D irradianceMap : register(t2);
 Texture2D visibilityMap : register(t3);
 Texture2D normalMap : register(t4);
 Texture2D metalRoughMap : register(t5);
+
+// Spot light shadow maps (t6-t9 for up to 4 shadow-casting spot lights)
+Texture2D spotLightShadowMaps[4] : register(t6);
+
 SamplerState texSampler : register(s1);
+
+// Number of spot lights that cast shadows (max 4)
+static const int MAX_SHADOW_POINT_LIGHTS = 4;
 
 struct PS_INPUT {
     float4 position : SV_POSITION;
@@ -87,6 +105,129 @@ struct PS_INPUT {
     float3 normal : TEXCOORD1;
     float2 texCoord : TEXCOORD2;
 };
+
+// Calculate shadow for a spot light using 2D shadow map
+float CalculateSpotLightShadow(int lightIndex, float3 fragPos, float3 lightPos, float3 lightDir, float lightRadius, float outerCone) {
+    // Only first 4 spot lights have shadow maps
+    if (lightIndex >= MAX_SHADOW_POINT_LIGHTS) {
+        return 1.0;
+    }
+    
+    // Vector from light to fragment
+    float3 fragToLight = fragPos - lightPos;
+    float distance = length(fragToLight);
+    
+    // If fragment is outside light radius, no shadow
+    if (distance > lightRadius) {
+        return 1.0;
+    }
+    
+    // Check if fragment is within spot cone
+    float3 toFrag = normalize(fragToLight);
+    float cosAngle = dot(toFrag, lightDir);
+    if (cosAngle < cos(outerCone)) {
+        return 1.0; // Outside cone, no shadow calculation needed
+    }
+    
+    // Project fragment position into spot light's view space
+    // Build a simple orthonormal basis from light direction
+    float3 up = abs(lightDir.y) > 0.99 ? float3(1, 0, 0) : float3(0, 1, 0);
+    float3 right = normalize(cross(up, lightDir));
+    up = cross(lightDir, right);
+    
+    // Transform to light's local space
+    float3 localPos = fragToLight;
+    float x = dot(localPos, right);
+    float y = dot(localPos, up);
+    float z = dot(localPos, lightDir);
+    
+    // Only shadow if in front of light
+    if (z <= 0.1) return 1.0;
+    
+    // Project to normalized device coordinates based on cone angle
+    float tanCone = tan(outerCone);
+    float projX = x / (z * tanCone);
+    float projY = y / (z * tanCone);
+    
+    // Convert to UV [0,1]
+    float2 shadowUV = float2(projX * 0.5 + 0.5, -projY * 0.5 + 0.5);
+    
+    // Check bounds
+    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0) {
+        return 1.0;
+    }
+    
+    // Sample shadow map
+    float shadowMapDepth = 0.0;
+    [branch]
+    switch (lightIndex) {
+        case 0: shadowMapDepth = spotLightShadowMaps[0].SampleLevel(texSampler, shadowUV, 0).r; break;
+        case 1: shadowMapDepth = spotLightShadowMaps[1].SampleLevel(texSampler, shadowUV, 0).r; break;
+        case 2: shadowMapDepth = spotLightShadowMaps[2].SampleLevel(texSampler, shadowUV, 0).r; break;
+        case 3: shadowMapDepth = spotLightShadowMaps[3].SampleLevel(texSampler, shadowUV, 0).r; break;
+        default: return 1.0;
+    }
+    
+    // Convert perspective depth to linear
+    float nearZ = 0.1;
+    float farZ = lightRadius;
+    float linearDepth = (farZ * nearZ) / (farZ - shadowMapDepth * (farZ - nearZ));
+    
+    // Bias
+    float bias = 0.05 + 0.1 * (distance / lightRadius);
+    
+    // Shadow test
+    float shadow = (distance > linearDepth + bias) ? 0.0 : 1.0;
+    
+    return shadow;
+}
+
+// Calculate shadow factor (1.0 = lit, 0.0 = shadowed)
+float CalculateShadow(float3 worldPos, float3 surfNormal) {
+    if (enableShadows == 0) return 1.0;
+    
+    // Transform world position to light space (row-major: vector * matrix)
+    float4 fragPosLightSpace = mul(float4(worldPos, 1.0), lightSpaceMatrix);
+    
+    // Perspective divide
+    float3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
+    
+    // Transform to [0,1] range (NDC to UV) - DirectX clip space is [-1,1] for XY and [0,1] for Z
+    float2 shadowUV;
+    shadowUV.x = projCoords.x * 0.5 + 0.5;
+    shadowUV.y = projCoords.y * -0.5 + 0.5; // Flip Y: DirectX texture origin is top-left
+    
+    // Check if outside shadow map
+    if (projCoords.z > 1.0 || projCoords.z < 0.0 ||
+        shadowUV.x < 0.0 || shadowUV.x > 1.0 || 
+        shadowUV.y < 0.0 || shadowUV.y > 1.0) {
+        return 1.0;
+    }
+    
+    float currentDepth = projCoords.z;
+    
+    // Slope-scaled bias to prevent shadow acne
+    float3 lightDir = normalize(lightPos);
+    float NdotL = dot(surfNormal, lightDir);
+    float bias = 0.001 + shadowBias * (1.0 - abs(NdotL));
+    bias = min(bias, 0.01);
+    
+    // PCF (Percentage Closer Filtering) 3x3
+    float shadow = 0.0;
+    float2 texelSize = 1.0 / 2048.0; // Shadow map size
+    
+    for (int x = -1; x <= 1; ++x) {
+        for (int y = -1; y <= 1; ++y) {
+            float2 sampleUV = shadowUV + float2(x, y) * texelSize;
+            float shadowMapDepth = shadowMap.SampleLevel(texSampler, sampleUV, 0).r;
+            // In shadow if current depth > shadow map depth (something is blocking the light)
+            shadow += (currentDepth - bias > shadowMapDepth) ? 0.0 : 1.0;
+        }
+    }
+    shadow /= 9.0;
+    
+    return shadow;
+}
 
 // Octahedral encoding helper (direction to UV)
 float2 OctEncode(float3 n) {
@@ -199,29 +340,47 @@ float3 sampleDDGIIrradiance(float3 worldPos, float3 normal) {
         irradiance /= totalWeight;
     }
     
-    // Apply gamma correction (probes store linear, but we apply a gamma to brighten)
-    irradiance = pow(max(irradiance, 0.0), 1.0 / irradianceGamma);
+    // Light gamma correction (less aggressive to preserve colors)
+    // irradianceGamma of 2.2 is standard, 5.0 was too aggressive
+    float gamma = max(irradianceGamma, 1.0);
+    irradiance = pow(max(irradiance, 0.001), 1.0 / gamma);
     
+    // Apply GI intensity (the compute shader already includes light intensities)
     return irradiance * giIntensity;
 }
 
-float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 viewDir) {
-    float3 lightPosition = pointLights[index].position;
-    float3 lightCol = pointLights[index].color;
-    float lightRadius = pointLights[index].radius;
-    float lightIntensity = pointLights[index].intensity;
+float3 calculateSpotLight(int index, float3 fragPos, float3 normal, float3 viewDir, float mainShadow) {
+    float3 lightPosition = spotLights[index].position;
+    float3 lightCol = spotLights[index].color;
+    float lightRadius = spotLights[index].radius;
+    float lightIntensity = spotLights[index].intensity;
+    float3 spotDirection = normalize(spotLights[index].direction);
+    float innerCone = spotLights[index].innerConeAngle;
+    float outerCone = spotLights[index].outerConeAngle;
+    int castsShadow = spotLights[index].castsShadow;
     
     float3 lightDir = normalize(lightPosition - fragPos);
     float distance = length(lightPosition - fragPos);
     
     if (distance > lightRadius) return float3(0, 0, 0);
     
+    // Spot light cone attenuation
+    // spotDirection points FROM the light, lightDir points TO the light from fragment
+    // So we need to compare -lightDir with spotDirection
+    float theta = dot(-lightDir, spotDirection);
+    float epsilon = cos(innerCone) - cos(outerCone);
+    float spotIntensity = saturate((theta - cos(outerCone)) / max(epsilon, 0.0001));
+    
+    // If outside the cone, no light contribution
+    if (theta < cos(outerCone)) return float3(0, 0, 0);
+    
+    // Distance attenuation
     float att_linear = 4.5 / lightRadius;
     float att_quadratic = 75.0 / (lightRadius * lightRadius);
     float attenuation = 1.0 / (1.0 + att_linear * distance + att_quadratic * distance * distance);
     
     float falloff = 1.0 - smoothstep(lightRadius * 0.75, lightRadius, distance);
-    attenuation *= falloff;
+    attenuation *= falloff * spotIntensity;
     
     float diff = max(dot(normal, lightDir), 0.0);
     float3 diffuse = diff * lightCol * lightIntensity;
@@ -230,7 +389,18 @@ float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 view
     float spec = pow(max(dot(normal, halfwayDir), 0.0), (float)shininess);
     float3 specular = specularStrength * spec * lightCol * lightIntensity;
     
-    return (diffuse + specular) * attenuation;
+    // Calculate spot light shadow
+    float spotLightShadow = 1.0;
+    
+    if (index < MAX_SHADOW_POINT_LIGHTS && enableShadows && castsShadow) {
+        // Use shadow map for first 4 lights
+        spotLightShadow = CalculateSpotLightShadow(index, fragPos, lightPosition, spotDirection, lightRadius, outerCone);
+    } else {
+        // For lights without shadow maps, use main shadow as approximation
+        spotLightShadow = lerp(0.5, 1.0, mainShadow);
+    }
+    
+    return (diffuse + specular) * attenuation * spotLightShadow;
 }
 
 float4 main(PS_INPUT input) : SV_TARGET {
@@ -358,18 +528,18 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float denominator = 4.0 * NdotV * NdotL + 0.0001;
     float3 specular = numerator / denominator;
     
-    // Combine
-    float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor * NdotL * attenuation; // No light intensity? lightColor should allow > 1.
+    // Calculate shadow for main light
+    float shadow = CalculateShadow(input.fragPos, normal);
+    
+    // Combine with shadow
+    float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor * NdotL * attenuation * shadow;
     
     result += Lo;
 
-    // Point lights contribution (clustered forward)
-    // Need to PBR-ify this too
+    // Spot lights contribution (clustered forward)
     for (int i = 0; i < numPointLights && i < 64; i++) {
-        // result += calculatePointLight(i, input.fragPos, normal, viewDir) * objectColor;
-        // Skip for now to save instruction count or update calculatePointLight to PBR
-        // Just use simple Blinn for point lights for performance?
-        result += calculatePointLight(i, input.fragPos, normal, viewDir) * albedo;
+        // Pass shadow factor so spot lights are dimmed in shadowed areas
+        result += calculateSpotLight(i, input.fragPos, normal, viewDir, shadow) * albedo;
     }
     
     return float4(result, 1.0);

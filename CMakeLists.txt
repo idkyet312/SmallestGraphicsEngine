@@ -69,6 +69,7 @@ if(USE_DX12)
     target_link_libraries(GraphicEngine 
         d3d12
         d3dcompiler
+        dxcompiler
         dxgi
         imgui::imgui
     )
@@ -131,4 +132,42 @@ add_custom_command(TARGET GraphicEngine POST_BUILD
     ${CMAKE_SOURCE_DIR}/build/models
     COMMENT "Copying models to build root"
 )
+
+# Copy DXC DLLs for raytracing shader compilation (from Windows SDK)
+if(USE_DX12)
+    # Try to find dxcompiler.dll in Windows SDK
+    # Usually located in: C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\
+    set(DXC_DLL_PATHS
+        "$ENV{WindowsSdkDir}/bin/$ENV{WindowsSDKVersion}x64"
+        "$ENV{VULKAN_SDK}/Bin"
+        "C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64"
+    )
+    
+    find_file(DXCOMPILER_DLL dxcompiler.dll PATHS ${DXC_DLL_PATHS})
+    find_file(DXIL_DLL dxil.dll PATHS ${DXC_DLL_PATHS})
+    
+    if(DXCOMPILER_DLL)
+        add_custom_command(TARGET GraphicEngine POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${DXCOMPILER_DLL}
+            $<TARGET_FILE_DIR:GraphicEngine>
+            COMMENT "Copying dxcompiler.dll"
+        )
+        message(STATUS "Found dxcompiler.dll at: ${DXCOMPILER_DLL}")
+    else()
+        message(STATUS "dxcompiler.dll not found - raytracing shaders may not work")
+    endif()
+    
+    if(DXIL_DLL)
+        add_custom_command(TARGET GraphicEngine POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${DXIL_DLL}
+            $<TARGET_FILE_DIR:GraphicEngine>
+            COMMENT "Copying dxil.dll"
+        )
+        message(STATUS "Found dxil.dll at: ${DXIL_DLL}")
+    else()
+        message(STATUS "dxil.dll not found - raytracing shaders may not work")
+    endif()
+endif()
 

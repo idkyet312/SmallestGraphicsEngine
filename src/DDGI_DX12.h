@@ -399,8 +399,27 @@ public:
     }
 
     void UpdateProbes(ID3D12GraphicsCommandList* cmdList, D3D12_GPU_VIRTUAL_ADDRESS lightBufferAddr, int numLights, D3D12_GPU_VIRTUAL_ADDRESS ddgiCBAddr, const DDGIMainLightData& mainLightData) {
-        if (!computeInitialized) return;
+        if (!computeInitialized) {
+            static bool printedOnce = false;
+            if (!printedOnce) {
+                std::cout << "DDGI_DX12: UpdateProbes called but computeInitialized=false!" << std::endl;
+                printedOnce = true;
+            }
+            return;
+        }
         frameCount++;
+        
+        // Print debug info once
+        static bool printedDebug = false;
+        if (!printedDebug) {
+            D3D12_RESOURCE_DESC desc = irradianceTexture->GetDesc();
+            std::cout << "DDGI_DX12: UpdateProbes running!" << std::endl;
+            std::cout << "  - Irradiance texture size: " << desc.Width << "x" << desc.Height << std::endl;
+            std::cout << "  - Dispatch groups: " << ((desc.Width + 7) / 8) << "x" << ((desc.Height + 7) / 8) << std::endl;
+            std::cout << "  - Num lights: " << numLights << std::endl;
+            std::cout << "  - Main light color: " << mainLightData.lightColor.x << ", " << mainLightData.lightColor.y << ", " << mainLightData.lightColor.z << std::endl;
+            printedDebug = true;
+        }
         
         // Update Main Light Buffer
         mainLightUploadBuffer.CopyData(g_dx12.frameIndex, mainLightData);

@@ -14,6 +14,10 @@
 #include <string>
 #include <stdexcept>
 
+// DXC (DirectX Shader Compiler) for SM 6.x / Raytracing shaders
+#include <dxcapi.h>
+#pragma comment(lib, "dxcompiler.lib")
+
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -36,11 +40,13 @@ struct DX12Context {
     ComPtr<IDXGIFactory6> factory;
     ComPtr<IDXGIAdapter4> adapter;
     ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12Device5> device5;  // For raytracing
     
     // Command infrastructure
     ComPtr<ID3D12CommandQueue> commandQueue;
     ComPtr<ID3D12CommandAllocator> commandAllocators[FRAME_COUNT];
     ComPtr<ID3D12GraphicsCommandList> commandList;
+    ComPtr<ID3D12GraphicsCommandList4> commandList4;  // For raytracing
     
     // Swap chain
     ComPtr<IDXGISwapChain4> swapChain;
@@ -77,6 +83,13 @@ struct DX12Context {
     
     bool initialized = false;
     bool tearingSupported = false;
+    bool raytracingSupported = false;
+    
+    // DXC Compiler for SM 6.x / Raytracing shaders
+    ComPtr<IDxcUtils> dxcUtils;
+    ComPtr<IDxcCompiler3> dxcCompiler;
+    ComPtr<IDxcIncludeHandler> dxcIncludeHandler;
+    bool dxcInitialized = false;
     
     // Descriptor heap allocation tracking
     UINT cbvSrvUavHeapOffset = 0;
@@ -85,6 +98,101 @@ struct DX12Context {
 
 // Global DX12 context
 inline DX12Context g_dx12;
+
+// Initialize DXC compiler
+inline bool InitDXC() {
+    if (g_dx12.dxcInitialized) return true;
+    
+    HRESULT hr = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&g_dx12.dxcUtils));
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create DXC Utils" << std::endl;
+        return false;
+    }
+    
+    hr = DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&g_dx12.dxcCompiler));
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create DXC Compiler" << std::endl;
+        return false;
+    }
+    
+    hr = g_dx12.dxcUtils->CreateDefaultIncludeHandler(&g_dx12.dxcIncludeHandler);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create DXC Include Handler" << std::endl;
+        return false;
+    }
+    
+    g_dx12.dxcInitialized = true;
+    std::cout << "DXC compiler initialized successfully" << std::endl;
+    return true;
+}
+
+// Compile shader using DXC (for SM 6.x / raytracing)
+inline ComPtr<IDxcBlob> CompileShaderDXC(const std::wstring& filePath, const std::wstring& entryPoint, 
+                                          const std::wstring& target, bool debug = false) {
+    if (!g_dx12.dxcInitialized && !InitDXC()) {
+        return nullptr;
+    }
+    
+    // Load source file
+    ComPtr<IDxcBlobEncoding> sourceBlob;
+    HRESULT hr = g_dx12.dxcUtils->LoadFile(filePath.c_str(), nullptr, &sourceBlob);
+    if (FAILED(hr)) {
+        std::wcerr << L"Failed to load shader file: " << filePath << std::endl;
+        return nullptr;
+    }
+    
+    // Setup compile arguments
+    std::vector<LPCWSTR> args;
+    args.push_back(filePath.c_str());
+    args.push_back(L"-E");
+    args.push_back(entryPoint.c_str());
+    args.push_back(L"-T");
+    args.push_back(target.c_str());
+    
+    if (debug) {
+        args.push_back(L"-Zi");  // Debug info
+        args.push_back(L"-Od");  // Disable optimization
+    } else {
+        args.push_back(L"-O3");  // Max optimization
+    }
+    
+    // For raytracing
+    args.push_back(L"-D");
+    args.push_back(L"__DXR__");
+    
+    DxcBuffer sourceBuffer;
+    sourceBuffer.Ptr = sourceBlob->GetBufferPointer();
+    sourceBuffer.Size = sourceBlob->GetBufferSize();
+    sourceBuffer.Encoding = DXC_CP_ACP;
+    
+    ComPtr<IDxcResult> result;
+    hr = g_dx12.dxcCompiler->Compile(&sourceBuffer, args.data(), (UINT32)args.size(),
+                                      g_dx12.dxcIncludeHandler.Get(), IID_PPV_ARGS(&result));
+    
+    // Check for errors
+    ComPtr<IDxcBlobUtf8> errors;
+    result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+    if (errors && errors->GetStringLength() > 0) {
+        std::cerr << "Shader compilation errors:\n" << errors->GetStringPointer() << std::endl;
+    }
+    
+    HRESULT status;
+    result->GetStatus(&status);
+    if (FAILED(status)) {
+        std::wcerr << L"Shader compilation failed: " << filePath << std::endl;
+        return nullptr;
+    }
+    
+    ComPtr<IDxcBlob> shaderBlob;
+    result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&shaderBlob), nullptr);
+    
+    return shaderBlob;
+}
+
+// Compile raytracing library shader
+inline ComPtr<IDxcBlob> CompileRaytracingLibrary(const std::wstring& filePath, bool debug = false) {
+    return CompileShaderDXC(filePath, L"", L"lib_6_3", debug);
+}
 
 // Helper function to check HRESULT
 inline void ThrowIfFailed(HRESULT hr, const char* message = "DX12 Error") {
@@ -188,6 +296,19 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     
     // Create device
     ThrowIfFailed(D3D12CreateDevice(g_dx12.adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_dx12.device)));
+    
+    // Check for raytracing support
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5 = {};
+    if (SUCCEEDED(g_dx12.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5)))) {
+        if (options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0) {
+            g_dx12.raytracingSupported = true;
+            g_dx12.device->QueryInterface(IID_PPV_ARGS(&g_dx12.device5));
+            std::cout << "DXR (DirectX Raytracing) supported!" << std::endl;
+        }
+    }
+    if (!g_dx12.raytracingSupported) {
+        std::cout << "DXR not supported, falling back to compute-based GI" << std::endl;
+    }
     
     // Create command queue
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
@@ -300,6 +421,11 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
         0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_dx12.commandAllocators[0].Get(), nullptr,
         IID_PPV_ARGS(&g_dx12.commandList)));
     ThrowIfFailed(g_dx12.commandList->Close());
+    
+    // Query raytracing command list interface
+    if (g_dx12.raytracingSupported) {
+        g_dx12.commandList->QueryInterface(IID_PPV_ARGS(&g_dx12.commandList4));
+    }
     
     // Create fence
     ThrowIfFailed(g_dx12.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_dx12.fence)));

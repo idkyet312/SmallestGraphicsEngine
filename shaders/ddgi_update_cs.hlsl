@@ -1,6 +1,8 @@
-// DDGI Update Compute Shader
+// DDGI Update Compute Shader - Real Global Illumination
 
 #define PI 3.14159265359
+#define NUM_GI_SAMPLES 16
+#define MAX_MARCH_STEPS 32
 
 // Constants
 cbuffer DDGIBuffer : register(b0) {
@@ -26,11 +28,18 @@ cbuffer DDGIBuffer : register(b0) {
     float3 ddgiPadding;
 };
 
-struct PointLightData {
+// Spot light data structure
+struct SpotLightData {
     float3 position;
     float radius;
     float3 color;
     float intensity;
+    float3 direction;
+    float innerConeAngle;
+    float outerConeAngle;
+    int castsShadow;
+    float padding1;
+    float padding2;
 };
 
 cbuffer PointLightsBuffer : register(b1) {
@@ -38,17 +47,17 @@ cbuffer PointLightsBuffer : register(b1) {
     float plPadding1;
     float plPadding2;
     float plPadding3;
-    PointLightData pointLights[64];
+    SpotLightData spotLights[64];
 };
 
 cbuffer MainLightBuffer : register(b2) {
     float3 mainLightPos;
-    int mainLightType;             // 0=Point, 1=Directional
+    int mainLightType;
     
     float3 mainLightColor;
     float mainLightIntensity;      
     
-    matrix lightSpaceMatrix; // For shadow mapping
+    matrix lightSpaceMatrix;
     
     float shadowBias;
     int enableShadows;
@@ -244,23 +253,34 @@ float3 CalculateIndirectLighting(float3 probePos, float3 sampleDir, float2 rando
         
         surfaceLight += mainLightColor * mainLightIntensity * mainAtt * NdotL * shadow * surfaceAlbedo;
         
-        // Point lights contribution at hit surface
+        // Spot lights contribution at hit surface
         for (int i = 0; i < min(numPointLights, 16); i++) {
-            float3 plPos = pointLights[i].position;
-            float3 plColor = pointLights[i].color;
-            float plRadius = pointLights[i].radius;
-            float plIntensity = pointLights[i].intensity;
+            float3 slPos = spotLights[i].position;
+            float3 slColor = spotLights[i].color;
+            float slRadius = spotLights[i].radius;
+            float slIntensity = spotLights[i].intensity;
+            float3 slDir = spotLights[i].direction;
+            float slInnerCone = spotLights[i].innerConeAngle;
+            float slOuterCone = spotLights[i].outerConeAngle;
             
-            float3 P_to_L = plPos - hitPos;
+            float3 P_to_L = slPos - hitPos;
             float dist = length(P_to_L);
             
-            if (dist < plRadius) {
+            if (dist < slRadius) {
                 float3 L = P_to_L / dist;
-                float att = saturate(1.0 - dist / plRadius);
-                att *= att;
                 
-                float plNdotL = max(dot(hitNormal, L), 0.0);
-                surfaceLight += plColor * plIntensity * att * plNdotL * surfaceAlbedo;
+                // Spot light cone attenuation
+                float theta = dot(-L, slDir);
+                float epsilon = cos(slInnerCone) - cos(slOuterCone);
+                float spotAtt = saturate((theta - cos(slOuterCone)) / max(epsilon, 0.0001));
+                
+                if (spotAtt > 0.0) {
+                    float distAtt = saturate(1.0 - dist / slRadius);
+                    distAtt *= distAtt;
+                    
+                    float plNdotL = max(dot(hitNormal, L), 0.0);
+                    surfaceLight += slColor * slIntensity * distAtt * spotAtt * plNdotL * surfaceAlbedo;
+                }
             }
         }
         
@@ -284,16 +304,17 @@ float3 CalculateProbeRadiance(float3 probePos, float3 direction, float2 pixelCoo
     float3 totalRadiance = float3(0, 0, 0);
     
     // ===== DIRECT LIGHTING =====
-    // This is what surfaces facing this direction would receive from lights
     float3 directLight = float3(0, 0, 0);
     
-    // Main light
+    // Main light contribution
     float3 lightDir;
     float mainAtt = 1.0;
     
     if (mainLightType == 0) {
+        // Directional light
         lightDir = normalize(mainLightPos);
     } else {
+        // Point light
         lightDir = normalize(mainLightPos - probePos);
         float dist = length(mainLightPos - probePos);
         mainAtt = 1.0 / (1.0 + 0.09 * dist + 0.032 * dist * dist);
@@ -304,33 +325,49 @@ float3 CalculateProbeRadiance(float3 probePos, float3 direction, float2 pixelCoo
     float shadow = CalculateShadow(probePos + direction * normalBias);
     directLight += mainLightColor * mainLightIntensity * mainAtt * NdotL * shadow;
     
-    // Point lights
+    // Spot lights - accumulate their colored contributions
     for (int i = 0; i < min(numPointLights, 32); i++) {
-        float3 plPos = pointLights[i].position;
-        float3 plColor = pointLights[i].color;
-        float plRadius = pointLights[i].radius;
-        float plIntensity = pointLights[i].intensity;
+        float3 slPos = spotLights[i].position;
+        float3 slColor = spotLights[i].color;
+        float slRadius = spotLights[i].radius;
+        float slIntensity = spotLights[i].intensity;
+        float3 slDir = normalize(spotLights[i].direction);
+        float slInnerCone = spotLights[i].innerConeAngle;
+        float slOuterCone = spotLights[i].outerConeAngle;
         
-        float3 P_to_L = plPos - probePos;
+        float3 P_to_L = slPos - probePos;
         float dist = length(P_to_L);
         
-        if (dist < plRadius) {
-            float3 L = P_to_L / dist;
-            float att = saturate(1.0 - dist / plRadius);
-            att *= att;
-            float plNdotL = max(dot(direction, L), 0.0);
-            directLight += plColor * plIntensity * att * plNdotL;
+        if (dist < slRadius) {
+            float3 L = normalize(P_to_L);
+            
+            // Spot cone attenuation - check if probe is in light cone
+            float theta = dot(-L, slDir);
+            float cosOuter = cos(slOuterCone);
+            float cosInner = cos(slInnerCone);
+            float epsilon = cosInner - cosOuter;
+            float spotAtt = saturate((theta - cosOuter) / max(epsilon, 0.0001));
+            
+            if (spotAtt > 0.0) {
+                // Distance attenuation
+                float distAtt = saturate(1.0 - dist / slRadius);
+                distAtt *= distAtt;
+                
+                // How much this light contributes to the irradiance in 'direction'
+                float slNdotL = max(dot(direction, L), 0.0);
+                
+                // Add colored light contribution
+                directLight += slColor * slIntensity * distAtt * spotAtt * slNdotL;
+            }
         }
     }
     
-    totalRadiance += directLight;
+    totalRadiance = directLight;
     
-    // ===== INDIRECT LIGHTING (bounced light / GI) =====
-    // Sample multiple directions in the hemisphere around 'direction' 
-    // to gather bounced light
+    // ===== INDIRECT LIGHTING (one-bounce GI) =====
     float3 indirectLight = float3(0, 0, 0);
     
-    // Use 4 random samples for indirect light
+    // Sample hemisphere for indirect light
     float2 seed = pixelCoord + float2(probePos.x, probePos.z);
     for (int s = 0; s < 4; s++) {
         float2 randUV = hash3(seed + float2(s * 13.37, s * 7.13)).xy;
@@ -339,12 +376,12 @@ float3 CalculateProbeRadiance(float3 probePos, float3 direction, float2 pixelCoo
     }
     indirectLight /= 4.0;
     
-    // Add indirect contribution (scaled down since it's bounced)
-    totalRadiance += indirectLight * giIntensity;
+    // Add indirect (already considers light colors via bounced light)
+    totalRadiance += indirectLight;
     
-    // Small ambient floor to prevent pure black
+    // Small ambient to prevent pure black
     float skyFactor = saturate(direction.y * 0.5 + 0.5);
-    totalRadiance += float3(0.01, 0.012, 0.015) * skyFactor;
+    totalRadiance += float3(0.02, 0.022, 0.025) * skyFactor;
     
     return totalRadiance;
 }

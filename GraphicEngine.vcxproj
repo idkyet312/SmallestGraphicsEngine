@@ -87,7 +87,10 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="shaders\ddgi_raytracing.hlsl" />
     <ClCompile Include="shaders\ddgi_update_cs.hlsl" />
+    <ClCompile Include="shaders\point_depth_ps.hlsl" />
+    <ClCompile Include="shaders\point_depth_vs.hlsl" />
     <ClCompile Include="src\GLBImporter.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\main_dx11.cpp" />
@@ -101,6 +104,7 @@
     <ClInclude Include="src\ClusteredRendererDX12.h" />
     <ClInclude Include="src\DDGI_DX11.h" />
     <ClInclude Include="src\DDGI_DX12.h" />
+    <ClInclude Include="src\DDGI_DX12_RT.h" />
     <ClInclude Include="src\DX11Core.h" />
     <ClInclude Include="src\DX12Core.h" />
     <ClInclude Include="src\GLBImporter.h" />

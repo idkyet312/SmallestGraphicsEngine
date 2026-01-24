@@ -42,19 +42,29 @@ struct alignas(256) ObjectBufferDX12 {
     float padding;
 };
 
-struct PointLightDataDX12 {
+// Spot light data for GPU (32 bytes per light)
+struct SpotLightDataDX12 {
     XMFLOAT3 position;
     float radius;
     XMFLOAT3 color;
     float intensity;
+    XMFLOAT3 direction;     // Normalized direction the light points
+    float innerConeAngle;   // Inner cone angle in radians (full intensity)
+    float outerConeAngle;   // Outer cone angle in radians (falloff to zero)
+    int castsShadow;        // 1 if this light casts shadows
+    float padding1;
+    float padding2;
 };
+
+// Keep PointLightDataDX12 as alias for backward compatibility
+typedef SpotLightDataDX12 PointLightDataDX12;
 
 struct alignas(256) PointLightsBufferDX12 {
     int numPointLights;
     float padding1;
     float padding2;
     float padding3;
-    PointLightDataDX12 lights[64];
+    SpotLightDataDX12 lights[64];
 };
 
 struct alignas(256) DDGIBufferDX12 {
@@ -246,7 +256,7 @@ public:
         }
         
         // SRV descriptor table for global textures
-        D3D12_DESCRIPTOR_RANGE globalSrvRanges[3] = {};
+        D3D12_DESCRIPTOR_RANGE globalSrvRanges[4] = {};
         // t0 - shadowMap
         globalSrvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         globalSrvRanges[0].NumDescriptors = 1;
@@ -265,9 +275,15 @@ public:
         globalSrvRanges[2].BaseShaderRegister = 3;
         globalSrvRanges[2].RegisterSpace = 0;
         globalSrvRanges[2].OffsetInDescriptorsFromTableStart = 2;
+        // t6-t9 - Point light shadow cube maps (4 cube maps)
+        globalSrvRanges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        globalSrvRanges[3].NumDescriptors = 4;
+        globalSrvRanges[3].BaseShaderRegister = 6;
+        globalSrvRanges[3].RegisterSpace = 0;
+        globalSrvRanges[3].OffsetInDescriptorsFromTableStart = 3;
         
         rootParams[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rootParams[6].DescriptorTable.NumDescriptorRanges = 3;
+        rootParams[6].DescriptorTable.NumDescriptorRanges = 4;
         rootParams[6].DescriptorTable.pDescriptorRanges = globalSrvRanges;
         rootParams[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
@@ -594,7 +610,7 @@ public:
         data.maxRayDistance = 20.0f;
         data.normalBias = normal_bias;
         data.viewBias = 0.01f;
-        data.irradianceGamma = 5.0f;
+        data.irradianceGamma = 2.2f;
         data.giIntensity = gi_intensity;
         data.irradianceTexWidth = 8;
         data.irradianceTexHeight = 8;

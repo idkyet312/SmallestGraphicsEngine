@@ -18,6 +18,7 @@
 #include "SceneGraph.h"
 #include "GLBImporter.h"
 #include "DDGI_DX12.h"
+#include "DDGI_DX12_RT.h"
 
 using namespace DirectX;
 
@@ -123,7 +124,9 @@ bool useClusteredRendering = true;
 
 // DDGI Global Illumination settings
 DDGIRendererDX12 ddgiRenderer;
+DDGIRendererRT ddgiRendererRT;  // Raytracing-based DDGI
 bool useDDGI = true;
+bool useRaytracedDDGI = true;   // Prefer raytracing if available
 float giIntensity = 0.5f;
 float normalBias = 0.1f;
 float probeSpacing = 2.0f;
@@ -138,6 +141,7 @@ bool animateDemoLights = false;
 // DX12 resources
 ShaderDX12 mainShader;
 ShaderDX12 depthShader;  // For shadow map rendering
+ShaderDX12 pointDepthShader;  // For point light shadow cube maps
 ComPtr<ID3D12Resource> cubeVertexBuffer;
 ComPtr<ID3D12Resource> planeVertexBuffer;
 D3D12_VERTEX_BUFFER_VIEW cubeVBV = {};
@@ -149,6 +153,22 @@ const UINT SHADOW_HEIGHT = 2048;
 ComPtr<ID3D12Resource> shadowMap;
 ComPtr<ID3D12DescriptorHeap> shadowDsvHeap;
 ComPtr<ID3D12DescriptorHeap> shadowSrvHeap;
+
+// Point light shadow cube maps
+const UINT POINT_SHADOW_SIZE = 512;  // Resolution per face
+const int MAX_SHADOW_POINT_LIGHTS = 4;
+ComPtr<ID3D12Resource> pointLightShadowCubeMaps[MAX_SHADOW_POINT_LIGHTS];
+ComPtr<ID3D12DescriptorHeap> pointShadowDsvHeap;
+ComPtr<ID3D12DescriptorHeap> pointShadowSrvHeap;
+
+// Point light constant buffer for depth shader
+struct PointLightCB {
+    XMFLOAT3 lightPosition;
+    float lightRadius;
+};
+ComPtr<ID3D12Resource> pointLightCB;
+PointLightCB* mappedPointLightCB = nullptr;
+bool pointLightShadowsEnabled = true;
 
 // Vertex structure
 struct Vertex {
@@ -371,6 +391,88 @@ bool CreateShadowMap() {
         shadowSrvHeap->GetCPUDescriptorHandleForHeapStart());
         
     std::cout << "Shadow map created successfully" << std::endl;
+    
+    return true;
+}
+
+bool CreatePointLightShadowMaps() {
+    // Create 2D shadow maps for spot light shadows (simpler than cube maps)
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+    
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = POINT_SHADOW_SIZE;
+    texDesc.Height = POINT_SHADOW_SIZE;
+    texDesc.DepthOrArraySize = 1;  // Single 2D texture per spot light
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    
+    D3D12_CLEAR_VALUE clearValue = {};
+    clearValue.Format = DXGI_FORMAT_D32_FLOAT;
+    clearValue.DepthStencil.Depth = 1.0f;
+    
+    for (int i = 0; i < MAX_SHADOW_POINT_LIGHTS; i++) {
+        HRESULT hr = g_dx12.device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &texDesc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clearValue,
+            IID_PPV_ARGS(&pointLightShadowCubeMaps[i]));
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create spot light shadow map " << i << std::endl;
+            return false;
+        }
+    }
+    
+    // Create DSV heap for spot light shadow maps (1 per light)
+    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
+    dsvHeapDesc.NumDescriptors = MAX_SHADOW_POINT_LIGHTS;
+    dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    HRESULT hr = g_dx12.device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&pointShadowDsvHeap));
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create spot shadow DSV heap" << std::endl;
+        return false;
+    }
+    
+    // Create DSVs for each spot light
+    UINT dsvIncrement = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = pointShadowDsvHeap->GetCPUDescriptorHandleForHeapStart();
+    
+    for (int i = 0; i < MAX_SHADOW_POINT_LIGHTS; i++) {
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+        dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
+        dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        g_dx12.device->CreateDepthStencilView(pointLightShadowCubeMaps[i].Get(), &dsvDesc, dsvHandle);
+        dsvHandle.ptr += dsvIncrement;
+    }
+    
+    // Create SRV heap for spot light shadow maps (shader visible)
+    D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
+    srvHeapDesc.NumDescriptors = MAX_SHADOW_POINT_LIGHTS;
+    srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = g_dx12.device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&pointShadowSrvHeap));
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create spot shadow SRV heap" << std::endl;
+        return false;
+    }
+    
+    // Create 2D texture SRVs
+    UINT srvIncrement = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = pointShadowSrvHeap->GetCPUDescriptorHandleForHeapStart();
+    
+    for (int i = 0; i < MAX_SHADOW_POINT_LIGHTS; i++) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        g_dx12.device->CreateShaderResourceView(pointLightShadowCubeMaps[i].Get(), &srvDesc, srvHandle);
+        srvHandle.ptr += srvIncrement;
+    }
+    
+    std::cout << "Spot light shadow maps created successfully (" << MAX_SHADOW_POINT_LIGHTS << " lights)" << std::endl;
     
     return true;
 }
@@ -866,12 +968,37 @@ void RecursiveDrawShadow(std::shared_ptr<SceneNode> node, const XMMATRIX& lightS
                  } else {
                      g_dx12.commandList->DrawInstanced((UINT)(prim.vertices.size() / 8), 1, 0, 0);
                  }
+                 depthShader.NextDrawCall();
              }
         }
     }
     
     for (auto& child : node->children) {
         RecursiveDrawShadow(child, lightSpaceMatrix);
+    }
+}
+
+// Register scene geometry for raytracing DDGI
+void RegisterSceneForRaytracing() {
+    if (!useRaytracedDDGI || !ddgiRendererRT.rtSupported) return;
+    
+    ddgiRendererRT.ClearGeometry();
+    
+    // Add floor plane
+    if (planeVertexBuffer) {
+        ddgiRendererRT.AddGeometry(planeVertexBuffer.Get(), 6, sizeof(Vertex),
+            nullptr, 0, floorColor);
+    }
+    
+    // Add cube
+    if (cubeVertexBuffer) {
+        ddgiRendererRT.AddGeometry(cubeVertexBuffer.Get(), 36, sizeof(Vertex),
+            nullptr, 0, cubeColor);
+    }
+    
+    // Build acceleration structures
+    if (!ddgiRendererRT.geometries.empty()) {
+        ddgiRendererRT.BuildAccelerationStructures();
     }
 }
 
@@ -1043,10 +1170,44 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cout << "Depth shader loaded successfully" << std::endl;
     }
     
+    // Load point light depth shader for cube shadow maps
+    if (!pointDepthShader.Load("shaders/point_depth_vs.hlsl", "shaders/point_depth_ps.hlsl")) {
+        std::cerr << "Failed to load point depth shader - point light shadows will be disabled" << std::endl;
+        pointLightShadowsEnabled = false;
+    } else {
+        std::cout << "Point depth shader loaded successfully" << std::endl;
+        
+        // Create point light constant buffer
+        D3D12_HEAP_PROPERTIES heapProps = {};
+        heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+        
+        D3D12_RESOURCE_DESC bufferDesc = {};
+        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufferDesc.Width = 256; // Aligned to 256 bytes
+        bufferDesc.Height = 1;
+        bufferDesc.DepthOrArraySize = 1;
+        bufferDesc.MipLevels = 1;
+        bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+        bufferDesc.SampleDesc.Count = 1;
+        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        
+        g_dx12.device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&pointLightCB));
+        pointLightCB->Map(0, nullptr, (void**)&mappedPointLightCB);
+    }
+    
     // Create shadow map
     if (enableShadows && !CreateShadowMap()) {
         std::cerr << "Failed to create shadow map - shadows will be disabled" << std::endl;
         enableShadows = false;
+    }
+    
+    // Create point light shadow cube maps
+    if (enableShadows && pointLightShadowsEnabled) {
+        if (!CreatePointLightShadowMaps()) {
+            std::cerr << "Failed to create point light shadow maps - point light shadows disabled" << std::endl;
+            pointLightShadowsEnabled = false;
+        }
     }
 
     // Initialize DDGI
@@ -1061,6 +1222,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
     }
     
+    // Initialize Raytraced DDGI if available
+    if (useRaytracedDDGI && g_dx12.raytracingSupported) {
+        if (ddgiRendererRT.Init()) {
+            std::cout << "Raytraced DDGI initialized (DXR)" << std::endl;
+        } else {
+            std::cout << "Raytraced DDGI failed, falling back to compute" << std::endl;
+            useRaytracedDDGI = false;
+        }
+    } else {
+        useRaytracedDDGI = false;
+    }
+    
     // Initialize clustered renderer and demo lights
     clusteredRenderer.init();
     for (int i = 0; i < numDemoLights; i++) {
@@ -1073,6 +1246,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         color.z = sinf(angle + 4.189f) * 0.5f + 0.5f;
         clusteredRenderer.addLight(pos, color, demoLightRadius, demoLightIntensity);
     }
+    
+    // Build raytracing acceleration structures for DDGI
+    RegisterSceneForRaytracing();
     
     gameTimer.Start();
     float lastTime = 0.0f;
@@ -1269,30 +1445,192 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
             g_dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
         }
+        
+        // =====================
+        // Point Light Shadow Pass
+        // =====================
+        if (enableShadows && pointLightShadowsEnabled && pointShadowDsvHeap) {
+            // Get active point lights
+            std::vector<PointLightDataDX12> activeLights = clusteredRenderer.getPointLightData();
+            int numShadowLights = (int)activeLights.size();
+            if (numShadowLights > MAX_SHADOW_POINT_LIGHTS) numShadowLights = MAX_SHADOW_POINT_LIGHTS;
+            
+            // Set point light shadow viewport
+            D3D12_VIEWPORT plShadowViewport = {};
+            plShadowViewport.Width = (float)POINT_SHADOW_SIZE;
+            plShadowViewport.Height = (float)POINT_SHADOW_SIZE;
+            plShadowViewport.MinDepth = 0.0f;
+            plShadowViewport.MaxDepth = 1.0f;
+            
+            D3D12_RECT plShadowScissor = { 0, 0, (LONG)POINT_SHADOW_SIZE, (LONG)POINT_SHADOW_SIZE };
+            
+            UINT dsvIncrement = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            
+            depthShader.Use(false);
+            
+            for (int lightIdx = 0; lightIdx < numShadowLights; lightIdx++) {
+                // Skip lights that don't cast shadows
+                if (!activeLights[lightIdx].castsShadow) continue;
+                
+                XMFLOAT3 slPos = activeLights[lightIdx].position;
+                XMFLOAT3 slDir = activeLights[lightIdx].direction;
+                float slRadius = activeLights[lightIdx].radius;
+                float slOuterCone = activeLights[lightIdx].outerConeAngle;
+                
+                // Transition shadow map to depth write
+                D3D12_RESOURCE_BARRIER barrier = {};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition.pResource = pointLightShadowCubeMaps[lightIdx].Get();
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                g_dx12.commandList->ResourceBarrier(1, &barrier);
+                
+                g_dx12.commandList->RSSetViewports(1, &plShadowViewport);
+                g_dx12.commandList->RSSetScissorRects(1, &plShadowScissor);
+                
+                // Get DSV for this light
+                D3D12_CPU_DESCRIPTOR_HANDLE lightDsv = pointShadowDsvHeap->GetCPUDescriptorHandleForHeapStart();
+                lightDsv.ptr += lightIdx * dsvIncrement;
+                
+                // Clear and set as render target
+                g_dx12.commandList->ClearDepthStencilView(lightDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+                g_dx12.commandList->OMSetRenderTargets(0, nullptr, FALSE, &lightDsv);
+                
+                // Create view matrix looking from light in spot direction
+                XMVECTOR slPosVec = XMLoadFloat3(&slPos);
+                XMFLOAT3 targetPos = XMFLOAT3(slPos.x + slDir.x, slPos.y + slDir.y, slPos.z + slDir.z);
+                XMVECTOR targetVec = XMLoadFloat3(&targetPos);
+                
+                // Calculate up vector perpendicular to direction
+                XMFLOAT3 upFloat = XMFLOAT3(0, 1, 0);
+                if (fabsf(slDir.y) > 0.99f) upFloat = XMFLOAT3(1, 0, 0);
+                XMVECTOR upVec = XMLoadFloat3(&upFloat);
+                
+                XMMATRIX slView = XMMatrixLookAtLH(slPosVec, targetVec, upVec);
+                // Use outer cone angle for FOV, doubled since it's half-angle
+                float fov = slOuterCone * 2.0f;
+                if (fov < 0.1f) fov = XM_PIDIV2; // Fallback if angle is too small
+                if (fov > XM_PI - 0.1f) fov = XM_PI - 0.1f; // Clamp to avoid extreme FOV
+                XMMATRIX slProj = XMMatrixPerspectiveFovLH(fov, 1.0f, 0.1f, slRadius);
+                XMMATRIX slLightSpace = slView * slProj;
+                
+                // Render scene from spot light perspective
+                XMMATRIX model = XMMatrixIdentity();
+                depthShader.SetMatrices(model, XMMatrixIdentity(), XMMatrixIdentity(), slLightSpace);
+                DrawPlane();
+                depthShader.NextDrawCall();
+                
+                // Cube 1
+                model = XMMatrixScaling(cubeScale.x, cubeScale.y, cubeScale.z);
+                model = model * XMMatrixRotationX(XMConvertToRadians(cubeRotation.x));
+                model = model * XMMatrixRotationY(XMConvertToRadians(cubeRotation.y));
+                model = model * XMMatrixRotationZ(XMConvertToRadians(cubeRotation.z));
+                model = model * XMMatrixTranslation(cubePosition.x, cubePosition.y, cubePosition.z);
+                depthShader.SetMatrices(model, XMMatrixIdentity(), XMMatrixIdentity(), slLightSpace);
+                DrawCube();
+                depthShader.NextDrawCall();
+                
+                // Cube 2
+                if (showSecondCube) {
+                    model = XMMatrixScaling(cube2Scale.x, cube2Scale.y, cube2Scale.z);
+                    model = model * XMMatrixRotationX(XMConvertToRadians(cube2Rotation.x));
+                    model = model * XMMatrixRotationY(XMConvertToRadians(cube2Rotation.y));
+                    model = model * XMMatrixRotationZ(XMConvertToRadians(cube2Rotation.z));
+                    model = model * XMMatrixTranslation(cube2Position.x, cube2Position.y, cube2Position.z);
+                    depthShader.SetMatrices(model, XMMatrixIdentity(), XMMatrixIdentity(), slLightSpace);
+                    DrawCube();
+                    depthShader.NextDrawCall();
+                }
+                
+                // Render imported GLB model for spot light shadows
+                if (loadedModelNode && !gunModel.loaded) {
+                    DirectX::XMFLOAT4X4 identity;
+                    DirectX::XMStoreFloat4x4(&identity, DirectX::XMMatrixIdentity());
+                    
+                    loadedModelNode->UpdateLocalTransform();
+                    loadedModelNode->UpdateGlobalTransform(identity);
+                    
+                    RecursiveDrawShadow(loadedModelNode, slLightSpace);
+                }
+                
+                // Transition shadow map back to shader resource
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                g_dx12.commandList->ResourceBarrier(1, &barrier);
+            }
+            
+            // Restore viewport and render target
+            g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
+            g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+            
+            D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = GetCPUDescriptorHandle(
+                g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize, g_dx12.frameIndex);
+            D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            g_dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+        }
 
-        // --- DDGI Update (Compute) ---
-        if (useDDGI && ddgiRenderer.computeInitialized) {
-             std::vector<PointLightDataDX12> lightData = clusteredRenderer.getPointLightData();
-             mainShader.SetPointLights((int)lightData.size(), lightData);
-             mainShader.SetDDGI(useDDGI, giIntensity, normalBias, probeSpacing);
-             
-             // Prepare Main Light Data
-             DDGIMainLightData mainLightData = {};
-             mainLightData.lightPos = lightPos;
-             mainLightData.lightType = lightType;
-             mainLightData.lightColor = lightColor;
-             mainLightData.intensity = 1.0f; // Assuming lightColor carries intensity or multiply if needed
-             mainLightData.lightSpaceMatrix = lightSpaceMatrix;
-             mainLightData.shadowBias = shadowBias;
-             mainLightData.enableShadows = enableShadows ? 1 : 0;
-             
-             ddgiRenderer.UpdateProbes(
-                 g_dx12.commandList.Get(), 
-                 mainShader.pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex),
-                 (int)lightData.size(),
-                 mainShader.ddgiBuffer.GetGPUAddress(g_dx12.frameIndex),
-                 mainLightData
-             );
+        // --- DDGI Update ---
+        if (useDDGI) {
+            std::vector<PointLightDataDX12> lightData = clusteredRenderer.getPointLightData();
+            mainShader.SetPointLights((int)lightData.size(), lightData);
+            mainShader.SetDDGI(useDDGI, giIntensity, normalBias, probeSpacing);
+            
+            bool usedRaytracing = false;
+            static bool printedDDGIStatus = false;
+            
+            // Try DXR raytracing first if enabled and available
+            if (useRaytracedDDGI && ddgiRendererRT.initialized && ddgiRendererRT.rtPipelineState) {
+                // Use raytraced DDGI (DXR) - only if we have a valid pipeline
+                XMFLOAT3 sunDir = lightPos;
+                ddgiRendererRT.config.giIntensity = giIntensity;
+                ddgiRendererRT.config.normalBias = normalBias;
+                ddgiRendererRT.config.probeSpacing = probeSpacing;
+                ddgiRendererRT.UpdateProbes(sunDir, lightColor, 1.0f, lightData);
+                usedRaytracing = true;
+                
+                if (!printedDDGIStatus) {
+                    std::cout << "DDGI: Using DXR Raytracing pipeline" << std::endl;
+                    printedDDGIStatus = true;
+                }
+            } else if (useRaytracedDDGI && ddgiRendererRT.initialized && !ddgiRendererRT.rtPipelineState) {
+                // DXR was requested but pipeline creation failed
+                if (!printedDDGIStatus) {
+                    std::cout << "DDGI: DXR requested but pipeline failed - using compute fallback" << std::endl;
+                    printedDDGIStatus = true;
+                }
+            }
+            
+            // Always use compute DDGI if raytracing wasn't used (fallback or primary)
+            if (!usedRaytracing && ddgiRenderer.computeInitialized) {
+                // Use compute-based DDGI
+                DDGIMainLightData mainLightData = {};
+                mainLightData.lightPos = lightPos;
+                mainLightData.lightType = lightType;
+                mainLightData.lightColor = lightColor;
+                mainLightData.intensity = 1.0f;
+                mainLightData.lightSpaceMatrix = lightSpaceMatrix;
+                mainLightData.shadowBias = shadowBias;
+                mainLightData.enableShadows = enableShadows ? 1 : 0;
+                
+                ddgiRenderer.UpdateProbes(
+                    g_dx12.commandList.Get(), 
+                    mainShader.pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex),
+                    (int)lightData.size(),
+                    mainShader.ddgiBuffer.GetGPUAddress(g_dx12.frameIndex),
+                    mainLightData
+                );
+                
+                if (!printedDDGIStatus) {
+                    std::cout << "DDGI: Using Compute shader pipeline" << std::endl;
+                    printedDDGIStatus = true;
+                }
+            } else if (!usedRaytracing && !ddgiRenderer.computeInitialized) {
+                if (!printedDDGIStatus) {
+                    std::cout << "DDGI: ERROR - No DDGI pipeline available! Compute not initialized." << std::endl;
+                    printedDDGIStatus = true;
+                }
+            }
         }
         
         // Use shader
@@ -1329,7 +1667,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // 2. DDGI Irradiance
         destHandle.ptr += increment;
         if (useDDGI) {
-            g_dx12.device->CopyDescriptorsSimple(1, destHandle, ddgiRenderer.GetIrradianceSRV(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            static bool printedSRVDebug = false;
+            D3D12_CPU_DESCRIPTOR_HANDLE srcHandle = ddgiRenderer.GetIrradianceSRV();
+            if (!printedSRVDebug) {
+                std::cout << "DDGI: Copying irradiance SRV, src handle ptr: " << srcHandle.ptr << std::endl;
+                std::cout << "DDGI: irradianceTexture valid: " << (ddgiRenderer.irradianceTexture ? "YES" : "NO") << std::endl;
+                printedSRVDebug = true;
+            }
+            g_dx12.device->CopyDescriptorsSimple(1, destHandle, srcHandle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         }
         
         // 3. DDGI Visibility
@@ -1338,7 +1683,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_dx12.device->CopyDescriptorsSimple(1, destHandle, ddgiRenderer.GetVisibilitySRV(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         }
         
-        // Bind the table starting at index 0 (contains Shadow, Irradiance, Visibility as requested by root parameter 6)
+        // 4-7. Point Light Shadow Cube Maps (t6-t9)
+        if (enableShadows && pointLightShadowsEnabled && pointShadowSrvHeap) {
+            destHandle.ptr += increment;
+            D3D12_CPU_DESCRIPTOR_HANDLE srcHandle = pointShadowSrvHeap->GetCPUDescriptorHandleForHeapStart();
+            g_dx12.device->CopyDescriptorsSimple(MAX_SHADOW_POINT_LIGHTS, destHandle, srcHandle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        
+        // Bind the table starting at index 0 (contains Shadow, Irradiance, Visibility, Point Light Shadows as requested by root parameter 6)
         g_dx12.commandList->SetGraphicsRootDescriptorTable(6, g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart());
         
         // Set common uniforms
@@ -1633,6 +1985,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 ImGui::ColorEdit3("Clear Color", &clearColor.x);
                 ImGui::Checkbox("Use Clustered Rendering", &useClusteredRendering);
                 ImGui::Checkbox("Enable Shadows", &enableShadows);
+                if (enableShadows) {
+                    ImGui::Indent();
+                    ImGui::Checkbox("Point Light Shadows", &pointLightShadowsEnabled);
+                    if (pointLightShadowsEnabled) {
+                        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "First %d lights cast shadows", MAX_SHADOW_POINT_LIGHTS);
+                    }
+                    ImGui::Unindent();
+                }
                 ImGui::Checkbox("Wireframe Mode", &wireframeMode);
                 ImGui::DragFloat("Ambient", &ambientStrength, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Specular", &specularStrength, 0.01f, 0.0f, 1.0f);
@@ -1674,13 +2034,35 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 
                 if (selectedLightIndex >= 0) {
                     ImGui::Separator();
-                    ImGui::Text("Selected Light: %d", selectedLightIndex);
-                    PointLightDX12* light = clusteredRenderer.getLight(selectedLightIndex);
+                    ImGui::Text("Selected Spot Light: %d", selectedLightIndex);
+                    SpotLightDX12* light = clusteredRenderer.getLight(selectedLightIndex);
                     if (light) {
                         ImGui::DragFloat3("Position##selected", &light->position.x, 0.1f);
                         ImGui::ColorEdit3("Color##selected", &light->color.x);
                         ImGui::DragFloat("Radius##selected", &light->radius, 0.5f, 1.0f, 50.0f);
                         ImGui::DragFloat("Intensity##selected", &light->intensity, 0.1f, 0.1f, 10.0f);
+                        
+                        ImGui::Separator();
+                        ImGui::Text("Spot Light Direction");
+                        bool rotChanged = false;
+                        rotChanged |= ImGui::DragFloat("Pitch (X)", &light->rotation.x, 1.0f, -180.0f, 180.0f);
+                        rotChanged |= ImGui::DragFloat("Yaw (Y)", &light->rotation.y, 1.0f, -180.0f, 180.0f);
+                        if (rotChanged) {
+                            light->UpdateDirectionFromRotation();
+                        }
+                        ImGui::Text("Direction: %.2f, %.2f, %.2f", light->direction.x, light->direction.y, light->direction.z);
+                        
+                        ImGui::Separator();
+                        ImGui::Text("Cone Angles (degrees)");
+                        ImGui::DragFloat("Inner Cone", &light->innerConeAngle, 1.0f, 5.0f, 85.0f);
+                        ImGui::DragFloat("Outer Cone", &light->outerConeAngle, 1.0f, 10.0f, 90.0f);
+                        // Ensure outer >= inner
+                        if (light->outerConeAngle < light->innerConeAngle) {
+                            light->outerConeAngle = light->innerConeAngle + 5.0f;
+                        }
+                        
+                        ImGui::Separator();
+                        ImGui::Checkbox("Casts Shadow", &light->castsShadow);
                         
                         if (ImGui::Button("Delete Selected Light")) {
                             clusteredRenderer.removeLight(selectedLightIndex);
@@ -1703,6 +2085,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 ImGui::Text("DDGI Global Illumination");
                 ImGui::Checkbox("Enable DDGI", &useDDGI);
                 if (useDDGI) {
+                    // Raytracing option
+                    if (g_dx12.raytracingSupported) {
+                        ImGui::Checkbox("Use Raytracing (DXR)", &useRaytracedDDGI);
+                        if (useRaytracedDDGI && ddgiRendererRT.initialized && ddgiRendererRT.rtPipelineState) {
+                            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "DXR Active");
+                        } else if (useRaytracedDDGI && ddgiRendererRT.initialized && !ddgiRendererRT.rtPipelineState) {
+                            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "DXR Failed - Using Compute");
+                        } else if (ddgiRenderer.computeInitialized) {
+                            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Compute Shader Active");
+                        } else {
+                            ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "No DDGI Pipeline!");
+                        }
+                    } else {
+                        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "DXR Not Supported");
+                        if (ddgiRenderer.computeInitialized) {
+                            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Compute Shader Active");
+                        }
+                    }
+                    
                     ImGui::DragFloat("GI Intensity", &giIntensity, 0.1f, 0.0f, 5.0f);
                     ImGui::DragFloat("Normal Bias", &normalBias, 0.01f, 0.0f, 1.0f);
                     ImGui::DragFloat("Probe Spacing", &probeSpacing, 0.1f, 0.5f, 10.0f);
