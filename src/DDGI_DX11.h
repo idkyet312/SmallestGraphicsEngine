@@ -304,33 +304,74 @@ public:
         g_dx11.context->PSSetShaderResources(visibilitySlot, 1, &nullSRV);
     }
     
-    // Simple probe update - accumulates ambient lighting from scene
-    // In a full implementation, this would use ray tracing
-    void updateProbes(const XMFLOAT3& mainLightDir, const XMFLOAT3& mainLightColor, float ambientStrength) {
+    // Structure to hold light info for GI computation
+    struct GILight {
+        XMFLOAT3 position;
+        XMFLOAT3 color;
+        float radius;
+        float intensity;
+        bool isDirectional;
+    };
+    
+    std::vector<GILight> giLights;
+    
+    void addGILight(const XMFLOAT3& pos, const XMFLOAT3& color, float radius, float intensity, bool directional = false) {
+        GILight light;
+        light.position = pos;
+        light.color = color;
+        light.radius = radius;
+        light.intensity = intensity;
+        light.isDirectional = directional;
+        giLights.push_back(light);
+    }
+    
+    void clearGILights() {
+        giLights.clear();
+    }
+    
+    // Update probes by computing GI from all scene lights
+    void updateProbesFromLights() {
         if (!initialized || !config.enabled) return;
         
         frameCount++;
         
-        // Copy current to previous for temporal blending
-        g_dx11.context->CopyResource(prevIrradianceTexture.Get(), irradianceTexture.Get());
-        g_dx11.context->CopyResource(prevVisibilityTexture.Get(), visibilityTexture.Get());
+        // Only update every 30 frames to avoid performance issues
+        if (frameCount % 30 != 0) return;
         
-        // For this simplified implementation, we'll just set a base ambient value
-        // A full DDGI implementation would trace rays from each probe
+        // Simple approach: clear with average light color
+        float totalR = 0.0f, totalG = 0.0f, totalB = 0.0f;
+        float totalIntensity = 0.0f;
         
-        // Clear with ambient-influenced color
-        float ambient = ambientStrength * config.giIntensity;
-        float clearColor[4] = {
-            mainLightColor.x * ambient * 0.5f,
-            mainLightColor.y * ambient * 0.5f,
-            mainLightColor.z * ambient * 0.5f,
-            1.0f
-        };
-        
-        // Only clear occasionally to simulate temporal accumulation
-        if (frameCount % 60 == 0) {
-            g_dx11.context->ClearRenderTargetView(irradianceRTV.Get(), clearColor);
+        for (const auto& light : giLights) {
+            float intensity = light.intensity;
+            if (!light.isDirectional) {
+                intensity *= 0.5f; // Reduce point light contribution
+            }
+            totalR += light.color.x * intensity;
+            totalG += light.color.y * intensity;
+            totalB += light.color.z * intensity;
+            totalIntensity += intensity;
         }
+        
+        if (totalIntensity > 0.0f) {
+            totalR /= totalIntensity;
+            totalG /= totalIntensity;
+            totalB /= totalIntensity;
+        }
+        
+        // Apply GI intensity
+        float gi = config.giIntensity * 0.3f;
+        float clearColor[4] = { totalR * gi, totalG * gi, totalB * gi, 1.0f };
+        
+        g_dx11.context->ClearRenderTargetView(irradianceRTV.Get(), clearColor);
+    }
+    
+    // Legacy update function - now calls the new one
+    void updateProbes(const XMFLOAT3& mainLightDir, const XMFLOAT3& mainLightColor, float ambientStrength) {
+        // Add main light as directional if not already in list
+        clearGILights();
+        addGILight(mainLightDir, mainLightColor, 100.0f, 1.0f, true);
+        updateProbesFromLights();
     }
 };
 
