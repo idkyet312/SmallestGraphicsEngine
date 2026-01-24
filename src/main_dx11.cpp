@@ -26,7 +26,7 @@ inline void Shader::setPointLights(int numLights, const std::vector<PointLightDa
     if (SUCCEEDED(g_dx11.context->Map(pointLightsBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         PointLightsBuffer* data = (PointLightsBuffer*)mapped.pData;
         data->numPointLights = numLights;
-        int count = numLights < 32 ? numLights : 32;
+        int count = numLights < 64 ? numLights : 64;
         for (int i = 0; i < count; i++) {
             data->lights[i].position = lights[i].position;
             data->lights[i].radius = lights[i].radius;
@@ -58,6 +58,9 @@ float deltaTime = 0.0f;
 float lastFrame = 0.0f;
 bool showUI = true;
 bool cameraLocked = true;
+bool isFullscreen = false;
+RECT windowedRect = {};
+DWORD windowedStyle = 0;
 
 // Editable scene parameters
 XMFLOAT3 lightPos(-5.0f, 10.0f, -5.0f);
@@ -124,7 +127,7 @@ float projectileScale = 0.1f;
 ClusteredRenderer clusteredRenderer;
 bool useClusteredRendering = true;
 bool showClusterDebug = false;
-int numDemoLights = 8;
+int numDemoLights = 64;
 float demoLightRadius = 8.0f;
 float demoLightIntensity = 1.5f;
 bool animateDemoLights = true;
@@ -282,16 +285,53 @@ void DrawPlane() {
     g_dx11.context->Draw(6, 0);
 }
 
+void ToggleFullscreen(HWND hwnd) {
+    if (!isFullscreen) {
+        // Save current window position and size
+        GetWindowRect(hwnd, &windowedRect);
+        windowedStyle = GetWindowLong(hwnd, GWL_STYLE);
+        
+        // Get monitor info
+        HMONITOR hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) };
+        GetMonitorInfo(hMon, &mi);
+        
+        // Set borderless fullscreen
+        SetWindowLong(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(hwnd, HWND_TOP,
+            mi.rcMonitor.left, mi.rcMonitor.top,
+            mi.rcMonitor.right - mi.rcMonitor.left,
+            mi.rcMonitor.bottom - mi.rcMonitor.top,
+            SWP_FRAMECHANGED | SWP_NOCOPYBITS);
+        
+        isFullscreen = true;
+    } else {
+        // Restore windowed mode
+        SetWindowLong(hwnd, GWL_STYLE, windowedStyle);
+        SetWindowPos(hwnd, HWND_NOTOPMOST,
+            windowedRect.left, windowedRect.top,
+            windowedRect.right - windowedRect.left,
+            windowedRect.bottom - windowedRect.top,
+            SWP_FRAMECHANGED | SWP_NOCOPYBITS);
+        
+        isFullscreen = false;
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
         return true;
     
     switch (msg) {
     case WM_SIZE:
-        if (g_dx11.device && wParam != SIZE_MINIMIZED) {
-            SCR_WIDTH = LOWORD(lParam);
-            SCR_HEIGHT = HIWORD(lParam);
-            ResizeDX11(SCR_WIDTH, SCR_HEIGHT);
+        if (g_dx11.device && g_dx11.initialized && wParam != SIZE_MINIMIZED) {
+            unsigned int newWidth = LOWORD(lParam);
+            unsigned int newHeight = HIWORD(lParam);
+            if (newWidth > 0 && newHeight > 0 && (newWidth != SCR_WIDTH || newHeight != SCR_HEIGHT)) {
+                SCR_WIDTH = newWidth;
+                SCR_HEIGHT = newHeight;
+                ResizeDX11(SCR_WIDTH, SCR_HEIGHT);
+            }
         }
         return 0;
         
@@ -366,6 +406,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (camera.FPSMode) {
                 camera.Position.y = camera.FloorY + camera.PlayerHeight;
             }
+        } else if (wParam == VK_F11) {
+            ToggleFullscreen(hwnd);
         }
         return 0;
         
@@ -811,10 +853,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         // Render gun viewmodel
         if (gunModel.loaded && gunModel.visible) {
             g_dx11.context->ClearDepthStencilView(g_dx11.depthStencilView.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+            g_dx11.context->RSSetState(g_dx11.noCullState.Get());  // Disable culling for gun model
             model = gunModel.getModelMatrix(camera.Position, camera.Front, camera.Up);
             clusteredShader.setMatrices(model, view, projection, lightSpaceMatrix);
             clusteredShader.setObjectColor(gunModel.color);
             gunModel.draw();
+            g_dx11.context->RSSetState(g_dx11.rasterizerState.Get());  // Restore normal culling
         }
         
         // Unbind shadow map SRV before next frame's render to depth
@@ -825,8 +869,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ImGui::Render();
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         
-        // Present
-        g_dx11.swapChain->Present(0, 0);
+        // Present (uncapped frame rate with tearing allowed)
+        g_dx11.swapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
     }
     
     // Cleanup

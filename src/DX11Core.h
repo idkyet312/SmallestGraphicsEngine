@@ -28,6 +28,7 @@ struct DX11Context {
     ComPtr<ID3D11Texture2D> depthStencilBuffer;
     ComPtr<ID3D11RasterizerState> rasterizerState;
     ComPtr<ID3D11RasterizerState> wireframeState;
+    ComPtr<ID3D11RasterizerState> noCullState;
     ComPtr<ID3D11DepthStencilState> depthStencilState;
     ComPtr<ID3D11DepthStencilState> depthDisabledState;
     ComPtr<ID3D11BlendState> blendState;
@@ -60,6 +61,7 @@ inline bool InitDX11(HWND hwnd, unsigned int width, unsigned int height) {
     swapChainDesc.SampleDesc.Quality = 0;
     swapChainDesc.Windowed = TRUE;
     swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    swapChainDesc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     
     D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
     UINT flags = 0;
@@ -128,6 +130,10 @@ inline bool InitDX11(HWND hwnd, unsigned int width, unsigned int height) {
     rasterDesc.FillMode = D3D11_FILL_WIREFRAME;
     g_dx11.device->CreateRasterizerState(&rasterDesc, &g_dx11.wireframeState);
     
+    rasterDesc.FillMode = D3D11_FILL_SOLID;
+    rasterDesc.CullMode = D3D11_CULL_NONE;
+    g_dx11.device->CreateRasterizerState(&rasterDesc, &g_dx11.noCullState);
+    
     g_dx11.context->RSSetState(g_dx11.rasterizerState.Get());
     
     // Create depth stencil states
@@ -183,7 +189,7 @@ inline void ResizeDX11(unsigned int width, unsigned int height) {
     g_dx11.depthStencilView.Reset();
     g_dx11.depthStencilBuffer.Reset();
     
-    HRESULT hr = g_dx11.swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+    HRESULT hr = g_dx11.swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
     if (FAILED(hr)) return;
     
     ComPtr<ID3D11Texture2D> backBuffer;

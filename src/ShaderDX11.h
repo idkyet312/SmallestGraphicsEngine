@@ -56,8 +56,10 @@ struct ShaderPointLightData {
 
 struct PointLightsBuffer {
     int numPointLights;
-    XMFLOAT3 padding;
-    ShaderPointLightData lights[32];
+    float padding1;
+    float padding2;
+    float padding3;
+    ShaderPointLightData lights[64];
 };
 
 class Shader {

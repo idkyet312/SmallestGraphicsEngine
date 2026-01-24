@@ -41,8 +41,10 @@ struct PointLightData {
 
 cbuffer PointLightsBuffer : register(b4) {
     int numPointLights;
-    float3 plPadding;
-    PointLightData pointLights[32];
+    float plPadding1;
+    float plPadding2;
+    float plPadding3;
+    PointLightData pointLights[64];
 };
 
 Texture2D shadowMap : register(t0);
@@ -163,7 +165,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
     result += (1.0 - shadow) * (diffuse + specular) * attenuation;
     
     // Point lights contribution (clustered)
-    for (int i = 0; i < numPointLights && i < 32; i++) {
+    for (int i = 0; i < numPointLights && i < 64; i++) {
         result += calculatePointLight(i, input.fragPos, normal, viewDir) * objectColor;
     }
     
