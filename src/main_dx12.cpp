@@ -6,6 +6,7 @@
 #include <vector>
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx12.h>
@@ -762,6 +763,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// Helpers for rotation
+XMFLOAT3 QuaternionToEuler(const XMFLOAT4& q) {
+    XMFLOAT3 angles;
+    
+    // Roll (x-axis rotation)
+    double sinr_cosp = 2 * (q.w * q.x + q.y * q.z);
+    double cosr_cosp = 1 - 2 * (q.x * q.x + q.y * q.y);
+    angles.x = (float)std::atan2(sinr_cosp, cosr_cosp);
+    
+    // Pitch (y-axis rotation)
+    double sinp = 2 * (q.w * q.y - q.z * q.x);
+    if (std::abs(sinp) >= 1)
+        angles.y = (float)std::copysign(XM_PI / 2, sinp); // use 90 degrees if out of range
+    else
+        angles.y = (float)std::asin(sinp);
+        
+    // Yaw (z-axis rotation)
+    double siny_cosp = 2 * (q.w * q.z + q.x * q.y);
+    double cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z);
+    angles.z = (float)std::atan2(siny_cosp, cosy_cosp);
+    
+    return angles;
+}
+
 // Helper to display recursive scene graph in ImGui
 void ShowSceneGraphNode(SceneNode* node) {
     if (!node) return;
@@ -777,14 +802,37 @@ void ShowSceneGraphNode(SceneNode* node) {
     if (nodeOpen) {
         // Transform controls
         ImGui::PushID(node);
-        ImGui::DragFloat3("Position", &node->translation.x, 0.1f);
         
-        // Convert quaternion to Euler angles for editing - this is simplified, proper implementation needs conversion
-        // For now just expose as 4 floats or assume euler if we change SceneNode to use Euler
-        // Assuming quaternion for now, let's just show it but maybe not edit it easily without conversion
-        // ImGui::DragFloat4("Rotation (Quat)", &node->rotation.x, 0.01f);
+        bool transformChanged = false;
         
-        ImGui::DragFloat3("Scale", &node->scale.x, 0.1f);
+        if (ImGui::DragFloat3("Position", &node->translation.x, 0.1f)) transformChanged = true;
+        
+        // Rotation
+        XMFLOAT3 euler = QuaternionToEuler(node->rotation);
+        // Convert to degrees for UI
+        euler.x = XMConvertToDegrees(euler.x);
+        euler.y = XMConvertToDegrees(euler.y);
+        euler.z = XMConvertToDegrees(euler.z);
+        
+        if (ImGui::DragFloat3("Rotation", &euler.x, 1.0f)) {
+            // Convert back to radians and then to quaternion
+            // Using XMQuaternionRotationRollPitchYaw(Pitch, Yaw, Roll)
+            // Where Pitch=X, Yaw=Y, Roll=Z in DirectX
+            XMVECTOR q = XMQuaternionRotationRollPitchYaw(
+                XMConvertToRadians(euler.x), // Pitch (X)
+                XMConvertToRadians(euler.y), // Yaw (Y)
+                XMConvertToRadians(euler.z)  // Roll (Z)
+            );
+            XMStoreFloat4(&node->rotation, q);
+            transformChanged = true;
+        }
+        
+        if (ImGui::DragFloat3("Scale", &node->scale.x, 0.1f)) transformChanged = true;
+        
+        if (transformChanged) {
+            node->UpdateLocalTransform();
+        }
+
         ImGui::PopID();
         
         // Children
@@ -1216,8 +1264,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // Shadow map SRV needs to be in that heap too.
         
         // Let's assume for now we use the main heap.
-        // We need to copy the shadow SRV to the main heap if it's not there.
-        // But shadowSrvHeap is created separately in CreateShadowMap().
+        // We need to copy the shadow descriptor to it. 
+        // Or assume SetObjectMaterial uses the currently bound heap.
         
         // Bind shadow map SRV if shadows are enabled
         if (enableShadows && shadowSrvHeap) {
@@ -1226,12 +1274,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // Let's rely on g_dx12.cbvSrvUavHeap being the main one.
             // We need to copy shadow descriptor to it. 
             // Or assume SetObjectMaterial uses the currently bound heap.
-            
-            // For this fix, let's just bind the main heap and put shadow map there.
-            // But I don't want to rewrite the whole heap management now.
-            
-            // Temporary fix: If we are drawing the GLB (which uses materials), we bind the main heap.
-            // If we assume the shadow map is just T0, we can put it at start of main heap.
             
             ID3D12DescriptorHeap* heaps[] = { g_dx12.cbvSrvUavHeap.Get() };
             g_dx12.commandList->SetDescriptorHeaps(1, heaps);
