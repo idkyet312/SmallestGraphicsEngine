@@ -25,6 +25,8 @@ build/
 *.pdb
 *.exp
 
+models/
+
 # CMake
 CMakeCache.txt
 CMakeFiles/
