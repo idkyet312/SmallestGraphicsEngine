@@ -1,4 +1,4 @@
-// Clustered Forward Pixel Shader - DX11 HLSL
+// Clustered Forward Pixel Shader - DX11 HLSL with DDGI
 
 cbuffer MatrixBuffer : register(b0) {
     matrix model;
@@ -47,7 +47,34 @@ cbuffer PointLightsBuffer : register(b4) {
     PointLightData pointLights[64];
 };
 
+// DDGI Constant Buffer
+cbuffer DDGIBuffer : register(b5) {
+    float3 probeGridOrigin;
+    float probeSpacing;
+    
+    int probeCountX;
+    int probeCountY;
+    int probeCountZ;
+    float maxRayDistance;
+    
+    float normalBias;
+    float viewBias;
+    float irradianceGamma;
+    float giIntensity;
+    
+    int irradianceTexWidth;
+    int irradianceTexHeight;
+    int visibilityTexWidth;
+    int visibilityTexHeight;
+    
+    int ddgiEnabled;
+    float ddgiPadding[3];
+};
+
 Texture2D shadowMap : register(t0);
+Texture2D ddgiIrradiance : register(t2);
+Texture2D ddgiVisibility : register(t3);
+
 SamplerComparisonState shadowSampler : register(s0);
 SamplerState regularSampler : register(s1);
 
@@ -57,6 +84,102 @@ struct PS_INPUT {
     float3 normal : TEXCOORD1;
     float4 fragPosLightSpace : TEXCOORD2;
 };
+
+// DDGI Helper functions
+int3 getProbeGridCoord(float3 worldPos) {
+    float3 offset = worldPos - probeGridOrigin;
+    return int3(
+        clamp((int)(offset.x / probeSpacing), 0, probeCountX - 1),
+        clamp((int)(offset.y / probeSpacing), 0, probeCountY - 1),
+        clamp((int)(offset.z / probeSpacing), 0, probeCountZ - 1)
+    );
+}
+
+float3 getProbeWorldPosition(int3 probeCoord) {
+    return probeGridOrigin + float3(probeCoord) * probeSpacing;
+}
+
+int getProbeIndex(int3 probeCoord) {
+    return probeCoord.x + probeCoord.z * probeCountX + probeCoord.y * probeCountX * probeCountZ;
+}
+
+float2 getProbeIrradianceUV(int3 probeCoord, float3 direction) {
+    // Octahedral mapping for direction
+    float2 octDir = direction.xy / (abs(direction.x) + abs(direction.y) + abs(direction.z));
+    if (direction.z < 0.0) {
+        octDir = (1.0 - abs(octDir.yx)) * sign(octDir);
+    }
+    octDir = octDir * 0.5 + 0.5;
+    
+    // Calculate probe's position in the atlas
+    int probesPerRow = probeCountX * probeCountZ;
+    int probeIdx = probeCoord.x + probeCoord.z * probeCountX;
+    int probeRow = probeCoord.y;
+    
+    float2 atlasOffset = float2(
+        (float)(probeIdx * irradianceTexWidth),
+        (float)(probeRow * irradianceTexHeight)
+    );
+    
+    float totalWidth = (float)(probeCountX * probeCountZ * irradianceTexWidth);
+    float totalHeight = (float)(probeCountY * irradianceTexHeight);
+    
+    float2 uv = (atlasOffset + octDir * float2(irradianceTexWidth, irradianceTexHeight)) / float2(totalWidth, totalHeight);
+    return uv;
+}
+
+float3 sampleDDGIIrradiance(float3 worldPos, float3 normal) {
+    if (ddgiEnabled == 0) return float3(0, 0, 0);
+    
+    // Get the 8 surrounding probes
+    float3 offset = worldPos - probeGridOrigin;
+    float3 gridPos = offset / probeSpacing;
+    
+    int3 baseCoord = int3(floor(gridPos));
+    baseCoord = clamp(baseCoord, int3(0, 0, 0), int3(probeCountX - 1, probeCountY - 1, probeCountZ - 1));
+    
+    float3 alpha = frac(gridPos);
+    
+    float3 totalIrradiance = float3(0, 0, 0);
+    float totalWeight = 0.0;
+    
+    // Trilinear interpolation over 8 probes
+    for (int i = 0; i < 8; i++) {
+        int3 probeOffset = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        int3 probeCoord = baseCoord + probeOffset;
+        
+        // Clamp to valid range
+        probeCoord = clamp(probeCoord, int3(0, 0, 0), int3(probeCountX - 1, probeCountY - 1, probeCountZ - 1));
+        
+        float3 probePos = getProbeWorldPosition(probeCoord);
+        float3 probeToPoint = worldPos - probePos;
+        float3 dir = normalize(probeToPoint);
+        
+        // Trilinear weights
+        float3 triWeights = lerp(1.0 - alpha, alpha, float3(probeOffset));
+        float weight = triWeights.x * triWeights.y * triWeights.z;
+        
+        // Backface test - reduce weight for probes behind the surface
+        float backfaceWeight = max(0.0001, dot(dir, normal) * 0.5 + 0.5);
+        weight *= backfaceWeight;
+        
+        // Sample irradiance
+        float2 uv = getProbeIrradianceUV(probeCoord, normal);
+        float3 irradiance = ddgiIrradiance.SampleLevel(regularSampler, uv, 0).rgb;
+        
+        // Apply gamma correction
+        irradiance = pow(max(irradiance, 0.0), 1.0 / irradianceGamma);
+        
+        totalIrradiance += irradiance * weight;
+        totalWeight += weight;
+    }
+    
+    if (totalWeight > 0.0) {
+        totalIrradiance /= totalWeight;
+    }
+    
+    return totalIrradiance * giIntensity;
+}
 
 float ShadowCalculation(float4 fragPosLightSpace, float3 normal, float3 lightDir) {
     if (enableShadows == 0) return 0.0;
@@ -130,8 +253,12 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float3 normal = normalize(input.normal);
     float3 viewDir = normalize(viewPos - input.fragPos);
     
-    // Ambient
+    // Ambient from DDGI or fallback
     float3 ambient = ambientStrength * objectColor;
+    
+    // Sample DDGI for global illumination
+    float3 giContribution = sampleDDGIIrradiance(input.fragPos, normal);
+    ambient += giContribution * objectColor;
     
     // Main light contribution
     float3 result = ambient;

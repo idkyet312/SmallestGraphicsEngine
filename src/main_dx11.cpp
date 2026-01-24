@@ -19,6 +19,7 @@
 #include "ShaderDX11.h"
 #include "CameraDX11.h"
 #include "ModelDX11.h"
+#include "DDGI_DX11.h"
 
 // Implementation of setPointLights (needs PointLightData from ClusteredRendererDX11.h)
 inline void Shader::setPointLights(int numLights, const std::vector<PointLightData>& lights) {
@@ -131,6 +132,10 @@ int numDemoLights = 64;
 float demoLightRadius = 8.0f;
 float demoLightIntensity = 1.5f;
 bool animateDemoLights = true;
+
+// DDGI Global Illumination
+DDGIRenderer ddgiRenderer;
+bool useDDGI = true;
 
 // DX11 Resources
 ComPtr<ID3D11Buffer> cubeVB;
@@ -521,6 +526,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return -1;
     }
     
+    // Initialize DDGI
+    if (!ddgiRenderer.init()) {
+        std::cerr << "Failed to initialize DDGI (non-fatal)" << std::endl;
+        useDDGI = false;
+    } else {
+        std::cout << "DDGI initialized with " << ddgiRenderer.getTotalProbeCount() << " probes" << std::endl;
+    }
+    
     // Load gun model
     gunModel.loadOBJ("models/gun.obj");
     
@@ -653,6 +666,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 ImGui::DragFloat("Ambient", &ambientStrength, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Specular", &specularStrength, 0.01f, 0.0f, 1.0f);
                 
+                // DDGI Settings
+                ImGui::Separator();
+                ImGui::Text("DDGI Global Illumination");
+                ImGui::Checkbox("Enable DDGI", &ddgiRenderer.config.enabled);
+                if (ddgiRenderer.config.enabled) {
+                    ImGui::DragFloat("GI Intensity", &ddgiRenderer.config.giIntensity, 0.1f, 0.0f, 5.0f);
+                    ImGui::DragFloat("Normal Bias", &ddgiRenderer.config.normalBias, 0.01f, 0.0f, 1.0f);
+                    ImGui::DragFloat("Probe Spacing", &ddgiRenderer.config.probeSpacing, 0.1f, 0.5f, 10.0f);
+                    ImGui::Checkbox("Show Probes", &ddgiRenderer.config.showProbes);
+                    ImGui::Text("Probes: %d (%dx%dx%d)", 
+                        ddgiRenderer.getTotalProbeCount(),
+                        ddgiRenderer.config.probeCountX,
+                        ddgiRenderer.config.probeCountY,
+                        ddgiRenderer.config.probeCountZ);
+                }
+                
                 if (useClusteredRendering) {
                     ImGui::Separator();
                     ImGui::Text("Clustered Rendering");
@@ -783,6 +812,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         g_dx11.context->PSSetSamplers(0, 1, g_dx11.shadowSamplerState.GetAddressOf());
         g_dx11.context->PSSetSamplers(1, 1, g_dx11.samplerState.GetAddressOf());
         
+        // Bind DDGI resources
+        if (useDDGI && ddgiRenderer.config.enabled) {
+            XMFLOAT3 lightDir;
+            XMStoreFloat3(&lightDir, XMVector3Normalize(XMLoadFloat3(&lightPos)));
+            ddgiRenderer.updateProbes(lightDir, lightColor, ambientStrength);
+            ddgiRenderer.bind(2, 3, 5);
+        }
+        
         // Set common uniforms
         clusteredShader.setLight(lightPos, lightType, lightColor, lightConstant, lightLinear, lightQuadratic,
             ambientStrength, specularStrength, specularShininess, shadowBias, enableShadows);
@@ -861,9 +898,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             g_dx11.context->RSSetState(g_dx11.rasterizerState.Get());  // Restore normal culling
         }
         
-        // Unbind shadow map SRV before next frame's render to depth
+        // Unbind shadow map SRV and DDGI before next frame's render to depth
         ID3D11ShaderResourceView* nullSRV = nullptr;
         g_dx11.context->PSSetShaderResources(0, 1, &nullSRV);
+        if (useDDGI) {
+            ddgiRenderer.unbind(2, 3);
+        }
         
         // Render ImGui
         ImGui::Render();
