@@ -35,6 +35,10 @@ struct alignas(256) CameraBufferDX12 {
 
 struct alignas(256) ObjectBufferDX12 {
     XMFLOAT3 objectColor;
+    float useTexture;      // > 0.5 enabled
+    float metalness;
+    float roughness;
+    float useNormalMap;    // > 0.5 enabled
     float padding;
 };
 
@@ -162,7 +166,8 @@ public:
     
     // Current draw call index within frame
     UINT currentDrawCall = 0;
-    
+    UINT currentSrvOffset = 0; // For material descriptors
+
     bool loaded = false;
     
     ShaderDX12() {}
@@ -227,9 +232,10 @@ public:
         // 3: CBV - Object buffer (b3)
         // 4: CBV - Point lights buffer (b4)
         // 5: CBV - DDGI buffer (b5)
-        // 6: Descriptor table - SRVs (t0, t2, t3 for shadowMap, ddgiIrradiance, ddgiVisibility)
+        // 6: Descriptor table - Global SRVs (t0, t2, t3)
+        // 7: Descriptor table - Material SRVs (t1, t4, t5)
         
-        D3D12_ROOT_PARAMETER rootParams[7] = {};
+        D3D12_ROOT_PARAMETER rootParams[8] = {};
         
         // CBVs (root descriptors)
         for (int i = 0; i < 6; i++) {
@@ -239,31 +245,57 @@ public:
             rootParams[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         }
         
-        // SRV descriptor table for textures
-        D3D12_DESCRIPTOR_RANGE srvRanges[3] = {};
+        // SRV descriptor table for global textures
+        D3D12_DESCRIPTOR_RANGE globalSrvRanges[3] = {};
         // t0 - shadowMap
-        srvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srvRanges[0].NumDescriptors = 1;
-        srvRanges[0].BaseShaderRegister = 0;
-        srvRanges[0].RegisterSpace = 0;
-        srvRanges[0].OffsetInDescriptorsFromTableStart = 0;
+        globalSrvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        globalSrvRanges[0].NumDescriptors = 1;
+        globalSrvRanges[0].BaseShaderRegister = 0;
+        globalSrvRanges[0].RegisterSpace = 0;
+        globalSrvRanges[0].OffsetInDescriptorsFromTableStart = 0;
         // t2 - ddgiIrradiance
-        srvRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srvRanges[1].NumDescriptors = 1;
-        srvRanges[1].BaseShaderRegister = 2;
-        srvRanges[1].RegisterSpace = 0;
-        srvRanges[1].OffsetInDescriptorsFromTableStart = 1;
+        globalSrvRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        globalSrvRanges[1].NumDescriptors = 1;
+        globalSrvRanges[1].BaseShaderRegister = 2;
+        globalSrvRanges[1].RegisterSpace = 0;
+        globalSrvRanges[1].OffsetInDescriptorsFromTableStart = 1;
         // t3 - ddgiVisibility
-        srvRanges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srvRanges[2].NumDescriptors = 1;
-        srvRanges[2].BaseShaderRegister = 3;
-        srvRanges[2].RegisterSpace = 0;
-        srvRanges[2].OffsetInDescriptorsFromTableStart = 2;
+        globalSrvRanges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        globalSrvRanges[2].NumDescriptors = 1;
+        globalSrvRanges[2].BaseShaderRegister = 3;
+        globalSrvRanges[2].RegisterSpace = 0;
+        globalSrvRanges[2].OffsetInDescriptorsFromTableStart = 2;
         
         rootParams[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         rootParams[6].DescriptorTable.NumDescriptorRanges = 3;
-        rootParams[6].DescriptorTable.pDescriptorRanges = srvRanges;
+        rootParams[6].DescriptorTable.pDescriptorRanges = globalSrvRanges;
         rootParams[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        // SRV descriptor table for material textures
+        D3D12_DESCRIPTOR_RANGE matSrvRanges[3] = {};
+        // t1 - Albedo
+        matSrvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        matSrvRanges[0].NumDescriptors = 1;
+        matSrvRanges[0].BaseShaderRegister = 1;
+        matSrvRanges[0].RegisterSpace = 0;
+        matSrvRanges[0].OffsetInDescriptorsFromTableStart = 0;
+        // t4 - Normal
+        matSrvRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        matSrvRanges[1].NumDescriptors = 1;
+        matSrvRanges[1].BaseShaderRegister = 4;
+        matSrvRanges[1].RegisterSpace = 0;
+        matSrvRanges[1].OffsetInDescriptorsFromTableStart = 1;
+        // t5 - MetallicRoughness
+        matSrvRanges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        matSrvRanges[2].NumDescriptors = 1;
+        matSrvRanges[2].BaseShaderRegister = 5;
+        matSrvRanges[2].RegisterSpace = 0;
+        matSrvRanges[2].OffsetInDescriptorsFromTableStart = 2;
+        
+        rootParams[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParams[7].DescriptorTable.NumDescriptorRanges = 3;
+        rootParams[7].DescriptorTable.pDescriptorRanges = matSrvRanges;
+        rootParams[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         
         // Static samplers
         D3D12_STATIC_SAMPLER_DESC staticSamplers[2] = {};
@@ -289,7 +321,7 @@ public:
         staticSamplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        rootSigDesc.NumParameters = 7;
+        rootSigDesc.NumParameters = 8;
         rootSigDesc.pParameters = rootParams;
         rootSigDesc.NumStaticSamplers = 2;
         rootSigDesc.pStaticSamplers = staticSamplers;
@@ -392,6 +424,10 @@ public:
     // Call this at the start of each frame to reset draw call counter
     void BeginFrame() {
         currentDrawCall = 0;
+        // Start after standard descriptors (if any). Let's assume 0-10 reserved or something?
+        // Actually, main_dx12 might use some slots.
+        // Let's reserve 0-63 for globals.
+        currentSrvOffset = 64; 
     }
     
     // Get the buffer index for per-draw-call data
@@ -449,8 +485,84 @@ public:
         
         ObjectBufferDX12 data;
         data.objectColor = color;
+        data.useTexture = 0.0f;
+        data.metalness = 0.0f;
+        data.roughness = 0.5f;
+        data.useNormalMap = 0.0f;
+        data.padding = 0.0f;
+        
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
+    }
+    
+    void SetObjectMaterial(const XMFLOAT3& color, bool useTex, bool useNorm, float metal, float rough,
+                          ID3D12Resource* albedo, ID3D12Resource* normal, ID3D12Resource* metalRough) {
+        UINT bufferIndex = GetDrawCallIndex();
+        
+        ObjectBufferDX12 data;
+        data.objectColor = color;
+        data.useTexture = useTex ? 1.0f : 0.0f;
+        data.useNormalMap = useNorm ? 1.0f : 0.0f;
+        data.metalness = metal;
+        data.roughness = rough;
+        
+        objectBuffer.CopyData(bufferIndex, data);
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
+
+        // Textures
+        if (useTex || useNorm) {
+             // We need 3 descriptors
+             UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+             
+             // Get handles
+             D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
+             D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle = g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart();
+             
+             cpuHandle.ptr += currentSrvOffset * descriptorSize;
+             gpuHandle.ptr += currentSrvOffset * descriptorSize;
+             
+             // Create SRVs
+             // Albedo (t1)
+             if (albedo) {
+                 g_dx12.device->CreateShaderResourceView(albedo, nullptr, cpuHandle);
+             } else {
+                 // Create null SRV? or just skip? safer to create null
+                 D3D12_SHADER_RESOURCE_VIEW_DESC nullDesc = {};
+                 nullDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                 nullDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                 nullDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                 g_dx12.device->CreateShaderResourceView(nullptr, &nullDesc, cpuHandle);
+             }
+             cpuHandle.ptr += descriptorSize;
+             
+             // Normal (t4)
+             if (normal) {
+                 g_dx12.device->CreateShaderResourceView(normal, nullptr, cpuHandle);
+             } else {
+                 D3D12_SHADER_RESOURCE_VIEW_DESC nullDesc = {};
+                 nullDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                 nullDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                 nullDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                 g_dx12.device->CreateShaderResourceView(nullptr, &nullDesc, cpuHandle);
+             }
+             cpuHandle.ptr += descriptorSize;
+             
+             // MetalRough (t5)
+             if (metalRough) {
+                 g_dx12.device->CreateShaderResourceView(metalRough, nullptr, cpuHandle);
+             } else {
+                 D3D12_SHADER_RESOURCE_VIEW_DESC nullDesc = {};
+                 nullDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                 nullDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                 nullDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                 g_dx12.device->CreateShaderResourceView(nullptr, &nullDesc, cpuHandle);
+             }
+             
+             // Bind table
+             g_dx12.commandList->SetGraphicsRootDescriptorTable(7, gpuHandle);
+             
+             currentSrvOffset += 3;
+        }
     }
     
     // Call this after each DrawCube/DrawPlane to advance to the next buffer slot
