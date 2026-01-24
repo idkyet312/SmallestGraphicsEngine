@@ -5,6 +5,7 @@
 #include <iostream>
 #include <vector>
 #include <chrono>
+#include <algorithm>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx12.h>
@@ -12,6 +13,7 @@
 #include "DX12Core.h"
 #include "ShaderDX12.h"
 #include "CameraDX11.h" // Camera logic is API-agnostic
+#include "ClusteredRendererDX12.h"
 
 using namespace DirectX;
 
@@ -32,22 +34,39 @@ DWORD windowedStyle = 0;
 
 // Scene parameters
 XMFLOAT3 lightPos(-5.0f, 10.0f, -5.0f);
+XMFLOAT3 lightTarget(0.0f, 0.0f, 0.0f);
+XMFLOAT3 lightUp(0.0f, 1.0f, 0.0f);
 XMFLOAT3 cubePosition(0.0f, 1.5f, 0.0f);
 XMFLOAT3 cubeScale(1.0f, 1.0f, 1.0f);
 XMFLOAT3 cubeRotation(0.0f, 0.0f, 0.0f);
-XMFLOAT3 cubeColor(0.8f, 0.2f, 0.2f);
+XMFLOAT3 cubeColor(0.7f, 0.7f, 0.7f);  // Grey like DX11
 XMFLOAT3 floorColor(0.5f, 0.5f, 0.5f);
 XMFLOAT3 clearColor(0.1f, 0.1f, 0.1f);
 float cameraFOV = 45.0f;
 float cameraNear = 0.1f;
 float cameraFar = 100.0f;
+float lightOrthoSize = 15.0f;
+float lightNear = 1.0f;
+float lightFar = 25.0f;
 
 float shadowBias = 0.005f;
 bool enableShadows = true;
 bool wireframeMode = false;
-float ambientStrength = 0.3f;
+float ambientStrength = 0.0f;
 float specularStrength = 0.5f;
 int specularShininess = 32;
+
+// Second cube
+bool showSecondCube = false;
+XMFLOAT3 cube2Position(-3.0f, 0.5f, 2.0f);
+XMFLOAT3 cube2Scale(0.5f, 0.5f, 0.5f);
+XMFLOAT3 cube2Rotation(0.0f, 45.0f, 0.0f);
+XMFLOAT3 cube2Color(0.8f, 0.8f, 0.8f);
+
+// Animation
+bool animateLight = false;
+bool animateCube = false;
+float animationSpeed = 1.0f;
 
 int lightType = 0;
 float lightConstant = 1.0f;
@@ -55,15 +74,43 @@ float lightLinear = 0.09f;
 float lightQuadratic = 0.032f;
 XMFLOAT3 lightColor(1.0f, 1.0f, 1.0f);
 
-// Point lights
-struct PointLight {
+// Gun viewmodel
+struct GunModel {
+    bool visible = true;
+    bool loaded = false;
+    XMFLOAT3 color = XMFLOAT3(0.2f, 0.2f, 0.25f);
+    XMFLOAT3 offset = XMFLOAT3(0.170f, -0.140f, 0.490f);
+    XMFLOAT3 scale = XMFLOAT3(0.5f, 0.5f, 0.5f);
+    XMFLOAT3 rotation = XMFLOAT3(0.0f, 180.0f, 0.0f);
+};
+GunModel gunModel;
+
+// Projectiles
+struct Projectile {
     XMFLOAT3 position;
-    float radius;
-    XMFLOAT3 color;
-    float intensity;
+    XMFLOAT3 direction;
+    float speed;
+    float lifetime;
     bool active;
 };
-std::vector<PointLight> pointLights;
+std::vector<Projectile> projectiles;
+float projectileSpeed = 50.0f;
+float projectileLifetime = 3.0f;
+XMFLOAT3 projectileColor(1.0f, 0.8f, 0.0f);
+float projectileScale = 0.1f;
+
+// Clustered rendering
+ClusteredRendererDX12 clusteredRenderer;
+bool useClusteredRendering = true;
+
+// DDGI Global Illumination settings
+bool useDDGI = true;
+float giIntensity = 0.5f;
+float normalBias = 0.1f;
+float probeSpacing = 2.0f;
+bool showProbes = false;
+
+// Point lights settings
 int numDemoLights = 64;
 float demoLightRadius = 8.0f;
 float demoLightIntensity = 1.5f;
@@ -198,14 +245,14 @@ bool CreateGeometry() {
     }
     
     // Plane vertices
-    float planeSize = 20.0f;
+    float planeSize = 25.0f;
     std::vector<Vertex> planeVertices = {
-        {{-planeSize, 0.0f,  planeSize}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-        {{ planeSize, 0.0f,  planeSize}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
-        {{ planeSize, 0.0f, -planeSize}, {0.0f, 1.0f, 0.0f}, {1.0f, 1.0f}},
-        {{-planeSize, 0.0f,  planeSize}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-        {{ planeSize, 0.0f, -planeSize}, {0.0f, 1.0f, 0.0f}, {1.0f, 1.0f}},
-        {{-planeSize, 0.0f, -planeSize}, {0.0f, 1.0f, 0.0f}, {0.0f, 1.0f}},
+        {{-planeSize, -0.5f,  planeSize}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
+        {{ planeSize, -0.5f,  planeSize}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+        {{ planeSize, -0.5f, -planeSize}, {0.0f, 1.0f, 0.0f}, {1.0f, 1.0f}},
+        {{-planeSize, -0.5f,  planeSize}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
+        {{ planeSize, -0.5f, -planeSize}, {0.0f, 1.0f, 0.0f}, {1.0f, 1.0f}},
+        {{-planeSize, -0.5f, -planeSize}, {0.0f, 1.0f, 0.0f}, {0.0f, 1.0f}},
     };
     
     if (!CreateVertexBuffer(planeVertices, planeVertexBuffer, planeVBV)) {
@@ -259,12 +306,22 @@ void ToggleFullscreen(HWND hwnd) {
 
 void ProcessInput(HWND hwnd) {
     if (!cameraLocked && !(showUI && ImGui::GetIO().WantCaptureKeyboard)) {
-        if (GetAsyncKeyState('W') & 0x8000) camera.ProcessKeyboard(0, deltaTime);
-        if (GetAsyncKeyState('S') & 0x8000) camera.ProcessKeyboard(1, deltaTime);
-        if (GetAsyncKeyState('A') & 0x8000) camera.ProcessKeyboard(2, deltaTime);
-        if (GetAsyncKeyState('D') & 0x8000) camera.ProcessKeyboard(3, deltaTime);
-        if (GetAsyncKeyState(VK_SPACE) & 0x8000) camera.ProcessKeyboard(4, deltaTime);
-        if (GetAsyncKeyState(VK_SHIFT) & 0x8000) camera.ProcessKeyboard(5, deltaTime);
+        if (GetAsyncKeyState('W') & 0x8000) camera.ProcessKeyboard('W', deltaTime);
+        if (GetAsyncKeyState('S') & 0x8000) camera.ProcessKeyboard('S', deltaTime);
+        if (GetAsyncKeyState('A') & 0x8000) camera.ProcessKeyboard('A', deltaTime);
+        if (GetAsyncKeyState('D') & 0x8000) camera.ProcessKeyboard('D', deltaTime);
+        
+        static bool spacePressed = false;
+        if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
+            if (!spacePressed) {
+                camera.Jump();
+                spacePressed = true;
+            }
+        } else {
+            spacePressed = false;
+        }
+        
+        if (GetAsyncKeyState(VK_SHIFT) & 0x8000) camera.ProcessKeyboard('Q', deltaTime);
     }
 }
 
@@ -320,6 +377,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 lastX = (float)(rect.right - rect.left) / 2;
                 lastY = (float)(rect.bottom - rect.top) / 2;
                 firstMouse = true;
+            } else {
+                // Shoot projectile
+                Projectile proj;
+                proj.position = camera.Position;
+                proj.direction = camera.Front;
+                proj.speed = projectileSpeed;
+                proj.lifetime = projectileLifetime;
+                proj.active = true;
+                projectiles.push_back(proj);
             }
         }
         return 0;
@@ -338,6 +404,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             cameraLocked = true;
             ReleaseCapture();
             ShowCursor(TRUE);
+        } else if (wParam == 'F') {
+            camera.FPSMode = !camera.FPSMode;
+            if (camera.FPSMode) {
+                camera.Position.y = camera.FloorY + camera.PlayerHeight;
+            }
         } else if (wParam == VK_F11) {
             ToggleFullscreen(hwnd);
         }
@@ -427,27 +498,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         return -1;
     }
     
-    // Load shaders
-    if (!mainShader.Load("shaders/simple_vs.hlsl", "shaders/simple_ps.hlsl")) {
-        std::cerr << "Failed to load shaders" << std::endl;
-        MessageBoxA(hwnd, "Failed to load shaders.\nCheck console for details.", "Shader Error", MB_OK | MB_ICONERROR);
-        return -1;
+    // Load shaders - using the real clustered shaders
+    if (!mainShader.Load("shaders/clustered_vs.hlsl", "shaders/clustered_ps.hlsl")) {
+        std::cerr << "Failed to load clustered shaders, trying DX12 specific shaders..." << std::endl;
+        if (!mainShader.Load("shaders/clustered_dx12_vs.hlsl", "shaders/clustered_dx12_ps.hlsl")) {
+            std::cerr << "Failed to load any shaders" << std::endl;
+            MessageBoxA(hwnd, "Failed to load shaders.\nCheck console for details.", "Shader Error", MB_OK | MB_ICONERROR);
+            return -1;
+        }
     }
-    std::cout << "Shaders loaded successfully" << std::endl;
+    std::cout << "Clustered Forward shaders loaded successfully" << std::endl;
     
-    // Initialize demo lights
+    // Initialize clustered renderer and demo lights
+    clusteredRenderer.init();
     for (int i = 0; i < numDemoLights; i++) {
         float angle = (float)i / numDemoLights * XM_2PI;
         float radius = 8.0f;
-        PointLight light;
-        light.position = XMFLOAT3(cosf(angle) * radius, 2.0f, sinf(angle) * radius);
-        light.color.x = sinf(angle) * 0.5f + 0.5f;
-        light.color.y = sinf(angle + 2.094f) * 0.5f + 0.5f;
-        light.color.z = sinf(angle + 4.189f) * 0.5f + 0.5f;
-        light.radius = demoLightRadius;
-        light.intensity = demoLightIntensity;
-        light.active = true;
-        pointLights.push_back(light);
+        XMFLOAT3 pos(cosf(angle) * radius, 2.0f, sinf(angle) * radius);
+        XMFLOAT3 color;
+        color.x = sinf(angle) * 0.5f + 0.5f;
+        color.y = sinf(angle + 2.094f) * 0.5f + 0.5f;
+        color.z = sinf(angle + 4.189f) * 0.5f + 0.5f;
+        clusteredRenderer.addLight(pos, color, demoLightRadius, demoLightIntensity);
     }
     
     gameTimer.Start();
@@ -476,19 +548,51 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         
         // Process input
         ProcessInput(hwnd);
+        camera.Update(deltaTime);
         
         // Animate lights
         if (animateDemoLights) {
-            for (int i = 0; i < (int)pointLights.size(); i++) {
-                float angle = (float)i / pointLights.size() * XM_2PI + currentTime;
+            for (int i = 0; i < clusteredRenderer.getTotalLightCount(); i++) {
+                float angle = (float)i / clusteredRenderer.getTotalLightCount() * XM_2PI + currentTime;
                 float radius = 8.0f;
-                pointLights[i].position = XMFLOAT3(
+                XMFLOAT3 pos(
                     cosf(angle) * radius,
                     2.0f + sinf(currentTime * 2.0f + angle) * 1.0f,
                     sinf(angle) * radius
                 );
+                clusteredRenderer.updateLight(i, pos);
             }
         }
+        
+        // Animate light
+        if (animateLight) {
+            lightPos.x = cosf(currentTime * animationSpeed) * 10.0f;
+            lightPos.z = sinf(currentTime * animationSpeed) * 10.0f;
+        }
+        
+        // Animate cube
+        if (animateCube) {
+            cubeRotation.y = currentTime * 50.0f * animationSpeed;
+        }
+        
+        // Update projectiles
+        for (auto& proj : projectiles) {
+            if (proj.active) {
+                proj.position.x += proj.direction.x * proj.speed * deltaTime;
+                proj.position.y += proj.direction.y * proj.speed * deltaTime;
+                proj.position.z += proj.direction.z * proj.speed * deltaTime;
+                proj.lifetime -= deltaTime;
+                if (proj.lifetime <= 0.0f) {
+                    proj.active = false;
+                }
+            }
+        }
+        
+        // Remove inactive projectiles
+        projectiles.erase(
+            std::remove_if(projectiles.begin(), projectiles.end(),
+                [](const Projectile& p) { return !p.active; }),
+            projectiles.end());
         
         // Begin frame
         try {
@@ -501,6 +605,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // Clear
         float clearColorArr[4] = { clearColor.x, clearColor.y, clearColor.z, 1.0f };
         ClearRenderTarget(clearColorArr);
+        
+        // Reset shader draw call counter at start of each frame
+        mainShader.BeginFrame();
         
         // Setup matrices
         XMMATRIX view = camera.GetViewMatrix();
@@ -518,27 +625,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ambientStrength, specularStrength, specularShininess, shadowBias, enableShadows);
         mainShader.SetCamera(camera.Position);
         
-        // Set point lights
-        std::vector<PointLightDataDX12> lightData;
-        for (const auto& light : pointLights) {
-            if (light.active) {
-                PointLightDataDX12 ld;
-                ld.position = light.position;
-                ld.radius = light.radius;
-                ld.color = light.color;
-                ld.intensity = light.intensity;
-                lightData.push_back(ld);
-            }
-        }
+        // Update clustered renderer camera and cull lights
+        clusteredRenderer.setScreenSize((float)SCR_WIDTH, (float)SCR_HEIGHT);
+        clusteredRenderer.setCamera(cameraFOV, cameraNear, cameraFar, view, projection);
+        clusteredRenderer.cullLights();
+        
+        // Set point lights from clustered renderer
+        std::vector<PointLightDataDX12> lightData = clusteredRenderer.getPointLightData();
         mainShader.SetPointLights((int)lightData.size(), lightData);
+        
+        // Set DDGI parameters
+        mainShader.SetDDGI(useDDGI, giIntensity, normalBias, probeSpacing);
         
         // Render floor
         XMMATRIX model = XMMatrixIdentity();
         mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
         mainShader.SetObjectColor(floorColor);
         DrawPlane();
+        mainShader.NextDrawCall();
         
-        // Render cube
+        // Render cube 1
         model = XMMatrixScaling(cubeScale.x, cubeScale.y, cubeScale.z);
         model = model * XMMatrixRotationX(XMConvertToRadians(cubeRotation.x));
         model = model * XMMatrixRotationY(XMConvertToRadians(cubeRotation.y));
@@ -547,16 +653,65 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
         mainShader.SetObjectColor(cubeColor);
         DrawCube();
+        mainShader.NextDrawCall();
+        
+        // Render cube 2
+        if (showSecondCube) {
+            model = XMMatrixScaling(cube2Scale.x, cube2Scale.y, cube2Scale.z);
+            model = model * XMMatrixRotationX(XMConvertToRadians(cube2Rotation.x));
+            model = model * XMMatrixRotationY(XMConvertToRadians(cube2Rotation.y));
+            model = model * XMMatrixRotationZ(XMConvertToRadians(cube2Rotation.z));
+            model = model * XMMatrixTranslation(cube2Position.x, cube2Position.y, cube2Position.z);
+            mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
+            mainShader.SetObjectColor(cube2Color);
+            DrawCube();
+            mainShader.NextDrawCall();
+        }
+        
+        // Render projectiles
+        for (auto& proj : projectiles) {
+            if (proj.active) {
+                model = XMMatrixScaling(projectileScale, projectileScale, projectileScale);
+                model = model * XMMatrixTranslation(proj.position.x, proj.position.y, proj.position.z);
+                mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
+                mainShader.SetObjectColor(projectileColor);
+                DrawCube();
+                mainShader.NextDrawCall();
+            }
+        }
+        
+        // Render gun viewmodel (simplified - just a cube for now)
+        if (gunModel.visible) {
+            // Position gun in front of camera
+            XMVECTOR camPos = XMLoadFloat3(&camera.Position);
+            XMVECTOR camFront = XMLoadFloat3(&camera.Front);
+            XMVECTOR camRight = XMVector3Cross(XMLoadFloat3(&camera.Up), camFront);
+            XMVECTOR camUp = XMLoadFloat3(&camera.Up);
+            
+            XMVECTOR gunPos = camPos + camFront * gunModel.offset.z + camRight * gunModel.offset.x + camUp * gunModel.offset.y;
+            XMFLOAT3 gunPosition;
+            XMStoreFloat3(&gunPosition, gunPos);
+            
+            model = XMMatrixScaling(gunModel.scale.x, gunModel.scale.y * 2.0f, gunModel.scale.z * 3.0f);
+            model = model * XMMatrixRotationY(XMConvertToRadians(gunModel.rotation.y) + camera.Yaw * 0.0174533f);
+            model = model * XMMatrixTranslation(gunPosition.x, gunPosition.y, gunPosition.z);
+            mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
+            mainShader.SetObjectColor(gunModel.color);
+            DrawCube();
+            mainShader.NextDrawCall();
+        }
         
         // Render light spheres
-        for (const auto& light : pointLights) {
-            if (!light.active) continue;
+        for (int i = 0; i < clusteredRenderer.getTotalLightCount(); i++) {
+            PointLightDX12* light = clusteredRenderer.getLight(i);
+            if (!light || !light->active) continue;
             model = XMMatrixScaling(0.2f, 0.2f, 0.2f);
-            model = model * XMMatrixTranslation(light.position.x, light.position.y, light.position.z);
+            model = model * XMMatrixTranslation(light->position.x, light->position.y, light->position.z);
             mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
-            XMFLOAT3 lightCol(light.color.x * light.intensity, light.color.y * light.intensity, light.color.z * light.intensity);
+            XMFLOAT3 lightCol(light->color.x * light->intensity, light->color.y * light->intensity, light->color.z * light->intensity);
             mainShader.SetObjectColor(lightCol);
             DrawCube();
+            mainShader.NextDrawCall();
         }
         
         // Render ImGui
@@ -570,37 +725,105 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ImGui::Text("Controls:");
             ImGui::BulletText("TAB: Toggle UI");
             ImGui::BulletText("C: Lock/Unlock Camera");
-            ImGui::BulletText("F11: Toggle Fullscreen");
-            ImGui::Text(cameraLocked ? "Camera LOCKED (Click to unlock)" : "Camera UNLOCKED (Press C to lock)");
+            ImGui::BulletText("F: Toggle FPS Walking Mode");
+            ImGui::BulletText("Left Click: Lock camera / Shoot");
+            if (cameraLocked) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.5f, 0.0f, 1.0f));
+                if (ImGui::Button("Camera LOCKED (Click to unlock)")) cameraLocked = false;
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 1.0f, 0.0f, 1.0f));
+                if (ImGui::Button("Camera UNLOCKED (Press C to lock)")) cameraLocked = true;
+                ImGui::PopStyleColor();
+            }
             ImGui::Separator();
             
             if (ImGui::CollapsingHeader("Camera Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
                 ImGui::DragFloat3("Camera Position", &camera.Position.x, 0.1f);
-                ImGui::DragFloat("FOV", &cameraFOV, 0.5f, 10.0f, 120.0f);
+                ImGui::DragFloat("FOV", &cameraFOV, 0.5f, 1.0f, 120.0f);
+                ImGui::DragFloat("Near Plane", &cameraNear, 0.01f, 0.01f, 10.0f);
+                ImGui::DragFloat("Far Plane", &cameraFar, 1.0f, 10.0f, 500.0f);
+                ImGui::DragFloat("Movement Speed", &camera.MovementSpeed, 0.1f, 0.1f, 50.0f);
+                ImGui::Checkbox("FPS Walking Mode", &camera.FPSMode);
             }
             
-            if (ImGui::CollapsingHeader("Light Settings")) {
+            if (ImGui::CollapsingHeader("Light Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
                 ImGui::DragFloat3("Light Position", &lightPos.x, 0.1f);
                 ImGui::ColorEdit3("Light Color", &lightColor.x);
+                ImGui::Checkbox("Animate Light", &animateLight);
             }
             
-            if (ImGui::CollapsingHeader("Cube Settings")) {
-                ImGui::DragFloat3("Position", &cubePosition.x, 0.1f);
-                ImGui::DragFloat3("Rotation", &cubeRotation.x, 1.0f);
-                ImGui::DragFloat3("Scale", &cubeScale.x, 0.1f, 0.1f, 10.0f);
-                ImGui::ColorEdit3("Color", &cubeColor.x);
+            if (ImGui::CollapsingHeader("Cube 1 Settings")) {
+                ImGui::DragFloat3("Position##cube1", &cubePosition.x, 0.1f);
+                ImGui::DragFloat3("Rotation##cube1", &cubeRotation.x, 1.0f);
+                ImGui::DragFloat3("Scale##cube1", &cubeScale.x, 0.1f, 0.1f, 10.0f);
+                ImGui::ColorEdit3("Color##cube1", &cubeColor.x);
+                ImGui::Checkbox("Animate##cube1", &animateCube);
+            }
+            
+            if (ImGui::CollapsingHeader("Cube 2 Settings")) {
+                ImGui::Checkbox("Show Second Cube", &showSecondCube);
+                if (showSecondCube) {
+                    ImGui::DragFloat3("Position##cube2", &cube2Position.x, 0.1f);
+                    ImGui::DragFloat3("Rotation##cube2", &cube2Rotation.x, 1.0f);
+                    ImGui::DragFloat3("Scale##cube2", &cube2Scale.x, 0.1f, 0.1f, 10.0f);
+                    ImGui::ColorEdit3("Color##cube2", &cube2Color.x);
+                }
             }
             
             if (ImGui::CollapsingHeader("Rendering Settings")) {
                 ImGui::ColorEdit3("Floor Color", &floorColor.x);
                 ImGui::ColorEdit3("Clear Color", &clearColor.x);
+                ImGui::Checkbox("Use Clustered Rendering", &useClusteredRendering);
+                ImGui::Checkbox("Enable Shadows", &enableShadows);
                 ImGui::Checkbox("Wireframe Mode", &wireframeMode);
                 ImGui::DragFloat("Ambient", &ambientStrength, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Specular", &specularStrength, 0.01f, 0.0f, 1.0f);
                 
+                // DDGI Settings
                 ImGui::Separator();
-                ImGui::Text("Point Lights: %d", (int)pointLights.size());
-                ImGui::Checkbox("Animate Lights", &animateDemoLights);
+                ImGui::Text("DDGI Global Illumination");
+                ImGui::Checkbox("Enable DDGI", &useDDGI);
+                if (useDDGI) {
+                    ImGui::DragFloat("GI Intensity", &giIntensity, 0.1f, 0.0f, 5.0f);
+                    ImGui::DragFloat("Normal Bias", &normalBias, 0.01f, 0.0f, 1.0f);
+                    ImGui::DragFloat("Probe Spacing", &probeSpacing, 0.1f, 0.5f, 10.0f);
+                    ImGui::Checkbox("Show Probes", &showProbes);
+                    ImGui::Text("Probes: 256 (8x4x8)");
+                }
+                
+                if (useClusteredRendering) {
+                    ImGui::Separator();
+                    ImGui::Text("Clustered Rendering");
+                    ImGui::Text("Active Clusters: %d", clusteredRenderer.getActiveClusterCount());
+                    ImGui::Text("Total Lights: %d", clusteredRenderer.getLightCount());
+                    ImGui::SliderInt("Demo Lights", &numDemoLights, 0, 64);
+                    ImGui::DragFloat("Light Radius", &demoLightRadius, 0.5f, 1.0f, 50.0f);
+                    ImGui::Checkbox("Animate Lights", &animateDemoLights);
+                    
+                    static int prevNumLights = numDemoLights;
+                    if (numDemoLights != prevNumLights) {
+                        clusteredRenderer.clearLights();
+                        for (int i = 0; i < numDemoLights; i++) {
+                            float angle = (float)i / numDemoLights * XM_2PI;
+                            XMFLOAT3 pos(cosf(angle) * 8.0f, 2.0f, sinf(angle) * 8.0f);
+                            XMFLOAT3 color;
+                            color.x = sinf(angle) * 0.5f + 0.5f;
+                            color.y = sinf(angle + 2.094f) * 0.5f + 0.5f;
+                            color.z = sinf(angle + 4.189f) * 0.5f + 0.5f;
+                            clusteredRenderer.addLight(pos, color, demoLightRadius, demoLightIntensity);
+                        }
+                        prevNumLights = numDemoLights;
+                    }
+                }
+            }
+            
+            if (ImGui::CollapsingHeader("Viewmodel (Gun)")) {
+                ImGui::Checkbox("Show Gun", &gunModel.visible);
+                ImGui::ColorEdit3("Gun Color", &gunModel.color.x);
+                ImGui::DragFloat3("Gun Offset", &gunModel.offset.x, 0.01f);
+                ImGui::DragFloat3("Gun Scale", &gunModel.scale.x, 0.01f);
+                ImGui::DragFloat3("Gun Rotation", &gunModel.rotation.x, 1.0f);
             }
             
             ImGui::Separator();
