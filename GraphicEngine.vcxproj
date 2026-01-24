@@ -99,6 +99,7 @@
     <ClInclude Include="src\ClusteredRendererDX11.h" />
     <ClInclude Include="src\ClusteredRendererDX12.h" />
     <ClInclude Include="src\DDGI_DX11.h" />
+    <ClInclude Include="src\DDGI_DX12.h" />
     <ClInclude Include="src\DX11Core.h" />
     <ClInclude Include="src\DX12Core.h" />
     <ClInclude Include="src\GLBImporter.h" />

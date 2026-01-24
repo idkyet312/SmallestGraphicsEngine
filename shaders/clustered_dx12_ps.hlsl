@@ -51,14 +51,32 @@ cbuffer PointLightsBuffer : register(b4) {
     PointLightData pointLights[64];
 };
 
-static const float3 probeGridOrigin = float3(-7.0, 0.5, -7.0);
-static const float probeSpacing = 2.0;
-static const int probeCountX = 8;
-static const int probeCountY = 4;
-static const int probeCountZ = 8;
-static const float giIntensity = 0.5;
+cbuffer DDGIBuffer : register(b5) {
+    float3 probeGridOrigin;
+    float probeSpacing;
+    
+    int probeCountX;
+    int probeCountY;
+    int probeCountZ;
+    float maxRayDistance;
+    
+    float normalBias;
+    float viewBias;
+    float irradianceGamma;
+    float giIntensity;
+    
+    int irradianceTexWidth;
+    int irradianceTexHeight;
+    int visibilityTexWidth;
+    int visibilityTexHeight;
+    
+    int ddgiEnabled;
+    float3 ddgiPadding;
+};
 
 Texture2D albedoMap : register(t1);
+Texture2D irradianceMap : register(t2);
+Texture2D visibilityMap : register(t3);
 Texture2D normalMap : register(t4);
 Texture2D metalRoughMap : register(t5);
 SamplerState texSampler : register(s1);
@@ -72,29 +90,28 @@ struct PS_INPUT {
 
 // Simple GI approximation based on probe grid position
 float3 sampleDDGIIrradiance(float3 worldPos, float3 normal) {
+    if (!ddgiEnabled) return float3(0,0,0);
+
     // Calculate which probe cell we're in
     float3 offset = worldPos - probeGridOrigin;
     float3 gridPos = offset / probeSpacing;
     
-    // Clamp to grid bounds
+    // Clamp to grid bounds for simple lookup
     gridPos = clamp(gridPos, float3(0,0,0), float3(probeCountX-1, probeCountY-1, probeCountZ-1));
+    
+    // Sample from the irradiance texture
+    // Since we are using a simplified update that clears the texture to a single color,
+    // we can sample anywhere. For robustness, sample center.
+    float3 gi = irradianceMap.Sample(texSampler, float2(0.5, 0.5)).rgb;
     
     // Simple ambient occlusion approximation based on height
     float heightFactor = saturate(worldPos.y / 5.0);
     
     // Hemisphere lighting approximation
     float skyFactor = saturate(normal.y * 0.5 + 0.5);
-    float groundFactor = saturate(-normal.y * 0.5 + 0.5);
     
-    // Sky color contribution (blue-ish)
-    float3 skyColor = float3(0.4, 0.5, 0.7);
-    // Ground bounce (brownish)
-    float3 groundColor = float3(0.3, 0.25, 0.2);
-    
-    float3 gi = skyColor * skyFactor + groundColor * groundFactor;
-    gi *= heightFactor * 0.5 + 0.5; // Reduce GI in lower areas
-    
-    return gi * giIntensity;
+    // Mix sampled GI with some geometric factors for better look
+    return gi * (0.5 + 0.5 * skyFactor) * (0.5 + 0.5 * heightFactor) * giIntensity;
 }
 
 float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 viewDir) {

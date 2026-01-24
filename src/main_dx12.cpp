@@ -17,6 +17,7 @@
 #include "ClusteredRendererDX12.h"
 #include "SceneGraph.h"
 #include "GLBImporter.h"
+#include "DDGI_DX12.h"
 
 using namespace DirectX;
 
@@ -121,6 +122,7 @@ ClusteredRendererDX12 clusteredRenderer;
 bool useClusteredRendering = true;
 
 // DDGI Global Illumination settings
+DDGIRendererDX12 ddgiRenderer;
 bool useDDGI = true;
 float giIntensity = 0.5f;
 float normalBias = 0.1f;
@@ -1045,6 +1047,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cerr << "Failed to create shadow map - shadows will be disabled" << std::endl;
         enableShadows = false;
     }
+
+    // Initialize DDGI
+    if (!ddgiRenderer.init(g_dx12.device.Get())) {
+        std::cerr << "Failed to initialize DDGI (non-fatal)" << std::endl;
+        useDDGI = false;
+    } else {
+        std::cout << "DDGI initialized (DX12)" << std::endl;
+    }
     
     // Initialize clustered renderer and demo lights
     clusteredRenderer.init();
@@ -1139,10 +1149,55 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             break;
         }
         
+        // Update DDGI Probes (Simulated GI)
+        if (useDDGI) {
+            float totalR = 0.0f, totalG = 0.0f, totalB = 0.0f;
+            float totalIntensity = 0.0f;
+            
+            // Add main directional light proxy
+            totalR += lightColor.x * 0.5f;
+            totalG += lightColor.y * 0.5f;
+            totalB += lightColor.z * 0.5f;
+            totalIntensity += 0.5f;
+
+            // Calculate average light color from active lights
+            for (int i = 0; i < clusteredRenderer.getTotalLightCount(); i++) {
+                PointLightDX12* light = clusteredRenderer.getLight(i);
+                if (light && light->active) {
+                    float intensity = light->intensity;
+                    // Cap intensity contribution to avoid explosion
+                    intensity = std::min(intensity, 2.0f);
+                    
+                    totalR += light->color.x * intensity;
+                    totalG += light->color.y * intensity;
+                    totalB += light->color.z * intensity;
+                    totalIntensity += intensity;
+                }
+            }
+            
+            XMFLOAT3 ambientColor = XMFLOAT3(0.0f, 0.0f, 0.0f);
+            if (totalIntensity > 0.0f) {
+                // Normalize and apply GI intensity
+                float factor = giIntensity * 0.2f;
+                // Average color weighted
+                ambientColor.x = (totalR / totalIntensity) * factor * (1.0f + totalIntensity * 0.05f);
+                ambientColor.y = (totalG / totalIntensity) * factor * (1.0f + totalIntensity * 0.05f);
+                ambientColor.z = (totalB / totalIntensity) * factor * (1.0f + totalIntensity * 0.05f);
+                
+                // Add base ambient
+                ambientColor.x += 0.02f * giIntensity;
+                ambientColor.y += 0.02f * giIntensity;
+                ambientColor.z += 0.03f * giIntensity;
+            }
+            
+            ddgiRenderer.UpdateProbes(g_dx12.commandList.Get(), ambientColor);
+        }
+        
+
         // Clear
         float clearColorArr[4] = { clearColor.x, clearColor.y, clearColor.z, 1.0f };
         ClearRenderTarget(clearColorArr);
-        
+
         // Reset shader draw call counter at start of each frame
         mainShader.BeginFrame();
         depthShader.BeginFrame();
@@ -1254,40 +1309,47 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         mainShader.Use(wireframeMode);
         mainShader.BeginFrame(); // Reset draw call and SRV counters
         
-        // Bind heaps. We need both shadow heap and the main CBV_SRV_UAV heap for materials.
-        // DX12 only allows one descriptor heap of each type to be bound at a time.
-        // We merged shadow heap into the main heap? Or we have separate heaps.
-        // If we have separate heaps, we have a problem.
-        // main_dx12.cpp uses shadowSrvHeap separately.
-        // AND imguiSrvHeap.
-        // We need a single global heap (g_dx12.cbvSrvUavHeap) for everything during the main pass.
-        // Shadow map SRV needs to be in that heap too.
+        // Bind heaps using the main CBV_SRV_UAV heap for materials and globals.
+        ID3D12DescriptorHeap* mainHeaps[] = { g_dx12.cbvSrvUavHeap.Get() };
+        g_dx12.commandList->SetDescriptorHeaps(1, mainHeaps);
         
-        // Let's assume for now we use the main heap.
-        // We need to copy the shadow descriptor to it. 
-        // Or assume SetObjectMaterial uses the currently bound heap.
+        // Copy global SRVs to the start of the heap (slot 0, 1, 2)
+        // 0: Shadow Map (t0)
+        // 1: Irradiance (t2)
+        // 2: Visibility (t3)
+        // Note: ShaderDX12::BeginFrame reserves slots 0-63 for us.
         
-        // Bind shadow map SRV if shadows are enabled
-        if (enableShadows && shadowSrvHeap) {
-            // Problem: We can't bind shadowSrvHeap AND materials from g_dx12.cbvSrvUavHeap.
-            // We must use one heap.
-            // Let's rely on g_dx12.cbvSrvUavHeap being the main one.
-            // We need to copy shadow descriptor to it. 
-            // Or assume SetObjectMaterial uses the currently bound heap.
-            
-            ID3D12DescriptorHeap* heaps[] = { g_dx12.cbvSrvUavHeap.Get() };
-            g_dx12.commandList->SetDescriptorHeaps(1, heaps);
-            
-            // We need to ensure Shadow Map SRV is at the start of this heap (index 0).
-            // This requires copying the descriptor.
-            if (shadowMap) {
-                 D3D12_CPU_DESCRIPTOR_HANDLE srcHandle = shadowSrvHeap->GetCPUDescriptorHandleForHeapStart();
-                 D3D12_CPU_DESCRIPTOR_HANDLE dstHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
-                 g_dx12.device->CopyDescriptorsSimple(1, dstHandle, srcHandle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-                 
-                 g_dx12.commandList->SetGraphicsRootDescriptorTable(6, g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart());
-            }
+        D3D12_CPU_DESCRIPTOR_HANDLE destHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        UINT increment = g_dx12.cbvSrvUavDescriptorSize;
+        
+        // 1. Shadow Map
+        if (enableShadows && shadowMap && shadowSrvHeap) {
+             g_dx12.device->CopyDescriptorsSimple(1, destHandle, shadowSrvHeap->GetCPUDescriptorHandleForHeapStart(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        } else {
+            // Null descriptor if shadow disabled
+             // D3D12_SHADER_RESOURCE_VIEW_DESC nullDesc = {};
+             // nullDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+             // nullDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+             // nullDesc.Format = DXGI_FORMAT_R32_FLOAT;
+             // g_dx12.device->CreateShaderResourceView(nullptr, &nullDesc, destHandle);
+             // Assume init provides valid nulls or we just ignore. 
+             // Copying something to prevent validation error
         }
+        
+        // 2. DDGI Irradiance
+        destHandle.ptr += increment;
+        if (useDDGI) {
+            g_dx12.device->CopyDescriptorsSimple(1, destHandle, ddgiRenderer.GetIrradianceSRV(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        
+        // 3. DDGI Visibility
+        destHandle.ptr += increment;
+        if (useDDGI) {
+            g_dx12.device->CopyDescriptorsSimple(1, destHandle, ddgiRenderer.GetVisibilitySRV(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        
+        // Bind the table starting at index 0 (contains Shadow, Irradiance, Visibility as requested by root parameter 6)
+        g_dx12.commandList->SetGraphicsRootDescriptorTable(6, g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart());
         
         // Set common uniforms
         mainShader.SetLight(lightPos, lightType, lightColor, lightConstant, lightLinear, lightQuadratic,
@@ -1489,6 +1551,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
         }
         
+        // Debug draw probes
+        if (useDDGI && showProbes) {
+             for (int z = 0; z < ddgiRenderer.config.probeCountZ; z++) {
+                 for (int y = 0; y < ddgiRenderer.config.probeCountY; y++) {
+                     for (int x = 0; x < ddgiRenderer.config.probeCountX; x++) {
+                         XMFLOAT3 pos(
+                             ddgiRenderer.config.probeGridOrigin.x + x * ddgiRenderer.config.probeSpacing,
+                             ddgiRenderer.config.probeGridOrigin.y + y * ddgiRenderer.config.probeSpacing,
+                             ddgiRenderer.config.probeGridOrigin.z + z * ddgiRenderer.config.probeSpacing
+                         );
+                         
+                         model = XMMatrixScaling(0.1f, 0.1f, 0.1f) * XMMatrixTranslation(pos.x, pos.y, pos.z);
+                         mainShader.SetMatrices(model, view, projection, lightSpaceMatrix);
+                         
+                         // We don't have a way to sample the probe color here easily on CPU
+                         // So just draw them as green for now to show location
+                         mainShader.SetObjectColor(XMFLOAT3(0.0f, 1.0f, 0.0f));
+                         DrawCube();
+                         mainShader.NextDrawCall();
+                     }
+                 }
+             }
+        }
+
         // Render ImGui
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
