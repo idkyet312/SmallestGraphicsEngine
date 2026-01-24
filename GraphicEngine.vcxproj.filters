@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="Shaders">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>hlsl;frag;vert;glsl</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\main.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\main_dx11.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\main_dx12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\CameraDX12.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ClusteredRenderer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ClusteredRendererDX11.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ClusteredRendererDX12.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\DDGI_DX11.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\DX11Core.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\DX12Core.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Model.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ModelDX11.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ShaderDX11.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ShaderDX12.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="shaders\clustered_dx12_ps.hlsl">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\clustered_dx12_vs.hlsl">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\clustered_ps.hlsl">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\clustered_vs.hlsl">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\clustered.frag">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\clustered.vert">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\debug_depth_ps.hlsl">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\debug_depth_vs.hlsl">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\debug_depth.frag">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\debug_depth.vert">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\depth_ps.hlsl">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\depth_vs.hlsl">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\depth.frag">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\depth.vert">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\shadow.frag">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\shadow.vert">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\simple_ps.hlsl">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\simple_vs.hlsl">
+      <Filter>Shaders</Filter>
+    </None>
+  </ItemGroup>
+</Project>
+
