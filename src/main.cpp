@@ -12,6 +12,7 @@
 #include "Shader.h"
 #include "Camera.h"
 #include "Model.h"
+#include "ClusteredRenderer.h"
 
 // Settings
 unsigned int SCR_WIDTH = 1280;
@@ -99,6 +100,15 @@ float projectileSpeed = 50.0f;
 float projectileLifetime = 3.0f;
 glm::vec3 projectileColor(1.0f, 0.8f, 0.0f);
 float projectileScale = 0.1f;
+
+// Clustered Forward Rendering
+ClusteredRenderer clusteredRenderer;
+bool useClusteredRendering = true;
+bool showClusterDebug = false;
+int numDemoLights = 8;
+float demoLightRadius = 8.0f;
+float demoLightIntensity = 1.5f;
+bool animateDemoLights = true;
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
@@ -370,6 +380,7 @@ int main() {
 
     Shader depthShader("shaders/depth.vert", "shaders/depth.frag");
     Shader shadowShader("shaders/shadow.vert", "shaders/shadow.frag");
+    Shader clusteredShader("shaders/clustered.vert", "shaders/clustered.frag");
     Shader debugDepthShader("shaders/debug_depth.vert", "shaders/debug_depth.frag");
 
     unsigned int depthMapFBO;
@@ -439,6 +450,20 @@ int main() {
             std::remove_if(projectiles.begin(), projectiles.end(),
                 [](const Projectile& p) { return !p.active; }),
             projectiles.end());
+
+        // Update demo lights animation
+        if (animateDemoLights && useClusteredRendering) {
+            float time = (float)glfwGetTime() * animationSpeed;
+            for (int i = 0; i < clusteredRenderer.getLightCount(); i++) {
+                float angle = (float)i / clusteredRenderer.getLightCount() * 6.28318f + time;
+                float radius = 8.0f;
+                clusteredRenderer.lights[i].position = glm::vec3(
+                    cos(angle) * radius,
+                    2.0f + sin(time * 2.0f + (float)i) * 1.5f,
+                    sin(angle) * radius
+                );
+            }
+        }
 
         // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
@@ -597,6 +622,64 @@ int main() {
                 ImGui::ColorEdit3("Floor Color", &floorColor.x);
                 ImGui::ColorEdit3("Clear Color", &clearColor.x);
                 ImGui::Separator();
+                
+                // Clustered Forward Rendering
+                ImGui::Text("Rendering Pipeline");
+                ImGui::Checkbox("Use Clustered Forward", &useClusteredRendering);
+                if (useClusteredRendering) {
+                    ImGui::Indent();
+                    ImGui::Text("Cluster Grid: %dx%dx%d", ClusteredRenderer::CLUSTER_X, ClusteredRenderer::CLUSTER_Y, ClusteredRenderer::CLUSTER_Z);
+                    ImGui::Text("Active Clusters: %d", clusteredRenderer.getActiveClusterCount());
+                    ImGui::Text("Total Lights: %d", clusteredRenderer.getLightCount());
+                    ImGui::Checkbox("Show Cluster Debug", &showClusterDebug);
+                    ImGui::Separator();
+                    
+                    ImGui::Text("Demo Lights");
+                    static int prevNumLights = numDemoLights;
+                    ImGui::SliderInt("Number of Lights", &numDemoLights, 0, 64);
+                    ImGui::DragFloat("Light Radius", &demoLightRadius, 0.5f, 1.0f, 50.0f);
+                    ImGui::DragFloat("Light Intensity", &demoLightIntensity, 0.1f, 0.1f, 10.0f);
+                    ImGui::Checkbox("Animate Lights", &animateDemoLights);
+                    
+                    // Update light properties
+                    for (int i = 0; i < clusteredRenderer.getLightCount(); i++) {
+                        clusteredRenderer.lights[i].radius = demoLightRadius;
+                        clusteredRenderer.lights[i].intensity = demoLightIntensity;
+                        // Recalculate attenuation
+                        clusteredRenderer.lights[i].linear = 4.5f / demoLightRadius;
+                        clusteredRenderer.lights[i].quadratic = 75.0f / (demoLightRadius * demoLightRadius);
+                    }
+                    
+                    if (numDemoLights != prevNumLights) {
+                        // Regenerate lights
+                        clusteredRenderer.clearLights();
+                        for (int i = 0; i < numDemoLights; i++) {
+                            float angle = (float)i / numDemoLights * 6.28318f;
+                            float radius = 8.0f;
+                            glm::vec3 pos(cos(angle) * radius, 2.0f, sin(angle) * radius);
+                            glm::vec3 color;
+                            color.r = sin(angle) * 0.5f + 0.5f;
+                            color.g = sin(angle + 2.094f) * 0.5f + 0.5f;
+                            color.b = sin(angle + 4.189f) * 0.5f + 0.5f;
+                            clusteredRenderer.addLight(pos, color, demoLightRadius, demoLightIntensity);
+                        }
+                        prevNumLights = numDemoLights;
+                    }
+                    
+                    if (ImGui::Button("Add Light at Camera")) {
+                        clusteredRenderer.addLight(camera.Position, glm::vec3(1.0f), demoLightRadius, demoLightIntensity);
+                        numDemoLights = clusteredRenderer.getLightCount();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Clear All Lights")) {
+                        clusteredRenderer.clearLights();
+                        numDemoLights = 0;
+                    }
+                    
+                    ImGui::Unindent();
+                }
+                ImGui::Separator();
+                
                 ImGui::Text("Lighting");
                 ImGui::DragFloat("Ambient Strength", &ambientStrength, 0.01f, 0.0f, 1.0f);
                 ImGui::DragFloat("Specular Strength", &specularStrength, 0.01f, 0.0f, 1.0f);
@@ -654,6 +737,7 @@ int main() {
                 try {
                     depthShader = Shader("shaders/depth.vert", "shaders/depth.frag");
                     shadowShader = Shader("shaders/shadow.vert", "shaders/shadow.frag");
+                    clusteredShader = Shader("shaders/clustered.vert", "shaders/clustered.frag");
                     shadowShader.use();
                     shadowShader.setInt("shadowMap", 0);
                     ImGui::Text("Shaders reloaded successfully!");
@@ -733,40 +817,78 @@ int main() {
         glClearColor(clearColor.r, clearColor.g, clearColor.b, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        shadowShader.use();
+        // Update clustered renderer and cull lights
         glm::mat4 projection;
         if (projectionType == 0) {
-            // Perspective projection
             projection = glm::perspective(glm::radians(cameraFOV), (float)SCR_WIDTH / (float)SCR_HEIGHT, cameraNear, cameraFar);
         } else {
-            // Orthographic projection
             float aspect = (float)SCR_WIDTH / (float)SCR_HEIGHT;
             projection = glm::ortho(-orthoSize * aspect, orthoSize * aspect, -orthoSize, orthoSize, cameraNear, cameraFar);
         }
         glm::mat4 view = camera.GetViewMatrix();
-        shadowShader.setMat4("projection", projection);
-        shadowShader.setMat4("view", view);
-        shadowShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
-        shadowShader.setVec3("viewPos", camera.Position);
-        shadowShader.setVec3("lightPos", lightPos);
+
+        // Update clustered renderer
+        clusteredRenderer.setScreenSize((float)SCR_WIDTH, (float)SCR_HEIGHT);
+        clusteredRenderer.setCamera(cameraFOV, cameraNear, cameraFar, view, projection);
+        if (useClusteredRendering) {
+            clusteredRenderer.cullLights();
+        }
+
+        // Choose shader based on rendering mode
+        Shader& activeShader = useClusteredRendering ? clusteredShader : shadowShader;
+        activeShader.use();
+        
+        activeShader.setMat4("projection", projection);
+        activeShader.setMat4("view", view);
+        activeShader.setMat4("lightSpaceMatrix", lightSpaceMatrix);
+        activeShader.setVec3("viewPos", camera.Position);
+        activeShader.setVec3("lightPos", lightPos);
         
         // Set light properties
-        shadowShader.setInt("lightType", lightType);
-        shadowShader.setFloat("constant", lightConstant);
-        shadowShader.setFloat("linear", lightLinear);
-        shadowShader.setFloat("quadratic", lightQuadratic);
-        shadowShader.setFloat("ambientStrength", ambientStrength);
-        shadowShader.setFloat("specularStrength", specularStrength);
-        shadowShader.setInt("shininess", specularShininess);
-        shadowShader.setFloat("shadowBias", shadowBias);
-        shadowShader.setBool("enableShadows", enableShadows);
+        activeShader.setInt("lightType", lightType);
+        activeShader.setVec3("lightColor", lightColor);
+        activeShader.setFloat("constant", lightConstant);
+        activeShader.setFloat("linear", lightLinear);
+        activeShader.setFloat("quadratic", lightQuadratic);
+        activeShader.setFloat("ambientStrength", ambientStrength);
+        activeShader.setFloat("specularStrength", specularStrength);
+        activeShader.setInt("shininess", specularShininess);
+        activeShader.setFloat("shadowBias", shadowBias);
+        activeShader.setBool("enableShadows", enableShadows);
+
+        // Point lights uniforms (for clustered rendering)
+        if (useClusteredRendering) {
+            int numLights = std::min(clusteredRenderer.getLightCount(), 32);
+            activeShader.setInt("numPointLights", numLights);
+            
+            for (int i = 0; i < numLights; i++) {
+                const auto& light = clusteredRenderer.lights[i];
+                std::string base = "pointLightPositions[" + std::to_string(i) + "]";
+                activeShader.setVec3(base, light.position);
+                
+                base = "pointLightColors[" + std::to_string(i) + "]";
+                activeShader.setVec3(base, light.color);
+                
+                base = "pointLightRadii[" + std::to_string(i) + "]";
+                activeShader.setFloat(base, light.radius);
+                
+                base = "pointLightIntensities[" + std::to_string(i) + "]";
+                activeShader.setFloat(base, light.intensity);
+            }
+            
+            activeShader.setInt("shadowMap", 0);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, depthMap);
+        } else {
+            activeShader.setInt("numPointLights", 0);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, depthMap);
+        }
         
         // Floor
         model = glm::mat4(1.0f);
-        shadowShader.setMat4("model", model);
-        shadowShader.setVec3("objectColor", floorColor);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, depthMap);
+        activeShader.setMat4("model", model);
+        activeShader.setVec3("objectColor", floorColor);
         glBindVertexArray(planeVAO);
         glDrawArrays(GL_TRIANGLES, 0, 6);
 
@@ -777,8 +899,8 @@ int main() {
         model = glm::rotate(model, glm::radians(cubeRotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
         model = glm::rotate(model, glm::radians(cubeRotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
         model = glm::scale(model, cubeScale);
-        shadowShader.setMat4("model", model);
-        shadowShader.setVec3("objectColor", cubeColor);
+        activeShader.setMat4("model", model);
+        activeShader.setVec3("objectColor", cubeColor);
         glBindVertexArray(cubeVAO);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
@@ -790,9 +912,24 @@ int main() {
             model = glm::rotate(model, glm::radians(cube2Rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
             model = glm::rotate(model, glm::radians(cube2Rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
             model = glm::scale(model, cube2Scale);
-            shadowShader.setMat4("model", model);
-            shadowShader.setVec3("objectColor", cube2Color);
+            activeShader.setMat4("model", model);
+            activeShader.setVec3("objectColor", cube2Color);
             glDrawArrays(GL_TRIANGLES, 0, 36);
+        }
+
+        // Render point light spheres (visual indicators)
+        if (useClusteredRendering) {
+            for (int i = 0; i < clusteredRenderer.getLightCount(); i++) {
+                const auto& light = clusteredRenderer.lights[i];
+                if (!light.active) continue;
+                model = glm::mat4(1.0f);
+                model = glm::translate(model, light.position);
+                model = glm::scale(model, glm::vec3(0.2f));
+                activeShader.setMat4("model", model);
+                activeShader.setVec3("objectColor", light.color * light.intensity);
+                glBindVertexArray(cubeVAO);
+                glDrawArrays(GL_TRIANGLES, 0, 36);
+            }
         }
 
         // Render projectiles
@@ -801,8 +938,8 @@ int main() {
                 model = glm::mat4(1.0f);
                 model = glm::translate(model, proj.position);
                 model = glm::scale(model, glm::vec3(projectileScale));
-                shadowShader.setMat4("model", model);
-                shadowShader.setVec3("objectColor", projectileColor);
+                activeShader.setMat4("model", model);
+                activeShader.setVec3("objectColor", projectileColor);
                 glBindVertexArray(cubeVAO);
                 glDrawArrays(GL_TRIANGLES, 0, 36);
             }
@@ -812,8 +949,8 @@ int main() {
         if (gunModel.loaded && gunModel.visible) {
             glClear(GL_DEPTH_BUFFER_BIT);  // Clear depth so gun renders on top
             model = gunModel.getModelMatrix(camera.Position, camera.Front, camera.Up);
-            shadowShader.setMat4("model", model);
-            shadowShader.setVec3("objectColor", gunModel.color);
+            activeShader.setMat4("model", model);
+            activeShader.setVec3("objectColor", gunModel.color);
             gunModel.draw();
         }
 

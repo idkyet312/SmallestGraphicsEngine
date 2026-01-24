@@ -12,6 +12,7 @@ uniform sampler2D shadowMap;
 uniform vec3 lightPos;
 uniform vec3 viewPos;
 uniform vec3 objectColor;
+uniform vec3 lightColor;
 
 // Light properties
 uniform int lightType; // 0 = directional, 1 = point
@@ -25,6 +26,7 @@ uniform float specularStrength;
 uniform int shininess;
 uniform float shadowBias;
 uniform bool enableShadows;
+uniform int numPointLights; // For compatibility with clustered shader
 
 float ShadowCalculation(vec4 fragPosLightSpace)
 {
@@ -44,7 +46,6 @@ void main()
 {           
     vec3 color = objectColor;
     vec3 normal = normalize(fs_in.Normal);
-    vec3 lightColor = vec3(1.0);
     
     // Ambient
     vec3 ambient = ambientStrength * lightColor;
