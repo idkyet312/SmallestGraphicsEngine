@@ -70,7 +70,7 @@ XMFLOAT3 lightUp(0.0f, 1.0f, 0.0f);
 XMFLOAT3 cubePosition(0.0f, 1.5f, 0.0f);
 XMFLOAT3 cubeScale(1.0f, 1.0f, 1.0f);
 XMFLOAT3 cubeRotation(0.0f, 0.0f, 0.0f);
-XMFLOAT3 cubeColor(0.8f, 0.2f, 0.2f);
+XMFLOAT3 cubeColor(0.7f, 0.7f, 0.7f);
 XMFLOAT3 floorColor(0.5f, 0.5f, 0.5f);
 XMFLOAT3 clearColor(0.1f, 0.1f, 0.1f);
 float cameraFOV = 45.0f;
@@ -86,7 +86,7 @@ float orthoSize = 10.0f;
 float shadowBias = 0.005f;
 bool enableShadows = true;
 bool wireframeMode = false;
-float ambientStrength = 0.3f;
+float ambientStrength = 0.0f;
 float specularStrength = 0.5f;
 int specularShininess = 32;
 
@@ -94,11 +94,11 @@ int renderMode = 0;
 bool showShadowMapOverlay = false;
 float overlaySize = 0.25f;
 
-bool showSecondCube = true;
+bool showSecondCube = false;
 XMFLOAT3 cube2Position(-3.0f, 0.5f, 2.0f);
 XMFLOAT3 cube2Scale(0.5f, 0.5f, 0.5f);
 XMFLOAT3 cube2Rotation(0.0f, 45.0f, 0.0f);
-XMFLOAT3 cube2Color(0.2f, 0.8f, 0.2f);
+XMFLOAT3 cube2Color(0.8f, 0.8f, 0.8f);
 
 bool animateLight = false;
 bool animateCube = false;
@@ -812,11 +812,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         g_dx11.context->PSSetSamplers(0, 1, g_dx11.shadowSamplerState.GetAddressOf());
         g_dx11.context->PSSetSamplers(1, 1, g_dx11.samplerState.GetAddressOf());
         
-        // Bind DDGI resources
+        // Update and bind DDGI resources with all scene lights
         if (useDDGI && ddgiRenderer.config.enabled) {
+            ddgiRenderer.clearGILights();
+            
+            // Add main light as directional
             XMFLOAT3 lightDir;
             XMStoreFloat3(&lightDir, XMVector3Normalize(XMLoadFloat3(&lightPos)));
-            ddgiRenderer.updateProbes(lightDir, lightColor, ambientStrength);
+            ddgiRenderer.addGILight(lightDir, lightColor, 100.0f, 1.0f, true);
+            
+            // Add all point lights from clustered renderer
+            if (useClusteredRendering) {
+                for (const auto& light : clusteredRenderer.lights) {
+                    if (light.active) {
+                        ddgiRenderer.addGILight(light.position, light.color, light.radius, light.intensity, false);
+                    }
+                }
+            }
+            
+            ddgiRenderer.updateProbesFromLights();
             ddgiRenderer.bind(2, 3, 5);
         }
         
