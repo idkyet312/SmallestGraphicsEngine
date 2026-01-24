@@ -12,7 +12,7 @@
 
 #include "DX12Core.h"
 #include "ShaderDX12.h"
-#include "CameraDX11.h" // Camera logic is API-agnostic
+#include "CameraDX12.h" // Camera logic is API-agnostic
 #include "ClusteredRendererDX12.h"
 
 using namespace DirectX;
