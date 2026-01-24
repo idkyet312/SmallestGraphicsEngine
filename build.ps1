@@ -1,7 +1,7 @@
-# Build script for GraphicEngine using Visual Studio's CMake
+# Build script for GraphicEngine (DirectX 11) using Visual Studio's CMake
 # This script locates Visual Studio's CMake and builds the project
 
-Write-Host "=== GraphicEngine Build Script ===" -ForegroundColor Cyan
+Write-Host "=== GraphicEngine (DirectX 11) Build Script ===" -ForegroundColor Cyan
 
 # Common Visual Studio CMake paths
 $vsPaths = @(
@@ -70,7 +70,7 @@ if (-not $vcpkgToolchain) {
     Write-Host "  cd C:\vcpkg" -ForegroundColor White
     Write-Host "  .\bootstrap-vcpkg.bat" -ForegroundColor White
     Write-Host "  .\vcpkg integrate install" -ForegroundColor White
-    Write-Host "  .\vcpkg install glfw3:x64-windows glm:x64-windows glad:x64-windows" -ForegroundColor White
+    Write-Host "  .\vcpkg install imgui[win32-binding,dx11-binding]:x64-windows" -ForegroundColor White
 }
 
 # Configure with CMake
@@ -85,11 +85,11 @@ try {
     & $cmake $cmakeArgs
     if ($LASTEXITCODE -ne 0) {
         Write-Host "`nCMake configuration failed. Common issues:" -ForegroundColor Red
-        Write-Host "  - Missing dependencies: GLFW, GLM, GLAD" -ForegroundColor Yellow
+        Write-Host "  - Missing dependencies: imgui with dx11 binding" -ForegroundColor Yellow
         if (-not $vcpkgToolchain) {
             Write-Host "  - vcpkg not detected. Install dependencies manually or set VCPKG_ROOT" -ForegroundColor Yellow
         } else {
-            Write-Host "  - Install via vcpkg: vcpkg install glfw3:x64-windows glm:x64-windows glad:x64-windows" -ForegroundColor Yellow
+            Write-Host "  - Install via vcpkg: vcpkg install imgui[win32-binding,dx11-binding]:x64-windows" -ForegroundColor Yellow
         }
         exit 1
     }
@@ -107,10 +107,28 @@ try {
     & $cmake --build . --config Release
     if ($LASTEXITCODE -eq 0) {
         Write-Host "`n=== Build Successful ===" -ForegroundColor Green
-        Write-Host "Executable location: $buildDir\Release\GraphicEngine.exe" -ForegroundColor Green
+        
+        # Find the exe location
+        $exeDir = $buildDir
+        if (Test-Path (Join-Path $buildDir "Release\GraphicEngine.exe")) {
+            $exeDir = Join-Path $buildDir "Release"
+        }
+        
+        # Copy shaders and models to exe directory
+        $shadersDest = Join-Path $exeDir "shaders"
+        $modelsDest = Join-Path $exeDir "models"
+        
+        if (-not (Test-Path $shadersDest)) { New-Item -ItemType Directory -Path $shadersDest -Force | Out-Null }
+        if (-not (Test-Path $modelsDest)) { New-Item -ItemType Directory -Path $modelsDest -Force | Out-Null }
+        
+        Copy-Item (Join-Path $scriptDir "shaders\*") $shadersDest -Force
+        Copy-Item (Join-Path $scriptDir "models\*") $modelsDest -Force
+        
+        Write-Host "Shaders and models copied to: $exeDir" -ForegroundColor Green
+        Write-Host "Executable location: $exeDir\GraphicEngine.exe" -ForegroundColor Green
         Write-Host "`nTo run the application:" -ForegroundColor Cyan
-        Write-Host "  cd `"$scriptDir`"" -ForegroundColor White
-        Write-Host "  .\build\Release\GraphicEngine.exe" -ForegroundColor White
+        Write-Host "  cd `"$exeDir`"" -ForegroundColor White
+        Write-Host "  .\GraphicEngine.exe" -ForegroundColor White
     } else {
         Write-Host "`n=== Build Failed ===" -ForegroundColor Red
         exit 1
@@ -121,3 +139,4 @@ try {
 } finally {
     Pop-Location
 }
+
