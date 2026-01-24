@@ -128,7 +128,7 @@ bool showProbes = false;
 int numDemoLights = 64;
 float demoLightRadius = 8.0f;
 float demoLightIntensity = 1.5f;
-bool animateDemoLights = true;
+bool animateDemoLights = false;
 
 // DX12 resources
 ShaderDX12 mainShader;
