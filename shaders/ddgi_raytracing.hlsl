@@ -40,6 +40,7 @@ RWTexture2D<float4> outputIrradiance : register(u0);
 Texture2D<float4> prevIrradiance : register(t0);
 RaytracingAccelerationStructure scene : register(t1);
 
+
 // Sampler for previous frame texture
 SamplerState linearSampler : register(s0);
 
@@ -188,8 +189,14 @@ void ClosestHit(inout RayPayload payload : SV_RayPayload, in BuiltInTriangleInte
         normal = float3(0, 1, 0);
     }
     
-    // Material properties (simplified)
-    float3 albedo = float3(0.6, 0.6, 0.58); // Grey diffuse
+    // Use test colors to verify shader is working
+    // Floor (y near 0) = green, everything else = red
+    float3 albedo;
+    if (abs(hitPos.y) < 0.1) {
+        albedo = float3(0.2, 0.6, 0.2); // Green floor
+    } else {
+        albedo = float3(0.6, 0.2, 0.2); // Red objects
+    }
     
     // Direct sun lighting
     float3 sunDir = normalize(sunDirection);

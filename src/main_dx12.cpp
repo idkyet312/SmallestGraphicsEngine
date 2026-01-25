@@ -131,6 +131,7 @@ float giIntensity = 0.5f;
 float normalBias = 0.1f;
 float probeSpacing = 2.0f;
 bool showProbes = false;
+int ddgiDebugMode = 0;  // 0=off, 1=GI only, 2=GI*albedo, 3=raw irradiance
 
 // Point lights settings
 int numDemoLights = 64;
@@ -1574,7 +1575,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (useDDGI) {
             std::vector<PointLightDataDX12> lightData = clusteredRenderer.getPointLightData();
             mainShader.SetPointLights((int)lightData.size(), lightData);
-            mainShader.SetDDGI(useDDGI, giIntensity, normalBias, probeSpacing);
+            mainShader.SetDDGI(useDDGI, giIntensity, normalBias, probeSpacing, ddgiDebugMode);
             
             bool usedRaytracing = false;
             static bool printedDDGIStatus = false;
@@ -1668,7 +1669,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         destHandle.ptr += increment;
         if (useDDGI) {
             static bool printedSRVDebug = false;
-            D3D12_CPU_DESCRIPTOR_HANDLE srcHandle = ddgiRenderer.GetIrradianceSRV();
+            D3D12_CPU_DESCRIPTOR_HANDLE srcHandle;
+            
+            // Use raytracing irradiance if DXR pipeline is active, otherwise use compute
+            if (useRaytracedDDGI && ddgiRendererRT.initialized && ddgiRendererRT.rtPipelineState) {
+                srcHandle = ddgiRendererRT.GetIrradianceSRV();
+                if (!printedSRVDebug) {
+                    std::cout << "DDGI: Using RAYTRACING irradiance SRV" << std::endl;
+                }
+            } else {
+                srcHandle = ddgiRenderer.GetIrradianceSRV();
+                if (!printedSRVDebug) {
+                    std::cout << "DDGI: Using COMPUTE irradiance SRV" << std::endl;
+                }
+            }
+            
             if (!printedSRVDebug) {
                 std::cout << "DDGI: Copying irradiance SRV, src handle ptr: " << srcHandle.ptr << std::endl;
                 std::cout << "DDGI: irradianceTexture valid: " << (ddgiRenderer.irradianceTexture ? "YES" : "NO") << std::endl;
@@ -1708,7 +1723,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         mainShader.SetPointLights((int)lightData.size(), lightData);
         
         // Set DDGI parameters
-        mainShader.SetDDGI(useDDGI, giIntensity, normalBias, probeSpacing);
+        mainShader.SetDDGI(useDDGI, giIntensity, normalBias, probeSpacing, ddgiDebugMode);
         
         // Render floor
         XMMATRIX model = XMMatrixIdentity();
@@ -2108,6 +2123,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     ImGui::DragFloat("Normal Bias", &normalBias, 0.01f, 0.0f, 1.0f);
                     ImGui::DragFloat("Probe Spacing", &probeSpacing, 0.1f, 0.5f, 10.0f);
                     ImGui::Checkbox("Show Probes", &showProbes);
+                    
+                    // Debug mode selector
+                    const char* debugModes[] = { "Off", "GI Only", "GI * Albedo", "Raw Irradiance", "Grid Position", "Center Sample" };
+                    ImGui::Combo("Debug Mode", &ddgiDebugMode, debugModes, IM_ARRAYSIZE(debugModes));
+                    
                     ImGui::Text("Probes: 256 (8x4x8)");
                 }
                 

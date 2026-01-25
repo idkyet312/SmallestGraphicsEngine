@@ -78,7 +78,8 @@ cbuffer DDGIBuffer : register(b5) {
     int visibilityTexHeight;
     
     int ddgiEnabled;
-    float3 ddgiPadding;
+    int ddgiDebugMode;  // 0=off, 1=show GI only, 2=show irradiance texture
+    float2 ddgiPadding;
 };
 
 // Shadow map (slot t0)
@@ -540,6 +541,35 @@ float4 main(PS_INPUT input) : SV_TARGET {
     for (int i = 0; i < numPointLights && i < 64; i++) {
         // Pass shadow factor so spot lights are dimmed in shadowed areas
         result += calculateSpotLight(i, input.fragPos, normal, viewDir, shadow) * albedo;
+    }
+    
+    // Debug modes for DDGI visualization
+    if (ddgiDebugMode == 1) {
+        // Show only GI contribution (no direct lighting)
+        return float4(giContribution, 1.0);
+    }
+    else if (ddgiDebugMode == 2) {
+        // Show GI * albedo (indirect lighting contribution)
+        return float4(giContribution * albedo, 1.0);
+    }
+    else if (ddgiDebugMode == 3) {
+        // Show raw irradiance texture (screen-space UV mapped)
+        float2 screenUV = input.position.xy / float2(1920.0, 1080.0);
+        float3 rawIrradiance = irradianceMap.SampleLevel(texSampler, screenUV, 0).rgb;
+        return float4(rawIrradiance, 1.0);
+    }
+    else if (ddgiDebugMode == 4) {
+        // Debug: show if DDGI is enabled and grid position
+        float3 offset = input.fragPos - probeGridOrigin;
+        float3 gridPosF = offset / probeSpacing;
+        // Color based on grid position (red=x, green=y, blue=z)
+        float3 debugColor = frac(gridPosF);
+        return float4(debugColor, 1.0);
+    }
+    else if (ddgiDebugMode == 5) {
+        // Sample center of irradiance texture directly
+        float3 centerSample = irradianceMap.SampleLevel(texSampler, float2(0.5, 0.5), 0).rgb;
+        return float4(centerSample * 10.0, 1.0); // Boost to make visible
     }
     
     return float4(result, 1.0);

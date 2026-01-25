@@ -87,7 +87,8 @@ struct alignas(256) DDGIBufferDX12 {
     int visibilityTexHeight;
     
     int ddgiEnabled;
-    float ddgiPadding[3];
+    int ddgiDebugMode;  // 0=off, 1=GI only, 2=GI*albedo, 3=raw irradiance
+    float ddgiPadding[2];
 };
 
 // Upload buffer helper
@@ -600,7 +601,7 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
     
-    void SetDDGI(bool enabled, float gi_intensity, float normal_bias, float probe_spacing) {
+    void SetDDGI(bool enabled, float gi_intensity, float normal_bias, float probe_spacing, int debugMode = 0) {
         DDGIBufferDX12 data = {};
         data.probeGridOrigin = XMFLOAT3(-7.0f, 0.5f, -7.0f);
         data.probeSpacing = probe_spacing;
@@ -617,6 +618,7 @@ public:
         data.visibilityTexWidth = 16;
         data.visibilityTexHeight = 16;
         data.ddgiEnabled = enabled ? 1 : 0;
+        data.ddgiDebugMode = debugMode;
         ddgiBuffer.CopyData(g_dx12.frameIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
     }

@@ -144,8 +144,13 @@ inline ComPtr<IDxcBlob> CompileShaderDXC(const std::wstring& filePath, const std
     // Setup compile arguments
     std::vector<LPCWSTR> args;
     args.push_back(filePath.c_str());
-    args.push_back(L"-E");
-    args.push_back(entryPoint.c_str());
+    
+    // Only add entry point for non-library targets
+    if (!entryPoint.empty()) {
+        args.push_back(L"-E");
+        args.push_back(entryPoint.c_str());
+    }
+    
     args.push_back(L"-T");
     args.push_back(target.c_str());
     
@@ -173,13 +178,15 @@ inline ComPtr<IDxcBlob> CompileShaderDXC(const std::wstring& filePath, const std
     ComPtr<IDxcBlobUtf8> errors;
     result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
     if (errors && errors->GetStringLength() > 0) {
-        std::cerr << "Shader compilation errors:\n" << errors->GetStringPointer() << std::endl;
+        std::cerr << "=== DXC Shader Compilation Errors ===" << std::endl;
+        std::cerr << errors->GetStringPointer() << std::endl;
+        std::cerr << "======================================" << std::endl;
     }
     
     HRESULT status;
     result->GetStatus(&status);
     if (FAILED(status)) {
-        std::wcerr << L"Shader compilation failed: " << filePath << std::endl;
+        std::wcerr << L"Shader compilation FAILED: " << filePath << L" (HRESULT: 0x" << std::hex << status << std::dec << L")" << std::endl;
         return nullptr;
     }
     
@@ -191,7 +198,7 @@ inline ComPtr<IDxcBlob> CompileShaderDXC(const std::wstring& filePath, const std
 
 // Compile raytracing library shader
 inline ComPtr<IDxcBlob> CompileRaytracingLibrary(const std::wstring& filePath, bool debug = false) {
-    return CompileShaderDXC(filePath, L"", L"lib_6_3", debug);
+    return CompileShaderDXC(filePath, L"", L"lib_6_5", debug);
 }
 
 // Helper function to check HRESULT

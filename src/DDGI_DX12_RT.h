@@ -60,6 +60,12 @@ struct alignas(256) DDGIRaytracingCB {
     int numPointLights;
 };
 
+// Material data for raytracing (matches HLSL)
+struct RTMaterial {
+    XMFLOAT3 albedo;
+    float padding;
+};
+
 // Simple geometry for BLAS
 struct RTGeometry {
     ComPtr<ID3D12Resource> vertexBuffer;
@@ -100,6 +106,9 @@ public:
     // Constant buffer
     ComPtr<ID3D12Resource> constantBuffer;
     DDGIRaytracingCB* mappedCB = nullptr;
+    
+    // Material buffer for per-geometry albedo
+    ComPtr<ID3D12Resource> materialBuffer;
     
     // Scene geometry for BLAS
     std::vector<RTGeometry> geometries;
@@ -340,6 +349,12 @@ public:
         uavBarrier.UAV.pResource = topLevelAS.Get();
         cmdList4->ResourceBarrier(1, &uavBarrier);
         
+        // Create material buffer with per-geometry albedo
+        if (!CreateMaterialBuffer()) {
+            std::cerr << "DDGI_RT: Failed to create material buffer" << std::endl;
+            return false;
+        }
+        
         std::cout << "DDGI_RT: Acceleration structures built successfully" << std::endl;
         return true;
     }
@@ -404,6 +419,9 @@ public:
         if (topLevelAS) {
             cmdList4->SetComputeRootShaderResourceView(2, topLevelAS->GetGPUVirtualAddress());
         }
+        if (materialBuffer) {
+            cmdList4->SetComputeRootShaderResourceView(3, materialBuffer->GetGPUVirtualAddress());
+        }
         
         // Dispatch rays
         D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
@@ -466,7 +484,7 @@ public:
 private:
     bool CreateRootSignatures() {
         // Global root signature
-        D3D12_ROOT_PARAMETER rootParams[3] = {};
+        D3D12_ROOT_PARAMETER rootParams[4] = {};
         
         // Constant buffer (b0)
         rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -499,8 +517,14 @@ private:
         rootParams[2].Descriptor.RegisterSpace = 0;
         rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         
+        // Material buffer (t2)
+        rootParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParams[3].Descriptor.ShaderRegister = 2;
+        rootParams[3].Descriptor.RegisterSpace = 0;
+        rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        rootSigDesc.NumParameters = 3;
+        rootSigDesc.NumParameters = 4;
         rootSigDesc.pParameters = rootParams;
         rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
         
@@ -528,14 +552,15 @@ private:
             return CreateSimplifiedPipeline();
         }
         
-        // Compile raytracing library shader using DXC
-        ComPtr<IDxcBlob> rtLibrary = CompileRaytracingLibrary(L"shaders/ddgi_raytracing.hlsl");
+        // Compile raytracing library shader using DXC with debug enabled
+        std::cout << "DDGI_RT: Compiling shaders/ddgi_raytracing.hlsl..." << std::endl;
+        ComPtr<IDxcBlob> rtLibrary = CompileRaytracingLibrary(L"shaders/ddgi_raytracing.hlsl", true);
         if (!rtLibrary) {
             std::cerr << "DDGI_RT: Failed to compile raytracing shader, using fallback" << std::endl;
             return CreateSimplifiedPipeline();
         }
         
-        std::cout << "DDGI_RT: Raytracing shader compiled successfully" << std::endl;
+        std::cout << "DDGI_RT: Raytracing shader compiled successfully, size: " << rtLibrary->GetBufferSize() << " bytes" << std::endl;
         
         // Create the state object
         D3D12_STATE_OBJECT_DESC stateDesc = {};
@@ -759,6 +784,48 @@ private:
         handle.ptr += increment;
         g_dx12.device->CreateShaderResourceView(irradianceTexture.Get(), &srvDesc, handle);
         
+        return true;
+    }
+    
+    bool CreateMaterialBuffer() {
+        if (geometries.empty()) return true;
+        
+        // Create structured buffer with material data for each geometry
+        std::vector<RTMaterial> materials(geometries.size());
+        for (size_t i = 0; i < geometries.size(); i++) {
+            materials[i].albedo = geometries[i].albedo;
+            materials[i].padding = 0.0f;
+        }
+        
+        D3D12_HEAP_PROPERTIES heapProps = {};
+        heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+        
+        D3D12_RESOURCE_DESC bufferDesc = {};
+        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufferDesc.Width = sizeof(RTMaterial) * materials.size();
+        bufferDesc.Height = 1;
+        bufferDesc.DepthOrArraySize = 1;
+        bufferDesc.MipLevels = 1;
+        bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+        bufferDesc.SampleDesc.Count = 1;
+        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        
+        HRESULT hr = g_dx12.device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&materialBuffer));
+        if (FAILED(hr)) {
+            std::cerr << "DDGI_RT: Failed to create material buffer" << std::endl;
+            return false;
+        }
+        
+        // Upload material data
+        void* mapped;
+        materialBuffer->Map(0, nullptr, &mapped);
+        memcpy(mapped, materials.data(), sizeof(RTMaterial) * materials.size());
+        materialBuffer->Unmap(0, nullptr);
+        
+        std::cout << "DDGI_RT: Created material buffer with " << materials.size() << " materials" << std::endl;
         return true;
     }
     
