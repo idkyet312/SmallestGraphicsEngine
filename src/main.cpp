@@ -19,6 +19,7 @@
 #include "EngineUI.h"
 #include "GLBImporter.h"
 #include "MipGenerator.h"
+#include "ShadowMapDX12.h"
 
 using namespace DirectX;
 
@@ -29,6 +30,7 @@ static unsigned int SCR_HEIGHT = 720;
 static Scene               scene;
 static ShaderDX12           mainShader;
 static VisibilityBufferDX12 visBuffer;
+static ShadowMapDX12        shadowMap;
 static GeometryBuffers      geo;
 static PackedGeometry       packed;
 static std::shared_ptr<SceneNode> crateModel;
@@ -362,6 +364,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cout << "Visibility Buffer ready\n";
     }
 
+    if (!shadowMap.Init()) {
+        std::cerr << "Shadow map init failed (non-fatal)\n";
+        scene.enableShadows = false;
+    }
+
     // Raytracing (DXR path)
     if (!InitRaytracing(geo)) {
         std::cerr << "DXR init failed (non-fatal)\n";
@@ -444,7 +451,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         } else if (scene.useVisibilityBuffer && visBuffer.initialized) {
             RenderIdTech(scene, mainShader, visBuffer, geo, packed);
         } else {
-            RenderForward(scene, mainShader, geo, crateModel, floorMaterial);
+            XMMATRIX lightSpace = XMMatrixIdentity();
+            ID3D12Resource* shadowResource = nullptr;
+            if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
+                lightSpace = shadowMap.Render(scene, geo, crateModel);
+                shadowResource = shadowMap.GetResource();
+            }
+            RenderForward(scene, mainShader, geo, crateModel, floorMaterial, lightSpace, shadowResource);
         }
 
         // Ensure ImGui renders to the swapchain backbuffer (VB path changes OM target)

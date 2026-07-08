@@ -64,6 +64,10 @@ struct Scene {
     int   specularShininess = 32;
     float shadowBias        = 0.005f;
     bool  enableShadows     = true;
+    XMFLOAT3 shadowCenter    = { 0.0f, 3.0f, 0.0f };
+    float shadowOrthoSize    = 30.0f;
+    float shadowDistance     = 40.0f;
+    float shadowFarPlane     = 90.0f;
 
     // Clear color
     XMFLOAT3 clearColor = { 0.1f, 0.1f, 0.15f };

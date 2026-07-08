@@ -46,6 +46,7 @@ set(HEADER_FILES
     src/VisibilityBufferDX12.h
     src/Scene.h
     src/ForwardRenderer.h
+    src/ShadowMapDX12.h
     src/IdTechRenderer.h
     src/EngineUI.h
     src/RaytracingDX12.h

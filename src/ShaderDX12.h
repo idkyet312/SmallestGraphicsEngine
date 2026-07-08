@@ -431,6 +431,32 @@ public:
         g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
         g_dx12.commandList->SetPipelineState(wireframe ? wireframePipelineState.Get() : pipelineState.Get());
     }
+
+    void BindGlobalResources(ID3D12Resource* shadowMap,
+                             ID3D12Resource* irradiance = nullptr,
+                             ID3D12Resource* visibility = nullptr) {
+        UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC shadowDesc = {};
+        shadowDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        shadowDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        shadowDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        shadowDesc.Texture2D.MipLevels = 1;
+        g_dx12.device->CreateShaderResourceView(shadowMap, &shadowDesc, cpuHandle);
+        cpuHandle.ptr += descriptorSize;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC colorDesc = {};
+        colorDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        colorDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        colorDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        colorDesc.Texture2D.MipLevels = 1;
+        g_dx12.device->CreateShaderResourceView(irradiance, &colorDesc, cpuHandle);
+        cpuHandle.ptr += descriptorSize;
+        g_dx12.device->CreateShaderResourceView(visibility, &colorDesc, cpuHandle);
+
+        g_dx12.commandList->SetGraphicsRootDescriptorTable(6, g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart());
+    }
     
     // Call this at the start of each frame to reset draw call counter
     void BeginFrame() {

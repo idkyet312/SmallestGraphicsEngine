@@ -79,6 +79,8 @@ Texture2D irradianceMap : register(t2);
 Texture2D visibilityMap : register(t3);
 Texture2D normalMap : register(t4);
 Texture2D metalRoughMap : register(t5);
+Texture2D<float> shadowMap : register(t0);
+SamplerComparisonState shadowSampler : register(s0);
 SamplerState texSampler : register(s1);
 
 struct PS_INPUT {
@@ -87,7 +89,42 @@ struct PS_INPUT {
     float3 normal : TEXCOORD1;
     float2 texCoord : TEXCOORD2;
     float4 tangent : TEXCOORD3;
+    float4 fragPosLightSpace : TEXCOORD4;
 };
+
+float CalculateShadow(float4 fragPosLightSpace, float3 normal, float3 lightDir) {
+    if (enableShadows == 0) return 1.0;
+
+    float3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
+    float2 shadowUV = projCoords.xy * float2(0.5, -0.5) + 0.5;
+
+    if (projCoords.z <= 0.0 || projCoords.z >= 1.0 ||
+        shadowUV.x < 0.0 || shadowUV.x > 1.0 ||
+        shadowUV.y < 0.0 || shadowUV.y > 1.0) {
+        return 1.0;
+    }
+
+    uint shadowWidth;
+    uint shadowHeight;
+    shadowMap.GetDimensions(shadowWidth, shadowHeight);
+    float2 texelSize = 1.0 / float2(shadowWidth, shadowHeight);
+
+    float ndotl = saturate(dot(normal, lightDir));
+    float bias = max(shadowBias * (1.0 - ndotl), shadowBias * 0.25);
+    float depth = projCoords.z - bias;
+
+    float visibility = 0.0;
+    [unroll]
+    for (int y = -1; y <= 1; y++) {
+        [unroll]
+        for (int x = -1; x <= 1; x++) {
+            visibility += shadowMap.SampleCmpLevelZero(
+                shadowSampler, shadowUV + float2(x, y) * texelSize, depth);
+        }
+    }
+
+    return visibility / 9.0;
+}
 
 // Octahedral encoding helper (direction to UV)
 float2 OctEncode(float3 n) {
@@ -374,7 +411,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float3 specular = numerator / denominator;
     
     // Combine
-    float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor * NdotL * attenuation; // No light intensity? lightColor should allow > 1.
+    float shadowVisibility = CalculateShadow(input.fragPosLightSpace, normal, lightDir);
+    float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor * NdotL * attenuation * shadowVisibility; // No light intensity? lightColor should allow > 1.
     
     result += Lo;
 

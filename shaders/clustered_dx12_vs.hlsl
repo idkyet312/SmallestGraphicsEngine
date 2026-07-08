@@ -20,6 +20,7 @@ struct VS_OUTPUT {
     float3 normal : TEXCOORD1;
     float2 texCoord : TEXCOORD2;
     float4 tangent : TEXCOORD3;
+    float4 fragPosLightSpace : TEXCOORD4;
 };
 
 VS_OUTPUT main(VS_INPUT input) {
@@ -36,6 +37,7 @@ VS_OUTPUT main(VS_INPUT input) {
     
     float4 viewPos = mul(worldPos, view);
     output.position = mul(viewPos, projection);
+    output.fragPosLightSpace = mul(worldPos, lightSpaceMatrix);
     
     return output;
 }
