@@ -122,7 +122,7 @@ struct Scene {
         cube2.color    = { 0.3f, 0.5f, 0.85f };
         cube2.visible  = true;
 
-        floor.color    = { 0.55f, 0.55f, 0.58f };
+        floor.color    = { 1.0f, 1.0f, 1.0f };
     }
 
     void InitLights() {

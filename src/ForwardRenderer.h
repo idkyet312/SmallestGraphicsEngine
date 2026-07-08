@@ -117,7 +117,8 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
 
 // Render the whole scene using the forward clustered path
 inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffers& geo,
-                           const std::shared_ptr<SceneNode>& crateModel = nullptr) {
+                           const std::shared_ptr<SceneNode>& crateModel = nullptr,
+                           const std::shared_ptr<SceneMaterial>& floorMaterial = nullptr) {
     XMMATRIX view = scene.GetViewMatrix();
     XMMATRIX proj = scene.GetProjectionMatrix();
     XMMATRIX lightSpace = XMMatrixIdentity();
@@ -142,7 +143,18 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Floor
     XMMATRIX model = XMMatrixIdentity();
     shader.SetMatrices(model, view, proj, lightSpace);
-    shader.SetObjectColor(scene.floor.color);
+    if (floorMaterial && floorMaterial->baseColorTexture) {
+        shader.SetObjectMaterial(scene.floor.color,
+                                 true,
+                                 floorMaterial->normalTexture != nullptr,
+                                 floorMaterial->metallicFactor,
+                                 floorMaterial->roughnessFactor,
+                                 floorMaterial->baseColorTexture.Get(),
+                                 floorMaterial->normalTexture.Get(),
+                                 floorMaterial->metallicRoughnessTexture.Get());
+    } else {
+        shader.SetObjectColor(scene.floor.color);
+    }
     DrawPlane(geo);
     shader.NextDrawCall();
 

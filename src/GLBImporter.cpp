@@ -231,6 +231,29 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
     return texture;
 }
 
+ComPtr<ID3D12Resource> GLBImporter::LoadTextureFromFile(const std::string& filepath, ComPtr<ID3D12Device> device,
+    ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
+    int width = 0;
+    int height = 0;
+    int components = 0;
+    unsigned char* pixels = stbi_load(filepath.c_str(), &width, &height, &components, 4);
+    if (!pixels) {
+        std::cerr << "Failed to load texture: " << filepath << std::endl;
+        return nullptr;
+    }
+
+    tinygltf::Image image;
+    image.width = width;
+    image.height = height;
+    image.component = 4;
+    image.bits = 8;
+    image.pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+    image.image.assign(pixels, pixels + (size_t)width * (size_t)height * 4);
+    stbi_image_free(pixels);
+
+    return CreateTexture(device.Get(), commandList.Get(), image, uploadHeaps);
+}
+
 // Convert GLTF mesh to SceneMesh
 std::shared_ptr<SceneMesh> ProcessMesh(const tinygltf::Model& model, const tinygltf::Mesh& gltfMesh, ID3D12Device* device, const std::vector<std::shared_ptr<SceneMaterial>>& materials) {
     auto sceneMesh = std::make_shared<SceneMesh>();
