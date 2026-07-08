@@ -29,8 +29,8 @@ public:
 
     Camera(XMFLOAT3 position = XMFLOAT3(0.0f, 5.0f, 10.0f))
         : Position(position), Front(XMFLOAT3(0.0f, 0.0f, -1.0f)), Up(XMFLOAT3(0.0f, 1.0f, 0.0f)),
-          Yaw(-90.0f), Pitch(-20.0f), MovementSpeed(7.5f), MouseSensitivity(0.1f),
-          FPSMode(false), PlayerHeight(1.7f), FloorY(-0.5f),
+          Yaw(-90.0f), Pitch(-5.0f), MovementSpeed(5.0f), MouseSensitivity(0.1f),
+          FPSMode(true), PlayerHeight(1.7f), FloorY(0.0f),
           IsGrounded(true), VerticalVelocity(0.0f), Gravity(9.8f), JumpStrength(5.0f) {
         updateCameraVectors();
     }

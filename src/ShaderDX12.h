@@ -311,8 +311,15 @@ public:
         staticSamplers[0].RegisterSpace = 0;
         staticSamplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         
-        // Regular sampler
-        staticSamplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        // Regular sampler - anisotropic so grazing-angle surfaces (e.g. walls
+        // viewed edge-on) don't alias/moire even with a correct mip chain bound;
+        // plain trilinear only fixes minification along the view axis, not the
+        // elongated footprint a shallow angle projects onto the texture.
+        staticSamplers[1].Filter = D3D12_FILTER_ANISOTROPIC;
+        staticSamplers[1].MaxAnisotropy = 8;
+        staticSamplers[1].MipLODBias = 0.0f;
+        staticSamplers[1].MinLOD = 0.0f;
+        staticSamplers[1].MaxLOD = D3D12_FLOAT32_MAX;
         staticSamplers[1].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         staticSamplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         staticSamplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -350,7 +357,8 @@ public:
         D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
             { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
             { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "TANGENT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
         };
         
         // Create PSO
@@ -361,7 +369,10 @@ public:
         psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
         
         psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+        // No culling: imported glTF materials are marked doubleSided, and glTF's
+        // front-face winding (CCW) is the opposite of DX12's default (CW), so
+        // culling here would drop faces on imported models (e.g. the h1.glb house).
+        psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         psoDesc.RasterizerState.FrontCounterClockwise = FALSE;
         psoDesc.RasterizerState.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
         psoDesc.RasterizerState.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
