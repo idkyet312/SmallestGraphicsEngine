@@ -4,6 +4,7 @@
 #include <windowsx.h>
 #include <iostream>
 #include <chrono>
+#include <filesystem>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx12.h>
@@ -31,6 +32,7 @@ static VisibilityBufferDX12 visBuffer;
 static GeometryBuffers      geo;
 static PackedGeometry       packed;
 static std::shared_ptr<SceneNode> crateModel;
+static std::shared_ptr<SceneMaterial> floorMaterial;
 static bool                 crateLoadAttempted = false;
 
 static float lastX = SCR_WIDTH / 2.0f;
@@ -45,6 +47,36 @@ static DWORD windowedStyle = 0;
 static float deltaTime     = 0.0f;
 
 static ComPtr<ID3D12DescriptorHeap> imguiSrvHeap;
+
+static std::string ResolveTexturePath(const char* relativePath) {
+    if (std::filesystem::exists(relativePath)) return relativePath;
+    std::string buildPath = std::string("build/") + relativePath;
+    if (std::filesystem::exists(buildPath)) return buildPath;
+    return relativePath;
+}
+
+static void LoadFloorMudMaterial() {
+    floorMaterial = std::make_shared<SceneMaterial>();
+    floorMaterial->name = "brown_mud_02";
+    floorMaterial->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+    floorMaterial->metallicFactor = 0.0f;
+    floorMaterial->roughnessFactor = 1.0f;
+
+    floorMaterial->baseColorTexture = GLBImporter::LoadTextureFromFile(
+        ResolveTexturePath("models/Textures/brown_mud_02_diff_2k.jpg"),
+        g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
+    floorMaterial->normalTexture = GLBImporter::LoadTextureFromFile(
+        ResolveTexturePath("models/Textures/brown_mud_02_nor_gl_2k.jpg"),
+        g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
+    floorMaterial->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
+        ResolveTexturePath("models/Textures/brown_mud_02_rough_2k.jpg"),
+        g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
+
+    if (!floorMaterial->baseColorTexture) {
+        floorMaterial.reset();
+        std::cerr << "Brown mud floor texture unavailable; using flat floor color\n";
+    }
+}
 
 // ?? timer ????????????????????????????????????????????????????????????????????
 class Timer {
@@ -93,9 +125,10 @@ static bool CreateAllGeometry() {
     if (!CreateVertexBuffer(cubeVerts, geo.cubeVertexBuffer, geo.cubeVBV)) return false;
 
     float s = 20.0f;
+    float tile = 8.0f;
     std::vector<VertexPosNormUV> planeVerts = {
-        {{-s,0, s},{0,1,0},{0,0}}, {{ s,0, s},{0,1,0},{1,0}}, {{ s,0,-s},{0,1,0},{1,1}},
-        {{-s,0, s},{0,1,0},{0,0}}, {{ s,0,-s},{0,1,0},{1,1}}, {{-s,0,-s},{0,1,0},{0,1}},
+        {{-s,0, s},{0,1,0},{0,0}}, {{ s,0, s},{0,1,0},{tile,0}}, {{ s,0,-s},{0,1,0},{tile,tile}},
+        {{-s,0, s},{0,1,0},{0,0}}, {{ s,0,-s},{0,1,0},{tile,tile}}, {{-s,0,-s},{0,1,0},{0,tile}},
     };
     if (!CreateVertexBuffer(planeVerts, geo.planeVertexBuffer, geo.planeVBV)) return false;
 
@@ -373,6 +406,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         if (!crateLoadAttempted) {
             crateLoadAttempted = true;
+            LoadFloorMudMaterial();
             std::cout << "Loading models/h1.glb...\n";
             crateModel = GLBImporter::LoadGLB("models/h1.glb", g_dx12.device, g_dx12.commandList);
             if (crateModel) {
@@ -410,7 +444,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         } else if (scene.useVisibilityBuffer && visBuffer.initialized) {
             RenderIdTech(scene, mainShader, visBuffer, geo, packed);
         } else {
-            RenderForward(scene, mainShader, geo, crateModel);
+            RenderForward(scene, mainShader, geo, crateModel, floorMaterial);
         }
 
         // Ensure ImGui renders to the swapchain backbuffer (VB path changes OM target)
