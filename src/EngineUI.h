@@ -64,6 +64,13 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat("Ambient",  &scene.ambientStrength,  0.01f, 0.0f, 1.0f);
         ImGui::DragFloat("Specular", &scene.specularStrength, 0.01f, 0.0f, 1.0f);
         ImGui::Checkbox("Enable Shadows", &scene.enableShadows);
+        if (scene.enableShadows) {
+            ImGui::DragFloat("Shadow Bias", &scene.shadowBias, 0.0005f, 0.0f, 0.05f, "%.4f");
+            ImGui::DragFloat3("Shadow Center", &scene.shadowCenter.x, 0.1f);
+            ImGui::DragFloat("Shadow Size", &scene.shadowOrthoSize, 0.5f, 5.0f, 80.0f);
+            ImGui::DragFloat("Shadow Distance", &scene.shadowDistance, 0.5f, 5.0f, 120.0f);
+            ImGui::DragFloat("Shadow Far", &scene.shadowFarPlane, 0.5f, 10.0f, 200.0f);
+        }
 
         // -- Rendering Pipeline Selection --
         ImGui::Separator();

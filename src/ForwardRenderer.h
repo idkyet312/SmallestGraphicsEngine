@@ -118,17 +118,19 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
 // Render the whole scene using the forward clustered path
 inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffers& geo,
                            const std::shared_ptr<SceneNode>& crateModel = nullptr,
-                           const std::shared_ptr<SceneMaterial>& floorMaterial = nullptr) {
+                           const std::shared_ptr<SceneMaterial>& floorMaterial = nullptr,
+                           XMMATRIX lightSpace = XMMatrixIdentity(),
+                           ID3D12Resource* shadowMap = nullptr) {
     XMMATRIX view = scene.GetViewMatrix();
     XMMATRIX proj = scene.GetProjectionMatrix();
-    XMMATRIX lightSpace = XMMatrixIdentity();
 
     shader.Use(scene.wireframeMode);
+    shader.BindGlobalResources(shadowMap);
 
     shader.SetLight(scene.lightPos, scene.lightType, scene.lightColor,
                     scene.lightConstant, scene.lightLinear, scene.lightQuadratic,
                     scene.ambientStrength, scene.specularStrength, scene.specularShininess,
-                    scene.shadowBias, scene.enableShadows);
+                    scene.shadowBias, scene.enableShadows && shadowMap != nullptr);
     shader.SetCamera(scene.camera.Position);
 
     // Clustered light cull
