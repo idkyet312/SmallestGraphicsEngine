@@ -10,6 +10,7 @@
 #include <DirectXMath.h>
 #include <wrl/client.h>
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <string>
 #include <stdexcept>
@@ -188,7 +189,31 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     
     // Create device
     ThrowIfFailed(D3D12CreateDevice(g_dx12.adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_dx12.device)));
-    
+
+#ifdef _DEBUG
+    // Disable break-on-error so an offscreen automated run doesn't halt in a
+    // debugger trap. Register a callback (Win10 1903+) that writes validation
+    // messages straight to a log file, since this app's own console can't be
+    // captured externally - this is the only reliable way to see them.
+    {
+        ComPtr<ID3D12InfoQueue1> infoQueue1;
+        if (SUCCEEDED(g_dx12.device.As(&infoQueue1))) {
+            infoQueue1->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
+            infoQueue1->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
+            DWORD cookie = 0;
+            infoQueue1->RegisterMessageCallback(
+                [](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity,
+                   D3D12_MESSAGE_ID, LPCSTR pDescription, void*) {
+                    if (severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
+                        std::ofstream log("d3d12_debug.log", std::ios::app);
+                        log << pDescription << "\n";
+                    }
+                },
+                D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
+        }
+    }
+#endif
+
     // Create command queue
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -267,7 +292,7 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     depthDesc.Height = height;
     depthDesc.DepthOrArraySize = 1;
     depthDesc.MipLevels = 1;
-    depthDesc.Format = DXGI_FORMAT_D32_FLOAT;
+    depthDesc.Format = DXGI_FORMAT_R32_TYPELESS;
     depthDesc.SampleDesc.Count = 1;
     depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     
@@ -371,7 +396,7 @@ inline void ResizeDX12(UINT width, UINT height) {
     depthDesc.Height = height;
     depthDesc.DepthOrArraySize = 1;
     depthDesc.MipLevels = 1;
-    depthDesc.Format = DXGI_FORMAT_D32_FLOAT;
+    depthDesc.Format = DXGI_FORMAT_R32_TYPELESS;
     depthDesc.SampleDesc.Count = 1;
     depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     
@@ -436,6 +461,26 @@ inline void BeginFrame() {
     // Set viewport and scissor rect
     g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
     g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+}
+
+// Prints and clears any queued D3D12 validation-layer messages (Debug builds only)
+inline void DumpDX12DebugMessages() {
+#ifdef _DEBUG
+    ComPtr<ID3D12InfoQueue> infoQueue;
+    if (FAILED(g_dx12.device.As(&infoQueue))) return;
+
+    UINT64 count = infoQueue->GetNumStoredMessages();
+    for (UINT64 i = 0; i < count; i++) {
+        SIZE_T msgLen = 0;
+        infoQueue->GetMessage(i, nullptr, &msgLen);
+        if (msgLen == 0) continue;
+        std::vector<char> buf(msgLen);
+        D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+        infoQueue->GetMessage(i, msg, &msgLen);
+        std::cerr << "[D3D12] " << msg->pDescription << std::endl;
+    }
+    infoQueue->ClearStoredMessages();
+#endif
 }
 
 // End frame - present

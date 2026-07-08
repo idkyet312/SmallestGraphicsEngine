@@ -25,7 +25,7 @@ struct SceneMaterial {
 
 // Represents a mesh part (subset) with its own material/texture
 struct MeshPrimitive {
-    std::vector<float> vertices; // Interleaved: Pos(3), Normal(3), Tex(2) -> 8 floats per vertex
+    std::vector<float> vertices; // Interleaved: Pos(3), Normal(3), Tex(2), Tangent(4) -> 12 floats per vertex
     std::vector<unsigned int> indices;
     int materialIndex = -1;
     std::shared_ptr<SceneMaterial> material;

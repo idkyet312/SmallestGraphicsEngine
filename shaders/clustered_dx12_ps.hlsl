@@ -86,6 +86,7 @@ struct PS_INPUT {
     float3 fragPos : TEXCOORD0;
     float3 normal : TEXCOORD1;
     float2 texCoord : TEXCOORD2;
+    float4 tangent : TEXCOORD3;
 };
 
 // Octahedral encoding helper (direction to UV)
@@ -205,7 +206,7 @@ float3 sampleDDGIIrradiance(float3 worldPos, float3 normal) {
     return irradiance * giIntensity;
 }
 
-float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 viewDir) {
+float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 viewDir, float rough) {
     float3 lightPosition = pointLights[index].position;
     float3 lightCol = pointLights[index].color;
     float lightRadius = pointLights[index].radius;
@@ -227,8 +228,9 @@ float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 view
     float3 diffuse = diff * lightCol * lightIntensity;
     
     float3 halfwayDir = normalize(lightDir + viewDir);
-    float spec = pow(max(dot(normal, halfwayDir), 0.0), (float)shininess);
-    float3 specular = specularStrength * spec * lightCol * lightIntensity;
+    float pointShininess = lerp(8.0, 128.0, saturate(1.0 - rough));
+    float spec = pow(max(dot(normal, halfwayDir), 0.0), pointShininess);
+    float3 specular = specularStrength * saturate(1.0 - rough) * spec * lightCol * lightIntensity;
     
     return (diffuse + specular) * attenuation;
 }
@@ -241,12 +243,11 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float3 albedo = objectColor;
     if (useTexture > 0.5) {
         float4 texColor = albedoMap.Sample(texSampler, input.texCoord);
-        // texColor is sRGB? The Importer forces RGBA but format DXGI_FORMAT_R8G8B8A8_UNORM means linear? 
+        // texColor is sRGB? The Importer forces RGBA but format DXGI_FORMAT_R8G8B8A8_UNORM means linear?
         // Usually file is sRGB. If UNORM, it is just raw values. If we need linear for PBR, we should pow 2.2.
         // But let's assume texture is albedo.
-        albedo = texColor.rgb * objectColor; 
+        albedo = texColor.rgb * objectColor;
     }
-    
     float metal = metalness;
     float rough = roughness;
     
@@ -275,25 +276,39 @@ float4 main(PS_INPUT input) : SV_TARGET {
         metal *= mrSample.b;
         rough *= mrSample.g;
     }
+    rough = clamp(rough, 0.045, 1.0); // avoid alpha->0 specular-aliasing spike
     
-    // Simple Normal mapping (PerturbNormalArb)
+    // Normal mapping through a stable vertex tangent frame. Imported meshes
+    // without tangents get UV-derived tangents generated at load time.
     if (useNormalMap > 0.5) {
-         float3 mapNormal = normalMap.Sample(texSampler, input.texCoord).xyz;
-         mapNormal = mapNormal * 2.0 - 1.0;
-         
-         // Q: pos, uv derivatives
-         float3 q1 = ddx(input.fragPos);
-         float3 q2 = ddy(input.fragPos);
-         float2 st1 = ddx(input.texCoord);
-         float2 st2 = ddy(input.texCoord);
-         
+         float normalMipBias = 1.5;
+         float normalStrength = 0.35;
+         float3 mapNormal = normalMap.SampleBias(texSampler, input.texCoord, normalMipBias).xyz * 2.0 - 1.0;
+         float normalMipLength = saturate(length(mapNormal));
+         mapNormal.xy *= normalMipLength;
+         mapNormal.z = sqrt(saturate(1.0 - dot(mapNormal.xy, mapNormal.xy)));
+
          float3 N = normalize(input.normal);
-         float3 T = normalize(q1 * st2.y - q2 * st1.y);
-         float3 B = -normalize(cross(N, T));
+         float3 T = normalize(input.tangent.xyz - N * dot(N, input.tangent.xyz));
+         float3 B = normalize(cross(N, T) * input.tangent.w);
          float3x3 TBN = float3x3(T, B, N);
-         
-         normal = normalize(mul(mapNormal, TBN));
+
+         float3 mappedNormal = normalize(mul(mapNormal, TBN));
+         uint normalWidth;
+         uint normalHeight;
+         normalMap.GetDimensions(normalWidth, normalHeight);
+         float2 normalMapSize = float2(normalWidth, normalHeight);
+         float normalFootprint = max(length(ddx(input.texCoord) * normalMapSize), length(ddy(input.texCoord) * normalMapSize));
+         float minifyFade = 1.0 - saturate((log2(max(normalFootprint, 1.0)) - 1.0) * 0.25);
+         float grazingFade = saturate(abs(dot(N, viewDir)) * 2.0);
+         normal = normalize(lerp(N, mappedNormal, normalStrength * grazingFade * minifyFade));
     }
+    
+    // Geometric specular AA: widen GGX for high screen-space normal variance.
+    float3 dndx = ddx(normal);
+    float3 dndy = ddy(normal);
+    float normalVariance = dot(dndx, dndx) + dot(dndy, dndy);
+    rough = clamp(sqrt(rough * rough + min(normalVariance * 0.25, 0.25)), 0.045, 1.0);
 
     // Base ambient
     float3 ambient = ambientStrength * albedo;
@@ -355,7 +370,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
     kD *= 1.0 - metal;
     
     float3 numerator = NDF * G * F;
-    float denominator = 4.0 * NdotV * NdotL + 0.0001;
+    float denominator = max(4.0 * NdotV * NdotL, 0.001);
     float3 specular = numerator / denominator;
     
     // Combine
@@ -369,7 +384,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
         // result += calculatePointLight(i, input.fragPos, normal, viewDir) * objectColor;
         // Skip for now to save instruction count or update calculatePointLight to PBR
         // Just use simple Blinn for point lights for performance?
-        result += calculatePointLight(i, input.fragPos, normal, viewDir) * albedo;
+        result += calculatePointLight(i, input.fragPos, normal, viewDir, rough) * albedo;
     }
     
     return float4(result, 1.0);

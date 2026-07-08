@@ -295,7 +295,10 @@ float4 main(PS_INPUT input) : SV_TARGET {
     for (int i = 0; i < numPointLights && i < 64; i++) {
         result += calculatePointLight(i, input.fragPos, normal, viewDir) * objectColor;
     }
-    
+
+    // Tonemap to avoid harsh clipping/hue-shift when many lights overlap
+    result = result / (result + 1.0);
+
     return float4(result, 1.0);
 }
 

@@ -43,6 +43,13 @@ set(HEADER_FILES
     src/ShaderDX12.h
     src/SceneGraph.h
     src/GLBImporter.h
+    src/VisibilityBufferDX12.h
+    src/Scene.h
+    src/ForwardRenderer.h
+    src/IdTechRenderer.h
+    src/EngineUI.h
+    src/RaytracingDX12.h
+    src/MipGenerator.h
 )
 
 # Find tinygltf
@@ -61,7 +68,7 @@ set_source_files_properties(${SHADER_FILES} PROPERTIES
 if(USE_DX12)
     message(STATUS "Building with DirectX 12")
     add_executable(GraphicEngine WIN32 
-        src/main_dx12.cpp
+        src/main.cpp
         src/GLBImporter.cpp
         ${HEADER_FILES}
         ${SHADER_FILES}

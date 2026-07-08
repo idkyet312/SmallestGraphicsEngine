@@ -7,10 +7,15 @@
 #include <tiny_gltf.h>
 
 #include "GLBImporter.h"
+#include "MipGenerator.h"
 #include <iostream>
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 using namespace DirectX;
+
+MipGenerator g_mipGen;
 
 // Helper to copy data from GLTF buffer to vector
 template<typename T>
@@ -30,17 +35,106 @@ void CopyBufferData(const tinygltf::Model& model, int accessorIndex, std::vector
     }
 }
 
-// Helper to load texture
+static DirectX::XMFLOAT3 Add3(const DirectX::XMFLOAT3& a, const DirectX::XMFLOAT3& b) {
+    return DirectX::XMFLOAT3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+static DirectX::XMFLOAT3 Sub3(const DirectX::XMFLOAT3& a, const DirectX::XMFLOAT3& b) {
+    return DirectX::XMFLOAT3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+static DirectX::XMFLOAT3 Mul3(const DirectX::XMFLOAT3& a, float s) {
+    return DirectX::XMFLOAT3(a.x * s, a.y * s, a.z * s);
+}
+
+static float Dot3(const DirectX::XMFLOAT3& a, const DirectX::XMFLOAT3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static DirectX::XMFLOAT3 Cross3(const DirectX::XMFLOAT3& a, const DirectX::XMFLOAT3& b) {
+    return DirectX::XMFLOAT3(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x);
+}
+
+static DirectX::XMFLOAT3 Normalize3(const DirectX::XMFLOAT3& v) {
+    float lenSq = Dot3(v, v);
+    if (lenSq <= 1e-12f) return DirectX::XMFLOAT3(1.0f, 0.0f, 0.0f);
+    return Mul3(v, 1.0f / std::sqrt(lenSq));
+}
+
+static void GenerateTangents(const std::vector<DirectX::XMFLOAT3>& positions,
+    const std::vector<DirectX::XMFLOAT3>& normals,
+    const std::vector<DirectX::XMFLOAT2>& texCoords,
+    const std::vector<unsigned int>& indices,
+    std::vector<DirectX::XMFLOAT4>& tangents) {
+    tangents.assign(positions.size(), DirectX::XMFLOAT4(1.0f, 0.0f, 0.0f, 1.0f));
+    if (positions.size() < 3 || texCoords.size() != positions.size()) return;
+
+    std::vector<DirectX::XMFLOAT3> tan1(positions.size(), DirectX::XMFLOAT3(0, 0, 0));
+    std::vector<DirectX::XMFLOAT3> tan2(positions.size(), DirectX::XMFLOAT3(0, 0, 0));
+
+    auto accumulateTri = [&](unsigned int i0, unsigned int i1, unsigned int i2) {
+        if (i0 >= positions.size() || i1 >= positions.size() || i2 >= positions.size()) return;
+
+        const DirectX::XMFLOAT3& p0 = positions[i0];
+        const DirectX::XMFLOAT3& p1 = positions[i1];
+        const DirectX::XMFLOAT3& p2 = positions[i2];
+        const DirectX::XMFLOAT2& w0 = texCoords[i0];
+        const DirectX::XMFLOAT2& w1 = texCoords[i1];
+        const DirectX::XMFLOAT2& w2 = texCoords[i2];
+
+        float x1 = p1.x - p0.x, x2 = p2.x - p0.x;
+        float y1 = p1.y - p0.y, y2 = p2.y - p0.y;
+        float z1 = p1.z - p0.z, z2 = p2.z - p0.z;
+        float s1 = w1.x - w0.x, s2 = w2.x - w0.x;
+        float t1 = w1.y - w0.y, t2 = w2.y - w0.y;
+
+        float det = s1 * t2 - s2 * t1;
+        if (std::abs(det) < 1e-8f) return;
+        float r = 1.0f / det;
+
+        DirectX::XMFLOAT3 sdir((t2 * x1 - t1 * x2) * r, (t2 * y1 - t1 * y2) * r, (t2 * z1 - t1 * z2) * r);
+        DirectX::XMFLOAT3 tdir((s1 * x2 - s2 * x1) * r, (s1 * y2 - s2 * y1) * r, (s1 * z2 - s2 * z1) * r);
+
+        tan1[i0] = Add3(tan1[i0], sdir); tan1[i1] = Add3(tan1[i1], sdir); tan1[i2] = Add3(tan1[i2], sdir);
+        tan2[i0] = Add3(tan2[i0], tdir); tan2[i1] = Add3(tan2[i1], tdir); tan2[i2] = Add3(tan2[i2], tdir);
+    };
+
+    if (!indices.empty()) {
+        for (size_t i = 0; i + 2 < indices.size(); i += 3) accumulateTri(indices[i], indices[i + 1], indices[i + 2]);
+    } else {
+        for (unsigned int i = 0; i + 2 < positions.size(); i += 3) accumulateTri(i, i + 1, i + 2);
+    }
+
+    for (size_t i = 0; i < positions.size(); i++) {
+        DirectX::XMFLOAT3 n = i < normals.size() ? Normalize3(normals[i]) : DirectX::XMFLOAT3(0, 1, 0);
+        DirectX::XMFLOAT3 t = Sub3(tan1[i], Mul3(n, Dot3(n, tan1[i])));
+        t = Normalize3(t);
+        float sign = Dot3(Cross3(n, t), tan2[i]) < 0.0f ? -1.0f : 1.0f;
+        tangents[i] = DirectX::XMFLOAT4(t.x, t.y, t.z, sign);
+    }
+}
+
+// Helper to load texture. Uploads mip 0 only; the remaining mip levels of the
+// resource are filled in by a GPU compute pass (see MipGenerator) since DX12
+// has no built-in equivalent of DX11's GenerateMips.
 ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList,
     const tinygltf::Image& image, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
     if (image.width == 0 || image.height == 0) return nullptr;
 
+    UINT baseW = (UINT)image.width;
+    UINT baseH = (UINT)image.height;
+    UINT16 mipLevels = 1;
+    while ((baseW >> mipLevels) > 0 || (baseH >> mipLevels) > 0) mipLevels++;
+
     D3D12_RESOURCE_DESC textureDesc = {};
-    textureDesc.MipLevels = 1;
+    textureDesc.MipLevels = mipLevels;
     textureDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    textureDesc.Width = image.width;
-    textureDesc.Height = image.height;
-    textureDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    textureDesc.Width = baseW;
+    textureDesc.Height = baseH;
+    textureDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS; // compute mip pass writes via UAV
     textureDesc.DepthOrArraySize = 1;
     textureDesc.SampleDesc.Count = 1;
     textureDesc.SampleDesc.Quality = 0;
@@ -57,12 +151,12 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
         return nullptr;
     }
 
-    // Prepare data (force RGBA)
+    // Prepare base-level data (force RGBA)
     std::vector<unsigned char> rgba;
     const unsigned char* pSource = image.image.data();
     if (image.component == 3) {
-        rgba.resize(image.width * image.height * 4);
-        for (size_t i = 0; i < (size_t)(image.width * image.height); i++) {
+        rgba.resize((size_t)baseW * baseH * 4);
+        for (size_t i = 0; i < (size_t)baseW * baseH; i++) {
             rgba[i * 4 + 0] = pSource[i * 3 + 0];
             rgba[i * 4 + 1] = pSource[i * 3 + 1];
             rgba[i * 4 + 2] = pSource[i * 3 + 2];
@@ -70,9 +164,8 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
         }
         pSource = rgba.data();
     }
-    // assume 4 component or 3 component forced to 4. 
 
-    UINT64 uploadBufferSize;
+    UINT64 uploadBufferSize = 0;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
     device->GetCopyableFootprints(&textureDesc, 0, 1, 0, &footprint, nullptr, nullptr, &uploadBufferSize);
 
@@ -102,12 +195,11 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
 
     BYTE* pData;
     uploadHeap->Map(0, nullptr, (void**)&pData);
-
     BYTE* pDest = pData + footprint.Offset;
-    for (UINT h = 0; h < (UINT)image.height; ++h) {
+    for (UINT h = 0; h < baseH; ++h) {
         memcpy(pDest + h * footprint.Footprint.RowPitch,
-            pSource + h * image.width * 4,
-            image.width * 4);
+            pSource + (size_t)h * baseW * 4,
+            (size_t)baseW * 4);
     }
     uploadHeap->Unmap(0, nullptr);
 
@@ -123,14 +215,18 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
 
     cmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
+    // Mip 0 -> PIXEL_SHADER_RESOURCE; remaining mips start there too so the
+    // compute pass's per-level transitions (which assume that starting state)
+    // are uniform across the whole chain even before they've been written.
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = texture.Get();
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-
     cmdList->ResourceBarrier(1, &barrier);
+
+    g_mipGen.GenerateMips(cmdList, texture.Get(), baseW, baseH, mipLevels);
 
     return texture;
 }
@@ -151,6 +247,7 @@ std::shared_ptr<SceneMesh> ProcessMesh(const tinygltf::Model& model, const tinyg
         int posIdx = -1;
         int normIdx = -1;
         int texIdx = -1;
+        int tangentIdx = -1;
         
         if (primitive.attributes.find("POSITION") != primitive.attributes.end())
             posIdx = primitive.attributes.at("POSITION");
@@ -158,33 +255,23 @@ std::shared_ptr<SceneMesh> ProcessMesh(const tinygltf::Model& model, const tinyg
             normIdx = primitive.attributes.at("NORMAL");
         if (primitive.attributes.find("TEXCOORD_0") != primitive.attributes.end())
             texIdx = primitive.attributes.at("TEXCOORD_0");
+        if (primitive.attributes.find("TANGENT") != primitive.attributes.end())
+            tangentIdx = primitive.attributes.at("TANGENT");
             
         // Extract data
         std::vector<XMFLOAT3> positions;
         std::vector<XMFLOAT3> normals;
         std::vector<XMFLOAT2> texCoords;
+        std::vector<XMFLOAT4> tangents;
         
         if (posIdx >= 0) CopyBufferData(model, posIdx, positions);
         if (normIdx >= 0) CopyBufferData(model, normIdx, normals);
         if (texIdx >= 0) CopyBufferData(model, texIdx, texCoords);
+        if (tangentIdx >= 0) CopyBufferData(model, tangentIdx, tangents);
         
         // Resize to match positions
         if (normals.empty() && !positions.empty()) normals.resize(positions.size(), XMFLOAT3(0, 1, 0));
         if (texCoords.empty() && !positions.empty()) texCoords.resize(positions.size(), XMFLOAT2(0, 0));
-        
-        // Interleave data
-        for (size_t i = 0; i < positions.size(); i++) {
-            meshPrim.vertices.push_back(positions[i].x);
-            meshPrim.vertices.push_back(positions[i].y);
-            meshPrim.vertices.push_back(positions[i].z);
-            
-            meshPrim.vertices.push_back(normals[i].x);
-            meshPrim.vertices.push_back(normals[i].y);
-            meshPrim.vertices.push_back(normals[i].z);
-            
-            meshPrim.vertices.push_back(texCoords[i].x);
-            meshPrim.vertices.push_back(texCoords[i].y);
-        }
         
         // Indices
         if (primitive.indices >= 0) {
@@ -207,6 +294,29 @@ std::shared_ptr<SceneMesh> ProcessMesh(const tinygltf::Model& model, const tinyg
                     meshPrim.indices.push_back(*val);
                 }
             }
+        }
+
+        if (tangents.size() != positions.size()) {
+            GenerateTangents(positions, normals, texCoords, meshPrim.indices, tangents);
+        }
+        
+        // Interleave data
+        for (size_t i = 0; i < positions.size(); i++) {
+            meshPrim.vertices.push_back(positions[i].x);
+            meshPrim.vertices.push_back(positions[i].y);
+            meshPrim.vertices.push_back(positions[i].z);
+            
+            meshPrim.vertices.push_back(normals[i].x);
+            meshPrim.vertices.push_back(normals[i].y);
+            meshPrim.vertices.push_back(normals[i].z);
+            
+            meshPrim.vertices.push_back(texCoords[i].x);
+            meshPrim.vertices.push_back(texCoords[i].y);
+
+            meshPrim.vertices.push_back(tangents[i].x);
+            meshPrim.vertices.push_back(tangents[i].y);
+            meshPrim.vertices.push_back(tangents[i].z);
+            meshPrim.vertices.push_back(tangents[i].w);
         }
         
         meshPrim.indexCount = (UINT)meshPrim.indices.size();
@@ -244,7 +354,7 @@ std::shared_ptr<SceneMesh> ProcessMesh(const tinygltf::Model& model, const tinyg
                 
                 meshPrim.vbv.BufferLocation = meshPrim.vertexBuffer->GetGPUVirtualAddress();
                 meshPrim.vbv.SizeInBytes = vbSize;
-                meshPrim.vbv.StrideInBytes = 8 * sizeof(float); // 3 pos + 3 norm + 2 uv
+                meshPrim.vbv.StrideInBytes = 12 * sizeof(float); // 3 pos + 3 norm + 2 uv + 4 tangent
             }
             
             // Index Buffer
