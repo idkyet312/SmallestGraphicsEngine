@@ -520,3 +520,173 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLB(const std::string& filepath, Com
     return rootNode;
 }
 
+// Recursively collects (primitive, nodeLocalToRoot) pairs, folding each
+// node's local transform into its parent's so the accumulated matrix maps
+// straight from the primitive's original vertex space into modelRoot space.
+static void CollectPrimitivesRelativeToRoot(
+    SceneNode* node, const XMMATRIX& parentToRoot,
+    std::vector<std::pair<const MeshPrimitive*, XMMATRIX>>& out) {
+    if (!node) return;
+
+    node->UpdateLocalTransform();
+    XMMATRIX localToRoot = XMLoadFloat4x4(&node->localTransform) * parentToRoot;
+
+    if (node->mesh) {
+        for (const auto& prim : node->mesh->primitives) {
+            if (prim.vbv.BufferLocation != 0) {
+                out.push_back({ &prim, localToRoot });
+            }
+        }
+    }
+
+    for (auto& child : node->children) {
+        CollectPrimitivesRelativeToRoot(child.get(), localToRoot, out);
+    }
+}
+
+static Microsoft::WRL::ComPtr<ID3D12Resource> CreateUploadBuffer(ID3D12Device* device, const void* data, UINT sizeBytes) {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    if (sizeBytes == 0) return resource;
+
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+    heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+
+    D3D12_RESOURCE_DESC bufferDesc = {};
+    bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufferDesc.Width = sizeBytes;
+    bufferDesc.Height = 1;
+    bufferDesc.DepthOrArraySize = 1;
+    bufferDesc.MipLevels = 1;
+    bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+    bufferDesc.SampleDesc.Count = 1;
+    bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    HRESULT hr = device->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        IID_PPV_ARGS(&resource));
+    if (FAILED(hr)) return nullptr;
+
+    void* mapped;
+    resource->Map(0, nullptr, &mapped);
+    memcpy(mapped, data, sizeBytes);
+    resource->Unmap(0, nullptr);
+    return resource;
+}
+
+std::shared_ptr<SceneNode> GLBImporter::MergeSceneByMaterial(const std::shared_ptr<SceneNode>& modelRoot, ComPtr<ID3D12Device> device) {
+    if (!modelRoot) return nullptr;
+
+    std::vector<std::pair<const MeshPrimitive*, XMMATRIX>> collected;
+    CollectPrimitivesRelativeToRoot(modelRoot.get(), XMMatrixIdentity(), collected);
+
+    // Group by material identity (nullptr = default material bucket)
+    std::vector<std::shared_ptr<SceneMaterial>> materialOrder;
+    std::vector<std::vector<std::pair<const MeshPrimitive*, XMMATRIX>>> buckets;
+
+    for (auto& entry : collected) {
+        std::shared_ptr<SceneMaterial> mat = entry.first->material;
+        int bucketIdx = -1;
+        for (size_t i = 0; i < materialOrder.size(); i++) {
+            if (materialOrder[i] == mat) { bucketIdx = (int)i; break; }
+        }
+        if (bucketIdx < 0) {
+            bucketIdx = (int)materialOrder.size();
+            materialOrder.push_back(mat);
+            buckets.push_back({});
+        }
+        buckets[bucketIdx].push_back(entry);
+    }
+
+    auto mergedMesh = std::make_shared<SceneMesh>();
+    mergedMesh->name = modelRoot->name + "_Merged";
+
+    for (size_t b = 0; b < buckets.size(); b++) {
+        MeshPrimitive merged;
+        merged.materialIndex = -1;
+        merged.material = materialOrder[b];
+
+        for (auto& entry : buckets[b]) {
+            const MeshPrimitive* src = entry.first;
+            const XMMATRIX& localToRoot = entry.second;
+            XMMATRIX normalMat = XMMatrixTranspose(XMMatrixInverse(nullptr, localToRoot));
+
+            UINT baseVertex = (UINT)(merged.vertices.size() / 12);
+            size_t vertCount = src->vertices.size() / 12;
+
+            for (size_t v = 0; v < vertCount; v++) {
+                const float* sv = &src->vertices[v * 12];
+
+                XMVECTOR pos = XMVectorSet(sv[0], sv[1], sv[2], 1.0f);
+                pos = XMVector3Transform(pos, localToRoot);
+
+                XMVECTOR norm = XMVectorSet(sv[3], sv[4], sv[5], 0.0f);
+                norm = XMVector3Normalize(XMVector3TransformNormal(norm, normalMat));
+
+                XMVECTOR tangentVec = XMVectorSet(sv[8], sv[9], sv[10], 0.0f);
+                tangentVec = XMVector3Normalize(XMVector3TransformNormal(tangentVec, localToRoot));
+
+                float px, py, pz, nx, ny, nz, tx, ty, tz;
+                XMFLOAT3 tmp;
+                XMStoreFloat3(&tmp, pos); px = tmp.x; py = tmp.y; pz = tmp.z;
+                XMStoreFloat3(&tmp, norm); nx = tmp.x; ny = tmp.y; nz = tmp.z;
+                XMStoreFloat3(&tmp, tangentVec); tx = tmp.x; ty = tmp.y; tz = tmp.z;
+
+                merged.vertices.push_back(px);
+                merged.vertices.push_back(py);
+                merged.vertices.push_back(pz);
+                merged.vertices.push_back(nx);
+                merged.vertices.push_back(ny);
+                merged.vertices.push_back(nz);
+                merged.vertices.push_back(sv[6]);
+                merged.vertices.push_back(sv[7]);
+                merged.vertices.push_back(tx);
+                merged.vertices.push_back(ty);
+                merged.vertices.push_back(tz);
+                merged.vertices.push_back(sv[11]);
+            }
+
+            for (unsigned int idx : src->indices) {
+                merged.indices.push_back(baseVertex + idx);
+            }
+        }
+
+        merged.indexCount = (UINT)merged.indices.size();
+
+        if (device) {
+            UINT vbSize = (UINT)(merged.vertices.size() * sizeof(float));
+            merged.vertexBuffer = CreateUploadBuffer(device.Get(), merged.vertices.data(), vbSize);
+            if (merged.vertexBuffer) {
+                merged.vbv.BufferLocation = merged.vertexBuffer->GetGPUVirtualAddress();
+                merged.vbv.SizeInBytes = vbSize;
+                merged.vbv.StrideInBytes = 12 * sizeof(float);
+            }
+
+            if (!merged.indices.empty()) {
+                UINT ibSize = (UINT)(merged.indices.size() * sizeof(unsigned int));
+                merged.indexBuffer = CreateUploadBuffer(device.Get(), merged.indices.data(), ibSize);
+                if (merged.indexBuffer) {
+                    merged.ibv.BufferLocation = merged.indexBuffer->GetGPUVirtualAddress();
+                    merged.ibv.SizeInBytes = ibSize;
+                    merged.ibv.Format = DXGI_FORMAT_R32_UINT;
+                }
+            }
+        }
+
+        mergedMesh->primitives.push_back(std::move(merged));
+    }
+
+    auto mergedRoot = std::make_shared<SceneNode>(modelRoot->name);
+    mergedRoot->translation = modelRoot->translation;
+    mergedRoot->rotation = modelRoot->rotation;
+    mergedRoot->scale = modelRoot->scale;
+    mergedRoot->mesh = mergedMesh;
+    mergedRoot->UpdateLocalTransform();
+    mergedRoot->UpdateGlobalTransform(mergedRoot->localTransform);
+
+    return mergedRoot;
+}
+

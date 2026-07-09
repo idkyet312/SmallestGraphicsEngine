@@ -1026,6 +1026,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     loadedModelNode = GLBImporter::LoadGLB("models/gun.glb", g_dx12.device, g_dx12.commandList);
     if (loadedModelNode) {
         std::cout << "Model loaded successfully!" << std::endl;
+        // Collapse the whole (static) node hierarchy into one draw call per
+        // material, so the Colour Pass isn't paying per-primitive draw overhead.
+        if (auto merged = GLBImporter::MergeSceneByMaterial(loadedModelNode, g_dx12.device)) {
+            loadedModelNode = merged;
+        }
         // Adjust model transform if needed (e.g. scale down)
         // loadedModelNode->scale = XMFLOAT3(0.1f, 0.1f, 0.1f);
         loadedModelNode->UpdateGlobalTransform(loadedModelNode->localTransform);
@@ -1755,7 +1760,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     loadedModelNode = GLBImporter::LoadGLB(modelPath, g_dx12.device, g_dx12.commandList);
                     if (loadedModelNode) {
                         std::cout << "Model loaded successfully!" << std::endl;
-                        
+
+                        // Collapse the hierarchy into one draw call per material.
+                        if (auto merged = GLBImporter::MergeSceneByMaterial(loadedModelNode, g_dx12.device)) {
+                            loadedModelNode = merged;
+                        }
+
                         // Set to center of scene
                         loadedModelNode->translation = XMFLOAT3(0.0f, 2.0f, 0.0f);
                         loadedModelNode->UpdateLocalTransform();
