@@ -477,6 +477,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 XMFLOAT3 hit;
                 if (g_destruction.HitTestSegment(projectile.previousPosition, projectile.position,
                                                  scene.projectileScale * 2.5f, hit)) {
+                    std::cout << "Projectile hit house at " << hit.x << ", "
+                              << hit.y << ", " << hit.z << "\n";
                     g_destruction.ApplyRadialDamage(hit, scene.destructionDamageRadius,
                                                     scene.destructionDamage);
                     projectile.active = false;
