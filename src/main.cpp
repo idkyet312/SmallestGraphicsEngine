@@ -26,6 +26,7 @@
 #include "SkyRendererDX12.h"
 #include "OcclusionDepthDX12.h"
 #include "DestructionDX12.h"
+#include "FBXImporter.h"
 
 using namespace DirectX;
 
@@ -47,6 +48,7 @@ static GeometryBuffers      geo;
 static PackedGeometry       packed;
 static std::shared_ptr<SceneNode> crateModel;
 static std::shared_ptr<SceneNode> wallModel;
+bool g_showH2Model = false;
 static std::shared_ptr<SceneMaterial> floorMaterial;
 static bool                 crateLoadAttempted = false;
 
@@ -93,106 +95,144 @@ static void LoadFloorMudMaterial() {
     }
 }
 
+// Crysis-style plank wall: the destructible is built from real structural
+// pieces -- vertical wooden planks held by horizontal cross-beams -- rather
+// than a uniform Voronoi field. Each plank/beam is one child chunk, so a hit
+// snaps that board loose along its true edges. Grid coords (x,y,z) drive
+// Blast's adjacency bonding, so touching boards stay welded until struck.
+// Basic modular destructible house built from real structural pieces: a
+// foundation slab and floor, four walls made of vertical studs + cladding,
+// door/window openings, and a two-slope roof of rafters + sheets. Each piece
+// is one child chunk. Pieces whose name starts with "Support:" are anchored to
+// the world by the destruction layer, so foundation and bottom wall plates
+// stay static and hold the structure up; disconnected sections fall. Blast
+// bonds touching pieces so a hit tears loose only what it structurally frees.
 static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
-    struct Point2 { float x, y; };
-    constexpr int columns = 6, rows = 4;
-    constexpr float left = 3.05f, right = 9.95f, bottom = 0.12f, top = 3.52f;
-    constexpr float centerZ = 2.5f, halfDepth = 0.32f;
-    const float cellWidth = (right - left) / columns;
-    const float cellHeight = (top - bottom) / rows;
+    // House footprint (world units). Front faces +Z toward the spawn area.
+    constexpr float minX = 4.0f, maxX = 11.0f;   // width
+    constexpr float minZ = 1.0f, maxZ = 6.0f;    // depth
+    constexpr float floorY = 0.0f, wallTop = 3.4f;
+    constexpr float wall = 0.28f;                // wall / slab thickness
+    const float uvSpanX = maxX - minX, uvSpanY = wallTop - floorY;
 
-    auto root = std::make_shared<SceneNode>("DestructibleWallVoronoi");
-    auto material = std::make_shared<SceneMaterial>();
-    material->name = "SolidWhiteWall";
-    material->baseColorFactor = XMFLOAT4(0.96f, 0.96f, 0.96f, 1.0f);
-    material->metallicFactor = 0.0f;
-    material->roughnessFactor = 0.72f;
+    auto root = std::make_shared<SceneNode>("DestructibleHouse");
+    auto matFoundation = std::make_shared<SceneMaterial>();
+    matFoundation->name = "Foundation";
+    matFoundation->baseColorFactor = XMFLOAT4(0.55f, 0.55f, 0.58f, 1.0f);
+    matFoundation->metallicFactor = 0.0f; matFoundation->roughnessFactor = 0.95f;
+    auto matStud = std::make_shared<SceneMaterial>();
+    matStud->name = "Stud";
+    matStud->baseColorFactor = XMFLOAT4(0.58f, 0.40f, 0.24f, 1.0f);
+    matStud->metallicFactor = 0.0f; matStud->roughnessFactor = 0.88f;
+    auto matCladding = std::make_shared<SceneMaterial>();
+    matCladding->name = "Cladding";
+    matCladding->baseColorFactor = XMFLOAT4(0.82f, 0.66f, 0.44f, 1.0f);
+    matCladding->metallicFactor = 0.0f; matCladding->roughnessFactor = 0.85f;
+    auto matRoof = std::make_shared<SceneMaterial>();
+    matRoof->name = "Roof";
+    matRoof->baseColorFactor = XMFLOAT4(0.45f, 0.22f, 0.18f, 1.0f);
+    matRoof->metallicFactor = 0.0f; matRoof->roughnessFactor = 0.80f;
 
-    std::vector<Point2> sites;
-    for (int y = 0; y < rows; ++y) for (int x = 0; x < columns; ++x) {
-        const float jitterX = (((x * 37 + y * 17 + 3) % 13) / 12.0f - 0.5f) * cellWidth * 0.48f;
-        const float jitterY = (((x * 19 + y * 41 + 7) % 11) / 10.0f - 0.5f) * cellHeight * 0.48f;
-        sites.push_back({ left + (x + 0.5f) * cellWidth + jitterX,
-                          bottom + (y + 0.5f) * cellHeight + jitterY });
-    }
-
-    auto clipCell = [&](uint32_t siteIndex) {
-        std::vector<Point2> polygon = { {left,bottom}, {right,bottom}, {right,top}, {left,top} };
-        const Point2 site = sites[siteIndex];
-        for (uint32_t otherIndex = 0; otherIndex < sites.size() && !polygon.empty(); ++otherIndex) {
-            if (otherIndex == siteIndex) continue;
-            const Point2 other = sites[otherIndex];
-            const float nx = other.x - site.x, ny = other.y - site.y;
-            const float c = (other.x * other.x + other.y * other.y - site.x * site.x - site.y * site.y) * 0.5f;
-            std::vector<Point2> clipped;
-            for (size_t i = 0; i < polygon.size(); ++i) {
-                const Point2 a = polygon[i], b = polygon[(i + 1) % polygon.size()];
-                const float da = a.x * nx + a.y * ny - c;
-                const float db = b.x * nx + b.y * ny - c;
-                const bool insideA = da <= 0.00001f, insideB = db <= 0.00001f;
-                if (insideA) clipped.push_back(a);
-                if (insideA != insideB) {
-                    const float t = da / (da - db);
-                    clipped.push_back({ a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t });
-                }
-            }
-            polygon.swap(clipped);
-        }
-        return polygon;
-    };
-
-    for (uint32_t cell = 0; cell < sites.size(); ++cell) {
-        const std::vector<Point2> polygon = clipCell(cell);
-        if (polygon.size() < 3) continue;
-        auto chunkNode = std::make_shared<SceneNode>("VoronoiCell");
-        chunkNode->mesh = std::make_shared<SceneMesh>();
+    // Emit one axis-aligned solid box as a chunk child.
+    auto addBox = [&](const char* name, const std::shared_ptr<SceneMaterial>& material,
+                      float x0, float x1, float y0, float y1, float z0, float z1) {
+        if (x1 <= x0 || y1 <= y0 || z1 <= z0) return;
+        auto node = std::make_shared<SceneNode>(name);
+        node->mesh = std::make_shared<SceneMesh>();
         MeshPrimitive primitive;
         primitive.material = material;
-
-        auto emitTriangle = [&](const XMFLOAT3& a, const XMFLOAT3& b, const XMFLOAT3& c,
-                                const XMFLOAT3& normal) {
+        auto emitQuad = [&](const XMFLOAT3& a, const XMFLOAT3& b, const XMFLOAT3& c,
+                            const XMFLOAT3& d, const XMFLOAT3& n) {
             const UINT base = (UINT)(primitive.vertices.size() / 12);
-            const XMFLOAT3 points[3] = { a, b, c };
-            for (const XMFLOAT3& p : points) {
-                const float u = (p.x - left) / (right - left), v = (p.y - bottom) / (top - bottom);
-                const float vertex[12] = { p.x,p.y,p.z, normal.x,normal.y,normal.z, u,v, 1,0,0,1 };
+            const XMFLOAT3 pts[4] = { a, b, c, d };
+            for (const XMFLOAT3& p : pts) {
+                const float u = (p.x - minX) / uvSpanX, v = (p.y - floorY) / uvSpanY;
+                const float vertex[12] = { p.x,p.y,p.z, n.x,n.y,n.z, u,v, 1,0,0,1 };
                 primitive.vertices.insert(primitive.vertices.end(), vertex, vertex + 12);
             }
-            primitive.indices.insert(primitive.indices.end(), { base, base + 1, base + 2 });
+            primitive.indices.insert(primitive.indices.end(),
+                { base, base + 1, base + 2, base, base + 2, base + 3 });
         };
-        auto emitDenseTriangle = [&](auto&& self, const XMFLOAT3& a, const XMFLOAT3& b,
-                                     const XMFLOAT3& c, const XMFLOAT3& normal, int depth) -> void {
-            if (depth == 0) { emitTriangle(a, b, c, normal); return; }
-            auto midpoint = [](const XMFLOAT3& p, const XMFLOAT3& q) {
-                return XMFLOAT3((p.x+q.x)*0.5f, (p.y+q.y)*0.5f, (p.z+q.z)*0.5f);
-            };
-            const XMFLOAT3 ab = midpoint(a,b), bc = midpoint(b,c), ca = midpoint(c,a);
-            self(self,a,ab,ca,normal,depth-1); self(self,ab,b,bc,normal,depth-1);
-            self(self,ca,bc,c,normal,depth-1); self(self,ab,bc,ca,normal,depth-1);
-        };
+        emitQuad({x0,y0,z1},{x1,y0,z1},{x1,y1,z1},{x0,y1,z1}, {0,0,1});    // front (+Z)
+        emitQuad({x1,y0,z0},{x0,y0,z0},{x0,y1,z0},{x1,y1,z0}, {0,0,-1});   // back
+        emitQuad({x0,y0,z0},{x0,y0,z1},{x0,y1,z1},{x0,y1,z0}, {-1,0,0});   // left
+        emitQuad({x1,y0,z1},{x1,y0,z0},{x1,y1,z0},{x1,y1,z1}, {1,0,0});    // right
+        emitQuad({x0,y1,z1},{x1,y1,z1},{x1,y1,z0},{x0,y1,z0}, {0,1,0});    // top
+        emitQuad({x0,y0,z0},{x1,y0,z0},{x1,y0,z1},{x0,y0,z1}, {0,-1,0});   // bottom
+        node->mesh->primitives.push_back(std::move(primitive));
+        root->AddChild(node);
+    };
 
-        Point2 centroid = {};
-        for (const Point2& p : polygon) { centroid.x += p.x; centroid.y += p.y; }
-        centroid.x /= polygon.size(); centroid.y /= polygon.size();
-        for (size_t edge = 0; edge < polygon.size(); ++edge) {
-            const Point2 a = polygon[edge], b = polygon[(edge + 1) % polygon.size()];
-            const XMFLOAT3 frontCenter(centroid.x,centroid.y,centerZ+halfDepth);
-            const XMFLOAT3 backCenter(centroid.x,centroid.y,centerZ-halfDepth);
-            emitDenseTriangle(emitDenseTriangle, frontCenter, {a.x,a.y,centerZ+halfDepth},
-                              {b.x,b.y,centerZ+halfDepth}, {0,0,1}, 2);
-            emitDenseTriangle(emitDenseTriangle, backCenter, {b.x,b.y,centerZ-halfDepth},
-                              {a.x,a.y,centerZ-halfDepth}, {0,0,-1}, 2);
-            const float ex = b.x-a.x, ey = b.y-a.y;
-            const float invLength = 1.0f / std::max(0.0001f, std::sqrt(ex*ex + ey*ey));
-            const XMFLOAT3 sideNormal(ey*invLength, -ex*invLength, 0);
-            emitDenseTriangle(emitDenseTriangle, {a.x,a.y,centerZ-halfDepth},
-                              {b.x,b.y,centerZ-halfDepth}, {b.x,b.y,centerZ+halfDepth}, sideNormal, 1);
-            emitDenseTriangle(emitDenseTriangle, {a.x,a.y,centerZ-halfDepth},
-                              {b.x,b.y,centerZ+halfDepth}, {a.x,a.y,centerZ+halfDepth}, sideNormal, 1);
+    // --- Foundation: single anchored slab spanning the footprint. ---
+    addBox("Support:Foundation", matFoundation, minX, maxX, floorY, floorY + wall, minZ, maxZ);
+
+    // --- Studded wall: vertical studs + outer cladding along one edge. The
+    // bottom row of studs is anchored (the sill plate), so the wall stands. ---
+    auto buildWall = [&](float x0, float x1, float z0, float z1, bool alongX,
+                         float openStart, float openEnd, float openTop) {
+        constexpr float studW = 0.16f;
+        constexpr int studCount = 8;
+        const float baseY = floorY + wall;                 // sit on foundation
+        const float span = alongX ? (x1 - x0) : (z1 - z0);
+        for (int s = 0; s <= studCount; ++s) {
+            const float t = (float)s / studCount;
+            const float c = t * span;
+            // Skip studs that fall inside the opening (door/window gap).
+            const bool inOpening = openEnd > openStart && c > openStart && c < openEnd;
+            const char* name = (s == 0) ? "Support:SillStud" : "Stud";
+            if (alongX) {
+                const float sx = x0 + c;
+                if (inOpening) {
+                    // Header stub above the opening keeps the wall continuous up top.
+                    addBox(name, matStud, sx - studW * 0.5f, sx + studW * 0.5f,
+                           openTop, wallTop, z0, z1);
+                } else {
+                    addBox(name, matStud, sx - studW * 0.5f, sx + studW * 0.5f,
+                           baseY, wallTop, z0, z1);
+                }
+            } else {
+                const float sz = z0 + c;
+                addBox(name, matStud, x0, x1, baseY, wallTop, sz - studW * 0.5f, sz + studW * 0.5f);
+            }
         }
-        chunkNode->mesh->primitives.push_back(std::move(primitive));
-        root->AddChild(chunkNode);
+        // Cladding: horizontal boards over the studs, split into a few pieces so
+        // the wall shatters into panels rather than one slab.
+        constexpr int boards = 5;
+        const float cladT = 0.06f;
+        for (int b = 0; b < boards; ++b) {
+            const float by0 = baseY + (wallTop - baseY) * b / boards;
+            const float by1 = baseY + (wallTop - baseY) * (b + 1) / boards;
+            if (alongX) {
+                addBox("Cladding", matCladding, x0, x1, by0, by1, z1, z1 + cladT);
+            } else {
+                addBox("Cladding", matCladding, x1, x1 + cladT, by0, by1, z0, z1);
+            }
+        }
+    };
+
+    // Front wall (+Z) with a door opening in the middle; other three solid.
+    buildWall(minX, maxX, maxZ - wall, maxZ, true, (maxX - minX) * 0.42f, (maxX - minX) * 0.58f, 2.2f);
+    buildWall(minX, maxX, minZ, minZ + wall, true, 0.0f, 0.0f, 0.0f);          // back
+    buildWall(minX, minX + wall, minZ, maxZ, false, 0.0f, 0.0f, 0.0f);         // left
+    buildWall(maxX - wall, maxX, minZ, maxZ, false, 0.0f, 0.0f, 0.0f);         // right
+
+    // --- Roof: two sloped slabs of rafters meeting at a ridge. Modelled as
+    // stepped boxes so they remain axis-aligned solids for collision. ---
+    const float ridgeY = wallTop + 1.1f;
+    const float midX = (minX + maxX) * 0.5f;
+    constexpr int roofSteps = 6;
+    for (int s = 0; s < roofSteps; ++s) {
+        const float t0 = (float)s / roofSteps, t1 = (float)(s + 1) / roofSteps;
+        const float y0 = wallTop + (ridgeY - wallTop) * t0;
+        const float y1 = wallTop + (ridgeY - wallTop) * t1 + 0.02f;
+        // left slope: from eave (minX) rising to ridge (midX)
+        addBox("Roof", matRoof, minX + (midX - minX) * t0, minX + (midX - minX) * t1,
+               y0, y1, minZ - 0.2f, maxZ + 0.2f);
+        // right slope
+        addBox("Roof", matRoof, maxX - (maxX - midX) * t1, maxX - (maxX - midX) * t0,
+               y0, y1, minZ - 0.2f, maxZ + 0.2f);
     }
+
     root->UpdateGlobalTransform(root->localTransform);
     return root;
 }
@@ -573,7 +613,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         if (scene.rebuildDestructionRequested && wallModel) {
             scene.rebuildDestructionRequested = false;
-            g_destruction.Initialize(wallModel, g_dx12.device.Get(), 6, 4, 1);
+            // Re-init frees the old chunk vertex/index buffers. The GPU may
+            // still be rendering last frame's chunk meshes, so drain it first
+            // or those buffers get destroyed in flight and crash.
+            WaitForGPU();
+            g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
         }
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.Update(deltaTime);
@@ -581,13 +625,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 if (!projectile.active) continue;
                 XMFLOAT3 hit;
                 if (g_destruction.HitTestSegment(projectile.previousPosition, projectile.position,
-                                                 scene.projectileScale * 2.5f, hit)) {
+                                                 scene.destructionDamageRadius, hit)) {
                     std::cout << "Projectile hit wall at " << hit.x << ", "
                               << hit.y << ", " << hit.z << "\n";
                     g_destruction.ApplyRadialDamage(hit, scene.destructionDamageRadius,
                                                     scene.destructionDamage);
                     g_destruction.ApplyImpulse(hit, projectile.direction,
-                                               scene.destructionBulletImpulse);
+                                               scene.destructionBulletImpulse,
+                                               scene.destructionDamageRadius);
                     projectile.active = false;
                 }
             }
@@ -610,8 +655,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             LoadFloorMudMaterial();
             std::cout << "Loading models/h2.glb...\n";
             crateModel = GLBImporter::LoadGLB("models/h2.glb", g_dx12.device, g_dx12.commandList);
+            // Modular destructible house built from structural pieces, with
+            // world-anchored foundation/sill chunks. Grid args unused (bonds
+            // come from AABB adjacency), so pass 1s.
             wallModel = CreateDestructibleWallModel();
-            g_destruction.Initialize(wallModel, g_dx12.device.Get(), 6, 4, 1);
+            g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
             if (crateModel) {
                 if (auto merged = GLBImporter::MergeSceneByMaterial(crateModel, g_dx12.device)) {
                     crateModel = merged;
@@ -656,7 +704,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
                 lightSpace = shadowMap.Render(scene, geo,
-                    crateModel);
+                    g_showH2Model ? crateModel : nullptr);
                 shadowResource = shadowMap.GetResource();
             }
             RenderForward(scene, mainShader, geo, crateModel, floorMaterial, lightSpace, shadowResource);

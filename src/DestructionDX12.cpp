@@ -130,6 +130,7 @@ struct DestructionDX12::Impl {
         XMFLOAT3 center = {};
         std::vector<XMFLOAT3> collisionPoints;
         int x = 0, y = 0, z = 0;
+        bool support = false;  // anchored to the world (foundation, sill plates)
     };
 
     struct ActorRuntime {
@@ -180,6 +181,9 @@ struct DestructionDX12::Impl {
                 chunk.x = (int)(chunkIndex % (uint32_t)gridX);
                 chunk.y = (int)((chunkIndex / (uint32_t)gridX) % (uint32_t)gridY);
                 chunk.z = (int)(chunkIndex / (uint32_t)(gridX * gridY));
+                // Pieces authored with a "Support:" name prefix stay anchored to
+                // the world; they hold the structure up until disconnected.
+                chunk.support = sourceChunk->name.rfind("Support:", 0) == 0;
                 chunk.minimum = { FLT_MAX, FLT_MAX, FLT_MAX };
                 chunk.maximum = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
                 chunk.node = std::make_shared<SceneNode>("VoronoiChunk");
@@ -319,22 +323,36 @@ struct DestructionDX12::Impl {
             desc.userData = i;
         }
 
+        // Bond any two chunks whose AABBs touch/overlap. This works for
+        // arbitrary structural pieces (planks, beams, cells) rather than a
+        // strict grid, so real seams -- plank-to-plank, plank-to-beam -- weld
+        // until a hit tears that specific joint apart.
         std::vector<NvBlastBondDesc> bonds;
+        constexpr float touchSlop = 0.05f;
         for (uint32_t a = 0; a < chunks.size(); ++a) for (uint32_t b = a + 1; b < chunks.size(); ++b) {
-            const int dx = chunks[b].x - chunks[a].x;
-            const int dy = chunks[b].y - chunks[a].y;
-            const int dz = chunks[b].z - chunks[a].z;
-            if (std::abs(dx) + std::abs(dy) + std::abs(dz) != 1) continue;
+            const Chunk& ca = chunks[a];
+            const Chunk& cb = chunks[b];
+            // Overlap (with slop) required on all three axes to count as touching.
+            const float ox = std::min(ca.maximum.x, cb.maximum.x) - std::max(ca.minimum.x, cb.minimum.x);
+            const float oy = std::min(ca.maximum.y, cb.maximum.y) - std::max(ca.minimum.y, cb.minimum.y);
+            const float oz = std::min(ca.maximum.z, cb.maximum.z) - std::max(ca.minimum.z, cb.minimum.z);
+            if (ox < -touchSlop || oy < -touchSlop || oz < -touchSlop) continue;
+            // Contact normal points along the thinnest overlap axis (the seam).
+            float nx = 0, ny = 0, nz = 0, area = 0;
+            const float overlaps[3] = { ox, oy, oz };
+            const int seam = (overlaps[0] <= overlaps[1] && overlaps[0] <= overlaps[2]) ? 0
+                           : (overlaps[1] <= overlaps[2] ? 1 : 2);
+            const float clampX = std::max(0.0f, ox), clampY = std::max(0.0f, oy), clampZ = std::max(0.0f, oz);
+            if (seam == 0) { nx = cb.center.x >= ca.center.x ? 1.0f : -1.0f; area = std::max(0.01f, clampY * clampZ); }
+            else if (seam == 1) { ny = cb.center.y >= ca.center.y ? 1.0f : -1.0f; area = std::max(0.01f, clampX * clampZ); }
+            else { nz = cb.center.z >= ca.center.z ? 1.0f : -1.0f; area = std::max(0.01f, clampX * clampY); }
             NvBlastBondDesc bond = {};
             bond.chunkIndices[0] = a + 1; bond.chunkIndices[1] = b + 1;
-            bond.bond.normal[0] = (float)dx; bond.bond.normal[1] = (float)dy; bond.bond.normal[2] = (float)dz;
-            bond.bond.centroid[0] = (chunks[a].center.x + chunks[b].center.x) * 0.5f;
-            bond.bond.centroid[1] = (chunks[a].center.y + chunks[b].center.y) * 0.5f;
-            bond.bond.centroid[2] = (chunks[a].center.z + chunks[b].center.z) * 0.5f;
-            const XMFLOAT3 size(chunks[a].maximum.x - chunks[a].minimum.x,
-                                chunks[a].maximum.y - chunks[a].minimum.y,
-                                chunks[a].maximum.z - chunks[a].minimum.z);
-            bond.bond.area = dx ? size.y * size.z : (dy ? size.x * size.z : size.x * size.y);
+            bond.bond.normal[0] = nx; bond.bond.normal[1] = ny; bond.bond.normal[2] = nz;
+            bond.bond.centroid[0] = (ca.center.x + cb.center.x) * 0.5f;
+            bond.bond.centroid[1] = (ca.center.y + cb.center.y) * 0.5f;
+            bond.bond.centroid[2] = (ca.center.z + cb.center.z) * 0.5f;
+            bond.bond.area = area;
             bond.bond.userData = (uint32_t)bonds.size();
             bonds.push_back(bond);
         }
@@ -394,6 +412,7 @@ struct DestructionDX12::Impl {
         runtime.dynamic = forceDynamic;
         b3BodyDef bodyDef = b3DefaultBodyDef();
         bodyDef.type = runtime.dynamic ? b3_dynamicBody : b3_staticBody;
+        bodyDef.enableSleep = true;
         bodyDef.position = { runtime.center.x, runtime.center.y, runtime.center.z };
         if (seed && seed->valid) {
             const XMVECTOR localOffset = XMVectorSet(runtime.center.x - seed->modelCenter.x,
@@ -415,7 +434,8 @@ struct DestructionDX12::Impl {
         bodyDef.linearDamping = 0.05f; bodyDef.angularDamping = 0.12f;
         runtime.body = b3CreateBody(world, &bodyDef);
         b3ShapeDef shapeDef = b3DefaultShapeDef();
-        shapeDef.density = runtime.dynamic ? 180.0f : 0.0f;
+        // Keep fragments light enough for ordinary projectile impulses to move.
+        shapeDef.density = runtime.dynamic ? 20.0f : 0.0f;
         shapeDef.baseMaterial.friction = 0.65f;
         shapeDef.baseMaterial.restitution = 0.05f;
         for (uint32_t index : runtime.chunks) {
@@ -444,13 +464,18 @@ struct DestructionDX12::Impl {
             b3BoxHull box = b3MakeOffsetBoxHull(hx, hy, hz, offset);
             b3CreateHullShape(runtime.body, &shapeDef, &box.base);
         }
+        // Scripted outward burst on split: adds to inherited seed velocity
+        // instead of replacing it, so fragments carry the parent's motion plus
+        // an explosion kick, and the bullet's ApplyImpulse still stacks on top.
         if (runtime.dynamic) {
             const b3Pos bodyPosition = b3Body_GetPosition(runtime.body);
             const XMFLOAT3 worldCenter((float)bodyPosition.x, (float)bodyPosition.y, (float)bodyPosition.z);
-            XMVECTOR impulse = XMLoadFloat3(&worldCenter) - XMLoadFloat3(&lastDamagePosition);
-            impulse = XMVector3Normalize(impulse + XMVectorSet(0.0f, 0.35f, 0.0f, 0.0f));
-            XMFLOAT3 v; XMStoreFloat3(&v, impulse * 3.0f);
-            b3Body_SetLinearVelocity(runtime.body, { v.x, v.y, v.z });
+            XMVECTOR burst = XMLoadFloat3(&worldCenter) - XMLoadFloat3(&lastDamagePosition);
+            burst = XMVector3Normalize(burst + XMVectorSet(0.0f, 0.35f, 0.0f, 0.0f));
+            const b3Vec3 existing = b3Body_GetLinearVelocity(runtime.body);
+            XMFLOAT3 v; XMStoreFloat3(&v, burst * 8.0f);
+            b3Body_SetLinearVelocity(runtime.body,
+                { existing.x + v.x, existing.y + v.y, existing.z + v.z });
         }
     }
 
@@ -609,35 +634,28 @@ bool DestructionDX12::ApplyImpulse(const XMFLOAT3& worldPosition,
                                    const XMFLOAT3& worldDirection,
                                    float impulseStrength, float hitRadius) {
     if (!m->initialized || impulseStrength <= 0.0f) return false;
-    Impl::ActorRuntime* closestActor = nullptr;
-    float closestDistanceSquared = FLT_MAX;
+    bool applied = false;
+    XMVECTOR direction = XMVector3Normalize(XMLoadFloat3(&worldDirection));
+    const XMVECTOR hitPoint = XMLoadFloat3(&worldPosition);
+    // Only shove fragments the bullet actually reaches, and fall off with
+    // distance so a hit stays local instead of nudging every loose piece.
+    const float falloffRadius = std::max(0.25f, hitRadius);
+    const float falloffSquared = falloffRadius * falloffRadius;
     for (auto& runtime : m->actors) {
         if (!runtime->dynamic || B3_IS_NULL(runtime->body)) continue;
-        const b3Vec3 local = b3Body_GetLocalPoint(runtime->body,
-            { worldPosition.x, worldPosition.y, worldPosition.z });
-        const XMFLOAT3 modelPoint(local.x + runtime->center.x,
-                                  local.y + runtime->center.y,
-                                  local.z + runtime->center.z);
-        for (uint32_t chunkIndex : runtime->chunks) {
-            const Impl::Chunk& chunk = m->chunks[chunkIndex];
-            const float x = std::max(chunk.minimum.x, std::min(modelPoint.x, chunk.maximum.x));
-            const float y = std::max(chunk.minimum.y, std::min(modelPoint.y, chunk.maximum.y));
-            const float z = std::max(chunk.minimum.z, std::min(modelPoint.z, chunk.maximum.z));
-            const float dx = modelPoint.x - x, dy = modelPoint.y - y, dz = modelPoint.z - z;
-            const float distanceSquared = dx * dx + dy * dy + dz * dz;
-            if (distanceSquared < closestDistanceSquared) {
-                closestDistanceSquared = distanceSquared;
-                closestActor = runtime.get();
-            }
-        }
+        const b3Pos bodyPosition = b3Body_GetPosition(runtime->body);
+        const XMVECTOR bodyCenter =
+            XMVectorSet((float)bodyPosition.x, (float)bodyPosition.y, (float)bodyPosition.z, 0.0f);
+        const float distanceSquared = XMVectorGetX(XMVector3LengthSq(bodyCenter - hitPoint));
+        if (distanceSquared > falloffSquared) continue;
+        const float scale = 1.0f - std::sqrt(distanceSquared) / falloffRadius;
+        XMFLOAT3 impulse;
+        XMStoreFloat3(&impulse, direction * impulseStrength * std::max(0.15f, scale));
+        b3Body_ApplyLinearImpulse(runtime->body, { impulse.x, impulse.y, impulse.z },
+            { worldPosition.x, worldPosition.y, worldPosition.z }, true);
+        applied = true;
     }
-    if (!closestActor || closestDistanceSquared > hitRadius * hitRadius) return false;
-    XMVECTOR direction = XMVector3Normalize(XMLoadFloat3(&worldDirection));
-    XMFLOAT3 impulse;
-    XMStoreFloat3(&impulse, direction * impulseStrength);
-    b3Body_ApplyLinearImpulse(closestActor->body, { impulse.x, impulse.y, impulse.z },
-        { worldPosition.x, worldPosition.y, worldPosition.z }, true);
-    return true;
+    return applied;
 }
 
 void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
@@ -672,7 +690,14 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
             }
             if (runtime->chunks.empty()) continue;
             child->userData = runtime.get();
-            m->CreateBody(*runtime, true, &seed);
+            // An island still containing an anchored support chunk is part of
+            // the standing structure -> keep it static. Islands with no support
+            // have been structurally freed -> simulate them dynamically.
+            bool islandSupported = false;
+            for (uint32_t chunkIndex : runtime->chunks) {
+                if (m->chunks[chunkIndex].support) { islandSupported = true; break; }
+            }
+            m->CreateBody(*runtime, !islandSupported, islandSupported ? nullptr : &seed);
             m->actors.push_back(std::move(runtime));
         }
     }
