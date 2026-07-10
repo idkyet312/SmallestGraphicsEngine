@@ -18,6 +18,7 @@
 #include "SceneGraph.h"
 #include "GLBImporter.h"
 #include "DDGI_DX12.h"
+#include "MeshShaderDX12.h"
 
 using namespace DirectX;
 
@@ -137,6 +138,8 @@ bool animateDemoLights = false;
 
 // DX12 resources
 ShaderDX12 mainShader;
+MeshShaderDX12 meshShader;
+bool useMeshShader = false;
 ShaderDX12 depthShader;  // For shadow map rendering
 ComPtr<ID3D12Resource> cubeVertexBuffer;
 ComPtr<ID3D12Resource> planeVertexBuffer;
@@ -294,12 +297,20 @@ bool CreateGeometry() {
 }
 
 void DrawCube() {
+    if (useMeshShader && meshShader.CanDraw(36, 0)) {
+        meshShader.Draw(cubeVBV, nullptr, 36, 0);
+        return;
+    }
     g_dx12.commandList->IASetVertexBuffers(0, 1, &cubeVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_dx12.commandList->DrawInstanced(36, 1, 0, 0);
 }
 
 void DrawPlane() {
+    if (useMeshShader && meshShader.CanDraw(6, 0)) {
+        meshShader.Draw(planeVBV, nullptr, 6, 0);
+        return;
+    }
     g_dx12.commandList->IASetVertexBuffers(0, 1, &planeVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_dx12.commandList->DrawInstanced(6, 1, 0, 0);
@@ -917,7 +928,13 @@ void RecursiveDraw(std::shared_ptr<SceneNode> node, const XMMATRIX& view, const 
                  g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
                  g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                  
-                 if (prim.ibv.BufferLocation != 0) {
+                 if (useMeshShader && meshShader.CanDraw((UINT)(prim.vertices.size() / 12),
+                                                         prim.ibv.BufferLocation ? prim.indexCount : 0)) {
+                     UINT vertexCount = (UINT)(prim.vertices.size() / 12);
+                     UINT indexCount = prim.ibv.BufferLocation ? prim.indexCount : 0;
+                     meshShader.Draw(prim.vbv, prim.ibv.BufferLocation ? &prim.ibv : nullptr,
+                                     vertexCount, indexCount);
+                 } else if (prim.ibv.BufferLocation != 0) {
                      g_dx12.commandList->IASetIndexBuffer(&prim.ibv);
                      g_dx12.commandList->DrawIndexedInstanced(prim.indexCount, 1, 0, 0, 0);
                  } else {
@@ -1020,6 +1037,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
     }
     std::cout << "Clustered Forward shaders loaded successfully" << std::endl;
+    useMeshShader = meshShader.Init(mainShader);
+    std::cout << (useMeshShader ? "Mesh shader path enabled" : "Mesh shader path unavailable; using raster path") << std::endl;
     
     // Load model
     std::cout << "Attempting to load models/gun.glb..." << std::endl;
@@ -1190,6 +1209,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // =====================
         // Shadow Pass
         // =====================
+        useMeshShader = false;
         if (enableShadows && shadowMap) {
             // Transition shadow map to depth write
             D3D12_RESOURCE_BARRIER barrier = {};
@@ -1302,6 +1322,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         
         // Use shader
         mainShader.Use(wireframeMode);
+        useMeshShader = meshShader.supported;
         mainShader.BeginFrame(); // Reset draw call and SRV counters
         
         // Bind heaps using the main CBV_SRV_UAV heap for materials and globals.

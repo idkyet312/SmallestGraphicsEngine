@@ -20,6 +20,7 @@
 #include "GLBImporter.h"
 #include "MipGenerator.h"
 #include "ShadowMapDX12.h"
+#include "MeshShaderDX12.h"
 
 using namespace DirectX;
 
@@ -29,6 +30,8 @@ static unsigned int SCR_HEIGHT = 720;
 
 static Scene               scene;
 static ShaderDX12           mainShader;
+MeshShaderDX12              g_meshShader;
+bool                        g_useMeshShader = false;
 static VisibilityBufferDX12 visBuffer;
 static ShadowMapDX12        shadowMap;
 static GeometryBuffers      geo;
@@ -351,6 +354,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
     std::cout << "Shaders loaded\n";
 
+    g_useMeshShader = g_meshShader.Init(mainShader);
+    std::cout << (g_useMeshShader
+        ? "Mesh shader path enabled\n"
+        : "Mesh shader path unavailable; using raster fallback\n");
+
     // Mip generator (compute shader) for imported GLB textures
     if (!g_mipGen.Init()) {
         std::cerr << "Mip generator init failed (non-fatal, textures will have no mips)\n";
@@ -414,13 +422,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (!crateLoadAttempted) {
             crateLoadAttempted = true;
             LoadFloorMudMaterial();
-            std::cout << "Loading models/h1.glb...\n";
-            crateModel = GLBImporter::LoadGLB("models/h1.glb", g_dx12.device, g_dx12.commandList);
+            std::cout << "Loading models/h2.glb...\n";
+            crateModel = GLBImporter::LoadGLB("models/h2.glb", g_dx12.device, g_dx12.commandList);
             if (crateModel) {
                 crateModel->UpdateGlobalTransform(crateModel->localTransform);
                 std::cout << "h1 model loaded\n";
             } else {
-                std::cerr << "Failed to load h1.glb, falling back to procedural cube\n";
+                std::cerr << "Failed to load h2.glb, falling back to procedural cube\n";
             }
 
             // Flush the load/mip-generation commands now and print any D3D12

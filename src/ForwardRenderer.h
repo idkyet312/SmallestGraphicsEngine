@@ -8,6 +8,10 @@
 #include "ShaderDX12.h"
 #include "Scene.h"
 #include "SceneGraph.h"
+#include "MeshShaderDX12.h"
+
+extern MeshShaderDX12 g_meshShader;
+extern bool g_useMeshShader;
 
 struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
@@ -54,12 +58,20 @@ inline bool CreateVertexBuffer(const std::vector<VertexPosNormUV>& verts,
 }
 
 inline void DrawCube(const GeometryBuffers& geo) {
+    if (g_useMeshShader && g_meshShader.CanDraw(36, 0)) {
+        g_meshShader.Draw(geo.cubeVBV, nullptr, 36, 0);
+        return;
+    }
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.cubeVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_dx12.commandList->DrawInstanced(36, 1, 0, 0);
 }
 
 inline void DrawPlane(const GeometryBuffers& geo) {
+    if (g_useMeshShader && g_meshShader.CanDraw(6, 0)) {
+        g_meshShader.Draw(geo.planeVBV, nullptr, 6, 0);
+        return;
+    }
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.planeVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_dx12.commandList->DrawInstanced(6, 1, 0, 0);
@@ -96,14 +108,25 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
                 shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
             }
 
-            g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
-            g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-            if (prim.ibv.BufferLocation != 0) {
+            if (g_useMeshShader && g_meshShader.CanDraw(
+                    (UINT)(prim.vertices.size() / 12),
+                    prim.ibv.BufferLocation ? prim.indexCount : 0)) {
+                g_meshShader.Draw(prim.vbv,
+                    prim.ibv.BufferLocation ? &prim.ibv : nullptr,
+                    (UINT)(prim.vertices.size() / 12),
+                    prim.ibv.BufferLocation ? prim.indexCount : 0);
+            } else {
+                // A previous mesh draw leaves the mesh PSO bound. Restore the
+                // conventional VS/PS pipeline before issuing IA draw calls.
+                g_dx12.commandList->SetPipelineState(shader.pipelineState.Get());
+                g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
+                g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                if (prim.ibv.BufferLocation != 0) {
                 g_dx12.commandList->IASetIndexBuffer(&prim.ibv);
                 g_dx12.commandList->DrawIndexedInstanced(prim.indexCount, 1, 0, 0, 0);
-            } else {
+                } else {
                 g_dx12.commandList->DrawInstanced((UINT)(prim.vertices.size() / 12), 1, 0, 0);
+                }
             }
 
             shader.NextDrawCall();
