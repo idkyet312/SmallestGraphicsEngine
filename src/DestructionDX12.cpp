@@ -28,6 +28,7 @@ struct RadialDamageParams {
     float position[3];
     float radius;
     float damage;
+    uint32_t targetChunk;
 };
 
 void RadialGraphShader(NvBlastFractureBuffers* commands,
@@ -46,10 +47,12 @@ void RadialGraphShader(NvBlastFractureBuffers* commands,
             if (node >= other || actor->nodeActorIndices[other] != actor->actorIndex) continue;
             const uint32_t bondIndex = actor->adjacentBondIndices[edge];
             const NvBlastBond& bond = actor->assetBonds[bondIndex];
+            const bool touchesHitChunk = actor->chunkIndices[node] == params.targetChunk ||
+                                         actor->chunkIndices[other] == params.targetChunk;
             const float dx = bond.centroid[0] - params.position[0];
             const float dy = bond.centroid[1] - params.position[1];
             const float dz = bond.centroid[2] - params.position[2];
-            if (dx * dx + dy * dy + dz * dz > radiusSquared ||
+            if ((!touchesHitChunk && dx * dx + dy * dy + dz * dz > radiusSquared) ||
                 commands->bondFractureCount >= capacity) continue;
             NvBlastBondFractureData& fracture =
                 commands->bondFractures[commands->bondFractureCount++];
@@ -311,16 +314,17 @@ struct DestructionDX12::Impl {
     void CreateBody(ActorRuntime& runtime, bool forceDynamic, const BodySeed* seed) {
         if (!B3_IS_NULL(runtime.body)) b3DestroyBody(runtime.body);
         runtime.center = {};
-        bool grounded = false;
         for (uint32_t index : runtime.chunks) {
             runtime.center.x += chunks[index].center.x;
             runtime.center.y += chunks[index].center.y;
             runtime.center.z += chunks[index].center.z;
-            grounded |= chunks[index].y == 0;
         }
         const float inv = 1.0f / std::max<size_t>(1, runtime.chunks.size());
         runtime.center.x *= inv; runtime.center.y *= inv; runtime.center.z *= inv;
-        runtime.dynamic = forceDynamic && !grounded;
+        // Initial house is static. Every Blast split child is dynamic, including
+        // foundation chunks; otherwise a projectile hitting the bottom row can
+        // split correctly but appear to do nothing.
+        runtime.dynamic = forceDynamic;
         b3BodyDef bodyDef = b3DefaultBodyDef();
         bodyDef.type = runtime.dynamic ? b3_dynamicBody : b3_staticBody;
         bodyDef.position = { runtime.center.x, runtime.center.y, runtime.center.z };
@@ -492,12 +496,31 @@ void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float rad
     for (auto& runtime : m->actors) {
         const b3Vec3 local = b3Body_GetLocalPoint(runtime->body,
             { worldPosition.x, worldPosition.y, worldPosition.z });
-        params.push_back({ { local.x + runtime->center.x, local.y + runtime->center.y,
-                             local.z + runtime->center.z }, radius, damage });
+        const XMFLOAT3 modelHit(local.x + runtime->center.x,
+                                local.y + runtime->center.y,
+                                local.z + runtime->center.z);
+        uint32_t targetChunk = InvalidIndex;
+        float nearestDistanceSquared = FLT_MAX;
+        for (uint32_t chunkIndex : runtime->chunks) {
+            const Impl::Chunk& chunk = m->chunks[chunkIndex];
+            const float x = std::max(chunk.minimum.x, std::min(modelHit.x, chunk.maximum.x));
+            const float y = std::max(chunk.minimum.y, std::min(modelHit.y, chunk.maximum.y));
+            const float z = std::max(chunk.minimum.z, std::min(modelHit.z, chunk.maximum.z));
+            const float dx = modelHit.x - x, dy = modelHit.y - y, dz = modelHit.z - z;
+            const float distanceSquared = dx * dx + dy * dy + dz * dz;
+            if (distanceSquared < nearestDistanceSquared) {
+                nearestDistanceSquared = distanceSquared;
+                targetChunk = chunkIndex + 1; // Blast leaf index; root is zero.
+            }
+        }
+        if (targetChunk == InvalidIndex || nearestDistanceSquared > radius * radius) continue;
+        params.push_back({ { modelHit.x, modelHit.y, modelHit.z }, radius, damage, targetChunk });
         runtime->actor->damage(program, &params.back());
     }
+    const uint32_t actorsBefore = (uint32_t)m->actors.size();
     m->group->process();
     m->RebuildRenderItems();
+    std::cout << "Blast hit: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
 }
 
 void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
