@@ -80,6 +80,13 @@ struct alignas(256) DDGIBufferDX12 {
     float ddgiPadding[3];
 };
 
+struct alignas(256) MeshDrawBufferDX12 {
+    UINT vertexCount;
+    UINT indexCount;
+    UINT indexed;
+    UINT firstCorner;
+};
+
 // Upload buffer helper
 template<typename T>
 class UploadBuffer {
@@ -153,6 +160,7 @@ public:
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipelineState;
     ComPtr<ID3D12PipelineState> wireframePipelineState;
+    ComPtr<ID3DBlob> pixelShaderBlob;
     
     // Per-draw-call constant buffers (need enough for all objects)
     UploadBuffer<MatrixBufferDX12> matrixBuffer;
@@ -223,6 +231,7 @@ public:
             }
             return false;
         }
+        pixelShaderBlob = psBlob;
         
         // Create root signature using version 1.0 for maximum compatibility
         // Root parameters:
@@ -235,7 +244,7 @@ public:
         // 6: Descriptor table - Global SRVs (t0, t2, t3)
         // 7: Descriptor table - Material SRVs (t1, t4, t5)
         
-        D3D12_ROOT_PARAMETER rootParams[8] = {};
+        D3D12_ROOT_PARAMETER rootParams[11] = {};
         
         // CBVs (root descriptors)
         for (int i = 0; i < 6; i++) {
@@ -296,6 +305,19 @@ public:
         rootParams[7].DescriptorTable.NumDescriptorRanges = 3;
         rootParams[7].DescriptorTable.pDescriptorRanges = matSrvRanges;
         rootParams[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        // Mesh-shader draw parameters. Existing raster path ignores these.
+        rootParams[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rootParams[8].Constants.ShaderRegister = 6;
+        rootParams[8].Constants.RegisterSpace = 0;
+        rootParams[8].Constants.Num32BitValues = 4;
+        rootParams[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
+        rootParams[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParams[9].Descriptor.ShaderRegister = 6;
+        rootParams[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
+        rootParams[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParams[10].Descriptor.ShaderRegister = 7;
+        rootParams[10].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
         
         // Static samplers
         D3D12_STATIC_SAMPLER_DESC staticSamplers[2] = {};
@@ -328,7 +350,7 @@ public:
         staticSamplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        rootSigDesc.NumParameters = 8;
+        rootSigDesc.NumParameters = 11;
         rootSigDesc.pParameters = rootParams;
         rootSigDesc.NumStaticSamplers = 2;
         rootSigDesc.pStaticSamplers = staticSamplers;

@@ -51,6 +51,7 @@ set(HEADER_FILES
     src/EngineUI.h
     src/RaytracingDX12.h
     src/MipGenerator.h
+    src/MeshShaderDX12.h
 )
 
 # Find tinygltf
@@ -58,6 +59,31 @@ find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h")
 
 # Shader files (for IDE support)
 file(GLOB SHADER_FILES "shaders/*.hlsl" "shaders/*.vert" "shaders/*.frag")
+
+find_program(DXC_EXECUTABLE dxc)
+if(USE_DX12 AND DXC_EXECUTABLE)
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/mesh_ms.cso
+        COMMAND ${DXC_EXECUTABLE} -T ms_6_5 -E MSMain
+                ${CMAKE_SOURCE_DIR}/shaders/mesh_ms.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/mesh_ms.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/mesh_ms.hlsl
+        COMMENT "Compiling mesh shader"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/mesh_ps.cso
+        COMMAND ${DXC_EXECUTABLE} -T ps_6_5 -E main
+                ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/mesh_ps.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
+        COMMENT "Compiling mesh-path pixel shader"
+    )
+    add_custom_target(MeshShaderCSO ALL DEPENDS
+        ${CMAKE_BINARY_DIR}/mesh_ms.cso
+        ${CMAKE_BINARY_DIR}/mesh_ps.cso)
+else()
+    message(STATUS "DXC not found; mesh shader path will use raster fallback")
+endif()
 
 # Mark shader files as non-compiled BEFORE adding to target
 set_source_files_properties(${SHADER_FILES} PROPERTIES
@@ -115,6 +141,17 @@ add_custom_command(TARGET GraphicEngine POST_BUILD
     $<TARGET_FILE_DIR:GraphicEngine>/shaders
     COMMENT "Copying shaders to build directory"
 )
+
+if(USE_DX12 AND DXC_EXECUTABLE)
+    add_custom_command(TARGET GraphicEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:GraphicEngine>/shaders
+        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/mesh_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ms.cso
+        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/mesh_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ps.cso
+    )
+    if(DXC_EXECUTABLE)
+        add_dependencies(GraphicEngine MeshShaderCSO)
+    endif()
+endif()
 
 # Also copy to build/shaders for convenience
 add_custom_command(TARGET GraphicEngine POST_BUILD

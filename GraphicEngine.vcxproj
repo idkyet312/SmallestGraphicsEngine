@@ -90,8 +90,6 @@
     <ClCompile Include="shaders\ddgi_update_cs.hlsl" />
     <ClCompile Include="src\GLBImporter.cpp" />
     <ClCompile Include="src\main.cpp" />
-    <ClCompile Include="src\main_dx11.cpp" />
-    <ClCompile Include="src\main_dx12.cpp" />
     <ClCompile Include="src\GLBImporter.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -110,6 +108,7 @@
     <ClInclude Include="src\Shader.h" />
     <ClInclude Include="src\ShaderDX11.h" />
     <ClInclude Include="src\ShaderDX12.h" />
+    <ClInclude Include="src\MeshShaderDX12.h" />
     <ClInclude Include="src\SceneGraph.h" />
     <ClInclude Include="src\GLBImporter.h" />
   </ItemGroup>
