@@ -98,6 +98,7 @@ struct Scene {
     int   destructionGridZ = 4;
     float destructionDamageRadius = 1.75f;
     float destructionDamage = 2.0f;
+    float destructionBulletImpulse = 260.0f;
     bool  rebuildDestructionRequested = false;
 
     // Clustered renderer

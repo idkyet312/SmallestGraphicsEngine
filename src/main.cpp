@@ -586,6 +586,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                               << hit.y << ", " << hit.z << "\n";
                     g_destruction.ApplyRadialDamage(hit, scene.destructionDamageRadius,
                                                     scene.destructionDamage);
+                    g_destruction.ApplyImpulse(hit, projectile.direction,
+                                               scene.destructionBulletImpulse);
                     projectile.active = false;
                 }
             }

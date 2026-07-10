@@ -29,6 +29,9 @@ public:
                         DirectX::XMFLOAT3& hitPosition) const;
     void ApplyRadialDamage(const DirectX::XMFLOAT3& worldPosition,
                            float radius, float damage = 2.0f);
+    bool ApplyImpulse(const DirectX::XMFLOAT3& worldPosition,
+                      const DirectX::XMFLOAT3& worldDirection,
+                      float impulseStrength, float hitRadius = 0.5f);
 
     bool IsInitialized() const;
     uint32_t GetChunkCount() const;
