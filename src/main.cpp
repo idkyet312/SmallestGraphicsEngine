@@ -94,60 +94,105 @@ static void LoadFloorMudMaterial() {
 }
 
 static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
-    auto root = std::make_shared<SceneNode>("DestructibleWall");
-    root->mesh = std::make_shared<SceneMesh>();
-    MeshPrimitive primitive;
-    primitive.material = std::make_shared<SceneMaterial>();
-    primitive.material->name = "SolidWhiteWall";
-    primitive.material->baseColorFactor = XMFLOAT4(0.96f, 0.96f, 0.96f, 1.0f);
-    primitive.material->metallicFactor = 0.0f;
-    primitive.material->roughnessFactor = 0.72f;
+    struct Point2 { float x, y; };
+    constexpr int columns = 6, rows = 4;
+    constexpr float left = 3.05f, right = 9.95f, bottom = 0.12f, top = 3.52f;
+    constexpr float centerZ = 2.5f, halfDepth = 0.32f;
+    const float cellWidth = (right - left) / columns;
+    const float cellHeight = (top - bottom) / rows;
 
-    auto addFace = [&](const XMFLOAT3& normal, const std::array<XMFLOAT3, 4>& points) {
-        // Dense face tessellation keeps fracture-cell ownership local. Large
-        // two-triangle faces crossed grid boundaries and flew with wrong chunk.
-        constexpr int subdivisions = 8;
-        auto bilerp = [&](float u, float v) {
-            XMFLOAT3 p;
-            p.x = (1-v)*((1-u)*points[0].x + u*points[1].x) + v*((1-u)*points[3].x + u*points[2].x);
-            p.y = (1-v)*((1-u)*points[0].y + u*points[1].y) + v*((1-u)*points[3].y + u*points[2].y);
-            p.z = (1-v)*((1-u)*points[0].z + u*points[1].z) + v*((1-u)*points[3].z + u*points[2].z);
-            return p;
-        };
-        for (int y = 0; y < subdivisions; ++y) for (int x = 0; x < subdivisions; ++x) {
-            const float u0 = (float)x / subdivisions, u1 = (float)(x + 1) / subdivisions;
-            const float v0 = (float)y / subdivisions, v1 = (float)(y + 1) / subdivisions;
-            const XMFLOAT3 quad[4] = { bilerp(u0,v0), bilerp(u1,v0), bilerp(u1,v1), bilerp(u0,v1) };
-            const XMFLOAT2 uv[4] = { {u0,1-v0}, {u1,1-v0}, {u1,1-v1}, {u0,1-v1} };
+    auto root = std::make_shared<SceneNode>("DestructibleWallVoronoi");
+    auto material = std::make_shared<SceneMaterial>();
+    material->name = "SolidWhiteWall";
+    material->baseColorFactor = XMFLOAT4(0.96f, 0.96f, 0.96f, 1.0f);
+    material->metallicFactor = 0.0f;
+    material->roughnessFactor = 0.72f;
+
+    std::vector<Point2> sites;
+    for (int y = 0; y < rows; ++y) for (int x = 0; x < columns; ++x) {
+        const float jitterX = (((x * 37 + y * 17 + 3) % 13) / 12.0f - 0.5f) * cellWidth * 0.48f;
+        const float jitterY = (((x * 19 + y * 41 + 7) % 11) / 10.0f - 0.5f) * cellHeight * 0.48f;
+        sites.push_back({ left + (x + 0.5f) * cellWidth + jitterX,
+                          bottom + (y + 0.5f) * cellHeight + jitterY });
+    }
+
+    auto clipCell = [&](uint32_t siteIndex) {
+        std::vector<Point2> polygon = { {left,bottom}, {right,bottom}, {right,top}, {left,top} };
+        const Point2 site = sites[siteIndex];
+        for (uint32_t otherIndex = 0; otherIndex < sites.size() && !polygon.empty(); ++otherIndex) {
+            if (otherIndex == siteIndex) continue;
+            const Point2 other = sites[otherIndex];
+            const float nx = other.x - site.x, ny = other.y - site.y;
+            const float c = (other.x * other.x + other.y * other.y - site.x * site.x - site.y * site.y) * 0.5f;
+            std::vector<Point2> clipped;
+            for (size_t i = 0; i < polygon.size(); ++i) {
+                const Point2 a = polygon[i], b = polygon[(i + 1) % polygon.size()];
+                const float da = a.x * nx + a.y * ny - c;
+                const float db = b.x * nx + b.y * ny - c;
+                const bool insideA = da <= 0.00001f, insideB = db <= 0.00001f;
+                if (insideA) clipped.push_back(a);
+                if (insideA != insideB) {
+                    const float t = da / (da - db);
+                    clipped.push_back({ a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t });
+                }
+            }
+            polygon.swap(clipped);
+        }
+        return polygon;
+    };
+
+    for (uint32_t cell = 0; cell < sites.size(); ++cell) {
+        const std::vector<Point2> polygon = clipCell(cell);
+        if (polygon.size() < 3) continue;
+        auto chunkNode = std::make_shared<SceneNode>("VoronoiCell");
+        chunkNode->mesh = std::make_shared<SceneMesh>();
+        MeshPrimitive primitive;
+        primitive.material = material;
+
+        auto emitTriangle = [&](const XMFLOAT3& a, const XMFLOAT3& b, const XMFLOAT3& c,
+                                const XMFLOAT3& normal) {
             const UINT base = (UINT)(primitive.vertices.size() / 12);
-            for (int i = 0; i < 4; ++i) {
-                const float vertex[12] = { quad[i].x, quad[i].y, quad[i].z,
-                    normal.x, normal.y, normal.z, uv[i].x, uv[i].y, 1, 0, 0, 1 };
+            const XMFLOAT3 points[3] = { a, b, c };
+            for (const XMFLOAT3& p : points) {
+                const float u = (p.x - left) / (right - left), v = (p.y - bottom) / (top - bottom);
+                const float vertex[12] = { p.x,p.y,p.z, normal.x,normal.y,normal.z, u,v, 1,0,0,1 };
                 primitive.vertices.insert(primitive.vertices.end(), vertex, vertex + 12);
             }
-            const UINT faceIndices[6] = { base, base + 1, base + 2, base, base + 2, base + 3 };
-            primitive.indices.insert(primitive.indices.end(), faceIndices, faceIndices + 6);
-        }
-    };
-    auto addBrick = [&](float cx, float cy, float cz, float hx, float hy, float hz) {
-        addFace({0,0,1},  {{{cx-hx,cy-hy,cz+hz},{cx+hx,cy-hy,cz+hz},{cx+hx,cy+hy,cz+hz},{cx-hx,cy+hy,cz+hz}}});
-        addFace({0,0,-1}, {{{cx+hx,cy-hy,cz-hz},{cx-hx,cy-hy,cz-hz},{cx-hx,cy+hy,cz-hz},{cx+hx,cy+hy,cz-hz}}});
-        addFace({1,0,0},  {{{cx+hx,cy-hy,cz+hz},{cx+hx,cy-hy,cz-hz},{cx+hx,cy+hy,cz-hz},{cx+hx,cy+hy,cz+hz}}});
-        addFace({-1,0,0}, {{{cx-hx,cy-hy,cz-hz},{cx-hx,cy-hy,cz+hz},{cx-hx,cy+hy,cz+hz},{cx-hx,cy+hy,cz-hz}}});
-        addFace({0,1,0},  {{{cx-hx,cy+hy,cz+hz},{cx+hx,cy+hy,cz+hz},{cx+hx,cy+hy,cz-hz},{cx-hx,cy+hy,cz-hz}}});
-        addFace({0,-1,0}, {{{cx-hx,cy-hy,cz-hz},{cx+hx,cy-hy,cz-hz},{cx+hx,cy-hy,cz+hz},{cx-hx,cy-hy,cz+hz}}});
-    };
+            primitive.indices.insert(primitive.indices.end(), { base, base + 1, base + 2 });
+        };
+        auto emitDenseTriangle = [&](auto&& self, const XMFLOAT3& a, const XMFLOAT3& b,
+                                     const XMFLOAT3& c, const XMFLOAT3& normal, int depth) -> void {
+            if (depth == 0) { emitTriangle(a, b, c, normal); return; }
+            auto midpoint = [](const XMFLOAT3& p, const XMFLOAT3& q) {
+                return XMFLOAT3((p.x+q.x)*0.5f, (p.y+q.y)*0.5f, (p.z+q.z)*0.5f);
+            };
+            const XMFLOAT3 ab = midpoint(a,b), bc = midpoint(b,c), ca = midpoint(c,a);
+            self(self,a,ab,ca,normal,depth-1); self(self,ab,b,bc,normal,depth-1);
+            self(self,ca,bc,c,normal,depth-1); self(self,ab,bc,ca,normal,depth-1);
+        };
 
-    constexpr int columns = 6, rows = 4;
-    constexpr float brickWidth = 1.15f, brickHeight = 0.85f;
-    for (int y = 0; y < rows; ++y) {
-        for (int x = 0; x < columns; ++x) {
-            addBrick(6.5f + (x - (columns - 1) * 0.5f) * brickWidth,
-                     0.12f + (y + 0.5f) * brickHeight, 2.5f,
-                     brickWidth * 0.4995f, brickHeight * 0.4995f, 0.32f);
+        Point2 centroid = {};
+        for (const Point2& p : polygon) { centroid.x += p.x; centroid.y += p.y; }
+        centroid.x /= polygon.size(); centroid.y /= polygon.size();
+        for (size_t edge = 0; edge < polygon.size(); ++edge) {
+            const Point2 a = polygon[edge], b = polygon[(edge + 1) % polygon.size()];
+            const XMFLOAT3 frontCenter(centroid.x,centroid.y,centerZ+halfDepth);
+            const XMFLOAT3 backCenter(centroid.x,centroid.y,centerZ-halfDepth);
+            emitDenseTriangle(emitDenseTriangle, frontCenter, {a.x,a.y,centerZ+halfDepth},
+                              {b.x,b.y,centerZ+halfDepth}, {0,0,1}, 2);
+            emitDenseTriangle(emitDenseTriangle, backCenter, {b.x,b.y,centerZ-halfDepth},
+                              {a.x,a.y,centerZ-halfDepth}, {0,0,-1}, 2);
+            const float ex = b.x-a.x, ey = b.y-a.y;
+            const float invLength = 1.0f / std::max(0.0001f, std::sqrt(ex*ex + ey*ey));
+            const XMFLOAT3 sideNormal(ey*invLength, -ex*invLength, 0);
+            emitDenseTriangle(emitDenseTriangle, {a.x,a.y,centerZ-halfDepth},
+                              {b.x,b.y,centerZ-halfDepth}, {b.x,b.y,centerZ+halfDepth}, sideNormal, 1);
+            emitDenseTriangle(emitDenseTriangle, {a.x,a.y,centerZ-halfDepth},
+                              {b.x,b.y,centerZ+halfDepth}, {a.x,a.y,centerZ+halfDepth}, sideNormal, 1);
         }
+        chunkNode->mesh->primitives.push_back(std::move(primitive));
+        root->AddChild(chunkNode);
     }
-    root->mesh->primitives.push_back(std::move(primitive));
     root->UpdateGlobalTransform(root->localTransform);
     return root;
 }
