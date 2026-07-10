@@ -23,6 +23,25 @@ using namespace Nv::Blast;
 
 namespace {
 constexpr uint32_t InvalidIndex = 0xFFFFFFFFu;
+TkFramework* SharedTkFramework = nullptr;
+uint32_t SharedTkFrameworkUsers = 0;
+
+TkFramework* AcquireTkFramework() {
+    if (!SharedTkFramework) {
+        SharedTkFramework = NvBlastTkFrameworkGet();
+        if (!SharedTkFramework) SharedTkFramework = NvBlastTkFrameworkCreate();
+    }
+    if (SharedTkFramework) ++SharedTkFrameworkUsers;
+    return SharedTkFramework;
+}
+
+void ReleaseTkFramework() {
+    if (!SharedTkFramework || SharedTkFrameworkUsers == 0) return;
+    if (--SharedTkFrameworkUsers == 0) {
+        SharedTkFramework->release();
+        SharedTkFramework = nullptr;
+    }
+}
 
 struct RadialDamageParams {
     float position[3];
@@ -224,7 +243,7 @@ struct DestructionDX12::Impl {
     }
 
     bool BuildBlast() {
-        framework = NvBlastTkFrameworkCreate();
+        framework = AcquireTkFramework();
         if (!framework) return false;
         std::vector<NvBlastChunkDesc> chunkDescs(chunks.size() + 1);
         XMFLOAT3 rootCenter = {};
@@ -418,7 +437,7 @@ void DestructionDX12::Shutdown() {
     m->family = nullptr; m->actors.clear();
     if (m->group) m->group->release();
     if (m->asset) m->asset->release();
-    if (m->framework) m->framework->release();
+    if (m->framework) ReleaseTkFramework();
     m->group = nullptr; m->asset = nullptr; m->framework = nullptr;
     m->chunks.clear(); m->renderItems.clear(); m->initialized = false;
 }

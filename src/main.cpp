@@ -5,6 +5,7 @@
 #include <iostream>
 #include <chrono>
 #include <filesystem>
+#include <array>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx12.h>
@@ -45,6 +46,7 @@ static ShadowMapDX12        shadowMap;
 static GeometryBuffers      geo;
 static PackedGeometry       packed;
 static std::shared_ptr<SceneNode> crateModel;
+static std::shared_ptr<SceneNode> wallModel;
 static std::shared_ptr<SceneMaterial> floorMaterial;
 static bool                 crateLoadAttempted = false;
 
@@ -89,6 +91,51 @@ static void LoadFloorMudMaterial() {
         floorMaterial.reset();
         std::cerr << "Brown mud floor texture unavailable; using flat floor color\n";
     }
+}
+
+static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
+    auto root = std::make_shared<SceneNode>("DestructibleWall");
+    root->mesh = std::make_shared<SceneMesh>();
+    MeshPrimitive primitive;
+    primitive.material = std::make_shared<SceneMaterial>();
+    primitive.material->name = "BrickWall";
+    primitive.material->baseColorFactor = XMFLOAT4(0.62f, 0.22f, 0.12f, 1.0f);
+    primitive.material->metallicFactor = 0.0f;
+    primitive.material->roughnessFactor = 0.9f;
+
+    auto addFace = [&](const XMFLOAT3& normal, const std::array<XMFLOAT3, 4>& points) {
+        const UINT base = (UINT)(primitive.vertices.size() / 12);
+        const XMFLOAT2 uv[4] = { {0,1}, {1,1}, {1,0}, {0,0} };
+        for (int i = 0; i < 4; ++i) {
+            const float vertex[12] = { points[i].x, points[i].y, points[i].z,
+                normal.x, normal.y, normal.z, uv[i].x, uv[i].y, 1, 0, 0, 1 };
+            primitive.vertices.insert(primitive.vertices.end(), vertex, vertex + 12);
+        }
+        const UINT faceIndices[6] = { base, base + 1, base + 2, base, base + 2, base + 3 };
+        primitive.indices.insert(primitive.indices.end(), faceIndices, faceIndices + 6);
+    };
+    auto addBrick = [&](float cx, float cy, float cz, float hx, float hy, float hz) {
+        addFace({0,0,1},  {{{cx-hx,cy-hy,cz+hz},{cx+hx,cy-hy,cz+hz},{cx+hx,cy+hy,cz+hz},{cx-hx,cy+hy,cz+hz}}});
+        addFace({0,0,-1}, {{{cx+hx,cy-hy,cz-hz},{cx-hx,cy-hy,cz-hz},{cx-hx,cy+hy,cz-hz},{cx+hx,cy+hy,cz-hz}}});
+        addFace({1,0,0},  {{{cx+hx,cy-hy,cz+hz},{cx+hx,cy-hy,cz-hz},{cx+hx,cy+hy,cz-hz},{cx+hx,cy+hy,cz+hz}}});
+        addFace({-1,0,0}, {{{cx-hx,cy-hy,cz-hz},{cx-hx,cy-hy,cz+hz},{cx-hx,cy+hy,cz+hz},{cx-hx,cy+hy,cz-hz}}});
+        addFace({0,1,0},  {{{cx-hx,cy+hy,cz+hz},{cx+hx,cy+hy,cz+hz},{cx+hx,cy+hy,cz-hz},{cx-hx,cy+hy,cz-hz}}});
+        addFace({0,-1,0}, {{{cx-hx,cy-hy,cz-hz},{cx+hx,cy-hy,cz-hz},{cx+hx,cy-hy,cz+hz},{cx-hx,cy-hy,cz+hz}}});
+    };
+
+    constexpr int columns = 6, rows = 4;
+    constexpr float brickWidth = 1.15f, brickHeight = 0.85f;
+    for (int y = 0; y < rows; ++y) {
+        const float offset = (y & 1) ? brickWidth * 0.25f : 0.0f;
+        for (int x = 0; x < columns; ++x) {
+            addBrick(6.5f + (x - (columns - 1) * 0.5f) * brickWidth + offset,
+                     0.12f + (y + 0.5f) * brickHeight, 2.5f,
+                     brickWidth * 0.46f, brickHeight * 0.46f, 0.32f);
+        }
+    }
+    root->mesh->primitives.push_back(std::move(primitive));
+    root->UpdateGlobalTransform(root->localTransform);
+    return root;
 }
 
 // ?? timer ????????????????????????????????????????????????????????????????????
@@ -465,10 +512,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         scene.Update(deltaTime, now);
 
-        if (scene.rebuildDestructionRequested && crateModel) {
+        if (scene.rebuildDestructionRequested && wallModel) {
             scene.rebuildDestructionRequested = false;
-            g_destruction.Initialize(crateModel, g_dx12.device.Get(),
-                scene.destructionGridX, scene.destructionGridY, scene.destructionGridZ);
+            g_destruction.Initialize(wallModel, g_dx12.device.Get(), 6, 4, 1);
         }
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.Update(deltaTime);
@@ -477,7 +523,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 XMFLOAT3 hit;
                 if (g_destruction.HitTestSegment(projectile.previousPosition, projectile.position,
                                                  scene.projectileScale * 2.5f, hit)) {
-                    std::cout << "Projectile hit house at " << hit.x << ", "
+                    std::cout << "Projectile hit wall at " << hit.x << ", "
                               << hit.y << ", " << hit.z << "\n";
                     g_destruction.ApplyRadialDamage(hit, scene.destructionDamageRadius,
                                                     scene.destructionDamage);
@@ -503,15 +549,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             LoadFloorMudMaterial();
             std::cout << "Loading models/h2.glb...\n";
             crateModel = GLBImporter::LoadGLB("models/h2.glb", g_dx12.device, g_dx12.commandList);
+            wallModel = CreateDestructibleWallModel();
+            g_destruction.Initialize(wallModel, g_dx12.device.Get(), 6, 4, 1);
             if (crateModel) {
                 if (auto merged = GLBImporter::MergeSceneByMaterial(crateModel, g_dx12.device)) {
                     crateModel = merged;
                 }
                 crateModel->UpdateGlobalTransform(crateModel->localTransform);
-                if (scene.useDestruction) {
-                    g_destruction.Initialize(crateModel, g_dx12.device.Get(),
-                        scene.destructionGridX, scene.destructionGridY, scene.destructionGridZ);
-                }
                 size_t materialDraws = crateModel->mesh ? crateModel->mesh->primitives.size() : 0;
                 std::cout << "h2 model loaded: " << materialDraws
                           << " material draw(s)\n";
@@ -551,7 +595,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
                 lightSpace = shadowMap.Render(scene, geo,
-                    g_destruction.IsInitialized() ? nullptr : crateModel);
+                    crateModel);
                 shadowResource = shadowMap.GetResource();
             }
             RenderForward(scene, mainShader, geo, crateModel, floorMaterial, lightSpace, shadowResource);

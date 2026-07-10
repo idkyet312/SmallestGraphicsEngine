@@ -160,14 +160,11 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     if (ImGui::CollapsingHeader("Destruction", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Checkbox("Enable Blast House", &scene.useDestruction);
-        ImGui::SliderInt("Grid X", &scene.destructionGridX, 1, 8);
-        ImGui::SliderInt("Grid Y", &scene.destructionGridY, 1, 8);
-        ImGui::SliderInt("Grid Z", &scene.destructionGridZ, 1, 8);
+        ImGui::Checkbox("Enable Destructible Wall", &scene.useDestruction);
         ImGui::DragFloat("Damage Radius", &scene.destructionDamageRadius, 0.1f, 0.25f, 8.0f);
         ImGui::DragFloat("Damage", &scene.destructionDamage, 0.1f, 0.1f, 10.0f);
-        ImGui::Text("Chunks: %u  Actors: %u", g_destruction.GetChunkCount(), g_destruction.GetActorCount());
-        if (ImGui::Button("Reset / Refracture")) scene.rebuildDestructionRequested = true;
+        ImGui::Text("Wall: %u chunks  %u actors", g_destruction.GetChunkCount(), g_destruction.GetActorCount());
+        if (ImGui::Button("Rebuild Wall")) scene.rebuildDestructionRequested = true;
     }
 
     ImGui::Separator();
