@@ -8,12 +8,31 @@
 
 using Microsoft::WRL::ComPtr;
 
+struct MeshletBoundsDX12 {
+    DirectX::XMFLOAT3 boundsMin;
+    float padding0;
+    DirectX::XMFLOAT3 boundsMax;
+    float padding1;
+    DirectX::XMFLOAT3 sphereCenter;
+    float sphereRadius;
+    DirectX::XMFLOAT3 coneAxis;
+    float coneCutoff;
+};
+
+struct MeshletDescDX12 {
+    UINT vertexOffset;
+    UINT vertexCount;
+    UINT triangleOffset;
+    UINT triangleCount;
+};
+
 struct SceneMaterial {
     std::string name;
     
     DirectX::XMFLOAT4 baseColorFactor = { 1.0f, 1.0f, 1.0f, 1.0f };
     float metallicFactor = 1.0f;
     float roughnessFactor = 1.0f;
+    bool doubleSided = false;
     
     ComPtr<ID3D12Resource> baseColorTexture;
     ComPtr<ID3D12Resource> metallicRoughnessTexture;
@@ -33,9 +52,14 @@ struct MeshPrimitive {
     // DX12 Resources (to be filled by the renderer/loader)
     ComPtr<ID3D12Resource> vertexBuffer;
     ComPtr<ID3D12Resource> indexBuffer;
+    ComPtr<ID3D12Resource> meshletBoundsBuffer;
+    ComPtr<ID3D12Resource> meshletDescBuffer;
+    ComPtr<ID3D12Resource> meshletVertexIndexBuffer;
+    ComPtr<ID3D12Resource> meshletTriangleBuffer;
     D3D12_VERTEX_BUFFER_VIEW vbv;
     D3D12_INDEX_BUFFER_VIEW ibv;
     UINT indexCount = 0;
+    UINT meshletCount = 0;
 };
 
 struct SceneMesh {

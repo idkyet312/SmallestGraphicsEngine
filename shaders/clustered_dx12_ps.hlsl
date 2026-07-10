@@ -74,6 +74,14 @@ cbuffer DDGIBuffer : register(b5) {
     float3 ddgiPadding;
 };
 
+// 9 L2 spherical-harmonic coefficients (RGB, cosine-lobe pre-convolved)
+// approximating diffuse sky irradiance from the equirectangular sky HDRI.
+cbuffer SHBuffer : register(b7) {
+    float4 shCoeffs[9];
+    float skyIntensity;
+    float3 shPadding;
+};
+
 Texture2D albedoMap : register(t1);
 Texture2D irradianceMap : register(t2);
 Texture2D visibilityMap : register(t3);
@@ -243,6 +251,23 @@ float3 sampleDDGIIrradiance(float3 worldPos, float3 normal) {
     return irradiance * giIntensity;
 }
 
+// Evaluates the L2 SH irradiance in the given normal direction. Coefficients
+// already include the cosine-lobe convolution, so this is a flat dot product
+// (Ramamoorthi/Hanrahan's SH diffuse irradiance formula, factors folded in
+// on the CPU side) rather than a full BRDF integral.
+float3 sampleSkyIrradiance(float3 normal) {
+    float3 result = shCoeffs[0].rgb * 0.282095;
+    result += shCoeffs[1].rgb * 0.488603 * normal.y;
+    result += shCoeffs[2].rgb * 0.488603 * normal.z;
+    result += shCoeffs[3].rgb * 0.488603 * normal.x;
+    result += shCoeffs[4].rgb * 1.092548 * normal.x * normal.y;
+    result += shCoeffs[5].rgb * 1.092548 * normal.y * normal.z;
+    result += shCoeffs[6].rgb * 0.315392 * (3.0 * normal.z * normal.z - 1.0);
+    result += shCoeffs[7].rgb * 1.092548 * normal.x * normal.z;
+    result += shCoeffs[8].rgb * 0.546274 * (normal.x * normal.x - normal.y * normal.y);
+    return max(result, 0.0) * skyIntensity;
+}
+
 float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 viewDir, float rough) {
     float3 lightPosition = pointLights[index].position;
     float3 lightCol = pointLights[index].color;
@@ -353,7 +378,11 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // Add DDGI global illumination
     float3 giContribution = sampleDDGIIrradiance(input.fragPos, normal);
     ambient += giContribution * albedo;
-    
+
+    // Add sky IBL (diffuse irradiance from the HDRI, via SH)
+    float3 skyContribution = sampleSkyIrradiance(normal);
+    ambient += skyContribution * albedo;
+
     float3 result = ambient;
     
     // Main directional/point light
@@ -424,6 +453,18 @@ float4 main(PS_INPUT input) : SV_TARGET {
         // Just use simple Blinn for point lights for performance?
         result += calculatePointLight(i, input.fragPos, normal, viewDir, rough) * albedo;
     }
+
+    // Aerial perspective ties distant geometry into the procedural sky.
+    float cameraDistance = length(viewPos - input.fragPos);
+    float3 cameraRay = -viewDir;
+    float horizonAmount = exp(-abs(cameraRay.y) * 6.0);
+    float3 fogZenith = float3(0.30, 0.55, 0.82);
+    float3 fogHorizon = float3(0.78, 0.72, 0.60);
+    float3 fogColor = lerp(fogZenith, fogHorizon, horizonAmount);
+    float distanceFog = 1.0 - exp(-cameraDistance * 0.012);
+    float heightFog = exp(-max(input.fragPos.y, 0.0) * 0.035);
+    float fogAmount = saturate(distanceFog * lerp(0.45, 1.0, heightFog));
+    result = lerp(result, fogColor, fogAmount * 0.72);
     
     return float4(result, 1.0);
 }

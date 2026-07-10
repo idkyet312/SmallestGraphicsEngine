@@ -52,14 +52,14 @@ struct Scene {
 
     // Main directional / point light
     XMFLOAT3 lightPos    = { -5.0f, 10.0f, -5.0f };
-    XMFLOAT3 lightColor  = { 1.0f, 1.0f, 1.0f };
+    XMFLOAT3 lightColor  = { 1.15f, 1.08f, 0.96f };
     int      lightType   = 0;
     float    lightConstant  = 1.0f;
     float    lightLinear    = 0.09f;
     float    lightQuadratic = 0.032f;
 
     // Material defaults
-    float ambientStrength   = 0.25f;
+    float ambientStrength   = 0.42f;
     float specularStrength  = 0.5f;
     int   specularShininess = 32;
     float shadowBias        = 0.005f;
@@ -70,7 +70,7 @@ struct Scene {
     float shadowFarPlane     = 90.0f;
 
     // Clear color
-    XMFLOAT3 clearColor = { 0.1f, 0.1f, 0.15f };
+    XMFLOAT3 clearColor = { 0.35f, 0.58f, 0.82f };
 
     // Objects
     SceneObject cube1;
@@ -115,6 +115,13 @@ struct Scene {
     bool useVisibilityBuffer = false; // id Tech VB+Deferred mode
     bool useRaytracing       = false; // DXR raytracing mode
 
+    // Mesh-shader tessellated terrain (replaces the flat floor plane when on)
+    bool  useMeshTerrain     = true;
+    float terrainHeightScale = 5.0f;
+
+    // Z key: wireframe for the mesh-shader pipelines (meshlets + terrain)
+    bool meshletWireframe = false;
+
     Scene() {
         cube1.position = { 0.0f, 1.0f, 0.0f };
         cube1.scale    = { 2.0f, 2.0f, 2.0f };
@@ -124,7 +131,7 @@ struct Scene {
         cube2.scale    = { 1.0f, 1.0f, 1.0f };
         cube2.rotation = { 0.0f, 45.0f, 0.0f };
         cube2.color    = { 0.3f, 0.5f, 0.85f };
-        cube2.visible  = true;
+        cube2.visible  = false;
 
         floor.color    = { 1.0f, 1.0f, 1.0f };
     }

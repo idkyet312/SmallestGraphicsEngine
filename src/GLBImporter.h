@@ -2,14 +2,26 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <array>
 #include "SceneGraph.h"
 #include <d3d12.h>
 #include <wrl/client.h>
+#include <DirectXMath.h>
 
 class GLBImporter {
 public:
     static std::shared_ptr<SceneNode> LoadGLB(const std::string& filepath, Microsoft::WRL::ComPtr<ID3D12Device> device, Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList);
     static Microsoft::WRL::ComPtr<ID3D12Resource> LoadTextureFromFile(const std::string& filepath, Microsoft::WRL::ComPtr<ID3D12Device> device, Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploadHeaps);
+
+    // Loads an equirectangular EXR as a linear R32G32B32A32_FLOAT texture
+    // (single mip). Used for the HDRI sky dome so it keeps full dynamic range.
+    static Microsoft::WRL::ComPtr<ID3D12Resource> LoadEXRTextureFromFile(const std::string& filepath, Microsoft::WRL::ComPtr<ID3D12Device> device, Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploadHeaps);
+
+    // Loads an equirectangular EXR and projects its radiance onto 9 (L2)
+    // spherical harmonic coefficients for cheap diffuse ambient/IBL lighting.
+    // Returns all-zero coefficients (caller should fall back to a flat
+    // ambient term) if the file can't be loaded.
+    static std::array<DirectX::XMFLOAT3, 9> ComputeSkyIrradianceSH(const std::string& filepath);
 
     // Collapses an entire (static) node hierarchy into one SceneNode per unique
     // material, each holding a single merged draw call. Each primitive's

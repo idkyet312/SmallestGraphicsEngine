@@ -13,12 +13,25 @@ struct alignas(8) MeshPSOSubobjectDX12 {
 class MeshShaderDX12 {
 public:
     ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12PipelineState> psoWireframe;
     ComPtr<ID3D12GraphicsCommandList6> commandList6;
     bool supported = false;
+    bool wireframe = false; // Z key: draw meshlets as wireframe
+    bool occlusionEnabled = false;
+    D3D12_GPU_DESCRIPTOR_HANDLE occlusionDepthHandle = {};
 
-    bool CanDraw(UINT vertexCount, UINT indexCount) const {
-        UINT cornerCount = indexCount ? indexCount : vertexCount;
-        return supported && vertexCount > 0 && cornerCount >= 3;
+    void SetOcclusionDepth(D3D12_GPU_DESCRIPTOR_HANDLE handle, bool enabled) {
+        occlusionDepthHandle = handle;
+        occlusionEnabled = enabled;
+    }
+
+    bool CanDraw(UINT meshletCount,
+                 D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress,
+                 D3D12_GPU_VIRTUAL_ADDRESS meshletBoundsAddress,
+                 D3D12_GPU_VIRTUAL_ADDRESS meshletVertexIndexAddress,
+                 D3D12_GPU_VIRTUAL_ADDRESS meshletTriangleAddress) const {
+        return supported && meshletCount > 0 && meshletDescAddress &&
+               meshletBoundsAddress && meshletVertexIndexAddress && meshletTriangleAddress;
     }
 
     bool Init(ShaderDX12& shader) {
@@ -39,7 +52,12 @@ public:
             return false;
         }
         ComPtr<ID3DBlob> ms;
+        ComPtr<ID3DBlob> as;
         ComPtr<ID3DBlob> ps;
+        if (FAILED(D3DReadFileToBlob(L"shaders/mesh_as.cso", &as))) {
+            std::cerr << "Amplification shader DXIL missing: shaders/mesh_as.cso\n";
+            return false;
+        }
         if (FAILED(D3DReadFileToBlob(L"shaders/mesh_ms.cso", &ms))) {
             std::cerr << "Mesh shader DXIL missing: shaders/mesh_ms.cso\n";
             return false;
@@ -51,6 +69,7 @@ public:
         if (!shader.rootSignature) return false;
 
         using Root = MeshPSOSubobjectDX12<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*>;
+        using AS = MeshPSOSubobjectDX12<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_SHADER_BYTECODE>;
         using MS = MeshPSOSubobjectDX12<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE>;
         using PS = MeshPSOSubobjectDX12<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE>;
         using Raster = MeshPSOSubobjectDX12<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC>;
@@ -60,8 +79,9 @@ public:
         using Mask = MeshPSOSubobjectDX12<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT>;
         using RT = MeshPSOSubobjectDX12<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY>;
         using DS = MeshPSOSubobjectDX12<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT>;
-        struct alignas(8) Stream { Root root; MS ms; PS ps; Raster raster; Blend blend; Depth depth; Sample sample; Mask mask; RT rt; DS ds; } stream;
+        struct alignas(8) Stream { Root root; AS as; MS ms; PS ps; Raster raster; Blend blend; Depth depth; Sample sample; Mask mask; RT rt; DS ds; } stream;
         stream.root.value = shader.rootSignature.Get();
+        stream.as.value = { as->GetBufferPointer(), as->GetBufferSize() };
         stream.ms.value = { ms->GetBufferPointer(), ms->GetBufferSize() };
         stream.ps.value = { ps->GetBufferPointer(), ps->GetBufferSize() };
         stream.raster.value.FillMode = D3D12_FILL_MODE_SOLID;
@@ -86,25 +106,52 @@ public:
             std::cerr << "Mesh PSO creation failed: 0x" << std::hex << psoHr << std::dec << "\n";
             return false;
         }
+
+        stream.raster.value.FillMode = D3D12_FILL_MODE_WIREFRAME;
+        ComPtr<ID3DBlob> wirePs;
+        if (SUCCEEDED(D3DReadFileToBlob(L"shaders/wire_green_ps.cso", &wirePs))) {
+            stream.ps.value = { wirePs->GetBufferPointer(), wirePs->GetBufferSize() };
+        }
+        if (FAILED(device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&psoWireframe)))) {
+            std::cerr << "Mesh wireframe PSO creation failed (non-fatal)\n";
+        }
+
         supported = true;
         return true;
     }
 
-    void Draw(const D3D12_VERTEX_BUFFER_VIEW& vbv, const D3D12_INDEX_BUFFER_VIEW* ibv,
-              UINT vertexCount, UINT indexCount) {
-        if (!CanDraw(vertexCount, indexCount)) return;
-        commandList6->SetPipelineState(pso.Get());
+    void Draw(const D3D12_VERTEX_BUFFER_VIEW& vbv,
+              UINT vertexCount, UINT indexCount, UINT totalMeshlets,
+              D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress,
+              D3D12_GPU_VIRTUAL_ADDRESS meshletBoundsAddress,
+              D3D12_GPU_VIRTUAL_ADDRESS meshletVertexIndexAddress,
+              D3D12_GPU_VIRTUAL_ADDRESS meshletTriangleAddress) {
+        if (!CanDraw(totalMeshlets, meshletDescAddress, meshletBoundsAddress,
+                     meshletVertexIndexAddress, meshletTriangleAddress)) return;
+        commandList6->SetPipelineState((wireframe && psoWireframe)
+            ? psoWireframe.Get() : pso.Get());
         commandList6->SetGraphicsRootShaderResourceView(9, vbv.BufferLocation);
-        commandList6->SetGraphicsRootShaderResourceView(10, ibv ? ibv->BufferLocation : 0);
-        const UINT cornerCount = ibv ? indexCount : vertexCount;
-        const UINT totalGroups = (cornerCount + 95) / 96;
-        UINT firstGroup = 0;
-        while (firstGroup < totalGroups) {
-            const UINT groupCount = std::min(65535u, totalGroups - firstGroup);
-            MeshDrawBufferDX12 data = { vertexCount, indexCount, ibv ? 1u : 0u, firstGroup * 96u };
-            commandList6->SetGraphicsRoot32BitConstants(8, 4, &data, 0);
-            commandList6->DispatchMesh(groupCount, 1, 1);
-            firstGroup += groupCount;
+        commandList6->SetGraphicsRootShaderResourceView(10, meshletDescAddress);
+        commandList6->SetGraphicsRootShaderResourceView(11, meshletBoundsAddress);
+        commandList6->SetGraphicsRootShaderResourceView(13, meshletVertexIndexAddress);
+        commandList6->SetGraphicsRootShaderResourceView(14, meshletTriangleAddress);
+        if (occlusionDepthHandle.ptr) {
+            commandList6->SetGraphicsRootDescriptorTable(12, occlusionDepthHandle);
+        }
+        const UINT maxMeshletsPerDispatch = 65535u * 32u;
+        UINT firstMeshlet = 0;
+        while (firstMeshlet < totalMeshlets) {
+            const UINT meshletCount = std::min(maxMeshletsPerDispatch, totalMeshlets - firstMeshlet);
+            const UINT amplificationGroups = (meshletCount + 31) / 32;
+            MeshDrawBufferDX12 data = {
+                vertexCount, indexCount, indexCount ? 1u : 0u,
+                firstMeshlet, totalMeshlets,
+                occlusionEnabled ? 1u : 0u,
+                g_dx12.screenWidth, g_dx12.screenHeight
+            };
+            commandList6->SetGraphicsRoot32BitConstants(8, 8, &data, 0);
+            commandList6->DispatchMesh(amplificationGroups, 1, 1);
+            firstMeshlet += meshletCount;
         }
     }
 };
