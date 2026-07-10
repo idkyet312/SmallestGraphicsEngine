@@ -808,6 +808,103 @@ static Microsoft::WRL::ComPtr<ID3D12Resource> CreateUploadBuffer(ID3D12Device* d
     return resource;
 }
 
+bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* device) {
+    primitive.indexCount = (UINT)primitive.indices.size();
+    if (!device || primitive.vertices.empty()) return false;
+
+    const UINT vbSize = (UINT)(primitive.vertices.size() * sizeof(float));
+    primitive.vertexBuffer = CreateUploadBuffer(device, primitive.vertices.data(), vbSize);
+    if (!primitive.vertexBuffer) return false;
+    primitive.vbv.BufferLocation = primitive.vertexBuffer->GetGPUVirtualAddress();
+    primitive.vbv.SizeInBytes = vbSize;
+    primitive.vbv.StrideInBytes = 12 * sizeof(float);
+
+    if (!primitive.indices.empty()) {
+        const UINT ibSize = (UINT)(primitive.indices.size() * sizeof(unsigned int));
+        primitive.indexBuffer = CreateUploadBuffer(device, primitive.indices.data(), ibSize);
+        if (!primitive.indexBuffer) return false;
+        primitive.ibv.BufferLocation = primitive.indexBuffer->GetGPUVirtualAddress();
+        primitive.ibv.SizeInBytes = ibSize;
+        primitive.ibv.Format = DXGI_FORMAT_R32_UINT;
+    }
+
+    constexpr UINT MaxMeshletVertices = 64;
+    constexpr UINT MaxMeshletTriangles = 124;
+    std::vector<UINT> sourceIndices = primitive.indices;
+    if (sourceIndices.empty()) {
+        sourceIndices.resize(primitive.vertices.size() / 12);
+        for (UINT i = 0; i < sourceIndices.size(); ++i) sourceIndices[i] = i;
+    }
+    if (sourceIndices.size() < 3) return true;
+
+    const size_t vertexCount = primitive.vertices.size() / 12;
+    const size_t maxMeshlets = meshopt_buildMeshletsBound(
+        sourceIndices.size(), MaxMeshletVertices, MaxMeshletTriangles);
+    std::vector<meshopt_Meshlet> optimizedMeshlets(maxMeshlets);
+    std::vector<UINT> meshletVertexIndices(maxMeshlets * MaxMeshletVertices);
+    std::vector<unsigned char> meshletTriangleBytes(maxMeshlets * MaxMeshletTriangles * 3);
+    const size_t meshletCount = meshopt_buildMeshlets(
+        optimizedMeshlets.data(), meshletVertexIndices.data(), meshletTriangleBytes.data(),
+        sourceIndices.data(), sourceIndices.size(), primitive.vertices.data(), vertexCount,
+        12 * sizeof(float), MaxMeshletVertices, MaxMeshletTriangles, 0.25f);
+    optimizedMeshlets.resize(meshletCount);
+    if (meshletCount > 0) {
+        const meshopt_Meshlet& last = optimizedMeshlets.back();
+        meshletVertexIndices.resize(last.vertex_offset + last.vertex_count);
+        meshletTriangleBytes.resize(last.triangle_offset + last.triangle_count * 3);
+    }
+
+    std::vector<MeshletDescDX12> meshlets;
+    std::vector<UINT> meshletTriangles;
+    std::vector<MeshletBoundsDX12> bounds;
+    meshlets.reserve(meshletCount);
+    bounds.reserve(meshletCount);
+    for (const meshopt_Meshlet& source : optimizedMeshlets) {
+        meshlets.push_back({ source.vertex_offset, source.vertex_count,
+            (UINT)meshletTriangles.size(), source.triangle_count });
+        for (UINT triangle = 0; triangle < source.triangle_count; ++triangle) {
+            const unsigned char* local = &meshletTriangleBytes[source.triangle_offset + triangle * 3];
+            meshletTriangles.push_back(UINT(local[0]) | (UINT(local[1]) << 8) | (UINT(local[2]) << 16));
+        }
+
+        XMFLOAT3 boundsMin(FLT_MAX, FLT_MAX, FLT_MAX);
+        XMFLOAT3 boundsMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        for (UINT i = 0; i < source.vertex_count; ++i) {
+            const UINT vertex = meshletVertexIndices[source.vertex_offset + i];
+            const float* p = &primitive.vertices[(size_t)vertex * 12];
+            boundsMin.x = std::min(boundsMin.x, p[0]);
+            boundsMin.y = std::min(boundsMin.y, p[1]);
+            boundsMin.z = std::min(boundsMin.z, p[2]);
+            boundsMax.x = std::max(boundsMax.x, p[0]);
+            boundsMax.y = std::max(boundsMax.y, p[1]);
+            boundsMax.z = std::max(boundsMax.z, p[2]);
+        }
+        const meshopt_Bounds optimizedBounds = meshopt_computeMeshletBounds(
+            &meshletVertexIndices[source.vertex_offset],
+            &meshletTriangleBytes[source.triangle_offset], source.triangle_count,
+            primitive.vertices.data(), vertexCount, 12 * sizeof(float));
+        const XMFLOAT3 center(optimizedBounds.center[0], optimizedBounds.center[1], optimizedBounds.center[2]);
+        const XMFLOAT3 coneAxis(optimizedBounds.cone_axis[0], optimizedBounds.cone_axis[1], optimizedBounds.cone_axis[2]);
+        const float coneCutoff = (primitive.material && primitive.material->doubleSided)
+            ? -1.0f : optimizedBounds.cone_cutoff;
+        bounds.push_back({ boundsMin, 0.0f, boundsMax, 0.0f,
+            center, optimizedBounds.radius, coneAxis, coneCutoff });
+    }
+
+    primitive.meshletCount = (UINT)meshlets.size();
+    if (!meshlets.empty()) {
+        primitive.meshletDescBuffer = CreateUploadBuffer(device, meshlets.data(),
+            (UINT)(meshlets.size() * sizeof(MeshletDescDX12)));
+        primitive.meshletVertexIndexBuffer = CreateUploadBuffer(device, meshletVertexIndices.data(),
+            (UINT)(meshletVertexIndices.size() * sizeof(UINT)));
+        primitive.meshletTriangleBuffer = CreateUploadBuffer(device, meshletTriangles.data(),
+            (UINT)(meshletTriangles.size() * sizeof(UINT)));
+        primitive.meshletBoundsBuffer = CreateUploadBuffer(device, bounds.data(),
+            (UINT)(bounds.size() * sizeof(MeshletBoundsDX12)));
+    }
+    return true;
+}
+
 std::shared_ptr<SceneNode> GLBImporter::MergeSceneByMaterial(const std::shared_ptr<SceneNode>& modelRoot, ComPtr<ID3D12Device> device) {
     if (!modelRoot) return nullptr;
 
@@ -885,110 +982,7 @@ std::shared_ptr<SceneNode> GLBImporter::MergeSceneByMaterial(const std::shared_p
             }
         }
 
-        merged.indexCount = (UINT)merged.indices.size();
-
-        if (device) {
-            UINT vbSize = (UINT)(merged.vertices.size() * sizeof(float));
-            merged.vertexBuffer = CreateUploadBuffer(device.Get(), merged.vertices.data(), vbSize);
-            if (merged.vertexBuffer) {
-                merged.vbv.BufferLocation = merged.vertexBuffer->GetGPUVirtualAddress();
-                merged.vbv.SizeInBytes = vbSize;
-                merged.vbv.StrideInBytes = 12 * sizeof(float);
-            }
-
-            if (!merged.indices.empty()) {
-                UINT ibSize = (UINT)(merged.indices.size() * sizeof(unsigned int));
-                merged.indexBuffer = CreateUploadBuffer(device.Get(), merged.indices.data(), ibSize);
-                if (merged.indexBuffer) {
-                    merged.ibv.BufferLocation = merged.indexBuffer->GetGPUVirtualAddress();
-                    merged.ibv.SizeInBytes = ibSize;
-                    merged.ibv.Format = DXGI_FORMAT_R32_UINT;
-                }
-            }
-
-            // meshoptimizer meshlets: 64 unique vertices, 124 triangles.
-            constexpr UINT MaxMeshletVertices = 64;
-            constexpr UINT MaxMeshletTriangles = 124;
-            std::vector<UINT> sourceIndices = merged.indices;
-            if (sourceIndices.empty()) {
-                sourceIndices.resize(merged.vertices.size() / 12);
-                for (UINT i = 0; i < sourceIndices.size(); ++i) sourceIndices[i] = i;
-            }
-            const size_t vertexCount = merged.vertices.size() / 12;
-            const size_t maxMeshlets = meshopt_buildMeshletsBound(
-                sourceIndices.size(), MaxMeshletVertices, MaxMeshletTriangles);
-            std::vector<meshopt_Meshlet> optimizedMeshlets(maxMeshlets);
-            // meshopt_buildMeshlets writes up to maxMeshlets * limit entries and pads
-            // each meshlet's triangle_offset to 4 bytes; index_count is too small.
-            std::vector<UINT> meshletVertexIndices(maxMeshlets * MaxMeshletVertices);
-            std::vector<unsigned char> meshletTriangleBytes(maxMeshlets * MaxMeshletTriangles * 3);
-            const size_t meshletCount = meshopt_buildMeshlets(
-                optimizedMeshlets.data(), meshletVertexIndices.data(), meshletTriangleBytes.data(),
-                sourceIndices.data(), sourceIndices.size(), merged.vertices.data(), vertexCount,
-                12 * sizeof(float), MaxMeshletVertices, MaxMeshletTriangles, 0.25f);
-            optimizedMeshlets.resize(meshletCount);
-            if (meshletCount > 0) {
-                const meshopt_Meshlet& last = optimizedMeshlets.back();
-                meshletVertexIndices.resize(last.vertex_offset + last.vertex_count);
-                meshletTriangleBytes.resize(last.triangle_offset + last.triangle_count * 3);
-            }
-
-            std::vector<MeshletDescDX12> meshlets;
-            std::vector<UINT> meshletTriangles;
-            std::vector<MeshletBoundsDX12> bounds;
-            meshlets.reserve(meshletCount);
-            bounds.reserve(meshletCount);
-            for (const meshopt_Meshlet& source : optimizedMeshlets) {
-                MeshletDescDX12 desc = {
-                    source.vertex_offset, source.vertex_count,
-                    (UINT)meshletTriangles.size(), source.triangle_count
-                };
-                meshlets.push_back(desc);
-                for (UINT triangle = 0; triangle < source.triangle_count; ++triangle) {
-                    const unsigned char* local = &meshletTriangleBytes[source.triangle_offset + triangle * 3];
-                    meshletTriangles.push_back(
-                        UINT(local[0]) | (UINT(local[1]) << 8) | (UINT(local[2]) << 16));
-                }
-
-                XMFLOAT3 boundsMin(FLT_MAX, FLT_MAX, FLT_MAX);
-                XMFLOAT3 boundsMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
-                for (UINT i = 0; i < source.vertex_count; ++i) {
-                    UINT vertex = meshletVertexIndices[source.vertex_offset + i];
-                    const float* p = &merged.vertices[(size_t)vertex * 12];
-                    boundsMin.x = std::min(boundsMin.x, p[0]);
-                    boundsMin.y = std::min(boundsMin.y, p[1]);
-                    boundsMin.z = std::min(boundsMin.z, p[2]);
-                    boundsMax.x = std::max(boundsMax.x, p[0]);
-                    boundsMax.y = std::max(boundsMax.y, p[1]);
-                    boundsMax.z = std::max(boundsMax.z, p[2]);
-                }
-                meshopt_Bounds optimizedBounds = meshopt_computeMeshletBounds(
-                    &meshletVertexIndices[source.vertex_offset],
-                    &meshletTriangleBytes[source.triangle_offset], source.triangle_count,
-                    merged.vertices.data(), vertexCount, 12 * sizeof(float));
-                XMFLOAT3 center(optimizedBounds.center[0], optimizedBounds.center[1], optimizedBounds.center[2]);
-                XMFLOAT3 coneAxis(optimizedBounds.cone_axis[0], optimizedBounds.cone_axis[1], optimizedBounds.cone_axis[2]);
-                float coneCutoff = (merged.material && merged.material->doubleSided)
-                    ? -1.0f : optimizedBounds.cone_cutoff;
-                bounds.push_back({
-                    boundsMin, 0.0f, boundsMax, 0.0f,
-                    center, optimizedBounds.radius,
-                    coneAxis, coneCutoff
-                });
-            }
-
-            merged.meshletCount = (UINT)meshlets.size();
-            if (!meshlets.empty()) {
-                merged.meshletDescBuffer = CreateUploadBuffer(device.Get(), meshlets.data(),
-                    (UINT)(meshlets.size() * sizeof(MeshletDescDX12)));
-                merged.meshletVertexIndexBuffer = CreateUploadBuffer(device.Get(), meshletVertexIndices.data(),
-                    (UINT)(meshletVertexIndices.size() * sizeof(UINT)));
-                merged.meshletTriangleBuffer = CreateUploadBuffer(device.Get(), meshletTriangles.data(),
-                    (UINT)(meshletTriangles.size() * sizeof(UINT)));
-                merged.meshletBoundsBuffer = CreateUploadBuffer(device.Get(), bounds.data(),
-                    (UINT)(bounds.size() * sizeof(MeshletBoundsDX12)));
-            }
-        }
+        BuildMeshletData(merged, device.Get());
 
         mergedMesh->primitives.push_back(std::move(merged));
     }

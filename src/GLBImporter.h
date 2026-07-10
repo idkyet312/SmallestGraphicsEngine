@@ -31,5 +31,8 @@ public:
     // original multi-node tree. Intended for static imports where per-node
     // animation isn't needed, to cut draw-call count for the Colour Pass.
     static std::shared_ptr<SceneNode> MergeSceneByMaterial(const std::shared_ptr<SceneNode>& modelRoot, Microsoft::WRL::ComPtr<ID3D12Device> device);
-};
 
+    // Uploads conventional vertex/index buffers and builds meshoptimizer
+    // meshlets (64 vertices, 124 triangles) for any generated primitive.
+    static bool BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* device);
+};

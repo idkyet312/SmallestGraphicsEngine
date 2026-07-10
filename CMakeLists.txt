@@ -1,6 +1,45 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.22)
 project(GraphicEngine)
 set(CMAKE_CXX_STANDARD 17)
+
+include(FetchContent)
+FetchContent_Declare(box3d
+    GIT_REPOSITORY https://github.com/erincatto/box3d.git
+    GIT_TAG v0.1.0
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(box3d)
+if(MSVC)
+    set_property(TARGET box3d PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
+
+file(GLOB NVBLAST_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/sdk/common/*.cpp"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/sdk/lowlevel/*.cpp"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/sdk/globals/*.cpp"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/sdk/toolkit/*.cpp"
+)
+add_library(NvBlast STATIC ${NVBLAST_SOURCES})
+target_compile_features(NvBlast PUBLIC cxx_std_17)
+target_include_directories(NvBlast PUBLIC
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/include/lowlevel"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/include/globals"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/include/toolkit"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/include/shared/NvFoundation"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/sdk/common"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/sdk/lowlevel"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/sdk/globals"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/sdk/toolkit"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/shared/NsFoundation/include"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/shared/NsFileBuffer/include"
+    "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/shared/NvTask/include"
+)
+if(MSVC)
+    target_compile_options(NvBlast PRIVATE /wd4005 /wd4244 /wd4267)
+    set_property(TARGET NvBlast PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
 
 # Option to choose DX11 or DX12
 option(USE_DX12 "Build with DirectX 12 instead of DirectX 11" ON)
@@ -57,6 +96,7 @@ set(HEADER_FILES
     src/TerrainRendererDX12.h
     src/SkyRendererDX12.h
     src/OcclusionDepthDX12.h
+    src/DestructionDX12.h
 )
 
 # Find tinygltf
@@ -138,6 +178,7 @@ if(USE_DX12)
     add_executable(GraphicEngine WIN32 
         src/main.cpp
         src/GLBImporter.cpp
+        src/DestructionDX12.cpp
         ${HEADER_FILES}
         ${SHADER_FILES}
     )
@@ -145,9 +186,12 @@ if(USE_DX12)
         d3d12
         d3dcompiler
         dxgi
+        Rpcrt4
         imgui::imgui
         meshoptimizer::meshoptimizer
         unofficial::tinyexr::tinyexr
+        box3d
+        NvBlast
     )
     target_include_directories(GraphicEngine PRIVATE ${TINYGLTF_INCLUDE_DIRS})
     target_compile_definitions(GraphicEngine PRIVATE USE_DX12=1)
