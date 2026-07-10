@@ -7,6 +7,8 @@ option(USE_DX12 "Build with DirectX 12 instead of DirectX 11" ON)
 
 # Find imgui package (for ImGui)
 find_package(imgui CONFIG)
+find_package(meshoptimizer CONFIG REQUIRED)
+find_package(tinyexr CONFIG REQUIRED)
 
 # If imgui not found, provide helpful message
 if(NOT imgui_FOUND)
@@ -52,6 +54,9 @@ set(HEADER_FILES
     src/RaytracingDX12.h
     src/MipGenerator.h
     src/MeshShaderDX12.h
+    src/TerrainRendererDX12.h
+    src/SkyRendererDX12.h
+    src/OcclusionDepthDX12.h
 )
 
 # Find tinygltf
@@ -62,6 +67,14 @@ file(GLOB SHADER_FILES "shaders/*.hlsl" "shaders/*.vert" "shaders/*.frag")
 
 find_program(DXC_EXECUTABLE dxc)
 if(USE_DX12 AND DXC_EXECUTABLE)
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/mesh_as.cso
+        COMMAND ${DXC_EXECUTABLE} -T as_6_5 -E ASMain
+                ${CMAKE_SOURCE_DIR}/shaders/mesh_as.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/mesh_as.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/mesh_as.hlsl
+        COMMENT "Compiling amplification shader"
+    )
     add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/mesh_ms.cso
         COMMAND ${DXC_EXECUTABLE} -T ms_6_5 -E MSMain
@@ -78,9 +91,37 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         DEPENDS ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
         COMMENT "Compiling mesh-path pixel shader"
     )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/terrain_as.cso
+        COMMAND ${DXC_EXECUTABLE} -T as_6_5 -E ASMain
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_as.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/terrain_as.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/terrain_as.hlsl
+        COMMENT "Compiling terrain amplification shader"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/terrain_ms.cso
+        COMMAND ${DXC_EXECUTABLE} -T ms_6_5 -E MSMain
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_ms.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/terrain_ms.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/terrain_ms.hlsl
+        COMMENT "Compiling terrain mesh shader"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/wire_green_ps.cso
+        COMMAND ${DXC_EXECUTABLE} -T ps_6_5 -E main
+                ${CMAKE_SOURCE_DIR}/shaders/wire_green_ps.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/wire_green_ps.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/wire_green_ps.hlsl
+        COMMENT "Compiling wireframe pixel shader"
+    )
     add_custom_target(MeshShaderCSO ALL DEPENDS
+        ${CMAKE_BINARY_DIR}/mesh_as.cso
         ${CMAKE_BINARY_DIR}/mesh_ms.cso
-        ${CMAKE_BINARY_DIR}/mesh_ps.cso)
+        ${CMAKE_BINARY_DIR}/mesh_ps.cso
+        ${CMAKE_BINARY_DIR}/terrain_as.cso
+        ${CMAKE_BINARY_DIR}/terrain_ms.cso
+        ${CMAKE_BINARY_DIR}/wire_green_ps.cso)
 else()
     message(STATUS "DXC not found; mesh shader path will use raster fallback")
 endif()
@@ -100,11 +141,13 @@ if(USE_DX12)
         ${HEADER_FILES}
         ${SHADER_FILES}
     )
-    target_link_libraries(GraphicEngine 
+    target_link_libraries(GraphicEngine
         d3d12
         d3dcompiler
         dxgi
         imgui::imgui
+        meshoptimizer::meshoptimizer
+        unofficial::tinyexr::tinyexr
     )
     target_include_directories(GraphicEngine PRIVATE ${TINYGLTF_INCLUDE_DIRS})
     target_compile_definitions(GraphicEngine PRIVATE USE_DX12=1)
@@ -145,8 +188,12 @@ add_custom_command(TARGET GraphicEngine POST_BUILD
 if(USE_DX12 AND DXC_EXECUTABLE)
     add_custom_command(TARGET GraphicEngine POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:GraphicEngine>/shaders
+        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/mesh_as.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_as.cso
         COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/mesh_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ms.cso
         COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/mesh_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ps.cso
+        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/terrain_as.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_as.cso
+        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/terrain_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ms.cso
+        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/wire_green_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/wire_green_ps.cso
     )
     if(DXC_EXECUTABLE)
         add_dependencies(GraphicEngine MeshShaderCSO)

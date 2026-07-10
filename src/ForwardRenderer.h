@@ -9,9 +9,11 @@
 #include "Scene.h"
 #include "SceneGraph.h"
 #include "MeshShaderDX12.h"
+#include "TerrainRendererDX12.h"
 
 extern MeshShaderDX12 g_meshShader;
 extern bool g_useMeshShader;
+extern TerrainRendererDX12 g_terrain;
 
 struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
@@ -58,20 +60,12 @@ inline bool CreateVertexBuffer(const std::vector<VertexPosNormUV>& verts,
 }
 
 inline void DrawCube(const GeometryBuffers& geo) {
-    if (g_useMeshShader && g_meshShader.CanDraw(36, 0)) {
-        g_meshShader.Draw(geo.cubeVBV, nullptr, 36, 0);
-        return;
-    }
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.cubeVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_dx12.commandList->DrawInstanced(36, 1, 0, 0);
 }
 
 inline void DrawPlane(const GeometryBuffers& geo) {
-    if (g_useMeshShader && g_meshShader.CanDraw(6, 0)) {
-        g_meshShader.Draw(geo.planeVBV, nullptr, 6, 0);
-        return;
-    }
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.planeVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_dx12.commandList->DrawInstanced(6, 1, 0, 0);
@@ -108,13 +102,21 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
                 shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
             }
 
+            D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress = prim.meshletDescBuffer
+                ? prim.meshletDescBuffer->GetGPUVirtualAddress() : 0;
+            D3D12_GPU_VIRTUAL_ADDRESS boundsAddress = prim.meshletBoundsBuffer
+                ? prim.meshletBoundsBuffer->GetGPUVirtualAddress() : 0;
+            D3D12_GPU_VIRTUAL_ADDRESS vertexIndexAddress = prim.meshletVertexIndexBuffer
+                ? prim.meshletVertexIndexBuffer->GetGPUVirtualAddress() : 0;
+            D3D12_GPU_VIRTUAL_ADDRESS triangleAddress = prim.meshletTriangleBuffer
+                ? prim.meshletTriangleBuffer->GetGPUVirtualAddress() : 0;
             if (g_useMeshShader && g_meshShader.CanDraw(
-                    (UINT)(prim.vertices.size() / 12),
-                    prim.ibv.BufferLocation ? prim.indexCount : 0)) {
+                    prim.meshletCount, meshletDescAddress, boundsAddress,
+                    vertexIndexAddress, triangleAddress)) {
                 g_meshShader.Draw(prim.vbv,
-                    prim.ibv.BufferLocation ? &prim.ibv : nullptr,
-                    (UINT)(prim.vertices.size() / 12),
-                    prim.ibv.BufferLocation ? prim.indexCount : 0);
+                    (UINT)(prim.vertices.size() / 12), prim.indexCount,
+                    prim.meshletCount, meshletDescAddress, boundsAddress,
+                    vertexIndexAddress, triangleAddress);
             } else {
                 // A previous mesh draw leaves the mesh PSO bound. Restore the
                 // conventional VS/PS pipeline before issuing IA draw calls.
@@ -164,8 +166,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     auto lightData = scene.clusteredRenderer.getPointLightData();
     shader.SetPointLights((int)lightData.size(), lightData);
     shader.SetDDGI(scene.useDDGI, scene.giIntensity, scene.normalBias, scene.probeSpacing);
+    shader.SetSH();
 
-    // Floor
+    g_meshShader.wireframe = scene.meshletWireframe;
+    g_terrain.wireframe = scene.meshletWireframe;
+
+    // Floor: mesh-shader tessellated terrain when available, flat plane otherwise.
     XMMATRIX model = XMMatrixIdentity();
     shader.SetMatrices(model, view, proj, lightSpace);
     if (floorMaterial && floorMaterial->baseColorTexture) {
@@ -180,7 +186,17 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     } else {
         shader.SetObjectColor(scene.floor.color);
     }
-    DrawPlane(geo);
+    if (scene.useMeshTerrain && g_terrain.supported) {
+        TerrainRendererDX12::Params terrainParams;
+        terrainParams.heightScale = scene.terrainHeightScale;
+        g_terrain.Draw(terrainParams);
+        // Terrain used the mesh pipeline; restore the IA pipeline for the
+        // raster draws that follow (same pattern as imported-model draws).
+        g_dx12.commandList->SetPipelineState(scene.wireframeMode
+            ? shader.wireframePipelineState.Get() : shader.pipelineState.Get());
+    } else {
+        DrawPlane(geo);
+    }
     shader.NextDrawCall();
 
     // Cube 1 - draw the imported model if loaded, else fall back to the procedural cube.
@@ -188,6 +204,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // on the floor at the origin rather than reusing cube1's small transform.
     if (crateModel) {
         DrawSceneNode(crateModel, shader, XMMatrixIdentity(), view, proj, lightSpace);
+        // Imported model used the mesh pipeline. Restore IA pipeline for
+        // procedural objects that follow it.
+        shader.Use(scene.wireframeMode);
     } else {
         model = scene.cube1.GetModelMatrix();
         shader.SetMatrices(model, view, proj, lightSpace);

@@ -64,6 +64,7 @@ public:
         float velocity = MovementSpeed * deltaTime;
         
         if (FPSMode) {
+            if (direction == ' ') { Jump(); return; }
             // FPS walking mode - movement constrained to XZ plane
             XMFLOAT3 frontXZ = XMFLOAT3(Front.x, 0.0f, Front.z);
             XMVECTOR frontXZVec = XMVector3Normalize(XMLoadFloat3(&frontXZ));

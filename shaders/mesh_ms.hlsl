@@ -9,11 +9,23 @@ cbuffer MeshDrawBuffer : register(b6) {
     uint vertexCount;
     uint indexCount;
     uint indexed;
-    uint firstCorner;
+    uint firstMeshlet;
+    uint meshletCount;
+    uint occlusionEnabled;
+    uint screenWidth;
+    uint screenHeight;
 };
 
 ByteAddressBuffer vertexData : register(t6);
-ByteAddressBuffer indexData : register(t7);
+struct MeshletDesc {
+    uint vertexOffset;
+    uint vertexCount;
+    uint triangleOffset;
+    uint triangleCount;
+};
+StructuredBuffer<MeshletDesc> meshlets : register(t7);
+StructuredBuffer<uint> meshletVertexIndices : register(t10);
+StructuredBuffer<uint> meshletTriangles : register(t11);
 
 struct Vertex {
     float3 position : POSITION;
@@ -43,24 +55,20 @@ Vertex LoadVertex(uint i) {
     return v;
 }
 
-uint LoadIndex(uint i) { return indexData.Load(i * 4); }
+struct MeshPayload { uint meshletIndices[32]; };
 
 [outputtopology("triangle")]
-[numthreads(96, 1, 1)]
+[numthreads(128, 1, 1)]
 void MSMain(uint3 id : SV_GroupThreadID,
             uint3 groupID : SV_GroupID,
-            out vertices OutVertex verts[96],
-            out indices uint3 tris[32]) {
-    uint cornerCount = indexed ? indexCount : vertexCount;
-    uint groupStart = firstCorner + groupID.x * 96;
-    uint remainingCorners = groupStart < cornerCount ? cornerCount - groupStart : 0;
-    uint triCount = min(remainingCorners / 3, 32);
-    uint outVertexCount = triCount * 3;
-    SetMeshOutputCounts(outVertexCount, triCount);
+            in payload MeshPayload payloadData,
+            out vertices OutVertex verts[64],
+            out indices uint3 tris[124]) {
+    MeshletDesc meshlet = meshlets[payloadData.meshletIndices[groupID.x]];
+    SetMeshOutputCounts(meshlet.vertexCount, meshlet.triangleCount);
 
-    if (id.x < outVertexCount) {
-        uint corner = groupStart + id.x;
-        uint sourceVertex = indexed ? LoadIndex(corner) : corner;
+    if (id.x < meshlet.vertexCount) {
+        uint sourceVertex = meshletVertexIndices[meshlet.vertexOffset + id.x];
         Vertex v = LoadVertex(sourceVertex);
         float4 world = mul(float4(v.position, 1), model);
         float4 viewPosition = mul(world, view);
@@ -72,8 +80,8 @@ void MSMain(uint3 id : SV_GroupThreadID,
         verts[id.x].fragPosLightSpace = mul(world, lightSpaceMatrix);
     }
 
-    if (id.x < triCount) {
-        uint base = id.x * 3;
-        tris[id.x] = uint3(base, base + 1, base + 2);
+    if (id.x < meshlet.triangleCount) {
+        uint packed = meshletTriangles[meshlet.triangleOffset + id.x];
+        tris[id.x] = uint3(packed & 0xff, (packed >> 8) & 0xff, (packed >> 16) & 0xff);
     }
 }

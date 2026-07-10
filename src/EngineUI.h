@@ -16,6 +16,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::BulletText("TAB: Toggle UI");
     ImGui::BulletText("C: Lock/Unlock Camera");
     ImGui::BulletText("F: Toggle FPS Walking Mode");
+    ImGui::BulletText("Z: Meshlet Wireframe");
     ImGui::BulletText("Left Click: Lock camera / Shoot");
     ImGui::Separator();
 
@@ -61,6 +62,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::ColorEdit3("Floor Color", &scene.floor.color.x);
         ImGui::ColorEdit3("Clear Color", &scene.clearColor.x);
         ImGui::Checkbox("Wireframe Mode", &scene.wireframeMode);
+        ImGui::Checkbox("Mesh Shader Terrain", &scene.useMeshTerrain);
+        if (scene.useMeshTerrain) {
+            ImGui::SliderFloat("Terrain Height", &scene.terrainHeightScale, 0.0f, 15.0f);
+        }
         ImGui::DragFloat("Ambient",  &scene.ambientStrength,  0.01f, 0.0f, 1.0f);
         ImGui::DragFloat("Specular", &scene.specularStrength, 0.01f, 0.0f, 1.0f);
         ImGui::Checkbox("Enable Shadows", &scene.enableShadows);

@@ -12,6 +12,13 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <cfloat>
+#include <unordered_map>
+#include <array>
+#include <meshoptimizer.h>
+
+#define TINYEXR_IMPLEMENTATION
+#include <tinyexr.h>
 
 using namespace DirectX;
 
@@ -254,6 +261,229 @@ ComPtr<ID3D12Resource> GLBImporter::LoadTextureFromFile(const std::string& filep
     return CreateTexture(device.Get(), commandList.Get(), image, uploadHeaps);
 }
 
+ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& filepath, ComPtr<ID3D12Device> device,
+    ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
+    float* pixels = nullptr;
+    int width = 0, height = 0;
+    const char* err = nullptr;
+    if (LoadEXR(&pixels, &width, &height, filepath.c_str(), &err) != TINYEXR_SUCCESS) {
+        std::cerr << "Failed to load EXR texture: " << filepath
+                  << (err ? (std::string(" (") + err + ")") : "") << std::endl;
+        if (err) FreeEXRErrorMessage(err);
+        return nullptr;
+    }
+    // Build a full CPU mip chain (RGBA float). Box filter: wrap in U (longitude)
+    // and clamp in V (latitude), matching how an equirect map tiles. Doing this on
+    // the CPU (one-time load cost) avoids needing typed-UAV float support the GPU
+    // MipGenerator assumes for R8G8B8A8. Trilinear sampling of these mips is what
+    // tames the pole singularity's radial smearing.
+    const UINT baseW = (UINT)width, baseH = (UINT)height;
+    UINT16 mipLevels = 1;
+    while ((baseW >> mipLevels) > 0 || (baseH >> mipLevels) > 0) mipLevels++;
+
+    std::vector<std::vector<float>> mips(mipLevels);
+    std::vector<UINT> mipW(mipLevels), mipH(mipLevels);
+    mipW[0] = baseW; mipH[0] = baseH;
+    mips[0].assign(pixels, pixels + (size_t)baseW * baseH * 4);
+    free(pixels);
+
+    for (UINT16 level = 1; level < mipLevels; ++level) {
+        UINT sw = mipW[level - 1], sh = mipH[level - 1];
+        UINT dw = std::max(1u, sw / 2), dh = std::max(1u, sh / 2);
+        mipW[level] = dw; mipH[level] = dh;
+        mips[level].resize((size_t)dw * dh * 4);
+        const std::vector<float>& s = mips[level - 1];
+        std::vector<float>& d = mips[level];
+        for (UINT y = 0; y < dh; ++y) {
+            UINT y0 = std::min(y * 2, sh - 1);
+            UINT y1 = std::min(y * 2 + 1, sh - 1);
+            for (UINT x = 0; x < dw; ++x) {
+                UINT x0 = (x * 2) % sw;
+                UINT x1 = (x * 2 + 1) % sw;
+                for (int c = 0; c < 4; ++c) {
+                    d[((size_t)y * dw + x) * 4 + c] = 0.25f * (
+                        s[((size_t)y0 * sw + x0) * 4 + c] +
+                        s[((size_t)y0 * sw + x1) * 4 + c] +
+                        s[((size_t)y1 * sw + x0) * 4 + c] +
+                        s[((size_t)y1 * sw + x1) * 4 + c]);
+                }
+            }
+        }
+    }
+
+    D3D12_RESOURCE_DESC textureDesc = {};
+    textureDesc.MipLevels = mipLevels;
+    textureDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    textureDesc.Width = baseW;
+    textureDesc.Height = baseH;
+    textureDesc.DepthOrArraySize = 1;
+    textureDesc.SampleDesc.Count = 1;
+    textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    ComPtr<ID3D12Resource> texture;
+    if (FAILED(device->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &textureDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        IID_PPV_ARGS(&texture)))) {
+        return nullptr;
+    }
+
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mipLevels);
+    std::vector<UINT> numRows(mipLevels);
+    std::vector<UINT64> rowSizes(mipLevels);
+    UINT64 uploadBufferSize = 0;
+    device->GetCopyableFootprints(&textureDesc, 0, mipLevels, 0,
+        footprints.data(), numRows.data(), rowSizes.data(), &uploadBufferSize);
+
+    D3D12_HEAP_PROPERTIES uploadHeapProps = {};
+    uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC uploadDesc = {};
+    uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadDesc.Width = uploadBufferSize;
+    uploadDesc.Height = 1;
+    uploadDesc.DepthOrArraySize = 1;
+    uploadDesc.MipLevels = 1;
+    uploadDesc.Format = DXGI_FORMAT_UNKNOWN;
+    uploadDesc.SampleDesc.Count = 1;
+    uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ComPtr<ID3D12Resource> uploadHeap;
+    if (FAILED(device->CreateCommittedResource(
+        &uploadHeapProps, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        IID_PPV_ARGS(&uploadHeap)))) {
+        return nullptr;
+    }
+    uploadHeaps.push_back(uploadHeap);
+
+    BYTE* pData;
+    uploadHeap->Map(0, nullptr, (void**)&pData);
+    for (UINT16 level = 0; level < mipLevels; ++level) {
+        const size_t srcRowBytes = (size_t)mipW[level] * 4 * sizeof(float);
+        BYTE* pDest = pData + footprints[level].Offset;
+        for (UINT row = 0; row < numRows[level]; ++row) {
+            memcpy(pDest + (size_t)row * footprints[level].Footprint.RowPitch,
+                (const BYTE*)mips[level].data() + (size_t)row * srcRowBytes,
+                srcRowBytes);
+        }
+    }
+    uploadHeap->Unmap(0, nullptr);
+
+    for (UINT16 level = 0; level < mipLevels; ++level) {
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource = texture.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = level;
+
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource = uploadHeap.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = footprints[level];
+
+        commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = texture.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    commandList->ResourceBarrier(1, &barrier);
+
+    return texture;
+}
+
+std::array<XMFLOAT3, 9> GLBImporter::ComputeSkyIrradianceSH(const std::string& filepath) {
+    std::array<XMFLOAT3, 9> coeffs{};
+    for (auto& c : coeffs) c = XMFLOAT3(0, 0, 0);
+
+    float* pixels = nullptr;
+    int width = 0, height = 0;
+    const char* err = nullptr;
+    int ret = LoadEXR(&pixels, &width, &height, filepath.c_str(), &err);
+    if (ret != TINYEXR_SUCCESS) {
+        std::cerr << "Failed to load EXR for sky SH: " << filepath
+                   << (err ? (std::string(" (") + err + ")") : "") << std::endl;
+        if (err) FreeEXRErrorMessage(err);
+        return coeffs;
+    }
+
+    // Real SH basis function values (unnormalized-direction form), L0-L2.
+    double sh[9];
+    double weightSum = 0.0;
+    double raw[9][3] = {};
+
+    for (int y = 0; y < height; ++y) {
+        // Equirectangular row -> polar angle theta in [0, pi]; sin(theta) is
+        // both the Jacobian for solid angle and the per-row sample weight.
+        double v = (y + 0.5) / height;
+        double theta = v * XM_PI;
+        double sinTheta = sin(theta);
+        double cosTheta = cos(theta);
+        if (sinTheta <= 0.0) continue;
+
+        for (int x = 0; x < width; ++x) {
+            double u = (x + 0.5) / width;
+            double phi = (u - 0.5) * 2.0 * XM_PI;
+
+            double dx = sinTheta * cos(phi);
+            double dz = sinTheta * sin(phi);
+            double dy = cosTheta;
+
+            const float* p = &pixels[((size_t)y * width + x) * 4];
+            double r = p[0], g = p[1], b = p[2];
+            if (!std::isfinite(r)) r = 0.0;
+            if (!std::isfinite(g)) g = 0.0;
+            if (!std::isfinite(b)) b = 0.0;
+
+            // L0
+            sh[0] = 0.282095;
+            // L1
+            sh[1] = 0.488603 * dy;
+            sh[2] = 0.488603 * dz;
+            sh[3] = 0.488603 * dx;
+            // L2
+            sh[4] = 1.092548 * dx * dy;
+            sh[5] = 1.092548 * dy * dz;
+            sh[6] = 0.315392 * (3.0 * dz * dz - 1.0);
+            sh[7] = 1.092548 * dx * dz;
+            sh[8] = 0.546274 * (dx * dx - dy * dy);
+
+            double weight = sinTheta;
+            for (int i = 0; i < 9; ++i) {
+                raw[i][0] += r * sh[i] * weight;
+                raw[i][1] += g * sh[i] * weight;
+                raw[i][2] += b * sh[i] * weight;
+            }
+            weightSum += weight;
+        }
+    }
+    free(pixels);
+
+    if (weightSum <= 0.0) return coeffs;
+
+    // Normalize so integrating sh[0] over the sphere reproduces the mean
+    // radiance, then fold in the cosine-lobe (Lambertian) convolution
+    // factors (A_l) so the shader only needs a flat dot product per band.
+    double normalization = (4.0 * XM_PI) / weightSum;
+    const double A[3] = { 1.0, 2.0 / 3.0, 1.0 / 4.0 };
+    const int bandOfCoeff[9] = { 0, 1, 1, 1, 2, 2, 2, 2, 2 };
+
+    for (int i = 0; i < 9; ++i) {
+        double scale = normalization * A[bandOfCoeff[i]];
+        coeffs[i] = XMFLOAT3(
+            (float)(raw[i][0] * scale),
+            (float)(raw[i][1] * scale),
+            (float)(raw[i][2] * scale));
+    }
+    return coeffs;
+}
+
 // Convert GLTF mesh to SceneMesh
 std::shared_ptr<SceneMesh> ProcessMesh(const tinygltf::Model& model, const tinygltf::Mesh& gltfMesh, ID3D12Device* device, const std::vector<std::shared_ptr<SceneMaterial>>& materials) {
     auto sceneMesh = std::make_shared<SceneMesh>();
@@ -471,6 +701,7 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLB(const std::string& filepath, Com
         }
         sceneMat->roughnessFactor = (float)mat.pbrMetallicRoughness.roughnessFactor;
         sceneMat->metallicFactor = (float)mat.pbrMetallicRoughness.metallicFactor;
+        sceneMat->doubleSided = mat.doubleSided;
 
         // Textures
         // Base Color
@@ -674,6 +905,89 @@ std::shared_ptr<SceneNode> GLBImporter::MergeSceneByMaterial(const std::shared_p
                     merged.ibv.Format = DXGI_FORMAT_R32_UINT;
                 }
             }
+
+            // meshoptimizer meshlets: 64 unique vertices, 124 triangles.
+            constexpr UINT MaxMeshletVertices = 64;
+            constexpr UINT MaxMeshletTriangles = 124;
+            std::vector<UINT> sourceIndices = merged.indices;
+            if (sourceIndices.empty()) {
+                sourceIndices.resize(merged.vertices.size() / 12);
+                for (UINT i = 0; i < sourceIndices.size(); ++i) sourceIndices[i] = i;
+            }
+            const size_t vertexCount = merged.vertices.size() / 12;
+            const size_t maxMeshlets = meshopt_buildMeshletsBound(
+                sourceIndices.size(), MaxMeshletVertices, MaxMeshletTriangles);
+            std::vector<meshopt_Meshlet> optimizedMeshlets(maxMeshlets);
+            // meshopt_buildMeshlets writes up to maxMeshlets * limit entries and pads
+            // each meshlet's triangle_offset to 4 bytes; index_count is too small.
+            std::vector<UINT> meshletVertexIndices(maxMeshlets * MaxMeshletVertices);
+            std::vector<unsigned char> meshletTriangleBytes(maxMeshlets * MaxMeshletTriangles * 3);
+            const size_t meshletCount = meshopt_buildMeshlets(
+                optimizedMeshlets.data(), meshletVertexIndices.data(), meshletTriangleBytes.data(),
+                sourceIndices.data(), sourceIndices.size(), merged.vertices.data(), vertexCount,
+                12 * sizeof(float), MaxMeshletVertices, MaxMeshletTriangles, 0.25f);
+            optimizedMeshlets.resize(meshletCount);
+            if (meshletCount > 0) {
+                const meshopt_Meshlet& last = optimizedMeshlets.back();
+                meshletVertexIndices.resize(last.vertex_offset + last.vertex_count);
+                meshletTriangleBytes.resize(last.triangle_offset + last.triangle_count * 3);
+            }
+
+            std::vector<MeshletDescDX12> meshlets;
+            std::vector<UINT> meshletTriangles;
+            std::vector<MeshletBoundsDX12> bounds;
+            meshlets.reserve(meshletCount);
+            bounds.reserve(meshletCount);
+            for (const meshopt_Meshlet& source : optimizedMeshlets) {
+                MeshletDescDX12 desc = {
+                    source.vertex_offset, source.vertex_count,
+                    (UINT)meshletTriangles.size(), source.triangle_count
+                };
+                meshlets.push_back(desc);
+                for (UINT triangle = 0; triangle < source.triangle_count; ++triangle) {
+                    const unsigned char* local = &meshletTriangleBytes[source.triangle_offset + triangle * 3];
+                    meshletTriangles.push_back(
+                        UINT(local[0]) | (UINT(local[1]) << 8) | (UINT(local[2]) << 16));
+                }
+
+                XMFLOAT3 boundsMin(FLT_MAX, FLT_MAX, FLT_MAX);
+                XMFLOAT3 boundsMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+                for (UINT i = 0; i < source.vertex_count; ++i) {
+                    UINT vertex = meshletVertexIndices[source.vertex_offset + i];
+                    const float* p = &merged.vertices[(size_t)vertex * 12];
+                    boundsMin.x = std::min(boundsMin.x, p[0]);
+                    boundsMin.y = std::min(boundsMin.y, p[1]);
+                    boundsMin.z = std::min(boundsMin.z, p[2]);
+                    boundsMax.x = std::max(boundsMax.x, p[0]);
+                    boundsMax.y = std::max(boundsMax.y, p[1]);
+                    boundsMax.z = std::max(boundsMax.z, p[2]);
+                }
+                meshopt_Bounds optimizedBounds = meshopt_computeMeshletBounds(
+                    &meshletVertexIndices[source.vertex_offset],
+                    &meshletTriangleBytes[source.triangle_offset], source.triangle_count,
+                    merged.vertices.data(), vertexCount, 12 * sizeof(float));
+                XMFLOAT3 center(optimizedBounds.center[0], optimizedBounds.center[1], optimizedBounds.center[2]);
+                XMFLOAT3 coneAxis(optimizedBounds.cone_axis[0], optimizedBounds.cone_axis[1], optimizedBounds.cone_axis[2]);
+                float coneCutoff = (merged.material && merged.material->doubleSided)
+                    ? -1.0f : optimizedBounds.cone_cutoff;
+                bounds.push_back({
+                    boundsMin, 0.0f, boundsMax, 0.0f,
+                    center, optimizedBounds.radius,
+                    coneAxis, coneCutoff
+                });
+            }
+
+            merged.meshletCount = (UINT)meshlets.size();
+            if (!meshlets.empty()) {
+                merged.meshletDescBuffer = CreateUploadBuffer(device.Get(), meshlets.data(),
+                    (UINT)(meshlets.size() * sizeof(MeshletDescDX12)));
+                merged.meshletVertexIndexBuffer = CreateUploadBuffer(device.Get(), meshletVertexIndices.data(),
+                    (UINT)(meshletVertexIndices.size() * sizeof(UINT)));
+                merged.meshletTriangleBuffer = CreateUploadBuffer(device.Get(), meshletTriangles.data(),
+                    (UINT)(meshletTriangles.size() * sizeof(UINT)));
+                merged.meshletBoundsBuffer = CreateUploadBuffer(device.Get(), bounds.data(),
+                    (UINT)(bounds.size() * sizeof(MeshletBoundsDX12)));
+            }
         }
 
         mergedMesh->primitives.push_back(std::move(merged));
@@ -689,4 +1003,3 @@ std::shared_ptr<SceneNode> GLBImporter::MergeSceneByMaterial(const std::shared_p
 
     return mergedRoot;
 }
-

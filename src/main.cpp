@@ -21,6 +21,9 @@
 #include "MipGenerator.h"
 #include "ShadowMapDX12.h"
 #include "MeshShaderDX12.h"
+#include "TerrainRendererDX12.h"
+#include "SkyRendererDX12.h"
+#include "OcclusionDepthDX12.h"
 
 using namespace DirectX;
 
@@ -32,6 +35,9 @@ static Scene               scene;
 static ShaderDX12           mainShader;
 MeshShaderDX12              g_meshShader;
 bool                        g_useMeshShader = false;
+TerrainRendererDX12         g_terrain;
+static SkyRendererDX12      skyRenderer;
+static OcclusionDepthDX12   occlusionDepth;
 static VisibilityBufferDX12 visBuffer;
 static ShadowMapDX12        shadowMap;
 static GeometryBuffers      geo;
@@ -190,6 +196,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 WaitForGPU();
                 SCR_WIDTH = w; SCR_HEIGHT = h;
                 ResizeDX12(SCR_WIDTH, SCR_HEIGHT);
+                if (occlusionDepth.initialized) occlusionDepth.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (visBuffer.initialized) visBuffer.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (g_rt.initialized) ResizeRaytracing(SCR_WIDTH, SCR_HEIGHT);
             }
@@ -274,6 +281,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         else if (wParam == 'C')    { cameraLocked = true; ReleaseCapture(); ShowCursor(TRUE); }
         else if (wParam == 'F')    { scene.camera.FPSMode = !scene.camera.FPSMode; }
+        // Bit 30 = key was already down (autorepeat); toggle once per press.
+        else if (wParam == 'Z' && !(lParam & 0x40000000)) {
+            scene.meshletWireframe = !scene.meshletWireframe;
+        }
         else if (wParam == VK_F11) { ToggleFullscreen(hwnd); }
         return 0;
 
@@ -359,9 +370,39 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         ? "Mesh shader path enabled\n"
         : "Mesh shader path unavailable; using raster fallback\n");
 
+    if (!g_useMeshShader || !g_terrain.Init(mainShader)) {
+        scene.useMeshTerrain = false;
+        std::cerr << "Mesh shader terrain unavailable; keeping flat floor\n";
+    }
+
     // Mip generator (compute shader) for imported GLB textures
     if (!g_mipGen.Init()) {
         std::cerr << "Mip generator init failed (non-fatal, textures will have no mips)\n";
+    }
+
+    // The command list is closed after InitDX12 and stays closed until the first
+    // BeginFrame(). skyRenderer.Init() records a CopyTextureRegion for the HDRI
+    // upload, so the list must be open while it runs and its work must be flushed
+    // (executed + waited) before the list is closed again - otherwise the copy
+    // never reaches the GPU and the sky texture stays black.
+    ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
+    ThrowIfFailed(g_dx12.commandList->Reset(g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
+    if (!skyRenderer.Init()) {
+        std::cerr << "HDRI sky init failed (non-fatal)\n";
+    }
+    ThrowIfFailed(g_dx12.commandList->Close());
+    {
+        ID3D12CommandList* skyLists[] = { g_dx12.commandList.Get() };
+        g_dx12.commandQueue->ExecuteCommandLists(1, skyLists);
+    }
+    WaitForGPU();
+    DumpDX12DebugMessages();
+    {
+        auto skySH = GLBImporter::ComputeSkyIrradianceSH("models/Skyboxes/sunny_rose_garden_2k.exr");
+        mainShader.SetSkyIrradiance(skySH, 1.0f);
+    }
+    if (!occlusionDepth.Init(SCR_WIDTH, SCR_HEIGHT)) {
+        std::cerr << "Meshlet occlusion depth init failed (non-fatal)\n";
     }
 
     // Visibility buffer (id Tech path)
@@ -408,6 +449,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         lastTime  = now;
 
         ProcessInput(hwnd);
+
+        // Walking collision: ground level follows the mesh-shader terrain at
+        // the camera's XZ so gravity settles the player onto the hills.
+        if (scene.useMeshTerrain && g_terrain.supported) {
+            TerrainRendererDX12::Params terrainParams;
+            terrainParams.heightScale = scene.terrainHeightScale;
+            scene.camera.FloorY = TerrainRendererDX12::HeightAt(
+                terrainParams, scene.camera.Position.x, scene.camera.Position.z);
+        } else {
+            scene.camera.FloorY = 0.0f;
+        }
+
         scene.Update(deltaTime, now);
 
         // ?? begin frame ??
@@ -416,8 +469,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         float cc[4] = { scene.clearColor.x, scene.clearColor.y, scene.clearColor.z, 1.0f };
         ClearRenderTarget(cc);
+        skyRenderer.Render(scene.camera, scene.cameraFOV, scene.lightPos, now);
 
         mainShader.BeginFrame();
+        g_meshShader.SetOcclusionDepth(
+            occlusionDepth.GetGPUHandle(), occlusionDepth.valid);
 
         if (!crateLoadAttempted) {
             crateLoadAttempted = true;
@@ -425,8 +481,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             std::cout << "Loading models/h2.glb...\n";
             crateModel = GLBImporter::LoadGLB("models/h2.glb", g_dx12.device, g_dx12.commandList);
             if (crateModel) {
+                if (auto merged = GLBImporter::MergeSceneByMaterial(crateModel, g_dx12.device)) {
+                    crateModel = merged;
+                }
                 crateModel->UpdateGlobalTransform(crateModel->localTransform);
-                std::cout << "h1 model loaded\n";
+                size_t materialDraws = crateModel->mesh ? crateModel->mesh->primitives.size() : 0;
+                std::cout << "h2 model loaded: " << materialDraws
+                          << " material draw(s)\n";
             } else {
                 std::cerr << "Failed to load h2.glb, falling back to procedural cube\n";
             }
@@ -467,6 +528,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             RenderForward(scene, mainShader, geo, crateModel, floorMaterial, lightSpace, shadowResource);
         }
+
+        // Preserve this frame's depth for next-frame amplification-shader
+        // occlusion tests before UI rendering changes descriptor heaps.
+        occlusionDepth.Capture(g_dx12.commandList.Get());
 
         // Ensure ImGui renders to the swapchain backbuffer (VB path changes OM target)
         {

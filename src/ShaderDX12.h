@@ -4,6 +4,7 @@
 #include "DX12Core.h"
 #include <fstream>
 #include <sstream>
+#include <array>
 
 // Constant buffer structures (must be 256-byte aligned for DX12)
 struct alignas(256) MatrixBufferDX12 {
@@ -80,11 +81,25 @@ struct alignas(256) DDGIBufferDX12 {
     float ddgiPadding[3];
 };
 
+// 9 L2 spherical-harmonic coefficients (RGB) approximating diffuse sky
+// irradiance from an equirectangular HDRI, cosine-lobe pre-convolved so the
+// shader evaluates them with a flat dot product. float4 padding keeps each
+// entry 16-byte aligned for HLSL cbuffer packing.
+struct alignas(256) SHBufferDX12 {
+    XMFLOAT4 shCoeffs[9];
+    float skyIntensity;
+    float shPadding[3];
+};
+
 struct alignas(256) MeshDrawBufferDX12 {
     UINT vertexCount;
     UINT indexCount;
     UINT indexed;
-    UINT firstCorner;
+    UINT firstMeshlet;
+    UINT meshletCount;
+    UINT occlusionEnabled;
+    UINT screenWidth;
+    UINT screenHeight;
 };
 
 // Upload buffer helper
@@ -171,6 +186,10 @@ public:
     UploadBuffer<CameraBufferDX12> cameraBuffer;
     UploadBuffer<PointLightsBufferDX12> pointLightsBuffer;
     UploadBuffer<DDGIBufferDX12> ddgiBuffer;
+    UploadBuffer<SHBufferDX12> shBuffer;
+    std::array<XMFLOAT3, 9> pendingSHCoeffs{};
+    float pendingSkyIntensity = 1.0f;
+    bool skyIrradianceValid = false;
     
     // Current draw call index within frame
     UINT currentDrawCall = 0;
@@ -244,7 +263,7 @@ public:
         // 6: Descriptor table - Global SRVs (t0, t2, t3)
         // 7: Descriptor table - Material SRVs (t1, t4, t5)
         
-        D3D12_ROOT_PARAMETER rootParams[11] = {};
+        D3D12_ROOT_PARAMETER rootParams[16] = {};
         
         // CBVs (root descriptors)
         for (int i = 0; i < 6; i++) {
@@ -310,15 +329,39 @@ public:
         rootParams[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         rootParams[8].Constants.ShaderRegister = 6;
         rootParams[8].Constants.RegisterSpace = 0;
-        rootParams[8].Constants.Num32BitValues = 4;
-        rootParams[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
+        rootParams[8].Constants.Num32BitValues = 8;
+        rootParams[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         rootParams[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[9].Descriptor.ShaderRegister = 6;
-        rootParams[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
+        rootParams[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         rootParams[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[10].Descriptor.ShaderRegister = 7;
-        rootParams[10].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
-        
+        rootParams[10].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rootParams[11].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParams[11].Descriptor.ShaderRegister = 8;
+        rootParams[11].ShaderVisibility = D3D12_SHADER_VISIBILITY_AMPLIFICATION;
+        D3D12_DESCRIPTOR_RANGE occlusionRange = {};
+        occlusionRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        occlusionRange.NumDescriptors = 1;
+        occlusionRange.BaseShaderRegister = 9;
+        occlusionRange.OffsetInDescriptorsFromTableStart = 0;
+        rootParams[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParams[12].DescriptorTable.NumDescriptorRanges = 1;
+        rootParams[12].DescriptorTable.pDescriptorRanges = &occlusionRange;
+        rootParams[12].ShaderVisibility = D3D12_SHADER_VISIBILITY_AMPLIFICATION;
+        rootParams[13].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParams[13].Descriptor.ShaderRegister = 10;
+        rootParams[13].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
+        rootParams[14].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParams[14].Descriptor.ShaderRegister = 11;
+        rootParams[14].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
+
+        // Sky irradiance SH coefficients (b7) - diffuse IBL ambient term
+        rootParams[15].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        rootParams[15].Descriptor.ShaderRegister = 7;
+        rootParams[15].Descriptor.RegisterSpace = 0;
+        rootParams[15].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
         // Static samplers
         D3D12_STATIC_SAMPLER_DESC staticSamplers[2] = {};
         
@@ -350,7 +393,7 @@ public:
         staticSamplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        rootSigDesc.NumParameters = 11;
+        rootSigDesc.NumParameters = 16;
         rootSigDesc.pParameters = rootParams;
         rootSigDesc.NumStaticSamplers = 2;
         rootSigDesc.pStaticSamplers = staticSamplers;
@@ -442,6 +485,7 @@ public:
         if (!cameraBuffer.Create(FRAME_COUNT)) return false;
         if (!pointLightsBuffer.Create(FRAME_COUNT)) return false;
         if (!ddgiBuffer.Create(FRAME_COUNT)) return false;
+        if (!shBuffer.Create(FRAME_COUNT)) return false;
         
         loaded = true;
         return true;
@@ -449,7 +493,10 @@ public:
     
     void Use(bool wireframe = false) {
         if (!loaded) return;
-        
+        ID3D12DescriptorHeap* heaps[] = {
+            g_dx12.cbvSrvUavHeap.Get(), g_dx12.samplerHeap.Get()
+        };
+        g_dx12.commandList->SetDescriptorHeaps(2, heaps);
         g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
         g_dx12.commandList->SetPipelineState(wireframe ? wireframePipelineState.Get() : pipelineState.Get());
     }
@@ -510,6 +557,7 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(2, cameraBuffer.GetGPUAddress(g_dx12.frameIndex));
         g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
         g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
     
     void SetLight(const XMFLOAT3& pos, int type, const XMFLOAT3& color, 
@@ -662,6 +710,26 @@ public:
         data.ddgiEnabled = enabled ? 1 : 0;
         ddgiBuffer.CopyData(g_dx12.frameIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
+    }
+
+    // Stores the SH coefficients computed once at load from the sky HDRI.
+    // Cheap to call once; SetSH() re-uploads per-frame like the other
+    // per-frame CBVs since the upload buffer is double/triple-buffered.
+    void SetSkyIrradiance(const std::array<XMFLOAT3, 9>& coeffs, float intensity) {
+        pendingSHCoeffs = coeffs;
+        pendingSkyIntensity = intensity;
+        skyIrradianceValid = true;
+    }
+
+    void SetSH() {
+        SHBufferDX12 data = {};
+        for (int i = 0; i < 9; i++) {
+            const XMFLOAT3& c = pendingSHCoeffs[i];
+            data.shCoeffs[i] = XMFLOAT4(c.x, c.y, c.z, 0.0f);
+        }
+        data.skyIntensity = skyIrradianceValid ? pendingSkyIntensity : 0.0f;
+        shBuffer.CopyData(g_dx12.frameIndex, data);
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
 };
 
