@@ -605,6 +605,41 @@ void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float rad
     std::cout << "Blast hit: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
 }
 
+bool DestructionDX12::ApplyImpulse(const XMFLOAT3& worldPosition,
+                                   const XMFLOAT3& worldDirection,
+                                   float impulseStrength, float hitRadius) {
+    if (!m->initialized || impulseStrength <= 0.0f) return false;
+    Impl::ActorRuntime* closestActor = nullptr;
+    float closestDistanceSquared = FLT_MAX;
+    for (auto& runtime : m->actors) {
+        if (!runtime->dynamic || B3_IS_NULL(runtime->body)) continue;
+        const b3Vec3 local = b3Body_GetLocalPoint(runtime->body,
+            { worldPosition.x, worldPosition.y, worldPosition.z });
+        const XMFLOAT3 modelPoint(local.x + runtime->center.x,
+                                  local.y + runtime->center.y,
+                                  local.z + runtime->center.z);
+        for (uint32_t chunkIndex : runtime->chunks) {
+            const Impl::Chunk& chunk = m->chunks[chunkIndex];
+            const float x = std::max(chunk.minimum.x, std::min(modelPoint.x, chunk.maximum.x));
+            const float y = std::max(chunk.minimum.y, std::min(modelPoint.y, chunk.maximum.y));
+            const float z = std::max(chunk.minimum.z, std::min(modelPoint.z, chunk.maximum.z));
+            const float dx = modelPoint.x - x, dy = modelPoint.y - y, dz = modelPoint.z - z;
+            const float distanceSquared = dx * dx + dy * dy + dz * dz;
+            if (distanceSquared < closestDistanceSquared) {
+                closestDistanceSquared = distanceSquared;
+                closestActor = runtime.get();
+            }
+        }
+    }
+    if (!closestActor || closestDistanceSquared > hitRadius * hitRadius) return false;
+    XMVECTOR direction = XMVector3Normalize(XMLoadFloat3(&worldDirection));
+    XMFLOAT3 impulse;
+    XMStoreFloat3(&impulse, direction * impulseStrength);
+    b3Body_ApplyLinearImpulse(closestActor->body, { impulse.x, impulse.y, impulse.z },
+        { worldPosition.x, worldPosition.y, worldPosition.z }, true);
+    return true;
+}
+
 void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
     for (uint32_t e = 0; e < eventCount; ++e) {
         if (events[e].type != TkEvent::Split) continue;
