@@ -104,15 +104,30 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     primitive.material->roughnessFactor = 0.72f;
 
     auto addFace = [&](const XMFLOAT3& normal, const std::array<XMFLOAT3, 4>& points) {
-        const UINT base = (UINT)(primitive.vertices.size() / 12);
-        const XMFLOAT2 uv[4] = { {0,1}, {1,1}, {1,0}, {0,0} };
-        for (int i = 0; i < 4; ++i) {
-            const float vertex[12] = { points[i].x, points[i].y, points[i].z,
-                normal.x, normal.y, normal.z, uv[i].x, uv[i].y, 1, 0, 0, 1 };
-            primitive.vertices.insert(primitive.vertices.end(), vertex, vertex + 12);
+        // Dense face tessellation keeps fracture-cell ownership local. Large
+        // two-triangle faces crossed grid boundaries and flew with wrong chunk.
+        constexpr int subdivisions = 8;
+        auto bilerp = [&](float u, float v) {
+            XMFLOAT3 p;
+            p.x = (1-v)*((1-u)*points[0].x + u*points[1].x) + v*((1-u)*points[3].x + u*points[2].x);
+            p.y = (1-v)*((1-u)*points[0].y + u*points[1].y) + v*((1-u)*points[3].y + u*points[2].y);
+            p.z = (1-v)*((1-u)*points[0].z + u*points[1].z) + v*((1-u)*points[3].z + u*points[2].z);
+            return p;
+        };
+        for (int y = 0; y < subdivisions; ++y) for (int x = 0; x < subdivisions; ++x) {
+            const float u0 = (float)x / subdivisions, u1 = (float)(x + 1) / subdivisions;
+            const float v0 = (float)y / subdivisions, v1 = (float)(y + 1) / subdivisions;
+            const XMFLOAT3 quad[4] = { bilerp(u0,v0), bilerp(u1,v0), bilerp(u1,v1), bilerp(u0,v1) };
+            const XMFLOAT2 uv[4] = { {u0,1-v0}, {u1,1-v0}, {u1,1-v1}, {u0,1-v1} };
+            const UINT base = (UINT)(primitive.vertices.size() / 12);
+            for (int i = 0; i < 4; ++i) {
+                const float vertex[12] = { quad[i].x, quad[i].y, quad[i].z,
+                    normal.x, normal.y, normal.z, uv[i].x, uv[i].y, 1, 0, 0, 1 };
+                primitive.vertices.insert(primitive.vertices.end(), vertex, vertex + 12);
+            }
+            const UINT faceIndices[6] = { base, base + 1, base + 2, base, base + 2, base + 3 };
+            primitive.indices.insert(primitive.indices.end(), faceIndices, faceIndices + 6);
         }
-        const UINT faceIndices[6] = { base, base + 1, base + 2, base, base + 2, base + 3 };
-        primitive.indices.insert(primitive.indices.end(), faceIndices, faceIndices + 6);
     };
     auto addBrick = [&](float cx, float cy, float cz, float hx, float hy, float hz) {
         addFace({0,0,1},  {{{cx-hx,cy-hy,cz+hz},{cx+hx,cy-hy,cz+hz},{cx+hx,cy+hy,cz+hz},{cx-hx,cy+hy,cz+hz}}});
@@ -129,7 +144,7 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
         for (int x = 0; x < columns; ++x) {
             addBrick(6.5f + (x - (columns - 1) * 0.5f) * brickWidth,
                      0.12f + (y + 0.5f) * brickHeight, 2.5f,
-                     brickWidth * 0.5f, brickHeight * 0.5f, 0.32f);
+                     brickWidth * 0.4995f, brickHeight * 0.4995f, 0.32f);
         }
     }
     root->mesh->primitives.push_back(std::move(primitive));
