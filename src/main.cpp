@@ -98,10 +98,10 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     root->mesh = std::make_shared<SceneMesh>();
     MeshPrimitive primitive;
     primitive.material = std::make_shared<SceneMaterial>();
-    primitive.material->name = "BrickWall";
-    primitive.material->baseColorFactor = XMFLOAT4(0.62f, 0.22f, 0.12f, 1.0f);
+    primitive.material->name = "SolidWhiteWall";
+    primitive.material->baseColorFactor = XMFLOAT4(0.96f, 0.96f, 0.96f, 1.0f);
     primitive.material->metallicFactor = 0.0f;
-    primitive.material->roughnessFactor = 0.9f;
+    primitive.material->roughnessFactor = 0.72f;
 
     auto addFace = [&](const XMFLOAT3& normal, const std::array<XMFLOAT3, 4>& points) {
         const UINT base = (UINT)(primitive.vertices.size() / 12);
@@ -126,11 +126,10 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     constexpr int columns = 6, rows = 4;
     constexpr float brickWidth = 1.15f, brickHeight = 0.85f;
     for (int y = 0; y < rows; ++y) {
-        const float offset = (y & 1) ? brickWidth * 0.25f : 0.0f;
         for (int x = 0; x < columns; ++x) {
-            addBrick(6.5f + (x - (columns - 1) * 0.5f) * brickWidth + offset,
+            addBrick(6.5f + (x - (columns - 1) * 0.5f) * brickWidth,
                      0.12f + (y + 0.5f) * brickHeight, 2.5f,
-                     brickWidth * 0.46f, brickHeight * 0.46f, 0.32f);
+                     brickWidth * 0.5f, brickHeight * 0.5f, 0.32f);
         }
     }
     root->mesh->primitives.push_back(std::move(primitive));
