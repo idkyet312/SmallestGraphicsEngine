@@ -24,6 +24,7 @@
 #include "TerrainRendererDX12.h"
 #include "SkyRendererDX12.h"
 #include "OcclusionDepthDX12.h"
+#include "DestructionDX12.h"
 
 using namespace DirectX;
 
@@ -36,6 +37,7 @@ static ShaderDX12           mainShader;
 MeshShaderDX12              g_meshShader;
 bool                        g_useMeshShader = false;
 TerrainRendererDX12         g_terrain;
+DestructionDX12             g_destruction;
 static SkyRendererDX12      skyRenderer;
 static OcclusionDepthDX12   occlusionDepth;
 static VisibilityBufferDX12 visBuffer;
@@ -463,6 +465,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         scene.Update(deltaTime, now);
 
+        if (scene.rebuildDestructionRequested && crateModel) {
+            scene.rebuildDestructionRequested = false;
+            g_destruction.Initialize(crateModel, g_dx12.device.Get(),
+                scene.destructionGridX, scene.destructionGridY, scene.destructionGridZ);
+        }
+        if (scene.useDestruction && g_destruction.IsInitialized()) {
+            g_destruction.Update(deltaTime);
+            for (auto& projectile : scene.projectiles) {
+                if (!projectile.active) continue;
+                XMFLOAT3 hit;
+                if (g_destruction.HitTestSegment(projectile.previousPosition, projectile.position,
+                                                 scene.projectileScale * 2.5f, hit)) {
+                    g_destruction.ApplyRadialDamage(hit, scene.destructionDamageRadius,
+                                                    scene.destructionDamage);
+                    projectile.active = false;
+                }
+            }
+        }
+
         // ?? begin frame ??
         try { BeginFrame(); }
         catch (const std::exception& e) { std::cerr << "BeginFrame: " << e.what() << "\n"; break; }
@@ -485,6 +506,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     crateModel = merged;
                 }
                 crateModel->UpdateGlobalTransform(crateModel->localTransform);
+                if (scene.useDestruction) {
+                    g_destruction.Initialize(crateModel, g_dx12.device.Get(),
+                        scene.destructionGridX, scene.destructionGridY, scene.destructionGridZ);
+                }
                 size_t materialDraws = crateModel->mesh ? crateModel->mesh->primitives.size() : 0;
                 std::cout << "h2 model loaded: " << materialDraws
                           << " material draw(s)\n";
@@ -523,7 +548,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
-                lightSpace = shadowMap.Render(scene, geo, crateModel);
+                lightSpace = shadowMap.Render(scene, geo,
+                    g_destruction.IsInitialized() ? nullptr : crateModel);
                 shadowResource = shadowMap.GetResource();
             }
             RenderForward(scene, mainShader, geo, crateModel, floorMaterial, lightSpace, shadowResource);
@@ -563,7 +589,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
+    g_destruction.Shutdown();
     CleanupDX12();
     return (int)msg.wParam;
 }
-

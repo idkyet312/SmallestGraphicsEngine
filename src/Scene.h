@@ -28,6 +28,7 @@ struct SceneObject {
 
 struct Projectile {
     XMFLOAT3 position;
+    XMFLOAT3 previousPosition;
     XMFLOAT3 direction;
     float    speed;
     float    lifetime;
@@ -89,6 +90,15 @@ struct Scene {
     float projectileLifetime = 3.0f;
     XMFLOAT3 projectileColor = { 1.0f, 0.8f, 0.0f };
     float projectileScale    = 0.1f;
+
+    // NVIDIA Blast + Box3D destructible house
+    bool  useDestruction = true;
+    int   destructionGridX = 4;
+    int   destructionGridY = 3;
+    int   destructionGridZ = 4;
+    float destructionDamageRadius = 1.75f;
+    float destructionDamage = 2.0f;
+    bool  rebuildDestructionRequested = false;
 
     // Clustered renderer
     ClusteredRendererDX12 clusteredRenderer;
@@ -181,6 +191,7 @@ struct Scene {
         // Projectiles
         for (auto& p : projectiles) {
             if (!p.active) continue;
+            p.previousPosition = p.position;
             p.position.x += p.direction.x * p.speed * dt;
             p.position.y += p.direction.y * p.speed * dt;
             p.position.z += p.direction.z * p.speed * dt;
@@ -196,6 +207,7 @@ struct Scene {
     void ShootProjectile() {
         Projectile p;
         p.position  = camera.Position;
+        p.previousPosition = p.position;
         p.direction = camera.Front;
         p.speed     = projectileSpeed;
         p.lifetime  = projectileLifetime;

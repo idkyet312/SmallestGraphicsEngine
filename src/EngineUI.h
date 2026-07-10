@@ -4,6 +4,7 @@
 #include <imgui.h>
 #include "Scene.h"
 #include "VisibilityBufferDX12.h"
+#include "DestructionDX12.h"
 
 // Forward declare raytracing context
 struct RaytracingContext;
@@ -156,6 +157,17 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat3("Offset",    &scene.gun.offset.x,   0.01f);
         ImGui::DragFloat3("Scale##gun",&scene.gun.scale.x,     0.01f);
         ImGui::DragFloat3("Rot##gun",  &scene.gun.rotation.x,  1.0f);
+    }
+
+    if (ImGui::CollapsingHeader("Destruction", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Enable Blast House", &scene.useDestruction);
+        ImGui::SliderInt("Grid X", &scene.destructionGridX, 1, 8);
+        ImGui::SliderInt("Grid Y", &scene.destructionGridY, 1, 8);
+        ImGui::SliderInt("Grid Z", &scene.destructionGridZ, 1, 8);
+        ImGui::DragFloat("Damage Radius", &scene.destructionDamageRadius, 0.1f, 0.25f, 8.0f);
+        ImGui::DragFloat("Damage", &scene.destructionDamage, 0.1f, 0.1f, 10.0f);
+        ImGui::Text("Chunks: %u  Actors: %u", g_destruction.GetChunkCount(), g_destruction.GetActorCount());
+        if (ImGui::Button("Reset / Refracture")) scene.rebuildDestructionRequested = true;
     }
 
     ImGui::Separator();

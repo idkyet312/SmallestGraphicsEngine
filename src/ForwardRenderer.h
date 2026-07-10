@@ -10,6 +10,7 @@
 #include "SceneGraph.h"
 #include "MeshShaderDX12.h"
 #include "TerrainRendererDX12.h"
+#include "DestructionDX12.h"
 
 extern MeshShaderDX12 g_meshShader;
 extern bool g_useMeshShader;
@@ -202,7 +203,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Cube 1 - draw the imported model if loaded, else fall back to the procedural cube.
     // The model is its own multi-meter scene (not a unit cube), so place it directly
     // on the floor at the origin rather than reusing cube1's small transform.
-    if (crateModel) {
+    if (scene.useDestruction && g_destruction.IsInitialized()) {
+        for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
+            DrawSceneNode(item.node, shader, XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
+        }
+        shader.Use(scene.wireframeMode);
+    } else if (crateModel) {
         DrawSceneNode(crateModel, shader, XMMatrixIdentity(), view, proj, lightSpace);
         // Imported model used the mesh pipeline. Restore IA pipeline for
         // procedural objects that follow it.
