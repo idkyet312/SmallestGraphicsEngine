@@ -128,6 +128,7 @@ struct DestructionDX12::Impl {
         XMFLOAT3 minimum = {};
         XMFLOAT3 maximum = {};
         XMFLOAT3 center = {};
+        std::vector<XMFLOAT3> collisionPoints;
         int x = 0, y = 0, z = 0;
     };
 
@@ -166,7 +167,54 @@ struct DestructionDX12::Impl {
     bool initialized = false;
 
     bool BuildChunks() {
-        if (!source || !source->mesh || !device) return false;
+        if (!source || !device) return false;
+
+        // Procedural Voronoi wall supplies one closed convex-prism child per
+        // fracture chunk. Preserve those exact touching cells instead of
+        // repartitioning their triangles through the regular grid.
+        if (!source->children.empty()) {
+            uint32_t chunkIndex = 0;
+            for (const auto& sourceChunk : source->children) {
+                if (!sourceChunk || !sourceChunk->mesh) continue;
+                Chunk chunk;
+                chunk.x = (int)(chunkIndex % (uint32_t)gridX);
+                chunk.y = (int)((chunkIndex / (uint32_t)gridX) % (uint32_t)gridY);
+                chunk.z = (int)(chunkIndex / (uint32_t)(gridX * gridY));
+                chunk.minimum = { FLT_MAX, FLT_MAX, FLT_MAX };
+                chunk.maximum = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+                chunk.node = std::make_shared<SceneNode>("VoronoiChunk");
+                chunk.node->mesh = std::make_shared<SceneMesh>();
+                for (const MeshPrimitive& sourcePrimitive : sourceChunk->mesh->primitives) {
+                    if (sourcePrimitive.indices.empty()) continue;
+                    MeshPrimitive primitive;
+                    primitive.vertices = sourcePrimitive.vertices;
+                    primitive.indices = sourcePrimitive.indices;
+                    primitive.material = sourcePrimitive.material;
+                    primitive.materialIndex = sourcePrimitive.materialIndex;
+                    for (size_t v = 0; v + 11 < primitive.vertices.size(); v += 12) {
+                        chunk.minimum.x = std::min(chunk.minimum.x, primitive.vertices[v]);
+                        chunk.minimum.y = std::min(chunk.minimum.y, primitive.vertices[v + 1]);
+                        chunk.minimum.z = std::min(chunk.minimum.z, primitive.vertices[v + 2]);
+                        chunk.maximum.x = std::max(chunk.maximum.x, primitive.vertices[v]);
+                        chunk.maximum.y = std::max(chunk.maximum.y, primitive.vertices[v + 1]);
+                        chunk.maximum.z = std::max(chunk.maximum.z, primitive.vertices[v + 2]);
+                        chunk.collisionPoints.push_back({ primitive.vertices[v],
+                            primitive.vertices[v + 1], primitive.vertices[v + 2] });
+                    }
+                    if (!GLBImporter::BuildMeshletData(primitive, device)) return false;
+                    chunk.node->mesh->primitives.push_back(std::move(primitive));
+                }
+                if (chunk.minimum.x == FLT_MAX) continue;
+                chunk.center = { (chunk.minimum.x + chunk.maximum.x) * 0.5f,
+                                 (chunk.minimum.y + chunk.maximum.y) * 0.5f,
+                                 (chunk.minimum.z + chunk.maximum.z) * 0.5f };
+                chunks.push_back(std::move(chunk));
+                ++chunkIndex;
+            }
+            return !chunks.empty();
+        }
+
+        if (!source->mesh) return false;
         XMFLOAT3 sceneMin(FLT_MAX, FLT_MAX, FLT_MAX);
         XMFLOAT3 sceneMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
         for (const MeshPrimitive& primitive : source->mesh->primitives) {
@@ -372,6 +420,21 @@ struct DestructionDX12::Impl {
         shapeDef.baseMaterial.restitution = 0.05f;
         for (uint32_t index : runtime.chunks) {
             const Chunk& chunk = chunks[index];
+            if (!chunk.collisionPoints.empty()) {
+                std::vector<b3Vec3> points;
+                points.reserve(chunk.collisionPoints.size());
+                for (const XMFLOAT3& point : chunk.collisionPoints) {
+                    points.push_back({ point.x - runtime.center.x,
+                                       point.y - runtime.center.y,
+                                       point.z - runtime.center.z });
+                }
+                b3HullData* hull = b3CreateHull(points.data(), (int)points.size(), 16);
+                if (hull) {
+                    b3CreateHullShape(runtime.body, &shapeDef, hull);
+                    b3DestroyHull(hull);
+                    continue;
+                }
+            }
             const float hx = std::max(0.05f, (chunk.maximum.x - chunk.minimum.x) * 0.48f);
             const float hy = std::max(0.05f, (chunk.maximum.y - chunk.minimum.y) * 0.48f);
             const float hz = std::max(0.05f, (chunk.maximum.z - chunk.minimum.z) * 0.48f);
