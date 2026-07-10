@@ -203,12 +203,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Cube 1 - draw the imported model if loaded, else fall back to the procedural cube.
     // The model is its own multi-meter scene (not a unit cube), so place it directly
     // on the floor at the origin rather than reusing cube1's small transform.
-    if (scene.useDestruction && g_destruction.IsInitialized()) {
-        for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
-            DrawSceneNode(item.node, shader, XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
-        }
-        shader.Use(scene.wireframeMode);
-    } else if (crateModel) {
+    if (crateModel) {
         DrawSceneNode(crateModel, shader, XMMatrixIdentity(), view, proj, lightSpace);
         // Imported model used the mesh pipeline. Restore IA pipeline for
         // procedural objects that follow it.
@@ -219,6 +214,14 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.SetObjectColor(scene.cube1.color);
         DrawCube(geo);
         shader.NextDrawCall();
+    }
+
+    // Separate destructible brick wall beside the house.
+    if (scene.useDestruction && g_destruction.IsInitialized()) {
+        for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
+            DrawSceneNode(item.node, shader, XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
+        }
+        shader.Use(scene.wireframeMode);
     }
 
     // Cube 2
