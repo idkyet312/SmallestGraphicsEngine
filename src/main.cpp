@@ -7,6 +7,9 @@
 #include <filesystem>
 #include <array>
 #include <cfloat>
+#include <cmath>
+#include <cstdint>
+#include <unordered_map>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx12.h>
@@ -101,6 +104,136 @@ static void LoadFloorMudMaterial() {
 // than a uniform Voronoi field. Each plank/beam is one child chunk, so a hit
 // snaps that board loose along its true edges. Grid coords (x,y,z) drive
 // Blast's adjacency bonding, so touching boards stay welded until struck.
+// ?? procedural material textures for the destructible house ?????????????????
+namespace HouseTex {
+// Cheap hash-based value noise in [0,1].
+inline float Hash(int x, int y) {
+    uint32_t h = (uint32_t)(x * 374761393 + y * 668265263);
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return ((h ^ (h >> 16)) & 0xFFFFFF) / (float)0xFFFFFF;
+}
+inline float ValueNoise(float x, float y) {
+    const int xi = (int)std::floor(x), yi = (int)std::floor(y);
+    const float fx = x - xi, fy = y - yi;
+    const float sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+    const float a = Hash(xi, yi), b = Hash(xi + 1, yi);
+    const float c = Hash(xi, yi + 1), d = Hash(xi + 1, yi + 1);
+    return (a + (b - a) * sx) + ((c + (d - c) * sx) - (a + (b - a) * sx)) * sy;
+}
+inline float Fbm(float x, float y) {
+    float sum = 0, amp = 0.5f, freq = 1;
+    for (int o = 0; o < 4; ++o) { sum += ValueNoise(x * freq, y * freq) * amp; freq *= 2; amp *= 0.5f; }
+    return sum;
+}
+inline unsigned char ToByte(float v) { return (unsigned char)std::max(0.0f, std::min(255.0f, v * 255.0f + 0.5f)); }
+
+// Wood: vertical grain lines along V with warped rings and knots.
+inline std::vector<unsigned char> Wood(int size, XMFLOAT3 base, XMFLOAT3 dark) {
+    std::vector<unsigned char> px((size_t)size * size * 4);
+    for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+        const float u = (float)x / size, v = (float)y / size;
+        const float warp = Fbm(u * 3.0f, v * 12.0f) * 0.35f;
+        float grain = std::sin((u * 18.0f + warp) * 3.14159f);
+        grain = 0.5f + 0.5f * grain * grain;                 // sharpen streaks
+        grain = grain * 0.7f + Fbm(u * 40.0f, v * 6.0f) * 0.3f;
+        const float t = std::min(1.0f, grain);
+        const size_t i = ((size_t)y * size + x) * 4;
+        px[i + 0] = ToByte(dark.x + (base.x - dark.x) * t);
+        px[i + 1] = ToByte(dark.y + (base.y - dark.y) * t);
+        px[i + 2] = ToByte(dark.z + (base.z - dark.z) * t);
+        px[i + 3] = 255;
+    }
+    return px;
+}
+// Stone: blocky mortar grid with speckled fill.
+inline std::vector<unsigned char> Stone(int size, XMFLOAT3 base, XMFLOAT3 mortar) {
+    std::vector<unsigned char> px((size_t)size * size * 4);
+    for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+        const float u = (float)x / size * 4.0f, v = (float)y / size * 4.0f;
+        const float bx = u - std::floor(u), by = v - std::floor(v);
+        const float mortarLine = std::min(std::min(bx, 1 - bx), std::min(by, 1 - by));
+        const float m = mortarLine < 0.06f ? 0.0f : 1.0f;
+        const float speck = 0.6f + 0.4f * Fbm(u * 8.0f, v * 8.0f);
+        const XMFLOAT3 c = { base.x * speck, base.y * speck, base.z * speck };
+        const size_t i = ((size_t)y * size + x) * 4;
+        px[i + 0] = ToByte(mortar.x + (c.x - mortar.x) * m);
+        px[i + 1] = ToByte(mortar.y + (c.y - mortar.y) * m);
+        px[i + 2] = ToByte(mortar.z + (c.z - mortar.z) * m);
+        px[i + 3] = 255;
+    }
+    return px;
+}
+// Shingles: overlapping horizontal rows, staggered, with edge shadow.
+inline std::vector<unsigned char> Shingle(int size, XMFLOAT3 base, XMFLOAT3 dark) {
+    std::vector<unsigned char> px((size_t)size * size * 4);
+    for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+        const float u = (float)x / size, v = (float)y / size;
+        const float row = v * 10.0f;
+        const int ri = (int)std::floor(row);
+        const float rf = row - ri;
+        const float offset = (ri & 1) ? 0.5f : 0.0f;
+        const float col = (u * 8.0f + offset);
+        const float cf = col - std::floor(col);
+        float shade = 1.0f - rf * 0.35f;                     // top-lit row
+        if (cf < 0.04f || rf > 0.94f) shade *= 0.55f;         // shingle gaps
+        shade *= 0.85f + 0.15f * Fbm(u * 20.0f, v * 20.0f);
+        const size_t i = ((size_t)y * size + x) * 4;
+        px[i + 0] = ToByte(dark.x + (base.x - dark.x) * shade);
+        px[i + 1] = ToByte(dark.y + (base.y - dark.y) * shade);
+        px[i + 2] = ToByte(dark.z + (base.z - dark.z) * shade);
+        px[i + 3] = 255;
+    }
+    return px;
+}
+}  // namespace HouseTex
+
+// Assigns downloaded CC0 albedo textures (ambientCG, models/house_pbr) to the
+// house's shared materials by name, falling back to procedurally generated
+// wood/stone/shingle when a file is missing. Call after building the house,
+// while a command list is open for the texture uploads.
+static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
+                               ID3D12Device* device, ID3D12GraphicsCommandList* cmdList) {
+    if (!house) return;
+    constexpr int kSize = 256;
+    // Collect the unique materials by name from the house children.
+    std::unordered_map<std::string, std::shared_ptr<SceneMaterial>> mats;
+    for (const auto& child : house->children) {
+        if (!child || !child->mesh) continue;
+        for (const auto& prim : child->mesh->primitives)
+            if (prim.material) mats[prim.material->name] = prim.material;
+    }
+    // Load the downloaded albedo + normal maps. Albedo falls back to the
+    // procedural texture so the house never renders untextured; the normal map
+    // is optional (skipped if the file is absent).
+    auto assign = [&](const char* name, const std::string& base, std::vector<unsigned char> fallback) {
+        auto it = mats.find(name);
+        if (it == mats.end()) return;
+        auto& mat = it->second;
+        mat->baseColorTexture = GLBImporter::LoadTextureFromFile(base + ".jpg", device, cmdList, mat->uploadHeaps);
+        if (!mat->baseColorTexture) {
+            mat->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
+                device, cmdList, fallback, kSize, kSize, mat->uploadHeaps);
+        }
+        if (mat->baseColorTexture) mat->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
+        mat->normalTexture = GLBImporter::LoadTextureFromFile(base + "_normal.jpg", device, cmdList, mat->uploadHeaps);
+        // Roughness map: grayscale JPG whose G channel the shader reads as
+        // roughness (glTF metallic-roughness convention). Metal stays 0.
+        mat->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
+            base + "_roughness.jpg", device, cmdList, mat->uploadHeaps);
+        if (mat->metallicRoughnessTexture) { mat->metallicFactor = 0.0f; mat->roughnessFactor = 1.0f; }
+    };
+    assign("Foundation", "models/house_pbr/foundation_brick",
+           HouseTex::Stone(kSize, { 0.62f, 0.62f, 0.64f }, { 0.34f, 0.34f, 0.36f }));
+    assign("Stud", "models/house_pbr/stud_wood",
+           HouseTex::Wood(kSize, { 0.60f, 0.42f, 0.25f }, { 0.34f, 0.22f, 0.12f }));
+    // Cladding uses the single-board wood (not the multi-plank field) so the
+    // grain reads as real boards when tiled.
+    assign("Cladding", "models/house_pbr/stud_wood",
+           HouseTex::Wood(kSize, { 0.84f, 0.68f, 0.46f }, { 0.55f, 0.40f, 0.24f }));
+    assign("Roof", "models/house_pbr/roof_tiles",
+           HouseTex::Shingle(kSize, { 0.52f, 0.26f, 0.20f }, { 0.26f, 0.12f, 0.10f }));
+}
+
 // Basic modular destructible house built from real structural pieces: a
 // foundation slab and floor, four walls made of vertical studs + cladding,
 // door/window openings, and a two-slope roof of rafters + sheets. Each piece
@@ -114,7 +247,6 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     constexpr float minZ = 1.0f, maxZ = 6.0f;    // depth
     constexpr float floorY = 0.0f, wallTop = 3.4f;
     constexpr float wall = 0.28f;                // wall / slab thickness
-    const float uvSpanX = maxX - minX, uvSpanY = wallTop - floorY;
 
     auto root = std::make_shared<SceneNode>("DestructibleHouse");
     auto matFoundation = std::make_shared<SceneMaterial>();
@@ -134,21 +266,48 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     matRoof->baseColorFactor = XMFLOAT4(0.45f, 0.22f, 0.18f, 1.0f);
     matRoof->metallicFactor = 0.0f; matRoof->roughnessFactor = 0.80f;
 
-    // Emit one axis-aligned solid box as a chunk child.
+    // Emit one axis-aligned solid box as a chunk child. `wrap` stretches the
+    // texture to span the whole piece (UV 0..1 per face) so a single-board wood
+    // texture reads as one plank; otherwise UVs map by world X/Y (tiling).
     auto addBox = [&](const char* name, const std::shared_ptr<SceneMaterial>& material,
-                      float x0, float x1, float y0, float y1, float z0, float z1) {
+                      float x0, float x1, float y0, float y1, float z0, float z1,
+                      bool wrap = false) {
         if (x1 <= x0 || y1 <= y0 || z1 <= z0) return;
         auto node = std::make_shared<SceneNode>(name);
         node->mesh = std::make_shared<SceneMesh>();
         MeshPrimitive primitive;
         primitive.material = material;
+        constexpr float kUvScale = 1.5f;  // world units per texture tile
+        const float extX = x1 - x0, extY = y1 - y0, extZ = z1 - z0;
         auto emitQuad = [&](const XMFLOAT3& a, const XMFLOAT3& b, const XMFLOAT3& c,
                             const XMFLOAT3& d, const XMFLOAT3& n) {
             const UINT base = (UINT)(primitive.vertices.size() / 12);
             const XMFLOAT3 pts[4] = { a, b, c, d };
+            const bool faceX = std::abs(n.x) > 0.5f;
+            const bool faceY = std::abs(n.y) > 0.5f;
             for (const XMFLOAT3& p : pts) {
-                const float u = (p.x - minX) / uvSpanX, v = (p.y - floorY) / uvSpanY;
-                const float vertex[12] = { p.x,p.y,p.z, n.x,n.y,n.z, u,v, 1,0,0,1 };
+                float u, v;
+                if (wrap) {
+                    // One texture span across the whole board. Long axis -> U so
+                    // the plank grain runs along the board's length.
+                    if (faceX)      { u = (p.z - z0) / extZ; v = (p.y - y0) / extY; }
+                    else if (faceY) { u = (p.x - x0) / extX; v = (p.z - z0) / extZ; }
+                    else            { u = (p.x - x0) / extX; v = (p.y - y0) / extY; }
+                } else {
+                    // World-scaled tiling per face -> uniform texel size, no
+                    // stretching whatever the face orientation.
+                    if (faceX)      { u = p.z; v = p.y; }
+                    else if (faceY) { u = p.x; v = p.z; }
+                    else            { u = p.x; v = p.y; }
+                    u /= kUvScale; v /= kUvScale;
+                }
+                // Tangent must lie in the face and follow U, and must NOT be
+                // parallel to the normal -- a flat (1,0,0) on an X-facing side
+                // collapses the TBN to zero and the normal map samples as noise.
+                const XMFLOAT3 tangent = faceX ? XMFLOAT3(0, 0, 1)   // U runs along Z
+                                       : XMFLOAT3(1, 0, 0);           // U runs along X
+                const float vertex[12] = { p.x,p.y,p.z, n.x,n.y,n.z, u,v,
+                                           tangent.x, tangent.y, tangent.z, 1 };
                 primitive.vertices.insert(primitive.vertices.end(), vertex, vertex + 12);
             }
             primitive.indices.insert(primitive.indices.end(),
@@ -808,6 +967,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // world-anchored foundation/sill chunks. Grid args unused (bonds
             // come from AABB adjacency), so pass 1s.
             wallModel = CreateDestructibleWallModel();
+            ApplyHouseTextures(wallModel, g_dx12.device.Get(), g_dx12.commandList.Get());
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
             if (crateModel) {
                 if (auto merged = GLBImporter::MergeSceneByMaterial(crateModel, g_dx12.device)) {

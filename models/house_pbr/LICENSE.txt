@@ -1,0 +1,14 @@
+Destructible house material textures.
+
+Source: ambientCG (https://ambientcg.com) — 1K JPG.
+License: CC0 1.0 (public domain). No attribution required.
+
+Maps per material (Color + NormalGL + Roughness, AO where available):
+  stud_wood.*        <- Wood062_1K-JPG
+  cladding_wood.*    <- Planks011_1K-JPG   (cladding albedo uses stud_wood single board)
+  roof_tiles.*       <- RoofingTiles002_1K-JPG   (no AO map published)
+  foundation_brick.* <- Bricks097_1K-JPG
+
+Suffixes: (base).jpg = color, _normal.jpg = NormalGL, _roughness.jpg = roughness
+(sampled as glTF metallic-roughness G channel), _ao.jpg = ambient occlusion
+(downloaded; not yet consumed by the shader).
