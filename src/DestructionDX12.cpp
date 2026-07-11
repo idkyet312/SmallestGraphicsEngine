@@ -249,6 +249,14 @@ struct DestructionDX12::Impl {
     std::vector<int> chunkGroupByAsset;           // asset-chunk-indexed plank id (root=[0]=-2)
     std::list<std::unique_ptr<ActorRuntime>> actors;
     std::vector<DestructionRenderItem> renderItems;
+    struct RagdollPart {
+        b3BodyId body = b3_nullBodyId;
+        XMFLOAT3 half = {};
+        XMFLOAT3 color = {};
+    };
+    std::vector<RagdollPart> ragdollParts;
+    std::vector<RagdollRenderItem> ragdollRenderItems;
+    mutable int lastRagdollHit = -1;
     TkFramework* framework = nullptr;
     TkAsset* asset = nullptr;
     TkFamily* family = nullptr;
@@ -270,6 +278,10 @@ struct DestructionDX12::Impl {
             uint32_t chunkIndex = 0;
             for (const auto& sourceChunk : source->children) {
                 if (!sourceChunk || !sourceChunk->mesh) continue;
+                // Roof geometry now comes from build/models/roof/roof.fbx.
+                // Do not turn the procedural roof panels into render chunks.
+                if (sourceChunk->name.rfind("Roof@", 0) == 0 ||
+                    sourceChunk->name.rfind("MetalRoof@", 0) == 0) continue;
                 Chunk chunk;
                 chunk.x = (int)(chunkIndex % (uint32_t)gridX);
                 chunk.y = (int)((chunkIndex / (uint32_t)gridX) % (uint32_t)gridY);
@@ -286,6 +298,7 @@ struct DestructionDX12::Impl {
                 }
                 chunk.glass = sourceChunk->name.rfind("Glass@", 0) == 0;
                 chunk.sheet = sourceChunk->name.rfind("Roof@", 0) == 0;
+                const bool simpleRoofBox = sourceChunk->name.rfind("ImportedRoof@", 0) == 0;
                 chunk.minimum = { FLT_MAX, FLT_MAX, FLT_MAX };
                 chunk.maximum = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
                 chunk.node = std::make_shared<SceneNode>("VoronoiChunk");
@@ -311,6 +324,29 @@ struct DestructionDX12::Impl {
                     chunk.node->mesh->primitives.push_back(std::move(primitive));
                 }
                 if (chunk.minimum.x == FLT_MAX) continue;
+                if (simpleRoofBox && !chunk.collisionPoints.empty()) {
+                    // Fit one thin oriented box to the pitched sheet. This
+                    // avoids oversized vertical AABBs while keeping collision
+                    // geometry simple (eight points, one convex box).
+                    float meanX=0,meanY=0;
+                    for(const XMFLOAT3& p:chunk.collisionPoints){meanX+=p.x;meanY+=p.y;}
+                    const float inv=1.0f/(float)chunk.collisionPoints.size();meanX*=inv;meanY*=inv;
+                    float covXX=0,covXY=0;
+                    for(const XMFLOAT3& p:chunk.collisionPoints){covXX+=(p.x-meanX)*(p.x-meanX);covXY+=(p.x-meanX)*(p.y-meanY);}
+                    const float slope=covXX>0.000001f?covXY/covXX:0.0f;
+                    const float il=1.0f/std::sqrt(1.0f+slope*slope);
+                    const XMFLOAT3 u(il,slope*il,0), n(u.y,-u.x,0);
+                    float u0=FLT_MAX,u1=-FLT_MAX,z0=FLT_MAX,z1=-FLT_MAX,n0=FLT_MAX,n1=-FLT_MAX;
+                    for(const XMFLOAT3& p:chunk.collisionPoints){
+                        const float pu=p.x*u.x+p.y*u.y,pn=p.x*n.x+p.y*n.y;
+                        u0=(std::min)(u0,pu);u1=(std::max)(u1,pu);z0=(std::min)(z0,p.z);z1=(std::max)(z1,p.z);
+                        n0=(std::min)(n0,pn);n1=(std::max)(n1,pn);
+                    }
+                    const float midN=(n0+n1)*0.5f;n0=midN-0.035f;n1=midN+0.035f;
+                    chunk.collisionPoints.clear();
+                    for(float pu:{u0,u1})for(float pz:{z0,z1})for(float pn:{n0,n1})
+                        chunk.collisionPoints.push_back({u.x*pu+n.x*pn,u.y*pu+n.y*pn,pz});
+                }
                 chunk.center = { (chunk.minimum.x + chunk.maximum.x) * 0.5f,
                                  (chunk.minimum.y + chunk.maximum.y) * 0.5f,
                                  (chunk.minimum.z + chunk.maximum.z) * 0.5f };
@@ -583,7 +619,75 @@ struct DestructionDX12::Impl {
         groundShape.enableHitEvents = true;
         b3CreateHullShape(ground, &groundShape, &groundHull.base);
         CreateBody(*actors.front(), false, nullptr);
+        CreateRagdolls();
         return true;
+    }
+
+    void CreateRagdolls() {
+        struct PartDef { XMFLOAT3 center, half, color; };
+        const XMFLOAT3 skin{ 0.62f, 0.39f, 0.27f };
+        const XMFLOAT3 shirt{ 0.12f, 0.24f, 0.42f };
+        const XMFLOAT3 pants{ 0.10f, 0.11f, 0.13f };
+        const PartDef defs[] = {
+            {{0,1.45f,0},{0.25f,0.38f,0.15f},shirt},   // torso
+            {{0,0.92f,0},{0.23f,0.16f,0.14f},pants},   // pelvis
+            {{0,2.02f,0},{0.18f,0.20f,0.18f},skin},    // head
+            {{-0.38f,1.48f,0},{0.12f,0.30f,0.11f},shirt},
+            {{-0.38f,0.94f,0},{0.10f,0.27f,0.09f},skin},
+            {{ 0.38f,1.48f,0},{0.12f,0.30f,0.11f},shirt},
+            {{ 0.38f,0.94f,0},{0.10f,0.27f,0.09f},skin},
+            {{-0.15f,0.53f,0},{0.14f,0.28f,0.13f},pants},
+            {{-0.15f,0.04f,0},{0.12f,0.25f,0.11f},pants},
+            {{ 0.15f,0.53f,0},{0.14f,0.28f,0.13f},pants},
+            {{ 0.15f,0.04f,0},{0.12f,0.25f,0.11f},pants},
+        };
+        struct Link { int a, b; XMFLOAT3 anchor; };
+        const Link links[] = {
+            {0,1,{0,1.08f,0}}, {0,2,{0,1.82f,0}},
+            {0,3,{-0.29f,1.68f,0}}, {3,4,{-0.38f,1.20f,0}},
+            {0,5,{ 0.29f,1.68f,0}}, {5,6,{ 0.38f,1.20f,0}},
+            {1,7,{-0.15f,0.76f,0}}, {7,8,{-0.15f,0.28f,0}},
+            {1,9,{ 0.15f,0.76f,0}}, {9,10,{0.15f,0.28f,0}},
+        };
+
+        auto spawn = [&](XMFLOAT3 origin, float pitch, float yaw, float roll) {
+            const size_t base = ragdollParts.size();
+            XMVECTOR rq = XMQuaternionRotationRollPitchYaw(pitch, yaw, roll);
+            XMFLOAT4 qf; XMStoreFloat4(&qf, rq);
+            for (const PartDef& def : defs) {
+                XMFLOAT3 rotated;
+                XMStoreFloat3(&rotated, XMVector3Rotate(XMLoadFloat3(&def.center), rq));
+                b3BodyDef bd = b3DefaultBodyDef();
+                bd.type = b3_dynamicBody;
+                bd.position = { origin.x + rotated.x, origin.y + rotated.y, origin.z + rotated.z };
+                bd.rotation = { { qf.x, qf.y, qf.z }, qf.w };
+                bd.linearDamping = 0.12f; bd.angularDamping = 0.35f;
+                b3BodyId body = b3CreateBody(world, &bd);
+                b3ShapeDef sd = b3DefaultShapeDef();
+                sd.density = 55.0f; sd.baseMaterial.friction = 0.72f;
+                sd.baseMaterial.restitution = 0.02f;
+                b3BoxHull box = b3MakeBoxHull(def.half.x, def.half.y, def.half.z);
+                b3CreateHullShape(body, &sd, &box.base);
+                ragdollParts.push_back({ body, def.half, def.color });
+            }
+            for (const Link& link : links) {
+                b3SphericalJointDef jd = b3DefaultSphericalJointDef();
+                jd.base.bodyIdA = ragdollParts[base + link.a].body;
+                jd.base.bodyIdB = ragdollParts[base + link.b].body;
+                const XMFLOAT3& ca = defs[link.a].center;
+                const XMFLOAT3& cb = defs[link.b].center;
+                jd.base.localFrameA.p = { link.anchor.x-ca.x, link.anchor.y-ca.y, link.anchor.z-ca.z };
+                jd.base.localFrameB.p = { link.anchor.x-cb.x, link.anchor.y-cb.y, link.anchor.z-cb.z };
+                jd.base.collideConnected = false;
+                jd.enableConeLimit = true; jd.coneAngle = 1.15f;
+                jd.enableTwistLimit = true; jd.lowerTwistAngle = -0.65f; jd.upperTwistAngle = 0.65f;
+                b3CreateSphericalJoint(world, &jd);
+            }
+        };
+
+        // One body leans against the metal shed; one starts sprawled on wood roof.
+        spawn({ 7.78f, 0.38f, 3.45f }, 0.0f, 0.0f, -0.28f);
+        spawn({ -3.4f, 4.75f, 3.55f }, 0.0f, 0.0f, 1.48f);
     }
 
     void CreateBody(ActorRuntime& runtime, bool forceDynamic, const BodySeed* seed) {
@@ -624,10 +728,13 @@ struct DestructionDX12::Impl {
         bodyDef.linearDamping = 0.05f; bodyDef.angularDamping = 0.12f;
         runtime.body = b3CreateBody(world, &bodyDef);
         b3ShapeDef shapeDef = b3DefaultShapeDef();
-        // Keep fragments light enough for ordinary projectile impulses to move.
-        shapeDef.density = runtime.dynamic ? 20.0f : 0.0f;
-        shapeDef.baseMaterial.friction = 0.65f;
-        shapeDef.baseMaterial.restitution = 0.05f;
+        // Keep fragments light so ordinary projectile impulses move them and,
+        // more importantly, so a fallen sheet resting on a ragdoll or on other
+        // debris settles onto it rather than bulldozing it. Zero restitution
+        // means a landing sheet does not bounce and kick things away.
+        shapeDef.density = runtime.dynamic ? 8.0f : 0.0f;
+        shapeDef.baseMaterial.friction = 0.75f;
+        shapeDef.baseMaterial.restitution = 0.0f;
         shapeDef.enableHitEvents = true;  // hard impacts fracture cells
         for (uint32_t index : runtime.chunks) {
             const Chunk& chunk = chunks[index];
@@ -667,6 +774,16 @@ struct DestructionDX12::Impl {
             if (!B3_IS_NULL(runtime->body)) transform = BoxTransform(runtime->body, runtime->center);
             XMFLOAT4X4 stored; XMStoreFloat4x4(&stored, transform);
             for (uint32_t chunk : runtime->chunks) renderItems.push_back({ chunks[chunk].node, stored });
+        }
+        ragdollRenderItems.clear();
+        for (const RagdollPart& part : ragdollParts) {
+            const b3Pos p = b3Body_GetPosition(part.body);
+            const b3Quat q = b3Body_GetRotation(part.body);
+            XMVECTOR rotation = XMVectorSet(q.v.x, q.v.y, q.v.z, q.s);
+            XMMATRIX transform = XMMatrixScaling(part.half.x * 2.0f, part.half.y * 2.0f, part.half.z * 2.0f) *
+                XMMatrixRotationQuaternion(rotation) * XMMatrixTranslation((float)p.x, (float)p.y, (float)p.z);
+            XMFLOAT4X4 stored; XMStoreFloat4x4(&stored, transform);
+            ragdollRenderItems.push_back({ stored, part.color });
         }
     }
 
@@ -836,7 +953,8 @@ void DestructionDX12::Shutdown() {
     if (m->asset) m->asset->release();
     if (m->framework) ReleaseTkFramework();
     m->group = nullptr; m->asset = nullptr; m->framework = nullptr;
-    m->chunks.clear(); m->renderItems.clear(); m->initialized = false;
+    m->chunks.clear(); m->renderItems.clear(); m->ragdollParts.clear();
+    m->ragdollRenderItems.clear(); m->initialized = false;
 }
 
 void DestructionDX12::Reset() {
@@ -889,6 +1007,7 @@ bool DestructionDX12::HitTest(const XMFLOAT3& worldPosition, float radius, XMFLO
 bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3& worldEnd,
                                      float radius, XMFLOAT3& hitPosition) const {
     if (!m->initialized) return false;
+    m->lastRagdollHit = -1;
     float closest = FLT_MAX;
     bool hit = false;
     for (const auto& runtime : m->actors) {
@@ -910,6 +1029,19 @@ bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3&
             }
         }
     }
+    for (size_t i = 0; i < m->ragdollParts.size(); ++i) {
+        const Impl::RagdollPart& part = m->ragdollParts[i];
+        const b3Vec3 a = b3Body_GetLocalPoint(part.body,
+            { worldStart.x, worldStart.y, worldStart.z });
+        const b3Vec3 b = b3Body_GetLocalPoint(part.body,
+            { worldEnd.x, worldEnd.y, worldEnd.z });
+        float t = 0.0f;
+        if (SegmentAabb({ a.x, a.y, a.z }, { b.x, b.y, b.z }, radius,
+                        { -part.half.x, -part.half.y, -part.half.z },
+                        {  part.half.x,  part.half.y,  part.half.z }, t) && t < closest) {
+            closest = t; hit = true; m->lastRagdollHit = (int)i;
+        }
+    }
     if (hit) {
         hitPosition = { worldStart.x + (worldEnd.x - worldStart.x) * closest,
                         worldStart.y + (worldEnd.y - worldStart.y) * closest,
@@ -920,6 +1052,8 @@ bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3&
 
 void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float radius, float damage) {
     if (!m->initialized) return;
+    // Bullet struck a person, not a Blast chunk. Preserve building bonds.
+    if (m->lastRagdollHit >= 0) return;
     m->lastDamagePosition = worldPosition;
     m->lastDamageRadius = radius;
     // Break only the single piece that was hit: sever the nearest cell's bonds
@@ -982,20 +1116,51 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
     const XMVECTOR center = XMLoadFloat3(&worldPosition);
     for (auto& runtime : m->actors) {
         if (!runtime->dynamic || B3_IS_NULL(runtime->body)) continue;
+        const b3Vec3 localBlast = b3Body_GetLocalPoint(runtime->body,
+            { worldPosition.x, worldPosition.y, worldPosition.z });
+        const XMFLOAT3 modelBlast(localBlast.x + runtime->center.x,
+                                  localBlast.y + runtime->center.y,
+                                  localBlast.z + runtime->center.z);
+        bool blastOverlapsChunk = false;
+        for (uint32_t chunkIndex : runtime->chunks) {
+            const Impl::Chunk& chunk = m->chunks[chunkIndex];
+            if (SphereAabb(modelBlast, radius, chunk.minimum, chunk.maximum)) {
+                blastOverlapsChunk = true; break;
+            }
+        }
         const b3Pos bp = b3Body_GetPosition(runtime->body);
         const XMVECTOR pos = XMVectorSet((float)bp.x, (float)bp.y, (float)bp.z, 0.0f);
         const float dist = XMVectorGetX(XMVector3Length(pos - center));
-        if (dist > radius) continue;
+        if (dist > radius && !blastOverlapsChunk) continue;
         XMVECTOR dir = pos - center;
         if (dist < 0.001f) dir = XMVectorSet(0, 1, 0, 0);  // at the centre: straight up
         dir = XMVector3Normalize(dir + XMVectorSet(0, 0.4f, 0, 0));
-        const float scale = std::max(0.2f, 1.0f - dist / radius);
+        const float scale = blastOverlapsChunk
+            ? std::max(0.35f, 1.0f - dist / radius)
+            : std::max(0.2f, 1.0f - dist / radius);
         // Cap the velocity change so feather-light shards don't launch.
         constexpr float kMaxDeltaV = 14.0f;  // m/s
         const float mass = std::max(0.05f, b3Body_GetMass(runtime->body));
         const float magnitude = std::min(impulse * scale, kMaxDeltaV * mass);
         XMFLOAT3 v; XMStoreFloat3(&v, dir * magnitude);
         b3Body_ApplyLinearImpulse(runtime->body, { v.x, v.y, v.z }, { (float)bp.x, (float)bp.y, (float)bp.z }, true);
+    }
+    // Blast pressure acts on every ragdoll limb. Applying at each limb center
+    // moves the whole articulated body while also producing natural rotation.
+    for (Impl::RagdollPart& part : m->ragdollParts) {
+        const b3Pos bp = b3Body_GetPosition(part.body);
+        const XMVECTOR pos = XMVectorSet((float)bp.x, (float)bp.y, (float)bp.z, 0.0f);
+        const float dist = XMVectorGetX(XMVector3Length(pos - center));
+        if (dist > radius) continue;
+        XMVECTOR dir = pos - center;
+        if (dist < 0.001f) dir = XMVectorSet(0, 1, 0, 0);
+        dir = XMVector3Normalize(dir + XMVectorSet(0, 0.55f, 0, 0));
+        const float scale = std::max(0.15f, 1.0f - dist / radius);
+        const float mass = std::max(0.05f, b3Body_GetMass(part.body));
+        const float magnitude = std::min(impulse * scale, 18.0f * mass);
+        XMFLOAT3 v; XMStoreFloat3(&v, dir * magnitude);
+        b3Body_ApplyLinearImpulse(part.body, { v.x, v.y, v.z },
+            { (float)bp.x, (float)bp.y, (float)bp.z }, true);
     }
     std::cout << "Grenade: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
 }
@@ -1011,6 +1176,17 @@ bool DestructionDX12::ApplyImpulse(const XMFLOAT3& worldPosition,
     // distance so a hit stays local instead of nudging every loose piece.
     const float falloffRadius = std::max(0.25f, hitRadius);
     const float falloffSquared = falloffRadius * falloffRadius;
+    if (m->lastRagdollHit >= 0 && m->lastRagdollHit < (int)m->ragdollParts.size()) {
+        Impl::RagdollPart& part = m->ragdollParts[(size_t)m->lastRagdollHit];
+        const float mass = std::max(0.05f, b3Body_GetMass(part.body));
+        const float magnitude = std::min(impulseStrength, 12.0f * mass);
+        XMFLOAT3 impulse;
+        XMStoreFloat3(&impulse, direction * magnitude);
+        b3Body_ApplyLinearImpulse(part.body, { impulse.x, impulse.y, impulse.z },
+            { worldPosition.x, worldPosition.y, worldPosition.z }, true);
+        m->lastRagdollHit = -1;
+        applied = true;
+    }
     for (auto& runtime : m->actors) {
         if (!runtime->dynamic || B3_IS_NULL(runtime->body)) continue;
         const b3Pos bodyPosition = b3Body_GetPosition(runtime->body);
@@ -1032,6 +1208,71 @@ bool DestructionDX12::ApplyImpulse(const XMFLOAT3& worldPosition,
         applied = true;
     }
     return applied;
+}
+
+void DestructionDX12::ResolvePlayerCollision(XMFLOAT3& eyePosition, float& floorY,
+                                             float radius, float height) {
+    if (!m->initialized) return;
+    const float feet = eyePosition.y - height;
+    constexpr float kStepHeight = 1.0f / 3.0f;   // max ledge the player can step up onto
+    auto resolveBox = [&](const XMFLOAT3& lo, const XMFLOAT3& hi, b3BodyId body, bool dynamic) {
+        if (eyePosition.y < lo.y || feet > hi.y) return;
+        const float nearestX = (std::max)(lo.x, (std::min)(eyePosition.x, hi.x));
+        const float nearestZ = (std::max)(lo.z, (std::min)(eyePosition.z, hi.z));
+        float dx = eyePosition.x - nearestX, dz = eyePosition.z - nearestZ;
+        float distance = std::sqrt(dx * dx + dz * dz);
+        if (distance >= radius) return;
+        // Step-up: the box top is at most one step above the feet and the player
+        // is horizontally over it -> stand on top instead of being shoved aside.
+        // (distance ~0 means the eye column is inside the box footprint.)
+        if (hi.y <= feet + kStepHeight && distance < radius) {
+            floorY = (std::max)(floorY, hi.y);
+            return;
+        }
+        if (distance < 0.0001f) {
+            const float left = std::abs(eyePosition.x - lo.x);
+            const float right = std::abs(hi.x - eyePosition.x);
+            const float back = std::abs(eyePosition.z - lo.z);
+            const float front = std::abs(hi.z - eyePosition.z);
+            const float smallest = (std::min)((std::min)(left, right), (std::min)(back, front));
+            if (smallest == left) { dx = -1; dz = 0; }
+            else if (smallest == right) { dx = 1; dz = 0; }
+            else if (smallest == back) { dx = 0; dz = -1; }
+            else { dx = 0; dz = 1; }
+            distance = 0.0f;
+        } else { dx /= distance; dz /= distance; }
+        const float push = radius - distance + 0.002f;
+        eyePosition.x += dx * push; eyePosition.z += dz * push;
+        if (dynamic && !B3_IS_NULL(body)) {
+            const float mass = (std::max)(0.05f, b3Body_GetMass(body));
+            const float magnitude = (std::min)(mass * 2.5f, 35.0f);
+            const b3Pos p = b3Body_GetPosition(body);
+            b3Body_ApplyLinearImpulse(body, { -dx * magnitude, 0.15f * magnitude, -dz * magnitude }, p, true);
+        }
+    };
+
+    for (const auto& runtime : m->actors) {
+        if (B3_IS_NULL(runtime->body)) continue;
+        const XMMATRIX transform = BoxTransform(runtime->body, runtime->center);
+        for (uint32_t index : runtime->chunks) {
+            const Impl::Chunk& chunk = m->chunks[index];
+            XMFLOAT3 lo(FLT_MAX,FLT_MAX,FLT_MAX), hi(-FLT_MAX,-FLT_MAX,-FLT_MAX);
+            for (float x : {chunk.minimum.x,chunk.maximum.x})
+            for (float y : {chunk.minimum.y,chunk.maximum.y})
+            for (float z : {chunk.minimum.z,chunk.maximum.z}) {
+                XMFLOAT3 p; XMStoreFloat3(&p, XMVector3TransformCoord(XMVectorSet(x,y,z,1), transform));
+                lo.x=(std::min)(lo.x,p.x);lo.y=(std::min)(lo.y,p.y);lo.z=(std::min)(lo.z,p.z);
+                hi.x=(std::max)(hi.x,p.x);hi.y=(std::max)(hi.y,p.y);hi.z=(std::max)(hi.z,p.z);
+            }
+            resolveBox(lo, hi, runtime->body, runtime->dynamic);
+        }
+    }
+    for (const Impl::RagdollPart& part : m->ragdollParts) {
+        const b3Pos p = b3Body_GetPosition(part.body);
+        resolveBox({(float)p.x-part.half.x,(float)p.y-part.half.y,(float)p.z-part.half.z},
+                   {(float)p.x+part.half.x,(float)p.y+part.half.y,(float)p.z+part.half.z},
+                   part.body, true);
+    }
 }
 
 void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
@@ -1083,6 +1324,7 @@ bool DestructionDX12::IsInitialized() const { return m && m->initialized; }
 uint32_t DestructionDX12::GetChunkCount() const { return m ? (uint32_t)m->chunks.size() : 0; }
 uint32_t DestructionDX12::GetActorCount() const { return m ? (uint32_t)m->actors.size() : 0; }
 const std::vector<DestructionRenderItem>& DestructionDX12::GetRenderItems() const { return m->renderItems; }
+const std::vector<RagdollRenderItem>& DestructionDX12::GetRagdollRenderItems() const { return m->ragdollRenderItems; }
 
 DestructionDebugData DestructionDX12::GetDebugData() const {
     DestructionDebugData data;

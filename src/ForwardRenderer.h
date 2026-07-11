@@ -11,6 +11,7 @@
 #include "MeshShaderDX12.h"
 #include "TerrainRendererDX12.h"
 #include "DestructionDX12.h"
+#include "RoofModel.h"
 
 extern MeshShaderDX12 g_meshShader;
 extern bool g_useMeshShader;
@@ -115,7 +116,9 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
         for (const auto& prim : node->mesh->primitives) {
             if (prim.vbv.BufferLocation == 0) continue;
 
+            const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
             if (prim.material) {
+                if (transparent) shader.UseTransparent(); else shader.Use(false);
                 XMFLOAT3 color(prim.material->baseColorFactor.x,
                                 prim.material->baseColorFactor.y,
                                 prim.material->baseColorFactor.z);
@@ -128,7 +131,8 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
                     prim.material->baseColorTexture.Get(),
                     prim.material->normalTexture.Get(),
                     prim.material->metallicRoughnessTexture.Get(),
-                    prim.material->roughnessOnlyTexture);
+                    prim.material->roughnessOnlyTexture,
+                    prim.material->baseColorFactor.w);
             } else {
                 shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
             }
@@ -141,7 +145,7 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
                 ? prim.meshletVertexIndexBuffer->GetGPUVirtualAddress() : 0;
             D3D12_GPU_VIRTUAL_ADDRESS triangleAddress = prim.meshletTriangleBuffer
                 ? prim.meshletTriangleBuffer->GetGPUVirtualAddress() : 0;
-            if (g_useMeshShader && g_meshShader.CanDraw(
+            if (!transparent && g_useMeshShader && g_meshShader.CanDraw(
                     prim.meshletCount, meshletDescAddress, boundsAddress,
                     vertexIndexAddress, triangleAddress)) {
                 g_meshShader.Draw(prim.vbv,
@@ -151,7 +155,8 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
             } else {
                 // A previous mesh draw leaves the mesh PSO bound. Restore the
                 // conventional VS/PS pipeline before issuing IA draw calls.
-                g_dx12.commandList->SetPipelineState(shader.pipelineState.Get());
+                g_dx12.commandList->SetPipelineState(transparent
+                    ? shader.transparentPipelineState.Get() : shader.pipelineState.Get());
                 g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
                 g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 if (prim.ibv.BufferLocation != 0) {
@@ -247,6 +252,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             DrawSceneNode(item.node, shader, XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
         }
         shader.Use(scene.wireframeMode);
+        for (const RagdollRenderItem& item : g_destruction.GetRagdollRenderItems()) {
+            shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
+            shader.SetObjectColor(item.color);
+            DrawCube(geo);
+            shader.NextDrawCall();
+        }
     }
 
     // Cube 2
