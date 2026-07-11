@@ -32,6 +32,7 @@
 #include "OcclusionDepthDX12.h"
 #include "DestructionDX12.h"
 #include "FBXImporter.h"
+#include "WaterVolume.h"
 
 using namespace DirectX;
 
@@ -45,6 +46,7 @@ MeshShaderDX12              g_meshShader;
 bool                        g_useMeshShader = false;
 TerrainRendererDX12         g_terrain;
 DestructionDX12             g_destruction;
+WaterVolume                 g_water;
 static SkyRendererDX12      skyRenderer;
 static OcclusionDepthDX12   occlusionDepth;
 static VisibilityBufferDX12 visBuffer;
@@ -1467,6 +1469,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             WaitForGPU();
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
         }
+        g_water.Update(deltaTime);
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.Update(deltaTime);
             for (auto& projectile : scene.projectiles) {
@@ -1537,6 +1540,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ApplyHouseTextures(wallModel, g_dx12.device.Get(), g_dx12.commandList.Get());
             AppendRoofChunksToDestructionModel(wallModel);
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
+            // Pool of water beside the house (on the clear -X side) with a
+            // handful of wooden crates dropped in to bob on the surface.
+            g_water.Initialize({ -12.0f, 1.0f, 0.0f }, { 8.0f, 2.5f, 8.0f });
             if (crateModel) {
                 if (auto merged = GLBImporter::MergeSceneByMaterial(crateModel, g_dx12.device)) {
                     crateModel = merged;

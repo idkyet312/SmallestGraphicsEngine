@@ -12,11 +12,13 @@
 #include "TerrainRendererDX12.h"
 #include "DestructionDX12.h"
 #include "RoofModel.h"
+#include "WaterVolume.h"
 
 extern MeshShaderDX12 g_meshShader;
 extern bool g_useMeshShader;
 extern TerrainRendererDX12 g_terrain;
 extern bool g_showH2Model;
+extern WaterVolume g_water;
 
 struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
@@ -258,6 +260,29 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             DrawCube(geo);
             shader.NextDrawCall();
         }
+    }
+
+    // Water pool: floating crates (opaque) drawn first, then the translucent
+    // water box on top so the crates show through it.
+    if (g_water.IsInitialized()) {
+        shader.Use(scene.wireframeMode);
+        for (const WaterFloaterItem& item : g_water.GetFloaterItems()) {
+            shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
+            shader.SetObjectColor(item.color);
+            DrawCube(geo);
+            shader.NextDrawCall();
+        }
+        // Translucent water volume.
+        const XMFLOAT3 c = g_water.GetCenter();
+        const XMFLOAT3 e = g_water.GetExtents();
+        XMMATRIX water = XMMatrixScaling(e.x, e.y, e.z) * XMMatrixTranslation(c.x, c.y, c.z);
+        shader.UseTransparent();
+        shader.SetMatrices(water, view, proj, lightSpace);
+        shader.SetObjectMaterial(XMFLOAT3(0.15f, 0.42f, 0.72f), false, false,
+                                 0.0f, 0.1f, nullptr, nullptr, nullptr, false, 0.45f);
+        DrawCube(geo);
+        shader.NextDrawCall();
+        shader.Use(scene.wireframeMode);
     }
 
     // Cube 2
