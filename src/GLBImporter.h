@@ -35,4 +35,11 @@ public:
     // Uploads conventional vertex/index buffers and builds meshoptimizer
     // meshlets (64 vertices, 124 triangles) for any generated primitive.
     static bool BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* device);
+
+    // Uploads an in-memory RGBA8 image (row-major, 4 bytes/texel) as a mipped
+    // shader texture. Used for procedurally generated material textures.
+    static Microsoft::WRL::ComPtr<ID3D12Resource> CreateTextureFromRGBA(
+        ID3D12Device* device, ID3D12GraphicsCommandList* commandList,
+        const std::vector<unsigned char>& rgba, int width, int height,
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploadHeaps);
 };

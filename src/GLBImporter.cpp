@@ -261,6 +261,20 @@ ComPtr<ID3D12Resource> GLBImporter::LoadTextureFromFile(const std::string& filep
     return CreateTexture(device.Get(), commandList.Get(), image, uploadHeaps);
 }
 
+ComPtr<ID3D12Resource> GLBImporter::CreateTextureFromRGBA(ID3D12Device* device,
+    ID3D12GraphicsCommandList* commandList, const std::vector<unsigned char>& rgba,
+    int width, int height, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
+    if (width <= 0 || height <= 0 || rgba.size() < (size_t)width * height * 4) return nullptr;
+    tinygltf::Image image;
+    image.width = width;
+    image.height = height;
+    image.component = 4;
+    image.bits = 8;
+    image.pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+    image.image = rgba;
+    return CreateTexture(device, commandList, image, uploadHeaps);
+}
+
 ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& filepath, ComPtr<ID3D12Device> device,
     ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
     float* pixels = nullptr;
