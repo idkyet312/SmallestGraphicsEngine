@@ -186,6 +186,31 @@ inline std::vector<unsigned char> Shingle(int size, XMFLOAT3 base, XMFLOAT3 dark
     }
     return px;
 }
+// Corrugated metal: tight vertical ribs shaded like a sine wave, streaked with
+// grime and rust patches -- reads as galvanised roofing sheets.
+inline std::vector<unsigned char> Corrugated(int size, XMFLOAT3 base, XMFLOAT3 rust) {
+    std::vector<unsigned char> px((size_t)size * size * 4);
+    for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+        const float u = (float)x / size, v = (float)y / size;
+        // Rib shading: sine across U, lit from one side so every rib has a
+        // bright crest and a dark valley.
+        const float rib = std::sin(u * 3.14159f * 2.0f * 34.0f);
+        const float crease = std::pow(std::abs(rib), 10.0f);
+        float shade = 0.48f + 0.42f * std::max(0.0f, rib) + 0.16f * crease;
+        // Vertical weather streaks running down the sheet.
+        shade *= 0.88f + 0.12f * Fbm(u * 60.0f, v * 4.0f);
+        // Sparse rust blotches.
+        const float rustMask = Fbm(u * 5.0f, v * 10.0f);
+        const float drip = Fbm(u * 70.0f, v * 1.6f);
+        const float r = rustMask > 0.70f ? std::min(1.0f, (rustMask - 0.70f) * 4.0f + drip * 0.20f) : drip * 0.025f;
+        const size_t i = ((size_t)y * size + x) * 4;
+        px[i + 0] = ToByte((base.x * shade) * (1 - r) + rust.x * r);
+        px[i + 1] = ToByte((base.y * shade) * (1 - r) + rust.y * r);
+        px[i + 2] = ToByte((base.z * shade) * (1 - r) + rust.z * r);
+        px[i + 3] = 255;
+    }
+    return px;
+}
 }  // namespace HouseTex
 
 // Assigns downloaded CC0 albedo textures (ambientCG, models/house_pbr) to the
@@ -221,7 +246,39 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
         // roughness (glTF metallic-roughness convention). Metal stays 0.
         mat->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
             base + "_roughness.jpg", device, cmdList, mat->uploadHeaps);
+        mat->roughnessOnlyTexture = mat->metallicRoughnessTexture != nullptr;
         if (mat->metallicRoughnessTexture) { mat->metallicFactor = 0.0f; mat->roughnessFactor = 1.0f; }
+    };
+    auto assignFile = [&](const char* name, const std::string& colorPath,
+                          const std::string& roughnessPath, std::vector<unsigned char> fallback) {
+        auto it = mats.find(name);
+        if (it == mats.end()) return;
+        auto& mat = it->second;
+        mat->baseColorTexture = GLBImporter::LoadTextureFromFile(colorPath, device, cmdList, mat->uploadHeaps);
+        if (!mat->baseColorTexture) {
+            mat->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
+                device, cmdList, fallback, kSize, kSize, mat->uploadHeaps);
+        }
+        if (mat->baseColorTexture) mat->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
+        mat->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
+            roughnessPath, device, cmdList, mat->uploadHeaps);
+        mat->roughnessOnlyTexture = mat->metallicRoughnessTexture != nullptr;
+        mat->metallicFactor = 0.75f;
+        mat->roughnessFactor = mat->metallicRoughnessTexture ? 1.0f : 0.55f;
+    };
+    auto assignGeneratedMetal = [&](const char* name, const std::string& roughnessPath,
+                                    std::vector<unsigned char> generated, float metallic, float roughness) {
+        auto it = mats.find(name);
+        if (it == mats.end()) return;
+        auto& mat = it->second;
+        mat->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
+            device, cmdList, generated, kSize, kSize, mat->uploadHeaps);
+        if (mat->baseColorTexture) mat->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
+        mat->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
+            roughnessPath, device, cmdList, mat->uploadHeaps);
+        mat->roughnessOnlyTexture = mat->metallicRoughnessTexture != nullptr;
+        mat->metallicFactor = metallic;
+        mat->roughnessFactor = roughness;
     };
     assign("Foundation", "models/house_pbr/foundation_brick",
            HouseTex::Stone(kSize, { 0.62f, 0.62f, 0.64f }, { 0.34f, 0.34f, 0.36f }));
@@ -231,8 +288,16 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
     // grain reads as real boards when tiled.
     assign("Cladding", "models/house_pbr/stud_wood",
            HouseTex::Wood(kSize, { 0.84f, 0.68f, 0.46f }, { 0.55f, 0.40f, 0.24f }));
-    assign("Roof", "models/house_pbr/roof_tiles",
-           HouseTex::Shingle(kSize, { 0.52f, 0.26f, 0.20f }, { 0.26f, 0.12f, 0.10f }));
+    // Corrugated metal sheets; no downloaded map for this one, so the
+    // procedural ribbed texture always kicks in.
+    assign("Roof", "models/house_pbr/roof_metal",
+           HouseTex::Corrugated(kSize, { 0.72f, 0.74f, 0.76f }, { 0.42f, 0.25f, 0.16f }));
+    assignGeneratedMetal("MetalWall",
+               "models/Corrugated metal pack/Wall/A/A Roughness rusted 2.jpg",
+               HouseTex::Corrugated(kSize, { 0.30f, 0.34f, 0.31f }, { 0.43f, 0.22f, 0.10f }), 0.82f, 0.66f);
+    assignGeneratedMetal("MetalRoof",
+               "models/Corrugated metal pack/Roof/C/C Roof rusted roughness.JPEG",
+               HouseTex::Corrugated(kSize, { 0.54f, 0.62f, 0.68f }, { 0.52f, 0.26f, 0.10f }), 0.88f, 0.50f);
 }
 
 // Basic modular destructible house built from real structural pieces: a
@@ -264,8 +329,28 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     matCladding->metallicFactor = 0.0f; matCladding->roughnessFactor = 0.85f;
     auto matRoof = std::make_shared<SceneMaterial>();
     matRoof->name = "Roof";
-    matRoof->baseColorFactor = XMFLOAT4(0.45f, 0.22f, 0.18f, 1.0f);
-    matRoof->metallicFactor = 0.0f; matRoof->roughnessFactor = 0.80f;
+    matRoof->baseColorFactor = XMFLOAT4(0.68f, 0.70f, 0.72f, 1.0f);
+    matRoof->metallicFactor = 0.65f; matRoof->roughnessFactor = 0.45f;  // galvanised sheet
+    auto matMetalWall = std::make_shared<SceneMaterial>();
+    matMetalWall->name = "MetalWall";
+    matMetalWall->baseColorFactor = XMFLOAT4(0.62f, 0.63f, 0.62f, 1.0f);
+    matMetalWall->metallicFactor = 0.80f; matMetalWall->roughnessFactor = 0.62f;
+    auto matMetalRoof = std::make_shared<SceneMaterial>();
+    matMetalRoof->name = "MetalRoof";
+    matMetalRoof->baseColorFactor = XMFLOAT4(0.58f, 0.58f, 0.56f, 1.0f);
+    matMetalRoof->metallicFactor = 0.85f; matMetalRoof->roughnessFactor = 0.58f;
+    auto matDarkMetal = std::make_shared<SceneMaterial>();
+    matDarkMetal->name = "DarkMetal";
+    matDarkMetal->baseColorFactor = XMFLOAT4(0.015f, 0.018f, 0.017f, 1.0f);
+    matDarkMetal->metallicFactor = 0.60f; matDarkMetal->roughnessFactor = 0.72f;
+    auto matTrim = std::make_shared<SceneMaterial>();
+    matTrim->name = "MetalTrim";
+    matTrim->baseColorFactor = XMFLOAT4(0.46f, 0.50f, 0.50f, 1.0f);
+    matTrim->metallicFactor = 0.90f; matTrim->roughnessFactor = 0.38f;
+    auto matGlass = std::make_shared<SceneMaterial>();
+    matGlass->name = "Glass";
+    matGlass->baseColorFactor = XMFLOAT4(0.62f, 0.78f, 0.86f, 1.0f);
+    matGlass->metallicFactor = 0.25f; matGlass->roughnessFactor = 0.06f;
 
     // Emit one axis-aligned solid box as a chunk child. `wrap` stretches the
     // texture to span the whole piece (UV 0..1 per face) so a single-board wood
@@ -332,9 +417,15 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     // the board breaks apart, and they are jagged rather than straight cuts.
     // Axes are derived from the box: thickness = thinnest extent, the Voronoi
     // plane spans the two remaining axes (L = longer of the two, H = other).
+    // `shatter` = glass mode: a denser 2D scatter of sites so the pane breaks
+    // into many small shards instead of a few plank-like slices.
+    // `xform`, if given, is applied to every emitted vertex after the board is
+    // built in its axis-aligned local frame -- used to tilt roof panels onto a
+    // real slope. Positions transform fully; normals/tangents by rotation only.
     auto addVoronoiBoard = [&](const char* name, const std::shared_ptr<SceneMaterial>& material,
                                float x0, float x1, float y0, float y1,
-                               float z0, float z1, int seed) {
+                               float z0, float z1, int seed, bool shatter = false,
+                               const XMMATRIX* xform = nullptr) {
         if (x1 <= x0 || y1 <= y0 || z1 <= z0) return;
         const float lo[3] = { x0, y0, z0 }, hi[3] = { x1, y1, z1 };
         const float ext[3] = { x1 - x0, y1 - y0, z1 - z0 };
@@ -348,15 +439,27 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
         const float t0 = lo[tAxis], t1 = hi[tAxis];
         struct P2 { float x, y; };
         const float length = l1 - l0;
-        const int cols = std::max(3, std::min(8, (int)std::lround(length / 1.2f)));
-        const float cellW = length / cols;
         // Deterministic integer-hash jitter (no RNG); the piece id seeds it so
         // every board breaks along different lines.
         std::vector<P2> sites;
-        for (int i = 0; i < cols; ++i) {
-            const float jx = (((i * 37 + seed * 17 + 3) % 13) / 12.0f - 0.5f) * cellW * 0.9f;
-            const float jy = (((i * 19 + seed * 41 + 7) % 11) / 10.0f - 0.5f) * (h1 - h0) * 0.8f;
-            sites.push_back({ l0 + (i + 0.5f) * cellW + jx, (h0 + h1) * 0.5f + jy });
+        if (shatter) {
+            // Glass: 2D grid of jittered sites -> many small angular shards.
+            const int cols = std::max(3, std::min(6, (int)std::lround(length / 0.35f)));
+            const int rows = std::max(2, std::min(4, (int)std::lround((h1 - h0) / 0.4f)));
+            const float cw = length / cols, ch = (h1 - h0) / rows;
+            for (int r = 0; r < rows; ++r) for (int i = 0; i < cols; ++i) {
+                const float jx = (((i * 37 + r * 53 + seed * 17 + 3) % 13) / 12.0f - 0.5f) * cw * 0.9f;
+                const float jy = (((i * 19 + r * 29 + seed * 41 + 7) % 11) / 10.0f - 0.5f) * ch * 0.9f;
+                sites.push_back({ l0 + (i + 0.5f) * cw + jx, h0 + (r + 0.5f) * ch + jy });
+            }
+        } else {
+            const int cols = std::max(3, std::min(8, (int)std::lround(length / 1.2f)));
+            const float cellW = length / cols;
+            for (int i = 0; i < cols; ++i) {
+                const float jx = (((i * 37 + seed * 17 + 3) % 13) / 12.0f - 0.5f) * cellW * 0.9f;
+                const float jy = (((i * 19 + seed * 41 + 7) % 11) / 10.0f - 0.5f) * (h1 - h0) * 0.8f;
+                sites.push_back({ l0 + (i + 0.5f) * cellW + jx, (h0 + h1) * 0.5f + jy });
+            }
         }
         // Voronoi cell = board rect clipped against the perpendicular bisector
         // of every other site (Sutherland-Hodgman). Result is convex and CCW.
@@ -413,13 +516,22 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
                 for (const XMFLOAT3& p : pts) {
                     // World-scaled tiling per dominant face axis (same rule as
                     // addBox) -> uniform texel size on the jagged side walls.
+                    // UVs use the LOCAL (pre-tilt) position so the corrugations
+                    // run straight along the panel regardless of slope.
                     float u, v;
                     if (faceX)      { u = p.z; v = p.y; }
                     else if (faceY) { u = p.x; v = p.z; }
                     else            { u = p.x; v = p.y; }
                     u /= kUvScale; v /= kUvScale;
-                    const float vert[12] = { p.x,p.y,p.z, n.x,n.y,n.z, u,v,
-                                             tan.x,tan.y,tan.z, 1 };
+                    // Tilt into world space if a transform was supplied.
+                    XMFLOAT3 wp = p, wn = n, wt = tan;
+                    if (xform) {
+                        XMStoreFloat3(&wp, XMVector3Transform(XMLoadFloat3(&p), *xform));
+                        XMStoreFloat3(&wn, XMVector3Normalize(XMVector3TransformNormal(XMLoadFloat3(&n), *xform)));
+                        XMStoreFloat3(&wt, XMVector3Normalize(XMVector3TransformNormal(XMLoadFloat3(&tan), *xform)));
+                    }
+                    const float vert[12] = { wp.x,wp.y,wp.z, wn.x,wn.y,wn.z, u,v,
+                                             wt.x,wt.y,wt.z, 1 };
                     prim.vertices.insert(prim.vertices.end(), vert, vert + 12);
                 }
                 prim.indices.insert(prim.indices.end(), { base, base + 1, base + 2 });
@@ -458,95 +570,276 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     // --- Studded wall: vertical studs + outer cladding along one edge. The
     // bottom row of studs is anchored (the sill plate), so the wall stands. ---
     int pieceId = 0;  // unique Voronoi group id per board across the house
+    // Windows occupy cladding rows 1..2 (a band from ~0.9 to ~2.15 above the
+    // floor) so the cladding cutout lines up exactly with board seams.
+    constexpr int boards = 5;         // cladding planks stacked up the wall
+    constexpr int kWinRowLo = 1, kWinRowHi = 2;  // rows the window band covers
+    // `windows` = horizontal span-offset ranges (start, end) along the wall.
     auto buildWall = [&](float x0, float x1, float z0, float z1, bool alongX,
-                         float openStart, float openEnd, float openTop) {
+                         float openStart, float openEnd, float openTop,
+                         const std::vector<std::pair<float, float>>& windows) {
         constexpr float studW = 0.16f;
         constexpr int studCount = 8;
         const float baseY = floorY + wall;                 // sit on foundation
+        const float rowH = (wallTop - baseY) / boards;
+        const float winB = baseY + rowH * kWinRowLo;       // window band bottom
+        const float winT = baseY + rowH * (kWinRowHi + 1); // window band top
         const float span = alongX ? (x1 - x0) : (z1 - z0);
+        auto inWindow = [&](float c) {
+            for (const auto& w : windows) if (c > w.first && c < w.second) return true;
+            return false;
+        };
         for (int s = 0; s <= studCount; ++s) {
             const float t = (float)s / studCount;
             const float c = t * span;
             // Skip studs that fall inside the opening (door/window gap).
             const bool inOpening = openEnd > openStart && c > openStart && c < openEnd;
-            if (s == 0) {
-                // Sill stud: anchored support, never breaks -- keep a plain box.
+            // Do not add anchored corner supports to the wooden house.
+            if (s == 0) continue;
+            // A stud crossing a window splits into a sill stub below the glass
+            // and a header stub above it.
+            const bool crossesWindow = inWindow(c);
+            auto emitStud = [&](float sy0, float sy1) {
+                if (sy1 <= sy0) return;
+                const int id = pieceId++;
+                const std::string studName = "Stud@" + std::to_string(id);
                 if (alongX) {
-                    addBox("Support:SillStud", matStud, x0 - studW * 0.5f + c, x0 + studW * 0.5f + c,
-                           baseY, wallTop, z0, z1);
-                } else {
-                    addBox("Support:SillStud", matStud, x0, x1, baseY, wallTop,
-                           z0 + c - studW * 0.5f, z0 + c + studW * 0.5f);
-                }
-                continue;
-            }
-            const int id = pieceId++;
-            const std::string studName = "Stud@" + std::to_string(id);
-            if (alongX) {
-                const float sx = x0 + c;
-                if (inOpening) {
-                    // Header stub above the opening keeps the wall continuous up top.
+                    const float sx = x0 + c;
                     addVoronoiBoard(studName.c_str(), matStud, sx - studW * 0.5f, sx + studW * 0.5f,
-                                    openTop, wallTop, z0, z1, id);
+                                    sy0, sy1, z0, z1, id);
                 } else {
-                    addVoronoiBoard(studName.c_str(), matStud, sx - studW * 0.5f, sx + studW * 0.5f,
-                                    baseY, wallTop, z0, z1, id);
+                    const float sz = z0 + c;
+                    addVoronoiBoard(studName.c_str(), matStud, x0, x1, sy0, sy1,
+                                    sz - studW * 0.5f, sz + studW * 0.5f, id);
                 }
+            };
+            if (inOpening) {
+                // Header stub above the opening keeps the wall continuous up top.
+                emitStud(openTop, wallTop);
+            } else if (crossesWindow) {
+                emitStud(baseY, winB);
+                emitStud(winT, wallTop);
             } else {
-                const float sz = z0 + c;
-                addVoronoiBoard(studName.c_str(), matStud, x0, x1, baseY, wallTop,
-                                sz - studW * 0.5f, sz + studW * 0.5f, id);
+                emitStud(baseY, wallTop);
             }
         }
         // Cladding: horizontal planks over the studs. Each plank is one visible
         // board built from flush Voronoi prism cells sharing one group id, so a
         // hit knocks a jagged cell out of the board instead of a straight strip.
-        constexpr int boards = 5;     // planks stacked up the wall
+        // Rows crossing the window band are split into segments around the glass.
         const float cladT = 0.08f;
-        for (int b = 0; b < boards; ++b) {
-            const float by0 = baseY + (wallTop - baseY) * b / boards;
-            const float by1 = baseY + (wallTop - baseY) * (b + 1) / boards;
+        auto emitClad = [&](float c0, float c1, float by0, float by1) {
+            if (c1 - c0 < 0.25f) return;  // skip slivers
             const int id = pieceId++;
             const std::string plankName = "Cladding@" + std::to_string(id);
             if (alongX) {
-                addVoronoiBoard(plankName.c_str(), matCladding, x0, x1, by0, by1,
+                addVoronoiBoard(plankName.c_str(), matCladding, x0 + c0, x0 + c1, by0, by1,
                                 z1, z1 + cladT, id);
             } else {
                 addVoronoiBoard(plankName.c_str(), matCladding, x1, x1 + cladT, by0, by1,
-                                z0, z1, id);
+                                z0 + c0, z0 + c1, id);
+            }
+        };
+        for (int b = 0; b < boards; ++b) {
+            const float by0 = baseY + rowH * b;
+            const float by1 = baseY + rowH * (b + 1);
+            if (b >= kWinRowLo && b <= kWinRowHi && !windows.empty()) {
+                // Cut the row around each window opening.
+                float cursor = 0.0f;
+                for (const auto& w : windows) {
+                    emitClad(cursor, w.first, by0, by1);
+                    cursor = w.second;
+                }
+                emitClad(cursor, span, by0, by1);
+            } else {
+                emitClad(0.0f, span, by0, by1);
+            }
+        }
+        // Glass panes: one thin shatter-mode board per window, centred in the
+        // wall so it bonds to the cladding edges and stud stubs around it.
+        for (const auto& w : windows) {
+            const int id = pieceId++;
+            const std::string glassName = "Glass@" + std::to_string(id);
+            constexpr float glassT = 0.015f;  // half thickness
+            if (alongX) {
+                const float zc = (z0 + z1) * 0.5f;
+                addVoronoiBoard(glassName.c_str(), matGlass, x0 + w.first, x0 + w.second,
+                                winB, winT, zc - glassT, zc + glassT, id, true);
+            } else {
+                const float xc = (x0 + x1) * 0.5f;
+                addVoronoiBoard(glassName.c_str(), matGlass, xc - glassT, xc + glassT,
+                                winB, winT, z0 + w.first, z0 + w.second, id, true);
             }
         }
     };
 
-    // Front wall (+Z) with a door opening in the middle; other three solid.
-    buildWall(minX, maxX, maxZ - wall, maxZ, true, (maxX - minX) * 0.42f, (maxX - minX) * 0.58f, 2.2f);
-    buildWall(minX, maxX, minZ, minZ + wall, true, 0.0f, 0.0f, 0.0f);          // back
-    buildWall(minX, minX + wall, minZ, maxZ, false, 0.0f, 0.0f, 0.0f);         // left
-    buildWall(maxX - wall, maxX, minZ, maxZ, false, 0.0f, 0.0f, 0.0f);         // right
+    // Front wall (+Z) with a door opening in the middle and a window either
+    // side; one window on the back and each side wall.
+    const float frontSpan = maxX - minX, sideSpan = maxZ - minZ;
+    buildWall(minX, maxX, maxZ - wall, maxZ, true, frontSpan * 0.42f, frontSpan * 0.58f, 2.2f,
+              { { frontSpan * 0.10f, frontSpan * 0.30f }, { frontSpan * 0.70f, frontSpan * 0.90f } });
+    buildWall(minX, maxX, minZ, minZ + wall, true, 0.0f, 0.0f, 0.0f,
+              { { frontSpan * 0.38f, frontSpan * 0.62f } });                    // back
+    buildWall(minX, minX + wall, minZ, maxZ, false, 0.0f, 0.0f, 0.0f,
+              { { sideSpan * 0.32f, sideSpan * 0.68f } });                      // left
+    buildWall(maxX - wall, maxX, minZ, maxZ, false, 0.0f, 0.0f, 0.0f,
+              { { sideSpan * 0.32f, sideSpan * 0.68f } });                      // right
 
-    // --- Roof: two sloped slabs of rafters meeting at a ridge. Modelled as
-    // stepped boxes so they remain axis-aligned solids for collision. ---
-    const float ridgeY = wallTop + 1.1f;
+    // --- Roof: Crysis-style corrugated metal on two real angled slopes meeting
+    // at a ridge. Each slope is a row of thin panels authored flat, then tilted
+    // about its eave edge to the roof pitch. One "Roof@<id>" panel = one sheet
+    // that tears off whole when hit. ---
+    const float ridgeY = wallTop + 1.0f;          // ridge height above the eaves
     const float midX = (minX + maxX) * 0.5f;
-    constexpr int roofSteps = 6;
-    for (int s = 0; s < roofSteps; ++s) {
-        const float t0 = (float)s / roofSteps, t1 = (float)(s + 1) / roofSteps;
-        const float y0 = wallTop + (ridgeY - wallTop) * t0;
-        // Steps overlap the next one enough that even a single Voronoi cell's
-        // share of the seam clears the bond's minContactArea, so the upper roof
-        // stays attached to the lower steps.
-        const float y1 = wallTop + (ridgeY - wallTop) * t1 + 0.06f;
-        // left slope: from eave (minX) rising to ridge (midX)
-        const int leftId = pieceId++;
-        addVoronoiBoard(("Roof@" + std::to_string(leftId)).c_str(), matRoof,
-                        minX + (midX - minX) * t0, minX + (midX - minX) * t1,
-                        y0, y1, minZ - 0.2f, maxZ + 0.2f, leftId);
-        // right slope
-        const int rightId = pieceId++;
-        addVoronoiBoard(("Roof@" + std::to_string(rightId)).c_str(), matRoof,
-                        maxX - (maxX - midX) * t1, maxX - (maxX - midX) * t0,
-                        y0, y1, minZ - 0.2f, maxZ + 0.2f, rightId);
+    const float halfW = midX - minX;              // horizontal run of one slope
+    const float slopeLen = std::sqrt(halfW * halfW + (ridgeY - wallTop) * (ridgeY - wallTop));
+    const float pitch = std::atan2(ridgeY - wallTop, halfW);  // slope angle
+    constexpr int sheetsUp = 4;                   // panels up the slope
+    constexpr int sheetsZ = 3;                    // panels along the roof depth
+    constexpr float sheetT = 0.05f;               // thin metal sheet
+    constexpr float overhang = 0.25f;             // panels jut past eave & gable
+    constexpr float lapUp = 0.12f;                // each course laps onto the one below
+    const float zLo = minZ - overhang, zHi = maxZ + overhang;
+    const float zSpan = zHi - zLo;
+    const float runStep = slopeLen / sheetsUp;
+    // Build one slope: mirrorX flips it to the far side of the ridge. Panels are
+    // authored in local space (x = up-slope run from the eave, y = thickness,
+    // z = depth) then rotated by the pitch and moved onto the eave line.
+    auto buildSlope = [&](bool mirror) {
+        const float eaveX = mirror ? maxX : minX;
+        // Local +x is "up the slope". Left slope rotates +pitch so +x runs
+        // up-and-right to the ridge; the right slope uses (pi - pitch) so +x
+        // runs up-and-LEFT to the same ridge. Z is untouched, so the panel's
+        // depth stays axis-aligned.
+        const XMMATRIX rot = XMMatrixRotationZ(mirror ? (3.14159265f - pitch) : pitch);
+        const XMMATRIX place = rot * XMMatrixTranslation(eaveX, wallTop, 0.0f);
+        for (int su = 0; su < sheetsUp; ++su) {
+            const float run0 = su * runStep - overhang;              // start below eave
+            const float run1 = (su + 1) * runStep + lapUp;           // lap onto next course
+            for (int zi = 0; zi < sheetsZ; ++zi) {
+                const float zr0 = zLo + zSpan * zi / sheetsZ;
+                const float zr1 = zLo + zSpan * (zi + 1) / sheetsZ;
+                const int id = pieceId++;
+                addVoronoiBoard(("Roof@" + std::to_string(id)).c_str(), matRoof,
+                                run0, run1, 0.0f, sheetT, zr0, zr1, id, false, &place);
+            }
+        }
+    };
+    buildSlope(false);   // left slope (eave at minX)
+    buildSlope(true);    // right slope (eave at maxX)
+
+    // --- Second destructible shack from the Corrugated Metal Pack textures.
+    // It lives next to the wooden house but is still part of the same Blast
+    // asset, so bullets/grenades hit both buildings with one physics system.
+    const float sx0 = 13.0f, sx1 = 18.5f;
+    const float sz0 = 1.2f, sz1 = 5.9f;
+    const float sy0 = floorY;
+    const float slabTop = sy0 + 0.20f;
+    const float eaveY = 2.85f;
+    const float metalT = 0.06f;
+    const float panelW = 0.42f;
+    addBox("Support:MetalFoundation", matFoundation, sx0, sx1, sy0, slabTop, sz0, sz1);
+    auto addMetalPanel = [&](float x0, float x1, float y0, float y1, float z0, float z1) {
+        const int id = pieceId++;
+        addVoronoiBoard(("MetalWall@" + std::to_string(id)).c_str(), matMetalWall,
+                        x0, x1, y0, y1, z0, z1, id);
+    };
+    auto addDoorPanel = [&](float x0, float x1, float y0, float y1, float z0, float z1) {
+        const int id = pieceId++;
+        addVoronoiBoard(("DarkMetal@" + std::to_string(id)).c_str(), matDarkMetal,
+                        x0, x1, y0, y1, z0, z1, id);
+    };
+    auto metalWallX = [&](float z, bool front) {
+        const float outer0 = front ? z : z - metalT;
+        const float outer1 = front ? z + metalT : z;
+        for (float x = sx0; x < sx1 - 0.01f; x += panelW) {
+            const float nx = (std::min)(x + panelW, sx1);
+            const float c0 = x - sx0, c1 = nx - sx0;
+            const bool door = front && c1 > 2.00f && c0 < 3.35f;
+            if (door) {
+                if (c0 < 2.00f) addMetalPanel(x, sx0 + 2.00f, slabTop, eaveY, outer0, outer1);
+                if (c1 > 3.35f) addMetalPanel(sx0 + 3.35f, nx, slabTop, eaveY, outer0, outer1);
+                addMetalPanel((std::max)(x, sx0 + 2.00f), (std::min)(nx, sx0 + 3.35f),
+                              2.15f, eaveY, outer0, outer1);
+            } else {
+                addMetalPanel(x, nx, slabTop, eaveY, outer0, outer1);
+            }
+        }
+    };
+    auto metalWallZ = [&](float x, bool right) {
+        const float outer0 = right ? x : x - metalT;
+        const float outer1 = right ? x + metalT : x;
+        for (float z = sz0; z < sz1 - 0.01f; z += panelW) {
+            const float nz = (std::min)(z + panelW, sz1);
+            addMetalPanel(outer0, outer1, slabTop, eaveY, z, nz);
+        }
+    };
+    metalWallX(sz1, true);
+    metalWallX(sz0, false);
+    metalWallZ(sx0, false);
+    metalWallZ(sx1, true);
+    const float doorZ0 = sz1 + 0.012f;
+    const float doorZ1 = sz1 + metalT + 0.012f;
+    addDoorPanel(sx0 + 2.02f, sx0 + 2.64f, slabTop, 2.15f, doorZ0, doorZ1);
+    addDoorPanel(sx0 + 2.71f, sx0 + 3.33f, slabTop, 2.15f, doorZ0, doorZ1);
+
+    const float shackMidX = (sx0 + sx1) * 0.5f;
+    const float shackRidgeY = eaveY + 0.85f;
+    const float shackHalfW = shackMidX - sx0;
+    const float shackSlopeLen = std::sqrt(shackHalfW * shackHalfW + (shackRidgeY - eaveY) * (shackRidgeY - eaveY));
+    const float shackPitch = std::atan2(shackRidgeY - eaveY, shackHalfW);
+    const float shackZLo = sz0 - 0.28f, shackZHi = sz1 + 0.28f;
+    const float roofStep = shackSlopeLen / 3.0f;
+    auto addGable = [&](float z, bool front) {
+        const float outer0 = front ? z : z - metalT;
+        const float outer1 = front ? z + metalT : z;
+        for (float x = sx0; x < sx1 - 0.01f; x += panelW) {
+            const float nx = (std::min)(x + panelW, sx1);
+            const float cx = (x + nx) * 0.5f;
+            const float t = 1.0f - std::min(1.0f, std::abs(cx - shackMidX) / shackHalfW);
+            const float top = eaveY + (shackRidgeY - eaveY) * t;
+            if (top > eaveY + 0.10f) addMetalPanel(x, nx, eaveY, top, outer0, outer1);
+        }
+    };
+    addGable(sz1, true);
+    addGable(sz0, false);
+
+    constexpr float trimT = 0.085f;
+    addBox("MetalTrim@CornerFL", matTrim, sx0 - trimT, sx0 + trimT, slabTop, eaveY, sz1 - trimT, sz1 + trimT);
+    addBox("MetalTrim@CornerFR", matTrim, sx1 - trimT, sx1 + trimT, slabTop, eaveY, sz1 - trimT, sz1 + trimT);
+    addBox("MetalTrim@CornerBL", matTrim, sx0 - trimT, sx0 + trimT, slabTop, eaveY, sz0 - trimT, sz0 + trimT);
+    addBox("MetalTrim@CornerBR", matTrim, sx1 - trimT, sx1 + trimT, slabTop, eaveY, sz0 - trimT, sz0 + trimT);
+    addBox("MetalTrim@DoorL", matTrim, sx0 + 1.92f, sx0 + 2.02f, slabTop, 2.28f, sz1 + metalT, sz1 + metalT + 0.08f);
+    addBox("MetalTrim@DoorR", matTrim, sx0 + 3.33f, sx0 + 3.43f, slabTop, 2.28f, sz1 + metalT, sz1 + metalT + 0.08f);
+    addBox("MetalTrim@DoorTop", matTrim, sx0 + 1.92f, sx0 + 3.43f, 2.15f, 2.28f, sz1 + metalT, sz1 + metalT + 0.08f);
+    addBox("MetalTrim@DoorSplit", matTrim, sx0 + 2.66f, sx0 + 2.72f, slabTop, 2.15f, sz1 + metalT + 0.01f, sz1 + metalT + 0.09f);
+    addBox("MetalTrim@RidgeCap", matTrim, shackMidX - 0.09f, shackMidX + 0.09f, shackRidgeY - 0.05f, shackRidgeY + 0.08f, shackZLo, shackZHi);
+    addBox("MetalTrim@LeftEave", matTrim, sx0 - 0.38f, sx0 - 0.20f, eaveY - 0.13f, eaveY + 0.03f, shackZLo, shackZHi);
+    addBox("MetalTrim@RightEave", matTrim, sx1 + 0.20f, sx1 + 0.38f, eaveY - 0.13f, eaveY + 0.03f, shackZLo, shackZHi);
+    addBox("MetalTrim@FrontFascia", matTrim, sx0 - 0.28f, sx1 + 0.28f, eaveY - 0.10f, eaveY + 0.05f, sz1 + 0.19f, sz1 + 0.31f);
+    addBox("MetalTrim@BackFascia", matTrim, sx0 - 0.28f, sx1 + 0.28f, eaveY - 0.10f, eaveY + 0.05f, sz0 - 0.31f, sz0 - 0.19f);
+    for (float x = sx0 + 0.25f; x < sx1 - 0.2f; x += 0.84f) {
+        addBox("DarkMetal@ScrewFront", matDarkMetal, x, x + 0.055f, eaveY - 0.30f, eaveY - 0.23f, sz1 + metalT + 0.015f, sz1 + metalT + 0.04f);
+        addBox("DarkMetal@ScrewFront", matDarkMetal, x, x + 0.055f, slabTop + 0.55f, slabTop + 0.62f, sz1 + metalT + 0.015f, sz1 + metalT + 0.04f);
     }
+
+    auto buildMetalSlope = [&](bool mirror) {
+        const float eaveX = mirror ? sx1 : sx0;
+        const XMMATRIX rot = XMMatrixRotationZ(mirror ? (3.14159265f - shackPitch) : shackPitch);
+        const XMMATRIX place = rot * XMMatrixTranslation(eaveX, eaveY, 0.0f);
+        for (int up = 0; up < 3; ++up) {
+            for (int zi = 0; zi < 3; ++zi) {
+                const float zr0 = shackZLo + (shackZHi - shackZLo) * zi / 3.0f;
+                const float zr1 = shackZLo + (shackZHi - shackZLo) * (zi + 1) / 3.0f;
+                const int id = pieceId++;
+                addVoronoiBoard(("MetalRoof@" + std::to_string(id)).c_str(), matMetalRoof,
+                                up * roofStep - 0.22f, (up + 1) * roofStep + 0.12f,
+                                0.0f, metalT, zr0, zr1, id, false, &place);
+            }
+        }
+    };
+    buildMetalSlope(false);
+    buildMetalSlope(true);
 
     root->UpdateGlobalTransform(root->localTransform);
     return root;

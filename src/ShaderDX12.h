@@ -40,7 +40,7 @@ struct alignas(256) ObjectBufferDX12 {
     float metalness;
     float roughness;
     float useNormalMap;    // > 0.5 enabled
-    float padding;
+    float metalRoughMode;  // 0=none, 1=glTF packed, 2=roughness-only
 };
 
 struct PointLightDataDX12 {
@@ -167,8 +167,11 @@ public:
     }
 };
 
-// Maximum draw calls per frame (for per-object constant buffers)
-static const UINT MAX_DRAW_CALLS_PER_FRAME = 256;
+// Maximum draw calls per frame (for per-object constant buffers). Must cover
+// every destruction chunk (the Voronoi house alone is ~360 pieces) plus scene
+// objects, projectiles and particles -- overflowing clamps draws to one shared
+// constant slot and geometry visibly glues itself to the last-drawn object.
+static const UINT MAX_DRAW_CALLS_PER_FRAME = 1024;
 
 class ShaderDX12 {
 public:
@@ -596,14 +599,15 @@ public:
         data.metalness = 0.0f;
         data.roughness = 0.5f;
         data.useNormalMap = 0.0f;
-        data.padding = 0.0f;
+        data.metalRoughMode = 0.0f;
         
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
     }
     
     void SetObjectMaterial(const XMFLOAT3& color, bool useTex, bool useNorm, float metal, float rough,
-                          ID3D12Resource* albedo, ID3D12Resource* normal, ID3D12Resource* metalRough) {
+                          ID3D12Resource* albedo, ID3D12Resource* normal, ID3D12Resource* metalRough,
+                          bool roughnessOnly = false) {
         UINT bufferIndex = GetDrawCallIndex();
         
         ObjectBufferDX12 data;
@@ -612,6 +616,7 @@ public:
         data.useNormalMap = useNorm ? 1.0f : 0.0f;
         data.metalness = metal;
         data.roughness = rough;
+        data.metalRoughMode = metalRough ? (roughnessOnly ? 2.0f : 1.0f) : 0.0f;
         
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));

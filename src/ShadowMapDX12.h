@@ -12,7 +12,7 @@
 #include <sstream>
 
 static const UINT SHADOW_MAP_SIZE = 2048;
-static const UINT SHADOW_MAX_DRAWS = 512;
+static const UINT SHADOW_MAX_DRAWS = 4096;
 
 class DepthOnlyShaderDX12 {
 public:
@@ -247,6 +247,14 @@ public:
             depthShader.SetMatrices(model, lightSpace);
             DrawCube(geo);
             depthShader.NextDrawCall();
+        }
+
+        // Detached chunks keep casting shadows from their live physics poses.
+        if (scene.useDestruction && g_destruction.IsInitialized()) {
+            for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
+                DrawSceneNodeShadow(item.node, depthShader,
+                                    XMLoadFloat4x4(&item.transform), lightSpace);
+            }
         }
 
         if (scene.cube2.visible) {
