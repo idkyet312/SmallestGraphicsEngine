@@ -309,7 +309,7 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
 // bonds touching pieces so a hit tears loose only what it structurally frees.
 static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     // House footprint (world units). Front faces +Z toward the spawn area.
-    constexpr float minX = 4.0f, maxX = 11.0f;   // width
+    constexpr float minX = -7.0f, maxX = 0.0f;   // flat terrain near world origin
     constexpr float minZ = 1.0f, maxZ = 6.0f;    // depth
     constexpr float floorY = 0.0f, wallTop = 3.4f;
     constexpr float wall = 0.28f;                // wall / slab thickness
@@ -633,10 +633,16 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
             const int id = pieceId++;
             const std::string plankName = "Cladding@" + std::to_string(id);
             if (alongX) {
+                const bool front = (z0 + z1) * 0.5f > (minZ + maxZ) * 0.5f;
+                const float cz0 = front ? z1 : z0 - cladT;
+                const float cz1 = front ? z1 + cladT : z0;
                 addVoronoiBoard(plankName.c_str(), matCladding, x0 + c0, x0 + c1, by0, by1,
-                                z1, z1 + cladT, id);
+                                cz0, cz1, id);
             } else {
-                addVoronoiBoard(plankName.c_str(), matCladding, x1, x1 + cladT, by0, by1,
+                const bool right = (x0 + x1) * 0.5f > (minX + maxX) * 0.5f;
+                const float cx0 = right ? x1 : x0 - cladT;
+                const float cx1 = right ? x1 + cladT : x0;
+                addVoronoiBoard(plankName.c_str(), matCladding, cx0, cx1, by0, by1,
                                 z0 + c0, z0 + c1, id);
             }
         };
@@ -731,7 +737,7 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     // --- Second destructible shack from the Corrugated Metal Pack textures.
     // It lives next to the wooden house but is still part of the same Blast
     // asset, so bullets/grenades hit both buildings with one physics system.
-    const float sx0 = 13.0f, sx1 = 18.5f;
+    const float sx0 = 2.0f, sx1 = 7.5f;
     const float sz0 = 1.2f, sz1 = 5.9f;
     const float sy0 = floorY;
     const float slabTop = sy0 + 0.20f;
