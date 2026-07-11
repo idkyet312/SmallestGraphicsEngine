@@ -15,12 +15,16 @@
 extern MeshShaderDX12 g_meshShader;
 extern bool g_useMeshShader;
 extern TerrainRendererDX12 g_terrain;
+extern bool g_showH2Model;
 
 struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
     ComPtr<ID3D12Resource>   planeVertexBuffer;
+    ComPtr<ID3D12Resource>   sphereVertexBuffer;
     D3D12_VERTEX_BUFFER_VIEW cubeVBV  = {};
     D3D12_VERTEX_BUFFER_VIEW planeVBV = {};
+    D3D12_VERTEX_BUFFER_VIEW sphereVBV = {};
+    UINT                     sphereVertexCount = 0;
 };
 
 // Vertex layout shared across renderers
@@ -70,6 +74,31 @@ inline void DrawPlane(const GeometryBuffers& geo) {
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.planeVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_dx12.commandList->DrawInstanced(6, 1, 0, 0);
+}
+
+inline void DrawSphere(const GeometryBuffers& geo) {
+    if (!geo.sphereVertexCount) { DrawCube(geo); return; }
+    g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.sphereVBV);
+    g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_dx12.commandList->DrawInstanced(geo.sphereVertexCount, 1, 0, 0);
+}
+
+// UV sphere as a non-indexed triangle list of VertexPosNormUV.
+inline std::vector<VertexPosNormUV> BuildSphereVertices(int stacks = 12, int slices = 16) {
+    std::vector<VertexPosNormUV> verts;
+    auto at = [&](int st, int sl) {
+        const float v = (float)st / stacks, u = (float)sl / slices;
+        const float phi = v * 3.14159265f, theta = u * 2.0f * 3.14159265f;
+        const float sp = sinf(phi), cp = cosf(phi), stc = sinf(theta), ctc = cosf(theta);
+        XMFLOAT3 n(sp * ctc, cp, sp * stc);
+        return VertexPosNormUV{ { n.x * 0.5f, n.y * 0.5f, n.z * 0.5f }, n, { u, v } };
+    };
+    for (int st = 0; st < stacks; ++st) for (int sl = 0; sl < slices; ++sl) {
+        VertexPosNormUV a = at(st, sl), b = at(st + 1, sl), c = at(st + 1, sl + 1), d = at(st, sl + 1);
+        verts.push_back(a); verts.push_back(b); verts.push_back(c);
+        verts.push_back(a); verts.push_back(c); verts.push_back(d);
+    }
+    return verts;
 }
 
 // Draw an imported GLB scene graph node (and its children) with an extra
@@ -203,17 +232,11 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Cube 1 - draw the imported model if loaded, else fall back to the procedural cube.
     // The model is its own multi-meter scene (not a unit cube), so place it directly
     // on the floor at the origin rather than reusing cube1's small transform.
-    if (crateModel) {
+    if (crateModel && g_showH2Model) {
         DrawSceneNode(crateModel, shader, XMMatrixIdentity(), view, proj, lightSpace);
         // Imported model used the mesh pipeline. Restore IA pipeline for
         // procedural objects that follow it.
         shader.Use(scene.wireframeMode);
-    } else {
-        model = scene.cube1.GetModelMatrix();
-        shader.SetMatrices(model, view, proj, lightSpace);
-        shader.SetObjectColor(scene.cube1.color);
-        DrawCube(geo);
-        shader.NextDrawCall();
     }
 
     // Separate destructible brick wall beside the house.
@@ -240,7 +263,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         model = model * XMMatrixTranslation(p.position.x, p.position.y, p.position.z);
         shader.SetMatrices(model, view, proj, lightSpace);
         shader.SetObjectColor(scene.projectileColor);
-        DrawCube(geo);
+        DrawSphere(geo);
         shader.NextDrawCall();
     }
 

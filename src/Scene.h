@@ -88,18 +88,22 @@ struct Scene {
     std::vector<Projectile> projectiles;
     float projectileSpeed    = 50.0f;
     float projectileLifetime = 3.0f;
-    XMFLOAT3 projectileColor = { 1.0f, 0.8f, 0.0f };
+    XMFLOAT3 projectileColor = { 1.0f, 1.0f, 1.0f };
     float projectileScale    = 0.1f;
+    bool  autoFire           = true;    // hold mouse to keep firing
+    float fireInterval       = 0.1f;    // seconds between auto-fire shots
+    float fireCooldown       = 0.0f;    // time left before next shot may fire
 
     // NVIDIA Blast + Box3D destructible house
     bool  useDestruction = true;
     int   destructionGridX = 4;
     int   destructionGridY = 3;
     int   destructionGridZ = 4;
-    float destructionDamageRadius = 1.75f;
-    float destructionDamage = 2.0f;
+    float destructionDamageRadius = 0.9f;   // tight blast so hits stay local
+    float destructionDamage = 0.3f;         // fraction of bond health per shot (~3-4 hits to break)
     float destructionBulletImpulse = 260.0f;
     bool  rebuildDestructionRequested = false;
+    bool  showDestructionDebug = false;
 
     // Clustered renderer
     ClusteredRendererDX12 clusteredRenderer;

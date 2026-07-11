@@ -157,6 +157,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat3("Offset",    &scene.gun.offset.x,   0.01f);
         ImGui::DragFloat3("Scale##gun",&scene.gun.scale.x,     0.01f);
         ImGui::DragFloat3("Rot##gun",  &scene.gun.rotation.x,  1.0f);
+        ImGui::Checkbox("Auto Fire", &scene.autoFire);
+        ImGui::DragFloat("Fire Interval", &scene.fireInterval, 0.005f, 0.02f, 1.0f, "%.3f s");
     }
 
     if (ImGui::CollapsingHeader("Destruction", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -165,6 +167,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat("Damage", &scene.destructionDamage, 0.1f, 0.1f, 10.0f);
         ImGui::DragFloat("Bullet Impulse", &scene.destructionBulletImpulse, 5.0f, 0.0f, 1000.0f);
         ImGui::Text("Wall: %u chunks  %u actors", g_destruction.GetChunkCount(), g_destruction.GetActorCount());
+        ImGui::Checkbox("Blast Debug Draw", &scene.showDestructionDebug);
         if (ImGui::Button("Rebuild Wall")) scene.rebuildDestructionRequested = true;
     }
 

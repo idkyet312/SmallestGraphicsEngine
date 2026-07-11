@@ -12,6 +12,33 @@ struct DestructionRenderItem {
     DirectX::XMFLOAT4X4 transform;
 };
 
+// Snapshot of the live Blast/Box3D state for on-screen debug drawing.
+struct DestructionDebugChunk {
+    DirectX::XMFLOAT3 worldMin;   // AABB corners already in world space
+    DirectX::XMFLOAT3 worldMax;
+    DirectX::XMFLOAT3 worldCenter;
+    bool support = false;         // anchored to the world
+    bool dynamic = false;         // owning actor is simulated
+};
+
+struct DestructionDebugBond {
+    DirectX::XMFLOAT3 a;          // world-space chunk centers the bond joins
+    DirectX::XMFLOAT3 b;
+    bool broken = false;         // healthy vs. severed
+    float health = 0.0f;         // live bond health (0 = gone, kBondHealth = full)
+    float healthFraction = 0.0f; // health normalized to [0,1]
+};
+
+struct DestructionDebugData {
+    std::vector<DestructionDebugChunk> chunks;
+    std::vector<DestructionDebugBond> bonds;
+    DirectX::XMFLOAT3 lastHit = {};
+    bool hasHit = false;
+    float hitRadius = 0.0f;
+    uint32_t actorCount = 0;
+    uint32_t dynamicActorCount = 0;
+};
+
 class DestructionDX12 final : public Nv::Blast::TkEventListener {
 public:
     DestructionDX12();
@@ -37,6 +64,7 @@ public:
     uint32_t GetChunkCount() const;
     uint32_t GetActorCount() const;
     const std::vector<DestructionRenderItem>& GetRenderItems() const;
+    DestructionDebugData GetDebugData() const;
 
     void receive(const Nv::Blast::TkEvent* events, uint32_t eventCount) override;
 

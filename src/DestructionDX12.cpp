@@ -2,6 +2,7 @@
 #include "DestructionDX12.h"
 
 #include "GLBImporter.h"
+#include "NvBlast.h"
 #include "NvBlastTkActor.h"
 #include "NvBlastTkAsset.h"
 #include "NvBlastTkFamily.h"
@@ -23,6 +24,9 @@ using namespace Nv::Blast;
 
 namespace {
 constexpr uint32_t InvalidIndex = 0xFFFFFFFFu;
+// Uniform starting health for every bond/chunk. A bullet's per-hit damage is a
+// fraction of this, so a joint takes several hits before it lets go.
+constexpr float kBondHealth = 1.0f;
 TkFramework* SharedTkFramework = nullptr;
 uint32_t SharedTkFrameworkUsers = 0;
 
@@ -50,6 +54,41 @@ struct RadialDamageParams {
     uint32_t targetChunk;
 };
 
+// Marks a set of chunks whose remaining bonds should all be severed, used to
+// drop pieces left hanging by fewer than a minimum number of bonds.
+struct IsolateChunksParams {
+    const uint8_t* breakChunk;  // indexed by asset chunk index; nonzero = sever its bonds
+    uint32_t chunkCount;
+};
+
+void IsolateGraphShader(NvBlastFractureBuffers* commands,
+                        const NvBlastGraphShaderActor* actor, const void* rawParams) {
+    const auto& params = *static_cast<const IsolateChunksParams*>(rawParams);
+    const uint32_t capacity = commands->bondFractureCount;
+    commands->bondFractureCount = 0;
+    commands->chunkFractureCount = 0;
+    for (uint32_t node = actor->firstGraphNodeIndex; node != InvalidIndex;
+         node = actor->graphNodeIndexLinks[node]) {
+        for (uint32_t edge = actor->adjacencyPartition[node];
+             edge < actor->adjacencyPartition[node + 1]; ++edge) {
+            const uint32_t other = actor->adjacentNodeIndices[edge];
+            if (node >= other || actor->nodeActorIndices[other] != actor->actorIndex) continue;
+            const uint32_t chunkA = actor->chunkIndices[node];
+            const uint32_t chunkB = actor->chunkIndices[other];
+            const bool breakIt = (chunkA < params.chunkCount && params.breakChunk[chunkA]) ||
+                                 (chunkB < params.chunkCount && params.breakChunk[chunkB]);
+            if (!breakIt || commands->bondFractureCount >= capacity) continue;
+            const uint32_t bondIndex = actor->adjacentBondIndices[edge];
+            NvBlastBondFractureData& fracture =
+                commands->bondFractures[commands->bondFractureCount++];
+            fracture.userdata = actor->assetBonds[bondIndex].userData;
+            fracture.nodeIndex0 = node;
+            fracture.nodeIndex1 = other;
+            fracture.health = FLT_MAX;  // sever completely
+        }
+    }
+}
+
 void RadialGraphShader(NvBlastFractureBuffers* commands,
                        const NvBlastGraphShaderActor* actor, const void* rawParams) {
     const auto& params = *static_cast<const RadialDamageParams*>(rawParams);
@@ -66,19 +105,21 @@ void RadialGraphShader(NvBlastFractureBuffers* commands,
             if (node >= other || actor->nodeActorIndices[other] != actor->actorIndex) continue;
             const uint32_t bondIndex = actor->adjacentBondIndices[edge];
             const NvBlastBond& bond = actor->assetBonds[bondIndex];
-            const bool touchesHitChunk = actor->chunkIndices[node] == params.targetChunk ||
-                                         actor->chunkIndices[other] == params.targetChunk;
             const float dx = bond.centroid[0] - params.position[0];
             const float dy = bond.centroid[1] - params.position[1];
             const float dz = bond.centroid[2] - params.position[2];
-            if ((!touchesHitChunk && dx * dx + dy * dy + dz * dz > radiusSquared) ||
-                commands->bondFractureCount >= capacity) continue;
+            const float distanceSquared = dx * dx + dy * dy + dz * dz;
+            // Only bonds whose seam lies within the blast radius take damage, and
+            // the damage falls off with distance so the impact stays local
+            // instead of severing an entire wall in one shot.
+            if (distanceSquared > radiusSquared || commands->bondFractureCount >= capacity) continue;
+            const float falloff = 1.0f - std::sqrt(distanceSquared) / std::max(0.0001f, params.radius);
             NvBlastBondFractureData& fracture =
                 commands->bondFractures[commands->bondFractureCount++];
             fracture.userdata = bond.userData;
             fracture.nodeIndex0 = node;
             fracture.nodeIndex1 = other;
-            fracture.health = params.damage;
+            fracture.health = params.damage * std::max(0.15f, falloff);
         }
     }
 }
@@ -154,7 +195,9 @@ struct DestructionDX12::Impl {
     std::shared_ptr<SceneNode> source;
     ID3D12Device* device = nullptr;
     int gridX = 4, gridY = 3, gridZ = 4;
+    struct BondPair { uint32_t a = 0, b = 0; };  // chunk indices (0-based)
     std::vector<Chunk> chunks;
+    std::vector<BondPair> bondPairs;              // for debug visualization
     std::list<std::unique_ptr<ActorRuntime>> actors;
     std::vector<DestructionRenderItem> renderItems;
     TkFramework* framework = nullptr;
@@ -165,6 +208,7 @@ struct DestructionDX12::Impl {
     b3BodyId ground = b3_nullBodyId;
     float accumulator = 0.0f;
     XMFLOAT3 lastDamagePosition = {};
+    float lastDamageRadius = 0.0f;
     bool initialized = false;
 
     bool BuildChunks() {
@@ -323,38 +367,78 @@ struct DestructionDX12::Impl {
             desc.userData = i;
         }
 
-        // Bond any two chunks whose AABBs touch/overlap. This works for
-        // arbitrary structural pieces (planks, beams, cells) rather than a
-        // strict grid, so real seams -- plank-to-plank, plank-to-beam -- weld
-        // until a hit tears that specific joint apart.
-        std::vector<NvBlastBondDesc> bonds;
-        constexpr float touchSlop = 0.05f;
+        // Bond only chunks that share a genuine, local face contact -- adjacent
+        // pieces whose faces actually meet -- rather than anything that merely
+        // overlaps. This keeps the support graph local: a stud bonds to its
+        // immediate neighbours, not to a distant wall it happens to graze, so a
+        // hit tears loose only the pieces around it.
+        constexpr float touchSlop = 0.3f;       // faces may sit a small gap apart and still bond
+        constexpr float minContactArea = 0.04f;  // require a substantial shared face
+        constexpr uint32_t maxNeighbours = 10;   // each chunk keeps up to its 10 closest bonds
+
+        // First gather every candidate face contact, then keep only the closest
+        // few per chunk so each piece bonds to just its nearest neighbours.
+        struct Candidate { uint32_t a, b; float nx, ny, nz, area, distSq; };
+        std::vector<Candidate> candidates;
         for (uint32_t a = 0; a < chunks.size(); ++a) for (uint32_t b = a + 1; b < chunks.size(); ++b) {
             const Chunk& ca = chunks[a];
             const Chunk& cb = chunks[b];
-            // Overlap (with slop) required on all three axes to count as touching.
             const float ox = std::min(ca.maximum.x, cb.maximum.x) - std::max(ca.minimum.x, cb.minimum.x);
             const float oy = std::min(ca.maximum.y, cb.maximum.y) - std::max(ca.minimum.y, cb.minimum.y);
             const float oz = std::min(ca.maximum.z, cb.maximum.z) - std::max(ca.minimum.z, cb.minimum.z);
+            // Must touch on all axes (small negative = a hair's gap is allowed).
             if (ox < -touchSlop || oy < -touchSlop || oz < -touchSlop) continue;
-            // Contact normal points along the thinnest overlap axis (the seam).
-            float nx = 0, ny = 0, nz = 0, area = 0;
+            // The seam is the thinnest-overlap axis. A real face contact meets
+            // near-flush there (|overlap| small): deep interpenetration means the
+            // pieces are stacked/nested, not edge-adjacent -- skip those so bonds
+            // stay between true neighbours.
             const float overlaps[3] = { ox, oy, oz };
             const int seam = (overlaps[0] <= overlaps[1] && overlaps[0] <= overlaps[2]) ? 0
                            : (overlaps[1] <= overlaps[2] ? 1 : 2);
+            if (overlaps[seam] > touchSlop) continue;  // faces not flush -> not a seam
+            float nx = 0, ny = 0, nz = 0, area = 0;
             const float clampX = std::max(0.0f, ox), clampY = std::max(0.0f, oy), clampZ = std::max(0.0f, oz);
-            if (seam == 0) { nx = cb.center.x >= ca.center.x ? 1.0f : -1.0f; area = std::max(0.01f, clampY * clampZ); }
-            else if (seam == 1) { ny = cb.center.y >= ca.center.y ? 1.0f : -1.0f; area = std::max(0.01f, clampX * clampZ); }
-            else { nz = cb.center.z >= ca.center.z ? 1.0f : -1.0f; area = std::max(0.01f, clampX * clampY); }
+            if (seam == 0) { nx = cb.center.x >= ca.center.x ? 1.0f : -1.0f; area = clampY * clampZ; }
+            else if (seam == 1) { ny = cb.center.y >= ca.center.y ? 1.0f : -1.0f; area = clampX * clampZ; }
+            else { nz = cb.center.z >= ca.center.z ? 1.0f : -1.0f; area = clampX * clampY; }
+            // Reject tiny grazing contacts -- a bond needs a real shared face.
+            if (area < minContactArea) continue;
+            const float cdx = cb.center.x - ca.center.x, cdy = cb.center.y - ca.center.y,
+                        cdz = cb.center.z - ca.center.z;
+            candidates.push_back({ a, b, nx, ny, nz, area, cdx * cdx + cdy * cdy + cdz * cdz });
+        }
+
+        // Keep a candidate only if it ranks among each endpoint's closest few, so
+        // every chunk bonds to just its nearest neighbours -- a super-local graph.
+        std::vector<std::vector<uint32_t>> perChunk(chunks.size());  // candidate indices
+        for (uint32_t i = 0; i < candidates.size(); ++i) {
+            perChunk[candidates[i].a].push_back(i);
+            perChunk[candidates[i].b].push_back(i);
+        }
+        for (auto& list : perChunk) {
+            std::sort(list.begin(), list.end(), [&](uint32_t l, uint32_t r) {
+                return candidates[l].distSq < candidates[r].distSq;
+            });
+        }
+        auto rankFor = [&](uint32_t chunk, uint32_t candIndex) -> uint32_t {
+            const auto& list = perChunk[chunk];
+            for (uint32_t r = 0; r < list.size(); ++r) if (list[r] == candIndex) return r;
+            return 0xFFFFFFFFu;
+        };
+        std::vector<NvBlastBondDesc> bonds;
+        for (uint32_t i = 0; i < candidates.size(); ++i) {
+            const Candidate& c = candidates[i];
+            if (rankFor(c.a, i) >= maxNeighbours || rankFor(c.b, i) >= maxNeighbours) continue;
             NvBlastBondDesc bond = {};
-            bond.chunkIndices[0] = a + 1; bond.chunkIndices[1] = b + 1;
-            bond.bond.normal[0] = nx; bond.bond.normal[1] = ny; bond.bond.normal[2] = nz;
-            bond.bond.centroid[0] = (ca.center.x + cb.center.x) * 0.5f;
-            bond.bond.centroid[1] = (ca.center.y + cb.center.y) * 0.5f;
-            bond.bond.centroid[2] = (ca.center.z + cb.center.z) * 0.5f;
-            bond.bond.area = area;
+            bond.chunkIndices[0] = c.a + 1; bond.chunkIndices[1] = c.b + 1;
+            bond.bond.normal[0] = c.nx; bond.bond.normal[1] = c.ny; bond.bond.normal[2] = c.nz;
+            bond.bond.centroid[0] = (chunks[c.a].center.x + chunks[c.b].center.x) * 0.5f;
+            bond.bond.centroid[1] = (chunks[c.a].center.y + chunks[c.b].center.y) * 0.5f;
+            bond.bond.centroid[2] = (chunks[c.a].center.z + chunks[c.b].center.z) * 0.5f;
+            bond.bond.area = c.area;
             bond.bond.userData = (uint32_t)bonds.size();
             bonds.push_back(bond);
+            bondPairs.push_back({ c.a, c.b });
         }
 
         TkAssetDesc assetDesc;
@@ -365,7 +449,15 @@ struct DestructionDX12::Impl {
         TkGroupDesc groupDesc = {}; groupDesc.workerCount = 1;
         group = framework->createGroup(groupDesc);
         if (!group) return false;
+        // Give every bond and chunk the same starting health so a hit removes a
+        // predictable fraction of it. Default health tracks bond area, and our
+        // structural pieces have tiny contact faces, so bonds would otherwise be
+        // near-zero health and shatter the whole house in one shot.
+        std::vector<float> bondHealths(bonds.size(), kBondHealth);
+        std::vector<float> chunkHealths(chunks.size(), kBondHealth);
         TkActorDesc actorDesc(asset);
+        actorDesc.initialBondHealths = bondHealths.empty() ? nullptr : bondHealths.data();
+        actorDesc.initialSupportChunkHealths = chunkHealths.empty() ? nullptr : chunkHealths.data();
         TkActor* actor = framework->createActor(actorDesc);
         if (!actor) return false;
         family = &actor->getFamily();
@@ -488,6 +580,65 @@ struct DestructionDX12::Impl {
             for (uint32_t chunk : runtime->chunks) renderItems.push_back({ chunks[chunk].node, stored });
         }
     }
+
+    // Any non-support chunk left hanging by fewer than kMinBonds live bonds is
+    // cut loose so it falls, matching real structures where a piece needs at
+    // least a couple of solid connections to stay attached. Cascades: dropping
+    // one piece can leave a neighbour under-connected, so repeat until stable.
+    void DropUnderConnectedChunks() {
+        // Drop a piece only once it has NO live bonds left. Using a higher
+        // threshold cascades: isolating the struck chunk drops its neighbours to
+        // one bond, which would then fall too, chaining across the whole wall.
+        constexpr uint32_t kMinBonds = 1;
+        if (!asset) return;
+        const uint32_t assetBondCount = asset->getBondCount();
+
+        for (int pass = 0; pass < 8; ++pass) {
+            bool anyMarked = false;
+            // damage() defers the fracture until group->process(), so the per-
+            // actor break mask and params must outlive this loop. Keep them in
+            // stable storage (deque never reallocates its elements).
+            std::list<std::vector<uint8_t>> masks;
+            std::list<IsolateChunksParams> paramStore;
+            for (auto& runtime : actors) {
+                if (!runtime->actor) continue;
+                const NvBlastActor* ll = runtime->actor->getActorLL();
+                if (!ll) continue;
+                const float* bondHealths = NvBlastActorGetBondHealths(ll, nullptr);
+                if (!bondHealths) continue;
+
+                // Count this actor's live bonds per chunk.
+                std::unordered_map<uint32_t, uint32_t> liveBonds;  // chunkIndex(0-based) -> count
+                for (uint32_t bp = 0; bp < bondPairs.size() && bp < assetBondCount; ++bp) {
+                    if (bondHealths[bp] <= 0.0f) continue;
+                    const uint32_t ca = bondPairs[bp].a, cb = bondPairs[bp].b;
+                    const bool ownsA = std::find(runtime->chunks.begin(), runtime->chunks.end(), ca) != runtime->chunks.end();
+                    const bool ownsB = std::find(runtime->chunks.begin(), runtime->chunks.end(), cb) != runtime->chunks.end();
+                    if (ownsA && ownsB) { ++liveBonds[ca]; ++liveBonds[cb]; }
+                }
+
+                std::vector<uint8_t> mask(chunks.size() + 1, 0);  // asset chunk index; 0 = root
+                bool actorMarked = false;
+                for (uint32_t chunkIndex : runtime->chunks) {
+                    if (chunks[chunkIndex].support) continue;         // anchored: never auto-drop
+                    if (runtime->chunks.size() <= 1) continue;         // already a loose single piece
+                    if (liveBonds[chunkIndex] < kMinBonds) {
+                        mask[chunkIndex + 1] = 1;                       // asset chunk index = 0-based + 1
+                        actorMarked = true;
+                    }
+                }
+                if (actorMarked) {
+                    masks.push_back(std::move(mask));
+                    paramStore.push_back({ masks.back().data(), (uint32_t)masks.back().size() });
+                    const NvBlastDamageProgram program = { IsolateGraphShader, nullptr };
+                    runtime->actor->damage(program, &paramStore.back());
+                    anyMarked = true;
+                }
+            }
+            if (!anyMarked) break;
+            group->process();  // splits off the newly isolated chunks
+        }
+    }
 };
 
 DestructionDX12::DestructionDX12() : m(std::make_unique<Impl>()) { m->owner = this; }
@@ -597,17 +748,20 @@ bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3&
 void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float radius, float damage) {
     if (!m->initialized) return;
     m->lastDamagePosition = worldPosition;
-    const NvBlastDamageProgram program = { RadialGraphShader, nullptr };
-    std::vector<RadialDamageParams> params;
-    params.reserve(m->actors.size());
+    m->lastDamageRadius = radius;
+    // Break only the single piece that was hit: find the chunk nearest the
+    // impact and sever its bonds so it splits off and falls. Neighbours are
+    // left completely untouched -- no radial spread.
+    (void)damage;  // no radial falloff damage; each hit frees exactly one piece
+    Impl::ActorRuntime* hitActor = nullptr;
+    uint32_t hitChunk = InvalidIndex;   // 0-based chunk index of the struck piece
+    float bestDistanceSquared = FLT_MAX;
     for (auto& runtime : m->actors) {
         const b3Vec3 local = b3Body_GetLocalPoint(runtime->body,
             { worldPosition.x, worldPosition.y, worldPosition.z });
         const XMFLOAT3 modelHit(local.x + runtime->center.x,
                                 local.y + runtime->center.y,
                                 local.z + runtime->center.z);
-        uint32_t targetChunk = InvalidIndex;
-        float nearestDistanceSquared = FLT_MAX;
         for (uint32_t chunkIndex : runtime->chunks) {
             const Impl::Chunk& chunk = m->chunks[chunkIndex];
             const float x = std::max(chunk.minimum.x, std::min(modelHit.x, chunk.maximum.x));
@@ -615,17 +769,26 @@ void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float rad
             const float z = std::max(chunk.minimum.z, std::min(modelHit.z, chunk.maximum.z));
             const float dx = modelHit.x - x, dy = modelHit.y - y, dz = modelHit.z - z;
             const float distanceSquared = dx * dx + dy * dy + dz * dz;
-            if (distanceSquared < nearestDistanceSquared) {
-                nearestDistanceSquared = distanceSquared;
-                targetChunk = chunkIndex + 1; // Blast leaf index; root is zero.
+            if (distanceSquared < bestDistanceSquared) {
+                bestDistanceSquared = distanceSquared;
+                hitActor = runtime.get();
+                hitChunk = chunkIndex;
             }
         }
-        if (targetChunk == InvalidIndex || nearestDistanceSquared > radius * radius) continue;
-        params.push_back({ { modelHit.x, modelHit.y, modelHit.z }, radius, damage, targetChunk });
-        runtime->actor->damage(program, &params.back());
     }
+
     const uint32_t actorsBefore = (uint32_t)m->actors.size();
-    m->group->process();
+    if (hitActor && hitActor->actor && hitChunk != InvalidIndex &&
+        !m->chunks[hitChunk].support) {
+        // Sever exactly the struck piece's bonds so it splits off and falls.
+        std::vector<uint8_t> mask(m->chunks.size() + 1, 0);  // asset chunk index; 0 = root
+        mask[hitChunk + 1] = 1;
+        IsolateChunksParams isolateParams{ mask.data(), (uint32_t)mask.size() };
+        const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
+        hitActor->actor->damage(isolate, &isolateParams);
+        m->group->process();
+    }
+    m->DropUnderConnectedChunks();
     m->RebuildRenderItems();
     std::cout << "Blast hit: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
 }
@@ -707,3 +870,71 @@ bool DestructionDX12::IsInitialized() const { return m && m->initialized; }
 uint32_t DestructionDX12::GetChunkCount() const { return m ? (uint32_t)m->chunks.size() : 0; }
 uint32_t DestructionDX12::GetActorCount() const { return m ? (uint32_t)m->actors.size() : 0; }
 const std::vector<DestructionRenderItem>& DestructionDX12::GetRenderItems() const { return m->renderItems; }
+
+DestructionDebugData DestructionDX12::GetDebugData() const {
+    DestructionDebugData data;
+    if (!m || !m->initialized) return data;
+    data.hasHit = m->lastDamagePosition.x != 0.0f || m->lastDamagePosition.y != 0.0f ||
+                  m->lastDamagePosition.z != 0.0f;
+    data.lastHit = m->lastDamagePosition;
+    data.hitRadius = m->lastDamageRadius;
+
+    // Map each chunk to its owning actor so bonds can be flagged severed when
+    // their two chunks now live in different actors (islands).
+    std::unordered_map<uint32_t, const Impl::ActorRuntime*> chunkOwner;
+    data.chunks.resize(m->chunks.size());
+    for (const auto& runtime : m->actors) {
+        ++data.actorCount;
+        if (runtime->dynamic) ++data.dynamicActorCount;
+        XMMATRIX transform = XMMatrixIdentity();
+        if (!B3_IS_NULL(runtime->body)) transform = BoxTransform(runtime->body, runtime->center);
+        for (uint32_t chunkIndex : runtime->chunks) {
+            chunkOwner[chunkIndex] = runtime.get();
+            const Impl::Chunk& chunk = m->chunks[chunkIndex];
+            const XMVECTOR modelCenter = XMLoadFloat3(&chunk.center);
+            XMFLOAT3 worldCenter; XMStoreFloat3(&worldCenter, XMVector3Transform(modelCenter, transform));
+            const XMFLOAT3 half((chunk.maximum.x - chunk.minimum.x) * 0.5f,
+                                (chunk.maximum.y - chunk.minimum.y) * 0.5f,
+                                (chunk.maximum.z - chunk.minimum.z) * 0.5f);
+            DestructionDebugChunk& out = data.chunks[chunkIndex];
+            out.worldCenter = worldCenter;
+            out.worldMin = { worldCenter.x - half.x, worldCenter.y - half.y, worldCenter.z - half.z };
+            out.worldMax = { worldCenter.x + half.x, worldCenter.y + half.y, worldCenter.z + half.z };
+            out.support = chunk.support;
+            out.dynamic = runtime->dynamic;
+        }
+    }
+
+    // Live bond healths are shared family-wide, indexed by asset bond index,
+    // which matches the order we created bondPairs. Read them from any actor.
+    const float* bondHealths = nullptr;
+    uint32_t bondHealthCount = 0;
+    if (!m->actors.empty() && m->actors.front()->actor) {
+        const NvBlastActor* ll = m->actors.front()->actor->getActorLL();
+        if (ll) {
+            bondHealths = NvBlastActorGetBondHealths(ll, nullptr);
+            bondHealthCount = m->asset ? m->asset->getBondCount() : 0;
+        }
+    }
+
+    data.bonds.reserve(m->bondPairs.size());
+    for (uint32_t i = 0; i < m->bondPairs.size(); ++i) {
+        const Impl::BondPair& pair = m->bondPairs[i];
+        if (pair.a >= data.chunks.size() || pair.b >= data.chunks.size()) continue;
+        auto ownerA = chunkOwner.find(pair.a);
+        auto ownerB = chunkOwner.find(pair.b);
+        DestructionDebugBond bond;
+        bond.a = data.chunks[pair.a].worldCenter;
+        bond.b = data.chunks[pair.b].worldCenter;
+        // Severed if either chunk is gone or the two now belong to different actors.
+        bond.broken = ownerA == chunkOwner.end() || ownerB == chunkOwner.end() ||
+                      ownerA->second != ownerB->second;
+        if (bondHealths && i < bondHealthCount) {
+            bond.health = std::max(0.0f, bondHealths[i]);
+            bond.healthFraction = std::min(1.0f, bond.health / kBondHealth);
+            if (bond.health <= 0.0f) bond.broken = true;
+        }
+        data.bonds.push_back(bond);
+    }
+    return data;
+}
