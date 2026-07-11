@@ -48,6 +48,7 @@ option(USE_DX12 "Build with DirectX 12 instead of DirectX 11" ON)
 find_package(imgui CONFIG)
 find_package(meshoptimizer CONFIG REQUIRED)
 find_package(tinyexr CONFIG REQUIRED)
+find_package(assimp CONFIG REQUIRED)
 
 # If imgui not found, provide helpful message
 if(NOT imgui_FOUND)
@@ -178,6 +179,7 @@ if(USE_DX12)
     add_executable(GraphicEngine WIN32 
         src/main.cpp
         src/GLBImporter.cpp
+        src/FBXImporter.cpp
         src/DestructionDX12.cpp
         ${HEADER_FILES}
         ${SHADER_FILES}
@@ -190,6 +192,7 @@ if(USE_DX12)
         imgui::imgui
         meshoptimizer::meshoptimizer
         unofficial::tinyexr::tinyexr
+        assimp::assimp
         box3d
         NvBlast
     )

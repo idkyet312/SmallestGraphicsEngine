@@ -9,6 +9,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <unordered_map>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
@@ -323,11 +324,140 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
         root->AddChild(node);
     };
 
+    // Emit one board as a cluster of Voronoi prism cells. The board's largest
+    // face is split by a jittered-site Voronoi diagram (half-plane clipping);
+    // each convex cell is extruded through the board thickness into its own
+    // chunk child. All cells share `name` (with an "@<id>" group suffix) so the
+    // destruction layer bonds them into one piece -- the seams only show once
+    // the board breaks apart, and they are jagged rather than straight cuts.
+    // Axes are derived from the box: thickness = thinnest extent, the Voronoi
+    // plane spans the two remaining axes (L = longer of the two, H = other).
+    auto addVoronoiBoard = [&](const char* name, const std::shared_ptr<SceneMaterial>& material,
+                               float x0, float x1, float y0, float y1,
+                               float z0, float z1, int seed) {
+        if (x1 <= x0 || y1 <= y0 || z1 <= z0) return;
+        const float lo[3] = { x0, y0, z0 }, hi[3] = { x1, y1, z1 };
+        const float ext[3] = { x1 - x0, y1 - y0, z1 - z0 };
+        const int tAxis = (ext[0] <= ext[1] && ext[0] <= ext[2]) ? 0
+                        : (ext[1] <= ext[2] ? 1 : 2);
+        const int r0 = tAxis == 0 ? 1 : 0, r1 = tAxis == 2 ? 1 : 2;
+        const int lAxis = ext[r0] >= ext[r1] ? r0 : r1;
+        const int hAxis = lAxis == r0 ? r1 : r0;
+        const float l0 = lo[lAxis], l1 = hi[lAxis];
+        const float h0 = lo[hAxis], h1 = hi[hAxis];
+        const float t0 = lo[tAxis], t1 = hi[tAxis];
+        struct P2 { float x, y; };
+        const float length = l1 - l0;
+        const int cols = std::max(3, std::min(8, (int)std::lround(length / 1.2f)));
+        const float cellW = length / cols;
+        // Deterministic integer-hash jitter (no RNG); the piece id seeds it so
+        // every board breaks along different lines.
+        std::vector<P2> sites;
+        for (int i = 0; i < cols; ++i) {
+            const float jx = (((i * 37 + seed * 17 + 3) % 13) / 12.0f - 0.5f) * cellW * 0.9f;
+            const float jy = (((i * 19 + seed * 41 + 7) % 11) / 10.0f - 0.5f) * (h1 - h0) * 0.8f;
+            sites.push_back({ l0 + (i + 0.5f) * cellW + jx, (h0 + h1) * 0.5f + jy });
+        }
+        // Voronoi cell = board rect clipped against the perpendicular bisector
+        // of every other site (Sutherland-Hodgman). Result is convex and CCW.
+        auto clipCell = [&](size_t s) {
+            std::vector<P2> poly = { {l0,h0},{l1,h0},{l1,h1},{l0,h1} };
+            for (size_t o = 0; o < sites.size() && !poly.empty(); ++o) {
+                if (o == s) continue;
+                const float nx = sites[o].x - sites[s].x, ny = sites[o].y - sites[s].y;
+                const float c = (sites[o].x * sites[o].x + sites[o].y * sites[o].y
+                               - sites[s].x * sites[s].x - sites[s].y * sites[s].y) * 0.5f;
+                std::vector<P2> out;
+                for (size_t i = 0; i < poly.size(); ++i) {
+                    const P2 pa = poly[i], pb = poly[(i + 1) % poly.size()];
+                    const float da = pa.x * nx + pa.y * ny - c;
+                    const float db = pb.x * nx + pb.y * ny - c;
+                    const bool ia = da <= 0.00001f, ib = db <= 0.00001f;
+                    if (ia) out.push_back(pa);
+                    if (ia != ib) {
+                        const float t = da / (da - db);
+                        out.push_back({ pa.x + (pb.x - pa.x) * t, pa.y + (pb.y - pa.y) * t });
+                    }
+                }
+                poly.swap(out);
+            }
+            return poly;
+        };
+        auto toWorld = [&](const P2& p, float t) {
+            float w[3]; w[lAxis] = p.x; w[hAxis] = p.y; w[tAxis] = t;
+            return XMFLOAT3(w[0], w[1], w[2]);
+        };
+        auto axisUnit = [](int axis) {
+            return XMFLOAT3(axis == 0 ? 1.0f : 0.0f, axis == 1 ? 1.0f : 0.0f,
+                            axis == 2 ? 1.0f : 0.0f);
+        };
+        for (size_t s = 0; s < sites.size(); ++s) {
+            const std::vector<P2> poly = clipCell(s);
+            if (poly.size() < 3) continue;
+            auto node = std::make_shared<SceneNode>(name);
+            node->mesh = std::make_shared<SceneMesh>();
+            MeshPrimitive prim;
+            prim.material = material;
+            constexpr float kUvScale = 1.5f;  // world units per texture tile
+            auto emitTri = [&](XMFLOAT3 ta, XMFLOAT3 tb, XMFLOAT3 tc,
+                               const XMFLOAT3& n, const XMFLOAT3& tan) {
+                // Fix winding so the triangle faces its lighting normal.
+                const XMVECTOR geometric = XMVector3Cross(
+                    XMVectorSubtract(XMLoadFloat3(&tb), XMLoadFloat3(&ta)),
+                    XMVectorSubtract(XMLoadFloat3(&tc), XMLoadFloat3(&ta)));
+                if (XMVectorGetX(XMVector3Dot(geometric, XMLoadFloat3(&n))) < 0.0f)
+                    std::swap(tb, tc);
+                const UINT base = (UINT)(prim.vertices.size() / 12);
+                const XMFLOAT3 pts[3] = { ta, tb, tc };
+                const bool faceX = std::abs(n.x) > 0.5f, faceY = std::abs(n.y) > 0.5f;
+                for (const XMFLOAT3& p : pts) {
+                    // World-scaled tiling per dominant face axis (same rule as
+                    // addBox) -> uniform texel size on the jagged side walls.
+                    float u, v;
+                    if (faceX)      { u = p.z; v = p.y; }
+                    else if (faceY) { u = p.x; v = p.z; }
+                    else            { u = p.x; v = p.y; }
+                    u /= kUvScale; v /= kUvScale;
+                    const float vert[12] = { p.x,p.y,p.z, n.x,n.y,n.z, u,v,
+                                             tan.x,tan.y,tan.z, 1 };
+                    prim.vertices.insert(prim.vertices.end(), vert, vert + 12);
+                }
+                prim.indices.insert(prim.indices.end(), { base, base + 1, base + 2 });
+            };
+            P2 centroid{ 0.0f, 0.0f };
+            for (const P2& p : poly) { centroid.x += p.x; centroid.y += p.y; }
+            centroid.x /= (float)poly.size(); centroid.y /= (float)poly.size();
+            const XMFLOAT3 capN = axisUnit(tAxis);
+            const XMFLOAT3 capNeg(-capN.x, -capN.y, -capN.z);
+            const XMFLOAT3 capTan = axisUnit(lAxis);   // in the cap plane
+            const XMFLOAT3 sideTan = capN;  // extrusion axis lies in every side face
+            for (size_t i = 0; i < poly.size(); ++i) {
+                const P2 a2 = poly[i], b2 = poly[(i + 1) % poly.size()];
+                // Caps: fan around the centroid on both thickness faces.
+                emitTri(toWorld(centroid, t1), toWorld(a2, t1), toWorld(b2, t1), capN, capTan);
+                emitTri(toWorld(centroid, t0), toWorld(a2, t0), toWorld(b2, t0), capNeg, capTan);
+                // Side wall for this edge; outward normal from the CCW polygon.
+                const float ex = b2.x - a2.x, ey = b2.y - a2.y;
+                const float elen = std::sqrt(ex * ex + ey * ey);
+                if (elen < 0.0001f) continue;
+                const P2 sn2{ ey / elen, -ex / elen };     // outward in (L, H)
+                const XMFLOAT3 snEnd = toWorld(sn2, 0.0f); // map plane dir to world
+                const XMFLOAT3 snOrg = toWorld({ 0, 0 }, 0.0f);
+                const XMFLOAT3 sn(snEnd.x - snOrg.x, snEnd.y - snOrg.y, snEnd.z - snOrg.z);
+                emitTri(toWorld(a2, t0), toWorld(b2, t0), toWorld(b2, t1), sn, sideTan);
+                emitTri(toWorld(a2, t0), toWorld(b2, t1), toWorld(a2, t1), sn, sideTan);
+            }
+            node->mesh->primitives.push_back(std::move(prim));
+            root->AddChild(node);
+        }
+    };
+
     // --- Foundation: single anchored slab spanning the footprint. ---
     addBox("Support:Foundation", matFoundation, minX, maxX, floorY, floorY + wall, minZ, maxZ);
 
     // --- Studded wall: vertical studs + outer cladding along one edge. The
     // bottom row of studs is anchored (the sill plate), so the wall stands. ---
+    int pieceId = 0;  // unique Voronoi group id per board across the house
     auto buildWall = [&](float x0, float x1, float z0, float z1, bool alongX,
                          float openStart, float openEnd, float openTop) {
         constexpr float studW = 0.16f;
@@ -339,33 +469,51 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
             const float c = t * span;
             // Skip studs that fall inside the opening (door/window gap).
             const bool inOpening = openEnd > openStart && c > openStart && c < openEnd;
-            const char* name = (s == 0) ? "Support:SillStud" : "Stud";
+            if (s == 0) {
+                // Sill stud: anchored support, never breaks -- keep a plain box.
+                if (alongX) {
+                    addBox("Support:SillStud", matStud, x0 - studW * 0.5f + c, x0 + studW * 0.5f + c,
+                           baseY, wallTop, z0, z1);
+                } else {
+                    addBox("Support:SillStud", matStud, x0, x1, baseY, wallTop,
+                           z0 + c - studW * 0.5f, z0 + c + studW * 0.5f);
+                }
+                continue;
+            }
+            const int id = pieceId++;
+            const std::string studName = "Stud@" + std::to_string(id);
             if (alongX) {
                 const float sx = x0 + c;
                 if (inOpening) {
                     // Header stub above the opening keeps the wall continuous up top.
-                    addBox(name, matStud, sx - studW * 0.5f, sx + studW * 0.5f,
-                           openTop, wallTop, z0, z1);
+                    addVoronoiBoard(studName.c_str(), matStud, sx - studW * 0.5f, sx + studW * 0.5f,
+                                    openTop, wallTop, z0, z1, id);
                 } else {
-                    addBox(name, matStud, sx - studW * 0.5f, sx + studW * 0.5f,
-                           baseY, wallTop, z0, z1);
+                    addVoronoiBoard(studName.c_str(), matStud, sx - studW * 0.5f, sx + studW * 0.5f,
+                                    baseY, wallTop, z0, z1, id);
                 }
             } else {
                 const float sz = z0 + c;
-                addBox(name, matStud, x0, x1, baseY, wallTop, sz - studW * 0.5f, sz + studW * 0.5f);
+                addVoronoiBoard(studName.c_str(), matStud, x0, x1, baseY, wallTop,
+                                sz - studW * 0.5f, sz + studW * 0.5f, id);
             }
         }
-        // Cladding: horizontal boards over the studs, split into a few pieces so
-        // the wall shatters into panels rather than one slab.
-        constexpr int boards = 5;
-        const float cladT = 0.06f;
+        // Cladding: horizontal planks over the studs. Each plank is one visible
+        // board built from flush Voronoi prism cells sharing one group id, so a
+        // hit knocks a jagged cell out of the board instead of a straight strip.
+        constexpr int boards = 5;     // planks stacked up the wall
+        const float cladT = 0.08f;
         for (int b = 0; b < boards; ++b) {
             const float by0 = baseY + (wallTop - baseY) * b / boards;
             const float by1 = baseY + (wallTop - baseY) * (b + 1) / boards;
+            const int id = pieceId++;
+            const std::string plankName = "Cladding@" + std::to_string(id);
             if (alongX) {
-                addBox("Cladding", matCladding, x0, x1, by0, by1, z1, z1 + cladT);
+                addVoronoiBoard(plankName.c_str(), matCladding, x0, x1, by0, by1,
+                                z1, z1 + cladT, id);
             } else {
-                addBox("Cladding", matCladding, x1, x1 + cladT, by0, by1, z0, z1);
+                addVoronoiBoard(plankName.c_str(), matCladding, x1, x1 + cladT, by0, by1,
+                                z0, z1, id);
             }
         }
     };
@@ -384,13 +532,20 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     for (int s = 0; s < roofSteps; ++s) {
         const float t0 = (float)s / roofSteps, t1 = (float)(s + 1) / roofSteps;
         const float y0 = wallTop + (ridgeY - wallTop) * t0;
-        const float y1 = wallTop + (ridgeY - wallTop) * t1 + 0.02f;
+        // Steps overlap the next one enough that even a single Voronoi cell's
+        // share of the seam clears the bond's minContactArea, so the upper roof
+        // stays attached to the lower steps.
+        const float y1 = wallTop + (ridgeY - wallTop) * t1 + 0.06f;
         // left slope: from eave (minX) rising to ridge (midX)
-        addBox("Roof", matRoof, minX + (midX - minX) * t0, minX + (midX - minX) * t1,
-               y0, y1, minZ - 0.2f, maxZ + 0.2f);
+        const int leftId = pieceId++;
+        addVoronoiBoard(("Roof@" + std::to_string(leftId)).c_str(), matRoof,
+                        minX + (midX - minX) * t0, minX + (midX - minX) * t1,
+                        y0, y1, minZ - 0.2f, maxZ + 0.2f, leftId);
         // right slope
-        addBox("Roof", matRoof, maxX - (maxX - midX) * t1, maxX - (maxX - midX) * t0,
-               y0, y1, minZ - 0.2f, maxZ + 0.2f);
+        const int rightId = pieceId++;
+        addVoronoiBoard(("Roof@" + std::to_string(rightId)).c_str(), matRoof,
+                        maxX - (maxX - midX) * t1, maxX - (maxX - midX) * t0,
+                        y0, y1, minZ - 0.2f, maxZ + 0.2f, rightId);
     }
 
     root->UpdateGlobalTransform(root->localTransform);
@@ -630,6 +785,13 @@ static void ProcessInput(HWND) {
         scene.fireCooldown <= 0.0f) {
         scene.ShootProjectile();
         scene.fireCooldown = scene.fireInterval;
+    }
+
+    // Grenade: press G to lob one. Cooldown debounces the held key.
+    scene.grenadeCooldown -= deltaTime;
+    if ((GetAsyncKeyState('G') & 0x8000) && scene.grenadeCooldown <= 0.0f) {
+        scene.ThrowGrenade();
+        scene.grenadeCooldown = 0.6f;
     }
 }
 
@@ -925,6 +1087,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.Update(deltaTime);
             for (auto& projectile : scene.projectiles) {
+                if (projectile.grenade) {
+                    // A grenade explodes on fuse timeout (Scene set detonate) or
+                    // the moment it strikes the building; either way a radial
+                    // blast breaks the whole sphere of pieces around it.
+                    XMFLOAT3 hit;
+                    const bool struck = projectile.active && g_destruction.HitTestSegment(
+                        projectile.previousPosition, projectile.position, 0.25f, hit);
+                    if (projectile.detonate || struck) {
+                        const XMFLOAT3 center = struck ? hit : projectile.position;
+                        g_destruction.ApplyExplosion(center, scene.grenadeBlastRadius,
+                                                     scene.grenadeDamage, scene.grenadeImpulse);
+                        projectile.active = false;
+                        projectile.detonate = false;
+                    }
+                    continue;
+                }
                 if (!projectile.active) continue;
                 XMFLOAT3 hit;
                 // Collision uses the bullet's own small radius so it must
@@ -941,6 +1119,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     g_destruction.ApplyImpulse(hit, projectile.direction,
                                                scene.destructionBulletImpulse,
                                                scene.destructionDamageRadius);
+                    // Impact FX: spark burst + hole decal. Surface normal is
+                    // approximated as facing back along the bullet's travel.
+                    const XMFLOAT3 normal(-projectile.direction.x,
+                                          -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(hit, normal);
                     projectile.active = false;
                 }
             }
