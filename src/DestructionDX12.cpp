@@ -15,6 +15,7 @@
 #include <array>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <list>
 #include <unordered_map>
@@ -78,6 +79,47 @@ void IsolateGraphShader(NvBlastFractureBuffers* commands,
             const bool breakIt = (chunkA < params.chunkCount && params.breakChunk[chunkA]) ||
                                  (chunkB < params.chunkCount && params.breakChunk[chunkB]);
             if (!breakIt || commands->bondFractureCount >= capacity) continue;
+            const uint32_t bondIndex = actor->adjacentBondIndices[edge];
+            NvBlastBondFractureData& fracture =
+                commands->bondFractures[commands->bondFractureCount++];
+            fracture.userdata = actor->assetBonds[bondIndex].userData;
+            fracture.nodeIndex0 = node;
+            fracture.nodeIndex1 = other;
+            fracture.health = FLT_MAX;  // sever completely
+        }
+    }
+}
+
+// Sever only the bonds that cross OUT of one plank group: a bond breaks when
+// exactly one of its two chunks belongs to the target group. Bonds internal to
+// the plank (both endpoints in the group) survive, so the whole plank frees off
+// the wall as one connected cluster that can still fracture further on a later
+// hit. chunkGroup is indexed by asset chunk index (root at 0 has group -2).
+struct IsolateGroupParams {
+    const int* chunkGroup;   // asset-chunk-indexed plank id (-1 = none)
+    uint32_t chunkCount;
+    int targetGroup;
+};
+
+void IsolateGroupShader(NvBlastFractureBuffers* commands,
+                        const NvBlastGraphShaderActor* actor, const void* rawParams) {
+    const auto& params = *static_cast<const IsolateGroupParams*>(rawParams);
+    const uint32_t capacity = commands->bondFractureCount;
+    commands->bondFractureCount = 0;
+    commands->chunkFractureCount = 0;
+    for (uint32_t node = actor->firstGraphNodeIndex; node != InvalidIndex;
+         node = actor->graphNodeIndexLinks[node]) {
+        for (uint32_t edge = actor->adjacencyPartition[node];
+             edge < actor->adjacencyPartition[node + 1]; ++edge) {
+            const uint32_t other = actor->adjacentNodeIndices[edge];
+            if (node >= other || actor->nodeActorIndices[other] != actor->actorIndex) continue;
+            const uint32_t chunkA = actor->chunkIndices[node];
+            const uint32_t chunkB = actor->chunkIndices[other];
+            const int gA = chunkA < params.chunkCount ? params.chunkGroup[chunkA] : -1;
+            const int gB = chunkB < params.chunkCount ? params.chunkGroup[chunkB] : -1;
+            const bool inA = gA == params.targetGroup;
+            const bool inB = gB == params.targetGroup;
+            if (inA == inB || commands->bondFractureCount >= capacity) continue;  // keep internal + far bonds
             const uint32_t bondIndex = actor->adjacentBondIndices[edge];
             NvBlastBondFractureData& fracture =
                 commands->bondFractures[commands->bondFractureCount++];
@@ -172,6 +214,10 @@ struct DestructionDX12::Impl {
         std::vector<XMFLOAT3> collisionPoints;
         int x = 0, y = 0, z = 0;
         bool support = false;  // anchored to the world (foundation, sill plates)
+        // Cladding sub-pieces of the same board share a plank id (>=0). A hit
+        // frees the whole plank as a cluster; sub-pieces stay bonded so they can
+        // fracture further later. -1 = a standalone chunk (stud, roof, ...).
+        int plankGroup = -1;
     };
 
     struct ActorRuntime {
@@ -198,6 +244,7 @@ struct DestructionDX12::Impl {
     struct BondPair { uint32_t a = 0, b = 0; };  // chunk indices (0-based)
     std::vector<Chunk> chunks;
     std::vector<BondPair> bondPairs;              // for debug visualization
+    std::vector<int> chunkGroupByAsset;           // asset-chunk-indexed plank id (root=[0]=-2)
     std::list<std::unique_ptr<ActorRuntime>> actors;
     std::vector<DestructionRenderItem> renderItems;
     TkFramework* framework = nullptr;
@@ -228,6 +275,13 @@ struct DestructionDX12::Impl {
                 // Pieces authored with a "Support:" name prefix stay anchored to
                 // the world; they hold the structure up until disconnected.
                 chunk.support = sourceChunk->name.rfind("Support:", 0) == 0;
+                // "<piece>@<id>" tags a Voronoi board (cladding plank, stud,
+                // roof slab): all cells of one board carry the same id so they
+                // bond into a single piece until it is shot apart.
+                const size_t at = sourceChunk->name.find('@');
+                if (at != std::string::npos) {
+                    chunk.plankGroup = std::atoi(sourceChunk->name.c_str() + at + 1);
+                }
                 chunk.minimum = { FLT_MAX, FLT_MAX, FLT_MAX };
                 chunk.maximum = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
                 chunk.node = std::make_shared<SceneNode>("VoronoiChunk");
@@ -287,10 +341,18 @@ struct DestructionDX12::Impl {
         std::vector<CellBuild> cells((size_t)gridX * gridY * gridZ);
         for (CellBuild& cell : cells) cell.primitives.resize(source->mesh->primitives.size());
 
-        auto axisCell = [](float value, float lo, float size, int count) {
-            if (size <= 0.00001f) return 0;
-            return std::max(0, std::min(count - 1, (int)((value - lo) / size)));
-        };
+        struct VoronoiSite { XMFLOAT3 position; int x, y, z; };
+        std::vector<VoronoiSite> sites;
+        sites.reserve((size_t)gridX * gridY * gridZ);
+        for (int z = 0; z < gridZ; ++z) for (int y = 0; y < gridY; ++y) for (int x = 0; x < gridX; ++x) {
+            const uint32_t hash = (uint32_t)(x * 73856093 ^ y * 19349663 ^ z * 83492791);
+            const float jx = ((hash & 255) / 255.0f - 0.5f) * 0.72f;
+            const float jy = (((hash >> 8) & 255) / 255.0f - 0.5f) * 0.72f;
+            const float jz = (((hash >> 16) & 255) / 255.0f - 0.5f) * 0.72f;
+            sites.push_back({ { sceneMin.x + (x + 0.5f + jx) * cellSize.x,
+                                sceneMin.y + (y + 0.5f + jy) * cellSize.y,
+                                sceneMin.z + (z + 0.5f + jz) * cellSize.z }, x, y, z });
+        }
         for (size_t material = 0; material < source->mesh->primitives.size(); ++material) {
             const MeshPrimitive& src = source->mesh->primitives[material];
             for (size_t tri = 0; tri + 2 < src.indices.size(); tri += 3) {
@@ -299,10 +361,16 @@ struct DestructionDX12::Impl {
                 const float cx = (src.vertices[(size_t)i0 * 12] + src.vertices[(size_t)i1 * 12] + src.vertices[(size_t)i2 * 12]) / 3.0f;
                 const float cy = (src.vertices[(size_t)i0 * 12 + 1] + src.vertices[(size_t)i1 * 12 + 1] + src.vertices[(size_t)i2 * 12 + 1]) / 3.0f;
                 const float cz = (src.vertices[(size_t)i0 * 12 + 2] + src.vertices[(size_t)i1 * 12 + 2] + src.vertices[(size_t)i2 * 12 + 2]) / 3.0f;
-                const int x = axisCell(cx, sceneMin.x, cellSize.x, gridX);
-                const int y = axisCell(cy, sceneMin.y, cellSize.y, gridY);
-                const int z = axisCell(cz, sceneMin.z, cellSize.z, gridZ);
-                CellBuild& cell = cells[(size_t)(z * gridY + y) * gridX + x];
+                size_t nearestSite = 0;
+                float nearestDistance = FLT_MAX;
+                for (size_t site = 0; site < sites.size(); ++site) {
+                    const float dx = (cx - sites[site].position.x) / std::max(0.001f, cellSize.x);
+                    const float dy = (cy - sites[site].position.y) / std::max(0.001f, cellSize.y);
+                    const float dz = (cz - sites[site].position.z) / std::max(0.001f, cellSize.z);
+                    const float distance = dx * dx + dy * dy + dz * dz;
+                    if (distance < nearestDistance) { nearestDistance = distance; nearestSite = site; }
+                }
+                CellBuild& cell = cells[nearestSite];
                 MeshPrimitive& dst = cell.primitives[material];
                 dst.material = src.material;
                 dst.materialIndex = src.materialIndex;
@@ -356,6 +424,8 @@ struct DestructionDX12::Impl {
         chunkDescs[0].parentChunkDescIndex = InvalidIndex;
         chunkDescs[0].flags = NvBlastChunkDesc::NoFlags;
         chunkDescs[0].userData = InvalidIndex;
+        chunkGroupByAsset.assign(chunks.size() + 1, -1);
+        chunkGroupByAsset[0] = -2;  // root: never a plank
         for (uint32_t i = 0; i < chunks.size(); ++i) {
             const Chunk& chunk = chunks[i];
             NvBlastChunkDesc& desc = chunkDescs[i + 1];
@@ -365,6 +435,7 @@ struct DestructionDX12::Impl {
             desc.parentChunkDescIndex = 0;
             desc.flags = NvBlastChunkDesc::SupportFlag;
             desc.userData = i;
+            chunkGroupByAsset[i + 1] = chunk.plankGroup;
         }
 
         // Bond only chunks that share a genuine, local face contact -- adjacent
@@ -388,6 +459,20 @@ struct DestructionDX12::Impl {
             const float oz = std::min(ca.maximum.z, cb.maximum.z) - std::max(ca.minimum.z, cb.minimum.z);
             // Must touch on all axes (small negative = a hair's gap is allowed).
             if (ox < -touchSlop || oy < -touchSlop || oz < -touchSlop) continue;
+            // Voronoi cells inside one plank have slanted seams that defeat the
+            // axis-aligned face test below, so bond any same-plank cells whose
+            // AABBs touch. Normal and area are nominal: plank bonds are only
+            // ever severed outright and bond healths are uniform anyway.
+            if (ca.plankGroup >= 0 && ca.plankGroup == cb.plankGroup) {
+                float nx = cb.center.x - ca.center.x, ny = cb.center.y - ca.center.y,
+                      nz = cb.center.z - ca.center.z;
+                const float distSq = nx * nx + ny * ny + nz * nz;
+                const float len = std::sqrt(distSq);
+                if (len < 0.0001f) continue;
+                nx /= len; ny /= len; nz /= len;
+                candidates.push_back({ a, b, nx, ny, nz, minContactArea, distSq });
+                continue;
+            }
             // The seam is the thinnest-overlap axis. A real face contact meets
             // near-flush there (|overlap| small): deep interpenetration means the
             // pieces are stacked/nested, not edge-adjacent -- skip those so bonds
@@ -475,6 +560,10 @@ struct DestructionDX12::Impl {
     bool BuildPhysics() {
         b3WorldDef worldDef = b3DefaultWorldDef();
         worldDef.gravity = { 0.0f, -9.81f, 0.0f };
+        // Collisions faster than this report hit events, which Update turns
+        // into fracture damage -- debris smashing into the house or ground
+        // breaks cells. Set high so only really violent impacts do damage.
+        worldDef.hitEventThreshold = 3.0f;
         world = b3CreateWorld(&worldDef);
         if (B3_IS_NULL(world)) return false;
         b3BodyDef groundDef = b3DefaultBodyDef();
@@ -483,6 +572,7 @@ struct DestructionDX12::Impl {
         b3BoxHull groundHull = b3MakeBoxHull(60.0f, 0.5f, 60.0f);
         b3ShapeDef groundShape = b3DefaultShapeDef();
         groundShape.baseMaterial.friction = 0.8f;
+        groundShape.enableHitEvents = true;
         b3CreateHullShape(ground, &groundShape, &groundHull.base);
         CreateBody(*actors.front(), false, nullptr);
         return true;
@@ -530,6 +620,7 @@ struct DestructionDX12::Impl {
         shapeDef.density = runtime.dynamic ? 20.0f : 0.0f;
         shapeDef.baseMaterial.friction = 0.65f;
         shapeDef.baseMaterial.restitution = 0.05f;
+        shapeDef.enableHitEvents = true;  // hard impacts fracture cells
         for (uint32_t index : runtime.chunks) {
             const Chunk& chunk = chunks[index];
             if (!chunk.collisionPoints.empty()) {
@@ -556,19 +647,9 @@ struct DestructionDX12::Impl {
             b3BoxHull box = b3MakeOffsetBoxHull(hx, hy, hz, offset);
             b3CreateHullShape(runtime.body, &shapeDef, &box.base);
         }
-        // Scripted outward burst on split: adds to inherited seed velocity
-        // instead of replacing it, so fragments carry the parent's motion plus
-        // an explosion kick, and the bullet's ApplyImpulse still stacks on top.
-        if (runtime.dynamic) {
-            const b3Pos bodyPosition = b3Body_GetPosition(runtime.body);
-            const XMFLOAT3 worldCenter((float)bodyPosition.x, (float)bodyPosition.y, (float)bodyPosition.z);
-            XMVECTOR burst = XMLoadFloat3(&worldCenter) - XMLoadFloat3(&lastDamagePosition);
-            burst = XMVector3Normalize(burst + XMVectorSet(0.0f, 0.35f, 0.0f, 0.0f));
-            const b3Vec3 existing = b3Body_GetLinearVelocity(runtime.body);
-            XMFLOAT3 v; XMStoreFloat3(&v, burst * 8.0f);
-            b3Body_SetLinearVelocity(runtime.body,
-                { existing.x + v.x, existing.y + v.y, existing.z + v.z });
-        }
+        // No scripted burst on split: fragments keep only their inherited seed
+        // velocity, and any push comes from the bullet's ApplyImpulse (or a
+        // grenade's explosion shove). Pieces otherwise just fall.
     }
 
     void RebuildRenderItems() {
@@ -579,6 +660,48 @@ struct DestructionDX12::Impl {
             XMFLOAT4X4 stored; XMStoreFloat4x4(&stored, transform);
             for (uint32_t chunk : runtime->chunks) renderItems.push_back({ chunks[chunk].node, stored });
         }
+    }
+
+    // Sever the bonds of the single non-support cell nearest `worldPosition`
+    // so it splits off. Shared by bullet strikes and physics-impact damage.
+    // Caller runs DropUnderConnectedChunks + RebuildRenderItems afterwards.
+    bool BreakNearestCell(const XMFLOAT3& worldPosition) {
+        ActorRuntime* hitActor = nullptr;
+        uint32_t hitChunk = InvalidIndex;   // 0-based chunk index of the struck piece
+        float bestDistanceSquared = FLT_MAX;
+        for (auto& runtime : actors) {
+            const b3Vec3 local = b3Body_GetLocalPoint(runtime->body,
+                { worldPosition.x, worldPosition.y, worldPosition.z });
+            const XMFLOAT3 modelHit(local.x + runtime->center.x,
+                                    local.y + runtime->center.y,
+                                    local.z + runtime->center.z);
+            for (uint32_t chunkIndex : runtime->chunks) {
+                const Chunk& chunk = chunks[chunkIndex];
+                const float x = std::max(chunk.minimum.x, std::min(modelHit.x, chunk.maximum.x));
+                const float y = std::max(chunk.minimum.y, std::min(modelHit.y, chunk.maximum.y));
+                const float z = std::max(chunk.minimum.z, std::min(modelHit.z, chunk.maximum.z));
+                const float dx = modelHit.x - x, dy = modelHit.y - y, dz = modelHit.z - z;
+                const float distanceSquared = dx * dx + dy * dy + dz * dz;
+                if (distanceSquared < bestDistanceSquared) {
+                    bestDistanceSquared = distanceSquared;
+                    hitActor = runtime.get();
+                    hitChunk = chunkIndex;
+                }
+            }
+        }
+        if (!hitActor || !hitActor->actor || hitChunk == InvalidIndex) return false;
+        if (chunks[hitChunk].support) return false;        // anchored pieces shrug it off
+        if (hitActor->chunks.size() <= 1) return false;    // lone cell: nothing left to sever
+        lastDamagePosition = worldPosition;  // outward burst origin for the split
+        // Break just the struck Voronoi cell: a local jagged hole rather than a
+        // whole straight-edged board.
+        std::vector<uint8_t> mask(chunks.size() + 1, 0);  // asset chunk index; 0 = root
+        mask[hitChunk + 1] = 1;
+        IsolateChunksParams isolateParams{ mask.data(), (uint32_t)mask.size() };
+        const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
+        hitActor->actor->damage(isolate, &isolateParams);
+        group->process();
+        return true;
     }
 
     // Any non-support chunk left hanging by fewer than kMinBonds live bonds is
@@ -621,6 +744,7 @@ struct DestructionDX12::Impl {
                 bool actorMarked = false;
                 for (uint32_t chunkIndex : runtime->chunks) {
                     if (chunks[chunkIndex].support) continue;         // anchored: never auto-drop
+                    if (chunks[chunkIndex].plankGroup >= 0) continue;  // plank sub-pieces break only on a hit, not by the low-bond rule
                     if (runtime->chunks.size() <= 1) continue;         // already a loose single piece
                     if (liveBonds[chunkIndex] < kMinBonds) {
                         mask[chunkIndex + 1] = 1;                       // asset chunk index = 0-based + 1
@@ -692,7 +816,22 @@ void DestructionDX12::Update(float dt) {
     if (!m->initialized) return;
     m->accumulator = std::min(0.25f, m->accumulator + dt);
     constexpr float step = 1.0f / 60.0f;
-    while (m->accumulator >= step) { b3World_Step(m->world, step, 4); m->accumulator -= step; }
+    bool anyImpactBroke = false;
+    while (m->accumulator >= step) {
+        b3World_Step(m->world, step, 4);
+        m->accumulator -= step;
+        // Physics impact damage: collisions above the world's hit-event speed
+        // threshold (debris slamming the house, pieces crashing onto the
+        // ground) fracture the cell they land on, same as a bullet strike.
+        const b3ContactEvents events = b3World_GetContactEvents(m->world);
+        int budget = 2;  // low impact damage: at most two cells per step
+        for (int i = 0; i < events.hitCount && budget > 0; ++i) {
+            const b3ContactHitEvent& hit = events.hitEvents[i];
+            const XMFLOAT3 point((float)hit.point.x, (float)hit.point.y, (float)hit.point.z);
+            if (m->BreakNearestCell(point)) { --budget; anyImpactBroke = true; }
+        }
+    }
+    if (anyImpactBroke) m->DropUnderConnectedChunks();
     m->RebuildRenderItems();
 }
 
@@ -749,48 +888,78 @@ void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float rad
     if (!m->initialized) return;
     m->lastDamagePosition = worldPosition;
     m->lastDamageRadius = radius;
-    // Break only the single piece that was hit: find the chunk nearest the
-    // impact and sever its bonds so it splits off and falls. Neighbours are
-    // left completely untouched -- no radial spread.
+    // Break only the single piece that was hit: sever the nearest cell's bonds
+    // so it splits off and falls. Neighbours stay untouched -- no radial spread.
     (void)damage;  // no radial falloff damage; each hit frees exactly one piece
-    Impl::ActorRuntime* hitActor = nullptr;
-    uint32_t hitChunk = InvalidIndex;   // 0-based chunk index of the struck piece
-    float bestDistanceSquared = FLT_MAX;
+    const uint32_t actorsBefore = (uint32_t)m->actors.size();
+    m->BreakNearestCell(worldPosition);
+    m->DropUnderConnectedChunks();
+    m->RebuildRenderItems();
+    std::cout << "Blast hit: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
+}
+
+void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius,
+                                     float damage, float impulse) {
+    if (!m->initialized) return;
+    (void)damage;  // explosion fully severs pieces in range rather than chipping
+    m->lastDamagePosition = worldPosition;
+    m->lastDamageRadius = radius;
+    const float radiusSquared = radius * radius;
+
+    // Mark every chunk whose centre lies within the blast radius (in that
+    // actor's model space) and sever all its bonds, so the whole sphere of the
+    // building around the blast breaks apart at once.
+    std::list<std::vector<uint8_t>> masks;
+    std::list<IsolateChunksParams> paramStore;
+    const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
     for (auto& runtime : m->actors) {
+        if (!runtime->actor) continue;
         const b3Vec3 local = b3Body_GetLocalPoint(runtime->body,
             { worldPosition.x, worldPosition.y, worldPosition.z });
         const XMFLOAT3 modelHit(local.x + runtime->center.x,
                                 local.y + runtime->center.y,
                                 local.z + runtime->center.z);
+        std::vector<uint8_t> mask(m->chunks.size() + 1, 0);  // asset chunk index; 0 = root
+        bool marked = false;
         for (uint32_t chunkIndex : runtime->chunks) {
             const Impl::Chunk& chunk = m->chunks[chunkIndex];
-            const float x = std::max(chunk.minimum.x, std::min(modelHit.x, chunk.maximum.x));
-            const float y = std::max(chunk.minimum.y, std::min(modelHit.y, chunk.maximum.y));
-            const float z = std::max(chunk.minimum.z, std::min(modelHit.z, chunk.maximum.z));
-            const float dx = modelHit.x - x, dy = modelHit.y - y, dz = modelHit.z - z;
-            const float distanceSquared = dx * dx + dy * dy + dz * dz;
-            if (distanceSquared < bestDistanceSquared) {
-                bestDistanceSquared = distanceSquared;
-                hitActor = runtime.get();
-                hitChunk = chunkIndex;
+            if (chunk.support) continue;  // anchored pieces resist the blast
+            const float dx = chunk.center.x - modelHit.x;
+            const float dy = chunk.center.y - modelHit.y;
+            const float dz = chunk.center.z - modelHit.z;
+            if (dx * dx + dy * dy + dz * dz <= radiusSquared) {
+                mask[chunkIndex + 1] = 1;
+                marked = true;
             }
         }
+        if (marked) {
+            masks.push_back(std::move(mask));
+            paramStore.push_back({ masks.back().data(), (uint32_t)masks.back().size() });
+            runtime->actor->damage(isolate, &paramStore.back());
+        }
     }
-
     const uint32_t actorsBefore = (uint32_t)m->actors.size();
-    if (hitActor && hitActor->actor && hitChunk != InvalidIndex &&
-        !m->chunks[hitChunk].support) {
-        // Sever exactly the struck piece's bonds so it splits off and falls.
-        std::vector<uint8_t> mask(m->chunks.size() + 1, 0);  // asset chunk index; 0 = root
-        mask[hitChunk + 1] = 1;
-        IsolateChunksParams isolateParams{ mask.data(), (uint32_t)mask.size() };
-        const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
-        hitActor->actor->damage(isolate, &isolateParams);
-        m->group->process();
-    }
+    m->group->process();
     m->DropUnderConnectedChunks();
     m->RebuildRenderItems();
-    std::cout << "Blast hit: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
+
+    // Blow the freed fragments outward from the blast centre, falling off with
+    // distance and with an upward bias so debris lifts.
+    const XMVECTOR center = XMLoadFloat3(&worldPosition);
+    for (auto& runtime : m->actors) {
+        if (!runtime->dynamic || B3_IS_NULL(runtime->body)) continue;
+        const b3Pos bp = b3Body_GetPosition(runtime->body);
+        const XMVECTOR pos = XMVectorSet((float)bp.x, (float)bp.y, (float)bp.z, 0.0f);
+        const float dist = XMVectorGetX(XMVector3Length(pos - center));
+        if (dist > radius) continue;
+        XMVECTOR dir = pos - center;
+        if (dist < 0.001f) dir = XMVectorSet(0, 1, 0, 0);  // at the centre: straight up
+        dir = XMVector3Normalize(dir + XMVectorSet(0, 0.4f, 0, 0));
+        const float scale = std::max(0.2f, 1.0f - dist / radius);
+        XMFLOAT3 v; XMStoreFloat3(&v, dir * impulse * scale);
+        b3Body_ApplyLinearImpulse(runtime->body, { v.x, v.y, v.z }, { (float)bp.x, (float)bp.y, (float)bp.z }, true);
+    }
+    std::cout << "Grenade: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
 }
 
 bool DestructionDX12::ApplyImpulse(const XMFLOAT3& worldPosition,

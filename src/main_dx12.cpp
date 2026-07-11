@@ -569,6 +569,14 @@ void ProcessInput(HWND hwnd) {
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_MOUSEWHEEL) {
+        const float wheelSteps = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) /
+            static_cast<float>(WHEEL_DELTA);
+        camera.MovementSpeed *= std::pow(1.2f, wheelSteps);
+        camera.MovementSpeed = std::clamp(camera.MovementSpeed, 0.1f, 1000.0f);
+        return 0;
+    }
+
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
         return true;
     
@@ -596,7 +604,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ClipCursorToWindow(hwnd);
         }
         return 0;
-        
+
     case WM_MOUSEMOVE:
         if (!ImGui::GetIO().WantCaptureMouse) {
             float xpos = (float)GET_X_LPARAM(lParam);

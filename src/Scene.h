@@ -5,6 +5,9 @@
 #include "CameraDX12.h"
 #include "ClusteredRendererDX12.h"
 #include <vector>
+#include <algorithm>
+#include <cstdlib>
+#include <cmath>
 
 using namespace DirectX;
 
@@ -33,6 +36,25 @@ struct Projectile {
     float    speed;
     float    lifetime;
     bool     active;
+    // Grenade: arcs under gravity and detonates (radial blast) on fuse timeout
+    // or first impact. Regular bullets leave these at defaults.
+    bool     grenade = false;
+    XMFLOAT3 velocity = { 0, 0, 0 };   // grenades integrate velocity + gravity
+    float    fuse = 0.0f;              // seconds until it explodes
+    bool     detonate = false;         // set the frame it should explode
+};
+
+// A particle from a bullet impact: either a rising grey smoke puff or a fast
+// ballistic spark/debris shard.
+struct ImpactParticle {
+    XMFLOAT3 position;
+    XMFLOAT3 velocity;
+    float    life;      // seconds remaining
+    float    maxLife;   // for fade
+    float    size;      // smoke: grows; spark: shrinks
+    float    growth;    // size delta per second (negative for sparks)
+    XMFLOAT3 color;
+    bool     spark = false;  // true = ballistic bright shard, false = smoke
 };
 
 struct GunViewModel {
@@ -86,6 +108,7 @@ struct Scene {
     // Gun & projectiles
     GunViewModel gun;
     std::vector<Projectile> projectiles;
+    std::vector<ImpactParticle> impactParticles;  // impact smoke puffs
     float projectileSpeed    = 50.0f;
     float projectileLifetime = 3.0f;
     XMFLOAT3 projectileColor = { 1.0f, 1.0f, 1.0f };
@@ -93,6 +116,17 @@ struct Scene {
     bool  autoFire           = true;    // hold mouse to keep firing
     float fireInterval       = 0.1f;    // seconds between auto-fire shots
     float fireCooldown       = 0.0f;    // time left before next shot may fire
+
+    // Grenade (press G): lobbed, arcs under gravity, radial blast on fuse.
+    float grenadeThrowSpeed    = 16.0f;  // launch speed along aim
+    float grenadeLob           = 3.0f;   // extra upward velocity for the arc
+    float grenadeGravityScale  = 1.0f;
+    float grenadeGroundY       = 0.15f;  // bounce height
+    float grenadeFuse          = 1.8f;   // seconds before it explodes
+    float grenadeBlastRadius   = 3.5f;   // radial destruction radius
+    float grenadeDamage        = 1.5f;   // per-bond damage in the blast
+    float grenadeImpulse       = 120.0f; // shove imparted to loosened pieces
+    float grenadeCooldown      = 0.0f;   // input debounce
 
     // NVIDIA Blast + Box3D destructible house
     bool  useDestruction = true;
@@ -197,16 +231,102 @@ struct Scene {
         for (auto& p : projectiles) {
             if (!p.active) continue;
             p.previousPosition = p.position;
-            p.position.x += p.direction.x * p.speed * dt;
-            p.position.y += p.direction.y * p.speed * dt;
-            p.position.z += p.direction.z * p.speed * dt;
-            p.lifetime -= dt;
-            if (p.lifetime <= 0.0f) p.active = false;
+            if (p.grenade) {
+                // Ballistic arc: integrate velocity under gravity, then bounce
+                // off the ground with damping so it settles before the fuse.
+                p.velocity.y += -9.81f * grenadeGravityScale * dt;
+                p.position.x += p.velocity.x * dt;
+                p.position.y += p.velocity.y * dt;
+                p.position.z += p.velocity.z * dt;
+                if (p.position.y < grenadeGroundY) {
+                    p.position.y = grenadeGroundY;
+                    p.velocity.y = -p.velocity.y * 0.4f;      // bounce
+                    p.velocity.x *= 0.7f; p.velocity.z *= 0.7f; // friction
+                }
+                p.fuse -= dt;
+                if (p.fuse <= 0.0f) { p.detonate = true; p.active = false; }
+            } else {
+                p.position.x += p.direction.x * p.speed * dt;
+                p.position.y += p.direction.y * p.speed * dt;
+                p.position.z += p.direction.z * p.speed * dt;
+                p.lifetime -= dt;
+                if (p.lifetime <= 0.0f) p.active = false;
+            }
         }
+        // Keep detonating grenades for one more frame so the game loop can read
+        // p.detonate; drop the rest.
         projectiles.erase(
             std::remove_if(projectiles.begin(), projectiles.end(),
-                [](const Projectile& p) { return !p.active; }),
+                [](const Projectile& p) { return !p.active && !p.detonate; }),
             projectiles.end());
+
+        // Impact particles: sparks fly ballistically under gravity; smoke rises
+        // and expands. Both fade with life.
+        for (auto& ip : impactParticles) {
+            if (ip.spark) {
+                ip.velocity.y += -22.0f * dt;          // gravity pulls sparks down
+                ip.velocity.x *= 0.99f; ip.velocity.z *= 0.99f;
+            } else {
+                ip.velocity.y += 0.6f * dt;            // buoyancy: smoke rises
+                ip.velocity.x *= 0.90f; ip.velocity.z *= 0.90f; ip.velocity.y *= 0.96f;
+            }
+            ip.position.x += ip.velocity.x * dt;
+            ip.position.y += ip.velocity.y * dt;
+            ip.position.z += ip.velocity.z * dt;
+            ip.size = std::max(0.0f, ip.size + ip.growth * dt);
+            ip.life -= dt;
+        }
+        impactParticles.erase(
+            std::remove_if(impactParticles.begin(), impactParticles.end(),
+                [](const ImpactParticle& p) { return p.life <= 0.0f; }),
+            impactParticles.end());
+    }
+
+    // Spawn a bullet impact: a burst of fast bright sparks/debris plus a few
+    // grey smoke puffs. `normal` points back out of the surface (reverse of the
+    // bullet's travel).
+    void SpawnBulletImpact(const XMFLOAT3& point, const XMFLOAT3& normal) {
+        auto rnd = [&]() { return (float)std::rand() / RAND_MAX * 2.0f - 1.0f; };
+        int spawned = 0;
+
+        // Sparks: sprayed out of the surface in a wide cone, fast, shrinking.
+        const int sparks = 16;
+        for (int i = 0; i < sparks; ++i) {
+            ImpactParticle sp;
+            sp.position = point;
+            const float spread = 6.0f;
+            sp.velocity = { normal.x * 5.0f + rnd() * spread,
+                            normal.y * 5.0f + rnd() * spread + 1.0f,
+                            normal.z * 5.0f + rnd() * spread };
+            sp.maxLife = sp.life = 0.18f + std::abs(rnd()) * 0.32f;
+            sp.size   = 0.02f + std::abs(rnd()) * 0.025f;
+            sp.growth = -sp.size / sp.maxLife;          // shrink to nothing
+            const float h = std::abs(rnd());            // white-hot -> orange
+            sp.color = { 1.0f, 0.75f + 0.25f * h, 0.15f + 0.25f * h };
+            sp.spark = true;
+            impactParticles.push_back(sp); ++spawned;
+        }
+
+        // Smoke: a few grey puffs drifting off the surface, growing and fading.
+        const int puffs = 5;
+        for (int i = 0; i < puffs; ++i) {
+            ImpactParticle sp;
+            sp.position = { point.x + normal.x * 0.05f + rnd() * 0.05f,
+                            point.y + normal.y * 0.05f + rnd() * 0.05f,
+                            point.z + normal.z * 0.05f + rnd() * 0.05f };
+            sp.velocity = { normal.x * 1.0f + rnd() * 0.6f,
+                            normal.y * 1.0f + std::abs(rnd()) * 0.5f + 0.3f,
+                            normal.z * 1.0f + rnd() * 0.6f };
+            sp.maxLife = sp.life = 0.6f + std::abs(rnd()) * 0.6f;
+            sp.size   = 0.06f + std::abs(rnd()) * 0.04f;
+            sp.growth = 0.30f + std::abs(rnd()) * 0.25f;
+            const float g = 0.40f + std::abs(rnd()) * 0.25f;
+            sp.color = { g, g, g };
+            impactParticles.push_back(sp); ++spawned;
+        }
+
+        if (impactParticles.size() > 600)
+            impactParticles.erase(impactParticles.begin(), impactParticles.begin() + spawned);
     }
 
     void ShootProjectile() {
@@ -217,6 +337,21 @@ struct Scene {
         p.speed     = projectileSpeed;
         p.lifetime  = projectileLifetime;
         p.active    = true;
+        projectiles.push_back(p);
+    }
+
+    void ThrowGrenade() {
+        Projectile p;
+        p.position  = camera.Position;
+        p.previousPosition = p.position;
+        p.direction = camera.Front;
+        p.grenade   = true;
+        p.active    = true;
+        p.fuse      = grenadeFuse;
+        // Launch along the aim direction plus a slight upward lob.
+        p.velocity  = { camera.Front.x * grenadeThrowSpeed,
+                        camera.Front.y * grenadeThrowSpeed + grenadeLob,
+                        camera.Front.z * grenadeThrowSpeed };
         projectiles.push_back(p);
     }
 

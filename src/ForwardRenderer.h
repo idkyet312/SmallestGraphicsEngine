@@ -267,6 +267,20 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.NextDrawCall();
     }
 
+    // Impact particles: bright sparks as sharp little cubes (debris shards),
+    // grey smoke as soft spheres. Both dim as they fade.
+    for (auto& sp : scene.impactParticles) {
+        const float fade = sp.life / sp.maxLife;
+        model = XMMatrixScaling(sp.size, sp.size, sp.size) *
+                XMMatrixTranslation(sp.position.x, sp.position.y, sp.position.z);
+        shader.SetMatrices(model, view, proj, lightSpace);
+        // Sparks stay bright (barely dimmed) so they read as hot; smoke fades.
+        const float b = sp.spark ? (0.6f + 0.4f * fade) : fade;
+        shader.SetObjectColor(XMFLOAT3(sp.color.x * b, sp.color.y * b, sp.color.z * b));
+        if (sp.spark) DrawCube(geo); else DrawSphere(geo);
+        shader.NextDrawCall();
+    }
+
     // Gun
     if (scene.gun.visible) {
         model = scene.GetGunModelMatrix();

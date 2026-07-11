@@ -56,6 +56,11 @@ public:
                         DirectX::XMFLOAT3& hitPosition) const;
     void ApplyRadialDamage(const DirectX::XMFLOAT3& worldPosition,
                            float radius, float damage = 2.0f);
+    // Grenade-style explosion: breaks every piece whose centre is within radius
+    // of the blast (a whole sphere of the building), then shoves the freed
+    // fragments radially outward from the blast centre.
+    void ApplyExplosion(const DirectX::XMFLOAT3& worldPosition,
+                        float radius, float damage, float impulse);
     bool ApplyImpulse(const DirectX::XMFLOAT3& worldPosition,
                       const DirectX::XMFLOAT3& worldDirection,
                       float impulseStrength, float hitRadius = 0.5f);
