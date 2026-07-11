@@ -74,7 +74,24 @@ static std::string ResolveTexturePath(const char* relativePath) {
     if (std::filesystem::exists(relativePath)) return relativePath;
     std::string buildPath = std::string("build/") + relativePath;
     if (std::filesystem::exists(buildPath)) return buildPath;
+    std::string parentPath = std::string("../") + relativePath;
+    if (std::filesystem::exists(parentPath)) return parentPath;
+    std::string parentBuildPath = std::string("../../build/") + relativePath;
+    if (std::filesystem::exists(parentBuildPath)) return parentBuildPath;
     return relativePath;
+}
+
+static std::vector<unsigned char> PinkMissingTexture(int size) {
+    std::vector<unsigned char> pixels((size_t)size * size * 4);
+    for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+        const bool bright = ((x / 16) ^ (y / 16)) & 1;
+        const size_t i = ((size_t)y * size + x) * 4;
+        pixels[i + 0] = bright ? 255 : 90;
+        pixels[i + 1] = 0;
+        pixels[i + 2] = bright ? 255 : 90;
+        pixels[i + 3] = 255;
+    }
+    return pixels;
 }
 
 static void LoadFloorMudMaterial() {
@@ -95,8 +112,11 @@ static void LoadFloorMudMaterial() {
         g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
 
     if (!floorMaterial->baseColorTexture) {
-        floorMaterial.reset();
-        std::cerr << "Brown mud floor texture unavailable; using flat floor color\n";
+        const auto missing = PinkMissingTexture(256);
+        floorMaterial->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
+            g_dx12.device.Get(), g_dx12.commandList.Get(), missing, 256, 256, floorMaterial->uploadHeaps);
+        floorMaterial->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
+        std::cerr << "Brown mud floor texture unavailable; using pink missing texture\n";
     }
 }
 
@@ -221,6 +241,7 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
                                ID3D12Device* device, ID3D12GraphicsCommandList* cmdList) {
     if (!house) return;
     constexpr int kSize = 256;
+    const std::vector<unsigned char> missingFallback = PinkMissingTexture(kSize);
     // Collect the unique materials by name from the house children.
     std::unordered_map<std::string, std::shared_ptr<SceneMaterial>> mats;
     for (const auto& child : house->children) {
@@ -238,7 +259,7 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
         mat->baseColorTexture = GLBImporter::LoadTextureFromFile(base + ".jpg", device, cmdList, mat->uploadHeaps);
         if (!mat->baseColorTexture) {
             mat->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
-                device, cmdList, fallback, kSize, kSize, mat->uploadHeaps);
+                device, cmdList, missingFallback, kSize, kSize, mat->uploadHeaps);
         }
         if (mat->baseColorTexture) mat->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
         mat->normalTexture = GLBImporter::LoadTextureFromFile(base + "_normal.jpg", device, cmdList, mat->uploadHeaps);
@@ -247,7 +268,7 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
         mat->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
             base + "_roughness.jpg", device, cmdList, mat->uploadHeaps);
         mat->roughnessOnlyTexture = mat->metallicRoughnessTexture != nullptr;
-        if (mat->metallicRoughnessTexture) { mat->metallicFactor = 0.0f; mat->roughnessFactor = 1.0f; }
+        if (mat->metallicRoughnessTexture) mat->metallicFactor = 0.0f;
     };
     auto assignFile = [&](const char* name, const std::string& colorPath,
                           const std::string& roughnessPath, std::vector<unsigned char> fallback) {
@@ -257,7 +278,7 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
         mat->baseColorTexture = GLBImporter::LoadTextureFromFile(colorPath, device, cmdList, mat->uploadHeaps);
         if (!mat->baseColorTexture) {
             mat->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
-                device, cmdList, fallback, kSize, kSize, mat->uploadHeaps);
+                device, cmdList, missingFallback, kSize, kSize, mat->uploadHeaps);
         }
         if (mat->baseColorTexture) mat->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
         mat->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
@@ -280,6 +301,28 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
         mat->metallicFactor = metallic;
         mat->roughnessFactor = roughness;
     };
+    auto assignPackedPBR = [&](const char* name, const std::string& colorPath,
+                               const std::string& normalPath, const std::string& armPath,
+                               std::vector<unsigned char> fallback) {
+        auto it = mats.find(name);
+        if (it == mats.end()) return;
+        auto& mat = it->second;
+        mat->baseColorTexture = GLBImporter::LoadTextureFromFile(
+            ResolveTexturePath(colorPath.c_str()), device, cmdList, mat->uploadHeaps);
+        if (!mat->baseColorTexture) {
+            mat->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
+                device, cmdList, missingFallback, kSize, kSize, mat->uploadHeaps);
+        }
+        mat->normalTexture = GLBImporter::LoadTextureFromFile(
+            ResolveTexturePath(normalPath.c_str()), device, cmdList, mat->uploadHeaps);
+        mat->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
+            ResolveTexturePath(armPath.c_str()), device, cmdList, mat->uploadHeaps);
+        if (mat->baseColorTexture) mat->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
+        // Poly Haven ARM is R=AO, G=roughness, B=metallic: exact glTF layout.
+        mat->roughnessOnlyTexture = false;
+        mat->metallicFactor = 1.0f;
+        mat->roughnessFactor = 1.0f;
+    };
     assign("Foundation", "models/house_pbr/foundation_brick",
            HouseTex::Stone(kSize, { 0.62f, 0.62f, 0.64f }, { 0.34f, 0.34f, 0.36f }));
     assign("Stud", "models/house_pbr/stud_wood",
@@ -295,9 +338,11 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
     assignGeneratedMetal("MetalWall",
                "models/Corrugated metal pack/Wall/A/A Roughness rusted 2.jpg",
                HouseTex::Corrugated(kSize, { 0.30f, 0.34f, 0.31f }, { 0.43f, 0.22f, 0.10f }), 0.82f, 0.66f);
-    assignGeneratedMetal("MetalRoof",
-               "models/Corrugated metal pack/Roof/C/C Roof rusted roughness.JPEG",
-               HouseTex::Corrugated(kSize, { 0.54f, 0.62f, 0.68f }, { 0.52f, 0.26f, 0.10f }), 0.88f, 0.50f);
+    assignPackedPBR("MetalRoof",
+               "models/polyhaven/corrugated_iron/corrugated_iron_diff_2k.jpg",
+               "models/polyhaven/corrugated_iron/corrugated_iron_nor_dx_2k.jpg",
+               "models/polyhaven/corrugated_iron/corrugated_iron_arm_2k.jpg",
+               HouseTex::Corrugated(kSize, { 0.42f, 0.46f, 0.48f }, { 0.38f, 0.18f, 0.08f }));
 }
 
 // Basic modular destructible house built from real structural pieces: a
@@ -349,8 +394,8 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     matTrim->metallicFactor = 0.90f; matTrim->roughnessFactor = 0.38f;
     auto matGlass = std::make_shared<SceneMaterial>();
     matGlass->name = "Glass";
-    matGlass->baseColorFactor = XMFLOAT4(0.62f, 0.78f, 0.86f, 1.0f);
-    matGlass->metallicFactor = 0.25f; matGlass->roughnessFactor = 0.06f;
+    matGlass->baseColorFactor = XMFLOAT4(0.58f, 0.76f, 0.86f, 0.28f);
+    matGlass->metallicFactor = 0.0f; matGlass->roughnessFactor = 0.04f;
 
     // Emit one axis-aligned solid box as a chunk child. `wrap` stretches the
     // texture to span the whole piece (UV 0..1 per face) so a single-board wood
@@ -697,6 +742,35 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     // that tears off whole when hit. ---
     const float ridgeY = wallTop + 1.0f;          // ridge height above the eaves
     const float midX = (minX + maxX) * 0.5f;
+    auto addWoodGable = [&](float nearZ, float farZ) {
+        const int id = pieceId++;
+        auto node = std::make_shared<SceneNode>("Cladding@" + std::to_string(id));
+        node->mesh = std::make_shared<SceneMesh>();
+        MeshPrimitive prim; prim.material = matCladding;
+        auto tri = [&](XMFLOAT3 a, XMFLOAT3 b, XMFLOAT3 c) {
+            const XMFLOAT3 ab(b.x-a.x,b.y-a.y,b.z-a.z), ac(c.x-a.x,c.y-a.y,c.z-a.z);
+            XMFLOAT3 n(ab.y*ac.z-ab.z*ac.y, ab.z*ac.x-ab.x*ac.z, ab.x*ac.y-ab.y*ac.x);
+            const float len=std::sqrt(n.x*n.x+n.y*n.y+n.z*n.z);
+            if(len>0.00001f){n.x/=len;n.y/=len;n.z/=len;}
+            for(const XMFLOAT3& p:{a,b,c}) {
+                prim.vertices.insert(prim.vertices.end(), {p.x,p.y,p.z,n.x,n.y,n.z,
+                    (p.x-minX)/(maxX-minX),(p.y-wallTop)/(ridgeY-wallTop),1,0,0,1});
+                prim.indices.push_back((UINT)prim.indices.size());
+            }
+        };
+        const XMFLOAT3 a0(minX,wallTop,nearZ), b0(maxX,wallTop,nearZ), c0(midX,ridgeY,nearZ);
+        const XMFLOAT3 a1(minX,wallTop,farZ),  b1(maxX,wallTop,farZ),  c1(midX,ridgeY,farZ);
+        tri(a0,b0,c0); tri(a1,c1,b1);                 // triangular faces
+        tri(a0,a1,b1); tri(a0,b1,b0);                 // bottom
+        tri(a0,c0,c1); tri(a0,c1,a1);                 // left roof edge
+        tri(b0,b1,c1); tri(b0,c1,c0);                 // right roof edge
+        node->mesh->primitives.push_back(std::move(prim));
+        root->AddChild(node);
+    };
+    constexpr float gableThickness = 0.08f;
+    addWoodGable(maxZ, maxZ + gableThickness);         // front triangle
+    addWoodGable(minZ - gableThickness, minZ);         // back triangle
+
     const float halfW = midX - minX;              // horizontal run of one slope
     const float slopeLen = std::sqrt(halfW * halfW + (ridgeY - wallTop) * (ridgeY - wallTop));
     const float pitch = std::atan2(ridgeY - wallTop, halfW);  // slope angle
@@ -726,7 +800,7 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
                 const float zr0 = zLo + zSpan * zi / sheetsZ;
                 const float zr1 = zLo + zSpan * (zi + 1) / sheetsZ;
                 const int id = pieceId++;
-                addVoronoiBoard(("Roof@" + std::to_string(id)).c_str(), matRoof,
+                addVoronoiBoard(("Roof@" + std::to_string(id)).c_str(), matMetalRoof,
                                 run0, run1, 0.0f, sheetT, zr0, zr1, id, false, &place);
             }
         }
@@ -1373,6 +1447,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             scene.camera.FloorY = 0.0f;
         }
 
+        // Resolve wall/roof collision BEFORE gravity runs (scene.Update ->
+        // camera.Update). Step-up raises FloorY onto brick/roof tops so the
+        // ground snap in the same frame stands the player on them instead of
+        // falling through. Uses last frame's body transforms -- fine for
+        // standing, and avoids a one-frame lag that would drop the player.
+        if (scene.useDestruction && g_destruction.IsInitialized()) {
+            g_destruction.ResolvePlayerCollision(scene.camera.Position,
+                scene.camera.FloorY, 0.35f, scene.camera.PlayerHeight);
+        }
+
         scene.Update(deltaTime, now);
 
         if (scene.rebuildDestructionRequested && wallModel) {
@@ -1451,6 +1535,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // come from AABB adjacency), so pass 1s.
             wallModel = CreateDestructibleWallModel();
             ApplyHouseTextures(wallModel, g_dx12.device.Get(), g_dx12.commandList.Get());
+            AppendRoofChunksToDestructionModel(wallModel);
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
             if (crateModel) {
                 if (auto merged = GLBImporter::MergeSceneByMaterial(crateModel, g_dx12.device)) {

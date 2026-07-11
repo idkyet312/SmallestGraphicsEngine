@@ -148,6 +148,7 @@ inline void DrawSceneNodeShadow(const std::shared_ptr<SceneNode>& node,
 
         for (const auto& prim : node->mesh->primitives) {
             if (prim.vbv.BufferLocation == 0) continue;
+            if (prim.material && prim.material->baseColorFactor.w < 0.5f) continue;
 
             g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
             g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -242,7 +243,8 @@ public:
 
         if (crateModel) {
             DrawSceneNodeShadow(crateModel, depthShader, XMMatrixIdentity(), lightSpace);
-        } else {
+        }
+        if (!crateModel && !g_destruction.IsInitialized()) {
             XMMATRIX model = scene.cube1.GetModelMatrix();
             depthShader.SetMatrices(model, lightSpace);
             DrawCube(geo);
@@ -254,6 +256,11 @@ public:
             for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
                 DrawSceneNodeShadow(item.node, depthShader,
                                     XMLoadFloat4x4(&item.transform), lightSpace);
+            }
+            for (const RagdollRenderItem& item : g_destruction.GetRagdollRenderItems()) {
+                depthShader.SetMatrices(XMLoadFloat4x4(&item.transform), lightSpace);
+                DrawCube(geo);
+                depthShader.NextDrawCall();
             }
         }
 

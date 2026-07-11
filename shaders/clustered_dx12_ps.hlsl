@@ -34,6 +34,8 @@ cbuffer ObjectBuffer : register(b3) {
     float roughness;
     float useNormalMap;
     float metalRoughMode;
+    float opacity;
+    float3 objectPadding;
 };
 
 struct PointLightData {
@@ -355,8 +357,14 @@ float4 main(PS_INPUT input) : SV_TARGET {
         // This is bad if we wanted 1.0 (default).
         // I'll stick to simple constants if no specific flag.
         // But I will enable it:
-        if (metalRoughMode < 1.5) metal *= mrSample.b;
-        rough *= mrSample.g;
+        if (metalRoughMode < 1.5) {
+            metal *= mrSample.b;
+            rough *= mrSample.g;
+        } else {
+            // Standalone roughness maps are authored as final roughness, not a
+            // glTF multiplier. Never let dark texels turn metal mirror-smooth.
+            rough = max(rough, mrSample.g);
+        }
     }
     rough = clamp(rough, 0.045, 1.0); // avoid alpha->0 specular-aliasing spike
     
@@ -502,7 +510,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
     result = saturate((result * (2.51 * result + 0.03)) /
                       (result * (2.43 * result + 0.59) + 0.14));
     result = pow(result, 1.0 / 2.2);
-    return float4(result, 1.0);
+    return float4(result, opacity);
 }
 
 

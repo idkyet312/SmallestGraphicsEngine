@@ -12,6 +12,11 @@ struct DestructionRenderItem {
     DirectX::XMFLOAT4X4 transform;
 };
 
+struct RagdollRenderItem {
+    DirectX::XMFLOAT4X4 transform;
+    DirectX::XMFLOAT3 color;
+};
+
 // Snapshot of the live Blast/Box3D state for on-screen debug drawing.
 struct DestructionDebugChunk {
     DirectX::XMFLOAT3 worldMin;   // AABB corners already in world space
@@ -64,11 +69,17 @@ public:
     bool ApplyImpulse(const DirectX::XMFLOAT3& worldPosition,
                       const DirectX::XMFLOAT3& worldDirection,
                       float impulseStrength, float hitRadius = 0.5f);
+    // Resolves the player against destruction/ragdoll boxes. Walls push the eye
+    // out horizontally; low boxes the player is standing over raise `floorY` (so
+    // the caller can stand the player on top) instead of shoving them sideways.
+    void ResolvePlayerCollision(DirectX::XMFLOAT3& eyePosition, float& floorY,
+                                float radius = 0.35f, float height = 1.7f);
 
     bool IsInitialized() const;
     uint32_t GetChunkCount() const;
     uint32_t GetActorCount() const;
     const std::vector<DestructionRenderItem>& GetRenderItems() const;
+    const std::vector<RagdollRenderItem>& GetRagdollRenderItems() const;
     DestructionDebugData GetDebugData() const;
 
     void receive(const Nv::Blast::TkEvent* events, uint32_t eventCount) override;

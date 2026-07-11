@@ -18,7 +18,8 @@ namespace fs = std::filesystem;
 std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
     Microsoft::WRL::ComPtr<ID3D12Device> device,
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
-    float uniformScale) {
+    float uniformScale,
+    bool splitIntoDestructibleBoards) {
     Assimp::Importer importer;
     const aiScene* scene = importer.ReadFile(filepath, aiProcess_Triangulate | aiProcess_JoinIdenticalVertices |
         aiProcess_GenSmoothNormals | aiProcess_CalcTangentSpace | aiProcess_ImproveCacheLocality |
@@ -97,6 +98,16 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
         for (unsigned f=0; f<src->mNumFaces; ++f)
             for (unsigned i=0; i<src->mFaces[f].mNumIndices; ++i) p.indices.push_back(src->mFaces[f].mIndices[i]);
         if (p.indices.empty()) continue;
+
+        // Static FBX assets such as the replacement roof must retain their
+        // authored topology. Splitting every connected component into random
+        // plank fragments is only appropriate for destructible house assets.
+        if (!splitIntoDestructibleBoards) {
+            p.materialIndex = (int)src->mMaterialIndex;
+            if (GLBImporter::BuildMeshletData(p, device.Get()))
+                root->mesh->primitives.push_back(std::move(p));
+            continue;
+        }
 
         // Whole-house fracture mode: keep original material meshes together.
         // DestructionDX12 partitions this volume with 3D Voronoi sites.

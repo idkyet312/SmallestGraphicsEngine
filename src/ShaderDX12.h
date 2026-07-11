@@ -41,6 +41,8 @@ struct alignas(256) ObjectBufferDX12 {
     float roughness;
     float useNormalMap;    // > 0.5 enabled
     float metalRoughMode;  // 0=none, 1=glTF packed, 2=roughness-only
+    float opacity;
+    float padding[3];
 };
 
 struct PointLightDataDX12 {
@@ -178,6 +180,7 @@ public:
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipelineState;
     ComPtr<ID3D12PipelineState> wireframePipelineState;
+    ComPtr<ID3D12PipelineState> transparentPipelineState;
     ComPtr<ID3DBlob> pixelShaderBlob;
     
     // Per-draw-call constant buffers (need enough for all objects)
@@ -469,6 +472,21 @@ public:
             std::cerr << "Failed to create pipeline state, HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
             return false;
         }
+
+        // Alpha-blended material pass. Keep depth testing, disable depth writes
+        // so glass reveals opaque geometry behind it.
+        psoDesc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+        psoDesc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        psoDesc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        psoDesc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+        psoDesc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+        psoDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+        psoDesc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&transparentPipelineState));
+        if (FAILED(hr)) return false;
+        psoDesc.BlendState.RenderTarget[0].BlendEnable = FALSE;
+        psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         
         // Create wireframe PSO
         psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
@@ -502,6 +520,11 @@ public:
         g_dx12.commandList->SetDescriptorHeaps(2, heaps);
         g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
         g_dx12.commandList->SetPipelineState(wireframe ? wireframePipelineState.Get() : pipelineState.Get());
+    }
+
+    void UseTransparent() {
+        Use(false);
+        if (transparentPipelineState) g_dx12.commandList->SetPipelineState(transparentPipelineState.Get());
     }
 
     void BindGlobalResources(ID3D12Resource* shadowMap,
@@ -600,6 +623,7 @@ public:
         data.roughness = 0.5f;
         data.useNormalMap = 0.0f;
         data.metalRoughMode = 0.0f;
+        data.opacity = 1.0f;
         
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
@@ -607,7 +631,7 @@ public:
     
     void SetObjectMaterial(const XMFLOAT3& color, bool useTex, bool useNorm, float metal, float rough,
                           ID3D12Resource* albedo, ID3D12Resource* normal, ID3D12Resource* metalRough,
-                          bool roughnessOnly = false) {
+                          bool roughnessOnly = false, float opacity = 1.0f) {
         UINT bufferIndex = GetDrawCallIndex();
         
         ObjectBufferDX12 data;
@@ -617,6 +641,7 @@ public:
         data.metalness = metal;
         data.roughness = rough;
         data.metalRoughMode = metalRough ? (roughnessOnly ? 2.0f : 1.0f) : 0.0f;
+        data.opacity = opacity;
         
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
