@@ -6,6 +6,7 @@
 #include <chrono>
 #include <filesystem>
 #include <array>
+#include <cfloat>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx12.h>
@@ -237,6 +238,132 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     return root;
 }
 
+// Draw Blast/Box3D destruction state as a 2D overlay using ImGui's foreground
+// draw list: chunk AABBs coloured by role, bonds (green healthy / red severed),
+// and the last hit sphere. No new pipeline needed -- just project to screen.
+static void DrawDestructionDebug(Scene& scene) {
+    if (!scene.showDestructionDebug || !g_destruction.IsInitialized()) return;
+    const DestructionDebugData data = g_destruction.GetDebugData();
+
+    const XMMATRIX viewProj = scene.GetViewMatrix() * scene.GetProjectionMatrix();
+    const ImGuiIO& io = ImGui::GetIO();
+    const float w = io.DisplaySize.x, h = io.DisplaySize.y;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+    // World -> screen; returns false when behind the camera.
+    auto project = [&](const XMFLOAT3& p, ImVec2& out) -> bool {
+        XMVECTOR clip = XMVector3Transform(XMLoadFloat3(&p), viewProj);
+        const float cw = XMVectorGetW(clip);
+        if (cw <= 0.0001f) return false;
+        const float ndcX = XMVectorGetX(clip) / cw, ndcY = XMVectorGetY(clip) / cw;
+        out = ImVec2((ndcX * 0.5f + 0.5f) * w, (1.0f - (ndcY * 0.5f + 0.5f)) * h);
+        return true;
+    };
+
+    // Wireframe box from world-space AABB corners.
+    auto drawBox = [&](const XMFLOAT3& lo, const XMFLOAT3& hi, ImU32 color) {
+        const XMFLOAT3 c[8] = {
+            {lo.x,lo.y,lo.z},{hi.x,lo.y,lo.z},{hi.x,hi.y,lo.z},{lo.x,hi.y,lo.z},
+            {lo.x,lo.y,hi.z},{hi.x,lo.y,hi.z},{hi.x,hi.y,hi.z},{lo.x,hi.y,hi.z} };
+        ImVec2 s[8]; bool ok = true;
+        for (int i = 0; i < 8; ++i) ok = project(c[i], s[i]) && ok;
+        if (!ok) return;
+        const int edges[12][2] = { {0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},
+                                   {0,4},{1,5},{2,6},{3,7} };
+        for (auto& e : edges) dl->AddLine(s[e[0]], s[e[1]], color, 1.2f);
+    };
+
+    // Chunks: yellow = anchored support, cyan = dynamic (falling), grey = static.
+    for (const DestructionDebugChunk& chunk : data.chunks) {
+        const ImU32 color = chunk.support ? IM_COL32(255, 215, 0, 200)
+                          : chunk.dynamic ? IM_COL32(0, 220, 255, 180)
+                                          : IM_COL32(150, 150, 150, 110);
+        drawBox(chunk.worldMin, chunk.worldMax, color);
+    }
+
+    // Bonds coloured by live health: full green -> yellow -> red as it drains.
+    // Skip severed bonds whose chunks have drifted apart (once pieces fall their
+    // world centres scatter and the lines sprawl across the scene as noise);
+    // only show a severed bond while its two chunks are still close.
+    for (const DestructionDebugBond& bond : data.bonds) {
+        if (bond.broken) {
+            const float dx = bond.a.x - bond.b.x, dy = bond.a.y - bond.b.y, dz = bond.a.z - bond.b.z;
+            if (dx * dx + dy * dy + dz * dz > 1.5f * 1.5f) continue;
+        }
+        ImVec2 a, b;
+        if (!project(bond.a, a) || !project(bond.b, b)) continue;
+        ImU32 color;
+        float thickness;
+        if (bond.broken) {
+            color = IM_COL32(255, 40, 40, 220); thickness = 1.0f;
+        } else {
+            // Health fraction f: f=1 green (0,255,60), f=0 red (255,40,40).
+            const float f = bond.healthFraction;
+            const int r = (int)(255 * (1.0f - f) + 40 * f);
+            const int g = (int)(60 * (1.0f - f) + 255 * f);
+            color = IM_COL32(r, g, 60, 210);
+            thickness = 1.5f + f;  // healthier = thicker
+        }
+        dl->AddLine(a, b, color, thickness);
+        // Label weakened (but not broken) bonds with their remaining health.
+        if (!bond.broken && bond.healthFraction < 0.99f) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.2f", bond.health);
+            const ImVec2 mid((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+            dl->AddText(mid, IM_COL32(255, 255, 255, 230), buf);
+        }
+    }
+
+    // Last hit: magenta ring at the impact, radius projected roughly to screen.
+    if (data.hasHit) {
+        ImVec2 center;
+        if (project(data.lastHit, center)) {
+            const XMFLOAT3 edge = { data.lastHit.x + data.hitRadius, data.lastHit.y, data.lastHit.z };
+            ImVec2 edgePt;
+            float pixelRadius = 8.0f;
+            if (project(edge, edgePt)) {
+                const float dx = edgePt.x - center.x, dy = edgePt.y - center.y;
+                pixelRadius = std::max(4.0f, std::sqrt(dx * dx + dy * dy));
+            }
+            dl->AddCircle(center, pixelRadius, IM_COL32(255, 0, 255, 230), 24, 2.0f);
+            dl->AddCircleFilled(center, 4.0f, IM_COL32(255, 0, 255, 255));
+        }
+    }
+
+    // Stats readout.
+    ImGui::SetNextWindowBgAlpha(0.75f);
+    if (ImGui::Begin("Blast Debug", &scene.showDestructionDebug,
+                     ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("chunks:  %zu", data.chunks.size());
+        ImGui::Text("bonds:   %zu", data.bonds.size());
+        size_t broken = 0, weakened = 0;
+        float minHealth = FLT_MAX, sumHealth = 0.0f;
+        for (const auto& bond : data.bonds) {
+            if (bond.broken) { ++broken; continue; }
+            sumHealth += bond.health;
+            minHealth = std::min(minHealth, bond.health);
+            if (bond.healthFraction < 0.99f) ++weakened;
+        }
+        const size_t intact = data.bonds.size() - broken;
+        ImGui::Text("severed:  %zu", broken);
+        ImGui::Text("weakened: %zu", weakened);
+        ImGui::Text("health:   min %.2f  avg %.2f",
+                    intact ? minHealth : 0.0f, intact ? sumHealth / intact : 0.0f);
+        ImGui::Text("actors:  %u  (dynamic %u)", data.actorCount, data.dynamicActorCount);
+        if (data.hasHit)
+            ImGui::Text("last hit: %.2f %.2f %.2f  r=%.2f",
+                        data.lastHit.x, data.lastHit.y, data.lastHit.z, data.hitRadius);
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1, 0.84f, 0, 1), "yellow = support (anchored)");
+        ImGui::TextColored(ImVec4(0, 0.86f, 1, 1), "cyan   = dynamic (falling)");
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "grey   = static");
+        ImGui::TextColored(ImVec4(0.24f, 1, 0.35f, 1), "bond: green = full health");
+        ImGui::TextColored(ImVec4(1, 0.84f, 0.24f, 1), "bond: yellow = damaged");
+        ImGui::TextColored(ImVec4(1, 0.24f, 0.24f, 1), "bond: red = severed");
+    }
+    ImGui::End();
+}
+
 // ?? timer ????????????????????????????????????????????????????????????????????
 class Timer {
     std::chrono::high_resolution_clock::time_point t0;
@@ -291,6 +418,11 @@ static bool CreateAllGeometry() {
     };
     if (!CreateVertexBuffer(planeVerts, geo.planeVertexBuffer, geo.planeVBV)) return false;
 
+    // Unit sphere (radius 0.5) for projectiles / debug spheres.
+    std::vector<VertexPosNormUV> sphereVerts = BuildSphereVertices();
+    if (!CreateVertexBuffer(sphereVerts, geo.sphereVertexBuffer, geo.sphereVBV)) return false;
+    geo.sphereVertexCount = (UINT)sphereVerts.size();
+
     BuildPackedGeometry(cubeVerts, planeVerts, packed);
     return true;
 }
@@ -330,6 +462,16 @@ static void ProcessInput(HWND) {
     if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime);
     if (GetAsyncKeyState(VK_SPACE) & 0x8000) scene.camera.ProcessKeyboard(' ', deltaTime);
     if (GetAsyncKeyState(VK_SHIFT) & 0x8000) scene.camera.ProcessKeyboard('Q', deltaTime);
+
+    // Auto-fire: while the mouse is held (and not interacting with the UI),
+    // keep shooting on a fixed interval instead of one shot per click.
+    scene.fireCooldown -= deltaTime;
+    const bool mouseHeld = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    if (scene.autoFire && mouseHeld && !ImGui::GetIO().WantCaptureMouse &&
+        scene.fireCooldown <= 0.0f) {
+        scene.ShootProjectile();
+        scene.fireCooldown = scene.fireInterval;
+    }
 }
 
 // ?? window proc ??????????????????????????????????????????????????????????????
@@ -397,7 +539,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 lastX = (float)(r.right-r.left)/2;
                 lastY = (float)(r.bottom-r.top)/2;
                 firstMouse = true;
-            } else {
+            } else if (!scene.autoFire) {
+                // Auto-fire handles shooting in ProcessInput while held; only
+                // fire on click when auto-fire is off.
                 scene.ShootProjectile();
             }
         }
@@ -624,8 +768,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             for (auto& projectile : scene.projectiles) {
                 if (!projectile.active) continue;
                 XMFLOAT3 hit;
+                // Collision uses the bullet's own small radius so it must
+                // actually reach the surface before it registers -- the wider
+                // damage radius only governs how far the fracture spreads once
+                // the bullet has struck. Otherwise the wall breaks at a distance.
+                const float bulletRadius = std::max(0.12f, scene.projectileScale * 0.5f);
                 if (g_destruction.HitTestSegment(projectile.previousPosition, projectile.position,
-                                                 scene.destructionDamageRadius, hit)) {
+                                                 bulletRadius, hit)) {
                     std::cout << "Projectile hit wall at " << hit.x << ", "
                               << hit.y << ", " << hit.z << "\n";
                     g_destruction.ApplyRadialDamage(hit, scene.destructionDamageRadius,
@@ -729,6 +878,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
         if (showUI) RenderUI(scene, visBuffer);
+        DrawDestructionDebug(scene);
         ImGui::Render();
 
         ID3D12DescriptorHeap* heaps[] = { imguiSrvHeap.Get() };
