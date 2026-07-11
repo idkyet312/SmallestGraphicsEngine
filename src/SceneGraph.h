@@ -36,6 +36,7 @@ struct SceneMaterial {
     
     ComPtr<ID3D12Resource> baseColorTexture;
     ComPtr<ID3D12Resource> metallicRoughnessTexture;
+    bool roughnessOnlyTexture = false;
     ComPtr<ID3D12Resource> normalTexture;
 
     // Keep upload heaps alive until GPU finishes

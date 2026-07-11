@@ -127,7 +127,8 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
                     prim.material->roughnessFactor,
                     prim.material->baseColorTexture.Get(),
                     prim.material->normalTexture.Get(),
-                    prim.material->metallicRoughnessTexture.Get());
+                    prim.material->metallicRoughnessTexture.Get(),
+                    prim.material->roughnessOnlyTexture);
             } else {
                 shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
             }
@@ -212,7 +213,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                                  floorMaterial->roughnessFactor,
                                  floorMaterial->baseColorTexture.Get(),
                                  floorMaterial->normalTexture.Get(),
-                                 floorMaterial->metallicRoughnessTexture.Get());
+                                 floorMaterial->metallicRoughnessTexture.Get(),
+                                 floorMaterial->roughnessOnlyTexture);
     } else {
         shader.SetObjectColor(scene.floor.color);
     }

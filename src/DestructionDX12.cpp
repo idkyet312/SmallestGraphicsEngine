@@ -218,6 +218,8 @@ struct DestructionDX12::Impl {
         // frees the whole plank as a cluster; sub-pieces stay bonded so they can
         // fracture further later. -1 = a standalone chunk (stud, roof, ...).
         int plankGroup = -1;
+        bool glass = false;    // window pane cell: any hit shatters the whole pane
+        bool sheet = false;    // corrugated roof sheet: a hit tears the whole sheet off
     };
 
     struct ActorRuntime {
@@ -282,6 +284,8 @@ struct DestructionDX12::Impl {
                 if (at != std::string::npos) {
                     chunk.plankGroup = std::atoi(sourceChunk->name.c_str() + at + 1);
                 }
+                chunk.glass = sourceChunk->name.rfind("Glass@", 0) == 0;
+                chunk.sheet = sourceChunk->name.rfind("Roof@", 0) == 0;
                 chunk.minimum = { FLT_MAX, FLT_MAX, FLT_MAX };
                 chunk.maximum = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
                 chunk.node = std::make_shared<SceneNode>("VoronoiChunk");
@@ -461,9 +465,13 @@ struct DestructionDX12::Impl {
             if (ox < -touchSlop || oy < -touchSlop || oz < -touchSlop) continue;
             // Voronoi cells inside one plank have slanted seams that defeat the
             // axis-aligned face test below, so bond any same-plank cells whose
-            // AABBs touch. Normal and area are nominal: plank bonds are only
-            // ever severed outright and bond healths are uniform anyway.
-            if (ca.plankGroup >= 0 && ca.plankGroup == cb.plankGroup) {
+            // AABBs touch. Glass panes are too thin to pass the face-area test
+            // at all, so they likewise bond to whatever they touch (the stud
+            // stubs and cladding edges framing the window). Normal and area are
+            // nominal: these bonds are only ever severed outright and bond
+            // healths are uniform anyway.
+            if ((ca.plankGroup >= 0 && ca.plankGroup == cb.plankGroup) ||
+                ca.glass || cb.glass) {
                 float nx = cb.center.x - ca.center.x, ny = cb.center.y - ca.center.y,
                       nz = cb.center.z - ca.center.z;
                 const float distSq = nx * nx + ny * ny + nz * nz;
@@ -693,10 +701,36 @@ struct DestructionDX12::Impl {
         if (chunks[hitChunk].support) return false;        // anchored pieces shrug it off
         if (hitActor->chunks.size() <= 1) return false;    // lone cell: nothing left to sever
         lastDamagePosition = worldPosition;  // outward burst origin for the split
-        // Break just the struck Voronoi cell: a local jagged hole rather than a
-        // whole straight-edged board.
+        const int hitGroup = chunks[hitChunk].plankGroup;
+        // Corrugated sheet still on the roof: cut only the bonds leaving its
+        // group so the whole sheet tears off in one piece (cells stay bonded).
+        // Once the sheet has fallen, its actor holds just that group and later
+        // hits drop through to per-cell fracture below.
+        if (chunks[hitChunk].sheet && hitGroup >= 0) {
+            bool attachedToOthers = false;
+            for (uint32_t ci : hitActor->chunks)
+                if (chunks[ci].plankGroup != hitGroup) { attachedToOthers = true; break; }
+            if (attachedToOthers) {
+                IsolateGroupParams groupParams{ chunkGroupByAsset.data(),
+                    (uint32_t)chunkGroupByAsset.size(), hitGroup };
+                const NvBlastDamageProgram isolateGroup = { IsolateGroupShader, nullptr };
+                hitActor->actor->damage(isolateGroup, &groupParams);
+                group->process();
+                return true;
+            }
+        }
         std::vector<uint8_t> mask(chunks.size() + 1, 0);  // asset chunk index; 0 = root
-        mask[hitChunk + 1] = 1;
+        if (chunks[hitChunk].glass) {
+            // Glass breaks like glass: one hit severs every cell of the pane so
+            // the whole window bursts into individual shards at once.
+            const int pane = chunks[hitChunk].plankGroup;
+            for (uint32_t ci : hitActor->chunks)
+                if (chunks[ci].plankGroup == pane) mask[ci + 1] = 1;
+        } else {
+            // Wood: break just the struck Voronoi cell -- a local jagged hole
+            // rather than a whole straight-edged board.
+            mask[hitChunk + 1] = 1;
+        }
         IsolateChunksParams isolateParams{ mask.data(), (uint32_t)mask.size() };
         const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
         hitActor->actor->damage(isolate, &isolateParams);
@@ -956,7 +990,11 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
         if (dist < 0.001f) dir = XMVectorSet(0, 1, 0, 0);  // at the centre: straight up
         dir = XMVector3Normalize(dir + XMVectorSet(0, 0.4f, 0, 0));
         const float scale = std::max(0.2f, 1.0f - dist / radius);
-        XMFLOAT3 v; XMStoreFloat3(&v, dir * impulse * scale);
+        // Cap the velocity change so feather-light shards don't launch.
+        constexpr float kMaxDeltaV = 14.0f;  // m/s
+        const float mass = std::max(0.05f, b3Body_GetMass(runtime->body));
+        const float magnitude = std::min(impulse * scale, kMaxDeltaV * mass);
+        XMFLOAT3 v; XMStoreFloat3(&v, dir * magnitude);
         b3Body_ApplyLinearImpulse(runtime->body, { v.x, v.y, v.z }, { (float)bp.x, (float)bp.y, (float)bp.z }, true);
     }
     std::cout << "Grenade: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
@@ -981,8 +1019,14 @@ bool DestructionDX12::ApplyImpulse(const XMFLOAT3& worldPosition,
         const float distanceSquared = XMVectorGetX(XMVector3LengthSq(bodyCenter - hitPoint));
         if (distanceSquared > falloffSquared) continue;
         const float scale = 1.0f - std::sqrt(distanceSquared) / falloffRadius;
+        // Cap the resulting velocity change: a fixed impulse on a feather-light
+        // fragment (a glass shard) would otherwise launch it at bullet speed.
+        constexpr float kMaxDeltaV = 9.0f;  // m/s
+        const float mass = std::max(0.05f, b3Body_GetMass(runtime->body));
+        const float magnitude = std::min(impulseStrength * std::max(0.15f, scale),
+                                         kMaxDeltaV * mass);
         XMFLOAT3 impulse;
-        XMStoreFloat3(&impulse, direction * impulseStrength * std::max(0.15f, scale));
+        XMStoreFloat3(&impulse, direction * magnitude);
         b3Body_ApplyLinearImpulse(runtime->body, { impulse.x, impulse.y, impulse.z },
             { worldPosition.x, worldPosition.y, worldPosition.z }, true);
         applied = true;

@@ -82,7 +82,7 @@ struct Scene {
     float    lightQuadratic = 0.032f;
 
     // Material defaults
-    float ambientStrength   = 0.42f;
+    float ambientStrength   = 0.18f;
     float specularStrength  = 0.5f;
     int   specularShininess = 32;
     float shadowBias        = 0.005f;

@@ -33,7 +33,7 @@ cbuffer ObjectBuffer : register(b3) {
     float metalness;
     float roughness;
     float useNormalMap;
-    float obPadding;
+    float metalRoughMode;
 };
 
 struct PointLightData {
@@ -268,6 +268,28 @@ float3 sampleSkyIrradiance(float3 normal) {
     return max(result, 0.0) * skyIntensity;
 }
 
+// Cheap local reflection probe for metals. Uses the same sky/ground palette as
+// the scene so corrugated sheets catch blue sky, warm horizon, and dark ground
+// even without a real cubemap capture.
+float3 sampleReflectionProbe(float3 reflectionDir, float rough) {
+    reflectionDir = normalize(reflectionDir);
+    float up = saturate(reflectionDir.y * 0.5 + 0.5);
+    float horizon = exp(-abs(reflectionDir.y) * 7.0);
+
+    float3 zenith = float3(0.34, 0.58, 0.86) * skyIntensity;
+    float3 horizonColor = float3(0.86, 0.78, 0.62) * skyIntensity;
+    float3 ground = float3(0.10, 0.13, 0.09);
+    float3 sky = lerp(horizonColor, zenith, smoothstep(0.30, 1.0, up));
+    float3 env = lerp(ground, sky, up);
+    env = lerp(env, horizonColor, horizon * 0.35);
+
+    float3 sunDir = normalize(lightPos);
+    float sunGlint = pow(saturate(dot(reflectionDir, sunDir)), lerp(96.0, 12.0, rough));
+    env += lightColor * sunGlint * (1.0 - rough) * 1.8;
+
+    return lerp(env, dot(env, float3(0.299, 0.587, 0.114)).xxx, rough * 0.35);
+}
+
 float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 viewDir, float rough) {
     float3 lightPosition = pointLights[index].position;
     float3 lightCol = pointLights[index].color;
@@ -305,15 +327,13 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float3 albedo = objectColor;
     if (useTexture > 0.5) {
         float4 texColor = albedoMap.Sample(texSampler, input.texCoord);
-        // texColor is sRGB? The Importer forces RGBA but format DXGI_FORMAT_R8G8B8A8_UNORM means linear?
-        // Usually file is sRGB. If UNORM, it is just raw values. If we need linear for PBR, we should pow 2.2.
-        // But let's assume texture is albedo.
-        albedo = texColor.rgb * objectColor;
+        // Textures are uploaded as UNORM, so decode authored sRGB before lighting.
+        albedo = pow(max(texColor.rgb, 0.0), 2.2) * objectColor;
     }
     float metal = metalness;
     float rough = roughness;
     
-    if (useTexture > 0.5) { // Assuming if albedo is used, metal/rough map might be too
+    if (metalRoughMode > 0.5) {
         // Check if metalRoughMap is bound? We don't have a flag for it specifically, assuming bundled with material
         // But for GLB, MetalRough is usually packed. B=Metal, G=Roughness.
         // Let's sample if useTexture is true? Or useNormalMap flag?
@@ -335,7 +355,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
         // This is bad if we wanted 1.0 (default).
         // I'll stick to simple constants if no specific flag.
         // But I will enable it:
-        metal *= mrSample.b;
+        if (metalRoughMode < 1.5) metal *= mrSample.b;
         rough *= mrSample.g;
     }
     rough = clamp(rough, 0.045, 1.0); // avoid alpha->0 specular-aliasing spike
@@ -344,7 +364,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // without tangents get UV-derived tangents generated at load time.
     if (useNormalMap > 0.5) {
          float normalMipBias = 1.5;
-         float normalStrength = 0.35;
+         float normalStrength = 0.70;
          float3 mapNormal = normalMap.SampleBias(texSampler, input.texCoord, normalMipBias).xyz * 2.0 - 1.0;
          float normalMipLength = saturate(length(mapNormal));
          mapNormal.xy *= normalMipLength;
@@ -373,15 +393,16 @@ float4 main(PS_INPUT input) : SV_TARGET {
     rough = clamp(sqrt(rough * rough + min(normalVariance * 0.25, 0.25)), 0.045, 1.0);
 
     // Base ambient
-    float3 ambient = ambientStrength * albedo;
+    float3 diffuseAlbedo = albedo * (1.0 - metal);
+    float3 ambient = ambientStrength * diffuseAlbedo;
     
     // Add DDGI global illumination
     float3 giContribution = sampleDDGIIrradiance(input.fragPos, normal);
-    ambient += giContribution * albedo;
+    ambient += giContribution * diffuseAlbedo;
 
     // Add sky IBL (diffuse irradiance from the HDRI, via SH)
     float3 skyContribution = sampleSkyIrradiance(normal);
-    ambient += skyContribution * albedo;
+    ambient += skyContribution * diffuseAlbedo;
 
     float3 result = ambient;
     
@@ -441,6 +462,9 @@ float4 main(PS_INPUT input) : SV_TARGET {
     
     // Combine
     float shadowVisibility = CalculateShadow(input.fragPosLightSpace, normal, lightDir);
+    // Direct occlusion must also reduce local sky/DDGI fill. Keep a small
+    // indirect floor so shadows stay readable instead of becoming pure black.
+    result *= lerp(0.28, 1.0, shadowVisibility);
     float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor * NdotL * attenuation * shadowVisibility; // No light intensity? lightColor should allow > 1.
     
     result += Lo;
@@ -454,6 +478,13 @@ float4 main(PS_INPUT input) : SV_TARGET {
         result += calculatePointLight(i, input.fragPos, normal, viewDir, rough) * albedo;
     }
 
+    float3 reflectionDir = reflect(-viewDir, normal);
+    float3 probeColor = sampleReflectionProbe(reflectionDir, rough);
+    float3 envFresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
+    float reflectionStrength = saturate((1.0 - rough * 0.75) * (0.10 + metal * 1.15));
+    float3 metalTint = lerp(float3(1.0, 1.0, 1.0), albedo, metal * 0.45);
+    result += probeColor * envFresnel * reflectionStrength * metalTint;
+
     // Aerial perspective ties distant geometry into the procedural sky.
     float cameraDistance = length(viewPos - input.fragPos);
     float3 cameraRay = -viewDir;
@@ -466,6 +497,11 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float fogAmount = saturate(distanceFog * lerp(0.45, 1.0, heightFog));
     result = lerp(result, fogColor, fogAmount * 0.72);
     
+    // ACES filmic tone mapping, then encode for UNORM display output.
+    result = max(result, 0.0);
+    result = saturate((result * (2.51 * result + 0.03)) /
+                      (result * (2.43 * result + 0.59) + 0.14));
+    result = pow(result, 1.0 / 2.2);
     return float4(result, 1.0);
 }
 
