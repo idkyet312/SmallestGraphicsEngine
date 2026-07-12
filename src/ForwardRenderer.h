@@ -311,14 +311,45 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.NextDrawCall();
     }
 
-    // Projectiles
+    // Projectiles. Grenades: dark spheres. Bullets: bright tracer rounds -- a
+    // thin streak stretched along the flight direction, glowing hot so it reads
+    // like a real tracer whipping downrange.
     for (auto& p : scene.projectiles) {
         if (!p.active) continue;
-        model = XMMatrixScaling(scene.projectileScale, scene.projectileScale, scene.projectileScale);
-        model = model * XMMatrixTranslation(p.position.x, p.position.y, p.position.z);
+        if (p.grenade) {
+            model = XMMatrixScaling(scene.projectileScale * 1.6f, scene.projectileScale * 1.6f,
+                                    scene.projectileScale * 1.6f) *
+                    XMMatrixTranslation(p.position.x, p.position.y, p.position.z);
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetObjectMaterial(XMFLOAT3(0.10f, 0.12f, 0.08f), false, false,
+                                     0.6f, 0.5f, nullptr, nullptr, nullptr);
+            DrawSphere(geo);
+            shader.NextDrawCall();
+            continue;
+        }
+
+        // Orthonormal basis with local +Z along the bullet's travel direction.
+        XMVECTOR fwd = XMLoadFloat3(&p.direction);
+        if (XMVectorGetX(XMVector3LengthSq(fwd)) < 1e-6f) fwd = XMVectorSet(0, 0, 1, 0);
+        fwd = XMVector3Normalize(fwd);
+        XMVECTOR up0 = fabsf(XMVectorGetY(fwd)) > 0.95f ? XMVectorSet(1, 0, 0, 0)
+                                                        : XMVectorSet(0, 1, 0, 0);
+        XMVECTOR right = XMVector3Normalize(XMVector3Cross(up0, fwd));
+        XMVECTOR up    = XMVector3Cross(fwd, right);
+        XMMATRIX basis = XMMatrixIdentity();
+        basis.r[0] = XMVectorSetW(right, 0.0f);
+        basis.r[1] = XMVectorSetW(up, 0.0f);
+        basis.r[2] = XMVectorSetW(fwd, 0.0f);
+        basis.r[3] = XMVectorSet(p.position.x, p.position.y, p.position.z, 1.0f);
+
+        const float r = scene.projectileScale * 0.28f;   // slim tracer
+        const float len = scene.projectileScale * 6.0f;  // long streak
+        model = XMMatrixScaling(r * 2.0f, r * 2.0f, len) * basis;
         shader.SetMatrices(model, view, proj, lightSpace);
-        shader.SetObjectColor(scene.projectileColor);
-        DrawSphere(geo);
+        // Hot tracer glow (bright, low-roughness so it reads as emissive-ish).
+        shader.SetObjectMaterial(XMFLOAT3(3.0f, 1.4f, 0.35f), false, false,
+                                 0.0f, 0.9f, nullptr, nullptr, nullptr);
+        DrawCube(geo);
         shader.NextDrawCall();
     }
 
@@ -375,13 +406,55 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     }
     shader.Use(scene.wireframeMode);
 
-    // Gun
+    // Gun: an M4-style carbine built from boxed parts. Laid out in the gun's
+    // local space (+Z down the barrel), then placed in front of the camera.
     if (scene.gun.visible) {
-        model = scene.GetGunModelMatrix();
-        shader.SetMatrices(model, view, proj, lightSpace);
-        shader.SetObjectColor(scene.gun.color);
-        DrawCube(geo);
-        shader.NextDrawCall();
+        const XMMATRIX gunBase = scene.GetGunBaseMatrix();
+        const float S = scene.GunModelScale();
+
+        // Gunmetal / polymer palette.
+        const XMFLOAT3 metal(0.14f, 0.14f, 0.16f);   // receiver, barrel
+        const XMFLOAT3 poly (0.09f, 0.10f, 0.11f);   // handguard, stock, grip
+        const XMFLOAT3 mag  (0.11f, 0.12f, 0.13f);   // magazine
+        const XMFLOAT3 iron (0.05f, 0.05f, 0.06f);   // sights, muzzle
+
+        struct Part { XMFLOAT3 c, h, col; };
+        // center (x,y,z), half-extents (x,y,z), colour -- local units.
+        const Part parts[] = {
+            // Upper + lower receiver (main body).
+            {{0.00f,  0.00f,  0.05f}, {0.055f, 0.075f, 0.26f}, metal},
+            // Handguard around the barrel (forward, slightly fatter).
+            {{0.00f, -0.01f,  0.42f}, {0.05f,  0.055f, 0.20f}, poly},
+            // Barrel poking out of the handguard.
+            {{0.00f,  0.01f,  0.66f}, {0.018f, 0.018f, 0.10f}, metal},
+            // Flash hider / muzzle tip.
+            {{0.00f,  0.01f,  0.78f}, {0.026f, 0.026f, 0.03f}, iron},
+            // Magazine, canted slightly forward under the receiver.
+            {{0.00f, -0.20f,  0.02f}, {0.04f,  0.13f,  0.055f}, mag},
+            // Pistol grip, behind the mag.
+            {{0.00f, -0.15f, -0.16f}, {0.035f, 0.10f,  0.04f}, poly},
+            // Buffer tube + stock, to the rear.
+            {{0.00f,  0.00f, -0.24f}, {0.03f,  0.05f,  0.10f}, metal},
+            {{0.00f, -0.02f, -0.38f}, {0.05f,  0.085f, 0.06f}, poly},
+            // Optic/carry-handle rail on top.
+            {{0.00f,  0.10f,  0.02f}, {0.03f,  0.03f,  0.20f}, iron},
+            // Front sight post.
+            {{0.00f,  0.11f,  0.52f}, {0.014f, 0.05f,  0.02f}, iron},
+            // Charging-handle bump at the back top.
+            {{0.00f,  0.09f, -0.14f}, {0.028f, 0.024f, 0.05f}, iron},
+        };
+
+        shader.Use(scene.wireframeMode);
+        for (const Part& p : parts) {
+            model = XMMatrixScaling(p.h.x * 2.0f * S, p.h.y * 2.0f * S, p.h.z * 2.0f * S) *
+                    XMMatrixTranslation(p.c.x * S, p.c.y * S, p.c.z * S) *
+                    gunBase;
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetObjectMaterial(p.col, false, false, 0.85f, 0.35f,
+                                     nullptr, nullptr, nullptr);
+            DrawCube(geo);
+            shader.NextDrawCall();
+        }
     }
 
     // Light spheres

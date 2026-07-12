@@ -304,7 +304,7 @@ struct Scene {
         auto rnd = [&]() { return (float)std::rand() / RAND_MAX * 2.0f - 1.0f; };
         int spawned = 0;
 
-        const int puffs = std::max(2, (int)(10 * intensity));
+        const int puffs = std::max(1, (int)(10 * intensity));
         for (int i = 0; i < puffs; ++i) {
             ImpactParticle sp;
             // Seed puffs across a rough sphere so the cloud has body.
@@ -378,6 +378,28 @@ struct Scene {
         m = m * XMMatrixTranslation(gunPos.x, gunPos.y, gunPos.z);
         return m;
     }
+
+    // Base view-model transform for the M4: places the weapon in front of the
+    // camera and orients its local space so +X = right, +Y = up, +Z = forward
+    // (down the barrel). Parts are laid out in this local space by the renderer.
+    // No non-uniform stretch here (unlike the legacy single-cube matrix).
+    XMMATRIX GetGunBaseMatrix() const {
+        XMVECTOR camPos   = XMLoadFloat3(&camera.Position);
+        XMVECTOR camFront = XMLoadFloat3(&camera.Front);
+        XMVECTOR camRight = XMVector3Cross(XMLoadFloat3(&camera.Up), camFront);
+        XMVECTOR camUp    = XMLoadFloat3(&camera.Up);
+        XMVECTOR gp = camPos + camFront * gun.offset.z + camRight * gun.offset.x + camUp * gun.offset.y;
+        // Orthonormal basis: columns right/up/front, translation at the gun spot.
+        XMMATRIX basis = XMMatrixIdentity();
+        basis.r[0] = XMVectorSetW(camRight, 0.0f);
+        basis.r[1] = XMVectorSetW(camUp, 0.0f);
+        basis.r[2] = XMVectorSetW(camFront, 0.0f);
+        basis.r[3] = XMVectorSetW(gp, 1.0f);
+        return basis;
+    }
+
+    // Overall size of the M4 view model (local units before the base transform).
+    float GunModelScale() const { return gun.scale.z * 3.0f; }
 };
 
 #endif // SCENE_H

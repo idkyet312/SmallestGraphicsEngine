@@ -1541,8 +1541,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
-                    // Smoke comes from the actual fracture (DrainBreakPoints),
-                    // not the impact point -- no dust puff here.
+                    // One small dust puff right at the hit; the bigger cloud
+                    // comes from the actual fracture (DrainBreakPoints).
+                    scene.SpawnSmokeBurst(hit, 0.3f, 0.1f);
                     projectile.active = false;
                 } else if (g_water.ShootFloaters(projectile.previousPosition,
                                                  projectile.position, projectile.direction,
