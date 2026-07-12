@@ -19,14 +19,17 @@ extern bool g_useMeshShader;
 extern TerrainRendererDX12 g_terrain;
 extern bool g_showH2Model;
 extern WaterVolume g_water;
+extern ComPtr<ID3D12Resource> g_smokeTexture;   // soft smoke sprite for billboards
 
 struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
     ComPtr<ID3D12Resource>   planeVertexBuffer;
     ComPtr<ID3D12Resource>   sphereVertexBuffer;
+    ComPtr<ID3D12Resource>   quadVertexBuffer;      // unit XY billboard quad
     D3D12_VERTEX_BUFFER_VIEW cubeVBV  = {};
     D3D12_VERTEX_BUFFER_VIEW planeVBV = {};
     D3D12_VERTEX_BUFFER_VIEW sphereVBV = {};
+    D3D12_VERTEX_BUFFER_VIEW quadVBV = {};
     UINT                     sphereVertexCount = 0;
 };
 
@@ -75,6 +78,13 @@ inline void DrawCube(const GeometryBuffers& geo) {
 
 inline void DrawPlane(const GeometryBuffers& geo) {
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.planeVBV);
+    g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_dx12.commandList->DrawInstanced(6, 1, 0, 0);
+}
+
+// A unit quad in the XY plane (-0.5..0.5, UV 0..1), for camera-facing billboards.
+inline void DrawQuad(const GeometryBuffers& geo) {
+    g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.quadVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_dx12.commandList->DrawInstanced(6, 1, 0, 0);
 }
@@ -262,8 +272,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
     }
 
-    // Water pool: floating crates (opaque) drawn first, then the translucent
-    // water box on top so the crates show through it.
+    // Water pool: floating crates + any debris (opaque) drawn first, then the
+    // animated, undulating water surface on top so the floaters show through it.
     if (g_water.IsInitialized()) {
         shader.Use(scene.wireframeMode);
         for (const WaterFloaterItem& item : g_water.GetFloaterItems()) {
@@ -272,16 +282,23 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             DrawCube(geo);
             shader.NextDrawCall();
         }
-        // Translucent water volume.
-        const XMFLOAT3 c = g_water.GetCenter();
-        const XMFLOAT3 e = g_water.GetExtents();
-        XMMATRIX water = XMMatrixScaling(e.x, e.y, e.z) * XMMatrixTranslation(c.x, c.y, c.z);
-        shader.UseTransparent();
-        shader.SetMatrices(water, view, proj, lightSpace);
-        shader.SetObjectMaterial(XMFLOAT3(0.15f, 0.42f, 0.72f), false, false,
-                                 0.0f, 0.1f, nullptr, nullptr, nullptr, false, 0.45f);
-        DrawCube(geo);
-        shader.NextDrawCall();
+        // Wave surface: positions/normals recomputed on the CPU each frame into a
+        // per-frame upload buffer, drawn as a translucent glossy sheet so the
+        // moving swell catches the light.
+        const D3D12_VERTEX_BUFFER_VIEW& wvbv = g_water.UpdateAndGetVBV(g_dx12.frameIndex);
+        const D3D12_INDEX_BUFFER_VIEW& wibv = g_water.GetIBV();
+        const UINT waterIndices = g_water.GetIndexCount();
+        if (waterIndices && wvbv.BufferLocation) {
+            shader.UseTransparent();
+            shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);  // verts are world-space
+            shader.SetObjectMaterial(XMFLOAT3(0.06f, 0.30f, 0.55f), false, false,
+                                     0.05f, 0.06f, nullptr, nullptr, nullptr, false, 0.62f);
+            g_dx12.commandList->IASetVertexBuffers(0, 1, &wvbv);
+            g_dx12.commandList->IASetIndexBuffer(&wibv);
+            g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_dx12.commandList->DrawIndexedInstanced(waterIndices, 1, 0, 0, 0);
+            shader.NextDrawCall();
+        }
         shader.Use(scene.wireframeMode);
     }
 
@@ -305,19 +322,58 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.NextDrawCall();
     }
 
-    // Impact particles: bright sparks as sharp little cubes (debris shards),
-    // grey smoke as soft spheres. Both dim as they fade.
+    // Impact particles. Sparks: opaque bright cubes (hot debris shards). Smoke:
+    // soft camera-facing billboards using the smoke sprite, alpha-blended so they
+    // read as real translucent, light-scattering puffs.
+    //
+    // Camera right/up come from the view matrix's rotation (its transpose maps
+    // view axes back to world), so every quad faces the camera.
+    XMMATRIX invRot = XMMatrixTranspose(view);
+    const XMVECTOR camRight = XMVectorSetW(invRot.r[0], 0.0f);
+    const XMVECTOR camUp    = XMVectorSetW(invRot.r[1], 0.0f);
+    const XMVECTOR camFwd   = XMVectorSetW(invRot.r[2], 0.0f);
+
+    // Opaque sparks first.
+    shader.Use(scene.wireframeMode);
     for (auto& sp : scene.impactParticles) {
+        if (!sp.spark) continue;
         const float fade = sp.life / sp.maxLife;
         model = XMMatrixScaling(sp.size, sp.size, sp.size) *
                 XMMatrixTranslation(sp.position.x, sp.position.y, sp.position.z);
         shader.SetMatrices(model, view, proj, lightSpace);
-        // Sparks stay bright (barely dimmed) so they read as hot; smoke fades.
-        const float b = sp.spark ? (0.6f + 0.4f * fade) : fade;
+        const float b = 0.6f + 0.4f * fade;
         shader.SetObjectColor(XMFLOAT3(sp.color.x * b, sp.color.y * b, sp.color.z * b));
-        if (sp.spark) DrawCube(geo); else DrawSphere(geo);
+        DrawCube(geo);
         shader.NextDrawCall();
     }
+
+    // Translucent smoke billboards.
+    shader.UseTransparent();
+    for (auto& sp : scene.impactParticles) {
+        if (sp.spark) continue;
+        const float fade = sp.life / sp.maxLife;      // 1 fresh -> 0 dead
+        const float age = 1.0f - fade;
+        // Opacity ramps up as the puff first blooms, then fades out at the end.
+        const float fadeIn = age < 0.15f ? age / 0.15f : 1.0f;
+        const float fadeOut = fade < 0.4f ? fade / 0.4f : 1.0f;
+        const float opacity = (std::min)(0.85f, fadeIn * fadeOut * 0.85f);
+        if (opacity <= 0.01f) { shader.NextDrawCall(); continue; }
+
+        // Billboard: build a world basis from the camera axes, scaled by size.
+        const XMVECTOR pos = XMVectorSet(sp.position.x, sp.position.y, sp.position.z, 1.0f);
+        model = XMMATRIX(camRight * sp.size, camUp * sp.size, camFwd * sp.size,
+                         XMVectorSetW(pos, 1.0f));
+        shader.SetMatrices(model, view, proj, lightSpace);
+        // Smoke lightens from sooty core to grey as it disperses.
+        const float g = 1.0f + 2.0f * age;
+        const XMFLOAT3 tint((std::min)(1.0f, sp.color.x * g),
+                            (std::min)(1.0f, sp.color.y * g),
+                            (std::min)(1.0f, sp.color.z * g));
+        shader.SetSmokeMaterial(tint, opacity, g_smokeTexture.Get());
+        DrawQuad(geo);
+        shader.NextDrawCall();
+    }
+    shader.Use(scene.wireframeMode);
 
     // Gun
     if (scene.gun.visible) {

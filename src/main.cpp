@@ -57,6 +57,10 @@ static std::shared_ptr<SceneNode> crateModel;
 static std::shared_ptr<SceneNode> wallModel;
 bool g_showH2Model = false;
 static std::shared_ptr<SceneMaterial> floorMaterial;
+// Soft smoke sprite (RGBA, alpha-shaped) for billboard particles, plus the
+// upload heap that must outlive the copy.
+ComPtr<ID3D12Resource> g_smokeTexture;
+static std::vector<ComPtr<ID3D12Resource>> g_smokeUploadHeaps;
 static bool                 crateLoadAttempted = false;
 
 static float lastX = SCR_WIDTH / 2.0f;
@@ -120,6 +124,13 @@ static void LoadFloorMudMaterial() {
         floorMaterial->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
         std::cerr << "Brown mud floor texture unavailable; using pink missing texture\n";
     }
+
+    // Soft smoke sprite for particle billboards.
+    g_smokeTexture = GLBImporter::LoadTextureFromFile(
+        ResolveTexturePath("models/textures/smoke.png"),
+        g_dx12.device, g_dx12.commandList, g_smokeUploadHeaps);
+    if (!g_smokeTexture)
+        std::cerr << "Smoke sprite (models/textures/smoke.png) unavailable\n";
 }
 
 // Crysis-style plank wall: the destructible is built from real structural
@@ -1110,6 +1121,13 @@ static bool CreateAllGeometry() {
     // Unit sphere (radius 0.5) for projectiles / debug spheres.
     std::vector<VertexPosNormUV> sphereVerts = BuildSphereVertices();
     if (!CreateVertexBuffer(sphereVerts, geo.sphereVertexBuffer, geo.sphereVBV)) return false;
+
+    // Unit XY quad (-0.5..0.5) with UV 0..1 for camera-facing smoke billboards.
+    std::vector<VertexPosNormUV> quadVerts = {
+        {{-0.5f,-0.5f,0},{0,0,1},{0,1}}, {{ 0.5f,-0.5f,0},{0,0,1},{1,1}}, {{ 0.5f, 0.5f,0},{0,0,1},{1,0}},
+        {{-0.5f,-0.5f,0},{0,0,1},{0,1}}, {{ 0.5f, 0.5f,0},{0,0,1},{1,0}}, {{-0.5f, 0.5f,0},{0,0,1},{0,0}},
+    };
+    if (!CreateVertexBuffer(quadVerts, geo.quadVertexBuffer, geo.quadVBV)) return false;
     geo.sphereVertexCount = (UINT)sphereVerts.size();
 
     BuildPackedGeometry(cubeVerts, planeVerts, packed);
@@ -1468,10 +1486,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // or those buffers get destroyed in flight and crash.
             WaitForGPU();
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
+            // Re-init rebuilds physics with a flat ground; restore the terrain
+            // heightfield collider so debris keeps colliding with real ground.
+            TerrainRendererDX12::Params tp;
+            tp.heightScale = scene.terrainHeightScale;
+            g_destruction.SetTerrainSampler([tp](float x, float z) {
+                return TerrainRendererDX12::HeightAt(tp, x, z);
+            });
+            g_destruction.SetSplashCallback([](float x, float z, float s) {
+                g_water.Splash(x, z, s);
+            });
         }
         g_water.Update(deltaTime);
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.Update(deltaTime);
+            // Smoke at the actual fracture points where pieces broke loose.
+            for (const XMFLOAT3& bp : g_destruction.DrainBreakPoints())
+                scene.SpawnSmokeBurst(bp, 0.5f, 0.4f);
             for (auto& projectile : scene.projectiles) {
                 if (projectile.grenade) {
                     // A grenade explodes on fuse timeout (Scene set detonate) or
@@ -1510,7 +1541,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
-                    scene.SpawnBulletImpact(hit, normal);
+                    // Smoke comes from the actual fracture (DrainBreakPoints),
+                    // not the impact point -- no dust puff here.
+                    projectile.active = false;
+                } else if (g_water.ShootFloaters(projectile.previousPosition,
+                                                 projectile.position, projectile.direction,
+                                                 bulletRadius, scene.destructionBulletImpulse)) {
+                    // Bullet knocked a crate floating in the pool.
+                    const XMFLOAT3 normal(-projectile.direction.x,
+                                          -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(projectile.position, normal);
                     projectile.active = false;
                 }
             }
@@ -1542,7 +1583,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
             // Pool of water beside the house (on the clear -X side) with a
             // handful of wooden crates dropped in to bob on the surface.
-            g_water.Initialize({ -12.0f, 1.0f, 0.0f }, { 8.0f, 2.5f, 8.0f });
+            // Pool sunk into a dug-out terrain basin (see TerrainHeight): the
+            // surface spans the whole basin (out to the rim) and sits just below
+            // ground level, so it reads as a filled hole in the ground. The pool
+            // gets the terrain height sampler so its rigid floor is the actual
+            // sloped basin -- crates and debris collide with the terrain.
+            {
+                TerrainRendererDX12::Params tp;
+                tp.heightScale = scene.terrainHeightScale;
+                auto terrainSampler = [tp](float x, float z) {
+                    return TerrainRendererDX12::HeightAt(tp, x, z);
+                };
+                g_water.Initialize({ -12.0f, -1.85f, 0.0f }, { 14.0f, 2.7f, 14.0f },
+                                   terrainSampler);
+                // House debris collides with the real terrain, not a flat plane.
+                g_destruction.SetTerrainSampler(terrainSampler);
+                // Debris/ragdolls splash the pool when they break the surface.
+                g_destruction.SetSplashCallback([](float x, float z, float s) {
+                    g_water.Splash(x, z, s);
+                });
+            }
+            // Same pool AABB for the destruction sim so house debris shoved into
+            // the water floats too (surface at max.y).
+            g_destruction.SetWaterRegion({ -19.0f, -3.2f, -7.0f },
+                                         {  -5.0f, -0.5f,  7.0f });
             if (crateModel) {
                 if (auto merged = GLBImporter::MergeSceneByMaterial(crateModel, g_dx12.device)) {
                     crateModel = merged;

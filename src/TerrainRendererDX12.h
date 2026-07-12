@@ -140,7 +140,18 @@ public:
         float t = (dist - params.flattenRadius) / params.flattenRadius; // (b-a)==flattenRadius
         t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
         float mask = t * t * (3.0f - 2.0f * t);
-        return h * mask;
+        h *= mask;
+
+        // Pool basin carve -- must match terrain_ms.hlsl's TerrainHeight and the
+        // pool spawned in main.cpp.
+        constexpr float poolCx = -12.0f, poolCz = 0.0f;
+        constexpr float poolRadius = 4.2f, poolRim = 7.0f, poolDepth = 3.0f;
+        float pd = sqrtf((x - poolCx) * (x - poolCx) + (z - poolCz) * (z - poolCz));
+        float bt = (pd - poolRadius) / (poolRim - poolRadius);
+        bt = bt < 0.0f ? 0.0f : (bt > 1.0f ? 1.0f : bt);
+        float basin = 1.0f - bt * bt * (3.0f - 2.0f * bt);   // 1 at centre -> 0 past rim
+        h -= poolDepth * basin;
+        return h;
     }
 
     // Caller must have bound matrices (SetMatrices, model = identity) and the

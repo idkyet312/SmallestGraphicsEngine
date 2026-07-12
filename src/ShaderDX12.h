@@ -42,7 +42,8 @@ struct alignas(256) ObjectBufferDX12 {
     float useNormalMap;    // > 0.5 enabled
     float metalRoughMode;  // 0=none, 1=glTF packed, 2=roughness-only
     float opacity;
-    float padding[3];
+    float smokeMode = 0.0f; // > 0.5: unlit soft sprite (alpha = opacity*texAlpha)
+    float padding[2];
 };
 
 struct PointLightDataDX12 {
@@ -701,7 +702,46 @@ public:
              currentSrvOffset += 3;
         }
     }
-    
+
+    // Unlit soft-sprite material for smoke billboards: samples `smokeTex`'s alpha
+    // to shape a translucent puff tinted by `color`, faded by `opacity`. Use with
+    // UseTransparent(). Binds the sprite as albedo (t1) and flags smokeMode.
+    void SetSmokeMaterial(const XMFLOAT3& color, float opacity, ID3D12Resource* smokeTex) {
+        UINT bufferIndex = GetDrawCallIndex();
+        ObjectBufferDX12 data;
+        data.objectColor = color;
+        data.useTexture = 1.0f;
+        data.useNormalMap = 0.0f;
+        data.metalness = 0.0f;
+        data.roughness = 1.0f;
+        data.metalRoughMode = 0.0f;
+        data.opacity = opacity;
+        data.smokeMode = 1.0f;
+        objectBuffer.CopyData(bufferIndex, data);
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
+
+        UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle = g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart();
+        cpuHandle.ptr += currentSrvOffset * descriptorSize;
+        gpuHandle.ptr += currentSrvOffset * descriptorSize;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC nullDesc = {};
+        nullDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        nullDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nullDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+        if (smokeTex) g_dx12.device->CreateShaderResourceView(smokeTex, nullptr, cpuHandle);
+        else          g_dx12.device->CreateShaderResourceView(nullptr, &nullDesc, cpuHandle);
+        cpuHandle.ptr += descriptorSize;
+        g_dx12.device->CreateShaderResourceView(nullptr, &nullDesc, cpuHandle);  // t4
+        cpuHandle.ptr += descriptorSize;
+        g_dx12.device->CreateShaderResourceView(nullptr, &nullDesc, cpuHandle);  // t5
+
+        g_dx12.commandList->SetGraphicsRootDescriptorTable(7, gpuHandle);
+        currentSrvOffset += 3;
+    }
+
     // Call this after each DrawCube/DrawPlane to advance to the next buffer slot
     void NextDrawCall() {
         currentDrawCall++;

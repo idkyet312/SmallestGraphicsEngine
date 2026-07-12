@@ -2,6 +2,7 @@
 
 #include <DirectXMath.h>
 #include <d3d12.h>
+#include <functional>
 #include <memory>
 #include <vector>
 #include "NvBlastTkEvent.h"
@@ -74,6 +75,20 @@ public:
     // the caller can stand the player on top) instead of shoving them sideways.
     void ResolvePlayerCollision(DirectX::XMFLOAT3& eyePosition, float& floorY,
                                 float radius = 0.35f, float height = 1.7f);
+    // Define a water region (AABB, with the surface at max.y). Dynamic
+    // fragments knocked into it get buoyancy so house debris floats.
+    void SetWaterRegion(const DirectX::XMFLOAT3& minCorner,
+                        const DirectX::XMFLOAT3& maxCorner);
+    // Supply the terrain-height sampler (CPU mirror of the terrain shader) so
+    // debris collides with the real ground surface instead of a flat plane.
+    // Rebuilds the static ground collider as a heightfield. Call after Initialize.
+    void SetTerrainSampler(std::function<float(float, float)> sampler);
+    // Callback invoked (x, z, strength) when a fragment or ragdoll part first
+    // breaks the water surface, so the caller can spawn a splash ripple.
+    void SetSplashCallback(std::function<void(float, float, float)> cb);
+    // Take and clear the world positions where the building fractured pieces
+    // loose since the last call, so the caller can spawn smoke at each break.
+    std::vector<DirectX::XMFLOAT3> DrainBreakPoints();
 
     bool IsInitialized() const;
     uint32_t GetChunkCount() const;
