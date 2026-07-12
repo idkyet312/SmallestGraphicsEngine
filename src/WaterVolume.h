@@ -122,17 +122,7 @@ public:
             addStatic(center.x, center.y, center.z - hz, hx, hy, wall);
             addStatic(center.x, center.y, center.z + hz, hx, hy, wall);
         }
-
-        // A tall stack of dense crates teetering on the +X bank: a shot topples
-        // them off the edge and they splash into the water and bob on the waves.
-        const XMFLOAT3 stackColor(0.60f, 0.30f, 0.16f);
-        const float bx = center.x + hx - 0.9f;    // just inside the +X wall
-        for (int i = 0; i < 5; ++i) {
-            const float cy = m_surfaceY + 0.5f + i * 0.72f;
-            const float jitter = (i % 2 ? 0.06f : -0.06f);   // slight offset -> unstable
-            SpawnFloater({ bx + jitter, cy, center.z }, { 0.35f, 0.35f, 0.35f },
-                         stackColor, 800.0f);
-        }
+        // No floaters: the pool is just the wave surface (crates removed).
     }
 
     b3BodyId SpawnFloater(const XMFLOAT3& position, const XMFLOAT3& half,
