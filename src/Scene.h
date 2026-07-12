@@ -268,7 +268,12 @@ struct Scene {
                 ip.velocity.x *= 0.99f; ip.velocity.z *= 0.99f;
             } else {
                 ip.velocity.y += 0.6f * dt;            // buoyancy: smoke rises
-                ip.velocity.x *= 0.90f; ip.velocity.z *= 0.90f; ip.velocity.y *= 0.96f;
+                // Turbulence: a little wandering push so the plume curls and
+                // billows instead of drifting in a straight line.
+                auto jit = [&]() { return ((float)std::rand() / RAND_MAX * 2.0f - 1.0f); };
+                ip.velocity.x += jit() * 1.2f * dt;
+                ip.velocity.z += jit() * 1.2f * dt;
+                ip.velocity.x *= 0.94f; ip.velocity.z *= 0.94f; ip.velocity.y *= 0.97f;
             }
             ip.position.x += ip.velocity.x * dt;
             ip.position.y += ip.velocity.y * dt;
@@ -282,50 +287,46 @@ struct Scene {
             impactParticles.end());
     }
 
-    // Spawn a bullet impact: a burst of fast bright sparks/debris plus a few
-    // grey smoke puffs. `normal` points back out of the surface (reverse of the
-    // bullet's travel).
+    // Bullet impact: just a soft smoke puff kicked off the surface (no sparks).
+    // `normal` points back out of the surface (reverse of the bullet's travel).
     void SpawnBulletImpact(const XMFLOAT3& point, const XMFLOAT3& normal) {
+        const XMFLOAT3 at{ point.x + normal.x * 0.1f,
+                           point.y + normal.y * 0.1f,
+                           point.z + normal.z * 0.1f };
+        SpawnSmokeBurst(at, 0.35f, 0.5f);
+    }
+
+    // A rolling cloud of smoke for when things break: a dense, long-lived,
+    // billowing plume centred on `center`. `radius` sizes the spread, `intensity`
+    // (~0.3 dust puff .. ~1.5 big explosion) scales puff count/size/darkness.
+    // Cores start dark (sooty) and lighten as they expand and thin out.
+    void SpawnSmokeBurst(const XMFLOAT3& center, float radius, float intensity = 1.0f) {
         auto rnd = [&]() { return (float)std::rand() / RAND_MAX * 2.0f - 1.0f; };
         int spawned = 0;
 
-        // Sparks: sprayed out of the surface in a wide cone, fast, shrinking.
-        const int sparks = 16;
-        for (int i = 0; i < sparks; ++i) {
-            ImpactParticle sp;
-            sp.position = point;
-            const float spread = 6.0f;
-            sp.velocity = { normal.x * 5.0f + rnd() * spread,
-                            normal.y * 5.0f + rnd() * spread + 1.0f,
-                            normal.z * 5.0f + rnd() * spread };
-            sp.maxLife = sp.life = 0.18f + std::abs(rnd()) * 0.32f;
-            sp.size   = 0.02f + std::abs(rnd()) * 0.025f;
-            sp.growth = -sp.size / sp.maxLife;          // shrink to nothing
-            const float h = std::abs(rnd());            // white-hot -> orange
-            sp.color = { 1.0f, 0.75f + 0.25f * h, 0.15f + 0.25f * h };
-            sp.spark = true;
-            impactParticles.push_back(sp); ++spawned;
-        }
-
-        // Smoke: a few grey puffs drifting off the surface, growing and fading.
-        const int puffs = 5;
+        const int puffs = std::max(2, (int)(10 * intensity));
         for (int i = 0; i < puffs; ++i) {
             ImpactParticle sp;
-            sp.position = { point.x + normal.x * 0.05f + rnd() * 0.05f,
-                            point.y + normal.y * 0.05f + rnd() * 0.05f,
-                            point.z + normal.z * 0.05f + rnd() * 0.05f };
-            sp.velocity = { normal.x * 1.0f + rnd() * 0.6f,
-                            normal.y * 1.0f + std::abs(rnd()) * 0.5f + 0.3f,
-                            normal.z * 1.0f + rnd() * 0.6f };
-            sp.maxLife = sp.life = 0.6f + std::abs(rnd()) * 0.6f;
-            sp.size   = 0.06f + std::abs(rnd()) * 0.04f;
-            sp.growth = 0.30f + std::abs(rnd()) * 0.25f;
-            const float g = 0.40f + std::abs(rnd()) * 0.25f;
+            // Seed puffs across a rough sphere so the cloud has body.
+            sp.position = { center.x + rnd() * radius,
+                            center.y + std::abs(rnd()) * radius * 0.7f,
+                            center.z + rnd() * radius };
+            // Roll outward and up; bigger bursts push harder.
+            const float out = 1.5f + 2.5f * intensity;
+            sp.velocity = { rnd() * out,
+                            std::abs(rnd()) * out * 0.6f + 0.8f * intensity,
+                            rnd() * out };
+            sp.maxLife = sp.life = 1.2f + std::abs(rnd()) * (1.4f + intensity);
+            sp.size    = radius * (0.35f + std::abs(rnd()) * 0.4f);
+            sp.growth  = (0.5f + std::abs(rnd()) * 0.7f) * intensity;   // billow out
+            // Sooty dark grey core; larger/darker for stronger bursts.
+            const float g = 0.10f + std::abs(rnd()) * 0.18f;
             sp.color = { g, g, g };
+            sp.spark = false;
             impactParticles.push_back(sp); ++spawned;
         }
 
-        if (impactParticles.size() > 600)
+        if (impactParticles.size() > 800)
             impactParticles.erase(impactParticles.begin(), impactParticles.begin() + spawned);
     }
 

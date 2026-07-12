@@ -16,6 +16,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <list>
 #include <unordered_map>
@@ -228,6 +229,7 @@ struct DestructionDX12::Impl {
         b3BodyId body = b3_nullBodyId;
         XMFLOAT3 center = {};
         bool dynamic = false;
+        bool wasSubmerged = false;   // for splash-on-entry detection
     };
 
     struct BodySeed {
@@ -253,6 +255,7 @@ struct DestructionDX12::Impl {
         b3BodyId body = b3_nullBodyId;
         XMFLOAT3 half = {};
         XMFLOAT3 color = {};
+        bool wasSubmerged = false;   // for splash-on-entry detection
     };
     std::vector<RagdollPart> ragdollParts;
     std::vector<RagdollRenderItem> ragdollRenderItems;
@@ -263,10 +266,112 @@ struct DestructionDX12::Impl {
     TkGroup* group = nullptr;
     b3WorldId world = b3_nullWorldId;
     b3BodyId ground = b3_nullBodyId;
+    // Optional terrain-height sampler. When set, the ground is a static
+    // heightfield matching the drawn terrain, so debris rests on the real hills
+    // and rolls into the basin instead of hovering on a flat plane.
+    std::function<float(float, float)> terrainSampler;
+    // Called (x, z, strength) when a body first breaks the water surface, so the
+    // pool can spawn a ripple/splash. Set from main.
+    std::function<void(float, float, float)> splashCallback;
+    // World positions where the building just fractured a piece loose this frame;
+    // drained by the caller to spawn smoke at the actual break points.
+    std::vector<XMFLOAT3> breakPoints;
     float accumulator = 0.0f;
     XMFLOAT3 lastDamagePosition = {};
     float lastDamageRadius = 0.0f;
     bool initialized = false;
+
+    // Optional water region: any dynamic fragment whose centre lies within this
+    // AABB gets buoyancy so house debris knocked into the pool floats.
+    bool  waterEnabled = false;
+    XMFLOAT3 waterMin = {};
+    XMFLOAT3 waterMax = {};
+    float waterSurfaceY = 0.0f;
+
+    // Archimedes buoyancy on any dynamic fragment sitting in the water AABB,
+    // matching the standalone WaterVolume so house pieces and crates behave the
+    // same in the pool.
+    // Fire the splash callback when a body first pierces the surface while
+    // moving down: returns the now-submerged state for the caller to store.
+    bool SplashOnEntry(const b3Pos& p, bool wasSubmerged, bool nowSubmerged,
+                       float vy) {
+        if (splashCallback && nowSubmerged && !wasSubmerged && vy < -1.2f)
+            splashCallback((float)p.x, (float)p.z, std::min(2.5f, -vy * 0.18f));
+        return nowSubmerged;
+    }
+
+    bool InWaterColumn(const b3Pos& p) const {
+        return !(p.x < waterMin.x || p.x > waterMax.x ||
+                 p.z < waterMin.z || p.z > waterMax.z ||
+                 p.y - 1.0f > waterMax.y);
+    }
+
+    void ApplyWaterBuoyancy() {
+        if (!waterEnabled) return;
+        constexpr float kWaterDensity = 1000.0f;
+        constexpr float kGravity = 9.81f;
+        for (auto& runtime : actors) {
+            if (!runtime->dynamic || B3_IS_NULL(runtime->body)) continue;
+            const b3Pos p = b3Body_GetPosition(runtime->body);
+            if (!InWaterColumn(p)) { runtime->wasSubmerged = false; continue; }
+
+            // Approximate the piece as a ~0.5m tall box for the submerged span.
+            constexpr float halfH = 0.4f;
+            const float bottom = (float)p.y - halfH;
+            const float boxH = halfH * 2.0f;
+            float submerged = (waterSurfaceY - bottom) / boxH;
+            submerged = std::max(0.0f, std::min(1.0f, submerged));
+
+            const b3Vec3 vel = b3Body_GetLinearVelocity(runtime->body);
+            runtime->wasSubmerged =
+                SplashOnEntry(p, runtime->wasSubmerged, submerged > 0.0f, vel.y);
+            if (submerged <= 0.0f) continue;
+
+            const float mass = std::max(0.05f, b3Body_GetMass(runtime->body));
+            // Displaced-volume force scaled so a light fragment rides high; drag
+            // settles the bob and viscosity kills horizontal drift.
+            const float volume = std::max(0.02f, mass / 8.0f);   // density ~8
+            const float buoyancy = kWaterDensity * kGravity * volume * submerged * 0.02f;
+            const b3Vec3 force = {
+                -vel.x * mass * 4.0f * submerged,
+                buoyancy - vel.y * mass * 6.0f * submerged,
+                -vel.z * mass * 4.0f * submerged
+            };
+            b3Body_ApplyForceToCenter(runtime->body, force, true);
+        }
+
+        // Ragdolls float too: each body part is buoyed against its real box
+        // volume (density 55 << water), so a corpse knocked into the pool bobs
+        // face-up-ish and drifts instead of sinking.
+        for (RagdollPart& part : ragdollParts) {
+            if (B3_IS_NULL(part.body)) continue;
+            const b3Pos p = b3Body_GetPosition(part.body);
+            if (!InWaterColumn(p)) { part.wasSubmerged = false; continue; }
+
+            const float bottom = (float)p.y - part.half.y;
+            const float boxH = std::max(1e-3f, part.half.y * 2.0f);
+            float submerged = (waterSurfaceY - bottom) / boxH;
+            submerged = std::max(0.0f, std::min(1.0f, submerged));
+
+            const b3Vec3 vel = b3Body_GetLinearVelocity(part.body);
+            part.wasSubmerged =
+                SplashOnEntry(p, part.wasSubmerged, submerged > 0.0f, vel.y);
+            if (submerged <= 0.0f) continue;
+
+            const float mass = std::max(0.02f, b3Body_GetMass(part.body));
+            const float volume = part.half.x * 2.0f * part.half.y * 2.0f * part.half.z * 2.0f;
+            const float displaced = volume * submerged;
+            // Full Archimedes lift (limbs are far less dense than water) plus drag.
+            const float buoyancy = kWaterDensity * kGravity * displaced;
+            const float vDrag = -vel.y * mass * 8.0f * submerged;
+            const b3Vec3 force = {
+                -vel.x * mass * 5.0f * submerged,
+                buoyancy + vDrag,
+                -vel.z * mass * 5.0f * submerged
+            };
+            b3Body_ApplyForceToCenter(part.body, force, true);
+        }
+    }
 
     bool BuildChunks() {
         if (!source || !device) return false;
@@ -610,17 +715,57 @@ struct DestructionDX12::Impl {
         worldDef.hitEventThreshold = 3.0f;
         world = b3CreateWorld(&worldDef);
         if (B3_IS_NULL(world)) return false;
-        b3BodyDef groundDef = b3DefaultBodyDef();
-        groundDef.position = { 0.0f, -0.5f, 0.0f };
-        ground = b3CreateBody(world, &groundDef);
-        b3BoxHull groundHull = b3MakeBoxHull(60.0f, 0.5f, 60.0f);
-        b3ShapeDef groundShape = b3DefaultShapeDef();
-        groundShape.baseMaterial.friction = 0.8f;
-        groundShape.enableHitEvents = true;
-        b3CreateHullShape(ground, &groundShape, &groundHull.base);
+        BuildGround();
         CreateBody(*actors.front(), false, nullptr);
         CreateRagdolls();
         return true;
+    }
+
+    // (Re)build the static ground collider. With a terrain sampler, lay down a
+    // grid of static boxes whose tops follow the drawn terrain (hills + pool
+    // basin) so debris collides with real ground. Without one, a single flat
+    // plane. Called at build time and again whenever the sampler is set.
+    void BuildGround() {
+        if (B3_IS_NULL(world)) return;
+        if (!B3_IS_NULL(ground)) { b3DestroyBody(ground); ground = b3_nullBodyId; }
+
+        auto addStaticBox = [&](float px, float py, float pz, float ex, float ey, float ez) {
+            b3BodyDef bd = b3DefaultBodyDef();
+            bd.position = { px, py, pz };
+            b3BodyId body = b3CreateBody(world, &bd);
+            b3BoxHull hull = b3MakeBoxHull(ex, ey, ez);
+            b3ShapeDef sd = b3DefaultShapeDef();
+            sd.baseMaterial.friction = 0.8f;
+            sd.enableHitEvents = true;
+            b3CreateHullShape(body, &sd, &hull.base);
+            return body;
+        };
+
+        if (terrainSampler) {
+            // Heightfield: cover the play area with a grid of columns sunk deep
+            // below their terrain-height tops. `ground` keeps the first column so
+            // Shutdown/rebuild can destroy the set (the rest leak until world
+            // teardown, which is fine -- they are static and never rebuilt mid-run
+            // except via this method, which recreates the world's ground wholesale
+            // only through the single `ground` handle at init).
+            constexpr float extent = 60.0f;    // half-size of the covered area
+            constexpr int   cells = 60;        // resolution -> 2m columns
+            constexpr float thick = 30.0f;     // column half-height (buries base)
+            const float cell = (extent * 2.0f) / cells;
+            const float x0 = -extent + cell * 0.5f;
+            const float z0 = -extent + cell * 0.5f;
+            for (int gz = 0; gz < cells; ++gz)
+            for (int gx = 0; gx < cells; ++gx) {
+                const float px = x0 + gx * cell;
+                const float pz = z0 + gz * cell;
+                const float gy = terrainSampler(px, pz);       // ground surface here
+                b3BodyId col = addStaticBox(px, gy - thick, pz,
+                                            cell * 0.5f + 0.02f, thick, cell * 0.5f + 0.02f);
+                if (gx == 0 && gz == 0) ground = col;
+            }
+        } else {
+            ground = addStaticBox(0.0f, -0.5f, 0.0f, 60.0f, 0.5f, 60.0f);
+        }
     }
 
     void CreateRagdolls() {
@@ -970,6 +1115,7 @@ void DestructionDX12::Update(float dt) {
     constexpr float step = 1.0f / 60.0f;
     bool anyImpactBroke = false;
     while (m->accumulator >= step) {
+        m->ApplyWaterBuoyancy();
         b3World_Step(m->world, step, 4);
         m->accumulator -= step;
         // Physics impact damage: collisions above the world's hit-event speed
@@ -1210,6 +1356,32 @@ bool DestructionDX12::ApplyImpulse(const XMFLOAT3& worldPosition,
     return applied;
 }
 
+void DestructionDX12::SetWaterRegion(const XMFLOAT3& minCorner, const XMFLOAT3& maxCorner) {
+    if (!m) return;
+    m->waterEnabled = true;
+    m->waterMin = minCorner;
+    m->waterMax = maxCorner;
+    m->waterSurfaceY = maxCorner.y;
+}
+
+void DestructionDX12::SetTerrainSampler(std::function<float(float, float)> sampler) {
+    if (!m) return;
+    m->terrainSampler = std::move(sampler);
+    m->BuildGround();   // rebuild the ground collider as a terrain heightfield
+}
+
+void DestructionDX12::SetSplashCallback(std::function<void(float, float, float)> cb) {
+    if (!m) return;
+    m->splashCallback = std::move(cb);
+}
+
+std::vector<XMFLOAT3> DestructionDX12::DrainBreakPoints() {
+    if (!m) return {};
+    std::vector<XMFLOAT3> out = std::move(m->breakPoints);
+    m->breakPoints.clear();
+    return out;
+}
+
 void DestructionDX12::ResolvePlayerCollision(XMFLOAT3& eyePosition, float& floorY,
                                              float radius, float height) {
     if (!m->initialized) return;
@@ -1315,6 +1487,12 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
                 if (m->chunks[chunkIndex].support) { islandSupported = true; break; }
             }
             m->CreateBody(*runtime, !islandSupported, islandSupported ? nullptr : &seed);
+            // A freed (unsupported) island is a real break -> mark its spot for
+            // a puff of smoke at the fracture.
+            if (!islandSupported && !B3_IS_NULL(runtime->body)) {
+                const b3Pos bp = b3Body_GetPosition(runtime->body);
+                m->breakPoints.push_back({ (float)bp.x, (float)bp.y, (float)bp.z });
+            }
             m->actors.push_back(std::move(runtime));
         }
     }

@@ -35,7 +35,8 @@ cbuffer ObjectBuffer : register(b3) {
     float useNormalMap;
     float metalRoughMode;
     float opacity;
-    float3 objectPadding;
+    float smokeMode;         // > 0.5: unlit soft sprite, alpha = opacity * texAlpha
+    float2 objectPadding;
 };
 
 struct PointLightData {
@@ -322,9 +323,23 @@ float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 view
 }
 
 float4 main(PS_INPUT input) : SV_TARGET {
+    // Unlit soft smoke sprite: sample the puff texture, tint by objectColor, and
+    // let its alpha (times opacity) shape a soft translucent billboard. Skips all
+    // lighting/fog so smoke reads as a light-scattering volume, not a lit surface.
+    if (smokeMode > 0.5) {
+        float4 smoke = albedoMap.Sample(texSampler, input.texCoord);
+        float a = smoke.a * opacity;
+        if (a <= 0.003) discard;
+        // Tone-map/encode to match the rest of the frame's output.
+        float3 c = smoke.rgb * objectColor;
+        c = saturate((c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14));
+        c = pow(max(c, 0.0), 1.0 / 2.2);
+        return float4(c, a);
+    }
+
     float3 normal = normalize(input.normal);
     float3 viewDir = normalize(viewPos - input.fragPos);
-    
+
     // Sample textures
     float3 albedo = objectColor;
     if (useTexture > 0.5) {

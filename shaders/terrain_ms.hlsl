@@ -62,11 +62,24 @@ float fbm(float2 p) {
     return sum;
 }
 
+// A dug-out basin the water pool sits in, so the pool reads as a hole in the
+// ground rather than a box on top of it. Centre/reach/depth must match the pool
+// spawned in main.cpp (and the CPU mirror in TerrainRendererDX12::HeightAt).
+static const float2 kPoolCenter = float2(-12.0, 0.0);
+static const float  kPoolRadius = 4.2;   // flat basin floor out to here
+static const float  kPoolRim    = 7.0;   // slopes back up to ground by here
+static const float  kPoolDepth  = 3.0;   // how far the floor drops below ground
+
 float TerrainHeight(float2 xz) {
     float h = fbm(xz * 0.08) * heightScale;
     // Level pad around the origin so the house sits on flat ground.
     float mask = smoothstep(flattenRadius, flattenRadius * 2.0, length(xz));
-    return h * mask;
+    h *= mask;
+    // Carve the pool basin: 1 at the centre, 0 past the rim -> subtract depth.
+    float d = length(xz - kPoolCenter);
+    float basin = 1.0 - smoothstep(kPoolRadius, kPoolRim, d);
+    h -= kPoolDepth * basin;
+    return h;
 }
 
 // k-th vertex along the tile perimeter, counterclockwise, k in [0, 4n).
