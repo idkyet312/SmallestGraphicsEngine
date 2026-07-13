@@ -16,6 +16,7 @@
 #include "RopeSwing.h"
 #include "PalmTrees.h"
 #include "PalmModel.h"
+#include "GunModel.h"
 
 extern MeshShaderDX12 g_meshShader;
 extern bool g_useMeshShader;
@@ -531,54 +532,69 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     }
     shader.Use(scene.wireframeMode);
 
-    // Gun: an M4-style carbine built from boxed parts. Laid out in the gun's
-    // local space (+Z down the barrel), then placed in front of the camera.
+    // Gun: the AK47 model, drawn in the gun's local space (+Z down the barrel)
+    // and placed in front of the camera. If the FBX did not load, fall back to
+    // the boxed carbine below so the player still sees a weapon.
     if (scene.gun.visible) {
         const XMMATRIX gunBase = scene.GetGunBaseMatrix();
         const float S = scene.GunModelScale();
 
-        // Gunmetal / polymer palette.
-        const XMFLOAT3 metal(0.14f, 0.14f, 0.16f);   // receiver, barrel
-        const XMFLOAT3 poly (0.09f, 0.10f, 0.11f);   // handguard, stock, grip
-        const XMFLOAT3 mag  (0.11f, 0.12f, 0.13f);   // magazine
-        const XMFLOAT3 iron (0.05f, 0.05f, 0.06f);   // sights, muzzle
+        if (GunModel::Loaded()) {
+            // The model is normalised with its origin at the rear of the weapon,
+            // so shift it back and down into the same pocket of screen space the
+            // boxed M4 occupied, then scale to the gun's on-screen size.
+            const XMMATRIX xf =
+                XMMatrixScaling(S, S, S) *
+                XMMatrixTranslation(0.0f, -0.10f * S, -0.44f * S) *
+                gunBase;
+            shader.Use(scene.wireframeMode);
+            DrawMeshAt(GunModel::Mesh(), shader, xf, view, proj, lightSpace);
+            shader.Use(scene.wireframeMode);
+        } else {
+            // Fallback: the old M4-style carbine, built from boxed parts.
+            // Gunmetal / polymer palette.
+            const XMFLOAT3 metal(0.14f, 0.14f, 0.16f);   // receiver, barrel
+            const XMFLOAT3 poly (0.09f, 0.10f, 0.11f);   // handguard, stock, grip
+            const XMFLOAT3 mag  (0.11f, 0.12f, 0.13f);   // magazine
+            const XMFLOAT3 iron (0.05f, 0.05f, 0.06f);   // sights, muzzle
 
-        struct Part { XMFLOAT3 c, h, col; };
-        // center (x,y,z), half-extents (x,y,z), colour -- local units.
-        const Part parts[] = {
-            // Upper + lower receiver (main body).
-            {{0.00f,  0.00f,  0.05f}, {0.055f, 0.075f, 0.26f}, metal},
-            // Handguard around the barrel (forward, slightly fatter).
-            {{0.00f, -0.01f,  0.42f}, {0.05f,  0.055f, 0.20f}, poly},
-            // Barrel poking out of the handguard.
-            {{0.00f,  0.01f,  0.66f}, {0.018f, 0.018f, 0.10f}, metal},
-            // Flash hider / muzzle tip.
-            {{0.00f,  0.01f,  0.78f}, {0.026f, 0.026f, 0.03f}, iron},
-            // Magazine, canted slightly forward under the receiver.
-            {{0.00f, -0.20f,  0.02f}, {0.04f,  0.13f,  0.055f}, mag},
-            // Pistol grip, behind the mag.
-            {{0.00f, -0.15f, -0.16f}, {0.035f, 0.10f,  0.04f}, poly},
-            // Buffer tube + stock, to the rear.
-            {{0.00f,  0.00f, -0.24f}, {0.03f,  0.05f,  0.10f}, metal},
-            {{0.00f, -0.02f, -0.38f}, {0.05f,  0.085f, 0.06f}, poly},
-            // Optic/carry-handle rail on top.
-            {{0.00f,  0.10f,  0.02f}, {0.03f,  0.03f,  0.20f}, iron},
-            // Front sight post.
-            {{0.00f,  0.11f,  0.52f}, {0.014f, 0.05f,  0.02f}, iron},
-            // Charging-handle bump at the back top.
-            {{0.00f,  0.09f, -0.14f}, {0.028f, 0.024f, 0.05f}, iron},
-        };
+            struct Part { XMFLOAT3 c, h, col; };
+            // center (x,y,z), half-extents (x,y,z), colour -- local units.
+            const Part parts[] = {
+                // Upper + lower receiver (main body).
+                {{0.00f,  0.00f,  0.05f}, {0.055f, 0.075f, 0.26f}, metal},
+                // Handguard around the barrel (forward, slightly fatter).
+                {{0.00f, -0.01f,  0.42f}, {0.05f,  0.055f, 0.20f}, poly},
+                // Barrel poking out of the handguard.
+                {{0.00f,  0.01f,  0.66f}, {0.018f, 0.018f, 0.10f}, metal},
+                // Flash hider / muzzle tip.
+                {{0.00f,  0.01f,  0.78f}, {0.026f, 0.026f, 0.03f}, iron},
+                // Magazine, canted slightly forward under the receiver.
+                {{0.00f, -0.20f,  0.02f}, {0.04f,  0.13f,  0.055f}, mag},
+                // Pistol grip, behind the mag.
+                {{0.00f, -0.15f, -0.16f}, {0.035f, 0.10f,  0.04f}, poly},
+                // Buffer tube + stock, to the rear.
+                {{0.00f,  0.00f, -0.24f}, {0.03f,  0.05f,  0.10f}, metal},
+                {{0.00f, -0.02f, -0.38f}, {0.05f,  0.085f, 0.06f}, poly},
+                // Optic/carry-handle rail on top.
+                {{0.00f,  0.10f,  0.02f}, {0.03f,  0.03f,  0.20f}, iron},
+                // Front sight post.
+                {{0.00f,  0.11f,  0.52f}, {0.014f, 0.05f,  0.02f}, iron},
+                // Charging-handle bump at the back top.
+                {{0.00f,  0.09f, -0.14f}, {0.028f, 0.024f, 0.05f}, iron},
+            };
 
-        shader.Use(scene.wireframeMode);
-        for (const Part& p : parts) {
-            model = XMMatrixScaling(p.h.x * 2.0f * S, p.h.y * 2.0f * S, p.h.z * 2.0f * S) *
-                    XMMatrixTranslation(p.c.x * S, p.c.y * S, p.c.z * S) *
-                    gunBase;
-            shader.SetMatrices(model, view, proj, lightSpace);
-            shader.SetObjectMaterial(p.col, false, false, 0.85f, 0.35f,
-                                     nullptr, nullptr, nullptr);
-            DrawCube(geo);
-            shader.NextDrawCall();
+            shader.Use(scene.wireframeMode);
+            for (const Part& p : parts) {
+                model = XMMatrixScaling(p.h.x * 2.0f * S, p.h.y * 2.0f * S, p.h.z * 2.0f * S) *
+                        XMMatrixTranslation(p.c.x * S, p.c.y * S, p.c.z * S) *
+                        gunBase;
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetObjectMaterial(p.col, false, false, 0.85f, 0.35f,
+                                         nullptr, nullptr, nullptr);
+                DrawCube(geo);
+                shader.NextDrawCall();
+            }
         }
     }
 

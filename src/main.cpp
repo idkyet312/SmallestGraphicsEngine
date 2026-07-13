@@ -1779,6 +1779,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 std::cerr << "Failed to load h2.glb, falling back to procedural cube\n";
             }
 
+            // The AK47 view model. Loaded here so its texture uploads land in the
+            // same command list the flush below submits.
+            GunModel::Load();
+
             // Flush the load/mip-generation commands now and print any D3D12
             // validation errors before continuing, so mip-related bugs surface
             // immediately instead of silently corrupting later frames.

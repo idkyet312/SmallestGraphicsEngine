@@ -261,6 +261,19 @@ ComPtr<ID3D12Resource> GLBImporter::LoadTextureFromFile(const std::string& filep
     return CreateTexture(device.Get(), commandList.Get(), image, uploadHeaps);
 }
 
+bool GLBImporter::LoadPixelsRGBA(const std::string& filepath,
+    std::vector<unsigned char>& outRGBA, int& outWidth, int& outHeight) {
+    int comps = 0;
+    unsigned char* pixels = stbi_load(filepath.c_str(), &outWidth, &outHeight, &comps, 4);
+    if (!pixels) {
+        std::cerr << "Failed to load image: " << filepath << std::endl;
+        return false;
+    }
+    outRGBA.assign(pixels, pixels + (size_t)outWidth * (size_t)outHeight * 4);
+    stbi_image_free(pixels);
+    return true;
+}
+
 ComPtr<ID3D12Resource> GLBImporter::CreateTextureFromRGBA(ID3D12Device* device,
     ID3D12GraphicsCommandList* commandList, const std::vector<unsigned char>& rgba,
     int width, int height, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
