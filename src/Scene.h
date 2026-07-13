@@ -58,10 +58,10 @@ struct ImpactParticle {
 };
 
 struct GunViewModel {
-    bool     visible  = false;
+    bool     visible  = true;   // AK47 view model is on by default
     XMFLOAT3 color    = { 0.3f, 0.3f, 0.35f };
-    XMFLOAT3 offset   = { 0.3f, -0.25f, 0.5f };
-    XMFLOAT3 scale    = { 0.15f, 0.15f, 0.15f };
+    XMFLOAT3 offset   = { 0.28f, -0.24f, 0.40f };
+    XMFLOAT3 scale    = { 0.15f, 0.15f, 0.30f };
     XMFLOAT3 rotation = { 0.0f, 180.0f, 0.0f };
 };
 
@@ -386,17 +386,37 @@ struct Scene {
         return m;
     }
 
-    // Base view-model transform for the M4: places the weapon in front of the
-    // camera and orients its local space so +X = right, +Y = up, +Z = forward
-    // (down the barrel). Parts are laid out in this local space by the renderer.
-    // No non-uniform stretch here (unlike the legacy single-cube matrix).
+    // Base view-model transform: places the weapon in front of the camera and
+    // orients its local space so +X = right, +Y = up, +Z = forward (down the
+    // barrel). The gun's geometry is laid out in this local space by the
+    // renderer. No non-uniform stretch here (unlike the legacy cube matrix).
+    //
+    // The basis must be built from the camera's TRUE up, not Camera::Up -- that
+    // member is a fixed world-up (0,1,0) and never tilts with pitch. Using it
+    // directly gave a non-orthogonal frame, so looking up or down sheared the
+    // weapon instead of pitching it with the view. Re-derive right and up from
+    // Front (Gram-Schmidt) so the gun rigidly follows the camera in yaw AND pitch.
     XMMATRIX GetGunBaseMatrix() const {
-        XMVECTOR camPos   = XMLoadFloat3(&camera.Position);
-        XMVECTOR camFront = XMLoadFloat3(&camera.Front);
-        XMVECTOR camRight = XMVector3Cross(XMLoadFloat3(&camera.Up), camFront);
-        XMVECTOR camUp    = XMLoadFloat3(&camera.Up);
-        XMVECTOR gp = camPos + camFront * gun.offset.z + camRight * gun.offset.x + camUp * gun.offset.y;
-        // Orthonormal basis: columns right/up/front, translation at the gun spot.
+        const XMVECTOR camPos   = XMLoadFloat3(&camera.Position);
+        const XMVECTOR camFront = XMVector3Normalize(XMLoadFloat3(&camera.Front));
+        const XMVECTOR worldUp  = XMLoadFloat3(&camera.Up);
+
+        // Left-handed frame (the view matrix is LookAtLH): right = up x front.
+        XMVECTOR camRight = XMVector3Cross(worldUp, camFront);
+        // Looking straight up or down makes that cross product vanish; fall back
+        // to a stable axis so the gun does not flip or disappear at the poles.
+        if (XMVectorGetX(XMVector3LengthSq(camRight)) < 1e-6f)
+            camRight = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+        camRight = XMVector3Normalize(camRight);
+
+        // True camera up, perpendicular to both: this is what tilts with pitch.
+        const XMVECTOR camUp = XMVector3Normalize(XMVector3Cross(camFront, camRight));
+
+        const XMVECTOR gp = camPos + camFront * gun.offset.z
+                                   + camRight * gun.offset.x
+                                   + camUp    * gun.offset.y;
+
+        // Orthonormal basis: rows right/up/front, translation at the gun spot.
         XMMATRIX basis = XMMatrixIdentity();
         basis.r[0] = XMVectorSetW(camRight, 0.0f);
         basis.r[1] = XMVectorSetW(camUp, 0.0f);

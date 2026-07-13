@@ -42,4 +42,12 @@ public:
         ID3D12Device* device, ID3D12GraphicsCommandList* commandList,
         const std::vector<unsigned char>& rgba, int width, int height,
         std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploadHeaps);
+
+    // Decodes an image file to raw RGBA8 without uploading it. Lets callers
+    // combine several source images into one texture -- e.g. assets that ship
+    // metalness and roughness as separate greyscale maps, which the shader
+    // expects packed into one (G = rough, B = metal). Returns false on failure.
+    static bool LoadPixelsRGBA(const std::string& filepath,
+                               std::vector<unsigned char>& outRGBA,
+                               int& outWidth, int& outHeight);
 };
