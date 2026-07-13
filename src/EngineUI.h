@@ -5,13 +5,90 @@
 #include "Scene.h"
 #include "VisibilityBufferDX12.h"
 #include "DestructionDX12.h"
+#include "VirtualInput.h"
 
 // Forward declare raytracing context
 struct RaytracingContext;
 extern RaytracingContext g_rt;
 
+// On-screen pad: drive the camera with the mouse alone. A button held down sets
+// the flag every frame it stays active, which ProcessInput drains like a key.
+inline void RenderMovementPad() {
+    // Rebuild the held state every frame: a button that is no longer active
+    // simply doesn't re-set its flag, so movement stops on release.
+    virtualInput.forward = virtualInput.back = false;
+    virtualInput.left = virtualInput.right = false;
+    virtualInput.down = virtualInput.shoot = false;
+    virtualInput.lookX = virtualInput.lookY = 0.0f;
+
+    if (!virtualInput.showPad) return;
+
+    ImGui::SetNextWindowSize(ImVec2(0, 0), ImGuiCond_Always);
+    // Bottom-right, pinned by that corner so it stays put across resizes.
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 20.0f,
+                                   ImGui::GetIO().DisplaySize.y - 20.0f),
+                            ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    ImGui::Begin("Movement Pad", &virtualInput.showPad, ImGuiWindowFlags_AlwaysAutoResize);
+
+    const ImVec2 btn(48.0f, 34.0f);
+    const float  colStart = ImGui::GetCursorPosX() + btn.x + ImGui::GetStyle().ItemSpacing.x;
+
+    // WASD cluster.
+    ImGui::TextUnformatted("Move");
+    ImGui::SetCursorPosX(colStart);
+    ImGui::Button("W", btn);
+    if (ImGui::IsItemActive()) virtualInput.forward = true;
+
+    ImGui::Button("A", btn);
+    if (ImGui::IsItemActive()) virtualInput.left = true;
+    ImGui::SameLine();
+    ImGui::Button("S", btn);
+    if (ImGui::IsItemActive()) virtualInput.back = true;
+    ImGui::SameLine();
+    ImGui::Button("D", btn);
+    if (ImGui::IsItemActive()) virtualInput.right = true;
+
+    ImGui::Separator();
+
+    // Look cluster: arrows nudge yaw/pitch while held.
+    ImGui::TextUnformatted("Look");
+    ImGui::SetCursorPosX(colStart);
+    ImGui::Button("Up", btn);
+    if (ImGui::IsItemActive()) virtualInput.lookY += 1.0f;
+
+    ImGui::Button("Left", btn);
+    if (ImGui::IsItemActive()) virtualInput.lookX -= 1.0f;
+    ImGui::SameLine();
+    ImGui::Button("Down", btn);
+    if (ImGui::IsItemActive()) virtualInput.lookY -= 1.0f;
+    ImGui::SameLine();
+    ImGui::Button("Right", btn);
+    if (ImGui::IsItemActive()) virtualInput.lookX += 1.0f;
+
+    ImGui::Separator();
+
+    // Jump fires once per click; the camera ignores it unless FPS mode is on.
+    if (ImGui::Button("Jump", ImVec2(74.0f, 34.0f))) virtualInput.jump = true;
+    ImGui::SameLine();
+    ImGui::Button("Down##fly", ImVec2(74.0f, 34.0f));
+    if (ImGui::IsItemActive()) virtualInput.down = true;
+
+    ImGui::Button("Shoot", ImVec2(155.0f, 34.0f));
+    if (ImGui::IsItemActive()) virtualInput.shoot = true;
+
+    ImGui::SetNextItemWidth(155.0f);
+    ImGui::SliderFloat("Look Speed", &virtualInput.lookSpeed, 20.0f, 600.0f, "%.0f");
+
+    ImGui::End();
+}
+
 inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
+    RenderMovementPad();
+
     ImGui::Begin("Scene Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
+    ImGui::Checkbox("Show Movement Pad", &virtualInput.showPad);
+    ImGui::Separator();
 
     ImGui::Text("Controls:");
     ImGui::BulletText("TAB: Toggle UI");
@@ -26,7 +103,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat3("Camera Position", &scene.camera.Position.x, 0.1f);
         ImGui::DragFloat("FOV",  &scene.cameraFOV,  0.5f, 1.0f, 120.0f);
         ImGui::DragFloat("Near", &scene.cameraNear, 0.01f, 0.01f, 10.0f);
-        ImGui::DragFloat("Far",  &scene.cameraFar,  1.0f, 10.0f, 500.0f);
+        ImGui::DragFloat("Far",  &scene.cameraFar,  1.0f, 10.0f, 2000.0f);
         ImGui::DragFloat("Speed", &scene.camera.MovementSpeed, 0.1f, 0.1f, 50.0f);
         ImGui::Checkbox("FPS Walking Mode", &scene.camera.FPSMode);
     }
@@ -169,6 +246,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::Text("Wall: %u chunks  %u actors", g_destruction.GetChunkCount(), g_destruction.GetActorCount());
         ImGui::Checkbox("Blast Debug Draw", &scene.showDestructionDebug);
         if (ImGui::Button("Rebuild Wall")) scene.rebuildDestructionRequested = true;
+    }
+
+    if (ImGui::CollapsingHeader("Palm Trees", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Absolute damage vs a section's 45 health: 15 => ~3 hits to sever.
+        ImGui::DragFloat("Tree Damage/Shot", &scene.treeDamagePerShot, 0.5f, 1.0f, 60.0f);
+        ImGui::Text("Shoot a trunk to fell the tree above the hit.");
     }
 
     ImGui::Separator();

@@ -1122,10 +1122,17 @@ void DestructionDX12::Update(float dt) {
         // threshold (debris slamming the house, pieces crashing onto the
         // ground) fracture the cell they land on, same as a bullet strike.
         const b3ContactEvents events = b3World_GetContactEvents(m->world);
+        // Splitting an actor destroys its Box3D body. Copy event points before
+        // doing that because Box3D owns the contact-event buffer.
+        std::vector<XMFLOAT3> hitPoints;
+        hitPoints.reserve(events.hitCount);
+        for (int i = 0; i < events.hitCount; ++i) {
+            const b3Vec3& point = events.hitEvents[i].point;
+            hitPoints.emplace_back((float)point.x, (float)point.y, (float)point.z);
+        }
         int budget = 2;  // low impact damage: at most two cells per step
-        for (int i = 0; i < events.hitCount && budget > 0; ++i) {
-            const b3ContactHitEvent& hit = events.hitEvents[i];
-            const XMFLOAT3 point((float)hit.point.x, (float)hit.point.y, (float)hit.point.z);
+        for (const XMFLOAT3& point : hitPoints) {
+            if (budget <= 0) break;
             if (m->BreakNearestCell(point)) { --budget; anyImpactBroke = true; }
         }
     }
@@ -1451,7 +1458,17 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
     for (uint32_t e = 0; e < eventCount; ++e) {
         if (events[e].type != TkEvent::Split) continue;
         const TkSplitEvent* split = events[e].getPayload<TkSplitEvent>();
-        auto* parent = static_cast<Impl::ActorRuntime*>(split->parentData.userData);
+        if (!split) continue;
+
+        // userData belongs to an actor that Blast has just replaced. A later
+        // split event may still contain that old pointer, so never dereference
+        // it until ownership is confirmed against the live runtime list.
+        auto* candidate = static_cast<Impl::ActorRuntime*>(split->parentData.userData);
+        auto parentIt = std::find_if(m->actors.begin(), m->actors.end(),
+            [candidate](const std::unique_ptr<Impl::ActorRuntime>& runtime) {
+                return runtime.get() == candidate;
+            });
+        Impl::ActorRuntime* parent = parentIt != m->actors.end() ? parentIt->get() : nullptr;
         Impl::BodySeed seed;
         if (parent && !B3_IS_NULL(parent->body)) {
             seed.valid = true;
@@ -1461,13 +1478,14 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
             seed.linearVelocity = b3Body_GetLinearVelocity(parent->body);
             seed.angularVelocity = b3Body_GetAngularVelocity(parent->body);
         }
-        for (auto it = m->actors.begin(); it != m->actors.end(); ++it) {
-            if (it->get() != parent) continue;
-            if (!B3_IS_NULL((*it)->body)) b3DestroyBody((*it)->body);
-            m->actors.erase(it); break;
+        if (parentIt != m->actors.end()) {
+            if (!B3_IS_NULL((*parentIt)->body)) b3DestroyBody((*parentIt)->body);
+            m->actors.erase(parentIt);
         }
         for (uint32_t childIndex = 0; childIndex < split->numChildren; ++childIndex) {
             TkActor* child = split->children[childIndex];
+            if (!child) continue;
+            child->userData = nullptr;
             auto runtime = std::make_unique<Impl::ActorRuntime>();
             runtime->actor = child;
             const uint32_t visibleCount = child->getVisibleChunkCount();

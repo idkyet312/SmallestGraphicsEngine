@@ -36,7 +36,8 @@ cbuffer ObjectBuffer : register(b3) {
     float metalRoughMode;
     float opacity;
     float smokeMode;         // > 0.5: unlit soft sprite, alpha = opacity * texAlpha
-    float2 objectPadding;
+    float alphaCut;          // > 0.5: clip transparent texels (foliage cards)
+    float objectPadding;
 };
 
 struct PointLightData {
@@ -387,6 +388,11 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float3 albedo = objectColor;
     if (useTexture > 0.5) {
         float4 texColor = albedoMap.Sample(texSampler, input.texCoord);
+        // Alpha cutout for foliage cards (palm fronds), opt-in per material.
+        // clip() disables early-Z for the draw, which is expensive scene-wide --
+        // an unconditional clip here once pushed heavy-overdraw frames past the
+        // GPU watchdog (device removed). Only foliage pays for it now.
+        if (alphaCut > 0.5) clip(texColor.a - 0.4);
         // Textures are uploaded as UNORM, so decode authored sRGB before lighting.
         albedo = pow(max(texColor.rgb, 0.0), 2.2) * objectColor;
     }

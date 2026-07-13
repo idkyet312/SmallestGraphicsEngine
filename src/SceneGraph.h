@@ -33,6 +33,9 @@ struct SceneMaterial {
     float metallicFactor = 1.0f;
     float roughnessFactor = 1.0f;
     bool doubleSided = false;
+    // Alpha-tested cutout (foliage cards): the pixel shader clips texels whose
+    // texture alpha is below threshold. Opt-in because clip() costs early-Z.
+    bool alphaCutout = false;
     
     ComPtr<ID3D12Resource> baseColorTexture;
     ComPtr<ID3D12Resource> metallicRoughnessTexture;

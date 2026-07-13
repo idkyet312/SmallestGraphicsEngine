@@ -21,7 +21,7 @@
     <ClCompile Include="src\main_dx11.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\main_dx12.cpp">
+    <ClCompile Include="src\main_dx12_legacy.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
