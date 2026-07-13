@@ -45,3 +45,6 @@ Makefile
 # OS
 .DS_Store
 Thumbs.db
+
+# Tool output
+graphify-out/

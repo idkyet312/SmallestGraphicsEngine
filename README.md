@@ -17,9 +17,9 @@ A DirectX 12 graphics engine featuring clustered forward rendering, Dynamic Diff
 ```
 SmallestGraphicsEngine/
 ├── src/                          # Source code directory
-│   ├── main_dx12.cpp             # Main DX12 application with clustered rendering
+│   ├── main.cpp                  # Main DX12 application (the entry point that is built)
+│   ├── main_dx12_legacy.cpp      # Superseded DX12 path, not built
 │   ├── main_dx11.cpp             # Legacy DX11 version
-│   ├── main.cpp                  # Entry point / shared main
 │   ├── DX12Core.h                # DirectX 12 initialization and device management
 │   ├── DX11Core.h                # DirectX 11 core (legacy)
 │   ├── CameraDX12.h              # FPS camera with mouse lock

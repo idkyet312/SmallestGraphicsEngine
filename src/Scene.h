@@ -71,7 +71,9 @@ struct Scene {
     Camera camera{ XMFLOAT3(0.0f, 1.7f, 20.0f) };
     float  cameraFOV  = 60.0f;
     float  cameraNear  = 0.1f;
-    float  cameraFar   = 100.0f;
+    // Far enough to see the sea run out to the horizon; the ocean plane alone is
+    // 600 m across, and a 100 m far plane sliced it off in plain view.
+    float  cameraFar   = 800.0f;
 
     // Main directional / point light
     XMFLOAT3 lightPos    = { -5.0f, 10.0f, -5.0f };
@@ -138,6 +140,11 @@ struct Scene {
     float destructionBulletImpulse = 260.0f;
     bool  rebuildDestructionRequested = false;
     bool  showDestructionDebug = false;
+
+    // Palm trees. Damage here is absolute (against a section's health), not the
+    // 0..1 bond fraction destructionDamage uses -- different system, different
+    // units. ~3 hits to sever one trunk section.
+    float treeDamagePerShot = 15.0f;
 
     // Clustered renderer
     ClusteredRendererDX12 clusteredRenderer;

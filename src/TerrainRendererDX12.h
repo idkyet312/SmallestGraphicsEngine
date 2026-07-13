@@ -151,6 +151,31 @@ public:
         bt = bt < 0.0f ? 0.0f : (bt > 1.0f ? 1.0f : bt);
         float basin = 1.0f - bt * bt * (3.0f - 2.0f * bt);   // 1 at centre -> 0 past rim
         h -= poolDepth * basin;
+
+        // Island falloff -- must match terrain_ms.hlsl's TerrainHeight. Land is
+        // lifted above sea level (y = 0), then ramps down to a seabed past the
+        // shore, so the island is ringed by ocean.
+        constexpr float landLift = 2.5f, seabed = -6.0f;
+        constexpr float shoreInner = 34.0f, shoreOuter = 52.0f;
+        float r = sqrtf(x * x + z * z);
+        float st = (r - shoreInner) / (shoreOuter - shoreInner);
+        st = st < 0.0f ? 0.0f : (st > 1.0f ? 1.0f : st);
+        float shore = st * st * (3.0f - 2.0f * st);          // smoothstep
+        float land = h + landLift;
+        h = land + (seabed - land) * shore;                  // lerp(land, seabed, shore)
+
+        // Flat building pad under both houses, applied LAST so neither the noise nor
+        // the pool rim can dent it. Must match terrain_ms.hlsl's TerrainHeight;
+        // padHeight is Ground::kBuildingPadY (src/GroundLevel.h), which the houses
+        // and roofs are built from -- change it there and here together.
+        constexpr float padCx = 0.25f, padCz = 3.5f;
+        constexpr float padRadius = 8.5f, padFade = 12.0f, padHeight = 2.5f;
+        float dpx = x - padCx, dpz = z - padCz;
+        float dpad = sqrtf(dpx * dpx + dpz * dpz);
+        float pt = (dpad - padRadius) / (padFade - padRadius);
+        pt = pt < 0.0f ? 0.0f : (pt > 1.0f ? 1.0f : pt);
+        float pad = 1.0f - pt * pt * (3.0f - 2.0f * pt);      // 1 on the pad -> 0 outside
+        h = h + (padHeight - h) * pad;                        // lerp(h, padHeight, pad)
         return h;
     }
 

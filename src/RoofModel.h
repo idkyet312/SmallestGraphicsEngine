@@ -3,6 +3,7 @@
 #include "DX12Core.h"
 #include "FBXImporter.h"
 #include "GLBImporter.h"
+#include "GroundLevel.h"
 #include <algorithm>
 #include <cfloat>
 #include <filesystem>
@@ -112,8 +113,13 @@ inline void EnsureRoofModelLoaded() {
         }
     };
 
-    addBuilding("Wood", -7.0f, 0.0f, 1.0f, 6.0f, 3.4f, 4.4f, 2, 1);
-    addBuilding("Metal", 2.0f, 7.5f, 1.2f, 5.9f, 2.85f, 3.70f, 4, 2);
+    // Eave/ridge heights are measured UP FROM THE BUILDING PAD, not from y = 0.
+    // These used to be absolute, so raising the island onto a pad left both roofs
+    // behind at the old ground level, sunk into the sand while the walls rose past
+    // them. They must match wallTop / ridgeY in CreateDestructibleWallModel.
+    constexpr float pad = Ground::kBuildingPadY;
+    addBuilding("Wood",  -7.0f, 0.0f, 1.0f, 6.0f, pad + 3.4f,  pad + 4.4f,  2, 1);
+    addBuilding("Metal",  2.0f, 7.5f, 1.2f, 5.9f, pad + 2.85f, pad + 3.70f, 4, 2);
 
     DirectX::XMFLOAT4X4 identity;
     DirectX::XMStoreFloat4x4(&identity, DirectX::XMMatrixIdentity());

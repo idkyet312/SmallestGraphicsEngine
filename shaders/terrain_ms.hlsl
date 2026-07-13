@@ -70,6 +70,27 @@ static const float  kPoolRadius = 4.2;   // flat basin floor out to here
 static const float  kPoolRim    = 7.0;   // slopes back up to ground by here
 static const float  kPoolDepth  = 3.0;   // how far the floor drops below ground
 
+// Island shape. Sea level is y = 0 (where the ocean plane sits), so the land is
+// lifted above it and the seabed dropped below it. The terrain grid spans +-64 m,
+// so the shore ramp must finish comfortably inside that or the mesh edge shows.
+// Must match TerrainRendererDX12::HeightAt.
+static const float kLandLift   =  2.5;   // how far the island sits above sea level
+static const float kSeabed     = -6.0;   // sea floor depth past the shore
+static const float kShoreInner = 34.0;   // solid land out to here
+static const float kShoreOuter = 52.0;   // fully underwater by here
+
+// Flat building pad under BOTH houses: the wooden one spans x -7..0 and the metal
+// shack x 2..7.5, both z ~1..6, so the pad is centred on their combined footprint.
+// Applied after everything else so neither the noise nor the pool rim can dent it,
+// and faded out before the pool basin at x = -12 so that stays intact.
+// kPadHeight is Ground::kBuildingPadY (src/GroundLevel.h) -- the houses and their
+// roofs are all built up from that constant, so if this drifts they end up buried
+// in the sand or floating over it. Must match TerrainRendererDX12::HeightAt.
+static const float2 kPadCenter = float2(0.25, 3.5);   // both houses' combined centre
+static const float  kPadRadius = 8.5;    // dead flat out to here
+static const float  kPadFade   = 12.0;   // blended back into the terrain by here
+static const float  kPadHeight = 2.5;    // = kLandLift: island's natural ground level
+
 float TerrainHeight(float2 xz) {
     float h = fbm(xz * 0.08) * heightScale;
     // Level pad around the origin so the house sits on flat ground.
@@ -79,6 +100,21 @@ float TerrainHeight(float2 xz) {
     float d = length(xz - kPoolCenter);
     float basin = 1.0 - smoothstep(kPoolRadius, kPoolRim, d);
     h -= kPoolDepth * basin;
+
+    // Island falloff: the ground is lifted well above the waterline out to
+    // kShoreInner, then ramps down past kShoreOuter to a seabed below sea level,
+    // so the land ends in a beach and the ocean takes over. The ramp finishes
+    // inside the terrain grid's own edge, so the mesh boundary is never visible
+    // above water. Must match TerrainRendererDX12::HeightAt.
+    float r = length(xz);
+    float shore = smoothstep(kShoreInner, kShoreOuter, r);   // 0 inland -> 1 at sea
+    h = lerp(h + kLandLift, kSeabed, shore);
+
+    // Building pad, applied LAST so nothing else can dent it. The pool rim was
+    // biting into the house footprint and dropping one corner ~2 m; forcing the
+    // pad flat here means the houses always sit on genuinely level ground.
+    float pad = 1.0 - smoothstep(kPadRadius, kPadFade, length(xz - kPadCenter));
+    h = lerp(h, kPadHeight, pad);
     return h;
 }
 

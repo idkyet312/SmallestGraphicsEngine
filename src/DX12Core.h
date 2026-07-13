@@ -25,8 +25,13 @@ using namespace DirectX;
 // Number of frames in flight
 static const UINT FRAME_COUNT = 2;
 
-// Descriptor heap sizes
-static const UINT CBV_SRV_UAV_HEAP_SIZE = 1024;
+// Descriptor heap sizes.
+// CBV_SRV_UAV: slots 0..63 are reserved for global resources (shadow map, DDGI);
+// material descriptors are handed out from 64 upward, 3 per textured draw. Smoke
+// billboards are textured draws too, so a couple of bursts can each cost hundreds
+// of descriptors -- keep plenty of headroom. Overflow is clamped in ShaderDX12,
+// but a heap this size means we don't hit the clamp and start dropping sprites.
+static const UINT CBV_SRV_UAV_HEAP_SIZE = 32768;
 static const UINT RTV_HEAP_SIZE = 16;
 static const UINT DSV_HEAP_SIZE = 8;
 static const UINT SAMPLER_HEAP_SIZE = 16;

@@ -13,12 +13,16 @@
 #include "DestructionDX12.h"
 #include "RoofModel.h"
 #include "WaterVolume.h"
+#include "RopeSwing.h"
+#include "PalmTrees.h"
+#include "PalmModel.h"
 
 extern MeshShaderDX12 g_meshShader;
 extern bool g_useMeshShader;
 extern TerrainRendererDX12 g_terrain;
 extern bool g_showH2Model;
 extern WaterVolume g_water;
+extern WaterVolume g_ocean;   // sea ringing the island
 extern ComPtr<ID3D12Resource> g_smokeTexture;   // soft smoke sprite for billboards
 
 struct GeometryBuffers {
@@ -112,6 +116,55 @@ inline std::vector<VertexPosNormUV> BuildSphereVertices(int stacks = 12, int sli
         verts.push_back(a); verts.push_back(c); verts.push_back(d);
     }
     return verts;
+}
+
+// Draw a standalone mesh's primitives at `model`, honouring their materials. This
+// is the per-primitive body of DrawSceneNode, pulled out so meshes that are not
+// part of a scene graph (e.g. the sliced palm) can be drawn the same way.
+inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shader,
+                       const XMMATRIX& model,
+                       const XMMATRIX& view, const XMMATRIX& proj, const XMMATRIX& lightSpace) {
+    if (!mesh) return;
+    shader.SetMatrices(model, view, proj, lightSpace);
+
+    for (const auto& prim : mesh->primitives) {
+        if (prim.vbv.BufferLocation == 0) continue;
+
+        const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
+        if (prim.material) {
+            if (transparent) shader.UseTransparent(); else shader.Use(false);
+            XMFLOAT3 color(prim.material->baseColorFactor.x,
+                           prim.material->baseColorFactor.y,
+                           prim.material->baseColorFactor.z);
+            shader.SetObjectMaterial(
+                color,
+                prim.material->baseColorTexture != nullptr,
+                prim.material->normalTexture != nullptr,
+                prim.material->metallicFactor,
+                prim.material->roughnessFactor,
+                prim.material->baseColorTexture.Get(),
+                prim.material->normalTexture.Get(),
+                prim.material->metallicRoughnessTexture.Get(),
+                prim.material->roughnessOnlyTexture,
+                prim.material->baseColorFactor.w,
+                prim.material->alphaCutout);
+        } else {
+            shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
+        }
+
+        // Palm slices are IA meshes (no meshlet data), so always take the VS/PS path.
+        g_dx12.commandList->SetPipelineState(transparent
+            ? shader.transparentPipelineState.Get() : shader.pipelineState.Get());
+        g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
+        g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if (prim.ibv.BufferLocation != 0) {
+            g_dx12.commandList->IASetIndexBuffer(&prim.ibv);
+            g_dx12.commandList->DrawIndexedInstanced(prim.indexCount, 1, 0, 0, 0);
+        } else {
+            g_dx12.commandList->DrawInstanced((UINT)(prim.vertices.size() / 12), 1, 0, 0);
+        }
+        shader.NextDrawCall();
+    }
 }
 
 // Draw an imported GLB scene graph node (and its children) with an extra
@@ -270,6 +323,78 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             DrawCube(geo);
             shader.NextDrawCall();
         }
+    }
+
+    // Palm trees: trunk sections and fronds are boxes driven by physics bodies,
+    // standing or toppling, so they all draw through the ordinary cube path.
+    if (g_trees.IsInitialized()) {
+        shader.Use(scene.wireframeMode);
+        for (const TreeItem& item : g_trees.GetItems()) {
+            const XMMATRIX xf = XMLoadFloat4x4(&item.transform);
+            // If the real palm model loaded, each physics box carries the identity
+            // of a model slice (a trunk segment or the crown); draw that slice's
+            // geometry at the box's transform. Otherwise the item is a plain box.
+            std::shared_ptr<SceneMesh> slice;
+            if (item.crown) slice = PalmModel::Crown();
+            else if (item.segment >= 0 && item.segment < (int)PalmModel::TrunkSlices().size())
+                slice = PalmModel::TrunkSlices()[item.segment].mesh;
+
+            if (slice) {
+                DrawMeshAt(slice, shader, xf, view, proj, lightSpace);
+            } else {
+                shader.Use(scene.wireframeMode);
+                shader.SetMatrices(xf, view, proj, lightSpace);
+                shader.SetObjectColor(item.color);
+                DrawCube(geo);
+                shader.NextDrawCall();
+            }
+        }
+        // A palm slice draw may have left a non-cube pipeline bound.
+        shader.Use(scene.wireframeMode);
+    }
+
+    // Rope-hung block: each rope link and the block are just boxes driven by the
+    // physics bodies, so they draw with the ordinary cube path.
+    if (g_rope.IsInitialized()) {
+        shader.Use(scene.wireframeMode);
+        for (const RopeItem& item : g_rope.GetItems()) {
+            shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
+            shader.SetObjectColor(item.color);
+            DrawCube(geo);
+            shader.NextDrawCall();
+        }
+    }
+
+    // Second rope rig: the strung-up ragdoll. Same boxes, same path.
+    if (g_gibbet.IsInitialized()) {
+        shader.Use(scene.wireframeMode);
+        for (const RopeItem& item : g_gibbet.GetItems()) {
+            shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
+            shader.SetObjectColor(item.color);
+            DrawCube(geo);
+            shader.NextDrawCall();
+        }
+    }
+
+    // The sea around the island. Drawn before the pool because it is the farther
+    // transparent surface, and blended surfaces have to go back-to-front.
+    if (g_ocean.IsInitialized()) {
+        const D3D12_VERTEX_BUFFER_VIEW& ovbv = g_ocean.UpdateAndGetVBV(g_dx12.frameIndex);
+        const D3D12_INDEX_BUFFER_VIEW& oibv = g_ocean.GetIBV();
+        const UINT oceanIndices = g_ocean.GetIndexCount();
+        if (oceanIndices && ovbv.BufferLocation) {
+            shader.UseTransparent();
+            shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
+            // Deeper and less transparent than the pool: open water reads darker.
+            shader.SetObjectMaterial(XMFLOAT3(0.03f, 0.18f, 0.38f), false, false,
+                                     0.04f, 0.05f, nullptr, nullptr, nullptr, false, 0.80f);
+            g_dx12.commandList->IASetVertexBuffers(0, 1, &ovbv);
+            g_dx12.commandList->IASetIndexBuffer(&oibv);
+            g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_dx12.commandList->DrawIndexedInstanced(oceanIndices, 1, 0, 0, 0);
+            shader.NextDrawCall();
+        }
+        shader.Use(scene.wireframeMode);
     }
 
     // Water pool: floating crates + any debris (opaque) drawn first, then the

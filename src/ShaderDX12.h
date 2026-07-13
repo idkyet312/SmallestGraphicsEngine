@@ -43,7 +43,8 @@ struct alignas(256) ObjectBufferDX12 {
     float metalRoughMode;  // 0=none, 1=glTF packed, 2=roughness-only
     float opacity;
     float smokeMode = 0.0f; // > 0.5: unlit soft sprite (alpha = opacity*texAlpha)
-    float padding[2];
+    float alphaCut = 0.0f;  // > 0.5: clip() texels with texture alpha < 0.4 (foliage)
+    float padding[1];
 };
 
 struct PointLightDataDX12 {
@@ -174,7 +175,10 @@ public:
 // every destruction chunk (the Voronoi house alone is ~360 pieces) plus scene
 // objects, projectiles and particles -- overflowing clamps draws to one shared
 // constant slot and geometry visibly glues itself to the last-drawn object.
-static const UINT MAX_DRAW_CALLS_PER_FRAME = 1024;
+// 4096: the sliced palm grove alone was pushing the old 1024 ceiling once every
+// destruction chunk and particle joined it. Overflow clamps to the last slot and
+// geometry visibly glues itself to the last-drawn object -- keep headroom.
+static const UINT MAX_DRAW_CALLS_PER_FRAME = 4096;
 
 class ShaderDX12 {
 public:
@@ -201,6 +205,24 @@ public:
     // Current draw call index within frame
     UINT currentDrawCall = 0;
     UINT currentSrvOffset = 0; // For material descriptors
+
+    // Reserve 3 consecutive material descriptors (albedo/normal/metal-rough) from
+    // the shared CBV/SRV/UAV heap. Returns false when the frame has used them all
+    // -- writing past the heap corrupts unrelated allocations (it used to clobber
+    // ImGui's font descriptor, making the UI vanish once enough smoke was alive).
+    bool ReserveMaterialSrvs(D3D12_CPU_DESCRIPTOR_HANDLE& cpuHandle,
+                             D3D12_GPU_DESCRIPTOR_HANDLE& gpuHandle) {
+        if (currentSrvOffset + 3 > CBV_SRV_UAV_HEAP_SIZE) return false;
+
+        const UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        gpuHandle = g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart();
+        cpuHandle.ptr += currentSrvOffset * descriptorSize;
+        gpuHandle.ptr += currentSrvOffset * descriptorSize;
+        currentSrvOffset += 3;
+        return true;
+    }
 
     bool loaded = false;
     
@@ -632,9 +654,9 @@ public:
     
     void SetObjectMaterial(const XMFLOAT3& color, bool useTex, bool useNorm, float metal, float rough,
                           ID3D12Resource* albedo, ID3D12Resource* normal, ID3D12Resource* metalRough,
-                          bool roughnessOnly = false, float opacity = 1.0f) {
+                          bool roughnessOnly = false, float opacity = 1.0f, bool alphaCut = false) {
         UINT bufferIndex = GetDrawCallIndex();
-        
+
         ObjectBufferDX12 data;
         data.objectColor = color;
         data.useTexture = useTex ? 1.0f : 0.0f;
@@ -643,22 +665,19 @@ public:
         data.roughness = rough;
         data.metalRoughMode = metalRough ? (roughnessOnly ? 2.0f : 1.0f) : 0.0f;
         data.opacity = opacity;
+        data.alphaCut = alphaCut ? 1.0f : 0.0f;
         
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
 
         // Textures
         if (useTex || useNorm) {
-             // We need 3 descriptors
              UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-             
-             // Get handles
-             D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
-             D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle = g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart();
-             
-             cpuHandle.ptr += currentSrvOffset * descriptorSize;
-             gpuHandle.ptr += currentSrvOffset * descriptorSize;
-             
+
+             D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
+             D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle;
+             if (!ReserveMaterialSrvs(cpuHandle, gpuHandle)) return;  // heap full this frame
+
              // Create SRVs
              // Albedo (t1)
              if (albedo) {
@@ -698,8 +717,6 @@ public:
              
              // Bind table
              g_dx12.commandList->SetGraphicsRootDescriptorTable(7, gpuHandle);
-             
-             currentSrvOffset += 3;
         }
     }
 
@@ -721,10 +738,10 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
 
         UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
-        D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle = g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart();
-        cpuHandle.ptr += currentSrvOffset * descriptorSize;
-        gpuHandle.ptr += currentSrvOffset * descriptorSize;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle;
+        if (!ReserveMaterialSrvs(cpuHandle, gpuHandle)) return;  // heap full this frame
 
         D3D12_SHADER_RESOURCE_VIEW_DESC nullDesc = {};
         nullDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -739,7 +756,6 @@ public:
         g_dx12.device->CreateShaderResourceView(nullptr, &nullDesc, cpuHandle);  // t5
 
         g_dx12.commandList->SetGraphicsRootDescriptorTable(7, gpuHandle);
-        currentSrvOffset += 3;
     }
 
     // Call this after each DrawCube/DrawPlane to advance to the next buffer slot

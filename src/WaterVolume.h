@@ -59,6 +59,9 @@ public:
     // of the terrain shader). When given, the pool floor/walls are replaced by a
     // static heightfield of the *actual dug basin*, so crates and debris collide
     // with the sloped terrain instead of an invisible box.
+    // Surface mesh resolution (cells per side). Call before Initialize.
+    void SetGridResolution(int n) { m_requestedGridN = std::max(8, n); }
+
     void Initialize(const XMFLOAT3& center, const XMFLOAT3& extents,
                     const std::function<float(float, float)>& terrainHeight = {}) {
         Shutdown();
@@ -67,7 +70,10 @@ public:
         m_surfaceY = center.y + extents.y * 0.5f;
 
         // ---- wave surface mesh ----
-        m_gridN = 48;
+        // Grid resolution is per-volume: an ocean spanning hundreds of metres needs
+        // far more cells than a small pool to keep the quads (and so the waves) at
+        // a sane size. Cost is CPU-side only -- the surface is rewritten each frame.
+        m_gridN = m_requestedGridN;
         BuildTopology();
         AllocateBuffers();
         m_meshReady = (m_buffers[0] != nullptr);
@@ -445,6 +451,7 @@ private:
     std::vector<Ripple>      m_ripples;
     bool m_meshReady = false;
     int  m_gridN = 48;
+    int  m_requestedGridN = 48;   // survives Shutdown(); applied on Initialize
 
     // ---- shared ----
     XMFLOAT3 m_center{};

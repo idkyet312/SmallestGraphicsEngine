@@ -2,6 +2,8 @@
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
+#include <DbgHelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #include <iostream>
 #include <chrono>
 #include <filesystem>
@@ -16,12 +18,14 @@
 #include <imgui_impl_dx12.h>
 
 #include "DX12Core.h"
+#include "GroundLevel.h"
 #include "ShaderDX12.h"
 #include "VisibilityBufferDX12.h"
 #include "Scene.h"
 #include "ForwardRenderer.h"
 #include "IdTechRenderer.h"
 #include "RaytracingDX12.h"
+#include "VirtualInput.h"
 #include "EngineUI.h"
 #include "GLBImporter.h"
 #include "MipGenerator.h"
@@ -33,6 +37,8 @@
 #include "DestructionDX12.h"
 #include "FBXImporter.h"
 #include "WaterVolume.h"
+#include "RopeSwing.h"
+#include "PalmTrees.h"
 
 using namespace DirectX;
 
@@ -47,6 +53,10 @@ bool                        g_useMeshShader = false;
 TerrainRendererDX12         g_terrain;
 DestructionDX12             g_destruction;
 WaterVolume                 g_water;
+WaterVolume                 g_ocean;   // sea ringing the island, surface at y = 0
+RopeSwing                   g_rope;
+RopeSwing                   g_gibbet;
+PalmTrees                   g_trees;
 static SkyRendererDX12      skyRenderer;
 static OcclusionDepthDX12   occlusionDepth;
 static VisibilityBufferDX12 visBuffer;
@@ -100,21 +110,24 @@ static std::vector<unsigned char> PinkMissingTexture(int size) {
     return pixels;
 }
 
+// Island ground material: sand (Poly Haven "sand_02", CC0). The previous mud set
+// was never actually in the repo, so the terrain had been falling back to the pink
+// missing-texture placeholder.
 static void LoadFloorMudMaterial() {
     floorMaterial = std::make_shared<SceneMaterial>();
-    floorMaterial->name = "brown_mud_02";
+    floorMaterial->name = "sand_02";
     floorMaterial->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
     floorMaterial->metallicFactor = 0.0f;
     floorMaterial->roughnessFactor = 1.0f;
 
     floorMaterial->baseColorTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("models/Textures/brown_mud_02_diff_2k.jpg"),
+        ResolveTexturePath("models/textures/sand_02_diff_2k.jpg"),
         g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
     floorMaterial->normalTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("models/Textures/brown_mud_02_nor_gl_2k.jpg"),
+        ResolveTexturePath("models/textures/sand_02_nor_gl_2k.jpg"),
         g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
     floorMaterial->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("models/Textures/brown_mud_02_rough_2k.jpg"),
+        ResolveTexturePath("models/textures/sand_02_rough_2k.jpg"),
         g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
 
     if (!floorMaterial->baseColorTexture) {
@@ -122,7 +135,7 @@ static void LoadFloorMudMaterial() {
         floorMaterial->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
             g_dx12.device.Get(), g_dx12.commandList.Get(), missing, 256, 256, floorMaterial->uploadHeaps);
         floorMaterial->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
-        std::cerr << "Brown mud floor texture unavailable; using pink missing texture\n";
+        std::cerr << "Sand ground texture unavailable; using pink missing texture\n";
     }
 
     // Soft smoke sprite for particle billboards.
@@ -369,7 +382,10 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     // House footprint (world units). Front faces +Z toward the spawn area.
     constexpr float minX = -7.0f, maxX = 0.0f;   // flat terrain near world origin
     constexpr float minZ = 1.0f, maxZ = 6.0f;    // depth
-    constexpr float floorY = 0.0f, wallTop = 3.4f;
+    // The island's ground sits above sea level, so the houses are built on the flat
+    // pad stamped into the terrain -- not at y = 0, or they end up buried in sand.
+    // The roofs (RoofModel.h) are placed off this same constant.
+    constexpr float floorY = Ground::kBuildingPadY, wallTop = floorY + 3.4f;
     constexpr float wall = 0.28f;                // wall / slab thickness
 
     auto root = std::make_shared<SceneNode>("DestructibleHouse");
@@ -740,7 +756,10 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     // Front wall (+Z) with a door opening in the middle and a window either
     // side; one window on the back and each side wall.
     const float frontSpan = maxX - minX, sideSpan = maxZ - minZ;
-    buildWall(minX, maxX, maxZ - wall, maxZ, true, frontSpan * 0.42f, frontSpan * 0.58f, 2.2f,
+    // Door head height is measured from the floor, not absolute -- otherwise the
+    // opening stays at the old ground level when the building pad moves.
+    buildWall(minX, maxX, maxZ - wall, maxZ, true, frontSpan * 0.42f, frontSpan * 0.58f,
+              floorY + 2.2f,
               { { frontSpan * 0.10f, frontSpan * 0.30f }, { frontSpan * 0.70f, frontSpan * 0.90f } });
     buildWall(minX, maxX, minZ, minZ + wall, true, 0.0f, 0.0f, 0.0f,
               { { frontSpan * 0.38f, frontSpan * 0.62f } });                    // back
@@ -828,7 +847,9 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     const float sz0 = 1.2f, sz1 = 5.9f;
     const float sy0 = floorY;
     const float slabTop = sy0 + 0.20f;
-    const float eaveY = 2.85f;
+    // Relative to the slab, not absolute: an absolute eave height would leave the
+    // metal shack behind at the old ground level when the pad moves.
+    const float eaveY = sy0 + 2.85f;
     const float metalT = 0.06f;
     const float panelW = 0.42f;
     addBox("Support:MetalFoundation", matFoundation, sx0, sx1, sy0, slabTop, sz0, sz1);
@@ -852,8 +873,10 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
             if (door) {
                 if (c0 < 2.00f) addMetalPanel(x, sx0 + 2.00f, slabTop, eaveY, outer0, outer1);
                 if (c1 > 3.35f) addMetalPanel(sx0 + 3.35f, nx, slabTop, eaveY, outer0, outer1);
+                // Door header, measured up from the slab -- an absolute height here
+                // would leave the doorway behind when the pad's ground level moves.
                 addMetalPanel((std::max)(x, sx0 + 2.00f), (std::min)(nx, sx0 + 3.35f),
-                              2.15f, eaveY, outer0, outer1);
+                              sy0 + 2.15f, eaveY, outer0, outer1);
             } else {
                 addMetalPanel(x, nx, slabTop, eaveY, outer0, outer1);
             }
@@ -1161,7 +1184,43 @@ static void ToggleFullscreen(HWND hwnd) {
 }
 
 // ?? input ????????????????????????????????????????????????????????????????????
+// On-screen movement pad. Buttons in the UI set these each frame; ProcessInput
+// drains them. Kept separate from the keyboard path so the pad still works while
+// the camera is locked (which is exactly when the mouse is free to click it).
+VirtualInput virtualInput;
+
+static void ApplyVirtualInput() {
+    Camera& cam = scene.camera;
+    if (virtualInput.forward) cam.ProcessKeyboard('W', deltaTime);
+    if (virtualInput.back)    cam.ProcessKeyboard('S', deltaTime);
+    if (virtualInput.left)    cam.ProcessKeyboard('A', deltaTime);
+    if (virtualInput.right)   cam.ProcessKeyboard('D', deltaTime);
+    if (virtualInput.down)    cam.ProcessKeyboard('Q', deltaTime);
+    if (virtualInput.jump)    cam.ProcessKeyboard(' ', deltaTime);
+
+    if (virtualInput.lookX != 0.0f || virtualInput.lookY != 0.0f) {
+        cam.ProcessMouseMovement(virtualInput.lookX * virtualInput.lookSpeed * deltaTime,
+                                 virtualInput.lookY * virtualInput.lookSpeed * deltaTime);
+    }
+
+    if (virtualInput.shoot) {
+        scene.fireCooldown -= deltaTime;
+        if (scene.fireCooldown <= 0.0f) {
+            scene.ShootProjectile();
+            scene.fireCooldown = scene.fireInterval;
+        }
+    }
+
+    // Jump is a one-shot: consume it here so a single click is a single jump.
+    // The held/analog flags are rebuilt from scratch by the pad in RenderUI,
+    // which runs later in the frame -- don't clear them here or they'd be wiped
+    // before ever being applied.
+    virtualInput.jump = false;
+}
+
 static void ProcessInput(HWND) {
+    ApplyVirtualInput();
+
     if (cameraLocked || (showUI && ImGui::GetIO().WantCaptureKeyboard)) return;
     if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime);
     if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime);
@@ -1300,7 +1359,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 // ?? entry point ??????????????????????????????????????????????????????????????
+// Unhandled-exception hook: write a minidump next to the exe (dumps/crash.dmp)
+// so a crash leaves a debuggable artifact instead of just an event-log entry.
+static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* info) {
+    CreateDirectoryA("dumps", nullptr);
+    HANDLE file = CreateFileA("dumps/crash.dmp", GENERIC_WRITE, 0, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei = {};
+        mei.ThreadId = GetCurrentThreadId();
+        mei.ExceptionPointers = info;
+        mei.ClientPointers = FALSE;
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
+                          MiniDumpWithIndirectlyReferencedMemory, &mei, nullptr, nullptr);
+        CloseHandle(file);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+    SetUnhandledExceptionFilter(WriteCrashDump);
     AllocConsole();
     FILE* fp;
     freopen_s(&fp, "CONOUT$", "w", stdout);
@@ -1498,6 +1576,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             });
         }
         g_water.Update(deltaTime);
+        g_ocean.Update(deltaTime);
+        g_rope.Update(deltaTime);
+        g_gibbet.Update(deltaTime);
+        g_trees.Update(deltaTime);
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.Update(deltaTime);
             // Smoke at the actual fracture points where pieces broke loose.
@@ -1554,6 +1636,39 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(projectile.position, normal);
                     projectile.active = false;
+                } else if (XMFLOAT3 treeHit;
+                           g_trees.Shoot(projectile.previousPosition, projectile.position,
+                                         projectile.direction, bulletRadius,
+                                         scene.treeDamagePerShot, treeHit)) {
+                    // Chewed a palm trunk; enough rounds and it snaps and topples.
+                    const XMFLOAT3 normal(-projectile.direction.x,
+                                          -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(treeHit, normal);
+                    scene.SpawnSmokeBurst(treeHit, 0.25f, 0.1f);
+                    projectile.active = false;
+                } else if (XMFLOAT3 ropeHit;
+                           g_rope.Shoot(projectile.previousPosition, projectile.position,
+                                        projectile.direction, bulletRadius,
+                                        scene.destructionBulletImpulse, ropeHit)) {
+                    // Cut the rope (block falls) or shove the block (it swings).
+                    const XMFLOAT3 normal(-projectile.direction.x,
+                                          -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(ropeHit, normal);
+                    scene.SpawnSmokeBurst(ropeHit, 0.2f, 0.08f);
+                    projectile.active = false;
+                } else if (XMFLOAT3 gibHit;
+                           g_gibbet.Shoot(projectile.previousPosition, projectile.position,
+                                          projectile.direction, bulletRadius,
+                                          scene.destructionBulletImpulse, gibHit)) {
+                    // Cut the rope (body drops) or hit a limb (it swings and spins).
+                    const XMFLOAT3 normal(-projectile.direction.x,
+                                          -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(gibHit, normal);
+                    scene.SpawnSmokeBurst(gibHit, 0.2f, 0.08f);
+                    projectile.active = false;
                 }
             }
         }
@@ -1597,12 +1712,56 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 };
                 g_water.Initialize({ -12.0f, -1.85f, 0.0f }, { 14.0f, 2.7f, 14.0f },
                                    terrainSampler);
+
+                // The sea. A single big wave surface at y = 0 (sea level), spanning
+                // far past the terrain grid so it runs to the horizon in every
+                // direction. No terrain sampler: nothing floats in it, so it gets
+                // the cheap flat tank rather than a heightfield basin.
+                constexpr float kSeaSpan = 600.0f;
+                constexpr float kSeaDepth = 12.0f;
+                // Denser grid than the pool's: at 600 m across, the default 48
+                // cells would give 12 m quads and the swell would vanish.
+                g_ocean.SetGridResolution(128);
+                g_ocean.Initialize({ 0.0f, -kSeaDepth * 0.5f, 0.0f },
+                                   { kSeaSpan, kSeaDepth, kSeaSpan });
                 // House debris collides with the real terrain, not a flat plane.
                 g_destruction.SetTerrainSampler(terrainSampler);
                 // Debris/ragdolls splash the pool when they break the surface.
                 g_destruction.SetSplashCallback([](float x, float z, float s) {
                     g_water.Splash(x, z, s);
                 });
+
+                // Block hung from a rope, out on the open +X side away from the
+                // pool. Shoot the rope and it drops; shoot the block and it swings.
+                const float ropeX = 14.0f, ropeZ = 2.0f;
+                const float groundY = terrainSampler(ropeX, ropeZ);
+                g_rope.SetGroundY(groundY);
+                g_rope.Initialize(XMFLOAT3(ropeX, groundY + 6.5f, ropeZ));
+
+                // Ragdoll strung up from a second rope, further along. Shoot the
+                // rope and the body drops in a heap; shoot a limb and it swings.
+                const float gibX = 20.0f, gibZ = 2.0f;
+                const float gibGround = terrainSampler(gibX, gibZ);
+                g_gibbet.SetGroundY(gibGround);
+                g_gibbet.Initialize(XMFLOAT3(gibX, gibGround + 7.5f, gibZ),
+                                    5, 0.5f, 0.55f, RopeSwing::Payload::Ragdoll);
+
+                // Palm grove ringing the pool. Shoot through a trunk and the tree
+                // snaps at that height and topples away from you.
+                g_trees.SetTerrainSampler(terrainSampler);
+                g_trees.Initialize();
+                struct PalmSpot { float x, z, h, lean; };
+                static const PalmSpot palms[] = {
+                    { -20.0f,  -8.0f, 7.5f,  0.5f },
+                    { -16.0f,  -9.5f, 6.4f, -0.4f },
+                    { -21.5f,   3.0f, 8.2f,  0.7f },
+                    { -18.0f,   8.5f, 6.8f, -0.6f },
+                    { -11.0f,  10.5f, 7.1f,  0.3f },
+                    {  -4.5f,   9.0f, 6.0f, -0.5f },
+                    {  -4.0f,  -9.0f, 7.8f,  0.6f },
+                    { -12.5f, -11.0f, 6.6f, -0.3f },
+                };
+                for (const PalmSpot& p : palms) g_trees.Plant(p.x, p.z, p.h, p.lean);
             }
             // Same pool AABB for the destruction sim so house debris shoved into
             // the water floats too (surface at max.y).

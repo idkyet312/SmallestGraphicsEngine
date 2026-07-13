@@ -19,7 +19,8 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
     Microsoft::WRL::ComPtr<ID3D12Device> device,
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
     float uniformScale,
-    bool splitIntoDestructibleBoards) {
+    bool splitIntoDestructibleBoards,
+    bool loadMaterials) {
     Assimp::Importer importer;
     const aiScene* scene = importer.ReadFile(filepath, aiProcess_Triangulate | aiProcess_JoinIdenticalVertices |
         aiProcess_GenSmoothNormals | aiProcess_CalcTangentSpace | aiProcess_ImproveCacheLocality |
@@ -51,18 +52,20 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
         return nullptr;
     };
     std::vector<fs::path> fallbackBaseColors;
-    for (const auto& entry : fs::recursive_directory_iterator(base)) {
-        const std::string name = entry.path().filename().string();
-        if (entry.is_regular_file() && name.find("_BaseColor.") != std::string::npos)
-            fallbackBaseColors.push_back(entry.path());
+    if (loadMaterials) {
+        for (const auto& entry : fs::recursive_directory_iterator(base)) {
+            const std::string name = entry.path().filename().string();
+            if (entry.is_regular_file() && name.find("_BaseColor.") != std::string::npos)
+                fallbackBaseColors.push_back(entry.path());
+        }
+        std::sort(fallbackBaseColors.begin(), fallbackBaseColors.end());
     }
-    std::sort(fallbackBaseColors.begin(), fallbackBaseColors.end());
     uint32_t plankId = 0;
     for (unsigned mi = 0; mi < scene->mNumMeshes; ++mi) {
         const aiMesh* src = scene->mMeshes[mi];
         MeshPrimitive p;
         auto mat = std::make_shared<SceneMaterial>();
-        if (src->mMaterialIndex < scene->mNumMaterials) {
+        if (loadMaterials && src->mMaterialIndex < scene->mNumMaterials) {
             const aiMaterial* am = scene->mMaterials[src->mMaterialIndex];
             aiString tex;
             const bool hasBaseColor =
@@ -74,7 +77,7 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
             if (am->GetTexture(aiTextureType_NORMALS, 0, &tex) == AI_SUCCESS && tex.length)
                 mat->normalTexture = loadTexture(tex, mat->uploadHeaps);
         }
-        if (!mat->baseColorTexture && !fallbackBaseColors.empty()) {
+        if (loadMaterials && !mat->baseColorTexture && !fallbackBaseColors.empty()) {
             const fs::path& color = fallbackBaseColors[mi % fallbackBaseColors.size()];
             mat->baseColorTexture = GLBImporter::LoadTextureFromFile(color.string(), device, commandList, mat->uploadHeaps);
             const std::string normalName = color.filename().string().replace(
