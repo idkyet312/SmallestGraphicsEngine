@@ -4,6 +4,7 @@
 #include "DX12Core.h"
 #include <fstream>
 #include <sstream>
+#include <cstdio>
 #include <array>
 
 // Constant buffer structures (must be 256-byte aligned for DX12)
@@ -186,6 +187,10 @@ public:
     ComPtr<ID3D12PipelineState> pipelineState;
     ComPtr<ID3D12PipelineState> wireframePipelineState;
     ComPtr<ID3D12PipelineState> transparentPipelineState;
+    // Grass: same root signature, same pixel shader, but a vertex shader that
+    // bends the blades in the wind. Null if grass_vs.hlsl failed to compile, in
+    // which case the grass simply is not drawn.
+    ComPtr<ID3D12PipelineState> grassPipelineState;
     ComPtr<ID3DBlob> pixelShaderBlob;
     
     // Per-draw-call constant buffers (need enough for all objects)
@@ -225,9 +230,37 @@ public:
     }
 
     bool loaded = false;
-    
+
     ShaderDX12() {}
-    
+
+    // Compile one HLSL file from disk. Same runtime-compile path the main shaders
+    // take; factored out so extra pipeline variants (e.g. the grass wind vertex
+    // shader) can be built without duplicating it.
+    static bool CompileShaderFile(const char* path, const char* target,
+                                  UINT compileFlags, ComPtr<ID3DBlob>& outBlob,
+                                  const D3D_SHADER_MACRO* defines = nullptr) {
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            std::cerr << "Failed to open shader file: " << path << std::endl;
+            return false;
+        }
+        std::stringstream ss;
+        ss << file.rdbuf();
+        const std::string code = ss.str();
+
+        ComPtr<ID3DBlob> errorBlob;
+        HRESULT hr = D3DCompile(code.c_str(), code.length(), path,
+            defines, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", target,
+            compileFlags, 0, &outBlob, &errorBlob);
+        if (FAILED(hr)) {
+            std::cerr << "Shader compilation error (" << path << "): "
+                      << (errorBlob ? (const char*)errorBlob->GetBufferPointer() : "unknown")
+                      << std::endl;
+            return false;
+        }
+        return true;
+    }
+
     bool Load(const char* vertexPath, const char* pixelPath) {
         // Read shader files
         std::ifstream vsFile(vertexPath);
@@ -518,7 +551,32 @@ public:
             std::cerr << "Failed to create wireframe pipeline state" << std::endl;
             // Non-fatal
         }
-        
+
+        // Grass PSO: the opaque state, but with the instanced wind vertex shader.
+        // The blade mesh is a single 8-vertex template drawn once per blade, so its
+        // vertex layout is just the corner (t, side) -- everything that varies per
+        // blade is read from a structured buffer by SV_InstanceID instead.
+        //
+        // Note the FillMode reset -- the wireframe PSO above left it WIREFRAME in
+        // the shared desc, and inheriting that would draw the grass as lines.
+        psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        D3D12_INPUT_ELEMENT_DESC grassLayout[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        };
+        ComPtr<ID3DBlob> grassVsBlob;
+        if (CompileShaderFile("shaders/grass_vs.hlsl", "vs_5_0", compileFlags, grassVsBlob)) {
+            psoDesc.InputLayout = { grassLayout, _countof(grassLayout) };
+            psoDesc.VS = { grassVsBlob->GetBufferPointer(), grassVsBlob->GetBufferSize() };
+            hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&grassPipelineState));
+            if (FAILED(hr)) {
+                std::cerr << "Failed to create grass pipeline state" << std::endl;
+                grassPipelineState.Reset();   // non-fatal: the grass just won't draw
+            }
+        }
+        // Restore the shared desc, in case anything below reuses it.
+        psoDesc.InputLayout = { inputLayout, _countof(inputLayout) };
+        psoDesc.VS = { vsBlob->GetBufferPointer(), vsBlob->GetBufferSize() };
+
         // Create constant buffers
         // Per-draw-call buffers need enough slots for all objects per frame
         if (!matrixBuffer.Create(FRAME_COUNT * MAX_DRAW_CALLS_PER_FRAME)) return false;

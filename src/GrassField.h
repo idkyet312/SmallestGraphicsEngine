@@ -13,16 +13,35 @@
 // of the sea, out of the sand, or off a cliff. Survivors keep a random yaw,
 // height, lean and phase, so the field never looks stamped from one blade.
 //
-// HOW THEY MOVE is recomputed every frame on the CPU, into a ring of UPLOAD
-// buffers -- exactly what WaterVolume already does for its wave surface. Wind is
-// a travelling wave sampled at the blade's own position, so gusts sweep ACROSS
-// the field rather than every blade swaying in unison, and the bend is applied
-// only to the blade's upper vertices, hinged at the root, so grass bends like
-// grass instead of sliding like a decal.
+// HOW THEY MOVE happens entirely in grass_vs.hlsl, on GPU-instanced geometry.
+// Everything here is STATIC: written once at load, never touched again.
 //
-// The blades are ordinary triangles in the ordinary object shader -- no new PSO,
-// no new vertex shader, and the shared pipeline already rasterises two-sided
-// (CULL_MODE_NONE), which is what a flat blade card needs.
+// The field is ONE blade -- 8 vertices, 18 indices -- drawn once per blade with
+// DrawIndexedInstanced. What makes a blade its own blade (root, height, facing,
+// lean, phase) lives in a structured buffer the vertex shader indexes by
+// SV_InstanceID, and the shader applies the wind, the bend and the distance fade.
+//
+// It took three versions to get here, and the two dead ends are worth recording:
+//
+//   1. Simulating every near-camera blade in scalar C++ each frame and streaming
+//      the result into an upload buffer -- the same trick WaterVolume uses for its
+//      waves. It cost ~11 ms/frame, more than the entire rest of the scene put
+//      together (161 -> 58 FPS). No amount of culling fixed the shape of that: the
+//      work was per-blade, per-frame, on the wrong processor.
+//
+//   2. Moving the wind to the vertex shader, but keeping a unique vertex per blade
+//      vertex. That made the geometry static, but left 1.4M vertices (~60 MB) to
+//      fetch, and drawing the whole field while letting the shader shrink distant
+//      blades to nothing was SLOWER than the CPU version it replaced -- a
+//      zero-height blade still costs vertex shading and triangle setup.
+//
+// Hence both halves of what is here now: instancing (so a blade's data is read
+// once, not eight times) and cell culling (so distant grass is never submitted at
+// all, rather than merely being invisible).
+//
+// The blades draw with the ordinary pixel shader through a grass-specific PSO that
+// swaps in the wind vertex shader. The shared pipeline already rasterises
+// two-sided (CULL_MODE_NONE), which is what a flat blade card needs.
 
 #include <DirectXMath.h>
 #include "DX12Core.h"
@@ -38,14 +57,26 @@ using namespace DirectX;
 
 class GrassField {
 public:
-    // Same layout as the forward renderer's VertexPosNormUV, so grass draws with
-    // the ordinary object shader.
+    // A vertex of the blade TEMPLATE. Only two things vary within a blade -- how
+    // far up it you are, and which edge you are on -- so that is all the vertex
+    // buffer holds. Eight of these describe every blade in the field.
     struct GrassVertex {
-        XMFLOAT3 position;
-        XMFLOAT3 normal;
-        XMFLOAT2 texCoord;
-        XMFLOAT4 tangent = XMFLOAT4(1.0f, 0.0f, 0.0f, 1.0f);
+        XMFLOAT2 corner;   // (t, side): t = 0 root -> 1 tip, side = -1 | +1
     };
+
+    // Everything that makes one blade different from another. The vertex shader
+    // reads this by SV_InstanceID; the layout must match grass_vs.hlsl's
+    // BladeInstance exactly, padded to a 16-byte multiple.
+    struct BladeInstance {
+        XMFLOAT3 root;     // world position of the base
+        float    height;
+        XMFLOAT2 dir;      // facing (width axis)
+        XMFLOAT2 lean;     // resting lean, as a tip offset in blade-height units
+        float    width;
+        float    phase;
+        XMFLOAT2 pad{};
+    };
+    static_assert(sizeof(BladeInstance) == 48, "must match the HLSL BladeInstance");
 
     // Scatter blades across a square of terrain centred on the origin.
     // `sampler` returns terrain height at (x, z); `waterY` is the sea level that
@@ -66,28 +97,78 @@ public:
         // planted -- the reject rate is the only way to tell a bad scatter from a
         // bad span without seeing the screen.
         if (FILE* f = std::fopen("grass_load.log", "w")) {
-            std::fprintf(f, "planted=%zu of %d candidates (span=%.1f) verts=%zu tris=%zu\n",
-                         m_blades.size(), count, span,
-                         m_blades.size() * kVertsPerBlade,
-                         m_indices.size() / 3);
+            std::fprintf(f, "planted=%zu of %d candidates (span=%.1f) cells=%zu "
+                            "templateVerts=%d instanceBytes=%zu\n",
+                         m_blades.size(), count, span, m_cells.size(),
+                         kVertsPerBlade,
+                         m_blades.size() * sizeof(BladeInstance));
             std::fclose(f);
         }
     }
 
     void Update(float dt) { m_time += dt; }
 
-    // Where the camera is, so distant blades can be skipped. Set before drawing.
+    // Where the camera is. Feeds the shader's distance fade and the cell cull.
     void SetViewer(const XMFLOAT3& eye) { m_eye = eye; }
 
-    // Rewrite this frame's vertices with the current wind, and hand back the view.
-    const D3D12_VERTEX_BUFFER_VIEW& UpdateAndGetVBV(UINT frameIndex) {
-        const UINT f = frameIndex % kFrames;
-        if (m_ready) WriteBlades(f);
-        return m_vbv[f];
-    }
+    // The blade TEMPLATE: 8 verts, 18 indices, shared by every blade in the field.
+    // Everything that makes a blade individual lives in the instance buffer below.
+    const D3D12_VERTEX_BUFFER_VIEW& GetVBV() const { return m_vbv; }
     const D3D12_INDEX_BUFFER_VIEW& GetIBV() const { return m_ibv; }
-    // Only the blades that survived the distance cull are drawn -- see WriteBlades.
-    UINT GetIndexCount() const { return m_drawIndices; }
+    static constexpr UINT IndexCount() { return kIndicesPerBlade; }
+
+    // The per-blade data, as a root SRV (t6) the vertex shader indexes with
+    // SV_InstanceID.
+    D3D12_GPU_VIRTUAL_ADDRESS GetInstanceBufferAddress() const {
+        return m_instances ? m_instances->GetGPUVirtualAddress() : 0;
+    }
+
+    // One INSTANCE range per patch of field near the camera. The renderer issues a
+    // draw per entry, and distant patches are simply never submitted. This is a few
+    // dozen tests over CELLS, not a walk over every blade, so the per-frame CPU cost
+    // is negligible -- which is the whole point.
+    struct DrawRange { UINT firstInstance, instanceCount; };
+    void GetVisible(std::vector<DrawRange>& out) const {
+        out.clear();
+        // A cell is drawn if any blade in it could be inside the draw radius, so
+        // test the cell's centre against the radius plus the cell's corner reach.
+        const float reach = kDrawDistance + kCellSize * 0.7072f;   // half-diagonal
+        const float reachSq = reach * reach;
+        for (const Cell& c : m_cells) {
+            const float dx = c.cx - m_eye.x;
+            const float dz = c.cz - m_eye.z;
+            if (dx * dx + dz * dz > reachSq) continue;
+            out.push_back({ c.firstBlade, c.bladeCount });
+        }
+    }
+
+    // The 8 root constants (b6) the grass vertex shader reads. Laid out to match
+    // grass_vs.hlsl's GrassParams exactly.
+    struct Params {
+        float time;
+        float windStrength;
+        float windSpeed;
+        float eyeX;
+        float eyeZ;
+        float drawDistance;
+        float fadeBand;
+        // The patch's first blade. SV_InstanceID does not pick up
+        // StartInstanceLocation for a structured buffer, so the shader adds this
+        // itself -- see grass_vs.hlsl. Set per draw.
+        UINT  firstBlade;
+    };
+    Params GetParams() const {
+        Params p;
+        p.time = m_time;
+        p.windStrength = m_windStrength;
+        p.windSpeed = m_windSpeed;
+        p.eyeX = m_eye.x;
+        p.eyeZ = m_eye.z;
+        p.drawDistance = kDrawDistance;
+        p.fadeBand = kFadeBand;
+        p.firstBlade = 0;      // the renderer overwrites this per patch
+        return p;
+    }
     bool IsInitialized() const { return m_ready; }
 
     // Wind controls, surfaced to the UI.
@@ -95,14 +176,11 @@ public:
     float& WindSpeed()    { return m_windSpeed; }
 
     void Shutdown() {
-        for (UINT f = 0; f < kFrames; ++f) {
-            if (m_vb[f] && m_mapped[f]) m_vb[f]->Unmap(0, nullptr);
-            m_vb[f].Reset();
-            m_mapped[f] = nullptr;
-        }
+        m_vb.Reset();
         m_ib.Reset();
+        m_instances.Reset();
         m_blades.clear();
-        m_indices.clear();
+        m_cells.clear();
         m_ready = false;
         m_time = 0.0f;
     }
@@ -110,7 +188,6 @@ public:
     ~GrassField() { Shutdown(); }
 
 private:
-    static constexpr UINT kFrames = 3;         // frames in flight
     static constexpr int  kSegments = 3;       // vertical segments per blade
     // A blade is a strip: (kSegments + 1) rows of 2 vertices, tapering to a point.
     static constexpr int  kVertsPerBlade = (kSegments + 1) * 2;
@@ -126,7 +203,20 @@ private:
         float phase = 0.0f;               // per-blade offset so gusts desynchronise
         float lean = 0.0f;                // resting lean, so the field isn't a lawn
         float leanX = 0.0f, leanZ = 0.0f; // which way that resting lean points
-        float tint = 1.0f;                // per-blade shade, via vertex UV.y
+    };
+
+    // A square patch of the field, holding a contiguous run of INSTANCES.
+    //
+    // The blades are static, so the only way to stop paying for the ones you cannot
+    // see is to not draw them -- shrinking them to zero height in the vertex shader
+    // still costs full vertex shading and triangle setup, which is what made the
+    // first GPU version slower than the CPU one it replaced. Sorting blades into
+    // cells at build time makes each cell one contiguous instance range, so the
+    // field becomes a few dozen instanced draws and the far ones are just skipped.
+    struct Cell {
+        float  cx = 0.0f, cz = 0.0f;   // centre, world space
+        UINT   firstBlade = 0;
+        UINT   bladeCount = 0;
     };
 
     // Cheap deterministic hash -> [0, 1). A fixed seed keeps the field identical
@@ -207,44 +297,132 @@ private:
                 b.leanX = std::cos(leanYaw);
                 b.leanZ = std::sin(leanYaw);
 
-                b.tint = 0.75f + Rand(seed) * 0.5f;
-
                 m_blades.push_back(b);
             }
         }
 
-        // The index buffer is static: blade topology never changes, only the
-        // vertex positions do.
-        m_indices.clear();
-        m_indices.reserve(m_blades.size() * kIndicesPerBlade);
-        for (size_t b = 0; b < m_blades.size(); ++b) {
-            const uint32_t base = (uint32_t)(b * kVertsPerBlade);
-            for (int s = 0; s < kSegments; ++s) {
-                const uint32_t r0 = base + s * 2;      // this row: left, right
-                const uint32_t r1 = base + (s + 1) * 2; // row above
-                m_indices.push_back(r0);     m_indices.push_back(r1);     m_indices.push_back(r0 + 1);
-                m_indices.push_back(r0 + 1); m_indices.push_back(r1);     m_indices.push_back(r1 + 1);
-            }
+        // Sort the blades into spatial cells, so that each cell owns one contiguous
+        // run of INSTANCES and can be drawn or skipped on its own. Without this the
+        // field is a single draw and the GPU pays for every blade on the island,
+        // however far away it is.
+        SortIntoCells(span);
+    }
+
+    // Reorder m_blades so that blades sharing a grid cell are adjacent, and record
+    // each cell's index range. Called once, before the buffers are built, so the
+    // ordering is baked into the static geometry.
+    void SortIntoCells(float span) {
+        m_cells.clear();
+        if (m_blades.empty()) return;
+
+        const float half = span * 0.5f;
+        const int n = std::max(1, (int)std::ceil(span / kCellSize));
+        const auto cellOf = [&](const Blade& b) {
+            const int ix = std::clamp((int)((b.x + half) / kCellSize), 0, n - 1);
+            const int iz = std::clamp((int)((b.z + half) / kCellSize), 0, n - 1);
+            return (size_t)iz * n + ix;
+        };
+
+        // Counting sort into cell order: one pass to size each bucket, one to fill.
+        std::vector<size_t> counts((size_t)n * n, 0);
+        for (const Blade& b : m_blades) ++counts[cellOf(b)];
+
+        std::vector<size_t> starts((size_t)n * n, 0);
+        size_t running = 0;
+        for (size_t c = 0; c < counts.size(); ++c) {
+            starts[c] = running;
+            running += counts[c];
+        }
+
+        std::vector<Blade> sorted(m_blades.size());
+        std::vector<size_t> cursor = starts;
+        for (const Blade& b : m_blades) sorted[cursor[cellOf(b)]++] = b;
+        m_blades.swap(sorted);
+
+        // Record the non-empty cells. Each is a contiguous run of instances, drawn
+        // with one DrawIndexedInstanced whose StartInstanceLocation is firstBlade.
+        for (int iz = 0; iz < n; ++iz)
+        for (int ix = 0; ix < n; ++ix) {
+            const size_t c = (size_t)iz * n + ix;
+            if (counts[c] == 0) continue;
+            Cell cell;
+            cell.cx = -half + (ix + 0.5f) * kCellSize;
+            cell.cz = -half + (iz + 0.5f) * kCellSize;
+            cell.firstBlade = (UINT)starts[c];
+            cell.bladeCount = (UINT)counts[c];
+            m_cells.push_back(cell);
         }
     }
 
+    // Write every blade's REST pose once. Nothing here is ever rewritten: the wind,
+    // the bend and the distance fade all happen in grass_vs.hlsl now, so this runs
+    // a single time at load and the per-frame CPU cost of the grass is zero.
+    //
+    // What the vertex actually carries is not the blade's final shape but the
+    // inputs the shader needs to rebuild it -- see the encoding note at the top of
+    // grass_vs.hlsl. Grass draws untextured, so the pixel shader reads neither
+    // texCoord nor tangent, and both are free to carry per-blade constants.
     bool BuildBuffers() {
-        const UINT vbSize = (UINT)(m_blades.size() * kVertsPerBlade * sizeof(GrassVertex));
-        for (UINT f = 0; f < kFrames; ++f) {
-            if (!MakeUploadBuffer(vbSize, m_vb[f], m_mapped[f])) return false;
-            m_vbv[f].BufferLocation = m_vb[f]->GetGPUVirtualAddress();
-            m_vbv[f].SizeInBytes = vbSize;
-            m_vbv[f].StrideInBytes = sizeof(GrassVertex);
+        // The blade TEMPLATE: 8 vertices and 18 indices, shared by every blade in
+        // the field. A vertex says only where it sits on a generic blade -- how far
+        // up (t) and which edge (side) -- and the shader builds the real thing from
+        // the instance data.
+        GrassVertex verts[kVertsPerBlade];
+        std::vector<uint32_t> idx;
+        idx.reserve(kIndicesPerBlade);
+
+        int v = 0;
+        for (int s = 0; s <= kSegments; ++s) {
+            const float t = (float)s / kSegments;
+            verts[v++].corner = XMFLOAT2(t, -1.0f);
+            verts[v++].corner = XMFLOAT2(t, +1.0f);
+        }
+        for (int s = 0; s < kSegments; ++s) {
+            const uint32_t r0 = s * 2;          // this row: left, right
+            const uint32_t r1 = (s + 1) * 2;    // the row above
+            idx.push_back(r0);     idx.push_back(r1);     idx.push_back(r0 + 1);
+            idx.push_back(r0 + 1); idx.push_back(r1);     idx.push_back(r1 + 1);
         }
 
-        const UINT ibSize = (UINT)(m_indices.size() * sizeof(uint32_t));
+        const UINT vbSize = (UINT)sizeof(verts);
+        void* vbMapped = nullptr;
+        if (!MakeUploadBuffer(vbSize, m_vb, vbMapped)) return false;
+        std::memcpy(vbMapped, verts, vbSize);
+        m_vb->Unmap(0, nullptr);
+        m_vbv.BufferLocation = m_vb->GetGPUVirtualAddress();
+        m_vbv.SizeInBytes = vbSize;
+        m_vbv.StrideInBytes = sizeof(GrassVertex);
+
+        const UINT ibSize = (UINT)(idx.size() * sizeof(uint32_t));
         void* ibMapped = nullptr;
         if (!MakeUploadBuffer(ibSize, m_ib, ibMapped)) return false;
-        std::memcpy(ibMapped, m_indices.data(), ibSize);
+        std::memcpy(ibMapped, idx.data(), ibSize);
         m_ib->Unmap(0, nullptr);
         m_ibv.BufferLocation = m_ib->GetGPUVirtualAddress();
         m_ibv.SizeInBytes = ibSize;
         m_ibv.Format = DXGI_FORMAT_R32_UINT;
+
+        // The instance buffer: one entry per blade, in the cell-sorted order the
+        // draw ranges refer to. This is the only place the field's real size shows
+        // up -- ~48 bytes a blade rather than eight duplicated 44-byte vertices.
+        std::vector<BladeInstance> inst;
+        inst.reserve(m_blades.size());
+        for (const Blade& b : m_blades) {
+            BladeInstance bi;
+            bi.root   = XMFLOAT3(b.x, b.baseY, b.z);
+            bi.height = b.height;
+            bi.dir    = XMFLOAT2(b.dirX, b.dirZ);
+            bi.lean   = XMFLOAT2(b.leanX * b.lean, b.leanZ * b.lean);
+            bi.width  = b.width;
+            bi.phase  = b.phase;
+            inst.push_back(bi);
+        }
+
+        const UINT instSize = (UINT)(inst.size() * sizeof(BladeInstance));
+        void* instMapped = nullptr;
+        if (!MakeUploadBuffer(instSize, m_instances, instMapped)) return false;
+        std::memcpy(instMapped, inst.data(), instSize);
+        m_instances->Unmap(0, nullptr);
         return true;
     }
 
@@ -265,159 +443,39 @@ private:
         return SUCCEEDED(buffer->Map(0, &r, &mapped));
     }
 
-    // Wind at a point: two travelling waves crossing the field at an angle, so
-    // gusts sweep over the grass instead of pulsing everywhere at once. Returns
-    // a signed bend amount; the caller decides which way it pushes.
-    float WindAt(float x, float z, float phase) const {
-        const float t = m_time * m_windSpeed;
-        const float a = std::sin((x + z) * 0.18f + t + phase);
-        const float b = std::sin((x * 0.31f - z * 0.13f) + t * 0.63f);
-        // Bias positive: real wind blows one way and gusts on top of that, rather
-        // than swinging symmetrically back and forth.
-        return (0.55f + 0.45f * a) * (0.7f + 0.3f * b);
-    }
-
-    void WriteBlades(UINT f) {
-        if (!m_mapped[f]) return;
-        GrassVertex* out = (GrassVertex*)m_mapped[f];
-
-        // The prevailing wind direction, slowly wandering so the field never
-        // settles into an obviously repeating pattern.
-        const float dirAng = std::sin(m_time * 0.07f) * 0.5f;
-        const float wx = std::cos(dirAng);
-        const float wz = std::sin(dirAng);
-
-        // Every blade written here is re-simulated on the CPU, so writing all of
-        // them costs the same whether they are underfoot or 80 m away and a
-        // fraction of a pixel tall. Rebuilding the whole field was ~11 ms/frame --
-        // more than the entire rest of the scene. So only blades within
-        // kDrawDistance are written, COMPACTED to the front of the buffer: because
-        // every blade has identical topology, the static index buffer already
-        // describes them, and the draw simply stops after however many were kept.
-        const float cullSq = kDrawDistance * kDrawDistance;
-
-        size_t written = 0;
-        size_t v = 0;
-        for (const Blade& b : m_blades) {
-            const float ddx = b.x - m_eye.x;
-            const float ddz = b.z - m_eye.z;
-            const float distSq = ddx * ddx + ddz * ddz;
-            if (distSq > cullSq) continue;
-            ++written;
-
-            // Cutting blades off at a hard radius makes a ring of grass pop in and
-            // out as you walk. Instead, shrink them to nothing over the last few
-            // metres before the cull, so they sink into the ground rather than
-            // blinking out of existence.
-            float fade = 1.0f;
-            const float fadeStart = kDrawDistance - kFadeBand;
-            if (distSq > fadeStart * fadeStart) {
-                const float d = std::sqrt(distSq);
-                fade = std::max(0.0f, (kDrawDistance - d) / kFadeBand);
-            }
-            const float height = b.height * fade;
-
-            const float bend = WindAt(b.x, b.z, b.phase) * m_windStrength;
-
-            // Total horizontal displacement of the blade TIP: its resting lean,
-            // plus the wind pushing along the prevailing direction. Expressed as a
-            // FRACTION of the blade's height, so it must stay below 1 -- a tip that
-            // travels further than the blade is long has nowhere to bend to, and
-            // the droop term below would fold the blade through its own root.
-            float tipX = b.leanX * b.lean + wx * bend;
-            float tipZ = b.leanZ * b.lean + wz * bend;
-            const float tipLen = std::sqrt(tipX * tipX + tipZ * tipZ);
-            if (tipLen > kMaxBend) {
-                const float s = kMaxBend / tipLen;
-                tipX *= s;
-                tipZ *= s;
-            }
-
-            for (int s = 0; s <= kSegments; ++s) {
-                const float t = (float)s / kSegments;      // 0 at root, 1 at tip
-
-                // Hinge at the root: displacement grows with t^2, so the base stays
-                // planted and the blade curves over rather than shearing rigidly.
-                const float k = t * t;
-                const float offX = tipX * k;
-                const float offZ = tipZ * k;
-
-                // Bending shortens the blade's vertical reach -- without this the
-                // grass stretches as it leans.
-                const float droop = std::sqrt(std::max(0.0f, 1.0f - (offX * offX + offZ * offZ)));
-                const float y = b.baseY + height * t * droop;
-
-                // Taper to a point at the tip.
-                const float w = b.width * (1.0f - t * 0.85f);
-
-                const float cx = b.x + offX;
-                const float cz = b.z + offZ;
-
-                // The blade's surface normal: perpendicular to both its width axis
-                // and the direction it is currently leaning, so lighting responds
-                // to the wind instead of staying flat.
-                XMVECTOR side = XMVectorSet(b.dirX, 0.0f, b.dirZ, 0.0f);
-                XMVECTOR up   = XMVector3Normalize(XMVectorSet(tipX, 1.0f, tipZ, 0.0f));
-                XMVECTOR nrm  = XMVector3Cross(side, up);
-                if (XMVectorGetX(XMVector3LengthSq(nrm)) < 1e-6f)
-                    nrm = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-                nrm = XMVector3Normalize(nrm);
-                // Grass reads better lit from above: tilt the normal skyward so a
-                // field of vertical cards doesn't go black under a high sun.
-                nrm = XMVector3Normalize(XMVectorAdd(nrm, XMVectorSet(0.0f, 0.9f, 0.0f, 0.0f)));
-                XMFLOAT3 nf; XMStoreFloat3(&nf, nrm);
-
-                XMFLOAT3 tf(b.dirX, 0.0f, b.dirZ);
-
-                for (int e = 0; e < 2; ++e) {          // left, right edge
-                    const float sgn = e ? 1.0f : -1.0f;
-                    GrassVertex& gv = out[v++];
-                    gv.position = XMFLOAT3(cx + b.dirX * w * sgn, y, cz + b.dirZ * w * sgn);
-                    gv.normal = nf;
-                    // u across the blade, v up it. The shader has no grass texture,
-                    // so v doubles as the shading gradient (dark at the root,
-                    // bright at the tip) and the blade's own tint rides in on it.
-                    gv.texCoord = XMFLOAT2(e ? 1.0f : 0.0f, t * b.tint);
-                    gv.tangent = XMFLOAT4(tf.x, tf.y, tf.z, 1.0f);
-                }
-            }
-        }
-
-        m_drawIndices = (UINT)(written * kIndicesPerBlade);
-    }
-
     // A blade must clear the waterline by this much to be planted, keeping grass
     // off the wet sand.
     static constexpr float kShoreMargin = 0.9f;
     // Steepest ground grass will grow on (rise over run).
     static constexpr float kMaxSlope = 0.6f;
-    // How far the tip may travel sideways, as a fraction of the blade's height.
-    // Past ~0.8 a blade is bent nearly flat and starts to look broken.
-    static constexpr float kMaxBend = 0.75f;
     // Blades are clumped into tufts rather than scattered evenly -- see BuildBlades.
     static constexpr int   kBladesPerTuft = 14;
     static constexpr float kTuftRadius    = 0.28f;   // metres
-    // Blades beyond this are neither simulated nor drawn. At this range a blade is
-    // a sliver a pixel or two tall, and paying full CPU wind for it is pure waste:
-    // the whole field costs ~11 ms/frame to rebuild, so what this radius excludes
-    // is most of the frame budget.
+    // Blades shrink to nothing as they approach this range, so distant grass costs
+    // no pixels and the field has no hard edge. Enforced in the vertex shader --
+    // the geometry is static, so there is nothing to cull on the CPU.
     static constexpr float kDrawDistance  = 28.0f;
-    // Blades shrink to nothing over the last few metres, so the cull edge does not
-    // read as a ring of grass popping in and out as the player walks.
+    // Width of that shrink, so the fade edge does not read as a ring of grass
+    // popping in and out as the player walks.
     static constexpr float kFadeBand      = 6.0f;
+    // Side of one draw-cell. Small enough that the cells hug the draw radius
+    // without dragging in much grass the shader would only fade away, large enough
+    // that the whole field stays a few dozen draws rather than hundreds.
+    static constexpr float kCellSize      = 8.0f;
 
     std::function<float(float, float)> m_terrain;
-    std::vector<Blade>    m_blades;
-    std::vector<uint32_t> m_indices;
+    std::vector<Blade> m_blades;
+    std::vector<Cell>  m_cells;
 
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_vb[kFrames];
-    void*                                  m_mapped[kFrames] = {};
-    D3D12_VERTEX_BUFFER_VIEW               m_vbv[kFrames] = {};
+    // Static geometry: written once at load, never touched again. m_vb/m_ib hold
+    // the single blade template; m_instances holds the whole field.
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_vb;
+    D3D12_VERTEX_BUFFER_VIEW               m_vbv = {};
     Microsoft::WRL::ComPtr<ID3D12Resource> m_ib;
     D3D12_INDEX_BUFFER_VIEW                m_ibv = {};
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_instances;
 
-    XMFLOAT3 m_eye{};          // camera position, for the distance cull
-    UINT     m_drawIndices = 0; // indices actually written this frame
+    XMFLOAT3 m_eye{};          // camera position, for the shader's distance fade
 
     float m_time = 0.0f;
     float m_waterY = 0.0f;
