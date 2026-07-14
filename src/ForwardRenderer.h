@@ -355,29 +355,66 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.Use(scene.wireframeMode);
     }
 
-    // Grass. One indexed draw for the whole field: the blades are rebuilt into a
-    // per-frame upload buffer with this frame's wind already applied, so they are
-    // world-space geometry and go up with an identity model matrix. Opaque, so it
-    // must land before the transparent water below or it would be sorted wrong.
-    if (g_grass.IsInitialized()) {
-        // Only blades near the camera are simulated and drawn, so the field needs
-        // to know where the viewer is before it rebuilds itself.
+    // Grass: an INSTANCED draw of one 8-vertex blade, bent in the wind by its own
+    // vertex shader. This is how a real engine draws foliage, and it is the third
+    // version -- the first re-simulated every blade on the CPU each frame (~11 ms,
+    // more than the whole rest of the scene), and the second made the geometry
+    // static but still pushed 1.4M unique vertices through the vertex fetch.
+    //
+    // Two things keep it cheap. The mesh is a single blade template drawn once per
+    // blade, so the per-blade data is read once from a structured buffer instead of
+    // being duplicated across eight vertices. And the field is submitted a patch at
+    // a time, so distant grass is not drawn at all -- shrinking blades away in the
+    // shader is not enough, because a zero-height blade still costs vertex shading
+    // and triangle setup.
+    //
+    // Blades are built in world space, hence the identity model matrix. Opaque, so
+    // this lands before the transparent water below or it would sort wrong.
+    if (g_grass.IsInitialized() && shader.grassPipelineState) {
+        // The shader fades blades with distance, and the cull below needs it too.
         g_grass.SetViewer(scene.camera.Position);
-        const D3D12_VERTEX_BUFFER_VIEW& gvbv = g_grass.UpdateAndGetVBV(g_dx12.frameIndex);
-        const UINT grassIndices = g_grass.GetIndexCount();
-        if (grassIndices && gvbv.BufferLocation) {
+
+        static std::vector<GrassField::DrawRange> grassRanges;
+        g_grass.GetVisible(grassRanges);
+
+        const D3D12_VERTEX_BUFFER_VIEW& gvbv = g_grass.GetVBV();
+        const D3D12_GPU_VIRTUAL_ADDRESS ginst = g_grass.GetInstanceBufferAddress();
+        if (!grassRanges.empty() && gvbv.BufferLocation && ginst) {
             const D3D12_INDEX_BUFFER_VIEW& gibv = g_grass.GetIBV();
-            shader.Use(scene.wireframeMode);
+
             shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
-            // No grass texture: the blade's own vertex colour gradient does the
-            // shaping, so this is a flat green with a matte response.
+            // Untextured: a flat green with a matte response.
             shader.SetObjectMaterial(XMFLOAT3(0.20f, 0.42f, 0.13f), false, false,
                                      0.0f, 0.85f, nullptr, nullptr, nullptr);
+
+            // Wind parameters as root constants (b6), and the per-blade data as a
+            // root SRV (t6). Both slots exist for the terrain mesh-shader path and
+            // are unused by the raster path, so the grass borrows them and needs no
+            // root-signature change of its own. (Terrain and grass never draw in the
+            // same call, so sharing the slots is safe.)
+            GrassField::Params gp = g_grass.GetParams();
+            static_assert(sizeof(GrassField::Params) == 8 * sizeof(UINT),
+                          "GrassParams must match the 8 root constants at b6");
+            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 8, &gp, 0);
+            g_dx12.commandList->SetGraphicsRootShaderResourceView(9, ginst);
+
+            g_dx12.commandList->SetPipelineState(shader.grassPipelineState.Get());
             g_dx12.commandList->IASetVertexBuffers(0, 1, &gvbv);
             g_dx12.commandList->IASetIndexBuffer(&gibv);
             g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            g_dx12.commandList->DrawIndexedInstanced(grassIndices, 1, 0, 0, 0);
+            // Every patch draws the same template with the same material. The only
+            // thing that changes is which run of blades it reads -- and that has to
+            // go in as a root constant, because SV_InstanceID ignores
+            // StartInstanceLocation for a structured buffer (see grass_vs.hlsl).
+            for (const GrassField::DrawRange& r : grassRanges) {
+                g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 1, &r.firstInstance, 7);
+                g_dx12.commandList->DrawIndexedInstanced(
+                    GrassField::IndexCount(), r.instanceCount, 0, 0, 0);
+            }
             shader.NextDrawCall();
+
+            // Hand the pipeline back to the ordinary object shader for what follows.
+            shader.Use(scene.wireframeMode);
         }
     }
 

@@ -183,35 +183,84 @@ public:
     }
 
     // Surface elevation above rest at world (x,z): calm-edged swell plus decaying
-    // circular ripples. Drives both buoyancy and the render mesh.
+    // circular ripples. Drives buoyancy (the render mesh wants the slope too, so
+    // it calls WaveHeightAndSlopeAt directly). Defined in terms of that one
+    // function so the two cannot drift out of step.
     float WaveHeightAt(float x, float z) const {
+        float dhdx, dhdz;
+        return WaveHeightAndSlopeAt(x, z, dhdx, dhdz);
+    }
+
+    // Height AND its slope at (x,z), in one pass.
+    //
+    // The mesh needs a normal per vertex, and the obvious way to get one is to
+    // sample the height four more times around the point and take a finite
+    // difference. That made the surface cost FIVE height evaluations per vertex --
+    // and on the 129x129 ocean grid, each one being a handful of sin/exp calls,
+    // that was the single most expensive thing on the CPU each frame.
+    //
+    // But this height field is a closed form: a sum of sines times a Gaussian bell,
+    // plus ripple terms. Its derivative is just as closed-form, so the gradient can
+    // be accumulated alongside the height for a few extra multiplies -- one
+    // evaluation instead of five, and it is exact rather than a difference
+    // approximation.
+    //
+    // Returns h; writes dh/dx and dh/dz to the out-params.
+    float WaveHeightAndSlopeAt(float x, float z, float& dhdx, float& dhdz) const {
         const float lx = x - m_center.x;
         const float lz = z - m_center.z;
         const float hx = m_extents.x * 0.5f;
         const float hz = m_extents.z * 0.5f;
 
-        // Gaussian bell: waves tallest at the centre, tapering to zero at the
-        // banks so the surface meets the walls flush.
+        // Gaussian bell: waves tallest at the centre, tapering to zero at the banks.
         const float nx = hx > 0.0f ? lx / hx : 0.0f;
         const float nz = hz > 0.0f ? lz / hz : 0.0f;
         const float bell = std::exp(-2.2f * (nx * nx + nz * nz));
+        // d(bell)/dlx and /dlz. (nx = lx/hx, so dnx/dlx = 1/hx.)
+        const float dbell_dx = hx > 0.0f ? bell * -4.4f * nx / hx : 0.0f;
+        const float dbell_dz = hz > 0.0f ? bell * -4.4f * nz / hz : 0.0f;
 
-        float h = 0.0f;
-        h += 0.14f * std::sin(0.90f * lx + 1.30f * m_time);
-        h += 0.10f * std::sin(0.70f * lz - 1.70f * m_time + 0.6f * lx);
-        h += 0.06f * std::sin(1.60f * (lx + lz) + 2.40f * m_time);
-        h += 0.04f * std::sin(2.30f * lx - 2.90f * m_time + 1.3f * lz);
-        h *= bell;
+        // The swell, and its gradient, before the bell is applied. Each term is
+        // A*sin(P), so d/dlx = A*cos(P) * dP/dlx.
+        float s = 0.0f, dsdx = 0.0f, dsdz = 0.0f;
+        auto wave = [&](float amp, float kx, float kz, float phase) {
+            const float p = kx * lx + kz * lz + phase;
+            const float c = amp * std::cos(p);
+            s    += amp * std::sin(p);
+            dsdx += c * kx;
+            dsdz += c * kz;
+        };
+        wave(0.14f, 0.90f, 0.00f,  1.30f * m_time);
+        wave(0.10f, 0.60f, 0.70f, -1.70f * m_time);
+        wave(0.06f, 1.60f, 1.60f,  2.40f * m_time);
+        wave(0.04f, 2.30f, 1.30f, -2.90f * m_time);
 
+        // Product rule for (swell * bell).
+        float h = s * bell;
+        dhdx = dsdx * bell + s * dbell_dx;
+        dhdz = dsdz * bell + s * dbell_dz;
+
+        // Ripples: r * sin(6*band) * exp(-a*1.2) * exp(-band^2 * 1.5), where
+        // band = dist - front and d(band)/dx = dx/dist. Chain rule through band.
         for (const Ripple& r : m_ripples) {
             const float age = m_time - r.t0;
             if (age <= 0.0f) continue;
             const float dx = x - r.x, dz = z - r.z;
             const float dist = std::sqrt(dx * dx + dz * dz);
-            const float front = 3.0f * age;              // ring radius
+            if (dist < 1e-5f) continue;              // gradient is undefined at the centre
+            const float front = 3.0f * age;
             const float band = dist - front;
-            const float env = std::exp(-age * 1.2f) * std::exp(-band * band * 1.5f);
-            h += r.strength * 0.5f * std::sin(6.0f * band) * env;
+            const float decay = std::exp(-age * 1.2f);
+            const float env = decay * std::exp(-band * band * 1.5f);
+            const float amp = r.strength * 0.5f;
+            const float sn = std::sin(6.0f * band);
+            const float cs = std::cos(6.0f * band);
+
+            h += amp * sn * env;
+            // d/dband of [sin(6b) * exp(-1.5 b^2)] = 6cos(6b)*e + sin(6b)*(-3b)*e
+            const float dband = amp * env * (6.0f * cs - 3.0f * band * sn);
+            dhdx += dband * (dx / dist);
+            dhdz += dband * (dz / dist);
         }
         return h;
     }
@@ -408,23 +457,20 @@ private:
 
         auto worldX = [&](int ix) { return m_center.x - hx + (m_extents.x * ix) / n; };
         auto worldZ = [&](int iz) { return m_center.z - hz + (m_extents.z * iz) / n; };
-        auto surf = [&](int ix, int iz) { return m_surfaceY + WaveHeightAt(worldX(ix), worldZ(iz)); };
 
+        // One height evaluation per vertex, with the normal coming from the exact
+        // gradient rather than four extra samples -- see WaveHeightAndSlopeAt. On
+        // the 129x129 ocean that is 16,641 evaluations a frame instead of 83,205.
         for (int iz = 0; iz <= n; ++iz)
         for (int ix = 0; ix <= n; ++ix) {
             const float x = worldX(ix);
             const float z = worldZ(iz);
-            const float y = surf(ix, iz);
 
-            const int xm = ix > 0 ? ix - 1 : ix, xp = ix < n ? ix + 1 : ix;
-            const int zm = iz > 0 ? iz - 1 : iz, zp = iz < n ? iz + 1 : iz;
-            const float dhx = (surf(xp, iz) - surf(xm, iz));
-            const float dhz = (surf(ix, zp) - surf(ix, zm));
-            const float ddx = (worldX(xp) - worldX(xm));
-            const float ddz = (worldZ(zp) - worldZ(zm));
-            XMVECTOR nrm = XMVector3Normalize(XMVectorSet(
-                ddx != 0.0f ? -dhx / ddx : 0.0f, 1.0f,
-                ddz != 0.0f ? -dhz / ddz : 0.0f, 0.0f));
+            float dhdx = 0.0f, dhdz = 0.0f;
+            const float y = m_surfaceY + WaveHeightAndSlopeAt(x, z, dhdx, dhdz);
+
+            // The surface is y = h(x,z), so its normal is (-dh/dx, 1, -dh/dz).
+            XMVECTOR nrm = XMVector3Normalize(XMVectorSet(-dhdx, 1.0f, -dhdz, 0.0f));
             XMFLOAT3 nf; XMStoreFloat3(&nf, nrm);
 
             WaterVertex& v = out[iz * (n + 1) + ix];
