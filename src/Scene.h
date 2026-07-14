@@ -111,7 +111,7 @@ struct Scene {
     GunViewModel gun;
     std::vector<Projectile> projectiles;
     std::vector<ImpactParticle> impactParticles;  // impact smoke puffs
-    float projectileSpeed    = 50.0f;
+    float projectileSpeed    = 300.0f;
     float projectileLifetime = 3.0f;
     XMFLOAT3 projectileColor = { 1.0f, 1.0f, 1.0f };
     float projectileScale    = 0.1f;
