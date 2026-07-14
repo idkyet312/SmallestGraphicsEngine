@@ -2,6 +2,7 @@
 #define CAMERA_DX12_H
 
 #include <DirectXMath.h>
+#include <algorithm>
 #include <cmath>
 
 using namespace DirectX;
@@ -114,6 +115,14 @@ public:
         Pitch += yoffset;
         if (Pitch > 89.0f) Pitch = 89.0f;
         if (Pitch < -89.0f) Pitch = -89.0f;
+        updateCameraVectors();
+    }
+
+    // Instant angular kick from weapon recoil. Unlike mouse input this is
+    // already expressed in degrees, so sensitivity must not scale it.
+    void ApplyRecoil(float pitchDegrees, float yawDegrees) {
+        Pitch = (std::max)(-89.0f, (std::min)(89.0f, Pitch + pitchDegrees));
+        Yaw += yawDegrees;
         updateCameraVectors();
     }
 

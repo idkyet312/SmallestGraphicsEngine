@@ -71,7 +71,9 @@ static std::shared_ptr<SceneMaterial> floorMaterial;
 // Soft smoke sprite (RGBA, alpha-shaped) for billboard particles, plus the
 // upload heap that must outlive the copy.
 ComPtr<ID3D12Resource> g_smokeTexture;
+ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 static std::vector<ComPtr<ID3D12Resource>> g_smokeUploadHeaps;
+static std::vector<ComPtr<ID3D12Resource>> g_muzzleFlashUploadHeaps;
 static bool                 crateLoadAttempted = false;
 
 static float lastX = SCR_WIDTH / 2.0f;
@@ -155,6 +157,12 @@ static void LoadFloorMudMaterial() {
         g_dx12.device, g_dx12.commandList, g_smokeUploadHeaps);
     if (!g_smokeTexture)
         std::cerr << "Smoke sprite (models/textures/smoke.png) unavailable\n";
+
+    g_muzzleFlashTexture = GLBImporter::LoadTextureFromFile(
+        ResolveTexturePath("models/textures/muzzle_flash.png"),
+        g_dx12.device, g_dx12.commandList, g_muzzleFlashUploadHeaps);
+    if (!g_muzzleFlashTexture)
+        std::cerr << "Muzzle flash (models/textures/muzzle_flash.png) unavailable\n";
 }
 
 // Crysis-style plank wall: the destructible is built from real structural
@@ -1162,6 +1170,14 @@ static bool CreateAllGeometry() {
         {{-0.5f,-0.5f,0},{0,0,1},{0,1}}, {{ 0.5f, 0.5f,0},{0,0,1},{1,0}}, {{-0.5f, 0.5f,0},{0,0,1},{0,0}},
     };
     if (!CreateVertexBuffer(quadVerts, geo.quadVertexBuffer, geo.quadVBV)) return false;
+
+    // OpenGameArt sheet contains four 128x128 frames across one row. Sample the
+    // first cell; additive blending removes its conventional black background.
+    std::vector<VertexPosNormUV> flashVerts = {
+        {{-0.5f,-0.5f,0},{0,0,1},{0.00f,1}}, {{ 0.5f,-0.5f,0},{0,0,1},{0.25f,1}}, {{ 0.5f, 0.5f,0},{0,0,1},{0.25f,0}},
+        {{-0.5f,-0.5f,0},{0,0,1},{0.00f,1}}, {{ 0.5f, 0.5f,0},{0,0,1},{0.25f,0}}, {{-0.5f, 0.5f,0},{0,0,1},{0.00f,0}},
+    };
+    if (!CreateVertexBuffer(flashVerts, geo.flashVertexBuffer, geo.flashVBV)) return false;
     geo.sphereVertexCount = (UINT)sphereVerts.size();
 
     BuildPackedGeometry(cubeVerts, planeVerts, packed);

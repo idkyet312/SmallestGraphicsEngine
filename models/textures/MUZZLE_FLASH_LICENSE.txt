@@ -1,0 +1,6 @@
+Muzzle Flash particle sheet
+Author: leftshoe18
+Source: https://opengameart.org/content/muzzle-flash-particle-sheet
+Asset: https://opengameart.org/sites/default/files/muzzleFlash0_0.png
+License: CC0 1.0 Universal (public domain dedication)
+https://creativecommons.org/publicdomain/zero/1.0/

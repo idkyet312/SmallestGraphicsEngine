@@ -187,6 +187,7 @@ public:
     ComPtr<ID3D12PipelineState> pipelineState;
     ComPtr<ID3D12PipelineState> wireframePipelineState;
     ComPtr<ID3D12PipelineState> transparentPipelineState;
+    ComPtr<ID3D12PipelineState> additivePipelineState;
     // Grass: same root signature, same pixel shader, but a vertex shader that
     // bends the blades in the wind. Null if grass_vs.hlsl failed to compile, in
     // which case the grass simply is not drawn.
@@ -541,6 +542,15 @@ public:
         psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
         hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&transparentPipelineState));
         if (FAILED(hr)) return false;
+
+        // Fire/glow sprites: alpha shapes the source, destination stays visible.
+        // This also makes black pixels in conventional VFX sheets disappear.
+        psoDesc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        psoDesc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+        psoDesc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ZERO;
+        psoDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
+        hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&additivePipelineState));
+        if (FAILED(hr)) return false;
         psoDesc.BlendState.RenderTarget[0].BlendEnable = FALSE;
         psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         
@@ -606,6 +616,11 @@ public:
     void UseTransparent() {
         Use(false);
         if (transparentPipelineState) g_dx12.commandList->SetPipelineState(transparentPipelineState.Get());
+    }
+
+    void UseAdditive() {
+        Use(false);
+        if (additivePipelineState) g_dx12.commandList->SetPipelineState(additivePipelineState.Get());
     }
 
     void BindGlobalResources(ID3D12Resource* shadowMap,
