@@ -831,6 +831,20 @@ public:
         g_dx12.commandList->SetGraphicsRootDescriptorTable(7, gpuHandle);
     }
 
+    // Unlit solid glow for tracers. smokeMode=2 selects the emissive shader path;
+    // UseAdditive() controls how it is composited over the scene.
+    void SetEmissiveMaterial(const XMFLOAT3& color, float opacity) {
+        UINT bufferIndex = GetDrawCallIndex();
+        ObjectBufferDX12 data = {};
+        data.objectColor = color;
+        data.roughness = 1.0f;
+        data.opacity = opacity;
+        data.smokeMode = 2.0f;
+        objectBuffer.CopyData(bufferIndex, data);
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(
+            3, objectBuffer.GetGPUAddress(bufferIndex));
+    }
+
     // Call this after each DrawCube/DrawPlane to advance to the next buffer slot
     void NextDrawCall() {
         currentDrawCall++;

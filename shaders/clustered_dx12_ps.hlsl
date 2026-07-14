@@ -368,6 +368,11 @@ float3 tonemapAgXPunchy(float3 color) {
 }
 
 float4 main(PS_INPUT input) : SV_TARGET {
+    // Solid unlit emissive geometry. Additive PSO turns opacity into glow weight.
+    if (smokeMode > 1.5) {
+        return float4(tonemapAgXPunchy(max(objectColor, 0.0)), opacity);
+    }
+
     // Unlit soft smoke sprite: sample the puff texture, tint by objectColor, and
     // let its alpha (times opacity) shape a soft translucent billboard. Skips all
     // lighting/fog so smoke reads as a light-scattering volume, not a lit surface.

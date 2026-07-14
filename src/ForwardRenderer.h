@@ -548,21 +548,39 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                                                         : XMVectorSet(0, 1, 0, 0);
         XMVECTOR right = XMVector3Normalize(XMVector3Cross(up0, fwd));
         XMVECTOR up    = XMVector3Cross(fwd, right);
+        // Streak covers distance travelled during this rendered frame. Clamp its
+        // exposure length so high refresh rates still show it and frame hitches do
+        // not produce a giant laser beam.
+        const XMVECTOR current = XMLoadFloat3(&p.position);
+        const XMVECTOR previous = XMLoadFloat3(&p.previousPosition);
+        const float moved = XMVectorGetX(XMVector3Length(current - previous));
+        const float len = (std::min)(5.0f, (std::max)(1.2f, moved));
+        const XMVECTOR center = current - fwd * (len * 0.5f);
+
         XMMATRIX basis = XMMatrixIdentity();
         basis.r[0] = XMVectorSetW(right, 0.0f);
         basis.r[1] = XMVectorSetW(up, 0.0f);
         basis.r[2] = XMVectorSetW(fwd, 0.0f);
-        basis.r[3] = XMVectorSet(p.position.x, p.position.y, p.position.z, 1.0f);
+        basis.r[3] = XMVectorSetW(center, 1.0f);
 
-        const float r = scene.projectileScale * 0.28f;   // slim tracer
-        const float len = scene.projectileScale * 6.0f;  // long streak
-        model = XMMatrixScaling(r * 2.0f, r * 2.0f, len) * basis;
+        // Warm translucent envelope first, then a needle-thin white-hot core.
+        // Additive unlit passes stay bright in shadow and stop looking like an
+        // orange physical box tumbling through the scene.
+        const float haloR = (std::max)(0.012f, scene.projectileScale * 0.16f);
+        shader.UseAdditive();
+        model = XMMatrixScaling(haloR * 2.0f, haloR * 2.0f, len) * basis;
         shader.SetMatrices(model, view, proj, lightSpace);
-        // Hot tracer glow (bright, low-roughness so it reads as emissive-ish).
-        shader.SetObjectMaterial(XMFLOAT3(3.0f, 1.4f, 0.35f), false, false,
-                                 0.0f, 0.9f, nullptr, nullptr, nullptr);
+        shader.SetEmissiveMaterial(XMFLOAT3(4.0f, 0.55f, 0.025f), 0.24f);
         DrawCube(geo);
         shader.NextDrawCall();
+
+        const float coreR = haloR * 0.38f;
+        model = XMMatrixScaling(coreR * 2.0f, coreR * 2.0f, len * 0.92f) * basis;
+        shader.SetMatrices(model, view, proj, lightSpace);
+        shader.SetEmissiveMaterial(XMFLOAT3(9.0f, 3.2f, 0.45f), 0.92f);
+        DrawCube(geo);
+        shader.NextDrawCall();
+        shader.Use(scene.wireframeMode);
     }
 
     // Impact particles. Sparks: opaque bright cubes (hot debris shards). Smoke:
