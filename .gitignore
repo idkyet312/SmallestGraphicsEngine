@@ -25,7 +25,12 @@ build/
 *.pdb
 *.exp
 
-models/
+!models/
+models/*
+!models/textures/
+models/textures/*
+!models/textures/muzzle_flash.png
+!models/textures/MUZZLE_FLASH_LICENSE.txt
 
 # CMake
 CMakeCache.txt

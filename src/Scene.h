@@ -118,6 +118,12 @@ struct Scene {
     bool  autoFire           = true;    // hold mouse to keep firing
     float fireInterval       = 0.1f;    // seconds between auto-fire shots
     float fireCooldown       = 0.0f;    // time left before next shot may fire
+    float muzzleFlashTime    = 0.0f;    // short enough to read as one-frame light
+    float muzzleFlashDuration = 0.055f;
+    float gunRecoilBack      = 0.0f;    // viewmodel translation, local metres
+    float gunRecoilKick      = 0.0f;    // viewmodel pitch, degrees
+    float recoilPitch        = 0.55f;   // camera climb per shot, degrees
+    float recoilYaw          = 0.22f;   // random horizontal camera kick
 
     // Grenade (press G): lobbed, arcs under gravity, radial blast on fuse.
     float grenadeThrowSpeed    = 16.0f;  // launch speed along aim
@@ -212,6 +218,12 @@ struct Scene {
 
     void Update(float dt, float currentTime) {
         camera.Update(dt);
+
+        muzzleFlashTime = (std::max)(0.0f, muzzleFlashTime - dt);
+        // Sharp impulse, quick mechanical return. Camera aim stays displaced,
+        // so automatic fire climbs unless the player actively compensates.
+        gunRecoilBack = (std::max)(0.0f, gunRecoilBack - 1.45f * dt);
+        gunRecoilKick = (std::max)(0.0f, gunRecoilKick - 95.0f * dt);
 
         // Animate demo lights
         if (animateDemoLights) {
@@ -338,8 +350,14 @@ struct Scene {
     }
 
     void ShootProjectile() {
+        const float randomYaw = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) * recoilYaw;
+        camera.ApplyRecoil(recoilPitch, randomYaw);
+        gunRecoilBack = (std::min)(0.12f, gunRecoilBack + 0.075f);
+        gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 4.2f);
+        muzzleFlashTime = muzzleFlashDuration;
+
         Projectile p;
-        p.position  = camera.Position;
+        p.position  = GetMuzzleWorldPosition();
         p.previousPosition = p.position;
         p.direction = camera.Front;
         p.speed     = projectileSpeed;
@@ -412,9 +430,9 @@ struct Scene {
         // True camera up, perpendicular to both: this is what tilts with pitch.
         const XMVECTOR camUp = XMVector3Normalize(XMVector3Cross(camFront, camRight));
 
-        const XMVECTOR gp = camPos + camFront * gun.offset.z
+        const XMVECTOR gp = camPos + camFront * (gun.offset.z - gunRecoilBack)
                                    + camRight * gun.offset.x
-                                   + camUp    * gun.offset.y;
+                                   + camUp    * (gun.offset.y + gunRecoilBack * 0.18f);
 
         // Orthonormal basis: rows right/up/front, translation at the gun spot.
         XMMATRIX basis = XMMatrixIdentity();
@@ -422,7 +440,15 @@ struct Scene {
         basis.r[1] = XMVectorSetW(camUp, 0.0f);
         basis.r[2] = XMVectorSetW(camFront, 0.0f);
         basis.r[3] = XMVectorSetW(gp, 1.0f);
-        return basis;
+        return XMMatrixRotationX(XMConvertToRadians(-gunRecoilKick)) * basis;
+    }
+
+    XMFLOAT3 GetMuzzleWorldPosition() const {
+        const float S = GunModelScale();
+        const XMVECTOR local = XMVectorSet(0.0f, 0.01f * S, 0.83f * S, 1.0f);
+        XMFLOAT3 result;
+        XMStoreFloat3(&result, XMVector3TransformCoord(local, GetGunBaseMatrix()));
+        return result;
     }
 
     // Overall size of the M4 view model (local units before the base transform).

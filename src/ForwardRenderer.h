@@ -26,16 +26,19 @@ extern bool g_showH2Model;
 extern WaterVolume g_water;
 extern WaterVolume g_ocean;   // sea ringing the island
 extern ComPtr<ID3D12Resource> g_smokeTexture;   // soft smoke sprite for billboards
+extern ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 
 struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
     ComPtr<ID3D12Resource>   planeVertexBuffer;
     ComPtr<ID3D12Resource>   sphereVertexBuffer;
     ComPtr<ID3D12Resource>   quadVertexBuffer;      // unit XY billboard quad
+    ComPtr<ID3D12Resource>   flashVertexBuffer;     // first cell of 4-frame VFX sheet
     D3D12_VERTEX_BUFFER_VIEW cubeVBV  = {};
     D3D12_VERTEX_BUFFER_VIEW planeVBV = {};
     D3D12_VERTEX_BUFFER_VIEW sphereVBV = {};
     D3D12_VERTEX_BUFFER_VIEW quadVBV = {};
+    D3D12_VERTEX_BUFFER_VIEW flashVBV = {};
     UINT                     sphereVertexCount = 0;
 };
 
@@ -91,6 +94,12 @@ inline void DrawPlane(const GeometryBuffers& geo) {
 // A unit quad in the XY plane (-0.5..0.5, UV 0..1), for camera-facing billboards.
 inline void DrawQuad(const GeometryBuffers& geo) {
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.quadVBV);
+    g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_dx12.commandList->DrawInstanced(6, 1, 0, 0);
+}
+
+inline void DrawFlashQuad(const GeometryBuffers& geo) {
+    g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.flashVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_dx12.commandList->DrawInstanced(6, 1, 0, 0);
 }
@@ -267,6 +276,14 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     scene.clusteredRenderer.cullLights();
 
     auto lightData = scene.clusteredRenderer.getPointLightData();
+    if (scene.muzzleFlashTime > 0.0f && lightData.size() < 64) {
+        PointLightDataDX12 flashLight = {};
+        flashLight.position = scene.GetMuzzleWorldPosition();
+        flashLight.radius = 4.5f;
+        flashLight.color = XMFLOAT3(1.0f, 0.42f, 0.08f);
+        flashLight.intensity = 13.0f * (scene.muzzleFlashTime / scene.muzzleFlashDuration);
+        lightData.push_back(flashLight);
+    }
     shader.SetPointLights((int)lightData.size(), lightData);
     shader.SetDDGI(scene.useDDGI, scene.giIntensity, scene.normalBias, scene.probeSpacing);
     shader.SetSH();
@@ -664,6 +681,25 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 DrawCube(geo);
                 shader.NextDrawCall();
             }
+        }
+
+
+        // Downloaded CC0 muzzle-flash sheet. One random-looking star frame is
+        // enough because real rifle flashes last only a few milliseconds.
+        if (scene.muzzleFlashTime > 0.0f && g_muzzleFlashTexture) {
+            const XMFLOAT3 muzzle = scene.GetMuzzleWorldPosition();
+            const float fade = scene.muzzleFlashTime / scene.muzzleFlashDuration;
+            const float size = scene.GunModelScale() * (0.32f + 0.10f * fade);
+            const XMVECTOR pos = XMVectorSet(muzzle.x, muzzle.y, muzzle.z, 1.0f);
+            model = XMMATRIX(camRight * size, camUp * size, camFwd * size,
+                             XMVectorSetW(pos, 1.0f));
+            shader.UseAdditive();
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetSmokeMaterial(XMFLOAT3(1.0f, 0.34f, 0.035f), fade,
+                                    g_muzzleFlashTexture.Get());
+            DrawFlashQuad(geo);
+            shader.NextDrawCall();
+            shader.Use(scene.wireframeMode);
         }
     }
 
