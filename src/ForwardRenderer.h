@@ -383,8 +383,13 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             const D3D12_INDEX_BUFFER_VIEW& gibv = g_grass.GetIBV();
 
             shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
-            // Untextured: a flat green with a matte response.
-            shader.SetObjectMaterial(XMFLOAT3(0.20f, 0.42f, 0.13f), false, false,
+            // The blades are untextured, so this colour goes into the lighting
+            // as-is -- i.e. it is already LINEAR. The ground beneath them samples
+            // Grass004's albedo and decodes it with pow(x, 2.2) first, so matching
+            // the two by eye in sRGB is what left the blades looking pale and
+            // yellow against the turf. This is that texture's mean colour taken
+            // through the same decode: sRGB (96, 108, 48) -> linear.
+            shader.SetObjectMaterial(XMFLOAT3(0.117f, 0.152f, 0.025f), false, false,
                                      0.0f, 0.85f, nullptr, nullptr, nullptr);
 
             // Wind parameters as root constants (b6), and the per-blade data as a
