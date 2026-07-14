@@ -116,27 +116,37 @@ static std::vector<unsigned char> PinkMissingTexture(int size) {
 // missing-texture placeholder.
 static void LoadFloorMudMaterial() {
     floorMaterial = std::make_shared<SceneMaterial>();
-    floorMaterial->name = "sand_02";
+    floorMaterial->name = "grass_004";
     floorMaterial->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
     floorMaterial->metallicFactor = 0.0f;
     floorMaterial->roughnessFactor = 1.0f;
 
+    // Grass ground (ambientCG Grass004). The blades from GrassField stand ON this,
+    // so the ground reads as turf between the tufts instead of bare dirt showing
+    // through. NormalDX, not NormalGL: the GL variant has its green channel
+    // inverted for OpenGL's Y-up tangent space, and using it here would light
+    // every bump from the wrong side.
+    const std::string dir = "models/grass/Grass004_2K-PNG/";
     floorMaterial->baseColorTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("models/textures/sand_02_diff_2k.jpg"),
+        ResolveTexturePath((dir + "Grass004_2K-PNG_Color.png").c_str()),
         g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
     floorMaterial->normalTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("models/textures/sand_02_nor_gl_2k.jpg"),
+        ResolveTexturePath((dir + "Grass004_2K-PNG_NormalDX.png").c_str()),
         g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
     floorMaterial->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("models/textures/sand_02_rough_2k.jpg"),
+        ResolveTexturePath((dir + "Grass004_2K-PNG_Roughness.png").c_str()),
         g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
+    // A standalone roughness map, not a packed glTF metal/rough one -- the shader
+    // needs telling, or it would read roughness out of the green channel of a
+    // texture that has roughness in all three.
+    floorMaterial->roughnessOnlyTexture = floorMaterial->metallicRoughnessTexture != nullptr;
 
     if (!floorMaterial->baseColorTexture) {
         const auto missing = PinkMissingTexture(256);
         floorMaterial->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
             g_dx12.device.Get(), g_dx12.commandList.Get(), missing, 256, 256, floorMaterial->uploadHeaps);
         floorMaterial->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
-        std::cerr << "Sand ground texture unavailable; using pink missing texture\n";
+        std::cerr << "Grass ground texture unavailable; using pink missing texture\n";
     }
 
     // Soft smoke sprite for particle billboards.
