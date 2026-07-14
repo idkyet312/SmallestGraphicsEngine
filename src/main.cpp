@@ -57,6 +57,7 @@ WaterVolume                 g_ocean;   // sea ringing the island, surface at y =
 RopeSwing                   g_rope;
 RopeSwing                   g_gibbet;
 PalmTrees                   g_trees;
+GrassField                  g_grass;
 static SkyRendererDX12      skyRenderer;
 static OcclusionDepthDX12   occlusionDepth;
 static VisibilityBufferDX12 visBuffer;
@@ -1580,6 +1581,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_rope.Update(deltaTime);
         g_gibbet.Update(deltaTime);
         g_trees.Update(deltaTime);
+        g_grass.Update(deltaTime);
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.Update(deltaTime);
             // Smoke at the actual fracture points where pieces broke loose.
@@ -1762,6 +1764,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     { -12.5f, -11.0f, 6.6f, -0.3f },
                 };
                 for (const PalmSpot& p : palms) g_trees.Plant(p.x, p.z, p.h, p.lean);
+
+                // Grass across the island, keyed off the same terrain height the
+                // ground is drawn from. Blades that would land in the sea, on the
+                // wet sand, or on a cliff face are rejected at build time, so the
+                // count below is an upper bound rather than the number planted.
+                // Blade budget over the island, clumped into tufts by GrassField.
+                // Only blades within GrassField's draw radius are simulated and
+                // drawn each frame, so this number sets the field's DENSITY -- how
+                // thick the grass is around the player -- rather than the per-frame
+                // cost, which the radius governs.
+                g_grass.Initialize(terrainSampler, 100.0f, 400000, 0.0f);
             }
             // Same pool AABB for the destruction sim so house debris shoved into
             // the water floats too (surface at max.y).

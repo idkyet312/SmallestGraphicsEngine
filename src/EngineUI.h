@@ -6,6 +6,7 @@
 #include "VisibilityBufferDX12.h"
 #include "DestructionDX12.h"
 #include "VirtualInput.h"
+#include "GrassField.h"
 
 // Forward declare raytracing context
 struct RaytracingContext;
@@ -86,6 +87,13 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     RenderMovementPad();
 
     ImGui::Begin("Scene Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
+    // Frame cost, front and centre: the CPU-side systems here (water waves, grass
+    // wind) are easy to scale past what the frame can pay for, and without a
+    // number on screen that only shows up as a vague feeling of sluggishness.
+    ImGui::Text("%.1f FPS  (%.2f ms)", ImGui::GetIO().Framerate,
+                1000.0f / ImGui::GetIO().Framerate);
+    ImGui::Separator();
 
     ImGui::Checkbox("Show Movement Pad", &virtualInput.showPad);
     ImGui::Separator();
@@ -236,6 +244,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat3("Rot##gun",  &scene.gun.rotation.x,  1.0f);
         ImGui::Checkbox("Auto Fire", &scene.autoFire);
         ImGui::DragFloat("Fire Interval", &scene.fireInterval, 0.005f, 0.02f, 1.0f, "%.3f s");
+    }
+
+    // -- Grass / wind --
+    if (g_grass.IsInitialized() && ImGui::CollapsingHeader("Grass & Wind")) {
+        ImGui::DragFloat("Wind Strength", &g_grass.WindStrength(), 0.01f, 0.0f, 1.0f);
+        ImGui::DragFloat("Wind Speed",    &g_grass.WindSpeed(),    0.05f, 0.0f, 6.0f);
     }
 
     if (ImGui::CollapsingHeader("Destruction", ImGuiTreeNodeFlags_DefaultOpen)) {

@@ -17,6 +17,7 @@
 #include "PalmTrees.h"
 #include "PalmModel.h"
 #include "GunModel.h"
+#include "GrassField.h"
 
 extern MeshShaderDX12 g_meshShader;
 extern bool g_useMeshShader;
@@ -352,6 +353,32 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
         // A palm slice draw may have left a non-cube pipeline bound.
         shader.Use(scene.wireframeMode);
+    }
+
+    // Grass. One indexed draw for the whole field: the blades are rebuilt into a
+    // per-frame upload buffer with this frame's wind already applied, so they are
+    // world-space geometry and go up with an identity model matrix. Opaque, so it
+    // must land before the transparent water below or it would be sorted wrong.
+    if (g_grass.IsInitialized()) {
+        // Only blades near the camera are simulated and drawn, so the field needs
+        // to know where the viewer is before it rebuilds itself.
+        g_grass.SetViewer(scene.camera.Position);
+        const D3D12_VERTEX_BUFFER_VIEW& gvbv = g_grass.UpdateAndGetVBV(g_dx12.frameIndex);
+        const UINT grassIndices = g_grass.GetIndexCount();
+        if (grassIndices && gvbv.BufferLocation) {
+            const D3D12_INDEX_BUFFER_VIEW& gibv = g_grass.GetIBV();
+            shader.Use(scene.wireframeMode);
+            shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
+            // No grass texture: the blade's own vertex colour gradient does the
+            // shaping, so this is a flat green with a matte response.
+            shader.SetObjectMaterial(XMFLOAT3(0.20f, 0.42f, 0.13f), false, false,
+                                     0.0f, 0.85f, nullptr, nullptr, nullptr);
+            g_dx12.commandList->IASetVertexBuffers(0, 1, &gvbv);
+            g_dx12.commandList->IASetIndexBuffer(&gibv);
+            g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_dx12.commandList->DrawIndexedInstanced(grassIndices, 1, 0, 0, 0);
+            shader.NextDrawCall();
+        }
     }
 
     // Rope-hung block: each rope link and the block are just boxes driven by the
