@@ -1164,6 +1164,9 @@ static bool CreateAllGeometry() {
     std::vector<VertexPosNormUV> sphereVerts = BuildSphereVertices();
     if (!CreateVertexBuffer(sphereVerts, geo.sphereVertexBuffer, geo.sphereVBV)) return false;
 
+    std::vector<VertexPosNormUV> capsuleVerts = BuildCapsuleVertices();
+    if (!CreateVertexBuffer(capsuleVerts, geo.capsuleVertexBuffer, geo.capsuleVBV)) return false;
+
     // Unit XY quad (-0.5..0.5) with UV 0..1 for camera-facing smoke billboards.
     std::vector<VertexPosNormUV> quadVerts = {
         {{-0.5f,-0.5f,0},{0,0,1},{0,1}}, {{ 0.5f,-0.5f,0},{0,0,1},{1,1}}, {{ 0.5f, 0.5f,0},{0,0,1},{1,0}},
@@ -1179,6 +1182,7 @@ static bool CreateAllGeometry() {
     };
     if (!CreateVertexBuffer(flashVerts, geo.flashVertexBuffer, geo.flashVBV)) return false;
     geo.sphereVertexCount = (UINT)sphereVerts.size();
+    geo.capsuleVertexCount = (UINT)capsuleVerts.size();
 
     BuildPackedGeometry(cubeVerts, planeVerts, packed);
     return true;
@@ -1249,12 +1253,13 @@ static void ProcessInput(HWND) {
     ApplyVirtualInput();
 
     if (cameraLocked || (showUI && ImGui::GetIO().WantCaptureKeyboard)) return;
-    if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime);
-    if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime);
-    if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime);
-    if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime);
+    const float sprintMultiplier =
+        (scene.camera.FPSMode && (GetAsyncKeyState(VK_SHIFT) & 0x8000)) ? 2.0f : 1.0f;
+    if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, sprintMultiplier);
+    if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, sprintMultiplier);
+    if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, sprintMultiplier);
+    if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, sprintMultiplier);
     if (GetAsyncKeyState(VK_SPACE) & 0x8000) scene.camera.ProcessKeyboard(' ', deltaTime);
-    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) scene.camera.ProcessKeyboard('Q', deltaTime);
 
     // Auto-fire: while the mouse is held (and not interacting with the UI),
     // keep shooting on a fixed interval instead of one shot per click.
@@ -1485,6 +1490,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         scene.useMeshTerrain = false;
         std::cerr << "Mesh shader terrain unavailable; keeping flat floor\n";
     }
+    scene.grenadeGroundHeight = [](float x, float z) {
+        if (!scene.useMeshTerrain || !g_terrain.supported) return 0.0f;
+        TerrainRendererDX12::Params params;
+        params.heightScale = scene.terrainHeightScale;
+        return TerrainRendererDX12::HeightAt(params, x, z);
+    };
 
     // Mip generator (compute shader) for imported GLB textures
     if (!g_mipGen.Init()) {
@@ -1606,10 +1617,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_ocean.Update(deltaTime);
         g_rope.Update(deltaTime);
         g_gibbet.Update(deltaTime);
+        g_trees.SetWind(g_grass.WindStrength(), g_grass.WindSpeed());
         g_trees.Update(deltaTime);
         g_grass.Update(deltaTime);
         if (scene.useDestruction && g_destruction.IsInitialized()) {
+            g_destruction.SetEnemyTarget(scene.camera.Position);
             g_destruction.Update(deltaTime);
+            for (const EnemyShot& shot : g_destruction.DrainEnemyShots())
+                scene.SpawnHostileProjectile(shot.origin, shot.direction);
             // Smoke at the actual fracture points where pieces broke loose.
             for (const XMFLOAT3& bp : g_destruction.DrainBreakPoints())
                 scene.SpawnSmokeBurst(bp, 0.5f, 0.4f);
@@ -1696,6 +1711,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(gibHit, normal);
                     scene.SpawnSmokeBurst(gibHit, 0.2f, 0.08f);
+                    projectile.active = false;
+                } else if (XMFLOAT3 waterHit;
+                           g_water.ShootSurface(projectile.previousPosition,
+                                                projectile.position, waterHit)) {
+                    projectile.position = waterHit;
+                    projectile.active = false;
+                } else if (XMFLOAT3 oceanHit;
+                           g_ocean.ShootSurface(projectile.previousPosition,
+                                                projectile.position, oceanHit, 0.28f)) {
+                    projectile.position = oceanHit;
                     projectile.active = false;
                 }
             }
@@ -1878,6 +1903,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+        RenderPlayerHUD(scene);
         if (showUI) RenderUI(scene, visBuffer);
         DrawDestructionDebug(scene);
         ImGui::Render();

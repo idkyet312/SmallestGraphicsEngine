@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cmath>
+#include <functional>
 
 using namespace DirectX;
 
@@ -36,6 +37,7 @@ struct Projectile {
     float    speed;
     float    lifetime;
     bool     active;
+    bool     hostile = false;
     // Grenade: arcs under gravity and detonates (radial blast) on fuse timeout
     // or first impact. Regular bullets leave these at defaults.
     bool     grenade = false;
@@ -124,6 +126,9 @@ struct Scene {
     float gunRecoilKick      = 0.0f;    // viewmodel pitch, degrees
     float recoilPitch        = 0.55f;   // camera climb per shot, degrees
     float recoilYaw          = 0.22f;   // random horizontal camera kick
+    float playerMaxHealth    = 100.0f;
+    float playerHealth       = 100.0f;
+    float playerDamageFlash  = 0.0f;
 
     // Grenade (press G): lobbed, arcs under gravity, radial blast on fuse.
     float grenadeThrowSpeed    = 16.0f;  // launch speed along aim
@@ -135,6 +140,9 @@ struct Scene {
     float grenadeDamage        = 1.5f;   // per-bond damage in the blast
     float grenadeImpulse       = 120.0f; // shove imparted to loosened pieces
     float grenadeCooldown      = 0.0f;   // input debounce
+    // Returns rendered ground height at world XZ. Installed by main so Scene
+    // does not depend on terrain renderer implementation.
+    std::function<float(float, float)> grenadeGroundHeight;
 
     // NVIDIA Blast + Box3D destructible house
     bool  useDestruction = true;
@@ -216,10 +224,22 @@ struct Scene {
         }
     }
 
+    void DamagePlayer(float damage) {
+        if (damage <= 0.0f || playerHealth <= 0.0f) return;
+        playerHealth = (std::max)(0.0f, playerHealth - damage);
+        playerDamageFlash = 0.22f;
+    }
+
+    void RestorePlayerHealth() {
+        playerHealth = playerMaxHealth;
+        playerDamageFlash = 0.0f;
+    }
+
     void Update(float dt, float currentTime) {
         camera.Update(dt);
 
         muzzleFlashTime = (std::max)(0.0f, muzzleFlashTime - dt);
+        playerDamageFlash = (std::max)(0.0f, playerDamageFlash - dt);
         // Sharp impulse, quick mechanical return. Camera aim stays displaced,
         // so automatic fire climbs unless the player actively compensates.
         gunRecoilBack = (std::max)(0.0f, gunRecoilBack - 1.45f * dt);
@@ -257,9 +277,12 @@ struct Scene {
                 p.position.x += p.velocity.x * dt;
                 p.position.y += p.velocity.y * dt;
                 p.position.z += p.velocity.z * dt;
-                if (p.position.y < grenadeGroundY) {
-                    p.position.y = grenadeGroundY;
-                    p.velocity.y = -p.velocity.y * 0.4f;      // bounce
+                const float surfaceY = grenadeGroundHeight
+                    ? grenadeGroundHeight(p.position.x, p.position.z) : 0.0f;
+                const float bounceY = surfaceY + grenadeGroundY;
+                if (p.position.y < bounceY) {
+                    p.position.y = bounceY;
+                    if (p.velocity.y < 0.0f) p.velocity.y = -p.velocity.y * 0.4f;
                     p.velocity.x *= 0.7f; p.velocity.z *= 0.7f; // friction
                 }
                 p.fuse -= dt;
@@ -270,6 +293,25 @@ struct Scene {
                 p.position.z += p.direction.z * p.speed * dt;
                 p.lifetime -= dt;
                 if (p.lifetime <= 0.0f) p.active = false;
+
+                // Hostile rounds use a swept point-to-segment test against the
+                // player's chest, so fast bullets cannot tunnel through them.
+                if (p.hostile && p.active) {
+                    const XMVECTOR a = XMLoadFloat3(&p.previousPosition);
+                    const XMVECTOR b = XMLoadFloat3(&p.position);
+                    const XMVECTOR chest = XMLoadFloat3(&camera.Position) +
+                        XMVectorSet(0.0f, -0.35f, 0.0f, 0.0f);
+                    const XMVECTOR ab = b - a;
+                    const float denom = XMVectorGetX(XMVector3LengthSq(ab));
+                    float t = denom > 1e-6f
+                        ? XMVectorGetX(XMVector3Dot(chest - a, ab)) / denom : 0.0f;
+                    t = (std::max)(0.0f, (std::min)(1.0f, t));
+                    const float d2 = XMVectorGetX(XMVector3LengthSq(chest - (a + ab * t)));
+                    if (d2 < 0.45f * 0.45f) {
+                        DamagePlayer(12.0f);
+                        p.active = false;
+                    }
+                }
             }
         }
         // Keep detonating grenades for one more frame so the game loop can read
@@ -441,6 +483,17 @@ struct Scene {
         basis.r[2] = XMVectorSetW(camFront, 0.0f);
         basis.r[3] = XMVectorSetW(gp, 1.0f);
         return XMMatrixRotationX(XMConvertToRadians(-gunRecoilKick)) * basis;
+    }
+
+    void SpawnHostileProjectile(const XMFLOAT3& origin, const XMFLOAT3& direction) {
+        Projectile p = {};
+        p.position = p.previousPosition = origin;
+        p.direction = direction;
+        p.speed = projectileSpeed;
+        p.lifetime = projectileLifetime;
+        p.active = true;
+        p.hostile = true;
+        projectiles.push_back(p);
     }
 
     XMFLOAT3 GetMuzzleWorldPosition() const {

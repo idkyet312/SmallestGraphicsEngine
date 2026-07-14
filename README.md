@@ -1,212 +1,194 @@
-# Clustered Forward Rendering Engine with DDGI
+# Smallest Graphics Engine
 
-A DirectX 12 graphics engine featuring clustered forward rendering, Dynamic Diffuse Global Illumination (DDGI), and FPS gameplay mechanics.
+Experimental Windows graphics and physics sandbox built around DirectX 12. The current demo combines multiple rendering paths, destructible structures, rigid-body gameplay, procedural terrain, vegetation, and water in one first-person scene.
 
-## Features
-- **Clustered Forward Rendering**: Efficient lighting with up to 64 lights
-- **Dynamic Diffuse Global Illumination (DDGI)**: Real-time indirect lighting
-- **DirectX 12 Renderer**: Modern graphics API with compute shader support
-- **FPS Camera System**: Mouse-locked first-person controls
-- **Interactive Shooting**: Target practice with damage system
-- **Light Placement**: Dynamically add and move lights with gizmos
-- **Gun Model**: Attached FPS weapon that follows camera rotation
-- **ImGui Interface**: Real-time parameter editing
-- **Uncapped Frame Rate**: High-performance rendering
+DirectX 12 is the primary path. A smaller legacy DirectX 11 target remains available through CMake.
 
-## Project Structure
-```
-SmallestGraphicsEngine/
-├── src/                          # Source code directory
-│   ├── main.cpp                  # Main DX12 application (the entry point that is built)
-│   ├── main_dx12_legacy.cpp      # Superseded DX12 path, not built
-│   ├── main_dx11.cpp             # Legacy DX11 version
-│   ├── DX12Core.h                # DirectX 12 initialization and device management
-│   ├── DX11Core.h                # DirectX 11 core (legacy)
-│   ├── CameraDX12.h              # FPS camera with mouse lock
-│   ├── ShaderDX12.h              # DX12 shader compilation and root signatures
-│   ├── ShaderDX11.h              # DX11 shader wrapper (legacy)
-│   ├── Shader.h                  # Shared shader utilities
-│   ├── ClusteredRendererDX12.h   # Clustered forward rendering implementation
-│   ├── ClusteredRendererDX11.h   # DX11 clustered renderer (legacy)
-│   ├── ClusteredRenderer.h       # Shared clustered renderer interface
-│   ├── DDGI_DX11.h               # Dynamic Diffuse Global Illumination
-│   ├── Model.h                   # OBJ model loader
-│   └── ModelDX11.h               # DX11 model renderer
-├── shaders/                      # HLSL shader files
-│   ├── clustered_dx12_vs.hlsl    # DX12 clustered vertex shader
-│   ├── clustered_dx12_ps.hlsl    # DX12 clustered pixel shader with DDGI
-│   ├── clustered_vs.hlsl         # DX11 clustered vertex shader
-│   ├── clustered_ps.hlsl         # DX11 clustered pixel shader
-│   ├── depth_vs.hlsl             # Depth pass vertex shader
-│   ├── depth_ps.hlsl             # Depth pass pixel shader
-│   ├── debug_depth_vs.hlsl       # Debug visualization shaders
-│   └── debug_depth_ps.hlsl
-├── models/                       # 3D model assets
-│   └── gun.obj                   # FPS gun model
-├── build/                        # Build output directory
-├── GraphicEngine.sln             # Visual Studio solution file
-├── GraphicEngine.vcxproj         # Visual Studio project file
-├── GraphicEngine.vcxproj.filters # VS project filters (folder organization)
-├── CMakeLists.txt                # CMake build configuration (DX11/DX12 option)
-├── build.ps1                     # Build script
-├── build_and_run.ps1             # Full build and run script
-├── quick_build.ps1               # Fast rebuild for code changes
-└── README.md                     # This file
-```
+## Highlights
+
+### Rendering
+
+- Clustered forward rendering with up to 64 dynamic point lights
+- Dynamic Diffuse Global Illumination (DDGI) probe updates
+- Directional shadow mapping
+- Optional visibility-buffer/deferred path
+- Optional DirectX Raytracing (DXR) path on supported hardware
+- Mesh and amplification shader paths with raster fallbacks
+- Meshlet generation through meshoptimizer
+- Previous-frame depth occlusion for mesh shaders
+- Procedural mesh-shader terrain
+- HDR environment sky and image-based ambient lighting
+- AgX/ACES-style tone mapping
+- GPU mip generation
+- Runtime renderer and debug controls through ImGui
+
+### Scene and gameplay
+
+- First-person camera, sprinting, shooting, automatic fire, and grenades
+- NVIDIA Blast structure destruction with connected chunks and support chunks
+- Box2D-based debris, ragdolls, ropes, floating objects, and collision
+- Destructible palm trees and shootable ropes
+- Terrain-aware destruction and physics
+- Pool and ocean surfaces with waves, splashes, and buoyancy
+- Dense procedural grass with distance culling and wind
+- Projectile, impact-particle, smoke, muzzle-flash, and enemy-shot effects
+- GLB/glTF and FBX import
+- Procedural fallback textures for missing house materials
 
 ## Controls
-- **WASD**: Move camera (continuous movement, no jump)
-- **Mouse**: Look around (locked to screen, resets to center)
-- **Left Mouse Button**: Shoot (damages center cube)
-- **L**: Place a new light at camera position
-- **Arrow Keys**: Move selected light (Up/Down/Left/Right)
-- **TAB**: Toggle ImGui UI
-- **ESC**: Exit application
 
-## Gameplay Features
-- **FPS Gun**: First-person weapon attached to camera with realistic offset
-- **Shooting System**: Left-click to shoot bullets that damage the center cube
-- **Damage System**: Center cube has 100 health, turns red when hit, shows health in UI
-- **Light Placement**: Press L to spawn lights, use arrow keys to move them with visual gizmos
-- **64 Dynamic Lights**: Supports up to 64 lights with clustered forward rendering
+| Input | Action |
+|---|---|
+| `W`, `A`, `S`, `D` | Move |
+| Mouse | Look |
+| `Shift` | Sprint in FPS walking mode |
+| `Space` | Move upward or jump, depending on camera mode |
+| Left mouse | Capture mouse or fire weapon |
+| `G` | Throw grenade |
+| `Tab` | Toggle UI and mouse capture |
+| `C` | Release mouse |
+| `F` | Toggle FPS walking mode |
+| `Z` | Toggle meshlet wireframe |
+| `F11` | Toggle fullscreen |
+| `Esc` | Exit |
 
-## ImGui Features
-The UI allows you to edit in real-time:
-- **Camera Settings**: Position, rotation, FOV, movement speed, mouse sensitivity
-- **Light Management**: Add/remove lights, adjust positions, colors, and intensities
-- **Cube Health**: View and reset target cube health
-- **Gun Settings**: Toggle visibility, adjust offset and scale
-- **DDGI Settings**: Global illumination intensity and parameters
-- **Rendering Stats**: FPS counter (uncapped frame rate)
-- **Scene Settings**: Background color, floor properties
+Rendering modes, lighting, DDGI, shadows, terrain, grass, weapon behavior, destruction debug drawing, and camera settings can be changed in the ImGui scene-controls window.
 
-## Prerequisites
+## Requirements
 
-### Windows Requirements
-- **Windows 10** or later (DirectX 12 support required)
-- **DirectX 12 compatible GPU** (NVIDIA GTX 900 series or newer, AMD GCN architecture or newer)
-- **Visual Studio 2019/2022** with:
-  - Desktop development with C++
-  - C++ CMake tools for Windows
-  - Windows 10 SDK
+- Windows 10 or later
+- 64-bit DirectX 12-capable GPU and current driver
+- Visual Studio 2022 with **Desktop development with C++**
+- CMake 3.22 or later
+- Windows SDK
+- vcpkg
+- Optional: `dxc` in `PATH` for Shader Model 6.5 mesh/amplification shaders
+- Optional: DXR-capable GPU for raytracing mode
 
-### vcpkg Setup
-1. Install [vcpkg](https://github.com/microsoft/vcpkg):
-   ```powershell
-   git clone https://github.com/Microsoft/vcpkg.git
-   cd vcpkg
-   .\bootstrap-vcpkg.bat
-   .\vcpkg integrate install
-   ```
+The DX12 build uses these vcpkg packages:
 
-2. Install dependencies:
-   ```powershell
-   # For DirectX 12 (default)
-   .\vcpkg install imgui[core,dx12-binding,win32-binding]:x64-windows
-   
-   # For DirectX 11 (legacy)
-   .\vcpkg install imgui[core,dx11-binding,win32-binding]:x64-windows
-   ```
-
-## Building
-
-### Quick Start (PowerShell Scripts)
-
-**Full build and run (DirectX 12):**
 ```powershell
-.\build_and_run.ps1
+vcpkg install `
+  imgui[core,dx12-binding,win32-binding]:x64-windows `
+  meshoptimizer:x64-windows `
+  tinyexr:x64-windows `
+  assimp:x64-windows `
+  tinygltf:x64-windows
 ```
 
-**Quick rebuild (after code changes):**
+Box2D is fetched by CMake. NVIDIA Blast source is vendored under `thirdparty/blast/`.
+
+## Build and run
+
+Set `VCPKG_ROOT`, then configure and build from PowerShell:
+
 ```powershell
-.\quick_build.ps1
+cmake -S . -B build `
+  -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+  -DUSE_DX12=ON
+
+cmake --build build --config Release
+./build/GraphicEngine.exe
 ```
 
-### Option 1: Using build.ps1 (Easiest)
-```powershell
-# Build with DirectX 12 (default)
-.\build.ps1
+Convenience scripts:
 
-# Build with DirectX 11 (legacy)
-.\build.ps1 -UseDX11
+```powershell
+./build_and_run.ps1   # configure, build, run
+./quick_build.ps1     # rebuild existing configuration, run
 ```
 
-### Option 2: Manual CMake with vcpkg
+The scripts contain default Visual Studio and vcpkg paths. Edit them or use the manual commands above when your tools live elsewhere.
+
+### Legacy DirectX 11 build
+
 ```powershell
-mkdir build
-cd build
+cmake -S . -B build-dx11 `
+  -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+  -DUSE_DX12=OFF
 
-# For DirectX 12 (default)
-cmake .. -DCMAKE_TOOLCHAIN_FILE=[path-to-vcpkg]/scripts/buildsystems/vcpkg.cmake -DUSE_DX12=ON
-cmake --build . --config Release
-
-# For DirectX 11 (legacy)
-cmake .. -DCMAKE_TOOLCHAIN_FILE=[path-to-vcpkg]/scripts/buildsystems/vcpkg.cmake -DUSE_DX12=OFF
-cmake --build . --config Release
+cmake --build build-dx11 --config Release
 ```
 
-## Running
-```powershell
-.\build\GraphicEngine.exe
+The DX11 target is retained for reference and does not contain the full DX12 feature set.
+
+## Rendering flow
+
+Each frame currently records into one direct command list:
+
+1. Transition and clear swap-chain backbuffer
+2. Render HDR sky
+3. Select DXR, visibility-buffer, or forward path
+4. Render shadow map when enabled
+5. Render terrain, scene geometry, destruction, vegetation, water, and effects
+6. Capture depth for next-frame occlusion
+7. Render ImGui
+8. Submit, present, and advance frame fence
+
+The engine uses per-frame command allocators and fence values. Command recording remains single-threaded.
+
+## Project layout
+
+```text
+src/
+  main.cpp                  DX12 application and demo orchestration
+  DX12Core.h                device, swap chain, descriptors, frames, fences
+  ForwardRenderer.h         forward scene rendering
+  VisibilityBufferDX12.h    visibility-buffer passes and compute resolve
+  RaytracingDX12.h          DXR pipeline, acceleration structures, dispatch
+  DDGI_DX12.h               DDGI resources and probe updates
+  ShadowMapDX12.h           directional shadow pass
+  MeshShaderDX12.h          meshlet rendering and occlusion
+  TerrainRendererDX12.h     mesh-shader terrain
+  DestructionDX12.*         Blast destruction and physics integration
+  GLBImporter.*             glTF loading, textures, meshlets, scene merging
+  FBXImporter.*             Assimp-backed FBX loading
+  Scene.h                   runtime scene and gameplay state
+  SceneGraph.h              scene hierarchy and mesh/material structures
+  EngineUI.h                ImGui controls
+  GrassField.h              grass generation and rendering
+  WaterVolume.h             water simulation, rendering, and buoyancy
+  PalmTrees.h               destructible palm simulation
+  RopeSwing.h               rope and payload simulation
+
+shaders/                    HLSL shaders and legacy GLSL files
+models/                     runtime models and textures
+thirdparty/blast/           vendored NVIDIA Blast source
+CMakeLists.txt              DX12/DX11 targets and asset-copy rules
 ```
 
-Or from the build directory:
-```powershell
-cd build
-.\GraphicEngine.exe
-```
+`src/main_dx11.cpp` and `src/main_dx12_legacy.cpp` are legacy paths. The primary executable builds from `src/main.cpp`.
 
-The executable will automatically load shaders from `build/shaders/` and models from `build/models/`.
+## Known limitations
 
-## How It Works
-
-### Clustered Forward Rendering Pipeline
-1. **Cluster Grid Generation**: Divide view frustum into 3D grid of clusters (16x9x24)
-2. **Light Assignment**: Compute shader assigns lights to clusters based on overlap
-3. **Geometry Pass**: Render scene, each pixel queries its cluster for affecting lights
-4. **DDGI Integration**: Dynamic Diffuse Global Illumination adds indirect lighting
-
-### DirectX 12 Architecture
-The engine uses modern DirectX 12 features:
-- **Command Lists**: Pre-recorded GPU commands for efficient submission
-- **Descriptor Heaps**: CBV/SRV/UAV management for shader resources
-- **Root Signatures**: Define shader parameter layouts
-- **Compute Shaders**: Light culling and cluster assignment
-- **Resource Barriers**: Synchronize resource state transitions
-- **Constant Buffers**: Per-frame data (camera, lights, settings)
-
-### Key Rendering Concepts
-- **Clustered Forward**: Divides screen into tiles in 3D space, assigns lights per cluster
-- **DDGI (Dynamic Diffuse Global Illumination)**: Real-time indirect lighting using probes
-- **64 Light Support**: Efficiently handles many lights without forward+ overhead
-- **FPS Camera**: Mouse-locked camera with continuous WASD movement
-- **Model Attachment**: Gun follows camera transform with custom offset
-- **Bullet System**: Raycasting from camera for hit detection
-
-### Performance
-- **Uncapped Frame Rate**: No vsync or frame limiting
-- **Efficient Light Culling**: Only process lights that affect visible clusters
-- **Direct3D 12**: Low-level API for minimal driver overhead
-- **Single-threaded**: Room for multi-threaded command list recording optimization
+- Windows-only
+- Main frame command recording is single-threaded
+- No automated test suite or CI configuration
+- Scene state is not serialized
+- Renderer uses shared global DX12 state
+- DX11 path lags behind DX12
+- Experimental features depend on GPU capability and driver support
 
 ## Troubleshooting
 
-### CMake can't find dependencies
-- Ensure vcpkg is integrated: `.\vcpkg integrate install`
-- Pass toolchain file: `-DCMAKE_TOOLCHAIN_FILE=[vcpkg-root]/scripts/buildsystems/vcpkg.cmake`
+### CMake cannot find packages
 
-### Black screen or no shadows
-- Check console for shader compilation errors
-- Verify `shaders/` folder is in the working directory
-- Ensure OpenGL 3.3+ support (check GPU drivers)
+Confirm `VCPKG_ROOT`, install all packages listed above for `x64-windows`, delete the affected CMake cache, then configure again with the vcpkg toolchain.
 
-### Shadow artifacts
-- **Shadow acne** (speckled self-shadows): increase bias in `shadow.frag`
-- **Peter-panning** (detached shadows): decrease bias
-- **Jagged edges**: increase `SHADOW_WIDTH`/`HEIGHT` in `main.cpp`
+### Mesh shaders do not activate
 
-## Next Steps
-- Add multiple lights or moving light
-- Implement cascaded shadow maps for larger scenes
-- Add normal mapping or PBR materials
-- Support point/spot lights with perspective shadow maps
+Install a recent DirectX Shader Compiler and place `dxc.exe` in `PATH`. CMake prints a fallback message when DXC is unavailable. Hardware and driver must support Shader Model 6.5 mesh shaders.
+
+### Raytracing does not activate
+
+DXR requires compatible hardware, Windows version, and driver. Use forward or visibility-buffer mode on unsupported systems.
+
+### Assets or shaders are missing
+
+Run from repository root or `build/`. CMake copies `models/` and `shaders/` beside the executable after a successful build.
+
+### Black output or GPU validation errors
+
+Build Debug, run under graphics debugging, and inspect console output. DX12 debug-layer messages are enabled in debug builds and dumped around sensitive upload operations.

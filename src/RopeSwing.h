@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cfloat>
 #include <algorithm>
+#include <cstdint>
 
 using namespace DirectX;
 
@@ -33,6 +34,7 @@ using namespace DirectX;
 struct RopeItem {
     XMFLOAT4X4 transform;
     XMFLOAT3   color;
+    uint8_t    shape = 0; // 0 box, 1 capsule, 2 sphere
 };
 
 class RopeSwing {
@@ -296,7 +298,7 @@ private:
     // stretch the chain; kept at ~350 the heaviest part lands near 40 kg, a ~2.5:1
     // ratio the solver holds without complaint.
     void BuildRagdoll(const XMFLOAT3& hangPoint, b3BodyId ropeEnd) {
-        struct PartDef { XMFLOAT3 center, half, color; };
+        struct PartDef { XMFLOAT3 center, half, color; uint8_t shape; };
         const XMFLOAT3 skin{ 0.62f, 0.39f, 0.27f };
         const XMFLOAT3 shirt{ 0.12f, 0.24f, 0.42f };
         const XMFLOAT3 pants{ 0.10f, 0.11f, 0.13f };
@@ -304,17 +306,17 @@ private:
         // Centres are relative to the torso's own centre, which we place just
         // under the rope end so the figure hangs from its chest.
         const PartDef defs[] = {
-            {{0,1.45f,0},{0.25f,0.38f,0.15f},shirt},   // 0 torso
-            {{0,0.92f,0},{0.23f,0.16f,0.14f},pants},   // 1 pelvis
-            {{0,2.02f,0},{0.18f,0.20f,0.18f},skin},    // 2 head
-            {{-0.38f,1.48f,0},{0.12f,0.30f,0.11f},shirt},  // 3 upper arm L
-            {{-0.38f,0.94f,0},{0.10f,0.27f,0.09f},skin},   // 4 forearm L
-            {{ 0.38f,1.48f,0},{0.12f,0.30f,0.11f},shirt},  // 5 upper arm R
-            {{ 0.38f,0.94f,0},{0.10f,0.27f,0.09f},skin},   // 6 forearm R
-            {{-0.15f,0.53f,0},{0.14f,0.28f,0.13f},pants},  // 7 thigh L
-            {{-0.15f,0.04f,0},{0.12f,0.25f,0.11f},pants},  // 8 shin L
-            {{ 0.15f,0.53f,0},{0.14f,0.28f,0.13f},pants},  // 9 thigh R
-            {{ 0.15f,0.04f,0},{0.12f,0.25f,0.11f},pants},  // 10 shin R
+            {{0,1.45f,0},{0.28f,0.38f,0.16f},shirt,1},   // 0 torso
+            {{0,0.92f,0},{0.23f,0.16f,0.15f},pants,1},   // 1 pelvis
+            {{0,2.02f,0},{0.18f,0.22f,0.18f},skin,2},    // 2 head
+            {{-0.39f,1.48f,0},{0.12f,0.30f,0.11f},shirt,1}, // 3 upper arm L
+            {{-0.39f,0.94f,0},{0.10f,0.27f,0.09f},skin,1},  // 4 forearm L
+            {{ 0.39f,1.48f,0},{0.12f,0.30f,0.11f},shirt,1}, // 5 upper arm R
+            {{ 0.39f,0.94f,0},{0.10f,0.27f,0.09f},skin,1},  // 6 forearm R
+            {{-0.15f,0.53f,0},{0.14f,0.28f,0.13f},pants,1}, // 7 thigh L
+            {{-0.15f,0.04f,0},{0.11f,0.25f,0.10f},pants,1}, // 8 shin L
+            {{ 0.15f,0.53f,0},{0.14f,0.28f,0.13f},pants,1}, // 9 thigh R
+            {{ 0.15f,0.04f,0},{0.11f,0.25f,0.10f},pants,1}, // 10 shin R
         };
         struct Link { int a, b; XMFLOAT3 anchor; };
         const Link links[] = {
@@ -347,7 +349,7 @@ private:
             b3BoxHull box = b3MakeBoxHull(def.half.x, def.half.y, def.half.z);
             b3CreateHullShape(body, &sd, &box.base);
 
-            m_ragdoll.push_back({ body, def.half, def.color });
+            m_ragdoll.push_back({ body, def.half, def.color, def.shape });
         }
 
         // Cone/twist limits keep the joints from folding through themselves, which
@@ -397,18 +399,22 @@ private:
         m_items.clear();
         m_items.reserve(m_links.size() + 1);
 
-        auto push = [&](b3BodyId body, const XMFLOAT3& half, const XMFLOAT3& color) {
+        auto push = [&](b3BodyId body, const XMFLOAT3& half, const XMFLOAT3& color,
+                        uint8_t shape = 0) {
             if (B3_IS_NULL(body)) return;
             const b3Pos  p = b3Body_GetPosition(body);
             const b3Quat q = b3Body_GetRotation(body);
             const XMVECTOR rot = XMVectorSet(q.v.x, q.v.y, q.v.z, q.s);
-            const XMMATRIX t =
-                XMMatrixScaling(half.x * 2.0f, half.y * 2.0f, half.z * 2.0f) *
+            const XMMATRIX scale = shape == 1
+                ? XMMatrixScaling(half.x * 4.0f, half.y * 2.15f, half.z * 4.0f)
+                : XMMatrixScaling(half.x * 2.08f, half.y * 2.08f, half.z * 2.08f);
+            const XMMATRIX t = scale *
                 XMMatrixRotationQuaternion(rot) *
                 XMMatrixTranslation((float)p.x, (float)p.y, (float)p.z);
             RopeItem item;
             XMStoreFloat4x4(&item.transform, t);
             item.color = color;
+            item.shape = shape;
             m_items.push_back(item);
         };
 
@@ -419,13 +425,15 @@ private:
         m_items.reserve(m_links.size() + m_ragdoll.size() + 1);
         for (b3BodyId link : m_links) push(link, linkHalf, ropeColor);
         push(m_block, m_blockHalf, blockColor);
-        for (const BodyPart& part : m_ragdoll) push(part.body, part.half, part.color);
+        for (const BodyPart& part : m_ragdoll)
+            push(part.body, part.half, part.color, part.shape);
     }
 
     struct BodyPart {
         b3BodyId body = b3_nullBodyId;
         XMFLOAT3 half{};
         XMFLOAT3 color{};
+        uint8_t shape = 0;
     };
 
     b3WorldId m_world = b3_nullWorldId;

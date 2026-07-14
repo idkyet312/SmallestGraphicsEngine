@@ -2,6 +2,7 @@
 
 #include <DirectXMath.h>
 #include <d3d12.h>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -16,6 +17,16 @@ struct DestructionRenderItem {
 struct RagdollRenderItem {
     DirectX::XMFLOAT4X4 transform;
     DirectX::XMFLOAT3 color;
+    uint8_t shape = 1; // 0 box, 1 capsule, 2 sphere
+};
+
+struct EnemyGunRenderItem {
+    DirectX::XMFLOAT4X4 transform;
+};
+
+struct EnemyShot {
+    DirectX::XMFLOAT3 origin;
+    DirectX::XMFLOAT3 direction;
 };
 
 // Snapshot of the live Blast/Box3D state for on-screen debug drawing.
@@ -55,6 +66,8 @@ public:
     void Shutdown();
     void Reset();
     void Update(float dt);
+    void SetEnemyTarget(const DirectX::XMFLOAT3& target);
+    std::vector<EnemyShot> DrainEnemyShots();
     bool HitTest(const DirectX::XMFLOAT3& worldPosition, float radius,
                  DirectX::XMFLOAT3& hitPosition) const;
     bool HitTestSegment(const DirectX::XMFLOAT3& worldStart,
@@ -95,6 +108,7 @@ public:
     uint32_t GetActorCount() const;
     const std::vector<DestructionRenderItem>& GetRenderItems() const;
     const std::vector<RagdollRenderItem>& GetRagdollRenderItems() const;
+    const std::vector<EnemyGunRenderItem>& GetEnemyGunRenderItems() const;
     DestructionDebugData GetDebugData() const;
 
     void receive(const Nv::Blast::TkEvent* events, uint32_t eventCount) override;

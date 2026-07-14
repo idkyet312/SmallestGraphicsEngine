@@ -251,14 +251,39 @@ struct DestructionDX12::Impl {
     std::vector<int> chunkGroupByAsset;           // asset-chunk-indexed plank id (root=[0]=-2)
     std::list<std::unique_ptr<ActorRuntime>> actors;
     std::vector<DestructionRenderItem> renderItems;
+    // True once the render items have been rebuilt at a moment when nothing was
+    // moving -- i.e. they are up to date and can be left alone until something
+    // changes. Cleared by anything that alters the scene (a break, a split, a new
+    // ragdoll) so the next Update refreshes them. See DestructionDX12::Update.
+    bool rebuiltWhileStill = false;
     struct RagdollPart {
         b3BodyId body = b3_nullBodyId;
         XMFLOAT3 half = {};
         XMFLOAT3 color = {};
+        uint8_t shape = 1; // 1 capsule, 2 sphere
         bool wasSubmerged = false;   // for splash-on-entry detection
     };
     std::vector<RagdollPart> ragdollParts;
     std::vector<RagdollRenderItem> ragdollRenderItems;
+    struct HoverEnemy {
+        size_t firstPart = 0;
+        b3BodyId torso = b3_nullBodyId;
+        float totalMass = 1.0f;
+        float hoverY = 4.5f;
+        float phase = 0.0f;
+        float fireCooldown = 0.5f;
+        int shotsInBurst = 0;
+        float health = 100.0f;
+        float respawnTimer = 0.0f;
+        bool alive = true;
+        std::vector<XMFLOAT3> spawnPositions;
+        XMFLOAT4 spawnRotation{ 0, 0, 0, 1 };
+    };
+    std::vector<HoverEnemy> hoverEnemies;
+    std::vector<EnemyGunRenderItem> enemyGunRenderItems;
+    std::vector<EnemyShot> pendingEnemyShots;
+    XMFLOAT3 enemyTarget = {};
+    bool enemyTargetValid = false;
     mutable int lastRagdollHit = -1;
     TkFramework* framework = nullptr;
     TkAsset* asset = nullptr;
@@ -370,6 +395,188 @@ struct DestructionDX12::Impl {
                 -vel.z * mass * 5.0f * submerged
             };
             b3Body_ApplyForceToCenter(part.body, force, true);
+        }
+    }
+
+    // Alive enemies are active ragdolls: targets keep a readable human pose while
+    // Box3D joints/collisions still add motion. On death these targets stop and the
+    // same bodies become an ordinary loose ragdoll.
+    void ApplyEnemyHover(float dt) {
+        if (!enemyTargetValid) return;
+        constexpr float approachMultiplier = 5.0f;
+        constexpr float animationMultiplier = 3.0f;
+        for (HoverEnemy& enemy : hoverEnemies) {
+            if (!enemy.alive || B3_IS_NULL(enemy.torso)) continue;
+            const b3Pos p = b3Body_GetPosition(enemy.torso);
+            const b3Vec3 v = b3Body_GetLinearVelocity(enemy.torso);
+
+            float ax = (float)p.x - enemyTarget.x;
+            float az = (float)p.z - enemyTarget.z;
+            float dist = std::sqrt(ax * ax + az * az);
+            if (dist < 0.1f) { ax = 1.0f; az = 0.0f; dist = 1.0f; }
+            ax /= dist; az /= dist;
+            // Keep combat distance while gently orbiting. Avoids motionless
+            // turret behaviour without requiring navmesh support.
+            const float orbit = std::sin(enemy.phase * 0.35f * animationMultiplier) * 1.2f;
+            const float desiredX = enemyTarget.x + ax * 9.0f - az * orbit;
+            const float desiredZ = enemyTarget.z + az * 9.0f + ax * orbit;
+            const float desiredY = enemy.hoverY +
+                std::sin(enemy.phase * 1.35f * animationMultiplier) * 0.45f;
+
+            // Force-based translation avoids SetTargetTransform trying to cover a
+            // large spawn-to-player distance in one pose interval.
+            const float mass = (std::max)(1.0f, enemy.totalMass);
+            b3Vec3 force = {
+                mass * (((desiredX - (float)p.x) * 0.45f * approachMultiplier) - v.x * 1.5f),
+                mass * (9.81f + (desiredY - (float)p.y) * 3.5f * animationMultiplier - v.y * 2.4f),
+                mass * (((desiredZ - (float)p.z) * 0.45f * approachMultiplier) - v.z * 1.5f)
+            };
+            const float horizontalCap = mass * 10.0f * approachMultiplier;
+            const float verticalCap = mass * 10.0f * animationMultiplier;
+            force.x = (std::max)(-horizontalCap, (std::min)(horizontalCap, force.x));
+            force.y = (std::max)(-verticalCap, (std::min)(verticalCap, force.y));
+            force.z = (std::max)(-horizontalCap, (std::min)(horizontalCap, force.z));
+            b3Body_ApplyForceToCenter(enemy.torso, force, true);
+
+            const XMVECTOR torso = XMVectorSet((float)p.x, (float)p.y, (float)p.z, 1.0f);
+            XMVECTOR aim = XMLoadFloat3(&enemyTarget) + XMVectorSet(0, -0.35f, 0, 0) - torso;
+            if (XMVectorGetX(XMVector3LengthSq(aim)) < 1e-5f) aim = XMVectorSet(0, 0, 1, 0);
+            aim = XMVector3Normalize(aim);
+            const XMVECTOR worldUp = XMVectorSet(0, 1, 0, 0);
+            XMVECTOR bodyForward = XMVectorSet(XMVectorGetX(aim), 0.0f, XMVectorGetZ(aim), 0.0f);
+            if (XMVectorGetX(XMVector3LengthSq(bodyForward)) < 1e-5f)
+                bodyForward = XMVectorSet(0, 0, 1, 0);
+            bodyForward = XMVector3Normalize(bodyForward);
+            XMVECTOR right = XMVector3Normalize(XMVector3Cross(worldUp, bodyForward));
+            const XMVECTOR up = worldUp;
+
+            auto quatFromAxes = [](XMVECTOR x, XMVECTOR y, XMVECTOR z) {
+                XMMATRIX m = XMMatrixIdentity();
+                m.r[0] = XMVectorSetW(x, 0); m.r[1] = XMVectorSetW(y, 0);
+                m.r[2] = XMVectorSetW(z, 0);
+                return XMQuaternionNormalize(XMQuaternionRotationMatrix(m));
+            };
+            const XMVECTOR bodyQ = quatFromAxes(right, up, bodyForward);
+
+            const float poseTime = (std::max)(0.24f, dt * 2.0f);
+            auto targetBody = [&](size_t localIndex, XMVECTOR position, XMVECTOR rotation) {
+                const b3BodyId body = ragdollParts[enemy.firstPart + localIndex].body;
+                XMFLOAT3 pos; XMFLOAT4 q;
+                XMStoreFloat3(&pos, position); XMStoreFloat4(&q, rotation);
+                b3WorldTransform target = { { pos.x, pos.y, pos.z }, { { q.x, q.y, q.z }, q.w } };
+                b3Body_SetTargetTransform(body, target, poseTime, true);
+            };
+            auto targetSegment = [&](size_t localIndex, XMVECTOR a, XMVECTOR b) {
+                XMVECTOR axis = XMVector3Normalize(b - a);
+                XMVECTOR side = XMVector3Cross(axis, aim);
+                if (XMVectorGetX(XMVector3LengthSq(side)) < 1e-5f)
+                    side = XMVector3Cross(axis, right);
+                side = XMVector3Normalize(side);
+                XMVECTOR segmentForward = XMVector3Normalize(XMVector3Cross(side, axis));
+                targetBody(localIndex, (a + b) * 0.5f,
+                           quatFromAxes(side, axis, segmentForward));
+            };
+
+            // Chest and pelvis receive no pose targets. Hover force, joints,
+            // inertia, and collisions control them. Head still tracks player.
+            const XMVECTOR predictedTorso = torso + XMVectorSet(v.x, v.y, v.z, 0) * poseTime;
+            targetBody(2, predictedTorso + up * 0.57f, bodyQ);
+
+            // Two-handed aiming pose. Right hand holds trigger; left supports barrel.
+            const XMVECTOR gunPos = predictedTorso + right * 0.04f + up * 0.04f + aim * 0.68f;
+            const XMVECTOR rightHand = gunPos + right * 0.10f - aim * 0.06f;
+            const XMVECTOR leftHand  = gunPos - right * 0.01f - up * 0.12f + aim * 0.18f;
+            const XMVECTOR rightShoulder = predictedTorso + right * 0.29f + up * 0.23f;
+            const XMVECTOR leftShoulder  = predictedTorso - right * 0.29f + up * 0.23f;
+            auto solveElbow = [&](XMVECTOR shoulder, XMVECTOR hand, XMVECTOR bendHint) {
+                constexpr float upperLength = 0.60f;
+                constexpr float lowerLength = 0.54f;
+                XMVECTOR delta = hand - shoulder;
+                float distance = XMVectorGetX(XMVector3Length(delta));
+                distance = (std::max)(0.08f,
+                    (std::min)(upperLength + lowerLength - 0.015f, distance));
+                const XMVECTOR direction = XMVector3Normalize(delta);
+                const float along = (upperLength * upperLength - lowerLength * lowerLength +
+                                     distance * distance) / (2.0f * distance);
+                const float height = std::sqrt((std::max)(0.0f,
+                    upperLength * upperLength - along * along));
+                bendHint -= direction * XMVector3Dot(bendHint, direction);
+                if (XMVectorGetX(XMVector3LengthSq(bendHint)) < 1e-5f) bendHint = up;
+                bendHint = XMVector3Normalize(bendHint);
+                return shoulder + direction * along + bendHint * height;
+            };
+            const XMVECTOR rightElbow = solveElbow(
+                rightShoulder, rightHand, right * 0.85f - up * 0.25f);
+            const XMVECTOR leftElbow = solveElbow(
+                leftShoulder, leftHand, -right * 0.22f - up * 0.55f);
+            // Local +Y points inward/upward on every authored limb. Preserve
+            // that convention or Box3D joint anchors land on opposite ends.
+            targetSegment(5, rightElbow, rightShoulder);
+            targetSegment(6, rightHand, rightElbow);
+            targetSegment(3, leftElbow, leftShoulder);
+            targetSegment(4, leftHand, leftElbow);
+
+            // Legs receive no animation targets. Hip/knee joints, gravity,
+            // acceleration, collisions, and inertia drive them completely.
+        }
+    }
+
+    void UpdateEnemyFire(float dt) {
+        if (!enemyTargetValid) return;
+        for (HoverEnemy& enemy : hoverEnemies) {
+            if (!enemy.alive) {
+                enemy.respawnTimer -= dt;
+                if (enemy.respawnTimer <= 0.0f && enemy.spawnPositions.size() == 11) {
+                    for (size_t i = 0; i < 11; ++i) {
+                        const b3BodyId body = ragdollParts[enemy.firstPart + i].body;
+                        const XMFLOAT3& p = enemy.spawnPositions[i];
+                        const XMFLOAT4& q = enemy.spawnRotation;
+                        b3Body_SetTransform(body, { p.x, p.y, p.z },
+                            { { q.x, q.y, q.z }, q.w });
+                        b3Body_SetLinearVelocity(body, { 0, 0, 0 });
+                        b3Body_SetAngularVelocity(body, { 0, 0, 0 });
+                        b3Body_SetAwake(body, true);
+                    }
+                    enemy.health = 100.0f;
+                    enemy.shotsInBurst = 0;
+                    enemy.fireCooldown = 0.5f;
+                    enemy.alive = true;
+                }
+                continue;
+            }
+            if (B3_IS_NULL(enemy.torso)) continue;
+            enemy.phase += dt;
+            enemy.fireCooldown -= dt;
+            if (enemy.fireCooldown > 0.0f) continue;
+
+            const RagdollPart& triggerArm = ragdollParts[enemy.firstPart + 6];
+            const b3Pos hand = b3Body_GetWorldPoint(triggerArm.body,
+                { 0.0f, -triggerArm.half.y, 0.0f });
+            XMVECTOR from = XMVectorSet((float)hand.x, (float)hand.y,
+                                        (float)hand.z, 1.0f);
+            XMVECTOR to = XMLoadFloat3(&enemyTarget) + XMVectorSet(0, -0.35f, 0, 0);
+            XMVECTOR dir = to - from;
+            const float distance = XMVectorGetX(XMVector3Length(dir));
+            if (distance > 40.0f || distance < 1.0f) {
+                enemy.fireCooldown = 0.0625f;
+                continue;
+            }
+            dir = XMVector3Normalize(dir);
+            // Small inaccuracy keeps sustained fire dangerous but dodgeable.
+            const float jx = ((float)std::rand() / RAND_MAX * 2.0f - 1.0f) * 0.018f;
+            const float jy = ((float)std::rand() / RAND_MAX * 2.0f - 1.0f) * 0.014f;
+            dir = XMVector3Normalize(dir + XMVectorSet(jx, jy, -jx * 0.4f, 0));
+            XMFLOAT3 origin, direction;
+            XMStoreFloat3(&origin, from + dir * 1.35f);
+            XMStoreFloat3(&direction, dir);
+            pendingEnemyShots.push_back({ origin, direction });
+            ++enemy.shotsInBurst;
+            if (enemy.shotsInBurst >= 7) {
+                enemy.shotsInBurst = 0;
+                enemy.fireCooldown = 4.0f;
+            } else {
+                enemy.fireCooldown = 0.18f + ((float)std::rand() / RAND_MAX) * 0.1375f;
+            }
         }
     }
 
@@ -769,22 +976,22 @@ struct DestructionDX12::Impl {
     }
 
     void CreateRagdolls() {
-        struct PartDef { XMFLOAT3 center, half, color; };
+        struct PartDef { XMFLOAT3 center, half, color; uint8_t shape; };
         const XMFLOAT3 skin{ 0.62f, 0.39f, 0.27f };
-        const XMFLOAT3 shirt{ 0.12f, 0.24f, 0.42f };
-        const XMFLOAT3 pants{ 0.10f, 0.11f, 0.13f };
+        const XMFLOAT3 shirt{ 0.20f, 0.27f, 0.10f }; // military olive drab
+        const XMFLOAT3 pants{ 0.025f, 0.028f, 0.025f }; // tactical black
         const PartDef defs[] = {
-            {{0,1.45f,0},{0.25f,0.38f,0.15f},shirt},   // torso
-            {{0,0.92f,0},{0.23f,0.16f,0.14f},pants},   // pelvis
-            {{0,2.02f,0},{0.18f,0.20f,0.18f},skin},    // head
-            {{-0.38f,1.48f,0},{0.12f,0.30f,0.11f},shirt},
-            {{-0.38f,0.94f,0},{0.10f,0.27f,0.09f},skin},
-            {{ 0.38f,1.48f,0},{0.12f,0.30f,0.11f},shirt},
-            {{ 0.38f,0.94f,0},{0.10f,0.27f,0.09f},skin},
-            {{-0.15f,0.53f,0},{0.14f,0.28f,0.13f},pants},
-            {{-0.15f,0.04f,0},{0.12f,0.25f,0.11f},pants},
-            {{ 0.15f,0.53f,0},{0.14f,0.28f,0.13f},pants},
-            {{ 0.15f,0.04f,0},{0.12f,0.25f,0.11f},pants},
+            {{0,1.45f,0},{0.28f,0.38f,0.16f},shirt,1},   // torso
+            {{0,0.92f,0},{0.23f,0.16f,0.15f},pants,1},   // pelvis
+            {{0,2.02f,0},{0.18f,0.22f,0.18f},skin,2},    // head
+            {{-0.39f,1.48f,0},{0.12f,0.30f,0.11f},shirt,1},
+            {{-0.39f,0.94f,0},{0.10f,0.27f,0.09f},skin,1},
+            {{ 0.39f,1.48f,0},{0.12f,0.30f,0.11f},shirt,1},
+            {{ 0.39f,0.94f,0},{0.10f,0.27f,0.09f},skin,1},
+            {{-0.15f,0.53f,0},{0.14f,0.28f,0.13f},pants,1},
+            {{-0.15f,0.04f,0},{0.11f,0.25f,0.10f},pants,1},
+            {{ 0.15f,0.53f,0},{0.14f,0.28f,0.13f},pants,1},
+            {{ 0.15f,0.04f,0},{0.11f,0.25f,0.10f},pants,1},
         };
         struct Link { int a, b; XMFLOAT3 anchor; };
         const Link links[] = {
@@ -795,8 +1002,11 @@ struct DestructionDX12::Impl {
             {1,9,{ 0.15f,0.76f,0}}, {9,10,{0.15f,0.28f,0}},
         };
 
-        auto spawn = [&](XMFLOAT3 origin, float pitch, float yaw, float roll) {
+        auto spawn = [&](XMFLOAT3 origin, float pitch, float yaw, float roll, float phase) {
             const size_t base = ragdollParts.size();
+            float totalMass = 0.0f;
+            std::vector<XMFLOAT3> spawnPositions;
+            spawnPositions.reserve(11);
             XMVECTOR rq = XMQuaternionRotationRollPitchYaw(pitch, yaw, roll);
             XMFLOAT4 qf; XMStoreFloat4(&qf, rq);
             for (const PartDef& def : defs) {
@@ -805,6 +1015,8 @@ struct DestructionDX12::Impl {
                 b3BodyDef bd = b3DefaultBodyDef();
                 bd.type = b3_dynamicBody;
                 bd.position = { origin.x + rotated.x, origin.y + rotated.y, origin.z + rotated.z };
+                spawnPositions.push_back({ (float)bd.position.x, (float)bd.position.y,
+                                           (float)bd.position.z });
                 bd.rotation = { { qf.x, qf.y, qf.z }, qf.w };
                 bd.linearDamping = 0.12f; bd.angularDamping = 0.35f;
                 b3BodyId body = b3CreateBody(world, &bd);
@@ -813,7 +1025,8 @@ struct DestructionDX12::Impl {
                 sd.baseMaterial.restitution = 0.02f;
                 b3BoxHull box = b3MakeBoxHull(def.half.x, def.half.y, def.half.z);
                 b3CreateHullShape(body, &sd, &box.base);
-                ragdollParts.push_back({ body, def.half, def.color });
+                ragdollParts.push_back({ body, def.half, def.color, def.shape });
+                totalMass += b3Body_GetMass(body);
             }
             for (const Link& link : links) {
                 b3SphericalJointDef jd = b3DefaultSphericalJointDef();
@@ -828,11 +1041,24 @@ struct DestructionDX12::Impl {
                 jd.enableTwistLimit = true; jd.lowerTwistAngle = -0.65f; jd.upperTwistAngle = 0.65f;
                 b3CreateSphericalJoint(world, &jd);
             }
+            HoverEnemy enemy;
+            enemy.firstPart = base;
+            enemy.torso = ragdollParts[base].body;
+            enemy.totalMass = totalMass;
+            enemy.hoverY = (std::max)(4.5f, origin.y + 1.8f);
+            enemy.phase = phase;
+            enemy.fireCooldown = 0.1125f + phase * 0.0425f;
+            enemy.spawnPositions = std::move(spawnPositions);
+            enemy.spawnRotation = qf;
+            hoverEnemies.push_back(enemy);
         };
 
-        // One body leans against the metal shed; one starts sprawled on wood roof.
-        spawn({ 7.78f, 0.38f, 3.45f }, 0.0f, 0.0f, -0.28f);
-        spawn({ -3.4f, 4.75f, 3.55f }, 0.0f, 0.0f, 1.48f);
+        // Player starts at z=+20 looking toward the house at the origin. Enemy
+        // spawner mirrors that point 20 m behind the house at z=-20.
+        constexpr float spawnerZ = -20.0f;
+        spawn({ -3.0f, 3.2f, spawnerZ },       0.0f, 0.0f, -0.15f, 0.0f);
+        spawn({  0.0f, 3.8f, spawnerZ - 1.0f },0.0f, 0.0f,  0.12f, 1.7f);
+        spawn({  3.0f, 3.2f, spawnerZ },       0.0f, 0.0f, -0.10f, 3.4f);
     }
 
     void CreateBody(ActorRuntime& runtime, bool forceDynamic, const BodySeed* seed) {
@@ -912,7 +1138,32 @@ struct DestructionDX12::Impl {
         // grenade's explosion shove). Pieces otherwise just fall.
     }
 
+    // Is there anything whose transform could have changed since the last rebuild?
+    //
+    // An intact house is entirely STATIC -- every chunk is anchored, nothing moves --
+    // yet the render items were being rebuilt from scratch every single frame, walking
+    // all ~588 chunks to recompute transforms that were identical to last frame's.
+    // Nothing is dynamic until you actually shoot something, so the common case was
+    // paying full price for no change at all. (PalmTrees already had this early-out;
+    // destruction did not.)
+    // Box3D puts a body to sleep once it has come to rest, so ASLEEP is the test --
+    // not merely "is it a dynamic body". Debris that has finished falling is
+    // dynamic forever after, and checking only the flag would mean the rebuild
+    // came back permanently the first time the player broke anything.
+    bool AnythingMoving() const {
+        for (const RagdollPart& part : ragdollParts)
+            if (!B3_IS_NULL(part.body) && b3Body_IsAwake(part.body)) return true;
+        for (const auto& runtime : actors)
+            if (runtime->dynamic && !B3_IS_NULL(runtime->body) && b3Body_IsAwake(runtime->body))
+                return true;
+        return false;
+    }
+
     void RebuildRenderItems() {
+        // Any direct rebuild (a bullet strike, a grenade, init) means the scene just
+        // changed. Drop the "settled" latch so Update re-evaluates from scratch
+        // rather than assuming its cached items are still good.
+        rebuiltWhileStill = false;
         renderItems.clear();
         for (const auto& runtime : actors) {
             XMMATRIX transform = XMMatrixIdentity();
@@ -925,10 +1176,53 @@ struct DestructionDX12::Impl {
             const b3Pos p = b3Body_GetPosition(part.body);
             const b3Quat q = b3Body_GetRotation(part.body);
             XMVECTOR rotation = XMVectorSet(q.v.x, q.v.y, q.v.z, q.s);
-            XMMATRIX transform = XMMatrixScaling(part.half.x * 2.0f, part.half.y * 2.0f, part.half.z * 2.0f) *
+            const XMMATRIX scale = part.shape == 1
+                ? XMMatrixScaling(part.half.x * 4.0f, part.half.y * 2.15f, part.half.z * 4.0f)
+                : XMMatrixScaling(part.half.x * 2.08f, part.half.y * 2.08f, part.half.z * 2.08f);
+            XMMATRIX transform = scale *
                 XMMatrixRotationQuaternion(rotation) * XMMatrixTranslation((float)p.x, (float)p.y, (float)p.z);
             XMFLOAT4X4 stored; XMStoreFloat4x4(&stored, transform);
-            ragdollRenderItems.push_back({ stored, part.color });
+            ragdollRenderItems.push_back({ stored, part.color, part.shape });
+        }
+
+        enemyGunRenderItems.clear();
+        if (enemyTargetValid) for (const HoverEnemy& enemy : hoverEnemies) {
+            if (!enemy.alive || B3_IS_NULL(enemy.torso)) continue;
+            const b3Pos bp = b3Body_GetPosition(enemy.torso);
+            const XMVECTOR torso = XMVectorSet((float)bp.x, (float)bp.y, (float)bp.z, 1);
+            XMVECTOR fwd = XMLoadFloat3(&enemyTarget) - torso;
+            if (XMVectorGetX(XMVector3LengthSq(fwd)) < 1e-5f) fwd = XMVectorSet(0, 0, 1, 0);
+            fwd = XMVector3Normalize(fwd);
+            const XMVECTOR worldUp = XMVectorSet(0, 1, 0, 0);
+            XMVECTOR right = XMVector3Normalize(XMVector3Cross(worldUp, fwd));
+            XMVECTOR up = XMVector3Normalize(XMVector3Cross(fwd, right));
+            const RagdollPart& rightForearm = ragdollParts[enemy.firstPart + 6];
+            const RagdollPart& leftForearm = ragdollParts[enemy.firstPart + 4];
+            const b3Pos rh = b3Body_GetWorldPoint(rightForearm.body,
+                { 0.0f, -rightForearm.half.y, 0.0f });
+            const b3Pos lh = b3Body_GetWorldPoint(leftForearm.body,
+                { 0.0f, -leftForearm.half.y, 0.0f });
+            const XMVECTOR rightHand = XMVectorSet((float)rh.x, (float)rh.y, (float)rh.z, 1);
+            const XMVECTOR leftHand = XMVectorSet((float)lh.x, (float)lh.y, (float)lh.z, 1);
+            const XMVECTOR gunPos = rightHand - right * 0.10f + fwd * 0.08f;
+
+            // Palms cover capsule tips and visibly contact trigger/foregrip.
+            const XMFLOAT3 skin{ 0.62f, 0.39f, 0.27f };
+            auto appendHand = [&](XMVECTOR handPos) {
+                XMFLOAT4X4 handTransform;
+                XMStoreFloat4x4(&handTransform,
+                    XMMatrixScaling(0.16f, 0.13f, 0.13f) *
+                    XMMatrixTranslationFromVector(handPos));
+                ragdollRenderItems.push_back({ handTransform, skin, 2 });
+            };
+            appendHand(rightHand);
+            appendHand(leftHand);
+            XMMATRIX basis = XMMatrixIdentity();
+            basis.r[0] = XMVectorSetW(right, 0); basis.r[1] = XMVectorSetW(up, 0);
+            basis.r[2] = XMVectorSetW(fwd, 0); basis.r[3] = XMVectorSetW(gunPos, 1);
+            XMFLOAT4X4 stored;
+            XMStoreFloat4x4(&stored, XMMatrixScaling(0.65f, 0.65f, 0.65f) * basis);
+            enemyGunRenderItems.push_back({ stored });
         }
     }
 
@@ -1116,6 +1410,7 @@ void DestructionDX12::Update(float dt) {
     bool anyImpactBroke = false;
     while (m->accumulator >= step) {
         m->ApplyWaterBuoyancy();
+        m->ApplyEnemyHover(step);
         b3World_Step(m->world, step, 4);
         m->accumulator -= step;
         // Physics impact damage: collisions above the world's hit-event speed
@@ -1137,7 +1432,34 @@ void DestructionDX12::Update(float dt) {
         }
     }
     if (anyImpactBroke) m->DropUnderConnectedChunks();
-    m->RebuildRenderItems();
+    m->UpdateEnemyFire(dt);
+
+    // Only rebuild when something could actually have moved. An intact house is
+    // fully static, so this walk over ~588 chunks was pure waste on every frame
+    // before the player breaks anything.
+    //
+    // The `rebuiltWhileStill` latch is what makes it safe: when the last dynamic
+    // piece settles back to static, AnythingMoving() flips to false, and without
+    // one final rebuild the render items would be frozen at wherever the debris was
+    // a frame before it came to rest.
+    const bool moving = m->AnythingMoving();
+    if (moving || anyImpactBroke || !m->rebuiltWhileStill) {
+        m->RebuildRenderItems();
+        m->rebuiltWhileStill = !moving;
+    }
+}
+
+void DestructionDX12::SetEnemyTarget(const XMFLOAT3& target) {
+    if (!m) return;
+    m->enemyTarget = target;
+    m->enemyTargetValid = true;
+}
+
+std::vector<EnemyShot> DestructionDX12::DrainEnemyShots() {
+    if (!m) return {};
+    std::vector<EnemyShot> result;
+    result.swap(m->pendingEnemyShots);
+    return result;
 }
 
 bool DestructionDX12::HitTest(const XMFLOAT3& worldPosition, float radius, XMFLOAT3& hitPosition) const {
@@ -1330,6 +1652,17 @@ bool DestructionDX12::ApplyImpulse(const XMFLOAT3& worldPosition,
     const float falloffRadius = std::max(0.25f, hitRadius);
     const float falloffSquared = falloffRadius * falloffRadius;
     if (m->lastRagdollHit >= 0 && m->lastRagdollHit < (int)m->ragdollParts.size()) {
+        for (Impl::HoverEnemy& enemy : m->hoverEnemies) {
+            if ((size_t)m->lastRagdollHit >= enemy.firstPart &&
+                (size_t)m->lastRagdollHit < enemy.firstPart + 11 && enemy.alive) {
+                enemy.health -= 25.0f;
+                if (enemy.health <= 0.0f) {
+                    enemy.alive = false; // controller off: corpse falls
+                    enemy.respawnTimer = 5.0f;
+                }
+                break;
+            }
+        }
         Impl::RagdollPart& part = m->ragdollParts[(size_t)m->lastRagdollHit];
         const float mass = std::max(0.05f, b3Body_GetMass(part.body));
         const float magnitude = std::min(impulseStrength, 12.0f * mass);
@@ -1521,6 +1854,7 @@ uint32_t DestructionDX12::GetChunkCount() const { return m ? (uint32_t)m->chunks
 uint32_t DestructionDX12::GetActorCount() const { return m ? (uint32_t)m->actors.size() : 0; }
 const std::vector<DestructionRenderItem>& DestructionDX12::GetRenderItems() const { return m->renderItems; }
 const std::vector<RagdollRenderItem>& DestructionDX12::GetRagdollRenderItems() const { return m->ragdollRenderItems; }
+const std::vector<EnemyGunRenderItem>& DestructionDX12::GetEnemyGunRenderItems() const { return m->enemyGunRenderItems; }
 
 DestructionDebugData DestructionDX12::GetDebugData() const {
     DestructionDebugData data;

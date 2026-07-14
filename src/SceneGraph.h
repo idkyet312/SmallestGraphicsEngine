@@ -42,6 +42,15 @@ struct SceneMaterial {
     bool roughnessOnlyTexture = false;
     ComPtr<ID3D12Resource> normalTexture;
 
+    // Where this material's three texture descriptors (albedo/normal/metal-rough)
+    // live in the persistent region of the shared CBV/SRV/UAV heap. They are
+    // created the first time the material is drawn and then reused forever -- a
+    // material's textures never change after load, so recreating the descriptors
+    // every draw was pure waste (~1,764 CreateShaderResourceView calls a frame
+    // just for the destructible house's chunks). ~0u means "not cached yet".
+    // See ShaderDX12::SetObjectMaterial.
+    UINT srvHeapSlot = ~0u;
+
     // Keep upload heaps alive until GPU finishes
     std::vector<ComPtr<ID3D12Resource>> uploadHeaps;
 };

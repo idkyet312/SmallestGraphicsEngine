@@ -4,6 +4,26 @@
 #include "ShaderDX12.h"
 #include <algorithm>
 
+// Load generated DXIL beside the executable, independent of process working
+// directory. Build scripts launch from the repository root while IDE/manual
+// launches often use build/, so relative-only paths made mesh terrain fail on
+// the first post-build run and work after relaunching from build/.
+inline HRESULT ReadCompiledShaderDX12(const wchar_t* relativePath, ID3DBlob** blob) {
+    wchar_t modulePath[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    if (length > 0 && length < MAX_PATH) {
+        std::wstring executablePath(modulePath, length);
+        const size_t slash = executablePath.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) {
+            const std::wstring besideExecutable =
+                executablePath.substr(0, slash + 1) + relativePath;
+            const HRESULT hr = D3DReadFileToBlob(besideExecutable.c_str(), blob);
+            if (SUCCEEDED(hr)) return hr;
+        }
+    }
+    return D3DReadFileToBlob(relativePath, blob);
+}
+
 template<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename T>
 struct alignas(8) MeshPSOSubobjectDX12 {
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
@@ -54,15 +74,15 @@ public:
         ComPtr<ID3DBlob> ms;
         ComPtr<ID3DBlob> as;
         ComPtr<ID3DBlob> ps;
-        if (FAILED(D3DReadFileToBlob(L"shaders/mesh_as.cso", &as))) {
+        if (FAILED(ReadCompiledShaderDX12(L"shaders/mesh_as.cso", &as))) {
             std::cerr << "Amplification shader DXIL missing: shaders/mesh_as.cso\n";
             return false;
         }
-        if (FAILED(D3DReadFileToBlob(L"shaders/mesh_ms.cso", &ms))) {
+        if (FAILED(ReadCompiledShaderDX12(L"shaders/mesh_ms.cso", &ms))) {
             std::cerr << "Mesh shader DXIL missing: shaders/mesh_ms.cso\n";
             return false;
         }
-        if (FAILED(D3DReadFileToBlob(L"shaders/mesh_ps.cso", &ps))) {
+        if (FAILED(ReadCompiledShaderDX12(L"shaders/mesh_ps.cso", &ps))) {
             std::cerr << "Mesh pixel shader DXIL missing: shaders/mesh_ps.cso\n";
             return false;
         }
@@ -109,7 +129,7 @@ public:
 
         stream.raster.value.FillMode = D3D12_FILL_MODE_WIREFRAME;
         ComPtr<ID3DBlob> wirePs;
-        if (SUCCEEDED(D3DReadFileToBlob(L"shaders/wire_green_ps.cso", &wirePs))) {
+        if (SUCCEEDED(ReadCompiledShaderDX12(L"shaders/wire_green_ps.cso", &wirePs))) {
             stream.ps.value = { wirePs->GetBufferPointer(), wirePs->GetBufferSize() };
         }
         if (FAILED(device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&psoWireframe)))) {

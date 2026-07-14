@@ -64,6 +64,12 @@ public:
         m_terrain = std::move(fn);
     }
 
+    // Shares the grass controls so one gust moves the whole landscape.
+    void SetWind(float strength, float speed) {
+        m_windStrength = (std::max)(0.0f, strength);
+        m_windSpeed = (std::max)(0.0f, speed);
+    }
+
     void Initialize() {
         Shutdown();
         b3WorldDef wd = b3DefaultWorldDef();
@@ -185,7 +191,13 @@ public:
 
     void Update(float dt) {
         if (B3_IS_NULL(m_world)) return;
-        if (m_activeBodies == 0) return;   // nothing moving: the grove is free
+        m_windTime += dt;
+        if (m_activeBodies == 0) {
+            // Physics is free while every tree stands, but visual wind still
+            // changes crown/trunk transforms each frame.
+            RebuildItems();
+            return;
+        }
 
         m_accumulator = std::min(0.1f, m_accumulator + dt);
         constexpr float step = 1.0f / 60.0f;
@@ -379,6 +391,21 @@ private:
         const b3Quat q = b3Body_GetRotation(body);
         return XMMatrixRotationQuaternion(XMVectorSet(q.v.x, q.v.y, q.v.z, q.s)) *
                XMMatrixTranslation((float)p.x, (float)p.y, (float)p.z);
+    }
+
+    // Low-frequency trunk bend plus a smaller fast gust. Each tree gets a stable
+    // spatial phase, preventing the grove from moving as one rigid object.
+    XMFLOAT4 WindRotation(const Tree& tree, float heightFraction) const {
+        const float phase = tree.x * 0.19f + tree.z * 0.13f;
+        const float t = m_windTime * m_windSpeed;
+        const float gust = std::sin(t + phase) + 0.35f * std::sin(t * 2.37f + phase * 1.71f);
+        const float bend = m_windStrength * 0.13f * gust * heightFraction * heightFraction;
+        const float heading = 0.35f + 0.22f * std::sin(t * 0.17f);
+        const XMVECTOR axis = XMVector3Normalize(
+            XMVectorSet(std::sin(heading), 0.0f, -std::cos(heading), 0.0f));
+        XMFLOAT4 result;
+        XMStoreFloat4(&result, XMQuaternionRotationAxis(axis, bend));
+        return result;
     }
 
     // Weld one piece onto a body as an offset/rotated box shape.
@@ -724,32 +751,48 @@ private:
             const int standTop = tree.felled ? tree.cutIndex : (int)tree.segments.size();
             for (int i = 0; i < standTop; ++i) {
                 const Segment& s = tree.segments[i];
+                const float heightFraction = (i + 0.5f) / (float)(std::max)(1, standTop);
+                const XMFLOAT4 windRot = WindRotation(tree, heightFraction);
                 if (model) {
                     // Draw this segment's slice of the real palm. The slice already
                     // carries its own height within the model, so it is placed from
                     // the TREE BASE -- not from the box's centre, which would double
                     // up the height offset.
-                    m_items.push_back(ModelItem(tree, XMFLOAT4(0,0,0,1),
+                    m_items.push_back(ModelItem(tree, windRot,
                                                 XMFLOAT3(tree.x, tree.baseY, tree.z),
                                                 i, false, TrunkColor(s.health)));
                 } else {
+                    const XMVECTOR rel = XMVectorSet(s.offX, s.centerY - tree.baseY, 0, 0);
+                    XMFLOAT3 bent;
+                    XMStoreFloat3(&bent, XMVector3Rotate(rel, XMLoadFloat4(&windRot)));
                     m_items.push_back(BoxItem(
-                        XMFLOAT3(tree.x + s.offX, s.centerY, tree.z),
-                        XMFLOAT4(0.0f, 0.0f, 0.0f, 1.0f),
+                        XMFLOAT3(tree.x + bent.x, tree.baseY + bent.y, tree.z + bent.z),
+                        windRot,
                         XMFLOAT3(s.radius, tree.segLen * 0.5f, s.radius),
                         TrunkColor(s.health), false));
                 }
             }
             if (!tree.felled) {
+                const XMFLOAT4 crownWind = WindRotation(tree, 1.0f);
                 if (model) {
-                    m_items.push_back(ModelItem(tree, XMFLOAT4(0,0,0,1),
+                    m_items.push_back(ModelItem(tree, crownWind,
                                                 XMFLOAT3(tree.x, tree.baseY, tree.z),
                                                 -1, true, kFrondColor));
                 } else {
                     const float crownY = tree.baseY + tree.segLen * tree.segments.size();
-                    for (const Piece& p : CrownPieces(tree, crownY))
-                        m_items.push_back(BoxItem(p.localPos, p.localRot, p.half,
+                    for (const Piece& p : CrownPieces(tree, crownY)) {
+                        const XMVECTOR rel = XMVectorSet(p.localPos.x - tree.x,
+                            p.localPos.y - tree.baseY, p.localPos.z - tree.z, 0);
+                        XMFLOAT3 bent;
+                        XMStoreFloat3(&bent, XMVector3Rotate(rel, XMLoadFloat4(&crownWind)));
+                        XMFLOAT4 rotation;
+                        XMStoreFloat4(&rotation, XMQuaternionMultiply(
+                            XMLoadFloat4(&p.localRot), XMLoadFloat4(&crownWind)));
+                        m_items.push_back(BoxItem(
+                            XMFLOAT3(tree.x + bent.x, tree.baseY + bent.y, tree.z + bent.z),
+                            rotation, p.half,
                                                   kFrondColor, true));
+                    }
                 }
             }
         }
@@ -851,6 +894,9 @@ private:
     std::vector<float> m_heights;
 
     float m_accumulator = 0.0f;
+    float m_windTime = 0.0f;
+    float m_windStrength = 0.28f;
+    float m_windSpeed = 1.6f;
     int   m_activeBodies = 0;
 };
 
