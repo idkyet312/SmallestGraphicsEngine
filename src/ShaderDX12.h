@@ -2,6 +2,7 @@
 #define SHADER_DX12_H
 
 #include "DX12Core.h"
+#include "SceneGraph.h"   // SceneMaterial: caches its descriptor slot (see SetObjectMaterial)
 #include <fstream>
 #include <sstream>
 #include <cstdio>
@@ -212,20 +213,50 @@ public:
     UINT currentDrawCall = 0;
     UINT currentSrvOffset = 0; // For material descriptors
 
+    // The shared CBV/SRV/UAV heap is carved into three regions:
+    //   [0, 64)                      globals, owned elsewhere (ImGui font, etc.)
+    //   [64, kPersistentSrvEnd)      PERSISTENT: cached per-material descriptors
+    //   [kPersistentSrvEnd, end)     per-frame scratch, reset every BeginFrame
+    //
+    // The persistent region exists because a material's textures never change once
+    // it is loaded, yet the descriptors were being recreated on every single draw:
+    // the destructible house alone is ~588 textured chunks, so that was ~1,764
+    // CreateShaderResourceView calls per frame for descriptors that were bit for
+    // bit identical each time. Now each material takes a slot here on its first
+    // draw and reuses it forever.
+    static constexpr UINT kPersistentSrvBegin = 64;
+    static constexpr UINT kPersistentSrvEnd   = 4096;   // room for ~1,344 materials
+    UINT persistentSrvOffset = kPersistentSrvBegin;
+
+    // Handles for descriptor slot `index` in the shared heap.
+    static void SrvHandlesAt(UINT index, D3D12_CPU_DESCRIPTOR_HANDLE& cpuHandle,
+                             D3D12_GPU_DESCRIPTOR_HANDLE& gpuHandle) {
+        const UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        gpuHandle = g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart();
+        cpuHandle.ptr += (SIZE_T)index * descriptorSize;
+        gpuHandle.ptr += (UINT64)index * descriptorSize;
+    }
+
+    // Claim 3 consecutive PERSISTENT descriptors for a material. Returns ~0u when
+    // that region is full, in which case the caller falls back to the per-frame
+    // path and simply pays the old cost.
+    UINT ReservePersistentMaterialSrvs() {
+        if (persistentSrvOffset + 3 > kPersistentSrvEnd) return ~0u;
+        const UINT slot = persistentSrvOffset;
+        persistentSrvOffset += 3;
+        return slot;
+    }
+
     // Reserve 3 consecutive material descriptors (albedo/normal/metal-rough) from
-    // the shared CBV/SRV/UAV heap. Returns false when the frame has used them all
+    // the per-frame scratch region. Returns false when the frame has used them all
     // -- writing past the heap corrupts unrelated allocations (it used to clobber
     // ImGui's font descriptor, making the UI vanish once enough smoke was alive).
     bool ReserveMaterialSrvs(D3D12_CPU_DESCRIPTOR_HANDLE& cpuHandle,
                              D3D12_GPU_DESCRIPTOR_HANDLE& gpuHandle) {
         if (currentSrvOffset + 3 > CBV_SRV_UAV_HEAP_SIZE) return false;
-
-        const UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
-        gpuHandle = g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart();
-        cpuHandle.ptr += currentSrvOffset * descriptorSize;
-        gpuHandle.ptr += currentSrvOffset * descriptorSize;
+        SrvHandlesAt(currentSrvOffset, cpuHandle, gpuHandle);
         currentSrvOffset += 3;
         return true;
     }
@@ -649,13 +680,20 @@ public:
         g_dx12.commandList->SetGraphicsRootDescriptorTable(6, g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart());
     }
     
+    // Diagnostic: how many descriptors we had to create this frame, and how many
+    // draws found theirs already cached.
+    UINT srvCreatesThisFrame = 0;
+    UINT srvCacheHitsThisFrame = 0;
+
     // Call this at the start of each frame to reset draw call counter
     void BeginFrame() {
+        srvCreatesThisFrame = 0;
+        srvCacheHitsThisFrame = 0;
         currentDrawCall = 0;
-        // Start after standard descriptors (if any). Let's assume 0-10 reserved or something?
-        // Actually, main_dx12 might use some slots.
-        // Let's reserve 0-63 for globals.
-        currentSrvOffset = 64; 
+        // The per-frame scratch region starts ABOVE the persistent one -- resetting
+        // to 64 here would hand out slots already owned by cached materials and
+        // scribble over their descriptors.
+        currentSrvOffset = kPersistentSrvEnd;
     }
     
     // Get the buffer index for per-draw-call data
@@ -725,9 +763,15 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
     }
     
+    // `cacheOwner`, when given, is the material these textures belong to. Its three
+    // descriptors are then created ONCE into the heap's persistent region and
+    // reused on every later draw, instead of being rebuilt per draw. Pass it for
+    // anything drawn from a long-lived SceneMaterial; leave it null for one-off
+    // materials assembled on the fly.
     void SetObjectMaterial(const XMFLOAT3& color, bool useTex, bool useNorm, float metal, float rough,
                           ID3D12Resource* albedo, ID3D12Resource* normal, ID3D12Resource* metalRough,
-                          bool roughnessOnly = false, float opacity = 1.0f, bool alphaCut = false) {
+                          bool roughnessOnly = false, float opacity = 1.0f, bool alphaCut = false,
+                          SceneMaterial* cacheOwner = nullptr) {
         UINT bufferIndex = GetDrawCallIndex();
 
         ObjectBufferDX12 data;
@@ -749,7 +793,31 @@ public:
 
              D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
              D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle;
-             if (!ReserveMaterialSrvs(cpuHandle, gpuHandle)) return;  // heap full this frame
+
+             // Already cached? Then the descriptors are still valid -- a material's
+             // textures never change after load -- so just point the table at them.
+             // This is the whole win: no CreateShaderResourceView calls at all.
+             if (cacheOwner && cacheOwner->srvHeapSlot != ~0u) {
+                 SrvHandlesAt(cacheOwner->srvHeapSlot, cpuHandle, gpuHandle);
+                 g_dx12.commandList->SetGraphicsRootDescriptorTable(7, gpuHandle);
+                 ++srvCacheHitsThisFrame;
+                 return;
+             }
+             srvCreatesThisFrame += 3;
+
+             if (cacheOwner) {
+                 // First draw of this material: claim a permanent slot and build its
+                 // descriptors there, once.
+                 const UINT slot = ReservePersistentMaterialSrvs();
+                 if (slot != ~0u) {
+                     cacheOwner->srvHeapSlot = slot;
+                     SrvHandlesAt(slot, cpuHandle, gpuHandle);
+                 } else if (!ReserveMaterialSrvs(cpuHandle, gpuHandle)) {
+                     return;   // persistent region full AND the frame's scratch is too
+                 }
+             } else if (!ReserveMaterialSrvs(cpuHandle, gpuHandle)) {
+                 return;  // heap full this frame
+             }
 
              // Create SRVs
              // Albedo (t1)

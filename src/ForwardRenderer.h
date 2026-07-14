@@ -32,14 +32,17 @@ struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
     ComPtr<ID3D12Resource>   planeVertexBuffer;
     ComPtr<ID3D12Resource>   sphereVertexBuffer;
+    ComPtr<ID3D12Resource>   capsuleVertexBuffer;
     ComPtr<ID3D12Resource>   quadVertexBuffer;      // unit XY billboard quad
     ComPtr<ID3D12Resource>   flashVertexBuffer;     // first cell of 4-frame VFX sheet
     D3D12_VERTEX_BUFFER_VIEW cubeVBV  = {};
     D3D12_VERTEX_BUFFER_VIEW planeVBV = {};
     D3D12_VERTEX_BUFFER_VIEW sphereVBV = {};
+    D3D12_VERTEX_BUFFER_VIEW capsuleVBV = {};
     D3D12_VERTEX_BUFFER_VIEW quadVBV = {};
     D3D12_VERTEX_BUFFER_VIEW flashVBV = {};
     UINT                     sphereVertexCount = 0;
+    UINT                     capsuleVertexCount = 0;
 };
 
 // Vertex layout shared across renderers
@@ -111,6 +114,13 @@ inline void DrawSphere(const GeometryBuffers& geo) {
     g_dx12.commandList->DrawInstanced(geo.sphereVertexCount, 1, 0, 0);
 }
 
+inline void DrawCapsule(const GeometryBuffers& geo) {
+    if (!geo.capsuleVertexCount) { DrawSphere(geo); return; }
+    g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.capsuleVBV);
+    g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_dx12.commandList->DrawInstanced(geo.capsuleVertexCount, 1, 0, 0);
+}
+
 // UV sphere as a non-indexed triangle list of VertexPosNormUV.
 inline std::vector<VertexPosNormUV> BuildSphereVertices(int stacks = 12, int slices = 16) {
     std::vector<VertexPosNormUV> verts;
@@ -125,6 +135,54 @@ inline std::vector<VertexPosNormUV> BuildSphereVertices(int stacks = 12, int sli
         VertexPosNormUV a = at(st, sl), b = at(st + 1, sl), c = at(st + 1, sl + 1), d = at(st, sl + 1);
         verts.push_back(a); verts.push_back(b); verts.push_back(c);
         verts.push_back(a); verts.push_back(c); verts.push_back(d);
+    }
+    return verts;
+}
+
+// Y-axis capsule contained in x/z +/-0.25 and y +/-0.5. Ragdoll transforms
+// scale it to each physics part. Cylinder middle keeps limbs connected and
+// readable; stretched spheres tapered to points and looked like floating blobs.
+inline std::vector<VertexPosNormUV> BuildCapsuleVertices(int hemiRings = 6, int slices = 16) {
+    struct Ring { float y, radius, normalY, normalRadius; };
+    std::vector<Ring> rings;
+    constexpr float pi = 3.14159265f;
+    constexpr float radius = 0.25f;
+    constexpr float cylinderHalf = 0.25f;
+
+    for (int i = 0; i <= hemiRings; ++i) {
+        const float angle = -pi * 0.5f + pi * 0.5f * (float)i / hemiRings;
+        rings.push_back({ -cylinderHalf + radius * sinf(angle), radius * cosf(angle),
+                          sinf(angle), cosf(angle) });
+    }
+    rings.push_back({ cylinderHalf, radius, 0.0f, 1.0f });
+    for (int i = 1; i <= hemiRings; ++i) {
+        const float angle = pi * 0.5f * (float)i / hemiRings;
+        rings.push_back({ cylinderHalf + radius * sinf(angle), radius * cosf(angle),
+                          sinf(angle), cosf(angle) });
+    }
+
+    auto at = [&](size_t ring, int slice) {
+        const float u = (float)slice / slices;
+        const float theta = u * 2.0f * pi;
+        const Ring& r = rings[ring];
+        const float c = cosf(theta), s = sinf(theta);
+        return VertexPosNormUV{
+            { r.radius * c, r.y, r.radius * s },
+            { r.normalRadius * c, r.normalY, r.normalRadius * s },
+            { u, (float)ring / (rings.size() - 1) }
+        };
+    };
+
+    std::vector<VertexPosNormUV> verts;
+    for (size_t ring = 0; ring + 1 < rings.size(); ++ring) {
+        for (int slice = 0; slice < slices; ++slice) {
+            const VertexPosNormUV a = at(ring, slice);
+            const VertexPosNormUV b = at(ring + 1, slice);
+            const VertexPosNormUV c = at(ring + 1, slice + 1);
+            const VertexPosNormUV d = at(ring, slice + 1);
+            verts.push_back(a); verts.push_back(b); verts.push_back(c);
+            verts.push_back(a); verts.push_back(c); verts.push_back(d);
+        }
     }
     return verts;
 }
@@ -158,7 +216,8 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
                 prim.material->metallicRoughnessTexture.Get(),
                 prim.material->roughnessOnlyTexture,
                 prim.material->baseColorFactor.w,
-                prim.material->alphaCutout);
+                prim.material->alphaCutout,
+                prim.material.get());   // cache its descriptors: they never change
         } else {
             shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
         }
@@ -208,7 +267,9 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
                     prim.material->normalTexture.Get(),
                     prim.material->metallicRoughnessTexture.Get(),
                     prim.material->roughnessOnlyTexture,
-                    prim.material->baseColorFactor.w);
+                    prim.material->baseColorFactor.w,
+                    prim.material->alphaCutout,
+                    prim.material.get());   // cache its descriptors: they never change
             } else {
                 shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
             }
@@ -303,7 +364,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                                  floorMaterial->baseColorTexture.Get(),
                                  floorMaterial->normalTexture.Get(),
                                  floorMaterial->metallicRoughnessTexture.Get(),
-                                 floorMaterial->roughnessOnlyTexture);
+                                 floorMaterial->roughnessOnlyTexture,
+                                 1.0f, false,
+                                 floorMaterial.get());   // cached: never changes
     } else {
         shader.SetObjectColor(scene.floor.color);
     }
@@ -339,8 +402,27 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         for (const RagdollRenderItem& item : g_destruction.GetRagdollRenderItems()) {
             shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
             shader.SetObjectColor(item.color);
-            DrawCube(geo);
+            // Physics remains box-based. Capsules provide continuous limbs and
+            // torso; only the head uses a sphere.
+            if (item.shape == 2) DrawSphere(geo);
+            else if (item.shape == 1) DrawCapsule(geo);
+            else DrawCube(geo);
             shader.NextDrawCall();
+        }
+        // Hover enemies carry the same imported AK as the player. Gun transforms
+        // are aimed independently while ragdoll limbs trail under physics.
+        for (const EnemyGunRenderItem& gun : g_destruction.GetEnemyGunRenderItems()) {
+            const XMMATRIX xf = XMLoadFloat4x4(&gun.transform);
+            if (GunModel::Loaded()) {
+                DrawMeshAt(GunModel::Mesh(), shader, xf, view, proj, lightSpace);
+                shader.Use(scene.wireframeMode);
+            } else {
+                shader.SetMatrices(XMMatrixScaling(0.22f, 0.18f, 1.35f) * xf,
+                                   view, proj, lightSpace);
+                shader.SetObjectColor(XMFLOAT3(0.06f, 0.055f, 0.05f));
+                DrawCube(geo);
+                shader.NextDrawCall();
+            }
         }
     }
 
@@ -452,13 +534,15 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
     }
 
-    // Second rope rig: the strung-up ragdoll. Same boxes, same path.
+    // Second rope rig: rope stays box-like; body parts use capsules and a head sphere.
     if (g_gibbet.IsInitialized()) {
         shader.Use(scene.wireframeMode);
         for (const RopeItem& item : g_gibbet.GetItems()) {
             shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
             shader.SetObjectColor(item.color);
-            DrawCube(geo);
+            if (item.shape == 2) DrawSphere(geo);
+            else if (item.shape == 1) DrawCapsule(geo);
+            else DrawCube(geo);
             shader.NextDrawCall();
         }
     }
@@ -570,14 +654,18 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.UseAdditive();
         model = XMMatrixScaling(haloR * 2.0f, haloR * 2.0f, len) * basis;
         shader.SetMatrices(model, view, proj, lightSpace);
-        shader.SetEmissiveMaterial(XMFLOAT3(4.0f, 0.55f, 0.025f), 0.24f);
+        const XMFLOAT3 halo = p.hostile ? XMFLOAT3(5.0f, 0.08f, 0.015f)
+                                        : XMFLOAT3(4.0f, 0.55f, 0.025f);
+        shader.SetEmissiveMaterial(halo, 0.24f);
         DrawCube(geo);
         shader.NextDrawCall();
 
         const float coreR = haloR * 0.38f;
         model = XMMatrixScaling(coreR * 2.0f, coreR * 2.0f, len * 0.92f) * basis;
         shader.SetMatrices(model, view, proj, lightSpace);
-        shader.SetEmissiveMaterial(XMFLOAT3(9.0f, 3.2f, 0.45f), 0.92f);
+        const XMFLOAT3 core = p.hostile ? XMFLOAT3(9.0f, 0.8f, 0.18f)
+                                        : XMFLOAT3(9.0f, 3.2f, 0.45f);
+        shader.SetEmissiveMaterial(core, 0.92f);
         DrawCube(geo);
         shader.NextDrawCall();
         shader.Use(scene.wireframeMode);
@@ -718,6 +806,21 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             DrawFlashQuad(geo);
             shader.NextDrawCall();
             shader.Use(scene.wireframeMode);
+        }
+    }
+
+    // Diagnostic: prove the material-descriptor cache and the destruction
+    // early-out are doing what they claim. Written once, a couple of seconds in,
+    // so the numbers reflect a settled steady-state frame rather than startup.
+    {
+        static int frames = 0;
+        if (++frames == 300) {
+            if (FILE* f = std::fopen("perf_counters.log", "w")) {
+                std::fprintf(f, "srvCreates=%u srvCacheHits=%u destructionRenderItems=%zu\n",
+                             shader.srvCreatesThisFrame, shader.srvCacheHitsThisFrame,
+                             g_destruction.GetRenderItems().size());
+                std::fclose(f);
+            }
         }
     }
 

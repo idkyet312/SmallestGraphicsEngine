@@ -34,15 +34,15 @@ public:
         if (FAILED(g_dx12.commandList.As(&commandList6))) return false;
 
         ComPtr<ID3DBlob> as, ms, ps;
-        if (FAILED(D3DReadFileToBlob(L"shaders/terrain_as.cso", &as))) {
+        if (FAILED(ReadCompiledShaderDX12(L"shaders/terrain_as.cso", &as))) {
             std::cerr << "Terrain amplification shader DXIL missing: shaders/terrain_as.cso\n";
             return false;
         }
-        if (FAILED(D3DReadFileToBlob(L"shaders/terrain_ms.cso", &ms))) {
+        if (FAILED(ReadCompiledShaderDX12(L"shaders/terrain_ms.cso", &ms))) {
             std::cerr << "Terrain mesh shader DXIL missing: shaders/terrain_ms.cso\n";
             return false;
         }
-        if (FAILED(D3DReadFileToBlob(L"shaders/mesh_ps.cso", &ps))) {
+        if (FAILED(ReadCompiledShaderDX12(L"shaders/mesh_ps.cso", &ps))) {
             std::cerr << "Mesh pixel shader DXIL missing: shaders/mesh_ps.cso\n";
             return false;
         }
@@ -87,7 +87,7 @@ public:
 
         stream.raster.value.FillMode = D3D12_FILL_MODE_WIREFRAME;
         ComPtr<ID3DBlob> wirePs;
-        if (SUCCEEDED(D3DReadFileToBlob(L"shaders/wire_green_ps.cso", &wirePs))) {
+        if (SUCCEEDED(ReadCompiledShaderDX12(L"shaders/wire_green_ps.cso", &wirePs))) {
             stream.ps.value = { wirePs->GetBufferPointer(), wirePs->GetBufferSize() };
         }
         if (FAILED(device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&psoWireframe)))) {

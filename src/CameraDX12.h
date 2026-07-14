@@ -61,8 +61,8 @@ public:
         }
     }
 
-    void ProcessKeyboard(char direction, float deltaTime) {
-        float velocity = MovementSpeed * deltaTime;
+    void ProcessKeyboard(char direction, float deltaTime, float speedMultiplier = 1.0f) {
+        float velocity = MovementSpeed * speedMultiplier * deltaTime;
         
         if (FPSMode) {
             if (direction == ' ') { Jump(); return; }

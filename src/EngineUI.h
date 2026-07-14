@@ -7,6 +7,7 @@
 #include "DestructionDX12.h"
 #include "VirtualInput.h"
 #include "GrassField.h"
+#include <cstdio>
 
 // Forward declare raytracing context
 struct RaytracingContext;
@@ -81,6 +82,47 @@ inline void RenderMovementPad() {
     ImGui::SliderFloat("Look Speed", &virtualInput.lookSpeed, 20.0f, 600.0f, "%.0f");
 
     ImGui::End();
+}
+
+inline void RenderPlayerHUD(const Scene& scene) {
+    const ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+
+    // Brief red hit flash. Draw first so HUD stays readable above it.
+    if (scene.playerDamageFlash > 0.0f) {
+        const float alpha = (std::min)(0.32f, scene.playerDamageFlash * 1.35f);
+        draw->AddRectFilled(ImVec2(0.0f, 0.0f), io.DisplaySize,
+                            ImGui::GetColorU32(ImVec4(0.75f, 0.0f, 0.0f, alpha)));
+    }
+
+    const float maxHealth = (std::max)(1.0f, scene.playerMaxHealth);
+    const float fraction = (std::max)(0.0f, (std::min)(1.0f, scene.playerHealth / maxHealth));
+    const ImVec2 min(24.0f, io.DisplaySize.y - 52.0f);
+    const ImVec2 max(min.x + 270.0f, min.y + 26.0f);
+    const ImVec2 fillMax(min.x + (max.x - min.x) * fraction, max.y);
+
+    draw->AddRectFilled(ImVec2(min.x - 3.0f, min.y - 3.0f),
+                        ImVec2(max.x + 3.0f, max.y + 3.0f), IM_COL32(0, 0, 0, 190), 4.0f);
+    const int red = (int)(255.0f * (1.0f - fraction));
+    const int green = (int)(220.0f * fraction);
+    if (fraction > 0.0f)
+        draw->AddRectFilled(min, fillMax, IM_COL32(red, green, 35, 235), 2.0f);
+    draw->AddRect(min, max, IM_COL32(255, 255, 255, 210), 2.0f, 0, 1.5f);
+
+    char label[48];
+    snprintf(label, sizeof(label), "HEALTH  %.0f / %.0f", scene.playerHealth, maxHealth);
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    draw->AddText(ImVec2(min.x + ((max.x - min.x) - textSize.x) * 0.5f,
+                         min.y + ((max.y - min.y) - textSize.y) * 0.5f),
+                  IM_COL32(255, 255, 255, 255), label);
+
+    if (scene.playerHealth <= 0.0f) {
+        const char* dead = "YOU DIED";
+        const ImVec2 deadSize = ImGui::CalcTextSize(dead);
+        draw->AddText(ImVec2((io.DisplaySize.x - deadSize.x) * 0.5f,
+                             io.DisplaySize.y * 0.42f),
+                      IM_COL32(255, 55, 40, 255), dead);
+    }
 }
 
 inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
@@ -269,6 +311,11 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     ImGui::Separator();
+    ImGui::TextColored(scene.playerHealth > 30.0f ? ImVec4(0.3f, 1.0f, 0.35f, 1.0f)
+                                                   : ImVec4(1.0f, 0.2f, 0.12f, 1.0f),
+                       "Health: %.0f / %.0f", scene.playerHealth, scene.playerMaxHealth);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Restore")) scene.RestorePlayerHealth();
     ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
     
     const char* renderer = "Forward Clustered";

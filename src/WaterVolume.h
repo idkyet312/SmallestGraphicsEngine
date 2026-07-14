@@ -182,6 +182,30 @@ public:
         if (m_ripples.size() > 24) m_ripples.erase(m_ripples.begin());
     }
 
+    // Swept bullet test against the live wavy surface. Endpoint signs catch a
+    // crossing even when a fast round travels several metres in one frame.
+    bool ShootSurface(const XMFLOAT3& start, const XMFLOAT3& end,
+                      XMFLOAT3& hit, float strength = 0.38f) {
+        if (!IsInitialized()) return false;
+        const float startSurface = m_surfaceY + WaveHeightAt(start.x, start.z);
+        const float endSurface = m_surfaceY + WaveHeightAt(end.x, end.z);
+        const float d0 = start.y - startSurface;
+        const float d1 = end.y - endSurface;
+        if (d0 * d1 > 0.0f || std::abs(d0 - d1) < 1e-6f) return false;
+
+        const float t = (std::max)(0.0f, (std::min)(1.0f, d0 / (d0 - d1)));
+        const float x = start.x + (end.x - start.x) * t;
+        const float z = start.z + (end.z - start.z) * t;
+        const float halfX = m_extents.x * 0.5f;
+        const float halfZ = m_extents.z * 0.5f;
+        if (x < m_center.x - halfX || x > m_center.x + halfX ||
+            z < m_center.z - halfZ || z > m_center.z + halfZ) return false;
+
+        hit = { x, m_surfaceY + WaveHeightAt(x, z), z };
+        Splash(x, z, strength);
+        return true;
+    }
+
     // Surface elevation above rest at world (x,z): calm-edged swell plus decaying
     // circular ripples. Drives buoyancy (the render mesh wants the slope too, so
     // it calls WaveHeightAndSlopeAt directly). Defined in terms of that one
