@@ -33,7 +33,7 @@ public:
         desc.SampleDesc.Count = 1;
         HRESULT hr = g_dx12.device->CreateCommittedResource(
             &heap, D3D12_HEAP_FLAG_NONE, &desc,
-            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            D3D12_RESOURCE_STATE_COMMON, nullptr,
             IID_PPV_ARGS(&previousDepth));
         if (FAILED(hr)) return false;
 
@@ -59,7 +59,7 @@ public:
         return gpu;
     }
 
-    // Direct queue: release resources to COPY states at end of rendered frame.
+    // Direct queue: release resources through COMMON for copy-queue ownership.
     void PrepareCapture(ID3D12GraphicsCommandList* cmd) {
         if (!initialized || !previousDepth || !g_dx12.depthStencilBuffer) return;
         cmd->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
@@ -68,14 +68,14 @@ public:
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = g_dx12.depthStencilBuffer.Get();
         barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
         barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[1].Transition.pResource = previousDepth.Get();
         barriers[1].Transition.StateBefore = valid
             ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-            : D3D12_RESOURCE_STATE_COPY_DEST;
-        barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            : D3D12_RESOURCE_STATE_COMMON;
+        barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
         barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         cmd->ResourceBarrier(valid ? 2 : 1, barriers);
         copyPending = true;
@@ -90,8 +90,28 @@ public:
         ThrowIfFailed(g_dx12.copyAllocators[pendingFrame]->Reset());
         ThrowIfFailed(g_dx12.copyCommandList->Reset(
             g_dx12.copyAllocators[pendingFrame].Get(), nullptr));
+
+        D3D12_RESOURCE_BARRIER preBarriers[2] = {};
+        preBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        preBarriers[0].Transition.pResource = g_dx12.depthStencilBuffer.Get();
+        preBarriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        preBarriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        preBarriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        preBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        preBarriers[1].Transition.pResource = previousDepth.Get();
+        preBarriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        preBarriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        preBarriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_dx12.copyCommandList->ResourceBarrier(2, preBarriers);
         g_dx12.copyCommandList->CopyResource(previousDepth.Get(),
                                              g_dx12.depthStencilBuffer.Get());
+
+        D3D12_RESOURCE_BARRIER postBarriers[2] = { preBarriers[0], preBarriers[1] };
+        postBarriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        postBarriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        postBarriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        postBarriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        g_dx12.copyCommandList->ResourceBarrier(2, postBarriers);
         ThrowIfFailed(g_dx12.copyCommandList->Close());
 
         ThrowIfFailed(g_dx12.copyQueue->Wait(
@@ -115,12 +135,12 @@ public:
         D3D12_RESOURCE_BARRIER barriers[2] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = g_dx12.depthStencilBuffer.Get();
-        barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
         barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
         barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[1].Transition.pResource = previousDepth.Get();
-        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
         barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         cmd->ResourceBarrier(2, barriers);

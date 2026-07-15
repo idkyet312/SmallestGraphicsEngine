@@ -12,6 +12,10 @@ public:
     ComPtr<ID3D12RootSignature> rootSig;
     ComPtr<ID3D12PipelineState> pso;
     ComPtr<ID3D12DescriptorHeap> srvUavHeap; // shader-visible; each texture's dispatches get their own slice
+    ComPtr<ID3D12CommandAllocator> graphicsHandoffAllocator;
+    ComPtr<ID3D12GraphicsCommandList> graphicsHandoffList;
+    ComPtr<ID3D12Fence> graphicsHandoffFence;
+    UINT64 graphicsHandoffFenceValue = 0;
     UINT nextDescriptorSlot = 0;
     bool loaded = false;
     struct PendingMip {
@@ -121,6 +125,18 @@ public:
         hr = g_dx12.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&srvUavHeap));
         if (FAILED(hr)) return false;
 
+        hr = g_dx12.device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&graphicsHandoffAllocator));
+        if (FAILED(hr)) return false;
+        hr = g_dx12.device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, graphicsHandoffAllocator.Get(), nullptr,
+            IID_PPV_ARGS(&graphicsHandoffList));
+        if (FAILED(hr)) return false;
+        if (FAILED(graphicsHandoffList->Close())) return false;
+        hr = g_dx12.device->CreateFence(
+            0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&graphicsHandoffFence));
+        if (FAILED(hr)) return false;
+
         loaded = true;
         return true;
     }
@@ -132,8 +148,8 @@ public:
         float texelSizeY;
     };
 
-    // texture must already have mip 0 uploaded and be in PIXEL_SHADER_RESOURCE state.
-    // Leaves the texture back in PIXEL_SHADER_RESOURCE state when done.
+    // Texture arrives in NON_PIXEL_SHADER_RESOURCE so every state used by the
+    // dedicated compute list is legal for that queue.
     void GenerateMips(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* texture,
                        UINT width, UINT height, UINT16 mipLevels) {
         if (!loaded || mipLevels <= 1) return;
@@ -154,8 +170,28 @@ public:
         for (const PendingMip& request : pending)
             RecordMips(cmdList, request.texture.Get(), request.width,
                        request.height, request.mipLevels);
-        pending.clear();
         SubmitComputeCommands();
+
+        // Compute queues cannot transition to PIXEL_SHADER_RESOURCE. Perform
+        // that final ownership/state handoff on a small direct command list.
+        WaitForFenceCPU(graphicsHandoffFence.Get(), graphicsHandoffFenceValue);
+        ThrowIfFailed(graphicsHandoffAllocator->Reset());
+        ThrowIfFailed(graphicsHandoffList->Reset(graphicsHandoffAllocator.Get(), nullptr));
+        std::vector<D3D12_RESOURCE_BARRIER> barriers(pending.size());
+        for (size_t i = 0; i < pending.size(); ++i) {
+            barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[i].Transition.pResource = pending[i].texture.Get();
+            barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        graphicsHandoffList->ResourceBarrier((UINT)barriers.size(), barriers.data());
+        ThrowIfFailed(graphicsHandoffList->Close());
+        ID3D12CommandList* handoffLists[] = { graphicsHandoffList.Get() };
+        g_dx12.commandQueue->ExecuteCommandLists(1, handoffLists);
+        const UINT64 value = ++graphicsHandoffFenceValue;
+        ThrowIfFailed(g_dx12.commandQueue->Signal(graphicsHandoffFence.Get(), value));
+        pending.clear();
     }
 
 private:
@@ -184,20 +220,14 @@ private:
             UINT dstW = std::max(1u, srcW / 2);
             UINT dstH = std::max(1u, srcH / 2);
 
-            // Transition source mip to SRV-readable, dest mip to UAV-writable
-            D3D12_RESOURCE_BARRIER preBarriers[2] = {};
-            preBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            preBarriers[0].Transition.pResource = texture;
-            preBarriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            preBarriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            preBarriers[0].Transition.Subresource = level - 1;
-
-            preBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            preBarriers[1].Transition.pResource = texture;
-            preBarriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            preBarriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            preBarriers[1].Transition.Subresource = level;
-            cmdList->ResourceBarrier(2, preBarriers);
+            // Source is already compute-readable. Only destination changes.
+            D3D12_RESOURCE_BARRIER preBarrier = {};
+            preBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            preBarrier.Transition.pResource = texture;
+            preBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            preBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            preBarrier.Transition.Subresource = level;
+            cmdList->ResourceBarrier(1, &preBarrier);
 
             D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = srvUavHeap->GetCPUDescriptorHandleForHeapStart();
             UINT tableOffset = nextDescriptorSlot;
@@ -242,20 +272,13 @@ private:
             uavBarrier.UAV.pResource = texture;
             cmdList->ResourceBarrier(1, &uavBarrier);
 
-            // Transition both subresources back to PIXEL_SHADER_RESOURCE
-            D3D12_RESOURCE_BARRIER postBarriers[2] = {};
-            postBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            postBarriers[0].Transition.pResource = texture;
-            postBarriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            postBarriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            postBarriers[0].Transition.Subresource = level - 1;
-
-            postBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            postBarriers[1].Transition.pResource = texture;
-            postBarriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            postBarriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            postBarriers[1].Transition.Subresource = level;
-            cmdList->ResourceBarrier(2, postBarriers);
+            D3D12_RESOURCE_BARRIER postBarrier = {};
+            postBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            postBarrier.Transition.pResource = texture;
+            postBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            postBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            postBarrier.Transition.Subresource = level;
+            cmdList->ResourceBarrier(1, &postBarrier);
 
             srcW = dstW;
             srcH = dstH;
