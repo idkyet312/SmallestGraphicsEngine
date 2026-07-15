@@ -39,6 +39,7 @@
 #include "FBXImporter.h"
 #include "SkinnedFBXImporter.h"
 #include "SkinnedEnemy.h"
+#include "T3DPhysicsAsset.h"
 #include "WaterVolume.h"
 #include "RopeSwing.h"
 #include "PalmTrees.h"
@@ -58,10 +59,8 @@ TerrainRendererDX12         g_terrain;
 DestructionDX12             g_destruction;
 SkinnedEnemy                g_bandit;
 bool                        g_banditLoaded = false;
-bool                        g_banditDebugSkeleton = false; // overlay bones on the mesh
 
 // One-line Bandit status for the debug HUD (declared in EngineUI.h).
-extern bool g_banditDebugSkeleton;
 void BanditDebugText() {
     if (!g_banditLoaded) { ImGui::Text("Bandit: NOT LOADED"); return; }
     int textured = 0, parts = 0;
@@ -75,16 +74,8 @@ void BanditDebugText() {
                 g_bandit.model.skeleton.BoneCount(), parts, textured,
                 g_bandit.Palette().size(),
                 g_bandit.position.x, g_bandit.position.y, g_bandit.position.z);
-    ImGui::Checkbox("Bandit skeleton debug", &g_banditDebugSkeleton);
-    ImGui::TextUnformatted("Root (mesh+skeleton):");
-    ImGui::SliderFloat("Bandit pitch", &g_bandit.rootPitch, -3.15f, 3.15f);
-    ImGui::SliderFloat("Bandit roll", &g_bandit.rootRoll, -3.15f, 3.15f);
-    ImGui::SliderFloat("Bandit yaw", &g_bandit.yaw, -3.15f, 3.15f);
-    ImGui::SliderFloat("Bandit foot", &g_bandit.footOffset, -3.0f, 3.0f);
-    ImGui::TextUnformatted("Mesh only:");
-    ImGui::SliderFloat("Mesh pitch", &g_bandit.meshPitch, -3.15f, 3.15f);
-    ImGui::SliderFloat("Mesh roll", &g_bandit.meshRoll, -3.15f, 3.15f);
-    ImGui::SliderFloat("Mesh yaw", &g_bandit.meshYaw, -3.15f, 3.15f);
+    ImGui::Text("Bandit: %s health=%.0f", g_bandit.Dead() ? "dead" : "ground AI",
+                g_bandit.health);
 }
 WaterVolume                 g_water;
 WaterVolume                 g_ocean;   // sea ringing the island, surface at y = 0
@@ -1656,13 +1647,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         // Stand the Bandit on the terrain surface (its mesh origin is at the
         // feet). Sampled each frame so it stays grounded if it later walks.
-        if (g_banditLoaded) {
+        if (g_banditLoaded && !g_bandit.Dead()) {
+            float groundY = 0.0f;
             if (scene.useMeshTerrain && g_terrain.supported) {
                 TerrainRendererDX12::Params tp; tp.heightScale = scene.terrainHeightScale;
-                g_bandit.position.y = TerrainRendererDX12::HeightAt(tp, g_bandit.position.x, g_bandit.position.z);
-            } else {
-                g_bandit.position.y = 0.0f;
+                groundY = TerrainRendererDX12::HeightAt(tp, g_bandit.position.x, g_bandit.position.z);
             }
+            g_bandit.Update(deltaTime, scene.camera.Position, groundY);
         }
         g_water.Update(deltaTime);
         g_ocean.Update(deltaTime);
@@ -1703,6 +1694,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // damage radius only governs how far the fracture spreads once
                 // the bullet has struck. Otherwise the wall breaks at a distance.
                 const float bulletRadius = std::max(0.12f, scene.projectileScale * 0.5f);
+                if (g_banditLoaded && g_bandit.Shoot(projectile.previousPosition,
+                        projectile.position, projectile.direction, bulletRadius)) {
+                    const XMFLOAT3 normal(-projectile.direction.x, -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(projectile.position, normal);
+                    scene.SpawnSmokeBurst(projectile.position, 0.25f, 0.08f);
+                    projectile.active = false;
+                    continue;
+                }
                 if (g_destruction.HitTestSegment(projectile.previousPosition, projectile.position,
                                                  bulletRadius, hit)) {
                     std::cout << "Projectile hit wall at " << hit.x << ", "
@@ -1915,6 +1915,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 };
                 SkinnedModel bm = SkinnedFBXImporter::Load(
                     banditDir + "SK_Bandit.FBX", clips, g_dx12.device, g_dx12.commandList);
+                bm.ragdoll = T3DPhysicsAsset::Load(banditDir + "Phy_Bandit_PhysicsAsset.T3D");
                 if (bm.valid && g_bandit.Init(bm)) {
                     g_bandit.position = { 0.0f, 0.0f, 10.0f };
                     g_bandit.PlayClip("Walk");
@@ -1959,7 +1960,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
                 ProfilerDX12::Scope profile(g_profiler, "Shadow", g_dx12.commandList.Get());
-                lightSpace = shadowMap.Render(scene, geo, g_showH2Model ? crateModel : nullptr);
+                lightSpace = shadowMap.Render(scene, geo, g_showH2Model ? crateModel : nullptr,
+                                              g_banditLoaded ? &g_bandit : nullptr);
                 shadowResource = shadowMap.GetResource();
             }
             {
@@ -1969,17 +1971,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // Skinned Bandit: advance its clip and draw it through the mesh
                 // shader with GPU skinning. Drawn after the forward scene so it
                 // reuses the same bound root signature / descriptor heaps.
-                if (g_banditLoaded) {
-                    g_bandit.Update(deltaTime);
-                    // Always draw the skinned mesh; in debug also overlay the skeleton
-                    // joints so mesh and bones can be aligned with the same sliders.
-                    g_bandit.Draw(mainShader, scene.GetViewMatrix(), scene.GetProjectionMatrix(), lightSpace);
-                    if (g_banditDebugSkeleton) {
-                        mainShader.Use(false);
-                        g_bandit.DrawSkeleton(mainShader, scene.GetViewMatrix(),
-                            scene.GetProjectionMatrix(), lightSpace, [&] { DrawSphere(geo); });
-                    }
-                    mainShader.Use(scene.wireframeMode); // restore IA pipeline for anything after
+            if (g_banditLoaded) {
+                g_bandit.Draw(mainShader, scene.GetViewMatrix(), scene.GetProjectionMatrix(), lightSpace);
+                mainShader.Use(scene.wireframeMode); // restore IA pipeline for anything after
                 }
             }
         }

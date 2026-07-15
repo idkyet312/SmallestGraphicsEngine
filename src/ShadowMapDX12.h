@@ -6,6 +6,7 @@
 #include "Scene.h"
 #include "ForwardRenderer.h"
 #include "SceneGraph.h"
+#include "SkinnedEnemy.h"
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -50,15 +51,24 @@ public:
             return false;
         }
 
-        D3D12_ROOT_PARAMETER rootParam = {};
-        rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-        rootParam.Descriptor.ShaderRegister = 0;
-        rootParam.Descriptor.RegisterSpace = 0;
-        rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        D3D12_ROOT_PARAMETER rootParams[4] = {};
+        rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        rootParams[0].Descriptor.ShaderRegister = 0;
+        rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rootParams[1].Constants.ShaderRegister = 1;
+        rootParams[1].Constants.Num32BitValues = 1;
+        rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParams[2].Descriptor.ShaderRegister = 12;
+        rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        rootParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParams[3].Descriptor.ShaderRegister = 13;
+        rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        rootSigDesc.NumParameters = 1;
-        rootSigDesc.pParameters = &rootParam;
+        rootSigDesc.NumParameters = _countof(rootParams);
+        rootSigDesc.pParameters = rootParams;
         rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ComPtr<ID3DBlob> sigBlob;
@@ -129,6 +139,17 @@ public:
         data.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
         matrixBuffer.CopyData(index, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(0, matrixBuffer.GetGPUAddress(index));
+        const UINT disabled = 0;
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(1, 1, &disabled, 0);
+    }
+
+    void SetSkinning(D3D12_GPU_VIRTUAL_ADDRESS palette, D3D12_GPU_VIRTUAL_ADDRESS skin) {
+        const UINT enabled = palette && skin ? 1u : 0u;
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(1, 1, &enabled, 0);
+        if (enabled) {
+            g_dx12.commandList->SetGraphicsRootShaderResourceView(2, palette);
+            g_dx12.commandList->SetGraphicsRootShaderResourceView(3, skin);
+        }
     }
 
     void NextDrawCall() {
@@ -212,7 +233,8 @@ public:
 
     XMMATRIX Render(Scene& scene,
                     const GeometryBuffers& geo,
-                    const std::shared_ptr<SceneNode>& crateModel) {
+                    const std::shared_ptr<SceneNode>& crateModel,
+                    SkinnedEnemy* bandit = nullptr) {
         XMMATRIX lightSpace = ComputeLightSpace(scene);
         if (!initialized || scene.lightType != 0) return lightSpace;
 
@@ -269,6 +291,25 @@ public:
             depthShader.SetMatrices(model, lightSpace);
             DrawCube(geo);
             depthShader.NextDrawCall();
+        }
+
+        if (bandit && bandit->CanRender()) {
+            const D3D12_GPU_VIRTUAL_ADDRESS palette = bandit->UploadPalette();
+            const XMMATRIX model = bandit->MeshWorldMatrix();
+            for (const auto& prim : bandit->model.node->mesh->primitives) {
+                if (!prim.vbv.BufferLocation || !prim.skinBuffer) continue;
+                depthShader.SetMatrices(model, lightSpace);
+                depthShader.SetSkinning(palette, prim.skinBuffer->GetGPUVirtualAddress());
+                g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
+                g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                if (prim.ibv.BufferLocation) {
+                    g_dx12.commandList->IASetIndexBuffer(&prim.ibv);
+                    g_dx12.commandList->DrawIndexedInstanced(prim.indexCount, 1, 0, 0, 0);
+                } else {
+                    g_dx12.commandList->DrawInstanced((UINT)(prim.vertices.size() / 12), 1, 0, 0);
+                }
+                depthShader.NextDrawCall();
+            }
         }
 
         for (auto& p : scene.projectiles) {

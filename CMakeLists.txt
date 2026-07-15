@@ -79,6 +79,7 @@ set(HEADER_FILES
     src/DX11Core.h
     src/DX12Core.h
     src/ProfilerDX12.h
+    src/T3DPhysicsAsset.h
     src/Model.h
     src/ModelDX11.h
     src/Shader.h

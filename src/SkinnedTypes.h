@@ -61,7 +61,7 @@ struct AnimationClip {
 struct RagdollBodySpec {
     std::string bone;
     uint8_t     shape = 1;                  // 1 capsule (Sphyl), 0 box
-    DirectX::XMFLOAT3 center = {};          // bone-local, metres
+    DirectX::XMFLOAT3 center = {};          // bone-local, native skeleton units (UE cm)
     DirectX::XMFLOAT4 rotation = { 0,0,0,1 }; // bone-local quaternion
     float       radius = 0.1f;              // capsule radius (metres)
     float       length = 0.2f;              // capsule segment length (metres)

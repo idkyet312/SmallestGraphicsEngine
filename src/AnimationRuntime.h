@@ -25,19 +25,10 @@ public:
     // HLSL matrices use column-major buffer packing, so transpose before upload,
     // exactly like ShaderDX12::SetMatrices does for its constant-buffer matrices.
     // clip is set, produces the bind pose (identity-driven local transforms).
-    // TEMP debug: when true, palette is all-identity so the mesh renders in its
-    // raw bind-pose vertex positions (isolates skinning-matrix bugs from
-    // position/scale/culling bugs).
-    static inline bool s_forceIdentity = false;
-
     void ComputePalette(const Skeleton& skel, std::vector<DirectX::XMFLOAT4X4>& palette) const {
         using namespace DirectX;
         const size_t n = skel.BoneCount();
         palette.resize(n);
-        if (s_forceIdentity) {
-            for (size_t b = 0; b < n; ++b) XMStoreFloat4x4(&palette[b], XMMatrixIdentity());
-            return;
-        }
         std::vector<XMMATRIX> global(n);
 
         for (size_t b = 0; b < n; ++b) {
@@ -64,8 +55,19 @@ public:
     // position in the character's local space.
     void ComputeGlobals(const Skeleton& skel, std::vector<DirectX::XMFLOAT3>& jointPos) const {
         using namespace DirectX;
-        const size_t n = skel.BoneCount();
+        std::vector<XMFLOAT4X4> matrices;
+        ComputeGlobalMatrices(skel, matrices);
+        const size_t n = matrices.size();
         jointPos.resize(n);
+        for (size_t b = 0; b < n; ++b)
+            XMStoreFloat3(&jointPos[b], XMLoadFloat4x4(&matrices[b]).r[3]);
+    }
+
+    void ComputeGlobalMatrices(const Skeleton& skel,
+                               std::vector<DirectX::XMFLOAT4X4>& matrices) const {
+        using namespace DirectX;
+        const size_t n = skel.BoneCount();
+        matrices.resize(n);
         std::vector<XMMATRIX> global(n);
         for (size_t b = 0; b < n; ++b) {
             XMMATRIX local = XMLoadFloat4x4(&skel.localBind[b]);
@@ -73,7 +75,7 @@ public:
             const int parent = skel.parent[b];
             global[b] = (parent < 0) ? local : XMMatrixMultiply(local, global[parent]);
             XMMATRIX modelSpace = global[b] * XMLoadFloat4x4(&skel.globalInverse);
-            XMStoreFloat3(&jointPos[b], modelSpace.r[3]);
+            XMStoreFloat4x4(&matrices[b], modelSpace);
         }
     }
 
