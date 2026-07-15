@@ -1462,6 +1462,68 @@ std::vector<EnemyShot> DestructionDX12::DrainEnemyShots() {
     return result;
 }
 
+bool DestructionDX12::SpawnAuthoredRagdoll(
+    const std::vector<AuthoredRagdollBody>& bodies,
+    const std::vector<RagdollConstraintSpec>& constraints,
+    const XMFLOAT3& impulseDirection) {
+    if (!m || !m->initialized || B3_IS_NULL(m->world) || bodies.empty()) return false;
+    const size_t base = m->ragdollParts.size();
+    std::unordered_map<std::string, size_t> indices;
+    const XMFLOAT3 cloth{ 0.08f, 0.09f, 0.075f };
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        const AuthoredRagdollBody& src = bodies[i];
+        b3BodyDef bd = b3DefaultBodyDef();
+        bd.type = b3_dynamicBody;
+        bd.position = { src.position.x, src.position.y, src.position.z };
+        bd.rotation = { { src.rotation.x, src.rotation.y, src.rotation.z }, src.rotation.w };
+        bd.linearDamping = 0.16f; bd.angularDamping = 0.32f;
+        const b3BodyId body = b3CreateBody(m->world, &bd);
+        b3ShapeDef sd = b3DefaultShapeDef();
+        sd.density = 350.0f; sd.baseMaterial.friction = 0.72f;
+        sd.baseMaterial.restitution = 0.02f;
+        sd.enableHitEvents = true;
+        if (src.shape == 1) {
+            b3Capsule capsule = {};
+            capsule.center1 = { 0.0f, -src.length * 0.5f, 0.0f };
+            capsule.center2 = { 0.0f,  src.length * 0.5f, 0.0f };
+            capsule.radius = src.radius;
+            b3CreateCapsuleShape(body, &sd, &capsule);
+        } else {
+            b3BoxHull box = b3MakeBoxHull(src.halfExtent.x, src.halfExtent.y, src.halfExtent.z);
+            b3CreateHullShape(body, &sd, &box.base);
+        }
+        m->ragdollParts.push_back({ body, src.halfExtent, cloth, src.shape });
+        indices[src.name] = i;
+    }
+    for (const RagdollConstraintSpec& link : constraints) {
+        auto a = indices.find(link.boneA), b = indices.find(link.boneB);
+        if (a == indices.end() || b == indices.end()) continue;
+        const b3BodyId bodyA = m->ragdollParts[base + a->second].body;
+        const b3BodyId bodyB = m->ragdollParts[base + b->second].body;
+        const b3Pos pa = b3Body_GetPosition(bodyA), pb = b3Body_GetPosition(bodyB);
+        const b3Pos anchor = { float((pa.x + pb.x) * 0.5), float((pa.y + pb.y) * 0.5),
+                               float((pa.z + pb.z) * 0.5) };
+        b3SphericalJointDef jd = b3DefaultSphericalJointDef();
+        jd.base.bodyIdA = bodyA; jd.base.bodyIdB = bodyB;
+        jd.base.localFrameA.p = b3Body_GetLocalPoint(bodyA, anchor);
+        jd.base.localFrameB.p = b3Body_GetLocalPoint(bodyB, anchor);
+        jd.base.collideConnected = false;
+        jd.enableConeLimit = true; jd.coneAngle = 0.9f;
+        jd.enableTwistLimit = true; jd.lowerTwistAngle = -0.55f; jd.upperTwistAngle = 0.55f;
+        b3CreateSphericalJoint(m->world, &jd);
+    }
+    XMVECTOR dir = XMVector3Normalize(XMLoadFloat3(&impulseDirection));
+    if (XMVectorGetX(XMVector3LengthSq(dir)) < 1e-5f) dir = XMVectorSet(0, 0.2f, 1, 0);
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        const b3BodyId body = m->ragdollParts[base + i].body;
+        const float mass = (std::max)(0.05f, b3Body_GetMass(body));
+        XMFLOAT3 impulse; XMStoreFloat3(&impulse, dir * (mass * 2.2f));
+        b3Body_ApplyLinearImpulseToCenter(body, { impulse.x, impulse.y + mass*0.4f, impulse.z }, true);
+    }
+    m->RebuildRenderItems();
+    return true;
+}
+
 bool DestructionDX12::HitTest(const XMFLOAT3& worldPosition, float radius, XMFLOAT3& hitPosition) const {
     if (!m->initialized) return false;
     for (const auto& runtime : m->actors) {

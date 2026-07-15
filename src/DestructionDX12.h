@@ -29,6 +29,16 @@ struct EnemyShot {
     DirectX::XMFLOAT3 direction;
 };
 
+struct AuthoredRagdollBody {
+    std::string name;
+    DirectX::XMFLOAT3 position;
+    DirectX::XMFLOAT4 rotation;
+    DirectX::XMFLOAT3 halfExtent;
+    float radius = 0.1f;
+    float length = 0.2f;
+    uint8_t shape = 1;
+};
+
 // Snapshot of the live Blast/Box3D state for on-screen debug drawing.
 struct DestructionDebugChunk {
     DirectX::XMFLOAT3 worldMin;   // AABB corners already in world space
@@ -68,6 +78,9 @@ public:
     void Update(float dt);
     void SetEnemyTarget(const DirectX::XMFLOAT3& target);
     std::vector<EnemyShot> DrainEnemyShots();
+    bool SpawnAuthoredRagdoll(const std::vector<AuthoredRagdollBody>& bodies,
+                              const std::vector<RagdollConstraintSpec>& constraints,
+                              const DirectX::XMFLOAT3& impulseDirection);
     bool HitTest(const DirectX::XMFLOAT3& worldPosition, float radius,
                  DirectX::XMFLOAT3& hitPosition) const;
     bool HitTestSegment(const DirectX::XMFLOAT3& worldStart,

@@ -155,6 +155,9 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
         auto mat = std::make_shared<SceneMaterial>();
         if (src->mMaterialIndex < scene->mNumMaterials) {
             const aiMaterial* am = scene->mMaterials[src->mMaterialIndex];
+            aiString materialName;
+            if (am->Get(AI_MATKEY_NAME, materialName) == AI_SUCCESS)
+                mat->name = materialName.C_Str();
             aiString tex;
             if ((am->GetTexture(aiTextureType_BASE_COLOR, 0, &tex) == AI_SUCCESS && tex.length) ||
                 (am->GetTexture(aiTextureType_DIFFUSE, 0, &tex) == AI_SUCCESS && tex.length))
@@ -162,14 +165,19 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
             if (am->GetTexture(aiTextureType_NORMALS, 0, &tex) == AI_SUCCESS && tex.length)
                 mat->normalTexture = loadTex(tex, mat->uploadHeaps);
         }
-        // Fallback: map this part to its on-disk texture set by material index
-        // (T_Bandit_1..6). Assigned when the FBX didn't embed a usable path.
+        // FBX only embeds one material path. The three exported mesh parts map
+        // to Bandit texture sets 1..3; some variants use an extra "_1" suffix.
         {
-            const std::string idx = std::to_string(src->mMaterialIndex + 1);
-            if (!mat->baseColorTexture)
-                mat->baseColorTexture = loadByStem("T_Bandit_" + idx + "_BaseColor", mat->uploadHeaps);
-            if (!mat->normalTexture)
-                mat->normalTexture = loadByStem("T_Bandit_" + idx + "_Normal", mat->uploadHeaps);
+            const std::string idx = std::to_string(mi + 1);
+            auto loadPart = [&](const char* suffix) {
+                auto tex = loadByStem("T_Bandit_" + idx + suffix, mat->uploadHeaps);
+                if (!tex) tex = loadByStem("T_Bandit_" + idx + "_1" + suffix, mat->uploadHeaps);
+                return tex;
+            };
+            if (!mat->baseColorTexture) mat->baseColorTexture = loadPart("_BaseColor");
+            if (!mat->normalTexture) mat->normalTexture = loadPart("_Normal");
+            mat->metallicRoughnessTexture = loadPart("_ORM");
+            mat->roughnessOnlyTexture = false;
         }
         p.material = mat;
         p.materialIndex = (int)src->mMaterialIndex;

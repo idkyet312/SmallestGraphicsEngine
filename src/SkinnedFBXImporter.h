@@ -15,6 +15,7 @@ struct SkinnedModel {
     std::shared_ptr<SceneNode>  node;      // renderable mesh (primitives carry skin[])
     Skeleton                    skeleton;
     std::vector<AnimationClip>  clips;      // includes the clip baked into the mesh FBX
+    RagdollSpec                 ragdoll;
     bool                        valid = false;
 
     const AnimationClip* FindClip(const std::string& name) const {
