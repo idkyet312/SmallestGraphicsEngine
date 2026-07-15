@@ -7,11 +7,18 @@
 #include "DestructionDX12.h"
 #include "VirtualInput.h"
 #include "GrassField.h"
+#include "ProfilerDX12.h"
 #include <cstdio>
 
 // Forward declare raytracing context
 struct RaytracingContext;
 extern RaytracingContext g_rt;
+extern ProfilerDX12 g_profiler;
+
+// Skinned Bandit enemy (defined in main.cpp) -- surfaced for debug readout.
+// BanditDebugText renders a one-line status; defined in main.cpp where the
+// SkinnedEnemy type is complete.
+void BanditDebugText();
 
 // On-screen pad: drive the camera with the mouse alone. A button held down sets
 // the flag every frame it stays active, which ProcessInput drains like a key.
@@ -33,39 +40,47 @@ inline void RenderMovementPad() {
     ImGui::Begin("Movement Pad", &virtualInput.showPad, ImGuiWindowFlags_AlwaysAutoResize);
 
     const ImVec2 btn(48.0f, 34.0f);
-    const float  colStart = ImGui::GetCursorPosX() + btn.x + ImGui::GetStyle().ItemSpacing.x;
+    const float  col = btn.x + ImGui::GetStyle().ItemSpacing.x;
 
-    // WASD cluster.
+    // A pad button counts as "held" while the cursor sits on it AND the left
+    // mouse is down. IsItemActive() alone drops the moment the cursor stops
+    // moving over the button, so holding still stopped the movement -- hover +
+    // IsMouseDown stays true with a stationary cursor.
+    auto isHeld = []() {
+        return ImGui::IsItemHovered() && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    };
+
+    // Directional pad drawn as an explicit 3-column cross. Each button gets an
+    // absolute cursor position, so the rows never overlap and every button is
+    // independently hittable.
+    auto padRow = [&](const char* topLbl, const char* lLbl, const char* mLbl,
+                      const char* rLbl, auto onTop, auto onL, auto onM, auto onR) {
+        float x0 = ImGui::GetCursorPosX();
+        // Top button, indented one column so it sits above the middle button.
+        ImGui::SetCursorPosX(x0 + col);
+        ImGui::Button(topLbl, btn); if (isHeld()) onTop();
+
+        // Bottom row: three buttons chained with plain SameLine so their rects
+        // never overlap and each stays put frame-to-frame.
+        ImGui::SetCursorPosX(x0);
+        ImGui::Button(lLbl, btn); if (isHeld()) onL();
+        ImGui::SameLine();
+        ImGui::Button(mLbl, btn); if (isHeld()) onM();
+        ImGui::SameLine();
+        ImGui::Button(rLbl, btn); if (isHeld()) onR();
+    };
+
     ImGui::TextUnformatted("Move");
-    ImGui::SetCursorPosX(colStart);
-    ImGui::Button("W", btn);
-    if (ImGui::IsItemActive()) virtualInput.forward = true;
-
-    ImGui::Button("A", btn);
-    if (ImGui::IsItemActive()) virtualInput.left = true;
-    ImGui::SameLine();
-    ImGui::Button("S", btn);
-    if (ImGui::IsItemActive()) virtualInput.back = true;
-    ImGui::SameLine();
-    ImGui::Button("D", btn);
-    if (ImGui::IsItemActive()) virtualInput.right = true;
+    padRow("W", "A", "S", "D",
+           [] { virtualInput.forward = true; }, [] { virtualInput.left = true; },
+           [] { virtualInput.back = true; },    [] { virtualInput.right = true; });
 
     ImGui::Separator();
 
-    // Look cluster: arrows nudge yaw/pitch while held.
     ImGui::TextUnformatted("Look");
-    ImGui::SetCursorPosX(colStart);
-    ImGui::Button("Up", btn);
-    if (ImGui::IsItemActive()) virtualInput.lookY += 1.0f;
-
-    ImGui::Button("Left", btn);
-    if (ImGui::IsItemActive()) virtualInput.lookX -= 1.0f;
-    ImGui::SameLine();
-    ImGui::Button("Down", btn);
-    if (ImGui::IsItemActive()) virtualInput.lookY -= 1.0f;
-    ImGui::SameLine();
-    ImGui::Button("Right", btn);
-    if (ImGui::IsItemActive()) virtualInput.lookX += 1.0f;
+    padRow("Up", "Left", "Down", "Right",
+           [] { virtualInput.lookY += 1.0f; }, [] { virtualInput.lookX -= 1.0f; },
+           [] { virtualInput.lookY -= 1.0f; }, [] { virtualInput.lookX += 1.0f; });
 
     ImGui::Separator();
 
@@ -73,10 +88,10 @@ inline void RenderMovementPad() {
     if (ImGui::Button("Jump", ImVec2(74.0f, 34.0f))) virtualInput.jump = true;
     ImGui::SameLine();
     ImGui::Button("Down##fly", ImVec2(74.0f, 34.0f));
-    if (ImGui::IsItemActive()) virtualInput.down = true;
+    if (isHeld()) virtualInput.down = true;
 
     ImGui::Button("Shoot", ImVec2(155.0f, 34.0f));
-    if (ImGui::IsItemActive()) virtualInput.shoot = true;
+    if (isHeld()) virtualInput.shoot = true;
 
     ImGui::SetNextItemWidth(155.0f);
     ImGui::SliderFloat("Look Speed", &virtualInput.lookSpeed, 20.0f, 600.0f, "%.0f");
@@ -135,6 +150,21 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     // number on screen that only shows up as a vague feeling of sluggishness.
     ImGui::Text("%.1f FPS  (%.2f ms)", ImGui::GetIO().Framerate,
                 1000.0f / ImGui::GetIO().Framerate);
+    if (ImGui::CollapsingHeader("CPU / GPU Profiler", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("CPU frame: %.2f ms", g_profiler.CpuFrameMs());
+        for (const auto& sample : g_profiler.CpuSamples())
+            ImGui::BulletText("%s: %.3f ms", sample.name.c_str(), sample.milliseconds);
+        ImGui::Separator();
+        if (g_profiler.IsInitialized()) {
+            ImGui::Text("GPU frame: %.2f ms", g_profiler.GpuFrameMs());
+            for (const auto& sample : g_profiler.GpuSamples())
+                ImGui::BulletText("%s: %.3f ms", sample.name.c_str(), sample.milliseconds);
+            ImGui::TextDisabled("GPU results delayed by frames in flight");
+        } else {
+            ImGui::TextDisabled("GPU timestamp queries unavailable");
+        }
+    }
+    BanditDebugText();
     ImGui::Separator();
 
     ImGui::Checkbox("Show Movement Pad", &virtualInput.showPad);

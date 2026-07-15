@@ -78,6 +78,7 @@ set(HEADER_FILES
     src/DDGI_DX11.h
     src/DX11Core.h
     src/DX12Core.h
+    src/ProfilerDX12.h
     src/Model.h
     src/ModelDX11.h
     src/Shader.h
@@ -176,10 +177,11 @@ set_source_files_properties(${SHADER_FILES} PROPERTIES
 # Create executable based on selected graphics API
 if(USE_DX12)
     message(STATUS "Building with DirectX 12")
-    add_executable(GraphicEngine WIN32 
+    add_executable(GraphicEngine WIN32
         src/main.cpp
         src/GLBImporter.cpp
         src/FBXImporter.cpp
+        src/SkinnedFBXImporter.cpp
         src/DestructionDX12.cpp
         ${HEADER_FILES}
         ${SHADER_FILES}

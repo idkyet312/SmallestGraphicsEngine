@@ -145,7 +145,9 @@ public:
               D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress,
               D3D12_GPU_VIRTUAL_ADDRESS meshletBoundsAddress,
               D3D12_GPU_VIRTUAL_ADDRESS meshletVertexIndexAddress,
-              D3D12_GPU_VIRTUAL_ADDRESS meshletTriangleAddress) {
+              D3D12_GPU_VIRTUAL_ADDRESS meshletTriangleAddress,
+              D3D12_GPU_VIRTUAL_ADDRESS bonePaletteAddress = 0,
+              D3D12_GPU_VIRTUAL_ADDRESS skinDataAddress = 0) {
         if (!CanDraw(totalMeshlets, meshletDescAddress, meshletBoundsAddress,
                      meshletVertexIndexAddress, meshletTriangleAddress)) return;
         commandList6->SetPipelineState((wireframe && psoWireframe)
@@ -158,6 +160,11 @@ public:
         if (occlusionDepthHandle.ptr) {
             commandList6->SetGraphicsRootDescriptorTable(12, occlusionDepthHandle);
         }
+        const UINT skinning = (bonePaletteAddress && skinDataAddress) ? 1u : 0u;
+        if (skinning) {
+            commandList6->SetGraphicsRootShaderResourceView(16, bonePaletteAddress);
+            commandList6->SetGraphicsRootShaderResourceView(17, skinDataAddress);
+        }
         const UINT maxMeshletsPerDispatch = 65535u * 32u;
         UINT firstMeshlet = 0;
         while (firstMeshlet < totalMeshlets) {
@@ -167,9 +174,10 @@ public:
                 vertexCount, indexCount, indexCount ? 1u : 0u,
                 firstMeshlet, totalMeshlets,
                 occlusionEnabled ? 1u : 0u,
-                g_dx12.screenWidth, g_dx12.screenHeight
+                g_dx12.screenWidth, g_dx12.screenHeight,
+                skinning
             };
-            commandList6->SetGraphicsRoot32BitConstants(8, 8, &data, 0);
+            commandList6->SetGraphicsRoot32BitConstants(8, 9, &data, 0);
             commandList6->DispatchMesh(amplificationGroups, 1, 1);
             firstMeshlet += meshletCount;
         }

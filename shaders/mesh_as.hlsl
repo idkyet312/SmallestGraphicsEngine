@@ -14,6 +14,7 @@ cbuffer MeshDrawBuffer : register(b6) {
     uint occlusionEnabled;
     uint screenWidth;
     uint screenHeight;
+    uint skinningEnabled;   // skinned meshlet bounds are bind-pose -> skip cull
 };
 
 cbuffer CameraBuffer : register(b2) {
@@ -129,9 +130,12 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
 
     if (globalMeshlet < meshletCount) {
         MeshletBounds bounds = meshletBounds[globalMeshlet];
-        bool visible = IntersectsFrustum(bounds) &&
-                       !IsBackfacing(bounds) &&
-                       !IsOccluded(bounds);
+        // Skinned bounds move per frame (baked at bind pose), so any cull test
+        // against them is unreliable -- emit all meshlets for skinned draws.
+        bool visible = skinningEnabled ? true :
+                       (IntersectsFrustum(bounds) &&
+                        !IsBackfacing(bounds) &&
+                        !IsOccluded(bounds));
         if (visible) {
             uint slot;
             InterlockedAdd(visibleCount, 1, slot);
