@@ -19,6 +19,7 @@ public:
     DirectX::XMFLOAT3 position{ 0, 0, 0 };
     float             yaw = 0.0f;     // radians, facing
     bool              visible = true;
+    bool              castsShadow = false; // full skinned shadow pass nearly doubles character cost
     float             health = 100.0f;
     float             moveSpeed = 1.8f;
     // Asset-space orientation and ground offset.
@@ -100,7 +101,8 @@ public:
             const float inv = 1.0f / distance;
             position.x += dx * inv * speed * dt;
             position.z += dz * inv * speed * dt;
-            yaw = std::atan2(dx, dz);
+            // UE mannequin faces local +X. Rotate +X onto target direction.
+            yaw = std::atan2(dx, dz) - DirectX::XM_PIDIV2;
         }
         PlayClip(speed > moveSpeed * 1.2f ? "Run" : speed > 0.01f ? "Walk" : "Idle");
         anim.Advance(dt);
