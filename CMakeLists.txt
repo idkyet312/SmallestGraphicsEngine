@@ -79,6 +79,7 @@ set(HEADER_FILES
     src/DX11Core.h
     src/DX12Core.h
     src/ProfilerDX12.h
+    src/GunAudio.h
     src/T3DPhysicsAsset.h
     src/Model.h
     src/ModelDX11.h
@@ -192,6 +193,7 @@ if(USE_DX12)
         d3dcompiler
         dxgi
         Rpcrt4
+        xaudio2
         imgui::imgui
         meshoptimizer::meshoptimizer
         unofficial::tinyexr::tinyexr

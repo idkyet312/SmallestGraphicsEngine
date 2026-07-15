@@ -40,6 +40,7 @@
 #include "SkinnedFBXImporter.h"
 #include "SkinnedEnemy.h"
 #include "T3DPhysicsAsset.h"
+#include "GunAudio.h"
 #include "WaterVolume.h"
 #include "RopeSwing.h"
 #include "PalmTrees.h"
@@ -59,6 +60,13 @@ TerrainRendererDX12         g_terrain;
 DestructionDX12             g_destruction;
 SkinnedEnemy                g_bandit;
 bool                        g_banditLoaded = false;
+GunAudio                    g_gunAudio;
+
+static void ShootPlayerWeapon() {
+    scene.ShootProjectile();
+    const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
+    g_gunAudio.Play(0.82f, pitch);
+}
 
 // One-line Bandit status for the debug HUD (declared in EngineUI.h).
 void BanditDebugText() {
@@ -1262,7 +1270,7 @@ static void ApplyVirtualInput() {
     if (virtualInput.shoot) {
         scene.fireCooldown -= deltaTime;
         if (scene.fireCooldown <= 0.0f) {
-            scene.ShootProjectile();
+            ShootPlayerWeapon();
             scene.fireCooldown = scene.fireInterval;
         }
     }
@@ -1292,7 +1300,7 @@ static void ProcessInput(HWND) {
     const bool mouseHeld = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
     if (scene.autoFire && mouseHeld && !ImGui::GetIO().WantCaptureMouse &&
         scene.fireCooldown <= 0.0f) {
-        scene.ShootProjectile();
+        ShootPlayerWeapon();
         scene.fireCooldown = scene.fireInterval;
     }
 
@@ -1372,7 +1380,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (!scene.autoFire) {
                 // Auto-fire handles shooting in ProcessInput while held; only
                 // fire on click when auto-fire is off.
-                scene.ShootProjectile();
+                ShootPlayerWeapon();
             }
         }
         return 0;
@@ -1476,6 +1484,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     if (!g_profiler.Init(g_dx12.device.Get(), g_dx12.commandQueue.Get()))
         std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
+    g_gunAudio.Initialize("models/audio/rifle_shot.wav");
 
     // ImGui
     D3D12_DESCRIPTOR_HEAP_DESC ihd = {};
@@ -1626,6 +1635,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
 
         scene.Update(deltaTime, now);
+        g_gunAudio.Update();
 
         if (scene.rebuildDestructionRequested && wallModel) {
             scene.rebuildDestructionRequested = false;
@@ -1666,8 +1676,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
             g_destruction.Update(deltaTime);
             if (g_banditLoaded && g_bandit.Dead()) g_bandit.SyncRagdoll();
-            for (const EnemyShot& shot : g_destruction.DrainEnemyShots())
+            for (const EnemyShot& shot : g_destruction.DrainEnemyShots()) {
                 scene.SpawnHostileProjectile(shot.origin, shot.direction);
+                const float dx = shot.origin.x - scene.camera.Position.x;
+                const float dy = shot.origin.y - scene.camera.Position.y;
+                const float dz = shot.origin.z - scene.camera.Position.z;
+                const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+                const float volume = (std::max)(0.06f, 0.55f * (1.0f - distance / 45.0f));
+                const float pitch = 0.88f + ((float)std::rand() / RAND_MAX) * 0.08f;
+                g_gunAudio.Play(volume, pitch);
+            }
             // Smoke at the actual fracture points where pieces broke loose.
             for (const XMFLOAT3& bp : g_destruction.DrainBreakPoints())
                 scene.SpawnSmokeBurst(bp, 0.5f, 0.4f);
@@ -2028,6 +2046,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     g_destruction.Shutdown();
+    g_gunAudio.Shutdown();
     g_profiler.Shutdown();
     CleanupDX12();
     return (int)msg.wParam;
