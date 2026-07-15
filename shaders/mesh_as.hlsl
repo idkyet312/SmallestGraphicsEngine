@@ -130,9 +130,9 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
 
     if (globalMeshlet < meshletCount) {
         MeshletBounds bounds = meshletBounds[globalMeshlet];
-        // Skinned bounds move per frame (baked at bind pose), so any cull test
-        // against them is unreliable -- emit all meshlets for skinned draws.
-        bool visible = skinningEnabled ? true :
+        // Animated bounds cannot safely use cone/backface or occlusion tests,
+        // but bind-pose bounds remain good enough for coarse frustum rejection.
+        bool visible = skinningEnabled ? IntersectsFrustum(bounds) :
                        (IntersectsFrustum(bounds) &&
                         !IsBackfacing(bounds) &&
                         !IsOccluded(bounds));
