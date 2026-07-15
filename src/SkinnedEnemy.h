@@ -22,7 +22,8 @@ public:
     float             health = 100.0f;
     float             moveSpeed = 1.8f;
     // Asset-space orientation and ground offset.
-    float             rootPitch = 0.0f;
+    // Assimp preserves this UE asset's Z-up skeleton. Rotate +Z onto engine +Y.
+    float             rootPitch = -DirectX::XM_PIDIV2;
     float             rootRoll = 0.0f;
     float             modelScale = 0.01f; // UE cm -> engine metres (applied on world)
     float             footOffset = 0.0f;
