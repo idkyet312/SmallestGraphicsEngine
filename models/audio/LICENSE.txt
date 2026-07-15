@@ -1,0 +1,10 @@
+rifle_shot.wav
+
+Title: Various Sound Effects (snd_gunshot1.wav)
+Creator: Spring Spring
+Source: https://opengameart.org/content/various-sound-effects-0
+License: CC0 1.0 Universal
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Downloaded July 16, 2026. Attribution is not legally required. Source and
+creator retained here for provenance.
