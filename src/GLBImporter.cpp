@@ -222,14 +222,15 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
 
     cmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
-    // Mip 0 -> PIXEL_SHADER_RESOURCE; remaining mips start there too so the
-    // compute pass's per-level transitions (which assume that starting state)
-    // are uniform across the whole chain even before they've been written.
+    // Dedicated compute lists cannot use PIXEL_SHADER_RESOURCE. Mipmapped
+    // textures stay compute-readable until MipGenerator's direct-queue handoff.
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = texture.Get();
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.StateAfter = mipLevels > 1
+        ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     cmdList->ResourceBarrier(1, &barrier);
 
