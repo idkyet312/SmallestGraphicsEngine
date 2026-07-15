@@ -5,6 +5,7 @@
 // matching SkinnedFBXImporter's ToXM and the engine's XMMatrixMultiply usage.
 #include "SkinnedTypes.h"
 #include <DirectXMath.h>
+#include <algorithm>
 #include <vector>
 
 class AnimationInstance {
@@ -28,23 +29,21 @@ public:
     void ComputePalette(const Skeleton& skel, std::vector<DirectX::XMFLOAT4X4>& palette) const {
         using namespace DirectX;
         const size_t n = skel.BoneCount();
+        EnsureCache(skel);
         palette.resize(n);
-        std::vector<XMMATRIX> global(n);
 
         for (size_t b = 0; b < n; ++b) {
             XMMATRIX local = XMLoadFloat4x4(&skel.localBind[b]);
-            if (clip) {
-                const BoneTrack* tr = FindTrack((int)b);
-                if (tr) local = SampleTrack(*tr, local);
-            }
+            const BoneTrack* tr = trackByBone_[b];
+            if (tr) local = SampleTrack(*tr, b);
             const int parent = skel.parent[b];
-            global[b] = (parent < 0) ? local : XMMatrixMultiply(local, global[parent]);
+            globalScratch_[b] = (parent < 0) ? local : XMMatrixMultiply(local, globalScratch_[parent]);
         }
         const XMMATRIX globalInverse = XMLoadFloat4x4(&skel.globalInverse);
         for (size_t b = 0; b < n; ++b) {
             // Transpose of Assimp's column-vector formula:
             // inverseRoot * globalBone * inverseBind.
-            const XMMATRIX skinMat = XMLoadFloat4x4(&skel.offset[b]) * global[b] * globalInverse;
+            const XMMATRIX skinMat = XMLoadFloat4x4(&skel.offset[b]) * globalScratch_[b] * globalInverse;
             XMStoreFloat4x4(&palette[b], XMMatrixTranspose(skinMat));
         }
     }
@@ -67,35 +66,61 @@ public:
                                std::vector<DirectX::XMFLOAT4X4>& matrices) const {
         using namespace DirectX;
         const size_t n = skel.BoneCount();
+        EnsureCache(skel);
         matrices.resize(n);
-        std::vector<XMMATRIX> global(n);
         for (size_t b = 0; b < n; ++b) {
             XMMATRIX local = XMLoadFloat4x4(&skel.localBind[b]);
-            if (clip) { const BoneTrack* tr = FindTrack((int)b); if (tr) local = SampleTrack(*tr, local); }
+            const BoneTrack* tr = trackByBone_[b];
+            if (tr) local = SampleTrack(*tr, b);
             const int parent = skel.parent[b];
-            global[b] = (parent < 0) ? local : XMMatrixMultiply(local, global[parent]);
-            XMMATRIX modelSpace = global[b] * XMLoadFloat4x4(&skel.globalInverse);
+            globalScratch_[b] = (parent < 0) ? local : XMMatrixMultiply(local, globalScratch_[parent]);
+            XMMATRIX modelSpace = globalScratch_[b] * XMLoadFloat4x4(&skel.globalInverse);
             XMStoreFloat4x4(&matrices[b], modelSpace);
         }
     }
 
 private:
-    const BoneTrack* FindTrack(int bone) const {
-        for (const auto& t : clip->tracks) if (t.bone == bone) return &t;
-        return nullptr;
+    void EnsureCache(const Skeleton& skel) const {
+        using namespace DirectX;
+        const size_t n = skel.BoneCount();
+        if (cachedSkeleton_ != &skel || bindScale_.size() != n) {
+            bindScale_.resize(n);
+            bindRotation_.resize(n);
+            bindTranslation_.resize(n);
+            globalScratch_.resize(n);
+            for (size_t b = 0; b < n; ++b) {
+                XMVECTOR scale, rotation, translation;
+                if (!XMMatrixDecompose(&scale, &rotation, &translation,
+                                       XMLoadFloat4x4(&skel.localBind[b]))) {
+                    scale = XMVectorSplatOne();
+                    rotation = XMQuaternionIdentity();
+                    translation = XMVectorZero();
+                }
+                XMStoreFloat3(&bindScale_[b], scale);
+                XMStoreFloat4(&bindRotation_[b], rotation);
+                XMStoreFloat3(&bindTranslation_[b], translation);
+            }
+            cachedSkeleton_ = &skel;
+            cachedClip_ = nullptr;
+        }
+
+        if (cachedClip_ != clip || trackByBone_.size() != n) {
+            trackByBone_.assign(n, nullptr);
+            if (clip) {
+                for (const BoneTrack& track : clip->tracks) {
+                    if (track.bone >= 0 && static_cast<size_t>(track.bone) < n)
+                        trackByBone_[track.bone] = &track;
+                }
+            }
+            cachedClip_ = clip;
+        }
     }
 
-    DirectX::XMMATRIX SampleTrack(const BoneTrack& tr, DirectX::FXMMATRIX bindLocal) const {
+    DirectX::XMMATRIX SampleTrack(const BoneTrack& tr, size_t bone) const {
         using namespace DirectX;
-        XMVECTOR bindScale, bindRotation, bindTranslation;
-        if (!XMMatrixDecompose(&bindScale, &bindRotation, &bindTranslation, bindLocal)) {
-            bindScale = XMVectorSplatOne();
-            bindRotation = XMQuaternionIdentity();
-            bindTranslation = XMVectorZero();
-        }
-        const XMVECTOR t = SampleVec(tr.positions, bindTranslation);
-        const XMVECTOR r = SampleQuat(tr.rotations, bindRotation);
-        const XMVECTOR s = SampleVec(tr.scales, bindScale);
+        const XMVECTOR t = SampleVec(tr.positions, XMLoadFloat3(&bindTranslation_[bone]));
+        const XMVECTOR r = SampleQuat(tr.rotations, XMLoadFloat4(&bindRotation_[bone]));
+        const XMVECTOR s = SampleVec(tr.scales, XMLoadFloat3(&bindScale_[bone]));
         return XMMatrixAffineTransformation(s, XMVectorZero(), r, t);
     }
 
@@ -104,14 +129,14 @@ private:
         using namespace DirectX;
         if (keys.empty()) return fallback;
         if (keys.size() == 1) return XMLoadFloat3(&keys[0].value);
-        for (size_t i = 0; i + 1 < keys.size(); ++i) {
-            if (time <= keys[i + 1].time) {
-                const float span = keys[i + 1].time - keys[i].time;
-                const float a = span > 1e-6f ? (time - keys[i].time) / span : 0.0f;
-                return XMVectorLerp(XMLoadFloat3(&keys[i].value), XMLoadFloat3(&keys[i + 1].value), a);
-            }
-        }
-        return XMLoadFloat3(&keys.back().value);
+        if (time <= keys.front().time) return XMLoadFloat3(&keys.front().value);
+        const auto upper = std::lower_bound(keys.begin() + 1, keys.end(), time,
+            [](const auto& key, float sampleTime) { return key.time < sampleTime; });
+        if (upper == keys.end()) return XMLoadFloat3(&keys.back().value);
+        const auto& lower = *(upper - 1);
+        const float span = upper->time - lower.time;
+        const float a = span > 1e-6f ? (time - lower.time) / span : 0.0f;
+        return XMVectorLerp(XMLoadFloat3(&lower.value), XMLoadFloat3(&upper->value), a);
     }
 
     DirectX::XMVECTOR SampleQuat(const std::vector<BoneTrack::QuatKey>& keys,
@@ -119,13 +144,21 @@ private:
         using namespace DirectX;
         if (keys.empty()) return fallback;
         if (keys.size() == 1) return XMLoadFloat4(&keys[0].value);
-        for (size_t i = 0; i + 1 < keys.size(); ++i) {
-            if (time <= keys[i + 1].time) {
-                const float span = keys[i + 1].time - keys[i].time;
-                const float a = span > 1e-6f ? (time - keys[i].time) / span : 0.0f;
-                return XMQuaternionSlerp(XMLoadFloat4(&keys[i].value), XMLoadFloat4(&keys[i + 1].value), a);
-            }
-        }
-        return XMLoadFloat4(&keys.back().value);
+        if (time <= keys.front().time) return XMLoadFloat4(&keys.front().value);
+        const auto upper = std::lower_bound(keys.begin() + 1, keys.end(), time,
+            [](const BoneTrack::QuatKey& key, float sampleTime) { return key.time < sampleTime; });
+        if (upper == keys.end()) return XMLoadFloat4(&keys.back().value);
+        const auto& lower = *(upper - 1);
+        const float span = upper->time - lower.time;
+        const float a = span > 1e-6f ? (time - lower.time) / span : 0.0f;
+        return XMQuaternionSlerp(XMLoadFloat4(&lower.value), XMLoadFloat4(&upper->value), a);
     }
+
+    mutable const Skeleton* cachedSkeleton_ = nullptr;
+    mutable const AnimationClip* cachedClip_ = nullptr;
+    mutable std::vector<const BoneTrack*> trackByBone_;
+    mutable std::vector<DirectX::XMFLOAT3> bindScale_;
+    mutable std::vector<DirectX::XMFLOAT4> bindRotation_;
+    mutable std::vector<DirectX::XMFLOAT3> bindTranslation_;
+    mutable std::vector<DirectX::XMMATRIX> globalScratch_;
 };
