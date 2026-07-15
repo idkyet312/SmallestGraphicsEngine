@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.26)
 project(GraphicEngine)
 set(CMAKE_CXX_STANDARD 17)
 
@@ -36,7 +36,7 @@ target_include_directories(NvBlast PUBLIC
     "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/shared/NvTask/include"
 )
 if(MSVC)
-    target_compile_options(NvBlast PRIVATE /wd4005 /wd4244 /wd4267)
+    target_compile_options(NvBlast PRIVATE /MP /wd4005 /wd4244 /wd4267)
     set_property(TARGET NvBlast PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
@@ -217,6 +217,12 @@ else()
     target_include_directories(GraphicEngine PRIVATE ${TINYGLTF_INCLUDE_DIRS})
 endif()
 
+if(MSVC)
+    # Compile independent translation units concurrently. Especially useful
+    # after header changes that invalidate main.cpp and renderer sources.
+    target_compile_options(GraphicEngine PRIVATE /MP)
+endif()
+
 # Group files in IDE
 source_group("Header Files" FILES ${HEADER_FILES})
 source_group("Shader Files" FILES ${SHADER_FILES})
@@ -229,7 +235,7 @@ set_target_properties(GraphicEngine PROPERTIES
 
 # Copy shaders to build directory
 add_custom_command(TARGET GraphicEngine POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
     ${CMAKE_SOURCE_DIR}/shaders
     $<TARGET_FILE_DIR:GraphicEngine>/shaders
     COMMENT "Copying shaders to build directory"
@@ -238,39 +244,34 @@ add_custom_command(TARGET GraphicEngine POST_BUILD
 if(USE_DX12 AND DXC_EXECUTABLE)
     add_custom_command(TARGET GraphicEngine POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:GraphicEngine>/shaders
-        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/mesh_as.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_as.cso
-        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/mesh_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ms.cso
-        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/mesh_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ps.cso
-        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/terrain_as.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_as.cso
-        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/terrain_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ms.cso
-        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/wire_green_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/wire_green_ps.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/mesh_as.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_as.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/mesh_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ms.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/mesh_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ps.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_as.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_as.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ms.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/wire_green_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/wire_green_ps.cso
     )
     if(DXC_EXECUTABLE)
         add_dependencies(GraphicEngine MeshShaderCSO)
     endif()
 endif()
 
-# Also copy to build/shaders for convenience
-add_custom_command(TARGET GraphicEngine POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-    ${CMAKE_SOURCE_DIR}/shaders
-    ${CMAKE_SOURCE_DIR}/build/shaders
-    COMMENT "Copying shaders to build root"
+# Models total roughly 1.5 GiB. A POST_BUILD copy made every code-only link spend
+# over a minute copying them, twice, to the same build directory. This stamped
+# target syncs only when an asset is added or modified.
+file(GLOB_RECURSE RUNTIME_MODEL_FILES CONFIGURE_DEPENDS LIST_DIRECTORIES false
+    "${CMAKE_SOURCE_DIR}/models/*")
+set(MODEL_SYNC_STAMP "${CMAKE_BINARY_DIR}/.models-synced")
+add_custom_command(
+    OUTPUT "${MODEL_SYNC_STAMP}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/models"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+            "${CMAKE_SOURCE_DIR}/models" "${CMAKE_BINARY_DIR}/models"
+    COMMAND ${CMAKE_COMMAND} -E touch "${MODEL_SYNC_STAMP}"
+    DEPENDS ${RUNTIME_MODEL_FILES}
+    COMMENT "Syncing changed runtime models"
+    VERBATIM
 )
-
-# Copy models to build directory
-add_custom_command(TARGET GraphicEngine POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-    ${CMAKE_SOURCE_DIR}/models
-    $<TARGET_FILE_DIR:GraphicEngine>/models
-    COMMENT "Copying models to build directory"
-)
-
-# Also copy to build/models for convenience
-add_custom_command(TARGET GraphicEngine POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-    ${CMAKE_SOURCE_DIR}/models
-    ${CMAKE_SOURCE_DIR}/build/models
-    COMMENT "Copying models to build root"
-)
+add_custom_target(RuntimeModels DEPENDS "${MODEL_SYNC_STAMP}")
+add_dependencies(GraphicEngine RuntimeModels)
 

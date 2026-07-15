@@ -104,7 +104,7 @@ try {
 Write-Host "`nBuilding project (Release)..." -ForegroundColor Cyan
 Push-Location $buildDir
 try {
-    & $cmake --build . --config Release
+    & $cmake --build . --config Release --target GraphicEngine --parallel
     if ($LASTEXITCODE -eq 0) {
         Write-Host "`n=== Build Successful ===" -ForegroundColor Green
         
@@ -114,17 +114,7 @@ try {
             $exeDir = Join-Path $buildDir "Release"
         }
         
-        # Copy shaders and models to exe directory
-        $shadersDest = Join-Path $exeDir "shaders"
-        $modelsDest = Join-Path $exeDir "models"
-        
-        if (-not (Test-Path $shadersDest)) { New-Item -ItemType Directory -Path $shadersDest -Force | Out-Null }
-        if (-not (Test-Path $modelsDest)) { New-Item -ItemType Directory -Path $modelsDest -Force | Out-Null }
-        
-        Copy-Item (Join-Path $scriptDir "shaders\*") $shadersDest -Force
-        Copy-Item (Join-Path $scriptDir "models\*") $modelsDest -Force
-        
-        Write-Host "Shaders and models copied to: $exeDir" -ForegroundColor Green
+        Write-Host "Runtime assets synced incrementally by CMake" -ForegroundColor Green
         Write-Host "Executable location: $exeDir\GraphicEngine.exe" -ForegroundColor Green
         Write-Host "`nTo run the application:" -ForegroundColor Cyan
         Write-Host "  cd `"$exeDir`"" -ForegroundColor White

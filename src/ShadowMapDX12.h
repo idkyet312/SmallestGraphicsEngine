@@ -293,7 +293,7 @@ public:
             depthShader.NextDrawCall();
         }
 
-        if (bandit && bandit->castsShadow && bandit->CanRender()) {
+        if (bandit && (bandit->castsShadow || bandit->Dead()) && bandit->CanRender()) {
             const D3D12_GPU_VIRTUAL_ADDRESS palette = bandit->UploadPalette();
             const XMMATRIX model = bandit->MeshWorldMatrix();
             for (const auto& prim : bandit->model.node->mesh->primitives) {
