@@ -5,6 +5,7 @@
 #include <DirectXMath.h>
 #include <d3d12.h>
 #include <wrl/client.h>
+#include "SkinnedTypes.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -61,7 +62,12 @@ struct MeshPrimitive {
     std::vector<unsigned int> indices;
     int materialIndex = -1;
     std::shared_ptr<SceneMaterial> material;
-    
+
+    // Optional per-vertex skin attributes (one SkinVertex per interleaved
+    // vertex, same order). Empty for static meshes; populated by the skinned
+    // importer. Uploaded to skinBuffer and bound at t13 when skinning is on.
+    std::vector<SkinVertex> skin;
+
     // DX12 Resources (to be filled by the renderer/loader)
     ComPtr<ID3D12Resource> vertexBuffer;
     ComPtr<ID3D12Resource> indexBuffer;
@@ -69,10 +75,12 @@ struct MeshPrimitive {
     ComPtr<ID3D12Resource> meshletDescBuffer;
     ComPtr<ID3D12Resource> meshletVertexIndexBuffer;
     ComPtr<ID3D12Resource> meshletTriangleBuffer;
+    ComPtr<ID3D12Resource> skinBuffer; // StructuredBuffer<SkinVertex>, bound at t13
     D3D12_VERTEX_BUFFER_VIEW vbv;
     D3D12_INDEX_BUFFER_VIEW ibv;
     UINT indexCount = 0;
     UINT meshletCount = 0;
+    UINT skinVertexCount = 0; // >0 when this primitive carries skin data
 };
 
 struct SceneMesh {

@@ -18,6 +18,7 @@
 #include <imgui_impl_dx12.h>
 
 #include "DX12Core.h"
+#include "ProfilerDX12.h"
 #include "GroundLevel.h"
 #include "ShaderDX12.h"
 #include "VisibilityBufferDX12.h"
@@ -36,6 +37,8 @@
 #include "OcclusionDepthDX12.h"
 #include "DestructionDX12.h"
 #include "FBXImporter.h"
+#include "SkinnedFBXImporter.h"
+#include "SkinnedEnemy.h"
 #include "WaterVolume.h"
 #include "RopeSwing.h"
 #include "PalmTrees.h"
@@ -48,10 +51,41 @@ static unsigned int SCR_HEIGHT = 720;
 
 static Scene               scene;
 static ShaderDX12           mainShader;
+ProfilerDX12                g_profiler;
 MeshShaderDX12              g_meshShader;
 bool                        g_useMeshShader = false;
 TerrainRendererDX12         g_terrain;
 DestructionDX12             g_destruction;
+SkinnedEnemy                g_bandit;
+bool                        g_banditLoaded = false;
+bool                        g_banditDebugSkeleton = false; // overlay bones on the mesh
+
+// One-line Bandit status for the debug HUD (declared in EngineUI.h).
+extern bool g_banditDebugSkeleton;
+void BanditDebugText() {
+    if (!g_banditLoaded) { ImGui::Text("Bandit: NOT LOADED"); return; }
+    int textured = 0, parts = 0;
+    if (g_bandit.model.node && g_bandit.model.node->mesh) {
+        for (const auto& p : g_bandit.model.node->mesh->primitives) {
+            ++parts;
+            if (p.material && p.material->baseColorTexture) ++textured;
+        }
+    }
+    ImGui::Text("Bandit: bones=%zu parts=%d tex=%d pal=%zu pos(%.1f,%.1f,%.1f)",
+                g_bandit.model.skeleton.BoneCount(), parts, textured,
+                g_bandit.Palette().size(),
+                g_bandit.position.x, g_bandit.position.y, g_bandit.position.z);
+    ImGui::Checkbox("Bandit skeleton debug", &g_banditDebugSkeleton);
+    ImGui::TextUnformatted("Root (mesh+skeleton):");
+    ImGui::SliderFloat("Bandit pitch", &g_bandit.rootPitch, -3.15f, 3.15f);
+    ImGui::SliderFloat("Bandit roll", &g_bandit.rootRoll, -3.15f, 3.15f);
+    ImGui::SliderFloat("Bandit yaw", &g_bandit.yaw, -3.15f, 3.15f);
+    ImGui::SliderFloat("Bandit foot", &g_bandit.footOffset, -3.0f, 3.0f);
+    ImGui::TextUnformatted("Mesh only:");
+    ImGui::SliderFloat("Mesh pitch", &g_bandit.meshPitch, -3.15f, 3.15f);
+    ImGui::SliderFloat("Mesh roll", &g_bandit.meshRoll, -3.15f, 3.15f);
+    ImGui::SliderFloat("Mesh yaw", &g_bandit.meshYaw, -3.15f, 3.15f);
+}
 WaterVolume                 g_water;
 WaterVolume                 g_ocean;   // sea ringing the island, surface at y = 0
 RopeSwing                   g_rope;
@@ -1449,6 +1483,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         return -1;
     }
 
+    if (!g_profiler.Init(g_dx12.device.Get(), g_dx12.commandQueue.Get()))
+        std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
+
     // ImGui
     D3D12_DESCRIPTOR_HEAP_DESC ihd = {};
     ihd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -1570,6 +1607,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         deltaTime = now - lastTime;
         lastTime  = now;
 
+        g_profiler.BeginCpuFrame();
+        {
+        ProfilerDX12::CpuScope updateProfile(g_profiler, "Update");
+
         ProcessInput(hwnd);
 
         // Walking collision: ground level follows the mesh-shader terrain at
@@ -1612,6 +1653,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_destruction.SetSplashCallback([](float x, float z, float s) {
                 g_water.Splash(x, z, s);
             });
+        }
+        // Stand the Bandit on the terrain surface (its mesh origin is at the
+        // feet). Sampled each frame so it stays grounded if it later walks.
+        if (g_banditLoaded) {
+            if (scene.useMeshTerrain && g_terrain.supported) {
+                TerrainRendererDX12::Params tp; tp.heightScale = scene.terrainHeightScale;
+                g_bandit.position.y = TerrainRendererDX12::HeightAt(tp, g_bandit.position.x, g_bandit.position.z);
+            } else {
+                g_bandit.position.y = 0.0f;
+            }
         }
         g_water.Update(deltaTime);
         g_ocean.Update(deltaTime);
@@ -1725,14 +1776,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 }
             }
         }
+        }
 
         // ?? begin frame ??
         try { BeginFrame(); }
         catch (const std::exception& e) { std::cerr << "BeginFrame: " << e.what() << "\n"; break; }
+        g_profiler.BeginGpuFrame(g_dx12.frameIndex, g_dx12.commandList.Get());
 
         float cc[4] = { scene.clearColor.x, scene.clearColor.y, scene.clearColor.z, 1.0f };
         ClearRenderTarget(cc);
-        skyRenderer.Render(scene.camera, scene.cameraFOV, scene.lightPos, now);
+        {
+            ProfilerDX12::Scope profile(g_profiler, "Sky", g_dx12.commandList.Get());
+            skyRenderer.Render(scene.camera, scene.cameraFOV, scene.lightPos, now);
+        }
 
         mainShader.BeginFrame();
         g_meshShader.SetOcclusionDepth(
@@ -1847,6 +1903,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // same command list the flush below submits.
             GunModel::Load();
 
+            // Skinned Bandit enemy: mesh + walk/idle/run clips. Texture uploads
+            // ride the same command list flushed just below.
+            {
+                const std::string banditDir = "models/MilitaryMercenaryBandit/";
+                const std::string animDir = banditDir + "Animations/Demo/";
+                std::vector<std::string> clips = {
+                    animDir + "ThirdPersonIdle.FBX",
+                    animDir + "ThirdPersonWalk.FBX",
+                    animDir + "ThirdPersonRun.FBX",
+                };
+                SkinnedModel bm = SkinnedFBXImporter::Load(
+                    banditDir + "SK_Bandit.FBX", clips, g_dx12.device, g_dx12.commandList);
+                if (bm.valid && g_bandit.Init(bm)) {
+                    g_bandit.position = { 0.0f, 0.0f, 10.0f };
+                    g_bandit.PlayClip("Walk");
+                    g_banditLoaded = true;
+                    std::cout << "Bandit enemy ready\n";
+                } else {
+                    std::cerr << "Bandit enemy failed to load\n";
+                }
+            }
+
             // Flush the load/mip-generation commands now and print any D3D12
             // validation errors before continuing, so mip-related bugs surface
             // immediately instead of silently corrupting later frames.
@@ -1871,23 +1949,47 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         // ?? render ??
         if (scene.useRaytracing && g_rt.initialized) {
+            ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());
             RenderRaytracing(scene);
         } else if (scene.useVisibilityBuffer && visBuffer.initialized) {
+            ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
             RenderIdTech(scene, mainShader, visBuffer, geo, packed);
         } else {
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
-                lightSpace = shadowMap.Render(scene, geo,
-                    g_showH2Model ? crateModel : nullptr);
+                ProfilerDX12::Scope profile(g_profiler, "Shadow", g_dx12.commandList.Get());
+                lightSpace = shadowMap.Render(scene, geo, g_showH2Model ? crateModel : nullptr);
                 shadowResource = shadowMap.GetResource();
             }
-            RenderForward(scene, mainShader, geo, crateModel, floorMaterial, lightSpace, shadowResource);
+            {
+                ProfilerDX12::Scope profile(g_profiler, "Forward", g_dx12.commandList.Get());
+                RenderForward(scene, mainShader, geo, crateModel, floorMaterial, lightSpace, shadowResource);
+
+                // Skinned Bandit: advance its clip and draw it through the mesh
+                // shader with GPU skinning. Drawn after the forward scene so it
+                // reuses the same bound root signature / descriptor heaps.
+                if (g_banditLoaded) {
+                    g_bandit.Update(deltaTime);
+                    // Always draw the skinned mesh; in debug also overlay the skeleton
+                    // joints so mesh and bones can be aligned with the same sliders.
+                    g_bandit.Draw(mainShader, scene.GetViewMatrix(), scene.GetProjectionMatrix(), lightSpace);
+                    if (g_banditDebugSkeleton) {
+                        mainShader.Use(false);
+                        g_bandit.DrawSkeleton(mainShader, scene.GetViewMatrix(),
+                            scene.GetProjectionMatrix(), lightSpace, [&] { DrawSphere(geo); });
+                    }
+                    mainShader.Use(scene.wireframeMode); // restore IA pipeline for anything after
+                }
+            }
         }
 
         // Preserve this frame's depth for next-frame amplification-shader
         // occlusion tests before UI rendering changes descriptor heaps.
-        occlusionDepth.Capture(g_dx12.commandList.Get());
+        {
+            ProfilerDX12::Scope profile(g_profiler, "Occlusion Depth", g_dx12.commandList.Get());
+            occlusionDepth.Capture(g_dx12.commandList.Get());
+        }
 
         // Ensure ImGui renders to the swapchain backbuffer (VB path changes OM target)
         {
@@ -1900,6 +2002,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
 
         // ?? ImGui ??
+        {
+        ProfilerDX12::Scope profile(g_profiler, "ImGui", g_dx12.commandList.Get());
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -1911,10 +2015,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         ID3D12DescriptorHeap* heaps[] = { imguiSrvHeap.Get() };
         g_dx12.commandList->SetDescriptorHeaps(1, heaps);
         ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_dx12.commandList.Get());
+        }
 
         // ?? end frame ??
+        g_profiler.EndGpuFrame(g_dx12.commandList.Get());
         try { EndFrame(); }
-        catch (const std::exception& e) { std::cerr << "EndFrame: " << e.what() << "\n"; break; }
+        catch (const std::exception& e) {
+            g_profiler.EndCpuFrame();
+            std::cerr << "EndFrame: " << e.what() << "\n";
+            break;
+        }
+        g_profiler.EndCpuFrame();
     }
 
     WaitForGPU();
@@ -1922,6 +2033,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     g_destruction.Shutdown();
+    g_profiler.Shutdown();
     CleanupDX12();
     return (int)msg.wParam;
 }

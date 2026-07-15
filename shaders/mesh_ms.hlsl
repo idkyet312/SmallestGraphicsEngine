@@ -14,6 +14,7 @@ cbuffer MeshDrawBuffer : register(b6) {
     uint occlusionEnabled;
     uint screenWidth;
     uint screenHeight;
+    uint skinningEnabled;   // 0 static, 1 apply bone palette
 };
 
 ByteAddressBuffer vertexData : register(t6);
@@ -26,6 +27,12 @@ struct MeshletDesc {
 StructuredBuffer<MeshletDesc> meshlets : register(t7);
 StructuredBuffer<uint> meshletVertexIndices : register(t10);
 StructuredBuffer<uint> meshletTriangles : register(t11);
+
+// Skinning: bone palette (global*offset per bone) and per-vertex weights, both
+// parallel to the vertex stream. Bound only for skinned draws.
+StructuredBuffer<float4x4> bonePalette : register(t12);
+struct SkinVtx { uint4 boneIndex; float4 boneWeight; };
+StructuredBuffer<SkinVtx> skinData : register(t13);
 
 struct Vertex {
     float3 position : POSITION;
@@ -70,6 +77,17 @@ void MSMain(uint3 id : SV_GroupThreadID,
     if (id.x < meshlet.vertexCount) {
         uint sourceVertex = meshletVertexIndices[meshlet.vertexOffset + id.x];
         Vertex v = LoadVertex(sourceVertex);
+        if (skinningEnabled) {
+            SkinVtx s = skinData[sourceVertex];
+            float4x4 skinMat =
+                s.boneWeight.x * bonePalette[s.boneIndex.x] +
+                s.boneWeight.y * bonePalette[s.boneIndex.y] +
+                s.boneWeight.z * bonePalette[s.boneIndex.z] +
+                s.boneWeight.w * bonePalette[s.boneIndex.w];
+            v.position = mul(float4(v.position, 1), skinMat).xyz;
+            v.normal = mul(v.normal, (float3x3)skinMat);
+            v.tangent.xyz = mul(v.tangent.xyz, (float3x3)skinMat);
+        }
         float4 world = mul(float4(v.position, 1), model);
         float4 viewPosition = mul(world, view);
         verts[id.x].position = mul(viewPosition, projection);
