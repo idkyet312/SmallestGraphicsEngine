@@ -262,9 +262,12 @@ struct DestructionDX12::Impl {
         XMFLOAT3 color = {};
         uint8_t shape = 1; // 1 capsule, 2 sphere
         bool wasSubmerged = false;   // for splash-on-entry detection
+        uint32_t authoredId = InvalidIndex;
+        std::string authoredBone;
     };
     std::vector<RagdollPart> ragdollParts;
     std::vector<RagdollRenderItem> ragdollRenderItems;
+    uint32_t nextAuthoredRagdollId = 0;
     struct HoverEnemy {
         size_t firstPart = 0;
         b3BodyId torso = b3_nullBodyId;
@@ -1173,6 +1176,8 @@ struct DestructionDX12::Impl {
         }
         ragdollRenderItems.clear();
         for (const RagdollPart& part : ragdollParts) {
+            // Authored corpses render through their original skinned mesh.
+            if (part.authoredId != InvalidIndex) continue;
             const b3Pos p = b3Body_GetPosition(part.body);
             const b3Quat q = b3Body_GetRotation(part.body);
             XMVECTOR rotation = XMVectorSet(q.v.x, q.v.y, q.v.z, q.s);
@@ -1462,11 +1467,12 @@ std::vector<EnemyShot> DestructionDX12::DrainEnemyShots() {
     return result;
 }
 
-bool DestructionDX12::SpawnAuthoredRagdoll(
+uint32_t DestructionDX12::SpawnAuthoredRagdoll(
     const std::vector<AuthoredRagdollBody>& bodies,
     const std::vector<RagdollConstraintSpec>& constraints,
     const XMFLOAT3& impulseDirection) {
-    if (!m || !m->initialized || B3_IS_NULL(m->world) || bodies.empty()) return false;
+    if (!m || !m->initialized || B3_IS_NULL(m->world) || bodies.empty()) return InvalidIndex;
+    const uint32_t ragdollId = m->nextAuthoredRagdollId++;
     const size_t base = m->ragdollParts.size();
     std::unordered_map<std::string, size_t> indices;
     const XMFLOAT3 cloth{ 0.08f, 0.09f, 0.075f };
@@ -1492,7 +1498,8 @@ bool DestructionDX12::SpawnAuthoredRagdoll(
             b3BoxHull box = b3MakeBoxHull(src.halfExtent.x, src.halfExtent.y, src.halfExtent.z);
             b3CreateHullShape(body, &sd, &box.base);
         }
-        m->ragdollParts.push_back({ body, src.halfExtent, cloth, src.shape });
+        m->ragdollParts.push_back({ body, src.halfExtent, cloth, src.shape,
+                                    false, ragdollId, src.name });
         indices[src.name] = i;
     }
     for (const RagdollConstraintSpec& link : constraints) {
@@ -1521,7 +1528,24 @@ bool DestructionDX12::SpawnAuthoredRagdoll(
         b3Body_ApplyLinearImpulseToCenter(body, { impulse.x, impulse.y + mass*0.4f, impulse.z }, true);
     }
     m->RebuildRenderItems();
-    return true;
+    return ragdollId;
+}
+
+bool DestructionDX12::GetAuthoredRagdollPose(
+    uint32_t ragdollId, std::vector<AuthoredRagdollPose>& pose) const {
+    pose.clear();
+    if (!m || ragdollId == InvalidIndex) return false;
+    for (const Impl::RagdollPart& part : m->ragdollParts) {
+        if (part.authoredId != ragdollId || B3_IS_NULL(part.body)) continue;
+        const b3Pos p = b3Body_GetPosition(part.body);
+        const b3Quat q = b3Body_GetRotation(part.body);
+        XMFLOAT4X4 transform;
+        XMStoreFloat4x4(&transform,
+            XMMatrixRotationQuaternion(XMVectorSet(q.v.x, q.v.y, q.v.z, q.s)) *
+            XMMatrixTranslation((float)p.x, (float)p.y, (float)p.z));
+        pose.push_back({ part.authoredBone, transform });
+    }
+    return !pose.empty();
 }
 
 bool DestructionDX12::HitTest(const XMFLOAT3& worldPosition, float radius, XMFLOAT3& hitPosition) const {

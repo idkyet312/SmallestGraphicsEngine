@@ -7,7 +7,7 @@ $cmake = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\Co
 Set-Location "build"
 
 Write-Host "Building project..." -ForegroundColor Yellow
-& $cmake --build . --config Release
+& $cmake --build . --config Release --target GraphicEngine --parallel
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "`nBuild failed!" -ForegroundColor Red

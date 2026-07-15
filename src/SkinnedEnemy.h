@@ -8,6 +8,7 @@
 #include "DX12Core.h"
 #include "DestructionDX12.h"
 #include <DirectXMath.h>
+#include <cstdint>
 #include <vector>
 
 extern MeshShaderDX12 g_meshShader;
@@ -81,7 +82,7 @@ public:
                XMMatrixRotationY(meshYaw) * WorldMatrix();
     }
 
-    bool CanRender() const { return visible && !dead_ && model.valid && !paletteCPU_.empty(); }
+    bool CanRender() const { return visible && model.valid && !paletteCPU_.empty(); }
 
     D3D12_GPU_VIRTUAL_ADDRESS UploadPalette() {
         if (!CanRender()) return 0;
@@ -101,12 +102,62 @@ public:
             const float inv = 1.0f / distance;
             position.x += dx * inv * speed * dt;
             position.z += dz * inv * speed * dt;
-            // UE mannequin faces local +X. Rotate +X onto target direction.
-            yaw = std::atan2(dx, dz) - DirectX::XM_PIDIV2;
+            // Imported FBX faces local +Z after its node/bind transforms.
+            yaw = std::atan2(dx, dz);
         }
         PlayClip(speed > moveSpeed * 1.2f ? "Run" : speed > 0.01f ? "Walk" : "Idle");
         anim.Advance(dt);
         anim.ComputePalette(model.skeleton, paletteCPU_);
+    }
+
+    void SyncRagdoll() {
+        using namespace DirectX;
+        if (!dead_ || ragdollId_ == UINT32_MAX || deathGlobals_.empty()) return;
+        std::vector<AuthoredRagdollPose> pose;
+        if (!g_destruction.GetAuthoredRagdollPose(ragdollId_, pose)) return;
+
+        const size_t count = model.skeleton.BoneCount();
+        std::vector<XMFLOAT4X4> globals(count);
+        std::vector<uint8_t> driven(count, 0);
+        const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, XMLoadFloat4x4(&deathWorld_));
+        for (const AuthoredRagdollPose& body : pose) {
+            const int bone = model.skeleton.Find(body.bone);
+            if (bone < 0 || static_cast<size_t>(bone) >= bodyLocal_.size()) continue;
+            // Box3D stores a rigid transform, so decomposition at spawn discarded
+            // the FBX centimetres-to-metres scale. Restore that scale before
+            // converting the body back into model space; otherwise inverseWorld
+            // expands every driven bone basis by 100x.
+            const XMMATRIX scaledBodyWorld =
+                XMMatrixScaling(modelScale, modelScale, modelScale) *
+                XMLoadFloat4x4(&body.bodyTransform);
+            const XMMATRIX recovered =
+                XMMatrixInverse(nullptr, XMLoadFloat4x4(&bodyLocal_[bone])) *
+                scaledBodyWorld * inverseWorld;
+            XMVECTOR scale, rotation, translation;
+            if (!XMMatrixDecompose(&scale, &rotation, &translation, recovered)) continue;
+            XMStoreFloat4x4(&globals[bone],
+                XMMatrixRotationQuaternion(rotation) * XMMatrixTranslationFromVector(translation));
+            driven[bone] = 1;
+        }
+
+        for (size_t bone = 0; bone < count; ++bone) {
+            if (driven[bone]) continue;
+            const int parent = model.skeleton.parent[bone];
+            if (parent < 0) {
+                globals[bone] = deathGlobals_[bone];
+                continue;
+            }
+            const XMMATRIX deathLocal = XMLoadFloat4x4(&deathGlobals_[bone]) *
+                XMMatrixInverse(nullptr, XMLoadFloat4x4(&deathGlobals_[parent]));
+            XMStoreFloat4x4(&globals[bone], deathLocal * XMLoadFloat4x4(&globals[parent]));
+        }
+
+        paletteCPU_.resize(count);
+        for (size_t bone = 0; bone < count; ++bone) {
+            const XMMATRIX skin = XMLoadFloat4x4(&model.skeleton.offset[bone]) *
+                                  XMLoadFloat4x4(&globals[bone]);
+            XMStoreFloat4x4(&paletteCPU_[bone], XMMatrixTranspose(skin));
+        }
     }
 
     bool Shoot(const DirectX::XMFLOAT3& start, const DirectX::XMFLOAT3& end,
@@ -185,6 +236,9 @@ private:
         dead_ = true;
         std::vector<XMFLOAT4X4> globals;
         anim.ComputeGlobalMatrices(model.skeleton, globals);
+        deathGlobals_ = globals;
+        bodyLocal_.assign(model.skeleton.BoneCount(), XMFLOAT4X4{});
+        XMStoreFloat4x4(&deathWorld_, WorldMatrix());
         std::vector<AuthoredRagdollBody> bodies;
         bodies.reserve(model.ragdoll.bodies.size());
         for (const RagdollBodySpec& spec : model.ragdoll.bodies) {
@@ -192,6 +246,7 @@ private:
             if (bone < 0 || (size_t)bone >= globals.size()) continue;
             const XMMATRIX local = XMMatrixRotationQuaternion(XMLoadFloat4(&spec.rotation)) *
                                    XMMatrixTranslation(spec.center.x, spec.center.y, spec.center.z);
+            XMStoreFloat4x4(&bodyLocal_[bone], local);
             const XMMATRIX bodyWorld = local * XMLoadFloat4x4(&globals[bone]) * WorldMatrix();
             XMVECTOR scale, rotation, translation;
             if (!XMMatrixDecompose(&scale, &rotation, &translation, bodyWorld)) continue;
@@ -202,12 +257,17 @@ private:
             XMStoreFloat4(&body.rotation, XMQuaternionNormalize(rotation));
             bodies.push_back(body);
         }
-        g_destruction.SpawnAuthoredRagdoll(bodies, model.ragdoll.constraints, impulseDirection);
+        ragdollId_ = g_destruction.SpawnAuthoredRagdoll(
+            bodies, model.ragdoll.constraints, impulseDirection);
     }
 
     Microsoft::WRL::ComPtr<ID3D12Resource> palette_[FRAME_COUNT];
     void* mapped_[FRAME_COUNT] = {};
     UINT  paletteBytes_ = 0;
     std::vector<DirectX::XMFLOAT4X4> paletteCPU_;
+    std::vector<DirectX::XMFLOAT4X4> deathGlobals_;
+    std::vector<DirectX::XMFLOAT4X4> bodyLocal_;
+    DirectX::XMFLOAT4X4 deathWorld_ = {};
+    uint32_t ragdollId_ = UINT32_MAX;
     bool dead_ = false;
 };

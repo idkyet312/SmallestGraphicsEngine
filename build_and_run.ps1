@@ -13,19 +13,21 @@ if (!(Test-Path "build")) {
 # Navigate to build directory
 Set-Location "build"
 
-# Configure with CMake
-Write-Host "`nConfiguring with CMake..." -ForegroundColor Yellow
-& $cmake .. -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "`nCMake configuration failed!" -ForegroundColor Red
-    Set-Location ..
-    exit 1
+# CMake automatically regenerates when CMakeLists.txt changes. Configure only
+# for a fresh build tree.
+if (!(Test-Path "CMakeCache.txt")) {
+    Write-Host "`nConfiguring with CMake..." -ForegroundColor Yellow
+    & $cmake .. -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "`nCMake configuration failed!" -ForegroundColor Red
+        Set-Location ..
+        exit 1
+    }
 }
 
 # Build the project
 Write-Host "`nBuilding project..." -ForegroundColor Yellow
-& $cmake --build . --config Release
+& $cmake --build . --config Release --target GraphicEngine --parallel
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "`nBuild failed!" -ForegroundColor Red

@@ -1665,6 +1665,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
             g_destruction.Update(deltaTime);
+            if (g_banditLoaded && g_bandit.Dead()) g_bandit.SyncRagdoll();
             for (const EnemyShot& shot : g_destruction.DrainEnemyShots())
                 scene.SpawnHostileProjectile(shot.origin, shot.direction);
             // Smoke at the actual fracture points where pieces broke loose.
