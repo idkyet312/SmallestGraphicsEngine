@@ -47,6 +47,12 @@ struct DX12Context {
     ComPtr<ID3D12CommandQueue> commandQueue;
     ComPtr<ID3D12CommandAllocator> commandAllocators[FRAME_COUNT];
     ComPtr<ID3D12GraphicsCommandList> commandList;
+    ComPtr<ID3D12CommandQueue> computeQueue;
+    ComPtr<ID3D12CommandAllocator> computeAllocator;
+    ComPtr<ID3D12GraphicsCommandList> computeCommandList;
+    ComPtr<ID3D12CommandQueue> copyQueue;
+    ComPtr<ID3D12CommandAllocator> copyAllocators[FRAME_COUNT];
+    ComPtr<ID3D12GraphicsCommandList> copyCommandList;
     
     // Swap chain
     ComPtr<IDXGISwapChain4> swapChain;
@@ -68,6 +74,13 @@ struct DX12Context {
     ComPtr<ID3D12Fence> fence;
     UINT64 fenceValues[FRAME_COUNT] = {};
     HANDLE fenceEvent = nullptr;
+    ComPtr<ID3D12Fence> computeFence;
+    UINT64 computeFenceValue = 0;
+    ComPtr<ID3D12Fence> copyFence;
+    UINT64 copyFenceValue = 0;
+    UINT64 copyAllocatorFenceValues[FRAME_COUNT] = {};
+    UINT64 latestCopyFenceValue = 0;
+    UINT64 lastDirectFenceValue = 0;
     
     // Frame management
     UINT frameIndex = 0;
@@ -130,10 +143,35 @@ inline void WaitForGPU() {
     g_dx12.fenceValues[g_dx12.frameIndex]++;
 }
 
+inline void WaitForFenceCPU(ID3D12Fence* fence, UINT64 value) {
+    if (!fence || value == 0 || fence->GetCompletedValue() >= value) return;
+    ThrowIfFailed(fence->SetEventOnCompletion(value, g_dx12.fenceEvent));
+    WaitForSingleObjectEx(g_dx12.fenceEvent, INFINITE, FALSE);
+}
+
+inline ID3D12GraphicsCommandList* BeginComputeCommands() {
+    WaitForFenceCPU(g_dx12.computeFence.Get(), g_dx12.computeFenceValue);
+    ThrowIfFailed(g_dx12.computeAllocator->Reset());
+    ThrowIfFailed(g_dx12.computeCommandList->Reset(g_dx12.computeAllocator.Get(), nullptr));
+    return g_dx12.computeCommandList.Get();
+}
+
+// Submit async compute and make subsequent direct work wait on the GPU. CPU keeps running.
+inline UINT64 SubmitComputeCommands() {
+    ThrowIfFailed(g_dx12.computeCommandList->Close());
+    ID3D12CommandList* lists[] = { g_dx12.computeCommandList.Get() };
+    g_dx12.computeQueue->ExecuteCommandLists(1, lists);
+    const UINT64 value = ++g_dx12.computeFenceValue;
+    ThrowIfFailed(g_dx12.computeQueue->Signal(g_dx12.computeFence.Get(), value));
+    ThrowIfFailed(g_dx12.commandQueue->Wait(g_dx12.computeFence.Get(), value));
+    return value;
+}
+
 // Move to next frame
 inline void MoveToNextFrame() {
     const UINT64 currentFenceValue = g_dx12.fenceValues[g_dx12.frameIndex];
     ThrowIfFailed(g_dx12.commandQueue->Signal(g_dx12.fence.Get(), currentFenceValue));
+    g_dx12.lastDirectFenceValue = currentFenceValue;
     
     g_dx12.frameIndex = g_dx12.swapChain->GetCurrentBackBufferIndex();
     
@@ -224,6 +262,11 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
     ThrowIfFailed(g_dx12.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&g_dx12.commandQueue)));
+
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    ThrowIfFailed(g_dx12.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&g_dx12.computeQueue)));
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+    ThrowIfFailed(g_dx12.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&g_dx12.copyQueue)));
     
     // Create swap chain
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
@@ -330,9 +373,27 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
         0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_dx12.commandAllocators[0].Get(), nullptr,
         IID_PPV_ARGS(&g_dx12.commandList)));
     ThrowIfFailed(g_dx12.commandList->Close());
+
+    ThrowIfFailed(g_dx12.device->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&g_dx12.computeAllocator)));
+    ThrowIfFailed(g_dx12.device->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_COMPUTE, g_dx12.computeAllocator.Get(), nullptr,
+        IID_PPV_ARGS(&g_dx12.computeCommandList)));
+    ThrowIfFailed(g_dx12.computeCommandList->Close());
+
+    for (UINT i = 0; i < FRAME_COUNT; ++i) {
+        ThrowIfFailed(g_dx12.device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&g_dx12.copyAllocators[i])));
+    }
+    ThrowIfFailed(g_dx12.device->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_COPY, g_dx12.copyAllocators[0].Get(), nullptr,
+        IID_PPV_ARGS(&g_dx12.copyCommandList)));
+    ThrowIfFailed(g_dx12.copyCommandList->Close());
     
     // Create fence
     ThrowIfFailed(g_dx12.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_dx12.fence)));
+    ThrowIfFailed(g_dx12.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_dx12.computeFence)));
+    ThrowIfFailed(g_dx12.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_dx12.copyFence)));
     g_dx12.fenceValues[g_dx12.frameIndex] = 1;
     
     g_dx12.fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
@@ -356,7 +417,7 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     
     g_dx12.initialized = true;
     
-    std::cout << "DirectX 12 initialized successfully" << std::endl;
+    std::cout << "DirectX 12 initialized: direct + compute + copy queues" << std::endl;
     
     return true;
 }
@@ -435,6 +496,16 @@ inline void ResizeDX12(UINT width, UINT height) {
 // Cleanup DX12
 inline void CleanupDX12() {
     WaitForGPU();
+    if (g_dx12.computeQueue && g_dx12.computeFence) {
+        const UINT64 value = ++g_dx12.computeFenceValue;
+        ThrowIfFailed(g_dx12.computeQueue->Signal(g_dx12.computeFence.Get(), value));
+        WaitForFenceCPU(g_dx12.computeFence.Get(), value);
+    }
+    if (g_dx12.copyQueue && g_dx12.copyFence) {
+        const UINT64 value = ++g_dx12.copyFenceValue;
+        ThrowIfFailed(g_dx12.copyQueue->Signal(g_dx12.copyFence.Get(), value));
+        WaitForFenceCPU(g_dx12.copyFence.Get(), value);
+    }
     
     if (g_dx12.fenceEvent) {
         CloseHandle(g_dx12.fenceEvent);

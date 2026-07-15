@@ -14,6 +14,13 @@ public:
     ComPtr<ID3D12DescriptorHeap> srvUavHeap; // shader-visible; each texture's dispatches get their own slice
     UINT nextDescriptorSlot = 0;
     bool loaded = false;
+    struct PendingMip {
+        ComPtr<ID3D12Resource> texture;
+        UINT width = 0;
+        UINT height = 0;
+        UINT16 mipLevels = 1;
+    };
+    std::vector<PendingMip> pending;
 
     // Total heap size: 2 descriptors per mip-level dispatch. All GenerateMips calls
     // made before the recording command list is executed share this heap, so it
@@ -130,6 +137,30 @@ public:
     void GenerateMips(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* texture,
                        UINT width, UINT height, UINT16 mipLevels) {
         if (!loaded || mipLevels <= 1) return;
+        (void)cmdList;
+        PendingMip request;
+        request.texture = texture;
+        request.width = width;
+        request.height = height;
+        request.mipLevels = mipLevels;
+        pending.push_back(std::move(request));
+    }
+
+    // Runs queued downsampling on the compute queue. Future direct submissions
+    // wait on its fence, while CPU initialization continues.
+    void FlushPending() {
+        if (!loaded || pending.empty()) return;
+        ID3D12GraphicsCommandList* cmdList = BeginComputeCommands();
+        for (const PendingMip& request : pending)
+            RecordMips(cmdList, request.texture.Get(), request.width,
+                       request.height, request.mipLevels);
+        pending.clear();
+        SubmitComputeCommands();
+    }
+
+private:
+    void RecordMips(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* texture,
+                    UINT width, UINT height, UINT16 mipLevels) {
 
         // Allocated on the heap and intentionally leaked for the app's lifetime:
         // the upload buffer must stay alive until the GPU executes these commands,

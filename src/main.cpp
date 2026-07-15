@@ -1555,6 +1555,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_dx12.commandQueue->ExecuteCommandLists(1, skyLists);
     }
     WaitForGPU();
+    g_mipGen.FlushPending();
     DumpDX12DebugMessages();
     {
         auto skySH = GLBImporter::ComputeSkyIrradianceSH("models/Skyboxes/sunny_rose_garden_2k.exr");
@@ -1800,6 +1801,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // ?? begin frame ??
         try { BeginFrame(); }
         catch (const std::exception& e) { std::cerr << "BeginFrame: " << e.what() << "\n"; break; }
+        occlusionDepth.FinalizeCapture(g_dx12.commandList.Get());
         g_profiler.BeginGpuFrame(g_dx12.frameIndex, g_dx12.commandList.Get());
 
         float cc[4] = { scene.clearColor.x, scene.clearColor.y, scene.clearColor.z, 1.0f };
@@ -1952,6 +1954,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ID3D12CommandList* loadLists[] = { g_dx12.commandList.Get() };
             g_dx12.commandQueue->ExecuteCommandLists(1, loadLists);
             WaitForGPU();
+            g_mipGen.FlushPending();
             DumpDX12DebugMessages();
             ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
             ThrowIfFailed(g_dx12.commandList->Reset(g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
@@ -2001,7 +2004,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // occlusion tests before UI rendering changes descriptor heaps.
         {
             ProfilerDX12::Scope profile(g_profiler, "Occlusion Depth", g_dx12.commandList.Get());
-            occlusionDepth.Capture(g_dx12.commandList.Get());
+            occlusionDepth.PrepareCapture(g_dx12.commandList.Get());
         }
 
         // Ensure ImGui renders to the swapchain backbuffer (VB path changes OM target)
@@ -2038,6 +2041,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             std::cerr << "EndFrame: " << e.what() << "\n";
             break;
         }
+        occlusionDepth.SubmitCopy();
         g_profiler.EndCpuFrame();
     }
 

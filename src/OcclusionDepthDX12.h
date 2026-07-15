@@ -8,6 +8,8 @@ public:
     ComPtr<ID3D12Resource> previousDepth;
     bool initialized = false;
     bool valid = false;
+    bool copyPending = false;
+    UINT pendingFrame = 0;
     UINT width = 0;
     UINT height = 0;
     static constexpr UINT DescriptorSlot = 63;
@@ -16,6 +18,7 @@ public:
         width = newWidth;
         height = newHeight;
         valid = false;
+        copyPending = false;
         previousDepth.Reset();
 
         D3D12_HEAP_PROPERTIES heap = {};
@@ -56,7 +59,8 @@ public:
         return gpu;
     }
 
-    void Capture(ID3D12GraphicsCommandList* cmd) {
+    // Direct queue: release resources to COPY states at end of rendered frame.
+    void PrepareCapture(ID3D12GraphicsCommandList* cmd) {
         if (!initialized || !previousDepth || !g_dx12.depthStencilBuffer) return;
         cmd->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
 
@@ -73,18 +77,53 @@ public:
             : D3D12_RESOURCE_STATE_COPY_DEST;
         barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        cmd->ResourceBarrier(valid ? 2 : 1, valid ? barriers : &barriers[0]);
-        if (!valid) {
-            // First frame needs only the source transition; destination already COPY_DEST.
-        }
-        cmd->CopyResource(previousDepth.Get(), g_dx12.depthStencilBuffer.Get());
+        cmd->ResourceBarrier(valid ? 2 : 1, barriers);
+        copyPending = true;
+        pendingFrame = g_dx12.frameIndex;
+    }
 
+    // Copy queue: runs after direct rendering, without stalling CPU.
+    void SubmitCopy() {
+        if (!copyPending) return;
+        WaitForFenceCPU(g_dx12.copyFence.Get(),
+                        g_dx12.copyAllocatorFenceValues[pendingFrame]);
+        ThrowIfFailed(g_dx12.copyAllocators[pendingFrame]->Reset());
+        ThrowIfFailed(g_dx12.copyCommandList->Reset(
+            g_dx12.copyAllocators[pendingFrame].Get(), nullptr));
+        g_dx12.copyCommandList->CopyResource(previousDepth.Get(),
+                                             g_dx12.depthStencilBuffer.Get());
+        ThrowIfFailed(g_dx12.copyCommandList->Close());
+
+        ThrowIfFailed(g_dx12.copyQueue->Wait(
+            g_dx12.fence.Get(), g_dx12.lastDirectFenceValue));
+        ID3D12CommandList* lists[] = { g_dx12.copyCommandList.Get() };
+        g_dx12.copyQueue->ExecuteCommandLists(1, lists);
+        const UINT64 value = ++g_dx12.copyFenceValue;
+        ThrowIfFailed(g_dx12.copyQueue->Signal(g_dx12.copyFence.Get(), value));
+        g_dx12.copyAllocatorFenceValues[pendingFrame] = value;
+        g_dx12.latestCopyFenceValue = value;
+        copyPending = false;
+        valid = true;
+    }
+
+    // Next direct frame: GPU-wait for copy, then restore shader/depth states.
+    void FinalizeCapture(ID3D12GraphicsCommandList* cmd) {
+        if (!valid || g_dx12.latestCopyFenceValue == 0) return;
+        ThrowIfFailed(g_dx12.commandQueue->Wait(
+            g_dx12.copyFence.Get(), g_dx12.latestCopyFenceValue));
+
+        D3D12_RESOURCE_BARRIER barriers[2] = {};
+        barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[0].Transition.pResource = g_dx12.depthStencilBuffer.Get();
         barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[1].Transition.pResource = previousDepth.Get();
         barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
         barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         cmd->ResourceBarrier(2, barriers);
-        valid = true;
     }
 };
 
