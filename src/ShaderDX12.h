@@ -46,7 +46,10 @@ struct alignas(256) ObjectBufferDX12 {
     float opacity;
     float smokeMode = 0.0f; // > 0.5: unlit soft sprite (alpha = opacity*texAlpha)
     float alphaCut = 0.0f;  // 1: alpha cutout, 2: luminance cutout (hair cards)
-    float padding[1];
+    float ambientScale = 1.0f;
+    float occlusionStrength = 0.0f;
+    float normalYSign = 1.0f;
+    float viewFillStrength = 0.0f;
 };
 
 struct PointLightDataDX12 {
@@ -785,7 +788,11 @@ public:
                           ID3D12Resource* albedo, ID3D12Resource* normal, ID3D12Resource* metalRough,
                           bool roughnessOnly = false, float opacity = 1.0f, bool alphaCut = false,
                           SceneMaterial* cacheOwner = nullptr,
-                          bool alphaFromLuminance = false) {
+                          bool alphaFromLuminance = false,
+                          float ambientScale = 1.0f,
+                          float occlusionStrength = 0.0f,
+                          float normalYSign = 1.0f,
+                          float viewFillStrength = 0.0f) {
         UINT bufferIndex = GetDrawCallIndex();
 
         ObjectBufferDX12 data;
@@ -797,6 +804,10 @@ public:
         data.metalRoughMode = metalRough ? (roughnessOnly ? 2.0f : 1.0f) : 0.0f;
         data.opacity = opacity;
         data.alphaCut = alphaFromLuminance ? 2.0f : (alphaCut ? 1.0f : 0.0f);
+        data.ambientScale = ambientScale;
+        data.occlusionStrength = occlusionStrength;
+        data.normalYSign = normalYSign;
+        data.viewFillStrength = viewFillStrength;
         
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));

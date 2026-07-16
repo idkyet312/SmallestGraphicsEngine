@@ -37,7 +37,10 @@ cbuffer ObjectBuffer : register(b3) {
     float opacity;
     float smokeMode;         // > 0.5: unlit soft sprite, alpha = opacity * texAlpha
     float alphaCut;          // 1: alpha cutout; 2: luminance cutout for hair
-    float objectPadding;
+    float ambientScale;
+    float occlusionStrength;
+    float normalYSign;
+    float viewFillStrength;
 };
 
 struct PointLightData {
@@ -397,13 +400,14 @@ float4 main(PS_INPUT input) : SV_TARGET {
         // clip() disables early-Z for the draw, which is expensive scene-wide --
         // an unconditional clip here once pushed heavy-overdraw frames past the
         // GPU watchdog (device removed). Only foliage pays for it now.
-        if (alphaCut > 1.5) clip(max(texColor.r, max(texColor.g, texColor.b)) - 0.12);
+        if (alphaCut > 1.5) clip(max(texColor.r, max(texColor.g, texColor.b)) - 0.38);
         else if (alphaCut > 0.5) clip(texColor.a - 0.4);
         // Textures are uploaded as UNORM, so decode authored sRGB before lighting.
         albedo = pow(max(texColor.rgb, 0.0), 2.2) * objectColor;
     }
     float metal = metalness;
     float rough = roughness;
+    float ambientOcclusion = 1.0;
     
     if (metalRoughMode > 0.5) {
         // Check if metalRoughMap is bound? We don't have a flag for it specifically, assuming bundled with material
@@ -430,6 +434,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
         if (metalRoughMode < 1.5) {
             metal *= mrSample.b;
             rough *= mrSample.g;
+            ambientOcclusion = lerp(1.0, mrSample.r, occlusionStrength);
         } else {
             // Standalone roughness maps are authored as final roughness, not a
             // glTF multiplier. Never let dark texels turn metal mirror-smooth.
@@ -444,6 +449,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
          float normalMipBias = 1.5;
          float normalStrength = 0.70;
          float3 mapNormal = normalMap.SampleBias(texSampler, input.texCoord, normalMipBias).xyz * 2.0 - 1.0;
+         mapNormal.y *= normalYSign;
          float normalMipLength = saturate(length(mapNormal));
          mapNormal.xy *= normalMipLength;
          mapNormal.z = sqrt(saturate(1.0 - dot(mapNormal.xy, mapNormal.xy)));
@@ -472,15 +478,20 @@ float4 main(PS_INPUT input) : SV_TARGET {
 
     // Base ambient
     float3 diffuseAlbedo = albedo * (1.0 - metal);
-    float3 ambient = ambientStrength * diffuseAlbedo;
+    float3 ambient = ambientStrength * diffuseAlbedo * ambientScale;
     
     // Add DDGI global illumination
     float3 giContribution = sampleDDGIIrradiance(input.fragPos, normal);
-    ambient += giContribution * diffuseAlbedo;
+    ambient += giContribution * diffuseAlbedo * ambientScale;
 
     // Add sky IBL (diffuse irradiance from the HDRI, via SH)
     float3 skyContribution = sampleSkyIrradiance(normal);
-    ambient += skyContribution * diffuseAlbedo;
+    ambient += skyContribution * diffuseAlbedo * ambientScale;
+    ambient *= ambientOcclusion;
+    // Character/material-local camera fill. Useful for imported presentation
+    // assets authored under studio lighting when scene sun is behind them.
+    float frontFill = 0.35 + 0.65 * saturate(dot(normal, viewDir));
+    ambient += diffuseAlbedo * viewFillStrength * frontFill;
 
     float3 result = ambient;
     

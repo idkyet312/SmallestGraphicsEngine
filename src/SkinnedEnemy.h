@@ -235,7 +235,11 @@ public:
                     prim.material->metallicRoughnessTexture.Get(),
                     prim.material->roughnessOnlyTexture, 1.0f,
                     prim.material->alphaCutout,
-                    prim.material.get(), prim.material->alphaFromLuminance);
+                    prim.material.get(), prim.material->alphaFromLuminance,
+                    prim.material->ambientScale,
+                    prim.material->occlusionStrength,
+                    prim.material->normalYSign,
+                    prim.material->viewFillStrength);
             } else {
                 shader.SetObjectColor(XMFLOAT3(0.7f, 0.7f, 0.72f));
             }
