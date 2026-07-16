@@ -40,6 +40,10 @@ struct SceneMaterial {
     // Hair/eyelash atlases ship as opaque RGB with white strands on black.
     // Clip from luminance instead of alpha for those cards.
     bool alphaFromLuminance = false;
+    float ambientScale = 1.0f;
+    float occlusionStrength = 0.0f;
+    float normalYSign = 1.0f;
+    float viewFillStrength = 0.0f;
     
     ComPtr<ID3D12Resource> baseColorTexture;
     ComPtr<ID3D12Resource> metallicRoughnessTexture;

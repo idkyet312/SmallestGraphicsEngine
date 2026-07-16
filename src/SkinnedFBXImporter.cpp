@@ -188,16 +188,28 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
                 mat->baseColorTexture = loadByStem("T_Bandit_Hair_BaseColor", mat->uploadHeaps);
                 mat->normalTexture.Reset();
                 mat->metallicRoughnessTexture.Reset();
+                const bool eyelashes = materialLower.find("eyelash") != std::string::npos;
+                mat->baseColorFactor = eyelashes
+                    ? XMFLOAT4(0.018f, 0.012f, 0.008f, 1.0f)
+                    : XMFLOAT4(0.025f, 0.018f, 0.012f, 1.0f);
                 mat->metallicFactor = 0.0f;
-                mat->roughnessFactor = 0.75f;
+                mat->roughnessFactor = 0.88f;
                 mat->doubleSided = true;
                 mat->alphaCutout = true;
                 mat->alphaFromLuminance = true;
+                mat->ambientScale = 1.45f;
+                mat->viewFillStrength = 0.08f;
             } else {
                 if (!mat->baseColorTexture) mat->baseColorTexture = loadPart("_BaseColor");
                 if (!mat->normalTexture) mat->normalTexture = loadPart("_Normal");
                 mat->metallicRoughnessTexture = loadPart("_ORM");
                 mat->roughnessOnlyTexture = false;
+                mat->baseColorFactor = XMFLOAT4(1.12f, 1.10f, 1.06f, 1.0f);
+                mat->ambientScale = 1.80f;
+                mat->occlusionStrength = 0.25f;
+                mat->viewFillStrength = 0.12f;
+                mat->metallicFactor = 1.0f;
+                mat->roughnessFactor = 1.0f;
             }
         }
         p.material = mat;
@@ -209,12 +221,22 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
             const aiVector3D n = src->HasNormals() ? src->mNormals[v] : aiVector3D(0, 1, 0);
             const aiVector3D uv = src->HasTextureCoords(0) ? src->mTextureCoords[0][v] : aiVector3D();
             const aiVector3D t = src->HasTangentsAndBitangents() ? src->mTangents[v] : aiVector3D(1, 0, 0);
+            float handedness = 1.0f;
+            if (src->HasTangentsAndBitangents()) {
+                const aiVector3D& b = src->mBitangents[v];
+                const aiVector3D cross(
+                    n.y * t.z - n.z * t.y,
+                    n.z * t.x - n.x * t.z,
+                    n.x * t.y - n.y * t.x);
+                handedness = (cross.x * b.x + cross.y * b.y + cross.z * b.z) < 0.0f
+                    ? -1.0f : 1.0f;
+            }
             p.vertices.insert(p.vertices.end(), {
                 // Keep vertices in native (UE cm) space so they stay consistent
                 // with the skeleton's offset/global matrices during GPU skinning.
                 // The 0.01 metre scale is applied once on the world matrix.
                 src->mVertices[v].x, src->mVertices[v].y, src->mVertices[v].z,
-                n.x, n.y, n.z, uv.x, uv.y, t.x, t.y, t.z, 1.0f });
+                n.x, n.y, n.z, uv.x, uv.y, t.x, t.y, t.z, handedness });
         }
         for (unsigned f = 0; f < src->mNumFaces; ++f)
             for (unsigned i = 0; i < src->mFaces[f].mNumIndices; ++i)
