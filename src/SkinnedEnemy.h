@@ -36,7 +36,7 @@ public:
     float             meshRoll = 0.0f;
     float             meshYaw  = 0.0f;
     bool              upperBodyGunLayer = true;
-    float             leftHandForegrip = 0.55f;
+    float             leftArmReach = 0.55f;
 
     bool Init(const SkinnedModel& m) {
         model = m;
@@ -440,13 +440,15 @@ private:
             origin.x + cz * 0.06f, origin.y - 0.03f,
             origin.z - sx * 0.06f, 1.0f);
         const XMVECTOR foreGripWorld = XMVectorSet(
-            origin.x - cz * 0.05f + sx * leftHandForegrip, origin.y - 0.02f,
-            origin.z + sx * 0.05f + cz * leftHandForegrip, 1.0f);
+            origin.x - cz * 0.05f + sx * leftArmReach, origin.y - 0.02f,
+            origin.z + sx * 0.05f + cz * leftArmReach, 1.0f);
         const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, MeshWorldMatrix());
+        // FBX arm labels are mirrored visually after the UE axis conversion.
+        // Route foregrip slider to the on-screen opposite arm.
         SolveArmIK(upperR, lowerR, handBone_,
-                   XMVector3TransformCoord(rightGripWorld, inverseWorld));
-        SolveArmIK(upperL, lowerL, handL,
                    XMVector3TransformCoord(foreGripWorld, inverseWorld));
+        SolveArmIK(upperL, lowerL, handL,
+                   XMVector3TransformCoord(rightGripWorld, inverseWorld));
 
         for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
             const XMMATRIX skin = XMLoadFloat4x4(&model.skeleton.offset[bone]) *
