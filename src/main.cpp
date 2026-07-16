@@ -84,7 +84,7 @@ void BanditDebugText() {
                 g_bandit.position.x, g_bandit.position.y, g_bandit.position.z);
     ImGui::Text("Bandit: %s health=%.0f", g_bandit.Dead() ? "dead" : "ground AI",
                 g_bandit.health);
-    ImGui::SliderFloat("Left arm reach", &g_bandit.leftHandForegrip,
+    ImGui::SliderFloat("Left arm reach", &g_bandit.leftArmReach,
                        0.20f, 0.85f, "%.2f m");
 }
 WaterVolume                 g_water;
