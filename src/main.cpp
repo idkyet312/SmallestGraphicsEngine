@@ -60,8 +60,6 @@ TerrainRendererDX12         g_terrain;
 DestructionDX12             g_destruction;
 SkinnedEnemy                g_bandit;
 bool                        g_banditLoaded = false;
-SkinnedEnemy                g_banditReference;
-bool                        g_banditReferenceLoaded = false;
 GunAudio                    g_gunAudio;
 
 static void ShootPlayerWeapon() {
@@ -86,16 +84,6 @@ void BanditDebugText() {
                 g_bandit.position.x, g_bandit.position.y, g_bandit.position.z);
     ImGui::Text("Bandit: %s health=%.0f", g_bandit.Dead() ? "dead" : "ground AI",
                 g_bandit.health);
-    if (g_banditReferenceLoaded && g_banditReference.model.node &&
-        g_banditReference.model.node->mesh) {
-        ImGui::Text("Fab reference: parts=%zu scale=%.3f pos(%.1f,%.1f,%.1f)",
-                    g_banditReference.model.node->mesh->primitives.size(),
-                    g_banditReference.modelScale,
-                    g_banditReference.position.x, g_banditReference.position.y,
-                    g_banditReference.position.z);
-    } else {
-        ImGui::Text("Fab reference: NOT LOADED");
-    }
     ImGui::SliderFloat("Left arm reach", &g_bandit.leftArmReach,
                        0.20f, 0.85f, "%.2f m");
 }
@@ -1680,15 +1668,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             g_bandit.Update(deltaTime, scene.camera.Position, groundY);
         }
-        if (g_banditReferenceLoaded) {
-            float groundY = 0.0f;
-            if (scene.useMeshTerrain && g_terrain.supported) {
-                TerrainRendererDX12::Params tp; tp.heightScale = scene.terrainHeightScale;
-                groundY = TerrainRendererDX12::HeightAt(
-                    tp, g_banditReference.position.x, g_banditReference.position.z);
-            }
-            g_banditReference.position.y = groundY;
-        }
         g_water.Update(deltaTime);
         g_ocean.Update(deltaTime);
         g_rope.Update(deltaTime);
@@ -1971,21 +1950,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     std::cerr << "Bandit enemy failed to load\n";
                 }
 
-                // Original Fab FBX beside gameplay Bandit. Static comparison
-                // copy makes scale, face, material, and orientation errors
-                // visible in the same scene lighting.
-                SkinnedModel referenceModel = SkinnedFBXImporter::Load(
-                    banditDir + "fbx/military_mercenary_bandit.fbx", {},
-                    g_dx12.device, g_dx12.commandList);
-                if (referenceModel.valid && g_banditReference.Init(referenceModel)) {
-                    g_banditReference.position = { 2.5f, 0.0f, 14.0f };
-                    // Blender-authored Fab FBX uses metres, unlike UE SK export
-                    // which uses centimetres.
-                    g_banditReference.modelScale = 1.0f;
-                    g_banditReference.upperBodyGunLayer = false;
-                    g_banditReferenceLoaded = true;
-                    std::cout << "Bandit Fab reference ready\n";
-                }
             }
 
             // Flush the load/mip-generation commands now and print any D3D12
@@ -2042,11 +2006,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                scene.GetViewMatrix(), scene.GetProjectionMatrix(), lightSpace);
                 }
                 mainShader.Use(scene.wireframeMode); // restore IA pipeline for anything after
-                }
-                if (g_banditReferenceLoaded) {
-                    g_banditReference.Draw(mainShader, scene.GetViewMatrix(),
-                                           scene.GetProjectionMatrix(), lightSpace);
-                    mainShader.Use(scene.wireframeMode);
                 }
             }
         }
