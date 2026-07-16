@@ -129,7 +129,8 @@ public:
         using namespace DirectX;
         if (!HasGunPose()) return XMMatrixIdentity();
         const XMFLOAT3 origin = GunOriginWorld();
-        return XMMatrixRotationY(yaw) *
+        return XMMatrixScaling(0.5f, 0.5f, 0.5f) *
+               XMMatrixRotationY(yaw) *
                XMMatrixTranslation(origin.x, origin.y, origin.z);
     }
 
