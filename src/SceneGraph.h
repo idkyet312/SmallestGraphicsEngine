@@ -37,6 +37,9 @@ struct SceneMaterial {
     // Alpha-tested cutout (foliage cards): the pixel shader clips texels whose
     // texture alpha is below threshold. Opt-in because clip() costs early-Z.
     bool alphaCutout = false;
+    // Hair/eyelash atlases ship as opaque RGB with white strands on black.
+    // Clip from luminance instead of alpha for those cards.
+    bool alphaFromLuminance = false;
     
     ComPtr<ID3D12Resource> baseColorTexture;
     ComPtr<ID3D12Resource> metallicRoughnessTexture;

@@ -36,7 +36,7 @@ cbuffer ObjectBuffer : register(b3) {
     float metalRoughMode;
     float opacity;
     float smokeMode;         // > 0.5: unlit soft sprite, alpha = opacity * texAlpha
-    float alphaCut;          // > 0.5: clip transparent texels (foliage cards)
+    float alphaCut;          // 1: alpha cutout; 2: luminance cutout for hair
     float objectPadding;
 };
 
@@ -397,7 +397,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
         // clip() disables early-Z for the draw, which is expensive scene-wide --
         // an unconditional clip here once pushed heavy-overdraw frames past the
         // GPU watchdog (device removed). Only foliage pays for it now.
-        if (alphaCut > 0.5) clip(texColor.a - 0.4);
+        if (alphaCut > 1.5) clip(max(texColor.r, max(texColor.g, texColor.b)) - 0.12);
+        else if (alphaCut > 0.5) clip(texColor.a - 0.4);
         // Textures are uploaded as UNORM, so decode authored sRGB before lighting.
         albedo = pow(max(texColor.rgb, 0.0), 2.2) * objectColor;
     }
