@@ -5,6 +5,7 @@
 #include <assimp/postprocess.h>
 #include <algorithm>
 #include <cctype>
+#include <cfloat>
 #include <filesystem>
 #include <iostream>
 #include <unordered_map>
@@ -109,27 +110,8 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
     auto root = std::make_shared<SceneNode>("SkinnedRoot");
     root->mesh = std::make_shared<SceneMesh>();
     const fs::path base = fs::path(meshPath).parent_path();
-
-    // Texture loader mirrors FBXImporter: try the material's referenced path,
-    // then search the model folder recursively by filename (FBX often stores
-    // Windows-style or absolute paths that don't exist on this disk).
-    auto loadTex = [&](const aiString& texPath, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploads)
-        -> Microsoft::WRL::ComPtr<ID3D12Resource> {
-        std::string raw = texPath.C_Str();
-        std::replace(raw.begin(), raw.end(), '\\', '/');
-        const fs::path filename = fs::path(raw).filename();
-        fs::path direct = (base / fs::path(raw)).lexically_normal();
-        if (fs::exists(direct))
-            return GLBImporter::LoadTextureFromFile(direct.string(), device, commandList, uploads);
-        // Case-insensitive filename search: the FBX stores ".png" but the files
-        // on disk are ".PNG"; a case-sensitive compare would miss every texture.
-        auto lower = [](std::string s) { for (char& c : s) c = (char)tolower((unsigned char)c); return s; };
-        const std::string want = lower(filename.string());
-        for (const auto& e : fs::recursive_directory_iterator(base))
-            if (e.is_regular_file() && lower(e.path().filename().string()) == want)
-                return GLBImporter::LoadTextureFromFile(e.path().string(), device, commandList, uploads);
-        return nullptr;
-    };
+    const fs::path textureRoot =
+        base.filename() == "fbx" ? base.parent_path() : base;
 
     // Load a texture by a bare filename stem, searching the model tree
     // case-insensitively for "<stem>.<ext>" (e.g. "T_Bandit_2_BaseColor").
@@ -140,7 +122,7 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
                           std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploads)
         -> Microsoft::WRL::ComPtr<ID3D12Resource> {
         const std::string want = lowerStr(stem);
-        for (const auto& e : fs::recursive_directory_iterator(base)) {
+        for (const auto& e : fs::recursive_directory_iterator(textureRoot)) {
             if (!e.is_regular_file()) continue;
             if (lowerStr(e.path().stem().string()) == want)
                 return GLBImporter::LoadTextureFromFile(e.path().string(), device, commandList, uploads);
@@ -158,12 +140,6 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
             aiString materialName;
             if (am->Get(AI_MATKEY_NAME, materialName) == AI_SUCCESS)
                 mat->name = materialName.C_Str();
-            aiString tex;
-            if ((am->GetTexture(aiTextureType_BASE_COLOR, 0, &tex) == AI_SUCCESS && tex.length) ||
-                (am->GetTexture(aiTextureType_DIFFUSE, 0, &tex) == AI_SUCCESS && tex.length))
-                mat->baseColorTexture = loadTex(tex, mat->uploadHeaps);
-            if (am->GetTexture(aiTextureType_NORMALS, 0, &tex) == AI_SUCCESS && tex.length)
-                mat->normalTexture = loadTex(tex, mat->uploadHeaps);
         }
         // FBX parts are body, hair, and eyelashes. Mesh-index fallback used to
         // assign outfit sets 2 and 3 to hair cards, producing black/material
@@ -179,12 +155,21 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
                 if (digit < materialLower.size() && std::isdigit((unsigned char)materialLower[digit]))
                     idx.assign(1, materialLower[digit]);
             }
+            // Fab preview uses green camouflage outfit variant 3. The FBX
+            // material itself points at brown variant 1, so following that
+            // embedded name can never match the advertised reference.
+            if (!hairCard) idx = "3";
             auto loadPart = [&](const char* suffix) {
-                auto tex = loadByStem("T_Bandit_" + idx + suffix, mat->uploadHeaps);
-                if (!tex) tex = loadByStem("T_Bandit_" + idx + "_1" + suffix, mat->uploadHeaps);
+                // Muted "_1" companion is closest to Fab's preview grading.
+                auto tex = loadByStem("T_Bandit_" + idx + "_1" + suffix, mat->uploadHeaps);
+                if (!tex) tex = loadByStem("T_Bandit_" + idx + suffix, mat->uploadHeaps);
                 return tex;
             };
             if (hairCard) {
+                // Reference character wears a closed beanie/balaclava. The
+                // separate hair-shell mesh is an optional customization layer
+                // and creates the brown dome seen in-engine, so omit it.
+                if (materialLower.find("hair") != std::string::npos) continue;
                 mat->baseColorTexture = loadByStem("T_Bandit_Hair_BaseColor", mat->uploadHeaps);
                 mat->normalTexture.Reset();
                 mat->metallicRoughnessTexture.Reset();
@@ -200,14 +185,17 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
                 mat->ambientScale = 1.45f;
                 mat->viewFillStrength = 0.08f;
             } else {
-                if (!mat->baseColorTexture) mat->baseColorTexture = loadPart("_BaseColor");
-                if (!mat->normalTexture) mat->normalTexture = loadPart("_Normal");
+                // Replace every map together. Keeping embedded variant-1
+                // albedo/normal while loading variant-3 ORM produced a hybrid
+                // material with incorrect colors and lighting.
+                mat->baseColorTexture = loadPart("_BaseColor");
+                mat->normalTexture = loadPart("_Normal");
                 mat->metallicRoughnessTexture = loadPart("_ORM");
                 mat->roughnessOnlyTexture = false;
-                mat->baseColorFactor = XMFLOAT4(1.12f, 1.10f, 1.06f, 1.0f);
-                mat->ambientScale = 1.80f;
+                mat->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+                mat->ambientScale = 1.35f;
                 mat->occlusionStrength = 0.25f;
-                mat->viewFillStrength = 0.12f;
+                mat->viewFillStrength = 0.65f;
                 mat->metallicFactor = 1.0f;
                 mat->roughnessFactor = 1.0f;
             }
@@ -270,26 +258,140 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
             else { s.boneIndex[0] = 0; s.boneWeight[0] = 1.0f; }
         }
 
-        if (!GLBImporter::BuildMeshletData(p, device.Get())) continue;
+        std::vector<MeshPrimitive> parts;
+        const int neckBone = out.skeleton.Find("neck_01");
+        if (src->mMaterialIndex == 0 && neckBone >= 0) {
+            auto belowNeck = [&](uint32_t bone) {
+                for (int current = static_cast<int>(bone); current >= 0;
+                     current = out.skeleton.parent[current])
+                    if (current == neckBone) return true;
+                return false;
+            };
+            auto headWeight = [&](uint32_t vertex) {
+                float weight = 0.0f;
+                const SkinVertex& skin = p.skin[vertex];
+                for (int influence = 0; influence < 4; ++influence)
+                    if (belowNeck(skin.boneIndex[influence]))
+                        weight += skin.boneWeight[influence];
+                return weight;
+            };
 
-        // Upload the parallel skin buffer (StructuredBuffer<SkinVertex> @ t13).
-        const UINT skinBytes = (UINT)(p.skin.size() * sizeof(SkinVertex));
-        D3D12_HEAP_PROPERTIES heap = {}; heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC rd = {};
-        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd.Width = skinBytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
-        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd,
-                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&p.skinBuffer)))) {
-            void* mapped = nullptr; D3D12_RANGE none{ 0, 0 };
-            if (SUCCEEDED(p.skinBuffer->Map(0, &none, &mapped))) {
-                memcpy(mapped, p.skin.data(), skinBytes);
-                p.skinBuffer->Unmap(0, nullptr);
-                p.skinVertexCount = (UINT)p.skin.size();
+            std::vector<unsigned> bodyIndices;
+            std::vector<unsigned> headIndices;
+            bodyIndices.reserve(p.indices.size());
+            headIndices.reserve(p.indices.size() / 8);
+            for (size_t triangle = 0; triangle + 2 < p.indices.size(); triangle += 3) {
+                const float weight =
+                    (headWeight(p.indices[triangle]) +
+                     headWeight(p.indices[triangle + 1]) +
+                     headWeight(p.indices[triangle + 2])) / 3.0f;
+                std::vector<unsigned>& destination =
+                    weight >= 0.45f ? headIndices : bodyIndices;
+                destination.push_back(p.indices[triangle]);
+                destination.push_back(p.indices[triangle + 1]);
+                destination.push_back(p.indices[triangle + 2]);
+            }
+
+            if (!headIndices.empty() && !bodyIndices.empty()) {
+                XMFLOAT3 headMin(FLT_MAX, FLT_MAX, FLT_MAX);
+                XMFLOAT3 headMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+                for (unsigned index : headIndices) {
+                    const size_t vertex = static_cast<size_t>(index) * 12;
+                    headMin.x = (std::min)(headMin.x, p.vertices[vertex]);
+                    headMin.y = (std::min)(headMin.y, p.vertices[vertex + 1]);
+                    headMin.z = (std::min)(headMin.z, p.vertices[vertex + 2]);
+                    headMax.x = (std::max)(headMax.x, p.vertices[vertex]);
+                    headMax.y = (std::max)(headMax.y, p.vertices[vertex + 1]);
+                    headMax.z = (std::max)(headMax.z, p.vertices[vertex + 2]);
+                }
+                std::vector<unsigned> faceIndices;
+                std::vector<unsigned> gearIndices;
+                const float headHeight = (std::max)(headMax.z - headMin.z, 0.001f);
+                const float headDepth = (std::max)(headMax.x - headMin.x, 0.001f);
+                for (size_t triangle = 0; triangle + 2 < headIndices.size(); triangle += 3) {
+                    XMFLOAT3 center{};
+                    for (int corner = 0; corner < 3; ++corner) {
+                        const size_t vertex =
+                            static_cast<size_t>(headIndices[triangle + corner]) * 12;
+                        center.x += p.vertices[vertex];
+                        center.y += p.vertices[vertex + 1];
+                        center.z += p.vertices[vertex + 2];
+                    }
+                    center.x /= 3.0f;
+                    center.z /= 3.0f;
+                    const float height01 = (center.z - headMin.z) / headHeight;
+                    const float front01 = (center.x - headMin.x) / headDepth;
+                    std::vector<unsigned>& destination =
+                        (front01 > 0.55f && height01 > 0.56f && height01 < 0.70f)
+                        ? faceIndices : gearIndices;
+                    destination.push_back(headIndices[triangle]);
+                    destination.push_back(headIndices[triangle + 1]);
+                    destination.push_back(headIndices[triangle + 2]);
+                }
+
+                MeshPrimitive gear = p;
+                p.indices = std::move(bodyIndices);
+                gear.indices = std::move(gearIndices);
+                auto gearMaterial = std::make_shared<SceneMaterial>();
+                gearMaterial->name = "Bandit dark beanie and balaclava";
+                gearMaterial->baseColorFactor = XMFLOAT4(0.004f, 0.0035f, 0.003f, 1.0f);
+                gearMaterial->metallicFactor = 0.0f;
+                gearMaterial->roughnessFactor = 0.92f;
+                gearMaterial->ambientScale = 0.9f;
+                gearMaterial->viewFillStrength = 0.18f;
+                gear.material = std::move(gearMaterial);
+                gear.materialIndex = 1000;
+                parts.push_back(std::move(p));
+                parts.push_back(std::move(gear));
+
+                if (!faceIndices.empty()) {
+                    MeshPrimitive face = parts.front();
+                    face.indices = std::move(faceIndices);
+                    auto faceMaterial = std::make_shared<SceneMaterial>();
+                    faceMaterial->name = "Bandit exposed face";
+                    faceMaterial->baseColorTexture =
+                        loadByStem("T_Bandit_1_BaseColor", faceMaterial->uploadHeaps);
+                    faceMaterial->normalTexture =
+                        loadByStem("T_Bandit_1_Normal", faceMaterial->uploadHeaps);
+                    faceMaterial->metallicRoughnessTexture =
+                        loadByStem("T_Bandit_1_ORM", faceMaterial->uploadHeaps);
+                    faceMaterial->metallicFactor = 0.0f;
+                    faceMaterial->roughnessFactor = 0.86f;
+                    faceMaterial->ambientScale = 1.45f;
+                    faceMaterial->occlusionStrength = 0.1f;
+                    faceMaterial->viewFillStrength = 1.1f;
+                    face.material = std::move(faceMaterial);
+                    face.materialIndex = 1001;
+                    parts.push_back(std::move(face));
+                }
             }
         }
-        root->mesh->primitives.push_back(std::move(p));
+        if (parts.empty()) parts.push_back(std::move(p));
+
+        for (MeshPrimitive& part : parts) {
+            if (!GLBImporter::BuildMeshletData(part, device.Get())) continue;
+
+            // Upload the parallel skin buffer (StructuredBuffer<SkinVertex> @ t13).
+            const UINT skinBytes = (UINT)(part.skin.size() * sizeof(SkinVertex));
+            D3D12_HEAP_PROPERTIES heap = {}; heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = skinBytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+            rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (SUCCEEDED(device->CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &rd,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    IID_PPV_ARGS(&part.skinBuffer)))) {
+                void* mapped = nullptr; D3D12_RANGE none{ 0, 0 };
+                if (SUCCEEDED(part.skinBuffer->Map(0, &none, &mapped))) {
+                    memcpy(mapped, part.skin.data(), skinBytes);
+                    part.skinBuffer->Unmap(0, nullptr);
+                    part.skinVertexCount = (UINT)part.skin.size();
+                }
+            }
+            root->mesh->primitives.push_back(std::move(part));
+        }
     }
 
     // Clips keep native-space translation keys (matching the unscaled skeleton);
