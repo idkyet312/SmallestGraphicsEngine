@@ -165,19 +165,40 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
             if (am->GetTexture(aiTextureType_NORMALS, 0, &tex) == AI_SUCCESS && tex.length)
                 mat->normalTexture = loadTex(tex, mat->uploadHeaps);
         }
-        // FBX only embeds one material path. The three exported mesh parts map
-        // to Bandit texture sets 1..3; some variants use an extra "_1" suffix.
+        // FBX parts are body, hair, and eyelashes. Mesh-index fallback used to
+        // assign outfit sets 2 and 3 to hair cards, producing black/material
+        // garbage. Resolve card materials by FBX material name instead.
         {
-            const std::string idx = std::to_string(mi + 1);
+            const std::string materialLower = lowerStr(mat->name);
+            const bool hairCard = materialLower.find("hair") != std::string::npos ||
+                                  materialLower.find("eyelash") != std::string::npos;
+            std::string idx = "1";
+            const size_t bandit = materialLower.find("bandit_");
+            if (bandit != std::string::npos) {
+                const size_t digit = bandit + 7;
+                if (digit < materialLower.size() && std::isdigit((unsigned char)materialLower[digit]))
+                    idx.assign(1, materialLower[digit]);
+            }
             auto loadPart = [&](const char* suffix) {
                 auto tex = loadByStem("T_Bandit_" + idx + suffix, mat->uploadHeaps);
                 if (!tex) tex = loadByStem("T_Bandit_" + idx + "_1" + suffix, mat->uploadHeaps);
                 return tex;
             };
-            if (!mat->baseColorTexture) mat->baseColorTexture = loadPart("_BaseColor");
-            if (!mat->normalTexture) mat->normalTexture = loadPart("_Normal");
-            mat->metallicRoughnessTexture = loadPart("_ORM");
-            mat->roughnessOnlyTexture = false;
+            if (hairCard) {
+                mat->baseColorTexture = loadByStem("T_Bandit_Hair_BaseColor", mat->uploadHeaps);
+                mat->normalTexture.Reset();
+                mat->metallicRoughnessTexture.Reset();
+                mat->metallicFactor = 0.0f;
+                mat->roughnessFactor = 0.75f;
+                mat->doubleSided = true;
+                mat->alphaCutout = true;
+                mat->alphaFromLuminance = true;
+            } else {
+                if (!mat->baseColorTexture) mat->baseColorTexture = loadPart("_BaseColor");
+                if (!mat->normalTexture) mat->normalTexture = loadPart("_Normal");
+                mat->metallicRoughnessTexture = loadPart("_ORM");
+                mat->roughnessOnlyTexture = false;
+            }
         }
         p.material = mat;
         p.materialIndex = (int)src->mMaterialIndex;

@@ -45,7 +45,7 @@ struct alignas(256) ObjectBufferDX12 {
     float metalRoughMode;  // 0=none, 1=glTF packed, 2=roughness-only
     float opacity;
     float smokeMode = 0.0f; // > 0.5: unlit soft sprite (alpha = opacity*texAlpha)
-    float alphaCut = 0.0f;  // > 0.5: clip() texels with texture alpha < 0.4 (foliage)
+    float alphaCut = 0.0f;  // 1: alpha cutout, 2: luminance cutout (hair cards)
     float padding[1];
 };
 
@@ -784,7 +784,8 @@ public:
     void SetObjectMaterial(const XMFLOAT3& color, bool useTex, bool useNorm, float metal, float rough,
                           ID3D12Resource* albedo, ID3D12Resource* normal, ID3D12Resource* metalRough,
                           bool roughnessOnly = false, float opacity = 1.0f, bool alphaCut = false,
-                          SceneMaterial* cacheOwner = nullptr) {
+                          SceneMaterial* cacheOwner = nullptr,
+                          bool alphaFromLuminance = false) {
         UINT bufferIndex = GetDrawCallIndex();
 
         ObjectBufferDX12 data;
@@ -795,7 +796,7 @@ public:
         data.roughness = rough;
         data.metalRoughMode = metalRough ? (roughnessOnly ? 2.0f : 1.0f) : 0.0f;
         data.opacity = opacity;
-        data.alphaCut = alphaCut ? 1.0f : 0.0f;
+        data.alphaCut = alphaFromLuminance ? 2.0f : (alphaCut ? 1.0f : 0.0f);
         
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
