@@ -488,11 +488,6 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float3 skyContribution = sampleSkyIrradiance(normal);
     ambient += skyContribution * diffuseAlbedo * ambientScale;
     ambient *= ambientOcclusion;
-    // Character/material-local camera fill. Useful for imported presentation
-    // assets authored under studio lighting when scene sun is behind them.
-    float frontFill = 0.35 + 0.65 * saturate(dot(normal, viewDir));
-    ambient += diffuseAlbedo * viewFillStrength * frontFill;
-
     float3 result = ambient;
     
     // Main directional/point light
@@ -554,6 +549,11 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // Direct occlusion must also reduce local sky/DDGI fill. Keep a small
     // indirect floor so shadows stay readable instead of becoming pure black.
     result *= lerp(0.28, 1.0, shadowVisibility);
+    // Material-local camera fill is applied after scene shadowing. Imported
+    // character previews use a soft frontal studio light; applying this before
+    // the shadow term crushed it back to black whenever the sun was behind him.
+    float frontFill = 0.35 + 0.65 * saturate(dot(normal, viewDir));
+    result += diffuseAlbedo * viewFillStrength * frontFill;
     float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor * NdotL * attenuation * shadowVisibility; // No light intensity? lightColor should allow > 1.
     
     result += Lo;
