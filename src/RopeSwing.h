@@ -170,6 +170,34 @@ public:
         RebuildItems();
     }
 
+    bool BlocksSegment(const XMFLOAT3& start, const XMFLOAT3& end,
+                       float radius) const {
+        if (B3_IS_NULL(m_world)) return false;
+        const XMVECTOR a = XMLoadFloat3(&start);
+        const XMVECTOR b = XMLoadFloat3(&end);
+        const XMVECTOR ab = b - a;
+        const float abLenSq = std::max(1e-6f, XMVectorGetX(XMVector3LengthSq(ab)));
+        auto blocked = [&](b3BodyId body, float bodyRadius) {
+            if (B3_IS_NULL(body)) return false;
+            const b3Pos p = b3Body_GetPosition(body);
+            const XMVECTOR center =
+                XMVectorSet((float)p.x, (float)p.y, (float)p.z, 0.0f);
+            float t = XMVectorGetX(XMVector3Dot(center - a, ab)) / abLenSq;
+            t = std::max(0.0f, std::min(1.0f, t));
+            return XMVectorGetX(XMVector3Length(center - (a + ab * t))) <=
+                   radius + bodyRadius;
+        };
+        for (b3BodyId link : m_links)
+            if (blocked(link, kLinkHitRadius)) return true;
+        if (blocked(m_block, m_blockHalf.x)) return true;
+        for (const BodyPart& part : m_ragdoll) {
+            const float partRadius =
+                std::max({ part.half.x, part.half.y, part.half.z });
+            if (blocked(part.body, partRadius)) return true;
+        }
+        return false;
+    }
+
     // Shoot the rig. If the segment start->end passes within `radius` of a rope
     // link, the joint holding that link up is destroyed and everything below it
     // drops. If it passes the block instead, the block just gets shoved.

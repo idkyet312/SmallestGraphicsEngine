@@ -100,6 +100,8 @@ set(HEADER_FILES
     src/TerrainRendererDX12.h
     src/SkyRendererDX12.h
     src/OcclusionDepthDX12.h
+    src/FXAADX12.h
+    src/MSAADX12.h
     src/DestructionDX12.h
 )
 
@@ -229,10 +231,14 @@ endif()
 source_group("Header Files" FILES ${HEADER_FILES})
 source_group("Shader Files" FILES ${SHADER_FILES})
 
-# Set output directory so exe is near shaders folder
+# Keep Release at the familiar build/GraphicEngine.exe path. Debug must use a
+# different path: sharing one EXE lets a Debug link overwrite Release, then an
+# incremental Release build incorrectly reports the newer Debug EXE up-to-date.
 set_target_properties(GraphicEngine PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_SOURCE_DIR}/build"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_SOURCE_DIR}/build/Debug"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}/build"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_SOURCE_DIR}/build/RelWithDebInfo"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_SOURCE_DIR}/build/MinSizeRel"
 )
 
 # Copy shaders to build directory

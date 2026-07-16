@@ -100,6 +100,8 @@ public:
     // fragments radially outward from the blast centre.
     void ApplyExplosion(const DirectX::XMFLOAT3& worldPosition,
                         float radius, float damage, float impulse);
+    void ApplyRagdollExplosion(const DirectX::XMFLOAT3& worldPosition,
+                               float radius, float impulse);
     bool ApplyImpulse(const DirectX::XMFLOAT3& worldPosition,
                       const DirectX::XMFLOAT3& worldDirection,
                       float impulseStrength, float hitRadius = 0.5f);

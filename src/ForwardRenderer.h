@@ -26,6 +26,7 @@ extern bool g_showH2Model;
 extern WaterVolume g_water;
 extern WaterVolume g_ocean;   // sea ringing the island
 extern ComPtr<ID3D12Resource> g_smokeTexture;   // soft smoke sprite for billboards
+extern ComPtr<ID3D12Resource> g_bloodTexture;
 extern ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 
 struct GeometryBuffers {
@@ -224,7 +225,8 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
 
         // Palm slices are IA meshes (no meshlet data), so always take the VS/PS path.
         g_dx12.commandList->SetPipelineState(transparent
-            ? shader.transparentPipelineState.Get() : shader.pipelineState.Get());
+            ? shader.GetTransparentPipelineState()
+            : shader.GetPipelineState(false));
         g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
         g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         if (prim.ibv.BufferLocation != 0) {
@@ -293,7 +295,8 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
                 // A previous mesh draw leaves the mesh PSO bound. Restore the
                 // conventional VS/PS pipeline before issuing IA draw calls.
                 g_dx12.commandList->SetPipelineState(transparent
-                    ? shader.transparentPipelineState.Get() : shader.pipelineState.Get());
+                    ? shader.GetTransparentPipelineState()
+                    : shader.GetPipelineState(false));
                 g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
                 g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 if (prim.ibv.BufferLocation != 0) {
@@ -376,8 +379,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         g_terrain.Draw(terrainParams);
         // Terrain used the mesh pipeline; restore the IA pipeline for the
         // raster draws that follow (same pattern as imported-model draws).
-        g_dx12.commandList->SetPipelineState(scene.wireframeMode
-            ? shader.wireframePipelineState.Get() : shader.pipelineState.Get());
+        g_dx12.commandList->SetPipelineState(
+            shader.GetPipelineState(scene.wireframeMode));
     } else {
         DrawPlane(geo);
     }
@@ -469,7 +472,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     //
     // Blades are built in world space, hence the identity model matrix. Opaque, so
     // this lands before the transparent water below or it would sort wrong.
-    if (g_grass.IsInitialized() && shader.grassPipelineState) {
+    if (g_grass.IsInitialized() && shader.GetGrassPipelineState()) {
         // The shader fades blades with distance, and the cull below needs it too.
         g_grass.SetViewer(scene.camera.Position);
 
@@ -502,7 +505,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 8, &gp, 0);
             g_dx12.commandList->SetGraphicsRootShaderResourceView(9, ginst);
 
-            g_dx12.commandList->SetPipelineState(shader.grassPipelineState.Get());
+            g_dx12.commandList->SetPipelineState(
+                shader.GetGrassPipelineState());
             g_dx12.commandList->IASetVertexBuffers(0, 1, &gvbv);
             g_dx12.commandList->IASetIndexBuffer(&gibv);
             g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -696,7 +700,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.NextDrawCall();
     }
 
-    // Translucent smoke billboards.
+    // Translucent smoke and blood billboards.
     shader.UseTransparent();
     for (auto& sp : scene.impactParticles) {
         if (sp.spark) continue;
@@ -705,7 +709,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         // Opacity ramps up as the puff first blooms, then fades out at the end.
         const float fadeIn = age < 0.15f ? age / 0.15f : 1.0f;
         const float fadeOut = fade < 0.4f ? fade / 0.4f : 1.0f;
-        const float opacity = (std::min)(0.85f, fadeIn * fadeOut * 0.85f);
+        const float opacity = sp.blood
+            ? (std::min)(0.36f, fadeIn * fadeOut * 0.36f)
+            : (std::min)(0.85f, fadeIn * fadeOut * 0.85f);
         if (opacity <= 0.01f) { shader.NextDrawCall(); continue; }
 
         // Billboard: build a world basis from the camera axes, scaled by size.
@@ -713,12 +719,17 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         model = XMMATRIX(camRight * sp.size, camUp * sp.size, camFwd * sp.size,
                          XMVectorSetW(pos, 1.0f));
         shader.SetMatrices(model, view, proj, lightSpace);
-        // Smoke lightens from sooty core to grey as it disperses.
-        const float g = 1.0f + 2.0f * age;
-        const XMFLOAT3 tint((std::min)(1.0f, sp.color.x * g),
+        XMFLOAT3 tint = sp.color;
+        ID3D12Resource* texture = g_bloodTexture.Get();
+        if (!sp.blood) {
+            // Smoke lightens from sooty core to grey as it disperses.
+            const float g = 1.0f + 2.0f * age;
+            tint = XMFLOAT3((std::min)(1.0f, sp.color.x * g),
                             (std::min)(1.0f, sp.color.y * g),
                             (std::min)(1.0f, sp.color.z * g));
-        shader.SetSmokeMaterial(tint, opacity, g_smokeTexture.Get());
+            texture = g_smokeTexture.Get();
+        }
+        shader.SetSmokeMaterial(tint, opacity, texture);
         DrawQuad(geo);
         shader.NextDrawCall();
     }

@@ -22,11 +22,14 @@ class SkyRendererDX12 {
 public:
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipelineState;
+    ComPtr<ID3D12PipelineState> msaaPipelineState;
     ComPtr<ID3D12DescriptorHeap> srvHeap;
     ComPtr<ID3D12Resource> skyTexture;
     std::vector<ComPtr<ID3D12Resource>> uploadHeaps;
     UploadBuffer<SkyBufferDX12> constants;
     bool initialized = false;
+    bool msaaSupported = false;
+    bool msaaEnabled = false;
 
     bool Init() {
         std::ifstream vsFile("shaders/sky_vs.hlsl");
@@ -94,6 +97,10 @@ public:
         desc.SampleDesc.Count = 1;
         hr = g_dx12.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipelineState));
         if (FAILED(hr) || !constants.Create(FRAME_COUNT)) return false;
+        desc.SampleDesc.Count = MSAADX12::SampleCount;
+        desc.RasterizerState.MultisampleEnable = TRUE;
+        msaaSupported = SUCCEEDED(g_dx12.device->CreateGraphicsPipelineState(
+            &desc, IID_PPV_ARGS(&msaaPipelineState)));
 
         skyTexture = GLBImporter::LoadEXRTextureFromFile(
             "models/Skyboxes/sunny_rose_garden_2k.exr", g_dx12.device,
@@ -108,6 +115,10 @@ public:
             skyTexture.Get(), nullptr, srvHeap->GetCPUDescriptorHandleForHeapStart());
         initialized = true;
         return true;
+    }
+
+    void SetMSAAEnabled(bool enabled) {
+        msaaEnabled = enabled && msaaSupported;
     }
 
     void Render(const Camera& camera, float fovDegrees, const XMFLOAT3& lightDirection, float time) {
@@ -133,7 +144,8 @@ public:
         data.exposure = 1.32f;
         constants.CopyData(g_dx12.frameIndex, data);
 
-        g_dx12.commandList->SetPipelineState(pipelineState.Get());
+        g_dx12.commandList->SetPipelineState(
+            msaaEnabled ? msaaPipelineState.Get() : pipelineState.Get());
         g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
         ID3D12DescriptorHeap* heaps[] = { srvHeap.Get() };
         g_dx12.commandList->SetDescriptorHeaps(1, heaps);

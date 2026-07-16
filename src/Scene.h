@@ -46,8 +46,7 @@ struct Projectile {
     bool     detonate = false;         // set the frame it should explode
 };
 
-// A particle from a bullet impact: either a rising grey smoke puff or a fast
-// ballistic spark/debris shard.
+// A particle from a bullet impact: smoke, blood billboard, or spark/debris shard.
 struct ImpactParticle {
     XMFLOAT3 position;
     XMFLOAT3 velocity;
@@ -57,6 +56,7 @@ struct ImpactParticle {
     float    growth;    // size delta per second (negative for sparks)
     XMFLOAT3 color;
     bool     spark = false;  // true = ballistic bright shard, false = smoke
+    bool     blood = false;  // textured blood billboard with ballistic motion
 };
 
 struct GunViewModel {
@@ -135,10 +135,14 @@ struct Scene {
     float grenadeLob           = 3.0f;   // extra upward velocity for the arc
     float grenadeGravityScale  = 1.0f;
     float grenadeGroundY       = 0.15f;  // bounce height
-    float grenadeFuse          = 1.8f;   // seconds before it explodes
-    float grenadeBlastRadius   = 3.5f;   // radial destruction radius
+    float grenadeFuse          = 2.0f;   // timer-only detonation
+    float grenadeBlastRadius   = 3.5f;   // original debris radius
     float grenadeDamage        = 1.5f;   // per-bond damage in the blast
-    float grenadeImpulse       = 120.0f; // shove imparted to loosened pieces
+    float grenadeImpulse       = 120.0f; // original debris impulse
+    float grenadeEnemyRadius   = 7.0f;
+    float grenadeEnemyDamage   = 500.0f; // 20% edge falloff still deals 100
+    float grenadeEnemyImpulse  = 100.0f;
+    float grenadeEnemyPush     = 9.0f;   // survivor knockback speed in m/s
     float grenadeCooldown      = 0.0f;   // input debounce
     // Returns rendered ground height at world XZ. Installed by main so Scene
     // does not depend on terrain renderer implementation.
@@ -146,6 +150,8 @@ struct Scene {
 
     // NVIDIA Blast + Box3D destructible house
     bool  useDestruction = true;
+    bool  enableMSAA = true;
+    bool  enableFXAA = false;
     int   destructionGridX = 4;
     int   destructionGridY = 3;
     int   destructionGridZ = 4;
@@ -235,6 +241,26 @@ struct Scene {
         playerDamageFlash = 0.0f;
     }
 
+    bool HitPlayerProjectile(Projectile& p) {
+        if (!p.hostile || !p.active || p.grenade) return false;
+        const XMVECTOR a = XMLoadFloat3(&p.previousPosition);
+        const XMVECTOR b = XMLoadFloat3(&p.position);
+        const XMVECTOR chest = XMLoadFloat3(&camera.Position) +
+            XMVectorSet(0.0f, -0.35f, 0.0f, 0.0f);
+        const XMVECTOR ab = b - a;
+        const float denom = XMVectorGetX(XMVector3LengthSq(ab));
+        float t = denom > 1e-6f
+            ? XMVectorGetX(XMVector3Dot(chest - a, ab)) / denom : 0.0f;
+        t = (std::max)(0.0f, (std::min)(1.0f, t));
+        const XMVECTOR closest = a + ab * t;
+        if (XMVectorGetX(XMVector3LengthSq(chest - closest)) >= 0.45f * 0.45f)
+            return false;
+        XMStoreFloat3(&p.position, closest);
+        DamagePlayer(2.4f);
+        p.active = false;
+        return true;
+    }
+
     void Update(float dt, float currentTime) {
         camera.Update(dt);
 
@@ -271,8 +297,8 @@ struct Scene {
             if (!p.active) continue;
             p.previousPosition = p.position;
             if (p.grenade) {
-                // Ballistic arc: integrate velocity under gravity, then bounce
-                // off the ground with damping so it settles before the fuse.
+                // Ballistic arc with a damped ground bounce. Only the fuse can
+                // detonate it; impacts never shorten the two-second timer.
                 p.velocity.y += -9.81f * grenadeGravityScale * dt;
                 p.position.x += p.velocity.x * dt;
                 p.position.y += p.velocity.y * dt;
@@ -282,8 +308,10 @@ struct Scene {
                 const float bounceY = surfaceY + grenadeGroundY;
                 if (p.position.y < bounceY) {
                     p.position.y = bounceY;
-                    if (p.velocity.y < 0.0f) p.velocity.y = -p.velocity.y * 0.4f;
-                    p.velocity.x *= 0.7f; p.velocity.z *= 0.7f; // friction
+                    if (p.velocity.y < 0.0f)
+                        p.velocity.y = -p.velocity.y * 0.4f;
+                    p.velocity.x *= 0.7f;
+                    p.velocity.z *= 0.7f;
                 }
                 p.fuse -= dt;
                 if (p.fuse <= 0.0f) { p.detonate = true; p.active = false; }
@@ -294,24 +322,6 @@ struct Scene {
                 p.lifetime -= dt;
                 if (p.lifetime <= 0.0f) p.active = false;
 
-                // Hostile rounds use a swept point-to-segment test against the
-                // player's chest, so fast bullets cannot tunnel through them.
-                if (p.hostile && p.active) {
-                    const XMVECTOR a = XMLoadFloat3(&p.previousPosition);
-                    const XMVECTOR b = XMLoadFloat3(&p.position);
-                    const XMVECTOR chest = XMLoadFloat3(&camera.Position) +
-                        XMVectorSet(0.0f, -0.35f, 0.0f, 0.0f);
-                    const XMVECTOR ab = b - a;
-                    const float denom = XMVectorGetX(XMVector3LengthSq(ab));
-                    float t = denom > 1e-6f
-                        ? XMVectorGetX(XMVector3Dot(chest - a, ab)) / denom : 0.0f;
-                    t = (std::max)(0.0f, (std::min)(1.0f, t));
-                    const float d2 = XMVectorGetX(XMVector3LengthSq(chest - (a + ab * t)));
-                    if (d2 < 0.45f * 0.45f) {
-                        DamagePlayer(12.0f);
-                        p.active = false;
-                    }
-                }
             }
         }
         // Keep detonating grenades for one more frame so the game loop can read
@@ -321,12 +331,14 @@ struct Scene {
                 [](const Projectile& p) { return !p.active && !p.detonate; }),
             projectiles.end());
 
-        // Impact particles: sparks fly ballistically under gravity; smoke rises
-        // and expands. Both fade with life.
+        // Impact particles: sparks/blood fall; smoke rises and expands.
         for (auto& ip : impactParticles) {
             if (ip.spark) {
                 ip.velocity.y += -22.0f * dt;          // gravity pulls sparks down
                 ip.velocity.x *= 0.99f; ip.velocity.z *= 0.99f;
+            } else if (ip.blood) {
+                ip.velocity.y += -5.5f * dt;
+                ip.velocity.x *= 0.93f; ip.velocity.y *= 0.96f; ip.velocity.z *= 0.93f;
             } else {
                 ip.velocity.y += 0.6f * dt;            // buoyancy: smoke rises
                 // Turbulence: a little wandering push so the plume curls and
@@ -389,6 +401,34 @@ struct Scene {
 
         if (impactParticles.size() > 800)
             impactParticles.erase(impactParticles.begin(), impactParticles.begin() + spawned);
+    }
+
+    void SpawnBloodBurst(const XMFLOAT3& point, const XMFLOAT3& normal) {
+        auto rnd = [&]() { return (float)std::rand() / RAND_MAX * 2.0f - 1.0f; };
+        constexpr int droplets = 8;
+        for (int i = 0; i < droplets; ++i) {
+            ImpactParticle blood;
+            blood.position = {
+                point.x + normal.x * 0.08f + rnd() * 0.08f,
+                point.y + normal.y * 0.08f + rnd() * 0.08f,
+                point.z + normal.z * 0.08f + rnd() * 0.08f
+            };
+            const float push = 0.8f + std::abs(rnd()) * 1.8f;
+            blood.velocity = {
+                normal.x * push + rnd() * 1.2f,
+                normal.y * push + std::abs(rnd()) * 1.4f,
+                normal.z * push + rnd() * 1.2f
+            };
+            blood.maxLife = blood.life = 0.32f + std::abs(rnd()) * 0.38f;
+            blood.size = 0.12f + std::abs(rnd()) * 0.18f;
+            blood.growth = 0.22f + std::abs(rnd()) * 0.28f;
+            blood.color = { 0.30f, 0.18f, 0.18f };
+            blood.blood = true;
+            impactParticles.push_back(blood);
+        }
+        if (impactParticles.size() > 800)
+            impactParticles.erase(impactParticles.begin(),
+                                  impactParticles.begin() + droplets);
     }
 
     void ShootProjectile() {

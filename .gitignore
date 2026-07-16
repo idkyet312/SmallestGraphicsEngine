@@ -31,6 +31,8 @@ models/*
 models/textures/*
 !models/textures/muzzle_flash.png
 !models/textures/MUZZLE_FLASH_LICENSE.txt
+!models/textures/blood_splat.png
+!models/textures/BLOOD_SPLAT_LICENSE.txt
 !models/audio/
 !models/audio/*
 

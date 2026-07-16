@@ -34,8 +34,12 @@ class MeshShaderDX12 {
 public:
     ComPtr<ID3D12PipelineState> pso;
     ComPtr<ID3D12PipelineState> psoWireframe;
+    ComPtr<ID3D12PipelineState> psoMSAA;
+    ComPtr<ID3D12PipelineState> psoWireframeMSAA;
     ComPtr<ID3D12GraphicsCommandList6> commandList6;
     bool supported = false;
+    bool msaaSupported = false;
+    bool msaaEnabled = false;
     bool wireframe = false; // Z key: draw meshlets as wireframe
     bool occlusionEnabled = false;
     D3D12_GPU_DESCRIPTOR_HANDLE occlusionDepthHandle = {};
@@ -126,6 +130,12 @@ public:
             std::cerr << "Mesh PSO creation failed: 0x" << std::hex << psoHr << std::dec << "\n";
             return false;
         }
+        stream.sample.value.Count = MSAADX12::SampleCount;
+        stream.raster.value.MultisampleEnable = TRUE;
+        msaaSupported = SUCCEEDED(
+            device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&psoMSAA)));
+        stream.sample.value.Count = 1;
+        stream.raster.value.MultisampleEnable = FALSE;
 
         stream.raster.value.FillMode = D3D12_FILL_MODE_WIREFRAME;
         ComPtr<ID3DBlob> wirePs;
@@ -135,9 +145,23 @@ public:
         if (FAILED(device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&psoWireframe)))) {
             std::cerr << "Mesh wireframe PSO creation failed (non-fatal)\n";
         }
+        if (msaaSupported) {
+            stream.sample.value.Count = MSAADX12::SampleCount;
+            stream.raster.value.MultisampleEnable = TRUE;
+            if (FAILED(device2->CreatePipelineState(
+                    &streamDesc, IID_PPV_ARGS(&psoWireframeMSAA)))) {
+                psoWireframeMSAA.Reset();
+            }
+            stream.sample.value.Count = 1;
+            stream.raster.value.MultisampleEnable = FALSE;
+        }
 
         supported = true;
         return true;
+    }
+
+    void SetMSAAEnabled(bool enabled) {
+        msaaEnabled = enabled && msaaSupported;
     }
 
     void Draw(const D3D12_VERTEX_BUFFER_VIEW& vbv,
@@ -150,8 +174,11 @@ public:
               D3D12_GPU_VIRTUAL_ADDRESS skinDataAddress = 0) {
         if (!CanDraw(totalMeshlets, meshletDescAddress, meshletBoundsAddress,
                      meshletVertexIndexAddress, meshletTriangleAddress)) return;
-        commandList6->SetPipelineState((wireframe && psoWireframe)
-            ? psoWireframe.Get() : pso.Get());
+        ID3D12PipelineState* solid =
+            msaaEnabled ? psoMSAA.Get() : pso.Get();
+        ID3D12PipelineState* wire =
+            msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get();
+        commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
         commandList6->SetGraphicsRootShaderResourceView(9, vbv.BufferLocation);
         commandList6->SetGraphicsRootShaderResourceView(10, meshletDescAddress);
         commandList6->SetGraphicsRootShaderResourceView(11, meshletBoundsAddress);

@@ -1,0 +1,7 @@
+Asset: blood_splat.png
+Author: TobiasM
+Source: https://opengameart.org/content/blood-splat
+Direct file: https://opengameart.org/sites/default/files/blood_splat.png
+License: Creative Commons Zero v1.0 Universal (CC0)
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+Attribution is not required. Source author appreciates credit.
