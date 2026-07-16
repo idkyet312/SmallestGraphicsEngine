@@ -1482,10 +1482,21 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
         bd.type = b3_dynamicBody;
         bd.position = { src.position.x, src.position.y, src.position.z };
         bd.rotation = { { src.rotation.x, src.rotation.y, src.rotation.z }, src.rotation.w };
-        bd.linearDamping = 0.16f; bd.angularDamping = 0.32f;
+        // Human tissue/clothing loses energy quickly. Extra angular damping
+        // removes rubber-doll spinning while leaving limbs responsive.
+        bd.linearDamping = 0.28f;
+        bd.angularDamping = 0.85f;
         const b3BodyId body = b3CreateBody(m->world, &bd);
         b3ShapeDef sd = b3DefaultShapeDef();
-        sd.density = 350.0f; sd.baseMaterial.friction = 0.72f;
+        float density = 420.0f;
+        if (src.name.find("pelvis") != std::string::npos ||
+            src.name.find("spine") != std::string::npos) density = 620.0f;
+        else if (src.name.find("head") != std::string::npos) density = 480.0f;
+        else if (src.name.find("thigh") != std::string::npos) density = 520.0f;
+        else if (src.name.find("hand") != std::string::npos ||
+                 src.name.find("foot") != std::string::npos) density = 280.0f;
+        sd.density = density;
+        sd.baseMaterial.friction = 0.82f;
         sd.baseMaterial.restitution = 0.02f;
         sd.enableHitEvents = true;
         if (src.shape == 1) {
@@ -1515,8 +1526,11 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
         jd.base.localFrameA.p = b3Body_GetLocalPoint(bodyA, anchor);
         jd.base.localFrameB.p = b3Body_GetLocalPoint(bodyB, anchor);
         jd.base.collideConnected = false;
-        jd.enableConeLimit = true; jd.coneAngle = 0.9f;
-        jd.enableTwistLimit = true; jd.lowerTwistAngle = -0.55f; jd.upperTwistAngle = 0.55f;
+        jd.enableConeLimit = true;
+        jd.coneAngle = (std::max)(0.035f, link.coneAngle);
+        jd.enableTwistLimit = true;
+        jd.lowerTwistAngle = -(std::max)(0.035f, link.twistAngle);
+        jd.upperTwistAngle =  (std::max)(0.035f, link.twistAngle);
         b3CreateSphericalJoint(m->world, &jd);
     }
     XMVECTOR dir = XMVector3Normalize(XMLoadFloat3(&impulseDirection));
@@ -1524,8 +1538,15 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
     for (size_t i = 0; i < bodies.size(); ++i) {
         const b3BodyId body = m->ragdollParts[base + i].body;
         const float mass = (std::max)(0.05f, b3Body_GetMass(body));
-        XMFLOAT3 impulse; XMStoreFloat3(&impulse, dir * (mass * 2.2f));
-        b3Body_ApplyLinearImpulseToCenter(body, { impulse.x, impulse.y + mass*0.4f, impulse.z }, true);
+        const std::string& bone = bodies[i].name;
+        const bool core = bone.find("pelvis") != std::string::npos ||
+                          bone.find("spine") != std::string::npos;
+        const float impulseScale = core ? 1.65f : 0.58f;
+        XMFLOAT3 impulse;
+        XMStoreFloat3(&impulse, dir * (mass * impulseScale));
+        b3Body_ApplyLinearImpulseToCenter(
+            body, { impulse.x, impulse.y + mass * (core ? 0.18f : 0.06f),
+                    impulse.z }, true);
     }
     m->RebuildRenderItems();
     return ragdollId;

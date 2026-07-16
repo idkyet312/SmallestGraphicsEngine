@@ -42,9 +42,47 @@ public:
             result.bodies.push_back(body);
         }
 
-        const std::regex link(R"rx(ConstraintBone1="([^"]+)",ConstraintBone2="([^"]+)")rx");
-        for (std::sregex_iterator it(text.begin(), text.end(), link), end; it != end; ++it)
-            result.constraints.push_back({ (*it)[1].str(), (*it)[2].str() });
+        const std::regex constraintBlock(
+            R"rx(Begin Object Name="PhysicsConstraintTemplate_[^"]+"[\s\S]*?End Object)rx");
+        const std::regex bones(
+            R"rx(ConstraintBone1="([^"]+)",ConstraintBone2="([^"]+)")rx");
+        for (std::sregex_iterator it(text.begin(), text.end(), constraintBlock), end;
+             it != end; ++it) {
+            const std::string block = it->str();
+            std::smatch names;
+            if (!std::regex_search(block, names, bones)) continue;
+            RagdollConstraintSpec link;
+            link.boneA = names[1].str();
+            link.boneB = names[2].str();
+
+            const bool swing1Locked =
+                block.find("Swing1Motion=ACM_Locked") != std::string::npos;
+            const bool swing2Locked =
+                block.find("Swing2Motion=ACM_Locked") != std::string::npos;
+            const bool swing1Free =
+                block.find("Swing1Motion=ACM_Free") != std::string::npos;
+            const bool swing2Free =
+                block.find("Swing2Motion=ACM_Free") != std::string::npos;
+            float swing1 = swing1Locked ? 2.0f :
+                swing1Free ? 70.0f : Field(block, "Swing1LimitDegrees");
+            float swing2 = swing2Locked ? 2.0f :
+                swing2Free ? 70.0f : Field(block, "Swing2LimitDegrees");
+            if (swing1 <= 0.0f) swing1 = 25.0f;
+            if (swing2 <= 0.0f) swing2 = 25.0f;
+
+            const bool twistLocked =
+                block.find("TwistMotion=ACM_Locked") != std::string::npos;
+            const bool twistFree =
+                block.find("TwistMotion=ACM_Free") != std::string::npos;
+            float twist = twistLocked ? 2.0f :
+                twistFree ? 55.0f : Field(block, "TwistLimitDegrees");
+            if (twist <= 0.0f) twist = 15.0f;
+
+            const float radians = DirectX::XM_PI / 180.0f;
+            link.coneAngle = (std::max)(swing1, swing2) * radians;
+            link.twistAngle = twist * radians;
+            result.constraints.push_back(std::move(link));
+        }
         return result;
     }
 

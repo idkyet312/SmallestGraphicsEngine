@@ -9,6 +9,7 @@
 #include "DestructionDX12.h"
 #include <DirectXMath.h>
 #include <cctype>
+#include <cstdlib>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -37,6 +38,10 @@ public:
     float             meshYaw  = 0.0f;
     bool              upperBodyGunLayer = true;
     float             leftArmReach = 0.55f;
+    float             orbitRadius = 4.8f;
+    float             orbitDirection = 1.0f;
+    float             fireCooldown = 1.0f;
+    int               burstShotsRemaining = 0;
 
     bool Init(const SkinnedModel& m) {
         model = m;
@@ -102,15 +107,39 @@ public:
         const float dx = target.x - position.x, dz = target.z - position.z;
         const float distance = std::sqrt(dx*dx + dz*dz);
         float speed = 0.0f;
-        if (distance > 4.0f) {
-            speed = distance > 11.0f ? moveSpeed * 1.65f : moveSpeed;
+        if (distance > 0.1f) {
             const float inv = 1.0f / distance;
+            const float inwardX = dx * inv;
+            const float inwardZ = dz * inv;
+            float moveX = inwardX;
+            float moveZ = inwardZ;
+
+            if (distance <= orbitRadius + 2.2f) {
+                // Grounded version of old hover-enemy controller: preserve a
+                // combat ring while moving tangentially around player.
+                const float tangentX = -inwardZ * orbitDirection;
+                const float tangentZ =  inwardX * orbitDirection;
+                const float radial = (std::max)(-0.7f,
+                    (std::min)(0.9f, (distance - orbitRadius) * 0.75f));
+                moveX = tangentX + inwardX * radial;
+                moveZ = tangentZ + inwardZ * radial;
+                const float moveLength = std::sqrt(moveX*moveX + moveZ*moveZ);
+                if (moveLength > 0.001f) {
+                    moveX /= moveLength;
+                    moveZ /= moveLength;
+                }
+                speed = moveSpeed * 0.9f;
+            } else {
+                speed = distance > 11.0f ? moveSpeed * 1.65f : moveSpeed;
+            }
+
             // Asset loading can make one frame several seconds long. Never let
             // that frame overshoot through the player and spawn behind them.
-            const float travel = (std::min)(speed * dt, distance - 4.0f);
-            position.x += dx * inv * travel;
-            position.z += dz * inv * travel;
+            const float travel = (std::min)(speed * dt, 0.45f);
+            position.x += moveX * travel;
+            position.z += moveZ * travel;
             // Imported FBX faces local +Z after its node/bind transforms.
+            // Keep gun aimed at player while legs strafe around combat ring.
             yaw = std::atan2(dx, dz);
         }
         PlayClip(speed > moveSpeed * 1.2f ? "Run" : speed > 0.01f ? "Walk" : "Idle");
@@ -121,6 +150,44 @@ public:
     bool HasGunPose() const {
         return upperBodyGunLayer && !dead_ && handBone_ >= 0 &&
                static_cast<size_t>(handBone_) < poseGlobals_.size();
+    }
+
+    bool TryFireAt(float dt, const DirectX::XMFLOAT3& target,
+                   DirectX::XMFLOAT3& origin, DirectX::XMFLOAT3& direction) {
+        using namespace DirectX;
+        if (dead_ || !visible || !HasGunPose()) return false;
+        fireCooldown -= dt;
+        if (fireCooldown > 0.0f) return false;
+
+        origin = GunOriginWorld();
+        // Start beyond hands/torso so projectile never intersects shooter on
+        // first simulation segment.
+        const float sx = std::sin(yaw), cz = std::cos(yaw);
+        origin.x += sx * 0.78f;
+        origin.y += 0.02f;
+        origin.z += cz * 0.78f;
+        XMVECTOR aim = XMLoadFloat3(&target) - XMLoadFloat3(&origin);
+        if (XMVectorGetX(XMVector3LengthSq(aim)) < 1e-5f) return false;
+
+        auto randomSigned = [] {
+            return ((float)std::rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+        };
+        // Slight human aim error. Bursts remain dangerous without becoming
+        // four perfectly accurate automatic turrets.
+        aim += XMVectorSet(randomSigned() * 0.018f,
+                           randomSigned() * 0.012f,
+                           randomSigned() * 0.018f, 0.0f);
+        XMStoreFloat3(&direction, XMVector3Normalize(aim));
+
+        if (burstShotsRemaining <= 0)
+            burstShotsRemaining = 2 + std::rand() % 4;
+        --burstShotsRemaining;
+        if (burstShotsRemaining > 0) {
+            fireCooldown = 0.11f + ((float)std::rand() / RAND_MAX) * 0.12f;
+        } else {
+            fireCooldown = 1.2f + ((float)std::rand() / RAND_MAX) * 2.8f;
+        }
+        return true;
     }
 
     // Weapon uses a stable character-facing frame. Arm IK places both hands on
