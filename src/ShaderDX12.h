@@ -2,6 +2,7 @@
 #define SHADER_DX12_H
 
 #include "DX12Core.h"
+#include "MSAADX12.h"
 #include "SceneGraph.h"   // SceneMaterial: caches its descriptor slot (see SetObjectMaterial)
 #include <fstream>
 #include <sstream>
@@ -193,11 +194,18 @@ public:
     ComPtr<ID3D12PipelineState> wireframePipelineState;
     ComPtr<ID3D12PipelineState> transparentPipelineState;
     ComPtr<ID3D12PipelineState> additivePipelineState;
+    ComPtr<ID3D12PipelineState> msaaPipelineState;
+    ComPtr<ID3D12PipelineState> msaaWireframePipelineState;
+    ComPtr<ID3D12PipelineState> msaaTransparentPipelineState;
+    ComPtr<ID3D12PipelineState> msaaAdditivePipelineState;
     // Grass: same root signature, same pixel shader, but a vertex shader that
     // bends the blades in the wind. Null if grass_vs.hlsl failed to compile, in
     // which case the grass simply is not drawn.
     ComPtr<ID3D12PipelineState> grassPipelineState;
+    ComPtr<ID3D12PipelineState> msaaGrassPipelineState;
     ComPtr<ID3DBlob> pixelShaderBlob;
+    bool msaaSupported = false;
+    bool msaaEnabled = false;
     
     // Per-draw-call constant buffers (need enough for all objects)
     UploadBuffer<MatrixBufferDX12> matrixBuffer;
@@ -570,12 +578,28 @@ public:
         psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         psoDesc.SampleDesc.Count = 1;
+
+        auto createMSAAPipeline = [&psoDesc](
+                ComPtr<ID3D12PipelineState>& target) {
+            const BOOL previousMultisample =
+                psoDesc.RasterizerState.MultisampleEnable;
+            psoDesc.SampleDesc.Count = MSAADX12::SampleCount;
+            psoDesc.SampleDesc.Quality = 0;
+            psoDesc.RasterizerState.MultisampleEnable = TRUE;
+            const HRESULT result = g_dx12.device->CreateGraphicsPipelineState(
+                &psoDesc, IID_PPV_ARGS(&target));
+            psoDesc.SampleDesc.Count = 1;
+            psoDesc.SampleDesc.Quality = 0;
+            psoDesc.RasterizerState.MultisampleEnable = previousMultisample;
+            return SUCCEEDED(result);
+        };
         
         hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState));
         if (FAILED(hr)) {
             std::cerr << "Failed to create pipeline state, HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
             return false;
         }
+        msaaSupported = createMSAAPipeline(msaaPipelineState);
 
         // Alpha-blended material pass. Keep depth testing, disable depth writes
         // so glass reveals opaque geometry behind it.
@@ -589,6 +613,8 @@ public:
         psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
         hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&transparentPipelineState));
         if (FAILED(hr)) return false;
+        if (msaaSupported && !createMSAAPipeline(msaaTransparentPipelineState))
+            msaaSupported = false;
 
         // Fire/glow sprites: alpha shapes the source, destination stays visible.
         // This also makes black pixels in conventional VFX sheets disappear.
@@ -598,6 +624,8 @@ public:
         psoDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
         hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&additivePipelineState));
         if (FAILED(hr)) return false;
+        if (msaaSupported && !createMSAAPipeline(msaaAdditivePipelineState))
+            msaaSupported = false;
         psoDesc.BlendState.RenderTarget[0].BlendEnable = FALSE;
         psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         
@@ -608,6 +636,8 @@ public:
             std::cerr << "Failed to create wireframe pipeline state" << std::endl;
             // Non-fatal
         }
+        if (msaaSupported && !createMSAAPipeline(msaaWireframePipelineState))
+            msaaSupported = false;
 
         // Grass PSO: the opaque state, but with the instanced wind vertex shader.
         // The blade mesh is a single 8-vertex template drawn once per blade, so its
@@ -628,6 +658,9 @@ public:
             if (FAILED(hr)) {
                 std::cerr << "Failed to create grass pipeline state" << std::endl;
                 grassPipelineState.Reset();   // non-fatal: the grass just won't draw
+            } else if (msaaSupported &&
+                       !createMSAAPipeline(msaaGrassPipelineState)) {
+                msaaSupported = false;
             }
         }
         // Restore the shared desc, in case anything below reuses it.
@@ -647,7 +680,47 @@ public:
         if (!shBuffer.Create(FRAME_COUNT)) return false;
         
         loaded = true;
+        if (!msaaSupported) {
+            msaaPipelineState.Reset();
+            msaaWireframePipelineState.Reset();
+            msaaTransparentPipelineState.Reset();
+            msaaAdditivePipelineState.Reset();
+            msaaGrassPipelineState.Reset();
+        }
         return true;
+    }
+
+    void SetMSAAEnabled(bool enabled) {
+        msaaEnabled = enabled && msaaSupported;
+    }
+
+    ID3D12PipelineState* GetPipelineState(bool wireframe = false) const {
+        if (msaaEnabled) {
+            if (wireframe && msaaWireframePipelineState)
+                return msaaWireframePipelineState.Get();
+            return msaaPipelineState.Get();
+        }
+        if (wireframe && wireframePipelineState)
+            return wireframePipelineState.Get();
+        return pipelineState.Get();
+    }
+
+    ID3D12PipelineState* GetTransparentPipelineState() const {
+        return msaaEnabled
+            ? msaaTransparentPipelineState.Get()
+            : transparentPipelineState.Get();
+    }
+
+    ID3D12PipelineState* GetAdditivePipelineState() const {
+        return msaaEnabled
+            ? msaaAdditivePipelineState.Get()
+            : additivePipelineState.Get();
+    }
+
+    ID3D12PipelineState* GetGrassPipelineState() const {
+        return msaaEnabled
+            ? msaaGrassPipelineState.Get()
+            : grassPipelineState.Get();
     }
     
     void Use(bool wireframe = false) {
@@ -657,17 +730,19 @@ public:
         };
         g_dx12.commandList->SetDescriptorHeaps(2, heaps);
         g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
-        g_dx12.commandList->SetPipelineState(wireframe ? wireframePipelineState.Get() : pipelineState.Get());
+        g_dx12.commandList->SetPipelineState(GetPipelineState(wireframe));
     }
 
     void UseTransparent() {
         Use(false);
-        if (transparentPipelineState) g_dx12.commandList->SetPipelineState(transparentPipelineState.Get());
+        if (GetTransparentPipelineState())
+            g_dx12.commandList->SetPipelineState(GetTransparentPipelineState());
     }
 
     void UseAdditive() {
         Use(false);
-        if (additivePipelineState) g_dx12.commandList->SetPipelineState(additivePipelineState.Get());
+        if (GetAdditivePipelineState())
+            g_dx12.commandList->SetPipelineState(GetAdditivePipelineState());
     }
 
     void BindGlobalResources(ID3D12Resource* shadowMap,

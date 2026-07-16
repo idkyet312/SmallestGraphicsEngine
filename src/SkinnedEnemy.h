@@ -21,7 +21,8 @@ public:
     SkinnedModel      model;
     AnimationInstance anim;
     DirectX::XMFLOAT3 position{ 0, 0, 0 };
-    float             yaw = 0.0f;     // radians, facing
+    float             yaw = 0.0f;     // radians, lower-body movement facing
+    float             aimYaw = 0.0f;  // radians, upper-body/weapon facing
     bool              visible = true;
     bool              castsShadow = false; // full skinned shadow pass nearly doubles character cost
     float             health = 100.0f;
@@ -31,7 +32,7 @@ public:
     float             rootPitch = -DirectX::XM_PIDIV2;
     float             rootRoll = 0.0f;
     float             modelScale = 0.01f; // UE cm -> engine metres (applied on world)
-    float             footOffset = 0.0f;
+    float             footOffset = 0.16f;
     // Optional model-space correction for asset-specific authoring axes.
     float             meshPitch = 0.0f;
     float             meshRoll = 0.0f;
@@ -104,15 +105,28 @@ public:
     void Update(float dt, const DirectX::XMFLOAT3& target, float groundY) {
         if (dead_) return;
         position.y = groundY;
+        position.x += knockbackVelocity_.x * dt;
+        position.z += knockbackVelocity_.z * dt;
+        const float knockbackDamping = std::exp(-4.8f * dt);
+        knockbackVelocity_.x *= knockbackDamping;
+        knockbackVelocity_.z *= knockbackDamping;
+        if (knockbackVelocity_.x * knockbackVelocity_.x +
+            knockbackVelocity_.z * knockbackVelocity_.z < 0.0025f) {
+            knockbackVelocity_.x = 0.0f;
+            knockbackVelocity_.z = 0.0f;
+        }
         const float dx = target.x - position.x, dz = target.z - position.z;
         const float distance = std::sqrt(dx*dx + dz*dz);
+        if (distance > 0.1f) aimYaw = std::atan2(dx, dz);
+        if (preparingShot_) stationaryAimTime_ += dt;
         float speed = 0.0f;
-        if (distance > 0.1f) {
+        if (distance > 0.1f && !preparingShot_) {
             const float inv = 1.0f / distance;
             const float inwardX = dx * inv;
             const float inwardZ = dz * inv;
             float moveX = inwardX;
             float moveZ = inwardZ;
+            bool orbiting = false;
 
             if (distance <= orbitRadius + 2.2f) {
                 // Grounded version of old hover-enemy controller: preserve a
@@ -129,6 +143,7 @@ public:
                     moveZ /= moveLength;
                 }
                 speed = moveSpeed * 0.9f;
+                orbiting = true;
             } else {
                 speed = distance > 11.0f ? moveSpeed * 1.65f : moveSpeed;
             }
@@ -138,12 +153,26 @@ public:
             const float travel = (std::min)(speed * dt, 0.45f);
             position.x += moveX * travel;
             position.z += moveZ * travel;
-            // Imported FBX faces local +Z after its node/bind transforms.
-            // Keep gun aimed at player while legs strafe around combat ring.
-            yaw = std::atan2(dx, dz);
+            const float movementYaw = std::atan2(moveX, moveZ);
+            const auto angleDelta = [](float from, float to) {
+                return std::atan2(std::sin(to - from), std::cos(to - from));
+            };
+            // Let legs turn into orbit instead of playing a forward walk while
+            // sliding fully sideways. Keep torso close enough to weapon aim for IK.
+            const float desiredYaw = orbiting
+                ? aimYaw + angleDelta(aimYaw, movementYaw) * 0.48f
+                : movementYaw;
+            const float turn = angleDelta(yaw, desiredYaw);
+            const float maxTurn = 5.5f * dt;
+            yaw += (std::max)(-maxTurn, (std::min)(maxTurn, turn));
         }
-        PlayClip(speed > moveSpeed * 1.2f ? "Run" : speed > 0.01f ? "Walk" : "Idle");
-        anim.Advance(dt);
+        const bool running = speed > moveSpeed * 1.2f;
+        PlayClip(running ? "Run" : speed > 0.01f ? "Walk" : "Idle");
+        const float referenceSpeed = running ? moveSpeed * 1.65f : moveSpeed;
+        const float playbackRate = speed > 0.01f
+            ? (std::max)(0.75f, (std::min)(1.15f, speed / referenceSpeed))
+            : 1.0f;
+        anim.Advance(dt * playbackRate);
         ComputePose();
     }
 
@@ -152,20 +181,48 @@ public:
                static_cast<size_t>(handBone_) < poseGlobals_.size();
     }
 
+    DirectX::XMFLOAT3 AimRayOrigin() const {
+        DirectX::XMFLOAT3 origin = GunOriginWorld();
+        const float sx = std::sin(aimYaw), cz = std::cos(aimYaw);
+        origin.x += sx * 0.78f;
+        origin.y += 0.02f;
+        origin.z += cz * 0.78f;
+        return origin;
+    }
+
+    bool NeedsLineOfSightCheck() const {
+        if (dead_ || !visible || !HasGunPose()) return false;
+        if (burstShotsRemaining > 0)
+            return fireCooldown <= 0.0f;
+        return fireCooldown <= 0.0f &&
+               preparingShot_ && stationaryAimTime_ >= 2.0f;
+    }
+
     bool TryFireAt(float dt, const DirectX::XMFLOAT3& target,
+                   bool hasLineOfSight,
                    DirectX::XMFLOAT3& origin, DirectX::XMFLOAT3& direction) {
         using namespace DirectX;
         if (dead_ || !visible || !HasGunPose()) return false;
         fireCooldown -= dt;
-        if (fireCooldown > 0.0f) return false;
+        if (!hasLineOfSight) {
+            burstShotsRemaining = 0;
+            preparingShot_ = false;
+            stationaryAimTime_ = 0.0f;
+            return false;
+        }
+        if (burstShotsRemaining <= 0) {
+            if (fireCooldown > 0.0f) return false;
+            if (!preparingShot_) {
+                preparingShot_ = true;
+                stationaryAimTime_ = 0.0f;
+                return false;
+            }
+            if (stationaryAimTime_ < 2.0f) return false;
+        } else if (fireCooldown > 0.0f) {
+            return false;
+        }
 
-        origin = GunOriginWorld();
-        // Start beyond hands/torso so projectile never intersects shooter on
-        // first simulation segment.
-        const float sx = std::sin(yaw), cz = std::cos(yaw);
-        origin.x += sx * 0.78f;
-        origin.y += 0.02f;
-        origin.z += cz * 0.78f;
+        origin = AimRayOrigin();
         XMVECTOR aim = XMLoadFloat3(&target) - XMLoadFloat3(&origin);
         if (XMVectorGetX(XMVector3LengthSq(aim)) < 1e-5f) return false;
 
@@ -186,6 +243,8 @@ public:
             fireCooldown = 0.11f + ((float)std::rand() / RAND_MAX) * 0.12f;
         } else {
             fireCooldown = 1.2f + ((float)std::rand() / RAND_MAX) * 2.8f;
+            preparingShot_ = false;
+            stationaryAimTime_ = 0.0f;
         }
         return true;
     }
@@ -197,7 +256,7 @@ public:
         if (!HasGunPose()) return XMMatrixIdentity();
         const XMFLOAT3 origin = GunOriginWorld();
         return XMMatrixScaling(0.6f, 0.6f, 0.6f) *
-               XMMatrixRotationY(yaw) *
+               XMMatrixRotationY(aimYaw) *
                XMMatrixTranslation(origin.x, origin.y, origin.z);
     }
 
@@ -252,7 +311,18 @@ public:
     }
 
     bool Shoot(const DirectX::XMFLOAT3& start, const DirectX::XMFLOAT3& end,
-               const DirectX::XMFLOAT3& direction, float radius) {
+               const DirectX::XMFLOAT3& direction, float radius,
+               DirectX::XMFLOAT3* hitPoint = nullptr) {
+        if (dead_ || !visible) return false;
+        if (!BlocksProjectile(start, end, radius, hitPoint)) return false;
+        health -= 34.0f;
+        if (health <= 0.0f) Kill(direction);
+        return true;
+    }
+
+    bool BlocksProjectile(const DirectX::XMFLOAT3& start,
+                          const DirectX::XMFLOAT3& end, float radius,
+                          DirectX::XMFLOAT3* hitPoint = nullptr) const {
         using namespace DirectX;
         if (dead_ || !visible) return false;
         const XMVECTOR a = XMLoadFloat3(&start), b = XMLoadFloat3(&end);
@@ -264,9 +334,45 @@ public:
             ? XMVectorGetX(XMVector3Dot(center - a, ab)) / lengthSq : 0.0f;
         t = (std::max)(0.0f, (std::min)(1.0f, t));
         const float hitRadius = 0.72f + radius;
-        if (XMVectorGetX(XMVector3LengthSq(a + ab*t - center)) > hitRadius*hitRadius) return false;
-        health -= 34.0f;
-        if (health <= 0.0f) Kill(direction);
+        const XMVECTOR closest = a + ab * t;
+        if (XMVectorGetX(XMVector3LengthSq(closest - center)) > hitRadius*hitRadius) return false;
+        if (hitPoint) XMStoreFloat3(hitPoint, closest);
+        return true;
+    }
+
+    bool ApplyExplosion(const DirectX::XMFLOAT3& center, float radius,
+                        float damage, float pushSpeed) {
+        using namespace DirectX;
+        if (dead_ || !visible || radius <= 0.0f) return false;
+        const XMVECTOR blast = XMLoadFloat3(&center);
+        const XMVECTOR body = XMVectorSet(
+            position.x, position.y + footOffset + 1.0f, position.z, 0.0f);
+        XMVECTOR away = body - blast;
+        const float distance = XMVectorGetX(XMVector3Length(away));
+        if (distance > radius) return false;
+
+        if (distance < 0.001f) away = XMVectorSet(0.0f, 0.4f, 1.0f, 0.0f);
+        away = XMVector3Normalize(away + XMVectorSet(0.0f, 0.35f, 0.0f, 0.0f));
+        const float falloff = (std::max)(0.2f, 1.0f - distance / radius);
+        health -= damage * falloff;
+
+        XMFLOAT3 direction;
+        XMStoreFloat3(&direction, away);
+        if (health <= 0.0f) {
+            Kill(direction);
+        } else {
+            knockbackVelocity_.x += direction.x * pushSpeed * falloff;
+            knockbackVelocity_.z += direction.z * pushSpeed * falloff;
+            const float velocitySq =
+                knockbackVelocity_.x * knockbackVelocity_.x +
+                knockbackVelocity_.z * knockbackVelocity_.z;
+            const float maxSpeed = pushSpeed * 1.25f;
+            if (velocitySq > maxSpeed * maxSpeed) {
+                const float scale = maxSpeed / std::sqrt(velocitySq);
+                knockbackVelocity_.x *= scale;
+                knockbackVelocity_.z *= scale;
+            }
+        }
         return true;
     }
 
@@ -368,6 +474,9 @@ private:
     std::vector<DirectX::XMFLOAT4X4> deathGlobals_;
     std::vector<DirectX::XMFLOAT4X4> bodyLocal_;
     DirectX::XMFLOAT4X4 deathWorld_ = {};
+    DirectX::XMFLOAT3 knockbackVelocity_{ 0.0f, 0.0f, 0.0f };
+    float stationaryAimTime_ = 0.0f;
+    bool preparingShot_ = false;
     uint32_t ragdollId_ = UINT32_MAX;
     int handBone_ = -1;
     bool dead_ = false;
@@ -425,7 +534,7 @@ private:
     }
 
     DirectX::XMFLOAT3 GunOriginWorld() const {
-        const float sx = std::sin(yaw), cz = std::cos(yaw);
+        const float sx = std::sin(aimYaw), cz = std::cos(aimYaw);
         return { position.x + cz * 0.12f + sx * 0.10f,
                  position.y + footOffset + 1.28f,
                  position.z - sx * 0.12f + cz * 0.10f };
@@ -461,6 +570,25 @@ private:
             if (!IsDescendant(static_cast<int>(bone), root)) continue;
             XMStoreFloat4x4(&poseGlobals_[bone],
                 XMLoadFloat4x4(&poseGlobals_[bone]) * delta);
+        }
+    }
+
+    void RotateBranchWorld(int root, DirectX::FXMVECTOR pivotModel,
+                           DirectX::CXMMATRIX rotationWorld) {
+        using namespace DirectX;
+        const XMMATRIX world = MeshWorldMatrix();
+        const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, world);
+        const XMVECTOR pivotWorld = XMVector3TransformCoord(pivotModel, world);
+        XMFLOAT3 p; XMStoreFloat3(&p, pivotWorld);
+        const XMMATRIX deltaWorld =
+            XMMatrixTranslation(-p.x, -p.y, -p.z) *
+            rotationWorld *
+            XMMatrixTranslation(p.x, p.y, p.z);
+        for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
+            if (!IsDescendant(static_cast<int>(bone), root)) continue;
+            XMStoreFloat4x4(&poseGlobals_[bone],
+                XMLoadFloat4x4(&poseGlobals_[bone]) *
+                world * deltaWorld * inverseWorld);
         }
     }
 
@@ -507,8 +635,19 @@ private:
         const int handL = model.skeleton.Find("hand_l");
         if (handBone_ < 0 || handL < 0) return;
 
+        // Legs follow locomotion yaw. Twist full spine branch back toward player
+        // before arm IK so chest, shoulders, neck, head, and arms share weapon aim.
+        const int spine = model.skeleton.Find("spine_01");
+        if (spine >= 0) {
+            const float upperBodyYaw =
+                std::atan2(std::sin(aimYaw - yaw), std::cos(aimYaw - yaw));
+            const XMVECTOR pivot =
+                XMLoadFloat4x4(&poseGlobals_[spine]).r[3];
+            RotateBranchWorld(spine, pivot, XMMatrixRotationY(upperBodyYaw));
+        }
+
         const XMFLOAT3 origin = GunOriginWorld();
-        const float sx = std::sin(yaw), cz = std::cos(yaw);
+        const float sx = std::sin(aimYaw), cz = std::cos(aimYaw);
         const XMVECTOR rightGripWorld = XMVectorSet(
             origin.x + cz * 0.06f, origin.y - 0.03f,
             origin.z - sx * 0.06f, 1.0f);

@@ -103,6 +103,24 @@ inline void RenderPlayerHUD(const Scene& scene) {
     const ImGuiIO& io = ImGui::GetIO();
     ImDrawList* draw = ImGui::GetForegroundDrawList();
 
+    if (scene.playerHealth > 0.0f) {
+        const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+        constexpr float gap = 3.0f;
+        constexpr float arm = 5.0f;
+        const ImU32 outline = IM_COL32(0, 0, 0, 190);
+        const ImU32 reticle = IM_COL32(235, 235, 225, 220);
+        const ImVec2 segments[4][2] = {
+            { ImVec2(center.x - gap - arm, center.y), ImVec2(center.x - gap, center.y) },
+            { ImVec2(center.x + gap, center.y), ImVec2(center.x + gap + arm, center.y) },
+            { ImVec2(center.x, center.y - gap - arm), ImVec2(center.x, center.y - gap) },
+            { ImVec2(center.x, center.y + gap), ImVec2(center.x, center.y + gap + arm) }
+        };
+        for (const auto& segment : segments)
+            draw->AddLine(segment[0], segment[1], outline, 3.0f);
+        for (const auto& segment : segments)
+            draw->AddLine(segment[0], segment[1], reticle, 1.0f);
+    }
+
     // Brief red hit flash. Draw first so HUD stays readable above it.
     if (scene.playerDamageFlash > 0.0f) {
         const float alpha = (std::min)(0.32f, scene.playerDamageFlash * 1.35f);
@@ -277,6 +295,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::TextDisabled("VB Pipeline: Not Available");
         }
 
+        ImGui::Checkbox("4x MSAA (Forward only)", &scene.enableMSAA);
+        ImGui::Checkbox("FXAA", &scene.enableFXAA);
+        if (scene.enableMSAA &&
+            (scene.useVisibilityBuffer || scene.useRaytracing)) {
+            ImGui::TextDisabled("MSAA inactive outside Forward renderer");
+        }
         if (!scene.useVisibilityBuffer && !scene.useRaytracing) {
             ImGui::Text("Active: Forward Clustered");
         }

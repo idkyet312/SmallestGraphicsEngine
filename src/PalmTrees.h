@@ -209,6 +209,46 @@ public:
         RebuildItems();
     }
 
+    bool BlocksSegment(const XMFLOAT3& start, const XMFLOAT3& end,
+                       float radius) const {
+        if (B3_IS_NULL(m_world)) return false;
+        const XMVECTOR a = XMLoadFloat3(&start);
+        const XMVECTOR b = XMLoadFloat3(&end);
+        const XMVECTOR ab = b - a;
+        const float abLenSq = std::max(1e-6f, XMVectorGetX(XMVector3LengthSq(ab)));
+        auto blocked = [&](const XMVECTOR& center, float rad, float halfLen) {
+            float t = XMVectorGetX(XMVector3Dot(center - a, ab)) / abLenSq;
+            t = std::max(0.0f, std::min(1.0f, t));
+            const float distance = XMVectorGetX(
+                XMVector3Length(center - (a + ab * t)));
+            return distance <= radius + std::max(rad, halfLen);
+        };
+        for (const Tree& tree : m_trees) {
+            const int standTop = tree.felled ? tree.cutIndex : (int)tree.segments.size();
+            for (int i = 0; i < standTop; ++i) {
+                const Segment& segment = tree.segments[i];
+                if (blocked(XMVectorSet(tree.x + segment.offX, segment.centerY,
+                                        tree.z, 0.0f),
+                            segment.radius, tree.segLen * 0.5f))
+                    return true;
+            }
+        }
+        for (const Log& log : m_logs) {
+            if (B3_IS_NULL(log.body)) continue;
+            const XMMATRIX transform = BodyTransform(log.body);
+            for (const Piece& piece : log.pieces) {
+                if (piece.frond) continue;
+                const XMVECTOR worldPosition = XMVector3Transform(
+                    XMVectorSet(piece.localPos.x, piece.localPos.y,
+                                piece.localPos.z, 1.0f), transform);
+                if (blocked(worldPosition, std::max(piece.half.x, piece.half.z),
+                            piece.half.y))
+                    return true;
+            }
+        }
+        return false;
+    }
+
     // Shoot the grove. Damages whichever trunk segment the bullet passes closest
     // to -- standing tree or fallen log alike. When that segment's health runs out
     // the thing splits there: the part above the cut becomes a new dynamic log.

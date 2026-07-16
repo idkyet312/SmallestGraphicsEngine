@@ -24,8 +24,12 @@ public:
 
     ComPtr<ID3D12PipelineState> pso;
     ComPtr<ID3D12PipelineState> psoWireframe;
+    ComPtr<ID3D12PipelineState> psoMSAA;
+    ComPtr<ID3D12PipelineState> psoWireframeMSAA;
     ComPtr<ID3D12GraphicsCommandList6> commandList6;
     bool supported = false;
+    bool msaaSupported = false;
+    bool msaaEnabled = false;
     bool wireframe = false; // Z key: draw terrain tiles as wireframe
 
     bool Init(ShaderDX12& shader) {
@@ -84,6 +88,12 @@ public:
             std::cerr << "Terrain PSO creation failed: 0x" << std::hex << psoHr << std::dec << "\n";
             return false;
         }
+        stream.sample.value.Count = MSAADX12::SampleCount;
+        stream.raster.value.MultisampleEnable = TRUE;
+        msaaSupported = SUCCEEDED(
+            device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&psoMSAA)));
+        stream.sample.value.Count = 1;
+        stream.raster.value.MultisampleEnable = FALSE;
 
         stream.raster.value.FillMode = D3D12_FILL_MODE_WIREFRAME;
         ComPtr<ID3DBlob> wirePs;
@@ -93,9 +103,23 @@ public:
         if (FAILED(device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&psoWireframe)))) {
             std::cerr << "Terrain wireframe PSO creation failed (non-fatal)\n";
         }
+        if (msaaSupported) {
+            stream.sample.value.Count = MSAADX12::SampleCount;
+            stream.raster.value.MultisampleEnable = TRUE;
+            if (FAILED(device2->CreatePipelineState(
+                    &streamDesc, IID_PPV_ARGS(&psoWireframeMSAA)))) {
+                psoWireframeMSAA.Reset();
+            }
+            stream.sample.value.Count = 1;
+            stream.raster.value.MultisampleEnable = FALSE;
+        }
 
         supported = true;
         return true;
+    }
+
+    void SetMSAAEnabled(bool enabled) {
+        msaaEnabled = enabled && msaaSupported;
     }
 
     // CPU mirror of terrain_ms.hlsl's height function (hash21/noise2/fbm/
@@ -183,8 +207,11 @@ public:
     // terrain material (SetObjectMaterial) beforehand, same as any other draw.
     void Draw(const Params& params) {
         if (!supported) return;
-        commandList6->SetPipelineState((wireframe && psoWireframe)
-            ? psoWireframe.Get() : pso.Get());
+        ID3D12PipelineState* solid =
+            msaaEnabled ? psoMSAA.Get() : pso.Get();
+        ID3D12PipelineState* wire =
+            msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get();
+        commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
         commandList6->SetGraphicsRoot32BitConstants(8, 8, &params, 0);
         const UINT tileCount = params.tilesX * params.tilesZ;
         commandList6->DispatchMesh((tileCount + 31) / 32, 1, 1);

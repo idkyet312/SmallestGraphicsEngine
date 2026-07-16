@@ -37,6 +37,8 @@
 #include "TerrainRendererDX12.h"
 #include "SkyRendererDX12.h"
 #include "OcclusionDepthDX12.h"
+#include "FXAADX12.h"
+#include "MSAADX12.h"
 #include "DestructionDX12.h"
 #include "FBXImporter.h"
 #include "SkinnedFBXImporter.h"
@@ -115,6 +117,64 @@ static void ShootPlayerWeapon() {
     g_gunAudio.Play(0.82f, pitch);
 }
 
+static bool HitTerrainSegment(const XMFLOAT3& start, const XMFLOAT3& end,
+                              float radius, XMFLOAT3& hit) {
+    if (!scene.useMeshTerrain || !g_terrain.supported) return false;
+    TerrainRendererDX12::Params params;
+    params.heightScale = scene.terrainHeightScale;
+    const float dx = end.x - start.x;
+    const float dy = end.y - start.y;
+    const float dz = end.z - start.z;
+    const float length = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const int steps = (std::max)(4, (std::min)(32,
+        static_cast<int>(std::ceil(length / 0.15f))));
+    float previousT = 0.0f;
+    for (int step = 1; step <= steps; ++step) {
+        const float t = static_cast<float>(step) / static_cast<float>(steps);
+        const float x = start.x + dx * t;
+        const float y = start.y + dy * t;
+        const float z = start.z + dz * t;
+        if (y > TerrainRendererDX12::HeightAt(params, x, z) + radius) {
+            previousT = t;
+            continue;
+        }
+        float lo = previousT, hi = t;
+        for (int refine = 0; refine < 6; ++refine) {
+            const float mid = (lo + hi) * 0.5f;
+            const float mx = start.x + dx * mid;
+            const float my = start.y + dy * mid;
+            const float mz = start.z + dz * mid;
+            if (my > TerrainRendererDX12::HeightAt(params, mx, mz) + radius)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        hit = { start.x + dx * hi, start.y + dy * hi, start.z + dz * hi };
+        return true;
+    }
+    return false;
+}
+
+static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
+                                 const XMFLOAT3& target) {
+    const XMFLOAT3 origin = shooter.AimRayOrigin();
+    constexpr float rayRadius = 0.04f;
+    XMFLOAT3 hit;
+    if (scene.useDestruction && g_destruction.IsInitialized() &&
+        g_destruction.HitTestSegment(origin, target, rayRadius, hit))
+        return false;
+    if (HitTerrainSegment(origin, target, rayRadius, hit)) return false;
+    if (g_trees.BlocksSegment(origin, target, rayRadius)) return false;
+    if (g_rope.BlocksSegment(origin, target, rayRadius) ||
+        g_gibbet.BlocksSegment(origin, target, rayRadius))
+        return false;
+    for (const auto& bandit : g_bandits) {
+        if (!bandit || bandit.get() == &shooter || bandit->Dead()) continue;
+        if (bandit->BlocksProjectile(origin, target, rayRadius)) return false;
+    }
+    return true;
+}
+
 // One-line Bandit status for the debug HUD (declared in EngineUI.h).
 void BanditDebugText() {
     if (!g_banditLoaded) { ImGui::Text("Bandit: NOT LOADED"); return; }
@@ -139,6 +199,9 @@ PalmTrees                   g_trees;
 GrassField                  g_grass;
 static SkyRendererDX12      skyRenderer;
 static OcclusionDepthDX12   occlusionDepth;
+static FXAADX12             fxaa;
+static MSAADX12             msaa;
+static bool                 msaaUsedLastFrame = false;
 static VisibilityBufferDX12 visBuffer;
 static ShadowMapDX12        shadowMap;
 static GeometryBuffers      geo;
@@ -150,8 +213,10 @@ static std::shared_ptr<SceneMaterial> floorMaterial;
 // Soft smoke sprite (RGBA, alpha-shaped) for billboard particles, plus the
 // upload heap that must outlive the copy.
 ComPtr<ID3D12Resource> g_smokeTexture;
+ComPtr<ID3D12Resource> g_bloodTexture;
 ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 static std::vector<ComPtr<ID3D12Resource>> g_smokeUploadHeaps;
+static std::vector<ComPtr<ID3D12Resource>> g_bloodUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_muzzleFlashUploadHeaps;
 static bool                 crateLoadAttempted = false;
 
@@ -236,6 +301,12 @@ static void LoadFloorMudMaterial() {
         g_dx12.device, g_dx12.commandList, g_smokeUploadHeaps);
     if (!g_smokeTexture)
         std::cerr << "Smoke sprite (models/textures/smoke.png) unavailable\n";
+
+    g_bloodTexture = GLBImporter::LoadTextureFromFile(
+        ResolveTexturePath("models/textures/blood_splat.png"),
+        g_dx12.device, g_dx12.commandList, g_bloodUploadHeaps);
+    if (!g_bloodTexture)
+        std::cerr << "Blood sprite (models/textures/blood_splat.png) unavailable\n";
 
     g_muzzleFlashTexture = GLBImporter::LoadTextureFromFile(
         ResolveTexturePath("models/textures/muzzle_flash.png"),
@@ -1371,6 +1442,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SCR_WIDTH = w; SCR_HEIGHT = h;
                 ResizeDX12(SCR_WIDTH, SCR_HEIGHT);
                 if (occlusionDepth.initialized) occlusionDepth.Resize(SCR_WIDTH, SCR_HEIGHT);
+                if (fxaa.initialized) fxaa.Resize(SCR_WIDTH, SCR_HEIGHT);
+                if (msaa.initialized) msaa.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (visBuffer.initialized) visBuffer.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (g_rt.initialized) ResizeRaytracing(SCR_WIDTH, SCR_HEIGHT);
             }
@@ -1610,6 +1683,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     if (!occlusionDepth.Init(SCR_WIDTH, SCR_HEIGHT)) {
         std::cerr << "Meshlet occlusion depth init failed (non-fatal)\n";
     }
+    if (!fxaa.Init(SCR_WIDTH, SCR_HEIGHT)) {
+        std::cerr << "FXAA init failed (non-fatal)\n";
+        scene.enableFXAA = false;
+    }
+    const bool msaaPipelinesReady =
+        mainShader.msaaSupported &&
+        (!g_useMeshShader || g_meshShader.msaaSupported) &&
+        (!g_terrain.supported || g_terrain.msaaSupported) &&
+        (!skyRenderer.initialized || skyRenderer.msaaSupported);
+    if (!msaa.Init(SCR_WIDTH, SCR_HEIGHT) || !msaaPipelinesReady) {
+        std::cerr << "4x MSAA unavailable (non-fatal)\n";
+        scene.enableMSAA = false;
+    }
 
     // Visibility buffer (id Tech path)
     if (!visBuffer.Init(SCR_WIDTH, SCR_HEIGHT)) {
@@ -1705,6 +1791,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // Maintain four live Bandits. Dead instances stay attached to their
         // ragdolls while replacements enter through the same spawn zone.
         if (g_banditLoaded) {
+            ProfilerDX12::CpuScope banditProfile(g_profiler, "Bandit Update");
             while (LiveBanditCount() < kBanditsOnScreen && SpawnBandit()) {}
             for (auto& bandit : g_bandits) {
                 if (!bandit || bandit->Dead()) continue;
@@ -1718,8 +1805,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 bandit->leftArmReach = g_banditLeftArmReach;
                 bandit->Update(deltaTime, scene.camera.Position, groundY);
                 XMFLOAT3 shotOrigin, shotDirection;
+                // Terrain LOS is deliberately expensive. Test only when a shot
+                // is actually ready, not every frame of the two-second aim pause.
+                const bool hasLineOfSight =
+                    !bandit->NeedsLineOfSightCheck() ||
+                    BanditHasLineOfSight(*bandit, scene.camera.Position);
                 if (bandit->TryFireAt(
-                        deltaTime, scene.camera.Position, shotOrigin, shotDirection)) {
+                        deltaTime, scene.camera.Position, hasLineOfSight,
+                        shotOrigin, shotDirection)) {
                     scene.SpawnHostileProjectile(shotOrigin, shotDirection);
                     const float dx = shotOrigin.x - scene.camera.Position.x;
                     const float dy = shotOrigin.y - scene.camera.Position.y;
@@ -1761,16 +1854,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 scene.SpawnSmokeBurst(bp, 0.5f, 0.4f);
             for (auto& projectile : scene.projectiles) {
                 if (projectile.grenade) {
-                    // A grenade explodes on fuse timeout (Scene set detonate) or
-                    // the moment it strikes the building; either way a radial
-                    // blast breaks the whole sphere of pieces around it.
-                    XMFLOAT3 hit;
-                    const bool struck = projectile.active && g_destruction.HitTestSegment(
-                        projectile.previousPosition, projectile.position, 0.25f, hit);
-                    if (projectile.detonate || struck) {
-                        const XMFLOAT3 center = struck ? hit : projectile.position;
+                    // Timer-only grenade: impacts and bounces never detonate it.
+                    if (projectile.detonate) {
+                        const XMFLOAT3 center = projectile.position;
+                        if (g_banditLoaded) {
+                            for (auto& bandit : g_bandits) {
+                                if (bandit) bandit->ApplyExplosion(
+                                    center, scene.grenadeEnemyRadius,
+                                    scene.grenadeEnemyDamage,
+                                    scene.grenadeEnemyPush);
+                            }
+                        }
+                        // Run after Bandit damage. Newly killed enemies have
+                        // ragdolls now, so same blast launches their limbs too.
                         g_destruction.ApplyExplosion(center, scene.grenadeBlastRadius,
                                                      scene.grenadeDamage, scene.grenadeImpulse);
+                        g_destruction.ApplyRagdollExplosion(
+                            center, scene.grenadeEnemyRadius,
+                            scene.grenadeEnemyImpulse);
                         projectile.active = false;
                         projectile.detonate = false;
                     }
@@ -1784,13 +1885,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // the bullet has struck. Otherwise the wall breaks at a distance.
                 const float bulletRadius = std::max(0.12f, scene.projectileScale * 0.5f);
                 bool hitBandit = false;
+                XMFLOAT3 banditHit = projectile.position;
                 // Hostile projectiles damage player only. Running them through
                 // this loop made enemies shoot themselves and squadmates.
                 if (g_banditLoaded && !projectile.hostile) {
                     for (auto& bandit : g_bandits) {
                         if (bandit && bandit->Shoot(
                                 projectile.previousPosition, projectile.position,
-                                projectile.direction, bulletRadius)) {
+                                projectile.direction, bulletRadius, &banditHit)) {
                             hitBandit = true;
                             break;
                         }
@@ -1799,10 +1901,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 if (hitBandit) {
                     const XMFLOAT3 normal(-projectile.direction.x, -projectile.direction.y,
                                           -projectile.direction.z);
-                    scene.SpawnBulletImpact(projectile.position, normal);
-                    scene.SpawnSmokeBurst(projectile.position, 0.25f, 0.08f);
+                    scene.SpawnBloodBurst(banditHit, normal);
                     projectile.active = false;
                     continue;
+                }
+                if (projectile.hostile && g_banditLoaded) {
+                    bool blockedByBandit = false;
+                    for (const auto& bandit : g_bandits) {
+                        if (bandit && bandit->BlocksProjectile(
+                                projectile.previousPosition, projectile.position,
+                                bulletRadius)) {
+                            blockedByBandit = true;
+                            break;
+                        }
+                    }
+                    if (blockedByBandit) {
+                        projectile.active = false;
+                        continue;
+                    }
                 }
                 if (g_destruction.HitTestSegment(projectile.previousPosition, projectile.position,
                                                  bulletRadius, hit)) {
@@ -1874,6 +1990,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                                 projectile.position, oceanHit, 0.28f)) {
                     projectile.position = oceanHit;
                     projectile.active = false;
+                } else if (XMFLOAT3 terrainHit;
+                           HitTerrainSegment(projectile.previousPosition,
+                                             projectile.position,
+                                             bulletRadius, terrainHit)) {
+                    projectile.position = terrainHit;
+                    projectile.active = false;
+                } else if (projectile.hostile) {
+                    // Player is tested last. Any world or character mesh in
+                    // front consumes the shot first, preventing wall penetration.
+                    scene.HitPlayerProjectile(projectile);
                 }
             }
         }
@@ -1886,7 +2012,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_profiler.BeginGpuFrame(g_dx12.frameIndex, g_dx12.commandList.Get());
 
         float cc[4] = { scene.clearColor.x, scene.clearColor.y, scene.clearColor.z, 1.0f };
-        ClearRenderTarget(cc);
+        const bool usingRaytracing =
+            scene.useRaytracing && g_rt.initialized;
+        const bool usingVisibility =
+            !usingRaytracing && scene.useVisibilityBuffer && visBuffer.initialized;
+        const bool msaaActive =
+            scene.enableMSAA && msaa.initialized &&
+            !usingRaytracing && !usingVisibility;
+        mainShader.SetMSAAEnabled(msaaActive);
+        g_meshShader.SetMSAAEnabled(msaaActive);
+        g_terrain.SetMSAAEnabled(msaaActive);
+        skyRenderer.SetMSAAEnabled(msaaActive);
+        if (msaaActive) msaa.BindAndClear(cc);
+        else ClearRenderTarget(cc);
         {
             ProfilerDX12::Scope profile(g_profiler, "Sky", g_dx12.commandList.Get());
             skyRenderer.Render(scene.camera, scene.cameraFOV, scene.lightPos, now);
@@ -1894,7 +2032,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         mainShader.BeginFrame();
         g_meshShader.SetOcclusionDepth(
-            occlusionDepth.GetGPUHandle(), occlusionDepth.valid);
+            occlusionDepth.GetGPUHandle(),
+            occlusionDepth.valid && !msaaActive && !msaaUsedLastFrame);
 
         if (!crateLoadAttempted) {
             crateLoadAttempted = true;
@@ -2050,15 +2189,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_dx12.commandList->SetDescriptorHeaps(2, mainHeaps);
             g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
             g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
-            ClearRenderTarget(cc);
+            if (msaaActive) msaa.BindAndClear(cc);
+            else ClearRenderTarget(cc);
             mainShader.BeginFrame();
         }
 
         // ?? render ??
-        if (scene.useRaytracing && g_rt.initialized) {
+        if (usingRaytracing) {
             ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());
             RenderRaytracing(scene);
-        } else if (scene.useVisibilityBuffer && visBuffer.initialized) {
+        } else if (usingVisibility) {
             ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
             RenderIdTech(scene, mainShader, visBuffer, geo, packed);
         } else {
@@ -2071,14 +2211,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     g_banditLoaded ? FirstLiveBandit() : nullptr);
                 shadowResource = shadowMap.GetResource();
             }
+            if (msaaActive) msaa.Bind();
             {
                 ProfilerDX12::Scope profile(g_profiler, "Forward", g_dx12.commandList.Get());
                 RenderForward(scene, mainShader, geo, crateModel, floorMaterial, lightSpace, shadowResource);
+            }
 
-                // Skinned Bandit: advance its clip and draw it through the mesh
-                // shader with GPU skinning. Drawn after the forward scene so it
-                // reuses the same bound root signature / descriptor heaps.
+            // Skinned Bandits use GPU skinning. Keep their cost separate from the
+            // scene's Forward timing so performance regressions stay visible.
             if (g_banditLoaded) {
+                ProfilerDX12::Scope profile(
+                    g_profiler, "Bandits", g_dx12.commandList.Get());
                 for (auto& bandit : g_bandits) {
                     if (!bandit) continue;
                     bandit->Draw(mainShader, scene.GetViewMatrix(),
@@ -2092,7 +2235,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 }
                 mainShader.Use(scene.wireframeMode); // restore IA pipeline for anything after
             }
-            }
+        }
+
+        if (msaaActive) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "MSAA Resolve", g_dx12.commandList.Get());
+            msaa.ResolveToBackBuffer();
         }
 
         // Preserve this frame's depth for next-frame amplification-shader
@@ -2100,6 +2248,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         {
             ProfilerDX12::Scope profile(g_profiler, "Occlusion Depth", g_dx12.commandList.Get());
             occlusionDepth.PrepareCapture(g_dx12.commandList.Get());
+        }
+
+        if (scene.enableFXAA && fxaa.initialized) {
+            ProfilerDX12::Scope profile(g_profiler, "FXAA", g_dx12.commandList.Get());
+            fxaa.Apply(g_dx12.commandList.Get());
         }
 
         // Ensure ImGui renders to the swapchain backbuffer (VB path changes OM target)
@@ -2137,6 +2290,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             break;
         }
         occlusionDepth.SubmitCopy();
+        msaaUsedLastFrame = msaaActive;
         g_profiler.EndCpuFrame();
     }
 

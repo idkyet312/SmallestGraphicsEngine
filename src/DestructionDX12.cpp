@@ -1727,8 +1727,14 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
         XMFLOAT3 v; XMStoreFloat3(&v, dir * magnitude);
         b3Body_ApplyLinearImpulse(runtime->body, { v.x, v.y, v.z }, { (float)bp.x, (float)bp.y, (float)bp.z }, true);
     }
-    // Blast pressure acts on every ragdoll limb. Applying at each limb center
-    // moves the whole articulated body while also producing natural rotation.
+    std::cout << "Grenade: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
+}
+
+void DestructionDX12::ApplyRagdollExplosion(
+    const XMFLOAT3& worldPosition, float radius, float impulse) {
+    if (!m->initialized || radius <= 0.0f || impulse <= 0.0f) return;
+    const XMVECTOR center = XMLoadFloat3(&worldPosition);
+    // Enemy-only blast pressure. Debris keeps its original independent settings.
     for (Impl::RagdollPart& part : m->ragdollParts) {
         const b3Pos bp = b3Body_GetPosition(part.body);
         const XMVECTOR pos = XMVectorSet((float)bp.x, (float)bp.y, (float)bp.z, 0.0f);
@@ -1744,7 +1750,6 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
         b3Body_ApplyLinearImpulse(part.body, { v.x, v.y, v.z },
             { (float)bp.x, (float)bp.y, (float)bp.z }, true);
     }
-    std::cout << "Grenade: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
 }
 
 bool DestructionDX12::ApplyImpulse(const XMFLOAT3& worldPosition,
