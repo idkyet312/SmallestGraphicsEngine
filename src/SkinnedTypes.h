@@ -72,6 +72,8 @@ struct RagdollBodySpec {
 struct RagdollConstraintSpec {
     std::string boneA;
     std::string boneB;
+    float coneAngle = DirectX::XM_PIDIV4;
+    float twistAngle = DirectX::XM_PIDIV4;
 };
 
 struct RagdollSpec {

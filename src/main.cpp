@@ -11,8 +11,10 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx12.h>
@@ -58,9 +60,54 @@ MeshShaderDX12              g_meshShader;
 bool                        g_useMeshShader = false;
 TerrainRendererDX12         g_terrain;
 DestructionDX12             g_destruction;
-SkinnedEnemy                g_bandit;
+std::vector<std::unique_ptr<SkinnedEnemy>> g_bandits;
+SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
+float                       g_banditLeftArmReach = 0.55f;
+uint32_t                    g_banditSpawnSerial = 0;
 GunAudio                    g_gunAudio;
+
+static constexpr size_t kBanditsOnScreen = 4;
+static const XMFLOAT3 kBanditSpawnPoint = { 0.0f, 0.0f, 14.0f };
+
+static size_t LiveBanditCount() {
+    size_t count = 0;
+    for (const auto& bandit : g_bandits)
+        if (bandit && !bandit->Dead()) ++count;
+    return count;
+}
+
+static SkinnedEnemy* FirstLiveBandit() {
+    for (const auto& bandit : g_bandits)
+        if (bandit && !bandit->Dead()) return bandit.get();
+    return nullptr;
+}
+
+static bool SpawnBandit() {
+    if (!g_banditModel.valid) return false;
+    auto bandit = std::make_unique<SkinnedEnemy>();
+    if (!bandit->Init(g_banditModel)) return false;
+
+    // Four lanes around one authored spawn point keep every replacement visible
+    // without stacking characters inside each other.
+    static constexpr float laneX[] = { -2.7f, -0.9f, 0.9f, 2.7f };
+    static constexpr float laneZ[] = { -0.8f, 0.4f, 0.4f, -0.8f };
+    const size_t lane = g_banditSpawnSerial++ % kBanditsOnScreen;
+    bandit->position = {
+        kBanditSpawnPoint.x + laneX[lane],
+        kBanditSpawnPoint.y,
+        kBanditSpawnPoint.z + laneZ[lane]
+    };
+    bandit->leftArmReach = g_banditLeftArmReach;
+    bandit->orbitRadius = 4.4f + static_cast<float>(lane) * 0.45f;
+    bandit->orbitDirection = (lane & 1) ? -1.0f : 1.0f;
+    bandit->fireCooldown =
+        0.7f + ((float)std::rand() / (float)RAND_MAX) * 2.8f;
+    bandit->PlayClip("Walk");
+    bandit->anim.Advance(0.19f * static_cast<float>(lane));
+    g_bandits.push_back(std::move(bandit));
+    return true;
+}
 
 static void ShootPlayerWeapon() {
     scene.ShootProjectile();
@@ -72,19 +119,16 @@ static void ShootPlayerWeapon() {
 void BanditDebugText() {
     if (!g_banditLoaded) { ImGui::Text("Bandit: NOT LOADED"); return; }
     int textured = 0, parts = 0;
-    if (g_bandit.model.node && g_bandit.model.node->mesh) {
-        for (const auto& p : g_bandit.model.node->mesh->primitives) {
+    if (g_banditModel.node && g_banditModel.node->mesh) {
+        for (const auto& p : g_banditModel.node->mesh->primitives) {
             ++parts;
             if (p.material && p.material->baseColorTexture) ++textured;
         }
     }
-    ImGui::Text("Bandit: bones=%zu parts=%d tex=%d pal=%zu pos(%.1f,%.1f,%.1f)",
-                g_bandit.model.skeleton.BoneCount(), parts, textured,
-                g_bandit.Palette().size(),
-                g_bandit.position.x, g_bandit.position.y, g_bandit.position.z);
-    ImGui::Text("Bandit: %s health=%.0f", g_bandit.Dead() ? "dead" : "ground AI",
-                g_bandit.health);
-    ImGui::SliderFloat("Left arm reach", &g_bandit.leftArmReach,
+    ImGui::Text("Bandits: live=%zu total=%zu bones=%zu parts=%d tex=%d",
+                LiveBanditCount(), g_bandits.size(),
+                g_banditModel.skeleton.BoneCount(), parts, textured);
+    ImGui::SliderFloat("Left arm reach", &g_banditLeftArmReach,
                        0.20f, 0.85f, "%.2f m");
 }
 WaterVolume                 g_water;
@@ -1658,15 +1702,36 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_water.Splash(x, z, s);
             });
         }
-        // Stand the Bandit on the terrain surface (its mesh origin is at the
-        // feet). Sampled each frame so it stays grounded if it later walks.
-        if (g_banditLoaded && !g_bandit.Dead()) {
-            float groundY = 0.0f;
-            if (scene.useMeshTerrain && g_terrain.supported) {
-                TerrainRendererDX12::Params tp; tp.heightScale = scene.terrainHeightScale;
-                groundY = TerrainRendererDX12::HeightAt(tp, g_bandit.position.x, g_bandit.position.z);
+        // Maintain four live Bandits. Dead instances stay attached to their
+        // ragdolls while replacements enter through the same spawn zone.
+        if (g_banditLoaded) {
+            while (LiveBanditCount() < kBanditsOnScreen && SpawnBandit()) {}
+            for (auto& bandit : g_bandits) {
+                if (!bandit || bandit->Dead()) continue;
+                float groundY = 0.0f;
+                if (scene.useMeshTerrain && g_terrain.supported) {
+                    TerrainRendererDX12::Params tp;
+                    tp.heightScale = scene.terrainHeightScale;
+                    groundY = TerrainRendererDX12::HeightAt(
+                        tp, bandit->position.x, bandit->position.z);
+                }
+                bandit->leftArmReach = g_banditLeftArmReach;
+                bandit->Update(deltaTime, scene.camera.Position, groundY);
+                XMFLOAT3 shotOrigin, shotDirection;
+                if (bandit->TryFireAt(
+                        deltaTime, scene.camera.Position, shotOrigin, shotDirection)) {
+                    scene.SpawnHostileProjectile(shotOrigin, shotDirection);
+                    const float dx = shotOrigin.x - scene.camera.Position.x;
+                    const float dy = shotOrigin.y - scene.camera.Position.y;
+                    const float dz = shotOrigin.z - scene.camera.Position.z;
+                    const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+                    const float volume =
+                        (std::max)(0.08f, 0.58f * (1.0f - distance / 45.0f));
+                    const float pitch =
+                        0.88f + ((float)std::rand() / RAND_MAX) * 0.08f;
+                    g_gunAudio.Play(volume, pitch);
+                }
             }
-            g_bandit.Update(deltaTime, scene.camera.Position, groundY);
         }
         g_water.Update(deltaTime);
         g_ocean.Update(deltaTime);
@@ -1678,7 +1743,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
             g_destruction.Update(deltaTime);
-            if (g_banditLoaded && g_bandit.Dead()) g_bandit.SyncRagdoll();
+            if (g_banditLoaded)
+                for (auto& bandit : g_bandits)
+                    if (bandit && bandit->Dead()) bandit->SyncRagdoll();
             for (const EnemyShot& shot : g_destruction.DrainEnemyShots()) {
                 scene.SpawnHostileProjectile(shot.origin, shot.direction);
                 const float dx = shot.origin.x - scene.camera.Position.x;
@@ -1716,8 +1783,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // damage radius only governs how far the fracture spreads once
                 // the bullet has struck. Otherwise the wall breaks at a distance.
                 const float bulletRadius = std::max(0.12f, scene.projectileScale * 0.5f);
-                if (g_banditLoaded && g_bandit.Shoot(projectile.previousPosition,
-                        projectile.position, projectile.direction, bulletRadius)) {
+                bool hitBandit = false;
+                // Hostile projectiles damage player only. Running them through
+                // this loop made enemies shoot themselves and squadmates.
+                if (g_banditLoaded && !projectile.hostile) {
+                    for (auto& bandit : g_bandits) {
+                        if (bandit && bandit->Shoot(
+                                projectile.previousPosition, projectile.position,
+                                projectile.direction, bulletRadius)) {
+                            hitBandit = true;
+                            break;
+                        }
+                    }
+                }
+                if (hitBandit) {
                     const XMFLOAT3 normal(-projectile.direction.x, -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(projectile.position, normal);
@@ -1939,15 +2018,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 SkinnedModel bm = SkinnedFBXImporter::Load(
                     banditDir + "SK_Bandit.FBX", clips, g_dx12.device, g_dx12.commandList);
                 bm.ragdoll = T3DPhysicsAsset::Load(banditDir + "Phy_Bandit_PhysicsAsset.T3D");
-                if (bm.valid && g_bandit.Init(bm)) {
-                    // Starting camera is at z=20 looking toward -Z. Spawn six
-                    // metres ahead so weapon pose is immediately visible.
-                    g_bandit.position = { 0.0f, 0.0f, 14.0f };
-                    g_bandit.PlayClip("Walk");
+                if (bm.valid) {
+                    g_banditModel = std::move(bm);
+                    for (size_t i = 0; i < kBanditsOnScreen; ++i)
+                        if (!SpawnBandit()) break;
                     g_banditLoaded = true;
-                    std::cout << "Bandit enemy ready\n";
+                    std::cout << "Bandit squad ready: " << LiveBanditCount()
+                              << " live enemies\n";
                 } else {
-                    std::cerr << "Bandit enemy failed to load\n";
+                    std::cerr << "Bandit squad failed to load\n";
                 }
 
             }
@@ -1987,8 +2066,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
                 ProfilerDX12::Scope profile(g_profiler, "Shadow", g_dx12.commandList.Get());
-                lightSpace = shadowMap.Render(scene, geo, g_showH2Model ? crateModel : nullptr,
-                                              g_banditLoaded ? &g_bandit : nullptr);
+                lightSpace = shadowMap.Render(
+                    scene, geo, g_showH2Model ? crateModel : nullptr,
+                    g_banditLoaded ? FirstLiveBandit() : nullptr);
                 shadowResource = shadowMap.GetResource();
             }
             {
@@ -1999,14 +2079,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // shader with GPU skinning. Drawn after the forward scene so it
                 // reuses the same bound root signature / descriptor heaps.
             if (g_banditLoaded) {
-                g_bandit.Draw(mainShader, scene.GetViewMatrix(), scene.GetProjectionMatrix(), lightSpace);
-                if (g_bandit.HasGunPose() && GunModel::Loaded()) {
-                    mainShader.Use(false);
-                    DrawMeshAt(GunModel::Mesh(), mainShader, g_bandit.GunWorldMatrix(),
-                               scene.GetViewMatrix(), scene.GetProjectionMatrix(), lightSpace);
+                for (auto& bandit : g_bandits) {
+                    if (!bandit) continue;
+                    bandit->Draw(mainShader, scene.GetViewMatrix(),
+                                 scene.GetProjectionMatrix(), lightSpace);
+                    if (bandit->HasGunPose() && GunModel::Loaded()) {
+                        mainShader.Use(false);
+                        DrawMeshAt(
+                            GunModel::Mesh(), mainShader, bandit->GunWorldMatrix(),
+                            scene.GetViewMatrix(), scene.GetProjectionMatrix(), lightSpace);
+                    }
                 }
                 mainShader.Use(scene.wireframeMode); // restore IA pipeline for anything after
-                }
+            }
             }
         }
 
