@@ -927,7 +927,7 @@ struct DestructionDX12::Impl {
         if (B3_IS_NULL(world)) return false;
         BuildGround();
         CreateBody(*actors.front(), false, nullptr);
-        CreateRagdolls();
+        // Flying prototype enemies disabled. Skinned Bandit is active test enemy.
         return true;
     }
 

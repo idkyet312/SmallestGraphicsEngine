@@ -48,6 +48,62 @@ public:
         }
     }
 
+    // Unreal-style layered blend per bone. `this` supplies locomotion, overlay
+    // supplies the upper-body clip, and mask[b] selects the overlay per bone.
+    // Optional local rotation offsets turn a neutral overlay into an authored
+    // pose such as a rifle hold without changing lower-body animation.
+    void ComputeLayeredPalette(
+        const Skeleton& skel, const AnimationInstance& overlay,
+        const std::vector<float>& mask,
+        const std::vector<DirectX::XMFLOAT4>& rotationOffsets,
+        std::vector<DirectX::XMFLOAT4X4>& palette,
+        std::vector<DirectX::XMFLOAT4X4>* modelMatrices = nullptr) const {
+        using namespace DirectX;
+        const size_t n = skel.BoneCount();
+        EnsureCache(skel);
+        overlay.EnsureCache(skel);
+        palette.resize(n);
+        if (modelMatrices) modelMatrices->resize(n);
+
+        for (size_t b = 0; b < n; ++b) {
+            XMMATRIX baseLocal = XMLoadFloat4x4(&skel.localBind[b]);
+            if (const BoneTrack* tr = trackByBone_[b]) baseLocal = SampleTrack(*tr, b);
+            XMMATRIX overlayLocal = XMLoadFloat4x4(&skel.localBind[b]);
+            if (const BoneTrack* tr = overlay.trackByBone_[b])
+                overlayLocal = overlay.SampleTrack(*tr, b);
+
+            const float weight = b < mask.size()
+                ? (std::max)(0.0f, (std::min)(1.0f, mask[b])) : 0.0f;
+            XMVECTOR bs, br, bt, os, orot, ot;
+            if (!XMMatrixDecompose(&bs, &br, &bt, baseLocal)) {
+                bs = XMVectorSplatOne(); br = XMQuaternionIdentity(); bt = XMVectorZero();
+            }
+            if (!XMMatrixDecompose(&os, &orot, &ot, overlayLocal)) {
+                os = bs; orot = br; ot = bt;
+            }
+            XMVECTOR rotation = XMQuaternionSlerp(br, orot, weight);
+            if (b < rotationOffsets.size()) {
+                const XMVECTOR poseOffset = XMQuaternionSlerp(
+                    XMQuaternionIdentity(), XMLoadFloat4(&rotationOffsets[b]), weight);
+                rotation = XMQuaternionNormalize(XMQuaternionMultiply(rotation, poseOffset));
+            }
+            const XMMATRIX local = XMMatrixAffineTransformation(
+                XMVectorLerp(bs, os, weight), XMVectorZero(), rotation,
+                XMVectorLerp(bt, ot, weight));
+            const int parent = skel.parent[b];
+            globalScratch_[b] = parent < 0
+                ? local : XMMatrixMultiply(local, globalScratch_[parent]);
+        }
+
+        const XMMATRIX globalInverse = XMLoadFloat4x4(&skel.globalInverse);
+        for (size_t b = 0; b < n; ++b) {
+            const XMMATRIX modelSpace = globalScratch_[b] * globalInverse;
+            if (modelMatrices) XMStoreFloat4x4(&(*modelMatrices)[b], modelSpace);
+            const XMMATRIX skinMat = XMLoadFloat4x4(&skel.offset[b]) * modelSpace;
+            XMStoreFloat4x4(&palette[b], XMMatrixTranspose(skinMat));
+        }
+    }
+
     // Debug: each bone's global (model-space) transform, for drawing the
     // skeleton as joints/bones without any mesh. Same forward pass as the
     // palette but WITHOUT the inverse-bind offset, so translation is the joint
