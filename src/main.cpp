@@ -1938,7 +1938,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     banditDir + "SK_Bandit.FBX", clips, g_dx12.device, g_dx12.commandList);
                 bm.ragdoll = T3DPhysicsAsset::Load(banditDir + "Phy_Bandit_PhysicsAsset.T3D");
                 if (bm.valid && g_bandit.Init(bm)) {
-                    g_bandit.position = { 0.0f, 0.0f, 10.0f };
+                    // Starting camera is at z=20 looking toward -Z. Spawn six
+                    // metres ahead so weapon pose is immediately visible.
+                    g_bandit.position = { 0.0f, 0.0f, 14.0f };
                     g_bandit.PlayClip("Walk");
                     g_banditLoaded = true;
                     std::cout << "Bandit enemy ready\n";
@@ -1995,6 +1997,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // reuses the same bound root signature / descriptor heaps.
             if (g_banditLoaded) {
                 g_bandit.Draw(mainShader, scene.GetViewMatrix(), scene.GetProjectionMatrix(), lightSpace);
+                if (g_bandit.HasGunPose() && GunModel::Loaded()) {
+                    mainShader.Use(false);
+                    DrawMeshAt(GunModel::Mesh(), mainShader, g_bandit.GunWorldMatrix(),
+                               scene.GetViewMatrix(), scene.GetProjectionMatrix(), lightSpace);
+                }
                 mainShader.Use(scene.wireframeMode); // restore IA pipeline for anything after
                 }
             }

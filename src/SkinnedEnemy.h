@@ -8,7 +8,9 @@
 #include "DX12Core.h"
 #include "DestructionDX12.h"
 #include <DirectXMath.h>
+#include <cctype>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 extern MeshShaderDX12 g_meshShader;
@@ -33,6 +35,7 @@ public:
     float             meshPitch = 0.0f;
     float             meshRoll = 0.0f;
     float             meshYaw  = 0.0f;
+    bool              upperBodyGunLayer = true;
 
     bool Init(const SkinnedModel& m) {
         model = m;
@@ -56,7 +59,8 @@ public:
         }
         // Prime with the bind pose so the very first frame renders upright even
         // before any clip is assigned.
-        anim.ComputePalette(model.skeleton, paletteCPU_);
+        ConfigureGunLayer();
+        ComputePose();
         return true;
     }
 
@@ -100,14 +104,32 @@ public:
         if (distance > 4.0f) {
             speed = distance > 11.0f ? moveSpeed * 1.65f : moveSpeed;
             const float inv = 1.0f / distance;
-            position.x += dx * inv * speed * dt;
-            position.z += dz * inv * speed * dt;
+            // Asset loading can make one frame several seconds long. Never let
+            // that frame overshoot through the player and spawn behind them.
+            const float travel = (std::min)(speed * dt, distance - 4.0f);
+            position.x += dx * inv * travel;
+            position.z += dz * inv * travel;
             // Imported FBX faces local +Z after its node/bind transforms.
             yaw = std::atan2(dx, dz);
         }
         PlayClip(speed > moveSpeed * 1.2f ? "Run" : speed > 0.01f ? "Walk" : "Idle");
         anim.Advance(dt);
-        anim.ComputePalette(model.skeleton, paletteCPU_);
+        ComputePose();
+    }
+
+    bool HasGunPose() const {
+        return upperBodyGunLayer && !dead_ && handBone_ >= 0 &&
+               static_cast<size_t>(handBone_) < poseGlobals_.size();
+    }
+
+    // Weapon uses a stable character-facing frame. Arm IK places both hands on
+    // this same frame, so walk animation cannot roll the barrel toward ground.
+    DirectX::XMMATRIX GunWorldMatrix() const {
+        using namespace DirectX;
+        if (!HasGunPose()) return XMMatrixIdentity();
+        const XMFLOAT3 origin = GunOriginWorld();
+        return XMMatrixRotationY(yaw) *
+               XMMatrixTranslation(origin.x, origin.y, origin.z);
     }
 
     void SyncRagdoll() {
@@ -234,8 +256,8 @@ private:
     void Kill(const DirectX::XMFLOAT3& impulseDirection) {
         using namespace DirectX;
         dead_ = true;
-        std::vector<XMFLOAT4X4> globals;
-        anim.ComputeGlobalMatrices(model.skeleton, globals);
+        std::vector<XMFLOAT4X4> globals = poseGlobals_;
+        if (globals.empty()) anim.ComputeGlobalMatrices(model.skeleton, globals);
         deathGlobals_ = globals;
         bodyLocal_.assign(model.skeleton.BoneCount(), XMFLOAT4X4{});
         XMStoreFloat4x4(&deathWorld_, WorldMatrix());
@@ -265,9 +287,170 @@ private:
     void* mapped_[FRAME_COUNT] = {};
     UINT  paletteBytes_ = 0;
     std::vector<DirectX::XMFLOAT4X4> paletteCPU_;
+    AnimationInstance upperBodyAnim_;
+    std::vector<float> upperBodyMask_;
+    std::vector<DirectX::XMFLOAT4> gunPoseOffsets_;
+    std::vector<DirectX::XMFLOAT4X4> poseGlobals_;
     std::vector<DirectX::XMFLOAT4X4> deathGlobals_;
     std::vector<DirectX::XMFLOAT4X4> bodyLocal_;
     DirectX::XMFLOAT4X4 deathWorld_ = {};
     uint32_t ragdollId_ = UINT32_MAX;
+    int handBone_ = -1;
     bool dead_ = false;
+
+    static bool ContainsNoCase(const std::string& value, const char* needle) {
+        std::string lower = value;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return lower.find(needle) != std::string::npos;
+    }
+
+    void SetPoseOffset(const char* boneName, float pitch, float yaw, float roll) {
+        using namespace DirectX;
+        const int bone = model.skeleton.Find(boneName);
+        if (bone < 0) return;
+        XMStoreFloat4(&gunPoseOffsets_[bone], XMQuaternionRotationRollPitchYaw(
+            XMConvertToRadians(pitch), XMConvertToRadians(yaw), XMConvertToRadians(roll)));
+    }
+
+    void ConfigureGunLayer() {
+        using namespace DirectX;
+        const size_t count = model.skeleton.BoneCount();
+        upperBodyMask_.assign(count, 0.0f);
+        gunPoseOffsets_.assign(count, XMFLOAT4(0, 0, 0, 1));
+        handBone_ = model.skeleton.Find("hand_r");
+
+        int spine = model.skeleton.Find("spine_01");
+        for (size_t bone = 0; bone < count; ++bone) {
+            for (int p = static_cast<int>(bone); p >= 0; p = model.skeleton.parent[p]) {
+                if (p == spine) { upperBodyMask_[bone] = 1.0f; break; }
+            }
+            if (ContainsNoCase(model.skeleton.names[bone], "spine_01")) upperBodyMask_[bone] = 0.35f;
+            if (ContainsNoCase(model.skeleton.names[bone], "spine_02")) upperBodyMask_[bone] = 0.65f;
+        }
+
+        if (const AnimationClip* idle = model.FindClip("Idle")) {
+            upperBodyAnim_.Play(idle);
+            upperBodyAnim_.loop = false;
+        }
+
+        // Rifle-ready additive pose. Only masked upper-body bones receive it.
+        SetPoseOffset("spine_02", -3.0f, 0.0f, 0.0f);
+        SetPoseOffset("spine_03", -4.0f, 0.0f, 0.0f);
+    }
+
+    void ComputePose() {
+        if (upperBodyGunLayer && upperBodyAnim_.clip) {
+            anim.ComputeLayeredPalette(model.skeleton, upperBodyAnim_, upperBodyMask_,
+                                       gunPoseOffsets_, paletteCPU_, &poseGlobals_);
+            ApplyGunIK();
+        } else {
+            anim.ComputePalette(model.skeleton, paletteCPU_);
+            anim.ComputeGlobalMatrices(model.skeleton, poseGlobals_);
+        }
+    }
+
+    DirectX::XMFLOAT3 GunOriginWorld() const {
+        const float sx = std::sin(yaw), cz = std::cos(yaw);
+        return { position.x + cz * 0.12f + sx * 0.10f,
+                 position.y + footOffset + 1.28f,
+                 position.z - sx * 0.12f + cz * 0.10f };
+    }
+
+    bool IsDescendant(int bone, int ancestor) const {
+        for (int p = bone; p >= 0; p = model.skeleton.parent[p])
+            if (p == ancestor) return true;
+        return false;
+    }
+
+    static DirectX::XMMATRIX RotationFromTo(DirectX::FXMVECTOR from,
+                                             DirectX::FXMVECTOR to) {
+        using namespace DirectX;
+        const XMVECTOR a = XMVector3Normalize(from);
+        const XMVECTOR b = XMVector3Normalize(to);
+        const float dot = (std::max)(-1.0f, (std::min)(1.0f,
+            XMVectorGetX(XMVector3Dot(a, b))));
+        if (dot > 0.9999f) return XMMatrixIdentity();
+        XMVECTOR axis = XMVector3Cross(a, b);
+        if (XMVectorGetX(XMVector3LengthSq(axis)) < 1e-6f)
+            axis = XMVectorSet(0, 1, 0, 0);
+        return XMMatrixRotationAxis(XMVector3Normalize(axis), std::acos(dot));
+    }
+
+    void RotateBranch(int root, DirectX::FXMVECTOR pivot,
+                      DirectX::CXMMATRIX rotation) {
+        using namespace DirectX;
+        XMFLOAT3 p; XMStoreFloat3(&p, pivot);
+        const XMMATRIX delta = XMMatrixTranslation(-p.x, -p.y, -p.z) *
+                               rotation * XMMatrixTranslation(p.x, p.y, p.z);
+        for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
+            if (!IsDescendant(static_cast<int>(bone), root)) continue;
+            XMStoreFloat4x4(&poseGlobals_[bone],
+                XMLoadFloat4x4(&poseGlobals_[bone]) * delta);
+        }
+    }
+
+    void SolveArmIK(int upper, int lower, int hand, DirectX::FXMVECTOR target) {
+        using namespace DirectX;
+        if (upper < 0 || lower < 0 || hand < 0) return;
+        auto positionOf = [&](int bone) {
+            return XMLoadFloat4x4(&poseGlobals_[bone]).r[3];
+        };
+        const XMVECTOR shoulder = positionOf(upper);
+        XMVECTOR elbow = positionOf(lower);
+        XMVECTOR handPos = positionOf(hand);
+        const float upperLength = XMVectorGetX(XMVector3Length(elbow - shoulder));
+        const float lowerLength = XMVectorGetX(XMVector3Length(handPos - elbow));
+        XMVECTOR aim = target - shoulder;
+        float distance = XMVectorGetX(XMVector3Length(aim));
+        if (upperLength < 1e-3f || lowerLength < 1e-3f || distance < 1e-3f) return;
+        const XMVECTOR direction = XMVector3Normalize(aim);
+        distance = (std::min)(distance, upperLength + lowerLength - 0.01f);
+        const float along = (upperLength * upperLength - lowerLength * lowerLength +
+                             distance * distance) / (2.0f * distance);
+        const float height = std::sqrt((std::max)(0.0f,
+            upperLength * upperLength - along * along));
+        XMVECTOR bend = (elbow - shoulder) - direction *
+            XMVector3Dot(elbow - shoulder, direction);
+        if (XMVectorGetX(XMVector3LengthSq(bend)) < 1e-5f)
+            bend = XMVector3Cross(direction, XMVectorSet(0, 0, 1, 0));
+        bend = XMVector3Normalize(bend);
+        const XMVECTOR desiredElbow = shoulder + direction * along + bend * height;
+
+        RotateBranch(upper, shoulder,
+            RotationFromTo(elbow - shoulder, desiredElbow - shoulder));
+        elbow = positionOf(lower);
+        handPos = positionOf(hand);
+        RotateBranch(lower, elbow, RotationFromTo(handPos - elbow, target - elbow));
+    }
+
+    void ApplyGunIK() {
+        using namespace DirectX;
+        const int upperR = model.skeleton.Find("upperarm_r");
+        const int lowerR = model.skeleton.Find("lowerarm_r");
+        const int upperL = model.skeleton.Find("upperarm_l");
+        const int lowerL = model.skeleton.Find("lowerarm_l");
+        const int handL = model.skeleton.Find("hand_l");
+        if (handBone_ < 0 || handL < 0) return;
+
+        const XMFLOAT3 origin = GunOriginWorld();
+        const float sx = std::sin(yaw), cz = std::cos(yaw);
+        const XMVECTOR rightGripWorld = XMVectorSet(
+            origin.x + cz * 0.06f, origin.y - 0.03f,
+            origin.z - sx * 0.06f, 1.0f);
+        const XMVECTOR foreGripWorld = XMVectorSet(
+            origin.x - cz * 0.05f + sx * 0.55f, origin.y - 0.02f,
+            origin.z + sx * 0.05f + cz * 0.55f, 1.0f);
+        const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, MeshWorldMatrix());
+        SolveArmIK(upperR, lowerR, handBone_,
+                   XMVector3TransformCoord(rightGripWorld, inverseWorld));
+        SolveArmIK(upperL, lowerL, handL,
+                   XMVector3TransformCoord(foreGripWorld, inverseWorld));
+
+        for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
+            const XMMATRIX skin = XMLoadFloat4x4(&model.skeleton.offset[bone]) *
+                                  XMLoadFloat4x4(&poseGlobals_[bone]);
+            XMStoreFloat4x4(&paletteCPU_[bone], XMMatrixTranspose(skin));
+        }
+    }
 };
