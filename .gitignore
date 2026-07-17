@@ -33,6 +33,15 @@ models/textures/*
 !models/textures/MUZZLE_FLASH_LICENSE.txt
 !models/textures/blood_splat.png
 !models/textures/BLOOD_SPLAT_LICENSE.txt
+!models/textures/fire1_64.png
+!models/textures/FIRE1_64_LICENSE.txt
+!models/Barrel Explosive/
+!models/Barrel Explosive/barrel.FBX
+!models/Barrel Explosive/textures/
+!models/Barrel Explosive/textures/Barrel_Ex_diff.tga
+!models/Barrel Explosive/textures/Barrel_Ex_norm.tga
+!models/Humvee/
+!models/Humvee/humvee.fbx
 !models/audio/
 !models/audio/*
 

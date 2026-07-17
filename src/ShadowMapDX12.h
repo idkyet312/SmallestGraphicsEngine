@@ -293,6 +293,29 @@ public:
             depthShader.NextDrawCall();
         }
 
+        if (g_humveeModel) {
+            DrawSceneNodeShadow(g_humveeModel, depthShader,
+                                HumveeWorldMatrix(), lightSpace);
+        }
+
+        for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+            if (!barrel.active) continue;
+            if (g_explosiveBarrelModel) {
+                const XMMATRIX model = XMMatrixTranslation(
+                    barrel.position.x, barrel.position.y - 0.75f,
+                    barrel.position.z);
+                DrawSceneNodeShadow(g_explosiveBarrelModel, depthShader,
+                                    model, lightSpace);
+            } else {
+                const XMMATRIX model = XMMatrixScaling(1.6f, 1.5f, 1.6f) *
+                    XMMatrixTranslation(barrel.position.x, barrel.position.y,
+                                        barrel.position.z);
+                depthShader.SetMatrices(model, lightSpace);
+                DrawCapsule(geo);
+                depthShader.NextDrawCall();
+            }
+        }
+
         if (bandits) for (const auto& banditOwner : *bandits) {
             SkinnedEnemy* bandit = banditOwner.get();
             if (!bandit || (!bandit->castsShadow && !bandit->Dead()) || !bandit->CanRender())

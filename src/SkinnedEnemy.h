@@ -44,6 +44,7 @@ public:
     float             orbitDirection = 1.0f;
     float             fireCooldown = 1.0f;
     int               spawnSlot = -1;
+    bool              turretGunner = false;
     int               burstShotsRemaining = 0;
 
     bool Init(const SkinnedModel& m) {
@@ -216,6 +217,58 @@ public:
         ComputePose();
     }
 
+    void HoldAt(float dt, const DirectX::XMFLOAT3& holdPosition, float facingYaw) {
+        if (dead_) return;
+        held_ = true;
+        position = holdPosition;
+        yaw = facingYaw;
+        aimYaw = facingYaw;
+        knockbackVelocity_ = { 0.0f, 0.0f, 0.0f };
+        preparingShot_ = false;
+        stationaryAimTime_ = 0.0f;
+        burstShotsRemaining = 0;
+        navigationPath_.clear();
+        PlayClip("Idle");
+        anim.Advance(dt * 0.35f);
+        ComputePose();
+    }
+
+    void UpdateMounted(float dt, const DirectX::XMFLOAT3& mountPosition,
+                       const DirectX::XMFLOAT3& target) {
+        if (dead_) return;
+        position = mountPosition;
+        knockbackVelocity_ = { 0.0f, 0.0f, 0.0f };
+        const float dx = target.x - position.x;
+        const float dz = target.z - position.z;
+        if (dx*dx + dz*dz > 0.01f) {
+            aimYaw = std::atan2(dx, dz);
+            yaw = aimYaw;
+        }
+        if (preparingShot_) stationaryAimTime_ += dt;
+        navigationPath_.clear();
+        PlayClip("Idle");
+        anim.Advance(dt);
+        ComputePose();
+    }
+
+    void SetHeld(bool held) {
+        if (dead_) return;
+        held_ = held;
+        preparingShot_ = false;
+        stationaryAimTime_ = 0.0f;
+        burstShotsRemaining = 0;
+    }
+
+    bool Held() const { return held_ && !dead_; }
+
+    bool Throw(const DirectX::XMFLOAT3& direction, float strength = 16.0f) {
+        if (dead_ || !held_) return false;
+        const DirectX::XMFLOAT3 impact = {
+            position.x, position.y + footOffset + 1.15f, position.z };
+        Kill(direction, impact, strength, true);
+        return true;
+    }
+
     bool HasGunPose() const {
         return upperBodyGunLayer && !dead_ && handBone_ >= 0 &&
                static_cast<size_t>(handBone_) < poseGlobals_.size();
@@ -231,7 +284,8 @@ public:
     }
 
     bool NeedsLineOfSightCheck() const {
-        if (dead_ || !visible || !HasGunPose()) return false;
+        if (dead_ || held_ || !visible || !HasGunPose()) return false;
+        if (turretGunner) return true;
         if (burstShotsRemaining > 0)
             return fireCooldown <= 0.0f;
         return fireCooldown <= 0.0f &&
@@ -242,25 +296,52 @@ public:
                    bool hasLineOfSight,
                    DirectX::XMFLOAT3& origin, DirectX::XMFLOAT3& direction) {
         using namespace DirectX;
-        if (dead_ || !visible || !HasGunPose()) return false;
+        if (dead_ || held_ || !visible || !HasGunPose()) return false;
         fireCooldown -= dt;
-        if (!hasLineOfSight) {
-            burstShotsRemaining = 0;
-            preparingShot_ = false;
-            stationaryAimTime_ = 0.0f;
-            return false;
-        }
-        if (burstShotsRemaining <= 0) {
+        if (turretGunner) {
+            if (!hasLineOfSight) {
+                if (!mountedFiring_) {
+                    mountedSightTime_ = 0.0f;
+                    mountedLostSightTime_ = 0.0f;
+                    fireCooldown = 0.0f;
+                    return false;
+                }
+                mountedLostSightTime_ += dt;
+                if (mountedLostSightTime_ >= 3.0f) {
+                    mountedSightTime_ = 0.0f;
+                    mountedLostSightTime_ = 0.0f;
+                    mountedFiring_ = false;
+                    fireCooldown = 0.0f;
+                    return false;
+                }
+            } else {
+                mountedLostSightTime_ = 0.0f;
+                if (mountedSightTime_ <= 0.0f)
+                    spottedEventPending_ = true;
+                mountedSightTime_ += dt;
+                if (mountedSightTime_ < 2.0f)
+                    return false;
+            }
             if (fireCooldown > 0.0f) return false;
-            if (!preparingShot_) {
-                preparingShot_ = true;
+        } else {
+            if (!hasLineOfSight) {
+                burstShotsRemaining = 0;
+                preparingShot_ = false;
                 stationaryAimTime_ = 0.0f;
-                spottedEventPending_ = true;
                 return false;
             }
-            if (stationaryAimTime_ < 2.0f) return false;
-        } else if (fireCooldown > 0.0f) {
-            return false;
+            if (burstShotsRemaining <= 0) {
+                if (fireCooldown > 0.0f) return false;
+                if (!preparingShot_) {
+                    preparingShot_ = true;
+                    stationaryAimTime_ = 0.0f;
+                    spottedEventPending_ = true;
+                    return false;
+                }
+                if (stationaryAimTime_ < 2.0f) return false;
+            } else if (fireCooldown > 0.0f) {
+                return false;
+            }
         }
 
         origin = AimRayOrigin();
@@ -276,6 +357,15 @@ public:
                            randomSigned() * 0.012f,
                            randomSigned() * 0.018f, 0.0f);
         XMStoreFloat3(&direction, XMVector3Normalize(aim));
+
+        if (turretGunner) {
+            if (!mountedFiring_) {
+                mountedFiring_ = true;
+                attackEventPending_ = true;
+            }
+            fireCooldown = 0.12f;
+            return true;
+        }
 
         if (burstShotsRemaining <= 0) {
             burstShotsRemaining = 2 + std::rand() % 4;
@@ -355,40 +445,61 @@ public:
 
     bool Shoot(const DirectX::XMFLOAT3& start, const DirectX::XMFLOAT3& end,
                const DirectX::XMFLOAT3& direction, float radius,
-               DirectX::XMFLOAT3* hitPoint = nullptr) {
+               DirectX::XMFLOAT3* hitPoint = nullptr,
+               bool* headshot = nullptr) {
         if (dead_ || !visible) return false;
         DirectX::XMFLOAT3 impact;
-        if (!BlocksProjectile(start, end, radius, &impact)) return false;
+        bool hitHead = false;
+        if (!BlocksProjectile(start, end, radius, &impact, &hitHead)) return false;
         if (hitPoint) *hitPoint = impact;
-        health -= 34.0f;
+        if (headshot) *headshot = hitHead;
+        health -= hitHead ? health : 34.0f;
         if (health <= 0.0f) Kill(direction, impact);
         return true;
     }
 
     bool BlocksProjectile(const DirectX::XMFLOAT3& start,
                           const DirectX::XMFLOAT3& end, float radius,
-                          DirectX::XMFLOAT3* hitPoint = nullptr) const {
+                          DirectX::XMFLOAT3* hitPoint = nullptr,
+                          bool* headshot = nullptr) const {
         using namespace DirectX;
         if (dead_ || !visible) return false;
         const XMVECTOR a = XMLoadFloat3(&start), b = XMLoadFloat3(&end);
-        const XMVECTOR center = XMVectorSet(position.x, position.y + footOffset + 1.0f,
-                                            position.z, 0.0f);
         const XMVECTOR ab = b - a;
         const float lengthSq = XMVectorGetX(XMVector3LengthSq(ab));
-        float t = lengthSq > 1e-6f
-            ? XMVectorGetX(XMVector3Dot(center - a, ab)) / lengthSq : 0.0f;
-        t = (std::max)(0.0f, (std::min)(1.0f, t));
-        const float hitRadius = 0.72f + radius;
-        const XMVECTOR closest = a + ab * t;
-        if (XMVectorGetX(XMVector3LengthSq(closest - center)) > hitRadius*hitRadius) return false;
-        if (hitPoint) XMStoreFloat3(hitPoint, closest);
-        return true;
+        auto hitSphere = [&](const XMVECTOR center, float sphereRadius,
+                             XMFLOAT3* impact) {
+            float t = lengthSq > 1e-6f
+                ? XMVectorGetX(XMVector3Dot(center - a, ab)) / lengthSq : 0.0f;
+            t = (std::max)(0.0f, (std::min)(1.0f, t));
+            const XMVECTOR closest = a + ab * t;
+            const float hitRadius = sphereRadius + radius;
+            if (XMVectorGetX(XMVector3LengthSq(closest - center)) >
+                hitRadius * hitRadius) return false;
+            if (impact) XMStoreFloat3(impact, closest);
+            return true;
+        };
+
+        if (headshot) *headshot = false;
+        if (headBone_ >= 0 && static_cast<size_t>(headBone_) < poseGlobals_.size()) {
+            XMVECTOR head = XMVector3TransformCoord(
+                XMVectorZero(), XMLoadFloat4x4(&poseGlobals_[headBone_]) * WorldMatrix());
+            head += XMVectorSet(0.0f, 0.12f, 0.0f, 0.0f);
+            if (hitSphere(head, 0.24f, hitPoint)) {
+                if (headshot) *headshot = true;
+                return true;
+            }
+        }
+
+        const XMVECTOR body = XMVectorSet(
+            position.x, position.y + footOffset + 1.0f, position.z, 0.0f);
+        return hitSphere(body, 0.72f, hitPoint);
     }
 
     bool ApplyExplosion(const DirectX::XMFLOAT3& center, float radius,
                         float damage, float pushSpeed) {
         using namespace DirectX;
-        if (dead_ || !visible || radius <= 0.0f) return false;
+        if (dead_ || held_ || !visible || radius <= 0.0f) return false;
         const XMVECTOR blast = XMLoadFloat3(&center);
         const XMVECTOR body = XMVectorSet(
             position.x, position.y + footOffset + 1.0f, position.z, 0.0f);
@@ -426,7 +537,7 @@ public:
     bool ApplyDebrisImpact(const DestructionDebrisHazard& debris,
                            DirectX::XMFLOAT3* hitPoint = nullptr) {
         using namespace DirectX;
-        if (dead_ || !visible || debrisHitCooldown_ > 0.0f) return false;
+        if (dead_ || held_ || !visible || debrisHitCooldown_ > 0.0f) return false;
 
         const float bodyBottom = position.y + footOffset + 0.10f;
         const float bodyTop = bodyBottom + 1.85f;
@@ -458,8 +569,10 @@ public:
             closestZ);
         if (hitPoint) *hitPoint = impact;
 
-        const float damage = (std::min)(80.0f, (std::max)(8.0f,
-            (speed - 2.5f) * 7.0f + std::sqrt((std::max)(0.05f, debris.mass)) * 3.0f));
+        const float damage = debris.lethalImpact ? health :
+            (std::min)(80.0f, (std::max)(8.0f,
+                (speed - 2.5f) * 7.0f +
+                std::sqrt((std::max)(0.05f, debris.mass)) * 3.0f));
         health -= damage;
         debrisHitCooldown_ = 0.45f;
         if (health <= 0.0f) {
@@ -548,9 +661,12 @@ public:
 
 private:
     void Kill(const DirectX::XMFLOAT3& impulseDirection,
-              const DirectX::XMFLOAT3& impactPosition) {
+              const DirectX::XMFLOAT3& impactPosition,
+              float impulseMultiplier = 1.0f,
+              bool lethalImpact = false) {
         using namespace DirectX;
         dead_ = true;
+        held_ = false;
         deathEventPending_ = true;
         std::vector<XMFLOAT4X4> globals = poseGlobals_;
         if (globals.empty()) anim.ComputeGlobalMatrices(model.skeleton, globals);
@@ -576,7 +692,8 @@ private:
             bodies.push_back(body);
         }
         ragdollId_ = g_destruction.SpawnAuthoredRagdoll(
-            bodies, model.ragdoll.constraints, impulseDirection, impactPosition);
+            bodies, model.ragdoll.constraints, impulseDirection, impactPosition,
+            impulseMultiplier, lethalImpact);
     }
 
     Microsoft::WRL::ComPtr<ID3D12Resource> palette_[FRAME_COUNT];
@@ -592,6 +709,8 @@ private:
     DirectX::XMFLOAT4X4 deathWorld_ = {};
     DirectX::XMFLOAT3 knockbackVelocity_{ 0.0f, 0.0f, 0.0f };
     float stationaryAimTime_ = 0.0f;
+    float mountedSightTime_ = 0.0f;
+    float mountedLostSightTime_ = 0.0f;
     float debrisHitCooldown_ = 0.0f;
     std::vector<DirectX::XMFLOAT3> navigationPath_;
     size_t navigationWaypoint_ = 0;
@@ -603,7 +722,10 @@ private:
     bool deathEventPending_ = false;
     uint32_t ragdollId_ = UINT32_MAX;
     int handBone_ = -1;
+    int headBone_ = -1;
     bool dead_ = false;
+    bool held_ = false;
+    bool mountedFiring_ = false;
 
     static bool ContainsNoCase(const std::string& value, const char* needle) {
         std::string lower = value;
@@ -626,6 +748,16 @@ private:
         upperBodyMask_.assign(count, 0.0f);
         gunPoseOffsets_.assign(count, XMFLOAT4(0, 0, 0, 1));
         handBone_ = model.skeleton.Find("hand_r");
+        headBone_ = model.skeleton.Find("head");
+        if (headBone_ < 0) {
+            for (size_t bone = 0; bone < count; ++bone) {
+                if (ContainsNoCase(model.skeleton.names[bone], "head") &&
+                    !ContainsNoCase(model.skeleton.names[bone], "end")) {
+                    headBone_ = static_cast<int>(bone);
+                    break;
+                }
+            }
+        }
 
         int spine = model.skeleton.Find("spine_01");
         for (size_t bone = 0; bone < count; ++bone) {

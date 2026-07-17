@@ -264,6 +264,7 @@ struct DestructionDX12::Impl {
         bool wasSubmerged = false;   // for splash-on-entry detection
         uint32_t authoredId = InvalidIndex;
         std::string authoredBone;
+        bool lethalHazard = false;
     };
     std::vector<RagdollPart> ragdollParts;
     std::vector<RagdollRenderItem> ragdollRenderItems;
@@ -300,6 +301,12 @@ struct DestructionDX12::Impl {
     TkGroup* group = nullptr;
     b3WorldId world = b3_nullWorldId;
     b3BodyId ground = b3_nullBodyId;
+    b3HeightFieldData* terrainHeightField = nullptr;
+    b3BodyId vehicleChassis = b3_nullBodyId;
+    std::array<b3BodyId, 4> vehicleWheels = {
+        b3_nullBodyId, b3_nullBodyId, b3_nullBodyId, b3_nullBodyId };
+    std::array<b3JointId, 4> vehicleJoints = {
+        b3_nullJointId, b3_nullJointId, b3_nullJointId, b3_nullJointId };
     // Optional terrain-height sampler. When set, the ground is a static
     // heightfield matching the drawn terrain, so debris rests on the real hills
     // and rolls into the basin instead of hovering on a flat plane.
@@ -949,13 +956,16 @@ struct DestructionDX12::Impl {
         return true;
     }
 
-    // (Re)build the static ground collider. With a terrain sampler, lay down a
-    // grid of static boxes whose tops follow the drawn terrain (hills + pool
-    // basin) so debris collides with real ground. Without one, a single flat
-    // plane. Called at build time and again whenever the sampler is set.
+    // (Re)build the static ground collider. The native Box3D height field uses
+    // continuous triangles rather than stair-step columns, which lets vehicle
+    // suspension follow the rendered hills without catching every grid edge.
     void BuildGround() {
         if (B3_IS_NULL(world)) return;
         if (!B3_IS_NULL(ground)) { b3DestroyBody(ground); ground = b3_nullBodyId; }
+        if (terrainHeightField) {
+            b3DestroyHeightField(terrainHeightField);
+            terrainHeightField = nullptr;
+        }
 
         auto addStaticBox = [&](float px, float py, float pz, float ex, float ey, float ez) {
             b3BodyDef bd = b3DefaultBodyDef();
@@ -970,27 +980,37 @@ struct DestructionDX12::Impl {
         };
 
         if (terrainSampler) {
-            // Heightfield: cover the play area with a grid of columns sunk deep
-            // below their terrain-height tops. `ground` keeps the first column so
-            // Shutdown/rebuild can destroy the set (the rest leak until world
-            // teardown, which is fine -- they are static and never rebuilt mid-run
-            // except via this method, which recreates the world's ground wholesale
-            // only through the single `ground` handle at init).
-            constexpr float extent = 60.0f;    // half-size of the covered area
-            constexpr int   cells = 60;        // resolution -> 2m columns
-            constexpr float thick = 30.0f;     // column half-height (buries base)
-            const float cell = (extent * 2.0f) / cells;
-            const float x0 = -extent + cell * 0.5f;
-            const float z0 = -extent + cell * 0.5f;
-            for (int gz = 0; gz < cells; ++gz)
-            for (int gx = 0; gx < cells; ++gx) {
-                const float px = x0 + gx * cell;
-                const float pz = z0 + gz * cell;
-                const float gy = terrainSampler(px, pz);       // ground surface here
-                b3BodyId col = addStaticBox(px, gy - thick, pz,
-                                            cell * 0.5f + 0.02f, thick, cell * 0.5f + 0.02f);
-                if (gx == 0 && gz == 0) ground = col;
+            constexpr float extent = 60.0f;
+            constexpr float cell = 0.5f;
+            constexpr int points = static_cast<int>(extent * 2.0f / cell) + 1;
+            std::vector<float> heights(static_cast<size_t>(points) * points);
+            float minimumHeight = FLT_MAX;
+            float maximumHeight = -FLT_MAX;
+            for (int z = 0; z < points; ++z)
+            for (int x = 0; x < points; ++x) {
+                const float height = terrainSampler(
+                    -extent + x * cell, -extent + z * cell);
+                heights[static_cast<size_t>(z) * points + x] = height;
+                minimumHeight = (std::min)(minimumHeight, height);
+                maximumHeight = (std::max)(maximumHeight, height);
             }
+
+            b3HeightFieldDef heightFieldDef = {};
+            heightFieldDef.heights = heights.data();
+            heightFieldDef.scale = { cell, 1.0f, cell };
+            heightFieldDef.countX = points;
+            heightFieldDef.countZ = points;
+            heightFieldDef.globalMinimumHeight = minimumHeight - 0.05f;
+            heightFieldDef.globalMaximumHeight = maximumHeight + 0.05f;
+            terrainHeightField = b3CreateHeightField(&heightFieldDef);
+
+            b3BodyDef bodyDef = b3DefaultBodyDef();
+            bodyDef.position = { -extent, 0.0f, -extent };
+            ground = b3CreateBody(world, &bodyDef);
+            b3ShapeDef shapeDef = b3DefaultShapeDef();
+            shapeDef.baseMaterial.friction = 1.15f;
+            shapeDef.enableHitEvents = true;
+            b3CreateHeightFieldShape(ground, &shapeDef, terrainHeightField);
         } else {
             ground = addStaticBox(0.0f, -0.5f, 0.0f, 60.0f, 0.5f, 60.0f);
         }
@@ -1402,6 +1422,10 @@ void DestructionDX12::Shutdown() {
     if (!m) return;
     if (!B3_IS_NULL(m->world)) b3DestroyWorld(m->world);
     m->world = b3_nullWorldId;
+    if (m->terrainHeightField) {
+        b3DestroyHeightField(m->terrainHeightField);
+        m->terrainHeightField = nullptr;
+    }
     if (m->family) {
         m->family->removeListener(*this);
         const uint32_t count = m->family->getActorCount();
@@ -1425,6 +1449,139 @@ void DestructionDX12::Reset() {
     auto source = m->source; ID3D12Device* device = m->device;
     const int x = m->gridX, y = m->gridY, z = m->gridZ;
     Initialize(source, device, x, y, z);
+}
+
+bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter) {
+    if (!m || !m->initialized || B3_IS_NULL(m->world) ||
+        !B3_IS_NULL(m->vehicleChassis)) return false;
+
+    b3BodyDef chassisDef = b3DefaultBodyDef();
+    chassisDef.type = b3_dynamicBody;
+    chassisDef.position = {
+        chassisCenter.x, chassisCenter.y, chassisCenter.z };
+    chassisDef.linearDamping = 0.12f;
+    chassisDef.angularDamping = 0.65f;
+    m->vehicleChassis = b3CreateBody(m->world, &chassisDef);
+    b3ShapeDef chassisShape = b3DefaultShapeDef();
+    chassisShape.density = 110.0f;
+    chassisShape.baseMaterial.friction = 0.75f;
+    chassisShape.baseMaterial.restitution = 0.02f;
+    chassisShape.enableHitEvents = true;
+    b3BoxHull chassisHull = b3MakeBoxHull(2.20f, 0.55f, 1.0f);
+    b3CreateHullShape(m->vehicleChassis, &chassisShape, &chassisHull.base);
+
+    // A soft parallel constraint resists catastrophic rollovers while still
+    // allowing pitch/roll from suspension and terrain.
+    if (!B3_IS_NULL(m->ground)) {
+        b3ParallelJointDef upright = b3DefaultParallelJointDef();
+        upright.base.bodyIdA = m->ground;
+        upright.base.bodyIdB = m->vehicleChassis;
+        upright.base.localFrameA.q =
+            b3ComputeQuatBetweenUnitVectors(b3Vec3_axisZ, b3Vec3_axisY);
+        upright.base.localFrameB.q =
+            b3ComputeQuatBetweenUnitVectors(b3Vec3_axisZ, b3Vec3_axisY);
+        upright.base.collideConnected = true;
+        upright.hertz = 0.65f;
+        upright.dampingRatio = 1.0f;
+        b3CreateParallelJoint(m->world, &upright);
+    }
+
+    b3BodyDef wheelBodyDef = b3DefaultBodyDef();
+    wheelBodyDef.type = b3_dynamicBody;
+    wheelBodyDef.allowFastRotation = true;
+    wheelBodyDef.rotation =
+        b3ComputeQuatBetweenUnitVectors(b3Vec3_axisY, b3Vec3_axisZ);
+    b3ShapeDef wheelShape = b3DefaultShapeDef();
+    wheelShape.density = 65.0f;
+    wheelShape.baseMaterial.friction = 4.0f;
+    wheelShape.baseMaterial.restitution = 0.01f;
+    b3Sphere wheelSphere = { b3Vec3_zero, 0.48f };
+
+    b3WheelJointDef joint = b3DefaultWheelJointDef();
+    joint.base.bodyIdA = m->vehicleChassis;
+    joint.base.localFrameA.q =
+        b3ComputeQuatBetweenUnitVectors(b3Vec3_axisX, b3Vec3_axisY);
+    joint.base.localFrameB.q =
+        b3ComputeQuatBetweenUnitVectors(b3Vec3_axisZ, b3Vec3_axisY);
+    joint.enableSuspensionLimit = true;
+    joint.lowerSuspensionLimit = -0.34f;
+    joint.upperSuspensionLimit = 0.28f;
+    joint.enableSuspensionSpring = true;
+    joint.suspensionHertz = 3.2f;
+    joint.suspensionDampingRatio = 0.92f;
+    joint.steeringHertz = 4.0f;
+    joint.steeringDampingRatio = 0.9f;
+    joint.maxSteeringTorque = 850.0f;
+    joint.enableSteeringLimit = true;
+    joint.lowerSteeringLimit = -0.58f;
+    joint.upperSteeringLimit = 0.58f;
+
+    const XMFLOAT3 wheelOffsets[4] = {
+        { 1.55f, -0.58f,  0.92f }, { 1.55f, -0.58f, -0.92f },
+        {-1.55f, -0.58f,  0.92f }, {-1.55f, -0.58f, -0.92f },
+    };
+    for (size_t i = 0; i < m->vehicleWheels.size(); ++i) {
+        const XMFLOAT3& offset = wheelOffsets[i];
+        wheelBodyDef.position = {
+            chassisCenter.x + offset.x,
+            chassisCenter.y + offset.y,
+            chassisCenter.z + offset.z };
+        m->vehicleWheels[i] = b3CreateBody(m->world, &wheelBodyDef);
+        b3CreateSphereShape(m->vehicleWheels[i], &wheelShape, &wheelSphere);
+        joint.base.bodyIdB = m->vehicleWheels[i];
+        joint.base.localFrameA.p = { offset.x, offset.y, offset.z };
+        joint.enableSteering = i < 2;
+        joint.enableSpinMotor = true;
+        joint.maxSpinTorque = 520.0f;
+        joint.spinSpeed = 0.0f;
+        joint.targetSteeringAngle = 0.0f;
+        m->vehicleJoints[i] = b3CreateWheelJoint(m->world, &joint);
+    }
+    return true;
+}
+
+void DestructionDX12::SetVehicleInput(float throttle, float steering, bool brake) {
+    if (!VehicleReady()) return;
+    throttle = (std::max)(-1.0f, (std::min)(1.0f, throttle));
+    steering = (std::max)(-1.0f, (std::min)(1.0f, steering));
+    b3Body_SetAwake(m->vehicleChassis, true);
+
+    const float steeringAngle = steering * 0.42f;
+    for (size_t i = 0; i < 4; ++i) {
+        if (i < 2)
+            b3WheelJoint_SetTargetSteeringAngle(m->vehicleJoints[i], steeringAngle);
+        b3WheelJoint_EnableSpinMotor(m->vehicleJoints[i], true);
+        b3WheelJoint_SetSpinMotorSpeed(
+            m->vehicleJoints[i], brake ? 0.0f : 20.0f * throttle);
+        const float torque = brake ? 1400.0f :
+            (std::abs(throttle) > 0.01f ? 520.0f : 95.0f);
+        b3WheelJoint_SetMaxSpinTorque(m->vehicleJoints[i], torque);
+    }
+}
+
+bool DestructionDX12::GetVehicleTransform(XMFLOAT4X4& transform,
+                                          XMFLOAT3* position,
+                                          XMFLOAT3* forward,
+                                          XMFLOAT3* linearVelocity) const {
+    if (!VehicleReady()) return false;
+    const XMMATRIX world = BoxTransform(m->vehicleChassis, { 0.0f, 0.0f, 0.0f });
+    XMStoreFloat4x4(&transform, world);
+    const b3Pos p = b3Body_GetPosition(m->vehicleChassis);
+    if (position) *position = { (float)p.x, (float)p.y, (float)p.z };
+    if (forward) {
+        XMVECTOR direction = XMVector3Normalize(XMVector3TransformNormal(
+            XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f), world));
+        XMStoreFloat3(forward, direction);
+    }
+    if (linearVelocity) {
+        const b3Vec3 velocity = b3Body_GetLinearVelocity(m->vehicleChassis);
+        *linearVelocity = { velocity.x, velocity.y, velocity.z };
+    }
+    return true;
+}
+
+bool DestructionDX12::VehicleReady() const {
+    return m && m->initialized && !B3_IS_NULL(m->vehicleChassis);
 }
 
 void DestructionDX12::Update(float dt) {
@@ -1491,7 +1648,9 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
     const std::vector<AuthoredRagdollBody>& bodies,
     const std::vector<RagdollConstraintSpec>& constraints,
     const XMFLOAT3& impulseDirection,
-    const XMFLOAT3& impactPosition) {
+    const XMFLOAT3& impactPosition,
+    float impulseMultiplier,
+    bool lethalImpact) {
     if (!m || !m->initialized || B3_IS_NULL(m->world) || bodies.empty()) return InvalidIndex;
     const uint32_t ragdollId = m->nextAuthoredRagdollId++;
     const size_t base = m->ragdollParts.size();
@@ -1531,7 +1690,7 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
             b3CreateHullShape(body, &sd, &box.base);
         }
         m->ragdollParts.push_back({ body, src.halfExtent, cloth, src.shape,
-                                    false, ragdollId, src.name });
+                                    false, ragdollId, src.name, lethalImpact });
         indices[src.name] = i;
     }
     Impl::AuthoredRagdollRuntime runtime;
@@ -1590,11 +1749,15 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
         const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
         const float localReaction = (i == nearest) ? 2.8f :
             0.85f * (std::max)(0.0f, 1.0f - distance / 0.9f);
-        const float impulseScale = 0.22f + (core ? 0.28f : 0.0f) + localReaction;
+        const float impulseScale =
+            (0.22f + (core ? 0.28f : 0.0f) + localReaction) *
+            (std::max)(0.0f, impulseMultiplier);
         XMFLOAT3 impulse;
         XMStoreFloat3(&impulse, dir * (mass * impulseScale));
         const b3Vec3 hitImpulse = {
-            impulse.x, impulse.y + mass * (core ? 0.14f : 0.04f), impulse.z };
+            impulse.x,
+            impulse.y + mass * (core ? 0.14f : 0.04f) * impulseMultiplier,
+            impulse.z };
         if (i == nearest) {
             b3Body_ApplyLinearImpulse(body, hitImpulse,
                 { impactPosition.x, impactPosition.y, impactPosition.z }, true);
@@ -2058,6 +2221,50 @@ std::vector<DestructionDebrisHazard> DestructionDX12::GetDangerousDebris(
             hazards.push_back({ worldMin, worldMax, center,
                 { velocity.x, velocity.y, velocity.z }, chunkMass });
         }
+    }
+
+    // Thrown authored ragdolls become gameplay hazards too. Their real Box3D
+    // velocity, mass, orientation, and extents feed the same enemy-impact path
+    // as destructible chunks, so a corpse can bowl another enemy over or kill it.
+    for (const Impl::RagdollPart& part : m->ragdollParts) {
+        if (part.authoredId == InvalidIndex || B3_IS_NULL(part.body) ||
+            !b3Body_IsAwake(part.body)) continue;
+        const b3Pos bodyPosition = b3Body_GetPosition(part.body);
+        const b3Vec3 velocity = b3Body_GetWorldPointVelocity(
+            part.body, bodyPosition);
+        const float speedSq = velocity.x * velocity.x +
+                              velocity.y * velocity.y +
+                              velocity.z * velocity.z;
+        if (speedSq < minimumSpeedSq) continue;
+
+        const XMMATRIX transform = BoxTransform(part.body, { 0.0f, 0.0f, 0.0f });
+        const XMFLOAT3 half = {
+            (std::max)(0.08f, part.half.x),
+            (std::max)(0.08f, part.half.y),
+            (std::max)(0.08f, part.half.z) };
+        XMFLOAT3 worldMin(FLT_MAX, FLT_MAX, FLT_MAX);
+        XMFLOAT3 worldMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        for (float x : { -half.x, half.x })
+        for (float y : { -half.y, half.y })
+        for (float z : { -half.z, half.z }) {
+            XMFLOAT3 point;
+            XMStoreFloat3(&point, XMVector3TransformCoord(
+                XMVectorSet(x, y, z, 1.0f), transform));
+            worldMin.x = (std::min)(worldMin.x, point.x);
+            worldMin.y = (std::min)(worldMin.y, point.y);
+            worldMin.z = (std::min)(worldMin.z, point.z);
+            worldMax.x = (std::max)(worldMax.x, point.x);
+            worldMax.y = (std::max)(worldMax.y, point.y);
+            worldMax.z = (std::max)(worldMax.z, point.z);
+        }
+        const XMFLOAT3 center = {
+            static_cast<float>(bodyPosition.x),
+            static_cast<float>(bodyPosition.y),
+            static_cast<float>(bodyPosition.z) };
+        hazards.push_back({ worldMin, worldMax, center,
+            { velocity.x, velocity.y, velocity.z },
+            (std::max)(0.05f, b3Body_GetMass(part.body)),
+            part.lethalHazard });
     }
     return hazards;
 }

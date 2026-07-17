@@ -20,6 +20,7 @@ struct DestructionDebrisHazard {
     DirectX::XMFLOAT3 worldCenter;
     DirectX::XMFLOAT3 velocity;
     float mass = 0.0f;
+    bool lethalImpact = false;
 };
 
 struct RagdollRenderItem {
@@ -89,12 +90,21 @@ public:
     void Shutdown();
     void Reset();
     void Update(float dt);
+    bool InitializeVehicle(const DirectX::XMFLOAT3& chassisCenter);
+    void SetVehicleInput(float throttle, float steering, bool brake);
+    bool GetVehicleTransform(DirectX::XMFLOAT4X4& transform,
+                             DirectX::XMFLOAT3* position = nullptr,
+                             DirectX::XMFLOAT3* forward = nullptr,
+                             DirectX::XMFLOAT3* linearVelocity = nullptr) const;
+    bool VehicleReady() const;
     void SetEnemyTarget(const DirectX::XMFLOAT3& target);
     std::vector<EnemyShot> DrainEnemyShots();
     uint32_t SpawnAuthoredRagdoll(const std::vector<AuthoredRagdollBody>& bodies,
                                   const std::vector<RagdollConstraintSpec>& constraints,
                                   const DirectX::XMFLOAT3& impulseDirection,
-                                  const DirectX::XMFLOAT3& impactPosition);
+                                  const DirectX::XMFLOAT3& impactPosition,
+                                  float impulseMultiplier = 1.0f,
+                                  bool lethalImpact = false);
     bool GetAuthoredRagdollPose(uint32_t ragdollId,
                                std::vector<AuthoredRagdollPose>& pose) const;
     bool HitTest(const DirectX::XMFLOAT3& worldPosition, float radius,
@@ -133,8 +143,8 @@ public:
     // Take and clear the world positions where the building fractured pieces
     // loose since the last call, so the caller can spawn smoke at each break.
     std::vector<DirectX::XMFLOAT3> DrainBreakPoints();
-    // Snapshot of awake, fast-moving destructible chunks. Used by gameplay to
-    // make physical debris strike characters without coupling physics to AI.
+    // Snapshot of awake, fast-moving destructible chunks and authored ragdoll
+    // limbs. Used by gameplay to make physical bodies strike characters.
     std::vector<DestructionDebrisHazard> GetDangerousDebris(
         float minimumSpeed = 2.5f) const;
 

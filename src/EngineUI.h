@@ -216,7 +216,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::Text("Controls:");
     ImGui::BulletText("TAB: Toggle UI");
     ImGui::BulletText("C: Lock/Unlock Camera");
-    ImGui::BulletText("F: Toggle FPS Walking Mode");
+    ImGui::BulletText("F: Grab / throw enemy");
+    ImGui::BulletText("E: Enter / exit Humvee");
+    ImGui::BulletText("Humvee: W/S camera-relative drive, Space brake");
+    ImGui::BulletText("Humvee mouse: Orbit camera / aim turret");
+    ImGui::BulletText("Humvee LMB: Fire turret");
+    ImGui::BulletText("V: Toggle FPS Walking Mode");
     ImGui::BulletText("Z: Meshlet Wireframe");
     ImGui::BulletText("Left Click: Lock camera / Shoot");
     ImGui::Separator();
