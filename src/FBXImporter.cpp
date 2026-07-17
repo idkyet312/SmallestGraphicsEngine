@@ -37,7 +37,7 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
         std::string rawPath = texturePath.C_Str();
         std::replace(rawPath.begin(), rawPath.end(), '\\', '/');
         fs::path path(rawPath);
-        if (path.is_absolute())
+        if (path.is_absolute() && fs::exists(path))
             return GLBImporter::LoadTextureFromFile(path.string(), device, commandList, uploads);
         // FBX files commonly store Windows separators even on other import paths.
         path = base / fs::path(path.generic_string());
@@ -67,6 +67,10 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
         auto mat = std::make_shared<SceneMaterial>();
         if (loadMaterials && src->mMaterialIndex < scene->mNumMaterials) {
             const aiMaterial* am = scene->mMaterials[src->mMaterialIndex];
+            aiColor4D diffuse;
+            if (aiGetMaterialColor(am, AI_MATKEY_COLOR_DIFFUSE, &diffuse) == AI_SUCCESS)
+                mat->baseColorFactor = XMFLOAT4(
+                    diffuse.r, diffuse.g, diffuse.b, diffuse.a);
             aiString tex;
             const bool hasBaseColor =
                 (am->GetTexture(aiTextureType_BASE_COLOR, 0, &tex) == AI_SUCCESS && tex.length) ||
@@ -107,6 +111,65 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
         // plank fragments is only appropriate for destructible house assets.
         if (!splitIntoDestructibleBoards) {
             p.materialIndex = (int)src->mMaterialIndex;
+            // Humvee source is flattened into three meshes. Extract the upper
+            // centre gun assembly from Body mesh into a pivoted child so runtime
+            // turret yaw does not rotate the hull, wheels, or rear antenna.
+            if (filepath.find("Humvee") != std::string::npos &&
+                std::string(src->mName.C_Str()) == "Mesh.005") {
+                constexpr float pivotX = 0.0f;
+                constexpr float pivotY = 622.0f;
+                constexpr float pivotZ = 82.0f;
+                MeshPrimitive turret;
+                turret.material = p.material;
+                turret.materialIndex = p.materialIndex;
+                std::unordered_map<UINT, UINT> remap;
+                std::vector<UINT> hullIndices;
+                hullIndices.reserve(p.indices.size());
+                for (size_t tri = 0; tri + 2 < p.indices.size(); tri += 3) {
+                    float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+                    for (int corner = 0; corner < 3; ++corner) {
+                        const size_t vertex = static_cast<size_t>(p.indices[tri + corner]) * 12;
+                        cx += p.vertices[vertex];
+                        cy += p.vertices[vertex + 1];
+                        cz += p.vertices[vertex + 2];
+                    }
+                    cx /= 3.0f; cy /= 3.0f; cz /= 3.0f;
+                    const bool turretTriangle =
+                        cy > 600.0f * uniformScale &&
+                        std::abs(cx) < 150.0f * uniformScale &&
+                        cz > -50.0f * uniformScale && cz < 460.0f * uniformScale;
+                    if (!turretTriangle) {
+                        hullIndices.insert(hullIndices.end(),
+                            p.indices.begin() + tri, p.indices.begin() + tri + 3);
+                        continue;
+                    }
+                    for (int corner = 0; corner < 3; ++corner) {
+                        const UINT oldIndex = p.indices[tri + corner];
+                        auto [entry, inserted] = remap.emplace(
+                            oldIndex, static_cast<UINT>(turret.vertices.size() / 12));
+                        if (inserted) {
+                            const float* source = &p.vertices[static_cast<size_t>(oldIndex) * 12];
+                            turret.vertices.insert(turret.vertices.end(), source, source + 12);
+                            const size_t base = turret.vertices.size() - 12;
+                            turret.vertices[base] -= pivotX * uniformScale;
+                            turret.vertices[base + 1] -= pivotY * uniformScale;
+                            turret.vertices[base + 2] -= pivotZ * uniformScale;
+                        }
+                        turret.indices.push_back(entry->second);
+                    }
+                }
+                p.indices = std::move(hullIndices);
+                if (!turret.indices.empty() &&
+                    GLBImporter::BuildMeshletData(turret, device.Get())) {
+                    auto turretNode = std::make_shared<SceneNode>("HumveeTurret");
+                    turretNode->translation = {
+                        pivotX * uniformScale, pivotY * uniformScale,
+                        pivotZ * uniformScale };
+                    turretNode->mesh = std::make_shared<SceneMesh>();
+                    turretNode->mesh->primitives.push_back(std::move(turret));
+                    root->AddChild(turretNode);
+                }
+            }
             if (GLBImporter::BuildMeshletData(p, device.Get()))
                 root->mesh->primitives.push_back(std::move(p));
             continue;

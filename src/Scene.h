@@ -59,6 +59,15 @@ struct ImpactParticle {
     bool     blood = false;  // textured blood billboard with ballistic motion
 };
 
+struct ExplosiveBarrel {
+    XMFLOAT3 position = { 0.0f, 0.0f, 0.0f };
+    int hits = 0;
+    bool active = true;
+    bool burning = false;
+    float fuse = 0.0f;
+    float fireFxCooldown = 0.0f;
+};
+
 struct GunViewModel {
     bool     visible  = true;   // AK47 view model is on by default
     XMFLOAT3 color    = { 0.3f, 0.3f, 0.35f };
@@ -113,6 +122,7 @@ struct Scene {
     GunViewModel gun;
     std::vector<Projectile> projectiles;
     std::vector<ImpactParticle> impactParticles;  // impact smoke puffs
+    std::vector<ExplosiveBarrel> explosiveBarrels;
     float projectileSpeed    = 300.0f;
     float projectileLifetime = 3.0f;
     XMFLOAT3 projectileColor = { 1.0f, 1.0f, 1.0f };
@@ -208,6 +218,15 @@ struct Scene {
         cube2.rotation = { 0.0f, 45.0f, 0.0f };
         cube2.color    = { 0.3f, 0.5f, 0.85f };
         cube2.visible  = false;
+
+        // Clear diagonal gaps between center and four houses. Barrel center is
+        // 0.75 m above the authored 2.5 m building pad.
+        explosiveBarrels = {
+            {{ 4.6f, 3.25f,  4.6f}},
+            {{-4.6f, 3.25f,  4.6f}},
+            {{ 4.6f, 3.25f, -4.6f}},
+            {{-4.6f, 3.25f, -4.6f}},
+        };
 
         floor.color    = { 1.0f, 1.0f, 1.0f };
     }
@@ -533,6 +552,18 @@ struct Scene {
         p.lifetime = projectileLifetime;
         p.active = true;
         p.hostile = true;
+        projectiles.push_back(p);
+    }
+
+    void SpawnPlayerProjectile(const XMFLOAT3& origin,
+                               const XMFLOAT3& direction,
+                               float speedMultiplier = 1.0f) {
+        Projectile p = {};
+        p.position = p.previousPosition = origin;
+        p.direction = direction;
+        p.speed = projectileSpeed * speedMultiplier;
+        p.lifetime = projectileLifetime;
+        p.active = true;
         projectiles.push_back(p);
     }
 

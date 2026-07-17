@@ -28,6 +28,10 @@ extern WaterVolume g_ocean;   // sea ringing the island
 extern ComPtr<ID3D12Resource> g_smokeTexture;   // soft smoke sprite for billboards
 extern ComPtr<ID3D12Resource> g_bloodTexture;
 extern ComPtr<ID3D12Resource> g_muzzleFlashTexture;
+extern ComPtr<ID3D12Resource> g_fireTexture;
+extern std::shared_ptr<SceneNode> g_explosiveBarrelModel;
+extern std::shared_ptr<SceneNode> g_humveeModel;
+DirectX::XMMATRIX HumveeWorldMatrix();
 
 struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
@@ -36,12 +40,14 @@ struct GeometryBuffers {
     ComPtr<ID3D12Resource>   capsuleVertexBuffer;
     ComPtr<ID3D12Resource>   quadVertexBuffer;      // unit XY billboard quad
     ComPtr<ID3D12Resource>   flashVertexBuffer;     // first cell of 4-frame VFX sheet
+    ComPtr<ID3D12Resource>   fireVertexBuffer;      // 60 cells from 10x6 fire sheet
     D3D12_VERTEX_BUFFER_VIEW cubeVBV  = {};
     D3D12_VERTEX_BUFFER_VIEW planeVBV = {};
     D3D12_VERTEX_BUFFER_VIEW sphereVBV = {};
     D3D12_VERTEX_BUFFER_VIEW capsuleVBV = {};
     D3D12_VERTEX_BUFFER_VIEW quadVBV = {};
     D3D12_VERTEX_BUFFER_VIEW flashVBV = {};
+    D3D12_VERTEX_BUFFER_VIEW fireVBV = {};
     UINT                     sphereVertexCount = 0;
     UINT                     capsuleVertexCount = 0;
 };
@@ -108,6 +114,12 @@ inline void DrawFlashQuad(const GeometryBuffers& geo) {
     g_dx12.commandList->DrawInstanced(6, 1, 0, 0);
 }
 
+inline void DrawFireFrame(const GeometryBuffers& geo, UINT frame) {
+    g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.fireVBV);
+    g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_dx12.commandList->DrawInstanced(6, 1, (frame % 60) * 6, 0);
+}
+
 inline void DrawSphere(const GeometryBuffers& geo) {
     if (!geo.sphereVertexCount) { DrawCube(geo); return; }
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.sphereVBV);
@@ -120,6 +132,71 @@ inline void DrawCapsule(const GeometryBuffers& geo) {
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.capsuleVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_dx12.commandList->DrawInstanced(geo.capsuleVertexCount, 1, 0, 0);
+}
+
+// Transparent world particles must run after every opaque pass, including GPU
+// skinned enemies. They still depth-test, so smoke behind a character stays
+// hidden while smoke in front blends over it.
+inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
+                                   const GeometryBuffers& geo,
+                                   const XMMATRIX& lightSpace) {
+    const XMMATRIX view = scene.GetViewMatrix();
+    const XMMATRIX proj = scene.GetProjectionMatrix();
+    const XMMATRIX invRot = XMMatrixTranspose(view);
+    const XMVECTOR camRight = XMVectorSetW(invRot.r[0], 0.0f);
+    const XMVECTOR camUp = XMVectorSetW(invRot.r[1], 0.0f);
+    const XMVECTOR camFwd = XMVectorSetW(invRot.r[2], 0.0f);
+
+    shader.UseTransparent();
+    for (auto& sp : scene.impactParticles) {
+        if (sp.spark) continue;
+        const float fade = sp.life / sp.maxLife;
+        const float age = 1.0f - fade;
+        const float fadeIn = age < 0.15f ? age / 0.15f : 1.0f;
+        const float fadeOut = fade < 0.4f ? fade / 0.4f : 1.0f;
+        const float opacity = sp.blood
+            ? (std::min)(0.36f, fadeIn * fadeOut * 0.36f)
+            : (std::min)(0.85f, fadeIn * fadeOut * 0.85f);
+        if (opacity <= 0.01f) { shader.NextDrawCall(); continue; }
+
+        const XMVECTOR pos = XMVectorSet(
+            sp.position.x, sp.position.y, sp.position.z, 1.0f);
+        const XMMATRIX model(camRight * sp.size, camUp * sp.size,
+                            camFwd * sp.size, XMVectorSetW(pos, 1.0f));
+        shader.SetMatrices(model, view, proj, lightSpace);
+        XMFLOAT3 tint = sp.color;
+        ID3D12Resource* texture = g_bloodTexture.Get();
+        if (!sp.blood) {
+            const float g = 1.0f + 2.0f * age;
+            tint = XMFLOAT3((std::min)(1.0f, sp.color.x * g),
+                            (std::min)(1.0f, sp.color.y * g),
+                            (std::min)(1.0f, sp.color.z * g));
+            texture = g_smokeTexture.Get();
+        }
+        shader.SetSmokeMaterial(tint, opacity, texture);
+        DrawQuad(geo);
+        shader.NextDrawCall();
+    }
+
+    if (g_fireTexture && geo.fireVBV.BufferLocation) {
+        shader.UseAdditive();
+        for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+            if (!barrel.active || !barrel.burning) continue;
+            const float age = 3.0f - barrel.fuse;
+            const UINT frame = static_cast<UINT>((std::max)(0.0f, age) * 24.0f) % 60;
+            const XMVECTOR pos = XMVectorSet(
+                barrel.position.x, barrel.position.y + 0.82f,
+                barrel.position.z, 1.0f);
+            const XMMATRIX model(camRight * 0.48f, camUp * 0.82f,
+                                 camFwd * 0.48f, XMVectorSetW(pos, 1.0f));
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetSmokeMaterial(XMFLOAT3(1.0f, 0.72f, 0.38f), 0.92f,
+                                    g_fireTexture.Get());
+            DrawFireFrame(geo, frame);
+            shader.NextDrawCall();
+        }
+    }
+    shader.Use(scene.wireframeMode);
 }
 
 // UV sphere as a non-indexed triangle list of VertexPosNormUV.
@@ -611,6 +688,32 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.NextDrawCall();
     }
 
+    if (g_humveeModel) {
+        DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
+                      view, proj, lightSpace);
+    }
+
+    // Authored shootable barrel FBX. Its pivot is at the base, while gameplay
+    // stores barrel.position at collision center 0.75 m above ground.
+    for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+        if (!barrel.active) continue;
+        if (g_explosiveBarrelModel) {
+            model = XMMatrixTranslation(
+                barrel.position.x, barrel.position.y - 0.75f, barrel.position.z);
+            DrawSceneNode(g_explosiveBarrelModel, shader, model,
+                          view, proj, lightSpace);
+        } else {
+            model = XMMatrixScaling(1.6f, 1.5f, 1.6f) *
+                    XMMatrixTranslation(barrel.position.x, barrel.position.y,
+                                        barrel.position.z);
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetObjectMaterial(XMFLOAT3(0.68f, 0.035f, 0.025f), false, false,
+                                     0.68f, 0.28f, nullptr, nullptr, nullptr);
+            DrawCapsule(geo);
+            shader.NextDrawCall();
+        }
+    }
+
     // Projectiles. Grenades: dark spheres. Bullets: bright tracer rounds -- a
     // thin streak stretched along the flight direction, glowing hot so it reads
     // like a real tracer whipping downrange.
@@ -675,18 +778,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.Use(scene.wireframeMode);
     }
 
-    // Impact particles. Sparks: opaque bright cubes (hot debris shards). Smoke:
-    // soft camera-facing billboards using the smoke sprite, alpha-blended so they
-    // read as real translucent, light-scattering puffs.
-    //
-    // Camera right/up come from the view matrix's rotation (its transpose maps
-    // view axes back to world), so every quad faces the camera.
-    XMMATRIX invRot = XMMatrixTranspose(view);
-    const XMVECTOR camRight = XMVectorSetW(invRot.r[0], 0.0f);
-    const XMVECTOR camUp    = XMVectorSetW(invRot.r[1], 0.0f);
-    const XMVECTOR camFwd   = XMVectorSetW(invRot.r[2], 0.0f);
-
-    // Opaque sparks first.
+    // Opaque sparks stay in Forward. Transparent smoke/blood runs after the
+    // separate skinned-enemy pass via RenderImpactBillboards().
     shader.Use(scene.wireframeMode);
     for (auto& sp : scene.impactParticles) {
         if (!sp.spark) continue;
@@ -699,41 +792,6 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         DrawCube(geo);
         shader.NextDrawCall();
     }
-
-    // Translucent smoke and blood billboards.
-    shader.UseTransparent();
-    for (auto& sp : scene.impactParticles) {
-        if (sp.spark) continue;
-        const float fade = sp.life / sp.maxLife;      // 1 fresh -> 0 dead
-        const float age = 1.0f - fade;
-        // Opacity ramps up as the puff first blooms, then fades out at the end.
-        const float fadeIn = age < 0.15f ? age / 0.15f : 1.0f;
-        const float fadeOut = fade < 0.4f ? fade / 0.4f : 1.0f;
-        const float opacity = sp.blood
-            ? (std::min)(0.36f, fadeIn * fadeOut * 0.36f)
-            : (std::min)(0.85f, fadeIn * fadeOut * 0.85f);
-        if (opacity <= 0.01f) { shader.NextDrawCall(); continue; }
-
-        // Billboard: build a world basis from the camera axes, scaled by size.
-        const XMVECTOR pos = XMVectorSet(sp.position.x, sp.position.y, sp.position.z, 1.0f);
-        model = XMMATRIX(camRight * sp.size, camUp * sp.size, camFwd * sp.size,
-                         XMVectorSetW(pos, 1.0f));
-        shader.SetMatrices(model, view, proj, lightSpace);
-        XMFLOAT3 tint = sp.color;
-        ID3D12Resource* texture = g_bloodTexture.Get();
-        if (!sp.blood) {
-            // Smoke lightens from sooty core to grey as it disperses.
-            const float g = 1.0f + 2.0f * age;
-            tint = XMFLOAT3((std::min)(1.0f, sp.color.x * g),
-                            (std::min)(1.0f, sp.color.y * g),
-                            (std::min)(1.0f, sp.color.z * g));
-            texture = g_smokeTexture.Get();
-        }
-        shader.SetSmokeMaterial(tint, opacity, texture);
-        DrawQuad(geo);
-        shader.NextDrawCall();
-    }
-    shader.Use(scene.wireframeMode);
 
     // Gun: the AK47 model, drawn in the gun's local space (+Z down the barrel)
     // and placed in front of the camera. If the FBX did not load, fall back to
@@ -808,6 +866,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             const float fade = scene.muzzleFlashTime / scene.muzzleFlashDuration;
             const float size = scene.GunModelScale() * (0.32f + 0.10f * fade);
             const XMVECTOR pos = XMVectorSet(muzzle.x, muzzle.y, muzzle.z, 1.0f);
+            const XMMATRIX invRot = XMMatrixTranspose(view);
+            const XMVECTOR camRight = XMVectorSetW(invRot.r[0], 0.0f);
+            const XMVECTOR camUp = XMVectorSetW(invRot.r[1], 0.0f);
+            const XMVECTOR camFwd = XMVectorSetW(invRot.r[2], 0.0f);
             model = XMMATRIX(camRight * size, camUp * size, camFwd * size,
                              XMVectorSetW(pos, 1.0f));
             shader.UseAdditive();

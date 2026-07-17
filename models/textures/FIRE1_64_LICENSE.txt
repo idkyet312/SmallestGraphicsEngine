@@ -1,0 +1,8 @@
+Asset: Animated Fire (fire1_64.png)
+Author: BenHickling
+Source: https://opengameart.org/content/animated-fire
+Direct file: https://opengameart.org/sites/default/files/fire1_64.png
+License: CC0 1.0 Universal
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Transparent PNG sprite sheet. 60 frames, 10 columns by 6 rows, 64x64 pixels per frame.
