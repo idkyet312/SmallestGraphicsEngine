@@ -19,7 +19,7 @@ cbuffer LightBuffer : register(b1) {
     int shininess;
     float shadowBias;
     int enableShadows;
-    float padding;
+    float shadowTexelSize;   // 1/shadow-map-size, precomputed on the CPU
 };
 
 cbuffer CameraBuffer : register(b2) {
@@ -41,6 +41,8 @@ cbuffer ObjectBuffer : register(b3) {
     float occlusionStrength;
     float normalYSign;
     float viewFillStrength;
+    float normalTexW;        // normal-map dimensions, precomputed on the CPU
+    float normalTexH;
 };
 
 struct PointLightData {
@@ -119,10 +121,7 @@ float CalculateShadow(float4 fragPosLightSpace, float3 normal, float3 lightDir) 
         return 1.0;
     }
 
-    uint shadowWidth;
-    uint shadowHeight;
-    shadowMap.GetDimensions(shadowWidth, shadowHeight);
-    float2 texelSize = 1.0 / float2(shadowWidth, shadowHeight);
+    float2 texelSize = shadowTexelSize.xx;
 
     float ndotl = saturate(dot(normal, lightDir));
     float bias = max(shadowBias * (1.0 - ndotl), shadowBias * 0.25);
@@ -460,10 +459,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
          float3x3 TBN = float3x3(T, B, N);
 
          float3 mappedNormal = normalize(mul(mapNormal, TBN));
-         uint normalWidth;
-         uint normalHeight;
-         normalMap.GetDimensions(normalWidth, normalHeight);
-         float2 normalMapSize = float2(normalWidth, normalHeight);
+         float2 normalMapSize = float2(normalTexW, normalTexH);
          float normalFootprint = max(length(ddx(input.texCoord) * normalMapSize), length(ddy(input.texCoord) * normalMapSize));
          float minifyFade = 1.0 - saturate((log2(max(normalFootprint, 1.0)) - 1.0) * 0.25);
          float grazingFade = saturate(abs(dot(N, viewDir)) * 2.0);

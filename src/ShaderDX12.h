@@ -29,7 +29,8 @@ struct alignas(256) LightBufferDX12 {
     int shininess;
     float shadowBias;
     int enableShadows;
-    float padding[1];
+    // 1/shadow-map-size, so the PCF loop needn't call GetDimensions per pixel.
+    float shadowTexelSize;
 };
 
 struct alignas(256) CameraBufferDX12 {
@@ -51,6 +52,10 @@ struct alignas(256) ObjectBufferDX12 {
     float occlusionStrength = 0.0f;
     float normalYSign = 1.0f;
     float viewFillStrength = 0.0f;
+    // Normal-map dimensions, so the shader's minification fade needn't call
+    // GetDimensions per pixel.
+    float normalTexW = 1.0f;
+    float normalTexH = 1.0f;
 };
 
 struct PointLightDataDX12 {
@@ -654,6 +659,14 @@ public:
         if (CompileShaderFile("shaders/grass_vs.hlsl", "vs_5_0", compileFlags, grassVsBlob)) {
             psoDesc.InputLayout = { grassLayout, _countof(grassLayout) };
             psoDesc.VS = { grassVsBlob->GetBufferPointer(), grassVsBlob->GetBufferSize() };
+            // Cheap grass pixel shader: Lambert + SH + 1-tap shadow, binding a
+            // strict subset of the shared root signature. Falls back to the
+            // full PS if it fails to compile -- the grass still draws.
+            ComPtr<ID3DBlob> grassPsBlob;
+            if (CompileShaderFile("shaders/grass_ps.hlsl", "ps_5_0", compileFlags, grassPsBlob))
+                psoDesc.PS = { grassPsBlob->GetBufferPointer(), grassPsBlob->GetBufferSize() };
+            else
+                std::cerr << "grass_ps.hlsl failed to compile; grass uses the full shader\n";
             hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&grassPipelineState));
             if (FAILED(hr)) {
                 std::cerr << "Failed to create grass pipeline state" << std::endl;
@@ -662,6 +675,7 @@ public:
                        !createMSAAPipeline(msaaGrassPipelineState)) {
                 msaaSupported = false;
             }
+            psoDesc.PS = { pixelShaderBlob->GetBufferPointer(), pixelShaderBlob->GetBufferSize() };
         }
         // Restore the shared desc, in case anything below reuses it.
         psoDesc.InputLayout = { inputLayout, _countof(inputLayout) };
@@ -731,6 +745,19 @@ public:
         g_dx12.commandList->SetDescriptorHeaps(2, heaps);
         g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
         g_dx12.commandList->SetPipelineState(GetPipelineState(wireframe));
+        // SetGraphicsRootSignature just invalidated every root binding, so this
+        // is exactly the place to re-establish the per-frame CBVs. Doing it here
+        // once, instead of in SetMatrices, drops five redundant root binds from
+        // every draw in between (~1200 destruction draws alone).
+        BindFrameConstants();
+    }
+
+    void BindFrameConstants() {
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(1, lightBuffer.GetGPUAddress(g_dx12.frameIndex));
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(2, cameraBuffer.GetGPUAddress(g_dx12.frameIndex));
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
 
     void UseTransparent() {
@@ -802,19 +829,15 @@ public:
         data.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
         matrixBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(0, matrixBuffer.GetGPUAddress(bufferIndex));
-        
-        // Rebind per-frame buffers to ensure they're not stale
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(1, lightBuffer.GetGPUAddress(g_dx12.frameIndex));
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(2, cameraBuffer.GetGPUAddress(g_dx12.frameIndex));
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(g_dx12.frameIndex));
+        // Per-frame CBVs (b1/b2/b4/b5/b7) are bound once in Use() -- the only
+        // point where the root signature (and thus every binding) is reset.
     }
     
-    void SetLight(const XMFLOAT3& pos, int type, const XMFLOAT3& color, 
+    void SetLight(const XMFLOAT3& pos, int type, const XMFLOAT3& color,
                   float constant, float linear, float quadratic,
                   float ambient, float specular, int shininess,
-                  float shadowBias, bool enableShadows) {
+                  float shadowBias, bool enableShadows,
+                  float shadowTexelSize = 1.0f / 2048.0f) {
         LightBufferDX12 data;
         data.lightPos = pos;
         data.lightType = type;
@@ -827,6 +850,7 @@ public:
         data.shininess = shininess;
         data.shadowBias = shadowBias;
         data.enableShadows = enableShadows ? 1 : 0;
+        data.shadowTexelSize = shadowTexelSize;
         lightBuffer.CopyData(g_dx12.frameIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(1, lightBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
@@ -883,7 +907,12 @@ public:
         data.occlusionStrength = occlusionStrength;
         data.normalYSign = normalYSign;
         data.viewFillStrength = viewFillStrength;
-        
+        if (useNorm && normal) {
+            const D3D12_RESOURCE_DESC nd = normal->GetDesc();
+            data.normalTexW = (float)nd.Width;
+            data.normalTexH = (float)nd.Height;
+        }
+
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
 

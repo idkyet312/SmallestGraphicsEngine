@@ -132,13 +132,19 @@ public:
         out.clear();
         // A cell is drawn if any blade in it could be inside the draw radius, so
         // test the cell's centre against the radius plus the cell's corner reach.
-        const float reach = kDrawDistance + kCellSize * 0.7072f;   // half-diagonal
+        const float reach = m_drawDistance + kCellSize * 0.7072f;   // half-diagonal
         const float reachSq = reach * reach;
         for (const Cell& c : m_cells) {
             const float dx = c.cx - m_eye.x;
             const float dz = c.cz - m_eye.z;
             if (dx * dx + dz * dz > reachSq) continue;
-            out.push_back({ c.firstBlade, c.bladeCount });
+            // Density trims each cell's contiguous instance run. Blades are
+            // stored tuft-contiguous, so a fractional cut drops whole tufts and
+            // reads as natural thinning -- no buffer rebuild, safe to change
+            // while frames are in flight.
+            const UINT count = (std::max)(1u,
+                (UINT)((float)c.bladeCount * m_density));
+            out.push_back({ c.firstBlade, count });
         }
     }
 
@@ -164,8 +170,8 @@ public:
         p.windSpeed = m_windSpeed;
         p.eyeX = m_eye.x;
         p.eyeZ = m_eye.z;
-        p.drawDistance = kDrawDistance;
-        p.fadeBand = kFadeBand;
+        p.drawDistance = m_drawDistance;
+        p.fadeBand = m_fadeBand;
         p.firstBlade = 0;      // the renderer overwrites this per patch
         return p;
     }
@@ -174,6 +180,10 @@ public:
     // Wind controls, surfaced to the UI.
     float& WindStrength() { return m_windStrength; }
     float& WindSpeed()    { return m_windSpeed; }
+    // Perf controls, surfaced to the UI. Density trims instances per cell;
+    // draw distance feeds both the cell cull and the shader's fade.
+    float& Density()      { return m_density; }
+    float& DrawDistance() { return m_drawDistance; }
 
     void Shutdown() {
         m_vb.Reset();
@@ -453,11 +463,14 @@ private:
     static constexpr float kTuftRadius    = 0.28f;   // metres
     // Blades shrink to nothing as they approach this range, so distant grass costs
     // no pixels and the field has no hard edge. Enforced in the vertex shader --
-    // the geometry is static, so there is nothing to cull on the CPU.
-    static constexpr float kDrawDistance  = 28.0f;
+    // the geometry is static, so there is nothing to cull on the CPU. Runtime-
+    // tunable (with kFadeBand and density) via the UI perf sliders.
+    float m_drawDistance = 28.0f;
     // Width of that shrink, so the fade edge does not read as a ring of grass
     // popping in and out as the player walks.
-    static constexpr float kFadeBand      = 6.0f;
+    float m_fadeBand = 6.0f;
+    // Fraction of each cell's blades actually drawn (1 = all).
+    float m_density = 1.0f;
     // Side of one draw-cell. Small enough that the cells hug the draw radius
     // without dragging in much grass the shader would only fade away, large enough
     // that the whole field stays a few dozen draws rather than hundreds.

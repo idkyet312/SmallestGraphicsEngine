@@ -1210,7 +1210,17 @@ struct DestructionDX12::Impl {
             XMMATRIX transform = XMMatrixIdentity();
             if (!B3_IS_NULL(runtime->body)) transform = BoxTransform(runtime->body, runtime->center);
             XMFLOAT4X4 stored; XMStoreFloat4x4(&stored, transform);
-            for (uint32_t chunk : runtime->chunks) renderItems.push_back({ chunks[chunk].node, stored });
+            for (uint32_t chunk : runtime->chunks) {
+                // BoxTransform is rigid, so the model-space half-diagonal is the
+                // world radius unchanged; +10% guards frustum-edge pop-in.
+                const Chunk& c = chunks[chunk];
+                const XMVECTOR extent = XMLoadFloat3(&c.maximum) - XMLoadFloat3(&c.minimum);
+                const float radius =
+                    0.55f * XMVectorGetX(XMVector3Length(extent));
+                XMFLOAT3 worldCenter;
+                XMStoreFloat3(&worldCenter, XMVector3Transform(XMLoadFloat3(&c.center), transform));
+                renderItems.push_back({ c.node, stored, worldCenter, radius });
+            }
         }
         ragdollRenderItems.clear();
         for (const RagdollPart& part : ragdollParts) {
@@ -1225,7 +1235,14 @@ struct DestructionDX12::Impl {
             XMMATRIX transform = scale *
                 XMMatrixRotationQuaternion(rotation) * XMMatrixTranslation((float)p.x, (float)p.y, (float)p.z);
             XMFLOAT4X4 stored; XMStoreFloat4x4(&stored, transform);
-            ragdollRenderItems.push_back({ stored, part.color, part.shape });
+            // Unit primitives span +-0.5, so the drawn extent is half the scale
+            // factor per axis; the sphere takes the largest and inflates 10%.
+            const float scaleMax = part.shape == 1
+                ? (std::max)({ part.half.x * 4.0f, part.half.y * 2.15f, part.half.z * 4.0f })
+                : (std::max)({ part.half.x, part.half.y, part.half.z }) * 2.08f;
+            ragdollRenderItems.push_back({ stored, part.color, part.shape,
+                XMFLOAT3((float)p.x, (float)p.y, (float)p.z),
+                scaleMax * 0.55f * 1.7321f });
         }
 
         enemyGunRenderItems.clear();
