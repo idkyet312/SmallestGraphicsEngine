@@ -275,11 +275,31 @@ public:
 
         // Detached chunks keep casting shadows from their live physics poses.
         if (scene.useDestruction && g_destruction.IsInitialized()) {
+            // Anything outside the light's ortho box cannot land in the shadow
+            // map; skip it before recording the draw. lightSpace is orthographic
+            // so w stays 1 and the NDC test needs no divide.
+            const float ortho = (std::max)(scene.shadowOrthoSize, 1.0f);
+            const float distance = (std::max)(scene.shadowDistance, 1.0f);
+            const float depthRange =
+                (std::max)(scene.shadowFarPlane, distance + ortho) - 0.1f;
+            const auto inLightBox = [&](const XMFLOAT3& c, float r) {
+                if (r <= 0.0f) return true;
+                XMFLOAT4 ndc;
+                XMStoreFloat4(&ndc, XMVector4Transform(
+                    XMVectorSet(c.x, c.y, c.z, 1.0f), lightSpace));
+                const float rx = r / ortho;
+                const float rz = r / depthRange;
+                return std::fabs(ndc.x) <= 1.0f + rx &&
+                       std::fabs(ndc.y) <= 1.0f + rx &&
+                       ndc.z + rz >= 0.0f && ndc.z - rz <= 1.0f;
+            };
             for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
+                if (!inLightBox(item.sphereCenter, item.sphereRadius)) continue;
                 DrawSceneNodeShadow(item.node, depthShader,
                                     XMLoadFloat4x4(&item.transform), lightSpace);
             }
             for (const RagdollRenderItem& item : g_destruction.GetRagdollRenderItems()) {
+                if (!inLightBox(item.sphereCenter, item.sphereRadius)) continue;
                 depthShader.SetMatrices(XMLoadFloat4x4(&item.transform), lightSpace);
                 DrawCube(geo);
                 depthShader.NextDrawCall();

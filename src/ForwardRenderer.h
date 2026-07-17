@@ -427,6 +427,34 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
     }
 }
 
+// Gribb-Hartmann plane extraction from the CPU-side (row-vector) view*proj.
+// Planes come out unnormalised with inward-facing normals; SphereVisible scales
+// the radius test by the plane length instead of normalising here.
+inline void BuildFrustumPlanes(const XMMATRIX& viewProj, XMFLOAT4 planes[6]) {
+    XMFLOAT4X4 m; XMStoreFloat4x4(&m, viewProj);
+    const auto set = [&](int i, float a, float b, float c, float d) {
+        planes[i] = XMFLOAT4(a, b, c, d);
+    };
+    set(0, m._14 + m._11, m._24 + m._21, m._34 + m._31, m._44 + m._41);  // left
+    set(1, m._14 - m._11, m._24 - m._21, m._34 - m._31, m._44 - m._41);  // right
+    set(2, m._14 + m._12, m._24 + m._22, m._34 + m._32, m._44 + m._42);  // bottom
+    set(3, m._14 - m._12, m._24 - m._22, m._34 - m._32, m._44 - m._42);  // top
+    set(4, m._13, m._23, m._33, m._43);                                  // near (D3D z>=0)
+    set(5, m._14 - m._13, m._24 - m._23, m._34 - m._33, m._44 - m._43);  // far
+}
+
+// Diagnostic: chunks skipped by the frustum cull in the last recorded frame.
+inline UINT g_destructionCulledThisFrame = 0;
+
+inline bool SphereVisible(const XMFLOAT4 planes[6], const XMFLOAT3& c, float r) {
+    for (int i = 0; i < 6; ++i) {
+        const XMFLOAT4& p = planes[i];
+        const float length = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+        if (p.x * c.x + p.y * c.y + p.z * c.z + p.w < -r * length) return false;
+    }
+    return true;
+}
+
 // Render the whole scene using the forward clustered path
 inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffers& geo,
                            const std::shared_ptr<SceneNode>& crateModel = nullptr,
@@ -442,7 +470,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     shader.SetLight(scene.lightPos, scene.lightType, scene.lightColor,
                     scene.lightConstant, scene.lightLinear, scene.lightQuadratic,
                     scene.ambientStrength, scene.specularStrength, scene.specularShininess,
-                    scene.shadowBias, scene.enableShadows && shadowMap != nullptr);
+                    scene.shadowBias, scene.enableShadows && shadowMap != nullptr,
+                    shadowMap ? 1.0f / (float)shadowMap->GetDesc().Width
+                              : 1.0f / 2048.0f);
     shader.SetCamera(scene.camera.Position);
 
     // Clustered light cull
@@ -508,12 +538,24 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     }
 
     // Separate destructible brick wall beside the house.
+    g_destructionCulledThisFrame = 0;
     if (scene.useDestruction && g_destruction.IsInitialized()) {
+        // ~588 chunk draws when both houses stand; the frustum test drops the
+        // ones behind the camera before any CBV write or draw is recorded.
+        XMFLOAT4 frustum[6];
+        BuildFrustumPlanes(view * proj, frustum);
         for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
+            if (item.sphereRadius > 0.0f &&
+                !SphereVisible(frustum, item.sphereCenter, item.sphereRadius)) {
+                ++g_destructionCulledThisFrame;
+                continue;
+            }
             DrawSceneNode(item.node, shader, XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
         }
         shader.Use(scene.wireframeMode);
         for (const RagdollRenderItem& item : g_destruction.GetRagdollRenderItems()) {
+            if (item.sphereRadius > 0.0f &&
+                !SphereVisible(frustum, item.sphereCenter, item.sphereRadius)) continue;
             shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
             shader.SetObjectColor(item.color);
             // Physics remains box-based. Capsules provide continuous limbs and
@@ -527,6 +569,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         // are aimed independently while ragdoll limbs trail under physics.
         for (const EnemyGunRenderItem& gun : g_destruction.GetEnemyGunRenderItems()) {
             const XMMATRIX xf = XMLoadFloat4x4(&gun.transform);
+            const XMFLOAT3 gunCenter(gun.transform._41, gun.transform._42, gun.transform._43);
+            if (!SphereVisible(frustum, gunCenter, 1.0f)) continue;
             if (GunModel::Loaded()) {
                 DrawMeshAt(GunModel::Mesh(), shader, xf, view, proj, lightSpace);
                 shader.Use(scene.wireframeMode);
@@ -928,9 +972,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         static int frames = 0;
         if (++frames == 300) {
             if (FILE* f = std::fopen("perf_counters.log", "w")) {
-                std::fprintf(f, "srvCreates=%u srvCacheHits=%u destructionRenderItems=%zu\n",
+                std::fprintf(f, "srvCreates=%u srvCacheHits=%u destructionRenderItems=%zu culled=%u\n",
                              shader.srvCreatesThisFrame, shader.srvCacheHitsThisFrame,
-                             g_destruction.GetRenderItems().size());
+                             g_destruction.GetRenderItems().size(),
+                             g_destructionCulledThisFrame);
                 std::fclose(f);
             }
         }

@@ -167,12 +167,24 @@ public:
     const std::vector<WaterFloaterItem>& GetFloaterItems() const { return m_items; }
 
     // --- wave surface access (renderer side) ---
-    // Recompute the surface into `frameIndex`'s buffer and return its view.
+    // Recompute the surface every m_updateInterval calls and return the view of
+    // the most recently WRITTEN buffer -- never the raw frame slot, which on a
+    // skipped frame would hold a surface from kFrames ago and visibly jump.
+    // Slots advance only on write, so with 2 frames in flight and 3 slots the
+    // earliest rewrite of a buffer is well after the GPU last read it.
     const D3D12_VERTEX_BUFFER_VIEW& UpdateAndGetVBV(UINT frameIndex) {
-        const UINT f = frameIndex % kFrames;
-        if (m_meshReady) WriteSurface(f);
-        return m_vbv[f];
+        (void)frameIndex;
+        if (m_meshReady && (m_updateCounter++ % m_updateInterval) == 0) {
+            m_currentSlot = (m_currentSlot + 1) % kFrames;
+            WriteSurface(m_currentSlot);
+        }
+        return m_vbv[m_currentSlot];
     }
+
+    // Recompute the surface every n-th rendered frame (1 = every frame). The
+    // big ocean grid is CPU-priced (16k sine evals per write); the swell moves
+    // slowly enough that half rate is imperceptible.
+    void SetUpdateInterval(UINT n) { m_updateInterval = (std::max)(1u, n); }
     UINT GetIndexCount() const { return (UINT)m_indices.size(); }
     const D3D12_INDEX_BUFFER_VIEW& GetIBV() const { return m_ibv; }
 
@@ -520,6 +532,9 @@ private:
     std::vector<uint32_t>    m_indices;
     std::vector<Ripple>      m_ripples;
     bool m_meshReady = false;
+    UINT m_updateInterval = 1;   // recompute every n-th frame
+    UINT m_updateCounter = 0;
+    UINT m_currentSlot = 0;      // last-written buffer; VBV always points here
     int  m_gridN = 48;
     int  m_requestedGridN = 48;   // survives Shutdown(); applied on Initialize
 

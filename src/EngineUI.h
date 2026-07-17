@@ -376,6 +376,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     if (g_grass.IsInitialized() && ImGui::CollapsingHeader("Grass & Wind")) {
         ImGui::DragFloat("Wind Strength", &g_grass.WindStrength(), 0.01f, 0.0f, 1.0f);
         ImGui::DragFloat("Wind Speed",    &g_grass.WindSpeed(),    0.05f, 0.0f, 6.0f);
+        // Perf dials: density trims blades per cell (whole tufts, no rebuild);
+        // distance shrinks the drawn ring. ~0.6 / 22 is a good perf preset.
+        ImGui::SliderFloat("Density", &g_grass.Density(), 0.05f, 1.0f);
+        ImGui::DragFloat("Draw Distance", &g_grass.DrawDistance(), 0.5f, 8.0f, 40.0f);
     }
 
     if (ImGui::CollapsingHeader("Destruction", ImGuiTreeNodeFlags_DefaultOpen)) {

@@ -12,6 +12,10 @@
 struct DestructionRenderItem {
     std::shared_ptr<SceneNode> node;
     DirectX::XMFLOAT4X4 transform;
+    // World-space bounding sphere so render passes can cull without walking the
+    // node's geometry. Radius is inflated 10% against edge pop-in.
+    DirectX::XMFLOAT3 sphereCenter = {};
+    float sphereRadius = 0.0f;
 };
 
 struct DestructionDebrisHazard {
@@ -27,6 +31,8 @@ struct RagdollRenderItem {
     DirectX::XMFLOAT4X4 transform;
     DirectX::XMFLOAT3 color;
     uint8_t shape = 1; // 0 box, 1 capsule, 2 sphere
+    DirectX::XMFLOAT3 sphereCenter = {};
+    float sphereRadius = 0.0f;
 };
 
 struct EnemyGunRenderItem {

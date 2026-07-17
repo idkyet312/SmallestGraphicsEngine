@@ -3465,6 +3465,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // Denser grid than the pool's: at 600 m across, the default 48
                 // cells would give 12 m quads and the swell would vanish.
                 g_ocean.SetGridResolution(128);
+                // The big grid costs 16k CPU sine evals per write; the swell
+                // reads the same at half rate. The pool stays at full rate for
+                // its splash ripples.
+                g_ocean.SetUpdateInterval(2);
                 g_ocean.Initialize({ 0.0f, -kSeaDepth * 0.5f, 0.0f },
                                    { kSeaSpan, kSeaDepth, kSeaSpan });
                 // House debris collides with the real terrain, not a flat plane.
