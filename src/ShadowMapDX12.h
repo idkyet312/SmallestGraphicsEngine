@@ -298,6 +298,11 @@ public:
                                 HumveeWorldMatrix(), lightSpace);
         }
 
+        if (g_helicopterModel) {
+            DrawSceneNodeShadow(g_helicopterModel, depthShader,
+                                HelicopterWorldMatrix(), lightSpace);
+        }
+
         for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
             if (!barrel.active) continue;
             if (g_explosiveBarrelModel) {

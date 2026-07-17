@@ -1,0 +1,8 @@
+Asset: Explosion Sheet (explosion_boom3.png, originally boom3.png)
+Author: StumpyStrust
+Source: https://opengameart.org/content/explosion-sheet
+Direct file: https://opengameart.org/sites/default/files/boom3.png
+License: CC0 1.0 Universal
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Transparent PNG sprite sheet. 64 frames, 8 columns by 8 rows, 128x128 pixels per frame.

@@ -24,6 +24,7 @@ public:
     DirectX::XMFLOAT3 position{ 0, 0, 0 };
     float             yaw = 0.0f;     // radians, lower-body movement facing
     float             aimYaw = 0.0f;  // radians, upper-body/weapon facing
+    float             aimPitch = 0.0f;
     bool              visible = true;
     bool              castsShadow = true;
     float             health = 100.0f;
@@ -122,7 +123,12 @@ public:
         navigationRepathTimer_ -= dt;
         const float dx = target.x - position.x, dz = target.z - position.z;
         const float distance = std::sqrt(dx*dx + dz*dz);
-        if (distance > 0.1f) aimYaw = std::atan2(dx, dz);
+        if (distance > 0.1f) {
+            aimYaw = std::atan2(dx, dz);
+            const float gunHeight = position.y + footOffset + 1.48f;
+            aimPitch = (std::max)(-0.55f, (std::min)(
+                0.55f, std::atan2(target.y - gunHeight, distance)));
+        }
         if (preparingShot_) stationaryAimTime_ += dt;
         float speed = 0.0f;
         if (distance > 0.1f && !preparingShot_) {
@@ -223,6 +229,7 @@ public:
         position = holdPosition;
         yaw = facingYaw;
         aimYaw = facingYaw;
+        aimPitch = 0.0f;
         knockbackVelocity_ = { 0.0f, 0.0f, 0.0f };
         preparingShot_ = false;
         stationaryAimTime_ = 0.0f;
@@ -240,8 +247,12 @@ public:
         knockbackVelocity_ = { 0.0f, 0.0f, 0.0f };
         const float dx = target.x - position.x;
         const float dz = target.z - position.z;
-        if (dx*dx + dz*dz > 0.01f) {
+        const float horizontalDistance = std::sqrt(dx*dx + dz*dz);
+        if (horizontalDistance > 0.1f) {
             aimYaw = std::atan2(dx, dz);
+            const float gunHeight = position.y + footOffset + 1.48f;
+            aimPitch = (std::max)(-0.55f, (std::min)(
+                0.55f, std::atan2(target.y - gunHeight, horizontalDistance)));
             yaw = aimYaw;
         }
         if (preparingShot_) stationaryAimTime_ += dt;
@@ -277,9 +288,10 @@ public:
     DirectX::XMFLOAT3 AimRayOrigin() const {
         DirectX::XMFLOAT3 origin = GunOriginWorld();
         const float sx = std::sin(aimYaw), cz = std::cos(aimYaw);
-        origin.x += sx * 0.78f;
-        origin.y += 0.02f;
-        origin.z += cz * 0.78f;
+        const float cp = std::cos(aimPitch), sp = std::sin(aimPitch);
+        origin.x += sx * cp * 0.78f;
+        origin.y += sp * 0.78f;
+        origin.z += cz * cp * 0.78f;
         return origin;
     }
 
@@ -389,6 +401,7 @@ public:
         if (!HasGunPose()) return XMMatrixIdentity();
         const XMFLOAT3 origin = GunOriginWorld();
         return XMMatrixScaling(0.6f, 0.6f, 0.6f) *
+               XMMatrixRotationX(-aimPitch) *
                XMMatrixRotationY(aimYaw) *
                XMMatrixTranslation(origin.x, origin.y, origin.z);
     }
@@ -587,6 +600,13 @@ public:
 
     bool Dead() const { return dead_; }
 
+    bool KillFromRotor(const DirectX::XMFLOAT3& direction,
+                       const DirectX::XMFLOAT3& impact) {
+        if (dead_ || !visible) return false;
+        Kill(direction, impact, 22.0f, true);
+        return true;
+    }
+
     bool ConsumeSpottedEvent() {
         const bool pending = spottedEventPending_;
         spottedEventPending_ = false;
@@ -766,6 +786,7 @@ private:
             }
             if (ContainsNoCase(model.skeleton.names[bone], "spine_01")) upperBodyMask_[bone] = 0.35f;
             if (ContainsNoCase(model.skeleton.names[bone], "spine_02")) upperBodyMask_[bone] = 0.65f;
+
         }
 
         if (const AnimationClip* idle = model.FindClip("Idle")) {
@@ -792,7 +813,7 @@ private:
     DirectX::XMFLOAT3 GunOriginWorld() const {
         const float sx = std::sin(aimYaw), cz = std::cos(aimYaw);
         return { position.x + cz * 0.12f + sx * 0.10f,
-                 position.y + footOffset + 1.28f,
+                 position.y + footOffset + 1.48f,
                  position.z - sx * 0.12f + cz * 0.10f };
     }
 
@@ -904,15 +925,18 @@ private:
 
         const XMFLOAT3 origin = GunOriginWorld();
         const float sx = std::sin(aimYaw), cz = std::cos(aimYaw);
+        const float cp = std::cos(aimPitch), sp = std::sin(aimPitch);
+        const XMFLOAT3 forward{ sx * cp, sp, cz * cp };
         const XMVECTOR rightGripWorld = XMVectorSet(
-            origin.x + cz * 0.06f, origin.y - 0.03f,
-            origin.z - sx * 0.06f, 1.0f);
+            origin.x + cz * 0.08f, origin.y - 0.02f,
+            origin.z - sx * 0.08f, 1.0f);
         const XMVECTOR foreGripWorld = XMVectorSet(
-            origin.x - cz * 0.05f + sx * leftArmReach, origin.y - 0.02f,
-            origin.z + sx * 0.05f + cz * leftArmReach, 1.0f);
+            origin.x - cz * 0.07f + forward.x * leftArmReach,
+            origin.y - 0.03f + forward.y * leftArmReach,
+            origin.z + sx * 0.07f + forward.z * leftArmReach, 1.0f);
         const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, MeshWorldMatrix());
-        // FBX arm labels are mirrored visually after the UE axis conversion.
-        // Route foregrip slider to the on-screen opposite arm.
+        // UE bone labels appear mirrored after asset-axis conversion. Route the
+        // visual trigger arm to rear grip and visual support arm to foregrip.
         SolveArmIK(upperR, lowerR, handBone_,
                    XMVector3TransformCoord(foreGripWorld, inverseWorld));
         SolveArmIK(upperL, lowerL, handL,
