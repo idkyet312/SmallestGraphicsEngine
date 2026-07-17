@@ -59,10 +59,22 @@ struct ImpactParticle {
     bool     blood = false;  // textured blood billboard with ballistic motion
 };
 
+// One-shot flipbook explosion billboard (8x8 CC0 sheet, see
+// models/textures/EXPLOSION_BOOM3_LICENSE.txt). Age drives frame selection.
+struct ExplosionFX {
+    XMFLOAT3 position;
+    float    size;      // world diameter at full bloom
+    float    age = 0.0f;
+    float    duration = 0.9f;
+};
+
 struct ExplosiveBarrel {
     XMFLOAT3 position = { 0.0f, 0.0f, 0.0f };
+    XMFLOAT3 velocity = { 0.0f, 0.0f, 0.0f };
     int hits = 0;
     bool active = true;
+    bool held = false;
+    bool thrown = false;
     bool burning = false;
     float fuse = 0.0f;
     float fireFxCooldown = 0.0f;
@@ -122,6 +134,7 @@ struct Scene {
     GunViewModel gun;
     std::vector<Projectile> projectiles;
     std::vector<ImpactParticle> impactParticles;  // impact smoke puffs
+    std::vector<ExplosionFX> explosionFX;         // animated explosion flipbooks
     std::vector<ExplosiveBarrel> explosiveBarrels;
     float projectileSpeed    = 300.0f;
     float projectileLifetime = 3.0f;
@@ -377,6 +390,22 @@ struct Scene {
             std::remove_if(impactParticles.begin(), impactParticles.end(),
                 [](const ImpactParticle& p) { return p.life <= 0.0f; }),
             impactParticles.end());
+
+        for (auto& fx : explosionFX) fx.age += dt;
+        explosionFX.erase(
+            std::remove_if(explosionFX.begin(), explosionFX.end(),
+                [](const ExplosionFX& fx) { return fx.age >= fx.duration; }),
+            explosionFX.end());
+    }
+
+    // Kick off one animated explosion flipbook centred on `center`.
+    // `size` is the billboard's full-bloom world diameter.
+    void SpawnExplosionFX(const XMFLOAT3& center, float size, float duration = 0.9f) {
+        ExplosionFX fx;
+        fx.position = center;
+        fx.size = size;
+        fx.duration = duration;
+        explosionFX.push_back(fx);
     }
 
     // Bullet impact: just a soft smoke puff kicked off the surface (no sparks).

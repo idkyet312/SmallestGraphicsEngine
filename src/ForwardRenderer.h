@@ -29,9 +29,12 @@ extern ComPtr<ID3D12Resource> g_smokeTexture;   // soft smoke sprite for billboa
 extern ComPtr<ID3D12Resource> g_bloodTexture;
 extern ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 extern ComPtr<ID3D12Resource> g_fireTexture;
+extern ComPtr<ID3D12Resource> g_explosionTexture;   // 8x8 flipbook explosion sheet
 extern std::shared_ptr<SceneNode> g_explosiveBarrelModel;
 extern std::shared_ptr<SceneNode> g_humveeModel;
+extern std::shared_ptr<SceneNode> g_helicopterModel;
 DirectX::XMMATRIX HumveeWorldMatrix();
+DirectX::XMMATRIX HelicopterWorldMatrix();
 
 struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
@@ -41,6 +44,7 @@ struct GeometryBuffers {
     ComPtr<ID3D12Resource>   quadVertexBuffer;      // unit XY billboard quad
     ComPtr<ID3D12Resource>   flashVertexBuffer;     // first cell of 4-frame VFX sheet
     ComPtr<ID3D12Resource>   fireVertexBuffer;      // 60 cells from 10x6 fire sheet
+    ComPtr<ID3D12Resource>   explosionVertexBuffer; // 64 cells from 8x8 explosion sheet
     D3D12_VERTEX_BUFFER_VIEW cubeVBV  = {};
     D3D12_VERTEX_BUFFER_VIEW planeVBV = {};
     D3D12_VERTEX_BUFFER_VIEW sphereVBV = {};
@@ -48,6 +52,7 @@ struct GeometryBuffers {
     D3D12_VERTEX_BUFFER_VIEW quadVBV = {};
     D3D12_VERTEX_BUFFER_VIEW flashVBV = {};
     D3D12_VERTEX_BUFFER_VIEW fireVBV = {};
+    D3D12_VERTEX_BUFFER_VIEW explosionVBV = {};
     UINT                     sphereVertexCount = 0;
     UINT                     capsuleVertexCount = 0;
 };
@@ -120,6 +125,13 @@ inline void DrawFireFrame(const GeometryBuffers& geo, UINT frame) {
     g_dx12.commandList->DrawInstanced(6, 1, (frame % 60) * 6, 0);
 }
 
+// One 64th of the 8x8 explosion flipbook (frame 0 top-left, row-major).
+inline void DrawExplosionFrame(const GeometryBuffers& geo, UINT frame) {
+    g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.explosionVBV);
+    g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_dx12.commandList->DrawInstanced(6, 1, (frame % 64) * 6, 0);
+}
+
 inline void DrawSphere(const GeometryBuffers& geo) {
     if (!geo.sphereVertexCount) { DrawCube(geo); return; }
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.sphereVBV);
@@ -176,6 +188,28 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
         shader.SetSmokeMaterial(tint, opacity, texture);
         DrawQuad(geo);
         shader.NextDrawCall();
+    }
+
+    // Animated explosion flipbooks: alpha-blended so the smoky tail frames of
+    // the sheet still read as smoke instead of washing out additively.
+    if (g_explosionTexture && geo.explosionVBV.BufferLocation) {
+        for (const ExplosionFX& fx : scene.explosionFX) {
+            const float t = (std::min)(1.0f, fx.age / fx.duration);
+            const UINT frame = (std::min)(63u, (UINT)(t * 64.0f));
+            // Blooms fast, then holds; last frames fade out.
+            const float bloom = 0.55f + 0.45f * (std::min)(1.0f, t * 4.0f);
+            const float opacity = t > 0.8f ? (1.0f - t) / 0.2f : 1.0f;
+            const float size = fx.size * bloom;
+            const XMVECTOR pos = XMVectorSet(
+                fx.position.x, fx.position.y, fx.position.z, 1.0f);
+            const XMMATRIX model(camRight * size, camUp * size,
+                                 camFwd * size, XMVectorSetW(pos, 1.0f));
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetSmokeMaterial(XMFLOAT3(1.0f, 1.0f, 1.0f), opacity,
+                                    g_explosionTexture.Get());
+            DrawExplosionFrame(geo, frame);
+            shader.NextDrawCall();
+        }
     }
 
     if (g_fireTexture && geo.fireVBV.BufferLocation) {
@@ -690,6 +724,11 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     if (g_humveeModel) {
         DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
+                      view, proj, lightSpace);
+    }
+
+    if (g_helicopterModel) {
+        DrawSceneNode(g_helicopterModel, shader, HelicopterWorldMatrix(),
                       view, proj, lightSpace);
     }
 

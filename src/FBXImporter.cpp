@@ -11,6 +11,7 @@
 #include <cmath>
 #include <array>
 #include <cfloat>
+#include <functional>
 
 using namespace DirectX;
 namespace fs = std::filesystem;
@@ -20,17 +21,33 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
     float uniformScale,
     bool splitIntoDestructibleBoards,
-    bool loadMaterials) {
+    bool loadMaterials,
+    bool diffuseAndNormalOnly) {
     Assimp::Importer importer;
-    const aiScene* scene = importer.ReadFile(filepath, aiProcess_Triangulate | aiProcess_JoinIdenticalVertices |
-        aiProcess_GenSmoothNormals | aiProcess_CalcTangentSpace | aiProcess_ImproveCacheLocality |
-        aiProcess_PreTransformVertices);
+    const bool preserveOH1Rotors = filepath.find("OH-1") != std::string::npos;
+    unsigned importFlags = aiProcess_Triangulate | aiProcess_JoinIdenticalVertices |
+        aiProcess_GenSmoothNormals | aiProcess_CalcTangentSpace |
+        aiProcess_ImproveCacheLocality;
+    if (!preserveOH1Rotors) importFlags |= aiProcess_PreTransformVertices;
+    const aiScene* scene = importer.ReadFile(filepath, importFlags);
     if (!scene || !scene->HasMeshes()) { std::cerr << "FBX load failed: " << importer.GetErrorString() << "\n"; return {}; }
     auto root = std::make_shared<SceneNode>("WoodenHouseFBX");
     root->mesh = std::make_shared<SceneMesh>();
     fs::path base = fs::path(filepath).parent_path();
     // Bake scale into vertices. Destruction path copies mesh data directly and
     // does not apply the source node transform.
+    std::vector<aiMatrix4x4> meshTransforms(scene->mNumMeshes);
+    if (preserveOH1Rotors) {
+        std::function<void(const aiNode*, const aiMatrix4x4&)> collectTransforms;
+        collectTransforms = [&](const aiNode* node, const aiMatrix4x4& parent) {
+            const aiMatrix4x4 global = parent * node->mTransformation;
+            for (unsigned mesh = 0; mesh < node->mNumMeshes; ++mesh)
+                meshTransforms[node->mMeshes[mesh]] = global;
+            for (unsigned child = 0; child < node->mNumChildren; ++child)
+                collectTransforms(node->mChildren[child], global);
+        };
+        collectTransforms(scene->mRootNode, aiMatrix4x4());
+    }
 
     auto loadTexture = [&](const aiString& texturePath, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploads)
         -> Microsoft::WRL::ComPtr<ID3D12Resource> {
@@ -55,7 +72,8 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
     if (loadMaterials) {
         for (const auto& entry : fs::recursive_directory_iterator(base)) {
             const std::string name = entry.path().filename().string();
-            if (entry.is_regular_file() && name.find("_BaseColor.") != std::string::npos)
+            const char* suffix = diffuseAndNormalOnly ? "_Diffuse." : "_BaseColor.";
+            if (entry.is_regular_file() && name.find(suffix) != std::string::npos)
                 fallbackBaseColors.push_back(entry.path());
         }
         std::sort(fallbackBaseColors.begin(), fallbackBaseColors.end());
@@ -72,20 +90,30 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
                 mat->baseColorFactor = XMFLOAT4(
                     diffuse.r, diffuse.g, diffuse.b, diffuse.a);
             aiString tex;
-            const bool hasBaseColor =
-                (am->GetTexture(aiTextureType_BASE_COLOR, 0, &tex) == AI_SUCCESS && tex.length) ||
-                (am->GetTexture(aiTextureType_DIFFUSE, 0, &tex) == AI_SUCCESS && tex.length);
+            const bool hasBaseColor = diffuseAndNormalOnly
+                ? (am->GetTexture(aiTextureType_DIFFUSE, 0, &tex) == AI_SUCCESS && tex.length)
+                : ((am->GetTexture(aiTextureType_BASE_COLOR, 0, &tex) == AI_SUCCESS && tex.length) ||
+                   (am->GetTexture(aiTextureType_DIFFUSE, 0, &tex) == AI_SUCCESS && tex.length));
             if (hasBaseColor) {
                 mat->baseColorTexture = loadTexture(tex, mat->uploadHeaps);
             }
-            if (am->GetTexture(aiTextureType_NORMALS, 0, &tex) == AI_SUCCESS && tex.length)
+            if ((am->GetTexture(aiTextureType_NORMALS, 0, &tex) == AI_SUCCESS && tex.length) ||
+                (am->GetTexture(aiTextureType_HEIGHT, 0, &tex) == AI_SUCCESS && tex.length))
                 mat->normalTexture = loadTexture(tex, mat->uploadHeaps);
+            if (diffuseAndNormalOnly) {
+                mat->metallicFactor = 0.0f;
+                mat->roughnessFactor = 0.62f;
+                mat->metallicRoughnessTexture.Reset();
+            }
         }
         if (loadMaterials && !mat->baseColorTexture && !fallbackBaseColors.empty()) {
             const fs::path& color = fallbackBaseColors[mi % fallbackBaseColors.size()];
             mat->baseColorTexture = GLBImporter::LoadTextureFromFile(color.string(), device, commandList, mat->uploadHeaps);
-            const std::string normalName = color.filename().string().replace(
-                color.filename().string().find("_BaseColor"), 10, "_Normal");
+            std::string normalName = color.filename().string();
+            const std::string colorSuffix = diffuseAndNormalOnly ? "_Diffuse" : "_BaseColor";
+            const size_t suffixPosition = normalName.find(colorSuffix);
+            if (suffixPosition != std::string::npos)
+                normalName.replace(suffixPosition, colorSuffix.size(), "_Normal");
             for (const auto& entry : fs::recursive_directory_iterator(base)) {
                 if (entry.path().filename().string() == normalName) {
                     mat->normalTexture = GLBImporter::LoadTextureFromFile(entry.path().string(), device, commandList, mat->uploadHeaps);
@@ -94,12 +122,21 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
             }
         }
         p.material = mat;
+        aiMatrix3x3 normalTransform(meshTransforms[mi]);
+        if (preserveOH1Rotors) normalTransform.Inverse().Transpose();
+        const aiMatrix3x3 directionTransform(meshTransforms[mi]);
         for (unsigned v = 0; v < src->mNumVertices; ++v) {
             aiVector3D n = src->HasNormals() ? src->mNormals[v] : aiVector3D(0,1,0);
             aiVector3D uv = src->HasTextureCoords(0) ? src->mTextureCoords[0][v] : aiVector3D();
             aiVector3D t = src->HasTangentsAndBitangents() ? src->mTangents[v] : aiVector3D(1,0,0);
-            p.vertices.insert(p.vertices.end(), {src->mVertices[v].x * uniformScale,
-                src->mVertices[v].y * uniformScale, src->mVertices[v].z * uniformScale,
+            aiVector3D position = src->mVertices[v];
+            if (preserveOH1Rotors) {
+                position = meshTransforms[mi] * position;
+                n = normalTransform * n; n.Normalize();
+                t = directionTransform * t; t.Normalize();
+            }
+            p.vertices.insert(p.vertices.end(), {position.x * uniformScale,
+                position.y * uniformScale, position.z * uniformScale,
                 n.x,n.y,n.z,uv.x,uv.y,t.x,t.y,t.z,1.0f});
         }
         for (unsigned f=0; f<src->mNumFaces; ++f)
@@ -111,6 +148,87 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
         // plank fragments is only appropriate for destructible house assets.
         if (!splitIntoDestructibleBoards) {
             p.materialIndex = (int)src->mMaterialIndex;
+            const std::string meshName = src->mName.C_Str();
+            if (preserveOH1Rotors &&
+                (meshName == "Rotor" || meshName == "Tail_Rotor")) {
+                XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
+                XMFLOAT3 maximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+                for (size_t vertex = 0; vertex + 11 < p.vertices.size(); vertex += 12) {
+                    minimum.x = (std::min)(minimum.x, p.vertices[vertex]);
+                    minimum.y = (std::min)(minimum.y, p.vertices[vertex + 1]);
+                    minimum.z = (std::min)(minimum.z, p.vertices[vertex + 2]);
+                    maximum.x = (std::max)(maximum.x, p.vertices[vertex]);
+                    maximum.y = (std::max)(maximum.y, p.vertices[vertex + 1]);
+                    maximum.z = (std::max)(maximum.z, p.vertices[vertex + 2]);
+                }
+                const XMFLOAT3 pivot{
+                    (minimum.x + maximum.x) * 0.5f,
+                    (minimum.y + maximum.y) * 0.5f,
+                    (minimum.z + maximum.z) * 0.5f };
+                for (size_t vertex = 0; vertex + 11 < p.vertices.size(); vertex += 12) {
+                    p.vertices[vertex] -= pivot.x;
+                    p.vertices[vertex + 1] -= pivot.y;
+                    p.vertices[vertex + 2] -= pivot.z;
+                }
+                if (GLBImporter::BuildMeshletData(p, device.Get())) {
+                    auto rotorNode = std::make_shared<SceneNode>(
+                        meshName == "Rotor" ? "OH1MainRotor" : "OH1TailRotor");
+                    rotorNode->translation = pivot;
+                    rotorNode->mesh = std::make_shared<SceneMesh>();
+                    rotorNode->mesh->primitives.push_back(std::move(p));
+                    root->AddChild(rotorNode);
+                }
+                continue;
+            }
+            // Wheels share the body material in the source FBX. Split their
+            // authored front/rear axle regions into a dedicated black material.
+            if (filepath.find("Humvee") != std::string::npos) {
+                MeshPrimitive wheels;
+                wheels.material = std::make_shared<SceneMaterial>();
+                wheels.material->name = "HumveeWheel";
+                wheels.material->baseColorFactor = XMFLOAT4(0.018f, 0.022f, 0.018f, 1.0f);
+                wheels.material->metallicFactor = 0.0f;
+                wheels.material->roughnessFactor = 0.92f;
+                wheels.materialIndex = p.materialIndex;
+                std::unordered_map<UINT, UINT> wheelRemap;
+                std::vector<UINT> bodyIndices;
+                bodyIndices.reserve(p.indices.size());
+                for (size_t tri = 0; tri + 2 < p.indices.size(); tri += 3) {
+                    float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+                    for (int corner = 0; corner < 3; ++corner) {
+                        const size_t vertex = static_cast<size_t>(p.indices[tri + corner]) * 12;
+                        cx += p.vertices[vertex];
+                        cy += p.vertices[vertex + 1];
+                        cz += p.vertices[vertex + 2];
+                    }
+                    cx /= 3.0f; cy /= 3.0f; cz /= 3.0f;
+                    const bool axleRegion =
+                        (cz > -660.0f * uniformScale && cz < -370.0f * uniformScale) ||
+                        (cz >  240.0f * uniformScale && cz <  530.0f * uniformScale);
+                    const bool wheelTriangle =
+                        cy < 265.0f * uniformScale &&
+                        std::abs(cx) > 180.0f * uniformScale && axleRegion;
+                    if (!wheelTriangle) {
+                        bodyIndices.insert(bodyIndices.end(),
+                            p.indices.begin() + tri, p.indices.begin() + tri + 3);
+                        continue;
+                    }
+                    for (int corner = 0; corner < 3; ++corner) {
+                        const UINT oldIndex = p.indices[tri + corner];
+                        auto [entry, inserted] = wheelRemap.emplace(
+                            oldIndex, static_cast<UINT>(wheels.vertices.size() / 12));
+                        if (inserted) {
+                            const float* source = &p.vertices[static_cast<size_t>(oldIndex) * 12];
+                            wheels.vertices.insert(wheels.vertices.end(), source, source + 12);
+                        }
+                        wheels.indices.push_back(entry->second);
+                    }
+                }
+                p.indices = std::move(bodyIndices);
+                if (!wheels.indices.empty() &&
+                    GLBImporter::BuildMeshletData(wheels, device.Get()))
+                    root->mesh->primitives.push_back(std::move(wheels));
+            }
             // Humvee source is flattened into three meshes. Extract the upper
             // centre gun assembly from Body mesh into a pivoted child so runtime
             // turret yaw does not rotate the hull, wheels, or rear antenna.
