@@ -6,10 +6,9 @@
 // RenderUI sets the flags while a button is held; ProcessInput consumes them
 // once per frame and clears them.
 struct VirtualInput {
-    bool forward = false;
-    bool back    = false;
-    bool left    = false;
-    bool right   = false;
+    // Analog movement stick: -1..1, with +Y forward and +X right.
+    float moveX = 0.0f;
+    float moveY = 0.0f;
     bool down    = false;
     bool jump    = false;
     bool shoot   = false;

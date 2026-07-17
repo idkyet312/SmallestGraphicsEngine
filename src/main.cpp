@@ -68,9 +68,29 @@ bool                        g_banditLoaded = false;
 float                       g_banditLeftArmReach = 0.55f;
 uint32_t                    g_banditSpawnSerial = 0;
 GunAudio                    g_gunAudio;
+GunAudio                    g_hitAudio;
+GunAudio                    g_banditSpottedAudio1;
+GunAudio                    g_banditSpottedAudio2;
+GunAudio                    g_banditAttackAudio;
+GunAudio                    g_banditDeathAudio;
+GunAudio                    g_banditHitVoiceAudio;
+float                       g_banditVoiceCooldown = 0.0f;
+float                       g_banditPainCooldown = 0.0f;
+float                       g_fleshHitPitchMin = 0.9f;
+float                       g_fleshHitPitchMax = 1.1f;
+NavigationSystem            g_navigation;
 
-static constexpr size_t kBanditsOnScreen = 4;
-static const XMFLOAT3 kBanditSpawnPoint = { 0.0f, 0.0f, 14.0f };
+static constexpr size_t kEnemiesPerSpawner = 2;
+static constexpr size_t kSpawnerCount = 4;
+static constexpr size_t kBanditsOnScreen = kSpawnerCount * kEnemiesPerSpawner;
+static constexpr float kBanditRespawnDelay = 5.0f;
+static std::array<float, kBanditsOnScreen> g_banditRespawnTimers = {};
+static const std::array<XMFLOAT3, kSpawnerCount> kBanditSpawnPoints = {{
+    {  0.0f, 0.0f,  17.5f }, // north: 5 m beyond house outer wall
+    { 17.5f, 0.0f,   0.0f }, // east
+    {  0.0f, 0.0f, -17.5f }, // south
+    {-17.5f, 0.0f,   0.0f }, // west
+}};
 
 static size_t LiveBanditCount() {
     size_t count = 0;
@@ -79,42 +99,85 @@ static size_t LiveBanditCount() {
     return count;
 }
 
-static SkinnedEnemy* FirstLiveBandit() {
-    for (const auto& bandit : g_bandits)
-        if (bandit && !bandit->Dead()) return bandit.get();
-    return nullptr;
+static float BanditVoiceVolume(const XMFLOAT3& position, float peak = 0.78f) {
+    const float dx = position.x - scene.camera.Position.x;
+    const float dy = position.y - scene.camera.Position.y;
+    const float dz = position.z - scene.camera.Position.z;
+    const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+    return (std::max)(0.06f, peak * (1.0f - distance / 38.0f));
+}
+
+static void PlayBanditDeathEvents() {
+    for (auto& bandit : g_bandits) {
+        if (!bandit || !bandit->ConsumeDeathEvent()) continue;
+        if (bandit->spawnSlot >= 0 &&
+            bandit->spawnSlot < static_cast<int>(kBanditsOnScreen)) {
+            g_banditRespawnTimers[static_cast<size_t>(bandit->spawnSlot)] =
+                kBanditRespawnDelay;
+        }
+        const float pitch = 0.94f + ((float)std::rand() / RAND_MAX) * 0.10f;
+        g_banditDeathAudio.Play(BanditVoiceVolume(bandit->position, 0.9f), pitch);
+    }
 }
 
 static bool SpawnBandit() {
     if (!g_banditModel.valid) return false;
+    size_t slot = kBanditsOnScreen;
+    for (size_t candidate = 0; candidate < kBanditsOnScreen; ++candidate) {
+        if (g_banditRespawnTimers[candidate] > 0.0f) continue;
+        bool occupied = false;
+        for (const auto& existing : g_bandits) {
+            if (existing && !existing->Dead() &&
+                existing->spawnSlot == static_cast<int>(candidate)) {
+                occupied = true;
+                break;
+            }
+        }
+        if (!occupied) { slot = candidate; break; }
+    }
+    if (slot == kBanditsOnScreen) return false;
+
     auto bandit = std::make_unique<SkinnedEnemy>();
     if (!bandit->Init(g_banditModel)) return false;
 
-    // Four lanes around one authored spawn point keep every replacement visible
-    // without stacking characters inside each other.
-    static constexpr float laneX[] = { -2.7f, -0.9f, 0.9f, 2.7f };
-    static constexpr float laneZ[] = { -0.8f, 0.4f, 0.4f, -0.8f };
-    const size_t lane = g_banditSpawnSerial++ % kBanditsOnScreen;
+    const size_t spawner = slot / kEnemiesPerSpawner;
+    const size_t member = slot % kEnemiesPerSpawner;
+    const XMFLOAT3 spawn = kBanditSpawnPoints[spawner];
+    const float length = std::sqrt(spawn.x * spawn.x + spawn.z * spawn.z);
+    const float outwardX = spawn.x / length;
+    const float outwardZ = spawn.z / length;
+    const float side = member == 0 ? -0.85f : 0.85f;
     bandit->position = {
-        kBanditSpawnPoint.x + laneX[lane],
-        kBanditSpawnPoint.y,
-        kBanditSpawnPoint.z + laneZ[lane]
+        spawn.x - outwardZ * side,
+        spawn.y,
+        spawn.z + outwardX * side
     };
+    bandit->spawnSlot = static_cast<int>(slot);
     bandit->leftArmReach = g_banditLeftArmReach;
-    bandit->orbitRadius = 4.4f + static_cast<float>(lane) * 0.45f;
-    bandit->orbitDirection = (lane & 1) ? -1.0f : 1.0f;
+    bandit->orbitRadius = 4.4f + static_cast<float>(slot % 4) * 0.45f;
+    bandit->orbitDirection = (slot & 1) ? -1.0f : 1.0f;
     bandit->fireCooldown =
         0.7f + ((float)std::rand() / (float)RAND_MAX) * 2.8f;
     bandit->PlayClip("Walk");
-    bandit->anim.Advance(0.19f * static_cast<float>(lane));
+    bandit->anim.Advance(0.19f * static_cast<float>(g_banditSpawnSerial++ % 8));
     g_bandits.push_back(std::move(bandit));
     return true;
 }
 
 static void ShootPlayerWeapon() {
-    scene.ShootProjectile();
-    const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
-    g_gunAudio.Play(0.82f, pitch);
+    if (GunModel::ShotgunSelected()) {
+        scene.ShootShotgun();
+        const float pitch = 0.78f + ((float)std::rand() / RAND_MAX) * 0.08f;
+        g_gunAudio.Play(0.96f, pitch);
+    } else {
+        scene.ShootProjectile();
+        const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
+        g_gunAudio.Play(0.82f, pitch);
+    }
+}
+
+static float PlayerFireInterval() {
+    return GunModel::ShotgunSelected() ? 0.8f : scene.fireInterval;
 }
 
 static bool HitTerrainSegment(const XMFLOAT3& start, const XMFLOAT3& end,
@@ -188,8 +251,17 @@ void BanditDebugText() {
     ImGui::Text("Bandits: live=%zu total=%zu bones=%zu parts=%d tex=%d",
                 LiveBanditCount(), g_bandits.size(),
                 g_banditModel.skeleton.BoneCount(), parts, textured);
+    ImGui::Text("Weapon: %s  (mouse wheel)", GunModel::SelectedWeaponName());
     ImGui::SliderFloat("Left arm reach", &g_banditLeftArmReach,
                        0.20f, 0.85f, "%.2f m");
+    if (ImGui::CollapsingHeader("Enemy Audio", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::SliderFloat("Flesh hit pitch min", &g_fleshHitPitchMin,
+                               0.5f, 2.0f, "%.2f"))
+            g_fleshHitPitchMin = (std::min)(g_fleshHitPitchMin, g_fleshHitPitchMax);
+        if (ImGui::SliderFloat("Flesh hit pitch max", &g_fleshHitPitchMax,
+                               0.5f, 2.0f, "%.2f"))
+            g_fleshHitPitchMax = (std::max)(g_fleshHitPitchMax, g_fleshHitPitchMin);
+    }
 }
 WaterVolume                 g_water;
 WaterVolume                 g_ocean;   // sea ringing the island, surface at y = 0
@@ -1130,6 +1202,107 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     return root;
 }
 
+// Reuse the authored wooden and metal house chunks as four independent
+// buildings around world centre. Vertex transforms are baked because the
+// destruction system consumes child geometry directly rather than node poses.
+static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root) {
+    if (!root) return;
+    std::vector<std::shared_ptr<SceneNode>> woodTemplate;
+    std::vector<std::shared_ptr<SceneNode>> metalTemplate;
+
+    auto meanX = [](const std::shared_ptr<SceneNode>& node) {
+        double sum = 0.0;
+        size_t count = 0;
+        if (node && node->mesh) {
+            for (const MeshPrimitive& primitive : node->mesh->primitives) {
+                for (size_t v = 0; v + 11 < primitive.vertices.size(); v += 12) {
+                    sum += primitive.vertices[v];
+                    ++count;
+                }
+            }
+        }
+        return count ? static_cast<float>(sum / static_cast<double>(count)) : 0.0f;
+    };
+
+    // Original templates sit side-by-side: wood is left of x=1, metal right.
+    for (const auto& child : root->children) {
+        if (!child || !child->mesh) continue;
+        (meanX(child) < 1.0f ? woodTemplate : metalTemplate).push_back(child);
+    }
+    root->children.clear();
+
+    auto uniqueName = [](const std::string& source, int groupOffset, size_t ordinal) {
+        const size_t at = source.rfind('@');
+        if (at == std::string::npos)
+            return source + "#" + std::to_string(groupOffset);
+        bool numeric = at + 1 < source.size();
+        for (size_t i = at + 1; i < source.size(); ++i)
+            numeric = numeric && source[i] >= '0' && source[i] <= '9';
+        if (numeric) {
+            const int oldId = std::atoi(source.c_str() + at + 1);
+            return source.substr(0, at + 1) + std::to_string(oldId + groupOffset);
+        }
+        return source + "@" + std::to_string(groupOffset + 500000 + ordinal);
+    };
+
+    auto addHouse = [&](const std::vector<std::shared_ptr<SceneNode>>& source,
+                        float sourceX, float sourceZ, float targetX, float targetZ,
+                        float yaw, int groupOffset) {
+        const XMMATRIX transform =
+            XMMatrixTranslation(-sourceX, 0.0f, -sourceZ) *
+            XMMatrixRotationY(yaw) *
+            XMMatrixTranslation(targetX, 0.0f, targetZ);
+        const XMMATRIX rotation = XMMatrixRotationY(yaw);
+        for (size_t childIndex = 0; childIndex < source.size(); ++childIndex) {
+            const auto& sourceChild = source[childIndex];
+            auto child = std::make_shared<SceneNode>(
+                uniqueName(sourceChild->name, groupOffset, childIndex));
+            child->mesh = std::make_shared<SceneMesh>();
+            for (const MeshPrimitive& sourcePrimitive : sourceChild->mesh->primitives) {
+                MeshPrimitive primitive;
+                primitive.vertices = sourcePrimitive.vertices;
+                primitive.indices = sourcePrimitive.indices;
+                primitive.materialIndex = sourcePrimitive.materialIndex;
+                primitive.material = sourcePrimitive.material;
+                for (size_t v = 0; v + 11 < primitive.vertices.size(); v += 12) {
+                    XMVECTOR p = XMVectorSet(primitive.vertices[v],
+                        primitive.vertices[v + 1], primitive.vertices[v + 2], 1.0f);
+                    XMVECTOR n = XMVectorSet(primitive.vertices[v + 3],
+                        primitive.vertices[v + 4], primitive.vertices[v + 5], 0.0f);
+                    XMVECTOR t = XMVectorSet(primitive.vertices[v + 8],
+                        primitive.vertices[v + 9], primitive.vertices[v + 10], 0.0f);
+                    p = XMVector3TransformCoord(p, transform);
+                    n = XMVector3Normalize(XMVector3TransformNormal(n, rotation));
+                    t = XMVector3Normalize(XMVector3TransformNormal(t, rotation));
+                    XMFLOAT3 pf, nf, tf;
+                    XMStoreFloat3(&pf, p); XMStoreFloat3(&nf, n); XMStoreFloat3(&tf, t);
+                    primitive.vertices[v] = pf.x;
+                    primitive.vertices[v + 1] = pf.y;
+                    primitive.vertices[v + 2] = pf.z;
+                    primitive.vertices[v + 3] = nf.x;
+                    primitive.vertices[v + 4] = nf.y;
+                    primitive.vertices[v + 5] = nf.z;
+                    primitive.vertices[v + 8] = tf.x;
+                    primitive.vertices[v + 9] = tf.y;
+                    primitive.vertices[v + 10] = tf.z;
+                }
+                child->mesh->primitives.push_back(std::move(primitive));
+            }
+            root->AddChild(child);
+        }
+    };
+
+    constexpr float radius = 9.0f;
+    addHouse(woodTemplate,  -3.5f, 3.5f,  0.0f,  radius, 0.0f,       1000000);
+    addHouse(metalTemplate,  4.75f, 3.55f, radius, 0.0f, XM_PIDIV2,  2000000);
+    addHouse(woodTemplate,  -3.5f, 3.5f,  0.0f, -radius, XM_PI,     3000000);
+    addHouse(metalTemplate,  4.75f, 3.55f,-radius, 0.0f,-XM_PIDIV2, 4000000);
+
+    XMFLOAT4X4 identity;
+    XMStoreFloat4x4(&identity, XMMatrixIdentity());
+    root->UpdateGlobalTransform(identity);
+}
+
 // Draw Blast/Box3D destruction state as a 2D overlay using ImGui's foreground
 // draw list: chunk AABBs coloured by role, bonds (green healthy / red severed),
 // and the last hit sphere. No new pipeline needed -- just project to screen.
@@ -1372,23 +1545,25 @@ VirtualInput virtualInput;
 
 static void ApplyVirtualInput() {
     Camera& cam = scene.camera;
-    if (virtualInput.forward) cam.ProcessKeyboard('W', deltaTime);
-    if (virtualInput.back)    cam.ProcessKeyboard('S', deltaTime);
-    if (virtualInput.left)    cam.ProcessKeyboard('A', deltaTime);
-    if (virtualInput.right)   cam.ProcessKeyboard('D', deltaTime);
+    if (virtualInput.moveY > 0.0f) cam.ProcessKeyboard('W', deltaTime,  virtualInput.moveY);
+    if (virtualInput.moveY < 0.0f) cam.ProcessKeyboard('S', deltaTime, -virtualInput.moveY);
+    if (virtualInput.moveX < 0.0f) cam.ProcessKeyboard('A', deltaTime, -virtualInput.moveX);
+    if (virtualInput.moveX > 0.0f) cam.ProcessKeyboard('D', deltaTime,  virtualInput.moveX);
     if (virtualInput.down)    cam.ProcessKeyboard('Q', deltaTime);
     if (virtualInput.jump)    cam.ProcessKeyboard(' ', deltaTime);
 
     if (virtualInput.lookX != 0.0f || virtualInput.lookY != 0.0f) {
-        cam.ProcessMouseMovement(virtualInput.lookX * virtualInput.lookSpeed * deltaTime,
-                                 virtualInput.lookY * virtualInput.lookSpeed * deltaTime);
+        constexpr float thumbstickLookMultiplier = 3.0f;
+        cam.ProcessMouseMovement(
+            virtualInput.lookX * virtualInput.lookSpeed * thumbstickLookMultiplier * deltaTime,
+            virtualInput.lookY * virtualInput.lookSpeed * thumbstickLookMultiplier * deltaTime);
     }
 
     if (virtualInput.shoot) {
         scene.fireCooldown -= deltaTime;
         if (scene.fireCooldown <= 0.0f) {
             ShootPlayerWeapon();
-            scene.fireCooldown = scene.fireInterval;
+            scene.fireCooldown = PlayerFireInterval();
         }
     }
 
@@ -1418,7 +1593,7 @@ static void ProcessInput(HWND) {
     if (scene.autoFire && mouseHeld && !ImGui::GetIO().WantCaptureMouse &&
         scene.fireCooldown <= 0.0f) {
         ShootPlayerWeapon();
-        scene.fireCooldown = scene.fireInterval;
+        scene.fireCooldown = PlayerFireInterval();
     }
 
     // Grenade: press G to lob one. Cooldown debounces the held key.
@@ -1447,6 +1622,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (visBuffer.initialized) visBuffer.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (g_rt.initialized) ResizeRaytracing(SCR_WIDTH, SCR_HEIGHT);
             }
+        }
+        return 0;
+
+    case WM_MOUSEWHEEL:
+        if (!ImGui::GetIO().WantCaptureMouse) {
+            GunModel::CycleWeapon(GET_WHEEL_DELTA_WPARAM(wParam));
+            scene.fireCooldown = 0.0f;
         }
         return 0;
 
@@ -1604,6 +1786,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     if (!g_profiler.Init(g_dx12.device.Get(), g_dx12.commandQueue.Get()))
         std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
     g_gunAudio.Initialize("models/audio/rifle_shot.wav");
+    g_hitAudio.Initialize("models/audio/bullet_flesh_hit.mp3");
+    g_banditSpottedAudio1.Initialize("models/audio/bandit_spotted_01.wav");
+    g_banditSpottedAudio2.Initialize("models/audio/bandit_spotted_02.wav");
+    g_banditAttackAudio.Initialize("models/audio/bandit_attack.wav");
+    g_banditDeathAudio.Initialize("models/audio/bandit_death.wav");
+    g_banditHitVoiceAudio.Initialize("models/audio/bandit_hit_voice.wav");
 
     // ImGui
     D3D12_DESCRIPTOR_HEAP_DESC ihd = {};
@@ -1769,6 +1957,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         scene.Update(deltaTime, now);
         g_gunAudio.Update();
+        g_hitAudio.Update();
+        g_banditSpottedAudio1.Update();
+        g_banditSpottedAudio2.Update();
+        g_banditAttackAudio.Update();
+        g_banditDeathAudio.Update();
+        g_banditHitVoiceAudio.Update();
+        g_banditVoiceCooldown = (std::max)(0.0f, g_banditVoiceCooldown - deltaTime);
+        g_banditPainCooldown = (std::max)(0.0f, g_banditPainCooldown - deltaTime);
 
         if (scene.rebuildDestructionRequested && wallModel) {
             scene.rebuildDestructionRequested = false;
@@ -1792,6 +1988,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // ragdolls while replacements enter through the same spawn zone.
         if (g_banditLoaded) {
             ProfilerDX12::CpuScope banditProfile(g_profiler, "Bandit Update");
+            for (float& timer : g_banditRespawnTimers)
+                timer = (std::max)(0.0f, timer - deltaTime);
             while (LiveBanditCount() < kBanditsOnScreen && SpawnBandit()) {}
             for (auto& bandit : g_bandits) {
                 if (!bandit || bandit->Dead()) continue;
@@ -1810,9 +2008,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 const bool hasLineOfSight =
                     !bandit->NeedsLineOfSightCheck() ||
                     BanditHasLineOfSight(*bandit, scene.camera.Position);
-                if (bandit->TryFireAt(
+                const bool fired = bandit->TryFireAt(
                         deltaTime, scene.camera.Position, hasLineOfSight,
-                        shotOrigin, shotDirection)) {
+                        shotOrigin, shotDirection);
+                if (bandit->ConsumeSpottedEvent() && g_banditVoiceCooldown <= 0.0f) {
+                    const float volume = BanditVoiceVolume(bandit->position);
+                    const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
+                    if (std::rand() & 1) g_banditSpottedAudio1.Play(volume, pitch);
+                    else g_banditSpottedAudio2.Play(volume, pitch);
+                    g_banditVoiceCooldown = 3.5f;
+                }
+                if (bandit->ConsumeAttackEvent() && g_banditVoiceCooldown <= 0.0f) {
+                    const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
+                    g_banditAttackAudio.Play(BanditVoiceVolume(bandit->position), pitch);
+                    g_banditVoiceCooldown = 4.5f;
+                }
+                if (fired) {
                     scene.SpawnHostileProjectile(shotOrigin, shotDirection);
                     const float dx = shotOrigin.x - scene.camera.Position.x;
                     const float dy = shotOrigin.y - scene.camera.Position.y;
@@ -1836,9 +2047,35 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
             g_destruction.Update(deltaTime);
-            if (g_banditLoaded)
+            if (g_banditLoaded) {
+                const std::vector<DestructionDebrisHazard> debris =
+                    g_destruction.GetDangerousDebris(2.5f);
+                for (const DestructionDebrisHazard& piece : debris) {
+                    for (auto& bandit : g_bandits) {
+                        if (!bandit || bandit->Dead()) continue;
+                        XMFLOAT3 impact;
+                        if (!bandit->ApplyDebrisImpact(piece, &impact)) continue;
+
+                        XMVECTOR normalVector = -XMLoadFloat3(&piece.velocity);
+                        normalVector = XMVector3Normalize(normalVector);
+                        XMFLOAT3 normal;
+                        XMStoreFloat3(&normal, normalVector);
+                        scene.SpawnBloodBurst(impact, normal);
+                        const float pitch =
+                            0.9f + ((float)std::rand() / RAND_MAX) * 0.2f;
+                        g_hitAudio.Play(0.72f * 0.3f, pitch);
+                        if (!bandit->Dead() && g_banditPainCooldown <= 0.0f) {
+                            g_banditHitVoiceAudio.Play(
+                                BanditVoiceVolume(impact, 0.72f), pitch);
+                            g_banditPainCooldown = 0.45f;
+                        }
+                        break; // one moving chunk damages one character per frame
+                    }
+                }
+                PlayBanditDeathEvents();
                 for (auto& bandit : g_bandits)
                     if (bandit && bandit->Dead()) bandit->SyncRagdoll();
+            }
             for (const EnemyShot& shot : g_destruction.DrainEnemyShots()) {
                 scene.SpawnHostileProjectile(shot.origin, shot.direction);
                 const float dx = shot.origin.x - scene.camera.Position.x;
@@ -1864,6 +2101,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                     scene.grenadeEnemyDamage,
                                     scene.grenadeEnemyPush);
                             }
+                            PlayBanditDeathEvents();
                         }
                         // Run after Bandit damage. Newly killed enemies have
                         // ragdolls now, so same blast launches their limbs too.
@@ -1885,6 +2123,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // the bullet has struck. Otherwise the wall breaks at a distance.
                 const float bulletRadius = std::max(0.12f, scene.projectileScale * 0.5f);
                 bool hitBandit = false;
+                bool killedBandit = false;
                 XMFLOAT3 banditHit = projectile.position;
                 // Hostile projectiles damage player only. Running them through
                 // this loop made enemies shoot themselves and squadmates.
@@ -1894,6 +2133,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                 projectile.previousPosition, projectile.position,
                                 projectile.direction, bulletRadius, &banditHit)) {
                             hitBandit = true;
+                            killedBandit = bandit->Dead();
                             break;
                         }
                     }
@@ -1902,6 +2142,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     const XMFLOAT3 normal(-projectile.direction.x, -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBloodBurst(banditHit, normal);
+                    const float hitPitch =
+                        g_fleshHitPitchMin + ((float)std::rand() / RAND_MAX) *
+                        (g_fleshHitPitchMax - g_fleshHitPitchMin);
+                    g_hitAudio.Play(0.72f * 0.3f, hitPitch);
+                    if (!killedBandit && g_banditPainCooldown <= 0.0f) {
+                        const float painPitch =
+                            0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
+                        g_banditHitVoiceAudio.Play(
+                            BanditVoiceVolume(banditHit, 0.82f), painPitch);
+                        g_banditPainCooldown = 0.45f;
+                    }
+                    PlayBanditDeathEvents();
                     projectile.active = false;
                     continue;
                 }
@@ -2046,6 +2298,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             wallModel = CreateDestructibleWallModel();
             ApplyHouseTextures(wallModel, g_dx12.device.Get(), g_dx12.commandList.Get());
             AppendRoofChunksToDestructionModel(wallModel);
+            ArrangeHousesInCross(wallModel);
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
             // Pool of water beside the house (on the clear -X side) with a
             // handful of wooden crates dropped in to bob on the surface.
@@ -2060,7 +2313,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 auto terrainSampler = [tp](float x, float z) {
                     return TerrainRendererDX12::HeightAt(tp, x, z);
                 };
-                g_water.Initialize({ -12.0f, -1.85f, 0.0f }, { 14.0f, 2.7f, 14.0f },
+                g_water.Initialize({ -22.0f, -1.85f, -20.0f }, { 14.0f, 2.7f, 14.0f },
                                    terrainSampler);
 
                 // The sea. A single big wave surface at y = 0 (sea level), spanning
@@ -2083,14 +2336,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
                 // Block hung from a rope, out on the open +X side away from the
                 // pool. Shoot the rope and it drops; shoot the block and it swings.
-                const float ropeX = 14.0f, ropeZ = 2.0f;
+                const float ropeX = 22.0f, ropeZ = 12.0f;
                 const float groundY = terrainSampler(ropeX, ropeZ);
                 g_rope.SetGroundY(groundY);
                 g_rope.Initialize(XMFLOAT3(ropeX, groundY + 6.5f, ropeZ));
 
                 // Ragdoll strung up from a second rope, further along. Shoot the
                 // rope and the body drops in a heap; shoot a limb and it swings.
-                const float gibX = 20.0f, gibZ = 2.0f;
+                const float gibX = 26.0f, gibZ = 12.0f;
                 const float gibGround = terrainSampler(gibX, gibZ);
                 g_gibbet.SetGroundY(gibGround);
                 g_gibbet.Initialize(XMFLOAT3(gibX, gibGround + 7.5f, gibZ),
@@ -2102,16 +2355,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_trees.Initialize();
                 struct PalmSpot { float x, z, h, lean; };
                 static const PalmSpot palms[] = {
-                    { -20.0f,  -8.0f, 7.5f,  0.5f },
-                    { -16.0f,  -9.5f, 6.4f, -0.4f },
-                    { -21.5f,   3.0f, 8.2f,  0.7f },
-                    { -18.0f,   8.5f, 6.8f, -0.6f },
-                    { -11.0f,  10.5f, 7.1f,  0.3f },
-                    {  -4.5f,   9.0f, 6.0f, -0.5f },
-                    {  -4.0f,  -9.0f, 7.8f,  0.6f },
-                    { -12.5f, -11.0f, 6.6f, -0.3f },
+                    { -29.0f, -25.0f, 7.5f,  0.5f },
+                    { -25.0f, -28.0f, 6.4f, -0.4f },
+                    { -20.0f, -29.0f, 8.2f,  0.7f },
+                    { -15.0f, -25.0f, 6.8f, -0.6f },
+                    { -14.0f, -19.0f, 7.1f,  0.3f },
+                    { -17.0f, -13.0f, 6.0f, -0.5f },
+                    { -23.0f, -12.0f, 7.8f,  0.6f },
+                    { -29.0f, -15.0f, 6.6f, -0.3f },
                 };
                 for (const PalmSpot& p : palms) g_trees.Plant(p.x, p.z, p.h, p.lean);
+
+                std::vector<NavigationObstacle> navigationObstacles = {
+                    { -4.2f,   5.8f,  4.2f,  12.2f }, // north house
+                    {  5.8f,  -3.4f, 12.2f,   3.4f }, // east house
+                    { -4.2f, -12.2f,  4.2f,  -5.8f }, // south house
+                    {-12.2f,  -3.4f, -5.8f,   3.4f }, // west house
+                    {-29.0f, -27.0f,-15.0f, -13.0f }  // relocated pool basin
+                };
+                for (const PalmSpot& p : palms)
+                    navigationObstacles.push_back(
+                        { p.x - 0.55f, p.z - 0.55f, p.x + 0.55f, p.z + 0.55f });
+                if (!g_navigation.BuildTerrain(
+                        terrainSampler, -61.0f, 61.0f, -61.0f, 61.0f,
+                        navigationObstacles)) {
+                    std::cerr << "Recast navigation build failed; Bandits use direct steering\n";
+                }
 
                 // Grass across the island, keyed off the same terrain height the
                 // ground is drawn from. Blades that would land in the sea, on the
@@ -2126,8 +2395,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             // Same pool AABB for the destruction sim so house debris shoved into
             // the water floats too (surface at max.y).
-            g_destruction.SetWaterRegion({ -19.0f, -3.2f, -7.0f },
-                                         {  -5.0f, -0.5f,  7.0f });
+            g_destruction.SetWaterRegion({ -29.0f, -3.2f, -27.0f },
+                                         { -15.0f, -0.5f, -13.0f });
             if (crateModel) {
                 if (auto merged = GLBImporter::MergeSceneByMaterial(crateModel, g_dx12.device)) {
                     crateModel = merged;
@@ -2208,7 +2477,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 ProfilerDX12::Scope profile(g_profiler, "Shadow", g_dx12.commandList.Get());
                 lightSpace = shadowMap.Render(
                     scene, geo, g_showH2Model ? crateModel : nullptr,
-                    g_banditLoaded ? FirstLiveBandit() : nullptr);
+                    g_banditLoaded ? &g_bandits : nullptr);
                 shadowResource = shadowMap.GetResource();
             }
             if (msaaActive) msaa.Bind();
@@ -2299,6 +2568,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     g_destruction.Shutdown();
+    g_banditHitVoiceAudio.Shutdown();
+    g_banditDeathAudio.Shutdown();
+    g_banditAttackAudio.Shutdown();
+    g_banditSpottedAudio2.Shutdown();
+    g_banditSpottedAudio1.Shutdown();
+    g_hitAudio.Shutdown();
     g_gunAudio.Shutdown();
     g_profiler.Shutdown();
     CleanupDX12();

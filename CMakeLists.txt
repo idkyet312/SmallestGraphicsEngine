@@ -41,6 +41,12 @@ if(MSVC)
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
 
+# Vendored stable Recast Navigation. Build only navmesh generation/runtime libs.
+set(RECASTNAVIGATION_DEMO OFF CACHE BOOL "" FORCE)
+set(RECASTNAVIGATION_TESTS OFF CACHE BOOL "" FORCE)
+set(RECASTNAVIGATION_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory(thirdparty/recastnavigation EXCLUDE_FROM_ALL)
+
 # Option to choose DX11 or DX12
 option(USE_DX12 "Build with DirectX 12 instead of DirectX 11" ON)
 
@@ -80,6 +86,7 @@ set(HEADER_FILES
     src/DX12Core.h
     src/ProfilerDX12.h
     src/GunAudio.h
+    src/NavigationSystem.h
     src/T3DPhysicsAsset.h
     src/Model.h
     src/ModelDX11.h
@@ -186,6 +193,9 @@ if(USE_DX12)
         src/GLBImporter.cpp
         src/FBXImporter.cpp
         src/SkinnedFBXImporter.cpp
+        src/StbVorbis.cpp
+        src/DrMp3.cpp
+        src/NavigationSystem.cpp
         src/DestructionDX12.cpp
         ${HEADER_FILES}
         ${SHADER_FILES}
@@ -201,6 +211,8 @@ if(USE_DX12)
         unofficial::tinyexr::tinyexr
         assimp::assimp
         box3d
+        RecastNavigation::Recast
+        RecastNavigation::Detour
         NvBlast
     )
     target_include_directories(GraphicEngine PRIVATE ${TINYGLTF_INCLUDE_DIRS})

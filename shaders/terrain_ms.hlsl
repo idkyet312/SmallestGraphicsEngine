@@ -65,7 +65,7 @@ float fbm(float2 p) {
 // A dug-out basin the water pool sits in, so the pool reads as a hole in the
 // ground rather than a box on top of it. Centre/reach/depth must match the pool
 // spawned in main.cpp (and the CPU mirror in TerrainRendererDX12::HeightAt).
-static const float2 kPoolCenter = float2(-12.0, 0.0);
+static const float2 kPoolCenter = float2(-22.0, -20.0);
 static const float  kPoolRadius = 4.2;   // flat basin floor out to here
 static const float  kPoolRim    = 7.0;   // slopes back up to ground by here
 static const float  kPoolDepth  = 3.0;   // how far the floor drops below ground
@@ -79,16 +79,14 @@ static const float kSeabed     = -6.0;   // sea floor depth past the shore
 static const float kShoreInner = 34.0;   // solid land out to here
 static const float kShoreOuter = 52.0;   // fully underwater by here
 
-// Flat building pad under BOTH houses: the wooden one spans x -7..0 and the metal
-// shack x 2..7.5, both z ~1..6, so the pad is centred on their combined footprint.
-// Applied after everything else so neither the noise nor the pool rim can dent it,
-// and faded out before the pool basin at x = -12 so that stays intact.
+// Flat arena under the four houses arranged around world centre. Applied after
+// everything else and faded out before the relocated pool basin.
 // kPadHeight is Ground::kBuildingPadY (src/GroundLevel.h) -- the houses and their
 // roofs are all built up from that constant, so if this drifts they end up buried
 // in the sand or floating over it. Must match TerrainRendererDX12::HeightAt.
-static const float2 kPadCenter = float2(0.25, 3.5);   // both houses' combined centre
-static const float  kPadRadius = 8.5;    // dead flat out to here
-static const float  kPadFade   = 12.0;   // blended back into the terrain by here
+static const float2 kPadCenter = float2(0.0, 0.0);
+static const float  kPadRadius = 14.0;   // dead flat through all four foundations
+static const float  kPadFade   = 18.0;   // blended back into the terrain by here
 static const float  kPadHeight = 2.5;    // = kLandLift: island's natural ground level
 
 float TerrainHeight(float2 xz) {

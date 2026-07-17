@@ -14,6 +14,14 @@ struct DestructionRenderItem {
     DirectX::XMFLOAT4X4 transform;
 };
 
+struct DestructionDebrisHazard {
+    DirectX::XMFLOAT3 worldMin;
+    DirectX::XMFLOAT3 worldMax;
+    DirectX::XMFLOAT3 worldCenter;
+    DirectX::XMFLOAT3 velocity;
+    float mass = 0.0f;
+};
+
 struct RagdollRenderItem {
     DirectX::XMFLOAT4X4 transform;
     DirectX::XMFLOAT3 color;
@@ -85,7 +93,8 @@ public:
     std::vector<EnemyShot> DrainEnemyShots();
     uint32_t SpawnAuthoredRagdoll(const std::vector<AuthoredRagdollBody>& bodies,
                                   const std::vector<RagdollConstraintSpec>& constraints,
-                                  const DirectX::XMFLOAT3& impulseDirection);
+                                  const DirectX::XMFLOAT3& impulseDirection,
+                                  const DirectX::XMFLOAT3& impactPosition);
     bool GetAuthoredRagdollPose(uint32_t ragdollId,
                                std::vector<AuthoredRagdollPose>& pose) const;
     bool HitTest(const DirectX::XMFLOAT3& worldPosition, float radius,
@@ -124,6 +133,10 @@ public:
     // Take and clear the world positions where the building fractured pieces
     // loose since the last call, so the caller can spawn smoke at each break.
     std::vector<DirectX::XMFLOAT3> DrainBreakPoints();
+    // Snapshot of awake, fast-moving destructible chunks. Used by gameplay to
+    // make physical debris strike characters without coupling physics to AI.
+    std::vector<DestructionDebrisHazard> GetDangerousDebris(
+        float minimumSpeed = 2.5f) const;
 
     bool IsInitialized() const;
     uint32_t GetChunkCount() const;

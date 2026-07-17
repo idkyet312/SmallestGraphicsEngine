@@ -268,6 +268,12 @@ struct DestructionDX12::Impl {
     std::vector<RagdollPart> ragdollParts;
     std::vector<RagdollRenderItem> ragdollRenderItems;
     uint32_t nextAuthoredRagdollId = 0;
+    struct AuthoredRagdollRuntime {
+        uint32_t id = InvalidIndex;
+        float muscleTime = 0.0f;
+        std::vector<b3JointId> joints;
+    };
+    std::vector<AuthoredRagdollRuntime> authoredRagdolls;
     struct HoverEnemy {
         size_t firstPart = 0;
         b3BodyId torso = b3_nullBodyId;
@@ -332,6 +338,18 @@ struct DestructionDX12::Impl {
         return !(p.x < waterMin.x || p.x > waterMax.x ||
                  p.z < waterMin.z || p.z > waterMax.z ||
                  p.y - 1.0f > waterMax.y);
+    }
+
+    // Brief muscle tension preserves the animated hit pose, then releases into
+    // passive physics. This avoids an instant rubber collapse on the kill frame.
+    void RelaxAuthoredRagdolls(float dt) {
+        for (AuthoredRagdollRuntime& ragdoll : authoredRagdolls) {
+            if (ragdoll.muscleTime <= 0.0f) continue;
+            ragdoll.muscleTime -= dt;
+            if (ragdoll.muscleTime > 0.0f) continue;
+            for (b3JointId joint : ragdoll.joints)
+                b3SphericalJoint_EnableSpring(joint, false);
+        }
     }
 
     void ApplyWaterBuoyancy() {
@@ -1398,6 +1416,7 @@ void DestructionDX12::Shutdown() {
     if (m->framework) ReleaseTkFramework();
     m->group = nullptr; m->asset = nullptr; m->framework = nullptr;
     m->chunks.clear(); m->renderItems.clear(); m->ragdollParts.clear();
+    m->authoredRagdolls.clear();
     m->ragdollRenderItems.clear(); m->initialized = false;
 }
 
@@ -1416,6 +1435,7 @@ void DestructionDX12::Update(float dt) {
     while (m->accumulator >= step) {
         m->ApplyWaterBuoyancy();
         m->ApplyEnemyHover(step);
+        m->RelaxAuthoredRagdolls(step);
         b3World_Step(m->world, step, 4);
         m->accumulator -= step;
         // Physics impact damage: collisions above the world's hit-event speed
@@ -1470,7 +1490,8 @@ std::vector<EnemyShot> DestructionDX12::DrainEnemyShots() {
 uint32_t DestructionDX12::SpawnAuthoredRagdoll(
     const std::vector<AuthoredRagdollBody>& bodies,
     const std::vector<RagdollConstraintSpec>& constraints,
-    const XMFLOAT3& impulseDirection) {
+    const XMFLOAT3& impulseDirection,
+    const XMFLOAT3& impactPosition) {
     if (!m || !m->initialized || B3_IS_NULL(m->world) || bodies.empty()) return InvalidIndex;
     const uint32_t ragdollId = m->nextAuthoredRagdollId++;
     const size_t base = m->ragdollParts.size();
@@ -1484,8 +1505,8 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
         bd.rotation = { { src.rotation.x, src.rotation.y, src.rotation.z }, src.rotation.w };
         // Human tissue/clothing loses energy quickly. Extra angular damping
         // removes rubber-doll spinning while leaving limbs responsive.
-        bd.linearDamping = 0.28f;
-        bd.angularDamping = 0.85f;
+        bd.linearDamping = 0.42f;
+        bd.angularDamping = 1.35f;
         const b3BodyId body = b3CreateBody(m->world, &bd);
         b3ShapeDef sd = b3DefaultShapeDef();
         float density = 420.0f;
@@ -1513,6 +1534,10 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
                                     false, ragdollId, src.name });
         indices[src.name] = i;
     }
+    Impl::AuthoredRagdollRuntime runtime;
+    runtime.id = ragdollId;
+    runtime.muscleTime = 0.42f;
+    runtime.joints.reserve(constraints.size());
     for (const RagdollConstraintSpec& link : constraints) {
         auto a = indices.find(link.boneA), b = indices.find(link.boneB);
         if (a == indices.end() || b == indices.end()) continue;
@@ -1531,22 +1556,51 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
         jd.enableTwistLimit = true;
         jd.lowerTwistAngle = -(std::max)(0.035f, link.twistAngle);
         jd.upperTwistAngle =  (std::max)(0.035f, link.twistAngle);
-        b3CreateSphericalJoint(m->world, &jd);
+        jd.enableSpring = true;
+        jd.hertz = 2.4f;
+        jd.dampingRatio = 1.05f;
+        jd.targetRotation = b3InvMulQuat(
+            b3Body_GetRotation(bodyA), b3Body_GetRotation(bodyB));
+        runtime.joints.push_back(b3CreateSphericalJoint(m->world, &jd));
     }
+    m->authoredRagdolls.push_back(std::move(runtime));
     XMVECTOR dir = XMVector3Normalize(XMLoadFloat3(&impulseDirection));
     if (XMVectorGetX(XMVector3LengthSq(dir)) < 1e-5f) dir = XMVectorSet(0, 0.2f, 1, 0);
+    size_t nearest = 0;
+    float nearestDistanceSq = FLT_MAX;
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        const float dx = bodies[i].position.x - impactPosition.x;
+        const float dy = bodies[i].position.y - impactPosition.y;
+        const float dz = bodies[i].position.z - impactPosition.z;
+        const float distanceSq = dx*dx + dy*dy + dz*dz;
+        if (distanceSq < nearestDistanceSq) {
+            nearestDistanceSq = distanceSq;
+            nearest = i;
+        }
+    }
     for (size_t i = 0; i < bodies.size(); ++i) {
         const b3BodyId body = m->ragdollParts[base + i].body;
         const float mass = (std::max)(0.05f, b3Body_GetMass(body));
         const std::string& bone = bodies[i].name;
         const bool core = bone.find("pelvis") != std::string::npos ||
                           bone.find("spine") != std::string::npos;
-        const float impulseScale = core ? 1.65f : 0.58f;
+        const float dx = bodies[i].position.x - impactPosition.x;
+        const float dy = bodies[i].position.y - impactPosition.y;
+        const float dz = bodies[i].position.z - impactPosition.z;
+        const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+        const float localReaction = (i == nearest) ? 2.8f :
+            0.85f * (std::max)(0.0f, 1.0f - distance / 0.9f);
+        const float impulseScale = 0.22f + (core ? 0.28f : 0.0f) + localReaction;
         XMFLOAT3 impulse;
         XMStoreFloat3(&impulse, dir * (mass * impulseScale));
-        b3Body_ApplyLinearImpulseToCenter(
-            body, { impulse.x, impulse.y + mass * (core ? 0.18f : 0.06f),
-                    impulse.z }, true);
+        const b3Vec3 hitImpulse = {
+            impulse.x, impulse.y + mass * (core ? 0.14f : 0.04f), impulse.z };
+        if (i == nearest) {
+            b3Body_ApplyLinearImpulse(body, hitImpulse,
+                { impactPosition.x, impactPosition.y, impactPosition.z }, true);
+        } else {
+            b3Body_ApplyLinearImpulseToCenter(body, hitImpulse, true);
+        }
     }
     m->RebuildRenderItems();
     return ragdollId;
@@ -1959,6 +2013,53 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
             m->actors.push_back(std::move(runtime));
         }
     }
+}
+
+std::vector<DestructionDebrisHazard> DestructionDX12::GetDangerousDebris(
+    float minimumSpeed) const {
+    std::vector<DestructionDebrisHazard> hazards;
+    if (!m || !m->initialized) return hazards;
+    const float minimumSpeedSq = minimumSpeed * minimumSpeed;
+
+    for (const auto& runtime : m->actors) {
+        if (!runtime->dynamic || B3_IS_NULL(runtime->body) ||
+            !b3Body_IsAwake(runtime->body)) continue;
+
+        const XMMATRIX transform = BoxTransform(runtime->body, runtime->center);
+        const float chunkMass = std::max(0.05f, b3Body_GetMass(runtime->body)) /
+                                std::max<size_t>(1, runtime->chunks.size());
+        for (uint32_t chunkIndex : runtime->chunks) {
+            const Impl::Chunk& chunk = m->chunks[chunkIndex];
+            XMFLOAT3 worldMin(FLT_MAX, FLT_MAX, FLT_MAX);
+            XMFLOAT3 worldMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            for (float x : { chunk.minimum.x, chunk.maximum.x })
+            for (float y : { chunk.minimum.y, chunk.maximum.y })
+            for (float z : { chunk.minimum.z, chunk.maximum.z }) {
+                XMFLOAT3 point;
+                XMStoreFloat3(&point, XMVector3TransformCoord(
+                    XMVectorSet(x, y, z, 1.0f), transform));
+                worldMin.x = std::min(worldMin.x, point.x);
+                worldMin.y = std::min(worldMin.y, point.y);
+                worldMin.z = std::min(worldMin.z, point.z);
+                worldMax.x = std::max(worldMax.x, point.x);
+                worldMax.y = std::max(worldMax.y, point.y);
+                worldMax.z = std::max(worldMax.z, point.z);
+            }
+
+            XMFLOAT3 center;
+            XMStoreFloat3(&center, XMVector3TransformCoord(
+                XMLoadFloat3(&chunk.center), transform));
+            const b3Vec3 velocity = b3Body_GetWorldPointVelocity(
+                runtime->body, { center.x, center.y, center.z });
+            const float speedSq = velocity.x * velocity.x +
+                                  velocity.y * velocity.y +
+                                  velocity.z * velocity.z;
+            if (speedSq < minimumSpeedSq) continue;
+            hazards.push_back({ worldMin, worldMax, center,
+                { velocity.x, velocity.y, velocity.z }, chunkMass });
+        }
+    }
+    return hazards;
 }
 
 bool DestructionDX12::IsInitialized() const { return m && m->initialized; }

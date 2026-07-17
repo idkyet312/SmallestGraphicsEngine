@@ -234,7 +234,7 @@ public:
     XMMATRIX Render(Scene& scene,
                     const GeometryBuffers& geo,
                     const std::shared_ptr<SceneNode>& crateModel,
-                    SkinnedEnemy* bandit = nullptr) {
+                    const std::vector<std::unique_ptr<SkinnedEnemy>>* bandits = nullptr) {
         XMMATRIX lightSpace = ComputeLightSpace(scene);
         if (!initialized || scene.lightType != 0) return lightSpace;
 
@@ -293,7 +293,10 @@ public:
             depthShader.NextDrawCall();
         }
 
-        if (bandit && (bandit->castsShadow || bandit->Dead()) && bandit->CanRender()) {
+        if (bandits) for (const auto& banditOwner : *bandits) {
+            SkinnedEnemy* bandit = banditOwner.get();
+            if (!bandit || (!bandit->castsShadow && !bandit->Dead()) || !bandit->CanRender())
+                continue;
             const D3D12_GPU_VIRTUAL_ADDRESS palette = bandit->UploadPalette();
             const XMMATRIX model = bandit->MeshWorldMatrix();
             for (const auto& prim : bandit->model.node->mesh->primitives) {

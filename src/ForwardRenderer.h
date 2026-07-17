@@ -742,7 +742,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         const XMMATRIX gunBase = scene.GetGunBaseMatrix();
         const float S = scene.GunModelScale();
 
-        if (GunModel::Loaded()) {
+        if (GunModel::PlayerLoaded()) {
             // The model is normalised with its origin at the rear of the weapon,
             // so shift it back and down into the same pocket of screen space the
             // boxed M4 occupied, then scale to the gun's on-screen size.
@@ -751,7 +751,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 XMMatrixTranslation(0.0f, -0.10f * S, -0.44f * S) *
                 gunBase;
             shader.Use(scene.wireframeMode);
-            DrawMeshAt(GunModel::Mesh(), shader, xf, view, proj, lightSpace);
+            DrawMeshAt(GunModel::PlayerMesh(), shader, xf, view, proj, lightSpace);
             shader.Use(scene.wireframeMode);
         } else {
             // Fallback: the old M4-style carbine, built from boxed parts.

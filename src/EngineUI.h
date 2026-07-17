@@ -8,6 +8,8 @@
 #include "VirtualInput.h"
 #include "GrassField.h"
 #include "ProfilerDX12.h"
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 // Forward declare raytracing context
@@ -20,27 +22,15 @@ extern ProfilerDX12 g_profiler;
 // SkinnedEnemy type is complete.
 void BanditDebugText();
 
-// On-screen pad: drive the camera with the mouse alone. A button held down sets
-// the flag every frame it stays active, which ProcessInput drains like a key.
+// On-screen dual-stick controls: analog movement and analog camera look.
 inline void RenderMovementPad() {
-    // Rebuild the held state every frame: a button that is no longer active
-    // simply doesn't re-set its flag, so movement stops on release.
-    virtualInput.forward = virtualInput.back = false;
-    virtualInput.left = virtualInput.right = false;
+    virtualInput.moveX = virtualInput.moveY = 0.0f;
     virtualInput.down = virtualInput.shoot = false;
     virtualInput.lookX = virtualInput.lookY = 0.0f;
 
     if (!virtualInput.showPad) return;
 
-    ImGui::SetNextWindowSize(ImVec2(0, 0), ImGuiCond_Always);
-    // Bottom-right, pinned by that corner so it stays put across resizes.
-    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 20.0f,
-                                   ImGui::GetIO().DisplaySize.y - 20.0f),
-                            ImGuiCond_Always, ImVec2(1.0f, 1.0f));
-    ImGui::Begin("Movement Pad", &virtualInput.showPad, ImGuiWindowFlags_AlwaysAutoResize);
-
-    const ImVec2 btn(48.0f, 34.0f);
-    const float  col = btn.x + ImGui::GetStyle().ItemSpacing.x;
+    constexpr float controlWidth = 155.0f;
 
     // A pad button counts as "held" while the cursor sits on it AND the left
     // mouse is down. IsItemActive() alone drops the moment the cursor stops
@@ -50,37 +40,72 @@ inline void RenderMovementPad() {
         return ImGui::IsItemHovered() && ImGui::IsMouseDown(ImGuiMouseButton_Left);
     };
 
-    // Directional pad drawn as an explicit 3-column cross. Each button gets an
-    // absolute cursor position, so the rows never overlap and every button is
-    // independently hittable.
-    auto padRow = [&](const char* topLbl, const char* lLbl, const char* mLbl,
-                      const char* rLbl, auto onTop, auto onL, auto onM, auto onR) {
-        float x0 = ImGui::GetCursorPosX();
-        // Top button, indented one column so it sits above the middle button.
-        ImGui::SetCursorPosX(x0 + col);
-        ImGui::Button(topLbl, btn); if (isHeld()) onTop();
-
-        // Bottom row: three buttons chained with plain SameLine so their rects
-        // never overlap and each stays put frame-to-frame.
-        ImGui::SetCursorPosX(x0);
-        ImGui::Button(lLbl, btn); if (isHeld()) onL();
-        ImGui::SameLine();
-        ImGui::Button(mLbl, btn); if (isHeld()) onM();
-        ImGui::SameLine();
-        ImGui::Button(rLbl, btn); if (isHeld()) onR();
+    auto thumbstick = [&](const char* id) {
+        constexpr float stickSize = 116.0f;
+        constexpr float stickRadius = 48.0f;
+        constexpr float knobRadius = 17.0f;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             (controlWidth - stickSize) * 0.5f);
+        ImGui::InvisibleButton(id, ImVec2(stickSize, stickSize),
+                               ImGuiButtonFlags_MouseButtonLeft);
+        const bool active = ImGui::IsItemActive();
+        const ImVec2 stickMin = ImGui::GetItemRectMin();
+        const ImVec2 center(stickMin.x + stickSize * 0.5f,
+                            stickMin.y + stickSize * 0.5f);
+        ImVec2 value(0.0f, 0.0f);
+        if (active) {
+            const ImVec2 mouse = ImGui::GetIO().MousePos;
+            value.x = (mouse.x - center.x) / stickRadius;
+            value.y = (mouse.y - center.y) / stickRadius;
+            const float length = std::sqrt(value.x * value.x + value.y * value.y);
+            if (length > 1.0f) { value.x /= length; value.y /= length; }
+            constexpr float deadZone = 0.12f;
+            if (length <= deadZone) {
+                value = ImVec2(0.0f, 0.0f);
+            } else {
+                const float clamped = (std::min)(1.0f, length);
+                const float scale = ((clamped - deadZone) / (1.0f - deadZone)) / clamped;
+                value.x *= scale; value.y *= scale;
+            }
+        }
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        draw->AddCircleFilled(center, stickRadius, IM_COL32(25, 28, 34, 220), 40);
+        draw->AddCircle(center, stickRadius, IM_COL32(130, 140, 155, 255), 40, 2.0f);
+        draw->AddLine(ImVec2(center.x-stickRadius+9.0f, center.y),
+                      ImVec2(center.x+stickRadius-9.0f, center.y), IM_COL32(75,82,94,180));
+        draw->AddLine(ImVec2(center.x, center.y-stickRadius+9.0f),
+                      ImVec2(center.x, center.y+stickRadius-9.0f), IM_COL32(75,82,94,180));
+        const ImVec2 knob(center.x + value.x * stickRadius,
+                          center.y + value.y * stickRadius);
+        draw->AddCircleFilled(knob, knobRadius,
+            active ? IM_COL32(86,156,255,255) : IM_COL32(105,112,124,255), 32);
+        draw->AddCircle(knob, knobRadius, IM_COL32(205,218,235,255), 32, 1.5f);
+        return value;
     };
 
+    // Movement belongs under left thumb. Keep it above bottom-left health bar.
+    ImGui::SetNextWindowSize(ImVec2(0, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(20.0f, ImGui::GetIO().DisplaySize.y - 88.0f),
+                            ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    ImGui::Begin("Movement Stick", nullptr,
+                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
     ImGui::TextUnformatted("Move");
-    padRow("W", "A", "S", "D",
-           [] { virtualInput.forward = true; }, [] { virtualInput.left = true; },
-           [] { virtualInput.back = true; },    [] { virtualInput.right = true; });
+    const ImVec2 moveStick = thumbstick("Move thumbstick");
+    virtualInput.moveX = moveStick.x;
+    virtualInput.moveY = -moveStick.y;
+    ImGui::End();
 
-    ImGui::Separator();
-
+    // Camera and action controls stay under right thumb.
+    ImGui::SetNextWindowSize(ImVec2(0, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 20.0f,
+                                   ImGui::GetIO().DisplaySize.y - 20.0f),
+                            ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    ImGui::Begin("Look / Actions", &virtualInput.showPad,
+                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
     ImGui::TextUnformatted("Look");
-    padRow("Up", "Left", "Down", "Right",
-           [] { virtualInput.lookY += 1.0f; }, [] { virtualInput.lookX -= 1.0f; },
-           [] { virtualInput.lookY -= 1.0f; }, [] { virtualInput.lookX += 1.0f; });
+    const ImVec2 lookStick = thumbstick("Look thumbstick");
+    virtualInput.lookX = lookStick.x;
+    virtualInput.lookY = -lookStick.y;
 
     ImGui::Separator();
 
@@ -90,10 +115,10 @@ inline void RenderMovementPad() {
     ImGui::Button("Down##fly", ImVec2(74.0f, 34.0f));
     if (isHeld()) virtualInput.down = true;
 
-    ImGui::Button("Shoot", ImVec2(155.0f, 34.0f));
+    ImGui::Button("Shoot", ImVec2(controlWidth, 34.0f));
     if (isHeld()) virtualInput.shoot = true;
 
-    ImGui::SetNextItemWidth(155.0f);
+    ImGui::SetNextItemWidth(controlWidth);
     ImGui::SliderFloat("Look Speed", &virtualInput.lookSpeed, 20.0f, 600.0f, "%.0f");
 
     ImGui::End();

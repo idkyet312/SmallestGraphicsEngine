@@ -2,12 +2,18 @@
 
 #include <xaudio2.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+
+#define STB_VORBIS_HEADER_ONLY
+#include "../thirdparty/stb/stb_vorbis.c"
+#undef STB_VORBIS_HEADER_ONLY
+#include "../thirdparty/dr_libs/dr_mp3.h"
 
 // Small overlapping-voice player for short PCM/float WAV effects.
 class GunAudio {
@@ -17,8 +23,8 @@ public:
     bool Initialize(const std::string& relativePath) {
         Shutdown();
         const std::string path = Resolve(relativePath);
-        if (!LoadWav(path)) {
-            std::cerr << "Gun audio unavailable: " << path << "\n";
+        if (!LoadAudio(path)) {
+            std::cerr << "Audio unavailable: " << path << "\n";
             return false;
         }
         HRESULT hr = XAudio2Create(&engine_);
@@ -27,7 +33,7 @@ public:
             std::cerr << "XAudio2 initialization failed\n";
             return false;
         }
-        std::cout << "Gun audio loaded: " << path << "\n";
+        std::cout << "Audio loaded: " << path << "\n";
         return true;
     }
 
@@ -73,6 +79,60 @@ private:
         uint32_t value = 0;
         file.read(reinterpret_cast<char*>(&value), sizeof(value));
         return value;
+    }
+
+    bool LoadAudio(const std::string& path) {
+        const std::string extension = std::filesystem::path(path).extension().string();
+        if (extension == ".ogg") return LoadOgg(path);
+        if (extension == ".mp3") return LoadMp3(path);
+        return LoadWav(path);
+    }
+
+    bool LoadMp3(const std::string& path) {
+        drmp3_config config = {};
+        drmp3_uint64 frameCount = 0;
+        drmp3_int16* decoded = drmp3_open_file_and_read_pcm_frames_s16(
+            path.c_str(), &config, &frameCount, nullptr);
+        if (!decoded || frameCount == 0 || config.channels == 0 || config.sampleRate == 0)
+            return false;
+
+        const size_t byteCount = static_cast<size_t>(frameCount) *
+                                 static_cast<size_t>(config.channels) * sizeof(drmp3_int16);
+        samples_.assign(reinterpret_cast<const uint8_t*>(decoded),
+                        reinterpret_cast<const uint8_t*>(decoded) + byteCount);
+        drmp3_free(decoded, nullptr);
+
+        format_ = {};
+        format_.wFormatTag = WAVE_FORMAT_PCM;
+        format_.nChannels = static_cast<WORD>(config.channels);
+        format_.nSamplesPerSec = static_cast<DWORD>(config.sampleRate);
+        format_.wBitsPerSample = 16;
+        format_.nBlockAlign = static_cast<WORD>(config.channels * sizeof(drmp3_int16));
+        format_.nAvgBytesPerSec = format_.nSamplesPerSec * format_.nBlockAlign;
+        return true;
+    }
+
+    bool LoadOgg(const std::string& path) {
+        int channels = 0, sampleRate = 0;
+        short* decoded = nullptr;
+        const int samplesPerChannel = stb_vorbis_decode_filename(
+            path.c_str(), &channels, &sampleRate, &decoded);
+        if (samplesPerChannel <= 0 || channels <= 0 || !decoded) return false;
+
+        const size_t byteCount = static_cast<size_t>(samplesPerChannel) *
+                                 static_cast<size_t>(channels) * sizeof(short);
+        samples_.assign(reinterpret_cast<const uint8_t*>(decoded),
+                        reinterpret_cast<const uint8_t*>(decoded) + byteCount);
+        free(decoded);
+
+        format_ = {};
+        format_.wFormatTag = WAVE_FORMAT_PCM;
+        format_.nChannels = static_cast<WORD>(channels);
+        format_.nSamplesPerSec = static_cast<DWORD>(sampleRate);
+        format_.wBitsPerSample = 16;
+        format_.nBlockAlign = static_cast<WORD>(channels * sizeof(short));
+        format_.nAvgBytesPerSec = format_.nSamplesPerSec * format_.nBlockAlign;
+        return true;
     }
 
     bool LoadWav(const std::string& path) {

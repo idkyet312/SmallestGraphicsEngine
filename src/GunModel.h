@@ -48,6 +48,30 @@ public:
     }
     static bool Loaded() { return Mesh() != nullptr; }
 
+    static std::shared_ptr<SceneMesh>& ShotgunMesh() {
+        static std::shared_ptr<SceneMesh> mesh;
+        return mesh;
+    }
+    static bool ShotgunLoaded() { return ShotgunMesh() != nullptr; }
+
+    static int& SelectedWeapon() {
+        static int weapon = 0; // 0 = AK47, 1 = Mossberg 590A1
+        return weapon;
+    }
+    static bool ShotgunSelected() { return SelectedWeapon() == 1 && ShotgunLoaded(); }
+    static const char* SelectedWeaponName() {
+        return ShotgunSelected() ? "Mossberg 590A1" : "AK47";
+    }
+    static std::shared_ptr<SceneMesh>& PlayerMesh() {
+        return ShotgunSelected() ? ShotgunMesh() : Mesh();
+    }
+    static bool PlayerLoaded() { return PlayerMesh() != nullptr; }
+    static void CycleWeapon(int direction) {
+        if (!ShotgunLoaded() || !Loaded()) return;
+        (void)direction; // two weapons: either wheel direction toggles the slot
+        SelectedWeapon() = (SelectedWeapon() + 1) % 2;
+    }
+
     // Load and normalise the AK. Safe to call repeatedly; only the first call
     // does anything. Must run inside the model-loading command-list window --
     // it records texture uploads.
@@ -66,6 +90,7 @@ public:
                                       1.0f, false, false);
         if (!root) {
             std::cerr << "AK47 FBX unavailable; gun falls back to boxes\n";
+            LoadShotgun();
             return;
         }
 
@@ -76,6 +101,7 @@ public:
         Flatten(root, prims);
         if (prims.empty()) {
             std::cerr << "AK47 FBX had no geometry; gun falls back to boxes\n";
+            LoadShotgun();
             return;
         }
 
@@ -110,6 +136,7 @@ public:
                          s_lo.x, s_hi.x, s_lo.y, s_hi.y, s_lo.z, s_hi.z);
             std::fclose(f);
         }
+        LoadShotgun();
     }
 
     // Keep the material alive: its texture uploads stay referenced by the open
@@ -129,6 +156,60 @@ private:
         for (const std::string& c : { rel, "build/" + rel, "../" + rel, "../../build/" + rel })
             if (std::filesystem::exists(c)) return c;
         return rel;
+    }
+
+    static void LoadShotgun() {
+        const std::string path = Resolve("models/shotgun_fbx/Mossberg 590A1.fbx");
+        std::cout << "Loading Mossberg 590A1 " << path << "...\n";
+        auto root = FBXImporter::Load(path, g_dx12.device, g_dx12.commandList,
+                                      1.0f, false, false);
+        if (!root) {
+            std::cerr << "Mossberg 590A1 FBX unavailable\n";
+            return;
+        }
+
+        std::vector<MeshPrimitive> prims;
+        XMFLOAT4X4 identity;
+        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+        root->UpdateGlobalTransform(identity);
+        Flatten(root, prims);
+        if (prims.empty()) {
+            std::cerr << "Mossberg 590A1 FBX had no geometry\n";
+            return;
+        }
+
+        FlipV(prims);
+        Orient(prims);
+        auto material = std::make_shared<SceneMaterial>();
+        material->name = "mossberg_590a1";
+        material->baseColorFactor = XMFLOAT4(0.075f, 0.085f, 0.09f, 1.0f);
+        material->metallicFactor = 0.78f;
+        material->roughnessFactor = 0.36f;
+        ShotgunMaterial() = material;
+        for (MeshPrimitive& primitive : prims) primitive.material = material;
+
+        auto mesh = std::make_shared<SceneMesh>();
+        mesh->primitives = std::move(prims);
+        for (MeshPrimitive& primitive : mesh->primitives)
+            GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get());
+        ShotgunMesh() = mesh;
+        std::cout << "Mossberg 590A1 loaded: " << mesh->primitives.size()
+                  << " primitive(s)\n";
+        if (FILE* file = std::fopen("gun_load.log", "a")) {
+            size_t triangles = 0, vertices = 0;
+            for (const MeshPrimitive& primitive : mesh->primitives) {
+                triangles += primitive.indices.size() / 3;
+                vertices += primitive.vertices.size() / 12;
+            }
+            std::fprintf(file, "shotgun_loaded=1 prims=%zu verts=%zu tris=%zu\n",
+                         mesh->primitives.size(), vertices, triangles);
+            std::fclose(file);
+        }
+    }
+
+    static std::shared_ptr<SceneMaterial>& ShotgunMaterial() {
+        static std::shared_ptr<SceneMaterial> material;
+        return material;
     }
 
     // Collapse the node tree into world-space primitives (same as PalmModel).
