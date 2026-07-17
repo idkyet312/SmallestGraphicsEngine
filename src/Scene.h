@@ -536,6 +536,37 @@ struct Scene {
         projectiles.push_back(p);
     }
 
+    void ShootShotgun() {
+        const float randomYaw = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) *
+                                recoilYaw * 2.2f;
+        camera.ApplyRecoil(recoilPitch * 2.8f, randomYaw);
+        gunRecoilBack = (std::min)(0.16f, gunRecoilBack + 0.13f);
+        gunRecoilKick = (std::min)(11.0f, gunRecoilKick + 7.5f);
+        muzzleFlashTime = muzzleFlashDuration * 1.35f;
+
+        const XMFLOAT3 muzzle = GetMuzzleWorldPosition();
+        const XMVECTOR cameraFront = XMLoadFloat3(&camera.Front);
+        const XMVECTOR cameraUp = XMLoadFloat3(&camera.Up);
+        const XMVECTOR cameraRight = XMVector3Normalize(
+            XMVector3Cross(cameraUp, cameraFront));
+        constexpr int pelletCount = 8;
+        constexpr float spread = 0.055f;
+        for (int pellet = 0; pellet < pelletCount; ++pellet) {
+            const float right = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) * spread;
+            const float up = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) * spread;
+            XMVECTOR direction =
+                cameraFront + cameraRight * right + cameraUp * up;
+
+            Projectile p;
+            p.position = p.previousPosition = muzzle;
+            XMStoreFloat3(&p.direction, XMVector3Normalize(direction));
+            p.speed = projectileSpeed;
+            p.lifetime = projectileLifetime;
+            p.active = true;
+            projectiles.push_back(p);
+        }
+    }
+
     XMFLOAT3 GetMuzzleWorldPosition() const {
         const float S = GunModelScale();
         const XMVECTOR local = XMVectorSet(0.0f, 0.01f * S, 0.83f * S, 1.0f);

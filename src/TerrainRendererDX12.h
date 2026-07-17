@@ -168,7 +168,7 @@ public:
 
         // Pool basin carve -- must match terrain_ms.hlsl's TerrainHeight and the
         // pool spawned in main.cpp.
-        constexpr float poolCx = -12.0f, poolCz = 0.0f;
+        constexpr float poolCx = -22.0f, poolCz = -20.0f;
         constexpr float poolRadius = 4.2f, poolRim = 7.0f, poolDepth = 3.0f;
         float pd = sqrtf((x - poolCx) * (x - poolCx) + (z - poolCz) * (z - poolCz));
         float bt = (pd - poolRadius) / (poolRim - poolRadius);
@@ -188,12 +188,12 @@ public:
         float land = h + landLift;
         h = land + (seabed - land) * shore;                  // lerp(land, seabed, shore)
 
-        // Flat building pad under both houses, applied LAST so neither the noise nor
+        // Flat arena under the four-house cross, applied LAST so neither noise nor
         // the pool rim can dent it. Must match terrain_ms.hlsl's TerrainHeight;
         // padHeight is Ground::kBuildingPadY (src/GroundLevel.h), which the houses
         // and roofs are built from -- change it there and here together.
-        constexpr float padCx = 0.25f, padCz = 3.5f;
-        constexpr float padRadius = 8.5f, padFade = 12.0f, padHeight = 2.5f;
+        constexpr float padCx = 0.0f, padCz = 0.0f;
+        constexpr float padRadius = 14.0f, padFade = 18.0f, padHeight = 2.5f;
         float dpx = x - padCx, dpz = z - padCz;
         float dpad = sqrtf(dpx * dpx + dpz * dpz);
         float pt = (dpad - padRadius) / (padFade - padRadius);

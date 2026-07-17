@@ -8,3 +8,44 @@ License URL: https://creativecommons.org/publicdomain/zero/1.0/
 
 Downloaded July 16, 2026. Attribution is not legally required. Source and
 creator retained here for provenance.
+
+bullet_flesh_hit.mp3
+
+User-supplied asset copied from:
+C:\Users\Bas\Downloads\u_68csiaifb5-bulletimpact1-442717.mp3
+
+Added July 17, 2026. Original licensing remains with supplied asset.
+
+bullet_flesh_hit.wav
+
+Title: Impacts/Gun/sfx (Impact Gun 3.wav)
+Creator: Eldritch Grim
+Source: https://opengameart.org/content/impactsgunsfx
+License: CC0 1.0 Universal
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Downloaded July 17, 2026. Attribution is not legally required. Source and
+creator retained here for provenance.
+
+bandit_spotted_01.wav, bandit_spotted_02.wav, bandit_attack.wav,
+bandit_death.wav, bandit_hit_voice.wav
+
+Title: Steampunk Fantasy Voices (Guard and Knight voice files)
+Creator: xathien
+Source: https://opengameart.org/content/steampunk-fantasy-voices
+License: CC0 1.0 Universal
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Downloaded July 17, 2026. Attribution is not legally required. Source and
+creator retained here for provenance.
+
+flesh_hit.ogg
+
+Title: Impact (qubodupImpactMeat01.ogg)
+Creator: Iwan "qubodup" Gabovitch
+Source: https://opengameart.org/content/impact
+License: CC0 1.0 Universal
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Downloaded July 17, 2026. Attribution is not legally required. Source and
+creator retained here for provenance.

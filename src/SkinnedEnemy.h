@@ -7,6 +7,7 @@
 #include "MeshShaderDX12.h"
 #include "DX12Core.h"
 #include "DestructionDX12.h"
+#include "NavigationSystem.h"
 #include <DirectXMath.h>
 #include <cctype>
 #include <cstdlib>
@@ -24,7 +25,7 @@ public:
     float             yaw = 0.0f;     // radians, lower-body movement facing
     float             aimYaw = 0.0f;  // radians, upper-body/weapon facing
     bool              visible = true;
-    bool              castsShadow = false; // full skinned shadow pass nearly doubles character cost
+    bool              castsShadow = true;
     float             health = 100.0f;
     float             moveSpeed = 1.8f;
     // Asset-space orientation and ground offset.
@@ -42,6 +43,7 @@ public:
     float             orbitRadius = 4.8f;
     float             orbitDirection = 1.0f;
     float             fireCooldown = 1.0f;
+    int               spawnSlot = -1;
     int               burstShotsRemaining = 0;
 
     bool Init(const SkinnedModel& m) {
@@ -104,6 +106,7 @@ public:
 
     void Update(float dt, const DirectX::XMFLOAT3& target, float groundY) {
         if (dead_) return;
+        debrisHitCooldown_ = (std::max)(0.0f, debrisHitCooldown_ - dt);
         position.y = groundY;
         position.x += knockbackVelocity_.x * dt;
         position.z += knockbackVelocity_.z * dt;
@@ -115,6 +118,7 @@ public:
             knockbackVelocity_.x = 0.0f;
             knockbackVelocity_.z = 0.0f;
         }
+        navigationRepathTimer_ -= dt;
         const float dx = target.x - position.x, dz = target.z - position.z;
         const float distance = std::sqrt(dx*dx + dz*dz);
         if (distance > 0.1f) aimYaw = std::atan2(dx, dz);
@@ -146,6 +150,42 @@ public:
                 orbiting = true;
             } else {
                 speed = distance > 11.0f ? moveSpeed * 1.65f : moveSpeed;
+            }
+
+            // Detour supplies corridor-safe steering. Near combat ring, query a
+            // short tangent destination; farther away, path toward player.
+            XMFLOAT3 requestedDestination = orbiting
+                ? XMFLOAT3(position.x + moveX * 3.0f, position.y,
+                           position.z + moveZ * 3.0f)
+                : XMFLOAT3(target.x, position.y, target.z);
+            const float navDx = requestedDestination.x - navigationDestination_.x;
+            const float navDz = requestedDestination.z - navigationDestination_.z;
+            if (g_navigation.Ready() &&
+                (navigationRepathTimer_ <= 0.0f || navDx*navDx + navDz*navDz > 2.25f)) {
+                if (g_navigation.FindPath(position, requestedDestination, navigationPath_)) {
+                    navigationWaypoint_ = navigationPath_.size() > 1 ? 1 : 0;
+                    navigationDestination_ = requestedDestination;
+                } else {
+                    navigationPath_.clear();
+                    navigationWaypoint_ = 0;
+                }
+                navigationRepathTimer_ = 0.45f +
+                    ((float)std::rand() / (float)RAND_MAX) * 0.18f;
+            }
+            while (navigationWaypoint_ < navigationPath_.size()) {
+                const float wx = navigationPath_[navigationWaypoint_].x - position.x;
+                const float wz = navigationPath_[navigationWaypoint_].z - position.z;
+                if (wx*wx + wz*wz > 0.30f) break;
+                ++navigationWaypoint_;
+            }
+            if (navigationWaypoint_ < navigationPath_.size()) {
+                const float wx = navigationPath_[navigationWaypoint_].x - position.x;
+                const float wz = navigationPath_[navigationWaypoint_].z - position.z;
+                const float waypointDistance = std::sqrt(wx*wx + wz*wz);
+                if (waypointDistance > 0.001f) {
+                    moveX = wx / waypointDistance;
+                    moveZ = wz / waypointDistance;
+                }
             }
 
             // Asset loading can make one frame several seconds long. Never let
@@ -215,6 +255,7 @@ public:
             if (!preparingShot_) {
                 preparingShot_ = true;
                 stationaryAimTime_ = 0.0f;
+                spottedEventPending_ = true;
                 return false;
             }
             if (stationaryAimTime_ < 2.0f) return false;
@@ -236,8 +277,10 @@ public:
                            randomSigned() * 0.018f, 0.0f);
         XMStoreFloat3(&direction, XMVector3Normalize(aim));
 
-        if (burstShotsRemaining <= 0)
+        if (burstShotsRemaining <= 0) {
             burstShotsRemaining = 2 + std::rand() % 4;
+            attackEventPending_ = true;
+        }
         --burstShotsRemaining;
         if (burstShotsRemaining > 0) {
             fireCooldown = 0.11f + ((float)std::rand() / RAND_MAX) * 0.12f;
@@ -314,9 +357,11 @@ public:
                const DirectX::XMFLOAT3& direction, float radius,
                DirectX::XMFLOAT3* hitPoint = nullptr) {
         if (dead_ || !visible) return false;
-        if (!BlocksProjectile(start, end, radius, hitPoint)) return false;
+        DirectX::XMFLOAT3 impact;
+        if (!BlocksProjectile(start, end, radius, &impact)) return false;
+        if (hitPoint) *hitPoint = impact;
         health -= 34.0f;
-        if (health <= 0.0f) Kill(direction);
+        if (health <= 0.0f) Kill(direction, impact);
         return true;
     }
 
@@ -359,7 +404,9 @@ public:
         XMFLOAT3 direction;
         XMStoreFloat3(&direction, away);
         if (health <= 0.0f) {
-            Kill(direction);
+            XMFLOAT3 impactPosition;
+            XMStoreFloat3(&impactPosition, body);
+            Kill(direction, impactPosition);
         } else {
             knockbackVelocity_.x += direction.x * pushSpeed * falloff;
             knockbackVelocity_.z += direction.z * pushSpeed * falloff;
@@ -376,7 +423,74 @@ public:
         return true;
     }
 
+    bool ApplyDebrisImpact(const DestructionDebrisHazard& debris,
+                           DirectX::XMFLOAT3* hitPoint = nullptr) {
+        using namespace DirectX;
+        if (dead_ || !visible || debrisHitCooldown_ > 0.0f) return false;
+
+        const float bodyBottom = position.y + footOffset + 0.10f;
+        const float bodyTop = bodyBottom + 1.85f;
+        if (debris.worldMax.y < bodyBottom || debris.worldMin.y > bodyTop) return false;
+        const float closestX = (std::max)(debris.worldMin.x,
+            (std::min)(position.x, debris.worldMax.x));
+        const float closestZ = (std::max)(debris.worldMin.z,
+            (std::min)(position.z, debris.worldMax.z));
+        const float dx = position.x - closestX;
+        const float dz = position.z - closestZ;
+        constexpr float bodyRadius = 0.62f;
+        if (dx * dx + dz * dz > bodyRadius * bodyRadius) return false;
+
+        const float speed = std::sqrt(
+            debris.velocity.x * debris.velocity.x +
+            debris.velocity.y * debris.velocity.y +
+            debris.velocity.z * debris.velocity.z);
+        if (speed < 2.5f) return false;
+
+        XMVECTOR directionVector = XMLoadFloat3(&debris.velocity);
+        if (XMVectorGetX(XMVector3LengthSq(directionVector)) < 0.0001f)
+            directionVector = XMVectorSet(0.0f, 0.2f, 1.0f, 0.0f);
+        directionVector = XMVector3Normalize(directionVector);
+        XMFLOAT3 direction;
+        XMStoreFloat3(&direction, directionVector);
+
+        XMFLOAT3 impact(closestX,
+            (std::max)(bodyBottom, (std::min)(debris.worldCenter.y, bodyTop)),
+            closestZ);
+        if (hitPoint) *hitPoint = impact;
+
+        const float damage = (std::min)(80.0f, (std::max)(8.0f,
+            (speed - 2.5f) * 7.0f + std::sqrt((std::max)(0.05f, debris.mass)) * 3.0f));
+        health -= damage;
+        debrisHitCooldown_ = 0.45f;
+        if (health <= 0.0f) {
+            Kill(direction, impact);
+        } else {
+            const float push = (std::min)(7.0f, speed * 0.65f);
+            knockbackVelocity_.x += direction.x * push;
+            knockbackVelocity_.z += direction.z * push;
+        }
+        return true;
+    }
+
     bool Dead() const { return dead_; }
+
+    bool ConsumeSpottedEvent() {
+        const bool pending = spottedEventPending_;
+        spottedEventPending_ = false;
+        return pending;
+    }
+
+    bool ConsumeAttackEvent() {
+        const bool pending = attackEventPending_;
+        attackEventPending_ = false;
+        return pending;
+    }
+
+    bool ConsumeDeathEvent() {
+        const bool pending = deathEventPending_;
+        deathEventPending_ = false;
+        return pending;
+    }
 
     // Uploads this frame's palette and draws every skinned primitive. Mirrors
     // DrawSceneNode's material setup but routes through g_meshShader.Draw with
@@ -433,9 +547,11 @@ public:
     const std::vector<DirectX::XMFLOAT4X4>& Palette() const { return paletteCPU_; }
 
 private:
-    void Kill(const DirectX::XMFLOAT3& impulseDirection) {
+    void Kill(const DirectX::XMFLOAT3& impulseDirection,
+              const DirectX::XMFLOAT3& impactPosition) {
         using namespace DirectX;
         dead_ = true;
+        deathEventPending_ = true;
         std::vector<XMFLOAT4X4> globals = poseGlobals_;
         if (globals.empty()) anim.ComputeGlobalMatrices(model.skeleton, globals);
         deathGlobals_ = globals;
@@ -460,7 +576,7 @@ private:
             bodies.push_back(body);
         }
         ragdollId_ = g_destruction.SpawnAuthoredRagdoll(
-            bodies, model.ragdoll.constraints, impulseDirection);
+            bodies, model.ragdoll.constraints, impulseDirection, impactPosition);
     }
 
     Microsoft::WRL::ComPtr<ID3D12Resource> palette_[FRAME_COUNT];
@@ -476,7 +592,15 @@ private:
     DirectX::XMFLOAT4X4 deathWorld_ = {};
     DirectX::XMFLOAT3 knockbackVelocity_{ 0.0f, 0.0f, 0.0f };
     float stationaryAimTime_ = 0.0f;
+    float debrisHitCooldown_ = 0.0f;
+    std::vector<DirectX::XMFLOAT3> navigationPath_;
+    size_t navigationWaypoint_ = 0;
+    float navigationRepathTimer_ = 0.0f;
+    DirectX::XMFLOAT3 navigationDestination_{};
     bool preparingShot_ = false;
+    bool spottedEventPending_ = false;
+    bool attackEventPending_ = false;
+    bool deathEventPending_ = false;
     uint32_t ragdollId_ = UINT32_MAX;
     int handBone_ = -1;
     bool dead_ = false;

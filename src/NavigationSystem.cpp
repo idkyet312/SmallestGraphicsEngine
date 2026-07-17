@@ -1,0 +1,215 @@
+#include "NavigationSystem.h"
+
+#include <DetourAlloc.h>
+#include <DetourNavMesh.h>
+#include <DetourNavMeshBuilder.h>
+#include <DetourNavMeshQuery.h>
+#include <Recast.h>
+
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <memory>
+
+using namespace DirectX;
+
+NavigationSystem::NavigationSystem() = default;
+NavigationSystem::~NavigationSystem() { Reset(); }
+
+void NavigationSystem::Reset() {
+    if (query_) { dtFreeNavMeshQuery(query_); query_ = nullptr; }
+    if (navMesh_) { dtFreeNavMesh(navMesh_); navMesh_ = nullptr; }
+}
+
+bool NavigationSystem::BuildTerrain(
+    const std::function<float(float, float)>& heightAt,
+    float minX, float maxX, float minZ, float maxZ,
+    const std::vector<NavigationObstacle>& obstacles) {
+    Reset();
+    if (!heightAt || minX >= maxX || minZ >= maxZ) return false;
+
+    constexpr float sampleSpacing = 0.65f;
+    const int columns = static_cast<int>(std::ceil((maxX - minX) / sampleSpacing)) + 1;
+    const int rows = static_cast<int>(std::ceil((maxZ - minZ) / sampleSpacing)) + 1;
+    std::vector<float> vertices(static_cast<size_t>(columns) * rows * 3);
+    for (int z = 0; z < rows; ++z) {
+        for (int x = 0; x < columns; ++x) {
+            const float wx = (std::min)(maxX, minX + x * sampleSpacing);
+            const float wz = (std::min)(maxZ, minZ + z * sampleSpacing);
+            const size_t offset = (static_cast<size_t>(z) * columns + x) * 3;
+            vertices[offset + 0] = wx;
+            vertices[offset + 1] = heightAt(wx, wz);
+            vertices[offset + 2] = wz;
+        }
+    }
+
+    std::vector<int> triangles;
+    triangles.reserve(static_cast<size_t>(columns - 1) * (rows - 1) * 6);
+    for (int z = 0; z + 1 < rows; ++z) {
+        for (int x = 0; x + 1 < columns; ++x) {
+            const int a = z * columns + x;
+            const int b = a + 1;
+            const int c = a + columns;
+            const int d = c + 1;
+            // Recast is Y-up. Winding below produces upward-facing normals.
+            triangles.insert(triangles.end(), { a, c, b, b, c, d });
+        }
+    }
+
+    rcConfig cfg{};
+    cfg.cs = 0.30f;
+    cfg.ch = 0.15f;
+    cfg.walkableSlopeAngle = 43.0f;
+    cfg.walkableHeight = static_cast<int>(std::ceil(1.75f / cfg.ch));
+    cfg.walkableClimb = static_cast<int>(std::floor(0.55f / cfg.ch));
+    cfg.walkableRadius = static_cast<int>(std::ceil(0.42f / cfg.cs));
+    cfg.maxEdgeLen = static_cast<int>(12.0f / cfg.cs);
+    cfg.maxSimplificationError = 1.3f;
+    cfg.minRegionArea = rcSqr(8);
+    cfg.mergeRegionArea = rcSqr(20);
+    cfg.maxVertsPerPoly = DT_VERTS_PER_POLYGON;
+    cfg.detailSampleDist = cfg.cs * 6.0f;
+    cfg.detailSampleMaxError = cfg.ch;
+    rcCalcBounds(vertices.data(), static_cast<int>(vertices.size() / 3), cfg.bmin, cfg.bmax);
+    rcCalcGridSize(cfg.bmin, cfg.bmax, cfg.cs, &cfg.width, &cfg.height);
+
+    rcContext context(false);
+    std::unique_ptr<rcHeightfield, decltype(&rcFreeHeightField)>
+        solid(rcAllocHeightfield(), rcFreeHeightField);
+    if (!solid || !rcCreateHeightfield(&context, *solid, cfg.width, cfg.height,
+                                        cfg.bmin, cfg.bmax, cfg.cs, cfg.ch)) return false;
+
+    const int triangleCount = static_cast<int>(triangles.size() / 3);
+    std::vector<unsigned char> areas(static_cast<size_t>(triangleCount), RC_NULL_AREA);
+    rcMarkWalkableTriangles(&context, cfg.walkableSlopeAngle, vertices.data(),
+                            static_cast<int>(vertices.size() / 3), triangles.data(),
+                            triangleCount, areas.data());
+    for (int i = 0; i < triangleCount; ++i) {
+        const int* tri = triangles.data() + i * 3;
+        const float centerX = (vertices[tri[0]*3] + vertices[tri[1]*3] +
+                               vertices[tri[2]*3]) / 3.0f;
+        const float centerZ = (vertices[tri[0]*3+2] + vertices[tri[1]*3+2] +
+                               vertices[tri[2]*3+2]) / 3.0f;
+        for (const NavigationObstacle& obstacle : obstacles) {
+            if (centerX >= obstacle.minX && centerX <= obstacle.maxX &&
+                centerZ >= obstacle.minZ && centerZ <= obstacle.maxZ) {
+                areas[i] = RC_NULL_AREA;
+                break;
+            }
+        }
+    }
+    if (!rcRasterizeTriangles(&context, vertices.data(),
+                              static_cast<int>(vertices.size() / 3), triangles.data(),
+                              areas.data(), triangleCount, *solid, cfg.walkableClimb)) return false;
+    rcFilterLowHangingWalkableObstacles(&context, cfg.walkableClimb, *solid);
+    rcFilterLedgeSpans(&context, cfg.walkableHeight, cfg.walkableClimb, *solid);
+    rcFilterWalkableLowHeightSpans(&context, cfg.walkableHeight, *solid);
+
+    std::unique_ptr<rcCompactHeightfield, decltype(&rcFreeCompactHeightfield)>
+        compact(rcAllocCompactHeightfield(), rcFreeCompactHeightfield);
+    if (!compact || !rcBuildCompactHeightfield(&context, cfg.walkableHeight,
+            cfg.walkableClimb, *solid, *compact)) return false;
+    solid.reset();
+    if (!rcErodeWalkableArea(&context, cfg.walkableRadius, *compact) ||
+        !rcBuildDistanceField(&context, *compact) ||
+        !rcBuildRegions(&context, *compact, 0, cfg.minRegionArea, cfg.mergeRegionArea)) return false;
+
+    std::unique_ptr<rcContourSet, decltype(&rcFreeContourSet)>
+        contours(rcAllocContourSet(), rcFreeContourSet);
+    if (!contours || !rcBuildContours(&context, *compact, cfg.maxSimplificationError,
+                                       cfg.maxEdgeLen, *contours)) return false;
+    std::unique_ptr<rcPolyMesh, decltype(&rcFreePolyMesh)>
+        mesh(rcAllocPolyMesh(), rcFreePolyMesh);
+    if (!mesh || !rcBuildPolyMesh(&context, *contours, cfg.maxVertsPerPoly, *mesh)) return false;
+    std::unique_ptr<rcPolyMeshDetail, decltype(&rcFreePolyMeshDetail)>
+        detail(rcAllocPolyMeshDetail(), rcFreePolyMeshDetail);
+    if (!detail || !rcBuildPolyMeshDetail(&context, *mesh, *compact,
+            cfg.detailSampleDist, cfg.detailSampleMaxError, *detail)) return false;
+    for (int i = 0; i < mesh->npolys; ++i)
+        if (mesh->areas[i] == RC_WALKABLE_AREA) mesh->flags[i] = 1;
+
+    dtNavMeshCreateParams params{};
+    params.verts = mesh->verts;
+    params.vertCount = mesh->nverts;
+    params.polys = mesh->polys;
+    params.polyAreas = mesh->areas;
+    params.polyFlags = mesh->flags;
+    params.polyCount = mesh->npolys;
+    params.nvp = mesh->nvp;
+    params.detailMeshes = detail->meshes;
+    params.detailVerts = detail->verts;
+    params.detailVertsCount = detail->nverts;
+    params.detailTris = detail->tris;
+    params.detailTriCount = detail->ntris;
+    params.walkableHeight = 1.75f;
+    params.walkableRadius = 0.42f;
+    params.walkableClimb = 0.55f;
+    rcVcopy(params.bmin, mesh->bmin);
+    rcVcopy(params.bmax, mesh->bmax);
+    params.cs = cfg.cs;
+    params.ch = cfg.ch;
+    params.buildBvTree = true;
+
+    unsigned char* navData = nullptr;
+    int navDataSize = 0;
+    if (!dtCreateNavMeshData(&params, &navData, &navDataSize)) return false;
+    navMesh_ = dtAllocNavMesh();
+    if (!navMesh_ || dtStatusFailed(navMesh_->init(navData, navDataSize, DT_TILE_FREE_DATA))) {
+        dtFree(navData);
+        Reset();
+        return false;
+    }
+    query_ = dtAllocNavMeshQuery();
+    if (!query_ || dtStatusFailed(query_->init(navMesh_, 2048))) {
+        Reset();
+        return false;
+    }
+    std::cout << "Navigation ready: " << mesh->npolys << " polygons, "
+              << obstacles.size() << " blocked regions\n";
+    return true;
+}
+
+bool NavigationSystem::FindPath(const XMFLOAT3& start,
+                                const XMFLOAT3& destination,
+                                std::vector<XMFLOAT3>& points) const {
+    points.clear();
+    if (!Ready()) return false;
+    dtQueryFilter filter;
+    filter.setIncludeFlags(1);
+    filter.setExcludeFlags(0);
+    const float extents[3] = { 2.0f, 4.0f, 2.0f };
+    const float from[3] = { start.x, start.y, start.z };
+    const float to[3] = { destination.x, destination.y, destination.z };
+    float nearestFrom[3]{}, nearestTo[3]{};
+    dtPolyRef fromRef = 0, toRef = 0;
+    if (dtStatusFailed(query_->findNearestPoly(from, extents, &filter,
+            &fromRef, nearestFrom)) || !fromRef ||
+        dtStatusFailed(query_->findNearestPoly(to, extents, &filter,
+            &toRef, nearestTo)) || !toRef) return false;
+
+    dtPolyRef corridor[256]{};
+    int corridorCount = 0;
+    if (dtStatusFailed(query_->findPath(fromRef, toRef, nearestFrom, nearestTo,
+            &filter, corridor, &corridorCount, 256)) || corridorCount == 0) return false;
+    if (corridor[corridorCount - 1] != toRef) {
+        float partialEnd[3]{};
+        if (dtStatusSucceed(query_->closestPointOnPoly(
+                corridor[corridorCount - 1], nearestTo, partialEnd, nullptr))) {
+            nearestTo[0] = partialEnd[0];
+            nearestTo[1] = partialEnd[1];
+            nearestTo[2] = partialEnd[2];
+        }
+    }
+
+    float straight[256 * 3]{};
+    unsigned char straightFlags[256]{};
+    dtPolyRef straightRefs[256]{};
+    int straightCount = 0;
+    if (dtStatusFailed(query_->findStraightPath(nearestFrom, nearestTo, corridor,
+            corridorCount, straight, straightFlags, straightRefs, &straightCount, 256)) ||
+        straightCount == 0) return false;
+    points.reserve(straightCount);
+    for (int i = 0; i < straightCount; ++i)
+        points.emplace_back(straight[i*3], straight[i*3+1], straight[i*3+2]);
+    return true;
+}
