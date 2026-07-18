@@ -220,7 +220,7 @@ struct Scene {
 
     // Rendering mode
     bool wireframeMode       = false;
-    bool useVisibilityBuffer = false; // id Tech VB+Deferred mode
+    bool useVisibilityBuffer = true; // Fast hybrid default; M toggles Forward fallback
     bool useRaytracing       = false; // DXR raytracing mode
 
     // Mesh-shader tessellated terrain (replaces the flat floor plane when on)

@@ -64,6 +64,7 @@ struct DrawCallData {
     uint     indexOffset;   // offset into global index buffer
     uint     indexCount;
     uint     hasIndices;    // 1 if indexed, 0 if non-indexed
+    uint     flags;         // bit 0: double-sided/mixed winding
 };
 
 // ---- Vertex data stored as float4 pairs ----
@@ -407,9 +408,12 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     }
     outputMotion[pixel] = currentUV - previousUV;
     
+    float3 viewDir = normalize(cameraPos - fragPos);
     float3 objNormal = normalize(bary.x * n0 + bary.y * n1 + bary.z * n2);
     // Transform normal to world space
     float3 normal = normalize(mul(objNormal, (float3x3)dc.modelMatrix));
+    if ((dc.flags & 1u) != 0u && dot(normal, viewDir) < 0.0)
+        normal = -normal;
     
     float2 texCoord = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
     float2 uvDx, uvDy;
@@ -463,8 +467,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         }
     }
     
-    // View direction
-    float3 viewDir = normalize(cameraPos - fragPos);
+    if ((dc.flags & 1u) != 0u && dot(normal, viewDir) < 0.0)
+        normal = -normal;
     
     float3 result = 0.0;
     

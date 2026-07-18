@@ -39,6 +39,7 @@ struct VBDrawCallData {
     UINT       indexOffset;
     UINT       indexCount;
     UINT       hasIndices;
+    UINT       flags;
 };
 
 struct VBMeshData {
@@ -136,6 +137,8 @@ public:
     ComPtr<ID3D12RootSignature> visPassRootSig;
     ComPtr<ID3D12PipelineState> visPassPSO;
     ComPtr<ID3D12PipelineState> visPassDoubleSidedPSO;
+    ComPtr<ID3D12PipelineState> visPassAlphaPSO;
+    ComPtr<ID3D12PipelineState> visPassAlphaDoubleSidedPSO;
 
     // Compute resolve PSO + root signature
     ComPtr<ID3D12RootSignature> resolveRootSig;
@@ -368,7 +371,7 @@ public:
     // Register only mutable instance/material data for this frame.
     UINT RegisterInstance(UINT meshID, const XMMATRIX& modelMatrix,
                           const XMFLOAT3& color, float metalness, float roughness,
-                          UINT materialID = 0) {
+                          UINT materialID = 0, UINT flags = 0) {
         if (currentDrawCall >= VB_MAX_DRAW_CALLS || meshID >= meshes.size())
             return UINT_MAX;
 
@@ -395,6 +398,7 @@ public:
         dc.indexOffset = mesh.indexOffset;
         dc.indexCount = mesh.indexCount;
         dc.hasIndices = mesh.hasIndices;
+        dc.flags = flags;
 
         currentDrawCall++;
         return dcID;
@@ -532,19 +536,38 @@ public:
         cmdList->RSSetScissorRects(1, &g_dx12.scissorRect);
 
         // Set pipeline
+        ID3D12DescriptorHeap* heaps[] = { computeDescHeap.Get() };
+        cmdList->SetDescriptorHeaps(1, heaps);
         cmdList->SetGraphicsRootSignature(visPassRootSig.Get());
+        D3D12_GPU_DESCRIPTOR_HANDLE defaultTexture =
+            computeDescHeap->GetGPUDescriptorHandleForHeapStart();
+        defaultTexture.ptr += static_cast<UINT64>(
+            g_dx12.cbvSrvUavDescriptorSize) * 8u;
+        cmdList->SetGraphicsRootDescriptorTable(2, defaultTexture);
         cmdList->SetPipelineState(visPassPSO.Get());
     }
 
-    // Set the draw call ID root constant before each draw
-    void SetDrawCallID(ID3D12GraphicsCommandList* cmdList, UINT drawCallID) {
-        cmdList->SetGraphicsRoot32BitConstant(1, drawCallID, 0);
-    }
+    void SetVisPassDraw(ID3D12GraphicsCommandList* cmdList, UINT drawCallID,
+                        UINT materialID, bool doubleSided, bool alphaCutout,
+                        bool alphaFromLuminance) {
+        const UINT constants[4] = { drawCallID, alphaCutout ? 1u : 0u,
+            alphaFromLuminance ? 1u : 0u, 0u };
+        cmdList->SetGraphicsRoot32BitConstants(1, 4, constants, 0);
 
-    void SetVisPassDoubleSided(ID3D12GraphicsCommandList* cmdList,
-                               bool doubleSided) {
-        cmdList->SetPipelineState(doubleSided
-            ? visPassDoubleSidedPSO.Get() : visPassPSO.Get());
+        UINT textureIndex = 0;
+        if (materialID < materialCount &&
+            mappedMaterials[materialID].textureIndices[0] < VB_MAX_MATERIAL_TEXTURES)
+            textureIndex = mappedMaterials[materialID].textureIndices[0];
+        D3D12_GPU_DESCRIPTOR_HANDLE texture =
+            computeDescHeap->GetGPUDescriptorHandleForHeapStart();
+        texture.ptr += static_cast<UINT64>(g_dx12.cbvSrvUavDescriptorSize) *
+            (8u + textureIndex);
+        cmdList->SetGraphicsRootDescriptorTable(2, texture);
+        cmdList->SetPipelineState(alphaCutout
+            ? (doubleSided ? visPassAlphaDoubleSidedPSO.Get()
+                           : visPassAlphaPSO.Get())
+            : (doubleSided ? visPassDoubleSidedPSO.Get()
+                           : visPassPSO.Get()));
     }
 
     // Set matrices for the current draw (reuses the matrix CBV at slot 0)
@@ -1233,7 +1256,7 @@ private:
         compileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
 #endif
 
-        ComPtr<ID3DBlob> vsBlob, psBlob, errorBlob;
+        ComPtr<ID3DBlob> vsBlob, psBlob, alphaPsBlob, errorBlob;
 
         HRESULT hr = D3DCompile(vsCode.c_str(), vsCode.length(), "visbuf_vs.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "vs_5_0",
@@ -1252,10 +1275,21 @@ private:
             return false;
         }
 
+        errorBlob.Reset();
+        hr = D3DCompile(psCode.c_str(), psCode.length(), "visbuf_ps.hlsl",
+            nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "mainAlpha", "ps_5_0",
+            compileFlags, 0, &alphaPsBlob, &errorBlob);
+        if (FAILED(hr)) {
+            if (errorBlob) std::cerr << "VB alpha PS error: "
+                << (char*)errorBlob->GetBufferPointer() << std::endl;
+            return false;
+        }
+
         // Root signature for vis pass:
         // 0: CBV - MatrixBuffer (b0)
-        // 1: Root constants - drawCallID (b1), 4 UINT values
-        D3D12_ROOT_PARAMETER visParams[2] = {};
+        // 1: Root constants - draw/material flags (b1), 4 UINT values
+        // 2: Alpha-test base colour (t0)
+        D3D12_ROOT_PARAMETER visParams[3] = {};
 
         visParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         visParams[0].Descriptor.ShaderRegister = 0;
@@ -1268,9 +1302,30 @@ private:
         visParams[1].Constants.Num32BitValues = 4;
         visParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+        D3D12_DESCRIPTOR_RANGE alphaRange = {};
+        alphaRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        alphaRange.NumDescriptors = 1;
+        alphaRange.BaseShaderRegister = 0;
+        alphaRange.OffsetInDescriptorsFromTableStart = 0;
+        visParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        visParams[2].DescriptorTable.NumDescriptorRanges = 1;
+        visParams[2].DescriptorTable.pDescriptorRanges = &alphaRange;
+        visParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_STATIC_SAMPLER_DESC alphaSampler = {};
+        alphaSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        alphaSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        alphaSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        alphaSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        alphaSampler.MaxLOD = D3D12_FLOAT32_MAX;
+        alphaSampler.ShaderRegister = 0;
+        alphaSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
         D3D12_ROOT_SIGNATURE_DESC visRootSigDesc = {};
-        visRootSigDesc.NumParameters = 2;
+        visRootSigDesc.NumParameters = 3;
         visRootSigDesc.pParameters = visParams;
+        visRootSigDesc.NumStaticSamplers = 1;
+        visRootSigDesc.pStaticSamplers = &alphaSampler;
         visRootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ComPtr<ID3DBlob> sigBlob;
@@ -1331,6 +1386,16 @@ private:
         psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         hr = g_dx12.device->CreateGraphicsPipelineState(
             &psoDesc, IID_PPV_ARGS(&visPassDoubleSidedPSO));
+        if (FAILED(hr)) return false;
+
+        psoDesc.PS = { alphaPsBlob->GetBufferPointer(), alphaPsBlob->GetBufferSize() };
+        psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+        hr = g_dx12.device->CreateGraphicsPipelineState(
+            &psoDesc, IID_PPV_ARGS(&visPassAlphaPSO));
+        if (FAILED(hr)) return false;
+        psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        hr = g_dx12.device->CreateGraphicsPipelineState(
+            &psoDesc, IID_PPV_ARGS(&visPassAlphaDoubleSidedPSO));
         if (FAILED(hr)) return false;
 
         std::cout << "Visibility pass pipeline created" << std::endl;

@@ -16,6 +16,7 @@ struct VS_INPUT {
 
 struct VS_OUTPUT {
     float4 position : SV_POSITION;
+    float2 texCoord : TEXCOORD0;
 };
 
 VS_OUTPUT main(VS_INPUT input) {
@@ -24,6 +25,7 @@ VS_OUTPUT main(VS_INPUT input) {
     float4 worldPos = mul(float4(input.position, 1.0), model);
     float4 viewPos  = mul(worldPos, view);
     output.position = mul(viewPos, projection);
+    output.texCoord = input.texCoord;
     
     return output;
 }
