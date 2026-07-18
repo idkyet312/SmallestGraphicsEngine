@@ -1149,20 +1149,10 @@ static void StartLevelOne(HWND hwnd, bool godMode) {
         scene.rebuildDestructionRequested = true;
     pendingLevelRuntimeReset = true;
     deathCursorReleased = false;
-    showUI = false;
-    cameraLocked = false;
-    SetCapture(hwnd);
-    SetCursorVisible(false);
-    RECT rect;
-    GetClientRect(hwnd, &rect);
-    POINT center = { (rect.right - rect.left) / 2,
-                     (rect.bottom - rect.top) / 2 };
-    ClientToScreen(hwnd, &center);
-    ignoreNextMouseMove = true;
-    SetCursorPos(center.x, center.y);
-    lastX = (float)(rect.right - rect.left) * 0.5f;
-    lastY = (float)(rect.bottom - rect.top) * 0.5f;
-    firstMouse = true;
+    showUI = true;
+    cameraLocked = true;
+    ReleaseCapture();
+    SetCursorVisible(true);
 }
 
 static void RenderMainMenu(HWND hwnd) {
@@ -1187,7 +1177,7 @@ static void RenderMainMenu(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 22.0f));
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("LEVEL 1", ImVec2(300.0f, 58.0f)))
-        StartLevelOne(hwnd, false);
+        StartLevelOne(hwnd, true);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("LEVEL 1 - GOD MODE", ImVec2(300.0f, 58.0f)))
@@ -1222,7 +1212,7 @@ static void RenderDeathScreen(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 20.0f));
     ImGui::SetCursorPosX(45.0f);
     if (ImGui::Button("RESTART LEVEL 1", ImVec2(300.0f, 55.0f)))
-        StartLevelOne(hwnd, false);
+        StartLevelOne(hwnd, true);
     ImGui::Dummy(ImVec2(0.0f, 9.0f));
     ImGui::SetCursorPosX(45.0f);
     if (ImGui::Button("MAIN MENU", ImVec2(300.0f, 45.0f)))
@@ -1262,7 +1252,7 @@ static void RenderWinScreen(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
     ImGui::SetCursorPosX(55.0f);
     if (ImGui::Button("REPLAY LEVEL 1", ImVec2(300.0f, 55.0f)))
-        StartLevelOne(hwnd, false);
+        StartLevelOne(hwnd, true);
     ImGui::Dummy(ImVec2(0.0f, 9.0f));
     ImGui::SetCursorPosX(55.0f);
     if (ImGui::Button("MAIN MENU", ImVec2(300.0f, 45.0f)))
