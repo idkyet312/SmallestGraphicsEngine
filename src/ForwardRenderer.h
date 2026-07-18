@@ -13,7 +13,6 @@
 #include "DestructionDX12.h"
 #include "RoofModel.h"
 #include "WaterVolume.h"
-#include "RopeSwing.h"
 #include "PalmTrees.h"
 #include "PalmModel.h"
 #include "GunModel.h"
@@ -712,31 +711,6 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
             // Hand the pipeline back to the ordinary object shader for what follows.
             shader.Use(scene.wireframeMode);
-        }
-    }
-
-    // Rope-hung block: each rope link and the block are just boxes driven by the
-    // physics bodies, so they draw with the ordinary cube path.
-    if (g_rope.IsInitialized()) {
-        shader.Use(scene.wireframeMode);
-        for (const RopeItem& item : g_rope.GetItems()) {
-            shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
-            shader.SetObjectColor(item.color);
-            DrawCube(geo);
-            shader.NextDrawCall();
-        }
-    }
-
-    // Second rope rig: rope stays box-like; body parts use capsules and a head sphere.
-    if (g_gibbet.IsInitialized()) {
-        shader.Use(scene.wireframeMode);
-        for (const RopeItem& item : g_gibbet.GetItems()) {
-            shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
-            shader.SetObjectColor(item.color);
-            if (item.shape == 2) DrawSphere(geo);
-            else if (item.shape == 1) DrawCapsule(geo);
-            else DrawCube(geo);
-            shader.NextDrawCall();
         }
     }
 
