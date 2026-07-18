@@ -124,6 +124,7 @@ float                       g_banditPainCooldown = 0.0f;
 float                       g_fleshHitPitchMin = 0.9f;
 float                       g_fleshHitPitchMax = 1.1f;
 bool                        g_suppressFireUntilMouseRelease = false;
+bool                        g_stressTestMode = false;
 NavigationSystem            g_navigation;
 
 static constexpr size_t kEnemiesPerSpawner = 2;
@@ -139,6 +140,10 @@ static const std::array<XMFLOAT3, kSpawnerCount> kBanditSpawnPoints = {{
     { 42.0f, 0.0f, -17.5f }, // second compound south
     { 24.5f, 0.0f,   0.0f }, // second compound west
 }};
+
+static size_t ActiveBanditSlotCount() {
+    return g_stressTestMode ? kBanditsOnScreen : 4 * kEnemiesPerSpawner;
+}
 
 static size_t LiveBanditCount() {
     size_t count = 0;
@@ -524,8 +529,9 @@ static void PlayBanditDeathEvents() {
 
 static bool SpawnBandit() {
     if (!g_banditModel.valid) return false;
-    size_t slot = kBanditsOnScreen;
-    for (size_t candidate = 0; candidate < kBanditsOnScreen; ++candidate) {
+    const size_t activeSlots = ActiveBanditSlotCount();
+    size_t slot = activeSlots;
+    for (size_t candidate = 0; candidate < activeSlots; ++candidate) {
         bool occupied = false;
         for (const auto& existing : g_bandits) {
             if (existing && !existing->Dead() &&
@@ -536,7 +542,7 @@ static bool SpawnBandit() {
         }
         if (!occupied) { slot = candidate; break; }
     }
-    if (slot == kBanditsOnScreen) return false;
+    if (slot == activeSlots) return false;
 
     auto bandit = std::make_unique<SkinnedEnemy>();
     if (!bandit->Init(g_banditModel)) return false;
@@ -1041,6 +1047,8 @@ static PackedGeometry       packed;
 static std::shared_ptr<SceneNode> crateModel;
 static std::shared_ptr<SceneNode> crateShadowModel;
 static std::shared_ptr<SceneNode> wallModel;
+static std::shared_ptr<SceneNode> normalWallModel;
+static std::shared_ptr<SceneNode> stressWallModel;
 bool g_showH2Model = false;
 static std::shared_ptr<SceneMaterial> floorMaterial;
 // Soft smoke sprite (RGBA, alpha-shaped) for billboard particles, plus the
@@ -1132,8 +1140,11 @@ static void OpenWinScreen() {
     SetCursorVisible(true);
 }
 
-static void StartLevelOne(HWND hwnd, bool godMode) {
+static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false) {
     gameScreen = GameScreen::Level1;
+    g_stressTestMode = stressTest;
+    if (crateLoadAttempted)
+        wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
     levelElapsedSeconds = 0.0f;
     levelTimerRunning = crateLoadAttempted;
     scene.playerGodMode = godMode;
@@ -1193,7 +1204,7 @@ static void RenderMainMenu(HWND hwnd) {
         ImVec2(0, 0), display, IM_COL32(5, 9, 12, 225));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(430.0f, 355.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(430.0f, 425.0f), ImGuiCond_Always);
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse;
@@ -1214,6 +1225,10 @@ static void RenderMainMenu(HWND hwnd) {
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("LEVEL 1 - GOD MODE", ImVec2(300.0f, 58.0f)))
         StartLevelOne(hwnd, true);
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    ImGui::SetCursorPosX(65.0f);
+    if (ImGui::Button("STRESS TEST", ImVec2(300.0f, 58.0f)))
+        StartLevelOne(hwnd, true, true);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("QUIT", ImVec2(300.0f, 42.0f)))
@@ -2218,7 +2233,22 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
 // Reuse the authored wooden and metal house chunks as four independent
 // buildings around world centre. Vertex transforms are baked because the
 // destruction system consumes child geometry directly rather than node poses.
-static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root) {
+static std::shared_ptr<SceneNode> CloneSceneTree(
+    const std::shared_ptr<SceneNode>& source) {
+    if (!source) return {};
+    auto clone = std::make_shared<SceneNode>(source->name);
+    clone->translation = source->translation;
+    clone->rotation = source->rotation;
+    clone->scale = source->scale;
+    if (source->mesh)
+        clone->mesh = std::make_shared<SceneMesh>(*source->mesh);
+    for (const auto& child : source->children)
+        clone->AddChild(CloneSceneTree(child));
+    return clone;
+}
+
+static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
+                                 bool stressTest) {
     if (!root) return;
     std::vector<std::shared_ptr<SceneNode>> woodTemplate;
     std::vector<std::shared_ptr<SceneNode>> metalTemplate;
@@ -2311,13 +2341,15 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root) {
     addHouse(woodTemplate,  -3.5f, 3.5f,  0.0f, -radius, XM_PI,     3000000);
     addHouse(metalTemplate,  4.75f, 3.55f,-radius, 0.0f,-XM_PIDIV2, 4000000);
 
-    constexpr float secondX = 42.0f;
-    addHouse(woodTemplate,  -3.5f, 3.5f, secondX,  radius, 0.0f,       5000000);
-    addHouse(metalTemplate,  4.75f, 3.55f,secondX + radius, 0.0f,
-             XM_PIDIV2, 6000000);
-    addHouse(woodTemplate,  -3.5f, 3.5f, secondX, -radius, XM_PI,     7000000);
-    addHouse(metalTemplate,  4.75f, 3.55f,secondX - radius, 0.0f,
-             -XM_PIDIV2, 8000000);
+    if (stressTest) {
+        constexpr float secondX = 42.0f;
+        addHouse(woodTemplate,  -3.5f, 3.5f, secondX,  radius, 0.0f,       5000000);
+        addHouse(metalTemplate,  4.75f, 3.55f,secondX + radius, 0.0f,
+                 XM_PIDIV2, 6000000);
+        addHouse(woodTemplate,  -3.5f, 3.5f, secondX, -radius, XM_PI,     7000000);
+        addHouse(metalTemplate,  4.75f, 3.55f,secondX - radius, 0.0f,
+                 -XM_PIDIV2, 8000000);
+    }
 
     XMFLOAT4X4 identity;
     XMStoreFloat4x4(&identity, XMMatrixIdentity());
@@ -3312,7 +3344,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (g_gibbet.IsInitialized()) g_gibbet.Reset();
             if (g_trees.IsInitialized()) ResetPalmTrees();
             pendingLevelRuntimeReset = false;
-            for (size_t i = 0; i < kBanditsOnScreen; ++i)
+            for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
                 if (!SpawnBandit()) break;
             pendingTurretGunnerRespawn = true;
             // Do not charge restart/reset stalls to completion time.
@@ -3381,8 +3413,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (g_banditLoaded) {
             ProfilerDX12::CpuScope banditProfile(g_profiler, "Bandit Update");
             if (pendingTurretGunnerRespawn) {
-                pendingTurretGunnerRespawn =
-                    !(SpawnHumveeTurretGunner(0) && SpawnHumveeTurretGunner(1));
+                const bool firstReady = SpawnHumveeTurretGunner(0);
+                const bool secondReady = !g_stressTestMode ||
+                    SpawnHumveeTurretGunner(1);
+                pendingTurretGunnerRespawn = !(firstReady && secondReady);
             }
             if (g_heldBandit && g_heldBandit->Dead()) g_heldBandit = nullptr;
             for (auto& bandit : g_bandits) {
@@ -3791,10 +3825,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // Modular destructible house built from structural pieces, with
             // world-anchored foundation/sill chunks. Grid args unused (bonds
             // come from AABB adjacency), so pass 1s.
-            wallModel = CreateDestructibleWallModel();
-            ApplyHouseTextures(wallModel, g_dx12.device.Get(), g_dx12.commandList.Get());
-            AppendRoofChunksToDestructionModel(wallModel);
-            ArrangeHousesInCross(wallModel);
+            auto houseTemplate = CreateDestructibleWallModel();
+            ApplyHouseTextures(houseTemplate, g_dx12.device.Get(), g_dx12.commandList.Get());
+            AppendRoofChunksToDestructionModel(houseTemplate);
+            normalWallModel = CloneSceneTree(houseTemplate);
+            stressWallModel = CloneSceneTree(houseTemplate);
+            ArrangeHousesInCross(normalWallModel, false);
+            ArrangeHousesInCross(stressWallModel, true);
+            wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
             // Pool of water beside the house (on the clear -X side) with a
             // handful of wooden crates dropped in to bob on the surface.
@@ -3973,10 +4011,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 bm.ragdoll = T3DPhysicsAsset::Load(banditDir + "Phy_Bandit_PhysicsAsset.T3D");
                 if (bm.valid) {
                     g_banditModel = std::move(bm);
-                    for (size_t i = 0; i < kBanditsOnScreen; ++i)
+                    for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
                         if (!SpawnBandit()) break;
                     SpawnHumveeTurretGunner(0);
-                    SpawnHumveeTurretGunner(1);
+                    if (g_stressTestMode) SpawnHumveeTurretGunner(1);
                     g_banditLoaded = true;
                     std::cout << "Bandit squad ready: " << LiveBanditCount()
                               << " live enemies\n";
