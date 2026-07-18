@@ -365,7 +365,8 @@ public:
         }
 
         if (g_humveeModel) {
-            DrawSceneNodeShadow(g_humveeModel, depthShader,
+            DrawSceneNodeShadow(g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,
+                                depthShader,
                                 HumveeWorldMatrix(), lightSpace);
         }
 
@@ -409,7 +410,10 @@ public:
                 const XMMATRIX model = XMMatrixTranslation(
                     barrel.position.x, barrel.position.y - 0.75f,
                     barrel.position.z);
-                DrawSceneNodeShadow(g_explosiveBarrelModel, depthShader,
+                DrawSceneNodeShadow(g_explosiveBarrelShadowModel
+                                        ? g_explosiveBarrelShadowModel
+                                        : g_explosiveBarrelModel,
+                                    depthShader,
                                     model, lightSpace);
             } else {
                 const XMMATRIX model = XMMatrixScaling(1.6f, 1.5f, 1.6f) *

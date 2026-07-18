@@ -38,7 +38,8 @@ public:
 
     // Uploads conventional vertex/index buffers and builds meshoptimizer
     // meshlets (64 vertices, 124 triangles) for any generated primitive.
-    static bool BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* device);
+    static bool BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* device,
+                                 bool buildMeshlets = true);
 
     // Uploads an in-memory RGBA8 image (row-major, 4 bytes/texel) as a mipped
     // shader texture. Used for procedurally generated material textures.

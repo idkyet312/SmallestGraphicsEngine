@@ -71,7 +71,9 @@ std::vector<std::unique_ptr<SkinnedEnemy>> g_bandits;
 SkinnedEnemy*               g_heldBandit = nullptr;
 size_t                      g_heldBarrelIndex = SIZE_MAX;
 std::shared_ptr<SceneNode>  g_explosiveBarrelModel;
+std::shared_ptr<SceneNode>  g_explosiveBarrelShadowModel;
 std::shared_ptr<SceneNode>  g_humveeModel;
+std::shared_ptr<SceneNode>  g_humveeShadowModel;
 std::shared_ptr<SceneNode>  g_helicopterModel;
 std::shared_ptr<SceneNode>  g_helicopterMainRotorNode;
 std::shared_ptr<SceneNode>  g_helicopterTailRotorNode;
@@ -1015,6 +1017,7 @@ static ShadowMapDX12        shadowMap;
 static GeometryBuffers      geo;
 static PackedGeometry       packed;
 static std::shared_ptr<SceneNode> crateModel;
+static std::shared_ptr<SceneNode> crateShadowModel;
 static std::shared_ptr<SceneNode> wallModel;
 bool g_showH2Model = false;
 static std::shared_ptr<SceneMaterial> floorMaterial;
@@ -3869,6 +3872,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     crateModel = merged;
                 }
                 crateModel->UpdateGlobalTransform(crateModel->localTransform);
+                crateShadowModel = GLBImporter::MergeSceneForDepth(
+                    crateModel, g_dx12.device);
                 size_t materialDraws = crateModel->mesh ? crateModel->mesh->primitives.size() : 0;
                 std::cout << "h2 model loaded: " << materialDraws
                           << " material draw(s)\n";
@@ -3885,9 +3890,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_explosiveBarrelModel = FBXImporter::Load(
                 "models/Barrel Explosive/barrel.FBX",
                 g_dx12.device, g_dx12.commandList, 0.72f, false, true);
-            if (g_explosiveBarrelModel)
+            if (g_explosiveBarrelModel) {
+                g_explosiveBarrelShadowModel = GLBImporter::MergeSceneForDepth(
+                    g_explosiveBarrelModel, g_dx12.device);
                 std::cout << "Explosive barrel FBX ready\n";
-            else
+            } else
                 std::cerr << "Explosive barrel FBX failed; using procedural fallback\n";
 
             g_humveeModel = FBXImporter::Load(
@@ -3898,8 +3905,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     if (child && child->name == "HumveeTurret") {
                         g_humveeTurretNode = child;
                         break;
-                    }
+                }
                 ConfigureHumveeBounds();
+                g_humveeShadowModel = GLBImporter::MergeSceneForDepth(
+                    g_humveeModel, g_dx12.device);
                 std::cout << "Humvee FBX ready at center\n";
             } else {
                 std::cerr << "Humvee FBX failed to load\n";
@@ -4013,7 +4022,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
                 ProfilerDX12::Scope profile(g_profiler, "Shadow", g_dx12.commandList.Get());
                 lightSpace = shadowMap.Render(
-                    scene, geo, g_showH2Model ? crateModel : nullptr,
+                    scene, geo, g_showH2Model
+                        ? (crateShadowModel ? crateShadowModel : crateModel)
+                        : nullptr,
                     g_banditLoaded ? &g_bandits : nullptr);
                 shadowResource = shadowMap.GetResource();
             }

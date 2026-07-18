@@ -819,7 +819,8 @@ static Microsoft::WRL::ComPtr<ID3D12Resource> CreateStaticGeometryBuffer(
     return resource;
 }
 
-bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* device) {
+bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* device,
+                                   bool buildMeshlets) {
     primitive.indexCount = (UINT)primitive.indices.size();
     if (!device || primitive.vertices.empty()) return false;
 
@@ -841,6 +842,8 @@ bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* devic
         primitive.ibv.SizeInBytes = ibSize;
         primitive.ibv.Format = DXGI_FORMAT_R32_UINT;
     }
+
+    if (!buildMeshlets) return true;
 
     constexpr UINT MaxMeshletVertices = 64;
     constexpr UINT MaxMeshletTriangles = 124;
@@ -1003,7 +1006,7 @@ static std::shared_ptr<SceneNode> MergeSceneGeometry(
             }
         }
 
-        GLBImporter::BuildMeshletData(merged, device.Get());
+        GLBImporter::BuildMeshletData(merged, device.Get(), preserveMaterials);
 
         mergedMesh->primitives.push_back(std::move(merged));
     }
