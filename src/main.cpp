@@ -151,10 +151,14 @@ static constexpr std::array<CompoundCenter, 8> kStressCompoundCenters = {{
 static constexpr size_t kSpawnersPerCompound = 4;
 static constexpr size_t kSpawnerCount =
     kStressCompoundCenters.size() * kSpawnersPerCompound;
-static constexpr size_t kBanditsOnScreen = kSpawnerCount * kEnemiesPerSpawner;
+static constexpr size_t kStressHouseCount = 29;
+static constexpr size_t kStressBanditCount = 58;
+static_assert(kStressHouseCount <= kStressCompoundCenters.size() *
+              kSpawnersPerCompound);
+static_assert(kStressBanditCount <= kSpawnerCount * kEnemiesPerSpawner);
 
 static size_t ActiveBanditSlotCount() {
-    return g_stressTestMode ? kBanditsOnScreen : 4 * kEnemiesPerSpawner;
+    return g_stressTestMode ? kStressBanditCount : 4 * kEnemiesPerSpawner;
 }
 
 static TerrainRendererDX12::Params CurrentTerrainParams() {
@@ -1312,17 +1316,23 @@ static void RebuildScalableEnvironment() {
         { -2.6f,  -1.5f,  2.6f,   1.5f },
         {-29.0f, -27.0f,-15.0f, -13.0f }
     };
-    const size_t compoundCount = g_stressTestMode
-        ? kStressCompoundCenters.size() : 1;
+    const size_t houseCount = g_stressTestMode ? kStressHouseCount : 4;
+    size_t houseIndex = 0;
+    const size_t compoundCount = (houseCount + kSpawnersPerCompound - 1) /
+        kSpawnersPerCompound;
     for (size_t i = 0; i < compoundCount; ++i) {
         const float x = kStressCompoundCenters[i].x;
         const float z = kStressCompoundCenters[i].z;
-        obstacles.insert(obstacles.end(), {
+        const NavigationObstacle houses[kSpawnersPerCompound] = {
             {x - 4.2f, z + 5.8f, x + 4.2f, z + 12.2f},
             {x + 5.8f, z - 3.4f, x + 12.2f, z + 3.4f},
             {x - 4.2f, z - 12.2f, x + 4.2f, z - 5.8f},
             {x - 12.2f, z - 3.4f, x - 5.8f, z + 3.4f}
-        });
+        };
+        for (size_t side = 0;
+             side < kSpawnersPerCompound && houseIndex < houseCount;
+             ++side, ++houseIndex)
+            obstacles.push_back(houses[side]);
     }
     if (g_stressTestMode) {
         obstacles.push_back({39.4f, 1.5f, 44.6f, 4.5f});
@@ -2602,18 +2612,25 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
     };
 
     constexpr float radius = 9.0f;
-    const size_t compoundCount = stressTest ? kStressCompoundCenters.size() : 1;
+    const size_t houseCount = stressTest ? kStressHouseCount : 4;
+    size_t houseIndex = 0;
+    const size_t compoundCount = (houseCount + kSpawnersPerCompound - 1) /
+        kSpawnersPerCompound;
     for (size_t compoundIndex = 0; compoundIndex < compoundCount; ++compoundIndex) {
         const CompoundCenter& center = kStressCompoundCenters[compoundIndex];
         const int groupBase = static_cast<int>(compoundIndex) * 4000000;
-        addHouse(woodTemplate, -3.5f, 3.5f,
-                 center.x, center.z + radius, 0.0f, groupBase + 1000000);
-        addHouse(metalTemplate, 4.75f, 3.55f,
-                 center.x + radius, center.z, XM_PIDIV2, groupBase + 2000000);
-        addHouse(woodTemplate, -3.5f, 3.5f,
-                 center.x, center.z - radius, XM_PI, groupBase + 3000000);
-        addHouse(metalTemplate, 4.75f, 3.55f,
-                 center.x - radius, center.z, -XM_PIDIV2, groupBase + 4000000);
+        if (houseIndex++ < houseCount)
+            addHouse(woodTemplate, -3.5f, 3.5f,
+                     center.x, center.z + radius, 0.0f, groupBase + 1000000);
+        if (houseIndex++ < houseCount)
+            addHouse(metalTemplate, 4.75f, 3.55f,
+                     center.x + radius, center.z, XM_PIDIV2, groupBase + 2000000);
+        if (houseIndex++ < houseCount)
+            addHouse(woodTemplate, -3.5f, 3.5f,
+                     center.x, center.z - radius, XM_PI, groupBase + 3000000);
+        if (houseIndex++ < houseCount)
+            addHouse(metalTemplate, 4.75f, 3.55f,
+                     center.x - radius, center.z, -XM_PIDIV2, groupBase + 4000000);
     }
 
     XMFLOAT4X4 identity;
