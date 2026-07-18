@@ -368,7 +368,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ImGui::Text("  Pass 1: Visibility rasterise");
                 ImGui::Text("  Pass 2: G-Buffer fill (compute)");
                 ImGui::Text("  Pass 3: Deferred lighting (compute)");
-                ImGui::Text("  Draw Calls: %u  Vertices: %u", vb.currentDrawCall, vb.currentVertexOffset);
+                ImGui::Text("  Instances: %u  Persistent vertices: %u",
+                    vb.currentDrawCall, vb.persistentVertexCount);
+                ImGui::Text("  Persistent meshes: %u",
+                    static_cast<UINT>(vb.meshes.size()));
             }
         } else {
             ImGui::TextDisabled("VB Pipeline: Not Available");
