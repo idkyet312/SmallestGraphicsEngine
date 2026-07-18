@@ -212,18 +212,26 @@ public:
         float land = h + landLift;
         h = land + (seabed - land) * shore;                  // lerp(land, seabed, shore)
 
-        // Flat arena under the four-house cross, applied LAST so neither noise nor
-        // the pool rim can dent it. Must match terrain_ms.hlsl's TerrainHeight;
+        // Flat arenas under each house compound, applied LAST so neither noise nor
+        // the pool rim can dent them. Must match terrain_ms.hlsl's TerrainHeight;
         // padHeight is Ground::kBuildingPadY (src/GroundLevel.h), which the houses
         // and roofs are built from -- change it there and here together.
-        constexpr float padCx = 0.0f, padCz = 0.0f;
         constexpr float padRadius = 14.0f, padFade = 18.0f, padHeight = 2.5f;
-        float dpx = x - padCx, dpz = z - padCz;
-        float dpad = sqrtf(dpx * dpx + dpz * dpz);
-        float pt = (dpad - padRadius) / (padFade - padRadius);
-        pt = pt < 0.0f ? 0.0f : (pt > 1.0f ? 1.0f : pt);
-        float pad = 1.0f - pt * pt * (3.0f - 2.0f * pt);      // 1 on the pad -> 0 outside
-        h = h + (padHeight - h) * pad;                        // lerp(h, padHeight, pad)
+        static constexpr float padCenters[8][2] = {
+            {  0.0f,   0.0f }, { 42.0f,   0.0f },
+            {-42.0f,   0.0f }, {  0.0f,  42.0f },
+            { 42.0f,  42.0f }, {-42.0f,  42.0f },
+            {  0.0f, -42.0f }, { 42.0f, -42.0f }
+        };
+        const int padCount = params.islandScale > 1.5f ? 8 : 1;
+        for (int i = 0; i < padCount; ++i) {
+            float dpx = x - padCenters[i][0], dpz = z - padCenters[i][1];
+            float dpad = sqrtf(dpx * dpx + dpz * dpz);
+            float pt = (dpad - padRadius) / (padFade - padRadius);
+            pt = pt < 0.0f ? 0.0f : (pt > 1.0f ? 1.0f : pt);
+            float pad = 1.0f - pt * pt * (3.0f - 2.0f * pt);
+            h = h + (padHeight - h) * pad;
+        }
         return h;
     }
 

@@ -137,18 +137,21 @@ bool                        g_stressTestMode = false;
 NavigationSystem            g_navigation;
 
 static constexpr size_t kEnemiesPerSpawner = 2;
-static constexpr size_t kSpawnerCount = 8;
-static constexpr size_t kBanditsOnScreen = kSpawnerCount * kEnemiesPerSpawner;
-static const std::array<XMFLOAT3, kSpawnerCount> kBanditSpawnPoints = {{
-    {  0.0f, 0.0f,  17.5f }, // north: 5 m beyond house outer wall
-    { 17.5f, 0.0f,   0.0f }, // east
-    {  0.0f, 0.0f, -17.5f }, // south
-    {-17.5f, 0.0f,   0.0f }, // west
-    { 42.0f, 0.0f,  17.5f }, // second compound north
-    { 59.5f, 0.0f,   0.0f }, // second compound east
-    { 42.0f, 0.0f, -17.5f }, // second compound south
-    { 24.5f, 0.0f,   0.0f }, // second compound west
+struct CompoundCenter { float x, z; };
+static constexpr std::array<CompoundCenter, 8> kStressCompoundCenters = {{
+    {  0.0f,   0.0f },
+    { 42.0f,   0.0f },
+    {-42.0f,   0.0f },
+    {  0.0f,  42.0f },
+    { 42.0f,  42.0f },
+    {-42.0f,  42.0f },
+    {  0.0f, -42.0f },
+    { 42.0f, -42.0f },
 }};
+static constexpr size_t kSpawnersPerCompound = 4;
+static constexpr size_t kSpawnerCount =
+    kStressCompoundCenters.size() * kSpawnersPerCompound;
+static constexpr size_t kBanditsOnScreen = kSpawnerCount * kEnemiesPerSpawner;
 
 static size_t ActiveBanditSlotCount() {
     return g_stressTestMode ? kBanditsOnScreen : 4 * kEnemiesPerSpawner;
@@ -714,15 +717,22 @@ static bool SpawnBandit() {
 
     const size_t spawner = slot / kEnemiesPerSpawner;
     const size_t member = slot % kEnemiesPerSpawner;
-    const XMFLOAT3 spawn = kBanditSpawnPoints[spawner];
-    const float length = std::sqrt(spawn.x * spawn.x + spawn.z * spawn.z);
-    const float outwardX = spawn.x / length;
-    const float outwardZ = spawn.z / length;
+    const CompoundCenter& compound =
+        kStressCompoundCenters[spawner / kSpawnersPerCompound];
+    static constexpr float outwardX[kSpawnersPerCompound] = {
+         0.0f, 1.0f, 0.0f, -1.0f };
+    static constexpr float outwardZ[kSpawnersPerCompound] = {
+         1.0f, 0.0f, -1.0f, 0.0f };
+    const size_t sideIndex = spawner % kSpawnersPerCompound;
+    const XMFLOAT3 spawn{
+        compound.x + outwardX[sideIndex] * 17.5f,
+        0.0f,
+        compound.z + outwardZ[sideIndex] * 17.5f };
     const float side = member == 0 ? -0.85f : 0.85f;
     bandit->position = {
-        spawn.x - outwardZ * side,
+        spawn.x - outwardZ[sideIndex] * side,
         spawn.y,
-        spawn.z + outwardX * side
+        spawn.z + outwardX[sideIndex] * side
     };
     bandit->spawnSlot = static_cast<int>(slot);
     bandit->leftArmReach = g_banditLeftArmReach;
@@ -1299,21 +1309,23 @@ static void RebuildScalableEnvironment() {
         return TerrainRendererDX12::HeightAt(terrainParams, x, z);
     };
     std::vector<NavigationObstacle> obstacles = {
-        { -4.2f,   5.8f,  4.2f,  12.2f },
-        {  5.8f,  -3.4f, 12.2f,   3.4f },
-        { -4.2f, -12.2f,  4.2f,  -5.8f },
-        {-12.2f,  -3.4f, -5.8f,   3.4f },
         { -2.6f,  -1.5f,  2.6f,   1.5f },
         {-29.0f, -27.0f,-15.0f, -13.0f }
     };
-    if (g_stressTestMode) {
+    const size_t compoundCount = g_stressTestMode
+        ? kStressCompoundCenters.size() : 1;
+    for (size_t i = 0; i < compoundCount; ++i) {
+        const float x = kStressCompoundCenters[i].x;
+        const float z = kStressCompoundCenters[i].z;
         obstacles.insert(obstacles.end(), {
-            {37.8f,  5.8f, 46.2f, 12.2f},
-            {47.8f, -3.4f, 54.2f,  3.4f},
-            {37.8f,-12.2f, 46.2f, -5.8f},
-            {29.8f, -3.4f, 36.2f,  3.4f},
-            {39.4f,  1.5f, 44.6f,  4.5f}
+            {x - 4.2f, z + 5.8f, x + 4.2f, z + 12.2f},
+            {x + 5.8f, z - 3.4f, x + 12.2f, z + 3.4f},
+            {x - 4.2f, z - 12.2f, x + 4.2f, z - 5.8f},
+            {x - 12.2f, z - 3.4f, x - 5.8f, z + 3.4f}
         });
+    }
+    if (g_stressTestMode) {
+        obstacles.push_back({39.4f, 1.5f, 44.6f, 4.5f});
     }
     for (const PalmSpawn& palm : kPalmSpawns)
         obstacles.push_back(
@@ -2484,8 +2496,8 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     return root;
 }
 
-// Reuse the authored wooden and metal house chunks as four independent
-// buildings around world centre. Vertex transforms are baked because the
+// Reuse the authored wooden and metal house chunks as independent compounds.
+// Vertex transforms are baked because the
 // destruction system consumes child geometry directly rather than node poses.
 static std::shared_ptr<SceneNode> CloneSceneTree(
     const std::shared_ptr<SceneNode>& source) {
@@ -2590,19 +2602,18 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
     };
 
     constexpr float radius = 9.0f;
-    addHouse(woodTemplate,  -3.5f, 3.5f,  0.0f,  radius, 0.0f,       1000000);
-    addHouse(metalTemplate,  4.75f, 3.55f, radius, 0.0f, XM_PIDIV2,  2000000);
-    addHouse(woodTemplate,  -3.5f, 3.5f,  0.0f, -radius, XM_PI,     3000000);
-    addHouse(metalTemplate,  4.75f, 3.55f,-radius, 0.0f,-XM_PIDIV2, 4000000);
-
-    if (stressTest) {
-        constexpr float secondX = 42.0f;
-        addHouse(woodTemplate,  -3.5f, 3.5f, secondX,  radius, 0.0f,       5000000);
-        addHouse(metalTemplate,  4.75f, 3.55f,secondX + radius, 0.0f,
-                 XM_PIDIV2, 6000000);
-        addHouse(woodTemplate,  -3.5f, 3.5f, secondX, -radius, XM_PI,     7000000);
-        addHouse(metalTemplate,  4.75f, 3.55f,secondX - radius, 0.0f,
-                 -XM_PIDIV2, 8000000);
+    const size_t compoundCount = stressTest ? kStressCompoundCenters.size() : 1;
+    for (size_t compoundIndex = 0; compoundIndex < compoundCount; ++compoundIndex) {
+        const CompoundCenter& center = kStressCompoundCenters[compoundIndex];
+        const int groupBase = static_cast<int>(compoundIndex) * 4000000;
+        addHouse(woodTemplate, -3.5f, 3.5f,
+                 center.x, center.z + radius, 0.0f, groupBase + 1000000);
+        addHouse(metalTemplate, 4.75f, 3.55f,
+                 center.x + radius, center.z, XM_PIDIV2, groupBase + 2000000);
+        addHouse(woodTemplate, -3.5f, 3.5f,
+                 center.x, center.z - radius, XM_PI, groupBase + 3000000);
+        addHouse(metalTemplate, 4.75f, 3.55f,
+                 center.x - radius, center.z, -XM_PIDIV2, groupBase + 4000000);
     }
 
     XMFLOAT4X4 identity;
