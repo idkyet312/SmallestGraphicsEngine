@@ -91,6 +91,12 @@ struct ClusterData {
     uint lightIndices[32];
     uint3 padding;
 };
+
+cbuffer SkySHBuffer : register(b3) {
+    float4 shCoeffs[9];
+    float skyIntensity;
+    float3 shPadding;
+};
 StructuredBuffer<ClusterData>   clusters  : register(t6);
 
 RWTexture2D<float4> outputColor : register(u0);
@@ -109,6 +115,57 @@ float3 ReconstructWorldPos(uint2 pixel, float depth) {
     float4 clipPos = float4(ndc, depth, 1.0);
     float4 worldPos = mul(clipPos, invViewProj);
     return worldPos.xyz / worldPos.w;
+}
+
+float3 SampleSkyIrradiance(float3 normal) {
+    float3 result = shCoeffs[0].rgb * 0.282095;
+    result += shCoeffs[1].rgb * 0.488603 * normal.y;
+    result += shCoeffs[2].rgb * 0.488603 * normal.z;
+    result += shCoeffs[3].rgb * 0.488603 * normal.x;
+    result += shCoeffs[4].rgb * 1.092548 * normal.x * normal.y;
+    result += shCoeffs[5].rgb * 1.092548 * normal.y * normal.z;
+    result += shCoeffs[6].rgb * 0.315392 * (3.0 * normal.z * normal.z - 1.0);
+    result += shCoeffs[7].rgb * 1.092548 * normal.x * normal.z;
+    result += shCoeffs[8].rgb * 0.546274 * (normal.x * normal.x - normal.y * normal.y);
+    return max(result, 0.0) * skyIntensity;
+}
+
+float3 SampleReflectionProbe(float3 reflectionDir, float roughness) {
+    reflectionDir = normalize(reflectionDir);
+    float up = saturate(reflectionDir.y * 0.5 + 0.5);
+    float horizon = exp(-abs(reflectionDir.y) * 7.0);
+    float3 zenith = float3(0.34, 0.58, 0.86) * skyIntensity;
+    float3 horizonColor = float3(0.86, 0.78, 0.62) * skyIntensity;
+    float3 ground = float3(0.10, 0.13, 0.09);
+    float3 sky = lerp(horizonColor, zenith, smoothstep(0.30, 1.0, up));
+    float3 environment = lerp(ground, sky, up);
+    environment = lerp(environment, horizonColor, horizon * 0.35);
+    float sunGlint = pow(saturate(dot(reflectionDir, normalize(lightPos))),
+                         lerp(96.0, 12.0, roughness));
+    environment += lightColor * sunGlint * (1.0 - roughness) * 1.8;
+    float luminance = dot(environment, float3(0.299, 0.587, 0.114));
+    return lerp(environment, luminance.xxx, roughness * 0.35);
+}
+
+float ScreenSpaceAO(uint2 pixel, float3 worldPos, float3 normal) {
+    static const int2 directions[8] = {
+        int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1),
+        int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1)
+    };
+    float occlusion = 0.0;
+    [unroll]
+    for (uint i = 0; i < 8; ++i) {
+        int2 samplePixel = clamp(int2(pixel) + directions[i] * 4,
+                                 int2(0, 0), int2(screenWidth - 1, screenHeight - 1));
+        float sampleDepth = depthBuffer.Load(int3(samplePixel, 0));
+        if (sampleDepth >= 1.0) continue;
+        float3 samplePosition = ReconstructWorldPos(samplePixel, sampleDepth);
+        float3 delta = samplePosition - worldPos;
+        float distanceToSample = length(delta);
+        float horizon = saturate((dot(normal, delta / max(distanceToSample, 0.001)) - 0.08) * 3.0);
+        occlusion += horizon * saturate(1.0 - distanceToSample / 2.5);
+    }
+    return saturate(1.0 - occlusion / 8.0);
 }
 
 float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
@@ -283,9 +340,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // View direction
     float3 viewDir = normalize(cameraPos - fragPos);
     
-    // Ambient
-    float3 ambient = ambientStrength * albedo;
-    float3 result = ambient;
+    float3 result = 0.0;
     
     // Main light
     float3 L;
@@ -329,6 +384,13 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 kS = F;
     float3 kD = float3(1.0, 1.0, 1.0) - kS;
     kD *= 1.0 - metal;
+
+    float ambientOcclusion = ScreenSpaceAO(pixel, fragPos, normal);
+    float3 diffuseIBL = SampleSkyIrradiance(normal) * albedo * kD / 3.14159265;
+    float3 reflectionIBL = SampleReflectionProbe(reflect(-V, normal), rough);
+    float3 specularIBL = reflectionIBL * F * (1.0 - rough * 0.65);
+    result += (diffuseIBL + specularIBL) * ambientOcclusion;
+    result += ambientStrength * albedo * ambientOcclusion;
     
     float3 numerator = NDF * G * F;
     float denominator = 4.0 * NdotV * NdotL + 0.0001;
