@@ -1277,10 +1277,25 @@ static constexpr std::array<PalmSpawn, 8> kPalmSpawns = {{
     { -29.0f, -15.0f, 6.6f, -0.3f },
 }};
 
+// Stress-map landscaping: loose, asymmetric clusters soften the bare compounds
+// without blocking house entrances, enemy spawns, or vehicle routes.
+static constexpr std::array<PalmSpawn, 6> kStressHousePalmSpawns = {{
+    { -12.5f,  11.5f, 7.4f,  0.35f },
+    {  12.0f,  10.8f, 6.6f, -0.28f },
+    { -12.2f, -10.8f, 8.0f,  0.42f },
+    {  29.5f,  11.8f, 7.7f, -0.38f },
+    {  54.2f,  10.5f, 6.8f,  0.30f },
+    {  54.0f, -11.2f, 8.2f, -0.45f },
+}};
+
 static void ResetPalmTrees() {
     g_trees.Initialize();
     for (const PalmSpawn& palm : kPalmSpawns)
         g_trees.Plant(palm.x, palm.z, palm.height, palm.lean);
+    if (g_stressTestMode) {
+        for (const PalmSpawn& palm : kStressHousePalmSpawns)
+            g_trees.Plant(palm.x, palm.z, palm.height, palm.lean);
+    }
 }
 
 static bool g_environmentInitialized = false;
@@ -1313,6 +1328,12 @@ static void RebuildScalableEnvironment() {
         obstacles.push_back(
             { palm.x - 0.55f, palm.z - 0.55f,
               palm.x + 0.55f, palm.z + 0.55f });
+    if (g_stressTestMode) {
+        for (const PalmSpawn& palm : kStressHousePalmSpawns)
+            obstacles.push_back(
+                { palm.x - 0.55f, palm.z - 0.55f,
+                  palm.x + 0.55f, palm.z + 0.55f });
+    }
     const float extent = g_stressTestMode ? 122.0f : 61.0f;
     if (!g_navigation.BuildTerrain(terrainSampler, -extent, extent,
             -extent, extent, obstacles))
