@@ -4355,16 +4355,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         mainShader.BeginFrame();
         g_meshShader.BeginFrame();
         hzbCaptureActive = gameScreen == GameScreen::Level1 &&
-            !levelLoadingActive && !usingRaytracing && !usingVisibility &&
-            !msaaActive && g_useMeshShader;
+            !levelLoadingActive && !usingRaytracing && !msaaActive &&
+            (g_useMeshShader || usingVisibility);
         if (!hzbCaptureActive) occlusionDepth.InvalidateCameraHistory();
         mainShader.SetPreviousViewProjection(previousHZBViewProjection);
+        const bool hzbHistoryUsable = hzbCaptureActive &&
+            occlusionDepth.CanUseHistory(
+                scene.camera.Position, scene.camera.Front) &&
+            !msaaUsedLastFrame;
         g_meshShader.SetOcclusionDepth(
             occlusionDepth.GetGPUHandle(),
-            hzbCaptureActive &&
-                occlusionDepth.CanUseHistory(
-                    scene.camera.Position, scene.camera.Front) &&
-                !msaaUsedLastFrame,
+            hzbHistoryUsable,
             occlusionDepth.GetMipCount());
 
         if (gameScreen == GameScreen::Level1 && levelLoadingActive) {
@@ -4693,7 +4694,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 shadowResource = shadowMap.GetResource();
             }
             RenderIdTech(scene, mainShader, visBuffer, geo, packed,
-                lightSpace, shadowResource);
+                lightSpace, shadowResource, &occlusionDepth,
+                hzbHistoryUsable, previousHZBViewProjection);
         } else if (gameScreen == GameScreen::Level1 && !levelLoadingActive) {
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
