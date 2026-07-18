@@ -199,24 +199,33 @@ public:
     UINT width = 0;
     UINT height = 0;
     bool initialized = false;
+    std::string initError;
 
     bool Init(UINT screenWidth, UINT screenHeight) {
         width = screenWidth;
         height = screenHeight;
 
-        if (!CreateVisBufferRT()) return false;
-        if (!CreateOutputTexture()) return false;
-        if (!CreateColorLUT()) return false;
-        if (!CreateStructuredBuffers()) return false;
-        if (!CreateComputeDescriptorHeap()) return false;
-        if (!CreateVisPassPipeline()) return false;
-        if (!CreateResolvePipeline()) return false;
-        if (!CreatePostPipeline()) return false;
-        if (!CreateExposurePipeline()) return false;
+        initError.clear();
+        auto require = [&](bool success, const char* stage) {
+            if (success) return true;
+            initError = stage;
+            std::ofstream log("visibility_buffer_error.log", std::ios::trunc);
+            log << "Visibility buffer initialization failed: " << stage << '\n';
+            return false;
+        };
+        if (!require(CreateVisBufferRT(), "visibility target")) return false;
+        if (!require(CreateOutputTexture(), "output textures")) return false;
+        if (!require(CreateColorLUT(), "colour LUT")) return false;
+        if (!require(CreateStructuredBuffers(), "structured buffers")) return false;
+        if (!require(CreateComputeDescriptorHeap(), "compute descriptors")) return false;
+        if (!require(CreateVisPassPipeline(), "visibility shaders")) return false;
+        if (!require(CreateResolvePipeline(), "resolve shader")) return false;
+        if (!require(CreatePostPipeline(), "post-process shader")) return false;
+        if (!require(CreateExposurePipeline(), "exposure shaders")) return false;
 
-        if (!frameConstantBuffer.Create(FRAME_COUNT)) return false;
-        if (!postConstantBuffer.Create(FRAME_COUNT)) return false;
-        if (!exposureConstantBuffer.Create(FRAME_COUNT)) return false;
+        if (!require(frameConstantBuffer.Create(FRAME_COUNT), "frame constants")) return false;
+        if (!require(postConstantBuffer.Create(FRAME_COUNT), "post constants")) return false;
+        if (!require(exposureConstantBuffer.Create(FRAME_COUNT), "exposure constants")) return false;
 
         cpuDrawCalls.resize(VB_MAX_DRAW_CALLS);
         cpuVertices.resize(VB_MAX_VERTICES);
@@ -1228,10 +1237,15 @@ private:
 
         ComPtr<ID3DBlob> csBlob, errorBlob;
         HRESULT hr = D3DCompile(csCode.c_str(), csCode.length(), "visbuf_resolve_cs.hlsl",
-            nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0",
+            nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_1",
             compileFlags, 0, &csBlob, &errorBlob);
         if (FAILED(hr)) {
-            if (errorBlob) std::cerr << "VB CS error: " << (char*)errorBlob->GetBufferPointer() << std::endl;
+            if (errorBlob) {
+                const char* message = static_cast<const char*>(errorBlob->GetBufferPointer());
+                std::cerr << "VB CS error: " << message << std::endl;
+                std::ofstream log("visibility_buffer_shader_error.log", std::ios::trunc);
+                log.write(message, static_cast<std::streamsize>(errorBlob->GetBufferSize()));
+            }
             return false;
         }
 

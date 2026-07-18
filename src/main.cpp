@@ -3788,7 +3788,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
 
     // Visibility buffer (id Tech path)
-    if (!visBuffer.Init(SCR_WIDTH, SCR_HEIGHT)) {
+    // Init uploads the 3D colour LUT. Record and submit that work now; the
+    // command list has been closed since the sky upload above.
+    ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
+    ThrowIfFailed(g_dx12.commandList->Reset(
+        g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
+    const bool visibilityBufferReady = visBuffer.Init(SCR_WIDTH, SCR_HEIGHT);
+    ThrowIfFailed(g_dx12.commandList->Close());
+    {
+        ID3D12CommandList* visibilityInitLists[] = { g_dx12.commandList.Get() };
+        g_dx12.commandQueue->ExecuteCommandLists(1, visibilityInitLists);
+    }
+    WaitForGPU();
+    DumpDX12DebugMessages();
+    if (!visibilityBufferReady) {
         std::cerr << "VB init failed (non-fatal)\n";
         scene.useVisibilityBuffer = false;
     } else {
@@ -3816,6 +3829,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     float lastTime = 0.0f;
 
     std::cout << "Controls: WASD, Mouse, TAB=UI, F11=Fullscreen, ESC=Exit\n";
+
+    // Deterministic renderer smoke path for GPU validation and crash dumps.
+    bool visibilityTestPending = false;
+    UINT visibilityTestForwardFrames = 0;
+    if (GetEnvironmentVariableA("SGE_VISIBILITY_TEST", nullptr, 0) > 0) {
+        scene.useVisibilityBuffer = false;
+        visibilityTestPending = true;
+        emptyLevelAssetsLoaded = true;
+        const bool emptyVisibilityTest =
+            GetEnvironmentVariableA("SGE_VISIBILITY_TEST_FULL", nullptr, 0) == 0;
+        StartLevelOne(hwnd, true, false, emptyVisibilityTest);
+    }
 
     // ?? main loop ????????????????????????????????????????????????????????????
     MSG msg = {};
@@ -4334,6 +4359,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_profiler.BeginGpuFrame(g_dx12.frameIndex, g_dx12.commandList.Get());
 
         float cc[4] = { scene.clearColor.x, scene.clearColor.y, scene.clearColor.z, 1.0f };
+        if (visibilityTestPending && gameScreen == GameScreen::Level1 &&
+            !levelLoadingActive && ++visibilityTestForwardFrames >= 120) {
+            scene.useVisibilityBuffer = true;
+            visibilityTestPending = false;
+            std::cerr << "VISIBILITY_TEST: toggled after 120 forward frames\n";
+        }
         const bool usingRaytracing =
             scene.useRaytracing && g_rt.initialized;
         const bool usingVisibility =
