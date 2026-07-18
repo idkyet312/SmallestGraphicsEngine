@@ -42,11 +42,21 @@ public:
     bool msaaEnabled = false;
     bool wireframe = false; // Z key: draw meshlets as wireframe
     bool occlusionEnabled = false;
+    UINT occlusionMipCount = 1;
     D3D12_GPU_DESCRIPTOR_HANDLE occlusionDepthHandle = {};
+    UINT dispatchesThisFrame = 0;
+    UINT meshletsThisFrame = 0;
 
-    void SetOcclusionDepth(D3D12_GPU_DESCRIPTOR_HANDLE handle, bool enabled) {
+    void BeginFrame() {
+        dispatchesThisFrame = 0;
+        meshletsThisFrame = 0;
+    }
+
+    void SetOcclusionDepth(D3D12_GPU_DESCRIPTOR_HANDLE handle, bool enabled,
+                           UINT mipCount = 1) {
         occlusionDepthHandle = handle;
         occlusionEnabled = enabled;
+        occlusionMipCount = (std::max)(1u, mipCount);
     }
 
     bool CanDraw(UINT meshletCount,
@@ -202,10 +212,12 @@ public:
                 firstMeshlet, totalMeshlets,
                 occlusionEnabled ? 1u : 0u,
                 g_dx12.screenWidth, g_dx12.screenHeight,
-                skinning
+                skinning, occlusionMipCount
             };
-            commandList6->SetGraphicsRoot32BitConstants(8, 9, &data, 0);
+            commandList6->SetGraphicsRoot32BitConstants(8, 10, &data, 0);
             commandList6->DispatchMesh(amplificationGroups, 1, 1);
+            ++dispatchesThisFrame;
+            meshletsThisFrame += meshletCount;
             firstMeshlet += meshletCount;
         }
     }

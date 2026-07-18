@@ -337,10 +337,17 @@ public:
                        std::fabs(ndc.y) <= 1.0f + rx &&
                        ndc.z + rz >= 0.0f && ndc.z - rz <= 1.0f;
             };
-            for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
-                if (!inLightBox(item.sphereCenter, item.sphereRadius)) continue;
-                DrawSceneNodeShadow(item.node, depthShader,
-                                    XMLoadFloat4x4(&item.transform), lightSpace);
+            const auto& batches = g_destruction.GetRenderBatches();
+            if (!batches.empty()) {
+                for (const DestructionRenderBatch& batch : batches) {
+                    if (!inLightBox(batch.sphereCenter, batch.sphereRadius)) continue;
+                    DrawSceneNodeShadow(batch.shadowNode, depthShader,
+                        XMLoadFloat4x4(&batch.transform), lightSpace);
+                }
+            } else for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
+                    if (!inLightBox(item.sphereCenter, item.sphereRadius)) continue;
+                    DrawSceneNodeShadow(item.node, depthShader,
+                        XMLoadFloat4x4(&item.transform), lightSpace);
             }
             for (const RagdollRenderItem& item : g_destruction.GetRagdollRenderItems()) {
                 if (!inLightBox(item.sphereCenter, item.sphereRadius)) continue;

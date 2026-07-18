@@ -8,6 +8,8 @@
 #include "VirtualInput.h"
 #include "GrassField.h"
 #include "ProfilerDX12.h"
+#include "MeshShaderDX12.h"
+#include "StaticBufferDX12.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -19,6 +21,10 @@ extern ProfilerDX12 g_profiler;
 extern UINT g_forwardDrawCalls;
 extern UINT g_shadowDrawCalls;
 extern UINT g_visibilityDrawCalls;
+extern UINT g_destructionBatchesThisFrame;
+extern UINT g_destructionChunksSubmittedThisFrame;
+extern UINT g_destructionCulledThisFrame;
+extern MeshShaderDX12 g_meshShader;
 
 // Skinned Bandit enemy (defined in main.cpp) -- surfaced for debug readout.
 // BanditDebugText renders a one-line status; defined in main.cpp where the
@@ -208,6 +214,16 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::Text("Draw calls: %u  (Forward %u, Shadow %u, Visibility %u)",
                 totalDrawCalls, g_forwardDrawCalls, g_shadowDrawCalls,
                 g_visibilityDrawCalls);
+    ImGui::Text("Mesh dispatches: %u  Meshlets: %u",
+                g_meshShader.dispatchesThisFrame, g_meshShader.meshletsThisFrame);
+    ImGui::Text("Destruction batches: %u  Chunks: %u  Culled: %u",
+                g_destructionBatchesThisFrame,
+                g_destructionChunksSubmittedThisFrame,
+                g_destructionCulledThisFrame);
+    const StaticBufferStatsDX12 staticStats = GetStaticBufferStatsDX12();
+    ImGui::Text("GPU-local static buffers: %u  %.1f MiB  Pending: %u",
+                staticStats.resources, staticStats.bytes / (1024.0 * 1024.0),
+                staticStats.pendingUploads);
     if (ImGui::CollapsingHeader("CPU / GPU Profiler", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Text("CPU frame: %.2f ms", g_profiler.CpuFrameMs());
         for (const auto& sample : g_profiler.CpuSamples())
@@ -215,6 +231,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::Separator();
         if (g_profiler.IsInitialized()) {
             ImGui::Text("GPU frame: %.2f ms", g_profiler.GpuFrameMs());
+            ImGui::Text("GPU p95 (%zu/300): %.2f ms",
+                        g_profiler.GpuHistorySize(), g_profiler.GpuFrameP95Ms());
             for (const auto& sample : g_profiler.GpuSamples())
                 ImGui::BulletText("%s: %.3f ms", sample.name.c_str(), sample.milliseconds);
             ImGui::TextDisabled("GPU results delayed by frames in flight");

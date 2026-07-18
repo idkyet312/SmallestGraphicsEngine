@@ -18,6 +18,16 @@ struct DestructionRenderItem {
     float sphereRadius = 0.0f;
 };
 
+struct DestructionRenderBatch {
+    // Colour mesh is merged by material; shadow mesh is fully flattened.
+    std::shared_ptr<SceneNode> colourNode;
+    std::shared_ptr<SceneNode> shadowNode;
+    DirectX::XMFLOAT4X4 transform;
+    DirectX::XMFLOAT3 sphereCenter = {};
+    float sphereRadius = 0.0f;
+    uint32_t chunkCount = 0;
+};
+
 struct DestructionDebrisHazard {
     DirectX::XMFLOAT3 worldMin;
     DirectX::XMFLOAT3 worldMax;
@@ -158,6 +168,7 @@ public:
     uint32_t GetChunkCount() const;
     uint32_t GetActorCount() const;
     const std::vector<DestructionRenderItem>& GetRenderItems() const;
+    const std::vector<DestructionRenderBatch>& GetRenderBatches() const;
     const std::vector<RagdollRenderItem>& GetRagdollRenderItems() const;
     const std::vector<EnemyGunRenderItem>& GetEnemyGunRenderItems() const;
     DestructionDebugData GetDebugData() const;

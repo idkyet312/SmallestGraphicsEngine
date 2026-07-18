@@ -15,6 +15,7 @@ cbuffer MeshDrawBuffer : register(b6) {
     uint screenWidth;
     uint screenHeight;
     uint skinningEnabled;   // skinned meshlet bounds are bind-pose -> skip cull
+    uint occlusionMipCount;
 };
 
 cbuffer CameraBuffer : register(b2) {
@@ -41,31 +42,22 @@ groupshared MeshPayload payloadData;
 groupshared uint visibleCount;
 
 bool IntersectsFrustum(MeshletBounds bounds) {
-    float4 clipCorners[8];
-    [unroll]
-    for (uint i = 0; i < 8; ++i) {
-        float3 p = float3(
-            (i & 1) ? bounds.boundsMax.x : bounds.boundsMin.x,
-            (i & 2) ? bounds.boundsMax.y : bounds.boundsMin.y,
-            (i & 4) ? bounds.boundsMax.z : bounds.boundsMin.z);
-        clipCorners[i] = mul(mul(mul(float4(p, 1), model), view), projection);
-    }
-
-    bool outsideLeft = true, outsideRight = true;
-    bool outsideBottom = true, outsideTop = true;
-    bool outsideNear = true, outsideFar = true;
-    [unroll]
-    for (uint i = 0; i < 8; ++i) {
-        float4 c = clipCorners[i];
-        outsideLeft   = outsideLeft   && c.x < -c.w;
-        outsideRight  = outsideRight  && c.x >  c.w;
-        outsideBottom = outsideBottom && c.y < -c.w;
-        outsideTop    = outsideTop    && c.y >  c.w;
-        outsideNear   = outsideNear   && c.z < 0.0;
-        outsideFar    = outsideFar    && c.z > c.w;
-    }
-    return !(outsideLeft || outsideRight || outsideBottom ||
-             outsideTop || outsideNear || outsideFar);
+    float4 worldCenter = mul(float4(bounds.sphereCenter, 1), model);
+    float4 clipCenter = mul(mul(worldCenter, view), projection);
+    float3 sx = float3(model[0][0], model[0][1], model[0][2]);
+    float3 sy = float3(model[1][0], model[1][1], model[1][2]);
+    float3 sz = float3(model[2][0], model[2][1], model[2][2]);
+    float radius = bounds.sphereRadius * max(length(sx), max(length(sy), length(sz)));
+    float radiusX = radius * abs(projection[0][0]);
+    float radiusY = radius * abs(projection[1][1]);
+    // Inflate depth radius because perspective changes both clip z and w.
+    float radiusZ = radius * (abs(projection[2][2]) + abs(projection[2][3]));
+    return clipCenter.x + radiusX >= -clipCenter.w &&
+           clipCenter.x - radiusX <=  clipCenter.w &&
+           clipCenter.y + radiusY >= -clipCenter.w &&
+           clipCenter.y - radiusY <=  clipCenter.w &&
+           clipCenter.z + radiusZ >= 0.0 &&
+           clipCenter.z - radiusZ <= clipCenter.w + radiusZ;
 }
 
 bool IsBackfacing(MeshletBounds bounds) {
@@ -83,38 +75,41 @@ bool IsBackfacing(MeshletBounds bounds) {
 
 bool IsOccluded(MeshletBounds bounds) {
     if (!occlusionEnabled) return false;
-    float2 uvMin = float2(1.0, 1.0);
-    float2 uvMax = float2(0.0, 0.0);
-    float nearestDepth = 1.0;
-    [unroll]
-    for (uint i = 0; i < 8; ++i) {
-        float3 p = float3(
-            (i & 1) ? bounds.boundsMax.x : bounds.boundsMin.x,
-            (i & 2) ? bounds.boundsMax.y : bounds.boundsMin.y,
-            (i & 4) ? bounds.boundsMax.z : bounds.boundsMin.z);
-        float4 clip = mul(mul(mul(float4(p, 1), model), view), projection);
-        if (clip.w <= 0.001) return false;
-        float3 ndc = clip.xyz / clip.w;
-        float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
-        uvMin = min(uvMin, uv);
-        uvMax = max(uvMax, uv);
-        nearestDepth = min(nearestDepth, ndc.z);
-    }
+    float4 worldCenter = mul(float4(bounds.sphereCenter, 1), model);
+    float4 viewCenter = mul(worldCenter, view);
+    float4 clip = mul(viewCenter, projection);
+    if (clip.w <= 0.001) return false;
+    float3 sx = float3(model[0][0], model[0][1], model[0][2]);
+    float3 sy = float3(model[1][0], model[1][1], model[1][2]);
+    float3 sz = float3(model[2][0], model[2][1], model[2][2]);
+    float radius = bounds.sphereRadius * max(length(sx), max(length(sy), length(sz)));
+    float2 centerUV = (clip.xy / clip.w) * float2(0.5, -0.5) + 0.5;
+    float2 radiusUV = radius * float2(abs(projection[0][0]), abs(projection[1][1])) /
+                      clip.w * 0.5;
+    float2 uvMin = centerUV - radiusUV;
+    float2 uvMax = centerUV + radiusUV;
+    float nearestDepth = saturate(clip.z / clip.w - radius / max(abs(viewCenter.z), 0.001));
     uvMin = saturate(uvMin);
     uvMax = saturate(uvMax);
     if (uvMin.x >= uvMax.x || uvMin.y >= uvMax.y) return false;
 
-    // Conservative 3x3 test against previous-frame depth. Any background or
+    // Conservative four-corner test against previous-frame depth. Any background or
     // farther sample keeps the meshlet visible, reducing false rejection.
+    float pixelDiameter = max(radiusUV.x * screenWidth, radiusUV.y * screenHeight) * 2.0;
+    uint mipLevel = min((uint)floor(log2(max(pixelDiameter, 1.0))),
+                        max(occlusionMipCount, 1u) - 1u);
+    uint mipWidth, mipHeight, availableMips;
+    previousDepth.GetDimensions(mipLevel, mipWidth, mipHeight, availableMips);
     float farthestOccluder = 0.0;
     [unroll]
-    for (uint y = 0; y < 3; ++y) {
+    for (uint y = 0; y < 2; ++y) {
         [unroll]
-        for (uint x = 0; x < 3; ++x) {
-            float2 uv = lerp(uvMin, uvMax, float2(x, y) * 0.5);
-            uint2 pixel = min(uint2(uv * float2(screenWidth, screenHeight)),
-                              uint2(screenWidth - 1, screenHeight - 1));
-            farthestOccluder = max(farthestOccluder, previousDepth.Load(int3(pixel, 0)));
+        for (uint x = 0; x < 2; ++x) {
+            float2 uv = lerp(uvMin, uvMax, float2(x, y));
+            uint2 pixel = min(uint2(uv * float2(mipWidth, mipHeight)),
+                              uint2(mipWidth - 1, mipHeight - 1));
+            farthestOccluder = max(farthestOccluder,
+                previousDepth.Load(int3(pixel, mipLevel)));
         }
     }
     return farthestOccluder < nearestDepth - 0.01;

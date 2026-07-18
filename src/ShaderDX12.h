@@ -116,6 +116,7 @@ struct alignas(256) MeshDrawBufferDX12 {
     UINT screenWidth;
     UINT screenHeight;
     UINT skinningEnabled; // 0 static draw, 1 apply bone palette (t12) + skin (t13)
+    UINT occlusionMipCount;
 };
 
 // Upload buffer helper

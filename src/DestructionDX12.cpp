@@ -2,6 +2,7 @@
 #include "DestructionDX12.h"
 
 #include "GLBImporter.h"
+#include "DX12Core.h"
 #include "NvBlast.h"
 #include "NvBlastTkActor.h"
 #include "NvBlastTkAsset.h"
@@ -251,6 +252,19 @@ struct DestructionDX12::Impl {
     std::vector<int> chunkGroupByAsset;           // asset-chunk-indexed plank id (root=[0]=-2)
     std::list<std::unique_ptr<ActorRuntime>> actors;
     std::vector<DestructionRenderItem> renderItems;
+    std::vector<DestructionRenderBatch> renderBatches;
+    struct BatchCacheEntry {
+        uint64_t chunkHash = 0;
+        std::shared_ptr<SceneNode> colourNode;
+        std::shared_ptr<SceneNode> shadowNode;
+    };
+    std::unordered_map<const ActorRuntime*, BatchCacheEntry> batchCache;
+    std::array<std::vector<std::shared_ptr<SceneNode>>, FRAME_COUNT> retiredBatchNodes;
+    std::array<UINT64, FRAME_COUNT> retiredBatchEpoch = {};
+    // Runtime mesh merging is expensive enough to stall the simulation during a
+    // Blast split. Keep the intact structure batched, then reuse authored chunk
+    // meshes after topology changes instead of rebuilding meshlets in Update().
+    bool renderBatchingEnabled = true;
     // True once the render items have been rebuilt at a moment when nothing was
     // moving -- i.e. they are up to date and can be left alone until something
     // changes. Cleared by anything that alters the scene (a break, a split, a new
@@ -1206,10 +1220,32 @@ struct DestructionDX12::Impl {
         // rather than assuming its cached items are still good.
         rebuiltWhileStill = false;
         renderItems.clear();
+        renderBatches.clear();
+        std::unordered_map<const ActorRuntime*, bool> liveActors;
+        bool batchBuildFailed = false;
+        const UINT retireSlot = g_dx12.frameIndex % FRAME_COUNT;
+        const UINT64 retireEpoch = g_dx12.fenceValues[retireSlot];
+        if (retiredBatchEpoch[retireSlot] != retireEpoch) {
+            retiredBatchNodes[retireSlot].clear();
+            retiredBatchEpoch[retireSlot] = retireEpoch;
+        }
+        auto retireBatch = [&](BatchCacheEntry& entry) {
+            if (entry.colourNode)
+                retiredBatchNodes[retireSlot].push_back(std::move(entry.colourNode));
+            if (entry.shadowNode)
+                retiredBatchNodes[retireSlot].push_back(std::move(entry.shadowNode));
+        };
+        if (!renderBatchingEnabled && !batchCache.empty()) {
+            for (auto& [actor, entry] : batchCache) retireBatch(entry);
+            batchCache.clear();
+        }
         for (const auto& runtime : actors) {
+            liveActors[runtime.get()] = true;
             XMMATRIX transform = XMMatrixIdentity();
             if (!B3_IS_NULL(runtime->body)) transform = BoxTransform(runtime->body, runtime->center);
             XMFLOAT4X4 stored; XMStoreFloat4x4(&stored, transform);
+            XMFLOAT3 batchMin(FLT_MAX, FLT_MAX, FLT_MAX);
+            XMFLOAT3 batchMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
             for (uint32_t chunk : runtime->chunks) {
                 // BoxTransform is rigid, so the model-space half-diagonal is the
                 // world radius unchanged; +10% guards frustum-edge pop-in.
@@ -1220,7 +1256,60 @@ struct DestructionDX12::Impl {
                 XMFLOAT3 worldCenter;
                 XMStoreFloat3(&worldCenter, XMVector3Transform(XMLoadFloat3(&c.center), transform));
                 renderItems.push_back({ c.node, stored, worldCenter, radius });
+                batchMin.x = (std::min)(batchMin.x, worldCenter.x - radius);
+                batchMin.y = (std::min)(batchMin.y, worldCenter.y - radius);
+                batchMin.z = (std::min)(batchMin.z, worldCenter.z - radius);
+                batchMax.x = (std::max)(batchMax.x, worldCenter.x + radius);
+                batchMax.y = (std::max)(batchMax.y, worldCenter.y + radius);
+                batchMax.z = (std::max)(batchMax.z, worldCenter.z + radius);
             }
+
+            if (!renderBatchingEnabled) continue;
+
+            uint64_t hash = 1469598103934665603ull;
+            for (uint32_t chunk : runtime->chunks) {
+                hash ^= chunk;
+                hash *= 1099511628211ull;
+            }
+            BatchCacheEntry& cache = batchCache[runtime.get()];
+            if (cache.chunkHash != hash || !cache.colourNode || !cache.shadowNode) {
+                retireBatch(cache);
+                auto root = std::make_shared<SceneNode>("DestructionActorBatch");
+                root->children.reserve(runtime->chunks.size());
+                for (uint32_t chunk : runtime->chunks)
+                    root->children.push_back(chunks[chunk].node);
+                root->UpdateGlobalTransform(root->localTransform);
+                cache.colourNode = GLBImporter::MergeSceneByMaterial(root, device);
+                cache.shadowNode = GLBImporter::MergeSceneForDepth(root, device);
+                cache.chunkHash = hash;
+            }
+            if (!cache.colourNode || !cache.shadowNode || batchMin.x == FLT_MAX) {
+                batchBuildFailed = true;
+                continue;
+            }
+            const XMFLOAT3 center(
+                (batchMin.x + batchMax.x) * 0.5f,
+                (batchMin.y + batchMax.y) * 0.5f,
+                (batchMin.z + batchMax.z) * 0.5f);
+            const XMVECTOR half = (XMLoadFloat3(&batchMax) - XMLoadFloat3(&batchMin)) * 0.5f;
+            renderBatches.push_back({ cache.colourNode, cache.shadowNode, stored,
+                center, XMVectorGetX(XMVector3Length(half)),
+                static_cast<uint32_t>(runtime->chunks.size()) });
+        }
+        for (auto it = batchCache.begin(); it != batchCache.end();) {
+            if (!liveActors.count(it->first)) {
+                retireBatch(it->second);
+                it = batchCache.erase(it);
+            }
+            else ++it;
+        }
+        if (batchBuildFailed) {
+            static bool warned = false;
+            if (!warned) {
+                std::cerr << "Destruction actor batching failed; using chunk fallback\n";
+                warned = true;
+            }
+            renderBatches.clear();
         }
         ragdollRenderItems.clear();
         for (const RagdollPart& part : ragdollParts) {
@@ -1456,7 +1545,9 @@ void DestructionDX12::Shutdown() {
     if (m->asset) m->asset->release();
     if (m->framework) ReleaseTkFramework();
     m->group = nullptr; m->asset = nullptr; m->framework = nullptr;
-    m->chunks.clear(); m->renderItems.clear(); m->ragdollParts.clear();
+    m->chunks.clear(); m->renderItems.clear(); m->renderBatches.clear();
+    m->batchCache.clear(); m->ragdollParts.clear();
+    for (auto& retired : m->retiredBatchNodes) retired.clear();
     m->authoredRagdolls.clear();
     m->ragdollRenderItems.clear(); m->initialized = false;
 }
@@ -2139,6 +2230,11 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
         const TkSplitEvent* split = events[e].getPayload<TkSplitEvent>();
         if (!split) continue;
 
+        if (m->renderBatchingEnabled) {
+            m->renderBatchingEnabled = false;
+            std::cout << "Destruction topology changed: using non-stalling chunk rendering\n";
+        }
+
         // userData belongs to an actor that Blast has just replaced. A later
         // split event may still contain that old pointer, so never dereference
         // it until ownership is confirmed against the live runtime list.
@@ -2290,6 +2386,7 @@ bool DestructionDX12::IsInitialized() const { return m && m->initialized; }
 uint32_t DestructionDX12::GetChunkCount() const { return m ? (uint32_t)m->chunks.size() : 0; }
 uint32_t DestructionDX12::GetActorCount() const { return m ? (uint32_t)m->actors.size() : 0; }
 const std::vector<DestructionRenderItem>& DestructionDX12::GetRenderItems() const { return m->renderItems; }
+const std::vector<DestructionRenderBatch>& DestructionDX12::GetRenderBatches() const { return m->renderBatches; }
 const std::vector<RagdollRenderItem>& DestructionDX12::GetRagdollRenderItems() const { return m->ragdollRenderItems; }
 const std::vector<EnemyGunRenderItem>& DestructionDX12::GetEnemyGunRenderItems() const { return m->enemyGunRenderItems; }
 

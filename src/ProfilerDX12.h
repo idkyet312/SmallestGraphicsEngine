@@ -2,7 +2,10 @@
 #define PROFILER_DX12_H
 
 #include "DX12Core.h"
+#include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -134,6 +137,14 @@ public:
     const std::vector<ProfilerSampleDX12>& GpuSamples() const { return gpuSamples; }
     double CpuFrameMs() const { return cpuFrameMs; }
     double GpuFrameMs() const { return gpuFrameMs; }
+    double GpuFrameP95Ms() const {
+        if (gpuFrameHistory.empty()) return 0.0;
+        std::vector<double> sorted(gpuFrameHistory.begin(), gpuFrameHistory.end());
+        std::sort(sorted.begin(), sorted.end());
+        const size_t index = static_cast<size_t>((sorted.size() - 1) * 0.95);
+        return sorted[index];
+    }
+    size_t GpuHistorySize() const { return gpuFrameHistory.size(); }
     bool IsInitialized() const { return initialized; }
 
     class CpuScope {
@@ -151,8 +162,12 @@ public:
     public:
         Scope(ProfilerDX12& owner, const char* name, ID3D12GraphicsCommandList* list)
             : profiler(owner), commandList(list), label(name), begin(Clock::now()),
-              eventIndex(owner.BeginGpuEvent(name, list)) {}
+              eventIndex(owner.BeginGpuEvent(name, list)) {
+            if (commandList && label)
+                commandList->BeginEvent(0, label, static_cast<UINT>(std::strlen(label) + 1));
+        }
         ~Scope() {
+            if (commandList && label) commandList->EndEvent();
             profiler.EndGpuEvent(eventIndex, commandList);
             profiler.AddCpuSample(label, begin, Clock::now());
         }
@@ -199,6 +214,8 @@ private:
             if (slot.frameBegin != InvalidQuery && slot.frameEnd != InvalidQuery) {
                 gpuFrameMs = double(timestamps[slot.frameEnd] - timestamps[slot.frameBegin])
                            * 1000.0 / double(timestampFrequency);
+                gpuFrameHistory.push_back(gpuFrameMs);
+                if (gpuFrameHistory.size() > 300) gpuFrameHistory.pop_front();
             }
             for (const GpuEvent& event : slot.events) {
                 if (event.begin == InvalidQuery || event.end == InvalidQuery) continue;
@@ -226,6 +243,7 @@ private:
     std::vector<ProfilerSampleDX12> currentCpuSamples;
     std::vector<ProfilerSampleDX12> cpuSamples;
     std::vector<ProfilerSampleDX12> gpuSamples;
+    std::deque<double> gpuFrameHistory;
 };
 
 #endif

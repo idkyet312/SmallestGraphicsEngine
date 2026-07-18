@@ -447,6 +447,8 @@ inline void BuildFrustumPlanes(const XMMATRIX& viewProj, XMFLOAT4 planes[6]) {
 
 // Diagnostic: chunks skipped by the frustum cull in the last recorded frame.
 inline UINT g_destructionCulledThisFrame = 0;
+inline UINT g_destructionBatchesThisFrame = 0;
+inline UINT g_destructionChunksSubmittedThisFrame = 0;
 
 inline bool SphereVisible(const XMFLOAT4 planes[6], const XMFLOAT3& c, float r) {
     for (int i = 0; i < 6; ++i) {
@@ -541,18 +543,35 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     // Separate destructible brick wall beside the house.
     g_destructionCulledThisFrame = 0;
+    g_destructionBatchesThisFrame = 0;
+    g_destructionChunksSubmittedThisFrame = 0;
     if (scene.useDestruction && g_destruction.IsInitialized()) {
         // ~588 chunk draws when both houses stand; the frustum test drops the
         // ones behind the camera before any CBV write or draw is recorded.
         XMFLOAT4 frustum[6];
         BuildFrustumPlanes(view * proj, frustum);
-        for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
-            if (item.sphereRadius > 0.0f &&
-                !SphereVisible(frustum, item.sphereCenter, item.sphereRadius)) {
-                ++g_destructionCulledThisFrame;
-                continue;
+        const auto& batches = g_destruction.GetRenderBatches();
+        if (!batches.empty()) {
+            for (const DestructionRenderBatch& batch : batches) {
+                if (batch.sphereRadius > 0.0f &&
+                    !SphereVisible(frustum, batch.sphereCenter, batch.sphereRadius)) {
+                    g_destructionCulledThisFrame += batch.chunkCount;
+                    continue;
+                }
+                DrawSceneNode(batch.colourNode, shader,
+                    XMLoadFloat4x4(&batch.transform), view, proj, lightSpace);
+                ++g_destructionBatchesThisFrame;
+                g_destructionChunksSubmittedThisFrame += batch.chunkCount;
             }
-            DrawSceneNode(item.node, shader, XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
+        } else for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
+                if (item.sphereRadius > 0.0f &&
+                    !SphereVisible(frustum, item.sphereCenter, item.sphereRadius)) {
+                    ++g_destructionCulledThisFrame;
+                    continue;
+                }
+                DrawSceneNode(item.node, shader, XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
+                ++g_destructionBatchesThisFrame;
+                ++g_destructionChunksSubmittedThisFrame;
         }
         shader.Use(scene.wireframeMode);
         for (const RagdollRenderItem& item : g_destruction.GetRagdollRenderItems()) {
@@ -774,11 +793,16 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     }
 
     if (g_helicopterModel && scene.showHelicopter) {
-        XMFLOAT4 helicopterFrustum[6];
-        BuildFrustumPlanes(view * proj, helicopterFrustum);
-        if (SphereVisible(helicopterFrustum, g_helicopterPosition, 6.5f))
-            DrawSceneNode(g_helicopterModel, shader, HelicopterWorldMatrix(),
-                          view, proj, lightSpace);
+        // Rotor child transforms and aggressively simplified cockpit/fuselage
+        // meshlets make the generic static-mesh bounds unsuitable here. A bad
+        // amplification-shader reject made the loaded aircraft disappear. The
+        // aircraft already has an import-time LOD, so keep this one model on the
+        // conventional raster path.
+        const bool meshShadersWereEnabled = g_useMeshShader;
+        g_useMeshShader = false;
+        DrawSceneNode(g_helicopterModel, shader, HelicopterWorldMatrix(),
+                      view, proj, lightSpace);
+        g_useMeshShader = meshShadersWereEnabled;
     }
 
     // Authored shootable barrel FBX. Its pivot is at the base, while gameplay
