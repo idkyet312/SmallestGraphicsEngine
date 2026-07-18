@@ -33,6 +33,7 @@ extern ComPtr<ID3D12Resource> g_explosionTexture;   // 8x8 flipbook explosion sh
 extern std::shared_ptr<SceneNode> g_explosiveBarrelModel;
 extern std::shared_ptr<SceneNode> g_humveeModel;
 extern std::shared_ptr<SceneNode> g_helicopterModel;
+extern DirectX::XMFLOAT3 g_helicopterPosition;
 DirectX::XMMATRIX HumveeWorldMatrix();
 DirectX::XMMATRIX HelicopterWorldMatrix();
 
@@ -304,7 +305,8 @@ inline std::vector<VertexPosNormUV> BuildCapsuleVertices(int hemiRings = 6, int 
 // part of a scene graph (e.g. the sliced palm) can be drawn the same way.
 inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shader,
                        const XMMATRIX& model,
-                       const XMMATRIX& view, const XMMATRIX& proj, const XMMATRIX& lightSpace) {
+                       const XMMATRIX& view, const XMMATRIX& proj,
+                       const XMMATRIX& lightSpace, bool colorNormalOnly = false) {
     if (!mesh) return;
     shader.SetMatrices(model, view, proj, lightSpace);
 
@@ -321,12 +323,12 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
                 color,
                 prim.material->baseColorTexture != nullptr,
                 prim.material->normalTexture != nullptr,
-                prim.material->metallicFactor,
-                prim.material->roughnessFactor,
+                colorNormalOnly ? 0.0f : prim.material->metallicFactor,
+                colorNormalOnly ? 0.58f : prim.material->roughnessFactor,
                 prim.material->baseColorTexture.Get(),
                 prim.material->normalTexture.Get(),
-                prim.material->metallicRoughnessTexture.Get(),
-                prim.material->roughnessOnlyTexture,
+                colorNormalOnly ? nullptr : prim.material->metallicRoughnessTexture.Get(),
+                colorNormalOnly ? false : prim.material->roughnessOnlyTexture,
                 prim.material->baseColorFactor.w,
                 prim.material->alphaCutout,
                 prim.material.get());   // cache its descriptors: they never change
@@ -572,7 +574,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             const XMFLOAT3 gunCenter(gun.transform._41, gun.transform._42, gun.transform._43);
             if (!SphereVisible(frustum, gunCenter, 1.0f)) continue;
             if (GunModel::Loaded()) {
-                DrawMeshAt(GunModel::Mesh(), shader, xf, view, proj, lightSpace);
+                DrawMeshAt(GunModel::Mesh(), shader, xf, view, proj, lightSpace, true);
                 shader.Use(scene.wireframeMode);
             } else {
                 shader.SetMatrices(XMMatrixScaling(0.22f, 0.18f, 1.35f) * xf,
@@ -655,9 +657,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // root-signature change of its own. (Terrain and grass never draw in the
             // same call, so sharing the slots is safe.)
             GrassField::Params gp = g_grass.GetParams();
-            static_assert(sizeof(GrassField::Params) == 8 * sizeof(UINT),
-                          "GrassParams must match the 8 root constants at b6");
-            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 8, &gp, 0);
+            static_assert(sizeof(GrassField::Params) == 12 * sizeof(UINT),
+                          "GrassParams must match the 12 root constants at b6");
+            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 12, &gp, 0);
             g_dx12.commandList->SetGraphicsRootShaderResourceView(9, ginst);
 
             g_dx12.commandList->SetPipelineState(
@@ -771,9 +773,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                       view, proj, lightSpace);
     }
 
-    if (g_helicopterModel) {
-        DrawSceneNode(g_helicopterModel, shader, HelicopterWorldMatrix(),
-                      view, proj, lightSpace);
+    if (g_helicopterModel && scene.showHelicopter) {
+        XMFLOAT4 helicopterFrustum[6];
+        BuildFrustumPlanes(view * proj, helicopterFrustum);
+        if (SphereVisible(helicopterFrustum, g_helicopterPosition, 6.5f))
+            DrawSceneNode(g_helicopterModel, shader, HelicopterWorldMatrix(),
+                          view, proj, lightSpace);
     }
 
     // Authored shootable barrel FBX. Its pivot is at the base, while gameplay
@@ -800,6 +805,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Projectiles. Grenades: dark spheres. Bullets: bright tracer rounds -- a
     // thin streak stretched along the flight direction, glowing hot so it reads
     // like a real tracer whipping downrange.
+    // Imported helicopter/barrel draws may leave a mesh-shader PSO and its
+    // meshlet SRVs bound. Procedural projectiles use the input assembler; without
+    // this restore a grenade can execute the last rotor mesh state instead.
+    shader.Use(scene.wireframeMode);
     for (auto& p : scene.projectiles) {
         if (!p.active) continue;
         if (p.grenade) {

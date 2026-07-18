@@ -59,6 +59,9 @@ static unsigned int SCR_HEIGHT = 720;
 static Scene               scene;
 static ShaderDX12           mainShader;
 ProfilerDX12                g_profiler;
+UINT                        g_forwardDrawCalls = 0;
+UINT                        g_shadowDrawCalls = 0;
+UINT                        g_visibilityDrawCalls = 0;
 MeshShaderDX12              g_meshShader;
 bool                        g_useMeshShader = false;
 TerrainRendererDX12         g_terrain;
@@ -110,6 +113,7 @@ GunAudio                    g_banditSpottedAudio2;
 GunAudio                    g_banditAttackAudio;
 GunAudio                    g_banditDeathAudio;
 GunAudio                    g_banditHitVoiceAudio;
+GunAudio                    g_helicopterHoverAudio;
 float                       g_banditVoiceCooldown = 0.0f;
 float                       g_banditPainCooldown = 0.0f;
 float                       g_fleshHitPitchMin = 0.9f;
@@ -121,7 +125,9 @@ static constexpr size_t kEnemiesPerSpawner = 2;
 static constexpr size_t kSpawnerCount = 4;
 static constexpr size_t kBanditsOnScreen = kSpawnerCount * kEnemiesPerSpawner;
 static constexpr float kBanditRespawnDelay = 5.0f;
+static constexpr float kBanditRespawnStartBlockRadius = 7.0f;
 static std::array<float, kBanditsOnScreen> g_banditRespawnTimers = {};
+static std::array<bool, kBanditsOnScreen> g_banditRespawnWaitingForPlayer = {};
 static const std::array<XMFLOAT3, kSpawnerCount> kBanditSpawnPoints = {{
     {  0.0f, 0.0f,  17.5f }, // north: 5 m beyond house outer wall
     { 17.5f, 0.0f,   0.0f }, // east
@@ -134,6 +140,16 @@ static size_t LiveBanditCount() {
     for (const auto& bandit : g_bandits)
         if (bandit && !bandit->Dead()) ++count;
     return count;
+}
+
+static void ReleaseMaterialUploadHeaps(const std::shared_ptr<SceneNode>& node) {
+    if (!node) return;
+    if (node->mesh) {
+        for (MeshPrimitive& primitive : node->mesh->primitives)
+            if (primitive.material) primitive.material->uploadHeaps.clear();
+    }
+    for (const auto& child : node->children)
+        ReleaseMaterialUploadHeaps(child);
 }
 
 static size_t LiveRespawningBanditCount() {
@@ -300,6 +316,7 @@ static bool KillBanditsTouchingRotor(const std::shared_ptr<SceneNode>& rotor,
 }
 
 static void UpdateHelicopterRotorKills() {
+    if (!scene.showHelicopter) return;
     bool killed = KillBanditsTouchingRotor(
         g_helicopterMainRotorNode, XMVectorSet(0, 1, 0, 0), 4.75f);
     killed |= KillBanditsTouchingRotor(
@@ -308,7 +325,7 @@ static void UpdateHelicopterRotorKills() {
 }
 
 static void UpdateHelicopter(float dt) {
-    if (!g_helicopterModel) return;
+    if (!g_helicopterModel || !scene.showHelicopter) return;
     if (g_helicopterDead) {
         if (g_helicopterCrashed) return;
         g_helicopterCrashVelocity.y -= 9.81f * dt;
@@ -472,8 +489,15 @@ static void PlayBanditDeathEvents() {
         if (!bandit || !bandit->ConsumeDeathEvent()) continue;
         if (bandit->spawnSlot >= 0 &&
             bandit->spawnSlot < static_cast<int>(kBanditsOnScreen)) {
-            g_banditRespawnTimers[static_cast<size_t>(bandit->spawnSlot)] =
-                kBanditRespawnDelay;
+            const size_t slot = static_cast<size_t>(bandit->spawnSlot);
+            const XMFLOAT3& spawn = kBanditSpawnPoints[slot / kEnemiesPerSpawner];
+            const float dx = spawn.x - scene.camera.Position.x;
+            const float dz = spawn.z - scene.camera.Position.z;
+            g_banditRespawnWaitingForPlayer[slot] =
+                dx * dx + dz * dz <= kBanditRespawnStartBlockRadius *
+                                      kBanditRespawnStartBlockRadius;
+            g_banditRespawnTimers[slot] = g_banditRespawnWaitingForPlayer[slot]
+                ? 0.0f : kBanditRespawnDelay;
         }
         const float pitch = 0.94f + ((float)std::rand() / RAND_MAX) * 0.10f;
         g_banditDeathAudio.Play(BanditVoiceVolume(bandit->position, 0.9f), pitch);
@@ -484,6 +508,7 @@ static bool SpawnBandit() {
     if (!g_banditModel.valid) return false;
     size_t slot = kBanditsOnScreen;
     for (size_t candidate = 0; candidate < kBanditsOnScreen; ++candidate) {
+        if (g_banditRespawnWaitingForPlayer[candidate]) continue;
         if (g_banditRespawnTimers[candidate] > 0.0f) continue;
         bool occupied = false;
         for (const auto& existing : g_bandits) {
@@ -1012,12 +1037,234 @@ static bool  firstMouse   = true;
 static bool  ignoreNextMouseMove = false;
 static bool  showUI        = true;
 static bool  cameraLocked  = true;
+enum class GameScreen { MainMenu, Level1, WinScreen };
+static GameScreen gameScreen = GameScreen::MainMenu;
+static float levelElapsedSeconds = 0.0f;
+static bool  levelTimerRunning = false;
+static bool  deathCursorReleased = false;
+static bool  pendingLevelRuntimeReset = false;
+static bool  pendingTurretGunnerRespawn = false;
 static bool  isFullscreen  = false;
 static RECT  windowedRect  = {};
 static DWORD windowedStyle = 0;
 static float deltaTime     = 0.0f;
 
 static ComPtr<ID3D12DescriptorHeap> imguiSrvHeap;
+
+struct PalmSpawn { float x, z, height, lean; };
+static constexpr std::array<PalmSpawn, 8> kPalmSpawns = {{
+    { -29.0f, -25.0f, 7.5f,  0.5f },
+    { -25.0f, -28.0f, 6.4f, -0.4f },
+    { -20.0f, -29.0f, 8.2f,  0.7f },
+    { -15.0f, -25.0f, 6.8f, -0.6f },
+    { -14.0f, -19.0f, 7.1f,  0.3f },
+    { -17.0f, -13.0f, 6.0f, -0.5f },
+    { -23.0f, -12.0f, 7.8f,  0.6f },
+    { -29.0f, -15.0f, 6.6f, -0.3f },
+}};
+
+static void ResetPalmTrees() {
+    g_trees.Initialize();
+    for (const PalmSpawn& palm : kPalmSpawns)
+        g_trees.Plant(palm.x, palm.z, palm.height, palm.lean);
+}
+
+static void UpdateHelicopterHoverAudio() {
+    const bool active = gameScreen == GameScreen::Level1 &&
+        scene.showHelicopter && !g_helicopterDead && !g_helicopterCrashed &&
+        (scene.playerGodMode || scene.playerHealth > 0.0f);
+    const float dx = g_helicopterPosition.x - scene.camera.Position.x;
+    const float dy = g_helicopterPosition.y - scene.camera.Position.y;
+    const float dz = g_helicopterPosition.z - scene.camera.Position.z;
+    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const float volume = 0.72f * (std::max)(0.0f, 1.0f - distance / 95.0f);
+    g_helicopterHoverAudio.SetLoop(active, volume, 0.96f);
+}
+
+static void SetCursorVisible(bool visible) {
+    if (visible) {
+        while (ShowCursor(TRUE) < 0) {}
+    } else {
+        while (ShowCursor(FALSE) >= 0) {}
+    }
+}
+
+static void OpenMainMenu() {
+    gameScreen = GameScreen::MainMenu;
+    showUI = false;
+    cameraLocked = true;
+    ReleaseCapture();
+    SetCursorVisible(true);
+}
+
+static void OpenWinScreen() {
+    levelTimerRunning = false;
+    gameScreen = GameScreen::WinScreen;
+    showUI = false;
+    cameraLocked = true;
+    ReleaseCapture();
+    SetCursorVisible(true);
+}
+
+static void StartLevelOne(HWND hwnd, bool godMode) {
+    gameScreen = GameScreen::Level1;
+    levelElapsedSeconds = 0.0f;
+    levelTimerRunning = crateLoadAttempted;
+    scene.playerGodMode = godMode;
+    scene.RestorePlayerHealth();
+    scene.ResetLevelRuntimeState();
+    scene.camera = Camera(XMFLOAT3(0.0f, 5.0f, 10.0f));
+    scene.gun.visible = true;
+    g_heldBandit = nullptr;
+    g_heldBarrelIndex = SIZE_MAX;
+    g_drivingHumvee = false;
+    g_savedGunVisible = true;
+    g_previousHumveePositionValid = false;
+    g_humveeHouseImpactCooldown = 0.0f;
+    g_humveeTurretYaw = 0.0f;
+    g_humveeTurretFireCooldown = 0.0f;
+    g_humveeAimPoint = {};
+    g_helicopterMainRotorAngle = 0.0f;
+    g_helicopterTailRotorAngle = 0.0f;
+    g_helicopterYaw = 0.0f;
+    g_helicopterPitch = 0.0f;
+    g_helicopterRoll = 0.0f;
+    g_helicopterHoverTime = 0.0f;
+    g_helicopterFireCooldown = 0.0f;
+    g_helicopterFireCycleTime = 0.0f;
+    g_helicopterHealth = 2000.0f;
+    g_helicopterDead = false;
+    g_helicopterCrashed = false;
+    g_helicopterPosition = { 0.0f, 14.0f, 0.0f };
+    g_helicopterCrashVelocity = { 0.0f, 0.0f, 0.0f };
+    g_banditSpawnSerial = 0;
+    g_banditVoiceCooldown = 0.0f;
+    g_banditPainCooldown = 0.0f;
+    g_suppressFireUntilMouseRelease = true;
+    if (crateLoadAttempted)
+        scene.rebuildDestructionRequested = true;
+    pendingLevelRuntimeReset = true;
+    deathCursorReleased = false;
+    showUI = false;
+    cameraLocked = false;
+    SetCapture(hwnd);
+    SetCursorVisible(false);
+    RECT rect;
+    GetClientRect(hwnd, &rect);
+    POINT center = { (rect.right - rect.left) / 2,
+                     (rect.bottom - rect.top) / 2 };
+    ClientToScreen(hwnd, &center);
+    ignoreNextMouseMove = true;
+    SetCursorPos(center.x, center.y);
+    lastX = (float)(rect.right - rect.left) * 0.5f;
+    lastY = (float)(rect.bottom - rect.top) * 0.5f;
+    firstMouse = true;
+}
+
+static void RenderMainMenu(HWND hwnd) {
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::GetBackgroundDrawList()->AddRectFilled(
+        ImVec2(0, 0), display, IM_COL32(5, 9, 12, 225));
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(430.0f, 355.0f), ImGuiCond_Always);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoCollapse;
+    ImGui::Begin("Main Menu", nullptr, flags);
+    ImGui::Dummy(ImVec2(0.0f, 20.0f));
+    const char* title = "SMALLEST GRAPHICS ENGINE";
+    ImGui::SetCursorPosX((430.0f - ImGui::CalcTextSize(title).x) * 0.5f);
+    ImGui::TextUnformatted(title);
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    const char* subtitle = "LEVEL SELECT";
+    ImGui::SetCursorPosX((430.0f - ImGui::CalcTextSize(subtitle).x) * 0.5f);
+    ImGui::TextDisabled("%s", subtitle);
+    ImGui::Dummy(ImVec2(0.0f, 22.0f));
+    ImGui::SetCursorPosX(65.0f);
+    if (ImGui::Button("LEVEL 1", ImVec2(300.0f, 58.0f)))
+        StartLevelOne(hwnd, false);
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    ImGui::SetCursorPosX(65.0f);
+    if (ImGui::Button("LEVEL 1 - GOD MODE", ImVec2(300.0f, 58.0f)))
+        StartLevelOne(hwnd, true);
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    ImGui::SetCursorPosX(65.0f);
+    if (ImGui::Button("QUIT", ImVec2(300.0f, 42.0f)))
+        PostQuitMessage(0);
+    ImGui::End();
+}
+
+static void RenderDeathScreen(HWND hwnd) {
+    if (!deathCursorReleased) {
+        cameraLocked = true;
+        ReleaseCapture();
+        SetCursorVisible(true);
+        deathCursorReleased = true;
+    }
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::GetBackgroundDrawList()->AddRectFilled(
+        ImVec2(0, 0), display, IM_COL32(25, 0, 0, 190));
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(390.0f, 235.0f), ImGuiCond_Always);
+    ImGui::Begin("Death Screen", nullptr, ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoCollapse);
+    ImGui::Dummy(ImVec2(0.0f, 15.0f));
+    const char* died = "YOU DIED";
+    ImGui::SetCursorPosX((390.0f - ImGui::CalcTextSize(died).x) * 0.5f);
+    ImGui::TextColored(ImVec4(1.0f, 0.12f, 0.08f, 1.0f), "%s", died);
+    ImGui::Dummy(ImVec2(0.0f, 20.0f));
+    ImGui::SetCursorPosX(45.0f);
+    if (ImGui::Button("RESTART LEVEL 1", ImVec2(300.0f, 55.0f)))
+        StartLevelOne(hwnd, false);
+    ImGui::Dummy(ImVec2(0.0f, 9.0f));
+    ImGui::SetCursorPosX(45.0f);
+    if (ImGui::Button("MAIN MENU", ImVec2(300.0f, 45.0f)))
+        OpenMainMenu();
+    ImGui::End();
+}
+
+static void RenderWinScreen(HWND hwnd) {
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::GetBackgroundDrawList()->AddRectFilled(
+        ImVec2(0, 0), display, IM_COL32(0, 22, 12, 215));
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(410.0f, 292.0f), ImGuiCond_Always);
+    ImGui::Begin("Win Screen", nullptr, ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoCollapse);
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
+    const char* won = "LEVEL 1 COMPLETE";
+    ImGui::SetCursorPosX((410.0f - ImGui::CalcTextSize(won).x) * 0.5f);
+    ImGui::TextColored(ImVec4(0.25f, 1.0f, 0.42f, 1.0f), "%s", won);
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    const char* cleared = "ALL ENEMIES ELIMINATED";
+    ImGui::SetCursorPosX((410.0f - ImGui::CalcTextSize(cleared).x) * 0.5f);
+    ImGui::TextDisabled("%s", cleared);
+    const int totalMilliseconds = static_cast<int>(
+        levelElapsedSeconds * 1000.0f + 0.5f);
+    const int minutes = totalMilliseconds / 60000;
+    const int seconds = (totalMilliseconds / 1000) % 60;
+    const int milliseconds = totalMilliseconds % 1000;
+    char timeText[48];
+    std::snprintf(timeText, sizeof(timeText), "TIME  %02d:%02d.%03d",
+                  minutes, seconds, milliseconds);
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    ImGui::SetCursorPosX((410.0f - ImGui::CalcTextSize(timeText).x) * 0.5f);
+    ImGui::TextUnformatted(timeText);
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
+    ImGui::SetCursorPosX(55.0f);
+    if (ImGui::Button("REPLAY LEVEL 1", ImVec2(300.0f, 55.0f)))
+        StartLevelOne(hwnd, false);
+    ImGui::Dummy(ImVec2(0.0f, 9.0f));
+    ImGui::SetCursorPosX(55.0f);
+    if (ImGui::Button("MAIN MENU", ImVec2(300.0f, 45.0f)))
+        OpenMainMenu();
+    ImGui::End();
+}
 
 static std::string ResolveTexturePath(const char* relativePath) {
     if (std::filesystem::exists(relativePath)) return relativePath;
@@ -2645,6 +2892,18 @@ static void ProcessInput(HWND) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam)) return true;
 
+    // ImGui gets first chance to consume menu clicks. Any unconsumed gameplay
+    // mouse input stops here so it cannot rotate camera, fire, or change guns.
+    const bool blocksGameplayMouse = gameScreen == GameScreen::MainMenu ||
+        gameScreen == GameScreen::WinScreen ||
+        (gameScreen == GameScreen::Level1 && !scene.playerGodMode &&
+         scene.playerHealth <= 0.0f);
+    if (blocksGameplayMouse &&
+        (msg == WM_MOUSEMOVE || msg == WM_MOUSEWHEEL ||
+         msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
+         msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP))
+        return 0;
+
     switch (msg) {
     case WM_SIZE:
         if (g_dx12.device && g_dx12.initialized && wParam != SIZE_MINIMIZED) {
@@ -2733,7 +2992,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) PostQuitMessage(0);
+        if (wParam == VK_ESCAPE) {
+            if (gameScreen != GameScreen::MainMenu) OpenMainMenu();
+            else PostQuitMessage(0);
+        }
         else if (wParam == VK_TAB) {
             showUI = !showUI;
             if (showUI) {
@@ -2844,6 +3106,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_banditAttackAudio.Initialize("models/audio/bandit_attack.wav");
     g_banditDeathAudio.Initialize("models/audio/bandit_death.wav");
     g_banditHitVoiceAudio.Initialize("models/audio/bandit_hit_voice.wav");
+    g_helicopterHoverAudio.Initialize("models/audio/helicopter_hover_loop.mp3");
 
     // ImGui
     D3D12_DESCRIPTOR_HEAP_DESC ihd = {};
@@ -2980,9 +3243,36 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         deltaTime = now - lastTime;
         lastTime  = now;
 
+        UpdateHelicopterHoverAudio();
+
         g_profiler.BeginCpuFrame();
         {
         ProfilerDX12::CpuScope updateProfile(g_profiler, "Update");
+
+        if (gameScreen == GameScreen::Level1 &&
+            (scene.playerGodMode || scene.playerHealth > 0.0f)) {
+
+        if (pendingLevelRuntimeReset) {
+            // Restart is requested from ImGui after the previous frame's enemy
+            // draws were recorded. Drain GPU use before destroying their buffers.
+            WaitForGPU();
+            g_bandits.clear();
+            g_banditRespawnTimers.fill(0.0f);
+            g_banditRespawnWaitingForPlayer.fill(false);
+            g_heldBandit = nullptr;
+            g_water.ResetSurface();
+            g_ocean.ResetSurface();
+            if (g_rope.IsInitialized()) g_rope.Reset();
+            if (g_gibbet.IsInitialized()) g_gibbet.Reset();
+            if (g_trees.IsInitialized()) ResetPalmTrees();
+            pendingLevelRuntimeReset = false;
+            pendingTurretGunnerRespawn = true;
+            // Do not charge restart/reset stalls to completion time.
+            lastTime = gameTimer.GetElapsed();
+        }
+
+        if (levelTimerRunning)
+            levelElapsedSeconds += (std::min)(deltaTime, 0.25f);
 
         ProcessInput(hwnd);
 
@@ -3043,9 +3333,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // ragdolls while replacements enter through the same spawn zone.
         if (g_banditLoaded) {
             ProfilerDX12::CpuScope banditProfile(g_profiler, "Bandit Update");
+            for (size_t slot = 0; slot < kBanditsOnScreen; ++slot) {
+                if (!g_banditRespawnWaitingForPlayer[slot]) continue;
+                const XMFLOAT3& spawn = kBanditSpawnPoints[slot / kEnemiesPerSpawner];
+                const float dx = spawn.x - scene.camera.Position.x;
+                const float dz = spawn.z - scene.camera.Position.z;
+                if (dx * dx + dz * dz > kBanditRespawnStartBlockRadius *
+                                      kBanditRespawnStartBlockRadius) {
+                    g_banditRespawnWaitingForPlayer[slot] = false;
+                    g_banditRespawnTimers[slot] = kBanditRespawnDelay;
+                }
+            }
             for (float& timer : g_banditRespawnTimers)
                 timer = (std::max)(0.0f, timer - deltaTime);
-            while (LiveRespawningBanditCount() < kBanditsOnScreen && SpawnBandit()) {}
+            // Normal mode gets one squad per level load. God mode keeps the
+            // survival-style respawn loop active.
+            if (scene.playerGodMode || g_bandits.empty()) {
+                while (LiveRespawningBanditCount() < kBanditsOnScreen && SpawnBandit()) {}
+            }
+            if (pendingTurretGunnerRespawn) {
+                pendingTurretGunnerRespawn = !SpawnHumveeTurretGunner();
+            }
             if (g_heldBandit && g_heldBandit->Dead()) g_heldBandit = nullptr;
             for (auto& bandit : g_bandits) {
                 if (!bandit || bandit->Dead()) continue;
@@ -3119,6 +3427,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_gibbet.Update(deltaTime);
         g_trees.SetWind(g_grass.WindStrength(), g_grass.WindSpeed());
         g_trees.Update(deltaTime);
+        g_grass.SetHelicopterWind(
+            g_helicopterPosition,
+            scene.showHelicopter && !g_helicopterDead && !g_helicopterCrashed);
         g_grass.Update(deltaTime);
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
@@ -3395,6 +3706,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 }
             }
         }
+        if (g_banditLoaded && !pendingTurretGunnerRespawn &&
+            LiveBanditCount() == 0 && g_helicopterDead)
+            OpenWinScreen();
+        }
         }
 
         // ?? begin frame ??
@@ -3427,7 +3742,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             occlusionDepth.GetGPUHandle(),
             occlusionDepth.valid && !msaaActive && !msaaUsedLastFrame);
 
-        if (!crateLoadAttempted) {
+        if (gameScreen == GameScreen::Level1 && !crateLoadAttempted) {
             crateLoadAttempted = true;
             LoadFloorMudMaterial();
             std::cout << "Loading models/h2.glb...\n";
@@ -3462,10 +3777,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // the cheap flat tank rather than a heightfield basin.
                 constexpr float kSeaSpan = 600.0f;
                 constexpr float kSeaDepth = 12.0f;
-                // Denser grid than the pool's: at 600 m across, the default 48
-                // cells would give 12 m quads and the swell would vanish.
-                g_ocean.SetGridResolution(128);
-                // The big grid costs 16k CPU sine evals per write; the swell
+                // Ocean swell is low-frequency. 64 cells preserve it while
+                // cutting the old 98,304-index draw and CPU writes by 75%.
+                g_ocean.SetGridResolution(64);
+                // The grid costs 4k CPU sine evals per write; the swell
                 // reads the same at half rate. The pool stays at full rate for
                 // its splash ripples.
                 g_ocean.SetUpdateInterval(2);
@@ -3497,19 +3812,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // Palm grove ringing the pool. Shoot through a trunk and the tree
                 // snaps at that height and topples away from you.
                 g_trees.SetTerrainSampler(terrainSampler);
-                g_trees.Initialize();
-                struct PalmSpot { float x, z, h, lean; };
-                static const PalmSpot palms[] = {
-                    { -29.0f, -25.0f, 7.5f,  0.5f },
-                    { -25.0f, -28.0f, 6.4f, -0.4f },
-                    { -20.0f, -29.0f, 8.2f,  0.7f },
-                    { -15.0f, -25.0f, 6.8f, -0.6f },
-                    { -14.0f, -19.0f, 7.1f,  0.3f },
-                    { -17.0f, -13.0f, 6.0f, -0.5f },
-                    { -23.0f, -12.0f, 7.8f,  0.6f },
-                    { -29.0f, -15.0f, 6.6f, -0.3f },
-                };
-                for (const PalmSpot& p : palms) g_trees.Plant(p.x, p.z, p.h, p.lean);
+                ResetPalmTrees();
 
                 std::vector<NavigationObstacle> navigationObstacles = {
                     { -4.2f,   5.8f,  4.2f,  12.2f }, // north house
@@ -3519,7 +3822,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     { -2.6f,  -1.5f,  2.6f,   1.5f }, // center Humvee
                     {-29.0f, -27.0f,-15.0f, -13.0f }  // relocated pool basin
                 };
-                for (const PalmSpot& p : palms)
+                for (const PalmSpawn& p : kPalmSpawns)
                     navigationObstacles.push_back(
                         { p.x - 0.55f, p.z - 0.55f, p.x + 0.55f, p.z + 0.55f });
                 if (!g_navigation.BuildTerrain(
@@ -3640,6 +3943,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_dx12.commandQueue->ExecuteCommandLists(1, loadLists);
             WaitForGPU();
             g_mipGen.FlushPending();
+            // Mip handoff is submitted by FlushPending. Wait once, then free
+            // texture staging resources retained by imported scene materials.
+            WaitForGPU();
+            ReleaseMaterialUploadHeaps(g_helicopterModel);
+            ReleaseMaterialUploadHeaps(g_humveeModel);
+            ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
+            ReleaseMaterialUploadHeaps(g_banditModel.node);
+            ReleaseMaterialUploadHeaps(crateModel);
+            ReleaseMaterialUploadHeaps(wallModel);
             DumpDX12DebugMessages();
             ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
             ThrowIfFailed(g_dx12.commandList->Reset(g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
@@ -3654,16 +3966,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (msaaActive) msaa.BindAndClear(cc);
             else ClearRenderTarget(cc);
             mainShader.BeginFrame();
+            // First Level 1 load is complete. Start timing after load/GPU waits,
+            // not from menu click.
+            levelTimerRunning = true;
+            lastTime = gameTimer.GetElapsed();
         }
 
         // ?? render ??
-        if (usingRaytracing) {
+        // Main menu draws only sky plus UI. Level geometry, weapons, enemies,
+        // shadows, and particles are never submitted behind the menu.
+        if (gameScreen == GameScreen::Level1 && usingRaytracing) {
             ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());
             RenderRaytracing(scene);
-        } else if (usingVisibility) {
+        } else if (gameScreen == GameScreen::Level1 && usingVisibility) {
             ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
             RenderIdTech(scene, mainShader, visBuffer, geo, packed);
-        } else {
+        } else if (gameScreen == GameScreen::Level1) {
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
@@ -3691,7 +4009,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         mainShader.Use(false);
                         DrawMeshAt(
                             GunModel::Mesh(), mainShader, bandit->GunWorldMatrix(),
-                            scene.GetViewMatrix(), scene.GetProjectionMatrix(), lightSpace);
+                            scene.GetViewMatrix(), scene.GetProjectionMatrix(),
+                            lightSpace, true);
                     }
                 }
                 mainShader.Use(scene.wireframeMode); // restore IA pipeline for anything after
@@ -3734,12 +4053,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // ?? ImGui ??
         {
         ProfilerDX12::Scope profile(g_profiler, "ImGui", g_dx12.commandList.Get());
+        g_forwardDrawCalls = mainShader.currentDrawCall;
+        g_shadowDrawCalls = (!usingRaytracing && !usingVisibility &&
+            scene.enableShadows && shadowMap.initialized && scene.lightType == 0)
+            ? shadowMap.depthShader.currentDrawCall : 0;
+        g_visibilityDrawCalls = usingVisibility ? visBuffer.currentDrawCall : 0;
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-        RenderPlayerHUD(scene);
-        if (showUI) RenderUI(scene, visBuffer);
-        DrawDestructionDebug(scene);
+        if (gameScreen == GameScreen::MainMenu) {
+            RenderMainMenu(hwnd);
+        } else if (gameScreen == GameScreen::WinScreen) {
+            RenderWinScreen(hwnd);
+        } else {
+            RenderPlayerHUD(scene);
+            if (!scene.playerGodMode && scene.playerHealth <= 0.0f) {
+                RenderDeathScreen(hwnd);
+            } else {
+                if (showUI) RenderUI(scene, visBuffer);
+                DrawDestructionDebug(scene);
+            }
+        }
         ImGui::Render();
 
         ID3D12DescriptorHeap* heaps[] = { imguiSrvHeap.Get() };

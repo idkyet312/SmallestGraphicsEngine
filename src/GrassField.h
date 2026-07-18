@@ -148,7 +148,7 @@ public:
         }
     }
 
-    // The 8 root constants (b6) the grass vertex shader reads. Laid out to match
+    // The 12 root constants (b6) the grass vertex shader reads. Laid out to match
     // grass_vs.hlsl's GrassParams exactly.
     struct Params {
         float time;
@@ -162,6 +162,10 @@ public:
         // StartInstanceLocation for a structured buffer, so the shader adds this
         // itself -- see grass_vs.hlsl. Set per draw.
         UINT  firstBlade;
+        float helicopterX;
+        float helicopterZ;
+        float helicopterWindRadius;
+        float helicopterWindStrength;
     };
     Params GetParams() const {
         Params p;
@@ -173,6 +177,10 @@ public:
         p.drawDistance = m_drawDistance;
         p.fadeBand = m_fadeBand;
         p.firstBlade = 0;      // the renderer overwrites this per patch
+        p.helicopterX = m_helicopterPosition.x;
+        p.helicopterZ = m_helicopterPosition.z;
+        p.helicopterWindRadius = m_helicopterWindRadius;
+        p.helicopterWindStrength = m_helicopterWindStrength;
         return p;
     }
     bool IsInitialized() const { return m_ready; }
@@ -180,10 +188,17 @@ public:
     // Wind controls, surfaced to the UI.
     float& WindStrength() { return m_windStrength; }
     float& WindSpeed()    { return m_windSpeed; }
+    void SetHelicopterWind(const XMFLOAT3& position, bool enabled) {
+        m_helicopterPosition = position;
+        m_helicopterWindStrength = enabled ? 1.8f : 0.0f;
+    }
     // Perf controls, surfaced to the UI. Density trims instances per cell;
     // draw distance feeds both the cell cull and the shader's fade.
     float& Density()      { return m_density; }
     float& DrawDistance() { return m_drawDistance; }
+    bool& CastShadows()   { return m_castShadows; }
+    float& ShadowDensity(){ return m_shadowDensity; }
+    size_t PlantedCount() const { return m_blades.size(); }
 
     void Shutdown() {
         m_vb.Reset();
@@ -471,6 +486,8 @@ private:
     float m_fadeBand = 6.0f;
     // Fraction of each cell's blades actually drawn (1 = all).
     float m_density = 1.0f;
+    bool  m_castShadows = true;
+    float m_shadowDensity = 0.28f;
     // Side of one draw-cell. Small enough that the cells hug the draw radius
     // without dragging in much grass the shader would only fade away, large enough
     // that the whole field stays a few dozen draws rather than hundreds.
@@ -494,6 +511,9 @@ private:
     float m_waterY = 0.0f;
     float m_windStrength = 0.28f;
     float m_windSpeed = 1.6f;
+    XMFLOAT3 m_helicopterPosition{};
+    float m_helicopterWindRadius = 22.0f;
+    float m_helicopterWindStrength = 0.0f;
     bool  m_ready = false;
 };
 

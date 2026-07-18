@@ -38,6 +38,10 @@ cbuffer GrassParams : register(b6) {
     float gDrawDistance;
     float gFadeBand;
     uint  gFirstBlade;   // index of this patch's first blade in the instance buffer
+    float gHelicopterX;
+    float gHelicopterZ;
+    float gHelicopterWindRadius;
+    float gHelicopterWindStrength;
 };
 
 // One blade. Matches GrassField::BladeInstance exactly.
@@ -106,14 +110,23 @@ VS_OUTPUT main(VS_INPUT input) {
     const float2 windDir = float2(cos(dirAng), sin(dirAng));
 
     const float bend = WindAt(b.root.x, b.root.z, b.phase) * gWindStrength;
+    const float2 fromHelicopter = b.root.xz - float2(gHelicopterX, gHelicopterZ);
+    const float helicopterDistance = length(fromHelicopter);
+    const float helicopterFalloff = pow(saturate(
+        1.0 - helicopterDistance / max(gHelicopterWindRadius, 1e-3)), 0.65);
+    const float2 helicopterDirection = helicopterDistance > 1e-3
+        ? fromHelicopter / helicopterDistance : float2(1.0, 0.0);
+    const float rotorPulse = 0.88 + 0.12 * sin(
+        gTime * 22.0 + helicopterDistance * 1.7 + b.phase);
 
     // Total tip displacement, as a FRACTION of blade height: the resting lean plus
     // the wind pushing along the prevailing direction. Clamped, because a tip that
     // travels further than the blade is long has nowhere to bend to, and the droop
     // term below would fold it through its own root.
-    float2 tip = b.lean + windDir * bend;
+    float2 tip = b.lean + windDir * bend + helicopterDirection *
+        (helicopterFalloff * gHelicopterWindStrength * rotorPulse);
     const float tipLen = length(tip);
-    const float kMaxBend = 0.75;
+    const float kMaxBend = 0.97;
     if (tipLen > kMaxBend) tip *= kMaxBend / tipLen;
 
     // Hinged at the root: displacement grows as t^2, so the base stays planted and

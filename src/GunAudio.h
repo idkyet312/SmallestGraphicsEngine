@@ -56,9 +56,43 @@ public:
         voices_.push_back(voice);
     }
 
+    void SetLoop(bool enabled, float volume = 1.0f, float pitch = 1.0f) {
+        if (!enabled || !engine_ || samples_.empty()) {
+            StopLoop();
+            return;
+        }
+        if (!loopVoice_) {
+            if (FAILED(engine_->CreateSourceVoice(&loopVoice_, &format_, 0, 2.0f))) {
+                loopVoice_ = nullptr;
+                return;
+            }
+            XAUDIO2_BUFFER buffer = {};
+            buffer.Flags = XAUDIO2_END_OF_STREAM;
+            buffer.AudioBytes = static_cast<UINT32>(samples_.size());
+            buffer.pAudioData = samples_.data();
+            buffer.LoopCount = XAUDIO2_LOOP_INFINITE;
+            if (FAILED(loopVoice_->SubmitSourceBuffer(&buffer)) ||
+                FAILED(loopVoice_->Start())) {
+                loopVoice_->DestroyVoice();
+                loopVoice_ = nullptr;
+                return;
+            }
+        }
+        loopVoice_->SetVolume((std::max)(0.0f, (std::min)(1.0f, volume)));
+        loopVoice_->SetFrequencyRatio((std::max)(0.5f, (std::min)(2.0f, pitch)));
+    }
+
+    void StopLoop() {
+        if (!loopVoice_) return;
+        loopVoice_->Stop();
+        loopVoice_->DestroyVoice();
+        loopVoice_ = nullptr;
+    }
+
     void Update() { ReclaimFinished(); }
 
     void Shutdown() {
+        StopLoop();
         for (IXAudio2SourceVoice* voice : voices_) voice->DestroyVoice();
         voices_.clear();
         if (master_) { master_->DestroyVoice(); master_ = nullptr; }
@@ -188,4 +222,5 @@ private:
     WAVEFORMATEX format_ = {};
     std::vector<uint8_t> samples_;
     std::vector<IXAudio2SourceVoice*> voices_;
+    IXAudio2SourceVoice* loopVoice_ = nullptr;
 };

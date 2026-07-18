@@ -339,6 +339,14 @@ public:
     float    GetSurfaceY() const { return m_surfaceY; }
     bool     IsInitialized() const { return m_meshReady || !B3_IS_NULL(m_world); }
 
+    void ResetSurface() {
+        m_ripples.clear();
+        m_accumulator = 0.0f;
+        m_time = 0.0f;
+        m_updateCounter = 0;
+        m_currentSlot = 0;
+    }
+
     void Shutdown() {
         if (!B3_IS_NULL(m_world)) b3DestroyWorld(m_world);
         m_world = b3_nullWorldId;
