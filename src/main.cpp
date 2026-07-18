@@ -127,10 +127,6 @@ NavigationSystem            g_navigation;
 static constexpr size_t kEnemiesPerSpawner = 2;
 static constexpr size_t kSpawnerCount = 4;
 static constexpr size_t kBanditsOnScreen = kSpawnerCount * kEnemiesPerSpawner;
-static constexpr float kBanditRespawnDelay = 5.0f;
-static constexpr float kBanditRespawnStartBlockRadius = 7.0f;
-static std::array<float, kBanditsOnScreen> g_banditRespawnTimers = {};
-static std::array<bool, kBanditsOnScreen> g_banditRespawnWaitingForPlayer = {};
 static const std::array<XMFLOAT3, kSpawnerCount> kBanditSpawnPoints = {{
     {  0.0f, 0.0f,  17.5f }, // north: 5 m beyond house outer wall
     { 17.5f, 0.0f,   0.0f }, // east
@@ -490,18 +486,6 @@ static float BanditVoiceVolume(const XMFLOAT3& position, float peak = 0.78f) {
 static void PlayBanditDeathEvents() {
     for (auto& bandit : g_bandits) {
         if (!bandit || !bandit->ConsumeDeathEvent()) continue;
-        if (bandit->spawnSlot >= 0 &&
-            bandit->spawnSlot < static_cast<int>(kBanditsOnScreen)) {
-            const size_t slot = static_cast<size_t>(bandit->spawnSlot);
-            const XMFLOAT3& spawn = kBanditSpawnPoints[slot / kEnemiesPerSpawner];
-            const float dx = spawn.x - scene.camera.Position.x;
-            const float dz = spawn.z - scene.camera.Position.z;
-            g_banditRespawnWaitingForPlayer[slot] =
-                dx * dx + dz * dz <= kBanditRespawnStartBlockRadius *
-                                      kBanditRespawnStartBlockRadius;
-            g_banditRespawnTimers[slot] = g_banditRespawnWaitingForPlayer[slot]
-                ? 0.0f : kBanditRespawnDelay;
-        }
         const float pitch = 0.94f + ((float)std::rand() / RAND_MAX) * 0.10f;
         g_banditDeathAudio.Play(BanditVoiceVolume(bandit->position, 0.9f), pitch);
     }
@@ -511,8 +495,6 @@ static bool SpawnBandit() {
     if (!g_banditModel.valid) return false;
     size_t slot = kBanditsOnScreen;
     for (size_t candidate = 0; candidate < kBanditsOnScreen; ++candidate) {
-        if (g_banditRespawnWaitingForPlayer[candidate]) continue;
-        if (g_banditRespawnTimers[candidate] > 0.0f) continue;
         bool occupied = false;
         for (const auto& existing : g_bandits) {
             if (existing && !existing->Dead() &&
@@ -1149,10 +1131,20 @@ static void StartLevelOne(HWND hwnd, bool godMode) {
         scene.rebuildDestructionRequested = true;
     pendingLevelRuntimeReset = true;
     deathCursorReleased = false;
-    showUI = true;
-    cameraLocked = true;
-    ReleaseCapture();
-    SetCursorVisible(true);
+    showUI = false;
+    cameraLocked = false;
+    SetCapture(hwnd);
+    SetCursorVisible(false);
+    RECT rect;
+    GetClientRect(hwnd, &rect);
+    POINT center = { (rect.right - rect.left) / 2,
+                     (rect.bottom - rect.top) / 2 };
+    ClientToScreen(hwnd, &center);
+    ignoreNextMouseMove = true;
+    SetCursorPos(center.x, center.y);
+    lastX = (float)(rect.right - rect.left) * 0.5f;
+    lastY = (float)(rect.bottom - rect.top) * 0.5f;
+    firstMouse = true;
 }
 
 static void RenderMainMenu(HWND hwnd) {
@@ -1177,7 +1169,7 @@ static void RenderMainMenu(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 22.0f));
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("LEVEL 1", ImVec2(300.0f, 58.0f)))
-        StartLevelOne(hwnd, true);
+        StartLevelOne(hwnd, false);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("LEVEL 1 - GOD MODE", ImVec2(300.0f, 58.0f)))
@@ -1212,7 +1204,7 @@ static void RenderDeathScreen(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 20.0f));
     ImGui::SetCursorPosX(45.0f);
     if (ImGui::Button("RESTART LEVEL 1", ImVec2(300.0f, 55.0f)))
-        StartLevelOne(hwnd, true);
+        StartLevelOne(hwnd, false);
     ImGui::Dummy(ImVec2(0.0f, 9.0f));
     ImGui::SetCursorPosX(45.0f);
     if (ImGui::Button("MAIN MENU", ImVec2(300.0f, 45.0f)))
@@ -1252,7 +1244,7 @@ static void RenderWinScreen(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
     ImGui::SetCursorPosX(55.0f);
     if (ImGui::Button("REPLAY LEVEL 1", ImVec2(300.0f, 55.0f)))
-        StartLevelOne(hwnd, true);
+        StartLevelOne(hwnd, false);
     ImGui::Dummy(ImVec2(0.0f, 9.0f));
     ImGui::SetCursorPosX(55.0f);
     if (ImGui::Button("MAIN MENU", ImVec2(300.0f, 45.0f)))
@@ -3265,8 +3257,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // draws were recorded. Drain GPU use before destroying their buffers.
             WaitForGPU();
             g_bandits.clear();
-            g_banditRespawnTimers.fill(0.0f);
-            g_banditRespawnWaitingForPlayer.fill(false);
             g_heldBandit = nullptr;
             g_water.ResetSurface();
             g_ocean.ResetSurface();
@@ -3274,6 +3264,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (g_gibbet.IsInitialized()) g_gibbet.Reset();
             if (g_trees.IsInitialized()) ResetPalmTrees();
             pendingLevelRuntimeReset = false;
+            for (size_t i = 0; i < kBanditsOnScreen; ++i)
+                if (!SpawnBandit()) break;
             pendingTurretGunnerRespawn = true;
             // Do not charge restart/reset stalls to completion time.
             lastTime = gameTimer.GetElapsed();
@@ -3337,28 +3329,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             });
             g_destruction.InitializeVehicle({ 0.0f, 3.45f, 0.0f });
         }
-        // Maintain four live Bandits. Dead instances stay attached to their
-        // ragdolls while replacements enter through the same spawn zone.
+        // Dead Bandits stay attached to their ragdolls. No mid-level respawns.
         if (g_banditLoaded) {
             ProfilerDX12::CpuScope banditProfile(g_profiler, "Bandit Update");
-            for (size_t slot = 0; slot < kBanditsOnScreen; ++slot) {
-                if (!g_banditRespawnWaitingForPlayer[slot]) continue;
-                const XMFLOAT3& spawn = kBanditSpawnPoints[slot / kEnemiesPerSpawner];
-                const float dx = spawn.x - scene.camera.Position.x;
-                const float dz = spawn.z - scene.camera.Position.z;
-                if (dx * dx + dz * dz > kBanditRespawnStartBlockRadius *
-                                      kBanditRespawnStartBlockRadius) {
-                    g_banditRespawnWaitingForPlayer[slot] = false;
-                    g_banditRespawnTimers[slot] = kBanditRespawnDelay;
-                }
-            }
-            for (float& timer : g_banditRespawnTimers)
-                timer = (std::max)(0.0f, timer - deltaTime);
-            // Normal mode gets one squad per level load. God mode keeps the
-            // survival-style respawn loop active.
-            if (scene.playerGodMode || g_bandits.empty()) {
-                while (LiveRespawningBanditCount() < kBanditsOnScreen && SpawnBandit()) {}
-            }
             if (pendingTurretGunnerRespawn) {
                 pendingTurretGunnerRespawn = !SpawnHumveeTurretGunner();
             }

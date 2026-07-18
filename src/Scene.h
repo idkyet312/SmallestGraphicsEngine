@@ -152,7 +152,7 @@ struct Scene {
     float playerMaxHealth    = 100.0f;
     float playerHealth       = 100.0f;
     float playerDamageFlash  = 0.0f;
-    bool  playerGodMode      = true;
+    bool  playerGodMode      = false;
 
     // Grenade (press G): lobbed, arcs under gravity, radial blast on fuse.
     float grenadeThrowSpeed    = 16.0f;  // launch speed along aim
