@@ -17,6 +17,7 @@ cbuffer FrameConstants : register(b0) {
     float  nearPlane;
     float  farPlane;
     uint   debugViewMode;
+    uint   enableMotionVectors;
 };
 
 cbuffer LightBuffer : register(b1) {
@@ -347,7 +348,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     if (debugViewMode == 2u) {
         float rawDepth = depthBuffer.Load(int3(pixel, 0));
         outputColor[pixel] = float4(rawDepth.xxx, 1.0);
-        outputMotion[pixel] = 0.0;
+        if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
         return;
     }
 
@@ -360,7 +361,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                                     (key >> 16u) & 255u) / 255.0;
             outputColor[pixel] = float4(idColor, 1.0);
         }
-        outputMotion[pixel] = 0.0;
+        if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
         return;
     }
     
@@ -368,7 +369,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     if (visValue.x == 0u) {
         // HDR sky was rasterized into outputColor before this compute pass.
         // Preserve it instead of replacing it with a mismatched procedural sky.
-        outputMotion[pixel] = 0.0;
+        if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
         return;
     }
     
@@ -398,15 +399,17 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     
     // Interpolate attributes
     float3 fragPos = bary.x * wp0 + bary.y * wp1 + bary.z * wp2;
-    float3 localPos = bary.x * p0 + bary.y * p1 + bary.z * p2;
-    float3 previousWorldPos = mul(float4(localPos, 1.0), dc.previousModelMatrix).xyz;
-    float4 previousClip = mul(float4(previousWorldPos, 1.0), previousViewProj);
-    float2 currentUV = (float2(pixel) + 0.5) / float2(screenWidth, screenHeight);
-    float2 previousUV = currentUV;
-    if (previousClip.w > 0.001) {
-        previousUV = (previousClip.xy / previousClip.w) * float2(0.5, -0.5) + 0.5;
+    if (enableMotionVectors != 0u) {
+        float3 localPos = bary.x * p0 + bary.y * p1 + bary.z * p2;
+        float3 previousWorldPos = mul(float4(localPos, 1.0), dc.previousModelMatrix).xyz;
+        float4 previousClip = mul(float4(previousWorldPos, 1.0), previousViewProj);
+        float2 currentUV = (float2(pixel) + 0.5) / float2(screenWidth, screenHeight);
+        float2 previousUV = currentUV;
+        if (previousClip.w > 0.001) {
+            previousUV = (previousClip.xy / previousClip.w) * float2(0.5, -0.5) + 0.5;
+        }
+        outputMotion[pixel] = currentUV - previousUV;
     }
-    outputMotion[pixel] = currentUV - previousUV;
     
     float3 viewDir = normalize(cameraPos - fragPos);
     float3 objNormal = normalize(bary.x * n0 + bary.y * n1 + bary.z * n2);

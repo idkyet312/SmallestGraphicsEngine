@@ -394,11 +394,66 @@ inline bool RasterPrimitiveIntersectsFrustum(const MeshPrimitive& primitive,
              outsideNear || outsideFar);
 }
 
-inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& shader,
-                           const XMMATRIX& worldTransform,
-                           const XMMATRIX& view, const XMMATRIX& proj,
-                           const XMMATRIX& lightSpace,
-                           bool visibilityExtensionsOnly = false) {
+struct ForwardExtensionListCacheEntry {
+    std::weak_ptr<SceneNode> root;
+    std::vector<SceneNode*> nodes;
+};
+
+inline std::unordered_map<const SceneNode*, ForwardExtensionListCacheEntry>
+    g_forwardExtensionListCache;
+
+inline void CollectForwardExtensionNodes(const std::shared_ptr<SceneNode>& node,
+    std::vector<SceneNode*>& nodes) {
+    if (!node) return;
+    bool nodeHasExtensions = false;
+    if (node->mesh) for (const MeshPrimitive& prim : node->mesh->primitives) {
+        if (prim.vbv.BufferLocation == 0) continue;
+        const bool transparent = prim.material &&
+            prim.material->baseColorFactor.w < 0.999f;
+        const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
+            !transparent && !prim.skinBuffer && !prim.vertices.empty();
+        if (!visibilityOwned) {
+            nodeHasExtensions = true;
+            break;
+        }
+    }
+    if (nodeHasExtensions) nodes.push_back(node.get());
+    for (const std::shared_ptr<SceneNode>& child : node->children)
+        CollectForwardExtensionNodes(child, nodes);
+}
+
+inline const std::vector<SceneNode*>& GetForwardExtensionNodes(
+    const std::shared_ptr<SceneNode>& node) {
+    static const std::vector<SceneNode*> empty;
+    if (!node) return empty;
+    auto found = g_forwardExtensionListCache.find(node.get());
+    if (found != g_forwardExtensionListCache.end()) {
+        std::shared_ptr<SceneNode> cached = found->second.root.lock();
+        if (cached.get() == node.get()) return found->second.nodes;
+        g_forwardExtensionListCache.erase(found);
+    }
+    ForwardExtensionListCacheEntry entry;
+    entry.root = node;
+    CollectForwardExtensionNodes(node, entry.nodes);
+    auto inserted = g_forwardExtensionListCache.emplace(node.get(),
+        std::move(entry));
+    if ((g_forwardExtensionListCache.size() & 511u) == 0u) {
+        for (auto it = g_forwardExtensionListCache.begin();
+             it != g_forwardExtensionListCache.end();) {
+            if (it->second.root.expired())
+                it = g_forwardExtensionListCache.erase(it);
+            else
+                ++it;
+        }
+    }
+    return inserted.first->second.nodes;
+}
+
+inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
+                              const XMMATRIX& worldTransform,
+                              const XMMATRIX& view, const XMMATRIX& proj,
+                              const XMMATRIX& lightSpace,
+                              bool visibilityExtensionsOnly) {
     if (!node) return;
 
     if (node->mesh) {
@@ -477,10 +532,28 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
         }
     }
 
-    for (auto& child : node->children) {
-        DrawSceneNode(child, shader, worldTransform, view, proj, lightSpace,
-            visibilityExtensionsOnly);
+}
+
+inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node,
+                          ShaderDX12& shader,
+                          const XMMATRIX& worldTransform,
+                          const XMMATRIX& view, const XMMATRIX& proj,
+                          const XMMATRIX& lightSpace,
+                          bool visibilityExtensionsOnly = false) {
+    if (!node) return;
+    if (visibilityExtensionsOnly) {
+        const std::vector<SceneNode*>& extensionNodes =
+            GetForwardExtensionNodes(node);
+        for (SceneNode* extensionNode : extensionNodes)
+            DrawSceneNodeMesh(extensionNode, shader, worldTransform, view,
+                proj, lightSpace, true);
+        return;
     }
+    DrawSceneNodeMesh(node.get(), shader, worldTransform, view, proj,
+        lightSpace, false);
+    for (const std::shared_ptr<SceneNode>& child : node->children)
+        DrawSceneNode(child, shader, worldTransform, view, proj, lightSpace,
+            false);
 }
 
 inline bool SceneNodeSupportsMeshInstancing(const std::shared_ptr<SceneNode>& node) {

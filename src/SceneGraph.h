@@ -86,8 +86,8 @@ struct MeshPrimitive {
     ComPtr<ID3D12Resource> meshletVertexIndexBuffer;
     ComPtr<ID3D12Resource> meshletTriangleBuffer;
     ComPtr<ID3D12Resource> skinBuffer; // StructuredBuffer<SkinVertex>, bound at t13
-    D3D12_VERTEX_BUFFER_VIEW vbv;
-    D3D12_INDEX_BUFFER_VIEW ibv;
+    D3D12_VERTEX_BUFFER_VIEW vbv = {};
+    D3D12_INDEX_BUFFER_VIEW ibv = {};
     UINT indexCount = 0;
     UINT meshletCount = 0;
     UINT skinVertexCount = 0; // >0 when this primitive carries skin data

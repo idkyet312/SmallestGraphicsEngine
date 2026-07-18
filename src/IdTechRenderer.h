@@ -59,6 +59,7 @@ struct IdTechDrawItem {
     std::shared_ptr<SceneMaterial> material;
     MeshPrimitive* primitive = nullptr;
     UINT visibilityMeshID = VB_INVALID_MESH;
+    uint64_t instanceKey = 0;
     bool doubleSided = false;
     bool alphaCutout = false;
     bool alphaFromLuminance = false;
@@ -158,46 +159,93 @@ inline XMFLOAT4 ComputeDrawItemBounds(const IdTechDrawItem& item) {
     return XMFLOAT4(center.x, center.y, center.z, radius);
 }
 
+inline void AppendOpaquePrimitiveDrawItem(MeshPrimitive& primitive,
+    const XMMATRIX& model, std::vector<IdTechDrawItem>& items) {
+    const std::shared_ptr<SceneMaterial>& material = primitive.material;
+    const bool transparent = material && material->baseColorFactor.w < 0.999f;
+    if (transparent || primitive.skinBuffer || primitive.vertices.empty() ||
+        primitive.vbv.BufferLocation == 0) return;
+    // Material baseColorFactor is already uploaded in VBMaterialData.
+    // Keep instance tint white or imported materials get multiplied twice.
+    IdTechDrawItem item = {};
+    item.model = model;
+    item.color = XMFLOAT3(1, 1, 1);
+    item.materialId = material
+        ? static_cast<UINT>(primitive.materialIndex + 2) : 0u;
+    item.material = material;
+    item.primitive = &primitive;
+    item.instanceKey = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(&primitive));
+    // Forward imported-mesh PSOs intentionally disable culling because
+    // FBX/glTF assets in this project mix winding conventions. Match
+    // that ownership contract in VB; otherwise Humvee/bin shells show
+    // their opposite faces and look spatially flipped.
+    item.doubleSided = true;
+    item.alphaCutout = material && material->alphaCutout &&
+        material->baseColorTexture != nullptr;
+    item.alphaFromLuminance = material && material->alphaFromLuminance;
+    items.push_back(item);
+}
+
 inline void AppendOpaqueMeshDrawItems(const std::shared_ptr<SceneMesh>& mesh,
     const XMMATRIX& model, std::vector<IdTechDrawItem>& items) {
     if (!mesh) return;
-    for (MeshPrimitive& primitive : mesh->primitives) {
-            const std::shared_ptr<SceneMaterial>& material = primitive.material;
-            const bool transparent = material && material->baseColorFactor.w < 0.999f;
-            if (transparent || primitive.skinBuffer ||
-                primitive.vertices.empty() || primitive.vbv.BufferLocation == 0)
-                continue;
-            // Material baseColorFactor is already uploaded in VBMaterialData.
-            // Keep instance tint white or imported materials get multiplied twice.
-            XMFLOAT3 color(1, 1, 1);
-            IdTechDrawItem item = {};
-            item.model = model;
-            item.color = color;
-            item.materialId = material ? static_cast<UINT>(primitive.materialIndex + 2) : 0u;
-            item.material = material;
-            item.primitive = &primitive;
-            // Forward imported-mesh PSOs intentionally disable culling because
-            // FBX/glTF assets in this project mix winding conventions. Match
-            // that ownership contract in VB; otherwise Humvee/bin shells show
-            // their opposite faces and look spatially flipped.
-            item.doubleSided = true;
-            item.alphaCutout = material && material->alphaCutout &&
-                material->baseColorTexture != nullptr;
-            item.alphaFromLuminance = material && material->alphaFromLuminance;
-            items.push_back(item);
+    for (MeshPrimitive& primitive : mesh->primitives)
+        AppendOpaquePrimitiveDrawItem(primitive, model, items);
+}
+
+struct FlattenedOpaquePacket {
+    MeshPrimitive* primitive = nullptr;
+    XMFLOAT4X4 localTransform = {};
+};
+
+struct FlattenedOpaquePacketCacheEntry {
+    std::weak_ptr<SceneNode> root;
+    std::vector<FlattenedOpaquePacket> packets;
+};
+
+inline std::unordered_map<const SceneNode*, FlattenedOpaquePacketCacheEntry>
+    g_flattenedOpaquePacketCache;
+
+inline void CollectFlattenedOpaquePackets(const std::shared_ptr<SceneNode>& node,
+    std::vector<FlattenedOpaquePacket>& packets) {
+    if (!node) return;
+    if (node->mesh) for (MeshPrimitive& primitive : node->mesh->primitives)
+        packets.push_back({ &primitive, node->globalTransform });
+    for (const std::shared_ptr<SceneNode>& child : node->children)
+        CollectFlattenedOpaquePackets(child, packets);
+}
+
+inline const std::vector<FlattenedOpaquePacket>& GetFlattenedOpaquePackets(
+    const std::shared_ptr<SceneNode>& node) {
+    static const std::vector<FlattenedOpaquePacket> empty;
+    if (!node) return empty;
+    auto found = g_flattenedOpaquePacketCache.find(node.get());
+    if (found != g_flattenedOpaquePacketCache.end()) {
+        std::shared_ptr<SceneNode> cached = found->second.root.lock();
+        if (cached.get() == node.get()) return found->second.packets;
+        g_flattenedOpaquePacketCache.erase(found);
     }
+    FlattenedOpaquePacketCacheEntry entry;
+    entry.root = node;
+    CollectFlattenedOpaquePackets(node, entry.packets);
+    auto inserted = g_flattenedOpaquePacketCache.emplace(node.get(),
+        std::move(entry));
+    return inserted.first->second.packets;
 }
 
 inline void AppendOpaqueSceneNodeDrawItems(
     const std::shared_ptr<SceneNode>& node, const XMMATRIX& worldTransform,
     std::vector<IdTechDrawItem>& items) {
     if (!node) return;
-    if (node->mesh) {
-        const XMMATRIX model = XMLoadFloat4x4(&node->globalTransform) * worldTransform;
-        AppendOpaqueMeshDrawItems(node->mesh, model, items);
+    const std::vector<FlattenedOpaquePacket>& packets =
+        GetFlattenedOpaquePackets(node);
+    for (const FlattenedOpaquePacket& packet : packets) {
+        if (!packet.primitive) continue;
+        const XMMATRIX model = XMLoadFloat4x4(&packet.localTransform) *
+            worldTransform;
+        AppendOpaquePrimitiveDrawItem(*packet.primitive, model, items);
     }
-    for (const std::shared_ptr<SceneNode>& child : node->children)
-        AppendOpaqueSceneNodeDrawItems(child, worldTransform, items);
 }
 
 inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items,
@@ -273,10 +321,8 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items
 
 inline void CullAndBatchDrawItems(Scene& scene, const XMMATRIX& view, const XMMATRIX& proj,
                                   std::vector<IdTechDrawItem>& items) {
-    std::vector<IdTechDrawItem> visible;
-    visible.reserve(items.size());
-
-    for (const auto& item : items) {
+    items.erase(std::remove_if(items.begin(), items.end(),
+        [&](const IdTechDrawItem& item) {
         XMFLOAT4 bounds = ComputeDrawItemBounds(item);
         XMFLOAT3 center(bounds.x, bounds.y, bounds.z);
 
@@ -287,19 +333,13 @@ inline void CullAndBatchDrawItems(Scene& scene, const XMMATRIX& view, const XMMA
                               scene.camera.Position.y - center.y,
                               scene.camera.Position.z - center.z);
             float facing = worldNormal.x * toCamera.x + worldNormal.y * toCamera.y + worldNormal.z * toCamera.z;
-            if (facing <= 0.0f) continue;
+            if (facing <= 0.0f) return true;
         }
-
-        visible.push_back(item);
-    }
-
-    // Batch by material ID for cache/coherence
-    std::sort(visible.begin(), visible.end(),
-        [](const IdTechDrawItem& a, const IdTechDrawItem& b) {
-            return a.materialId < b.materialId;
-        });
-
-    items.swap(visible);
+        return false;
+    }), items.end());
+    // Preserve cached packet order. Opaque indirect streams are PSO-batched
+    // later; sorting thousands of records by material added CPU work without
+    // reducing state changes.
 }
 
 #pragma pack(push, 1)
@@ -348,6 +388,7 @@ struct GPUDrivenVisibilityContext {
     ComPtr<ID3D12RootSignature> cullRootSignature;
     ComPtr<ID3D12PipelineState> cullPipeline;
     GPUVisibilityCullInput* mappedInputs = nullptr;
+    std::vector<uint64_t> inputKeys;
     UploadBuffer<GPUVisibilityCullConstants> constants;
 
     bool Init(ID3D12RootSignature* visRootSig) {
@@ -374,6 +415,7 @@ struct GPUDrivenVisibilityContext {
         if (FAILED(hr)) return false;
 
         if (!CreateBuffers()) return false;
+        inputKeys.assign(maxCommands, 0);
         if (!CreateCullPipeline()) return false;
         if (!constants.Create(FRAME_COUNT)) return false;
 
@@ -488,6 +530,24 @@ struct GPUDrivenVisibilityContext {
         return mappedInputs[g_dx12.frameIndex * maxCommands + index];
     }
 
+    bool NeedsInput(UINT index, uint64_t key) const {
+        if (index >= maxCommands) return false;
+        if (key == 0) key = 1;
+        return inputKeys[index] != key;
+    }
+
+    GPUVisibilityCullInput& PrepareInput(UINT index, uint64_t key,
+        const GPUVisibilityCullInput& staticInput) {
+        if (index >= maxCommands) return Input(0);
+        if (key == 0) key = 1;
+        if (inputKeys[index] != key) {
+            for (UINT frame = 0; frame < FRAME_COUNT; ++frame)
+                mappedInputs[frame * maxCommands + index] = staticInput;
+            inputKeys[index] = key;
+        }
+        return Input(index);
+    }
+
     void CreateBufferDescriptors(UINT frame) {
         UINT size = g_dx12.cbvSrvUavDescriptorSize;
         D3D12_CPU_DESCRIPTOR_HANDLE handle =
@@ -598,14 +658,14 @@ struct GPUDrivenVisibilityContext {
     }
 };
 
-inline void FillMatrixBufferForIndirect(ShaderDX12& matrixShader, UINT drawIndex,
-                                        const XMMATRIX& model, const XMMATRIX& view,
+inline void FillFrameMatrixBufferForIndirect(ShaderDX12& matrixShader,
+                                        const XMMATRIX& view,
                                         const XMMATRIX& proj, const XMMATRIX& lightSpace,
                                         D3D12_GPU_VIRTUAL_ADDRESS& outCBV) {
-    UINT bufferIndex = g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME + drawIndex;
+    UINT bufferIndex = g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME;
 
     MatrixBufferDX12 data;
-    data.model = XMMatrixTranspose(model);
+    data.model = XMMatrixIdentity();
     data.view = XMMatrixTranspose(view);
     data.projection = XMMatrixTranspose(proj);
     data.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
@@ -632,7 +692,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     XMMATRIX proj = scene.GetProjectionMatrix();
 
     // Build draw item list
-    std::vector<IdTechDrawItem> drawItems;
+    static std::vector<IdTechDrawItem> drawItems;
     BuildSceneDrawItems(scene, drawItems, floorMaterial, importedScene);
 
     // CPU retains only cheap material ordering/backface rejection. GPU decides
@@ -661,9 +721,11 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         const auto& cluster = scene.clusteredRenderer.clusters[clusterIndex];
         vb.SetCluster(clusterIndex, (UINT)cluster.lightCount, cluster.lightIndices);
     }
-    std::vector<UINT> dcIDs;
+    static std::vector<UINT> dcIDs;
+    dcIDs.clear();
     dcIDs.reserve(drawItems.size());
-    std::vector<IdTechDrawItem> registeredItems;
+    static std::vector<IdTechDrawItem> registeredItems;
+    registeredItems.clear();
     registeredItems.reserve(drawItems.size());
 
     for (IdTechDrawItem item : drawItems) {
@@ -671,10 +733,14 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
             ? vb.RegisterPrimitive(item.primitive)
             : (item.isCube ? cubeMesh : planeMesh);
         if (item.visibilityMeshID == VB_INVALID_MESH) continue;
+        if (item.instanceKey)
+            item.instanceKey ^= static_cast<uint64_t>(item.visibilityMeshID + 1u) *
+                0x9e3779b97f4a7c15ull;
         UINT materialID = vb.RegisterMaterial(item.material.get());
         const UINT flags = item.doubleSided ? 1u : 0u;
         UINT dc = vb.RegisterInstance(item.visibilityMeshID,
-            item.model, item.color, 0.0f, 0.5f, materialID, flags);
+            item.model, item.color, 0.0f, 0.5f, materialID, flags,
+            item.instanceKey);
         if (dc == UINT_MAX) continue;
         item.materialId = materialID;
         registeredItems.push_back(item);
@@ -700,13 +766,15 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
 
     UINT culledCount = 0;
     UINT doubleSidedCount = 0;
-    std::vector<UINT> directDraws;
+    static std::vector<UINT> directDraws;
+    directDraws.clear();
     directDraws.reserve(drawCount);
 
-    for (UINT i = 0; i < drawCount; i++) {
-        D3D12_GPU_VIRTUAL_ADDRESS matrixCBV = 0;
-        FillMatrixBufferForIndirect(shader, i, drawItems[i].model, view, proj, lightSpace, matrixCBV);
+    D3D12_GPU_VIRTUAL_ADDRESS frameMatrixCBV = 0;
+    FillFrameMatrixBufferForIndirect(shader, view, proj, lightSpace,
+        frameMatrixCBV);
 
+    for (UINT i = 0; i < drawCount; i++) {
         const bool indexedOpaque = useGPUDriven && !drawItems[i].alphaCutout &&
             drawItems[i].primitive &&
             drawItems[i].primitive->ibv.BufferLocation != 0;
@@ -715,18 +783,36 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
                 ? doubleSidedCount : culledCount;
             GPUDrivenVisibilityContext& context = drawItems[i].doubleSided
                 ? gpuDoubleSided : gpuCulled;
-            GPUVisibilityCullInput& input = context.Input(batchCount++);
-            input.command.vbv = drawItems[i].primitive->vbv;
-            input.command.ibv = drawItems[i].primitive->ibv;
-            input.command.matrixCBV = matrixCBV;
-            input.command.drawCallID = dcIDs[i];
-            input.command.drawArgs.IndexCountPerInstance =
+            GPUVisibilityCullInput staticInput = {};
+            staticInput.command.vbv = drawItems[i].primitive->vbv;
+            staticInput.command.ibv = drawItems[i].primitive->ibv;
+            staticInput.command.drawCallID = dcIDs[i];
+            staticInput.command.drawArgs.IndexCountPerInstance =
                 drawItems[i].primitive->indexCount;
-            input.command.drawArgs.InstanceCount = 1;
-            input.command.drawArgs.StartIndexLocation = 0;
-            input.command.drawArgs.BaseVertexLocation = 0;
-            input.command.drawArgs.StartInstanceLocation = 0;
-            input.worldBounds = ComputeDrawItemBounds(drawItems[i]);
+            staticInput.command.drawArgs.InstanceCount = 1;
+            staticInput.command.drawArgs.StartIndexLocation = 0;
+            staticInput.command.drawArgs.BaseVertexLocation = 0;
+            staticInput.command.drawArgs.StartInstanceLocation = 0;
+            uint64_t inputKey = static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(drawItems[i].primitive));
+            inputKey ^= static_cast<uint64_t>(dcIDs[i]) *
+                0x9e3779b97f4a7c15ull;
+            inputKey ^= static_cast<uint64_t>(
+                drawItems[i].primitive->indexCount) << 32;
+            XMFLOAT4X4 modelForHash;
+            XMStoreFloat4x4(&modelForHash, drawItems[i].model);
+            const uint32_t* modelWords =
+                reinterpret_cast<const uint32_t*>(&modelForHash);
+            for (UINT word = 0; word < 16; ++word) {
+                inputKey ^= modelWords[word];
+                inputKey *= 1099511628211ull;
+            }
+            const UINT inputIndex = batchCount++;
+            if (context.NeedsInput(inputIndex, inputKey))
+                staticInput.worldBounds = ComputeDrawItemBounds(drawItems[i]);
+            GPUVisibilityCullInput& input = context.PrepareInput(
+                inputIndex, inputKey, staticInput);
+            input.command.matrixCBV = frameMatrixCBV;
         } else {
             directDraws.push_back(i);
         }
@@ -736,7 +822,8 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     // forward extensions. Reserve the written range so later weapon,
     // transparent, and particle draws cannot overwrite visibility matrices
     // before the GPU consumes them.
-    shader.currentDrawCall = (std::max)(shader.currentDrawCall, drawCount);
+    shader.currentDrawCall = (std::max)(shader.currentDrawCall,
+        (std::max)(drawCount, 1u));
 
     GPUVisibilityCullConstants cull = {};
     if ((culledCount > 0 || doubleSidedCount > 0) && useGPUDriven) {
@@ -762,6 +849,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     }
 
     vb.BeginVisibilityPass(g_dx12.commandList.Get());
+    g_dx12.commandList->SetGraphicsRootConstantBufferView(0, frameMatrixCBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if (culledCount > 0) {
         vb.SetVisPassDraw(g_dx12.commandList.Get(), 0, 0, false, false, false);
@@ -776,8 +864,6 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
                 ? drawItems[i].primitive->vbv
                 : (drawItems[i].isCube ? geo.cubeVBV : geo.planeVBV);
             g_dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
-            vb.SetVisPassMatrices(g_dx12.commandList.Get(), drawItems[i].model,
-                view, proj, lightSpace, shader, i);
             vb.SetVisPassDraw(g_dx12.commandList.Get(), dcIDs[i],
                 drawItems[i].materialId, drawItems[i].doubleSided,
                 drawItems[i].alphaCutout, drawItems[i].alphaFromLuminance);
