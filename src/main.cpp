@@ -3628,7 +3628,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (wParam == VK_F11) { ToggleFullscreen(hwnd); }
         return 0;
 
-    case WM_DESTROY: PostQuitMessage(0); return 0;
+    case WM_DESTROY:
+        std::ofstream("engine_runtime_error.log", std::ios::app)
+            << "WM_DESTROY\n";
+        PostQuitMessage(0); return 0;
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
@@ -3847,6 +3850,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     UINT visibilityTestForwardFrames = 0;
     bool visibilitySmokeEnabled = false;
     bool visibilitySmokeReported = false;
+    UINT visibilityCpuReportFrames = 0;
     const bool visibilityBenchmark =
         GetEnvironmentVariableA("SGE_VISIBILITY_BENCHMARK", nullptr, 0) > 0;
     const bool visibilityForwardOnly =
@@ -3869,10 +3873,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         scene.useVisibilityBuffer = false;
         visibilityTestPending = true;
-        emptyLevelAssetsLoaded = true;
         const bool emptyVisibilityTest =
             GetEnvironmentVariableA("SGE_VISIBILITY_TEST_FULL", nullptr, 0) == 0;
-        StartLevelOne(hwnd, true, false, emptyVisibilityTest);
+        const bool stressVisibilityTest =
+            GetEnvironmentVariableA("SGE_VISIBILITY_TEST_STRESS", nullptr, 0) > 0;
+        StartLevelOne(hwnd, true, stressVisibilityTest, emptyVisibilityTest);
     }
 
     // ?? main loop ????????????????????????????????????????????????????????????
@@ -3994,6 +3999,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 pendingTurretGunnerRespawn = !(firstReady && secondReady);
             }
             if (g_heldBandit && g_heldBandit->Dead()) g_heldBandit = nullptr;
+            static std::unordered_map<SkinnedEnemy*, float> banditUpdateDebt;
             for (auto& bandit : g_bandits) {
                 if (!bandit || bandit->Dead()) continue;
                 if (bandit.get() == g_heldBandit) {
@@ -4008,7 +4014,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     continue;
                 }
                 bandit->leftArmReach = g_banditLeftArmReach;
-                if (bandit->turretGunner) {
+                const float cameraDx = bandit->position.x - scene.camera.Position.x;
+                const float cameraDz = bandit->position.z - scene.camera.Position.z;
+                const float cameraDistanceSq = cameraDx * cameraDx + cameraDz * cameraDz;
+                const float updateInterval = cameraDistanceSq > 55.0f * 55.0f
+                    ? (1.0f / 15.0f)
+                    : (cameraDistanceSq > 30.0f * 30.0f ? (1.0f / 30.0f) : 0.0f);
+                float& updateDebt = banditUpdateDebt[bandit.get()];
+                updateDebt += deltaTime;
+                const bool updateBandit = updateInterval == 0.0f ||
+                    updateDebt >= updateInterval;
+                const float banditDeltaTime = updateBandit ? updateDebt : 0.0f;
+                if (updateBandit) updateDebt = 0.0f;
+                if (updateBandit && bandit->turretGunner) {
                     const XMFLOAT3 mount = bandit->mountedVehicleIndex == 0
                         ? HumveeTurretMountWorld()
                         : XMFLOAT3{
@@ -4016,10 +4034,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             g_humveeTurretLocal.y + 3.45f,
                             g_secondaryHumveePosition.z + g_humveeTurretLocal.z };
                     bandit->UpdateMounted(
-                        deltaTime, mount,
+                        banditDeltaTime, mount,
                         (g_drivingHumvee && bandit->mountedVehicleIndex == 0)
                             ? g_humveeAimPoint : scene.camera.Position);
-                } else {
+                } else if (updateBandit) {
                     float groundY = 0.0f;
                     if (scene.useMeshTerrain && g_terrain.supported) {
                         auto tp = CurrentTerrainParams();
@@ -4027,7 +4045,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         groundY = TerrainRendererDX12::HeightAt(
                             tp, bandit->position.x, bandit->position.z);
                     }
-                    bandit->Update(deltaTime, scene.camera.Position, groundY);
+                    bandit->Update(banditDeltaTime, scene.camera.Position, groundY);
                     ResolveBanditHumveeCollision(*bandit);
                 }
                 XMFLOAT3 shotOrigin, shotDirection;
@@ -4387,7 +4405,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         // ?? begin frame ??
         try { BeginFrame(); }
-        catch (const std::exception& e) { std::cerr << "BeginFrame: " << e.what() << "\n"; break; }
+        catch (const std::exception& e) {
+            std::ofstream("engine_runtime_error.log", std::ios::app)
+                << "BeginFrame: " << e.what() << '\n';
+            std::cerr << "BeginFrame: " << e.what() << "\n"; break;
+        }
         occlusionDepth.FinalizeCapture(g_dx12.commandList.Get());
         g_profiler.BeginGpuFrame(g_dx12.frameIndex, g_dx12.commandList.Get());
 
@@ -4967,6 +4989,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             std::cerr << "EndFrame: " << e.what()
                       << " deviceRemovedReason=0x" << std::hex
                       << static_cast<unsigned long>(removedReason) << std::dec << "\n";
+            std::ofstream("engine_runtime_error.log", std::ios::app)
+                << "EndFrame: " << e.what() << " deviceRemovedReason=0x"
+                << std::hex << static_cast<unsigned long>(removedReason)
+                << std::dec << '\n';
             DumpDX12DebugMessages();
             break;
         }
@@ -4976,6 +5002,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 scene.GetViewMatrix() * scene.GetProjectionMatrix();
         msaaUsedLastFrame = msaaActive;
         g_profiler.EndCpuFrame();
+        if (visibilitySmokeEnabled && ++visibilityCpuReportFrames >= 300) {
+            visibilityCpuReportFrames = 0;
+            std::ofstream cpuLog("visibility_cpu.log", std::ios::trunc);
+            cpuLog << "cpu_frame_ms=" << g_profiler.CpuFrameMs() << '\n';
+            for (const ProfilerSampleDX12& sample : g_profiler.CpuSamples())
+                cpuLog << sample.name << '=' << sample.milliseconds << '\n';
+            cpuLog << "visibility_draws=" << g_visibilityDrawCalls << '\n'
+                   << "forward_draws=" << g_forwardDrawCalls << '\n'
+                   << "destruction_batches="
+                   << g_destruction.GetRenderBatches().size() << '\n'
+                   << "destruction_fallbacks="
+                   << g_destruction.GetRenderItems().size() << '\n'
+                   << "destruction_awake="
+                   << g_destruction.GetAwakeActorCount() << '\n'
+                   << "destruction_low_motion="
+                   << g_destruction.GetLowMotionActorCount() << '\n'
+                   << "destruction_spatial_batches="
+                   << g_destruction.GetSpatialBatchCount() << '\n';
+        }
 
         if (visibilityBenchmark && !visibilityBenchmarkComplete &&
             gameScreen == GameScreen::Level1 && !levelLoadingActive) {

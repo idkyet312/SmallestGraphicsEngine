@@ -96,20 +96,22 @@ float3 CinematicInput(uint2 pixel) {
     int2 dimensions = int2(outputSize);
     float3 color = hdrInput.Load(int3(pixel, 0)).rgb;
 
-    float2 velocityPixels = motionInput.Load(int3(pixel, 0)) * float2(outputSize);
-    float blurLength = min(length(velocityPixels) * motionBlurStrength, 12.0);
-    if (blurLength > 0.5) {
-        float2 direction = velocityPixels / max(length(velocityPixels), 1e-4);
-        float3 motionColor = color * 0.28;
-        [unroll]
-        for (int tap = 1; tap <= 2; ++tap) {
-            float offset = blurLength * (tap / 2.0);
-            int2 a = clamp(int2(float2(pixel) + direction * offset), 0, dimensions - 1);
-            int2 b = clamp(int2(float2(pixel) - direction * offset), 0, dimensions - 1);
-            motionColor += (hdrInput.Load(int3(a, 0)).rgb +
-                            hdrInput.Load(int3(b, 0)).rgb) * 0.18;
+    if (motionBlurStrength > 0.0) {
+        float2 velocityPixels = motionInput.Load(int3(pixel, 0)) * float2(outputSize);
+        float blurLength = min(length(velocityPixels) * motionBlurStrength, 12.0);
+        if (blurLength > 0.5) {
+            float2 direction = velocityPixels / max(length(velocityPixels), 1e-4);
+            float3 motionColor = color * 0.28;
+            [unroll]
+            for (int tap = 1; tap <= 2; ++tap) {
+                float offset = blurLength * (tap / 2.0);
+                int2 a = clamp(int2(float2(pixel) + direction * offset), 0, dimensions - 1);
+                int2 b = clamp(int2(float2(pixel) - direction * offset), 0, dimensions - 1);
+                motionColor += (hdrInput.Load(int3(a, 0)).rgb +
+                                hdrInput.Load(int3(b, 0)).rgb) * 0.18;
+            }
+            color = motionColor;
         }
-        color = motionColor;
     }
 
     float depth = sceneDepth.Load(int3(pixel, 0));

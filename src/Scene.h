@@ -188,7 +188,7 @@ struct Scene {
     int   destructionGridY = 3;
     int   destructionGridZ = 4;
     float destructionDamageRadius = 0.9f;   // tight blast so hits stay local
-    float destructionDamage = 0.3f;         // fraction of bond health per shot (~3-4 hits to break)
+    float destructionDamage = 0.5f;         // bullets weaken once, then break on second hit
     float destructionBulletImpulse = 260.0f;
     bool  rebuildDestructionRequested = false;
     bool  showDestructionDebug = false;

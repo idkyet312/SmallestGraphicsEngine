@@ -169,6 +169,9 @@ public:
     uint32_t GetActorCount() const;
     uint64_t GetRenderItemRebuildCount() const;
     uint64_t GetBatchGeometryRebuildCount() const;
+    uint32_t GetAwakeActorCount() const;
+    uint32_t GetLowMotionActorCount() const;
+    uint32_t GetSpatialBatchCount() const;
     bool IsBatchBuildPending() const;
     const std::vector<DestructionRenderItem>& GetRenderItems() const;
     const std::vector<DestructionRenderBatch>& GetRenderBatches() const;

@@ -85,6 +85,7 @@ struct alignas(256) VBFrameConstants {
     float    nearPlane;
     float    farPlane;
     UINT     debugViewMode;
+    UINT     enableMotionVectors;
 };
 
 struct alignas(256) VBPostConstants {
@@ -178,6 +179,7 @@ public:
     std::vector<UINT>           cpuIndices;
     std::vector<VBClusterData>  cpuClusters;
     std::vector<XMFLOAT4X4>     previousModels;
+    std::unordered_map<uint64_t, XMFLOAT4X4> previousModelByInstance;
     std::vector<VBMeshData>     meshes;
     std::unordered_map<const MeshPrimitive*, UINT> primitiveMeshLookup;
     std::unordered_map<const SceneMaterial*, UINT> materialLookup;
@@ -186,6 +188,8 @@ public:
     UINT materialTextureCount = 0;
     UINT currentDrawCall = 0;
     UINT previousDrawCount = 0;
+    UINT drawCallDirtyMin = UINT_MAX;
+    UINT drawCallDirtyMax = 0;
     UINT persistentVertexCount = 0;
     UINT persistentIndexCount = 0;
     bool geometryUploaded = false;
@@ -196,6 +200,7 @@ public:
     float vignetteStrength = 0.18f;
     float grainStrength = 0.012f;
     float taaFeedback = 0.90f;
+    bool temporalEffectsEnabled = false;
     bool temporalHistoryValid = false;
     bool exposureReadable = false;
     float exposureAdaptation = 0.05f;
@@ -251,8 +256,13 @@ public:
     }
 
     void BeginFrame() {
+        if (previousModelByInstance.size() >
+            static_cast<size_t>(VB_MAX_DRAW_CALLS) * 4u)
+            previousModelByInstance.clear();
         previousDrawCount = currentDrawCall;
         currentDrawCall = 0;
+        drawCallDirtyMin = UINT_MAX;
+        drawCallDirtyMax = 0;
     }
 
     void SetCluster(UINT clusterIndex, UINT lightCount, const int* lightIndices) {
@@ -371,34 +381,51 @@ public:
     // Register only mutable instance/material data for this frame.
     UINT RegisterInstance(UINT meshID, const XMMATRIX& modelMatrix,
                           const XMFLOAT3& color, float metalness, float roughness,
-                          UINT materialID = 0, UINT flags = 0) {
+                          UINT materialID = 0, UINT flags = 0,
+                          uint64_t instanceKey = 0) {
         if (currentDrawCall >= VB_MAX_DRAW_CALLS || meshID >= meshes.size())
             return UINT_MAX;
 
         UINT dcID = currentDrawCall;
         VBDrawCallData& dc = cpuDrawCalls[dcID];
+        VBDrawCallData next = {};
         const VBMeshData& mesh = meshes[meshID];
 
         XMMATRIX transposed = XMMatrixTranspose(modelMatrix);
-        XMStoreFloat4x4(&dc.modelMatrix, transposed);
-        if (dcID < previousDrawCount) {
-            dc.previousModelMatrix = previousModels[dcID];
+        XMStoreFloat4x4(&next.modelMatrix, transposed);
+        auto previous = temporalEffectsEnabled && instanceKey
+            ? previousModelByInstance.find(instanceKey)
+            : previousModelByInstance.end();
+        if (!temporalEffectsEnabled) {
+            next.previousModelMatrix = next.modelMatrix;
+        } else if (previous != previousModelByInstance.end()) {
+            next.previousModelMatrix = previous->second;
+        } else if (instanceKey == 0 && dcID < previousDrawCount) {
+            next.previousModelMatrix = previousModels[dcID];
         } else {
-            dc.previousModelMatrix = dc.modelMatrix;
+            next.previousModelMatrix = next.modelMatrix;
         }
-        previousModels[dcID] = dc.modelMatrix;
+        previousModels[dcID] = next.modelMatrix;
+        if (temporalEffectsEnabled && instanceKey)
+            previousModelByInstance[instanceKey] = next.modelMatrix;
 
-        dc.objectColor = color;
-        dc.useTexture = 0.0f;
-        dc.metalness = metalness;
-        dc.roughness = roughness;
-        dc.useNormalMap = 0.0f;
-        dc.materialID = materialID;
-        dc.vertexOffset = mesh.vertexOffset;
-        dc.indexOffset = mesh.indexOffset;
-        dc.indexCount = mesh.indexCount;
-        dc.hasIndices = mesh.hasIndices;
-        dc.flags = flags;
+        next.objectColor = color;
+        next.useTexture = 0.0f;
+        next.metalness = metalness;
+        next.roughness = roughness;
+        next.useNormalMap = 0.0f;
+        next.materialID = materialID;
+        next.vertexOffset = mesh.vertexOffset;
+        next.indexOffset = mesh.indexOffset;
+        next.indexCount = mesh.indexCount;
+        next.hasIndices = mesh.hasIndices;
+        next.flags = flags;
+        if (dcID >= previousDrawCount ||
+            memcmp(&dc, &next, sizeof(VBDrawCallData)) != 0) {
+            dc = next;
+            drawCallDirtyMin = (std::min)(drawCallDirtyMin, dcID);
+            drawCallDirtyMax = (std::max)(drawCallDirtyMax, dcID);
+        }
 
         currentDrawCall++;
         return dcID;
@@ -407,15 +434,21 @@ public:
     // Upload all CPU-side data to GPU before the resolve pass
     void UploadBuffers(ID3D12GraphicsCommandList* cmdList) {
         // Upload draw calls
-        {
+        if (drawCallDirtyMin != UINT_MAX) {
+            const UINT64 offset = static_cast<UINT64>(drawCallDirtyMin) *
+                sizeof(VBDrawCallData);
+            const UINT64 size = static_cast<UINT64>(
+                drawCallDirtyMax - drawCallDirtyMin + 1) *
+                sizeof(VBDrawCallData);
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
             drawCallUpload->Map(0, &readRange, &mapped);
-            memcpy(mapped, cpuDrawCalls.data(), currentDrawCall * sizeof(VBDrawCallData));
+            memcpy(static_cast<uint8_t*>(mapped) + offset,
+                cpuDrawCalls.data() + drawCallDirtyMin, size);
             drawCallUpload->Unmap(0, nullptr);
 
-            cmdList->CopyBufferRegion(drawCallBuffer.Get(), 0,
-                drawCallUpload.Get(), 0, currentDrawCall * sizeof(VBDrawCallData));
+            cmdList->CopyBufferRegion(drawCallBuffer.Get(), offset,
+                drawCallUpload.Get(), offset, size);
         }
 
         // Geometry changes only when a mesh is added. DEFAULT buffers stay SRVs
@@ -539,6 +572,8 @@ public:
         ID3D12DescriptorHeap* heaps[] = { computeDescHeap.Get() };
         cmdList->SetDescriptorHeaps(1, heaps);
         cmdList->SetGraphicsRootSignature(visPassRootSig.Get());
+        cmdList->SetGraphicsRootShaderResourceView(3,
+            drawCallBuffer->GetGPUVirtualAddress());
         D3D12_GPU_DESCRIPTOR_HANDLE defaultTexture =
             computeDescHeap->GetGPUDescriptorHandleForHeapStart();
         defaultTexture.ptr += static_cast<UINT64>(
@@ -655,6 +690,7 @@ public:
         fc.nearPlane = nearPlane;
         fc.farPlane = farPlane;
         fc.debugViewMode = static_cast<UINT>(debugViewMode);
+        fc.enableMotionVectors = temporalEffectsEnabled ? 1u : 0u;
         frameConstantBuffer.CopyData(g_dx12.frameIndex, fc);
 
         // Set compute pipeline
@@ -842,9 +878,12 @@ public:
         constants.vignetteStrength = validationMode ? 0.0f : vignetteStrength;
         constants.grainStrength = validationMode ? 0.0f : grainStrength;
         constants.frameIndex = postFrameIndex++;
-        constants.historyValid = (!validationMode && allowHistory && temporalHistoryValid) ? 1u : 0u;
-        constants.taaFeedback = validationMode ? 0.0f : taaFeedback;
-        constants.motionBlurStrength = validationMode ? 0.0f : motionBlurStrength;
+        constants.historyValid = (temporalEffectsEnabled && !validationMode &&
+            allowHistory && temporalHistoryValid) ? 1u : 0u;
+        constants.taaFeedback = (temporalEffectsEnabled && !validationMode)
+            ? taaFeedback : 0.0f;
+        constants.motionBlurStrength = (temporalEffectsEnabled &&
+            !validationMode) ? motionBlurStrength : 0.0f;
         constants.focusDistance = focusDistance;
         constants.aperture = validationMode ? 0.0f : aperture;
         constants.nearPlane = currentNearPlane;
@@ -877,7 +916,7 @@ public:
         depth.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
         depth.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         cmdList->ResourceBarrier(1, &depth);
-        temporalHistoryValid = true;
+        temporalHistoryValid = temporalEffectsEnabled;
     }
 
     // Copy the resolved output to the back buffer
@@ -1289,7 +1328,8 @@ private:
         // 0: CBV - MatrixBuffer (b0)
         // 1: Root constants - draw/material flags (b1), 4 UINT values
         // 2: Alpha-test base colour (t0)
-        D3D12_ROOT_PARAMETER visParams[3] = {};
+        // 3: Persistent per-instance data (t1); VS reads model by drawCallID
+        D3D12_ROOT_PARAMETER visParams[4] = {};
 
         visParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         visParams[0].Descriptor.ShaderRegister = 0;
@@ -1300,7 +1340,7 @@ private:
         visParams[1].Constants.ShaderRegister = 1;
         visParams[1].Constants.RegisterSpace = 0;
         visParams[1].Constants.Num32BitValues = 4;
-        visParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        visParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_DESCRIPTOR_RANGE alphaRange = {};
         alphaRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -1312,6 +1352,11 @@ private:
         visParams[2].DescriptorTable.pDescriptorRanges = &alphaRange;
         visParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+        visParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        visParams[3].Descriptor.ShaderRegister = 1;
+        visParams[3].Descriptor.RegisterSpace = 0;
+        visParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
         D3D12_STATIC_SAMPLER_DESC alphaSampler = {};
         alphaSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         alphaSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -1322,7 +1367,7 @@ private:
         alphaSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC visRootSigDesc = {};
-        visRootSigDesc.NumParameters = 3;
+        visRootSigDesc.NumParameters = 4;
         visRootSigDesc.pParameters = visParams;
         visRootSigDesc.NumStaticSamplers = 1;
         visRootSigDesc.pStaticSamplers = &alphaSampler;

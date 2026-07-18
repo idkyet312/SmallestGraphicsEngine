@@ -546,6 +546,7 @@ inline void DumpDX12DebugMessages() {
     if (FAILED(g_dx12.device.As(&infoQueue))) return;
 
     UINT64 count = infoQueue->GetNumStoredMessages();
+    std::ofstream debugLog("d3d12_debug.log", std::ios::app);
     for (UINT64 i = 0; i < count; i++) {
         SIZE_T msgLen = 0;
         infoQueue->GetMessage(i, nullptr, &msgLen);
@@ -554,6 +555,8 @@ inline void DumpDX12DebugMessages() {
         D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
         infoQueue->GetMessage(i, msg, &msgLen);
         std::cerr << "[D3D12] " << msg->pDescription << std::endl;
+        if (debugLog)
+            debugLog << "[D3D12] " << msg->pDescription << '\n';
     }
     infoQueue->ClearStoredMessages();
 #endif
