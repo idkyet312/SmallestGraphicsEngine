@@ -1251,11 +1251,76 @@ static std::vector<ComPtr<ID3D12Resource>> g_muzzleFlashUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_fireUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_explosionUploadHeaps;
 static bool                 crateLoadAttempted = false;
-enum class LevelLoadStage { World, Vehicles, Helicopter, Bandits, Finalize, Complete };
+enum class LevelLoadStage {
+    WorldAssets, Destruction, Environment, Weapons, Humvee, Helicopter,
+    BanditModel, BanditSpawn, GPUFinalize, ReleaseUploads, Complete
+};
+struct LevelLoadRecord {
+    std::string label;
+    double milliseconds = 0.0;
+    bool succeeded = true;
+};
+static constexpr uint32_t   LevelLoadTaskCount = 10;
 static LevelLoadStage       levelLoadStage = LevelLoadStage::Complete;
 static bool                 levelLoadingActive = false;
 static float                levelLoadingProgress = 0.0f;
-static const char*          levelLoadingLabel = "Preparing level...";
+static std::string          levelLoadingLabel = "Preparing level...";
+static std::string          levelLoadingAsset = "None";
+static uint32_t             levelLoadingTaskIndex = 0;
+static uint32_t             levelLoadingLastSubmittedUploads = 0;
+static uint32_t             levelLoadingSubmittedUploads = 0;
+static StaticBufferStatsDX12 levelLoadingUploadBaseline = {};
+static std::chrono::steady_clock::time_point levelLoadingStartedAt;
+static std::chrono::steady_clock::time_point levelLoadingTaskStartedAt;
+static std::vector<LevelLoadRecord> levelLoadingRecords;
+
+static double LevelLoadElapsedMs(
+    std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
+static void BeginLevelLoading() {
+    const auto now = std::chrono::steady_clock::now();
+    levelLoadStage = LevelLoadStage::WorldAssets;
+    levelLoadingActive = true;
+    levelLoadingProgress = 0.02f;
+    levelLoadingLabel = "Terrain material and crate model";
+    levelLoadingAsset = "models/h2.glb";
+    levelLoadingTaskIndex = 1;
+    levelLoadingLastSubmittedUploads = 0;
+    levelLoadingSubmittedUploads = 0;
+    levelLoadingUploadBaseline = GetStaticBufferStatsDX12();
+    levelLoadingStartedAt = now;
+    levelLoadingTaskStartedAt = now;
+    levelLoadingRecords.clear();
+}
+
+static void AdvanceLevelLoading(LevelLoadStage next, const char* label,
+                                const char* asset, bool succeeded = true) {
+    levelLoadingRecords.push_back({ levelLoadingLabel,
+        LevelLoadElapsedMs(levelLoadingTaskStartedAt), succeeded });
+    if (levelLoadingRecords.size() > 6)
+        levelLoadingRecords.erase(levelLoadingRecords.begin());
+    levelLoadStage = next;
+    ++levelLoadingTaskIndex;
+    levelLoadingProgress = (std::min)(0.95f,
+        static_cast<float>(levelLoadingTaskIndex - 1) / LevelLoadTaskCount);
+    levelLoadingLabel = label;
+    levelLoadingAsset = asset;
+    levelLoadingTaskStartedAt = std::chrono::steady_clock::now();
+}
+
+static void CompleteLevelLoading(bool succeeded = true) {
+    levelLoadingRecords.push_back({ levelLoadingLabel,
+        LevelLoadElapsedMs(levelLoadingTaskStartedAt), succeeded });
+    levelLoadStage = LevelLoadStage::Complete;
+    levelLoadingTaskIndex = LevelLoadTaskCount;
+    levelLoadingProgress = 1.0f;
+    levelLoadingLabel = "Ready";
+    levelLoadingAsset = "None";
+    levelLoadingActive = false;
+}
 
 static float lastX = SCR_WIDTH / 2.0f;
 static float lastY = SCR_HEIGHT / 2.0f;
@@ -1419,12 +1484,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false) {
         wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
     levelElapsedSeconds = 0.0f;
     levelTimerRunning = crateLoadAttempted;
-    if (!crateLoadAttempted) {
-        levelLoadStage = LevelLoadStage::World;
-        levelLoadingActive = true;
-        levelLoadingProgress = 0.05f;
-        levelLoadingLabel = "Preparing world...";
-    }
+    if (!crateLoadAttempted) BeginLevelLoading();
     scene.playerGodMode = godMode;
     scene.RestorePlayerHealth();
     scene.ResetLevelRuntimeState();
@@ -1534,18 +1594,65 @@ static void RenderLoadingScreen() {
         ImVec2(0, 0), display, IM_COL32(4, 8, 12, 238));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
         ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(520.0f, 150.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(620.0f, 390.0f), ImGuiCond_Always);
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoInputs;
     ImGui::Begin("Loading Level", nullptr, flags);
-    ImGui::Dummy(ImVec2(0.0f, 18.0f));
-    const char* title = "LOADING LEVEL 1";
-    ImGui::SetCursorPosX((520.0f - ImGui::CalcTextSize(title).x) * 0.5f);
-    ImGui::TextUnformatted(title);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::TextDisabled("%s", levelLoadingLabel);
-    ImGui::ProgressBar(levelLoadingProgress, ImVec2(-1.0f, 24.0f));
+    const char* title = g_stressTestMode
+        ? "LOADING STRESS TEST" : "LOADING LEVEL 1";
+    ImGui::SetCursorPosX((620.0f - ImGui::CalcTextSize(title).x) * 0.5f);
+    ImGui::TextUnformatted(title);
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+    char progressText[64];
+    std::snprintf(progressText, sizeof(progressText), "Task %u / %u  (%.0f%%)",
+        levelLoadingTaskIndex, LevelLoadTaskCount,
+        levelLoadingProgress * 100.0f);
+    ImGui::ProgressBar(levelLoadingProgress, ImVec2(-1.0f, 25.0f), progressText);
+    ImGui::Text("Current: %s", levelLoadingLabel.c_str());
+    ImGui::TextDisabled("Asset:   %s", levelLoadingAsset.c_str());
+
+    const double totalMs = LevelLoadElapsedMs(levelLoadingStartedAt);
+    const double taskMs = LevelLoadElapsedMs(levelLoadingTaskStartedAt);
+    ImGui::Text("Elapsed: %.2f s total | %.2f s current task",
+        totalMs / 1000.0, taskMs / 1000.0);
+
+    const StaticBufferStatsDX12 uploads = GetStaticBufferStatsDX12();
+    const uint64_t uploadBytes = uploads.bytes >= levelLoadingUploadBaseline.bytes
+        ? uploads.bytes - levelLoadingUploadBaseline.bytes : 0;
+    const uint32_t uploadResources =
+        uploads.resources >= levelLoadingUploadBaseline.resources
+        ? uploads.resources - levelLoadingUploadBaseline.resources : 0;
+    ImGui::Text("GPU buffers: %u resources | %.2f MiB queued/created",
+        uploadResources, static_cast<double>(uploadBytes) / (1024.0 * 1024.0));
+    ImGui::Text("Uploads: %u submitted total | %u last frame | %u pending",
+        levelLoadingSubmittedUploads, levelLoadingLastSubmittedUploads,
+        uploads.pendingUploads);
+
+    const HRESULT gpuHealth = g_dx12.device
+        ? g_dx12.device->GetDeviceRemovedReason() : E_POINTER;
+    if (gpuHealth == S_OK)
+        ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f), "GPU: OK");
+    else
+        ImGui::TextColored(ImVec4(1.0f, 0.25f, 0.2f, 1.0f),
+            "GPU: REMOVED 0x%08lX", static_cast<unsigned long>(gpuHealth));
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Recent tasks");
+    if (levelLoadingRecords.empty()) {
+        ImGui::TextDisabled("Waiting for first task...");
+    } else {
+        for (auto it = levelLoadingRecords.rbegin();
+             it != levelLoadingRecords.rend(); ++it) {
+            ImGui::TextColored(it->succeeded
+                ? ImVec4(0.55f, 0.95f, 0.6f, 1.0f)
+                : ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
+                "%s  %s  %.1f ms", it->succeeded ? "OK" : "FAIL",
+                it->label.c_str(), it->milliseconds);
+        }
+    }
     ImGui::End();
 }
 
@@ -4160,11 +4267,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             occlusionDepth.GetMipCount());
 
         if (gameScreen == GameScreen::Level1 && levelLoadingActive) {
-        if (levelLoadStage == LevelLoadStage::World) {
-            levelLoadingLabel = "Building world and destruction...";
+        if (levelLoadStage == LevelLoadStage::WorldAssets) {
             LoadFloorMudMaterial();
             std::cout << "Loading models/h2.glb...\n";
             crateModel = GLBImporter::LoadGLB("models/h2.glb", g_dx12.device, g_dx12.commandList);
+            AdvanceLevelLoading(LevelLoadStage::Destruction,
+                "Destruction geometry and Blast actors",
+                "procedural house chunks + roof", crateModel != nullptr);
+        } else if (levelLoadStage == LevelLoadStage::Destruction) {
             // Modular destructible house built from structural pieces, with
             // world-anchored foundation/sill chunks. Grid args unused (bonds
             // come from AABB adjacency), so pass 1s.
@@ -4177,6 +4287,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ArrangeHousesInCross(stressWallModel, true);
             wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
+            AdvanceLevelLoading(LevelLoadStage::Environment,
+                "Water, ocean, trees and scalable environment",
+                g_stressTestMode ? "stress environment" : "level environment",
+                wallModel != nullptr);
+        } else if (levelLoadStage == LevelLoadStage::Environment) {
             // Pool of water beside the house (on the clear -X side) with a
             // handful of wooden crates dropped in to bob on the surface.
             // Pool sunk into a dug-out terrain basin (see TerrainHeight): the
@@ -4241,10 +4356,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 std::cerr << "Failed to load h2.glb, falling back to procedural cube\n";
             }
 
-            levelLoadStage = LevelLoadStage::Vehicles;
-            levelLoadingProgress = 0.35f;
-            levelLoadingLabel = "Loading weapons and vehicles...";
-        } else if (levelLoadStage == LevelLoadStage::Vehicles) {
+            AdvanceLevelLoading(LevelLoadStage::Weapons,
+                "Weapon and explosive barrel",
+                "AK47 + models/Barrel Explosive/barrel.FBX");
+        } else if (levelLoadStage == LevelLoadStage::Weapons) {
 
             // The AK47 view model. Loaded here so its texture uploads land in the
             // same command list the flush below submits.
@@ -4262,6 +4377,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             } else
                 std::cerr << "Explosive barrel FBX failed; using procedural fallback\n";
 
+            AdvanceLevelLoading(LevelLoadStage::Humvee,
+                "Humvee model, bounds and shadow mesh",
+                "models/Humvee/humvee.fbx",
+                g_explosiveBarrelModel != nullptr);
+        } else if (levelLoadStage == LevelLoadStage::Humvee) {
             g_humveeModel = FBXImporter::Load(
                 "models/Humvee/humvee.fbx",
                 g_dx12.device, g_dx12.commandList, 1.0f, false, true);
@@ -4279,9 +4399,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 std::cerr << "Humvee FBX failed to load\n";
             }
 
-            levelLoadStage = LevelLoadStage::Helicopter;
-            levelLoadingProgress = 0.58f;
-            levelLoadingLabel = "Loading helicopter...";
+            AdvanceLevelLoading(LevelLoadStage::Helicopter,
+                "OH-1 import, geometry LOD and rotor setup",
+                "models/OH-1_fbx/OH-1.fbx", g_humveeModel != nullptr);
         } else if (levelLoadStage == LevelLoadStage::Helicopter) {
 
             const std::string helicopterModelPath =
@@ -4308,10 +4428,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             else
                 std::cerr << "Humvee dark green material failed\n";
 
-            levelLoadStage = LevelLoadStage::Bandits;
-            levelLoadingProgress = 0.76f;
-            levelLoadingLabel = "Loading characters and animation...";
-        } else if (levelLoadStage == LevelLoadStage::Bandits) {
+            AdvanceLevelLoading(LevelLoadStage::BanditModel,
+                "Bandit mesh, skeleton, clips and physics asset",
+                "models/MilitaryMercenaryBandit/SK_Bandit.FBX",
+                g_helicopterModel != nullptr);
+        } else if (levelLoadStage == LevelLoadStage::BanditModel) {
 
             // Skinned Bandit enemy: mesh + walk/idle/run clips. Texture uploads
             // ride the same command list flushed just below.
@@ -4328,23 +4449,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 bm.ragdoll = T3DPhysicsAsset::Load(banditDir + "Phy_Bandit_PhysicsAsset.T3D");
                 if (bm.valid) {
                     g_banditModel = std::move(bm);
-                    for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
-                        if (!SpawnBandit()) break;
-                    SpawnHumveeTurretGunner(0);
-                    if (g_stressTestMode) SpawnHumveeTurretGunner(1);
-                    g_banditLoaded = true;
-                    std::cout << "Bandit squad ready: " << LiveBanditCount()
-                              << " live enemies\n";
                 } else {
                     std::cerr << "Bandit squad failed to load\n";
                 }
 
             }
-
-            levelLoadStage = LevelLoadStage::Finalize;
-            levelLoadingProgress = 0.92f;
-            levelLoadingLabel = "Finalizing GPU resources...";
-        } else if (levelLoadStage == LevelLoadStage::Finalize) {
+            AdvanceLevelLoading(LevelLoadStage::BanditSpawn,
+                "Spawn squad and turret gunners",
+                g_stressTestMode ? "stress squad: enemies + 2 gunners"
+                                 : "level squad: enemies + gunner",
+                g_banditModel.valid);
+        } else if (levelLoadStage == LevelLoadStage::BanditSpawn) {
+            if (g_banditModel.valid) {
+                for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
+                    if (!SpawnBandit()) break;
+                SpawnHumveeTurretGunner(0);
+                if (g_stressTestMode) SpawnHumveeTurretGunner(1);
+                g_banditLoaded = true;
+                std::cout << "Bandit squad ready: " << LiveBanditCount()
+                          << " live enemies\n";
+            }
+            AdvanceLevelLoading(LevelLoadStage::GPUFinalize,
+                "Drain graphics uploads and generate texture mips",
+                "direct queue + compute queue", g_banditLoaded);
+        } else if (levelLoadStage == LevelLoadStage::GPUFinalize) {
 
             // Flush the load/mip-generation commands now and print any D3D12
             // validation errors before continuing, so mip-related bugs surface
@@ -4356,6 +4484,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // Mip handoff is submitted by FlushPending. Wait once, then free
             // texture staging resources retained by imported scene materials.
             WaitForGPU();
+            AdvanceLevelLoading(LevelLoadStage::ReleaseUploads,
+                "Release staging heaps and validate DX12 device",
+                "material upload heaps");
+        } else if (levelLoadStage == LevelLoadStage::ReleaseUploads) {
             ReleaseMaterialUploadHeaps(g_helicopterModel);
             ReleaseMaterialUploadHeaps(g_humveeModel);
             ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
@@ -4368,10 +4500,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // First Level 1 load is complete. Start timing after load/GPU waits,
             // not from menu click.
             crateLoadAttempted = true;
-            levelLoadStage = LevelLoadStage::Complete;
-            levelLoadingProgress = 1.0f;
-            levelLoadingLabel = "Ready";
-            levelLoadingActive = false;
+            CompleteLevelLoading(g_dx12.device &&
+                g_dx12.device->GetDeviceRemovedReason() == S_OK);
             levelTimerRunning = true;
             lastTime = gameTimer.GetElapsed();
         }
@@ -4382,7 +4512,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // shadows, and particles are never submitted behind the menu.
         // Loaders and destruction rebuilds enqueue immutable geometry in DEFAULT
         // heaps. Record all copies before any pass consumes those resources.
-        FlushStaticBufferUploadsDX12(g_dx12.commandList.Get());
+        const uint32_t submittedUploads =
+            FlushStaticBufferUploadsDX12(g_dx12.commandList.Get());
+        if (levelLoadingActive) {
+            levelLoadingLastSubmittedUploads = submittedUploads;
+            levelLoadingSubmittedUploads += submittedUploads;
+        }
 
         if (gameScreen == GameScreen::Level1 && !levelLoadingActive &&
             usingRaytracing) {
