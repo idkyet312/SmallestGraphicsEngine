@@ -797,7 +797,7 @@ private:
 
     bool CreateComputeDescriptorHeap() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-        heapDesc.NumDescriptors = 11;
+        heapDesc.NumDescriptors = 12;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         HRESULT hr = g_dx12.device->CreateDescriptorHeap(
@@ -992,9 +992,9 @@ private:
         ranges[1].RegisterSpace = 0;
         ranges[1].OffsetInDescriptorsFromTableStart = 7;
 
-        // CBVs b1..b2
+        // CBVs b1..b3 (lights, point lights, sky SH)
         ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
-        ranges[2].NumDescriptors = 2;
+        ranges[2].NumDescriptors = 3;
         ranges[2].BaseShaderRegister = 1;
         ranges[2].RegisterSpace = 0;
         ranges[2].OffsetInDescriptorsFromTableStart = 9;
@@ -1219,6 +1219,7 @@ private:
 
         // [9] b1 - light buffer CBV (placeholder, will be updated per frame)
         // [10] b2 - point lights CBV (placeholder, will be updated per frame)
+        // [11] b3 - sky SH CBV
         // These will be created in UpdateLightDescriptors
     }
 
@@ -1325,7 +1326,8 @@ private:
 public:
     // Call this each frame before resolve to update the light CBV descriptors
     void UpdateLightDescriptors(D3D12_GPU_VIRTUAL_ADDRESS lightBufferAddr,
-                                D3D12_GPU_VIRTUAL_ADDRESS pointLightsAddr) {
+                                D3D12_GPU_VIRTUAL_ADDRESS pointLightsAddr,
+                                D3D12_GPU_VIRTUAL_ADDRESS shBufferAddr) {
         UINT descSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
         cpuHandle.ptr += 9 * descSize;
@@ -1344,6 +1346,15 @@ public:
             D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
             cbvDesc.BufferLocation = pointLightsAddr;
             cbvDesc.SizeInBytes = sizeof(PointLightsBufferDX12);
+            g_dx12.device->CreateConstantBufferView(&cbvDesc, cpuHandle);
+            cpuHandle.ptr += descSize;
+        }
+
+        // [11] b3 - preconvolved HDRI spherical harmonics
+        {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+            cbvDesc.BufferLocation = shBufferAddr;
+            cbvDesc.SizeInBytes = sizeof(SHBufferDX12);
             g_dx12.device->CreateConstantBufferView(&cbvDesc, cpuHandle);
         }
     }

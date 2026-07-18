@@ -653,9 +653,11 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         shader.pointLightsBuffer.CopyData(g_dx12.frameIndex, plb);
     }
 
+    shader.SetSH();
     vb.UpdateLightDescriptors(
         shader.lightBuffer.GetGPUAddress(g_dx12.frameIndex),
-        shader.pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
+        shader.pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex),
+        shader.shBuffer.GetGPUAddress(g_dx12.frameIndex));
     vb.UpdateShadowMapDescriptor(shadowResource);
 
     LightBufferDX12 dummyLB = {};
