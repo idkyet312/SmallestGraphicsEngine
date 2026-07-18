@@ -10,16 +10,17 @@
 // (mesh_ps.cso), so terrain receives the full PBR/shadow/DDGI/SH lighting.
 class TerrainRendererDX12 {
 public:
-    // Matches TerrainParams (b6, root param 8: 8 x 32-bit constants).
+    // Matches TerrainParams (b6, root param 8).
     struct Params {
-        UINT tilesX = 32;
-        UINT tilesZ = 32;
+        UINT tilesX = 16;
+        UINT tilesZ = 16;
         float tileSize = 8.0f;
         float heightScale = 5.0f;
         float lodNear = 24.0f;
         float lodStep = 28.0f;
         float skirtDepth = 1.0f;
         float flattenRadius = 14.0f;
+        float islandScale = 1.0f;
     };
 
     ComPtr<ID3D12PipelineState> pso;
@@ -180,9 +181,32 @@ public:
         // lifted above sea level (y = 0), then ramps down to a seabed past the
         // shore, so the island is ringed by ocean.
         constexpr float landLift = 2.5f, seabed = -6.0f;
-        constexpr float shoreInner = 68.0f, shoreOuter = 104.0f;
-        float r = sqrtf(x * x + z * z);
-        float st = (r - shoreInner) / (shoreOuter - shoreInner);
+        const float shoreInner = 34.0f * params.islandScale;
+        const float shoreOuter = 52.0f * params.islandScale;
+        // Warp an oval coastline, then cut a northwest bay and extend a
+        // southeast headland. This avoids the artificial circular-atoll shape.
+        float coastDistance = sqrtf(x * x + z * z);
+        auto coastLobe = [](float distance, float radius) {
+            float t = distance / radius;
+            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+            return 1.0f - t * t * (3.0f - 2.0f * t);
+        };
+        if (params.islandScale > 1.5f) {
+            const float warpedX = x + sinf(z * 0.055f) * 7.0f +
+                sinf((x + z) * 0.025f) * 4.0f;
+            const float warpedZ = z + sinf(x * 0.047f) * 6.0f -
+                sinf((x - z) * 0.031f) * 3.0f;
+            coastDistance = sqrtf(
+                warpedX * warpedX * 0.92f * 0.92f +
+                warpedZ * warpedZ * 1.06f * 1.06f);
+            coastDistance += coastLobe(
+                sqrtf((x + 55.0f) * (x + 55.0f) +
+                      (z - 15.0f) * (z - 15.0f)), 22.0f) * 13.0f;
+            coastDistance -= coastLobe(
+                sqrtf((x - 35.0f) * (x - 35.0f) +
+                      (z + 55.0f) * (z + 55.0f)), 26.0f) * 11.0f;
+        }
+        float st = (coastDistance - shoreInner) / (shoreOuter - shoreInner);
         st = st < 0.0f ? 0.0f : (st > 1.0f ? 1.0f : st);
         float shore = st * st * (3.0f - 2.0f * st);          // smoothstep
         float land = h + landLift;
@@ -212,7 +236,7 @@ public:
         ID3D12PipelineState* wire =
             msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get();
         commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
-        commandList6->SetGraphicsRoot32BitConstants(8, 8, &params, 0);
+        commandList6->SetGraphicsRoot32BitConstants(8, 9, &params, 0);
         const UINT tileCount = params.tilesX * params.tilesZ;
         commandList6->DispatchMesh((tileCount + 31) / 32, 1, 1);
     }

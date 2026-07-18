@@ -20,6 +20,7 @@ cbuffer TerrainParams : register(b6) {
     float lodStep;
     float skirtDepth;
     float flattenRadius;
+    float islandScale;
 };
 
 struct TerrainPayload {
@@ -76,8 +77,8 @@ static const float  kPoolDepth  = 3.0;   // how far the floor drops below ground
 // Must match TerrainRendererDX12::HeightAt.
 static const float kLandLift   =  2.5;   // how far the island sits above sea level
 static const float kSeabed     = -6.0;   // sea floor depth past the shore
-static const float kShoreInner = 68.0;   // solid land out to here
-static const float kShoreOuter = 104.0;  // fully underwater by here
+static const float kShoreInner = 34.0;   // Level 1 solid-land radius
+static const float kShoreOuter = 52.0;   // Level 1 outer-shore radius
 
 // Flat arena under the four houses arranged around world centre. Applied after
 // everything else and faded out before the relocated pool basin.
@@ -104,8 +105,21 @@ float TerrainHeight(float2 xz) {
     // so the land ends in a beach and the ocean takes over. The ramp finishes
     // inside the terrain grid's own edge, so the mesh boundary is never visible
     // above water. Must match TerrainRendererDX12::HeightAt.
-    float r = length(xz);
-    float shore = smoothstep(kShoreInner, kShoreOuter, r);   // 0 inland -> 1 at sea
+    float coastDistance = length(xz);
+    if (islandScale > 1.5) {
+        float2 warped = xz + float2(
+            sin(xz.y * 0.055) * 7.0 + sin((xz.x + xz.y) * 0.025) * 4.0,
+            sin(xz.x * 0.047) * 6.0 - sin((xz.x - xz.y) * 0.031) * 3.0);
+        coastDistance = length(warped * float2(0.92, 1.06));
+        float northwestBay = 1.0 - smoothstep(0.0, 22.0,
+            length(xz - float2(-55.0, 15.0)));
+        float southeastHeadland = 1.0 - smoothstep(0.0, 26.0,
+            length(xz - float2(35.0, -55.0)));
+        coastDistance += northwestBay * 13.0;
+        coastDistance -= southeastHeadland * 11.0;
+    }
+    float shore = smoothstep(kShoreInner * islandScale,
+                             kShoreOuter * islandScale, coastDistance);
     h = lerp(h + kLandLift, kSeabed, shore);
 
     // Building pad, applied LAST so nothing else can dent it. The pool rim was

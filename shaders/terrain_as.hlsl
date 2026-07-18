@@ -26,6 +26,7 @@ cbuffer TerrainParams : register(b6) {
     float lodStep;        // distance per LOD level after lodNear
     float skirtDepth;
     float flattenRadius;  // level pad around origin for the house
+    float islandScale;
 };
 
 struct TerrainPayload {
