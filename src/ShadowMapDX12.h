@@ -370,6 +370,9 @@ public:
             DrawSceneNodeShadow(g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,
                                 depthShader,
                                 HumveeWorldMatrix(), lightSpace);
+            DrawSceneNodeShadow(g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,
+                                depthShader,
+                                SecondaryHumveeWorldMatrix(), lightSpace);
         }
 
         // Sparse instanced blade silhouettes give grass a readable basic shadow

@@ -92,6 +92,8 @@ float                       g_helicopterHoverTime = 0.0f;
 float                       g_helicopterFireCooldown = 0.0f;
 float                       g_helicopterFireCycleTime = 0.0f;
 XMFLOAT3                    g_helicopterPosition{ 0.0f, 14.0f, 0.0f };
+XMFLOAT3                    g_secondaryHelicopterPosition{ 42.0f, 14.0f, 0.0f };
+XMFLOAT3                    g_secondaryHumveePosition{ 42.0f, 2.5f, 3.0f };
 float                       g_helicopterHealth = 2000.0f;
 bool                        g_helicopterDead = false;
 bool                        g_helicopterCrashed = false;
@@ -125,13 +127,17 @@ bool                        g_suppressFireUntilMouseRelease = false;
 NavigationSystem            g_navigation;
 
 static constexpr size_t kEnemiesPerSpawner = 2;
-static constexpr size_t kSpawnerCount = 4;
+static constexpr size_t kSpawnerCount = 8;
 static constexpr size_t kBanditsOnScreen = kSpawnerCount * kEnemiesPerSpawner;
 static const std::array<XMFLOAT3, kSpawnerCount> kBanditSpawnPoints = {{
     {  0.0f, 0.0f,  17.5f }, // north: 5 m beyond house outer wall
     { 17.5f, 0.0f,   0.0f }, // east
     {  0.0f, 0.0f, -17.5f }, // south
     {-17.5f, 0.0f,   0.0f }, // west
+    { 42.0f, 0.0f,  17.5f }, // second compound north
+    { 59.5f, 0.0f,   0.0f }, // second compound east
+    { 42.0f, 0.0f, -17.5f }, // second compound south
+    { 24.5f, 0.0f,   0.0f }, // second compound west
 }};
 
 static size_t LiveBanditCount() {
@@ -174,6 +180,17 @@ XMMATRIX HumveeWorldMatrix() {
     return model * XMMatrixTranslation(0.0f, 2.5f, 0.0f);
 }
 
+XMMATRIX SecondaryHumveeWorldMatrix() {
+    return XMMatrixTranslation(-g_humveeModelCenter.x, -g_humveeModelMinY,
+                               -g_humveeModelCenter.z) *
+           XMMatrixScaling(g_humveeModelScale, g_humveeModelScale,
+                           g_humveeModelScale) *
+           XMMatrixRotationY(-XM_PIDIV2) *
+           XMMatrixTranslation(g_secondaryHumveePosition.x,
+                               g_secondaryHumveePosition.y,
+                               g_secondaryHumveePosition.z);
+}
+
 XMMATRIX HelicopterWorldMatrix() {
     return XMMatrixTranslation(-g_helicopterModelCenter.x,
                                -g_helicopterModelCenter.y,
@@ -186,6 +203,20 @@ XMMATRIX HelicopterWorldMatrix() {
            XMMatrixTranslation(g_helicopterPosition.x,
                                g_helicopterPosition.y,
                                g_helicopterPosition.z);
+}
+
+XMMATRIX SecondaryHelicopterWorldMatrix() {
+    return XMMatrixTranslation(-g_helicopterModelCenter.x,
+                               -g_helicopterModelCenter.y,
+                               -g_helicopterModelCenter.z) *
+           XMMatrixScaling(g_helicopterModelScale, g_helicopterModelScale,
+                           g_helicopterModelScale) *
+           XMMatrixRotationRollPitchYaw(g_helicopterPitch,
+                                        g_helicopterYaw + XM_PI,
+                                        g_helicopterRoll) *
+           XMMatrixTranslation(g_secondaryHelicopterPosition.x,
+                               g_secondaryHelicopterPosition.y,
+                               g_secondaryHelicopterPosition.z);
 }
 
 static void ConfigureHelicopterBounds() {
@@ -534,12 +565,21 @@ static bool SpawnBandit() {
     return true;
 }
 
-static bool SpawnHumveeTurretGunner() {
+static bool SpawnHumveeTurretGunner(int vehicleIndex) {
     if (!g_banditModel.valid || !g_humveeModel) return false;
+    for (const auto& existing : g_bandits)
+        if (existing && !existing->Dead() && existing->turretGunner &&
+            existing->mountedVehicleIndex == vehicleIndex)
+            return true;
     auto bandit = std::make_unique<SkinnedEnemy>();
     if (!bandit->Init(g_banditModel)) return false;
-    bandit->position = HumveeTurretMountWorld();
+    bandit->position = vehicleIndex == 0
+        ? HumveeTurretMountWorld()
+        : XMFLOAT3{ g_secondaryHumveePosition.x + g_humveeTurretLocal.x,
+                    g_humveeTurretLocal.y + 3.45f,
+                    g_secondaryHumveePosition.z + g_humveeTurretLocal.z };
     bandit->turretGunner = true;
+    bandit->mountedVehicleIndex = vehicleIndex;
     bandit->spawnSlot = -1;
     bandit->leftArmReach = g_banditLeftArmReach;
     bandit->fireCooldown = 1.4f;
@@ -2271,6 +2311,14 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root) {
     addHouse(woodTemplate,  -3.5f, 3.5f,  0.0f, -radius, XM_PI,     3000000);
     addHouse(metalTemplate,  4.75f, 3.55f,-radius, 0.0f,-XM_PIDIV2, 4000000);
 
+    constexpr float secondX = 42.0f;
+    addHouse(woodTemplate,  -3.5f, 3.5f, secondX,  radius, 0.0f,       5000000);
+    addHouse(metalTemplate,  4.75f, 3.55f,secondX + radius, 0.0f,
+             XM_PIDIV2, 6000000);
+    addHouse(woodTemplate,  -3.5f, 3.5f, secondX, -radius, XM_PI,     7000000);
+    addHouse(metalTemplate,  4.75f, 3.55f,secondX - radius, 0.0f,
+             -XM_PIDIV2, 8000000);
+
     XMFLOAT4X4 identity;
     XMStoreFloat4x4(&identity, XMMatrixIdentity());
     root->UpdateGlobalTransform(identity);
@@ -3333,7 +3381,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (g_banditLoaded) {
             ProfilerDX12::CpuScope banditProfile(g_profiler, "Bandit Update");
             if (pendingTurretGunnerRespawn) {
-                pendingTurretGunnerRespawn = !SpawnHumveeTurretGunner();
+                pendingTurretGunnerRespawn =
+                    !(SpawnHumveeTurretGunner(0) && SpawnHumveeTurretGunner(1));
             }
             if (g_heldBandit && g_heldBandit->Dead()) g_heldBandit = nullptr;
             for (auto& bandit : g_bandits) {
@@ -3351,9 +3400,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 }
                 bandit->leftArmReach = g_banditLeftArmReach;
                 if (bandit->turretGunner) {
+                    const XMFLOAT3 mount = bandit->mountedVehicleIndex == 0
+                        ? HumveeTurretMountWorld()
+                        : XMFLOAT3{
+                            g_secondaryHumveePosition.x + g_humveeTurretLocal.x,
+                            g_humveeTurretLocal.y + 3.45f,
+                            g_secondaryHumveePosition.z + g_humveeTurretLocal.z };
                     bandit->UpdateMounted(
-                        deltaTime, HumveeTurretMountWorld(),
-                        g_drivingHumvee ? g_humveeAimPoint : scene.camera.Position);
+                        deltaTime, mount,
+                        (g_drivingHumvee && bandit->mountedVehicleIndex == 0)
+                            ? g_humveeAimPoint : scene.camera.Position);
                 } else {
                     float groundY = 0.0f;
                     if (scene.useMeshTerrain && g_terrain.supported) {
@@ -3371,7 +3427,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 const bool hasLineOfSight =
                     !bandit->NeedsLineOfSightCheck() ||
                     BanditHasLineOfSight(*bandit, scene.camera.Position);
-                const bool fired = !(g_drivingHumvee && bandit->turretGunner) &&
+                const bool fired = !(g_drivingHumvee && bandit->turretGunner &&
+                                     bandit->mountedVehicleIndex == 0) &&
                     bandit->TryFireAt(
                         deltaTime, scene.camera.Position, hasLineOfSight,
                         shotOrigin, shotDirection);
@@ -3918,7 +3975,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     g_banditModel = std::move(bm);
                     for (size_t i = 0; i < kBanditsOnScreen; ++i)
                         if (!SpawnBandit()) break;
-                    SpawnHumveeTurretGunner();
+                    SpawnHumveeTurretGunner(0);
+                    SpawnHumveeTurretGunner(1);
                     g_banditLoaded = true;
                     std::cout << "Bandit squad ready: " << LiveBanditCount()
                               << " live enemies\n";

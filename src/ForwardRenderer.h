@@ -37,7 +37,9 @@ extern std::shared_ptr<SceneNode> g_humveeShadowModel;
 extern std::shared_ptr<SceneNode> g_helicopterModel;
 extern DirectX::XMFLOAT3 g_helicopterPosition;
 DirectX::XMMATRIX HumveeWorldMatrix();
+DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
 DirectX::XMMATRIX HelicopterWorldMatrix();
+DirectX::XMMATRIX SecondaryHelicopterWorldMatrix();
 
 struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
@@ -792,6 +794,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     if (g_humveeModel) {
         DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
                       view, proj, lightSpace);
+        DrawSceneNode(g_humveeModel, shader, SecondaryHumveeWorldMatrix(),
+                      view, proj, lightSpace);
     }
 
     if (g_helicopterModel && scene.showHelicopter) {
@@ -803,6 +807,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         const bool meshShadersWereEnabled = g_useMeshShader;
         g_useMeshShader = false;
         DrawSceneNode(g_helicopterModel, shader, HelicopterWorldMatrix(),
+                      view, proj, lightSpace);
+        DrawSceneNode(g_helicopterModel, shader, SecondaryHelicopterWorldMatrix(),
                       view, proj, lightSpace);
         g_useMeshShader = meshShadersWereEnabled;
     }

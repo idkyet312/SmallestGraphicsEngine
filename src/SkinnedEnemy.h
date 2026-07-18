@@ -46,6 +46,7 @@ public:
     float             fireCooldown = 1.0f;
     int               spawnSlot = -1;
     bool              turretGunner = false;
+    int               mountedVehicleIndex = 0;
     int               burstShotsRemaining = 0;
 
     bool Init(const SkinnedModel& m) {
