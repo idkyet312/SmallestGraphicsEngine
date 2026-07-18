@@ -60,6 +60,8 @@ struct IdTechDrawItem {
     MeshPrimitive* primitive = nullptr;
     UINT visibilityMeshID = VB_INVALID_MESH;
     bool doubleSided = false;
+    bool alphaCutout = false;
+    bool alphaFromLuminance = false;
 };
 
 struct FrustumPlanes {
@@ -162,8 +164,7 @@ inline void AppendOpaqueMeshDrawItems(const std::shared_ptr<SceneMesh>& mesh,
     for (MeshPrimitive& primitive : mesh->primitives) {
             const std::shared_ptr<SceneMaterial>& material = primitive.material;
             const bool transparent = material && material->baseColorFactor.w < 0.999f;
-            const bool unsupportedMaterial = material && material->alphaCutout;
-            if (transparent || unsupportedMaterial || primitive.skinBuffer ||
+            if (transparent || primitive.skinBuffer ||
                 primitive.vertices.empty() || primitive.vbv.BufferLocation == 0)
                 continue;
             // Material baseColorFactor is already uploaded in VBMaterialData.
@@ -180,6 +181,9 @@ inline void AppendOpaqueMeshDrawItems(const std::shared_ptr<SceneMesh>& mesh,
             // that ownership contract in VB; otherwise Humvee/bin shells show
             // their opposite faces and look spatially flipped.
             item.doubleSided = true;
+            item.alphaCutout = material && material->alphaCutout &&
+                material->baseColorTexture != nullptr;
+            item.alphaFromLuminance = material && material->alphaFromLuminance;
             items.push_back(item);
     }
 }
@@ -664,9 +668,11 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
             : (item.isCube ? cubeMesh : planeMesh);
         if (item.visibilityMeshID == VB_INVALID_MESH) continue;
         UINT materialID = vb.RegisterMaterial(item.material.get());
+        const UINT flags = item.doubleSided ? 1u : 0u;
         UINT dc = vb.RegisterInstance(item.visibilityMeshID,
-            item.model, item.color, 0.0f, 0.5f, materialID);
+            item.model, item.color, 0.0f, 0.5f, materialID, flags);
         if (dc == UINT_MAX) continue;
+        item.materialId = materialID;
         registeredItems.push_back(item);
         dcIDs.push_back(dc);
     }
@@ -740,9 +746,9 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
             g_dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
             vb.SetVisPassMatrices(g_dx12.commandList.Get(), drawItems[i].model,
                 view, proj, lightSpace, shader, i);
-            vb.SetDrawCallID(g_dx12.commandList.Get(), dcIDs[i]);
-            vb.SetVisPassDoubleSided(g_dx12.commandList.Get(),
-                drawItems[i].doubleSided);
+            vb.SetVisPassDraw(g_dx12.commandList.Get(), dcIDs[i],
+                drawItems[i].materialId, drawItems[i].doubleSided,
+                drawItems[i].alphaCutout, drawItems[i].alphaFromLuminance);
             if (drawItems[i].primitive &&
                 drawItems[i].primitive->ibv.BufferLocation != 0) {
                 g_dx12.commandList->IASetIndexBuffer(&drawItems[i].primitive->ibv);
