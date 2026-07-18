@@ -19,6 +19,7 @@ class DepthOnlyShaderDX12 {
 public:
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipelineState;
+    ComPtr<ID3D12PipelineState> grassPipelineState;
     UploadBuffer<MatrixBufferDX12> matrixBuffer;
     UINT currentDrawCall = 0;
     bool loaded = false;
@@ -51,7 +52,7 @@ public:
             return false;
         }
 
-        D3D12_ROOT_PARAMETER rootParams[4] = {};
+        D3D12_ROOT_PARAMETER rootParams[6] = {};
         rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         rootParams[0].Descriptor.ShaderRegister = 0;
         rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -65,6 +66,13 @@ public:
         rootParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[3].Descriptor.ShaderRegister = 13;
         rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        rootParams[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rootParams[4].Constants.ShaderRegister = 6;
+        rootParams[4].Constants.Num32BitValues = 12;
+        rootParams[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        rootParams[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParams[5].Descriptor.ShaderRegister = 6;
+        rootParams[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
         rootSigDesc.NumParameters = _countof(rootParams);
@@ -116,6 +124,32 @@ public:
             return false;
         }
 
+        std::ifstream grassVsFile("shaders/grass_shadow_vs.hlsl");
+        if (!grassVsFile.is_open()) return false;
+        std::stringstream grassVsStream;
+        grassVsStream << grassVsFile.rdbuf();
+        const std::string grassVsCode = grassVsStream.str();
+        ComPtr<ID3DBlob> grassVsBlob;
+        errorBlob.Reset();
+        hr = D3DCompile(grassVsCode.c_str(), grassVsCode.length(),
+            "shaders/grass_shadow_vs.hlsl", nullptr,
+            D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "vs_5_0",
+            compileFlags, 0, &grassVsBlob, &errorBlob);
+        if (FAILED(hr)) {
+            if (errorBlob) std::cerr << "Grass shadow VS error: "
+                                     << (char*)errorBlob->GetBufferPointer() << std::endl;
+            return false;
+        }
+        D3D12_INPUT_ELEMENT_DESC grassInput[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+        };
+        psoDesc.InputLayout = { grassInput, _countof(grassInput) };
+        psoDesc.VS = { grassVsBlob->GetBufferPointer(), grassVsBlob->GetBufferSize() };
+        hr = g_dx12.device->CreateGraphicsPipelineState(
+            &psoDesc, IID_PPV_ARGS(&grassPipelineState));
+        if (FAILED(hr)) return false;
+
         if (!matrixBuffer.Create(FRAME_COUNT * SHADOW_MAX_DRAWS)) return false;
         loaded = true;
         return true;
@@ -152,6 +186,17 @@ public:
         }
     }
 
+    void UseGrass() {
+        g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
+        g_dx12.commandList->SetPipelineState(grassPipelineState.Get());
+    }
+
+    void SetGrass(const GrassField::Params& params,
+                  D3D12_GPU_VIRTUAL_ADDRESS instances) {
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(4, 12, &params, 0);
+        g_dx12.commandList->SetGraphicsRootShaderResourceView(5, instances);
+    }
+
     void NextDrawCall() {
         if (currentDrawCall + 1 < SHADOW_MAX_DRAWS) currentDrawCall++;
     }
@@ -180,9 +225,8 @@ inline void DrawSceneNodeShadow(const std::shared_ptr<SceneNode>& node,
             } else {
                 g_dx12.commandList->DrawInstanced((UINT)(prim.vertices.size() / 12), 1, 0, 0);
             }
+            shader.NextDrawCall();
         }
-
-        shader.NextDrawCall();
     }
 
     for (auto& child : node->children) {
@@ -318,9 +362,38 @@ public:
                                 HumveeWorldMatrix(), lightSpace);
         }
 
-        if (g_helicopterModel) {
-            DrawSceneNodeShadow(g_helicopterModel, depthShader,
-                                HelicopterWorldMatrix(), lightSpace);
+        // Sparse instanced blade silhouettes give grass a readable basic shadow
+        // without repeating the full-density 400k-blade forward pass.
+        if (g_grass.IsInitialized() && g_grass.CastShadows() &&
+            g_grass.ShadowDensity() > 0.0f && depthShader.grassPipelineState) {
+            g_grass.SetViewer(scene.camera.Position);
+            static std::vector<GrassField::DrawRange> grassShadowRanges;
+            g_grass.GetVisible(grassShadowRanges);
+            const auto& grassVbv = g_grass.GetVBV();
+            const auto& grassIbv = g_grass.GetIBV();
+            const auto instances = g_grass.GetInstanceBufferAddress();
+            if (!grassShadowRanges.empty() && grassVbv.BufferLocation && instances) {
+                depthShader.UseGrass();
+                // Pipeline/root signature must be bound before its b0 matrix;
+                // binding it afterward invalidates the light-space transform.
+                depthShader.SetMatrices(XMMatrixIdentity(), lightSpace);
+                g_dx12.commandList->IASetVertexBuffers(0, 1, &grassVbv);
+                g_dx12.commandList->IASetIndexBuffer(&grassIbv);
+                g_dx12.commandList->IASetPrimitiveTopology(
+                    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                GrassField::Params params = g_grass.GetParams();
+                for (const auto& range : grassShadowRanges) {
+                    params.firstBlade = range.firstInstance;
+                    depthShader.SetGrass(params, instances);
+                    const UINT sparseCount = static_cast<UINT>(
+                        range.instanceCount * g_grass.ShadowDensity());
+                    if (!sparseCount) continue;
+                    g_dx12.commandList->DrawIndexedInstanced(
+                        GrassField::IndexCount(), sparseCount, 0, 0, 0);
+                    depthShader.NextDrawCall();
+                }
+                depthShader.Use();
+            }
         }
 
         for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {

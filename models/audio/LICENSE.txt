@@ -27,6 +27,17 @@ License URL: https://creativecommons.org/publicdomain/zero/1.0/
 Downloaded July 17, 2026. Attribution is not legally required. Source and
 creator retained here for provenance.
 
+helicopter_hover_loop.mp3
+
+Title: Helicopter Rotor Loop.flac
+Creator: Iwan "qubodup" Gabovitch
+Source: https://freesound.org/people/qubodup/sounds/187681/
+License: CC0 1.0 Universal / Public Domain
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Downloaded July 18, 2026 from Freesound's HQ MP3 preview. Source describes
+the loop as extracted from a US Government work and released as CC0.
+
 bandit_spotted_01.wav, bandit_spotted_02.wav, bandit_attack.wav,
 bandit_death.wav, bandit_hit_voice.wav
 

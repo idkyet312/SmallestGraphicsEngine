@@ -440,7 +440,7 @@ public:
         rootParams[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         rootParams[8].Constants.ShaderRegister = 6;
         rootParams[8].Constants.RegisterSpace = 0;
-        rootParams[8].Constants.Num32BitValues = 9; // +1 for skinningEnabled
+        rootParams[8].Constants.Num32BitValues = 12;
         rootParams[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         rootParams[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[9].Descriptor.ShaderRegister = 6;

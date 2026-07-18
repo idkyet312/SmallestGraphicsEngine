@@ -152,6 +152,7 @@ struct Scene {
     float playerMaxHealth    = 100.0f;
     float playerHealth       = 100.0f;
     float playerDamageFlash  = 0.0f;
+    bool  playerGodMode      = false;
 
     // Grenade (press G): lobbed, arcs under gravity, radial blast on fuse.
     float grenadeThrowSpeed    = 16.0f;  // launch speed along aim
@@ -173,6 +174,7 @@ struct Scene {
 
     // NVIDIA Blast + Box3D destructible house
     bool  useDestruction = true;
+    bool  showHelicopter = true;   // draw + simulate the hovering attack heli
     bool  enableMSAA = true;
     bool  enableFXAA = false;
     int   destructionGridX = 4;
@@ -262,8 +264,26 @@ struct Scene {
         }
     }
 
+    void ResetLevelRuntimeState() {
+        projectiles.clear();
+        impactParticles.clear();
+        explosionFX.clear();
+        explosiveBarrels = {
+            {{ 4.6f, 3.25f,  4.6f}},
+            {{-4.6f, 3.25f,  4.6f}},
+            {{ 4.6f, 3.25f, -4.6f}},
+            {{-4.6f, 3.25f, -4.6f}},
+        };
+        fireCooldown = 0.0f;
+        muzzleFlashTime = 0.0f;
+        gunRecoilBack = 0.0f;
+        gunRecoilKick = 0.0f;
+        grenadeCooldown = 0.0f;
+        playerDamageFlash = 0.0f;
+    }
+
     void DamagePlayer(float damage) {
-        if (damage <= 0.0f || playerHealth <= 0.0f) return;
+        if (playerGodMode || damage <= 0.0f || playerHealth <= 0.0f) return;
         playerHealth = (std::max)(0.0f, playerHealth - damage);
         playerDamageFlash = 0.22f;
     }

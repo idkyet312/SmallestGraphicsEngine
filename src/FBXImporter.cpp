@@ -12,6 +12,8 @@
 #include <array>
 #include <cfloat>
 #include <functional>
+#include <cctype>
+#include <meshoptimizer.h>
 
 using namespace DirectX;
 namespace fs = std::filesystem;
@@ -69,59 +71,106 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
         return nullptr;
     };
     std::vector<fs::path> fallbackBaseColors;
+    std::unordered_map<std::string, fs::path> textureFiles;
     if (loadMaterials) {
         for (const auto& entry : fs::recursive_directory_iterator(base)) {
             const std::string name = entry.path().filename().string();
             const char* suffix = diffuseAndNormalOnly ? "_Diffuse." : "_BaseColor.";
-            if (entry.is_regular_file() && name.find(suffix) != std::string::npos)
+            if (!entry.is_regular_file()) continue;
+            std::string lowerName = name;
+            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            textureFiles.emplace(lowerName, entry.path());
+            if (name.find(suffix) != std::string::npos)
                 fallbackBaseColors.push_back(entry.path());
         }
         std::sort(fallbackBaseColors.begin(), fallbackBaseColors.end());
     }
+    // Assimp material indices are shared by meshes. Cache them here so a 4K
+    // texture is uploaded once, rather than once for every mesh using it.
+    std::vector<std::shared_ptr<SceneMaterial>> materialCache(scene->mNumMaterials);
+    auto getMaterial = [&](unsigned materialIndex) {
+        if (materialIndex >= scene->mNumMaterials)
+            return std::make_shared<SceneMaterial>();
+        auto& mat = materialCache[materialIndex];
+        if (mat) return mat;
+        mat = std::make_shared<SceneMaterial>();
+        const aiMaterial* am = scene->mMaterials[materialIndex];
+        aiString materialName;
+        if (am->Get(AI_MATKEY_NAME, materialName) == AI_SUCCESS)
+            mat->name = materialName.C_Str();
+        aiColor4D diffuse;
+        if (loadMaterials &&
+            aiGetMaterialColor(am, AI_MATKEY_COLOR_DIFFUSE, &diffuse) == AI_SUCCESS)
+            mat->baseColorFactor = XMFLOAT4(diffuse.r, diffuse.g, diffuse.b, diffuse.a);
+        aiString tex;
+        const bool hasBaseColor = loadMaterials && (diffuseAndNormalOnly
+            ? (am->GetTexture(aiTextureType_DIFFUSE, 0, &tex) == AI_SUCCESS && tex.length)
+            : ((am->GetTexture(aiTextureType_BASE_COLOR, 0, &tex) == AI_SUCCESS && tex.length) ||
+               (am->GetTexture(aiTextureType_DIFFUSE, 0, &tex) == AI_SUCCESS && tex.length)));
+        if (hasBaseColor)
+            mat->baseColorTexture = loadTexture(tex, mat->uploadHeaps);
+        if (loadMaterials &&
+            ((am->GetTexture(aiTextureType_NORMALS, 0, &tex) == AI_SUCCESS && tex.length) ||
+             (am->GetTexture(aiTextureType_HEIGHT, 0, &tex) == AI_SUCCESS && tex.length)))
+            mat->normalTexture = loadTexture(tex, mat->uploadHeaps);
+
+        if (loadMaterials && !mat->baseColorTexture && !fallbackBaseColors.empty()) {
+            const fs::path* color = nullptr;
+            std::string lowerMaterialName = mat->name;
+            std::transform(lowerMaterialName.begin(), lowerMaterialName.end(), lowerMaterialName.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            for (const fs::path& candidate : fallbackBaseColors) {
+                std::string stem = candidate.stem().string();
+                std::transform(stem.begin(), stem.end(), stem.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                const std::string suffix = diffuseAndNormalOnly ? "_diffuse" : "_basecolor";
+                if (stem.size() > suffix.size() &&
+                    stem.compare(stem.size() - suffix.size(), suffix.size(), suffix) == 0)
+                    stem.resize(stem.size() - suffix.size());
+                if (stem == lowerMaterialName) { color = &candidate; break; }
+            }
+            // OH-1's Glass/Lights materials intentionally stay untextured.
+            // Generic single-texture FBX assets retain their legacy fallback.
+            if (!color && !diffuseAndNormalOnly)
+                color = fallbackBaseColors.size() == 1
+                    ? &fallbackBaseColors.front()
+                    : &fallbackBaseColors[materialIndex % fallbackBaseColors.size()];
+            if (color) {
+                mat->baseColorTexture = GLBImporter::LoadTextureFromFile(
+                    color->string(), device, commandList, mat->uploadHeaps);
+                std::string normalName = color->filename().string();
+                const std::string colorSuffix = diffuseAndNormalOnly ? "_Diffuse" : "_BaseColor";
+                const size_t suffixPosition = normalName.find(colorSuffix);
+                if (suffixPosition != std::string::npos)
+                    normalName.replace(suffixPosition, colorSuffix.size(), "_Normal");
+                std::transform(normalName.begin(), normalName.end(), normalName.begin(),
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                const auto normal = textureFiles.find(normalName);
+                if (normal != textureFiles.end())
+                    mat->normalTexture = GLBImporter::LoadTextureFromFile(
+                        normal->second.string(), device, commandList, mat->uploadHeaps);
+            }
+        }
+        if (diffuseAndNormalOnly) {
+            mat->metallicFactor = 0.0f;
+            mat->roughnessFactor = 0.62f;
+            mat->metallicRoughnessTexture.Reset();
+        }
+        return mat;
+    };
     uint32_t plankId = 0;
+    size_t sourceHelicopterIndices = 0;
+    size_t lodHelicopterIndices = 0;
     for (unsigned mi = 0; mi < scene->mNumMeshes; ++mi) {
         const aiMesh* src = scene->mMeshes[mi];
+        // Dense cockpit switches and fixtures are enclosed by the fuselage and
+        // never resolve from the helicopter's gameplay altitude. The source
+        // mesh alone carries ~89k vertices and creates pure hidden overdraw.
+        if (preserveOH1Rotors && std::string(src->mName.C_Str()) == "Cockpit_Details")
+            continue;
         MeshPrimitive p;
-        auto mat = std::make_shared<SceneMaterial>();
-        if (loadMaterials && src->mMaterialIndex < scene->mNumMaterials) {
-            const aiMaterial* am = scene->mMaterials[src->mMaterialIndex];
-            aiColor4D diffuse;
-            if (aiGetMaterialColor(am, AI_MATKEY_COLOR_DIFFUSE, &diffuse) == AI_SUCCESS)
-                mat->baseColorFactor = XMFLOAT4(
-                    diffuse.r, diffuse.g, diffuse.b, diffuse.a);
-            aiString tex;
-            const bool hasBaseColor = diffuseAndNormalOnly
-                ? (am->GetTexture(aiTextureType_DIFFUSE, 0, &tex) == AI_SUCCESS && tex.length)
-                : ((am->GetTexture(aiTextureType_BASE_COLOR, 0, &tex) == AI_SUCCESS && tex.length) ||
-                   (am->GetTexture(aiTextureType_DIFFUSE, 0, &tex) == AI_SUCCESS && tex.length));
-            if (hasBaseColor) {
-                mat->baseColorTexture = loadTexture(tex, mat->uploadHeaps);
-            }
-            if ((am->GetTexture(aiTextureType_NORMALS, 0, &tex) == AI_SUCCESS && tex.length) ||
-                (am->GetTexture(aiTextureType_HEIGHT, 0, &tex) == AI_SUCCESS && tex.length))
-                mat->normalTexture = loadTexture(tex, mat->uploadHeaps);
-            if (diffuseAndNormalOnly) {
-                mat->metallicFactor = 0.0f;
-                mat->roughnessFactor = 0.62f;
-                mat->metallicRoughnessTexture.Reset();
-            }
-        }
-        if (loadMaterials && !mat->baseColorTexture && !fallbackBaseColors.empty()) {
-            const fs::path& color = fallbackBaseColors[mi % fallbackBaseColors.size()];
-            mat->baseColorTexture = GLBImporter::LoadTextureFromFile(color.string(), device, commandList, mat->uploadHeaps);
-            std::string normalName = color.filename().string();
-            const std::string colorSuffix = diffuseAndNormalOnly ? "_Diffuse" : "_BaseColor";
-            const size_t suffixPosition = normalName.find(colorSuffix);
-            if (suffixPosition != std::string::npos)
-                normalName.replace(suffixPosition, colorSuffix.size(), "_Normal");
-            for (const auto& entry : fs::recursive_directory_iterator(base)) {
-                if (entry.path().filename().string() == normalName) {
-                    mat->normalTexture = GLBImporter::LoadTextureFromFile(entry.path().string(), device, commandList, mat->uploadHeaps);
-                    break;
-                }
-            }
-        }
-        p.material = mat;
+        p.material = getMaterial(src->mMaterialIndex);
         aiMatrix3x3 normalTransform(meshTransforms[mi]);
         if (preserveOH1Rotors) normalTransform.Inverse().Transpose();
         const aiMatrix3x3 directionTransform(meshTransforms[mi]);
@@ -142,6 +191,26 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
         for (unsigned f=0; f<src->mNumFaces; ++f)
             for (unsigned i=0; i<src->mFaces[f].mNumIndices; ++i) p.indices.push_back(src->mFaces[f].mIndices[i]);
         if (p.indices.empty()) continue;
+
+        // This aircraft stays high above play space. Its authored density is
+        // invisible at that distance but is paid in both forward and shadow
+        // passes, so build a lightweight runtime LOD before GPU upload.
+        if (preserveOH1Rotors) {
+            sourceHelicopterIndices += p.indices.size();
+            if (p.indices.size() >= 3000) {
+                const size_t target = ((p.indices.size() * 15 / 100) / 3) * 3;
+                std::vector<unsigned int> simplified(p.indices.size());
+                const size_t count = meshopt_simplify(
+                    simplified.data(), p.indices.data(), p.indices.size(),
+                    p.vertices.data(), p.vertices.size() / 12,
+                    12 * sizeof(float), target, 0.020f, 0, nullptr);
+                if (count >= 3 && count < p.indices.size()) {
+                    simplified.resize(count);
+                    p.indices = std::move(simplified);
+                }
+            }
+            lodHelicopterIndices += p.indices.size();
+        }
 
         // Static FBX assets such as the replacement roof must retain their
         // authored topology. Splitting every connected component into random
@@ -480,6 +549,9 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
             }
         }
     }
+    if (preserveOH1Rotors)
+        std::cout << "OH-1 geometry LOD: " << sourceHelicopterIndices / 3
+                  << " -> " << lodHelicopterIndices / 3 << " triangles\n";
     root->UpdateGlobalTransform(root->localTransform);
     return root;
 }

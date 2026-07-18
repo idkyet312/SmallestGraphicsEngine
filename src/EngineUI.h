@@ -16,6 +16,9 @@
 struct RaytracingContext;
 extern RaytracingContext g_rt;
 extern ProfilerDX12 g_profiler;
+extern UINT g_forwardDrawCalls;
+extern UINT g_shadowDrawCalls;
+extern UINT g_visibilityDrawCalls;
 
 // Skinned Bandit enemy (defined in main.cpp) -- surfaced for debug readout.
 // BanditDebugText renders a one-line status; defined in main.cpp where the
@@ -128,6 +131,13 @@ inline void RenderPlayerHUD(const Scene& scene) {
     const ImGuiIO& io = ImGui::GetIO();
     ImDrawList* draw = ImGui::GetForegroundDrawList();
 
+    if (scene.playerGodMode) {
+        const char* god = "GOD MODE";
+        const ImVec2 size = ImGui::CalcTextSize(god);
+        draw->AddText(ImVec2((io.DisplaySize.x - size.x) * 0.5f, 24.0f),
+                      IM_COL32(255, 220, 65, 245), god);
+    }
+
     if (scene.playerHealth > 0.0f) {
         const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
         constexpr float gap = 3.0f;
@@ -193,6 +203,11 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     // number on screen that only shows up as a vague feeling of sluggishness.
     ImGui::Text("%.1f FPS  (%.2f ms)", ImGui::GetIO().Framerate,
                 1000.0f / ImGui::GetIO().Framerate);
+    const UINT totalDrawCalls = g_forwardDrawCalls + g_shadowDrawCalls +
+                                g_visibilityDrawCalls;
+    ImGui::Text("Draw calls: %u  (Forward %u, Shadow %u, Visibility %u)",
+                totalDrawCalls, g_forwardDrawCalls, g_shadowDrawCalls,
+                g_visibilityDrawCalls);
     if (ImGui::CollapsingHeader("CPU / GPU Profiler", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Text("CPU frame: %.2f ms", g_profiler.CpuFrameMs());
         for (const auto& sample : g_profiler.CpuSamples())
@@ -274,6 +289,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         }
         ImGui::DragFloat("Ambient",  &scene.ambientStrength,  0.01f, 0.0f, 1.0f);
         ImGui::DragFloat("Specular", &scene.specularStrength, 0.01f, 0.0f, 1.0f);
+        ImGui::Checkbox("Show Helicopter", &scene.showHelicopter);
         ImGui::Checkbox("Enable Shadows", &scene.enableShadows);
         if (scene.enableShadows) {
             ImGui::DragFloat("Shadow Bias", &scene.shadowBias, 0.0005f, 0.0f, 0.05f, "%.4f");
@@ -380,6 +396,19 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // distance shrinks the drawn ring. ~0.6 / 22 is a good perf preset.
         ImGui::SliderFloat("Density", &g_grass.Density(), 0.05f, 1.0f);
         ImGui::DragFloat("Draw Distance", &g_grass.DrawDistance(), 0.5f, 8.0f, 40.0f);
+        ImGui::SeparatorText("Grass Shadows");
+        ImGui::Checkbox("Cast Grass Shadows", &g_grass.CastShadows());
+        if (g_grass.CastShadows()) {
+            float shadowPercent = g_grass.ShadowDensity() * 100.0f;
+            if (ImGui::SliderFloat("Shadow Amount", &shadowPercent,
+                                   0.0f, 100.0f, "%.0f%%",
+                                   ImGuiSliderFlags_AlwaysClamp))
+                g_grass.ShadowDensity() = shadowPercent * 0.01f;
+            const size_t shadowBudget = static_cast<size_t>(
+                g_grass.PlantedCount() * g_grass.Density() *
+                g_grass.ShadowDensity());
+            ImGui::Text("Shadow blade budget: ~%zu", shadowBudget);
+        }
     }
 
     if (ImGui::CollapsingHeader("Destruction", ImGuiTreeNodeFlags_DefaultOpen)) {
