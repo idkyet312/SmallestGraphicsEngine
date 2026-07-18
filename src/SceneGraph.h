@@ -91,6 +91,9 @@ struct MeshPrimitive {
     UINT indexCount = 0;
     UINT meshletCount = 0;
     UINT skinVertexCount = 0; // >0 when this primitive carries skin data
+    // Set only after visibility geometry registration succeeds. Forward hybrid
+    // filtering checks this so capacity failures never make geometry disappear.
+    UINT visibilityMeshID = UINT_MAX;
     // CPU-side local bounds retained for conservative culling when this
     // primitive must use the conventional IA raster fallback.
     DirectX::XMFLOAT3 boundsMin = {};

@@ -3834,6 +3834,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     bool visibilityTestPending = false;
     UINT visibilityTestForwardFrames = 0;
     if (GetEnvironmentVariableA("SGE_VISIBILITY_TEST", nullptr, 0) > 0) {
+        char visibilityDebugMode[8] = {};
+        if (GetEnvironmentVariableA("SGE_VISIBILITY_DEBUG", visibilityDebugMode,
+                static_cast<DWORD>(sizeof(visibilityDebugMode))) > 0) {
+            visBuffer.debugViewMode = (std::max)(0, (std::min)(2,
+                atoi(visibilityDebugMode)));
+        }
         scene.useVisibilityBuffer = false;
         visibilityTestPending = true;
         emptyLevelAssetsLoaded = true;
@@ -4726,7 +4732,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             RenderIdTech(scene, mainShader, visBuffer, geo, packed,
                 lightSpace, shadowResource, &occlusionDepth,
-                hzbHistoryUsable, previousHZBViewProjection, floorMaterial);
+                hzbHistoryUsable, previousHZBViewProjection, floorMaterial,
+                (!g_emptyLevelMode && g_showH2Model) ? crateModel : nullptr);
             fogLightSpace = lightSpace;
             fogShadowResource = shadowResource;
             renderedForward = true;
@@ -4788,7 +4795,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             msaa.ResolveToBackBuffer();
         }
 
-        if (renderedForward && scene.enableVolumetricFog && volumetricFog.initialized) {
+        const bool visibilityValidation = usingVisibility && visBuffer.validationMode;
+        if (renderedForward && scene.enableVolumetricFog && volumetricFog.initialized &&
+            !visibilityValidation) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Volumetric Fog", g_dx12.commandList.Get());
             volumetricFog.Render(scene, fogLightSpace, fogShadowResource,
@@ -4803,7 +4812,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             occlusionDepth.PrepareCapture(g_dx12.commandList.Get());
         }
 
-        if (scene.enableFXAA && fxaa.initialized) {
+        if (scene.enableFXAA && fxaa.initialized && !visibilityValidation) {
             ProfilerDX12::Scope profile(g_profiler, "FXAA", g_dx12.commandList.Get());
             fxaa.Apply(g_dx12.commandList.Get());
         }
