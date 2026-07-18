@@ -145,6 +145,16 @@ static size_t ActiveBanditSlotCount() {
     return g_stressTestMode ? kBanditsOnScreen : 4 * kEnemiesPerSpawner;
 }
 
+static TerrainRendererDX12::Params CurrentTerrainParams() {
+    TerrainRendererDX12::Params params;
+    if (g_stressTestMode) {
+        params.tilesX = 32;
+        params.tilesZ = 32;
+        params.islandScale = 2.0f;
+    }
+    return params;
+}
+
 static size_t LiveBanditCount() {
     size_t count = 0;
     for (const auto& bandit : g_bandits)
@@ -373,7 +383,7 @@ static void UpdateHelicopter(float dt) {
 
         float groundY = 0.0f;
         if (scene.useMeshTerrain && g_terrain.supported) {
-            TerrainRendererDX12::Params params;
+            auto params = CurrentTerrainParams();
             params.heightScale = scene.terrainHeightScale;
             groundY = TerrainRendererDX12::HeightAt(
                 params, g_helicopterPosition.x, g_helicopterPosition.z);
@@ -613,7 +623,7 @@ static float PlayerFireInterval() {
 static bool HitTerrainSegment(const XMFLOAT3& start, const XMFLOAT3& end,
                               float radius, XMFLOAT3& hit) {
     if (!scene.useMeshTerrain || !g_terrain.supported) return false;
-    TerrainRendererDX12::Params params;
+    auto params = CurrentTerrainParams();
     params.heightScale = scene.terrainHeightScale;
     const float dx = end.x - start.x;
     const float dy = end.y - start.y;
@@ -933,7 +943,7 @@ static void UpdateExplosiveBarrels(float dt) {
             bool impact = false;
             XMFLOAT3 impactPoint = barrel.position;
             if (scene.useMeshTerrain && g_terrain.supported) {
-                TerrainRendererDX12::Params params;
+                auto params = CurrentTerrainParams();
                 params.heightScale = scene.terrainHeightScale;
                 const float ground = TerrainRendererDX12::HeightAt(
                     params, barrel.position.x, barrel.position.z);
@@ -1101,6 +1111,48 @@ static void ResetPalmTrees() {
     g_trees.Initialize();
     for (const PalmSpawn& palm : kPalmSpawns)
         g_trees.Plant(palm.x, palm.z, palm.height, palm.lean);
+}
+
+static bool g_environmentInitialized = false;
+static bool g_environmentStressMode = false;
+
+static void RebuildScalableEnvironment() {
+    auto terrainParams = CurrentTerrainParams();
+    terrainParams.heightScale = scene.terrainHeightScale;
+    auto terrainSampler = [terrainParams](float x, float z) {
+        return TerrainRendererDX12::HeightAt(terrainParams, x, z);
+    };
+    std::vector<NavigationObstacle> obstacles = {
+        { -4.2f,   5.8f,  4.2f,  12.2f },
+        {  5.8f,  -3.4f, 12.2f,   3.4f },
+        { -4.2f, -12.2f,  4.2f,  -5.8f },
+        {-12.2f,  -3.4f, -5.8f,   3.4f },
+        { -2.6f,  -1.5f,  2.6f,   1.5f },
+        {-29.0f, -27.0f,-15.0f, -13.0f }
+    };
+    if (g_stressTestMode) {
+        obstacles.insert(obstacles.end(), {
+            {37.8f,  5.8f, 46.2f, 12.2f},
+            {47.8f, -3.4f, 54.2f,  3.4f},
+            {37.8f,-12.2f, 46.2f, -5.8f},
+            {29.8f, -3.4f, 36.2f,  3.4f},
+            {39.4f,  1.5f, 44.6f,  4.5f}
+        });
+    }
+    for (const PalmSpawn& palm : kPalmSpawns)
+        obstacles.push_back(
+            { palm.x - 0.55f, palm.z - 0.55f,
+              palm.x + 0.55f, palm.z + 0.55f });
+    const float extent = g_stressTestMode ? 122.0f : 61.0f;
+    if (!g_navigation.BuildTerrain(terrainSampler, -extent, extent,
+            -extent, extent, obstacles))
+        std::cerr << "Recast navigation build failed; Bandits use direct steering\n";
+
+    g_grass.Initialize(terrainSampler,
+        g_stressTestMode ? 200.0f : 100.0f,
+        g_stressTestMode ? 1600000 : 400000, 0.0f);
+    g_environmentInitialized = true;
+    g_environmentStressMode = g_stressTestMode;
 }
 
 static void UpdateHelicopterHoverAudio() {
@@ -2528,8 +2580,8 @@ static bool CreateAllGeometry() {
     };
     if (!CreateVertexBuffer(cubeVerts, geo.cubeVertexBuffer, geo.cubeVBV)) return false;
 
-    float s = 128.0f;
-    float tile = 51.2f;
+    float s = 20.0f;
+    float tile = 8.0f;
     std::vector<VertexPosNormUV> planeVerts = {
         {{-s,0, s},{0,1,0},{0,0}}, {{ s,0, s},{0,1,0},{tile,0}}, {{ s,0,-s},{0,1,0},{tile,tile}},
         {{-s,0, s},{0,1,0},{0,0}}, {{ s,0,-s},{0,1,0},{tile,tile}}, {{-s,0,-s},{0,1,0},{0,tile}},
@@ -3231,7 +3283,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
     scene.grenadeGroundHeight = [](float x, float z) {
         if (!scene.useMeshTerrain || !g_terrain.supported) return 0.0f;
-        TerrainRendererDX12::Params params;
+        auto params = CurrentTerrainParams();
         params.heightScale = scene.terrainHeightScale;
         return TerrainRendererDX12::HeightAt(params, x, z);
     };
@@ -3343,6 +3395,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (g_rope.IsInitialized()) g_rope.Reset();
             if (g_gibbet.IsInitialized()) g_gibbet.Reset();
             if (g_trees.IsInitialized()) ResetPalmTrees();
+            if (g_environmentInitialized &&
+                g_environmentStressMode != g_stressTestMode)
+                RebuildScalableEnvironment();
             pendingLevelRuntimeReset = false;
             for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
                 if (!SpawnBandit()) break;
@@ -3359,7 +3414,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // Walking collision: ground level follows the mesh-shader terrain at
         // the camera's XZ so gravity settles the player onto the hills.
         if (scene.useMeshTerrain && g_terrain.supported) {
-            TerrainRendererDX12::Params terrainParams;
+            auto terrainParams = CurrentTerrainParams();
             terrainParams.heightScale = scene.terrainHeightScale;
             scene.camera.FloorY = TerrainRendererDX12::HeightAt(
                 terrainParams, scene.camera.Position.x, scene.camera.Position.z);
@@ -3399,7 +3454,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
             // Re-init rebuilds physics with a flat ground; restore the terrain
             // heightfield collider so debris keeps colliding with real ground.
-            TerrainRendererDX12::Params tp;
+            auto tp = CurrentTerrainParams();
             tp.heightScale = scene.terrainHeightScale;
             g_destruction.SetTerrainSampler([tp](float x, float z) {
                 return TerrainRendererDX12::HeightAt(tp, x, z);
@@ -3447,7 +3502,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 } else {
                     float groundY = 0.0f;
                     if (scene.useMeshTerrain && g_terrain.supported) {
-                        TerrainRendererDX12::Params tp;
+                        auto tp = CurrentTerrainParams();
                         tp.heightScale = scene.terrainHeightScale;
                         groundY = TerrainRendererDX12::HeightAt(
                             tp, bandit->position.x, bandit->position.z);
@@ -3842,7 +3897,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // gets the terrain height sampler so its rigid floor is the actual
             // sloped basin -- crates and debris collide with the terrain.
             {
-                TerrainRendererDX12::Params tp;
+                auto tp = CurrentTerrainParams();
                 tp.heightScale = scene.terrainHeightScale;
                 auto terrainSampler = [tp](float x, float z) {
                     return TerrainRendererDX12::HeightAt(tp, x, z);
@@ -3893,33 +3948,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_trees.SetTerrainSampler(terrainSampler);
                 ResetPalmTrees();
 
-                std::vector<NavigationObstacle> navigationObstacles = {
-                    { -4.2f,   5.8f,  4.2f,  12.2f }, // north house
-                    {  5.8f,  -3.4f, 12.2f,   3.4f }, // east house
-                    { -4.2f, -12.2f,  4.2f,  -5.8f }, // south house
-                    {-12.2f,  -3.4f, -5.8f,   3.4f }, // west house
-                    { -2.6f,  -1.5f,  2.6f,   1.5f }, // center Humvee
-                    {-29.0f, -27.0f,-15.0f, -13.0f }  // relocated pool basin
-                };
-                for (const PalmSpawn& p : kPalmSpawns)
-                    navigationObstacles.push_back(
-                        { p.x - 0.55f, p.z - 0.55f, p.x + 0.55f, p.z + 0.55f });
-                if (!g_navigation.BuildTerrain(
-                        terrainSampler, -122.0f, 122.0f, -122.0f, 122.0f,
-                        navigationObstacles)) {
-                    std::cerr << "Recast navigation build failed; Bandits use direct steering\n";
-                }
-
-                // Grass across the island, keyed off the same terrain height the
-                // ground is drawn from. Blades that would land in the sea, on the
-                // wet sand, or on a cliff face are rejected at build time, so the
-                // count below is an upper bound rather than the number planted.
-                // Blade budget over the island, clumped into tufts by GrassField.
-                // Only blades within GrassField's draw radius are simulated and
-                // drawn each frame, so this number sets the field's DENSITY -- how
-                // thick the grass is around the player -- rather than the per-frame
-                // cost, which the radius governs.
-                g_grass.Initialize(terrainSampler, 200.0f, 1600000, 0.0f);
+                RebuildScalableEnvironment();
             }
             // Same pool AABB for the destruction sim so house debris shoved into
             // the water floats too (surface at max.y).

@@ -506,7 +506,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     g_terrain.wireframe = scene.meshletWireframe;
 
     // Floor: mesh-shader tessellated terrain when available, flat plane otherwise.
-    XMMATRIX model = XMMatrixIdentity();
+    XMMATRIX model = (!scene.useMeshTerrain || !g_terrain.supported) &&
+        g_stressTestMode
+        ? XMMatrixScaling(6.4f, 1.0f, 6.4f)
+        : XMMatrixIdentity();
     shader.SetMatrices(model, view, proj, lightSpace);
     if (floorMaterial && floorMaterial->baseColorTexture) {
         shader.SetObjectMaterial(scene.floor.color,
@@ -526,6 +529,11 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     if (scene.useMeshTerrain && g_terrain.supported) {
         TerrainRendererDX12::Params terrainParams;
         terrainParams.heightScale = scene.terrainHeightScale;
+        if (g_stressTestMode) {
+            terrainParams.tilesX = 32;
+            terrainParams.tilesZ = 32;
+            terrainParams.islandScale = 2.0f;
+        }
         g_terrain.Draw(terrainParams);
         // Terrain used the mesh pipeline; restore the IA pipeline for the
         // raster draws that follow (same pattern as imported-model draws).
