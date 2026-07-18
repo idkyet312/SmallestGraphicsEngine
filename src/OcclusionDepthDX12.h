@@ -124,18 +124,11 @@ public:
         ThrowIfFailed(g_dx12.copyCommandList->Reset(
             g_dx12.copyAllocators[pendingFrame].Get(), nullptr));
 
-        D3D12_RESOURCE_BARRIER preBarriers[2] = {};
-        preBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        preBarriers[0].Transition.pResource = g_dx12.depthStencilBuffer.Get();
-        preBarriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-        preBarriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        preBarriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        preBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        preBarriers[1].Transition.pResource = previousDepth.Get();
-        preBarriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-        preBarriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        preBarriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        g_dx12.copyCommandList->ResourceBarrier(2, preBarriers);
+        // COPY command lists require cross-queue resources in COMMON. The copy
+        // implicitly promotes them to COPY_SOURCE/COPY_DEST and they decay back
+        // to COMMON when this command list completes. Explicit legacy barriers
+        // here produce invalid enhanced-barrier layouts on current drivers and
+        // can remove/hang the device under a heavy stress-test load.
         D3D12_TEXTURE_COPY_LOCATION destination = {};
         destination.pResource = previousDepth.Get();
         destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -147,12 +140,6 @@ public:
         g_dx12.copyCommandList->CopyTextureRegion(
             &destination, 0, 0, 0, &source, nullptr);
 
-        D3D12_RESOURCE_BARRIER postBarriers[2] = { preBarriers[0], preBarriers[1] };
-        postBarriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        postBarriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-        postBarriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        postBarriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-        g_dx12.copyCommandList->ResourceBarrier(2, postBarriers);
         ThrowIfFailed(g_dx12.copyCommandList->Close());
 
         ThrowIfFailed(g_dx12.copyQueue->Wait(
