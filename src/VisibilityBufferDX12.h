@@ -3,6 +3,7 @@
 
 #include "DX12Core.h"
 #include "ShaderDX12.h"
+#include <DirectXPackedVector.h>
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
@@ -93,7 +94,13 @@ struct alignas(256) VBPostConstants {
     UINT frameIndex;
     UINT historyValid;
     float taaFeedback;
-    float padding;
+    float motionBlurStrength;
+    float focusDistance;
+    float aperture;
+    float nearPlane;
+    float farPlane;
+    float padding0;
+    float padding1;
 };
 
 struct alignas(256) VBExposureConstants {
@@ -119,6 +126,8 @@ public:
     ComPtr<ID3D12Resource> motionTexture;
     ComPtr<ID3D12Resource> historyTextures[2];
     ComPtr<ID3D12Resource> exposureState;
+    ComPtr<ID3D12Resource> colorLUT;
+    ComPtr<ID3D12Resource> colorLUTUpload;
 
     // Visibility pass PSO + root signature
     ComPtr<ID3D12RootSignature> visPassRootSig;
@@ -181,6 +190,11 @@ public:
     bool temporalHistoryValid = false;
     bool exposureReadable = false;
     float exposureAdaptation = 0.05f;
+    float motionBlurStrength = 0.35f;
+    float focusDistance = 8.0f;
+    float aperture = 0.025f;
+    float currentNearPlane = 0.1f;
+    float currentFarPlane = 1000.0f;
 
     UINT width = 0;
     UINT height = 0;
@@ -192,6 +206,7 @@ public:
 
         if (!CreateVisBufferRT()) return false;
         if (!CreateOutputTexture()) return false;
+        if (!CreateColorLUT()) return false;
         if (!CreateStructuredBuffers()) return false;
         if (!CreateComputeDescriptorHeap()) return false;
         if (!CreateVisPassPipeline()) return false;
@@ -530,6 +545,8 @@ public:
                  float nearPlane, float farPlane,
                  const LightBufferDX12& lightData,
                  const PointLightsBufferDX12& pointLightData) {
+        currentNearPlane = nearPlane;
+        currentFarPlane = farPlane;
         // Transition HDR and motion-vector outputs to UAV.
         {
             D3D12_RESOURCE_BARRIER barriers[2] = {};
@@ -621,16 +638,6 @@ public:
             cmdList->ResourceBarrier(2, barriers);
         }
 
-        // Transition depth buffer back
-        {
-            D3D12_RESOURCE_BARRIER barrier = {};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = g_dx12.depthStencilBuffer.Get();
-            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            cmdList->ResourceBarrier(1, &barrier);
-        }
     }
 
     void UpdateExposure(ID3D12GraphicsCommandList* cmdList) {
@@ -705,6 +712,11 @@ public:
         constants.frameIndex = postFrameIndex++;
         constants.historyValid = (allowHistory && temporalHistoryValid) ? 1u : 0u;
         constants.taaFeedback = taaFeedback;
+        constants.motionBlurStrength = motionBlurStrength;
+        constants.focusDistance = focusDistance;
+        constants.aperture = aperture;
+        constants.nearPlane = currentNearPlane;
+        constants.farPlane = currentFarPlane;
         postConstantBuffer.CopyData(g_dx12.frameIndex, constants);
 
         cmdList->SetComputeRootSignature(postRootSig.Get());
@@ -715,7 +727,7 @@ public:
             postConstantBuffer.GetGPUAddress(g_dx12.frameIndex));
         D3D12_GPU_DESCRIPTOR_HANDLE table =
             postDescHeap->GetGPUDescriptorHandleForHeapStart();
-        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize * historyIndex * 6;
+        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize * historyIndex * 8;
         cmdList->SetComputeRootDescriptorTable(1, table);
         cmdList->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 
@@ -724,6 +736,13 @@ public:
         barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         cmdList->ResourceBarrier(2, barriers);
+        D3D12_RESOURCE_BARRIER depth = {};
+        depth.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        depth.Transition.pResource = g_dx12.depthStencilBuffer.Get();
+        depth.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        depth.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        depth.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &depth);
         temporalHistoryValid = true;
     }
 
@@ -960,6 +979,94 @@ private:
             reinterpret_cast<void**>(&mappedMaterials));
         if (FAILED(hr)) return false;
 
+        return true;
+    }
+
+    bool CreateColorLUT() {
+        constexpr UINT LUTSize = 16;
+        D3D12_RESOURCE_DESC texture = {};
+        texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        texture.Width = LUTSize;
+        texture.Height = LUTSize;
+        texture.DepthOrArraySize = LUTSize;
+        texture.MipLevels = 1;
+        texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texture.SampleDesc.Count = 1;
+        D3D12_HEAP_PROPERTIES defaultHeap = {};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        HRESULT hr = g_dx12.device->CreateCommittedResource(
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &texture,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&colorLUT));
+        if (FAILED(hr)) return false;
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+        UINT rows = 0;
+        UINT64 rowSize = 0;
+        UINT64 uploadSize = 0;
+        g_dx12.device->GetCopyableFootprints(
+            &texture, 0, 1, 0, &footprint, &rows, &rowSize, &uploadSize);
+        D3D12_RESOURCE_DESC buffer = {};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = uploadSize;
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES uploadHeap = {};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        hr = g_dx12.device->CreateCommittedResource(
+            &uploadHeap, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&colorLUTUpload));
+        if (FAILED(hr)) return false;
+
+        BYTE* mapped = nullptr;
+        D3D12_RANGE noRead = { 0, 0 };
+        hr = colorLUTUpload->Map(0, &noRead, reinterpret_cast<void**>(&mapped));
+        if (FAILED(hr)) return false;
+        mapped += footprint.Offset;
+        for (UINT z = 0; z < LUTSize; ++z) {
+            for (UINT y = 0; y < LUTSize; ++y) {
+                BYTE* row = mapped + (SIZE_T)z * footprint.Footprint.RowPitch * LUTSize
+                    + (SIZE_T)y * footprint.Footprint.RowPitch;
+                for (UINT x = 0; x < LUTSize; ++x) {
+                    float r = x / float(LUTSize - 1);
+                    float g = y / float(LUTSize - 1);
+                    float b = z / float(LUTSize - 1);
+                    float luma = r * 0.2126f + g * 0.7152f + b * 0.0722f;
+                    r = (std::min)(1.0f, (std::max)(0.0f,
+                        r * 1.035f + (1.0f - luma) * 0.012f));
+                    g = (std::min)(1.0f, (std::max)(0.0f, g * 1.005f));
+                    b = (std::min)(1.0f, (std::max)(0.0f,
+                        b * 0.975f + luma * 0.008f));
+                    row[x * 4 + 0] = (BYTE)roundf(r * 255.0f);
+                    row[x * 4 + 1] = (BYTE)roundf(g * 255.0f);
+                    row[x * 4 + 2] = (BYTE)roundf(b * 255.0f);
+                    row[x * 4 + 3] = 255;
+                }
+            }
+        }
+        colorLUTUpload->Unmap(0, nullptr);
+
+        D3D12_TEXTURE_COPY_LOCATION source = {};
+        source.pResource = colorLUTUpload.Get();
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = footprint;
+        D3D12_TEXTURE_COPY_LOCATION destination = {};
+        destination.pResource = colorLUT.Get();
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = 0;
+        g_dx12.commandList->CopyTextureRegion(
+            &destination, 0, 0, 0, &source, nullptr);
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = colorLUT.Get();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_dx12.commandList->ResourceBarrier(1, &barrier);
         return true;
     }
 
@@ -1526,13 +1633,13 @@ private:
 
         D3D12_DESCRIPTOR_RANGE ranges[2] = {};
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 4;
+        ranges[0].NumDescriptors = 6;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         ranges[1].NumDescriptors = 2;
         ranges[1].BaseShaderRegister = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 4;
+        ranges[1].OffsetInDescriptorsFromTableStart = 6;
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -1546,6 +1653,17 @@ private:
         D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
         rootDesc.NumParameters = 2;
         rootDesc.pParameters = params;
+        D3D12_STATIC_SAMPLER_DESC lutSampler = {};
+        lutSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        lutSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        lutSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        lutSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        lutSampler.ShaderRegister = 0;
+        lutSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        lutSampler.MinLOD = 0.0f;
+        lutSampler.MaxLOD = D3D12_FLOAT32_MAX;
+        rootDesc.NumStaticSamplers = 1;
+        rootDesc.pStaticSamplers = &lutSampler;
         ComPtr<ID3DBlob> rootBlob;
         hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1,
             &rootBlob, &errorBlob);
@@ -1561,7 +1679,7 @@ private:
         if (FAILED(hr)) return false;
 
         D3D12_DESCRIPTOR_HEAP_DESC heap = {};
-        heap.NumDescriptors = 12;
+        heap.NumDescriptors = 16;
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = g_dx12.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&postDescHeap));
@@ -1577,7 +1695,7 @@ private:
         for (UINT parity = 0; parity < 2; ++parity) {
             D3D12_CPU_DESCRIPTOR_HANDLE handle =
                 postDescHeap->GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (SIZE_T)descriptorSize * parity * 6;
+            handle.ptr += (SIZE_T)descriptorSize * parity * 8;
 
             D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
             srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -1601,6 +1719,21 @@ private:
             exposureSrv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
             g_dx12.device->CreateShaderResourceView(
                 exposureState.Get(), &exposureSrv, handle);
+            handle.ptr += descriptorSize;
+            D3D12_SHADER_RESOURCE_VIEW_DESC lutSrv = {};
+            lutSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            lutSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            lutSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            lutSrv.Texture3D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(colorLUT.Get(), &lutSrv, handle);
+            handle.ptr += descriptorSize;
+            D3D12_SHADER_RESOURCE_VIEW_DESC depthSrv = {};
+            depthSrv.Format = DXGI_FORMAT_R32_FLOAT;
+            depthSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            depthSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            depthSrv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(
+                g_dx12.depthStencilBuffer.Get(), &depthSrv, handle);
             handle.ptr += descriptorSize;
 
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
