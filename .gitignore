@@ -1,5 +1,6 @@
 # Build artifacts
 build/
+build-perf/
 *.exe
 *.obj
 *.o

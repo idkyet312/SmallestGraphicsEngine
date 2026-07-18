@@ -1,5 +1,6 @@
 #include "SkinnedFBXImporter.h"
 #include "GLBImporter.h"
+#include "StaticBufferDX12.h"
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
@@ -304,23 +305,9 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
 
         // Upload the parallel skin buffer (StructuredBuffer<SkinVertex> @ t13).
         const UINT skinBytes = (UINT)(p.skin.size() * sizeof(SkinVertex));
-        D3D12_HEAP_PROPERTIES heap = {}; heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC rd = {};
-        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd.Width = skinBytes; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
-        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (SUCCEEDED(device->CreateCommittedResource(
-                &heap, D3D12_HEAP_FLAG_NONE, &rd,
-                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                IID_PPV_ARGS(&p.skinBuffer)))) {
-            void* mapped = nullptr; D3D12_RANGE none{ 0, 0 };
-            if (SUCCEEDED(p.skinBuffer->Map(0, &none, &mapped))) {
-                memcpy(mapped, p.skin.data(), skinBytes);
-                p.skinBuffer->Unmap(0, nullptr);
-                p.skinVertexCount = (UINT)p.skin.size();
-            }
-        }
+        if (CreateStaticBufferDX12(device.Get(), p.skin.data(), skinBytes,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, p.skinBuffer))
+            p.skinVertexCount = (UINT)p.skin.size();
         root->mesh->primitives.push_back(std::move(p));
     }
 

@@ -84,6 +84,7 @@ set(HEADER_FILES
     src/DDGI_DX11.h
     src/DX11Core.h
     src/DX12Core.h
+    src/StaticBufferDX12.h
     src/ProfilerDX12.h
     src/GunAudio.h
     src/NavigationSystem.h
@@ -243,14 +244,14 @@ endif()
 source_group("Header Files" FILES ${HEADER_FILES})
 source_group("Shader Files" FILES ${SHADER_FILES})
 
-# Keep Release at the familiar build/GraphicEngine.exe path. Debug must use a
-# different path: sharing one EXE lets a Debug link overwrite Release, then an
-# incremental Release build incorrectly reports the newer Debug EXE up-to-date.
+# Keep each CMake build tree self-contained. The default tree still produces
+# build/GraphicEngine.exe; alternate trees produce their own executable instead
+# of overwriting or being locked by the default build.
 set_target_properties(GraphicEngine PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_SOURCE_DIR}/build/Debug"
-    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_SOURCE_DIR}/build"
-    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_SOURCE_DIR}/build/RelWithDebInfo"
-    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_SOURCE_DIR}/build/MinSizeRel"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_BINARY_DIR}/MinSizeRel"
 )
 
 # Copy shaders to build directory

@@ -25,6 +25,7 @@
 #include "GroundLevel.h"
 #include "ShaderDX12.h"
 #include "VisibilityBufferDX12.h"
+#include "StaticBufferDX12.h"
 #include "Scene.h"
 #include "ForwardRenderer.h"
 #include "IdTechRenderer.h"
@@ -1267,13 +1268,27 @@ static void RenderWinScreen(HWND hwnd) {
 }
 
 static std::string ResolveTexturePath(const char* relativePath) {
-    if (std::filesystem::exists(relativePath)) return relativePath;
-    std::string buildPath = std::string("build/") + relativePath;
-    if (std::filesystem::exists(buildPath)) return buildPath;
-    std::string parentPath = std::string("../") + relativePath;
-    if (std::filesystem::exists(parentPath)) return parentPath;
-    std::string parentBuildPath = std::string("../../build/") + relativePath;
-    if (std::filesystem::exists(parentBuildPath)) return parentBuildPath;
+    namespace fs = std::filesystem;
+    const fs::path requested(relativePath);
+    std::vector<fs::path> roots = { fs::current_path() };
+
+    wchar_t modulePath[MAX_PATH] = {};
+    const DWORD moduleLength = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    if (moduleLength > 0 && moduleLength < MAX_PATH)
+        roots.push_back(fs::path(modulePath).parent_path());
+
+    for (const fs::path& root : roots) {
+        const fs::path candidates[] = {
+            root / requested,
+            root / "build" / requested,
+            root.parent_path() / requested,
+            root.parent_path() / "build" / requested
+        };
+        for (const fs::path& candidate : candidates) {
+            if (fs::exists(candidate))
+                return fs::weakly_canonical(candidate).string();
+        }
+    }
     return relativePath;
 }
 
@@ -3738,9 +3753,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
 
         mainShader.BeginFrame();
+        g_meshShader.BeginFrame();
         g_meshShader.SetOcclusionDepth(
             occlusionDepth.GetGPUHandle(),
-            occlusionDepth.valid && !msaaActive && !msaaUsedLastFrame);
+            occlusionDepth.CanUseHistory(scene.camera.Position, scene.camera.Front) &&
+                !msaaActive && !msaaUsedLastFrame,
+            occlusionDepth.GetMipCount());
 
         if (gameScreen == GameScreen::Level1 && !crateLoadAttempted) {
             crateLoadAttempted = true;
@@ -3887,8 +3905,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 std::cerr << "Humvee FBX failed to load\n";
             }
 
+            const std::string helicopterModelPath =
+                ResolveTexturePath("models/OH-1_fbx/OH-1.fbx");
+            std::cout << "OH-1 asset: " << helicopterModelPath << "\n";
             g_helicopterModel = FBXImporter::Load(
-                "models/OH-1_fbx/OH-1.fbx",
+                helicopterModelPath,
                 g_dx12.device, g_dx12.commandList, 1.0f, false, true, true);
             if (g_helicopterModel) {
                 for (const auto& child : g_helicopterModel->children) {
@@ -3966,6 +3987,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (msaaActive) msaa.BindAndClear(cc);
             else ClearRenderTarget(cc);
             mainShader.BeginFrame();
+            g_meshShader.BeginFrame();
             // First Level 1 load is complete. Start timing after load/GPU waits,
             // not from menu click.
             levelTimerRunning = true;
@@ -3975,6 +3997,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // ?? render ??
         // Main menu draws only sky plus UI. Level geometry, weapons, enemies,
         // shadows, and particles are never submitted behind the menu.
+        // Loaders and destruction rebuilds enqueue immutable geometry in DEFAULT
+        // heaps. Record all copies before any pass consumes those resources.
+        FlushStaticBufferUploadsDX12(g_dx12.commandList.Get());
+
         if (gameScreen == GameScreen::Level1 && usingRaytracing) {
             ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());
             RenderRaytracing(scene);
@@ -4085,8 +4111,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_profiler.EndGpuFrame(g_dx12.commandList.Get());
         try { EndFrame(); }
         catch (const std::exception& e) {
+            const HRESULT removedReason = g_dx12.device
+                ? g_dx12.device->GetDeviceRemovedReason() : S_OK;
             g_profiler.EndCpuFrame();
-            std::cerr << "EndFrame: " << e.what() << "\n";
+            std::cerr << "EndFrame: " << e.what()
+                      << " deviceRemovedReason=0x" << std::hex
+                      << static_cast<unsigned long>(removedReason) << std::dec << "\n";
+            DumpDX12DebugMessages();
             break;
         }
         occlusionDepth.SubmitCopy();

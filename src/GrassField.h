@@ -45,6 +45,7 @@
 
 #include <DirectXMath.h>
 #include "DX12Core.h"
+#include "StaticBufferDX12.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -410,19 +411,17 @@ private:
         }
 
         const UINT vbSize = (UINT)sizeof(verts);
-        void* vbMapped = nullptr;
-        if (!MakeUploadBuffer(vbSize, m_vb, vbMapped)) return false;
-        std::memcpy(vbMapped, verts, vbSize);
-        m_vb->Unmap(0, nullptr);
+        if (!CreateStaticBufferDX12(g_dx12.device.Get(), verts, vbSize,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, m_vb))
+            return false;
         m_vbv.BufferLocation = m_vb->GetGPUVirtualAddress();
         m_vbv.SizeInBytes = vbSize;
         m_vbv.StrideInBytes = sizeof(GrassVertex);
 
         const UINT ibSize = (UINT)(idx.size() * sizeof(uint32_t));
-        void* ibMapped = nullptr;
-        if (!MakeUploadBuffer(ibSize, m_ib, ibMapped)) return false;
-        std::memcpy(ibMapped, idx.data(), ibSize);
-        m_ib->Unmap(0, nullptr);
+        if (!CreateStaticBufferDX12(g_dx12.device.Get(), idx.data(), ibSize,
+                D3D12_RESOURCE_STATE_INDEX_BUFFER, m_ib))
+            return false;
         m_ibv.BufferLocation = m_ib->GetGPUVirtualAddress();
         m_ibv.SizeInBytes = ibSize;
         m_ibv.Format = DXGI_FORMAT_R32_UINT;
@@ -444,28 +443,10 @@ private:
         }
 
         const UINT instSize = (UINT)(inst.size() * sizeof(BladeInstance));
-        void* instMapped = nullptr;
-        if (!MakeUploadBuffer(instSize, m_instances, instMapped)) return false;
-        std::memcpy(instMapped, inst.data(), instSize);
-        m_instances->Unmap(0, nullptr);
+        if (!CreateStaticBufferDX12(g_dx12.device.Get(), inst.data(), instSize,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, m_instances))
+            return false;
         return true;
-    }
-
-    static bool MakeUploadBuffer(UINT size, Microsoft::WRL::ComPtr<ID3D12Resource>& buffer,
-                                 void*& mapped) {
-        if (size == 0) return false;
-        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC bd = {};
-        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = size; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
-        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
-        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        HRESULT hr = g_dx12.device->CreateCommittedResource(
-            &hp, D3D12_HEAP_FLAG_NONE, &bd,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&buffer));
-        if (FAILED(hr)) return false;
-        D3D12_RANGE r = { 0, 0 };
-        return SUCCEEDED(buffer->Map(0, &r, &mapped));
     }
 
     // A blade must clear the waterline by this much to be planted, keeping grass

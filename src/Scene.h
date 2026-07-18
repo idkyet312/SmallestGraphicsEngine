@@ -175,8 +175,8 @@ struct Scene {
     // NVIDIA Blast + Box3D destructible house
     bool  useDestruction = true;
     bool  showHelicopter = true;   // draw + simulate the hovering attack heli
-    bool  enableMSAA = true;
-    bool  enableFXAA = false;
+    bool  enableMSAA = false;
+    bool  enableFXAA = true;
     int   destructionGridX = 4;
     int   destructionGridY = 3;
     int   destructionGridZ = 4;

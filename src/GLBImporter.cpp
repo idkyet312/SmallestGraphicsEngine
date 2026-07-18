@@ -8,6 +8,7 @@
 
 #include "GLBImporter.h"
 #include "MipGenerator.h"
+#include "StaticBufferDX12.h"
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -762,7 +763,12 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLB(const std::string& filepath, Com
     // Convert Meshes
     std::vector<std::shared_ptr<SceneMesh>> convertedMeshes;
     for (const auto& mesh : model.meshes) {
-        convertedMeshes.push_back(ProcessMesh(model, mesh, device.Get(), materials));
+        auto converted = ProcessMesh(model, mesh, device.Get(), materials);
+        if (converted) {
+            for (MeshPrimitive& primitive : converted->primitives)
+                BuildMeshletData(primitive, device.Get());
+        }
+        convertedMeshes.push_back(std::move(converted));
     }
 
     // Process Scene
@@ -803,36 +809,13 @@ static void CollectPrimitivesRelativeToRoot(
     }
 }
 
-static Microsoft::WRL::ComPtr<ID3D12Resource> CreateUploadBuffer(ID3D12Device* device, const void* data, UINT sizeBytes) {
+static Microsoft::WRL::ComPtr<ID3D12Resource> CreateStaticGeometryBuffer(
+    ID3D12Device* device, const void* data, UINT sizeBytes,
+    D3D12_RESOURCE_STATES finalState) {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     if (sizeBytes == 0) return resource;
-
-    D3D12_HEAP_PROPERTIES heapProps = {};
-    heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-    heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-    heapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-
-    D3D12_RESOURCE_DESC bufferDesc = {};
-    bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bufferDesc.Width = sizeBytes;
-    bufferDesc.Height = 1;
-    bufferDesc.DepthOrArraySize = 1;
-    bufferDesc.MipLevels = 1;
-    bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
-    bufferDesc.SampleDesc.Count = 1;
-    bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
-    HRESULT hr = device->CreateCommittedResource(
-        &heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-        IID_PPV_ARGS(&resource));
-    if (FAILED(hr)) return nullptr;
-
-    void* mapped;
-    resource->Map(0, nullptr, &mapped);
-    memcpy(mapped, data, sizeBytes);
-    resource->Unmap(0, nullptr);
+    if (!CreateStaticBufferDX12(device, data, sizeBytes, finalState, resource))
+        return {};
     return resource;
 }
 
@@ -841,7 +824,9 @@ bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* devic
     if (!device || primitive.vertices.empty()) return false;
 
     const UINT vbSize = (UINT)(primitive.vertices.size() * sizeof(float));
-    primitive.vertexBuffer = CreateUploadBuffer(device, primitive.vertices.data(), vbSize);
+    primitive.vertexBuffer = CreateStaticGeometryBuffer(device, primitive.vertices.data(), vbSize,
+        D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     if (!primitive.vertexBuffer) return false;
     primitive.vbv.BufferLocation = primitive.vertexBuffer->GetGPUVirtualAddress();
     primitive.vbv.SizeInBytes = vbSize;
@@ -849,7 +834,8 @@ bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* devic
 
     if (!primitive.indices.empty()) {
         const UINT ibSize = (UINT)(primitive.indices.size() * sizeof(unsigned int));
-        primitive.indexBuffer = CreateUploadBuffer(device, primitive.indices.data(), ibSize);
+        primitive.indexBuffer = CreateStaticGeometryBuffer(device, primitive.indices.data(), ibSize,
+            D3D12_RESOURCE_STATE_INDEX_BUFFER);
         if (!primitive.indexBuffer) return false;
         primitive.ibv.BufferLocation = primitive.indexBuffer->GetGPUVirtualAddress();
         primitive.ibv.SizeInBytes = ibSize;
@@ -921,19 +907,25 @@ bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* devic
 
     primitive.meshletCount = (UINT)meshlets.size();
     if (!meshlets.empty()) {
-        primitive.meshletDescBuffer = CreateUploadBuffer(device, meshlets.data(),
-            (UINT)(meshlets.size() * sizeof(MeshletDescDX12)));
-        primitive.meshletVertexIndexBuffer = CreateUploadBuffer(device, meshletVertexIndices.data(),
-            (UINT)(meshletVertexIndices.size() * sizeof(UINT)));
-        primitive.meshletTriangleBuffer = CreateUploadBuffer(device, meshletTriangles.data(),
-            (UINT)(meshletTriangles.size() * sizeof(UINT)));
-        primitive.meshletBoundsBuffer = CreateUploadBuffer(device, bounds.data(),
-            (UINT)(bounds.size() * sizeof(MeshletBoundsDX12)));
+        primitive.meshletDescBuffer = CreateStaticGeometryBuffer(device, meshlets.data(),
+            (UINT)(meshlets.size() * sizeof(MeshletDescDX12)),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        primitive.meshletVertexIndexBuffer = CreateStaticGeometryBuffer(device, meshletVertexIndices.data(),
+            (UINT)(meshletVertexIndices.size() * sizeof(UINT)),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        primitive.meshletTriangleBuffer = CreateStaticGeometryBuffer(device, meshletTriangles.data(),
+            (UINT)(meshletTriangles.size() * sizeof(UINT)),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        primitive.meshletBoundsBuffer = CreateStaticGeometryBuffer(device, bounds.data(),
+            (UINT)(bounds.size() * sizeof(MeshletBoundsDX12)),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     return true;
 }
 
-std::shared_ptr<SceneNode> GLBImporter::MergeSceneByMaterial(const std::shared_ptr<SceneNode>& modelRoot, ComPtr<ID3D12Device> device) {
+static std::shared_ptr<SceneNode> MergeSceneGeometry(
+    const std::shared_ptr<SceneNode>& modelRoot, ComPtr<ID3D12Device> device,
+    bool preserveMaterials) {
     if (!modelRoot) return nullptr;
 
     std::vector<std::pair<const MeshPrimitive*, XMMATRIX>> collected;
@@ -944,7 +936,8 @@ std::shared_ptr<SceneNode> GLBImporter::MergeSceneByMaterial(const std::shared_p
     std::vector<std::vector<std::pair<const MeshPrimitive*, XMMATRIX>>> buckets;
 
     for (auto& entry : collected) {
-        std::shared_ptr<SceneMaterial> mat = entry.first->material;
+        std::shared_ptr<SceneMaterial> mat = preserveMaterials
+            ? entry.first->material : nullptr;
         int bucketIdx = -1;
         for (size_t i = 0; i < materialOrder.size(); i++) {
             if (materialOrder[i] == mat) { bucketIdx = (int)i; break; }
@@ -1010,7 +1003,7 @@ std::shared_ptr<SceneNode> GLBImporter::MergeSceneByMaterial(const std::shared_p
             }
         }
 
-        BuildMeshletData(merged, device.Get());
+        GLBImporter::BuildMeshletData(merged, device.Get());
 
         mergedMesh->primitives.push_back(std::move(merged));
     }
@@ -1024,4 +1017,14 @@ std::shared_ptr<SceneNode> GLBImporter::MergeSceneByMaterial(const std::shared_p
     mergedRoot->UpdateGlobalTransform(mergedRoot->localTransform);
 
     return mergedRoot;
+}
+
+std::shared_ptr<SceneNode> GLBImporter::MergeSceneByMaterial(
+    const std::shared_ptr<SceneNode>& modelRoot, ComPtr<ID3D12Device> device) {
+    return MergeSceneGeometry(modelRoot, std::move(device), true);
+}
+
+std::shared_ptr<SceneNode> GLBImporter::MergeSceneForDepth(
+    const std::shared_ptr<SceneNode>& modelRoot, ComPtr<ID3D12Device> device) {
+    return MergeSceneGeometry(modelRoot, std::move(device), false);
 }
