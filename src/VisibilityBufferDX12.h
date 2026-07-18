@@ -7,8 +7,9 @@
 #include <sstream>
 #include <vector>
 
-// Maximum draw calls the visibility buffer supports per frame
-static const UINT VB_MAX_DRAW_CALLS = 512;
+// Instance IDs occupy a full uint in the visibility target. Keep this aligned
+// with ShaderDX12's per-frame matrix capacity.
+static const UINT VB_MAX_DRAW_CALLS = MAX_DRAW_CALLS_PER_FRAME;
 // Maximum total vertices across all draw calls
 static const UINT VB_MAX_VERTICES = 1024 * 1024;
 // Maximum total indices across all draw calls
@@ -22,12 +23,22 @@ struct VBDrawCallData {
     float      metalness;
     float      roughness;
     float      useNormalMap;
-    float      dcPad;
+    UINT       materialID;
     UINT       vertexOffset;
     UINT       indexOffset;
     UINT       indexCount;
     UINT       hasIndices;
 };
+
+struct VBMeshData {
+    UINT vertexOffset = 0;
+    UINT vertexCount = 0;
+    UINT indexOffset = 0;
+    UINT indexCount = 0;
+    UINT hasIndices = 0;
+};
+
+static const UINT VB_INVALID_MESH = UINT_MAX;
 
 // Must match the compute shader's PackedVertex (two float4s)
 struct VBPackedVertex {
@@ -50,7 +61,7 @@ struct alignas(256) VBFrameConstants {
 
 class VisibilityBufferDX12 {
 public:
-    // The visibility render target (R32_UINT)
+    // Full-width instance and primitive IDs (R32G32_UINT).
     ComPtr<ID3D12Resource> visBufferRT;
     ComPtr<ID3D12DescriptorHeap> visRtvHeap;    // RTV for visibility pass
     ComPtr<ID3D12DescriptorHeap> visSrvUavHeap; // SRV/UAV for compute resolve
@@ -87,9 +98,12 @@ public:
     std::vector<VBDrawCallData> cpuDrawCalls;
     std::vector<VBPackedVertex> cpuVertices;
     std::vector<UINT>           cpuIndices;
+    std::vector<VBMeshData>     meshes;
     UINT currentDrawCall = 0;
-    UINT currentVertexOffset = 0;
-    UINT currentIndexOffset = 0;
+    UINT persistentVertexCount = 0;
+    UINT persistentIndexCount = 0;
+    bool geometryUploaded = false;
+    bool geometryDirty = false;
 
     UINT width = 0;
     UINT height = 0;
@@ -118,21 +132,53 @@ public:
 
     void BeginFrame() {
         currentDrawCall = 0;
-        currentVertexOffset = 0;
-        currentIndexOffset = 0;
     }
 
-    // Register a draw call's geometry and material.
-    // vertices: interleaved float array (pos3, norm3, uv2) = 8 floats per vert
-    // Returns the drawCallID to pass to the visibility pass shader.
-    UINT RegisterDrawCall(const XMMATRIX& modelMatrix,
+    // Upload-once mesh registration. Instances reference this immutable geometry
+    // every frame instead of duplicating vertices per draw.
+    UINT RegisterMesh(const float* vertexData, UINT vertexCount,
+                      const UINT* indexData, UINT indexCount) {
+        if (!vertexData || vertexCount == 0 ||
+            persistentVertexCount + vertexCount > VB_MAX_VERTICES ||
+            persistentIndexCount + indexCount > VB_MAX_INDICES) {
+            return VB_INVALID_MESH;
+        }
+
+        VBMeshData mesh;
+        mesh.vertexOffset = persistentVertexCount;
+        mesh.vertexCount = vertexCount;
+        mesh.indexOffset = persistentIndexCount;
+        mesh.indexCount = indexCount;
+        mesh.hasIndices = (indexData && indexCount > 0) ? 1u : 0u;
+
+        for (UINT i = 0; i < vertexCount; ++i) {
+            const float* v = vertexData + i * 8;
+            VBPackedVertex& pv = cpuVertices[persistentVertexCount + i];
+            pv.d0 = XMFLOAT4(v[0], v[1], v[2], v[3]);
+            pv.d1 = XMFLOAT4(v[4], v[5], v[6], v[7]);
+        }
+        if (mesh.hasIndices) {
+            memcpy(cpuIndices.data() + persistentIndexCount, indexData,
+                   indexCount * sizeof(UINT));
+        }
+
+        persistentVertexCount += vertexCount;
+        persistentIndexCount += indexCount;
+        meshes.push_back(mesh);
+        geometryDirty = true;
+        return static_cast<UINT>(meshes.size() - 1);
+    }
+
+    // Register only mutable instance/material data for this frame.
+    UINT RegisterInstance(UINT meshID, const XMMATRIX& modelMatrix,
                           const XMFLOAT3& color, float metalness, float roughness,
-                          const float* vertexData, UINT vertexCount,
-                          const UINT* indexData, UINT indexCount) {
-        if (currentDrawCall >= VB_MAX_DRAW_CALLS) return 0;
+                          UINT materialID = 0) {
+        if (currentDrawCall >= VB_MAX_DRAW_CALLS || meshID >= meshes.size())
+            return UINT_MAX;
 
         UINT dcID = currentDrawCall;
         VBDrawCallData& dc = cpuDrawCalls[dcID];
+        const VBMeshData& mesh = meshes[meshID];
 
         XMMATRIX transposed = XMMatrixTranspose(modelMatrix);
         XMStoreFloat4x4(&dc.modelMatrix, transposed);
@@ -142,28 +188,11 @@ public:
         dc.metalness = metalness;
         dc.roughness = roughness;
         dc.useNormalMap = 0.0f;
-        dc.dcPad = 0.0f;
-        dc.vertexOffset = currentVertexOffset;
-        dc.indexOffset = currentIndexOffset;
-        dc.indexCount = indexCount;
-        dc.hasIndices = (indexData && indexCount > 0) ? 1 : 0;
-
-        // Pack vertices
-        for (UINT i = 0; i < vertexCount && (currentVertexOffset + i) < VB_MAX_VERTICES; i++) {
-            const float* v = vertexData + i * 8;
-            VBPackedVertex& pv = cpuVertices[currentVertexOffset + i];
-            pv.d0 = XMFLOAT4(v[0], v[1], v[2], v[3]); // pos.xyz, norm.x
-            pv.d1 = XMFLOAT4(v[4], v[5], v[6], v[7]); // norm.yz, uv.xy
-        }
-        currentVertexOffset += vertexCount;
-
-        // Copy indices
-        if (indexData && indexCount > 0) {
-            for (UINT i = 0; i < indexCount && (currentIndexOffset + i) < VB_MAX_INDICES; i++) {
-                cpuIndices[currentIndexOffset + i] = indexData[i];
-            }
-            currentIndexOffset += indexCount;
-        }
+        dc.materialID = materialID;
+        dc.vertexOffset = mesh.vertexOffset;
+        dc.indexOffset = mesh.indexOffset;
+        dc.indexCount = mesh.indexCount;
+        dc.hasIndices = mesh.hasIndices;
 
         currentDrawCall++;
         return dcID;
@@ -183,28 +212,41 @@ public:
                 drawCallUpload.Get(), 0, currentDrawCall * sizeof(VBDrawCallData));
         }
 
-        // Upload vertices
-        if (currentVertexOffset > 0) {
+        // Geometry changes only when a mesh is added. DEFAULT buffers stay SRVs
+        // between frames, eliminating per-instance vertex/index uploads.
+        if (geometryDirty && geometryUploaded) {
+            D3D12_RESOURCE_BARRIER geometryToCopy[2] = {};
+            for (UINT i = 0; i < 2; ++i) {
+                geometryToCopy[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                geometryToCopy[i].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                geometryToCopy[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                geometryToCopy[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            }
+            geometryToCopy[0].Transition.pResource = vertexDataBuffer.Get();
+            geometryToCopy[1].Transition.pResource = indexDataBuffer.Get();
+            cmdList->ResourceBarrier(2, geometryToCopy);
+        }
+
+        if (geometryDirty && persistentVertexCount > 0) {
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
             vertexDataUpload->Map(0, &readRange, &mapped);
-            memcpy(mapped, cpuVertices.data(), currentVertexOffset * sizeof(VBPackedVertex));
+            memcpy(mapped, cpuVertices.data(), persistentVertexCount * sizeof(VBPackedVertex));
             vertexDataUpload->Unmap(0, nullptr);
 
             cmdList->CopyBufferRegion(vertexDataBuffer.Get(), 0,
-                vertexDataUpload.Get(), 0, currentVertexOffset * sizeof(VBPackedVertex));
+                vertexDataUpload.Get(), 0, persistentVertexCount * sizeof(VBPackedVertex));
         }
 
-        // Upload indices
-        if (currentIndexOffset > 0) {
+        if (geometryDirty && persistentIndexCount > 0) {
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
             indexDataUpload->Map(0, &readRange, &mapped);
-            memcpy(mapped, cpuIndices.data(), currentIndexOffset * sizeof(UINT));
+            memcpy(mapped, cpuIndices.data(), persistentIndexCount * sizeof(UINT));
             indexDataUpload->Unmap(0, nullptr);
 
             cmdList->CopyBufferRegion(indexDataBuffer.Get(), 0,
-                indexDataUpload.Get(), 0, currentIndexOffset * sizeof(UINT));
+                indexDataUpload.Get(), 0, persistentIndexCount * sizeof(UINT));
         }
 
         // Barriers: transition structured buffers from copy dest to SRV
@@ -221,25 +263,29 @@ public:
         barriers[2] = barriers[0];
         barriers[2].Transition.pResource = indexDataBuffer.Get();
 
-        cmdList->ResourceBarrier(3, barriers);
+        UINT barrierCount = 1;
+        if (geometryDirty) {
+            barriers[1] = barriers[0];
+            barriers[1].Transition.pResource = vertexDataBuffer.Get();
+            barriers[2] = barriers[0];
+            barriers[2].Transition.pResource = indexDataBuffer.Get();
+            barrierCount = 3;
+            geometryUploaded = true;
+            geometryDirty = false;
+        }
+        cmdList->ResourceBarrier(barrierCount, barriers);
     }
 
     // Transition structured buffers back to copy dest for next frame
     void TransitionBuffersForUpload(ID3D12GraphicsCommandList* cmdList) {
-        D3D12_RESOURCE_BARRIER barriers[3] = {};
+        D3D12_RESOURCE_BARRIER barriers[1] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = drawCallBuffer.Get();
         barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-        barriers[1] = barriers[0];
-        barriers[1].Transition.pResource = vertexDataBuffer.Get();
-
-        barriers[2] = barriers[0];
-        barriers[2].Transition.pResource = indexDataBuffer.Get();
-
-        cmdList->ResourceBarrier(3, barriers);
+        cmdList->ResourceBarrier(1, barriers);
     }
 
     // Begin the visibility pass: clear VB RT, set render targets
@@ -253,18 +299,10 @@ public:
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         cmdList->ResourceBarrier(1, &barrier);
 
-        // Clear visibility buffer to 0xFFFFFFFF (no geometry)
+        // Zero means background. Stored instance IDs are biased by one.
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = visRtvHeap->GetCPUDescriptorHandleForHeapStart();
-        const float clearVal[4] = { (float)0xFFFFFFFF, 0.0f, 0.0f, 0.0f };
-        // For UINT targets, we need to use ClearUnorderedAccessViewUint or just clear to a UINT value.
-        // Actually for RTV with UINT format, ClearRenderTargetView with the correct bit pattern works.
-        // The bits of the float are reinterpreted as UINT. NaN float = 0xFFFFFFFF.
-        UINT clearUint[4] = { 0xFFFFFFFF, 0, 0, 0 };
-        // ClearRenderTargetView works for UINT formats if we pass the value as float bit-cast
-        float clearFloat[4];
-        memcpy(&clearFloat[0], &clearUint[0], sizeof(float));
-        clearFloat[1] = 0.0f; clearFloat[2] = 0.0f; clearFloat[3] = 0.0f;
-        cmdList->ClearRenderTargetView(rtvHandle, clearFloat, 0, nullptr);
+        const float clearValue[4] = {};
+        cmdList->ClearRenderTargetView(rtvHandle, clearValue, 0, nullptr);
 
         // Also clear main depth
         D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -476,18 +514,12 @@ private:
         desc.Height = height;
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
-        desc.Format = DXGI_FORMAT_R32_UINT;
+        desc.Format = DXGI_FORMAT_R32G32_UINT;
         desc.SampleDesc.Count = 1;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
         D3D12_CLEAR_VALUE clearValue = {};
-        clearValue.Format = DXGI_FORMAT_R32_UINT;
-        // Clear to 0xFFFFFFFF
-        UINT clearUint = 0xFFFFFFFF;
-        memcpy(&clearValue.Color[0], &clearUint, sizeof(float));
-        clearValue.Color[1] = 0.0f;
-        clearValue.Color[2] = 0.0f;
-        clearValue.Color[3] = 0.0f;
+        clearValue.Format = DXGI_FORMAT_R32G32_UINT;
 
         HRESULT hr = g_dx12.device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
@@ -507,7 +539,7 @@ private:
 
         // Create RTV
         D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
-        rtvDesc.Format = DXGI_FORMAT_R32_UINT;
+        rtvDesc.Format = DXGI_FORMAT_R32G32_UINT;
         rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         g_dx12.device->CreateRenderTargetView(visBufferRT.Get(), &rtvDesc,
             visRtvHeap->GetCPUDescriptorHandleForHeapStart());
@@ -697,7 +729,7 @@ private:
         psoDesc.SampleMask = UINT_MAX;
         psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         psoDesc.NumRenderTargets = 1;
-        psoDesc.RTVFormats[0] = DXGI_FORMAT_R32_UINT;
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R32G32_UINT;
         psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         psoDesc.SampleDesc.Count = 1;
 
@@ -891,10 +923,10 @@ private:
         UINT descSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
 
-        // [0] t0 - visBuffer SRV (R32_UINT)
+        // [0] t0 - visBuffer SRV (R32G32_UINT)
         {
             D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-            srvDesc.Format = DXGI_FORMAT_R32_UINT;
+            srvDesc.Format = DXGI_FORMAT_R32G32_UINT;
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srvDesc.Texture2D.MipLevels = 1;

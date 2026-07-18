@@ -1,5 +1,5 @@
 // Visibility Buffer - Pixel Shader
-// Writes (drawCallID << 23) | SV_PrimitiveID into a R32_UINT render target.
+// Writes full-width instance and primitive IDs into R32G32_UINT.
 // The drawCallID is supplied via a root constant.
 
 cbuffer VisBufferConstants : register(b1) {
@@ -14,8 +14,7 @@ struct PS_INPUT {
     uint   primitiveID : SV_PrimitiveID;
 };
 
-uint main(PS_INPUT input) : SV_Target0 {
-    // Pack: upper 9 bits = drawCallID (max 512), lower 23 bits = triangleID (max ~8M)
-    uint packed = ((drawCallID & 0x1FFu) << 23u) | (input.primitiveID & 0x7FFFFFu);
-    return packed;
+uint2 main(PS_INPUT input) : SV_Target0 {
+    // Zero is reserved for background so clears are exact and portable.
+    return uint2(drawCallID + 1u, input.primitiveID);
 }

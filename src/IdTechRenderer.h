@@ -1,11 +1,11 @@
 #ifndef IDTECH_RENDERER_H
 #define IDTECH_RENDERER_H
 
-// id Tech 8–style Visibility Buffer + Deferred hybrid.
+// id Tech 8â€“style Visibility Buffer + Deferred hybrid.
 //
-// Pass 1  – Visibility rasterisation (ultra-thin VS/PS, writes drawID|triID to R32_UINT)
-// Pass 2  – G-Buffer fill            (compute, reads VB + structured geometry ? writes compact G-Buffer)
-// Pass 3  – Deferred lighting         (compute, reads G-Buffer + clustered lights ? writes final colour)
+// Pass 1  â€“ Visibility rasterisation (ultra-thin VS/PS, writes drawID|triID to R32_UINT)
+// Pass 2  â€“ G-Buffer fill            (compute, reads VB + structured geometry ? writes compact G-Buffer)
+// Pass 3  â€“ Deferred lighting         (compute, reads G-Buffer + clustered lights ? writes final colour)
 //
 // The existing VisibilityBufferDX12 class handles Pass 1 + a single combined resolve.
 // Here we orchestrate the full frame using that class and populate the light upload
@@ -288,7 +288,7 @@ inline void FillMatrixBufferForIndirect(ShaderDX12& matrixShader, UINT drawIndex
     outCBV = matrixShader.matrixBuffer.GetGPUAddress(bufferIndex);
 }
 
-// Full id Tech–style frame.
+// Full id Techâ€“style frame.
 // Pass 1: Visibility rasterisation
 // Pass 2+3 (combined in visbuf_resolve_cs): G-Buffer fill + deferred lighting
 inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
@@ -306,19 +306,23 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     // Culling before visibility pass (frustum + backface + small triangle)
     CullAndBatchDrawItems(scene, view, proj, drawItems);
 
-    // Register geometry into VB structured buffers (batched order)
+    // Register immutable meshes once. Frames upload instance/material records only.
+    static UINT cubeMesh = VB_INVALID_MESH;
+    static UINT planeMesh = VB_INVALID_MESH;
+    if (cubeMesh == VB_INVALID_MESH)
+        cubeMesh = vb.RegisterMesh(packed.cubeFloats.data(),
+            (UINT)(packed.cubeFloats.size() / 8), nullptr, 0);
+    if (planeMesh == VB_INVALID_MESH)
+        planeMesh = vb.RegisterMesh(packed.planeFloats.data(),
+            (UINT)(packed.planeFloats.size() / 8), nullptr, 0);
+
     vb.BeginFrame();
     std::vector<UINT> dcIDs;
     dcIDs.reserve(drawItems.size());
 
-    UINT cubeVC = (UINT)(packed.cubeFloats.size() / 8);
-    UINT planeVC = (UINT)(packed.planeFloats.size() / 8);
-
     for (const auto& item : drawItems) {
-        UINT dc = vb.RegisterDrawCall(item.model, item.color, 0.0f, 0.5f,
-            item.isCube ? packed.cubeFloats.data() : packed.planeFloats.data(),
-            item.isCube ? cubeVC : planeVC,
-            nullptr, 0);
+        UINT dc = vb.RegisterInstance(item.isCube ? cubeMesh : planeMesh,
+            item.model, item.color, 0.0f, 0.5f, item.materialId);
         dcIDs.push_back(dc);
     }
 

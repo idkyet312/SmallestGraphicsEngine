@@ -56,7 +56,7 @@ struct DrawCallData {
     float    metalness;
     float    roughness;
     float    useNormalMap;
-    float    dcPad;
+    uint     materialID;
     uint     vertexOffset;  // offset into global vertex buffer
     uint     indexOffset;   // offset into global index buffer
     uint     indexCount;
@@ -75,7 +75,7 @@ struct PackedVertex {
 
 // ---- Resources ----
 
-Texture2D<uint>   visBuffer    : register(t0);
+Texture2D<uint2>  visBuffer    : register(t0);
 Texture2D<float>  depthBuffer  : register(t1);
 Texture2D<float4> shadowMapTex : register(t2);
 
@@ -185,17 +185,16 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         return;
     }
     
-    uint visValue = visBuffer.Load(int3(pixel, 0));
+    uint2 visValue = visBuffer.Load(int3(pixel, 0));
     
-    // 0xFFFFFFFF means no geometry was written (clear value)
-    if (visValue == 0xFFFFFFFFu) {
+    // Zero instance ID means no geometry was written.
+    if (visValue.x == 0u) {
         outputColor[pixel] = float4(0.1, 0.1, 0.1, 1.0); // background
         return;
     }
     
-    // Unpack
-    uint drawCallID = (visValue >> 23u) & 0x1FFu;
-    uint triangleID = visValue & 0x7FFFFFu;
+    uint drawCallID = visValue.x - 1u;
+    uint triangleID = visValue.y;
     
     // Load draw call data
     DrawCallData dc = drawCalls[drawCallID];
