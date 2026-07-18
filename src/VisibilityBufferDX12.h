@@ -23,6 +23,7 @@ static const UINT VB_MAX_LIGHTS_PER_CLUSTER = 32;
 // Must match the compute shader's DrawCallData
 struct VBDrawCallData {
     XMFLOAT4X4 modelMatrix;
+    XMFLOAT4X4 previousModelMatrix;
     XMFLOAT3   objectColor;
     float      useTexture;
     float      metalness;
@@ -63,6 +64,7 @@ struct alignas(256) VBFrameConstants {
     XMMATRIX projMatrix;
     XMMATRIX invViewProj;
     XMMATRIX lightViewProj;
+    XMMATRIX previousViewProj;
     XMFLOAT3 cameraPos;
     float    screenWidth;
     float    screenHeight;
@@ -79,6 +81,8 @@ struct alignas(256) VBPostConstants {
     float vignetteStrength;
     float grainStrength;
     UINT frameIndex;
+    UINT historyValid;
+    float taaFeedback;
     float padding;
 };
 
@@ -95,6 +99,8 @@ public:
     // Lighting stays HDR until the dedicated cinematic post pass.
     ComPtr<ID3D12Resource> outputTexture;
     ComPtr<ID3D12Resource> presentTexture;
+    ComPtr<ID3D12Resource> motionTexture;
+    ComPtr<ID3D12Resource> historyTextures[2];
 
     // Visibility pass PSO + root signature
     ComPtr<ID3D12RootSignature> visPassRootSig;
@@ -129,8 +135,10 @@ public:
     std::vector<VBPackedVertex> cpuVertices;
     std::vector<UINT>           cpuIndices;
     std::vector<VBClusterData>  cpuClusters;
+    std::vector<XMFLOAT4X4>     previousModels;
     std::vector<VBMeshData>     meshes;
     UINT currentDrawCall = 0;
+    UINT previousDrawCount = 0;
     UINT persistentVertexCount = 0;
     UINT persistentIndexCount = 0;
     bool geometryUploaded = false;
@@ -140,6 +148,8 @@ public:
     float bloomStrength = 0.12f;
     float vignetteStrength = 0.18f;
     float grainStrength = 0.012f;
+    float taaFeedback = 0.90f;
+    bool temporalHistoryValid = false;
 
     UINT width = 0;
     UINT height = 0;
@@ -164,6 +174,7 @@ public:
         cpuVertices.resize(VB_MAX_VERTICES);
         cpuIndices.resize(VB_MAX_INDICES);
         cpuClusters.resize(VB_CLUSTER_COUNT);
+        previousModels.resize(VB_MAX_DRAW_CALLS);
 
         initialized = true;
         std::cout << "Visibility Buffer initialized (" << width << "x" << height << ")" << std::endl;
@@ -171,6 +182,7 @@ public:
     }
 
     void BeginFrame() {
+        previousDrawCount = currentDrawCall;
         currentDrawCall = 0;
     }
 
@@ -230,6 +242,12 @@ public:
 
         XMMATRIX transposed = XMMatrixTranspose(modelMatrix);
         XMStoreFloat4x4(&dc.modelMatrix, transposed);
+        if (dcID < previousDrawCount) {
+            dc.previousModelMatrix = previousModels[dcID];
+        } else {
+            dc.previousModelMatrix = dc.modelMatrix;
+        }
+        previousModels[dcID] = dc.modelMatrix;
 
         dc.objectColor = color;
         dc.useTexture = 0.0f;
@@ -426,19 +444,23 @@ public:
     void Resolve(ID3D12GraphicsCommandList* cmdList,
                  const XMMATRIX& view, const XMMATRIX& proj,
                  const XMMATRIX& lightViewProj,
+                 const XMMATRIX& previousViewProj,
                  const XMFLOAT3& cameraPos,
                  float nearPlane, float farPlane,
                  const LightBufferDX12& lightData,
                  const PointLightsBufferDX12& pointLightData) {
-        // Transition output texture to UAV
+        // Transition HDR and motion-vector outputs to UAV.
         {
-            D3D12_RESOURCE_BARRIER barrier = {};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = outputTexture.Get();
-            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            cmdList->ResourceBarrier(1, &barrier);
+            D3D12_RESOURCE_BARRIER barriers[2] = {};
+            for (UINT i = 0; i < 2; ++i) {
+                barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            }
+            barriers[0].Transition.pResource = outputTexture.Get();
+            barriers[1].Transition.pResource = motionTexture.Get();
+            cmdList->ResourceBarrier(2, barriers);
         }
 
         // Also transition depth buffer to SRV for reading
@@ -459,6 +481,7 @@ public:
         XMMATRIX invVP = XMMatrixInverse(nullptr, view * proj);
         fc.invViewProj = XMMatrixTranspose(invVP);
         fc.lightViewProj = XMMatrixTranspose(lightViewProj);
+        fc.previousViewProj = XMMatrixTranspose(previousViewProj);
         fc.cameraPos = cameraPos;
         fc.screenWidth = (float)width;
         fc.screenHeight = (float)height;
@@ -503,15 +526,18 @@ public:
             cmdList->Dispatch(groupsX, groupsY, 1);
         }
 
-        // Keep linear HDR as an SRV for post processing.
+        // Keep linear HDR and motion vectors as SRVs for post processing.
         {
-            D3D12_RESOURCE_BARRIER barrier = {};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = outputTexture.Get();
-            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            cmdList->ResourceBarrier(1, &barrier);
+            D3D12_RESOURCE_BARRIER barriers[2] = {};
+            for (UINT i = 0; i < 2; ++i) {
+                barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            }
+            barriers[0].Transition.pResource = outputTexture.Get();
+            barriers[1].Transition.pResource = motionTexture.Get();
+            cmdList->ResourceBarrier(2, barriers);
         }
 
         // Transition depth buffer back
@@ -526,14 +552,18 @@ public:
         }
     }
 
-    void PostProcess(ID3D12GraphicsCommandList* cmdList) {
-        D3D12_RESOURCE_BARRIER barrier = {};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = presentTexture.Get();
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        cmdList->ResourceBarrier(1, &barrier);
+    void PostProcess(ID3D12GraphicsCommandList* cmdList, bool allowHistory) {
+        const UINT historyIndex = postFrameIndex & 1u;
+        D3D12_RESOURCE_BARRIER barriers[2] = {};
+        barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[0].Transition.pResource = presentTexture.Get();
+        barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[1] = barriers[0];
+        barriers[1].Transition.pResource = historyTextures[historyIndex].Get();
+        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        cmdList->ResourceBarrier(2, barriers);
 
         VBPostConstants constants = {};
         constants.outputWidth = width;
@@ -543,6 +573,8 @@ public:
         constants.vignetteStrength = vignetteStrength;
         constants.grainStrength = grainStrength;
         constants.frameIndex = postFrameIndex++;
+        constants.historyValid = (allowHistory && temporalHistoryValid) ? 1u : 0u;
+        constants.taaFeedback = taaFeedback;
         postConstantBuffer.CopyData(g_dx12.frameIndex, constants);
 
         cmdList->SetComputeRootSignature(postRootSig.Get());
@@ -551,13 +583,18 @@ public:
         cmdList->SetDescriptorHeaps(1, heaps);
         cmdList->SetComputeRootConstantBufferView(0,
             postConstantBuffer.GetGPUAddress(g_dx12.frameIndex));
-        cmdList->SetComputeRootDescriptorTable(1,
-            postDescHeap->GetGPUDescriptorHandleForHeapStart());
+        D3D12_GPU_DESCRIPTOR_HANDLE table =
+            postDescHeap->GetGPUDescriptorHandleForHeapStart();
+        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize * historyIndex * 5;
+        cmdList->SetComputeRootDescriptorTable(1, table);
         cmdList->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        cmdList->ResourceBarrier(1, &barrier);
+        barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        cmdList->ResourceBarrier(2, barriers);
+        temporalHistoryValid = true;
     }
 
     // Copy the resolved output to the back buffer
@@ -598,6 +635,10 @@ public:
         visBufferRT.Reset();
         outputTexture.Reset();
         presentTexture.Reset();
+        motionTexture.Reset();
+        historyTextures[0].Reset();
+        historyTextures[1].Reset();
+        temporalHistoryValid = false;
         visRtvHeap.Reset();
 
         CreateVisBufferRT();
@@ -682,6 +723,22 @@ private:
             std::cerr << "Failed to create VB present texture" << std::endl;
             return false;
         }
+
+        desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+        hr = g_dx12.device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+            IID_PPV_ARGS(&motionTexture));
+        if (FAILED(hr)) return false;
+
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        for (UINT i = 0; i < 2; ++i) {
+            hr = g_dx12.device->CreateCommittedResource(
+                &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&historyTextures[i]));
+            if (FAILED(hr)) return false;
+        }
         return true;
     }
 
@@ -740,7 +797,7 @@ private:
 
     bool CreateComputeDescriptorHeap() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-        heapDesc.NumDescriptors = 10;
+        heapDesc.NumDescriptors = 11;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         HRESULT hr = g_dx12.device->CreateDescriptorHeap(
@@ -928,9 +985,9 @@ private:
         ranges[0].RegisterSpace = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
 
-        // UAV u0
+        // UAVs u0..u1 (HDR + motion vectors)
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ranges[1].NumDescriptors = 1;
+        ranges[1].NumDescriptors = 2;
         ranges[1].BaseShaderRegister = 0;
         ranges[1].RegisterSpace = 0;
         ranges[1].OffsetInDescriptorsFromTableStart = 7;
@@ -940,7 +997,7 @@ private:
         ranges[2].NumDescriptors = 2;
         ranges[2].BaseShaderRegister = 1;
         ranges[2].RegisterSpace = 0;
-        ranges[2].OffsetInDescriptorsFromTableStart = 8;
+        ranges[2].OffsetInDescriptorsFromTableStart = 9;
 
         D3D12_ROOT_PARAMETER resolveParams[2] = {};
 
@@ -1150,8 +1207,18 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [8] b1 - light buffer CBV (placeholder, will be updated per frame)
-        // [9] b2 - point lights CBV (placeholder, will be updated per frame)
+        // [8] u1 - screen-space motion vectors
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+            uavDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+            uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            g_dx12.device->CreateUnorderedAccessView(
+                motionTexture.Get(), nullptr, &uavDesc, cpuHandle);
+            cpuHandle.ptr += descSize;
+        }
+
+        // [9] b1 - light buffer CBV (placeholder, will be updated per frame)
+        // [10] b2 - point lights CBV (placeholder, will be updated per frame)
         // These will be created in UpdateLightDescriptors
     }
 
@@ -1175,13 +1242,13 @@ private:
 
         D3D12_DESCRIPTOR_RANGE ranges[2] = {};
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 1;
+        ranges[0].NumDescriptors = 3;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ranges[1].NumDescriptors = 1;
+        ranges[1].NumDescriptors = 2;
         ranges[1].BaseShaderRegister = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 1;
+        ranges[1].OffsetInDescriptorsFromTableStart = 3;
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -1210,7 +1277,7 @@ private:
         if (FAILED(hr)) return false;
 
         D3D12_DESCRIPTOR_HEAP_DESC heap = {};
-        heap.NumDescriptors = 2;
+        heap.NumDescriptors = 10;
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = g_dx12.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&postDescHeap));
@@ -1223,22 +1290,36 @@ private:
         if (!postDescHeap) return;
         UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        D3D12_CPU_DESCRIPTOR_HANDLE handle =
-            postDescHeap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT parity = 0; parity < 2; ++parity) {
+            D3D12_CPU_DESCRIPTOR_HANDLE handle =
+                postDescHeap->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += (SIZE_T)descriptorSize * parity * 5;
 
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-        g_dx12.device->CreateShaderResourceView(outputTexture.Get(), &srv, handle);
-        handle.ptr += descriptorSize;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(outputTexture.Get(), &srv, handle);
+            handle.ptr += descriptorSize;
+            srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+            g_dx12.device->CreateShaderResourceView(motionTexture.Get(), &srv, handle);
+            handle.ptr += descriptorSize;
+            srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            g_dx12.device->CreateShaderResourceView(
+                historyTextures[parity ^ 1u].Get(), &srv, handle);
+            handle.ptr += descriptorSize;
 
-        D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
-        uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        g_dx12.device->CreateUnorderedAccessView(
-            presentTexture.Get(), nullptr, &uav, handle);
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            g_dx12.device->CreateUnorderedAccessView(
+                presentTexture.Get(), nullptr, &uav, handle);
+            handle.ptr += descriptorSize;
+            uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            g_dx12.device->CreateUnorderedAccessView(
+                historyTextures[parity].Get(), nullptr, &uav, handle);
+        }
     }
 
 public:
@@ -1247,7 +1328,7 @@ public:
                                 D3D12_GPU_VIRTUAL_ADDRESS pointLightsAddr) {
         UINT descSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
-        cpuHandle.ptr += 8 * descSize;
+        cpuHandle.ptr += 9 * descSize;
 
         // [7] b1 - light buffer CBV
         {
