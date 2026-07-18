@@ -96,6 +96,13 @@ struct alignas(256) VBPostConstants {
     float padding;
 };
 
+struct alignas(256) VBExposureConstants {
+    UINT inputWidth;
+    UINT inputHeight;
+    float adaptationRate;
+    float middleGray;
+};
+
 class VisibilityBufferDX12 {
 public:
     // Full-width instance and primitive IDs (R32G32_UINT).
@@ -111,6 +118,7 @@ public:
     ComPtr<ID3D12Resource> presentTexture;
     ComPtr<ID3D12Resource> motionTexture;
     ComPtr<ID3D12Resource> historyTextures[2];
+    ComPtr<ID3D12Resource> exposureState;
 
     // Visibility pass PSO + root signature
     ComPtr<ID3D12RootSignature> visPassRootSig;
@@ -122,6 +130,11 @@ public:
     ComPtr<ID3D12RootSignature> postRootSig;
     ComPtr<ID3D12PipelineState> postPSO;
     ComPtr<ID3D12DescriptorHeap> postDescHeap;
+    ComPtr<ID3D12RootSignature> exposureRootSig;
+    ComPtr<ID3D12PipelineState> exposureResetPSO;
+    ComPtr<ID3D12PipelineState> exposureAccumulatePSO;
+    ComPtr<ID3D12PipelineState> exposureFinalizePSO;
+    ComPtr<ID3D12DescriptorHeap> exposureDescHeap;
 
     // GPU-visible structured buffers
     ComPtr<ID3D12Resource> drawCallBuffer;       // StructuredBuffer<DrawCallData>
@@ -138,6 +151,7 @@ public:
     // Upload buffer for frame constants
     UploadBuffer<VBFrameConstants> frameConstantBuffer;
     UploadBuffer<VBPostConstants> postConstantBuffer;
+    UploadBuffer<VBExposureConstants> exposureConstantBuffer;
 
     // Descriptor heap for compute pass SRVs/UAVs
     ComPtr<ID3D12DescriptorHeap> computeDescHeap;
@@ -165,6 +179,8 @@ public:
     float grainStrength = 0.012f;
     float taaFeedback = 0.90f;
     bool temporalHistoryValid = false;
+    bool exposureReadable = false;
+    float exposureAdaptation = 0.05f;
 
     UINT width = 0;
     UINT height = 0;
@@ -181,9 +197,11 @@ public:
         if (!CreateVisPassPipeline()) return false;
         if (!CreateResolvePipeline()) return false;
         if (!CreatePostPipeline()) return false;
+        if (!CreateExposurePipeline()) return false;
 
         if (!frameConstantBuffer.Create(FRAME_COUNT)) return false;
         if (!postConstantBuffer.Create(FRAME_COUNT)) return false;
+        if (!exposureConstantBuffer.Create(FRAME_COUNT)) return false;
 
         cpuDrawCalls.resize(VB_MAX_DRAW_CALLS);
         cpuVertices.resize(VB_MAX_VERTICES);
@@ -615,6 +633,55 @@ public:
         }
     }
 
+    void UpdateExposure(ID3D12GraphicsCommandList* cmdList) {
+        if (exposureReadable) {
+            D3D12_RESOURCE_BARRIER transition = {};
+            transition.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            transition.Transition.pResource = exposureState.Get();
+            transition.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            transition.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            transition.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cmdList->ResourceBarrier(1, &transition);
+        }
+
+        VBExposureConstants constants = {};
+        constants.inputWidth = width;
+        constants.inputHeight = height;
+        constants.adaptationRate = exposureAdaptation;
+        constants.middleGray = 0.18f;
+        exposureConstantBuffer.CopyData(g_dx12.frameIndex, constants);
+
+        cmdList->SetComputeRootSignature(exposureRootSig.Get());
+        ID3D12DescriptorHeap* heaps[] = { exposureDescHeap.Get() };
+        cmdList->SetDescriptorHeaps(1, heaps);
+        cmdList->SetComputeRootConstantBufferView(0,
+            exposureConstantBuffer.GetGPUAddress(g_dx12.frameIndex));
+        cmdList->SetComputeRootDescriptorTable(1,
+            exposureDescHeap->GetGPUDescriptorHandleForHeapStart());
+
+        D3D12_RESOURCE_BARRIER uav = {};
+        uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav.UAV.pResource = exposureState.Get();
+        cmdList->SetPipelineState(exposureResetPSO.Get());
+        cmdList->Dispatch(1, 1, 1);
+        cmdList->ResourceBarrier(1, &uav);
+        cmdList->SetPipelineState(exposureAccumulatePSO.Get());
+        cmdList->Dispatch((width + 127) / 128, (height + 127) / 128, 1);
+        cmdList->ResourceBarrier(1, &uav);
+        cmdList->SetPipelineState(exposureFinalizePSO.Get());
+        cmdList->Dispatch(1, 1, 1);
+        cmdList->ResourceBarrier(1, &uav);
+
+        D3D12_RESOURCE_BARRIER transition = {};
+        transition.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        transition.Transition.pResource = exposureState.Get();
+        transition.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        transition.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        transition.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &transition);
+        exposureReadable = true;
+    }
+
     void PostProcess(ID3D12GraphicsCommandList* cmdList, bool allowHistory) {
         const UINT historyIndex = postFrameIndex & 1u;
         D3D12_RESOURCE_BARRIER barriers[2] = {};
@@ -648,7 +715,7 @@ public:
             postConstantBuffer.GetGPUAddress(g_dx12.frameIndex));
         D3D12_GPU_DESCRIPTOR_HANDLE table =
             postDescHeap->GetGPUDescriptorHandleForHeapStart();
-        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize * historyIndex * 5;
+        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize * historyIndex * 6;
         cmdList->SetComputeRootDescriptorTable(1, table);
         cmdList->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 
@@ -701,13 +768,16 @@ public:
         motionTexture.Reset();
         historyTextures[0].Reset();
         historyTextures[1].Reset();
+        exposureState.Reset();
         temporalHistoryValid = false;
+        exposureReadable = false;
         visRtvHeap.Reset();
 
         CreateVisBufferRT();
         CreateOutputTexture();
         UpdateComputeDescriptors();
         UpdatePostDescriptors();
+        UpdateExposureDescriptors();
     }
 
 private:
@@ -802,6 +872,21 @@ private:
                 IID_PPV_ARGS(&historyTextures[i]));
             if (FAILED(hr)) return false;
         }
+
+        D3D12_RESOURCE_DESC exposureDesc = {};
+        exposureDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        exposureDesc.Width = 3 * sizeof(UINT);
+        exposureDesc.Height = 1;
+        exposureDesc.DepthOrArraySize = 1;
+        exposureDesc.MipLevels = 1;
+        exposureDesc.SampleDesc.Count = 1;
+        exposureDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        exposureDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        hr = g_dx12.device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &exposureDesc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(&exposureState));
+        if (FAILED(hr)) return false;
         return true;
     }
 
@@ -1330,6 +1415,97 @@ private:
         // These will be created in UpdateLightDescriptors
     }
 
+    bool CreateExposurePipeline() {
+        std::ifstream file("shaders/visbuf_exposure_cs.hlsl");
+        if (!file.is_open()) return false;
+        std::stringstream stream;
+        stream << file.rdbuf();
+        const std::string source = stream.str();
+
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors = 1;
+        ranges[0].BaseShaderRegister = 0;
+        ranges[0].OffsetInDescriptorsFromTableStart = 0;
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors = 1;
+        ranges[1].BaseShaderRegister = 0;
+        ranges[1].OffsetInDescriptorsFromTableStart = 1;
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable.NumDescriptorRanges = 2;
+        params[1].DescriptorTable.pDescriptorRanges = ranges;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC root = {};
+        root.NumParameters = 2;
+        root.pParameters = params;
+        ComPtr<ID3DBlob> rootBlob, errors;
+        HRESULT hr = D3D12SerializeRootSignature(&root,
+            D3D_ROOT_SIGNATURE_VERSION_1, &rootBlob, &errors);
+        if (FAILED(hr)) return false;
+        hr = g_dx12.device->CreateRootSignature(0, rootBlob->GetBufferPointer(),
+            rootBlob->GetBufferSize(), IID_PPV_ARGS(&exposureRootSig));
+        if (FAILED(hr)) return false;
+
+        auto createPSO = [&](const char* entry,
+                             ComPtr<ID3D12PipelineState>& result) -> bool {
+            ComPtr<ID3DBlob> shader;
+            errors.Reset();
+            HRESULT compile = D3DCompile(source.data(), source.size(),
+                "visbuf_exposure_cs.hlsl", nullptr,
+                D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, "cs_5_0",
+                D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                0, &shader, &errors);
+            if (FAILED(compile)) {
+                if (errors) std::cerr << "VB exposure CS error: "
+                    << (char*)errors->GetBufferPointer() << std::endl;
+                return false;
+            }
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+            pso.pRootSignature = exposureRootSig.Get();
+            pso.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
+            return SUCCEEDED(g_dx12.device->CreateComputePipelineState(
+                &pso, IID_PPV_ARGS(&result)));
+        };
+        if (!createPSO("Reset", exposureResetPSO) ||
+            !createPSO("Accumulate", exposureAccumulatePSO) ||
+            !createPSO("Finalize", exposureFinalizePSO)) return false;
+
+        D3D12_DESCRIPTOR_HEAP_DESC heap = {};
+        heap.NumDescriptors = 2;
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = g_dx12.device->CreateDescriptorHeap(&heap,
+            IID_PPV_ARGS(&exposureDescHeap));
+        if (FAILED(hr)) return false;
+        UpdateExposureDescriptors();
+        return true;
+    }
+
+    void UpdateExposureDescriptors() {
+        if (!exposureDescHeap) return;
+        UINT size = g_dx12.cbvSrvUavDescriptorSize;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            exposureDescHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_SHADER_RESOURCE_VIEW_DESC hdr = {};
+        hdr.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        hdr.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        hdr.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        hdr.Texture2D.MipLevels = 1;
+        g_dx12.device->CreateShaderResourceView(outputTexture.Get(), &hdr, handle);
+        handle.ptr += size;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC state = {};
+        state.Format = DXGI_FORMAT_R32_TYPELESS;
+        state.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        state.Buffer.NumElements = 3;
+        state.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        g_dx12.device->CreateUnorderedAccessView(
+            exposureState.Get(), nullptr, &state, handle);
+    }
+
     bool CreatePostPipeline() {
         std::ifstream csFile("shaders/visbuf_post_cs.hlsl");
         if (!csFile.is_open()) return false;
@@ -1350,13 +1526,13 @@ private:
 
         D3D12_DESCRIPTOR_RANGE ranges[2] = {};
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 3;
+        ranges[0].NumDescriptors = 4;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         ranges[1].NumDescriptors = 2;
         ranges[1].BaseShaderRegister = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 3;
+        ranges[1].OffsetInDescriptorsFromTableStart = 4;
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -1385,7 +1561,7 @@ private:
         if (FAILED(hr)) return false;
 
         D3D12_DESCRIPTOR_HEAP_DESC heap = {};
-        heap.NumDescriptors = 10;
+        heap.NumDescriptors = 12;
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = g_dx12.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&postDescHeap));
@@ -1401,7 +1577,7 @@ private:
         for (UINT parity = 0; parity < 2; ++parity) {
             D3D12_CPU_DESCRIPTOR_HANDLE handle =
                 postDescHeap->GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (SIZE_T)descriptorSize * parity * 5;
+            handle.ptr += (SIZE_T)descriptorSize * parity * 6;
 
             D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
             srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -1416,6 +1592,15 @@ private:
             srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
             g_dx12.device->CreateShaderResourceView(
                 historyTextures[parity ^ 1u].Get(), &srv, handle);
+            handle.ptr += descriptorSize;
+            D3D12_SHADER_RESOURCE_VIEW_DESC exposureSrv = {};
+            exposureSrv.Format = DXGI_FORMAT_R32_TYPELESS;
+            exposureSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            exposureSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            exposureSrv.Buffer.NumElements = 3;
+            exposureSrv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            g_dx12.device->CreateShaderResourceView(
+                exposureState.Get(), &exposureSrv, handle);
             handle.ptr += descriptorSize;
 
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};

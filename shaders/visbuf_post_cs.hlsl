@@ -1,6 +1,7 @@
 Texture2D<float4> hdrInput : register(t0);
 Texture2D<float2> motionInput : register(t1);
 Texture2D<float4> historyInput : register(t2);
+ByteAddressBuffer exposureState : register(t3);
 RWTexture2D<float4> ldrOutput : register(u0);
 RWTexture2D<float4> historyOutput : register(u1);
 
@@ -103,7 +104,10 @@ void main(uint3 threadID : SV_DispatchThreadID) {
     if (any(pixel >= outputSize)) return;
     float3 hdr = TemporalResolve(pixel, hdrInput.Load(int3(pixel, 0)).rgb);
     historyOutput[pixel] = float4(hdr, 1.0);
-    float3 color = TonemapAgX((hdr + Bloom(pixel) * bloomStrength) * exposure);
+    float autoExposure = exposureState.Load(8) / 65536.0;
+    if (autoExposure <= 0.0) autoExposure = 1.0;
+    float3 color = TonemapAgX((hdr + Bloom(pixel) * bloomStrength)
+                              * exposure * autoExposure);
     const float3x3 grade = float3x3(
         1.035, 0.005, -0.015,
         0.000, 1.010,  0.000,

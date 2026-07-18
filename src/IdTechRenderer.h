@@ -672,6 +672,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         scene.camera.Position, scene.cameraNear, scene.cameraFar,
         dummyLB, dummyPL);
 
+    vb.UpdateExposure(g_dx12.commandList.Get());
     vb.PostProcess(g_dx12.commandList.Get(), useHZBOcclusion);
     vb.CopyToBackBuffer(g_dx12.commandList.Get());
     vb.TransitionBuffersForUpload(g_dx12.commandList.Get());
