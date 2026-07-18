@@ -15,6 +15,10 @@ cbuffer MeshDrawBuffer : register(b6) {
     uint screenWidth;
     uint screenHeight;
     uint skinningEnabled;   // 0 static, 1 apply bone palette
+    uint occlusionMipCount;
+    float modelMaxScale;
+    uint instanceCount;
+    uint instancingEnabled;
 };
 
 ByteAddressBuffer vertexData : register(t6);
@@ -33,6 +37,12 @@ StructuredBuffer<uint> meshletTriangles : register(t11);
 StructuredBuffer<float4x4> bonePalette : register(t12);
 struct SkinVtx { uint4 boneIndex; float4 boneWeight; };
 StructuredBuffer<SkinVtx> skinData : register(t13);
+struct MeshInstanceData {
+    float4x4 model;
+    float modelMaxScale;
+    float3 padding;
+};
+StructuredBuffer<MeshInstanceData> meshInstances : register(t14);
 
 struct Vertex {
     float3 position : POSITION;
@@ -62,7 +72,7 @@ Vertex LoadVertex(uint i) {
     return v;
 }
 
-struct MeshPayload { uint meshletIndices[32]; };
+struct MeshPayload { uint2 workItems[32]; };
 
 [outputtopology("triangle")]
 [numthreads(128, 1, 1)]
@@ -71,7 +81,10 @@ void MSMain(uint3 id : SV_GroupThreadID,
             in payload MeshPayload payloadData,
             out vertices OutVertex verts[64],
             out indices uint3 tris[124]) {
-    MeshletDesc meshlet = meshlets[payloadData.meshletIndices[groupID.x]];
+    uint2 workItem = payloadData.workItems[groupID.x];
+    MeshletDesc meshlet = meshlets[workItem.x];
+    float4x4 drawModel = instancingEnabled
+        ? meshInstances[workItem.y].model : model;
     SetMeshOutputCounts(meshlet.vertexCount, meshlet.triangleCount);
 
     if (id.x < meshlet.vertexCount) {
@@ -88,13 +101,13 @@ void MSMain(uint3 id : SV_GroupThreadID,
             v.normal = mul(v.normal, (float3x3)skinMat);
             v.tangent.xyz = mul(v.tangent.xyz, (float3x3)skinMat);
         }
-        float4 world = mul(float4(v.position, 1), model);
+        float4 world = mul(float4(v.position, 1), drawModel);
         float4 viewPosition = mul(world, view);
         verts[id.x].position = mul(viewPosition, projection);
         verts[id.x].fragPos = world.xyz;
-        verts[id.x].normal = normalize(mul(v.normal, (float3x3)model));
+        verts[id.x].normal = normalize(mul(v.normal, (float3x3)drawModel));
         verts[id.x].texCoord = v.uv;
-        verts[id.x].tangent = float4(normalize(mul(v.tangent.xyz, (float3x3)model)), v.tangent.w);
+        verts[id.x].tangent = float4(normalize(mul(v.tangent.xyz, (float3x3)drawModel)), v.tangent.w);
         verts[id.x].fragPosLightSpace = mul(world, lightSpaceMatrix);
     }
 

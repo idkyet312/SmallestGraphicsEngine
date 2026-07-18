@@ -14,6 +14,7 @@
 
 static const UINT SHADOW_MAP_SIZE = 2048;
 static const UINT SHADOW_MAX_DRAWS = 4096;
+static const UINT SHADOW_MAX_INSTANCES = 4096;
 
 class DepthOnlyShaderDX12 {
 public:
@@ -21,7 +22,11 @@ public:
     ComPtr<ID3D12PipelineState> pipelineState;
     ComPtr<ID3D12PipelineState> grassPipelineState;
     UploadBuffer<MatrixBufferDX12> matrixBuffer;
+    UploadBuffer<MeshInstanceDataDX12> instanceBuffer;
     UINT currentDrawCall = 0;
+    UINT currentInstance = 0;
+    UINT batchesThisFrame = 0;
+    UINT instancesThisFrame = 0;
     bool loaded = false;
 
     bool Load(const char* vertexPath) {
@@ -52,7 +57,7 @@ public:
             return false;
         }
 
-        D3D12_ROOT_PARAMETER rootParams[6] = {};
+        D3D12_ROOT_PARAMETER rootParams[8] = {};
         rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         rootParams[0].Descriptor.ShaderRegister = 0;
         rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -73,6 +78,13 @@ public:
         rootParams[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[5].Descriptor.ShaderRegister = 6;
         rootParams[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        rootParams[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rootParams[6].Constants.ShaderRegister = 7;
+        rootParams[6].Constants.Num32BitValues = 1;
+        rootParams[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        rootParams[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParams[7].Descriptor.ShaderRegister = 14;
+        rootParams[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
         rootSigDesc.NumParameters = _countof(rootParams);
@@ -151,12 +163,16 @@ public:
         if (FAILED(hr)) return false;
 
         if (!matrixBuffer.Create(FRAME_COUNT * SHADOW_MAX_DRAWS)) return false;
+        if (!instanceBuffer.Create(FRAME_COUNT * SHADOW_MAX_INSTANCES)) return false;
         loaded = true;
         return true;
     }
 
     void BeginFrame() {
         currentDrawCall = 0;
+        currentInstance = 0;
+        batchesThisFrame = 0;
+        instancesThisFrame = 0;
     }
 
     void Use() {
@@ -177,15 +193,42 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(0, matrixBuffer.GetGPUAddress(index));
         const UINT disabled = 0;
         g_dx12.commandList->SetGraphicsRoot32BitConstants(1, 1, &disabled, 0);
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(6, 1, &disabled, 0);
+        g_dx12.commandList->SetGraphicsRootShaderResourceView(7,
+            instanceBuffer.GetGPUAddress(
+                g_dx12.frameIndex * SHADOW_MAX_INSTANCES));
     }
 
     void SetSkinning(D3D12_GPU_VIRTUAL_ADDRESS palette, D3D12_GPU_VIRTUAL_ADDRESS skin) {
+        const UINT instanceDisabled = 0;
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(
+            6, 1, &instanceDisabled, 0);
         const UINT enabled = palette && skin ? 1u : 0u;
         g_dx12.commandList->SetGraphicsRoot32BitConstants(1, 1, &enabled, 0);
         if (enabled) {
             g_dx12.commandList->SetGraphicsRootShaderResourceView(2, palette);
             g_dx12.commandList->SetGraphicsRootShaderResourceView(3, skin);
         }
+    }
+
+    bool SetInstances(const std::vector<XMMATRIX>& models) {
+        if (models.size() < 2 ||
+            models.size() > SHADOW_MAX_INSTANCES - currentInstance) return false;
+        const UINT frameBase = g_dx12.frameIndex * SHADOW_MAX_INSTANCES;
+        const UINT first = currentInstance;
+        for (const XMMATRIX& model : models) {
+            MeshInstanceDataDX12 instance = {};
+            XMStoreFloat4x4(&instance.model, XMMatrixTranspose(model));
+            instanceBuffer.CopyData(frameBase + currentInstance, instance);
+            ++currentInstance;
+        }
+        const UINT enabled = 1;
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(6, 1, &enabled, 0);
+        g_dx12.commandList->SetGraphicsRootShaderResourceView(
+            7, instanceBuffer.GetGPUAddress(frameBase + first));
+        ++batchesThisFrame;
+        instancesThisFrame += static_cast<UINT>(models.size());
+        return true;
     }
 
     void UseGrass() {
@@ -234,6 +277,72 @@ inline void DrawSceneNodeShadow(const std::shared_ptr<SceneNode>& node,
     for (auto& child : node->children) {
         DrawSceneNodeShadow(child, shader, worldTransform, lightSpace);
     }
+}
+
+inline bool SceneNodeSupportsShadowInstancing(const std::shared_ptr<SceneNode>& node) {
+    if (!node) return false;
+    if (node->mesh) for (const auto& prim : node->mesh->primitives) {
+        if (!prim.vbv.BufferLocation || prim.skinBuffer ||
+            (prim.material && prim.material->baseColorFactor.w < 0.5f)) return false;
+    }
+    for (const auto& child : node->children)
+        if (!SceneNodeSupportsShadowInstancing(child)) return false;
+    return true;
+}
+
+inline void DrawSceneNodeShadowInstances(const std::shared_ptr<SceneNode>& node,
+                                         DepthOnlyShaderDX12& shader,
+                                         const std::vector<XMMATRIX>& worlds,
+                                         const XMMATRIX& lightSpace) {
+    if (!node || worlds.empty()) return;
+    if (worlds.size() < 2 || !SceneNodeSupportsShadowInstancing(node)) {
+        for (const XMMATRIX& world : worlds)
+            DrawSceneNodeShadow(node, shader, world, lightSpace);
+        return;
+    }
+
+    if (node->mesh) {
+        std::vector<XMMATRIX> models;
+        models.reserve(worlds.size());
+        const XMMATRIX local = XMLoadFloat4x4(&node->globalTransform);
+        for (const XMMATRIX& world : worlds) models.push_back(local * world);
+        for (const auto& prim : node->mesh->primitives) {
+            shader.SetMatrices(XMMatrixIdentity(), lightSpace);
+            if (!shader.SetInstances(models)) {
+                for (const XMMATRIX& model : models) {
+                    shader.SetMatrices(model, lightSpace);
+                    g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
+                    g_dx12.commandList->IASetPrimitiveTopology(
+                        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    if (prim.ibv.BufferLocation) {
+                        g_dx12.commandList->IASetIndexBuffer(&prim.ibv);
+                        g_dx12.commandList->DrawIndexedInstanced(
+                            prim.indexCount, 1, 0, 0, 0);
+                    } else {
+                        g_dx12.commandList->DrawInstanced(
+                            static_cast<UINT>(prim.vertices.size() / 12), 1, 0, 0);
+                    }
+                    shader.NextDrawCall();
+                }
+                continue;
+            }
+            g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
+            g_dx12.commandList->IASetPrimitiveTopology(
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            const UINT count = static_cast<UINT>(models.size());
+            if (prim.ibv.BufferLocation) {
+                g_dx12.commandList->IASetIndexBuffer(&prim.ibv);
+                g_dx12.commandList->DrawIndexedInstanced(
+                    prim.indexCount, count, 0, 0, 0);
+            } else {
+                g_dx12.commandList->DrawInstanced(
+                    static_cast<UINT>(prim.vertices.size() / 12), count, 0, 0);
+            }
+            shader.NextDrawCall();
+        }
+    }
+    for (const auto& child : node->children)
+        DrawSceneNodeShadowInstances(child, shader, worlds, lightSpace);
 }
 
 class ShadowMapDX12 {
@@ -367,13 +476,12 @@ public:
         }
 
         if (g_humveeModel) {
-            DrawSceneNodeShadow(g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,
-                                depthShader,
-                                HumveeWorldMatrix(), lightSpace);
+            std::vector<XMMATRIX> humveeTransforms = { HumveeWorldMatrix() };
             if (g_stressTestMode)
-                DrawSceneNodeShadow(
-                    g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,
-                    depthShader, SecondaryHumveeWorldMatrix(), lightSpace);
+                humveeTransforms.push_back(SecondaryHumveeWorldMatrix());
+            DrawSceneNodeShadowInstances(
+                g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,
+                depthShader, humveeTransforms, lightSpace);
         }
 
         // Sparse instanced blade silhouettes give grass a readable basic shadow
@@ -410,18 +518,21 @@ public:
             }
         }
 
-        for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
-            if (!barrel.active) continue;
-            if (g_explosiveBarrelModel) {
-                const XMMATRIX model = XMMatrixTranslation(
+        if (g_explosiveBarrelModel) {
+            std::vector<XMMATRIX> barrelTransforms;
+            barrelTransforms.reserve(scene.explosiveBarrels.size());
+            for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+                if (!barrel.active) continue;
+                barrelTransforms.push_back(XMMatrixTranslation(
                     barrel.position.x, barrel.position.y - 0.75f,
-                    barrel.position.z);
-                DrawSceneNodeShadow(g_explosiveBarrelShadowModel
-                                        ? g_explosiveBarrelShadowModel
-                                        : g_explosiveBarrelModel,
-                                    depthShader,
-                                    model, lightSpace);
-            } else {
+                    barrel.position.z));
+            }
+            DrawSceneNodeShadowInstances(
+                g_explosiveBarrelShadowModel
+                    ? g_explosiveBarrelShadowModel : g_explosiveBarrelModel,
+                depthShader, barrelTransforms, lightSpace);
+        } else for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+            if (barrel.active) {
                 const XMMATRIX model = XMMatrixScaling(1.6f, 1.5f, 1.6f) *
                     XMMatrixTranslation(barrel.position.x, barrel.position.y,
                                         barrel.position.z);

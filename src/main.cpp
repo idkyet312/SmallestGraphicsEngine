@@ -62,6 +62,8 @@ ProfilerDX12                g_profiler;
 UINT                        g_forwardDrawCalls = 0;
 UINT                        g_shadowDrawCalls = 0;
 UINT                        g_visibilityDrawCalls = 0;
+UINT                        g_shadowBatches = 0;
+UINT                        g_shadowBatchInstances = 0;
 MeshShaderDX12              g_meshShader;
 bool                        g_useMeshShader = false;
 TerrainRendererDX12         g_terrain;
@@ -1249,6 +1251,11 @@ static std::vector<ComPtr<ID3D12Resource>> g_muzzleFlashUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_fireUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_explosionUploadHeaps;
 static bool                 crateLoadAttempted = false;
+enum class LevelLoadStage { World, Vehicles, Helicopter, Bandits, Finalize, Complete };
+static LevelLoadStage       levelLoadStage = LevelLoadStage::Complete;
+static bool                 levelLoadingActive = false;
+static float                levelLoadingProgress = 0.0f;
+static const char*          levelLoadingLabel = "Preparing level...";
 
 static float lastX = SCR_WIDTH / 2.0f;
 static float lastY = SCR_HEIGHT / 2.0f;
@@ -1412,6 +1419,12 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false) {
         wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
     levelElapsedSeconds = 0.0f;
     levelTimerRunning = crateLoadAttempted;
+    if (!crateLoadAttempted) {
+        levelLoadStage = LevelLoadStage::World;
+        levelLoadingActive = true;
+        levelLoadingProgress = 0.05f;
+        levelLoadingLabel = "Preparing world...";
+    }
     scene.playerGodMode = godMode;
     scene.RestorePlayerHealth();
     scene.ResetLevelRuntimeState();
@@ -1474,6 +1487,8 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false) {
     firstMouse = true;
 }
 
+static void RenderLoadingScreen();
+
 static void RenderMainMenu(HWND hwnd) {
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     ImGui::GetBackgroundDrawList()->AddRectFilled(
@@ -1509,6 +1524,28 @@ static void RenderMainMenu(HWND hwnd) {
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("QUIT", ImVec2(300.0f, 42.0f)))
         PostQuitMessage(0);
+    ImGui::End();
+    if (levelLoadingActive) RenderLoadingScreen();
+}
+
+static void RenderLoadingScreen() {
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::GetBackgroundDrawList()->AddRectFilled(
+        ImVec2(0, 0), display, IM_COL32(4, 8, 12, 238));
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+        ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 150.0f), ImGuiCond_Always);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoInputs;
+    ImGui::Begin("Loading Level", nullptr, flags);
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+    const char* title = "LOADING LEVEL 1";
+    ImGui::SetCursorPosX((520.0f - ImGui::CalcTextSize(title).x) * 0.5f);
+    ImGui::TextUnformatted(title);
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    ImGui::TextDisabled("%s", levelLoadingLabel);
+    ImGui::ProgressBar(levelLoadingProgress, ImVec2(-1.0f, 24.0f));
     ImGui::End();
 }
 
@@ -3803,7 +3840,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_grass.Update(deltaTime);
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
-            g_destruction.Update(deltaTime);
+            {
+                ProfilerDX12::CpuScope profile(g_profiler, "Destruction Update");
+                g_destruction.Update(deltaTime);
+            }
             UpdateHumveeImpacts(deltaTime);
             UpdateHumveeChaseCamera(deltaTime);
             UpdateHumveeTurretAim(deltaTime);
@@ -4119,8 +4159,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 !msaaActive && !msaaUsedLastFrame,
             occlusionDepth.GetMipCount());
 
-        if (gameScreen == GameScreen::Level1 && !crateLoadAttempted) {
-            crateLoadAttempted = true;
+        if (gameScreen == GameScreen::Level1 && levelLoadingActive) {
+        if (levelLoadStage == LevelLoadStage::World) {
+            levelLoadingLabel = "Building world and destruction...";
             LoadFloorMudMaterial();
             std::cout << "Loading models/h2.glb...\n";
             crateModel = GLBImporter::LoadGLB("models/h2.glb", g_dx12.device, g_dx12.commandList);
@@ -4200,6 +4241,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 std::cerr << "Failed to load h2.glb, falling back to procedural cube\n";
             }
 
+            levelLoadStage = LevelLoadStage::Vehicles;
+            levelLoadingProgress = 0.35f;
+            levelLoadingLabel = "Loading weapons and vehicles...";
+        } else if (levelLoadStage == LevelLoadStage::Vehicles) {
+
             // The AK47 view model. Loaded here so its texture uploads land in the
             // same command list the flush below submits.
             GunModel::Load();
@@ -4233,6 +4279,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 std::cerr << "Humvee FBX failed to load\n";
             }
 
+            levelLoadStage = LevelLoadStage::Helicopter;
+            levelLoadingProgress = 0.58f;
+            levelLoadingLabel = "Loading helicopter...";
+        } else if (levelLoadStage == LevelLoadStage::Helicopter) {
+
             const std::string helicopterModelPath =
                 ResolveTexturePath("models/OH-1_fbx/OH-1.fbx");
             std::cout << "OH-1 asset: " << helicopterModelPath << "\n";
@@ -4256,6 +4307,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 std::cout << "Humvee dark green material ready\n";
             else
                 std::cerr << "Humvee dark green material failed\n";
+
+            levelLoadStage = LevelLoadStage::Bandits;
+            levelLoadingProgress = 0.76f;
+            levelLoadingLabel = "Loading characters and animation...";
+        } else if (levelLoadStage == LevelLoadStage::Bandits) {
 
             // Skinned Bandit enemy: mesh + walk/idle/run clips. Texture uploads
             // ride the same command list flushed just below.
@@ -4285,12 +4341,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
             }
 
+            levelLoadStage = LevelLoadStage::Finalize;
+            levelLoadingProgress = 0.92f;
+            levelLoadingLabel = "Finalizing GPU resources...";
+        } else if (levelLoadStage == LevelLoadStage::Finalize) {
+
             // Flush the load/mip-generation commands now and print any D3D12
             // validation errors before continuing, so mip-related bugs surface
             // immediately instead of silently corrupting later frames.
-            ThrowIfFailed(g_dx12.commandList->Close());
-            ID3D12CommandList* loadLists[] = { g_dx12.commandList.Get() };
-            g_dx12.commandQueue->ExecuteCommandLists(1, loadLists);
+            // Earlier stages were submitted as ordinary loading-screen frames.
+            // Drain them before mip generation and staging-resource release.
             WaitForGPU();
             g_mipGen.FlushPending();
             // Mip handoff is submitted by FlushPending. Wait once, then free
@@ -4300,27 +4360,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ReleaseMaterialUploadHeaps(g_humveeModel);
             ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
             ReleaseMaterialUploadHeaps(g_banditModel.node);
+            for (const auto& material : g_banditModel.materialKeepAlive)
+                if (material) material->uploadHeaps.clear();
             ReleaseMaterialUploadHeaps(crateModel);
             ReleaseMaterialUploadHeaps(wallModel);
             DumpDX12DebugMessages();
-            ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
-            ThrowIfFailed(g_dx12.commandList->Reset(g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
-            // Reset() drops all descriptor heap bindings and the RTV/DSV binding
-            // set by BeginFrame()/ClearRenderTarget() earlier this frame, so redo
-            // that setup (minus the PRESENT->RENDER_TARGET barrier, which only
-            // applies once - the target is already in RENDER_TARGET state).
-            ID3D12DescriptorHeap* mainHeaps[] = { g_dx12.cbvSrvUavHeap.Get(), g_dx12.samplerHeap.Get() };
-            g_dx12.commandList->SetDescriptorHeaps(2, mainHeaps);
-            g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
-            g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
-            if (msaaActive) msaa.BindAndClear(cc);
-            else ClearRenderTarget(cc);
-            mainShader.BeginFrame();
-            g_meshShader.BeginFrame();
             // First Level 1 load is complete. Start timing after load/GPU waits,
             // not from menu click.
+            crateLoadAttempted = true;
+            levelLoadStage = LevelLoadStage::Complete;
+            levelLoadingProgress = 1.0f;
+            levelLoadingLabel = "Ready";
+            levelLoadingActive = false;
             levelTimerRunning = true;
             lastTime = gameTimer.GetElapsed();
+        }
         }
 
         // ?? render ??
@@ -4330,13 +4384,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // heaps. Record all copies before any pass consumes those resources.
         FlushStaticBufferUploadsDX12(g_dx12.commandList.Get());
 
-        if (gameScreen == GameScreen::Level1 && usingRaytracing) {
+        if (gameScreen == GameScreen::Level1 && !levelLoadingActive &&
+            usingRaytracing) {
             ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());
             RenderRaytracing(scene);
-        } else if (gameScreen == GameScreen::Level1 && usingVisibility) {
+        } else if (gameScreen == GameScreen::Level1 && !levelLoadingActive &&
+                   usingVisibility) {
             ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
             RenderIdTech(scene, mainShader, visBuffer, geo, packed);
-        } else if (gameScreen == GameScreen::Level1) {
+        } else if (gameScreen == GameScreen::Level1 && !levelLoadingActive) {
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
@@ -4414,11 +4470,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_shadowDrawCalls = (!usingRaytracing && !usingVisibility &&
             scene.enableShadows && shadowMap.initialized && scene.lightType == 0)
             ? shadowMap.depthShader.currentDrawCall : 0;
+        g_shadowBatches = g_shadowDrawCalls
+            ? shadowMap.depthShader.batchesThisFrame : 0;
+        g_shadowBatchInstances = g_shadowDrawCalls
+            ? shadowMap.depthShader.instancesThisFrame : 0;
         g_visibilityDrawCalls = usingVisibility ? visBuffer.currentDrawCall : 0;
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-        if (gameScreen == GameScreen::MainMenu) {
+        if (levelLoadingActive) {
+            RenderLoadingScreen();
+        } else if (gameScreen == GameScreen::MainMenu) {
             RenderMainMenu(hwnd);
         } else if (gameScreen == GameScreen::WinScreen) {
             RenderWinScreen(hwnd);

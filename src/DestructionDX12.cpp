@@ -265,6 +265,8 @@ struct DestructionDX12::Impl {
     // Blast split. Keep the intact structure batched, then reuse authored chunk
     // meshes after topology changes instead of rebuilding meshlets in Update().
     bool renderBatchingEnabled = true;
+    uint64_t renderItemRebuildCount = 0;
+    uint64_t batchGeometryRebuildCount = 0;
     // True once the render items have been rebuilt at a moment when nothing was
     // moving -- i.e. they are up to date and can be left alone until something
     // changes. Cleared by anything that alters the scene (a break, a split, a new
@@ -1215,6 +1217,7 @@ struct DestructionDX12::Impl {
     }
 
     void RebuildRenderItems() {
+        ++renderItemRebuildCount;
         // Any direct rebuild (a bullet strike, a grenade, init) means the scene just
         // changed. Drop the "settled" latch so Update re-evaluates from scratch
         // rather than assuming its cached items are still good.
@@ -1273,6 +1276,7 @@ struct DestructionDX12::Impl {
             }
             BatchCacheEntry& cache = batchCache[runtime.get()];
             if (cache.chunkHash != hash || !cache.colourNode || !cache.shadowNode) {
+                ++batchGeometryRebuildCount;
                 retireBatch(cache);
                 auto root = std::make_shared<SceneNode>("DestructionActorBatch");
                 root->children.reserve(runtime->chunks.size());
@@ -2385,6 +2389,12 @@ std::vector<DestructionDebrisHazard> DestructionDX12::GetDangerousDebris(
 bool DestructionDX12::IsInitialized() const { return m && m->initialized; }
 uint32_t DestructionDX12::GetChunkCount() const { return m ? (uint32_t)m->chunks.size() : 0; }
 uint32_t DestructionDX12::GetActorCount() const { return m ? (uint32_t)m->actors.size() : 0; }
+uint64_t DestructionDX12::GetRenderItemRebuildCount() const {
+    return m ? m->renderItemRebuildCount : 0;
+}
+uint64_t DestructionDX12::GetBatchGeometryRebuildCount() const {
+    return m ? m->batchGeometryRebuildCount : 0;
+}
 const std::vector<DestructionRenderItem>& DestructionDX12::GetRenderItems() const { return m->renderItems; }
 const std::vector<DestructionRenderBatch>& DestructionDX12::GetRenderBatches() const { return m->renderBatches; }
 const std::vector<RagdollRenderItem>& DestructionDX12::GetRagdollRenderItems() const { return m->ragdollRenderItems; }

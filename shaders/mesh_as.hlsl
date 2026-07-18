@@ -19,6 +19,8 @@ cbuffer MeshDrawBuffer : register(b6) {
     uint skinningEnabled;   // skinned meshlet bounds are bind-pose -> skip cull
     uint occlusionMipCount;
     float modelMaxScale;
+    uint instanceCount;
+    uint instancingEnabled;
 };
 
 cbuffer CameraBuffer : register(b2) {
@@ -39,14 +41,20 @@ struct MeshletBounds {
 
 StructuredBuffer<MeshletBounds> meshletBounds : register(t8);
 Texture2D<float> previousDepth : register(t9);
-struct MeshPayload { uint meshletIndices[32]; };
+struct MeshInstanceData {
+    float4x4 model;
+    float modelMaxScale;
+    float3 padding;
+};
+StructuredBuffer<MeshInstanceData> meshInstances : register(t14);
+struct MeshPayload { uint2 workItems[32]; };
 
 groupshared MeshPayload payloadData;
 groupshared uint visibleCount;
 
-bool IntersectsFrustum(MeshletBounds bounds) {
-    float4 clipCenter = mul(float4(bounds.sphereCenter, 1), modelViewProjection);
-    float radius = bounds.sphereRadius * modelMaxScale;
+bool IntersectsFrustum(MeshletBounds bounds, float4x4 drawMVP, float drawScale) {
+    float4 clipCenter = mul(float4(bounds.sphereCenter, 1), drawMVP);
+    float radius = bounds.sphereRadius * drawScale;
     float radiusX = radius * abs(projection[0][0]);
     float radiusY = radius * abs(projection[1][1]);
     // Inflate depth radius because perspective changes both clip z and w.
@@ -59,22 +67,23 @@ bool IntersectsFrustum(MeshletBounds bounds) {
            clipCenter.z - radiusZ <= clipCenter.w + radiusZ;
 }
 
-bool IsBackfacing(MeshletBounds bounds) {
+bool IsBackfacing(MeshletBounds bounds, float4x4 drawModel, float drawScale) {
     if (bounds.coneCutoff < 0.0) return false;
-    float3 worldCenter = mul(float4(bounds.sphereCenter, 1), model).xyz;
-    float3 axis = normalize(mul(bounds.coneAxis, (float3x3)model));
+    float3 worldCenter = mul(float4(bounds.sphereCenter, 1), drawModel).xyz;
+    float3 axis = normalize(mul(bounds.coneAxis, (float3x3)drawModel));
     float3 toCenter = worldCenter - viewPos;
     return dot(toCenter, axis) >=
-           bounds.coneCutoff * length(toCenter) + bounds.sphereRadius * modelMaxScale;
+           bounds.coneCutoff * length(toCenter) + bounds.sphereRadius * drawScale;
 }
 
-bool IsOccluded(MeshletBounds bounds) {
+bool IsOccluded(MeshletBounds bounds, float4x4 drawModelView,
+                float4x4 drawMVP, float drawScale) {
     if (!occlusionEnabled) return false;
     float4 localCenter = float4(bounds.sphereCenter, 1);
-    float4 viewCenter = mul(localCenter, modelView);
-    float4 clip = mul(localCenter, modelViewProjection);
+    float4 viewCenter = mul(localCenter, drawModelView);
+    float4 clip = mul(localCenter, drawMVP);
     if (clip.w <= 0.001) return false;
-    float radius = bounds.sphereRadius * modelMaxScale;
+    float radius = bounds.sphereRadius * drawScale;
     float2 centerUV = (clip.xy / clip.w) * float2(0.5, -0.5) + 0.5;
     float2 radiusUV = radius * float2(abs(projection[0][0]), abs(projection[1][1])) /
                       clip.w * 0.5;
@@ -112,21 +121,37 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
     if (threadID == 0) visibleCount = 0;
     GroupMemoryBarrierWithGroupSync();
 
-    uint localMeshlet = groupID.x * 32 + threadID;
-    uint globalMeshlet = firstMeshlet + localMeshlet;
+    uint localWorkItem = groupID.x * 32 + threadID;
+    uint globalWorkItem = firstMeshlet + localWorkItem;
+    uint totalWorkItems = meshletCount * max(instanceCount, 1u);
 
-    if (globalMeshlet < meshletCount) {
+    if (globalWorkItem < totalWorkItems) {
+        uint instanceIndex = instancingEnabled ? globalWorkItem / meshletCount : 0;
+        uint globalMeshlet = instancingEnabled
+            ? globalWorkItem % meshletCount : globalWorkItem;
+        float4x4 drawModel = model;
+        float4x4 drawModelView = modelView;
+        float4x4 drawMVP = modelViewProjection;
+        float drawScale = modelMaxScale;
+        if (instancingEnabled) {
+            MeshInstanceData instance = meshInstances[instanceIndex];
+            drawModel = instance.model;
+            drawModelView = mul(drawModel, view);
+            drawMVP = mul(drawModelView, projection);
+            drawScale = instance.modelMaxScale;
+        }
         MeshletBounds bounds = meshletBounds[globalMeshlet];
         // Animated bounds cannot safely use cone/backface or occlusion tests,
         // but bind-pose bounds remain good enough for coarse frustum rejection.
-        bool visible = skinningEnabled ? IntersectsFrustum(bounds) :
-                       (IntersectsFrustum(bounds) &&
-                        !IsBackfacing(bounds) &&
-                        !IsOccluded(bounds));
+        bool visible = skinningEnabled
+            ? IntersectsFrustum(bounds, drawMVP, drawScale)
+            : (IntersectsFrustum(bounds, drawMVP, drawScale) &&
+               !IsBackfacing(bounds, drawModel, drawScale) &&
+               !IsOccluded(bounds, drawModelView, drawMVP, drawScale));
         if (visible) {
             uint slot;
             InterlockedAdd(visibleCount, 1, slot);
-            payloadData.meshletIndices[slot] = globalMeshlet;
+            payloadData.workItems[slot] = uint2(globalMeshlet, instanceIndex);
         }
     }
 
