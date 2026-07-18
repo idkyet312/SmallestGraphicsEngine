@@ -85,10 +85,15 @@ static const float kShoreOuter = 52.0;   // Level 1 outer-shore radius
 // kPadHeight is Ground::kBuildingPadY (src/GroundLevel.h) -- the houses and their
 // roofs are all built up from that constant, so if this drifts they end up buried
 // in the sand or floating over it. Must match TerrainRendererDX12::HeightAt.
-static const float2 kPadCenter = float2(0.0, 0.0);
 static const float  kPadRadius = 14.0;   // dead flat through all four foundations
 static const float  kPadFade   = 18.0;   // blended back into the terrain by here
 static const float  kPadHeight = 2.5;    // = kLandLift: island's natural ground level
+static const float2 kStressPadCenters[8] = {
+    float2(  0.0,   0.0), float2(42.0,   0.0),
+    float2(-42.0,   0.0), float2( 0.0,  42.0),
+    float2( 42.0,  42.0), float2(-42.0, 42.0),
+    float2(  0.0, -42.0), float2(42.0, -42.0)
+};
 
 float TerrainHeight(float2 xz) {
     float h = fbm(xz * 0.08) * heightScale;
@@ -125,8 +130,12 @@ float TerrainHeight(float2 xz) {
     // Building pad, applied LAST so nothing else can dent it. The pool rim was
     // biting into the house footprint and dropping one corner ~2 m; forcing the
     // pad flat here means the houses always sit on genuinely level ground.
-    float pad = 1.0 - smoothstep(kPadRadius, kPadFade, length(xz - kPadCenter));
-    h = lerp(h, kPadHeight, pad);
+    uint padCount = islandScale > 1.5 ? 8 : 1;
+    for (uint i = 0; i < padCount; ++i) {
+        float pad = 1.0 - smoothstep(
+            kPadRadius, kPadFade, length(xz - kStressPadCenters[i]));
+        h = lerp(h, kPadHeight, pad);
+    }
     return h;
 }
 
