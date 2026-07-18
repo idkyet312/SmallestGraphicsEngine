@@ -369,10 +369,18 @@ float3 tonemapAgXPunchy(float3 color) {
     return saturate(color);                   // already display-encoded
 }
 
+float3 FinalizeOutput(float3 color) {
+#ifdef SGE_HDR_TARGET
+    return max(color, 0.0);
+#else
+    return tonemapAgXPunchy(max(color, 0.0));
+#endif
+}
+
 float4 main(PS_INPUT input) : SV_TARGET {
     // Solid unlit emissive geometry. Additive PSO turns opacity into glow weight.
     if (smokeMode > 1.5) {
-        return float4(tonemapAgXPunchy(max(objectColor, 0.0)), opacity);
+        return float4(FinalizeOutput(objectColor), opacity);
     }
 
     // Unlit soft smoke sprite: sample the puff texture, tint by objectColor, and
@@ -384,7 +392,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
         if (a <= 0.003) discard;
         // Tone-map/encode to match the rest of the frame's output.
         float3 c = smoke.rgb * objectColor;
-        c = tonemapAgXPunchy(max(c, 0.0));
+        c = FinalizeOutput(c);
         return float4(c, a);
     }
 
@@ -571,7 +579,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
     result += probeColor * envFresnel * reflectionStrength * metalTint;
 
     // AgX (Punchy) tone mapping; returns display-encoded sRGB.
-    result = tonemapAgXPunchy(max(result, 0.0));
+    result = FinalizeOutput(result);
     return float4(result, opacity);
 }
 

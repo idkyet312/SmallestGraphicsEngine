@@ -324,8 +324,7 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
         const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
             !transparent && !prim.skinBuffer &&
             !prim.vertices.empty() &&
-            (!prim.material || (!prim.material->alphaCutout &&
-                                 !prim.material->doubleSided));
+            (!prim.material || !prim.material->alphaCutout);
         if (visibilityExtensionsOnly && visibilityOwned) continue;
         if (prim.material) {
             if (transparent) shader.UseTransparent(); else shader.Use(false);
@@ -414,8 +413,7 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
             const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
                 !transparent && !prim.skinBuffer &&
                 !prim.vertices.empty() &&
-                (!prim.material || (!prim.material->alphaCutout &&
-                                     !prim.material->doubleSided));
+                (!prim.material || !prim.material->alphaCutout);
             if (visibilityExtensionsOnly && visibilityOwned) continue;
             const D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress = prim.meshletDescBuffer
                 ? prim.meshletDescBuffer->GetGPUVirtualAddress() : 0;

@@ -38,11 +38,15 @@ public:
     ComPtr<ID3D12PipelineState> psoMSAA;
     ComPtr<ID3D12PipelineState> psoDoubleSidedMSAA;
     ComPtr<ID3D12PipelineState> psoWireframeMSAA;
+    ComPtr<ID3D12PipelineState> psoHDR;
+    ComPtr<ID3D12PipelineState> psoDoubleSidedHDR;
+    ComPtr<ID3D12PipelineState> psoWireframeHDR;
     ComPtr<ID3D12GraphicsCommandList6> commandList6;
     bool supported = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
     bool wireframe = false; // Z key: draw meshlets as wireframe
+    bool hdrTargetEnabled = false;
     bool occlusionEnabled = false;
     UINT occlusionMipCount = 1;
     D3D12_GPU_DESCRIPTOR_HANDLE occlusionDepthHandle = {};
@@ -100,6 +104,7 @@ public:
         ComPtr<ID3DBlob> ms;
         ComPtr<ID3DBlob> as;
         ComPtr<ID3DBlob> ps;
+        ComPtr<ID3DBlob> hdrPs;
         if (FAILED(ReadCompiledShaderDX12(L"shaders/mesh_as.cso", &as))) {
             std::cerr << "Amplification shader DXIL missing: shaders/mesh_as.cso\n";
             return false;
@@ -110,6 +115,10 @@ public:
         }
         if (FAILED(ReadCompiledShaderDX12(L"shaders/mesh_ps.cso", &ps))) {
             std::cerr << "Mesh pixel shader DXIL missing: shaders/mesh_ps.cso\n";
+            return false;
+        }
+        if (FAILED(ReadCompiledShaderDX12(L"shaders/mesh_ps_hdr.cso", &hdrPs))) {
+            std::cerr << "HDR mesh pixel shader DXIL missing: shaders/mesh_ps_hdr.cso\n";
             return false;
         }
         if (!shader.rootSignature) return false;
@@ -154,6 +163,12 @@ public:
             std::cerr << "Mesh PSO creation failed: 0x" << std::hex << psoHr << std::dec << "\n";
             return false;
         }
+        stream.rt.value.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        stream.ps.value = { hdrPs->GetBufferPointer(), hdrPs->GetBufferSize() };
+        if (FAILED(device2->CreatePipelineState(
+                &streamDesc, IID_PPV_ARGS(&psoHDR)))) return false;
+        stream.ps.value = { ps->GetBufferPointer(), ps->GetBufferSize() };
+        stream.rt.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         stream.sample.value.Count = MSAADX12::SampleCount;
         stream.raster.value.MultisampleEnable = TRUE;
         msaaSupported = SUCCEEDED(
@@ -169,6 +184,12 @@ public:
             std::cerr << "Mesh double-sided PSO creation failed\n";
             return false;
         }
+        stream.rt.value.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        stream.ps.value = { hdrPs->GetBufferPointer(), hdrPs->GetBufferSize() };
+        if (FAILED(device2->CreatePipelineState(
+                &streamDesc, IID_PPV_ARGS(&psoDoubleSidedHDR)))) return false;
+        stream.ps.value = { ps->GetBufferPointer(), ps->GetBufferSize() };
+        stream.rt.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         if (msaaSupported) {
             stream.sample.value.Count = MSAADX12::SampleCount;
             stream.raster.value.MultisampleEnable = TRUE;
@@ -189,6 +210,11 @@ public:
         if (FAILED(device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&psoWireframe)))) {
             std::cerr << "Mesh wireframe PSO creation failed (non-fatal)\n";
         }
+        stream.rt.value.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (FAILED(device2->CreatePipelineState(
+                &streamDesc, IID_PPV_ARGS(&psoWireframeHDR))))
+            psoWireframeHDR.Reset();
+        stream.rt.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         if (msaaSupported) {
             stream.sample.value.Count = MSAADX12::SampleCount;
             stream.raster.value.MultisampleEnable = TRUE;
@@ -213,6 +239,8 @@ public:
         msaaEnabled = enabled && msaaSupported;
     }
 
+    void SetHDRTargetEnabled(bool enabled) { hdrTargetEnabled = enabled; }
+
     void Draw(const D3D12_VERTEX_BUFFER_VIEW& vbv,
               UINT vertexCount, UINT indexCount, UINT totalMeshlets,
               D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress,
@@ -225,11 +253,14 @@ public:
               bool allowOcclusion = true) {
         if (!CanDraw(totalMeshlets, meshletDescAddress, meshletBoundsAddress,
                      meshletVertexIndexAddress, meshletTriangleAddress)) return;
-        ID3D12PipelineState* solid = doubleSided
-            ? (msaaEnabled ? psoDoubleSidedMSAA.Get() : psoDoubleSided.Get())
-            : (msaaEnabled ? psoMSAA.Get() : pso.Get());
-        ID3D12PipelineState* wire =
-            msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get();
+        ID3D12PipelineState* solid = hdrTargetEnabled
+            ? (doubleSided ? psoDoubleSidedHDR.Get() : psoHDR.Get())
+            : (doubleSided
+                ? (msaaEnabled ? psoDoubleSidedMSAA.Get() : psoDoubleSided.Get())
+                : (msaaEnabled ? psoMSAA.Get() : pso.Get()));
+        ID3D12PipelineState* wire = hdrTargetEnabled
+            ? psoWireframeHDR.Get()
+            : (msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get());
         commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
         commandList6->SetGraphicsRootShaderResourceView(9, vbv.BufferLocation);
         commandList6->SetGraphicsRootShaderResourceView(10, meshletDescAddress);
@@ -301,10 +332,14 @@ public:
             ++currentInstance;
         }
 
-        ID3D12PipelineState* solid = doubleSided
-            ? (msaaEnabled ? psoDoubleSidedMSAA.Get() : psoDoubleSided.Get())
-            : (msaaEnabled ? psoMSAA.Get() : pso.Get());
-        ID3D12PipelineState* wire = msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get();
+        ID3D12PipelineState* solid = hdrTargetEnabled
+            ? (doubleSided ? psoDoubleSidedHDR.Get() : psoHDR.Get())
+            : (doubleSided
+                ? (msaaEnabled ? psoDoubleSidedMSAA.Get() : psoDoubleSided.Get())
+                : (msaaEnabled ? psoMSAA.Get() : pso.Get()));
+        ID3D12PipelineState* wire = hdrTargetEnabled
+            ? psoWireframeHDR.Get()
+            : (msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get());
         commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
         commandList6->SetGraphicsRootShaderResourceView(9, vbv.BufferLocation);
         commandList6->SetGraphicsRootShaderResourceView(10, meshletDescAddress);

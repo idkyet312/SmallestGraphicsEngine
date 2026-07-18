@@ -22,6 +22,7 @@ class SkyRendererDX12 {
 public:
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipelineState;
+    ComPtr<ID3D12PipelineState> hdrPipelineState;
     ComPtr<ID3D12PipelineState> msaaPipelineState;
     ComPtr<ID3D12DescriptorHeap> srvHeap;
     ComPtr<ID3D12Resource> skyTexture;
@@ -30,6 +31,7 @@ public:
     bool initialized = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
+    bool hdrTargetEnabled = false;
 
     bool Init() {
         std::ifstream vsFile("shaders/sky_vs.hlsl");
@@ -40,7 +42,7 @@ public:
         std::string vsSource = vsText.str();
         std::string psSource = psText.str();
 
-        ComPtr<ID3DBlob> vs, ps, errors;
+        ComPtr<ID3DBlob> vs, ps, hdrPs, errors;
         UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
         HRESULT hr = D3DCompile(vsSource.data(), vsSource.size(), "sky_vs.hlsl",
             nullptr, nullptr, "main", "vs_5_0", flags, 0, &vs, &errors);
@@ -48,6 +50,13 @@ public:
         errors.Reset();
         hr = D3DCompile(psSource.data(), psSource.size(), "sky_ps.hlsl",
             nullptr, nullptr, "main", "ps_5_0", flags, 0, &ps, &errors);
+        if (FAILED(hr)) { if (errors) std::cerr << (char*)errors->GetBufferPointer(); return false; }
+        const D3D_SHADER_MACRO hdrDefines[] = {
+            { "SGE_HDR_TARGET", "1" }, { nullptr, nullptr }
+        };
+        errors.Reset();
+        hr = D3DCompile(psSource.data(), psSource.size(), "sky_ps.hlsl",
+            hdrDefines, nullptr, "main", "ps_5_0", flags, 0, &hdrPs, &errors);
         if (FAILED(hr)) { if (errors) std::cerr << (char*)errors->GetBufferPointer(); return false; }
 
         D3D12_ROOT_PARAMETER roots[2] = {};
@@ -97,6 +106,12 @@ public:
         desc.SampleDesc.Count = 1;
         hr = g_dx12.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipelineState));
         if (FAILED(hr) || !constants.Create(FRAME_COUNT)) return false;
+        desc.PS = { hdrPs->GetBufferPointer(), hdrPs->GetBufferSize() };
+        desc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &desc, IID_PPV_ARGS(&hdrPipelineState)))) return false;
+        desc.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+        desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count = MSAADX12::SampleCount;
         desc.RasterizerState.MultisampleEnable = TRUE;
         msaaSupported = SUCCEEDED(g_dx12.device->CreateGraphicsPipelineState(
@@ -121,6 +136,8 @@ public:
         msaaEnabled = enabled && msaaSupported;
     }
 
+    void SetHDRTargetEnabled(bool enabled) { hdrTargetEnabled = enabled; }
+
     void Render(const Camera& camera, float fovDegrees, const XMFLOAT3& lightDirection, float time) {
         if (!initialized) return;
         // camera.Up is always world-up, not the camera's actual up. Building the
@@ -144,8 +161,9 @@ public:
         data.exposure = 1.32f;
         constants.CopyData(g_dx12.frameIndex, data);
 
-        g_dx12.commandList->SetPipelineState(
-            msaaEnabled ? msaaPipelineState.Get() : pipelineState.Get());
+        g_dx12.commandList->SetPipelineState(hdrTargetEnabled
+            ? hdrPipelineState.Get()
+            : (msaaEnabled ? msaaPipelineState.Get() : pipelineState.Get()));
         g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
         ID3D12DescriptorHeap* heaps[] = { srvHeap.Get() };
         g_dx12.commandList->SetDescriptorHeaps(1, heaps);

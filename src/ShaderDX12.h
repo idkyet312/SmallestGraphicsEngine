@@ -225,9 +225,15 @@ public:
     // which case the grass simply is not drawn.
     ComPtr<ID3D12PipelineState> grassPipelineState;
     ComPtr<ID3D12PipelineState> msaaGrassPipelineState;
+    ComPtr<ID3D12PipelineState> hdrPipelineState;
+    ComPtr<ID3D12PipelineState> hdrWireframePipelineState;
+    ComPtr<ID3D12PipelineState> hdrTransparentPipelineState;
+    ComPtr<ID3D12PipelineState> hdrAdditivePipelineState;
+    ComPtr<ID3D12PipelineState> hdrGrassPipelineState;
     ComPtr<ID3DBlob> pixelShaderBlob;
     bool msaaSupported = false;
     bool msaaEnabled = false;
+    bool hdrTargetEnabled = false;
     bool graphicsRootBound = false;
     
     // Per-draw-call constant buffers (need enough for all objects)
@@ -378,6 +384,19 @@ public:
             if (errorBlob) {
                 std::cerr << "Pixel shader compilation error: " << (char*)errorBlob->GetBufferPointer() << std::endl;
             }
+            return false;
+        }
+        const D3D_SHADER_MACRO hdrDefines[] = {
+            { "SGE_HDR_TARGET", "1" }, { nullptr, nullptr }
+        };
+        ComPtr<ID3DBlob> hdrPsBlob;
+        errorBlob.Reset();
+        hr = D3DCompile(psCode.c_str(), psCode.length(), pixelPath,
+            hdrDefines, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "ps_5_0",
+            compileFlags, 0, &hdrPsBlob, &errorBlob);
+        if (FAILED(hr)) {
+            if (errorBlob) std::cerr << "HDR pixel shader compilation error: "
+                << (char*)errorBlob->GetBufferPointer() << std::endl;
             return false;
         }
         pixelShaderBlob = psBlob;
@@ -630,6 +649,12 @@ public:
             std::cerr << "Failed to create pipeline state, HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
             return false;
         }
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        psoDesc.PS = { hdrPsBlob->GetBufferPointer(), hdrPsBlob->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &psoDesc, IID_PPV_ARGS(&hdrPipelineState)))) return false;
+        psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         msaaSupported = createMSAAPipeline(msaaPipelineState);
 
         // Alpha-blended material pass. Keep depth testing, disable depth writes
@@ -644,6 +669,12 @@ public:
         psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
         hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&transparentPipelineState));
         if (FAILED(hr)) return false;
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        psoDesc.PS = { hdrPsBlob->GetBufferPointer(), hdrPsBlob->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &psoDesc, IID_PPV_ARGS(&hdrTransparentPipelineState)))) return false;
+        psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         if (msaaSupported && !createMSAAPipeline(msaaTransparentPipelineState))
             msaaSupported = false;
 
@@ -655,6 +686,12 @@ public:
         psoDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
         hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&additivePipelineState));
         if (FAILED(hr)) return false;
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        psoDesc.PS = { hdrPsBlob->GetBufferPointer(), hdrPsBlob->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &psoDesc, IID_PPV_ARGS(&hdrAdditivePipelineState)))) return false;
+        psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         if (msaaSupported && !createMSAAPipeline(msaaAdditivePipelineState))
             msaaSupported = false;
         psoDesc.BlendState.RenderTarget[0].BlendEnable = FALSE;
@@ -667,6 +704,12 @@ public:
             std::cerr << "Failed to create wireframe pipeline state" << std::endl;
             // Non-fatal
         }
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        psoDesc.PS = { hdrPsBlob->GetBufferPointer(), hdrPsBlob->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &psoDesc, IID_PPV_ARGS(&hdrWireframePipelineState)))) return false;
+        psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         if (msaaSupported && !createMSAAPipeline(msaaWireframePipelineState))
             msaaSupported = false;
 
@@ -689,17 +732,35 @@ public:
             // strict subset of the shared root signature. Falls back to the
             // full PS if it fails to compile -- the grass still draws.
             ComPtr<ID3DBlob> grassPsBlob;
+            ComPtr<ID3DBlob> hdrGrassPsBlob;
             if (CompileShaderFile("shaders/grass_ps.hlsl", "ps_5_0", compileFlags, grassPsBlob))
                 psoDesc.PS = { grassPsBlob->GetBufferPointer(), grassPsBlob->GetBufferSize() };
             else
                 std::cerr << "grass_ps.hlsl failed to compile; grass uses the full shader\n";
+            CompileShaderFile("shaders/grass_ps.hlsl", "ps_5_0", compileFlags,
+                hdrGrassPsBlob, hdrDefines);
             hr = g_dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&grassPipelineState));
             if (FAILED(hr)) {
                 std::cerr << "Failed to create grass pipeline state" << std::endl;
                 grassPipelineState.Reset();   // non-fatal: the grass just won't draw
-            } else if (msaaSupported &&
-                       !createMSAAPipeline(msaaGrassPipelineState)) {
-                msaaSupported = false;
+            } else {
+                psoDesc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                psoDesc.PS = hdrGrassPsBlob
+                    ? D3D12_SHADER_BYTECODE{ hdrGrassPsBlob->GetBufferPointer(),
+                                             hdrGrassPsBlob->GetBufferSize() }
+                    : D3D12_SHADER_BYTECODE{ hdrPsBlob->GetBufferPointer(),
+                                             hdrPsBlob->GetBufferSize() };
+                if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                        &psoDesc, IID_PPV_ARGS(&hdrGrassPipelineState))))
+                    hdrGrassPipelineState.Reset();
+                psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                psoDesc.PS = grassPsBlob
+                    ? D3D12_SHADER_BYTECODE{ grassPsBlob->GetBufferPointer(),
+                                             grassPsBlob->GetBufferSize() }
+                    : D3D12_SHADER_BYTECODE{ psBlob->GetBufferPointer(),
+                                             psBlob->GetBufferSize() };
+                if (msaaSupported && !createMSAAPipeline(msaaGrassPipelineState))
+                    msaaSupported = false;
             }
             psoDesc.PS = { pixelShaderBlob->GetBufferPointer(), pixelShaderBlob->GetBufferSize() };
         }
@@ -734,7 +795,14 @@ public:
         msaaEnabled = enabled && msaaSupported;
     }
 
+    void SetHDRTargetEnabled(bool enabled) { hdrTargetEnabled = enabled; }
+
     ID3D12PipelineState* GetPipelineState(bool wireframe = false) const {
+        if (hdrTargetEnabled) {
+            if (wireframe && hdrWireframePipelineState)
+                return hdrWireframePipelineState.Get();
+            return hdrPipelineState.Get();
+        }
         if (msaaEnabled) {
             if (wireframe && msaaWireframePipelineState)
                 return msaaWireframePipelineState.Get();
@@ -746,18 +814,21 @@ public:
     }
 
     ID3D12PipelineState* GetTransparentPipelineState() const {
+        if (hdrTargetEnabled) return hdrTransparentPipelineState.Get();
         return msaaEnabled
             ? msaaTransparentPipelineState.Get()
             : transparentPipelineState.Get();
     }
 
     ID3D12PipelineState* GetAdditivePipelineState() const {
+        if (hdrTargetEnabled) return hdrAdditivePipelineState.Get();
         return msaaEnabled
             ? msaaAdditivePipelineState.Get()
             : additivePipelineState.Get();
     }
 
     ID3D12PipelineState* GetGrassPipelineState() const {
+        if (hdrTargetEnabled) return hdrGrassPipelineState.Get();
         return msaaEnabled
             ? msaaGrassPipelineState.Get()
             : grassPipelineState.Get();

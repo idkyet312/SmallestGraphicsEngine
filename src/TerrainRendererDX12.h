@@ -27,18 +27,21 @@ public:
     ComPtr<ID3D12PipelineState> psoWireframe;
     ComPtr<ID3D12PipelineState> psoMSAA;
     ComPtr<ID3D12PipelineState> psoWireframeMSAA;
+    ComPtr<ID3D12PipelineState> psoHDR;
+    ComPtr<ID3D12PipelineState> psoWireframeHDR;
     ComPtr<ID3D12GraphicsCommandList6> commandList6;
     bool supported = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
     bool wireframe = false; // Z key: draw terrain tiles as wireframe
+    bool hdrTargetEnabled = false;
 
     bool Init(ShaderDX12& shader) {
         // Mesh shader tier support was already verified by MeshShaderDX12::Init;
         // if that failed these .cso files won't exist either, so just try to load.
         if (FAILED(g_dx12.commandList.As(&commandList6))) return false;
 
-        ComPtr<ID3DBlob> as, ms, ps;
+        ComPtr<ID3DBlob> as, ms, ps, hdrPs;
         if (FAILED(ReadCompiledShaderDX12(L"shaders/terrain_as.cso", &as))) {
             std::cerr << "Terrain amplification shader DXIL missing: shaders/terrain_as.cso\n";
             return false;
@@ -49,6 +52,10 @@ public:
         }
         if (FAILED(ReadCompiledShaderDX12(L"shaders/mesh_ps.cso", &ps))) {
             std::cerr << "Mesh pixel shader DXIL missing: shaders/mesh_ps.cso\n";
+            return false;
+        }
+        if (FAILED(ReadCompiledShaderDX12(L"shaders/mesh_ps_hdr.cso", &hdrPs))) {
+            std::cerr << "HDR terrain pixel shader DXIL missing: shaders/mesh_ps_hdr.cso\n";
             return false;
         }
         if (!shader.rootSignature) return false;
@@ -89,6 +96,12 @@ public:
             std::cerr << "Terrain PSO creation failed: 0x" << std::hex << psoHr << std::dec << "\n";
             return false;
         }
+        stream.rt.value.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        stream.ps.value = { hdrPs->GetBufferPointer(), hdrPs->GetBufferSize() };
+        if (FAILED(device2->CreatePipelineState(
+                &streamDesc, IID_PPV_ARGS(&psoHDR)))) return false;
+        stream.ps.value = { ps->GetBufferPointer(), ps->GetBufferSize() };
+        stream.rt.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         stream.sample.value.Count = MSAADX12::SampleCount;
         stream.raster.value.MultisampleEnable = TRUE;
         msaaSupported = SUCCEEDED(
@@ -104,6 +117,11 @@ public:
         if (FAILED(device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&psoWireframe)))) {
             std::cerr << "Terrain wireframe PSO creation failed (non-fatal)\n";
         }
+        stream.rt.value.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (FAILED(device2->CreatePipelineState(
+                &streamDesc, IID_PPV_ARGS(&psoWireframeHDR))))
+            psoWireframeHDR.Reset();
+        stream.rt.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         if (msaaSupported) {
             stream.sample.value.Count = MSAADX12::SampleCount;
             stream.raster.value.MultisampleEnable = TRUE;
@@ -122,6 +140,8 @@ public:
     void SetMSAAEnabled(bool enabled) {
         msaaEnabled = enabled && msaaSupported;
     }
+
+    void SetHDRTargetEnabled(bool enabled) { hdrTargetEnabled = enabled; }
 
     // CPU mirror of terrain_ms.hlsl's height function (hash21/noise2/fbm/
     // TerrainHeight), used for walking collision. Keep the two in sync - any
@@ -239,10 +259,11 @@ public:
     // terrain material (SetObjectMaterial) beforehand, same as any other draw.
     void Draw(const Params& params) {
         if (!supported) return;
-        ID3D12PipelineState* solid =
-            msaaEnabled ? psoMSAA.Get() : pso.Get();
-        ID3D12PipelineState* wire =
-            msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get();
+        ID3D12PipelineState* solid = hdrTargetEnabled
+            ? psoHDR.Get() : (msaaEnabled ? psoMSAA.Get() : pso.Get());
+        ID3D12PipelineState* wire = hdrTargetEnabled
+            ? psoWireframeHDR.Get()
+            : (msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get());
         commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
         commandList6->SetGraphicsRoot32BitConstants(8, 9, &params, 0);
         const UINT tileCount = params.tilesX * params.tilesZ;

@@ -162,6 +162,10 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float NdotL = saturate(dot(normal, lightDir));
     result += albedo / 3.14159265 * lightColor * NdotL * shadowVisibility;
 
+#ifdef SGE_HDR_TARGET
+    result = max(result, 0.0);
+#else
     result = tonemapAgXPunchy(max(result, 0.0));
+#endif
     return float4(result, 1.0);
 }

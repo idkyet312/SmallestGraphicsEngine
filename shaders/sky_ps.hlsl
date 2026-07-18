@@ -47,7 +47,12 @@ float4 main(PSInput input) : SV_Target {
     float lod = clamp(log2(max(uTexelsPerPixel, 1.0)), 0.0, (float)(mipCount - 1));
     float3 hdr = skyEquirectangular.SampleLevel(skySampler, skyUV, lod).rgb;
 
-    float3 color = TonemapACES(hdr * exposure);
+    float3 color;
+#ifdef SGE_HDR_TARGET
+    color = hdr * exposure;
+#else
+    color = TonemapACES(hdr * exposure);
     color = pow(color, 1.0 / 2.2);
+#endif
     return float4(color, 1.0);
 }

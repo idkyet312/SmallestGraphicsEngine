@@ -2180,7 +2180,10 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     matTrim->metallicFactor = 0.90f; matTrim->roughnessFactor = 0.38f;
     auto matGlass = std::make_shared<SceneMaterial>();
     matGlass->name = "Glass";
-    matGlass->baseColorFactor = XMFLOAT4(0.58f, 0.76f, 0.86f, 0.28f);
+    // Hybrid rendering correctly composites panes after every opaque object.
+    // Keep the tint subtle; the old 0.28 alpha only looked acceptable because
+    // forward rendering accidentally overwrote glass with later opaque draws.
+    matGlass->baseColorFactor = XMFLOAT4(0.58f, 0.76f, 0.86f, 0.04f);
     matGlass->metallicFactor = 0.0f; matGlass->roughnessFactor = 0.04f;
 
     // Emit one axis-aligned solid box as a chunk child. `wrap` stretches the
@@ -3605,6 +3608,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (wParam == 'V' && !(lParam & 0x40000000)) {
             scene.camera.FPSMode = !scene.camera.FPSMode;
         }
+        else if (wParam == 'M' && !(lParam & 0x40000000)) {
+            if (visBuffer.initialized) {
+                scene.useVisibilityBuffer = !scene.useVisibilityBuffer;
+                if (scene.useVisibilityBuffer) {
+                    scene.useRaytracing = false;
+                    g_rt.enabled = false;
+                }
+            }
+        }
         else if (!g_emptyLevelMode && wParam == 'E' &&
                  !(lParam & 0x40000000)) {
             ToggleHumveeDriving();
@@ -3833,7 +3845,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // Deterministic renderer smoke path for GPU validation and crash dumps.
     bool visibilityTestPending = false;
     UINT visibilityTestForwardFrames = 0;
+    bool visibilitySmokeEnabled = false;
+    bool visibilitySmokeReported = false;
+    const bool visibilityBenchmark =
+        GetEnvironmentVariableA("SGE_VISIBILITY_BENCHMARK", nullptr, 0) > 0;
+    const bool visibilityForwardOnly =
+        GetEnvironmentVariableA("SGE_VISIBILITY_FORWARD_ONLY", nullptr, 0) > 0;
+    UINT visibilityBenchmarkVBFrames = 0;
+    UINT visibilityBenchmarkForwardSamples = 0;
+    UINT visibilityBenchmarkVBSamples = 0;
+    double visibilityBenchmarkForwardMs = 0.0;
+    double visibilityBenchmarkVBMs = 0.0;
+    bool visibilityBenchmarkComplete = false;
     if (GetEnvironmentVariableA("SGE_VISIBILITY_TEST", nullptr, 0) > 0) {
+        visibilitySmokeEnabled = true;
+        std::ofstream("visibility_smoke.log", std::ios::trunc)
+            << "starting\n";
         char visibilityDebugMode[8] = {};
         if (GetEnvironmentVariableA("SGE_VISIBILITY_DEBUG", visibilityDebugMode,
                 static_cast<DWORD>(sizeof(visibilityDebugMode))) > 0) {
@@ -4366,18 +4393,36 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         float cc[4] = { scene.clearColor.x, scene.clearColor.y, scene.clearColor.z, 1.0f };
         if (visibilityTestPending && gameScreen == GameScreen::Level1 &&
-            !levelLoadingActive && ++visibilityTestForwardFrames >= 120) {
-            scene.useVisibilityBuffer = true;
-            visibilityTestPending = false;
-            std::cerr << "VISIBILITY_TEST: toggled after 120 forward frames\n";
+            !levelLoadingActive) {
+            ++visibilityTestForwardFrames;
+            if (visibilityTestForwardFrames == 1) {
+                std::ofstream("visibility_smoke.log", std::ios::app)
+                    << "forward-active\n";
+            }
+            if (!visibilityBenchmark && !visibilityForwardOnly &&
+                visibilityTestForwardFrames >= 120) {
+                scene.useVisibilityBuffer = true;
+                visibilityTestPending = false;
+                std::cerr << "VISIBILITY_TEST: toggled after 120 forward frames\n";
+                std::ofstream("visibility_smoke.log", std::ios::app)
+                    << "toggled\n";
+            }
         }
         const bool usingRaytracing =
             scene.useRaytracing && g_rt.initialized;
         const bool usingVisibility =
             !usingRaytracing && scene.useVisibilityBuffer && visBuffer.initialized;
+        const bool visibilityDebugActive =
+            usingVisibility && visBuffer.debugViewMode != 0;
+        // Validation is a cross-renderer comparison mode. Keep both sides on
+        // the same baseline while M toggles ownership: no MSAA, fog, or FXAA.
+        const bool visibilityParityValidation =
+            !usingRaytracing && visBuffer.initialized && visBuffer.validationMode;
+        const bool commonHDRValidationTarget =
+            usingVisibility || visibilityParityValidation;
         const bool msaaActive =
             scene.enableMSAA && msaa.initialized &&
-            !usingRaytracing && !usingVisibility;
+            !usingRaytracing && !usingVisibility && !visibilityParityValidation;
         mainShader.SetMSAAEnabled(msaaActive);
         g_meshShader.SetMSAAEnabled(msaaActive);
         g_terrain.SetMSAAEnabled(msaaActive);
@@ -4386,7 +4431,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         else ClearRenderTarget(cc);
         {
             ProfilerDX12::Scope profile(g_profiler, "Sky", g_dx12.commandList.Get());
+            if (commonHDRValidationTarget) {
+                visBuffer.BeginHDRBackground(g_dx12.commandList.Get());
+                skyRenderer.SetHDRTargetEnabled(true);
+            }
             skyRenderer.Render(scene.camera, scene.cameraFOV, scene.lightPos, now);
+            if (commonHDRValidationTarget) {
+                skyRenderer.SetHDRTargetEnabled(false);
+                visBuffer.EndHDRBackground(g_dx12.commandList.Get());
+            }
         }
 
         mainShader.BeginFrame();
@@ -4736,8 +4789,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 (!g_emptyLevelMode && g_showH2Model) ? crateModel : nullptr);
             fogLightSpace = lightSpace;
             fogShadowResource = shadowResource;
-            renderedForward = true;
-            {
+            renderedForward = !visibilityDebugActive;
+            mainShader.SetHDRTargetEnabled(true);
+            g_meshShader.SetHDRTargetEnabled(true);
+            g_terrain.SetHDRTargetEnabled(true);
+            if (!visibilityDebugActive) {
                 ProfilerDX12::Scope extensions(
                     g_profiler, "Forward Extensions", g_dx12.commandList.Get());
                 RenderForward(scene, mainShader, geo, crateModel, floorMaterial,
@@ -4759,6 +4815,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             fogShadowResource = shadowResource;
             renderedForward = true;
             if (msaaActive) msaa.Bind();
+            if (visibilityParityValidation) {
+                visBuffer.BeginForwardExtensions(g_dx12.commandList.Get());
+                mainShader.SetHDRTargetEnabled(true);
+                g_meshShader.SetHDRTargetEnabled(true);
+                g_terrain.SetHDRTargetEnabled(true);
+            }
             {
                 ProfilerDX12::Scope profile(g_profiler, "Forward", g_dx12.commandList.Get());
                 RenderForward(scene, mainShader, geo, crateModel, floorMaterial, lightSpace, shadowResource);
@@ -4795,14 +4857,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             msaa.ResolveToBackBuffer();
         }
 
-        const bool visibilityValidation = usingVisibility && visBuffer.validationMode;
+        const bool visibilityValidation = visibilityParityValidation;
         if (renderedForward && scene.enableVolumetricFog && volumetricFog.initialized &&
             !visibilityValidation) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Volumetric Fog", g_dx12.commandList.Get());
             volumetricFog.Render(scene, fogLightSpace, fogShadowResource,
                 msaaActive ? msaa.GetDepthResource() : g_dx12.depthStencilBuffer.Get(),
-                msaaActive);
+                msaaActive,
+                usingVisibility ? visBuffer.GetOutputRTV()
+                                : D3D12_CPU_DESCRIPTOR_HANDLE{},
+                usingVisibility);
+        }
+
+        if (commonHDRValidationTarget) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "Common HDR Post", g_dx12.commandList.Get());
+            visBuffer.EndForwardExtensions(g_dx12.commandList.Get());
+            if (usingVisibility && !visBuffer.validationMode)
+                visBuffer.UpdateExposure(g_dx12.commandList.Get());
+            visBuffer.PostProcess(g_dx12.commandList.Get(), hzbHistoryUsable);
+            visBuffer.CopyToBackBuffer(g_dx12.commandList.Get());
+            if (usingVisibility)
+                visBuffer.TransitionBuffersForUpload(g_dx12.commandList.Get());
+            mainShader.SetHDRTargetEnabled(false);
+            g_meshShader.SetHDRTargetEnabled(false);
+            g_terrain.SetHDRTargetEnabled(false);
         }
 
         // Preserve this frame's depth for next-frame amplification-shader
@@ -4839,6 +4919,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_shadowBatchInstances = g_shadowDrawCalls
             ? shadowMap.depthShader.instancesThisFrame : 0;
         g_visibilityDrawCalls = usingVisibility ? visBuffer.currentDrawCall : 0;
+        if (visibilitySmokeEnabled && usingVisibility &&
+            !visibilitySmokeReported) {
+            std::ofstream("visibility_smoke.log", std::ios::app)
+                << "active draws=" << visBuffer.currentDrawCall
+                << " materials=" << visBuffer.materialCount
+                << " textures=" << visBuffer.materialTextureCount
+                << " vertices=" << visBuffer.persistentVertexCount
+                << " indices=" << visBuffer.persistentIndexCount
+                << " debug=" << visBuffer.debugViewMode
+                << " validation=" << (visBuffer.validationMode ? 1 : 0)
+                << '\n';
+            visibilitySmokeReported = true;
+        }
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -4883,6 +4976,46 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 scene.GetViewMatrix() * scene.GetProjectionMatrix();
         msaaUsedLastFrame = msaaActive;
         g_profiler.EndCpuFrame();
+
+        if (visibilityBenchmark && !visibilityBenchmarkComplete &&
+            gameScreen == GameScreen::Level1 && !levelLoadingActive) {
+            const double gpuMs = g_profiler.GpuFrameMs();
+            if (!usingVisibility) {
+                if (visibilityTestForwardFrames > 120 && gpuMs > 0.0) {
+                    visibilityBenchmarkForwardMs += gpuMs;
+                    ++visibilityBenchmarkForwardSamples;
+                }
+                if (visibilityBenchmarkForwardSamples >= 300) {
+                    const double average = visibilityBenchmarkForwardMs /
+                        visibilityBenchmarkForwardSamples;
+                    std::ofstream("visibility_benchmark.log", std::ios::trunc)
+                        << "forward_gpu_ms=" << average << '\n';
+                    scene.useVisibilityBuffer = true;
+                    visibilityTestPending = false;
+                    visibilityBenchmarkVBFrames = 0;
+                }
+            } else {
+                ++visibilityBenchmarkVBFrames;
+                if (visibilityBenchmarkVBFrames > 120 && gpuMs > 0.0) {
+                    visibilityBenchmarkVBMs += gpuMs;
+                    ++visibilityBenchmarkVBSamples;
+                }
+                if (visibilityBenchmarkVBSamples >= 300) {
+                    const double forwardAverage = visibilityBenchmarkForwardMs /
+                        visibilityBenchmarkForwardSamples;
+                    const double vbAverage = visibilityBenchmarkVBMs /
+                        visibilityBenchmarkVBSamples;
+                    const bool keepVisibility = vbAverage < forwardAverage;
+                    std::ofstream log("visibility_benchmark.log", std::ios::app);
+                    log << "visibility_gpu_ms=" << vbAverage << '\n'
+                        << "delta_gpu_ms=" << (vbAverage - forwardAverage) << '\n'
+                        << "decision=" << (keepVisibility ? "keep" : "disable")
+                        << '\n';
+                    scene.useVisibilityBuffer = keepVisibility;
+                    visibilityBenchmarkComplete = true;
+                }
+            }
+        }
     }
 
     WaitForGPU();
