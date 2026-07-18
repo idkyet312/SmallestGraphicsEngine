@@ -2528,8 +2528,8 @@ static bool CreateAllGeometry() {
     };
     if (!CreateVertexBuffer(cubeVerts, geo.cubeVertexBuffer, geo.cubeVBV)) return false;
 
-    float s = 20.0f;
-    float tile = 8.0f;
+    float s = 128.0f;
+    float tile = 51.2f;
     std::vector<VertexPosNormUV> planeVerts = {
         {{-s,0, s},{0,1,0},{0,0}}, {{ s,0, s},{0,1,0},{tile,0}}, {{ s,0,-s},{0,1,0},{tile,tile}},
         {{-s,0, s},{0,1,0},{0,0}}, {{ s,0,-s},{0,1,0},{tile,tile}}, {{-s,0,-s},{0,1,0},{0,tile}},
@@ -3905,7 +3905,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     navigationObstacles.push_back(
                         { p.x - 0.55f, p.z - 0.55f, p.x + 0.55f, p.z + 0.55f });
                 if (!g_navigation.BuildTerrain(
-                        terrainSampler, -61.0f, 61.0f, -61.0f, 61.0f,
+                        terrainSampler, -122.0f, 122.0f, -122.0f, 122.0f,
                         navigationObstacles)) {
                     std::cerr << "Recast navigation build failed; Bandits use direct steering\n";
                 }
@@ -3919,7 +3919,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // drawn each frame, so this number sets the field's DENSITY -- how
                 // thick the grass is around the player -- rather than the per-frame
                 // cost, which the radius governs.
-                g_grass.Initialize(terrainSampler, 100.0f, 400000, 0.0f);
+                g_grass.Initialize(terrainSampler, 200.0f, 1600000, 0.0f);
             }
             // Same pool AABB for the destruction sim so house debris shoved into
             // the water floats too (surface at max.y).

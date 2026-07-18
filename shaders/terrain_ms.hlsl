@@ -71,13 +71,13 @@ static const float  kPoolRim    = 7.0;   // slopes back up to ground by here
 static const float  kPoolDepth  = 3.0;   // how far the floor drops below ground
 
 // Island shape. Sea level is y = 0 (where the ocean plane sits), so the land is
-// lifted above it and the seabed dropped below it. The terrain grid spans +-64 m,
+// lifted above it and the seabed dropped below it. The terrain grid spans +-128 m,
 // so the shore ramp must finish comfortably inside that or the mesh edge shows.
 // Must match TerrainRendererDX12::HeightAt.
 static const float kLandLift   =  2.5;   // how far the island sits above sea level
 static const float kSeabed     = -6.0;   // sea floor depth past the shore
-static const float kShoreInner = 34.0;   // solid land out to here
-static const float kShoreOuter = 52.0;   // fully underwater by here
+static const float kShoreInner = 68.0;   // solid land out to here
+static const float kShoreOuter = 104.0;  // fully underwater by here
 
 // Flat arena under the four houses arranged around world centre. Applied after
 // everything else and faded out before the relocated pool basin.

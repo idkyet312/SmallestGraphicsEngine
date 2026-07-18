@@ -7,6 +7,8 @@ cbuffer MatrixBuffer : register(b0) {
     matrix view;
     matrix projection;
     matrix lightSpaceMatrix;
+    matrix modelView;
+    matrix modelViewProjection;
 };
 
 cbuffer CameraBuffer : register(b2) {
@@ -34,26 +36,15 @@ struct TerrainPayload {
 groupshared TerrainPayload payloadData;
 groupshared uint visibleCount;
 
-bool TileIntersectsFrustum(float3 bbMin, float3 bbMax) {
-    bool outsideLeft = true, outsideRight = true;
-    bool outsideBottom = true, outsideTop = true;
-    bool outsideNear = true, outsideFar = true;
-    [unroll]
-    for (uint i = 0; i < 8; ++i) {
-        float3 p = float3(
-            (i & 1) ? bbMax.x : bbMin.x,
-            (i & 2) ? bbMax.y : bbMin.y,
-            (i & 4) ? bbMax.z : bbMin.z);
-        float4 c = mul(mul(float4(p, 1), view), projection);
-        outsideLeft   = outsideLeft   && c.x < -c.w;
-        outsideRight  = outsideRight  && c.x >  c.w;
-        outsideBottom = outsideBottom && c.y < -c.w;
-        outsideTop    = outsideTop    && c.y >  c.w;
-        outsideNear   = outsideNear   && c.z < 0.0;
-        outsideFar    = outsideFar    && c.z > c.w;
-    }
-    return !(outsideLeft || outsideRight || outsideBottom ||
-             outsideTop || outsideNear || outsideFar);
+bool TileIntersectsFrustum(float3 center, float radius) {
+    float4 clip = mul(float4(center, 1), modelViewProjection);
+    float radiusX = radius * abs(projection[0][0]);
+    float radiusY = radius * abs(projection[1][1]);
+    float radiusZ = radius *
+        (abs(projection[2][2]) + abs(projection[2][3]));
+    return clip.x + radiusX >= -clip.w && clip.x - radiusX <= clip.w &&
+           clip.y + radiusY >= -clip.w && clip.y - radiusY <= clip.w &&
+           clip.z + radiusZ >= 0.0 && clip.z - radiusZ <= clip.w + radiusZ;
 }
 
 [numthreads(32, 1, 1)]
@@ -70,10 +61,13 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
         float worldX = ((float)tx - (float)tilesX * 0.5) * tileSize;
         float worldZ = ((float)tz - (float)tilesZ * 0.5) * tileSize;
 
-        float3 bbMin = float3(worldX, -skirtDepth, worldZ);
-        float3 bbMax = float3(worldX + tileSize, heightScale, worldZ + tileSize);
+        float3 center3 = float3(worldX + tileSize * 0.5,
+            (heightScale - skirtDepth) * 0.5,
+            worldZ + tileSize * 0.5);
+        float3 halfExtent = float3(tileSize * 0.5,
+            (heightScale + skirtDepth) * 0.5, tileSize * 0.5);
 
-        if (TileIntersectsFrustum(bbMin, bbMax)) {
+        if (TileIntersectsFrustum(center3, length(halfExtent))) {
             float2 center = float2(worldX + tileSize * 0.5, worldZ + tileSize * 0.5);
             float dist = length(center - viewPos.xz);
             uint lod = (uint)clamp((dist - lodNear) / lodStep, 0.0, 3.0);

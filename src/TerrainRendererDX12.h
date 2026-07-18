@@ -12,8 +12,8 @@ class TerrainRendererDX12 {
 public:
     // Matches TerrainParams (b6, root param 8: 8 x 32-bit constants).
     struct Params {
-        UINT tilesX = 16;
-        UINT tilesZ = 16;
+        UINT tilesX = 32;
+        UINT tilesZ = 32;
         float tileSize = 8.0f;
         float heightScale = 5.0f;
         float lodNear = 24.0f;
@@ -180,7 +180,7 @@ public:
         // lifted above sea level (y = 0), then ramps down to a seabed past the
         // shore, so the island is ringed by ocean.
         constexpr float landLift = 2.5f, seabed = -6.0f;
-        constexpr float shoreInner = 34.0f, shoreOuter = 52.0f;
+        constexpr float shoreInner = 68.0f, shoreOuter = 104.0f;
         float r = sqrtf(x * x + z * z);
         float st = (r - shoreInner) / (shoreOuter - shoreInner);
         st = st < 0.0f ? 0.0f : (st > 1.0f ? 1.0f : st);
