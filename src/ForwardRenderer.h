@@ -31,7 +31,9 @@ extern ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 extern ComPtr<ID3D12Resource> g_fireTexture;
 extern ComPtr<ID3D12Resource> g_explosionTexture;   // 8x8 flipbook explosion sheet
 extern std::shared_ptr<SceneNode> g_explosiveBarrelModel;
+extern std::shared_ptr<SceneNode> g_explosiveBarrelShadowModel;
 extern std::shared_ptr<SceneNode> g_humveeModel;
+extern std::shared_ptr<SceneNode> g_humveeShadowModel;
 extern std::shared_ptr<SceneNode> g_helicopterModel;
 extern DirectX::XMFLOAT3 g_helicopterPosition;
 DirectX::XMMATRIX HumveeWorldMatrix();
