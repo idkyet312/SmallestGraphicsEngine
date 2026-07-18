@@ -156,6 +156,24 @@ float3 SampleReflectionProbe(float3 reflectionDir, float roughness) {
     return lerp(environment, luminance.xxx, roughness * 0.35);
 }
 
+float3 RenderProceduralSky(uint2 pixel) {
+    float2 uv = (float2(pixel) + 0.5) / float2(screenWidth, screenHeight);
+    float2 ndc = uv * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float4 farWorld = mul(float4(ndc, 1.0, 1.0), invViewProj);
+    float3 direction = normalize(farWorld.xyz / farWorld.w - cameraPos);
+    float up = saturate(direction.y * 0.5 + 0.5);
+    float horizon = exp(-abs(direction.y) * 6.0);
+    float3 zenith = float3(0.18, 0.42, 0.82) * max(skyIntensity, 0.5);
+    float3 horizonColor = float3(0.80, 0.68, 0.50) * max(skyIntensity, 0.5);
+    float3 ground = float3(0.035, 0.055, 0.08);
+    float3 sky = lerp(ground, lerp(horizonColor, zenith, smoothstep(0.48, 1.0, up)), up);
+    sky = lerp(sky, horizonColor, horizon * 0.35);
+    float sun = pow(saturate(dot(direction, normalize(lightPos))), 1200.0);
+    float halo = pow(saturate(dot(direction, normalize(lightPos))), 24.0);
+    return sky + lightColor * (sun * 18.0 + halo * 0.22);
+}
+
 float ScreenSpaceAO(uint2 pixel, float3 worldPos, float3 normal) {
     static const int2 directions[8] = {
         int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1),
@@ -323,7 +341,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     
     // Zero instance ID means no geometry was written.
     if (visValue.x == 0u) {
-        outputColor[pixel] = float4(0.1, 0.1, 0.1, 1.0); // background
+        outputColor[pixel] = float4(RenderProceduralSky(pixel), 1.0);
         outputMotion[pixel] = 0.0;
         return;
     }
