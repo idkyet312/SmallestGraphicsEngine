@@ -380,7 +380,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ImGui::SliderFloat("VB TAA Feedback", &vb.taaFeedback, 0.0f, 0.98f, "%.2f");
             }
         } else {
-            ImGui::TextDisabled("VB Pipeline: Not Available");
+            ImGui::TextDisabled("VB Pipeline: Not Available (%s)",
+                vb.initError.empty() ? "initialization failed" : vb.initError.c_str());
         }
 
         ImGui::Checkbox("4x MSAA (Forward only)", &scene.enableMSAA);
