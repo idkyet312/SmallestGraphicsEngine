@@ -217,6 +217,7 @@ public:
     ComPtr<ID3DBlob> pixelShaderBlob;
     bool msaaSupported = false;
     bool msaaEnabled = false;
+    bool graphicsRootBound = false;
     
     // Per-draw-call constant buffers (need enough for all objects)
     UploadBuffer<MatrixBufferDX12> matrixBuffer;
@@ -745,17 +746,19 @@ public:
     
     void Use(bool wireframe = false) {
         if (!loaded) return;
+        EnsureGraphicsRootBound();
+        g_dx12.commandList->SetPipelineState(GetPipelineState(wireframe));
+    }
+
+    void EnsureGraphicsRootBound() {
+        if (graphicsRootBound) return;
         ID3D12DescriptorHeap* heaps[] = {
             g_dx12.cbvSrvUavHeap.Get(), g_dx12.samplerHeap.Get()
         };
         g_dx12.commandList->SetDescriptorHeaps(2, heaps);
         g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
-        g_dx12.commandList->SetPipelineState(GetPipelineState(wireframe));
-        // SetGraphicsRootSignature just invalidated every root binding, so this
-        // is exactly the place to re-establish the per-frame CBVs. Doing it here
-        // once, instead of in SetMatrices, drops five redundant root binds from
-        // every draw in between (~1200 destruction draws alone).
         BindFrameConstants();
+        graphicsRootBound = true;
     }
 
     void BindFrameConstants() {
@@ -767,13 +770,15 @@ public:
     }
 
     void UseTransparent() {
-        Use(false);
+        if (!loaded) return;
+        EnsureGraphicsRootBound();
         if (GetTransparentPipelineState())
             g_dx12.commandList->SetPipelineState(GetTransparentPipelineState());
     }
 
     void UseAdditive() {
-        Use(false);
+        if (!loaded) return;
+        EnsureGraphicsRootBound();
         if (GetAdditivePipelineState())
             g_dx12.commandList->SetPipelineState(GetAdditivePipelineState());
     }
@@ -814,6 +819,7 @@ public:
         srvCreatesThisFrame = 0;
         srvCacheHitsThisFrame = 0;
         currentDrawCall = 0;
+        graphicsRootBound = false;
         // The per-frame scratch region starts ABOVE the persistent one -- resetting
         // to 64 here would hand out slots already owned by cached materials and
         // scribble over their descriptors.
