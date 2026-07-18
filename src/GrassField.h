@@ -58,6 +58,13 @@ using namespace DirectX;
 
 class GrassField {
 public:
+    struct Exclusion {
+        float minX = 0.0f;
+        float minZ = 0.0f;
+        float maxX = 0.0f;
+        float maxZ = 0.0f;
+    };
+
     // A vertex of the blade TEMPLATE. Only two things vary within a blade -- how
     // far up it you are, and which edge you are on -- so that is all the vertex
     // buffer holds. Eight of these describe every blade in the field.
@@ -83,11 +90,13 @@ public:
     // `sampler` returns terrain height at (x, z); `waterY` is the sea level that
     // blades must stay above.
     void Initialize(std::function<float(float, float)> sampler,
-                    float span = 90.0f, int count = 12000, float waterY = 0.0f) {
+                    float span = 90.0f, int count = 12000, float waterY = 0.0f,
+                    const std::vector<Exclusion>& exclusions = {}) {
         Shutdown();
         if (!sampler) return;
         m_terrain = std::move(sampler);
         m_waterY = waterY;
+        m_exclusions = exclusions;
 
         BuildBlades(span, count);
         if (m_blades.empty()) return;
@@ -207,6 +216,7 @@ public:
         m_instances.Reset();
         m_blades.clear();
         m_cells.clear();
+        m_exclusions.clear();
         m_ready = false;
         m_time = 0.0f;
     }
@@ -256,6 +266,7 @@ private:
     // any face too steep to hold grass (slope from a central difference on the
     // same sampler the terrain is drawn from, so the test matches what you see).
     bool Plantable(float x, float z) const {
+        if (Excluded(x, z)) return false;
         const float y = m_terrain(x, z);
         if (y < m_waterY + kShoreMargin) return false;
 
@@ -263,6 +274,14 @@ private:
         const float dx = (m_terrain(x + e, z) - m_terrain(x - e, z)) / (2.0f * e);
         const float dz = (m_terrain(x, z + e) - m_terrain(x, z - e)) / (2.0f * e);
         return std::sqrt(dx * dx + dz * dz) <= kMaxSlope;
+    }
+
+    bool Excluded(float x, float z) const {
+        for (const Exclusion& exclusion : m_exclusions)
+            if (x >= exclusion.minX && x <= exclusion.maxX &&
+                z >= exclusion.minZ && z <= exclusion.maxZ)
+                return true;
+        return false;
     }
 
     void BuildBlades(float span, int count) {
@@ -291,6 +310,7 @@ private:
                 const float r = kTuftRadius * std::sqrt(Rand(seed));
                 const float x = cx + std::cos(a) * r;
                 const float z = cz + std::sin(a) * r;
+                if (Excluded(x, z)) continue;
                 const float y = m_terrain(x, z);
                 if (y < m_waterY + kShoreMargin) continue;
 
@@ -412,7 +432,8 @@ private:
 
         const UINT vbSize = (UINT)sizeof(verts);
         if (!CreateStaticBufferDX12(g_dx12.device.Get(), verts, vbSize,
-                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, m_vb))
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, m_vb,
+                "GrassVertexBuffer"))
             return false;
         m_vbv.BufferLocation = m_vb->GetGPUVirtualAddress();
         m_vbv.SizeInBytes = vbSize;
@@ -420,7 +441,8 @@ private:
 
         const UINT ibSize = (UINT)(idx.size() * sizeof(uint32_t));
         if (!CreateStaticBufferDX12(g_dx12.device.Get(), idx.data(), ibSize,
-                D3D12_RESOURCE_STATE_INDEX_BUFFER, m_ib))
+                D3D12_RESOURCE_STATE_INDEX_BUFFER, m_ib,
+                "GrassIndexBuffer"))
             return false;
         m_ibv.BufferLocation = m_ib->GetGPUVirtualAddress();
         m_ibv.SizeInBytes = ibSize;
@@ -444,7 +466,8 @@ private:
 
         const UINT instSize = (UINT)(inst.size() * sizeof(BladeInstance));
         if (!CreateStaticBufferDX12(g_dx12.device.Get(), inst.data(), instSize,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, m_instances))
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, m_instances,
+                "GrassInstanceBuffer"))
             return false;
         return true;
     }
@@ -475,6 +498,7 @@ private:
     static constexpr float kCellSize      = 8.0f;
 
     std::function<float(float, float)> m_terrain;
+    std::vector<Exclusion> m_exclusions;
     std::vector<Blade> m_blades;
     std::vector<Cell>  m_cells;
 

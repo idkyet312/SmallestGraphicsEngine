@@ -177,6 +177,13 @@ struct Scene {
     bool  showHelicopter = true;   // draw + simulate the hovering attack heli
     bool  enableMSAA = true;
     bool  enableFXAA = false;
+    bool  enableVolumetricFog = true;
+    float volumetricFogDensity = 0.0145f;
+    float volumetricFogAnisotropy = 0.0f;
+    float volumetricFogHeightFalloff = 0.055f;
+    float volumetricFogBaseHeight = 1.0f;
+    float volumetricFogDistance = 50.0f;
+    XMFLOAT3 volumetricFogTint = { 191.0f / 255.0f, 246.0f / 255.0f, 1.0f };
     int   destructionGridX = 4;
     int   destructionGridY = 3;
     int   destructionGridZ = 4;

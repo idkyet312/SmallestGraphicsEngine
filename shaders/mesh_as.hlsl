@@ -5,6 +5,7 @@ cbuffer MatrixBuffer : register(b0) {
     matrix lightSpaceMatrix;
     matrix modelView;
     matrix modelViewProjection;
+    matrix previousViewProjection;
 };
 
 cbuffer MeshDrawBuffer : register(b6) {
@@ -76,12 +77,13 @@ bool IsBackfacing(MeshletBounds bounds, float4x4 drawModel, float drawScale) {
            bounds.coneCutoff * length(toCenter) + bounds.sphereRadius * drawScale;
 }
 
-bool IsOccluded(MeshletBounds bounds, float4x4 drawModelView,
-                float4x4 drawMVP, float drawScale) {
+bool IsOccluded(MeshletBounds bounds, float4x4 drawModel,
+                float4x4 drawModelView, float drawScale) {
     if (!occlusionEnabled) return false;
     float4 localCenter = float4(bounds.sphereCenter, 1);
     float4 viewCenter = mul(localCenter, drawModelView);
-    float4 clip = mul(localCenter, drawMVP);
+    float4 worldCenter = mul(localCenter, drawModel);
+    float4 clip = mul(worldCenter, previousViewProjection);
     if (clip.w <= 0.001) return false;
     float radius = bounds.sphereRadius * drawScale;
     float2 centerUV = (clip.xy / clip.w) * float2(0.5, -0.5) + 0.5;
@@ -89,7 +91,8 @@ bool IsOccluded(MeshletBounds bounds, float4x4 drawModelView,
                       clip.w * 0.5;
     float2 uvMin = centerUV - radiusUV;
     float2 uvMax = centerUV + radiusUV;
-    float nearestDepth = saturate(clip.z / clip.w - radius / max(abs(viewCenter.z), 0.001));
+    float nearestDepth = saturate(clip.z / clip.w -
+        radius / max(abs(viewCenter.z), 0.001));
     uvMin = saturate(uvMin);
     uvMax = saturate(uvMax);
     if (uvMin.x >= uvMax.x || uvMin.y >= uvMax.y) return false;
@@ -147,7 +150,7 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
             ? IntersectsFrustum(bounds, drawMVP, drawScale)
             : (IntersectsFrustum(bounds, drawMVP, drawScale) &&
                !IsBackfacing(bounds, drawModel, drawScale) &&
-               !IsOccluded(bounds, drawModelView, drawMVP, drawScale));
+               !IsOccluded(bounds, drawModel, drawModelView, drawScale));
         if (visible) {
             uint slot;
             InterlockedAdd(visibleCount, 1, slot);

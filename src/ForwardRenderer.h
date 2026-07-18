@@ -37,6 +37,7 @@ extern std::shared_ptr<SceneNode> g_humveeShadowModel;
 extern std::shared_ptr<SceneNode> g_helicopterModel;
 extern DirectX::XMFLOAT3 g_helicopterPosition;
 extern bool g_stressTestMode;
+extern bool g_emptyLevelMode;
 DirectX::XMMATRIX HumveeWorldMatrix();
 DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
 DirectX::XMMATRIX HelicopterWorldMatrix();
@@ -359,6 +360,35 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
 
 // Draw an imported GLB scene graph node (and its children) with an extra
 // world transform applied on top of each node's own local/global transform.
+inline bool RasterPrimitiveIntersectsFrustum(const MeshPrimitive& primitive,
+                                             const XMMATRIX& modelViewProjection) {
+    if (!primitive.boundsValid) return true;
+
+    bool outsideLeft = true, outsideRight = true;
+    bool outsideBottom = true, outsideTop = true;
+    bool outsideNear = true, outsideFar = true;
+    for (UINT corner = 0; corner < 8; ++corner) {
+        const XMVECTOR local = XMVectorSet(
+            (corner & 1) ? primitive.boundsMax.x : primitive.boundsMin.x,
+            (corner & 2) ? primitive.boundsMax.y : primitive.boundsMin.y,
+            (corner & 4) ? primitive.boundsMax.z : primitive.boundsMin.z,
+            1.0f);
+        XMFLOAT4 clip;
+        XMStoreFloat4(&clip, XMVector4Transform(local, modelViewProjection));
+        // Bounds crossing the camera plane are ambiguous in homogeneous clip
+        // space. Keep them to avoid near-camera popping.
+        if (clip.w <= 0.0f) return true;
+        outsideLeft &= clip.x < -clip.w;
+        outsideRight &= clip.x > clip.w;
+        outsideBottom &= clip.y < -clip.w;
+        outsideTop &= clip.y > clip.w;
+        outsideNear &= clip.z < 0.0f;
+        outsideFar &= clip.z > clip.w;
+    }
+    return !(outsideLeft || outsideRight || outsideBottom || outsideTop ||
+             outsideNear || outsideFar);
+}
+
 inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& shader,
                            const XMMATRIX& worldTransform,
                            const XMMATRIX& view, const XMMATRIX& proj, const XMMATRIX& lightSpace) {
@@ -372,6 +402,21 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
             if (prim.vbv.BufferLocation == 0) continue;
 
             const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
+            const D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress = prim.meshletDescBuffer
+                ? prim.meshletDescBuffer->GetGPUVirtualAddress() : 0;
+            const D3D12_GPU_VIRTUAL_ADDRESS boundsAddress = prim.meshletBoundsBuffer
+                ? prim.meshletBoundsBuffer->GetGPUVirtualAddress() : 0;
+            const D3D12_GPU_VIRTUAL_ADDRESS vertexIndexAddress = prim.meshletVertexIndexBuffer
+                ? prim.meshletVertexIndexBuffer->GetGPUVirtualAddress() : 0;
+            const D3D12_GPU_VIRTUAL_ADDRESS triangleAddress = prim.meshletTriangleBuffer
+                ? prim.meshletTriangleBuffer->GetGPUVirtualAddress() : 0;
+            const bool meshShaderDraw = !transparent && g_useMeshShader &&
+                g_meshShader.CanDraw(prim.meshletCount, meshletDescAddress,
+                    boundsAddress, vertexIndexAddress, triangleAddress);
+            if (!meshShaderDraw && !transparent && !prim.skinBuffer &&
+                !RasterPrimitiveIntersectsFrustum(prim, model * view * proj))
+                continue;
+
             if (prim.material) {
                 if (transparent) shader.UseTransparent(); else shader.Use(false);
                 XMFLOAT3 color(prim.material->baseColorFactor.x,
@@ -394,21 +439,13 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
                 shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
             }
 
-            D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress = prim.meshletDescBuffer
-                ? prim.meshletDescBuffer->GetGPUVirtualAddress() : 0;
-            D3D12_GPU_VIRTUAL_ADDRESS boundsAddress = prim.meshletBoundsBuffer
-                ? prim.meshletBoundsBuffer->GetGPUVirtualAddress() : 0;
-            D3D12_GPU_VIRTUAL_ADDRESS vertexIndexAddress = prim.meshletVertexIndexBuffer
-                ? prim.meshletVertexIndexBuffer->GetGPUVirtualAddress() : 0;
-            D3D12_GPU_VIRTUAL_ADDRESS triangleAddress = prim.meshletTriangleBuffer
-                ? prim.meshletTriangleBuffer->GetGPUVirtualAddress() : 0;
-            if (!transparent && g_useMeshShader && g_meshShader.CanDraw(
-                    prim.meshletCount, meshletDescAddress, boundsAddress,
-                    vertexIndexAddress, triangleAddress)) {
+            if (meshShaderDraw) {
                 g_meshShader.Draw(prim.vbv,
                     (UINT)(prim.vertices.size() / 12), prim.indexCount,
                     prim.meshletCount, meshletDescAddress, boundsAddress,
-                    vertexIndexAddress, triangleAddress);
+                    vertexIndexAddress, triangleAddress,
+                    0, 0, prim.material && prim.material->doubleSided,
+                    !prim.material || !prim.material->disableOcclusionCulling);
             } else {
                 // A previous mesh draw leaves the mesh PSO bound. Restore the
                 // conventional VS/PS pipeline before issuing IA draw calls.
@@ -522,7 +559,9 @@ inline void DrawSceneNodeInstances(const std::shared_ptr<SceneNode>& node,
                 prim.meshletDescBuffer->GetGPUVirtualAddress(),
                 prim.meshletBoundsBuffer->GetGPUVirtualAddress(),
                 prim.meshletVertexIndexBuffer->GetGPUVirtualAddress(),
-                prim.meshletTriangleBuffer->GetGPUVirtualAddress(), models);
+                prim.meshletTriangleBuffer->GetGPUVirtualAddress(), models,
+                prim.material && prim.material->doubleSided,
+                !prim.material || !prim.material->disableOcclusionCulling);
             shader.NextDrawCall();
         }
     }
@@ -683,7 +722,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Cube 1 - draw the imported model if loaded, else fall back to the procedural cube.
     // The model is its own multi-meter scene (not a unit cube), so place it directly
     // on the floor at the origin rather than reusing cube1's small transform.
-    if (crateModel && g_showH2Model) {
+    if (!g_emptyLevelMode && crateModel && g_showH2Model) {
         DrawSceneNode(crateModel, shader, XMMatrixIdentity(), view, proj, lightSpace);
         // Imported model used the mesh pipeline. Restore IA pipeline for
         // procedural objects that follow it.
@@ -712,7 +751,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 ++g_destructionBatchesThisFrame;
                 g_destructionChunksSubmittedThisFrame += batch.chunkCount;
             }
-        } else for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
+        }
+        for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
                 if (item.sphereRadius > 0.0f &&
                     !SphereVisible(frustum, item.sphereCenter, item.sphereRadius)) {
                     ++g_destructionCulledThisFrame;
@@ -756,7 +796,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     // Palm trees: trunk sections and fronds are boxes driven by physics bodies,
     // standing or toppling, so they all draw through the ordinary cube path.
-    if (g_trees.IsInitialized()) {
+    if (!g_emptyLevelMode && g_trees.IsInitialized()) {
         shader.Use(scene.wireframeMode);
         for (const TreeItem& item : g_trees.GetItems()) {
             const XMMATRIX xf = XMLoadFloat4x4(&item.transform);
@@ -797,7 +837,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     //
     // Blades are built in world space, hence the identity model matrix. Opaque, so
     // this lands before the transparent water below or it would sort wrong.
-    if (g_grass.IsInitialized() && shader.GetGrassPipelineState()) {
+    if (!g_emptyLevelMode && g_grass.IsInitialized() && shader.GetGrassPipelineState()) {
         // The shader fades blades with distance, and the cull below needs it too.
         g_grass.SetViewer(scene.camera.Position);
 
@@ -853,7 +893,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     // The sea around the island. Drawn before the pool because it is the farther
     // transparent surface, and blended surfaces have to go back-to-front.
-    if (g_ocean.IsInitialized()) {
+    if (!g_emptyLevelMode && g_ocean.IsInitialized()) {
         const D3D12_VERTEX_BUFFER_VIEW& ovbv = g_ocean.UpdateAndGetVBV(g_dx12.frameIndex);
         const D3D12_INDEX_BUFFER_VIEW& oibv = g_ocean.GetIBV();
         const UINT oceanIndices = g_ocean.GetIndexCount();
@@ -874,7 +914,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     // Water pool: floating crates + any debris (opaque) drawn first, then the
     // animated, undulating water surface on top so the floaters show through it.
-    if (g_water.IsInitialized()) {
+    if (!g_emptyLevelMode && g_water.IsInitialized()) {
         shader.Use(scene.wireframeMode);
         for (const WaterFloaterItem& item : g_water.GetFloaterItems()) {
             shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
@@ -903,7 +943,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     }
 
     // Cube 2
-    if (scene.cube2.visible) {
+    if (!g_emptyLevelMode && scene.cube2.visible) {
         model = scene.cube2.GetModelMatrix();
         shader.SetMatrices(model, view, proj, lightSpace);
         shader.SetObjectColor(scene.cube2.color);
@@ -911,7 +951,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.NextDrawCall();
     }
 
-    if (g_humveeModel) {
+    if (!g_emptyLevelMode && g_humveeModel) {
         if (!staticBatches.Submit(g_humveeModel, HumveeWorldMatrix()))
             DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
                 view, proj, lightSpace);
@@ -921,7 +961,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 view, proj, lightSpace);
     }
 
-    if (g_helicopterModel && scene.showHelicopter) {
+    if (!g_emptyLevelMode && g_helicopterModel && scene.showHelicopter) {
         // Rotor child transforms and aggressively simplified cockpit/fuselage
         // meshlets make the generic static-mesh bounds unsuitable here. A bad
         // amplification-shader reject made the loaded aircraft disappear. The
@@ -939,7 +979,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     // Authored shootable barrel FBX. Its pivot is at the base, while gameplay
     // stores barrel.position at collision center 0.75 m above ground.
-    if (g_explosiveBarrelModel) {
+    if (!g_emptyLevelMode && g_explosiveBarrelModel) {
         for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
             if (!barrel.active) continue;
             const XMMATRIX barrelTransform = XMMatrixTranslation(
@@ -948,7 +988,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 DrawSceneNode(g_explosiveBarrelModel, shader, barrelTransform,
                     view, proj, lightSpace);
         }
-    } else for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+    } else if (!g_emptyLevelMode) for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
         if (barrel.active) {
             model = XMMatrixScaling(1.6f, 1.5f, 1.6f) *
                     XMMatrixTranslation(barrel.position.x, barrel.position.y,
@@ -1139,12 +1179,14 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // so the numbers reflect a settled steady-state frame rather than startup.
     {
         static int frames = 0;
-        if (++frames == 300) {
+        if (++frames % 300 == 0) {
             if (FILE* f = std::fopen("perf_counters.log", "w")) {
-                std::fprintf(f, "srvCreates=%u srvCacheHits=%u destructionRenderItems=%zu culled=%u\n",
+                std::fprintf(f, "srvCreates=%u srvCacheHits=%u destructionRenderItems=%zu destructionRenderBatches=%zu culled=%u batchWorker=%u\n",
                              shader.srvCreatesThisFrame, shader.srvCacheHitsThisFrame,
                              g_destruction.GetRenderItems().size(),
-                             g_destructionCulledThisFrame);
+                             g_destruction.GetRenderBatches().size(),
+                             g_destructionCulledThisFrame,
+                             g_destruction.IsBatchBuildPending() ? 1u : 0u);
                 std::fclose(f);
             }
         }

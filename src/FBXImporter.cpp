@@ -29,7 +29,10 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
     const bool preserveOH1Rotors = filepath.find("OH-1") != std::string::npos;
     unsigned importFlags = aiProcess_Triangulate | aiProcess_JoinIdenticalVertices |
         aiProcess_GenSmoothNormals | aiProcess_CalcTangentSpace |
-        aiProcess_ImproveCacheLocality;
+        aiProcess_ImproveCacheLocality |
+        // Assimp emits counter-clockwise triangles. DX12 mesh-shader pipelines
+        // use the default clockwise front face, unlike the no-cull IA fallback.
+        aiProcess_FlipWindingOrder;
     if (!preserveOH1Rotors) importFlags |= aiProcess_PreTransformVertices;
     const aiScene* scene = importer.ReadFile(filepath, importFlags);
     if (!scene || !scene->HasMeshes()) { std::cerr << "FBX load failed: " << importer.GetErrorString() << "\n"; return {}; }
@@ -178,15 +181,19 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
             aiVector3D n = src->HasNormals() ? src->mNormals[v] : aiVector3D(0,1,0);
             aiVector3D uv = src->HasTextureCoords(0) ? src->mTextureCoords[0][v] : aiVector3D();
             aiVector3D t = src->HasTangentsAndBitangents() ? src->mTangents[v] : aiVector3D(1,0,0);
+            aiVector3D b = src->HasTangentsAndBitangents() ? src->mBitangents[v] : aiVector3D(0,0,1);
             aiVector3D position = src->mVertices[v];
             if (preserveOH1Rotors) {
                 position = meshTransforms[mi] * position;
                 n = normalTransform * n; n.Normalize();
                 t = directionTransform * t; t.Normalize();
+                b = directionTransform * b; b.Normalize();
             }
+            const aiVector3D crossNT = n ^ t;
+            const float tangentSign = crossNT * b < 0.0f ? -1.0f : 1.0f;
             p.vertices.insert(p.vertices.end(), {position.x * uniformScale,
                 position.y * uniformScale, position.z * uniformScale,
-                n.x,n.y,n.z,uv.x,uv.y,t.x,t.y,t.z,1.0f});
+                n.x,n.y,n.z,uv.x,uv.y,t.x,t.y,t.z,tangentSign});
         }
         for (unsigned f=0; f<src->mNumFaces; ++f)
             for (unsigned i=0; i<src->mFaces[f].mNumIndices; ++i) p.indices.push_back(src->mFaces[f].mIndices[i]);

@@ -672,7 +672,8 @@ public:
             if (g_meshShader.CanDraw(prim.meshletCount, descA, boundsA, vidxA, triA)) {
                 g_meshShader.Draw(prim.vbv, (UINT)(prim.vertices.size() / 12), prim.indexCount,
                     prim.meshletCount, descA, boundsA, vidxA, triA,
-                    paletteAddr, prim.skinBuffer->GetGPUVirtualAddress());
+                    paletteAddr, prim.skinBuffer->GetGPUVirtualAddress(),
+                    prim.material && prim.material->doubleSided);
             }
             shader.NextDrawCall();
         }

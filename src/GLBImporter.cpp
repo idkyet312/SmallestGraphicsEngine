@@ -811,10 +811,11 @@ static void CollectPrimitivesRelativeToRoot(
 
 static Microsoft::WRL::ComPtr<ID3D12Resource> CreateStaticGeometryBuffer(
     ID3D12Device* device, const void* data, UINT sizeBytes,
-    D3D12_RESOURCE_STATES finalState) {
+    D3D12_RESOURCE_STATES finalState, const char* debugLabel) {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     if (sizeBytes == 0) return resource;
-    if (!CreateStaticBufferDX12(device, data, sizeBytes, finalState, resource))
+    if (!CreateStaticBufferDX12(device, data, sizeBytes, finalState, resource,
+            debugLabel))
         return {};
     return resource;
 }
@@ -824,10 +825,28 @@ bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* devic
     primitive.indexCount = (UINT)primitive.indices.size();
     if (!device || primitive.vertices.empty()) return false;
 
+    const size_t primitiveVertexCount = primitive.vertices.size() / 12;
+    if (primitiveVertexCount > 0) {
+        XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
+        XMFLOAT3 maximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        for (size_t vertex = 0; vertex < primitiveVertexCount; ++vertex) {
+            const float* position = &primitive.vertices[vertex * 12];
+            minimum.x = (std::min)(minimum.x, position[0]);
+            minimum.y = (std::min)(minimum.y, position[1]);
+            minimum.z = (std::min)(minimum.z, position[2]);
+            maximum.x = (std::max)(maximum.x, position[0]);
+            maximum.y = (std::max)(maximum.y, position[1]);
+            maximum.z = (std::max)(maximum.z, position[2]);
+        }
+        primitive.boundsMin = minimum;
+        primitive.boundsMax = maximum;
+        primitive.boundsValid = true;
+    }
+
     const UINT vbSize = (UINT)(primitive.vertices.size() * sizeof(float));
     primitive.vertexBuffer = CreateStaticGeometryBuffer(device, primitive.vertices.data(), vbSize,
         D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "VertexBuffer");
     if (!primitive.vertexBuffer) return false;
     primitive.vbv.BufferLocation = primitive.vertexBuffer->GetGPUVirtualAddress();
     primitive.vbv.SizeInBytes = vbSize;
@@ -836,7 +855,7 @@ bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* devic
     if (!primitive.indices.empty()) {
         const UINT ibSize = (UINT)(primitive.indices.size() * sizeof(unsigned int));
         primitive.indexBuffer = CreateStaticGeometryBuffer(device, primitive.indices.data(), ibSize,
-            D3D12_RESOURCE_STATE_INDEX_BUFFER);
+            D3D12_RESOURCE_STATE_INDEX_BUFFER, "IndexBuffer");
         if (!primitive.indexBuffer) return false;
         primitive.ibv.BufferLocation = primitive.indexBuffer->GetGPUVirtualAddress();
         primitive.ibv.SizeInBytes = ibSize;
@@ -854,7 +873,7 @@ bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* devic
     }
     if (sourceIndices.size() < 3) return true;
 
-    const size_t vertexCount = primitive.vertices.size() / 12;
+    const size_t vertexCount = primitiveVertexCount;
     const size_t maxMeshlets = meshopt_buildMeshletsBound(
         sourceIndices.size(), MaxMeshletVertices, MaxMeshletTriangles);
     std::vector<meshopt_Meshlet> optimizedMeshlets(maxMeshlets);
@@ -912,16 +931,16 @@ bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* devic
     if (!meshlets.empty()) {
         primitive.meshletDescBuffer = CreateStaticGeometryBuffer(device, meshlets.data(),
             (UINT)(meshlets.size() * sizeof(MeshletDescDX12)),
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "MeshletDescBuffer");
         primitive.meshletVertexIndexBuffer = CreateStaticGeometryBuffer(device, meshletVertexIndices.data(),
             (UINT)(meshletVertexIndices.size() * sizeof(UINT)),
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "MeshletVertexIndices");
         primitive.meshletTriangleBuffer = CreateStaticGeometryBuffer(device, meshletTriangles.data(),
             (UINT)(meshletTriangles.size() * sizeof(UINT)),
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "MeshletTriangles");
         primitive.meshletBoundsBuffer = CreateStaticGeometryBuffer(device, bounds.data(),
             (UINT)(bounds.size() * sizeof(MeshletBoundsDX12)),
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "MeshletBoundsBuffer");
     }
     return true;
 }

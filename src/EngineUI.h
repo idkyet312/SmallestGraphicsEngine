@@ -230,6 +230,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     g_destruction.GetRenderItemRebuildCount()),
                 static_cast<unsigned long long>(
                     g_destruction.GetBatchGeometryRebuildCount()));
+    ImGui::Text("Destruction render cache: %zu actor batches  %zu chunk fallbacks  Worker: %s",
+                g_destruction.GetRenderBatches().size(),
+                g_destruction.GetRenderItems().size(),
+                g_destruction.IsBatchBuildPending() ? "building" : "idle");
     ImGui::Checkbox("God Mode", &scene.playerGodMode);
     const StaticBufferStatsDX12 staticStats = GetStaticBufferStatsDX12();
     ImGui::Text("GPU-local static buffers: %u  %.1f MiB  Pending: %u",
@@ -372,6 +376,16 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
 
         ImGui::Checkbox("4x MSAA (Forward only)", &scene.enableMSAA);
         ImGui::Checkbox("FXAA", &scene.enableFXAA);
+        ImGui::Checkbox("Volumetric Fog (Forward)", &scene.enableVolumetricFog);
+        if (scene.enableVolumetricFog) {
+            ImGui::DragFloat("Fog Density", &scene.volumetricFogDensity,
+                             0.0005f, 0.0001f, 0.05f, "%.4f");
+            ImGui::SliderFloat("Fog Anisotropy", &scene.volumetricFogAnisotropy,
+                               0.0f, 0.9f, "%.2f");
+            ImGui::ColorEdit3("Fog Tint", &scene.volumetricFogTint.x);
+            ImGui::DragFloat("Fog Distance", &scene.volumetricFogDistance,
+                             5.0f, 20.0f, scene.cameraFar, "%.0f m");
+        }
         if (scene.enableMSAA &&
             (scene.useVisibilityBuffer || scene.useRaytracing)) {
             ImGui::TextDisabled("MSAA inactive outside Forward renderer");

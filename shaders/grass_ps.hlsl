@@ -162,18 +162,6 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float NdotL = saturate(dot(normal, lightDir));
     result += albedo / 3.14159265 * lightColor * NdotL * shadowVisibility;
 
-    // Same aerial perspective as clustered_dx12_ps.hlsl.
-    float cameraDistance = length(viewPos - input.fragPos);
-    float3 cameraRay = -viewDir;
-    float horizonAmount = exp(-abs(cameraRay.y) * 6.0);
-    float3 fogZenith = float3(0.30, 0.55, 0.82);
-    float3 fogHorizon = float3(0.78, 0.72, 0.60);
-    float3 fogColor = lerp(fogZenith, fogHorizon, horizonAmount);
-    float distanceFog = 1.0 - exp(-cameraDistance * 0.012);
-    float heightFog = exp(-max(input.fragPos.y, 0.0) * 0.035);
-    float fogAmount = saturate(distanceFog * lerp(0.45, 1.0, heightFog));
-    result = lerp(result, fogColor, fogAmount * 0.72);
-
     result = tonemapAgXPunchy(max(result, 0.0));
     return float4(result, 1.0);
 }
