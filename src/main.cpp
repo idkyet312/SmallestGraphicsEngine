@@ -48,7 +48,6 @@
 #include "T3DPhysicsAsset.h"
 #include "GunAudio.h"
 #include "WaterVolume.h"
-#include "RopeSwing.h"
 #include "PalmTrees.h"
 
 using namespace DirectX;
@@ -824,9 +823,6 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
         return false;
     if (HitTerrainSegment(origin, target, rayRadius, hit)) return false;
     if (g_trees.BlocksSegment(origin, target, rayRadius)) return false;
-    if (g_rope.BlocksSegment(origin, target, rayRadius) ||
-        g_gibbet.BlocksSegment(origin, target, rayRadius))
-        return false;
     for (const auto& bandit : g_bandits) {
         if (!bandit || bandit.get() == &shooter || bandit->Dead()) continue;
         // Human shield must not stop enemies from taking the shot. The hostile
@@ -845,9 +841,6 @@ static bool GrabPathClear(const XMFLOAT3& target) {
         return false;
     if (HitTerrainSegment(scene.camera.Position, target, rayRadius, hit)) return false;
     if (g_trees.BlocksSegment(scene.camera.Position, target, rayRadius)) return false;
-    if (g_rope.BlocksSegment(scene.camera.Position, target, rayRadius) ||
-        g_gibbet.BlocksSegment(scene.camera.Position, target, rayRadius))
-        return false;
     return true;
 }
 
@@ -1211,8 +1204,6 @@ void BanditDebugText() {
 }
 WaterVolume                 g_water;
 WaterVolume                 g_ocean;   // sea ringing the island, surface at y = 0
-RopeSwing                   g_rope;
-RopeSwing                   g_gibbet;
 PalmTrees                   g_trees;
 GrassField                  g_grass;
 static SkyRendererDX12      skyRenderer;
@@ -3603,8 +3594,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_heldBandit = nullptr;
             g_water.ResetSurface();
             g_ocean.ResetSurface();
-            if (g_rope.IsInitialized()) g_rope.Reset();
-            if (g_gibbet.IsInitialized()) g_gibbet.Reset();
             if (g_trees.IsInitialized()) ResetPalmTrees();
             if (g_environmentInitialized &&
                 g_environmentStressMode != g_stressTestMode)
@@ -3762,8 +3751,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         g_water.Update(deltaTime);
         g_ocean.Update(deltaTime);
-        g_rope.Update(deltaTime);
-        g_gibbet.Update(deltaTime);
         g_trees.SetWind(g_grass.WindStrength(), g_grass.WindSpeed());
         g_trees.Update(deltaTime);
         const bool primaryHelicopterActive =
@@ -4041,28 +4028,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     scene.SpawnBulletImpact(treeHit, normal);
                     scene.SpawnSmokeBurst(treeHit, 0.25f, 0.1f);
                     projectile.active = false;
-                } else if (XMFLOAT3 ropeHit;
-                           g_rope.Shoot(projectile.previousPosition, projectile.position,
-                                        projectile.direction, bulletRadius,
-                                        scene.destructionBulletImpulse, ropeHit)) {
-                    // Cut the rope (block falls) or shove the block (it swings).
-                    const XMFLOAT3 normal(-projectile.direction.x,
-                                          -projectile.direction.y,
-                                          -projectile.direction.z);
-                    scene.SpawnBulletImpact(ropeHit, normal);
-                    scene.SpawnSmokeBurst(ropeHit, 0.2f, 0.08f);
-                    projectile.active = false;
-                } else if (XMFLOAT3 gibHit;
-                           g_gibbet.Shoot(projectile.previousPosition, projectile.position,
-                                          projectile.direction, bulletRadius,
-                                          scene.destructionBulletImpulse, gibHit)) {
-                    // Cut the rope (body drops) or hit a limb (it swings and spins).
-                    const XMFLOAT3 normal(-projectile.direction.x,
-                                          -projectile.direction.y,
-                                          -projectile.direction.z);
-                    scene.SpawnBulletImpact(gibHit, normal);
-                    scene.SpawnSmokeBurst(gibHit, 0.2f, 0.08f);
-                    projectile.active = false;
                 } else if (XMFLOAT3 waterHit;
                            g_water.ShootSurface(projectile.previousPosition,
                                                 projectile.position, waterHit)) {
@@ -4181,21 +4146,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     g_water.Splash(x, z, s);
                 });
                 g_destruction.InitializeVehicle({ 0.0f, 3.45f, 0.0f });
-
-                // Block hung from a rope, out on the open +X side away from the
-                // pool. Shoot the rope and it drops; shoot the block and it swings.
-                const float ropeX = 22.0f, ropeZ = 12.0f;
-                const float groundY = terrainSampler(ropeX, ropeZ);
-                g_rope.SetGroundY(groundY);
-                g_rope.Initialize(XMFLOAT3(ropeX, groundY + 6.5f, ropeZ));
-
-                // Ragdoll strung up from a second rope, further along. Shoot the
-                // rope and the body drops in a heap; shoot a limb and it swings.
-                const float gibX = 26.0f, gibZ = 12.0f;
-                const float gibGround = terrainSampler(gibX, gibZ);
-                g_gibbet.SetGroundY(gibGround);
-                g_gibbet.Initialize(XMFLOAT3(gibX, gibGround + 7.5f, gibZ),
-                                    5, 0.5f, 0.55f, RopeSwing::Payload::Ragdoll);
 
                 // Palm grove ringing the pool. Shoot through a trunk and the tree
                 // snaps at that height and topples away from you.
