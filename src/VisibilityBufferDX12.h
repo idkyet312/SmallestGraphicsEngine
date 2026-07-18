@@ -5,6 +5,7 @@
 #include "ShaderDX12.h"
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 // Instance IDs occupy a full uint in the visibility target. Keep this aligned
@@ -19,6 +20,8 @@ static const UINT VB_CLUSTER_Y = 9;
 static const UINT VB_CLUSTER_Z = 10;
 static const UINT VB_CLUSTER_COUNT = VB_CLUSTER_X * VB_CLUSTER_Y * VB_CLUSTER_Z;
 static const UINT VB_MAX_LIGHTS_PER_CLUSTER = 32;
+static const UINT VB_MAX_MATERIALS = 256;
+static const UINT VB_MAX_MATERIAL_TEXTURES = 64;
 
 // Must match the compute shader's DrawCallData
 struct VBDrawCallData {
@@ -48,6 +51,13 @@ struct VBClusterData {
     UINT lightCount = 0;
     UINT lightIndices[VB_MAX_LIGHTS_PER_CLUSTER] = {};
     UINT padding[3] = {};
+};
+
+struct VBMaterialData {
+    XMFLOAT4 baseColorFactor = { 1, 1, 1, 1 };
+    XMFLOAT4 emissiveOcclusion = { 0, 0, 0, 0 };
+    XMFLOAT4 pbrParams = { 0, 0.5f, 1, 0 };
+    UINT textureIndices[4] = { UINT_MAX, UINT_MAX, UINT_MAX, 0 };
 };
 
 static const UINT VB_INVALID_MESH = UINT_MAX;
@@ -122,6 +132,8 @@ public:
     ComPtr<ID3D12Resource> indexDataUpload;
     ComPtr<ID3D12Resource> clusterDataBuffer;     // StructuredBuffer<ClusterData>
     ComPtr<ID3D12Resource> clusterDataUpload;
+    ComPtr<ID3D12Resource> materialDataBuffer;
+    VBMaterialData* mappedMaterials = nullptr;
 
     // Upload buffer for frame constants
     UploadBuffer<VBFrameConstants> frameConstantBuffer;
@@ -137,6 +149,9 @@ public:
     std::vector<VBClusterData>  cpuClusters;
     std::vector<XMFLOAT4X4>     previousModels;
     std::vector<VBMeshData>     meshes;
+    std::unordered_map<const SceneMaterial*, UINT> materialLookup;
+    UINT materialCount = 1;
+    UINT materialTextureCount = 0;
     UINT currentDrawCall = 0;
     UINT previousDrawCount = 0;
     UINT persistentVertexCount = 0;
@@ -175,6 +190,7 @@ public:
         cpuIndices.resize(VB_MAX_INDICES);
         cpuClusters.resize(VB_CLUSTER_COUNT);
         previousModels.resize(VB_MAX_DRAW_CALLS);
+        if (mappedMaterials) mappedMaterials[0] = VBMaterialData{};
 
         initialized = true;
         std::cout << "Visibility Buffer initialized (" << width << "x" << height << ")" << std::endl;
@@ -192,6 +208,53 @@ public:
         cluster.lightCount = (std::min)(lightCount, VB_MAX_LIGHTS_PER_CLUSTER);
         for (UINT i = 0; i < cluster.lightCount; ++i)
             cluster.lightIndices[i] = static_cast<UINT>(lightIndices[i]);
+    }
+
+    UINT RegisterMaterial(const SceneMaterial* material) {
+        if (!material) return 0;
+        auto found = materialLookup.find(material);
+        if (found != materialLookup.end()) return found->second;
+        if (materialCount >= VB_MAX_MATERIALS) return 0;
+
+        VBMaterialData data;
+        data.baseColorFactor = material->baseColorFactor;
+        data.emissiveOcclusion.w = material->occlusionStrength;
+        data.pbrParams = XMFLOAT4(material->metallicFactor,
+            material->roughnessFactor, material->normalYSign, 1.0f);
+        auto addTexture = [&](ID3D12Resource* texture) -> UINT {
+            if (!texture || materialTextureCount >= VB_MAX_MATERIAL_TEXTURES)
+                return UINT_MAX;
+            const UINT textureIndex = materialTextureCount++;
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = texture;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            g_dx12.commandList->ResourceBarrier(1, &barrier);
+            UINT descriptorSize = g_dx12.cbvSrvUavDescriptorSize;
+            D3D12_CPU_DESCRIPTOR_HANDLE handle =
+                computeDescHeap->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += (SIZE_T)descriptorSize * (8 + textureIndex);
+            D3D12_RESOURCE_DESC resource = texture->GetDesc();
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = resource.Format;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = resource.MipLevels;
+            g_dx12.device->CreateShaderResourceView(texture, &srv, handle);
+            return textureIndex;
+        };
+        data.textureIndices[0] = addTexture(material->baseColorTexture.Get());
+        data.textureIndices[1] = addTexture(material->normalTexture.Get());
+        data.textureIndices[2] = addTexture(material->metallicRoughnessTexture.Get());
+        data.textureIndices[3] = material->roughnessOnlyTexture ? 1u : 0u;
+
+        const UINT id = materialCount++;
+        mappedMaterials[id] = data;
+        materialLookup.emplace(material, id);
+        return id;
     }
 
     // Upload-once mesh registration. Instances reference this immutable geometry
@@ -792,12 +855,32 @@ private:
                                      clusterDataBuffer, clusterDataUpload))
             return false;
 
+        D3D12_HEAP_PROPERTIES materialHeap = {};
+        materialHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC materialDesc = {};
+        materialDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        materialDesc.Width = VB_MAX_MATERIALS * sizeof(VBMaterialData);
+        materialDesc.Height = 1;
+        materialDesc.DepthOrArraySize = 1;
+        materialDesc.MipLevels = 1;
+        materialDesc.SampleDesc.Count = 1;
+        materialDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT hr = g_dx12.device->CreateCommittedResource(
+            &materialHeap, D3D12_HEAP_FLAG_NONE, &materialDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&materialDataBuffer));
+        if (FAILED(hr)) return false;
+        D3D12_RANGE noRead = { 0, 0 };
+        hr = materialDataBuffer->Map(0, &noRead,
+            reinterpret_cast<void**>(&mappedMaterials));
+        if (FAILED(hr)) return false;
+
         return true;
     }
 
     bool CreateComputeDescriptorHeap() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-        heapDesc.NumDescriptors = 12;
+        heapDesc.NumDescriptors = 77;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         HRESULT hr = g_dx12.device->CreateDescriptorHeap(
@@ -978,9 +1061,9 @@ private:
         //   [9] b2 - point lights CBV
 
         D3D12_DESCRIPTOR_RANGE ranges[3] = {};
-        // SRVs t0..t6
+        // SRVs t0..t71: frame/geometry, material table, texture array.
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 7;
+        ranges[0].NumDescriptors = 72;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].RegisterSpace = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
@@ -990,14 +1073,14 @@ private:
         ranges[1].NumDescriptors = 2;
         ranges[1].BaseShaderRegister = 0;
         ranges[1].RegisterSpace = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 7;
+        ranges[1].OffsetInDescriptorsFromTableStart = 72;
 
         // CBVs b1..b3 (lights, point lights, sky SH)
         ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
         ranges[2].NumDescriptors = 3;
         ranges[2].BaseShaderRegister = 1;
         ranges[2].RegisterSpace = 0;
-        ranges[2].OffsetInDescriptorsFromTableStart = 9;
+        ranges[2].OffsetInDescriptorsFromTableStart = 74;
 
         D3D12_ROOT_PARAMETER resolveParams[2] = {};
 
@@ -1198,7 +1281,31 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [7] u0 - linear HDR output UAV
+        // [7] t7 - persistent material table
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvDesc.Buffer.NumElements = VB_MAX_MATERIALS;
+            srvDesc.Buffer.StructureByteStride = sizeof(VBMaterialData);
+            g_dx12.device->CreateShaderResourceView(
+                materialDataBuffer.Get(), &srvDesc, cpuHandle);
+            cpuHandle.ptr += descSize;
+        }
+
+        // [8..71] t8..t71 - material texture array, initialized to null.
+        for (UINT i = 0; i < VB_MAX_MATERIAL_TEXTURES; ++i) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv = {};
+            nullSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            nullSrv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(nullptr, &nullSrv, cpuHandle);
+            cpuHandle.ptr += descSize;
+        }
+
+        // [72] u0 - linear HDR output UAV
         {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
             uavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -1207,7 +1314,7 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [8] u1 - screen-space motion vectors
+        // [73] u1 - screen-space motion vectors
         {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
             uavDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
@@ -1217,9 +1324,9 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [9] b1 - light buffer CBV (placeholder, will be updated per frame)
-        // [10] b2 - point lights CBV (placeholder, will be updated per frame)
-        // [11] b3 - sky SH CBV
+        // [74] b1 - light buffer CBV
+        // [75] b2 - point lights CBV
+        // [76] b3 - sky SH CBV
         // These will be created in UpdateLightDescriptors
     }
 
@@ -1330,7 +1437,7 @@ public:
                                 D3D12_GPU_VIRTUAL_ADDRESS shBufferAddr) {
         UINT descSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
-        cpuHandle.ptr += 9 * descSize;
+        cpuHandle.ptr += 74 * descSize;
 
         // [7] b1 - light buffer CBV
         {

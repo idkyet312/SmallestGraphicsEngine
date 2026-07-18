@@ -56,6 +56,7 @@ struct IdTechDrawItem {
     bool isCube;
     UINT materialId;
     bool backfaceCullable;
+    std::shared_ptr<SceneMaterial> material;
 };
 
 struct FrustumPlanes {
@@ -133,10 +134,12 @@ inline XMFLOAT4 ComputeDrawItemBounds(const IdTechDrawItem& item) {
     return XMFLOAT4(center.x, center.y, center.z, radius);
 }
 
-inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items) {
+inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items,
+                                const std::shared_ptr<SceneMaterial>& floorMaterial) {
     items.clear();
 
-    items.push_back({ XMMatrixIdentity(), scene.floor.color, false, MAT_FLOOR, true });
+    items.push_back({ XMMatrixIdentity(), scene.floor.color, false,
+        MAT_FLOOR, true, floorMaterial });
     items.push_back({ scene.cube1.GetModelMatrix(), scene.cube1.color, true, MAT_CUBE, false });
 
     if (scene.cube2.visible) {
@@ -514,13 +517,14 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
                          ID3D12Resource* shadowResource,
                          OcclusionDepthDX12* hzb,
                          bool useHZBOcclusion,
-                         const XMMATRIX& previousViewProjection) {
+                         const XMMATRIX& previousViewProjection,
+                         const std::shared_ptr<SceneMaterial>& floorMaterial) {
     XMMATRIX view = scene.GetViewMatrix();
     XMMATRIX proj = scene.GetProjectionMatrix();
 
     // Build draw item list
     std::vector<IdTechDrawItem> drawItems;
-    BuildSceneDrawItems(scene, drawItems);
+    BuildSceneDrawItems(scene, drawItems, floorMaterial);
 
     // CPU retains only cheap material ordering/backface rejection. GPU decides
     // frustum, projected-size LOD, HZB visibility, and final indirect draw count.
@@ -552,8 +556,9 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     dcIDs.reserve(drawItems.size());
 
     for (const auto& item : drawItems) {
+        UINT materialID = vb.RegisterMaterial(item.material.get());
         UINT dc = vb.RegisterInstance(item.isCube ? cubeMesh : planeMesh,
-            item.model, item.color, 0.0f, 0.5f, item.materialId);
+            item.model, item.color, 0.0f, 0.5f, materialID);
         dcIDs.push_back(dc);
     }
 
