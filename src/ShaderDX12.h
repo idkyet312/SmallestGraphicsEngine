@@ -193,10 +193,10 @@ public:
 // every destruction chunk (the Voronoi house alone is ~360 pieces) plus scene
 // objects, projectiles and particles -- overflowing clamps draws to one shared
 // constant slot and geometry visibly glues itself to the last-drawn object.
-// 4096: the sliced palm grove alone was pushing the old 1024 ceiling once every
-// destruction chunk and particle joined it. Overflow clamps to the last slot and
-// geometry visibly glues itself to the last-drawn object -- keep headroom.
-static const UINT MAX_DRAW_CALLS_PER_FRAME = 4096;
+// Stress scenes exceed 4,096 forward draws. Overflow clamps to the last slot and
+// geometry visibly glues itself to the last-drawn object. 16K costs roughly 16 MiB
+// across the double-buffered matrix/object upload heaps and leaves fracture headroom.
+static const UINT MAX_DRAW_CALLS_PER_FRAME = 16384;
 
 class ShaderDX12 {
 public:
