@@ -93,6 +93,16 @@ float                       g_helicopterFireCooldown = 0.0f;
 float                       g_helicopterFireCycleTime = 0.0f;
 XMFLOAT3                    g_helicopterPosition{ 0.0f, 14.0f, 0.0f };
 XMFLOAT3                    g_secondaryHelicopterPosition{ 42.0f, 14.0f, 0.0f };
+float                       g_secondaryHelicopterYaw = 0.0f;
+float                       g_secondaryHelicopterPitch = 0.0f;
+float                       g_secondaryHelicopterRoll = 0.0f;
+float                       g_secondaryHelicopterHoverTime = 1.7f;
+float                       g_secondaryHelicopterFireCooldown = 0.0f;
+float                       g_secondaryHelicopterFireCycleTime = 3.5f;
+float                       g_secondaryHelicopterHealth = 2000.0f;
+bool                        g_secondaryHelicopterDead = false;
+bool                        g_secondaryHelicopterCrashed = false;
+XMFLOAT3                    g_secondaryHelicopterCrashVelocity{ 0.0f, 0.0f, 0.0f };
 XMFLOAT3                    g_secondaryHumveePosition{ 42.0f, 2.5f, 3.0f };
 float                       g_helicopterHealth = 2000.0f;
 bool                        g_helicopterDead = false;
@@ -226,9 +236,9 @@ XMMATRIX SecondaryHelicopterWorldMatrix() {
                                -g_helicopterModelCenter.z) *
            XMMatrixScaling(g_helicopterModelScale, g_helicopterModelScale,
                            g_helicopterModelScale) *
-           XMMatrixRotationRollPitchYaw(g_helicopterPitch,
-                                        g_helicopterYaw + XM_PI,
-                                        g_helicopterRoll) *
+           XMMatrixRotationRollPitchYaw(g_secondaryHelicopterPitch,
+                                        g_secondaryHelicopterYaw + XM_PI,
+                                        g_secondaryHelicopterRoll) *
            XMMatrixTranslation(g_secondaryHelicopterPosition.x,
                                g_secondaryHelicopterPosition.y,
                                g_secondaryHelicopterPosition.z);
@@ -296,12 +306,30 @@ static void DamageHelicopter(float damage, const XMFLOAT3& hit) {
     scene.SpawnSmokeBurst(g_helicopterPosition, 1.25f, 1.5f);
 }
 
-static bool HitHelicopterSegment(const XMFLOAT3& start, const XMFLOAT3& end,
-                                 float radius, XMFLOAT3& hit) {
-    if (!g_helicopterModel || g_helicopterDead) return false;
+static void DamageSecondaryHelicopter(float damage, const XMFLOAT3& hit) {
+    if (damage <= 0.0f || g_secondaryHelicopterDead || !g_helicopterModel ||
+        !g_stressTestMode) return;
+    g_secondaryHelicopterHealth = (std::max)(
+        0.0f, g_secondaryHelicopterHealth - damage);
+    scene.SpawnSmokeBurst(hit, 0.22f, 0.10f);
+    if (g_secondaryHelicopterHealth > 0.0f) return;
+    g_secondaryHelicopterDead = true;
+    g_secondaryHelicopterFireCooldown = 9999.0f;
+    g_secondaryHelicopterCrashVelocity = {
+        std::sin(g_secondaryHelicopterYaw) * 2.2f,
+        -0.8f,
+        std::cos(g_secondaryHelicopterYaw) * 2.2f };
+    scene.SpawnExplosionFX(g_secondaryHelicopterPosition, 7.0f, 1.0f);
+    scene.SpawnSmokeBurst(g_secondaryHelicopterPosition, 1.25f, 1.5f);
+}
+
+static bool HitHelicopterAtSegment(const XMFLOAT3& position, bool dead,
+                                   const XMFLOAT3& start, const XMFLOAT3& end,
+                                   float radius, XMFLOAT3& hit) {
+    if (!g_helicopterModel || dead) return false;
     const XMVECTOR a = XMLoadFloat3(&start);
     const XMVECTOR b = XMLoadFloat3(&end);
-    const XMVECTOR center = XMLoadFloat3(&g_helicopterPosition);
+    const XMVECTOR center = XMLoadFloat3(&position);
     const XMVECTOR ab = b - a;
     const float lengthSq = XMVectorGetX(XMVector3LengthSq(ab));
     float t = lengthSq > 1e-6f
@@ -315,13 +343,28 @@ static bool HitHelicopterSegment(const XMFLOAT3& start, const XMFLOAT3& end,
     return true;
 }
 
+static bool HitHelicopterSegment(const XMFLOAT3& start, const XMFLOAT3& end,
+                                 float radius, XMFLOAT3& hit) {
+    return HitHelicopterAtSegment(g_helicopterPosition, g_helicopterDead,
+                                  start, end, radius, hit);
+}
+
+static bool HitSecondaryHelicopterSegment(const XMFLOAT3& start,
+                                          const XMFLOAT3& end, float radius,
+                                          XMFLOAT3& hit) {
+    return g_stressTestMode && HitHelicopterAtSegment(
+        g_secondaryHelicopterPosition, g_secondaryHelicopterDead,
+        start, end, radius, hit);
+}
+
 static void PlayBanditDeathEvents();
 
 static bool KillBanditsTouchingRotor(const std::shared_ptr<SceneNode>& rotor,
-                                     FXMVECTOR localAxis, float rotorRadius) {
-    if (!rotor || g_helicopterDead || !g_banditLoaded) return false;
+                                     FXMVECTOR localAxis, float rotorRadius,
+                                     CXMMATRIX helicopterWorld, bool dead) {
+    if (!rotor || dead || !g_banditLoaded) return false;
     const XMMATRIX rotorWorld = XMLoadFloat4x4(&rotor->globalTransform) *
-                                HelicopterWorldMatrix();
+                                helicopterWorld;
     const XMVECTOR center = XMVector3TransformCoord(XMVectorZero(), rotorWorld);
     const XMVECTOR axis = XMVector3Normalize(
         XMVector3TransformNormal(localAxis, rotorWorld));
@@ -363,14 +406,38 @@ static bool KillBanditsTouchingRotor(const std::shared_ptr<SceneNode>& rotor,
 static void UpdateHelicopterRotorKills() {
     if (!scene.showHelicopter) return;
     bool killed = KillBanditsTouchingRotor(
-        g_helicopterMainRotorNode, XMVectorSet(0, 1, 0, 0), 4.75f);
+        g_helicopterMainRotorNode, XMVectorSet(0, 1, 0, 0), 4.75f,
+        HelicopterWorldMatrix(), g_helicopterDead);
     killed |= KillBanditsTouchingRotor(
-        g_helicopterTailRotorNode, XMVectorSet(1, 0, 0, 0), 1.10f);
+        g_helicopterTailRotorNode, XMVectorSet(1, 0, 0, 0), 1.10f,
+        HelicopterWorldMatrix(), g_helicopterDead);
+    if (g_stressTestMode) {
+        killed |= KillBanditsTouchingRotor(
+            g_helicopterMainRotorNode, XMVectorSet(0, 1, 0, 0), 4.75f,
+            SecondaryHelicopterWorldMatrix(), g_secondaryHelicopterDead);
+        killed |= KillBanditsTouchingRotor(
+            g_helicopterTailRotorNode, XMVectorSet(1, 0, 0, 0), 1.10f,
+            SecondaryHelicopterWorldMatrix(), g_secondaryHelicopterDead);
+    }
     if (killed) PlayBanditDeathEvents();
 }
 
 static void UpdateHelicopter(float dt) {
     if (!g_helicopterModel || !scene.showHelicopter) return;
+    if (!g_helicopterDead || (g_stressTestMode && !g_secondaryHelicopterDead)) {
+        g_helicopterMainRotorAngle = std::fmod(
+            g_helicopterMainRotorAngle + dt * 24.0f, XM_2PI);
+        g_helicopterTailRotorAngle = std::fmod(
+            g_helicopterTailRotorAngle + dt * 38.0f, XM_2PI);
+        if (g_helicopterMainRotorNode)
+            XMStoreFloat4(&g_helicopterMainRotorNode->rotation,
+                XMQuaternionRotationAxis(XMVectorSet(0, 1, 0, 0),
+                                         g_helicopterMainRotorAngle));
+        if (g_helicopterTailRotorNode)
+            XMStoreFloat4(&g_helicopterTailRotorNode->rotation,
+                XMQuaternionRotationAxis(XMVectorSet(1, 0, 0, 0),
+                                         g_helicopterTailRotorAngle));
+    }
     if (g_helicopterDead) {
         if (g_helicopterCrashed) return;
         g_helicopterCrashVelocity.y -= 9.81f * dt;
@@ -428,18 +495,6 @@ static void UpdateHelicopter(float dt) {
     g_helicopterRoll += (desiredRoll - g_helicopterRoll) * attitudeLerp;
     g_helicopterPitch += (desiredPitch - g_helicopterPitch) * attitudeLerp;
 
-    g_helicopterMainRotorAngle = std::fmod(
-        g_helicopterMainRotorAngle + dt * 24.0f, XM_2PI);
-    g_helicopterTailRotorAngle = std::fmod(
-        g_helicopterTailRotorAngle + dt * 38.0f, XM_2PI);
-    if (g_helicopterMainRotorNode)
-        XMStoreFloat4(&g_helicopterMainRotorNode->rotation,
-            XMQuaternionRotationAxis(XMVectorSet(0, 1, 0, 0),
-                                     g_helicopterMainRotorAngle));
-    if (g_helicopterTailRotorNode)
-        XMStoreFloat4(&g_helicopterTailRotorNode->rotation,
-            XMQuaternionRotationAxis(XMVectorSet(1, 0, 0, 0),
-                                     g_helicopterTailRotorAngle));
     XMFLOAT4X4 identity;
     XMStoreFloat4x4(&identity, XMMatrixIdentity());
     g_helicopterModel->UpdateGlobalTransform(identity);
@@ -476,6 +531,107 @@ static void UpdateHelicopter(float dt) {
     const float volume = (std::max)(0.10f, 0.68f * (1.0f - distance / 90.0f));
     g_gunAudio.Play(volume, 0.82f + ((float)std::rand() / RAND_MAX) * 0.08f);
     g_helicopterFireCooldown = 0.10f;
+}
+
+static void UpdateSecondaryHelicopter(float dt) {
+    if (!g_stressTestMode || !g_helicopterModel || !scene.showHelicopter) return;
+    if (g_secondaryHelicopterDead) {
+        if (g_secondaryHelicopterCrashed) return;
+        g_secondaryHelicopterCrashVelocity.y -= 9.81f * dt;
+        g_secondaryHelicopterPosition.x += g_secondaryHelicopterCrashVelocity.x * dt;
+        g_secondaryHelicopterPosition.y += g_secondaryHelicopterCrashVelocity.y * dt;
+        g_secondaryHelicopterPosition.z += g_secondaryHelicopterCrashVelocity.z * dt;
+        g_secondaryHelicopterPitch += 0.42f * dt;
+        g_secondaryHelicopterRoll += 0.78f * dt;
+        g_secondaryHelicopterYaw += 0.18f * dt;
+
+        float groundY = 0.0f;
+        if (scene.useMeshTerrain && g_terrain.supported) {
+            auto params = CurrentTerrainParams();
+            params.heightScale = scene.terrainHeightScale;
+            groundY = TerrainRendererDX12::HeightAt(
+                params, g_secondaryHelicopterPosition.x,
+                g_secondaryHelicopterPosition.z);
+        }
+        if (g_secondaryHelicopterPosition.y <= groundY + 1.65f) {
+            g_secondaryHelicopterPosition.y = groundY + 1.65f;
+            g_secondaryHelicopterCrashed = true;
+            g_secondaryHelicopterCrashVelocity = { 0.0f, 0.0f, 0.0f };
+            scene.SpawnExplosionFX(
+                { g_secondaryHelicopterPosition.x,
+                  g_secondaryHelicopterPosition.y + 1.6f,
+                  g_secondaryHelicopterPosition.z }, 9.0f, 1.1f);
+            scene.SpawnSmokeBurst(g_secondaryHelicopterPosition, 2.8f, 3.0f);
+            if (g_destruction.IsInitialized())
+                g_destruction.ApplyExplosion(
+                    g_secondaryHelicopterPosition, 4.5f, 55.0f, 12.0f);
+        }
+        return;
+    }
+
+    g_secondaryHelicopterHoverTime += dt;
+    g_secondaryHelicopterPosition.x = 42.0f +
+        std::sin(g_secondaryHelicopterHoverTime * 0.29f) * 0.72f;
+    g_secondaryHelicopterPosition.y = 14.0f +
+        std::sin(g_secondaryHelicopterHoverTime * 1.19f) * 0.26f +
+        std::sin(g_secondaryHelicopterHoverTime * 0.39f) * 0.12f;
+    g_secondaryHelicopterPosition.z =
+        std::cos(g_secondaryHelicopterHoverTime * 0.25f) * 0.55f;
+
+    const float targetX = scene.camera.Position.x - g_secondaryHelicopterPosition.x;
+    const float targetZ = scene.camera.Position.z - g_secondaryHelicopterPosition.z;
+    const float desiredYaw = std::atan2(targetX, targetZ);
+    const float yawDelta = std::atan2(
+        std::sin(desiredYaw - g_secondaryHelicopterYaw),
+        std::cos(desiredYaw - g_secondaryHelicopterYaw));
+    const float yawLerp = 1.0f - std::exp(-1.65f * (std::max)(0.0f, dt));
+    g_secondaryHelicopterYaw += yawDelta * yawLerp;
+    const float desiredRoll = (std::max)(-0.10f, (std::min)(0.10f,
+        -yawDelta * 0.075f +
+        std::sin(g_secondaryHelicopterHoverTime * 0.67f) * 0.025f));
+    const float desiredPitch =
+        std::sin(g_secondaryHelicopterHoverTime * 0.43f) * 0.022f;
+    const float attitudeLerp = 1.0f - std::exp(-2.4f * (std::max)(0.0f, dt));
+    g_secondaryHelicopterRoll +=
+        (desiredRoll - g_secondaryHelicopterRoll) * attitudeLerp;
+    g_secondaryHelicopterPitch +=
+        (desiredPitch - g_secondaryHelicopterPitch) * attitudeLerp;
+
+    g_secondaryHelicopterFireCycleTime = std::fmod(
+        g_secondaryHelicopterFireCycleTime + dt, 7.0f);
+    if (g_secondaryHelicopterFireCycleTime >= 2.0f) {
+        g_secondaryHelicopterFireCooldown = 0.0f;
+        return;
+    }
+    g_secondaryHelicopterFireCooldown -= dt;
+    if (scene.playerHealth <= 0.0f || g_secondaryHelicopterFireCooldown > 0.0f)
+        return;
+    const XMFLOAT3 forward{
+        std::sin(g_secondaryHelicopterYaw), 0.0f,
+        std::cos(g_secondaryHelicopterYaw) };
+    const XMFLOAT3 muzzle{
+        g_secondaryHelicopterPosition.x + forward.x * 3.75f,
+        g_secondaryHelicopterPosition.y - 0.65f,
+        g_secondaryHelicopterPosition.z + forward.z * 3.75f };
+    XMVECTOR direction =
+        XMLoadFloat3(&scene.camera.Position) - XMLoadFloat3(&muzzle);
+    const float distanceSq = XMVectorGetX(XMVector3LengthSq(direction));
+    if (distanceSq < 4.0f || distanceSq > 75.0f * 75.0f) {
+        g_secondaryHelicopterFireCooldown = 0.10f;
+        return;
+    }
+    direction = XMVector3Normalize(direction) + XMVectorSet(
+        ((float)std::rand() / RAND_MAX - 0.5f) * 0.018f,
+        ((float)std::rand() / RAND_MAX - 0.5f) * 0.012f,
+        ((float)std::rand() / RAND_MAX - 0.5f) * 0.018f, 0.0f);
+    XMFLOAT3 shotDirection;
+    XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
+    scene.SpawnHostileProjectile(muzzle, shotDirection);
+    scene.SpawnSmokeBurst(muzzle, 0.10f, 0.13f);
+    const float distance = std::sqrt(distanceSq);
+    g_gunAudio.Play((std::max)(0.10f, 0.68f * (1.0f - distance / 90.0f)),
+                    0.82f + ((float)std::rand() / RAND_MAX) * 0.08f);
+    g_secondaryHelicopterFireCooldown = 0.10f;
 }
 
 static XMFLOAT3 HumveeTurretMountWorld() {
@@ -848,6 +1004,17 @@ static void DetonateBarrel(size_t firstBarrel) {
                 DamageHelicopter(120.0f * (1.0f - distance / reach),
                                  g_helicopterPosition);
         }
+        if (g_stressTestMode && !g_secondaryHelicopterDead && g_helicopterModel) {
+            const float hx = g_secondaryHelicopterPosition.x - center.x;
+            const float hy = g_secondaryHelicopterPosition.y - center.y;
+            const float hz = g_secondaryHelicopterPosition.z - center.z;
+            const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
+            const float reach = 11.5f;
+            if (distance < reach)
+                DamageSecondaryHelicopter(
+                    120.0f * (1.0f - distance / reach),
+                    g_secondaryHelicopterPosition);
+        }
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.ApplyExplosion(center, 5.0f, 3.0f, 180.0f);
             g_destruction.ApplyRagdollExplosion(center, 6.5f, 110.0f);
@@ -961,6 +1128,9 @@ static void UpdateExplosiveBarrels(float dt) {
             // Thrown barrels detonate on the helicopter's hull.
             if (!impact &&
                 HitHelicopterSegment(previous, barrel.position, 0.44f, impactPoint))
+                impact = true;
+            if (!impact && HitSecondaryHelicopterSegment(
+                    previous, barrel.position, 0.44f, impactPoint))
                 impact = true;
             if (!impact && g_banditLoaded) {
                 for (const auto& bandit : g_bandits) {
@@ -1156,13 +1326,22 @@ static void RebuildScalableEnvironment() {
 }
 
 static void UpdateHelicopterHoverAudio() {
+    const bool primaryActive = !g_helicopterDead && !g_helicopterCrashed;
+    const bool secondaryActive = g_stressTestMode &&
+        !g_secondaryHelicopterDead && !g_secondaryHelicopterCrashed;
     const bool active = gameScreen == GameScreen::Level1 &&
-        scene.showHelicopter && !g_helicopterDead && !g_helicopterCrashed &&
+        scene.showHelicopter && (primaryActive || secondaryActive) &&
         (scene.playerGodMode || scene.playerHealth > 0.0f);
-    const float dx = g_helicopterPosition.x - scene.camera.Position.x;
-    const float dy = g_helicopterPosition.y - scene.camera.Position.y;
-    const float dz = g_helicopterPosition.z - scene.camera.Position.z;
-    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    auto distanceToCamera = [](const XMFLOAT3& position) {
+        const float dx = position.x - scene.camera.Position.x;
+        const float dy = position.y - scene.camera.Position.y;
+        const float dz = position.z - scene.camera.Position.z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    };
+    float distance = primaryActive ? distanceToCamera(g_helicopterPosition) : FLT_MAX;
+    if (secondaryActive)
+        distance = (std::min)(distance,
+                              distanceToCamera(g_secondaryHelicopterPosition));
     const float volume = 0.72f * (std::max)(0.0f, 1.0f - distance / 95.0f);
     g_helicopterHoverAudio.SetLoop(active, volume, 0.96f);
 }
@@ -1226,6 +1405,17 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false) {
     g_helicopterCrashed = false;
     g_helicopterPosition = { 0.0f, 14.0f, 0.0f };
     g_helicopterCrashVelocity = { 0.0f, 0.0f, 0.0f };
+    g_secondaryHelicopterYaw = 0.0f;
+    g_secondaryHelicopterPitch = 0.0f;
+    g_secondaryHelicopterRoll = 0.0f;
+    g_secondaryHelicopterHoverTime = 1.7f;
+    g_secondaryHelicopterFireCooldown = 0.0f;
+    g_secondaryHelicopterFireCycleTime = 3.5f;
+    g_secondaryHelicopterHealth = 2000.0f;
+    g_secondaryHelicopterDead = false;
+    g_secondaryHelicopterCrashed = false;
+    g_secondaryHelicopterPosition = { 42.0f, 14.0f, 0.0f };
+    g_secondaryHelicopterCrashVelocity = { 0.0f, 0.0f, 0.0f };
     g_banditSpawnSerial = 0;
     g_banditVoiceCooldown = 0.0f;
     g_banditPainCooldown = 0.0f;
@@ -3434,6 +3624,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         scene.Update(deltaTime, now);
         UpdateHelicopter(deltaTime);
+        UpdateSecondaryHelicopter(deltaTime);
         UpdateExplosiveBarrels(deltaTime);
         g_gunAudio.Update();
         g_hitAudio.Update();
@@ -3554,9 +3745,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_gibbet.Update(deltaTime);
         g_trees.SetWind(g_grass.WindStrength(), g_grass.WindSpeed());
         g_trees.Update(deltaTime);
+        const bool primaryHelicopterActive =
+            scene.showHelicopter && !g_helicopterDead && !g_helicopterCrashed;
+        const bool secondaryHelicopterActive =
+            scene.showHelicopter && g_stressTestMode &&
+            !g_secondaryHelicopterDead && !g_secondaryHelicopterCrashed;
+        XMFLOAT3 grassHelicopter = g_helicopterPosition;
+        if (secondaryHelicopterActive) {
+            const XMVECTOR camera = XMLoadFloat3(&scene.camera.Position);
+            const float primaryDistance = primaryHelicopterActive
+                ? XMVectorGetX(XMVector3LengthSq(
+                    XMLoadFloat3(&g_helicopterPosition) - camera)) : FLT_MAX;
+            const float secondaryDistance = XMVectorGetX(XMVector3LengthSq(
+                XMLoadFloat3(&g_secondaryHelicopterPosition) - camera));
+            if (secondaryDistance < primaryDistance)
+                grassHelicopter = g_secondaryHelicopterPosition;
+        }
         g_grass.SetHelicopterWind(
-            g_helicopterPosition,
-            scene.showHelicopter && !g_helicopterDead && !g_helicopterCrashed);
+            grassHelicopter,
+            primaryHelicopterActive || secondaryHelicopterActive);
         g_grass.Update(deltaTime);
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
@@ -3645,6 +3852,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                                  g_helicopterPosition);
                             }
                         }
+                        if (g_stressTestMode && !g_secondaryHelicopterDead &&
+                            g_helicopterModel) {
+                            const float dx = g_secondaryHelicopterPosition.x - center.x;
+                            const float dy = g_secondaryHelicopterPosition.y - center.y;
+                            const float dz = g_secondaryHelicopterPosition.z - center.z;
+                            const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+                            const float reach = scene.grenadeEnemyRadius + 5.0f;
+                            if (distance < reach) {
+                                const float falloff = 1.0f - distance / reach;
+                                DamageSecondaryHelicopter(
+                                    scene.grenadeEnemyDamage * falloff,
+                                    g_secondaryHelicopterPosition);
+                            }
+                        }
                         // Run after Bandit damage. Newly killed enemies have
                         // ragdolls now, so same blast launches their limbs too.
                         g_destruction.ApplyExplosion(center, scene.grenadeBlastRadius,
@@ -3726,6 +3947,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(helicopterHit, normal);
                     DamageHelicopter(34.0f, helicopterHit);
+                    projectile.active = false;
+                    continue;
+                }
+                if (!projectile.hostile && HitSecondaryHelicopterSegment(
+                        projectile.previousPosition, projectile.position,
+                        bulletRadius, helicopterHit)) {
+                    const XMFLOAT3 normal(-projectile.direction.x,
+                                          -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(helicopterHit, normal);
+                    DamageSecondaryHelicopter(34.0f, helicopterHit);
                     projectile.active = false;
                     continue;
                 }
@@ -3834,7 +4066,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
         }
         if (g_banditLoaded && !pendingTurretGunnerRespawn &&
-            LiveBanditCount() == 0 && g_helicopterDead)
+            LiveBanditCount() == 0 && g_helicopterDead &&
+            (!g_stressTestMode || g_secondaryHelicopterDead))
             OpenWinScreen();
         }
         }
