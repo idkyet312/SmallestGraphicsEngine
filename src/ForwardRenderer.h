@@ -17,6 +17,7 @@
 #include "PalmModel.h"
 #include "GunModel.h"
 #include "GrassField.h"
+#include <unordered_map>
 
 extern MeshShaderDX12 g_meshShader;
 extern bool g_useMeshShader;
@@ -433,6 +434,141 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
     }
 }
 
+inline bool SceneNodeSupportsMeshInstancing(const std::shared_ptr<SceneNode>& node) {
+    if (!node) return false;
+    if (node->mesh) for (const auto& prim : node->mesh->primitives) {
+        const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
+        const D3D12_GPU_VIRTUAL_ADDRESS desc = prim.meshletDescBuffer
+            ? prim.meshletDescBuffer->GetGPUVirtualAddress() : 0;
+        const D3D12_GPU_VIRTUAL_ADDRESS bounds = prim.meshletBoundsBuffer
+            ? prim.meshletBoundsBuffer->GetGPUVirtualAddress() : 0;
+        const D3D12_GPU_VIRTUAL_ADDRESS vertices = prim.meshletVertexIndexBuffer
+            ? prim.meshletVertexIndexBuffer->GetGPUVirtualAddress() : 0;
+        const D3D12_GPU_VIRTUAL_ADDRESS triangles = prim.meshletTriangleBuffer
+            ? prim.meshletTriangleBuffer->GetGPUVirtualAddress() : 0;
+        if (transparent || prim.skinBuffer || !g_meshShader.CanDraw(
+                prim.meshletCount, desc, bounds, vertices, triangles)) return false;
+    }
+    for (const auto& child : node->children)
+        if (!SceneNodeSupportsMeshInstancing(child)) return false;
+    return true;
+}
+
+inline size_t SceneNodeMeshPrimitiveCount(const std::shared_ptr<SceneNode>& node) {
+    if (!node) return 0;
+    size_t count = node->mesh ? node->mesh->primitives.size() : 0;
+    for (const auto& child : node->children)
+        count += SceneNodeMeshPrimitiveCount(child);
+    return count;
+}
+
+// Geometry/material-keyed static batch. Every world transform shares the same
+// scene graph and material set, allowing each primitive to become one dispatch.
+// Incompatible, transparent, and skinned models use the unchanged draw path.
+inline void DrawSceneNodeInstances(const std::shared_ptr<SceneNode>& node,
+                                   ShaderDX12& shader,
+                                   const std::vector<XMMATRIX>& worldTransforms,
+                                   const XMMATRIX& view, const XMMATRIX& proj,
+                                   const XMMATRIX& lightSpace) {
+    if (!node || worldTransforms.empty()) return;
+    const size_t requiredInstances = worldTransforms.size() *
+        SceneNodeMeshPrimitiveCount(node);
+    if (worldTransforms.size() < 2 || !g_useMeshShader ||
+        !SceneNodeSupportsMeshInstancing(node) ||
+        requiredInstances > MeshShaderDX12::MaxInstancesPerFrame -
+            g_meshShader.currentInstance) {
+        for (const XMMATRIX& world : worldTransforms)
+            DrawSceneNode(node, shader, world, view, proj, lightSpace);
+        return;
+    }
+
+    if (node->mesh) {
+        std::vector<XMMATRIX> models;
+        models.reserve(worldTransforms.size());
+        const XMMATRIX local = XMLoadFloat4x4(&node->globalTransform);
+        for (const XMMATRIX& world : worldTransforms) models.push_back(local * world);
+
+        shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
+        for (const auto& prim : node->mesh->primitives) {
+            if (!prim.vbv.BufferLocation) continue;
+            shader.Use(false);
+            if (prim.material) {
+                const XMFLOAT3 color(prim.material->baseColorFactor.x,
+                    prim.material->baseColorFactor.y,
+                    prim.material->baseColorFactor.z);
+                shader.SetObjectMaterial(color,
+                    prim.material->baseColorTexture != nullptr,
+                    prim.material->normalTexture != nullptr,
+                    prim.material->metallicFactor, prim.material->roughnessFactor,
+                    prim.material->baseColorTexture.Get(),
+                    prim.material->normalTexture.Get(),
+                    prim.material->metallicRoughnessTexture.Get(),
+                    prim.material->roughnessOnlyTexture,
+                    prim.material->baseColorFactor.w,
+                    prim.material->alphaCutout, prim.material.get(),
+                    prim.material->alphaFromLuminance,
+                    prim.material->ambientScale,
+                    prim.material->occlusionStrength,
+                    prim.material->normalYSign,
+                    prim.material->viewFillStrength);
+            } else {
+                shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false,
+                    0.0f, 0.5f, nullptr, nullptr, nullptr);
+            }
+
+            g_meshShader.DrawInstanced(prim.vbv,
+                static_cast<UINT>(prim.vertices.size() / 12), prim.indexCount,
+                prim.meshletCount,
+                prim.meshletDescBuffer->GetGPUVirtualAddress(),
+                prim.meshletBoundsBuffer->GetGPUVirtualAddress(),
+                prim.meshletVertexIndexBuffer->GetGPUVirtualAddress(),
+                prim.meshletTriangleBuffer->GetGPUVirtualAddress(), models);
+            shader.NextDrawCall();
+        }
+    }
+
+    for (const auto& child : node->children)
+        DrawSceneNodeInstances(child, shader, worldTransforms,
+            view, proj, lightSpace);
+}
+
+class ForwardStaticBatchQueueDX12 {
+    struct Entry {
+        std::shared_ptr<SceneNode> node;
+        std::vector<XMMATRIX> transforms;
+    };
+    std::vector<Entry> entries;
+    std::unordered_map<const SceneNode*, size_t> byGeometry;
+
+public:
+    bool Submit(const std::shared_ptr<SceneNode>& node,
+                const XMMATRIX& transform) {
+        if (!node || !g_useMeshShader) return false;
+        auto it = byGeometry.find(node.get());
+        if (it != byGeometry.end()) {
+            entries[it->second].transforms.push_back(transform);
+            return true;
+        }
+        if (!SceneNodeSupportsMeshInstancing(node)) return false;
+        auto [insertedIt, inserted] = byGeometry.emplace(
+            node.get(), entries.size());
+        (void)inserted;
+        entries.push_back({ node, {} });
+        it = insertedIt;
+        entries[it->second].transforms.push_back(transform);
+        return true;
+    }
+
+    void Flush(ShaderDX12& shader, const XMMATRIX& view,
+               const XMMATRIX& proj, const XMMATRIX& lightSpace) {
+        for (Entry& entry : entries)
+            DrawSceneNodeInstances(entry.node, shader, entry.transforms,
+                view, proj, lightSpace);
+        entries.clear();
+        byGeometry.clear();
+    }
+};
+
 // Gribb-Hartmann plane extraction from the CPU-side (row-vector) view*proj.
 // Planes come out unnormalised with inward-facing normals; SphereVisible scales
 // the radius test by the plane length instead of normalising here.
@@ -503,6 +639,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     g_meshShader.wireframe = scene.meshletWireframe;
     g_terrain.wireframe = scene.meshletWireframe;
+    ForwardStaticBatchQueueDX12 staticBatches;
 
     // Floor: mesh-shader tessellated terrain when available, flat plane otherwise.
     XMMATRIX model = (!scene.useMeshTerrain || !g_terrain.supported) &&
@@ -775,11 +912,13 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     }
 
     if (g_humveeModel) {
-        DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
-                      view, proj, lightSpace);
-        if (g_stressTestMode)
+        if (!staticBatches.Submit(g_humveeModel, HumveeWorldMatrix()))
+            DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
+                view, proj, lightSpace);
+        if (g_stressTestMode &&
+            !staticBatches.Submit(g_humveeModel, SecondaryHumveeWorldMatrix()))
             DrawSceneNode(g_humveeModel, shader, SecondaryHumveeWorldMatrix(),
-                          view, proj, lightSpace);
+                view, proj, lightSpace);
     }
 
     if (g_helicopterModel && scene.showHelicopter) {
@@ -800,14 +939,17 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     // Authored shootable barrel FBX. Its pivot is at the base, while gameplay
     // stores barrel.position at collision center 0.75 m above ground.
-    for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
-        if (!barrel.active) continue;
-        if (g_explosiveBarrelModel) {
-            model = XMMatrixTranslation(
+    if (g_explosiveBarrelModel) {
+        for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+            if (!barrel.active) continue;
+            const XMMATRIX barrelTransform = XMMatrixTranslation(
                 barrel.position.x, barrel.position.y - 0.75f, barrel.position.z);
-            DrawSceneNode(g_explosiveBarrelModel, shader, model,
-                          view, proj, lightSpace);
-        } else {
+            if (!staticBatches.Submit(g_explosiveBarrelModel, barrelTransform))
+                DrawSceneNode(g_explosiveBarrelModel, shader, barrelTransform,
+                    view, proj, lightSpace);
+        }
+    } else for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+        if (barrel.active) {
             model = XMMatrixScaling(1.6f, 1.5f, 1.6f) *
                     XMMatrixTranslation(barrel.position.x, barrel.position.y,
                                         barrel.position.z);
@@ -962,10 +1104,11 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 shader.SetMatrices(model, view, proj, lightSpace);
                 shader.SetObjectMaterial(p.col, false, false, 0.85f, 0.35f,
                                          nullptr, nullptr, nullptr);
-                DrawCube(geo);
-                shader.NextDrawCall();
-            }
+            DrawCube(geo);
+            shader.NextDrawCall();
         }
+    }
+    staticBatches.Flush(shader, view, proj, lightSpace);
 
 
         // Downloaded CC0 muzzle-flash sheet. One random-looking star frame is

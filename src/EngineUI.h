@@ -21,6 +21,8 @@ extern ProfilerDX12 g_profiler;
 extern UINT g_forwardDrawCalls;
 extern UINT g_shadowDrawCalls;
 extern UINT g_visibilityDrawCalls;
+extern UINT g_shadowBatches;
+extern UINT g_shadowBatchInstances;
 extern UINT g_destructionBatchesThisFrame;
 extern UINT g_destructionChunksSubmittedThisFrame;
 extern UINT g_destructionCulledThisFrame;
@@ -214,12 +216,20 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::Text("Draw calls: %u  (Forward %u, Shadow %u, Visibility %u)",
                 totalDrawCalls, g_forwardDrawCalls, g_shadowDrawCalls,
                 g_visibilityDrawCalls);
-    ImGui::Text("Mesh dispatches: %u  Meshlets: %u",
-                g_meshShader.dispatchesThisFrame, g_meshShader.meshletsThisFrame);
+    ImGui::Text("Mesh dispatches: %u  Batches: %u  Instances: %u  Meshlets: %u",
+                g_meshShader.dispatchesThisFrame, g_meshShader.batchesThisFrame,
+                g_meshShader.instancesThisFrame, g_meshShader.meshletsThisFrame);
+    ImGui::Text("Shadow instance batches: %u  Instances: %u",
+                g_shadowBatches, g_shadowBatchInstances);
     ImGui::Text("Destruction batches: %u  Chunks: %u  Culled: %u",
                 g_destructionBatchesThisFrame,
                 g_destructionChunksSubmittedThisFrame,
                 g_destructionCulledThisFrame);
+    ImGui::Text("Destruction cache: item rebuilds %llu  geometry rebuilds %llu",
+                static_cast<unsigned long long>(
+                    g_destruction.GetRenderItemRebuildCount()),
+                static_cast<unsigned long long>(
+                    g_destruction.GetBatchGeometryRebuildCount()));
     ImGui::Checkbox("God Mode", &scene.playerGodMode);
     const StaticBufferStatsDX12 staticStats = GetStaticBufferStatsDX12();
     ImGui::Text("GPU-local static buffers: %u  %.1f MiB  Pending: %u",

@@ -46,10 +46,20 @@ public:
     D3D12_GPU_DESCRIPTOR_HANDLE occlusionDepthHandle = {};
     UINT dispatchesThisFrame = 0;
     UINT meshletsThisFrame = 0;
+    UINT batchesThisFrame = 0;
+    UINT instancesThisFrame = 0;
+    UINT culledInstancesThisFrame = 0;
+    static constexpr UINT MaxInstancesPerFrame = 4096;
+    UploadBuffer<MeshInstanceDataDX12> instanceBuffer;
+    UINT currentInstance = 0;
 
     void BeginFrame() {
         dispatchesThisFrame = 0;
         meshletsThisFrame = 0;
+        batchesThisFrame = 0;
+        instancesThisFrame = 0;
+        culledInstancesThisFrame = 0;
+        currentInstance = 0;
     }
 
     void SetOcclusionDepth(D3D12_GPU_DESCRIPTOR_HANDLE handle, bool enabled,
@@ -166,6 +176,11 @@ public:
             stream.raster.value.MultisampleEnable = FALSE;
         }
 
+        if (!instanceBuffer.Create(FRAME_COUNT * MaxInstancesPerFrame)) {
+            std::cerr << "Mesh instance upload buffer creation failed\n";
+            return false;
+        }
+
         supported = true;
         return true;
     }
@@ -194,6 +209,12 @@ public:
         commandList6->SetGraphicsRootShaderResourceView(11, meshletBoundsAddress);
         commandList6->SetGraphicsRootShaderResourceView(13, meshletVertexIndexAddress);
         commandList6->SetGraphicsRootShaderResourceView(14, meshletTriangleAddress);
+        // t14 is part of the root signature even for ordinary draws. Keep a
+        // valid fallback VA bound: some drivers may speculatively evaluate the
+        // instance-buffer branch despite instancingEnabled being zero.
+        commandList6->SetGraphicsRootShaderResourceView(18,
+            instanceBuffer.GetGPUAddress(
+                g_dx12.frameIndex * MaxInstancesPerFrame));
         if (occlusionDepthHandle.ptr) {
             commandList6->SetGraphicsRootDescriptorTable(12, occlusionDepthHandle);
         }
@@ -212,14 +233,83 @@ public:
                 firstMeshlet, totalMeshlets,
                 occlusionEnabled ? 1u : 0u,
                 g_dx12.screenWidth, g_dx12.screenHeight,
-                skinning, occlusionMipCount, g_currentModelMaxScale
+                skinning, occlusionMipCount, g_currentModelMaxScale,
+                1u, 0u
             };
-            commandList6->SetGraphicsRoot32BitConstants(8, 11, &data, 0);
+            commandList6->SetGraphicsRoot32BitConstants(8, 13, &data, 0);
             commandList6->DispatchMesh(amplificationGroups, 1, 1);
             ++dispatchesThisFrame;
             meshletsThisFrame += meshletCount;
             firstMeshlet += meshletCount;
         }
+    }
+
+    // Draw repeated static geometry in one mesh dispatch. The caller binds one
+    // material and supplies all model transforms. Skinned geometry deliberately
+    // stays on Draw(), where each instance owns a different bone palette.
+    bool DrawInstanced(const D3D12_VERTEX_BUFFER_VIEW& vbv,
+                       UINT vertexCount, UINT indexCount, UINT totalMeshlets,
+                       D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress,
+                       D3D12_GPU_VIRTUAL_ADDRESS meshletBoundsAddress,
+                       D3D12_GPU_VIRTUAL_ADDRESS meshletVertexIndexAddress,
+                       D3D12_GPU_VIRTUAL_ADDRESS meshletTriangleAddress,
+                       const std::vector<DirectX::XMMATRIX>& models) {
+        if (models.size() < 2 || !CanDraw(totalMeshlets, meshletDescAddress,
+                meshletBoundsAddress, meshletVertexIndexAddress,
+                meshletTriangleAddress)) return false;
+        if (models.size() > MaxInstancesPerFrame - currentInstance) return false;
+
+        const UINT frameBase = g_dx12.frameIndex * MaxInstancesPerFrame;
+        const UINT instanceBase = currentInstance;
+        for (const DirectX::XMMATRIX& model : models) {
+            MeshInstanceDataDX12 instance = {};
+            DirectX::XMStoreFloat4x4(&instance.model, DirectX::XMMatrixTranspose(model));
+            instance.modelMaxScale = (std::max)({
+                DirectX::XMVectorGetX(DirectX::XMVector3Length(model.r[0])),
+                DirectX::XMVectorGetX(DirectX::XMVector3Length(model.r[1])),
+                DirectX::XMVectorGetX(DirectX::XMVector3Length(model.r[2])) });
+            instanceBuffer.CopyData(frameBase + currentInstance, instance);
+            ++currentInstance;
+        }
+
+        ID3D12PipelineState* solid = msaaEnabled ? psoMSAA.Get() : pso.Get();
+        ID3D12PipelineState* wire = msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get();
+        commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
+        commandList6->SetGraphicsRootShaderResourceView(9, vbv.BufferLocation);
+        commandList6->SetGraphicsRootShaderResourceView(10, meshletDescAddress);
+        commandList6->SetGraphicsRootShaderResourceView(11, meshletBoundsAddress);
+        commandList6->SetGraphicsRootShaderResourceView(13, meshletVertexIndexAddress);
+        commandList6->SetGraphicsRootShaderResourceView(14, meshletTriangleAddress);
+        commandList6->SetGraphicsRootShaderResourceView(
+            18, instanceBuffer.GetGPUAddress(frameBase + instanceBase));
+        if (occlusionDepthHandle.ptr)
+            commandList6->SetGraphicsRootDescriptorTable(12, occlusionDepthHandle);
+
+        const UINT instanceCount = static_cast<UINT>(models.size());
+        const UINT totalWorkItems = totalMeshlets * instanceCount;
+        const UINT maxWorkItems = 65535u * 32u;
+        UINT firstWorkItem = 0;
+        while (firstWorkItem < totalWorkItems) {
+            const UINT workCount = (std::min)(maxWorkItems,
+                totalWorkItems - firstWorkItem);
+            const UINT amplificationGroups = (workCount + 31) / 32;
+            MeshDrawBufferDX12 data = {
+                vertexCount, indexCount, indexCount ? 1u : 0u,
+                firstWorkItem, totalMeshlets,
+                occlusionEnabled ? 1u : 0u,
+                g_dx12.screenWidth, g_dx12.screenHeight,
+                0u, occlusionMipCount, 1.0f,
+                instanceCount, 1u
+            };
+            commandList6->SetGraphicsRoot32BitConstants(8, 13, &data, 0);
+            commandList6->DispatchMesh(amplificationGroups, 1, 1);
+            ++dispatchesThisFrame;
+            firstWorkItem += workCount;
+        }
+        ++batchesThisFrame;
+        instancesThisFrame += instanceCount;
+        meshletsThisFrame += totalMeshlets * instanceCount;
+        return true;
     }
 };
 

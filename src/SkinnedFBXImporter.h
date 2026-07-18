@@ -13,6 +13,10 @@
 
 struct SkinnedModel {
     std::shared_ptr<SceneNode>  node;      // renderable mesh (primitives carry skin[])
+    // Importers may collapse many source meshes into one primitive per material.
+    // Keep every source material alive because its upload heaps can still be
+    // referenced by the load command list when the merged primitives replace it.
+    std::vector<std::shared_ptr<SceneMaterial>> materialKeepAlive;
     Skeleton                    skeleton;
     std::vector<AnimationClip>  clips;      // includes the clip baked into the mesh FBX
     RagdollSpec                 ragdoll;

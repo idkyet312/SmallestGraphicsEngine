@@ -167,12 +167,24 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
         return nullptr;
     };
 
+    std::vector<MeshPrimitive> sourcePrimitives;
+    sourcePrimitives.reserve(scene->mNumMeshes);
+    out.materialKeepAlive.reserve(scene->mNumMeshes);
+    std::vector<std::shared_ptr<SceneMaterial>> materialCache(
+        scene->mNumMaterials);
+
     for (unsigned mi = 0; mi < scene->mNumMeshes; ++mi) {
         const aiMesh* src = scene->mMeshes[mi];
         if (!src->HasPositions()) continue;
         MeshPrimitive p;
-        auto mat = std::make_shared<SceneMaterial>();
-        if (src->mMaterialIndex < scene->mNumMaterials) {
+        std::shared_ptr<SceneMaterial> mat;
+        const bool cachedMaterial = src->mMaterialIndex < materialCache.size() &&
+            materialCache[src->mMaterialIndex] != nullptr;
+        if (cachedMaterial) {
+            mat = materialCache[src->mMaterialIndex];
+        } else {
+            mat = std::make_shared<SceneMaterial>();
+            if (src->mMaterialIndex < scene->mNumMaterials) {
             const aiMaterial* am = scene->mMaterials[src->mMaterialIndex];
             aiString materialName;
             if (am->Get(AI_MATKEY_NAME, materialName) == AI_SUCCESS)
@@ -188,11 +200,10 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
                 texture.length)
                 mat->normalTexture =
                     loadReferencedTexture(texture, mat->uploadHeaps);
-        }
-        // FBX parts are body, hair, and eyelashes. Mesh-index fallback used to
-        // assign outfit sets 2 and 3 to hair cards, producing black/material
-        // garbage. Resolve card materials by FBX material name instead.
-        {
+            }
+            // FBX parts are body, hair, and eyelashes. Mesh-index fallback used to
+            // assign outfit sets 2 and 3 to hair cards, producing black/material
+            // garbage. Resolve card materials by FBX material name instead.
             const std::string materialLower = lowerStr(mat->name);
             const bool hairCard = materialLower.find("hair") != std::string::npos ||
                                   materialLower.find("eyelash") != std::string::npos;
@@ -242,9 +253,12 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
                 mat->metallicFactor = 1.0f;
                 mat->roughnessFactor = 1.0f;
             }
+            if (src->mMaterialIndex < materialCache.size())
+                materialCache[src->mMaterialIndex] = mat;
         }
         p.material = mat;
         p.materialIndex = (int)src->mMaterialIndex;
+        out.materialKeepAlive.push_back(mat);
 
         // Geometry (12-float interleaved, scaled). Skin data is a parallel array.
         p.skin.assign(src->mNumVertices, SkinVertex{});
@@ -301,13 +315,44 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
             else { s.boneIndex[0] = 0; s.boneWeight[0] = 1.0f; }
         }
 
+        sourcePrimitives.push_back(std::move(p));
+    }
+
+    // Assimp commonly exposes one tiny aiMesh per authored FBX section even when
+    // dozens of sections use the same material. Drawing those sections separately
+    // produced ~72 mesh dispatches and ~40 shadow draws per bandit. Concatenate
+    // compatible sections before creating GPU buffers; skin indices remain valid
+    // because the skin array is parallel to the appended vertex stream.
+    std::vector<MeshPrimitive> mergedPrimitives;
+    std::unordered_map<int, size_t> bucketByMaterial;
+    mergedPrimitives.reserve(sourcePrimitives.size());
+    for (MeshPrimitive& source : sourcePrimitives) {
+        auto [it, inserted] = bucketByMaterial.emplace(
+            source.materialIndex, mergedPrimitives.size());
+        if (inserted) {
+            MeshPrimitive merged;
+            merged.materialIndex = source.materialIndex;
+            merged.material = source.material;
+            mergedPrimitives.push_back(std::move(merged));
+        }
+
+        MeshPrimitive& merged = mergedPrimitives[it->second];
+        const UINT baseVertex = static_cast<UINT>(merged.vertices.size() / 12);
+        merged.vertices.insert(merged.vertices.end(),
+            source.vertices.begin(), source.vertices.end());
+        merged.skin.insert(merged.skin.end(), source.skin.begin(), source.skin.end());
+        merged.indices.reserve(merged.indices.size() + source.indices.size());
+        for (UINT index : source.indices) merged.indices.push_back(baseVertex + index);
+    }
+
+    for (MeshPrimitive& p : mergedPrimitives) {
         if (!GLBImporter::BuildMeshletData(p, device.Get())) continue;
 
-        // Upload the parallel skin buffer (StructuredBuffer<SkinVertex> @ t13).
-        const UINT skinBytes = (UINT)(p.skin.size() * sizeof(SkinVertex));
+        // Upload one parallel skin stream per merged material primitive.
+        const UINT skinBytes = static_cast<UINT>(p.skin.size() * sizeof(SkinVertex));
         if (CreateStaticBufferDX12(device.Get(), p.skin.data(), skinBytes,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, p.skinBuffer))
-            p.skinVertexCount = (UINT)p.skin.size();
+            p.skinVertexCount = static_cast<UINT>(p.skin.size());
         root->mesh->primitives.push_back(std::move(p));
     }
 
@@ -333,6 +378,8 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
     out.node = root;
     out.valid = !root->mesh->primitives.empty();
     std::cout << "Loaded skinned model: " << out.skeleton.BoneCount() << " bones, "
-              << root->mesh->primitives.size() << " parts, " << out.clips.size() << " clips\n";
+              << sourcePrimitives.size() << " source parts -> "
+              << root->mesh->primitives.size() << " material batches, "
+              << out.clips.size() << " clips\n";
     return out;
 }

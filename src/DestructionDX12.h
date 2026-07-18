@@ -167,6 +167,8 @@ public:
     bool IsInitialized() const;
     uint32_t GetChunkCount() const;
     uint32_t GetActorCount() const;
+    uint64_t GetRenderItemRebuildCount() const;
+    uint64_t GetBatchGeometryRebuildCount() const;
     const std::vector<DestructionRenderItem>& GetRenderItems() const;
     const std::vector<DestructionRenderBatch>& GetRenderBatches() const;
     const std::vector<RagdollRenderItem>& GetRagdollRenderItems() const;

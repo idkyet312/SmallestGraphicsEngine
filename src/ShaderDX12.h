@@ -122,6 +122,16 @@ struct alignas(256) MeshDrawBufferDX12 {
     UINT skinningEnabled; // 0 static draw, 1 apply bone palette (t12) + skin (t13)
     UINT occlusionMipCount;
     float modelMaxScale;
+    UINT instanceCount;
+    UINT instancingEnabled;
+};
+
+// Transforms consumed directly by the amplification and mesh shaders. Unlike a
+// CBV array these records are tightly packed in one root SRV.
+struct MeshInstanceDataDX12 {
+    XMFLOAT4X4 model;
+    float modelMaxScale;
+    float padding[3];
 };
 
 // Upload buffer helper
@@ -381,7 +391,7 @@ public:
         // 6: Descriptor table - Global SRVs (t0, t2, t3)
         // 7: Descriptor table - Material SRVs (t1, t4, t5)
         
-        D3D12_ROOT_PARAMETER rootParams[18] = {};
+        D3D12_ROOT_PARAMETER rootParams[19] = {};
         
         // CBVs (root descriptors)
         for (int i = 0; i < 6; i++) {
@@ -447,7 +457,7 @@ public:
         rootParams[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         rootParams[8].Constants.ShaderRegister = 6;
         rootParams[8].Constants.RegisterSpace = 0;
-        rootParams[8].Constants.Num32BitValues = 12;
+        rootParams[8].Constants.Num32BitValues = 13;
         rootParams[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         rootParams[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[9].Descriptor.ShaderRegister = 6;
@@ -492,6 +502,13 @@ public:
         rootParams[17].Descriptor.RegisterSpace = 0;
         rootParams[17].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+        // Static mesh instances (t14). Skinned draws keep their per-draw palette
+        // path and leave instancing disabled.
+        rootParams[18].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParams[18].Descriptor.ShaderRegister = 14;
+        rootParams[18].Descriptor.RegisterSpace = 0;
+        rootParams[18].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
         // Static samplers
         D3D12_STATIC_SAMPLER_DESC staticSamplers[2] = {};
         
@@ -523,7 +540,7 @@ public:
         staticSamplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        rootSigDesc.NumParameters = 18;
+        rootSigDesc.NumParameters = 19;
         rootSigDesc.pParameters = rootParams;
         rootSigDesc.NumStaticSamplers = 2;
         rootSigDesc.pStaticSamplers = staticSamplers;
