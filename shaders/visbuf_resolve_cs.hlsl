@@ -99,6 +99,15 @@ cbuffer SkySHBuffer : register(b3) {
 };
 StructuredBuffer<ClusterData>   clusters  : register(t6);
 
+struct MaterialData {
+    float4 baseColorFactor;
+    float4 emissiveOcclusion;
+    float4 pbrParams;
+    uint4 textureIndices;
+};
+StructuredBuffer<MaterialData> materials : register(t7);
+Texture2D<float4> materialTextures[64] : register(t8);
+
 RWTexture2D<float4> outputColor : register(u0);
 RWTexture2D<float2> outputMotion : register(u1);
 
@@ -250,6 +259,35 @@ float3 ComputeBarycentrics(float3 worldPos, float3 wp0, float3 wp1, float3 wp2) 
     return float3(u, v, w);
 }
 
+void ComputeUVGradients(float3 wp0, float3 wp1, float3 wp2,
+                        float2 uv0, float2 uv1, float2 uv2,
+                        out float2 uvDx, out float2 uvDy) {
+    float4 c0 = mul(mul(float4(wp0, 1.0), viewMatrix), projMatrix);
+    float4 c1 = mul(mul(float4(wp1, 1.0), viewMatrix), projMatrix);
+    float4 c2 = mul(mul(float4(wp2, 1.0), viewMatrix), projMatrix);
+    float2 s0 = (c0.xy / max(c0.w, 1e-6) * float2(0.5, -0.5) + 0.5)
+              * float2(screenWidth, screenHeight);
+    float2 s1 = (c1.xy / max(c1.w, 1e-6) * float2(0.5, -0.5) + 0.5)
+              * float2(screenWidth, screenHeight);
+    float2 s2 = (c2.xy / max(c2.w, 1e-6) * float2(0.5, -0.5) + 0.5)
+              * float2(screenWidth, screenHeight);
+    float2 e0 = s1 - s0;
+    float2 e1 = s2 - s0;
+    float determinant = e0.x * e1.y - e0.y * e1.x;
+    if (abs(determinant) < 1e-6) {
+        uvDx = 0.0;
+        uvDy = 0.0;
+        return;
+    }
+    float invDet = rcp(determinant);
+    float3 baryDx = float3((e0.y - e1.y) * invDet,
+                           e1.y * invDet, -e0.y * invDet);
+    float3 baryDy = float3((e1.x - e0.x) * invDet,
+                          -e1.x * invDet, e0.x * invDet);
+    uvDx = baryDx.x * uv0 + baryDx.y * uv1 + baryDx.z * uv2;
+    uvDy = baryDy.x * uv0 + baryDy.y * uv1 + baryDy.z * uv2;
+}
+
 // ---- Point Light Calculation (matching forward shader) ----
 
 float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 viewDir) {
@@ -331,11 +369,47 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 normal = normalize(mul(objNormal, (float3x3)dc.modelMatrix));
     
     float2 texCoord = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
+    float2 uvDx, uvDy;
+    ComputeUVGradients(wp0, wp1, wp2, uv0, uv1, uv2, uvDx, uvDy);
     
     // Material
-    float3 albedo = dc.objectColor;
-    float  metal  = dc.metalness;
-    float  rough  = dc.roughness;
+    MaterialData material = materials[min(dc.materialID, 255u)];
+    float3 albedo = dc.objectColor * material.baseColorFactor.rgb;
+    float metal = material.pbrParams.w > 0.5 ? material.pbrParams.x : dc.metalness;
+    float rough = material.pbrParams.w > 0.5 ? material.pbrParams.y : dc.roughness;
+    float materialAO = 1.0;
+    if (material.textureIndices.x < 64u) {
+        albedo *= materialTextures[material.textureIndices.x].SampleGrad(
+            texSampler, texCoord, uvDx, uvDy).rgb;
+    }
+    if (material.textureIndices.z < 64u) {
+        float4 mr = materialTextures[material.textureIndices.z].SampleGrad(
+            texSampler, texCoord, uvDx, uvDy);
+        materialAO = lerp(1.0, mr.r, saturate(material.emissiveOcclusion.w));
+        if (material.textureIndices.w != 0u) rough *= mr.r;
+        else { rough *= mr.g; metal *= mr.b; }
+    }
+    metal = saturate(metal);
+    rough = clamp(rough, 0.04, 1.0);
+
+    if (material.textureIndices.y < 64u) {
+        float3 tangentNormal = materialTextures[material.textureIndices.y].SampleGrad(
+            texSampler, texCoord, uvDx, uvDy).xyz * 2.0 - 1.0;
+        tangentNormal.y *= material.pbrParams.z;
+        float3 edge1 = wp1 - wp0;
+        float3 edge2 = wp2 - wp0;
+        float2 deltaUV1 = uv1 - uv0;
+        float2 deltaUV2 = uv2 - uv0;
+        float uvDet = deltaUV1.x * deltaUV2.y - deltaUV1.y * deltaUV2.x;
+        if (abs(uvDet) > 1e-6) {
+            float3 tangent = normalize((edge1 * deltaUV2.y - edge2 * deltaUV1.y) / uvDet);
+            tangent = normalize(tangent - normal * dot(normal, tangent));
+            float3 bitangent = normalize(cross(normal, tangent));
+            normal = normalize(tangentNormal.x * tangent +
+                               tangentNormal.y * bitangent +
+                               tangentNormal.z * normal);
+        }
+    }
     
     // View direction
     float3 viewDir = normalize(cameraPos - fragPos);
@@ -385,12 +459,13 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 kD = float3(1.0, 1.0, 1.0) - kS;
     kD *= 1.0 - metal;
 
-    float ambientOcclusion = ScreenSpaceAO(pixel, fragPos, normal);
+    float ambientOcclusion = ScreenSpaceAO(pixel, fragPos, normal) * materialAO;
     float3 diffuseIBL = SampleSkyIrradiance(normal) * albedo * kD / 3.14159265;
     float3 reflectionIBL = SampleReflectionProbe(reflect(-V, normal), rough);
     float3 specularIBL = reflectionIBL * F * (1.0 - rough * 0.65);
     result += (diffuseIBL + specularIBL) * ambientOcclusion;
     result += ambientStrength * albedo * ambientOcclusion;
+    result += material.emissiveOcclusion.rgb;
     
     float3 numerator = NDF * G * F;
     float denominator = 4.0 * NdotV * NdotL + 0.0001;

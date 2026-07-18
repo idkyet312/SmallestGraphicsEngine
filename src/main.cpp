@@ -4695,7 +4695,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             RenderIdTech(scene, mainShader, visBuffer, geo, packed,
                 lightSpace, shadowResource, &occlusionDepth,
-                hzbHistoryUsable, previousHZBViewProjection);
+                hzbHistoryUsable, previousHZBViewProjection, floorMaterial);
         } else if (gameScreen == GameScreen::Level1 && !levelLoadingActive) {
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
