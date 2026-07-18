@@ -220,6 +220,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 g_destructionBatchesThisFrame,
                 g_destructionChunksSubmittedThisFrame,
                 g_destructionCulledThisFrame);
+    ImGui::Checkbox("God Mode", &scene.playerGodMode);
     const StaticBufferStatsDX12 staticStats = GetStaticBufferStatsDX12();
     ImGui::Text("GPU-local static buffers: %u  %.1f MiB  Pending: %u",
                 staticStats.resources, staticStats.bytes / (1024.0 * 1024.0),
