@@ -303,22 +303,25 @@ inline void CullAndBatchDrawItems(Scene& scene, const XMMATRIX& view, const XMMA
 }
 
 #pragma pack(push, 1)
-struct VisIndirectCommand {
+struct VisIndexedIndirectCommand {
     D3D12_VERTEX_BUFFER_VIEW vbv;
+    D3D12_INDEX_BUFFER_VIEW ibv;
     D3D12_GPU_VIRTUAL_ADDRESS matrixCBV;
     UINT drawCallID;
-    D3D12_DRAW_ARGUMENTS drawArgs;
+    D3D12_DRAW_INDEXED_ARGUMENTS drawArgs;
 };
 
 struct GPUVisibilityCullInput {
-    VisIndirectCommand command;
+    VisIndexedIndirectCommand command;
     XMFLOAT4 worldBounds;
 };
 #pragma pack(pop)
 
-static_assert(sizeof(VisIndirectCommand) == sizeof(D3D12_VERTEX_BUFFER_VIEW) + sizeof(D3D12_GPU_VIRTUAL_ADDRESS) + sizeof(UINT) + sizeof(D3D12_DRAW_ARGUMENTS),
-    "VisIndirectCommand must be tightly packed for ExecuteIndirect.");
-static_assert(sizeof(GPUVisibilityCullInput) == 60,
+static_assert(sizeof(VisIndexedIndirectCommand) == sizeof(D3D12_VERTEX_BUFFER_VIEW) +
+    sizeof(D3D12_INDEX_BUFFER_VIEW) + sizeof(D3D12_GPU_VIRTUAL_ADDRESS) +
+    sizeof(UINT) + sizeof(D3D12_DRAW_INDEXED_ARGUMENTS),
+    "VisIndexedIndirectCommand must be tightly packed for ExecuteIndirect.");
+static_assert(sizeof(GPUVisibilityCullInput) == 80,
     "GPU cull input must match visibility_cull_cs.hlsl.");
 
 struct alignas(256) GPUVisibilityCullConstants {
@@ -350,19 +353,20 @@ struct GPUDrivenVisibilityContext {
     bool Init(ID3D12RootSignature* visRootSig) {
         if (initialized) return true;
 
-        D3D12_INDIRECT_ARGUMENT_DESC args[4] = {};
+        D3D12_INDIRECT_ARGUMENT_DESC args[5] = {};
         args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
         args[0].VertexBuffer.Slot = 0;
-        args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
-        args[1].ConstantBufferView.RootParameterIndex = 0; // matrix CBV
-        args[2].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
-        args[2].Constant.RootParameterIndex = 1; // drawCallID root constants
-        args[2].Constant.DestOffsetIn32BitValues = 0;
-        args[2].Constant.Num32BitValuesToSet = 1;
-        args[3].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
+        args[2].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
+        args[2].ConstantBufferView.RootParameterIndex = 0; // matrix CBV
+        args[3].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+        args[3].Constant.RootParameterIndex = 1; // drawCallID root constants
+        args[3].Constant.DestOffsetIn32BitValues = 0;
+        args[3].Constant.Num32BitValuesToSet = 1;
+        args[4].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
 
         D3D12_COMMAND_SIGNATURE_DESC sigDesc = {};
-        sigDesc.ByteStride = sizeof(VisIndirectCommand);
+        sigDesc.ByteStride = sizeof(VisIndexedIndirectCommand);
         sigDesc.NumArgumentDescs = _countof(args);
         sigDesc.pArgumentDescs = args;
 
@@ -403,7 +407,7 @@ struct GPUDrivenVisibilityContext {
         D3D12_HEAP_PROPERTIES defaultHeap = {};
         defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        desc.Width = sizeof(VisIndirectCommand) * maxCommands;
+        desc.Width = sizeof(VisIndexedIndirectCommand) * maxCommands;
         hr = g_dx12.device->CreateCommittedResource(
             &defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, nullptr,
@@ -503,7 +507,7 @@ struct GPUDrivenVisibilityContext {
         commandsUav.Format = DXGI_FORMAT_R32_TYPELESS;
         commandsUav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
         commandsUav.Buffer.NumElements =
-            (sizeof(VisIndirectCommand) * maxCommands) / sizeof(UINT);
+            (sizeof(VisIndexedIndirectCommand) * maxCommands) / sizeof(UINT);
         commandsUav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         g_dx12.device->CreateUnorderedAccessView(visibleCommandBuffer.Get(),
             nullptr, &commandsUav, handle);
@@ -681,32 +685,50 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     vb.UploadBuffers(g_dx12.commandList.Get());
 
     // Pass 1: GPU cull and compact the actual ExecuteIndirect stream.
-    static GPUDrivenVisibilityContext gpuDriven;
-    if (!gpuDriven.initialized) {
-        gpuDriven.Init(vb.visPassRootSig.Get());
-    }
-    const bool hasIndexedOrImportedGeometry = std::any_of(drawItems.begin(),
-        drawItems.end(), [](const IdTechDrawItem& item) { return item.primitive != nullptr; });
-    const bool useGPUDriven = gpuDriven.initialized && !hasIndexedOrImportedGeometry;
+    // PSO state cannot change inside ExecuteIndirect. Keep separate compacted
+    // streams for culled and double-sided opaque indexed geometry. Alpha-cutout
+    // draws retain direct submission because each batch needs its own texture SRV.
+    static GPUDrivenVisibilityContext gpuCulled;
+    static GPUDrivenVisibilityContext gpuDoubleSided;
+    if (!gpuCulled.initialized) gpuCulled.Init(vb.visPassRootSig.Get());
+    if (!gpuDoubleSided.initialized) gpuDoubleSided.Init(vb.visPassRootSig.Get());
+    const bool useGPUDriven = gpuCulled.initialized && gpuDoubleSided.initialized;
 
     UINT drawCount = (UINT)drawItems.size();
-    if (drawCount > gpuDriven.maxCommands) drawCount = gpuDriven.maxCommands;
+    if (drawCount > gpuCulled.maxCommands) drawCount = gpuCulled.maxCommands;
     if (drawCount > MAX_DRAW_CALLS_PER_FRAME) drawCount = MAX_DRAW_CALLS_PER_FRAME;
+
+    UINT culledCount = 0;
+    UINT doubleSidedCount = 0;
+    std::vector<UINT> directDraws;
+    directDraws.reserve(drawCount);
 
     for (UINT i = 0; i < drawCount; i++) {
         D3D12_GPU_VIRTUAL_ADDRESS matrixCBV = 0;
         FillMatrixBufferForIndirect(shader, i, drawItems[i].model, view, proj, lightSpace, matrixCBV);
 
-        if (useGPUDriven) {
-            GPUVisibilityCullInput& input = gpuDriven.Input(i);
-            input.command.vbv = drawItems[i].isCube ? geo.cubeVBV : geo.planeVBV;
+        const bool indexedOpaque = useGPUDriven && !drawItems[i].alphaCutout &&
+            drawItems[i].primitive &&
+            drawItems[i].primitive->ibv.BufferLocation != 0;
+        if (indexedOpaque) {
+            UINT& batchCount = drawItems[i].doubleSided
+                ? doubleSidedCount : culledCount;
+            GPUDrivenVisibilityContext& context = drawItems[i].doubleSided
+                ? gpuDoubleSided : gpuCulled;
+            GPUVisibilityCullInput& input = context.Input(batchCount++);
+            input.command.vbv = drawItems[i].primitive->vbv;
+            input.command.ibv = drawItems[i].primitive->ibv;
             input.command.matrixCBV = matrixCBV;
             input.command.drawCallID = dcIDs[i];
-            input.command.drawArgs.VertexCountPerInstance = drawItems[i].isCube ? 36 : 6;
+            input.command.drawArgs.IndexCountPerInstance =
+                drawItems[i].primitive->indexCount;
             input.command.drawArgs.InstanceCount = 1;
-            input.command.drawArgs.StartVertexLocation = 0;
+            input.command.drawArgs.StartIndexLocation = 0;
+            input.command.drawArgs.BaseVertexLocation = 0;
             input.command.drawArgs.StartInstanceLocation = 0;
             input.worldBounds = ComputeDrawItemBounds(drawItems[i]);
+        } else {
+            directDraws.push_back(i);
         }
     }
 
@@ -716,8 +738,8 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     // before the GPU consumes them.
     shader.currentDrawCall = (std::max)(shader.currentDrawCall, drawCount);
 
-    if (drawCount > 0 && useGPUDriven) {
-        GPUVisibilityCullConstants cull = {};
+    GPUVisibilityCullConstants cull = {};
+    if ((culledCount > 0 || doubleSidedCount > 0) && useGPUDriven) {
         FrustumPlanes frustum = ExtractFrustumPlanes(view * proj);
         for (UINT i = 0; i < 6; ++i) cull.frustumPlanes[i] = frustum.p[i];
         cull.previousViewProjection = XMMatrixTranspose(previousViewProjection);
@@ -726,20 +748,30 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         XMStoreFloat4x4(&projection, proj);
         cull.projectionScaleY = fabsf(projection._22);
         cull.screenSize = XMUINT2(g_dx12.screenWidth, g_dx12.screenHeight);
-        cull.commandCount = drawCount;
         cull.hzbMipCount = hzb ? hzb->GetMipCount() : 0;
         cull.useOcclusion = useHZBOcclusion ? 1u : 0u;
         cull.lodPixelThreshold = 2.0f;
-        gpuDriven.Cull(g_dx12.commandList.Get(), cull, hzb);
+        if (culledCount > 0) {
+            cull.commandCount = culledCount;
+            gpuCulled.Cull(g_dx12.commandList.Get(), cull, hzb);
+        }
+        if (doubleSidedCount > 0) {
+            cull.commandCount = doubleSidedCount;
+            gpuDoubleSided.Cull(g_dx12.commandList.Get(), cull, hzb);
+        }
     }
 
     vb.BeginVisibilityPass(g_dx12.commandList.Get());
-    if (drawCount > 0 && useGPUDriven) {
-        g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        gpuDriven.Execute(g_dx12.commandList.Get(), drawCount);
-    } else {
-        g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        for (UINT i = 0; i < drawCount; ++i) {
+    g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (culledCount > 0) {
+        vb.SetVisPassDraw(g_dx12.commandList.Get(), 0, 0, false, false, false);
+        gpuCulled.Execute(g_dx12.commandList.Get(), culledCount);
+    }
+    if (doubleSidedCount > 0) {
+        vb.SetVisPassDraw(g_dx12.commandList.Get(), 0, 0, true, false, false);
+        gpuDoubleSided.Execute(g_dx12.commandList.Get(), doubleSidedCount);
+    }
+    for (UINT i : directDraws) {
             D3D12_VERTEX_BUFFER_VIEW vbv = drawItems[i].primitive
                 ? drawItems[i].primitive->vbv
                 : (drawItems[i].isCube ? geo.cubeVBV : geo.planeVBV);
@@ -760,7 +792,6 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
                     : (drawItems[i].isCube ? 36u : 6u);
                 g_dx12.commandList->DrawInstanced(vertexCount, 1, 0, 0);
             }
-        }
     }
 
     vb.EndVisibilityPass(g_dx12.commandList.Get());
