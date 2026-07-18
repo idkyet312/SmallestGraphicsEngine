@@ -376,6 +376,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ImGui::SliderFloat("VB Bloom", &vb.bloomStrength, 0.0f, 1.0f, "%.2f");
                 ImGui::SliderFloat("VB Vignette", &vb.vignetteStrength, 0.0f, 1.0f, "%.2f");
                 ImGui::SliderFloat("VB Film Grain", &vb.grainStrength, 0.0f, 0.08f, "%.3f");
+                ImGui::SliderFloat("VB TAA Feedback", &vb.taaFeedback, 0.0f, 0.98f, "%.2f");
             }
         } else {
             ImGui::TextDisabled("VB Pipeline: Not Available");

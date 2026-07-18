@@ -661,10 +661,11 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     LightBufferDX12 dummyLB = {};
     PointLightsBufferDX12 dummyPL = {};
     vb.Resolve(g_dx12.commandList.Get(), view, proj, lightSpace,
+        previousViewProjection,
         scene.camera.Position, scene.cameraNear, scene.cameraFar,
         dummyLB, dummyPL);
 
-    vb.PostProcess(g_dx12.commandList.Get());
+    vb.PostProcess(g_dx12.commandList.Get(), useHZBOcclusion);
     vb.CopyToBackBuffer(g_dx12.commandList.Get());
     vb.TransitionBuffersForUpload(g_dx12.commandList.Get());
 }

@@ -10,6 +10,7 @@ cbuffer FrameConstants : register(b0) {
     matrix projMatrix;
     matrix invViewProj;
     matrix lightViewProj;
+    matrix previousViewProj;
     float3 cameraPos;
     float  screenWidth;
     float  screenHeight;
@@ -52,6 +53,7 @@ cbuffer PointLightsBuffer : register(b2) {
 
 struct DrawCallData {
     float4x4 modelMatrix;
+    float4x4 previousModelMatrix;
     float3   objectColor;
     float    useTexture;
     float    metalness;
@@ -92,6 +94,7 @@ struct ClusterData {
 StructuredBuffer<ClusterData>   clusters  : register(t6);
 
 RWTexture2D<float4> outputColor : register(u0);
+RWTexture2D<float2> outputMotion : register(u1);
 
 SamplerState              texSampler    : register(s0);
 SamplerComparisonState    shadowSampler : register(s1);
@@ -226,6 +229,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // Zero instance ID means no geometry was written.
     if (visValue.x == 0u) {
         outputColor[pixel] = float4(0.1, 0.1, 0.1, 1.0); // background
+        outputMotion[pixel] = 0.0;
         return;
     }
     
@@ -255,6 +259,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     
     // Interpolate attributes
     float3 fragPos = bary.x * wp0 + bary.y * wp1 + bary.z * wp2;
+    float3 localPos = bary.x * p0 + bary.y * p1 + bary.z * p2;
+    float3 previousWorldPos = mul(float4(localPos, 1.0), dc.previousModelMatrix).xyz;
+    float4 previousClip = mul(float4(previousWorldPos, 1.0), previousViewProj);
+    float2 currentUV = (float2(pixel) + 0.5) / float2(screenWidth, screenHeight);
+    float2 previousUV = currentUV;
+    if (previousClip.w > 0.001) {
+        previousUV = (previousClip.xy / previousClip.w) * float2(0.5, -0.5) + 0.5;
+    }
+    outputMotion[pixel] = currentUV - previousUV;
     
     float3 objNormal = normalize(bary.x * n0 + bary.y * n1 + bary.z * n2);
     // Transform normal to world space

@@ -1,5 +1,8 @@
 Texture2D<float4> hdrInput : register(t0);
+Texture2D<float2> motionInput : register(t1);
+Texture2D<float4> historyInput : register(t2);
 RWTexture2D<float4> ldrOutput : register(u0);
+RWTexture2D<float4> historyOutput : register(u1);
 
 cbuffer PostConstants : register(b0) {
     uint2 outputSize;
@@ -8,6 +11,8 @@ cbuffer PostConstants : register(b0) {
     float vignetteStrength;
     float grainStrength;
     uint frameIndex;
+    uint historyValid;
+    float taaFeedback;
     float postPadding;
 };
 
@@ -64,11 +69,40 @@ float3 Bloom(uint2 pixel) {
     return bloom;
 }
 
+float3 TemporalResolve(uint2 pixel, float3 currentColor) {
+    if (historyValid == 0) return currentColor;
+    float2 uv = (float2(pixel) + 0.5) / float2(outputSize);
+    float2 motion = motionInput.Load(int3(pixel, 0));
+    float2 previousUV = uv - motion;
+    if (any(previousUV <= 0.0) || any(previousUV >= 1.0)) return currentColor;
+
+    int2 previousPixel = clamp(int2(previousUV * float2(outputSize)),
+                               int2(0, 0), int2(outputSize) - 1);
+    float3 history = historyInput.Load(int3(previousPixel, 0)).rgb;
+    float3 neighborhoodMin = currentColor;
+    float3 neighborhoodMax = currentColor;
+    [unroll]
+    for (int y = -1; y <= 1; ++y) {
+        [unroll]
+        for (int x = -1; x <= 1; ++x) {
+            int2 p = clamp(int2(pixel) + int2(x, y), int2(0, 0),
+                           int2(outputSize) - 1);
+            float3 c = hdrInput.Load(int3(p, 0)).rgb;
+            neighborhoodMin = min(neighborhoodMin, c);
+            neighborhoodMax = max(neighborhoodMax, c);
+        }
+    }
+    history = clamp(history, neighborhoodMin, neighborhoodMax);
+    float motionConfidence = saturate(1.0 - length(motion * float2(outputSize)) * 0.08);
+    return lerp(currentColor, history, taaFeedback * motionConfidence);
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 threadID : SV_DispatchThreadID) {
     uint2 pixel = threadID.xy;
     if (any(pixel >= outputSize)) return;
-    float3 hdr = hdrInput.Load(int3(pixel, 0)).rgb;
+    float3 hdr = TemporalResolve(pixel, hdrInput.Load(int3(pixel, 0)).rgb);
+    historyOutput[pixel] = float4(hdr, 1.0);
     float3 color = TonemapAgX((hdr + Bloom(pixel) * bloomStrength) * exposure);
     const float3x3 grade = float3x3(
         1.035, 0.005, -0.015,
