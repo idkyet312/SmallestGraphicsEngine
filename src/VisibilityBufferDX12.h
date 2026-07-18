@@ -3,6 +3,7 @@
 
 #include "DX12Core.h"
 #include "ShaderDX12.h"
+#include "SceneGraph.h"
 #include <DirectXPackedVector.h>
 #include <fstream>
 #include <sstream>
@@ -81,7 +82,7 @@ struct alignas(256) VBFrameConstants {
     float    screenHeight;
     float    nearPlane;
     float    farPlane;
-    float    pad0;
+    UINT     debugViewMode;
 };
 
 struct alignas(256) VBPostConstants {
@@ -99,7 +100,7 @@ struct alignas(256) VBPostConstants {
     float aperture;
     float nearPlane;
     float farPlane;
-    float padding0;
+    UINT debugViewMode;
     float padding1;
 };
 
@@ -172,6 +173,7 @@ public:
     std::vector<VBClusterData>  cpuClusters;
     std::vector<XMFLOAT4X4>     previousModels;
     std::vector<VBMeshData>     meshes;
+    std::unordered_map<const MeshPrimitive*, UINT> primitiveMeshLookup;
     std::unordered_map<const SceneMaterial*, UINT> materialLookup;
     UINT materialCount = 1;
     UINT materialTextureCount = 0;
@@ -195,6 +197,8 @@ public:
     float aperture = 0.025f;
     float currentNearPlane = 0.1f;
     float currentFarPlane = 1000.0f;
+    int debugViewMode = 0; // 0=lit, 1=instance/primitive IDs, 2=depth
+    bool validationMode = true;
 
     UINT width = 0;
     UINT height = 0;
@@ -302,7 +306,8 @@ public:
     // Upload-once mesh registration. Instances reference this immutable geometry
     // every frame instead of duplicating vertices per draw.
     UINT RegisterMesh(const float* vertexData, UINT vertexCount,
-                      const UINT* indexData, UINT indexCount) {
+                      const UINT* indexData, UINT indexCount,
+                      UINT vertexStrideFloats = 8) {
         if (!vertexData || vertexCount == 0 ||
             persistentVertexCount + vertexCount > VB_MAX_VERTICES ||
             persistentIndexCount + indexCount > VB_MAX_INDICES) {
@@ -317,7 +322,7 @@ public:
         mesh.hasIndices = (indexData && indexCount > 0) ? 1u : 0u;
 
         for (UINT i = 0; i < vertexCount; ++i) {
-            const float* v = vertexData + i * 8;
+            const float* v = vertexData + i * vertexStrideFloats;
             VBPackedVertex& pv = cpuVertices[persistentVertexCount + i];
             pv.d0 = XMFLOAT4(v[0], v[1], v[2], v[3]);
             pv.d1 = XMFLOAT4(v[4], v[5], v[6], v[7]);
@@ -332,6 +337,21 @@ public:
         meshes.push_back(mesh);
         geometryDirty = true;
         return static_cast<UINT>(meshes.size() - 1);
+    }
+
+    UINT RegisterPrimitive(MeshPrimitive* primitive) {
+        if (!primitive || primitive->vertices.empty()) return VB_INVALID_MESH;
+        auto found = primitiveMeshLookup.find(primitive);
+        if (found != primitiveMeshLookup.end()) return found->second;
+        const UINT mesh = RegisterMesh(primitive->vertices.data(),
+            static_cast<UINT>(primitive->vertices.size() / 12),
+            primitive->indices.empty() ? nullptr : primitive->indices.data(),
+            static_cast<UINT>(primitive->indices.size()), 12);
+        if (mesh != VB_INVALID_MESH) {
+            primitiveMeshLookup.emplace(primitive, mesh);
+            primitive->visibilityMeshID = mesh;
+        }
+        return mesh;
     }
 
     // Register only mutable instance/material data for this frame.
@@ -594,7 +614,7 @@ public:
         fc.screenHeight = (float)height;
         fc.nearPlane = nearPlane;
         fc.farPlane = farPlane;
-        fc.pad0 = 0.0f;
+        fc.debugViewMode = static_cast<UINT>(debugViewMode);
         frameConstantBuffer.CopyData(g_dx12.frameIndex, fc);
 
         // Set compute pipeline
@@ -715,17 +735,18 @@ public:
         constants.outputWidth = width;
         constants.outputHeight = height;
         constants.exposure = exposure;
-        constants.bloomStrength = bloomStrength;
-        constants.vignetteStrength = vignetteStrength;
-        constants.grainStrength = grainStrength;
+        constants.bloomStrength = validationMode ? 0.0f : bloomStrength;
+        constants.vignetteStrength = validationMode ? 0.0f : vignetteStrength;
+        constants.grainStrength = validationMode ? 0.0f : grainStrength;
         constants.frameIndex = postFrameIndex++;
-        constants.historyValid = (allowHistory && temporalHistoryValid) ? 1u : 0u;
-        constants.taaFeedback = taaFeedback;
-        constants.motionBlurStrength = motionBlurStrength;
+        constants.historyValid = (!validationMode && allowHistory && temporalHistoryValid) ? 1u : 0u;
+        constants.taaFeedback = validationMode ? 0.0f : taaFeedback;
+        constants.motionBlurStrength = validationMode ? 0.0f : motionBlurStrength;
         constants.focusDistance = focusDistance;
-        constants.aperture = aperture;
+        constants.aperture = validationMode ? 0.0f : aperture;
         constants.nearPlane = currentNearPlane;
         constants.farPlane = currentFarPlane;
+        constants.debugViewMode = static_cast<UINT>(debugViewMode);
         postConstantBuffer.CopyData(g_dx12.frameIndex, constants);
 
         cmdList->SetComputeRootSignature(postRootSig.Get());

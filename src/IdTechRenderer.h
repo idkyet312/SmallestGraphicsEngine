@@ -57,6 +57,8 @@ struct IdTechDrawItem {
     UINT materialId;
     bool backfaceCullable;
     std::shared_ptr<SceneMaterial> material;
+    MeshPrimitive* primitive = nullptr;
+    UINT visibilityMeshID = VB_INVALID_MESH;
 };
 
 struct FrustumPlanes {
@@ -121,6 +123,25 @@ inline XMFLOAT3 TransformDir(const XMMATRIX& m, const XMFLOAT3& d) {
 }
 
 inline XMFLOAT4 ComputeDrawItemBounds(const IdTechDrawItem& item) {
+    if (item.primitive && item.primitive->boundsValid) {
+        const XMFLOAT3 localCenter(
+            (item.primitive->boundsMin.x + item.primitive->boundsMax.x) * 0.5f,
+            (item.primitive->boundsMin.y + item.primitive->boundsMax.y) * 0.5f,
+            (item.primitive->boundsMin.z + item.primitive->boundsMax.z) * 0.5f);
+        const XMFLOAT3 worldCenter = TransformPoint(item.model, localCenter);
+        const XMFLOAT3 extent(
+            (item.primitive->boundsMax.x - item.primitive->boundsMin.x) * 0.5f,
+            (item.primitive->boundsMax.y - item.primitive->boundsMin.y) * 0.5f,
+            (item.primitive->boundsMax.z - item.primitive->boundsMin.z) * 0.5f);
+        XMFLOAT4X4 m;
+        XMStoreFloat4x4(&m, item.model);
+        const float sx = XMVectorGetX(XMVector3Length(XMVectorSet(m._11, m._12, m._13, 0)));
+        const float sy = XMVectorGetX(XMVector3Length(XMVectorSet(m._21, m._22, m._23, 0)));
+        const float sz = XMVectorGetX(XMVector3Length(XMVectorSet(m._31, m._32, m._33, 0)));
+        const float radius = sqrtf(extent.x * extent.x + extent.y * extent.y +
+            extent.z * extent.z) * (std::max)(sx, (std::max)(sy, sz));
+        return XMFLOAT4(worldCenter.x, worldCenter.y, worldCenter.z, radius);
+    }
     XMFLOAT3 center = TransformPoint(item.model, XMFLOAT3(0, 0, 0));
     float radius = 28.5f;
     if (item.isCube) {
@@ -134,8 +155,45 @@ inline XMFLOAT4 ComputeDrawItemBounds(const IdTechDrawItem& item) {
     return XMFLOAT4(center.x, center.y, center.z, radius);
 }
 
+inline void AppendOpaqueMeshDrawItems(const std::shared_ptr<SceneMesh>& mesh,
+    const XMMATRIX& model, std::vector<IdTechDrawItem>& items) {
+    if (!mesh) return;
+    for (MeshPrimitive& primitive : mesh->primitives) {
+            const std::shared_ptr<SceneMaterial>& material = primitive.material;
+            const bool transparent = material && material->baseColorFactor.w < 0.999f;
+            const bool unsupportedMaterial = material &&
+                (material->alphaCutout || material->doubleSided);
+            if (transparent || unsupportedMaterial || primitive.skinBuffer ||
+                primitive.vertices.empty() || primitive.vbv.BufferLocation == 0)
+                continue;
+            XMFLOAT3 color(1, 1, 1);
+            if (material) color = XMFLOAT3(material->baseColorFactor.x,
+                material->baseColorFactor.y, material->baseColorFactor.z);
+            IdTechDrawItem item = {};
+            item.model = model;
+            item.color = color;
+            item.materialId = material ? static_cast<UINT>(primitive.materialIndex + 2) : 0u;
+            item.material = material;
+            item.primitive = &primitive;
+            items.push_back(item);
+    }
+}
+
+inline void AppendOpaqueSceneNodeDrawItems(
+    const std::shared_ptr<SceneNode>& node, const XMMATRIX& worldTransform,
+    std::vector<IdTechDrawItem>& items) {
+    if (!node) return;
+    if (node->mesh) {
+        const XMMATRIX model = XMLoadFloat4x4(&node->globalTransform) * worldTransform;
+        AppendOpaqueMeshDrawItems(node->mesh, model, items);
+    }
+    for (const std::shared_ptr<SceneNode>& child : node->children)
+        AppendOpaqueSceneNodeDrawItems(child, worldTransform, items);
+}
+
 inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items,
-                                const std::shared_ptr<SceneMaterial>& floorMaterial) {
+                                const std::shared_ptr<SceneMaterial>& floorMaterial,
+                                const std::shared_ptr<SceneNode>& importedScene) {
     items.clear();
 
     if (!scene.useMeshTerrain) {
@@ -145,6 +203,61 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items
 
     if (scene.cube2.visible) {
         items.push_back({ scene.cube2.GetModelMatrix(), scene.cube2.color, true, MAT_CUBE, false });
+    }
+
+    if (!g_emptyLevelMode && importedScene && g_showH2Model)
+        AppendOpaqueSceneNodeDrawItems(importedScene, XMMatrixIdentity(), items);
+
+    if (!g_emptyLevelMode && scene.useDestruction && g_destruction.IsInitialized()) {
+        for (const DestructionRenderBatch& batch : g_destruction.GetRenderBatches())
+            AppendOpaqueSceneNodeDrawItems(batch.colourNode,
+                XMLoadFloat4x4(&batch.transform), items);
+        for (const DestructionRenderItem& item : g_destruction.GetRenderItems())
+            AppendOpaqueSceneNodeDrawItems(item.node,
+                XMLoadFloat4x4(&item.transform), items);
+    }
+
+    if (!g_emptyLevelMode && g_trees.IsInitialized()) {
+        for (const TreeItem& tree : g_trees.GetItems()) {
+            std::shared_ptr<SceneMesh> slice;
+            if (tree.crown) slice = PalmModel::Crown();
+            else if (tree.segment >= 0 &&
+                     tree.segment < static_cast<int>(PalmModel::TrunkSlices().size()))
+                slice = PalmModel::TrunkSlices()[tree.segment].mesh;
+            if (slice) AppendOpaqueMeshDrawItems(slice,
+                XMLoadFloat4x4(&tree.transform), items);
+            else items.push_back({ XMLoadFloat4x4(&tree.transform), tree.color,
+                true, MAT_CUBE, false });
+        }
+    }
+
+    if (!g_emptyLevelMode && g_water.IsInitialized()) {
+        for (const WaterFloaterItem& floater : g_water.GetFloaterItems())
+            items.push_back({ XMLoadFloat4x4(&floater.transform), floater.color,
+                true, MAT_CUBE, false });
+    }
+
+    if (!g_emptyLevelMode && g_humveeModel) {
+        AppendOpaqueSceneNodeDrawItems(g_humveeModel, HumveeWorldMatrix(), items);
+        if (g_stressTestMode)
+            AppendOpaqueSceneNodeDrawItems(g_humveeModel,
+                SecondaryHumveeWorldMatrix(), items);
+    }
+
+    if (!g_emptyLevelMode && g_helicopterModel && scene.showHelicopter) {
+        AppendOpaqueSceneNodeDrawItems(g_helicopterModel, HelicopterWorldMatrix(), items);
+        if (g_stressTestMode)
+            AppendOpaqueSceneNodeDrawItems(g_helicopterModel,
+                SecondaryHelicopterWorldMatrix(), items);
+    }
+
+    if (!g_emptyLevelMode && g_explosiveBarrelModel) {
+        for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+            if (!barrel.active) continue;
+            AppendOpaqueSceneNodeDrawItems(g_explosiveBarrelModel,
+                XMMatrixTranslation(barrel.position.x,
+                    barrel.position.y - 0.75f, barrel.position.z), items);
+        }
     }
 
 }
@@ -500,13 +613,14 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
                          OcclusionDepthDX12* hzb,
                          bool useHZBOcclusion,
                          const XMMATRIX& previousViewProjection,
-                         const std::shared_ptr<SceneMaterial>& floorMaterial) {
+                         const std::shared_ptr<SceneMaterial>& floorMaterial,
+                         const std::shared_ptr<SceneNode>& importedScene = nullptr) {
     XMMATRIX view = scene.GetViewMatrix();
     XMMATRIX proj = scene.GetProjectionMatrix();
 
     // Build draw item list
     std::vector<IdTechDrawItem> drawItems;
-    BuildSceneDrawItems(scene, drawItems, floorMaterial);
+    BuildSceneDrawItems(scene, drawItems, floorMaterial, importedScene);
 
     // CPU retains only cheap material ordering/backface rejection. GPU decides
     // frustum, projected-size LOD, HZB visibility, and final indirect draw count.
@@ -536,13 +650,22 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     }
     std::vector<UINT> dcIDs;
     dcIDs.reserve(drawItems.size());
+    std::vector<IdTechDrawItem> registeredItems;
+    registeredItems.reserve(drawItems.size());
 
-    for (const auto& item : drawItems) {
+    for (IdTechDrawItem item : drawItems) {
+        item.visibilityMeshID = item.primitive
+            ? vb.RegisterPrimitive(item.primitive)
+            : (item.isCube ? cubeMesh : planeMesh);
+        if (item.visibilityMeshID == VB_INVALID_MESH) continue;
         UINT materialID = vb.RegisterMaterial(item.material.get());
-        UINT dc = vb.RegisterInstance(item.isCube ? cubeMesh : planeMesh,
+        UINT dc = vb.RegisterInstance(item.visibilityMeshID,
             item.model, item.color, 0.0f, 0.5f, materialID);
+        if (dc == UINT_MAX) continue;
+        registeredItems.push_back(item);
         dcIDs.push_back(dc);
     }
+    drawItems.swap(registeredItems);
 
     vb.UploadBuffers(g_dx12.commandList.Get());
 
@@ -551,6 +674,9 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     if (!gpuDriven.initialized) {
         gpuDriven.Init(vb.visPassRootSig.Get());
     }
+    const bool hasIndexedOrImportedGeometry = std::any_of(drawItems.begin(),
+        drawItems.end(), [](const IdTechDrawItem& item) { return item.primitive != nullptr; });
+    const bool useGPUDriven = gpuDriven.initialized && !hasIndexedOrImportedGeometry;
 
     UINT drawCount = (UINT)drawItems.size();
     if (drawCount > gpuDriven.maxCommands) drawCount = gpuDriven.maxCommands;
@@ -560,7 +686,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         D3D12_GPU_VIRTUAL_ADDRESS matrixCBV = 0;
         FillMatrixBufferForIndirect(shader, i, drawItems[i].model, view, proj, lightSpace, matrixCBV);
 
-        if (gpuDriven.initialized) {
+        if (useGPUDriven) {
             GPUVisibilityCullInput& input = gpuDriven.Input(i);
             input.command.vbv = drawItems[i].isCube ? geo.cubeVBV : geo.planeVBV;
             input.command.matrixCBV = matrixCBV;
@@ -573,7 +699,13 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         }
     }
 
-    if (drawCount > 0 && gpuDriven.initialized) {
+    // These CBVs live in the same persistently mapped upload buffer used by
+    // forward extensions. Reserve the written range so later weapon,
+    // transparent, and particle draws cannot overwrite visibility matrices
+    // before the GPU consumes them.
+    shader.currentDrawCall = (std::max)(shader.currentDrawCall, drawCount);
+
+    if (drawCount > 0 && useGPUDriven) {
         GPUVisibilityCullConstants cull = {};
         FrustumPlanes frustum = ExtractFrustumPlanes(view * proj);
         for (UINT i = 0; i < 6; ++i) cull.frustumPlanes[i] = frustum.p[i];
@@ -591,20 +723,30 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     }
 
     vb.BeginVisibilityPass(g_dx12.commandList.Get());
-    if (drawCount > 0 && gpuDriven.initialized) {
+    if (drawCount > 0 && useGPUDriven) {
         g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         gpuDriven.Execute(g_dx12.commandList.Get(), drawCount);
     } else {
         g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         for (UINT i = 0; i < drawCount; ++i) {
-            D3D12_VERTEX_BUFFER_VIEW vbv = drawItems[i].isCube
-                ? geo.cubeVBV : geo.planeVBV;
+            D3D12_VERTEX_BUFFER_VIEW vbv = drawItems[i].primitive
+                ? drawItems[i].primitive->vbv
+                : (drawItems[i].isCube ? geo.cubeVBV : geo.planeVBV);
             g_dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
             vb.SetVisPassMatrices(g_dx12.commandList.Get(), drawItems[i].model,
                 view, proj, lightSpace, shader, i);
             vb.SetDrawCallID(g_dx12.commandList.Get(), dcIDs[i]);
-            g_dx12.commandList->DrawInstanced(
-                drawItems[i].isCube ? 36 : 6, 1, 0, 0);
+            if (drawItems[i].primitive &&
+                drawItems[i].primitive->ibv.BufferLocation != 0) {
+                g_dx12.commandList->IASetIndexBuffer(&drawItems[i].primitive->ibv);
+                g_dx12.commandList->DrawIndexedInstanced(
+                    drawItems[i].primitive->indexCount, 1, 0, 0, 0);
+            } else {
+                const UINT vertexCount = drawItems[i].primitive
+                    ? static_cast<UINT>(drawItems[i].primitive->vertices.size() / 12)
+                    : (drawItems[i].isCube ? 36u : 6u);
+                g_dx12.commandList->DrawInstanced(vertexCount, 1, 0, 0);
+            }
         }
     }
 

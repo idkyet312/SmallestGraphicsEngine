@@ -16,7 +16,7 @@ cbuffer FrameConstants : register(b0) {
     float  screenHeight;
     float  nearPlane;
     float  farPlane;
-    float  pad0;
+    uint   debugViewMode;
 };
 
 cbuffer LightBuffer : register(b1) {
@@ -338,6 +338,26 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     }
     
     uint2 visValue = visBuffer.Load(int3(pixel, 0));
+
+    if (debugViewMode == 2u) {
+        float rawDepth = depthBuffer.Load(int3(pixel, 0));
+        outputColor[pixel] = float4(rawDepth.xxx, 1.0);
+        outputMotion[pixel] = 0.0;
+        return;
+    }
+
+    if (debugViewMode == 1u) {
+        if (visValue.x == 0u) {
+            outputColor[pixel] = float4(0.0, 0.0, 0.0, 1.0);
+        } else {
+            uint key = visValue.x * 1664525u + visValue.y * 1013904223u;
+            float3 idColor = float3(key & 255u, (key >> 8u) & 255u,
+                                    (key >> 16u) & 255u) / 255.0;
+            outputColor[pixel] = float4(idColor, 1.0);
+        }
+        outputMotion[pixel] = 0.0;
+        return;
+    }
     
     // Zero instance ID means no geometry was written.
     if (visValue.x == 0u) {

@@ -22,7 +22,8 @@ cbuffer PostConstants : register(b0) {
     float aperture;
     float nearPlane;
     float farPlane;
-    float2 postPadding;
+    uint debugViewMode;
+    float postPadding;
 };
 
 float Luminance(float3 color) { return dot(color, float3(0.2126, 0.7152, 0.0722)); }
@@ -156,6 +157,12 @@ float3 TemporalResolve(uint2 pixel, float3 currentColor) {
 void main(uint3 threadID : SV_DispatchThreadID) {
     uint2 pixel = threadID.xy;
     if (any(pixel >= outputSize)) return;
+    if (debugViewMode != 0u) {
+        float4 debugColor = hdrInput.Load(int3(pixel, 0));
+        historyOutput[pixel] = debugColor;
+        ldrOutput[pixel] = debugColor;
+        return;
+    }
     float3 hdr = TemporalResolve(pixel, CinematicInput(pixel));
     historyOutput[pixel] = float4(hdr, 1.0);
     float autoExposure = exposureState.Load(8) / 65536.0;

@@ -312,7 +312,8 @@ inline std::vector<VertexPosNormUV> BuildCapsuleVertices(int hemiRings = 6, int 
 inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shader,
                        const XMMATRIX& model,
                        const XMMATRIX& view, const XMMATRIX& proj,
-                       const XMMATRIX& lightSpace, bool colorNormalOnly = false) {
+                       const XMMATRIX& lightSpace, bool colorNormalOnly = false,
+                       bool visibilityExtensionsOnly = false) {
     if (!mesh) return;
     shader.SetMatrices(model, view, proj, lightSpace);
 
@@ -320,6 +321,12 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
         if (prim.vbv.BufferLocation == 0) continue;
 
         const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
+        const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
+            !transparent && !prim.skinBuffer &&
+            !prim.vertices.empty() &&
+            (!prim.material || (!prim.material->alphaCutout &&
+                                 !prim.material->doubleSided));
+        if (visibilityExtensionsOnly && visibilityOwned) continue;
         if (prim.material) {
             if (transparent) shader.UseTransparent(); else shader.Use(false);
             XMFLOAT3 color(prim.material->baseColorFactor.x,
@@ -391,7 +398,9 @@ inline bool RasterPrimitiveIntersectsFrustum(const MeshPrimitive& primitive,
 
 inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& shader,
                            const XMMATRIX& worldTransform,
-                           const XMMATRIX& view, const XMMATRIX& proj, const XMMATRIX& lightSpace) {
+                           const XMMATRIX& view, const XMMATRIX& proj,
+                           const XMMATRIX& lightSpace,
+                           bool visibilityExtensionsOnly = false) {
     if (!node) return;
 
     if (node->mesh) {
@@ -402,6 +411,12 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
             if (prim.vbv.BufferLocation == 0) continue;
 
             const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
+            const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
+                !transparent && !prim.skinBuffer &&
+                !prim.vertices.empty() &&
+                (!prim.material || (!prim.material->alphaCutout &&
+                                     !prim.material->doubleSided));
+            if (visibilityExtensionsOnly && visibilityOwned) continue;
             const D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress = prim.meshletDescBuffer
                 ? prim.meshletDescBuffer->GetGPUVirtualAddress() : 0;
             const D3D12_GPU_VIRTUAL_ADDRESS boundsAddress = prim.meshletBoundsBuffer
@@ -467,7 +482,8 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node, ShaderDX12& sh
     }
 
     for (auto& child : node->children) {
-        DrawSceneNode(child, shader, worldTransform, view, proj, lightSpace);
+        DrawSceneNode(child, shader, worldTransform, view, proj, lightSpace,
+            visibilityExtensionsOnly);
     }
 }
 
@@ -728,7 +744,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // The model is its own multi-meter scene (not a unit cube), so place it directly
     // on the floor at the origin rather than reusing cube1's small transform.
     if (!g_emptyLevelMode && crateModel && g_showH2Model) {
-        DrawSceneNode(crateModel, shader, XMMatrixIdentity(), view, proj, lightSpace);
+        DrawSceneNode(crateModel, shader, XMMatrixIdentity(), view, proj,
+            lightSpace, visibilityExtensionsOnly);
         // Imported model used the mesh pipeline. Restore IA pipeline for
         // procedural objects that follow it.
         shader.Use(scene.wireframeMode);
@@ -752,7 +769,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                     continue;
                 }
                 DrawSceneNode(batch.colourNode, shader,
-                    XMLoadFloat4x4(&batch.transform), view, proj, lightSpace);
+                    XMLoadFloat4x4(&batch.transform), view, proj, lightSpace,
+                    visibilityExtensionsOnly);
                 ++g_destructionBatchesThisFrame;
                 g_destructionChunksSubmittedThisFrame += batch.chunkCount;
             }
@@ -763,7 +781,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                     ++g_destructionCulledThisFrame;
                     continue;
                 }
-                DrawSceneNode(item.node, shader, XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
+                DrawSceneNode(item.node, shader, XMLoadFloat4x4(&item.transform),
+                    view, proj, lightSpace, visibilityExtensionsOnly);
                 ++g_destructionBatchesThisFrame;
                 ++g_destructionChunksSubmittedThisFrame;
         }
@@ -814,8 +833,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 slice = PalmModel::TrunkSlices()[item.segment].mesh;
 
             if (slice) {
-                DrawMeshAt(slice, shader, xf, view, proj, lightSpace);
+                DrawMeshAt(slice, shader, xf, view, proj, lightSpace, false,
+                    visibilityExtensionsOnly);
             } else {
+                if (visibilityExtensionsOnly) continue;
                 shader.Use(scene.wireframeMode);
                 shader.SetMatrices(xf, view, proj, lightSpace);
                 shader.SetObjectColor(item.color);
@@ -921,7 +942,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // animated, undulating water surface on top so the floaters show through it.
     if (!g_emptyLevelMode && g_water.IsInitialized()) {
         shader.Use(scene.wireframeMode);
-        for (const WaterFloaterItem& item : g_water.GetFloaterItems()) {
+        if (!visibilityExtensionsOnly) for (const WaterFloaterItem& item : g_water.GetFloaterItems()) {
             shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj, lightSpace);
             shader.SetObjectColor(item.color);
             DrawCube(geo);
@@ -957,13 +978,20 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     }
 
     if (!g_emptyLevelMode && g_humveeModel) {
-        if (!staticBatches.Submit(g_humveeModel, HumveeWorldMatrix()))
+        if (visibilityExtensionsOnly) {
+            DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
+                view, proj, lightSpace, true);
+        } else if (!staticBatches.Submit(g_humveeModel, HumveeWorldMatrix()))
             DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
                 view, proj, lightSpace);
-        if (g_stressTestMode &&
-            !staticBatches.Submit(g_humveeModel, SecondaryHumveeWorldMatrix()))
-            DrawSceneNode(g_humveeModel, shader, SecondaryHumveeWorldMatrix(),
-                view, proj, lightSpace);
+        if (g_stressTestMode) {
+            if (visibilityExtensionsOnly)
+                DrawSceneNode(g_humveeModel, shader, SecondaryHumveeWorldMatrix(),
+                    view, proj, lightSpace, true);
+            else if (!staticBatches.Submit(g_humveeModel, SecondaryHumveeWorldMatrix()))
+                DrawSceneNode(g_humveeModel, shader, SecondaryHumveeWorldMatrix(),
+                    view, proj, lightSpace);
+        }
     }
 
     if (!g_emptyLevelMode && g_helicopterModel && scene.showHelicopter) {
@@ -975,10 +1003,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         const bool meshShadersWereEnabled = g_useMeshShader;
         g_useMeshShader = false;
         DrawSceneNode(g_helicopterModel, shader, HelicopterWorldMatrix(),
-                      view, proj, lightSpace);
+                      view, proj, lightSpace, visibilityExtensionsOnly);
         if (g_stressTestMode)
             DrawSceneNode(g_helicopterModel, shader, SecondaryHelicopterWorldMatrix(),
-                          view, proj, lightSpace);
+                          view, proj, lightSpace, visibilityExtensionsOnly);
         g_useMeshShader = meshShadersWereEnabled;
     }
 
@@ -989,7 +1017,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             if (!barrel.active) continue;
             const XMMATRIX barrelTransform = XMMatrixTranslation(
                 barrel.position.x, barrel.position.y - 0.75f, barrel.position.z);
-            if (!staticBatches.Submit(g_explosiveBarrelModel, barrelTransform))
+            if (visibilityExtensionsOnly)
+                DrawSceneNode(g_explosiveBarrelModel, shader, barrelTransform,
+                    view, proj, lightSpace, true);
+            else if (!staticBatches.Submit(g_explosiveBarrelModel, barrelTransform))
                 DrawSceneNode(g_explosiveBarrelModel, shader, barrelTransform,
                     view, proj, lightSpace);
         }
