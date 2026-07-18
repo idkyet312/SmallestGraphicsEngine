@@ -8,6 +8,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <array>
 #include <cfloat>
 #include <cmath>
@@ -40,6 +41,7 @@
 #include "SkyRendererDX12.h"
 #include "OcclusionDepthDX12.h"
 #include "FXAADX12.h"
+#include "VolumetricFogDX12.h"
 #include "MSAADX12.h"
 #include "DestructionDX12.h"
 #include "FBXImporter.h"
@@ -136,6 +138,7 @@ float                       g_fleshHitPitchMin = 0.9f;
 float                       g_fleshHitPitchMax = 1.1f;
 bool                        g_suppressFireUntilMouseRelease = false;
 bool                        g_stressTestMode = false;
+bool                        g_emptyLevelMode = false;
 NavigationSystem            g_navigation;
 
 static constexpr size_t kEnemiesPerSpawner = 2;
@@ -334,7 +337,8 @@ static void DamageSecondaryHelicopter(float damage, const XMFLOAT3& hit) {
 static bool HitHelicopterAtSegment(const XMFLOAT3& position, bool dead,
                                    const XMFLOAT3& start, const XMFLOAT3& end,
                                    float radius, XMFLOAT3& hit) {
-    if (!g_helicopterModel || dead) return false;
+    if (g_emptyLevelMode || !scene.showHelicopter ||
+        !g_helicopterModel || dead) return false;
     const XMVECTOR a = XMLoadFloat3(&start);
     const XMVECTOR b = XMLoadFloat3(&end);
     const XMVECTOR center = XMLoadFloat3(&position);
@@ -1056,6 +1060,7 @@ static void DetonateBarrel(size_t firstBarrel) {
 static bool HitExplosiveBarrelSegment(const XMFLOAT3& start,
                                       const XMFLOAT3& end, float radius,
                                       size_t& barrelIndex, XMFLOAT3& hit) {
+    if (g_emptyLevelMode) return false;
     const float direction[3] = {
         end.x - start.x, end.y - start.y, end.z - start.z };
     const float origin[3] = { start.x, start.y, start.z };
@@ -1224,7 +1229,10 @@ PalmTrees                   g_trees;
 GrassField                  g_grass;
 static SkyRendererDX12      skyRenderer;
 static OcclusionDepthDX12   occlusionDepth;
+static XMMATRIX             previousHZBViewProjection = XMMatrixIdentity();
+static bool                 hzbCaptureActive = false;
 static FXAADX12             fxaa;
+static VolumetricFogDX12    volumetricFog;
 static MSAADX12             msaa;
 static bool                 msaaUsedLastFrame = false;
 static VisibilityBufferDX12 visBuffer;
@@ -1250,7 +1258,8 @@ static std::vector<ComPtr<ID3D12Resource>> g_bloodUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_muzzleFlashUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_fireUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_explosionUploadHeaps;
-static bool                 crateLoadAttempted = false;
+static bool                 fullLevelAssetsLoaded = false;
+static bool                 emptyLevelAssetsLoaded = false;
 enum class LevelLoadStage {
     WorldAssets, Destruction, Environment, Weapons, Humvee, Helicopter,
     BanditModel, BanditSpawn, GPUFinalize, ReleaseUploads, Complete
@@ -1260,7 +1269,7 @@ struct LevelLoadRecord {
     double milliseconds = 0.0;
     bool succeeded = true;
 };
-static constexpr uint32_t   LevelLoadTaskCount = 10;
+static uint32_t             levelLoadTaskCount = 10;
 static LevelLoadStage       levelLoadStage = LevelLoadStage::Complete;
 static bool                 levelLoadingActive = false;
 static float                levelLoadingProgress = 0.0f;
@@ -1273,6 +1282,8 @@ static StaticBufferStatsDX12 levelLoadingUploadBaseline = {};
 static std::chrono::steady_clock::time_point levelLoadingStartedAt;
 static std::chrono::steady_clock::time_point levelLoadingTaskStartedAt;
 static std::vector<LevelLoadRecord> levelLoadingRecords;
+static std::future<bool> levelDestructionLoadFuture;
+static bool levelDestructionLoadInFlight = false;
 
 static double LevelLoadElapsedMs(
     std::chrono::steady_clock::time_point start) {
@@ -1285,8 +1296,11 @@ static void BeginLevelLoading() {
     levelLoadStage = LevelLoadStage::WorldAssets;
     levelLoadingActive = true;
     levelLoadingProgress = 0.02f;
-    levelLoadingLabel = "Terrain material and crate model";
-    levelLoadingAsset = "models/h2.glb";
+    levelLoadTaskCount = g_emptyLevelMode ? 5u : 10u;
+    levelLoadingLabel = g_emptyLevelMode
+        ? "Terrain material"
+        : "Terrain material and crate model";
+    levelLoadingAsset = g_emptyLevelMode ? "floor material" : "models/h2.glb";
     levelLoadingTaskIndex = 1;
     levelLoadingLastSubmittedUploads = 0;
     levelLoadingSubmittedUploads = 0;
@@ -1305,7 +1319,7 @@ static void AdvanceLevelLoading(LevelLoadStage next, const char* label,
     levelLoadStage = next;
     ++levelLoadingTaskIndex;
     levelLoadingProgress = (std::min)(0.95f,
-        static_cast<float>(levelLoadingTaskIndex - 1) / LevelLoadTaskCount);
+        static_cast<float>(levelLoadingTaskIndex - 1) / levelLoadTaskCount);
     levelLoadingLabel = label;
     levelLoadingAsset = asset;
     levelLoadingTaskStartedAt = std::chrono::steady_clock::now();
@@ -1315,7 +1329,7 @@ static void CompleteLevelLoading(bool succeeded = true) {
     levelLoadingRecords.push_back({ levelLoadingLabel,
         LevelLoadElapsedMs(levelLoadingTaskStartedAt), succeeded });
     levelLoadStage = LevelLoadStage::Complete;
-    levelLoadingTaskIndex = LevelLoadTaskCount;
+    levelLoadingTaskIndex = levelLoadTaskCount;
     levelLoadingProgress = 1.0f;
     levelLoadingLabel = "Ready";
     levelLoadingAsset = "None";
@@ -1388,6 +1402,7 @@ static void RebuildScalableEnvironment() {
         { -2.6f,  -1.5f,  2.6f,   1.5f },
         {-29.0f, -27.0f,-15.0f, -13.0f }
     };
+    std::vector<GrassField::Exclusion> grassExclusions;
     const size_t houseCount = g_stressTestMode ? kStressHouseCount : 4;
     size_t houseIndex = 0;
     const size_t compoundCount = (houseCount + kSpawnersPerCompound - 1) /
@@ -1403,11 +1418,19 @@ static void RebuildScalableEnvironment() {
         };
         for (size_t side = 0;
              side < kSpawnersPerCompound && houseIndex < houseCount;
-             ++side, ++houseIndex)
+             ++side, ++houseIndex) {
             obstacles.push_back(houses[side]);
+            constexpr float grassClearance = 0.4f;
+            grassExclusions.push_back({
+                houses[side].minX - grassClearance,
+                houses[side].minZ - grassClearance,
+                houses[side].maxX + grassClearance,
+                houses[side].maxZ + grassClearance });
+        }
     }
     if (g_stressTestMode) {
         obstacles.push_back({39.4f, 1.5f, 44.6f, 4.5f});
+        grassExclusions.push_back({39.0f, 1.1f, 45.0f, 4.9f});
     }
     for (const PalmSpawn& palm : kPalmSpawns)
         obstacles.push_back(
@@ -1426,7 +1449,7 @@ static void RebuildScalableEnvironment() {
 
     g_grass.Initialize(terrainSampler,
         g_stressTestMode ? 200.0f : 100.0f,
-        g_stressTestMode ? 1600000 : 400000, 0.0f);
+        g_stressTestMode ? 1600000 : 400000, 0.0f, grassExclusions);
     g_environmentInitialized = true;
     g_environmentStressMode = g_stressTestMode;
 }
@@ -1477,19 +1500,24 @@ static void OpenWinScreen() {
     SetCursorVisible(true);
 }
 
-static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false) {
+static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
+                          bool emptyLevel = false) {
     gameScreen = GameScreen::Level1;
-    g_stressTestMode = stressTest;
-    if (crateLoadAttempted)
+    g_emptyLevelMode = emptyLevel;
+    g_stressTestMode = stressTest && !emptyLevel;
+    const bool modeAssetsLoaded = g_emptyLevelMode
+        ? emptyLevelAssetsLoaded : fullLevelAssetsLoaded;
+    if (modeAssetsLoaded)
         wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
     levelElapsedSeconds = 0.0f;
-    levelTimerRunning = crateLoadAttempted;
-    if (!crateLoadAttempted) BeginLevelLoading();
+    levelTimerRunning = modeAssetsLoaded;
+    if (!modeAssetsLoaded) BeginLevelLoading();
     scene.playerGodMode = godMode;
     scene.RestorePlayerHealth();
     scene.ResetLevelRuntimeState();
     scene.camera = Camera(XMFLOAT3(0.0f, 5.0f, 10.0f));
     scene.gun.visible = true;
+    scene.showHelicopter = !g_emptyLevelMode;
     g_heldBandit = nullptr;
     g_heldBarrelIndex = SIZE_MAX;
     g_drivingHumvee = false;
@@ -1527,9 +1555,9 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false) {
     g_banditVoiceCooldown = 0.0f;
     g_banditPainCooldown = 0.0f;
     g_suppressFireUntilMouseRelease = true;
-    if (crateLoadAttempted)
+    if (modeAssetsLoaded)
         scene.rebuildDestructionRequested = true;
-    pendingLevelRuntimeReset = true;
+    pendingLevelRuntimeReset = modeAssetsLoaded;
     deathCursorReleased = false;
     showUI = false;
     cameraLocked = false;
@@ -1555,7 +1583,7 @@ static void RenderMainMenu(HWND hwnd) {
         ImVec2(0, 0), display, IM_COL32(5, 9, 12, 225));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(430.0f, 425.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(430.0f, 493.0f), ImGuiCond_Always);
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse;
@@ -1578,6 +1606,10 @@ static void RenderMainMenu(HWND hwnd) {
         StartLevelOne(hwnd, true);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     ImGui::SetCursorPosX(65.0f);
+    if (ImGui::Button("EMPTY", ImVec2(300.0f, 58.0f)))
+        StartLevelOne(hwnd, true, false, true);
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("STRESS TEST", ImVec2(300.0f, 58.0f)))
         StartLevelOne(hwnd, true, true);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
@@ -1594,21 +1626,21 @@ static void RenderLoadingScreen() {
         ImVec2(0, 0), display, IM_COL32(4, 8, 12, 238));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
         ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(620.0f, 390.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(680.0f, 450.0f), ImGuiCond_Always);
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoInputs;
     ImGui::Begin("Loading Level", nullptr, flags);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    const char* title = g_stressTestMode
-        ? "LOADING STRESS TEST" : "LOADING LEVEL 1";
-    ImGui::SetCursorPosX((620.0f - ImGui::CalcTextSize(title).x) * 0.5f);
+    const char* title = g_emptyLevelMode ? "LOADING EMPTY"
+        : (g_stressTestMode ? "LOADING STRESS TEST" : "LOADING LEVEL 1");
+    ImGui::SetCursorPosX((680.0f - ImGui::CalcTextSize(title).x) * 0.5f);
     ImGui::TextUnformatted(title);
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
 
     char progressText[64];
     std::snprintf(progressText, sizeof(progressText), "Task %u / %u  (%.0f%%)",
-        levelLoadingTaskIndex, LevelLoadTaskCount,
+        levelLoadingTaskIndex, levelLoadTaskCount,
         levelLoadingProgress * 100.0f);
     ImGui::ProgressBar(levelLoadingProgress, ImVec2(-1.0f, 25.0f), progressText);
     ImGui::Text("Current: %s", levelLoadingLabel.c_str());
@@ -1630,6 +1662,30 @@ static void RenderLoadingScreen() {
     ImGui::Text("Uploads: %u submitted total | %u last frame | %u pending",
         levelLoadingSubmittedUploads, levelLoadingLastSubmittedUploads,
         uploads.pendingUploads);
+
+    const StaticBufferDiagnosticDX12 resource = GetStaticBufferDiagnosticDX12();
+    const char* resourceState = "D3D12_RESOURCE_STATE_UNKNOWN";
+    if (resource.finalState == D3D12_RESOURCE_STATE_INDEX_BUFFER)
+        resourceState = "D3D12_RESOURCE_STATE_INDEX_BUFFER";
+    else if (resource.finalState == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+        resourceState = "D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE";
+    else if (resource.finalState ==
+        (D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
+         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+        resourceState = "D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | NON_PIXEL_SHADER_RESOURCE";
+    else if (resource.finalState == D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)
+        resourceState = "D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER";
+    ImGui::Separator();
+    ImGui::Text("DX12 resource #%llu: %s  %.2f KiB",
+        static_cast<unsigned long long>(resource.serial), resource.label.c_str(),
+        static_cast<double>(resource.bytes) / 1024.0);
+    ImGui::TextDisabled(
+        "CreateCommittedResource(DEFAULT, COPY_DEST) + UPLOAD(GENERIC_READ)");
+    ImGui::TextDisabled(
+        "COPY queue: CopyBufferRegion | DIRECT queue: final barrier/render");
+    ImGui::TextDisabled("CopyBufferRegion -> ResourceBarrier(");
+    ImGui::TextDisabled("  COPY_DEST -> %s [0x%X])", resourceState,
+        static_cast<unsigned>(resource.finalState));
 
     const HRESULT gpuHealth = g_dx12.device
         ? g_dx12.device->GetDeviceRemovedReason() : E_POINTER;
@@ -1964,6 +2020,15 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
         for (const auto& prim : child->mesh->primitives)
             if (prim.material) mats[prim.material->name] = prim.material;
     }
+    // Fracture chunks are closed prisms with visible interior faces. Meshlet
+    // cone/HZB rejection can mistake the previous frame's shell for an
+    // occluder and punch holes through intact walls. Cull these by frustum only.
+    for (auto& entry : mats) {
+        auto& material = entry.second;
+        if (!material) continue;
+        material->doubleSided = true;
+        material->disableOcclusionCulling = true;
+    }
     // Load the downloaded albedo + normal maps. Albedo falls back to the
     // procedural texture so the house never renders untextured; the normal map
     // is optional (skipped if the file is absent).
@@ -2076,6 +2141,9 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     // The roofs (RoofModel.h) are placed off this same constant.
     constexpr float floorY = Ground::kBuildingPadY, wallTop = floorY + 3.4f;
     constexpr float wall = 0.28f;                // wall / slab thickness
+    // Terrain pad is exactly floorY. Sink slab undersides slightly so their
+    // bottom triangles never occupy the same depth plane as terrain.
+    constexpr float foundationEmbed = 0.06f;
 
     auto root = std::make_shared<SceneNode>("DestructibleHouse");
     auto matFoundation = std::make_shared<SceneMaterial>();
@@ -2311,6 +2379,11 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
                 // Caps: fan around the centroid on both thickness faces.
                 emitTri(toWorld(centroid, t1), toWorld(a2, t1), toWorld(b2, t1), capN, capTan);
                 emitTri(toWorld(centroid, t0), toWorld(a2, t0), toWorld(b2, t0), capNeg, capTan);
+                // Transparent glass cells share these edges while intact. Their
+                // internal extrusion walls showed through both caps as bright
+                // pre-cracked lines. Glass keeps two caps (and therefore real
+                // collision thickness), but only separation exposes shard gaps.
+                if (shatter) continue;
                 // Side wall for this edge; outward normal from the CCW polygon.
                 const float ex = b2.x - a2.x, ey = b2.y - a2.y;
                 const float elen = std::sqrt(ex * ex + ey * ey);
@@ -2328,7 +2401,8 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     };
 
     // --- Foundation: single anchored slab spanning the footprint. ---
-    addBox("Support:Foundation", matFoundation, minX, maxX, floorY, floorY + wall, minZ, maxZ);
+    addBox("Support:Foundation", matFoundation, minX, maxX,
+        floorY - foundationEmbed, floorY + wall, minZ, maxZ);
 
     // --- Studded wall: vertical studs + outer cladding along one edge. The
     // bottom row of studs is anchored (the sill plate), so the wall stands. ---
@@ -2541,7 +2615,8 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     const float eaveY = sy0 + 2.85f;
     const float metalT = 0.06f;
     const float panelW = 0.42f;
-    addBox("Support:MetalFoundation", matFoundation, sx0, sx1, sy0, slabTop, sz0, sz1);
+    addBox("Support:MetalFoundation", matFoundation, sx0, sx1,
+        sy0 - foundationEmbed, slabTop, sz0, sz1);
     auto addMetalPanel = [&](float x0, float x1, float y0, float y1, float z0, float z1) {
         const int id = pieceId++;
         addVoronoiBoard(("MetalWall@" + std::to_string(id)).c_str(), matMetalWall,
@@ -3525,11 +3600,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
         }
         else if (wParam == 'C')    { cameraLocked = true; ReleaseCapture(); ShowCursor(TRUE); }
-        else if (wParam == 'F' && !(lParam & 0x40000000)) { GrabOrThrowObject(); }
+        else if (!g_emptyLevelMode && wParam == 'F' &&
+                 !(lParam & 0x40000000)) { GrabOrThrowObject(); }
         else if (wParam == 'V' && !(lParam & 0x40000000)) {
             scene.camera.FPSMode = !scene.camera.FPSMode;
         }
-        else if (wParam == 'E' && !(lParam & 0x40000000)) {
+        else if (!g_emptyLevelMode && wParam == 'E' &&
+                 !(lParam & 0x40000000)) {
             ToggleHumveeDriving();
         }
         // Bit 30 = key was already down (autorepeat); toggle once per press.
@@ -3696,6 +3773,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cerr << "FXAA init failed (non-fatal)\n";
         scene.enableFXAA = false;
     }
+    if (!volumetricFog.Init()) {
+        std::cerr << "Volumetric fog init failed (non-fatal)\n";
+        scene.enableVolumetricFog = false;
+    }
     const bool msaaPipelinesReady =
         mainShader.msaaSupported &&
         (!g_useMeshShader || g_meshShader.msaaSupported) &&
@@ -3755,7 +3836,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         {
         ProfilerDX12::CpuScope updateProfile(g_profiler, "Update");
 
-        if (gameScreen == GameScreen::Level1 &&
+        if (gameScreen == GameScreen::Level1 && !levelLoadingActive &&
             (scene.playerGodMode || scene.playerHealth > 0.0f)) {
 
         if (pendingLevelRuntimeReset) {
@@ -3764,16 +3845,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             WaitForGPU();
             g_bandits.clear();
             g_heldBandit = nullptr;
-            g_water.ResetSurface();
-            g_ocean.ResetSurface();
-            if (g_trees.IsInitialized()) ResetPalmTrees();
-            if (g_environmentInitialized &&
+            if (!g_emptyLevelMode) g_water.ResetSurface();
+            if (!g_emptyLevelMode) g_ocean.ResetSurface();
+            if (!g_emptyLevelMode && g_trees.IsInitialized()) ResetPalmTrees();
+            if (!g_emptyLevelMode && g_environmentInitialized &&
                 g_environmentStressMode != g_stressTestMode)
                 RebuildScalableEnvironment();
             pendingLevelRuntimeReset = false;
-            for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
-                if (!SpawnBandit()) break;
-            pendingTurretGunnerRespawn = true;
+            if (!g_emptyLevelMode) {
+                for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
+                    if (!SpawnBandit()) break;
+                pendingTurretGunnerRespawn = true;
+            } else {
+                pendingTurretGunnerRespawn = false;
+            }
             // Do not charge restart/reset stalls to completion time.
             lastTime = gameTimer.GetElapsed();
         }
@@ -3805,9 +3890,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
 
         scene.Update(deltaTime, now);
-        UpdateHelicopter(deltaTime);
-        UpdateSecondaryHelicopter(deltaTime);
-        UpdateExplosiveBarrels(deltaTime);
+        if (!g_emptyLevelMode) {
+            UpdateHelicopter(deltaTime);
+            UpdateSecondaryHelicopter(deltaTime);
+            UpdateExplosiveBarrels(deltaTime);
+        }
         g_gunAudio.Update();
         g_hitAudio.Update();
         g_banditSpottedAudio1.Update();
@@ -3832,13 +3919,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_destruction.SetTerrainSampler([tp](float x, float z) {
                 return TerrainRendererDX12::HeightAt(tp, x, z);
             });
-            g_destruction.SetSplashCallback([](float x, float z, float s) {
-                g_water.Splash(x, z, s);
-            });
-            g_destruction.InitializeVehicle({ 0.0f, 3.45f, 0.0f });
+            if (!g_emptyLevelMode) {
+                g_destruction.SetSplashCallback([](float x, float z, float s) {
+                    g_water.Splash(x, z, s);
+                });
+                g_destruction.InitializeVehicle({ 0.0f, 3.45f, 0.0f });
+            }
         }
         // Dead Bandits stay attached to their ragdolls. No mid-level respawns.
-        if (g_banditLoaded) {
+        if (!g_emptyLevelMode && g_banditLoaded) {
             ProfilerDX12::CpuScope banditProfile(g_profiler, "Bandit Update");
             if (pendingTurretGunnerRespawn) {
                 const bool firstReady = SpawnHumveeTurretGunner(0);
@@ -3921,6 +4010,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             UpdateHelicopterRotorKills();
         }
+        if (!g_emptyLevelMode) {
         g_water.Update(deltaTime);
         g_ocean.Update(deltaTime);
         g_trees.SetWind(g_grass.WindStrength(), g_grass.WindSpeed());
@@ -3945,16 +4035,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             grassHelicopter,
             primaryHelicopterActive || secondaryHelicopterActive);
         g_grass.Update(deltaTime);
+        }
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
             {
                 ProfilerDX12::CpuScope profile(g_profiler, "Destruction Update");
                 g_destruction.Update(deltaTime);
             }
-            UpdateHumveeImpacts(deltaTime);
-            UpdateHumveeChaseCamera(deltaTime);
-            UpdateHumveeTurretAim(deltaTime);
-            if (g_banditLoaded) {
+            if (!g_emptyLevelMode) {
+                UpdateHumveeImpacts(deltaTime);
+                UpdateHumveeChaseCamera(deltaTime);
+                UpdateHumveeTurretAim(deltaTime);
+            }
+            if (!g_emptyLevelMode && g_banditLoaded) {
                 const std::vector<DestructionDebrisHazard> debris =
                     g_destruction.GetDangerousDebris(2.5f);
                 for (const DestructionDebrisHazard& piece : debris) {
@@ -4004,6 +4097,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         scene.SpawnExplosionFX(
                             { center.x, center.y + 0.6f, center.z },
                             scene.grenadeBlastRadius * 1.6f);
+                        if (!g_emptyLevelMode)
                         for (size_t i = 0; i < scene.explosiveBarrels.size(); ++i) {
                             const ExplosiveBarrel& barrel = scene.explosiveBarrels[i];
                             if (!barrel.active) continue;
@@ -4183,7 +4277,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     // comes from the actual fracture (DrainBreakPoints).
                     scene.SpawnSmokeBurst(hit, 0.3f, 0.1f);
                     projectile.active = false;
-                } else if (g_water.ShootFloaters(projectile.previousPosition,
+                } else if (!g_emptyLevelMode && g_water.ShootFloaters(projectile.previousPosition,
                                                  projectile.position, projectile.direction,
                                                  bulletRadius, scene.destructionBulletImpulse)) {
                     // Bullet knocked a crate floating in the pool.
@@ -4193,7 +4287,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     scene.SpawnBulletImpact(projectile.position, normal);
                     projectile.active = false;
                 } else if (XMFLOAT3 treeHit;
-                           g_trees.Shoot(projectile.previousPosition, projectile.position,
+                           !g_emptyLevelMode && g_trees.Shoot(projectile.previousPosition, projectile.position,
                                          projectile.direction, bulletRadius,
                                          scene.treeDamagePerShot, treeHit)) {
                     // Chewed a palm trunk; enough rounds and it snaps and topples.
@@ -4204,12 +4298,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     scene.SpawnSmokeBurst(treeHit, 0.25f, 0.1f);
                     projectile.active = false;
                 } else if (XMFLOAT3 waterHit;
-                           g_water.ShootSurface(projectile.previousPosition,
+                           !g_emptyLevelMode && g_water.ShootSurface(projectile.previousPosition,
                                                 projectile.position, waterHit)) {
                     projectile.position = waterHit;
                     projectile.active = false;
                 } else if (XMFLOAT3 oceanHit;
-                           g_ocean.ShootSurface(projectile.previousPosition,
+                           !g_emptyLevelMode && g_ocean.ShootSurface(projectile.previousPosition,
                                                 projectile.position, oceanHit, 0.28f)) {
                     projectile.position = oceanHit;
                     projectile.active = false;
@@ -4226,7 +4320,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 }
             }
         }
-        if (g_banditLoaded && !pendingTurretGunnerRespawn &&
+        if (!g_emptyLevelMode && g_banditLoaded && !pendingTurretGunnerRespawn &&
             LiveBanditCount() == 0 && g_helicopterDead &&
             (!g_stressTestMode || g_secondaryHelicopterDead))
             OpenWinScreen();
@@ -4260,37 +4354,85 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         mainShader.BeginFrame();
         g_meshShader.BeginFrame();
+        hzbCaptureActive = gameScreen == GameScreen::Level1 &&
+            !levelLoadingActive && !usingRaytracing && !usingVisibility &&
+            !msaaActive && g_useMeshShader;
+        if (!hzbCaptureActive) occlusionDepth.InvalidateCameraHistory();
+        mainShader.SetPreviousViewProjection(previousHZBViewProjection);
         g_meshShader.SetOcclusionDepth(
             occlusionDepth.GetGPUHandle(),
-            occlusionDepth.CanUseHistory(scene.camera.Position, scene.camera.Front) &&
-                !msaaActive && !msaaUsedLastFrame,
+            hzbCaptureActive &&
+                occlusionDepth.CanUseHistory(
+                    scene.camera.Position, scene.camera.Front) &&
+                !msaaUsedLastFrame,
             occlusionDepth.GetMipCount());
 
         if (gameScreen == GameScreen::Level1 && levelLoadingActive) {
         if (levelLoadStage == LevelLoadStage::WorldAssets) {
             LoadFloorMudMaterial();
-            std::cout << "Loading models/h2.glb...\n";
-            crateModel = GLBImporter::LoadGLB("models/h2.glb", g_dx12.device, g_dx12.commandList);
+            if (!g_emptyLevelMode) {
+                std::cout << "Loading models/h2.glb...\n";
+                crateModel = GLBImporter::LoadGLB(
+                    "models/h2.glb", g_dx12.device, g_dx12.commandList);
+            }
             AdvanceLevelLoading(LevelLoadStage::Destruction,
                 "Destruction geometry and Blast actors",
-                "procedural house chunks + roof", crateModel != nullptr);
+                "procedural house chunks + roof",
+                g_emptyLevelMode || crateModel != nullptr);
         } else if (levelLoadStage == LevelLoadStage::Destruction) {
-            // Modular destructible house built from structural pieces, with
-            // world-anchored foundation/sill chunks. Grid args unused (bonds
-            // come from AABB adjacency), so pass 1s.
-            auto houseTemplate = CreateDestructibleWallModel();
-            ApplyHouseTextures(houseTemplate, g_dx12.device.Get(), g_dx12.commandList.Get());
-            AppendRoofChunksToDestructionModel(houseTemplate);
-            normalWallModel = CloneSceneTree(houseTemplate);
-            stressWallModel = CloneSceneTree(houseTemplate);
-            ArrangeHousesInCross(normalWallModel, false);
-            ArrangeHousesInCross(stressWallModel, true);
-            wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
-            g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
-            AdvanceLevelLoading(LevelLoadStage::Environment,
-                "Water, ocean, trees and scalable environment",
-                g_stressTestMode ? "stress environment" : "level environment",
-                wallModel != nullptr);
+            if (!levelDestructionLoadInFlight) {
+                if (g_destruction.IsInitialized()) WaitForGPU();
+                // Build authored scene nodes on the render thread because their
+                // texture uploads record into this frame's direct command list.
+                auto houseTemplate = CreateDestructibleWallModel();
+                ApplyHouseTextures(houseTemplate, g_dx12.device.Get(),
+                    g_dx12.commandList.Get());
+                AppendRoofChunksToDestructionModel(houseTemplate);
+                normalWallModel = CloneSceneTree(houseTemplate);
+                stressWallModel = CloneSceneTree(houseTemplate);
+                ArrangeHousesInCross(normalWallModel, false);
+                ArrangeHousesInCross(stressWallModel, true);
+                wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
+
+                // Chunk meshlets, Blast actors, Box3D bodies, and merged actor
+                // geometry are CPU/device creation work. D3D12 device creation
+                // is thread-safe; static uploads enter the mutex-protected queue.
+                // Keeping it off the render thread makes resource telemetry and
+                // the loading screen update while thousands of chunks build.
+                const std::shared_ptr<SceneNode> destructionModel = wallModel;
+                ComPtr<ID3D12Device> destructionDevice = g_dx12.device;
+                levelLoadingLabel =
+                    "Build meshlet SRVs, Blast actors and depth-only batch";
+                levelLoadingAsset = g_stressTestMode
+                    ? "DestructionDX12: stressWallModel"
+                    : "DestructionDX12: normalWallModel";
+                levelDestructionLoadFuture = std::async(std::launch::async,
+                    [destructionModel, destructionDevice]() {
+                        return g_destruction.Initialize(destructionModel,
+                            destructionDevice.Get(), 1, 1, 1);
+                    });
+                levelDestructionLoadInFlight = true;
+            } else if (levelDestructionLoadFuture.wait_for(
+                    std::chrono::seconds(0)) == std::future_status::ready) {
+                const bool initialized = levelDestructionLoadFuture.get();
+                levelDestructionLoadInFlight = false;
+                if (g_emptyLevelMode && initialized) {
+                    auto tp = CurrentTerrainParams();
+                    tp.heightScale = scene.terrainHeightScale;
+                    g_destruction.SetTerrainSampler([tp](float x, float z) {
+                        return TerrainRendererDX12::HeightAt(tp, x, z);
+                    });
+                }
+                AdvanceLevelLoading(
+                    g_emptyLevelMode ? LevelLoadStage::Weapons
+                                     : LevelLoadStage::Environment,
+                    g_emptyLevelMode ? "Player weapon"
+                                     : "Water, ocean, trees and scalable environment",
+                    g_emptyLevelMode ? "AK47"
+                        : (g_stressTestMode ? "stress environment"
+                                            : "level environment"),
+                    initialized);
+            }
         } else if (levelLoadStage == LevelLoadStage::Environment) {
             // Pool of water beside the house (on the clear -X side) with a
             // handful of wooden crates dropped in to bob on the surface.
@@ -4365,22 +4507,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // same command list the flush below submits.
             GunModel::Load();
 
-            // Authored explosive barrel. Source mesh is 2.08 m high; 0.72 keeps
-            // its in-game size aligned with existing 1.5 m gameplay collision.
-            g_explosiveBarrelModel = FBXImporter::Load(
-                "models/Barrel Explosive/barrel.FBX",
-                g_dx12.device, g_dx12.commandList, 0.72f, false, true);
-            if (g_explosiveBarrelModel) {
-                g_explosiveBarrelShadowModel = GLBImporter::MergeSceneForDepth(
-                    g_explosiveBarrelModel, g_dx12.device);
-                std::cout << "Explosive barrel FBX ready\n";
-            } else
-                std::cerr << "Explosive barrel FBX failed; using procedural fallback\n";
+            if (g_emptyLevelMode) {
+                AdvanceLevelLoading(LevelLoadStage::GPUFinalize,
+                    "Drain graphics uploads and generate texture mips",
+                    "direct queue + compute queue", GunModel::Loaded());
+            } else {
+                // Authored explosive barrel. Source mesh is 2.08 m high; 0.72 keeps
+                // its in-game size aligned with existing 1.5 m gameplay collision.
+                g_explosiveBarrelModel = FBXImporter::Load(
+                    "models/Barrel Explosive/barrel.FBX",
+                    g_dx12.device, g_dx12.commandList, 0.72f, false, true);
+                if (g_explosiveBarrelModel) {
+                    g_explosiveBarrelShadowModel = GLBImporter::MergeSceneForDepth(
+                        g_explosiveBarrelModel, g_dx12.device);
+                    std::cout << "Explosive barrel FBX ready\n";
+                } else
+                    std::cerr << "Explosive barrel FBX failed; using procedural fallback\n";
 
-            AdvanceLevelLoading(LevelLoadStage::Humvee,
-                "Humvee model, bounds and shadow mesh",
-                "models/Humvee/humvee.fbx",
-                g_explosiveBarrelModel != nullptr);
+                AdvanceLevelLoading(LevelLoadStage::Humvee,
+                    "Humvee model, bounds and shadow mesh",
+                    "models/Humvee/humvee.fbx",
+                    g_explosiveBarrelModel != nullptr);
+            }
         } else if (levelLoadStage == LevelLoadStage::Humvee) {
             g_humveeModel = FBXImporter::Load(
                 "models/Humvee/humvee.fbx",
@@ -4499,7 +4647,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             DumpDX12DebugMessages();
             // First Level 1 load is complete. Start timing after load/GPU waits,
             // not from menu click.
-            crateLoadAttempted = true;
+            if (g_emptyLevelMode) {
+                emptyLevelAssetsLoaded = true;
+            } else {
+                fullLevelAssetsLoaded = true;
+                emptyLevelAssetsLoaded = true;
+            }
             CompleteLevelLoading(g_dx12.device &&
                 g_dx12.device->GetDeviceRemovedReason() == S_OK);
             levelTimerRunning = true;
@@ -4519,6 +4672,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             levelLoadingSubmittedUploads += submittedUploads;
         }
 
+        XMMATRIX fogLightSpace = XMMatrixIdentity();
+        ID3D12Resource* fogShadowResource = nullptr;
+        bool renderedForward = false;
         if (gameScreen == GameScreen::Level1 && !levelLoadingActive &&
             usingRaytracing) {
             ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());
@@ -4533,12 +4689,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
                 ProfilerDX12::Scope profile(g_profiler, "Shadow", g_dx12.commandList.Get());
                 lightSpace = shadowMap.Render(
-                    scene, geo, g_showH2Model
+                    scene, geo, (!g_emptyLevelMode && g_showH2Model)
                         ? (crateShadowModel ? crateShadowModel : crateModel)
                         : nullptr,
-                    g_banditLoaded ? &g_bandits : nullptr);
+                    (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr);
                 shadowResource = shadowMap.GetResource();
             }
+            fogLightSpace = lightSpace;
+            fogShadowResource = shadowResource;
+            renderedForward = true;
             if (msaaActive) msaa.Bind();
             {
                 ProfilerDX12::Scope profile(g_profiler, "Forward", g_dx12.commandList.Get());
@@ -4546,7 +4705,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             // Forward establishes this frame's global shader resources first.
             // Drawing Bandits before that setup caused stale-state flashing.
-            if (g_banditLoaded) {
+            if (!g_emptyLevelMode && g_banditLoaded) {
                 ProfilerDX12::Scope profile(
                     g_profiler, "Bandits", g_dx12.commandList.Get());
                 for (auto& bandit : g_bandits) {
@@ -4576,9 +4735,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             msaa.ResolveToBackBuffer();
         }
 
+        if (renderedForward && scene.enableVolumetricFog && volumetricFog.initialized) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "Volumetric Fog", g_dx12.commandList.Get());
+            volumetricFog.Render(scene, fogLightSpace, fogShadowResource,
+                msaaActive ? msaa.GetDepthResource() : g_dx12.depthStencilBuffer.Get(),
+                msaaActive);
+        }
+
         // Preserve this frame's depth for next-frame amplification-shader
         // occlusion tests before UI rendering changes descriptor heaps.
-        {
+        if (hzbCaptureActive) {
             ProfilerDX12::Scope profile(g_profiler, "Occlusion Depth", g_dx12.commandList.Get());
             occlusionDepth.PrepareCapture(g_dx12.commandList.Get());
         }
@@ -4649,6 +4816,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             break;
         }
         occlusionDepth.SubmitCopy();
+        if (hzbCaptureActive)
+            previousHZBViewProjection =
+                scene.GetViewMatrix() * scene.GetProjectionMatrix();
         msaaUsedLastFrame = msaaActive;
         g_profiler.EndCpuFrame();
     }

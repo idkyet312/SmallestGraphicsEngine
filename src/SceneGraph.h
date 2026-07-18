@@ -34,6 +34,9 @@ struct SceneMaterial {
     float metallicFactor = 1.0f;
     float roughnessFactor = 1.0f;
     bool doubleSided = false;
+    // Closed fracture prisms and layered shells can self-occlude against the
+    // previous-frame HZB. Keep frustum culling, but skip HZB for those materials.
+    bool disableOcclusionCulling = false;
     // Alpha-tested cutout (foliage cards): the pixel shader clips texels whose
     // texture alpha is below threshold. Opt-in because clip() costs early-Z.
     bool alphaCutout = false;
@@ -88,6 +91,11 @@ struct MeshPrimitive {
     UINT indexCount = 0;
     UINT meshletCount = 0;
     UINT skinVertexCount = 0; // >0 when this primitive carries skin data
+    // CPU-side local bounds retained for conservative culling when this
+    // primitive must use the conventional IA raster fallback.
+    DirectX::XMFLOAT3 boundsMin = {};
+    DirectX::XMFLOAT3 boundsMax = {};
+    bool boundsValid = false;
 };
 
 struct SceneMesh {

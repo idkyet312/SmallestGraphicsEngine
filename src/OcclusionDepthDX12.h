@@ -76,6 +76,8 @@ public:
 
     UINT GetMipCount() const { return mipCount; }
 
+    void InvalidateCameraHistory() { cameraHistoryValid = false; }
+
     bool CanUseHistory(const XMFLOAT3& position, const XMFLOAT3& forward) {
         bool continuous = cameraHistoryValid;
         if (continuous) {

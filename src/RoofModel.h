@@ -68,6 +68,9 @@ inline void EnsureRoofModelLoaded() {
         material.metallicFactor = 1.0f;
         material.roughnessFactor = 1.0f;
         material.roughnessOnlyTexture = false;
+        // Thin overlapping roof sheets need conservative culling.
+        material.doubleSided = true;
+        material.disableOcclusionCulling = true;
     }
 
     auto root = std::make_shared<SceneNode>("SplitRoofFBX");

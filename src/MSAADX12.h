@@ -108,6 +108,8 @@ public:
         g_dx12.commandList->ResourceBarrier(2, barriers);
     }
 
+    ID3D12Resource* GetDepthResource() const { return depthTarget_.Get(); }
+
 private:
     bool CreateTargets(UINT width, UINT height) {
         D3D12_HEAP_PROPERTIES heap = {};

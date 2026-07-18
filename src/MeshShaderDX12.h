@@ -33,8 +33,10 @@ struct alignas(8) MeshPSOSubobjectDX12 {
 class MeshShaderDX12 {
 public:
     ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12PipelineState> psoDoubleSided;
     ComPtr<ID3D12PipelineState> psoWireframe;
     ComPtr<ID3D12PipelineState> psoMSAA;
+    ComPtr<ID3D12PipelineState> psoDoubleSidedMSAA;
     ComPtr<ID3D12PipelineState> psoWireframeMSAA;
     ComPtr<ID3D12GraphicsCommandList6> commandList6;
     bool supported = false;
@@ -129,7 +131,9 @@ public:
         stream.ms.value = { ms->GetBufferPointer(), ms->GetBufferSize() };
         stream.ps.value = { ps->GetBufferPointer(), ps->GetBufferSize() };
         stream.raster.value.FillMode = D3D12_FILL_MODE_SOLID;
-        stream.raster.value.CullMode = D3D12_CULL_MODE_NONE;
+        stream.raster.value.CullMode = D3D12_CULL_MODE_BACK;
+        // Engine geometry and imported glTF/FBX assets use CCW outward winding.
+        stream.raster.value.FrontCounterClockwise = TRUE;
         stream.raster.value.DepthClipEnable = TRUE;
         stream.blend.value.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         stream.depth.value.DepthEnable = TRUE;
@@ -156,6 +160,26 @@ public:
             device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&psoMSAA)));
         stream.sample.value.Count = 1;
         stream.raster.value.MultisampleEnable = FALSE;
+
+        // Thin sheets, foliage, glass, and explicitly double-sided imported
+        // materials keep the compatibility path.
+        stream.raster.value.CullMode = D3D12_CULL_MODE_NONE;
+        if (FAILED(device2->CreatePipelineState(
+                &streamDesc, IID_PPV_ARGS(&psoDoubleSided)))) {
+            std::cerr << "Mesh double-sided PSO creation failed\n";
+            return false;
+        }
+        if (msaaSupported) {
+            stream.sample.value.Count = MSAADX12::SampleCount;
+            stream.raster.value.MultisampleEnable = TRUE;
+            if (FAILED(device2->CreatePipelineState(
+                    &streamDesc, IID_PPV_ARGS(&psoDoubleSidedMSAA)))) {
+                msaaSupported = false;
+                psoDoubleSidedMSAA.Reset();
+            }
+            stream.sample.value.Count = 1;
+            stream.raster.value.MultisampleEnable = FALSE;
+        }
 
         stream.raster.value.FillMode = D3D12_FILL_MODE_WIREFRAME;
         ComPtr<ID3DBlob> wirePs;
@@ -196,11 +220,14 @@ public:
               D3D12_GPU_VIRTUAL_ADDRESS meshletVertexIndexAddress,
               D3D12_GPU_VIRTUAL_ADDRESS meshletTriangleAddress,
               D3D12_GPU_VIRTUAL_ADDRESS bonePaletteAddress = 0,
-              D3D12_GPU_VIRTUAL_ADDRESS skinDataAddress = 0) {
+              D3D12_GPU_VIRTUAL_ADDRESS skinDataAddress = 0,
+              bool doubleSided = false,
+              bool allowOcclusion = true) {
         if (!CanDraw(totalMeshlets, meshletDescAddress, meshletBoundsAddress,
                      meshletVertexIndexAddress, meshletTriangleAddress)) return;
-        ID3D12PipelineState* solid =
-            msaaEnabled ? psoMSAA.Get() : pso.Get();
+        ID3D12PipelineState* solid = doubleSided
+            ? (msaaEnabled ? psoDoubleSidedMSAA.Get() : psoDoubleSided.Get())
+            : (msaaEnabled ? psoMSAA.Get() : pso.Get());
         ID3D12PipelineState* wire =
             msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get();
         commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
@@ -231,7 +258,7 @@ public:
             MeshDrawBufferDX12 data = {
                 vertexCount, indexCount, indexCount ? 1u : 0u,
                 firstMeshlet, totalMeshlets,
-                occlusionEnabled ? 1u : 0u,
+                (occlusionEnabled && allowOcclusion) ? 1u : 0u,
                 g_dx12.screenWidth, g_dx12.screenHeight,
                 skinning, occlusionMipCount, g_currentModelMaxScale,
                 1u, 0u
@@ -253,7 +280,9 @@ public:
                        D3D12_GPU_VIRTUAL_ADDRESS meshletBoundsAddress,
                        D3D12_GPU_VIRTUAL_ADDRESS meshletVertexIndexAddress,
                        D3D12_GPU_VIRTUAL_ADDRESS meshletTriangleAddress,
-                       const std::vector<DirectX::XMMATRIX>& models) {
+                       const std::vector<DirectX::XMMATRIX>& models,
+                       bool doubleSided = false,
+                       bool allowOcclusion = true) {
         if (models.size() < 2 || !CanDraw(totalMeshlets, meshletDescAddress,
                 meshletBoundsAddress, meshletVertexIndexAddress,
                 meshletTriangleAddress)) return false;
@@ -272,7 +301,9 @@ public:
             ++currentInstance;
         }
 
-        ID3D12PipelineState* solid = msaaEnabled ? psoMSAA.Get() : pso.Get();
+        ID3D12PipelineState* solid = doubleSided
+            ? (msaaEnabled ? psoDoubleSidedMSAA.Get() : psoDoubleSided.Get())
+            : (msaaEnabled ? psoMSAA.Get() : pso.Get());
         ID3D12PipelineState* wire = msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get();
         commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
         commandList6->SetGraphicsRootShaderResourceView(9, vbv.BufferLocation);
@@ -296,7 +327,7 @@ public:
             MeshDrawBufferDX12 data = {
                 vertexCount, indexCount, indexCount ? 1u : 0u,
                 firstWorkItem, totalMeshlets,
-                occlusionEnabled ? 1u : 0u,
+                (occlusionEnabled && allowOcclusion) ? 1u : 0u,
                 g_dx12.screenWidth, g_dx12.screenHeight,
                 0u, occlusionMipCount, 1.0f,
                 instanceCount, 1u

@@ -17,6 +17,7 @@ struct alignas(256) MatrixBufferDX12 {
     XMMATRIX lightSpaceMatrix;
     XMMATRIX modelView;
     XMMATRIX modelViewProjection;
+    XMMATRIX previousViewProjection;
 };
 
 inline float g_currentModelMaxScale = 1.0f;
@@ -231,6 +232,7 @@ public:
     
     // Per-draw-call constant buffers (need enough for all objects)
     UploadBuffer<MatrixBufferDX12> matrixBuffer;
+    XMMATRIX previousViewProjection = XMMatrixIdentity();
     UploadBuffer<ObjectBufferDX12> objectBuffer;
     
     // Per-frame constant buffers (shared across all draw calls in a frame)
@@ -859,6 +861,7 @@ public:
         const XMMATRIX modelView = model * view;
         data.modelView = XMMatrixTranspose(modelView);
         data.modelViewProjection = XMMatrixTranspose(modelView * proj);
+        data.previousViewProjection = XMMatrixTranspose(previousViewProjection);
         g_currentModelMaxScale = (std::max)({
             XMVectorGetX(XMVector3Length(model.r[0])),
             XMVectorGetX(XMVector3Length(model.r[1])),
@@ -867,6 +870,10 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(0, matrixBuffer.GetGPUAddress(bufferIndex));
         // Per-frame CBVs (b1/b2/b4/b5/b7) are bound once in Use() -- the only
         // point where the root signature (and thus every binding) is reset.
+    }
+
+    void SetPreviousViewProjection(const XMMATRIX& matrix) {
+        previousViewProjection = matrix;
     }
     
     void SetLight(const XMFLOAT3& pos, int type, const XMFLOAT3& color,

@@ -455,7 +455,8 @@ public:
                     DrawSceneNodeShadow(batch.shadowNode, depthShader,
                         XMLoadFloat4x4(&batch.transform), lightSpace);
                 }
-            } else for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
+            }
+            for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
                     if (!inLightBox(item.sphereCenter, item.sphereRadius)) continue;
                     DrawSceneNodeShadow(item.node, depthShader,
                         XMLoadFloat4x4(&item.transform), lightSpace);
@@ -468,14 +469,14 @@ public:
             }
         }
 
-        if (scene.cube2.visible) {
+        if (!g_emptyLevelMode && scene.cube2.visible) {
             XMMATRIX model = scene.cube2.GetModelMatrix();
             depthShader.SetMatrices(model, lightSpace);
             DrawCube(geo);
             depthShader.NextDrawCall();
         }
 
-        if (g_humveeModel) {
+        if (!g_emptyLevelMode && g_humveeModel) {
             std::vector<XMMATRIX> humveeTransforms = { HumveeWorldMatrix() };
             if (g_stressTestMode)
                 humveeTransforms.push_back(SecondaryHumveeWorldMatrix());
@@ -486,7 +487,7 @@ public:
 
         // Sparse instanced blade silhouettes give grass a readable basic shadow
         // without repeating the full-density 400k-blade forward pass.
-        if (g_grass.IsInitialized() && g_grass.CastShadows() &&
+        if (!g_emptyLevelMode && g_grass.IsInitialized() && g_grass.CastShadows() &&
             g_grass.ShadowDensity() > 0.0f && depthShader.grassPipelineState) {
             g_grass.SetViewer(scene.camera.Position);
             static std::vector<GrassField::DrawRange> grassShadowRanges;
@@ -518,7 +519,7 @@ public:
             }
         }
 
-        if (g_explosiveBarrelModel) {
+        if (!g_emptyLevelMode && g_explosiveBarrelModel) {
             std::vector<XMMATRIX> barrelTransforms;
             barrelTransforms.reserve(scene.explosiveBarrels.size());
             for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
@@ -531,7 +532,7 @@ public:
                 g_explosiveBarrelShadowModel
                     ? g_explosiveBarrelShadowModel : g_explosiveBarrelModel,
                 depthShader, barrelTransforms, lightSpace);
-        } else for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+        } else if (!g_emptyLevelMode) for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
             if (barrel.active) {
                 const XMMATRIX model = XMMatrixScaling(1.6f, 1.5f, 1.6f) *
                     XMMatrixTranslation(barrel.position.x, barrel.position.y,

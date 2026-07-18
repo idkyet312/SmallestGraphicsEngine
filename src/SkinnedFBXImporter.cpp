@@ -351,7 +351,8 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
         // Upload one parallel skin stream per merged material primitive.
         const UINT skinBytes = static_cast<UINT>(p.skin.size() * sizeof(SkinVertex));
         if (CreateStaticBufferDX12(device.Get(), p.skin.data(), skinBytes,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, p.skinBuffer))
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, p.skinBuffer,
+                "SkinWeights"))
             p.skinVertexCount = static_cast<UINT>(p.skin.size());
         root->mesh->primitives.push_back(std::move(p));
     }

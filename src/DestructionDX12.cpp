@@ -14,12 +14,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
+#include <chrono>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <list>
+#include <thread>
 #include <unordered_map>
 
 using namespace DirectX;
@@ -27,6 +31,8 @@ using namespace Nv::Blast;
 
 namespace {
 constexpr uint32_t InvalidIndex = 0xFFFFFFFFu;
+constexpr float DebrisLifetimeSeconds = 20.0f;
+constexpr float DebrisShrinkSeconds = 3.0f;
 // Uniform starting health for every bond/chunk. A bullet's per-hit damage is a
 // fraction of this, so a joint takes several hits before it lets go.
 constexpr float kBondHealth = 1.0f;
@@ -231,6 +237,14 @@ struct DestructionDX12::Impl {
         XMFLOAT3 center = {};
         bool dynamic = false;
         bool wasSubmerged = false;   // for splash-on-entry detection
+        float debrisAge = 0.0f;
+        // Only unsupported, fully detached debris receives cleanup lifetime.
+        bool debrisCleanupEligible = false;
+        uint64_t renderId = 0;
+        uint64_t failedBatchHash = 0;
+        XMFLOAT3 batchCenter = {};
+        float batchRadius = 0.0f;
+        bool batchBoundsValid = false;
     };
 
     struct BodySeed {
@@ -258,13 +272,19 @@ struct DestructionDX12::Impl {
         std::shared_ptr<SceneNode> colourNode;
         std::shared_ptr<SceneNode> shadowNode;
     };
+    struct BatchBuildResult {
+        uint64_t actorId = 0;
+        uint64_t chunkHash = 0;
+        std::shared_ptr<SceneNode> colourNode;
+        std::shared_ptr<SceneNode> shadowNode;
+    };
     std::unordered_map<const ActorRuntime*, BatchCacheEntry> batchCache;
     std::array<std::vector<std::shared_ptr<SceneNode>>, FRAME_COUNT> retiredBatchNodes;
     std::array<UINT64, FRAME_COUNT> retiredBatchEpoch = {};
-    // Runtime mesh merging is expensive enough to stall the simulation during a
-    // Blast split. Keep the intact structure batched, then reuse authored chunk
-    // meshes after topology changes instead of rebuilding meshlets in Update().
-    bool renderBatchingEnabled = true;
+    std::future<BatchBuildResult> batchBuildFuture;
+    bool batchBuildInFlight = false;
+    bool initialBatchBuild = true;
+    uint64_t nextActorRenderId = 1;
     uint64_t renderItemRebuildCount = 0;
     uint64_t batchGeometryRebuildCount = 0;
     // True once the render items have been rebuilt at a moment when nothing was
@@ -627,6 +647,37 @@ struct DestructionDX12::Impl {
     bool BuildChunks() {
         if (!source || !device) return false;
 
+        auto buildChunkResources = [&]() {
+            if (chunks.empty()) return false;
+            std::atomic<size_t> nextChunk{0};
+            std::atomic<bool> succeeded{true};
+            const unsigned hardwareThreads = (std::max)(1u,
+                std::thread::hardware_concurrency());
+            const unsigned workerCount = (std::min)(
+                (std::max)(1u, hardwareThreads > 2 ? hardwareThreads - 1 : hardwareThreads),
+                (std::min)(16u, static_cast<unsigned>(chunks.size())));
+            auto worker = [&]() {
+                while (succeeded.load(std::memory_order_relaxed)) {
+                    const size_t index = nextChunk.fetch_add(1,
+                        std::memory_order_relaxed);
+                    if (index >= chunks.size()) break;
+                    for (MeshPrimitive& primitive : chunks[index].node->mesh->primitives) {
+                        if (!GLBImporter::BuildMeshletData(primitive, device)) {
+                            succeeded.store(false, std::memory_order_relaxed);
+                            break;
+                        }
+                    }
+                }
+            };
+            std::vector<std::thread> workers;
+            workers.reserve(workerCount > 0 ? workerCount - 1 : 0);
+            for (unsigned i = 1; i < workerCount; ++i)
+                workers.emplace_back(worker);
+            worker();
+            for (std::thread& thread : workers) thread.join();
+            return succeeded.load(std::memory_order_relaxed);
+        };
+
         // Procedural Voronoi wall supplies one closed convex-prism child per
         // fracture chunk. Preserve those exact touching cells instead of
         // repartitioning their triangles through the regular grid.
@@ -676,7 +727,6 @@ struct DestructionDX12::Impl {
                         chunk.collisionPoints.push_back({ primitive.vertices[v],
                             primitive.vertices[v + 1], primitive.vertices[v + 2] });
                     }
-                    if (!GLBImporter::BuildMeshletData(primitive, device)) return false;
                     chunk.node->mesh->primitives.push_back(std::move(primitive));
                 }
                 if (chunk.minimum.x == FLT_MAX) continue;
@@ -709,7 +759,7 @@ struct DestructionDX12::Impl {
                 chunks.push_back(std::move(chunk));
                 ++chunkIndex;
             }
-            return !chunks.empty();
+            return buildChunkResources();
         }
 
         if (!source->mesh) return false;
@@ -794,12 +844,11 @@ struct DestructionDX12::Impl {
             chunk.node->mesh = std::make_shared<SceneMesh>();
             for (MeshPrimitive& primitive : build.primitives) {
                 if (primitive.indices.empty()) continue;
-                if (!GLBImporter::BuildMeshletData(primitive, device)) return false;
                 chunk.node->mesh->primitives.push_back(std::move(primitive));
             }
             chunks.push_back(std::move(chunk));
         }
-        return !chunks.empty();
+        return buildChunkResources();
     }
 
     bool BuildBlast() {
@@ -841,6 +890,12 @@ struct DestructionDX12::Impl {
         // hit tears loose only the pieces around it.
         constexpr float touchSlop = 0.3f;       // faces may sit a small gap apart and still bond
         constexpr float minContactArea = 0.04f;  // require a substantial shared face
+        // Corrugated wall cells meet their foundation along a deliberately thin
+        // 6 cm edge. That contact is structurally valid but smaller than the
+        // generic threshold. Without this exception, every metal house is a
+        // disconnected unsupported island; splitting any house starts all metal
+        // houses' debris timers at once.
+        constexpr float minSupportContactArea = 0.004f;
         constexpr uint32_t maxNeighbours = 10;   // each chunk keeps up to its 10 closest bonds
 
         // First gather every candidate face contact, then keep only the closest
@@ -887,7 +942,9 @@ struct DestructionDX12::Impl {
             else if (seam == 1) { ny = cb.center.y >= ca.center.y ? 1.0f : -1.0f; area = clampX * clampZ; }
             else { nz = cb.center.z >= ca.center.z ? 1.0f : -1.0f; area = clampX * clampY; }
             // Reject tiny grazing contacts -- a bond needs a real shared face.
-            if (area < minContactArea) continue;
+            const bool touchesSupport = ca.support || cb.support;
+            if (area < minContactArea &&
+                (!touchesSupport || area < minSupportContactArea)) continue;
             const float cdx = cb.center.x - ca.center.x, cdy = cb.center.y - ca.center.y,
                         cdz = cb.center.z - ca.center.z;
             candidates.push_back({ a, b, nx, ny, nz, area, cdx * cdx + cdy * cdy + cdz * cdz });
@@ -950,6 +1007,7 @@ struct DestructionDX12::Impl {
         group->addActor(*actor);
         auto runtime = std::make_unique<ActorRuntime>();
         runtime->actor = actor;
+        runtime->renderId = nextActorRenderId++;
         runtime->chunks.resize(chunks.size());
         for (uint32_t i = 0; i < chunks.size(); ++i) runtime->chunks[i] = i;
         actor->userData = runtime.get();
@@ -1195,6 +1253,98 @@ struct DestructionDX12::Impl {
         // grenade's explosion shove). Pieces otherwise just fall.
     }
 
+    static uint64_t HashChunks(const std::vector<uint32_t>& actorChunks) {
+        uint64_t hash = 1469598103934665603ull;
+        for (uint32_t chunk : actorChunks) {
+            hash ^= chunk;
+            hash *= 1099511628211ull;
+        }
+        return hash;
+    }
+
+    static BatchBuildResult BuildActorBatch(
+        ID3D12Device* batchDevice, uint64_t actorId, uint64_t chunkHash,
+        std::vector<std::shared_ptr<SceneNode>> nodes,
+        bool background = false) {
+        if (background)
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        BatchBuildResult result;
+        result.actorId = actorId;
+        result.chunkHash = chunkHash;
+        auto root = std::make_shared<SceneNode>("DestructionActorBatch");
+        root->children = std::move(nodes);
+        root->UpdateGlobalTransform(root->localTransform);
+        ComPtr<ID3D12Device> deviceRef = batchDevice;
+        auto shadowFuture = std::async(std::launch::async,
+            [root, deviceRef, background]() {
+                if (background)
+                    SetThreadPriority(GetCurrentThread(),
+                        THREAD_PRIORITY_BELOW_NORMAL);
+                return GLBImporter::MergeSceneForDepth(root, deviceRef);
+            });
+        result.colourNode = GLBImporter::MergeSceneByMaterial(root, deviceRef);
+        result.shadowNode = shadowFuture.get();
+        return result;
+    }
+
+    void EnsureActorBatchBounds(ActorRuntime& runtime) {
+        if (runtime.batchBoundsValid) return;
+        XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
+        XMFLOAT3 maximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        for (uint32_t index : runtime.chunks) {
+            const Chunk& chunk = chunks[index];
+            minimum.x = (std::min)(minimum.x, chunk.minimum.x);
+            minimum.y = (std::min)(minimum.y, chunk.minimum.y);
+            minimum.z = (std::min)(minimum.z, chunk.minimum.z);
+            maximum.x = (std::max)(maximum.x, chunk.maximum.x);
+            maximum.y = (std::max)(maximum.y, chunk.maximum.y);
+            maximum.z = (std::max)(maximum.z, chunk.maximum.z);
+        }
+        runtime.batchCenter = {
+            (minimum.x + maximum.x) * 0.5f,
+            (minimum.y + maximum.y) * 0.5f,
+            (minimum.z + maximum.z) * 0.5f };
+        runtime.batchRadius = 0.55f * XMVectorGetX(XMVector3Length(
+            XMLoadFloat3(&maximum) - XMLoadFloat3(&minimum)));
+        runtime.batchBoundsValid = true;
+    }
+
+    bool PollBatchBuild() {
+        if (!batchBuildInFlight ||
+            batchBuildFuture.wait_for(std::chrono::seconds(0)) !=
+                std::future_status::ready) return false;
+        BatchBuildResult result = batchBuildFuture.get();
+        batchBuildInFlight = false;
+        auto actorIt = std::find_if(actors.begin(), actors.end(),
+            [&](const std::unique_ptr<ActorRuntime>& runtime) {
+                return runtime->renderId == result.actorId;
+            });
+        if (actorIt == actors.end()) return true;
+        ActorRuntime* runtime = actorIt->get();
+        if (HashChunks(runtime->chunks) != result.chunkHash) return true;
+        if (!result.colourNode || !result.shadowNode) {
+            runtime->failedBatchHash = result.chunkHash;
+            return true;
+        }
+
+        const UINT retireSlot = g_dx12.frameIndex % FRAME_COUNT;
+        const UINT64 retireEpoch = g_dx12.fenceValues[retireSlot];
+        if (retiredBatchEpoch[retireSlot] != retireEpoch) {
+            retiredBatchNodes[retireSlot].clear();
+            retiredBatchEpoch[retireSlot] = retireEpoch;
+        }
+        BatchCacheEntry& cache = batchCache[runtime];
+        if (cache.colourNode)
+            retiredBatchNodes[retireSlot].push_back(std::move(cache.colourNode));
+        if (cache.shadowNode)
+            retiredBatchNodes[retireSlot].push_back(std::move(cache.shadowNode));
+        cache = { result.chunkHash, std::move(result.colourNode),
+                  std::move(result.shadowNode) };
+        runtime->failedBatchHash = 0;
+        ++batchGeometryRebuildCount;
+        return true;
+    }
+
     // Is there anything whose transform could have changed since the last rebuild?
     //
     // An intact house is entirely STATIC -- every chunk is anchored, nothing moves --
@@ -1225,7 +1375,6 @@ struct DestructionDX12::Impl {
         renderItems.clear();
         renderBatches.clear();
         std::unordered_map<const ActorRuntime*, bool> liveActors;
-        bool batchBuildFailed = false;
         const UINT retireSlot = g_dx12.frameIndex % FRAME_COUNT;
         const UINT64 retireEpoch = g_dx12.fenceValues[retireSlot];
         if (retiredBatchEpoch[retireSlot] != retireEpoch) {
@@ -1238,27 +1387,60 @@ struct DestructionDX12::Impl {
             if (entry.shadowNode)
                 retiredBatchNodes[retireSlot].push_back(std::move(entry.shadowNode));
         };
-        if (!renderBatchingEnabled && !batchCache.empty()) {
-            for (auto& [actor, entry] : batchCache) retireBatch(entry);
-            batchCache.clear();
-        }
         for (const auto& runtime : actors) {
             liveActors[runtime.get()] = true;
             XMMATRIX transform = XMMatrixIdentity();
             if (!B3_IS_NULL(runtime->body)) transform = BoxTransform(runtime->body, runtime->center);
+            float debrisScale = 1.0f;
+            if (runtime->dynamic) {
+                const float shrinkStart =
+                    DebrisLifetimeSeconds - DebrisShrinkSeconds;
+                debrisScale = 1.0f - (std::max)(0.0f,
+                    runtime->debrisAge - shrinkStart) / DebrisShrinkSeconds;
+                debrisScale = (std::clamp)(debrisScale, 0.0f, 1.0f);
+                if (debrisScale < 1.0f) {
+                    transform = XMMatrixTranslation(-runtime->center.x,
+                        -runtime->center.y, -runtime->center.z) *
+                        XMMatrixScaling(debrisScale, debrisScale, debrisScale) *
+                        XMMatrixTranslation(runtime->center.x, runtime->center.y,
+                            runtime->center.z) * transform;
+                }
+            }
             XMFLOAT4X4 stored; XMStoreFloat4x4(&stored, transform);
+            const uint64_t hash = HashChunks(runtime->chunks);
+            auto cacheIt = batchCache.find(runtime.get());
+            if (cacheIt != batchCache.end() &&
+                (cacheIt->second.chunkHash != hash ||
+                 !cacheIt->second.colourNode || !cacheIt->second.shadowNode)) {
+                retireBatch(cacheIt->second);
+                batchCache.erase(cacheIt);
+                cacheIt = batchCache.end();
+            }
+            if (cacheIt != batchCache.end()) {
+                EnsureActorBatchBounds(*runtime);
+                XMFLOAT3 worldCenter;
+                XMStoreFloat3(&worldCenter, XMVector3Transform(
+                    XMLoadFloat3(&runtime->batchCenter), transform));
+                renderBatches.push_back({ cacheIt->second.colourNode,
+                    cacheIt->second.shadowNode, stored, worldCenter,
+                    runtime->batchRadius,
+                    static_cast<uint32_t>(runtime->chunks.size()) });
+                continue;
+            }
             XMFLOAT3 batchMin(FLT_MAX, FLT_MAX, FLT_MAX);
             XMFLOAT3 batchMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            std::vector<DestructionRenderItem> actorItems;
+            actorItems.reserve(runtime->chunks.size());
             for (uint32_t chunk : runtime->chunks) {
                 // BoxTransform is rigid, so the model-space half-diagonal is the
                 // world radius unchanged; +10% guards frustum-edge pop-in.
                 const Chunk& c = chunks[chunk];
                 const XMVECTOR extent = XMLoadFloat3(&c.maximum) - XMLoadFloat3(&c.minimum);
                 const float radius =
-                    0.55f * XMVectorGetX(XMVector3Length(extent));
+                    0.55f * XMVectorGetX(XMVector3Length(extent)) * debrisScale;
                 XMFLOAT3 worldCenter;
                 XMStoreFloat3(&worldCenter, XMVector3Transform(XMLoadFloat3(&c.center), transform));
-                renderItems.push_back({ c.node, stored, worldCenter, radius });
+                actorItems.push_back({ c.node, stored, worldCenter, radius });
                 batchMin.x = (std::min)(batchMin.x, worldCenter.x - radius);
                 batchMin.y = (std::min)(batchMin.y, worldCenter.y - radius);
                 batchMin.z = (std::min)(batchMin.z, worldCenter.z - radius);
@@ -1267,38 +1449,42 @@ struct DestructionDX12::Impl {
                 batchMax.z = (std::max)(batchMax.z, worldCenter.z + radius);
             }
 
-            if (!renderBatchingEnabled) continue;
-
-            uint64_t hash = 1469598103934665603ull;
-            for (uint32_t chunk : runtime->chunks) {
-                hash ^= chunk;
-                hash *= 1099511628211ull;
-            }
-            BatchCacheEntry& cache = batchCache[runtime.get()];
-            if (cache.chunkHash != hash || !cache.colourNode || !cache.shadowNode) {
-                ++batchGeometryRebuildCount;
-                retireBatch(cache);
-                auto root = std::make_shared<SceneNode>("DestructionActorBatch");
-                root->children.reserve(runtime->chunks.size());
+            // Only intact initialization is merged. Once Blast splits an actor,
+            // its children stay on the individual path for their full lifetime.
+            const bool eligible = initialBatchBuild &&
+                runtime->chunks.size() > 1 && runtime->failedBatchHash != hash;
+            if (cacheIt == batchCache.end() && eligible) {
+                std::vector<std::shared_ptr<SceneNode>> nodes;
+                nodes.reserve(runtime->chunks.size());
                 for (uint32_t chunk : runtime->chunks)
-                    root->children.push_back(chunks[chunk].node);
-                root->UpdateGlobalTransform(root->localTransform);
-                cache.colourNode = GLBImporter::MergeSceneByMaterial(root, device);
-                cache.shadowNode = GLBImporter::MergeSceneForDepth(root, device);
-                cache.chunkHash = hash;
+                    nodes.push_back(chunks[chunk].node);
+                if (initialBatchBuild) {
+                    BatchBuildResult result = BuildActorBatch(
+                        device, runtime->renderId, hash, std::move(nodes));
+                    if (result.colourNode && result.shadowNode) {
+                        batchCache[runtime.get()] = { hash,
+                            std::move(result.colourNode),
+                            std::move(result.shadowNode) };
+                        ++batchGeometryRebuildCount;
+                        cacheIt = batchCache.find(runtime.get());
+                    } else {
+                        runtime->failedBatchHash = hash;
+                    }
+                }
             }
-            if (!cache.colourNode || !cache.shadowNode || batchMin.x == FLT_MAX) {
-                batchBuildFailed = true;
-                continue;
+
+            if (cacheIt != batchCache.end() && batchMin.x != FLT_MAX) {
+                EnsureActorBatchBounds(*runtime);
+                XMFLOAT3 center;
+                XMStoreFloat3(&center, XMVector3Transform(
+                    XMLoadFloat3(&runtime->batchCenter), transform));
+                renderBatches.push_back({ cacheIt->second.colourNode,
+                    cacheIt->second.shadowNode, stored, center,
+                    runtime->batchRadius,
+                    static_cast<uint32_t>(runtime->chunks.size()) });
+            } else {
+                renderItems.insert(renderItems.end(), actorItems.begin(), actorItems.end());
             }
-            const XMFLOAT3 center(
-                (batchMin.x + batchMax.x) * 0.5f,
-                (batchMin.y + batchMax.y) * 0.5f,
-                (batchMin.z + batchMax.z) * 0.5f);
-            const XMVECTOR half = (XMLoadFloat3(&batchMax) - XMLoadFloat3(&batchMin)) * 0.5f;
-            renderBatches.push_back({ cache.colourNode, cache.shadowNode, stored,
-                center, XMVectorGetX(XMVector3Length(half)),
-                static_cast<uint32_t>(runtime->chunks.size()) });
         }
         for (auto it = batchCache.begin(); it != batchCache.end();) {
             if (!liveActors.count(it->first)) {
@@ -1306,14 +1492,6 @@ struct DestructionDX12::Impl {
                 it = batchCache.erase(it);
             }
             else ++it;
-        }
-        if (batchBuildFailed) {
-            static bool warned = false;
-            if (!warned) {
-                std::cerr << "Destruction actor batching failed; using chunk fallback\n";
-                warned = true;
-            }
-            renderBatches.clear();
         }
         ragdollRenderItems.clear();
         for (const RagdollPart& part : ragdollParts) {
@@ -1408,6 +1586,7 @@ struct DestructionDX12::Impl {
         }
         if (!hitActor || !hitActor->actor || hitChunk == InvalidIndex) return false;
         if (chunks[hitChunk].support) return false;        // anchored pieces shrug it off
+        if (hitActor->debrisCleanupEligible) hitActor->debrisAge = 0.0f;
         if (hitActor->chunks.size() <= 1) return false;    // lone cell: nothing left to sever
         lastDamagePosition = worldPosition;  // outward burst origin for the split
         const int hitGroup = chunks[hitChunk].plankGroup;
@@ -1523,6 +1702,7 @@ bool DestructionDX12::Initialize(const std::shared_ptr<SceneNode>& mergedModel,
     }
     m->initialized = true;
     m->RebuildRenderItems();
+    m->initialBatchBuild = false;
     std::cout << "Destruction ready: " << m->chunks.size() << " chunks, "
               << m->asset->getBondCount() << " bonds\n";
     return true;
@@ -1698,6 +1878,36 @@ bool DestructionDX12::VehicleReady() const {
 
 void DestructionDX12::Update(float dt) {
     if (!m->initialized) return;
+    const bool batchCompleted = m->PollBatchBuild();
+    bool debrisExpired = false;
+    bool debrisShrinking = false;
+    for (auto it = m->actors.begin(); it != m->actors.end();) {
+        Impl::ActorRuntime& runtime = **it;
+        const bool renderedAsBatch =
+            m->batchCache.find(&runtime) != m->batchCache.end();
+        // Cached actor batches represent intact/merged structure. Never start
+        // debris cleanup on them, even if physics temporarily marks the actor
+        // dynamic. Only individually rendered split parts shrink and disappear.
+        if (!runtime.dynamic || !runtime.debrisCleanupEligible || renderedAsBatch) {
+            if (renderedAsBatch) runtime.debrisAge = 0.0f;
+            ++it;
+            continue;
+        }
+        runtime.debrisAge += dt;
+        debrisShrinking = debrisShrinking || runtime.debrisAge >=
+            DebrisLifetimeSeconds - DebrisShrinkSeconds;
+        if (runtime.debrisAge < DebrisLifetimeSeconds) {
+            ++it;
+            continue;
+        }
+        if (runtime.actor) {
+            runtime.actor->userData = nullptr;
+            runtime.actor->removeFromGroup();
+        }
+        if (!B3_IS_NULL(runtime.body)) b3DestroyBody(runtime.body);
+        it = m->actors.erase(it);
+        debrisExpired = true;
+    }
     m->accumulator = std::min(0.25f, m->accumulator + dt);
     constexpr float step = 1.0f / 60.0f;
     bool anyImpactBroke = false;
@@ -1737,7 +1947,8 @@ void DestructionDX12::Update(float dt) {
     // one final rebuild the render items would be frozen at wherever the debris was
     // a frame before it came to rest.
     const bool moving = m->AnythingMoving();
-    if (moving || anyImpactBroke || !m->rebuiltWhileStill) {
+    if (moving || anyImpactBroke || !m->rebuiltWhileStill ||
+        batchCompleted || debrisExpired || debrisShrinking) {
         m->RebuildRenderItems();
         m->rebuiltWhileStill = !moving;
     }
@@ -2043,6 +2254,7 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
         const XMVECTOR pos = XMVectorSet((float)bp.x, (float)bp.y, (float)bp.z, 0.0f);
         const float dist = XMVectorGetX(XMVector3Length(pos - center));
         if (dist > radius && !blastOverlapsChunk) continue;
+        if (runtime->debrisCleanupEligible) runtime->debrisAge = 0.0f;
         XMVECTOR dir = pos - center;
         if (dist < 0.001f) dir = XMVectorSet(0, 1, 0, 0);  // at the centre: straight up
         dir = XMVector3Normalize(dir + XMVectorSet(0, 0.4f, 0, 0));
@@ -2121,6 +2333,7 @@ bool DestructionDX12::ApplyImpulse(const XMFLOAT3& worldPosition,
             XMVectorSet((float)bodyPosition.x, (float)bodyPosition.y, (float)bodyPosition.z, 0.0f);
         const float distanceSquared = XMVectorGetX(XMVector3LengthSq(bodyCenter - hitPoint));
         if (distanceSquared > falloffSquared) continue;
+        if (runtime->debrisCleanupEligible) runtime->debrisAge = 0.0f;
         const float scale = 1.0f - std::sqrt(distanceSquared) / falloffRadius;
         // Cap the resulting velocity change: a fixed impulse on a feather-light
         // fragment (a glass shard) would otherwise launch it at bullet speed.
@@ -2234,11 +2447,6 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
         const TkSplitEvent* split = events[e].getPayload<TkSplitEvent>();
         if (!split) continue;
 
-        if (m->renderBatchingEnabled) {
-            m->renderBatchingEnabled = false;
-            std::cout << "Destruction topology changed: using non-stalling chunk rendering\n";
-        }
-
         // userData belongs to an actor that Blast has just replaced. A later
         // split event may still contain that old pointer, so never dereference
         // it until ownership is confirmed against the live runtime list.
@@ -2267,6 +2475,9 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
             child->userData = nullptr;
             auto runtime = std::make_unique<Impl::ActorRuntime>();
             runtime->actor = child;
+            runtime->renderId = m->nextActorRenderId++;
+            // Destroyed actors never enter batch construction. Rendering remains
+            // immediately available through their individual chunk geometry.
             const uint32_t visibleCount = child->getVisibleChunkCount();
             std::vector<uint32_t> visible(visibleCount);
             child->getVisibleChunkIndices(visible.data(), visibleCount);
@@ -2284,6 +2495,10 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
                 if (m->chunks[chunkIndex].support) { islandSupported = true; break; }
             }
             m->CreateBody(*runtime, !islandSupported, islandSupported ? nullptr : &seed);
+            // This is the zero-health transition. Start a fresh inactivity
+            // timer; later impacts reset it instead of inheriting old age.
+            runtime->debrisCleanupEligible = runtime->dynamic;
+            runtime->debrisAge = 0.0f;
             // A freed (unsupported) island is a real break -> mark its spot for
             // a puff of smoke at the fracture.
             if (!islandSupported && !B3_IS_NULL(runtime->body)) {
@@ -2394,6 +2609,9 @@ uint64_t DestructionDX12::GetRenderItemRebuildCount() const {
 }
 uint64_t DestructionDX12::GetBatchGeometryRebuildCount() const {
     return m ? m->batchGeometryRebuildCount : 0;
+}
+bool DestructionDX12::IsBatchBuildPending() const {
+    return m && m->batchBuildInFlight;
 }
 const std::vector<DestructionRenderItem>& DestructionDX12::GetRenderItems() const { return m->renderItems; }
 const std::vector<DestructionRenderBatch>& DestructionDX12::GetRenderBatches() const { return m->renderBatches; }
