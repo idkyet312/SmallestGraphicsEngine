@@ -294,10 +294,11 @@ inline void FillMatrixBufferForIndirect(ShaderDX12& matrixShader, UINT drawIndex
 inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
                          VisibilityBufferDX12& vb,
                          const GeometryBuffers& geo,
-                         const PackedGeometry& packed) {
+                         const PackedGeometry& packed,
+                         const XMMATRIX& lightSpace,
+                         ID3D12Resource* shadowResource) {
     XMMATRIX view = scene.GetViewMatrix();
     XMMATRIX proj = scene.GetProjectionMatrix();
-    XMMATRIX lightSpace = XMMatrixIdentity();
 
     // Build draw item list
     std::vector<IdTechDrawItem> drawItems;
@@ -305,6 +306,11 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
 
     // Culling before visibility pass (frustum + backface + small triangle)
     CullAndBatchDrawItems(scene, view, proj, drawItems);
+
+    scene.clusteredRenderer.setScreenSize((float)g_dx12.screenWidth, (float)g_dx12.screenHeight);
+    scene.clusteredRenderer.setCamera(scene.cameraFOV, scene.cameraNear,
+        scene.cameraFar, view, proj);
+    scene.clusteredRenderer.cullLights();
 
     // Register immutable meshes once. Frames upload instance/material records only.
     static UINT cubeMesh = VB_INVALID_MESH;
@@ -317,6 +323,12 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
             (UINT)(packed.planeFloats.size() / 8), nullptr, 0);
 
     vb.BeginFrame();
+    for (UINT clusterIndex = 0;
+         clusterIndex < (UINT)scene.clusteredRenderer.clusters.size();
+         ++clusterIndex) {
+        const auto& cluster = scene.clusteredRenderer.clusters[clusterIndex];
+        vb.SetCluster(clusterIndex, (UINT)cluster.lightCount, cluster.lightIndices);
+    }
     std::vector<UINT> dcIDs;
     dcIDs.reserve(drawItems.size());
 
@@ -382,26 +394,32 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         lb.enableShadows = scene.enableShadows ? 1 : 0;
         shader.lightBuffer.CopyData(g_dx12.frameIndex, lb);
 
-        scene.clusteredRenderer.setScreenSize((float)g_dx12.screenWidth, (float)g_dx12.screenHeight);
-        scene.clusteredRenderer.setCamera(scene.cameraFOV, scene.cameraNear, scene.cameraFar, view, proj);
-        scene.clusteredRenderer.cullLights();
-
-        auto ld = scene.clusteredRenderer.getPointLightData();
         PointLightsBufferDX12 plb = {};
-        plb.numPointLights = (int)ld.size();
-        int cnt = ((int)ld.size() < 64) ? (int)ld.size() : 64;
-        for (int i = 0; i < cnt; i++) plb.lights[i] = ld[i];
+        const auto& sourceLights = scene.clusteredRenderer.lights;
+        int cnt = ((int)sourceLights.size() < 64) ? (int)sourceLights.size() : 64;
+        plb.numPointLights = cnt;
+        for (int i = 0; i < cnt; i++) {
+            plb.lights[i].position = sourceLights[i].position;
+            plb.lights[i].radius = sourceLights[i].radius;
+            plb.lights[i].color = sourceLights[i].color;
+            plb.lights[i].intensity = sourceLights[i].active
+                ? sourceLights[i].intensity : 0.0f;
+        }
         shader.pointLightsBuffer.CopyData(g_dx12.frameIndex, plb);
     }
 
     vb.UpdateLightDescriptors(
         shader.lightBuffer.GetGPUAddress(g_dx12.frameIndex),
         shader.pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
+    vb.UpdateShadowMapDescriptor(shadowResource);
 
     LightBufferDX12 dummyLB = {};
     PointLightsBufferDX12 dummyPL = {};
-    vb.Resolve(g_dx12.commandList.Get(), view, proj, scene.camera.Position, dummyLB, dummyPL);
+    vb.Resolve(g_dx12.commandList.Get(), view, proj, lightSpace,
+        scene.camera.Position, scene.cameraNear, scene.cameraFar,
+        dummyLB, dummyPL);
 
+    vb.PostProcess(g_dx12.commandList.Get());
     vb.CopyToBackBuffer(g_dx12.commandList.Get());
     vb.TransitionBuffersForUpload(g_dx12.commandList.Get());
 }

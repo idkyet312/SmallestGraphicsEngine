@@ -9,12 +9,13 @@ cbuffer FrameConstants : register(b0) {
     matrix viewMatrix;
     matrix projMatrix;
     matrix invViewProj;
+    matrix lightViewProj;
     float3 cameraPos;
     float  screenWidth;
     float  screenHeight;
+    float  nearPlane;
+    float  farPlane;
     float  pad0;
-    float  pad1;
-    float  pad2;
 };
 
 cbuffer LightBuffer : register(b1) {
@@ -77,11 +78,18 @@ struct PackedVertex {
 
 Texture2D<uint2>  visBuffer    : register(t0);
 Texture2D<float>  depthBuffer  : register(t1);
-Texture2D<float4> shadowMapTex : register(t2);
+Texture2D<float>  shadowMapTex : register(t2);
 
 StructuredBuffer<DrawCallData> drawCalls : register(t3);
 StructuredBuffer<PackedVertex> vertices  : register(t4);
 StructuredBuffer<uint>         indices   : register(t5);
+
+struct ClusterData {
+    uint lightCount;
+    uint lightIndices[32];
+    uint3 padding;
+};
+StructuredBuffer<ClusterData>   clusters  : register(t6);
 
 RWTexture2D<float4> outputColor : register(u0);
 
@@ -98,6 +106,34 @@ float3 ReconstructWorldPos(uint2 pixel, float depth) {
     float4 clipPos = float4(ndc, depth, 1.0);
     float4 worldPos = mul(clipPos, invViewProj);
     return worldPos.xyz / worldPos.w;
+}
+
+float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
+    if (enableShadows == 0) return 1.0;
+
+    float4 lightClip = mul(float4(worldPos, 1.0), lightViewProj);
+    if (lightClip.w <= 0.0) return 1.0;
+    float3 projected = lightClip.xyz / lightClip.w;
+    float2 uv = projected.xy * float2(0.5, -0.5) + 0.5;
+    if (projected.z <= 0.0 || projected.z >= 1.0 ||
+        any(uv < 0.0) || any(uv > 1.0)) return 1.0;
+
+    uint shadowWidth, shadowHeight;
+    shadowMapTex.GetDimensions(shadowWidth, shadowHeight);
+    float2 texel = rcp(float2(shadowWidth, shadowHeight));
+    float slopeBias = max(shadowBias * (1.0 - saturate(dot(normal, lightDir))),
+                          shadowBias * 0.25);
+    float visibility = 0.0;
+    [unroll]
+    for (int y = -1; y <= 1; ++y) {
+        [unroll]
+        for (int x = -1; x <= 1; ++x) {
+            visibility += shadowMapTex.SampleCmpLevelZero(
+                shadowSampler, uv + float2(x, y) * texel,
+                projected.z - slopeBias);
+        }
+    }
+    return visibility / 9.0;
 }
 
 void GetTriangleVertices(DrawCallData dc, uint triangleID,
@@ -285,12 +321,23 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float denominator = 4.0 * NdotV * NdotL + 0.0001;
     float3 specular = numerator / denominator;
     
-    float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor * NdotL * atten;
+    float shadowVisibility = CalculateShadow(fragPos, normal, L);
+    float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor *
+                NdotL * atten * shadowVisibility;
     result += Lo;
     
-    // Point lights
-    for (int i = 0; i < numPointLights && i < 64; i++) {
-        result += calculatePointLight(i, fragPos, normal, viewDir) * albedo;
+    // Clustered point lights: at most 32 relevant lights instead of all 64.
+    uint clusterX = min((pixel.x * 16u) / max((uint)screenWidth, 1u), 15u);
+    uint clusterY = min((pixel.y * 9u) / max((uint)screenHeight, 1u), 8u);
+    float viewDepth = max(abs(mul(float4(fragPos, 1.0), viewMatrix).z), nearPlane);
+    float depthScale = log(viewDepth / nearPlane) / log(farPlane / nearPlane);
+    uint clusterZ = min((uint)(saturate(depthScale) * 10.0), 9u);
+    ClusterData cluster = clusters[clusterX + clusterY * 16u + clusterZ * 144u];
+    [loop]
+    for (uint listIndex = 0; listIndex < min(cluster.lightCount, 32u); ++listIndex) {
+        uint lightIndex = cluster.lightIndices[listIndex];
+        if (lightIndex < (uint)numPointLights && lightIndex < 64u)
+            result += calculatePointLight(lightIndex, fragPos, normal, viewDir) * albedo;
     }
     
     outputColor[pixel] = float4(result, 1.0);
