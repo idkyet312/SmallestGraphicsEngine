@@ -14,6 +14,7 @@
 #include "DX12Core.h"
 #include "ShaderDX12.h"
 #include "VisibilityBufferDX12.h"
+#include "OcclusionDepthDX12.h"
 #include "Scene.h"
 #include "ForwardRenderer.h"
 #include <array>
@@ -118,6 +119,20 @@ inline XMFLOAT3 TransformDir(const XMMATRIX& m, const XMFLOAT3& d) {
     return out;
 }
 
+inline XMFLOAT4 ComputeDrawItemBounds(const IdTechDrawItem& item) {
+    XMFLOAT3 center = TransformPoint(item.model, XMFLOAT3(0, 0, 0));
+    float radius = 28.5f;
+    if (item.isCube) {
+        XMFLOAT4X4 m;
+        XMStoreFloat4x4(&m, item.model);
+        float sx = sqrtf(m._11 * m._11 + m._12 * m._12 + m._13 * m._13);
+        float sy = sqrtf(m._21 * m._21 + m._22 * m._22 + m._23 * m._23);
+        float sz = sqrtf(m._31 * m._31 + m._32 * m._32 + m._33 * m._33);
+        radius = 0.8660254f * (std::max)(sx, (std::max)(sy, sz));
+    }
+    return XMFLOAT4(center.x, center.y, center.z, radius);
+}
+
 inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items) {
     items.clear();
 
@@ -151,30 +166,12 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items
 
 inline void CullAndBatchDrawItems(Scene& scene, const XMMATRIX& view, const XMMATRIX& proj,
                                   std::vector<IdTechDrawItem>& items) {
-    FrustumPlanes frustum = ExtractFrustumPlanes(view * proj);
-    const float smallTriPixelAreaThreshold = 2.0f;
-
     std::vector<IdTechDrawItem> visible;
     visible.reserve(items.size());
 
     for (const auto& item : items) {
-        XMFLOAT3 center = TransformPoint(item.model, XMFLOAT3(0, 0, 0));
-
-        float radius;
-        if (item.isCube) {
-            XMFLOAT4X4 m;
-            XMStoreFloat4x4(&m, item.model);
-            float sx = sqrtf(m._11 * m._11 + m._12 * m._12 + m._13 * m._13);
-            float sy = sqrtf(m._21 * m._21 + m._22 * m._22 + m._23 * m._23);
-            float sz = sqrtf(m._31 * m._31 + m._32 * m._32 + m._33 * m._33);
-            float maxScale = std::max(sx, std::max(sy, sz));
-            radius = 0.8660254f * maxScale;
-        } else {
-            radius = 28.5f; // Plane approx radius for side ~40
-        }
-
-        // Frustum culling
-        if (!SphereInsideFrustum(frustum, center, radius)) continue;
+        XMFLOAT4 bounds = ComputeDrawItemBounds(item);
+        XMFLOAT3 center(bounds.x, bounds.y, bounds.z);
 
         // Backface culling (object-level) where safe
         if (item.backfaceCullable) {
@@ -185,11 +182,6 @@ inline void CullAndBatchDrawItems(Scene& scene, const XMMATRIX& view, const XMMA
             float facing = worldNormal.x * toCamera.x + worldNormal.y * toCamera.y + worldNormal.z * toCamera.z;
             if (facing <= 0.0f) continue;
         }
-
-        // Small-triangle culling via projected-area estimate
-        float pxArea = ApproximateProjectedPixelArea(radius, center, scene.camera.Position,
-                                                     scene.cameraFOV, (float)g_dx12.screenHeight);
-        if (pxArea < smallTriPixelAreaThreshold) continue;
 
         visible.push_back(item);
     }
@@ -210,17 +202,43 @@ struct VisIndirectCommand {
     UINT drawCallID;
     D3D12_DRAW_ARGUMENTS drawArgs;
 };
+
+struct GPUVisibilityCullInput {
+    VisIndirectCommand command;
+    XMFLOAT4 worldBounds;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(VisIndirectCommand) == sizeof(D3D12_VERTEX_BUFFER_VIEW) + sizeof(D3D12_GPU_VIRTUAL_ADDRESS) + sizeof(UINT) + sizeof(D3D12_DRAW_ARGUMENTS),
     "VisIndirectCommand must be tightly packed for ExecuteIndirect.");
+static_assert(sizeof(GPUVisibilityCullInput) == 60,
+    "GPU cull input must match visibility_cull_cs.hlsl.");
+
+struct alignas(256) GPUVisibilityCullConstants {
+    XMFLOAT4 frustumPlanes[6];
+    XMMATRIX previousViewProjection;
+    XMFLOAT3 cameraPosition;
+    float projectionScaleY;
+    XMUINT2 screenSize;
+    UINT commandCount;
+    UINT hzbMipCount;
+    UINT useOcclusion;
+    float lodPixelThreshold;
+    XMFLOAT2 padding;
+};
 
 struct GPUDrivenVisibilityContext {
     bool initialized = false;
-    UINT maxCommands = 2048;
+    UINT maxCommands = MAX_DRAW_CALLS_PER_FRAME;
     ComPtr<ID3D12CommandSignature> commandSignature;
-    ComPtr<ID3D12Resource> indirectBuffer;
-    VisIndirectCommand* mappedCommands = nullptr;
+    ComPtr<ID3D12Resource> inputBuffer;
+    ComPtr<ID3D12Resource> visibleCommandBuffer;
+    ComPtr<ID3D12Resource> visibleCountBuffer;
+    ComPtr<ID3D12DescriptorHeap> descriptorHeap;
+    ComPtr<ID3D12RootSignature> cullRootSignature;
+    ComPtr<ID3D12PipelineState> cullPipeline;
+    GPUVisibilityCullInput* mappedInputs = nullptr;
+    UploadBuffer<GPUVisibilityCullConstants> constants;
 
     bool Init(ID3D12RootSignature* visRootSig) {
         if (initialized) return true;
@@ -244,31 +262,228 @@ struct GPUDrivenVisibilityContext {
         HRESULT hr = g_dx12.device->CreateCommandSignature(&sigDesc, visRootSig, IID_PPV_ARGS(&commandSignature));
         if (FAILED(hr)) return false;
 
-        D3D12_HEAP_PROPERTIES heapProps = {};
-        heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-        D3D12_RESOURCE_DESC bufferDesc = {};
-        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bufferDesc.Width = sizeof(VisIndirectCommand) * maxCommands;
-        bufferDesc.Height = 1;
-        bufferDesc.DepthOrArraySize = 1;
-        bufferDesc.MipLevels = 1;
-        bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
-        bufferDesc.SampleDesc.Count = 1;
-        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-        hr = g_dx12.device->CreateCommittedResource(
-            &heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-            IID_PPV_ARGS(&indirectBuffer));
-        if (FAILED(hr)) return false;
-
-        D3D12_RANGE rr = { 0, 0 };
-        hr = indirectBuffer->Map(0, &rr, reinterpret_cast<void**>(&mappedCommands));
-        if (FAILED(hr)) return false;
+        if (!CreateBuffers()) return false;
+        if (!CreateCullPipeline()) return false;
+        if (!constants.Create(FRAME_COUNT)) return false;
 
         initialized = true;
         return true;
+    }
+
+    bool CreateBuffers() {
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_UNKNOWN;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        D3D12_HEAP_PROPERTIES uploadHeap = {};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        desc.Width = sizeof(GPUVisibilityCullInput) * maxCommands * FRAME_COUNT;
+        HRESULT hr = g_dx12.device->CreateCommittedResource(
+            &uploadHeap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&inputBuffer));
+        if (FAILED(hr)) return false;
+        D3D12_RANGE noRead = { 0, 0 };
+        hr = inputBuffer->Map(0, &noRead,
+            reinterpret_cast<void**>(&mappedInputs));
+        if (FAILED(hr)) return false;
+
+        D3D12_HEAP_PROPERTIES defaultHeap = {};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        desc.Width = sizeof(VisIndirectCommand) * maxCommands;
+        hr = g_dx12.device->CreateCommittedResource(
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, nullptr,
+            IID_PPV_ARGS(&visibleCommandBuffer));
+        if (FAILED(hr)) return false;
+        desc.Width = sizeof(UINT);
+        hr = g_dx12.device->CreateCommittedResource(
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, nullptr,
+            IID_PPV_ARGS(&visibleCountBuffer));
+        return SUCCEEDED(hr);
+    }
+
+    bool CreateCullPipeline() {
+        std::ifstream file("shaders/visibility_cull_cs.hlsl");
+        if (!file.is_open()) return false;
+        std::stringstream stream;
+        stream << file.rdbuf();
+        std::string source = stream.str();
+        ComPtr<ID3DBlob> shader, errors;
+        HRESULT hr = D3DCompile(source.data(), source.size(),
+            "visibility_cull_cs.hlsl", nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            "main", "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS |
+            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shader, &errors);
+        if (FAILED(hr)) {
+            if (errors) std::cerr << "Visibility cull CS error: "
+                << (char*)errors->GetBufferPointer() << std::endl;
+            return false;
+        }
+
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors = 2;
+        ranges[0].BaseShaderRegister = 0;
+        ranges[0].OffsetInDescriptorsFromTableStart = 0;
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors = 2;
+        ranges[1].BaseShaderRegister = 0;
+        ranges[1].OffsetInDescriptorsFromTableStart = 2;
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable.NumDescriptorRanges = 2;
+        params[1].DescriptorTable.pDescriptorRanges = ranges;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC root = {};
+        root.NumParameters = 2;
+        root.pParameters = params;
+        ComPtr<ID3DBlob> rootBlob;
+        hr = D3D12SerializeRootSignature(&root, D3D_ROOT_SIGNATURE_VERSION_1,
+            &rootBlob, &errors);
+        if (FAILED(hr)) return false;
+        hr = g_dx12.device->CreateRootSignature(0, rootBlob->GetBufferPointer(),
+            rootBlob->GetBufferSize(), IID_PPV_ARGS(&cullRootSignature));
+        if (FAILED(hr)) return false;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = cullRootSignature.Get();
+        pso.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
+        hr = g_dx12.device->CreateComputePipelineState(&pso,
+            IID_PPV_ARGS(&cullPipeline));
+        if (FAILED(hr)) return false;
+
+        D3D12_DESCRIPTOR_HEAP_DESC heap = {};
+        heap.NumDescriptors = 4 * FRAME_COUNT;
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = g_dx12.device->CreateDescriptorHeap(&heap,
+            IID_PPV_ARGS(&descriptorHeap));
+        if (FAILED(hr)) return false;
+        for (UINT frame = 0; frame < FRAME_COUNT; ++frame)
+            CreateBufferDescriptors(frame);
+        return true;
+    }
+
+    GPUVisibilityCullInput& Input(UINT index) {
+        return mappedInputs[g_dx12.frameIndex * maxCommands + index];
+    }
+
+    void CreateBufferDescriptors(UINT frame) {
+        UINT size = g_dx12.cbvSrvUavDescriptorSize;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += (SIZE_T)size * frame * 4;
+        D3D12_SHADER_RESOURCE_VIEW_DESC inputSrv = {};
+        inputSrv.Format = DXGI_FORMAT_UNKNOWN;
+        inputSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        inputSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        inputSrv.Buffer.FirstElement = frame * maxCommands;
+        inputSrv.Buffer.NumElements = maxCommands;
+        inputSrv.Buffer.StructureByteStride = sizeof(GPUVisibilityCullInput);
+        g_dx12.device->CreateShaderResourceView(inputBuffer.Get(), &inputSrv, handle);
+        handle.ptr += size * 2;
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC commandsUav = {};
+        commandsUav.Format = DXGI_FORMAT_R32_TYPELESS;
+        commandsUav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        commandsUav.Buffer.NumElements =
+            (sizeof(VisIndirectCommand) * maxCommands) / sizeof(UINT);
+        commandsUav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        g_dx12.device->CreateUnorderedAccessView(visibleCommandBuffer.Get(),
+            nullptr, &commandsUav, handle);
+        handle.ptr += size;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC countUav = commandsUav;
+        countUav.Buffer.NumElements = 1;
+        g_dx12.device->CreateUnorderedAccessView(visibleCountBuffer.Get(),
+            nullptr, &countUav, handle);
+    }
+
+    void UpdateHZBDescriptor(OcclusionDepthDX12* hzb) {
+        UINT size = g_dx12.cbvSrvUavDescriptorSize;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += (SIZE_T)size * (g_dx12.frameIndex * 4 + 1);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = DXGI_FORMAT_R32_FLOAT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = hzb ? hzb->GetMipCount() : 1;
+        g_dx12.device->CreateShaderResourceView(
+            hzb ? hzb->previousDepth.Get() : nullptr, &srv, handle);
+    }
+
+    void Cull(ID3D12GraphicsCommandList* cmd,
+              const GPUVisibilityCullConstants& data,
+              OcclusionDepthDX12* hzb) {
+        if (!initialized || data.commandCount == 0) return;
+        UpdateHZBDescriptor(hzb);
+        constants.CopyData(g_dx12.frameIndex, data);
+
+        D3D12_RESOURCE_BARRIER barriers[2] = {};
+        for (UINT i = 0; i < 2; ++i) {
+            barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        barriers[0].Transition.pResource = visibleCommandBuffer.Get();
+        barriers[1].Transition.pResource = visibleCountBuffer.Get();
+        cmd->ResourceBarrier(2, barriers);
+
+        UINT descriptorSize = g_dx12.cbvSrvUavDescriptorSize;
+        const UINT frameBase = g_dx12.frameIndex * 4;
+        D3D12_CPU_DESCRIPTOR_HANDLE countCpu =
+            descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+        countCpu.ptr += (SIZE_T)descriptorSize * (frameBase + 3);
+        D3D12_GPU_DESCRIPTOR_HANDLE countGpu =
+            descriptorHeap->GetGPUDescriptorHandleForHeapStart();
+        countGpu.ptr += (UINT64)descriptorSize * (frameBase + 3);
+        D3D12_GPU_DESCRIPTOR_HANDLE tableGpu =
+            descriptorHeap->GetGPUDescriptorHandleForHeapStart();
+        tableGpu.ptr += (UINT64)descriptorSize * frameBase;
+        ID3D12DescriptorHeap* heaps[] = { descriptorHeap.Get() };
+        cmd->SetDescriptorHeaps(1, heaps);
+        const UINT zeros[4] = {};
+        cmd->ClearUnorderedAccessViewUint(countGpu, countCpu,
+            visibleCountBuffer.Get(), zeros, 0, nullptr);
+
+        cmd->SetComputeRootSignature(cullRootSignature.Get());
+        cmd->SetPipelineState(cullPipeline.Get());
+        cmd->SetComputeRootConstantBufferView(0,
+            constants.GetGPUAddress(g_dx12.frameIndex));
+        cmd->SetComputeRootDescriptorTable(1, tableGpu);
+        cmd->Dispatch((data.commandCount + 63) / 64, 1, 1);
+
+        for (UINT i = 0; i < 2; ++i) {
+            barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barriers[i].UAV.pResource = i == 0
+                ? visibleCommandBuffer.Get() : visibleCountBuffer.Get();
+        }
+        cmd->ResourceBarrier(2, barriers);
+        for (UINT i = 0; i < 2; ++i) {
+            barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[i].Transition.pResource = i == 0
+                ? visibleCommandBuffer.Get() : visibleCountBuffer.Get();
+            barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        cmd->ResourceBarrier(2, barriers);
+    }
+
+    void Execute(ID3D12GraphicsCommandList* cmd, UINT submittedCount) {
+        if (!initialized || submittedCount == 0) return;
+        cmd->ExecuteIndirect(commandSignature.Get(), submittedCount,
+            visibleCommandBuffer.Get(), 0, visibleCountBuffer.Get(), 0);
     }
 };
 
@@ -296,7 +511,10 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
                          const GeometryBuffers& geo,
                          const PackedGeometry& packed,
                          const XMMATRIX& lightSpace,
-                         ID3D12Resource* shadowResource) {
+                         ID3D12Resource* shadowResource,
+                         OcclusionDepthDX12* hzb,
+                         bool useHZBOcclusion,
+                         const XMMATRIX& previousViewProjection) {
     XMMATRIX view = scene.GetViewMatrix();
     XMMATRIX proj = scene.GetProjectionMatrix();
 
@@ -304,7 +522,8 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     std::vector<IdTechDrawItem> drawItems;
     BuildSceneDrawItems(scene, drawItems);
 
-    // Culling before visibility pass (frustum + backface + small triangle)
+    // CPU retains only cheap material ordering/backface rejection. GPU decides
+    // frustum, projected-size LOD, HZB visibility, and final indirect draw count.
     CullAndBatchDrawItems(scene, view, proj, drawItems);
 
     scene.clusteredRenderer.setScreenSize((float)g_dx12.screenWidth, (float)g_dx12.screenHeight);
@@ -340,9 +559,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
 
     vb.UploadBuffers(g_dx12.commandList.Get());
 
-    // Pass 1: visibility rasterisation (GPU-driven ExecuteIndirect)
-    vb.BeginVisibilityPass(g_dx12.commandList.Get());
-
+    // Pass 1: GPU cull and compact the actual ExecuteIndirect stream.
     static GPUDrivenVisibilityContext gpuDriven;
     if (!gpuDriven.initialized) {
         gpuDriven.Init(vb.visPassRootSig.Get());
@@ -356,24 +573,52 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         D3D12_GPU_VIRTUAL_ADDRESS matrixCBV = 0;
         FillMatrixBufferForIndirect(shader, i, drawItems[i].model, view, proj, lightSpace, matrixCBV);
 
-        gpuDriven.mappedCommands[i].vbv = drawItems[i].isCube ? geo.cubeVBV : geo.planeVBV;
-        gpuDriven.mappedCommands[i].matrixCBV = matrixCBV;
-        gpuDriven.mappedCommands[i].drawCallID = dcIDs[i];
-        gpuDriven.mappedCommands[i].drawArgs.VertexCountPerInstance = drawItems[i].isCube ? 36 : 6;
-        gpuDriven.mappedCommands[i].drawArgs.InstanceCount = 1;
-        gpuDriven.mappedCommands[i].drawArgs.StartVertexLocation = 0;
-        gpuDriven.mappedCommands[i].drawArgs.StartInstanceLocation = 0;
+        if (gpuDriven.initialized) {
+            GPUVisibilityCullInput& input = gpuDriven.Input(i);
+            input.command.vbv = drawItems[i].isCube ? geo.cubeVBV : geo.planeVBV;
+            input.command.matrixCBV = matrixCBV;
+            input.command.drawCallID = dcIDs[i];
+            input.command.drawArgs.VertexCountPerInstance = drawItems[i].isCube ? 36 : 6;
+            input.command.drawArgs.InstanceCount = 1;
+            input.command.drawArgs.StartVertexLocation = 0;
+            input.command.drawArgs.StartInstanceLocation = 0;
+            input.worldBounds = ComputeDrawItemBounds(drawItems[i]);
+        }
     }
 
-    if (drawCount > 0 && gpuDriven.commandSignature) {
+    if (drawCount > 0 && gpuDriven.initialized) {
+        GPUVisibilityCullConstants cull = {};
+        FrustumPlanes frustum = ExtractFrustumPlanes(view * proj);
+        for (UINT i = 0; i < 6; ++i) cull.frustumPlanes[i] = frustum.p[i];
+        cull.previousViewProjection = XMMatrixTranspose(previousViewProjection);
+        cull.cameraPosition = scene.camera.Position;
+        XMFLOAT4X4 projection;
+        XMStoreFloat4x4(&projection, proj);
+        cull.projectionScaleY = fabsf(projection._22);
+        cull.screenSize = XMUINT2(g_dx12.screenWidth, g_dx12.screenHeight);
+        cull.commandCount = drawCount;
+        cull.hzbMipCount = hzb ? hzb->GetMipCount() : 0;
+        cull.useOcclusion = useHZBOcclusion ? 1u : 0u;
+        cull.lodPixelThreshold = 2.0f;
+        gpuDriven.Cull(g_dx12.commandList.Get(), cull, hzb);
+    }
+
+    vb.BeginVisibilityPass(g_dx12.commandList.Get());
+    if (drawCount > 0 && gpuDriven.initialized) {
         g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        g_dx12.commandList->ExecuteIndirect(
-            gpuDriven.commandSignature.Get(),
-            drawCount,
-            gpuDriven.indirectBuffer.Get(),
-            0,
-            nullptr,
-            0);
+        gpuDriven.Execute(g_dx12.commandList.Get(), drawCount);
+    } else {
+        g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        for (UINT i = 0; i < drawCount; ++i) {
+            D3D12_VERTEX_BUFFER_VIEW vbv = drawItems[i].isCube
+                ? geo.cubeVBV : geo.planeVBV;
+            g_dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
+            vb.SetVisPassMatrices(g_dx12.commandList.Get(), drawItems[i].model,
+                view, proj, lightSpace, shader, i);
+            vb.SetDrawCallID(g_dx12.commandList.Get(), dcIDs[i]);
+            g_dx12.commandList->DrawInstanced(
+                drawItems[i].isCube ? 36 : 6, 1, 0, 0);
+        }
     }
 
     vb.EndVisibilityPass(g_dx12.commandList.Get());
