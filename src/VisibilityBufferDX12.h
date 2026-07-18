@@ -14,6 +14,11 @@ static const UINT VB_MAX_DRAW_CALLS = MAX_DRAW_CALLS_PER_FRAME;
 static const UINT VB_MAX_VERTICES = 1024 * 1024;
 // Maximum total indices across all draw calls
 static const UINT VB_MAX_INDICES = 1024 * 1024 * 3;
+static const UINT VB_CLUSTER_X = 16;
+static const UINT VB_CLUSTER_Y = 9;
+static const UINT VB_CLUSTER_Z = 10;
+static const UINT VB_CLUSTER_COUNT = VB_CLUSTER_X * VB_CLUSTER_Y * VB_CLUSTER_Z;
+static const UINT VB_MAX_LIGHTS_PER_CLUSTER = 32;
 
 // Must match the compute shader's DrawCallData
 struct VBDrawCallData {
@@ -38,6 +43,12 @@ struct VBMeshData {
     UINT hasIndices = 0;
 };
 
+struct VBClusterData {
+    UINT lightCount = 0;
+    UINT lightIndices[VB_MAX_LIGHTS_PER_CLUSTER] = {};
+    UINT padding[3] = {};
+};
+
 static const UINT VB_INVALID_MESH = UINT_MAX;
 
 // Must match the compute shader's PackedVertex (two float4s)
@@ -51,12 +62,24 @@ struct alignas(256) VBFrameConstants {
     XMMATRIX viewMatrix;
     XMMATRIX projMatrix;
     XMMATRIX invViewProj;
+    XMMATRIX lightViewProj;
     XMFLOAT3 cameraPos;
     float    screenWidth;
     float    screenHeight;
+    float    nearPlane;
+    float    farPlane;
     float    pad0;
-    float    pad1;
-    float    pad2;
+};
+
+struct alignas(256) VBPostConstants {
+    UINT outputWidth;
+    UINT outputHeight;
+    float exposure;
+    float bloomStrength;
+    float vignetteStrength;
+    float grainStrength;
+    UINT frameIndex;
+    float padding;
 };
 
 class VisibilityBufferDX12 {
@@ -69,8 +92,9 @@ public:
     // Depth buffer SRV for the compute pass (reads main depth)
     // We'll create a SRV for the engine's existing depth buffer
 
-    // Compute output texture (RGBA8, written by compute, copied to back buffer)
+    // Lighting stays HDR until the dedicated cinematic post pass.
     ComPtr<ID3D12Resource> outputTexture;
+    ComPtr<ID3D12Resource> presentTexture;
 
     // Visibility pass PSO + root signature
     ComPtr<ID3D12RootSignature> visPassRootSig;
@@ -79,6 +103,9 @@ public:
     // Compute resolve PSO + root signature
     ComPtr<ID3D12RootSignature> resolveRootSig;
     ComPtr<ID3D12PipelineState> resolvePSO;
+    ComPtr<ID3D12RootSignature> postRootSig;
+    ComPtr<ID3D12PipelineState> postPSO;
+    ComPtr<ID3D12DescriptorHeap> postDescHeap;
 
     // GPU-visible structured buffers
     ComPtr<ID3D12Resource> drawCallBuffer;       // StructuredBuffer<DrawCallData>
@@ -87,9 +114,12 @@ public:
     ComPtr<ID3D12Resource> vertexDataUpload;
     ComPtr<ID3D12Resource> indexDataBuffer;       // StructuredBuffer<uint>
     ComPtr<ID3D12Resource> indexDataUpload;
+    ComPtr<ID3D12Resource> clusterDataBuffer;     // StructuredBuffer<ClusterData>
+    ComPtr<ID3D12Resource> clusterDataUpload;
 
     // Upload buffer for frame constants
     UploadBuffer<VBFrameConstants> frameConstantBuffer;
+    UploadBuffer<VBPostConstants> postConstantBuffer;
 
     // Descriptor heap for compute pass SRVs/UAVs
     ComPtr<ID3D12DescriptorHeap> computeDescHeap;
@@ -98,12 +128,18 @@ public:
     std::vector<VBDrawCallData> cpuDrawCalls;
     std::vector<VBPackedVertex> cpuVertices;
     std::vector<UINT>           cpuIndices;
+    std::vector<VBClusterData>  cpuClusters;
     std::vector<VBMeshData>     meshes;
     UINT currentDrawCall = 0;
     UINT persistentVertexCount = 0;
     UINT persistentIndexCount = 0;
     bool geometryUploaded = false;
     bool geometryDirty = false;
+    UINT postFrameIndex = 0;
+    float exposure = 1.15f;
+    float bloomStrength = 0.12f;
+    float vignetteStrength = 0.18f;
+    float grainStrength = 0.012f;
 
     UINT width = 0;
     UINT height = 0;
@@ -116,14 +152,18 @@ public:
         if (!CreateVisBufferRT()) return false;
         if (!CreateOutputTexture()) return false;
         if (!CreateStructuredBuffers()) return false;
+        if (!CreateComputeDescriptorHeap()) return false;
         if (!CreateVisPassPipeline()) return false;
         if (!CreateResolvePipeline()) return false;
+        if (!CreatePostPipeline()) return false;
 
         if (!frameConstantBuffer.Create(FRAME_COUNT)) return false;
+        if (!postConstantBuffer.Create(FRAME_COUNT)) return false;
 
         cpuDrawCalls.resize(VB_MAX_DRAW_CALLS);
         cpuVertices.resize(VB_MAX_VERTICES);
         cpuIndices.resize(VB_MAX_INDICES);
+        cpuClusters.resize(VB_CLUSTER_COUNT);
 
         initialized = true;
         std::cout << "Visibility Buffer initialized (" << width << "x" << height << ")" << std::endl;
@@ -132,6 +172,14 @@ public:
 
     void BeginFrame() {
         currentDrawCall = 0;
+    }
+
+    void SetCluster(UINT clusterIndex, UINT lightCount, const int* lightIndices) {
+        if (clusterIndex >= cpuClusters.size()) return;
+        VBClusterData& cluster = cpuClusters[clusterIndex];
+        cluster.lightCount = (std::min)(lightCount, VB_MAX_LIGHTS_PER_CLUSTER);
+        for (UINT i = 0; i < cluster.lightCount; ++i)
+            cluster.lightIndices[i] = static_cast<UINT>(lightIndices[i]);
     }
 
     // Upload-once mesh registration. Instances reference this immutable geometry
@@ -227,6 +275,21 @@ public:
             cmdList->ResourceBarrier(2, geometryToCopy);
         }
 
+
+        // CPU cluster construction already exists in ClusteredRendererDX12.
+        // Upload its compact light lists instead of scanning every light per pixel.
+        {
+            void* mapped = nullptr;
+            D3D12_RANGE readRange = { 0, 0 };
+            clusterDataUpload->Map(0, &readRange, &mapped);
+            memcpy(mapped, cpuClusters.data(),
+                   cpuClusters.size() * sizeof(VBClusterData));
+            clusterDataUpload->Unmap(0, nullptr);
+            cmdList->CopyBufferRegion(clusterDataBuffer.Get(), 0,
+                clusterDataUpload.Get(), 0,
+                cpuClusters.size() * sizeof(VBClusterData));
+        }
+
         if (geometryDirty && persistentVertexCount > 0) {
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
@@ -250,7 +313,7 @@ public:
         }
 
         // Barriers: transition structured buffers from copy dest to SRV
-        D3D12_RESOURCE_BARRIER barriers[3] = {};
+        D3D12_RESOURCE_BARRIER barriers[4] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = drawCallBuffer.Get();
         barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -258,18 +321,15 @@ public:
         barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
         barriers[1] = barriers[0];
-        barriers[1].Transition.pResource = vertexDataBuffer.Get();
+        barriers[1].Transition.pResource = clusterDataBuffer.Get();
 
-        barriers[2] = barriers[0];
-        barriers[2].Transition.pResource = indexDataBuffer.Get();
-
-        UINT barrierCount = 1;
+        UINT barrierCount = 2;
         if (geometryDirty) {
-            barriers[1] = barriers[0];
-            barriers[1].Transition.pResource = vertexDataBuffer.Get();
             barriers[2] = barriers[0];
-            barriers[2].Transition.pResource = indexDataBuffer.Get();
-            barrierCount = 3;
+            barriers[2].Transition.pResource = vertexDataBuffer.Get();
+            barriers[3] = barriers[0];
+            barriers[3].Transition.pResource = indexDataBuffer.Get();
+            barrierCount = 4;
             geometryUploaded = true;
             geometryDirty = false;
         }
@@ -278,14 +338,16 @@ public:
 
     // Transition structured buffers back to copy dest for next frame
     void TransitionBuffersForUpload(ID3D12GraphicsCommandList* cmdList) {
-        D3D12_RESOURCE_BARRIER barriers[1] = {};
+        D3D12_RESOURCE_BARRIER barriers[2] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = drawCallBuffer.Get();
         barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-        cmdList->ResourceBarrier(1, barriers);
+        barriers[1] = barriers[0];
+        barriers[1].Transition.pResource = clusterDataBuffer.Get();
+        cmdList->ResourceBarrier(2, barriers);
     }
 
     // Begin the visibility pass: clear VB RT, set render targets
@@ -363,7 +425,9 @@ public:
     // Run the compute resolve pass
     void Resolve(ID3D12GraphicsCommandList* cmdList,
                  const XMMATRIX& view, const XMMATRIX& proj,
+                 const XMMATRIX& lightViewProj,
                  const XMFLOAT3& cameraPos,
+                 float nearPlane, float farPlane,
                  const LightBufferDX12& lightData,
                  const PointLightsBufferDX12& pointLightData) {
         // Transition output texture to UAV
@@ -371,7 +435,7 @@ public:
             D3D12_RESOURCE_BARRIER barrier = {};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             barrier.Transition.pResource = outputTexture.Get();
-            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             cmdList->ResourceBarrier(1, &barrier);
@@ -394,10 +458,13 @@ public:
         fc.projMatrix = XMMatrixTranspose(proj);
         XMMATRIX invVP = XMMatrixInverse(nullptr, view * proj);
         fc.invViewProj = XMMatrixTranspose(invVP);
+        fc.lightViewProj = XMMatrixTranspose(lightViewProj);
         fc.cameraPos = cameraPos;
         fc.screenWidth = (float)width;
         fc.screenHeight = (float)height;
-        fc.pad0 = fc.pad1 = fc.pad2 = 0.0f;
+        fc.nearPlane = nearPlane;
+        fc.farPlane = farPlane;
+        fc.pad0 = 0.0f;
         frameConstantBuffer.CopyData(g_dx12.frameIndex, fc);
 
         // Set compute pipeline
@@ -436,13 +503,13 @@ public:
             cmdList->Dispatch(groupsX, groupsY, 1);
         }
 
-        // Transition output texture back to copy source
+        // Keep linear HDR as an SRV for post processing.
         {
             D3D12_RESOURCE_BARRIER barrier = {};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             barrier.Transition.pResource = outputTexture.Get();
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             cmdList->ResourceBarrier(1, &barrier);
         }
@@ -457,6 +524,40 @@ public:
             barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             cmdList->ResourceBarrier(1, &barrier);
         }
+    }
+
+    void PostProcess(ID3D12GraphicsCommandList* cmdList) {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = presentTexture.Get();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &barrier);
+
+        VBPostConstants constants = {};
+        constants.outputWidth = width;
+        constants.outputHeight = height;
+        constants.exposure = exposure;
+        constants.bloomStrength = bloomStrength;
+        constants.vignetteStrength = vignetteStrength;
+        constants.grainStrength = grainStrength;
+        constants.frameIndex = postFrameIndex++;
+        postConstantBuffer.CopyData(g_dx12.frameIndex, constants);
+
+        cmdList->SetComputeRootSignature(postRootSig.Get());
+        cmdList->SetPipelineState(postPSO.Get());
+        ID3D12DescriptorHeap* heaps[] = { postDescHeap.Get() };
+        cmdList->SetDescriptorHeaps(1, heaps);
+        cmdList->SetComputeRootConstantBufferView(0,
+            postConstantBuffer.GetGPUAddress(g_dx12.frameIndex));
+        cmdList->SetComputeRootDescriptorTable(1,
+            postDescHeap->GetGPUDescriptorHandleForHeapStart());
+        cmdList->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        cmdList->ResourceBarrier(1, &barrier);
     }
 
     // Copy the resolved output to the back buffer
@@ -475,7 +576,7 @@ public:
             cmdList->ResourceBarrier(1, &barrier);
         }
 
-        cmdList->CopyResource(backBuffer, outputTexture.Get());
+        cmdList->CopyResource(backBuffer, presentTexture.Get());
 
         // Transition back to RENDER_TARGET for ImGui
         {
@@ -496,11 +597,13 @@ public:
 
         visBufferRT.Reset();
         outputTexture.Reset();
+        presentTexture.Reset();
         visRtvHeap.Reset();
 
         CreateVisBufferRT();
         CreateOutputTexture();
         UpdateComputeDescriptors();
+        UpdatePostDescriptors();
     }
 
 private:
@@ -557,16 +660,26 @@ private:
         desc.Height = height;
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
-        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc.SampleDesc.Count = 1;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
         HRESULT hr = g_dx12.device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
-            D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
             IID_PPV_ARGS(&outputTexture));
         if (FAILED(hr)) {
             std::cerr << "Failed to create VB output texture" << std::endl;
+            return false;
+        }
+
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        hr = g_dx12.device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+            IID_PPV_ARGS(&presentTexture));
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create VB present texture" << std::endl;
             return false;
         }
         return true;
@@ -618,6 +731,25 @@ private:
                                      indexDataBuffer, indexDataUpload))
             return false;
 
+        if (!CreateDefaultAndUpload(VB_CLUSTER_COUNT * sizeof(VBClusterData),
+                                     clusterDataBuffer, clusterDataUpload))
+            return false;
+
+        return true;
+    }
+
+    bool CreateComputeDescriptorHeap() {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = 10;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        HRESULT hr = g_dx12.device->CreateDescriptorHeap(
+            &heapDesc, IID_PPV_ARGS(&computeDescHeap));
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create visibility compute descriptor heap\n";
+            return false;
+        }
+        UpdateComputeDescriptors();
         return true;
     }
 
@@ -783,14 +915,15 @@ private:
         //   [3] t3 - drawCalls SRV
         //   [4] t4 - vertices SRV
         //   [5] t5 - indices SRV
-        //   [6] u0 - output UAV
-        //   [7] b1 - light buffer CBV
-        //   [8] b2 - point lights CBV
+        //   [6] t6 - clustered light lists
+        //   [7] u0 - output UAV
+        //   [8] b1 - light buffer CBV
+        //   [9] b2 - point lights CBV
 
         D3D12_DESCRIPTOR_RANGE ranges[3] = {};
-        // SRVs t0..t5
+        // SRVs t0..t6
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 6;
+        ranges[0].NumDescriptors = 7;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].RegisterSpace = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
@@ -800,14 +933,14 @@ private:
         ranges[1].NumDescriptors = 1;
         ranges[1].BaseShaderRegister = 0;
         ranges[1].RegisterSpace = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 6;
+        ranges[1].OffsetInDescriptorsFromTableStart = 7;
 
         // CBVs b1..b2
         ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
         ranges[2].NumDescriptors = 2;
         ranges[2].BaseShaderRegister = 1;
         ranges[2].RegisterSpace = 0;
-        ranges[2].OffsetInDescriptorsFromTableStart = 7;
+        ranges[2].OffsetInDescriptorsFromTableStart = 8;
 
         D3D12_ROOT_PARAMETER resolveParams[2] = {};
 
@@ -995,18 +1128,117 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [6] u0 - output UAV (R8G8B8A8_UNORM)
+        // [6] t6 - clustered light lists
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvDesc.Buffer.FirstElement = 0;
+            srvDesc.Buffer.NumElements = VB_CLUSTER_COUNT;
+            srvDesc.Buffer.StructureByteStride = sizeof(VBClusterData);
+            g_dx12.device->CreateShaderResourceView(clusterDataBuffer.Get(), &srvDesc, cpuHandle);
+            cpuHandle.ptr += descSize;
+        }
+
+        // [7] u0 - linear HDR output UAV
         {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
-            uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            uavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
             uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
             g_dx12.device->CreateUnorderedAccessView(outputTexture.Get(), nullptr, &uavDesc, cpuHandle);
             cpuHandle.ptr += descSize;
         }
 
-        // [7] b1 - light buffer CBV (placeholder, will be updated per frame)
-        // [8] b2 - point lights CBV (placeholder, will be updated per frame)
+        // [8] b1 - light buffer CBV (placeholder, will be updated per frame)
+        // [9] b2 - point lights CBV (placeholder, will be updated per frame)
         // These will be created in UpdateLightDescriptors
+    }
+
+    bool CreatePostPipeline() {
+        std::ifstream csFile("shaders/visbuf_post_cs.hlsl");
+        if (!csFile.is_open()) return false;
+        std::stringstream stream;
+        stream << csFile.rdbuf();
+        const std::string source = stream.str();
+
+        ComPtr<ID3DBlob> shaderBlob, errorBlob;
+        HRESULT hr = D3DCompile(source.data(), source.size(), "visbuf_post_cs.hlsl",
+            nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0",
+            D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+            0, &shaderBlob, &errorBlob);
+        if (FAILED(hr)) {
+            if (errorBlob) std::cerr << "VB post CS error: "
+                << (char*)errorBlob->GetBufferPointer() << std::endl;
+            return false;
+        }
+
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors = 1;
+        ranges[0].BaseShaderRegister = 0;
+        ranges[0].OffsetInDescriptorsFromTableStart = 0;
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors = 1;
+        ranges[1].BaseShaderRegister = 0;
+        ranges[1].OffsetInDescriptorsFromTableStart = 1;
+
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable.NumDescriptorRanges = 2;
+        params[1].DescriptorTable.pDescriptorRanges = ranges;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+        rootDesc.NumParameters = 2;
+        rootDesc.pParameters = params;
+        ComPtr<ID3DBlob> rootBlob;
+        hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+            &rootBlob, &errorBlob);
+        if (FAILED(hr)) return false;
+        hr = g_dx12.device->CreateRootSignature(0, rootBlob->GetBufferPointer(),
+            rootBlob->GetBufferSize(), IID_PPV_ARGS(&postRootSig));
+        if (FAILED(hr)) return false;
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = postRootSig.Get();
+        pso.CS = { shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize() };
+        hr = g_dx12.device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&postPSO));
+        if (FAILED(hr)) return false;
+
+        D3D12_DESCRIPTOR_HEAP_DESC heap = {};
+        heap.NumDescriptors = 2;
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = g_dx12.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&postDescHeap));
+        if (FAILED(hr)) return false;
+        UpdatePostDescriptors();
+        return true;
+    }
+
+    void UpdatePostDescriptors() {
+        if (!postDescHeap) return;
+        UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            postDescHeap->GetCPUDescriptorHandleForHeapStart();
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        g_dx12.device->CreateShaderResourceView(outputTexture.Get(), &srv, handle);
+        handle.ptr += descriptorSize;
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+        uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        g_dx12.device->CreateUnorderedAccessView(
+            presentTexture.Get(), nullptr, &uav, handle);
     }
 
 public:
@@ -1015,7 +1247,7 @@ public:
                                 D3D12_GPU_VIRTUAL_ADDRESS pointLightsAddr) {
         UINT descSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
-        cpuHandle.ptr += 7 * descSize;
+        cpuHandle.ptr += 8 * descSize;
 
         // [7] b1 - light buffer CBV
         {

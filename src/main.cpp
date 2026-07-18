@@ -4682,7 +4682,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         } else if (gameScreen == GameScreen::Level1 && !levelLoadingActive &&
                    usingVisibility) {
             ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
-            RenderIdTech(scene, mainShader, visBuffer, geo, packed);
+            XMMATRIX lightSpace = XMMatrixIdentity();
+            ID3D12Resource* shadowResource = nullptr;
+            if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
+                lightSpace = shadowMap.Render(
+                    scene, geo, (!g_emptyLevelMode && g_showH2Model)
+                        ? (crateShadowModel ? crateShadowModel : crateModel)
+                        : nullptr,
+                    (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr);
+                shadowResource = shadowMap.GetResource();
+            }
+            RenderIdTech(scene, mainShader, visBuffer, geo, packed,
+                lightSpace, shadowResource);
         } else if (gameScreen == GameScreen::Level1 && !levelLoadingActive) {
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;

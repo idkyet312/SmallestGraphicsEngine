@@ -372,6 +372,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     vb.currentDrawCall, vb.persistentVertexCount);
                 ImGui::Text("  Persistent meshes: %u",
                     static_cast<UINT>(vb.meshes.size()));
+                ImGui::SliderFloat("VB Exposure", &vb.exposure, 0.25f, 4.0f, "%.2f");
+                ImGui::SliderFloat("VB Bloom", &vb.bloomStrength, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("VB Vignette", &vb.vignetteStrength, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("VB Film Grain", &vb.grainStrength, 0.0f, 0.08f, "%.3f");
             }
         } else {
             ImGui::TextDisabled("VB Pipeline: Not Available");
