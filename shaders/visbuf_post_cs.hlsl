@@ -2,8 +2,11 @@ Texture2D<float4> hdrInput : register(t0);
 Texture2D<float2> motionInput : register(t1);
 Texture2D<float4> historyInput : register(t2);
 ByteAddressBuffer exposureState : register(t3);
+Texture3D<float4> colorLUT : register(t4);
+Texture2D<float> sceneDepth : register(t5);
 RWTexture2D<float4> ldrOutput : register(u0);
 RWTexture2D<float4> historyOutput : register(u1);
+SamplerState lutSampler : register(s0);
 
 cbuffer PostConstants : register(b0) {
     uint2 outputSize;
@@ -14,7 +17,12 @@ cbuffer PostConstants : register(b0) {
     uint frameIndex;
     uint historyValid;
     float taaFeedback;
-    float postPadding;
+    float motionBlurStrength;
+    float focusDistance;
+    float aperture;
+    float nearPlane;
+    float farPlane;
+    float2 postPadding;
 };
 
 float Luminance(float3 color) { return dot(color, float3(0.2126, 0.7152, 0.0722)); }
@@ -70,6 +78,52 @@ float3 Bloom(uint2 pixel) {
     return bloom;
 }
 
+float LinearizeDepth(float depth) {
+    return nearPlane * farPlane /
+        max(farPlane - depth * (farPlane - nearPlane), 1e-4);
+}
+
+float3 CinematicInput(uint2 pixel) {
+    int2 dimensions = int2(outputSize);
+    float3 color = hdrInput.Load(int3(pixel, 0)).rgb;
+
+    float2 velocityPixels = motionInput.Load(int3(pixel, 0)) * float2(outputSize);
+    float blurLength = min(length(velocityPixels) * motionBlurStrength, 12.0);
+    if (blurLength > 0.5) {
+        float2 direction = velocityPixels / max(length(velocityPixels), 1e-4);
+        float3 motionColor = color * 0.28;
+        [unroll]
+        for (int tap = 1; tap <= 2; ++tap) {
+            float offset = blurLength * (tap / 2.0);
+            int2 a = clamp(int2(float2(pixel) + direction * offset), 0, dimensions - 1);
+            int2 b = clamp(int2(float2(pixel) - direction * offset), 0, dimensions - 1);
+            motionColor += (hdrInput.Load(int3(a, 0)).rgb +
+                            hdrInput.Load(int3(b, 0)).rgb) * 0.18;
+        }
+        color = motionColor;
+    }
+
+    float depth = sceneDepth.Load(int3(pixel, 0));
+    float viewDepth = LinearizeDepth(depth);
+    float coc = min(abs(viewDepth - focusDistance) * aperture /
+                    max(viewDepth, 0.1) * outputSize.y, 6.0);
+    if (depth < 0.9999 && coc > 0.75) {
+        static const float2 disk[8] = {
+            float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1),
+            float2(0.707, 0.707), float2(-0.707, 0.707),
+            float2(0.707, -0.707), float2(-0.707, -0.707)
+        };
+        float3 defocused = color * 0.2;
+        [unroll]
+        for (int i = 0; i < 8; ++i) {
+            int2 p = clamp(int2(float2(pixel) + disk[i] * coc), 0, dimensions - 1);
+            defocused += hdrInput.Load(int3(p, 0)).rgb * 0.1;
+        }
+        color = defocused;
+    }
+    return color;
+}
+
 float3 TemporalResolve(uint2 pixel, float3 currentColor) {
     if (historyValid == 0) return currentColor;
     float2 uv = (float2(pixel) + 0.5) / float2(outputSize);
@@ -102,17 +156,16 @@ float3 TemporalResolve(uint2 pixel, float3 currentColor) {
 void main(uint3 threadID : SV_DispatchThreadID) {
     uint2 pixel = threadID.xy;
     if (any(pixel >= outputSize)) return;
-    float3 hdr = TemporalResolve(pixel, hdrInput.Load(int3(pixel, 0)).rgb);
+    float3 hdr = TemporalResolve(pixel, CinematicInput(pixel));
     historyOutput[pixel] = float4(hdr, 1.0);
     float autoExposure = exposureState.Load(8) / 65536.0;
     if (autoExposure <= 0.0) autoExposure = 1.0;
     float3 color = TonemapAgX((hdr + Bloom(pixel) * bloomStrength)
                               * exposure * autoExposure);
-    const float3x3 grade = float3x3(
-        1.035, 0.005, -0.015,
-        0.000, 1.010,  0.000,
-       -0.015, 0.005,  0.970);
-    color = saturate(mul(grade, color));
+    float lutScale = 15.0 / 16.0;
+    float lutOffset = 0.5 / 16.0;
+    color = colorLUT.SampleLevel(lutSampler,
+        saturate(color) * lutScale + lutOffset, 0).rgb;
     float2 uv = (float2(pixel) + 0.5) / float2(outputSize);
     float2 centered = uv * 2.0 - 1.0;
     float vignette = smoothstep(1.35, 0.35, dot(centered, centered));
