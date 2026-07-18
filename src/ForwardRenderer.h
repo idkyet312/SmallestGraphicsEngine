@@ -643,7 +643,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                            const std::shared_ptr<SceneNode>& crateModel = nullptr,
                            const std::shared_ptr<SceneMaterial>& floorMaterial = nullptr,
                            XMMATRIX lightSpace = XMMatrixIdentity(),
-                           ID3D12Resource* shadowMap = nullptr) {
+                           ID3D12Resource* shadowMap = nullptr,
+                           bool visibilityExtensionsOnly = false) {
     XMMATRIX view = scene.GetViewMatrix();
     XMMATRIX proj = scene.GetProjectionMatrix();
 
@@ -680,8 +681,11 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     g_terrain.wireframe = scene.meshletWireframe;
     ForwardStaticBatchQueueDX12 staticBatches;
 
-    // Floor: mesh-shader tessellated terrain when available, flat plane otherwise.
-    XMMATRIX model = (!scene.useMeshTerrain || !g_terrain.supported) &&
+    // Floor: visibility owns the flat floor in hybrid mode. Mesh terrain remains
+    // on its amplification/mesh path until it emits visibility IDs directly.
+    XMMATRIX model = XMMatrixIdentity();
+    if (!visibilityExtensionsOnly || (scene.useMeshTerrain && g_terrain.supported)) {
+    model = (!scene.useMeshTerrain || !g_terrain.supported) &&
         g_stressTestMode
         ? XMMatrixScaling(6.4f, 1.0f, 6.4f)
         : XMMatrixIdentity();
@@ -718,6 +722,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         DrawPlane(geo);
     }
     shader.NextDrawCall();
+    }
 
     // Cube 1 - draw the imported model if loaded, else fall back to the procedural cube.
     // The model is its own multi-meter scene (not a unit cube), so place it directly
@@ -943,7 +948,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     }
 
     // Cube 2
-    if (!g_emptyLevelMode && scene.cube2.visible) {
+    if (!visibilityExtensionsOnly && !g_emptyLevelMode && scene.cube2.visible) {
         model = scene.cube2.GetModelMatrix();
         shader.SetMatrices(model, view, proj, lightSpace);
         shader.SetObjectColor(scene.cube2.color);

@@ -138,33 +138,15 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items
                                 const std::shared_ptr<SceneMaterial>& floorMaterial) {
     items.clear();
 
-    items.push_back({ XMMatrixIdentity(), scene.floor.color, false,
-        MAT_FLOOR, true, floorMaterial });
-    items.push_back({ scene.cube1.GetModelMatrix(), scene.cube1.color, true, MAT_CUBE, false });
+    if (!scene.useMeshTerrain) {
+        items.push_back({ XMMatrixIdentity(), scene.floor.color, false,
+            MAT_FLOOR, true, floorMaterial });
+    }
 
     if (scene.cube2.visible) {
         items.push_back({ scene.cube2.GetModelMatrix(), scene.cube2.color, true, MAT_CUBE, false });
     }
 
-    for (auto& p : scene.projectiles) {
-        if (!p.active) continue;
-        XMMATRIX m = XMMatrixScaling(scene.projectileScale, scene.projectileScale, scene.projectileScale)
-                   * XMMatrixTranslation(p.position.x, p.position.y, p.position.z);
-        items.push_back({ m, scene.projectileColor, true, MAT_PROJECTILE, false });
-    }
-
-    if (scene.gun.visible) {
-        items.push_back({ scene.GetGunModelMatrix(), scene.gun.color, true, MAT_GUN, false });
-    }
-
-    for (int i = 0; i < scene.clusteredRenderer.getTotalLightCount(); i++) {
-        PointLightDX12* l = scene.clusteredRenderer.getLight(i);
-        if (!l || !l->active) continue;
-        XMMATRIX m = XMMatrixScaling(0.2f, 0.2f, 0.2f)
-                   * XMMatrixTranslation(l->position.x, l->position.y, l->position.z);
-        XMFLOAT3 lc(l->color.x * l->intensity, l->color.y * l->intensity, l->color.z * l->intensity);
-        items.push_back({ m, lc, true, MAT_LIGHT_SPHERE, false });
-    }
 }
 
 inline void CullAndBatchDrawItems(Scene& scene, const XMMATRIX& view, const XMMATRIX& proj,

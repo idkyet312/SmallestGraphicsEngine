@@ -4696,6 +4696,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             RenderIdTech(scene, mainShader, visBuffer, geo, packed,
                 lightSpace, shadowResource, &occlusionDepth,
                 hzbHistoryUsable, previousHZBViewProjection, floorMaterial);
+            fogLightSpace = lightSpace;
+            fogShadowResource = shadowResource;
+            renderedForward = true;
+            {
+                ProfilerDX12::Scope extensions(
+                    g_profiler, "Forward Extensions", g_dx12.commandList.Get());
+                RenderForward(scene, mainShader, geo, crateModel, floorMaterial,
+                    lightSpace, shadowResource, true);
+            }
         } else if (gameScreen == GameScreen::Level1 && !levelLoadingActive) {
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
@@ -4716,30 +4725,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 ProfilerDX12::Scope profile(g_profiler, "Forward", g_dx12.commandList.Get());
                 RenderForward(scene, mainShader, geo, crateModel, floorMaterial, lightSpace, shadowResource);
             }
-            // Forward establishes this frame's global shader resources first.
-            // Drawing Bandits before that setup caused stale-state flashing.
-            if (!g_emptyLevelMode && g_banditLoaded) {
-                ProfilerDX12::Scope profile(
-                    g_profiler, "Bandits", g_dx12.commandList.Get());
-                for (auto& bandit : g_bandits) {
-                    if (!bandit) continue;
-                    bandit->Draw(mainShader, scene.GetViewMatrix(),
-                                 scene.GetProjectionMatrix(), lightSpace);
-                    if (bandit->HasGunPose() && GunModel::Loaded()) {
-                        mainShader.Use(false);
-                        DrawMeshAt(
-                            GunModel::Mesh(), mainShader, bandit->GunWorldMatrix(),
-                            scene.GetViewMatrix(), scene.GetProjectionMatrix(),
-                            lightSpace, true);
-                    }
+        }
+
+        // Hybrid visibility and pure forward both establish global forward
+        // resources before skinned/transparent extension passes.
+        if (renderedForward && !g_emptyLevelMode && g_banditLoaded) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "Bandits", g_dx12.commandList.Get());
+            for (auto& bandit : g_bandits) {
+                if (!bandit) continue;
+                bandit->Draw(mainShader, scene.GetViewMatrix(),
+                             scene.GetProjectionMatrix(), fogLightSpace);
+                if (bandit->HasGunPose() && GunModel::Loaded()) {
+                    mainShader.Use(false);
+                    DrawMeshAt(GunModel::Mesh(), mainShader,
+                        bandit->GunWorldMatrix(), scene.GetViewMatrix(),
+                        scene.GetProjectionMatrix(), fogLightSpace, true);
                 }
-                mainShader.Use(scene.wireframeMode); // restore IA pipeline for anything after
             }
-            {
-                ProfilerDX12::Scope profile(
-                    g_profiler, "Impact Particles", g_dx12.commandList.Get());
-                RenderImpactBillboards(scene, mainShader, geo, lightSpace);
-            }
+            mainShader.Use(scene.wireframeMode);
+        }
+        if (renderedForward) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "Impact Particles", g_dx12.commandList.Get());
+            RenderImpactBillboards(scene, mainShader, geo, fogLightSpace);
         }
 
         if (msaaActive) {
