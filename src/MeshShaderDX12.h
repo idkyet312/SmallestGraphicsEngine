@@ -212,9 +212,9 @@ public:
                 firstMeshlet, totalMeshlets,
                 occlusionEnabled ? 1u : 0u,
                 g_dx12.screenWidth, g_dx12.screenHeight,
-                skinning, occlusionMipCount
+                skinning, occlusionMipCount, g_currentModelMaxScale
             };
-            commandList6->SetGraphicsRoot32BitConstants(8, 10, &data, 0);
+            commandList6->SetGraphicsRoot32BitConstants(8, 11, &data, 0);
             commandList6->DispatchMesh(amplificationGroups, 1, 1);
             ++dispatchesThisFrame;
             meshletsThisFrame += meshletCount;
