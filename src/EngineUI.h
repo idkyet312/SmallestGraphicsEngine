@@ -357,13 +357,16 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // VB option
         if (vb.initialized) {
             bool vbEnabled = scene.useVisibilityBuffer;
-            if (ImGui::Checkbox("id Tech VB + Deferred", &vbEnabled)) {
+            if (ImGui::Checkbox("id Tech VB + Deferred (M)", &vbEnabled)) {
                 scene.useVisibilityBuffer = vbEnabled;
                 if (vbEnabled) {
                     scene.useRaytracing = false;
                     g_rt.enabled = false;
                 }
             }
+            ImGui::Checkbox("VB/Forward Parity Mode", &vb.validationMode);
+            if (vb.validationMode)
+                ImGui::TextDisabled("  MSAA / fog / FXAA / TAA / bloom disabled");
             if (scene.useVisibilityBuffer) {
                 ImGui::Text("  Pass 1: Visibility rasterise");
                 ImGui::Text("  Pass 2: G-Buffer fill (compute)");
@@ -377,7 +380,6 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 };
                 ImGui::Combo("VB Debug View", &vb.debugViewMode,
                     debugViews, IM_ARRAYSIZE(debugViews));
-                ImGui::Checkbox("VB Validation Mode", &vb.validationMode);
                 ImGui::SliderFloat("VB Exposure", &vb.exposure, 0.25f, 4.0f, "%.2f");
                 ImGui::SliderFloat("VB Eye Adaptation", &vb.exposureAdaptation, 0.005f, 0.25f, "%.3f");
                 ImGui::SliderFloat("VB Bloom", &vb.bloomStrength, 0.0f, 1.0f, "%.2f");

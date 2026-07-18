@@ -41,7 +41,9 @@ public:
 
     void Render(const Scene& scene, const XMMATRIX& lightSpace,
                 ID3D12Resource* shadowResource, ID3D12Resource* depthResource,
-                bool multisampledDepth) {
+                bool multisampledDepth,
+                D3D12_CPU_DESCRIPTOR_HANDLE targetRtv = {},
+                bool hdrTarget = false) {
         if (!initialized || !g_dx12.commandList || !depthResource) return;
         UpdateFrameData(scene, lightSpace, shadowResource, depthResource,
                         multisampledDepth);
@@ -65,13 +67,17 @@ public:
         Transition(commandList, depthResource,
                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetCPUDescriptorHandle(
-            g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize, g_dx12.frameIndex);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = targetRtv.ptr
+            ? targetRtv
+            : GetCPUDescriptorHandle(g_dx12.rtvHeap.Get(),
+                g_dx12.rtvDescriptorSize, g_dx12.frameIndex);
         commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         commandList->RSSetViewports(1, &g_dx12.viewport);
         commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
-        commandList->SetPipelineState(multisampledDepth
-            ? graphicsPipelineMSAA_.Get() : graphicsPipeline_.Get());
+        commandList->SetPipelineState(hdrTarget
+            ? graphicsPipelineHDR_.Get()
+            : (multisampledDepth
+                ? graphicsPipelineMSAA_.Get() : graphicsPipeline_.Get()));
         commandList->SetGraphicsRootSignature(rootSignature_.Get());
         BindGraphicsRoots(commandList);
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -210,6 +216,10 @@ private:
         graphics.SampleDesc.Count = 1;
         if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
                 &graphics, IID_PPV_ARGS(&graphicsPipeline_)))) return false;
+        graphics.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &graphics, IID_PPV_ARGS(&graphicsPipelineHDR_)))) return false;
+        graphics.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         graphics.PS = { psMSAA->GetBufferPointer(), psMSAA->GetBufferSize() };
         return SUCCEEDED(g_dx12.device->CreateGraphicsPipelineState(
             &graphics, IID_PPV_ARGS(&graphicsPipelineMSAA_)));
@@ -406,6 +416,7 @@ private:
     ComPtr<ID3D12RootSignature> rootSignature_;
     ComPtr<ID3D12PipelineState> computePipeline_;
     ComPtr<ID3D12PipelineState> graphicsPipeline_;
+    ComPtr<ID3D12PipelineState> graphicsPipelineHDR_;
     ComPtr<ID3D12PipelineState> graphicsPipelineMSAA_;
     ComPtr<ID3D12DescriptorHeap> descriptorHeap_;
     ComPtr<ID3D12Resource> volume_;

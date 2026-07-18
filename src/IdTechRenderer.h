@@ -59,6 +59,7 @@ struct IdTechDrawItem {
     std::shared_ptr<SceneMaterial> material;
     MeshPrimitive* primitive = nullptr;
     UINT visibilityMeshID = VB_INVALID_MESH;
+    bool doubleSided = false;
 };
 
 struct FrustumPlanes {
@@ -161,20 +162,24 @@ inline void AppendOpaqueMeshDrawItems(const std::shared_ptr<SceneMesh>& mesh,
     for (MeshPrimitive& primitive : mesh->primitives) {
             const std::shared_ptr<SceneMaterial>& material = primitive.material;
             const bool transparent = material && material->baseColorFactor.w < 0.999f;
-            const bool unsupportedMaterial = material &&
-                (material->alphaCutout || material->doubleSided);
+            const bool unsupportedMaterial = material && material->alphaCutout;
             if (transparent || unsupportedMaterial || primitive.skinBuffer ||
                 primitive.vertices.empty() || primitive.vbv.BufferLocation == 0)
                 continue;
+            // Material baseColorFactor is already uploaded in VBMaterialData.
+            // Keep instance tint white or imported materials get multiplied twice.
             XMFLOAT3 color(1, 1, 1);
-            if (material) color = XMFLOAT3(material->baseColorFactor.x,
-                material->baseColorFactor.y, material->baseColorFactor.z);
             IdTechDrawItem item = {};
             item.model = model;
             item.color = color;
             item.materialId = material ? static_cast<UINT>(primitive.materialIndex + 2) : 0u;
             item.material = material;
             item.primitive = &primitive;
+            // Forward imported-mesh PSOs intentionally disable culling because
+            // FBX/glTF assets in this project mix winding conventions. Match
+            // that ownership contract in VB; otherwise Humvee/bin shells show
+            // their opposite faces and look spatially flipped.
+            item.doubleSided = true;
             items.push_back(item);
     }
 }
@@ -736,6 +741,8 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
             vb.SetVisPassMatrices(g_dx12.commandList.Get(), drawItems[i].model,
                 view, proj, lightSpace, shader, i);
             vb.SetDrawCallID(g_dx12.commandList.Get(), dcIDs[i]);
+            vb.SetVisPassDoubleSided(g_dx12.commandList.Get(),
+                drawItems[i].doubleSided);
             if (drawItems[i].primitive &&
                 drawItems[i].primitive->ibv.BufferLocation != 0) {
                 g_dx12.commandList->IASetIndexBuffer(&drawItems[i].primitive->ibv);
@@ -796,10 +803,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         scene.camera.Position, scene.cameraNear, scene.cameraFar,
         dummyLB, dummyPL);
 
-    vb.UpdateExposure(g_dx12.commandList.Get());
-    vb.PostProcess(g_dx12.commandList.Get(), useHZBOcclusion);
-    vb.CopyToBackBuffer(g_dx12.commandList.Get());
-    vb.TransitionBuffersForUpload(g_dx12.commandList.Get());
+    vb.BeginForwardExtensions(g_dx12.commandList.Get());
 }
 
 #endif // IDTECH_RENDERER_H

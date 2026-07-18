@@ -59,12 +59,13 @@ struct VBMaterialData {
     XMFLOAT4 baseColorFactor = { 1, 1, 1, 1 };
     XMFLOAT4 emissiveOcclusion = { 0, 0, 0, 0 };
     XMFLOAT4 pbrParams = { 0, 0.5f, 1, 0 };
+    XMFLOAT4 shadingParams = { 1, 0, 0.7f, 0 };
     UINT textureIndices[4] = { UINT_MAX, UINT_MAX, UINT_MAX, 0 };
 };
 
 static const UINT VB_INVALID_MESH = UINT_MAX;
 
-// Must match the compute shader's PackedVertex (two float4s)
+// Must match the compute shader's PackedVertex (two float4s).
 struct VBPackedVertex {
     XMFLOAT4 d0; // pos.xyz, normal.x
     XMFLOAT4 d1; // normal.yz, uv.xy
@@ -101,7 +102,7 @@ struct alignas(256) VBPostConstants {
     float nearPlane;
     float farPlane;
     UINT debugViewMode;
-    float padding1;
+    UINT validationMode;
 };
 
 struct alignas(256) VBExposureConstants {
@@ -123,6 +124,7 @@ public:
 
     // Lighting stays HDR until the dedicated cinematic post pass.
     ComPtr<ID3D12Resource> outputTexture;
+    ComPtr<ID3D12DescriptorHeap> outputRtvHeap;
     ComPtr<ID3D12Resource> presentTexture;
     ComPtr<ID3D12Resource> motionTexture;
     ComPtr<ID3D12Resource> historyTextures[2];
@@ -133,6 +135,7 @@ public:
     // Visibility pass PSO + root signature
     ComPtr<ID3D12RootSignature> visPassRootSig;
     ComPtr<ID3D12PipelineState> visPassPSO;
+    ComPtr<ID3D12PipelineState> visPassDoubleSidedPSO;
 
     // Compute resolve PSO + root signature
     ComPtr<ID3D12RootSignature> resolveRootSig;
@@ -175,6 +178,7 @@ public:
     std::vector<VBMeshData>     meshes;
     std::unordered_map<const MeshPrimitive*, UINT> primitiveMeshLookup;
     std::unordered_map<const SceneMaterial*, UINT> materialLookup;
+    std::unordered_map<ID3D12Resource*, UINT> materialTextureLookup;
     UINT materialCount = 1;
     UINT materialTextureCount = 0;
     UINT currentDrawCall = 0;
@@ -267,8 +271,14 @@ public:
         data.emissiveOcclusion.w = material->occlusionStrength;
         data.pbrParams = XMFLOAT4(material->metallicFactor,
             material->roughnessFactor, material->normalYSign, 1.0f);
+        data.shadingParams = XMFLOAT4(material->ambientScale,
+            material->viewFillStrength, 0.7f, 0.0f);
         auto addTexture = [&](ID3D12Resource* texture) -> UINT {
-            if (!texture || materialTextureCount >= VB_MAX_MATERIAL_TEXTURES)
+            if (!texture) return UINT_MAX;
+            auto foundTexture = materialTextureLookup.find(texture);
+            if (foundTexture != materialTextureLookup.end())
+                return foundTexture->second;
+            if (materialTextureCount >= VB_MAX_MATERIAL_TEXTURES)
                 return UINT_MAX;
             const UINT textureIndex = materialTextureCount++;
             D3D12_RESOURCE_BARRIER barrier = {};
@@ -290,6 +300,7 @@ public:
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.Texture2D.MipLevels = resource.MipLevels;
             g_dx12.device->CreateShaderResourceView(texture, &srv, handle);
+            materialTextureLookup.emplace(texture, textureIndex);
             return textureIndex;
         };
         data.textureIndices[0] = addTexture(material->baseColorTexture.Get());
@@ -530,6 +541,12 @@ public:
         cmdList->SetGraphicsRoot32BitConstant(1, drawCallID, 0);
     }
 
+    void SetVisPassDoubleSided(ID3D12GraphicsCommandList* cmdList,
+                               bool doubleSided) {
+        cmdList->SetPipelineState(doubleSided
+            ? visPassDoubleSidedPSO.Get() : visPassPSO.Get());
+    }
+
     // Set matrices for the current draw (reuses the matrix CBV at slot 0)
     void SetVisPassMatrices(ID3D12GraphicsCommandList* cmdList,
                             const XMMATRIX& model, const XMMATRIX& view,
@@ -718,6 +735,69 @@ public:
         exposureReadable = true;
     }
 
+    // Composite forward-only materials into the same linear HDR image produced
+    // by the visibility resolve. Post-processing must run after this range.
+    void BeginHDRBackground(ID3D12GraphicsCommandList* cmdList) {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = outputTexture.Get();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &barrier);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetOutputRTV();
+        cmdList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        cmdList->RSSetViewports(1, &g_dx12.viewport);
+        cmdList->RSSetScissorRects(1, &g_dx12.scissorRect);
+    }
+
+    void EndHDRBackground(ID3D12GraphicsCommandList* cmdList) {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = outputTexture.Get();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &barrier);
+    }
+
+    void BeginForwardExtensions(ID3D12GraphicsCommandList* cmdList) {
+        D3D12_RESOURCE_BARRIER barriers[2] = {};
+        barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[0].Transition.pResource = outputTexture.Get();
+        barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[1] = barriers[0];
+        barriers[1].Transition.pResource = g_dx12.depthStencilBuffer.Get();
+        barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        cmdList->ResourceBarrier(2, barriers);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetOutputRTV();
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv =
+            g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        cmdList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        cmdList->RSSetViewports(1, &g_dx12.viewport);
+        cmdList->RSSetScissorRects(1, &g_dx12.scissorRect);
+    }
+
+    void EndForwardExtensions(ID3D12GraphicsCommandList* cmdList) {
+        D3D12_RESOURCE_BARRIER barriers[2] = {};
+        barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[0].Transition.pResource = outputTexture.Get();
+        barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[1] = barriers[0];
+        barriers[1].Transition.pResource = g_dx12.depthStencilBuffer.Get();
+        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        cmdList->ResourceBarrier(2, barriers);
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE GetOutputRTV() const {
+        return outputRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    }
+
     void PostProcess(ID3D12GraphicsCommandList* cmdList, bool allowHistory) {
         const UINT historyIndex = postFrameIndex & 1u;
         D3D12_RESOURCE_BARRIER barriers[2] = {};
@@ -734,7 +814,7 @@ public:
         VBPostConstants constants = {};
         constants.outputWidth = width;
         constants.outputHeight = height;
-        constants.exposure = exposure;
+        constants.exposure = validationMode ? 1.0f : exposure;
         constants.bloomStrength = validationMode ? 0.0f : bloomStrength;
         constants.vignetteStrength = validationMode ? 0.0f : vignetteStrength;
         constants.grainStrength = validationMode ? 0.0f : grainStrength;
@@ -747,6 +827,7 @@ public:
         constants.nearPlane = currentNearPlane;
         constants.farPlane = currentFarPlane;
         constants.debugViewMode = static_cast<UINT>(debugViewMode);
+        constants.validationMode = validationMode ? 1u : 0u;
         postConstantBuffer.CopyData(g_dx12.frameIndex, constants);
 
         cmdList->SetComputeRootSignature(postRootSig.Get());
@@ -821,6 +902,7 @@ public:
         temporalHistoryValid = false;
         exposureReadable = false;
         visRtvHeap.Reset();
+        outputRtvHeap.Reset();
 
         CreateVisBufferRT();
         CreateOutputTexture();
@@ -885,7 +967,8 @@ private:
         desc.MipLevels = 1;
         desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc.SampleDesc.Count = 1;
-        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
         HRESULT hr = g_dx12.device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
@@ -896,7 +979,20 @@ private:
             return false;
         }
 
+        D3D12_DESCRIPTOR_HEAP_DESC outputHeap = {};
+        outputHeap.NumDescriptors = 1;
+        outputHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hr = g_dx12.device->CreateDescriptorHeap(
+            &outputHeap, IID_PPV_ARGS(&outputRtvHeap));
+        if (FAILED(hr)) return false;
+        D3D12_RENDER_TARGET_VIEW_DESC outputRtv = {};
+        outputRtv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        outputRtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        g_dx12.device->CreateRenderTargetView(outputTexture.Get(),
+            &outputRtv, outputRtvHeap->GetCPUDescriptorHandleForHeapStart());
+
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         hr = g_dx12.device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
@@ -1232,6 +1328,10 @@ private:
             std::cerr << "Failed to create vis pass PSO, HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
             return false;
         }
+        psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        hr = g_dx12.device->CreateGraphicsPipelineState(
+            &psoDesc, IID_PPV_ARGS(&visPassDoubleSidedPSO));
+        if (FAILED(hr)) return false;
 
         std::cout << "Visibility pass pipeline created" << std::endl;
         return true;

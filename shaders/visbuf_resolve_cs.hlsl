@@ -103,6 +103,7 @@ struct MaterialData {
     float4 baseColorFactor;
     float4 emissiveOcclusion;
     float4 pbrParams;
+    float4 shadingParams;
     uint4 textureIndices;
 };
 StructuredBuffer<MaterialData> materials : register(t7);
@@ -308,23 +309,26 @@ void ComputeUVGradients(float3 wp0, float3 wp1, float3 wp2,
 
 // ---- Point Light Calculation (matching forward shader) ----
 
-float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 viewDir) {
-    float3 lightDir = normalize(pointLights[index].position - fragPos);
-    float distance = length(pointLights[index].position - fragPos);
+float3 calculatePointLight(int index, float3 fragPos, float3 normal,
+                           float3 viewDir, float rough) {
+    float3 lightPosition = pointLights[index].position;
+    float lightRadius = pointLights[index].radius;
+    float3 lightDir = normalize(lightPosition - fragPos);
+    float distance = length(lightPosition - fragPos);
     
-    if (distance > pointLights[index].radius) return float3(0, 0, 0);
+    if (distance > lightRadius) return 0.0;
     
-    float attenuation = 1.0 / (1.0 + 0.7 * distance + 1.8 * distance * distance);
-    float fadeFactor = saturate(1.0 - distance / pointLights[index].radius);
-    fadeFactor *= fadeFactor;
-    attenuation *= fadeFactor;
+    float attenuation = 1.0 / (1.0 + (4.5 / lightRadius) * distance +
+        (75.0 / (lightRadius * lightRadius)) * distance * distance);
+    attenuation *= 1.0 - smoothstep(lightRadius * 0.75, lightRadius, distance);
     
     float diff = max(dot(normal, lightDir), 0.0);
+    float3 radiance = pointLights[index].color * pointLights[index].intensity;
     float3 halfDir = normalize(lightDir + viewDir);
-    float spec = pow(max(dot(normal, halfDir), 0.0), 32.0);
-    
-    float3 result = (diff + spec * 0.5) * pointLights[index].color * pointLights[index].intensity * attenuation;
-    return result;
+    float pointShininess = lerp(8.0, 128.0, saturate(1.0 - rough));
+    float spec = pow(max(dot(normal, halfDir), 0.0), pointShininess);
+    float3 specular = specularStrength * saturate(1.0 - rough) * spec * radiance;
+    return (diff * radiance + specular) * attenuation;
 }
 
 // ---- Main ----
@@ -361,7 +365,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     
     // Zero instance ID means no geometry was written.
     if (visValue.x == 0u) {
-        outputColor[pixel] = float4(RenderProceduralSky(pixel), 1.0);
+        // HDR sky was rasterized into outputColor before this compute pass.
+        // Preserve it instead of replacing it with a mismatched procedural sky.
         outputMotion[pixel] = 0.0;
         return;
     }
@@ -409,7 +414,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float2 texCoord = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
     float2 uvDx, uvDy;
     ComputeUVGradients(wp0, wp1, wp2, uv0, uv1, uv2, uvDx, uvDy);
-    
+
     // Material
     MaterialData material = materials[min(dc.materialID, 255u)];
     float3 albedo = dc.objectColor * material.baseColorFactor.rgb;
@@ -417,14 +422,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float rough = material.pbrParams.w > 0.5 ? material.pbrParams.y : dc.roughness;
     float materialAO = 1.0;
     if (material.textureIndices.x < 64u) {
-        albedo *= materialTextures[material.textureIndices.x].SampleGrad(
+        float3 authoredAlbedo = materialTextures[material.textureIndices.x].SampleGrad(
             texSampler, texCoord, uvDx, uvDy).rgb;
+        albedo *= pow(max(authoredAlbedo, 0.0), 2.2);
     }
     if (material.textureIndices.z < 64u) {
         float4 mr = materialTextures[material.textureIndices.z].SampleGrad(
             texSampler, texCoord, uvDx, uvDy);
         materialAO = lerp(1.0, mr.r, saturate(material.emissiveOcclusion.w));
-        if (material.textureIndices.w != 0u) rough *= mr.r;
+        if (material.textureIndices.w != 0u) rough = max(rough, mr.g);
         else { rough *= mr.g; metal *= mr.b; }
     }
     metal = saturate(metal);
@@ -434,6 +440,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         float3 tangentNormal = materialTextures[material.textureIndices.y].SampleGrad(
             texSampler, texCoord, uvDx, uvDy).xyz * 2.0 - 1.0;
         tangentNormal.y *= material.pbrParams.z;
+        float tangentLength = saturate(length(tangentNormal));
+        tangentNormal.xy *= tangentLength;
+        tangentNormal.z = sqrt(saturate(1.0 - dot(tangentNormal.xy,
+                                                  tangentNormal.xy)));
         float3 edge1 = wp1 - wp0;
         float3 edge2 = wp2 - wp0;
         float2 deltaUV1 = uv1 - uv0;
@@ -443,9 +453,13 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
             float3 tangent = normalize((edge1 * deltaUV2.y - edge2 * deltaUV1.y) / uvDet);
             tangent = normalize(tangent - normal * dot(normal, tangent));
             float3 bitangent = normalize(cross(normal, tangent));
-            normal = normalize(tangentNormal.x * tangent +
-                               tangentNormal.y * bitangent +
-                               tangentNormal.z * normal);
+            float3 mappedNormal = normalize(tangentNormal.x * tangent +
+                                            tangentNormal.y * bitangent +
+                                            tangentNormal.z * normal);
+            float grazingFade = saturate(abs(dot(normal,
+                normalize(cameraPos - fragPos))) * 2.0);
+            normal = normalize(lerp(normal, mappedNormal,
+                material.shadingParams.z * grazingFade));
         }
     }
     
@@ -497,12 +511,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 kD = float3(1.0, 1.0, 1.0) - kS;
     kD *= 1.0 - metal;
 
-    float ambientOcclusion = ScreenSpaceAO(pixel, fragPos, normal) * materialAO;
-    float3 diffuseIBL = SampleSkyIrradiance(normal) * albedo * kD / 3.14159265;
+    float ambientOcclusion = materialAO;
+    float3 diffuseAlbedo = albedo * (1.0 - metal);
+    float ambientScale = material.shadingParams.x;
+    float3 diffuseIBL = SampleSkyIrradiance(normal) * diffuseAlbedo * ambientScale;
     float3 reflectionIBL = SampleReflectionProbe(reflect(-V, normal), rough);
-    float3 specularIBL = reflectionIBL * F * (1.0 - rough * 0.65);
+    float3 envFresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
+    float reflectionStrength = saturate((1.0 - rough * 0.75) *
+        (0.10 + metal * 1.15));
+    float3 metalTint = lerp(1.0.xxx, albedo, metal * 0.45);
+    float3 specularIBL = reflectionIBL * envFresnel *
+        reflectionStrength * metalTint;
     result += (diffuseIBL + specularIBL) * ambientOcclusion;
-    result += ambientStrength * albedo * ambientOcclusion;
+    result += ambientStrength * diffuseAlbedo * ambientScale * ambientOcclusion;
     result += material.emissiveOcclusion.rgb;
     
     float3 numerator = NDF * G * F;
@@ -510,6 +531,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 specular = numerator / denominator;
     
     float shadowVisibility = CalculateShadow(fragPos, normal, L);
+    result *= lerp(0.28, 1.0, shadowVisibility);
+    float frontFill = 0.35 + 0.65 * saturate(dot(normal, viewDir));
+    result += diffuseAlbedo * material.shadingParams.y * frontFill;
     float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor *
                 NdotL * atten * shadowVisibility;
     result += Lo;
@@ -525,7 +549,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     for (uint listIndex = 0; listIndex < min(cluster.lightCount, 32u); ++listIndex) {
         uint lightIndex = cluster.lightIndices[listIndex];
         if (lightIndex < (uint)numPointLights && lightIndex < 64u)
-            result += calculatePointLight(lightIndex, fragPos, normal, viewDir) * albedo;
+            result += calculatePointLight(lightIndex, fragPos, normal,
+                                          viewDir, rough) * albedo;
     }
     
     outputColor[pixel] = float4(result, 1.0);

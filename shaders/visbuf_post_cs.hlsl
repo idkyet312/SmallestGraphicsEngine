@@ -23,7 +23,7 @@ cbuffer PostConstants : register(b0) {
     float nearPlane;
     float farPlane;
     uint debugViewMode;
-    float postPadding;
+    uint validationMode;
 };
 
 float Luminance(float3 color) { return dot(color, float3(0.2126, 0.7152, 0.0722)); }
@@ -56,9 +56,17 @@ float3 TonemapAgX(float3 color) {
     color = (clamp(log2(color), minEv, maxEv) - minEv) / (maxEv - minEv);
     color = AgXContrast(color);
     float luma = Luminance(color);
-    color = pow(saturate(color), 1.25);
-    color = luma + 1.25 * (color - luma);
+    // Match clustered_dx12_ps.hlsl exactly. Validation mode must compare
+    // renderer ownership/lighting, not two different display transforms.
+    color = pow(saturate(color), 1.35);
+    color = luma + 1.4 * (color - luma);
     return saturate(mul(agxOut, color));
+}
+
+float3 TonemapSkyACES(float3 color) {
+    color = saturate((color * (2.51 * color + 0.03)) /
+                     (color * (2.43 * color + 0.59) + 0.14));
+    return pow(color, 1.0 / 2.2);
 }
 
 float3 Bloom(uint2 pixel) {
@@ -165,14 +173,24 @@ void main(uint3 threadID : SV_DispatchThreadID) {
     }
     float3 hdr = TemporalResolve(pixel, CinematicInput(pixel));
     historyOutput[pixel] = float4(hdr, 1.0);
-    float autoExposure = exposureState.Load(8) / 65536.0;
+    float autoExposure = 1.0;
+    if (validationMode == 0u)
+        autoExposure = exposureState.Load(8) / 65536.0;
     if (autoExposure <= 0.0) autoExposure = 1.0;
-    float3 color = TonemapAgX((hdr + Bloom(pixel) * bloomStrength)
-                              * exposure * autoExposure);
+    // Forward sky uses ACES + display gamma. The VB background is stored as
+    // linear HDR, so reproduce that exact transform for parity captures.
+    float rawDepth = sceneDepth.Load(int3(pixel, 0));
+    bool validationSky = validationMode != 0u && rawDepth >= 0.9999;
+    float3 color = validationSky
+        ? TonemapSkyACES(hdr)
+        : TonemapAgX((hdr + Bloom(pixel) * bloomStrength)
+                     * exposure * autoExposure);
     float lutScale = 15.0 / 16.0;
     float lutOffset = 0.5 / 16.0;
-    color = colorLUT.SampleLevel(lutSampler,
-        saturate(color) * lutScale + lutOffset, 0).rgb;
+    if (validationMode == 0u) {
+        color = colorLUT.SampleLevel(lutSampler,
+            saturate(color) * lutScale + lutOffset, 0).rgb;
+    }
     float2 uv = (float2(pixel) + 0.5) / float2(outputSize);
     float2 centered = uv * 2.0 - 1.0;
     float vignette = smoothstep(1.35, 0.35, dot(centered, centered));
