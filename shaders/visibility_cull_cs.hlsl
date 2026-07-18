@@ -15,9 +15,16 @@ struct CullInput {
     uint2 vertexBufferAddress;
     uint vertexBufferSize;
     uint vertexStride;
+    uint2 indexBufferAddress;
+    uint indexBufferSize;
+    uint indexFormat;
     uint2 matrixCBV;
     uint drawCallID;
-    uint4 drawArguments;
+    uint indexCountPerInstance;
+    uint instanceCount;
+    uint startIndexLocation;
+    int baseVertexLocation;
+    uint startInstanceLocation;
     float4 worldBounds;
 };
 
@@ -69,14 +76,20 @@ bool Occluded(float3 center, float radius) {
 }
 
 void WriteCommand(uint outputIndex, CullInput command) {
-    // D3D12 command layout: VBV(16), root CBV(8), root constant(4), DRAW(16).
-    uint address = outputIndex * 44u;
+    // D3D12 command layout: VBV(16), IBV(16), root CBV(8), constant(4), DRAW_INDEXED(20).
+    uint address = outputIndex * 64u;
     visibleCommands.Store2(address + 0u, command.vertexBufferAddress);
     visibleCommands.Store(address + 8u, command.vertexBufferSize);
     visibleCommands.Store(address + 12u, command.vertexStride);
-    visibleCommands.Store2(address + 16u, command.matrixCBV);
-    visibleCommands.Store(address + 24u, command.drawCallID);
-    visibleCommands.Store4(address + 28u, command.drawArguments);
+    visibleCommands.Store2(address + 16u, command.indexBufferAddress);
+    visibleCommands.Store(address + 24u, command.indexBufferSize);
+    visibleCommands.Store(address + 28u, command.indexFormat);
+    visibleCommands.Store2(address + 32u, command.matrixCBV);
+    visibleCommands.Store(address + 40u, command.drawCallID);
+    visibleCommands.Store4(address + 44u, uint4(command.indexCountPerInstance,
+        command.instanceCount, command.startIndexLocation,
+        asuint(command.baseVertexLocation)));
+    visibleCommands.Store(address + 60u, command.startInstanceLocation);
 }
 
 [numthreads(64, 1, 1)]
