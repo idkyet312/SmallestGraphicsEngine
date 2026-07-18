@@ -171,6 +171,8 @@ public:
         data.view = XMMatrixIdentity();
         data.projection = XMMatrixIdentity();
         data.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
+        data.modelView = data.model;
+        data.modelViewProjection = XMMatrixTranspose(model * lightSpace);
         matrixBuffer.CopyData(index, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(0, matrixBuffer.GetGPUAddress(index));
         const UINT disabled = 0;

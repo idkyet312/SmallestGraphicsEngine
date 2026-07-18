@@ -15,7 +15,11 @@ struct alignas(256) MatrixBufferDX12 {
     XMMATRIX view;
     XMMATRIX projection;
     XMMATRIX lightSpaceMatrix;
+    XMMATRIX modelView;
+    XMMATRIX modelViewProjection;
 };
+
+inline float g_currentModelMaxScale = 1.0f;
 
 struct alignas(256) LightBufferDX12 {
     XMFLOAT3 lightPos;
@@ -117,6 +121,7 @@ struct alignas(256) MeshDrawBufferDX12 {
     UINT screenHeight;
     UINT skinningEnabled; // 0 static draw, 1 apply bone palette (t12) + skin (t13)
     UINT occlusionMipCount;
+    float modelMaxScale;
 };
 
 // Upload buffer helper
@@ -828,6 +833,13 @@ public:
         data.view = XMMatrixTranspose(view);
         data.projection = XMMatrixTranspose(proj);
         data.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
+        const XMMATRIX modelView = model * view;
+        data.modelView = XMMatrixTranspose(modelView);
+        data.modelViewProjection = XMMatrixTranspose(modelView * proj);
+        g_currentModelMaxScale = (std::max)({
+            XMVectorGetX(XMVector3Length(model.r[0])),
+            XMVectorGetX(XMVector3Length(model.r[1])),
+            XMVectorGetX(XMVector3Length(model.r[2])) });
         matrixBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(0, matrixBuffer.GetGPUAddress(bufferIndex));
         // Per-frame CBVs (b1/b2/b4/b5/b7) are bound once in Use() -- the only

@@ -3,6 +3,8 @@ cbuffer MatrixBuffer : register(b0) {
     matrix view;
     matrix projection;
     matrix lightSpaceMatrix;
+    matrix modelView;
+    matrix modelViewProjection;
 };
 
 cbuffer MeshDrawBuffer : register(b6) {
@@ -16,6 +18,7 @@ cbuffer MeshDrawBuffer : register(b6) {
     uint screenHeight;
     uint skinningEnabled;   // skinned meshlet bounds are bind-pose -> skip cull
     uint occlusionMipCount;
+    float modelMaxScale;
 };
 
 cbuffer CameraBuffer : register(b2) {
@@ -42,12 +45,8 @@ groupshared MeshPayload payloadData;
 groupshared uint visibleCount;
 
 bool IntersectsFrustum(MeshletBounds bounds) {
-    float4 worldCenter = mul(float4(bounds.sphereCenter, 1), model);
-    float4 clipCenter = mul(mul(worldCenter, view), projection);
-    float3 sx = float3(model[0][0], model[0][1], model[0][2]);
-    float3 sy = float3(model[1][0], model[1][1], model[1][2]);
-    float3 sz = float3(model[2][0], model[2][1], model[2][2]);
-    float radius = bounds.sphereRadius * max(length(sx), max(length(sy), length(sz)));
+    float4 clipCenter = mul(float4(bounds.sphereCenter, 1), modelViewProjection);
+    float radius = bounds.sphereRadius * modelMaxScale;
     float radiusX = radius * abs(projection[0][0]);
     float radiusY = radius * abs(projection[1][1]);
     // Inflate depth radius because perspective changes both clip z and w.
@@ -65,24 +64,17 @@ bool IsBackfacing(MeshletBounds bounds) {
     float3 worldCenter = mul(float4(bounds.sphereCenter, 1), model).xyz;
     float3 axis = normalize(mul(bounds.coneAxis, (float3x3)model));
     float3 toCenter = worldCenter - viewPos;
-    float3 sx = float3(model[0][0], model[0][1], model[0][2]);
-    float3 sy = float3(model[1][0], model[1][1], model[1][2]);
-    float3 sz = float3(model[2][0], model[2][1], model[2][2]);
-    float radiusScale = max(length(sx), max(length(sy), length(sz)));
     return dot(toCenter, axis) >=
-           bounds.coneCutoff * length(toCenter) + bounds.sphereRadius * radiusScale;
+           bounds.coneCutoff * length(toCenter) + bounds.sphereRadius * modelMaxScale;
 }
 
 bool IsOccluded(MeshletBounds bounds) {
     if (!occlusionEnabled) return false;
-    float4 worldCenter = mul(float4(bounds.sphereCenter, 1), model);
-    float4 viewCenter = mul(worldCenter, view);
-    float4 clip = mul(viewCenter, projection);
+    float4 localCenter = float4(bounds.sphereCenter, 1);
+    float4 viewCenter = mul(localCenter, modelView);
+    float4 clip = mul(localCenter, modelViewProjection);
     if (clip.w <= 0.001) return false;
-    float3 sx = float3(model[0][0], model[0][1], model[0][2]);
-    float3 sy = float3(model[1][0], model[1][1], model[1][2]);
-    float3 sz = float3(model[2][0], model[2][1], model[2][2]);
-    float radius = bounds.sphereRadius * max(length(sx), max(length(sy), length(sz)));
+    float radius = bounds.sphereRadius * modelMaxScale;
     float2 centerUV = (clip.xy / clip.w) * float2(0.5, -0.5) + 0.5;
     float2 radiusUV = radius * float2(abs(projection[0][0]), abs(projection[1][1])) /
                       clip.w * 0.5;
