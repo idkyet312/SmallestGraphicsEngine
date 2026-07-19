@@ -15,19 +15,20 @@ struct FogPointLight
 cbuffer FogConstants : register(b0)
 {
     float4x4 inverseViewProjection;
-    float4x4 lightSpace;
+    float4x4 shadowCascadeMatrices[3];
     float4 cameraPositionNear;
     float4 cameraForwardFar;
     float4 sunDirectionDensity;
     float4 sunColorAnisotropy;
     float4 fogParams;             // height falloff, base height, max distance, shadow enabled
     float4 ambientFogColor;
+    float4 shadowCascadeSplits;
     uint4 clusterDimsLightCount;  // x, y, z, source light count
 };
 
 StructuredBuffer<FogCluster> clusters : register(t0);
 StructuredBuffer<FogPointLight> pointLights : register(t1);
-Texture2D<float> shadowMap : register(t2);
+Texture2DArray<float> shadowMap : register(t2);
 Texture2D<float> sceneDepth : register(t3);
 Texture3D<float4> fogVolume : register(t4);
 Texture2DMS<float, 4> sceneDepthMS : register(t5);
@@ -55,12 +56,18 @@ float SunVisibility(float3 worldPosition)
 {
     if (fogParams.w < 0.5)
         return 1.0;
-    float4 projected = mul(float4(worldPosition, 1.0), lightSpace);
+    float viewDepth = dot(worldPosition - cameraPositionNear.xyz,
+                          normalize(cameraForwardFar.xyz));
+    uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
+                   (viewDepth < shadowCascadeSplits.y ? 1u : 2u);
+    float4 projected = mul(float4(worldPosition, 1.0),
+                           shadowCascadeMatrices[cascade]);
     projected.xyz /= max(abs(projected.w), 1e-5);
     float2 uv = projected.xy * float2(0.5, -0.5) + 0.5;
     if (any(uv < 0.0) || any(uv > 1.0) || projected.z <= 0.0 || projected.z >= 1.0)
         return 1.0;
-    return shadowMap.SampleCmpLevelZero(shadowSampler, uv, projected.z - 0.0025);
+    return shadowMap.SampleCmpLevelZero(
+        shadowSampler, float3(uv, cascade), projected.z - 0.0025);
 }
 
 float HenyeyGreenstein(float cosineTheta, float g)

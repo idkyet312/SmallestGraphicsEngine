@@ -9,6 +9,12 @@
 #include <cstdio>
 #include <array>
 
+inline constexpr UINT SHADOW_CASCADE_COUNT = 3;
+inline std::array<XMMATRIX, SHADOW_CASCADE_COUNT> g_shadowCascadeMatrices = {
+    XMMatrixIdentity(), XMMatrixIdentity(), XMMatrixIdentity()
+};
+inline XMFLOAT4 g_shadowCascadeSplits = { 18.0f, 55.0f, 180.0f, 0.0f };
+
 // Constant buffer structures (must be 256-byte aligned for DX12)
 struct alignas(256) MatrixBufferDX12 {
     XMMATRIX model;
@@ -125,6 +131,11 @@ struct alignas(256) MeshDrawBufferDX12 {
     float modelMaxScale;
     UINT instanceCount;
     UINT instancingEnabled;
+};
+
+struct alignas(256) ShadowCascadeBufferDX12 {
+    XMMATRIX lightViewProjection[SHADOW_CASCADE_COUNT];
+    XMFLOAT4 splitDepths;
 };
 
 // Transforms consumed directly by the amplification and mesh shaders. Unlike a
@@ -247,6 +258,7 @@ public:
     UploadBuffer<PointLightsBufferDX12> pointLightsBuffer;
     UploadBuffer<DDGIBufferDX12> ddgiBuffer;
     UploadBuffer<SHBufferDX12> shBuffer;
+    UploadBuffer<ShadowCascadeBufferDX12> shadowCascadeBuffer;
     std::array<XMFLOAT3, 9> pendingSHCoeffs{};
     float pendingSkyIntensity = 1.0f;
     bool skyIrradianceValid = false;
@@ -412,7 +424,7 @@ public:
         // 6: Descriptor table - Global SRVs (t0, t2, t3)
         // 7: Descriptor table - Material SRVs (t1, t4, t5)
         
-        D3D12_ROOT_PARAMETER rootParams[19] = {};
+        D3D12_ROOT_PARAMETER rootParams[20] = {};
         
         // CBVs (root descriptors)
         for (int i = 0; i < 6; i++) {
@@ -537,6 +549,11 @@ public:
         rootParams[18].Descriptor.RegisterSpace = 0;
         rootParams[18].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+        rootParams[19].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        rootParams[19].Descriptor.ShaderRegister = 8;
+        rootParams[19].Descriptor.RegisterSpace = 0;
+        rootParams[19].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
         // Static samplers
         D3D12_STATIC_SAMPLER_DESC staticSamplers[2] = {};
         
@@ -568,7 +585,7 @@ public:
         staticSamplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        rootSigDesc.NumParameters = 19;
+        rootSigDesc.NumParameters = 20;
         rootSigDesc.pParameters = rootParams;
         rootSigDesc.NumStaticSamplers = 2;
         rootSigDesc.pStaticSamplers = staticSamplers;
@@ -786,6 +803,7 @@ public:
         if (!pointLightsBuffer.Create(FRAME_COUNT)) return false;
         if (!ddgiBuffer.Create(FRAME_COUNT)) return false;
         if (!shBuffer.Create(FRAME_COUNT)) return false;
+        if (!shadowCascadeBuffer.Create(FRAME_COUNT)) return false;
         
         loaded = true;
         if (!msaaSupported) {
@@ -864,6 +882,8 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
         g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
         g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(g_dx12.frameIndex));
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(19,
+            shadowCascadeBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
 
     void UseTransparent() {
@@ -888,10 +908,11 @@ public:
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
 
         D3D12_SHADER_RESOURCE_VIEW_DESC shadowDesc = {};
-        shadowDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        shadowDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         shadowDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         shadowDesc.Format = DXGI_FORMAT_R32_FLOAT;
-        shadowDesc.Texture2D.MipLevels = 1;
+        shadowDesc.Texture2DArray.MipLevels = 1;
+        shadowDesc.Texture2DArray.ArraySize = SHADOW_CASCADE_COUNT;
         g_dx12.device->CreateShaderResourceView(shadowMap, &shadowDesc, cpuHandle);
         cpuHandle.ptr += descriptorSize;
 
@@ -986,6 +1007,13 @@ public:
         data.shadowTexelSize = shadowTexelSize;
         lightBuffer.CopyData(g_dx12.frameIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(1, lightBuffer.GetGPUAddress(g_dx12.frameIndex));
+        ShadowCascadeBufferDX12 cascades = {};
+        for (UINT i = 0; i < SHADOW_CASCADE_COUNT; ++i)
+            cascades.lightViewProjection[i] = XMMatrixTranspose(g_shadowCascadeMatrices[i]);
+        cascades.splitDepths = g_shadowCascadeSplits;
+        shadowCascadeBuffer.CopyData(g_dx12.frameIndex, cascades);
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(19,
+            shadowCascadeBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
     
     void SetCamera(const XMFLOAT3& pos) {

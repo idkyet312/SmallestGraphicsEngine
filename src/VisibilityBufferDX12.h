@@ -77,8 +77,9 @@ struct alignas(256) VBFrameConstants {
     XMMATRIX viewMatrix;
     XMMATRIX projMatrix;
     XMMATRIX invViewProj;
-    XMMATRIX lightViewProj;
+    XMMATRIX shadowCascadeMatrices[SHADOW_CASCADE_COUNT];
     XMMATRIX previousViewProj;
+    XMFLOAT4 shadowCascadeSplits;
     XMFLOAT3 cameraPos;
     float    screenWidth;
     float    screenHeight;
@@ -86,6 +87,7 @@ struct alignas(256) VBFrameConstants {
     float    farPlane;
     UINT     debugViewMode;
     UINT     enableMotionVectors;
+    UINT     padding[3];
 };
 
 struct alignas(256) VBPostConstants {
@@ -691,8 +693,10 @@ public:
         fc.projMatrix = XMMatrixTranspose(proj);
         XMMATRIX invVP = XMMatrixInverse(nullptr, view * proj);
         fc.invViewProj = XMMatrixTranspose(invVP);
-        fc.lightViewProj = XMMatrixTranspose(lightViewProj);
+        for (UINT i = 0; i < SHADOW_CASCADE_COUNT; ++i)
+            fc.shadowCascadeMatrices[i] = XMMatrixTranspose(g_shadowCascadeMatrices[i]);
         fc.previousViewProj = XMMatrixTranspose(previousViewProj);
+        fc.shadowCascadeSplits = g_shadowCascadeSplits;
         fc.cameraPos = cameraPos;
         fc.screenWidth = (float)width;
         fc.screenHeight = (float)height;
@@ -1670,9 +1674,10 @@ private:
         {
             D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
             srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
-            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
             srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srvDesc.Texture2D.MipLevels = 1;
+            srvDesc.Texture2DArray.MipLevels = 1;
+            srvDesc.Texture2DArray.ArraySize = SHADOW_CASCADE_COUNT;
             g_dx12.device->CreateShaderResourceView(nullptr, &srvDesc, cpuHandle);
             cpuHandle.ptr += descSize;
         }
@@ -2076,9 +2081,10 @@ public:
 
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
         srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
-        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srvDesc.Texture2D.MipLevels = 1;
+        srvDesc.Texture2DArray.MipLevels = 1;
+        srvDesc.Texture2DArray.ArraySize = SHADOW_CASCADE_COUNT;
 
         if (shadowMapResource) {
             g_dx12.device->CreateShaderResourceView(shadowMapResource, &srvDesc, cpuHandle);
