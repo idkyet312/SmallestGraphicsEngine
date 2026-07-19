@@ -63,6 +63,7 @@ struct IdTechDrawItem {
     bool doubleSided = false;
     bool alphaCutout = false;
     bool alphaFromLuminance = false;
+    XMFLOAT4 palmWindRoot{};
 };
 
 struct FrustumPlanes {
@@ -142,8 +143,10 @@ inline XMFLOAT4 ComputeDrawItemBounds(const IdTechDrawItem& item) {
         const float sx = XMVectorGetX(XMVector3Length(XMVectorSet(m._11, m._12, m._13, 0)));
         const float sy = XMVectorGetX(XMVector3Length(XMVectorSet(m._21, m._22, m._23, 0)));
         const float sz = XMVectorGetX(XMVector3Length(XMVectorSet(m._31, m._32, m._33, 0)));
-        const float radius = sqrtf(extent.x * extent.x + extent.y * extent.y +
+        float radius = sqrtf(extent.x * extent.x + extent.y * extent.y +
             extent.z * extent.z) * (std::max)(sx, (std::max)(sy, sz));
+        if (item.palmWindRoot.z > 0.5f) radius += 3.0f *
+            (std::max)(sx, (std::max)(sy, sz));
         return XMFLOAT4(worldCenter.x, worldCenter.y, worldCenter.z, radius);
     }
     XMFLOAT3 center = TransformPoint(item.model, XMFLOAT3(0, 0, 0));
@@ -160,7 +163,8 @@ inline XMFLOAT4 ComputeDrawItemBounds(const IdTechDrawItem& item) {
 }
 
 inline void AppendOpaquePrimitiveDrawItem(MeshPrimitive& primitive,
-    const XMMATRIX& model, std::vector<IdTechDrawItem>& items) {
+    const XMMATRIX& model, std::vector<IdTechDrawItem>& items,
+    XMFLOAT4 palmWindRoot = {}) {
     const std::shared_ptr<SceneMaterial>& material = primitive.material;
     const bool transparent = material && material->baseColorFactor.w < 0.999f;
     // Alpha-tested cards need their material texture bound per draw. Keep them
@@ -188,14 +192,22 @@ inline void AppendOpaquePrimitiveDrawItem(MeshPrimitive& primitive,
     item.alphaCutout = material && material->alphaCutout &&
         material->baseColorTexture != nullptr;
     item.alphaFromLuminance = material && material->alphaFromLuminance;
+    item.palmWindRoot = palmWindRoot;
+    if (palmWindRoot.z > 0.5f) {
+        const int rootX = static_cast<int>(palmWindRoot.x * 100.0f);
+        const int rootZ = static_cast<int>(palmWindRoot.y * 100.0f);
+        item.instanceKey ^= static_cast<uint64_t>(static_cast<uint32_t>(rootX));
+        item.instanceKey ^= static_cast<uint64_t>(static_cast<uint32_t>(rootZ)) << 32;
+    }
     items.push_back(item);
 }
 
 inline void AppendOpaqueMeshDrawItems(const std::shared_ptr<SceneMesh>& mesh,
-    const XMMATRIX& model, std::vector<IdTechDrawItem>& items) {
+    const XMMATRIX& model, std::vector<IdTechDrawItem>& items,
+    XMFLOAT4 palmWindRoot = {}) {
     if (!mesh) return;
     for (MeshPrimitive& primitive : mesh->primitives)
-        AppendOpaquePrimitiveDrawItem(primitive, model, items);
+        AppendOpaquePrimitiveDrawItem(primitive, model, items, palmWindRoot);
 }
 
 struct FlattenedOpaquePacket {
@@ -288,7 +300,7 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items
                      tree.segment < static_cast<int>(PalmModel::TrunkSlices().size()))
                 slice = PalmModel::TrunkSlices()[tree.segment].mesh;
             if (slice) AppendOpaqueMeshDrawItems(slice,
-                XMLoadFloat4x4(&tree.transform), items);
+                XMLoadFloat4x4(&tree.transform), items, tree.palmWindRoot);
             else items.push_back({ XMLoadFloat4x4(&tree.transform), tree.color,
                 true, MAT_CUBE, false });
         }
@@ -675,6 +687,13 @@ inline void FillFrameMatrixBufferForIndirect(ShaderDX12& matrixShader,
     data.view = XMMatrixTranspose(view);
     data.projection = XMMatrixTranspose(proj);
     data.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
+    data.palmWind = matrixShader.palmWindFrame.wind;
+    data.palmPrimary = matrixShader.palmWindFrame.primary;
+    data.palmSecondary = matrixShader.palmWindFrame.secondary;
+    data.palmPreviousPrimary = matrixShader.palmWindFrame.previousPrimary;
+    data.palmPreviousSecondary = matrixShader.palmWindFrame.previousSecondary;
+    data.palmParams = matrixShader.palmWindFrame.params;
+    data.palmRoot = {};
     matrixShader.matrixBuffer.CopyData(bufferIndex, data);
 
     outCBV = matrixShader.matrixBuffer.GetGPUAddress(bufferIndex);
@@ -720,6 +739,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         planeMesh = vb.RegisterMesh(packed.planeFloats.data(),
             (UINT)(packed.planeFloats.size() / 8), nullptr, 0);
 
+    vb.SetPalmWindFrame(g_trees.GetWindFrame());
     vb.BeginFrame();
     for (UINT clusterIndex = 0;
          clusterIndex < (UINT)scene.clusteredRenderer.clusters.size();
@@ -746,7 +766,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         const UINT flags = item.doubleSided ? 1u : 0u;
         UINT dc = vb.RegisterInstance(item.visibilityMeshID,
             item.model, item.color, 0.0f, 0.5f, materialID, flags,
-            item.instanceKey);
+            item.instanceKey, item.palmWindRoot);
         if (dc == UINT_MAX) continue;
         item.materialId = materialID;
         registeredItems.push_back(item);

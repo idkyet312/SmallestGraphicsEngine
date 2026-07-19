@@ -20,7 +20,15 @@ cbuffer FrameConstants : register(b0) {
     uint   debugViewMode;
     uint   enableMotionVectors;
     uint3  framePadding;
+    float4 palmWind;
+    float4 palmPrimary;
+    float4 palmSecondary;
+    float4 palmPreviousPrimary;
+    float4 palmPreviousSecondary;
+    float4 palmParams;
 };
+
+#include "palm_wind.hlsli"
 
 cbuffer LightBuffer : register(b1) {
     float3 lightPos;
@@ -68,6 +76,7 @@ struct DrawCallData {
     uint     indexCount;
     uint     hasIndices;    // 1 if indexed, 0 if non-indexed
     uint     flags;         // bit 0: double-sided/mixed winding
+    float4   palmWindRoot;
 };
 
 // ---- Vertex data stored as float4 pairs ----
@@ -518,6 +527,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 n0, n1, n2;
     float2 uv0, uv1, uv2;
     GetTriangleVertices(dc, triangleID, p0, p1, p2, n0, n1, n2, uv0, uv1, uv2);
+    const float3 originalP0 = p0;
+    const float3 originalP1 = p1;
+    const float3 originalP2 = p2;
+
+    float3 tangentDummy = float3(1.0, 0.0, 0.0);
+    ApplyPalmWind(p0, n0, tangentDummy, dc.palmWindRoot, palmWind,
+                  palmPrimary, palmSecondary, palmParams);
+    tangentDummy = float3(1.0, 0.0, 0.0);
+    ApplyPalmWind(p1, n1, tangentDummy, dc.palmWindRoot, palmWind,
+                  palmPrimary, palmSecondary, palmParams);
+    tangentDummy = float3(1.0, 0.0, 0.0);
+    ApplyPalmWind(p2, n2, tangentDummy, dc.palmWindRoot, palmWind,
+                  palmPrimary, palmSecondary, palmParams);
     
     // Transform to world space
     float3 wp0 = mul(float4(p0, 1.0), dc.modelMatrix).xyz;
@@ -534,8 +556,21 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // Interpolate attributes
     float3 fragPos = bary.x * wp0 + bary.y * wp1 + bary.z * wp2;
     if (enableMotionVectors != 0u) {
-        float3 localPos = bary.x * p0 + bary.y * p1 + bary.z * p2;
-        float3 previousWorldPos = mul(float4(localPos, 1.0), dc.previousModelMatrix).xyz;
+        float4 previousWind = palmWind;
+        previousWind.x = palmWind.y;
+        float3 previousP0 = ApplyPalmWindPosition(
+            originalP0, dc.palmWindRoot,
+            previousWind, palmPreviousPrimary, palmPreviousSecondary, palmParams);
+        float3 previousP1 = ApplyPalmWindPosition(
+            originalP1, dc.palmWindRoot,
+            previousWind, palmPreviousPrimary, palmPreviousSecondary, palmParams);
+        float3 previousP2 = ApplyPalmWindPosition(
+            originalP2, dc.palmWindRoot,
+            previousWind, palmPreviousPrimary, palmPreviousSecondary, palmParams);
+        float3 previousLocalPos = bary.x * previousP0 +
+            bary.y * previousP1 + bary.z * previousP2;
+        float3 previousWorldPos = mul(
+            float4(previousLocalPos, 1.0), dc.previousModelMatrix).xyz;
         float4 previousClip = mul(float4(previousWorldPos, 1.0), previousViewProj);
         float2 currentUV = (float2(pixel) + 0.5) / float2(screenWidth, screenHeight);
         float2 previousUV = currentUV;

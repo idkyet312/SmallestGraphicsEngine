@@ -145,7 +145,7 @@ struct Scene {
     std::vector<Projectile> projectiles;
     std::vector<ImpactParticle> impactParticles;  // impact smoke puffs
     std::vector<ExplosionFX> explosionFX;         // animated explosion flipbooks
-    std::function<void(const XMFLOAT3&, float)> explosionAudioCallback;
+    std::function<void(const XMFLOAT3&, float, bool)> explosionAudioCallback;
     std::vector<ExplosiveBarrel> explosiveBarrels;
     float projectileSpeed    = 300.0f;
     float projectileLifetime = 3.0f;
@@ -463,13 +463,14 @@ struct Scene {
 
     // Kick off one animated explosion flipbook centred on `center`.
     // `size` is the billboard's full-bloom world diameter.
-    void SpawnExplosionFX(const XMFLOAT3& center, float size, float duration = 0.9f) {
+    void SpawnExplosionFX(const XMFLOAT3& center, float size,
+                          float duration = 0.9f, bool grenade = false) {
         ExplosionFX fx;
         fx.position = center;
         fx.size = size;
         fx.duration = duration;
         explosionFX.push_back(fx);
-        if (explosionAudioCallback) explosionAudioCallback(center, size);
+        if (explosionAudioCallback) explosionAudioCallback(center, size, grenade);
 
         SpawnSmokeBurst(center, size * 0.18f, 1.35f);
         auto randomSigned = []() {

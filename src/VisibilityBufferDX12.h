@@ -40,6 +40,7 @@ struct VBDrawCallData {
     UINT       indexCount;
     UINT       hasIndices;
     UINT       flags;
+    XMFLOAT4   palmWindRoot;
 };
 
 struct VBMeshData {
@@ -88,6 +89,12 @@ struct alignas(256) VBFrameConstants {
     UINT     debugViewMode;
     UINT     enableMotionVectors;
     UINT     padding[3];
+    XMFLOAT4 palmWind;
+    XMFLOAT4 palmPrimary;
+    XMFLOAT4 palmSecondary;
+    XMFLOAT4 palmPreviousPrimary;
+    XMFLOAT4 palmPreviousSecondary;
+    XMFLOAT4 palmParams;
 };
 
 struct alignas(256) VBPostConstants {
@@ -210,6 +217,7 @@ public:
     bool exposureReadable = false;
     float exposureAdaptation = 0.05f;
     float motionBlurStrength = 0.0f;
+    PalmWindFrameDX12 palmWindFrame{};
     float focusDistance = 8.0f;
     float aperture = 0.0f;
     float currentNearPlane = 0.1f;
@@ -415,7 +423,8 @@ public:
     UINT RegisterInstance(UINT meshID, const XMMATRIX& modelMatrix,
                           const XMFLOAT3& color, float metalness, float roughness,
                           UINT materialID = 0, UINT flags = 0,
-                          uint64_t instanceKey = 0) {
+                          uint64_t instanceKey = 0,
+                          XMFLOAT4 palmWindRoot = {}) {
         if (currentDrawCall >= VB_MAX_DRAW_CALLS || meshID >= meshes.size())
             return UINT_MAX;
 
@@ -453,6 +462,7 @@ public:
         next.indexCount = mesh.indexCount;
         next.hasIndices = mesh.hasIndices;
         next.flags = flags;
+        next.palmWindRoot = palmWindRoot;
         if (dcID >= previousDrawCount ||
             memcmp(&dc, &next, sizeof(VBDrawCallData)) != 0) {
             dc = next;
@@ -638,6 +648,10 @@ public:
                            : visPassPSO.Get()));
     }
 
+    void SetPalmWindFrame(const PalmWindFrameDX12& frame) {
+        palmWindFrame = frame;
+    }
+
     // Set matrices for the current draw (reuses the matrix CBV at slot 0)
     void SetVisPassMatrices(ID3D12GraphicsCommandList* cmdList,
                             const XMMATRIX& model, const XMMATRIX& view,
@@ -646,11 +660,17 @@ public:
         // We reuse the existing matrix buffer from ShaderDX12
         UINT bufferIndex = g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME + drawIndex;
 
-        MatrixBufferDX12 data;
+        MatrixBufferDX12 data = {};
         data.model = XMMatrixTranspose(model);
         data.view = XMMatrixTranspose(view);
         data.projection = XMMatrixTranspose(proj);
         data.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
+        data.palmWind = matrixSource.palmWindFrame.wind;
+        data.palmPrimary = matrixSource.palmWindFrame.primary;
+        data.palmSecondary = matrixSource.palmWindFrame.secondary;
+        data.palmPreviousPrimary = matrixSource.palmWindFrame.previousPrimary;
+        data.palmPreviousSecondary = matrixSource.palmWindFrame.previousSecondary;
+        data.palmParams = matrixSource.palmWindFrame.params;
         matrixSource.matrixBuffer.CopyData(bufferIndex, data);
 
         cmdList->SetGraphicsRootConstantBufferView(0,
@@ -726,6 +746,12 @@ public:
         fc.farPlane = farPlane;
         fc.debugViewMode = static_cast<UINT>(debugViewMode);
         fc.enableMotionVectors = temporalEffectsEnabled ? 1u : 0u;
+        fc.palmWind = palmWindFrame.wind;
+        fc.palmPrimary = palmWindFrame.primary;
+        fc.palmSecondary = palmWindFrame.secondary;
+        fc.palmPreviousPrimary = palmWindFrame.previousPrimary;
+        fc.palmPreviousSecondary = palmWindFrame.previousSecondary;
+        fc.palmParams = palmWindFrame.params;
         frameConstantBuffer.CopyData(g_dx12.frameIndex, fc);
 
         // Set compute pipeline

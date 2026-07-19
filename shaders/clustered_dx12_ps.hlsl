@@ -458,7 +458,9 @@ float4 main(PS_INPUT input) : SV_TARGET {
         // keeps grey mip-filtered background and turns eyelash cards into solid
         // black strips across the face, so retain only authored strand coverage.
         if (alphaCut > 1.5) clip(max(texColor.r, max(texColor.g, texColor.b)) - 0.62);
-        else if (alphaCut > 0.5) clip(texColor.a - 0.4);
+        // Preserve thin palm rachises and leaflet stems. Higher cutoff detached
+        // opaque leaf clusters from their nearly transparent connecting pixels.
+        else if (alphaCut > 0.5) clip(texColor.a - 0.20);
         // Textures are uploaded as UNORM, so decode authored sRGB before lighting.
         albedo = pow(max(texColor.rgb, 0.0), 2.2) * objectColor;
     }

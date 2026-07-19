@@ -59,8 +59,8 @@
 using namespace DirectX;
 
 // ?? globals ??????????????????????????????????????????????????????????????????
-static unsigned int SCR_WIDTH  = 1280;
-static unsigned int SCR_HEIGHT = 720;
+static unsigned int SCR_WIDTH  = 1920;
+static unsigned int SCR_HEIGHT = 1080;
 
 static Scene               scene;
 static ShaderDX12           mainShader;
@@ -140,6 +140,7 @@ uint32_t                    g_banditSpawnSerial = 0;
 GunAudio                    g_gunAudio;
 GunAudio                    g_rpgFireAudio;
 GunAudio                    g_explosionAudio;
+GunAudio                    g_grenadeExplosionAudio;
 GunAudio                    g_hitAudio;
 GunAudio                    g_banditSpottedAudio1;
 GunAudio                    g_banditSpottedAudio2;
@@ -3939,6 +3940,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     wc.lpszClassName = L"GraphicEngineDX12";
     RegisterClassExW(&wc);
 
+    DEVMODEW displayMode = {};
+    displayMode.dmSize = sizeof(displayMode);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &displayMode)) {
+        SCR_WIDTH = displayMode.dmPelsWidth;
+        SCR_HEIGHT = displayMode.dmPelsHeight;
+    }
+
     RECT rc = { 0, 0, (LONG)SCR_WIDTH, (LONG)SCR_HEIGHT };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
     HWND hwnd = CreateWindowW(L"GraphicEngineDX12", L"Graphics Engine - DirectX 12",
@@ -3964,8 +3972,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
     g_gunAudio.Initialize("models/audio/rifle_shot.wav");
     g_rpgFireAudio.Initialize("models/audio/rpg_fire.wav");
-    g_explosionAudio.Initialize("models/audio/explosion.ogg");
-    scene.explosionAudioCallback = [](const XMFLOAT3& position, float size) {
+    g_explosionAudio.Initialize("build/Sounds/Rpg/RocketExplosion3.mp3");
+    g_grenadeExplosionAudio.Initialize("models/audio/explosion.ogg");
+    scene.explosionAudioCallback = [](const XMFLOAT3& position, float size,
+                                      bool grenade) {
         const float dx = position.x - scene.camera.Position.x;
         const float dy = position.y - scene.camera.Position.y;
         const float dz = position.z - scene.camera.Position.z;
@@ -3973,7 +3983,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         const float reach = 55.0f + size * 4.0f;
         const float volume = (std::max)(0.08f, 1.0f - distance / reach);
         const float pitch = 0.92f + ((float)std::rand() / RAND_MAX) * 0.10f;
-        g_explosionAudio.Play(volume, pitch);
+        (grenade ? g_grenadeExplosionAudio : g_explosionAudio).Play(volume, pitch);
     };
     g_hitAudio.Initialize("models/audio/bullet_flesh_hit.mp3");
     g_banditSpottedAudio1.Initialize("models/audio/bandit_spotted_01.wav");
@@ -4297,6 +4307,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_gunAudio.Update();
         g_rpgFireAudio.Update();
         g_explosionAudio.Update();
+        g_grenadeExplosionAudio.Update();
         g_hitAudio.Update();
         g_banditSpottedAudio1.Update();
         g_banditSpottedAudio2.Update();
@@ -4430,12 +4441,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_water.Update(deltaTime);
         g_ocean.Update(deltaTime);
         g_trees.SetWind(g_grass.WindStrength(), g_grass.WindSpeed());
-        g_trees.Update(deltaTime);
         const bool primaryHelicopterActive =
             scene.showHelicopter && !g_helicopterDead && !g_helicopterCrashed;
         const bool secondaryHelicopterActive =
             scene.showHelicopter && g_stressTestMode &&
             !g_secondaryHelicopterDead && !g_secondaryHelicopterCrashed;
+        g_trees.SetHelicopterWind(
+            g_helicopterPosition, primaryHelicopterActive,
+            g_secondaryHelicopterPosition, secondaryHelicopterActive);
+        g_trees.Update(deltaTime);
         XMFLOAT3 grassHelicopter = g_helicopterPosition;
         if (secondaryHelicopterActive) {
             const XMVECTOR camera = XMLoadFloat3(&scene.camera.Position);
@@ -4583,7 +4597,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         const XMFLOAT3 center = projectile.position;
                         scene.SpawnExplosionFX(
                             { center.x, center.y + 0.6f, center.z },
-                            scene.grenadeBlastRadius * 1.6f);
+                            scene.grenadeBlastRadius * 1.6f, 0.9f,
+                            projectile.grenade);
                         if (!g_emptyLevelMode)
                         for (size_t i = 0; i < scene.explosiveBarrels.size(); ++i) {
                             const ExplosiveBarrel& barrel = scene.explosiveBarrels[i];
@@ -4896,6 +4911,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
 
         mainShader.BeginFrame();
+        mainShader.SetPalmWindFrame(g_trees.GetWindFrame());
         g_meshShader.BeginFrame();
         hzbCaptureActive = gameScreen == GameScreen::Level1 &&
             !levelLoadingActive && !usingRaytracing && !msaaActive &&
@@ -5558,6 +5574,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_banditSpottedAudio2.Shutdown();
     g_banditSpottedAudio1.Shutdown();
     g_hitAudio.Shutdown();
+    g_grenadeExplosionAudio.Shutdown();
     g_explosionAudio.Shutdown();
     g_rpgFireAudio.Shutdown();
     g_gunAudio.Shutdown();

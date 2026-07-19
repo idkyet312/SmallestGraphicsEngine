@@ -30,6 +30,7 @@
 #include <DirectXMath.h>
 #include "DX12Core.h"
 #include "PalmModel.h"
+#include "PalmWindGPU.h"
 #include <box3d/box3d.h>
 #include <vector>
 #include <cmath>
@@ -56,6 +57,8 @@ struct TreeItem {
     // Scale to apply to the model slice: the model is normalised to a fixed height,
     // but trees are planted at varying heights.
     float modelScale = 1.0f;
+    // root.xy = tree world XZ, z = GPU wind enabled. Falling/cut logs leave zero.
+    XMFLOAT4 palmWindRoot{};
 };
 
 class PalmTrees {
@@ -68,6 +71,18 @@ public:
     void SetWind(float strength, float speed) {
         m_windStrength = (std::max)(0.0f, strength);
         m_windSpeed = (std::max)(0.0f, speed);
+    }
+
+    void SetHelicopterWind(const XMFLOAT3& primary, bool primaryEnabled,
+                           const XMFLOAT3& secondary, bool secondaryEnabled) {
+        m_previousPrimaryHelicopter = m_primaryHelicopter;
+        m_previousSecondaryHelicopter = m_secondaryHelicopter;
+        m_previousPrimaryHelicopterWind = m_primaryHelicopterWind;
+        m_previousSecondaryHelicopterWind = m_secondaryHelicopterWind;
+        m_primaryHelicopter = primary;
+        m_secondaryHelicopter = secondary;
+        m_primaryHelicopterWind = primaryEnabled;
+        m_secondaryHelicopterWind = secondaryEnabled;
     }
 
     void Initialize() {
@@ -156,6 +171,11 @@ public:
         tree.baseY = m_terrain ? m_terrain(x, z) : 0.0f;
         tree.sizeScale = height / 7.0f;
         tree.lean = lean * tree.sizeScale;
+        const float seed = static_cast<float>(m_trees.size()) * 17.17f;
+        // Asset uses layered alpha cards that only form a coherent crown near
+        // its authored orientation. Large rotations expose isolated card groups.
+        tree.crownYaw = XMConvertToRadians(
+            -8.0f + 16.0f * Variation01(x, z, seed + 1.0f));
 
         // Fixed segment count across every tree, so physics segment i always maps
         // to the same model trunk slice i regardless of how tall this tree is.
@@ -189,11 +209,12 @@ public:
 
     void Update(float dt) {
         if (B3_IS_NULL(m_world)) return;
+        m_previousWindTime = m_windTime;
         m_windTime += dt;
         if (m_activeBodies == 0) {
-            // Physics is free while every tree stands, but visual wind still
-            // changes crown/trunk transforms each frame.
-            RebuildItems();
+            // Loaded palms now bend in the vertex shader, so standing-tree CPU
+            // transforms stay immutable. Box fallback still needs CPU wind.
+            if (!PalmModel::Loaded()) RebuildItems();
             return;
         }
 
@@ -205,6 +226,30 @@ public:
         }
         SettleLogs();
         RebuildItems();
+    }
+
+    PalmWindFrameDX12 GetWindFrame() const {
+        PalmWindFrameDX12 frame;
+        frame.wind = { m_windTime, m_previousWindTime,
+                       m_windStrength, m_windSpeed };
+        frame.primary = { m_primaryHelicopter.x, m_primaryHelicopter.y,
+                          m_primaryHelicopter.z,
+                          m_primaryHelicopterWind ? 1.0f : 0.0f };
+        frame.secondary = { m_secondaryHelicopter.x, m_secondaryHelicopter.y,
+                            m_secondaryHelicopter.z,
+                            m_secondaryHelicopterWind ? 1.0f : 0.0f };
+        frame.previousPrimary = {
+            m_previousPrimaryHelicopter.x, m_previousPrimaryHelicopter.y,
+            m_previousPrimaryHelicopter.z,
+            m_previousPrimaryHelicopterWind ? 1.0f : 0.0f };
+        frame.previousSecondary = {
+            m_previousSecondaryHelicopter.x, m_previousSecondaryHelicopter.y,
+            m_previousSecondaryHelicopter.z,
+            m_previousSecondaryHelicopterWind ? 1.0f : 0.0f };
+        frame.params = { m_helicopterWindRadius, m_helicopterWindStrength,
+                         PalmModel::Loaded() ? PalmModel::ModelHeight() : 8.0f,
+                         0.0f };
+        return frame;
     }
 
     bool BlocksSegment(const XMFLOAT3& start, const XMFLOAT3& end,
@@ -403,6 +448,7 @@ private:
         float    modelScale = 1.0f;
         float    modelScaleXZ = 1.0f;
         XMFLOAT3 modelOrigin{};   // where the slice's local origin sits, in body frame
+        float    crownYaw = 0.0f;
     };
 
     // A felled section of trunk: one dynamic body carrying its pieces. Shootable,
@@ -423,6 +469,8 @@ private:
         bool felled = false;
         float modelScale = 1.0f;   // planted height / model height
         float modelScaleXZ = 1.0f; // uniform with modelScale for authored proportions
+        // Stable yaw breaks cloned silhouettes without separating crown from trunk.
+        float crownYaw = 0.0f;
     };
 
     // ---- helpers ------------------------------------------------------------
@@ -434,18 +482,49 @@ private:
                XMMatrixTranslation((float)p.x, (float)p.y, (float)p.z);
     }
 
-    // Low-frequency trunk bend plus a smaller fast gust. Each tree gets a stable
-    // spatial phase, preventing the grove from moving as one rigid object.
+    static float Variation01(float x, float z, float salt) {
+        const float value = std::sin(x * 12.9898f + z * 78.233f + salt * 37.719f) *
+                            43758.5453f;
+        return value - std::floor(value);
+    }
+
+    // Low-frequency ambient bend plus radial rotor wash from both helicopters.
+    // Each tree gets a stable phase, preventing the grove from moving as one.
     XMFLOAT4 WindRotation(const Tree& tree, float heightFraction) const {
         const float phase = tree.x * 0.19f + tree.z * 0.13f;
         const float t = m_windTime * m_windSpeed;
         const float gust = std::sin(t + phase) + 0.35f * std::sin(t * 2.37f + phase * 1.71f);
         const float bend = m_windStrength * 0.13f * gust * heightFraction * heightFraction;
         const float heading = 0.35f + 0.22f * std::sin(t * 0.17f);
-        const XMVECTOR axis = XMVector3Normalize(
-            XMVectorSet(std::sin(heading), 0.0f, -std::cos(heading), 0.0f));
+        float bendX = std::cos(heading) * bend;
+        float bendZ = std::sin(heading) * bend;
+
+        auto addRotorWash = [&](const XMFLOAT3& helicopter, bool enabled) {
+            if (!enabled) return;
+            const float dx = tree.x - helicopter.x;
+            const float dz = tree.z - helicopter.z;
+            const float distance = std::sqrt(dx * dx + dz * dz);
+            if (distance >= m_helicopterWindRadius) return;
+            const float falloff = std::pow(
+                1.0f - distance / m_helicopterWindRadius, 0.65f);
+            const float pulse = 0.88f + 0.12f * std::sin(
+                m_windTime * 22.0f + distance * 1.7f + phase);
+            const float rotorBend = m_helicopterWindStrength * falloff * pulse *
+                                    heightFraction * heightFraction;
+            const float invDistance = distance > 1e-3f ? 1.0f / distance : 0.0f;
+            bendX += (distance > 1e-3f ? dx * invDistance : 1.0f) * rotorBend;
+            bendZ += (distance > 1e-3f ? dz * invDistance : 0.0f) * rotorBend;
+        };
+        addRotorWash(m_primaryHelicopter, m_primaryHelicopterWind);
+        addRotorWash(m_secondaryHelicopter, m_secondaryHelicopterWind);
+
+        const float bendMagnitude = std::sqrt(bendX * bendX + bendZ * bendZ);
+        if (bendMagnitude <= 1e-5f) return { 0.0f, 0.0f, 0.0f, 1.0f };
+        const float totalBend = (std::min)(0.34f, bendMagnitude);
+        const XMVECTOR axis = XMVectorSet(
+            bendZ / bendMagnitude, 0.0f, -bendX / bendMagnitude, 0.0f);
         XMFLOAT4 result;
-        XMStoreFloat4(&result, XMQuaternionRotationAxis(axis, bend));
+        XMStoreFloat4(&result, XMQuaternionRotationAxis(axis, totalBend));
         return result;
     }
 
@@ -504,19 +583,29 @@ private:
         const float topX = tree.x + tree.lean;
         const float frondLength = kFrondLen * tree.sizeScale;
         for (int f = 0; f < kFronds; ++f) {
-            const float ang = (XM_2PI * f) / kFronds;
+            const float leafSeed = static_cast<float>(f) * 11.73f;
+            const float angleJitter = XMConvertToRadians(
+                -1.5f + 3.0f * Variation01(tree.x, tree.z, leafSeed + 6.0f));
+            const float ang = tree.crownYaw + (XM_2PI * f) / kFronds + angleJitter;
+            const float lengthScale = 0.97f + 0.06f *
+                Variation01(tree.x, tree.z, leafSeed + 7.0f);
+            const float droop = kFrondDroop + XMConvertToRadians(
+                -1.0f + 2.0f * Variation01(tree.x, tree.z, leafSeed + 8.0f));
+            const float variedLength = frondLength * lengthScale;
             Piece p;
             p.localPos = XMFLOAT3(
-                topX + std::cos(ang) * frondLength * 0.5f,
-                crownY + std::sin(kFrondDroop) * frondLength * 0.5f,
-                tree.z + std::sin(ang) * frondLength * 0.5f);
+                topX + std::cos(ang) * variedLength * 0.5f,
+                crownY + std::sin(droop) * variedLength * 0.5f,
+                tree.z + std::sin(ang) * variedLength * 0.5f);
             const b3Quat q = b3MulQuat(
                 b3MakeQuatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, -ang),
-                b3MakeQuatFromAxisAngle({ 0.0f, 0.0f, 1.0f }, kFrondDroop));
+                b3MakeQuatFromAxisAngle({ 0.0f, 0.0f, 1.0f }, droop));
             p.localRot = XMFLOAT4(q.v.x, q.v.y, q.v.z, q.s);
-            p.half = XMFLOAT3(frondLength * 0.5f,
+            p.half = XMFLOAT3(variedLength * 0.5f,
                               0.04f * tree.sizeScale,
-                              kFrondWidth * tree.sizeScale);
+                              kFrondWidth * tree.sizeScale *
+                                  (0.98f + 0.04f * Variation01(
+                                      tree.x, tree.z, leafSeed + 9.0f)));
             p.frond = true;
             out.push_back(p);
         }
@@ -624,6 +713,7 @@ private:
                 p.modelScale = tree.modelScale;
                 p.modelScaleXZ = tree.modelScaleXZ;
                 p.modelOrigin = modelOrigin;
+                p.crownYaw = tree.crownYaw;
                 crownAssigned = true;
             }
             pieces.push_back(p);               // seg stays -1: fronds are not structural
@@ -796,16 +886,16 @@ private:
             for (int i = 0; i < standTop; ++i) {
                 const Segment& s = tree.segments[i];
                 const float heightFraction = (i + 0.5f) / (float)(std::max)(1, standTop);
-                const XMFLOAT4 windRot = WindRotation(tree, heightFraction);
                 if (model) {
                     // Draw this segment's slice of the real palm. The slice already
                     // carries its own height within the model, so it is placed from
                     // the TREE BASE -- not from the box's centre, which would double
                     // up the height offset.
-                    m_items.push_back(ModelItem(tree, windRot,
+                    m_items.push_back(ModelItem(tree, XMFLOAT4(0, 0, 0, 1),
                                                 XMFLOAT3(tree.x, tree.baseY, tree.z),
                                                 i, false, TrunkColor(s.health)));
                 } else {
+                    const XMFLOAT4 windRot = WindRotation(tree, heightFraction);
                     const XMVECTOR rel = XMVectorSet(s.offX, s.centerY - tree.baseY, 0, 0);
                     XMFLOAT3 bent;
                     XMStoreFloat3(&bent, XMVector3Rotate(rel, XMLoadFloat4(&windRot)));
@@ -817,12 +907,12 @@ private:
                 }
             }
             if (!tree.felled) {
-                const XMFLOAT4 crownWind = WindRotation(tree, 1.0f);
                 if (model) {
-                    m_items.push_back(ModelItem(tree, crownWind,
+                    m_items.push_back(ModelItem(tree, XMFLOAT4(0, 0, 0, 1),
                                                 XMFLOAT3(tree.x, tree.baseY, tree.z),
                                                 -1, true, kFrondColor));
                 } else {
+                    const XMFLOAT4 crownWind = WindRotation(tree, 1.0f);
                     const float crownY = tree.baseY + tree.segLen * tree.segments.size();
                     for (const Piece& p : CrownPieces(tree, crownY)) {
                         const XMVECTOR rel = XMVectorSet(p.localPos.x - tree.x,
@@ -873,6 +963,7 @@ private:
                     XMStoreFloat4x4(&item.transform, local * bodyXf);
                     item.segment = p.crown ? -1 : p.modelSeg;
                     item.crown = p.crown;
+                    item.palmWindRoot.w = p.crown ? p.crownYaw : 0.0f;
                     item.modelScale = p.modelScale;
                     item.color = p.crown ? kFrondColor
                                          : TrunkColor(p.seg >= 0 && p.seg < (int)log.segments.size()
@@ -922,6 +1013,8 @@ private:
         item.crown = crown;
         item.isFrond = crown;
         item.modelScale = tree.modelScale;
+        item.palmWindRoot = XMFLOAT4(
+            tree.x, tree.z, 1.0f, crown ? tree.crownYaw : 0.0f);
         return item;
     }
 
@@ -959,8 +1052,19 @@ private:
 
     float m_accumulator = 0.0f;
     float m_windTime = 0.0f;
+    float m_previousWindTime = 0.0f;
     float m_windStrength = 0.28f;
     float m_windSpeed = 1.6f;
+    XMFLOAT3 m_primaryHelicopter{};
+    XMFLOAT3 m_secondaryHelicopter{};
+    XMFLOAT3 m_previousPrimaryHelicopter{};
+    XMFLOAT3 m_previousSecondaryHelicopter{};
+    float m_helicopterWindRadius = 22.0f;
+    float m_helicopterWindStrength = 0.24f;
+    bool m_primaryHelicopterWind = false;
+    bool m_secondaryHelicopterWind = false;
+    bool m_previousPrimaryHelicopterWind = false;
+    bool m_previousSecondaryHelicopterWind = false;
     int   m_activeBodies = 0;
 };
 

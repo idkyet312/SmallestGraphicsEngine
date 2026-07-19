@@ -328,9 +328,10 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
                        const XMMATRIX& view, const XMMATRIX& proj,
                        const XMMATRIX& lightSpace, bool colorNormalOnly = false,
                        bool visibilityExtensionsOnly = false,
-                       ID3D12PipelineState* pipelineOverride = nullptr) {
+                       ID3D12PipelineState* pipelineOverride = nullptr,
+                       XMFLOAT4 palmWindRoot = {}) {
     if (!mesh) return;
-    shader.SetMatrices(model, view, proj, lightSpace);
+    shader.SetMatrices(model, view, proj, lightSpace, palmWindRoot);
 
     for (const auto& prim : mesh->primitives) {
         if (prim.vbv.BufferLocation == 0) continue;
@@ -806,7 +807,8 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
         if (crown) for (const TreeItem& item : g_trees.GetItems()) {
             if (!item.crown) continue;
             DrawMeshAt(crown, shader, XMLoadFloat4x4(&item.transform),
-                view, proj, lightSpace, false, false, crownPipeline);
+                view, proj, lightSpace, false, false, crownPipeline,
+                item.palmWindRoot);
         }
     }
 }
@@ -1028,7 +1030,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
             if (slice) {
                 DrawMeshAt(slice, shader, xf, view, proj, lightSpace, false,
-                    visibilityExtensionsOnly);
+                    visibilityExtensionsOnly, nullptr, item.palmWindRoot);
             } else {
                 if (visibilityExtensionsOnly) continue;
                 shader.Use(scene.wireframeMode);
