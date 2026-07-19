@@ -205,7 +205,7 @@ public:
     float vignetteStrength = 0.18f;
     float grainStrength = 0.012f;
     float taaFeedback = 0.86f;
-    bool temporalEffectsEnabled = true;
+    bool temporalEffectsEnabled = false;
     bool temporalHistoryValid = false;
     bool exposureReadable = false;
     float exposureAdaptation = 0.05f;

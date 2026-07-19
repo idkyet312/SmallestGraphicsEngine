@@ -139,6 +139,87 @@ inline void RenderPlayerHUD(const Scene& scene) {
     const ImGuiIO& io = ImGui::GetIO();
     ImDrawList* draw = ImGui::GetForegroundDrawList();
 
+    if (scene.sniperScopeBlend > 0.01f) {
+        const float blend = (std::min)(1.0f, scene.sniperScopeBlend);
+        const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+        const float radius = (std::min)(io.DisplaySize.x, io.DisplaySize.y) * 0.455f;
+        const float outerRadius = std::sqrt(
+            io.DisplaySize.x * io.DisplaySize.x + io.DisplaySize.y * io.DisplaySize.y);
+        const int shadeAlpha = static_cast<int>(255.0f * blend);
+        const ImU32 shade = IM_COL32(0, 0, 0, shadeAlpha);
+        constexpr int segments = 128;
+        for (int i = 0; i < segments; ++i) {
+            const float a0 = 6.2831853f * static_cast<float>(i) / segments;
+            const float a1 = 6.2831853f * static_cast<float>(i + 1) / segments;
+            const ImVec2 inner0(center.x + std::cos(a0) * radius,
+                                center.y + std::sin(a0) * radius);
+            const ImVec2 inner1(center.x + std::cos(a1) * radius,
+                                center.y + std::sin(a1) * radius);
+            const ImVec2 outer0(center.x + std::cos(a0) * outerRadius,
+                                center.y + std::sin(a0) * outerRadius);
+            const ImVec2 outer1(center.x + std::cos(a1) * outerRadius,
+                                center.y + std::sin(a1) * outerRadius);
+            draw->AddQuadFilled(inner0, outer0, outer1, inner1, shade);
+        }
+
+        const int lineAlpha = static_cast<int>(235.0f * blend);
+        const ImU32 reticleShadow = IM_COL32(0, 0, 0, lineAlpha);
+        const ImU32 reticleGlow = IM_COL32(145, 255, 170, lineAlpha);
+        draw->AddCircle(center, radius, IM_COL32(12, 18, 13, shadeAlpha),
+                        segments, 7.0f);
+        draw->AddCircle(center, radius - 5.0f,
+                        IM_COL32(165, 190, 170, lineAlpha), segments, 1.2f);
+
+        const float edge = radius - 10.0f;
+        const float gap = 4.0f;
+        const ImVec2 horizontal[2][2] = {
+            { ImVec2(center.x - edge, center.y), ImVec2(center.x - gap, center.y) },
+            { ImVec2(center.x + gap, center.y), ImVec2(center.x + edge, center.y) }
+        };
+        const ImVec2 vertical[2][2] = {
+            { ImVec2(center.x, center.y - edge), ImVec2(center.x, center.y - gap) },
+            { ImVec2(center.x, center.y + gap), ImVec2(center.x, center.y + edge) }
+        };
+        for (const auto& line : horizontal) {
+            draw->AddLine(line[0], line[1], reticleShadow, 3.0f);
+            draw->AddLine(line[0], line[1], reticleGlow, 1.0f);
+        }
+        for (const auto& line : vertical) {
+            draw->AddLine(line[0], line[1], reticleShadow, 3.0f);
+            draw->AddLine(line[0], line[1], reticleGlow, 1.0f);
+        }
+        draw->AddCircleFilled(center, 2.2f, reticleShadow, 16);
+        draw->AddCircleFilled(center, 1.0f, reticleGlow, 12);
+
+        for (int mark = 1; mark <= 5; ++mark) {
+            const float offset = radius * 0.105f * mark;
+            const float halfWidth = mark % 2 ? 5.0f : 9.0f;
+            draw->AddLine(ImVec2(center.x - halfWidth, center.y + offset),
+                          ImVec2(center.x + halfWidth, center.y + offset),
+                          reticleShadow, 3.0f);
+            draw->AddLine(ImVec2(center.x - halfWidth, center.y + offset),
+                          ImVec2(center.x + halfWidth, center.y + offset),
+                          reticleGlow, 1.0f);
+        }
+        for (int mark = 1; mark <= 4; ++mark) {
+            const float offset = radius * 0.13f * mark;
+            const float halfHeight = mark % 2 ? 4.0f : 7.0f;
+            for (float side : { -1.0f, 1.0f }) {
+                const float x = center.x + side * offset;
+                draw->AddLine(ImVec2(x, center.y - halfHeight),
+                              ImVec2(x, center.y + halfHeight), reticleShadow, 3.0f);
+                draw->AddLine(ImVec2(x, center.y - halfHeight),
+                              ImVec2(x, center.y + halfHeight), reticleGlow, 1.0f);
+            }
+        }
+
+        const char* zoomLabel = "SVD  4x";
+        const ImVec2 labelSize = ImGui::CalcTextSize(zoomLabel);
+        draw->AddText(ImVec2(center.x + radius * 0.46f - labelSize.x * 0.5f,
+                             center.y + radius * 0.74f),
+                      IM_COL32(145, 255, 170, lineAlpha), zoomLabel);
+    }
+
     if (scene.playerGodMode) {
         const char* god = "GOD MODE";
         const ImVec2 size = ImGui::CalcTextSize(god);
@@ -146,7 +227,7 @@ inline void RenderPlayerHUD(const Scene& scene) {
                       IM_COL32(255, 220, 65, 245), god);
     }
 
-    if (scene.playerHealth > 0.0f) {
+    if (scene.playerHealth > 0.0f && scene.sniperScopeBlend < 0.25f) {
         const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
         constexpr float gap = 3.0f;
         constexpr float arm = 5.0f;

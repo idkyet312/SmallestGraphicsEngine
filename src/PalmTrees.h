@@ -154,7 +154,8 @@ public:
         tree.x = x;
         tree.z = z;
         tree.baseY = m_terrain ? m_terrain(x, z) : 0.0f;
-        tree.lean = lean;
+        tree.sizeScale = height / 7.0f;
+        tree.lean = lean * tree.sizeScale;
 
         // Fixed segment count across every tree, so physics segment i always maps
         // to the same model trunk slice i regardless of how tall this tree is.
@@ -166,19 +167,16 @@ public:
         PalmModel::Load(count);
         if (PalmModel::Loaded() && PalmModel::ModelHeight() > 0.0f) {
             tree.modelScale = height / PalmModel::ModelHeight();
-            // Height varies per tree, but crown collision radius does not. Clamp
-            // horizontal model scale to the physics crown so nearby palms cannot
-            // spread giant leaf geometry across the terrain.
-            if (PalmModel::ModelRadius() > 0.0f)
-                tree.modelScaleXZ = std::min(tree.modelScale,
-                    kFrondLen / PalmModel::ModelRadius());
+            // Preserve authored proportions. Previous XZ clamp made tall palms
+            // scale only vertically, producing identical narrow crowns.
+            tree.modelScaleXZ = tree.modelScale;
         }
 
         for (int i = 0; i < count; ++i) {
             const float t = (float)i / std::max(1, count - 1);
             Segment s;
-            s.radius  = kTrunkBase * (1.0f - 0.35f * t);
-            s.offX    = lean * t * t;
+            s.radius  = kTrunkBase * tree.sizeScale * (1.0f - 0.35f * t);
+            s.offX    = tree.lean * t * t;
             s.centerY = tree.baseY + tree.segLen * (i + 0.5f);
             s.health  = kSegmentHealth;
             tree.segments.push_back(s);
@@ -352,7 +350,9 @@ public:
     ~PalmTrees() { Shutdown(); }
 
 private:
-    static constexpr int   kTrunkSegments = 6;      // trunk pieces per tree (fixed)
+    // Fine localized sections let bullets chew a narrow break ring before the
+    // upper trunk separates, rather than snapping the tree in six huge blocks.
+    static constexpr int   kTrunkSegments = 12;
     static constexpr float kSegmentLen    = 1.2f;
     static constexpr float kTrunkBase     = 0.17f;
     static constexpr float kSegmentHealth = 45.0f;
@@ -417,11 +417,12 @@ private:
     struct Tree {
         std::vector<Segment> segments;
         float x = 0.0f, z = 0.0f, baseY = 0.0f, lean = 0.0f, segLen = 0.0f;
+        float sizeScale = 1.0f; // uniform world scale relative to a 7 m palm
         b3BodyId standing = b3_nullBodyId;
         int  cutIndex = 0;
         bool felled = false;
         float modelScale = 1.0f;   // planted height / model height
-        float modelScaleXZ = 1.0f; // crown width matched to physics radius
+        float modelScaleXZ = 1.0f; // uniform with modelScale for authored proportions
     };
 
     // ---- helpers ------------------------------------------------------------
@@ -501,18 +502,21 @@ private:
         std::vector<Piece> out;
         out.reserve(kFronds);
         const float topX = tree.x + tree.lean;
+        const float frondLength = kFrondLen * tree.sizeScale;
         for (int f = 0; f < kFronds; ++f) {
             const float ang = (XM_2PI * f) / kFronds;
             Piece p;
             p.localPos = XMFLOAT3(
-                topX + std::cos(ang) * kFrondLen * 0.5f,
-                crownY + std::sin(kFrondDroop) * kFrondLen * 0.5f,
-                tree.z + std::sin(ang) * kFrondLen * 0.5f);
+                topX + std::cos(ang) * frondLength * 0.5f,
+                crownY + std::sin(kFrondDroop) * frondLength * 0.5f,
+                tree.z + std::sin(ang) * frondLength * 0.5f);
             const b3Quat q = b3MulQuat(
                 b3MakeQuatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, -ang),
                 b3MakeQuatFromAxisAngle({ 0.0f, 0.0f, 1.0f }, kFrondDroop));
             p.localRot = XMFLOAT4(q.v.x, q.v.y, q.v.z, q.s);
-            p.half = XMFLOAT3(kFrondLen * 0.5f, 0.04f, kFrondWidth);
+            p.half = XMFLOAT3(frondLength * 0.5f,
+                              0.04f * tree.sizeScale,
+                              kFrondWidth * tree.sizeScale);
             p.frond = true;
             out.push_back(p);
         }
@@ -854,8 +858,17 @@ private:
                     // the cut, so we rebuild the slice's pose in the body's frame and
                     // let the body transform carry it. Uniform scale only: squashing
                     // a mesh to the box's extents would deform the trunk.
+                    float damageScale = 1.0f;
+                    if (!p.crown && p.seg >= 0 &&
+                        p.seg < static_cast<int>(log.segments.size())) {
+                        const float healthFraction = (std::max)(0.0f,
+                            log.segments[p.seg].health / kSegmentHealth);
+                        damageScale = 0.58f + 0.42f * healthFraction;
+                    }
                     const XMMATRIX local =
-                        XMMatrixScaling(p.modelScaleXZ, p.modelScale, p.modelScaleXZ) *
+                        XMMatrixScaling(p.modelScaleXZ * damageScale,
+                                        p.modelScale,
+                                        p.modelScaleXZ * damageScale) *
                         XMMatrixTranslation(p.modelOrigin.x, p.modelOrigin.y, p.modelOrigin.z);
                     XMStoreFloat4x4(&item.transform, local * bodyXf);
                     item.segment = p.crown ? -1 : p.modelSeg;
@@ -887,8 +900,19 @@ private:
     // A standing tree's model slice: uniform scale, anchored at the trunk base.
     TreeItem ModelItem(const Tree& tree, const XMFLOAT4& rot, const XMFLOAT3& base,
                        int segment, bool crown, const XMFLOAT3& color) const {
+        float damageScale = 1.0f;
+        if (!crown && segment >= 0 &&
+            segment < static_cast<int>(tree.segments.size())) {
+            const float healthFraction = (std::max)(0.0f,
+                tree.segments[segment].health / kSegmentHealth);
+            // Each hit visibly narrows only the struck band. At zero health the
+            // upper section detaches and topples in the shot direction.
+            damageScale = 0.58f + 0.42f * healthFraction;
+        }
         const XMMATRIX t =
-            XMMatrixScaling(tree.modelScaleXZ, tree.modelScale, tree.modelScaleXZ) *
+            XMMatrixScaling(tree.modelScaleXZ * damageScale,
+                            tree.modelScale,
+                            tree.modelScaleXZ * damageScale) *
             XMMatrixRotationQuaternion(XMLoadFloat4(&rot)) *
             XMMatrixTranslation(base.x, base.y, base.z);
         TreeItem item;

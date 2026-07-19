@@ -28,6 +28,7 @@
 #include <DirectXMath.h>
 #include <algorithm>
 #include <cfloat>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -54,22 +55,59 @@ public:
     }
     static bool ShotgunLoaded() { return ShotgunMesh() != nullptr; }
 
+    static std::shared_ptr<SceneMesh>& RPGMesh() {
+        static std::shared_ptr<SceneMesh> mesh;
+        return mesh;
+    }
+    static bool RPGLoaded() { return RPGMesh() != nullptr; }
+    static std::shared_ptr<SceneMesh>& RPGRocketMesh() {
+        static std::shared_ptr<SceneMesh> mesh;
+        return mesh;
+    }
+
+    static std::shared_ptr<SceneMesh>& SVDMesh() {
+        static std::shared_ptr<SceneMesh> mesh;
+        return mesh;
+    }
+    static bool SVDLoaded() { return SVDMesh() != nullptr; }
+
     static int& SelectedWeapon() {
-        static int weapon = 0; // 0 = AK47, 1 = Mossberg 590A1
+        static int weapon = 0; // 0 = AK47, 1 = shotgun, 2 = RPG-7, 3 = SVD
         return weapon;
     }
     static bool ShotgunSelected() { return SelectedWeapon() == 1 && ShotgunLoaded(); }
+    static bool RPGSelected() { return SelectedWeapon() == 2 && RPGLoaded(); }
+    static bool SVDSelected() { return SelectedWeapon() == 3 && SVDLoaded(); }
     static const char* SelectedWeaponName() {
+        if (SVDSelected()) return "SVD Sniper";
+        if (RPGSelected()) return "RPG-7";
         return ShotgunSelected() ? "Mossberg 590A1" : "AK47";
     }
     static std::shared_ptr<SceneMesh>& PlayerMesh() {
+        if (SVDSelected()) return SVDMesh();
+        if (RPGSelected()) return RPGMesh();
         return ShotgunSelected() ? ShotgunMesh() : Mesh();
     }
     static bool PlayerLoaded() { return PlayerMesh() != nullptr; }
+    static bool WeaponLoaded(int weapon) {
+        switch (weapon) {
+        case 0: return Loaded();
+        case 1: return ShotgunLoaded();
+        case 2: return RPGLoaded();
+        case 3: return SVDLoaded();
+        default: return false;
+        }
+    }
     static void CycleWeapon(int direction) {
-        if (!ShotgunLoaded() || !Loaded()) return;
-        (void)direction; // two weapons: either wheel direction toggles the slot
-        SelectedWeapon() = (SelectedWeapon() + 1) % 2;
+        const int step = direction < 0 ? -1 : 1;
+        int candidate = SelectedWeapon();
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            candidate = (candidate + step + 4) % 4;
+            if (WeaponLoaded(candidate)) {
+                SelectedWeapon() = candidate;
+                return;
+            }
+        }
     }
 
     // Load and normalise the AK. Safe to call repeatedly; only the first call
@@ -91,6 +129,8 @@ public:
         if (!root) {
             std::cerr << "AK47 FBX unavailable; gun falls back to boxes\n";
             LoadShotgun();
+            LoadRPG();
+            LoadSVD();
             return;
         }
 
@@ -102,6 +142,8 @@ public:
         if (prims.empty()) {
             std::cerr << "AK47 FBX had no geometry; gun falls back to boxes\n";
             LoadShotgun();
+            LoadRPG();
+            LoadSVD();
             return;
         }
 
@@ -137,6 +179,8 @@ public:
             std::fclose(f);
         }
         LoadShotgun();
+        LoadRPG();
+        LoadSVD();
     }
 
     // Keep the material alive: its texture uploads stay referenced by the open
@@ -212,10 +256,113 @@ private:
         return material;
     }
 
+    static std::shared_ptr<SceneMaterial>& RPGMaterial() {
+        static std::shared_ptr<SceneMaterial> material;
+        return material;
+    }
+    static std::shared_ptr<SceneMaterial>& RPGRocketMaterial() {
+        static std::shared_ptr<SceneMaterial> material;
+        return material;
+    }
+
+    static std::vector<std::shared_ptr<SceneMaterial>>& SVDMaterials() {
+        static std::vector<std::shared_ptr<SceneMaterial>> materials;
+        return materials;
+    }
+
+    static void LoadRPG() {
+        const std::string path = Resolve("models/RPG7/RPG72.fbx");
+        std::cout << "Loading RPG-7 " << path << "...\n";
+        auto root = FBXImporter::Load(path, g_dx12.device, g_dx12.commandList,
+                                      1.0f, false, false);
+        if (!root) {
+            std::cerr << "RPG-7 FBX unavailable\n";
+            return;
+        }
+
+        std::vector<MeshPrimitive> prims;
+        std::vector<MeshPrimitive> rocketPrims;
+        XMFLOAT4X4 identity;
+        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+        root->UpdateGlobalTransform(identity);
+        Flatten(root, prims, &rocketPrims);
+        if (prims.empty()) {
+            std::cerr << "RPG-7 FBX had no geometry\n";
+            return;
+        }
+
+        FlipV(prims);
+        Orient(prims, 1.48f);
+        // RPG72 already exports upright after axis normalization. Older RPG7
+        // needed an extra -90 degree roll, which turns this replacement sideways.
+        AssignRPGMaterial(prims);
+
+        auto mesh = std::make_shared<SceneMesh>();
+        mesh->primitives = std::move(prims);
+        for (MeshPrimitive& primitive : mesh->primitives)
+            GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get());
+        RPGMesh() = mesh;
+        std::cout << "RPG-7 loaded: " << mesh->primitives.size() << " primitive(s)\n";
+
+        if (!rocketPrims.empty()) {
+            FlipV(rocketPrims);
+            Orient(rocketPrims, 0.52f);
+            RollRPGUpright(rocketPrims);
+            AssignRPGRocketMaterial(rocketPrims);
+            auto rocketMesh = std::make_shared<SceneMesh>();
+            rocketMesh->primitives = std::move(rocketPrims);
+            for (MeshPrimitive& primitive : rocketMesh->primitives)
+                GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get());
+            RPGRocketMesh() = rocketMesh;
+        }
+    }
+
+    static void LoadSVD() {
+        // Source FBX is version 6100 (FBX SDK 9.4), older than Assimp supports.
+        // SVD.obj is the equivalent static mesh converted with ufbx.
+        const std::string path = Resolve("models/SVD_v1.3/Models/SVD.obj");
+        std::cout << "Loading SVD " << path << "...\n";
+        auto root = FBXImporter::Load(path, g_dx12.device, g_dx12.commandList,
+                                      1.0f, false, false);
+        if (!root) {
+            std::cerr << "SVD FBX unavailable\n";
+            return;
+        }
+
+        std::vector<MeshPrimitive> prims;
+        XMFLOAT4X4 identity;
+        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+        root->UpdateGlobalTransform(identity);
+        Flatten(root, prims);
+        if (prims.empty()) {
+            std::cerr << "SVD FBX had no geometry\n";
+            return;
+        }
+
+        FlipV(prims);
+        Orient(prims, 1.55f);
+        AssignSVDMaterials(prims);
+
+        auto mesh = std::make_shared<SceneMesh>();
+        mesh->primitives = std::move(prims);
+        for (MeshPrimitive& primitive : mesh->primitives)
+            GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get());
+        SVDMesh() = mesh;
+        std::cout << "SVD loaded: " << mesh->primitives.size() << " primitive(s)\n";
+    }
+
     // Collapse the node tree into world-space primitives (same as PalmModel).
     static void Flatten(const std::shared_ptr<SceneNode>& node,
-                        std::vector<MeshPrimitive>& out) {
+                        std::vector<MeshPrimitive>& out,
+                        std::vector<MeshPrimitive>* separatedRockets = nullptr,
+                        bool insideRocket = false) {
         if (!node) return;
+        std::string nodeName = node->name;
+        std::transform(nodeName.begin(), nodeName.end(), nodeName.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        insideRocket = insideRocket || nodeName.find("rocket") != std::string::npos;
+        std::vector<MeshPrimitive>& target =
+            separatedRockets && insideRocket ? *separatedRockets : out;
         if (node->mesh) {
             const XMMATRIX world = XMLoadFloat4x4(&node->globalTransform);
             const XMMATRIX nrm = XMMatrixTranspose(XMMatrixInverse(nullptr, world));
@@ -241,10 +388,11 @@ private:
                     p.vertices[v+3]=nf.x; p.vertices[v+4]=nf.y;  p.vertices[v+5]=nf.z;
                     p.vertices[v+8]=tf.x; p.vertices[v+9]=tf.y;  p.vertices[v+10]=tf.z;
                 }
-                out.push_back(std::move(p));
+                target.push_back(std::move(p));
             }
         }
-        for (const auto& child : node->children) Flatten(child, out);
+        for (const auto& child : node->children)
+            Flatten(child, out, separatedRockets, insideRocket);
     }
 
     // Assimp hands back OpenGL-convention UVs (V = 0 at the BOTTOM of the image),
@@ -263,10 +411,29 @@ private:
                 p.vertices[v + 7] = 1.0f - p.vertices[v + 7];   // offset 7 = V
     }
 
+    static void RollRPGUpright(std::vector<MeshPrimitive>& prims) {
+        // Generic orientation finds barrel axis but cannot infer roll. RPG grips
+        // arrived on right side; rotate -90 degrees around local +Z so they hang.
+        for (MeshPrimitive& primitive : prims) {
+            for (size_t v = 0; v + 11 < primitive.vertices.size(); v += 12) {
+                const float px = primitive.vertices[v];
+                const float nx = primitive.vertices[v + 3];
+                const float tx = primitive.vertices[v + 8];
+                primitive.vertices[v] = primitive.vertices[v + 1];
+                primitive.vertices[v + 1] = -px;
+                primitive.vertices[v + 3] = primitive.vertices[v + 4];
+                primitive.vertices[v + 4] = -nx;
+                primitive.vertices[v + 8] = primitive.vertices[v + 9];
+                primitive.vertices[v + 9] = -tx;
+            }
+        }
+    }
+
     // Bake the asset's own axis convention and units away, so the mesh comes out
     // in the gun's local space: barrel along +Z, sights up +Z, sized to
     // kBarrelLength, origin at the rear of the weapon (roughly the grip).
-    static void Orient(std::vector<MeshPrimitive>& prims) {
+    static void Orient(std::vector<MeshPrimitive>& prims,
+                       float targetLength = kBarrelLength) {
         XMFLOAT3 lo(FLT_MAX, FLT_MAX, FLT_MAX), hi(-FLT_MAX, -FLT_MAX, -FLT_MAX);
         for (const MeshPrimitive& p : prims)
             for (size_t v = 0; v + 11 < p.vertices.size(); v += 12) {
@@ -288,7 +455,7 @@ private:
         if (side == fwd) side = (fwd + 1) % 3;          // degenerate; pick anything else
         const int up = 3 - fwd - side;                  // the remaining axis
 
-        const float scale = kBarrelLength / ext[fwd];
+        const float scale = targetLength / ext[fwd];
         // Centre across the body and on the barrel axis; sit the origin at the
         // rear so the model grows forward from the camera like the boxed M4 did.
         const float mid[3] = { (lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f, (lo.z + hi.z) * 0.5f };
@@ -431,6 +598,116 @@ private:
 
         Material() = mat;
         for (MeshPrimitive& p : prims) p.material = mat;
+    }
+
+    // RPG uses exactly four authored maps: albedo, normal, roughness and metal.
+    // AO is deliberately excluded. Pack roughness/metal into glTF G/B channels.
+    static void AssignRPGMaterial(std::vector<MeshPrimitive>& prims) {
+        auto mat = std::make_shared<SceneMaterial>();
+        mat->name = "rpg7";
+        mat->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
+        const std::string dir = "models/RPG7/textures/";
+        mat->baseColorTexture = GLBImporter::LoadTextureFromFile(
+            Resolve(dir + "RPG7_Albedo.png"), g_dx12.device, g_dx12.commandList,
+            mat->uploadHeaps);
+        mat->normalTexture = GLBImporter::LoadTextureFromFile(
+            Resolve(dir + "RPG7_Normal.png"), g_dx12.device, g_dx12.commandList,
+            mat->uploadHeaps);
+
+        std::vector<unsigned char> rough, metal, packed;
+        int rw = 0, rh = 0, mw = 0, mh = 0;
+        const bool haveRough = GLBImporter::LoadPixelsRGBA(
+            Resolve(dir + "RPG7_Roughness.png"), rough, rw, rh);
+        const bool haveMetal = GLBImporter::LoadPixelsRGBA(
+            Resolve(dir + "RPG7_Metallic.png"), metal, mw, mh);
+        if (haveRough && haveMetal && rw == mw && rh == mh && rw > 0) {
+            const size_t texels = static_cast<size_t>(rw) * rh;
+            packed.resize(texels * 4);
+            for (size_t i = 0; i < texels; ++i) {
+                packed[i * 4 + 0] = 255;
+                packed[i * 4 + 1] = rough[i * 4];
+                packed[i * 4 + 2] = metal[i * 4];
+                packed[i * 4 + 3] = 255;
+            }
+            mat->metallicRoughnessTexture = GLBImporter::CreateTextureFromRGBA(
+                g_dx12.device.Get(), g_dx12.commandList.Get(), packed, rw, rh,
+                mat->uploadHeaps);
+        }
+        mat->roughnessOnlyTexture = false;
+        mat->metallicFactor = mat->metallicRoughnessTexture ? 1.0f : 0.55f;
+        mat->roughnessFactor = mat->metallicRoughnessTexture ? 1.0f : 0.48f;
+        RPGMaterial() = mat;
+        for (MeshPrimitive& primitive : prims) primitive.material = mat;
+    }
+
+    static void AssignRPGRocketMaterial(std::vector<MeshPrimitive>& prims) {
+        auto mat = std::make_shared<SceneMaterial>();
+        mat->name = "rpg7_rocket";
+        mat->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
+        const std::string dir = "models/RPG7/textures/";
+        mat->baseColorTexture = GLBImporter::LoadTextureFromFile(
+            Resolve(dir + "RPG7Rocket_Albedo.png"), g_dx12.device,
+            g_dx12.commandList, mat->uploadHeaps);
+        mat->normalTexture = GLBImporter::LoadTextureFromFile(
+            Resolve(dir + "RPG7Rocket_Normal.png"), g_dx12.device,
+            g_dx12.commandList, mat->uploadHeaps);
+
+        std::vector<unsigned char> rough, metal, packed;
+        int rw = 0, rh = 0, mw = 0, mh = 0;
+        const bool haveRough = GLBImporter::LoadPixelsRGBA(
+            Resolve(dir + "RPG7Rocket_Roughness.png"), rough, rw, rh);
+        const bool haveMetal = GLBImporter::LoadPixelsRGBA(
+            Resolve(dir + "RPG7Rocket_Metallic.png"), metal, mw, mh);
+        if (haveRough && haveMetal && rw == mw && rh == mh && rw > 0) {
+            const size_t texels = static_cast<size_t>(rw) * rh;
+            packed.resize(texels * 4);
+            for (size_t i = 0; i < texels; ++i) {
+                packed[i * 4] = 255;
+                packed[i * 4 + 1] = rough[i * 4];
+                packed[i * 4 + 2] = metal[i * 4];
+                packed[i * 4 + 3] = 255;
+            }
+            mat->metallicRoughnessTexture = GLBImporter::CreateTextureFromRGBA(
+                g_dx12.device.Get(), g_dx12.commandList.Get(), packed, rw, rh,
+                mat->uploadHeaps);
+        }
+        mat->roughnessOnlyTexture = false;
+        mat->metallicFactor = mat->metallicRoughnessTexture ? 1.0f : 0.55f;
+        mat->roughnessFactor = mat->metallicRoughnessTexture ? 1.0f : 0.48f;
+        RPGRocketMaterial() = mat;
+        for (MeshPrimitive& primitive : prims) primitive.material = mat;
+    }
+
+    static void AssignSVDMaterials(std::vector<MeshPrimitive>& prims) {
+        const std::string dir = "models/SVD_v1.3/Textures/";
+        auto makeMaterial = [&](const char* name, const char* textureStem,
+                                float metallic, float roughness) {
+            auto material = std::make_shared<SceneMaterial>();
+            material->name = name;
+            material->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
+            material->baseColorTexture = GLBImporter::LoadTextureFromFile(
+                Resolve(dir + textureStem + "_dif.png"), g_dx12.device,
+                g_dx12.commandList, material->uploadHeaps);
+            material->normalTexture = GLBImporter::LoadTextureFromFile(
+                Resolve(dir + textureStem + "_normal.png"), g_dx12.device,
+                g_dx12.commandList, material->uploadHeaps);
+            material->metallicFactor = metallic;
+            material->roughnessFactor = roughness;
+            return material;
+        };
+
+        auto body = makeMaterial("svd", "SVD", 0.62f, 0.42f);
+        auto optics = makeMaterial("svd_optics", "Optics", 0.52f, 0.30f);
+        auto bullet = makeMaterial("svd_bullet", "bullet", 0.78f, 0.28f);
+        SVDMaterials() = { body, optics, bullet };
+
+        for (MeshPrimitive& primitive : prims) {
+            std::string sourceName = primitive.material ? primitive.material->name : "";
+            std::transform(sourceName.begin(), sourceName.end(), sourceName.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            primitive.material = sourceName.find("optic") != std::string::npos ? optics
+                : sourceName.find("bullet") != std::string::npos ? bullet : body;
+        }
     }
 
     // Extents of the normalised mesh in gun-local space.

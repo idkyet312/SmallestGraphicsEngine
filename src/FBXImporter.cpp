@@ -174,6 +174,13 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
             continue;
         MeshPrimitive p;
         p.material = getMaterial(src->mMaterialIndex);
+        // When material loading is disabled, retain source mesh/group name on a
+        // private placeholder material. Callers such as GunModel use it to map
+        // authored submeshes to their manually loaded textures.
+        if (!loadMaterials) {
+            p.material = std::make_shared<SceneMaterial>();
+            p.material->name = src->mName.C_Str();
+        }
         aiMatrix3x3 normalTransform(meshTransforms[mi]);
         if (preserveOH1Rotors) normalTransform.Inverse().Transpose();
         const aiMatrix3x3 directionTransform(meshTransforms[mi]);

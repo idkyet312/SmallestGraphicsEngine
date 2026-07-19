@@ -706,7 +706,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     CullAndBatchDrawItems(scene, view, proj, drawItems);
 
     scene.clusteredRenderer.setScreenSize((float)g_dx12.screenWidth, (float)g_dx12.screenHeight);
-    scene.clusteredRenderer.setCamera(scene.cameraFOV, scene.cameraNear,
+    scene.clusteredRenderer.setCamera(scene.EffectiveCameraFOV(), scene.cameraNear,
         scene.cameraFar, view, proj);
     scene.clusteredRenderer.cullLights();
 

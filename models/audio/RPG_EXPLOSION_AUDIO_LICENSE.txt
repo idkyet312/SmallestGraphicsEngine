@@ -1,0 +1,9 @@
+rpg_fire.wav (original: missile.wav) by mikeask
+Source: https://opengameart.org/content/missile-sound
+License: CC0 1.0 Universal
+
+explosion.ogg (original: cannon_02.ogg) by rubberduck
+Source: https://opengameart.org/content/25-cc0-bang-firework-sfx
+License: CC0 1.0 Universal
+
+Downloaded: 2026-07-19

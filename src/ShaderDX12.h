@@ -239,6 +239,7 @@ public:
     ComPtr<ID3D12PipelineState> msaaWireframePipelineState;
     ComPtr<ID3D12PipelineState> msaaTransparentPipelineState;
     ComPtr<ID3D12PipelineState> msaaAdditivePipelineState;
+    ComPtr<ID3D12PipelineState> hdrMsaaPipelineState;
     // Grass: same root signature, same pixel shader, but a vertex shader that
     // bends the blades in the wind. Null if grass_vs.hlsl failed to compile, in
     // which case the grass simply is not drawn.
@@ -692,9 +693,12 @@ public:
         psoDesc.PS = { hdrPsBlob->GetBufferPointer(), hdrPsBlob->GetBufferSize() };
         if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
                 &psoDesc, IID_PPV_ARGS(&hdrPipelineState)))) return false;
+        const bool hdrMsaaMainSupported =
+            createMSAAPipeline(hdrMsaaPipelineState);
         psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
         psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        msaaSupported = createMSAAPipeline(msaaPipelineState);
+        msaaSupported = hdrMsaaMainSupported &&
+            createMSAAPipeline(msaaPipelineState);
 
         // Alpha-blended material pass. Keep depth testing, disable depth writes
         // so glass reveals opaque geometry behind it.
@@ -827,6 +831,7 @@ public:
             msaaWireframePipelineState.Reset();
             msaaTransparentPipelineState.Reset();
             msaaAdditivePipelineState.Reset();
+            hdrMsaaPipelineState.Reset();
             msaaGrassPipelineState.Reset();
             hdrMsaaGrassPipelineState.Reset();
         }
@@ -884,6 +889,10 @@ public:
 
     ID3D12PipelineState* GetHDRMSAAGrassPipelineState() const {
         return hdrMsaaGrassPipelineState.Get();
+    }
+
+    ID3D12PipelineState* GetHDRMSAAPipelineState() const {
+        return hdrMsaaPipelineState.Get();
     }
 
     void InvalidateGraphicsRootBinding() { graphicsRootBound = false; }

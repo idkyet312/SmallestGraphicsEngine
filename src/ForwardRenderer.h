@@ -30,12 +30,19 @@ extern ComPtr<ID3D12Resource> g_smokeTexture;   // soft smoke sprite for billboa
 extern ComPtr<ID3D12Resource> g_bloodTexture;
 extern ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 extern ComPtr<ID3D12Resource> g_fireTexture;
-extern ComPtr<ID3D12Resource> g_explosionTexture;   // 8x8 flipbook explosion sheet
+extern ComPtr<ID3D12Resource> g_explosionTexture;   // 4x4 flipbook explosion sheet
 extern std::shared_ptr<SceneNode> g_explosiveBarrelModel;
 extern std::shared_ptr<SceneNode> g_explosiveBarrelShadowModel;
 extern std::shared_ptr<SceneNode> g_humveeModel;
 extern std::shared_ptr<SceneNode> g_humveeShadowModel;
 extern std::shared_ptr<SceneNode> g_helicopterModel;
+struct FernInstance {
+    DirectX::XMFLOAT4X4 transform;
+    DirectX::XMFLOAT3 center;
+    float radius = 1.0f;
+};
+extern std::shared_ptr<SceneNode> g_fernModel;
+extern std::vector<FernInstance> g_fernInstances;
 extern ID3D12Resource* g_skyEnvironmentResource;
 extern ID3D12Resource* g_specularEnvironmentResource;
 extern ID3D12Resource* g_brdfIntegrationResource;
@@ -58,7 +65,7 @@ struct GeometryBuffers {
     ComPtr<ID3D12Resource>   quadVertexBuffer;      // unit XY billboard quad
     ComPtr<ID3D12Resource>   flashVertexBuffer;     // first cell of 4-frame VFX sheet
     ComPtr<ID3D12Resource>   fireVertexBuffer;      // 60 cells from 10x6 fire sheet
-    ComPtr<ID3D12Resource>   explosionVertexBuffer; // 64 cells from 8x8 explosion sheet
+    ComPtr<ID3D12Resource>   explosionVertexBuffer; // 16 cells from 4x4 explosion sheet
     D3D12_VERTEX_BUFFER_VIEW cubeVBV  = {};
     D3D12_VERTEX_BUFFER_VIEW planeVBV = {};
     D3D12_VERTEX_BUFFER_VIEW sphereVBV = {};
@@ -139,11 +146,11 @@ inline void DrawFireFrame(const GeometryBuffers& geo, UINT frame) {
     g_dx12.commandList->DrawInstanced(6, 1, (frame % 60) * 6, 0);
 }
 
-// One 64th of the 8x8 explosion flipbook (frame 0 top-left, row-major).
+// One cell of the 4x4 explosion flipbook (frame 0 top-left, row-major).
 inline void DrawExplosionFrame(const GeometryBuffers& geo, UINT frame) {
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.explosionVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    g_dx12.commandList->DrawInstanced(6, 1, (frame % 64) * 6, 0);
+    g_dx12.commandList->DrawInstanced(6, 1, (frame % 16) * 6, 0);
 }
 
 inline void DrawSphere(const GeometryBuffers& geo) {
@@ -209,10 +216,10 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
     if (g_explosionTexture && geo.explosionVBV.BufferLocation) {
         for (const ExplosionFX& fx : scene.explosionFX) {
             const float t = (std::min)(1.0f, fx.age / fx.duration);
-            const UINT frame = (std::min)(63u, (UINT)(t * 64.0f));
-            // Blooms fast, then holds; last frames fade out.
-            const float bloom = 0.55f + 0.45f * (std::min)(1.0f, t * 4.0f);
-            const float opacity = t > 0.8f ? (1.0f - t) / 0.2f : 1.0f;
+            const UINT frame = (std::min)(15u, (UINT)(t * 16.0f));
+            // Fast pressure bloom, slight overshoot, then smoke collapse.
+            const float bloom = 0.18f + 0.92f * (std::min)(1.0f, t * 5.0f);
+            const float opacity = t > 0.72f ? (1.0f - t) / 0.28f : 1.0f;
             const float size = fx.size * bloom;
             const XMVECTOR pos = XMVectorSet(
                 fx.position.x, fx.position.y, fx.position.z, 1.0f);
@@ -320,7 +327,8 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
                        const XMMATRIX& model,
                        const XMMATRIX& view, const XMMATRIX& proj,
                        const XMMATRIX& lightSpace, bool colorNormalOnly = false,
-                       bool visibilityExtensionsOnly = false) {
+                       bool visibilityExtensionsOnly = false,
+                       ID3D12PipelineState* pipelineOverride = nullptr) {
     if (!mesh) return;
     shader.SetMatrices(model, view, proj, lightSpace);
 
@@ -356,9 +364,10 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
         }
 
         // Palm slices are IA meshes (no meshlet data), so always take the VS/PS path.
-        g_dx12.commandList->SetPipelineState(transparent
-            ? shader.GetTransparentPipelineState()
-            : shader.GetPipelineState(false));
+        g_dx12.commandList->SetPipelineState(
+            pipelineOverride && !transparent ? pipelineOverride :
+            (transparent ? shader.GetTransparentPipelineState()
+                         : shader.GetPipelineState(false)));
         g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
         g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         if (prim.ibv.BufferLocation != 0) {
@@ -743,7 +752,7 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
                                ID3D12PipelineState* pipelineOverride = nullptr) {
     ID3D12PipelineState* grassPipeline = pipelineOverride
         ? pipelineOverride : shader.GetGrassPipelineState();
-    if (g_emptyLevelMode || !g_grass.IsInitialized() || !grassPipeline) return;
+    if (g_emptyLevelMode || !grassPipeline) return;
 
     // Compute post passes replace descriptor heaps and root signatures. Restore
     // every binding the grass shader consumes before this late raster pass.
@@ -753,38 +762,53 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
         g_ddgiVisibilityResource,
         g_specularEnvironmentResource, g_brdfIntegrationResource);
 
-    g_grass.SetViewer(scene.camera.Position);
-    static std::vector<GrassField::DrawRange> grassRanges;
-    g_grass.GetVisible(grassRanges);
+    if (g_grass.IsInitialized()) {
+        g_grass.SetViewer(scene.camera.Position);
+        static std::vector<GrassField::DrawRange> grassRanges;
+        g_grass.GetVisible(grassRanges);
 
-    const D3D12_VERTEX_BUFFER_VIEW& gvbv = g_grass.GetVBV();
-    const D3D12_GPU_VIRTUAL_ADDRESS ginst =
-        g_grass.GetInstanceBufferAddress();
-    if (grassRanges.empty() || !gvbv.BufferLocation || !ginst) return;
+        const D3D12_VERTEX_BUFFER_VIEW& gvbv = g_grass.GetVBV();
+        const D3D12_GPU_VIRTUAL_ADDRESS ginst =
+            g_grass.GetInstanceBufferAddress();
+        if (!grassRanges.empty() && gvbv.BufferLocation && ginst) {
+            const D3D12_INDEX_BUFFER_VIEW& gibv = g_grass.GetIBV();
+            shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
+            shader.SetObjectMaterial(XMFLOAT3(0.117f, 0.152f, 0.025f), false, false,
+                                     0.0f, 0.85f, nullptr, nullptr, nullptr);
 
-    const D3D12_INDEX_BUFFER_VIEW& gibv = g_grass.GetIBV();
-    shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
-    shader.SetObjectMaterial(XMFLOAT3(0.117f, 0.152f, 0.025f), false, false,
-                             0.0f, 0.85f, nullptr, nullptr, nullptr);
-
-    GrassField::Params gp = g_grass.GetParams(
-        scene.cameraFOV, static_cast<float>(g_dx12.screenHeight));
-    static_assert(sizeof(GrassField::Params) == 13 * sizeof(UINT),
-                  "GrassParams must match the 13 root constants at b6");
-    g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 13, &gp, 0);
-    g_dx12.commandList->SetGraphicsRootShaderResourceView(9, ginst);
-    g_dx12.commandList->SetPipelineState(grassPipeline);
-    g_dx12.commandList->IASetVertexBuffers(0, 1, &gvbv);
-    g_dx12.commandList->IASetIndexBuffer(&gibv);
-    g_dx12.commandList->IASetPrimitiveTopology(
-        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    for (const GrassField::DrawRange& r : grassRanges) {
-        g_dx12.commandList->SetGraphicsRoot32BitConstants(
-            8, 1, &r.firstInstance, 7);
-        g_dx12.commandList->DrawIndexedInstanced(
-            GrassField::IndexCount(), r.instanceCount, 0, 0, 0);
+            GrassField::Params gp = g_grass.GetParams(
+                scene.EffectiveCameraFOV(), static_cast<float>(g_dx12.screenHeight));
+            static_assert(sizeof(GrassField::Params) == 13 * sizeof(UINT),
+                          "GrassParams must match the 13 root constants at b6");
+            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 13, &gp, 0);
+            g_dx12.commandList->SetGraphicsRootShaderResourceView(9, ginst);
+            g_dx12.commandList->SetPipelineState(grassPipeline);
+            g_dx12.commandList->IASetVertexBuffers(0, 1, &gvbv);
+            g_dx12.commandList->IASetIndexBuffer(&gibv);
+            g_dx12.commandList->IASetPrimitiveTopology(
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            for (const GrassField::DrawRange& r : grassRanges) {
+                g_dx12.commandList->SetGraphicsRoot32BitConstants(
+                    8, 1, &r.firstInstance, 7);
+                g_dx12.commandList->DrawIndexedInstanced(
+                    GrassField::IndexCount(), r.instanceCount, 0, 0, 0);
+            }
+            shader.NextDrawCall();
+        }
     }
-    shader.NextDrawCall();
+
+    // Palm crowns are alpha-cut foliage too. Draw them into this same 4x HDR
+    // layer with the regular material shader so frond texture edges get true
+    // per-sample coverage while trunks stay in the single-sample scene pass.
+    ID3D12PipelineState* crownPipeline = shader.GetHDRMSAAPipelineState();
+    if (crownPipeline && g_trees.IsInitialized()) {
+        const std::shared_ptr<SceneMesh> crown = PalmModel::Crown();
+        if (crown) for (const TreeItem& item : g_trees.GetItems()) {
+            if (!item.crown) continue;
+            DrawMeshAt(crown, shader, XMLoadFloat4x4(&item.transform),
+                view, proj, lightSpace, false, false, crownPipeline);
+        }
+    }
 }
 
 // Render the whole scene using the forward clustered path
@@ -813,7 +837,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     // Clustered light cull
     scene.clusteredRenderer.setScreenSize((float)g_dx12.screenWidth, (float)g_dx12.screenHeight);
-    scene.clusteredRenderer.setCamera(scene.cameraFOV, scene.cameraNear, scene.cameraFar, view, proj);
+    scene.clusteredRenderer.setCamera(scene.EffectiveCameraFOV(), scene.cameraNear,
+                                      scene.cameraFar, view, proj);
     scene.clusteredRenderer.cullLights();
 
     auto lightData = scene.clusteredRenderer.getPointLightData();
@@ -824,6 +849,18 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         flashLight.color = XMFLOAT3(1.0f, 0.42f, 0.08f);
         flashLight.intensity = 13.0f * (scene.muzzleFlashTime / scene.muzzleFlashDuration);
         lightData.push_back(flashLight);
+    }
+    for (const ExplosionFX& fx : scene.explosionFX) {
+        if (lightData.size() >= 64) break;
+        const float t = (std::min)(1.0f, fx.age / fx.duration);
+        const float energy = (1.0f - t) * (1.0f - t);
+        if (energy < 0.01f) continue;
+        PointLightDataDX12 blastLight = {};
+        blastLight.position = fx.position;
+        blastLight.radius = fx.size * (1.1f + t * 0.7f);
+        blastLight.color = XMFLOAT3(1.0f, 0.24f + t * 0.18f, 0.025f);
+        blastLight.intensity = 24.0f * energy;
+        lightData.push_back(blastLight);
     }
     shader.SetPointLights((int)lightData.size(), lightData);
     shader.SetDDGI(scene.useDDGI, scene.giIntensity, scene.normalBias, scene.probeSpacing);
@@ -979,6 +1016,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     if (!g_emptyLevelMode && g_trees.IsInitialized()) {
         shader.Use(scene.wireframeMode);
         for (const TreeItem& item : g_trees.GetItems()) {
+            if (item.crown && !includeGrass) continue;
             const XMMATRIX xf = XMLoadFloat4x4(&item.transform);
             // If the real palm model loaded, each physics box carries the identity
             // of a model slice (a trunk segment or the crown); draw that slice's
@@ -1001,6 +1039,30 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             }
         }
         // A palm slice draw may have left a non-cube pipeline bound.
+        shader.Use(scene.wireframeMode);
+    }
+
+    // Fern cards use the regular lit foliage material, but share one model and
+    // one mesh-shader dispatch. CPU work is limited to cheap distance/frustum
+    // tests; no draw call is emitted per plant when mesh shaders are enabled.
+    if (!g_emptyLevelMode && g_fernModel && !g_fernInstances.empty()) {
+        XMFLOAT4 fernFrustum[6];
+        BuildFrustumPlanes(view * proj, fernFrustum);
+        static std::vector<XMMATRIX> visibleFerns;
+        visibleFerns.clear();
+        visibleFerns.reserve(g_fernInstances.size());
+        const float maxFernDistance = g_grass.IsInitialized()
+            ? g_grass.DrawDistance() : 28.0f;
+        for (const FernInstance& fern : g_fernInstances) {
+            const float dx = fern.center.x - scene.camera.Position.x;
+            const float dz = fern.center.z - scene.camera.Position.z;
+            const float range = maxFernDistance + fern.radius;
+            if (dx * dx + dz * dz > range * range ||
+                !SphereVisible(fernFrustum, fern.center, fern.radius)) continue;
+            visibleFerns.push_back(XMLoadFloat4x4(&fern.transform));
+        }
+        DrawSceneNodeInstances(g_fernModel, shader, visibleFerns,
+                               view, proj, lightSpace);
         shader.Use(scene.wireframeMode);
     }
 
@@ -1047,7 +1109,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // root-signature change of its own. (Terrain and grass never draw in the
             // same call, so sharing the slots is safe.)
             GrassField::Params gp = g_grass.GetParams(
-                scene.cameraFOV, static_cast<float>(g_dx12.screenHeight));
+                scene.EffectiveCameraFOV(), static_cast<float>(g_dx12.screenHeight));
             static_assert(sizeof(GrassField::Params) == 13 * sizeof(UINT),
                           "GrassParams must match the 13 root constants at b6");
             g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 13, &gp, 0);
@@ -1203,6 +1265,30 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     shader.Use(scene.wireframeMode);
     for (auto& p : scene.projectiles) {
         if (!p.active) continue;
+        if (p.rocket) {
+            XMVECTOR fwd = XMVector3Normalize(XMLoadFloat3(&p.direction));
+            XMVECTOR up0 = fabsf(XMVectorGetY(fwd)) > 0.95f ? XMVectorSet(1, 0, 0, 0)
+                                                            : XMVectorSet(0, 1, 0, 0);
+            XMVECTOR right = XMVector3Normalize(XMVector3Cross(up0, fwd));
+            XMVECTOR up = XMVector3Cross(fwd, right);
+            XMMATRIX basis = XMMatrixIdentity();
+            basis.r[0] = XMVectorSetW(right, 0.0f);
+            basis.r[1] = XMVectorSetW(up, 0.0f);
+            basis.r[2] = XMVectorSetW(fwd, 0.0f);
+            basis.r[3] = XMVectorSet(p.position.x, p.position.y, p.position.z, 1.0f);
+            if (GunModel::RPGRocketMesh()) {
+                DrawMeshAt(GunModel::RPGRocketMesh(), shader, basis,
+                           view, proj, lightSpace);
+            } else {
+                model = XMMatrixScaling(0.09f, 0.09f, 0.52f) * basis;
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetObjectMaterial(XMFLOAT3(0.18f, 0.20f, 0.12f), false, false,
+                                         0.72f, 0.25f, nullptr, nullptr, nullptr);
+                DrawCube(geo);
+                shader.NextDrawCall();
+            }
+            continue;
+        }
         if (p.grenade) {
             model = XMMatrixScaling(scene.projectileScale * 1.6f, scene.projectileScale * 1.6f,
                                     scene.projectileScale * 1.6f) *
@@ -1280,7 +1366,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Gun: the AK47 model, drawn in the gun's local space (+Z down the barrel)
     // and placed in front of the camera. If the FBX did not load, fall back to
     // the boxed carbine below so the player still sees a weapon.
-    if (scene.gun.visible) {
+    if (scene.gun.visible && !scene.sniperScopeActive) {
         const XMMATRIX gunBase = scene.GetGunBaseMatrix();
         const float S = scene.GunModelScale();
 

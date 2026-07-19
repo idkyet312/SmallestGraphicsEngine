@@ -41,6 +41,8 @@ struct Projectile {
     // Grenade: arcs under gravity and detonates (radial blast) on fuse timeout
     // or first impact. Regular bullets leave these at defaults.
     bool     grenade = false;
+    bool     rocket = false;
+    float    damageMultiplier = 1.0f;
     XMFLOAT3 velocity = { 0, 0, 0 };   // grenades integrate velocity + gravity
     float    fuse = 0.0f;              // seconds until it explodes
     bool     detonate = false;         // set the frame it should explode
@@ -93,6 +95,9 @@ struct Scene {
     // Camera - positioned back so the imported model (a small building) is fully framed at spawn
     Camera camera{ XMFLOAT3(0.0f, 1.7f, 20.0f) };
     float  cameraFOV  = 60.0f;
+    float  sniperScopeFOV = 15.0f;
+    float  sniperScopeBlend = 0.0f;
+    bool   sniperScopeActive = false;
     float  cameraNear  = 0.1f;
     // Far enough to see the sea run out to the horizon; the ocean plane alone is
     // 600 m across, and a 100 m far plane sliced it off in plain view.
@@ -140,11 +145,13 @@ struct Scene {
     std::vector<Projectile> projectiles;
     std::vector<ImpactParticle> impactParticles;  // impact smoke puffs
     std::vector<ExplosionFX> explosionFX;         // animated explosion flipbooks
+    std::function<void(const XMFLOAT3&, float)> explosionAudioCallback;
     std::vector<ExplosiveBarrel> explosiveBarrels;
     float projectileSpeed    = 300.0f;
     float projectileLifetime = 3.0f;
     XMFLOAT3 projectileColor = { 1.0f, 1.0f, 1.0f };
     float projectileScale    = 0.1f;
+    float rocketTurnRate     = 2.8f;    // radians/sec; aim crosshair guides missile
     bool  autoFire           = true;    // hold mouse to keep firing
     float fireInterval       = 0.1f;    // seconds between auto-fire shots
     float fireCooldown       = 0.0f;    // time left before next shot may fire
@@ -385,11 +392,30 @@ struct Scene {
                 p.fuse -= dt;
                 if (p.fuse <= 0.0f) { p.detonate = true; p.active = false; }
             } else {
+                if (p.rocket) {
+                    // Battlefield 2-style wire guidance: rocket bends toward the
+                    // player's current crosshair, with finite steering authority.
+                    const XMVECTOR aim = XMLoadFloat3(&camera.Position) +
+                                         XMLoadFloat3(&camera.Front) * 500.0f;
+                    const XMVECTOR position = XMLoadFloat3(&p.position);
+                    const XMVECTOR current = XMVector3Normalize(XMLoadFloat3(&p.direction));
+                    const XMVECTOR desired = XMVector3Normalize(aim - position);
+                    const float dot = (std::max)(-1.0f, (std::min)(1.0f,
+                        XMVectorGetX(XMVector3Dot(current, desired))));
+                    const float angle = std::acos(dot);
+                    const float blend = angle > 1e-4f
+                        ? (std::min)(1.0f, rocketTurnRate * dt / angle) : 1.0f;
+                    XMStoreFloat3(&p.direction,
+                        XMVector3Normalize(XMVectorLerp(current, desired, blend)));
+                }
                 p.position.x += p.direction.x * p.speed * dt;
                 p.position.y += p.direction.y * p.speed * dt;
                 p.position.z += p.direction.z * p.speed * dt;
                 p.lifetime -= dt;
-                if (p.lifetime <= 0.0f) p.active = false;
+                if (p.lifetime <= 0.0f) {
+                    p.active = false;
+                    if (p.rocket) p.detonate = true;
+                }
 
             }
         }
@@ -443,6 +469,26 @@ struct Scene {
         fx.size = size;
         fx.duration = duration;
         explosionFX.push_back(fx);
+        if (explosionAudioCallback) explosionAudioCallback(center, size);
+
+        SpawnSmokeBurst(center, size * 0.18f, 1.35f);
+        auto randomSigned = []() {
+            return ((float)std::rand() / RAND_MAX) * 2.0f - 1.0f;
+        };
+        for (int i = 0; i < 34; ++i) {
+            ImpactParticle spark;
+            spark.position = center;
+            spark.velocity = {
+                randomSigned() * size * 1.8f,
+                2.5f + std::abs(randomSigned()) * size * 2.2f,
+                randomSigned() * size * 1.8f };
+            spark.maxLife = spark.life = 0.35f + std::abs(randomSigned()) * 0.75f;
+            spark.size = 0.04f + std::abs(randomSigned()) * 0.09f;
+            spark.growth = -spark.size * 0.72f;
+            spark.color = { 1.0f, 0.20f + std::abs(randomSigned()) * 0.34f, 0.01f };
+            spark.spark = true;
+            impactParticles.push_back(spark);
+        }
     }
 
     // Bullet impact: just a soft smoke puff kicked off the surface (no sparks).
@@ -548,11 +594,57 @@ struct Scene {
         projectiles.push_back(p);
     }
 
+    void ShootSniperProjectile() {
+        const XMFLOAT3 aimDirection = camera.Front;
+        camera.ApplyRecoil(recoilPitch * 4.2f, 0.0f);
+        gunRecoilBack = (std::min)(0.16f, gunRecoilBack + 0.12f);
+        gunRecoilKick = (std::min)(12.0f, gunRecoilKick + 7.0f);
+        muzzleFlashTime = muzzleFlashDuration * 1.35f;
+
+        Projectile p = {};
+        p.position = p.previousPosition = GetMuzzleWorldPosition();
+        p.direction = aimDirection;
+        p.speed = 650.0f;
+        p.lifetime = 4.0f;
+        p.active = true;
+        p.damageMultiplier = 5.0f;
+        projectiles.push_back(p);
+    }
+
+    void ShootRocket() {
+        camera.ApplyRecoil(recoilPitch * 4.0f, 0.0f);
+        gunRecoilBack = (std::min)(0.20f, gunRecoilBack + 0.16f);
+        gunRecoilKick = (std::min)(14.0f, gunRecoilKick + 9.0f);
+        muzzleFlashTime = muzzleFlashDuration * 1.8f;
+
+        Projectile p = {};
+        p.position = p.previousPosition = GetMuzzleWorldPosition();
+        p.direction = camera.Front;
+        p.speed = 42.0f;
+        p.lifetime = 6.0f;
+        p.active = true;
+        p.rocket = true;
+        projectiles.push_back(p);
+    }
+
     // Build matrices
+    void UpdateSniperScope(bool active, float dt) {
+        sniperScopeActive = active;
+        const float target = active ? 1.0f : 0.0f;
+        const float response = (std::min)(1.0f, (std::max)(0.0f, dt) * 12.0f);
+        sniperScopeBlend += (target - sniperScopeBlend) * response;
+        if (!active && sniperScopeBlend < 0.001f) sniperScopeBlend = 0.0f;
+    }
+    float EffectiveCameraFOV() const {
+        return cameraFOV + (sniperScopeFOV - cameraFOV) * sniperScopeBlend;
+    }
+    float ScopeLookScale() const {
+        return 1.0f - 0.72f * sniperScopeBlend;
+    }
     XMMATRIX GetViewMatrix()       const { return const_cast<Camera&>(camera).GetViewMatrix(); }
     XMMATRIX GetProjectionMatrix() const {
         XMMATRIX projection = XMMatrixPerspectiveFovLH(
-            XMConvertToRadians(cameraFOV),
+            XMConvertToRadians(EffectiveCameraFOV()),
             (float)g_dx12.screenWidth / (float)g_dx12.screenHeight,
             cameraNear, cameraFar);
         if (g_dx12.screenWidth > 0 && g_dx12.screenHeight > 0) {
