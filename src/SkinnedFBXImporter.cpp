@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <unordered_map>
 
@@ -120,6 +121,15 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
         for (char& c : s) c = (char)tolower((unsigned char)c);
         return s;
     };
+    int headBoneId = -1;
+    for (size_t bone = 0; bone < out.skeleton.names.size(); ++bone) {
+        const std::string name = lowerStr(out.skeleton.names[bone]);
+        if (name.find("head") != std::string::npos &&
+            name.find("end") == std::string::npos) {
+            headBoneId = static_cast<int>(bone);
+            break;
+        }
+    }
 
     // Resolve Blender/FBX material texture paths. Exported FBX files often keep
     // the author's absolute path, so fall back to the matching filename beside
@@ -172,6 +182,9 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
     out.materialKeepAlive.reserve(scene->mNumMeshes);
     std::vector<std::shared_ptr<SceneMaterial>> materialCache(
         scene->mNumMaterials);
+    size_t headMeshesFound = 0;
+    size_t headTrianglesExamined = 0;
+    size_t correctedHeadTriangles = 0;
 
     for (unsigned mi = 0; mi < scene->mNumMeshes; ++mi) {
         const aiMesh* src = scene->mMeshes[mi];
@@ -323,8 +336,51 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
             else { s.boneIndex[0] = 0; s.boneWeight[0] = 1.0f; }
         }
 
+        // Assimp collapses this FBX's named parts into shared material meshes,
+        // so identify the face region by skin influence rather than mesh name.
+        // The head bone's converted skin transform reverses handedness at draw
+        // time, even though bind-pose winding agrees with bind-pose normals.
+        // Pre-flip only head-driven triangles so raster culling sees their
+        // animated outer surface. Body indices and global culling stay intact.
+        bool meshContainsHead = false;
+        if (headBoneId >= 0) {
+            auto headWeight = [&](unsigned vertex) {
+                float weight = 0.0f;
+                for (int influence = 0; influence < 4; ++influence)
+                    if (p.skin[vertex].boneIndex[influence] ==
+                        static_cast<uint32_t>(headBoneId))
+                        weight += p.skin[vertex].boneWeight[influence];
+                return weight;
+            };
+            for (size_t triangle = 0; triangle + 2 < p.indices.size(); triangle += 3) {
+                const unsigned i0 = p.indices[triangle + 0];
+                const unsigned i1 = p.indices[triangle + 1];
+                const unsigned i2 = p.indices[triangle + 2];
+                if (i0 >= src->mNumVertices || i1 >= src->mNumVertices ||
+                    i2 >= src->mNumVertices)
+                    continue;
+                const float influence =
+                    (headWeight(i0) + headWeight(i1) + headWeight(i2)) / 3.0f;
+                if (influence < 0.5f) continue;
+
+                meshContainsHead = true;
+                ++headTrianglesExamined;
+                std::swap(p.indices[triangle + 1], p.indices[triangle + 2]);
+                ++correctedHeadTriangles;
+            }
+        }
+        if (meshContainsHead) ++headMeshesFound;
+
         sourcePrimitives.push_back(std::move(p));
     }
+
+    std::cout << "Bandit head winding: meshes=" << headMeshesFound
+              << " triangles=" << headTrianglesExamined
+              << " corrected=" << correctedHeadTriangles << '\n';
+    std::ofstream("bandit_winding.log", std::ios::trunc)
+        << "meshes=" << headMeshesFound
+        << " triangles=" << headTrianglesExamined
+        << " corrected=" << correctedHeadTriangles << '\n';
 
     // Assimp commonly exposes one tiny aiMesh per authored FBX section even when
     // dozens of sections use the same material. Drawing those sections separately
