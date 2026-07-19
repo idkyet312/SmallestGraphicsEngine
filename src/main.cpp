@@ -4763,6 +4763,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     "models/Barrel Explosive/barrel.FBX",
                     g_dx12.device, g_dx12.commandList, 0.72f, false, true);
                 if (g_explosiveBarrelModel) {
+                    // Asset provides only diffuse + normal maps. Treating its
+                    // unmasked surface as smooth metal creates broad white IBL
+                    // glare over painted/rusted areas. Keep it dielectric and
+                    // substantially rough, without changing other FBX assets.
+                    const auto fixBarrelMaterial = [&](const auto& self,
+                                                       const std::shared_ptr<SceneNode>& node)
+                        -> void {
+                        if (!node) return;
+                        if (node->mesh) for (auto& primitive : node->mesh->primitives) {
+                            if (!primitive.material) continue;
+                            primitive.material->metallicFactor = 0.0f;
+                            primitive.material->roughnessFactor = 0.88f;
+                            primitive.material->metallicRoughnessTexture.Reset();
+                            primitive.material->roughnessOnlyTexture = false;
+                        }
+                        for (const auto& child : node->children) self(self, child);
+                    };
+                    fixBarrelMaterial(fixBarrelMaterial, g_explosiveBarrelModel);
                     g_explosiveBarrelShadowModel = GLBImporter::MergeSceneForDepth(
                         g_explosiveBarrelModel, g_dx12.device);
                     std::cout << "Explosive barrel FBX ready\n";
