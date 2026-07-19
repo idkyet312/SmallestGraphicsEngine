@@ -871,6 +871,40 @@ private:
         }
     }
 
+    void FaceHeadTowardAim() {
+        using namespace DirectX;
+        if (headBone_ < 0 || static_cast<size_t>(headBone_) >= poseGlobals_.size())
+            return;
+        const int parent = model.skeleton.parent[headBone_];
+        if (parent < 0 || static_cast<size_t>(parent) >= poseGlobals_.size())
+            return;
+
+        // Idle/walk clips contain authored head turns. Restore the head's bind
+        // orientation relative to its currently aimed neck: the spine already
+        // tracks aimYaw, so this makes the face inherit the exact player yaw.
+        const XMMATRIX currentHead = XMLoadFloat4x4(&poseGlobals_[headBone_]);
+        const XMMATRIX desiredHead =
+            XMLoadFloat4x4(&model.skeleton.localBind[headBone_]) *
+            XMLoadFloat4x4(&poseGlobals_[parent]);
+        const XMMATRIX headCorrection =
+            XMMatrixInverse(nullptr, currentHead) * desiredHead;
+        for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
+            if (!IsDescendant(static_cast<int>(bone), headBone_)) continue;
+            XMStoreFloat4x4(&poseGlobals_[bone],
+                XMLoadFloat4x4(&poseGlobals_[bone]) * headCorrection);
+        }
+
+        // Pitch the neutralized head toward player height. Keep a natural neck
+        // limit even if weapon aims farther up/down.
+        const float pitch = (std::max)(-XMConvertToRadians(32.0f),
+            (std::min)(XMConvertToRadians(32.0f), aimPitch));
+        const XMVECTOR pivot = XMLoadFloat4x4(&poseGlobals_[headBone_]).r[3];
+        const XMVECTOR rightWorld = XMVectorSet(
+            std::cos(aimYaw), 0.0f, -std::sin(aimYaw), 0.0f);
+        RotateBranchWorld(headBone_, pivot,
+            XMMatrixRotationAxis(rightWorld, -pitch));
+    }
+
     void SolveArmIK(int upper, int lower, int hand, DirectX::FXMVECTOR target) {
         using namespace DirectX;
         if (upper < 0 || lower < 0 || hand < 0) return;
@@ -924,6 +958,8 @@ private:
                 XMLoadFloat4x4(&poseGlobals_[spine]).r[3];
             RotateBranchWorld(spine, pivot, XMMatrixRotationY(upperBodyYaw));
         }
+
+        FaceHeadTowardAim();
 
         const XMFLOAT3 origin = GunOriginWorld();
         const float sx = std::sin(aimYaw), cz = std::cos(aimYaw);
