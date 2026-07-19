@@ -423,7 +423,7 @@ public:
         }
         
         // SRV descriptor table for global textures
-        D3D12_DESCRIPTOR_RANGE globalSrvRanges[3] = {};
+        D3D12_DESCRIPTOR_RANGE globalSrvRanges[4] = {};
         // t0 - shadowMap
         globalSrvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         globalSrvRanges[0].NumDescriptors = 1;
@@ -442,9 +442,16 @@ public:
         globalSrvRanges[2].BaseShaderRegister = 3;
         globalSrvRanges[2].RegisterSpace = 0;
         globalSrvRanges[2].OffsetInDescriptorsFromTableStart = 2;
+        // t15 - HDR equirectangular environment for specular IBL. t14 is the
+        // static-instance root SRV and cannot overlap this descriptor table.
+        globalSrvRanges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        globalSrvRanges[3].NumDescriptors = 1;
+        globalSrvRanges[3].BaseShaderRegister = 15;
+        globalSrvRanges[3].RegisterSpace = 0;
+        globalSrvRanges[3].OffsetInDescriptorsFromTableStart = 3;
         
         rootParams[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rootParams[6].DescriptorTable.NumDescriptorRanges = 3;
+        rootParams[6].DescriptorTable.NumDescriptorRanges = 4;
         rootParams[6].DescriptorTable.pDescriptorRanges = globalSrvRanges;
         rootParams[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
@@ -875,7 +882,8 @@ public:
 
     void BindGlobalResources(ID3D12Resource* shadowMap,
                              ID3D12Resource* irradiance = nullptr,
-                             ID3D12Resource* visibility = nullptr) {
+                             ID3D12Resource* visibility = nullptr,
+                             ID3D12Resource* environment = nullptr) {
         UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
 
@@ -895,6 +903,17 @@ public:
         g_dx12.device->CreateShaderResourceView(irradiance, &colorDesc, cpuHandle);
         cpuHandle.ptr += descriptorSize;
         g_dx12.device->CreateShaderResourceView(visibility, &colorDesc, cpuHandle);
+        cpuHandle.ptr += descriptorSize;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC environmentDesc = {};
+        environmentDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        environmentDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        environmentDesc.Format = environment
+            ? environment->GetDesc().Format : DXGI_FORMAT_R32G32B32A32_FLOAT;
+        environmentDesc.Texture2D.MipLevels = environment
+            ? environment->GetDesc().MipLevels : 1;
+        g_dx12.device->CreateShaderResourceView(
+            environment, &environmentDesc, cpuHandle);
 
         g_dx12.commandList->SetGraphicsRootDescriptorTable(6, g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart());
     }

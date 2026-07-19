@@ -100,14 +100,14 @@ struct Scene {
 
     // Main directional / point light
     XMFLOAT3 lightPos    = { -5.0f, 10.0f, -5.0f };
-    XMFLOAT3 lightColor  = { 1.15f, 1.08f, 0.96f };
+    XMFLOAT3 lightColor  = { 1.22f, 1.10f, 0.94f };
     int      lightType   = 0;
     float    lightConstant  = 1.0f;
     float    lightLinear    = 0.09f;
     float    lightQuadratic = 0.032f;
 
     // Material defaults
-    float ambientStrength   = 0.18f;
+    float ambientStrength   = 0.14f;
     float specularStrength  = 0.5f;
     int   specularShininess = 32;
     float shadowBias        = 0.005f;
@@ -178,12 +178,17 @@ struct Scene {
     bool  enableMSAA = true;
     bool  enableFXAA = false;
     bool  enableVolumetricFog = true;
-    float volumetricFogDensity = 0.0145f;
+    float volumetricFogDensity = 0.0050f;
     float volumetricFogAnisotropy = 0.0f;
     float volumetricFogHeightFalloff = 0.055f;
     float volumetricFogBaseHeight = 1.0f;
-    float volumetricFogDistance = 50.0f;
+    float volumetricFogDistance = 120.0f;
     XMFLOAT3 volumetricFogTint = { 191.0f / 255.0f, 246.0f / 255.0f, 1.0f };
+    bool  enableAmbientOcclusion = true;
+    float ambientOcclusionRadius = 1.35f;
+    float ambientOcclusionStrength = 1.15f;
+    float ambientOcclusionBias = 0.035f;
+    float contactShadowStrength = 0.65f;
     int   destructionGridX = 4;
     int   destructionGridY = 3;
     int   destructionGridZ = 4;

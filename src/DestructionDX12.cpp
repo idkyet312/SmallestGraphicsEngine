@@ -23,6 +23,7 @@
 #include <future>
 #include <iostream>
 #include <list>
+#include <deque>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,6 +38,15 @@ constexpr float DebrisShrinkSeconds = 3.0f;
 constexpr uint32_t MaxAwakeDebrisBodies = 256;
 constexpr uint32_t MaxRetainedDebrisBodies = 1024;
 constexpr float StructuralSolverStep = 1.0f / 15.0f;
+constexpr double StructuralSolverBudgetMs = 0.35;
+constexpr uint32_t MaxStructuresPerSolverSlice = 2;
+constexpr float DebrisCollisionLodAge = 3.0f;
+constexpr float DebrisCollisionLodVolume = 0.035f;
+constexpr float TinyDebrisMaxExtent = 0.20f;
+constexpr float SettledPileFreezeSeconds = 3.0f;
+constexpr uint64_t CollisionCategoryWorld = 1ull << 0;
+constexpr uint64_t CollisionCategoryDebris = 1ull << 1;
+constexpr uint64_t CollisionCategoryLodDebris = 1ull << 2;
 // Uniform starting health for every bond/chunk. A bullet's per-hit damage is a
 // fraction of this, so a joint takes several hits before it lets go.
 constexpr float kBondHealth = 1.0f;
@@ -232,6 +242,7 @@ struct DestructionDX12::Impl {
         int plankGroup = -1;
         bool glass = false;    // window pane cell: any hit shatters the whole pane
         bool sheet = false;    // corrugated roof sheet: a hit tears the whole sheet off
+        uint32_t structureId = 0;
     };
 
     struct ActorRuntime {
@@ -245,6 +256,10 @@ struct DestructionDX12::Impl {
         float debrisAge = 0.0f;
         // Only unsupported, fully detached debris receives cleanup lifetime.
         bool debrisCleanupEligible = false;
+        bool collisionLod = false;
+        bool frozen = false;
+        float settledTime = 0.0f;
+        uint32_t structureId = 0;
         uint64_t renderId = 0;
         uint64_t failedBatchHash = 0;
         XMFLOAT3 batchCenter = {};
@@ -407,12 +422,19 @@ struct DestructionDX12::Impl {
     // World positions where the building just fractured a piece loose this frame;
     // drained by the caller to spawn smoke at the actual break points.
     std::vector<XMFLOAT3> breakPoints;
+    std::vector<TinyDebrisParticle> tinyDebrisParticles;
     float accumulator = 0.0f;
     float maintenanceAccumulator = 0.0f;
     std::unordered_set<uint32_t> bulletWeakenedChunks;
-    bool structuralDirty = false;
-    float structuralDelay = 0.0f;
     float structuralAccumulator = 0.0f;
+    float structuralClock = 0.0f;
+    struct DirtyStructure { uint32_t id = 0; float readyTime = 0.0f; };
+    std::deque<DirtyStructure> dirtyStructures;
+    std::unordered_set<uint32_t> dirtyStructureSet;
+    uint32_t lastBrokenStructure = InvalidIndex;
+    DestructionStressStats stressStats;
+    double stressUpdateTotalMs = 0.0;
+    uint64_t stressStartRebuilds = 0;
     XMFLOAT3 lastDamagePosition = {};
     float lastDamageRadius = 0.0f;
     bool initialized = false;
@@ -700,6 +722,88 @@ struct DestructionDX12::Impl {
             } else {
                 enemy.fireCooldown = 0.18f + ((float)std::rand() / RAND_MAX) * 0.1375f;
             }
+        }
+    }
+
+    float ActorVolume(const ActorRuntime& runtime) const {
+        float volume = 0.0f;
+        for (uint32_t index : runtime.chunks) {
+            const Chunk& chunk = chunks[index];
+            volume += (std::max)(0.0f, chunk.maximum.x - chunk.minimum.x) *
+                      (std::max)(0.0f, chunk.maximum.y - chunk.minimum.y) *
+                      (std::max)(0.0f, chunk.maximum.z - chunk.minimum.z);
+        }
+        return volume;
+    }
+
+    float ActorMaxExtent(const ActorRuntime& runtime) const {
+        XMFLOAT3 lo{ FLT_MAX, FLT_MAX, FLT_MAX };
+        XMFLOAT3 hi{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+        for (uint32_t index : runtime.chunks) {
+            const Chunk& chunk = chunks[index];
+            lo.x = (std::min)(lo.x, chunk.minimum.x);
+            lo.y = (std::min)(lo.y, chunk.minimum.y);
+            lo.z = (std::min)(lo.z, chunk.minimum.z);
+            hi.x = (std::max)(hi.x, chunk.maximum.x);
+            hi.y = (std::max)(hi.y, chunk.maximum.y);
+            hi.z = (std::max)(hi.z, chunk.maximum.z);
+        }
+        return (std::max)({ hi.x - lo.x, hi.y - lo.y, hi.z - lo.z });
+    }
+
+    void SetDebrisCollisionLod(ActorRuntime& runtime, bool lod) {
+        if (B3_IS_NULL(runtime.body) || runtime.collisionLod == lod) return;
+        const int count = b3Body_GetShapeCount(runtime.body);
+        if (count <= 0) return;
+        std::vector<b3ShapeId> shapes(static_cast<size_t>(count));
+        const int found = b3Body_GetShapes(runtime.body, shapes.data(), count);
+        for (int i = 0; i < found; ++i) {
+            b3Filter filter = b3Shape_GetFilter(shapes[i]);
+            filter.categoryBits = lod ? CollisionCategoryLodDebris :
+                (runtime.dynamic ? CollisionCategoryDebris : CollisionCategoryWorld);
+            filter.maskBits = lod ? CollisionCategoryWorld : B3_DEFAULT_MASK_BITS;
+            b3Shape_SetFilter(shapes[i], filter, true);
+            b3Shape_EnableHitEvents(shapes[i], !lod);
+        }
+        runtime.collisionLod = lod;
+    }
+
+    void WakeDebris(ActorRuntime& runtime) {
+        if (B3_IS_NULL(runtime.body) || !runtime.dynamic) return;
+        if (runtime.frozen) {
+            b3Body_SetType(runtime.body, b3_dynamicBody);
+            runtime.frozen = false;
+        }
+        runtime.settledTime = 0.0f;
+        runtime.restTime = 0.0f;
+        runtime.debrisAge = 0.0f;
+        SetDebrisCollisionLod(runtime, false);
+        b3Body_SetAwake(runtime.body, true);
+    }
+
+    void EmitTinyDebris(const ActorRuntime& runtime, const BodySeed* seed) {
+        XMFLOAT3 position = runtime.center;
+        XMFLOAT3 velocity{};
+        if (seed && seed->valid) {
+            const XMVECTOR offset = XMVectorSet(runtime.center.x - seed->modelCenter.x,
+                runtime.center.y - seed->modelCenter.y, runtime.center.z - seed->modelCenter.z, 0.0f);
+            XMFLOAT3 rotated;
+            XMStoreFloat3(&rotated, XMVector3Rotate(offset,
+                XMVectorSet(seed->rotation.v.x, seed->rotation.v.y,
+                            seed->rotation.v.z, seed->rotation.s)));
+            position = { (float)seed->position.x + rotated.x,
+                         (float)seed->position.y + rotated.y,
+                         (float)seed->position.z + rotated.z };
+            velocity = { seed->linearVelocity.x, seed->linearVelocity.y,
+                         seed->linearVelocity.z };
+        }
+        const float size = (std::clamp)(ActorMaxExtent(runtime) * 0.55f, 0.035f, 0.12f);
+        for (int i = 0; i < 3; ++i) {
+            const float rx = (float(std::rand()) / RAND_MAX) * 2.0f - 1.0f;
+            const float rz = (float(std::rand()) / RAND_MAX) * 2.0f - 1.0f;
+            tinyDebrisParticles.push_back({ position,
+                { velocity.x + rx * 1.4f, velocity.y + 0.8f + 0.35f * i,
+                  velocity.z + rz * 1.4f }, size });
         }
     }
 
@@ -1042,6 +1146,25 @@ struct DestructionDX12::Impl {
             bondPairs.push_back({ c.a, c.b });
         }
 
+        // Initial connected components are independent buildings/structures.
+        // Damage schedules only the affected component in the structural queue.
+        std::vector<uint32_t> parent(chunks.size());
+        for (uint32_t i = 0; i < parent.size(); ++i) parent[i] = i;
+        std::function<uint32_t(uint32_t)> findRoot = [&](uint32_t v) -> uint32_t {
+            return parent[v] == v ? v : (parent[v] = findRoot(parent[v]));
+        };
+        for (const BondPair& pair : bondPairs) {
+            const uint32_t a = findRoot(pair.a), b = findRoot(pair.b);
+            if (a != b) parent[b] = a;
+        }
+        std::unordered_map<uint32_t, uint32_t> componentIds;
+        for (uint32_t i = 0; i < chunks.size(); ++i) {
+            const uint32_t root = findRoot(i);
+            auto [it, inserted] = componentIds.emplace(root,
+                static_cast<uint32_t>(componentIds.size()));
+            chunks[i].structureId = it->second;
+        }
+
         TkAssetDesc assetDesc;
         assetDesc.chunkCount = (uint32_t)chunkDescs.size(); assetDesc.chunkDescs = chunkDescs.data();
         assetDesc.bondCount = (uint32_t)bonds.size(); assetDesc.bondDescs = bonds.data();
@@ -1067,6 +1190,7 @@ struct DestructionDX12::Impl {
         auto runtime = std::make_unique<ActorRuntime>();
         runtime->actor = actor;
         runtime->renderId = nextActorRenderId++;
+        runtime->structureId = chunks.empty() ? 0 : chunks.front().structureId;
         runtime->chunks.resize(chunks.size());
         for (uint32_t i = 0; i < chunks.size(); ++i) runtime->chunks[i] = i;
         actor->userData = runtime.get();
@@ -1249,6 +1373,9 @@ struct DestructionDX12::Impl {
         // foundation chunks; otherwise a projectile hitting the bottom row can
         // split correctly but appear to do nothing.
         runtime.dynamic = forceDynamic;
+        runtime.frozen = false;
+        runtime.collisionLod = false;
+        runtime.settledTime = 0.0f;
         b3BodyDef bodyDef = b3DefaultBodyDef();
         bodyDef.type = runtime.dynamic ? b3_dynamicBody : b3_staticBody;
         bodyDef.enableSleep = true;
@@ -1273,6 +1400,8 @@ struct DestructionDX12::Impl {
         bodyDef.linearDamping = 0.05f; bodyDef.angularDamping = 0.12f;
         runtime.body = b3CreateBody(world, &bodyDef);
         b3ShapeDef shapeDef = b3DefaultShapeDef();
+        shapeDef.filter.categoryBits = runtime.dynamic ?
+            CollisionCategoryDebris : CollisionCategoryWorld;
         // Keep fragments light so ordinary projectile impulses move them and,
         // more importantly, so a fallen sheet resting on a ragdoll or on other
         // debris settles onto it rather than bulldozing it. Zero restitution
@@ -1878,7 +2007,10 @@ struct DestructionDX12::Impl {
         ActorRuntime* hitActor = nullptr;
         uint32_t hitChunk = InvalidIndex;
         if (!FindNearestBreakableCell(worldPosition, hitActor, hitChunk)) return false;
-        if (hitActor->debrisCleanupEligible) hitActor->debrisAge = 0.0f;
+        lastBrokenStructure = chunks[hitChunk].structureId;
+        if (hitActor->debrisCleanupEligible) {
+            WakeDebris(*hitActor);
+        }
         lastDamagePosition = worldPosition;  // outward burst origin for the split
         const int hitGroup = chunks[hitChunk].plankGroup;
         // Corrugated sheet still on the roof: cut only the bonds leaving its
@@ -1917,15 +2049,25 @@ struct DestructionDX12::Impl {
         return true;
     }
 
-    void MarkStructureDirty(float delay = 0.15f) {
-        structuralDirty = true;
-        structuralDelay = (std::max)(structuralDelay, delay);
+    void MarkStructureDirty(uint32_t structureId, float delay = 0.15f) {
+        if (structureId == InvalidIndex) return;
+        const float ready = structuralClock + delay;
+        if (dirtyStructureSet.insert(structureId).second) {
+            dirtyStructures.push_back({ structureId, ready });
+        } else {
+            for (DirtyStructure& entry : dirtyStructures) {
+                if (entry.id == structureId) {
+                    entry.readyTime = (std::max)(entry.readyTime, ready);
+                    break;
+                }
+            }
+        }
     }
 
     // One conservative connectivity relaxation pass. Damage marks the graph
     // dirty; Update runs at most one pass per 15 Hz slice. Stable structures do
     // no solver work, and cascades naturally acquire a short physical delay.
-    bool DropUnderConnectedPass() {
+    bool DropUnderConnectedPass(uint32_t structureId) {
         // Drop a piece only once it has NO live bonds left. Using a higher
         // threshold cascades: isolating the struck chunk drops its neighbours to
         // one bond, which would then fall too, chaining across the whole wall.
@@ -1961,6 +2103,7 @@ struct DestructionDX12::Impl {
                 std::vector<uint8_t> mask(chunks.size() + 1, 0);  // asset chunk index; 0 = root
                 bool actorMarked = false;
                 for (uint32_t chunkIndex : runtime->chunks) {
+                    if (chunks[chunkIndex].structureId != structureId) continue;
                     if (chunks[chunkIndex].support) continue;         // anchored: never auto-drop
                     if (chunks[chunkIndex].plankGroup >= 0) continue;  // plank sub-pieces break only on a hit, not by the low-bond rule
                     if (runtime->chunks.size() <= 1) continue;         // already a loose single piece
@@ -1983,16 +2126,38 @@ struct DestructionDX12::Impl {
     }
 
     bool UpdateStructuralSolver(float dt) {
-        if (!structuralDirty) return false;
-        structuralDelay = (std::max)(0.0f, structuralDelay - dt);
-        if (structuralDelay > 0.0f) return false;
+        structuralClock += dt;
+        if (dirtyStructures.empty()) return false;
         structuralAccumulator += dt;
         if (structuralAccumulator < StructuralSolverStep) return false;
         structuralAccumulator = std::fmod(structuralAccumulator,
             StructuralSolverStep);
-        const bool broke = DropUnderConnectedPass();
-        structuralDirty = broke;
-        return broke;
+        const auto begin = std::chrono::steady_clock::now();
+        bool anyBroke = false;
+        uint32_t processed = 0;
+        const size_t available = dirtyStructures.size();
+        for (size_t scanned = 0; scanned < available &&
+             processed < MaxStructuresPerSolverSlice; ++scanned) {
+            DirtyStructure entry = dirtyStructures.front();
+            dirtyStructures.pop_front();
+            if (entry.readyTime > structuralClock) {
+                dirtyStructures.push_back(entry);
+                continue;
+            }
+            const bool broke = DropUnderConnectedPass(entry.id);
+            anyBroke = anyBroke || broke;
+            ++processed;
+            if (broke) {
+                entry.readyTime = structuralClock + StructuralSolverStep;
+                dirtyStructures.push_back(entry);
+            } else {
+                dirtyStructureSet.erase(entry.id);
+            }
+            const double elapsed = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - begin).count();
+            if (elapsed >= StructuralSolverBudgetMs) break;
+        }
+        return anyBroke;
     }
 
     // Hard aftermath budget. Preserve fast/new pieces. First sleep old slow
@@ -2264,6 +2429,7 @@ bool DestructionDX12::VehicleReady() const {
 
 void DestructionDX12::Update(float dt) {
     if (!m->initialized) return;
+    const auto updateBegin = std::chrono::steady_clock::now();
     const bool batchCompleted = m->PollBatchBuild();
     const bool spatialBatchCompleted = m->PollSpatialBatchBuild();
     const bool structuralBroke = m->UpdateStructuralSolver(dt);
@@ -2298,6 +2464,10 @@ void DestructionDX12::Update(float dt) {
             continue;
         }
         runtime.debrisAge += maintenanceDt;
+        if (!runtime.collisionLod &&
+            (runtime.debrisAge >= DebrisCollisionLodAge ||
+             m->ActorVolume(runtime) <= DebrisCollisionLodVolume))
+            m->SetDebrisCollisionLod(runtime, true);
         debrisShrinking = debrisShrinking || runtime.debrisAge >=
             DebrisLifetimeSeconds - DebrisShrinkSeconds;
         if (runtime.debrisAge < DebrisLifetimeSeconds) {
@@ -2321,6 +2491,7 @@ void DestructionDX12::Update(float dt) {
         ? (1.0f / 30.0f) : (1.0f / 60.0f);
     bool anyImpactBroke = false;
     bool physicsStepped = false;
+    const auto physicsBegin = std::chrono::steady_clock::now();
     while (m->accumulator >= step) {
         physicsStepped = true;
         m->ApplyWaterBuoyancy();
@@ -2343,9 +2514,15 @@ void DestructionDX12::Update(float dt) {
         int budget = 2;  // low impact damage: at most two cells per step
         for (const XMFLOAT3& point : hitPoints) {
             if (budget <= 0) break;
-            if (m->BreakNearestCell(point)) { --budget; anyImpactBroke = true; }
+            if (m->BreakNearestCell(point)) {
+                --budget;
+                anyImpactBroke = true;
+                m->MarkStructureDirty(m->lastBrokenStructure);
+            }
         }
     }
+    const double physicsMilliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - physicsBegin).count();
     // Dense debris piles can jitter below visible motion forever and Box3D then
     // keeps thousands of tiny actors awake. Promote genuinely low-energy pieces
     // to sleep so they enter spatial render batches. Any later contact/impulse
@@ -2353,11 +2530,25 @@ void DestructionDX12::Update(float dt) {
     bool sleepStateChanged = false;
     for (const auto& runtime : m->actors) {
         if (!maintenanceDue) break;
-        if (!runtime->dynamic || B3_IS_NULL(runtime->body) ||
-            !b3Body_IsAwake(runtime->body)) {
+        if (!runtime->dynamic || B3_IS_NULL(runtime->body)) {
             runtime->restTime = 0.0f;
             continue;
         }
+        if (runtime->frozen) continue;
+        if (!b3Body_IsAwake(runtime->body)) {
+            runtime->restTime = 0.0f;
+            runtime->settledTime += maintenanceDt;
+            if (runtime->settledTime >= SettledPileFreezeSeconds) {
+                // Static bodies do not form solver islands with one another.
+                // Existing spatial render batching merges their visible pile.
+                b3Body_SetType(runtime->body, b3_staticBody);
+                runtime->frozen = true;
+                m->SetDebrisCollisionLod(*runtime, true);
+                sleepStateChanged = true;
+            }
+            continue;
+        }
+        runtime->settledTime = 0.0f;
         const b3Pos position = b3Body_GetPosition(runtime->body);
         if (m->waterEnabled && m->InWaterColumn(position)) {
             runtime->restTime = 0.0f;
@@ -2380,7 +2571,6 @@ void DestructionDX12::Update(float dt) {
             runtime->restTime = 0.0f;
         }
     }
-    if (anyImpactBroke) m->MarkStructureDirty();
     const bool debrisBudgetChanged = maintenanceDue &&
         m->EnforceDebrisBudget();
     m->UpdateEnemyFire(dt);
@@ -2404,8 +2594,51 @@ void DestructionDX12::Update(float dt) {
         structuralBroke || debrisBudgetChanged ||
         batchCompleted || spatialBatchCompleted ||
         debrisExpired || debrisShrinking) {
+        const auto rebuildBegin = std::chrono::steady_clock::now();
         m->RebuildRenderItems();
+        const double rebuildMilliseconds = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - rebuildBegin).count();
+        if (m->stressStats.running)
+            m->stressStats.peakRenderRebuildMilliseconds = (std::max)(
+                m->stressStats.peakRenderRebuildMilliseconds, rebuildMilliseconds);
         m->rebuiltWhileStill = !moving;
+    }
+    if (m->stressStats.running) {
+        const double updateMilliseconds = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - updateBegin).count();
+        m->stressStats.elapsedSeconds += dt;
+        ++m->stressStats.sampledFrames;
+        const double frameMilliseconds = static_cast<double>(dt) * 1000.0;
+        m->stressStats.averageFrameMilliseconds =
+            static_cast<double>(m->stressStats.elapsedSeconds) * 1000.0 /
+            static_cast<double>(m->stressStats.sampledFrames);
+        m->stressStats.peakFrameMilliseconds = (std::max)(
+            m->stressStats.peakFrameMilliseconds, frameMilliseconds);
+        m->stressUpdateTotalMs += updateMilliseconds;
+        m->stressStats.averageUpdateMilliseconds = m->stressUpdateTotalMs /
+            static_cast<double>(m->stressStats.sampledFrames);
+        m->stressStats.peakUpdateMilliseconds = (std::max)(
+            m->stressStats.peakUpdateMilliseconds, updateMilliseconds);
+        m->stressStats.peakPhysicsMilliseconds = (std::max)(
+            m->stressStats.peakPhysicsMilliseconds, physicsMilliseconds);
+        m->stressStats.peakActors = (std::max)(m->stressStats.peakActors,
+            static_cast<uint32_t>(m->actors.size()));
+        uint32_t awake = 0, lod = 0, frozen = 0;
+        for (const auto& runtime : m->actors) {
+            awake += runtime->dynamic && !B3_IS_NULL(runtime->body) &&
+                b3Body_IsAwake(runtime->body) ? 1u : 0u;
+            lod += runtime->collisionLod ? 1u : 0u;
+            frozen += runtime->frozen ? 1u : 0u;
+        }
+        m->stressStats.peakAwakeActors = (std::max)(
+            m->stressStats.peakAwakeActors, awake);
+        m->stressStats.collisionLodBodies = lod;
+        m->stressStats.frozenBodies = frozen;
+        m->stressStats.renderRebuilds = m->renderItemRebuildCount -
+            m->stressStartRebuilds;
+        if (m->stressStats.elapsedSeconds >= 8.0f ||
+            (m->stressStats.elapsedSeconds >= 1.0f && awake == 0))
+            m->stressStats.running = false;
     }
 }
 
@@ -2646,7 +2879,7 @@ void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float rad
     m->bulletWeakenedChunks.erase(hitChunk);
     const uint32_t actorsBefore = (uint32_t)m->actors.size();
     m->BreakNearestCell(worldPosition);
-    m->MarkStructureDirty();
+    m->MarkStructureDirty(m->lastBrokenStructure);
     m->RebuildRenderItems();
     std::cout << "Blast hit: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
 }
@@ -2664,6 +2897,7 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
     // building around the blast breaks apart at once.
     std::list<std::vector<uint8_t>> masks;
     std::list<IsolateChunksParams> paramStore;
+    std::unordered_set<uint32_t> damagedStructures;
     const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
     for (auto& runtime : m->actors) {
         if (!runtime->actor) continue;
@@ -2683,6 +2917,7 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
             if (dx * dx + dy * dy + dz * dz <= radiusSquared) {
                 mask[chunkIndex + 1] = 1;
                 marked = true;
+                damagedStructures.insert(chunk.structureId);
             }
         }
         if (marked) {
@@ -2693,7 +2928,8 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
     }
     const uint32_t actorsBefore = (uint32_t)m->actors.size();
     m->group->process();
-    m->MarkStructureDirty();
+    for (uint32_t structureId : damagedStructures)
+        m->MarkStructureDirty(structureId);
     m->RebuildRenderItems();
 
     // Blow the freed fragments outward from the blast centre, falling off with
@@ -2717,7 +2953,7 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
         const XMVECTOR pos = XMVectorSet((float)bp.x, (float)bp.y, (float)bp.z, 0.0f);
         const float dist = XMVectorGetX(XMVector3Length(pos - center));
         if (dist > radius && !blastOverlapsChunk) continue;
-        if (runtime->debrisCleanupEligible) runtime->debrisAge = 0.0f;
+        if (runtime->debrisCleanupEligible) m->WakeDebris(*runtime);
         XMVECTOR dir = pos - center;
         if (dist < 0.001f) dir = XMVectorSet(0, 1, 0, 0);  // at the centre: straight up
         dir = XMVector3Normalize(dir + XMVectorSet(0, 0.4f, 0, 0));
@@ -2796,7 +3032,7 @@ bool DestructionDX12::ApplyImpulse(const XMFLOAT3& worldPosition,
             XMVectorSet((float)bodyPosition.x, (float)bodyPosition.y, (float)bodyPosition.z, 0.0f);
         const float distanceSquared = XMVectorGetX(XMVector3LengthSq(bodyCenter - hitPoint));
         if (distanceSquared > falloffSquared) continue;
-        if (runtime->debrisCleanupEligible) runtime->debrisAge = 0.0f;
+        if (runtime->debrisCleanupEligible) m->WakeDebris(*runtime);
         const float scale = 1.0f - std::sqrt(distanceSquared) / falloffRadius;
         // Cap the resulting velocity change: a fixed impulse on a feather-light
         // fragment (a glass shard) would otherwise launch it at bullet speed.
@@ -2836,6 +3072,13 @@ std::vector<XMFLOAT3> DestructionDX12::DrainBreakPoints() {
     if (!m) return {};
     std::vector<XMFLOAT3> out = std::move(m->breakPoints);
     m->breakPoints.clear();
+    return out;
+}
+
+std::vector<TinyDebrisParticle> DestructionDX12::DrainTinyDebrisParticles() {
+    if (!m) return {};
+    std::vector<TinyDebrisParticle> out = std::move(m->tinyDebrisParticles);
+    m->tinyDebrisParticles.clear();
     return out;
 }
 
@@ -2958,6 +3201,16 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
                     runtime->chunks.push_back(assetChunk - 1);
             }
             if (runtime->chunks.empty()) continue;
+            runtime->structureId = m->chunks[runtime->chunks.front()].structureId;
+            for (uint32_t chunkIndex : runtime->chunks) {
+                runtime->center.x += m->chunks[chunkIndex].center.x;
+                runtime->center.y += m->chunks[chunkIndex].center.y;
+                runtime->center.z += m->chunks[chunkIndex].center.z;
+            }
+            const float centerInv = 1.0f / static_cast<float>(runtime->chunks.size());
+            runtime->center.x *= centerInv;
+            runtime->center.y *= centerInv;
+            runtime->center.z *= centerInv;
             child->userData = runtime.get();
             // An island still containing an anchored support chunk is part of
             // the standing structure -> keep it static. Islands with no support
@@ -2965,6 +3218,14 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
             bool islandSupported = false;
             for (uint32_t chunkIndex : runtime->chunks) {
                 if (m->chunks[chunkIndex].support) { islandSupported = true; break; }
+            }
+            if (!islandSupported && runtime->chunks.size() == 1 &&
+                m->ActorMaxExtent(*runtime) <= TinyDebrisMaxExtent) {
+                child->userData = nullptr;
+                child->removeFromGroup();
+                m->EmitTinyDebris(*runtime, &seed);
+                if (m->stressStats.running) m->stressStats.tinyParticles += 3;
+                continue;
             }
             m->CreateBody(*runtime, !islandSupported, islandSupported ? nullptr : &seed);
             // This is the zero-health transition. Start a fresh inactivity
@@ -3073,6 +3334,36 @@ std::vector<DestructionDebrisHazard> DestructionDX12::GetDangerousDebris(
     return hazards;
 }
 
+void DestructionDX12::StartCollapseStressBenchmark() {
+    if (!m || !m->initialized || m->chunks.empty()) return;
+    m->stressStats = {};
+    m->stressStats.running = true;
+    m->stressUpdateTotalMs = 0.0;
+    m->stressStartRebuilds = m->renderItemRebuildCount;
+    XMFLOAT3 lo{ FLT_MAX, FLT_MAX, FLT_MAX };
+    XMFLOAT3 hi{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    for (const Impl::Chunk& chunk : m->chunks) {
+        lo.x = (std::min)(lo.x, chunk.minimum.x);
+        lo.y = (std::min)(lo.y, chunk.minimum.y);
+        lo.z = (std::min)(lo.z, chunk.minimum.z);
+        hi.x = (std::max)(hi.x, chunk.maximum.x);
+        hi.y = (std::max)(hi.y, chunk.maximum.y);
+        hi.z = (std::max)(hi.z, chunk.maximum.z);
+    }
+    const XMFLOAT3 center{ (lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
+                           (lo.z + hi.z) * 0.5f };
+    const float dx = hi.x - lo.x, dy = hi.y - lo.y, dz = hi.z - lo.z;
+    const float radius = std::sqrt(dx * dx + dy * dy + dz * dz) * 0.55f + 1.0f;
+    const auto begin = std::chrono::steady_clock::now();
+    ApplyExplosion(center, radius, 1000.0f, 35.0f);
+    m->stressStats.triggerMilliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - begin).count();
+}
+
+DestructionStressStats DestructionDX12::GetStressStats() const {
+    return m ? m->stressStats : DestructionStressStats{};
+}
+
 bool DestructionDX12::IsInitialized() const { return m && m->initialized; }
 uint32_t DestructionDX12::GetChunkCount() const { return m ? (uint32_t)m->chunks.size() : 0; }
 uint32_t DestructionDX12::GetActorCount() const { return m ? (uint32_t)m->actors.size() : 0; }
@@ -3108,6 +3399,18 @@ uint32_t DestructionDX12::GetLowMotionActorCount() const {
 }
 uint32_t DestructionDX12::GetSpatialBatchCount() const {
     return m ? static_cast<uint32_t>(m->spatialBatchCache.size()) : 0;
+}
+uint32_t DestructionDX12::GetCollisionLodActorCount() const {
+    if (!m) return 0;
+    uint32_t count = 0;
+    for (const auto& runtime : m->actors) count += runtime->collisionLod ? 1u : 0u;
+    return count;
+}
+uint32_t DestructionDX12::GetFrozenActorCount() const {
+    if (!m) return 0;
+    uint32_t count = 0;
+    for (const auto& runtime : m->actors) count += runtime->frozen ? 1u : 0u;
+    return count;
 }
 bool DestructionDX12::IsBatchBuildPending() const {
     return m && (m->batchBuildInFlight || m->spatialBatchBuildInFlight);

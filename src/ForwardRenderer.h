@@ -35,6 +35,7 @@ extern std::shared_ptr<SceneNode> g_explosiveBarrelShadowModel;
 extern std::shared_ptr<SceneNode> g_humveeModel;
 extern std::shared_ptr<SceneNode> g_humveeShadowModel;
 extern std::shared_ptr<SceneNode> g_helicopterModel;
+extern ID3D12Resource* g_skyEnvironmentResource;
 extern DirectX::XMFLOAT3 g_helicopterPosition;
 extern bool g_stressTestMode;
 extern bool g_emptyLevelMode;
@@ -321,8 +322,9 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
         if (prim.vbv.BufferLocation == 0) continue;
 
         const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
+        const bool alphaCutout = prim.material && prim.material->alphaCutout;
         const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
-            !transparent && !prim.skinBuffer &&
+            !transparent && !alphaCutout && !prim.skinBuffer &&
             !prim.vertices.empty();
         if (visibilityExtensionsOnly && visibilityOwned) continue;
         if (prim.material) {
@@ -410,8 +412,9 @@ inline void CollectForwardExtensionNodes(const std::shared_ptr<SceneNode>& node,
         if (prim.vbv.BufferLocation == 0) continue;
         const bool transparent = prim.material &&
             prim.material->baseColorFactor.w < 0.999f;
+        const bool alphaCutout = prim.material && prim.material->alphaCutout;
         const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
-            !transparent && !prim.skinBuffer && !prim.vertices.empty();
+            !transparent && !alphaCutout && !prim.skinBuffer && !prim.vertices.empty();
         if (!visibilityOwned) {
             nodeHasExtensions = true;
             break;
@@ -464,8 +467,9 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
             if (prim.vbv.BufferLocation == 0) continue;
 
             const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
+            const bool alphaCutout = prim.material && prim.material->alphaCutout;
             const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
-                !transparent && !prim.skinBuffer &&
+                !transparent && !alphaCutout && !prim.skinBuffer &&
                 !prim.vertices.empty();
             if (visibilityExtensionsOnly && visibilityOwned) continue;
             const D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress = prim.meshletDescBuffer
@@ -734,7 +738,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     XMMATRIX proj = scene.GetProjectionMatrix();
 
     shader.Use(scene.wireframeMode);
-    shader.BindGlobalResources(shadowMap);
+    shader.BindGlobalResources(shadowMap, nullptr, nullptr,
+        g_skyEnvironmentResource);
 
     shader.SetLight(scene.lightPos, scene.lightType, scene.lightColor,
                     scene.lightConstant, scene.lightLinear, scene.lightQuadratic,
@@ -959,10 +964,11 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // are unused by the raster path, so the grass borrows them and needs no
             // root-signature change of its own. (Terrain and grass never draw in the
             // same call, so sharing the slots is safe.)
-            GrassField::Params gp = g_grass.GetParams();
-            static_assert(sizeof(GrassField::Params) == 12 * sizeof(UINT),
-                          "GrassParams must match the 12 root constants at b6");
-            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 12, &gp, 0);
+            GrassField::Params gp = g_grass.GetParams(
+                scene.cameraFOV, static_cast<float>(g_dx12.screenHeight));
+            static_assert(sizeof(GrassField::Params) == 13 * sizeof(UINT),
+                          "GrassParams must match the 13 root constants at b6");
+            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 13, &gp, 0);
             g_dx12.commandList->SetGraphicsRootShaderResourceView(9, ginst);
 
             g_dx12.commandList->SetPipelineState(

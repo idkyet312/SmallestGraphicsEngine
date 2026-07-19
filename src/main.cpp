@@ -42,6 +42,7 @@
 #include "OcclusionDepthDX12.h"
 #include "FXAADX12.h"
 #include "VolumetricFogDX12.h"
+#include "ScreenSpaceAODX12.h"
 #include "MSAADX12.h"
 #include "DestructionDX12.h"
 #include "FBXImporter.h"
@@ -1228,11 +1229,13 @@ WaterVolume                 g_ocean;   // sea ringing the island, surface at y =
 PalmTrees                   g_trees;
 GrassField                  g_grass;
 static SkyRendererDX12      skyRenderer;
+ID3D12Resource*             g_skyEnvironmentResource = nullptr;
 static OcclusionDepthDX12   occlusionDepth;
 static XMMATRIX             previousHZBViewProjection = XMMatrixIdentity();
 static bool                 hzbCaptureActive = false;
 static FXAADX12             fxaa;
 static VolumetricFogDX12    volumetricFog;
+static ScreenSpaceAODX12    screenSpaceAO;
 static MSAADX12             msaa;
 static bool                 msaaUsedLastFrame = false;
 static VisibilityBufferDX12 visBuffer;
@@ -1830,6 +1833,9 @@ static void LoadFloorMudMaterial() {
     floorMaterial->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
     floorMaterial->metallicFactor = 0.0f;
     floorMaterial->roughnessFactor = 1.0f;
+    // Negative view-fill tags terrain for macro/detail/slope blending in both
+    // forward and visibility material paths. Other materials keep normal fill.
+    floorMaterial->viewFillStrength = -1.0f;
 
     // Grass ground (ambientCG Grass004). The blades from GrassField stand ON this,
     // so the ground reads as turf between the tufts instead of bare dirt showing
@@ -2226,8 +2232,14 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
                 // collapses the TBN to zero and the normal map samples as noise.
                 const XMFLOAT3 tangent = faceX ? XMFLOAT3(0, 0, 1)   // U runs along Z
                                        : XMFLOAT3(1, 0, 0);           // U runs along X
+                const XMFLOAT3 bitangent = faceY ? XMFLOAT3(0, 0, 1)
+                                                 : XMFLOAT3(0, 1, 0);
+                const XMVECTOR crossNT = XMVector3Cross(
+                    XMLoadFloat3(&n), XMLoadFloat3(&tangent));
+                const float tangentW = XMVectorGetX(XMVector3Dot(
+                    crossNT, XMLoadFloat3(&bitangent))) >= 0.0f ? 1.0f : -1.0f;
                 const float vertex[12] = { p.x,p.y,p.z, n.x,n.y,n.z, u,v,
-                                           tangent.x, tangent.y, tangent.z, 1 };
+                                           tangent.x, tangent.y, tangent.z, tangentW };
                 primitive.vertices.insert(primitive.vertices.end(), vertex, vertex + 12);
             }
             primitive.indices.insert(primitive.indices.end(),
@@ -2347,6 +2359,35 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
                 const UINT base = (UINT)(prim.vertices.size() / 12);
                 const XMFLOAT3 pts[3] = { ta, tb, tc };
                 const bool faceX = std::abs(n.x) > 0.5f, faceY = std::abs(n.y) > 0.5f;
+                auto uvFor = [&](const XMFLOAT3& p) {
+                    if (faceX) return XMFLOAT2(p.z / kUvScale, p.y / kUvScale);
+                    if (faceY) return XMFLOAT2(p.x / kUvScale, p.z / kUvScale);
+                    return XMFLOAT2(p.x / kUvScale, p.y / kUvScale);
+                };
+                const XMFLOAT2 uv0 = uvFor(ta), uv1 = uvFor(tb), uv2 = uvFor(tc);
+                const XMFLOAT3 edge1(tb.x - ta.x, tb.y - ta.y, tb.z - ta.z);
+                const XMFLOAT3 edge2(tc.x - ta.x, tc.y - ta.y, tc.z - ta.z);
+                const float du1 = uv1.x - uv0.x, dv1 = uv1.y - uv0.y;
+                const float du2 = uv2.x - uv0.x, dv2 = uv2.y - uv0.y;
+                const float uvDet = du1 * dv2 - dv1 * du2;
+                XMFLOAT3 generatedTangent = tan;
+                float tangentW = 1.0f;
+                if (std::abs(uvDet) > 0.000001f) {
+                    const float invDet = 1.0f / uvDet;
+                    XMVECTOR tangentV = XMVectorSet(
+                        (edge1.x * dv2 - edge2.x * dv1) * invDet,
+                        (edge1.y * dv2 - edge2.y * dv1) * invDet,
+                        (edge1.z * dv2 - edge2.z * dv1) * invDet, 0.0f);
+                    const XMVECTOR bitangentV = XMVectorSet(
+                        (edge2.x * du1 - edge1.x * du2) * invDet,
+                        (edge2.y * du1 - edge1.y * du2) * invDet,
+                        (edge2.z * du1 - edge1.z * du2) * invDet, 0.0f);
+                    tangentV = XMVector3Normalize(tangentV);
+                    XMStoreFloat3(&generatedTangent, tangentV);
+                    tangentW = XMVectorGetX(XMVector3Dot(
+                        XMVector3Cross(XMLoadFloat3(&n), tangentV), bitangentV)) >= 0.0f
+                        ? 1.0f : -1.0f;
+                }
                 for (const XMFLOAT3& p : pts) {
                     // World-scaled tiling per dominant face axis (same rule as
                     // addBox) -> uniform texel size on the jagged side walls.
@@ -2358,14 +2399,14 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
                     else            { u = p.x; v = p.y; }
                     u /= kUvScale; v /= kUvScale;
                     // Tilt into world space if a transform was supplied.
-                    XMFLOAT3 wp = p, wn = n, wt = tan;
+                    XMFLOAT3 wp = p, wn = n, wt = generatedTangent;
                     if (xform) {
                         XMStoreFloat3(&wp, XMVector3Transform(XMLoadFloat3(&p), *xform));
                         XMStoreFloat3(&wn, XMVector3Normalize(XMVector3TransformNormal(XMLoadFloat3(&n), *xform)));
                         XMStoreFloat3(&wt, XMVector3Normalize(XMVector3TransformNormal(XMLoadFloat3(&tan), *xform)));
                     }
                     const float vert[12] = { wp.x,wp.y,wp.z, wn.x,wn.y,wn.z, u,v,
-                                             wt.x,wt.y,wt.z, 1 };
+                                             wt.x,wt.y,wt.z, tangentW };
                     prim.vertices.insert(prim.vertices.end(), vert, vert + 12);
                 }
                 prim.indices.insert(prim.indices.end(), { base, base + 1, base + 2 });
@@ -3769,6 +3810,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     if (!skyRenderer.Init()) {
         std::cerr << "HDRI sky init failed (non-fatal)\n";
     }
+    g_skyEnvironmentResource = skyRenderer.skyTexture.Get();
     ThrowIfFailed(g_dx12.commandList->Close());
     {
         ID3D12CommandList* skyLists[] = { g_dx12.commandList.Get() };
@@ -3778,7 +3820,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_mipGen.FlushPending();
     DumpDX12DebugMessages();
     {
-        auto skySH = GLBImporter::ComputeSkyIrradianceSH("models/Skyboxes/sunny_rose_garden_2k.exr");
+        auto skySH = GLBImporter::ComputeSkyIrradianceSH(kSkyEnvironmentPath);
         mainShader.SetSkyIrradiance(skySH, 1.0f);
     }
     if (!occlusionDepth.Init(SCR_WIDTH, SCR_HEIGHT)) {
@@ -3791,6 +3833,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     if (!volumetricFog.Init()) {
         std::cerr << "Volumetric fog init failed (non-fatal)\n";
         scene.enableVolumetricFog = false;
+    }
+    if (!screenSpaceAO.Init()) {
+        std::cerr << "Screen-space AO init failed (non-fatal)\n";
+        scene.enableAmbientOcclusion = false;
     }
     const bool msaaPipelinesReady =
         mainShader.msaaSupported &&
@@ -3820,6 +3866,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cerr << "VB init failed (non-fatal)\n";
         scene.useVisibilityBuffer = false;
     } else {
+        visBuffer.UpdateEnvironmentMap(g_skyEnvironmentResource);
         std::cout << "Visibility Buffer ready\n";
     }
 
@@ -4165,6 +4212,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // Smoke at the actual fracture points where pieces broke loose.
             for (const XMFLOAT3& bp : g_destruction.DrainBreakPoints())
                 scene.SpawnSmokeBurst(bp, 0.5f, 0.4f);
+            for (const TinyDebrisParticle& tiny :
+                 g_destruction.DrainTinyDebrisParticles()) {
+                ImpactParticle particle;
+                particle.position = tiny.position;
+                particle.velocity = tiny.velocity;
+                particle.maxLife = particle.life = 0.8f;
+                particle.size = tiny.size;
+                particle.growth = -tiny.size * 0.75f;
+                particle.color = { 0.36f, 0.31f, 0.25f };
+                particle.spark = true;
+                scene.impactParticles.push_back(particle);
+            }
+            if (scene.impactParticles.size() > 800)
+                scene.impactParticles.erase(scene.impactParticles.begin(),
+                    scene.impactParticles.begin() +
+                    (scene.impactParticles.size() - 800));
             for (auto& projectile : scene.projectiles) {
                 if (projectile.grenade) {
                     // Timer-only grenade: impacts and bounces never detonate it.
@@ -4787,7 +4850,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         XMMATRIX fogLightSpace = XMMatrixIdentity();
         ID3D12Resource* fogShadowResource = nullptr;
-        bool renderedForward = false;
+        bool renderedScene = false;
         if (gameScreen == GameScreen::Level1 && !levelLoadingActive &&
             usingRaytracing) {
             ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());
@@ -4811,7 +4874,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 (!g_emptyLevelMode && g_showH2Model) ? crateModel : nullptr);
             fogLightSpace = lightSpace;
             fogShadowResource = shadowResource;
-            renderedForward = !visibilityDebugActive;
+            renderedScene = !visibilityDebugActive;
             mainShader.SetHDRTargetEnabled(true);
             g_meshShader.SetHDRTargetEnabled(true);
             g_terrain.SetHDRTargetEnabled(true);
@@ -4835,7 +4898,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             fogLightSpace = lightSpace;
             fogShadowResource = shadowResource;
-            renderedForward = true;
+            renderedScene = true;
             if (msaaActive) msaa.Bind();
             if (visibilityParityValidation) {
                 visBuffer.BeginForwardExtensions(g_dx12.commandList.Get());
@@ -4851,7 +4914,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         // Hybrid visibility and pure forward both establish global forward
         // resources before skinned/transparent extension passes.
-        if (renderedForward && !g_emptyLevelMode && g_banditLoaded) {
+        if (renderedScene && !g_emptyLevelMode && g_banditLoaded) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Bandits", g_dx12.commandList.Get());
             for (auto& bandit : g_bandits) {
@@ -4867,7 +4930,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             mainShader.Use(scene.wireframeMode);
         }
-        if (renderedForward) {
+        if (renderedScene) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Impact Particles", g_dx12.commandList.Get());
             RenderImpactBillboards(scene, mainShader, geo, fogLightSpace);
@@ -4879,17 +4942,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             msaa.ResolveToBackBuffer();
         }
 
+        if (renderedScene && scene.enableAmbientOcclusion &&
+            screenSpaceAO.initialized) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "GTAO + Contact Shadows", g_dx12.commandList.Get());
+            screenSpaceAO.Render(scene,
+                msaaActive ? msaa.GetDepthResource() : g_dx12.depthStencilBuffer.Get(),
+                msaaActive,
+                commonHDRValidationTarget ? visBuffer.GetOutputRTV()
+                                          : D3D12_CPU_DESCRIPTOR_HANDLE{},
+                commonHDRValidationTarget);
+        }
+
         const bool visibilityValidation = visibilityParityValidation;
-        if (renderedForward && scene.enableVolumetricFog && volumetricFog.initialized &&
-            !visibilityValidation) {
+        // Shared post-render pass. Normal forward composites to the resolved
+        // swapchain target. Visibility and parity-forward composite to HDR.
+        if (renderedScene && scene.enableVolumetricFog && volumetricFog.initialized) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Volumetric Fog", g_dx12.commandList.Get());
             volumetricFog.Render(scene, fogLightSpace, fogShadowResource,
                 msaaActive ? msaa.GetDepthResource() : g_dx12.depthStencilBuffer.Get(),
                 msaaActive,
-                usingVisibility ? visBuffer.GetOutputRTV()
-                                : D3D12_CPU_DESCRIPTOR_HANDLE{},
-                usingVisibility);
+                commonHDRValidationTarget ? visBuffer.GetOutputRTV()
+                                          : D3D12_CPU_DESCRIPTOR_HANDLE{},
+                commonHDRValidationTarget);
         }
 
         if (commonHDRValidationTarget) {

@@ -176,8 +176,11 @@ public:
         float helicopterZ;
         float helicopterWindRadius;
         float helicopterWindStrength;
+        // World-space height of one screen pixel per unit of view distance.
+        // Keeps distant moving blades rasterizable instead of subpixel flicker.
+        float pixelWorldScale;
     };
-    Params GetParams() const {
+    Params GetParams(float verticalFovDegrees, float viewportHeight) const {
         Params p;
         p.time = m_time;
         p.windStrength = m_windStrength;
@@ -191,6 +194,9 @@ public:
         p.helicopterZ = m_helicopterPosition.z;
         p.helicopterWindRadius = m_helicopterWindRadius;
         p.helicopterWindStrength = m_helicopterWindStrength;
+        p.pixelWorldScale = 2.0f * std::tan(
+            XMConvertToRadians(verticalFovDegrees) * 0.5f) /
+            (std::max)(viewportHeight, 1.0f);
         return p;
     }
     bool IsInitialized() const { return m_ready; }
