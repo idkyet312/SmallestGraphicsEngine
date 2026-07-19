@@ -875,34 +875,27 @@ private:
         using namespace DirectX;
         if (headBone_ < 0 || static_cast<size_t>(headBone_) >= poseGlobals_.size())
             return;
-        const int parent = model.skeleton.parent[headBone_];
-        if (parent < 0 || static_cast<size_t>(parent) >= poseGlobals_.size())
-            return;
 
-        // Idle/walk clips contain authored head turns. Restore the head's bind
-        // orientation relative to its currently aimed neck: the spine already
-        // tracks aimYaw, so this makes the face inherit the exact player yaw.
-        const XMMATRIX currentHead = XMLoadFloat4x4(&poseGlobals_[headBone_]);
-        const XMMATRIX desiredHead =
-            XMLoadFloat4x4(&model.skeleton.localBind[headBone_]) *
-            XMLoadFloat4x4(&poseGlobals_[parent]);
-        const XMMATRIX headCorrection =
-            XMMatrixInverse(nullptr, currentHead) * desiredHead;
-        for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
-            if (!IsDescendant(static_cast<int>(bone), headBone_)) continue;
-            XMStoreFloat4x4(&poseGlobals_[bone],
-                XMLoadFloat4x4(&poseGlobals_[bone]) * headCorrection);
-        }
+        // This UE mesh's authored face points down native -Y. Measure that axis
+        // after the current animation, skin transform, asset orientation, and
+        // world yaw instead of assuming the head bone's local axes face forward.
+        const XMMATRIX headSkin =
+            XMLoadFloat4x4(&model.skeleton.offset[headBone_]) *
+            XMLoadFloat4x4(&poseGlobals_[headBone_]);
+        const XMMATRIX headToWorld = headSkin * MeshWorldMatrix();
+        const XMVECTOR currentFaceWorld = XMVector3Normalize(
+            XMVector3TransformNormal(XMVectorSet(0.0f, -1.0f, 0.0f, 0.0f),
+                                     headToWorld));
 
-        // Pitch the neutralized head toward player height. Keep a natural neck
-        // limit even if weapon aims farther up/down.
         const float pitch = (std::max)(-XMConvertToRadians(32.0f),
             (std::min)(XMConvertToRadians(32.0f), aimPitch));
+        const float cp = std::cos(pitch);
+        const XMVECTOR desiredFaceWorld = XMVector3Normalize(XMVectorSet(
+            std::sin(aimYaw) * cp, std::sin(pitch),
+            std::cos(aimYaw) * cp, 0.0f));
         const XMVECTOR pivot = XMLoadFloat4x4(&poseGlobals_[headBone_]).r[3];
-        const XMVECTOR rightWorld = XMVectorSet(
-            std::cos(aimYaw), 0.0f, -std::sin(aimYaw), 0.0f);
         RotateBranchWorld(headBone_, pivot,
-            XMMatrixRotationAxis(rightWorld, -pitch));
+            RotationFromTo(currentFaceWorld, desiredFaceWorld));
     }
 
     void SolveArmIK(int upper, int lower, int hand, DirectX::FXMVECTOR target) {
