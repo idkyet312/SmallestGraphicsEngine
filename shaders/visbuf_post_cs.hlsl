@@ -4,6 +4,7 @@ Texture2D<float4> historyInput : register(t2);
 ByteAddressBuffer exposureState : register(t3);
 Texture3D<float4> colorLUT : register(t4);
 Texture2D<float> sceneDepth : register(t5);
+Texture2D<float> visibilityDepth : register(t6);
 RWTexture2D<float4> ldrOutput : register(u0);
 RWTexture2D<float4> historyOutput : register(u1);
 SamplerState lutSampler : register(s0);
@@ -142,9 +143,7 @@ float3 TemporalResolve(uint2 pixel, float3 currentColor) {
     float2 previousUV = uv - motion;
     if (any(previousUV <= 0.0) || any(previousUV >= 1.0)) return currentColor;
 
-    int2 previousPixel = clamp(int2(previousUV * float2(outputSize)),
-                               int2(0, 0), int2(outputSize) - 1);
-    float3 history = historyInput.Load(int3(previousPixel, 0)).rgb;
+    float3 history = historyInput.SampleLevel(lutSampler, previousUV, 0.0).rgb;
     float3 neighborhoodMin = currentColor;
     float3 neighborhoodMax = currentColor;
     [unroll]
@@ -159,8 +158,24 @@ float3 TemporalResolve(uint2 pixel, float3 currentColor) {
         }
     }
     history = clamp(history, neighborhoodMin, neighborhoodMax);
-    float motionConfidence = saturate(1.0 - length(motion * float2(outputSize)) * 0.08);
-    return lerp(currentColor, history, taaFeedback * motionConfidence);
+    float motionConfidence = saturate(1.0 -
+        length(motion * float2(outputSize)) * 0.035);
+    float currentLuma = Luminance(currentColor);
+    float historyLuma = Luminance(history);
+    // Contact shadows move independently of visibility-buffer motion vectors.
+    // Reject meaningful luminance changes instead of accumulating old shadow
+    // positions into several dark silhouettes.
+    float luminanceConfidence = saturate(1.0 -
+        abs(currentLuma - historyLuma) /
+        max(max(currentLuma, historyLuma) * 0.18, 0.025));
+    // Trees, rotor blades, skinned actors, and other forward extensions do not
+    // yet emit per-object motion. Reject their stale underlying VB history.
+    float currentDepth = sceneDepth.Load(int3(pixel, 0));
+    float resolvedDepth = visibilityDepth.Load(int3(pixel, 0));
+    float extensionConfidence = currentDepth + 1e-5 < resolvedDepth ? 0.0 : 1.0;
+    return lerp(currentColor, history,
+                taaFeedback * motionConfidence * luminanceConfidence *
+                extensionConfidence);
 }
 
 [numthreads(8, 8, 1)]

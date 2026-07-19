@@ -94,6 +94,8 @@ cbuffer SHBuffer : register(b7) {
 cbuffer ShadowCascadeBuffer : register(b8) {
     matrix shadowCascadeMatrices[3];
     float4 shadowCascadeSplits;
+    float4 shadowCascadeTexelWorld;
+    float4 shadowCascadeDepthRange;
 };
 
 Texture2D albedoMap : register(t1);
@@ -103,6 +105,7 @@ Texture2D normalMap : register(t4);
 Texture2D metalRoughMap : register(t5);
 Texture2DArray<float> shadowMap : register(t0);
 Texture2D<float4> environmentMap : register(t15);
+Texture2D<float2> brdfIntegrationLUT : register(t16);
 SamplerComparisonState shadowSampler : register(s0);
 SamplerState texSampler : register(s1);
 
@@ -115,13 +118,54 @@ struct PS_INPUT {
     float4 fragPosLightSpace : TEXCOORD4;
 };
 
+// Smooth 3D value noise from integer avalanche hashing (same mixer as
+// terrain_ms.hlsl's hash21). A plane-wave sin() here striped every large flat
+// dielectric surface -- most visibly the terrain -- with diagonal roughness
+// bands ~6 m apart.
+uint MatVarHashUint(uint value) {
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+float MatVarHash(int3 cell) {
+    uint value = MatVarHashUint(asuint(cell.x) ^
+        MatVarHashUint(asuint(cell.y) + MatVarHashUint(asuint(cell.z))) +
+        0x9e3779b9u);
+    return float(value & 0x00ffffffu) * (1.0 / 16777216.0);
+}
+
+float MatVarNoise(float3 position) {
+    int3 cell = (int3)floor(position);
+    float3 blend = frac(position);
+    blend = blend * blend * (3.0 - 2.0 * blend);
+    float n00 = lerp(MatVarHash(cell), MatVarHash(cell + int3(1, 0, 0)), blend.x);
+    float n10 = lerp(MatVarHash(cell + int3(0, 1, 0)),
+                     MatVarHash(cell + int3(1, 1, 0)), blend.x);
+    float n01 = lerp(MatVarHash(cell + int3(0, 0, 1)),
+                     MatVarHash(cell + int3(1, 0, 1)), blend.x);
+    float n11 = lerp(MatVarHash(cell + int3(0, 1, 1)),
+                     MatVarHash(cell + int3(1, 1, 1)), blend.x);
+    return lerp(lerp(n00, n10, blend.y), lerp(n01, n11, blend.y), blend.z);
+}
+
 float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
     if (enableShadows == 0) return 1.0;
 
     float viewDepth = mul(float4(worldPos, 1.0), view).z;
     uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
                    (viewDepth < shadowCascadeSplits.y ? 1u : 2u);
-    float4 fragPosLightSpace = mul(float4(worldPos, 1.0),
+
+    // Normal-offset + per-cascade slope-scaled bias. A single [0,1]-depth bias
+    // constant cannot fit all three cascades (different world extents), which
+    // left grazing-angle acne bands across distant terrain at low sun.
+    float ndotl = saturate(dot(normal, lightDir));
+    float texelWorld = shadowCascadeTexelWorld[cascade];
+    float3 samplePos = worldPos + normal * texelWorld * 1.8;
+    float4 fragPosLightSpace = mul(float4(samplePos, 1.0),
                                    shadowCascadeMatrices[cascade]);
 
     float3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
@@ -135,8 +179,9 @@ float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
 
     float2 texelSize = shadowTexelSize.xx;
 
-    float ndotl = saturate(dot(normal, lightDir));
-    float bias = max(shadowBias * (1.0 - ndotl), shadowBias * 0.25);
+    float slope = clamp(sqrt(1.0 - ndotl * ndotl) / max(ndotl, 0.1), 0.0, 8.0);
+    float bias = texelWorld * (1.0 + 2.0 * slope) /
+                 max(shadowCascadeDepthRange[cascade], 1e-3);
     float depth = projCoords.z - bias;
 
     float visibility = 0.0;
@@ -485,25 +530,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
     if (dot(normal, viewDir) < 0.0)
         normal = -normal;
 
-    // Terrain tag: negative view fill. Add world-space macro variation,
-    // high-frequency detail normal, slope soil, and worn dirt tracks without
-    // another texture fetch or visible tiling repetition.
-    if (viewFillStrength < -0.5) {
-        float macro = sin(input.fragPos.x * 0.071 + sin(input.fragPos.z * 0.043)) *
-                      sin(input.fragPos.z * 0.063) * 0.5 + 0.5;
-        float slope = 1.0 - saturate(normal.y);
-        float track = 1.0 - smoothstep(0.65, 2.4,
-            abs(input.fragPos.x - sin(input.fragPos.z * 0.055) * 5.0));
-        float3 soil = float3(0.34, 0.22, 0.095);
-        albedo *= lerp(0.78, 1.16, macro);
-        albedo = lerp(albedo, soil, saturate(slope * 1.7 + track * 0.42));
-        float2 detail = float2(sin(input.fragPos.x * 3.7 + input.fragPos.z * 1.9),
-                               cos(input.fragPos.z * 3.2 - input.fragPos.x * 1.4));
-        normal = normalize(normal + float3(detail.x, 0.0, detail.y) * 0.075);
-        rough = saturate(rough * lerp(0.88, 1.08, macro));
-    } else if (metal < 0.25) {
-        float materialVariation = sin(input.fragPos.x * 0.83 +
-            input.fragPos.y * 1.17 + input.fragPos.z * 0.61) * 0.5 + 0.5;
+    if (metal < 0.25) {
+        float materialVariation = MatVarNoise(input.fragPos * 0.35);
         rough = clamp(rough * lerp(0.88, 1.10, materialVariation), 0.045, 1.0);
     }
     
@@ -579,13 +607,16 @@ float4 main(PS_INPUT input) : SV_TARGET {
     
     float3 numerator = NDF * G * F;
     float denominator = max(4.0 * NdotV * NdotL, 0.001);
-    float3 specular = numerator / denominator;
+    // Skinned enemy outfits share a positive view-fill tag. Their mostly
+    // cloth/polymer surfaces need much less HDRI grazing response than guns
+    // and hard-surface assets, or the bright horizon creates a silver rim.
+    float characterSpecularScale = viewFillStrength > 0.25 ? 0.38 : 1.0;
+    float3 specular = numerator / denominator * characterSpecularScale;
     
     // Combine
     float shadowVisibility = CalculateShadow(input.fragPos, normal, lightDir);
-    // Direct occlusion must also reduce local sky/DDGI fill. Keep a small
-    // indirect floor so shadows stay readable instead of becoming pure black.
-    result *= lerp(0.28, 1.0, shadowVisibility);
+    // Shadow map blocks direct sun only. Sky IBL and bounced DDGI remain,
+    // preventing sun-facing occluders from crushing entire facades to black.
     // Material-local camera fill is applied after scene shadowing. Imported
     // character previews use a soft frontal studio light; applying this before
     // the shadow term crushed it back to black whenever the sun was behind him.
@@ -605,11 +636,13 @@ float4 main(PS_INPUT input) : SV_TARGET {
     }
 
     float3 reflectionDir = reflect(-viewDir, normal);
+    // Split-sum specular IBL: GGX-prefiltered HDRI radiance multiplied by the
+    // preintegrated Fresnel/visibility response for this NdotV and roughness.
     float3 probeColor = sampleReflectionProbe(reflectionDir, rough);
-    float3 envFresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
-    float reflectionStrength = saturate((1.0 - rough * 0.75) * (0.10 + metal * 1.15));
-    float3 metalTint = lerp(float3(1.0, 1.0, 1.0), albedo, metal * 0.45);
-    result += probeColor * envFresnel * reflectionStrength * metalTint;
+    float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
+        texSampler, float2(NdotV, rough), 0.0);
+    result += probeColor * (F0 * environmentBRDF.x + environmentBRDF.y) *
+              ambientOcclusion * characterSpecularScale;
 
     // AgX (Punchy) tone mapping; returns display-encoded sRGB.
     result = FinalizeOutput(result);

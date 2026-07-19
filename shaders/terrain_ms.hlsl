@@ -37,10 +37,21 @@ struct OutVertex {
     float4 fragPosLightSpace : TEXCOORD4;
 };
 
+uint hashUint(uint value) {
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
 float hash21(float2 p) {
-    p = frac(p * float2(123.34, 456.21));
-    p += dot(p, p + 45.32);
-    return frac(p.x * p.y);
+    // p contains integer lattice coordinates. Integer avalanche mixing avoids
+    // the short periods created by frac(integer * decimal constants).
+    uint2 cell = asuint(int2(p));
+    uint value = hashUint(cell.x ^ (hashUint(cell.y) + 0x9e3779b9u));
+    return float(value & 0x00ffffffu) * (1.0 / 16777216.0);
 }
 
 float noise2(float2 p) {
@@ -57,7 +68,10 @@ float fbm(float2 p) {
     [unroll]
     for (int i = 0; i < 5; ++i) {
         sum += noise2(p) * amp;
-        p = p * 2.02;
+        // Scale by 2.02 and rotate each octave. Keeping every lattice axis
+        // aligned made unrelated octaves reinforce into long parallel ridges.
+        p = float2(p.x * 1.616 - p.y * 1.212,
+                   p.x * 1.212 + p.y * 1.616);
         amp *= 0.5;
     }
     return sum;

@@ -41,7 +41,7 @@ public:
     float             meshYaw  = 0.0f;
     bool              upperBodyGunLayer = true;
     float             leftArmReach = 0.55f;
-    float             headTorsoYawOffsetDegrees = -18.0f;
+    float             headTorsoYawOffsetDegrees = 20.4f;
     float             orbitRadius = 4.8f;
     float             orbitDirection = 1.0f;
     float             fireCooldown = 1.0f;

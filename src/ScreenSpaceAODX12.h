@@ -35,12 +35,17 @@ public:
 
     void Render(const Scene& scene, ID3D12Resource* depthResource,
                 bool multisampledDepth, D3D12_CPU_DESCRIPTOR_HANDLE targetRtv = {},
-                bool hdrTarget = false) {
+                bool hdrTarget = false,
+                ID3D12Resource* staticCasterDepth = nullptr) {
         if (!initialized || !depthResource || !g_dx12.commandList) return;
-        Update(scene, depthResource, multisampledDepth);
+        Update(scene, depthResource, multisampledDepth, staticCasterDepth);
         ID3D12GraphicsCommandList* list = g_dx12.commandList.Get();
         Transition(list, depthResource, D3D12_RESOURCE_STATE_DEPTH_WRITE,
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (staticCasterDepth && staticCasterDepth != depthResource)
+            Transition(list, staticCasterDepth,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = targetRtv.ptr ? targetRtv :
             GetCPUDescriptorHandle(g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize,
                                    g_dx12.frameIndex);
@@ -60,6 +65,10 @@ public:
         list->DrawInstanced(3, 1, 0, 0);
         Transition(list, depthResource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        if (staticCasterDepth && staticCasterDepth != depthResource)
+            Transition(list, staticCasterDepth,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
 private:
@@ -70,6 +79,7 @@ private:
         XMFLOAT4 lightDirection;
         XMFLOAT4 aoParams;
         XMFLOAT4 screenParams;
+        XMFLOAT4 filterParams;
     };
 
     bool Compile(const std::string& source, const char* entry, const char* target,
@@ -85,7 +95,7 @@ private:
     bool CreateRootSignature() {
         D3D12_DESCRIPTOR_RANGE range = {};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = 2;
+        range.NumDescriptors = 3;
         range.BaseShaderRegister = 0;
         D3D12_ROOT_PARAMETER roots[2] = {};
         roots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -154,7 +164,7 @@ private:
     bool CreateResources() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 2;
+        heapDesc.NumDescriptors = 3;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_dx12.device->CreateDescriptorHeap(&heapDesc,
                 IID_PPV_ARGS(&descriptorHeap_)))) return false;
@@ -177,7 +187,8 @@ private:
             reinterpret_cast<void**>(&mappedConstants_)));
     }
 
-    void Update(const Scene& scene, ID3D12Resource* depth, bool multisampled) {
+    void Update(const Scene& scene, ID3D12Resource* depth, bool multisampled,
+                ID3D12Resource* staticCasterDepth) {
         Constants constants = {};
         XMMATRIX vp = scene.GetViewMatrix() * scene.GetProjectionMatrix();
         XMStoreFloat4x4(&constants.inverseViewProjection,
@@ -196,6 +207,9 @@ private:
         constants.screenParams = { static_cast<float>(g_dx12.screenWidth),
             static_cast<float>(g_dx12.screenHeight),
             1.0f / g_dx12.screenWidth, 1.0f / g_dx12.screenHeight };
+        constants.filterParams = {
+            staticCasterDepth && staticCasterDepth != depth ? 1.0f : 0.0f,
+            0.0f, 0.0f, 0.0f };
         std::memcpy(mappedConstants_ + g_dx12.frameIndex * 256u,
             &constants, sizeof(constants));
 
@@ -211,6 +225,13 @@ private:
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
         srv.Texture2D.MipLevels = 0;
         g_dx12.device->CreateShaderResourceView(multisampled ? depth : nullptr,
+            &srv, handle);
+        handle.ptr += descriptorSize_;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = 1;
+        g_dx12.device->CreateShaderResourceView(
+            staticCasterDepth && staticCasterDepth != depth
+                ? staticCasterDepth : nullptr,
             &srv, handle);
     }
 

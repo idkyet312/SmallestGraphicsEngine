@@ -25,6 +25,7 @@
 #include "ProfilerDX12.h"
 #include "GroundLevel.h"
 #include "ShaderDX12.h"
+#include "DDGI_DX12.h"
 #include "VisibilityBufferDX12.h"
 #include "StaticBufferDX12.h"
 #include "Scene.h"
@@ -39,11 +40,13 @@
 #include "MeshShaderDX12.h"
 #include "TerrainRendererDX12.h"
 #include "SkyRendererDX12.h"
+#include "EnvironmentIBLDX12.h"
 #include "OcclusionDepthDX12.h"
 #include "FXAADX12.h"
 #include "VolumetricFogDX12.h"
 #include "ScreenSpaceAODX12.h"
 #include "MSAADX12.h"
+#include "GrassMSAADX12.h"
 #include "DestructionDX12.h"
 #include "FBXImporter.h"
 #include "SkinnedFBXImporter.h"
@@ -124,7 +127,7 @@ float                       g_humveeTurretFireCooldown = 0.0f;
 SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
 float                       g_banditLeftArmReach = 0.55f;
-float                       g_banditHeadYawOffsetDegrees = -18.0f;
+float                       g_banditHeadYawOffsetDegrees = 20.4f;
 uint32_t                    g_banditSpawnSerial = 0;
 GunAudio                    g_gunAudio;
 GunAudio                    g_hitAudio;
@@ -1233,7 +1236,13 @@ WaterVolume                 g_ocean;   // sea ringing the island, surface at y =
 PalmTrees                   g_trees;
 GrassField                  g_grass;
 static SkyRendererDX12      skyRenderer;
+static EnvironmentIBLDX12   environmentIBL;
+DDGIRendererDX12            g_ddgiRenderer;
 ID3D12Resource*             g_skyEnvironmentResource = nullptr;
+ID3D12Resource*             g_specularEnvironmentResource = nullptr;
+ID3D12Resource*             g_brdfIntegrationResource = nullptr;
+ID3D12Resource*             g_ddgiIrradianceResource = nullptr;
+ID3D12Resource*             g_ddgiVisibilityResource = nullptr;
 static OcclusionDepthDX12   occlusionDepth;
 static XMMATRIX             previousHZBViewProjection = XMMatrixIdentity();
 static bool                 hzbCaptureActive = false;
@@ -1241,6 +1250,7 @@ static FXAADX12             fxaa;
 static VolumetricFogDX12    volumetricFog;
 static ScreenSpaceAODX12    screenSpaceAO;
 static MSAADX12             msaa;
+static GrassMSAADX12        grassMSAA;
 static bool                 msaaUsedLastFrame = false;
 static VisibilityBufferDX12 visBuffer;
 static ShadowMapDX12        shadowMap;
@@ -1837,34 +1847,21 @@ static void LoadFloorMudMaterial() {
     floorMaterial->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
     floorMaterial->metallicFactor = 0.0f;
     floorMaterial->roughnessFactor = 1.0f;
-    // Negative view-fill tags terrain for macro/detail/slope blending in both
-    // forward and visibility material paths. Other materials keep normal fill.
-    floorMaterial->viewFillStrength = -1.0f;
+    floorMaterial->viewFillStrength = 0.0f;
 
-    // Grass ground (ambientCG Grass004). The blades from GrassField stand ON this,
-    // so the ground reads as turf between the tufts instead of bare dirt showing
-    // through. NormalDX, not NormalGL: the GL variant has its green channel
-    // inverted for OpenGL's Y-up tangent space, and using it here would light
-    // every bump from the wrong side.
     const std::string dir = "models/grass/Grass004_2K-PNG/";
     floorMaterial->baseColorTexture = GLBImporter::LoadTextureFromFile(
         ResolveTexturePath((dir + "Grass004_2K-PNG_Color.png").c_str()),
         g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
-    floorMaterial->normalTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath((dir + "Grass004_2K-PNG_NormalDX.png").c_str()),
-        g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
-    floorMaterial->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath((dir + "Grass004_2K-PNG_Roughness.png").c_str()),
-        g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
-    // A standalone roughness map, not a packed glTF metal/rough one -- the shader
-    // needs telling, or it would read roughness out of the green channel of a
-    // texture that has roughness in all three.
-    floorMaterial->roughnessOnlyTexture = floorMaterial->metallicRoughnessTexture != nullptr;
+    floorMaterial->normalTexture.Reset();
+    floorMaterial->metallicRoughnessTexture.Reset();
+    floorMaterial->roughnessOnlyTexture = false;
 
     if (!floorMaterial->baseColorTexture) {
         const auto missing = PinkMissingTexture(256);
         floorMaterial->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
-            g_dx12.device.Get(), g_dx12.commandList.Get(), missing, 256, 256, floorMaterial->uploadHeaps);
+            g_dx12.device.Get(), g_dx12.commandList.Get(), missing, 256, 256,
+            floorMaterial->uploadHeaps);
         floorMaterial->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
         std::cerr << "Grass ground texture unavailable; using pink missing texture\n";
     }
@@ -3545,6 +3542,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (fxaa.initialized) fxaa.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (msaa.initialized) msaa.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (visBuffer.initialized) visBuffer.Resize(SCR_WIDTH, SCR_HEIGHT);
+                if (grassMSAA.initialized) grassMSAA.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (g_rt.initialized) ResizeRaytracing(SCR_WIDTH, SCR_HEIGHT);
             }
         }
@@ -3815,6 +3813,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cerr << "HDRI sky init failed (non-fatal)\n";
     }
     g_skyEnvironmentResource = skyRenderer.skyTexture.Get();
+    if (environmentIBL.Init(g_skyEnvironmentResource)) {
+        g_specularEnvironmentResource =
+            environmentIBL.prefilteredEnvironment.Get();
+        g_brdfIntegrationResource = environmentIBL.brdfIntegrationLUT.Get();
+        std::cout << "GGX HDRI prefilter and BRDF integration LUT ready\n";
+    } else {
+        g_specularEnvironmentResource = g_skyEnvironmentResource;
+        std::cerr << "Specular IBL prefilter failed (using raw HDRI fallback)\n";
+    }
     ThrowIfFailed(g_dx12.commandList->Close());
     {
         ID3D12CommandList* skyLists[] = { g_dx12.commandList.Get() };
@@ -3826,6 +3833,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     {
         auto skySH = GLBImporter::ComputeSkyIrradianceSH(kSkyEnvironmentPath);
         mainShader.SetSkyIrradiance(skySH, 1.0f);
+        const HDRISunLight hdriSun =
+            GLBImporter::ExtractHDRISunLight(kSkyEnvironmentPath, 2.1f);
+        if (hdriSun.valid) {
+            constexpr float DirectionScale = 10.0f;
+            scene.lightPos = {
+                hdriSun.direction.x * DirectionScale,
+                hdriSun.direction.y * DirectionScale,
+                hdriSun.direction.z * DirectionScale
+            };
+            scene.lightColor = hdriSun.color;
+            std::cout << "HDRI sun aligned: direction=("
+                      << hdriSun.direction.x << ", "
+                      << hdriSun.direction.y << ", "
+                      << hdriSun.direction.z << ") color=("
+                      << hdriSun.color.x << ", "
+                      << hdriSun.color.y << ", "
+                      << hdriSun.color.z << ") sourceLuminance="
+                      << hdriSun.sourceLuminance << '\n';
+        } else {
+            std::cerr << "HDRI sun extraction failed; using scene fallback light\n";
+        }
     }
     if (!occlusionDepth.Init(SCR_WIDTH, SCR_HEIGHT)) {
         std::cerr << "Meshlet occlusion depth init failed (non-fatal)\n";
@@ -3870,13 +3898,36 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cerr << "VB init failed (non-fatal)\n";
         scene.useVisibilityBuffer = false;
     } else {
-        visBuffer.UpdateEnvironmentMap(g_skyEnvironmentResource);
+        visBuffer.UpdateEnvironmentMap(
+            g_specularEnvironmentResource, g_brdfIntegrationResource);
         std::cout << "Visibility Buffer ready\n";
+    }
+
+    if (!visibilityBufferReady || !mainShader.GetHDRMSAAGrassPipelineState() ||
+        !grassMSAA.Init(SCR_WIDTH, SCR_HEIGHT)) {
+        std::cerr << "Visibility grass 4x MSAA unavailable (non-fatal)\n";
+        scene.enableGrassMSAA = false;
+    } else {
+        std::cout << "Visibility grass 4x MSAA ready\n";
     }
 
     if (!shadowMap.Init()) {
         std::cerr << "Shadow map init failed (non-fatal)\n";
         scene.enableShadows = false;
+    }
+
+    if (!g_ddgiRenderer.init(g_dx12.device.Get())) {
+        std::cerr << "DDGI init failed (non-fatal)\n";
+        scene.useDDGI = false;
+    } else {
+        g_ddgiRenderer.RegisterShadowMap(shadowMap.GetResource());
+        g_ddgiIrradianceResource = g_ddgiRenderer.irradianceTexture.Get();
+        g_ddgiVisibilityResource = g_ddgiRenderer.visibilityTexture.Get();
+        if (visibilityBufferReady) {
+            visBuffer.UpdateDDGIResources(
+                g_ddgiIrradianceResource, g_ddgiVisibilityResource);
+        }
+        std::cout << "DDGI ready\n";
     }
 
     // Raytracing (DXR path)
@@ -4503,6 +4554,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             scene.useRaytracing && g_rt.initialized;
         const bool usingVisibility =
             !usingRaytracing && scene.useVisibilityBuffer && visBuffer.initialized;
+        static bool visibilityWasActive = false;
+        if (usingVisibility != visibilityWasActive) {
+            visBuffer.InvalidateTemporalHistory();
+            visibilityWasActive = usingVisibility;
+        }
+        scene.temporalJitterPixels = usingVisibility
+            ? visBuffer.GetTemporalJitterPixels()
+            : XMFLOAT2(0.0f, 0.0f);
         const bool visibilityDebugActive =
             usingVisibility && visBuffer.debugViewMode != 0;
         // Validation is a cross-renderer comparison mode. Keep both sides on
@@ -4514,6 +4573,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         const bool msaaActive =
             scene.enableMSAA && msaa.initialized &&
             !usingRaytracing && !usingVisibility && !visibilityParityValidation;
+        const bool grassMSAAActive =
+            usingVisibility && !visibilityDebugActive &&
+            scene.enableGrassMSAA && grassMSAA.initialized &&
+            mainShader.GetHDRMSAAGrassPipelineState() != nullptr;
         mainShader.SetMSAAEnabled(msaaActive);
         g_meshShader.SetMSAAEnabled(msaaActive);
         g_terrain.SetMSAAEnabled(msaaActive);
@@ -4888,7 +4951,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 ProfilerDX12::Scope extensions(
                     g_profiler, "Forward Extensions", g_dx12.commandList.Get());
                 RenderForward(scene, mainShader, geo, crateModel, floorMaterial,
-                    lightSpace, shadowResource, true);
+                    lightSpace, shadowResource, true, !grassMSAAActive);
             }
         } else if (gameScreen == GameScreen::Level1 && !levelLoadingActive) {
             XMMATRIX lightSpace = XMMatrixIdentity();
@@ -4942,6 +5005,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             RenderImpactBillboards(scene, mainShader, geo, fogLightSpace);
         }
 
+        if (renderedScene && grassMSAAActive) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "Grass 4x MSAA", g_dx12.commandList.Get());
+            grassMSAA.Begin(g_dx12.commandList.Get());
+            RenderGrassForward(scene, mainShader, scene.GetViewMatrix(),
+                scene.GetProjectionMatrix(), fogLightSpace, fogShadowResource,
+                mainShader.GetHDRMSAAGrassPipelineState());
+
+            // Resolve the independently sampled grass against opaque scene
+            // depth, then reopen HDR for shared AO and fog.
+            visBuffer.EndForwardExtensions(g_dx12.commandList.Get());
+            grassMSAA.Composite(g_dx12.commandList.Get(),
+                visBuffer.GetOutputResource(), visBuffer.GetMotionResource(),
+                g_dx12.depthStencilBuffer.Get());
+            visBuffer.BeginForwardExtensions(g_dx12.commandList.Get());
+        }
+
         if (msaaActive) {
             ProfilerDX12::Scope profile(
                 g_profiler, "MSAA Resolve", g_dx12.commandList.Get());
@@ -4957,7 +5037,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 msaaActive,
                 commonHDRValidationTarget ? visBuffer.GetOutputRTV()
                                           : D3D12_CPU_DESCRIPTOR_HANDLE{},
-                commonHDRValidationTarget);
+                commonHDRValidationTarget,
+                usingVisibility ? visBuffer.GetVisibilityDepthResource() : nullptr);
         }
 
         const bool visibilityValidation = visibilityParityValidation;
@@ -4980,7 +5061,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             visBuffer.EndForwardExtensions(g_dx12.commandList.Get());
             if (usingVisibility && !visBuffer.validationMode)
                 visBuffer.UpdateExposure(g_dx12.commandList.Get());
-            visBuffer.PostProcess(g_dx12.commandList.Get(), hzbHistoryUsable);
+            // TAA reprojection remains valid during ordinary camera movement;
+            // HZB history is intentionally stricter and must not gate it.
+            visBuffer.PostProcess(g_dx12.commandList.Get(), usingVisibility);
             visBuffer.CopyToBackBuffer(g_dx12.commandList.Get());
             if (usingVisibility)
                 visBuffer.TransitionBuffersForUpload(g_dx12.commandList.Get());

@@ -919,10 +919,29 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     }
 
     shader.SetSH();
+    shader.SetDDGI(scene.useDDGI && g_ddgiRenderer.computeInitialized,
+        scene.giIntensity, scene.normalBias, scene.probeSpacing);
+    if (scene.useDDGI && g_ddgiRenderer.computeInitialized) {
+        DDGIMainLightData mainLight = {};
+        mainLight.lightPos = scene.lightPos;
+        mainLight.lightType = scene.lightType;
+        mainLight.lightColor = scene.lightColor;
+        mainLight.intensity = 1.0f;
+        mainLight.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
+        mainLight.shadowBias = scene.shadowBias;
+        mainLight.enableShadows = scene.enableShadows && shadowResource ? 1 : 0;
+        const int pointLightCount = (std::min)(
+            (int)scene.clusteredRenderer.lights.size(), 64);
+        g_ddgiRenderer.UpdateProbes(g_dx12.commandList.Get(),
+            shader.pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex),
+            pointLightCount,
+            shader.ddgiBuffer.GetGPUAddress(g_dx12.frameIndex), mainLight);
+    }
     vb.UpdateLightDescriptors(
         shader.lightBuffer.GetGPUAddress(g_dx12.frameIndex),
         shader.pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex),
-        shader.shBuffer.GetGPUAddress(g_dx12.frameIndex));
+        shader.shBuffer.GetGPUAddress(g_dx12.frameIndex),
+        shader.ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
     vb.UpdateShadowMapDescriptor(shadowResource);
 
     LightBufferDX12 dummyLB = {};

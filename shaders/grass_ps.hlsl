@@ -61,6 +61,8 @@ cbuffer SHBuffer : register(b7) {
 cbuffer ShadowCascadeBuffer : register(b8) {
     matrix shadowCascadeMatrices[3];
     float4 shadowCascadeSplits;
+    float4 shadowCascadeTexelWorld;
+    float4 shadowCascadeDepthRange;
 };
 
 Texture2DArray<float> shadowMap : register(t0);
@@ -73,6 +75,7 @@ struct PS_INPUT {
     float2 texCoord : TEXCOORD2;
     float4 tangent : TEXCOORD3;
     float4 fragPosLightSpace : TEXCOORD4;
+    float  colorVariation : TEXCOORD5;
 };
 
 // One comparison tap: the linear-filtered comparison sampler gives hardware
@@ -83,7 +86,13 @@ float CalculateShadowCheap(float3 worldPos, float3 normal, float3 lightDir) {
     float viewDepth = mul(float4(worldPos, 1.0), view).z;
     uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
                    (viewDepth < shadowCascadeSplits.y ? 1u : 2u);
-    float4 fragPosLightSpace = mul(float4(worldPos, 1.0),
+
+    // Same normal-offset + per-cascade bias as clustered_dx12_ps.hlsl so the
+    // field's shadow response matches the turf underneath.
+    float ndotl = saturate(dot(normal, lightDir));
+    float texelWorld = shadowCascadeTexelWorld[cascade];
+    float3 samplePos = worldPos + normal * texelWorld * 1.8;
+    float4 fragPosLightSpace = mul(float4(samplePos, 1.0),
                                    shadowCascadeMatrices[cascade]);
 
     float3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
@@ -95,8 +104,9 @@ float CalculateShadowCheap(float3 worldPos, float3 normal, float3 lightDir) {
         return 1.0;
     }
 
-    float ndotl = saturate(dot(normal, lightDir));
-    float bias = max(shadowBias * (1.0 - ndotl), shadowBias * 0.25);
+    float slope = clamp(sqrt(1.0 - ndotl * ndotl) / max(ndotl, 0.1), 0.0, 8.0);
+    float bias = texelWorld * (1.0 + 2.0 * slope) /
+                 max(shadowCascadeDepthRange[cascade], 1e-3);
     return shadowMap.SampleCmpLevelZero(
         shadowSampler, float3(shadowUV, cascade), projCoords.z - bias);
 }
@@ -158,16 +168,13 @@ float3 tonemapAgXPunchy(float3 color) {
 float4 main(PS_INPUT input) : SV_TARGET {
     float3 normal = normalize(input.normal);
     float3 viewDir = normalize(viewPos - input.fragPos);
-    // World-space patch and blade variation breaks the uniform green carpet.
-    float macroPatch = sin(input.fragPos.x * 0.075 +
-                           sin(input.fragPos.z * 0.052) * 1.7) * 0.5 + 0.5;
-    float bladeRandom = frac(sin(dot(floor(input.fragPos.xz * 1.7),
-        float2(12.9898, 78.233))) * 43758.5453);
-    float dryPatch = smoothstep(0.70, 0.96, macroPatch);
-    float3 lushTint = float3(0.78, 1.08, 0.72);
-    float3 dryTint = float3(1.28, 1.02, 0.48);
-    float3 albedo = objectColor * lerp(lushTint, dryTint, dryPatch);
-    albedo *= lerp(0.82, 1.14, bladeRandom);
+    // Subtle stable blade-to-blade yellow/green and brightness variation.
+    // Keep amplitude low to avoid noisy distant grass.
+    float3 coolTint = float3(0.90, 1.03, 0.92);
+    float3 warmTint = float3(1.06, 1.00, 0.78);
+    float3 tint = lerp(coolTint, warmTint, input.colorVariation);
+    float brightness = lerp(0.88, 1.10, input.colorVariation);
+    float3 albedo = saturate(objectColor * tint * brightness);
 
     // Blades are two-sided cards; flip the normal to face the camera so the
     // back of a blade doesn't go black.

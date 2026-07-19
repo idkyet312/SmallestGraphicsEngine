@@ -158,7 +158,7 @@ public:
             return false;
         }
         D3D12_INPUT_ELEMENT_DESC grassInput[] = {
-            { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
               D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
         };
         psoDesc.InputLayout = { grassInput, _countof(grassInput) };
@@ -459,6 +459,8 @@ public:
             result[cascade] = lightView * XMMatrixOrthographicOffCenterLH(
                 centerX - extent, centerX + extent,
                 centerY - extent, centerY + extent, nearPlane, farPlane);
+            (&g_shadowCascadeTexelWorld.x)[cascade] = texel;
+            (&g_shadowCascadeDepthRange.x)[cascade] = farPlane - nearPlane;
             segmentNear = segmentFar;
         }
         return result;
@@ -571,7 +573,9 @@ public:
         }
 
         // Sparse instanced blade silhouettes give grass a readable basic shadow
-        // without repeating the full-density 400k-blade forward pass.
+        // without repeating the full-density 400k-blade forward pass. The grass
+        // shadow VS strides through each range so these are distributed tufts,
+        // not a contiguous prefix that forms bands.
         if (!g_emptyLevelMode && g_grass.IsInitialized() && g_grass.CastShadows() &&
             g_grass.ShadowDensity() > 0.0f && depthShader.grassPipelineState) {
             g_grass.SetViewer(scene.camera.Position);
@@ -593,6 +597,11 @@ public:
                     scene.cameraFOV, static_cast<float>(g_dx12.screenHeight));
                 for (const auto& range : grassShadowRanges) {
                     params.firstBlade = range.firstInstance;
+                    // Shadow VS reuses raster-only fields to scatter the sparse
+                    // caster budget across the complete cell instead of taking
+                    // a stripe-forming contiguous prefix.
+                    params.drawDistance = g_grass.ShadowDensity();
+                    params.pixelWorldScale = static_cast<float>(range.instanceCount);
                     depthShader.SetGrass(params, instances);
                     const UINT sparseCount = static_cast<UINT>(
                         range.instanceCount * g_grass.ShadowDensity());

@@ -8,6 +8,13 @@
 #include <wrl/client.h>
 #include <DirectXMath.h>
 
+struct HDRISunLight {
+    DirectX::XMFLOAT3 direction = { 0.0f, 1.0f, 0.0f };
+    DirectX::XMFLOAT3 color = { 1.0f, 1.0f, 1.0f };
+    float sourceLuminance = 0.0f;
+    bool valid = false;
+};
+
 class GLBImporter {
 public:
     static std::shared_ptr<SceneNode> LoadGLB(const std::string& filepath, Microsoft::WRL::ComPtr<ID3D12Device> device, Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList);
@@ -22,6 +29,12 @@ public:
     // Returns all-zero coefficients (caller should fall back to a flat
     // ambient term) if the file can't be loaded.
     static std::array<DirectX::XMFLOAT3, 9> ComputeSkyIrradianceSH(const std::string& filepath);
+
+    // Finds the compact brightest region in an equirectangular HDRI and
+    // returns its world-space direction and radiance chromaticity. This keeps
+    // the analytic directional light aligned with the visible environment sun.
+    static HDRISunLight ExtractHDRISunLight(const std::string& filepath,
+                                            float targetLuminance = 2.1f);
 
     // Collapses an entire (static) node hierarchy into one SceneNode per unique
     // material, each holding a single merged draw call. Each primitive's

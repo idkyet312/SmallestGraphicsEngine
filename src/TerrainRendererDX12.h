@@ -147,13 +147,23 @@ public:
     // TerrainHeight), used for walking collision. Keep the two in sync - any
     // drift puts the camera above or inside the rendered ground.
     static float HeightAt(const Params& params, float x, float z) {
-        auto fract = [](float v) { return v - floorf(v); };
+        auto hashUint = [](uint32_t value) {
+            value ^= value >> 16;
+            value *= 0x7feb352du;
+            value ^= value >> 15;
+            value *= 0x846ca68bu;
+            value ^= value >> 16;
+            return value;
+        };
         auto hash21 = [&](float px, float py) {
-            px = fract(px * 123.34f);
-            py = fract(py * 456.21f);
-            float d = px * (px + 45.32f) + py * (py + 45.32f);
-            px += d; py += d;
-            return fract(px * py);
+            const uint32_t cellX = static_cast<uint32_t>(
+                static_cast<int32_t>(px));
+            const uint32_t cellY = static_cast<uint32_t>(
+                static_cast<int32_t>(py));
+            const uint32_t value = hashUint(
+                cellX ^ (hashUint(cellY) + 0x9e3779b9u));
+            return static_cast<float>(value & 0x00ffffffu) *
+                   (1.0f / 16777216.0f);
         };
         auto noise2 = [&](float px, float py) {
             float ix = floorf(px), iy = floorf(py);
@@ -176,7 +186,9 @@ public:
         float sum = 0.0f, amp = 0.5f;
         for (int i = 0; i < 5; ++i) {
             sum += noise2(px, py) * amp;
-            px *= 2.02f; py *= 2.02f;
+            const float nextX = px * 1.616f - py * 1.212f;
+            const float nextY = px * 1.212f + py * 1.616f;
+            px = nextX; py = nextY;
             amp *= 0.5f;
         }
         float h = sum * params.heightScale;
