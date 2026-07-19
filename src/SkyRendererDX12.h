@@ -7,6 +7,10 @@
 #include <fstream>
 #include <sstream>
 
+// Poly Haven "Quarry 01 (Pure Sky)", CC0.
+inline constexpr const char* kSkyEnvironmentPath =
+    "models/Skyboxes/quarry_01_puresky_2k.exr";
+
 struct alignas(256) SkyBufferDX12 {
     XMFLOAT3 cameraForward;
     float tanHalfFov;
@@ -118,7 +122,7 @@ public:
             &desc, IID_PPV_ARGS(&msaaPipelineState)));
 
         skyTexture = GLBImporter::LoadEXRTextureFromFile(
-            "models/Skyboxes/sunny_rose_garden_2k.exr", g_dx12.device,
+            kSkyEnvironmentPath, g_dx12.device,
             g_dx12.commandList, uploadHeaps);
         if (!skyTexture) return false;
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};

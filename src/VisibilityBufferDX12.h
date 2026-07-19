@@ -206,11 +206,11 @@ public:
     float exposureAdaptation = 0.05f;
     float motionBlurStrength = 0.35f;
     float focusDistance = 8.0f;
-    float aperture = 0.025f;
+    float aperture = 0.0f;
     float currentNearPlane = 0.1f;
     float currentFarPlane = 1000.0f;
     int debugViewMode = 0; // 0=lit, 1=instance/primitive IDs, 2=depth
-    bool validationMode = true;
+    bool validationMode = false;
 
     UINT width = 0;
     UINT height = 0;
@@ -366,7 +366,16 @@ public:
     UINT RegisterPrimitive(MeshPrimitive* primitive) {
         if (!primitive || primitive->vertices.empty()) return VB_INVALID_MESH;
         auto found = primitiveMeshLookup.find(primitive);
-        if (found != primitiveMeshLookup.end()) return found->second;
+        if (found != primitiveMeshLookup.end()) {
+            // Spatial batches replace their merged SceneNode after a cell
+            // changes. The allocator can reuse the old MeshPrimitive address,
+            // but a freshly constructed primitive has not been registered yet.
+            // Do not bind the recycled address to the old material bucket's
+            // geometry.
+            if (primitive->visibilityMeshID == found->second)
+                return found->second;
+            primitiveMeshLookup.erase(found);
+        }
         const UINT mesh = RegisterMesh(primitive->vertices.data(),
             static_cast<UINT>(primitive->vertices.size() / 12),
             primitive->indices.empty() ? nullptr : primitive->indices.data(),
@@ -885,7 +894,9 @@ public:
         constants.motionBlurStrength = (temporalEffectsEnabled &&
             !validationMode) ? motionBlurStrength : 0.0f;
         constants.focusDistance = focusDistance;
-        constants.aperture = validationMode ? 0.0f : aperture;
+        // Depth of field disabled. It blurred the entire game view whenever
+        // parity validation was off.
+        constants.aperture = 0.0f;
         constants.nearPlane = currentNearPlane;
         constants.farPlane = currentFarPlane;
         constants.debugViewMode = static_cast<UINT>(debugViewMode);
@@ -1260,7 +1271,7 @@ private:
 
     bool CreateComputeDescriptorHeap() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-        heapDesc.NumDescriptors = 77;
+        heapDesc.NumDescriptors = 78;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         HRESULT hr = g_dx12.device->CreateDescriptorHeap(
@@ -1498,9 +1509,9 @@ private:
         //   [9] b2 - point lights CBV
 
         D3D12_DESCRIPTOR_RANGE ranges[3] = {};
-        // SRVs t0..t71: frame/geometry, material table, texture array.
+        // SRVs t0..t72: frame/geometry, material table, textures, environment.
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 72;
+        ranges[0].NumDescriptors = 73;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].RegisterSpace = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
@@ -1510,14 +1521,14 @@ private:
         ranges[1].NumDescriptors = 2;
         ranges[1].BaseShaderRegister = 0;
         ranges[1].RegisterSpace = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 72;
+        ranges[1].OffsetInDescriptorsFromTableStart = 73;
 
         // CBVs b1..b3 (lights, point lights, sky SH)
         ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
         ranges[2].NumDescriptors = 3;
         ranges[2].BaseShaderRegister = 1;
         ranges[2].RegisterSpace = 0;
-        ranges[2].OffsetInDescriptorsFromTableStart = 74;
+        ranges[2].OffsetInDescriptorsFromTableStart = 75;
 
         D3D12_ROOT_PARAMETER resolveParams[2] = {};
 
@@ -1742,7 +1753,18 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [72] u0 - linear HDR output UAV
+        // [72] t72 - HDR environment map for specular IBL.
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC environment = {};
+            environment.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            environment.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            environment.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            environment.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(nullptr, &environment, cpuHandle);
+            cpuHandle.ptr += descSize;
+        }
+
+        // [73] u0 - linear HDR output UAV
         {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
             uavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -1751,7 +1773,7 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [73] u1 - screen-space motion vectors
+        // [74] u1 - screen-space motion vectors
         {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
             uavDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
@@ -1761,9 +1783,9 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [74] b1 - light buffer CBV
-        // [75] b2 - point lights CBV
-        // [76] b3 - sky SH CBV
+        // [75] b1 - light buffer CBV
+        // [76] b2 - point lights CBV
+        // [77] b3 - sky SH CBV
         // These will be created in UpdateLightDescriptors
     }
 
@@ -2000,7 +2022,7 @@ public:
                                 D3D12_GPU_VIRTUAL_ADDRESS shBufferAddr) {
         UINT descSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
-        cpuHandle.ptr += 74 * descSize;
+        cpuHandle.ptr += 75 * descSize;
 
         // [7] b1 - light buffer CBV
         {
@@ -2027,6 +2049,21 @@ public:
             cbvDesc.SizeInBytes = sizeof(SHBufferDX12);
             g_dx12.device->CreateConstantBufferView(&cbvDesc, cpuHandle);
         }
+    }
+
+    void UpdateEnvironmentMap(ID3D12Resource* environmentResource) {
+        if (!computeDescHeap) return;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            computeDescHeap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(g_dx12.cbvSrvUavDescriptorSize) * 72u;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Format = environmentResource
+            ? environmentResource->GetDesc().Format : DXGI_FORMAT_R32G32B32A32_FLOAT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = environmentResource
+            ? environmentResource->GetDesc().MipLevels : 1;
+        g_dx12.device->CreateShaderResourceView(environmentResource, &srv, handle);
     }
 
     // Update the shadow map SRV in the compute descriptor heap

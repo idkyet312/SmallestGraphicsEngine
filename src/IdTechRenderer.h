@@ -163,7 +163,11 @@ inline void AppendOpaquePrimitiveDrawItem(MeshPrimitive& primitive,
     const XMMATRIX& model, std::vector<IdTechDrawItem>& items) {
     const std::shared_ptr<SceneMaterial>& material = primitive.material;
     const bool transparent = material && material->baseColorFactor.w < 0.999f;
-    if (transparent || primitive.skinBuffer || primitive.vertices.empty() ||
+    // Alpha-tested cards need their material texture bound per draw. Keep them
+    // in forward extensions with transparent/skinned geometry instead of
+    // claiming them for the opaque visibility batch.
+    const bool alphaCutout = material && material->alphaCutout;
+    if (transparent || alphaCutout || primitive.skinBuffer || primitive.vertices.empty() ||
         primitive.vbv.BufferLocation == 0) return;
     // Material baseColorFactor is already uploaded in VBMaterialData.
     // Keep instance tint white or imported materials get multiplied twice.
@@ -196,7 +200,7 @@ inline void AppendOpaqueMeshDrawItems(const std::shared_ptr<SceneMesh>& mesh,
 
 struct FlattenedOpaquePacket {
     MeshPrimitive* primitive = nullptr;
-    XMFLOAT4X4 localTransform = {};
+    SceneNode* owner = nullptr;
 };
 
 struct FlattenedOpaquePacketCacheEntry {
@@ -211,7 +215,7 @@ inline void CollectFlattenedOpaquePackets(const std::shared_ptr<SceneNode>& node
     std::vector<FlattenedOpaquePacket>& packets) {
     if (!node) return;
     if (node->mesh) for (MeshPrimitive& primitive : node->mesh->primitives)
-        packets.push_back({ &primitive, node->globalTransform });
+        packets.push_back({ &primitive, node.get() });
     for (const std::shared_ptr<SceneNode>& child : node->children)
         CollectFlattenedOpaquePackets(child, packets);
 }
@@ -241,8 +245,10 @@ inline void AppendOpaqueSceneNodeDrawItems(
     const std::vector<FlattenedOpaquePacket>& packets =
         GetFlattenedOpaquePackets(node);
     for (const FlattenedOpaquePacket& packet : packets) {
-        if (!packet.primitive) continue;
-        const XMMATRIX model = XMLoadFloat4x4(&packet.localTransform) *
+        if (!packet.primitive || !packet.owner) continue;
+        // Node hierarchy is cached; animated transforms are not. Rotor nodes
+        // update globalTransform every frame.
+        const XMMATRIX model = XMLoadFloat4x4(&packet.owner->globalTransform) *
             worldTransform;
         AppendOpaquePrimitiveDrawItem(*packet.primitive, model, items);
     }

@@ -42,6 +42,7 @@ cbuffer GrassParams : register(b6) {
     float gHelicopterZ;
     float gHelicopterWindRadius;
     float gHelicopterWindStrength;
+    float gPixelWorldScale;
 };
 
 // One blade. Matches GrassField::BladeInstance exactly.
@@ -138,7 +139,12 @@ VS_OUTPUT main(VS_INPUT input) {
     const float droop = sqrt(max(0.0, 1.0 - dot(off, off)));
 
     const float h = b.height * fade;
-    const float w = b.width * (1.0 - t * 0.85);   // taper to a point at the tip
+    // MSAA resolves sample coverage; it cannot recover animated geometry that
+    // is narrower than a sample footprint. Keep the blade body just over one
+    // pixel wide at distance, then retain the authored taper toward its tip.
+    const float minHalfWidth = length(toEye) * gPixelWorldScale * 0.55;
+    const float rasterHalfWidth = max(b.width, minHalfWidth);
+    const float w = rasterHalfWidth * (1.0 - t * 0.85);
 
     float3 pos;
     pos.x = b.root.x + b.dir.x * w * side + off.x * h;

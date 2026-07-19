@@ -110,6 +110,7 @@ struct MaterialData {
 };
 StructuredBuffer<MaterialData> materials : register(t7);
 Texture2D<float4> materialTextures[64] : register(t8);
+Texture2D<float4> environmentMap : register(t72);
 
 RWTexture2D<float4> outputColor : register(u0);
 RWTexture2D<float2> outputMotion : register(u1);
@@ -144,19 +145,12 @@ float3 SampleSkyIrradiance(float3 normal) {
 
 float3 SampleReflectionProbe(float3 reflectionDir, float roughness) {
     reflectionDir = normalize(reflectionDir);
-    float up = saturate(reflectionDir.y * 0.5 + 0.5);
-    float horizon = exp(-abs(reflectionDir.y) * 7.0);
-    float3 zenith = float3(0.34, 0.58, 0.86) * skyIntensity;
-    float3 horizonColor = float3(0.86, 0.78, 0.62) * skyIntensity;
-    float3 ground = float3(0.10, 0.13, 0.09);
-    float3 sky = lerp(horizonColor, zenith, smoothstep(0.30, 1.0, up));
-    float3 environment = lerp(ground, sky, up);
-    environment = lerp(environment, horizonColor, horizon * 0.35);
-    float sunGlint = pow(saturate(dot(reflectionDir, normalize(lightPos))),
-                         lerp(96.0, 12.0, roughness));
-    environment += lightColor * sunGlint * (1.0 - roughness) * 1.8;
-    float luminance = dot(environment, float3(0.299, 0.587, 0.114));
-    return lerp(environment, luminance.xxx, roughness * 0.35);
+    float2 uv = float2(atan2(reflectionDir.z, reflectionDir.x) * 0.159154943 + 0.5,
+                       acos(clamp(reflectionDir.y, -1.0, 1.0)) * 0.318309886);
+    uint width, height, mipCount;
+    environmentMap.GetDimensions(0, width, height, mipCount);
+    float lod = roughness * roughness * max((float)mipCount - 1.0, 0.0);
+    return environmentMap.SampleLevel(texSampler, uv, lod).rgb * skyIntensity;
 }
 
 float3 RenderProceduralSky(uint2 pixel) {
@@ -417,7 +411,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 normal = normalize(mul(objNormal, (float3x3)dc.modelMatrix));
     if ((dc.flags & 1u) != 0u && dot(normal, viewDir) < 0.0)
         normal = -normal;
-    
+
     float2 texCoord = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
     float2 uvDx, uvDy;
     ComputeUVGradients(wp0, wp1, wp2, uv0, uv1, uv2, uvDx, uvDy);
@@ -472,6 +466,25 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     
     if ((dc.flags & 1u) != 0u && dot(normal, viewDir) < 0.0)
         normal = -normal;
+
+    if (material.shadingParams.y < -0.5) {
+        float macro = sin(fragPos.x * 0.071 + sin(fragPos.z * 0.043)) *
+                      sin(fragPos.z * 0.063) * 0.5 + 0.5;
+        float slope = 1.0 - saturate(normal.y);
+        float track = 1.0 - smoothstep(0.65, 2.4,
+            abs(fragPos.x - sin(fragPos.z * 0.055) * 5.0));
+        albedo *= lerp(0.78, 1.16, macro);
+        albedo = lerp(albedo, float3(0.34, 0.22, 0.095),
+            saturate(slope * 1.7 + track * 0.42));
+        float2 detail = float2(sin(fragPos.x * 3.7 + fragPos.z * 1.9),
+                               cos(fragPos.z * 3.2 - fragPos.x * 1.4));
+        normal = normalize(normal + float3(detail.x, 0.0, detail.y) * 0.075);
+        rough = saturate(rough * lerp(0.88, 1.08, macro));
+    } else if (metal < 0.25) {
+        float variation = sin(fragPos.x * 0.83 + fragPos.y * 1.17 +
+                              fragPos.z * 0.61) * 0.5 + 0.5;
+        rough = clamp(rough * lerp(0.88, 1.10, variation), 0.04, 1.0);
+    }
     
     float3 result = 0.0;
     

@@ -37,6 +37,31 @@ struct DestructionDebrisHazard {
     bool lethalImpact = false;
 };
 
+struct TinyDebrisParticle {
+    DirectX::XMFLOAT3 position = {};
+    DirectX::XMFLOAT3 velocity = {};
+    float size = 0.08f;
+};
+
+struct DestructionStressStats {
+    bool running = false;
+    float elapsedSeconds = 0.0f;
+    uint32_t sampledFrames = 0;
+    uint32_t peakActors = 0;
+    uint32_t peakAwakeActors = 0;
+    uint32_t tinyParticles = 0;
+    uint32_t collisionLodBodies = 0;
+    uint32_t frozenBodies = 0;
+    uint64_t renderRebuilds = 0;
+    double triggerMilliseconds = 0.0;
+    double averageFrameMilliseconds = 0.0;
+    double peakFrameMilliseconds = 0.0;
+    double averageUpdateMilliseconds = 0.0;
+    double peakUpdateMilliseconds = 0.0;
+    double peakPhysicsMilliseconds = 0.0;
+    double peakRenderRebuildMilliseconds = 0.0;
+};
+
 struct RagdollRenderItem {
     DirectX::XMFLOAT4X4 transform;
     DirectX::XMFLOAT3 color;
@@ -163,6 +188,9 @@ public:
     // limbs. Used by gameplay to make physical bodies strike characters.
     std::vector<DestructionDebrisHazard> GetDangerousDebris(
         float minimumSpeed = 2.5f) const;
+    std::vector<TinyDebrisParticle> DrainTinyDebrisParticles();
+    void StartCollapseStressBenchmark();
+    DestructionStressStats GetStressStats() const;
 
     bool IsInitialized() const;
     uint32_t GetChunkCount() const;
@@ -172,6 +200,8 @@ public:
     uint32_t GetAwakeActorCount() const;
     uint32_t GetLowMotionActorCount() const;
     uint32_t GetSpatialBatchCount() const;
+    uint32_t GetCollisionLodActorCount() const;
+    uint32_t GetFrozenActorCount() const;
     bool IsBatchBuildPending() const;
     const std::vector<DestructionRenderItem>& GetRenderItems() const;
     const std::vector<DestructionRenderBatch>& GetRenderBatches() const;

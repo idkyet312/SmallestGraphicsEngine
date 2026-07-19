@@ -394,7 +394,16 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
 
         ImGui::Checkbox("4x MSAA (Forward only)", &scene.enableMSAA);
         ImGui::Checkbox("FXAA", &scene.enableFXAA);
-        ImGui::Checkbox("Volumetric Fog (Forward)", &scene.enableVolumetricFog);
+        ImGui::Checkbox("GTAO + Contact Shadows", &scene.enableAmbientOcclusion);
+        if (scene.enableAmbientOcclusion) {
+            ImGui::DragFloat("AO Radius", &scene.ambientOcclusionRadius,
+                             0.05f, 0.2f, 4.0f, "%.2f m");
+            ImGui::SliderFloat("AO Strength", &scene.ambientOcclusionStrength,
+                               0.0f, 2.5f, "%.2f");
+            ImGui::SliderFloat("Contact Shadows", &scene.contactShadowStrength,
+                               0.0f, 1.0f, "%.2f");
+        }
+        ImGui::Checkbox("Volumetric Fog", &scene.enableVolumetricFog);
         if (scene.enableVolumetricFog) {
             ImGui::DragFloat("Fog Density", &scene.volumetricFogDensity,
                              0.0005f, 0.0001f, 0.05f, "%.4f");
@@ -478,8 +487,34 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat("Damage", &scene.destructionDamage, 0.1f, 0.1f, 10.0f);
         ImGui::DragFloat("Bullet Impulse", &scene.destructionBulletImpulse, 5.0f, 0.0f, 1000.0f);
         ImGui::Text("Wall: %u chunks  %u actors", g_destruction.GetChunkCount(), g_destruction.GetActorCount());
+        ImGui::Text("Debris LOD: %u world-only  %u frozen/merged",
+                    g_destruction.GetCollisionLodActorCount(),
+                    g_destruction.GetFrozenActorCount());
         ImGui::Checkbox("Blast Debug Draw", &scene.showDestructionDebug);
         if (ImGui::Button("Rebuild Wall")) scene.rebuildDestructionRequested = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Collapse Stress Benchmark"))
+            g_destruction.StartCollapseStressBenchmark();
+        const DestructionStressStats stress = g_destruction.GetStressStats();
+        if (stress.running || stress.sampledFrames > 0) {
+            ImGui::Text("Stress: %s  %.1fs  %u frames",
+                        stress.running ? "running" : "complete",
+                        stress.elapsedSeconds, stress.sampledFrames);
+            ImGui::Text("Trigger %.2f ms  Update avg/peak %.2f / %.2f ms",
+                        stress.triggerMilliseconds,
+                        stress.averageUpdateMilliseconds,
+                        stress.peakUpdateMilliseconds);
+            ImGui::Text("Frame avg/peak %.2f / %.2f ms",
+                        stress.averageFrameMilliseconds,
+                        stress.peakFrameMilliseconds);
+            ImGui::Text("Physics peak %.2f ms  Render rebuild peak %.2f ms",
+                        stress.peakPhysicsMilliseconds,
+                        stress.peakRenderRebuildMilliseconds);
+            ImGui::Text("Peak actors/awake %u / %u  Rebuilds %llu  Tiny %u",
+                        stress.peakActors, stress.peakAwakeActors,
+                        static_cast<unsigned long long>(stress.renderRebuilds),
+                        stress.tinyParticles);
+        }
     }
 
     if (ImGui::CollapsingHeader("Palm Trees", ImGuiTreeNodeFlags_DefaultOpen)) {

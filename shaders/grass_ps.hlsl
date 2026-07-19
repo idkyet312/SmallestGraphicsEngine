@@ -139,7 +139,16 @@ float3 tonemapAgXPunchy(float3 color) {
 float4 main(PS_INPUT input) : SV_TARGET {
     float3 normal = normalize(input.normal);
     float3 viewDir = normalize(viewPos - input.fragPos);
-    float3 albedo = objectColor;
+    // World-space patch and blade variation breaks the uniform green carpet.
+    float macroPatch = sin(input.fragPos.x * 0.075 +
+                           sin(input.fragPos.z * 0.052) * 1.7) * 0.5 + 0.5;
+    float bladeRandom = frac(sin(dot(floor(input.fragPos.xz * 1.7),
+        float2(12.9898, 78.233))) * 43758.5453);
+    float dryPatch = smoothstep(0.70, 0.96, macroPatch);
+    float3 lushTint = float3(0.78, 1.08, 0.72);
+    float3 dryTint = float3(1.28, 1.02, 0.48);
+    float3 albedo = objectColor * lerp(lushTint, dryTint, dryPatch);
+    albedo *= lerp(0.82, 1.14, bladeRandom);
 
     // Blades are two-sided cards; flip the normal to face the camera so the
     // back of a blade doesn't go black.

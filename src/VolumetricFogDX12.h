@@ -45,6 +45,7 @@ public:
                 D3D12_CPU_DESCRIPTOR_HANDLE targetRtv = {},
                 bool hdrTarget = false) {
         if (!initialized || !g_dx12.commandList || !depthResource) return;
+        fogTime_ += 1.0f / 60.0f;
         UpdateFrameData(scene, lightSpace, shadowResource, depthResource,
                         multisampledDepth);
         ID3D12GraphicsCommandList* commandList = g_dx12.commandList.Get();
@@ -321,7 +322,7 @@ private:
             scene.volumetricFogTint.x,
             scene.volumetricFogTint.y,
             scene.volumetricFogTint.z,
-            0.0f };
+            fogTime_ };
         constants.clusterDimsLightCount = { GridX, GridY, GridZ,
             static_cast<UINT>((std::min)(scene.clusteredRenderer.lights.size(),
                                         static_cast<size_t>(MaxLights))) };
@@ -430,6 +431,7 @@ private:
     UINT clusterFrameSize_ = 0;
     UINT lightFrameSize_ = 0;
     UINT frame_ = 0;
+    float fogTime_ = 0.0f;
 };
 
 #endif

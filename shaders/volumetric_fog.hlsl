@@ -69,6 +69,16 @@ float HenyeyGreenstein(float cosineTheta, float g)
     return (1.0 - g2) / max(4.0 * 3.14159265 * pow(1.0 + g2 - 2.0 * g * cosineTheta, 1.5), 1e-4);
 }
 
+float FogNoise(float3 p)
+{
+    // Broad moving density cells. Stable in world space; time only advects them.
+    p += float3(ambientFogColor.w * 0.42, 0.0, ambientFogColor.w * 0.19);
+    float n = sin(p.x * 0.105 + sin(p.z * 0.071)) *
+              sin(p.z * 0.093 - p.y * 0.17);
+    n += sin((p.x + p.z) * 0.037 + ambientFogColor.w * 0.31) * 0.55;
+    return saturate(n * 0.32 + 0.62);
+}
+
 [numthreads(8, 8, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
@@ -93,7 +103,10 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float3 worldPosition = cameraPositionNear.xyz + ray * (centerDepth / viewCos);
 
         float heightDensity = exp(-max(worldPosition.y - fogParams.y, 0.0) * fogParams.x);
-        heightDensity = max(heightDensity, 0.08);
+        float lowLayer = exp(-abs(worldPosition.y - fogParams.y) * 0.22);
+        float densityNoise = lerp(0.58, 1.28, FogNoise(worldPosition));
+        heightDensity *= densityNoise * lerp(0.72, 1.18, lowLayer);
+        heightDensity = max(heightDensity, 0.035);
         float extinction = max(sunDirectionDensity.w * heightDensity, 0.00001);
         float segmentTransmittance = exp(-extinction * stepLength);
 

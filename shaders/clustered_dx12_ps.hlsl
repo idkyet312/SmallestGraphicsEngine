@@ -97,6 +97,7 @@ Texture2D visibilityMap : register(t3);
 Texture2D normalMap : register(t4);
 Texture2D metalRoughMap : register(t5);
 Texture2D<float> shadowMap : register(t0);
+Texture2D<float4> environmentMap : register(t15);
 SamplerComparisonState shadowSampler : register(s0);
 SamplerState texSampler : register(s1);
 
@@ -274,26 +275,15 @@ float3 sampleSkyIrradiance(float3 normal) {
     return max(result, 0.0) * skyIntensity;
 }
 
-// Cheap local reflection probe for metals. Uses the same sky/ground palette as
-// the scene so corrugated sheets catch blue sky, warm horizon, and dark ground
-// even without a real cubemap capture.
+// Roughness-aware specular IBL from the same Quarry 01 HDRI rendered as sky.
 float3 sampleReflectionProbe(float3 reflectionDir, float rough) {
     reflectionDir = normalize(reflectionDir);
-    float up = saturate(reflectionDir.y * 0.5 + 0.5);
-    float horizon = exp(-abs(reflectionDir.y) * 7.0);
-
-    float3 zenith = float3(0.34, 0.58, 0.86) * skyIntensity;
-    float3 horizonColor = float3(0.86, 0.78, 0.62) * skyIntensity;
-    float3 ground = float3(0.10, 0.13, 0.09);
-    float3 sky = lerp(horizonColor, zenith, smoothstep(0.30, 1.0, up));
-    float3 env = lerp(ground, sky, up);
-    env = lerp(env, horizonColor, horizon * 0.35);
-
-    float3 sunDir = normalize(lightPos);
-    float sunGlint = pow(saturate(dot(reflectionDir, sunDir)), lerp(96.0, 12.0, rough));
-    env += lightColor * sunGlint * (1.0 - rough) * 1.8;
-
-    return lerp(env, dot(env, float3(0.299, 0.587, 0.114)).xxx, rough * 0.35);
+    float2 uv = float2(atan2(reflectionDir.z, reflectionDir.x) * 0.159154943 + 0.5,
+                       acos(clamp(reflectionDir.y, -1.0, 1.0)) * 0.318309886);
+    uint width, height, mipCount;
+    environmentMap.GetDimensions(0, width, height, mipCount);
+    float lod = rough * rough * max((float)mipCount - 1.0, 0.0);
+    return environmentMap.SampleLevel(texSampler, uv, lod).rgb * skyIntensity;
 }
 
 float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 viewDir, float rough) {
@@ -407,7 +397,10 @@ float4 main(PS_INPUT input) : SV_TARGET {
         // clip() disables early-Z for the draw, which is expensive scene-wide --
         // an unconditional clip here once pushed heavy-overdraw frames past the
         // GPU watchdog (device removed). Only foliage pays for it now.
-        if (alphaCut > 1.5) clip(max(texColor.r, max(texColor.g, texColor.b)) - 0.38);
+        // Bandit hair atlas stores bright strands on black. A low threshold
+        // keeps grey mip-filtered background and turns eyelash cards into solid
+        // black strips across the face, so retain only authored strand coverage.
+        if (alphaCut > 1.5) clip(max(texColor.r, max(texColor.g, texColor.b)) - 0.62);
         else if (alphaCut > 0.5) clip(texColor.a - 0.4);
         // Textures are uploaded as UNORM, so decode authored sRGB before lighting.
         albedo = pow(max(texColor.rgb, 0.0), 2.2) * objectColor;
@@ -472,6 +465,34 @@ float4 main(PS_INPUT input) : SV_TARGET {
          float minifyFade = 1.0 - saturate((log2(max(normalFootprint, 1.0)) - 1.0) * 0.25);
          float grazingFade = saturate(abs(dot(N, viewDir)) * 2.0);
          normal = normalize(lerp(N, mappedNormal, normalStrength * grazingFade * minifyFade));
+    }
+
+    // Forward imports use a no-cull PSO so foliage cards, rotor blades, and
+    // mixed-winding assets remain visible. Orient the shading normal toward
+    // the visible side; otherwise back faces light inside-out.
+    if (dot(normal, viewDir) < 0.0)
+        normal = -normal;
+
+    // Terrain tag: negative view fill. Add world-space macro variation,
+    // high-frequency detail normal, slope soil, and worn dirt tracks without
+    // another texture fetch or visible tiling repetition.
+    if (viewFillStrength < -0.5) {
+        float macro = sin(input.fragPos.x * 0.071 + sin(input.fragPos.z * 0.043)) *
+                      sin(input.fragPos.z * 0.063) * 0.5 + 0.5;
+        float slope = 1.0 - saturate(normal.y);
+        float track = 1.0 - smoothstep(0.65, 2.4,
+            abs(input.fragPos.x - sin(input.fragPos.z * 0.055) * 5.0));
+        float3 soil = float3(0.34, 0.22, 0.095);
+        albedo *= lerp(0.78, 1.16, macro);
+        albedo = lerp(albedo, soil, saturate(slope * 1.7 + track * 0.42));
+        float2 detail = float2(sin(input.fragPos.x * 3.7 + input.fragPos.z * 1.9),
+                               cos(input.fragPos.z * 3.2 - input.fragPos.x * 1.4));
+        normal = normalize(normal + float3(detail.x, 0.0, detail.y) * 0.075);
+        rough = saturate(rough * lerp(0.88, 1.08, macro));
+    } else if (metal < 0.25) {
+        float materialVariation = sin(input.fragPos.x * 0.83 +
+            input.fragPos.y * 1.17 + input.fragPos.z * 0.61) * 0.5 + 0.5;
+        rough = clamp(rough * lerp(0.88, 1.10, materialVariation), 0.045, 1.0);
     }
     
     // Geometric specular AA: widen GGX for high screen-space normal variance.
@@ -557,7 +578,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // character previews use a soft frontal studio light; applying this before
     // the shadow term crushed it back to black whenever the sun was behind him.
     float frontFill = 0.35 + 0.65 * saturate(dot(normal, viewDir));
-    result += diffuseAlbedo * viewFillStrength * frontFill;
+    result += diffuseAlbedo * max(viewFillStrength, 0.0) * frontFill;
     float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor * NdotL * attenuation * shadowVisibility; // No light intensity? lightColor should allow > 1.
     
     result += Lo;

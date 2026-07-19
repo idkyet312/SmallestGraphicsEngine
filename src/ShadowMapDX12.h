@@ -73,7 +73,7 @@ public:
         rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         rootParams[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         rootParams[4].Constants.ShaderRegister = 6;
-        rootParams[4].Constants.Num32BitValues = 12;
+        rootParams[4].Constants.Num32BitValues = 13;
         rootParams[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         rootParams[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[5].Descriptor.ShaderRegister = 6;
@@ -238,7 +238,7 @@ public:
 
     void SetGrass(const GrassField::Params& params,
                   D3D12_GPU_VIRTUAL_ADDRESS instances) {
-        g_dx12.commandList->SetGraphicsRoot32BitConstants(4, 12, &params, 0);
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(4, 13, &params, 0);
         g_dx12.commandList->SetGraphicsRootShaderResourceView(5, instances);
     }
 
@@ -504,7 +504,8 @@ public:
                 g_dx12.commandList->IASetIndexBuffer(&grassIbv);
                 g_dx12.commandList->IASetPrimitiveTopology(
                     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                GrassField::Params params = g_grass.GetParams();
+                GrassField::Params params = g_grass.GetParams(
+                    scene.cameraFOV, static_cast<float>(g_dx12.screenHeight));
                 for (const auto& range : grassShadowRanges) {
                     params.firstBlade = range.firstInstance;
                     depthShader.SetGrass(params, instances);
