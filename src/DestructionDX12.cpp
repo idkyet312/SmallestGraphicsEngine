@@ -33,10 +33,7 @@ using namespace Nv::Blast;
 
 namespace {
 constexpr uint32_t InvalidIndex = 0xFFFFFFFFu;
-constexpr float DebrisLifetimeSeconds = 20.0f;
-constexpr float DebrisShrinkSeconds = 3.0f;
 constexpr uint32_t MaxAwakeDebrisBodies = 256;
-constexpr uint32_t MaxRetainedDebrisBodies = 1024;
 constexpr float StructuralSolverStep = 1.0f / 15.0f;
 constexpr double StructuralSolverBudgetMs = 0.35;
 constexpr uint32_t MaxStructuresPerSolverSlice = 2;
@@ -1707,21 +1704,6 @@ struct DestructionDX12::Impl {
             liveActors[runtime.get()] = true;
             XMMATRIX transform = XMMatrixIdentity();
             if (!B3_IS_NULL(runtime->body)) transform = BoxTransform(runtime->body, runtime->center);
-            float debrisScale = 1.0f;
-            if (runtime->dynamic) {
-                const float shrinkStart =
-                    DebrisLifetimeSeconds - DebrisShrinkSeconds;
-                debrisScale = 1.0f - (std::max)(0.0f,
-                    runtime->debrisAge - shrinkStart) / DebrisShrinkSeconds;
-                debrisScale = (std::clamp)(debrisScale, 0.0f, 1.0f);
-                if (debrisScale < 1.0f) {
-                    transform = XMMatrixTranslation(-runtime->center.x,
-                        -runtime->center.y, -runtime->center.z) *
-                        XMMatrixScaling(debrisScale, debrisScale, debrisScale) *
-                        XMMatrixTranslation(runtime->center.x, runtime->center.y,
-                            runtime->center.z) * transform;
-                }
-            }
             XMFLOAT4X4 stored; XMStoreFloat4x4(&stored, transform);
             const uint64_t hash = HashChunks(runtime->chunks);
             auto cacheIt = batchCache.find(runtime.get());
@@ -1750,8 +1732,7 @@ struct DestructionDX12::Impl {
             const bool spatiallyStable = !runtime->dynamic ||
                 (runtime->debrisCleanupEligible && runtime->chunks.size() == 1);
             const bool settledForSpatialBatch = spatiallyStable &&
-                !B3_IS_NULL(runtime->body) && !b3Body_IsAwake(runtime->body) &&
-                debrisScale >= 0.999f;
+                !B3_IS_NULL(runtime->body) && !b3Body_IsAwake(runtime->body);
             if (settledForSpatialBatch) {
                 for (uint32_t chunkIndex : runtime->chunks) {
                     const Chunk& chunk = chunks[chunkIndex];
@@ -1787,7 +1768,7 @@ struct DestructionDX12::Impl {
                 const Chunk& c = chunks[chunk];
                 const XMVECTOR extent = XMLoadFloat3(&c.maximum) - XMLoadFloat3(&c.minimum);
                 const float radius =
-                    0.55f * XMVectorGetX(XMVector3Length(extent)) * debrisScale;
+                    0.55f * XMVectorGetX(XMVector3Length(extent));
                 XMFLOAT3 worldCenter;
                 XMStoreFloat3(&worldCenter, XMVector3Transform(XMLoadFloat3(&c.center), transform));
                 actorItems.push_back({ c.node, stored, worldCenter, radius });
@@ -2160,8 +2141,8 @@ struct DestructionDX12::Impl {
         return anyBroke;
     }
 
-    // Hard aftermath budget. Preserve fast/new pieces. First sleep old slow
-    // debris, then retire the oldest already-sleeping bodies with a dust point.
+    // Bound active physics cost without deleting aftermath. Old slow debris is
+    // put to sleep and later spatially batched, but its geometry remains forever.
     bool EnforceDebrisBudget() {
         std::vector<ActorRuntime*> debris;
         std::vector<ActorRuntime*> slowAwake;
@@ -2194,38 +2175,6 @@ struct DestructionDX12::Impl {
             changed = true;
         }
 
-        if (debris.size() <= MaxRetainedDebrisBodies) return changed;
-        std::vector<ActorRuntime*> retirement;
-        for (ActorRuntime* runtime : debris) {
-            if (!b3Body_IsAwake(runtime->body) && runtime->debrisAge >= 3.0f)
-                retirement.push_back(runtime);
-        }
-        std::sort(retirement.begin(), retirement.end(),
-            [](const ActorRuntime* a, const ActorRuntime* b) {
-                if (a->chunks.size() != b->chunks.size())
-                    return a->chunks.size() < b->chunks.size();
-                return a->debrisAge > b->debrisAge;
-            });
-        const size_t retireCount = (std::min)(retirement.size(),
-            debris.size() - MaxRetainedDebrisBodies);
-        std::unordered_set<ActorRuntime*> retireSet;
-        for (size_t i = 0; i < retireCount; ++i)
-            retireSet.insert(retirement[i]);
-        if (retireSet.empty()) return changed;
-        for (auto it = actors.begin(); it != actors.end();) {
-            ActorRuntime* runtime = it->get();
-            if (!retireSet.count(runtime)) { ++it; continue; }
-            const b3Pos position = b3Body_GetPosition(runtime->body);
-            breakPoints.push_back({ (float)position.x, (float)position.y,
-                (float)position.z });
-            if (runtime->actor) {
-                runtime->actor->userData = nullptr;
-                runtime->actor->removeFromGroup();
-            }
-            b3DestroyBody(runtime->body);
-            it = actors.erase(it);
-            changed = true;
-        }
         return changed;
     }
 };
@@ -2449,15 +2398,12 @@ void DestructionDX12::Update(float dt) {
     } else {
         m->maintenanceAccumulator = 0.0f;
     }
-    bool debrisExpired = false;
-    bool debrisShrinking = false;
     for (auto it = m->actors.begin(); maintenanceDue && it != m->actors.end();) {
         Impl::ActorRuntime& runtime = **it;
         const bool renderedAsBatch =
             m->batchCache.find(&runtime) != m->batchCache.end();
-        // Cached actor batches represent intact/merged structure. Never start
-        // debris cleanup on them, even if physics temporarily marks the actor
-        // dynamic. Only individually rendered split parts shrink and disappear.
+        // Age still drives cheaper collision for old debris. Visual geometry is
+        // never scaled or expired.
         if (!runtime.dynamic || !runtime.debrisCleanupEligible || renderedAsBatch) {
             if (renderedAsBatch) runtime.debrisAge = 0.0f;
             ++it;
@@ -2468,19 +2414,7 @@ void DestructionDX12::Update(float dt) {
             (runtime.debrisAge >= DebrisCollisionLodAge ||
              m->ActorVolume(runtime) <= DebrisCollisionLodVolume))
             m->SetDebrisCollisionLod(runtime, true);
-        debrisShrinking = debrisShrinking || runtime.debrisAge >=
-            DebrisLifetimeSeconds - DebrisShrinkSeconds;
-        if (runtime.debrisAge < DebrisLifetimeSeconds) {
-            ++it;
-            continue;
-        }
-        if (runtime.actor) {
-            runtime.actor->userData = nullptr;
-            runtime.actor->removeFromGroup();
-        }
-        if (!B3_IS_NULL(runtime.body)) b3DestroyBody(runtime.body);
-        it = m->actors.erase(it);
-        debrisExpired = true;
+        ++it;
     }
     m->accumulator = std::min(0.25f, m->accumulator + dt);
     // Thousands of settled split actors make a 60 Hz broadphase needlessly
@@ -2592,8 +2526,7 @@ void DestructionDX12::Update(float dt) {
         !m->rebuiltWhileStill;
     if (movingGeometryChanged || finalSettleRebuild || anyImpactBroke ||
         structuralBroke || debrisBudgetChanged ||
-        batchCompleted || spatialBatchCompleted ||
-        debrisExpired || debrisShrinking) {
+        batchCompleted || spatialBatchCompleted) {
         const auto rebuildBegin = std::chrono::steady_clock::now();
         m->RebuildRenderItems();
         const double rebuildMilliseconds = std::chrono::duration<double, std::milli>(
