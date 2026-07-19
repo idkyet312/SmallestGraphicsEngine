@@ -124,6 +124,7 @@ float                       g_humveeTurretFireCooldown = 0.0f;
 SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
 float                       g_banditLeftArmReach = 0.55f;
+float                       g_banditHeadYawOffsetDegrees = -18.0f;
 uint32_t                    g_banditSpawnSerial = 0;
 GunAudio                    g_gunAudio;
 GunAudio                    g_hitAudio;
@@ -1215,6 +1216,9 @@ void BanditDebugText() {
     ImGui::Text("Weapon: %s  (mouse wheel)", GunModel::SelectedWeaponName());
     ImGui::SliderFloat("Left arm reach", &g_banditLeftArmReach,
                        0.20f, 0.85f, "%.2f m");
+    ImGui::SliderFloat("Head/torso yaw offset",
+                       &g_banditHeadYawOffsetDegrees,
+                       -90.0f, 90.0f, "%.1f deg");
     if (ImGui::CollapsingHeader("Enemy Audio", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::SliderFloat("Flesh hit pitch min", &g_fleshHitPitchMin,
                                0.5f, 2.0f, "%.2f"))
@@ -4061,6 +4065,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     continue;
                 }
                 bandit->leftArmReach = g_banditLeftArmReach;
+                bandit->headTorsoYawOffsetDegrees =
+                    g_banditHeadYawOffsetDegrees;
                 const float cameraDx = bandit->position.x - scene.camera.Position.x;
                 const float cameraDz = bandit->position.z - scene.camera.Position.z;
                 const float cameraDistanceSq = cameraDx * cameraDx + cameraDz * cameraDz;
