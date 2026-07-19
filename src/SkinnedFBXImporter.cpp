@@ -260,10 +260,12 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
         p.materialIndex = (int)src->mMaterialIndex;
         out.materialKeepAlive.push_back(mat);
 
-        // Authored eyelash cards are displaced through the face by this FBX's
-        // skeleton conversion and render as opaque black strips across the eyes.
-        // Keep scalp hair cards, but omit this separate cosmetic batch.
-        if (mat && lowerStr(mat->name).find("eyelash") != std::string::npos)
+        // This FBX's separate hair-card meshes do not follow the converted head
+        // bind pose. Both scalp and eyelash cards cut through the face as opaque
+        // strips. The opaque head underneath already carries the authored cap,
+        // mask, brows, and eye texture, so omit only these broken card batches.
+        if (mat && (lowerStr(mat->name).find("hair") != std::string::npos ||
+                    lowerStr(mat->name).find("eyelash") != std::string::npos))
             continue;
 
         // Geometry (12-float interleaved, scaled). Skin data is a parallel array.
