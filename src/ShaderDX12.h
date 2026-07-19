@@ -14,6 +14,12 @@ inline std::array<XMMATRIX, SHADOW_CASCADE_COUNT> g_shadowCascadeMatrices = {
     XMMatrixIdentity(), XMMatrixIdentity(), XMMatrixIdentity()
 };
 inline XMFLOAT4 g_shadowCascadeSplits = { 18.0f, 55.0f, 180.0f, 0.0f };
+// Per-cascade shadow texel size in world units and light-space depth range,
+// filled by ComputeCascadeMatrices. Shaders scale their depth bias by these so
+// one bias constant cannot under-bias the wide far cascade (terrain acne
+// bands) while over-biasing the tight near one.
+inline XMFLOAT4 g_shadowCascadeTexelWorld = { 0.05f, 0.05f, 0.05f, 0.0f };
+inline XMFLOAT4 g_shadowCascadeDepthRange = { 300.0f, 300.0f, 300.0f, 0.0f };
 
 // Constant buffer structures (must be 256-byte aligned for DX12)
 struct alignas(256) MatrixBufferDX12 {
@@ -136,6 +142,8 @@ struct alignas(256) MeshDrawBufferDX12 {
 struct alignas(256) ShadowCascadeBufferDX12 {
     XMMATRIX lightViewProjection[SHADOW_CASCADE_COUNT];
     XMFLOAT4 splitDepths;
+    XMFLOAT4 texelWorld;
+    XMFLOAT4 depthRange;
 };
 
 // Transforms consumed directly by the amplification and mesh shaders. Unlike a
@@ -236,6 +244,7 @@ public:
     // which case the grass simply is not drawn.
     ComPtr<ID3D12PipelineState> grassPipelineState;
     ComPtr<ID3D12PipelineState> msaaGrassPipelineState;
+    ComPtr<ID3D12PipelineState> hdrMsaaGrassPipelineState;
     ComPtr<ID3D12PipelineState> hdrPipelineState;
     ComPtr<ID3D12PipelineState> hdrWireframePipelineState;
     ComPtr<ID3D12PipelineState> hdrTransparentPipelineState;
@@ -435,7 +444,7 @@ public:
         }
         
         // SRV descriptor table for global textures
-        D3D12_DESCRIPTOR_RANGE globalSrvRanges[4] = {};
+        D3D12_DESCRIPTOR_RANGE globalSrvRanges[5] = {};
         // t0 - shadowMap
         globalSrvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         globalSrvRanges[0].NumDescriptors = 1;
@@ -461,9 +470,15 @@ public:
         globalSrvRanges[3].BaseShaderRegister = 15;
         globalSrvRanges[3].RegisterSpace = 0;
         globalSrvRanges[3].OffsetInDescriptorsFromTableStart = 3;
+        // t16 - split-sum GGX BRDF integration LUT.
+        globalSrvRanges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        globalSrvRanges[4].NumDescriptors = 1;
+        globalSrvRanges[4].BaseShaderRegister = 16;
+        globalSrvRanges[4].RegisterSpace = 0;
+        globalSrvRanges[4].OffsetInDescriptorsFromTableStart = 4;
         
         rootParams[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rootParams[6].DescriptorTable.NumDescriptorRanges = 4;
+        rootParams[6].DescriptorTable.NumDescriptorRanges = 5;
         rootParams[6].DescriptorTable.pDescriptorRanges = globalSrvRanges;
         rootParams[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
@@ -738,15 +753,13 @@ public:
             msaaSupported = false;
 
         // Grass PSO: the opaque state, but with the instanced wind vertex shader.
-        // The blade mesh is a single 8-vertex template drawn once per blade, so its
-        // vertex layout is just the corner (t, side) -- everything that varies per
-        // blade is read from a structured buffer by SV_InstanceID instead.
+        // Authored template stores height, edge, forward curve, and width profile.
         //
         // Note the FillMode reset -- the wireframe PSO above left it WIREFRAME in
         // the shared desc, and inheriting that would draw the grass as lines.
         psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         D3D12_INPUT_ELEMENT_DESC grassLayout[] = {
-            { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         };
         ComPtr<ID3DBlob> grassVsBlob;
         if (CompileShaderFile("shaders/grass_vs.hlsl", "vs_5_0", compileFlags, grassVsBlob)) {
@@ -777,6 +790,9 @@ public:
                 if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
                         &psoDesc, IID_PPV_ARGS(&hdrGrassPipelineState))))
                     hdrGrassPipelineState.Reset();
+                if (msaaSupported &&
+                    !createMSAAPipeline(hdrMsaaGrassPipelineState))
+                    hdrMsaaGrassPipelineState.Reset();
                 psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
                 psoDesc.PS = grassPsBlob
                     ? D3D12_SHADER_BYTECODE{ grassPsBlob->GetBufferPointer(),
@@ -812,6 +828,7 @@ public:
             msaaTransparentPipelineState.Reset();
             msaaAdditivePipelineState.Reset();
             msaaGrassPipelineState.Reset();
+            hdrMsaaGrassPipelineState.Reset();
         }
         return true;
     }
@@ -865,6 +882,12 @@ public:
         g_dx12.commandList->SetPipelineState(GetPipelineState(wireframe));
     }
 
+    ID3D12PipelineState* GetHDRMSAAGrassPipelineState() const {
+        return hdrMsaaGrassPipelineState.Get();
+    }
+
+    void InvalidateGraphicsRootBinding() { graphicsRootBound = false; }
+
     void EnsureGraphicsRootBound() {
         if (graphicsRootBound) return;
         ID3D12DescriptorHeap* heaps[] = {
@@ -903,7 +926,8 @@ public:
     void BindGlobalResources(ID3D12Resource* shadowMap,
                              ID3D12Resource* irradiance = nullptr,
                              ID3D12Resource* visibility = nullptr,
-                             ID3D12Resource* environment = nullptr) {
+                             ID3D12Resource* environment = nullptr,
+                             ID3D12Resource* brdfLUT = nullptr) {
         UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
 
@@ -919,10 +943,13 @@ public:
         D3D12_SHADER_RESOURCE_VIEW_DESC colorDesc = {};
         colorDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         colorDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        colorDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        colorDesc.Format = irradiance
+            ? irradiance->GetDesc().Format : DXGI_FORMAT_R16G16B16A16_FLOAT;
         colorDesc.Texture2D.MipLevels = 1;
         g_dx12.device->CreateShaderResourceView(irradiance, &colorDesc, cpuHandle);
         cpuHandle.ptr += descriptorSize;
+        colorDesc.Format = visibility
+            ? visibility->GetDesc().Format : DXGI_FORMAT_R16G16_FLOAT;
         g_dx12.device->CreateShaderResourceView(visibility, &colorDesc, cpuHandle);
         cpuHandle.ptr += descriptorSize;
 
@@ -935,6 +962,14 @@ public:
             ? environment->GetDesc().MipLevels : 1;
         g_dx12.device->CreateShaderResourceView(
             environment, &environmentDesc, cpuHandle);
+        cpuHandle.ptr += descriptorSize;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC brdfDesc = {};
+        brdfDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        brdfDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        brdfDesc.Format = DXGI_FORMAT_R32G32_FLOAT;
+        brdfDesc.Texture2D.MipLevels = 1;
+        g_dx12.device->CreateShaderResourceView(brdfLUT, &brdfDesc, cpuHandle);
 
         g_dx12.commandList->SetGraphicsRootDescriptorTable(6, g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart());
     }
@@ -1011,6 +1046,8 @@ public:
         for (UINT i = 0; i < SHADOW_CASCADE_COUNT; ++i)
             cascades.lightViewProjection[i] = XMMatrixTranspose(g_shadowCascadeMatrices[i]);
         cascades.splitDepths = g_shadowCascadeSplits;
+        cascades.texelWorld = g_shadowCascadeTexelWorld;
+        cascades.depthRange = g_shadowCascadeDepthRange;
         shadowCascadeBuffer.CopyData(g_dx12.frameIndex, cascades);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(19,
             shadowCascadeBuffer.GetGPUAddress(g_dx12.frameIndex));
@@ -1224,15 +1261,15 @@ public:
     
     void SetDDGI(bool enabled, float gi_intensity, float normal_bias, float probe_spacing) {
         DDGIBufferDX12 data = {};
-        data.probeGridOrigin = XMFLOAT3(-7.0f, 0.5f, -7.0f);
+        data.probeGridOrigin = XMFLOAT3(-27.5f, 0.5f, -27.5f);
         data.probeSpacing = probe_spacing;
-        data.probeCountX = 8;
+        data.probeCountX = 12;
         data.probeCountY = 4;
-        data.probeCountZ = 8;
-        data.maxRayDistance = 20.0f;
+        data.probeCountZ = 12;
+        data.maxRayDistance = 24.0f;
         data.normalBias = normal_bias;
         data.viewBias = 0.01f;
-        data.irradianceGamma = 5.0f;
+        data.irradianceGamma = 1.0f;
         data.giIntensity = gi_intensity;
         data.irradianceTexWidth = 8;
         data.irradianceTexHeight = 8;

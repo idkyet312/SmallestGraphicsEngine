@@ -7,9 +7,9 @@
 #include <fstream>
 #include <sstream>
 
-// Poly Haven "Quarry 01 (Pure Sky)", CC0.
+// Poly Haven "Kloppenheim 06 (Pure Sky)", CC0.
 inline constexpr const char* kSkyEnvironmentPath =
-    "models/Skyboxes/quarry_01_puresky_2k.exr";
+    "models/Skyboxes/kloppenheim_06_puresky_2k.exr";
 
 struct alignas(256) SkyBufferDX12 {
     XMFLOAT3 cameraForward;

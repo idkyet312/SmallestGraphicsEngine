@@ -513,6 +513,103 @@ std::array<XMFLOAT3, 9> GLBImporter::ComputeSkyIrradianceSH(const std::string& f
     return coeffs;
 }
 
+HDRISunLight GLBImporter::ExtractHDRISunLight(const std::string& filepath,
+                                              float targetLuminance) {
+    HDRISunLight result;
+    float* pixels = nullptr;
+    int width = 0, height = 0;
+    const char* err = nullptr;
+    if (LoadEXR(&pixels, &width, &height, filepath.c_str(), &err) !=
+        TINYEXR_SUCCESS) {
+        std::cerr << "Failed to analyze HDRI sun: " << filepath
+                  << (err ? (std::string(" (") + err + ")") : "") << '\n';
+        if (err) FreeEXRErrorMessage(err);
+        return result;
+    }
+
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    std::vector<float> luminance(pixelCount, 0.0f);
+    double luminanceSum = 0.0;
+    for (size_t i = 0; i < pixelCount; ++i) {
+        const float* p = pixels + i * 4;
+        const float r = std::isfinite(p[0]) ? (std::max)(p[0], 0.0f) : 0.0f;
+        const float g = std::isfinite(p[1]) ? (std::max)(p[1], 0.0f) : 0.0f;
+        const float b = std::isfinite(p[2]) ? (std::max)(p[2], 0.0f) : 0.0f;
+        luminance[i] = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+        luminanceSum += luminance[i];
+    }
+
+    // Top 0.02% captures sun disk plus immediate glow while rejecting bright
+    // cloud banks. Slightly lower threshold makes centroid stable across EXRs.
+    std::vector<float> ranked = luminance;
+    const size_t percentileIndex = static_cast<size_t>(pixelCount * 0.9998);
+    std::nth_element(ranked.begin(), ranked.begin() + percentileIndex,
+                     ranked.end());
+    const float meanLuminance = static_cast<float>(
+        luminanceSum / (std::max)(pixelCount, size_t{1}));
+    const float threshold = (std::max)(ranked[percentileIndex] * 0.85f,
+                                       meanLuminance * 4.0f);
+
+    XMVECTOR directionSum = XMVectorZero();
+    double colorR = 0.0, colorG = 0.0, colorB = 0.0, weightSum = 0.0;
+    for (int y = 0; y < height; ++y) {
+        const double theta = (static_cast<double>(y) + 0.5) / height * XM_PI;
+        const double sinTheta = sin(theta);
+        const double cosTheta = cos(theta);
+        for (int x = 0; x < width; ++x) {
+            const size_t index = static_cast<size_t>(y) * width + x;
+            const float value = luminance[index];
+            if (value < threshold) continue;
+            const double weight = sqrt((std::max)(
+                static_cast<double>(value - threshold),
+                static_cast<double>(threshold) * 0.002));
+            const double phi = ((static_cast<double>(x) + 0.5) / width - 0.5) *
+                               2.0 * XM_PI;
+            const XMVECTOR direction = XMVectorSet(
+                static_cast<float>(sinTheta * cos(phi)),
+                static_cast<float>(cosTheta),
+                static_cast<float>(sinTheta * sin(phi)), 0.0f);
+            directionSum = XMVectorMultiplyAdd(
+                direction, XMVectorReplicate(static_cast<float>(weight)),
+                directionSum);
+            const float* p = pixels + index * 4;
+            colorR += (std::max)(p[0], 0.0f) * weight;
+            colorG += (std::max)(p[1], 0.0f) * weight;
+            colorB += (std::max)(p[2], 0.0f) * weight;
+            weightSum += weight;
+        }
+    }
+    free(pixels);
+
+    if (weightSum <= 0.0 || XMVectorGetX(XMVector3LengthSq(directionSum)) < 1e-8f)
+        return result;
+    XMStoreFloat3(&result.direction, XMVector3Normalize(directionSum));
+    const float averageR = static_cast<float>(colorR / weightSum);
+    const float averageG = static_cast<float>(colorG / weightSum);
+    const float averageB = static_cast<float>(colorB / weightSum);
+    result.sourceLuminance = 0.2126f * averageR + 0.7152f * averageG +
+                             0.0722f * averageB;
+    if (result.sourceLuminance <= 1e-5f) return result;
+
+    const float scale = targetLuminance / result.sourceLuminance;
+    result.color = {
+        (std::max)(0.45f, (std::min)(1.55f, averageR * scale)),
+        (std::max)(0.45f, (std::min)(1.55f, averageG * scale)),
+        (std::max)(0.45f, (std::min)(1.55f, averageB * scale))
+    };
+    // Preserve target luminance after chromaticity safety clamps.
+    const float clampedLuminance = 0.2126f * result.color.x +
+        0.7152f * result.color.y + 0.0722f * result.color.z;
+    if (clampedLuminance > 1e-5f) {
+        const float renormalize = targetLuminance / clampedLuminance;
+        result.color.x *= renormalize;
+        result.color.y *= renormalize;
+        result.color.z *= renormalize;
+    }
+    result.valid = true;
+    return result;
+}
+
 // Convert GLTF mesh to SceneMesh
 std::shared_ptr<SceneMesh> ProcessMesh(const tinygltf::Model& model, const tinygltf::Mesh& gltfMesh, ID3D12Device* device, const std::vector<std::shared_ptr<SceneMaterial>>& materials) {
     auto sceneMesh = std::make_shared<SceneMesh>();

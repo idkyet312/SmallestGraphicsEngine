@@ -260,11 +260,14 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
                 mat->metallicRoughnessTexture = loadPart("_ORM");
                 mat->roughnessOnlyTexture = false;
                 mat->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
-                mat->ambientScale = 1.35f;
+                mat->ambientScale = 1.15f;
                 mat->occlusionStrength = 0.25f;
-                mat->viewFillStrength = 0.65f;
-                mat->metallicFactor = 1.0f;
-                mat->roughnessFactor = 1.0f;
+                // Outfit ORM maps are essentially non-metallic (~0 B) and
+                // rough (~0.85 G). Keep defensive factors conservative and
+                // use viewFillStrength as the skinned-character material tag.
+                mat->viewFillStrength = 0.30f;
+                mat->metallicFactor = 0.25f;
+                mat->roughnessFactor = 1.10f;
             }
             if (src->mMaterialIndex < materialCache.size())
                 materialCache[src->mMaterialIndex] = mat;

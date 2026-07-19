@@ -57,7 +57,7 @@ cbuffer MainLightBuffer : register(b2) {
 };
 
 RWTexture2D<float4> OutputIrradiance : register(u0);
-Texture2D shadowMap : register(t0);
+Texture2DArray shadowMap : register(t0);
 SamplerState shadowSampler : register(s0);
 
 // Helper to get probe position from index
@@ -125,7 +125,9 @@ float CalculateShadow(float3 worldPos) {
     
     for(int x = -1; x <= 1; ++x) {
         for(int y = -1; y <= 1; ++y) {
-            float pcfDepth = shadowMap.SampleLevel(shadowSampler, projCoords.xy + float2(x, y) * texelSize, 0).r;
+            float pcfDepth = shadowMap.SampleLevel(
+                shadowSampler,
+                float3(projCoords.xy + float2(x, y) * texelSize, 0.0), 0).r;
             shadow += (currentDepth - shadowBias > pcfDepth) ? 0.0 : 1.0;
         }
     }
@@ -179,7 +181,8 @@ float3 estimateSurfaceHit(float3 origin, float3 dir, float maxDist) {
         projCoords.y = -projCoords.y * 0.5 + 0.5;
         
         if (projCoords.x >= 0 && projCoords.x <= 1 && projCoords.y >= 0 && projCoords.y <= 1) {
-            float shadowDepth = shadowMap.SampleLevel(shadowSampler, projCoords.xy, 0).r;
+            float shadowDepth = shadowMap.SampleLevel(
+                shadowSampler, float3(projCoords.xy, 0.0), 0).r;
             // If the shadow depth is less than our current depth, we're behind a surface
             if (shadowDepth < projCoords.z - 0.01) {
                 // We found an occluder - return the estimated hit position
@@ -339,8 +342,9 @@ float3 CalculateProbeRadiance(float3 probePos, float3 direction, float2 pixelCoo
     }
     indirectLight /= 4.0;
     
-    // Add indirect contribution (scaled down since it's bounced)
-    totalRadiance += indirectLight * giIntensity;
+    // Store bounced radiance only. Direct light is evaluated at the surface;
+    // including it here would apply the sun twice.
+    totalRadiance = indirectLight;
     
     // Small ambient floor to prevent pure black
     float skyFactor = saturate(direction.y * 0.5 + 0.5);

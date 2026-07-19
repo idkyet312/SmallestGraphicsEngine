@@ -12,11 +12,11 @@ using Microsoft::WRL::ComPtr;
 extern DX12Context g_dx12;
 
 struct DDGIConfigDX12 {
-    int probeCountX = 8;
+    int probeCountX = 12;
     int probeCountY = 4;
-    int probeCountZ = 8;
-    float probeSpacing = 2.0f;
-    XMFLOAT3 probeGridOrigin = XMFLOAT3(-7.0f, 0.5f, -7.0f);
+    int probeCountZ = 12;
+    float probeSpacing = 5.0f;
+    XMFLOAT3 probeGridOrigin = XMFLOAT3(-27.5f, 0.5f, -27.5f);
     
     int irradianceTexWidth = 8;   // Per probe
     int irradianceTexHeight = 8;
@@ -270,7 +270,8 @@ public:
         
         HRESULT hr = device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &texDesc,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clearVal,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &clearVal,
             IID_PPV_ARGS(&irradianceTexture));
             
         if (FAILED(hr)) {
@@ -288,7 +289,8 @@ public:
         
         hr = device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &texDesc,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clearVal,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &clearVal,
             IID_PPV_ARGS(&visibilityTexture));
 
         if (FAILED(hr)) {
@@ -358,8 +360,9 @@ public:
         D3D12_SHADER_RESOURCE_VIEW_DESC nullSrvDesc = {};
         nullSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         nullSrvDesc.Format = DXGI_FORMAT_R32_FLOAT;
-        nullSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        nullSrvDesc.Texture2D.MipLevels = 1;
+        nullSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        nullSrvDesc.Texture2DArray.MipLevels = 1;
+        nullSrvDesc.Texture2DArray.ArraySize = SHADOW_CASCADE_COUNT;
         device->CreateShaderResourceView(nullptr, &nullSrvDesc, srvHandle);
 
         std::cout << "DDGI_DX12: Descriptors created successfully." << std::endl;
@@ -392,15 +395,17 @@ public:
             D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
             srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srvDesc.Format = DXGI_FORMAT_R32_FLOAT; // Assuming Depth texture
-            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            srvDesc.Texture2D.MipLevels = 1;
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            srvDesc.Texture2DArray.MipLevels = 1;
+            srvDesc.Texture2DArray.ArraySize = SHADOW_CASCADE_COUNT;
             g_dx12.device->CreateShaderResourceView(resource, &srvDesc, handle);
         }
     }
 
     void UpdateProbes(ID3D12GraphicsCommandList* cmdList, D3D12_GPU_VIRTUAL_ADDRESS lightBufferAddr, int numLights, D3D12_GPU_VIRTUAL_ADDRESS ddgiCBAddr, const DDGIMainLightData& mainLightData) {
         if (!computeInitialized) return;
-        frameCount++;
+        // Low-frequency irradiance does not need a full update every frame.
+        if ((frameCount++ & 3) != 0) return;
         
         // Update Main Light Buffer
         mainLightUploadBuffer.CopyData(g_dx12.frameIndex, mainLightData);
@@ -410,7 +415,8 @@ public:
         D3D12_RESOURCE_BARRIER barrier = {};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barrier.Transition.pResource = irradianceTexture.Get();
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         cmdList->ResourceBarrier(1, &barrier);
@@ -437,7 +443,8 @@ public:
 
         // Transition back
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         cmdList->ResourceBarrier(1, &barrier);
     }
     

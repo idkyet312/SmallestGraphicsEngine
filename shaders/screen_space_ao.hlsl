@@ -6,10 +6,12 @@ cbuffer AOConstants : register(b0)
     float4 lightDirection;      // xyz surface-to-sun direction, w contact strength
     float4 aoParams;            // radius, strength, bias, contact distance
     float4 screenParams;        // width, height, 1/width, 1/height
+    float4 filterParams;        // x: pre-forward contact-caster depth bound
 };
 
 Texture2D<float> sceneDepth : register(t0);
 Texture2DMS<float, 4> sceneDepthMS : register(t1);
+Texture2D<float> staticCasterDepth : register(t2);
 SamplerState pointClamp : register(s0);
 
 struct VSOutput
@@ -54,6 +56,20 @@ float SampleDepth(float2 uv, bool multisampled)
     return depth;
 }
 
+static const float kViewModelMaxDepth = 1.25;
+
+bool IsViewModelDepth(float deviceDepth)
+{
+    return deviceDepth < 0.99999 && LinearDepth(deviceDepth) < kViewModelMaxDepth;
+}
+
+float SampleContactCasterDepth(float2 uv, bool multisampled)
+{
+    if (filterParams.x > 0.5)
+        return staticCasterDepth.SampleLevel(pointClamp, saturate(uv), 0.0);
+    return SampleDepth(uv, multisampled);
+}
+
 float AmbientVisibility(float2 uv, float deviceDepth, bool multisampled)
 {
     if (deviceDepth >= 0.99999) return 1.0;
@@ -86,6 +102,7 @@ float AmbientVisibility(float2 uv, float deviceDepth, bool multisampled)
 float ContactVisibility(float2 uv, float deviceDepth, bool multisampled)
 {
     if (deviceDepth >= 0.99999 || lightDirection.w <= 0.0) return 1.0;
+    if (IsViewModelDepth(deviceDepth)) return 1.0;
     float3 world = ReconstructWorld(uv, deviceDepth);
     float3 rayDirection = normalize(lightDirection.xyz);
     const float maxDistance = max(aoParams.w * 0.004, 1.5);
@@ -98,7 +115,9 @@ float ContactVisibility(float2 uv, float deviceDepth, bool multisampled)
         float3 ndc = projected.xyz / projected.w;
         float2 rayUV = ndc.xy * float2(0.5, -0.5) + 0.5;
         if (any(rayUV <= 0.0) || any(rayUV >= 1.0)) break;
-        float sampledDepth = SampleDepth(rayUV, multisampled);
+        // Use depth captured before gun and animated enemies were drawn.
+        float sampledDepth = SampleContactCasterDepth(rayUV, multisampled);
+        if (IsViewModelDepth(sampledDepth)) continue;
         float thickness = 0.00035 + t * 0.000035;
         if (sampledDepth + thickness < ndc.z) {
             visibility = 1.0 - lightDirection.w *

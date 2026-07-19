@@ -65,11 +65,10 @@ public:
         float maxZ = 0.0f;
     };
 
-    // A vertex of the blade TEMPLATE. Only two things vary within a blade -- how
-    // far up it you are, and which edge you are on -- so that is all the vertex
-    // buffer holds. Eight of these describe every blade in the field.
+    // Authored blade template extracted from models/grass2/grass/allGrass_001.obj.
+    // Shape stores height, edge, forward curvature, and width profile.
     struct GrassVertex {
-        XMFLOAT2 corner;   // (t, side): t = 0 root -> 1 tip, side = -1 | +1
+        XMFLOAT4 shape; // (t, side, forward offset / height, width / root width)
     };
 
     // Everything that makes one blade different from another. The vertex shader
@@ -212,7 +211,9 @@ public:
     // draw distance feeds both the cell cull and the shader's fade.
     float& Density()      { return m_density; }
     float& DrawDistance() { return m_drawDistance; }
-    bool& CastShadows()   { return m_castShadows; }
+    // Authored curved cards overlap into large repeated silhouettes on nearby
+    // vehicles and buildings. Grass receives lighting but never enters CSMs.
+    bool CastShadows() const { return false; }
     float& ShadowDensity(){ return m_shadowDensity; }
     size_t PlantedCount() const { return m_blades.size(); }
 
@@ -230,7 +231,7 @@ public:
     ~GrassField() { Shutdown(); }
 
 private:
-    static constexpr int  kSegments = 3;       // vertical segments per blade
+    static constexpr int  kSegments = 4;       // authored vertical segments
     // A blade is a strip: (kSegments + 1) rows of 2 vertices, tapering to a point.
     static constexpr int  kVertsPerBlade = (kSegments + 1) * 2;
     static constexpr int  kIndicesPerBlade = kSegments * 6;
@@ -415,19 +416,27 @@ private:
     // grass_vs.hlsl. Grass draws untextured, so the pixel shader reads neither
     // texCoord nor tangent, and both are free to carry per-blade constants.
     bool BuildBuffers() {
-        // The blade TEMPLATE: 8 vertices and 18 indices, shared by every blade in
-        // the field. A vertex says only where it sits on a generic blade -- how far
-        // up (t) and which edge (side) -- and the shader builds the real thing from
-        // the instance data.
+        // First blade from allGrass_001.obj, normalized from centimetres. Reusing
+        // one authored blade as the instanced template avoids multiplying the OBJ's
+        // 836-blade clump by every procedural placement.
+        static constexpr float authoredRows[kSegments + 1][3] = {
+            { 0.0000000f, 0.0000000f, 1.0000000f },
+            { 0.3607508f, 0.1504676f, 0.9375900f },
+            { 0.6090932f, 0.3003972f, 0.6735600f },
+            { 0.8640370f, 0.5956549f, 0.3752100f },
+            { 1.0000000f, 0.8813891f, 0.2461600f },
+        };
         GrassVertex verts[kVertsPerBlade];
         std::vector<uint32_t> idx;
         idx.reserve(kIndicesPerBlade);
 
         int v = 0;
         for (int s = 0; s <= kSegments; ++s) {
-            const float t = (float)s / kSegments;
-            verts[v++].corner = XMFLOAT2(t, -1.0f);
-            verts[v++].corner = XMFLOAT2(t, +1.0f);
+            const float t = authoredRows[s][0];
+            const float forward = authoredRows[s][1];
+            const float widthScale = authoredRows[s][2];
+            verts[v++].shape = XMFLOAT4(t, -1.0f, forward, widthScale);
+            verts[v++].shape = XMFLOAT4(t, +1.0f, forward, widthScale);
         }
         for (int s = 0; s < kSegments; ++s) {
             const uint32_t r0 = s * 2;          // this row: left, right
@@ -496,7 +505,8 @@ private:
     float m_fadeBand = 6.0f;
     // Fraction of each cell's blades actually drawn (1 = all).
     float m_density = 1.0f;
-    bool  m_castShadows = true;
+    // Sparse grass casters still produce visible cascade/cell bands across the
+    // terrain. Keep blade lighting, but leave terrain shadowing to solid props.
     float m_shadowDensity = 0.28f;
     // Side of one draw-cell. Small enough that the cells hug the draw radius
     // without dragging in much grass the shader would only fade away, large enough

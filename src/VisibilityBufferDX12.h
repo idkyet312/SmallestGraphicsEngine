@@ -131,6 +131,9 @@ public:
     ComPtr<ID3D12DescriptorHeap> outputRtvHeap;
     ComPtr<ID3D12Resource> presentTexture;
     ComPtr<ID3D12Resource> motionTexture;
+    // Depth immediately after visibility resolve. Forward extensions can then
+    // be detected and rejected from history when they lack motion vectors.
+    ComPtr<ID3D12Resource> visibilityDepthTexture;
     ComPtr<ID3D12Resource> historyTextures[2];
     ComPtr<ID3D12Resource> exposureState;
     ComPtr<ID3D12Resource> colorLUT;
@@ -201,12 +204,12 @@ public:
     float bloomStrength = 0.12f;
     float vignetteStrength = 0.18f;
     float grainStrength = 0.012f;
-    float taaFeedback = 0.90f;
-    bool temporalEffectsEnabled = false;
+    float taaFeedback = 0.86f;
+    bool temporalEffectsEnabled = true;
     bool temporalHistoryValid = false;
     bool exposureReadable = false;
     float exposureAdaptation = 0.05f;
-    float motionBlurStrength = 0.35f;
+    float motionBlurStrength = 0.0f;
     float focusDistance = 8.0f;
     float aperture = 0.0f;
     float currentNearPlane = 0.1f;
@@ -218,6 +221,25 @@ public:
     UINT height = 0;
     bool initialized = false;
     std::string initError;
+
+    XMFLOAT2 GetTemporalJitterPixels() const {
+        if (!temporalEffectsEnabled || validationMode) return { 0.0f, 0.0f };
+        // Eight-sample Halton(2,3), centered on pixel. Sequence repeats only
+        // after covering complementary sub-pixel locations.
+        static constexpr XMFLOAT2 sequence[8] = {
+            { 0.0f,       -0.1666667f },
+            { -0.25f,      0.1666667f },
+            { 0.25f,      -0.3888889f },
+            { -0.375f,    -0.0555556f },
+            { 0.125f,      0.2777778f },
+            { -0.125f,    -0.2777778f },
+            { 0.375f,      0.0555556f },
+            { -0.4375f,    0.3888889f }
+        };
+        return sequence[postFrameIndex & 7u];
+    }
+
+    void InvalidateTemporalHistory() { temporalHistoryValid = false; }
 
     bool Init(UINT screenWidth, UINT screenHeight) {
         width = screenWidth;
@@ -756,6 +778,29 @@ public:
             cmdList->ResourceBarrier(2, barriers);
         }
 
+        // Preserve visibility depth before forward-only animated/alpha-tested
+        // geometry modifies it. Post uses the difference as a reactive mask.
+        {
+            D3D12_RESOURCE_BARRIER barriers[3] = {};
+            barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[0].Transition.pResource = g_dx12.depthStencilBuffer.Get();
+            barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barriers[1] = barriers[0];
+            barriers[1].Transition.pResource = visibilityDepthTexture.Get();
+            barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            cmdList->ResourceBarrier(2, barriers);
+            cmdList->CopyResource(visibilityDepthTexture.Get(),
+                                  g_dx12.depthStencilBuffer.Get());
+            barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            cmdList->ResourceBarrier(2, barriers);
+        }
+
     }
 
     void UpdateExposure(ID3D12GraphicsCommandList* cmdList) {
@@ -818,6 +863,11 @@ public:
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         cmdList->ResourceBarrier(1, &barrier);
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetOutputRTV();
+        // Never preserve previous-frame HDR contents. If sky initialization
+        // fails or its draw is skipped, background resolve intentionally leaves
+        // untouched pixels alone, so an uncleared target becomes feedback.
+        const float clearColor[4] = {};
+        cmdList->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
         cmdList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         cmdList->RSSetViewports(1, &g_dx12.viewport);
         cmdList->RSSetScissorRects(1, &g_dx12.scissorRect);
@@ -870,6 +920,12 @@ public:
         return outputRtvHeap->GetCPUDescriptorHandleForHeapStart();
     }
 
+    ID3D12Resource* GetOutputResource() const { return outputTexture.Get(); }
+    ID3D12Resource* GetMotionResource() const { return motionTexture.Get(); }
+    ID3D12Resource* GetVisibilityDepthResource() const {
+        return visibilityDepthTexture.Get();
+    }
+
     void PostProcess(ID3D12GraphicsCommandList* cmdList, bool allowHistory) {
         const UINT historyIndex = postFrameIndex & 1u;
         D3D12_RESOURCE_BARRIER barriers[2] = {};
@@ -915,7 +971,7 @@ public:
             postConstantBuffer.GetGPUAddress(g_dx12.frameIndex));
         D3D12_GPU_DESCRIPTOR_HANDLE table =
             postDescHeap->GetGPUDescriptorHandleForHeapStart();
-        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize * historyIndex * 8;
+        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize * historyIndex * 9;
         cmdList->SetComputeRootDescriptorTable(1, table);
         cmdList->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 
@@ -973,6 +1029,7 @@ public:
         outputTexture.Reset();
         presentTexture.Reset();
         motionTexture.Reset();
+        visibilityDepthTexture.Reset();
         historyTextures[0].Reset();
         historyTextures[1].Reset();
         exposureState.Reset();
@@ -1084,6 +1141,14 @@ private:
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
             IID_PPV_ARGS(&motionTexture));
+        if (FAILED(hr)) return false;
+
+        D3D12_RESOURCE_DESC depthSnapshotDesc =
+            g_dx12.depthStencilBuffer->GetDesc();
+        hr = g_dx12.device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &depthSnapshotDesc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+            IID_PPV_ARGS(&visibilityDepthTexture));
         if (FAILED(hr)) return false;
 
         desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -1275,7 +1340,7 @@ private:
 
     bool CreateComputeDescriptorHeap() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-        heapDesc.NumDescriptors = 78;
+        heapDesc.NumDescriptors = 82;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         HRESULT hr = g_dx12.device->CreateDescriptorHeap(
@@ -1513,9 +1578,9 @@ private:
         //   [9] b2 - point lights CBV
 
         D3D12_DESCRIPTOR_RANGE ranges[3] = {};
-        // SRVs t0..t72: frame/geometry, material table, textures, environment.
+        // SRVs t0..t75: frame/geometry, materials, IBL, and DDGI atlases.
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 73;
+        ranges[0].NumDescriptors = 76;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].RegisterSpace = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
@@ -1525,14 +1590,14 @@ private:
         ranges[1].NumDescriptors = 2;
         ranges[1].BaseShaderRegister = 0;
         ranges[1].RegisterSpace = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 73;
+        ranges[1].OffsetInDescriptorsFromTableStart = 76;
 
-        // CBVs b1..b3 (lights, point lights, sky SH)
+        // CBVs b1..b4 (lights, point lights, sky SH, DDGI)
         ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
-        ranges[2].NumDescriptors = 3;
+        ranges[2].NumDescriptors = 4;
         ranges[2].BaseShaderRegister = 1;
         ranges[2].RegisterSpace = 0;
-        ranges[2].OffsetInDescriptorsFromTableStart = 75;
+        ranges[2].OffsetInDescriptorsFromTableStart = 78;
 
         D3D12_ROOT_PARAMETER resolveParams[2] = {};
 
@@ -1769,7 +1834,40 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [73] u0 - linear HDR output UAV
+        // [73] t73 - split-sum GGX BRDF integration LUT.
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC brdf = {};
+            brdf.Format = DXGI_FORMAT_R32G32_FLOAT;
+            brdf.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            brdf.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            brdf.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(nullptr, &brdf, cpuHandle);
+            cpuHandle.ptr += descSize;
+        }
+
+        // [74] t74 - DDGI irradiance atlas.
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(nullptr, &srv, cpuHandle);
+            cpuHandle.ptr += descSize;
+        }
+
+        // [75] t75 - DDGI visibility atlas.
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(nullptr, &srv, cpuHandle);
+            cpuHandle.ptr += descSize;
+        }
+
+        // [76] u0 - linear HDR output UAV
         {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
             uavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -1778,7 +1876,7 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [74] u1 - screen-space motion vectors
+        // [77] u1 - screen-space motion vectors
         {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
             uavDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
@@ -1788,9 +1886,10 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [75] b1 - light buffer CBV
-        // [76] b2 - point lights CBV
-        // [77] b3 - sky SH CBV
+        // [78] b1 - light buffer CBV
+        // [79] b2 - point lights CBV
+        // [80] b3 - sky SH CBV
+        // [81] b4 - DDGI CBV
         // These will be created in UpdateLightDescriptors
     }
 
@@ -1905,13 +2004,13 @@ private:
 
         D3D12_DESCRIPTOR_RANGE ranges[2] = {};
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 6;
+        ranges[0].NumDescriptors = 7;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         ranges[1].NumDescriptors = 2;
         ranges[1].BaseShaderRegister = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 6;
+        ranges[1].OffsetInDescriptorsFromTableStart = 7;
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -1951,7 +2050,7 @@ private:
         if (FAILED(hr)) return false;
 
         D3D12_DESCRIPTOR_HEAP_DESC heap = {};
-        heap.NumDescriptors = 16;
+        heap.NumDescriptors = 18;
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = g_dx12.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&postDescHeap));
@@ -1967,7 +2066,7 @@ private:
         for (UINT parity = 0; parity < 2; ++parity) {
             D3D12_CPU_DESCRIPTOR_HANDLE handle =
                 postDescHeap->GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (SIZE_T)descriptorSize * parity * 8;
+            handle.ptr += (SIZE_T)descriptorSize * parity * 9;
 
             D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
             srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -2007,6 +2106,9 @@ private:
             g_dx12.device->CreateShaderResourceView(
                 g_dx12.depthStencilBuffer.Get(), &depthSrv, handle);
             handle.ptr += descriptorSize;
+            g_dx12.device->CreateShaderResourceView(
+                visibilityDepthTexture.Get(), &depthSrv, handle);
+            handle.ptr += descriptorSize;
 
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
             uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2024,10 +2126,11 @@ public:
     // Call this each frame before resolve to update the light CBV descriptors
     void UpdateLightDescriptors(D3D12_GPU_VIRTUAL_ADDRESS lightBufferAddr,
                                 D3D12_GPU_VIRTUAL_ADDRESS pointLightsAddr,
-                                D3D12_GPU_VIRTUAL_ADDRESS shBufferAddr) {
+                                D3D12_GPU_VIRTUAL_ADDRESS shBufferAddr,
+                                D3D12_GPU_VIRTUAL_ADDRESS ddgiBufferAddr) {
         UINT descSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
-        cpuHandle.ptr += 75 * descSize;
+        cpuHandle.ptr += 78 * descSize;
 
         // [7] b1 - light buffer CBV
         {
@@ -2053,10 +2156,39 @@ public:
             cbvDesc.BufferLocation = shBufferAddr;
             cbvDesc.SizeInBytes = sizeof(SHBufferDX12);
             g_dx12.device->CreateConstantBufferView(&cbvDesc, cpuHandle);
+            cpuHandle.ptr += descSize;
+        }
+
+        // [81] b4 - DDGI grid parameters
+        {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+            cbvDesc.BufferLocation = ddgiBufferAddr;
+            cbvDesc.SizeInBytes = sizeof(DDGIBufferDX12);
+            g_dx12.device->CreateConstantBufferView(&cbvDesc, cpuHandle);
         }
     }
 
-    void UpdateEnvironmentMap(ID3D12Resource* environmentResource) {
+    void UpdateDDGIResources(ID3D12Resource* irradianceResource,
+                             ID3D12Resource* visibilityResource) {
+        if (!computeDescHeap) return;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            computeDescHeap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(g_dx12.cbvSrvUavDescriptorSize) * 74u;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = 1;
+        srv.Format = irradianceResource
+            ? irradianceResource->GetDesc().Format : DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g_dx12.device->CreateShaderResourceView(irradianceResource, &srv, handle);
+        handle.ptr += g_dx12.cbvSrvUavDescriptorSize;
+        srv.Format = visibilityResource
+            ? visibilityResource->GetDesc().Format : DXGI_FORMAT_R16G16_FLOAT;
+        g_dx12.device->CreateShaderResourceView(visibilityResource, &srv, handle);
+    }
+
+    void UpdateEnvironmentMap(ID3D12Resource* environmentResource,
+                              ID3D12Resource* brdfResource) {
         if (!computeDescHeap) return;
         D3D12_CPU_DESCRIPTOR_HANDLE handle =
             computeDescHeap->GetCPUDescriptorHandleForHeapStart();
@@ -2069,6 +2201,13 @@ public:
         srv.Texture2D.MipLevels = environmentResource
             ? environmentResource->GetDesc().MipLevels : 1;
         g_dx12.device->CreateShaderResourceView(environmentResource, &srv, handle);
+        handle.ptr += g_dx12.cbvSrvUavDescriptorSize;
+        D3D12_SHADER_RESOURCE_VIEW_DESC brdf = {};
+        brdf.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        brdf.Format = DXGI_FORMAT_R32G32_FLOAT;
+        brdf.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        brdf.Texture2D.MipLevels = 1;
+        g_dx12.device->CreateShaderResourceView(brdfResource, &brdf, handle);
     }
 
     // Update the shadow map SRV in the compute descriptor heap

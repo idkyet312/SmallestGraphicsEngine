@@ -385,7 +385,15 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ImGui::SliderFloat("VB Bloom", &vb.bloomStrength, 0.0f, 1.0f, "%.2f");
                 ImGui::SliderFloat("VB Vignette", &vb.vignetteStrength, 0.0f, 1.0f, "%.2f");
                 ImGui::SliderFloat("VB Film Grain", &vb.grainStrength, 0.0f, 0.08f, "%.3f");
-                ImGui::TextDisabled("VB TAA / motion vectors: disconnected");
+            }
+            if (ImGui::Checkbox("Temporal AA (TAA)",
+                                &vb.temporalEffectsEnabled))
+                vb.InvalidateTemporalHistory();
+            if (vb.temporalEffectsEnabled) {
+                ImGui::SliderFloat("TAA History Weight", &vb.taaFeedback,
+                                   0.70f, 0.95f, "%.2f");
+                if (!scene.useVisibilityBuffer || vb.validationMode)
+                    ImGui::TextDisabled("  TAA inactive outside normal VB mode");
             }
         } else {
             ImGui::TextDisabled("VB Pipeline: Not Available (%s)",
@@ -393,6 +401,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         }
 
         ImGui::Checkbox("4x MSAA (Forward only)", &scene.enableMSAA);
+        ImGui::Checkbox("4x MSAA Grass (VB)", &scene.enableGrassMSAA);
+        if (scene.enableGrassMSAA && !scene.useVisibilityBuffer)
+            ImGui::TextDisabled("Grass MSAA active only in Visibility Buffer");
         ImGui::Checkbox("FXAA", &scene.enableFXAA);
         ImGui::Checkbox("GTAO + Contact Shadows", &scene.enableAmbientOcclusion);
         if (scene.enableAmbientOcclusion) {
@@ -466,19 +477,6 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // distance shrinks the drawn ring. ~0.6 / 22 is a good perf preset.
         ImGui::SliderFloat("Density", &g_grass.Density(), 0.05f, 1.0f);
         ImGui::DragFloat("Draw Distance", &g_grass.DrawDistance(), 0.5f, 8.0f, 40.0f);
-        ImGui::SeparatorText("Grass Shadows");
-        ImGui::Checkbox("Cast Grass Shadows", &g_grass.CastShadows());
-        if (g_grass.CastShadows()) {
-            float shadowPercent = g_grass.ShadowDensity() * 100.0f;
-            if (ImGui::SliderFloat("Shadow Amount", &shadowPercent,
-                                   0.0f, 100.0f, "%.0f%%",
-                                   ImGuiSliderFlags_AlwaysClamp))
-                g_grass.ShadowDensity() = shadowPercent * 0.01f;
-            const size_t shadowBudget = static_cast<size_t>(
-                g_grass.PlantedCount() * g_grass.Density() *
-                g_grass.ShadowDensity());
-            ImGui::Text("Shadow blade budget: ~%zu", shadowBudget);
-        }
     }
 
     if (ImGui::CollapsingHeader("Destruction", ImGuiTreeNodeFlags_DefaultOpen)) {

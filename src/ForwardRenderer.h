@@ -6,6 +6,7 @@
 
 #include "DX12Core.h"
 #include "ShaderDX12.h"
+#include "DDGI_DX12.h"
 #include "Scene.h"
 #include "SceneGraph.h"
 #include "MeshShaderDX12.h"
@@ -36,6 +37,11 @@ extern std::shared_ptr<SceneNode> g_humveeModel;
 extern std::shared_ptr<SceneNode> g_humveeShadowModel;
 extern std::shared_ptr<SceneNode> g_helicopterModel;
 extern ID3D12Resource* g_skyEnvironmentResource;
+extern ID3D12Resource* g_specularEnvironmentResource;
+extern ID3D12Resource* g_brdfIntegrationResource;
+extern ID3D12Resource* g_ddgiIrradianceResource;
+extern ID3D12Resource* g_ddgiVisibilityResource;
+extern DDGIRendererDX12 g_ddgiRenderer;
 extern DirectX::XMFLOAT3 g_helicopterPosition;
 extern bool g_stressTestMode;
 extern bool g_emptyLevelMode;
@@ -727,19 +733,75 @@ inline bool SphereVisible(const XMFLOAT4 planes[6], const XMFLOAT3& c, float r) 
     return true;
 }
 
+// Draw only the wind-driven grass. Used by the visibility-buffer path to put
+// foliage in an independent multisampled layer without multisampling the full
+// visibility buffer.
+inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
+                               const XMMATRIX& view, const XMMATRIX& proj,
+                               const XMMATRIX& lightSpace,
+                               ID3D12Resource* shadowMap,
+                               ID3D12PipelineState* pipelineOverride = nullptr) {
+    ID3D12PipelineState* grassPipeline = pipelineOverride
+        ? pipelineOverride : shader.GetGrassPipelineState();
+    if (g_emptyLevelMode || !g_grass.IsInitialized() || !grassPipeline) return;
+
+    // Compute post passes replace descriptor heaps and root signatures. Restore
+    // every binding the grass shader consumes before this late raster pass.
+    shader.InvalidateGraphicsRootBinding();
+    shader.Use(false);
+    shader.BindGlobalResources(shadowMap, g_ddgiIrradianceResource,
+        g_ddgiVisibilityResource,
+        g_specularEnvironmentResource, g_brdfIntegrationResource);
+
+    g_grass.SetViewer(scene.camera.Position);
+    static std::vector<GrassField::DrawRange> grassRanges;
+    g_grass.GetVisible(grassRanges);
+
+    const D3D12_VERTEX_BUFFER_VIEW& gvbv = g_grass.GetVBV();
+    const D3D12_GPU_VIRTUAL_ADDRESS ginst =
+        g_grass.GetInstanceBufferAddress();
+    if (grassRanges.empty() || !gvbv.BufferLocation || !ginst) return;
+
+    const D3D12_INDEX_BUFFER_VIEW& gibv = g_grass.GetIBV();
+    shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
+    shader.SetObjectMaterial(XMFLOAT3(0.117f, 0.152f, 0.025f), false, false,
+                             0.0f, 0.85f, nullptr, nullptr, nullptr);
+
+    GrassField::Params gp = g_grass.GetParams(
+        scene.cameraFOV, static_cast<float>(g_dx12.screenHeight));
+    static_assert(sizeof(GrassField::Params) == 13 * sizeof(UINT),
+                  "GrassParams must match the 13 root constants at b6");
+    g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 13, &gp, 0);
+    g_dx12.commandList->SetGraphicsRootShaderResourceView(9, ginst);
+    g_dx12.commandList->SetPipelineState(grassPipeline);
+    g_dx12.commandList->IASetVertexBuffers(0, 1, &gvbv);
+    g_dx12.commandList->IASetIndexBuffer(&gibv);
+    g_dx12.commandList->IASetPrimitiveTopology(
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    for (const GrassField::DrawRange& r : grassRanges) {
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(
+            8, 1, &r.firstInstance, 7);
+        g_dx12.commandList->DrawIndexedInstanced(
+            GrassField::IndexCount(), r.instanceCount, 0, 0, 0);
+    }
+    shader.NextDrawCall();
+}
+
 // Render the whole scene using the forward clustered path
 inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffers& geo,
                            const std::shared_ptr<SceneNode>& crateModel = nullptr,
                            const std::shared_ptr<SceneMaterial>& floorMaterial = nullptr,
                            XMMATRIX lightSpace = XMMatrixIdentity(),
                            ID3D12Resource* shadowMap = nullptr,
-                           bool visibilityExtensionsOnly = false) {
+                           bool visibilityExtensionsOnly = false,
+                           bool includeGrass = true) {
     XMMATRIX view = scene.GetViewMatrix();
     XMMATRIX proj = scene.GetProjectionMatrix();
 
     shader.Use(scene.wireframeMode);
-    shader.BindGlobalResources(shadowMap, nullptr, nullptr,
-        g_skyEnvironmentResource);
+    shader.BindGlobalResources(shadowMap, g_ddgiIrradianceResource,
+        g_ddgiVisibilityResource,
+        g_specularEnvironmentResource, g_brdfIntegrationResource);
 
     shader.SetLight(scene.lightPos, scene.lightType, scene.lightColor,
                     scene.lightConstant, scene.lightLinear, scene.lightQuadratic,
@@ -766,6 +828,26 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     shader.SetPointLights((int)lightData.size(), lightData);
     shader.SetDDGI(scene.useDDGI, scene.giIntensity, scene.normalBias, scene.probeSpacing);
     shader.SetSH();
+
+    if (!visibilityExtensionsOnly && scene.useDDGI &&
+        g_ddgiRenderer.computeInitialized) {
+        DDGIMainLightData mainLight = {};
+        mainLight.lightPos = scene.lightPos;
+        mainLight.lightType = scene.lightType;
+        mainLight.lightColor = scene.lightColor;
+        mainLight.intensity = 1.0f;
+        mainLight.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
+        mainLight.shadowBias = scene.shadowBias;
+        mainLight.enableShadows = scene.enableShadows && shadowMap ? 1 : 0;
+        g_ddgiRenderer.UpdateProbes(g_dx12.commandList.Get(),
+            shader.pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex),
+            (int)lightData.size(),
+            shader.ddgiBuffer.GetGPUAddress(g_dx12.frameIndex), mainLight);
+        // Probe update binds its private heap. Restore forward global table.
+        shader.BindGlobalResources(shadowMap, g_ddgiIrradianceResource,
+            g_ddgiVisibilityResource,
+            g_specularEnvironmentResource, g_brdfIntegrationResource);
+    }
 
     g_meshShader.wireframe = scene.meshletWireframe;
     g_terrain.wireframe = scene.meshletWireframe;
@@ -937,7 +1019,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     //
     // Blades are built in world space, hence the identity model matrix. Opaque, so
     // this lands before the transparent water below or it would sort wrong.
-    if (!g_emptyLevelMode && g_grass.IsInitialized() && shader.GetGrassPipelineState()) {
+    if (includeGrass && !g_emptyLevelMode && g_grass.IsInitialized() && shader.GetGrassPipelineState()) {
         // The shader fades blades with distance, and the cull below needs it too.
         g_grass.SetViewer(scene.camera.Position);
 

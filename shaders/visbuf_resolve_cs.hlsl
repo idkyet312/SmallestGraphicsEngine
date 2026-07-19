@@ -101,6 +101,25 @@ cbuffer SkySHBuffer : register(b3) {
     float skyIntensity;
     float3 shPadding;
 };
+
+cbuffer DDGIBuffer : register(b4) {
+    float3 probeGridOrigin;
+    float probeSpacing;
+    int probeCountX;
+    int probeCountY;
+    int probeCountZ;
+    float maxRayDistance;
+    float normalBias;
+    float viewBias;
+    float irradianceGamma;
+    float giIntensity;
+    int irradianceTexWidth;
+    int irradianceTexHeight;
+    int visibilityTexWidth;
+    int visibilityTexHeight;
+    int ddgiEnabled;
+    float3 ddgiPadding;
+};
 StructuredBuffer<ClusterData>   clusters  : register(t6);
 
 struct MaterialData {
@@ -113,6 +132,9 @@ struct MaterialData {
 StructuredBuffer<MaterialData> materials : register(t7);
 Texture2D<float4> materialTextures[64] : register(t8);
 Texture2D<float4> environmentMap : register(t72);
+Texture2D<float2> brdfIntegrationLUT : register(t73);
+Texture2D<float4> ddgiIrradianceMap : register(t74);
+Texture2D<float2> ddgiVisibilityMap : register(t75);
 
 RWTexture2D<float4> outputColor : register(u0);
 RWTexture2D<float2> outputMotion : register(u1);
@@ -121,6 +143,40 @@ SamplerState              texSampler    : register(s0);
 SamplerComparisonState    shadowSampler : register(s1);
 
 // ---- Helpers ----
+
+// Smooth 3D value noise from integer avalanche hashing (same mixer as
+// terrain_ms.hlsl's hash21). A plane-wave sin() here striped every large flat
+// dielectric surface -- most visibly the terrain -- with diagonal roughness
+// bands ~6 m apart. Identical to clustered_dx12_ps.hlsl.
+uint MatVarHashUint(uint value) {
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+float MatVarHash(int3 cell) {
+    uint value = MatVarHashUint(asuint(cell.x) ^
+        MatVarHashUint(asuint(cell.y) + MatVarHashUint(asuint(cell.z))) +
+        0x9e3779b9u);
+    return float(value & 0x00ffffffu) * (1.0 / 16777216.0);
+}
+
+float MatVarNoise(float3 position) {
+    int3 cell = (int3)floor(position);
+    float3 blend = frac(position);
+    blend = blend * blend * (3.0 - 2.0 * blend);
+    float n00 = lerp(MatVarHash(cell), MatVarHash(cell + int3(1, 0, 0)), blend.x);
+    float n10 = lerp(MatVarHash(cell + int3(0, 1, 0)),
+                     MatVarHash(cell + int3(1, 1, 0)), blend.x);
+    float n01 = lerp(MatVarHash(cell + int3(0, 0, 1)),
+                     MatVarHash(cell + int3(1, 0, 1)), blend.x);
+    float n11 = lerp(MatVarHash(cell + int3(0, 1, 1)),
+                     MatVarHash(cell + int3(1, 1, 1)), blend.x);
+    return lerp(lerp(n00, n10, blend.y), lerp(n01, n11, blend.y), blend.z);
+}
 
 float3 ReconstructWorldPos(uint2 pixel, float depth) {
     float2 uv = (float2(pixel) + 0.5) / float2(screenWidth, screenHeight);
@@ -153,6 +209,72 @@ float3 SampleReflectionProbe(float3 reflectionDir, float roughness) {
     environmentMap.GetDimensions(0, width, height, mipCount);
     float lod = roughness * roughness * max((float)mipCount - 1.0, 0.0);
     return environmentMap.SampleLevel(texSampler, uv, lod).rgb * skyIntensity;
+}
+
+float2 DDGIOctEncode(float3 direction) {
+    direction /= max(abs(direction.x) + abs(direction.y) +
+                     abs(direction.z), 1e-5);
+    if (direction.y < 0.0) {
+        float2 signDirection = float2(direction.x >= 0.0 ? 1.0 : -1.0,
+                                      direction.z >= 0.0 ? 1.0 : -1.0);
+        direction.xz = (1.0 - abs(direction.zx)) * signDirection;
+    }
+    return direction.xz * 0.5 + 0.5;
+}
+
+float3 SampleDDGIProbe(int probeIndex, float3 normal) {
+    int totalProbes = probeCountX * probeCountY * probeCountZ;
+    int atlasProbeWidth = max((int)sqrt((float)totalProbes), 1);
+    int probeX = probeIndex % atlasProbeWidth;
+    int probeY = probeIndex / atlasProbeWidth;
+    int tileWidth = irradianceTexWidth + 2;
+    int tileHeight = irradianceTexHeight + 2;
+    int atlasHeight = (totalProbes + atlasProbeWidth - 1) / atlasProbeWidth;
+    float2 octUV = DDGIOctEncode(normalize(normal));
+    float2 atlasUV = float2(
+        (probeX * tileWidth + 1.0 + octUV.x * irradianceTexWidth) /
+            (atlasProbeWidth * tileWidth),
+        (probeY * tileHeight + 1.0 + octUV.y * irradianceTexHeight) /
+            (atlasHeight * tileHeight));
+    return ddgiIrradianceMap.SampleLevel(texSampler, atlasUV, 0.0).rgb;
+}
+
+float3 SampleDDGIIrradiance(float3 worldPos, float3 normal) {
+    if (ddgiEnabled == 0) return 0.0;
+    float3 gridPosition =
+        (worldPos + normal * normalBias - probeGridOrigin) / probeSpacing;
+    if (any(gridPosition < 0.0) ||
+        gridPosition.x > probeCountX - 1 ||
+        gridPosition.y > probeCountY - 1 ||
+        gridPosition.z > probeCountZ - 1)
+        return 0.0;
+    int3 base = clamp((int3)floor(gridPosition), 0,
+                      int3(probeCountX - 2, probeCountY - 2,
+                           probeCountZ - 2));
+    float3 fraction = saturate(gridPosition - base);
+    float3 irradiance = 0.0;
+    float totalWeight = 0.0;
+    [unroll]
+    for (int z = 0; z < 2; ++z) {
+        [unroll]
+        for (int y = 0; y < 2; ++y) {
+            [unroll]
+            for (int x = 0; x < 2; ++x) {
+                int3 coordinate = base + int3(x, y, z);
+                float3 cornerWeight = lerp(1.0 - fraction, fraction,
+                                           float3(x, y, z));
+                float weight = cornerWeight.x * cornerWeight.y * cornerWeight.z;
+                int index = coordinate.x + coordinate.y * probeCountX +
+                            coordinate.z * probeCountX * probeCountY;
+                irradiance += SampleDDGIProbe(index, normal) * weight;
+                totalWeight += weight;
+            }
+        }
+    }
+    irradiance /= max(totalWeight, 1e-4);
+    irradiance = pow(max(irradiance, 0.0),
+                     1.0 / max(irradianceGamma, 0.1));
+    return irradiance * giIntensity;
 }
 
 float3 RenderProceduralSky(uint2 pixel) {
@@ -369,7 +491,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     if (visValue.x == 0u) {
         // HDR sky was rasterized into outputColor before this compute pass.
         // Preserve it instead of replacing it with a mismatched procedural sky.
-        if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
+        if (enableMotionVectors != 0u) {
+            // Reproject a far-plane point so camera rotation moves sky history
+            // instead of pinning the previous sky to screen coordinates.
+            float3 farWorld = ReconstructWorldPos(pixel, 1.0);
+            float4 previousClip = mul(float4(farWorld, 1.0), previousViewProj);
+            float2 currentUV = (float2(pixel) + 0.5) /
+                               float2(screenWidth, screenHeight);
+            float2 previousUV = currentUV;
+            if (previousClip.w > 0.001)
+                previousUV = (previousClip.xy / previousClip.w) *
+                             float2(0.5, -0.5) + 0.5;
+            outputMotion[pixel] = currentUV - previousUV;
+        }
         return;
     }
     
@@ -473,22 +607,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     if ((dc.flags & 1u) != 0u && dot(normal, viewDir) < 0.0)
         normal = -normal;
 
-    if (material.shadingParams.y < -0.5) {
-        float macro = sin(fragPos.x * 0.071 + sin(fragPos.z * 0.043)) *
-                      sin(fragPos.z * 0.063) * 0.5 + 0.5;
-        float slope = 1.0 - saturate(normal.y);
-        float track = 1.0 - smoothstep(0.65, 2.4,
-            abs(fragPos.x - sin(fragPos.z * 0.055) * 5.0));
-        albedo *= lerp(0.78, 1.16, macro);
-        albedo = lerp(albedo, float3(0.34, 0.22, 0.095),
-            saturate(slope * 1.7 + track * 0.42));
-        float2 detail = float2(sin(fragPos.x * 3.7 + fragPos.z * 1.9),
-                               cos(fragPos.z * 3.2 - fragPos.x * 1.4));
-        normal = normalize(normal + float3(detail.x, 0.0, detail.y) * 0.075);
-        rough = saturate(rough * lerp(0.88, 1.08, macro));
-    } else if (metal < 0.25) {
-        float variation = sin(fragPos.x * 0.83 + fragPos.y * 1.17 +
-                              fragPos.z * 0.61) * 0.5 + 0.5;
+    if (metal < 0.25) {
+        float variation = MatVarNoise(fragPos * 0.35);
         rough = clamp(rough * lerp(0.88, 1.10, variation), 0.04, 1.0);
     }
     
@@ -541,14 +661,14 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 diffuseAlbedo = albedo * (1.0 - metal);
     float ambientScale = material.shadingParams.x;
     float3 diffuseIBL = SampleSkyIrradiance(normal) * diffuseAlbedo * ambientScale;
+    float3 diffuseGI = SampleDDGIIrradiance(fragPos, normal) *
+        diffuseAlbedo * ambientScale;
     float3 reflectionIBL = SampleReflectionProbe(reflect(-V, normal), rough);
-    float3 envFresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
-    float reflectionStrength = saturate((1.0 - rough * 0.75) *
-        (0.10 + metal * 1.15));
-    float3 metalTint = lerp(1.0.xxx, albedo, metal * 0.45);
-    float3 specularIBL = reflectionIBL * envFresnel *
-        reflectionStrength * metalTint;
-    result += (diffuseIBL + specularIBL) * ambientOcclusion;
+    float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
+        texSampler, float2(NdotV, rough), 0.0);
+    float3 specularIBL = reflectionIBL *
+        (F0 * environmentBRDF.x + environmentBRDF.y);
+    result += (diffuseIBL + diffuseGI + specularIBL) * ambientOcclusion;
     result += ambientStrength * diffuseAlbedo * ambientScale * ambientOcclusion;
     result += material.emissiveOcclusion.rgb;
     
@@ -557,7 +677,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 specular = numerator / denominator;
     
     float shadowVisibility = CalculateShadow(fragPos, normal, L);
-    result *= lerp(0.28, 1.0, shadowVisibility);
+    // Shadow map blocks direct sun only. IBL/DDGI are already low-frequency
+    // indirect terms and must stay present on occluded building/actor sides.
     float frontFill = 0.35 + 0.65 * saturate(dot(normal, viewDir));
     result += diffuseAlbedo * material.shadingParams.y * frontFill;
     float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor *

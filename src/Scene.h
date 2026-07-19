@@ -97,17 +97,22 @@ struct Scene {
     // Far enough to see the sea run out to the horizon; the ocean plane alone is
     // 600 m across, and a 100 m far plane sliced it off in plain view.
     float  cameraFar   = 800.0f;
+    // Sub-pixel projection offset used by visibility-buffer TAA. Zero for
+    // forward, raytracing, menus, and validation captures.
+    XMFLOAT2 temporalJitterPixels = { 0.0f, 0.0f };
 
     // Main directional / point light
-    XMFLOAT3 lightPos    = { -5.0f, 10.0f, -5.0f };
-    XMFLOAT3 lightColor  = { 1.22f, 1.10f, 0.94f };
+    // Angled, HDR-strength warm sun. Lower elevation gives terrain and props
+    // longer modelling shadows while cool sky irradiance keeps them readable.
+    XMFLOAT3 lightPos    = { -8.0f, 7.0f, -3.0f };
+    XMFLOAT3 lightColor  = { 2.40f, 2.05f, 1.55f };
     int      lightType   = 0;
     float    lightConstant  = 1.0f;
     float    lightLinear    = 0.09f;
     float    lightQuadratic = 0.032f;
 
     // Material defaults
-    float ambientStrength   = 0.14f;
+    float ambientStrength   = 0.07f;
     float specularStrength  = 0.5f;
     int   specularShininess = 32;
     float shadowBias        = 0.005f;
@@ -176,19 +181,20 @@ struct Scene {
     bool  useDestruction = true;
     bool  showHelicopter = true;   // draw + simulate the hovering attack heli
     bool  enableMSAA = true;
+    bool  enableGrassMSAA = true;
     bool  enableFXAA = false;
     bool  enableVolumetricFog = true;
-    float volumetricFogDensity = 0.0050f;
-    float volumetricFogAnisotropy = 0.0f;
+    float volumetricFogDensity = 0.0020f;
+    float volumetricFogAnisotropy = 0.35f;
     float volumetricFogHeightFalloff = 0.055f;
     float volumetricFogBaseHeight = 1.0f;
     float volumetricFogDistance = 120.0f;
-    XMFLOAT3 volumetricFogTint = { 191.0f / 255.0f, 246.0f / 255.0f, 1.0f };
+    XMFLOAT3 volumetricFogTint = { 0.72f, 0.84f, 1.0f };
     bool  enableAmbientOcclusion = true;
-    float ambientOcclusionRadius = 1.35f;
-    float ambientOcclusionStrength = 1.15f;
+    float ambientOcclusionRadius = 0.60f;
+    float ambientOcclusionStrength = 1.96f;
     float ambientOcclusionBias = 0.035f;
-    float contactShadowStrength = 0.65f;
+    float contactShadowStrength = 0.19f;
     int   destructionGridX = 4;
     int   destructionGridY = 3;
     int   destructionGridZ = 4;
@@ -215,12 +221,11 @@ struct Scene {
     float demoLightIntensity  = 1.5f;
     bool  animateDemoLights   = true;
 
-    // DDGI (DX12 backend not wired up yet - irradiance/visibility textures are never
-    // created or bound, so sampling them would read garbage descriptor memory)
-    bool  useDDGI      = false;
-    float giIntensity  = 0.5f;
-    float normalBias   = 0.1f;
-    float probeSpacing = 2.0f;
+    // Dynamic diffuse probe grid for low-frequency bounced lighting.
+    bool  useDDGI      = true;
+    float giIntensity  = 0.45f;
+    float normalBias   = 0.18f;
+    float probeSpacing = 5.0f;
     bool  showProbes   = false;
 
     // Rendering mode
@@ -546,10 +551,19 @@ struct Scene {
     // Build matrices
     XMMATRIX GetViewMatrix()       const { return const_cast<Camera&>(camera).GetViewMatrix(); }
     XMMATRIX GetProjectionMatrix() const {
-        return XMMatrixPerspectiveFovLH(
+        XMMATRIX projection = XMMatrixPerspectiveFovLH(
             XMConvertToRadians(cameraFOV),
             (float)g_dx12.screenWidth / (float)g_dx12.screenHeight,
             cameraNear, cameraFar);
+        if (g_dx12.screenWidth > 0 && g_dx12.screenHeight > 0) {
+            const float jitterX = 2.0f * temporalJitterPixels.x /
+                                  static_cast<float>(g_dx12.screenWidth);
+            const float jitterY = -2.0f * temporalJitterPixels.y /
+                                  static_cast<float>(g_dx12.screenHeight);
+            projection.r[2] = XMVectorAdd(
+                projection.r[2], XMVectorSet(jitterX, jitterY, 0.0f, 0.0f));
+        }
+        return projection;
     }
 
     // Gun world-space model matrix
