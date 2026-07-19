@@ -41,6 +41,7 @@ public:
     float             meshYaw  = 0.0f;
     bool              upperBodyGunLayer = true;
     float             leftArmReach = 0.55f;
+    float             headTorsoYawOffsetDegrees = -18.0f;
     float             orbitRadius = 4.8f;
     float             orbitDirection = 1.0f;
     float             fireCooldown = 1.0f;
@@ -875,27 +876,31 @@ private:
         using namespace DirectX;
         if (headBone_ < 0 || static_cast<size_t>(headBone_) >= poseGlobals_.size())
             return;
+        const int parent = model.skeleton.parent[headBone_];
+        if (parent < 0 || static_cast<size_t>(parent) >= poseGlobals_.size())
+            return;
 
-        // This UE mesh's authored face points down native -Y. Measure that axis
-        // after the current animation, skin transform, asset orientation, and
-        // world yaw instead of assuming the head bone's local axes face forward.
-        const XMMATRIX headSkin =
-            XMLoadFloat4x4(&model.skeleton.offset[headBone_]) *
-            XMLoadFloat4x4(&poseGlobals_[headBone_]);
-        const XMMATRIX headToWorld = headSkin * MeshWorldMatrix();
-        const XMVECTOR currentFaceWorld = XMVector3Normalize(
-            XMVector3TransformNormal(XMVectorSet(0.0f, -1.0f, 0.0f, 0.0f),
-                                     headToWorld));
+        // Remove sideways head turns authored into idle/walk poses. Rebuild the
+        // head from its bind transform relative to the currently aimed neck, so
+        // it stays locked to torso direction instead of running a separate
+        // look-at solver.
+        const XMMATRIX currentHead = XMLoadFloat4x4(&poseGlobals_[headBone_]);
+        const XMMATRIX straightHead =
+            XMLoadFloat4x4(&model.skeleton.localBind[headBone_]) *
+            XMLoadFloat4x4(&poseGlobals_[parent]);
+        const XMMATRIX straighten =
+            XMMatrixInverse(nullptr, currentHead) * straightHead;
+        for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
+            if (!IsDescendant(static_cast<int>(bone), headBone_)) continue;
+            XMStoreFloat4x4(&poseGlobals_[bone],
+                XMLoadFloat4x4(&poseGlobals_[bone]) * straighten);
+        }
 
-        const float pitch = (std::max)(-XMConvertToRadians(32.0f),
-            (std::min)(XMConvertToRadians(32.0f), aimPitch));
-        const float cp = std::cos(pitch);
-        const XMVECTOR desiredFaceWorld = XMVector3Normalize(XMVectorSet(
-            std::sin(aimYaw) * cp, std::sin(pitch),
-            std::cos(aimYaw) * cp, 0.0f));
+        // Asset-specific bind offset: its neutral face sits about 18 degrees to
+        // the right of its torso. Counter-rotate once around the neck vertical.
         const XMVECTOR pivot = XMLoadFloat4x4(&poseGlobals_[headBone_]).r[3];
         RotateBranchWorld(headBone_, pivot,
-            RotationFromTo(currentFaceWorld, desiredFaceWorld));
+            XMMatrixRotationY(XMConvertToRadians(headTorsoYawOffsetDegrees)));
     }
 
     void SolveArmIK(int upper, int lower, int hand, DirectX::FXMVECTOR target) {
