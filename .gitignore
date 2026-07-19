@@ -36,6 +36,8 @@ models/textures/*
 !models/textures/BLOOD_SPLAT_LICENSE.txt
 !models/textures/fire1_64.png
 !models/textures/FIRE1_64_LICENSE.txt
+!models/textures/explosion_soluna.png
+!models/textures/EXPLOSION_SOLUNA_LICENSE.txt
 !models/Barrel Explosive/
 !models/Barrel Explosive/barrel.FBX
 !models/Barrel Explosive/textures/
@@ -45,6 +47,8 @@ models/textures/*
 !models/Humvee/humvee.fbx
 !models/audio/
 !models/audio/*
+!models/SVD_v1.3/
+!models/SVD_v1.3/**
 
 # CMake
 CMakeCache.txt

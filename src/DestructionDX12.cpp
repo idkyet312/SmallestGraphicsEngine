@@ -861,7 +861,14 @@ struct DestructionDX12::Impl {
                 // bond into a single piece until it is shot apart.
                 const size_t at = sourceChunk->name.find('@');
                 if (at != std::string::npos) {
-                    chunk.plankGroup = std::atoi(sourceChunk->name.c_str() + at + 1);
+                    const char* groupText = sourceChunk->name.c_str() + at + 1;
+                    char* groupEnd = nullptr;
+                    const long parsedGroup = std::strtol(groupText, &groupEnd, 10);
+                    // Only numeric suffixes identify multi-cell boards. Names
+                    // such as MetalTrim@RidgeCap are independent rigid pieces;
+                    // atoi() previously collapsed every one of them into group 0.
+                    if (groupEnd != groupText && *groupEnd == '\0')
+                        chunk.plankGroup = static_cast<int>(parsedGroup);
                 }
                 chunk.glass = sourceChunk->name.rfind("Glass@", 0) == 0;
                 chunk.sheet = sourceChunk->name.rfind("Roof@", 0) == 0;
@@ -2061,6 +2068,7 @@ struct DestructionDX12::Impl {
             // stable storage (deque never reallocates its elements).
             std::list<std::vector<uint8_t>> masks;
             std::list<IsolateChunksParams> paramStore;
+            std::list<IsolateGroupParams> groupParamStore;
             for (auto& runtime : actors) {
                 if (!runtime->actor) continue;
                 const NvBlastActor* ll = runtime->actor->getActorLL();
@@ -2073,12 +2081,44 @@ struct DestructionDX12::Impl {
                     owned[chunkIndex] = 1;
                 // Count this actor's live bonds per chunk.
                 std::unordered_map<uint32_t, uint32_t> liveBonds;  // chunkIndex(0-based) -> count
+                std::unordered_map<int, uint32_t> externalGroupBonds;
+                std::unordered_set<int> actorGroups;
+                for (uint32_t chunkIndex : runtime->chunks) {
+                    const int plankGroup = chunks[chunkIndex].plankGroup;
+                    if (plankGroup >= 0) actorGroups.insert(plankGroup);
+                }
                 for (uint32_t bp = 0; bp < bondPairs.size() && bp < assetBondCount; ++bp) {
                     if (bondHealths[bp] <= 0.0f) continue;
                     const uint32_t ca = bondPairs[bp].a, cb = bondPairs[bp].b;
                     const bool ownsA = ca < owned.size() && owned[ca] != 0;
                     const bool ownsB = cb < owned.size() && owned[cb] != 0;
-                    if (ownsA && ownsB) { ++liveBonds[ca]; ++liveBonds[cb]; }
+                    if (ownsA && ownsB) {
+                        ++liveBonds[ca]; ++liveBonds[cb];
+                        const int groupA = chunks[ca].plankGroup;
+                        const int groupB = chunks[cb].plankGroup;
+                        if (groupA >= 0 && groupA != groupB) ++externalGroupBonds[groupA];
+                        if (groupB >= 0 && groupB != groupA) ++externalGroupBonds[groupB];
+                    }
+                }
+
+                // A multi-cell board remains internally bonded so it can fall
+                // intact. Once fewer than two bonds connect it to the standing
+                // structure, sever only those external bonds. This prevents a
+                // large roof panel or plank from hovering rigidly by one point.
+                for (int plankGroup : actorGroups) {
+                    bool hasOtherChunks = false;
+                    for (uint32_t chunkIndex : runtime->chunks) {
+                        if (chunks[chunkIndex].plankGroup != plankGroup) {
+                            hasOtherChunks = true;
+                            break;
+                        }
+                    }
+                    if (!hasOtherChunks || externalGroupBonds[plankGroup] >= 2) continue;
+                    groupParamStore.push_back({ chunkGroupByAsset.data(),
+                        static_cast<uint32_t>(chunkGroupByAsset.size()), plankGroup });
+                    const NvBlastDamageProgram groupProgram = { IsolateGroupShader, nullptr };
+                    runtime->actor->damage(groupProgram, &groupParamStore.back());
+                    anyMarked = true;
                 }
 
                 std::vector<uint8_t> mask(chunks.size() + 1, 0);  // asset chunk index; 0 = root

@@ -82,6 +82,11 @@ std::shared_ptr<SceneNode>  g_explosiveBarrelShadowModel;
 std::shared_ptr<SceneNode>  g_humveeModel;
 std::shared_ptr<SceneNode>  g_humveeShadowModel;
 std::shared_ptr<SceneNode>  g_helicopterModel;
+std::shared_ptr<SceneNode>  g_fernModel;
+std::vector<FernInstance>   g_fernInstances;
+static XMFLOAT3             g_fernSourceCenter{};
+static float                g_fernSourceMinY = 0.0f;
+static float                g_fernSourceHeight = 1.0f;
 std::shared_ptr<SceneNode>  g_helicopterMainRotorNode;
 std::shared_ptr<SceneNode>  g_helicopterTailRotorNode;
 std::shared_ptr<SceneNode>  g_humveeTurretNode;
@@ -100,18 +105,21 @@ float                       g_helicopterFireCooldown = 0.0f;
 float                       g_helicopterFireCycleTime = 0.0f;
 XMFLOAT3                    g_helicopterPosition{ 0.0f, 14.0f, 0.0f };
 XMFLOAT3                    g_secondaryHelicopterPosition{ 42.0f, 14.0f, 0.0f };
+constexpr float             kHelicopterPatrolRadius = 16.0f;
 float                       g_secondaryHelicopterYaw = 0.0f;
 float                       g_secondaryHelicopterPitch = 0.0f;
 float                       g_secondaryHelicopterRoll = 0.0f;
 float                       g_secondaryHelicopterHoverTime = 1.7f;
 float                       g_secondaryHelicopterFireCooldown = 0.0f;
 float                       g_secondaryHelicopterFireCycleTime = 3.5f;
-float                       g_secondaryHelicopterHealth = 2000.0f;
+constexpr float             kHelicopterMaxHealth = 2000.0f;
+constexpr float             kRocketHelicopterDamage = kHelicopterMaxHealth * 0.5f;
+float                       g_secondaryHelicopterHealth = kHelicopterMaxHealth;
 bool                        g_secondaryHelicopterDead = false;
 bool                        g_secondaryHelicopterCrashed = false;
 XMFLOAT3                    g_secondaryHelicopterCrashVelocity{ 0.0f, 0.0f, 0.0f };
 XMFLOAT3                    g_secondaryHumveePosition{ 42.0f, 2.5f, 3.0f };
-float                       g_helicopterHealth = 2000.0f;
+float                       g_helicopterHealth = kHelicopterMaxHealth;
 bool                        g_helicopterDead = false;
 bool                        g_helicopterCrashed = false;
 XMFLOAT3                    g_helicopterCrashVelocity{ 0.0f, 0.0f, 0.0f };
@@ -130,6 +138,8 @@ float                       g_banditLeftArmReach = 0.55f;
 float                       g_banditHeadYawOffsetDegrees = 20.4f;
 uint32_t                    g_banditSpawnSerial = 0;
 GunAudio                    g_gunAudio;
+GunAudio                    g_rpgFireAudio;
+GunAudio                    g_explosionAudio;
 GunAudio                    g_hitAudio;
 GunAudio                    g_banditSpottedAudio1;
 GunAudio                    g_banditSpottedAudio2;
@@ -490,12 +500,18 @@ static void UpdateHelicopter(float dt) {
     }
     g_helicopterHoverTime += dt;
 
-    // Layered low-frequency movement avoids a perfectly fixed, mechanical hover.
-    g_helicopterPosition.x = std::sin(g_helicopterHoverTime * 0.31f) * 0.72f;
+    // Slow bounded patrol around spawn, with small independent hover drift.
+    // Horizontal distance never exceeds the configured patrol radius.
+    const float patrolPhase = g_helicopterHoverTime * 0.105f;
+    g_helicopterPosition.x =
+        std::sin(patrolPhase) * (kHelicopterPatrolRadius - 0.72f) +
+        std::sin(g_helicopterHoverTime * 0.31f) * 0.72f;
     g_helicopterPosition.y = 14.0f +
         std::sin(g_helicopterHoverTime * 1.27f) * 0.26f +
         std::sin(g_helicopterHoverTime * 0.43f) * 0.12f;
-    g_helicopterPosition.z = std::cos(g_helicopterHoverTime * 0.27f) * 0.55f;
+    g_helicopterPosition.z =
+        std::cos(patrolPhase) * (kHelicopterPatrolRadius * 0.68f) +
+        std::cos(g_helicopterHoverTime * 0.27f) * 0.55f;
 
     const float targetX = scene.camera.Position.x - g_helicopterPosition.x;
     const float targetZ = scene.camera.Position.z - g_helicopterPosition.z;
@@ -587,12 +603,15 @@ static void UpdateSecondaryHelicopter(float dt) {
     }
 
     g_secondaryHelicopterHoverTime += dt;
+    const float patrolPhase = g_secondaryHelicopterHoverTime * 0.105f + XM_PI;
     g_secondaryHelicopterPosition.x = 42.0f +
+        std::sin(patrolPhase) * (kHelicopterPatrolRadius - 0.72f) +
         std::sin(g_secondaryHelicopterHoverTime * 0.29f) * 0.72f;
     g_secondaryHelicopterPosition.y = 14.0f +
         std::sin(g_secondaryHelicopterHoverTime * 1.19f) * 0.26f +
         std::sin(g_secondaryHelicopterHoverTime * 0.39f) * 0.12f;
     g_secondaryHelicopterPosition.z =
+        std::cos(patrolPhase) * (kHelicopterPatrolRadius * 0.68f) +
         std::cos(g_secondaryHelicopterHoverTime * 0.25f) * 0.55f;
 
     const float targetX = scene.camera.Position.x - g_secondaryHelicopterPosition.x;
@@ -785,7 +804,15 @@ static bool SpawnHumveeTurretGunner(int vehicleIndex) {
 }
 
 static void ShootPlayerWeapon() {
-    if (GunModel::ShotgunSelected()) {
+    if (GunModel::SVDSelected()) {
+        scene.ShootSniperProjectile();
+        const float pitch = 0.70f + ((float)std::rand() / RAND_MAX) * 0.04f;
+        g_gunAudio.Play(1.0f, pitch);
+    } else if (GunModel::RPGSelected()) {
+        scene.ShootRocket();
+        const float pitch = 0.68f + ((float)std::rand() / RAND_MAX) * 0.05f;
+        g_rpgFireAudio.Play(1.0f, pitch);
+    } else if (GunModel::ShotgunSelected()) {
         scene.ShootShotgun();
         const float pitch = 0.78f + ((float)std::rand() / RAND_MAX) * 0.08f;
         g_gunAudio.Play(0.96f, pitch);
@@ -797,6 +824,8 @@ static void ShootPlayerWeapon() {
 }
 
 static float PlayerFireInterval() {
+    if (GunModel::SVDSelected()) return 1.05f;
+    if (GunModel::RPGSelected()) return 1.7f;
     return GunModel::ShotgunSelected() ? 0.8f : scene.fireInterval;
 }
 
@@ -973,24 +1002,6 @@ static void GrabOrThrowObject() {
 static void SpawnBarrelExplosionFX(const XMFLOAT3& center) {
     scene.SpawnExplosionFX(
         { center.x, center.y + 1.1f, center.z }, 5.5f);
-    scene.SpawnSmokeBurst(center, 1.25f, 2.2f);
-    auto randomSigned = []() {
-        return ((float)std::rand() / (float)RAND_MAX) * 2.0f - 1.0f;
-    };
-    for (int i = 0; i < 28; ++i) {
-        ImpactParticle spark;
-        spark.position = center;
-        spark.velocity = {
-            randomSigned() * 9.0f,
-            3.0f + std::abs(randomSigned()) * 10.0f,
-            randomSigned() * 9.0f };
-        spark.maxLife = spark.life = 0.45f + std::abs(randomSigned()) * 0.65f;
-        spark.size = 0.055f + std::abs(randomSigned()) * 0.075f;
-        spark.growth = -spark.size * 0.65f;
-        spark.color = { 1.0f, 0.23f + std::abs(randomSigned()) * 0.25f, 0.015f };
-        spark.spark = true;
-        scene.impactParticles.push_back(spark);
-    }
 }
 
 static void DetonateBarrel(size_t firstBarrel) {
@@ -1375,14 +1386,14 @@ static ComPtr<ID3D12DescriptorHeap> imguiSrvHeap;
 
 struct PalmSpawn { float x, z, height, lean; };
 static constexpr std::array<PalmSpawn, 8> kPalmSpawns = {{
-    { -29.0f, -25.0f, 7.5f,  0.5f },
-    { -25.0f, -28.0f, 6.4f, -0.4f },
-    { -20.0f, -29.0f, 8.2f,  0.7f },
-    { -15.0f, -25.0f, 6.8f, -0.6f },
-    { -14.0f, -19.0f, 7.1f,  0.3f },
-    { -17.0f, -13.0f, 6.0f, -0.5f },
-    { -23.0f, -12.0f, 7.8f,  0.6f },
-    { -29.0f, -15.0f, 6.6f, -0.3f },
+    { -15.5f, -13.8f, 7.5f,  0.5f },
+    {  -3.5f, -18.0f, 6.4f, -0.4f },
+    {  14.8f, -14.2f, 8.2f,  0.7f },
+    {  18.0f,   2.8f, 6.8f, -0.6f },
+    {  14.2f,  14.8f, 7.1f,  0.3f },
+    {   3.2f,  18.2f, 6.0f, -0.5f },
+    { -14.5f,  14.0f, 7.8f,  0.6f },
+    { -18.0f,   2.5f, 6.6f, -0.3f },
 }};
 
 // Stress-map landscaping: loose, asymmetric clusters soften the bare compounds
@@ -1399,15 +1410,210 @@ static constexpr std::array<PalmSpawn, 6> kStressHousePalmSpawns = {{
 static void ResetPalmTrees() {
     g_trees.Initialize();
     for (const PalmSpawn& palm : kPalmSpawns)
-        g_trees.Plant(palm.x, palm.z, palm.height, palm.lean);
+        g_trees.Plant(palm.x, palm.z, palm.height * 2.0f, palm.lean);
     if (g_stressTestMode) {
         for (const PalmSpawn& palm : kStressHousePalmSpawns)
-            g_trees.Plant(palm.x, palm.z, palm.height, palm.lean);
+            g_trees.Plant(palm.x, palm.z, palm.height * 2.0f, palm.lean);
     }
 }
 
 static bool g_environmentInitialized = false;
 static bool g_environmentStressMode = false;
+
+static bool LoadFernModel() {
+    if (g_fernModel) return true;
+    const std::string root = "models/fbx_Dandelion/";
+    auto model = FBXImporter::Load(root + "Dandelion.FBX",
+        g_dx12.device, g_dx12.commandList, 1.0f, false, false);
+    if (!model) {
+        std::cerr << "Failed to load dandelion foliage model\n";
+        return false;
+    }
+
+    auto material = std::make_shared<SceneMaterial>();
+    material->name = "Dandelion foliage";
+    material->metallicFactor = 0.0f;
+    material->roughnessFactor = 1.0f;
+    material->doubleSided = true;
+    material->alphaCutout = true;
+    material->disableOcclusionCulling = true;
+
+    // Source is a JPEG photographed on white. Derive a hard cutout alpha from
+    // distance to white so only leaf/stem geometry survives on the cards.
+    std::vector<unsigned char> albedo;
+    int aw = 0, ah = 0;
+    if (GLBImporter::LoadPixelsRGBA(root + "dandelion_leaf.jpg",
+                                    albedo, aw, ah)) {
+        const size_t pixelCount = static_cast<size_t>(aw) * ah;
+        std::vector<unsigned char> mask(pixelCount, 0);
+        for (size_t pixel = 0; pixel < pixelCount; ++pixel) {
+            const size_t i = pixel * 4;
+            const int darkest = (std::min)({ static_cast<int>(albedo[i]),
+                static_cast<int>(albedo[i + 1]),
+                static_cast<int>(albedo[i + 2]) });
+            mask[pixel] = darkest < 220 ? 255 : 0;
+        }
+        // Erode one texel of photographed white fringe. Also bleed a dark leaf
+        // green into transparent texels so bilinear filtering cannot mix white
+        // JPEG background into the surviving cutout edge.
+        for (int y = 0; y < ah; ++y) for (int x = 0; x < aw; ++x) {
+            const size_t pixel = static_cast<size_t>(y) * aw + x;
+            bool opaque = mask[pixel] != 0;
+            if (opaque && x > 0 && x + 1 < aw && y > 0 && y + 1 < ah) {
+                for (int oy = -1; oy <= 1 && opaque; ++oy)
+                    for (int ox = -1; ox <= 1; ++ox)
+                        if (!mask[static_cast<size_t>(y + oy) * aw + x + ox]) {
+                            opaque = false;
+                            break;
+                        }
+            }
+            const size_t i = pixel * 4;
+            albedo[i + 3] = opaque ? 255 : 0;
+            if (!opaque) {
+                albedo[i] = 48;
+                albedo[i + 1] = 82;
+                albedo[i + 2] = 24;
+            }
+        }
+        material->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
+            g_dx12.device.Get(), g_dx12.commandList.Get(), albedo, aw, ah,
+            material->uploadHeaps);
+    }
+
+    XMFLOAT3 boundsMin(FLT_MAX, FLT_MAX, FLT_MAX);
+    XMFLOAT3 boundsMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    const auto configure = [&](const auto& self,
+                               const std::shared_ptr<SceneNode>& node) -> void {
+        if (!node) return;
+        if (node->mesh) for (MeshPrimitive& primitive : node->mesh->primitives) {
+            primitive.material = material;
+            for (size_t i = 0; i + 2 < primitive.vertices.size(); i += 12) {
+                const float x = primitive.vertices[i];
+                const float y = primitive.vertices[i + 1];
+                const float z = primitive.vertices[i + 2];
+                boundsMin.x = (std::min)(boundsMin.x, x);
+                boundsMin.y = (std::min)(boundsMin.y, y);
+                boundsMin.z = (std::min)(boundsMin.z, z);
+                boundsMax.x = (std::max)(boundsMax.x, x);
+                boundsMax.y = (std::max)(boundsMax.y, y);
+                boundsMax.z = (std::max)(boundsMax.z, z);
+            }
+        }
+        for (const auto& child : node->children) self(self, child);
+    };
+    configure(configure, model);
+    // FBX stores each frond under a transformed child node. Bake those node
+    // transforms before computing plant bounds or instancing; otherwise the
+    // shared normalization transform scales around raw card coordinates and
+    // pulls individual leaves away from the plant.
+    if (auto merged = GLBImporter::MergeSceneByMaterial(model, g_dx12.device))
+        model = std::move(merged);
+    // Merge baked every source-node transform into vertex positions. Reset the
+    // replacement root or FBX root rotation/scale gets applied a second time.
+    model->translation = XMFLOAT3(0.0f, 0.0f, 0.0f);
+    model->rotation = XMFLOAT4(0.0f, 0.0f, 0.0f, 1.0f);
+    model->scale = XMFLOAT3(1.0f, 1.0f, 1.0f);
+    XMFLOAT4X4 identity;
+    XMStoreFloat4x4(&identity, XMMatrixIdentity());
+    model->UpdateGlobalTransform(identity);
+    boundsMin = XMFLOAT3(FLT_MAX, FLT_MAX, FLT_MAX);
+    boundsMax = XMFLOAT3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    const auto collectBounds = [&](const auto& self,
+                                   const std::shared_ptr<SceneNode>& node) -> void {
+        if (!node) return;
+        if (node->mesh) for (const MeshPrimitive& primitive : node->mesh->primitives) {
+            for (size_t i = 0; i + 2 < primitive.vertices.size(); i += 12) {
+                boundsMin.x = (std::min)(boundsMin.x, primitive.vertices[i]);
+                boundsMin.y = (std::min)(boundsMin.y, primitive.vertices[i + 1]);
+                boundsMin.z = (std::min)(boundsMin.z, primitive.vertices[i + 2]);
+                boundsMax.x = (std::max)(boundsMax.x, primitive.vertices[i]);
+                boundsMax.y = (std::max)(boundsMax.y, primitive.vertices[i + 1]);
+                boundsMax.z = (std::max)(boundsMax.z, primitive.vertices[i + 2]);
+            }
+        }
+        for (const auto& child : node->children) self(self, child);
+    };
+    collectBounds(collectBounds, model);
+    if (boundsMin.x == FLT_MAX || !material->baseColorTexture) {
+        std::cerr << "Fern geometry or cutout texture missing\n";
+        return false;
+    }
+    g_fernSourceCenter = XMFLOAT3(
+        (boundsMin.x + boundsMax.x) * 0.5f, 0.0f,
+        (boundsMin.z + boundsMax.z) * 0.5f);
+    g_fernSourceMinY = boundsMin.y;
+    g_fernSourceHeight = (std::max)(0.001f, boundsMax.y - boundsMin.y);
+    g_fernModel = std::move(model);
+    std::cout << "Dandelion foliage model ready\n";
+    return true;
+}
+
+static void ScatterFerns(
+    const std::function<float(float, float)>& terrainSampler,
+    const std::vector<GrassField::Exclusion>& exclusions) {
+    g_fernInstances.clear();
+    if (!g_fernModel) return;
+    uint32_t rng = 0x7f4a7c15u;
+    auto random01 = [&]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<float>(rng >> 8) * (1.0f / 16777216.0f);
+    };
+    const auto excluded = [&](float x, float z) {
+        for (const auto& e : exclusions)
+            if (x >= e.minX && x <= e.maxX && z >= e.minZ && z <= e.maxZ)
+                return true;
+        return false;
+    };
+    const int clusterCount = g_stressTestMode ? 420 : 180;
+    const float span = g_stressTestMode ? 196.0f : 96.0f;
+    g_fernInstances.reserve(clusterCount * 7);
+    for (int cluster = 0; cluster < clusterCount; ++cluster) {
+        // First clusters sit around level-one compound so foliage is visible
+        // immediately; remaining clusters cover terrain deterministically.
+        static constexpr XMFLOAT2 nearbyClusters[] = {
+            {  4.3f,  4.2f }, { -4.4f,  4.0f },
+            {  4.1f, -4.3f }, { -4.2f, -4.4f },
+            { 14.0f,  8.0f }, {-14.0f,  7.0f }
+        };
+        const float cx = cluster < static_cast<int>(std::size(nearbyClusters))
+            ? nearbyClusters[cluster].x : (random01() - 0.5f) * span;
+        const float cz = cluster < static_cast<int>(std::size(nearbyClusters))
+            ? nearbyClusters[cluster].y : (random01() - 0.5f) * span;
+        const int plants = 4 + static_cast<int>(random01() * 7.0f);
+        for (int plant = 0; plant < plants; ++plant) {
+            const float angle = random01() * XM_2PI;
+            const float distance = std::sqrt(random01()) * 2.8f;
+            const float x = cx + std::cos(angle) * distance;
+            const float z = cz + std::sin(angle) * distance;
+            if (excluded(x, z)) continue;
+            const float y = terrainSampler(x, z);
+            if (y < 0.22f) continue;
+            const float hx = terrainSampler(x + 0.35f, z) -
+                             terrainSampler(x - 0.35f, z);
+            const float hz = terrainSampler(x, z + 0.35f) -
+                             terrainSampler(x, z - 0.35f);
+            if (hx * hx + hz * hz > 0.34f) continue;
+            const float targetHeight = 0.544f + random01() * 0.376f;
+            const float scale = targetHeight / g_fernSourceHeight;
+            const float yaw = random01() * XM_2PI;
+            const XMMATRIX transform =
+                XMMatrixTranslation(-g_fernSourceCenter.x, -g_fernSourceMinY,
+                                    -g_fernSourceCenter.z) *
+                XMMatrixScaling(scale, scale, scale) *
+                XMMatrixRotationY(yaw) *
+                // Sink stem/pivot slightly so sloped terrain cannot expose a
+                // gap below the lowest card.
+                XMMatrixTranslation(x, y + 0.025f, z);
+            FernInstance instance;
+            XMStoreFloat4x4(&instance.transform, transform);
+            instance.center = XMFLOAT3(x, y + 0.025f + targetHeight * 0.48f, z);
+            instance.radius = targetHeight * 0.75f;
+            g_fernInstances.push_back(instance);
+        }
+    }
+    std::cout << "Dandelion foliage: " << g_fernInstances.size()
+              << " GPU instances\n";
+}
 
 static void RebuildScalableEnvironment() {
     auto terrainParams = CurrentTerrainParams();
@@ -1467,6 +1673,7 @@ static void RebuildScalableEnvironment() {
     g_grass.Initialize(terrainSampler,
         g_stressTestMode ? 200.0f : 100.0f,
         g_stressTestMode ? 1600000 : 400000, 0.0f, grassExclusions);
+    ScatterFerns(terrainSampler, grassExclusions);
     g_environmentInitialized = true;
     g_environmentStressMode = g_stressTestMode;
 }
@@ -1552,7 +1759,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_helicopterHoverTime = 0.0f;
     g_helicopterFireCooldown = 0.0f;
     g_helicopterFireCycleTime = 0.0f;
-    g_helicopterHealth = 2000.0f;
+    g_helicopterHealth = kHelicopterMaxHealth;
     g_helicopterDead = false;
     g_helicopterCrashed = false;
     g_helicopterPosition = { 0.0f, 14.0f, 0.0f };
@@ -1563,7 +1770,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_secondaryHelicopterHoverTime = 1.7f;
     g_secondaryHelicopterFireCooldown = 0.0f;
     g_secondaryHelicopterFireCycleTime = 3.5f;
-    g_secondaryHelicopterHealth = 2000.0f;
+    g_secondaryHelicopterHealth = kHelicopterMaxHealth;
     g_secondaryHelicopterDead = false;
     g_secondaryHelicopterCrashed = false;
     g_secondaryHelicopterPosition = { 42.0f, 14.0f, 0.0f };
@@ -1853,9 +2060,15 @@ static void LoadFloorMudMaterial() {
     floorMaterial->baseColorTexture = GLBImporter::LoadTextureFromFile(
         ResolveTexturePath((dir + "Grass004_2K-PNG_Color.png").c_str()),
         g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
-    floorMaterial->normalTexture.Reset();
-    floorMaterial->metallicRoughnessTexture.Reset();
-    floorMaterial->roughnessOnlyTexture = false;
+    floorMaterial->normalTexture = GLBImporter::LoadTextureFromFile(
+        ResolveTexturePath((dir + "Grass004_2K-PNG_NormalGL.png").c_str()),
+        g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
+    floorMaterial->normalYSign = 1.0f;
+    floorMaterial->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
+        ResolveTexturePath((dir + "Grass004_2K-PNG_Roughness.png").c_str()),
+        g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
+    floorMaterial->roughnessOnlyTexture =
+        floorMaterial->metallicRoughnessTexture != nullptr;
 
     if (!floorMaterial->baseColorTexture) {
         const auto missing = PinkMissingTexture(256);
@@ -1892,10 +2105,10 @@ static void LoadFloorMudMaterial() {
         std::cerr << "Fire sprite (models/textures/fire1_64.png) unavailable\n";
 
     g_explosionTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("models/textures/explosion_boom3.png"),
+        ResolveTexturePath("models/textures/explosion_soluna.png"),
         g_dx12.device, g_dx12.commandList, g_explosionUploadHeaps);
     if (!g_explosionTexture)
-        std::cerr << "Explosion sheet (models/textures/explosion_boom3.png) unavailable\n";
+        std::cerr << "Explosion sheet (models/textures/explosion_soluna.png) unavailable\n";
 }
 
 // Crysis-style plank wall: the destructible is built from real structural
@@ -3119,14 +3332,14 @@ static bool CreateAllGeometry() {
     }
     if (!CreateVertexBuffer(fireVerts, geo.fireVertexBuffer, geo.fireVBV)) return false;
 
-    // OpenGameArt CC0 explosion sheet: 8 columns x 8 rows, 64 frames at 128 px.
+    // OpenGameArt CC0 explosion sheet: 4 columns x 4 rows, 16 frames at 128 px.
     std::vector<VertexPosNormUV> explosionVerts;
-    explosionVerts.reserve(64 * 6);
-    for (int frame = 0; frame < 64; ++frame) {
-        const int column = frame % 8;
-        const int row = frame / 8;
-        const float u0 = column / 8.0f, u1 = (column + 1) / 8.0f;
-        const float v0 = row / 8.0f, v1 = (row + 1) / 8.0f;
+    explosionVerts.reserve(16 * 6);
+    for (int frame = 0; frame < 16; ++frame) {
+        const int column = frame % 4;
+        const int row = frame / 4;
+        const float u0 = column / 4.0f, u1 = (column + 1) / 4.0f;
+        const float v0 = row / 4.0f, v1 = (row + 1) / 4.0f;
         explosionVerts.insert(explosionVerts.end(), {
             {{-0.5f,-0.5f,0},{0,0,1},{u0,v1}}, {{ 0.5f,-0.5f,0},{0,0,1},{u1,v1}}, {{ 0.5f, 0.5f,0},{0,0,1},{u1,v0}},
             {{-0.5f,-0.5f,0},{0,0,1},{u0,v1}}, {{ 0.5f, 0.5f,0},{0,0,1},{u1,v0}}, {{-0.5f, 0.5f,0},{0,0,1},{u0,v0}},
@@ -3445,6 +3658,12 @@ static void ApplyVirtualInput() {
 }
 
 static void ProcessInput(HWND) {
+    const bool scopeRequested = gameScreen == GameScreen::Level1 &&
+        scene.playerHealth > 0.0f && GunModel::SVDSelected() &&
+        !g_drivingHumvee && !cameraLocked &&
+        !(showUI && ImGui::GetIO().WantCaptureMouse) &&
+        (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    scene.UpdateSniperScope(scopeRequested, deltaTime);
     if (cameraLocked || (showUI && ImGui::GetIO().WantCaptureKeyboard)) return;
     if (g_drivingHumvee) {
         g_humveeTurretFireCooldown = (std::max)(
@@ -3575,7 +3794,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             else {
                 float dx = xpos - lastX;
                 float dy = lastY - ypos; // screen Y grows downward; flip so moving the mouse up looks up
-                if (dx != 0.0f || dy != 0.0f) scene.camera.ProcessMouseMovement(dx, dy);
+                if (dx != 0.0f || dy != 0.0f) {
+                    const float scopeScale = scene.ScopeLookScale();
+                    scene.camera.ProcessMouseMovement(dx * scopeScale, dy * scopeScale);
+                }
             }
 
             // Re-center the cursor every move so it never reaches the screen
@@ -3741,6 +3963,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     if (!g_profiler.Init(g_dx12.device.Get(), g_dx12.commandQueue.Get()))
         std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
     g_gunAudio.Initialize("models/audio/rifle_shot.wav");
+    g_rpgFireAudio.Initialize("models/audio/rpg_fire.wav");
+    g_explosionAudio.Initialize("models/audio/explosion.ogg");
+    scene.explosionAudioCallback = [](const XMFLOAT3& position, float size) {
+        const float dx = position.x - scene.camera.Position.x;
+        const float dy = position.y - scene.camera.Position.y;
+        const float dz = position.z - scene.camera.Position.z;
+        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const float reach = 55.0f + size * 4.0f;
+        const float volume = (std::max)(0.08f, 1.0f - distance / reach);
+        const float pitch = 0.92f + ((float)std::rand() / RAND_MAX) * 0.10f;
+        g_explosionAudio.Play(volume, pitch);
+    };
     g_hitAudio.Initialize("models/audio/bullet_flesh_hit.mp3");
     g_banditSpottedAudio1.Initialize("models/audio/bandit_spotted_01.wav");
     g_banditSpottedAudio2.Initialize("models/audio/bandit_spotted_02.wav");
@@ -4061,6 +4295,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             UpdateExplosiveBarrels(deltaTime);
         }
         g_gunAudio.Update();
+        g_rpgFireAudio.Update();
+        g_explosionAudio.Update();
         g_hitAudio.Update();
         g_banditSpottedAudio1.Update();
         g_banditSpottedAudio2.Update();
@@ -4286,8 +4522,63 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     scene.impactParticles.begin() +
                     (scene.impactParticles.size() - 800));
             for (auto& projectile : scene.projectiles) {
-                if (projectile.grenade) {
-                    // Timer-only grenade: impacts and bounces never detonate it.
+                if (projectile.rocket && projectile.active) {
+                    XMFLOAT3 impact = projectile.position;
+                    bool struck = false;
+                    const float radius = 0.22f;
+                    size_t barrelIndex = 0;
+                    XMFLOAT3 candidate;
+                    if (g_banditLoaded) {
+                        for (const auto& bandit : g_bandits) {
+                            if (bandit && bandit->BlocksProjectile(
+                                    projectile.previousPosition, projectile.position,
+                                    radius)) {
+                                struck = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!struck && HitHelicopterSegment(
+                            projectile.previousPosition, projectile.position,
+                            radius, candidate)) {
+                        impact = candidate;
+                        struck = true;
+                    }
+                    if (!struck && HitSecondaryHelicopterSegment(
+                            projectile.previousPosition, projectile.position,
+                            radius, candidate)) {
+                        impact = candidate;
+                        struck = true;
+                    }
+                    if (!struck && HitExplosiveBarrelSegment(
+                            projectile.previousPosition, projectile.position,
+                            radius, barrelIndex, candidate)) {
+                        impact = candidate;
+                        struck = true;
+                    }
+                    if (!struck && g_destruction.HitTestSegment(
+                            projectile.previousPosition, projectile.position,
+                            radius, candidate)) {
+                        impact = candidate;
+                        struck = true;
+                    }
+                    if (!struck && g_trees.BlocksSegment(
+                            projectile.previousPosition, projectile.position, radius))
+                        struck = true;
+                    if (!struck && HitTerrainSegment(
+                            projectile.previousPosition, projectile.position,
+                            radius, candidate)) {
+                        impact = candidate;
+                        struck = true;
+                    }
+                    if (struck) {
+                        projectile.position = impact;
+                        projectile.active = false;
+                        projectile.detonate = true;
+                    }
+                }
+                if (projectile.grenade || projectile.rocket) {
+                    // Grenades use fuse; rockets detonate on first solid impact.
                     if (projectile.detonate) {
                         const XMFLOAT3 center = projectile.position;
                         scene.SpawnExplosionFX(
@@ -4321,8 +4612,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             const float reach = scene.grenadeEnemyRadius + 5.0f;
                             if (distance < reach) {
                                 const float falloff = 1.0f - distance / reach;
-                                DamageHelicopter(scene.grenadeEnemyDamage * falloff,
-                                                 g_helicopterPosition);
+                                DamageHelicopter(
+                                    projectile.rocket ? kRocketHelicopterDamage
+                                                      : scene.grenadeEnemyDamage * falloff,
+                                    g_helicopterPosition);
                             }
                         }
                         if (g_stressTestMode && !g_secondaryHelicopterDead &&
@@ -4335,7 +4628,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             if (distance < reach) {
                                 const float falloff = 1.0f - distance / reach;
                                 DamageSecondaryHelicopter(
-                                    scene.grenadeEnemyDamage * falloff,
+                                    projectile.rocket ? kRocketHelicopterDamage
+                                                      : scene.grenadeEnemyDamage * falloff,
                                     g_secondaryHelicopterPosition);
                             }
                         }
@@ -4368,7 +4662,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         if (projectile.hostile && bandit.get() != g_heldBandit) continue;
                         if (bandit && bandit->Shoot(
                                 projectile.previousPosition, projectile.position,
-                                projectile.direction, bulletRadius, &banditHit)) {
+                                projectile.direction, bulletRadius, &banditHit, nullptr,
+                                20.0f * projectile.damageMultiplier)) {
                             hitBandit = true;
                             killedBandit = bandit->Dead();
                             if (killedBandit && bandit.get() == g_heldBandit)
@@ -4419,7 +4714,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(helicopterHit, normal);
-                    DamageHelicopter(34.0f, helicopterHit);
+                    DamageHelicopter(34.0f * projectile.damageMultiplier, helicopterHit);
                     projectile.active = false;
                     continue;
                 }
@@ -4430,7 +4725,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(helicopterHit, normal);
-                    DamageSecondaryHelicopter(34.0f, helicopterHit);
+                    DamageSecondaryHelicopter(
+                        34.0f * projectile.damageMultiplier, helicopterHit);
                     projectile.active = false;
                     continue;
                 }
@@ -4440,7 +4736,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         projectile.previousPosition, projectile.position,
                         bulletRadius, barrelIndex, barrelHit)) {
                     ExplosiveBarrel& barrel = scene.explosiveBarrels[barrelIndex];
-                    ++barrel.hits;
+                    barrel.hits += static_cast<int>(std::ceil(projectile.damageMultiplier));
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
@@ -4459,10 +4755,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                                  bulletRadius, hit)) {
                     std::cout << "Projectile hit wall at " << hit.x << ", "
                               << hit.y << ", " << hit.z << "\n";
-                    g_destruction.ApplyRadialDamage(hit, scene.destructionDamageRadius,
-                                                    scene.destructionDamage);
+                    g_destruction.ApplyRadialDamage(
+                        hit, scene.destructionDamageRadius,
+                        scene.destructionDamage * projectile.damageMultiplier);
                     g_destruction.ApplyImpulse(hit, projectile.direction,
-                                               scene.destructionBulletImpulse,
+                                               scene.destructionBulletImpulse *
+                                                   projectile.damageMultiplier,
                                                scene.destructionDamageRadius);
                     // Impact FX: spark burst + hole decal. Surface normal is
                     // approximated as facing back along the bullet's travel.
@@ -4485,7 +4783,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 } else if (XMFLOAT3 treeHit;
                            !g_emptyLevelMode && g_trees.Shoot(projectile.previousPosition, projectile.position,
                                          projectile.direction, bulletRadius,
-                                         scene.treeDamagePerShot, treeHit)) {
+                                         scene.treeDamagePerShot * projectile.damageMultiplier,
+                                         treeHit)) {
                     // Chewed a palm trunk; enough rounds and it snaps and topples.
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
@@ -4589,7 +4888,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 visBuffer.BeginHDRBackground(g_dx12.commandList.Get());
                 skyRenderer.SetHDRTargetEnabled(true);
             }
-            skyRenderer.Render(scene.camera, scene.cameraFOV, scene.lightPos, now);
+            skyRenderer.Render(scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now);
             if (commonHDRValidationTarget) {
                 skyRenderer.SetHDRTargetEnabled(false);
                 visBuffer.EndHDRBackground(g_dx12.commandList.Get());
@@ -4723,6 +5022,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_trees.SetTerrainSampler(terrainSampler);
                 ResetPalmTrees();
 
+                LoadFernModel();
                 RebuildScalableEnvironment();
             }
             // Same pool AABB for the destruction sim so house debris shoved into
@@ -4902,6 +5202,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ReleaseMaterialUploadHeaps(g_helicopterModel);
             ReleaseMaterialUploadHeaps(g_humveeModel);
             ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
+            ReleaseMaterialUploadHeaps(g_fernModel);
             ReleaseMaterialUploadHeaps(g_banditModel.node);
             for (const auto& material : g_banditModel.materialKeepAlive)
                 if (material) material->uploadHeaps.clear();
@@ -5257,6 +5558,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_banditSpottedAudio2.Shutdown();
     g_banditSpottedAudio1.Shutdown();
     g_hitAudio.Shutdown();
+    g_explosionAudio.Shutdown();
+    g_rpgFireAudio.Shutdown();
     g_gunAudio.Shutdown();
     g_profiler.Shutdown();
     CleanupDX12();

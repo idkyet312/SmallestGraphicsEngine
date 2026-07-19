@@ -461,14 +461,17 @@ public:
     bool Shoot(const DirectX::XMFLOAT3& start, const DirectX::XMFLOAT3& end,
                const DirectX::XMFLOAT3& direction, float radius,
                DirectX::XMFLOAT3* hitPoint = nullptr,
-               bool* headshot = nullptr) {
+               bool* headshot = nullptr,
+               float bodyDamage = 20.0f) {
         if (dead_ || !visible) return false;
         DirectX::XMFLOAT3 impact;
         bool hitHead = false;
         if (!BlocksProjectile(start, end, radius, &impact, &hitHead)) return false;
         if (hitPoint) *hitPoint = impact;
         if (headshot) *headshot = hitHead;
-        health -= hitHead ? health : 34.0f;
+        // Standard rifle balance: one headshot, exactly five body hits from
+        // full 100 health.
+        health -= hitHead ? health : bodyDamage;
         if (health <= 0.0f) Kill(direction, impact);
         return true;
     }

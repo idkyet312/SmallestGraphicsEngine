@@ -409,7 +409,8 @@ public:
         const XMVECTOR front = XMVector3Normalize(XMLoadFloat3(&scene.camera.Front));
         const XMVECTOR up = XMVector3Normalize(XMLoadFloat3(&scene.camera.Up));
         const XMVECTOR right = XMVector3Normalize(XMVector3Cross(up, front));
-        const float tanHalfFov = std::tan(XMConvertToRadians(scene.cameraFOV) * 0.5f);
+        const float tanHalfFov = std::tan(
+            XMConvertToRadians(scene.EffectiveCameraFOV()) * 0.5f);
         const float aspect = static_cast<float>(g_dx12.screenWidth) /
             (std::max)(1.0f, static_cast<float>(g_dx12.screenHeight));
         XMVECTOR lightDir = XMVector3Normalize(XMLoadFloat3(&scene.lightPos));
@@ -594,7 +595,7 @@ public:
                 g_dx12.commandList->IASetPrimitiveTopology(
                     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 GrassField::Params params = g_grass.GetParams(
-                    scene.cameraFOV, static_cast<float>(g_dx12.screenHeight));
+                    scene.EffectiveCameraFOV(), static_cast<float>(g_dx12.screenHeight));
                 for (const auto& range : grassShadowRanges) {
                     params.firstBlade = range.firstInstance;
                     // Shadow VS reuses raster-only fields to scatter the sparse
