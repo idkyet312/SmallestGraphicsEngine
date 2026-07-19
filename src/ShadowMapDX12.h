@@ -26,6 +26,9 @@ public:
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipelineState;
     ComPtr<ID3D12PipelineState> grassPipelineState;
+    ComPtr<ID3D12PipelineState> palmPipelineState;
+    ComPtr<ID3D12PipelineState> palmAlphaPipelineState;
+    ComPtr<ID3D12DescriptorHeap> palmTextureHeap;
     UploadBuffer<MatrixBufferDX12> matrixBuffer;
     UploadBuffer<MeshInstanceDataDX12> instanceBuffer;
     UINT currentDrawCall = 0;
@@ -33,6 +36,8 @@ public:
     UINT batchesThisFrame = 0;
     UINT instancesThisFrame = 0;
     bool loaded = false;
+    PalmWindFrameDX12 palmWindFrame{};
+    ID3D12Resource* boundPalmTexture = nullptr;
 
     bool Load(const char* vertexPath) {
         std::ifstream vsFile(vertexPath);
@@ -62,7 +67,12 @@ public:
             return false;
         }
 
-        D3D12_ROOT_PARAMETER rootParams[8] = {};
+        D3D12_DESCRIPTOR_RANGE palmTextureRange = {};
+        palmTextureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        palmTextureRange.NumDescriptors = 1;
+        palmTextureRange.BaseShaderRegister = 0;
+
+        D3D12_ROOT_PARAMETER rootParams[9] = {};
         rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         rootParams[0].Descriptor.ShaderRegister = 0;
         rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -90,10 +100,27 @@ public:
         rootParams[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[7].Descriptor.ShaderRegister = 14;
         rootParams[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        rootParams[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParams[8].DescriptorTable.NumDescriptorRanges = 1;
+        rootParams[8].DescriptorTable.pDescriptorRanges = &palmTextureRange;
+        rootParams[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_STATIC_SAMPLER_DESC palmSampler = {};
+        palmSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        palmSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        palmSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        palmSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        palmSampler.MaxAnisotropy = 1;
+        palmSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        palmSampler.MaxLOD = D3D12_FLOAT32_MAX;
+        palmSampler.ShaderRegister = 0;
+        palmSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
         rootSigDesc.NumParameters = _countof(rootParams);
         rootSigDesc.pParameters = rootParams;
+        rootSigDesc.NumStaticSamplers = 1;
+        rootSigDesc.pStaticSamplers = &palmSampler;
         rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ComPtr<ID3DBlob> sigBlob;
@@ -167,6 +194,52 @@ public:
             &psoDesc, IID_PPV_ARGS(&grassPipelineState));
         if (FAILED(hr)) return false;
 
+        auto compileShader = [&](const char* path, const char* target,
+                                 ComPtr<ID3DBlob>& blob) {
+            std::ifstream file(path);
+            if (!file.is_open()) return false;
+            std::stringstream stream;
+            stream << file.rdbuf();
+            const std::string code = stream.str();
+            errorBlob.Reset();
+            const HRESULT result = D3DCompile(
+                code.c_str(), code.length(), path, nullptr,
+                D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", target,
+                compileFlags, 0, &blob, &errorBlob);
+            if (FAILED(result) && errorBlob)
+                std::cerr << "Palm shadow shader error: "
+                          << (char*)errorBlob->GetBufferPointer() << std::endl;
+            return SUCCEEDED(result);
+        };
+        ComPtr<ID3DBlob> palmVsBlob;
+        ComPtr<ID3DBlob> palmPsBlob;
+        if (!compileShader("shaders/palm_shadow_vs.hlsl", "vs_5_0", palmVsBlob) ||
+            !compileShader("shaders/palm_shadow_ps.hlsl", "ps_5_0", palmPsBlob))
+            return false;
+        D3D12_INPUT_ELEMENT_DESC palmInput[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+        };
+        psoDesc.InputLayout = { palmInput, _countof(palmInput) };
+        psoDesc.VS = { palmVsBlob->GetBufferPointer(), palmVsBlob->GetBufferSize() };
+        psoDesc.PS = {};
+        hr = g_dx12.device->CreateGraphicsPipelineState(
+            &psoDesc, IID_PPV_ARGS(&palmPipelineState));
+        if (FAILED(hr)) return false;
+        psoDesc.PS = { palmPsBlob->GetBufferPointer(), palmPsBlob->GetBufferSize() };
+        hr = g_dx12.device->CreateGraphicsPipelineState(
+            &psoDesc, IID_PPV_ARGS(&palmAlphaPipelineState));
+        if (FAILED(hr)) return false;
+
+        D3D12_DESCRIPTOR_HEAP_DESC palmHeapDesc = {};
+        palmHeapDesc.NumDescriptors = 1;
+        palmHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        palmHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(g_dx12.device->CreateDescriptorHeap(
+                &palmHeapDesc, IID_PPV_ARGS(&palmTextureHeap)))) return false;
+
         if (!matrixBuffer.Create(FRAME_COUNT * SHADOW_MAX_DRAWS)) return false;
         if (!instanceBuffer.Create(FRAME_COUNT * SHADOW_MAX_INSTANCES)) return false;
         loaded = true;
@@ -185,7 +258,8 @@ public:
         g_dx12.commandList->SetPipelineState(pipelineState.Get());
     }
 
-    void SetMatrices(const XMMATRIX& model, const XMMATRIX& lightSpace) {
+    void SetMatrices(const XMMATRIX& model, const XMMATRIX& lightSpace,
+                     const XMFLOAT4& palmRoot = {}) {
         UINT index = g_dx12.frameIndex * SHADOW_MAX_DRAWS + std::min(currentDrawCall, SHADOW_MAX_DRAWS - 1);
         MatrixBufferDX12 data = {};
         data.model = XMMatrixTranspose(model);
@@ -194,6 +268,13 @@ public:
         data.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
         data.modelView = data.model;
         data.modelViewProjection = XMMatrixTranspose(model * lightSpace);
+        data.palmWind = palmWindFrame.wind;
+        data.palmPrimary = palmWindFrame.primary;
+        data.palmSecondary = palmWindFrame.secondary;
+        data.palmPreviousPrimary = palmWindFrame.previousPrimary;
+        data.palmPreviousSecondary = palmWindFrame.previousSecondary;
+        data.palmParams = palmWindFrame.params;
+        data.palmRoot = palmRoot;
         matrixBuffer.CopyData(index, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(0, matrixBuffer.GetGPUAddress(index));
         const UINT disabled = 0;
@@ -239,6 +320,35 @@ public:
     void UseGrass() {
         g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
         g_dx12.commandList->SetPipelineState(grassPipelineState.Get());
+    }
+
+    void SetPalmWindFrame(const PalmWindFrameDX12& frame) {
+        palmWindFrame = frame;
+    }
+
+    void UsePalm(bool alphaCutout) {
+        g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
+        g_dx12.commandList->SetPipelineState(
+            alphaCutout ? palmAlphaPipelineState.Get() : palmPipelineState.Get());
+    }
+
+    void SetPalmTexture(ID3D12Resource* texture) {
+        if (!texture || !palmTextureHeap) return;
+        if (boundPalmTexture != texture) {
+            const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Format = desc.Format;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Texture2D.MipLevels = desc.MipLevels;
+            g_dx12.device->CreateShaderResourceView(
+                texture, &srv, palmTextureHeap->GetCPUDescriptorHandleForHeapStart());
+            boundPalmTexture = texture;
+        }
+        ID3D12DescriptorHeap* heaps[] = { palmTextureHeap.Get() };
+        g_dx12.commandList->SetDescriptorHeaps(1, heaps);
+        g_dx12.commandList->SetGraphicsRootDescriptorTable(
+            8, palmTextureHeap->GetGPUDescriptorHandleForHeapStart());
     }
 
     void SetGrass(const GrassField::Params& params,
@@ -477,6 +587,7 @@ public:
         if (!initialized || scene.lightType != 0) return lightSpace;
 
         depthShader.BeginFrame();
+        depthShader.SetPalmWindFrame(g_trees.GetWindFrame());
 
         D3D12_RESOURCE_BARRIER barrier = {};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -571,6 +682,53 @@ public:
             DrawSceneNodeShadowInstances(
                 g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,
                 depthShader, humveeTransforms, lightSpace);
+        }
+
+        // Palm shadows use the same GPU wind as the visible mesh. Leaf cards run
+        // an alpha-tested depth pass so fronds cast silhouettes, not solid quads.
+        if (!g_emptyLevelMode && g_trees.IsInitialized()) {
+            for (const TreeItem& item : g_trees.GetItems()) {
+                std::shared_ptr<SceneMesh> slice;
+                if (item.crown) slice = PalmModel::Crown();
+                else if (item.segment >= 0 &&
+                         item.segment < static_cast<int>(PalmModel::TrunkSlices().size()))
+                    slice = PalmModel::TrunkSlices()[item.segment].mesh;
+
+                const XMMATRIX model = XMLoadFloat4x4(&item.transform);
+                if (!slice) {
+                    depthShader.Use();
+                    depthShader.SetMatrices(model, lightSpace);
+                    DrawCube(geo);
+                    depthShader.NextDrawCall();
+                    continue;
+                }
+
+                for (const MeshPrimitive& prim : slice->primitives) {
+                    if (!prim.vbv.BufferLocation) continue;
+                    const bool alphaCutout = prim.material &&
+                        prim.material->alphaCutout &&
+                        prim.material->baseColorTexture;
+                    depthShader.UsePalm(alphaCutout);
+                    if (alphaCutout)
+                        depthShader.SetPalmTexture(
+                            prim.material->baseColorTexture.Get());
+                    depthShader.SetMatrices(model, lightSpace, item.palmWindRoot);
+                    g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
+                    g_dx12.commandList->IASetPrimitiveTopology(
+                        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    if (prim.ibv.BufferLocation) {
+                        g_dx12.commandList->IASetIndexBuffer(&prim.ibv);
+                        g_dx12.commandList->DrawIndexedInstanced(
+                            prim.indexCount, 1, 0, 0, 0);
+                    } else {
+                        g_dx12.commandList->DrawInstanced(
+                            static_cast<UINT>(prim.vertices.size() / 12),
+                            1, 0, 0);
+                    }
+                    depthShader.NextDrawCall();
+                }
+            }
+            depthShader.Use();
         }
 
         // Sparse instanced blade silhouettes give grass a readable basic shadow

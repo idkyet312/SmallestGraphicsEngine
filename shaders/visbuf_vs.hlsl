@@ -6,7 +6,19 @@ cbuffer MatrixBuffer : register(b0) {
     matrix view;
     matrix projection;
     matrix lightSpaceMatrix;
+    matrix unusedModelView;
+    matrix unusedModelViewProjection;
+    matrix unusedPreviousViewProjection;
+    float4 palmWind;
+    float4 palmPrimary;
+    float4 palmSecondary;
+    float4 palmPreviousPrimary;
+    float4 palmPreviousSecondary;
+    float4 palmParams;
+    float4 unusedPalmRoot;
 };
+
+#include "palm_wind.hlsli"
 
 cbuffer VisBufferConstants : register(b1) {
     uint drawCallID;
@@ -29,6 +41,7 @@ struct DrawCallData {
     uint indexCount;
     uint hasIndices;
     uint flags;
+    float4 palmWindRoot;
 };
 
 StructuredBuffer<DrawCallData> drawCalls : register(t1);
@@ -47,7 +60,10 @@ struct VS_OUTPUT {
 VS_OUTPUT main(VS_INPUT input) {
     VS_OUTPUT output;
     
-    float4 worldPos = mul(float4(input.position, 1.0),
+    float3 localPosition = ApplyPalmWindPosition(
+        input.position, drawCalls[drawCallID].palmWindRoot, palmWind,
+        palmPrimary, palmSecondary, palmParams);
+    float4 worldPos = mul(float4(localPosition, 1.0),
                           drawCalls[drawCallID].modelMatrix);
     float4 viewPos  = mul(worldPos, view);
     output.position = mul(viewPos, projection);

@@ -5,7 +5,19 @@ cbuffer MatrixBuffer : register(b0) {
     matrix view;
     matrix projection;
     matrix lightSpaceMatrix;
+    matrix modelView;
+    matrix modelViewProjection;
+    matrix previousViewProjection;
+    float4 palmWind;
+    float4 palmPrimary;
+    float4 palmSecondary;
+    float4 palmPreviousPrimary;
+    float4 palmPreviousSecondary;
+    float4 palmParams;
+    float4 palmRoot;
 };
+
+#include "palm_wind.hlsli"
 
 struct VS_INPUT {
     float3 position : POSITION;
@@ -25,13 +37,19 @@ struct VS_OUTPUT {
 
 VS_OUTPUT main(VS_INPUT input) {
     VS_OUTPUT output;
-    
-    float4 worldPos = mul(float4(input.position, 1.0), model);
+
+    float3 localPosition = input.position;
+    float3 localNormal = input.normal;
+    float3 localTangent = input.tangent.xyz;
+    ApplyPalmWind(localPosition, localNormal, localTangent, palmRoot,
+                  palmWind, palmPrimary, palmSecondary, palmParams);
+
+    float4 worldPos = mul(float4(localPosition, 1.0), model);
     output.fragPos = worldPos.xyz;
     
     // Transform normal to world space
-    output.normal = normalize(mul(input.normal, (float3x3)model));
-    output.tangent = float4(normalize(mul(input.tangent.xyz, (float3x3)model)), input.tangent.w);
+    output.normal = normalize(mul(localNormal, (float3x3)model));
+    output.tangent = float4(normalize(mul(localTangent, (float3x3)model)), input.tangent.w);
     
     output.texCoord = input.texCoord;
     

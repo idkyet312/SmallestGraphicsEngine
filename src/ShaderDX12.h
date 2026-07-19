@@ -4,6 +4,7 @@
 #include "DX12Core.h"
 #include "MSAADX12.h"
 #include "SceneGraph.h"   // SceneMaterial: caches its descriptor slot (see SetObjectMaterial)
+#include "PalmWindGPU.h"
 #include <fstream>
 #include <sstream>
 #include <cstdio>
@@ -30,6 +31,13 @@ struct alignas(256) MatrixBufferDX12 {
     XMMATRIX modelView;
     XMMATRIX modelViewProjection;
     XMMATRIX previousViewProjection;
+    XMFLOAT4 palmWind;
+    XMFLOAT4 palmPrimary;
+    XMFLOAT4 palmSecondary;
+    XMFLOAT4 palmPreviousPrimary;
+    XMFLOAT4 palmPreviousSecondary;
+    XMFLOAT4 palmParams;
+    XMFLOAT4 palmRoot;
 };
 
 inline float g_currentModelMaxScale = 1.0f;
@@ -260,6 +268,7 @@ public:
     // Per-draw-call constant buffers (need enough for all objects)
     UploadBuffer<MatrixBufferDX12> matrixBuffer;
     XMMATRIX previousViewProjection = XMMatrixIdentity();
+    PalmWindFrameDX12 palmWindFrame{};
     UploadBuffer<ObjectBufferDX12> objectBuffer;
     
     // Per-frame constant buffers (shared across all draw calls in a frame)
@@ -1005,7 +1014,9 @@ public:
         return g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME + currentDrawCall;
     }
     
-    void SetMatrices(const XMMATRIX& model, const XMMATRIX& view, const XMMATRIX& proj, const XMMATRIX& lightSpace) {
+    void SetMatrices(const XMMATRIX& model, const XMMATRIX& view,
+                     const XMMATRIX& proj, const XMMATRIX& lightSpace,
+                     XMFLOAT4 palmRoot = {}) {
         UINT bufferIndex = GetDrawCallIndex();
         
         MatrixBufferDX12 data;
@@ -1017,6 +1028,13 @@ public:
         data.modelView = XMMatrixTranspose(modelView);
         data.modelViewProjection = XMMatrixTranspose(modelView * proj);
         data.previousViewProjection = XMMatrixTranspose(previousViewProjection);
+        data.palmWind = palmWindFrame.wind;
+        data.palmPrimary = palmWindFrame.primary;
+        data.palmSecondary = palmWindFrame.secondary;
+        data.palmPreviousPrimary = palmWindFrame.previousPrimary;
+        data.palmPreviousSecondary = palmWindFrame.previousSecondary;
+        data.palmParams = palmWindFrame.params;
+        data.palmRoot = palmRoot;
         g_currentModelMaxScale = (std::max)({
             XMVectorGetX(XMVector3Length(model.r[0])),
             XMVectorGetX(XMVector3Length(model.r[1])),
@@ -1029,6 +1047,10 @@ public:
 
     void SetPreviousViewProjection(const XMMATRIX& matrix) {
         previousViewProjection = matrix;
+    }
+
+    void SetPalmWindFrame(const PalmWindFrameDX12& frame) {
+        palmWindFrame = frame;
     }
     
     void SetLight(const XMFLOAT3& pos, int type, const XMFLOAT3& color,

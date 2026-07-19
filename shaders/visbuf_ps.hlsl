@@ -28,6 +28,6 @@ uint2 mainAlpha(PS_INPUT input) : SV_Target0 {
     if (alphaFromLuminance != 0u)
         clip(max(sampleValue.r, max(sampleValue.g, sampleValue.b)) - 0.38);
     else
-        clip(sampleValue.a - 0.4);
+        clip(sampleValue.a - 0.20);
     return uint2(drawCallID + 1u, input.primitiveID);
 }
