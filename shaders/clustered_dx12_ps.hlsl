@@ -91,12 +91,17 @@ cbuffer SHBuffer : register(b7) {
     float3 shPadding;
 };
 
+cbuffer ShadowCascadeBuffer : register(b8) {
+    matrix shadowCascadeMatrices[3];
+    float4 shadowCascadeSplits;
+};
+
 Texture2D albedoMap : register(t1);
 Texture2D irradianceMap : register(t2);
 Texture2D visibilityMap : register(t3);
 Texture2D normalMap : register(t4);
 Texture2D metalRoughMap : register(t5);
-Texture2D<float> shadowMap : register(t0);
+Texture2DArray<float> shadowMap : register(t0);
 Texture2D<float4> environmentMap : register(t15);
 SamplerComparisonState shadowSampler : register(s0);
 SamplerState texSampler : register(s1);
@@ -110,8 +115,14 @@ struct PS_INPUT {
     float4 fragPosLightSpace : TEXCOORD4;
 };
 
-float CalculateShadow(float4 fragPosLightSpace, float3 normal, float3 lightDir) {
+float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
     if (enableShadows == 0) return 1.0;
+
+    float viewDepth = mul(float4(worldPos, 1.0), view).z;
+    uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
+                   (viewDepth < shadowCascadeSplits.y ? 1u : 2u);
+    float4 fragPosLightSpace = mul(float4(worldPos, 1.0),
+                                   shadowCascadeMatrices[cascade]);
 
     float3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
     float2 shadowUV = projCoords.xy * float2(0.5, -0.5) + 0.5;
@@ -134,7 +145,8 @@ float CalculateShadow(float4 fragPosLightSpace, float3 normal, float3 lightDir) 
         [unroll]
         for (int x = -1; x <= 1; x++) {
             visibility += shadowMap.SampleCmpLevelZero(
-                shadowSampler, shadowUV + float2(x, y) * texelSize, depth);
+                shadowSampler,
+                float3(shadowUV + float2(x, y) * texelSize, cascade), depth);
         }
     }
 
@@ -570,7 +582,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float3 specular = numerator / denominator;
     
     // Combine
-    float shadowVisibility = CalculateShadow(input.fragPosLightSpace, normal, lightDir);
+    float shadowVisibility = CalculateShadow(input.fragPos, normal, lightDir);
     // Direct occlusion must also reduce local sky/DDGI fill. Keep a small
     // indirect floor so shadows stay readable instead of becoming pure black.
     result *= lerp(0.28, 1.0, shadowVisibility);

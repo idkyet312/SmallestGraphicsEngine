@@ -9,12 +9,17 @@
 #include "SkinnedEnemy.h"
 #include <algorithm>
 #include <cmath>
+#include <cfloat>
 #include <fstream>
 #include <sstream>
 
 static const UINT SHADOW_MAP_SIZE = 2048;
-static const UINT SHADOW_MAX_DRAWS = 4096;
-static const UINT SHADOW_MAX_INSTANCES = 4096;
+static const UINT SHADOW_MAX_DRAWS = 12288;
+static const UINT SHADOW_MAX_INSTANCES = 12288;
+static constexpr D3D12_RESOURCE_STATES SHADOW_SHADER_READ_STATE =
+    static_cast<D3D12_RESOURCE_STATES>(
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
 class DepthOnlyShaderDX12 {
 public:
@@ -386,11 +391,86 @@ public:
         return lightView * lightProj;
     }
 
+    std::array<XMMATRIX, SHADOW_CASCADE_COUNT> ComputeCascadeMatrices(
+        const Scene& scene) const {
+        const float nearDepth = (std::max)(scene.cameraNear, 0.05f);
+        const float farDepth = (std::min)(scene.cameraFar,
+            (std::max)(180.0f, scene.shadowFarPlane * 2.0f));
+        constexpr float splitLambda = 0.65f;
+        float splits[SHADOW_CASCADE_COUNT] = {};
+        for (UINT i = 0; i < SHADOW_CASCADE_COUNT; ++i) {
+            const float p = static_cast<float>(i + 1) / SHADOW_CASCADE_COUNT;
+            const float logarithmic = nearDepth * std::pow(farDepth / nearDepth, p);
+            const float uniform = nearDepth + (farDepth - nearDepth) * p;
+            splits[i] = splitLambda * logarithmic + (1.0f - splitLambda) * uniform;
+        }
+        g_shadowCascadeSplits = { splits[0], splits[1], splits[2], 0.0f };
+        const XMVECTOR cameraPos = XMLoadFloat3(&scene.camera.Position);
+        const XMVECTOR front = XMVector3Normalize(XMLoadFloat3(&scene.camera.Front));
+        const XMVECTOR up = XMVector3Normalize(XMLoadFloat3(&scene.camera.Up));
+        const XMVECTOR right = XMVector3Normalize(XMVector3Cross(up, front));
+        const float tanHalfFov = std::tan(XMConvertToRadians(scene.cameraFOV) * 0.5f);
+        const float aspect = static_cast<float>(g_dx12.screenWidth) /
+            (std::max)(1.0f, static_cast<float>(g_dx12.screenHeight));
+        XMVECTOR lightDir = XMVector3Normalize(XMLoadFloat3(&scene.lightPos));
+        XMVECTOR lightUp = XMVectorSet(0, 1, 0, 0);
+        if (std::fabs(XMVectorGetX(XMVector3Dot(lightDir, lightUp))) > 0.95f)
+            lightUp = XMVectorSet(0, 0, 1, 0);
+        std::array<XMMATRIX, SHADOW_CASCADE_COUNT> result;
+        float segmentNear = nearDepth;
+        for (UINT cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+            const float segmentFar = splits[cascade];
+            std::array<XMVECTOR, 8> corners;
+            UINT corner = 0;
+            for (float depth : { segmentNear, segmentFar }) {
+                const float halfY = tanHalfFov * depth;
+                const float halfX = halfY * aspect;
+                const XMVECTOR center = cameraPos + front * depth;
+                for (float y : { -1.0f, 1.0f })
+                    for (float x : { -1.0f, 1.0f })
+                        corners[corner++] = center + right * (x * halfX) + up * (y * halfY);
+            }
+            XMVECTOR center = XMVectorZero();
+            for (XMVECTOR p : corners) center += p;
+            center /= 8.0f;
+            const XMMATRIX lightView = XMMatrixLookAtLH(
+                center + lightDir * 260.0f, center, lightUp);
+            XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
+            XMFLOAT3 maximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            for (XMVECTOR p : corners) {
+                XMFLOAT3 q;
+                XMStoreFloat3(&q, XMVector3TransformCoord(p, lightView));
+                minimum.x = (std::min)(minimum.x, q.x);
+                minimum.y = (std::min)(minimum.y, q.y);
+                minimum.z = (std::min)(minimum.z, q.z);
+                maximum.x = (std::max)(maximum.x, q.x);
+                maximum.y = (std::max)(maximum.y, q.y);
+                maximum.z = (std::max)(maximum.z, q.z);
+            }
+            const float extent = (std::max)(maximum.x - minimum.x,
+                                             maximum.y - minimum.y) * 0.55f;
+            float centerX = (minimum.x + maximum.x) * 0.5f;
+            float centerY = (minimum.y + maximum.y) * 0.5f;
+            const float texel = (extent * 2.0f) / static_cast<float>(size);
+            centerX = std::floor(centerX / texel) * texel;
+            centerY = std::floor(centerY / texel) * texel;
+            const float nearPlane = (std::max)(0.1f, minimum.z - 80.0f);
+            const float farPlane = maximum.z + 80.0f;
+            result[cascade] = lightView * XMMatrixOrthographicOffCenterLH(
+                centerX - extent, centerX + extent,
+                centerY - extent, centerY + extent, nearPlane, farPlane);
+            segmentNear = segmentFar;
+        }
+        return result;
+    }
+
     XMMATRIX Render(Scene& scene,
                     const GeometryBuffers& geo,
                     const std::shared_ptr<SceneNode>& crateModel,
                     const std::vector<std::unique_ptr<SkinnedEnemy>>* bandits = nullptr) {
-        XMMATRIX lightSpace = ComputeLightSpace(scene);
+        const auto cascadeMatrices = ComputeCascadeMatrices(scene);
+        g_shadowCascadeMatrices = cascadeMatrices;
+        XMMATRIX lightSpace = cascadeMatrices[0];
         if (!initialized || scene.lightType != 0) return lightSpace;
 
         depthShader.BeginFrame();
@@ -398,7 +478,7 @@ public:
         D3D12_RESOURCE_BARRIER barrier = {};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barrier.Transition.pResource = shadowMap.Get();
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateBefore = SHADOW_SHADER_READ_STATE;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         g_dx12.commandList->ResourceBarrier(1, &barrier);
@@ -412,7 +492,12 @@ public:
         g_dx12.commandList->RSSetViewports(1, &shadowViewport);
         g_dx12.commandList->RSSetScissorRects(1, &shadowScissor);
 
+        const UINT dsvStride = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        for (UINT cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+        lightSpace = cascadeMatrices[cascade];
         D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv = dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        shadowDsv.ptr += static_cast<SIZE_T>(cascade) * dsvStride;
         g_dx12.commandList->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
         g_dx12.commandList->OMSetRenderTargets(0, nullptr, FALSE, &shadowDsv);
 
@@ -574,9 +659,11 @@ public:
             DrawCube(geo);
             depthShader.NextDrawCall();
         }
+        }
+        lightSpace = cascadeMatrices[0];
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = SHADOW_SHADER_READ_STATE;
         g_dx12.commandList->ResourceBarrier(1, &barrier);
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = GetCPUDescriptorHandle(
@@ -598,7 +685,7 @@ private:
         texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         texDesc.Width = size;
         texDesc.Height = size;
-        texDesc.DepthOrArraySize = 1;
+        texDesc.DepthOrArraySize = SHADOW_CASCADE_COUNT;
         texDesc.MipLevels = 1;
         texDesc.Format = DXGI_FORMAT_R32_TYPELESS;
         texDesc.SampleDesc.Count = 1;
@@ -611,7 +698,7 @@ private:
 
         HRESULT hr = g_dx12.device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &texDesc,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clearValue,
+            SHADOW_SHADER_READ_STATE, &clearValue,
             IID_PPV_ARGS(&shadowMap));
         if (FAILED(hr)) {
             std::cerr << "Failed to create shadow map texture" << std::endl;
@@ -619,16 +706,23 @@ private:
         }
 
         D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
-        dsvHeapDesc.NumDescriptors = 1;
+        dsvHeapDesc.NumDescriptors = SHADOW_CASCADE_COUNT;
         dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
         hr = g_dx12.device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&dsvHeap));
         if (FAILED(hr)) return false;
 
         D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
         dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
-        dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-        g_dx12.device->CreateDepthStencilView(shadowMap.Get(), &dsvDesc,
-            dsvHeap->GetCPUDescriptorHandleForHeapStart());
+        dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        dsvDesc.Texture2DArray.ArraySize = 1;
+        const UINT dsvStride = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+            dsvDesc.Texture2DArray.FirstArraySlice = cascade;
+            g_dx12.device->CreateDepthStencilView(shadowMap.Get(), &dsvDesc, dsv);
+            dsv.ptr += dsvStride;
+        }
 
         return true;
     }

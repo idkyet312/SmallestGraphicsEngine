@@ -7,6 +7,13 @@
 // fog and AgX tonemap so the field stays color-matched to the scene -- and
 // drops everything else. Binds a strict subset of the main root signature.
 
+cbuffer MatrixBuffer : register(b0) {
+    matrix model;
+    matrix view;
+    matrix projection;
+    matrix lightSpaceMatrix;
+};
+
 cbuffer LightBuffer : register(b1) {
     float3 lightPos;
     int lightType;
@@ -51,7 +58,12 @@ cbuffer SHBuffer : register(b7) {
     float3 shPadding;
 };
 
-Texture2D<float> shadowMap : register(t0);
+cbuffer ShadowCascadeBuffer : register(b8) {
+    matrix shadowCascadeMatrices[3];
+    float4 shadowCascadeSplits;
+};
+
+Texture2DArray<float> shadowMap : register(t0);
 SamplerComparisonState shadowSampler : register(s0);
 
 struct PS_INPUT {
@@ -65,8 +77,14 @@ struct PS_INPUT {
 
 // One comparison tap: the linear-filtered comparison sampler gives hardware
 // 2x2 PCF, which is plenty of softness for a 1-2 cm wide blade.
-float CalculateShadowCheap(float4 fragPosLightSpace, float3 normal, float3 lightDir) {
+float CalculateShadowCheap(float3 worldPos, float3 normal, float3 lightDir) {
     if (enableShadows == 0) return 1.0;
+
+    float viewDepth = mul(float4(worldPos, 1.0), view).z;
+    uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
+                   (viewDepth < shadowCascadeSplits.y ? 1u : 2u);
+    float4 fragPosLightSpace = mul(float4(worldPos, 1.0),
+                                   shadowCascadeMatrices[cascade]);
 
     float3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
     float2 shadowUV = projCoords.xy * float2(0.5, -0.5) + 0.5;
@@ -79,7 +97,8 @@ float CalculateShadowCheap(float4 fragPosLightSpace, float3 normal, float3 light
 
     float ndotl = saturate(dot(normal, lightDir));
     float bias = max(shadowBias * (1.0 - ndotl), shadowBias * 0.25);
-    return shadowMap.SampleCmpLevelZero(shadowSampler, shadowUV, projCoords.z - bias);
+    return shadowMap.SampleCmpLevelZero(
+        shadowSampler, float3(shadowUV, cascade), projCoords.z - bias);
 }
 
 // Identical to clustered_dx12_ps.hlsl so the field's ambient matches the turf.
@@ -158,7 +177,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
         ? normalize(lightPos)
         : normalize(lightPos - input.fragPos);
 
-    float shadowVisibility = CalculateShadowCheap(input.fragPosLightSpace, normal, lightDir);
+    float shadowVisibility = CalculateShadowCheap(input.fragPos, normal, lightDir);
 
     // Ambient (flat + SH sky), dimmed by shadow the same way the main shader
     // dims its indirect terms.

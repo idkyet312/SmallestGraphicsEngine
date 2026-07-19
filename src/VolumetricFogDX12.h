@@ -94,7 +94,7 @@ private:
     static constexpr UINT GridZ = ClusteredRendererDX12::CLUSTER_Z;
     static constexpr UINT ClusterCount = GridX * GridY * GridZ;
     static constexpr UINT MaxLights = ClusteredRendererDX12::MAX_LIGHTS;
-    static constexpr UINT ConstantsSize = 256;
+    static constexpr UINT ConstantsSize = 512;
 
     struct GPUCluster {
         UINT lightCount;
@@ -108,13 +108,14 @@ private:
     };
     struct FogConstants {
         XMFLOAT4X4 inverseViewProjection;
-        XMFLOAT4X4 lightSpace;
+        XMFLOAT4X4 shadowCascadeMatrices[SHADOW_CASCADE_COUNT];
         XMFLOAT4 cameraPositionNear;
         XMFLOAT4 cameraForwardFar;
         XMFLOAT4 sunDirectionDensity;
         XMFLOAT4 sunColorAnisotropy;
         XMFLOAT4 fogParams;
         XMFLOAT4 ambientFogColor;
+        XMFLOAT4 shadowCascadeSplits;
         XMUINT4 clusterDimsLightCount;
     };
     static_assert(sizeof(FogConstants) <= ConstantsSize, "Fog constants exceed one CBV page");
@@ -303,7 +304,9 @@ private:
         FogConstants constants = {};
         XMStoreFloat4x4(&constants.inverseViewProjection,
             XMMatrixTranspose(XMMatrixInverse(nullptr, viewProjection)));
-        XMStoreFloat4x4(&constants.lightSpace, XMMatrixTranspose(lightSpace));
+        for (UINT i = 0; i < SHADOW_CASCADE_COUNT; ++i)
+            XMStoreFloat4x4(&constants.shadowCascadeMatrices[i],
+                XMMatrixTranspose(g_shadowCascadeMatrices[i]));
         constants.cameraPositionNear = { scene.camera.Position.x, scene.camera.Position.y,
             scene.camera.Position.z, scene.cameraNear };
         constants.cameraForwardFar = { scene.camera.Front.x, scene.camera.Front.y,
@@ -323,6 +326,7 @@ private:
             scene.volumetricFogTint.y,
             scene.volumetricFogTint.z,
             fogTime_ };
+        constants.shadowCascadeSplits = g_shadowCascadeSplits;
         constants.clusterDimsLightCount = { GridX, GridY, GridZ,
             static_cast<UINT>((std::min)(scene.clusteredRenderer.lights.size(),
                                         static_cast<size_t>(MaxLights))) };
@@ -351,10 +355,15 @@ private:
         D3D12_SHADER_RESOURCE_VIEW_DESC shadowSrv = {};
         shadowSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         shadowSrv.Format = DXGI_FORMAT_R32_FLOAT;
-        shadowSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        shadowSrv.Texture2D.MipLevels = 1;
+        shadowSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        shadowSrv.Texture2DArray.MipLevels = 1;
+        shadowSrv.Texture2DArray.ArraySize = SHADOW_CASCADE_COUNT;
         g_dx12.device->CreateShaderResourceView(shadowResource, &shadowSrv, CpuHandle(0));
-        D3D12_SHADER_RESOURCE_VIEW_DESC depthSrv = shadowSrv;
+        D3D12_SHADER_RESOURCE_VIEW_DESC depthSrv = {};
+        depthSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        depthSrv.Format = DXGI_FORMAT_R32_FLOAT;
+        depthSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        depthSrv.Texture2D.MipLevels = 1;
         if (!multisampledDepth) {
             g_dx12.device->CreateShaderResourceView(depthResource, &depthSrv, CpuHandle(2));
             D3D12_SHADER_RESOURCE_VIEW_DESC nullMSAA = {};

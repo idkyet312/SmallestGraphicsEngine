@@ -9,8 +9,9 @@ cbuffer FrameConstants : register(b0) {
     matrix viewMatrix;
     matrix projMatrix;
     matrix invViewProj;
-    matrix lightViewProj;
+    matrix shadowCascadeMatrices[3];
     matrix previousViewProj;
+    float4 shadowCascadeSplits;
     float3 cameraPos;
     float  screenWidth;
     float  screenHeight;
@@ -18,6 +19,7 @@ cbuffer FrameConstants : register(b0) {
     float  farPlane;
     uint   debugViewMode;
     uint   enableMotionVectors;
+    uint3  framePadding;
 };
 
 cbuffer LightBuffer : register(b1) {
@@ -82,7 +84,7 @@ struct PackedVertex {
 
 Texture2D<uint2>  visBuffer    : register(t0);
 Texture2D<float>  depthBuffer  : register(t1);
-Texture2D<float>  shadowMapTex : register(t2);
+Texture2DArray<float> shadowMapTex : register(t2);
 
 StructuredBuffer<DrawCallData> drawCalls : register(t3);
 StructuredBuffer<PackedVertex> vertices  : register(t4);
@@ -195,15 +197,19 @@ float ScreenSpaceAO(uint2 pixel, float3 worldPos, float3 normal) {
 float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
     if (enableShadows == 0) return 1.0;
 
-    float4 lightClip = mul(float4(worldPos, 1.0), lightViewProj);
+    float viewDepth = mul(float4(worldPos, 1.0), viewMatrix).z;
+    uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
+                   (viewDepth < shadowCascadeSplits.y ? 1u : 2u);
+    float4 lightClip = mul(float4(worldPos, 1.0),
+                           shadowCascadeMatrices[cascade]);
     if (lightClip.w <= 0.0) return 1.0;
     float3 projected = lightClip.xyz / lightClip.w;
     float2 uv = projected.xy * float2(0.5, -0.5) + 0.5;
     if (projected.z <= 0.0 || projected.z >= 1.0 ||
         any(uv < 0.0) || any(uv > 1.0)) return 1.0;
 
-    uint shadowWidth, shadowHeight;
-    shadowMapTex.GetDimensions(shadowWidth, shadowHeight);
+    uint shadowWidth, shadowHeight, shadowLayers;
+    shadowMapTex.GetDimensions(shadowWidth, shadowHeight, shadowLayers);
     float2 texel = rcp(float2(shadowWidth, shadowHeight));
     float slopeBias = max(shadowBias * (1.0 - saturate(dot(normal, lightDir))),
                           shadowBias * 0.25);
@@ -213,7 +219,7 @@ float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
         [unroll]
         for (int x = -1; x <= 1; ++x) {
             visibility += shadowMapTex.SampleCmpLevelZero(
-                shadowSampler, uv + float2(x, y) * texel,
+                shadowSampler, float3(uv + float2(x, y) * texel, cascade),
                 projected.z - slopeBias);
         }
     }
