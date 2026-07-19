@@ -85,9 +85,7 @@ void AppendClips(const aiScene* scene, const Skeleton& skel, float positionScale
 
 constexpr unsigned kImportFlags = aiProcess_Triangulate | aiProcess_JoinIdenticalVertices |
     aiProcess_GenSmoothNormals | aiProcess_CalcTangentSpace | aiProcess_LimitBoneWeights |
-    // Blender FBX UVs use bottom-left image origin. Engine texture uploads and
-    // D3D sampling use top-left, so flip V once during import.
-    aiProcess_FlipUVs;
+    aiProcess_ImproveCacheLocality;
 
 } // namespace
 
