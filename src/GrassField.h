@@ -65,6 +65,14 @@ public:
         float maxZ = 0.0f;
     };
 
+    struct AuthoredPatch {
+        float x = 0.0f;
+        float z = 0.0f;
+        float radius = 1.0f;
+        float density = 1.0f;
+        uint32_t seed = 1;
+    };
+
     // Authored blade template extracted from models/grass2/grass/allGrass_001.obj.
     // Shape stores height, edge, forward curvature, and width profile.
     struct GrassVertex {
@@ -90,12 +98,14 @@ public:
     // blades must stay above.
     void Initialize(std::function<float(float, float)> sampler,
                     float span = 90.0f, int count = 12000, float waterY = 0.0f,
-                    const std::vector<Exclusion>& exclusions = {}) {
+                    const std::vector<Exclusion>& exclusions = {},
+                    const std::vector<AuthoredPatch>& authoredPatches = {}) {
         Shutdown();
         if (!sampler) return;
         m_terrain = std::move(sampler);
         m_waterY = waterY;
         m_exclusions = exclusions;
+        m_authoredPatches = authoredPatches;
 
         BuildBlades(span, count);
         if (m_blades.empty()) return;
@@ -354,6 +364,47 @@ private:
             }
         }
 
+        // Editor-authored patches add deterministic dense tufts without replacing
+        // the base island scatter. Patch radius and density come from entity scale.
+        for (const AuthoredPatch& patch : m_authoredPatches) {
+            uint32_t patchSeed = patch.seed ? patch.seed : 1u;
+            const float radius = (std::max)(0.15f, patch.radius);
+            const float density = std::clamp(patch.density, 0.05f, 4.0f);
+            const int patchTufts = std::clamp(static_cast<int>(
+                XM_PI * radius * radius * 2.8f * density), 1, 12000);
+            for (int t = 0; t < patchTufts; ++t) {
+                const float clusterAngle = Rand(patchSeed) * XM_2PI;
+                const float clusterRadius = std::sqrt(Rand(patchSeed)) * radius;
+                const float cx = patch.x + std::cos(clusterAngle) * clusterRadius;
+                const float cz = patch.z + std::sin(clusterAngle) * clusterRadius;
+                if (!Plantable(cx, cz)) continue;
+                for (int i = 0; i < kBladesPerTuft; ++i) {
+                    const float angle = Rand(patchSeed) * XM_2PI;
+                    const float r = kTuftRadius * std::sqrt(Rand(patchSeed));
+                    const float x = cx + std::cos(angle) * r;
+                    const float z = cz + std::sin(angle) * r;
+                    if (Excluded(x, z)) continue;
+                    const float y = m_terrain(x, z);
+                    if (y < m_waterY + kShoreMargin) continue;
+                    Blade blade;
+                    blade.x = x;
+                    blade.z = z;
+                    blade.baseY = y;
+                    blade.height = 0.38f + Rand(patchSeed) * 0.42f;
+                    blade.width = 0.012f + Rand(patchSeed) * 0.010f;
+                    const float yaw = Rand(patchSeed) * XM_2PI;
+                    blade.dirX = std::cos(yaw);
+                    blade.dirZ = std::sin(yaw);
+                    blade.phase = (Rand(patchSeed) - 0.5f) * 0.6f;
+                    const float leanYaw = angle + (Rand(patchSeed) - 0.5f) * 1.2f;
+                    blade.lean = 0.05f + Rand(patchSeed) * 0.20f;
+                    blade.leanX = std::cos(leanYaw);
+                    blade.leanZ = std::sin(leanYaw);
+                    m_blades.push_back(blade);
+                }
+            }
+        }
+
         // Sort the blades into spatial cells, so that each cell owns one contiguous
         // run of INSTANCES and can be drawn or skipped on its own. Without this the
         // field is a single draw and the GPU pays for every blade on the island,
@@ -368,8 +419,12 @@ private:
         m_cells.clear();
         if (m_blades.empty()) return;
 
-        const float half = span * 0.5f;
-        const int n = std::max(1, (int)std::ceil(span / kCellSize));
+        float half = span * 0.5f;
+        for (const Blade& blade : m_blades)
+            half = (std::max)(half, (std::max)(std::abs(blade.x), std::abs(blade.z)) +
+                kCellSize);
+        half = std::ceil(half / kCellSize) * kCellSize;
+        const int n = std::max(1, (int)std::ceil((half * 2.0f) / kCellSize));
         const auto cellOf = [&](const Blade& b) {
             const int ix = std::clamp((int)((b.x + half) / kCellSize), 0, n - 1);
             const int iz = std::clamp((int)((b.z + half) / kCellSize), 0, n - 1);
@@ -515,6 +570,7 @@ private:
 
     std::function<float(float, float)> m_terrain;
     std::vector<Exclusion> m_exclusions;
+    std::vector<AuthoredPatch> m_authoredPatches;
     std::vector<Blade> m_blades;
     std::vector<Cell>  m_cells;
 

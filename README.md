@@ -54,6 +54,10 @@ DirectX 12 is the primary path. A smaller legacy DirectX 11 target remains avail
 
 Rendering modes, lighting, DDGI, shadows, terrain, grass, weapon behavior, destruction debug drawing, and camera settings can be changed in the ImGui scene-controls window.
 
+Level Editor includes a terrain-aware foliage painter. Select Grass, Fern, or Trees; choose Paint or Erase; then hold left mouse over terrain. Radius, density, stroke spacing, and random scale are adjustable. `B` toggles paint/select. Each drag stroke is one undo operation, and foliage is stored in level JSON.
+
+Level Editor **Save** and **Save As** open a native save dialog rooted in `levels/`. The main-menu **Custom Levels** button opens the matching JSON file browser. Selected levels launch through the full gameplay runtime.
+
 ## Requirements
 
 - Windows 10 or later
@@ -70,6 +74,8 @@ The DX12 build uses these vcpkg packages:
 ```powershell
 vcpkg install `
   imgui[core,dx12-binding,win32-binding]:x64-windows `
+  imguizmo:x64-windows `
+  nlohmann-json:x64-windows `
   meshoptimizer:x64-windows `
   tinyexr:x64-windows `
   assimp:x64-windows `

@@ -131,7 +131,8 @@ public:
     void Shutdown();
     void Reset();
     void Update(float dt);
-    bool InitializeVehicle(const DirectX::XMFLOAT3& chassisCenter);
+    bool InitializeVehicle(const DirectX::XMFLOAT3& chassisCenter,
+                           float yawRadians = 0.0f);
     void SetVehicleInput(float throttle, float steering, bool brake);
     bool GetVehicleTransform(DirectX::XMFLOAT4X4& transform,
                              DirectX::XMFLOAT3* position = nullptr,

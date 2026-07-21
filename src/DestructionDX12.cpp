@@ -2283,7 +2283,8 @@ void DestructionDX12::Reset() {
     Initialize(source, device, x, y, z);
 }
 
-bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter) {
+bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter,
+                                        float yawRadians) {
     if (!m || !m->initialized || B3_IS_NULL(m->world) ||
         !B3_IS_NULL(m->vehicleChassis)) return false;
 
@@ -2291,6 +2292,8 @@ bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter) {
     chassisDef.type = b3_dynamicBody;
     chassisDef.position = {
         chassisCenter.x, chassisCenter.y, chassisCenter.z };
+    const b3Quat yawRotation = b3MakeQuatFromAxisAngle(b3Vec3_axisY, yawRadians);
+    chassisDef.rotation = yawRotation;
     chassisDef.linearDamping = 0.12f;
     chassisDef.angularDamping = 0.65f;
     m->vehicleChassis = b3CreateBody(m->world, &chassisDef);
@@ -2321,8 +2324,8 @@ bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter) {
     b3BodyDef wheelBodyDef = b3DefaultBodyDef();
     wheelBodyDef.type = b3_dynamicBody;
     wheelBodyDef.allowFastRotation = true;
-    wheelBodyDef.rotation =
-        b3ComputeQuatBetweenUnitVectors(b3Vec3_axisY, b3Vec3_axisZ);
+    wheelBodyDef.rotation = b3MulQuat(yawRotation,
+        b3ComputeQuatBetweenUnitVectors(b3Vec3_axisY, b3Vec3_axisZ));
     b3ShapeDef wheelShape = b3DefaultShapeDef();
     wheelShape.density = 65.0f;
     wheelShape.baseMaterial.friction = 4.0f;
@@ -2354,10 +2357,12 @@ bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter) {
     };
     for (size_t i = 0; i < m->vehicleWheels.size(); ++i) {
         const XMFLOAT3& offset = wheelOffsets[i];
+        const b3Vec3 rotatedOffset = b3RotateVector(yawRotation,
+            { offset.x, offset.y, offset.z });
         wheelBodyDef.position = {
-            chassisCenter.x + offset.x,
-            chassisCenter.y + offset.y,
-            chassisCenter.z + offset.z };
+            chassisCenter.x + rotatedOffset.x,
+            chassisCenter.y + rotatedOffset.y,
+            chassisCenter.z + rotatedOffset.z };
         m->vehicleWheels[i] = b3CreateBody(m->world, &wheelBodyDef);
         b3CreateSphereShape(m->vehicleWheels[i], &wheelShape, &wheelSphere);
         joint.base.bodyIdB = m->vehicleWheels[i];

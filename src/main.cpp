@@ -2,9 +2,12 @@
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
+#include <commdlg.h>
 #include <DbgHelp.h>
 #pragma comment(lib, "dbghelp.lib")
+#pragma comment(lib, "comdlg32.lib")
 #include <iostream>
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <functional>
@@ -20,6 +23,7 @@
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx12.h>
+#include <ImGuizmo.h>
 
 #include "DX12Core.h"
 #include "ProfilerDX12.h"
@@ -55,6 +59,8 @@
 #include "GunAudio.h"
 #include "WaterVolume.h"
 #include "PalmTrees.h"
+#include "LevelDefinition.h"
+#include "LevelEditor.h"
 
 using namespace DirectX;
 
@@ -95,6 +101,7 @@ float                       g_humveeModelMinY = 0.0f;
 float                       g_humveeModelScale = 1.0f;
 XMFLOAT3                    g_helicopterModelCenter{ 0.0f, 0.0f, 0.0f };
 float                       g_helicopterModelScale = 1.0f;
+float                       g_helicopterLevelScale = 1.0f;
 float                       g_helicopterMainRotorAngle = 0.0f;
 float                       g_helicopterTailRotorAngle = 0.0f;
 float                       g_helicopterYaw = 0.0f;
@@ -104,6 +111,7 @@ float                       g_helicopterHoverTime = 0.0f;
 float                       g_helicopterFireCooldown = 0.0f;
 float                       g_helicopterFireCycleTime = 0.0f;
 XMFLOAT3                    g_helicopterPosition{ 0.0f, 14.0f, 0.0f };
+XMFLOAT3                    g_helicopterSpawn{ 0.0f, 14.0f, 0.0f };
 XMFLOAT3                    g_secondaryHelicopterPosition{ 42.0f, 14.0f, 0.0f };
 constexpr float             kHelicopterPatrolRadius = 16.0f;
 float                       g_secondaryHelicopterYaw = 0.0f;
@@ -156,6 +164,16 @@ bool                        g_suppressFireUntilMouseRelease = false;
 bool                        g_stressTestMode = false;
 bool                        g_emptyLevelMode = false;
 NavigationSystem            g_navigation;
+static LevelEditor          g_levelEditor;
+static Camera               g_editorCameraSnapshot;
+static LevelDefinition      g_runtimeLevel = MakeLevelOneTemplate();
+static bool                 g_customLevelMode = false;
+static bool                 g_pendingEnvironmentRebuild = false;
+static std::string          g_activeCustomLevelName;
+static std::string          g_mainMenuLevelStatus;
+static XMFLOAT3             g_primaryHumveeSpawn{ 0.0f, 3.45f, 0.0f };
+static float                g_primaryHumveeYaw = 0.0f;
+static std::shared_ptr<SceneNode> g_houseTemplate;
 
 static constexpr size_t kEnemiesPerSpawner = 2;
 struct CompoundCenter { float x, z; };
@@ -179,6 +197,12 @@ static_assert(kStressHouseCount <= kStressCompoundCenters.size() *
 static_assert(kStressBanditCount <= kSpawnerCount * kEnemiesPerSpawner);
 
 static size_t ActiveBanditSlotCount() {
+    if (g_customLevelMode) {
+        return static_cast<size_t>(std::count_if(g_runtimeLevel.entities.begin(),
+            g_runtimeLevel.entities.end(), [](const LevelEntity& entity) {
+                return entity.enabled && entity.type == LevelEntityType::EnemySpawn;
+            }));
+    }
     return g_stressTestMode ? kStressBanditCount : 4 * kEnemiesPerSpawner;
 }
 
@@ -229,7 +253,10 @@ XMMATRIX HumveeWorldMatrix() {
         return model * XMMatrixTranslation(0.0f, -0.95f, 0.0f) *
                XMLoadFloat4x4(&physicsPose);
     }
-    return model * XMMatrixTranslation(0.0f, 2.5f, 0.0f);
+    return model * XMMatrixRotationY(XMConvertToRadians(g_primaryHumveeYaw)) *
+           XMMatrixTranslation(g_primaryHumveeSpawn.x,
+                               g_primaryHumveeSpawn.y - 0.95f,
+                               g_primaryHumveeSpawn.z);
 }
 
 XMMATRIX SecondaryHumveeWorldMatrix() {
@@ -261,8 +288,9 @@ XMMATRIX SecondaryHelicopterWorldMatrix() {
     return XMMatrixTranslation(-g_helicopterModelCenter.x,
                                -g_helicopterModelCenter.y,
                                -g_helicopterModelCenter.z) *
-           XMMatrixScaling(g_helicopterModelScale, g_helicopterModelScale,
-                           g_helicopterModelScale) *
+           XMMatrixScaling(g_helicopterModelScale * g_helicopterLevelScale,
+                           g_helicopterModelScale * g_helicopterLevelScale,
+                           g_helicopterModelScale * g_helicopterLevelScale) *
            XMMatrixRotationRollPitchYaw(g_secondaryHelicopterPitch,
                                         g_secondaryHelicopterYaw + XM_PI,
                                         g_secondaryHelicopterRoll) *
@@ -505,12 +533,14 @@ static void UpdateHelicopter(float dt) {
     // Horizontal distance never exceeds the configured patrol radius.
     const float patrolPhase = g_helicopterHoverTime * 0.105f;
     g_helicopterPosition.x =
+        g_helicopterSpawn.x +
         std::sin(patrolPhase) * (kHelicopterPatrolRadius - 0.72f) +
         std::sin(g_helicopterHoverTime * 0.31f) * 0.72f;
-    g_helicopterPosition.y = 14.0f +
+    g_helicopterPosition.y = g_helicopterSpawn.y +
         std::sin(g_helicopterHoverTime * 1.27f) * 0.26f +
         std::sin(g_helicopterHoverTime * 0.43f) * 0.12f;
     g_helicopterPosition.z =
+        g_helicopterSpawn.z +
         std::cos(patrolPhase) * (kHelicopterPatrolRadius * 0.68f) +
         std::cos(g_helicopterHoverTime * 0.27f) * 0.55f;
 
@@ -749,6 +779,29 @@ static bool SpawnBandit() {
 
     auto bandit = std::make_unique<SkinnedEnemy>();
     if (!bandit->Init(g_banditModel)) return false;
+
+    if (g_customLevelMode) {
+        size_t spawnIndex = 0;
+        for (const LevelEntity& entity : g_runtimeLevel.entities) {
+            if (!entity.enabled || entity.type != LevelEntityType::EnemySpawn) continue;
+            if (spawnIndex++ != slot) continue;
+            bandit->position = { entity.transform.position[0],
+                                 entity.transform.position[1],
+                                 entity.transform.position[2] };
+            bandit->yaw = XMConvertToRadians(entity.transform.rotation[1]);
+            bandit->modelScale *= entity.transform.scale[0];
+            bandit->spawnSlot = static_cast<int>(slot);
+            bandit->leftArmReach = g_banditLeftArmReach;
+            bandit->orbitRadius = 4.4f + static_cast<float>(slot % 4) * 0.45f;
+            bandit->orbitDirection = (slot & 1) ? -1.0f : 1.0f;
+            bandit->fireCooldown = 0.7f +
+                ((float)std::rand() / (float)RAND_MAX) * 2.8f;
+            bandit->PlayClip("Walk");
+            g_bandits.push_back(std::move(bandit));
+            return true;
+        }
+        return false;
+    }
 
     const size_t spawner = slot / kEnemiesPerSpawner;
     const size_t member = slot % kEnemiesPerSpawner;
@@ -1371,13 +1424,28 @@ static bool  firstMouse   = true;
 static bool  ignoreNextMouseMove = false;
 static bool  showUI        = true;
 static bool  cameraLocked  = true;
-enum class GameScreen { MainMenu, Level1, WinScreen };
+enum class GameScreen { MainMenu, Level1, LevelEditor, WinScreen };
 static GameScreen gameScreen = GameScreen::MainMenu;
+static bool IsEditorEditing() {
+    return gameScreen == GameScreen::LevelEditor && !g_levelEditor.IsPlaying();
+}
+static bool IsEditorPlaying() {
+    return gameScreen == GameScreen::LevelEditor && g_levelEditor.IsPlaying();
+}
+static bool IsSceneScreen() {
+    return gameScreen == GameScreen::Level1 || gameScreen == GameScreen::LevelEditor;
+}
+static bool IsGameplayScreen() {
+    return gameScreen == GameScreen::Level1 || IsEditorPlaying();
+}
 static float levelElapsedSeconds = 0.0f;
 static bool  levelTimerRunning = false;
 static bool  deathCursorReleased = false;
 static bool  pendingLevelRuntimeReset = false;
 static bool  pendingTurretGunnerRespawn = false;
+static bool  pendingEditorBeginPlay = false;
+static bool  pendingEditorStopPlay = false;
+static bool  pendingEditorReturnToMenu = false;
 static bool  isFullscreen  = false;
 static RECT  windowedRect  = {};
 static DWORD windowedStyle = 0;
@@ -1410,6 +1478,14 @@ static constexpr std::array<PalmSpawn, 6> kStressHousePalmSpawns = {{
 
 static void ResetPalmTrees() {
     g_trees.Initialize();
+    if (g_customLevelMode) {
+        for (const LevelEntity& entity : g_runtimeLevel.entities) {
+            if (!entity.enabled || entity.type != LevelEntityType::Palm) continue;
+            g_trees.Plant(entity.transform.position[0], entity.transform.position[2],
+                entity.transform.scale[1], entity.transform.rotation[2]);
+        }
+        return;
+    }
     for (const PalmSpawn& palm : kPalmSpawns)
         g_trees.Plant(palm.x, palm.z, palm.height * 2.0f, palm.lean);
     if (g_stressTestMode) {
@@ -1423,63 +1499,46 @@ static bool g_environmentStressMode = false;
 
 static bool LoadFernModel() {
     if (g_fernModel) return true;
-    const std::string root = "models/fbx_Dandelion/";
-    auto model = FBXImporter::Load(root + "Dandelion.FBX",
+    const std::string root = "models/ferns/";
+    const std::string textures = root +
+        "Fern_Plant_Preview__FREE_Model_TEXTURES/";
+    auto model = FBXImporter::Load(root + "Fern_Plant_Preview_FREE_Model.fbx",
         g_dx12.device, g_dx12.commandList, 1.0f, false, false);
     if (!model) {
-        std::cerr << "Failed to load dandelion foliage model\n";
+        std::cerr << "Failed to load fern foliage model\n";
         return false;
     }
 
     auto material = std::make_shared<SceneMaterial>();
-    material->name = "Dandelion foliage";
+    material->name = "Fern foliage";
     material->metallicFactor = 0.0f;
     material->roughnessFactor = 1.0f;
     material->doubleSided = true;
     material->alphaCutout = true;
     material->disableOcclusionCulling = true;
 
-    // Source is a JPEG photographed on white. Derive a hard cutout alpha from
-    // distance to white so only leaf/stem geometry survives on the cards.
     std::vector<unsigned char> albedo;
+    std::vector<unsigned char> opacity;
     int aw = 0, ah = 0;
-    if (GLBImporter::LoadPixelsRGBA(root + "dandelion_leaf.jpg",
-                                    albedo, aw, ah)) {
+    int ow = 0, oh = 0;
+    if (GLBImporter::LoadPixelsRGBA(textures +
+            "Fern_Plant_Preview_FREE_Model_BASE_COLOR_(Albedo)_MAP.png",
+            albedo, aw, ah) &&
+        GLBImporter::LoadPixelsRGBA(textures +
+            "Fern_Plant_Preview_FREE_Model_OPACITY_MAP.png",
+            opacity, ow, oh) && aw == ow && ah == oh) {
         const size_t pixelCount = static_cast<size_t>(aw) * ah;
-        std::vector<unsigned char> mask(pixelCount, 0);
         for (size_t pixel = 0; pixel < pixelCount; ++pixel) {
             const size_t i = pixel * 4;
-            const int darkest = (std::min)({ static_cast<int>(albedo[i]),
-                static_cast<int>(albedo[i + 1]),
-                static_cast<int>(albedo[i + 2]) });
-            mask[pixel] = darkest < 220 ? 255 : 0;
-        }
-        // Erode one texel of photographed white fringe. Also bleed a dark leaf
-        // green into transparent texels so bilinear filtering cannot mix white
-        // JPEG background into the surviving cutout edge.
-        for (int y = 0; y < ah; ++y) for (int x = 0; x < aw; ++x) {
-            const size_t pixel = static_cast<size_t>(y) * aw + x;
-            bool opaque = mask[pixel] != 0;
-            if (opaque && x > 0 && x + 1 < aw && y > 0 && y + 1 < ah) {
-                for (int oy = -1; oy <= 1 && opaque; ++oy)
-                    for (int ox = -1; ox <= 1; ++ox)
-                        if (!mask[static_cast<size_t>(y + oy) * aw + x + ox]) {
-                            opaque = false;
-                            break;
-                        }
-            }
-            const size_t i = pixel * 4;
-            albedo[i + 3] = opaque ? 255 : 0;
-            if (!opaque) {
-                albedo[i] = 48;
-                albedo[i + 1] = 82;
-                albedo[i + 2] = 24;
-            }
+            albedo[i + 3] = opacity[i];
         }
         material->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
             g_dx12.device.Get(), g_dx12.commandList.Get(), albedo, aw, ah,
             material->uploadHeaps);
     }
+    material->normalTexture = GLBImporter::LoadTextureFromFile(textures +
+        "Fern_Plant_Preview_FREE_Model_NORMAL_MAP.png", g_dx12.device,
+        g_dx12.commandList, material->uploadHeaps);
 
     XMFLOAT3 boundsMin(FLT_MAX, FLT_MAX, FLT_MAX);
     XMFLOAT3 boundsMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
@@ -1612,6 +1671,31 @@ static void ScatterFerns(
             g_fernInstances.push_back(instance);
         }
     }
+    if (g_customLevelMode) {
+        for (const LevelEntity& entity : g_runtimeLevel.entities) {
+            if (!entity.enabled || entity.type != LevelEntityType::Fern) continue;
+            const float x = entity.transform.position[0];
+            const float z = entity.transform.position[2];
+            const float y = terrainSampler(x, z);
+            const float authoredScale = (std::max)(0.05f, entity.transform.scale[1]);
+            const float targetHeight = 0.75f * authoredScale;
+            const float scale = targetHeight / g_fernSourceHeight;
+            const XMMATRIX transform =
+                XMMatrixTranslation(-g_fernSourceCenter.x, -g_fernSourceMinY,
+                                    -g_fernSourceCenter.z) *
+                XMMatrixScaling(scale, scale, scale) *
+                XMMatrixRotationRollPitchYaw(
+                    XMConvertToRadians(entity.transform.rotation[0]),
+                    XMConvertToRadians(entity.transform.rotation[1]),
+                    XMConvertToRadians(entity.transform.rotation[2])) *
+                XMMatrixTranslation(x, y + 0.025f, z);
+            FernInstance instance;
+            XMStoreFloat4x4(&instance.transform, transform);
+            instance.center = XMFLOAT3(x, y + 0.025f + targetHeight * 0.48f, z);
+            instance.radius = targetHeight * 0.75f;
+            g_fernInstances.push_back(instance);
+        }
+    }
     std::cout << "Dandelion foliage: " << g_fernInstances.size()
               << " GPU instances\n";
 }
@@ -1627,6 +1711,50 @@ static void RebuildScalableEnvironment() {
         {-29.0f, -27.0f,-15.0f, -13.0f }
     };
     std::vector<GrassField::Exclusion> grassExclusions;
+    std::vector<GrassField::AuthoredPatch> grassPatches;
+    if (g_customLevelMode) {
+        obstacles.clear();
+        obstacles.push_back({-29.0f, -27.0f, -15.0f, -13.0f});
+        for (const LevelEntity& entity : g_runtimeLevel.entities) {
+            if (!entity.enabled) continue;
+            if (entity.type == LevelEntityType::WoodHouse ||
+                entity.type == LevelEntityType::MetalHouse) {
+                const float yaw = XMConvertToRadians(entity.transform.rotation[1]);
+                const float c = std::abs(std::cos(yaw));
+                const float s = std::abs(std::sin(yaw));
+                const float halfX = c * 4.2f + s * 3.4f;
+                const float halfZ = s * 4.2f + c * 3.4f;
+                NavigationObstacle house{ entity.transform.position[0] - halfX,
+                    entity.transform.position[2] - halfZ,
+                    entity.transform.position[0] + halfX,
+                    entity.transform.position[2] + halfZ };
+                obstacles.push_back(house);
+                grassExclusions.push_back({ house.minX - 0.4f, house.minZ - 0.4f,
+                    house.maxX + 0.4f, house.maxZ + 0.4f });
+            } else if (entity.type == LevelEntityType::Palm) {
+                obstacles.push_back({ entity.transform.position[0] - 0.55f,
+                    entity.transform.position[2] - 0.55f,
+                    entity.transform.position[0] + 0.55f,
+                    entity.transform.position[2] + 0.55f });
+            } else if (entity.type == LevelEntityType::Humvee) {
+                const float yaw = XMConvertToRadians(entity.transform.rotation[1]);
+                const float halfX = std::abs(std::cos(yaw)) * 2.6f +
+                    std::abs(std::sin(yaw)) * 1.5f;
+                const float halfZ = std::abs(std::sin(yaw)) * 2.6f +
+                    std::abs(std::cos(yaw)) * 1.5f;
+                obstacles.push_back({ entity.transform.position[0] - halfX,
+                    entity.transform.position[2] - halfZ,
+                    entity.transform.position[0] + halfX,
+                    entity.transform.position[2] + halfZ });
+            } else if (entity.type == LevelEntityType::GrassPatch) {
+                grassPatches.push_back({ entity.transform.position[0],
+                    entity.transform.position[2],
+                    (std::max)(0.15f, entity.transform.scale[0]),
+                    (std::max)(0.05f, entity.transform.scale[1]),
+                    static_cast<uint32_t>(entity.id) });
+            }
+        }
+    } else {
     const size_t houseCount = g_stressTestMode ? kStressHouseCount : 4;
     size_t houseIndex = 0;
     const size_t compoundCount = (houseCount + kSpawnersPerCompound - 1) /
@@ -1666,14 +1794,16 @@ static void RebuildScalableEnvironment() {
                 { palm.x - 0.55f, palm.z - 0.55f,
                   palm.x + 0.55f, palm.z + 0.55f });
     }
-    const float extent = g_stressTestMode ? 122.0f : 61.0f;
+    }
+    const float extent = g_customLevelMode ? 122.0f :
+        (g_stressTestMode ? 122.0f : 61.0f);
     if (!g_navigation.BuildTerrain(terrainSampler, -extent, extent,
             -extent, extent, obstacles))
         std::cerr << "Recast navigation build failed; Bandits use direct steering\n";
 
     g_grass.Initialize(terrainSampler,
         g_stressTestMode ? 200.0f : 100.0f,
-        g_stressTestMode ? 1600000 : 400000, 0.0f, grassExclusions);
+        g_stressTestMode ? 1600000 : 400000, 0.0f, grassExclusions, grassPatches);
     ScatterFerns(terrainSampler, grassExclusions);
     g_environmentInitialized = true;
     g_environmentStressMode = g_stressTestMode;
@@ -1683,7 +1813,7 @@ static void UpdateHelicopterHoverAudio() {
     const bool primaryActive = !g_helicopterDead && !g_helicopterCrashed;
     const bool secondaryActive = g_stressTestMode &&
         !g_secondaryHelicopterDead && !g_secondaryHelicopterCrashed;
-    const bool active = gameScreen == GameScreen::Level1 &&
+    const bool active = IsGameplayScreen() &&
         scene.showHelicopter && (primaryActive || secondaryActive) &&
         (scene.playerGodMode || scene.playerHealth > 0.0f);
     auto distanceToCamera = [](const XMFLOAT3& position) {
@@ -1716,6 +1846,53 @@ static void OpenMainMenu() {
     SetCursorVisible(true);
 }
 
+static const LevelEntity* FirstRuntimeEntity(LevelEntityType type) {
+    auto it = std::find_if(g_runtimeLevel.entities.begin(), g_runtimeLevel.entities.end(),
+        [&](const LevelEntity& entity) { return entity.enabled && entity.type == type; });
+    return it == g_runtimeLevel.entities.end() ? nullptr : &*it;
+}
+
+static void ApplyRuntimeLevelBasics(bool movePlayer) {
+    if (!g_customLevelMode) return;
+    scene.terrainHeightScale = g_runtimeLevel.terrainHeightScale;
+    scene.explosiveBarrels.clear();
+    for (const LevelEntity& entity : g_runtimeLevel.entities) {
+        if (!entity.enabled || entity.type != LevelEntityType::ExplosiveBarrel) continue;
+        scene.explosiveBarrels.push_back({{ entity.transform.position[0],
+                                            entity.transform.position[1],
+                                            entity.transform.position[2] }});
+    }
+    if (const LevelEntity* humvee = FirstRuntimeEntity(LevelEntityType::Humvee)) {
+        g_primaryHumveeSpawn = { humvee->transform.position[0],
+                                 humvee->transform.position[1],
+                                 humvee->transform.position[2] };
+        g_primaryHumveeYaw = humvee->transform.rotation[1];
+    }
+    if (const LevelEntity* helicopter = FirstRuntimeEntity(LevelEntityType::Helicopter)) {
+        g_helicopterSpawn = { helicopter->transform.position[0],
+                              helicopter->transform.position[1],
+                              helicopter->transform.position[2] };
+        g_helicopterPosition = g_helicopterSpawn;
+        g_helicopterLevelScale = helicopter->transform.scale[0];
+        g_helicopterYaw = XMConvertToRadians(helicopter->transform.rotation[1]);
+        scene.showHelicopter = true;
+    } else { scene.showHelicopter = false; g_helicopterLevelScale = 1.0f; }
+    if (movePlayer) {
+        if (const LevelEntity* player = FirstRuntimeEntity(LevelEntityType::PlayerSpawn)) {
+            scene.camera = Camera({ player->transform.position[0],
+                                    player->transform.position[1],
+                                    player->transform.position[2] });
+            scene.camera.Yaw = player->transform.rotation[1] - 90.0f;
+            scene.camera.Pitch = player->transform.rotation[0];
+            scene.camera.ProcessMouseMovement(0.0f, 0.0f);
+        }
+    }
+}
+
+static void SynchronizeEditorRuntime(bool play);
+static void StartLevelEditor(HWND hwnd);
+static void StopEditorPlaytest();
+
 static void OpenWinScreen() {
     levelTimerRunning = false;
     gameScreen = GameScreen::WinScreen;
@@ -1726,8 +1903,21 @@ static void OpenWinScreen() {
 }
 
 static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
-                          bool emptyLevel = false) {
+                          bool emptyLevel = false,
+                          const LevelDefinition* customLevel = nullptr) {
     gameScreen = GameScreen::Level1;
+    g_customLevelMode = !stressTest && !emptyLevel;
+    if (customLevel) {
+        g_customLevelMode = true;
+        g_runtimeLevel = *customLevel;
+        g_activeCustomLevelName = customLevel->name;
+    } else {
+        g_activeCustomLevelName.clear();
+        if (g_customLevelMode) g_runtimeLevel = MakeLevelOneTemplate();
+    }
+    g_primaryHumveeSpawn = { 0.0f, 3.45f, 0.0f };
+    g_primaryHumveeYaw = 0.0f;
+    g_helicopterLevelScale = 1.0f;
     g_emptyLevelMode = emptyLevel;
     g_stressTestMode = stressTest && !emptyLevel;
     const bool modeAssetsLoaded = g_emptyLevelMode
@@ -1737,6 +1927,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     levelElapsedSeconds = 0.0f;
     levelTimerRunning = modeAssetsLoaded;
     if (!modeAssetsLoaded) BeginLevelLoading();
+    g_pendingEnvironmentRebuild = modeAssetsLoaded && g_customLevelMode;
     scene.playerGodMode = godMode;
     scene.RestorePlayerHealth();
     scene.ResetLevelRuntimeState();
@@ -1764,6 +1955,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_helicopterDead = false;
     g_helicopterCrashed = false;
     g_helicopterPosition = { 0.0f, 14.0f, 0.0f };
+    g_helicopterSpawn = g_helicopterPosition;
     g_helicopterCrashVelocity = { 0.0f, 0.0f, 0.0f };
     g_secondaryHelicopterYaw = 0.0f;
     g_secondaryHelicopterPitch = 0.0f;
@@ -1780,6 +1972,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_banditVoiceCooldown = 0.0f;
     g_banditPainCooldown = 0.0f;
     g_suppressFireUntilMouseRelease = true;
+    ApplyRuntimeLevelBasics(true);
     if (modeAssetsLoaded)
         scene.rebuildDestructionRequested = true;
     pendingLevelRuntimeReset = modeAssetsLoaded;
@@ -1800,6 +1993,49 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     firstMouse = true;
 }
 
+static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path) {
+    LevelLoadResult loaded = LoadLevel(path);
+    if (!loaded.ok) {
+        g_mainMenuLevelStatus = "Load failed: " + loaded.error;
+        return;
+    }
+    g_mainMenuLevelStatus.clear();
+    StartLevelOne(hwnd, false, false, false, &loaded.level);
+}
+
+static void BrowseAndStartCustomLevel(HWND hwnd) {
+    std::error_code error;
+    std::filesystem::create_directories("levels", error);
+    const std::wstring initialDirectory =
+        std::filesystem::absolute("levels", error).wstring();
+    wchar_t selected[MAX_PATH] = {};
+    OPENFILENAMEW dialog = {};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = hwnd;
+    dialog.lpstrFilter = L"Level JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
+    dialog.lpstrFile = selected;
+    dialog.nMaxFile = static_cast<DWORD>(std::size(selected));
+    dialog.lpstrInitialDir = initialDirectory.c_str();
+    dialog.lpstrDefExt = L"json";
+    dialog.lpstrTitle = L"Load Custom Level";
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
+        OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
+    if (GetOpenFileNameW(&dialog)) {
+        StartCustomLevel(hwnd, std::filesystem::path(selected));
+    } else if (const DWORD code = CommDlgExtendedError()) {
+        g_mainMenuLevelStatus = "File browser failed: " + std::to_string(code);
+    }
+}
+
+static void RestartActiveLevel(HWND hwnd) {
+    if (!g_activeCustomLevelName.empty()) {
+        const LevelDefinition custom = g_runtimeLevel;
+        StartLevelOne(hwnd, false, false, false, &custom);
+    } else {
+        StartLevelOne(hwnd, false);
+    }
+}
+
 static void RenderLoadingScreen();
 
 static void RenderMainMenu(HWND hwnd) {
@@ -1808,7 +2044,8 @@ static void RenderMainMenu(HWND hwnd) {
         ImVec2(0, 0), display, IM_COL32(5, 9, 12, 225));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(430.0f, 493.0f), ImGuiCond_Always);
+    const float menuHeight = (std::min)(650.0f, display.y - 24.0f);
+    ImGui::SetNextWindowSize(ImVec2(430.0f, menuHeight), ImGuiCond_Always);
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse;
@@ -1829,6 +2066,16 @@ static void RenderMainMenu(HWND hwnd) {
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("LEVEL 1 - GOD MODE", ImVec2(300.0f, 58.0f)))
         StartLevelOne(hwnd, true);
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    ImGui::SetCursorPosX(65.0f);
+    if (ImGui::Button("LEVEL EDITOR", ImVec2(300.0f, 58.0f)))
+        StartLevelEditor(hwnd);
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    ImGui::SetCursorPosX(65.0f);
+    if (ImGui::Button("CUSTOM LEVELS", ImVec2(300.0f, 58.0f)))
+        BrowseAndStartCustomLevel(hwnd);
+    if (!g_mainMenuLevelStatus.empty())
+        ImGui::TextWrapped("%s", g_mainMenuLevelStatus.c_str());
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("EMPTY", ImVec2(300.0f, 58.0f)))
@@ -1857,8 +2104,10 @@ static void RenderLoadingScreen() {
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoInputs;
     ImGui::Begin("Loading Level", nullptr, flags);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    const char* title = g_emptyLevelMode ? "LOADING EMPTY"
-        : (g_stressTestMode ? "LOADING STRESS TEST" : "LOADING LEVEL 1");
+    const char* title = gameScreen == GameScreen::LevelEditor ? "LOADING LEVEL EDITOR" :
+        (g_emptyLevelMode ? "LOADING EMPTY"
+        : (g_stressTestMode ? "LOADING STRESS TEST" :
+           (!g_activeCustomLevelName.empty() ? "LOADING CUSTOM LEVEL" : "LOADING LEVEL 1")));
     ImGui::SetCursorPosX((680.0f - ImGui::CalcTextSize(title).x) * 0.5f);
     ImGui::TextUnformatted(title);
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
@@ -1959,8 +2208,9 @@ static void RenderDeathScreen(HWND hwnd) {
     ImGui::TextColored(ImVec4(1.0f, 0.12f, 0.08f, 1.0f), "%s", died);
     ImGui::Dummy(ImVec2(0.0f, 20.0f));
     ImGui::SetCursorPosX(45.0f);
-    if (ImGui::Button("RESTART LEVEL 1", ImVec2(300.0f, 55.0f)))
-        StartLevelOne(hwnd, false);
+    if (ImGui::Button(g_activeCustomLevelName.empty() ? "RESTART LEVEL 1" :
+            "RESTART CUSTOM LEVEL", ImVec2(300.0f, 55.0f)))
+        RestartActiveLevel(hwnd);
     ImGui::Dummy(ImVec2(0.0f, 9.0f));
     ImGui::SetCursorPosX(45.0f);
     if (ImGui::Button("MAIN MENU", ImVec2(300.0f, 45.0f)))
@@ -1999,8 +2249,9 @@ static void RenderWinScreen(HWND hwnd) {
     ImGui::TextUnformatted(timeText);
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
     ImGui::SetCursorPosX(55.0f);
-    if (ImGui::Button("REPLAY LEVEL 1", ImVec2(300.0f, 55.0f)))
-        StartLevelOne(hwnd, false);
+    if (ImGui::Button(g_activeCustomLevelName.empty() ? "REPLAY LEVEL 1" :
+            "REPLAY CUSTOM LEVEL", ImVec2(300.0f, 55.0f)))
+        RestartActiveLevel(hwnd);
     ImGui::Dummy(ImVec2(0.0f, 9.0f));
     ImGui::SetCursorPosX(55.0f);
     if (ImGui::Button("MAIN MENU", ImVec2(300.0f, 45.0f)))
@@ -3043,12 +3294,13 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
     };
 
     auto addHouse = [&](const std::vector<std::shared_ptr<SceneNode>>& source,
-                        float sourceX, float sourceZ, float targetX, float targetZ,
+                        float sourceX, float sourceZ, float targetX, float targetY,
+                        float targetZ,
                         float yaw, int groupOffset) {
         const XMMATRIX transform =
             XMMatrixTranslation(-sourceX, 0.0f, -sourceZ) *
             XMMatrixRotationY(yaw) *
-            XMMatrixTranslation(targetX, 0.0f, targetZ);
+            XMMatrixTranslation(targetX, targetY, targetZ);
         const XMMATRIX rotation = XMMatrixRotationY(yaw);
         for (size_t childIndex = 0; childIndex < source.size(); ++childIndex) {
             const auto& sourceChild = source[childIndex];
@@ -3089,6 +3341,26 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
         }
     };
 
+    if (g_customLevelMode) {
+        int groupOffset = 1000000;
+        for (const LevelEntity& entity : g_runtimeLevel.entities) {
+            if (!entity.enabled ||
+                (entity.type != LevelEntityType::WoodHouse &&
+                 entity.type != LevelEntityType::MetalHouse)) continue;
+            const bool wood = entity.type == LevelEntityType::WoodHouse;
+            addHouse(wood ? woodTemplate : metalTemplate,
+                wood ? -3.5f : 4.75f, wood ? 3.5f : 3.55f,
+                entity.transform.position[0], entity.transform.position[1],
+                entity.transform.position[2],
+                XMConvertToRadians(entity.transform.rotation[1]), groupOffset);
+            groupOffset += 1000000;
+        }
+        XMFLOAT4X4 identity;
+        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+        root->UpdateGlobalTransform(identity);
+        return;
+    }
+
     constexpr float radius = 9.0f;
     const size_t houseCount = stressTest ? kStressHouseCount : 4;
     size_t houseIndex = 0;
@@ -3099,21 +3371,103 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
         const int groupBase = static_cast<int>(compoundIndex) * 4000000;
         if (houseIndex++ < houseCount)
             addHouse(woodTemplate, -3.5f, 3.5f,
-                     center.x, center.z + radius, 0.0f, groupBase + 1000000);
+                     center.x, 0.0f, center.z + radius, 0.0f, groupBase + 1000000);
         if (houseIndex++ < houseCount)
             addHouse(metalTemplate, 4.75f, 3.55f,
-                     center.x + radius, center.z, XM_PIDIV2, groupBase + 2000000);
+                     center.x + radius, 0.0f, center.z, XM_PIDIV2, groupBase + 2000000);
         if (houseIndex++ < houseCount)
             addHouse(woodTemplate, -3.5f, 3.5f,
-                     center.x, center.z - radius, XM_PI, groupBase + 3000000);
+                     center.x, 0.0f, center.z - radius, XM_PI, groupBase + 3000000);
         if (houseIndex++ < houseCount)
             addHouse(metalTemplate, 4.75f, 3.55f,
-                     center.x - radius, center.z, -XM_PIDIV2, groupBase + 4000000);
+                     center.x - radius, 0.0f, center.z, -XM_PIDIV2, groupBase + 4000000);
     }
 
     XMFLOAT4X4 identity;
     XMStoreFloat4x4(&identity, XMMatrixIdentity());
     root->UpdateGlobalTransform(identity);
+}
+
+static void SynchronizeEditorRuntime(bool play) {
+    if (gameScreen != GameScreen::LevelEditor) return;
+    const bool foliageChanged = g_levelEditor.FoliageRuntimeDirty();
+    g_runtimeLevel = g_levelEditor.Level();
+    g_customLevelMode = true;
+    ApplyRuntimeLevelBasics(play);
+    if (g_houseTemplate) {
+        WaitForGPU();
+        wallModel = CloneSceneTree(g_houseTemplate);
+        ArrangeHousesInCross(wallModel, false);
+        if (wallModel && g_dx12.device)
+            g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
+    }
+    if (g_trees.IsInitialized()) ResetPalmTrees();
+    if ((play || foliageChanged) && g_environmentInitialized)
+        RebuildScalableEnvironment();
+    if (g_destruction.IsInitialized()) {
+        auto tp = CurrentTerrainParams();
+        tp.heightScale = scene.terrainHeightScale;
+        g_destruction.SetTerrainSampler([tp](float x, float z) {
+            return TerrainRendererDX12::HeightAt(tp, x, z);
+        });
+        if (FirstRuntimeEntity(LevelEntityType::Humvee))
+            g_destruction.InitializeVehicle(g_primaryHumveeSpawn,
+                XMConvertToRadians(g_primaryHumveeYaw));
+    }
+    g_levelEditor.MarkRuntimeSynchronized();
+    g_levelEditor.MarkFoliageRuntimeSynchronized();
+}
+
+static void StartLevelEditor(HWND hwnd) {
+    g_levelEditor.NewFromLevelOne();
+    StartLevelOne(hwnd, true);
+    gameScreen = GameScreen::LevelEditor;
+    g_customLevelMode = true;
+    g_runtimeLevel = g_levelEditor.Level();
+    g_pendingEnvironmentRebuild = false;
+    levelTimerRunning = false;
+    showUI = false;
+    cameraLocked = true;
+    scene.camera.FPSMode = false;
+    ReleaseCapture();
+    SetCursorVisible(true);
+}
+
+static void BeginEditorPlaytest(HWND hwnd) {
+    if (gameScreen != GameScreen::LevelEditor || g_levelEditor.IsPlaying()) return;
+    g_editorCameraSnapshot = scene.camera;
+    g_levelEditor.BeginPlay();
+    scene.ResetLevelRuntimeState();
+    SynchronizeEditorRuntime(true);
+    scene.playerGodMode = true;
+    scene.RestorePlayerHealth();
+    pendingLevelRuntimeReset = true;
+    levelTimerRunning = false;
+    cameraLocked = false;
+    scene.camera.FPSMode = true;
+    SetCapture(hwnd);
+    SetCursorVisible(false);
+}
+
+static void StopEditorPlaytest() {
+    if (!IsEditorPlaying()) return;
+    // Previous frame can still reference enemy vertex/index buffers. Drain GPU
+    // before destroying Bandits or rebuilding editor destruction resources.
+    WaitForGPU();
+    g_levelEditor.StopPlay();
+    g_heldBandit = nullptr;
+    g_bandits.clear();
+    scene.ResetLevelRuntimeState();
+    pendingLevelRuntimeReset = false;
+    pendingTurretGunnerRespawn = false;
+    levelTimerRunning = false;
+    scene.camera.FPSMode = false;
+    scene.camera = g_editorCameraSnapshot;
+    scene.camera.FPSMode = false;
+    cameraLocked = true;
+    ReleaseCapture();
+    SetCursorVisible(true);
+    SynchronizeEditorRuntime(false);
 }
 
 // Draw Blast/Box3D destruction state as a 2D overlay using ImGui's foreground
@@ -3659,7 +4013,7 @@ static void ApplyVirtualInput() {
 }
 
 static void ProcessInput(HWND) {
-    const bool scopeRequested = gameScreen == GameScreen::Level1 &&
+    const bool scopeRequested = IsGameplayScreen() &&
         scene.playerHealth > 0.0f && GunModel::SVDSelected() &&
         !g_drivingHumvee && !cameraLocked &&
         !(showUI && ImGui::GetIO().WantCaptureMouse) &&
@@ -3750,6 +4104,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
          msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP))
         return 0;
 
+    if (IsEditorEditing() &&
+        (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_MOUSEWHEEL))
+        return 0;
+
     switch (msg) {
     case WM_SIZE:
         if (g_dx12.device && g_dx12.initialized && wParam != SIZE_MINIMIZED) {
@@ -3811,6 +4169,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
 
+    case WM_RBUTTONDOWN:
+        if (IsEditorEditing() && !ImGui::GetIO().WantCaptureMouse) {
+            cameraLocked = false;
+            SetCapture(hwnd);
+            SetCursorVisible(false);
+            firstMouse = true;
+        }
+        return 0;
+
+    case WM_RBUTTONUP:
+        if (IsEditorEditing()) {
+            cameraLocked = true;
+            ReleaseCapture();
+            SetCursorVisible(true);
+        }
+        return 0;
+
     case WM_LBUTTONDOWN:
         if (!ImGui::GetIO().WantCaptureMouse) {
             if (g_drivingHumvee) {
@@ -3843,8 +4218,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
-            if (gameScreen != GameScreen::MainMenu) OpenMainMenu();
+            if (IsEditorPlaying()) pendingEditorStopPlay = true;
+            else if (IsEditorEditing()) {
+                if (!g_levelEditor.IsDirty()) OpenMainMenu();
+            }
+            else if (gameScreen != GameScreen::MainMenu) OpenMainMenu();
             else PostQuitMessage(0);
+        }
+        else if (IsEditorEditing()) {
+            const bool controlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            if (!(GetAsyncKeyState(VK_RBUTTON) & 0x8000))
+                g_levelEditor.OnKeyDown(static_cast<unsigned>(wParam), controlDown);
         }
         else if (wParam == VK_TAB) {
             showUI = !showUI;
@@ -4239,13 +4623,50 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         deltaTime = now - lastTime;
         lastTime  = now;
 
+        if (pendingEditorStopPlay) {
+            pendingEditorStopPlay = false;
+            StopEditorPlaytest();
+        }
+        if (pendingEditorBeginPlay) {
+            pendingEditorBeginPlay = false;
+            BeginEditorPlaytest(hwnd);
+        }
+        if (pendingEditorReturnToMenu) {
+            pendingEditorReturnToMenu = false;
+            g_customLevelMode = false;
+            OpenMainMenu();
+        }
+        if (g_pendingEnvironmentRebuild && IsSceneScreen() &&
+            !levelLoadingActive && g_environmentInitialized) {
+            WaitForGPU();
+            RebuildScalableEnvironment();
+            if (g_trees.IsInitialized()) ResetPalmTrees();
+            g_pendingEnvironmentRebuild = false;
+        }
+        if (IsEditorEditing() && !levelLoadingActive &&
+            g_levelEditor.RuntimeDirty())
+            SynchronizeEditorRuntime(false);
+
+        if (IsEditorEditing() && !cameraLocked &&
+            !ImGui::GetIO().WantCaptureKeyboard) {
+            const float speed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) ? 3.0f : 1.0f;
+            if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, speed);
+            if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, speed);
+            if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, speed);
+            if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, speed);
+            if (GetAsyncKeyState(VK_SPACE) & 0x8000)
+                scene.camera.Position.y += scene.camera.MovementSpeed * speed * deltaTime;
+            if (GetAsyncKeyState('Q') & 0x8000)
+                scene.camera.Position.y -= scene.camera.MovementSpeed * speed * deltaTime;
+        }
+
         UpdateHelicopterHoverAudio();
 
         g_profiler.BeginCpuFrame();
         {
         ProfilerDX12::CpuScope updateProfile(g_profiler, "Update");
 
-        if (gameScreen == GameScreen::Level1 && !levelLoadingActive &&
+        if (IsGameplayScreen() && !levelLoadingActive &&
             (scene.playerGodMode || scene.playerHealth > 0.0f)) {
 
         if (pendingLevelRuntimeReset) {
@@ -4264,7 +4685,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (!g_emptyLevelMode) {
                 for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
                     if (!SpawnBandit()) break;
-                pendingTurretGunnerRespawn = true;
+                pendingTurretGunnerRespawn = !g_customLevelMode ||
+                    FirstRuntimeEntity(LevelEntityType::Humvee) != nullptr;
             } else {
                 pendingTurretGunnerRespawn = false;
             }
@@ -4335,7 +4757,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_destruction.SetSplashCallback([](float x, float z, float s) {
                     g_water.Splash(x, z, s);
                 });
-                g_destruction.InitializeVehicle({ 0.0f, 3.45f, 0.0f });
+                g_destruction.InitializeVehicle(g_customLevelMode
+                    ? g_primaryHumveeSpawn : XMFLOAT3{ 0.0f, 3.45f, 0.0f },
+                    g_customLevelMode ? XMConvertToRadians(g_primaryHumveeYaw) : 0.0f);
             }
         }
         // Dead Bandits stay attached to their ragdolls. No mid-level respawns.
@@ -4830,7 +5254,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 }
             }
         }
-        if (!g_emptyLevelMode && g_banditLoaded && !pendingTurretGunnerRespawn &&
+        if (gameScreen == GameScreen::Level1 && !g_emptyLevelMode && g_banditLoaded &&
+            !pendingTurretGunnerRespawn &&
             LiveBanditCount() == 0 && g_helicopterDead &&
             (!g_stressTestMode || g_secondaryHelicopterDead))
             OpenWinScreen();
@@ -4913,7 +5338,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         mainShader.BeginFrame();
         mainShader.SetPalmWindFrame(g_trees.GetWindFrame());
         g_meshShader.BeginFrame();
-        hzbCaptureActive = gameScreen == GameScreen::Level1 &&
+        hzbCaptureActive = IsSceneScreen() &&
             !levelLoadingActive && !usingRaytracing && !msaaActive &&
             (g_useMeshShader || usingVisibility);
         if (!hzbCaptureActive) occlusionDepth.InvalidateCameraHistory();
@@ -4927,7 +5352,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             hzbHistoryUsable,
             occlusionDepth.GetMipCount());
 
-        if (gameScreen == GameScreen::Level1 && levelLoadingActive) {
+        if (IsSceneScreen() && levelLoadingActive) {
         if (levelLoadStage == LevelLoadStage::WorldAssets) {
             LoadFloorMudMaterial();
             if (!g_emptyLevelMode) {
@@ -4948,11 +5373,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 ApplyHouseTextures(houseTemplate, g_dx12.device.Get(),
                     g_dx12.commandList.Get());
                 AppendRoofChunksToDestructionModel(houseTemplate);
+                g_houseTemplate = CloneSceneTree(houseTemplate);
                 normalWallModel = CloneSceneTree(houseTemplate);
                 stressWallModel = CloneSceneTree(houseTemplate);
+                const bool customLayout = g_customLevelMode;
+                g_customLevelMode = false;
                 ArrangeHousesInCross(normalWallModel, false);
                 ArrangeHousesInCross(stressWallModel, true);
-                wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
+                g_customLevelMode = customLayout;
+                if (customLayout) {
+                    wallModel = CloneSceneTree(houseTemplate);
+                    ArrangeHousesInCross(wallModel, false);
+                } else wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
 
                 // Chunk meshlets, Blast actors, Box3D bodies, and merged actor
                 // geometry are CPU/device creation work. D3D12 device creation
@@ -5031,7 +5463,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_destruction.SetSplashCallback([](float x, float z, float s) {
                     g_water.Splash(x, z, s);
                 });
-                g_destruction.InitializeVehicle({ 0.0f, 3.45f, 0.0f });
+                g_destruction.InitializeVehicle(g_customLevelMode
+                    ? g_primaryHumveeSpawn : XMFLOAT3{ 0.0f, 3.45f, 0.0f },
+                    g_customLevelMode ? XMConvertToRadians(g_primaryHumveeYaw) : 0.0f);
 
                 // Palm grove ringing the pool. Shoot through a trunk and the tree
                 // snaps at that height and topples away from you.
@@ -5255,11 +5689,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         XMMATRIX fogLightSpace = XMMatrixIdentity();
         ID3D12Resource* fogShadowResource = nullptr;
         bool renderedScene = false;
-        if (gameScreen == GameScreen::Level1 && !levelLoadingActive &&
+        if (IsSceneScreen() && !levelLoadingActive &&
             usingRaytracing) {
             ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());
             RenderRaytracing(scene);
-        } else if (gameScreen == GameScreen::Level1 && !levelLoadingActive &&
+        } else if (IsSceneScreen() && !levelLoadingActive &&
                    usingVisibility) {
             ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
             XMMATRIX lightSpace = XMMatrixIdentity();
@@ -5288,7 +5722,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 RenderForward(scene, mainShader, geo, crateModel, floorMaterial,
                     lightSpace, shadowResource, true, !grassMSAAActive);
             }
-        } else if (gameScreen == GameScreen::Level1 && !levelLoadingActive) {
+        } else if (IsSceneScreen() && !levelLoadingActive) {
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
@@ -5463,6 +5897,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             RenderMainMenu(hwnd);
         } else if (gameScreen == GameScreen::WinScreen) {
             RenderWinScreen(hwnd);
+        } else if (gameScreen == GameScreen::LevelEditor) {
+            const LevelEditorActions actions = g_levelEditor.Render(scene.camera,
+                scene.GetViewMatrix(), scene.GetProjectionMatrix(),
+                [](float x, float z) {
+                    if (!scene.useMeshTerrain || !g_terrain.supported) return 0.0f;
+                    auto params = CurrentTerrainParams();
+                    params.heightScale = scene.terrainHeightScale;
+                    return TerrainRendererDX12::HeightAt(params, x, z);
+                });
+            pendingEditorBeginPlay = actions.beginPlay;
+            pendingEditorStopPlay = actions.stopPlay;
+            pendingEditorReturnToMenu = actions.returnToMenu;
+            if (g_levelEditor.IsPlaying()) RenderPlayerHUD(scene);
         } else {
             RenderPlayerHUD(scene);
             if (!scene.playerGodMode && scene.playerHealth <= 0.0f) {

@@ -52,6 +52,8 @@ option(USE_DX12 "Build with DirectX 12 instead of DirectX 11" ON)
 
 # Find imgui package (for ImGui)
 find_package(imgui CONFIG)
+find_package(imguizmo CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
 find_package(meshoptimizer CONFIG REQUIRED)
 find_package(tinyexr CONFIG REQUIRED)
 find_package(assimp CONFIG REQUIRED)
@@ -98,6 +100,8 @@ set(HEADER_FILES
     src/GLBImporter.h
     src/VisibilityBufferDX12.h
     src/Scene.h
+    src/LevelDefinition.h
+    src/LevelEditor.h
     src/ForwardRenderer.h
     src/ShadowMapDX12.h
     src/IdTechRenderer.h
@@ -207,6 +211,8 @@ if(USE_DX12)
         src/DrMp3.cpp
         src/NavigationSystem.cpp
         src/DestructionDX12.cpp
+        src/LevelDefinition.cpp
+        src/LevelEditor.cpp
         ${HEADER_FILES}
         ${SHADER_FILES}
     )
@@ -217,6 +223,8 @@ if(USE_DX12)
         Rpcrt4
         xaudio2
         imgui::imgui
+        imguizmo::imguizmo
+        nlohmann_json::nlohmann_json
         meshoptimizer::meshoptimizer
         unofficial::tinyexr::tinyexr
         assimp::assimp
@@ -241,6 +249,16 @@ else()
         imgui::imgui
     )
     target_include_directories(GraphicEngine PRIVATE ${TINYGLTF_INCLUDE_DIRS})
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(LevelDefinitionTests
+        tests/LevelDefinitionTests.cpp
+        src/LevelDefinition.cpp)
+    target_include_directories(LevelDefinitionTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(LevelDefinitionTests PRIVATE nlohmann_json::nlohmann_json)
+    add_test(NAME LevelDefinitionTests COMMAND LevelDefinitionTests)
 endif()
 
 if(MSVC)
