@@ -1,0 +1,6 @@
+Leafy Grass texture by Charlotte Baglioni / Poly Haven
+Source: https://polyhaven.com/a/leafy_grass
+License: CC0 1.0 Universal
+https://creativecommons.org/publicdomain/zero/1.0/
+
+Included maps: 1K diffuse, OpenGL normal, roughness.

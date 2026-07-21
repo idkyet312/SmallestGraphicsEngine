@@ -36,13 +36,13 @@ extern std::shared_ptr<SceneNode> g_explosiveBarrelShadowModel;
 extern std::shared_ptr<SceneNode> g_humveeModel;
 extern std::shared_ptr<SceneNode> g_humveeShadowModel;
 extern std::shared_ptr<SceneNode> g_helicopterModel;
-struct FernInstance {
+struct DandelionInstance {
     DirectX::XMFLOAT4X4 transform;
     DirectX::XMFLOAT3 center;
     float radius = 1.0f;
 };
-extern std::shared_ptr<SceneNode> g_fernModel;
-extern std::vector<FernInstance> g_fernInstances;
+extern std::shared_ptr<SceneNode> g_dandelionModel;
+extern std::vector<DandelionInstance> g_dandelionInstances;
 extern ID3D12Resource* g_skyEnvironmentResource;
 extern ID3D12Resource* g_specularEnvironmentResource;
 extern ID3D12Resource* g_brdfIntegrationResource;
@@ -901,7 +901,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         ? XMMatrixScaling(6.4f, 1.0f, 6.4f)
         : XMMatrixIdentity();
     shader.SetMatrices(model, view, proj, lightSpace);
-    if (floorMaterial && floorMaterial->baseColorTexture) {
+    if (scene.useMeshTerrain && g_terrain.supported) {
+        shader.SetTerrainMaterial();
+    } else if (floorMaterial && floorMaterial->baseColorTexture) {
         shader.SetObjectMaterial(scene.floor.color,
                                  true,
                                  floorMaterial->normalTexture != nullptr,
@@ -924,7 +926,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             terrainParams.tilesZ = 32;
             terrainParams.islandScale = 2.0f;
         }
-        g_terrain.Draw(terrainParams);
+        g_terrain.Draw(shader, terrainParams);
         // Terrain used the mesh pipeline; restore the IA pipeline for the
         // raster draws that follow (same pattern as imported-model draws).
         g_dx12.commandList->SetPipelineState(
@@ -1044,26 +1046,29 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.Use(scene.wireframeMode);
     }
 
-    // Fern cards use the regular lit foliage material, but share one model and
+    // Dandelion cards use the regular lit foliage material, but share one model and
     // one mesh-shader dispatch. CPU work is limited to cheap distance/frustum
     // tests; no draw call is emitted per plant when mesh shaders are enabled.
-    if (!g_emptyLevelMode && g_fernModel && !g_fernInstances.empty()) {
-        XMFLOAT4 fernFrustum[6];
-        BuildFrustumPlanes(view * proj, fernFrustum);
-        static std::vector<XMMATRIX> visibleFerns;
-        visibleFerns.clear();
-        visibleFerns.reserve(g_fernInstances.size());
-        const float maxFernDistance = g_grass.IsInitialized()
+    if (!g_emptyLevelMode && g_dandelionModel && !g_dandelionInstances.empty()) {
+        XMFLOAT4 dandelionFrustum[6];
+        BuildFrustumPlanes(view * proj, dandelionFrustum);
+        static std::vector<XMMATRIX> visibleDandelions;
+        visibleDandelions.clear();
+        visibleDandelions.reserve(g_dandelionInstances.size());
+        const float maxDandelionDistance = g_grass.IsInitialized()
             ? g_grass.DrawDistance() : 28.0f;
-        for (const FernInstance& fern : g_fernInstances) {
-            const float dx = fern.center.x - scene.camera.Position.x;
-            const float dz = fern.center.z - scene.camera.Position.z;
-            const float range = maxFernDistance + fern.radius;
+        for (const DandelionInstance& dandelion : g_dandelionInstances) {
+            const float dx = dandelion.center.x - scene.camera.Position.x;
+            const float dz = dandelion.center.z - scene.camera.Position.z;
+            const float range = maxDandelionDistance + dandelion.radius;
             if (dx * dx + dz * dz > range * range ||
-                !SphereVisible(fernFrustum, fern.center, fern.radius)) continue;
-            visibleFerns.push_back(XMLoadFloat4x4(&fern.transform));
+                !SphereVisible(dandelionFrustum, dandelion.center, dandelion.radius) ||
+                g_grass.RuntimeExcluded(
+                    dandelion.center.x, dandelion.center.z,
+                    dandelion.radius)) continue;
+            visibleDandelions.push_back(XMLoadFloat4x4(&dandelion.transform));
         }
-        DrawSceneNodeInstances(g_fernModel, shader, visibleFerns,
+        DrawSceneNodeInstances(g_dandelionModel, shader, visibleDandelions,
                                view, proj, lightSpace);
         shader.Use(scene.wireframeMode);
     }

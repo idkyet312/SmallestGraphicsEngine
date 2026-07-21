@@ -372,6 +372,20 @@ public:
         return true;
     }
 
+    void ApplyExplosion(const XMFLOAT3& center, float radius) {
+        if (B3_IS_NULL(m_world) || radius <= 0.0f) return;
+        bool changed = false;
+        for (Tree& tree : m_trees) {
+            if (tree.felled) continue;
+            const float dx = tree.x - center.x;
+            const float dz = tree.z - center.z;
+            if (dx * dx + dz * dz > radius * radius) continue;
+            FellTree(tree, 0, { dx, 0.0f, dz });
+            changed = true;
+        }
+        if (changed) RebuildItems();
+    }
+
     const std::vector<TreeItem>& GetItems() const { return m_items; }
     bool IsInitialized() const { return !B3_IS_NULL(m_world); }
 

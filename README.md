@@ -42,6 +42,7 @@ DirectX 12 is the primary path. A smaller legacy DirectX 11 target remains avail
 | `W`, `A`, `S`, `D` | Move |
 | Mouse | Look |
 | `Shift` | Sprint in FPS walking mode |
+| `Ctrl` | Hold to crouch |
 | `Space` | Move upward or jump, depending on camera mode |
 | Left mouse | Capture mouse or fire weapon |
 | `G` | Throw grenade |
@@ -54,7 +55,10 @@ DirectX 12 is the primary path. A smaller legacy DirectX 11 target remains avail
 
 Rendering modes, lighting, DDGI, shadows, terrain, grass, weapon behavior, destruction debug drawing, and camera settings can be changed in the ImGui scene-controls window.
 
-Level Editor includes a terrain-aware foliage painter. Select Grass, Fern, or Trees; choose Paint or Erase; then hold left mouse over terrain. Radius, density, stroke spacing, and random scale are adjustable. `B` toggles paint/select. Each drag stroke is one undo operation, and foliage is stored in level JSON.
+Level Editor includes a terrain-aware foliage painter. Select Grass, Dandelion, or Trees; choose Paint or Erase; then hold left mouse over terrain. Radius, density, stroke spacing, and random scale are adjustable. `B` toggles paint/select. Each drag stroke is one undo operation, and foliage is stored in level JSON.
+
+
+Terrain Sculpt provides Raise, Lower, and Flatten brushes with adjustable radius, strength, and spacing. Sculpt strokes support undo/redo, affect rendering and gameplay collision, and persist in level JSON.
 
 Level Editor **Save** and **Save As** open a native save dialog rooted in `levels/`. The main-menu **Custom Levels** button opens the matching JSON file browser. Selected levels launch through the full gameplay runtime.
 

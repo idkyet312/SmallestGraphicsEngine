@@ -88,11 +88,11 @@ std::shared_ptr<SceneNode>  g_explosiveBarrelShadowModel;
 std::shared_ptr<SceneNode>  g_humveeModel;
 std::shared_ptr<SceneNode>  g_humveeShadowModel;
 std::shared_ptr<SceneNode>  g_helicopterModel;
-std::shared_ptr<SceneNode>  g_fernModel;
-std::vector<FernInstance>   g_fernInstances;
-static XMFLOAT3             g_fernSourceCenter{};
-static float                g_fernSourceMinY = 0.0f;
-static float                g_fernSourceHeight = 1.0f;
+std::shared_ptr<SceneNode>  g_dandelionModel;
+std::vector<DandelionInstance> g_dandelionInstances;
+static XMFLOAT3             g_dandelionSourceCenter{};
+static float                g_dandelionSourceMinY = 0.0f;
+static float                g_dandelionSourceHeight = 1.0f;
 std::shared_ptr<SceneNode>  g_helicopterMainRotorNode;
 std::shared_ptr<SceneNode>  g_helicopterTailRotorNode;
 std::shared_ptr<SceneNode>  g_humveeTurretNode;
@@ -167,6 +167,7 @@ NavigationSystem            g_navigation;
 static LevelEditor          g_levelEditor;
 static Camera               g_editorCameraSnapshot;
 static LevelDefinition      g_runtimeLevel = MakeLevelOneTemplate();
+static std::vector<TerrainSculptStamp> g_runtimeTerrainSculpt;
 static bool                 g_customLevelMode = false;
 static bool                 g_pendingEnvironmentRebuild = false;
 static std::string          g_activeCustomLevelName;
@@ -214,6 +215,24 @@ static TerrainRendererDX12::Params CurrentTerrainParams() {
         params.islandScale = 2.0f;
     }
     return params;
+}
+
+static void AddExplosionTerrainCrater(const XMFLOAT3& impact) {
+    if (!scene.useMeshTerrain || !g_terrain.supported ||
+        g_runtimeTerrainSculpt.size() >= 256) return;
+
+    TerrainSculptStamp crater;
+    crater.x = impact.x;
+    crater.z = impact.z;
+    crater.radius = scene.grenadeBlastRadius;
+    crater.operation = TerrainSculptOperation::Add;
+    crater.value = -1.0f;
+    crater.strength = 1.0f;
+    g_runtimeTerrainSculpt.push_back(crater);
+    g_terrain.SetSculptStamps(g_runtimeTerrainSculpt);
+    const float foliageRadius = crater.radius * 0.5f;
+    g_grass.AddRuntimeExclusion(impact.x, impact.z, foliageRadius);
+    g_trees.ApplyExplosion(impact, foliageRadius);
 }
 
 static size_t LiveBanditCount() {
@@ -1069,6 +1088,7 @@ static void DetonateBarrel(size_t firstBarrel) {
     scene.explosiveBarrels[firstBarrel].thrown = false;
     for (size_t cursor = 0; cursor < pending.size(); ++cursor) {
         const XMFLOAT3 center = scene.explosiveBarrels[pending[cursor]].position;
+        AddExplosionTerrainCrater(center);
         SpawnBarrelExplosionFX(center);
 
         for (auto& bandit : g_bandits) {
@@ -1497,20 +1517,18 @@ static void ResetPalmTrees() {
 static bool g_environmentInitialized = false;
 static bool g_environmentStressMode = false;
 
-static bool LoadFernModel() {
-    if (g_fernModel) return true;
-    const std::string root = "models/ferns/";
-    const std::string textures = root +
-        "Fern_Plant_Preview__FREE_Model_TEXTURES/";
-    auto model = FBXImporter::Load(root + "Fern_Plant_Preview_FREE_Model.fbx",
+static bool LoadDandelionModel() {
+    if (g_dandelionModel) return true;
+    const std::string root = "models/fbx_Dandelion/";
+    auto model = FBXImporter::Load(root + "Dandelion.FBX",
         g_dx12.device, g_dx12.commandList, 1.0f, false, false);
     if (!model) {
-        std::cerr << "Failed to load fern foliage model\n";
+        std::cerr << "Failed to load dandelion foliage model\n";
         return false;
     }
 
     auto material = std::make_shared<SceneMaterial>();
-    material->name = "Fern foliage";
+    material->name = "Dandelion foliage";
     material->metallicFactor = 0.0f;
     material->roughnessFactor = 1.0f;
     material->doubleSided = true;
@@ -1518,27 +1536,24 @@ static bool LoadFernModel() {
     material->disableOcclusionCulling = true;
 
     std::vector<unsigned char> albedo;
-    std::vector<unsigned char> opacity;
     int aw = 0, ah = 0;
-    int ow = 0, oh = 0;
-    if (GLBImporter::LoadPixelsRGBA(textures +
-            "Fern_Plant_Preview_FREE_Model_BASE_COLOR_(Albedo)_MAP.png",
-            albedo, aw, ah) &&
-        GLBImporter::LoadPixelsRGBA(textures +
-            "Fern_Plant_Preview_FREE_Model_OPACITY_MAP.png",
-            opacity, ow, oh) && aw == ow && ah == oh) {
+    if (GLBImporter::LoadPixelsRGBA(root + "dandelion_leaf.jpg",
+            albedo, aw, ah)) {
+        // Source JPEG has a white backdrop instead of alpha. Convert distance
+        // from white into a soft cutout while preserving the leaf colour.
         const size_t pixelCount = static_cast<size_t>(aw) * ah;
         for (size_t pixel = 0; pixel < pixelCount; ++pixel) {
             const size_t i = pixel * 4;
-            albedo[i + 3] = opacity[i];
+            const int darkness = 255 - (std::min)({
+                static_cast<int>(albedo[i]), static_cast<int>(albedo[i + 1]),
+                static_cast<int>(albedo[i + 2]) });
+            albedo[i + 3] = static_cast<unsigned char>(
+                std::clamp((darkness - 5) * 8, 0, 255));
         }
         material->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
             g_dx12.device.Get(), g_dx12.commandList.Get(), albedo, aw, ah,
             material->uploadHeaps);
     }
-    material->normalTexture = GLBImporter::LoadTextureFromFile(textures +
-        "Fern_Plant_Preview_FREE_Model_NORMAL_MAP.png", g_dx12.device,
-        g_dx12.commandList, material->uploadHeaps);
 
     XMFLOAT3 boundsMin(FLT_MAX, FLT_MAX, FLT_MAX);
     XMFLOAT3 boundsMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
@@ -1595,24 +1610,24 @@ static bool LoadFernModel() {
     };
     collectBounds(collectBounds, model);
     if (boundsMin.x == FLT_MAX || !material->baseColorTexture) {
-        std::cerr << "Fern geometry or cutout texture missing\n";
+        std::cerr << "Dandelion geometry or cutout texture missing\n";
         return false;
     }
-    g_fernSourceCenter = XMFLOAT3(
+    g_dandelionSourceCenter = XMFLOAT3(
         (boundsMin.x + boundsMax.x) * 0.5f, 0.0f,
         (boundsMin.z + boundsMax.z) * 0.5f);
-    g_fernSourceMinY = boundsMin.y;
-    g_fernSourceHeight = (std::max)(0.001f, boundsMax.y - boundsMin.y);
-    g_fernModel = std::move(model);
+    g_dandelionSourceMinY = boundsMin.y;
+    g_dandelionSourceHeight = (std::max)(0.001f, boundsMax.y - boundsMin.y);
+    g_dandelionModel = std::move(model);
     std::cout << "Dandelion foliage model ready\n";
     return true;
 }
 
-static void ScatterFerns(
+static void ScatterDandelions(
     const std::function<float(float, float)>& terrainSampler,
     const std::vector<GrassField::Exclusion>& exclusions) {
-    g_fernInstances.clear();
-    if (!g_fernModel) return;
+    g_dandelionInstances.clear();
+    if (!g_dandelionModel) return;
     uint32_t rng = 0x7f4a7c15u;
     auto random01 = [&]() {
         rng = rng * 1664525u + 1013904223u;
@@ -1626,7 +1641,7 @@ static void ScatterFerns(
     };
     const int clusterCount = g_stressTestMode ? 420 : 180;
     const float span = g_stressTestMode ? 196.0f : 96.0f;
-    g_fernInstances.reserve(clusterCount * 7);
+    g_dandelionInstances.reserve(clusterCount * 7);
     for (int cluster = 0; cluster < clusterCount; ++cluster) {
         // First clusters sit around level-one compound so foliage is visible
         // immediately; remaining clusters cover terrain deterministically.
@@ -1654,49 +1669,52 @@ static void ScatterFerns(
                              terrainSampler(x, z - 0.35f);
             if (hx * hx + hz * hz > 0.34f) continue;
             const float targetHeight = 0.544f + random01() * 0.376f;
-            const float scale = targetHeight / g_fernSourceHeight;
+            const float scale = targetHeight / g_dandelionSourceHeight;
             const float yaw = random01() * XM_2PI;
             const XMMATRIX transform =
-                XMMatrixTranslation(-g_fernSourceCenter.x, -g_fernSourceMinY,
-                                    -g_fernSourceCenter.z) *
+                XMMatrixTranslation(-g_dandelionSourceCenter.x,
+                                    -g_dandelionSourceMinY,
+                                    -g_dandelionSourceCenter.z) *
                 XMMatrixScaling(scale, scale, scale) *
                 XMMatrixRotationY(yaw) *
                 // Sink stem/pivot slightly so sloped terrain cannot expose a
                 // gap below the lowest card.
                 XMMatrixTranslation(x, y + 0.025f, z);
-            FernInstance instance;
+            DandelionInstance instance;
             XMStoreFloat4x4(&instance.transform, transform);
             instance.center = XMFLOAT3(x, y + 0.025f + targetHeight * 0.48f, z);
             instance.radius = targetHeight * 0.75f;
-            g_fernInstances.push_back(instance);
+            g_dandelionInstances.push_back(instance);
         }
     }
     if (g_customLevelMode) {
         for (const LevelEntity& entity : g_runtimeLevel.entities) {
-            if (!entity.enabled || entity.type != LevelEntityType::Fern) continue;
+            if (!entity.enabled ||
+                entity.type != LevelEntityType::Dandelion) continue;
             const float x = entity.transform.position[0];
             const float z = entity.transform.position[2];
             const float y = terrainSampler(x, z);
             const float authoredScale = (std::max)(0.05f, entity.transform.scale[1]);
             const float targetHeight = 0.75f * authoredScale;
-            const float scale = targetHeight / g_fernSourceHeight;
+            const float scale = targetHeight / g_dandelionSourceHeight;
             const XMMATRIX transform =
-                XMMatrixTranslation(-g_fernSourceCenter.x, -g_fernSourceMinY,
-                                    -g_fernSourceCenter.z) *
+                XMMatrixTranslation(-g_dandelionSourceCenter.x,
+                                    -g_dandelionSourceMinY,
+                                    -g_dandelionSourceCenter.z) *
                 XMMatrixScaling(scale, scale, scale) *
                 XMMatrixRotationRollPitchYaw(
                     XMConvertToRadians(entity.transform.rotation[0]),
                     XMConvertToRadians(entity.transform.rotation[1]),
                     XMConvertToRadians(entity.transform.rotation[2])) *
                 XMMatrixTranslation(x, y + 0.025f, z);
-            FernInstance instance;
+            DandelionInstance instance;
             XMStoreFloat4x4(&instance.transform, transform);
             instance.center = XMFLOAT3(x, y + 0.025f + targetHeight * 0.48f, z);
             instance.radius = targetHeight * 0.75f;
-            g_fernInstances.push_back(instance);
+            g_dandelionInstances.push_back(instance);
         }
     }
-    std::cout << "Dandelion foliage: " << g_fernInstances.size()
+    std::cout << "Dandelion foliage: " << g_dandelionInstances.size()
               << " GPU instances\n";
 }
 
@@ -1804,7 +1822,7 @@ static void RebuildScalableEnvironment() {
     g_grass.Initialize(terrainSampler,
         g_stressTestMode ? 200.0f : 100.0f,
         g_stressTestMode ? 1600000 : 400000, 0.0f, grassExclusions, grassPatches);
-    ScatterFerns(terrainSampler, grassExclusions);
+    ScatterDandelions(terrainSampler, grassExclusions);
     g_environmentInitialized = true;
     g_environmentStressMode = g_stressTestMode;
 }
@@ -1915,6 +1933,10 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
         g_activeCustomLevelName.clear();
         if (g_customLevelMode) g_runtimeLevel = MakeLevelOneTemplate();
     }
+    g_runtimeTerrainSculpt = g_customLevelMode
+        ? g_runtimeLevel.terrainSculpt : std::vector<TerrainSculptStamp>{};
+    g_terrain.SetSculptStamps(g_runtimeTerrainSculpt);
+    g_grass.ClearRuntimeExclusions();
     g_primaryHumveeSpawn = { 0.0f, 3.45f, 0.0f };
     g_primaryHumveeYaw = 0.0f;
     g_helicopterLevelScale = 1.0f;
@@ -3391,9 +3413,25 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
 static void SynchronizeEditorRuntime(bool play) {
     if (gameScreen != GameScreen::LevelEditor) return;
     const bool foliageChanged = g_levelEditor.FoliageRuntimeDirty();
+    const bool terrainChanged = g_levelEditor.TerrainRuntimeDirty();
     g_runtimeLevel = g_levelEditor.Level();
+    g_runtimeTerrainSculpt = g_runtimeLevel.terrainSculpt;
+    g_terrain.SetSculptStamps(g_runtimeTerrainSculpt);
+    g_grass.ClearRuntimeExclusions();
     g_customLevelMode = true;
     ApplyRuntimeLevelBasics(play);
+    if (!play && terrainChanged && !foliageChanged) {
+        if (g_destruction.IsInitialized()) {
+            auto tp = CurrentTerrainParams();
+            tp.heightScale = scene.terrainHeightScale;
+            g_destruction.SetTerrainSampler([tp](float x, float z) {
+                return TerrainRendererDX12::HeightAt(tp, x, z);
+            });
+        }
+        g_levelEditor.MarkRuntimeSynchronized();
+        g_levelEditor.MarkTerrainRuntimeSynchronized();
+        return;
+    }
     if (g_houseTemplate) {
         WaitForGPU();
         wallModel = CloneSceneTree(g_houseTemplate);
@@ -3402,7 +3440,7 @@ static void SynchronizeEditorRuntime(bool play) {
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
     }
     if (g_trees.IsInitialized()) ResetPalmTrees();
-    if ((play || foliageChanged) && g_environmentInitialized)
+    if ((play || foliageChanged || terrainChanged) && g_environmentInitialized)
         RebuildScalableEnvironment();
     if (g_destruction.IsInitialized()) {
         auto tp = CurrentTerrainParams();
@@ -3416,6 +3454,7 @@ static void SynchronizeEditorRuntime(bool play) {
     }
     g_levelEditor.MarkRuntimeSynchronized();
     g_levelEditor.MarkFoliageRuntimeSynchronized();
+    g_levelEditor.MarkTerrainRuntimeSynchronized();
 }
 
 static void StartLevelEditor(HWND hwnd) {
@@ -4060,13 +4099,18 @@ static void ProcessInput(HWND) {
     }
     g_destruction.SetVehicleInput(0.0f, 0.0f, true);
     ApplyVirtualInput();
-    const float sprintMultiplier =
-        (scene.camera.FPSMode && (GetAsyncKeyState(VK_SHIFT) & 0x8000)) ? 2.0f : 1.0f;
-    if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, sprintMultiplier);
-    if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, sprintMultiplier);
-    if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, sprintMultiplier);
-    if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, sprintMultiplier);
-    if (GetAsyncKeyState(VK_SPACE) & 0x8000) scene.camera.ProcessKeyboard(' ', deltaTime);
+    const bool crouching = scene.camera.FPSMode &&
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+    scene.camera.SetCrouching(crouching, deltaTime);
+    const float movementMultiplier = crouching ? 0.55f :
+        ((scene.camera.FPSMode && (GetAsyncKeyState(VK_SHIFT) & 0x8000))
+            ? 2.0f : 1.0f);
+    if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, movementMultiplier);
+    if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, movementMultiplier);
+    if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, movementMultiplier);
+    if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, movementMultiplier);
+    if (!crouching && (GetAsyncKeyState(VK_SPACE) & 0x8000))
+        scene.camera.ProcessKeyboard(' ', deltaTime);
 
     // Auto-fire: while the mouse is held (and not interacting with the UI),
     // keep shooting on a fixed interval instead of one shot per click.
@@ -4414,7 +4458,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         ? "Mesh shader path enabled\n"
         : "Mesh shader path unavailable; using raster fallback\n");
 
-    if (!g_useMeshShader || !g_terrain.Init(mainShader)) {
+    bool terrainReady = false;
+    if (g_useMeshShader) {
+        // Terrain initialization uploads its PBR texture arrays. InitDX12 leaves
+        // the command list closed, so record and submit those copies explicitly;
+        // otherwise the following sky reset discards them and every terrain SRV
+        // samples zero.
+        ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
+        ThrowIfFailed(g_dx12.commandList->Reset(
+            g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
+        terrainReady = g_terrain.Init(mainShader);
+        ThrowIfFailed(g_dx12.commandList->Close());
+        {
+            ID3D12CommandList* terrainLists[] = { g_dx12.commandList.Get() };
+            g_dx12.commandQueue->ExecuteCommandLists(1, terrainLists);
+        }
+        WaitForGPU();
+        DumpDX12DebugMessages();
+    }
+    if (!terrainReady) {
         scene.useMeshTerrain = false;
         std::cerr << "Mesh shader terrain unavailable; keeping flat floor\n";
     }
@@ -5019,6 +5081,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     // Grenades use fuse; rockets detonate on first solid impact.
                     if (projectile.detonate) {
                         const XMFLOAT3 center = projectile.position;
+                        if (projectile.grenade)
+                            AddExplosionTerrainCrater(center);
                         scene.SpawnExplosionFX(
                             { center.x, center.y + 0.6f, center.z },
                             scene.grenadeBlastRadius * 1.6f, 0.9f,
@@ -5472,7 +5536,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_trees.SetTerrainSampler(terrainSampler);
                 ResetPalmTrees();
 
-                LoadFernModel();
+                LoadDandelionModel();
                 RebuildScalableEnvironment();
             }
             // Same pool AABB for the destruction sim so house debris shoved into
@@ -5652,7 +5716,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ReleaseMaterialUploadHeaps(g_helicopterModel);
             ReleaseMaterialUploadHeaps(g_humveeModel);
             ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
-            ReleaseMaterialUploadHeaps(g_fernModel);
+            ReleaseMaterialUploadHeaps(g_dandelionModel);
             ReleaseMaterialUploadHeaps(g_banditModel.node);
             for (const auto& material : g_banditModel.materialKeepAlive)
                 if (material) material->uploadHeaps.clear();

@@ -21,11 +21,15 @@ int main() {
     grass.transform.scale[0] = grass.transform.scale[2] = 3.0f;
     grass.transform.scale[1] = 1.5f;
     level.entities.push_back(grass);
-    LevelEntity fern;
-    fern.id = 1002;
-    fern.type = LevelEntityType::Fern;
-    fern.name = "Painted Fern";
-    level.entities.push_back(fern);
+    LevelEntity dandelion;
+    dandelion.id = 1002;
+    dandelion.type = LevelEntityType::Dandelion;
+    dandelion.name = "Painted Dandelion";
+    level.entities.push_back(dandelion);
+    level.terrainSculpt.push_back({ 3.0f, -4.0f, 2.5f,
+        TerrainSculptOperation::Add, 0.75f, 1.0f });
+    level.terrainSculpt.push_back({ 0.0f, 1.0f, 4.0f,
+        TerrainSculptOperation::Flatten, 2.5f, 0.6f });
 
     const auto root = std::filesystem::temp_directory_path() /
                       "smallest-graphics-engine-level-tests";
@@ -36,7 +40,14 @@ int main() {
     CHECK(loaded.level.entities.size() == level.entities.size());
     CHECK(loaded.level.entities[4].id == level.entities[4].id);
     CHECK(loaded.level.entities[27].type == LevelEntityType::GrassPatch);
-    CHECK(loaded.level.entities[28].type == LevelEntityType::Fern);
+    CHECK(loaded.level.entities[28].type == LevelEntityType::Dandelion);
+    LevelEntityType legacyFoliage = LevelEntityType::GrassPatch;
+    CHECK(ParseLevelEntityType("fern", legacyFoliage));
+    CHECK(legacyFoliage == LevelEntityType::Dandelion);
+    CHECK(std::string(LevelEntityTypeName(legacyFoliage)) == "dandelion");
+    CHECK(loaded.level.terrainSculpt.size() == 2);
+    CHECK(loaded.level.terrainSculpt[1].operation ==
+          TerrainSculptOperation::Flatten);
 
     LevelDefinition duplicate = level;
     duplicate.entities[1].id = duplicate.entities[0].id;
@@ -47,6 +58,9 @@ int main() {
     LevelDefinition unknown = level;
     unknown.entities[1].type = static_cast<LevelEntityType>(999);
     CHECK(!ValidateLevel(unknown).ok);
+    LevelDefinition invalidSculpt = level;
+    invalidSculpt.terrainSculpt[0].radius = 0.0f;
+    CHECK(!ValidateLevel(invalidSculpt).ok);
 
     std::filesystem::create_directories(root);
     const auto malformed = root / "malformed.json";

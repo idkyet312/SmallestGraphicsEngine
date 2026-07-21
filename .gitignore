@@ -49,6 +49,11 @@ models/textures/*
 !models/audio/*
 !models/SVD_v1.3/
 !models/SVD_v1.3/**
+!models/terrain/
+!models/terrain/leafy_grass/
+!models/terrain/leafy_grass/**
+!models/fbx_Dandelion/
+!models/fbx_Dandelion/**
 
 # CMake
 CMakeCache.txt

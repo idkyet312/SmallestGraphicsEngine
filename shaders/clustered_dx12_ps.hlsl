@@ -98,11 +98,20 @@ cbuffer ShadowCascadeBuffer : register(b8) {
     float4 shadowCascadeDepthRange;
 };
 
+#ifdef SGE_TERRAIN_PBR
+Texture2DArray albedoMap : register(t1);
+#else
 Texture2D albedoMap : register(t1);
+#endif
 Texture2D irradianceMap : register(t2);
 Texture2D visibilityMap : register(t3);
+#ifdef SGE_TERRAIN_PBR
+Texture2DArray normalMap : register(t4);
+Texture2DArray metalRoughMap : register(t5);
+#else
 Texture2D normalMap : register(t4);
 Texture2D metalRoughMap : register(t5);
+#endif
 Texture2DArray<float> shadowMap : register(t0);
 Texture2D<float4> environmentMap : register(t15);
 Texture2D<float2> brdfIntegrationLUT : register(t16);
@@ -424,6 +433,10 @@ float3 FinalizeOutput(float3 color) {
 #endif
 }
 
+#ifdef SGE_TERRAIN_PBR
+#include "terrain_pbr.hlsli"
+#endif
+
 float4 main(PS_INPUT input) : SV_TARGET {
     // Solid unlit emissive geometry. Additive PSO turns opacity into glow weight.
     if (smokeMode > 1.5) {
@@ -434,7 +447,11 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // let its alpha (times opacity) shape a soft translucent billboard. Skips all
     // lighting/fog so smoke reads as a light-scattering volume, not a lit surface.
     if (smokeMode > 0.5) {
+#ifdef SGE_TERRAIN_PBR
+        float4 smoke = albedoMap.Sample(texSampler, float3(input.texCoord, 0));
+#else
         float4 smoke = albedoMap.Sample(texSampler, input.texCoord);
+#endif
         float a = smoke.a * opacity;
         if (a <= 0.003) discard;
         // Tone-map/encode to match the rest of the frame's output.
@@ -448,6 +465,11 @@ float4 main(PS_INPUT input) : SV_TARGET {
 
     // Sample textures
     float3 albedo = objectColor;
+#ifdef SGE_TERRAIN_PBR
+    TerrainPBR terrain = SampleTerrainPBR(input.fragPos, normal);
+    // Terrain albedo uses an sRGB SRV, so hardware has already decoded it.
+    albedo = max(terrain.albedo, 0.0) * objectColor;
+#else
     if (useTexture > 0.5) {
         float4 texColor = albedoMap.Sample(texSampler, input.texCoord);
         // Alpha cutout for foliage cards (palm fronds), opt-in per material.
@@ -464,10 +486,16 @@ float4 main(PS_INPUT input) : SV_TARGET {
         // Textures are uploaded as UNORM, so decode authored sRGB before lighting.
         albedo = pow(max(texColor.rgb, 0.0), 2.2) * objectColor;
     }
+#endif
     float metal = metalness;
     float rough = roughness;
     float ambientOcclusion = 1.0;
-    
+
+#ifdef SGE_TERRAIN_PBR
+    metal = 0.0;
+    rough = terrain.roughness;
+    normal = terrain.normal;
+#else
     if (metalRoughMode > 0.5) {
         // Check if metalRoughMap is bound? We don't have a flag for it specifically, assuming bundled with material
         // But for GLB, MetalRough is usually packed. B=Metal, G=Roughness.
@@ -500,10 +528,12 @@ float4 main(PS_INPUT input) : SV_TARGET {
             rough = max(rough, mrSample.g);
         }
     }
+#endif
     rough = clamp(rough, 0.045, 1.0); // avoid alpha->0 specular-aliasing spike
     
     // Normal mapping through a stable vertex tangent frame. Imported meshes
     // without tangents get UV-derived tangents generated at load time.
+#ifndef SGE_TERRAIN_PBR
     if (useNormalMap > 0.5) {
          float normalMipBias = 1.5;
          float normalStrength = 0.70;
@@ -525,6 +555,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
          float grazingFade = saturate(abs(dot(N, viewDir)) * 2.0);
          normal = normalize(lerp(N, mappedNormal, normalStrength * grazingFade * minifyFade));
     }
+#endif
 
     // Forward imports use a no-cull PSO so foliage cards, rotor blades, and
     // mixed-winding assets remain visible. Orient the shading normal toward

@@ -16,7 +16,7 @@ enum class LevelEntityType {
     Humvee,
     Helicopter,
     GrassPatch,
-    Fern
+    Dandelion
 };
 
 struct Transform {
@@ -33,10 +33,25 @@ struct LevelEntity {
     bool enabled = true;
 };
 
+enum class TerrainSculptOperation : uint32_t {
+    Add = 0,
+    Flatten = 1
+};
+
+struct TerrainSculptStamp {
+    float x = 0.0f;
+    float z = 0.0f;
+    float radius = 2.0f;
+    TerrainSculptOperation operation = TerrainSculptOperation::Add;
+    float value = 0.0f;
+    float strength = 1.0f;
+};
+
 struct LevelDefinition {
     uint32_t schemaVersion = 1;
     std::string name = "Untitled Level";
     float terrainHeightScale = 5.0f;
+    std::vector<TerrainSculptStamp> terrainSculpt;
     std::vector<LevelEntity> entities;
 };
 

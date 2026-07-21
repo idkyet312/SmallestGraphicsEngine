@@ -30,6 +30,8 @@ public:
     bool RuntimeDirty() const { return runtimeDirty_; }
     bool FoliageRuntimeDirty() const { return foliageRuntimeDirty_; }
     void MarkFoliageRuntimeSynchronized() { foliageRuntimeDirty_ = false; }
+    bool TerrainRuntimeDirty() const { return terrainRuntimeDirty_; }
+    void MarkTerrainRuntimeSynchronized() { terrainRuntimeDirty_ = false; }
     void OnKeyDown(unsigned key, bool controlDown);
     LevelEditorActions Render(Camera& camera,
         DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
@@ -58,6 +60,9 @@ private:
         const std::function<float(float, float)>& terrainHeight,
         DirectX::XMFLOAT3& point) const;
     bool FoliageChanged(const LevelDefinition& before) const;
+    bool TerrainChanged(const LevelDefinition& before) const;
+    void SculptTerrain(DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
+        const std::function<float(float, float)>& terrainHeight);
 
     LevelDefinition level_ = MakeLevelOneTemplate();
     LevelDefinition playSnapshot_;
@@ -67,6 +72,7 @@ private:
     bool dirty_ = false;
     bool runtimeDirty_ = true;
     bool foliageRuntimeDirty_ = true;
+    bool terrainRuntimeDirty_ = true;
     bool localSpace_ = false;
     bool snapEnabled_ = true;
     bool terrainSnap_ = true;
@@ -89,6 +95,15 @@ private:
     DirectX::XMFLOAT3 lastFoliageStamp_ = { 100000.0f, 0.0f, 100000.0f };
     LevelDefinition foliageStrokeBefore_;
     uint32_t foliageRandom_ = 0x52a7d91bu;
+    int terrainTool_ = 0;
+    float terrainBrushRadius_ = 3.0f;
+    float terrainBrushStrength_ = 0.45f;
+    float terrainBrushSpacing_ = 1.0f;
+    float terrainFlattenHeight_ = 0.0f;
+    bool terrainStrokeActive_ = false;
+    bool terrainStrokeChanged_ = false;
+    DirectX::XMFLOAT3 lastTerrainStamp_ = { 100000.0f, 0.0f, 100000.0f };
+    LevelDefinition terrainStrokeBefore_;
     std::vector<LevelDefinition> undo_;
     std::vector<LevelDefinition> redo_;
     std::filesystem::path currentPath_;

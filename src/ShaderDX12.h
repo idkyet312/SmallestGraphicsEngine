@@ -917,6 +917,19 @@ public:
         graphicsRootBound = true;
     }
 
+    // Compute passes such as DDGI bind private descriptor heaps. Descriptor-table
+    // bindings become invalid whenever that happens, even though the graphics
+    // root signature and root CBVs remain intact. Restore the shared graphics
+    // heaps and the global texture table before any following graphics dispatch.
+    void RebindGraphicsResourceTables() {
+        ID3D12DescriptorHeap* heaps[] = {
+            g_dx12.cbvSrvUavHeap.Get(), g_dx12.samplerHeap.Get()
+        };
+        g_dx12.commandList->SetDescriptorHeaps(2, heaps);
+        g_dx12.commandList->SetGraphicsRootDescriptorTable(
+            6, g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart());
+    }
+
     void BindFrameConstants() {
         g_dx12.commandList->SetGraphicsRootConstantBufferView(1, lightBuffer.GetGPUAddress(g_dx12.frameIndex));
         g_dx12.commandList->SetGraphicsRootConstantBufferView(2, cameraBuffer.GetGPUAddress(g_dx12.frameIndex));
@@ -989,7 +1002,7 @@ public:
         brdfDesc.Texture2D.MipLevels = 1;
         g_dx12.device->CreateShaderResourceView(brdfLUT, &brdfDesc, cpuHandle);
 
-        g_dx12.commandList->SetGraphicsRootDescriptorTable(6, g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart());
+        RebindGraphicsResourceTables();
     }
     
     // Diagnostic: how many descriptors we had to create this frame, and how many
@@ -1105,6 +1118,20 @@ public:
         
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
+    }
+
+    void SetTerrainMaterial() {
+        const UINT bufferIndex = GetDrawCallIndex();
+        ObjectBufferDX12 data = {};
+        data.objectColor = XMFLOAT3(1.0f, 1.0f, 1.0f);
+        data.metalness = 0.0f;
+        data.roughness = 1.0f;
+        data.opacity = 1.0f;
+        data.ambientScale = 1.0f;
+        data.normalYSign = 1.0f;
+        objectBuffer.CopyData(bufferIndex, data);
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(
+            3, objectBuffer.GetGPUAddress(bufferIndex));
     }
     
     // `cacheOwner`, when given, is the material these textures belong to. Its three
