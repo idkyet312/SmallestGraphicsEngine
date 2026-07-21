@@ -174,6 +174,26 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMENT "Compiling terrain mesh shader"
     )
     add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/terrain_ps.cso
+        COMMAND ${DXC_EXECUTABLE} -T ps_6_5 -E main -D SGE_TERRAIN_PBR=1
+                -I ${CMAKE_SOURCE_DIR}/shaders
+                ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/terrain_ps.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_pbr.hlsli
+        COMMENT "Compiling triplanar terrain PBR pixel shader"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso
+        COMMAND ${DXC_EXECUTABLE} -T ps_6_5 -E main -D SGE_TERRAIN_PBR=1
+                -D SGE_HDR_TARGET=1 -I ${CMAKE_SOURCE_DIR}/shaders
+                ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_pbr.hlsli
+        COMMENT "Compiling HDR triplanar terrain PBR pixel shader"
+    )
+    add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/wire_green_ps.cso
         COMMAND ${DXC_EXECUTABLE} -T ps_6_5 -E main
                 ${CMAKE_SOURCE_DIR}/shaders/wire_green_ps.hlsl
@@ -188,6 +208,8 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         ${CMAKE_BINARY_DIR}/mesh_ps_hdr.cso
         ${CMAKE_BINARY_DIR}/terrain_as.cso
         ${CMAKE_BINARY_DIR}/terrain_ms.cso
+        ${CMAKE_BINARY_DIR}/terrain_ps.cso
+        ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso
         ${CMAKE_BINARY_DIR}/wire_green_ps.cso)
 else()
     message(STATUS "DXC not found; mesh shader path will use raster fallback")
@@ -298,6 +320,8 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/mesh_ps_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ps_hdr.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_as.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_as.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ms.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps_hdr.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/wire_green_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/wire_green_ps.cso
     )
     if(DXC_EXECUTABLE)

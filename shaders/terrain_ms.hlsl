@@ -21,7 +21,18 @@ cbuffer TerrainParams : register(b6) {
     float skirtDepth;
     float flattenRadius;
     float islandScale;
+    uint sculptCount;
+    float sculptMaxDisplacement;
 };
+
+struct TerrainSculptStamp {
+    float3 centerRadius;
+    uint operation;
+    float value;
+    float strength;
+    float2 padding;
+};
+StructuredBuffer<TerrainSculptStamp> terrainSculpt : register(t10);
 
 struct TerrainPayload {
     uint tileId[32];
@@ -149,6 +160,16 @@ float TerrainHeight(float2 xz) {
         float pad = 1.0 - smoothstep(
             kPadRadius, kPadFade, length(xz - kStressPadCenters[i]));
         h = lerp(h, kPadHeight, pad);
+    }
+    for (uint stampIndex = 0; stampIndex < sculptCount; ++stampIndex) {
+        TerrainSculptStamp stamp = terrainSculpt[stampIndex];
+        float weight = saturate(1.0 -
+            length(xz - stamp.centerRadius.xy) / stamp.centerRadius.z);
+        weight = weight * weight * (3.0 - 2.0 * weight);
+        if (stamp.operation == 0)
+            h += stamp.value * weight;
+        else
+            h = lerp(h, stamp.value, saturate(stamp.strength * weight));
     }
     return h;
 }

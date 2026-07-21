@@ -27,6 +27,8 @@ cbuffer TerrainParams : register(b6) {
     float skirtDepth;
     float flattenRadius;  // level pad around origin for the house
     float islandScale;
+    uint sculptCount;
+    float sculptMaxDisplacement;
 };
 
 struct TerrainPayload {
@@ -62,11 +64,12 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
         float worldX = ((float)tx - (float)tilesX * 0.5) * tileSize;
         float worldZ = ((float)tz - (float)tilesZ * 0.5) * tileSize;
 
+        float verticalReach = heightScale + sculptMaxDisplacement;
         float3 center3 = float3(worldX + tileSize * 0.5,
-            (heightScale - skirtDepth) * 0.5,
+            (verticalReach - skirtDepth) * 0.5,
             worldZ + tileSize * 0.5);
         float3 halfExtent = float3(tileSize * 0.5,
-            (heightScale + skirtDepth) * 0.5, tileSize * 0.5);
+            (verticalReach + skirtDepth) * 0.5, tileSize * 0.5);
 
         if (TileIntersectsFrustum(center3, length(halfExtent))) {
             float2 center = float2(worldX + tileSize * 0.5, worldZ + tileSize * 0.5);

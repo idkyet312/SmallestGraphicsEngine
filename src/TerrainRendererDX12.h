@@ -2,6 +2,13 @@
 #define TERRAIN_RENDERER_DX12_H
 
 #include "MeshShaderDX12.h" // MeshPSOSubobjectDX12 template + ShaderDX12
+#include "GLBImporter.h"
+#include "LevelDefinition.h"
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <vector>
 
 // Procedural heightfield terrain drawn entirely on the GPU through the
 // amplification/mesh shader pipeline: terrain_as.hlsl culls tiles and picks a
@@ -21,7 +28,17 @@ public:
         float skirtDepth = 1.0f;
         float flattenRadius = 14.0f;
         float islandScale = 1.0f;
+        UINT sculptCount = 0;
+        float sculptMaxDisplacement = 0.0f;
     };
+
+    struct SculptGPU {
+        float x, z, radius;
+        UINT operation;
+        float value, strength;
+        float padding[2] = {};
+    };
+    static_assert(sizeof(SculptGPU) == 32);
 
     ComPtr<ID3D12PipelineState> pso;
     ComPtr<ID3D12PipelineState> psoWireframe;
@@ -30,6 +47,12 @@ public:
     ComPtr<ID3D12PipelineState> psoHDR;
     ComPtr<ID3D12PipelineState> psoWireframeHDR;
     ComPtr<ID3D12GraphicsCommandList6> commandList6;
+    ComPtr<ID3D12Resource> terrainAlbedoArray;
+    ComPtr<ID3D12Resource> terrainNormalArray;
+    ComPtr<ID3D12Resource> terrainRoughnessArray;
+    std::array<ComPtr<ID3D12Resource>, FRAME_COUNT> sculptBuffers;
+    std::array<ComPtr<ID3D12Resource>, 3> terrainUploads;
+    D3D12_GPU_DESCRIPTOR_HANDLE terrainTextureTable{};
     bool supported = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
@@ -50,12 +73,12 @@ public:
             std::cerr << "Terrain mesh shader DXIL missing: shaders/terrain_ms.cso\n";
             return false;
         }
-        if (FAILED(ReadCompiledShaderDX12(L"shaders/mesh_ps.cso", &ps))) {
-            std::cerr << "Mesh pixel shader DXIL missing: shaders/mesh_ps.cso\n";
+        if (FAILED(ReadCompiledShaderDX12(L"shaders/terrain_ps.cso", &ps))) {
+            std::cerr << "Terrain PBR pixel shader missing: shaders/terrain_ps.cso\n";
             return false;
         }
-        if (FAILED(ReadCompiledShaderDX12(L"shaders/mesh_ps_hdr.cso", &hdrPs))) {
-            std::cerr << "HDR terrain pixel shader DXIL missing: shaders/mesh_ps_hdr.cso\n";
+        if (FAILED(ReadCompiledShaderDX12(L"shaders/terrain_ps_hdr.cso", &hdrPs))) {
+            std::cerr << "HDR terrain PBR pixel shader missing: shaders/terrain_ps_hdr.cso\n";
             return false;
         }
         if (!shader.rootSignature) return false;
@@ -133,8 +156,22 @@ public:
             stream.raster.value.MultisampleEnable = FALSE;
         }
 
+        if (!CreateTerrainTextureArrays(shader) || !CreateSculptBuffers()) return false;
         supported = true;
         return true;
+    }
+
+    void SetSculptStamps(const std::vector<TerrainSculptStamp>& stamps) {
+        s_sculptStamps.assign(stamps.begin(), stamps.begin() +
+            (std::min)(stamps.size(), static_cast<size_t>(256)));
+        m_sculptMaxDisplacement = 0.0f;
+        for (const TerrainSculptStamp& stamp : s_sculptStamps) {
+            if (stamp.operation == TerrainSculptOperation::Add)
+                m_sculptMaxDisplacement += std::abs(stamp.value);
+            else
+                m_sculptMaxDisplacement = (std::max)(m_sculptMaxDisplacement,
+                    std::abs(stamp.value) + 12.0f);
+        }
     }
 
     void SetMSAAEnabled(bool enabled) {
@@ -147,6 +184,11 @@ public:
     // TerrainHeight), used for walking collision. Keep the two in sync - any
     // drift puts the camera above or inside the rendered ground.
     static float HeightAt(const Params& params, float x, float z) {
+        return HeightAt(params, x, z, s_sculptStamps);
+    }
+
+    static float HeightAt(const Params& params, float x, float z,
+        const std::vector<TerrainSculptStamp>& sculpt) {
         auto hashUint = [](uint32_t value) {
             value ^= value >> 16;
             value *= 0x7feb352du;
@@ -264,23 +306,413 @@ public:
             float pad = 1.0f - pt * pt * (3.0f - 2.0f * pt);
             h = h + (padHeight - h) * pad;
         }
+        for (const TerrainSculptStamp& stamp : sculpt) {
+            const float dx = x - stamp.x;
+            const float dz = z - stamp.z;
+            const float distance = sqrtf(dx * dx + dz * dz);
+            float weight = 1.0f - distance / stamp.radius;
+            weight = weight < 0.0f ? 0.0f : (weight > 1.0f ? 1.0f : weight);
+            weight = weight * weight * (3.0f - 2.0f * weight);
+            if (stamp.operation == TerrainSculptOperation::Add)
+                h += stamp.value * weight;
+            else {
+                const float blend = (std::min)(1.0f, stamp.strength * weight);
+                h += (stamp.value - h) * blend;
+            }
+        }
         return h;
+    }
+
+    bool CreateSculptBuffers() {
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = sizeof(SculptGPU) * 256;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
+            if (FAILED(g_dx12.device->CreateCommittedResource(&heap,
+                    D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    IID_PPV_ARGS(&sculptBuffers[frame])))) return false;
+            UploadSculptStamps(frame);
+        }
+        return true;
+    }
+
+    void UploadSculptStamps(UINT frame) {
+        if (frame >= FRAME_COUNT || !sculptBuffers[frame]) return;
+        SculptGPU* destination = nullptr;
+        if (FAILED(sculptBuffers[frame]->Map(0, nullptr,
+                reinterpret_cast<void**>(&destination)))) return;
+        std::memset(destination, 0, sizeof(SculptGPU) * 256);
+        for (size_t i = 0; i < s_sculptStamps.size(); ++i) {
+            const TerrainSculptStamp& source = s_sculptStamps[i];
+            destination[i] = { source.x, source.z, source.radius,
+                static_cast<UINT>(source.operation), source.value, source.strength };
+        }
+        sculptBuffers[frame]->Unmap(0, nullptr);
+    }
+
+    bool CreateTextureArray(const std::vector<uint8_t>& pixels, UINT side,
+                            UINT layers, bool srgb,
+                            ComPtr<ID3D12Resource>& texture,
+                            ComPtr<ID3D12Resource>& upload) {
+        UINT mipLevels = 1;
+        for (UINT mipSide = side; mipSide > 1; mipSide >>= 1) ++mipLevels;
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = side;
+        desc.Height = side;
+        desc.DepthOrArraySize = static_cast<UINT16>(layers);
+        desc.MipLevels = mipLevels;
+        desc.Format = srgb ? DXGI_FORMAT_R8G8B8A8_TYPELESS
+                           : DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+
+        D3D12_HEAP_PROPERTIES defaultHeap = {};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&texture)))) return false;
+
+        const UINT subresourceCount = layers * mipLevels;
+        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(subresourceCount);
+        std::vector<UINT> rows(subresourceCount);
+        std::vector<UINT64> rowBytes(subresourceCount);
+        UINT64 uploadBytes = 0;
+        g_dx12.device->GetCopyableFootprints(
+            &desc, 0, subresourceCount, 0, layouts.data(), rows.data(),
+            rowBytes.data(), &uploadBytes);
+        D3D12_RESOURCE_DESC uploadDesc = {};
+        uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDesc.Width = uploadBytes;
+        uploadDesc.Height = 1;
+        uploadDesc.DepthOrArraySize = 1;
+        uploadDesc.MipLevels = 1;
+        uploadDesc.SampleDesc.Count = 1;
+        uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES uploadHeap = {};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&upload)))) return false;
+
+        uint8_t* mapped = nullptr;
+        if (FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))))
+            return false;
+        const size_t sourceLayerPitch = static_cast<size_t>(side) * side * 4;
+        std::vector<std::vector<uint8_t>> mipData(subresourceCount);
+        for (UINT layer = 0; layer < layers; ++layer) {
+            mipData[layer * mipLevels].assign(
+                pixels.begin() + sourceLayerPitch * layer,
+                pixels.begin() + sourceLayerPitch * (layer + 1));
+            UINT previousSide = side;
+            for (UINT mip = 1; mip < mipLevels; ++mip) {
+                const UINT mipSide = (std::max)(1u, previousSide / 2);
+                const auto& previous = mipData[layer * mipLevels + mip - 1];
+                auto& current = mipData[layer * mipLevels + mip];
+                current.resize(static_cast<size_t>(mipSide) * mipSide * 4);
+                for (UINT y = 0; y < mipSide; ++y) for (UINT x = 0; x < mipSide; ++x)
+                    for (UINT channel = 0; channel < 4; ++channel) {
+                        UINT sum = 0;
+                        for (UINT oy = 0; oy < 2; ++oy) for (UINT ox = 0; ox < 2; ++ox) {
+                            const UINT sx = (std::min)(previousSide - 1, x * 2 + ox);
+                            const UINT sy = (std::min)(previousSide - 1, y * 2 + oy);
+                            sum += previous[(static_cast<size_t>(sy) * previousSide + sx) * 4 + channel];
+                        }
+                        current[(static_cast<size_t>(y) * mipSide + x) * 4 + channel] =
+                            static_cast<uint8_t>((sum + 2) / 4);
+                    }
+                previousSide = mipSide;
+            }
+        }
+        for (UINT subresource = 0; subresource < subresourceCount; ++subresource) {
+            const UINT mip = subresource % mipLevels;
+            const UINT mipSide = (std::max)(1u, side >> mip);
+            const size_t sourceRowPitch = static_cast<size_t>(mipSide) * 4;
+            uint8_t* destination = mapped + layouts[subresource].Offset;
+            const uint8_t* source = mipData[subresource].data();
+            for (UINT row = 0; row < rows[subresource]; ++row)
+                std::memcpy(destination + static_cast<size_t>(row) *
+                    layouts[subresource].Footprint.RowPitch,
+                    source + static_cast<size_t>(row) * sourceRowPitch,
+                    sourceRowPitch);
+        }
+        upload->Unmap(0, nullptr);
+
+        for (UINT subresource = 0; subresource < subresourceCount; ++subresource) {
+            D3D12_TEXTURE_COPY_LOCATION destination = {};
+            destination.pResource = texture.Get();
+            destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            destination.SubresourceIndex = subresource;
+            D3D12_TEXTURE_COPY_LOCATION source = {};
+            source.pResource = upload.Get();
+            source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            source.PlacedFootprint = layouts[subresource];
+            g_dx12.commandList->CopyTextureRegion(
+                &destination, 0, 0, 0, &source, nullptr);
+        }
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = texture.Get();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_dx12.commandList->ResourceBarrier(1, &barrier);
+        return true;
+    }
+
+    bool CreateTerrainTextureArrays(ShaderDX12& shader) {
+        // Keep the authored 1K scans intact. The previous 256px arrays erased
+        // most fine ground detail before mip filtering even began.
+        constexpr UINT side = 1024;
+        constexpr UINT layers = 4;
+        constexpr UINT bytesPerPixel = 4;
+        const size_t layerBytes = static_cast<size_t>(side) * side * bytesPerPixel;
+        std::array<std::vector<uint8_t>, 3> maps;
+        for (auto& map : maps) map.resize(layerBytes * layers);
+
+        const std::array<std::array<float, 3>, layers> baseColors = {{
+            {{ 0.25f, 0.43f, 0.12f }},
+            {{ 0.34f, 0.20f, 0.10f }},
+            {{ 0.72f, 0.58f, 0.36f }},
+            {{ 0.31f, 0.32f, 0.30f }}
+        }};
+        const std::array<float, layers> baseRoughness = {
+            0.88f, 0.94f, 0.82f, 0.76f
+        };
+        auto height = [](int x, int y, UINT layer) {
+            constexpr float twoPi = 6.28318530718f;
+            const float fx = static_cast<float>(x & 255) / 256.0f;
+            const float fy = static_cast<float>(y & 255) / 256.0f;
+            const float phase = static_cast<float>(layer) * 1.731f;
+            float value = 0.50f;
+            value += std::sin((fx * (5.0f + layer) + phase) * twoPi) * 0.18f;
+            value += std::sin((fy * (7.0f + layer * 2.0f) - phase) * twoPi) * 0.14f;
+            value += std::sin(((fx + fy) * 17.0f + phase * 0.37f) * twoPi) * 0.08f;
+            value += std::sin(((fx - fy) * 31.0f - phase * 0.61f) * twoPi) * 0.035f;
+            return value;
+        };
+        auto byte = [](float value) {
+            return static_cast<uint8_t>((std::max)(0.0f,
+                (std::min)(1.0f, value)) * 255.0f + 0.5f);
+        };
+
+        for (UINT layer = 0; layer < layers; ++layer) {
+            for (UINT y = 0; y < side; ++y) for (UINT x = 0; x < side; ++x) {
+                const float h = height(static_cast<int>(x), static_cast<int>(y), layer);
+                const float dx = height(static_cast<int>(x) + 1,
+                    static_cast<int>(y), layer) - height(static_cast<int>(x) - 1,
+                    static_cast<int>(y), layer);
+                const float dy = height(static_cast<int>(x),
+                    static_cast<int>(y) + 1, layer) - height(static_cast<int>(x),
+                    static_cast<int>(y) - 1, layer);
+                const float strength = layer == 2 ? 2.0f : (layer == 3 ? 5.5f : 3.8f);
+                XMVECTOR vectorNormal = XMVector3Normalize(XMVectorSet(
+                    -dx * strength, -dy * strength, 1.0f, 0.0f));
+                XMFLOAT3 normal;
+                XMStoreFloat3(&normal, vectorNormal);
+                const size_t offset = static_cast<size_t>(layer) * layerBytes +
+                    (static_cast<size_t>(y) * side + x) * bytesPerPixel;
+                const float variation = 0.76f + h * 0.43f;
+                // Pixel shader decodes albedo from sRGB. Encode procedural linear
+                // colors here; writing linear values directly caused a second
+                // gamma operation and crushed dirt/rock almost to black.
+                maps[0][offset + 0] = byte(std::pow(
+                    (std::min)(1.0f, baseColors[layer][0] * variation), 1.0f / 2.2f));
+                maps[0][offset + 1] = byte(std::pow(
+                    (std::min)(1.0f, baseColors[layer][1] * variation), 1.0f / 2.2f));
+                maps[0][offset + 2] = byte(std::pow(
+                    (std::min)(1.0f, baseColors[layer][2] * variation), 1.0f / 2.2f));
+                maps[0][offset + 3] = 255;
+                maps[1][offset + 0] = byte(normal.x * 0.5f + 0.5f);
+                maps[1][offset + 1] = byte(normal.y * 0.5f + 0.5f);
+                maps[1][offset + 2] = byte(normal.z * 0.5f + 0.5f);
+                maps[1][offset + 3] = 255;
+                const uint8_t rough = byte(
+                    baseRoughness[layer] + (h - 0.5f) * 0.12f);
+                maps[2][offset + 0] = 255;
+                maps[2][offset + 1] = rough;
+                maps[2][offset + 2] = 0;
+                maps[2][offset + 3] = 255;
+            }
+        }
+
+        // Replace all generated fallback slices with Poly Haven CC0 scans.
+        auto resolveTerrainMap = [](const char* folder, const char* file) {
+            for (const std::filesystem::path root : {
+                    std::filesystem::path("models"),
+                    std::filesystem::path("build/models"),
+                    std::filesystem::path("../models") }) {
+                const std::filesystem::path path = root / folder / file;
+                if (std::filesystem::exists(path)) return path.string();
+            }
+            return std::string(file);
+        };
+        auto loadTerrainSlice = [&](const char* folder, const char* file,
+                                    UINT layer, std::vector<uint8_t>& target,
+                                    bool normalSource, bool roughnessSource) {
+            std::vector<unsigned char> source;
+            int width = 0, heightPixels = 0;
+            if (!GLBImporter::LoadPixelsRGBA(
+                    resolveTerrainMap(folder, file), source, width, heightPixels) ||
+                width <= 0 || heightPixels <= 0) return false;
+            for (UINT y = 0; y < side; ++y) for (UINT x = 0; x < side; ++x) {
+                const int sx0 = static_cast<int>((uint64_t)x * width / side);
+                const int sx1 = (std::max)(sx0 + 1,
+                    static_cast<int>((uint64_t)(x + 1) * width / side));
+                const int sy0 = static_cast<int>((uint64_t)y * heightPixels / side);
+                const int sy1 = (std::max)(sy0 + 1,
+                    static_cast<int>((uint64_t)(y + 1) * heightPixels / side));
+                uint64_t sums[3] = {};
+                uint64_t count = 0;
+                for (int sy = sy0; sy < (std::min)(sy1, heightPixels); ++sy)
+                    for (int sx = sx0; sx < (std::min)(sx1, width); ++sx) {
+                        const size_t sourceOffset =
+                            (static_cast<size_t>(sy) * width + sx) * 4;
+                        sums[0] += source[sourceOffset + 0];
+                        sums[1] += source[sourceOffset + 1];
+                        sums[2] += source[sourceOffset + 2];
+                        ++count;
+                }
+                const size_t destination =
+                    static_cast<size_t>(layer) * layerBytes +
+                    (static_cast<size_t>(y) * side + x) * 4;
+                if (roughnessSource) {
+                    target[destination + 0] = 255;
+                    target[destination + 1] = static_cast<uint8_t>(sums[0] / count);
+                    target[destination + 2] = 0;
+                } else if (normalSource) {
+                    XMVECTOR n = XMVector3Normalize(XMVectorSet(
+                        static_cast<float>(sums[0] / count) / 127.5f - 1.0f,
+                        static_cast<float>(sums[1] / count) / 127.5f - 1.0f,
+                        static_cast<float>(sums[2] / count) / 127.5f - 1.0f,
+                        0.0f));
+                    XMFLOAT3 decoded;
+                    XMStoreFloat3(&decoded, n);
+                    target[destination + 0] = byte(decoded.x * 0.5f + 0.5f);
+                    target[destination + 1] = byte(decoded.y * 0.5f + 0.5f);
+                    target[destination + 2] = byte(decoded.z * 0.5f + 0.5f);
+                } else {
+                    const float exposure = layer == 0 ? 1.25f : 1.0f;
+                    target[destination + 0] = byte(
+                        static_cast<float>(sums[0] / count) / 255.0f * exposure);
+                    target[destination + 1] = byte(
+                        static_cast<float>(sums[1] / count) / 255.0f * exposure);
+                    target[destination + 2] = byte(
+                        static_cast<float>(sums[2] / count) / 255.0f * exposure);
+                }
+                target[destination + 3] = 255;
+            }
+            return true;
+        };
+        struct TerrainAsset {
+            const char* folder;
+            const char* albedo;
+            const char* normal;
+            const char* roughness;
+        };
+        static constexpr TerrainAsset assets[layers] = {
+            { "terrain/leafy_grass", "leafy_grass_diff_1k.png",
+              "leafy_grass_nor_gl_1k.png", "leafy_grass_rough_1k.png" },
+            { "terrain/dirt_floor", "dirt_floor_diff_1k.png",
+              "dirt_floor_nor_gl_1k.png", "dirt_floor_rough_1k.png" },
+            { "terrain/coast_sand_01", "coast_sand_01_diff_1k.png",
+              "coast_sand_01_nor_gl_1k.png", "coast_sand_01_rough_1k.png" },
+            { "terrain/dark_rock", "dark_rock_diff_1k.png",
+              "dark_rock_nor_gl_1k.png", "dark_rock_rough_1k.png" }
+        };
+        for (UINT layer = 0; layer < layers; ++layer) {
+            const bool albedoLoaded = loadTerrainSlice(
+                assets[layer].folder, assets[layer].albedo, layer,
+                maps[0], false, false);
+            const bool normalLoaded = loadTerrainSlice(
+                assets[layer].folder, assets[layer].normal, layer,
+                maps[1], true, false);
+            const bool roughnessLoaded = loadTerrainSlice(
+                assets[layer].folder, assets[layer].roughness, layer,
+                maps[2], false, true);
+            if (!albedoLoaded || !normalLoaded || !roughnessLoaded) {
+                std::cerr << "Terrain PBR: " << assets[layer].folder
+                          << " maps missing (albedo=" << albedoLoaded
+                          << ", normal=" << normalLoaded
+                          << ", roughness=" << roughnessLoaded
+                          << "); using generated fallback slice\n";
+            }
+        }
+
+        if (!CreateTextureArray(maps[0], side, layers, true,
+                                terrainAlbedoArray, terrainUploads[0])) {
+            std::cerr << "Terrain PBR: failed to create albedo texture array\n";
+            return false;
+        }
+        if (!CreateTextureArray(maps[1], side, layers, false,
+                                terrainNormalArray, terrainUploads[1])) {
+            std::cerr << "Terrain PBR: failed to create normal texture array\n";
+            return false;
+        }
+        if (!CreateTextureArray(maps[2], side, layers, false,
+                                terrainRoughnessArray, terrainUploads[2])) {
+            std::cerr << "Terrain PBR: failed to create roughness texture array\n";
+            return false;
+        }
+
+        const UINT slot = shader.ReservePersistentMaterialSrvs();
+        if (slot == ~0u) {
+            std::cerr << "Terrain PBR: persistent descriptor allocation failed\n";
+            return false;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+        ShaderDX12::SrvHandlesAt(slot, cpu, terrainTextureTable);
+        const UINT stride = g_dx12.cbvSrvUavDescriptorSize;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        srv.Texture2DArray.MipLevels = terrainAlbedoArray->GetDesc().MipLevels;
+        srv.Texture2DArray.ArraySize = layers;
+        g_dx12.device->CreateShaderResourceView(terrainAlbedoArray.Get(), &srv, cpu);
+        cpu.ptr += stride;
+        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g_dx12.device->CreateShaderResourceView(terrainNormalArray.Get(), &srv, cpu);
+        cpu.ptr += stride;
+        g_dx12.device->CreateShaderResourceView(terrainRoughnessArray.Get(), &srv, cpu);
+        return true;
     }
 
     // Caller must have bound matrices (SetMatrices, model = identity) and the
     // terrain material (SetObjectMaterial) beforehand, same as any other draw.
-    void Draw(const Params& params) {
+    void Draw(ShaderDX12& shader, const Params& params) {
         if (!supported) return;
+        shader.RebindGraphicsResourceTables();
+        commandList6->SetGraphicsRootDescriptorTable(7, terrainTextureTable);
         ID3D12PipelineState* solid = hdrTargetEnabled
             ? psoHDR.Get() : (msaaEnabled ? psoMSAA.Get() : pso.Get());
         ID3D12PipelineState* wire = hdrTargetEnabled
             ? psoWireframeHDR.Get()
             : (msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get());
         commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
-        commandList6->SetGraphicsRoot32BitConstants(8, 9, &params, 0);
+        Params drawParams = params;
+        drawParams.sculptCount = static_cast<UINT>(s_sculptStamps.size());
+        drawParams.sculptMaxDisplacement = m_sculptMaxDisplacement;
+        UploadSculptStamps(g_dx12.frameIndex);
+        commandList6->SetGraphicsRoot32BitConstants(8, 11, &drawParams, 0);
+        commandList6->SetGraphicsRootShaderResourceView(
+            13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
         const UINT tileCount = params.tilesX * params.tilesZ;
         commandList6->DispatchMesh((tileCount + 31) / 32, 1, 1);
     }
+
+private:
+    inline static std::vector<TerrainSculptStamp> s_sculptStamps;
+    float m_sculptMaxDisplacement = 0.0f;
 };
 
 #endif // TERRAIN_RENDERER_DX12_H

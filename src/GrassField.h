@@ -157,6 +157,7 @@ public:
             const float dx = c.cx - m_eye.x;
             const float dz = c.cz - m_eye.z;
             if (dx * dx + dz * dz > reachSq) continue;
+            if (RuntimeCellExcluded(c.cx, c.cz)) continue;
             // Density trims each cell's contiguous instance run. Blades are
             // stored tuft-contiguous, so a fractional cut drops whole tufts and
             // reads as natural thinning -- no buffer rebuild, safe to change
@@ -165,6 +166,23 @@ public:
                 (UINT)((float)c.bladeCount * m_density));
             out.push_back({ c.firstBlade, count });
         }
+    }
+
+    void AddRuntimeExclusion(float x, float z, float radius) {
+        if (radius <= 0.0f) return;
+        m_runtimeExclusions.push_back({ x, z, radius });
+    }
+
+    void ClearRuntimeExclusions() { m_runtimeExclusions.clear(); }
+
+    bool RuntimeExcluded(float x, float z, float padding = 0.0f) const {
+        for (const RuntimeExclusion& exclusion : m_runtimeExclusions) {
+            const float dx = x - exclusion.x;
+            const float dz = z - exclusion.z;
+            const float reach = exclusion.radius + padding;
+            if (dx * dx + dz * dz <= reach * reach) return true;
+        }
+        return false;
     }
 
     // The 12 root constants (b6) the grass vertex shader reads. Laid out to match
@@ -234,6 +252,7 @@ public:
         m_blades.clear();
         m_cells.clear();
         m_exclusions.clear();
+        m_runtimeExclusions.clear();
         m_ready = false;
         m_time = 0.0f;
     }
@@ -241,6 +260,25 @@ public:
     ~GrassField() { Shutdown(); }
 
 private:
+    struct RuntimeExclusion {
+        float x = 0.0f;
+        float z = 0.0f;
+        float radius = 0.0f;
+    };
+
+    bool RuntimeCellExcluded(float centerX, float centerZ) const {
+        constexpr float halfCell = kCellSize * 0.5f;
+        for (const RuntimeExclusion& exclusion : m_runtimeExclusions) {
+            const float dx = (std::max)(
+                std::abs(exclusion.x - centerX) - halfCell, 0.0f);
+            const float dz = (std::max)(
+                std::abs(exclusion.z - centerZ) - halfCell, 0.0f);
+            if (dx * dx + dz * dz <= exclusion.radius * exclusion.radius)
+                return true;
+        }
+        return false;
+    }
+
     static constexpr int  kSegments = 4;       // authored vertical segments
     // A blade is a strip: (kSegments + 1) rows of 2 vertices, tapering to a point.
     static constexpr int  kVertsPerBlade = (kSegments + 1) * 2;
@@ -570,6 +608,7 @@ private:
 
     std::function<float(float, float)> m_terrain;
     std::vector<Exclusion> m_exclusions;
+    std::vector<RuntimeExclusion> m_runtimeExclusions;
     std::vector<AuthoredPatch> m_authoredPatches;
     std::vector<Blade> m_blades;
     std::vector<Cell>  m_cells;

@@ -66,14 +66,18 @@ const char* LevelEntityTypeName(LevelEntityType type) {
     case LevelEntityType::Humvee: return "humvee";
     case LevelEntityType::Helicopter: return "helicopter";
     case LevelEntityType::GrassPatch: return "grass_patch";
-    case LevelEntityType::Fern: return "fern";
+    case LevelEntityType::Dandelion: return "dandelion";
     }
     return "unknown";
 }
 
 bool ParseLevelEntityType(const std::string& text, LevelEntityType& type) {
+    if (text == "fern") {
+        type = LevelEntityType::Dandelion;
+        return true;
+    }
     for (int i = static_cast<int>(LevelEntityType::PlayerSpawn);
-         i <= static_cast<int>(LevelEntityType::Fern); ++i) {
+         i <= static_cast<int>(LevelEntityType::Dandelion); ++i) {
         const auto candidate = static_cast<LevelEntityType>(i);
         if (text == LevelEntityTypeName(candidate)) {
             type = candidate;
@@ -136,6 +140,7 @@ LevelDefinition MakeLevelOneTemplate() {
         "Humvee", 0.0f, 3.45f, 0.0f));
     level.entities.push_back(MakeEntity(id++, LevelEntityType::Helicopter,
         "Helicopter", 0.0f, 14.0f, 0.0f));
+
     return level;
 }
 
@@ -148,13 +153,25 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
     if (!std::isfinite(level.terrainHeightScale) ||
         level.terrainHeightScale < 0.0f || level.terrainHeightScale > 50.0f)
         result.errors.push_back("terrain heightScale must be between 0 and 50");
+    if (level.terrainSculpt.size() > 256)
+        result.errors.push_back("terrain sculpt supports at most 256 stamps");
+    for (const TerrainSculptStamp& stamp : level.terrainSculpt) {
+        if (!std::isfinite(stamp.x) || !std::isfinite(stamp.z) ||
+            !std::isfinite(stamp.radius) || !std::isfinite(stamp.value) ||
+            !std::isfinite(stamp.strength) || stamp.radius < 0.1f ||
+            stamp.radius > 64.0f || stamp.strength < 0.0f ||
+            stamp.strength > 10.0f ||
+            (stamp.operation != TerrainSculptOperation::Add &&
+             stamp.operation != TerrainSculptOperation::Flatten))
+            result.errors.push_back("terrain contains an invalid sculpt stamp");
+    }
     std::unordered_set<uint64_t> ids;
     size_t playerSpawns = 0;
     for (const LevelEntity& entity : level.entities) {
         if (static_cast<int>(entity.type) <
-                static_cast<int>(LevelEntityType::PlayerSpawn) ||
+            static_cast<int>(LevelEntityType::PlayerSpawn) ||
             static_cast<int>(entity.type) >
-                static_cast<int>(LevelEntityType::Fern))
+                static_cast<int>(LevelEntityType::Dandelion))
             result.errors.push_back("entity " + std::to_string(entity.id) +
                                     " has an unknown type");
         if (!entity.id || !ids.insert(entity.id).second)
@@ -191,6 +208,25 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         level.schemaVersion = root.at("schemaVersion").get<uint32_t>();
         level.name = root.at("name").get<std::string>();
         level.terrainHeightScale = root.at("terrain").at("heightScale").get<float>();
+        const json& terrain = root.at("terrain");
+        if (terrain.contains("sculpt")) {
+            if (!terrain.at("sculpt").is_array())
+                throw std::runtime_error("terrain sculpt must be an array");
+            for (const json& source : terrain.at("sculpt")) {
+                TerrainSculptStamp stamp;
+                stamp.x = source.at("x").get<float>();
+                stamp.z = source.at("z").get<float>();
+                stamp.radius = source.at("radius").get<float>();
+                const std::string operation = source.value("operation", "add");
+                if (operation == "add") stamp.operation = TerrainSculptOperation::Add;
+                else if (operation == "flatten")
+                    stamp.operation = TerrainSculptOperation::Flatten;
+                else throw std::runtime_error("unknown terrain sculpt operation: " + operation);
+                stamp.value = source.at("value").get<float>();
+                stamp.strength = source.value("strength", 1.0f);
+                level.terrainSculpt.push_back(stamp);
+            }
+        }
         const json& entities = root.at("entities");
         if (!entities.is_array()) throw std::runtime_error("entities must be an array");
         for (const json& source : entities) {
@@ -239,9 +275,19 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
                 }}
             });
         }
+        json sculpt = json::array();
+        for (const TerrainSculptStamp& stamp : level.terrainSculpt) {
+            sculpt.push_back({
+                {"x", stamp.x}, {"z", stamp.z}, {"radius", stamp.radius},
+                {"operation", stamp.operation == TerrainSculptOperation::Flatten
+                    ? "flatten" : "add"},
+                {"value", stamp.value}, {"strength", stamp.strength}
+            });
+        }
         const json root = {
             {"schemaVersion", level.schemaVersion}, {"name", level.name},
-            {"terrain", {{"heightScale", level.terrainHeightScale}}},
+            {"terrain", {{"heightScale", level.terrainHeightScale},
+                         {"sculpt", std::move(sculpt)}}},
             {"entities", std::move(entities)}
         };
         if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());

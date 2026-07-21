@@ -21,6 +21,7 @@ public:
     bool FPSMode;
     float PlayerHeight;
     float FloorY;
+    bool IsCrouching;
     
     // Jump mechanics
     bool IsGrounded;
@@ -32,6 +33,7 @@ public:
         : Position(position), Front(XMFLOAT3(0.0f, 0.0f, -1.0f)), Up(XMFLOAT3(0.0f, 1.0f, 0.0f)),
           Yaw(-90.0f), Pitch(-5.0f), MovementSpeed(5.0f), MouseSensitivity(0.1f),
           FPSMode(true), PlayerHeight(1.7f), FloorY(0.0f),
+          IsCrouching(false),
           IsGrounded(true), VerticalVelocity(0.0f), Gravity(9.8f), JumpStrength(5.0f) {
         updateCameraVectors();
     }
@@ -118,6 +120,22 @@ public:
         updateCameraVectors();
     }
 
+    void SetCrouching(bool crouching, float deltaTime) {
+        if (!FPSMode) return;
+        constexpr float standingHeight = 1.7f;
+        constexpr float crouchingHeight = 0.95f;
+        constexpr float transitionSpeed = 5.0f;
+        IsCrouching = crouching;
+        const float target = crouching ? crouchingHeight : standingHeight;
+        const float oldHeight = PlayerHeight;
+        const float step = transitionSpeed * deltaTime;
+        if (PlayerHeight < target)
+            PlayerHeight = (std::min)(target, PlayerHeight + step);
+        else
+            PlayerHeight = (std::max)(target, PlayerHeight - step);
+        if (IsGrounded) Position.y += PlayerHeight - oldHeight;
+    }
+
     // Instant angular kick from weapon recoil. Unlike mouse input this is
     // already expressed in degrees, so sensitivity must not scale it.
     void ApplyRecoil(float pitchDegrees, float yawDegrees) {
@@ -127,7 +145,7 @@ public:
     }
 
     void Jump() {
-        if (FPSMode && IsGrounded) {
+        if (FPSMode && IsGrounded && !IsCrouching) {
             VerticalVelocity = JumpStrength;
             IsGrounded = false;
         }
