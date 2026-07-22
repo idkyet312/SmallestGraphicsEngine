@@ -89,6 +89,12 @@ set(HEADER_FILES
     src/StaticBufferDX12.h
     src/ProfilerDX12.h
     src/EngineLogger.h
+    src/PrefabRegistry.h
+    src/PrefabRuntime.h
+    src/PrefabColliders.h
+    src/AssetRegistry.h
+    src/AssetWatcher.h
+    src/PrefabThumbnailGenerator.h
     src/GunAudio.h
     src/NavigationSystem.h
     src/T3DPhysicsAsset.h
@@ -236,6 +242,10 @@ if(USE_DX12)
         src/DestructionDX12.cpp
         src/LevelDefinition.cpp
         src/LevelEditor.cpp
+        src/PrefabRegistry.cpp
+        src/AssetRegistry.cpp
+        src/AssetWatcher.cpp
+        src/PrefabThumbnailGenerator.cpp
         ${HEADER_FILES}
         ${SHADER_FILES}
     )
@@ -282,6 +292,37 @@ if(BUILD_TESTING)
     target_include_directories(LevelDefinitionTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(LevelDefinitionTests PRIVATE nlohmann_json::nlohmann_json)
     add_test(NAME LevelDefinitionTests COMMAND LevelDefinitionTests)
+
+    add_executable(PrefabRegistryTests
+        tests/PrefabRegistryTests.cpp
+        src/PrefabRegistry.cpp)
+    target_include_directories(PrefabRegistryTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(PrefabRegistryTests PRIVATE nlohmann_json::nlohmann_json)
+    target_link_libraries(PrefabRegistryTests PRIVATE assimp::assimp)
+    add_test(NAME PrefabRegistryTests COMMAND PrefabRegistryTests)
+
+    add_executable(AssetRegistryTests
+        tests/AssetRegistryTests.cpp
+        src/AssetRegistry.cpp)
+    target_include_directories(AssetRegistryTests PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${TINYGLTF_INCLUDE_DIRS})
+    target_link_libraries(AssetRegistryTests PRIVATE nlohmann_json::nlohmann_json)
+    add_test(NAME AssetRegistryTests COMMAND AssetRegistryTests)
+
+    add_executable(PrefabThumbnailTests
+        tests/PrefabThumbnailTests.cpp
+        tests/StbImageWriteImpl.cpp
+        src/PrefabThumbnailGenerator.cpp)
+    target_include_directories(PrefabThumbnailTests PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${TINYGLTF_INCLUDE_DIRS})
+    target_link_libraries(PrefabThumbnailTests PRIVATE assimp::assimp)
+    add_test(NAME PrefabThumbnailTests COMMAND PrefabThumbnailTests)
+
+    add_executable(AssetWatcherTests
+        tests/AssetWatcherTests.cpp
+        src/AssetWatcher.cpp)
+    target_include_directories(AssetWatcherTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME AssetWatcherTests COMMAND AssetWatcherTests)
 endif()
 
 if(MSVC)
@@ -309,7 +350,13 @@ add_custom_command(TARGET GraphicEngine POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
     ${CMAKE_SOURCE_DIR}/shaders
     $<TARGET_FILE_DIR:GraphicEngine>/shaders
-    COMMENT "Copying shaders to build directory"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+    ${CMAKE_SOURCE_DIR}/prefabs
+    $<TARGET_FILE_DIR:GraphicEngine>/prefabs
+    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+    ${CMAKE_SOURCE_DIR}/scripts
+    $<TARGET_FILE_DIR:GraphicEngine>/scripts
+    COMMENT "Copying shaders and data-driven content to build directory"
 )
 
 if(USE_DX12 AND DXC_EXECUTABLE)

@@ -684,6 +684,12 @@ public:
                 depthShader, humveeTransforms, lightSpace);
         }
 
+        for (const PrefabRenderBatch& batch : g_prefabRenderBatches) {
+            if (batch.model && batch.castShadow && !batch.transforms.empty())
+                DrawSceneNodeShadowInstances(batch.model, depthShader,
+                    batch.transforms, lightSpace);
+        }
+
         // Palm shadows use the same GPU wind as the visible mesh. Leaf cards run
         // an alpha-tested depth pass so fronds cast silhouettes, not solid quads.
         if (!g_emptyLevelMode && g_trees.IsInitialized()) {
