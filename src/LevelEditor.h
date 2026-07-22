@@ -32,6 +32,7 @@ public:
     void StopPlay();
     bool IsPlaying() const { return playing_; }
     bool ImportInProgress() const { return pendingImport_.valid(); }
+    void OpenAssetBrowser() { assetBrowserOpen_ = true; }
     bool IsDirty() const { return dirty_; }
     void RefreshAssets();
     const LevelDefinition& Level() const { return level_; }
@@ -55,6 +56,12 @@ private:
         bool afterExists = false;
         std::string before;
         std::string after;
+    };
+    struct PendingImportResult {
+        PrefabSaveResult result;
+        std::filesystem::path savedPrefab;
+        PrefabRegistry prefabRegistry;
+        AssetRegistry assetRegistry;
     };
     LevelEntity* Selected();
     const LevelEntity* Selected() const;
@@ -152,7 +159,7 @@ private:
     int prefabLodModelSelection_ = 0;
     float prefabNewLodDistance_ = 25.0f;
     int prefabChildSelection_ = 0;
-    std::future<std::pair<PrefabSaveResult, std::filesystem::path>> pendingImport_;
+    std::future<PendingImportResult> pendingImport_;
     std::vector<AssetFileChange> pendingImportChanges_;
     std::vector<std::vector<AssetFileChange>> assetUndo_;
     std::vector<std::vector<AssetFileChange>> assetRedo_;

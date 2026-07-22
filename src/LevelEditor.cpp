@@ -475,9 +475,13 @@ bool LevelEditor::BrowseImportModel() {
                 importDirectory / it->path().filename()));
     }
     pendingImport_ = std::async(std::launch::async, [source]() {
-        std::filesystem::path savedPrefab;
-        PrefabSaveResult result = PrefabRegistry::ImportModel(source, savedPrefab);
-        return std::make_pair(std::move(result), std::move(savedPrefab));
+        PendingImportResult output;
+        output.result = PrefabRegistry::ImportModel(source, output.savedPrefab);
+        if (output.result.ok) {
+            output.assetRegistry.Refresh(true);
+            output.prefabRegistry.Refresh();
+        }
+        return output;
     });
     status_ = "Importing " + source.filename().string() + " in background...";
     return true;
@@ -819,8 +823,9 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     LevelEditorActions actions;
     if (pendingImport_.valid() && pendingImport_.wait_for(
             std::chrono::seconds(0)) == std::future_status::ready) {
-        auto [result, savedPrefab] = pendingImport_.get();
-        if (!result.ok) status_ = "Import failed: " + result.error;
+        PendingImportResult imported = pendingImport_.get();
+        if (!imported.result.ok)
+            status_ = "Import failed: " + imported.result.error;
         else {
             for (AssetFileChange& change : pendingImportChanges_) {
                 change.afterExists = std::filesystem::is_regular_file(change.path);
@@ -831,14 +836,15 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             }
             assetUndo_.push_back(std::move(pendingImportChanges_));
             assetRedo_.clear();
-            assetRegistry_.Refresh(true);
-            prefabRegistry_.Refresh();
+            assetRegistry_ = std::move(imported.assetRegistry);
+            prefabRegistry_ = std::move(imported.prefabRegistry);
             selectedPrefab_ = -1;
             const auto& assets = prefabRegistry_.Assets();
             for (size_t i = 0; i < assets.size(); ++i)
-                if (assets[i].definitionPath == savedPrefab)
+                if (assets[i].definitionPath == imported.savedPrefab)
                     selectedPrefab_ = static_cast<int>(i);
-            status_ = "Imported model and created " + savedPrefab.string();
+            status_ = "Imported model and created " +
+                imported.savedPrefab.string();
         }
     }
     if (playing_) {

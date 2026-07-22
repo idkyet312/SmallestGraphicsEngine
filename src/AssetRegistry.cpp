@@ -7,6 +7,9 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <assimp/Importer.hpp>
+#include <assimp/material.h>
+#include <assimp/scene.h>
 #include <nlohmann/json.hpp>
 #define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
@@ -74,6 +77,74 @@ bool ParseKind(const std::string& text, AssetKind& kind) {
         }
     }
     return false;
+}
+
+std::string PathKey(const std::filesystem::path& path) {
+    std::string key = path.lexically_normal().generic_string();
+#ifdef _WIN32
+    key = Lower(std::move(key));
+#endif
+    return key;
+}
+
+std::string DecodeTextureUri(std::string value) {
+    if (value.rfind("file://", 0) == 0) value.erase(0, 7);
+    std::string decoded;
+    decoded.reserve(value.size());
+    const auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t index = 0; index < value.size(); ++index) {
+        if (value[index] == '%' && index + 2 < value.size()) {
+            const int high = hex(value[index + 1]);
+            const int low = hex(value[index + 2]);
+            if (high >= 0 && low >= 0) {
+                decoded.push_back(static_cast<char>((high << 4) | low));
+                index += 2;
+                continue;
+            }
+        }
+        decoded.push_back(value[index]);
+    }
+    return decoded;
+}
+
+std::vector<std::string> ModelTextureReferences(
+        const std::filesystem::path& modelPath) {
+    std::vector<std::string> references;
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile(modelPath.string(), 0);
+    if (!scene) return references;
+    constexpr aiTextureType types[] = {
+        aiTextureType_DIFFUSE, aiTextureType_SPECULAR, aiTextureType_AMBIENT,
+        aiTextureType_EMISSIVE, aiTextureType_HEIGHT, aiTextureType_NORMALS,
+        aiTextureType_SHININESS, aiTextureType_OPACITY, aiTextureType_DISPLACEMENT,
+        aiTextureType_LIGHTMAP, aiTextureType_REFLECTION, aiTextureType_BASE_COLOR,
+        aiTextureType_NORMAL_CAMERA, aiTextureType_EMISSION_COLOR,
+        aiTextureType_METALNESS, aiTextureType_DIFFUSE_ROUGHNESS,
+        aiTextureType_AMBIENT_OCCLUSION
+    };
+    for (unsigned materialIndex = 0; materialIndex < scene->mNumMaterials;
+         ++materialIndex) {
+        const aiMaterial* material = scene->mMaterials[materialIndex];
+        for (const aiTextureType type : types) {
+            for (unsigned textureIndex = 0;
+                 textureIndex < material->GetTextureCount(type); ++textureIndex) {
+                aiString path;
+                if (material->GetTexture(type, textureIndex, &path) != AI_SUCCESS)
+                    continue;
+                std::string value = DecodeTextureUri(path.C_Str());
+                if (value.empty() || value.front() == '*') continue;
+                std::replace(value.begin(), value.end(), '\\', '/');
+                if (std::find(references.begin(), references.end(), value) ==
+                    references.end()) references.push_back(std::move(value));
+            }
+        }
+    }
+    return references;
 }
 
 } // namespace
@@ -195,7 +266,7 @@ bool AssetRegistry::Refresh(bool force) {
         std::unordered_map<std::string, std::vector<std::string>> cachedBySignature;
         std::unordered_map<std::string, std::string> declaredGuidByPath;
         for (const AssetRecord& old : cached) {
-            cachedByPath[old.path.lexically_normal().generic_string()] = old;
+            cachedByPath[PathKey(old.path)] = old;
             if (!old.guid.empty())
                 cachedBySignature[Signature(old)].push_back(old.guid);
         }
@@ -206,15 +277,13 @@ bool AssetRegistry::Refresh(bool force) {
                 json root; stream >> root;
                 const json& mesh = root.at("components").at("staticMesh");
                 const std::string guid = mesh.value("assetGuid", "");
-                const std::string path = std::filesystem::path(
-                    mesh.value("path", "")).lexically_normal().generic_string();
+                const std::string path = PathKey(mesh.value("path", ""));
                 if (!guid.empty() && !path.empty()) declaredGuidByPath[path] = guid;
             } catch (...) {}
         }
         std::unordered_set<std::string> usedGuids;
         for (AssetRecord& asset : scanned) {
-            const std::string normalizedPath =
-                asset.path.lexically_normal().generic_string();
+            const std::string normalizedPath = PathKey(asset.path);
             const auto declared = declaredGuidByPath.find(normalizedPath);
             if (declared != declaredGuidByPath.end()) asset.guid = declared->second;
             const auto old = cachedByPath.find(
@@ -243,7 +312,7 @@ bool AssetRegistry::Refresh(bool force) {
         std::unordered_map<std::string, std::string> guidByPath;
         std::unordered_map<std::string, std::string> guidByPrefabId;
         for (const AssetRecord& asset : scanned)
-            guidByPath[asset.path.lexically_normal().generic_string()] = asset.guid;
+            guidByPath[PathKey(asset.path)] = asset.guid;
         for (const AssetRecord& asset : scanned) {
             if (asset.kind != AssetKind::Prefab) continue;
             try {
@@ -262,10 +331,37 @@ bool AssetRegistry::Refresh(bool force) {
         };
         for (AssetRecord& asset : scanned) {
             if (asset.kind == AssetKind::Model) {
-                for (const AssetRecord& texture : scanned)
-                    if (texture.kind == AssetKind::Texture &&
-                        texture.path.parent_path() == asset.path.parent_path())
-                        addDependency(asset, texture.guid);
+                const auto cachedModel = cachedByPath.find(PathKey(asset.path));
+                if (cachedModel != cachedByPath.end() &&
+                    cachedModel->second.size == asset.size &&
+                    cachedModel->second.modified == asset.modified) {
+                    asset.dependencies = cachedModel->second.dependencies;
+                    asset.missingDependencies =
+                        cachedModel->second.missingDependencies;
+                } else {
+                    for (const std::string& reference :
+                         ModelTextureReferences(asset.path)) {
+                        const std::filesystem::path raw(reference);
+                        const std::filesystem::path resolved = raw.is_absolute()
+                            ? raw.lexically_normal()
+                            : (asset.path.parent_path() / raw).lexically_normal();
+                        auto texture = guidByPath.find(PathKey(resolved));
+                        if (texture == guidByPath.end() && !raw.is_absolute())
+                            texture = guidByPath.find(PathKey(raw));
+                        if (texture != guidByPath.end()) {
+                            addDependency(asset, texture->second);
+                        } else {
+                            const std::string missing = resolved.generic_string();
+                            if (std::find(asset.missingDependencies.begin(),
+                                          asset.missingDependencies.end(), missing) ==
+                                asset.missingDependencies.end())
+                                asset.missingDependencies.push_back(missing);
+                        }
+                    }
+                }
+                std::sort(asset.dependencies.begin(), asset.dependencies.end());
+                std::sort(asset.missingDependencies.begin(),
+                          asset.missingDependencies.end());
             }
             if (asset.kind != AssetKind::Prefab && asset.kind != AssetKind::Level)
                 continue;
@@ -281,8 +377,7 @@ bool AssetRegistry::Refresh(bool force) {
                         for (const json& child : value) self(self, child, field);
                     } else if (value.is_string()) {
                         const std::string text = value.get<std::string>();
-                        auto byPath = guidByPath.find(
-                            std::filesystem::path(text).lexically_normal().generic_string());
+                        auto byPath = guidByPath.find(PathKey(text));
                         bool resolved = false;
                         if (byPath != guidByPath.end()) {
                             addDependency(asset, byPath->second);
