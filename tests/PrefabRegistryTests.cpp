@@ -46,6 +46,8 @@ int main() {
         crate.defaultScale[0] = crate.defaultScale[1] = crate.defaultScale[2] = 2.0f;
         crate.targetSize = 1.5f;
         crate.useMaterials = false;
+        crate.materialAmbientScale = 1.25f;
+        crate.materialViewFillStrength = 0.1f;
         crate.collision = "box";
         crate.light.enabled = true;
         crate.light.intensity = 3.5f;
@@ -65,6 +67,8 @@ int main() {
             CHECK(loaded->modelPath == std::filesystem::path("models/crate.glb"));
             CHECK(loaded->targetSize == 1.5f);
             CHECK(!loaded->useMaterials);
+            CHECK(loaded->materialAmbientScale == 1.25f);
+            CHECK(loaded->materialViewFillStrength == 0.1f);
             CHECK(loaded->collision == "box");
             CHECK(loaded->schemaVersion == 2);
             CHECK(loaded->light.enabled);

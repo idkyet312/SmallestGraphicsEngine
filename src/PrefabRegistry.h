@@ -80,6 +80,8 @@ struct PrefabAsset {
     float targetSize = 0.0f;
     bool castShadow = true;
     bool useMaterials = true;
+    float materialAmbientScale = 1.0f;
+    float materialViewFillStrength = 0.0f;
     std::string collision = "none";
     PrefabLightComponent light;
     PrefabAudioComponent audio;

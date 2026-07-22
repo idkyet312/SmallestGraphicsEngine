@@ -223,8 +223,16 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
             prefab.castShadow = mesh.value("castShadow", true);
             prefab.useMaterials = mesh.value("useMaterials", true);
             prefab.targetSize = mesh.value("targetSize", 0.0f);
+            prefab.materialAmbientScale = mesh.value("materialAmbientScale", 1.0f);
+            prefab.materialViewFillStrength = mesh.value(
+                "materialViewFillStrength", 0.0f);
             if (prefab.targetSize < 0.0f || prefab.targetSize > 10000.0f)
                 throw std::runtime_error("staticMesh.targetSize is out of range");
+            if (prefab.materialAmbientScale < 0.0f ||
+                prefab.materialAmbientScale > 4.0f ||
+                prefab.materialViewFillStrength < 0.0f ||
+                prefab.materialViewFillStrength > 1.0f)
+                throw std::runtime_error("staticMesh material lighting is out of range");
             if (mesh.contains("defaultScale") &&
                 !ReadScale(mesh.at("defaultScale"), prefab.defaultScale))
                 throw std::runtime_error("staticMesh.defaultScale must be three positive numbers");
@@ -472,6 +480,8 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
                 merged.castShadow = local.castShadow;
                 merged.useMaterials = local.useMaterials;
                 merged.targetSize = local.targetSize;
+                merged.materialAmbientScale = local.materialAmbientScale;
+                merged.materialViewFillStrength = local.materialViewFillStrength;
                 merged.materialOverrides = local.materialOverrides;
                 merged.lods = local.lods;
                 std::copy(std::begin(local.defaultScale), std::end(local.defaultScale),
@@ -632,6 +642,8 @@ PrefabSaveResult PrefabRegistry::Save(const PrefabAsset& prefab,
             mesh["targetSize"] = prefab.targetSize;
             mesh["castShadow"] = prefab.castShadow;
             mesh["useMaterials"] = prefab.useMaterials;
+            mesh["materialAmbientScale"] = prefab.materialAmbientScale;
+            mesh["materialViewFillStrength"] = prefab.materialViewFillStrength;
         }
         else components.erase("staticMesh");
         if (components.contains("staticMesh")) {

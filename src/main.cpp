@@ -2300,6 +2300,23 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
         };
         stripMaterials(stripMaterials, model);
     }
+    if (prefab.materialAmbientScale != 1.0f ||
+        prefab.materialViewFillStrength != 0.0f) {
+        const auto tuneMaterials = [&](const auto& self,
+                                       const std::shared_ptr<SceneNode>& node) -> void {
+            if (!node) return;
+            if (node->mesh) {
+                for (MeshPrimitive& primitive : node->mesh->primitives) {
+                    if (!primitive.material) continue;
+                    primitive.material->ambientScale = prefab.materialAmbientScale;
+                    primitive.material->viewFillStrength =
+                        prefab.materialViewFillStrength;
+                }
+            }
+            for (const auto& child : node->children) self(self, child);
+        };
+        tuneMaterials(tuneMaterials, model);
+    }
     model->translation = XMFLOAT3(0.0f, 0.0f, 0.0f);
     model->rotation = XMFLOAT4(0.0f, 0.0f, 0.0f, 1.0f);
     model->scale = XMFLOAT3(1.0f, 1.0f, 1.0f);
