@@ -5,7 +5,6 @@
 #include <filesystem>
 #include <string>
 #include <vector>
-#include <nlohmann/json.hpp>
 
 enum class LevelEntityType {
     PlayerSpawn,
@@ -18,8 +17,7 @@ enum class LevelEntityType {
     Helicopter,
     GrassPatch,
     Dandelion,
-    Rock,
-    Prefab
+    Rock
 };
 
 struct Transform {
@@ -32,12 +30,6 @@ struct LevelEntity {
     uint64_t id = 0;
     LevelEntityType type = LevelEntityType::EnemySpawn;
     std::string name;
-    // Registry ID for generic data-driven entities. Built-in entity types leave
-    // this empty; Prefab entities resolve it through PrefabRegistry.
-    std::string prefabId;
-    // Per-instance component values. Stored verbatim and recursively merged on
-    // top of prefab defaults at runtime.
-    nlohmann::json overrides = nlohmann::json::object();
     Transform transform;
     bool enabled = true;
 };
