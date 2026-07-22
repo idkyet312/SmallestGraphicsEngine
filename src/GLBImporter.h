@@ -19,6 +19,21 @@ class GLBImporter {
 public:
     static std::shared_ptr<SceneNode> LoadGLB(const std::string& filepath, Microsoft::WRL::ComPtr<ID3D12Device> device, Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList);
     static Microsoft::WRL::ComPtr<ID3D12Resource> LoadTextureFromFile(const std::string& filepath, Microsoft::WRL::ComPtr<ID3D12Device> device, Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploadHeaps);
+    static Microsoft::WRL::ComPtr<ID3D12Resource> LoadTextureFromMemory(
+        const unsigned char* data, size_t size,
+        Microsoft::WRL::ComPtr<ID3D12Device> device,
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploadHeaps);
+    static Microsoft::WRL::ComPtr<ID3D12Resource> LoadEmbeddedTextureRGBA256(
+        const unsigned char* rgba, int width, int height,
+        Microsoft::WRL::ComPtr<ID3D12Device> device,
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploadHeaps);
+    static Microsoft::WRL::ComPtr<ID3D12Resource> LoadTextureSingleMip(
+        const std::string& filepath,
+        Microsoft::WRL::ComPtr<ID3D12Device> device,
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploadHeaps);
 
     // Loads an equirectangular EXR as a linear R32G32B32A32_FLOAT texture
     // (single mip). Used for the HDRI sky dome so it keeps full dynamic range.
