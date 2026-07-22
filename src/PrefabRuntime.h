@@ -47,6 +47,7 @@ struct PrefabSpawnPoint {
 
 struct PrefabDestructibleInstance {
     uint64_t entityId = 0;
+    DirectX::XMFLOAT3 position{};
     float health = 100.0f;
 };
 

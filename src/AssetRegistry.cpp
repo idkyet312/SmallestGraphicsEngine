@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <nlohmann/json.hpp>
 #define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
@@ -47,9 +48,10 @@ std::string Signature(const AssetRecord& asset) {
         std::to_string(asset.size) + ':' + std::to_string(asset.modified);
 }
 
-std::string MakeGuid(const AssetRecord& asset) {
+std::string MakeGuid(const AssetRecord& asset, uint64_t salt = 0) {
     const std::string source = asset.path.generic_string() + ':' +
-        std::to_string(asset.size) + ':' + std::to_string(asset.modified);
+        std::to_string(asset.size) + ':' + std::to_string(asset.modified) + ':' +
+        std::to_string(salt);
     const uint64_t first = Hash(1469598103934665603ull, source);
     const uint64_t second = Hash(1099511628211ull, source + ":sge");
     std::ostringstream stream;
@@ -154,11 +156,13 @@ bool AssetRegistry::Refresh(bool force) {
     const std::filesystem::path cachePath = "assetcache/registry.json";
     std::vector<AssetRecord> cached;
     uint64_t cachedFingerprint = 0;
+    uint32_t cachedSchemaVersion = 0;
     try {
         std::ifstream stream(cachePath);
         json root;
         if (stream) stream >> root;
         if (root.is_object()) {
+            cachedSchemaVersion = root.value("schemaVersion", 1u);
             cachedFingerprint = root.value("fingerprint", 0ull);
             for (const json& item : root.at("assets")) {
                 AssetRecord record;
@@ -172,6 +176,8 @@ bool AssetRegistry::Refresh(bool force) {
                 record.height = item.value("height", 0);
                 record.dependencies = item.value("dependencies",
                                                   std::vector<std::string>{});
+                record.missingDependencies = item.value("missingDependencies",
+                                                  std::vector<std::string>{});
                 cached.push_back(std::move(record));
             }
         }
@@ -180,16 +186,18 @@ bool AssetRegistry::Refresh(bool force) {
     }
     const bool cacheHasGuids = !cached.empty() && std::all_of(cached.begin(),
         cached.end(), [](const AssetRecord& asset) { return !asset.guid.empty(); });
-    const bool cacheLoaded = !force && cachedFingerprint == fingerprint &&
+    const bool cacheLoaded = !force && cachedSchemaVersion == 3 &&
+                             cachedFingerprint == fingerprint &&
                              cacheHasGuids;
     if (cacheLoaded) scanned = cached;
     if (!cacheLoaded) {
         std::unordered_map<std::string, AssetRecord> cachedByPath;
-        std::unordered_map<std::string, std::string> cachedBySignature;
+        std::unordered_map<std::string, std::vector<std::string>> cachedBySignature;
         std::unordered_map<std::string, std::string> declaredGuidByPath;
         for (const AssetRecord& old : cached) {
             cachedByPath[old.path.lexically_normal().generic_string()] = old;
-            if (!old.guid.empty()) cachedBySignature[Signature(old)] = old.guid;
+            if (!old.guid.empty())
+                cachedBySignature[Signature(old)].push_back(old.guid);
         }
         for (const AssetRecord& definition : scanned) {
             if (definition.kind != AssetKind::Prefab) continue;
@@ -203,6 +211,7 @@ bool AssetRegistry::Refresh(bool force) {
                 if (!guid.empty() && !path.empty()) declaredGuidByPath[path] = guid;
             } catch (...) {}
         }
+        std::unordered_set<std::string> usedGuids;
         for (AssetRecord& asset : scanned) {
             const std::string normalizedPath =
                 asset.path.lexically_normal().generic_string();
@@ -216,9 +225,14 @@ bool AssetRegistry::Refresh(bool force) {
                 asset.height = old->second.height;
             } else if (asset.guid.empty()) {
                 const auto renamed = cachedBySignature.find(Signature(asset));
-                asset.guid = renamed == cachedBySignature.end()
-                    ? MakeGuid(asset) : renamed->second;
+                asset.guid = renamed != cachedBySignature.end() &&
+                             renamed->second.size() == 1 &&
+                             !usedGuids.count(renamed->second.front())
+                    ? renamed->second.front() : MakeGuid(asset);
             }
+            for (uint64_t salt = 1; usedGuids.count(asset.guid); ++salt)
+                asset.guid = MakeGuid(asset, salt);
+            usedGuids.insert(asset.guid);
             if (asset.kind == AssetKind::Texture && asset.width == 0) {
                 int channels = 0;
                 stbi_info(asset.path.string().c_str(), &asset.width,
@@ -258,29 +272,48 @@ bool AssetRegistry::Refresh(bool force) {
             try {
                 std::ifstream stream(asset.path);
                 json root; stream >> root;
-                const auto walk = [&](const auto& self, const json& value) -> void {
+                const auto walk = [&](const auto& self, const json& value,
+                                      const std::string& field) -> void {
                     if (value.is_object()) {
                         for (auto it = value.begin(); it != value.end(); ++it)
-                            self(self, it.value());
+                            self(self, it.value(), it.key());
                     } else if (value.is_array()) {
-                        for (const json& child : value) self(self, child);
+                        for (const json& child : value) self(self, child, field);
                     } else if (value.is_string()) {
                         const std::string text = value.get<std::string>();
                         auto byPath = guidByPath.find(
                             std::filesystem::path(text).lexically_normal().generic_string());
-                        if (byPath != guidByPath.end()) addDependency(asset, byPath->second);
+                        bool resolved = false;
+                        if (byPath != guidByPath.end()) {
+                            addDependency(asset, byPath->second);
+                            resolved = true;
+                        }
                         auto byId = guidByPrefabId.find(text);
-                        if (byId != guidByPrefabId.end()) addDependency(asset, byId->second);
+                        if (byId != guidByPrefabId.end()) {
+                            addDependency(asset, byId->second);
+                            resolved = true;
+                        }
+                        const std::string lowerField = Lower(field);
+                        const bool referenceField = lowerField == "path" ||
+                            lowerField == "texture" || lowerField == "prefab" ||
+                            lowerField == "prefabid" || lowerField == "extends";
+                        if (!resolved && referenceField && !text.empty() &&
+                            std::find(asset.missingDependencies.begin(),
+                                      asset.missingDependencies.end(), text) ==
+                                      asset.missingDependencies.end())
+                            asset.missingDependencies.push_back(text);
                     }
                 };
-                walk(walk, root);
+                walk(walk, root, "");
             } catch (...) {}
             std::sort(asset.dependencies.begin(), asset.dependencies.end());
+            std::sort(asset.missingDependencies.begin(),
+                      asset.missingDependencies.end());
         }
         try {
             std::filesystem::create_directories(cachePath.parent_path());
             json root;
-            root["schemaVersion"] = 2;
+            root["schemaVersion"] = 3;
             root["fingerprint"] = fingerprint;
             root["assets"] = json::array();
             for (const AssetRecord& asset : scanned)
@@ -289,7 +322,8 @@ bool AssetRegistry::Refresh(bool force) {
                     {"kind", KindString(asset.kind)}, {"size", asset.size},
                     {"mtime", asset.modified}, {"width", asset.width},
                     {"height", asset.height},
-                    {"dependencies", asset.dependencies} });
+                    {"dependencies", asset.dependencies},
+                    {"missingDependencies", asset.missingDependencies} });
             std::ofstream stream(cachePath);
             stream << root.dump(2) << '\n';
         } catch (const std::exception& exception) {

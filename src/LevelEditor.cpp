@@ -1048,7 +1048,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             if (prefabDraftIndex_ != selectedPrefab_) {
                 prefabDraftIndex_ = selectedPrefab_;
                 prefabDraft_ = prefabs[selectedPrefab_];
-                strncpy_s(prefabScriptPath_, prefabDraft_.scriptPath.string().c_str(),
+                strncpy_s(prefabAudioPath_, prefabDraft_.audio.path.string().c_str(),
                           _TRUNCATE);
             }
             ImGui::SeparatorText("Prefab Settings");
@@ -1058,17 +1058,168 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             ImGui::DragFloat3("Default scale", prefabDraft_.defaultScale, 0.05f,
                               0.01f, 100.0f);
             ImGui::Checkbox("Cast shadow", &prefabDraft_.castShadow);
+            ImGui::Checkbox("Use materials", &prefabDraft_.useMaterials);
             const char* collisionShapes[] = { "none", "box", "mesh" };
             int collisionIndex = prefabDraft_.collision == "box" ? 1 :
                 (prefabDraft_.collision == "mesh" ? 2 : 0);
             if (ImGui::Combo("Collision", &collisionIndex, collisionShapes,
                              IM_ARRAYSIZE(collisionShapes)))
                 prefabDraft_.collision = collisionShapes[collisionIndex];
-            ImGui::InputTextWithHint("Script", "scripts/my_behavior.json",
-                                     prefabScriptPath_, sizeof(prefabScriptPath_));
+
+            ImGui::SeparatorText("Components");
+            ImGui::Checkbox("Light", &prefabDraft_.light.enabled);
+            if (prefabDraft_.light.enabled) {
+                ImGui::ColorEdit3("Light color", prefabDraft_.light.color);
+                ImGui::DragFloat("Light intensity", &prefabDraft_.light.intensity,
+                                 0.1f, 0.0f, 100000.0f);
+                ImGui::DragFloat("Light radius", &prefabDraft_.light.radius,
+                                 0.1f, 0.01f, 10000.0f);
+            }
+            ImGui::Checkbox("Audio emitter", &prefabDraft_.audio.enabled);
+            if (prefabDraft_.audio.enabled) {
+                ImGui::InputTextWithHint("Audio path", "audio/loop.wav",
+                    prefabAudioPath_, sizeof(prefabAudioPath_));
+                ImGui::Checkbox("Audio loop", &prefabDraft_.audio.loop);
+                ImGui::DragFloat("Audio radius", &prefabDraft_.audio.radius,
+                                 0.1f, 0.01f, 10000.0f);
+            }
+            ImGui::Checkbox("Destructible", &prefabDraft_.destructible.enabled);
+            if (prefabDraft_.destructible.enabled)
+                ImGui::DragFloat("Health", &prefabDraft_.destructible.health,
+                                 1.0f, 0.01f, 1000000.0f);
+            ImGui::Checkbox("Spawner", &prefabDraft_.spawner.enabled);
+            if (prefabDraft_.spawner.enabled) {
+                char enemyType[96] = {};
+                strncpy_s(enemyType, prefabDraft_.spawner.enemyType.c_str(), _TRUNCATE);
+                if (ImGui::InputText("Enemy type", enemyType, sizeof(enemyType)))
+                    prefabDraft_.spawner.enemyType = enemyType;
+                int count = static_cast<int>(prefabDraft_.spawner.count);
+                if (ImGui::DragInt("Spawn count", &count, 1.0f, 1, 1024))
+                    prefabDraft_.spawner.count = static_cast<uint32_t>(count);
+            }
+
+            ImGui::SeparatorText("Variant / Nesting");
+            const char* basePreview = prefabDraft_.basePrefabId.empty()
+                ? "None" : prefabDraft_.basePrefabId.c_str();
+            if (ImGui::BeginCombo("Extends", basePreview)) {
+                if (ImGui::Selectable("None", prefabDraft_.basePrefabId.empty()))
+                    prefabDraft_.basePrefabId.clear();
+                for (const PrefabAsset& candidate : prefabs) {
+                    if (candidate.id == prefabDraft_.id || !candidate.error.empty()) continue;
+                    if (ImGui::Selectable(candidate.id.c_str(),
+                            prefabDraft_.basePrefabId == candidate.id))
+                        prefabDraft_.basePrefabId = candidate.id;
+                }
+                ImGui::EndCombo();
+            }
+            for (size_t childIndex = 0; childIndex < prefabDraft_.children.size();) {
+                PrefabChildAsset& child = prefabDraft_.children[childIndex];
+                ImGui::PushID(static_cast<int>(childIndex));
+                ImGui::TextUnformatted(child.prefabId.c_str());
+                ImGui::DragFloat3("Position", child.position, 0.05f);
+                ImGui::DragFloat3("Rotation", child.rotation, 0.5f);
+                ImGui::DragFloat3("Scale", child.scale, 0.05f, 0.01f, 100.0f);
+                const bool remove = ImGui::SmallButton("Remove child");
+                ImGui::PopID();
+                if (remove) prefabDraft_.children.erase(
+                    prefabDraft_.children.begin() + childIndex);
+                else ++childIndex;
+            }
+            if (!prefabs.empty()) {
+                prefabChildSelection_ = (std::min)(prefabChildSelection_,
+                    static_cast<int>(prefabs.size()) - 1);
+                if (ImGui::BeginCombo("Child prefab",
+                        prefabs[prefabChildSelection_].id.c_str())) {
+                    for (size_t i = 0; i < prefabs.size(); ++i) {
+                        if (prefabs[i].id == prefabDraft_.id || !prefabs[i].error.empty())
+                            continue;
+                        if (ImGui::Selectable(prefabs[i].id.c_str(),
+                                prefabChildSelection_ == static_cast<int>(i)))
+                            prefabChildSelection_ = static_cast<int>(i);
+                    }
+                    ImGui::EndCombo();
+                }
+                if (ImGui::Button("Add child") &&
+                    prefabs[prefabChildSelection_].id != prefabDraft_.id)
+                    prefabDraft_.children.push_back(
+                        { prefabs[prefabChildSelection_].id });
+            }
+
+            ImGui::SeparatorText("Material Overrides");
+            for (size_t overrideIndex = 0;
+                 overrideIndex < prefabDraft_.materialOverrides.size();) {
+                const PrefabMaterialOverride& material =
+                    prefabDraft_.materialOverrides[overrideIndex];
+                ImGui::PushID(static_cast<int>(overrideIndex));
+                ImGui::Text("%s -> %s", material.mesh.c_str(),
+                    material.texture.generic_string().c_str());
+                const bool remove = ImGui::SmallButton("Remove material");
+                ImGui::PopID();
+                if (remove) prefabDraft_.materialOverrides.erase(
+                    prefabDraft_.materialOverrides.begin() + overrideIndex);
+                else ++overrideIndex;
+            }
+            const auto textures = assetRegistry_.Assets(AssetKind::Texture);
+            if (!textures.empty()) {
+                prefabMaterialTextureSelection_ = (std::min)(
+                    prefabMaterialTextureSelection_, static_cast<int>(textures.size()) - 1);
+                ImGui::InputTextWithHint("Mesh / material", "MaterialName",
+                    prefabMaterialMesh_, sizeof(prefabMaterialMesh_));
+                if (ImGui::BeginCombo("Override texture", textures[
+                        prefabMaterialTextureSelection_]->path.filename().string().c_str())) {
+                    for (size_t i = 0; i < textures.size(); ++i)
+                        if (ImGui::Selectable(textures[i]->path.generic_string().c_str(),
+                                prefabMaterialTextureSelection_ == static_cast<int>(i)))
+                            prefabMaterialTextureSelection_ = static_cast<int>(i);
+                    ImGui::EndCombo();
+                }
+                ImGui::BeginDisabled(prefabMaterialMesh_[0] == '\0');
+                if (ImGui::Button("Add material override"))
+                    prefabDraft_.materialOverrides.push_back({
+                        prefabMaterialMesh_,
+                        textures[prefabMaterialTextureSelection_]->path });
+                ImGui::EndDisabled();
+            }
+
+            ImGui::SeparatorText("LODs");
+            for (size_t lodIndex = 0; lodIndex < prefabDraft_.lods.size();) {
+                PrefabLodAsset& lod = prefabDraft_.lods[lodIndex];
+                ImGui::PushID(static_cast<int>(lodIndex));
+                ImGui::TextUnformatted(lod.path.generic_string().c_str());
+                ImGui::DragFloat("Distance", &lod.distance, 0.5f, 0.0f, 100000.0f);
+                const bool remove = ImGui::SmallButton("Remove LOD");
+                ImGui::PopID();
+                if (remove) prefabDraft_.lods.erase(
+                    prefabDraft_.lods.begin() + lodIndex);
+                else ++lodIndex;
+            }
+            const auto models = assetRegistry_.Assets(AssetKind::Model);
+            if (!models.empty()) {
+                prefabLodModelSelection_ = (std::min)(prefabLodModelSelection_,
+                    static_cast<int>(models.size()) - 1);
+                if (ImGui::BeginCombo("LOD model", models[
+                        prefabLodModelSelection_]->path.filename().string().c_str())) {
+                    for (size_t i = 0; i < models.size(); ++i)
+                        if (ImGui::Selectable(models[i]->path.generic_string().c_str(),
+                                prefabLodModelSelection_ == static_cast<int>(i)))
+                            prefabLodModelSelection_ = static_cast<int>(i);
+                    ImGui::EndCombo();
+                }
+                ImGui::DragFloat("New LOD distance", &prefabNewLodDistance_,
+                                 0.5f, 0.0f, 100000.0f);
+                if (ImGui::Button("Add LOD")) {
+                    const AssetRecord* modelAsset = models[prefabLodModelSelection_];
+                    prefabDraft_.lods.push_back({ modelAsset->path,
+                        modelAsset->guid, prefabNewLodDistance_ });
+                    std::sort(prefabDraft_.lods.begin(), prefabDraft_.lods.end(),
+                        [](const PrefabLodAsset& a, const PrefabLodAsset& b) {
+                            return a.distance < b.distance;
+                        });
+                }
+            }
             if (ImGui::Button(prefabDraft_.generated
                     ? "Create Editable Prefab" : "Save Prefab Settings")) {
-                prefabDraft_.scriptPath = prefabScriptPath_;
+                prefabDraft_.audio.path = prefabAudioPath_;
                 std::filesystem::path destination = prefabDraft_.definitionPath;
                 if (prefabDraft_.generated) {
                     const std::string stem = SanitizeFileName(prefabDraft_.name);
@@ -1135,6 +1286,17 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                     ImGui::SameLine();
                 }
                 ImGui::TextUnformatted(asset->path.filename().string().c_str());
+                if (!asset->missingDependencies.empty()) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.58f, 0.18f, 1.0f),
+                                       "[MISSING DEP]");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::BeginTooltip();
+                        for (const std::string& missing : asset->missingDependencies)
+                            ImGui::TextUnformatted(missing.c_str());
+                        ImGui::EndTooltip();
+                    }
+                }
                 if (kind == AssetKind::Model) {
                     const PrefabAsset* generatedPrefab = nullptr;
                     for (const PrefabAsset& prefab : prefabRegistry_.Assets())

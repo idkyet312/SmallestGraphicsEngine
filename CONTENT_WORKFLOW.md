@@ -8,7 +8,7 @@ Routine static content needs no C++ change.
 2. Open **Assets**.
 3. Click **Import Model...** and choose FBX, GLB, or GLTF.
 4. Select imported asset.
-5. Set target size, default scale, shadows, collision, and optional script.
+5. Set target size, default scale, material use, shadows, and collision.
 6. Click **Add Selected** or double-click asset.
 7. Position it with gizmo and save level.
 
@@ -22,7 +22,7 @@ Use **Create Editable Prefab** to save their settings.
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "id": "props/example",
   "name": "Example",
   "components": {
@@ -30,10 +30,10 @@ Use **Create Editable Prefab** to save their settings.
       "path": "models/example.glb",
       "defaultScale": [1, 1, 1],
       "targetSize": 2.0,
-      "castShadow": true
+      "castShadow": true,
+      "useMaterials": true
     },
-    "collision": { "shape": "box" },
-    "script": { "path": "scripts/example_spin.json" }
+    "collision": { "shape": "box" }
   }
 }
 ```
@@ -41,13 +41,19 @@ Use **Create Editable Prefab** to save their settings.
 Collision values: `none`, `box`, `mesh`. Current `mesh` gameplay collision uses
 prefab bounds; renderer still uses original mesh.
 
-## Data script format
+Prefab Settings can add lights, looping/one-shot audio, destructible health,
+enemy spawners, material overrides, LOD models, child prefabs, and an `extends`
+base prefab. These settings save directly to schema v2 JSON. Per-instance
+overrides appear in Inspector after placing prefab; enable checkbox beside any
+property before editing it.
 
-```json
-{
-  "spinDegreesPerSecond": [0, 30, 0],
-  "bob": { "amplitude": 0.25, "frequency": 1.0 }
-}
-```
+Assets use persistent GUIDs stored in `assetcache/registry.json`. Prefabs retain
+GUID plus readable fallback path, so model renames survive registry refresh.
+Missing dependencies appear as `[MISSING DEP]` rows with tooltip details.
 
-Prefab and model changes hot-reload every three seconds while editor is open.
+Use **Undo Asset** and **Redo Asset** for prefab edits and imports. Ordinary
+level edits use toolbar **Undo** and **Redo**.
+
+Scripting remains reserved for a future language/runtime decision. Prefab and
+asset changes hot-reload through the native filesystem watcher while editor is
+open. Model imports and thumbnail generation run in background jobs.
