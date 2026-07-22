@@ -19,7 +19,6 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
@@ -63,12 +62,6 @@
 #include "PalmTrees.h"
 #include "LevelDefinition.h"
 #include "LevelEditor.h"
-#include "PrefabRegistry.h"
-#include "PrefabRuntime.h"
-#include "PrefabColliders.h"
-#include "AssetRegistry.h"
-#include "AssetWatcher.h"
-#include "PrefabThumbnailGenerator.h"
 
 using namespace DirectX;
 
@@ -101,28 +94,11 @@ std::vector<DandelionInstance> g_dandelionInstances;
 static XMFLOAT3             g_dandelionSourceCenter{};
 static float                g_dandelionSourceMinY = 0.0f;
 static float                g_dandelionSourceHeight = 1.0f;
-std::vector<PrefabRenderBatch> g_prefabRenderBatches;
-std::vector<PrefabCollider>    g_prefabColliders;
-std::vector<PrefabLightInstance> g_prefabLightInstances;
-std::vector<PrefabAudioEmitter> g_prefabAudioEmitters;
-std::vector<PrefabSpawnPoint> g_prefabSpawnPoints;
-std::vector<PrefabDestructibleInstance> g_prefabDestructibles;
-struct PrefabAudioPlayer {
-    size_t emitterIndex = 0;
-    std::unique_ptr<GunAudio> player;
-};
-static std::vector<PrefabAudioPlayer> g_prefabAudioPlayers;
-static PrefabRegistry       g_prefabRegistry;
-static AssetRegistry        g_assetRegistry;
-static AssetWatcher         g_assetWatcher;
-struct PrefabModelCacheEntry {
-    std::shared_ptr<SceneNode> model;
-    XMFLOAT3 boundsMinimum{};
-    XMFLOAT3 boundsMaximum{};
-};
-static std::unordered_map<std::string, PrefabModelCacheEntry> g_prefabModelCache;
-static std::unordered_set<std::string> g_prefabMeshFallbackWarnings;
-static bool                 g_prefabRebuildRequested = true;
+std::shared_ptr<SceneNode>  g_editorRockModel;
+std::vector<XMMATRIX>       g_editorRockInstances;
+bool                        g_editorRockVisible = false;
+static XMFLOAT3             g_editorRockSourceCenter{};
+static float                g_editorRockSourceSpan = 1.0f;
 std::shared_ptr<SceneNode>  g_helicopterMainRotorNode;
 std::shared_ptr<SceneNode>  g_helicopterTailRotorNode;
 std::shared_ptr<SceneNode>  g_humveeTurretNode;
@@ -229,13 +205,10 @@ static_assert(kStressBanditCount <= kSpawnerCount * kEnemiesPerSpawner);
 
 static size_t ActiveBanditSlotCount() {
     if (g_customLevelMode) {
-        size_t count = static_cast<size_t>(std::count_if(g_runtimeLevel.entities.begin(),
+        return static_cast<size_t>(std::count_if(g_runtimeLevel.entities.begin(),
             g_runtimeLevel.entities.end(), [](const LevelEntity& entity) {
                 return entity.enabled && entity.type == LevelEntityType::EnemySpawn;
             }));
-        for (const PrefabSpawnPoint& spawn : g_prefabSpawnPoints)
-            if (spawn.enemyType == "bandit") count += spawn.count;
-        return count;
     }
     return g_stressTestMode ? kStressBanditCount : 4 * kEnemiesPerSpawner;
 }
@@ -851,27 +824,6 @@ static bool SpawnBandit() {
             bandit->PlayClip("Walk");
             g_bandits.push_back(std::move(bandit));
             return true;
-        }
-        for (const PrefabSpawnPoint& spawn : g_prefabSpawnPoints) {
-            if (spawn.enemyType != "bandit") continue;
-            for (uint32_t member = 0; member < spawn.count; ++member, ++spawnIndex) {
-                if (spawnIndex != slot) continue;
-                const float angle = spawn.yawRadians + member * 2.3999632f;
-                const float radius = member == 0 ? 0.0f : 0.8f * std::sqrt(
-                    static_cast<float>(member));
-                bandit->position = { spawn.position.x + std::cos(angle) * radius,
-                    spawn.position.y, spawn.position.z + std::sin(angle) * radius };
-                bandit->yaw = spawn.yawRadians;
-                bandit->spawnSlot = static_cast<int>(slot);
-                bandit->leftArmReach = g_banditLeftArmReach;
-                bandit->orbitRadius = 4.4f + static_cast<float>(slot % 4) * 0.45f;
-                bandit->orbitDirection = (slot & 1) ? -1.0f : 1.0f;
-                bandit->fireCooldown = 0.7f +
-                    ((float)std::rand() / (float)RAND_MAX) * 2.8f;
-                bandit->PlayClip("Walk");
-                g_bandits.push_back(std::move(bandit));
-                return true;
-            }
         }
         return false;
     }
@@ -1526,72 +1478,6 @@ static DWORD windowedStyle = 0;
 static float deltaTime     = 0.0f;
 
 static ComPtr<ID3D12DescriptorHeap> imguiSrvHeap;
-static constexpr UINT kImGuiDescriptorCount = 512;
-struct PrefabThumbnailRuntime {
-    size_t sourceHash = 0;
-    std::filesystem::path pngPath;
-    std::future<bool> generation;
-    ComPtr<ID3D12Resource> texture;
-    std::vector<ComPtr<ID3D12Resource>> uploads;
-    UINT descriptorSlot = ~0u;
-};
-static std::unordered_map<std::string, PrefabThumbnailRuntime> g_prefabThumbnails;
-static UINT g_nextImGuiTextureSlot = 1;
-
-static uint64_t PrefabThumbnailTexture(const PrefabAsset& prefab) {
-    if (!imguiSrvHeap || prefab.modelPath.empty()) return 0;
-    std::error_code error;
-    const std::string source = prefab.modelPath.generic_string() + ':' +
-        std::to_string(std::filesystem::file_size(prefab.modelPath, error)) + ':' +
-        std::to_string(std::filesystem::last_write_time(prefab.modelPath, error)
-            .time_since_epoch().count()) + ':' + std::to_string(g_prefabRegistry.Revision());
-    const size_t sourceHash = std::hash<std::string>{}(source);
-    PrefabThumbnailRuntime& entry = g_prefabThumbnails[prefab.id];
-    if (entry.sourceHash != sourceHash) {
-        entry = PrefabThumbnailRuntime{};
-        entry.sourceHash = sourceHash;
-        entry.pngPath = std::filesystem::path("assetcache/thumbs") /
-            (std::to_string(sourceHash) + ".png");
-    }
-    if (!entry.texture && !std::filesystem::exists(entry.pngPath) &&
-        !entry.generation.valid()) {
-        const auto modelPath = prefab.modelPath;
-        const auto pngPath = entry.pngPath;
-        entry.generation = std::async(std::launch::async, [modelPath, pngPath]() {
-            return PrefabThumbnailGenerator::Render128(modelPath, pngPath);
-        });
-        return 0;
-    }
-    if (entry.generation.valid()) {
-        if (entry.generation.wait_for(std::chrono::seconds(0)) !=
-            std::future_status::ready) return 0;
-        if (!entry.generation.get()) return 0;
-    }
-    if (!entry.texture) {
-        if (g_nextImGuiTextureSlot >= kImGuiDescriptorCount) return 0;
-        entry.texture = GLBImporter::LoadTextureSingleMip(entry.pngPath.string(),
-            g_dx12.device, g_dx12.commandList, entry.uploads);
-        if (!entry.texture) return 0;
-        entry.descriptorSlot = g_nextImGuiTextureSlot++;
-        const UINT stride = g_dx12.device->GetDescriptorHandleIncrementSize(
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu =
-            imguiSrvHeap->GetCPUDescriptorHandleForHeapStart();
-        cpu.ptr += static_cast<SIZE_T>(entry.descriptorSlot) * stride;
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-        g_dx12.device->CreateShaderResourceView(entry.texture.Get(), &srv, cpu);
-    }
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu =
-        imguiSrvHeap->GetGPUDescriptorHandleForHeapStart();
-    gpu.ptr += static_cast<UINT64>(entry.descriptorSlot) *
-        g_dx12.device->GetDescriptorHandleIncrementSize(
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    return gpu.ptr;
-}
 
 struct PalmSpawn { float x, z, height, lean; };
 static constexpr std::array<PalmSpawn, 8> kPalmSpawns = {{
@@ -1838,79 +1724,13 @@ static void ScatterDandelions(
               << " GPU instances\n";
 }
 
-static bool ComputePrefabModelBounds(const std::shared_ptr<SceneNode>& model,
-                                     XMFLOAT3& minimum, XMFLOAT3& maximum) {
-    minimum = XMFLOAT3(FLT_MAX, FLT_MAX, FLT_MAX);
-    maximum = XMFLOAT3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
-    const auto visit = [&](const auto& self,
-                           const std::shared_ptr<SceneNode>& node) -> void {
-        if (!node) return;
-        const XMMATRIX nodeWorld = XMLoadFloat4x4(&node->globalTransform);
-        if (node->mesh) for (const MeshPrimitive& primitive : node->mesh->primitives) {
-            for (size_t i = 0; i + 11 < primitive.vertices.size(); i += 12) {
-                XMFLOAT3 point;
-                XMStoreFloat3(&point, XMVector3TransformCoord(XMVectorSet(
-                    primitive.vertices[i], primitive.vertices[i + 1],
-                    primitive.vertices[i + 2], 1.0f), nodeWorld));
-                minimum.x = (std::min)(minimum.x, point.x);
-                minimum.y = (std::min)(minimum.y, point.y);
-                minimum.z = (std::min)(minimum.z, point.z);
-                maximum.x = (std::max)(maximum.x, point.x);
-                maximum.y = (std::max)(maximum.y, point.y);
-                maximum.z = (std::max)(maximum.z, point.z);
-            }
-        }
-        for (const auto& child : node->children) self(self, child);
-    };
-    visit(visit, model);
-    return minimum.x != FLT_MAX;
-}
-
-static void ApplyPrefabMaterialOverrides(const PrefabAsset& prefab,
-                                         const std::shared_ptr<SceneNode>& model) {
-    for (const PrefabMaterialOverride& overrideValue : prefab.materialOverrides) {
-        const auto visit = [&](const auto& self,
-                               const std::shared_ptr<SceneNode>& node) -> void {
-            if (!node) return;
-            if (node->mesh) {
-                for (MeshPrimitive& primitive : node->mesh->primitives) {
-                    const bool matchesMesh = node->name == overrideValue.mesh ||
-                        node->mesh->name == overrideValue.mesh;
-                    const bool matchesMaterial = primitive.material &&
-                        primitive.material->name == overrideValue.mesh;
-                    if (!matchesMesh && !matchesMaterial) continue;
-                    auto material = primitive.material
-                        ? std::make_shared<SceneMaterial>(*primitive.material)
-                        : std::make_shared<SceneMaterial>();
-                    material->baseColorTexture = GLBImporter::LoadTextureFromFile(
-                        overrideValue.texture.string(), g_dx12.device,
-                        g_dx12.commandList, material->uploadHeaps);
-                    material->srvHeapSlot = ~0u;
-                    primitive.material = std::move(material);
-                }
-            }
-            for (const auto& child : node->children) self(self, child);
-        };
-        visit(visit, model);
-    }
-}
-
-static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
-    auto cached = g_prefabModelCache.find(prefab.id);
-    if (cached != g_prefabModelCache.end()) return &cached->second;
-    const std::string extension = prefab.modelPath.extension().string();
-    std::shared_ptr<SceneNode> model;
-    if (_stricmp(extension.c_str(), ".fbx") == 0) {
-        model = FBXImporter::Load(prefab.modelPath.string(), g_dx12.device,
-            g_dx12.commandList, 1.0f, false, true, false, true);
-    } else {
-        model = GLBImporter::LoadGLB(prefab.modelPath.string(), g_dx12.device,
-            g_dx12.commandList);
-    }
+static bool LoadEditorRockModel() {
+    if (g_editorRockModel) return true;
+    auto model = FBXImporter::Load("models/Rock1/Rock_Pack_num1.fbx",
+        g_dx12.device, g_dx12.commandList, 1.0f, false, false, false, false);
     if (!model) {
-        SGE_LOG("LogPrefab", EngineLog::Level::Error,
-            "Failed to load " + prefab.id + " from " + prefab.modelPath.string());
-        return nullptr;
+        std::cerr << "Editor rock FBX failed to load\n";
+        return false;
     }
     model->translation = XMFLOAT3(0.0f, 0.0f, 0.0f);
     model->rotation = XMFLOAT4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -1918,288 +1738,66 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
     XMFLOAT4X4 identity;
     XMStoreFloat4x4(&identity, XMMatrixIdentity());
     model->UpdateGlobalTransform(identity);
-    if (prefab.targetSize > 0.0f) {
-        XMFLOAT3 minimum;
-        XMFLOAT3 maximum;
-        if (ComputePrefabModelBounds(model, minimum, maximum)) {
-            const float span = (std::max)({ maximum.x - minimum.x,
-                maximum.y - minimum.y, maximum.z - minimum.z, 0.001f });
-            const float normalizedScale = prefab.targetSize / span;
-            const XMFLOAT3 anchor((minimum.x + maximum.x) * 0.5f, minimum.y,
-                                  (minimum.z + maximum.z) * 0.5f);
-            model->scale = XMFLOAT3(normalizedScale, normalizedScale,
-                                    normalizedScale);
-            model->translation = XMFLOAT3(-anchor.x * normalizedScale,
-                                          -anchor.y * normalizedScale,
-                                          -anchor.z * normalizedScale);
-            model->UpdateGlobalTransform(identity);
-        }
-    }
-    ApplyPrefabMaterialOverrides(prefab, model);
-    PrefabModelCacheEntry entry;
-    entry.model = model;
-    if (!ComputePrefabModelBounds(model, entry.boundsMinimum, entry.boundsMaximum)) {
-        entry.boundsMinimum = XMFLOAT3(-0.5f, 0.0f, -0.5f);
-        entry.boundsMaximum = XMFLOAT3(0.5f, 1.0f, 0.5f);
-        SGE_LOG("LogPrefab", EngineLog::Level::Warning,
-            "Model has no renderable bounds; using unit box: " + prefab.id);
-    }
-    auto inserted = g_prefabModelCache.emplace(prefab.id, std::move(entry));
-    SGE_LOG("LogPrefab", EngineLog::Level::Display,
-        "Loaded " + prefab.id + " from " + prefab.modelPath.string());
-    return &inserted.first->second;
-}
 
-static void RebuildPrefabRenderBatches() {
-    g_prefabRenderBatches.clear();
-    g_prefabColliders.clear();
-    g_assetRegistry.Refresh();
-    g_prefabRegistry.Refresh();
-    g_prefabLightInstances.clear();
-    g_prefabAudioEmitters.clear();
-    g_prefabSpawnPoints.clear();
-    g_prefabDestructibles.clear();
-    g_prefabAudioPlayers.clear();
-    std::unordered_map<std::string, size_t> batches;
-    const auto addInstance = [&](const auto& self, const std::string& prefabId,
-                                 const XMMATRIX& world, uint64_t entityId,
-                                 const nlohmann::json& overrides,
-                                 unsigned depth) -> void {
-        if (depth > 16) {
-            SGE_LOG("LogPrefab", EngineLog::Level::Error,
-                "Prefab nesting depth exceeded at: " + prefabId);
-            return;
-        }
-        const PrefabAsset* prefab = g_prefabRegistry.Find(prefabId);
-        if (!prefab) {
-            SGE_LOG("LogPrefab", EngineLog::Level::Warning,
-                "Level entity references missing prefab: " + prefabId);
-            return;
-        }
-        PrefabModelCacheEntry* cachedModel = LoadPrefabModel(*prefab);
-        if (!cachedModel) return;
-        const nlohmann::json components = MergePrefabComponents(
-            prefab->components, overrides);
-        const bool castShadow = components.contains("staticMesh")
-            ? components.at("staticMesh").value("castShadow", prefab->castShadow)
-            : prefab->castShadow;
-        const std::string batchKey = prefabId + (castShadow ? "#shadow" : "#noshadow");
-        size_t index = 0;
-        auto found = batches.find(batchKey);
-        if (found == batches.end()) {
-            index = g_prefabRenderBatches.size();
-            batches[batchKey] = index;
-            PrefabRenderBatch batch;
-            batch.prefabId = prefabId;
-            batch.model = cachedModel->model;
-            batch.baseModel = cachedModel->model;
-            batch.castShadow = castShadow;
-            for (size_t lodIndex = 0; lodIndex < prefab->lods.size(); ++lodIndex) {
-                PrefabAsset lodPrefab = *prefab;
-                lodPrefab.id = prefab->id + "#lod" + std::to_string(lodIndex);
-                lodPrefab.modelPath = prefab->lods[lodIndex].path;
-                lodPrefab.modelGuid = prefab->lods[lodIndex].assetGuid;
-                lodPrefab.lods.clear();
-                if (PrefabModelCacheEntry* lodModel = LoadPrefabModel(lodPrefab))
-                    batch.lods.push_back({ prefab->lods[lodIndex].distance,
-                                           lodModel->model });
+    XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
+    XMFLOAT3 maximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    const auto configure = [&](const auto& self,
+                               const std::shared_ptr<SceneNode>& node) -> void {
+        if (!node) return;
+        if (node->mesh) for (MeshPrimitive& primitive : node->mesh->primitives) {
+            if (primitive.material) {
+                primitive.material->baseColorFactor =
+                    XMFLOAT4(0.32f, 0.30f, 0.27f, 1.0f);
+                primitive.material->metallicFactor = 0.0f;
+                primitive.material->roughnessFactor = 0.92f;
             }
-            g_prefabRenderBatches.push_back(std::move(batch));
-        } else index = found->second;
-        g_prefabRenderBatches[index].baseTransforms.push_back(world);
-        g_prefabRenderBatches[index].transforms.push_back(world);
-
-        const std::string collision = components.contains("collision")
-            ? components.at("collision").value("shape", prefab->collision)
-            : prefab->collision;
-        if (collision != "none") {
-            if (collision == "mesh" &&
-                g_prefabMeshFallbackWarnings.insert(prefabId).second) {
-                SGE_LOG("LogPrefab", EngineLog::Level::Warning,
-                    "Mesh collision unavailable; using bounds box: " + prefabId);
+            for (size_t i = 0; i + 11 < primitive.vertices.size(); i += 12) {
+                minimum.x = (std::min)(minimum.x, primitive.vertices[i]);
+                minimum.y = (std::min)(minimum.y, primitive.vertices[i + 1]);
+                minimum.z = (std::min)(minimum.z, primitive.vertices[i + 2]);
+                maximum.x = (std::max)(maximum.x, primitive.vertices[i]);
+                maximum.y = (std::max)(maximum.y, primitive.vertices[i + 1]);
+                maximum.z = (std::max)(maximum.z, primitive.vertices[i + 2]);
             }
-            const XMFLOAT3& minimum = cachedModel->boundsMinimum;
-            const XMFLOAT3& maximum = cachedModel->boundsMaximum;
-            const XMFLOAT3 localCenter((minimum.x + maximum.x) * 0.5f,
-                (minimum.y + maximum.y) * 0.5f,
-                (minimum.z + maximum.z) * 0.5f);
-            XMFLOAT3 worldCenter;
-            XMStoreFloat3(&worldCenter, XMVector3TransformCoord(
-                XMLoadFloat3(&localCenter), world));
-            XMFLOAT3 worldX, worldY, worldZ;
-            XMStoreFloat3(&worldX, XMVector3TransformNormal(
-                XMVectorSet(1, 0, 0, 0), world));
-            XMStoreFloat3(&worldY, XMVector3TransformNormal(
-                XMVectorSet(0, 1, 0, 0), world));
-            XMStoreFloat3(&worldZ, XMVector3TransformNormal(
-                XMVectorSet(0, 0, 1, 0), world));
-            const float scaleX = XMVectorGetX(XMVector3Length(XMLoadFloat3(&worldX)));
-            const float scaleY = XMVectorGetX(XMVector3Length(XMLoadFloat3(&worldY)));
-            const float scaleZ = XMVectorGetX(XMVector3Length(XMLoadFloat3(&worldZ)));
-            PrefabCollider collider;
-            collider.entityId = entityId;
-            collider.prefabId = prefabId;
-            collider.center = worldCenter;
-            collider.halfExtents = XMFLOAT3(
-                (maximum.x - minimum.x) * 0.5f * scaleX,
-                (maximum.y - minimum.y) * 0.5f * scaleY,
-                (maximum.z - minimum.z) * 0.5f * scaleZ);
-            collider.yawRadians = std::atan2(worldX.z, worldX.x);
-            g_prefabColliders.push_back(std::move(collider));
         }
-
-        XMFLOAT3 origin;
-        XMStoreFloat3(&origin, XMVector3TransformCoord(XMVectorZero(), world));
-        if (components.contains("light")) {
-            const auto& light = components.at("light");
-            const auto color = light.value("color", std::vector<float>{1, 1, 1});
-            if (color.size() == 3) g_prefabLightInstances.push_back({ entityId,
-                origin, {color[0], color[1], color[2]},
-                light.value("intensity", 1.0f), light.value("radius", 5.0f) });
-        }
-        if (components.contains("audio")) {
-            const auto& audio = components.at("audio");
-            g_prefabAudioEmitters.push_back({ entityId, origin,
-                audio.value("path", ""), audio.value("loop", false),
-                audio.value("radius", 15.0f) });
-        }
-        if (components.contains("destructible"))
-            g_prefabDestructibles.push_back({ entityId,
-                components.at("destructible").value("health", 100.0f) });
-        if (components.contains("spawner")) {
-            const auto& spawner = components.at("spawner");
-            XMFLOAT3 spawnWorldX;
-            XMStoreFloat3(&spawnWorldX, XMVector3TransformNormal(
-                XMVectorSet(1, 0, 0, 0), world));
-            g_prefabSpawnPoints.push_back({ entityId, origin,
-                std::atan2(spawnWorldX.z, spawnWorldX.x),
-                spawner.value("enemyType", "bandit"),
-                spawner.value("count", 1u) });
-        }
-        for (const PrefabChildAsset& child : prefab->children) {
-            const XMMATRIX childLocal = XMMatrixScaling(child.scale[0], child.scale[1],
-                child.scale[2]) * XMMatrixRotationRollPitchYaw(
-                XMConvertToRadians(child.rotation[0]),
-                XMConvertToRadians(child.rotation[1]),
-                XMConvertToRadians(child.rotation[2])) * XMMatrixTranslation(
-                child.position[0], child.position[1], child.position[2]);
-            self(self, child.prefabId, childLocal * world, entityId,
-                 nlohmann::json::object(), depth + 1);
-        }
+        for (const auto& child : node->children) self(self, child);
     };
-    for (const LevelEntity& entity : g_runtimeLevel.entities) {
-        if (!entity.enabled) continue;
-        std::string prefabId;
-        if (entity.type == LevelEntityType::Prefab) prefabId = entity.prefabId;
-        else if (entity.type == LevelEntityType::Rock) prefabId = "rock";
-        else continue;
-        const Transform& t = entity.transform;
-        const XMMATRIX world = XMMatrixScaling(t.scale[0], t.scale[1], t.scale[2]) *
-            XMMatrixRotationRollPitchYaw(XMConvertToRadians(t.rotation[0]),
-                XMConvertToRadians(t.rotation[1]), XMConvertToRadians(t.rotation[2])) *
-            XMMatrixTranslation(t.position[0], t.position[1], t.position[2]);
-        addInstance(addInstance, prefabId, world, entity.id, entity.overrides, 0);
-    }
-    scene.RebuildDemoLights();
-    for (const PrefabLightInstance& light : g_prefabLightInstances)
-        scene.clusteredRenderer.addLight(light.position, light.color,
-                                         light.radius, light.intensity);
-    for (size_t emitterIndex = 0; emitterIndex < g_prefabAudioEmitters.size();
-         ++emitterIndex) {
-        const PrefabAudioEmitter& emitter = g_prefabAudioEmitters[emitterIndex];
-        auto player = std::make_unique<GunAudio>();
-        if (player->Initialize(emitter.path)) {
-            if (emitter.loop) player->SetLoop(true, 0.0f);
-            else player->Play(0.7f);
-            g_prefabAudioPlayers.push_back({ emitterIndex, std::move(player) });
-        }
-    }
-    g_prefabRebuildRequested = false;
-    if (g_customLevelMode) g_pendingEnvironmentRebuild = true;
+    configure(configure, model);
+    if (minimum.x == FLT_MAX) return false;
+    g_editorRockSourceCenter = {
+        (minimum.x + maximum.x) * 0.5f,
+        minimum.y,
+        (minimum.z + maximum.z) * 0.5f };
+    g_editorRockSourceSpan = (std::max)({ maximum.x - minimum.x,
+        maximum.y - minimum.y, maximum.z - minimum.z, 0.001f });
+    g_editorRockModel = std::move(model);
+    return true;
 }
 
-static void UpdatePrefabAudio() {
-    for (PrefabAudioPlayer& runtime : g_prefabAudioPlayers) {
-        if (!runtime.player || runtime.emitterIndex >= g_prefabAudioEmitters.size())
-            continue;
-        const PrefabAudioEmitter& emitter = g_prefabAudioEmitters[runtime.emitterIndex];
-        const float dx = emitter.position.x - scene.camera.Position.x;
-        const float dy = emitter.position.y - scene.camera.Position.y;
-        const float dz = emitter.position.z - scene.camera.Position.z;
-        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
-        const float volume = (std::max)(0.0f, 1.0f - distance / emitter.radius);
-        if (emitter.loop) runtime.player->SetLoop(true, volume * 0.8f);
-        runtime.player->Update();
+static void BuildEditorRockInstances() {
+    g_editorRockInstances.clear();
+    g_editorRockVisible = gameScreen == GameScreen::LevelEditor &&
+        static_cast<bool>(g_editorRockModel);
+    if (!g_editorRockVisible) return;
+    constexpr float authoredSize = 2.0f;
+    const float normalization = authoredSize / g_editorRockSourceSpan;
+    for (const LevelEntity& entity : g_levelEditor.Level().entities) {
+        if (!entity.enabled || entity.type != LevelEntityType::Rock) continue;
+        g_editorRockInstances.push_back(
+            XMMatrixTranslation(-g_editorRockSourceCenter.x,
+                                -g_editorRockSourceCenter.y,
+                                -g_editorRockSourceCenter.z) *
+            XMMatrixScaling(normalization * entity.transform.scale[0],
+                            normalization * entity.transform.scale[1],
+                            normalization * entity.transform.scale[2]) *
+            XMMatrixRotationRollPitchYaw(
+                XMConvertToRadians(entity.transform.rotation[0]),
+                XMConvertToRadians(entity.transform.rotation[1]),
+                XMConvertToRadians(entity.transform.rotation[2])) *
+            XMMatrixTranslation(entity.transform.position[0],
+                                entity.transform.position[1],
+                                entity.transform.position[2]));
     }
-}
-
-static void UpdatePrefabLods() {
-    for (PrefabRenderBatch& batch : g_prefabRenderBatches) {
-        if (batch.lods.empty() || !batch.baseModel) continue;
-        float nearest = FLT_MAX;
-        for (const XMMATRIX& transform : batch.baseTransforms) {
-            XMFLOAT4X4 matrix;
-            XMStoreFloat4x4(&matrix, transform);
-            const float dx = matrix._41 - scene.camera.Position.x;
-            const float dy = matrix._42 - scene.camera.Position.y;
-            const float dz = matrix._43 - scene.camera.Position.z;
-            nearest = (std::min)(nearest,
-                std::sqrt(dx * dx + dy * dy + dz * dz));
-        }
-        batch.model = batch.baseModel;
-        for (const PrefabRenderBatch::LodModel& lod : batch.lods)
-            if (nearest >= lod.distance) batch.model = lod.model;
-    }
-}
-
-static void ResolvePlayerPrefabCollisions(XMFLOAT3& position, float radius,
-                                          float playerHeight) {
-    if (!scene.camera.FPSMode) return;
-    const float feet = position.y - playerHeight;
-    for (const PrefabCollider& collider : g_prefabColliders) {
-        if (feet >= collider.center.y + collider.halfExtents.y ||
-            position.y <= collider.center.y - collider.halfExtents.y) continue;
-        const float yaw = collider.yawRadians;
-        XMFLOAT3 local = PrefabColliderToLocal(collider, position);
-        float localX = local.x;
-        float localZ = local.z;
-        const float halfX = collider.halfExtents.x + radius;
-        const float halfZ = collider.halfExtents.z + radius;
-        if (std::abs(localX) >= halfX || std::abs(localZ) >= halfZ) continue;
-        const float penetrationX = halfX - std::abs(localX);
-        const float penetrationZ = halfZ - std::abs(localZ);
-        if (penetrationX < penetrationZ)
-            localX = std::copysign(halfX, std::abs(localX) > 0.001f ? localX : 1.0f);
-        else
-            localZ = std::copysign(halfZ, std::abs(localZ) > 0.001f ? localZ : 1.0f);
-        const float worldCosine = std::cos(yaw);
-        const float worldSine = std::sin(yaw);
-        position.x = collider.center.x +
-                     localX * worldCosine - localZ * worldSine;
-        position.z = collider.center.z +
-                     localX * worldSine + localZ * worldCosine;
-    }
-}
-
-static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
-                                     float radius, XMFLOAT3& hit) {
-    float closestDistanceSquared = FLT_MAX;
-    bool struck = false;
-    for (const PrefabCollider& collider : g_prefabColliders) {
-        XMFLOAT3 candidate;
-        if (!PrefabColliderIntersectsSegment(collider, start, end, radius,
-                                             &candidate)) continue;
-        const float dx = candidate.x - start.x;
-        const float dy = candidate.y - start.y;
-        const float dz = candidate.z - start.z;
-        const float distanceSquared = dx * dx + dy * dy + dz * dz;
-        if (distanceSquared < closestDistanceSquared) {
-            closestDistanceSquared = distanceSquared;
-            hit = candidate;
-            struck = true;
-        }
-    }
-    return struck;
 }
 
 static void RebuildScalableEnvironment() {
@@ -2254,23 +1852,6 @@ static void RebuildScalableEnvironment() {
                     (std::max)(0.15f, entity.transform.scale[0]),
                     (std::max)(0.05f, entity.transform.scale[1]),
                     static_cast<uint32_t>(entity.id) });
-            } else if (entity.type == LevelEntityType::Prefab ||
-                       entity.type == LevelEntityType::Rock) {
-                for (const PrefabCollider& collider : g_prefabColliders) {
-                    if (collider.entityId != entity.id) continue;
-                    const float c = std::abs(std::cos(collider.yawRadians));
-                    const float s = std::abs(std::sin(collider.yawRadians));
-                    const float halfX = c * collider.halfExtents.x +
-                                        s * collider.halfExtents.z;
-                    const float halfZ = s * collider.halfExtents.x +
-                                        c * collider.halfExtents.z;
-                    obstacles.push_back({ collider.center.x - halfX,
-                        collider.center.z - halfZ, collider.center.x + halfX,
-                        collider.center.z + halfZ });
-                    grassExclusions.push_back({ collider.center.x - halfX,
-                        collider.center.z - halfZ, collider.center.x + halfX,
-                        collider.center.z + halfZ });
-                }
             }
         }
     } else {
@@ -2358,8 +1939,8 @@ static void SetCursorVisible(bool visible) {
 }
 
 static void OpenMainMenu() {
-    g_prefabRenderBatches.clear();
-    g_prefabColliders.clear();
+    g_editorRockVisible = false;
+    g_editorRockInstances.clear();
     gameScreen = GameScreen::MainMenu;
     showUI = false;
     cameraLocked = true;
@@ -2523,7 +2104,6 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     lastX = (float)(rect.right - rect.left) * 0.5f;
     lastY = (float)(rect.bottom - rect.top) * 0.5f;
     firstMouse = true;
-    g_prefabRebuildRequested = true;
 }
 
 static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path) {
@@ -3930,10 +3510,8 @@ static void SynchronizeEditorRuntime(bool play) {
     g_terrain.SetSculptStamps(g_runtimeTerrainSculpt);
     g_grass.ClearRuntimeExclusions();
     g_customLevelMode = true;
-    g_assetRegistry.Refresh();
-    g_prefabRegistry.Refresh();
     ApplyRuntimeLevelBasics(play);
-    g_prefabRebuildRequested = true;
+    BuildEditorRockInstances();
     if (!play && terrainChanged && !foliageChanged) {
         if (g_destruction.IsInitialized()) {
             auto tp = CurrentTerrainParams();
@@ -3984,7 +3562,10 @@ static void StartLevelEditor(HWND hwnd) {
     scene.camera.FPSMode = false;
     ReleaseCapture();
     SetCursorVisible(true);
-    g_prefabRebuildRequested = true;
+    if (fullLevelAssetsLoaded) {
+        LoadEditorRockModel();
+        BuildEditorRockInstances();
+    }
 }
 
 static void BeginEditorPlaytest(HWND hwnd) {
@@ -4876,7 +4457,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     freopen_s(&fp, "CONOUT$", "w", stderr);
 
     EngineLog::ScopedSession logSession("GraphicEngine");
-    g_assetWatcher.Start();
 
     std::cout << "GraphicEngine DX12 Starting..." << std::endl;
 
@@ -4946,7 +4526,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // ImGui
     D3D12_DESCRIPTOR_HEAP_DESC ihd = {};
     ihd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    ihd.NumDescriptors = kImGuiDescriptorCount;
+    ihd.NumDescriptors = 1;
     ihd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     g_dx12.device->CreateDescriptorHeap(&ihd, IID_PPV_ARGS(&imguiSrvHeap));
 
@@ -5207,19 +4787,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         deltaTime = now - lastTime;
         lastTime  = now;
 
-        if (IsEditorEditing() && g_assetWatcher.ConsumeChange()) {
-            const bool assetsChanged = g_assetRegistry.Refresh();
-            if (assetsChanged || g_prefabRegistry.Refresh()) {
-                g_levelEditor.RefreshAssets();
-                WaitForGPU();
-                g_prefabRenderBatches.clear();
-                g_prefabModelCache.clear();
-                g_prefabRebuildRequested = true;
-                SGE_LOG("LogPrefab", EngineLog::Level::Display,
-                    "Asset change detected; prefab cache reloading");
-            }
-        }
-
         if (pendingEditorStopPlay) {
             pendingEditorStopPlay = false;
             StopEditorPlaytest();
@@ -5316,8 +4883,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_destruction.ResolvePlayerCollision(scene.camera.Position,
                 scene.camera.FloorY, 0.35f, scene.camera.PlayerHeight);
         }
-        ResolvePlayerPrefabCollisions(scene.camera.Position, 0.35f,
-                                      scene.camera.PlayerHeight);
 
         scene.Update(deltaTime, now);
         if (!g_emptyLevelMode) {
@@ -5602,12 +5167,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     if (!struck && g_trees.BlocksSegment(
                             projectile.previousPosition, projectile.position, radius))
                         struck = true;
-                    if (!struck && HitPrefabColliderSegment(
-                            projectile.previousPosition, projectile.position,
-                            radius, candidate)) {
-                        impact = candidate;
-                        struck = true;
-                    }
                     if (!struck && HitTerrainSegment(
                             projectile.previousPosition, projectile.position,
                             radius, candidate)) {
@@ -5797,16 +5356,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     projectile.active = false;
                     continue;
                 }
-                if (HitPrefabColliderSegment(projectile.previousPosition,
-                        projectile.position, bulletRadius, hit)) {
-                    projectile.position = hit;
-                    const XMFLOAT3 normal(-projectile.direction.x,
-                                          -projectile.direction.y,
-                                          -projectile.direction.z);
-                    scene.SpawnBulletImpact(hit, normal);
-                    projectile.active = false;
-                    continue;
-                }
                 if (g_destruction.HitTestSegment(projectile.previousPosition, projectile.position,
                                                  bulletRadius, hit)) {
                     std::cout << "Projectile hit wall at " << hit.x << ", "
@@ -5886,10 +5435,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 << "BeginFrame: " << e.what() << '\n';
             std::cerr << "BeginFrame: " << e.what() << "\n"; break;
         }
-        if (IsSceneScreen() && g_prefabRebuildRequested)
-            RebuildPrefabRenderBatches();
-        if (IsSceneScreen()) UpdatePrefabAudio();
-        if (IsSceneScreen()) UpdatePrefabLods();
         occlusionDepth.FinalizeCapture(g_dx12.commandList.Get());
         g_profiler.BeginGpuFrame(g_dx12.frameIndex, g_dx12.commandList.Get());
 
@@ -6094,7 +5639,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 ResetPalmTrees();
 
                 LoadDandelionModel();
-                g_prefabRebuildRequested = true;
+                if (gameScreen == GameScreen::LevelEditor) {
+                    LoadEditorRockModel();
+                    BuildEditorRockInstances();
+                }
                 RebuildScalableEnvironment();
             }
             // Same pool AABB for the destruction sim so house debris shoved into
@@ -6275,8 +5823,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ReleaseMaterialUploadHeaps(g_humveeModel);
             ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
             ReleaseMaterialUploadHeaps(g_dandelionModel);
-            for (const auto& entry : g_prefabModelCache)
-                ReleaseMaterialUploadHeaps(entry.second.model);
+            ReleaseMaterialUploadHeaps(g_editorRockModel);
             ReleaseMaterialUploadHeaps(g_banditModel.node);
             for (const auto& material : g_banditModel.materialKeepAlive)
                 if (material) material->uploadHeaps.clear();
@@ -6529,7 +6076,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     auto params = CurrentTerrainParams();
                     params.heightScale = scene.terrainHeightScale;
                     return TerrainRendererDX12::HeightAt(params, x, z);
-                }, PrefabThumbnailTexture);
+                });
             pendingEditorBeginPlay = actions.beginPlay;
             pendingEditorStopPlay = actions.stopPlay;
             pendingEditorReturnToMenu = actions.returnToMenu;
@@ -6635,7 +6182,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
 
     WaitForGPU();
-    g_assetWatcher.Stop();
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

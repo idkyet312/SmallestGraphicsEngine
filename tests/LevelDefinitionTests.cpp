@@ -31,14 +31,6 @@ int main() {
     rock.type = LevelEntityType::Rock;
     rock.name = "Editor Rock";
     level.entities.push_back(rock);
-    LevelEntity prefabEntity;
-    prefabEntity.id = 1004;
-    prefabEntity.type = LevelEntityType::Prefab;
-    prefabEntity.name = "Data Driven Crate";
-    prefabEntity.prefabId = "test/crate";
-    prefabEntity.overrides = { {"staticMesh", {{"castShadow", false}}},
-                               {"light", {{"intensity", 4.0f}}} };
-    level.entities.push_back(prefabEntity);
     level.terrainSculpt.push_back({ 3.0f, -4.0f, 2.5f,
         TerrainSculptOperation::Add, 0.75f, 1.0f });
     level.terrainSculpt.push_back({ 0.0f, 1.0f, 4.0f,
@@ -56,9 +48,6 @@ int main() {
     CHECK(loaded.level.entities[28].type == LevelEntityType::Dandelion);
     CHECK(loaded.level.entities[29].type == LevelEntityType::Rock);
     CHECK(std::string(LevelEntityTypeName(loaded.level.entities[29].type)) == "rock");
-    CHECK(loaded.level.entities[30].type == LevelEntityType::Prefab);
-    CHECK(loaded.level.entities[30].prefabId == "test/crate");
-    CHECK(loaded.level.entities[30].overrides == prefabEntity.overrides);
     LevelEntityType legacyFoliage = LevelEntityType::GrassPatch;
     CHECK(ParseLevelEntityType("fern", legacyFoliage));
     CHECK(legacyFoliage == LevelEntityType::Dandelion);
@@ -79,9 +68,6 @@ int main() {
     LevelDefinition invalidSculpt = level;
     invalidSculpt.terrainSculpt[0].radius = 0.0f;
     CHECK(!ValidateLevel(invalidSculpt).ok);
-    LevelDefinition missingPrefabId = level;
-    missingPrefabId.entities.back().prefabId.clear();
-    CHECK(!ValidateLevel(missingPrefabId).ok);
 
     std::filesystem::create_directories(root);
     const auto malformed = root / "malformed.json";
