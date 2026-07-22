@@ -54,6 +54,8 @@ models/textures/*
 !models/terrain/leafy_grass/**
 !models/fbx_Dandelion/
 !models/fbx_Dandelion/**
+!models/Rock1/
+!models/Rock1/**
 
 # CMake
 CMakeCache.txt

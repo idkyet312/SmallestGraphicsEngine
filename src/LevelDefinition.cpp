@@ -67,6 +67,7 @@ const char* LevelEntityTypeName(LevelEntityType type) {
     case LevelEntityType::Helicopter: return "helicopter";
     case LevelEntityType::GrassPatch: return "grass_patch";
     case LevelEntityType::Dandelion: return "dandelion";
+    case LevelEntityType::Rock: return "rock";
     }
     return "unknown";
 }
@@ -77,7 +78,7 @@ bool ParseLevelEntityType(const std::string& text, LevelEntityType& type) {
         return true;
     }
     for (int i = static_cast<int>(LevelEntityType::PlayerSpawn);
-         i <= static_cast<int>(LevelEntityType::Dandelion); ++i) {
+         i <= static_cast<int>(LevelEntityType::Rock); ++i) {
         const auto candidate = static_cast<LevelEntityType>(i);
         if (text == LevelEntityTypeName(candidate)) {
             type = candidate;
@@ -171,7 +172,7 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         if (static_cast<int>(entity.type) <
             static_cast<int>(LevelEntityType::PlayerSpawn) ||
             static_cast<int>(entity.type) >
-                static_cast<int>(LevelEntityType::Dandelion))
+                static_cast<int>(LevelEntityType::Rock))
             result.errors.push_back("entity " + std::to_string(entity.id) +
                                     " has an unknown type");
         if (!entity.id || !ids.insert(entity.id).second)

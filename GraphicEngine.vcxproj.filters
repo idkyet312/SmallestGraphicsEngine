@@ -53,6 +53,9 @@
     <ClInclude Include="src\DX12Core.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\EngineLogger.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\Model.h">
       <Filter>Header Files</Filter>
     </ClInclude>

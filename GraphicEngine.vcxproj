@@ -105,6 +105,7 @@
     <ClInclude Include="src\DDGI_DX12.h" />
     <ClInclude Include="src\DX11Core.h" />
     <ClInclude Include="src\DX12Core.h" />
+    <ClInclude Include="src\EngineLogger.h" />
     <ClInclude Include="src\GLBImporter.h" />
     <ClInclude Include="src\Model.h" />
     <ClInclude Include="src\ModelDX11.h" />

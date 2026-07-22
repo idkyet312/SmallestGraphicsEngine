@@ -24,7 +24,8 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
     float uniformScale,
     bool splitIntoDestructibleBoards,
     bool loadMaterials,
-    bool diffuseAndNormalOnly) {
+    bool diffuseAndNormalOnly,
+    bool buildMeshlets) {
     Assimp::Importer importer;
     const bool preserveOH1Rotors = filepath.find("OH-1") != std::string::npos;
     unsigned importFlags = aiProcess_Triangulate | aiProcess_JoinIdenticalVertices |
@@ -371,7 +372,7 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
                     root->AddChild(turretNode);
                 }
             }
-            if (GLBImporter::BuildMeshletData(p, device.Get()))
+            if (GLBImporter::BuildMeshletData(p, device.Get(), buildMeshlets))
                 root->mesh->primitives.push_back(std::move(p));
             continue;
         }
