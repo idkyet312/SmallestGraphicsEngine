@@ -88,6 +88,7 @@ set(HEADER_FILES
     src/DX12Core.h
     src/StaticBufferDX12.h
     src/ProfilerDX12.h
+    src/EngineLogger.h
     src/GunAudio.h
     src/NavigationSystem.h
     src/T3DPhysicsAsset.h

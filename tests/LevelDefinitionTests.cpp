@@ -26,6 +26,11 @@ int main() {
     dandelion.type = LevelEntityType::Dandelion;
     dandelion.name = "Painted Dandelion";
     level.entities.push_back(dandelion);
+    LevelEntity rock;
+    rock.id = 1003;
+    rock.type = LevelEntityType::Rock;
+    rock.name = "Editor Rock";
+    level.entities.push_back(rock);
     level.terrainSculpt.push_back({ 3.0f, -4.0f, 2.5f,
         TerrainSculptOperation::Add, 0.75f, 1.0f });
     level.terrainSculpt.push_back({ 0.0f, 1.0f, 4.0f,
@@ -41,6 +46,8 @@ int main() {
     CHECK(loaded.level.entities[4].id == level.entities[4].id);
     CHECK(loaded.level.entities[27].type == LevelEntityType::GrassPatch);
     CHECK(loaded.level.entities[28].type == LevelEntityType::Dandelion);
+    CHECK(loaded.level.entities[29].type == LevelEntityType::Rock);
+    CHECK(std::string(LevelEntityTypeName(loaded.level.entities[29].type)) == "rock");
     LevelEntityType legacyFoliage = LevelEntityType::GrassPatch;
     CHECK(ParseLevelEntityType("fern", legacyFoliage));
     CHECK(legacyFoliage == LevelEntityType::Dandelion);

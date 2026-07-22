@@ -43,6 +43,9 @@ struct DandelionInstance {
 };
 extern std::shared_ptr<SceneNode> g_dandelionModel;
 extern std::vector<DandelionInstance> g_dandelionInstances;
+extern std::shared_ptr<SceneNode> g_editorRockModel;
+extern std::vector<DirectX::XMMATRIX> g_editorRockInstances;
+extern bool g_editorRockVisible;
 extern ID3D12Resource* g_skyEnvironmentResource;
 extern ID3D12Resource* g_specularEnvironmentResource;
 extern ID3D12Resource* g_brdfIntegrationResource;
@@ -1218,6 +1221,13 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 DrawSceneNode(g_humveeModel, shader, SecondaryHumveeWorldMatrix(),
                     view, proj, lightSpace);
         }
+    }
+
+    if (g_editorRockVisible && g_editorRockModel) {
+        for (const XMMATRIX& rock : g_editorRockInstances)
+            DrawSceneNode(g_editorRockModel, shader, rock,
+                          view, proj, lightSpace, visibilityExtensionsOnly);
+        shader.Use(scene.wireframeMode);
     }
 
     if (!g_emptyLevelMode && g_helicopterModel && scene.showHelicopter) {

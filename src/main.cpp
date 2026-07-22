@@ -27,6 +27,7 @@
 
 #include "DX12Core.h"
 #include "ProfilerDX12.h"
+#include "EngineLogger.h"
 #include "GroundLevel.h"
 #include "ShaderDX12.h"
 #include "DDGI_DX12.h"
@@ -93,6 +94,11 @@ std::vector<DandelionInstance> g_dandelionInstances;
 static XMFLOAT3             g_dandelionSourceCenter{};
 static float                g_dandelionSourceMinY = 0.0f;
 static float                g_dandelionSourceHeight = 1.0f;
+std::shared_ptr<SceneNode>  g_editorRockModel;
+std::vector<XMMATRIX>       g_editorRockInstances;
+bool                        g_editorRockVisible = false;
+static XMFLOAT3             g_editorRockSourceCenter{};
+static float                g_editorRockSourceSpan = 1.0f;
 std::shared_ptr<SceneNode>  g_helicopterMainRotorNode;
 std::shared_ptr<SceneNode>  g_helicopterTailRotorNode;
 std::shared_ptr<SceneNode>  g_humveeTurretNode;
@@ -1718,6 +1724,82 @@ static void ScatterDandelions(
               << " GPU instances\n";
 }
 
+static bool LoadEditorRockModel() {
+    if (g_editorRockModel) return true;
+    auto model = FBXImporter::Load("models/Rock1/Rock_Pack_num1.fbx",
+        g_dx12.device, g_dx12.commandList, 1.0f, false, false, false, false);
+    if (!model) {
+        std::cerr << "Editor rock FBX failed to load\n";
+        return false;
+    }
+    model->translation = XMFLOAT3(0.0f, 0.0f, 0.0f);
+    model->rotation = XMFLOAT4(0.0f, 0.0f, 0.0f, 1.0f);
+    model->scale = XMFLOAT3(1.0f, 1.0f, 1.0f);
+    XMFLOAT4X4 identity;
+    XMStoreFloat4x4(&identity, XMMatrixIdentity());
+    model->UpdateGlobalTransform(identity);
+
+    XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
+    XMFLOAT3 maximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    const auto configure = [&](const auto& self,
+                               const std::shared_ptr<SceneNode>& node) -> void {
+        if (!node) return;
+        if (node->mesh) for (MeshPrimitive& primitive : node->mesh->primitives) {
+            if (primitive.material) {
+                primitive.material->baseColorFactor =
+                    XMFLOAT4(0.32f, 0.30f, 0.27f, 1.0f);
+                primitive.material->metallicFactor = 0.0f;
+                primitive.material->roughnessFactor = 0.92f;
+            }
+            for (size_t i = 0; i + 11 < primitive.vertices.size(); i += 12) {
+                minimum.x = (std::min)(minimum.x, primitive.vertices[i]);
+                minimum.y = (std::min)(minimum.y, primitive.vertices[i + 1]);
+                minimum.z = (std::min)(minimum.z, primitive.vertices[i + 2]);
+                maximum.x = (std::max)(maximum.x, primitive.vertices[i]);
+                maximum.y = (std::max)(maximum.y, primitive.vertices[i + 1]);
+                maximum.z = (std::max)(maximum.z, primitive.vertices[i + 2]);
+            }
+        }
+        for (const auto& child : node->children) self(self, child);
+    };
+    configure(configure, model);
+    if (minimum.x == FLT_MAX) return false;
+    g_editorRockSourceCenter = {
+        (minimum.x + maximum.x) * 0.5f,
+        minimum.y,
+        (minimum.z + maximum.z) * 0.5f };
+    g_editorRockSourceSpan = (std::max)({ maximum.x - minimum.x,
+        maximum.y - minimum.y, maximum.z - minimum.z, 0.001f });
+    g_editorRockModel = std::move(model);
+    return true;
+}
+
+static void BuildEditorRockInstances() {
+    g_editorRockInstances.clear();
+    g_editorRockVisible = gameScreen == GameScreen::LevelEditor &&
+        static_cast<bool>(g_editorRockModel);
+    if (!g_editorRockVisible) return;
+    constexpr float authoredSize = 2.0f;
+    const float normalization = authoredSize / g_editorRockSourceSpan;
+    for (const LevelEntity& entity : g_levelEditor.Level().entities) {
+        if (!entity.enabled || entity.type != LevelEntityType::Rock) continue;
+        g_editorRockInstances.push_back(
+            XMMatrixTranslation(-g_editorRockSourceCenter.x,
+                                -g_editorRockSourceCenter.y,
+                                -g_editorRockSourceCenter.z) *
+            XMMatrixScaling(normalization * entity.transform.scale[0],
+                            normalization * entity.transform.scale[1],
+                            normalization * entity.transform.scale[2]) *
+            XMMatrixRotationRollPitchYaw(
+                XMConvertToRadians(entity.transform.rotation[0]),
+                XMConvertToRadians(entity.transform.rotation[1]),
+                XMConvertToRadians(entity.transform.rotation[2])) *
+            XMMatrixTranslation(entity.transform.position[0],
+                                entity.transform.position[1],
+                                entity.transform.position[2]));
+    }
+}
+
 static void RebuildScalableEnvironment() {
     auto terrainParams = CurrentTerrainParams();
     terrainParams.heightScale = scene.terrainHeightScale;
@@ -1857,6 +1939,8 @@ static void SetCursorVisible(bool visible) {
 }
 
 static void OpenMainMenu() {
+    g_editorRockVisible = false;
+    g_editorRockInstances.clear();
     gameScreen = GameScreen::MainMenu;
     showUI = false;
     cameraLocked = true;
@@ -1922,7 +2006,8 @@ static void OpenWinScreen() {
 
 static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
                           bool emptyLevel = false,
-                          const LevelDefinition* customLevel = nullptr) {
+                          const LevelDefinition* customLevel = nullptr,
+                          bool startWithUIAndMobileControls = false) {
     gameScreen = GameScreen::Level1;
     g_customLevelMode = !stressTest && !emptyLevel;
     if (customLevel) {
@@ -1999,10 +2084,16 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
         scene.rebuildDestructionRequested = true;
     pendingLevelRuntimeReset = modeAssetsLoaded;
     deathCursorReleased = false;
-    showUI = false;
+    showUI = startWithUIAndMobileControls;
+    virtualInput.showPad = startWithUIAndMobileControls;
     cameraLocked = false;
-    SetCapture(hwnd);
-    SetCursorVisible(false);
+    if (startWithUIAndMobileControls) {
+        ReleaseCapture();
+        SetCursorVisible(true);
+    } else {
+        SetCapture(hwnd);
+        SetCursorVisible(false);
+    }
     RECT rect;
     GetClientRect(hwnd, &rect);
     POINT center = { (rect.right - rect.left) / 2,
@@ -2087,7 +2178,7 @@ static void RenderMainMenu(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("LEVEL 1 - GOD MODE", ImVec2(300.0f, 58.0f)))
-        StartLevelOne(hwnd, true);
+        StartLevelOne(hwnd, true, false, false, nullptr, true);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("LEVEL EDITOR", ImVec2(300.0f, 58.0f)))
@@ -3420,6 +3511,7 @@ static void SynchronizeEditorRuntime(bool play) {
     g_grass.ClearRuntimeExclusions();
     g_customLevelMode = true;
     ApplyRuntimeLevelBasics(play);
+    BuildEditorRockInstances();
     if (!play && terrainChanged && !foliageChanged) {
         if (g_destruction.IsInitialized()) {
             auto tp = CurrentTerrainParams();
@@ -3470,6 +3562,10 @@ static void StartLevelEditor(HWND hwnd) {
     scene.camera.FPSMode = false;
     ReleaseCapture();
     SetCursorVisible(true);
+    if (fullLevelAssetsLoaded) {
+        LoadEditorRockModel();
+        BuildEditorRockInstances();
+    }
 }
 
 static void BeginEditorPlaytest(HWND hwnd) {
@@ -4058,6 +4154,11 @@ static void ProcessInput(HWND) {
         !(showUI && ImGui::GetIO().WantCaptureMouse) &&
         (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
     scene.UpdateSniperScope(scopeRequested, deltaTime);
+
+    // Virtual controls are ImGui widgets, so WantCaptureKeyboard/cameraLocked
+    // must not suppress the input those widgets produced on the previous frame.
+    if (!g_drivingHumvee) ApplyVirtualInput();
+
     if (cameraLocked || (showUI && ImGui::GetIO().WantCaptureKeyboard)) return;
     if (g_drivingHumvee) {
         g_humveeTurretFireCooldown = (std::max)(
@@ -4098,7 +4199,6 @@ static void ProcessInput(HWND) {
         return;
     }
     g_destruction.SetVehicleInput(0.0f, 0.0f, true);
-    ApplyVirtualInput();
     const bool crouching = scene.camera.FPSMode &&
         (GetAsyncKeyState(VK_CONTROL) & 0x8000);
     scene.camera.SetCrouching(crouching, deltaTime);
@@ -4355,6 +4455,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     FILE* fp;
     freopen_s(&fp, "CONOUT$", "w", stdout);
     freopen_s(&fp, "CONOUT$", "w", stderr);
+
+    EngineLog::ScopedSession logSession("GraphicEngine");
 
     std::cout << "GraphicEngine DX12 Starting..." << std::endl;
 
@@ -5537,6 +5639,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 ResetPalmTrees();
 
                 LoadDandelionModel();
+                if (gameScreen == GameScreen::LevelEditor) {
+                    LoadEditorRockModel();
+                    BuildEditorRockInstances();
+                }
                 RebuildScalableEnvironment();
             }
             // Same pool AABB for the destruction sim so house debris shoved into
@@ -5717,6 +5823,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ReleaseMaterialUploadHeaps(g_humveeModel);
             ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
             ReleaseMaterialUploadHeaps(g_dandelionModel);
+            ReleaseMaterialUploadHeaps(g_editorRockModel);
             ReleaseMaterialUploadHeaps(g_banditModel.node);
             for (const auto& material : g_banditModel.materialKeepAlive)
                 if (material) material->uploadHeaps.clear();

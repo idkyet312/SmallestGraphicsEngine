@@ -37,6 +37,7 @@ float PickRadius(LevelEntityType type) {
     case LevelEntityType::Palm: return 1.3f;
     case LevelEntityType::GrassPatch: return 2.0f;
     case LevelEntityType::Dandelion: return 0.55f;
+    case LevelEntityType::Rock: return 1.5f;
     default: return 0.9f;
     }
 }
@@ -44,7 +45,7 @@ float PickRadius(LevelEntityType type) {
 bool SupportsScale(LevelEntityType type) {
     return type == LevelEntityType::Palm || type == LevelEntityType::EnemySpawn ||
            type == LevelEntityType::Helicopter || type == LevelEntityType::GrassPatch ||
-           type == LevelEntityType::Dandelion;
+           type == LevelEntityType::Dandelion || type == LevelEntityType::Rock;
 }
 
 bool IsFoliage(LevelEntityType type) {
@@ -65,6 +66,7 @@ ImU32 TypeColor(LevelEntityType type, bool selected) {
     case LevelEntityType::Helicopter: return IM_COL32(170, 130, 255, 230);
     case LevelEntityType::GrassPatch: return IM_COL32(95, 210, 70, 180);
     case LevelEntityType::Dandelion: return IM_COL32(35, 170, 75, 220);
+    case LevelEntityType::Rock: return IM_COL32(145, 145, 135, 230);
     }
     return IM_COL32_WHITE;
 }
@@ -630,7 +632,6 @@ LevelEditorActions LevelEditor::Render(Camera&, CXMMATRIX view,
     }
     ImGui::SameLine();
     ImGui::TextDisabled("%s%s", level_.name.c_str(), dirty_ ? " *" : "");
-    ImGui::End();
 
     if (ImGui::BeginPopupModal("Confirm New Level", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -678,6 +679,7 @@ LevelEditorActions LevelEditor::Render(Camera&, CXMMATRIX view,
         if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
+    ImGui::End();
 
     ImGui::SetNextWindowPos(ImVec2(10, 70), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(285, display.y - 90), ImGuiCond_FirstUseEver);
@@ -696,7 +698,7 @@ LevelEditorActions LevelEditor::Render(Camera&, CXMMATRIX view,
     const LevelEntityType types[] = { LevelEntityType::WoodHouse, LevelEntityType::MetalHouse,
         LevelEntityType::Palm, LevelEntityType::ExplosiveBarrel, LevelEntityType::EnemySpawn,
         LevelEntityType::Humvee, LevelEntityType::Helicopter, LevelEntityType::PlayerSpawn,
-        LevelEntityType::GrassPatch, LevelEntityType::Dandelion };
+        LevelEntityType::GrassPatch, LevelEntityType::Dandelion, LevelEntityType::Rock };
     for (auto type : types) {
         if (ImGui::SmallButton(LevelEntityTypeName(type))) AddEntity(type);
         if (type != LevelEntityType::PlayerSpawn) ImGui::SameLine();

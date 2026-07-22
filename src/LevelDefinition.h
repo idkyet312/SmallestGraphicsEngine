@@ -16,7 +16,8 @@ enum class LevelEntityType {
     Humvee,
     Helicopter,
     GrassPatch,
-    Dandelion
+    Dandelion,
+    Rock
 };
 
 struct Transform {

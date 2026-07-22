@@ -11,5 +11,6 @@ public:
         float uniformScale = 0.1f,
         bool splitIntoDestructibleBoards = false,
         bool loadMaterials = true,
-        bool diffuseAndNormalOnly = false);
+        bool diffuseAndNormalOnly = false,
+        bool buildMeshlets = true);
 };
