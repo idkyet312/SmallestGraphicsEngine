@@ -129,15 +129,13 @@ static void GenerateTangents(const std::vector<DirectX::XMFLOAT3>& positions,
 // resource are filled in by a GPU compute pass (see MipGenerator) since DX12
 // has no built-in equivalent of DX11's GenerateMips.
 ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList,
-    const tinygltf::Image& image, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps,
-    bool generateMips = true) {
+    const tinygltf::Image& image, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
     if (image.width == 0 || image.height == 0) return nullptr;
 
     UINT baseW = (UINT)image.width;
     UINT baseH = (UINT)image.height;
     UINT16 mipLevels = 1;
-    if (generateMips)
-        while ((baseW >> mipLevels) > 0 || (baseH >> mipLevels) > 0) mipLevels++;
+    while ((baseW >> mipLevels) > 0 || (baseH >> mipLevels) > 0) mipLevels++;
 
     D3D12_RESOURCE_DESC textureDesc = {};
     textureDesc.MipLevels = mipLevels;
@@ -262,76 +260,6 @@ ComPtr<ID3D12Resource> GLBImporter::LoadTextureFromFile(const std::string& filep
     image.image.assign(pixels, pixels + (size_t)width * (size_t)height * 4);
     stbi_image_free(pixels);
 
-    return CreateTexture(device.Get(), commandList.Get(), image, uploadHeaps);
-}
-
-ComPtr<ID3D12Resource> GLBImporter::LoadTextureSingleMip(
-    const std::string& filepath, ComPtr<ID3D12Device> device,
-    ComPtr<ID3D12GraphicsCommandList> commandList,
-    std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
-    int width = 0, height = 0, components = 0;
-    unsigned char* pixels = stbi_load(filepath.c_str(), &width, &height, &components, 4);
-    if (!pixels) return nullptr;
-    tinygltf::Image image;
-    image.width = width; image.height = height; image.component = 4;
-    image.bits = 8; image.pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
-    image.image.assign(pixels, pixels + static_cast<size_t>(width) * height * 4);
-    stbi_image_free(pixels);
-    return CreateTexture(device.Get(), commandList.Get(), image, uploadHeaps, false);
-}
-
-ComPtr<ID3D12Resource> GLBImporter::LoadTextureFromMemory(
-    const unsigned char* data, size_t size, ComPtr<ID3D12Device> device,
-    ComPtr<ID3D12GraphicsCommandList> commandList,
-    std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
-    if (!data || size == 0 || size > static_cast<size_t>(INT_MAX)) return nullptr;
-    int width = 0, height = 0, components = 0;
-    unsigned char* pixels = stbi_load_from_memory(data, static_cast<int>(size),
-        &width, &height, &components, 4);
-    if (!pixels) return nullptr;
-    ComPtr<ID3D12Resource> texture = LoadEmbeddedTextureRGBA256(pixels, width,
-        height, device, commandList, uploadHeaps);
-    stbi_image_free(pixels);
-    return texture;
-}
-
-ComPtr<ID3D12Resource> GLBImporter::LoadEmbeddedTextureRGBA256(
-    const unsigned char* rgba, int width, int height, ComPtr<ID3D12Device> device,
-    ComPtr<ID3D12GraphicsCommandList> commandList,
-    std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
-    if (!rgba || width <= 0 || height <= 0) return nullptr;
-    constexpr int target = 256;
-    std::vector<unsigned char> resized(static_cast<size_t>(target) * target * 4);
-    for (int y = 0; y < target; ++y) {
-        const float sourceY = ((y + 0.5f) * height / target) - 0.5f;
-        const int y0 = (std::max)(0, (std::min)(height - 1,
-            static_cast<int>(std::floor(sourceY))));
-        const int y1 = (std::min)(height - 1, y0 + 1);
-        const float fy = (std::max)(0.0f, sourceY - std::floor(sourceY));
-        for (int x = 0; x < target; ++x) {
-            const float sourceX = ((x + 0.5f) * width / target) - 0.5f;
-            const int x0 = (std::max)(0, (std::min)(width - 1,
-                static_cast<int>(std::floor(sourceX))));
-            const int x1 = (std::min)(width - 1, x0 + 1);
-            const float fx = (std::max)(0.0f, sourceX - std::floor(sourceX));
-            for (int channel = 0; channel < 4; ++channel) {
-                const float a = rgba[(static_cast<size_t>(y0) * width + x0) * 4 + channel];
-                const float b = rgba[(static_cast<size_t>(y0) * width + x1) * 4 + channel];
-                const float c = rgba[(static_cast<size_t>(y1) * width + x0) * 4 + channel];
-                const float d = rgba[(static_cast<size_t>(y1) * width + x1) * 4 + channel];
-                resized[(static_cast<size_t>(y) * target + x) * 4 + channel] =
-                    static_cast<unsigned char>((a + (b - a) * fx) * (1.0f - fy) +
-                                               (c + (d - c) * fx) * fy + 0.5f);
-            }
-        }
-    }
-    tinygltf::Image image;
-    image.width = target;
-    image.height = target;
-    image.component = 4;
-    image.bits = 8;
-    image.pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
-    image.image = std::move(resized);
     return CreateTexture(device.Get(), commandList.Get(), image, uploadHeaps);
 }
 
