@@ -408,6 +408,10 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
             const std::filesystem::path relative = std::filesystem::relative(it->path(), error);
             if (error) { error.clear(); continue; }
             const std::string model = Generic(relative);
+            // Rock prefab is disabled. Keep source model available as a model
+            // asset, but do not auto-create a renderable prefab or thumbnail.
+            if (Lower(it->path().stem().string()) == "rock_pack_num1")
+                continue;
             fingerprintParts.push_back(model + ':' +
                 std::to_string(it->file_size(error)) + ':' +
                 std::to_string(it->last_write_time(error).time_since_epoch().count()));
