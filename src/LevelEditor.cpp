@@ -5,8 +5,10 @@
 #include <ImGuizmo.h>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -38,6 +40,7 @@ float PickRadius(LevelEntityType type) {
     case LevelEntityType::GrassPatch: return 2.0f;
     case LevelEntityType::Dandelion: return 0.55f;
     case LevelEntityType::Rock: return 1.5f;
+    case LevelEntityType::Prefab: return 1.5f;
     default: return 0.9f;
     }
 }
@@ -45,7 +48,8 @@ float PickRadius(LevelEntityType type) {
 bool SupportsScale(LevelEntityType type) {
     return type == LevelEntityType::Palm || type == LevelEntityType::EnemySpawn ||
            type == LevelEntityType::Helicopter || type == LevelEntityType::GrassPatch ||
-           type == LevelEntityType::Dandelion || type == LevelEntityType::Rock;
+           type == LevelEntityType::Dandelion || type == LevelEntityType::Rock ||
+           type == LevelEntityType::Prefab;
 }
 
 bool IsFoliage(LevelEntityType type) {
@@ -67,6 +71,7 @@ ImU32 TypeColor(LevelEntityType type, bool selected) {
     case LevelEntityType::GrassPatch: return IM_COL32(95, 210, 70, 180);
     case LevelEntityType::Dandelion: return IM_COL32(35, 170, 75, 220);
     case LevelEntityType::Rock: return IM_COL32(145, 145, 135, 230);
+    case LevelEntityType::Prefab: return IM_COL32(90, 185, 255, 230);
     }
     return IM_COL32_WHITE;
 }
@@ -78,6 +83,86 @@ std::string SanitizeFileName(std::string value) {
     }
     while (!value.empty() && value.back() == '_') value.pop_back();
     return value.empty() ? "untitled_level" : value;
+}
+
+bool DrawPrefabOverrides(LevelEntity& entity, const PrefabAsset& prefab) {
+    bool changed = false;
+    const nlohmann::json merged = MergePrefabComponents(prefab.components,
+                                                        entity.overrides);
+    const char* currentComponent = nullptr;
+    for (const PrefabPropertyDescriptor& property : PrefabPropertyMetadata()) {
+        if (!merged.contains(property.component) ||
+            !merged.at(property.component).is_object() ||
+            !merged.at(property.component).contains(property.field)) continue;
+        if (!currentComponent || std::strcmp(currentComponent,
+                                              property.component) != 0) {
+            currentComponent = property.component;
+            ImGui::SeparatorText(currentComponent);
+        }
+        ImGui::PushID(property.component);
+        ImGui::PushID(property.field);
+        bool overridden = entity.overrides.contains(property.component) &&
+            entity.overrides.at(property.component).is_object() &&
+            entity.overrides.at(property.component).contains(property.field);
+        if (ImGui::Checkbox("##override", &overridden)) {
+            if (overridden)
+                entity.overrides[property.component][property.field] =
+                    merged.at(property.component).at(property.field);
+            else {
+                entity.overrides[property.component].erase(property.field);
+                if (entity.overrides[property.component].empty())
+                    entity.overrides.erase(property.component);
+            }
+            changed = true;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!overridden);
+        nlohmann::json& value = overridden
+            ? entity.overrides[property.component][property.field]
+            : const_cast<nlohmann::json&>(
+                merged.at(property.component).at(property.field));
+        try {
+            if (property.type == PrefabPropertyType::Boolean) {
+                bool edited = value.get<bool>();
+                if (ImGui::Checkbox(property.field, &edited) && overridden) {
+                    value = edited; changed = true;
+                }
+            } else if (property.type == PrefabPropertyType::Number) {
+                float edited = value.get<float>();
+                if (ImGui::DragFloat(property.field, &edited, 0.05f,
+                        property.minimum, property.maximum) && overridden) {
+                    value = edited; changed = true;
+                }
+            } else if (property.type == PrefabPropertyType::Integer) {
+                int edited = value.get<int>();
+                if (ImGui::DragInt(property.field, &edited, 1.0f,
+                        static_cast<int>(property.minimum),
+                        static_cast<int>(property.maximum)) && overridden) {
+                    value = edited; changed = true;
+                }
+            } else if (property.type == PrefabPropertyType::Color3) {
+                float edited[3] = { value.at(0).get<float>(),
+                    value.at(1).get<float>(), value.at(2).get<float>() };
+                if (ImGui::ColorEdit3(property.field, edited) && overridden) {
+                    value = { edited[0], edited[1], edited[2] }; changed = true;
+                }
+            } else {
+                char edited[260] = {};
+                strncpy_s(edited, value.get<std::string>().c_str(), _TRUNCATE);
+                if (ImGui::InputText(property.field, edited, sizeof(edited)) &&
+                    overridden) {
+                    value = edited; changed = true;
+                }
+            }
+        } catch (...) {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                "%s has invalid type", property.field);
+        }
+        ImGui::EndDisabled();
+        ImGui::PopID();
+        ImGui::PopID();
+    }
+    return changed;
 }
 
 } // namespace
@@ -93,6 +178,13 @@ void LevelEditor::NewFromLevelOne() {
     terrainRuntimeDirty_ = true; playing_ = false;
     status_ = "New level created from Level 1";
     RefreshLevelFiles();
+    prefabRegistry_.Refresh();
+    assetRegistry_.Refresh();
+}
+
+void LevelEditor::RefreshAssets() {
+    assetRegistry_.Refresh();
+    prefabRegistry_.Refresh();
 }
 
 LevelEntity* LevelEditor::Selected() {
@@ -162,6 +254,71 @@ void LevelEditor::Redo() {
     terrainRuntimeDirty_ = terrainRuntimeDirty_ || TerrainChanged(before);
 }
 
+LevelEditor::AssetFileChange LevelEditor::CaptureAssetBefore(
+        const std::filesystem::path& path) const {
+    AssetFileChange change;
+    change.path = path;
+    change.beforeExists = std::filesystem::is_regular_file(path);
+    if (change.beforeExists) {
+        std::ifstream stream(path, std::ios::binary);
+        change.before.assign(std::istreambuf_iterator<char>(stream), {});
+    }
+    return change;
+}
+
+void LevelEditor::FinishAssetChange(AssetFileChange change) {
+    change.afterExists = std::filesystem::is_regular_file(change.path);
+    if (change.afterExists) {
+        std::ifstream stream(change.path, std::ios::binary);
+        change.after.assign(std::istreambuf_iterator<char>(stream), {});
+    }
+    assetUndo_.push_back({ std::move(change) });
+    if (assetUndo_.size() > 50) assetUndo_.erase(assetUndo_.begin());
+    assetRedo_.clear();
+}
+
+void LevelEditor::UndoAsset() {
+    if (assetUndo_.empty() || playing_) return;
+    auto operation = std::move(assetUndo_.back());
+    assetUndo_.pop_back();
+    for (const AssetFileChange& change : operation) {
+        if (!change.beforeExists) {
+            std::error_code error;
+            std::filesystem::remove(change.path, error);
+        } else {
+            if (change.path.has_parent_path())
+                std::filesystem::create_directories(change.path.parent_path());
+            std::ofstream stream(change.path, std::ios::binary | std::ios::trunc);
+            stream.write(change.before.data(),
+                         static_cast<std::streamsize>(change.before.size()));
+        }
+    }
+    assetRedo_.push_back(std::move(operation));
+    RefreshAssets();
+    status_ = "Undid asset change";
+}
+
+void LevelEditor::RedoAsset() {
+    if (assetRedo_.empty() || playing_) return;
+    auto operation = std::move(assetRedo_.back());
+    assetRedo_.pop_back();
+    for (const AssetFileChange& change : operation) {
+        if (!change.afterExists) {
+            std::error_code error;
+            std::filesystem::remove(change.path, error);
+        } else {
+            if (change.path.has_parent_path())
+                std::filesystem::create_directories(change.path.parent_path());
+            std::ofstream stream(change.path, std::ios::binary | std::ios::trunc);
+            stream.write(change.after.data(),
+                         static_cast<std::streamsize>(change.after.size()));
+        }
+    }
+    assetUndo_.push_back(std::move(operation));
+    RefreshAssets();
+    status_ = "Redid asset change";
+}
+
 void LevelEditor::AddEntity(LevelEntityType type) {
     const LevelDefinition before = level_;
     LevelEntity entity;
@@ -184,6 +341,27 @@ void LevelEditor::AddEntity(LevelEntityType type) {
     level_.entities.push_back(entity);
     selectedId_ = entity.id;
     MarkChanged(before);
+}
+
+void LevelEditor::AddPrefab(const PrefabAsset& prefab, const Camera& camera,
+        const std::function<float(float, float)>& terrainHeight) {
+    if (!prefab.error.empty()) { status_ = prefab.error; return; }
+    const LevelDefinition before = level_;
+    LevelEntity entity;
+    entity.id = nextId_++;
+    entity.type = LevelEntityType::Prefab;
+    entity.prefabId = prefab.id;
+    entity.name = prefab.name;
+    entity.transform.position[0] = camera.Position.x + camera.Front.x * 5.0f;
+    entity.transform.position[2] = camera.Position.z + camera.Front.z * 5.0f;
+    entity.transform.position[1] = terrainHeight
+        ? terrainHeight(entity.transform.position[0], entity.transform.position[2])
+        : 0.0f;
+    std::copy(prefab.defaultScale, prefab.defaultScale + 3, entity.transform.scale);
+    level_.entities.push_back(std::move(entity));
+    selectedId_ = level_.entities.back().id;
+    MarkChanged(before);
+    status_ = "Added prefab " + prefab.name;
 }
 
 void LevelEditor::DuplicateSelected() {
@@ -252,6 +430,57 @@ bool LevelEditor::BrowseSaveAs() {
     const std::filesystem::path path(selected);
     strncpy_s(saveName_, path.stem().string().c_str(), _TRUNCATE);
     return SaveTo(path);
+}
+
+bool LevelEditor::BrowseImportModel() {
+    wchar_t selected[MAX_PATH] = {};
+    OPENFILENAMEW dialog = {};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = GetActiveWindow();
+    dialog.lpstrFilter = L"3D Models (*.fbx;*.glb;*.gltf)\0*.fbx;*.glb;*.gltf\0\0";
+    dialog.lpstrFile = selected;
+    dialog.nMaxFile = static_cast<DWORD>(std::size(selected));
+    dialog.lpstrTitle = L"Import Model as Prefab";
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
+        OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
+    if (!GetOpenFileNameW(&dialog)) {
+        if (const DWORD code = CommDlgExtendedError())
+            status_ = "Import browser failed: " + std::to_string(code);
+        return false;
+    }
+    const std::filesystem::path source(selected);
+    std::string safeStem = source.stem().string();
+    for (char& c : safeStem) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (!(std::isalnum(u) || c == '-' || c == '_')) c = '_';
+    }
+    if (safeStem.empty()) safeStem = "imported_model";
+    const std::filesystem::path importDirectory =
+        std::filesystem::path("models/Imported") / safeStem;
+    pendingImportChanges_.clear();
+    pendingImportChanges_.push_back(CaptureAssetBefore(
+        std::filesystem::path("prefabs/Imported") / (safeStem + ".json")));
+    pendingImportChanges_.push_back(CaptureAssetBefore(
+        importDirectory / source.filename()));
+    const std::vector<std::string> sidecars = {
+        ".png", ".jpg", ".jpeg", ".tga", ".dds", ".bmp", ".bin", ".mtl" };
+    std::error_code scanError;
+    for (std::filesystem::directory_iterator it(source.parent_path(), scanError), end;
+         !scanError && it != end; it.increment(scanError)) {
+        std::string extension = it->path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (std::find(sidecars.begin(), sidecars.end(), extension) != sidecars.end())
+            pendingImportChanges_.push_back(CaptureAssetBefore(
+                importDirectory / it->path().filename()));
+    }
+    pendingImport_ = std::async(std::launch::async, [source]() {
+        std::filesystem::path savedPrefab;
+        PrefabSaveResult result = PrefabRegistry::ImportModel(source, savedPrefab);
+        return std::make_pair(std::move(result), std::move(savedPrefab));
+    });
+    status_ = "Importing " + source.filename().string() + " in background...";
+    return true;
 }
 
 void LevelEditor::RefreshLevelFiles() {
@@ -583,10 +812,35 @@ void LevelEditor::SelectFromViewport(CXMMATRIX view, CXMMATRIX projection) {
     if (hitId) selectedId_ = hitId;
 }
 
-LevelEditorActions LevelEditor::Render(Camera&, CXMMATRIX view,
+LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     CXMMATRIX projection,
-    const std::function<float(float, float)>& terrainHeight) {
+    const std::function<float(float, float)>& terrainHeight,
+    const std::function<uint64_t(const PrefabAsset&)>& thumbnailTexture) {
     LevelEditorActions actions;
+    if (pendingImport_.valid() && pendingImport_.wait_for(
+            std::chrono::seconds(0)) == std::future_status::ready) {
+        auto [result, savedPrefab] = pendingImport_.get();
+        if (!result.ok) status_ = "Import failed: " + result.error;
+        else {
+            for (AssetFileChange& change : pendingImportChanges_) {
+                change.afterExists = std::filesystem::is_regular_file(change.path);
+                if (change.afterExists) {
+                    std::ifstream stream(change.path, std::ios::binary);
+                    change.after.assign(std::istreambuf_iterator<char>(stream), {});
+                }
+            }
+            assetUndo_.push_back(std::move(pendingImportChanges_));
+            assetRedo_.clear();
+            assetRegistry_.Refresh(true);
+            prefabRegistry_.Refresh();
+            selectedPrefab_ = -1;
+            const auto& assets = prefabRegistry_.Assets();
+            for (size_t i = 0; i < assets.size(); ++i)
+                if (assets[i].definitionPath == savedPrefab)
+                    selectedPrefab_ = static_cast<int>(i);
+            status_ = "Imported model and created " + savedPrefab.string();
+        }
+    }
     if (playing_) {
         ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
         ImGui::Begin("Playtest", nullptr, ImGuiWindowFlags_AlwaysAutoResize |
@@ -615,6 +869,8 @@ LevelEditorActions LevelEditor::Render(Camera&, CXMMATRIX view,
     if (ImGui::Button("Save As")) BrowseSaveAs();
     ImGui::SameLine();
     if (ImGui::Button("Load")) { RefreshLevelFiles(); ImGui::OpenPopup("Load Level"); }
+    ImGui::SameLine();
+    if (ImGui::Button("Assets")) assetBrowserOpen_ = !assetBrowserOpen_;
     ImGui::SameLine();
     ImGui::BeginDisabled(undo_.empty());
     if (ImGui::Button("Undo")) Undo();
@@ -681,6 +937,237 @@ LevelEditorActions LevelEditor::Render(Camera&, CXMMATRIX view,
     }
     ImGui::End();
 
+    if (assetBrowserOpen_) {
+        ImGui::SetNextWindowPos(ImVec2(display.x - 430.0f, 490.0f),
+                                ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(420.0f, display.y - 500.0f),
+                                 ImGuiCond_FirstUseEver);
+        ImGui::Begin("Content Browser", &assetBrowserOpen_);
+        ImGui::BeginDisabled(pendingImport_.valid());
+        if (ImGui::Button("Import Model...")) BrowseImportModel();
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Refresh")) {
+            prefabRegistry_.Refresh();
+            assetRegistry_.Refresh(true);
+            selectedPrefab_ = -1;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(assetUndo_.empty());
+        if (ImGui::Button("Undo Asset")) UndoAsset();
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(assetRedo_.empty());
+        if (ImGui::Button("Redo Asset")) RedoAsset();
+        ImGui::EndDisabled();
+        if (ImGui::BeginTabBar("AssetKinds")) {
+            const AssetKind kinds[] = { AssetKind::Model, AssetKind::Texture,
+                AssetKind::Audio, AssetKind::Prefab, AssetKind::Level };
+            for (int tab = 0; tab < IM_ARRAYSIZE(kinds); ++tab) {
+                if (ImGui::BeginTabItem(AssetRegistry::KindName(kinds[tab]),
+                                        nullptr)) {
+                    assetKindTab_ = tab;
+                    ImGui::EndTabItem();
+                }
+            }
+            ImGui::EndTabBar();
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##AssetFilter", "Filter assets...",
+                                 assetFilter_, sizeof(assetFilter_));
+        const std::string filter = assetFilter_;
+        if (assetKindTab_ == 3) {
+        const auto& prefabs = prefabRegistry_.Assets();
+        for (size_t i = 0; i < prefabs.size(); ++i) {
+            const PrefabAsset& prefab = prefabs[i];
+            std::string searchable = prefab.name + " " + prefab.id + " " +
+                                     prefab.modelPath.string();
+            std::transform(searchable.begin(), searchable.end(), searchable.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            std::string loweredFilter = filter;
+            std::transform(loweredFilter.begin(), loweredFilter.end(),
+                loweredFilter.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+            if (!loweredFilter.empty() &&
+                searchable.find(loweredFilter) == std::string::npos) continue;
+            ImGui::PushID(static_cast<int>(i));
+            const bool selected = selectedPrefab_ == static_cast<int>(i);
+            const std::string label = prefab.error.empty()
+                ? prefab.name + (prefab.generated ? "  [model]" : "  [prefab]") +
+                    (prefab.warnings.empty() ? "" : "  [WARN]")
+                : prefab.name + "  [INVALID]";
+            const ImVec4 placeholder = prefab.error.empty()
+                ? (prefab.generated ? ImVec4(0.20f, 0.42f, 0.72f, 1.0f)
+                                    : ImVec4(0.22f, 0.62f, 0.42f, 1.0f))
+                : ImVec4(0.75f, 0.18f, 0.14f, 1.0f);
+            const uint64_t thumbnail = thumbnailTexture && prefab.error.empty()
+                ? thumbnailTexture(prefab) : 0;
+            if (thumbnail)
+                ImGui::Image((ImTextureID)(intptr_t)thumbnail,
+                             ImVec2(42.0f, 42.0f));
+            else
+                ImGui::ColorButton("##thumbnail", placeholder,
+                    ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
+                    ImVec2(42.0f, 42.0f));
+            ImGui::SameLine();
+            if (ImGui::Selectable(label.c_str(), selected,
+                                  ImGuiSelectableFlags_AllowDoubleClick)) {
+                selectedPrefab_ = static_cast<int>(i);
+                prefabDraftIndex_ = -1;
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+                    prefab.error.empty()) AddPrefab(prefab, camera, terrainHeight);
+            }
+            if (prefab.error.empty() && ImGui::BeginDragDropSource()) {
+                ImGui::SetDragDropPayload("SGE_PREFAB_ID", prefab.id.c_str(),
+                    prefab.id.size() + 1);
+                ImGui::Text("Place %s", prefab.name.c_str());
+                ImGui::EndDragDropSource();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted(prefab.id.c_str());
+                ImGui::TextWrapped("%s", prefab.error.empty()
+                    ? prefab.modelPath.string().c_str() : prefab.error.c_str());
+                for (const std::string& warning : prefab.warnings)
+                    ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.2f, 1.0f),
+                        "%s", warning.c_str());
+                ImGui::EndTooltip();
+            }
+            ImGui::PopID();
+        }
+        const bool validSelection = selectedPrefab_ >= 0 &&
+            selectedPrefab_ < static_cast<int>(prefabs.size()) &&
+            prefabs[selectedPrefab_].error.empty();
+        ImGui::BeginDisabled(!validSelection);
+        if (ImGui::Button("Add Selected", ImVec2(-1.0f, 0.0f)))
+            AddPrefab(prefabs[selectedPrefab_], camera, terrainHeight);
+        ImGui::EndDisabled();
+        if (validSelection) {
+            if (prefabDraftIndex_ != selectedPrefab_) {
+                prefabDraftIndex_ = selectedPrefab_;
+                prefabDraft_ = prefabs[selectedPrefab_];
+                strncpy_s(prefabScriptPath_, prefabDraft_.scriptPath.string().c_str(),
+                          _TRUNCATE);
+            }
+            ImGui::SeparatorText("Prefab Settings");
+            ImGui::TextWrapped("%s", prefabDraft_.modelPath.string().c_str());
+            ImGui::DragFloat("Target size", &prefabDraft_.targetSize, 0.1f,
+                             0.0f, 1000.0f, "%.2f m");
+            ImGui::DragFloat3("Default scale", prefabDraft_.defaultScale, 0.05f,
+                              0.01f, 100.0f);
+            ImGui::Checkbox("Cast shadow", &prefabDraft_.castShadow);
+            const char* collisionShapes[] = { "none", "box", "mesh" };
+            int collisionIndex = prefabDraft_.collision == "box" ? 1 :
+                (prefabDraft_.collision == "mesh" ? 2 : 0);
+            if (ImGui::Combo("Collision", &collisionIndex, collisionShapes,
+                             IM_ARRAYSIZE(collisionShapes)))
+                prefabDraft_.collision = collisionShapes[collisionIndex];
+            ImGui::InputTextWithHint("Script", "scripts/my_behavior.json",
+                                     prefabScriptPath_, sizeof(prefabScriptPath_));
+            if (ImGui::Button(prefabDraft_.generated
+                    ? "Create Editable Prefab" : "Save Prefab Settings")) {
+                prefabDraft_.scriptPath = prefabScriptPath_;
+                std::filesystem::path destination = prefabDraft_.definitionPath;
+                if (prefabDraft_.generated) {
+                    const std::string stem = SanitizeFileName(prefabDraft_.name);
+                    prefabDraft_.id = "custom/" + stem;
+                    prefabDraft_.generated = false;
+                    destination = std::filesystem::path("prefabs/Created") /
+                                  (stem + ".json");
+                }
+                AssetFileChange assetChange = CaptureAssetBefore(destination);
+                const PrefabSaveResult saved = PrefabRegistry::Save(
+                    prefabDraft_, destination);
+                if (saved.ok) {
+                    FinishAssetChange(std::move(assetChange));
+                    status_ = "Saved prefab " + destination.string();
+                    const std::string savedId = prefabDraft_.id;
+                    prefabRegistry_.Refresh();
+                    selectedPrefab_ = -1;
+                    const auto& refreshed = prefabRegistry_.Assets();
+                    for (size_t i = 0; i < refreshed.size(); ++i)
+                        if (refreshed[i].id == savedId)
+                            selectedPrefab_ = static_cast<int>(i);
+                    prefabDraftIndex_ = -1;
+                } else status_ = "Prefab save failed: " + saved.error;
+            }
+        }
+        if (!prefabRegistry_.LastError().empty())
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "%s",
+                prefabRegistry_.LastError().c_str());
+        } else {
+            const AssetKind kind = assetKindTab_ == 0 ? AssetKind::Model :
+                assetKindTab_ == 1 ? AssetKind::Texture :
+                assetKindTab_ == 2 ? AssetKind::Audio : AssetKind::Level;
+            std::string loweredFilter = filter;
+            std::transform(loweredFilter.begin(), loweredFilter.end(),
+                loweredFilter.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+            const auto assets = assetRegistry_.Assets(kind);
+            ImGui::BeginChild("AssetRows", ImVec2(0.0f, 0.0f), false);
+            for (const AssetRecord* asset : assets) {
+                std::string searchable = asset->path.generic_string();
+                std::transform(searchable.begin(), searchable.end(),
+                    searchable.begin(), [](unsigned char c) {
+                        return static_cast<char>(std::tolower(c));
+                    });
+                if (!loweredFilter.empty() &&
+                    searchable.find(loweredFilter) == std::string::npos) continue;
+                ImGui::PushID(asset->path.generic_string().c_str());
+                if (kind == AssetKind::Audio) {
+                    if (ImGui::SmallButton("Play")) {
+                        if (audioPreview_.Initialize(asset->path.string()))
+                            audioPreview_.Play(0.8f);
+                    }
+                    ImGui::SameLine();
+                } else {
+                    const ImVec4 color = kind == AssetKind::Texture
+                        ? ImVec4(0.55f, 0.32f, 0.68f, 1.0f)
+                        : kind == AssetKind::Model
+                            ? ImVec4(0.20f, 0.42f, 0.72f, 1.0f)
+                            : ImVec4(0.72f, 0.52f, 0.18f, 1.0f);
+                    ImGui::ColorButton("##asset", color,
+                        ImGuiColorEditFlags_NoTooltip |
+                        ImGuiColorEditFlags_NoDragDrop, ImVec2(18.0f, 18.0f));
+                    ImGui::SameLine();
+                }
+                ImGui::TextUnformatted(asset->path.filename().string().c_str());
+                if (kind == AssetKind::Model) {
+                    const PrefabAsset* generatedPrefab = nullptr;
+                    for (const PrefabAsset& prefab : prefabRegistry_.Assets())
+                        if (prefab.error.empty() &&
+                            prefab.modelPath.lexically_normal() ==
+                                asset->path.lexically_normal()) {
+                            generatedPrefab = &prefab;
+                            break;
+                        }
+                    if (generatedPrefab && ImGui::BeginDragDropSource()) {
+                        ImGui::SetDragDropPayload("SGE_PREFAB_ID",
+                            generatedPrefab->id.c_str(), generatedPrefab->id.size() + 1);
+                        ImGui::Text("Place %s", generatedPrefab->name.c_str());
+                        ImGui::EndDragDropSource();
+                    }
+                }
+                if (kind == AssetKind::Texture && asset->width > 0)
+                    ImGui::TextDisabled("%d x %d  %.1f KB", asset->width,
+                        asset->height, static_cast<double>(asset->size) / 1024.0);
+                else
+                    ImGui::TextDisabled("%.1f KB  %s",
+                        static_cast<double>(asset->size) / 1024.0,
+                        asset->path.generic_string().c_str());
+                ImGui::PopID();
+            }
+            if (!assetRegistry_.LastError().empty())
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "%s",
+                    assetRegistry_.LastError().c_str());
+            ImGui::EndChild();
+        }
+        ImGui::End();
+    }
+
     ImGui::SetNextWindowPos(ImVec2(10, 70), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(285, display.y - 90), ImGuiCond_FirstUseEver);
     ImGui::Begin("Hierarchy");
@@ -693,6 +1180,22 @@ LevelEditorActions LevelEditor::Render(Camera&, CXMMATRIX view,
         const bool selected = selectedId_ == entity.id;
         if (ImGui::Selectable(entity.name.c_str(), selected)) selectedId_ = entity.id;
         ImGui::PopID();
+    }
+    ImGui::InvisibleButton("##PrefabDropTarget", ImVec2(-1.0f, 32.0f));
+    const ImVec2 dropMin = ImGui::GetItemRectMin();
+    ImGui::GetWindowDrawList()->AddRectFilled(dropMin, ImGui::GetItemRectMax(),
+        IM_COL32(35, 52, 68, 180), 4.0f);
+    ImGui::GetWindowDrawList()->AddText(
+        ImVec2(dropMin.x + 8.0f, dropMin.y + 8.0f),
+        IM_COL32(180, 210, 235, 255), "Drop prefab here");
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(
+                "SGE_PREFAB_ID")) {
+            const char* prefabId = static_cast<const char*>(payload->Data);
+            if (const PrefabAsset* prefab = prefabRegistry_.Find(prefabId))
+                AddPrefab(*prefab, camera, terrainHeight);
+        }
+        ImGui::EndDragDropTarget();
     }
     ImGui::SeparatorText("Create");
     const LevelEntityType types[] = { LevelEntityType::WoodHouse, LevelEntityType::MetalHouse,
@@ -738,6 +1241,18 @@ LevelEditorActions LevelEditor::Render(Camera&, CXMMATRIX view,
         before = level_;
         changed = ImGui::Checkbox("Enabled", &entity->enabled);
         TrackItemEdit(before, changed);
+        if (entity->type == LevelEntityType::Prefab) {
+            ImGui::TextDisabled("Prefab: %s", entity->prefabId.c_str());
+            const PrefabAsset* prefab = prefabRegistry_.Find(entity->prefabId);
+            if (prefab) {
+                ImGui::TextWrapped("Model: %s", prefab->modelPath.string().c_str());
+                before = level_;
+                changed = DrawPrefabOverrides(*entity, *prefab);
+                if (changed) MarkChanged(before);
+            }
+            else ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                "Missing prefab. Refresh Content Browser.");
+        }
         before = level_;
         changed = ImGui::DragFloat3("Position", entity->transform.position, 0.1f);
         TrackItemEdit(before, changed);
@@ -858,6 +1373,39 @@ LevelEditorActions LevelEditor::Render(Camera&, CXMMATRIX view,
             }
         } else if (gizmoWasUsing_) MarkChanged(gizmoBefore_);
         gizmoWasUsing_ = usingGizmo;
+    }
+
+    if (const ImGuiPayload* dragging = ImGui::GetDragDropPayload();
+        dragging && dragging->IsDataType("SGE_PREFAB_ID")) {
+        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+        ImGui::SetNextWindowSize(display);
+        ImGui::SetNextWindowBgAlpha(0.0f);
+        const ImGuiWindowFlags dropFlags = ImGuiWindowFlags_NoDecoration |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus;
+        ImGui::Begin("##ScenePrefabDropTarget", nullptr, dropFlags);
+        ImGui::InvisibleButton("##SceneDropSurface", ImGui::GetContentRegionAvail());
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(
+                    "SGE_PREFAB_ID")) {
+                const char* prefabId = static_cast<const char*>(payload->Data);
+                if (const PrefabAsset* prefab = prefabRegistry_.Find(prefabId)) {
+                    XMFLOAT3 hit;
+                    const bool hasHit = TerrainPointUnderMouse(
+                        view, projection, terrainHeight, hit);
+                    AddPrefab(*prefab, camera, terrainHeight);
+                    if (hasHit) {
+                        if (LevelEntity* placed = Selected()) {
+                            placed->transform.position[0] = hit.x;
+                            placed->transform.position[1] = hit.y;
+                            placed->transform.position[2] = hit.z;
+                        }
+                    }
+                }
+            }
+            ImGui::EndDragDropTarget();
+        }
+        ImGui::End();
     }
 
     SculptTerrain(view, projection, terrainHeight);
