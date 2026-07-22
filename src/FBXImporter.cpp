@@ -55,10 +55,56 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
         collectTransforms(scene->mRootNode, aiMatrix4x4());
     }
 
+    auto normalizedTexturePath = [](std::string path) {
+        std::replace(path.begin(), path.end(), '\\', '/');
+        std::transform(path.begin(), path.end(), path.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return path;
+    };
+    auto loadEmbeddedTexture = [&](const aiTexture* embedded,
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploads)
+        -> Microsoft::WRL::ComPtr<ID3D12Resource> {
+        if (!embedded) return nullptr;
+        if (embedded->mHeight == 0)
+            return GLBImporter::LoadTextureFromMemory(
+                reinterpret_cast<const unsigned char*>(embedded->pcData),
+                embedded->mWidth, device, commandList, uploads);
+        std::vector<unsigned char> rgba(
+            static_cast<size_t>(embedded->mWidth) * embedded->mHeight * 4);
+        for (size_t pixel = 0;
+             pixel < static_cast<size_t>(embedded->mWidth) * embedded->mHeight;
+             ++pixel) {
+            rgba[pixel * 4] = embedded->pcData[pixel].r;
+            rgba[pixel * 4 + 1] = embedded->pcData[pixel].g;
+            rgba[pixel * 4 + 2] = embedded->pcData[pixel].b;
+            rgba[pixel * 4 + 3] = embedded->pcData[pixel].a;
+        }
+        return GLBImporter::LoadEmbeddedTextureRGBA256(rgba.data(),
+            static_cast<int>(embedded->mWidth), static_cast<int>(embedded->mHeight),
+            device, commandList, uploads);
+    };
     auto loadTexture = [&](const aiString& texturePath, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploads)
         -> Microsoft::WRL::ComPtr<ID3D12Resource> {
-        std::string rawPath = texturePath.C_Str();
-        std::replace(rawPath.begin(), rawPath.end(), '\\', '/');
+        const std::string rawPath = normalizedTexturePath(texturePath.C_Str());
+        if (!rawPath.empty() && rawPath[0] == '*') {
+            try {
+                const size_t index = static_cast<size_t>(std::stoul(rawPath.substr(1)));
+                if (index < scene->mNumTextures)
+                    return loadEmbeddedTexture(scene->mTextures[index], uploads);
+            } catch (...) {}
+        }
+        // FBX commonly references embedded textures by their original filename
+        // instead of Assimp's *N syntax. Match both complete and leaf names.
+        const std::string requestedName = fs::path(rawPath).filename().string();
+        for (unsigned index = 0; index < scene->mNumTextures; ++index) {
+            const aiTexture* embedded = scene->mTextures[index];
+            if (!embedded) continue;
+            const std::string embeddedPath = normalizedTexturePath(
+                embedded->mFilename.C_Str());
+            if (embeddedPath == rawPath ||
+                fs::path(embeddedPath).filename().string() == requestedName)
+                return loadEmbeddedTexture(embedded, uploads);
+        }
         fs::path path(rawPath);
         if (path.is_absolute() && fs::exists(path))
             return GLBImporter::LoadTextureFromFile(path.string(), device, commandList, uploads);

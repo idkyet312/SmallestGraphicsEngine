@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "rock",
+  "name": "Rock",
+  "components": {
+    "staticMesh": {
+      "path": "models/Rock1/Rock_Pack_num1.fbx",
+      "defaultScale": [1.0, 1.0, 1.0],
+      "targetSize": 2.0,
+      "castShadow": true
+    },
+    "collision": {
+      "shape": "box"
+    },
+    "script": {
+      "path": ""
+    }
+  }
+}

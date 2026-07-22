@@ -14,6 +14,7 @@
 #include "DestructionDX12.h"
 #include "RoofModel.h"
 #include "WaterVolume.h"
+#include "PrefabRuntime.h"
 #include "PalmTrees.h"
 #include "PalmModel.h"
 #include "GunModel.h"
@@ -43,9 +44,6 @@ struct DandelionInstance {
 };
 extern std::shared_ptr<SceneNode> g_dandelionModel;
 extern std::vector<DandelionInstance> g_dandelionInstances;
-extern std::shared_ptr<SceneNode> g_editorRockModel;
-extern std::vector<DirectX::XMMATRIX> g_editorRockInstances;
-extern bool g_editorRockVisible;
 extern ID3D12Resource* g_skyEnvironmentResource;
 extern ID3D12Resource* g_specularEnvironmentResource;
 extern ID3D12Resource* g_brdfIntegrationResource;
@@ -1223,9 +1221,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
     }
 
-    if (g_editorRockVisible && g_editorRockModel) {
-        for (const XMMATRIX& rock : g_editorRockInstances)
-            DrawSceneNode(g_editorRockModel, shader, rock,
+    for (const PrefabRenderBatch& batch : g_prefabRenderBatches) {
+        if (!batch.model) continue;
+        for (const XMMATRIX& transform : batch.transforms)
+            DrawSceneNode(batch.model, shader, transform,
                           view, proj, lightSpace, visibilityExtensionsOnly);
         shader.Use(scene.wireframeMode);
     }
