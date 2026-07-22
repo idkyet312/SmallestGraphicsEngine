@@ -16,6 +16,17 @@ static void Write(const std::filesystem::path& path, const std::string& text) {
     std::ofstream stream(path, std::ios::binary); stream << text;
 }
 
+static std::string TexturedGltf(const std::string& texture) {
+    return std::string(R"({"asset":{"version":"2.0"},"scene":0,
+      "scenes":[{"nodes":[0]}],"nodes":[{"mesh":0}],
+      "meshes":[{"primitives":[{"attributes":{"POSITION":0},"material":0}]}],
+      "buffers":[{"uri":"data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","byteLength":36}],
+      "bufferViews":[{"buffer":0,"byteLength":36}],
+      "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[0,0,0]}],
+      "images":[{"uri":")") + texture + R"("}],"textures":[{"source":0}],
+      "materials":[{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}}}]})";
+}
+
 int main() {
     const auto root = std::filesystem::temp_directory_path() /
         ("sge-asset-registry-" + std::to_string(
@@ -27,7 +38,10 @@ int main() {
     Write("models/props/crate_copy.glb", "model bytes");
     std::filesystem::last_write_time("models/props/crate_copy.glb",
         std::filesystem::last_write_time("models/props/crate.glb"));
-    Write("models/props/albedo.png", "not a real png");
+    Write("models/props/albedo map.png", "not a real png");
+    Write("models/props/unreferenced.png", "not a real png");
+    Write("models/props/textured.gltf", TexturedGltf("albedo%20map.png"));
+    Write("models/props/missing_texture.gltf", TexturedGltf("missing.png"));
 
     AssetRegistry registry;
     CHECK(registry.Refresh());
@@ -39,6 +53,25 @@ int main() {
     CHECK(copy != nullptr);
     if (copy) CHECK(copy->guid != guid);
     CHECK(std::filesystem::exists("assetcache/registry.json"));
+    const AssetRecord* albedo = registry.FindPath("models/props/albedo map.png");
+    const AssetRecord* unreferenced = registry.FindPath(
+        "models/props/unreferenced.png");
+    const AssetRecord* textured = registry.FindPath("models/props/textured.gltf");
+    CHECK(albedo != nullptr);
+    CHECK(unreferenced != nullptr);
+    CHECK(textured != nullptr);
+    if (albedo && unreferenced && textured) {
+        CHECK(std::find(textured->dependencies.begin(), textured->dependencies.end(),
+                        albedo->guid) != textured->dependencies.end());
+        CHECK(std::find(textured->dependencies.begin(), textured->dependencies.end(),
+                        unreferenced->guid) == textured->dependencies.end());
+    }
+    const AssetRecord* missingTexture = registry.FindPath(
+        "models/props/missing_texture.gltf");
+    CHECK(missingTexture != nullptr);
+    if (missingTexture) CHECK(std::find(missingTexture->missingDependencies.begin(),
+        missingTexture->missingDependencies.end(),
+        "models/props/missing.png") != missingTexture->missingDependencies.end());
 
     Write("prefabs/crate.json", std::string(R"({"schemaVersion":2,
       "id":"crate","components":{"staticMesh":{"path":"models/props/crate.glb",
@@ -48,6 +81,17 @@ int main() {
     CHECK(prefab != nullptr);
     if (prefab) CHECK(std::find(prefab->dependencies.begin(),
         prefab->dependencies.end(), guid) != prefab->dependencies.end());
+    Write("levels/dependency_chain.json", R"({"schemaVersion":1,
+      "name":"Dependency Chain","entities":[{"id":1,"type":"prefab",
+      "name":"Crate","prefabId":"crate","transform":{
+      "position":[0,0,0],"rotation":[0,0,0],"scale":[1,1,1]}}]})");
+    CHECK(registry.Refresh());
+    prefab = registry.FindPath("prefabs/crate.json");
+    const AssetRecord* level = registry.FindPath("levels/dependency_chain.json");
+    CHECK(prefab != nullptr);
+    CHECK(level != nullptr);
+    if (prefab && level) CHECK(std::find(level->dependencies.begin(),
+        level->dependencies.end(), prefab->guid) != level->dependencies.end());
 
     Write("prefabs/missing.json", R"({"schemaVersion":2,
       "id":"missing","components":{"staticMesh":{

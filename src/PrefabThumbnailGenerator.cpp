@@ -18,6 +18,57 @@ float Edge(const Vertex& a, const Vertex& b, float x, float y) {
 }
 }
 
+bool PrefabThumbnailGenerator::LoadMesh(
+        const std::filesystem::path& modelPath,
+        PrefabThumbnailMesh& output) {
+    output = {};
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile(modelPath.string(),
+        aiProcess_Triangulate | aiProcess_PreTransformVertices |
+        aiProcess_GenSmoothNormals);
+    if (!scene || !scene->HasMeshes()) return false;
+
+    aiVector3D minimum(FLT_MAX), maximum(-FLT_MAX);
+    for (unsigned meshIndex = 0; meshIndex < scene->mNumMeshes; ++meshIndex) {
+        const aiMesh* mesh = scene->mMeshes[meshIndex];
+        aiColor4D diffuse(0.62f, 0.65f, 0.70f, 1.0f);
+        if (mesh->mMaterialIndex < scene->mNumMaterials) {
+            const aiMaterial* material = scene->mMaterials[mesh->mMaterialIndex];
+            if (aiGetMaterialColor(material, AI_MATKEY_BASE_COLOR, &diffuse) !=
+                AI_SUCCESS)
+                aiGetMaterialColor(material, AI_MATKEY_COLOR_DIFFUSE, &diffuse);
+        }
+        const unsigned int base = static_cast<unsigned int>(output.vertices.size());
+        output.vertices.reserve(output.vertices.size() + mesh->mNumVertices);
+        for (unsigned vertexIndex = 0; vertexIndex < mesh->mNumVertices;
+             ++vertexIndex) {
+            const aiVector3D& position = mesh->mVertices[vertexIndex];
+            const aiVector3D normal = mesh->HasNormals()
+                ? mesh->mNormals[vertexIndex] : aiVector3D(0.0f, 1.0f, 0.0f);
+            output.vertices.push_back({ position.x, position.y, position.z,
+                normal.x, normal.y, normal.z, diffuse.r, diffuse.g, diffuse.b });
+            minimum.x = (std::min)(minimum.x, position.x);
+            minimum.y = (std::min)(minimum.y, position.y);
+            minimum.z = (std::min)(minimum.z, position.z);
+            maximum.x = (std::max)(maximum.x, position.x);
+            maximum.y = (std::max)(maximum.y, position.y);
+            maximum.z = (std::max)(maximum.z, position.z);
+        }
+        for (unsigned faceIndex = 0; faceIndex < mesh->mNumFaces; ++faceIndex) {
+            const aiFace& face = mesh->mFaces[faceIndex];
+            if (face.mNumIndices != 3) continue;
+            output.indices.push_back(base + face.mIndices[0]);
+            output.indices.push_back(base + face.mIndices[1]);
+            output.indices.push_back(base + face.mIndices[2]);
+        }
+    }
+    if (output.vertices.empty() || output.indices.empty()) return false;
+    output.minimum[0] = minimum.x; output.minimum[1] = minimum.y;
+    output.minimum[2] = minimum.z; output.maximum[0] = maximum.x;
+    output.maximum[1] = maximum.y; output.maximum[2] = maximum.z;
+    return true;
+}
+
 bool PrefabThumbnailGenerator::Render128(const std::filesystem::path& modelPath,
                                          const std::filesystem::path& pngPath) {
     Assimp::Importer importer;

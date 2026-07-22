@@ -25,6 +25,10 @@ int main() {
         std::ofstream stream(model);
         stream << "v -1 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
     }
+    PrefabThumbnailMesh mesh;
+    CHECK(PrefabThumbnailGenerator::LoadMesh(model, mesh));
+    CHECK(mesh.vertices.size() == 3);
+    CHECK(mesh.indices.size() == 3);
     CHECK(PrefabThumbnailGenerator::Render128(model, image));
     int width = 0, height = 0, channels = 0;
     CHECK(stbi_info(image.string().c_str(), &width, &height, &channels) != 0);

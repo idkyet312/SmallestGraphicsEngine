@@ -50,10 +50,15 @@ property before editing it.
 Assets use persistent GUIDs stored in `assetcache/registry.json`. Prefabs retain
 GUID plus readable fallback path, so model renames survive registry refresh.
 Missing dependencies appear as `[MISSING DEP]` rows with tooltip details.
+Model dependencies come from material texture references, not folder guesses;
+the registry records the complete model -> texture -> prefab -> level chain.
 
 Use **Undo Asset** and **Redo Asset** for prefab edits and imports. Ordinary
 level edits use toolbar **Undo** and **Redo**.
 
 Scripting remains reserved for a future language/runtime decision. Prefab and
 asset changes hot-reload through the native filesystem watcher while editor is
-open. Model imports and thumbnail generation run in background jobs.
+open. Model copying, validation, dependency refresh, and thumbnail mesh import run
+in background jobs. Thumbnail geometry is rendered by DX12 into a 128 x 128
+offscreen target, displayed directly, then asynchronously cached as PNG under
+`assetcache/thumbs/`.

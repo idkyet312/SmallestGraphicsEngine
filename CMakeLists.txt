@@ -306,7 +306,8 @@ if(BUILD_TESTING)
         src/AssetRegistry.cpp)
     target_include_directories(AssetRegistryTests PRIVATE
         ${CMAKE_SOURCE_DIR}/src ${TINYGLTF_INCLUDE_DIRS})
-    target_link_libraries(AssetRegistryTests PRIVATE nlohmann_json::nlohmann_json)
+    target_link_libraries(AssetRegistryTests PRIVATE
+        nlohmann_json::nlohmann_json assimp::assimp)
     add_test(NAME AssetRegistryTests COMMAND AssetRegistryTests)
 
     add_executable(PrefabThumbnailTests
