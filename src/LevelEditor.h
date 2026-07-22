@@ -1,10 +1,18 @@
 #ifndef LEVEL_EDITOR_H
 #define LEVEL_EDITOR_H
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "LevelDefinition.h"
+#include "PrefabRegistry.h"
+#include "AssetRegistry.h"
+#include "GunAudio.h"
 #include <DirectXMath.h>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -24,6 +32,7 @@ public:
     void StopPlay();
     bool IsPlaying() const { return playing_; }
     bool IsDirty() const { return dirty_; }
+    void RefreshAssets();
     const LevelDefinition& Level() const { return level_; }
     LevelDefinition& Level() { return level_; }
     void MarkRuntimeSynchronized() { runtimeDirty_ = false; }
@@ -35,9 +44,17 @@ public:
     void OnKeyDown(unsigned key, bool controlDown);
     LevelEditorActions Render(Camera& camera,
         DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
-        const std::function<float(float, float)>& terrainHeight);
+        const std::function<float(float, float)>& terrainHeight,
+        const std::function<uint64_t(const PrefabAsset&)>& thumbnailTexture = {});
 
 private:
+    struct AssetFileChange {
+        std::filesystem::path path;
+        bool beforeExists = false;
+        bool afterExists = false;
+        std::string before;
+        std::string after;
+    };
     LevelEntity* Selected();
     const LevelEntity* Selected() const;
     void SelectFromViewport(DirectX::CXMMATRIX view,
@@ -45,11 +62,18 @@ private:
     void PushUndo(const LevelDefinition& before);
     void Undo();
     void Redo();
+    AssetFileChange CaptureAssetBefore(const std::filesystem::path& path) const;
+    void FinishAssetChange(AssetFileChange change);
+    void UndoAsset();
+    void RedoAsset();
     void AddEntity(LevelEntityType type);
+    void AddPrefab(const PrefabAsset& prefab, const Camera& camera,
+        const std::function<float(float, float)>& terrainHeight);
     void DuplicateSelected();
     void DeleteSelected();
     bool SaveTo(const std::filesystem::path& path);
     bool BrowseSaveAs();
+    bool BrowseImportModel();
     void RefreshLevelFiles();
     void MarkChanged(const LevelDefinition& before);
     void TrackItemEdit(const LevelDefinition& before, bool changed);
@@ -112,6 +136,20 @@ private:
     char levelName_[128] = "Level 1 Copy";
     char saveName_[128] = "level_1_copy";
     std::string status_;
+    PrefabRegistry prefabRegistry_;
+    AssetRegistry assetRegistry_;
+    GunAudio audioPreview_;
+    bool assetBrowserOpen_ = true;
+    int assetKindTab_ = 3;
+    int selectedPrefab_ = -1;
+    int prefabDraftIndex_ = -1;
+    PrefabAsset prefabDraft_;
+    char assetFilter_[128] = {};
+    char prefabScriptPath_[260] = {};
+    std::future<std::pair<PrefabSaveResult, std::filesystem::path>> pendingImport_;
+    std::vector<AssetFileChange> pendingImportChanges_;
+    std::vector<std::vector<AssetFileChange>> assetUndo_;
+    std::vector<std::vector<AssetFileChange>> assetRedo_;
 };
 
 #endif

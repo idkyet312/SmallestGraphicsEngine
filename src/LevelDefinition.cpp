@@ -68,6 +68,7 @@ const char* LevelEntityTypeName(LevelEntityType type) {
     case LevelEntityType::GrassPatch: return "grass_patch";
     case LevelEntityType::Dandelion: return "dandelion";
     case LevelEntityType::Rock: return "rock";
+    case LevelEntityType::Prefab: return "prefab";
     }
     return "unknown";
 }
@@ -78,7 +79,7 @@ bool ParseLevelEntityType(const std::string& text, LevelEntityType& type) {
         return true;
     }
     for (int i = static_cast<int>(LevelEntityType::PlayerSpawn);
-         i <= static_cast<int>(LevelEntityType::Rock); ++i) {
+         i <= static_cast<int>(LevelEntityType::Prefab); ++i) {
         const auto candidate = static_cast<LevelEntityType>(i);
         if (text == LevelEntityTypeName(candidate)) {
             type = candidate;
@@ -172,7 +173,7 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         if (static_cast<int>(entity.type) <
             static_cast<int>(LevelEntityType::PlayerSpawn) ||
             static_cast<int>(entity.type) >
-                static_cast<int>(LevelEntityType::Rock))
+                static_cast<int>(LevelEntityType::Prefab))
             result.errors.push_back("entity " + std::to_string(entity.id) +
                                     " has an unknown type");
         if (!entity.id || !ids.insert(entity.id).second)
@@ -180,6 +181,12 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         if (entity.name.empty())
             result.errors.push_back("entity " + std::to_string(entity.id) +
                                     " has an empty name");
+        if (entity.type == LevelEntityType::Prefab && entity.prefabId.empty())
+            result.errors.push_back("prefab entity " + std::to_string(entity.id) +
+                                    " has no prefab ID");
+        if (!entity.overrides.is_object())
+            result.errors.push_back("entity " + std::to_string(entity.id) +
+                                    " overrides must be an object");
         if (!Finite3(entity.transform.position) ||
             !Finite3(entity.transform.rotation) || !Finite3(entity.transform.scale))
             result.errors.push_back("entity " + std::to_string(entity.id) +
@@ -237,6 +244,8 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
             if (!ParseLevelEntityType(typeName, entity.type))
                 throw std::runtime_error("unknown entity type: " + typeName);
             entity.name = source.at("name").get<std::string>();
+            entity.prefabId = source.value("prefab", "");
+            entity.overrides = source.value("overrides", json::object());
             entity.enabled = source.value("enabled", true);
             const json& transform = source.at("transform");
             if (!ReadVec3(transform.at("position"), entity.transform.position) ||
@@ -266,7 +275,7 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
     try {
         json entities = json::array();
         for (const LevelEntity& entity : level.entities) {
-            entities.push_back({
+            json saved = {
                 {"id", entity.id}, {"type", LevelEntityTypeName(entity.type)},
                 {"name", entity.name}, {"enabled", entity.enabled},
                 {"transform", {
@@ -274,7 +283,10 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
                     {"rotation", Vec3(entity.transform.rotation)},
                     {"scale", Vec3(entity.transform.scale)}
                 }}
-            });
+            };
+            if (!entity.prefabId.empty()) saved["prefab"] = entity.prefabId;
+            if (!entity.overrides.empty()) saved["overrides"] = entity.overrides;
+            entities.push_back(std::move(saved));
         }
         json sculpt = json::array();
         for (const TerrainSculptStamp& stamp : level.terrainSculpt) {
