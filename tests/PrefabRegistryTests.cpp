@@ -45,10 +45,14 @@ int main() {
         crate.modelPath = "models/crate.glb";
         crate.defaultScale[0] = crate.defaultScale[1] = crate.defaultScale[2] = 2.0f;
         crate.targetSize = 1.5f;
+        crate.useMaterials = false;
         crate.collision = "box";
         crate.light.enabled = true;
         crate.light.intensity = 3.5f;
         crate.components["customComponent"] = {{"kept", 42}};
+        crate.components["staticMesh"]["futureMeshField"] = 17;
+        crate.components["light"]["futureLightField"] = "kept";
+        crate.document["futureRootField"] = { {"kept", true} };
         CHECK(PrefabRegistry::Save(crate, "prefabs/crate.json").ok);
 
         PrefabRegistry registry;
@@ -60,15 +64,33 @@ int main() {
         if (loaded) {
             CHECK(loaded->modelPath == std::filesystem::path("models/crate.glb"));
             CHECK(loaded->targetSize == 1.5f);
+            CHECK(!loaded->useMaterials);
             CHECK(loaded->collision == "box");
             CHECK(loaded->schemaVersion == 2);
             CHECK(loaded->light.enabled);
             CHECK(loaded->light.intensity == 3.5f);
             CHECK(loaded->components.at("customComponent").at("kept") == 42);
+            CHECK(loaded->components.at("staticMesh").at("futureMeshField") == 17);
+            CHECK(loaded->components.at("light").at("futureLightField") == "kept");
+            CHECK(loaded->document.at("futureRootField").at("kept") == true);
         }
         CHECK(registry.Find("model/models/loose.fbx") != nullptr);
         CHECK(!registry.Refresh());
         CHECK(registry.Revision() == firstRevision);
+
+        PrefabAsset edited = *registry.Find("test/crate");
+        edited.name = "Crate Hot Reloaded";
+        CHECK(PrefabRegistry::Save(edited, "prefabs/crate.json").ok);
+        CHECK(registry.Refresh());
+        CHECK(registry.Revision() > firstRevision);
+        const PrefabAsset* hotReloaded = registry.Find("test/crate");
+        CHECK(hotReloaded != nullptr);
+        if (hotReloaded) {
+            CHECK(hotReloaded->name == "Crate Hot Reloaded");
+            CHECK(hotReloaded->components.at("staticMesh")
+                .at("futureMeshField") == 17);
+            CHECK(hotReloaded->document.at("futureRootField").at("kept") == true);
+        }
 
         WriteText("prefabs/bad.json", "{not json");
         CHECK(registry.Refresh());
@@ -135,6 +157,21 @@ int main() {
                                                 0.1f, &hit));
         CHECK(!PrefabColliderIntersectsSegment(collider, {-3, 4, 0}, {3, 4, 0},
                                                  0.1f));
+
+        WriteText("models/renamed.glb", "renamed model");
+        WriteText("assetcache/registry.json", R"({
+          "schemaVersion":3,"assets":[{"guid":"stable-model-guid",
+          "path":"models/renamed.glb","kind":"Models"}]})");
+        WriteText("prefabs/guid_reference.json", R"({
+          "schemaVersion":2,"id":"test/guid-reference","components":{
+            "staticMesh":{"path":"models/old_name.glb",
+            "assetGuid":"stable-model-guid"}}})");
+        CHECK(registry.Refresh());
+        const PrefabAsset* guidReference = registry.Find("test/guid-reference");
+        CHECK(guidReference != nullptr);
+        if (guidReference)
+            CHECK(guidReference->modelPath ==
+                  std::filesystem::path("models/renamed.glb"));
 
         WriteText("prefabs/missing_model.json", R"({
           "schemaVersion":2,"id":"test/missing","components":{

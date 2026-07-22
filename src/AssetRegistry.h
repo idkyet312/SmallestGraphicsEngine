@@ -17,6 +17,7 @@ struct AssetRecord {
     int width = 0;
     int height = 0;
     std::vector<std::string> dependencies;
+    std::vector<std::string> missingDependencies;
 };
 
 class AssetRegistry {

@@ -107,6 +107,7 @@ std::vector<PrefabLightInstance> g_prefabLightInstances;
 std::vector<PrefabAudioEmitter> g_prefabAudioEmitters;
 std::vector<PrefabSpawnPoint> g_prefabSpawnPoints;
 std::vector<PrefabDestructibleInstance> g_prefabDestructibles;
+static std::unordered_map<uint64_t, float> g_prefabHealth;
 struct PrefabAudioPlayer {
     size_t emitterIndex = 0;
     std::unique_ptr<GunAudio> player;
@@ -1537,6 +1538,16 @@ struct PrefabThumbnailRuntime {
 };
 static std::unordered_map<std::string, PrefabThumbnailRuntime> g_prefabThumbnails;
 static UINT g_nextImGuiTextureSlot = 1;
+static bool g_thumbnailUploadedThisFrame = false;
+
+static uint64_t StableThumbnailHash(const std::string& value) {
+    uint64_t hash = 1469598103934665603ull;
+    for (unsigned char byte : value) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
 
 static uint64_t PrefabThumbnailTexture(const PrefabAsset& prefab) {
     if (!imguiSrvHeap || prefab.modelPath.empty()) return 0;
@@ -1544,8 +1555,8 @@ static uint64_t PrefabThumbnailTexture(const PrefabAsset& prefab) {
     const std::string source = prefab.modelPath.generic_string() + ':' +
         std::to_string(std::filesystem::file_size(prefab.modelPath, error)) + ':' +
         std::to_string(std::filesystem::last_write_time(prefab.modelPath, error)
-            .time_since_epoch().count()) + ':' + std::to_string(g_prefabRegistry.Revision());
-    const size_t sourceHash = std::hash<std::string>{}(source);
+            .time_since_epoch().count());
+    const uint64_t sourceHash = StableThumbnailHash(source);
     PrefabThumbnailRuntime& entry = g_prefabThumbnails[prefab.id];
     if (entry.sourceHash != sourceHash) {
         entry = PrefabThumbnailRuntime{};
@@ -1555,6 +1566,13 @@ static uint64_t PrefabThumbnailTexture(const PrefabAsset& prefab) {
     }
     if (!entry.texture && !std::filesystem::exists(entry.pngPath) &&
         !entry.generation.valid()) {
+        size_t runningJobs = 0;
+        for (auto& [id, thumbnail] : g_prefabThumbnails)
+            if (thumbnail.generation.valid() &&
+                thumbnail.generation.wait_for(std::chrono::seconds(0)) !=
+                    std::future_status::ready)
+                ++runningJobs;
+        if (runningJobs >= 2) return 0;
         const auto modelPath = prefab.modelPath;
         const auto pngPath = entry.pngPath;
         entry.generation = std::async(std::launch::async, [modelPath, pngPath]() {
@@ -1568,10 +1586,12 @@ static uint64_t PrefabThumbnailTexture(const PrefabAsset& prefab) {
         if (!entry.generation.get()) return 0;
     }
     if (!entry.texture) {
-        if (g_nextImGuiTextureSlot >= kImGuiDescriptorCount) return 0;
+        if (g_thumbnailUploadedThisFrame ||
+            g_nextImGuiTextureSlot >= kImGuiDescriptorCount) return 0;
         entry.texture = GLBImporter::LoadTextureSingleMip(entry.pngPath.string(),
             g_dx12.device, g_dx12.commandList, entry.uploads);
         if (!entry.texture) return 0;
+        g_thumbnailUploadedThisFrame = true;
         entry.descriptorSlot = g_nextImGuiTextureSlot++;
         const UINT stride = g_dx12.device->GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1902,7 +1922,7 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
     std::shared_ptr<SceneNode> model;
     if (_stricmp(extension.c_str(), ".fbx") == 0) {
         model = FBXImporter::Load(prefab.modelPath.string(), g_dx12.device,
-            g_dx12.commandList, 1.0f, false, true, false, true);
+            g_dx12.commandList, 1.0f, false, prefab.useMaterials, false, true);
     } else {
         model = GLBImporter::LoadGLB(prefab.modelPath.string(), g_dx12.device,
             g_dx12.commandList);
@@ -1911,6 +1931,18 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
         SGE_LOG("LogPrefab", EngineLog::Level::Error,
             "Failed to load " + prefab.id + " from " + prefab.modelPath.string());
         return nullptr;
+    }
+    if (!prefab.useMaterials) {
+        const auto stripMaterials = [](const auto& self,
+                                       const std::shared_ptr<SceneNode>& node) -> void {
+            if (!node) return;
+            if (node->mesh) {
+                for (MeshPrimitive& primitive : node->mesh->primitives)
+                    primitive.material = std::make_shared<SceneMaterial>();
+            }
+            for (const auto& child : node->children) self(self, child);
+        };
+        stripMaterials(stripMaterials, model);
     }
     model->translation = XMFLOAT3(0.0f, 0.0f, 0.0f);
     model->rotation = XMFLOAT4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -2063,9 +2095,12 @@ static void RebuildPrefabRenderBatches() {
                 audio.value("path", ""), audio.value("loop", false),
                 audio.value("radius", 15.0f) });
         }
-        if (components.contains("destructible"))
-            g_prefabDestructibles.push_back({ entityId,
-                components.at("destructible").value("health", 100.0f) });
+        if (components.contains("destructible")) {
+            const float health = components.at("destructible").value(
+                "health", 100.0f);
+            g_prefabDestructibles.push_back({ entityId, origin, health });
+            g_prefabHealth.try_emplace(entityId, health);
+        }
         if (components.contains("spawner")) {
             const auto& spawner = components.at("spawner");
             XMFLOAT3 spawnWorldX;
@@ -2182,7 +2217,8 @@ static void ResolvePlayerPrefabCollisions(XMFLOAT3& position, float radius,
 }
 
 static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
-                                     float radius, XMFLOAT3& hit) {
+                                     float radius, XMFLOAT3& hit,
+                                     uint64_t* hitEntityId = nullptr) {
     float closestDistanceSquared = FLT_MAX;
     bool struck = false;
     for (const PrefabCollider& collider : g_prefabColliders) {
@@ -2196,10 +2232,47 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
         if (distanceSquared < closestDistanceSquared) {
             closestDistanceSquared = distanceSquared;
             hit = candidate;
+            if (hitEntityId) *hitEntityId = collider.entityId;
             struck = true;
         }
     }
     return struck;
+}
+
+static void DamagePrefabEntity(uint64_t entityId, float damage,
+                               const XMFLOAT3& hit) {
+    const auto definition = std::find_if(g_prefabDestructibles.begin(),
+        g_prefabDestructibles.end(), [&](const PrefabDestructibleInstance& value) {
+            return value.entityId == entityId;
+        });
+    if (definition == g_prefabDestructibles.end() || damage <= 0.0f) return;
+    float& health = g_prefabHealth.try_emplace(
+        entityId, definition->health).first->second;
+    health -= damage;
+    if (health > 0.0f) return;
+    for (LevelEntity& entity : g_runtimeLevel.entities) {
+        if (entity.id != entityId || !entity.enabled) continue;
+        entity.enabled = false;
+        scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
+        g_prefabRebuildRequested = true;
+        SGE_LOG("LogPrefab", EngineLog::Level::Display,
+            "Destroyed prefab entity " + std::to_string(entityId));
+        break;
+    }
+}
+
+static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
+                                  float damage) {
+    if (radius <= 0.0f) return;
+    for (const PrefabDestructibleInstance& prefab : g_prefabDestructibles) {
+        const float dx = prefab.position.x - center.x;
+        const float dy = prefab.position.y - center.y;
+        const float dz = prefab.position.z - center.z;
+        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (distance >= radius) continue;
+        DamagePrefabEntity(prefab.entityId,
+            damage * (1.0f - distance / radius), prefab.position);
+    }
 }
 
 static void RebuildScalableEnvironment() {
@@ -2456,6 +2529,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_pendingEnvironmentRebuild = modeAssetsLoaded && g_customLevelMode;
     scene.playerGodMode = godMode;
     scene.RestorePlayerHealth();
+    g_prefabHealth.clear();
     scene.ResetLevelRuntimeState();
     scene.camera = Camera(XMFLOAT3(0.0f, 5.0f, 10.0f));
     scene.gun.visible = true;
@@ -3991,6 +4065,7 @@ static void BeginEditorPlaytest(HWND hwnd) {
     if (gameScreen != GameScreen::LevelEditor || g_levelEditor.IsPlaying()) return;
     g_editorCameraSnapshot = scene.camera;
     g_levelEditor.BeginPlay();
+    g_prefabHealth.clear();
     scene.ResetLevelRuntimeState();
     SynchronizeEditorRuntime(true);
     scene.playerGodMode = true;
@@ -4011,6 +4086,7 @@ static void StopEditorPlaytest() {
     g_levelEditor.StopPlay();
     g_heldBandit = nullptr;
     g_bandits.clear();
+    g_prefabHealth.clear();
     scene.ResetLevelRuntimeState();
     pendingLevelRuntimeReset = false;
     pendingTurretGunnerRespawn = false;
@@ -5192,6 +5268,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         const bool stressVisibilityTest =
             GetEnvironmentVariableA("SGE_VISIBILITY_TEST_STRESS", nullptr, 0) > 0;
         StartLevelOne(hwnd, true, stressVisibilityTest, emptyVisibilityTest);
+        if (GetEnvironmentVariableA("SGE_PREFAB_SMOKE_TEST", nullptr, 0) > 0) {
+            LevelEntity rock;
+            rock.id = 9000001;
+            rock.type = LevelEntityType::Prefab;
+            rock.name = "Prefab Smoke Rock";
+            rock.prefabId = "rock";
+            rock.transform.position[0] = 6.0f;
+            rock.transform.position[2] = 6.0f;
+            g_runtimeLevel.entities.push_back(std::move(rock));
+            g_prefabRebuildRequested = true;
+            SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                "Prefab smoke test injected rock instance");
+        }
     }
 
     // ?? main loop ????????????????????????????????????????????????????????????
@@ -5207,7 +5296,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         deltaTime = now - lastTime;
         lastTime  = now;
 
-        if (IsEditorEditing() && g_assetWatcher.ConsumeChange()) {
+        if (IsEditorEditing() && !g_levelEditor.ImportInProgress() &&
+            g_assetWatcher.ConsumeChange()) {
             const bool assetsChanged = g_assetRegistry.Refresh();
             if (assetsChanged || g_prefabRegistry.Refresh()) {
                 g_levelEditor.RefreshAssets();
@@ -5686,6 +5776,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         g_destruction.ApplyRagdollExplosion(
                             center, scene.grenadeEnemyRadius,
                             scene.grenadeEnemyImpulse);
+                        DamagePrefabsInRadius(center, scene.grenadeBlastRadius,
+                            scene.grenadeDamage);
                         projectile.active = false;
                         projectile.detonate = false;
                     }
@@ -5797,13 +5889,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     projectile.active = false;
                     continue;
                 }
+                uint64_t prefabEntityId = 0;
                 if (HitPrefabColliderSegment(projectile.previousPosition,
-                        projectile.position, bulletRadius, hit)) {
+                        projectile.position, bulletRadius, hit,
+                        &prefabEntityId)) {
                     projectile.position = hit;
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(hit, normal);
+                    DamagePrefabEntity(prefabEntityId,
+                        34.0f * projectile.damageMultiplier, hit);
                     projectile.active = false;
                     continue;
                 }
@@ -6515,6 +6611,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+        g_thumbnailUploadedThisFrame = false;
         if (levelLoadingActive) {
             RenderLoadingScreen();
         } else if (gameScreen == GameScreen::MainMenu) {

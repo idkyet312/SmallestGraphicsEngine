@@ -181,6 +181,7 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
         stream >> root;
         if (!root.is_object()) throw std::runtime_error("root must be an object");
         MigratePrefabJson(root);
+        prefab.document = root;
         prefab.schemaVersion = root.value("schemaVersion", 2u);
         prefab.id = root.at("id").get<std::string>();
         prefab.name = root.value("name", prefab.id);
@@ -220,6 +221,7 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
             if (prefab.modelGuid.empty())
                 prefab.modelGuid = GuidForAssetPath(prefab.modelPath);
             prefab.castShadow = mesh.value("castShadow", true);
+            prefab.useMaterials = mesh.value("useMaterials", true);
             prefab.targetSize = mesh.value("targetSize", 0.0f);
             if (prefab.targetSize < 0.0f || prefab.targetSize > 10000.0f)
                 throw std::runtime_error("staticMesh.targetSize is out of range");
@@ -340,6 +342,7 @@ json MergePrefabComponents(const json& defaults, const json& overrides) {
 const std::vector<PrefabPropertyDescriptor>& PrefabPropertyMetadata() {
     static const std::vector<PrefabPropertyDescriptor> properties = {
         {"staticMesh", "castShadow", PrefabPropertyType::Boolean},
+        {"staticMesh", "useMaterials", PrefabPropertyType::Boolean},
         {"staticMesh", "targetSize", PrefabPropertyType::Number, 0.0f, 10000.0f},
         {"collision", "shape", PrefabPropertyType::String},
         {"light", "color", PrefabPropertyType::Color3, 0.0f, 1.0f},
@@ -408,10 +411,6 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
             const std::filesystem::path relative = std::filesystem::relative(it->path(), error);
             if (error) { error.clear(); continue; }
             const std::string model = Generic(relative);
-            // Rock prefab is disabled. Keep source model available as a model
-            // asset, but do not auto-create a renderable prefab or thumbnail.
-            if (Lower(it->path().stem().string()) == "rock_pack_num1")
-                continue;
             fingerprintParts.push_back(model + ':' +
                 std::to_string(it->file_size(error)) + ':' +
                 std::to_string(it->last_write_time(error).time_since_epoch().count()));
@@ -460,6 +459,7 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
             merged.name = local.name;
             merged.basePrefabId = local.basePrefabId;
             merged.definitionPath = local.definitionPath;
+            merged.document = local.document;
             merged.generated = local.generated;
             merged.error = local.error;
             merged.components = MergePrefabComponents(merged.components,
@@ -470,6 +470,7 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
                 merged.modelPath = local.modelPath;
                 merged.modelGuid = local.modelGuid;
                 merged.castShadow = local.castShadow;
+                merged.useMaterials = local.useMaterials;
                 merged.targetSize = local.targetSize;
                 merged.materialOverrides = local.materialOverrides;
                 merged.lods = local.lods;
@@ -618,16 +619,20 @@ PrefabSaveResult PrefabRegistry::Save(const PrefabAsset& prefab,
     try {
         json components = prefab.components.is_object()
             ? prefab.components : json::object();
-        if (!prefab.modelPath.empty()) components["staticMesh"] = {
-            {"path", Generic(prefab.modelPath)},
-            {"assetGuid", prefab.modelGuid.empty()
+        if (!prefab.modelPath.empty()) {
+            json& mesh = components["staticMesh"];
+            if (!mesh.is_object()) mesh = json::object();
+            mesh["path"] = Generic(prefab.modelPath);
+            mesh["assetGuid"] = prefab.modelGuid.empty()
                 ? ([&]() { const std::string cached = GuidForAssetPath(prefab.modelPath);
                     return cached.empty() ? NewAssetGuid(prefab.modelPath) : cached; })()
-                : prefab.modelGuid},
-            {"defaultScale", json::array({ prefab.defaultScale[0],
-                prefab.defaultScale[1], prefab.defaultScale[2] })},
-            {"targetSize", prefab.targetSize}, {"castShadow", prefab.castShadow}
-        };
+                : prefab.modelGuid;
+            mesh["defaultScale"] = json::array({ prefab.defaultScale[0],
+                prefab.defaultScale[1], prefab.defaultScale[2] });
+            mesh["targetSize"] = prefab.targetSize;
+            mesh["castShadow"] = prefab.castShadow;
+            mesh["useMaterials"] = prefab.useMaterials;
+        }
         else components.erase("staticMesh");
         if (components.contains("staticMesh")) {
             json materialOverrides = json::array();
@@ -644,46 +649,53 @@ PrefabSaveResult PrefabRegistry::Save(const PrefabAsset& prefab,
             if (!lods.empty()) components["staticMesh"]["lods"] = lods;
             else components["staticMesh"].erase("lods");
         }
-        components["collision"] = {{"shape", prefab.collision}};
-        if (!prefab.scriptPath.empty())
-            components["script"] = {{"path", Generic(prefab.scriptPath)}};
+        if (!components["collision"].is_object())
+            components["collision"] = json::object();
+        components["collision"]["shape"] = prefab.collision;
+        if (!prefab.scriptPath.empty()) {
+            if (!components["script"].is_object())
+                components["script"] = json::object();
+            components["script"]["path"] = Generic(prefab.scriptPath);
+        }
         else components.erase("script");
-        if (prefab.light.enabled)
-            components["light"] = {
-                {"color", json::array({ prefab.light.color[0],
-                    prefab.light.color[1], prefab.light.color[2] })},
-                {"intensity", prefab.light.intensity}, {"radius", prefab.light.radius}
-            };
+        if (prefab.light.enabled) {
+            json& light = components["light"];
+            if (!light.is_object()) light = json::object();
+            light["color"] = json::array({ prefab.light.color[0],
+                prefab.light.color[1], prefab.light.color[2] });
+            light["intensity"] = prefab.light.intensity;
+            light["radius"] = prefab.light.radius;
+        }
         else components.erase("light");
-        if (prefab.audio.enabled)
-            components["audio"] = { {"path", Generic(prefab.audio.path)},
-                {"loop", prefab.audio.loop}, {"radius", prefab.audio.radius} };
+        if (prefab.audio.enabled) {
+            json& audio = components["audio"];
+            if (!audio.is_object()) audio = json::object();
+            audio["path"] = Generic(prefab.audio.path);
+            audio["loop"] = prefab.audio.loop;
+            audio["radius"] = prefab.audio.radius;
+        }
         else components.erase("audio");
-        if (prefab.destructible.enabled)
-            components["destructible"] = {{"health", prefab.destructible.health}};
+        if (prefab.destructible.enabled) {
+            json& destructible = components["destructible"];
+            if (!destructible.is_object()) destructible = json::object();
+            destructible["health"] = prefab.destructible.health;
+        }
         else components.erase("destructible");
-        if (prefab.spawner.enabled)
-            components["spawner"] = { {"enemyType", prefab.spawner.enemyType},
-                                       {"count", prefab.spawner.count} };
+        if (prefab.spawner.enabled) {
+            json& spawner = components["spawner"];
+            if (!spawner.is_object()) spawner = json::object();
+            spawner["enemyType"] = prefab.spawner.enemyType;
+            spawner["count"] = prefab.spawner.count;
+        }
         else components.erase("spawner");
-        const json rootV1 = {
-            {"schemaVersion", 1}, {"id", prefab.id}, {"name", prefab.name},
-            {"components", {
-                {"staticMesh", {
-                    {"path", Generic(prefab.modelPath)},
-                    {"defaultScale", json::array({ prefab.defaultScale[0],
-                        prefab.defaultScale[1], prefab.defaultScale[2] })},
-                    {"targetSize", prefab.targetSize},
-                    {"castShadow", prefab.castShadow}
-                }},
-                {"collision", {{"shape", prefab.collision}}},
-                {"script", {{"path", Generic(prefab.scriptPath)}}}
-            }}
-        };
-        (void)rootV1;
-        json root = { {"schemaVersion", 2}, {"id", prefab.id},
-                      {"name", prefab.name}, {"components", components} };
+        json root = prefab.document.is_object()
+            ? prefab.document : json::object();
+        root["schemaVersion"] = 2;
+        root["id"] = prefab.id;
+        root["name"] = prefab.name;
+        root["components"] = components;
         if (!prefab.basePrefabId.empty()) root["extends"] = prefab.basePrefabId;
+        else root.erase("extends");
         if (!prefab.children.empty()) {
             root["children"] = json::array();
             for (const PrefabChildAsset& child : prefab.children)
@@ -694,7 +706,7 @@ PrefabSaveResult PrefabRegistry::Save(const PrefabAsset& prefab,
                                                child.rotation[2] })},
                     {"scale", json::array({ child.scale[0], child.scale[1],
                                             child.scale[2] })} });
-        }
+        } else root.erase("children");
         if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
         std::filesystem::path temporary = path;
         temporary += ".tmp";

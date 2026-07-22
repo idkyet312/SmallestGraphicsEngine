@@ -79,6 +79,7 @@ struct PrefabAsset {
     // metres and model is grounded at local Y=0.
     float targetSize = 0.0f;
     bool castShadow = true;
+    bool useMaterials = true;
     std::string collision = "none";
     PrefabLightComponent light;
     PrefabAudioComponent audio;
@@ -87,6 +88,8 @@ struct PrefabAsset {
     // Original component object. Unknown component fields survive load/save and
     // provide data for generic editor overrides.
     nlohmann::json components = nlohmann::json::object();
+    // Migrated source document. Unknown top-level fields survive editor saves.
+    nlohmann::json document = nlohmann::json::object();
     std::filesystem::path scriptPath;
     bool generated = false;
     std::string error;

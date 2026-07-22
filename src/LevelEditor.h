@@ -31,6 +31,7 @@ public:
     void BeginPlay();
     void StopPlay();
     bool IsPlaying() const { return playing_; }
+    bool ImportInProgress() const { return pendingImport_.valid(); }
     bool IsDirty() const { return dirty_; }
     void RefreshAssets();
     const LevelDefinition& Level() const { return level_; }
@@ -145,7 +146,12 @@ private:
     int prefabDraftIndex_ = -1;
     PrefabAsset prefabDraft_;
     char assetFilter_[128] = {};
-    char prefabScriptPath_[260] = {};
+    char prefabAudioPath_[260] = {};
+    char prefabMaterialMesh_[128] = {};
+    int prefabMaterialTextureSelection_ = 0;
+    int prefabLodModelSelection_ = 0;
+    float prefabNewLodDistance_ = 25.0f;
+    int prefabChildSelection_ = 0;
     std::future<std::pair<PrefabSaveResult, std::filesystem::path>> pendingImport_;
     std::vector<AssetFileChange> pendingImportChanges_;
     std::vector<std::vector<AssetFileChange>> assetUndo_;
