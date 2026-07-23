@@ -1559,6 +1559,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::Separator();
     ImGui::Text("DXR support: %s",
         dxrDDGIStatus_.supported ? "Yes" : "No");
+    ImGui::Text("Probe updates: %s",
+        dxrDDGIStatus_.updatesActive ? "Active" : "Inactive");
     ImGui::Text("Probes: %u", dxrDDGIStatus_.probeCount);
     ImGui::Text("Rays/frame: %u", dxrDDGIStatus_.raysPerFrame);
     ImGui::Text("Cache: %s", dxrDDGIStatus_.cacheStatus.c_str());
