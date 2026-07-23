@@ -279,7 +279,7 @@ struct Scene {
         clusteredRenderer.clearLights();
         for (int i = 0; i < numDemoLights; i++) {
             float angle = (float)i / numDemoLights * XM_2PI;
-            XMFLOAT3 pos(cosf(angle) * 8.0f, 2.0f, sinf(angle) * 8.0f);
+            XMFLOAT3 pos(cosf(angle) * 8.0f, 4.0f, sinf(angle) * 8.0f);
             XMFLOAT3 c;
             c.x = sinf(angle) * 0.5f + 0.5f;
             c.y = sinf(angle + 2.094f) * 0.5f + 0.5f;
@@ -353,7 +353,7 @@ struct Scene {
                 float angle = (float)i / clusteredRenderer.getTotalLightCount() * XM_2PI + currentTime;
                 float r = 8.0f;
                 XMFLOAT3 pos(cosf(angle) * r,
-                             2.0f + sinf(currentTime * 2.0f + angle) * 1.0f,
+                             4.0f + sinf(currentTime * 2.0f + angle) * 1.0f,
                              sinf(angle) * r);
                 clusteredRenderer.updateLight(i, pos);
             }

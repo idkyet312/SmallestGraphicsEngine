@@ -1098,7 +1098,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     for (int i = 0; i < numDemoLights; i++) {
         float angle = (float)i / numDemoLights * XM_2PI;
         float radius = 8.0f;
-        XMFLOAT3 pos(cosf(angle) * radius, 2.0f, sinf(angle) * radius);
+        XMFLOAT3 pos(cosf(angle) * radius, 4.0f, sinf(angle) * radius);
         XMFLOAT3 color;
         color.x = sinf(angle) * 0.5f + 0.5f;
         color.y = sinf(angle + 2.094f) * 0.5f + 0.5f;
@@ -1141,7 +1141,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 float radius = 8.0f;
                 XMFLOAT3 pos(
                     cosf(angle) * radius,
-                    2.0f + sinf(currentTime * 2.0f + angle) * 1.0f,
+                    4.0f + sinf(currentTime * 2.0f + angle) * 1.0f,
                     sinf(angle) * radius
                 );
                 clusteredRenderer.updateLight(i, pos);
@@ -1758,7 +1758,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         clusteredRenderer.clearLights();
                         for (int i = 0; i < numDemoLights; i++) {
                             float angle = (float)i / numDemoLights * XM_2PI;
-                            XMFLOAT3 pos(cosf(angle) * 8.0f, 2.0f, sinf(angle) * 8.0f);
+                            XMFLOAT3 pos(cosf(angle) * 8.0f, 4.0f, sinf(angle) * 8.0f);
                             XMFLOAT3 color;
                             color.x = sinf(angle) * 0.5f + 0.5f;
                             color.y = sinf(angle + 2.094f) * 0.5f + 0.5f;
