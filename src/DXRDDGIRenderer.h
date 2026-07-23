@@ -80,7 +80,6 @@ public:
     bool UploadProbeBuffers(ID3D12GraphicsCommandList* commandList) {
         if (!device_ || !commandList || layout_.probes.empty()) return false;
         gpuMemoryBytes_ = 0;
-        pendingUploads_.clear();
         if (!UploadVector(commandList, layout_.probes, probeBuffer_) ||
             !UploadVector(commandList, layout_.cells, cellBuffer_) ||
             !UploadVector(commandList, layout_.cellProbeIndices, indexBuffer_))
@@ -89,6 +88,9 @@ public:
         status_.gpuMemoryBytes = gpuMemoryBytes_;
         return true;
     }
+
+    // Call only after the queue fence confirms all layout copies completed.
+    void ReleaseCompletedUploads() { pendingUploads_.clear(); }
 
     bool UpdateTLAS(ID3D12GraphicsCommandList4* commandList,
                     const std::vector<DXRScene::Instance>& instances) {

@@ -54,7 +54,11 @@ public:
     bool TerrainRuntimeDirty() const { return terrainRuntimeDirty_; }
     void MarkTerrainRuntimeSynchronized() { terrainRuntimeDirty_ = false; }
     bool DXRDDGIRuntimeDirty() const { return dxrDDGIRuntimeDirty_; }
-    void MarkDXRDDGIRuntimeSynchronized() { dxrDDGIRuntimeDirty_ = false; }
+    bool DXRDDGILayoutDirty() const { return dxrDDGILayoutDirty_; }
+    void MarkDXRDDGIRuntimeSynchronized() {
+        dxrDDGIRuntimeDirty_ = false;
+        dxrDDGILayoutDirty_ = false;
+    }
     void SetDXRDDGIStatus(const LevelDXRDDGIStatus& status) {
         dxrDDGIStatus_ = status;
     }
@@ -121,6 +125,7 @@ private:
     bool foliageRuntimeDirty_ = true;
     bool terrainRuntimeDirty_ = true;
     bool dxrDDGIRuntimeDirty_ = true;
+    bool dxrDDGILayoutDirty_ = true;
     LevelDXRDDGIStatus dxrDDGIStatus_;
     bool localSpace_ = false;
     bool snapEnabled_ = true;

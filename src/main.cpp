@@ -1698,6 +1698,10 @@ static bool RebuildDXRDDGIProbeLayout(bool force) {
     g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
     if (!g_runtimeLevel.dxrDDGI.enabled) return false;
     if (!force && !g_dxrDDGI.LayoutDirty()) return true;
+    // Probe/atlas buffers may still be referenced by an older in-flight frame.
+    // Fence before replacing them and releasing their upload sources.
+    WaitForGPU();
+    g_dxrDDGI.ReleaseCompletedUploads();
     std::vector<DXRProbeTriangle> triangles;
     uint64_t geometryHash = 1469598103934665603ull;
     for (const PrefabRenderBatch& batch : g_prefabRenderBatches) {
@@ -6720,8 +6724,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             RebuildPrefabRenderBatches();
         if (gameScreen == GameScreen::LevelEditor &&
             g_levelEditor.DXRDDGIRuntimeDirty()) {
-            g_dxrDDGI.MarkLayoutDirty();
-            RebuildDXRDDGIProbeLayout(true);
+            if (g_levelEditor.DXRDDGILayoutDirty())
+                g_dxrDDGI.MarkLayoutDirty();
+            RebuildDXRDDGIProbeLayout(false);
             g_levelEditor.MarkDXRDDGIRuntimeSynchronized();
         }
         static uint32_t dxrDDGIFrame = 0;

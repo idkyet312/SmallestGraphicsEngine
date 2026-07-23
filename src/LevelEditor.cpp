@@ -175,7 +175,8 @@ void LevelEditor::NewFromLevelOne() {
     for (const auto& entity : level_.entities) nextId_ = (std::max)(nextId_, entity.id + 1);
     undo_.clear(); redo_.clear(); currentPath_.clear();
     dirty_ = false; runtimeDirty_ = true; foliageRuntimeDirty_ = true;
-    terrainRuntimeDirty_ = true; playing_ = false;
+    terrainRuntimeDirty_ = true; dxrDDGIRuntimeDirty_ = true;
+    dxrDDGILayoutDirty_ = true; playing_ = false;
     status_ = "New level created from Level 1";
     RefreshLevelFiles();
     prefabRegistry_.Refresh();
@@ -721,6 +722,7 @@ void LevelEditor::SculptTerrain(CXMMATRIX view, CXMMATRIX projection,
             runtimeDirty_ = true;
             terrainRuntimeDirty_ = true;
             dxrDDGIRuntimeDirty_ = true;
+            dxrDDGILayoutDirty_ = true;
         }
         terrainStrokeActive_ = false;
         terrainStrokeChanged_ = false;
@@ -1539,6 +1541,12 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         &ddgi.multiBounceStrength, 0.0f, 1.0f);
     ddgiChanged |= ImGui::Checkbox("Show probes", &ddgi.showProbes);
     if (ddgiChanged) {
+        const LevelDXRDDGISettings& oldDDGI = ddgiBefore.dxrDDGI;
+        dxrDDGILayoutDirty_ |=
+            oldDDGI.enabled != ddgi.enabled ||
+            oldDDGI.surfaceSpacing != ddgi.surfaceSpacing ||
+            oldDDGI.surfaceOffset != ddgi.surfaceOffset ||
+            oldDDGI.maxProbes != ddgi.maxProbes;
         MarkChanged(ddgiBefore);
         dxrDDGIRuntimeDirty_ = true;
         actions.levelChanged = true;
@@ -1599,6 +1607,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         } else if (gizmoWasUsing_) {
             MarkChanged(gizmoBefore_);
             dxrDDGIRuntimeDirty_ = true;
+            dxrDDGILayoutDirty_ = true;
         }
         gizmoWasUsing_ = usingGizmo;
     }
