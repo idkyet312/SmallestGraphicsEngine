@@ -129,6 +129,7 @@ static bool                 g_prefabRebuildRequested = true;
 static bool                 g_prefabRuntimeSmokeEnabled = false;
 static bool                 g_prefabRuntimeSmokeChecked = false;
 static bool                 g_ddgiCornellTestMode = false;
+static bool                 g_ddgiCornellPreviousTemporalEffects = false;
 static std::shared_ptr<SceneNode> g_ddgiCornellModel;
 std::shared_ptr<SceneNode>  g_helicopterMainRotorNode;
 std::shared_ptr<SceneNode>  g_helicopterTailRotorNode;
@@ -2703,11 +2704,17 @@ static std::shared_ptr<SceneNode> CreateDDGICornellBoxModel() {
         value->baseColorFactor = XMFLOAT4(color.x, color.y, color.z, 1.0f);
         value->metallicFactor = 0.0f;
         value->roughnessFactor = 0.88f;
+        // Test geometry must remain correct in forward, visibility, and mesh
+        // shader paths even when their front-face conventions differ.
+        value->doubleSided = true;
+        value->disableOcclusionCulling = true;
         return value;
     };
     const auto white = material("Cornell White", { 0.78f, 0.78f, 0.74f });
     const auto red = material("Cornell Red", { 0.72f, 0.055f, 0.035f });
     const auto green = material("Cornell Green", { 0.045f, 0.50f, 0.085f });
+    const auto light = material("Ceiling Light", { 5.0f, 3.9f, 2.6f });
+    light->roughnessFactor = 0.35f;
 
     const auto addBox = [&](const char* name,
                             const std::shared_ptr<SceneMaterial>& boxMaterial,
@@ -2763,6 +2770,7 @@ static std::shared_ptr<SceneNode> CreateDDGICornellBoxModel() {
     addBox("Green Wall", green, 4.0f, 4.12f, 0.02f, 7.12f, 0.0f, 8.0f);
     addBox("Short Block", white, -2.7f, -0.25f, 0.14f, 2.5f, 3.8f, 6.2f);
     addBox("Tall Block", white, 0.65f, 2.85f, 0.14f, 4.4f, 4.7f, 6.8f);
+    addBox("Ceiling Light", light, -1.25f, 1.25f, 6.82f, 6.98f, 2.4f, 4.8f);
 
     XMFLOAT4X4 identity;
     XMStoreFloat4x4(&identity, XMMatrixIdentity());
@@ -2945,7 +2953,7 @@ static void RebuildPrefabRenderBatches() {
     if (g_ddgiCornellTestMode) {
         scene.clusteredRenderer.clearLights();
         scene.clusteredRenderer.addLight(
-            { 0.0f, 6.15f, 3.25f }, { 1.0f, 0.88f, 0.70f }, 12.0f, 18.0f);
+            { 0.0f, 6.55f, 3.6f }, { 1.0f, 0.86f, 0.66f }, 11.0f, 24.0f);
     }
     for (const PrefabLightInstance& light : g_prefabLightInstances)
         scene.clusteredRenderer.addLight(light.position, light.color,
@@ -3320,10 +3328,19 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     const bool wasCornellTest = g_ddgiCornellTestMode;
     g_ddgiCornellTestMode = customLevel &&
         customLevel->name == "DXR DDGI Cornell Box";
-    if (g_ddgiCornellTestMode)
+    if (g_ddgiCornellTestMode) {
+        if (!wasCornellTest)
+            g_ddgiCornellPreviousTemporalEffects =
+                visBuffer.temporalEffectsEnabled;
+        visBuffer.temporalEffectsEnabled = false;
+        visBuffer.InvalidateTemporalHistory();
         scene.ambientStrength = 0.015f;
-    else if (wasCornellTest)
+    } else if (wasCornellTest) {
+        visBuffer.temporalEffectsEnabled =
+            g_ddgiCornellPreviousTemporalEffects;
+        visBuffer.InvalidateTemporalHistory();
         scene.ambientStrength = 0.07f;
+    }
     gameScreen = GameScreen::Level1;
     g_customLevelMode = !stressTest && !emptyLevel;
     if (customLevel) {
