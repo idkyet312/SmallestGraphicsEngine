@@ -49,6 +49,13 @@ extern ID3D12Resource* g_specularEnvironmentResource;
 extern ID3D12Resource* g_brdfIntegrationResource;
 extern ID3D12Resource* g_ddgiIrradianceResource;
 extern ID3D12Resource* g_ddgiVisibilityResource;
+extern ID3D12Resource* g_dxrDDGIProbeResource;
+extern ID3D12Resource* g_dxrDDGICellResource;
+extern ID3D12Resource* g_dxrDDGIIndexResource;
+extern UINT g_dxrDDGIProbeCount;
+extern UINT g_dxrDDGICellCount;
+extern UINT g_dxrDDGIIndexCount;
+extern float g_dxrDDGICellSize;
 extern DDGIRendererDX12 g_ddgiRenderer;
 extern DirectX::XMFLOAT3 g_helicopterPosition;
 extern bool g_stressTestMode;
@@ -762,7 +769,10 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
     shader.Use(false);
     shader.BindGlobalResources(shadowMap, g_ddgiIrradianceResource,
         g_ddgiVisibilityResource,
-        g_specularEnvironmentResource, g_brdfIntegrationResource);
+        g_specularEnvironmentResource, g_brdfIntegrationResource,
+        g_dxrDDGIProbeResource, g_dxrDDGICellResource,
+        g_dxrDDGIIndexResource, g_dxrDDGIProbeCount,
+        g_dxrDDGICellCount, g_dxrDDGIIndexCount);
 
     if (g_grass.IsInitialized()) {
         g_grass.SetViewer(scene.camera.Position);
@@ -828,7 +838,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     shader.Use(scene.wireframeMode);
     shader.BindGlobalResources(shadowMap, g_ddgiIrradianceResource,
         g_ddgiVisibilityResource,
-        g_specularEnvironmentResource, g_brdfIntegrationResource);
+        g_specularEnvironmentResource, g_brdfIntegrationResource,
+        g_dxrDDGIProbeResource, g_dxrDDGICellResource,
+        g_dxrDDGIIndexResource, g_dxrDDGIProbeCount,
+        g_dxrDDGICellCount, g_dxrDDGIIndexCount);
 
     shader.SetLight(scene.lightPos, scene.lightType, scene.lightColor,
                     scene.lightConstant, scene.lightLinear, scene.lightQuadratic,
@@ -866,10 +879,13 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         lightData.push_back(blastLight);
     }
     shader.SetPointLights((int)lightData.size(), lightData);
-    shader.SetDDGI(scene.useDDGI, scene.giIntensity, scene.normalBias, scene.probeSpacing);
+    shader.SetDDGI(scene.useDDGI, scene.giIntensity, scene.normalBias,
+        scene.probeSpacing, g_dxrDDGIProbeCount, g_dxrDDGICellCount,
+        g_dxrDDGICellSize);
     shader.SetSH();
 
     if (!visibilityExtensionsOnly && scene.useDDGI &&
+        g_dxrDDGIProbeCount == 0 &&
         g_ddgiRenderer.computeInitialized) {
         DDGIMainLightData mainLight = {};
         mainLight.lightPos = scene.lightPos;
@@ -886,7 +902,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         // Probe update binds its private heap. Restore forward global table.
         shader.BindGlobalResources(shadowMap, g_ddgiIrradianceResource,
             g_ddgiVisibilityResource,
-            g_specularEnvironmentResource, g_brdfIntegrationResource);
+            g_specularEnvironmentResource, g_brdfIntegrationResource,
+            g_dxrDDGIProbeResource, g_dxrDDGICellResource,
+            g_dxrDDGIIndexResource, g_dxrDDGIProbeCount,
+            g_dxrDDGICellCount, g_dxrDDGIIndexCount);
     }
 
     g_meshShader.wireframe = scene.meshletWireframe;

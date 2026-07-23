@@ -939,9 +939,12 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     }
 
     shader.SetSH();
-    shader.SetDDGI(scene.useDDGI && g_ddgiRenderer.computeInitialized,
-        scene.giIntensity, scene.normalBias, scene.probeSpacing);
-    if (scene.useDDGI && g_ddgiRenderer.computeInitialized) {
+    shader.SetDDGI(scene.useDDGI &&
+        (g_ddgiRenderer.computeInitialized || g_dxrDDGIProbeCount > 0),
+        scene.giIntensity, scene.normalBias, scene.probeSpacing,
+        g_dxrDDGIProbeCount, g_dxrDDGICellCount, g_dxrDDGICellSize);
+    if (scene.useDDGI && g_dxrDDGIProbeCount == 0 &&
+        g_ddgiRenderer.computeInitialized) {
         DDGIMainLightData mainLight = {};
         mainLight.lightPos = scene.lightPos;
         mainLight.lightType = scene.lightType;

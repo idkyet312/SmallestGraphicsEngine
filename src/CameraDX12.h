@@ -22,6 +22,10 @@ public:
     float PlayerHeight;
     float FloorY;
     bool IsCrouching;
+    bool IsSliding;
+    XMFLOAT3 SlideDirection;
+    float SlideSpeed;
+    float SlideTimeRemaining;
     
     // Jump mechanics
     bool IsGrounded;
@@ -33,7 +37,9 @@ public:
         : Position(position), Front(XMFLOAT3(0.0f, 0.0f, -1.0f)), Up(XMFLOAT3(0.0f, 1.0f, 0.0f)),
           Yaw(-90.0f), Pitch(-5.0f), MovementSpeed(5.0f), MouseSensitivity(0.1f),
           FPSMode(true), PlayerHeight(1.7f), FloorY(0.0f),
-          IsCrouching(false),
+          IsCrouching(false), IsSliding(false),
+          SlideDirection(0.0f, 0.0f, -1.0f), SlideSpeed(0.0f),
+          SlideTimeRemaining(0.0f),
           IsGrounded(true), VerticalVelocity(0.0f), Gravity(9.8f), JumpStrength(5.0f) {
         updateCameraVectors();
     }
@@ -47,6 +53,18 @@ public:
 
     void Update(float deltaTime) {
         if (FPSMode) {
+            if (IsSliding) {
+                Position.x += SlideDirection.x * SlideSpeed * deltaTime;
+                Position.z += SlideDirection.z * SlideSpeed * deltaTime;
+                SlideSpeed = (std::max)(0.0f, SlideSpeed - 9.0f * deltaTime);
+                SlideTimeRemaining -= deltaTime;
+                if (SlideTimeRemaining <= 0.0f ||
+                    SlideSpeed <= MovementSpeed || !IsGrounded) {
+                    IsSliding = false;
+                    SlideSpeed = 0.0f;
+                }
+            }
+
             // Apply gravity
             float groundLevel = FloorY + PlayerHeight;
             VerticalVelocity -= Gravity * deltaTime;
@@ -134,6 +152,27 @@ public:
         else
             PlayerHeight = (std::max)(target, PlayerHeight - step);
         if (IsGrounded) Position.y += PlayerHeight - oldHeight;
+    }
+
+    bool StartSlide(float forwardInput, float strafeInput) {
+        if (!FPSMode || !IsGrounded || IsSliding) return false;
+
+        XMVECTOR forward = XMVectorSet(Front.x, 0.0f, Front.z, 0.0f);
+        if (XMVectorGetX(XMVector3LengthSq(forward)) <= 1e-6f) return false;
+        forward = XMVector3Normalize(forward);
+        const XMVECTOR right = XMVector3Normalize(XMVector3Cross(
+            forward, XMLoadFloat3(&Up)));
+        XMVECTOR direction = XMVectorAdd(
+            XMVectorScale(forward, forwardInput),
+            XMVectorScale(right, strafeInput));
+        if (XMVectorGetX(XMVector3LengthSq(direction)) <= 1e-6f) return false;
+
+        direction = XMVector3Normalize(direction);
+        XMStoreFloat3(&SlideDirection, direction);
+        SlideSpeed = MovementSpeed * 2.2f;
+        SlideTimeRemaining = 0.65f;
+        IsSliding = true;
+        return true;
     }
 
     // Instant angular kick from weapon recoil. Unlike mouse input this is

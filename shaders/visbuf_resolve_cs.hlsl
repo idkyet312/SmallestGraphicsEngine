@@ -127,7 +127,9 @@ cbuffer DDGIBuffer : register(b4) {
     int visibilityTexWidth;
     int visibilityTexHeight;
     int ddgiEnabled;
-    float3 ddgiPadding;
+    int sparseProbeCount;
+    int sparseCellCount;
+    float sparseCellSize;
 };
 StructuredBuffer<ClusterData>   clusters  : register(t6);
 
@@ -144,6 +146,18 @@ Texture2D<float4> environmentMap : register(t72);
 Texture2D<float2> brdfIntegrationLUT : register(t73);
 Texture2D<float4> ddgiIrradianceMap : register(t74);
 Texture2D<float2> ddgiVisibilityMap : register(t75);
+struct SparseProbeData {
+    float3 position; float radius;
+    float3 normal; uint state;
+    uint2 stableId; uint lastUpdatedFrame; uint padding;
+};
+struct SparseProbeCell {
+    int3 coordinate; uint offset;
+    uint count; uint3 padding;
+};
+StructuredBuffer<SparseProbeData> sparseProbes : register(t76);
+StructuredBuffer<SparseProbeCell> sparseProbeCells : register(t77);
+StructuredBuffer<uint> sparseProbeIndices : register(t78);
 
 RWTexture2D<float4> outputColor : register(u0);
 RWTexture2D<float2> outputMotion : register(u1);
@@ -232,8 +246,11 @@ float2 DDGIOctEncode(float3 direction) {
 }
 
 float3 SampleDDGIProbe(int probeIndex, float3 normal) {
-    int totalProbes = probeCountX * probeCountY * probeCountZ;
-    int atlasProbeWidth = max((int)sqrt((float)totalProbes), 1);
+    int totalProbes = sparseProbeCount > 0 ? sparseProbeCount :
+                      probeCountX * probeCountY * probeCountZ;
+    int atlasProbeWidth = sparseProbeCount > 0
+        ? max((int)ceil(sqrt((float)totalProbes)), 1)
+        : max((int)sqrt((float)totalProbes), 1);
     int probeX = probeIndex % atlasProbeWidth;
     int probeY = probeIndex / atlasProbeWidth;
     int tileWidth = irradianceTexWidth + 2;
@@ -248,8 +265,83 @@ float3 SampleDDGIProbe(int probeIndex, float3 normal) {
     return ddgiIrradianceMap.SampleLevel(texSampler, atlasUV, 0.0).rgb;
 }
 
+uint DDGIHash(uint value) {
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    return value ^ (value >> 16);
+}
+
+uint DDGICellHash(int3 coordinate) {
+    uint hash = DDGIHash(asuint(coordinate.x));
+    hash ^= DDGIHash(asuint(coordinate.y) + 0x9e3779b9u);
+    hash ^= DDGIHash(asuint(coordinate.z) + 0x85ebca6bu);
+    return DDGIHash(hash);
+}
+
+float SparseProbeVisibility(uint probeIndex, float3 delta, float distance) {
+    int atlasColumns = max((int)ceil(sqrt((float)sparseProbeCount)), 1);
+    int probeX = probeIndex % atlasColumns;
+    int probeY = probeIndex / atlasColumns;
+    uint atlasWidth, atlasHeight;
+    ddgiVisibilityMap.GetDimensions(atlasWidth, atlasHeight);
+    float2 octUV = DDGIOctEncode(normalize(delta));
+    float2 uv = float2(
+        (probeX * (visibilityTexWidth + 2) + 1 +
+         octUV.x * visibilityTexWidth) / atlasWidth,
+        (probeY * (visibilityTexHeight + 2) + 1 +
+         octUV.y * visibilityTexHeight) / atlasHeight);
+    float2 moments = ddgiVisibilityMap.SampleLevel(texSampler, uv, 0.0).rg;
+    if (moments.y <= 1e-5 || distance <= moments.x) return 1.0;
+    float variance = max(moments.y - moments.x * moments.x, 0.001);
+    float difference = distance - moments.x;
+    return saturate(variance / (variance + difference * difference));
+}
+
+float3 SampleSparseDDGI(float3 worldPos, float3 normal) {
+    float3 biased = worldPos + normal * normalBias;
+    int3 center = (int3)floor(biased / sparseCellSize);
+    float3 irradiance = 0.0;
+    float totalWeight = 0.0;
+    uint accepted = 0;
+    [loop] for (int z = -1; z <= 1 && accepted < 8; ++z)
+    [loop] for (int y = -1; y <= 1 && accepted < 8; ++y)
+    [loop] for (int x = -1; x <= 1 && accepted < 8; ++x) {
+        int3 coordinate = center + int3(x, y, z);
+        uint slot = DDGICellHash(coordinate) & (sparseCellCount - 1);
+        [loop] for (uint search = 0;
+                    search < (uint)sparseCellCount; ++search) {
+            SparseProbeCell cell = sparseProbeCells[slot];
+            if (cell.count == 0) break;
+            if (all(cell.coordinate == coordinate)) {
+                [loop] for (uint i = 0; i < cell.count && accepted < 8; ++i) {
+                    uint index = sparseProbeIndices[cell.offset + i];
+                    SparseProbeData probe = sparseProbes[index];
+                    if (probe.state == 2) continue;
+                    float3 delta = biased - probe.position;
+                    float distance = length(delta);
+                    float weight = saturate(dot(normal, probe.normal) *
+                                            0.5 + 0.5);
+                    weight *= SparseProbeVisibility(index, delta, distance);
+                    weight /= max(distance * distance, 0.04);
+                    irradiance += SampleDDGIProbe(index, normal) * weight;
+                    totalWeight += weight;
+                    ++accepted;
+                }
+                break;
+            }
+            slot = (slot + 1) & (sparseCellCount - 1);
+        }
+    }
+    return totalWeight > 1e-5
+        ? irradiance / totalWeight * giIntensity : 0.0;
+}
+
 float3 SampleDDGIIrradiance(float3 worldPos, float3 normal) {
     if (ddgiEnabled == 0) return 0.0;
+    if (sparseProbeCount > 0 && sparseCellCount > 0)
+        return SampleSparseDDGI(worldPos, normal);
     float3 gridPosition =
         (worldPos + normal * normalBias - probeGridOrigin) / probeSpacing;
     if (any(gridPosition < 0.0) ||
@@ -632,8 +724,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
             float3 mappedNormal = normalize(tangentNormal.x * tangent +
                                             tangentNormal.y * bitangent +
                                             tangentNormal.z * normal);
-            float grazingFade = saturate(abs(dot(normal,
-                normalize(cameraPos - fragPos))) * 2.0);
+            float grazingFade = smoothstep(0.25, 0.65, saturate(abs(dot(
+                normal, normalize(cameraPos - fragPos)))));
             normal = normalize(lerp(normal, mappedNormal,
                 material.shadingParams.z * grazingFade));
         }
@@ -714,7 +806,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float shadowVisibility = CalculateShadow(fragPos, normal, L);
     // Shadow map blocks direct sun only. IBL/DDGI are already low-frequency
     // indirect terms and must stay present on occluded building/actor sides.
-    float frontFill = 0.35 + 0.65 * saturate(dot(normal, viewDir));
+    float frontFill = 0.65 + 0.35 * saturate(dot(normal, viewDir));
     result += diffuseAlbedo * material.shadingParams.y * frontFill;
     float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor *
                 NdotL * atten * shadowVisibility;

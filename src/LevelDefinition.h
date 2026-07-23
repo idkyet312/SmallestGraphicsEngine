@@ -56,11 +56,27 @@ struct TerrainSculptStamp {
     float strength = 1.0f;
 };
 
+struct LevelDXRDDGISettings {
+    bool enabled = false;
+    float surfaceSpacing = 3.0f;
+    float surfaceOffset = 0.35f;
+    uint32_t maxProbes = 2048;
+    uint32_t raysPerProbe = 64;
+    uint32_t probesPerFrame = 16;
+    float intensity = 0.45f;
+    float normalBias = 0.18f;
+    float viewBias = 0.05f;
+    float hysteresis = 0.95f;
+    float multiBounceStrength = 0.35f;
+    bool showProbes = false;
+};
+
 struct LevelDefinition {
     uint32_t schemaVersion = 1;
     std::string name = "Untitled Level";
     float terrainHeightScale = 5.0f;
     std::vector<TerrainSculptStamp> terrainSculpt;
+    LevelDXRDDGISettings dxrDDGI;
     std::vector<LevelEntity> entities;
 };
 

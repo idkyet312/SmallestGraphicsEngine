@@ -2,6 +2,7 @@
 #define SHADER_DX12_H
 
 #include "DX12Core.h"
+#include "DXRProbeLayout.h"
 #include "MSAADX12.h"
 #include "SceneGraph.h"   // SceneMaterial: caches its descriptor slot (see SetObjectMaterial)
 #include "PalmWindGPU.h"
@@ -118,7 +119,9 @@ struct alignas(256) DDGIBufferDX12 {
     int visibilityTexHeight;
     
     int ddgiEnabled;
-    float ddgiPadding[3];
+    int sparseProbeCount;
+    int sparseCellCount;
+    float sparseCellSize;
 };
 
 // 9 L2 spherical-harmonic coefficients (RGB) approximating diffuse sky
@@ -454,7 +457,7 @@ public:
         }
         
         // SRV descriptor table for global textures
-        D3D12_DESCRIPTOR_RANGE globalSrvRanges[5] = {};
+        D3D12_DESCRIPTOR_RANGE globalSrvRanges[8] = {};
         // t0 - shadowMap
         globalSrvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         globalSrvRanges[0].NumDescriptors = 1;
@@ -486,9 +489,17 @@ public:
         globalSrvRanges[4].BaseShaderRegister = 16;
         globalSrvRanges[4].RegisterSpace = 0;
         globalSrvRanges[4].OffsetInDescriptorsFromTableStart = 4;
+        for (UINT i = 0; i < 3; ++i) {
+            globalSrvRanges[5 + i].RangeType =
+                D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            globalSrvRanges[5 + i].NumDescriptors = 1;
+            globalSrvRanges[5 + i].BaseShaderRegister = 17 + i;
+            globalSrvRanges[5 + i].RegisterSpace = 0;
+            globalSrvRanges[5 + i].OffsetInDescriptorsFromTableStart = 5 + i;
+        }
         
         rootParams[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rootParams[6].DescriptorTable.NumDescriptorRanges = 5;
+        rootParams[6].DescriptorTable.NumDescriptorRanges = 8;
         rootParams[6].DescriptorTable.pDescriptorRanges = globalSrvRanges;
         rootParams[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
@@ -958,7 +969,13 @@ public:
                              ID3D12Resource* irradiance = nullptr,
                              ID3D12Resource* visibility = nullptr,
                              ID3D12Resource* environment = nullptr,
-                             ID3D12Resource* brdfLUT = nullptr) {
+                             ID3D12Resource* brdfLUT = nullptr,
+                             ID3D12Resource* sparseProbes = nullptr,
+                             ID3D12Resource* sparseCells = nullptr,
+                             ID3D12Resource* sparseIndices = nullptr,
+                             UINT sparseProbeCount = 0,
+                             UINT sparseCellCount = 0,
+                             UINT sparseIndexCount = 0) {
         UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
 
@@ -1001,6 +1018,32 @@ public:
         brdfDesc.Format = DXGI_FORMAT_R32G32_FLOAT;
         brdfDesc.Texture2D.MipLevels = 1;
         g_dx12.device->CreateShaderResourceView(brdfLUT, &brdfDesc, cpuHandle);
+        cpuHandle.ptr += descriptorSize;
+
+        const ID3D12Resource* sparseResources[3] = {
+            sparseProbes, sparseCells, sparseIndices
+        };
+        const UINT sparseCounts[3] = {
+            (std::max)(sparseProbeCount, 1u),
+            (std::max)(sparseCellCount, 1u),
+            (std::max)(sparseIndexCount, 1u)
+        };
+        const UINT sparseStrides[3] = {
+            sizeof(DXRProbeRecord), sizeof(DXRProbeGridCell), sizeof(UINT)
+        };
+        for (UINT i = 0; i < 3; ++i) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC sparseDesc = {};
+            sparseDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            sparseDesc.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sparseDesc.Format = DXGI_FORMAT_UNKNOWN;
+            sparseDesc.Buffer.NumElements = sparseCounts[i];
+            sparseDesc.Buffer.StructureByteStride = sparseStrides[i];
+            g_dx12.device->CreateShaderResourceView(
+                const_cast<ID3D12Resource*>(sparseResources[i]),
+                &sparseDesc, cpuHandle);
+            cpuHandle.ptr += descriptorSize;
+        }
 
         RebindGraphicsResourceTables();
     }
@@ -1317,7 +1360,9 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
     
-    void SetDDGI(bool enabled, float gi_intensity, float normal_bias, float probe_spacing) {
+    void SetDDGI(bool enabled, float gi_intensity, float normal_bias,
+                 float probe_spacing, UINT sparseProbeCount = 0,
+                 UINT sparseCellCount = 0, float sparseCellSize = 0.0f) {
         DDGIBufferDX12 data = {};
         data.probeGridOrigin = XMFLOAT3(-27.5f, 0.5f, -27.5f);
         data.probeSpacing = probe_spacing;
@@ -1334,6 +1379,9 @@ public:
         data.visibilityTexWidth = 16;
         data.visibilityTexHeight = 16;
         data.ddgiEnabled = enabled ? 1 : 0;
+        data.sparseProbeCount = static_cast<int>(sparseProbeCount);
+        data.sparseCellCount = static_cast<int>(sparseCellCount);
+        data.sparseCellSize = sparseCellSize;
         ddgiBuffer.CopyData(g_dx12.frameIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
     }

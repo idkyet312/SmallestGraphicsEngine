@@ -17,6 +17,7 @@ struct PrefabRenderBatch {
     std::shared_ptr<SceneNode> baseModel;
     std::vector<DirectX::XMMATRIX> baseTransforms;
     std::vector<DirectX::XMMATRIX> transforms;
+    std::vector<uint64_t> entityIds;
     std::vector<LodModel> lods;
     bool castShadow = true;
 };

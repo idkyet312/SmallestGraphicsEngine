@@ -114,6 +114,9 @@ set(HEADER_FILES
     src/IdTechRenderer.h
     src/EngineUI.h
     src/RaytracingDX12.h
+    src/DXRScene.h
+    src/DXRProbeLayout.h
+    src/DXRDDGIRenderer.h
     src/MipGenerator.h
     src/MeshShaderDX12.h
     src/TerrainRendererDX12.h
@@ -208,6 +211,14 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         DEPENDS ${CMAKE_SOURCE_DIR}/shaders/wire_green_ps.hlsl
         COMMENT "Compiling wireframe pixel shader"
     )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/dxr_ddgi.cso
+        COMMAND ${DXC_EXECUTABLE} -T lib_6_3
+                ${CMAKE_SOURCE_DIR}/shaders/dxr_ddgi.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/dxr_ddgi.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/dxr_ddgi.hlsl
+        COMMENT "Compiling DXR sparse DDGI library"
+    )
     add_custom_target(MeshShaderCSO ALL DEPENDS
         ${CMAKE_BINARY_DIR}/mesh_as.cso
         ${CMAKE_BINARY_DIR}/mesh_ms.cso
@@ -217,7 +228,8 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         ${CMAKE_BINARY_DIR}/terrain_ms.cso
         ${CMAKE_BINARY_DIR}/terrain_ps.cso
         ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso
-        ${CMAKE_BINARY_DIR}/wire_green_ps.cso)
+        ${CMAKE_BINARY_DIR}/wire_green_ps.cso
+        ${CMAKE_BINARY_DIR}/dxr_ddgi.cso)
 else()
     message(STATUS "DXC not found; mesh shader path will use raster fallback")
 endif()
@@ -324,6 +336,11 @@ if(BUILD_TESTING)
         src/AssetWatcher.cpp)
     target_include_directories(AssetWatcherTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME AssetWatcherTests COMMAND AssetWatcherTests)
+
+    add_executable(DXRProbeLayoutTests tests/DXRProbeLayoutTests.cpp)
+    target_include_directories(DXRProbeLayoutTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(DXRProbeLayoutTests PRIVATE nlohmann_json::nlohmann_json)
+    add_test(NAME DXRProbeLayoutTests COMMAND DXRProbeLayoutTests)
 endif()
 
 if(MSVC)
@@ -372,6 +389,7 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps_hdr.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/wire_green_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/wire_green_ps.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/dxr_ddgi.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/dxr_ddgi.cso
     )
     if(DXC_EXECUTABLE)
         add_dependencies(GraphicEngine MeshShaderCSO)
