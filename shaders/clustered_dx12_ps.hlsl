@@ -303,38 +303,69 @@ float DDGIProbeVisibility(int probeIndex, float3 probeToPoint,
 float3 sampleSparseDDGI(float3 worldPos, float3 normal) {
     float3 biasedPos = worldPos + normal * normalBias;
     int3 center = (int3)floor(biasedPos / sparseCellSize);
-    float3 sum = 0.0;
-    float weightSum = 0.0;
-    uint accepted = 0;
-    [loop] for (int z = -1; z <= 1 && accepted < 8; ++z)
-    [loop] for (int y = -1; y <= 1 && accepted < 8; ++y)
-    [loop] for (int x = -1; x <= 1 && accepted < 8; ++x) {
+    uint nearestIndices[8];
+    float nearestDistanceSq[8];
+    uint nearestCount = 0;
+
+    // Gather all candidates from neighboring hash cells. The old path accepted
+    // the first eight in cell traversal order, so crossing a cell boundary
+    // abruptly selected a different set of probes and produced visible boxes.
+    [loop] for (int z = -1; z <= 1; ++z)
+    [loop] for (int y = -1; y <= 1; ++y)
+    [loop] for (int x = -1; x <= 1; ++x) {
         int3 coordinate = center + int3(x, y, z);
         uint slot = DDGICellHash(coordinate) & (sparseCellCount - 1);
-        [loop] for (uint probe = 0; probe < (uint)sparseCellCount; ++probe) {
+        [loop] for (uint search = 0; search < (uint)sparseCellCount; ++search) {
             SparseProbeCell cell = sparseProbeCells[slot];
             if (cell.count == 0) break;
             if (all(cell.coordinate == coordinate)) {
-                [loop] for (uint i = 0; i < cell.count && accepted < 8; ++i) {
+                [loop] for (uint i = 0; i < cell.count; ++i) {
                     uint index = sparseProbeIndices[cell.offset + i];
                     SparseProbeData data = sparseProbes[index];
                     if (data.state == 2) continue;
-                    float3 delta = biasedPos - data.position;
-                    float distanceToProbe = length(delta);
-                    float normalWeight = saturate(dot(normal, data.normal) *
-                                                  0.5 + 0.5);
-                    float visibility = DDGIProbeVisibility(index, delta,
-                                                           distanceToProbe);
-                    float weight = normalWeight * visibility /
-                                   max(distanceToProbe * distanceToProbe, 0.04);
-                    sum += sampleProbeIrradiance(index, normal) * weight;
-                    weightSum += weight;
-                    ++accepted;
+                    float distanceSq =
+                        dot(biasedPos - data.position, biasedPos - data.position);
+                    uint insertAt = nearestCount;
+                    if (nearestCount < 8) {
+                        ++nearestCount;
+                    } else {
+                        if (distanceSq >= nearestDistanceSq[7]) continue;
+                        insertAt = 7;
+                    }
+                    [loop] while (insertAt > 0 &&
+                                  distanceSq < nearestDistanceSq[insertAt - 1]) {
+                        nearestDistanceSq[insertAt] =
+                            nearestDistanceSq[insertAt - 1];
+                        nearestIndices[insertAt] = nearestIndices[insertAt - 1];
+                        --insertAt;
+                    }
+                    nearestDistanceSq[insertAt] = distanceSq;
+                    nearestIndices[insertAt] = index;
                 }
                 break;
             }
             slot = (slot + 1) & (sparseCellCount - 1);
         }
+    }
+
+    float3 sum = 0.0;
+    float weightSum = 0.0;
+    [loop] for (uint i = 0; i < nearestCount; ++i) {
+        uint index = nearestIndices[i];
+        SparseProbeData data = sparseProbes[index];
+        float3 delta = biasedPos - data.position;
+        float distanceToProbe = sqrt(nearestDistanceSq[i]);
+        float alignment = saturate(dot(normal, data.normal));
+        float normalWeight = 0.04 + 0.96 * alignment * alignment;
+        float rangeWeight = saturate(
+            1.0 - distanceToProbe / max(sparseCellSize * 1.75, 0.1));
+        rangeWeight *= rangeWeight;
+        float visibility = DDGIProbeVisibility(
+            index, delta, distanceToProbe);
+        float weight = normalWeight * rangeWeight * visibility /
+                       max(nearestDistanceSq[i], 0.09);
+        sum += sampleProbeIrradiance(index, normal) * weight;
+        weightSum += weight;
     }
     return weightSum > 1e-5 ? sum / weightSum * giIntensity : 0.0;
 }
