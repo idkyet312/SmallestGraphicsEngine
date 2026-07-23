@@ -1854,6 +1854,8 @@ static bool  pendingTurretGunnerRespawn = false;
 static bool  pendingEditorBeginPlay = false;
 static bool  pendingEditorStopPlay = false;
 static bool  pendingEditorReturnToMenu = false;
+static bool  pendingDXRDDGIRebuild = false;
+static bool  pendingDXRDDGIHistoryReset = false;
 static bool  isFullscreen  = false;
 static RECT  windowedRect  = {};
 static DWORD windowedStyle = 0;
@@ -6734,6 +6736,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         if (IsSceneScreen() && g_prefabRebuildRequested)
             RebuildPrefabRenderBatches();
+        // Editor buttons are processed here, before any scene pass binds the
+        // old probe atlases. Rebuilding from the late ImGui phase destroyed
+        // resources still referenced by the open frame command list.
+        if (gameScreen == GameScreen::LevelEditor &&
+            pendingDXRDDGIRebuild) {
+            pendingDXRDDGIRebuild = false;
+            g_runtimeLevel = g_levelEditor.Level();
+            g_dxrDDGI.MarkLayoutDirty();
+            RebuildDXRDDGIProbeLayout(true);
+            g_levelEditor.MarkDXRDDGIRuntimeSynchronized();
+        }
+        if (pendingDXRDDGIHistoryReset) {
+            pendingDXRDDGIHistoryReset = false;
+            g_dxrDDGI.ResetHistory();
+        }
         if (gameScreen == GameScreen::LevelEditor &&
             g_levelEditor.DXRDDGIRuntimeDirty()) {
             if (g_levelEditor.DXRDDGILayoutDirty())
@@ -6756,6 +6773,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_ddgiVisibilityResource = g_dxrDDGI.VisibilityAtlas();
             visBuffer.UpdateDDGIResources(
                 g_ddgiIrradianceResource, g_ddgiVisibilityResource);
+            if (dxrDDGIFrame == 30 &&
+                GetEnvironmentVariableA(
+                    "SGE_DXR_DDGI_TEST", nullptr, 0) > 0) {
+                pendingDXRDDGIRebuild = true;
+                SGE_LOG("LogRenderer", EngineLog::Level::Display,
+                    "DXR DDGI smoke rebuild queued");
+            }
         }
         if (g_prefabRuntimeSmokeEnabled && !g_prefabRuntimeSmokeChecked &&
             !g_prefabRebuildRequested) {
@@ -7440,14 +7464,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             pendingEditorBeginPlay = actions.beginPlay;
             pendingEditorStopPlay = actions.stopPlay;
             pendingEditorReturnToMenu = actions.returnToMenu;
-            if (actions.rebuildDXRDDGI) {
-                g_runtimeLevel = g_levelEditor.Level();
-                g_dxrDDGI.MarkLayoutDirty();
-                RebuildDXRDDGIProbeLayout(true);
-                g_levelEditor.MarkDXRDDGIRuntimeSynchronized();
-            }
+            if (actions.rebuildDXRDDGI)
+                pendingDXRDDGIRebuild = true;
             if (actions.resetDXRDDGIHistory)
-                g_dxrDDGI.ResetHistory();
+                pendingDXRDDGIHistoryReset = true;
             DrawDXRDDGIProbeDebug(
                 scene.GetViewMatrix(), scene.GetProjectionMatrix());
             if (g_levelEditor.IsPlaying()) RenderPlayerHUD(scene);
