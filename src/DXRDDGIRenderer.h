@@ -42,6 +42,10 @@ public:
             value.normalBias != settings_.normalBias ||
             value.viewBias != settings_.viewBias;
         settings_ = value;
+        // Irradiance atlas has an 8x8 directional interior. More than 64 rays
+        // would race while writing the same directional texels.
+        settings_.raysPerProbe =
+            (std::min)(64u, (std::max)(8u, settings_.raysPerProbe));
         if (settings_.probesPerFrame > settings_.maxProbes)
             settings_.probesPerFrame = settings_.maxProbes;
         layoutDirty_ |= layoutChanged;

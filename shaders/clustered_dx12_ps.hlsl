@@ -259,8 +259,10 @@ float3 sampleProbeIrradiance(int probeIndex, float3 direction) {
     
     // Map to probe's tile area (excluding border)
     float2 probeUV;
-    probeUV.x = (probeX * tileWidth + 1 + octUV.x * irradianceTexWidth) / (float)atlasWidth;
-    probeUV.y = (probeY * tileHeight + 1 + octUV.y * irradianceTexHeight) / (float)atlasHeight;
+    probeUV.x = (probeX * tileWidth + 1.5 +
+                 octUV.x * (irradianceTexWidth - 1)) / (float)atlasWidth;
+    probeUV.y = (probeY * tileHeight + 1.5 +
+                 octUV.y * (irradianceTexHeight - 1)) / (float)atlasHeight;
     
     return irradianceMap.SampleLevel(texSampler, probeUV, 0).rgb;
 }
@@ -289,10 +291,10 @@ float DDGIProbeVisibility(int probeIndex, float3 probeToPoint,
     uint atlasWidth, atlasHeight;
     visibilityMap.GetDimensions(atlasWidth, atlasHeight);
     float2 uv = float2(
-        (probeX * (visibilityTexWidth + 2) + 1 +
-         octUV.x * visibilityTexWidth) / atlasWidth,
-        (probeY * (visibilityTexHeight + 2) + 1 +
-         octUV.y * visibilityTexHeight) / atlasHeight);
+        (probeX * (visibilityTexWidth + 2) + 1.5 +
+         octUV.x * (visibilityTexWidth - 1)) / atlasWidth,
+        (probeY * (visibilityTexHeight + 2) + 1.5 +
+         octUV.y * (visibilityTexHeight - 1)) / atlasHeight);
     float2 moments = visibilityMap.SampleLevel(texSampler, uv, 0).rg;
     if (moments.y <= 1e-5 || distanceToPoint <= moments.x) return 1.0;
     float variance = max(moments.y - moments.x * moments.x, 0.001);
