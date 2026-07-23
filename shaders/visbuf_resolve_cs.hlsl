@@ -258,9 +258,11 @@ float3 SampleDDGIProbe(int probeIndex, float3 normal) {
     int atlasHeight = (totalProbes + atlasProbeWidth - 1) / atlasProbeWidth;
     float2 octUV = DDGIOctEncode(normalize(normal));
     float2 atlasUV = float2(
-        (probeX * tileWidth + 1.0 + octUV.x * irradianceTexWidth) /
+        (probeX * tileWidth + 1.5 +
+         octUV.x * (irradianceTexWidth - 1)) /
             (atlasProbeWidth * tileWidth),
-        (probeY * tileHeight + 1.0 + octUV.y * irradianceTexHeight) /
+        (probeY * tileHeight + 1.5 +
+         octUV.y * (irradianceTexHeight - 1)) /
             (atlasHeight * tileHeight));
     return ddgiIrradianceMap.SampleLevel(texSampler, atlasUV, 0.0).rgb;
 }
@@ -288,10 +290,10 @@ float SparseProbeVisibility(uint probeIndex, float3 delta, float distance) {
     ddgiVisibilityMap.GetDimensions(atlasWidth, atlasHeight);
     float2 octUV = DDGIOctEncode(normalize(delta));
     float2 uv = float2(
-        (probeX * (visibilityTexWidth + 2) + 1 +
-         octUV.x * visibilityTexWidth) / atlasWidth,
-        (probeY * (visibilityTexHeight + 2) + 1 +
-         octUV.y * visibilityTexHeight) / atlasHeight);
+        (probeX * (visibilityTexWidth + 2) + 1.5 +
+         octUV.x * (visibilityTexWidth - 1)) / atlasWidth,
+        (probeY * (visibilityTexHeight + 2) + 1.5 +
+         octUV.y * (visibilityTexHeight - 1)) / atlasHeight);
     float2 moments = ddgiVisibilityMap.SampleLevel(texSampler, uv, 0.0).rg;
     if (moments.y <= 1e-5 || distance <= moments.x) return 1.0;
     float variance = max(moments.y - moments.x * moments.x, 0.001);

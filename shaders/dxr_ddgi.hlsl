@@ -58,6 +58,18 @@ float2 OctEncode(float3 direction) {
     return direction.xz * 0.5 + 0.5;
 }
 
+float3 OctDecode(float2 encoded) {
+    float2 f = encoded * 2.0 - 1.0;
+    float3 direction = float3(f.x, 1.0 - abs(f.x) - abs(f.y), f.y);
+    if (direction.y < 0.0) {
+        float2 oldXZ = direction.xz;
+        direction.xz = (1.0 - abs(oldXZ.yx)) *
+            float2(oldXZ.x >= 0.0 ? 1.0 : -1.0,
+                   oldXZ.y >= 0.0 ? 1.0 : -1.0);
+    }
+    return normalize(direction);
+}
+
 [shader("raygeneration")]
 void ProbeRayGen() {
     uint2 launch = DispatchRaysIndex().xy;
@@ -65,8 +77,11 @@ void ProbeRayGen() {
     if (launch.y >= probeCount || launch.x >= raysPerProbe) return;
     ProbeData probe = probes[probeIndex];
     if (probe.state == 2) return;
-    float3 direction = FibonacciDirection(
-        launch.x, raysPerProbe, frameIndex ^ probeIndex);
+    uint tileInterior = irradianceTileSize - 2;
+    uint2 directionTexel = uint2(
+        launch.x % tileInterior, launch.x / tileInterior);
+    float3 direction = OctDecode(
+        (float2(directionTexel) + 0.5) / tileInterior);
     RayDesc ray;
     ray.Origin = probe.position + probe.normal * surfaceBias;
     ray.Direction = direction;
@@ -80,7 +95,6 @@ void ProbeRayGen() {
     uint2 probeTile = uint2(probeIndex % atlasColumns,
                             probeIndex / atlasColumns);
     uint2 tile = probeTile * irradianceTileSize;
-    uint tileInterior = irradianceTileSize - 2;
     float2 octUV = OctEncode(direction);
     uint2 texel = tile + 1 + min(
         uint2(octUV * tileInterior), tileInterior - 1);

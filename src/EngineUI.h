@@ -26,6 +26,9 @@ extern UINT g_shadowBatchInstances;
 extern UINT g_destructionBatchesThisFrame;
 extern UINT g_destructionChunksSubmittedThisFrame;
 extern UINT g_destructionCulledThisFrame;
+extern UINT g_dxrDDGIProbeCount;
+extern UINT g_dxrDDGICellCount;
+extern float g_dxrDDGICellSize;
 extern MeshShaderDX12 g_meshShader;
 
 // Skinned Bandit enemy (defined in main.cpp) -- surfaced for debug readout.
@@ -515,12 +518,31 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
 
         // -- DDGI --
         ImGui::Separator();
-        ImGui::Text("DDGI Global Illumination");
+        const bool sparseDXR = g_dxrDDGIProbeCount > 0;
+        ImGui::Text(sparseDXR ? "DXR Sparse DDGI" : "Legacy Grid DDGI");
         ImGui::Checkbox("Enable DDGI", &scene.useDDGI);
         if (scene.useDDGI) {
-            ImGui::DragFloat("GI Intensity", &scene.giIntensity, 0.1f, 0.0f, 5.0f);
-            ImGui::DragFloat("Normal Bias",  &scene.normalBias,  0.01f, 0.0f, 1.0f);
-            ImGui::DragFloat("Probe Spacing",&scene.probeSpacing, 0.1f, 0.5f, 10.0f);
+            if (sparseDXR) {
+                scene.giIntensity =
+                    std::clamp(scene.giIntensity, 0.0f, 2.0f);
+                scene.normalBias =
+                    std::clamp(scene.normalBias, 0.02f, 0.30f);
+            }
+            ImGui::DragFloat("GI Intensity", &scene.giIntensity,
+                             0.05f, 0.0f, sparseDXR ? 2.0f : 5.0f);
+            ImGui::DragFloat("Normal Bias", &scene.normalBias,
+                             0.005f, sparseDXR ? 0.02f : 0.0f,
+                             sparseDXR ? 0.30f : 1.0f);
+            if (sparseDXR) {
+                ImGui::Text("Probes: %u  Hash cells: %u",
+                            g_dxrDDGIProbeCount, g_dxrDDGICellCount);
+                ImGui::Text("Cell size: %.2f m", g_dxrDDGICellSize);
+                ImGui::TextDisabled(
+                    "Spacing changes require Level Editor > Rebuild Layout");
+            } else {
+                ImGui::DragFloat("Probe Spacing", &scene.probeSpacing,
+                                 0.1f, 0.5f, 10.0f);
+            }
             ImGui::Checkbox("Show Probes",   &scene.showProbes);
         }
 

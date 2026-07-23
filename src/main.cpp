@@ -1756,7 +1756,7 @@ static bool RebuildDXRDDGIProbeLayout(bool force) {
 }
 
 static void DrawDXRDDGIProbeDebug(CXMMATRIX view, CXMMATRIX projection) {
-    if (!g_runtimeLevel.dxrDDGI.showProbes) return;
+    if (!g_runtimeLevel.dxrDDGI.showProbes && !scene.showProbes) return;
     const auto& probes = g_dxrDDGI.GetDebugProbes();
     if (probes.empty()) return;
     const XMMATRIX viewProjection = view * projection;
@@ -2755,8 +2755,10 @@ static std::shared_ptr<SceneNode> CreateDDGICornellBoxModel() {
              {0,1,0}, {1,0,0});
         quad({x0,y0,z0},{x1,y0,z0},{x1,y0,z1},{x0,y0,z1},
              {0,-1,0}, {1,0,0});
+        // Keep diagnostic geometry on conventional IA. It avoids front-face
+        // convention differences between forward, visibility, and mesh paths.
         if (!GLBImporter::BuildMeshletData(
-                primitive, g_dx12.device.Get(), true))
+                primitive, g_dx12.device.Get(), false))
             return;
         node->mesh->primitives.push_back(std::move(primitive));
         root->AddChild(node);
@@ -7659,6 +7661,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     status.probeCount, status.raysPerFrame);
                 ImGui::TextDisabled("Low ambient exposes indirect bounce.");
                 ImGui::End();
+                DrawDXRDDGIProbeDebug(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
             }
             if (!scene.playerGodMode && scene.playerHealth <= 0.0f) {
                 RenderDeathScreen(hwnd);
