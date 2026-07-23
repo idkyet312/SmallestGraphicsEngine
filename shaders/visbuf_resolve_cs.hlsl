@@ -302,12 +302,13 @@ float SparseProbeVisibility(uint probeIndex, float3 delta, float distance) {
 float3 SampleSparseDDGI(float3 worldPos, float3 normal) {
     float3 biased = worldPos + normal * normalBias;
     int3 center = (int3)floor(biased / sparseCellSize);
-    float3 irradiance = 0.0;
-    float totalWeight = 0.0;
-    uint accepted = 0;
-    [loop] for (int z = -1; z <= 1 && accepted < 8; ++z)
-    [loop] for (int y = -1; y <= 1 && accepted < 8; ++y)
-    [loop] for (int x = -1; x <= 1 && accepted < 8; ++x) {
+    uint nearestIndices[8];
+    float nearestDistanceSq[8];
+    uint nearestCount = 0;
+
+    [loop] for (int z = -1; z <= 1; ++z)
+    [loop] for (int y = -1; y <= 1; ++y)
+    [loop] for (int x = -1; x <= 1; ++x) {
         int3 coordinate = center + int3(x, y, z);
         uint slot = DDGICellHash(coordinate) & (sparseCellCount - 1);
         [loop] for (uint search = 0;
@@ -315,24 +316,52 @@ float3 SampleSparseDDGI(float3 worldPos, float3 normal) {
             SparseProbeCell cell = sparseProbeCells[slot];
             if (cell.count == 0) break;
             if (all(cell.coordinate == coordinate)) {
-                [loop] for (uint i = 0; i < cell.count && accepted < 8; ++i) {
+                [loop] for (uint i = 0; i < cell.count; ++i) {
                     uint index = sparseProbeIndices[cell.offset + i];
                     SparseProbeData probe = sparseProbes[index];
                     if (probe.state == 2) continue;
-                    float3 delta = biased - probe.position;
-                    float distance = length(delta);
-                    float weight = saturate(dot(normal, probe.normal) *
-                                            0.5 + 0.5);
-                    weight *= SparseProbeVisibility(index, delta, distance);
-                    weight /= max(distance * distance, 0.04);
-                    irradiance += SampleDDGIProbe(index, normal) * weight;
-                    totalWeight += weight;
-                    ++accepted;
+                    float distanceSq =
+                        dot(biased - probe.position, biased - probe.position);
+                    uint insertAt = nearestCount;
+                    if (nearestCount < 8) {
+                        ++nearestCount;
+                    } else {
+                        if (distanceSq >= nearestDistanceSq[7]) continue;
+                        insertAt = 7;
+                    }
+                    [loop] while (insertAt > 0 &&
+                                  distanceSq < nearestDistanceSq[insertAt - 1]) {
+                        nearestDistanceSq[insertAt] =
+                            nearestDistanceSq[insertAt - 1];
+                        nearestIndices[insertAt] = nearestIndices[insertAt - 1];
+                        --insertAt;
+                    }
+                    nearestDistanceSq[insertAt] = distanceSq;
+                    nearestIndices[insertAt] = index;
                 }
                 break;
             }
             slot = (slot + 1) & (sparseCellCount - 1);
         }
+    }
+
+    float3 irradiance = 0.0;
+    float totalWeight = 0.0;
+    [loop] for (uint i = 0; i < nearestCount; ++i) {
+        uint index = nearestIndices[i];
+        SparseProbeData probe = sparseProbes[index];
+        float3 delta = biased - probe.position;
+        float distance = sqrt(nearestDistanceSq[i]);
+        float alignment = saturate(dot(normal, probe.normal));
+        float normalWeight = 0.04 + 0.96 * alignment * alignment;
+        float rangeWeight = saturate(
+            1.0 - distance / max(sparseCellSize * 1.75, 0.1));
+        rangeWeight *= rangeWeight;
+        float weight = normalWeight * rangeWeight *
+            SparseProbeVisibility(index, delta, distance) /
+            max(nearestDistanceSq[i], 0.09);
+        irradiance += SampleDDGIProbe(index, normal) * weight;
+        totalWeight += weight;
     }
     return totalWeight > 1e-5
         ? irradiance / totalWeight * giIntensity : 0.0;
