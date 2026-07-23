@@ -3459,7 +3459,10 @@ static void StartDDGICornellTest(HWND hwnd) {
     player.transform.position[2] = -6.5f;
     player.transform.rotation[1] = 180.0f;
     level.entities.push_back(player);
-    StartLevelOne(hwnd, true, false, false, &level);
+    // Empty runtime suppresses gameplay actors, foliage, houses, ocean clutter,
+    // and stale full-level objects while custom-level mode keeps DDGI enabled.
+    StartLevelOne(hwnd, true, false, true, &level);
+    scene.gun.visible = false;
 }
 
 static void BrowseAndStartCustomLevel(HWND hwnd) {
