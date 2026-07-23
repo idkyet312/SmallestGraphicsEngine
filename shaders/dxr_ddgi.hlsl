@@ -11,15 +11,7 @@ struct ProbeData {
     uint lastUpdatedFrame;
     uint padding;
 };
-struct SurfaceVertex {
-    float3 position;
-    float3 normal;
-    float2 uv;
-    float4 baseColor;
-};
 StructuredBuffer<ProbeData> probes : register(t1);
-StructuredBuffer<SurfaceVertex> vertices : register(t2);
-StructuredBuffer<uint> indices : register(t3);
 Texture2D<float4> previousIrradiance : register(t4);
 RWTexture2D<float4> currentIrradiance : register(u0);
 RWTexture2D<float2> currentDistanceMoments : register(u1);
@@ -55,6 +47,17 @@ float3 FibonacciDirection(uint index, uint count, uint scramble) {
     return float3(cos(phi) * radius, y, sin(phi) * radius);
 }
 
+float2 OctEncode(float3 direction) {
+    direction /= max(abs(direction.x) + abs(direction.y) +
+                     abs(direction.z), 1e-5);
+    if (direction.y < 0.0) {
+        float2 signs = float2(direction.x >= 0.0 ? 1.0 : -1.0,
+                              direction.z >= 0.0 ? 1.0 : -1.0);
+        direction.xz = (1.0 - abs(direction.zx)) * signs;
+    }
+    return direction.xz * 0.5 + 0.5;
+}
+
 [shader("raygeneration")]
 void ProbeRayGen() {
     uint2 launch = DispatchRaysIndex().xy;
@@ -72,19 +75,25 @@ void ProbeRayGen() {
     RadiancePayload payload;
     payload.radiance = float3(0.0, 0.0, 0.0);
     payload.distance = maxRayDistance;
-    TraceRay(StaticScene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, payload);
+    TraceRay(StaticScene, RAY_FLAG_NONE, 0xff, 0, 0, 0, ray, payload);
 
-    uint2 tile = uint2(probeIndex % atlasColumns,
-                       probeIndex / atlasColumns) * irradianceTileSize;
+    uint2 probeTile = uint2(probeIndex % atlasColumns,
+                            probeIndex / atlasColumns);
+    uint2 tile = probeTile * irradianceTileSize;
     uint tileInterior = irradianceTileSize - 2;
-    uint2 texel = tile + 1 + uint2(launch.x % tileInterior,
-                                  launch.x / tileInterior);
+    float2 octUV = OctEncode(direction);
+    uint2 texel = tile + 1 + min(
+        uint2(octUV * tileInterior), tileInterior - 1);
     float3 previous = previousIrradiance[texel].rgb;
     float3 sampleValue = min(payload.radiance, previous * 8.0 + 24.0);
     sampleValue += previous * multiBounceStrength;
     currentIrradiance[texel] =
         float4(lerp(sampleValue, previous, hysteresis), 1.0);
-    currentDistanceMoments[texel] =
+    const uint visibilityTileSize = 18;
+    const uint visibilityInterior = 16;
+    uint2 visibilityTexel = probeTile * visibilityTileSize + 1 + min(
+        uint2(octUV * visibilityInterior), visibilityInterior - 1);
+    currentDistanceMoments[visibilityTexel] =
         float2(payload.distance, payload.distance * payload.distance);
 }
 
@@ -102,22 +111,10 @@ void ShadowMiss(inout ShadowPayload payload) { payload.visible = 1; }
 [shader("closesthit")]
 void SurfaceClosestHit(inout RadiancePayload payload,
                        BuiltInTriangleIntersectionAttributes attributes) {
-    uint triangleIndex = PrimitiveIndex();
-    uint3 tri = uint3(indices[triangleIndex * 3],
-                      indices[triangleIndex * 3 + 1],
-                      indices[triangleIndex * 3 + 2]);
-    float3 bary = float3(1.0 - attributes.barycentrics.x -
-                         attributes.barycentrics.y,
-                         attributes.barycentrics);
-    SurfaceVertex a = vertices[tri.x];
-    SurfaceVertex b = vertices[tri.y];
-    SurfaceVertex c = vertices[tri.z];
-    float3 normal = normalize(a.normal * bary.x + b.normal * bary.y +
-                              c.normal * bary.z);
-    normal = normalize(mul((float3x3)ObjectToWorld3x4(), normal));
-    float3 baseColor = a.baseColor.rgb * bary.x +
-                       b.baseColor.rgb * bary.y +
-                       c.baseColor.rgb * bary.z;
+    // DXR still traces the real static BLAS/TLAS. Until material-local hit
+    // records are added, use a stable diffuse approximation at the real hit.
+    float3 normal = normalize(-WorldRayDirection());
+    float3 baseColor = float3(0.72, 0.70, 0.66);
     float3 hit = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
     float3 lightDirection = normalize(-sunDirection);
     ShadowPayload shadow = { 0 };
@@ -128,7 +125,7 @@ void SurfaceClosestHit(inout RadiancePayload payload,
     shadowRay.TMax = maxRayDistance;
     TraceRay(StaticScene,
         RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
-        RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xff, 0, 1, 1,
+        RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xff, 0, 0, 1,
         shadowRay, shadow);
     float diffuse = saturate(dot(normal, lightDirection));
     payload.radiance = baseColor * sunColor * sunIntensity *

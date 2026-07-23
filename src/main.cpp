@@ -6020,6 +6020,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         SGE_LOG("LogPrefab", EngineLog::Level::Display,
             "Prefab editor RTT smoke test started");
     }
+    if (GetEnvironmentVariableA("SGE_DXR_DDGI_TEST", nullptr, 0) > 0) {
+        if (gameScreen != GameScreen::LevelEditor) StartLevelEditor(hwnd);
+        LevelDXRDDGISettings& test = g_levelEditor.Level().dxrDDGI;
+        test.enabled = true;
+        test.showProbes = true;
+        test.maxProbes = 256;
+        test.raysPerProbe = 32;
+        test.probesPerFrame = 8;
+        SynchronizeEditorRuntime(false);
+        SGE_LOG("LogRenderer", EngineLog::Level::Display,
+            "DXR DDGI smoke test enabled");
+    }
 
     // ?? main loop ????????????????????????????????????????????????????????????
     MSG msg = {};
@@ -6732,9 +6744,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         static uint32_t dxrDDGIFrame = 0;
         if (g_runtimeLevel.dxrDDGI.enabled) {
             if (g_dxrDDGI.HistoryDirty()) g_dxrDDGI.ResetHistory();
-            g_dxrDDGI.UpdateProbes(++dxrDDGIFrame);
+            ComPtr<ID3D12GraphicsCommandList4> dxrDDGICommands;
+            if (SUCCEEDED(g_dx12.commandList.As(&dxrDDGICommands))) {
+                const XMFLOAT3 raySunDirection(
+                    -scene.lightPos.x, -scene.lightPos.y, -scene.lightPos.z);
+                g_dxrDDGI.UpdateProbes(
+                    dxrDDGICommands.Get(), ++dxrDDGIFrame,
+                    raySunDirection, scene.lightColor, 1.0f, 1.0f);
+            }
             g_ddgiIrradianceResource = g_dxrDDGI.IrradianceAtlas();
             g_ddgiVisibilityResource = g_dxrDDGI.VisibilityAtlas();
+            visBuffer.UpdateDDGIResources(
+                g_ddgiIrradianceResource, g_ddgiVisibilityResource);
         }
         if (g_prefabRuntimeSmokeEnabled && !g_prefabRuntimeSmokeChecked &&
             !g_prefabRebuildRequested) {
@@ -7403,7 +7424,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         } else if (gameScreen == GameScreen::LevelEditor) {
             const DXRDDGIRenderer::Status& ddgiStatus = g_dxrDDGI.GetStatus();
             g_levelEditor.SetDXRDDGIStatus({
-                ddgiStatus.dxrSupported, ddgiStatus.probeCount,
+                ddgiStatus.dxrSupported, ddgiStatus.updatesActive,
+                ddgiStatus.probeCount,
                 ddgiStatus.raysPerFrame, ddgiStatus.gpuMemoryBytes,
                 ddgiStatus.cacheStatus
             });

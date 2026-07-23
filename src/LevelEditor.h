@@ -29,6 +29,7 @@ struct LevelEditorActions {
 
 struct LevelDXRDDGIStatus {
     bool supported = false;
+    bool updatesActive = false;
     uint32_t probeCount = 0;
     uint32_t raysPerFrame = 0;
     uint64_t gpuMemoryBytes = 0;
