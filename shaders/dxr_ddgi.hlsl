@@ -1,0 +1,137 @@
+// DXR Tier 1.0 sparse-probe update library. One launch maps to one directional
+// texel, so rays never race while writing an octahedral probe tile.
+RaytracingAccelerationStructure StaticScene : register(t0);
+
+struct ProbeData {
+    float3 position;
+    float radius;
+    float3 normal;
+    uint state;
+    uint2 stableId;
+    uint lastUpdatedFrame;
+    uint padding;
+};
+struct SurfaceVertex {
+    float3 position;
+    float3 normal;
+    float2 uv;
+    float4 baseColor;
+};
+StructuredBuffer<ProbeData> probes : register(t1);
+StructuredBuffer<SurfaceVertex> vertices : register(t2);
+StructuredBuffer<uint> indices : register(t3);
+Texture2D<float4> previousIrradiance : register(t4);
+RWTexture2D<float4> currentIrradiance : register(u0);
+RWTexture2D<float2> currentDistanceMoments : register(u1);
+
+cbuffer ProbeConstants : register(b0) {
+    uint startProbe;
+    uint probeCount;
+    uint raysPerProbe;
+    uint atlasColumns;
+    uint irradianceTileSize;
+    uint frameIndex;
+    float hysteresis;
+    float multiBounceStrength;
+    float maxRayDistance;
+    float surfaceBias;
+    float3 sunDirection;
+    float sunIntensity;
+    float3 sunColor;
+    float skyIntensity;
+};
+
+struct RadiancePayload {
+    float3 radiance;
+    float distance;
+};
+struct ShadowPayload { uint visible; };
+
+float3 FibonacciDirection(uint index, uint count, uint scramble) {
+    const float golden = 2.39996323;
+    float y = 1.0 - 2.0 * ((index + 0.5) / max((float)count, 1.0));
+    float radius = sqrt(max(0.0, 1.0 - y * y));
+    float phi = golden * (index + scramble * 0.6180339);
+    return float3(cos(phi) * radius, y, sin(phi) * radius);
+}
+
+[shader("raygeneration")]
+void ProbeRayGen() {
+    uint2 launch = DispatchRaysIndex().xy;
+    uint probeIndex = startProbe + launch.y;
+    if (launch.y >= probeCount || launch.x >= raysPerProbe) return;
+    ProbeData probe = probes[probeIndex];
+    if (probe.state == 2) return;
+    float3 direction = FibonacciDirection(
+        launch.x, raysPerProbe, frameIndex ^ probeIndex);
+    RayDesc ray;
+    ray.Origin = probe.position + probe.normal * surfaceBias;
+    ray.Direction = direction;
+    ray.TMin = 0.02;
+    ray.TMax = maxRayDistance;
+    RadiancePayload payload;
+    payload.radiance = float3(0.0, 0.0, 0.0);
+    payload.distance = maxRayDistance;
+    TraceRay(StaticScene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, payload);
+
+    uint2 tile = uint2(probeIndex % atlasColumns,
+                       probeIndex / atlasColumns) * irradianceTileSize;
+    uint tileInterior = irradianceTileSize - 2;
+    uint2 texel = tile + 1 + uint2(launch.x % tileInterior,
+                                  launch.x / tileInterior);
+    float3 previous = previousIrradiance[texel].rgb;
+    float3 sampleValue = min(payload.radiance, previous * 8.0 + 24.0);
+    sampleValue += previous * multiBounceStrength;
+    currentIrradiance[texel] =
+        float4(lerp(sampleValue, previous, hysteresis), 1.0);
+    currentDistanceMoments[texel] =
+        float2(payload.distance, payload.distance * payload.distance);
+}
+
+[shader("miss")]
+void RadianceMiss(inout RadiancePayload payload) {
+    float horizon = saturate(WorldRayDirection().y * 0.5 + 0.5);
+    payload.radiance = lerp(float3(0.06, 0.08, 0.12),
+        float3(0.36, 0.52, 0.82), horizon) * skyIntensity;
+    payload.distance = maxRayDistance;
+}
+
+[shader("miss")]
+void ShadowMiss(inout ShadowPayload payload) { payload.visible = 1; }
+
+[shader("closesthit")]
+void SurfaceClosestHit(inout RadiancePayload payload,
+                       BuiltInTriangleIntersectionAttributes attributes) {
+    uint triangleIndex = PrimitiveIndex();
+    uint3 tri = uint3(indices[triangleIndex * 3],
+                      indices[triangleIndex * 3 + 1],
+                      indices[triangleIndex * 3 + 2]);
+    float3 bary = float3(1.0 - attributes.barycentrics.x -
+                         attributes.barycentrics.y,
+                         attributes.barycentrics);
+    SurfaceVertex a = vertices[tri.x];
+    SurfaceVertex b = vertices[tri.y];
+    SurfaceVertex c = vertices[tri.z];
+    float3 normal = normalize(a.normal * bary.x + b.normal * bary.y +
+                              c.normal * bary.z);
+    normal = normalize(mul((float3x3)ObjectToWorld3x4(), normal));
+    float3 baseColor = a.baseColor.rgb * bary.x +
+                       b.baseColor.rgb * bary.y +
+                       c.baseColor.rgb * bary.z;
+    float3 hit = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
+    float3 lightDirection = normalize(-sunDirection);
+    ShadowPayload shadow = { 0 };
+    RayDesc shadowRay;
+    shadowRay.Origin = hit + normal * surfaceBias;
+    shadowRay.Direction = lightDirection;
+    shadowRay.TMin = 0.02;
+    shadowRay.TMax = maxRayDistance;
+    TraceRay(StaticScene,
+        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+        RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xff, 0, 1, 1,
+        shadowRay, shadow);
+    float diffuse = saturate(dot(normal, lightDirection));
+    payload.radiance = baseColor * sunColor * sunIntensity *
+                       diffuse * shadow.visible;
+    payload.distance = RayTCurrent();
+}

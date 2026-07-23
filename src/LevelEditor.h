@@ -23,6 +23,16 @@ struct LevelEditorActions {
     bool beginPlay = false;
     bool stopPlay = false;
     bool returnToMenu = false;
+    bool rebuildDXRDDGI = false;
+    bool resetDXRDDGIHistory = false;
+};
+
+struct LevelDXRDDGIStatus {
+    bool supported = false;
+    uint32_t probeCount = 0;
+    uint32_t raysPerFrame = 0;
+    uint64_t gpuMemoryBytes = 0;
+    std::string cacheStatus = "Not built";
 };
 
 class LevelEditor {
@@ -43,6 +53,11 @@ public:
     void MarkFoliageRuntimeSynchronized() { foliageRuntimeDirty_ = false; }
     bool TerrainRuntimeDirty() const { return terrainRuntimeDirty_; }
     void MarkTerrainRuntimeSynchronized() { terrainRuntimeDirty_ = false; }
+    bool DXRDDGIRuntimeDirty() const { return dxrDDGIRuntimeDirty_; }
+    void MarkDXRDDGIRuntimeSynchronized() { dxrDDGIRuntimeDirty_ = false; }
+    void SetDXRDDGIStatus(const LevelDXRDDGIStatus& status) {
+        dxrDDGIStatus_ = status;
+    }
     void OnKeyDown(unsigned key, bool controlDown);
     LevelEditorActions Render(Camera& camera,
         DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
@@ -105,6 +120,8 @@ private:
     bool runtimeDirty_ = true;
     bool foliageRuntimeDirty_ = true;
     bool terrainRuntimeDirty_ = true;
+    bool dxrDDGIRuntimeDirty_ = true;
+    LevelDXRDDGIStatus dxrDDGIStatus_;
     bool localSpace_ = false;
     bool snapEnabled_ = true;
     bool terrainSnap_ = true;

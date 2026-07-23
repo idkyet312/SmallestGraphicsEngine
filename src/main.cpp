@@ -39,6 +39,7 @@
 #include "ForwardRenderer.h"
 #include "IdTechRenderer.h"
 #include "RaytracingDX12.h"
+#include "DXRDDGIRenderer.h"
 #include "VirtualInput.h"
 #include "EngineUI.h"
 #include "GLBImporter.h"
@@ -1381,11 +1382,19 @@ GrassField                  g_grass;
 static SkyRendererDX12      skyRenderer;
 static EnvironmentIBLDX12   environmentIBL;
 DDGIRendererDX12            g_ddgiRenderer;
+static DXRDDGIRenderer       g_dxrDDGI;
 ID3D12Resource*             g_skyEnvironmentResource = nullptr;
 ID3D12Resource*             g_specularEnvironmentResource = nullptr;
 ID3D12Resource*             g_brdfIntegrationResource = nullptr;
 ID3D12Resource*             g_ddgiIrradianceResource = nullptr;
 ID3D12Resource*             g_ddgiVisibilityResource = nullptr;
+ID3D12Resource*             g_dxrDDGIProbeResource = nullptr;
+ID3D12Resource*             g_dxrDDGICellResource = nullptr;
+ID3D12Resource*             g_dxrDDGIIndexResource = nullptr;
+UINT                        g_dxrDDGIProbeCount = 0;
+UINT                        g_dxrDDGICellCount = 0;
+UINT                        g_dxrDDGIIndexCount = 0;
+float                       g_dxrDDGICellSize = 0.0f;
 static OcclusionDepthDX12   occlusionDepth;
 static XMMATRIX             previousHZBViewProjection = XMMatrixIdentity();
 static bool                 hzbCaptureActive = false;
@@ -1444,6 +1453,323 @@ static std::chrono::steady_clock::time_point levelLoadingTaskStartedAt;
 static std::vector<LevelLoadRecord> levelLoadingRecords;
 static std::future<bool> levelDestructionLoadFuture;
 static bool levelDestructionLoadInFlight = false;
+
+static uint64_t DXRDDGIHash(uint64_t hash, uint64_t value) {
+    hash ^= value;
+    return hash * 1099511628211ull;
+}
+
+static void DXRDDGIHashFloat(uint64_t& hash, float value) {
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    hash = DXRDDGIHash(hash, bits);
+}
+
+static uint64_t DXRDDGIStringHash(const std::string& value) {
+    uint64_t hash = 1469598103934665603ull;
+    for (unsigned char character : value)
+        hash = DXRDDGIHash(hash, character);
+    return hash;
+}
+
+static void AppendDXRDDGINodeTriangles(
+    const std::shared_ptr<SceneNode>& node, CXMMATRIX instanceWorld,
+    uint64_t entityId, uint64_t& geometryHash,
+    std::vector<DXRProbeTriangle>& triangles, uint32_t& primitiveOrdinal) {
+    if (!node) return;
+    const XMMATRIX world = XMLoadFloat4x4(&node->globalTransform) *
+                           instanceWorld;
+    if (node->mesh) {
+        for (const MeshPrimitive& primitive : node->mesh->primitives) {
+            const uint32_t ordinal = primitiveOrdinal++;
+            const size_t vertexCount = primitive.vertices.size() / 12u;
+            const size_t indexCount = primitive.indices.empty()
+                ? vertexCount : primitive.indices.size();
+            for (size_t i = 0; i + 2 < indexCount; i += 3) {
+                const uint32_t indices[3] = {
+                    primitive.indices.empty() ? static_cast<uint32_t>(i) :
+                                               primitive.indices[i],
+                    primitive.indices.empty() ? static_cast<uint32_t>(i + 1) :
+                                               primitive.indices[i + 1],
+                    primitive.indices.empty() ? static_cast<uint32_t>(i + 2) :
+                                               primitive.indices[i + 2]
+                };
+                if (indices[0] >= vertexCount || indices[1] >= vertexCount ||
+                    indices[2] >= vertexCount)
+                    continue;
+                DXRProbeTriangle triangle;
+                XMFLOAT3* points[3] = {
+                    &triangle.a, &triangle.b, &triangle.c
+                };
+                for (uint32_t corner = 0; corner < 3; ++corner) {
+                    const size_t base = static_cast<size_t>(indices[corner]) * 12u;
+                    XMStoreFloat3(points[corner], XMVector3TransformCoord(
+                        XMVectorSet(primitive.vertices[base],
+                                    primitive.vertices[base + 1],
+                                    primitive.vertices[base + 2], 1.0f), world));
+                    DXRDDGIHashFloat(geometryHash, points[corner]->x);
+                    DXRDDGIHashFloat(geometryHash, points[corner]->y);
+                    DXRDDGIHashFloat(geometryHash, points[corner]->z);
+                }
+                triangle.sourceId = DXRProbeLayout::Hash64(entityId ^
+                    (static_cast<uint64_t>(ordinal) << 32u) ^
+                    static_cast<uint64_t>(i / 3u));
+                triangles.push_back(triangle);
+            }
+        }
+    }
+    for (const auto& child : node->children)
+        AppendDXRDDGINodeTriangles(child, instanceWorld, entityId,
+            geometryHash, triangles, primitiveOrdinal);
+}
+
+static void AppendDXRDDGITerrain(std::vector<DXRProbeTriangle>& triangles,
+                                 uint64_t& geometryHash) {
+    auto params = CurrentTerrainParams();
+    params.heightScale = scene.terrainHeightScale;
+    const float width = params.tilesX * params.tileSize;
+    const float depth = params.tilesZ * params.tileSize;
+    const float step = (std::max)(2.0f,
+        g_runtimeLevel.dxrDDGI.surfaceSpacing);
+    const uint32_t columns = static_cast<uint32_t>(std::ceil(width / step));
+    const uint32_t rows = static_cast<uint32_t>(std::ceil(depth / step));
+    const float startX = -width * 0.5f;
+    const float startZ = -depth * 0.5f;
+    auto point = [&](uint32_t x, uint32_t z) {
+        const float px = startX + (std::min)(width, x * step);
+        const float pz = startZ + (std::min)(depth, z * step);
+        return XMFLOAT3(px, TerrainRendererDX12::HeightAt(params, px, pz), pz);
+    };
+    for (uint32_t z = 0; z < rows; ++z) {
+        for (uint32_t x = 0; x < columns; ++x) {
+            const XMFLOAT3 p00 = point(x, z);
+            const XMFLOAT3 p10 = point(x + 1, z);
+            const XMFLOAT3 p01 = point(x, z + 1);
+            const XMFLOAT3 p11 = point(x + 1, z + 1);
+            DXRProbeTriangle pair[2] = {
+                { p00, p01, p10, DXRProbeLayout::Hash64(
+                    0x5445525241494eull ^ (static_cast<uint64_t>(z) << 32u) ^ x) },
+                { p10, p01, p11, DXRProbeLayout::Hash64(
+                    0x5445525241494eull ^ (static_cast<uint64_t>(z) << 32u) ^ x ^
+                    0x80000000ull) }
+            };
+            for (const DXRProbeTriangle& triangle : pair) {
+                const XMFLOAT3 points[3] = {
+                    triangle.a, triangle.b, triangle.c
+                };
+                for (const XMFLOAT3& p : points) {
+                    DXRDDGIHashFloat(geometryHash, p.x);
+                    DXRDDGIHashFloat(geometryHash, p.y);
+                    DXRDDGIHashFloat(geometryHash, p.z);
+                }
+                triangles.push_back(triangle);
+            }
+        }
+    }
+}
+
+static void BuildDXRDDGINodeScene(
+    const std::shared_ptr<SceneNode>& node, uint64_t meshNamespace,
+    const std::vector<XMMATRIX>& worlds, const std::vector<uint64_t>& entityIds,
+    uint32_t& nodeOrdinal, ID3D12GraphicsCommandList4* commandList,
+    std::vector<DXRScene::Instance>& instances) {
+    if (!node) return;
+    const uint32_t ordinal = nodeOrdinal++;
+    if (node->mesh) {
+        std::vector<DXRScene::Geometry> geometries;
+        uint64_t sourceHash = 1469598103934665603ull;
+        for (const MeshPrimitive& primitive : node->mesh->primitives) {
+            if (!primitive.vertexBuffer || primitive.vertices.size() < 36)
+                continue;
+            DXRScene::Geometry geometry;
+            geometry.vertexAddress =
+                primitive.vertexBuffer->GetGPUVirtualAddress();
+            geometry.vertexCount =
+                static_cast<uint32_t>(primitive.vertices.size() / 12u);
+            geometry.vertexStride = 12u * sizeof(float);
+            geometry.indexAddress = primitive.indexBuffer
+                ? primitive.indexBuffer->GetGPUVirtualAddress() : 0;
+            geometry.indexCount = primitive.indexCount;
+            geometry.indexFormat = primitive.ibv.Format;
+            geometry.opaque = !primitive.material ||
+                              !primitive.material->alphaCutout;
+            geometries.push_back(geometry);
+            sourceHash = DXRDDGIHash(sourceHash, geometry.vertexCount);
+            sourceHash = DXRDDGIHash(sourceHash, geometry.indexCount);
+            for (float component : primitive.vertices)
+                DXRDDGIHashFloat(sourceHash, component);
+            for (uint32_t index : primitive.indices)
+                sourceHash = DXRDDGIHash(sourceHash, index);
+        }
+        if (!geometries.empty()) {
+            const uint64_t meshId = DXRProbeLayout::Hash64(
+                meshNamespace ^ ordinal);
+            if (g_dxrDDGI.Scene().BuildMeshBLAS(commandList, meshId,
+                                                sourceHash, geometries)) {
+                const XMMATRIX nodeWorld =
+                    XMLoadFloat4x4(&node->globalTransform);
+                for (size_t i = 0; i < worlds.size(); ++i) {
+                    DXRScene::Instance instance;
+                    instance.meshId = meshId;
+                    instance.entityId = i < entityIds.size() ? entityIds[i] : i;
+                    XMStoreFloat4x4(&instance.transform,
+                                    nodeWorld * worlds[i]);
+                    instances.push_back(instance);
+                }
+            }
+        }
+    }
+    for (const auto& child : node->children)
+        BuildDXRDDGINodeScene(child, meshNamespace, worlds, entityIds,
+            nodeOrdinal, commandList, instances);
+}
+
+static bool BuildDXRDDGIAccelerationScene() {
+    ComPtr<ID3D12GraphicsCommandList4> commandList;
+    if (!g_dxrDDGI.Scene().Supported() ||
+        FAILED(g_dx12.commandList.As(&commandList)))
+        return false;
+    std::vector<DXRScene::Instance> instances;
+    for (const PrefabRenderBatch& batch : g_prefabRenderBatches) {
+        uint32_t nodeOrdinal = 0;
+        BuildDXRDDGINodeScene(batch.baseModel,
+            DXRDDGIStringHash(batch.prefabId), batch.baseTransforms,
+            batch.entityIds, nodeOrdinal, commandList.Get(), instances);
+    }
+    if (wallModel) {
+        uint32_t nodeOrdinal = 0;
+        const std::vector<XMMATRIX> worlds{ XMMatrixIdentity() };
+        const std::vector<uint64_t> ids{ 0x484f555345ull };
+        BuildDXRDDGINodeScene(wallModel, 0x484f555345ull, worlds, ids,
+            nodeOrdinal, commandList.Get(), instances);
+    }
+    if (scene.useMeshTerrain && g_terrain.supported) {
+        auto params = CurrentTerrainParams();
+        params.heightScale = scene.terrainHeightScale;
+        const float width = params.tilesX * params.tileSize;
+        const float depth = params.tilesZ * params.tileSize;
+        const float step = (std::max)(2.0f,
+            g_runtimeLevel.dxrDDGI.surfaceSpacing);
+        const uint32_t columns =
+            static_cast<uint32_t>(std::ceil(width / step));
+        const uint32_t rows =
+            static_cast<uint32_t>(std::ceil(depth / step));
+        std::vector<XMFLOAT3> vertices;
+        std::vector<uint32_t> indices;
+        vertices.reserve((columns + 1u) * (rows + 1u));
+        uint64_t terrainHash = 1469598103934665603ull;
+        for (uint32_t z = 0; z <= rows; ++z) {
+            for (uint32_t x = 0; x <= columns; ++x) {
+                const float px = -width * 0.5f +
+                    (std::min)(width, x * step);
+                const float pz = -depth * 0.5f +
+                    (std::min)(depth, z * step);
+                XMFLOAT3 vertex(
+                    px, TerrainRendererDX12::HeightAt(params, px, pz), pz);
+                vertices.push_back(vertex);
+                DXRDDGIHashFloat(terrainHash, vertex.x);
+                DXRDDGIHashFloat(terrainHash, vertex.y);
+                DXRDDGIHashFloat(terrainHash, vertex.z);
+            }
+        }
+        indices.reserve(columns * rows * 6u);
+        for (uint32_t z = 0; z < rows; ++z) {
+            for (uint32_t x = 0; x < columns; ++x) {
+                const uint32_t a = z * (columns + 1u) + x;
+                const uint32_t b = a + 1u;
+                const uint32_t c = a + columns + 1u;
+                const uint32_t d = c + 1u;
+                indices.insert(indices.end(), { a, c, b, b, c, d });
+            }
+        }
+        if (g_dxrDDGI.Scene().BuildTerrainBLAS(
+                commandList.Get(), terrainHash, vertices, indices)) {
+            DXRScene::Instance terrain;
+            terrain.meshId = DXRScene::TerrainMeshId();
+            terrain.entityId = 0;
+            XMStoreFloat4x4(&terrain.transform, XMMatrixIdentity());
+            instances.push_back(terrain);
+        }
+    }
+    return g_dxrDDGI.UpdateTLAS(commandList.Get(), instances);
+}
+
+static bool RebuildDXRDDGIProbeLayout(bool force) {
+    g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
+    if (!g_runtimeLevel.dxrDDGI.enabled) return false;
+    if (!force && !g_dxrDDGI.LayoutDirty()) return true;
+    std::vector<DXRProbeTriangle> triangles;
+    uint64_t geometryHash = 1469598103934665603ull;
+    for (const PrefabRenderBatch& batch : g_prefabRenderBatches) {
+        for (size_t i = 0; i < batch.baseTransforms.size(); ++i) {
+            const uint64_t entityId = i < batch.entityIds.size()
+                ? batch.entityIds[i]
+                : DXRProbeLayout::Hash64(DXRDDGIStringHash(batch.prefabId) ^ i);
+            uint32_t primitiveOrdinal = 0;
+            AppendDXRDDGINodeTriangles(batch.baseModel, batch.baseTransforms[i],
+                entityId, geometryHash, triangles, primitiveOrdinal);
+        }
+    }
+    if (wallModel) {
+        uint32_t primitiveOrdinal = 0;
+        AppendDXRDDGINodeTriangles(wallModel, XMMatrixIdentity(),
+            0x484f555345ull, geometryHash, triangles, primitiveOrdinal);
+    }
+    if (scene.useMeshTerrain && g_terrain.supported)
+        AppendDXRDDGITerrain(triangles, geometryHash);
+    const std::filesystem::path cache = std::filesystem::path("levels") /
+        ".ddgi" / (std::to_string(geometryHash) + ".ddgi");
+    if (!g_dxrDDGI.BuildProbeLayout(triangles, geometryHash, cache))
+        return false;
+    if (!g_dxrDDGI.UploadProbeBuffers(g_dx12.commandList.Get()))
+        return false;
+    g_dxrDDGIProbeResource = g_dxrDDGI.ProbeBuffer();
+    g_dxrDDGICellResource = g_dxrDDGI.CellBuffer();
+    g_dxrDDGIIndexResource = g_dxrDDGI.IndexBuffer();
+    g_dxrDDGIProbeCount =
+        static_cast<UINT>(g_dxrDDGI.Layout().probes.size());
+    g_dxrDDGICellCount =
+        static_cast<UINT>(g_dxrDDGI.Layout().cells.size());
+    g_dxrDDGIIndexCount =
+        static_cast<UINT>(g_dxrDDGI.Layout().cellProbeIndices.size());
+    g_dxrDDGICellSize = g_dxrDDGI.Layout().cellSize;
+    g_ddgiIrradianceResource = g_dxrDDGI.IrradianceAtlas();
+    g_ddgiVisibilityResource = g_dxrDDGI.VisibilityAtlas();
+    visBuffer.UpdateDDGIResources(
+        g_ddgiIrradianceResource, g_ddgiVisibilityResource);
+    visBuffer.UpdateSparseDDGIResources(
+        g_dxrDDGIProbeResource, g_dxrDDGIProbeCount,
+        g_dxrDDGICellResource, g_dxrDDGICellCount,
+        g_dxrDDGIIndexResource, g_dxrDDGIIndexCount);
+    BuildDXRDDGIAccelerationScene();
+    g_dxrDDGI.ResetHistory();
+    return true;
+}
+
+static void DrawDXRDDGIProbeDebug(CXMMATRIX view, CXMMATRIX projection) {
+    if (!g_runtimeLevel.dxrDDGI.showProbes) return;
+    const auto& probes = g_dxrDDGI.GetDebugProbes();
+    if (probes.empty()) return;
+    const XMMATRIX viewProjection = view * projection;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    for (const DXRProbeRecord& probe : probes) {
+        const XMVECTOR clip = XMVector3Transform(
+            XMLoadFloat3(&probe.position), viewProjection);
+        const float w = XMVectorGetW(clip);
+        if (w <= 0.01f) continue;
+        const float x = (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x;
+        const float y = (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) *
+                        display.y;
+        const ImU32 color = probe.state == DXRProbeState::Valid
+            ? IM_COL32(70, 235, 100, 220)
+            : (probe.state == DXRProbeState::Rejected
+                ? IM_COL32(245, 65, 55, 220)
+                : IM_COL32(245, 180, 45, 220));
+        draw->AddCircleFilled(ImVec2(x, y), 3.5f, color);
+        draw->AddCircle(ImVec2(x, y), 5.0f, IM_COL32(0, 0, 0, 180));
+    }
+}
 
 static double LevelLoadElapsedMs(
     std::chrono::steady_clock::time_point start) {
@@ -1899,7 +2225,11 @@ static uint64_t ThumbnailGpuHandle(const PrefabThumbnailRuntime& entry) {
 
 static uint64_t PrefabThumbnailTexture(const PrefabAsset& prefab) {
     if (!imguiSrvHeap || prefab.modelPath.empty()) return 0;
-    if (g_prefabEditorSmokeEnabled && prefab.id != "rock") return 0;
+    if (g_prefabEditorSmokeEnabled) {
+        std::error_code smokeError;
+        if (std::filesystem::file_size(prefab.modelPath, smokeError) > 32768 ||
+            smokeError) return 0;
+    }
     std::error_code error;
     const std::string source = prefab.modelPath.generic_string() + ':' +
         std::to_string(std::filesystem::file_size(prefab.modelPath, error)) + ':' +
@@ -2413,6 +2743,7 @@ static void RebuildPrefabRenderBatches() {
         } else index = found->second;
         g_prefabRenderBatches[index].baseTransforms.push_back(world);
         g_prefabRenderBatches[index].transforms.push_back(world);
+        g_prefabRenderBatches[index].entityIds.push_back(entityId);
 
         const std::string collision = components.contains("collision")
             ? components.at("collision").value("shape", prefab->collision)
@@ -2822,6 +3153,12 @@ static const LevelEntity* FirstRuntimeEntity(LevelEntityType type) {
 static void ApplyRuntimeLevelBasics(bool movePlayer) {
     if (!g_customLevelMode) return;
     scene.terrainHeightScale = g_runtimeLevel.terrainHeightScale;
+    g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
+    scene.useDDGI = g_runtimeLevel.dxrDDGI.enabled &&
+                    g_dxrDDGI.GetStatus().dxrSupported;
+    scene.giIntensity = g_runtimeLevel.dxrDDGI.intensity;
+    scene.normalBias = g_runtimeLevel.dxrDDGI.normalBias;
+    scene.probeSpacing = g_runtimeLevel.dxrDDGI.surfaceSpacing;
     scene.explosiveBarrels.clear();
     for (const LevelEntity& entity : g_runtimeLevel.entities) {
         if (!entity.enabled || entity.type != LevelEntityType::ExplosiveBarrel) continue;
@@ -5067,16 +5404,31 @@ static void ProcessInput(HWND) {
         return;
     }
     g_destruction.SetVehicleInput(0.0f, 0.0f, true);
-    const bool crouching = scene.camera.FPSMode &&
+    const bool controlDown = scene.camera.FPSMode &&
         (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+    const bool sprinting = scene.camera.FPSMode &&
+        (GetAsyncKeyState(VK_SHIFT) & 0x8000);
+    const float forwardInput =
+        ((GetAsyncKeyState('W') & 0x8000) ? 1.0f : 0.0f) -
+        ((GetAsyncKeyState('S') & 0x8000) ? 1.0f : 0.0f);
+    const float strafeInput =
+        ((GetAsyncKeyState('A') & 0x8000) ? 1.0f : 0.0f) -
+        ((GetAsyncKeyState('D') & 0x8000) ? 1.0f : 0.0f);
+    static bool controlWasDown = false;
+    if (controlDown && !controlWasDown && sprinting)
+        scene.camera.StartSlide(forwardInput, strafeInput);
+    controlWasDown = controlDown;
+
+    const bool crouching = controlDown || scene.camera.IsSliding;
     scene.camera.SetCrouching(crouching, deltaTime);
     const float movementMultiplier = crouching ? 0.55f :
-        ((scene.camera.FPSMode && (GetAsyncKeyState(VK_SHIFT) & 0x8000))
-            ? 2.0f : 1.0f);
-    if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, movementMultiplier);
-    if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, movementMultiplier);
-    if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, movementMultiplier);
-    if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, movementMultiplier);
+        (sprinting ? 2.0f : 1.0f);
+    if (!scene.camera.IsSliding) {
+        if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, movementMultiplier);
+        if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, movementMultiplier);
+        if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, movementMultiplier);
+        if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, movementMultiplier);
+    }
     if (!crouching && (GetAsyncKeyState(VK_SPACE) & 0x8000))
         scene.camera.ProcessKeyboard(' ', deltaTime);
 
@@ -5592,6 +5944,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
 
     // Raytracing (DXR path)
+    g_dxrDDGI.Initialize(g_dx12.device.Get());
     if (!InitRaytracing(geo)) {
         std::cerr << "DXR init failed (non-fatal)\n";
         scene.useRaytracing = false;
@@ -6365,6 +6718,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         if (IsSceneScreen() && g_prefabRebuildRequested)
             RebuildPrefabRenderBatches();
+        if (gameScreen == GameScreen::LevelEditor &&
+            g_levelEditor.DXRDDGIRuntimeDirty()) {
+            g_dxrDDGI.MarkLayoutDirty();
+            RebuildDXRDDGIProbeLayout(true);
+            g_levelEditor.MarkDXRDDGIRuntimeSynchronized();
+        }
+        static uint32_t dxrDDGIFrame = 0;
+        if (g_runtimeLevel.dxrDDGI.enabled) {
+            if (g_dxrDDGI.HistoryDirty()) g_dxrDDGI.ResetHistory();
+            g_dxrDDGI.UpdateProbes(++dxrDDGIFrame);
+            g_ddgiIrradianceResource = g_dxrDDGI.IrradianceAtlas();
+            g_ddgiVisibilityResource = g_dxrDDGI.VisibilityAtlas();
+        }
         if (g_prefabRuntimeSmokeEnabled && !g_prefabRuntimeSmokeChecked &&
             !g_prefabRebuildRequested) {
             const auto batch = std::find_if(g_prefabRenderBatches.begin(),
@@ -7030,6 +7396,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         } else if (gameScreen == GameScreen::WinScreen) {
             RenderWinScreen(hwnd);
         } else if (gameScreen == GameScreen::LevelEditor) {
+            const DXRDDGIRenderer::Status& ddgiStatus = g_dxrDDGI.GetStatus();
+            g_levelEditor.SetDXRDDGIStatus({
+                ddgiStatus.dxrSupported, ddgiStatus.probeCount,
+                ddgiStatus.raysPerFrame, ddgiStatus.gpuMemoryBytes,
+                ddgiStatus.cacheStatus
+            });
             const LevelEditorActions actions = g_levelEditor.Render(scene.camera,
                 scene.GetViewMatrix(), scene.GetProjectionMatrix(),
                 [](float x, float z) {
@@ -7041,6 +7413,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             pendingEditorBeginPlay = actions.beginPlay;
             pendingEditorStopPlay = actions.stopPlay;
             pendingEditorReturnToMenu = actions.returnToMenu;
+            if (actions.rebuildDXRDDGI) {
+                g_runtimeLevel = g_levelEditor.Level();
+                g_dxrDDGI.MarkLayoutDirty();
+                RebuildDXRDDGIProbeLayout(true);
+                g_levelEditor.MarkDXRDDGIRuntimeSynchronized();
+            }
+            if (actions.resetDXRDDGIHistory)
+                g_dxrDDGI.ResetHistory();
+            DrawDXRDDGIProbeDebug(
+                scene.GetViewMatrix(), scene.GetProjectionMatrix());
             if (g_levelEditor.IsPlaying()) RenderPlayerHUD(scene);
         } else {
             RenderPlayerHUD(scene);

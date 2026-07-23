@@ -157,6 +157,22 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         result.errors.push_back("terrain heightScale must be between 0 and 50");
     if (level.terrainSculpt.size() > 256)
         result.errors.push_back("terrain sculpt supports at most 256 stamps");
+    const LevelDXRDDGISettings& gi = level.dxrDDGI;
+    if (!std::isfinite(gi.surfaceSpacing) || gi.surfaceSpacing < 0.25f ||
+        gi.surfaceSpacing > 50.0f || !std::isfinite(gi.surfaceOffset) ||
+        gi.surfaceOffset < 0.0f || gi.surfaceOffset > 5.0f ||
+        gi.maxProbes == 0 || gi.maxProbes > 2048 ||
+        gi.raysPerProbe < 8 || gi.raysPerProbe > 256 ||
+        gi.probesPerFrame == 0 || gi.probesPerFrame > gi.maxProbes ||
+        !std::isfinite(gi.intensity) || gi.intensity < 0.0f ||
+        gi.intensity > 5.0f || !std::isfinite(gi.normalBias) ||
+        gi.normalBias < 0.0f || gi.normalBias > 2.0f ||
+        !std::isfinite(gi.viewBias) || gi.viewBias < 0.0f ||
+        gi.viewBias > 2.0f || !std::isfinite(gi.hysteresis) ||
+        gi.hysteresis < 0.0f || gi.hysteresis > 0.999f ||
+        !std::isfinite(gi.multiBounceStrength) ||
+        gi.multiBounceStrength < 0.0f || gi.multiBounceStrength > 1.0f)
+        result.errors.push_back("lighting.dxrDDGI contains invalid settings");
     for (const TerrainSculptStamp& stamp : level.terrainSculpt) {
         if (!std::isfinite(stamp.x) || !std::isfinite(stamp.z) ||
             !std::isfinite(stamp.radius) || !std::isfinite(stamp.value) ||
@@ -216,6 +232,29 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         level.schemaVersion = root.at("schemaVersion").get<uint32_t>();
         level.name = root.at("name").get<std::string>();
         level.terrainHeightScale = root.at("terrain").at("heightScale").get<float>();
+        if (root.contains("lighting") && root.at("lighting").is_object() &&
+            root.at("lighting").contains("dxrDDGI")) {
+            const json& source = root.at("lighting").at("dxrDDGI");
+            if (!source.is_object())
+                throw std::runtime_error("lighting.dxrDDGI must be an object");
+            level.dxrDDGI.enabled = source.value("enabled", false);
+            level.dxrDDGI.surfaceSpacing =
+                source.value("surfaceSpacing", 3.0f);
+            level.dxrDDGI.surfaceOffset =
+                source.value("surfaceOffset", 0.35f);
+            level.dxrDDGI.maxProbes = source.value("maxProbes", 2048u);
+            level.dxrDDGI.raysPerProbe =
+                source.value("raysPerProbe", 64u);
+            level.dxrDDGI.probesPerFrame =
+                source.value("probesPerFrame", 16u);
+            level.dxrDDGI.intensity = source.value("intensity", 0.45f);
+            level.dxrDDGI.normalBias = source.value("normalBias", 0.18f);
+            level.dxrDDGI.viewBias = source.value("viewBias", 0.05f);
+            level.dxrDDGI.hysteresis = source.value("hysteresis", 0.95f);
+            level.dxrDDGI.multiBounceStrength =
+                source.value("multiBounceStrength", 0.35f);
+            level.dxrDDGI.showProbes = source.value("showProbes", false);
+        }
         const json& terrain = root.at("terrain");
         if (terrain.contains("sculpt")) {
             if (!terrain.at("sculpt").is_array())
@@ -301,6 +340,21 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
             {"schemaVersion", level.schemaVersion}, {"name", level.name},
             {"terrain", {{"heightScale", level.terrainHeightScale},
                          {"sculpt", std::move(sculpt)}}},
+            {"lighting", {{"dxrDDGI", {
+                {"enabled", level.dxrDDGI.enabled},
+                {"surfaceSpacing", level.dxrDDGI.surfaceSpacing},
+                {"surfaceOffset", level.dxrDDGI.surfaceOffset},
+                {"maxProbes", level.dxrDDGI.maxProbes},
+                {"raysPerProbe", level.dxrDDGI.raysPerProbe},
+                {"probesPerFrame", level.dxrDDGI.probesPerFrame},
+                {"intensity", level.dxrDDGI.intensity},
+                {"normalBias", level.dxrDDGI.normalBias},
+                {"viewBias", level.dxrDDGI.viewBias},
+                {"hysteresis", level.dxrDDGI.hysteresis},
+                {"multiBounceStrength",
+                    level.dxrDDGI.multiBounceStrength},
+                {"showProbes", level.dxrDDGI.showProbes}
+            }}}},
             {"entities", std::move(entities)}
         };
         if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());

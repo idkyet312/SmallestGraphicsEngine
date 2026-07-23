@@ -43,6 +43,13 @@ int main() {
         TerrainSculptOperation::Add, 0.75f, 1.0f });
     level.terrainSculpt.push_back({ 0.0f, 1.0f, 4.0f,
         TerrainSculptOperation::Flatten, 2.5f, 0.6f });
+    level.dxrDDGI.enabled = true;
+    level.dxrDDGI.surfaceSpacing = 2.5f;
+    level.dxrDDGI.surfaceOffset = 0.4f;
+    level.dxrDDGI.maxProbes = 1024;
+    level.dxrDDGI.raysPerProbe = 32;
+    level.dxrDDGI.probesPerFrame = 8;
+    level.dxrDDGI.hysteresis = 0.9f;
 
     const auto root = std::filesystem::temp_directory_path() /
                       "smallest-graphics-engine-level-tests";
@@ -66,6 +73,13 @@ int main() {
     CHECK(loaded.level.terrainSculpt.size() == 2);
     CHECK(loaded.level.terrainSculpt[1].operation ==
           TerrainSculptOperation::Flatten);
+    CHECK(loaded.level.dxrDDGI.enabled);
+    CHECK(loaded.level.dxrDDGI.surfaceSpacing == 2.5f);
+    CHECK(loaded.level.dxrDDGI.surfaceOffset == 0.4f);
+    CHECK(loaded.level.dxrDDGI.maxProbes == 1024);
+    CHECK(loaded.level.dxrDDGI.raysPerProbe == 32);
+    CHECK(loaded.level.dxrDDGI.probesPerFrame == 8);
+    CHECK(loaded.level.dxrDDGI.hysteresis == 0.9f);
 
     LevelDefinition duplicate = level;
     duplicate.entities[1].id = duplicate.entities[0].id;
@@ -82,6 +96,9 @@ int main() {
     LevelDefinition missingPrefabId = level;
     missingPrefabId.entities.back().prefabId.clear();
     CHECK(!ValidateLevel(missingPrefabId).ok);
+    LevelDefinition invalidGI = level;
+    invalidGI.dxrDDGI.maxProbes = 4096;
+    CHECK(!ValidateLevel(invalidGI).ok);
 
     std::filesystem::create_directories(root);
     const auto malformed = root / "malformed.json";
@@ -92,6 +109,15 @@ int main() {
       "schemaVersion":2,"name":"Future","terrain":{"heightScale":5},
       "entities":[]})"; }
     CHECK(!LoadLevel(future).ok);
+    const auto legacy = root / "legacy.json";
+    { std::ofstream stream(legacy); stream << R"({
+      "schemaVersion":1,"name":"Legacy","terrain":{"heightScale":5},
+      "entities":[{"id":1,"type":"player_spawn","name":"Player",
+      "transform":{"position":[0,1.7,0],"rotation":[0,0,0],
+      "scale":[1,1,1]}}]})"; }
+    LevelLoadResult legacyLoaded = LoadLevel(legacy);
+    CHECK(legacyLoaded.ok);
+    CHECK(!legacyLoaded.level.dxrDDGI.enabled);
 
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);

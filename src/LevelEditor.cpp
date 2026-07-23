@@ -720,6 +720,7 @@ void LevelEditor::SculptTerrain(CXMMATRIX view, CXMMATRIX projection,
             dirty_ = true;
             runtimeDirty_ = true;
             terrainRuntimeDirty_ = true;
+            dxrDDGIRuntimeDirty_ = true;
         }
         terrainStrokeActive_ = false;
         terrainStrokeChanged_ = false;
@@ -1501,6 +1502,62 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::TextWrapped("Hold LMB on terrain. Flatten uses height where stroke starts.");
     ImGui::End();
 
+    ImGui::Begin("DXR Lumen Lite");
+    LevelDXRDDGISettings& ddgi = level_.dxrDDGI;
+    const LevelDefinition ddgiBefore = level_;
+    bool ddgiChanged = false;
+    ddgiChanged |= ImGui::Checkbox("Enable", &ddgi.enabled);
+    ddgiChanged |= ImGui::DragFloat("Surface spacing", &ddgi.surfaceSpacing,
+        0.1f, 0.25f, 50.0f, "%.2f m");
+    ddgiChanged |= ImGui::DragFloat("Surface offset", &ddgi.surfaceOffset,
+        0.02f, 0.0f, 5.0f, "%.2f m");
+    int maximumProbes = static_cast<int>(ddgi.maxProbes);
+    if (ImGui::DragInt("Maximum probes", &maximumProbes, 8.0f, 1, 2048)) {
+        ddgi.maxProbes = static_cast<uint32_t>(maximumProbes);
+        ddgiChanged = true;
+    }
+    int raysPerProbe = static_cast<int>(ddgi.raysPerProbe);
+    if (ImGui::DragInt("Rays per probe", &raysPerProbe, 1.0f, 8, 256)) {
+        ddgi.raysPerProbe = static_cast<uint32_t>(raysPerProbe);
+        ddgiChanged = true;
+    }
+    int probesPerFrame = static_cast<int>(ddgi.probesPerFrame);
+    if (ImGui::DragInt("Probes per frame", &probesPerFrame, 1.0f, 1,
+                       static_cast<int>(ddgi.maxProbes))) {
+        ddgi.probesPerFrame = static_cast<uint32_t>(probesPerFrame);
+        ddgiChanged = true;
+    }
+    ddgiChanged |= ImGui::SliderFloat("GI intensity", &ddgi.intensity,
+        0.0f, 5.0f);
+    ddgiChanged |= ImGui::SliderFloat("Normal bias", &ddgi.normalBias,
+        0.0f, 2.0f);
+    ddgiChanged |= ImGui::SliderFloat("View bias", &ddgi.viewBias,
+        0.0f, 2.0f);
+    ddgiChanged |= ImGui::SliderFloat("Hysteresis", &ddgi.hysteresis,
+        0.0f, 0.999f, "%.3f");
+    ddgiChanged |= ImGui::SliderFloat("Multi-bounce strength",
+        &ddgi.multiBounceStrength, 0.0f, 1.0f);
+    ddgiChanged |= ImGui::Checkbox("Show probes", &ddgi.showProbes);
+    if (ddgiChanged) {
+        MarkChanged(ddgiBefore);
+        dxrDDGIRuntimeDirty_ = true;
+        actions.levelChanged = true;
+    }
+    if (ImGui::Button("Rebuild Layout"))
+        actions.rebuildDXRDDGI = true;
+    ImGui::SameLine();
+    if (ImGui::Button("Reset History"))
+        actions.resetDXRDDGIHistory = true;
+    ImGui::Separator();
+    ImGui::Text("DXR support: %s",
+        dxrDDGIStatus_.supported ? "Yes" : "No");
+    ImGui::Text("Probes: %u", dxrDDGIStatus_.probeCount);
+    ImGui::Text("Rays/frame: %u", dxrDDGIStatus_.raysPerFrame);
+    ImGui::Text("Cache: %s", dxrDDGIStatus_.cacheStatus.c_str());
+    ImGui::Text("GPU memory: %.2f MiB",
+        static_cast<double>(dxrDDGIStatus_.gpuMemoryBytes) / (1024.0 * 1024.0));
+    ImGui::End();
+
     entity = Selected();
     if (entity && entity->enabled && foliageTool_ == 0 && terrainTool_ == 0) {
         XMFLOAT4X4 world, viewMatrix, projectionMatrix;
@@ -1539,7 +1596,10 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                 if (SupportsScale(entity->type))
                     std::copy(scale, scale + 3, entity->transform.scale);
             }
-        } else if (gizmoWasUsing_) MarkChanged(gizmoBefore_);
+        } else if (gizmoWasUsing_) {
+            MarkChanged(gizmoBefore_);
+            dxrDDGIRuntimeDirty_ = true;
+        }
         gizmoWasUsing_ = usingGizmo;
     }
 

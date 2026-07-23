@@ -1366,7 +1366,7 @@ private:
 
     bool CreateComputeDescriptorHeap() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-        heapDesc.NumDescriptors = 82;
+        heapDesc.NumDescriptors = 85;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         HRESULT hr = g_dx12.device->CreateDescriptorHeap(
@@ -1604,9 +1604,9 @@ private:
         //   [9] b2 - point lights CBV
 
         D3D12_DESCRIPTOR_RANGE ranges[3] = {};
-        // SRVs t0..t75: frame/geometry, materials, IBL, and DDGI atlases.
+        // SRVs t0..t78: frame/geometry, materials, IBL, DDGI, sparse lookup.
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 76;
+        ranges[0].NumDescriptors = 79;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].RegisterSpace = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
@@ -1616,14 +1616,14 @@ private:
         ranges[1].NumDescriptors = 2;
         ranges[1].BaseShaderRegister = 0;
         ranges[1].RegisterSpace = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 76;
+        ranges[1].OffsetInDescriptorsFromTableStart = 79;
 
         // CBVs b1..b4 (lights, point lights, sky SH, DDGI)
         ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
         ranges[2].NumDescriptors = 4;
         ranges[2].BaseShaderRegister = 1;
         ranges[2].RegisterSpace = 0;
-        ranges[2].OffsetInDescriptorsFromTableStart = 78;
+        ranges[2].OffsetInDescriptorsFromTableStart = 81;
 
         D3D12_ROOT_PARAMETER resolveParams[2] = {};
 
@@ -1893,7 +1893,25 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [76] u0 - linear HDR output UAV
+        // [76..78] t76..t78 - sparse probes, hash cells, flattened indices.
+        {
+            const UINT strides[3] = {
+                sizeof(DXRProbeRecord), sizeof(DXRProbeGridCell), sizeof(UINT)
+            };
+            for (UINT i = 0; i < 3; ++i) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+                srv.Format = DXGI_FORMAT_UNKNOWN;
+                srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                srv.Shader4ComponentMapping =
+                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                srv.Buffer.NumElements = 1;
+                srv.Buffer.StructureByteStride = strides[i];
+                g_dx12.device->CreateShaderResourceView(nullptr, &srv, cpuHandle);
+                cpuHandle.ptr += descSize;
+            }
+        }
+
+        // [79] u0 - linear HDR output UAV
         {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
             uavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -1902,7 +1920,7 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [77] u1 - screen-space motion vectors
+        // [80] u1 - screen-space motion vectors
         {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
             uavDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
@@ -1912,10 +1930,10 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [78] b1 - light buffer CBV
-        // [79] b2 - point lights CBV
-        // [80] b3 - sky SH CBV
-        // [81] b4 - DDGI CBV
+        // [81] b1 - light buffer CBV
+        // [82] b2 - point lights CBV
+        // [83] b3 - sky SH CBV
+        // [84] b4 - DDGI CBV
         // These will be created in UpdateLightDescriptors
     }
 
@@ -2156,7 +2174,7 @@ public:
                                 D3D12_GPU_VIRTUAL_ADDRESS ddgiBufferAddr) {
         UINT descSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
-        cpuHandle.ptr += 78 * descSize;
+        cpuHandle.ptr += 81 * descSize;
 
         // [7] b1 - light buffer CBV
         {
@@ -2211,6 +2229,35 @@ public:
         srv.Format = visibilityResource
             ? visibilityResource->GetDesc().Format : DXGI_FORMAT_R16G16_FLOAT;
         g_dx12.device->CreateShaderResourceView(visibilityResource, &srv, handle);
+    }
+
+    void UpdateSparseDDGIResources(ID3D12Resource* probes, UINT probeCount,
+                                   ID3D12Resource* cells, UINT cellCount,
+                                   ID3D12Resource* indices, UINT indexCount) {
+        if (!computeDescHeap) return;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            computeDescHeap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(
+            g_dx12.cbvSrvUavDescriptorSize) * 76u;
+        ID3D12Resource* resources[3] = { probes, cells, indices };
+        const UINT counts[3] = {
+            (std::max)(probeCount, 1u), (std::max)(cellCount, 1u),
+            (std::max)(indexCount, 1u)
+        };
+        const UINT strides[3] = {
+            sizeof(DXRProbeRecord), sizeof(DXRProbeGridCell), sizeof(UINT)
+        };
+        for (UINT i = 0; i < 3; ++i) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_UNKNOWN;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Buffer.NumElements = counts[i];
+            srv.Buffer.StructureByteStride = strides[i];
+            g_dx12.device->CreateShaderResourceView(resources[i], &srv, handle);
+            handle.ptr += g_dx12.cbvSrvUavDescriptorSize;
+        }
     }
 
     void UpdateEnvironmentMap(ID3D12Resource* environmentResource,
