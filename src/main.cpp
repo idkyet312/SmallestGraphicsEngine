@@ -128,6 +128,8 @@ static std::unordered_set<std::string> g_prefabMeshFallbackWarnings;
 static bool                 g_prefabRebuildRequested = true;
 static bool                 g_prefabRuntimeSmokeEnabled = false;
 static bool                 g_prefabRuntimeSmokeChecked = false;
+static bool                 g_ddgiCornellTestMode = false;
+static std::shared_ptr<SceneNode> g_ddgiCornellModel;
 std::shared_ptr<SceneNode>  g_helicopterMainRotorNode;
 std::shared_ptr<SceneNode>  g_helicopterTailRotorNode;
 std::shared_ptr<SceneNode>  g_humveeTurretNode;
@@ -1636,14 +1638,15 @@ static bool BuildDXRDDGIAccelerationScene() {
             DXRDDGIStringHash(batch.prefabId), batch.baseTransforms,
             batch.entityIds, nodeOrdinal, commandList.Get(), instances);
     }
-    if (wallModel) {
+    if (wallModel && !g_ddgiCornellTestMode) {
         uint32_t nodeOrdinal = 0;
         const std::vector<XMMATRIX> worlds{ XMMatrixIdentity() };
         const std::vector<uint64_t> ids{ 0x484f555345ull };
         BuildDXRDDGINodeScene(wallModel, 0x484f555345ull, worlds, ids,
             nodeOrdinal, commandList.Get(), instances);
     }
-    if (scene.useMeshTerrain && g_terrain.supported) {
+    if (scene.useMeshTerrain && g_terrain.supported &&
+        !g_ddgiCornellTestMode) {
         auto params = CurrentTerrainParams();
         params.heightScale = scene.terrainHeightScale;
         const float width = params.tilesX * params.tileSize;
@@ -1714,12 +1717,13 @@ static bool RebuildDXRDDGIProbeLayout(bool force) {
                 entityId, geometryHash, triangles, primitiveOrdinal);
         }
     }
-    if (wallModel) {
+    if (wallModel && !g_ddgiCornellTestMode) {
         uint32_t primitiveOrdinal = 0;
         AppendDXRDDGINodeTriangles(wallModel, XMMatrixIdentity(),
             0x484f555345ull, geometryHash, triangles, primitiveOrdinal);
     }
-    if (scene.useMeshTerrain && g_terrain.supported)
+    if (scene.useMeshTerrain && g_terrain.supported &&
+        !g_ddgiCornellTestMode)
         AppendDXRDDGITerrain(triangles, geometryHash);
     const std::filesystem::path cache = std::filesystem::path("levels") /
         ".ddgi" / (std::to_string(geometryHash) + ".ddgi");
@@ -2691,6 +2695,81 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
     return &inserted.first->second;
 }
 
+static std::shared_ptr<SceneNode> CreateDDGICornellBoxModel() {
+    auto root = std::make_shared<SceneNode>("DDGI Cornell Box");
+    const auto material = [](const char* name, const XMFLOAT3& color) {
+        auto value = std::make_shared<SceneMaterial>();
+        value->name = name;
+        value->baseColorFactor = XMFLOAT4(color.x, color.y, color.z, 1.0f);
+        value->metallicFactor = 0.0f;
+        value->roughnessFactor = 0.88f;
+        return value;
+    };
+    const auto white = material("Cornell White", { 0.78f, 0.78f, 0.74f });
+    const auto red = material("Cornell Red", { 0.72f, 0.055f, 0.035f });
+    const auto green = material("Cornell Green", { 0.045f, 0.50f, 0.085f });
+
+    const auto addBox = [&](const char* name,
+                            const std::shared_ptr<SceneMaterial>& boxMaterial,
+                            float x0, float x1, float y0, float y1,
+                            float z0, float z1) {
+        auto node = std::make_shared<SceneNode>(name);
+        node->mesh = std::make_shared<SceneMesh>();
+        MeshPrimitive primitive;
+        primitive.material = boxMaterial;
+        const auto quad = [&](const XMFLOAT3& a, const XMFLOAT3& b,
+                              const XMFLOAT3& c, const XMFLOAT3& d,
+                              const XMFLOAT3& normal,
+                              const XMFLOAT3& tangent) {
+            const UINT base = static_cast<UINT>(primitive.vertices.size() / 12u);
+            const XMFLOAT3 points[4] = { a, b, c, d };
+            constexpr float uv[4][2] = { {0,0}, {1,0}, {1,1}, {0,1} };
+            for (UINT i = 0; i < 4; ++i) {
+                const float vertex[12] = {
+                    points[i].x, points[i].y, points[i].z,
+                    normal.x, normal.y, normal.z, uv[i][0], uv[i][1],
+                    tangent.x, tangent.y, tangent.z, 1.0f
+                };
+                primitive.vertices.insert(
+                    primitive.vertices.end(), vertex, vertex + 12);
+            }
+            primitive.indices.insert(primitive.indices.end(),
+                { base, base + 1, base + 2, base, base + 2, base + 3 });
+        };
+        quad({x0,y0,z1},{x1,y0,z1},{x1,y1,z1},{x0,y1,z1},
+             {0,0,1}, {1,0,0});
+        quad({x1,y0,z0},{x0,y0,z0},{x0,y1,z0},{x1,y1,z0},
+             {0,0,-1}, {-1,0,0});
+        quad({x0,y0,z0},{x0,y0,z1},{x0,y1,z1},{x0,y1,z0},
+             {-1,0,0}, {0,0,1});
+        quad({x1,y0,z1},{x1,y0,z0},{x1,y1,z0},{x1,y1,z1},
+             {1,0,0}, {0,0,-1});
+        quad({x0,y1,z1},{x1,y1,z1},{x1,y1,z0},{x0,y1,z0},
+             {0,1,0}, {1,0,0});
+        quad({x0,y0,z0},{x1,y0,z0},{x1,y0,z1},{x0,y0,z1},
+             {0,-1,0}, {1,0,0});
+        if (!GLBImporter::BuildMeshletData(
+                primitive, g_dx12.device.Get(), true))
+            return;
+        node->mesh->primitives.push_back(std::move(primitive));
+        root->AddChild(node);
+    };
+
+    // Open front faces +Z. Thin closed slabs keep raster and DXR winding robust.
+    addBox("Floor", white, -4.0f, 4.0f, 0.02f, 0.14f, 0.0f, 8.0f);
+    addBox("Ceiling", white, -4.0f, 4.0f, 7.0f, 7.12f, 0.0f, 8.0f);
+    addBox("Back", white, -4.0f, 4.0f, 0.02f, 7.12f, 7.88f, 8.0f);
+    addBox("Red Wall", red, -4.12f, -4.0f, 0.02f, 7.12f, 0.0f, 8.0f);
+    addBox("Green Wall", green, 4.0f, 4.12f, 0.02f, 7.12f, 0.0f, 8.0f);
+    addBox("Short Block", white, -2.7f, -0.25f, 0.14f, 2.5f, 3.8f, 6.2f);
+    addBox("Tall Block", white, 0.65f, 2.85f, 0.14f, 4.4f, 4.7f, 6.8f);
+
+    XMFLOAT4X4 identity;
+    XMStoreFloat4x4(&identity, XMMatrixIdentity());
+    root->UpdateGlobalTransform(identity);
+    return root;
+}
+
 static void RebuildPrefabRenderBatches() {
     g_prefabRenderBatches.clear();
     g_prefabColliders.clear();
@@ -2845,7 +2924,29 @@ static void RebuildPrefabRenderBatches() {
             XMMatrixTranslation(t.position[0], t.position[1], t.position[2]);
         addInstance(addInstance, prefabId, world, entity.id, entity.overrides, 0);
     }
+    if (g_ddgiCornellTestMode) {
+        const bool createModel = !g_ddgiCornellModel;
+        if (createModel)
+            g_ddgiCornellModel = CreateDDGICornellBoxModel();
+        if (createModel && g_ddgiCornellModel)
+            FlushStaticBufferUploadsDX12(g_dx12.commandList.Get());
+        if (g_ddgiCornellModel) {
+            PrefabRenderBatch batch;
+            batch.prefabId = "__ddgi_cornell_box";
+            batch.model = g_ddgiCornellModel;
+            batch.baseModel = g_ddgiCornellModel;
+            batch.baseTransforms.push_back(XMMatrixIdentity());
+            batch.transforms.push_back(XMMatrixIdentity());
+            batch.entityIds.push_back(0x434f524e454c4cull);
+            g_prefabRenderBatches.push_back(std::move(batch));
+        }
+    }
     scene.RebuildDemoLights();
+    if (g_ddgiCornellTestMode) {
+        scene.clusteredRenderer.clearLights();
+        scene.clusteredRenderer.addLight(
+            { 0.0f, 6.15f, 3.25f }, { 1.0f, 0.88f, 0.70f }, 12.0f, 18.0f);
+    }
     for (const PrefabLightInstance& light : g_prefabLightInstances)
         scene.clusteredRenderer.addLight(light.position, light.color,
                                          light.radius, light.intensity);
@@ -3216,6 +3317,13 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
                           bool emptyLevel = false,
                           const LevelDefinition* customLevel = nullptr,
                           bool startWithUIAndMobileControls = false) {
+    const bool wasCornellTest = g_ddgiCornellTestMode;
+    g_ddgiCornellTestMode = customLevel &&
+        customLevel->name == "DXR DDGI Cornell Box";
+    if (g_ddgiCornellTestMode)
+        scene.ambientStrength = 0.015f;
+    else if (wasCornellTest)
+        scene.ambientStrength = 0.07f;
     gameScreen = GameScreen::Level1;
     g_customLevelMode = !stressTest && !emptyLevel;
     if (customLevel) {
@@ -3326,6 +3434,34 @@ static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path) {
     StartLevelOne(hwnd, false, false, false, &loaded.level);
 }
 
+static void StartDDGICornellTest(HWND hwnd) {
+    LevelDefinition level;
+    level.name = "DXR DDGI Cornell Box";
+    level.terrainHeightScale = 0.0f;
+    level.dxrDDGI.enabled = true;
+    level.dxrDDGI.surfaceSpacing = 0.8f;
+    level.dxrDDGI.surfaceOffset = 0.22f;
+    level.dxrDDGI.maxProbes = 768;
+    level.dxrDDGI.raysPerProbe = 64;
+    level.dxrDDGI.probesPerFrame = 24;
+    level.dxrDDGI.intensity = 1.0f;
+    level.dxrDDGI.normalBias = 0.12f;
+    level.dxrDDGI.viewBias = 0.04f;
+    level.dxrDDGI.hysteresis = 0.94f;
+    level.dxrDDGI.multiBounceStrength = 0.45f;
+    level.dxrDDGI.showProbes = false;
+    LevelEntity player;
+    player.id = 0x434f524e454c4c01ull;
+    player.type = LevelEntityType::PlayerSpawn;
+    player.name = "Cornell Camera";
+    player.transform.position[0] = 0.0f;
+    player.transform.position[1] = 3.2f;
+    player.transform.position[2] = -6.5f;
+    player.transform.rotation[1] = 180.0f;
+    level.entities.push_back(player);
+    StartLevelOne(hwnd, true, false, false, &level);
+}
+
 static void BrowseAndStartCustomLevel(HWND hwnd) {
     std::error_code error;
     std::filesystem::create_directories("levels", error);
@@ -3367,7 +3503,7 @@ static void RenderMainMenu(HWND hwnd) {
         ImVec2(0, 0), display, IM_COL32(5, 9, 12, 225));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    const float menuHeight = (std::min)(650.0f, display.y - 24.0f);
+    const float menuHeight = (std::min)(730.0f, display.y - 24.0f);
     ImGui::SetNextWindowSize(ImVec2(430.0f, menuHeight), ImGuiCond_Always);
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -3393,6 +3529,10 @@ static void RenderMainMenu(HWND hwnd) {
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("LEVEL EDITOR", ImVec2(300.0f, 58.0f)))
         StartLevelEditor(hwnd);
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    ImGui::SetCursorPosX(65.0f);
+    if (ImGui::Button("DXR DDGI CORNELL BOX", ImVec2(300.0f, 58.0f)))
+        StartDDGICornellTest(hwnd);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     ImGui::SetCursorPosX(65.0f);
     if (ImGui::Button("CUSTOM LEVELS", ImVec2(300.0f, 58.0f)))
@@ -6734,18 +6874,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 << "BeginFrame: " << e.what() << '\n';
             std::cerr << "BeginFrame: " << e.what() << "\n"; break;
         }
-        if (IsSceneScreen() && g_prefabRebuildRequested)
+        if (IsSceneScreen() && g_prefabRebuildRequested) {
             RebuildPrefabRenderBatches();
+            if (g_ddgiCornellTestMode) {
+                g_dxrDDGI.MarkLayoutDirty();
+                RebuildDXRDDGIProbeLayout(true);
+            }
+        }
         // Editor buttons are processed here, before any scene pass binds the
         // old probe atlases. Rebuilding from the late ImGui phase destroyed
         // resources still referenced by the open frame command list.
-        if (gameScreen == GameScreen::LevelEditor &&
+        if ((gameScreen == GameScreen::LevelEditor ||
+             g_ddgiCornellTestMode) &&
             pendingDXRDDGIRebuild) {
             pendingDXRDDGIRebuild = false;
-            g_runtimeLevel = g_levelEditor.Level();
+            if (gameScreen == GameScreen::LevelEditor)
+                g_runtimeLevel = g_levelEditor.Level();
             g_dxrDDGI.MarkLayoutDirty();
             RebuildDXRDDGIProbeLayout(true);
-            g_levelEditor.MarkDXRDDGIRuntimeSynchronized();
+            if (gameScreen == GameScreen::LevelEditor)
+                g_levelEditor.MarkDXRDDGIRuntimeSynchronized();
         }
         if (pendingDXRDDGIHistoryReset) {
             pendingDXRDDGIHistoryReset = false;
@@ -7473,6 +7621,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (g_levelEditor.IsPlaying()) RenderPlayerHUD(scene);
         } else {
             RenderPlayerHUD(scene);
+            if (g_ddgiCornellTestMode) {
+                const DXRDDGIRenderer::Status& status = g_dxrDDGI.GetStatus();
+                ImGui::SetNextWindowPos(ImVec2(18.0f, 18.0f), ImGuiCond_Always);
+                ImGui::SetNextWindowBgAlpha(0.82f);
+                ImGui::Begin("DDGI Cornell Status", nullptr,
+                    ImGuiWindowFlags_AlwaysAutoResize |
+                    ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_NoCollapse |
+                    ImGuiWindowFlags_NoInputs);
+                ImGui::TextColored(
+                    status.updatesActive ? ImVec4(0.25f, 1.0f, 0.35f, 1.0f)
+                                         : ImVec4(1.0f, 0.35f, 0.2f, 1.0f),
+                    status.updatesActive ? "DXR DDGI: UPDATING"
+                                         : "DXR DDGI: UNAVAILABLE");
+                ImGui::Text("Probes: %u   Rays/frame: %u",
+                    status.probeCount, status.raysPerFrame);
+                ImGui::TextDisabled("Low ambient exposes indirect bounce.");
+                ImGui::End();
+            }
             if (!scene.playerGodMode && scene.playerHealth <= 0.0f) {
                 RenderDeathScreen(hwnd);
             } else {
