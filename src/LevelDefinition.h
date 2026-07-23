@@ -63,6 +63,7 @@ struct LevelDXRDDGISettings {
     uint32_t maxProbes = 2048;
     uint32_t raysPerProbe = 64;
     uint32_t probesPerFrame = 16;
+    float maxRayDistance = 24.0f;
     float intensity = 0.45f;
     float normalBias = 0.18f;
     float viewBias = 0.05f;

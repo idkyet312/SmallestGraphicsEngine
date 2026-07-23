@@ -231,6 +231,7 @@ struct Scene {
     // Dynamic diffuse probe grid for low-frequency bounced lighting.
     bool  useDDGI      = true;
     float giIntensity  = 0.45f;
+    float giMaxDistance = 24.0f;
     float normalBias   = 0.18f;
     float probeSpacing = 5.0f;
     bool  showProbes   = false;

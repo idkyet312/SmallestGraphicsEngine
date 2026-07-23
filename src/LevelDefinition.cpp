@@ -162,8 +162,10 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         gi.surfaceSpacing > 50.0f || !std::isfinite(gi.surfaceOffset) ||
         gi.surfaceOffset < 0.0f || gi.surfaceOffset > 5.0f ||
         gi.maxProbes == 0 || gi.maxProbes > 2048 ||
-        gi.raysPerProbe < 8 || gi.raysPerProbe > 256 ||
+        gi.raysPerProbe < 8 || gi.raysPerProbe > 64 ||
         gi.probesPerFrame == 0 || gi.probesPerFrame > gi.maxProbes ||
+        !std::isfinite(gi.maxRayDistance) || gi.maxRayDistance < 1.0f ||
+        gi.maxRayDistance > 200.0f ||
         !std::isfinite(gi.intensity) || gi.intensity < 0.0f ||
         gi.intensity > 5.0f || !std::isfinite(gi.normalBias) ||
         gi.normalBias < 0.0f || gi.normalBias > 2.0f ||
@@ -247,6 +249,8 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
                 source.value("raysPerProbe", 64u);
             level.dxrDDGI.probesPerFrame =
                 source.value("probesPerFrame", 16u);
+            level.dxrDDGI.maxRayDistance =
+                source.value("maxRayDistance", 24.0f);
             level.dxrDDGI.intensity = source.value("intensity", 0.45f);
             level.dxrDDGI.normalBias = source.value("normalBias", 0.18f);
             level.dxrDDGI.viewBias = source.value("viewBias", 0.05f);
@@ -347,6 +351,7 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
                 {"maxProbes", level.dxrDDGI.maxProbes},
                 {"raysPerProbe", level.dxrDDGI.raysPerProbe},
                 {"probesPerFrame", level.dxrDDGI.probesPerFrame},
+                {"maxRayDistance", level.dxrDDGI.maxRayDistance},
                 {"intensity", level.dxrDDGI.intensity},
                 {"normalBias", level.dxrDDGI.normalBias},
                 {"viewBias", level.dxrDDGI.viewBias},

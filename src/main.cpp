@@ -1700,6 +1700,7 @@ static bool BuildDXRDDGIAccelerationScene() {
 
 static bool RebuildDXRDDGIProbeLayout(bool force) {
     g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
+    scene.giMaxDistance = g_runtimeLevel.dxrDDGI.maxRayDistance;
     if (!g_runtimeLevel.dxrDDGI.enabled) return false;
     if (!force && !g_dxrDDGI.LayoutDirty()) return true;
     // Probe/atlas buffers may still be referenced by an older in-flight frame.
@@ -3274,6 +3275,7 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
     scene.useDDGI = g_runtimeLevel.dxrDDGI.enabled &&
                     g_dxrDDGI.GetStatus().dxrSupported;
     scene.giIntensity = g_runtimeLevel.dxrDDGI.intensity;
+    scene.giMaxDistance = g_runtimeLevel.dxrDDGI.maxRayDistance;
     scene.normalBias = g_runtimeLevel.dxrDDGI.normalBias;
     scene.probeSpacing = g_runtimeLevel.dxrDDGI.surfaceSpacing;
     scene.explosiveBarrels.clear();
@@ -3463,6 +3465,7 @@ static void StartDDGICornellTest(HWND hwnd) {
     level.dxrDDGI.maxProbes = 768;
     level.dxrDDGI.raysPerProbe = 64;
     level.dxrDDGI.probesPerFrame = 24;
+    level.dxrDDGI.maxRayDistance = 18.0f;
     level.dxrDDGI.intensity = 1.0f;
     level.dxrDDGI.normalBias = 0.12f;
     level.dxrDDGI.viewBias = 0.04f;
@@ -3480,7 +3483,7 @@ static void StartDDGICornellTest(HWND hwnd) {
     level.entities.push_back(player);
     // Empty runtime suppresses gameplay actors, foliage, houses, ocean clutter,
     // and stale full-level objects while custom-level mode keeps DDGI enabled.
-    StartLevelOne(hwnd, true, false, true, &level);
+    StartLevelOne(hwnd, true, false, true, &level, true);
     scene.gun.visible = false;
 }
 
@@ -6930,6 +6933,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         static uint32_t dxrDDGIFrame = 0;
         if (g_runtimeLevel.dxrDDGI.enabled) {
+            if (std::abs(g_runtimeLevel.dxrDDGI.maxRayDistance -
+                         scene.giMaxDistance) > 0.001f) {
+                g_runtimeLevel.dxrDDGI.maxRayDistance =
+                    std::clamp(scene.giMaxDistance, 1.0f, 200.0f);
+                g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
+            }
             if (g_dxrDDGI.HistoryDirty()) g_dxrDDGI.ResetHistory();
             ComPtr<ID3D12GraphicsCommandList4> dxrDDGICommands;
             if (SUCCEEDED(g_dx12.commandList.As(&dxrDDGICommands))) {
