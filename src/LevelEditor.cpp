@@ -1519,7 +1519,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         ddgiChanged = true;
     }
     int raysPerProbe = static_cast<int>(ddgi.raysPerProbe);
-    if (ImGui::DragInt("Rays per probe", &raysPerProbe, 1.0f, 8, 256)) {
+    if (ImGui::DragInt("Rays per probe", &raysPerProbe, 1.0f, 8, 64)) {
         ddgi.raysPerProbe = static_cast<uint32_t>(raysPerProbe);
         ddgiChanged = true;
     }
@@ -1529,6 +1529,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         ddgi.probesPerFrame = static_cast<uint32_t>(probesPerFrame);
         ddgiChanged = true;
     }
+    ddgiChanged |= ImGui::DragFloat("Ray distance",
+        &ddgi.maxRayDistance, 0.5f, 1.0f, 200.0f, "%.1f m");
     ddgiChanged |= ImGui::SliderFloat("GI intensity", &ddgi.intensity,
         0.0f, 5.0f);
     ddgiChanged |= ImGui::SliderFloat("Normal bias", &ddgi.normalBias,

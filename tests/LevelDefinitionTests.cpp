@@ -49,6 +49,7 @@ int main() {
     level.dxrDDGI.maxProbes = 1024;
     level.dxrDDGI.raysPerProbe = 32;
     level.dxrDDGI.probesPerFrame = 8;
+    level.dxrDDGI.maxRayDistance = 42.0f;
     level.dxrDDGI.hysteresis = 0.9f;
 
     const auto root = std::filesystem::temp_directory_path() /
@@ -79,6 +80,7 @@ int main() {
     CHECK(loaded.level.dxrDDGI.maxProbes == 1024);
     CHECK(loaded.level.dxrDDGI.raysPerProbe == 32);
     CHECK(loaded.level.dxrDDGI.probesPerFrame == 8);
+    CHECK(loaded.level.dxrDDGI.maxRayDistance == 42.0f);
     CHECK(loaded.level.dxrDDGI.hysteresis == 0.9f);
 
     LevelDefinition duplicate = level;

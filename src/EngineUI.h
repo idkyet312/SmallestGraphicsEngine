@@ -537,6 +537,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ImGui::Text("Probes: %u  Hash cells: %u",
                             g_dxrDDGIProbeCount, g_dxrDDGICellCount);
                 ImGui::Text("Cell size: %.2f m", g_dxrDDGICellSize);
+                ImGui::DragFloat("Ray Distance", &scene.giMaxDistance,
+                                 0.5f, 1.0f, 200.0f, "%.1f m");
                 ImGui::TextDisabled(
                     "Spacing changes require Level Editor > Rebuild Layout");
             } else {

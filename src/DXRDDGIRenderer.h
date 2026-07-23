@@ -38,6 +38,7 @@ public:
             value.maxProbes != settings_.maxProbes;
         const bool historyChanged = value.hysteresis != settings_.hysteresis ||
             value.multiBounceStrength != settings_.multiBounceStrength ||
+            value.maxRayDistance != settings_.maxRayDistance ||
             value.intensity != settings_.intensity ||
             value.normalBias != settings_.normalBias ||
             value.viewBias != settings_.viewBias;
@@ -174,7 +175,7 @@ public:
         constants.hysteresis = historyValid_ ? settings_.hysteresis : 0.0f;
         constants.multiBounceStrength = historyValid_
             ? settings_.multiBounceStrength : 0.0f;
-        constants.maxRayDistance = settings_.surfaceSpacing * 8.0f;
+        constants.maxRayDistance = settings_.maxRayDistance;
         constants.surfaceBias = (std::max)(settings_.normalBias, 0.02f);
         constants.sunDirection = sunDirection;
         constants.sunIntensity = sunIntensity;
