@@ -116,7 +116,11 @@ public:
                       const DirectX::XMFLOAT3& sunDirection,
                       const DirectX::XMFLOAT3& sunColor,
                       float sunIntensity = 1.0f,
-                      float skyIntensity = 1.0f) {
+                      float skyIntensity = 1.0f,
+                      const DirectX::XMFLOAT3& pointLightPosition = {},
+                      const DirectX::XMFLOAT3& pointLightColor = {},
+                      float pointLightRadius = 0.0f,
+                      float pointLightIntensity = 0.0f) {
         if (!settings_.enabled || !status_.dxrSupported ||
             !pipelineReady_ || !commandList || !scene_.TLAS() ||
             layout_.probes.empty() || historyDirty_)
@@ -181,6 +185,10 @@ public:
         constants.sunIntensity = sunIntensity;
         constants.sunColor = sunColor;
         constants.skyIntensity = skyIntensity;
+        constants.pointLightPosition = pointLightPosition;
+        constants.pointLightRadius = pointLightRadius;
+        constants.pointLightColor = pointLightColor;
+        constants.pointLightIntensity = pointLightIntensity;
         *mappedConstants_ = constants;
 
         commandList->SetPipelineState1(stateObject_.Get());
@@ -332,6 +340,10 @@ private:
         float sunIntensity = 1.0f;
         DirectX::XMFLOAT3 sunColor = { 1.0f, 1.0f, 1.0f };
         float skyIntensity = 1.0f;
+        DirectX::XMFLOAT3 pointLightPosition = {};
+        float pointLightRadius = 0.0f;
+        DirectX::XMFLOAT3 pointLightColor = {};
+        float pointLightIntensity = 0.0f;
     };
     ProbeConstants* mappedConstants_ = nullptr;
 

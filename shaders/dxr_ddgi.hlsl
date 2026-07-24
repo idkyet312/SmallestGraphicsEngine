@@ -31,6 +31,10 @@ cbuffer ProbeConstants : register(b0) {
     float sunIntensity;
     float3 sunColor;
     float skyIntensity;
+    float3 pointLightPosition;
+    float pointLightRadius;
+    float3 pointLightColor;
+    float pointLightIntensity;
 };
 
 struct RadiancePayload {
@@ -131,18 +135,31 @@ void SurfaceClosestHit(inout RadiancePayload payload,
     float3 baseColor = float3(0.72, 0.70, 0.66);
     float3 hit = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
     float3 lightDirection = normalize(-sunDirection);
+    float lightDistance = maxRayDistance;
+    float3 directRadiance = sunColor * sunIntensity;
+    if (pointLightIntensity > 0.0 && pointLightRadius > 0.0) {
+        float3 toLight = pointLightPosition - hit;
+        lightDistance = length(toLight);
+        lightDirection = toLight / max(lightDistance, 1e-4);
+        float range = saturate(1.0 - lightDistance / pointLightRadius);
+        float attenuation = range * range /
+            max(1.0 + 4.5 * lightDistance / pointLightRadius +
+                75.0 * lightDistance * lightDistance /
+                    (pointLightRadius * pointLightRadius), 1e-4);
+        directRadiance = pointLightColor * pointLightIntensity * attenuation;
+    }
     ShadowPayload shadow = { 0 };
     RayDesc shadowRay;
     shadowRay.Origin = hit + normal * surfaceBias;
     shadowRay.Direction = lightDirection;
     shadowRay.TMin = 0.02;
-    shadowRay.TMax = maxRayDistance;
+    shadowRay.TMax = min(maxRayDistance, max(lightDistance - 0.04, 0.02));
     TraceRay(StaticScene,
         RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
         RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xff, 0, 0, 1,
         shadowRay, shadow);
     float diffuse = saturate(dot(normal, lightDirection));
-    payload.radiance = baseColor * sunColor * sunIntensity *
+    payload.radiance = baseColor * directRadiance *
                        diffuse * shadow.visible;
     payload.distance = RayTCurrent();
 }

@@ -198,10 +198,10 @@ struct Scene {
     float volumetricFogDistance = 120.0f;
     XMFLOAT3 volumetricFogTint = { 0.72f, 0.84f, 1.0f };
     bool  enableAmbientOcclusion = true;
-    float ambientOcclusionRadius = 0.60f;
+    float ambientOcclusionRadius = 0.12f;
     float ambientOcclusionStrength = 1.96f;
     float ambientOcclusionBias = 0.035f;
-    float contactShadowStrength = 0.19f;
+    float contactShadowStrength = 0.0f;
     int   destructionGridX = 4;
     int   destructionGridY = 3;
     int   destructionGridZ = 4;
