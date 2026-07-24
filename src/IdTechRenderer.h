@@ -913,11 +913,12 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         LightBufferDX12 lb = {};
         lb.lightPos = scene.lightPos;
         lb.lightType = scene.lightType;
-        lb.lightColor = scene.lightColor;
+        lb.lightColor = scene.EffectiveLightColor();
         lb.constant = scene.lightConstant;
         lb.linear = scene.lightLinear;
         lb.quadratic = scene.lightQuadratic;
         lb.ambientStrength = scene.ambientStrength;
+        lb.ambientLightingIntensity = scene.ambientLightingIntensity;
         lb.specularStrength = scene.specularStrength;
         lb.shininess = scene.specularShininess;
         lb.shadowBias = scene.shadowBias;
@@ -949,7 +950,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         mainLight.lightPos = scene.lightPos;
         mainLight.lightType = scene.lightType;
         mainLight.lightColor = scene.lightColor;
-        mainLight.intensity = 1.0f;
+        mainLight.intensity = scene.directionalLightIntensity;
         mainLight.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
         mainLight.shadowBias = scene.shadowBias;
         mainLight.enableShadows = scene.enableShadows && shadowResource ? 1 : 0;

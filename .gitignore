@@ -52,6 +52,13 @@ models/textures/*
 !models/terrain/
 !models/terrain/leafy_grass/
 !models/terrain/leafy_grass/**
+!models/Grass3/
+models/Grass3/*
+!models/Grass3/Grass004_2K-JPG/
+!models/Grass3/Grass004_2K-JPG/Grass004_2K-JPG_Color.jpg
+!models/Grass3/Grass004_2K-JPG/Grass004_2K-JPG_NormalGL.jpg
+!models/Grass3/Grass004_2K-JPG/Grass004_2K-JPG_Roughness.jpg
+!models/Grass3/Grass004_2K-JPG/Grass004_2K-JPG_AmbientOcclusion.jpg
 !models/fbx_Dandelion/
 !models/fbx_Dandelion/**
 !models/Rock1/

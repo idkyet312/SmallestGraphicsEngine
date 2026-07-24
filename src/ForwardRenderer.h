@@ -843,9 +843,11 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         g_dxrDDGIIndexResource, g_dxrDDGIProbeCount,
         g_dxrDDGICellCount, g_dxrDDGIIndexCount);
 
-    shader.SetLight(scene.lightPos, scene.lightType, scene.lightColor,
+    shader.SetLight(scene.lightPos, scene.lightType,
+                    scene.EffectiveLightColor(),
                     scene.lightConstant, scene.lightLinear, scene.lightQuadratic,
-                    scene.ambientStrength, scene.specularStrength, scene.specularShininess,
+                    scene.ambientStrength, scene.ambientLightingIntensity,
+                    scene.specularStrength, scene.specularShininess,
                     scene.shadowBias, scene.enableShadows && shadowMap != nullptr,
                     shadowMap ? 1.0f / (float)shadowMap->GetDesc().Width
                               : 1.0f / 2048.0f);
@@ -891,7 +893,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         mainLight.lightPos = scene.lightPos;
         mainLight.lightType = scene.lightType;
         mainLight.lightColor = scene.lightColor;
-        mainLight.intensity = 1.0f;
+        mainLight.intensity = scene.directionalLightIntensity;
         mainLight.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
         mainLight.shadowBias = scene.shadowBias;
         mainLight.enableShadows = scene.enableShadows && shadowMap ? 1 : 0;

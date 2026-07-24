@@ -558,7 +558,8 @@ public:
         };
         auto loadTerrainSlice = [&](const char* folder, const char* file,
                                     UINT layer, std::vector<uint8_t>& target,
-                                    bool normalSource, bool roughnessSource) {
+                                    bool normalSource, bool roughnessSource,
+                                    bool ambientOcclusionSource = false) {
             std::vector<unsigned char> source;
             int width = 0, heightPixels = 0;
             if (!GLBImporter::LoadPixelsRGBA(
@@ -585,7 +586,10 @@ public:
                 const size_t destination =
                     static_cast<size_t>(layer) * layerBytes +
                     (static_cast<size_t>(y) * side + x) * 4;
-                if (roughnessSource) {
+                if (ambientOcclusionSource) {
+                    target[destination + 0] =
+                        static_cast<uint8_t>(sums[0] / count);
+                } else if (roughnessSource) {
                     target[destination + 0] = 255;
                     target[destination + 1] = static_cast<uint8_t>(sums[0] / count);
                     target[destination + 2] = 0;
@@ -618,16 +622,20 @@ public:
             const char* albedo;
             const char* normal;
             const char* roughness;
+            const char* ambientOcclusion;
         };
         static constexpr TerrainAsset assets[layers] = {
-            { "terrain/leafy_grass", "leafy_grass_diff_1k.png",
-              "leafy_grass_nor_gl_1k.png", "leafy_grass_rough_1k.png" },
+            { "Grass3/Grass004_2K-JPG", "Grass004_2K-JPG_Color.jpg",
+              "Grass004_2K-JPG_NormalGL.jpg",
+              "Grass004_2K-JPG_Roughness.jpg",
+              "Grass004_2K-JPG_AmbientOcclusion.jpg" },
             { "terrain/dirt_floor", "dirt_floor_diff_1k.png",
-              "dirt_floor_nor_gl_1k.png", "dirt_floor_rough_1k.png" },
+              "dirt_floor_nor_gl_1k.png", "dirt_floor_rough_1k.png", nullptr },
             { "terrain/coast_sand_01", "coast_sand_01_diff_1k.png",
-              "coast_sand_01_nor_gl_1k.png", "coast_sand_01_rough_1k.png" },
+              "coast_sand_01_nor_gl_1k.png",
+              "coast_sand_01_rough_1k.png", nullptr },
             { "terrain/dark_rock", "dark_rock_diff_1k.png",
-              "dark_rock_nor_gl_1k.png", "dark_rock_rough_1k.png" }
+              "dark_rock_nor_gl_1k.png", "dark_rock_rough_1k.png", nullptr }
         };
         for (UINT layer = 0; layer < layers; ++layer) {
             const bool albedoLoaded = loadTerrainSlice(
@@ -639,11 +647,17 @@ public:
             const bool roughnessLoaded = loadTerrainSlice(
                 assets[layer].folder, assets[layer].roughness, layer,
                 maps[2], false, true);
-            if (!albedoLoaded || !normalLoaded || !roughnessLoaded) {
+            const bool aoLoaded = !assets[layer].ambientOcclusion ||
+                loadTerrainSlice(assets[layer].folder,
+                    assets[layer].ambientOcclusion, layer,
+                    maps[2], false, false, true);
+            if (!albedoLoaded || !normalLoaded || !roughnessLoaded ||
+                !aoLoaded) {
                 std::cerr << "Terrain PBR: " << assets[layer].folder
                           << " maps missing (albedo=" << albedoLoaded
                           << ", normal=" << normalLoaded
                           << ", roughness=" << roughnessLoaded
+                          << ", ao=" << aoLoaded
                           << "); using generated fallback slice\n";
             }
         }

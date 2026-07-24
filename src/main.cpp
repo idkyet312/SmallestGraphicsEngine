@@ -6037,14 +6037,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         const HDRISunLight hdriSun =
             GLBImporter::ExtractHDRISunLight(kSkyEnvironmentPath, 2.1f);
         if (hdriSun.valid) {
-            constexpr float DirectionScale = 10.0f;
-            scene.lightPos = {
-                hdriSun.direction.x * DirectionScale,
-                hdriSun.direction.y * DirectionScale,
-                hdriSun.direction.z * DirectionScale
-            };
-            scene.lightColor = hdriSun.color;
-            std::cout << "HDRI sun aligned: direction=("
+            std::cout << "HDRI sun analyzed (scene defaults retained): direction=("
                       << hdriSun.direction.x << ", "
                       << hdriSun.direction.y << ", "
                       << hdriSun.direction.z << ") color=("
@@ -6984,7 +6977,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_dxrDDGI.UpdateProbes(
                     dxrDDGICommands.Get(), ++dxrDDGIFrame,
                     raySunDirection, scene.lightColor,
-                    g_ddgiCornellTestMode ? 0.0f : 1.0f,
+                    g_ddgiCornellTestMode
+                        ? 0.0f : scene.directionalLightIntensity,
                     g_ddgiCornellTestMode ? 0.0f : 1.0f,
                     g_ddgiCornellTestMode
                         ? g_ddgiCornellLightPosition : XMFLOAT3{},

@@ -316,8 +316,11 @@ private:
         XMStoreFloat3(&sunDirection, sun);
         constants.sunDirectionDensity = { sunDirection.x, sunDirection.y, sunDirection.z,
             scene.volumetricFogDensity };
-        constants.sunColorAnisotropy = { scene.lightColor.x, scene.lightColor.y,
-            scene.lightColor.z, scene.volumetricFogAnisotropy };
+        const XMFLOAT3 effectiveLightColor = scene.EffectiveLightColor();
+        constants.sunColorAnisotropy = {
+            effectiveLightColor.x, effectiveLightColor.y,
+            effectiveLightColor.z, scene.volumetricFogAnisotropy
+        };
         constants.fogParams = { scene.volumetricFogHeightFalloff,
             scene.volumetricFogBaseHeight, scene.volumetricFogDistance,
             shadowResource ? 1.0f : 0.0f };
