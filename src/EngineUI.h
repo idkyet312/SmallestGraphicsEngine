@@ -373,6 +373,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     if (ImGui::CollapsingHeader("Light Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::DragFloat3("Light Position", &scene.lightPos.x, 0.1f);
         ImGui::ColorEdit3("Light Color", &scene.lightColor.x);
+        ImGui::SliderFloat("Directional Intensity",
+                           &scene.directionalLightIntensity,
+                           0.0f, 20.0f, "%.2f");
+        ImGui::SliderFloat("Base Ambient",
+                           &scene.ambientLightingIntensity,
+                           0.0f, 2.0f, "%.3f");
         ImGui::Checkbox("Animate Light", &scene.animateLight);
     }
 
@@ -405,7 +411,6 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         if (scene.useMeshTerrain) {
             ImGui::SliderFloat("Terrain Height", &scene.terrainHeightScale, 0.0f, 15.0f);
         }
-        ImGui::DragFloat("Ambient",  &scene.ambientStrength,  0.01f, 0.0f, 1.0f);
         ImGui::DragFloat("Specular", &scene.specularStrength, 0.01f, 0.0f, 1.0f);
         ImGui::Checkbox("Show Helicopter", &scene.showHelicopter);
         ImGui::Checkbox("Enable Shadows", &scene.enableShadows);

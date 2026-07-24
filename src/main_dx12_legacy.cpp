@@ -1377,7 +1377,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         
         // Set common uniforms
         mainShader.SetLight(lightPos, lightType, lightColor, lightConstant, lightLinear, lightQuadratic,
-            ambientStrength, specularStrength, specularShininess, shadowBias, enableShadows);
+            ambientStrength, 1.0f, specularStrength, specularShininess,
+            shadowBias, enableShadows);
         mainShader.SetCamera(camera.Position);
         
         // Update clustered renderer camera and cull lights

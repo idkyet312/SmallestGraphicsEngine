@@ -7,6 +7,8 @@ struct TerrainPBR {
     float3 albedo;
     float3 normal;
     float roughness;
+    float metallic;
+    float occlusion;
 };
 
 float TerrainBlendNoise(float2 p) {
@@ -55,7 +57,7 @@ float4 SampleTerrainArray(Texture2DArray map, float3 worldPos,
 
 float3 SampleTerrainNormalLayer(float3 worldPos, float3 geometricNormal,
                                 float3 projectionWeights, float layer,
-                                float scale) {
+                                float scale, float strength) {
     float3 nx = normalMap.Sample(texSampler,
         float3(worldPos.zy * scale, layer)).xyz * 2.0 - 1.0;
     float3 ny = normalMap.Sample(texSampler,
@@ -65,6 +67,12 @@ float3 SampleTerrainNormalLayer(float3 worldPos, float3 geometricNormal,
     nx.y *= normalYSign;
     ny.y *= normalYSign;
     nz.y *= normalYSign;
+    nx.xy *= strength;
+    ny.xy *= strength;
+    nz.xy *= strength;
+    nx = normalize(nx);
+    ny = normalize(ny);
+    nz = normalize(nz);
 
     float sx = geometricNormal.x < 0.0 ? -1.0 : 1.0;
     float sy = geometricNormal.y < 0.0 ? -1.0 : 1.0;
@@ -80,23 +88,31 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal) {
     TerrainPBR result;
     const float3 projectionWeights = TerrainProjectionWeights(geometricNormal);
     const float4 layerWeights = TerrainLayerWeights(worldPos, geometricNormal);
-    // Leafy Grass keeps its previous art-directed tiling. Other layers use their
-    // scan dimensions: 2.07m dirt, 15m coast sand, 2.421m rock.
-    const float scales[4] = { 0.34, 0.4831, 0.06667, 0.4130 };
+    // Grass004 uses one third of the original UV tiling, making each visible
+    // texture tile three times larger. Other layers retain scan dimensions.
+    const float scales[4] = { 0.16667, 0.4831, 0.06667, 0.4130 };
+    // Preserve fine leafy-grass relief. Other broad terrain layers stay softer
+    // to avoid noisy distant slopes.
+    const float normalStrengths[4] = { 1.15, 0.72, 0.55, 0.92 };
 
     result.albedo = 0.0;
     result.normal = 0.0;
     result.roughness = 0.0;
+    result.metallic = 0.0;
+    result.occlusion = 0.0;
     [unroll] for (uint layer = 0; layer < 4; ++layer) {
         const float weight = layerWeights[layer];
         result.albedo += SampleTerrainArray(
             albedoMap, worldPos, projectionWeights, layer, scales[layer]).rgb * weight;
         result.normal += SampleTerrainNormalLayer(
             worldPos, geometricNormal, projectionWeights, layer,
-            scales[layer]) * weight;
-        result.roughness += SampleTerrainArray(
+            scales[layer], normalStrengths[layer]) * weight;
+        const float4 packedPBR = SampleTerrainArray(
             metalRoughMap, worldPos, projectionWeights, layer,
-            scales[layer]).g * weight;
+            scales[layer]);
+        result.roughness += packedPBR.g * weight;
+        result.metallic += packedPBR.b * weight;
+        result.occlusion += packedPBR.r * weight;
     }
     // Invalid/unbound SRVs return zero. Keep terrain readable and make binding
     // faults obvious as flat material colors instead of an all-black island.
@@ -111,10 +127,15 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal) {
         fallbackAlbedo += fallbackColors[fallbackLayer] * layerWeights[fallbackLayer];
     if (dot(result.albedo, float3(0.2126, 0.7152, 0.0722)) < 0.002)
         result.albedo = fallbackAlbedo;
-    // Dry soil and vegetation are broad diffuse lobes. Strong scan normals plus
-    // low roughness made the terrain read as wet reflective plastic under HDRI.
-    result.normal = normalize(lerp(geometricNormal, normalize(result.normal), 0.62));
-    result.roughness = clamp(result.roughness, 0.65, 1.0);
+    const float grassResponse = layerWeights.x;
+    result.normal = normalize(lerp(
+        geometricNormal, normalize(result.normal),
+        lerp(0.62, 0.92, grassResponse)));
+    // Retain authored grass roughness variation instead of crushing every layer
+    // into the previous 0.65 floor.
+    result.roughness = clamp(result.roughness, 0.42, 1.0);
+    result.metallic = saturate(result.metallic);
+    result.occlusion = saturate(result.occlusion);
     return result;
 }
 

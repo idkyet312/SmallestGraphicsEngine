@@ -355,6 +355,17 @@ private:
             const float cx = (Rand(seed) * 2.0f - 1.0f) * half;
             const float cz = (Rand(seed) * 2.0f - 1.0f) * half;
 
+            // Keep the playable centre dense, then progressively thin the large
+            // stress-test island. At 120 m and beyond only 15% of generated
+            // tufts remain. Authored patches below intentionally bypass this.
+            const float radialDistance = std::sqrt(cx * cx + cz * cz);
+            const float falloffT = std::clamp(
+                (radialDistance - 90.0f) / 30.0f, 0.0f, 1.0f);
+            const float smoothFalloff =
+                falloffT * falloffT * (3.0f - 2.0f * falloffT);
+            const float radialDensity = 1.0f - smoothFalloff * 0.85f;
+            if (Rand(seed) > radialDensity) continue;
+
             // Test the CLUMP's centre once, not every blade: if the middle of the
             // tuft is in the sea or on a cliff, the whole tuft is rejected.
             if (!Plantable(cx, cz)) continue;

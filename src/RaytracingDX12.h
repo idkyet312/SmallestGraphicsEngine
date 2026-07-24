@@ -654,7 +654,7 @@ inline void RenderRaytracing(Scene& scene) {
     XMStoreFloat4x4(&g_rt.mappedConstants->invViewProj, XMMatrixTranspose(invViewProj));
     g_rt.mappedConstants->cameraPos = scene.camera.Position;
     g_rt.mappedConstants->lightPos = scene.lightPos;
-    g_rt.mappedConstants->lightColor = scene.lightColor;
+    g_rt.mappedConstants->lightColor = scene.EffectiveLightColor();
 
     // Update TLAS with current scene
     UpdateTLAS(scene);

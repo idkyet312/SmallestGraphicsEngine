@@ -27,6 +27,7 @@ cbuffer LightBuffer : register(b1) {
     float shadowBias;
     int enableShadows;
     float shadowTexelSize;   // unused here (single tap), kept for layout parity
+    float ambientLightingIntensity;
 };
 
 cbuffer CameraBuffer : register(b2) {
@@ -190,7 +191,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // dims its indirect terms.
     float3 result = ambientStrength * albedo * ambientScale;
     result += sampleSkyIrradiance(normal) * albedo * ambientScale;
-    result *= lerp(0.28, 1.0, shadowVisibility);
+    result *= lerp(0.28, 1.0, shadowVisibility) *
+              ambientLightingIntensity;
 
     // Direct sun: Lambert only. Blade roughness is 0.85 -- the GGX lobe the
     // main shader would compute is visually nil at that roughness.

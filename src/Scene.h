@@ -109,8 +109,9 @@ struct Scene {
     // Main directional / point light
     // Angled, HDR-strength warm sun. Lower elevation gives terrain and props
     // longer modelling shadows while cool sky irradiance keeps them readable.
-    XMFLOAT3 lightPos    = { -8.0f, 7.0f, -3.0f };
-    XMFLOAT3 lightColor  = { 2.40f, 2.05f, 1.55f };
+    XMFLOAT3 lightPos    = { 8.246f, 3.095f, 4.735f };
+    XMFLOAT3 lightColor  = { 1.0f, 1.0f, 0.760784f };
+    float    directionalLightIntensity = 12.18f;
     int      lightType   = 0;
     float    lightConstant  = 1.0f;
     float    lightLinear    = 0.09f;
@@ -118,12 +119,21 @@ struct Scene {
 
     // Material defaults
     float ambientStrength   = 0.07f;
+    float ambientLightingIntensity = 0.356f;
     float specularStrength  = 0.5f;
     int   specularShininess = 32;
     float shadowBias        = 0.005f;
     bool  enableShadows     = true;
     XMFLOAT3 shadowCenter    = { 0.0f, 3.0f, 0.0f };
     float shadowOrthoSize    = 30.0f;
+
+    XMFLOAT3 EffectiveLightColor() const {
+        return {
+            lightColor.x * directionalLightIntensity,
+            lightColor.y * directionalLightIntensity,
+            lightColor.z * directionalLightIntensity
+        };
+    }
     float shadowDistance     = 40.0f;
     float shadowFarPlane     = 90.0f;
 

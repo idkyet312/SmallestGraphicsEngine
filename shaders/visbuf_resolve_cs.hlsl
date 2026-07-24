@@ -43,6 +43,7 @@ cbuffer LightBuffer : register(b1) {
     float  shadowBias;
     int    enableShadows;
     float  lbPadding;
+    float  ambientLightingIntensity;
 };
 
 struct PointLightData {
@@ -826,8 +827,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         texSampler, float2(NdotV, rough), 0.0);
     float3 specularIBL = reflectionIBL *
         (F0 * environmentBRDF.x + environmentBRDF.y);
-    result += (diffuseIBL + diffuseGI + specularIBL) * ambientOcclusion;
-    result += ambientStrength * diffuseAlbedo * ambientScale * ambientOcclusion;
+    result += (diffuseIBL + diffuseGI + specularIBL) * ambientOcclusion *
+              ambientLightingIntensity;
+    result += ambientStrength * diffuseAlbedo * ambientScale *
+              ambientOcclusion * ambientLightingIntensity;
     result += material.emissiveOcclusion.rgb;
     
     float3 numerator = NDF * G * F;
@@ -838,7 +841,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // Shadow map blocks direct sun only. IBL/DDGI are already low-frequency
     // indirect terms and must stay present on occluded building/actor sides.
     float frontFill = 0.65 + 0.35 * saturate(dot(normal, viewDir));
-    result += diffuseAlbedo * material.shadingParams.y * frontFill;
+    result += diffuseAlbedo * material.shadingParams.y * frontFill *
+              ambientLightingIntensity;
     float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor *
                 NdotL * atten * shadowVisibility;
     result += Lo;

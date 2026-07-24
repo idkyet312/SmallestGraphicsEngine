@@ -20,6 +20,7 @@ cbuffer LightBuffer : register(b1) {
     float shadowBias;
     int enableShadows;
     float shadowTexelSize;   // 1/shadow-map-size, precomputed on the CPU
+    float ambientLightingIntensity;
 };
 
 cbuffer CameraBuffer : register(b2) {
@@ -618,9 +619,10 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float ambientOcclusion = 1.0;
 
 #ifdef SGE_TERRAIN_PBR
-    metal = 0.0;
+    metal = terrain.metallic;
     rough = terrain.roughness;
     normal = terrain.normal;
+    ambientOcclusion = terrain.occlusion;
 #else
     if (metalRoughMode > 0.5) {
         // Check if metalRoughMap is bound? We don't have a flag for it specifically, assuming bundled with material
@@ -715,7 +717,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // Add sky IBL (diffuse irradiance from the HDRI, via SH)
     float3 skyContribution = sampleSkyIrradiance(normal);
     ambient += skyContribution * diffuseAlbedo * ambientScale;
-    ambient *= ambientOcclusion;
+    ambient *= ambientOcclusion * ambientLightingIntensity;
     float3 result = ambient;
     
     // Main directional/point light
@@ -786,7 +788,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // Keep authored view fill present at silhouettes. The old 0.35 floor made
     // grazing surfaces lose most of their only indirect-light fallback.
     float frontFill = 0.65 + 0.35 * saturate(dot(normal, viewDir));
-    result += diffuseAlbedo * max(viewFillStrength, 0.0) * frontFill;
+    result += diffuseAlbedo * max(viewFillStrength, 0.0) * frontFill *
+              ambientLightingIntensity;
     float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor * NdotL * attenuation * shadowVisibility; // No light intensity? lightColor should allow > 1.
     
     result += Lo;
@@ -807,7 +810,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
         texSampler, float2(NdotV, rough), 0.0);
     result += probeColor * (F0 * environmentBRDF.x + environmentBRDF.y) *
-              ambientOcclusion * characterSpecularScale;
+              ambientOcclusion * characterSpecularScale *
+              ambientLightingIntensity;
 
     // AgX (Punchy) tone mapping; returns display-encoded sRGB.
     result = FinalizeOutput(result);

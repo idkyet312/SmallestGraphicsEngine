@@ -57,6 +57,7 @@ struct alignas(256) LightBufferDX12 {
     int enableShadows;
     // 1/shadow-map-size, so the PCF loop needn't call GetDimensions per pixel.
     float shadowTexelSize;
+    float ambientLightingIntensity;
 };
 
 struct alignas(256) CameraBufferDX12 {
@@ -1111,7 +1112,8 @@ public:
     
     void SetLight(const XMFLOAT3& pos, int type, const XMFLOAT3& color,
                   float constant, float linear, float quadratic,
-                  float ambient, float specular, int shininess,
+                  float ambient, float ambientIntensity,
+                  float specular, int shininess,
                   float shadowBias, bool enableShadows,
                   float shadowTexelSize = 1.0f / 2048.0f) {
         LightBufferDX12 data;
@@ -1122,6 +1124,7 @@ public:
         data.linear = linear;
         data.quadratic = quadratic;
         data.ambientStrength = ambient;
+        data.ambientLightingIntensity = ambientIntensity;
         data.specularStrength = specular;
         data.shininess = shininess;
         data.shadowBias = shadowBias;
@@ -1171,7 +1174,9 @@ public:
         data.roughness = 1.0f;
         data.opacity = 1.0f;
         data.ambientScale = 1.0f;
-        data.normalYSign = 1.0f;
+        // Terrain scans use OpenGL normal maps. DX12 texture coordinates use
+        // the opposite V direction, so flip tangent-space green.
+        data.normalYSign = -1.0f;
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(
             3, objectBuffer.GetGPUAddress(bufferIndex));
