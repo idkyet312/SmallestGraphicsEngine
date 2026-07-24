@@ -35,6 +35,7 @@ extern MeshShaderDX12 g_meshShader;
 // BanditDebugText renders a one-line status; defined in main.cpp where the
 // SkinnedEnemy type is complete.
 void BanditDebugText();
+void RequestLiveDXRDDGIRebuild();
 
 // On-screen dual-stick controls: analog movement and analog camera look.
 inline void RenderMovementPad() {
@@ -492,7 +493,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::Checkbox("GTAO + Contact Shadows", &scene.enableAmbientOcclusion);
         if (scene.enableAmbientOcclusion) {
             ImGui::DragFloat("AO Radius", &scene.ambientOcclusionRadius,
-                             0.05f, 0.2f, 4.0f, "%.2f m");
+                             0.01f, 0.01f, 4.0f, "%.2f m");
             ImGui::SliderFloat("AO Strength", &scene.ambientOcclusionStrength,
                                0.0f, 2.5f, "%.2f");
             ImGui::SliderFloat("Contact Shadows", &scene.contactShadowStrength,
@@ -520,7 +521,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::Separator();
         const bool sparseDXR = g_dxrDDGIProbeCount > 0;
         ImGui::Text(sparseDXR ? "DXR Sparse DDGI" : "Legacy Grid DDGI");
-        ImGui::Checkbox("Enable DDGI", &scene.useDDGI);
+        if (ImGui::Checkbox("Enable DDGI", &scene.useDDGI))
+            RequestLiveDXRDDGIRebuild();
         if (scene.useDDGI) {
             if (sparseDXR) {
                 scene.giIntensity =
@@ -539,8 +541,11 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ImGui::Text("Cell size: %.2f m", g_dxrDDGICellSize);
                 ImGui::DragFloat("Ray Distance", &scene.giMaxDistance,
                                  0.5f, 1.0f, 200.0f, "%.1f m");
-                ImGui::TextDisabled(
-                    "Spacing changes require Level Editor > Rebuild Layout");
+                ImGui::DragFloat("Probe Spacing", &scene.probeSpacing,
+                                 0.1f, 0.25f, 50.0f, "%.2f m");
+                if (ImGui::IsItemDeactivatedAfterEdit())
+                    RequestLiveDXRDDGIRebuild();
+                ImGui::TextDisabled("Spacing rebuilds layout when released");
             } else {
                 ImGui::DragFloat("Probe Spacing", &scene.probeSpacing,
                                  0.1f, 0.5f, 10.0f);

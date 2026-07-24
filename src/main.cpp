@@ -130,6 +130,13 @@ static bool                 g_prefabRuntimeSmokeEnabled = false;
 static bool                 g_prefabRuntimeSmokeChecked = false;
 static bool                 g_ddgiCornellTestMode = false;
 static bool                 g_ddgiCornellPreviousTemporalEffects = false;
+static bool                 g_ddgiCornellPreviousAnimateDemoLights = true;
+static constexpr XMFLOAT3   g_ddgiCornellLightPosition =
+    { 0.0f, 6.55f, 3.6f };
+static constexpr XMFLOAT3   g_ddgiCornellLightColor =
+    { 1.0f, 0.86f, 0.66f };
+static constexpr float      g_ddgiCornellLightRadius = 11.0f;
+static constexpr float      g_ddgiCornellLightIntensity = 24.0f;
 static std::shared_ptr<SceneNode> g_ddgiCornellModel;
 std::shared_ptr<SceneNode>  g_helicopterMainRotorNode;
 std::shared_ptr<SceneNode>  g_helicopterTailRotorNode;
@@ -1862,6 +1869,9 @@ static bool  pendingEditorStopPlay = false;
 static bool  pendingEditorReturnToMenu = false;
 static bool  pendingDXRDDGIRebuild = false;
 static bool  pendingDXRDDGIHistoryReset = false;
+void RequestLiveDXRDDGIRebuild() {
+    pendingDXRDDGIRebuild = true;
+}
 static bool  isFullscreen  = false;
 static RECT  windowedRect  = {};
 static DWORD windowedStyle = 0;
@@ -2956,7 +2966,8 @@ static void RebuildPrefabRenderBatches() {
     if (g_ddgiCornellTestMode) {
         scene.clusteredRenderer.clearLights();
         scene.clusteredRenderer.addLight(
-            { 0.0f, 6.55f, 3.6f }, { 1.0f, 0.86f, 0.66f }, 11.0f, 24.0f);
+            g_ddgiCornellLightPosition, g_ddgiCornellLightColor,
+            g_ddgiCornellLightRadius, g_ddgiCornellLightIntensity);
     }
     for (const PrefabLightInstance& light : g_prefabLightInstances)
         scene.clusteredRenderer.addLight(light.position, light.color,
@@ -3333,16 +3344,22 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_ddgiCornellTestMode = customLevel &&
         customLevel->name == "DXR DDGI Cornell Box";
     if (g_ddgiCornellTestMode) {
-        if (!wasCornellTest)
+        if (!wasCornellTest) {
             g_ddgiCornellPreviousTemporalEffects =
                 visBuffer.temporalEffectsEnabled;
+            g_ddgiCornellPreviousAnimateDemoLights =
+                scene.animateDemoLights;
+        }
         visBuffer.temporalEffectsEnabled = false;
         visBuffer.InvalidateTemporalHistory();
+        scene.animateDemoLights = false;
         scene.ambientStrength = 0.015f;
     } else if (wasCornellTest) {
         visBuffer.temporalEffectsEnabled =
             g_ddgiCornellPreviousTemporalEffects;
         visBuffer.InvalidateTemporalHistory();
+        scene.animateDemoLights =
+            g_ddgiCornellPreviousAnimateDemoLights;
         scene.ambientStrength = 0.07f;
     }
     gameScreen = GameScreen::Level1;
@@ -6909,14 +6926,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // Editor buttons are processed here, before any scene pass binds the
         // old probe atlases. Rebuilding from the late ImGui phase destroyed
         // resources still referenced by the open frame command list.
-        if ((gameScreen == GameScreen::LevelEditor ||
-             g_ddgiCornellTestMode) &&
-            pendingDXRDDGIRebuild) {
+        if (IsSceneScreen() && pendingDXRDDGIRebuild) {
             pendingDXRDDGIRebuild = false;
-            if (gameScreen == GameScreen::LevelEditor)
+            if (gameScreen == GameScreen::LevelEditor) {
                 g_runtimeLevel = g_levelEditor.Level();
-            g_dxrDDGI.MarkLayoutDirty();
-            RebuildDXRDDGIProbeLayout(true);
+                scene.useDDGI = g_runtimeLevel.dxrDDGI.enabled &&
+                    g_dxrDDGI.GetStatus().dxrSupported;
+                scene.probeSpacing =
+                    g_runtimeLevel.dxrDDGI.surfaceSpacing;
+            } else {
+                g_runtimeLevel.dxrDDGI.enabled = scene.useDDGI;
+                g_runtimeLevel.dxrDDGI.surfaceSpacing =
+                    std::clamp(scene.probeSpacing, 0.25f, 50.0f);
+                g_runtimeLevel.dxrDDGI.maxRayDistance =
+                    std::clamp(scene.giMaxDistance, 1.0f, 200.0f);
+            }
+            g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
+            if (g_runtimeLevel.dxrDDGI.enabled &&
+                g_dxrDDGI.GetStatus().dxrSupported) {
+                g_dxrDDGI.MarkLayoutDirty();
+                if (!RebuildDXRDDGIProbeLayout(true)) {
+                    g_runtimeLevel.dxrDDGI.enabled = false;
+                    scene.useDDGI = false;
+                    g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
+                }
+            } else {
+                scene.useDDGI = false;
+                g_dxrDDGI.ResetHistory();
+            }
             if (gameScreen == GameScreen::LevelEditor)
                 g_levelEditor.MarkDXRDDGIRuntimeSynchronized();
         }
@@ -6946,7 +6983,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     -scene.lightPos.x, -scene.lightPos.y, -scene.lightPos.z);
                 g_dxrDDGI.UpdateProbes(
                     dxrDDGICommands.Get(), ++dxrDDGIFrame,
-                    raySunDirection, scene.lightColor, 1.0f, 1.0f);
+                    raySunDirection, scene.lightColor,
+                    g_ddgiCornellTestMode ? 0.0f : 1.0f,
+                    g_ddgiCornellTestMode ? 0.0f : 1.0f,
+                    g_ddgiCornellTestMode
+                        ? g_ddgiCornellLightPosition : XMFLOAT3{},
+                    g_ddgiCornellTestMode
+                        ? g_ddgiCornellLightColor : XMFLOAT3{},
+                    g_ddgiCornellTestMode
+                        ? g_ddgiCornellLightRadius : 0.0f,
+                    g_ddgiCornellTestMode
+                        ? g_ddgiCornellLightIntensity : 0.0f);
             }
             g_ddgiIrradianceResource = g_dxrDDGI.IrradianceAtlas();
             g_ddgiVisibilityResource = g_dxrDDGI.VisibilityAtlas();
