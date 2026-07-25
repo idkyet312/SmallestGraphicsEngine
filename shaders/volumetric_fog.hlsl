@@ -109,11 +109,16 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float stepLength = (farDepth - nearDepth) / viewCos;
         float3 worldPosition = cameraPositionNear.xyz + ray * (centerDepth / viewCos);
 
-        float heightDensity = exp(-max(worldPosition.y - fogParams.y, 0.0) * fogParams.x);
-        float lowLayer = exp(-abs(worldPosition.y - fogParams.y) * 0.22);
+        // Jungle gradient: a broad upper haze plus a softer, denser low ground
+        // layer that pools in the valley floor. The ground layer's falloff is kept
+        // gentle (2x, not a sharp spike) so it fades smoothly into the upper haze
+        // with no hard seam where it cuts off across tall grass and terrain.
+        float aboveBase = max(worldPosition.y - fogParams.y, 0.0);
+        float heightDensity = exp(-aboveBase * fogParams.x);
+        float groundLayer = exp(-aboveBase * (fogParams.x * 2.0)) * 0.9;
         float densityNoise = lerp(0.58, 1.28, FogNoise(worldPosition));
-        heightDensity *= densityNoise * lerp(0.72, 1.18, lowLayer);
-        heightDensity = max(heightDensity, 0.035);
+        heightDensity = (heightDensity + groundLayer) * densityNoise;
+        heightDensity = max(heightDensity, 0.03);
         float extinction = max(sunDirectionDensity.w * heightDensity, 0.00001);
         float segmentTransmittance = exp(-extinction * stepLength);
 
