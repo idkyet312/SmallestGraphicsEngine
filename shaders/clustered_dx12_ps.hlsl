@@ -595,7 +595,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // Sample textures
     float3 albedo = objectColor;
 #ifdef SGE_TERRAIN_PBR
-    TerrainPBR terrain = SampleTerrainPBR(input.fragPos, normal);
+    TerrainPBR terrain = SampleTerrainPBR(input.fragPos, normal,
+                                          length(viewPos - input.fragPos));
     // Terrain albedo uses an sRGB SRV, so hardware has already decoded it.
     albedo = max(terrain.albedo, 0.0) * objectColor;
 #else

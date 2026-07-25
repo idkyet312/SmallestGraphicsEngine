@@ -42,6 +42,7 @@ struct TerrainPayload {
     float2 originXZ[32];   // world min-corner of the tile
     float  size[32];       // tile world size (metres)
     uint   lod[32];
+    float  morph[32];      // 0..1 blend toward the next-coarser LOD (geomorph)
 };
 
 struct OutVertex {
@@ -226,6 +227,7 @@ void MSMain(uint3 id : SV_GroupThreadID,
     float2 tileOrigin = payloadData.originXZ[groupID.x];
     float thisTileSize = payloadData.size[groupID.x];
     uint lod = min(payloadData.lod[groupID.x], 3u);
+    float morph = payloadData.morph[groupID.x];
     uint n = 8u >> lod; // quads per side: 8/4/2/1
 
     uint side = n + 1;
@@ -243,7 +245,14 @@ void MSMain(uint3 id : SV_GroupThreadID,
         if (vi < gridVerts) {
             uint gx = vi % side;
             uint gz = vi / side;
-            xz = tileOrigin + float2(gx, gz) * quadSize;
+            // Geomorph toward the next-coarser grid: blend each vertex's index
+            // toward the even (coarse) index by 'morph', so odd vertices slide
+            // onto the coarse grid as the tile approaches its LOD switch. Avoids
+            // popping. Even indices are unchanged (morph target == self).
+            float2 fine = float2(gx, gz);
+            float2 coarse = floor(fine * 0.5) * 2.0;
+            float2 morphed = lerp(fine, coarse, morph);
+            xz = tileOrigin + morphed * quadSize;
             y = TerrainHeight(xz);
         } else {
             uint2 pc = PerimeterCoord(vi - gridVerts, n);
