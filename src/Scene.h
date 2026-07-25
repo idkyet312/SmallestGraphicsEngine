@@ -110,7 +110,7 @@ struct Scene {
     // Angled, HDR-strength warm sun. Lower elevation gives terrain and props
     // longer modelling shadows while cool sky irradiance keeps them readable.
     XMFLOAT3 lightPos    = { 8.246f, 3.095f, 4.735f };
-    XMFLOAT3 lightColor  = { 1.0f, 1.0f, 0.760784f };
+    XMFLOAT3 lightColor  = { 1.0f, 0.92f, 0.70f };
     float    directionalLightIntensity = 12.18f;
     int      lightType   = 0;
     float    lightConstant  = 1.0f;
@@ -201,12 +201,12 @@ struct Scene {
     bool  enableGrassMSAA = true;
     bool  enableFXAA = false;
     bool  enableVolumetricFog = true;
-    float volumetricFogDensity = 0.0020f;
-    float volumetricFogAnisotropy = 0.35f;
-    float volumetricFogHeightFalloff = 0.055f;
-    float volumetricFogBaseHeight = 1.0f;
-    float volumetricFogDistance = 120.0f;
-    XMFLOAT3 volumetricFogTint = { 0.72f, 0.84f, 1.0f };
+    float volumetricFogDensity = 0.0042f;
+    float volumetricFogAnisotropy = 0.28f;
+    float volumetricFogHeightFalloff = 0.045f;
+    float volumetricFogBaseHeight = 1.5f;
+    float volumetricFogDistance = 260.0f;
+    XMFLOAT3 volumetricFogTint = { 0.62f, 0.76f, 0.92f };
     bool  enableAmbientOcclusion = true;
     float ambientOcclusionRadius = 0.12f;
     float ambientOcclusionStrength = 1.96f;

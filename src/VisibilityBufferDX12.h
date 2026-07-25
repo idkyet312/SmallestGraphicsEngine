@@ -1329,12 +1329,6 @@ private:
                     float r = x / float(LUTSize - 1);
                     float g = y / float(LUTSize - 1);
                     float b = z / float(LUTSize - 1);
-                    float luma = r * 0.2126f + g * 0.7152f + b * 0.0722f;
-                    r = (std::min)(1.0f, (std::max)(0.0f,
-                        r * 1.035f + (1.0f - luma) * 0.012f));
-                    g = (std::min)(1.0f, (std::max)(0.0f, g * 1.005f));
-                    b = (std::min)(1.0f, (std::max)(0.0f,
-                        b * 0.975f + luma * 0.008f));
                     row[x * 4 + 0] = (BYTE)roundf(r * 255.0f);
                     row[x * 4 + 1] = (BYTE)roundf(g * 255.0f);
                     row[x * 4 + 2] = (BYTE)roundf(b * 255.0f);
@@ -2036,7 +2030,8 @@ private:
         const std::string source = stream.str();
 
         ComPtr<ID3DBlob> shaderBlob, errorBlob;
-        HRESULT hr = D3DCompile(source.data(), source.size(), "visbuf_post_cs.hlsl",
+        HRESULT hr = D3DCompile(source.data(), source.size(),
+            "shaders/visbuf_post_cs.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0",
             D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
             0, &shaderBlob, &errorBlob);

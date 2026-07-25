@@ -9,6 +9,8 @@ RWTexture2D<float4> ldrOutput : register(u0);
 RWTexture2D<float4> historyOutput : register(u1);
 SamplerState lutSampler : register(s0);
 
+#include "color_grade.hlsli"
+
 cbuffer PostConstants : register(b0) {
     uint2 outputSize;
     float exposure;
@@ -202,6 +204,7 @@ void main(uint3 threadID : SV_DispatchThreadID) {
         ? TonemapSkyACES(hdr)
         : TonemapAgX((hdr + Bloom(pixel) * bloomStrength)
                      * exposure * autoExposure);
+    color = ApplySceneColorGrade(color);
     float lutScale = 15.0 / 16.0;
     float lutOffset = 0.5 / 16.0;
     if (validationMode == 0u) {

@@ -139,6 +139,8 @@ float3 agxDefaultContrastApprox(float3 x) {
           - 0.00232;
 }
 
+#include "color_grade.hlsli"
+
 float3 tonemapAgXPunchy(float3 color) {
     const float3x3 agxIn = float3x3(
         0.842479062253094,  0.0423282422610123, 0.0423756549057051,
@@ -163,7 +165,7 @@ float3 tonemapAgXPunchy(float3 color) {
     color = luma + 1.4 * (color - luma);
 
     color = mul(agxOut, color);
-    return saturate(color);
+    return ApplySceneColorGrade(color);
 }
 
 float4 main(PS_INPUT input) : SV_TARGET {

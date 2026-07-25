@@ -52,15 +52,17 @@ public:
             nullptr, nullptr, "main", "vs_5_0", flags, 0, &vs, &errors);
         if (FAILED(hr)) { if (errors) std::cerr << (char*)errors->GetBufferPointer(); return false; }
         errors.Reset();
-        hr = D3DCompile(psSource.data(), psSource.size(), "sky_ps.hlsl",
-            nullptr, nullptr, "main", "ps_5_0", flags, 0, &ps, &errors);
+        hr = D3DCompile(psSource.data(), psSource.size(), "shaders/sky_ps.hlsl",
+            nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            "main", "ps_5_0", flags, 0, &ps, &errors);
         if (FAILED(hr)) { if (errors) std::cerr << (char*)errors->GetBufferPointer(); return false; }
         const D3D_SHADER_MACRO hdrDefines[] = {
             { "SGE_HDR_TARGET", "1" }, { nullptr, nullptr }
         };
         errors.Reset();
-        hr = D3DCompile(psSource.data(), psSource.size(), "sky_ps.hlsl",
-            hdrDefines, nullptr, "main", "ps_5_0", flags, 0, &hdrPs, &errors);
+        hr = D3DCompile(psSource.data(), psSource.size(), "shaders/sky_ps.hlsl",
+            hdrDefines, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+            "main", "ps_5_0", flags, 0, &hdrPs, &errors);
         if (FAILED(hr)) { if (errors) std::cerr << (char*)errors->GetBufferPointer(); return false; }
 
         D3D12_ROOT_PARAMETER roots[2] = {};
