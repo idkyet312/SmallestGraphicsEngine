@@ -273,29 +273,21 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
         // Hard-clamp the tile grid: the mesh/amplification path tessellates per
         // tile, and an oversized extent hangs the GPU (TDR / device removed).
         // 48x48 = ~2300 tiles is well within budget (stress mode uses 32x32).
-        constexpr UINT kMaxTilesPerAxis = 48;
+        // Island capped at 5x. Tiles stay at the base 8 m size so the ground
+        // keeps full detail (no coarsening). The tile grid is frustum-culled in
+        // the amplification shader, so only visible tiles tessellate -- a 5x
+        // island's ~72x72 grid is safe because most tiles are off-screen. The
+        // cap keeps the worst case (looking across the whole island) bounded.
+        constexpr UINT kMaxTilesPerAxis = 96;   // fits a 5x island at 8 m tiles
         params.islandScaleX = (std::max)(0.5f,
-            (std::min)(scene.terrainIslandScaleX, 12.0f));
+            (std::min)(scene.terrainIslandScaleX, 5.0f));
         params.islandScaleZ = (std::max)(0.5f,
-            (std::min)(scene.terrainIslandScaleZ, 12.0f));
-        // The land reaches ~kShoreOuter*scale on each axis (52 m in
-        // terrain_ms.hlsl). The tile grid must reach past that shore per axis, or
-        // the ground plane clips the island before the beach fades to ocean.
-        //
-        // Tile COUNT is capped for GPU safety (each tile tessellates in the mesh
-        // shader; too many hangs the device). So for large islands we grow the
-        // tile SIZE instead of the count: the grid still covers the whole island
-        // + ocean, just with bigger tiles. This lets the island scale past 10x
-        // without ever exceeding the safe tile budget.
+            (std::min)(scene.terrainIslandScaleZ, 5.0f));
+        // The land reaches ~kShoreOuter*scale on each axis (52 m). The tile grid
+        // must reach past that shore per axis or the ground plane clips the
+        // island before the beach fades to ocean. Auto-grow each axis to fit.
         constexpr float kShoreOuter = 52.0f;
         constexpr float kOceanMargin = 24.0f;   // open water ringing the beach
-        const float maxScale = (std::max)(params.islandScaleX, params.islandScaleZ);
-        const float needHalf = kShoreOuter * maxScale + kOceanMargin;
-        const float needFull = 2.0f * needHalf;
-        // Pick the smallest tile size (>= the 8 m default) that fits the island
-        // within kMaxTilesPerAxis tiles.
-        params.tileSize = (std::max)(8.0f,
-            std::ceil(needFull / kMaxTilesPerAxis));
         const UINT fitTilesX = static_cast<UINT>(std::ceil(
             (2.0f * (kShoreOuter * params.islandScaleX + kOceanMargin)) /
             params.tileSize));
