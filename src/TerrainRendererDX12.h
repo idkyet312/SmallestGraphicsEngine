@@ -232,16 +232,22 @@ public:
             return (a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fy;
         };
 
-        // Outside the tiled extent there is no drawn ground; treat as level 0.
-        // The grid's min corner is offset by originTile* so an edge-extended
-        // island can grow off-center; match terrain_as/ms.hlsl's tile origin.
-        const float minX = (static_cast<float>(params.originTileX) -
-            params.tilesX * 0.5f) * params.tileSize;
-        const float minZ = (static_cast<float>(params.originTileZ) -
-            params.tilesZ * 0.5f) * params.tileSize;
-        const float maxX = minX + params.tilesX * params.tileSize;
-        const float maxZ = minZ + params.tilesZ * params.tileSize;
-        if (x < minX || x >= maxX || z < minZ || z >= maxZ) return 0.0f;
+        // Clipmap mode covers a large camera-centred area, so there is no fixed
+        // grid extent to clamp to - the island falloff below sinks the ground to
+        // seabed past the shore. Only the legacy uniform grid has a hard edge.
+        constexpr UINT kClipmapFlag = 2u;
+        if ((params.terrainStyle & kClipmapFlag) == 0u) {
+            // Outside the tiled extent there is no drawn ground; treat as
+            // level 0. The grid's min corner is offset by originTile* so an
+            // edge-extended island can grow off-center; match the shaders.
+            const float minX = (static_cast<float>(params.originTileX) -
+                params.tilesX * 0.5f) * params.tileSize;
+            const float minZ = (static_cast<float>(params.originTileZ) -
+                params.tilesZ * 0.5f) * params.tileSize;
+            const float maxX = minX + params.tilesX * params.tileSize;
+            const float maxZ = minZ + params.tilesZ * params.tileSize;
+            if (x < minX || x >= maxX || z < minZ || z >= maxZ) return 0.0f;
+        }
 
         float px = x * 0.08f, py = z * 0.08f;
         float sum = 0.0f, amp = 0.5f;
@@ -746,7 +752,18 @@ public:
         commandList6->SetGraphicsRoot32BitConstants(8, 15, &drawParams, 0);
         commandList6->SetGraphicsRootShaderResourceView(
             13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
-        const UINT tileCount = params.tilesX * params.tilesZ;
+        // Clipmap (terrainStyle bit 1): tilesX=ring grid G, tilesZ=ring count R.
+        // Total tiles = ring0 (G*G) + (R-1) hollow rings (G*G - (G/2)^2 each).
+        UINT tileCount;
+        constexpr UINT kClipmapFlag = 2u;
+        if ((params.terrainStyle & kClipmapFlag) != 0u) {
+            const UINT G = params.tilesX, R = params.tilesZ;
+            const UINT ring0 = G * G;
+            const UINT ringN = ring0 - (G / 2) * (G / 2);
+            tileCount = ring0 + (R > 0 ? (R - 1) * ringN : 0);
+        } else {
+            tileCount = params.tilesX * params.tilesZ;
+        }
         commandList6->DispatchMesh((tileCount + 31) / 32, 1, 1);
     }
 

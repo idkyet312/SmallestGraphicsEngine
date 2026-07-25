@@ -1644,19 +1644,19 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     // CurrentTerrainParams), so this one slider stretches the whole island and
     // the ground + surrounding ocean follow. Manual Extend buttons below add
     // extra ground/ocean beyond the auto-fit if you want a bigger sea.
-    // Per-axis island size (independent -> wide ovals or long strips). Capped at
-    // 5x: tiles stay at full 8 m detail, and the frustum-culled grid keeps a 5x
-    // island's tile count GPU-safe.
+    // Per-axis island size (independent -> wide ovals or long strips). The
+    // clipmap terrain keeps full detail near the camera at any size, so this
+    // can go large.
     {
         const LevelDefinition before = level_;
         bool changed = ImGui::SliderFloat("Island width (X)",
-            &level_.terrainIslandScaleX, 0.5f, 5.0f, "%.2f x");
+            &level_.terrainIslandScaleX, 0.5f, 12.0f, "%.2f x");
         TrackItemEdit(before, changed);
     }
     {
         const LevelDefinition before = level_;
         bool changed = ImGui::SliderFloat("Island depth (Z)",
-            &level_.terrainIslandScaleZ, 0.5f, 5.0f, "%.2f x");
+            &level_.terrainIslandScaleZ, 0.5f, 12.0f, "%.2f x");
         TrackItemEdit(before, changed);
     }
     // Link toggle: drag either slider with this on to scale both together.
