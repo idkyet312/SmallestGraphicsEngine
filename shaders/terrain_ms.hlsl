@@ -39,8 +39,9 @@ struct TerrainSculptStamp {
 StructuredBuffer<TerrainSculptStamp> terrainSculpt : register(t10);
 
 struct TerrainPayload {
-    uint tileId[32];
-    uint lod[32];
+    float2 originXZ[32];   // world min-corner of the tile
+    float  size[32];       // tile world size (metres)
+    uint   lod[32];
 };
 
 struct OutVertex {
@@ -222,7 +223,8 @@ void MSMain(uint3 id : SV_GroupThreadID,
             in payload TerrainPayload payloadData,
             out vertices OutVertex verts[113],
             out indices uint3 tris[192]) {
-    uint tileId = payloadData.tileId[groupID.x];
+    float2 tileOrigin = payloadData.originXZ[groupID.x];
+    float thisTileSize = payloadData.size[groupID.x];
     uint lod = min(payloadData.lod[groupID.x], 3u);
     uint n = 8u >> lod; // quads per side: 8/4/2/1
 
@@ -233,12 +235,7 @@ void MSMain(uint3 id : SV_GroupThreadID,
     uint skirtTris = 8 * n;
     SetMeshOutputCounts(gridVerts + skirtVerts, gridTris + skirtTris);
 
-    uint tx = tileId % tilesX;
-    uint tz = tileId / tilesX;
-    float2 tileOrigin = float2(
-        ((float)tx + (float)originTileX - (float)tilesX * 0.5) * tileSize,
-        ((float)tz + (float)originTileZ - (float)tilesZ * 0.5) * tileSize);
-    float quadSize = tileSize / (float)n;
+    float quadSize = thisTileSize / (float)n;
 
     for (uint vi = id.x; vi < gridVerts + skirtVerts; vi += 128) {
         float2 xz;

@@ -267,39 +267,36 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
         params.islandScaleZ = 2.0f;
         params.terrainStyle = 1;   // warped coast + bay/headland + 8 house pads
     } else {
-        // Island builder: extent + per-axis coastline scale come from the loaded
-        // level (mirrored into scene by ApplyRuntimeLevelBasics), so growing the
-        // island in the editor expands the ground and the ocean around it.
-        // Hard-clamp the tile grid: the mesh/amplification path tessellates per
-        // tile, and an oversized extent hangs the GPU (TDR / device removed).
-        // 48x48 = ~2300 tiles is well within budget (stress mode uses 32x32).
-        // Island capped at 5x. Tiles stay at the base 8 m size so the ground
-        // keeps full detail (no coarsening). The tile grid is frustum-culled in
-        // the amplification shader, so only visible tiles tessellate -- a 5x
-        // island's ~72x72 grid is safe because most tiles are off-screen. The
-        // cap keeps the worst case (looking across the whole island) bounded.
-        constexpr UINT kMaxTilesPerAxis = 96;   // fits a 5x island at 8 m tiles
+        // Camera-centred geoclipmap: concentric LOD rings. Ring 0 is fine tiles
+        // around the camera; each outer ring doubles the tile size, so the map
+        // has crisp ground underfoot and cheap coarse ground to the horizon at a
+        // bounded tile count -- islands can be huge with full near detail.
+        //   terrainStyle bit 1 = clipmap; tilesX = ring grid G; tilesZ = ring
+        //   count R; tileSize = base (innermost) tile size.
+        params.terrainStyle = 2u;   // clipmap mode
         params.islandScaleX = (std::max)(0.5f,
-            (std::min)(scene.terrainIslandScaleX, 5.0f));
+            (std::min)(scene.terrainIslandScaleX, 12.0f));
         params.islandScaleZ = (std::max)(0.5f,
-            (std::min)(scene.terrainIslandScaleZ, 5.0f));
-        // The land reaches ~kShoreOuter*scale on each axis (52 m). The tile grid
-        // must reach past that shore per axis or the ground plane clips the
-        // island before the beach fades to ocean. Auto-grow each axis to fit.
+            (std::min)(scene.terrainIslandScaleZ, 12.0f));
+        params.tileSize = 8.0f;                 // base ring tile size (full detail)
+        constexpr UINT kRingGrid = 8u;          // G: tiles per side of each ring
+        params.tilesX = kRingGrid;
+        // Enough rings so the outermost reaches past the island shore. Ring r
+        // half-span = G/2 * base * 2^r. Need it to cover kShoreOuter*scale + margin.
         constexpr float kShoreOuter = 52.0f;
-        constexpr float kOceanMargin = 24.0f;   // open water ringing the beach
-        const UINT fitTilesX = static_cast<UINT>(std::ceil(
-            (2.0f * (kShoreOuter * params.islandScaleX + kOceanMargin)) /
-            params.tileSize));
-        const UINT fitTilesZ = static_cast<UINT>(std::ceil(
-            (2.0f * (kShoreOuter * params.islandScaleZ + kOceanMargin)) /
-            params.tileSize));
-        params.tilesX = (std::min)(
-            (std::max)(scene.terrainTilesX, fitTilesX), kMaxTilesPerAxis);
-        params.tilesZ = (std::min)(
-            (std::max)(scene.terrainTilesZ, fitTilesZ), kMaxTilesPerAxis);
-        params.originTileX = scene.terrainOriginTileX;
-        params.originTileZ = scene.terrainOriginTileZ;
+        constexpr float kOceanMargin = 40.0f;
+        const float maxScale = (std::max)(params.islandScaleX, params.islandScaleZ);
+        const float need = kShoreOuter * maxScale + kOceanMargin;
+        UINT rings = 1;
+        while (rings < 8) {
+            const float halfSpan = (kRingGrid * 0.5f) * params.tileSize *
+                static_cast<float>(1u << (rings - 1));
+            if (halfSpan >= need) break;
+            ++rings;
+        }
+        params.tilesZ = rings;                  // R: ring count
+        params.originTileX = 0;
+        params.originTileZ = 0;
     }
     return params;
 }
