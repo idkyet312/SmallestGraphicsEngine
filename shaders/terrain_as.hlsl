@@ -42,6 +42,7 @@ struct TerrainPayload {
     float2 originXZ[32];   // world min-corner of the tile
     float  size[32];       // tile world size (metres)
     uint   lod[32];        // tessellation level 0..3
+    float  morph[32];      // 0..1 blend toward the next-coarser LOD (geomorph)
 };
 
 // Clipmap is enabled by terrainStyle bit 1 (value & 2). In that mode:
@@ -154,13 +155,19 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
             // In clipmap mode each ring already sets its resolution by tile
             // size, so keep near tiles at full tessellation; still drop LOD for
             // the coarse outer rings to save triangles.
-            uint lod = (uint)clamp((dist - lodNear) / lodStep, 0.0, 3.0);
+            float lodF = clamp((dist - lodNear) / lodStep, 0.0, 3.0);
+            uint lod = (uint)lodF;
+            // Geomorph: as the tile nears the threshold to the next-coarser LOD,
+            // morph rises 0->1 over the last 30% of the band so fine vertices
+            // slide onto the coarse grid instead of popping.
+            float morph = smoothstep(0.7, 1.0, frac(lodF));
 
             uint slot;
             InterlockedAdd(visibleCount, 1, slot);
             payloadData.originXZ[slot] = originXZ;
             payloadData.size[slot] = tsize;
             payloadData.lod[slot] = lod;
+            payloadData.morph[slot] = morph;
         }
     }
 

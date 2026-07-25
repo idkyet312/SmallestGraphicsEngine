@@ -84,7 +84,8 @@ float3 SampleTerrainNormalLayer(float3 worldPos, float3 geometricNormal,
                      wz * projectionWeights.z);
 }
 
-TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal) {
+TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
+                            float cameraDistance) {
     TerrainPBR result;
     const float3 projectionWeights = TerrainProjectionWeights(geometricNormal);
     const float4 layerWeights = TerrainLayerWeights(worldPos, geometricNormal);
@@ -127,6 +128,24 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal) {
         fallbackAlbedo += fallbackColors[fallbackLayer] * layerWeights[fallbackLayer];
     if (dot(result.albedo, float3(0.2126, 0.7152, 0.0722)) < 0.002)
         result.albedo = fallbackAlbedo;
+    // Close-range detail: a high-frequency albedo modulation + normal
+    // perturbation that fades out with distance. Breaks up the tiling repeat and
+    // adds crispness underfoot without new textures. Fades to nothing by ~60 m
+    // so distant coarse-ring ground stays clean and cheap.
+    const float detailFade = 1.0 - smoothstep(12.0, 60.0, cameraDistance);
+    if (detailFade > 0.001) {
+        const float d1 = MatVarNoise(float3(worldPos.xz * 1.7, 5.0));
+        const float d2 = MatVarNoise(float3(worldPos.xz * 4.3, 9.0));
+        const float detail = (d1 * 0.6 + d2 * 0.4) - 0.5;
+        // Subtle albedo contrast + a tiny normal wobble for micro-relief.
+        result.albedo *= 1.0 + detail * 0.18 * detailFade;
+        result.normal.xz += float2(
+            MatVarNoise(float3(worldPos.xz * 3.1 + 2.0, 1.0)) - 0.5,
+            MatVarNoise(float3(worldPos.zx * 3.1 + 7.0, 1.0)) - 0.5) *
+            0.35 * detailFade;
+        result.normal = normalize(result.normal);
+    }
+
     const float grassResponse = layerWeights.x;
     result.normal = normalize(lerp(
         geometricNormal, normalize(result.normal),
