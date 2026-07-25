@@ -161,10 +161,10 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         level.terrainTilesZ < 4 || level.terrainTilesZ > 48)
         result.errors.push_back("terrain tile extent must be between 4 and 48");
     if (!std::isfinite(level.terrainIslandScaleX) ||
-        level.terrainIslandScaleX < 0.5f || level.terrainIslandScaleX > 6.0f ||
+        level.terrainIslandScaleX < 0.5f || level.terrainIslandScaleX > 12.0f ||
         !std::isfinite(level.terrainIslandScaleZ) ||
-        level.terrainIslandScaleZ < 0.5f || level.terrainIslandScaleZ > 6.0f)
-        result.errors.push_back("terrain island scale must be between 0.5 and 6");
+        level.terrainIslandScaleZ < 0.5f || level.terrainIslandScaleZ > 12.0f)
+        result.errors.push_back("terrain island scale must be between 0.5 and 12");
     if (level.terrainOriginTileX < -256 || level.terrainOriginTileX > 256 ||
         level.terrainOriginTileZ < -256 || level.terrainOriginTileZ > 256)
         result.errors.push_back("terrain origin tile offset out of range");

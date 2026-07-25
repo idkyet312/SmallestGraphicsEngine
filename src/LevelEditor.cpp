@@ -1644,19 +1644,19 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     // CurrentTerrainParams), so this one slider stretches the whole island and
     // the ground + surrounding ocean follow. Manual Extend buttons below add
     // extra ground/ocean beyond the auto-fit if you want a bigger sea.
-    // Per-axis island size. Capped at 3.0: 48 tiles (the GPU-safe max) reach
-    // +/-192 m, and the land radius kShoreOuter*scale (52*3=156 m) plus ocean
-    // margin fits. X and Z are independent -> wide ovals or long strips.
+    // Per-axis island size, independent -> wide ovals or long strips. Large
+    // islands keep a safe tile count by growing tile size (see
+    // CurrentTerrainParams), so this can go well past 10x.
     {
         const LevelDefinition before = level_;
         bool changed = ImGui::SliderFloat("Island width (X)",
-            &level_.terrainIslandScaleX, 0.5f, 3.0f, "%.2f x");
+            &level_.terrainIslandScaleX, 0.5f, 12.0f, "%.2f x");
         TrackItemEdit(before, changed);
     }
     {
         const LevelDefinition before = level_;
         bool changed = ImGui::SliderFloat("Island depth (Z)",
-            &level_.terrainIslandScaleZ, 0.5f, 3.0f, "%.2f x");
+            &level_.terrainIslandScaleZ, 0.5f, 12.0f, "%.2f x");
         TrackItemEdit(before, changed);
     }
     // Link toggle: drag either slider with this on to scale both together.
