@@ -20,9 +20,13 @@ cbuffer TerrainParams : register(b6) {
     float lodStep;
     float skirtDepth;
     float flattenRadius;
-    float islandScale;
+    float islandScaleX;   // per-axis coastline stretch
+    float islandScaleZ;
     uint sculptCount;
     float sculptMaxDisplacement;
+    int originTileX;   // grid min-corner offset in tiles (0 = centered)
+    int originTileZ;
+    uint terrainStyle; // 0 = smooth radial coast, 1 = stress island layout
 };
 
 struct TerrainSculptStamp {
@@ -135,27 +139,31 @@ float TerrainHeight(float2 xz) {
     // so the land ends in a beach and the ocean takes over. The ramp finishes
     // inside the terrain grid's own edge, so the mesh boundary is never visible
     // above water. Must match TerrainRendererDX12::HeightAt.
-    float coastDistance = length(xz);
-    if (islandScale > 1.5) {
-        float2 warped = xz + float2(
-            sin(xz.y * 0.055) * 7.0 + sin((xz.x + xz.y) * 0.025) * 4.0,
-            sin(xz.x * 0.047) * 6.0 - sin((xz.x - xz.y) * 0.031) * 3.0);
+    // Per-axis island size: normalise the coordinate by each axis' scale so the
+    // coastline stretches independently on X and Z. Shore thresholds stay at
+    // their base radii in this normalised space. Must match HeightAt.
+    float2 n = xz / float2(max(0.01, islandScaleX), max(0.01, islandScaleZ));
+    float maxScale = max(islandScaleX, islandScaleZ);
+    float coastDistance = length(n);
+    if (terrainStyle == 1 && maxScale > 1.5) {
+        float2 warped = n + float2(
+            sin(n.y * 0.055) * 7.0 + sin((n.x + n.y) * 0.025) * 4.0,
+            sin(n.x * 0.047) * 6.0 - sin((n.x - n.y) * 0.031) * 3.0);
         coastDistance = length(warped * float2(0.92, 1.06));
         float northwestBay = 1.0 - smoothstep(0.0, 22.0,
-            length(xz - float2(-55.0, 15.0)));
+            length(n - float2(-55.0, 15.0)));
         float southeastHeadland = 1.0 - smoothstep(0.0, 26.0,
-            length(xz - float2(35.0, -55.0)));
+            length(n - float2(35.0, -55.0)));
         coastDistance += northwestBay * 13.0;
         coastDistance -= southeastHeadland * 11.0;
     }
-    float shore = smoothstep(kShoreInner * islandScale,
-                             kShoreOuter * islandScale, coastDistance);
+    float shore = smoothstep(kShoreInner, kShoreOuter, coastDistance);
     h = lerp(h + kLandLift, kSeabed, shore);
 
     // Building pad, applied LAST so nothing else can dent it. The pool rim was
     // biting into the house footprint and dropping one corner ~2 m; forcing the
     // pad flat here means the houses always sit on genuinely level ground.
-    uint padCount = islandScale > 1.5 ? 8 : 1;
+    uint padCount = (terrainStyle == 1 && maxScale > 1.5) ? 8 : 1;
     for (uint i = 0; i < padCount; ++i) {
         float pad = 1.0 - smoothstep(
             kPadRadius, kPadFade, length(xz - kStressPadCenters[i]));
@@ -228,8 +236,8 @@ void MSMain(uint3 id : SV_GroupThreadID,
     uint tx = tileId % tilesX;
     uint tz = tileId / tilesX;
     float2 tileOrigin = float2(
-        ((float)tx - (float)tilesX * 0.5) * tileSize,
-        ((float)tz - (float)tilesZ * 0.5) * tileSize);
+        ((float)tx + (float)originTileX - (float)tilesX * 0.5) * tileSize,
+        ((float)tz + (float)originTileZ - (float)tilesZ * 0.5) * tileSize);
     float quadSize = tileSize / (float)n;
 
     for (uint vi = id.x; vi < gridVerts + skirtVerts; vi += 128) {

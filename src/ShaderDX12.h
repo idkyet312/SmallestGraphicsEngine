@@ -534,7 +534,9 @@ public:
         rootParams[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         rootParams[8].Constants.ShaderRegister = 6;
         rootParams[8].Constants.RegisterSpace = 0;
-        rootParams[8].Constants.Num32BitValues = 13;
+        // 15 DWORDs: grass uploads 13, terrain 15 (per-axis island scale + a
+        // terrain-style flag over the original 13). Both fit within this size.
+        rootParams[8].Constants.Num32BitValues = 15;
         rootParams[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         rootParams[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[9].Descriptor.ShaderRegister = 6;

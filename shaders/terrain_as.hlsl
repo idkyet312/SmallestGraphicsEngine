@@ -26,9 +26,13 @@ cbuffer TerrainParams : register(b6) {
     float lodStep;        // distance per LOD level after lodNear
     float skirtDepth;
     float flattenRadius;  // level pad around origin for the house
-    float islandScale;
+    float islandScaleX;   // per-axis coastline stretch
+    float islandScaleZ;
     uint sculptCount;
     float sculptMaxDisplacement;
+    int originTileX;   // grid min-corner offset in tiles (0 = centered)
+    int originTileZ;
+    uint terrainStyle; // 0 = smooth radial coast, 1 = stress island layout
 };
 
 struct TerrainPayload {
@@ -61,8 +65,8 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
     if (tileId < tileCount) {
         uint tx = tileId % tilesX;
         uint tz = tileId / tilesX;
-        float worldX = ((float)tx - (float)tilesX * 0.5) * tileSize;
-        float worldZ = ((float)tz - (float)tilesZ * 0.5) * tileSize;
+        float worldX = ((float)tx + (float)originTileX - (float)tilesX * 0.5) * tileSize;
+        float worldZ = ((float)tz + (float)originTileZ - (float)tilesZ * 0.5) * tileSize;
 
         float verticalReach = heightScale + sculptMaxDisplacement;
         float3 center3 = float3(worldX + tileSize * 0.5,

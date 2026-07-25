@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 #include <iostream>
 #include <fstream>
+#include <cstdlib>
 #include <vector>
 #include <string>
 #include <stdexcept>
@@ -96,6 +97,7 @@ struct DX12Context {
     
     bool initialized = false;
     bool tearingSupported = false;
+    bool debugLayerEnabled = false;   // D3D12 validation active (env/_DEBUG)
     
     // Descriptor heap allocation tracking
     UINT cbvSrvUavHeapOffset = 0;
@@ -189,15 +191,27 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     g_dx12.screenHeight = height;
     
     UINT dxgiFactoryFlags = 0;
-    
+
+    // Debug layer: always on in _DEBUG, and opt-in for Release via the env var
+    // SGE_D3D12_DEBUG=1 so a shipped build can still validate a crash on demand.
+    bool enableD3D12Debug = false;
 #ifdef _DEBUG
-    // Enable debug layer
+    enableD3D12Debug = true;
+#endif
+    {
+        char envValue[8] = {};
+        size_t envLen = 0;
+        if (getenv_s(&envLen, envValue, sizeof(envValue), "SGE_D3D12_DEBUG") == 0 &&
+            envLen > 0 && envValue[0] == '1')
+            enableD3D12Debug = true;
+    }
     ComPtr<ID3D12Debug> debugController;
-    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
+    if (enableD3D12Debug &&
+        SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
         debugController->EnableDebugLayer();
         dxgiFactoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
     }
-#endif
+    g_dx12.debugLayerEnabled = enableD3D12Debug;
     
     // Create DXGI Factory
     ThrowIfFailed(CreateDXGIFactory2(dxgiFactoryFlags, IID_PPV_ARGS(&g_dx12.factory)));
@@ -233,12 +247,12 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     // Create device
     ThrowIfFailed(D3D12CreateDevice(g_dx12.adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_dx12.device)));
 
-#ifdef _DEBUG
     // Disable break-on-error so an offscreen automated run doesn't halt in a
     // debugger trap. Register a callback (Win10 1903+) that writes validation
     // messages straight to a log file, since this app's own console can't be
-    // captured externally - this is the only reliable way to see them.
-    {
+    // captured externally - this is the only reliable way to see them. Runs
+    // whenever the debug layer is on (always in _DEBUG, or SGE_D3D12_DEBUG=1).
+    if (enableD3D12Debug) {
         ComPtr<ID3D12InfoQueue1> infoQueue1;
         if (SUCCEEDED(g_dx12.device.As(&infoQueue1))) {
             infoQueue1->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
@@ -255,7 +269,6 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
                 D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
         }
     }
-#endif
 
     // Create command queue
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};

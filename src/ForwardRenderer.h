@@ -24,6 +24,10 @@
 extern MeshShaderDX12 g_meshShader;
 extern bool g_useMeshShader;
 extern TerrainRendererDX12 g_terrain;
+// Shared island-builder terrain params (island size, extent, origin offset,
+// GPU-safe clamps). Defined in main.cpp; declared here so the terrain draw
+// uses the same params as foliage/collision/GI instead of a stale default.
+TerrainRendererDX12::Params CurrentTerrainParams();
 extern bool g_showH2Model;
 extern WaterVolume g_water;
 extern WaterVolume g_ocean;   // sea ringing the island
@@ -941,13 +945,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.SetObjectColor(scene.floor.color);
     }
     if (scene.useMeshTerrain && g_terrain.supported) {
-        TerrainRendererDX12::Params terrainParams;
+        // Use the shared island-builder params so the drawn mesh matches the
+        // island size/extent that foliage, collision and GI already read from
+        // CurrentTerrainParams(). Building a fresh Params{} here ignored the
+        // level's islandScale/extent, so the mesh never grew with the slider.
+        TerrainRendererDX12::Params terrainParams = CurrentTerrainParams();
         terrainParams.heightScale = scene.terrainHeightScale;
-        if (g_stressTestMode) {
-            terrainParams.tilesX = 32;
-            terrainParams.tilesZ = 32;
-            terrainParams.islandScale = 2.0f;
-        }
         g_terrain.Draw(shader, terrainParams);
         // Terrain used the mesh pipeline; restore the IA pipeline for the
         // raster draws that follow (same pattern as imported-model draws).

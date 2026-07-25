@@ -27,10 +27,23 @@ public:
         float lodStep = 28.0f;
         float skirtDepth = 1.0f;
         float flattenRadius = 14.0f;
-        float islandScale = 1.0f;
+        float islandScaleX = 1.0f;   // per-axis coastline stretch (X)
+        float islandScaleZ = 1.0f;   // per-axis coastline stretch (Z)
         UINT sculptCount = 0;
         float sculptMaxDisplacement = 0.0f;
+        // Grid min-corner offset in tiles; 0 keeps the legacy centered grid.
+        int originTileX = 0;
+        int originTileZ = 0;
+        // 0 = smooth radial coast (editor islands, stretches cleanly per axis);
+        // 1 = the Level-1 stress island (warped coast, NW bay, SE headland, 8
+        // building pads). Those features use fixed world positions that fragment
+        // when the coast is stretched, so they are stress-mode only.
+        UINT terrainStyle = 0;
     };
+    // Root param 8 is 15 DWORDs; Draw uploads 15. Keep the struct exactly that
+    // size so the upload never reads past it or shifts the cbuffer layout.
+    static_assert(sizeof(Params) == 15 * sizeof(UINT),
+                  "TerrainParams must be exactly 15 DWORDs (matches root const upload)");
 
     struct SculptGPU {
         float x, z, radius;
@@ -220,9 +233,15 @@ public:
         };
 
         // Outside the tiled extent there is no drawn ground; treat as level 0.
-        float halfX = params.tilesX * params.tileSize * 0.5f;
-        float halfZ = params.tilesZ * params.tileSize * 0.5f;
-        if (x < -halfX || x >= halfX || z < -halfZ || z >= halfZ) return 0.0f;
+        // The grid's min corner is offset by originTile* so an edge-extended
+        // island can grow off-center; match terrain_as/ms.hlsl's tile origin.
+        const float minX = (static_cast<float>(params.originTileX) -
+            params.tilesX * 0.5f) * params.tileSize;
+        const float minZ = (static_cast<float>(params.originTileZ) -
+            params.tilesZ * 0.5f) * params.tileSize;
+        const float maxX = minX + params.tilesX * params.tileSize;
+        const float maxZ = minZ + params.tilesZ * params.tileSize;
+        if (x < minX || x >= maxX || z < minZ || z >= maxZ) return 0.0f;
 
         float px = x * 0.08f, py = z * 0.08f;
         float sum = 0.0f, amp = 0.5f;
@@ -255,30 +274,37 @@ public:
         // lifted above sea level (y = 0), then ramps down to a seabed past the
         // shore, so the island is ringed by ocean.
         constexpr float landLift = 2.5f, seabed = -6.0f;
-        const float shoreInner = 34.0f * params.islandScale;
-        const float shoreOuter = 52.0f * params.islandScale;
+        constexpr float shoreInner = 34.0f;
+        constexpr float shoreOuter = 52.0f;
+        // Per-axis island size: normalise the coordinate by each axis' scale so
+        // the coastline stretches independently on X and Z (oval / strip). The
+        // shore thresholds stay at their base radii in this normalised space.
+        const float sx = (std::max)(0.01f, params.islandScaleX);
+        const float sz = (std::max)(0.01f, params.islandScaleZ);
+        const float nx = x / sx, nz = z / sz;
+        const float maxScale = (std::max)(params.islandScaleX, params.islandScaleZ);
         // Warp an oval coastline, then cut a northwest bay and extend a
         // southeast headland. This avoids the artificial circular-atoll shape.
-        float coastDistance = sqrtf(x * x + z * z);
+        float coastDistance = sqrtf(nx * nx + nz * nz);
         auto coastLobe = [](float distance, float radius) {
             float t = distance / radius;
             t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
             return 1.0f - t * t * (3.0f - 2.0f * t);
         };
-        if (params.islandScale > 1.5f) {
-            const float warpedX = x + sinf(z * 0.055f) * 7.0f +
-                sinf((x + z) * 0.025f) * 4.0f;
-            const float warpedZ = z + sinf(x * 0.047f) * 6.0f -
-                sinf((x - z) * 0.031f) * 3.0f;
+        if (params.terrainStyle == 1u && maxScale > 1.5f) {
+            const float warpedX = nx + sinf(nz * 0.055f) * 7.0f +
+                sinf((nx + nz) * 0.025f) * 4.0f;
+            const float warpedZ = nz + sinf(nx * 0.047f) * 6.0f -
+                sinf((nx - nz) * 0.031f) * 3.0f;
             coastDistance = sqrtf(
                 warpedX * warpedX * 0.92f * 0.92f +
                 warpedZ * warpedZ * 1.06f * 1.06f);
             coastDistance += coastLobe(
-                sqrtf((x + 55.0f) * (x + 55.0f) +
-                      (z - 15.0f) * (z - 15.0f)), 22.0f) * 13.0f;
+                sqrtf((nx + 55.0f) * (nx + 55.0f) +
+                      (nz - 15.0f) * (nz - 15.0f)), 22.0f) * 13.0f;
             coastDistance -= coastLobe(
-                sqrtf((x - 35.0f) * (x - 35.0f) +
-                      (z + 55.0f) * (z + 55.0f)), 26.0f) * 11.0f;
+                sqrtf((nx - 35.0f) * (nx - 35.0f) +
+                      (nz + 55.0f) * (nz + 55.0f)), 26.0f) * 11.0f;
         }
         float st = (coastDistance - shoreInner) / (shoreOuter - shoreInner);
         st = st < 0.0f ? 0.0f : (st > 1.0f ? 1.0f : st);
@@ -297,7 +323,7 @@ public:
             { 42.0f,  42.0f }, {-42.0f,  42.0f },
             {  0.0f, -42.0f }, { 42.0f, -42.0f }
         };
-        const int padCount = params.islandScale > 1.5f ? 8 : 1;
+        const int padCount = (params.terrainStyle == 1u && maxScale > 1.5f) ? 8 : 1;
         for (int i = 0; i < padCount; ++i) {
             float dpx = x - padCenters[i][0], dpz = z - padCenters[i][1];
             float dpad = sqrtf(dpx * dpx + dpz * dpz);
@@ -717,7 +743,7 @@ public:
         drawParams.sculptCount = static_cast<UINT>(s_sculptStamps.size());
         drawParams.sculptMaxDisplacement = m_sculptMaxDisplacement;
         UploadSculptStamps(g_dx12.frameIndex);
-        commandList6->SetGraphicsRoot32BitConstants(8, 11, &drawParams, 0);
+        commandList6->SetGraphicsRoot32BitConstants(8, 15, &drawParams, 0);
         commandList6->SetGraphicsRootShaderResourceView(
             13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
         const UINT tileCount = params.tilesX * params.tilesZ;

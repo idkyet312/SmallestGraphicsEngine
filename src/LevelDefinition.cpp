@@ -157,6 +157,17 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         result.errors.push_back("terrain heightScale must be between 0 and 50");
     if (level.terrainSculpt.size() > 256)
         result.errors.push_back("terrain sculpt supports at most 256 stamps");
+    if (level.terrainTilesX < 4 || level.terrainTilesX > 48 ||
+        level.terrainTilesZ < 4 || level.terrainTilesZ > 48)
+        result.errors.push_back("terrain tile extent must be between 4 and 48");
+    if (!std::isfinite(level.terrainIslandScaleX) ||
+        level.terrainIslandScaleX < 0.5f || level.terrainIslandScaleX > 6.0f ||
+        !std::isfinite(level.terrainIslandScaleZ) ||
+        level.terrainIslandScaleZ < 0.5f || level.terrainIslandScaleZ > 6.0f)
+        result.errors.push_back("terrain island scale must be between 0.5 and 6");
+    if (level.terrainOriginTileX < -256 || level.terrainOriginTileX > 256 ||
+        level.terrainOriginTileZ < -256 || level.terrainOriginTileZ > 256)
+        result.errors.push_back("terrain origin tile offset out of range");
     const LevelDXRDDGISettings& gi = level.dxrDDGI;
     if (!std::isfinite(gi.surfaceSpacing) || gi.surfaceSpacing < 0.25f ||
         gi.surfaceSpacing > 50.0f || !std::isfinite(gi.surfaceOffset) ||
@@ -234,6 +245,20 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         level.schemaVersion = root.at("schemaVersion").get<uint32_t>();
         level.name = root.at("name").get<std::string>();
         level.terrainHeightScale = root.at("terrain").at("heightScale").get<float>();
+        {
+            const json& terrainRoot = root.at("terrain");
+            level.terrainTilesX = terrainRoot.value("tilesX", 16u);
+            level.terrainTilesZ = terrainRoot.value("tilesZ", 16u);
+            // Back-compat: old files stored a single "islandScale"; use it as
+            // the default for both axes, then let per-axis keys override.
+            const float legacyScale = terrainRoot.value("islandScale", 1.0f);
+            level.terrainIslandScaleX =
+                terrainRoot.value("islandScaleX", legacyScale);
+            level.terrainIslandScaleZ =
+                terrainRoot.value("islandScaleZ", legacyScale);
+            level.terrainOriginTileX = terrainRoot.value("originTileX", 0);
+            level.terrainOriginTileZ = terrainRoot.value("originTileZ", 0);
+        }
         if (root.contains("lighting") && root.at("lighting").is_object() &&
             root.at("lighting").contains("dxrDDGI")) {
             const json& source = root.at("lighting").at("dxrDDGI");
@@ -343,6 +368,12 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
         const json root = {
             {"schemaVersion", level.schemaVersion}, {"name", level.name},
             {"terrain", {{"heightScale", level.terrainHeightScale},
+                         {"tilesX", level.terrainTilesX},
+                         {"tilesZ", level.terrainTilesZ},
+                         {"islandScaleX", level.terrainIslandScaleX},
+                         {"islandScaleZ", level.terrainIslandScaleZ},
+                         {"originTileX", level.terrainOriginTileX},
+                         {"originTileZ", level.terrainOriginTileZ},
                          {"sculpt", std::move(sculpt)}}},
             {"lighting", {{"dxrDDGI", {
                 {"enabled", level.dxrDDGI.enabled},

@@ -76,6 +76,22 @@ struct LevelDefinition {
     uint32_t schemaVersion = 1;
     std::string name = "Untitled Level";
     float terrainHeightScale = 5.0f;
+    // Island builder: terrain drawn extent (tile grid) and coastline scale. The
+    // ocean is procedurally ringed around the land, so growing tiles + island
+    // scale together makes a bigger island with more open water around it.
+    uint32_t terrainTilesX = 16;
+    uint32_t terrainTilesZ = 16;
+    // Per-axis island size: the land coastline stretches independently along X
+    // and Z, so the island can be a wide oval or a long strip, not just a
+    // uniform disc. 1.0 = the original Level 1 radius on that axis.
+    float terrainIslandScaleX = 1.0f;
+    float terrainIslandScaleZ = 1.0f;
+    // Grid min-corner offset in tiles from the origin. Zero keeps the grid
+    // centered (legacy behaviour: origin = -tiles/2 .. +tiles/2). Extending an
+    // edge in the editor grows one dimension and shifts this so the new tiles
+    // appear on the clicked side instead of forcing symmetric growth.
+    int32_t terrainOriginTileX = 0;
+    int32_t terrainOriginTileZ = 0;
     std::vector<TerrainSculptStamp> terrainSculpt;
     LevelDXRDDGISettings dxrDDGI;
     std::vector<LevelEntity> entities;

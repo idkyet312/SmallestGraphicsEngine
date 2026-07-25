@@ -142,17 +142,23 @@ public:
         DirectX::XMStoreFloat4x4(&localTransform, m);
     }
     
-    void UpdateGlobalTransform(const DirectX::XMFLOAT4X4& parentGlobal) {
+    void UpdateGlobalTransform(const DirectX::XMFLOAT4X4& parentGlobal,
+                               int depth = 0) {
+        // Depth guard: a malformed/cyclic imported model (a child that also
+        // appears up its own ancestor chain) would recurse until the thread
+        // stack overflows and crashes in a deep memcpy. Real hierarchies are
+        // shallow; 256 is far beyond any legitimate model.
+        if (depth > 256) return;
         UpdateLocalTransform(); // Ensure local is fresh
-        
+
         DirectX::XMMATRIX local = DirectX::XMLoadFloat4x4(&localTransform);
         DirectX::XMMATRIX parent = DirectX::XMLoadFloat4x4(&parentGlobal);
         DirectX::XMMATRIX global = DirectX::XMMatrixMultiply(local, parent);
-        
+
         DirectX::XMStoreFloat4x4(&globalTransform, global);
-        
+
         for (auto& child : children) {
-            child->UpdateGlobalTransform(globalTransform);
+            child->UpdateGlobalTransform(globalTransform, depth + 1);
         }
     }
 };

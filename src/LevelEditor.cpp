@@ -517,6 +517,7 @@ void LevelEditor::OnKeyDown(unsigned key, bool controlDown) {
     if (playing_) return;
     if (controlDown && key == 'Z') Undo();
     else if (controlDown && key == 'Y') Redo();
+    else if (controlDown && key == 'D') DuplicateSelected();
     else if (key == 'W') gizmoOperation_ = 0;
     else if (key == 'E') gizmoOperation_ = 1;
     else if (key == 'R') gizmoOperation_ = 2;
@@ -548,6 +549,12 @@ bool LevelEditor::FoliageChanged(const LevelDefinition& before) const {
 
 bool LevelEditor::TerrainChanged(const LevelDefinition& before) const {
     if (before.terrainHeightScale != level_.terrainHeightScale ||
+        before.terrainTilesX != level_.terrainTilesX ||
+        before.terrainTilesZ != level_.terrainTilesZ ||
+        before.terrainIslandScaleX != level_.terrainIslandScaleX ||
+        before.terrainIslandScaleZ != level_.terrainIslandScaleZ ||
+        before.terrainOriginTileX != level_.terrainOriginTileX ||
+        before.terrainOriginTileZ != level_.terrainOriginTileZ ||
         before.terrainSculpt.size() != level_.terrainSculpt.size()) return true;
     for (size_t i = 0; i < before.terrainSculpt.size(); ++i) {
         const TerrainSculptStamp& a = before.terrainSculpt[i];
@@ -712,6 +719,131 @@ void LevelEditor::PaintFoliage(CXMMATRIX view, CXMMATRIX projection,
     foliageStrokeChanged_ = true;
 }
 
+namespace {
+// Must match TerrainRendererDX12::Params::tileSize and the GPU-safe clamp in
+// main.cpp's CurrentTerrainParams (kMaxTilesPerAxis).
+constexpr float kEditorTileSize = 8.0f;
+constexpr int kEditorMaxTiles = 48;
+
+// World-space min corner of the current tile grid, mirroring the terrain
+// shaders: origin = (originTile - tiles/2) * tileSize.
+void GridMinCorner(const LevelDefinition& level, float& minX, float& minZ) {
+    minX = (static_cast<float>(level.terrainOriginTileX) -
+        level.terrainTilesX * 0.5f) * kEditorTileSize;
+    minZ = (static_cast<float>(level.terrainOriginTileZ) -
+        level.terrainTilesZ * 0.5f) * kEditorTileSize;
+}
+} // namespace
+
+void LevelEditor::ExtendTerrain(int direction) {
+    const LevelDefinition before = level_;
+    // Growing +X/+Z just adds a column/row on the max side (origin unchanged,
+    // since the min corner stays put). Growing -X/-Z adds on the min side and
+    // shifts the origin down by one tile so existing land keeps its world spot.
+    switch (direction) {
+        case 0: // +X
+            if (static_cast<int>(level_.terrainTilesX) >= kEditorMaxTiles) return;
+            level_.terrainTilesX += 1;
+            break;
+        case 1: // -X
+            if (static_cast<int>(level_.terrainTilesX) >= kEditorMaxTiles) return;
+            level_.terrainTilesX += 1;
+            level_.terrainOriginTileX -= 1;
+            break;
+        case 2: // +Z
+            if (static_cast<int>(level_.terrainTilesZ) >= kEditorMaxTiles) return;
+            level_.terrainTilesZ += 1;
+            break;
+        case 3: // -Z
+            if (static_cast<int>(level_.terrainTilesZ) >= kEditorMaxTiles) return;
+            level_.terrainTilesZ += 1;
+            level_.terrainOriginTileZ -= 1;
+            break;
+        default: return;
+    }
+    MarkChanged(before);
+    status_ = "Terrain extended.";
+}
+
+void LevelEditor::ExtendTerrainInteraction(CXMMATRIX view, CXMMATRIX projection) {
+    if (terrainTool_ != 4) return;
+
+    float minX, minZ;
+    GridMinCorner(level_, minX, minZ);
+    const float maxX = minX + level_.terrainTilesX * kEditorTileSize;
+    const float maxZ = minZ + level_.terrainTilesZ * kEditorTileSize;
+    const XMMATRIX viewProj = view * projection;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+
+    // Project a world point (y=0 ground plane) to screen. Returns false when the
+    // point is at/behind the near plane OR projects far outside the viewport:
+    // dividing by a near-zero w yields million-pixel coordinates that overflow
+    // ImGui's draw-list clipping and crash. A generous off-screen margin lets
+    // partly-visible grid lines still draw, but rejects the degenerate cases.
+    auto project = [&](float wx, float wz, ImVec2& out) -> bool {
+        const XMVECTOR raw = XMVector4Transform(
+            XMVectorSet(wx, 0.0f, wz, 1.0f), viewProj);
+        const float w = XMVectorGetW(raw);
+        if (w <= 0.05f) return false;   // near/behind camera
+        const float ndcX = XMVectorGetX(raw) / w;
+        const float ndcY = XMVectorGetY(raw) / w;
+        const float sx = (ndcX * 0.5f + 0.5f) * display.x;
+        const float sy = (1.0f - (ndcY * 0.5f + 0.5f)) * display.y;
+        // Clamp to a bounded off-screen margin so ImGui never sees wild coords.
+        const float margin = 8192.0f;
+        if (sx < -margin || sx > display.x + margin ||
+            sy < -margin || sy > display.y + margin) return false;
+        out = ImVec2(sx, sy);
+        return true;
+    };
+
+    // Draw the grid lines so the tiles are visible (Unreal-style).
+    const ImU32 gridCol = IM_COL32(90, 200, 255, 90);
+    for (uint32_t i = 0; i <= level_.terrainTilesX; ++i) {
+        const float wx = minX + i * kEditorTileSize;
+        ImVec2 a, b;
+        if (project(wx, minZ, a) && project(wx, maxZ, b))
+            draw->AddLine(a, b, gridCol, 1.0f);
+    }
+    for (uint32_t j = 0; j <= level_.terrainTilesZ; ++j) {
+        const float wz = minZ + j * kEditorTileSize;
+        ImVec2 a, b;
+        if (project(minX, wz, a) && project(maxX, wz, b))
+            draw->AddLine(a, b, gridCol, 1.0f);
+    }
+
+    // One clickable "add tile" band just past each edge, drawn as a filled strip
+    // at the grid's mid-line on that side. Hovering highlights; click extends.
+    const float midX = (minX + maxX) * 0.5f;
+    const float midZ = (minZ + maxZ) * 0.5f;
+    const float t = kEditorTileSize;
+    struct Edge { int dir; float cx, cz; const char* label; };
+    const Edge edges[4] = {
+        { 0, maxX + t * 0.5f, midZ, "+X" },
+        { 1, minX - t * 0.5f, midZ, "-X" },
+        { 2, midX, maxZ + t * 0.5f, "+Z" },
+        { 3, midX, minZ - t * 0.5f, "-Z" },
+    };
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const bool blocked = ImGui::GetIO().WantCaptureMouse;
+    for (const Edge& e : edges) {
+        ImVec2 center;
+        if (!project(e.cx, e.cz, center)) continue;
+        const float r = 16.0f;
+        const bool hovered = !blocked &&
+            std::abs(mouse.x - center.x) < r && std::abs(mouse.y - center.y) < r;
+        const ImU32 col = hovered ? IM_COL32(120, 255, 140, 235)
+                                  : IM_COL32(90, 200, 255, 170);
+        draw->AddRectFilled(ImVec2(center.x - r, center.y - r * 0.7f),
+                            ImVec2(center.x + r, center.y + r * 0.7f), col, 3.0f);
+        draw->AddText(ImVec2(center.x - 7.0f, center.y - 7.0f),
+                      IM_COL32(10, 20, 10, 255), e.label);
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            ExtendTerrain(e.dir);
+    }
+}
+
 void LevelEditor::SculptTerrain(CXMMATRIX view, CXMMATRIX projection,
     const std::function<float(float, float)>& terrainHeight) {
     const bool released = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
@@ -727,7 +859,9 @@ void LevelEditor::SculptTerrain(CXMMATRIX view, CXMMATRIX projection,
         terrainStrokeActive_ = false;
         terrainStrokeChanged_ = false;
     }
-    if (terrainTool_ == 0 || ImGui::GetIO().WantCaptureMouse || ImGuizmo::IsOver())
+    // Tools: 1 raise, 2 lower, 3 flatten. 0 select and 4 grow don't sculpt.
+    if (terrainTool_ == 0 || terrainTool_ == 4 ||
+        ImGui::GetIO().WantCaptureMouse || ImGuizmo::IsOver())
         return;
     XMFLOAT3 hit;
     if (!TerrainPointUnderMouse(view, projection, terrainHeight, hit)) return;
@@ -1490,6 +1624,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::SameLine();
     if (ImGui::RadioButton("Lower", &terrainTool_, 2)) foliageTool_ = 0;
     if (ImGui::RadioButton("Flatten", &terrainTool_, 3)) foliageTool_ = 0;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Grow", &terrainTool_, 4)) foliageTool_ = 0;
     ImGui::SliderFloat("Brush radius", &terrainBrushRadius_, 0.5f, 15.0f, "%.1f m");
     ImGui::SliderFloat("Strength", &terrainBrushStrength_, 0.05f, 2.0f, "%.2f");
     ImGui::SliderFloat("Stroke spacing", &terrainBrushSpacing_, 0.2f, 8.0f, "%.2f m");
@@ -1502,6 +1638,52 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     }
     ImGui::EndDisabled();
     ImGui::TextWrapped("Hold LMB on terrain. Flatten uses height where stroke starts.");
+
+    ImGui::SeparatorText("Island Builder");
+    // Island size = the land radius. The tile grid auto-grows to fit it (see
+    // CurrentTerrainParams), so this one slider stretches the whole island and
+    // the ground + surrounding ocean follow. Manual Extend buttons below add
+    // extra ground/ocean beyond the auto-fit if you want a bigger sea.
+    // Per-axis island size. Capped at 3.0: 48 tiles (the GPU-safe max) reach
+    // +/-192 m, and the land radius kShoreOuter*scale (52*3=156 m) plus ocean
+    // margin fits. X and Z are independent -> wide ovals or long strips.
+    {
+        const LevelDefinition before = level_;
+        bool changed = ImGui::SliderFloat("Island width (X)",
+            &level_.terrainIslandScaleX, 0.5f, 3.0f, "%.2f x");
+        TrackItemEdit(before, changed);
+    }
+    {
+        const LevelDefinition before = level_;
+        bool changed = ImGui::SliderFloat("Island depth (Z)",
+            &level_.terrainIslandScaleZ, 0.5f, 3.0f, "%.2f x");
+        TrackItemEdit(before, changed);
+    }
+    // Link toggle: drag either slider with this on to scale both together.
+    {
+        const LevelDefinition before = level_;
+        if (ImGui::Button("Make Square")) {
+            const float s = (std::max)(level_.terrainIslandScaleX,
+                                       level_.terrainIslandScaleZ);
+            level_.terrainIslandScaleX = s;
+            level_.terrainIslandScaleZ = s;
+            MarkChanged(before);
+        }
+    }
+
+    ImGui::SeparatorText("Extend Terrain");
+    ImGui::Text("Grid: %u x %u tiles", level_.terrainTilesX, level_.terrainTilesZ);
+    // Directional growth: add a row/column on one side. The 'Grow' tool also
+    // lets you click the on-screen edge markers to do the same thing.
+    if (ImGui::Button("-Z")) ExtendTerrain(3);
+    ImGui::SameLine();
+    if (ImGui::Button("-X")) ExtendTerrain(1);
+    ImGui::SameLine();
+    if (ImGui::Button("+X")) ExtendTerrain(0);
+    ImGui::SameLine();
+    if (ImGui::Button("+Z")) ExtendTerrain(2);
+    ImGui::TextWrapped("Pick the Grow tool to see the tile grid and click an "
+                       "edge marker, or use these buttons. Max 48 tiles/side.");
     ImGui::End();
 
     ImGui::Begin("DXR Lumen Lite");
@@ -1650,6 +1832,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     }
 
     SculptTerrain(view, projection, terrainHeight);
+    ExtendTerrainInteraction(view, projection);
     PaintFoliage(view, projection, terrainHeight);
     if (foliageTool_ == 0 && terrainTool_ == 0)
         SelectFromViewport(view, projection);
