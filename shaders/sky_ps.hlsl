@@ -12,6 +12,8 @@ cbuffer SkyBuffer : register(b0) {
 Texture2D skyEquirectangular : register(t0);
 SamplerState skySampler : register(s0);
 
+#include "color_grade.hlsli"
+
 struct PSInput {
     float4 position : SV_Position;
     float2 uv : TEXCOORD0;
@@ -53,6 +55,7 @@ float4 main(PSInput input) : SV_Target {
 #else
     color = TonemapACES(hdr * exposure);
     color = pow(color, 1.0 / 2.2);
+    color = ApplySceneColorGrade(color);
 #endif
     return float4(color, 1.0);
 }

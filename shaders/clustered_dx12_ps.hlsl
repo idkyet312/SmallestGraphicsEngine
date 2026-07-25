@@ -523,6 +523,8 @@ float3 agxDefaultContrastApprox(float3 x) {
           - 0.00232;
 }
 
+#include "color_grade.hlsli"
+
 float3 tonemapAgXPunchy(float3 color) {
     // Input transform (sRGB primaries -> AgX working space).
     const float3x3 agxIn = float3x3(
@@ -549,7 +551,7 @@ float3 tonemapAgXPunchy(float3 color) {
     color = luma + 1.4 * (color - luma);      // punchy saturation
 
     color = mul(agxOut, color);
-    return saturate(color);                   // already display-encoded
+    return ApplySceneColorGrade(color);       // already display-encoded
 }
 
 float3 FinalizeOutput(float3 color) {
