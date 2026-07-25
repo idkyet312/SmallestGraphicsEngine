@@ -614,6 +614,16 @@ float4 main(PS_INPUT input) : SV_TARGET {
         else if (alphaCut > 0.5) clip(texColor.a - 0.20);
         // Textures are uploaded as UNORM, so decode authored sRGB before lighting.
         albedo = pow(max(texColor.rgb, 0.0), 2.2) * objectColor;
+        // Palm-leaf photos carry near-black shadowed leaflets; gamma decode crushes
+        // them to zero, so backlit crown fronds read as black silhouettes. Lift the
+        // darkest foliage texels toward a leafy green so they can catch light.
+        // Blend the darkest leaflets toward a leafy green rather than just
+        // clamping, so near-black photo pixels never survive as black tips.
+        if (alphaCut > 0.5 && alphaCut < 1.5) {
+            float leafLum = dot(albedo, float3(0.299, 0.587, 0.114));
+            float dark = 1.0 - smoothstep(0.02, 0.12, leafLum);
+            albedo = lerp(albedo, float3(0.10, 0.20, 0.06), dark * 0.85);
+        }
     }
 #endif
     float metal = metalness;
@@ -793,8 +803,25 @@ float4 main(PS_INPUT input) : SV_TARGET {
     result += diffuseAlbedo * max(viewFillStrength, 0.0) * frontFill *
               ambientLightingIntensity;
     float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor * NdotL * attenuation * shadowVisibility; // No light intensity? lightColor should allow > 1.
-    
+
     result += Lo;
+
+    // Foliage back-light: thin palm fronds transmit sun coming from behind them,
+    // so a leaf between the camera and the sun should glow instead of silhouetting
+    // black. Gated to alpha-cut leaf cards; skips the hair (luminance) cutout.
+    if (alphaCut > 0.5 && alphaCut < 1.5)
+    {
+        float backLit = pow(saturate(dot(viewDir, -lightDir)), 3.0);
+        float3 transmission = albedo * lightColor * backLit *
+                              attenuation * shadowVisibility * 0.5;
+        result += transmission;
+        // Sky-side fill so backlit fronds keep a readable green instead of
+        // silhouetting flat against a bright sky.
+        result += albedo * skyContribution * 0.6;
+        // Flat foliage floor: guarantee every frond, even fully backlit tips,
+        // shows some green and never renders as a pure-black silhouette.
+        result += albedo * 0.35;
+    }
 
     // Point lights contribution (clustered forward)
     // Need to PBR-ify this too

@@ -511,6 +511,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::SliderFloat("Fog Anisotropy", &scene.volumetricFogAnisotropy,
                                0.0f, 0.9f, "%.2f");
             ImGui::ColorEdit3("Fog Tint", &scene.volumetricFogTint.x);
+            ImGui::SliderFloat("Fog Height Falloff", &scene.volumetricFogHeightFalloff,
+                               0.01f, 0.25f, "%.3f");
+            ImGui::DragFloat("Fog Base Height", &scene.volumetricFogBaseHeight,
+                             0.1f, -5.0f, 30.0f, "%.1f m");
             ImGui::DragFloat("Fog Distance", &scene.volumetricFogDistance,
                              5.0f, 20.0f, scene.cameraFar, "%.0f m");
         }
