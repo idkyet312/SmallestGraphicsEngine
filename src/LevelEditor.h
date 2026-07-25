@@ -42,6 +42,13 @@ public:
     void BeginPlay();
     void StopPlay();
     bool IsPlaying() const { return playing_; }
+    // True while the user is mid-edit (dragging the gizmo, painting foliage, or
+    // sculpting terrain). The runtime sync (asset refresh + prefab reload + GPU
+    // rebuild) is heavy and must not run every drag frame - it lags and races
+    // GPU work. Callers defer the heavy sync until interaction settles.
+    bool IsInteracting() const {
+        return gizmoWasUsing_ || foliageStrokeActive_ || terrainStrokeActive_;
+    }
     bool ImportInProgress() const { return pendingImport_.valid(); }
     void OpenAssetBrowser() { assetBrowserOpen_ = true; }
     bool IsDirty() const { return dirty_; }
@@ -115,6 +122,12 @@ private:
     bool TerrainChanged(const LevelDefinition& before) const;
     void SculptTerrain(DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
         const std::function<float(float, float)>& terrainHeight);
+    // Grow the terrain tile grid by one row/column on a side (0=+X,1=-X,2=+Z,
+    // 3=-Z), shifting the grid origin so the new tiles land on that side.
+    void ExtendTerrain(int direction);
+    // Draw the tile grid + highlighted extendable edges; click an edge to grow.
+    void ExtendTerrainInteraction(DirectX::CXMMATRIX view,
+        DirectX::CXMMATRIX projection);
 
     LevelDefinition level_ = MakeLevelOneTemplate();
     LevelDefinition playSnapshot_;

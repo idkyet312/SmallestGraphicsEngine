@@ -214,6 +214,9 @@ static Camera               g_editorCameraSnapshot;
 static LevelDefinition      g_runtimeLevel = MakeLevelOneTemplate();
 static std::vector<TerrainSculptStamp> g_runtimeTerrainSculpt;
 static bool                 g_customLevelMode = false;
+// Editor fly-camera speed multiplier, adjusted with the mouse wheel (Unreal
+// style). Persists across frames; clamped to a sane range.
+static float                g_editorCameraSpeed = 1.0f;
 static bool                 g_pendingEnvironmentRebuild = false;
 static std::string          g_activeCustomLevelName;
 static std::string          g_mainMenuLevelStatus;
@@ -255,12 +258,45 @@ static size_t ActiveBanditSlotCount() {
     return g_stressTestMode ? kStressBanditCount : 4 * kEnemiesPerSpawner;
 }
 
-static TerrainRendererDX12::Params CurrentTerrainParams() {
+TerrainRendererDX12::Params CurrentTerrainParams() {
     TerrainRendererDX12::Params params;
     if (g_stressTestMode) {
         params.tilesX = 32;
         params.tilesZ = 32;
-        params.islandScale = 2.0f;
+        params.islandScaleX = 2.0f;
+        params.islandScaleZ = 2.0f;
+        params.terrainStyle = 1;   // warped coast + bay/headland + 8 house pads
+    } else {
+        // Island builder: extent + per-axis coastline scale come from the loaded
+        // level (mirrored into scene by ApplyRuntimeLevelBasics), so growing the
+        // island in the editor expands the ground and the ocean around it.
+        // Hard-clamp the tile grid: the mesh/amplification path tessellates per
+        // tile, and an oversized extent hangs the GPU (TDR / device removed).
+        // 48x48 = ~2300 tiles is well within budget (stress mode uses 32x32).
+        constexpr UINT kMaxTilesPerAxis = 48;
+        params.islandScaleX = (std::max)(0.5f,
+            (std::min)(scene.terrainIslandScaleX, 6.0f));
+        params.islandScaleZ = (std::max)(0.5f,
+            (std::min)(scene.terrainIslandScaleZ, 6.0f));
+        // The land reaches ~kShoreOuter*scale on each axis (52 m in
+        // terrain_ms.hlsl). The tile grid must reach past that shore per axis or
+        // the ground plane clips the island before the beach fades to ocean.
+        // Auto-grow each axis independently so the island + ground + ocean follow
+        // the sliders, and a wide island doesn't force a wastefully deep grid.
+        constexpr float kShoreOuter = 52.0f;
+        constexpr float kOceanMargin = 24.0f;   // open water ringing the beach
+        const float needHalfX = kShoreOuter * params.islandScaleX + kOceanMargin;
+        const float needHalfZ = kShoreOuter * params.islandScaleZ + kOceanMargin;
+        const UINT fitTilesX = static_cast<UINT>(
+            std::ceil(2.0f * needHalfX / params.tileSize));
+        const UINT fitTilesZ = static_cast<UINT>(
+            std::ceil(2.0f * needHalfZ / params.tileSize));
+        params.tilesX = (std::min)(
+            (std::max)(scene.terrainTilesX, fitTilesX), kMaxTilesPerAxis);
+        params.tilesZ = (std::min)(
+            (std::max)(scene.terrainTilesZ, fitTilesZ), kMaxTilesPerAxis);
+        params.originTileX = scene.terrainOriginTileX;
+        params.originTileZ = scene.terrainOriginTileZ;
     }
     return params;
 }
@@ -1543,8 +1579,12 @@ static void AppendDXRDDGITerrain(std::vector<DXRProbeTriangle>& triangles,
         g_runtimeLevel.dxrDDGI.surfaceSpacing);
     const uint32_t columns = static_cast<uint32_t>(std::ceil(width / step));
     const uint32_t rows = static_cast<uint32_t>(std::ceil(depth / step));
-    const float startX = -width * 0.5f;
-    const float startZ = -depth * 0.5f;
+    // Grid min corner honours the tile origin offset so GI probes track an
+    // edge-extended (off-center) island instead of the old centered rectangle.
+    const float startX = (static_cast<float>(params.originTileX) -
+        params.tilesX * 0.5f) * params.tileSize;
+    const float startZ = (static_cast<float>(params.originTileZ) -
+        params.tilesZ * 0.5f) * params.tileSize;
     auto point = [&](uint32_t x, uint32_t z) {
         const float px = startX + (std::min)(width, x * step);
         const float pz = startZ + (std::min)(depth, z * step);
@@ -1669,11 +1709,15 @@ static bool BuildDXRDDGIAccelerationScene() {
         std::vector<uint32_t> indices;
         vertices.reserve((columns + 1u) * (rows + 1u));
         uint64_t terrainHash = 1469598103934665603ull;
+        const float terrainStartX = (static_cast<float>(params.originTileX) -
+            params.tilesX * 0.5f) * params.tileSize;
+        const float terrainStartZ = (static_cast<float>(params.originTileZ) -
+            params.tilesZ * 0.5f) * params.tileSize;
         for (uint32_t z = 0; z <= rows; ++z) {
             for (uint32_t x = 0; x <= columns; ++x) {
-                const float px = -width * 0.5f +
+                const float px = terrainStartX +
                     (std::min)(width, x * step);
-                const float pz = -depth * 0.5f +
+                const float pz = terrainStartZ +
                     (std::min)(depth, z * step);
                 XMFLOAT3 vertex(
                     px, TerrainRendererDX12::HeightAt(params, px, pz), pz);
@@ -3282,6 +3326,12 @@ static const LevelEntity* FirstRuntimeEntity(LevelEntityType type) {
 static void ApplyRuntimeLevelBasics(bool movePlayer) {
     if (!g_customLevelMode) return;
     scene.terrainHeightScale = g_runtimeLevel.terrainHeightScale;
+    scene.terrainTilesX = g_runtimeLevel.terrainTilesX;
+    scene.terrainTilesZ = g_runtimeLevel.terrainTilesZ;
+    scene.terrainIslandScaleX = g_runtimeLevel.terrainIslandScaleX;
+    scene.terrainIslandScaleZ = g_runtimeLevel.terrainIslandScaleZ;
+    scene.terrainOriginTileX = g_runtimeLevel.terrainOriginTileX;
+    scene.terrainOriginTileZ = g_runtimeLevel.terrainOriginTileZ;
     g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
     scene.useDDGI = g_runtimeLevel.dxrDDGI.enabled &&
                     g_dxrDDGI.GetStatus().dxrSupported;
@@ -4744,8 +4794,8 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
 // Vertex transforms are baked because the
 // destruction system consumes child geometry directly rather than node poses.
 static std::shared_ptr<SceneNode> CloneSceneTree(
-    const std::shared_ptr<SceneNode>& source) {
-    if (!source) return {};
+    const std::shared_ptr<SceneNode>& source, int depth = 0) {
+    if (!source || depth > 256) return {};   // guard cyclic/degenerate trees
     auto clone = std::make_shared<SceneNode>(source->name);
     clone->translation = source->translation;
     clone->rotation = source->rotation;
@@ -4753,7 +4803,7 @@ static std::shared_ptr<SceneNode> CloneSceneTree(
     if (source->mesh)
         clone->mesh = std::make_shared<SceneMesh>(*source->mesh);
     for (const auto& child : source->children)
-        clone->AddChild(CloneSceneTree(child));
+        clone->AddChild(CloneSceneTree(child, depth + 1));
     return clone;
 }
 
@@ -4893,6 +4943,50 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
     root->UpdateGlobalTransform(identity);
 }
 
+// Cheap per-frame sync used while the user is actively dragging in the editor.
+// Updates only entity transforms already present in the runtime level and the
+// prefab render batches - no registry refresh, no model reload, no GPU rebuild,
+// no WaitForGPU. Deliberately does NOT clear runtimeDirty_, so the full
+// SynchronizeEditorRuntime runs once when the interaction settles.
+static void SynchronizeEditorRuntimeLight() {
+    if (gameScreen != GameScreen::LevelEditor) return;
+    const LevelDefinition& edited = g_levelEditor.Level();
+    // Only a live transform update is safe here. If the entity set changed
+    // (add/delete/duplicate) the batches are stale; leave it for the full sync.
+    if (edited.entities.size() != g_runtimeLevel.entities.size()) return;
+
+    // Map entityId -> new world transform for prefab/rock entities.
+    for (size_t i = 0; i < edited.entities.size(); ++i) {
+        const LevelEntity& src = edited.entities[i];
+        LevelEntity& dst = g_runtimeLevel.entities[i];
+        if (dst.id != src.id) return;   // ordering changed -> defer to full sync
+        dst.transform = src.transform;
+        dst.enabled = src.enabled;
+    }
+
+    // Rebuild the transform list of each prefab batch in place (same instances,
+    // new matrices). entityIds were captured in build order per batch.
+    for (PrefabRenderBatch& batch : g_prefabRenderBatches) {
+        for (size_t j = 0; j < batch.entityIds.size(); ++j) {
+            const uint64_t id = batch.entityIds[j];
+            const LevelEntity* e = nullptr;
+            for (const LevelEntity& candidate : g_runtimeLevel.entities)
+                if (candidate.id == id) { e = &candidate; break; }
+            if (!e) continue;
+            const Transform& t = e->transform;
+            const XMMATRIX world =
+                XMMatrixScaling(t.scale[0], t.scale[1], t.scale[2]) *
+                XMMatrixRotationRollPitchYaw(
+                    XMConvertToRadians(t.rotation[0]),
+                    XMConvertToRadians(t.rotation[1]),
+                    XMConvertToRadians(t.rotation[2])) *
+                XMMatrixTranslation(t.position[0], t.position[1], t.position[2]);
+            if (j < batch.baseTransforms.size()) batch.baseTransforms[j] = world;
+            if (j < batch.transforms.size()) batch.transforms[j] = world;
+        }
+    }
+}
+
 static void SynchronizeEditorRuntime(bool play) {
     if (gameScreen != GameScreen::LevelEditor) return;
     const bool foliageChanged = g_levelEditor.FoliageRuntimeDirty();
@@ -4926,8 +5020,15 @@ static void SynchronizeEditorRuntime(bool play) {
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
     }
     if (g_trees.IsInitialized()) ResetPalmTrees();
-    if ((play || foliageChanged || terrainChanged) && g_environmentInitialized)
+    if ((play || foliageChanged || terrainChanged) && g_environmentInitialized) {
+        // Terrain extent/island size can change mid-session in the editor. The
+        // environment rebuild samples terrain and re-uploads GPU buffers, so the
+        // GPU must be idle first or we free/replace resources still in flight
+        // (device removed / crash). Ordinary foliage edits were safe because the
+        // extent was fixed; growing the island makes this wait necessary.
+        WaitForGPU();
         RebuildScalableEnvironment();
+    }
     if (g_destruction.IsInitialized()) {
         auto tp = CurrentTerrainParams();
         tp.heightScale = scene.terrainHeightScale;
@@ -5657,8 +5758,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     if (IsEditorEditing() &&
-        (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_MOUSEWHEEL))
+        (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP))
         return 0;
+    // Editor mouse wheel: over the 3D viewport it scales fly-camera speed
+    // (Unreal style); over an ImGui panel let ImGui handle it (e.g. sliders).
+    if (IsEditorEditing() && msg == WM_MOUSEWHEEL) {
+        if (!ImGui::GetIO().WantCaptureMouse) {
+            const int wheel = GET_WHEEL_DELTA_WPARAM(wParam);
+            const float step = wheel > 0 ? 1.15f : (1.0f / 1.15f);
+            g_editorCameraSpeed = (std::max)(0.1f,
+                (std::min)(g_editorCameraSpeed * step, 10.0f));
+        }
+        return 0;
+    }
 
     switch (msg) {
     case WM_SIZE:
@@ -5679,6 +5791,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_MOUSEWHEEL:
+        // Editor camera-speed scrolling is handled earlier; here it only cycles
+        // the weapon during gameplay.
         if (!ImGui::GetIO().WantCaptureMouse) {
             GunModel::CycleWeapon(GET_WHEEL_DELTA_WPARAM(wParam));
             scene.fireCooldown = 0.0f;
@@ -5850,8 +5964,14 @@ static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* info) {
         mei.ThreadId = GetCurrentThreadId();
         mei.ExceptionPointers = info;
         mei.ClientPointers = FALSE;
+        // Capture full thread stacks + data so the crash is analyzable offline
+        // (the indirectly-referenced flavour omitted stacks, leaving no usable
+        // call stack). WithFullMemory is large but these crashes are rare.
+        const MINIDUMP_TYPE dumpType = static_cast<MINIDUMP_TYPE>(
+            MiniDumpWithFullMemory | MiniDumpWithThreadInfo |
+            MiniDumpWithProcessThreadData | MiniDumpWithModuleHeaders);
         MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
-                          MiniDumpWithIndirectlyReferencedMemory, &mei, nullptr, nullptr);
+                          dumpType, &mei, nullptr, nullptr);
         CloseHandle(file);
     }
     return EXCEPTION_EXECUTE_HANDLER;
@@ -6258,12 +6378,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_pendingEnvironmentRebuild = false;
         }
         if (IsEditorEditing() && !levelLoadingActive &&
-            g_levelEditor.RuntimeDirty())
-            SynchronizeEditorRuntime(false);
+            g_levelEditor.RuntimeDirty()) {
+            // While the user is actively dragging/painting, do only the cheap
+            // transform sync each frame so the object follows the gizmo without
+            // lag. The heavy sync (asset refresh, prefab model reload, GPU
+            // rebuild) runs once when interaction settles - running it every
+            // drag frame lagged the editor and raced GPU work into a crash.
+            if (g_levelEditor.IsInteracting())
+                SynchronizeEditorRuntimeLight();
+            else
+                SynchronizeEditorRuntime(false);
+        }
 
         if (IsEditorEditing() && !cameraLocked &&
             !ImGui::GetIO().WantCaptureKeyboard) {
-            const float speed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) ? 3.0f : 1.0f;
+            const float speed = ((GetAsyncKeyState(VK_SHIFT) & 0x8000) ? 3.0f : 1.0f)
+                * g_editorCameraSpeed;
             if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, speed);
             if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, speed);
             if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, speed);
@@ -6910,6 +7040,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             std::cerr << "BeginFrame: " << e.what() << "\n"; break;
         }
         if (IsSceneScreen() && g_prefabRebuildRequested) {
+            // Rebuilding prefab batches recreates model/GPU resources. If the
+            // previous frame's command list still references the old ones, the
+            // driver dereferences freed memory (access violation deep in the
+            // D3D12/driver DLL) - exactly the crash seen when duplicating a rock.
+            // Idle the GPU first so nothing in flight points at what we replace.
+            WaitForGPU();
             RebuildPrefabRenderBatches();
             if (g_ddgiCornellTestMode) {
                 g_dxrDDGI.MarkLayoutDirty();
