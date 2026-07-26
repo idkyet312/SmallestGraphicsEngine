@@ -429,7 +429,10 @@ struct Scene {
         if (XMVectorGetX(XMVector3LengthSq(chest - closest)) >= 0.45f * 0.45f)
             return false;
         XMStoreFloat3(&p.position, closest);
-        DamagePlayer(2.4f);
+        // Rifle rounds stay at the long-standing 2.4 chip damage. Enemy shotgun
+        // pellets and sniper rounds carry a multiplier so one hit means something
+        // without needing a separate hit path.
+        DamagePlayer(2.4f * p.damageMultiplier);
         p.active = false;
         return true;
     }
@@ -809,14 +812,17 @@ struct Scene {
         return XMMatrixRotationX(XMConvertToRadians(-gunRecoilKick)) * basis;
     }
 
-    void SpawnHostileProjectile(const XMFLOAT3& origin, const XMFLOAT3& direction) {
+    void SpawnHostileProjectile(const XMFLOAT3& origin, const XMFLOAT3& direction,
+                                float damageMultiplier = 1.0f,
+                                float speedMultiplier = 1.0f) {
         Projectile p = {};
         p.position = p.previousPosition = origin;
         p.direction = direction;
-        p.speed = projectileSpeed;
+        p.speed = projectileSpeed * speedMultiplier;
         p.lifetime = projectileLifetime;
         p.active = true;
         p.hostile = true;
+        p.damageMultiplier = damageMultiplier;
         projectiles.push_back(p);
     }
 

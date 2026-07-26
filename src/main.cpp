@@ -887,6 +887,46 @@ static float RandomUnit() {
     return (float)std::rand() / (float)RAND_MAX;
 }
 
+// Squad composition. Most bandits keep the rifle; the specialists are rare
+// because each one changes how a whole fight plays -- a shotgunner forces the
+// player to back off, a sniper forces them into cover.
+static constexpr float kBanditShotgunShare = 0.22f;
+static constexpr float kBanditSniperShare  = 0.16f;
+
+// Shotgun: a tight cone of pellets, lethal up close and nearly harmless past a
+// few metres because each pellet is individually weak and the spread is wide.
+static constexpr int   kBanditShotgunPellets = 7;
+static constexpr float kBanditShotgunSpread = 0.075f;
+// Combat ring for each class. The shotgunner has to close to be a threat; the
+// sniper stays out past rifle range where its long telegraph is survivable.
+static constexpr float kBanditShotgunOrbitRadius = 2.6f;
+static constexpr float kBanditSniperOrbitRadius = 26.0f;
+
+static BanditWeapon PickBanditWeapon() {
+    const float roll = RandomUnit();
+    if (roll < kBanditSniperShare) return BanditWeapon::Sniper;
+    if (roll < kBanditSniperShare + kBanditShotgunShare)
+        return BanditWeapon::Shotgun;
+    return BanditWeapon::Rifle;
+}
+
+// Applies the loadout's movement profile. Called after the spawn code has set
+// its own orbit radius so the class choice wins.
+static void ApplyBanditLoadout(SkinnedEnemy& bandit) {
+    bandit.weapon = PickBanditWeapon();
+    if (bandit.weapon == BanditWeapon::Shotgun) {
+        bandit.orbitRadius = kBanditShotgunOrbitRadius;
+        // Aggressive closer: it only ever gets to shoot if it reaches the player.
+        bandit.moveSpeed *= 1.25f;
+        bandit.health = 130.0f;
+    } else if (bandit.weapon == BanditWeapon::Sniper) {
+        bandit.orbitRadius = kBanditSniperOrbitRadius;
+        // Holds the line and repositions slowly between shots.
+        bandit.moveSpeed *= 0.7f;
+        bandit.health = 80.0f;
+    }
+}
+
 static float BanditVoiceVolume(const XMFLOAT3& position, float peak = 0.78f) {
     const float dx = position.x - scene.camera.Position.x;
     const float dy = position.y - scene.camera.Position.y;
@@ -943,6 +983,7 @@ static bool SpawnBandit() {
             bandit->orbitDirection = (slot & 1) ? -1.0f : 1.0f;
             bandit->fireCooldown = 0.7f +
                 ((float)std::rand() / (float)RAND_MAX) * 2.8f;
+            ApplyBanditLoadout(*bandit);
             bandit->PlayClip("Walk");
             g_bandits.push_back(std::move(bandit));
             return true;
@@ -963,6 +1004,7 @@ static bool SpawnBandit() {
                 bandit->orbitDirection = (slot & 1) ? -1.0f : 1.0f;
                 bandit->fireCooldown = 0.7f +
                     ((float)std::rand() / (float)RAND_MAX) * 2.8f;
+                ApplyBanditLoadout(*bandit);
                 bandit->PlayClip("Walk");
                 g_bandits.push_back(std::move(bandit));
                 return true;
@@ -996,6 +1038,7 @@ static bool SpawnBandit() {
     bandit->orbitDirection = (slot & 1) ? -1.0f : 1.0f;
     bandit->fireCooldown =
         0.7f + ((float)std::rand() / (float)RAND_MAX) * 2.8f;
+    ApplyBanditLoadout(*bandit);
     bandit->PlayClip("Walk");
     bandit->anim.Advance(0.19f * static_cast<float>(g_banditSpawnSerial++ % 8));
     g_bandits.push_back(std::move(bandit));
@@ -1182,6 +1225,93 @@ static void BanditThrowGrenade(const SkinnedEnemy& bandit) {
                          verticalSpeed,
                          dz * inverseHorizontal * horizontalSpeed };
     scene.projectiles.push_back(grenade);
+}
+
+// Red targeting beam a charging sniper paints on the player. Drawn as a thin
+// additive box stretched from muzzle to target, same technique as bullet
+// tracers, so it stays bright in shadow instead of reading as a red stick.
+// The beam is the entire counterplay to the sniper's damage: it has to be
+// impossible to miss, so it brightens and thickens as the shot approaches.
+static void DrawSniperLaser(const SkinnedEnemy& bandit, Scene& scene,
+                            ShaderDX12& shader, const GeometryBuffers& geo,
+                            const XMMATRIX& lightSpace) {
+    if (!bandit.LaserActive()) return;
+
+    const XMFLOAT3 originF = bandit.AimRayOrigin();
+    const XMFLOAT3 targetF = bandit.LaserTarget();
+    const XMVECTOR origin = XMLoadFloat3(&originF);
+    const XMVECTOR target = XMLoadFloat3(&targetF);
+    XMVECTOR along = target - origin;
+    const float length = XMVectorGetX(XMVector3Length(along));
+    if (length < 0.05f) return;
+
+    XMVECTOR forward = along / length;
+    XMVECTOR up = std::fabs(XMVectorGetY(forward)) > 0.95f
+        ? XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f)
+        : XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+    const XMVECTOR right = XMVector3Normalize(XMVector3Cross(up, forward));
+    up = XMVector3Cross(forward, right);
+
+    XMMATRIX basis = XMMatrixIdentity();
+    basis.r[0] = XMVectorSetW(right, 0.0f);
+    basis.r[1] = XMVectorSetW(up, 0.0f);
+    basis.r[2] = XMVectorSetW(forward, 0.0f);
+    basis.r[3] = XMVectorSetW(origin + forward * (length * 0.5f), 1.0f);
+
+    // Ramp from a faint sighting line to a hot, obviously-about-to-fire beam,
+    // with a pulse over the last stretch so the final second reads as urgent
+    // even in the corner of the eye. Driven off the charge itself rather than a
+    // wall clock, so every sniper's beam pulses in step with its own timer.
+    const float charge = bandit.LaserCharge();
+    const float pulse = charge > 0.6f
+        ? 1.0f + 0.35f * std::sin(charge * SkinnedEnemy::kSniperLaserWarning * 26.0f)
+        : 1.0f;
+    const float intensity = (0.35f + 1.65f * charge * charge) * pulse;
+    // Cross-section is a sixth of the original beam: at full size the box read
+    // as a translucent slab head-on, which is the angle a beam aimed at the
+    // player is always seen from. Length and brightness are unchanged.
+    constexpr float kThickness = 1.0f / 6.0f;
+    const float radius = (0.012f + 0.016f * charge) * kThickness;
+
+    // Capsule mesh is built along its own local Y (radius 0.25, half-length
+    // 0.5), so swing that axis onto the beam's forward Z and undo those base
+    // dimensions before applying the real radius and length.
+    const XMMATRIX capsuleToBeam = XMMatrixRotationX(XM_PIDIV2);
+    auto capsuleModel = [&](float r, float len) {
+        return XMMatrixScaling(r * 4.0f, len, r * 4.0f) * capsuleToBeam * basis;
+    };
+
+    shader.UseAdditive();
+    XMMATRIX model = capsuleModel(radius * 2.4f, length);
+    shader.SetMatrices(model, scene.GetViewMatrix(),
+                       scene.GetProjectionMatrix(), lightSpace);
+    shader.SetEmissiveMaterial(
+        XMFLOAT3(3.4f * intensity, 0.05f, 0.03f), 0.20f + 0.16f * charge);
+    DrawCapsule(geo);
+    shader.NextDrawCall();
+
+    // Thin white-hot core keeps the line crisp at distance, where the soft halo
+    // alone would smear into a wide pink band.
+    model = capsuleModel(radius * 0.85f, length);
+    shader.SetMatrices(model, scene.GetViewMatrix(),
+                       scene.GetProjectionMatrix(), lightSpace);
+    shader.SetEmissiveMaterial(
+        XMFLOAT3(9.0f * intensity, 0.6f, 0.45f), 0.85f);
+    DrawCapsule(geo);
+    shader.NextDrawCall();
+
+    // Dot on the player. Sells the beam as aimed AT them rather than past them.
+    // Sphere mesh is radius 0.5, so double the scale to get the wanted radius.
+    const float dot = (0.045f + 0.03f * charge) * kThickness * 2.0f;
+    model = XMMatrixScaling(dot, dot, dot) *
+            XMMatrixTranslation(targetF.x, targetF.y, targetF.z);
+    shader.SetMatrices(model, scene.GetViewMatrix(),
+                       scene.GetProjectionMatrix(), lightSpace);
+    shader.SetEmissiveMaterial(
+        XMFLOAT3(9.0f * intensity, 0.35f, 0.25f), 0.95f);
+    DrawSphere(geo);
+    shader.NextDrawCall();
+    shader.Use(scene.wireframeMode);
 }
 
 static bool GrabPathClear(const XMFLOAT3& target) {
@@ -6745,7 +6875,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     g_banditVoiceCooldown = 4.5f;
                 }
                 if (fired) {
-                    scene.SpawnHostileProjectile(shotOrigin, shotDirection);
+                    if (bandit->IsShotgunner()) {
+                        // Cone of individually weak pellets. Overlapping hits at
+                        // point-blank are what make it lethal; at range the cone
+                        // is wide enough that most pellets miss entirely.
+                        const XMVECTOR forward =
+                            XMVector3Normalize(XMLoadFloat3(&shotDirection));
+                        XMVECTOR up = std::fabs(XMVectorGetY(forward)) > 0.95f
+                            ? XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f)
+                            : XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+                        const XMVECTOR right =
+                            XMVector3Normalize(XMVector3Cross(up, forward));
+                        up = XMVector3Cross(forward, right);
+                        for (int pellet = 0; pellet < kBanditShotgunPellets; ++pellet) {
+                            const float spreadRight =
+                                (RandomUnit() * 2.0f - 1.0f) * kBanditShotgunSpread;
+                            const float spreadUp =
+                                (RandomUnit() * 2.0f - 1.0f) * kBanditShotgunSpread;
+                            XMFLOAT3 pelletDirection;
+                            XMStoreFloat3(&pelletDirection, XMVector3Normalize(
+                                forward + right * spreadRight + up * spreadUp));
+                            scene.SpawnHostileProjectile(
+                                shotOrigin, pelletDirection, 1.6f);
+                        }
+                    } else if (bandit->IsSniper()) {
+                        // One heavy, fast round. Damage is high because the five
+                        // second laser gave the player every chance to not be
+                        // standing there.
+                        scene.SpawnHostileProjectile(
+                            shotOrigin, shotDirection, 18.0f, 2.2f);
+                    } else {
+                        scene.SpawnHostileProjectile(shotOrigin, shotDirection);
+                    }
                     const float dx = shotOrigin.x - scene.camera.Position.x;
                     const float dy = shotOrigin.y - scene.camera.Position.y;
                     const float dz = shotOrigin.z - scene.camera.Position.z;
@@ -7838,6 +7999,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         bandit->GunWorldMatrix(), scene.GetViewMatrix(),
                         scene.GetProjectionMatrix(), fogLightSpace, true);
                 }
+                DrawSniperLaser(*bandit, scene, mainShader, geo, fogLightSpace);
             }
             mainShader.Use(scene.wireframeMode);
         }

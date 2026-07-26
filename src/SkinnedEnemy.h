@@ -17,6 +17,14 @@
 
 extern MeshShaderDX12 g_meshShader;
 
+// Loadout class. Rifle is the original bandit behaviour; the other two change
+// engagement range, damage, and the shape of a shot rather than the model.
+enum class BanditWeapon {
+    Rifle,
+    Shotgun,
+    Sniper,
+};
+
 class SkinnedEnemy {
 public:
     SkinnedModel      model;
@@ -53,6 +61,30 @@ public:
     bool              turretGunner = false;
     int               mountedVehicleIndex = 0;
     int               burstShotsRemaining = 0;
+    // Loadout. Set at spawn; drives engagement range, aim delay, and how main
+    // turns a "fired" result into projectiles.
+    BanditWeapon      weapon = BanditWeapon::Rifle;
+
+    // Sniper telegraph: how long the laser paints the player before the shot.
+    // Long on purpose -- the beam IS the warning, so the player needs time to
+    // break line of sight or take cover after spotting it.
+    static constexpr float kSniperLaserWarning = 5.0f;
+
+    bool IsSniper() const { return weapon == BanditWeapon::Sniper; }
+    bool IsShotgunner() const { return weapon == BanditWeapon::Shotgun; }
+
+    // True while the red beam should be drawn. Laser only exists during the
+    // charge; it disappears the instant the shot goes out.
+    bool LaserActive() const {
+        return IsSniper() && !dead_ && !held_ && visible && laserCharge_ > 0.0f;
+    }
+    // 0 at first lock, 1 the frame the rifle fires. Renderer ramps the beam.
+    float LaserCharge() const {
+        return (std::min)(1.0f, laserCharge_ / kSniperLaserWarning);
+    }
+    // Beam endpoint. Tracks the player continuously, so the dot slides along
+    // with them and only the aim delay -- not the aim itself -- can be dodged.
+    DirectX::XMFLOAT3 LaserTarget() const { return laserTarget_; }
 
     bool Init(const SkinnedModel& m) {
         model = m;
@@ -136,8 +168,11 @@ public:
                 0.55f, std::atan2(target.y - gunHeight, distance)));
         }
         if (preparingShot_) stationaryAimTime_ += dt;
+        // A sniper walking while its laser is up would drag the beam across the
+        // world and make the telegraph unreadable. Plant it for the wind-up.
+        const bool rooted = preparingShot_ || laserCharge_ > 0.0f;
         float speed = 0.0f;
-        if (distance > 0.1f && !preparingShot_) {
+        if (distance > 0.1f && !rooted) {
             const float inv = 1.0f / distance;
             const float inwardX = dx * inv;
             const float inwardZ = dz * inv;
@@ -239,6 +274,7 @@ public:
         knockbackVelocity_ = { 0.0f, 0.0f, 0.0f };
         preparingShot_ = false;
         stationaryAimTime_ = 0.0f;
+        laserCharge_ = 0.0f;
         burstShotsRemaining = 0;
         navigationPath_.clear();
         PlayClip("Idle");
@@ -273,6 +309,7 @@ public:
         held_ = held;
         preparingShot_ = false;
         stationaryAimTime_ = 0.0f;
+        laserCharge_ = 0.0f;
         burstShotsRemaining = 0;
     }
 
@@ -304,6 +341,10 @@ public:
     bool NeedsLineOfSightCheck() const {
         if (dead_ || held_ || !visible || !HasGunPose()) return false;
         if (turretGunner) return true;
+        // The sniper needs a truthful sight test every frame it is charging, not
+        // just on the firing frame: the beam is only fair if breaking cover
+        // actually drops the lock.
+        if (IsSniper()) return fireCooldown <= 0.0f;
         if (burstShotsRemaining > 0)
             return fireCooldown <= 0.0f;
         return fireCooldown <= 0.0f &&
@@ -341,6 +382,28 @@ public:
                     return false;
             }
             if (fireCooldown > 0.0f) return false;
+        } else if (IsSniper()) {
+            // Losing sight cancels the charge outright rather than pausing it, so
+            // ducking behind cover buys a fresh five seconds instead of a shot
+            // the moment the player leans back out.
+            if (!hasLineOfSight) {
+                laserCharge_ = 0.0f;
+                preparingShot_ = false;
+                stationaryAimTime_ = 0.0f;
+                return false;
+            }
+            if (fireCooldown > 0.0f) {
+                laserCharge_ = 0.0f;
+                return false;
+            }
+            if (laserCharge_ <= 0.0f) spottedEventPending_ = true;
+            // Keep the beam glued to the player through the whole wind-up.
+            laserTarget_ = target;
+            laserCharge_ += dt;
+            preparingShot_ = true;
+            if (laserCharge_ < kSniperLaserWarning) return false;
+            laserCharge_ = 0.0f;
+            preparingShot_ = false;
         } else {
             if (!hasLineOfSight) {
                 burstShotsRemaining = 0;
@@ -370,10 +433,14 @@ public:
             return ((float)std::rand() / (float)RAND_MAX) * 2.0f - 1.0f;
         };
         // Slight human aim error. Bursts remain dangerous without becoming
-        // four perfectly accurate automatic turrets.
-        aim += XMVectorSet(randomSigned() * 0.018f,
-                           randomSigned() * 0.012f,
-                           randomSigned() * 0.018f, 0.0f);
+        // four perfectly accurate automatic turrets. The sniper spent five
+        // seconds lining the shot up on a visible beam, so it gets a much
+        // tighter cone -- the telegraph is the counterplay, not bad aim.
+        const float spread = IsSniper() ? 0.004f : 0.018f;
+        const float verticalSpread = IsSniper() ? 0.003f : 0.012f;
+        aim += XMVectorSet(randomSigned() * spread,
+                           randomSigned() * verticalSpread,
+                           randomSigned() * spread, 0.0f);
         XMStoreFloat3(&direction, XMVector3Normalize(aim));
 
         if (turretGunner) {
@@ -382,6 +449,22 @@ public:
                 attackEventPending_ = true;
             }
             fireCooldown = 0.12f;
+            return true;
+        }
+
+        // Single-shot loadouts bypass the burst machinery: one trigger pull, then
+        // a long recovery. Bolt cycling and shell pumping are what keeps them
+        // from out-damaging the rifle despite hitting far harder per shot.
+        if (IsSniper()) {
+            attackEventPending_ = true;
+            fireCooldown = 4.5f + ((float)std::rand() / RAND_MAX) * 2.5f;
+            return true;
+        }
+        if (IsShotgunner()) {
+            attackEventPending_ = true;
+            fireCooldown = 1.5f + ((float)std::rand() / RAND_MAX) * 1.1f;
+            preparingShot_ = false;
+            stationaryAimTime_ = 0.0f;
             return true;
         }
 
@@ -698,6 +781,7 @@ private:
         dead_ = true;
         held_ = false;
         deathEventPending_ = true;
+        laserCharge_ = 0.0f;
         std::vector<XMFLOAT4X4> globals = poseGlobals_;
         if (globals.empty()) anim.ComputeGlobalMatrices(model.skeleton, globals);
         deathGlobals_ = globals;
@@ -746,6 +830,8 @@ private:
     size_t navigationWaypoint_ = 0;
     float navigationRepathTimer_ = 0.0f;
     DirectX::XMFLOAT3 navigationDestination_{};
+    float laserCharge_ = 0.0f;
+    DirectX::XMFLOAT3 laserTarget_{ 0.0f, 0.0f, 0.0f };
     bool preparingShot_ = false;
     bool spottedEventPending_ = false;
     bool attackEventPending_ = false;
