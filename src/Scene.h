@@ -175,6 +175,14 @@ struct Scene {
     float playerHealth       = 100.0f;
     float playerDamageFlash  = 0.0f;
     bool  playerGodMode      = false;
+    // Regenerating health. Any damage restarts the delay, so staying in a
+    // firefight never heals you -- breaking contact is what does. The rate is
+    // deliberately slower than sustained rifle fire, so regen rewards
+    // disengaging without trivialising a fight the player chooses to stand in.
+    bool  playerHealthRegen  = true;
+    float playerRegenDelay   = 5.0f;   // seconds after last hit before healing
+    float playerRegenRate    = 12.0f;  // health per second once it starts
+    float playerRegenTimer   = 0.0f;   // counts down to the delay above
 
     // Ammo, per weapon slot (0 = AK47, 1 = shotgun, 2 = RPG-7, 3 = SVD) to match
     // GunModel::SelectedWeapon(). Only enforced when playerGodMode is false --
@@ -397,17 +405,22 @@ struct Scene {
         gunRecoilKick = 0.0f;
         grenadeCooldown = 0.0f;
         playerDamageFlash = 0.0f;
+        playerRegenTimer = 0.0f;
     }
 
     void DamagePlayer(float damage) {
         if (playerGodMode || damage <= 0.0f || playerHealth <= 0.0f) return;
         playerHealth = (std::max)(0.0f, playerHealth - damage);
         playerDamageFlash = 0.22f;
+        // Restart the hold-off on every hit, including the one that kills, so a
+        // revive does not inherit a nearly expired timer.
+        playerRegenTimer = playerRegenDelay;
     }
 
     void RestorePlayerHealth() {
         playerHealth = playerMaxHealth;
         playerDamageFlash = 0.0f;
+        playerRegenTimer = 0.0f;
         // Ammo rides along with health: every caller (level start, editor play,
         // the debug Restore button) wants a fully kitted player, and refilling
         // here keeps the two from drifting apart.
@@ -442,6 +455,17 @@ struct Scene {
 
         muzzleFlashTime = (std::max)(0.0f, muzzleFlashTime - dt);
         playerDamageFlash = (std::max)(0.0f, playerDamageFlash - dt);
+
+        // Health regen. Death is final: at zero health the timer stops rather
+        // than quietly healing a corpse back to fighting strength.
+        if (playerHealthRegen && playerHealth > 0.0f &&
+            playerHealth < playerMaxHealth) {
+            playerRegenTimer = (std::max)(0.0f, playerRegenTimer - dt);
+            if (playerRegenTimer <= 0.0f) {
+                playerHealth = (std::min)(playerMaxHealth,
+                                          playerHealth + playerRegenRate * dt);
+            }
+        }
         // Sharp impulse, quick mechanical return. Camera aim stays displaced,
         // so automatic fire climbs unless the player actively compensates.
         gunRecoilBack = (std::max)(0.0f, gunRecoilBack - 1.45f * dt);

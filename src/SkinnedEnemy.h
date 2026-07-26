@@ -469,7 +469,10 @@ public:
         }
 
         if (burstShotsRemaining <= 0) {
-            burstShotsRemaining = 2 + std::rand() % 4;
+            // Longer volleys: 5-8 rounds. The between-burst pause is unchanged,
+            // so the rifle leans harder on suppressing bursts the player has to
+            // wait out rather than on firing more often.
+            burstShotsRemaining = 5 + std::rand() % 4;
             attackEventPending_ = true;
         }
         --burstShotsRemaining;
