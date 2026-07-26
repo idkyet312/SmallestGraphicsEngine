@@ -1397,7 +1397,8 @@ private:
 
         ComPtr<ID3DBlob> vsBlob, psBlob, alphaPsBlob, errorBlob;
 
-        HRESULT hr = D3DCompile(vsCode.c_str(), vsCode.length(), "visbuf_vs.hlsl",
+        HRESULT hr = D3DCompile(vsCode.c_str(), vsCode.length(),
+            "shaders/visbuf_vs.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "vs_5_0",
             compileFlags, 0, &vsBlob, &errorBlob);
         if (FAILED(hr)) {
@@ -1406,7 +1407,8 @@ private:
         }
 
         errorBlob.Reset();
-        hr = D3DCompile(psCode.c_str(), psCode.length(), "visbuf_ps.hlsl",
+        hr = D3DCompile(psCode.c_str(), psCode.length(),
+            "shaders/visbuf_ps.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "ps_5_0",
             compileFlags, 0, &psBlob, &errorBlob);
         if (FAILED(hr)) {
@@ -1415,7 +1417,8 @@ private:
         }
 
         errorBlob.Reset();
-        hr = D3DCompile(psCode.c_str(), psCode.length(), "visbuf_ps.hlsl",
+        hr = D3DCompile(psCode.c_str(), psCode.length(),
+            "shaders/visbuf_ps.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "mainAlpha", "ps_5_0",
             compileFlags, 0, &alphaPsBlob, &errorBlob);
         if (FAILED(hr)) {
@@ -1567,7 +1570,8 @@ private:
 #endif
 
         ComPtr<ID3DBlob> csBlob, errorBlob;
-        HRESULT hr = D3DCompile(csCode.c_str(), csCode.length(), "visbuf_resolve_cs.hlsl",
+        HRESULT hr = D3DCompile(csCode.c_str(), csCode.length(),
+            "shaders/visbuf_resolve_cs.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_1",
             compileFlags, 0, &csBlob, &errorBlob);
         if (FAILED(hr)) {
