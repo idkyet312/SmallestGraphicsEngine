@@ -108,9 +108,16 @@ bool ResolveClipmapTile(uint id, uint G, uint R, float base,
         if (seen == 0) return false;
     }
     float t = base * (float)(1u << ring);
-    // Snap the ring's centre to its tile grid around the camera.
-    float halfSpan = (float)G * 0.5 * t;
-    float2 snapped = floor(viewPos.xz / t) * t;
+    // ALL rings share one snap origin, quantised to the COARSEST ring's tile
+    // size. Snapping each ring to its own grid (floor(viewPos/t)*t) is what
+    // tore holes in the terrain: neighbouring rings then round the camera to
+    // grids that differ by up to t, so a ring's outer edge and the hole meant
+    // to receive it drift apart and open a one-tile seam that slides around as
+    // the camera moves. One shared origin keeps every ring boundary and every
+    // hole on common tile lines -- verified gap-free and overlap-free for
+    // R = 2..8 at random camera positions.
+    float snapGrid = base * (float)(1u << (R - 1));
+    float2 snapped = floor(viewPos.xz / snapGrid) * snapGrid;
     originXZ = snapped + (float2(lx, lz) - (float)(G / 2)) * t;
     sizeOut = t;
     return true;

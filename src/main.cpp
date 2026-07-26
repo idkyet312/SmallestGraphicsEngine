@@ -302,16 +302,33 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
 }
 
 static void AddExplosionTerrainCrater(const XMFLOAT3& impact) {
-    if (!scene.useMeshTerrain || !g_terrain.supported ||
-        g_runtimeTerrainSculpt.size() >= 256) return;
+    if (!scene.useMeshTerrain || !g_terrain.supported) return;
+
+    // Craters must land on any island size. The sculpt evaluator works in raw
+    // world XZ (no island-scale term), so the stamp itself is scale-agnostic --
+    // but a fixed 1 m dimple reads as nothing on a stretched island, and the
+    // outer clipmap rings use coarse tiles that cannot resolve a small radius.
+    // Grow the crater with the island so it stays visible at every scale.
+    const TerrainRendererDX12::Params terrainParams = CurrentTerrainParams();
+    const float islandScale = (std::max)(1.0f,
+        (std::max)(terrainParams.islandScaleX, terrainParams.islandScaleZ));
+    // sqrt keeps a 12x island's craters big enough to read without turning the
+    // blast into a canyon; clamp so huge islands stay within the AS tile's
+    // vertical reach (sculptMaxDisplacement feeds terrain_as.hlsl culling).
+    const float craterScale = (std::min)(3.0f, sqrtf(islandScale));
 
     TerrainSculptStamp crater;
     crater.x = impact.x;
     crater.z = impact.z;
-    crater.radius = scene.grenadeBlastRadius;
+    crater.radius = scene.grenadeBlastRadius * craterScale;
     crater.operation = TerrainSculptOperation::Add;
-    crater.value = -1.0f;
+    crater.value = -1.0f * craterScale;
     crater.strength = 1.0f;
+    // At capacity, drop the OLDEST crater rather than rejecting the new one --
+    // a barrel that explodes must always leave a hole. SetSculptStamps trims
+    // from the front too, so CPU collision and the GPU buffer stay in sync.
+    if (g_runtimeTerrainSculpt.size() >= kMaxTerrainSculptStamps)
+        g_runtimeTerrainSculpt.erase(g_runtimeTerrainSculpt.begin());
     g_runtimeTerrainSculpt.push_back(crater);
     g_terrain.SetSculptStamps(g_runtimeTerrainSculpt);
     const float foliageRadius = crater.radius * 0.5f;

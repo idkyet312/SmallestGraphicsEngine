@@ -900,8 +900,13 @@ void LevelEditor::SculptTerrain(CXMMATRIX view, CXMMATRIX projection,
     const float dx = hit.x - lastTerrainStamp_.x;
     const float dz = hit.z - lastTerrainStamp_.z;
     if (dx * dx + dz * dz < terrainBrushSpacing_ * terrainBrushSpacing_) return;
-    if (level_.terrainSculpt.size() >= 256) {
-        status_ = "Terrain sculpt limit reached (256 stamps). Undo or Clear Sculpt.";
+    // The editor deliberately refuses instead of evicting: authored strokes are
+    // the user's work, so silently dropping the oldest one would destroy it.
+    // Runtime craters (AddExplosionTerrainCrater) are transient and do evict.
+    if (level_.terrainSculpt.size() >= kMaxTerrainSculptStamps) {
+        status_ = "Terrain sculpt limit reached (" +
+            std::to_string(kMaxTerrainSculptStamps) +
+            " stamps). Undo or Clear Sculpt.";
         return;
     }
     lastTerrainStamp_ = hit;
@@ -1629,7 +1634,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::SliderFloat("Brush radius", &terrainBrushRadius_, 0.5f, 15.0f, "%.1f m");
     ImGui::SliderFloat("Strength", &terrainBrushStrength_, 0.05f, 2.0f, "%.2f");
     ImGui::SliderFloat("Stroke spacing", &terrainBrushSpacing_, 0.2f, 8.0f, "%.2f m");
-    ImGui::Text("Stamps: %zu / 256", level_.terrainSculpt.size());
+    ImGui::Text("Stamps: %zu / %zu", level_.terrainSculpt.size(),
+                kMaxTerrainSculptStamps);
     ImGui::BeginDisabled(level_.terrainSculpt.empty());
     if (ImGui::Button("Clear Sculpt")) {
         const LevelDefinition before = level_;
