@@ -97,6 +97,22 @@ struct Scene {
     float  cameraFOV  = 60.0f;
     float  sniperScopeFOV = 15.0f;
     float  sniperScopeBlend = 0.0f;
+    // Iron-sight ADS for every non-scoped weapon. Separate from the SVD scope
+    // blend: that one swaps to a scope overlay and hides the viewmodel, this one
+    // just pulls the gun to centre and tightens the FOV a little.
+    float  adsFOV     = 42.0f;   // moderate -- ADS is for accuracy, not zoom
+    float  adsBlend   = 0.0f;    // 0 = hip, 1 = fully sighted
+    bool   adsActive  = false;
+    // Sighted viewmodel offset, against a hip offset of {0.28, -0.24, 0.40}.
+    // X overshoots slightly past zero: the weapon mesh sits right of its own
+    // origin, so putting the origin on the view axis still leaves the barrel
+    // and sights off to the right. Y sits just below the crosshair so the
+    // weapon does not cover it; Z is pulled in toward the eye.
+    // Live-tunable so the sight alignment can be dialled in from the debug UI
+    // instead of a rebuild per nudge.
+    float adsOffsetX = -0.01f;
+    float adsOffsetY = -0.075f;
+    float adsOffsetZ = 0.30f;
     bool   sniperScopeActive = false;
     float  cameraNear  = 0.1f;
     // Far enough to see the sea run out to the horizon; the ocean plane alone is
@@ -406,6 +422,8 @@ struct Scene {
         grenadeCooldown = 0.0f;
         playerDamageFlash = 0.0f;
         playerRegenTimer = 0.0f;
+        adsBlend = 0.0f;
+        adsActive = false;
     }
 
     void DamagePlayer(float damage) {
@@ -688,10 +706,16 @@ struct Scene {
     }
 
     void ShootProjectile() {
-        const float randomYaw = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) * recoilYaw;
-        camera.ApplyRecoil(recoilPitch, randomYaw);
+        // Bullets already travel exactly along the view axis, so sights cannot
+        // tighten grouping. What they buy is recoil control: sighted fire is
+        // almost perfectly flat, so holding the sights on a target is the way
+        // to land sustained fire, and hipfire is the spray option.
+        const float recoilScale = 1.0f - 0.90f * adsBlend;
+        const float randomYaw = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) *
+                                recoilYaw * recoilScale;
+        camera.ApplyRecoil(recoilPitch * recoilScale, randomYaw);
         gunRecoilBack = (std::min)(0.12f, gunRecoilBack + 0.075f);
-        gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 4.2f);
+        gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 4.2f * recoilScale);
         muzzleFlashTime = muzzleFlashDuration;
 
         Projectile p;
@@ -756,15 +780,33 @@ struct Scene {
     void UpdateSniperScope(bool active, float dt) {
         sniperScopeActive = active;
         const float target = active ? 1.0f : 0.0f;
-        const float response = (std::min)(1.0f, (std::max)(0.0f, dt) * 12.0f);
+        // Matches the iron-sight raise rate so swapping to the SVD does not
+        // change how fast the weapon comes up.
+        const float response = (std::min)(1.0f, (std::max)(0.0f, dt) * 24.0f);
         sniperScopeBlend += (target - sniperScopeBlend) * response;
         if (!active && sniperScopeBlend < 0.001f) sniperScopeBlend = 0.0f;
     }
+    // Iron sights. The two blends are mutually exclusive by construction: only
+    // the SVD ever requests the scope, so a weapon is either scoped or sighted.
+    void UpdateAimDownSights(bool active, float dt) {
+        adsActive = active;
+        const float target = active ? 1.0f : 0.0f;
+        // Snappy on purpose: ADS is used mid-fight, and a slow raise makes the
+        // weapon feel heavy to bring up.
+        const float response = (std::min)(1.0f, (std::max)(0.0f, dt) * 20.0f);
+        adsBlend += (target - adsBlend) * response;
+        if (!active && adsBlend < 0.001f) adsBlend = 0.0f;
+    }
     float EffectiveCameraFOV() const {
-        return cameraFOV + (sniperScopeFOV - cameraFOV) * sniperScopeBlend;
+        // Scope wins when both are somehow non-zero, since it is the narrower
+        // of the two and blending them would land between the sights.
+        const float sighted = cameraFOV + (adsFOV - cameraFOV) * adsBlend;
+        return sighted + (sniperScopeFOV - sighted) * sniperScopeBlend;
     }
     float ScopeLookScale() const {
-        return 1.0f - 0.72f * sniperScopeBlend;
+        // Sights slow the turn rate proportionally to the zoom so the sensitivity
+        // at the sight picture feels the same as at the hip.
+        return (1.0f - 0.72f * sniperScopeBlend) * (1.0f - 0.30f * adsBlend);
     }
     XMMATRIX GetViewMatrix()       const { return const_cast<Camera&>(camera).GetViewMatrix(); }
     XMMATRIX GetProjectionMatrix() const {
@@ -823,9 +865,19 @@ struct Scene {
         // True camera up, perpendicular to both: this is what tilts with pitch.
         const XMVECTOR camUp = XMVector3Normalize(XMVector3Cross(camFront, camRight));
 
-        const XMVECTOR gp = camPos + camFront * (gun.offset.z - gunRecoilBack)
-                                   + camRight * gun.offset.x
-                                   + camUp    * (gun.offset.y + gunRecoilBack * 0.18f);
+        // Aiming slides the weapon from its hip offset onto the view axis, so
+        // the sights line up with the crosshair. X goes to zero (centred), Y
+        // rises to eye level, Z pushes slightly forward to bring the rear sight
+        // closer to the camera.
+        const float hipToSights = (std::min)(1.0f, (std::max)(0.0f, adsBlend));
+        const float offsetX =
+            gun.offset.x + (adsOffsetX - gun.offset.x) * hipToSights;
+        const float offsetY = gun.offset.y + (adsOffsetY - gun.offset.y) * hipToSights;
+        const float offsetZ = gun.offset.z + (adsOffsetZ - gun.offset.z) * hipToSights;
+
+        const XMVECTOR gp = camPos + camFront * (offsetZ - gunRecoilBack)
+                                   + camRight * offsetX
+                                   + camUp    * (offsetY + gunRecoilBack * 0.18f);
 
         // Orthonormal basis: rows right/up/front, translation at the gun spot.
         XMMATRIX basis = XMMatrixIdentity();

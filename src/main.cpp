@@ -5889,12 +5889,17 @@ static void ApplyVirtualInput() {
 }
 
 static void ProcessInput(HWND) {
-    const bool scopeRequested = IsGameplayScreen() &&
-        scene.playerHealth > 0.0f && GunModel::SVDSelected() &&
+    // Right mouse aims. The SVD goes to its scope overlay; every other weapon
+    // raises iron sights instead, so the button means the same thing in the
+    // player's hands regardless of what they are holding.
+    const bool aimRequested = IsGameplayScreen() &&
+        scene.playerHealth > 0.0f &&
         !g_drivingHumvee && !cameraLocked &&
         !(showUI && ImGui::GetIO().WantCaptureMouse) &&
         (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    const bool scopeRequested = aimRequested && GunModel::SVDSelected();
     scene.UpdateSniperScope(scopeRequested, deltaTime);
+    scene.UpdateAimDownSights(aimRequested && !scopeRequested, deltaTime);
 
     // Virtual controls are ImGui widgets, so WantCaptureKeyboard/cameraLocked
     // must not suppress the input those widgets produced on the previous frame.

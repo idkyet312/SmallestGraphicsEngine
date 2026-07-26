@@ -236,8 +236,14 @@ inline void RenderPlayerHUD(const Scene& scene) {
         const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
         constexpr float gap = 3.0f;
         constexpr float arm = 5.0f;
-        const ImU32 outline = IM_COL32(0, 0, 0, 190);
-        const ImU32 reticle = IM_COL32(235, 235, 225, 220);
+        // Fade the reticle out as the sights come up: the weapon's own sights
+        // become the aiming reference, and leaving a crosshair floating over
+        // them reads as a double sight picture.
+        const float reticleFade = 1.0f - (std::min)(1.0f, scene.adsBlend * 1.35f);
+        const int outlineAlpha = static_cast<int>(190.0f * reticleFade);
+        const int reticleAlpha = static_cast<int>(220.0f * reticleFade);
+        const ImU32 outline = IM_COL32(0, 0, 0, outlineAlpha);
+        const ImU32 reticle = IM_COL32(235, 235, 225, reticleAlpha);
         const ImVec2 segments[4][2] = {
             { ImVec2(center.x - gap - arm, center.y), ImVec2(center.x - gap, center.y) },
             { ImVec2(center.x + gap, center.y), ImVec2(center.x + gap + arm, center.y) },
@@ -628,6 +634,17 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat3("Rot##gun",  &scene.gun.rotation.x,  1.0f);
         ImGui::Checkbox("Auto Fire", &scene.autoFire);
         ImGui::DragFloat("Fire Interval", &scene.fireInterval, 0.005f, 0.02f, 1.0f, "%.3f s");
+
+        // Sighted weapon position. Hold right mouse while dragging these to see
+        // the alignment update live -- X is the one that decides whether the
+        // sights sit on the crosshair or off to one side.
+        ImGui::SeparatorText("Aim Down Sights");
+        ImGui::DragFloat("ADS X", &scene.adsOffsetX, 0.001f, -0.30f, 0.30f, "%.3f");
+        ImGui::DragFloat("ADS Y", &scene.adsOffsetY, 0.001f, -0.40f, 0.20f, "%.3f");
+        ImGui::DragFloat("ADS Z", &scene.adsOffsetZ, 0.005f,  0.05f, 1.00f, "%.3f");
+        ImGui::DragFloat("ADS FOV", &scene.adsFOV, 0.5f, 15.0f, 60.0f, "%.1f deg");
+        ImGui::Text("blend %.2f%s", scene.adsBlend,
+                    scene.adsActive ? "  (aiming)" : "");
     }
 
     // -- Grass / wind --
