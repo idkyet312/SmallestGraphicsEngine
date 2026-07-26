@@ -45,6 +45,10 @@ public:
     float             orbitRadius = 4.8f;
     float             orbitDirection = 1.0f;
     float             fireCooldown = 1.0f;
+    // Grenade throwing. Independent of fireCooldown so a grenade never competes
+    // with the rifle for the same timer; spawn code randomises the initial value
+    // so a squad does not lob in unison.
+    float             grenadeCooldown = 8.0f;
     int               spawnSlot = -1;
     bool              turretGunner = false;
     int               mountedVehicleIndex = 0;

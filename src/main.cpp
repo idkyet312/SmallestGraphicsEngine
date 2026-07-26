@@ -865,6 +865,28 @@ static void ConfigureHumveeBounds() {
     g_humveeTurretLocal = { 0.0f, vehicleTop - 3.0f - 3.45f, 0.0f };
 }
 
+// Enemy grenades. Bandits lob one only from a mid-range band: too close and they
+// would blow themselves up (and the player has no time to react), too far and the
+// throw cannot reach. Inside the band they rifle-fire as before.
+// Max range is set by physics, not taste: at grenadeThrowSpeed (16 m/s) the
+// ballistic solver has no solution past ~26 m and degrades to a 45-degree heave
+// that falls short, and the 2 s fuse burns out mid-air before the grenade
+// arrives. 22 m keeps every throw landing within ~0.1 m of the player with fuse
+// left. Raise grenadeThrowSpeed or grenadeFuse before raising this.
+static constexpr float kBanditGrenadeMinRange = 12.0f;
+static constexpr float kBanditGrenadeMaxRange = 22.0f;
+// Seconds between throws for one bandit, randomised per throw so a group does not
+// settle into a synchronised rhythm.
+static constexpr float kBanditGrenadeCooldownMin = 9.0f;
+static constexpr float kBanditGrenadeCooldownMax = 16.0f;
+// Chance to actually throw once in range and off cooldown. Keeps grenades feeling
+// like an occasional decision rather than a metronome.
+static constexpr float kBanditGrenadeChance = 0.35f;
+
+static float RandomUnit() {
+    return (float)std::rand() / (float)RAND_MAX;
+}
+
 static float BanditVoiceVolume(const XMFLOAT3& position, float peak = 0.78f) {
     const float dx = position.x - scene.camera.Position.x;
     const float dy = position.y - scene.camera.Position.y;
@@ -900,6 +922,10 @@ static bool SpawnBandit() {
 
     auto bandit = std::make_unique<SkinnedEnemy>();
     if (!bandit->Init(g_banditModel)) return false;
+    // Stagger the first grenade across the whole cooldown window so a squad
+    // spawning together does not throw its opening volley in lockstep.
+    bandit->grenadeCooldown = kBanditGrenadeCooldownMin +
+        RandomUnit() * (kBanditGrenadeCooldownMax - kBanditGrenadeCooldownMin);
 
     if (g_customLevelMode) {
         size_t spawnIndex = 0;
@@ -984,6 +1010,10 @@ static bool SpawnHumveeTurretGunner(int vehicleIndex) {
             return true;
     auto bandit = std::make_unique<SkinnedEnemy>();
     if (!bandit->Init(g_banditModel)) return false;
+    // Stagger the first grenade across the whole cooldown window so a squad
+    // spawning together does not throw its opening volley in lockstep.
+    bandit->grenadeCooldown = kBanditGrenadeCooldownMin +
+        RandomUnit() * (kBanditGrenadeCooldownMax - kBanditGrenadeCooldownMin);
     bandit->position = vehicleIndex == 0
         ? HumveeTurretMountWorld()
         : XMFLOAT3{ g_secondaryHumveePosition.x + g_humveeTurretLocal.x,
@@ -1105,6 +1135,53 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
         if (bandit->BlocksProjectile(origin, target, rayRadius)) return false;
     }
     return true;
+}
+
+// Ballistic lob from the thrower toward the target. Solves the launch elevation
+// for a fixed speed under gravity, so grenades arc onto the player instead of
+// being flung flat past them.
+static void BanditThrowGrenade(const SkinnedEnemy& bandit) {
+    const XMFLOAT3 origin = bandit.AimRayOrigin();
+    const XMFLOAT3& target = scene.camera.Position;
+
+    const float dx = target.x - origin.x;
+    const float dz = target.z - origin.z;
+    const float horizontal = std::sqrt(dx * dx + dz * dz);
+    if (horizontal < 0.01f) return;
+    const float dy = target.y - origin.y;
+
+    // Aim slightly ahead of the player so a moving target still gets bracketed.
+    const float speed = scene.grenadeThrowSpeed;
+    const float gravity = 9.81f * scene.grenadeGravityScale;
+
+    // Projectile solution: pick the low-arc launch angle that lands at (h, dy).
+    // v^4 - g(g*h^2 + 2*dy*v^2) < 0 means the target is out of range; fall back
+    // to a 45-degree heave so the grenade still travels sensibly.
+    const float v2 = speed * speed;
+    const float discriminant =
+        v2 * v2 - gravity * (gravity * horizontal * horizontal + 2.0f * dy * v2);
+    float angle;
+    if (discriminant < 0.0f) {
+        angle = XM_PIDIV4;
+    } else {
+        angle = std::atan((v2 - std::sqrt(discriminant)) / (gravity * horizontal));
+    }
+
+    const float horizontalSpeed = speed * std::cos(angle);
+    const float verticalSpeed = speed * std::sin(angle);
+    const float inverseHorizontal = 1.0f / horizontal;
+
+    Projectile grenade = {};
+    grenade.position = grenade.previousPosition = origin;
+    grenade.direction = { dx * inverseHorizontal, 0.0f, dz * inverseHorizontal };
+    grenade.grenade = true;
+    grenade.hostile = true;
+    grenade.active = true;
+    grenade.fuse = scene.grenadeFuse;
+    grenade.velocity = { dx * inverseHorizontal * horizontalSpeed,
+                         verticalSpeed,
+                         dz * inverseHorizontal * horizontalSpeed };
+    scene.projectiles.push_back(grenade);
 }
 
 static bool GrabPathClear(const XMFLOAT3& target) {
@@ -6626,6 +6703,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 const bool hasLineOfSight =
                     !bandit->NeedsLineOfSightCheck() ||
                     BanditHasLineOfSight(*bandit, scene.camera.Position);
+
+                // Grenade throw: mid-range only, on its own cooldown, and gated
+                // on the same line of sight the rifle uses so bandits do not lob
+                // through a wall. Mounted gunners keep to the turret.
+                if (!bandit->Dead() && !bandit->turretGunner &&
+                    !scene.playerGodMode && scene.playerHealth > 0.0f) {
+                    bandit->grenadeCooldown -= deltaTime;
+                    if (bandit->grenadeCooldown <= 0.0f) {
+                        const float gx = bandit->position.x - scene.camera.Position.x;
+                        const float gz = bandit->position.z - scene.camera.Position.z;
+                        const float range = std::sqrt(gx * gx + gz * gz);
+                        const bool inBand = range >= kBanditGrenadeMinRange &&
+                                            range <= kBanditGrenadeMaxRange;
+                        if (inBand && hasLineOfSight) {
+                            if (RandomUnit() < kBanditGrenadeChance)
+                                BanditThrowGrenade(*bandit);
+                            // Re-arm whether or not the roll passed, so a bandit
+                            // that declines does not retry every single frame.
+                            bandit->grenadeCooldown = kBanditGrenadeCooldownMin +
+                                RandomUnit() * (kBanditGrenadeCooldownMax -
+                                                kBanditGrenadeCooldownMin);
+                        }
+                    }
+                }
                 const bool fired = !(g_drivingHumvee && bandit->turretGunner &&
                                      bandit->mountedVehicleIndex == 0) &&
                     bandit->TryFireAt(
@@ -6875,6 +6976,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                     projectile.rocket ? kRocketHelicopterDamage
                                                       : scene.grenadeEnemyDamage * falloff,
                                     g_secondaryHelicopterPosition);
+                            }
+                        }
+                        // Grenades hurt the player too. Previously only enemies
+                        // took blast damage, because every grenade in the game
+                        // was thrown BY the player -- enemy grenades made the
+                        // radius matter in both directions. Own grenades still
+                        // count: standing on your own throw should cost you.
+                        {
+                            const float ex = scene.camera.Position.x - center.x;
+                            const float ey = scene.camera.Position.y - center.y;
+                            const float ez = scene.camera.Position.z - center.z;
+                            const float playerRange =
+                                std::sqrt(ex * ex + ey * ey + ez * ez);
+                            const float reach = scene.grenadeEnemyRadius;
+                            if (playerRange < reach) {
+                                const float falloff = 1.0f - playerRange / reach;
+                                scene.DamagePlayer(
+                                    scene.grenadePlayerDamage * falloff);
                             }
                         }
                         // Run after Bandit damage. Newly killed enemies have

@@ -258,6 +258,10 @@ struct Scene {
     float grenadeEnemyDamage   = 500.0f; // 20% edge falloff still deals 100
     float grenadeEnemyImpulse  = 100.0f;
     float grenadeEnemyPush     = 9.0f;   // survivor knockback speed in m/s
+    // Blast damage to the player at the centre, falling off to 0 at
+    // grenadeEnemyRadius. Enemies lob these, so a direct hit should hurt badly
+    // without being an instant kill from full health.
+    float grenadePlayerDamage  = 75.0f;
     float grenadeCooldown      = 0.0f;   // input debounce
     // Returns rendered ground height at world XZ. Installed by main so Scene
     // does not depend on terrain renderer implementation.
