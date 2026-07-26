@@ -192,6 +192,7 @@ float                       g_banditHeadYawOffsetDegrees = 20.4f;
 uint32_t                    g_banditSpawnSerial = 0;
 GunAudio                    g_gunAudio;
 GunAudio                    g_rpgFireAudio;
+GunAudio                    g_reloadAudio;
 GunAudio                    g_explosionAudio;
 GunAudio                    g_grenadeExplosionAudio;
 GunAudio                    g_hitAudio;
@@ -998,7 +999,30 @@ static bool SpawnHumveeTurretGunner(int vehicleIndex) {
     return true;
 }
 
-static void ShootPlayerWeapon() {
+// Reload click. Pitched per weapon so the heavier guns sound heavier: the RPG
+// and shotgun drop below unity, the AK sits near it, the SVD just above.
+static void PlayReloadSound() {
+    float pitch = 1.0f;
+    if (GunModel::RPGSelected())           pitch = 0.72f;
+    else if (GunModel::ShotgunSelected())  pitch = 0.85f;
+    else if (GunModel::SVDSelected())      pitch = 1.06f;
+    pitch += ((float)std::rand() / RAND_MAX) * 0.05f;
+    g_reloadAudio.Play(0.85f, pitch);
+}
+
+// Fires the selected weapon if it has a round chambered. Returns false when the
+// shot was blocked (empty magazine or mid-reload) so callers can skip arming the
+// fire cooldown. Ammo is only enforced outside god mode -- see Scene::ConsumeAmmo.
+static bool ShootPlayerWeapon() {
+    const int slot = GunModel::SelectedWeapon();
+    if (!scene.ConsumeAmmo(slot)) {
+        // Dry fire: auto-reload if there are spare rounds, so the player is not
+        // stuck clicking an empty gun without knowing why. BeginReload returns
+        // true only when a reload actually starts, so the click sound fires once
+        // rather than on every held-trigger frame.
+        if (scene.BeginReload(slot)) PlayReloadSound();
+        return false;
+    }
     if (GunModel::SVDSelected()) {
         scene.ShootSniperProjectile();
         const float pitch = 0.70f + ((float)std::rand() / RAND_MAX) * 0.04f;
@@ -1016,6 +1040,7 @@ static void ShootPlayerWeapon() {
         const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
         g_gunAudio.Play(0.82f, pitch);
     }
+    return true;
 }
 
 static float PlayerFireInterval() {
@@ -5645,10 +5670,8 @@ static void ApplyVirtualInput() {
 
     if (virtualInput.shoot) {
         scene.fireCooldown -= deltaTime;
-        if (scene.fireCooldown <= 0.0f) {
-            ShootPlayerWeapon();
+        if (scene.fireCooldown <= 0.0f && ShootPlayerWeapon())
             scene.fireCooldown = PlayerFireInterval();
-        }
     }
 
     // Jump is a one-shot: consume it here so a single click is a single jump.
@@ -5745,10 +5768,16 @@ static void ProcessInput(HWND) {
     if (!mouseHeld) g_suppressFireUntilMouseRelease = false;
     if (scene.autoFire && mouseHeld && !g_suppressFireUntilMouseRelease &&
         !ImGui::GetIO().WantCaptureMouse &&
-        scene.fireCooldown <= 0.0f) {
-        ShootPlayerWeapon();
+        scene.fireCooldown <= 0.0f && ShootPlayerWeapon()) {
         scene.fireCooldown = PlayerFireInterval();
     }
+
+    // Reload: press R. Held keys are fine here because BeginReload rejects a
+    // second start while one is already running.
+    scene.UpdateReload(deltaTime);
+    if ((GetAsyncKeyState('R') & 0x8000) &&
+        scene.BeginReload(GunModel::SelectedWeapon()))
+        PlayReloadSound();
 
     // Grenade: press G to lob one. Cooldown debounces the held key.
     scene.grenadeCooldown -= deltaTime;
@@ -6048,6 +6077,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
     g_gunAudio.Initialize("models/audio/rifle_shot.wav");
     g_rpgFireAudio.Initialize("models/audio/rpg_fire.wav");
+    // Lives under build/Sounds like the RPG explosion above, not models/audio --
+    // that tree is CMake-synced from source, this one ships in the build dir.
+    // Missing audio degrades to silence (Play() no-ops when nothing loaded).
+    g_reloadAudio.Initialize("build/Sounds/Reload/dragon-studio-gun-reload-2-504027.mp3");
     g_explosionAudio.Initialize("build/Sounds/Rpg/RocketExplosion3.mp3");
     g_grenadeExplosionAudio.Initialize("models/audio/explosion.ogg");
     scene.explosionAudioCallback = [](const XMFLOAT3& position, float size,
@@ -6491,6 +6524,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         g_gunAudio.Update();
         g_rpgFireAudio.Update();
+        g_reloadAudio.Update();
         g_explosionAudio.Update();
         g_grenadeExplosionAudio.Update();
         g_hitAudio.Update();
@@ -7995,6 +8029,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_hitAudio.Shutdown();
     g_grenadeExplosionAudio.Shutdown();
     g_explosionAudio.Shutdown();
+    g_reloadAudio.Shutdown();
     g_rpgFireAudio.Shutdown();
     g_gunAudio.Shutdown();
     g_profiler.Shutdown();
