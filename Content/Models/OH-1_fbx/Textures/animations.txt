@@ -1,0 +1,5 @@
+Demo:0-250
+Main_Rotor_Spinning:250-350
+Tail_Rotor_Spinning:350-450
+Navi_Lights_On:450-460
+Beacon_Light_On:460-490

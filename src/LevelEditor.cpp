@@ -405,9 +405,9 @@ bool LevelEditor::SaveTo(const std::filesystem::path& path) {
 
 bool LevelEditor::BrowseSaveAs() {
     std::error_code error;
-    std::filesystem::create_directories("levels", error);
+    std::filesystem::create_directories("Content/Levels", error);
     const std::wstring initialDirectory =
-        std::filesystem::absolute("levels", error).wstring();
+        std::filesystem::absolute("Content/Levels", error).wstring();
     std::wstring suggested = std::filesystem::path(
         SanitizeFileName(saveName_) + ".json").wstring();
     wchar_t selected[MAX_PATH] = {};
@@ -457,10 +457,10 @@ bool LevelEditor::BrowseImportModel() {
     }
     if (safeStem.empty()) safeStem = "imported_model";
     const std::filesystem::path importDirectory =
-        std::filesystem::path("models/Imported") / safeStem;
+        std::filesystem::path("Content/Models/Imported") / safeStem;
     pendingImportChanges_.clear();
     pendingImportChanges_.push_back(CaptureAssetBefore(
-        std::filesystem::path("prefabs/Imported") / (safeStem + ".json")));
+        std::filesystem::path("Content/Prefabs/Imported") / (safeStem + ".json")));
     pendingImportChanges_.push_back(CaptureAssetBefore(
         importDirectory / source.filename()));
     const std::vector<std::string> sidecars = {
@@ -491,8 +491,8 @@ bool LevelEditor::BrowseImportModel() {
 void LevelEditor::RefreshLevelFiles() {
     levelFiles_.clear();
     std::error_code error;
-    std::filesystem::create_directories("levels", error);
-    for (std::filesystem::directory_iterator it("levels", error), end;
+    std::filesystem::create_directories("Content/Levels", error);
+    for (std::filesystem::directory_iterator it("Content/Levels", error), end;
          !error && it != end; it.increment(error)) {
         if (it->is_regular_file() && it->path().extension() == ".json")
             levelFiles_.push_back(it->path());
@@ -1225,7 +1225,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             }
             ImGui::Checkbox("Audio emitter", &prefabDraft_.audio.enabled);
             if (prefabDraft_.audio.enabled) {
-                ImGui::InputTextWithHint("Audio path", "audio/loop.wav",
+                ImGui::InputTextWithHint("Audio path", "Content/Audio/loop.wav",
                     prefabAudioPath_, sizeof(prefabAudioPath_));
                 ImGui::Checkbox("Audio loop", &prefabDraft_.audio.loop);
                 ImGui::DragFloat("Audio radius", &prefabDraft_.audio.radius,
@@ -1373,7 +1373,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                     const std::string stem = SanitizeFileName(prefabDraft_.name);
                     prefabDraft_.id = "custom/" + stem;
                     prefabDraft_.generated = false;
-                    destination = std::filesystem::path("prefabs/Created") /
+                    destination = std::filesystem::path("Content/Prefabs/Created") /
                                   (stem + ".json");
                 }
                 AssetFileChange assetChange = CaptureAssetBefore(destination);

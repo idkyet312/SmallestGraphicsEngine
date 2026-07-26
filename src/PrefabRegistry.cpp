@@ -548,7 +548,7 @@ PrefabSaveResult PrefabRegistry::ImportModel(
             return value.empty() ? std::string("imported_model") : value;
         }();
         const std::filesystem::path modelDirectory =
-            std::filesystem::path("models/Imported") / safeStem;
+            std::filesystem::path("Content/Models/Imported") / safeStem;
         std::filesystem::create_directories(modelDirectory);
         const std::filesystem::path destination = modelDirectory / source.filename();
         std::filesystem::copy_file(source, destination,
@@ -573,7 +573,7 @@ PrefabSaveResult PrefabRegistry::ImportModel(
         if (prefab.modelGuid.empty()) prefab.modelGuid = NewAssetGuid(destination);
         prefab.targetSize = 2.0f;
         prefab.collision = "box";
-        savedPrefab = std::filesystem::path("prefabs/Imported") /
+        savedPrefab = std::filesystem::path("Content/Prefabs/Imported") /
                       (safeStem + ".json");
         return Save(prefab, savedPrefab);
     } catch (const std::exception& error) {

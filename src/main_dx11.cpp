@@ -535,7 +535,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     
     // Load gun model
-    gunModel.loadOBJ("models/gun.obj");
+    gunModel.loadOBJ("Content/Models/gun.obj");
     
     // Initialize demo lights
     for (int i = 0; i < numDemoLights; i++) {

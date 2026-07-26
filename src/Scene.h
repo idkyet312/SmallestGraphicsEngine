@@ -183,7 +183,7 @@ struct Scene {
     static constexpr int kWeaponSlots = 4;
     int magazineSize[kWeaponSlots] = { 30,  8,  1, 10 };
     int maxReserve  [kWeaponSlots] = { 240, 64, 8, 80 };
-    // Tuned around the reload clip (build/Sounds/Reload/..., 1.512s) so the
+    // Tuned around the reload clip (Content/Audio/... , 1.512s) so the
     // sound lands close to when the magazine actually seats. The RPG and
     // shotgun run longer deliberately -- they read as heavier reloads, and the
     // audio simply finishes a little early there.

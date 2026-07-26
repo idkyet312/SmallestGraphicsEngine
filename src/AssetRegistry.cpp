@@ -205,11 +205,11 @@ bool AssetRegistry::Refresh(bool force) {
             scanned.push_back(std::move(record));
         }
     };
-    scan("models", AssetKind::Model, true);
-    scan("textures", AssetKind::Texture, true);
-    scan("audio", AssetKind::Audio, true);
-    scan("prefabs", AssetKind::Prefab, false);
-    scan("levels", AssetKind::Level, false);
+    scan("Content/Models", AssetKind::Model, true);
+    scan("Content/Textures", AssetKind::Texture, true);
+    scan("Content/Audio", AssetKind::Audio, true);
+    scan("Content/Prefabs", AssetKind::Prefab, false);
+    scan("Content/Levels", AssetKind::Level, false);
     if (error) lastError_ = error.message(); else lastError_.clear();
     std::sort(scanned.begin(), scanned.end(), [](const AssetRecord& a,
                                                   const AssetRecord& b) {

@@ -1820,7 +1820,7 @@ static bool RebuildDXRDDGIProbeLayout(bool force) {
     if (scene.useMeshTerrain && g_terrain.supported &&
         !g_ddgiCornellTestMode)
         AppendDXRDDGITerrain(triangles, geometryHash);
-    const std::filesystem::path cache = std::filesystem::path("levels") /
+    const std::filesystem::path cache = std::filesystem::path("Content/Levels") /
         ".ddgi" / (std::to_string(geometryHash) + ".ddgi");
     if (!g_dxrDDGI.BuildProbeLayout(triangles, geometryHash, cache))
         return false;
@@ -1889,7 +1889,7 @@ static void BeginLevelLoading() {
     levelLoadingLabel = g_emptyLevelMode
         ? "Terrain material"
         : "Terrain material and crate model";
-    levelLoadingAsset = g_emptyLevelMode ? "floor material" : "models/h2.glb";
+    levelLoadingAsset = g_emptyLevelMode ? "floor material" : "Content/Models/h2.glb";
     levelLoadingTaskIndex = 1;
     levelLoadingLastSubmittedUploads = 0;
     levelLoadingSubmittedUploads = 0;
@@ -2453,7 +2453,7 @@ static bool g_environmentStressMode = false;
 
 static bool LoadDandelionModel() {
     if (g_dandelionModel) return true;
-    const std::string root = "models/fbx_Dandelion/";
+    const std::string root = "Content/Models/fbx_Dandelion/";
     auto model = FBXImporter::Load(root + "Dandelion.FBX",
         g_dx12.device, g_dx12.commandList, 1.0f, false, false);
     if (!model) {
@@ -3598,9 +3598,9 @@ static void StartDDGICornellTest(HWND hwnd) {
 
 static void BrowseAndStartCustomLevel(HWND hwnd) {
     std::error_code error;
-    std::filesystem::create_directories("levels", error);
+    std::filesystem::create_directories("Content/Levels", error);
     const std::wstring initialDirectory =
-        std::filesystem::absolute("levels", error).wstring();
+        std::filesystem::absolute("Content/Levels", error).wstring();
     wchar_t selected[MAX_PATH] = {};
     OPENFILENAMEW dialog = {};
     dialog.lStructSize = sizeof(dialog);
@@ -3905,7 +3905,7 @@ static void LoadFloorMudMaterial() {
     floorMaterial->roughnessFactor = 1.0f;
     floorMaterial->viewFillStrength = 0.0f;
 
-    const std::string dir = "models/grass/Grass004_2K-PNG/";
+    const std::string dir = "Content/Models/grass/Grass004_2K-PNG/";
     floorMaterial->baseColorTexture = GLBImporter::LoadTextureFromFile(
         ResolveTexturePath((dir + "Grass004_2K-PNG_Color.png").c_str()),
         g_dx12.device, g_dx12.commandList, floorMaterial->uploadHeaps);
@@ -3930,31 +3930,31 @@ static void LoadFloorMudMaterial() {
 
     // Soft smoke sprite for particle billboards.
     g_smokeTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("models/textures/smoke.png"),
+        ResolveTexturePath("Content/Models/textures/smoke.png"),
         g_dx12.device, g_dx12.commandList, g_smokeUploadHeaps);
     if (!g_smokeTexture)
         std::cerr << "Smoke sprite (models/textures/smoke.png) unavailable\n";
 
     g_bloodTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("models/textures/blood_splat.png"),
+        ResolveTexturePath("Content/Models/textures/blood_splat.png"),
         g_dx12.device, g_dx12.commandList, g_bloodUploadHeaps);
     if (!g_bloodTexture)
         std::cerr << "Blood sprite (models/textures/blood_splat.png) unavailable\n";
 
     g_muzzleFlashTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("models/textures/muzzle_flash.png"),
+        ResolveTexturePath("Content/Models/textures/muzzle_flash.png"),
         g_dx12.device, g_dx12.commandList, g_muzzleFlashUploadHeaps);
     if (!g_muzzleFlashTexture)
         std::cerr << "Muzzle flash (models/textures/muzzle_flash.png) unavailable\n";
 
     g_fireTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("models/textures/fire1_64.png"),
+        ResolveTexturePath("Content/Models/textures/fire1_64.png"),
         g_dx12.device, g_dx12.commandList, g_fireUploadHeaps);
     if (!g_fireTexture)
         std::cerr << "Fire sprite (models/textures/fire1_64.png) unavailable\n";
 
     g_explosionTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("models/textures/explosion_soluna.png"),
+        ResolveTexturePath("Content/Models/textures/explosion_soluna.png"),
         g_dx12.device, g_dx12.commandList, g_explosionUploadHeaps);
     if (!g_explosionTexture)
         std::cerr << "Explosion sheet (models/textures/explosion_soluna.png) unavailable\n";
@@ -4172,25 +4172,25 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
         mat->metallicFactor = 1.0f;
         mat->roughnessFactor = 1.0f;
     };
-    assign("Foundation", "models/house_pbr/foundation_brick",
+    assign("Foundation", "Content/Models/house_pbr/foundation_brick",
            HouseTex::Stone(kSize, { 0.62f, 0.62f, 0.64f }, { 0.34f, 0.34f, 0.36f }));
-    assign("Stud", "models/house_pbr/stud_wood",
+    assign("Stud", "Content/Models/house_pbr/stud_wood",
            HouseTex::Wood(kSize, { 0.60f, 0.42f, 0.25f }, { 0.34f, 0.22f, 0.12f }));
     // Cladding uses the single-board wood (not the multi-plank field) so the
     // grain reads as real boards when tiled.
-    assign("Cladding", "models/house_pbr/stud_wood",
+    assign("Cladding", "Content/Models/house_pbr/stud_wood",
            HouseTex::Wood(kSize, { 0.84f, 0.68f, 0.46f }, { 0.55f, 0.40f, 0.24f }));
     // Corrugated metal sheets; no downloaded map for this one, so the
     // procedural ribbed texture always kicks in.
-    assign("Roof", "models/house_pbr/roof_metal",
+    assign("Roof", "Content/Models/house_pbr/roof_metal",
            HouseTex::Corrugated(kSize, { 0.72f, 0.74f, 0.76f }, { 0.42f, 0.25f, 0.16f }));
     assignGeneratedMetal("MetalWall",
-               "models/Corrugated metal pack/Wall/A/A Roughness rusted 2.jpg",
+               "Content/Models/Corrugated metal pack/Wall/A/A Roughness rusted 2.jpg",
                HouseTex::Corrugated(kSize, { 0.30f, 0.34f, 0.31f }, { 0.43f, 0.22f, 0.10f }), 0.82f, 0.66f);
     assignPackedPBR("MetalRoof",
-               "models/polyhaven/corrugated_iron/corrugated_iron_diff_2k.jpg",
-               "models/polyhaven/corrugated_iron/corrugated_iron_nor_dx_2k.jpg",
-               "models/polyhaven/corrugated_iron/corrugated_iron_arm_2k.jpg",
+               "Content/Models/polyhaven/corrugated_iron/corrugated_iron_diff_2k.jpg",
+               "Content/Models/polyhaven/corrugated_iron/corrugated_iron_nor_dx_2k.jpg",
+               "Content/Models/polyhaven/corrugated_iron/corrugated_iron_arm_2k.jpg",
                HouseTex::Corrugated(kSize, { 0.42f, 0.46f, 0.48f }, { 0.38f, 0.18f, 0.08f }));
 }
 
@@ -6075,14 +6075,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     if (!g_profiler.Init(g_dx12.device.Get(), g_dx12.commandQueue.Get()))
         std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
-    g_gunAudio.Initialize("models/audio/rifle_shot.wav");
-    g_rpgFireAudio.Initialize("models/audio/rpg_fire.wav");
+    g_gunAudio.Initialize("Content/Audio/rifle_shot.wav");
+    g_rpgFireAudio.Initialize("Content/Audio/rpg_fire.wav");
     // Lives under build/Sounds like the RPG explosion above, not models/audio --
     // that tree is CMake-synced from source, this one ships in the build dir.
     // Missing audio degrades to silence (Play() no-ops when nothing loaded).
-    g_reloadAudio.Initialize("build/Sounds/Reload/dragon-studio-gun-reload-2-504027.mp3");
-    g_explosionAudio.Initialize("build/Sounds/Rpg/RocketExplosion3.mp3");
-    g_grenadeExplosionAudio.Initialize("models/audio/explosion.ogg");
+    g_reloadAudio.Initialize("Content/Audio/dragon-studio-gun-reload-2-504027.mp3");
+    g_explosionAudio.Initialize("Content/Audio/RocketExplosion3.mp3");
+    g_grenadeExplosionAudio.Initialize("Content/Audio/explosion.ogg");
     scene.explosionAudioCallback = [](const XMFLOAT3& position, float size,
                                       bool grenade) {
         const float dx = position.x - scene.camera.Position.x;
@@ -6094,13 +6094,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         const float pitch = 0.92f + ((float)std::rand() / RAND_MAX) * 0.10f;
         (grenade ? g_grenadeExplosionAudio : g_explosionAudio).Play(volume, pitch);
     };
-    g_hitAudio.Initialize("models/audio/bullet_flesh_hit.mp3");
-    g_banditSpottedAudio1.Initialize("models/audio/bandit_spotted_01.wav");
-    g_banditSpottedAudio2.Initialize("models/audio/bandit_spotted_02.wav");
-    g_banditAttackAudio.Initialize("models/audio/bandit_attack.wav");
-    g_banditDeathAudio.Initialize("models/audio/bandit_death.wav");
-    g_banditHitVoiceAudio.Initialize("models/audio/bandit_hit_voice.wav");
-    g_helicopterHoverAudio.Initialize("models/audio/helicopter_hover_loop.mp3");
+    g_hitAudio.Initialize("Content/Audio/bullet_flesh_hit.mp3");
+    g_banditSpottedAudio1.Initialize("Content/Audio/bandit_spotted_01.wav");
+    g_banditSpottedAudio2.Initialize("Content/Audio/bandit_spotted_02.wav");
+    g_banditAttackAudio.Initialize("Content/Audio/bandit_attack.wav");
+    g_banditDeathAudio.Initialize("Content/Audio/bandit_death.wav");
+    g_banditHitVoiceAudio.Initialize("Content/Audio/bandit_hit_voice.wav");
+    g_helicopterHoverAudio.Initialize("Content/Audio/helicopter_hover_loop.mp3");
 
     // ImGui
     D3D12_DESCRIPTOR_HEAP_DESC ihd = {};
@@ -7309,7 +7309,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (!g_emptyLevelMode) {
                 std::cout << "Loading models/h2.glb...\n";
                 crateModel = GLBImporter::LoadGLB(
-                    "models/h2.glb", g_dx12.device, g_dx12.commandList);
+                    "Content/Models/h2.glb", g_dx12.device, g_dx12.commandList);
             }
             AdvanceLevelLoading(LevelLoadStage::Destruction,
                 "Destruction geometry and Blast actors",
@@ -7462,7 +7462,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // Authored explosive barrel. Source mesh is 2.08 m high; 0.72 keeps
                 // its in-game size aligned with existing 1.5 m gameplay collision.
                 g_explosiveBarrelModel = FBXImporter::Load(
-                    "models/Barrel Explosive/barrel.FBX",
+                    "Content/Models/Barrel Explosive/barrel.FBX",
                     g_dx12.device, g_dx12.commandList, 0.72f, false, true);
                 if (g_explosiveBarrelModel) {
                     // Asset provides only diffuse + normal maps. Treating its
@@ -7491,12 +7491,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
                 AdvanceLevelLoading(LevelLoadStage::Humvee,
                     "Humvee model, bounds and shadow mesh",
-                    "models/Humvee/humvee.fbx",
+                    "Content/Models/Humvee/humvee.fbx",
                     g_explosiveBarrelModel != nullptr);
             }
         } else if (levelLoadStage == LevelLoadStage::Humvee) {
             g_humveeModel = FBXImporter::Load(
-                "models/Humvee/humvee.fbx",
+                "Content/Models/Humvee/humvee.fbx",
                 g_dx12.device, g_dx12.commandList, 1.0f, false, true);
             if (g_humveeModel) {
                 for (const auto& child : g_humveeModel->children)
@@ -7514,11 +7514,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
             AdvanceLevelLoading(LevelLoadStage::Helicopter,
                 "OH-1 import, geometry LOD and rotor setup",
-                "models/OH-1_fbx/OH-1.fbx", g_humveeModel != nullptr);
+                "Content/Models/OH-1_fbx/OH-1.fbx", g_humveeModel != nullptr);
         } else if (levelLoadStage == LevelLoadStage::Helicopter) {
 
             const std::string helicopterModelPath =
-                ResolveTexturePath("models/OH-1_fbx/OH-1.fbx");
+                ResolveTexturePath("Content/Models/OH-1_fbx/OH-1.fbx");
             std::cout << "OH-1 asset: " << helicopterModelPath << "\n";
             g_helicopterModel = FBXImporter::Load(
                 helicopterModelPath,
@@ -7543,14 +7543,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
             AdvanceLevelLoading(LevelLoadStage::BanditModel,
                 "Bandit mesh, skeleton, clips and physics asset",
-                "models/MilitaryMercenaryBandit/SK_Bandit.FBX",
+                "Content/Models/MilitaryMercenaryBandit/SK_Bandit.FBX",
                 g_helicopterModel != nullptr);
         } else if (levelLoadStage == LevelLoadStage::BanditModel) {
 
             // Skinned Bandit enemy: mesh + walk/idle/run clips. Texture uploads
             // ride the same command list flushed just below.
             {
-                const std::string banditDir = "models/MilitaryMercenaryBandit/";
+                const std::string banditDir = "Content/Models/MilitaryMercenaryBandit/";
                 const std::string animDir = banditDir + "Animations/Demo/";
                 std::vector<std::string> clips = {
                     animDir + "ThirdPersonIdle.FBX",

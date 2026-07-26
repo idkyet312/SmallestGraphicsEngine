@@ -9,7 +9,7 @@
 
 // Poly Haven "Kloppenheim 06 (Pure Sky)", CC0.
 inline constexpr const char* kSkyEnvironmentPath =
-    "models/Skyboxes/kloppenheim_06_puresky_2k.exr";
+    "Content/Models/Skyboxes/kloppenheim_06_puresky_2k.exr";
 
 struct alignas(256) SkyBufferDX12 {
     XMFLOAT3 cameraForward;

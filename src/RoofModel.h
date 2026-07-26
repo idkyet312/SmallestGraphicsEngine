@@ -27,7 +27,7 @@ inline void EnsureRoofModelLoaded() {
     if (attempted) return;
     attempted = true;
 
-    const std::string modelPath = ResolveRoofAsset("models/MetalRoof/Metalroof.fbx");
+    const std::string modelPath = ResolveRoofAsset("Content/Models/MetalRoof/Metalroof.fbx");
     std::cout << "Loading " << modelPath << "...\n";
     auto sheet = FBXImporter::Load(modelPath, g_dx12.device, g_dx12.commandList, 0.1f, false);
     if (!sheet || !sheet->mesh) {
@@ -51,7 +51,7 @@ inline void EnsureRoofModelLoaded() {
     if (width < 0.001f || depth < 0.001f) return;
 
     // Use Poly Haven's real glTF-compatible PBR set on imported sheet geometry.
-    const std::string pbr = "models/polyhaven/corrugated_iron/";
+    const std::string pbr = "Content/Models/polyhaven/corrugated_iron/";
     for (MeshPrimitive& primitive : sheet->mesh->primitives) {
         if (!primitive.material) primitive.material = std::make_shared<SceneMaterial>();
         SceneMaterial& material = *primitive.material;

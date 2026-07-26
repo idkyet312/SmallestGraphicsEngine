@@ -118,7 +118,7 @@ public:
         if (attempted) return;
         attempted = true;
 
-        const std::string path = Resolve("models/ak47/AK47.FBX");
+        const std::string path = Resolve("Content/Models/ak47/AK47.FBX");
         std::cout << "Loading AK47 " << path << "...\n";
         // Scale 1 and no FBX-side textures: we normalise the size ourselves below
         // and assign the material by hand, so letting the importer resolve
@@ -203,7 +203,7 @@ private:
     }
 
     static void LoadShotgun() {
-        const std::string path = Resolve("models/shotgun_fbx/Mossberg 590A1.fbx");
+        const std::string path = Resolve("Content/Models/shotgun_fbx/Mossberg 590A1.fbx");
         std::cout << "Loading Mossberg 590A1 " << path << "...\n";
         auto root = FBXImporter::Load(path, g_dx12.device, g_dx12.commandList,
                                       1.0f, false, false);
@@ -271,7 +271,7 @@ private:
     }
 
     static void LoadRPG() {
-        const std::string path = Resolve("models/RPG7/RPG72.fbx");
+        const std::string path = Resolve("Content/Models/RPG7/RPG72.fbx");
         std::cout << "Loading RPG-7 " << path << "...\n";
         auto root = FBXImporter::Load(path, g_dx12.device, g_dx12.commandList,
                                       1.0f, false, false);
@@ -320,7 +320,7 @@ private:
     static void LoadSVD() {
         // Source FBX is version 6100 (FBX SDK 9.4), older than Assimp supports.
         // SVD.obj is the equivalent static mesh converted with ufbx.
-        const std::string path = Resolve("models/SVD_v1.3/Models/SVD.obj");
+        const std::string path = Resolve("Content/Models/SVD_v1.3/Models/SVD.obj");
         std::cout << "Loading SVD " << path << "...\n";
         auto root = FBXImporter::Load(path, g_dx12.device, g_dx12.commandList,
                                       1.0f, false, false);
@@ -527,7 +527,7 @@ private:
         mat->name = "ak47";
         mat->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
 
-        const std::string dir = "models/ak47/textures/";
+        const std::string dir = "Content/Models/ak47/textures/";
         mat->baseColorTexture = GLBImporter::LoadTextureFromFile(
             Resolve(dir + "AK47_albedo.tga"), g_dx12.device, g_dx12.commandList,
             mat->uploadHeaps);
@@ -606,7 +606,7 @@ private:
         auto mat = std::make_shared<SceneMaterial>();
         mat->name = "rpg7";
         mat->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
-        const std::string dir = "models/RPG7/textures/";
+        const std::string dir = "Content/Models/RPG7/textures/";
         mat->baseColorTexture = GLBImporter::LoadTextureFromFile(
             Resolve(dir + "RPG7_Albedo.png"), g_dx12.device, g_dx12.commandList,
             mat->uploadHeaps);
@@ -644,7 +644,7 @@ private:
         auto mat = std::make_shared<SceneMaterial>();
         mat->name = "rpg7_rocket";
         mat->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
-        const std::string dir = "models/RPG7/textures/";
+        const std::string dir = "Content/Models/RPG7/textures/";
         mat->baseColorTexture = GLBImporter::LoadTextureFromFile(
             Resolve(dir + "RPG7Rocket_Albedo.png"), g_dx12.device,
             g_dx12.commandList, mat->uploadHeaps);
@@ -679,7 +679,7 @@ private:
     }
 
     static void AssignSVDMaterials(std::vector<MeshPrimitive>& prims) {
-        const std::string dir = "models/SVD_v1.3/Textures/";
+        const std::string dir = "Content/Models/SVD_v1.3/Textures/";
         auto makeMaterial = [&](const char* name, const char* textureStem,
                                 float metallic, float roughness) {
             auto material = std::make_shared<SceneMaterial>();

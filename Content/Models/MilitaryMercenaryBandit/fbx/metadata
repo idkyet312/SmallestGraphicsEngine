@@ -1,0 +1,268 @@
+{
+	"assetNamespace": "fab",
+	"listing":
+	{
+		"averageRating": 4.3099999999999996,
+		"createdAt": "",
+		"description": "<p>Low poly model of Military Mercenary Bandit. Suitable for your projects of genre: Shooters, survival, action, horror, etc.&nbsp;<span>For Unreal Engine, Unity &amp; Blender.</span></p><p></p><p><span>| </span><a target=\"_blank\" href=\"https://www.artstation.com/s_grez\" rel=\"noopener noreferrer nofollow\"><span>ArtStation </span></a><span>| </span><a target=\"_blank\" href=\"https://x.com/VowaSeleznev\" rel=\"noopener noreferrer nofollow\"><span>X (Twitter)</span></a><span> | </span><a target=\"_blank\" href=\"https://www.youtube.com/@S_Grez\" rel=\"noopener noreferrer nofollow\"><span>YouTube </span></a><span>| </span><a target=\"_blank\" href=\"https://www.instagram.com/abandonedworld_cg/\" rel=\"noopener noreferrer nofollow\"><span>Instagram</span></a><span> | </span><a target=\"_blank\" href=\"https://www.reddit.com/user/S_Grez\" rel=\"noopener noreferrer nofollow\"><span>Reddit </span></a><span>| </span><a target=\"_blank\" href=\"https://abandonedworld.xyz/\" rel=\"noopener noreferrer nofollow\"><span>WebSite </span></a><span>| </span><a target=\"_blank\" href=\"https://www.fab.com/sellers/Abandoned%20World\" rel=\"noopener noreferrer nofollow\">FAB </a><span>|</span></p><p></p><blockquote><p><strong>Video presentation: </strong><a target=\"_blank\" href=\"https://youtu.be/Ff4-LjwzGiQ\" rel=\"noopener noreferrer nofollow\">https://youtu.be/Ff4-LjwzGiQ</a></p></blockquote><p></p><p><span class=\"fabkit-prose-color--green\"><strong>Features:</strong></span></p><p></p><ul><li><p>Unreal Engine, Unity &amp; Blender version</p></li><li><p>Hight Quality Model &amp; PBR Materials</p></li><li><p>LowPoly - Game Ready</p></li><li><p>Reasonable poly count</p></li><li><p>Optimized the density of the textures</p></li><li><p>PBR Textures are collected in ORM packages</p></li><li><p>10 sets of textures for the character</p></li></ul><p></p><p>ArtStation of the artist who made this project: <a target=\"_blank\" href=\"https://www.artstation.com/viktorova\" rel=\"noopener noreferrer nofollow\">ArtStation Daria Viktorova</a></p><p></p><p><span class=\"fabkit-prose-color--red\"><strong>Available file formats:</strong></span></p><p></p><ul><li><p>Unreal Engine 4.27 and later</p></li><li><p>Unity 2022 [Built-in | URP | HDRP]</p></li><li><p>Blender Scene 3.6</p></li><li><p>FBX (only mesh)</p></li><li><p>OBJ (only mesh)</p></li><li><p>PNG for Textures</p></li></ul>",
+		"isAiForbidden": true,
+		"isAiGenerated": false,
+		"lastUpdatedAt": "",
+		"listingType": "3d-model",
+		"media": "https://media.fab.com/image_previews/gallery_images/ccfffac5-e2f9-4ffa-8e7e-350a2752d0ed/6b3a1ecc-296a-4750-a6d7-8c59d80e8989.jpg",
+		"publishedAt": "2026-06-24T23:41:11.820735Z",
+		"reviewCount": 29,
+		"thumbnail": "https://media.fab.com/image_previews/gallery_images/08d1d71b-827f-4a51-af07-c1f742c16796/e5ed810e-c1c9-4a95-a0fe-15055e9a44de.jpg",
+		"title": "Military Mercenary Bandit",
+		"uid": "c726acc3-9849-4af9-8d30-cc7b0f62e6a7",
+		"updatedAt": "",
+		"user":
+		{
+			"coverImageUrl": "https://cdn1.epicgames.com/fab/seller/o-myucxjdvslgufvfyteb7fjzhx34f4n/cover/5594926c.jpg",
+			"profileImageUrl": "https://cdn1.epicgames.com/fab/seller/o-myucxjdvslgufvfyteb7fjzhx34f4n/profile/281659f9.png",
+			"sellerName": "Abandoned World",
+			"uid": "f460ab6b-b029-43ad-ac2d-77a6ac3058d8"
+		},
+		"tags": [
+			{
+				"name": "Camouflage",
+				"slug": "camouflage",
+				"uid": "f76b722b-7c7a-407c-8f4e-486181f3ef78"
+			},
+			{
+				"name": "Human",
+				"slug": "human",
+				"uid": "cbc60226-383b-49fc-bc12-fde398c13fba"
+			},
+			{
+				"name": "Military",
+				"slug": "military",
+				"uid": "d72bfec9-cfd7-44c0-85d9-eac5049405aa"
+			},
+			{
+				"name": "Horror",
+				"slug": "horror",
+				"uid": "e2b772ec-e68e-400a-89da-4ed6863c2d08"
+			},
+			{
+				"name": "Character",
+				"slug": "character",
+				"uid": "f07e8c06-66ed-4396-81cf-108f0afcb6d6"
+			},
+			{
+				"name": "Stalker",
+				"slug": "stalker",
+				"uid": "03e7ea7b-7f5f-4e3a-aea1-b5bc24cb1116"
+			},
+			{
+				"name": "Pbr",
+				"slug": "pbr",
+				"uid": "080edd3b-d10a-4f32-ace2-30f5baa480dc"
+			},
+			{
+				"name": "Postapocalyptic",
+				"slug": "postapocalyptic",
+				"uid": "0f89b929-9f95-43cf-8255-d9f5cf2139ad"
+			},
+			{
+				"name": "Army",
+				"slug": "army",
+				"uid": "145920d1-f66b-46e1-894b-ca6c9f62b704"
+			},
+			{
+				"name": "Survival",
+				"slug": "survival",
+				"uid": "1bccf364-5fcd-49d8-815e-254995d9c278"
+			},
+			{
+				"name": "Russian",
+				"slug": "russian",
+				"uid": "2b852d33-9e89-49db-b85a-ae0a09afd38a"
+			},
+			{
+				"name": "Man",
+				"slug": "man",
+				"uid": "5e99785b-683a-42a7-9ecd-f705bf73c752"
+			},
+			{
+				"name": "Gameready",
+				"slug": "gameready",
+				"uid": "6a250196-0821-43cb-b9cd-3975f235b88d"
+			},
+			{
+				"name": "Bandit",
+				"slug": "bandit",
+				"uid": "71aad1e3-d3ce-4eef-830b-1703a77ec523"
+			},
+			{
+				"name": "Mercenary",
+				"slug": "mercenary",
+				"uid": "872993ae-9d61-452c-b97a-f4c97c7b0142"
+			},
+			{
+				"name": "Script",
+				"slug": "script",
+				"uid": "8a8d511d-a915-4f38-9bde-1ef129a32f6e"
+			},
+			{
+				"name": "Animated",
+				"slug": "animated",
+				"uid": "8e61a209-4e02-4dd1-8e44-cc2bf9356e7a"
+			},
+			{
+				"name": "Realistic",
+				"slug": "realistic",
+				"uid": "93b0d3f1-a96c-4d68-9d44-69a313519e32"
+			},
+			{
+				"name": "Male",
+				"slug": "male",
+				"uid": "9f5a4616-550c-48bb-b040-78c85ff389a7"
+			},
+			{
+				"name": "Grunge",
+				"slug": "grunge",
+				"uid": "ac954825-7cee-4d92-b13f-ee07f0b1eee0"
+			},
+			{
+				"name": "Rigged",
+				"slug": "rigged",
+				"uid": "c5c1f70c-aabe-41d4-bd3a-e7e00ab60f0c"
+			},
+			{
+				"name": "Animationblueprint",
+				"slug": "animationblueprint",
+				"uid": "01741263-b18a-48e1-97b4-fbab9cf17c4a"
+			},
+			{
+				"name": "Epicskeleton",
+				"slug": "epicskeleton",
+				"uid": "0115280d-641a-4d87-9371-badb07297f4e"
+			},
+			{
+				"name": "Urp",
+				"slug": "urp",
+				"uid": "85decde8-4b99-4569-9b9f-58ede613999f"
+			},
+			{
+				"name": "Hdrp",
+				"slug": "hdrp",
+				"uid": "87812c0f-ae7d-4558-adfc-10abc140c4da"
+			}
+		],
+		"category":
+		{
+			"name": "Humans",
+			"path": "characters-creatures/humans",
+			"slug": "characters-creatures--humans",
+			"uid": "0a4f7590-4376-400b-a6e4-c7a658cbab47"
+		},
+		"assetFormats": [
+			{
+				"assetFormatType":
+				{
+					"name": "Unreal Engine",
+					"groupName": "Game Engine Formats",
+					"code": "unreal-engine",
+					"icon": "unreal-engine",
+					"extensions": [
+						"uasset",
+						"uproject"
+					]
+				}
+			},
+			{
+				"assetFormatType":
+				{
+					"name": "Blender",
+					"groupName": "3D DCC Formats",
+					"code": "blender",
+					"icon": "blender",
+					"extensions": [
+						"blend"
+					]
+				}
+			},
+			{
+				"assetFormatType":
+				{
+					"name": "Additional files",
+					"groupName": "Other Formats",
+					"code": "additional-files",
+					"icon": "file",
+					"extensions": [
+						"zip"
+					]
+				}
+			},
+			{
+				"assetFormatType":
+				{
+					"name": "FBX",
+					"groupName": "3D Exchange Formats",
+					"code": "fbx",
+					"icon": "cube",
+					"extensions": [
+						"fbx"
+					]
+				}
+			},
+			{
+				"assetFormatType":
+				{
+					"name": "OBJ",
+					"groupName": "3D Exchange Formats",
+					"code": "obj",
+					"icon": "cube",
+					"extensions": [
+						"obj"
+					]
+				}
+			},
+			{
+				"assetFormatType":
+				{
+					"name": "Unity",
+					"groupName": "Game Engine Formats",
+					"code": "unity",
+					"icon": "unity",
+					"extensions": [
+						"unitypackage"
+					]
+				}
+			},
+			{
+				"assetFormatType":
+				{
+					"name": "Converted Files",
+					"groupName": "",
+					"code": "converted-files",
+					"icon": "cube",
+					"extensions": [
+						"gltf",
+						"glb",
+						"usdz"
+					]
+				}
+			}
+		],
+		"_PluginMetas":
+		{
+			"apiDataVersion": "0.0.1",
+			"entitlementUid": "",
+			"cacheSize": 0,
+			"downloaded": []
+		}
+	},
+	"target": "",
+	"quality": "",
+	"format": "fbx",
+	"fileId": "6fc9957b-321d-4964-bf87-a00210f7d722",
+	"platformIncluded": "",
+	"distributionPointBaseUrls": [],
+	"distributionMethod": "",
+	"entitlementUid": "",
+	"invertedNormal": false,
+	"isConverted": false,
+	"isQuixel": false
+}

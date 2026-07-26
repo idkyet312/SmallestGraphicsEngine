@@ -14,7 +14,8 @@ public:
     AssetWatcher& operator=(const AssetWatcher&) = delete;
 
     void Start(const std::vector<std::filesystem::path>& roots = {
-        "models", "textures", "audio", "prefabs", "levels" });
+        "Content/Models", "Content/Textures", "Content/Audio",
+        "Content/Prefabs", "Content/Levels" });
     void Stop();
     bool ConsumeChange() { return changed_.exchange(false); }
 

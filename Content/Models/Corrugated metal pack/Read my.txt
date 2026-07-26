@@ -1,0 +1,18 @@
+
+The letters "A", "B", "C" stands for textures group. 
+"A C" models use material with "A" textures on one material slot,and "C" textures material on the other slot.
+
+"Rust patterns" are PNG images of rust, with alpha channel. You can use them to create a rusted paint efect.      
+
+Use grid snap, and 90 degree rotation to easily create constructions (except the doors).
+
+Use double sided materials/normals or similar function.
+
+
+
+   
+
+
+
+One or more textures on this 3D model have been created with photographs from Textures.com. 
+These photographs may not be redistributed by default; please visit www.textures.com for more information.

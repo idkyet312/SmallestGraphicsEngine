@@ -583,9 +583,9 @@ public:
         // Replace all generated fallback slices with Poly Haven CC0 scans.
         auto resolveTerrainMap = [](const char* folder, const char* file) {
             for (const std::filesystem::path root : {
-                    std::filesystem::path("models"),
-                    std::filesystem::path("build/models"),
-                    std::filesystem::path("../models") }) {
+                    std::filesystem::path("Content/Models"),
+                    std::filesystem::path("build/Content/Models"),
+                    std::filesystem::path("../Content/Models") }) {
                 const std::filesystem::path path = root / folder / file;
                 if (std::filesystem::exists(path)) return path.string();
             }

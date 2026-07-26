@@ -1050,7 +1050,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     
     // Load model
     std::cout << "Attempting to load models/gun.glb..." << std::endl;
-    loadedModelNode = GLBImporter::LoadGLB("models/gun.glb", g_dx12.device, g_dx12.commandList);
+    loadedModelNode = GLBImporter::LoadGLB("Content/Models/gun.glb", g_dx12.device, g_dx12.commandList);
     if (loadedModelNode) {
         std::cout << "Model loaded successfully!" << std::endl;
         // Collapse the whole (static) node hierarchy into one draw call per
@@ -1780,7 +1780,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             
             if (ImGui::CollapsingHeader("Scene Graph & Models")) {
-                static char modelPath[128] = "models/gun.glb";
+                static char modelPath[128] = "Content/Models/gun.glb";
                 ImGui::InputText("Model Path", modelPath, IM_ARRAYSIZE(modelPath));
                 if (ImGui::Button("Load Model")) {
                     std::cout << "Loading model: " << modelPath << std::endl;

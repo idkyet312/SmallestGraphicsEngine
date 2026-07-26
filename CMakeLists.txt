@@ -369,9 +369,6 @@ add_custom_command(TARGET GraphicEngine POST_BUILD
     ${CMAKE_SOURCE_DIR}/shaders
     $<TARGET_FILE_DIR:GraphicEngine>/shaders
     COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
-    ${CMAKE_SOURCE_DIR}/prefabs
-    $<TARGET_FILE_DIR:GraphicEngine>/prefabs
-    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
     ${CMAKE_SOURCE_DIR}/scripts
     $<TARGET_FILE_DIR:GraphicEngine>/scripts
     COMMENT "Copying shaders and data-driven content to build directory"
@@ -396,22 +393,27 @@ if(USE_DX12 AND DXC_EXECUTABLE)
     endif()
 endif()
 
-# Models total roughly 1.5 GiB. A POST_BUILD copy made every code-only link spend
-# over a minute copying them, twice, to the same build directory. This stamped
-# target syncs only when an asset is added or modified.
-file(GLOB_RECURSE RUNTIME_MODEL_FILES CONFIGURE_DEPENDS LIST_DIRECTORIES false
-    "${CMAKE_SOURCE_DIR}/models/*")
-set(MODEL_SYNC_STAMP "${CMAKE_BINARY_DIR}/.models-synced")
+# Content (Unreal-style asset root: Models, Audio, Textures, Levels, Prefabs)
+# totals roughly 1.5 GiB. A POST_BUILD copy made every code-only link spend over
+# a minute copying it, twice, to the same build directory. This stamped target
+# syncs only when an asset is added or modified.
+#
+# CONFIGURE_DEPENDS re-globs at build time, so newly added assets are picked up
+# without a manual re-run of cmake -- but only for files under Content/. Assets
+# dropped anywhere else still need a reconfigure to be seen.
+file(GLOB_RECURSE RUNTIME_CONTENT_FILES CONFIGURE_DEPENDS LIST_DIRECTORIES false
+    "${CMAKE_SOURCE_DIR}/Content/*")
+set(CONTENT_SYNC_STAMP "${CMAKE_BINARY_DIR}/.content-synced")
 add_custom_command(
-    OUTPUT "${MODEL_SYNC_STAMP}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/models"
+    OUTPUT "${CONTENT_SYNC_STAMP}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/Content"
     COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
-            "${CMAKE_SOURCE_DIR}/models" "${CMAKE_BINARY_DIR}/models"
-    COMMAND ${CMAKE_COMMAND} -E touch "${MODEL_SYNC_STAMP}"
-    DEPENDS ${RUNTIME_MODEL_FILES}
-    COMMENT "Syncing changed runtime models"
+            "${CMAKE_SOURCE_DIR}/Content" "${CMAKE_BINARY_DIR}/Content"
+    COMMAND ${CMAKE_COMMAND} -E touch "${CONTENT_SYNC_STAMP}"
+    DEPENDS ${RUNTIME_CONTENT_FILES}
+    COMMENT "Syncing changed runtime content"
     VERBATIM
 )
-add_custom_target(RuntimeModels DEPENDS "${MODEL_SYNC_STAMP}")
-add_dependencies(GraphicEngine RuntimeModels)
+add_custom_target(RuntimeContent DEPENDS "${CONTENT_SYNC_STAMP}")
+add_dependencies(GraphicEngine RuntimeContent)
 

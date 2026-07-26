@@ -71,7 +71,7 @@ public:
         if (attempted) return;
         attempted = true;
 
-        const std::string path = Resolve("models/palmtree/Fbx/Coconut Tree.fbx");
+        const std::string path = Resolve("Content/Models/palmtree/Fbx/Coconut Tree.fbx");
         std::cout << "Loading palm " << path << "...\n";
         // Scale 1.0: we normalise the height ourselves below, so whatever units the
         // FBX shipped in do not matter.
@@ -342,7 +342,7 @@ private:
             m->metallicFactor = 0.0f;
             m->roughnessFactor = 0.9f;
             m->baseColorTexture = GLBImporter::LoadTextureFromFile(
-                Resolve(std::string("models/palmtree/Texture/") + texture),
+                Resolve(std::string("Content/Models/palmtree/Texture/") + texture),
                 g_dx12.device, g_dx12.commandList, m->uploadHeaps);
             if (!m->baseColorTexture)
                 std::cerr << "Palm texture missing: " << texture << "\n";
