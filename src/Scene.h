@@ -176,6 +176,75 @@ struct Scene {
     float playerDamageFlash  = 0.0f;
     bool  playerGodMode      = false;
 
+    // Ammo, per weapon slot (0 = AK47, 1 = shotgun, 2 = RPG-7, 3 = SVD) to match
+    // GunModel::SelectedWeapon(). Only enforced when playerGodMode is false --
+    // god mode keeps the old unlimited-fire behaviour so sandbox/debug levels
+    // are unchanged. magazine = rounds in the gun, reserve = spare rounds.
+    static constexpr int kWeaponSlots = 4;
+    int magazineSize[kWeaponSlots] = { 30,  8,  1, 10 };
+    int maxReserve  [kWeaponSlots] = { 240, 64, 8, 80 };
+    // Tuned around the reload clip (build/Sounds/Reload/..., 1.512s) so the
+    // sound lands close to when the magazine actually seats. The RPG and
+    // shotgun run longer deliberately -- they read as heavier reloads, and the
+    // audio simply finishes a little early there.
+    float reloadTime[kWeaponSlots] = { 1.55f, 2.4f, 2.8f, 1.75f };
+    int   magazine  [kWeaponSlots] = { 30,  8,  1, 10 };
+    int   reserve   [kWeaponSlots] = { 120, 32, 4, 40 };
+    float reloadTimer = 0.0f;   // >0 while reloading; blocks firing
+    int   reloadingSlot = -1;   // slot being reloaded, -1 when idle
+
+    bool AmmoEnforced() const { return !playerGodMode; }
+    bool Reloading() const { return reloadTimer > 0.0f; }
+
+    // Refill everything to a full magazine + full reserve. Used on level start
+    // so a fresh run never begins dry.
+    void RestoreAmmo() {
+        for (int i = 0; i < kWeaponSlots; ++i) {
+            magazine[i] = magazineSize[i];
+            reserve[i] = maxReserve[i];
+        }
+        reloadTimer = 0.0f;
+        reloadingSlot = -1;
+    }
+
+    // Begin a reload of `slot`. No-op when god mode is on, already reloading,
+    // the magazine is full, or there is nothing in reserve to load.
+    bool BeginReload(int slot) {
+        if (!AmmoEnforced() || Reloading()) return false;
+        if (slot < 0 || slot >= kWeaponSlots) return false;
+        if (magazine[slot] >= magazineSize[slot] || reserve[slot] <= 0)
+            return false;
+        reloadingSlot = slot;
+        reloadTimer = reloadTime[slot];
+        return true;
+    }
+
+    // Drive the reload timer. Ammo moves from reserve to magazine only on
+    // completion, so interrupting a reload (weapon swap) loses no rounds.
+    void UpdateReload(float dt) {
+        if (!Reloading()) return;
+        reloadTimer -= dt;
+        if (reloadTimer > 0.0f) return;
+        reloadTimer = 0.0f;
+        const int slot = reloadingSlot;
+        reloadingSlot = -1;
+        if (slot < 0 || slot >= kWeaponSlots) return;
+        const int needed = magazineSize[slot] - magazine[slot];
+        const int moved = (needed < reserve[slot]) ? needed : reserve[slot];
+        magazine[slot] += moved;
+        reserve[slot] -= moved;
+    }
+
+    // Consume one round from `slot`. Returns false (and fires nothing) when the
+    // magazine is empty, so the caller can skip the shot and its cooldown.
+    bool ConsumeAmmo(int slot) {
+        if (!AmmoEnforced()) return true;
+        if (slot < 0 || slot >= kWeaponSlots) return true;
+        if (Reloading() || magazine[slot] <= 0) return false;
+        --magazine[slot];
+        return true;
+    }
+
     // Grenade (press G): lobbed, arcs under gravity, radial blast on fuse.
     float grenadeThrowSpeed    = 16.0f;  // launch speed along aim
     float grenadeLob           = 3.0f;   // extra upward velocity for the arc
@@ -335,6 +404,10 @@ struct Scene {
     void RestorePlayerHealth() {
         playerHealth = playerMaxHealth;
         playerDamageFlash = 0.0f;
+        // Ammo rides along with health: every caller (level start, editor play,
+        // the debug Restore button) wants a fully kitted player, and refilling
+        // here keeps the two from drifting apart.
+        RestoreAmmo();
     }
 
     bool HitPlayerProjectile(Projectile& p) {

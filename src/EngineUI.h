@@ -10,6 +10,7 @@
 #include "ProfilerDX12.h"
 #include "MeshShaderDX12.h"
 #include "StaticBufferDX12.h"
+#include "GunModel.h"   // SelectedWeapon() -- indexes the HUD ammo readout
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -277,6 +278,46 @@ inline void RenderPlayerHUD(const Scene& scene) {
                          min.y + ((max.y - min.y) - textSize.y) * 0.5f),
                   IM_COL32(255, 255, 255, 255), label);
 
+    // Ammo readout, bottom-right corner, mirroring the health bar's inset so the
+    // two read as one HUD band. Right-aligned: the text grows leftward, keeping
+    // the corner margin fixed as the digit count changes. God mode has no ammo
+    // to show, so the HUD stays exactly as it was there.
+    if (scene.AmmoEnforced()) {
+        const int slot = GunModel::SelectedWeapon();
+        const int inMag = scene.magazine[slot];
+        const int spare = scene.reserve[slot];
+        char ammo[64];
+        if (scene.Reloading())
+            snprintf(ammo, sizeof(ammo), "RELOADING...");
+        else
+            snprintf(ammo, sizeof(ammo), "%d / %d", inMag, spare);
+        // Red when the magazine is dry, amber at a quarter left, else white.
+        const int magSize = (std::max)(1, scene.magazineSize[slot]);
+        ImU32 tint = IM_COL32(255, 255, 255, 255);
+        if (!scene.Reloading() && inMag == 0)
+            tint = IM_COL32(255, 70, 55, 255);
+        else if (!scene.Reloading() && inMag * 4 <= magSize)
+            tint = IM_COL32(255, 200, 60, 255);
+
+        const ImVec2 ammoSize = ImGui::CalcTextSize(ammo);
+        // 24 px from the right edge = the health bar's left inset, and the same
+        // vertical band, so both sit on one line across the bottom.
+        const float ammoRight = io.DisplaySize.x - 24.0f;
+        const ImVec2 ammoPos(ammoRight - ammoSize.x,
+                             min.y + ((max.y - min.y) - ammoSize.y) * 0.5f);
+        draw->AddRectFilled(ImVec2(ammoPos.x - 8.0f, min.y - 3.0f),
+                            ImVec2(ammoRight + 8.0f, max.y + 3.0f),
+                            IM_COL32(0, 0, 0, 190), 4.0f);
+        draw->AddText(ammoPos, tint, ammo);
+
+        if (!scene.Reloading() && inMag == 0 && spare > 0) {
+            const char* hint = "PRESS R";
+            const ImVec2 hintSize = ImGui::CalcTextSize(hint);
+            draw->AddText(ImVec2(ammoRight - hintSize.x, min.y - 22.0f),
+                          IM_COL32(255, 200, 60, 235), hint);
+        }
+    }
+
     if (scene.playerHealth <= 0.0f) {
         const char* dead = "YOU DIED";
         const ImVec2 deadSize = ImGui::CalcTextSize(dead);
@@ -357,6 +398,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::BulletText("V: Toggle FPS Walking Mode");
     ImGui::BulletText("Z: Meshlet Wireframe");
     ImGui::BulletText("Left Click: Lock camera / Shoot");
+    ImGui::BulletText("R: Reload (ammo is unlimited in God Mode)");
     ImGui::Separator();
 
     // -- Camera --
