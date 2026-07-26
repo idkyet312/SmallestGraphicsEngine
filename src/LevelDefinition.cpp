@@ -155,8 +155,9 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
     if (!std::isfinite(level.terrainHeightScale) ||
         level.terrainHeightScale < 0.0f || level.terrainHeightScale > 50.0f)
         result.errors.push_back("terrain heightScale must be between 0 and 50");
-    if (level.terrainSculpt.size() > 256)
-        result.errors.push_back("terrain sculpt supports at most 256 stamps");
+    if (level.terrainSculpt.size() > kMaxTerrainSculptStamps)
+        result.errors.push_back("terrain sculpt supports at most " +
+            std::to_string(kMaxTerrainSculptStamps) + " stamps");
     if (level.terrainTilesX < 4 || level.terrainTilesX > 48 ||
         level.terrainTilesZ < 4 || level.terrainTilesZ > 48)
         result.errors.push_back("terrain tile extent must be between 4 and 48");

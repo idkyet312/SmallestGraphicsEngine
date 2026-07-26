@@ -56,6 +56,14 @@ struct TerrainSculptStamp {
     float strength = 1.0f;
 };
 
+// Hard cap on live sculpt stamps. Bounds the GPU upload buffer
+// (kMaxTerrainSculptStamps * 32B) and, more importantly, the per-sample cost:
+// both TerrainRendererDX12::HeightAt and terrain_ms.hlsl's TerrainHeight loop
+// every stamp for every height query, with no spatial acceleration. Raising
+// this scales that loop linearly -- 1024 stamps is ~8x the Level-1 budget and
+// still only a 32 KB buffer.
+inline constexpr size_t kMaxTerrainSculptStamps = 1024;
+
 struct LevelDXRDDGISettings {
     bool enabled = false;
     float surfaceSpacing = 3.0f;

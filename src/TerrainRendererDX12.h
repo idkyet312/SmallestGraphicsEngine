@@ -175,8 +175,11 @@ public:
     }
 
     void SetSculptStamps(const std::vector<TerrainSculptStamp>& stamps) {
-        s_sculptStamps.assign(stamps.begin(), stamps.begin() +
-            (std::min)(stamps.size(), static_cast<size_t>(256)));
+        // Keep the NEWEST stamps when over capacity: runtime craters are pushed
+        // in chronological order, so trimming the front means the most recent
+        // explosion always leaves a hole instead of silently doing nothing.
+        const size_t keep = (std::min)(stamps.size(), kMaxTerrainSculptStamps);
+        s_sculptStamps.assign(stamps.end() - keep, stamps.end());
         m_sculptMaxDisplacement = 0.0f;
         for (const TerrainSculptStamp& stamp : s_sculptStamps) {
             if (stamp.operation == TerrainSculptOperation::Add)
@@ -360,7 +363,7 @@ public:
         heap.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC desc = {};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = sizeof(SculptGPU) * 256;
+        desc.Width = sizeof(SculptGPU) * kMaxTerrainSculptStamps;
         desc.Height = 1;
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
@@ -381,7 +384,7 @@ public:
         SculptGPU* destination = nullptr;
         if (FAILED(sculptBuffers[frame]->Map(0, nullptr,
                 reinterpret_cast<void**>(&destination)))) return;
-        std::memset(destination, 0, sizeof(SculptGPU) * 256);
+        std::memset(destination, 0, sizeof(SculptGPU) * kMaxTerrainSculptStamps);
         for (size_t i = 0; i < s_sculptStamps.size(); ++i) {
             const TerrainSculptStamp& source = s_sculptStamps[i];
             destination[i] = { source.x, source.z, source.radius,
