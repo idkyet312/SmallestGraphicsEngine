@@ -337,6 +337,21 @@ ComPtr<ID3D12Resource> GLBImporter::LoadEmbeddedTextureRGBA256(
     return CreateTexture(device.Get(), commandList.Get(), image, uploadHeaps);
 }
 
+bool GLBImporter::LoadPixelsRGBAFromMemory(const unsigned char* data, size_t size,
+    std::vector<unsigned char>& outRGBA, int& outWidth, int& outHeight) {
+    if (!data || size == 0 || size > static_cast<size_t>(INT_MAX)) return false;
+    int comps = 0;
+    unsigned char* pixels = stbi_load_from_memory(data, static_cast<int>(size),
+        &outWidth, &outHeight, &comps, 4);
+    if (!pixels) {
+        std::cerr << "Failed to decode embedded image" << std::endl;
+        return false;
+    }
+    outRGBA.assign(pixels, pixels + (size_t)outWidth * (size_t)outHeight * 4);
+    stbi_image_free(pixels);
+    return true;
+}
+
 bool GLBImporter::LoadPixelsRGBA(const std::string& filepath,
     std::vector<unsigned char>& outRGBA, int& outWidth, int& outHeight) {
     int comps = 0;

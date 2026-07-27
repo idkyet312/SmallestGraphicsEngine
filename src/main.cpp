@@ -5900,12 +5900,31 @@ static void ProcessInput(HWND) {
     const bool scopeRequested = aimRequested && GunModel::SVDSelected();
     scene.UpdateSniperScope(scopeRequested, deltaTime);
     scene.UpdateAimDownSights(aimRequested && !scopeRequested, deltaTime);
+    // Advance the view model's idle clip and rebuild its bone palette.
+    ArmsModel::Update(deltaTime);
 
     // Virtual controls are ImGui widgets, so WantCaptureKeyboard/cameraLocked
     // must not suppress the input those widgets produced on the previous frame.
     if (!g_drivingHumvee) ApplyVirtualInput();
 
     if (cameraLocked || (showUI && ImGui::GetIO().WantCaptureKeyboard)) return;
+
+    // Ejected (F8): the camera flies free while the player body -- and with it
+    // the weapon and arms -- stays parked where it was. Shift accelerates,
+    // Space/Q lift and drop, matching the level editor's fly camera. Returning
+    // early keeps walking, gravity, sliding and shooting out of the way.
+    if (scene.ejected) {
+        const float speed = ((GetAsyncKeyState(VK_SHIFT) & 0x8000) ? 3.0f : 1.0f);
+        if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, speed);
+        if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, speed);
+        if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, speed);
+        if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, speed);
+        const float lift = scene.camera.MovementSpeed * speed * deltaTime;
+        if (GetAsyncKeyState(VK_SPACE) & 0x8000) scene.camera.Position.y += lift;
+        if (GetAsyncKeyState('Q') & 0x8000)      scene.camera.Position.y -= lift;
+        return;
+    }
+
     if (g_drivingHumvee) {
         g_humveeTurretFireCooldown = (std::max)(
             0.0f, g_humveeTurretFireCooldown - deltaTime);
@@ -6198,6 +6217,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Bit 30 = key was already down (autorepeat); toggle once per press.
         else if (wParam == 'Z' && !(lParam & 0x40000000)) {
             scene.meshletWireframe = !scene.meshletWireframe;
+        }
+        else if (wParam == VK_F8 && !(lParam & 0x40000000)) {
+            // Unreal-style eject: detach the camera from the player so the view
+            // model can be flown around and inspected from outside.
+            scene.ToggleEjectedCamera();
         }
         else if (wParam == VK_F11) { ToggleFullscreen(hwnd); }
         return 0;
@@ -7738,6 +7762,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // The AK47 view model. Loaded here so its texture uploads land in the
             // same command list the flush below submits.
             GunModel::Load();
+            // The first-person arms share that window for the same reason, and
+            // are drawn in the weapon's own local space.
+            ArmsModel::Load();
 
             if (g_emptyLevelMode) {
                 AdvanceLevelLoading(LevelLoadStage::GPUFinalize,
@@ -7895,6 +7922,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ReleaseMaterialUploadHeaps(g_banditModel.node);
             for (const auto& material : g_banditModel.materialKeepAlive)
                 if (material) material->uploadHeaps.clear();
+            ArmsModel::ReleaseUploadHeaps();
             ReleaseMaterialUploadHeaps(crateModel);
             ReleaseMaterialUploadHeaps(wallModel);
             DumpDX12DebugMessages();

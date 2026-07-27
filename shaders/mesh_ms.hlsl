@@ -14,7 +14,7 @@ cbuffer MeshDrawBuffer : register(b6) {
     uint occlusionEnabled;
     uint screenWidth;
     uint screenHeight;
-    uint skinningEnabled;   // 0 static, 1 apply bone palette
+    uint skinningEnabled;   // 0 static, 1 skinned, 2 skinned view model (both skin)
     uint occlusionMipCount;
     float modelMaxScale;
     uint instanceCount;

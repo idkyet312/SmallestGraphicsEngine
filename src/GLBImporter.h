@@ -83,4 +83,11 @@ public:
     static bool LoadPixelsRGBA(const std::string& filepath,
                                std::vector<unsigned char>& outRGBA,
                                int& outWidth, int& outHeight);
+
+    // Same, for an encoded image already in memory -- e.g. a texture embedded
+    // inside an FBX, whose authored path points at the exporter's machine and
+    // cannot be resolved on disk.
+    static bool LoadPixelsRGBAFromMemory(const unsigned char* data, size_t size,
+                                         std::vector<unsigned char>& outRGBA,
+                                         int& outWidth, int& outHeight);
 };

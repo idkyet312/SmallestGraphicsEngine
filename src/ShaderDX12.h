@@ -144,7 +144,11 @@ struct alignas(256) MeshDrawBufferDX12 {
     UINT occlusionEnabled;
     UINT screenWidth;
     UINT screenHeight;
-    UINT skinningEnabled; // 0 static draw, 1 apply bone palette (t12) + skin (t13)
+    // 0 static draw, 1 apply bone palette (t12) + skin (t13), 2 skinned AND
+    // exempt from meshlet culling -- see mesh_as.hlsl. Packed into this field
+    // rather than added as a new one because b6 is shared with the grass pass,
+    // which static_asserts its 13 root constants.
+    UINT skinningEnabled;
     UINT occlusionMipCount;
     float modelMaxScale;
     UINT instanceCount;

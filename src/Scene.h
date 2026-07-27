@@ -778,6 +778,9 @@ struct Scene {
 
     // Build matrices
     void UpdateSniperScope(bool active, float dt) {
+        // The scope overlay hides the view model outright, which would defeat
+        // the point of ejecting to look at it.
+        if (ejected) active = false;
         sniperScopeActive = active;
         const float target = active ? 1.0f : 0.0f;
         // Matches the iron-sight raise rate so swapping to the SVD does not
@@ -789,6 +792,10 @@ struct Scene {
     // Iron sights. The two blends are mutually exclusive by construction: only
     // the SVD ever requests the scope, so a weapon is either scoped or sighted.
     void UpdateAimDownSights(bool active, float dt) {
+        // Aiming while ejected would slide the parked weapon onto a view axis
+        // the player is no longer looking down, so the inspection camera always
+        // sees the neutral hip pose.
+        if (ejected) active = false;
         adsActive = active;
         const float target = active ? 1.0f : 0.0f;
         // Snappy on purpose: ADS is used mid-fight, and a slow raise makes the
@@ -825,6 +832,58 @@ struct Scene {
         return projection;
     }
 
+    // -- Ejected free camera (Unreal's F8) --------------------------------------
+    //
+    // Detaches the rendering camera from the player so the view model can be
+    // inspected from outside. The player's viewpoint at the moment of ejecting is
+    // frozen in ejectAnchor*, and the weapon and arms keep building their
+    // transform from THAT, so they stay behind with the body while `camera` flies
+    // away. Pressing the key again drops the camera back where it was.
+    bool     ejected = false;
+    XMFLOAT3 ejectAnchorPosition = { 0.0f, 0.0f, 0.0f };
+    XMFLOAT3 ejectAnchorFront    = { 0.0f, 0.0f, 1.0f };
+    // The player camera is restored from these on re-attach.
+    XMFLOAT3 ejectReturnPosition = { 0.0f, 0.0f, 0.0f };
+    XMFLOAT3 ejectReturnFront    = { 0.0f, 0.0f, 1.0f };
+    float    ejectReturnYaw = 0.0f;
+    float    ejectReturnPitch = 0.0f;
+    bool     ejectReturnFPSMode = true;
+
+    // Where the view model anchors: the live camera normally, the frozen player
+    // viewpoint while ejected.
+    const XMFLOAT3& ViewmodelAnchorPosition() const {
+        return ejected ? ejectAnchorPosition : camera.Position;
+    }
+    const XMFLOAT3& ViewmodelAnchorFront() const {
+        return ejected ? ejectAnchorFront : camera.Front;
+    }
+
+    void ToggleEjectedCamera() {
+        if (!ejected) {
+            // Freeze the viewpoint the weapon hangs off, and remember where to
+            // put the player back.
+            ejectAnchorPosition = ejectReturnPosition = camera.Position;
+            ejectAnchorFront = ejectReturnFront = camera.Front;
+            ejectReturnYaw      = camera.Yaw;
+            ejectReturnPitch    = camera.Pitch;
+            // Free flight: gravity and the XZ-plane walk constraint would fight
+            // an inspection camera, so leave FPS mode for the duration.
+            ejectReturnFPSMode  = camera.FPSMode;
+            camera.FPSMode      = false;
+            ejected = true;
+        } else {
+            camera.Position = ejectReturnPosition;
+            camera.Yaw      = ejectReturnYaw;
+            camera.Pitch    = ejectReturnPitch;
+            // Front is normally recomputed from yaw/pitch inside the camera, but
+            // that helper is private; restoring the saved vector is equivalent
+            // and keeps the camera header untouched.
+            camera.Front    = ejectReturnFront;
+            camera.FPSMode  = ejectReturnFPSMode;
+            ejected = false;
+        }
+    }
+
     // Gun world-space model matrix
     XMMATRIX GetGunModelMatrix() const {
         XMVECTOR camPos   = XMLoadFloat3(&camera.Position);
@@ -850,8 +909,11 @@ struct Scene {
     // weapon instead of pitching it with the view. Re-derive right and up from
     // Front (Gram-Schmidt) so the gun rigidly follows the camera in yaw AND pitch.
     XMMATRIX GetGunBaseMatrix() const {
-        const XMVECTOR camPos   = XMLoadFloat3(&camera.Position);
-        const XMVECTOR camFront = XMVector3Normalize(XMLoadFloat3(&camera.Front));
+        // While ejected the weapon must stay parked at the body the player left
+        // behind, not ride the free camera -- otherwise flying out to inspect the
+        // view model just drags it along and you never see it from outside.
+        const XMVECTOR camPos   = XMLoadFloat3(&ViewmodelAnchorPosition());
+        const XMVECTOR camFront = XMVector3Normalize(XMLoadFloat3(&ViewmodelAnchorFront()));
         const XMVECTOR worldUp  = XMLoadFloat3(&camera.Up);
 
         // Left-handed frame (the view matrix is LookAtLH): right = up x front.

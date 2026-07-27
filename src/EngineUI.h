@@ -11,6 +11,7 @@
 #include "MeshShaderDX12.h"
 #include "StaticBufferDX12.h"
 #include "GunModel.h"   // SelectedWeapon() -- indexes the HUD ammo readout
+#include "ArmsModel.h"  // arms placement controls, tuned against the weapon
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -645,6 +646,75 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat("ADS FOV", &scene.adsFOV, 0.5f, 15.0f, 60.0f, "%.1f deg");
         ImGui::Text("blend %.2f%s", scene.adsBlend,
                     scene.adsActive ? "  (aiming)" : "");
+
+        // The arms ride the weapon's transform, so these offsets are relative to
+        // the gun, not the camera: they position the hands ON the weapon.
+        ImGui::SeparatorText("Arms");
+        if (ArmsModel::Loaded()) {
+            ImGui::Checkbox("Show Arms", &ArmsModel::Visible());
+            ImGui::SameLine();
+            ImGui::Checkbox("Hide Head", &ArmsModel::HideHead());
+            // Mirrors the body so the rifle is held in the other hand. Re-solve
+            // the alignment after toggling: the grip hand moves across.
+            if (ImGui::Checkbox("Mirror", &ArmsModel::MirrorX()))
+                ArmsModel::RealignHandsToWeapon();
+            ImGui::SameLine();
+            // Which wrist the gun is aligned to. Mirroring swaps which side of
+            // the screen each rig-named hand appears on, so this needs to flip
+            // with it.
+            if (ImGui::Checkbox("Grip: Left Bone", &ArmsModel::GripUsesLeftHand()))
+                ArmsModel::RebindGripBone();
+            // Free nudge on top of the solved placement. Not re-solved on drag:
+            // this is the manual override for when the solved position is close
+            // but wants a touch of adjustment.
+            ImGui::DragFloat3("Arms Offset", &ArmsModel::Offset().x, 0.005f);
+            // Yaw/pitch/roll in degrees, applied in the model's own space. This
+            // is what turns the arms to face down the barrel. Rotation and scale
+            // both feed the transform the alignment measures through, so both
+            // re-solve on change -- otherwise the hand slides off the weapon as
+            // the body turns under it.
+            if (ImGui::DragFloat3("Arms Rot", &ArmsModel::Rotation().x, 1.0f))
+                ArmsModel::RealignHandsToWeapon();
+            if (ImGui::DragFloat("Arms Scale", &ArmsModel::Scale(), 0.01f, 0.2f,
+                                 3.0f, "%.2f"))
+                ArmsModel::RealignHandsToWeapon();
+            if (ImGui::Button("Reset Rotation")) {
+                ArmsModel::Rotation() = DirectX::XMFLOAT3(0.0f, 0.0f, 0.0f);
+                ArmsModel::RealignHandsToWeapon();
+            }
+            // The idle is held on a single frame by default so the pose can be
+            // aligned against the fixed weapon; scrub PoseTime to pick which
+            // moment of the clip to align to, then enable Animate.
+            ImGui::Checkbox("Animate", &ArmsModel::Animate());
+            ImGui::SameLine();
+            ImGui::Text("t=%.2fs", ArmsModel::Animation().time);
+            if (!ArmsModel::Animate()) {
+                const float duration = ArmsModel::Animation().clip
+                    ? ArmsModel::Animation().clip->duration : 1.0f;
+                ImGui::SliderFloat("Pose Time", &ArmsModel::PoseTime(), 0.0f,
+                                   duration, "%.2f s");
+            }
+            // The point on the weapon the aligned hand is pinned to. Dragging
+            // this re-solves immediately, so the hand can be walked along the
+            // rifle until it sits on the handguard properly.
+            ImGui::SeparatorText("Weapon Grip Point");
+            if (ImGui::DragFloat3("Grip Target", &ArmsModel::WeaponGrip().x, 0.005f))
+                ArmsModel::RealignHandsToWeapon();
+            if (ImGui::Button("Snap Hands To Weapon"))
+                ArmsModel::RealignHandsToWeapon();
+
+            // With the idle playing the hand both moves and turns, so the weapon
+            // tracks its full motion rather than hanging at a fixed spot.
+            ImGui::SeparatorText("Weapon Follows Hand");
+            ImGui::Checkbox("Follow Grip Hand", &ArmsModel::WeaponFollowsHand());
+            if (ArmsModel::WeaponFollowsHand()) {
+                // Fixed corrections on top of what the hand contributes.
+                ImGui::DragFloat3("Follow Offset", &ArmsModel::FollowOffset().x, 0.005f);
+                ImGui::DragFloat3("Weapon Rot Fix", &ArmsModel::FollowRotation().x, 1.0f);
+            }
+        } else {
+            ImGui::TextDisabled("arms model not loaded");
+        }
     }
 
     // -- Grass / wind --

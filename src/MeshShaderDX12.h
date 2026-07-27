@@ -250,7 +250,10 @@ public:
               D3D12_GPU_VIRTUAL_ADDRESS bonePaletteAddress = 0,
               D3D12_GPU_VIRTUAL_ADDRESS skinDataAddress = 0,
               bool doubleSided = false,
-              bool allowOcclusion = true) {
+              bool allowOcclusion = true,
+              // View model: bind-pose meshlet bounds say nothing about where
+              // this ends up on screen, so exempt it from meshlet culling.
+              bool disableCulling = false) {
         if (!CanDraw(totalMeshlets, meshletDescAddress, meshletBoundsAddress,
                      meshletVertexIndexAddress, meshletTriangleAddress)) return;
         ID3D12PipelineState* solid = hdrTargetEnabled
@@ -276,7 +279,10 @@ public:
         if (occlusionDepthHandle.ptr) {
             commandList6->SetGraphicsRootDescriptorTable(12, occlusionDepthHandle);
         }
-        const UINT skinning = (bonePaletteAddress && skinDataAddress) ? 1u : 0u;
+        // 2 selects the skinned-and-unculled path in mesh_as.hlsl; the mesh
+        // shader treats any non-zero value as "skin this".
+        const UINT skinning = (bonePaletteAddress && skinDataAddress)
+            ? (disableCulling ? 2u : 1u) : 0u;
         if (skinning) {
             commandList6->SetGraphicsRootShaderResourceView(16, bonePaletteAddress);
             commandList6->SetGraphicsRootShaderResourceView(17, skinDataAddress);

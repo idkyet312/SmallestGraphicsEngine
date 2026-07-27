@@ -248,6 +248,7 @@ if(USE_DX12)
         src/GLBImporter.cpp
         src/FBXImporter.cpp
         src/SkinnedFBXImporter.cpp
+        src/ArmsTextures.cpp
         src/StbVorbis.cpp
         src/DrMp3.cpp
         src/NavigationSystem.cpp
@@ -336,6 +337,10 @@ if(BUILD_TESTING)
         src/AssetWatcher.cpp)
     target_include_directories(AssetWatcherTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME AssetWatcherTests COMMAND AssetWatcherTests)
+
+    # Diagnostic for the FPS arms asset: prints raw per-mesh bounds from Assimp.
+    add_executable(InspectArms tests/InspectArms.cpp)
+    target_link_libraries(InspectArms PRIVATE assimp::assimp)
 
     add_executable(DXRProbeLayoutTests tests/DXRProbeLayoutTests.cpp)
     target_include_directories(DXRProbeLayoutTests PRIVATE ${CMAKE_SOURCE_DIR}/src)

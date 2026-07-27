@@ -17,7 +17,16 @@ cbuffer MeshDrawBuffer : register(b6) {
     uint occlusionEnabled;
     uint screenWidth;
     uint screenHeight;
-    uint skinningEnabled;   // skinned meshlet bounds are bind-pose -> skip cull
+    // 0 = static, 1 = skinned (bounds are bind-pose, so only the coarse frustum
+    // test is safe), 2 = skinned view model: no culling at all.
+    //
+    // The view model is drawn inches from the eye and posed far from its bind
+    // pose, so its bind-pose meshlet bounds bear no relation to where the
+    // geometry actually ends up. At that distance the frustum test rejects
+    // meshlets that are plainly on screen and the character flickers or
+    // disappears as the camera turns. It is a handful of meshlets that are
+    // always in view, so the cheapest correct answer is to skip the tests.
+    uint skinningEnabled;
     uint occlusionMipCount;
     float modelMaxScale;
     uint instanceCount;
@@ -146,11 +155,13 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
         MeshletBounds bounds = meshletBounds[globalMeshlet];
         // Animated bounds cannot safely use cone/backface or occlusion tests,
         // but bind-pose bounds remain good enough for coarse frustum rejection.
-        bool visible = skinningEnabled
-            ? IntersectsFrustum(bounds, drawMVP, drawScale)
-            : (IntersectsFrustum(bounds, drawMVP, drawScale) &&
-               !IsBackfacing(bounds, drawModel, drawScale) &&
-               !IsOccluded(bounds, drawModel, drawModelView, drawScale));
+        bool visible = (skinningEnabled == 2)
+            ? true
+            : (skinningEnabled
+                ? IntersectsFrustum(bounds, drawMVP, drawScale)
+                : (IntersectsFrustum(bounds, drawMVP, drawScale) &&
+                   !IsBackfacing(bounds, drawModel, drawScale) &&
+                   !IsOccluded(bounds, drawModel, drawModelView, drawScale)));
         if (visible) {
             uint slot;
             InterlockedAdd(visibleCount, 1, slot);

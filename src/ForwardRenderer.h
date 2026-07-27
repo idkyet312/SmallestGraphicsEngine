@@ -18,6 +18,7 @@
 #include "PalmTrees.h"
 #include "PalmModel.h"
 #include "GunModel.h"
+#include "ArmsModel.h"
 #include "GrassField.h"
 #include <unordered_map>
 
@@ -1411,15 +1412,39 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         const float S = scene.GunModelScale();
 
         if (GunModel::PlayerLoaded()) {
-            // The model is normalised with its origin at the rear of the weapon,
-            // so shift it back and down into the same pocket of screen space the
-            // boxed M4 occupied, then scale to the gun's on-screen size.
-            const XMMATRIX xf =
+            // The weapon sits at a fixed spot in front of the camera: the model
+            // is normalised with its origin at the rear of the weapon, so shift
+            // it back and down into the same pocket of screen space the boxed M4
+            // occupied, then scale to the gun's on-screen size.
+            //
+            // The weapon deliberately does NOT ride the character's hand bone.
+            // Hanging it off the hand meant any error in the body's placement
+            // moved the gun too, so the one thing that was framed correctly
+            // stopped being so. Keeping the gun fixed makes it the reference the
+            // arms are aligned against, rather than the other way round.
+            // Base placement: the pocket of screen space the weapon was tuned
+            // in, before any hand motion is added.
+            XMMATRIX xf =
                 XMMatrixScaling(S, S, S) *
                 XMMatrixTranslation(0.0f, -0.10f * S, -0.44f * S) *
                 gunBase;
+            // With the idle playing, ride the trigger hand so the rifle stays in
+            // the grip instead of hanging still while the arms breathe past it.
+            // The follow transform is a delta from the reference pose, so it
+            // composes on top of the tuned placement rather than replacing it.
+            XMMATRIX handFollow;
+            if (ArmsModel::WeaponFollowTransform(handFollow))
+                xf = XMMatrixScaling(S, S, S) *
+                     XMMatrixTranslation(0.0f, -0.10f * S, -0.44f * S) *
+                     handFollow * gunBase;
             shader.Use(scene.wireframeMode);
             DrawMeshAt(GunModel::PlayerMesh(), shader, xf, view, proj, lightSpace);
+            shader.Use(scene.wireframeMode);
+
+            // The body hangs off the same base transform as the weapon, so it
+            // inherits recoil, the ADS slide and the hip offset for free. This
+            // one is GPU-skinned and animating, so it owns its own draw.
+            ArmsModel::Draw(shader, gunBase, view, proj, lightSpace, S);
             shader.Use(scene.wireframeMode);
         } else {
             // Fallback: the old M4-style carbine, built from boxed parts.
