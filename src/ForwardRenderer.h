@@ -1433,7 +1433,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // The follow transform is a delta from the reference pose, so it
             // composes on top of the tuned placement rather than replacing it.
             XMMATRIX handFollow;
-            if (ArmsModel::WeaponFollowTransform(handFollow))
+            if (ArmsModel::WeaponFollowTransform(handFollow, S))
                 xf = XMMatrixScaling(S, S, S) *
                      XMMatrixTranslation(0.0f, -0.10f * S, -0.44f * S) *
                      handFollow * gunBase;

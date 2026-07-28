@@ -410,7 +410,10 @@ public:
     // Re-solve the body offset so the aligned hand sits on the weapon's grip
     // point. Exposed for the debug UI: after scrubbing to a different frame of
     // the idle, or moving the grip target, this snaps the body back onto the gun.
-    static void RealignHandsToWeapon() { AlignHandsToWeapon(); }
+    static void RealignHandsToWeapon() {
+        AlignHandsToWeapon();
+        BindGlobals() = PoseGlobals();
+    }
 
     // Let the weapon ride the hand instead of hanging at a fixed spot.
     //
@@ -445,57 +448,33 @@ public:
     // sits in the model's own space -- metres away, and it would ignore all the
     // hand-tuned placement the weapon already has. The delta keeps the gun where
     // it was authored and only adds the movement the animation introduces.
-    static bool WeaponFollowTransform(XMMATRIX& out) {
+    static bool WeaponFollowTransform(XMMATRIX& out, float weaponScale) {
         if (!WeaponFollowsHand() || !Loaded() || !Visible()) return false;
         const int bone = FollowBone();
         if (bone < 0 || static_cast<size_t>(bone) >= PoseGlobals().size() ||
             static_cast<size_t>(bone) >= BindGlobals().size())
             return false;
 
-        XMVECTOR determinant = {};
-        const XMMATRIX bindInverse =
-            XMMatrixInverse(&determinant, XMLoadFloat4x4(&BindGlobals()[bone]));
-        if (XMVectorGetX(XMVectorAbs(determinant)) < 1e-12f) return false;
-
-        // Take BOTH the hand's rotation and its displacement, as a delta from
-        // the reference pose. Because it is a delta, the weapon keeps the
-        // orientation it was tuned at and the clip only adds the change on top
-        // -- the wrist's own axes never leak in, which is what would otherwise
-        // roll the rifle out of the grip.
-        const XMMATRIX delta = bindInverse * XMLoadFloat4x4(&PoseGlobals()[bone]);
-
-        XMVECTOR deltaScale, deltaRotation, deltaTranslation;
-        if (!XMMatrixDecompose(&deltaScale, &deltaRotation, &deltaTranslation, delta))
-            return false;
-
-        // Bone motion is in the model's centimetre space; convert the
-        // displacement into gun-local units. Scale is discarded: a hand that
-        // squashes slightly under the rig should not resize the weapon.
-        const float scale = Scale() * NormaliseScale();
-        XMFLOAT3 translation;
-        XMStoreFloat3(&translation, XMVectorScale(deltaTranslation, scale));
-
-        // A mirrored body has its X axis negated, so the raw delta runs the
-        // wrong way across the screen. Mirroring a rotation means negating the
-        // axis components that lie in the mirrored plane -- for an X mirror that
-        // is the Y and Z parts of the quaternion, leaving X and W.
-        XMFLOAT4 rotationQuat;
-        XMStoreFloat4(&rotationQuat, deltaRotation);
-        if (MirrorX()) {
-            translation.x = -translation.x;
-            rotationQuat.y = -rotationQuat.y;
-            rotationQuat.z = -rotationQuat.z;
-        }
-
+        // Track wrist LOCATION only. Wrist rotation axes differ from weapon
+        // axes, and applying them twists the rifle. Measuring both poses after
+        // ModelToGunLocal handles arm rotation, mirroring, pivot, and scale.
+        const XMMATRIX modelToGun = ModelToGunLocal();
+        const XMMATRIX bindHand =
+            XMLoadFloat4x4(&BindGlobals()[bone]) * modelToGun;
+        const XMMATRIX poseHand =
+            XMLoadFloat4x4(&PoseGlobals()[bone]) * modelToGun;
+        const XMVECTOR translation = poseHand.r[3] - bindHand.r[3];
         const XMFLOAT3& offset = FollowOffset();
         const XMFLOAT3& rotation = FollowRotation();
+        const float s = (std::max)(0.0f, weaponScale);
+        XMFLOAT3 delta;
+        XMStoreFloat3(&delta, translation);
         out = XMMatrixRotationRollPitchYaw(XMConvertToRadians(rotation.x),
                                            XMConvertToRadians(rotation.y),
                                            XMConvertToRadians(rotation.z)) *
-              XMMatrixRotationQuaternion(XMLoadFloat4(&rotationQuat)) *
-              XMMatrixTranslation(translation.x + offset.x,
-                                  translation.y + offset.y,
-                                  translation.z + offset.z);
+              XMMatrixTranslation((delta.x + offset.x) * s,
+                                  (delta.y + offset.y) * s,
+                                  (delta.z + offset.z) * s);
         return true;
     }
 
@@ -503,9 +482,9 @@ public:
     // debug UI, after switching which hand holds the gun.
     static void RebindGripBone() {
         FindGripBone();
-        // The weapon follows the opposite hand, so it moves across too.
         FindFollowBone();
         AlignHandsToWeapon();
+        BindGlobals() = PoseGlobals();
     }
 
     // Upload resolution for the two maps that are actually sampled. The source
@@ -780,8 +759,8 @@ private:
         static int bone = -1;
         return bone;
     }
-    // The hand the WEAPON follows: the opposite one to the grip bone the body is
-    // aligned by. One hand positions the arms, the other carries the rifle.
+    // The hand the weapon follows: the same wrist used to align the body. The
+    // support hand moves independently and must not steer the rifle.
     static int& FollowBone() {
         static int bone = -1;
         return bone;
