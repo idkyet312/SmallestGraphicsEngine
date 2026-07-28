@@ -6,6 +6,7 @@
 #include <assimp/postprocess.h>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -50,6 +51,75 @@ void BuildSkeleton(const aiNode* node, int parentId, Skeleton& skel) {
 
 XMFLOAT3 KeyVec(const aiVector3D& v, float s = 1.0f) { return XMFLOAT3(v.x * s, v.y * s, v.z * s); }
 
+// Animation-only Mixamo FBXs often split a joint into Translation,
+// PreRotation, Rotation, and the named bone while the mesh FBX has one combined
+// node. Rebuild the combined rotation as animated Rotation * fixed PreRotation,
+// while keeping translation and scale from the mesh skeleton. Mapping the raw
+// Rotation channel directly loses both pre-rotation and joint translation,
+// which is what previously exploded the arms across the screen.
+bool AppendRetargetedSplitRotationTrack(const aiScene* scene,
+                                        const aiNodeAnim* channel,
+                                        const Skeleton& skel,
+                                        double ticksPerSecond,
+                                        AnimationClip& clip) {
+    const std::string channelName = channel->mNodeName.C_Str();
+    constexpr const char* rotationSuffix = "_$AssimpFbx$_Rotation";
+    const size_t split = channelName.find(rotationSuffix);
+    if (split == std::string::npos ||
+        split + std::strlen(rotationSuffix) != channelName.size())
+        return false;
+
+    const std::string boneName = channelName.substr(0, split);
+    if (channel->mNumRotationKeys == 0) return false;
+    const int bone = skel.Find(boneName);
+    if (bone < 0 || static_cast<size_t>(bone) >= skel.localBind.size())
+        return false;
+
+    const aiNode* rotationNode = scene && scene->mRootNode
+        ? scene->mRootNode->FindNode(channel->mNodeName) : nullptr;
+    const aiNode* preRotationNode =
+        rotationNode ? rotationNode->mParent : nullptr;
+    if (!preRotationNode ||
+        std::string(preRotationNode->mName.C_Str()).find(
+            "_$AssimpFbx$_PreRotation") == std::string::npos)
+        return false;
+
+    const XMFLOAT4X4 preTransform =
+        ToXM(preRotationNode->mTransformation);
+    XMVECTOR preScale, preRotation, preTranslation;
+    if (!XMMatrixDecompose(
+            &preScale, &preRotation, &preTranslation,
+            XMLoadFloat4x4(&preTransform)))
+        return false;
+    const XMMATRIX preRotationMatrix =
+        XMMatrixRotationQuaternion(XMQuaternionNormalize(preRotation));
+
+    BoneTrack track;
+    track.bone = bone;
+    track.rotations.reserve(channel->mNumRotationKeys);
+    for (unsigned key = 0; key < channel->mNumRotationKeys; ++key) {
+        const aiQuaternion& value = channel->mRotationKeys[key].mValue;
+        const XMVECTOR animatedRotation = XMQuaternionNormalize(
+            XMVectorSet(value.x, value.y, value.z, value.w));
+        const XMMATRIX retargeted =
+            XMMatrixRotationQuaternion(animatedRotation) *
+            preRotationMatrix;
+        XMVECTOR scale, rotation, translation;
+        if (!XMMatrixDecompose(&scale, &rotation, &translation, retargeted))
+            continue;
+        XMFLOAT4 result;
+        XMStoreFloat4(&result, XMQuaternionNormalize(rotation));
+        track.rotations.push_back({
+            static_cast<float>(
+                channel->mRotationKeys[key].mTime / ticksPerSecond),
+            result
+        });
+    }
+    if (track.rotations.empty()) return false;
+    clip.tracks.push_back(std::move(track));
+    return true;
+}
+
 // Append every AnimStack in `scene` to `clips`, resolving channels to skeleton
 // bone ids by name. positionScale scales translation keys to match the baked
 // mesh scale.
@@ -64,7 +134,11 @@ void AppendClips(const aiScene* scene, const Skeleton& skel, float positionScale
         for (unsigned c = 0; c < anim->mNumChannels; ++c) {
             const aiNodeAnim* ch = anim->mChannels[c];
             const int bone = skel.Find(ch->mNodeName.C_Str());
-            if (bone < 0) continue;
+            if (bone < 0) {
+                AppendRetargetedSplitRotationTrack(
+                    scene, ch, skel, tps, clip);
+                continue;
+            }
             BoneTrack track;
             track.bone = bone;
             for (unsigned k = 0; k < ch->mNumPositionKeys; ++k)

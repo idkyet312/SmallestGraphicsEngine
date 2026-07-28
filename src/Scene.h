@@ -85,7 +85,7 @@ struct ExplosiveBarrel {
 struct GunViewModel {
     bool     visible  = true;   // AK47 view model is on by default
     XMFLOAT3 color    = { 0.3f, 0.3f, 0.35f };
-    XMFLOAT3 offset   = { 0.28f, -0.24f, 0.40f };
+    XMFLOAT3 offset   = { 0.11f, -0.20f, 0.47f };
     XMFLOAT3 scale    = { 0.15f, 0.15f, 0.30f };
     XMFLOAT3 rotation = { 0.0f, 180.0f, 0.0f };
 };
@@ -103,7 +103,7 @@ struct Scene {
     float  adsFOV     = 42.0f;   // moderate -- ADS is for accuracy, not zoom
     float  adsBlend   = 0.0f;    // 0 = hip, 1 = fully sighted
     bool   adsActive  = false;
-    // Sighted viewmodel offset, against a hip offset of {0.28, -0.24, 0.40}.
+    // Sighted viewmodel offset, against a hip offset of {0.11, -0.20, 0.47}.
     // X overshoots slightly past zero: the weapon mesh sits right of its own
     // origin, so putting the origin on the view axis still leaves the barrel
     // and sights off to the right. Y sits just below the crosshair so the

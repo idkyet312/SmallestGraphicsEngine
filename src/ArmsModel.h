@@ -75,18 +75,18 @@ public:
     // Tuned against the render rather than derived: these are the values the
     // arms actually sit correctly at on the weapon.
     static XMFLOAT3& Offset() {
-        static XMFLOAT3 offset = { -0.292f, 0.314f, -0.243f };
+        static XMFLOAT3 offset = { -0.261f, 0.019f, -0.171f };
         return offset;
     }
     static float& Scale() {
-        static float scale = 1.01f;
+        static float scale = 1.00f;
         return scale;
     }
     // Yaw/pitch/roll in degrees, applied in the model's own space before it is
     // placed on the weapon. The character faces down its own +Z; whether that
     // lines up with the barrel depends on the export, so this stays adjustable.
     static XMFLOAT3& Rotation() {
-        static XMFLOAT3 rotation = { 0.0f, 16.0f, -38.0f };
+        static XMFLOAT3 rotation = { 0.0f, -9.0f, -20.0f };
         return rotation;
     }
 
@@ -275,7 +275,7 @@ public:
         // on the clips baked into PlayerArms.fbx: those are Blender's per-object
         // action leftovers, six of which are two-key stubs.
         const std::string animationPath =
-            Resolve("Content/Models/MainPlayer/ArmsOnly/Rifle Idle(2).fbx");
+            Resolve("Content/Models/MainPlayer/ArmsOnly/Rifle Aiming Idle(1).fbx");
         std::vector<std::string> animationPaths;
         if (std::filesystem::exists(animationPath))
             animationPaths.push_back(animationPath);
@@ -302,10 +302,8 @@ public:
             return;
         }
 
-        // Pose first, THEN measure. Normalise() and AlignHandsToWeapon() both
-        // read joint positions out of PoseGlobals, so the clip has to be
-        // sampled before either runs -- measuring first would size and place the
-        // arms against an empty pose.
+        // Pose first, THEN measure. Normalise() reads joint positions out of
+        // PoseGlobals, so the clip has to be sampled before it runs.
         if (const AnimationClip* clip = RichestClip()) Animation().Play(clip);
         Animation().time = PoseTime();
         Animation().ComputePalette(Source().skeleton, PaletteCPU());
@@ -321,7 +319,8 @@ public:
         FindGripBone();
         FindFollowBone();
         FindHiddenBones();
-        AlignHandsToWeapon();
+        // Keep the artist-tuned startup Offset. Alignment remains available
+        // through the UI for fitting another pose or asset.
         if (HideHead()) CollapseHiddenBones();
 
         if (FILE* file = std::fopen("arms_load.log", "w")) {
@@ -357,7 +356,7 @@ public:
                     XMLoadFloat4x4(&PoseGlobals()[GripBone()]) * ModelToGunLocal();
                 XMFLOAT3 handPosition;
                 XMStoreFloat3(&handPosition, hand.r[3]);
-                std::fprintf(file, "handAfterAlign=(%.3f,%.3f,%.3f)\n",
+                std::fprintf(file, "handAtLoad=(%.3f,%.3f,%.3f)\n",
                              handPosition.x, handPosition.y, handPosition.z);
             }
             std::fprintf(file, "skeletonBones=%zu firstNames:", Source().skeleton.names.size());
@@ -542,7 +541,7 @@ private:
     static const AnimationClip* RichestClip() {
         // AppendClips adds the mesh FBX's own stacks first and the external
         // animation files after, so anything past that count came from
-        // Rifle Idle(2).fbx -- the clip we actually want. Prefer it outright:
+        // Rifle Aiming Idle(1).fbx -- the clip we actually want. Prefer it outright:
         // PlayerArms.fbx's embedded 'Armature|Armature' stack has more raw
         // keyframes and would otherwise win the count, even though it is the
         // Blender action left over from authoring rather than the intended idle.

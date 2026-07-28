@@ -633,6 +633,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat3("Offset",    &scene.gun.offset.x,   0.01f);
         ImGui::DragFloat3("Scale##gun",&scene.gun.scale.x,     0.01f);
         ImGui::DragFloat3("Rot##gun",  &scene.gun.rotation.x,  1.0f);
+        ImGui::Text("Fit: %s", GunModel::SelectedWeaponName());
+        ImGui::DragFloat3("Weapon Fit Offset",
+                          &GunModel::PlayerOffset().x, 0.005f);
         ImGui::Checkbox("Auto Fire", &scene.autoFire);
         ImGui::DragFloat("Fire Interval", &scene.fireInterval, 0.005f, 0.02f, 1.0f, "%.3f s");
 

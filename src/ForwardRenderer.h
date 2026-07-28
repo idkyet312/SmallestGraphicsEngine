@@ -1424,19 +1424,20 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // arms are aligned against, rather than the other way round.
             // Base placement: the pocket of screen space the weapon was tuned
             // in, before any hand motion is added.
-            XMMATRIX xf =
+            const XMFLOAT3& weaponOffset = GunModel::PlayerOffset();
+            const XMMATRIX weaponPlacement =
                 XMMatrixScaling(S, S, S) *
-                XMMatrixTranslation(0.0f, -0.10f * S, -0.44f * S) *
-                gunBase;
+                XMMatrixTranslation(weaponOffset.x * S,
+                                    weaponOffset.y * S,
+                                    weaponOffset.z * S);
+            XMMATRIX xf = weaponPlacement * gunBase;
             // With the idle playing, ride the trigger hand so the rifle stays in
             // the grip instead of hanging still while the arms breathe past it.
             // The follow transform is a delta from the reference pose, so it
             // composes on top of the tuned placement rather than replacing it.
             XMMATRIX handFollow;
             if (ArmsModel::WeaponFollowTransform(handFollow, S))
-                xf = XMMatrixScaling(S, S, S) *
-                     XMMatrixTranslation(0.0f, -0.10f * S, -0.44f * S) *
-                     handFollow * gunBase;
+                xf = weaponPlacement * handFollow * gunBase;
             shader.Use(scene.wireframeMode);
             DrawMeshAt(GunModel::PlayerMesh(), shader, xf, view, proj, lightSpace);
             shader.Use(scene.wireframeMode);

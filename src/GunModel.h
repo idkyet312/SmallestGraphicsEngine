@@ -27,6 +27,7 @@
 #include "GLBImporter.h"
 #include <DirectXMath.h>
 #include <algorithm>
+#include <array>
 #include <cfloat>
 #include <cctype>
 #include <cmath>
@@ -87,6 +88,22 @@ public:
         if (SVDSelected()) return SVDMesh();
         if (RPGSelected()) return RPGMesh();
         return ShotgunSelected() ? ShotgunMesh() : Mesh();
+    }
+    // Per-weapon placement in gun-local space. Each imported mesh has a
+    // different distance from its rear bound to its support-hand grip, so one
+    // shared offset cannot keep every weapon inside the same animated hands.
+    static XMFLOAT3& WeaponOffset(int weapon) {
+        static std::array<XMFLOAT3, 4> offsets = {{
+            { 0.000f, -0.100f, -0.440f }, // AK47 handguard
+            { 0.045f, -0.100f, -0.290f }, // Mossberg pump
+            { 0.020f, -0.030f, -0.330f }, // RPG forward grip
+            { 0.030f, -0.060f, -0.490f }, // SVD handguard
+        }};
+        const int slot = (std::max)(0, (std::min)(weapon, 3));
+        return offsets[static_cast<size_t>(slot)];
+    }
+    static XMFLOAT3& PlayerOffset() {
+        return WeaponOffset(SelectedWeapon());
     }
     static bool PlayerLoaded() { return PlayerMesh() != nullptr; }
     static bool WeaponLoaded(int weapon) {
