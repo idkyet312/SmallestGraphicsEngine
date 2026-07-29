@@ -111,6 +111,7 @@ set(HEADER_FILES
     src/AssetRegistry.h
     src/AssetWatcher.h
     src/PrefabThumbnailGenerator.h
+    src/PalmMeshCutter.h
     src/GunAudio.h
     src/NavigationSystem.h
     src/T3DPhysicsAsset.h
@@ -276,6 +277,7 @@ if(USE_DX12)
         src/AssetRegistry.cpp
         src/AssetWatcher.cpp
         src/PrefabThumbnailGenerator.cpp
+        src/PalmMeshCutter.cpp
         ${HEADER_FILES}
         ${SHADER_FILES}
     )

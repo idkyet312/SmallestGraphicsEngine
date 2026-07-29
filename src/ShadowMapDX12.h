@@ -695,11 +695,14 @@ public:
         // an alpha-tested depth pass so fronds cast silhouettes, not solid quads.
         if (!g_emptyLevelMode && g_trees.IsInitialized()) {
             for (const TreeItem& item : g_trees.GetItems()) {
-                std::shared_ptr<SceneMesh> slice;
-                if (item.crown) slice = PalmModel::Crown();
-                else if (item.segment >= 0 &&
-                         item.segment < static_cast<int>(PalmModel::TrunkSlices().size()))
-                    slice = PalmModel::TrunkSlices()[item.segment].mesh;
+                std::shared_ptr<SceneMesh> slice = item.meshOverride;
+                if (!slice) {
+                    if (item.crown) slice = PalmModel::Crown();
+                    else if (item.segment >= 0 &&
+                             item.segment < static_cast<int>(
+                                 PalmModel::TrunkSlices().size()))
+                        slice = PalmModel::TrunkSlices()[item.segment].mesh;
+                }
 
                 const XMMATRIX model = XMLoadFloat4x4(&item.transform);
                 if (!slice) {

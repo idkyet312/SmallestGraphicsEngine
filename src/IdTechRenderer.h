@@ -294,11 +294,14 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items
 
     if (!g_emptyLevelMode && g_trees.IsInitialized()) {
         for (const TreeItem& tree : g_trees.GetItems()) {
-            std::shared_ptr<SceneMesh> slice;
-            if (tree.crown) slice = PalmModel::Crown();
-            else if (tree.segment >= 0 &&
-                     tree.segment < static_cast<int>(PalmModel::TrunkSlices().size()))
-                slice = PalmModel::TrunkSlices()[tree.segment].mesh;
+            std::shared_ptr<SceneMesh> slice = tree.meshOverride;
+            if (!slice) {
+                if (tree.crown) slice = PalmModel::Crown();
+                else if (tree.segment >= 0 &&
+                         tree.segment < static_cast<int>(
+                             PalmModel::TrunkSlices().size()))
+                    slice = PalmModel::TrunkSlices()[tree.segment].mesh;
+            }
             if (slice) AppendOpaqueMeshDrawItems(slice,
                 XMLoadFloat4x4(&tree.transform), items, tree.palmWindRoot);
             else items.push_back({ XMLoadFloat4x4(&tree.transform), tree.color,

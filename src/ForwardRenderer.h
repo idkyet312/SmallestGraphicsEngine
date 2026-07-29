@@ -1051,10 +1051,13 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // If the real palm model loaded, each physics box carries the identity
             // of a model slice (a trunk segment or the crown); draw that slice's
             // geometry at the box's transform. Otherwise the item is a plain box.
-            std::shared_ptr<SceneMesh> slice;
-            if (item.crown) slice = PalmModel::Crown();
-            else if (item.segment >= 0 && item.segment < (int)PalmModel::TrunkSlices().size())
-                slice = PalmModel::TrunkSlices()[item.segment].mesh;
+            std::shared_ptr<SceneMesh> slice = item.meshOverride;
+            if (!slice) {
+                if (item.crown) slice = PalmModel::Crown();
+                else if (item.segment >= 0 &&
+                         item.segment < (int)PalmModel::TrunkSlices().size())
+                    slice = PalmModel::TrunkSlices()[item.segment].mesh;
+            }
 
             if (slice) {
                 DrawMeshAt(slice, shader, xf, view, proj, lightSpace, false,

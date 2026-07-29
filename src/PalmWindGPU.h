@@ -12,4 +12,3 @@ struct PalmWindFrameDX12 {
     DirectX::XMFLOAT4 previousSecondary{};
     DirectX::XMFLOAT4 params{};            // radius, rotor strength, model height, unused
 };
-

@@ -30,6 +30,7 @@
 #include <DirectXMath.h>
 #include "DX12Core.h"
 #include "PalmModel.h"
+#include "PalmMeshCutter.h"
 #include "PalmWindGPU.h"
 #include <box3d/box3d.h>
 #include <vector>
@@ -57,6 +58,8 @@ struct TreeItem {
     // Scale to apply to the model slice: the model is normalised to a fixed height,
     // but trees are planted at varying heights.
     float modelScale = 1.0f;
+    // Runtime boolean fragments own unique meshes. Null keeps shared slice path.
+    std::shared_ptr<SceneMesh> meshOverride;
     // root.xy = tree world XZ, z = GPU wind enabled. Falling/cut logs leave zero.
     XMFLOAT4 palmWindRoot{};
 };
@@ -177,13 +180,9 @@ public:
         tree.crownYaw = XMConvertToRadians(
             -8.0f + 16.0f * Variation01(x, z, seed + 1.0f));
 
-        // Fixed segment count across every tree, so physics segment i always maps
-        // to the same model trunk slice i regardless of how tall this tree is.
-        const int count = kTrunkSegments;
-        tree.segLen = height / count;
-
         // Slice the palm into `count` trunk pieces (once, on first plant). Uniform
         // model scale = planted height / the model's normalised height.
+        const int count = kTrunkSegments;
         PalmModel::Load(count);
         if (PalmModel::Loaded() && PalmModel::ModelHeight() > 0.0f) {
             tree.modelScale = height / PalmModel::ModelHeight();
@@ -191,6 +190,13 @@ public:
             // scale only vertically, producing identical narrow crowns.
             tree.modelScaleXZ = tree.modelScale;
         }
+        // Physics must end where visible trunk ends, not at full tree height.
+        // The previous full-height boxes put cuts and crown collisions ~25% above
+        // their rendered geometry.
+        const float trunkHeight = PalmModel::Loaded()
+            ? PalmModel::CrownBaseY() * tree.modelScale
+            : height;
+        tree.segLen = trunkHeight / count;
 
         for (int i = 0; i < count; ++i) {
             const float t = (float)i / std::max(1, count - 1);
@@ -209,6 +215,7 @@ public:
 
     void Update(float dt) {
         if (B3_IS_NULL(m_world)) return;
+        CollectRetiredMeshes();
         m_previousWindTime = m_windTime;
         m_windTime += dt;
         if (m_activeBodies == 0) {
@@ -303,36 +310,34 @@ public:
         const XMVECTOR a = XMLoadFloat3(&start);
         const XMVECTOR b = XMLoadFloat3(&end);
         const XMVECTOR ab = b - a;
-        const float abLenSq = std::max(1e-6f, XMVectorGetX(XMVector3LengthSq(ab)));
 
         float    bestT = FLT_MAX;
+        float    bestModelY = 0.0f;
         Tree*    bestTree = nullptr;
         size_t   bestLog  = SIZE_MAX;   // index into m_logs; SIZE_MAX = none
         int      bestSeg  = -1;
         XMFLOAT3 bestPos{};
 
-        // Test one trunk piece: `center` is its world position, `radius` its
-        // horizontal extent, `halfLen` its extent along the trunk axis.
-        auto test = [&](const XMVECTOR& center, float rad, float halfLen,
+        // Capsule test against the actual trunk axis. The old bounding-sphere
+        // approximation could register air beside a trunk and choose the wrong
+        // height band.
+        auto test = [&](const XMVECTOR& axisStart, const XMVECTOR& axisEnd,
+                        float rad, float modelYStart, float modelYEnd,
                         Tree* tree, size_t log, int seg) {
-            float t = XMVectorGetX(XMVector3Dot(center - a, ab)) / abLenSq;
-            t = std::max(0.0f, std::min(1.0f, t));
-            const XMVECTOR closest = a + ab * t;
-            const XMVECTOR delta = center - closest;
-            const float d = XMVectorGetX(XMVector3Length(delta));
+            float bulletT = 0.0f;
+            float trunkT = 0.0f;
+            const float distanceSq = ClosestSegmentDistanceSquared(
+                a, b, axisStart, axisEnd, bulletT, trunkT);
+            const float reach = radius + rad;
+            if (distanceSq > reach * reach || bulletT >= bestT) return;
 
-            // Sphere test against the piece's bounding radius. A log lies at any
-            // angle once it has fallen, so an axis-aligned test would be wrong --
-            // this stays orientation-independent, at the cost of being a little
-            // generous on the long axis.
-            const float reach = std::max(rad, halfLen);
-            if (d > radius + reach || t >= bestT) return;
-
-            bestT = t;
+            bestT = bulletT;
             bestTree = tree;
             bestLog = log;
             bestSeg = seg;
-            XMStoreFloat3(&bestPos, center);
+            bestModelY =
+                modelYStart + (modelYEnd - modelYStart) * trunkT;
+            XMStoreFloat3(&bestPos, a + ab * bulletT);
         };
 
         // Standing trees (their still-upright segments).
@@ -340,8 +345,20 @@ public:
             const int standTop = tree.felled ? tree.cutIndex : (int)tree.segments.size();
             for (int i = 0; i < standTop; ++i) {
                 const Segment& s = tree.segments[i];
-                test(XMVectorSet(tree.x + s.offX, s.centerY, tree.z, 0.0f),
-                     s.radius, tree.segLen * 0.5f, &tree, SIZE_MAX, i);
+                const XMVECTOR center =
+                    XMVectorSet(tree.x + s.offX, s.centerY, tree.z, 0.0f);
+                const XMVECTOR half =
+                    XMVectorSet(0.0f, tree.segLen * 0.5f, 0.0f, 0.0f);
+                const float modelYStart = tree.modelScale > 1e-5f
+                    ? (s.centerY - tree.segLen * 0.5f - tree.baseY) /
+                        tree.modelScale
+                    : 0.0f;
+                const float modelYEnd = tree.modelScale > 1e-5f
+                    ? (s.centerY + tree.segLen * 0.5f - tree.baseY) /
+                        tree.modelScale
+                    : 0.0f;
+                test(center - half, center + half, s.radius,
+                     modelYStart, modelYEnd, &tree, SIZE_MAX, i);
             }
         }
 
@@ -352,9 +369,14 @@ public:
             const XMMATRIX xf = BodyTransform(log.body);
             for (const Piece& p : log.pieces) {
                 if (p.frond) continue;                     // fronds aren't structural
-                const XMVECTOR wp = XMVector3Transform(
-                    XMVectorSet(p.localPos.x, p.localPos.y, p.localPos.z, 1.0f), xf);
-                test(wp, std::max(p.half.x, p.half.z), p.half.y, nullptr, li, p.seg);
+                const XMVECTOR localStart = XMVectorSet(
+                    p.localPos.x, p.localPos.y - p.half.y, p.localPos.z, 1.0f);
+                const XMVECTOR localEnd = XMVectorSet(
+                    p.localPos.x, p.localPos.y + p.half.y, p.localPos.z, 1.0f);
+                test(XMVector3Transform(localStart, xf),
+                     XMVector3Transform(localEnd, xf),
+                     std::max(p.half.x, p.half.z),
+                     p.modelYLo, p.modelYHi, nullptr, li, p.seg);
             }
         }
 
@@ -365,10 +387,17 @@ public:
         Segment& seg = bestTree ? bestTree->segments[bestSeg]
                                 : m_logs[bestLog].segments[bestSeg];
         seg.health -= damage;
+        seg.hitDirectionX += direction.x * damage;
+        seg.hitDirectionZ += direction.z * damage;
         if (seg.health > 0.0f) return true;   // chewing through, not severed yet
 
-        if (bestTree) FellTree(*bestTree, bestSeg, direction);
-        else          SplitLog(bestLog, bestSeg, direction);
+        const XMFLOAT3 fractureDirection =
+            FallDir({ seg.hitDirectionX, 0.0f, seg.hitDirectionZ });
+        if (bestTree)
+            FellTree(*bestTree, bestSeg, bestModelY, fractureDirection);
+        else
+            SplitLog(bestLog, bestSeg, bestModelY, fractureDirection);
+        RebuildItems();
         return true;
     }
 
@@ -379,9 +408,53 @@ public:
             if (tree.felled) continue;
             const float dx = tree.x - center.x;
             const float dz = tree.z - center.z;
-            if (dx * dx + dz * dz > radius * radius) continue;
-            FellTree(tree, 0, { dx, 0.0f, dz });
+            const float trunkTop = tree.baseY +
+                tree.segLen * static_cast<float>(tree.segments.size());
+            const float nearestY = std::clamp(center.y, tree.baseY, trunkTop);
+            const float dy = nearestY - center.y;
+            if (dx * dx + dy * dy + dz * dz > radius * radius) continue;
+            const int cut = std::clamp(
+                static_cast<int>((nearestY - tree.baseY) / tree.segLen),
+                0, static_cast<int>(tree.segments.size()) - 1);
+            const float modelCutY = tree.modelScale > 1e-5f
+                ? (nearestY - tree.baseY) / tree.modelScale
+                : static_cast<float>(cut);
+            FellTree(tree, cut, modelCutY, { dx, 0.0f, dz });
             changed = true;
+        }
+
+        // Blast pressure keeps affecting already-felled sections. This is what
+        // lets a second grenade roll or flip a fallen crown instead of treating
+        // it as frozen scenery.
+        for (Log& log : m_logs) {
+            if (B3_IS_NULL(log.body)) continue;
+            const b3Pos position = b3Body_GetPosition(log.body);
+            float dx = static_cast<float>(position.x) - center.x;
+            float dy = static_cast<float>(position.y) - center.y;
+            float dz = static_cast<float>(position.z) - center.z;
+            const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (distance >= radius) continue;
+            if (distance > 1e-3f) {
+                const float inverseDistance = 1.0f / distance;
+                dx *= inverseDistance;
+                dy *= inverseDistance;
+                dz *= inverseDistance;
+            } else {
+                dx = 1.0f;
+                dy = 0.35f;
+                dz = 0.0f;
+            }
+            if (log.asleep) {
+                b3Body_SetType(log.body, b3_dynamicBody);
+                log.asleep = false;
+                ++m_activeBodies;
+            }
+            const float falloff = 1.0f - distance / radius;
+            const float impulse =
+                std::max(1.0f, b3Body_GetMass(log.body)) *
+                kExplosionPush * falloff;
+            b3Body_ApplyLinearImpulseToCenter(
+                log.body, { dx * impulse, dy * impulse, dz * impulse }, true);
         }
         if (changed) RebuildItems();
     }
@@ -402,6 +475,7 @@ public:
         m_trees.clear();
         m_logs.clear();
         m_items.clear();
+        m_retiredMeshes.clear();
         m_accumulator = 0.0f;
         m_activeBodies = 0;
     }
@@ -411,7 +485,7 @@ public:
 private:
     // Fine localized sections let bullets chew a narrow break ring before the
     // upper trunk separates, rather than snapping the tree in six huge blocks.
-    static constexpr int   kTrunkSegments = 12;
+    static constexpr int   kTrunkSegments = 18;
     static constexpr float kSegmentLen    = 1.2f;
     static constexpr float kTrunkBase     = 0.17f;
     static constexpr float kSegmentHealth = 45.0f;
@@ -429,6 +503,7 @@ private:
     // direction. Raising these launches the log instead of toppling it.
     static constexpr float kTopple = 0.6f;
     static constexpr float kSpin   = 0.5f;
+    static constexpr float kExplosionPush = 2.8f;
 
     // Far above real wood (~700) on purpose: a palm trunk is thin, and at honest
     // density the log is light enough for the break impulse to fling it about.
@@ -442,6 +517,8 @@ private:
         float offX    = 0.0f;   // lean offset from the trunk axis
         float centerY = 0.0f;   // only meaningful while standing
         float health  = 0.0f;
+        float hitDirectionX = 0.0f;
+        float hitDirectionZ = 0.0f;
     };
 
     // One shape welded onto a log body, in that body's LOCAL frame. Trunk pieces
@@ -463,6 +540,8 @@ private:
         float    modelScaleXZ = 1.0f;
         XMFLOAT3 modelOrigin{};   // where the slice's local origin sits, in body frame
         float    crownYaw = 0.0f;
+        float    modelYLo = 0.0f;
+        float    modelYHi = 0.0f;
     };
 
     // A felled section of trunk: one dynamic body carrying its pieces. Shootable,
@@ -471,6 +550,7 @@ private:
         b3BodyId body = b3_nullBodyId;
         std::vector<Piece>   pieces;
         std::vector<Segment> segments;   // parallel to the trunk pieces' seg indices
+        std::shared_ptr<SceneMesh> trunkMesh;
         bool asleep = false;
     };
 
@@ -481,10 +561,17 @@ private:
         b3BodyId standing = b3_nullBodyId;
         int  cutIndex = 0;
         bool felled = false;
+        float cutModelY = 0.0f;
+        std::shared_ptr<SceneMesh> stumpMesh;
         float modelScale = 1.0f;   // planted height / model height
         float modelScaleXZ = 1.0f; // uniform with modelScale for authored proportions
         // Stable yaw breaks cloned silhouettes without separating crown from trunk.
         float crownYaw = 0.0f;
+    };
+
+    struct RetiredMesh {
+        uint64_t fenceValue = 0;
+        std::shared_ptr<SceneMesh> mesh;
     };
 
     // ---- helpers ------------------------------------------------------------
@@ -500,6 +587,57 @@ private:
         const float value = std::sin(x * 12.9898f + z * 78.233f + salt * 37.719f) *
                             43758.5453f;
         return value - std::floor(value);
+    }
+
+    void RetireMesh(const std::shared_ptr<SceneMesh>& mesh) {
+        if (!mesh) return;
+        m_retiredMeshes.push_back({ g_dx12.lastDirectFenceValue, mesh });
+    }
+
+    void CollectRetiredMeshes() {
+        if (!g_dx12.fence) return;
+        const uint64_t completed = g_dx12.fence->GetCompletedValue();
+        m_retiredMeshes.erase(std::remove_if(
+            m_retiredMeshes.begin(), m_retiredMeshes.end(),
+            [completed](const RetiredMesh& retired) {
+                return retired.fenceValue <= completed;
+            }), m_retiredMeshes.end());
+    }
+
+    static float ClosestSegmentDistanceSquared(
+        const XMVECTOR& p0, const XMVECTOR& p1,
+        const XMVECTOR& q0, const XMVECTOR& q1,
+        float& pFraction, float& qFraction) {
+        const XMVECTOR u = p1 - p0;
+        const XMVECTOR v = q1 - q0;
+        const XMVECTOR w = p0 - q0;
+        const float uu = XMVectorGetX(XMVector3Dot(u, u));
+        const float uv = XMVectorGetX(XMVector3Dot(u, v));
+        const float vv = XMVectorGetX(XMVector3Dot(v, v));
+        const float uw = XMVectorGetX(XMVector3Dot(u, w));
+        const float vw = XMVectorGetX(XMVector3Dot(v, w));
+        const float denominator = uu * vv - uv * uv;
+
+        pFraction = denominator > 1e-6f
+            ? std::clamp((uv * vw - vv * uw) / denominator, 0.0f, 1.0f)
+            : 0.0f;
+        qFraction = vv > 1e-6f
+            ? (uv * pFraction + vw) / vv
+            : 0.0f;
+
+        if (qFraction < 0.0f) {
+            qFraction = 0.0f;
+            pFraction = uu > 1e-6f ? std::clamp(-uw / uu, 0.0f, 1.0f) : 0.0f;
+        } else if (qFraction > 1.0f) {
+            qFraction = 1.0f;
+            pFraction = uu > 1e-6f
+                ? std::clamp((uv - uw) / uu, 0.0f, 1.0f)
+                : 0.0f;
+        }
+
+        const XMVECTOR delta =
+            (p0 + u * pFraction) - (q0 + v * qFraction);
+        return XMVectorGetX(XMVector3LengthSq(delta));
     }
 
     // Low-frequency ambient bend plus radial rotor wash from both helicopters.
@@ -564,7 +702,15 @@ private:
             tree.standing = b3_nullBodyId;
         }
         const int top = tree.felled ? tree.cutIndex : (int)tree.segments.size();
-        if (top <= 0) return;   // cut at the base: no stump left
+        float partialHeight = 0.0f;
+        if (tree.felled && top < static_cast<int>(tree.segments.size())) {
+            const float cutWorldY =
+                tree.baseY + tree.cutModelY * tree.modelScale;
+            const float partialBottom = tree.baseY + tree.segLen * top;
+            partialHeight = std::clamp(
+                cutWorldY - partialBottom, 0.0f, tree.segLen);
+        }
+        if (top <= 0 && partialHeight <= 1e-3f) return;
 
         b3BodyDef bd = b3DefaultBodyDef();
         bd.type = b3_staticBody;
@@ -576,6 +722,16 @@ private:
             Piece p;
             p.localPos = XMFLOAT3(s.offX, s.centerY - tree.baseY, 0.0f);
             p.half = XMFLOAT3(s.radius, tree.segLen * 0.5f, s.radius);
+            AddPieceShape(tree.standing, p);
+        }
+        if (partialHeight > 1e-3f) {
+            const Segment& segment = tree.segments[top];
+            Piece p;
+            p.localPos = XMFLOAT3(
+                segment.offX, tree.segLen * top + partialHeight * 0.5f,
+                0.0f);
+            p.half = XMFLOAT3(
+                segment.radius, partialHeight * 0.5f, segment.radius);
             AddPieceShape(tree.standing, p);
         }
 
@@ -635,7 +791,8 @@ private:
     // Returns an INDEX, not a reference: this push_back can reallocate m_logs, so
     // any Log& held across this call would dangle. Callers must re-index.
     size_t SpawnLog(const XMFLOAT3& origin, std::vector<Piece> pieces,
-                    std::vector<Segment> segments, const XMFLOAT3& dir) {
+                    std::vector<Segment> segments, const XMFLOAT3& dir,
+                    std::shared_ptr<SceneMesh> trunkMesh = {}) {
         b3BodyDef bd = b3DefaultBodyDef();
         bd.type = b3_dynamicBody;
         bd.position = { origin.x, origin.y, origin.z };
@@ -648,6 +805,7 @@ private:
         log.body = b3CreateBody(m_world, &bd);
         log.pieces = std::move(pieces);
         log.segments = std::move(segments);
+        log.trunkMesh = std::move(trunkMesh);
 
         for (const Piece& p : log.pieces) AddPieceShape(log.body, p);
 
@@ -676,17 +834,38 @@ private:
 
     // Fell a standing tree at segment `cut`: the stump stays, everything above
     // becomes one dynamic log (crown included).
-    void FellTree(Tree& tree, int cut, const XMFLOAT3& direction) {
+    void FellTree(Tree& tree, int cut, float modelCutY,
+                  const XMFLOAT3& direction) {
         if (tree.felled) return;
         const int count = (int)tree.segments.size();
         if (cut >= count) return;
 
+        if (PalmModel::Loaded()) {
+            modelCutY = std::clamp(modelCutY, 0.08f,
+                (std::max)(0.09f, PalmModel::CrownBaseY() - 0.08f));
+        } else {
+            modelCutY = tree.modelScale > 1e-5f
+                ? tree.segLen * (cut + 0.5f) / tree.modelScale
+                : tree.segLen * (cut + 0.5f);
+        }
+        const float cutWorldY = tree.baseY + modelCutY * tree.modelScale;
         const XMFLOAT3 origin(tree.x + tree.segments[cut].offX,
-                              tree.baseY + tree.segLen * cut,
+                              cutWorldY,
                               tree.z);
 
         std::vector<Piece>   pieces;
         std::vector<Segment> segs;
+        std::shared_ptr<SceneMesh> upperMesh;
+        if (PalmModel::Loaded()) {
+            const std::shared_ptr<SceneMesh> whole =
+                PalmMeshCutter::BuildWholeTrunk();
+            PalmMeshCut meshCut = PalmMeshCutter::Cut(
+                whole, modelCutY, { direction.x, direction.z });
+            PalmMeshCutter::Upload(meshCut.lower);
+            PalmMeshCutter::Upload(meshCut.upper);
+            tree.stumpMesh = std::move(meshCut.lower);
+            upperMesh = std::move(meshCut.upper);
+        }
 
         // The palm model's base (trunk foot), expressed in the new log body's frame.
         // Every slice this log carries is drawn relative to this point, so the whole
@@ -698,15 +877,24 @@ private:
         for (int i = cut; i < count; ++i) {
             const Segment& s = tree.segments[i];
             Piece p;
-            p.localPos = XMFLOAT3(tree.x + s.offX - origin.x,
-                                  s.centerY - origin.y,
-                                  0.0f);
-            p.half = XMFLOAT3(s.radius, tree.segLen * 0.5f, s.radius);
+            float pieceBottom = s.centerY - tree.segLen * 0.5f;
+            const float pieceTop = s.centerY + tree.segLen * 0.5f;
+            if (i == cut) pieceBottom = cutWorldY;
+            const float pieceHeight = (std::max)(0.01f, pieceTop - pieceBottom);
+            p.localPos = XMFLOAT3(
+                tree.x + s.offX - origin.x,
+                (pieceBottom + pieceTop) * 0.5f - origin.y, 0.0f);
+            p.half = XMFLOAT3(s.radius, pieceHeight * 0.5f, s.radius);
             p.seg = (int)segs.size();          // index within the new log
             p.modelSeg = i;                    // model slice this piece stands in for
             p.modelScale = tree.modelScale;
             p.modelScaleXZ = tree.modelScaleXZ;
             p.modelOrigin = modelOrigin;
+            p.modelYLo = i == cut
+                ? modelCutY
+                : static_cast<float>(i) * PalmModel::CrownBaseY() / count;
+            p.modelYHi =
+                static_cast<float>(i + 1) * PalmModel::CrownBaseY() / count;
             pieces.push_back(p);
             segs.push_back(s);                 // carries its remaining health
         }
@@ -734,10 +922,12 @@ private:
         }
 
         tree.cutIndex = cut;
+        tree.cutModelY = modelCutY;
         tree.felled = true;
         BuildStanding(tree);
 
-        SpawnLog(origin, std::move(pieces), std::move(segs), FallDir(direction));
+        SpawnLog(origin, std::move(pieces), std::move(segs),
+                 FallDir(direction), std::move(upperMesh));
     }
 
     // Split a fallen log at segment `cut`: the log keeps the pieces below the cut,
@@ -747,88 +937,108 @@ private:
     //
     // Takes an INDEX, not a Log&: SpawnLog below can reallocate m_logs, so a
     // reference held by the caller across this call would dangle.
-    void SplitLog(size_t logIdx, int cut, const XMFLOAT3& direction) {
+    void SplitLog(size_t logIdx, int cut, float modelCutY,
+                  const XMFLOAT3& direction) {
         Log& log = m_logs[logIdx];
         const int segCount = (int)log.segments.size();
-        // Need at least one piece on each side, or there is nothing to split.
-        if (cut <= 0 || cut >= segCount) {
-            // Cut at an end: the log is already as short as it can be here. Reset
-            // that segment's health so it can still be chipped at, rather than
-            // sitting at zero and re-triggering a split on every subsequent hit.
-            if (cut >= 0 && cut < segCount)
-                log.segments[cut].health = kSegmentHealth * 0.5f;
-            return;
-        }
+        if (cut < 0 || cut >= segCount) return;
 
         const XMMATRIX xf = BodyTransform(log.body);
 
-        // The new log's origin: the world position of the first piece going with it.
         const Piece* cutPiece = nullptr;
         for (const Piece& p : log.pieces)
             if (!p.frond && p.seg == cut) { cutPiece = &p; break; }
         if (!cutPiece) return;
 
+        const float minimumCut = cutPiece->modelYLo + 0.015f;
+        const float maximumCut = cutPiece->modelYHi - 0.015f;
+        if (minimumCut >= maximumCut) {
+            log.segments[cut].health = kSegmentHealth * 0.5f;
+            return;
+        }
+        modelCutY = std::clamp(modelCutY, minimumCut, maximumCut);
+        const float cutLocalY =
+            cutPiece->modelOrigin.y + modelCutY * cutPiece->modelScale;
+        const XMFLOAT3 localOrigin(
+            cutPiece->localPos.x, cutLocalY, cutPiece->localPos.z);
+
         XMFLOAT3 origin;
         XMStoreFloat3(&origin, XMVector3Transform(
-            XMVectorSet(cutPiece->localPos.x, cutPiece->localPos.y,
-                        cutPiece->localPos.z, 1.0f), xf));
+            XMVectorSet(localOrigin.x, localOrigin.y,
+                        localOrigin.z, 1.0f), xf));
 
-        // The split has to preserve each piece's current WORLD pose: the log may be
-        // lying at any orientation, so we re-express the upper pieces relative to
-        // the new origin, keeping the body's rotation.
         const b3Quat bq = b3Body_GetRotation(log.body);
         const XMVECTOR bodyRot = XMVectorSet(bq.v.x, bq.v.y, bq.v.z, bq.s);
         const XMMATRIX rotOnly = XMMatrixRotationQuaternion(bodyRot);
 
+        XMFLOAT3 localDirection{};
+        XMStoreFloat3(&localDirection, XMVector3TransformNormal(
+            XMLoadFloat3(&direction), XMMatrixTranspose(rotOnly)));
+        const std::shared_ptr<SceneMesh> sourceMesh = log.trunkMesh
+            ? log.trunkMesh : PalmMeshCutter::BuildWholeTrunk();
+        PalmMeshCut meshCut = PalmMeshCutter::Cut(
+            sourceMesh, modelCutY,
+            { localDirection.x, localDirection.z });
+        PalmMeshCutter::Upload(meshCut.lower);
+        PalmMeshCutter::Upload(meshCut.upper);
+
         std::vector<Piece> upper, lower;
         std::vector<Segment> upperSegs, lowerSegs;
 
-        // Fronds sit at the crown end, which is the far end of the segment run, so
-        // they travel with the upper half.
+        auto rebaseUpper = [&](Piece piece) {
+            piece.localPos.x -= localOrigin.x;
+            piece.localPos.y -= localOrigin.y;
+            piece.localPos.z -= localOrigin.z;
+            if (piece.modelSeg >= 0) {
+                piece.modelOrigin.x -= localOrigin.x;
+                piece.modelOrigin.y -= localOrigin.y;
+                piece.modelOrigin.z -= localOrigin.z;
+            }
+            return piece;
+        };
+
         for (const Piece& p : log.pieces) {
-            const bool goesUp = p.frond ? true : (p.seg >= cut);
-
-            if (goesUp) {
-                // Re-base into the new origin's frame (same rotation, new pivot).
-                XMFLOAT3 world;
-                XMStoreFloat3(&world, XMVector3Transform(
-                    XMVectorSet(p.localPos.x, p.localPos.y, p.localPos.z, 1.0f), xf));
-
-                XMVECTOR rel = XMVectorSet(world.x - origin.x,
-                                           world.y - origin.y,
-                                           world.z - origin.z, 0.0f);
-                // Undo the body rotation so the offset is in the new body's frame,
-                // which will be created with the same rotation.
-                rel = XMVector3Transform(rel, XMMatrixTranspose(rotOnly));
-
-                Piece np = p;
-                XMStoreFloat3(&np.localPos, rel);
-                if (!p.frond) np.seg = p.seg - cut;   // reindex into the new log
-                // modelSeg is the ABSOLUTE model slice and must not be reindexed --
-                // it still stands for the same physical piece of tree. Its origin,
-                // like localPos, is a point in the body frame, so re-base it too.
-                if (np.modelSeg >= 0) {
-                    XMFLOAT3 mw;
-                    XMStoreFloat3(&mw, XMVector3Transform(
-                        XMVectorSet(p.modelOrigin.x, p.modelOrigin.y, p.modelOrigin.z, 1.0f), xf));
-                    XMVECTOR mrel = XMVectorSet(mw.x - origin.x, mw.y - origin.y,
-                                               mw.z - origin.z, 0.0f);
-                    mrel = XMVector3Transform(mrel, XMMatrixTranspose(rotOnly));
-                    XMStoreFloat3(&np.modelOrigin, mrel);
-                }
+            if (p.frond || p.seg > cut) {
+                Piece np = rebaseUpper(p);
+                if (!p.frond) np.seg = p.seg - cut;
                 upper.push_back(np);
-            } else {
+            } else if (p.seg < cut) {
                 lower.push_back(p);
+            } else {
+                const float bottom = p.localPos.y - p.half.y;
+                const float top = p.localPos.y + p.half.y;
+                const float split = std::clamp(
+                    cutLocalY, bottom + 0.005f, top - 0.005f);
+
+                Piece lowerPiece = p;
+                lowerPiece.localPos.y = (bottom + split) * 0.5f;
+                lowerPiece.half.y = (split - bottom) * 0.5f;
+                lowerPiece.modelYHi = modelCutY;
+                lower.push_back(lowerPiece);
+
+                Piece upperPiece = p;
+                upperPiece.localPos.y = (split + top) * 0.5f;
+                upperPiece.half.y = (top - split) * 0.5f;
+                upperPiece.modelYLo = modelCutY;
+                upperPiece.seg = 0;
+                upper.push_back(rebaseUpper(upperPiece));
             }
         }
 
         for (int i = 0; i < segCount; ++i) {
+            if (i <= cut) lowerSegs.push_back(log.segments[i]);
             if (i >= cut) upperSegs.push_back(log.segments[i]);
-            else          lowerSegs.push_back(log.segments[i]);
         }
-        // The severed segment starts the new log with fresh-ish wood, so the new
-        // log is not instantly re-splittable at its very first piece.
-        if (!upperSegs.empty()) upperSegs[0].health = kSegmentHealth;
+        if (!lowerSegs.empty()) {
+            lowerSegs.back().health = kSegmentHealth;
+            lowerSegs.back().hitDirectionX = 0.0f;
+            lowerSegs.back().hitDirectionZ = 0.0f;
+        }
+        if (!upperSegs.empty()) {
+            upperSegs[0].health = kSegmentHealth;
+            upperSegs[0].hitDirectionX = 0.0f;
+            upperSegs[0].hitDirectionZ = 0.0f;
+        }
 
         // Rebuild the existing body with only the lower pieces. Simplest correct
         // route: destroy and recreate at the same pose, since Box3D has no
@@ -857,6 +1067,8 @@ private:
 
         log.pieces = std::move(lower);
         log.segments = std::move(lowerSegs);
+        RetireMesh(log.trunkMesh);
+        log.trunkMesh = std::move(meshCut.lower);
         if (wasAsleep) {
             log.asleep = false;      // it is dynamic again, so it must be counted
             ++m_activeBodies;
@@ -867,10 +1079,20 @@ private:
         // Nothing below touches `log`, and we index the new entry rather than
         // holding a reference to it.
         const XMFLOAT3 dir = FallDir(direction);
-        const size_t idx = SpawnLog(origin, std::move(upper), std::move(upperSegs), dir);
+        const size_t idx = SpawnLog(
+            origin, std::move(upper), std::move(upperSegs), dir,
+            std::move(meshCut.upper));
         // Match the parent's orientation so the split reads as a clean break
         // rather than the new piece snapping to an axis.
         b3Body_SetTransform(m_logs[idx].body, { origin.x, origin.y, origin.z }, lq);
+        const b3Vec3 upperLinear = b3Body_GetLinearVelocity(m_logs[idx].body);
+        const b3Vec3 upperAngular = b3Body_GetAngularVelocity(m_logs[idx].body);
+        b3Body_SetLinearVelocity(m_logs[idx].body,
+            { upperLinear.x + lv.x, upperLinear.y + lv.y,
+              upperLinear.z + lv.z });
+        b3Body_SetAngularVelocity(m_logs[idx].body,
+            { upperAngular.x + lw.x, upperAngular.y + lw.y,
+              upperAngular.z + lw.z });
     }
 
     // A log that has come to rest freezes back to static: costs nothing again.
@@ -897,7 +1119,18 @@ private:
 
         for (const Tree& tree : m_trees) {
             const int standTop = tree.felled ? tree.cutIndex : (int)tree.segments.size();
-            for (int i = 0; i < standTop; ++i) {
+            if (model && tree.felled && tree.stumpMesh) {
+                TreeItem stump;
+                const XMMATRIX transform =
+                    XMMatrixScaling(tree.modelScaleXZ, tree.modelScale,
+                                    tree.modelScaleXZ) *
+                    XMMatrixTranslation(tree.x, tree.baseY, tree.z);
+                XMStoreFloat4x4(&stump.transform, transform);
+                stump.color = TrunkColor(kSegmentHealth);
+                stump.meshOverride = tree.stumpMesh;
+                stump.modelScale = tree.modelScale;
+                m_items.push_back(std::move(stump));
+            } else for (int i = 0; i < standTop; ++i) {
                 const Segment& s = tree.segments[i];
                 const float heightFraction = (i + 0.5f) / (float)(std::max)(1, standTop);
                 if (model) {
@@ -949,10 +1182,35 @@ private:
             if (B3_IS_NULL(log.body)) continue;
             const XMMATRIX bodyXf = BodyTransform(log.body);
 
+            if (model && log.trunkMesh) {
+                const Piece* modelPiece = nullptr;
+                for (const Piece& piece : log.pieces)
+                    if (!piece.frond && piece.modelSeg >= 0) {
+                        modelPiece = &piece;
+                        break;
+                    }
+                if (modelPiece) {
+                    TreeItem trunk;
+                    const XMMATRIX local =
+                        XMMatrixScaling(modelPiece->modelScaleXZ,
+                                        modelPiece->modelScale,
+                                        modelPiece->modelScaleXZ) *
+                        XMMatrixTranslation(modelPiece->modelOrigin.x,
+                                            modelPiece->modelOrigin.y,
+                                            modelPiece->modelOrigin.z);
+                    XMStoreFloat4x4(&trunk.transform, local * bodyXf);
+                    trunk.color = TrunkColor(kSegmentHealth);
+                    trunk.meshOverride = log.trunkMesh;
+                    trunk.modelScale = modelPiece->modelScale;
+                    m_items.push_back(std::move(trunk));
+                }
+            }
+
             for (const Piece& p : log.pieces) {
                 // With the model loaded, frond boxes are collision-only: the crown
                 // mesh is drawn once via the single piece marked `crown`.
                 if (model && p.frond && !p.crown) continue;
+                if (model && log.trunkMesh && !p.frond) continue;
 
                 TreeItem item;
 
@@ -1057,6 +1315,7 @@ private:
     std::vector<Tree>     m_trees;
     std::vector<Log>      m_logs;
     std::vector<TreeItem> m_items;
+    std::vector<RetiredMesh> m_retiredMeshes;
     std::function<float(float, float)> m_terrain;
 
     // Terrain collision. Box3D keeps a reference to the height field (it is not
