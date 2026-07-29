@@ -6193,14 +6193,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         SCR_HEIGHT = displayMode.dmPelsHeight;
     }
 
-    RECT rc = { 0, 0, (LONG)SCR_WIDTH, (LONG)SCR_HEIGHT };
+    const LONG windowedWidth =
+        static_cast<LONG>((std::min)(SCR_WIDTH, 1600u));
+    const LONG windowedHeight =
+        static_cast<LONG>((std::min)(SCR_HEIGHT, 900u));
+    RECT rc = { 0, 0, windowedWidth, windowedHeight };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    const int windowX =
+        (static_cast<int>(SCR_WIDTH) - (rc.right - rc.left)) / 2;
+    const int windowY =
+        (static_cast<int>(SCR_HEIGHT) - (rc.bottom - rc.top)) / 2;
     HWND hwnd = CreateWindowW(L"GraphicEngineDX12", L"Graphics Engine - DirectX 12",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+        WS_OVERLAPPEDWINDOW, windowX, windowY,
         rc.right - rc.left, rc.bottom - rc.top,
         nullptr, nullptr, hInstance, nullptr);
     if (!hwnd) { std::cerr << "Window creation failed\n"; return -1; }
     ShowWindow(hwnd, nCmdShow);
+    ToggleFullscreen(hwnd);
     UpdateWindow(hwnd);
 
     // DX12

@@ -86,7 +86,7 @@ struct ExplosiveBarrel {
 struct GunViewModel {
     bool     visible  = true;   // AK47 view model is on by default
     XMFLOAT3 color    = { 0.3f, 0.3f, 0.35f };
-    XMFLOAT3 offset   = { 0.11f, -0.20f, 0.47f };
+    XMFLOAT3 offset   = { 0.11f, -0.20f, 0.33f };
     XMFLOAT3 scale    = { 0.15f, 0.15f, 0.30f };
     XMFLOAT3 rotation = { 0.0f, 180.0f, 0.0f };
 };

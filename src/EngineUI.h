@@ -659,6 +659,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::Checkbox("Show Arms", &ArmsModel::Visible());
             ImGui::SameLine();
             ImGui::Checkbox("Hide Head", &ArmsModel::HideHead());
+            ImGui::SameLine();
+            ImGui::Checkbox("Hide Free Hand", &ArmsModel::HideFreeHand());
             // Mirrors the body so the rifle is held in the other hand. Re-solve
             // the alignment after toggling: the grip hand moves across.
             if (ImGui::Checkbox("Mirror", &ArmsModel::MirrorX()))

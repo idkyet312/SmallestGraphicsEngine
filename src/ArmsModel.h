@@ -155,6 +155,13 @@ public:
         return hide;
     }
 
+    // Suppress the wrist and fingers opposite the hand pinned to the weapon.
+    // Default grip uses the rig's left hand, so this hides the rig's right hand.
+    static bool& HideFreeHand() {
+        static bool hide = true;
+        return hide;
+    }
+
     // Play/pause the idle. Held still by default: a moving body is impossible to
     // align a fixed weapon against, because the hands are somewhere different
     // every frame. Get the pose sitting on the gun first, then turn this on.
@@ -204,7 +211,7 @@ public:
             Source().skeleton, RunAnimation(), 0.0f,
             RunBlendWeight() * kProceduralRunStrength,
             PaletteCPU(), &PoseGlobals());
-        if (HideHead()) CollapseHiddenBones();
+        if (HideHead() || HideFreeHand()) CollapseHiddenBones();
     }
 
     // Per-frame palette upload. One buffer per in-flight frame so a palette the
@@ -359,7 +366,7 @@ public:
         FindHiddenBones();
         // Keep the artist-tuned startup Offset. Alignment remains available
         // through the UI for fitting another pose or asset.
-        if (HideHead()) CollapseHiddenBones();
+        if (HideHead() || HideFreeHand()) CollapseHiddenBones();
 
         if (FILE* file = std::fopen("arms_load.log", "w")) {
             size_t triangles = 0, vertices = 0, skinned = 0;
@@ -413,7 +420,7 @@ public:
                          GripBone() >= 0 &&
                              static_cast<size_t>(GripBone()) < Source().skeleton.names.size()
                              ? Source().skeleton.names[GripBone()].c_str() : "none",
-                         HiddenBones().size());
+                         HiddenBones().size() + FreeHandBones().size());
             std::fprintf(file, "bounds x[%.2f..%.2f] y[%.2f..%.2f] z[%.2f..%.2f]\n",
                          s_lo.x, s_hi.x, s_lo.y, s_hi.y, s_lo.z, s_hi.z);
             std::fclose(file);
@@ -524,6 +531,7 @@ public:
     static void RebindGripBone() {
         FindGripBone();
         FindFollowBone();
+        FindHiddenBones();
         AlignHandsToWeapon();
         BindGlobals() = PoseGlobals();
     }
@@ -918,6 +926,10 @@ private:
         static std::vector<int> bones;
         return bones;
     }
+    static std::vector<int>& FreeHandBones() {
+        static std::vector<int> bones;
+        return bones;
+    }
 
     // Zero out the hidden bones' palette entries. A zero matrix sends every
     // vertex weighted to that bone to the origin, collapsing the triangles to
@@ -925,14 +937,23 @@ private:
     // hiding part of a skinned mesh without editing the geometry or splitting
     // the draw. Runs after ComputePalette, so the animation is untouched.
     static void CollapseHiddenBones() {
-        for (int bone : HiddenBones())
-            if (bone >= 0 && static_cast<size_t>(bone) < PaletteCPU().size())
-                PaletteCPU()[bone] = XMFLOAT4X4();   // all zeros
+        const auto collapse = [](const std::vector<int>& bones) {
+            for (int bone : bones)
+                if (bone >= 0 &&
+                    static_cast<size_t>(bone) < PaletteCPU().size())
+                    PaletteCPU()[bone] = XMFLOAT4X4(); // all zeros
+        };
+        if (HideHead()) collapse(HiddenBones());
+        if (HideFreeHand()) collapse(FreeHandBones());
     }
 
     static void FindHiddenBones() {
         HiddenBones().clear();
+        FreeHandBones().clear();
         const Skeleton& skeleton = Source().skeleton;
+        const char* freeWristName =
+            GripUsesLeftHand() ? "righthand" : "lefthand";
+        int freeWrist = -1;
         for (size_t b = 0; b < skeleton.names.size(); ++b) {
             std::string name = skeleton.names[b];
             std::transform(name.begin(), name.end(), name.begin(),
@@ -942,6 +963,29 @@ private:
             // in a hole.
             if (name.find("head") != std::string::npos)
                 HiddenBones().push_back(static_cast<int>(b));
+
+            const size_t colon = name.find_last_of(':');
+            const std::string leaf =
+                colon == std::string::npos ? name : name.substr(colon + 1);
+            if (leaf == freeWristName)
+                freeWrist = static_cast<int>(b);
+        }
+
+        // Include wrist and every descendant, which covers all five fingers
+        // without depending on exporter-specific finger naming.
+        if (freeWrist >= 0) {
+            for (size_t b = 0; b < skeleton.parent.size(); ++b) {
+                int ancestor = static_cast<int>(b);
+                while (ancestor >= 0) {
+                    if (ancestor == freeWrist) {
+                        FreeHandBones().push_back(static_cast<int>(b));
+                        break;
+                    }
+                    if (static_cast<size_t>(ancestor) >= skeleton.parent.size())
+                        break;
+                    ancestor = skeleton.parent[ancestor];
+                }
+            }
         }
     }
 
