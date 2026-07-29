@@ -4,7 +4,7 @@ cbuffer SkyBuffer : register(b0) {
     float3 cameraRight;
     float aspectRatio;
     float3 cameraUp;
-    float time;
+    float environmentRotation;
     float3 sunDirection;
     float exposure;
 };
@@ -34,6 +34,9 @@ float4 main(PSInput input) : SV_Target {
 
     float2 skyUV = float2(atan2(ray.z, ray.x) * 0.159154943 + 0.5,
                           acos(clamp(ray.y, -1.0, 1.0)) * 0.318309886);
+    // DirectX +Y yaw rotates the environment clockwise when viewed from above.
+    // Sampling the source at world longitude + yaw applies that rotation.
+    skyUV.x = frac(skyUV.x + environmentRotation * 0.159154943);
 
     // Pick the mip by how fast longitude changes per pixel. Near the poles a
     // single pixel spans a huge U range, so a coarse mip (whose texels already

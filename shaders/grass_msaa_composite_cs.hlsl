@@ -3,6 +3,7 @@ Texture2DMS<float, 4> grassDepth : register(t1);
 Texture2D<float> sceneDepth : register(t2);
 RWTexture2D<float4> sceneColor : register(u0);
 RWTexture2D<float2> sceneMotion : register(u1);
+RWTexture2D<float> combinedDepth : register(u2);
 
 cbuffer CompositeConstants : register(b0) {
     uint2 outputSize;
@@ -16,6 +17,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
     const float opaqueDepth = sceneDepth.Load(int3(pixel, 0));
     float3 premultipliedGrass = 0.0;
     float coverage = 0.0;
+    float nearestDepth = opaqueDepth;
 
     [unroll]
     for (uint sampleIndex = 0; sampleIndex < 4; ++sampleIndex) {
@@ -26,8 +28,13 @@ void main(uint3 threadId : SV_DispatchThreadID) {
         if (covered) {
             premultipliedGrass += sampleColor.rgb * 0.25;
             coverage += 0.25;
+            nearestDepth = min(nearestDepth, sampleDepth);
         }
     }
+
+    // Fog runs after this pass. Preserve the nearest visible grass sample so
+    // fog integrates only to the blade, not to terrain hidden behind it.
+    combinedDepth[pixel] = nearestDepth;
 
     if (coverage > 0.0) {
         const float3 background = sceneColor[pixel].rgb;

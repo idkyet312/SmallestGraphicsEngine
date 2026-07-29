@@ -43,7 +43,8 @@ public:
                 ID3D12Resource* shadowResource, ID3D12Resource* depthResource,
                 bool multisampledDepth,
                 D3D12_CPU_DESCRIPTOR_HANDLE targetRtv = {},
-                bool hdrTarget = false) {
+                bool hdrTarget = false,
+                bool depthAlreadyReadable = false) {
         if (!initialized || !g_dx12.commandList || !depthResource) return;
         fogTime_ += 1.0f / 60.0f;
         UpdateFrameData(scene, lightSpace, shadowResource, depthResource,
@@ -65,9 +66,10 @@ public:
         Transition(commandList, volume_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-        Transition(commandList, depthResource,
-                   D3D12_RESOURCE_STATE_DEPTH_WRITE,
-                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (!depthAlreadyReadable)
+            Transition(commandList, depthResource,
+                       D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = targetRtv.ptr
             ? targetRtv
             : GetCPUDescriptorHandle(g_dx12.rtvHeap.Get(),
@@ -83,9 +85,10 @@ public:
         BindGraphicsRoots(commandList);
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         commandList->DrawInstanced(3, 1, 0, 0);
-        Transition(commandList, depthResource,
-                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                   D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        if (!depthAlreadyReadable)
+            Transition(commandList, depthResource,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
 
 private:

@@ -12,7 +12,8 @@ public:
     Microsoft::WRL::ComPtr<ID3D12Resource> prefilteredEnvironment;
     Microsoft::WRL::ComPtr<ID3D12Resource> brdfIntegrationLUT;
 
-    bool Init(ID3D12Resource* sourceEnvironment) {
+    bool Init(ID3D12Resource* sourceEnvironment,
+              float environmentRotationRadians = 0.0f) {
         if (!sourceEnvironment || !g_dx12.device || !g_dx12.commandList)
             return false;
         const D3D12_RESOURCE_DESC sourceDesc = sourceEnvironment->GetDesc();
@@ -49,13 +50,14 @@ public:
                 ? static_cast<float>(mip) / static_cast<float>(mipLevels_ - 1)
                 : 0.0f;
             const UINT samples = mip == 0 ? 1u : (mip < 3 ? 64u : 128u);
-            const UINT constants[4] = {
-                width, height, FloatBits(roughness), samples
+            const UINT constants[5] = {
+                width, height, FloatBits(roughness), samples,
+                FloatBits(environmentRotationRadians)
             };
             D3D12_GPU_DESCRIPTOR_HANDLE output = base;
             output.ptr += static_cast<UINT64>(descriptorSize) * (1u + mip);
             list->SetComputeRootDescriptorTable(1, output);
-            list->SetComputeRoot32BitConstants(2, 4, constants, 0);
+            list->SetComputeRoot32BitConstants(2, 5, constants, 0);
             list->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1u);
             D3D12_RESOURCE_BARRIER uav = {};
             uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -68,8 +70,10 @@ public:
         D3D12_GPU_DESCRIPTOR_HANDLE brdf = base;
         brdf.ptr += static_cast<UINT64>(descriptorSize) * (1u + mipLevels_);
         list->SetComputeRootDescriptorTable(0, brdf);
-        const UINT brdfConstants[4] = { BrdfSize, BrdfSize, FloatBits(0.0f), 256u };
-        list->SetComputeRoot32BitConstants(1, 4, brdfConstants, 0);
+        const UINT brdfConstants[5] = {
+            BrdfSize, BrdfSize, FloatBits(0.0f), 256u, FloatBits(0.0f)
+        };
+        list->SetComputeRoot32BitConstants(1, 5, brdfConstants, 0);
         list->Dispatch((BrdfSize + 7u) / 8u, (BrdfSize + 7u) / 8u, 1u);
 
         D3D12_RESOURCE_BARRIER finished[2] = {};
@@ -164,7 +168,7 @@ private:
             params[1].DescriptorTable.pDescriptorRanges = &ranges[1];
             params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
             params[2].Constants.ShaderRegister = 0;
-            params[2].Constants.Num32BitValues = 4;
+            params[2].Constants.Num32BitValues = 5;
             paramCount = 3;
         } else {
             ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -175,7 +179,7 @@ private:
             params[0].DescriptorTable.pDescriptorRanges = &ranges[0];
             params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
             params[1].Constants.ShaderRegister = 0;
-            params[1].Constants.Num32BitValues = 4;
+            params[1].Constants.Num32BitValues = 5;
             paramCount = 2;
         }
 

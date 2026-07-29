@@ -21,6 +21,7 @@ public:
         if (!initialized || width == 0 || height == 0) return false;
         colorTarget_.Reset();
         depthTarget_.Reset();
+        combinedDepth_.Reset();
         width_ = width;
         height_ = height;
         readable_ = true;
@@ -61,7 +62,7 @@ public:
                    ID3D12Resource* sceneDepth) {
         if (!initialized || !sceneColor || !sceneMotion || !sceneDepth) return;
 
-        D3D12_RESOURCE_BARRIER barriers[4] = {};
+        D3D12_RESOURCE_BARRIER barriers[5] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = colorTarget_.Get();
         barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -76,7 +77,11 @@ public:
         barriers[2].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         barriers[3] = barriers[2];
         barriers[3].Transition.pResource = sceneMotion;
-        commandList->ResourceBarrier(4, barriers);
+        barriers[4] = barriers[2];
+        barriers[4].Transition.pResource = combinedDepth_.Get();
+        barriers[4].Transition.StateBefore =
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        commandList->ResourceBarrier(5, barriers);
         readable_ = true;
 
         UpdateDescriptors(sceneColor, sceneMotion, sceneDepth);
@@ -90,17 +95,25 @@ public:
         commandList->SetComputeRoot32BitConstants(1, 2, size, 0);
         commandList->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
 
-        D3D12_RESOURCE_BARRIER uav[2] = {};
-        for (UINT i = 0; i < 2; ++i) {
+        D3D12_RESOURCE_BARRIER uav[3] = {};
+        for (UINT i = 0; i < 3; ++i) {
             uav[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            uav[i].UAV.pResource = i == 0 ? sceneColor : sceneMotion;
+            uav[i].UAV.pResource =
+                i == 0 ? sceneColor :
+                (i == 1 ? sceneMotion : combinedDepth_.Get());
         }
-        commandList->ResourceBarrier(2, uav);
+        commandList->ResourceBarrier(3, uav);
         std::swap(barriers[2].Transition.StateBefore,
                   barriers[2].Transition.StateAfter);
         std::swap(barriers[3].Transition.StateBefore,
                   barriers[3].Transition.StateAfter);
-        commandList->ResourceBarrier(2, &barriers[2]);
+        std::swap(barriers[4].Transition.StateBefore,
+                  barriers[4].Transition.StateAfter);
+        commandList->ResourceBarrier(3, &barriers[2]);
+    }
+
+    ID3D12Resource* GetCombinedDepthResource() const {
+        return combinedDepth_.Get();
     }
 
 private:
@@ -116,7 +129,7 @@ private:
                 &dsv, IID_PPV_ARGS(&dsvHeap_)))) return false;
         D3D12_DESCRIPTOR_HEAP_DESC descriptors = {};
         descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        descriptors.NumDescriptors = 5;
+        descriptors.NumDescriptors = 6;
         descriptors.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         return SUCCEEDED(g_dx12.device->CreateDescriptorHeap(
             &descriptors, IID_PPV_ARGS(&descriptorHeap_)));
@@ -172,6 +185,14 @@ private:
         g_dx12.device->CreateDepthStencilView(
             depthTarget_.Get(), &dsv,
             dsvHeap_->GetCPUDescriptorHandleForHeapStart());
+
+        desc.Format = DXGI_FORMAT_R32_FLOAT;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&combinedDepth_)))) return false;
         readable_ = true;
         return true;
     }
@@ -199,7 +220,7 @@ private:
         ranges[0].BaseShaderRegister = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ranges[1].NumDescriptors = 2;
+        ranges[1].NumDescriptors = 3;
         ranges[1].BaseShaderRegister = 0;
         ranges[1].OffsetInDescriptorsFromTableStart = 3;
         D3D12_ROOT_PARAMETER params[2] = {};
@@ -254,6 +275,10 @@ private:
         handle.ptr += stride;
         uav.Format = DXGI_FORMAT_R16G16_FLOAT;
         g_dx12.device->CreateUnorderedAccessView(sceneMotion, nullptr, &uav, handle);
+        handle.ptr += stride;
+        uav.Format = DXGI_FORMAT_R32_FLOAT;
+        g_dx12.device->CreateUnorderedAccessView(
+            combinedDepth_.Get(), nullptr, &uav, handle);
     }
 
     UINT width_ = 0;
@@ -261,6 +286,7 @@ private:
     bool readable_ = true;
     ComPtr<ID3D12Resource> colorTarget_;
     ComPtr<ID3D12Resource> depthTarget_;
+    ComPtr<ID3D12Resource> combinedDepth_;
     ComPtr<ID3D12DescriptorHeap> rtvHeap_;
     ComPtr<ID3D12DescriptorHeap> dsvHeap_;
     ComPtr<ID3D12DescriptorHeap> descriptorHeap_;

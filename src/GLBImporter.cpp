@@ -516,7 +516,8 @@ ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& fi
     return texture;
 }
 
-std::array<XMFLOAT3, 9> GLBImporter::ComputeSkyIrradianceSH(const std::string& filepath) {
+std::array<XMFLOAT3, 9> GLBImporter::ComputeSkyIrradianceSH(
+    const std::string& filepath, float environmentRotationRadians) {
     std::array<XMFLOAT3, 9> coeffs{};
     for (auto& c : coeffs) c = XMFLOAT3(0, 0, 0);
 
@@ -535,6 +536,8 @@ std::array<XMFLOAT3, 9> GLBImporter::ComputeSkyIrradianceSH(const std::string& f
     double sh[9];
     double weightSum = 0.0;
     double raw[9][3] = {};
+    const double rotationCos = cos(environmentRotationRadians);
+    const double rotationSin = sin(environmentRotationRadians);
 
     for (int y = 0; y < height; ++y) {
         // Equirectangular row -> polar angle theta in [0, pi]; sin(theta) is
@@ -549,8 +552,12 @@ std::array<XMFLOAT3, 9> GLBImporter::ComputeSkyIrradianceSH(const std::string& f
             double u = (x + 0.5) / width;
             double phi = (u - 0.5) * 2.0 * XM_PI;
 
-            double dx = sinTheta * cos(phi);
-            double dz = sinTheta * sin(phi);
+            const double sourceX = sinTheta * cos(phi);
+            const double sourceZ = sinTheta * sin(phi);
+            // Matches XMMatrixRotationY under the engine's row-vector
+            // convention: world = source * rotationY.
+            double dx = sourceX * rotationCos + sourceZ * rotationSin;
+            double dz = -sourceX * rotationSin + sourceZ * rotationCos;
             double dy = cosTheta;
 
             const float* p = &pixels[((size_t)y * width + x) * 4];
@@ -603,7 +610,8 @@ std::array<XMFLOAT3, 9> GLBImporter::ComputeSkyIrradianceSH(const std::string& f
 }
 
 HDRISunLight GLBImporter::ExtractHDRISunLight(const std::string& filepath,
-                                              float targetLuminance) {
+                                              float targetLuminance,
+                                              float environmentRotationRadians) {
     HDRISunLight result;
     float* pixels = nullptr;
     int width = 0, height = 0;
@@ -672,7 +680,10 @@ HDRISunLight GLBImporter::ExtractHDRISunLight(const std::string& filepath,
 
     if (weightSum <= 0.0 || XMVectorGetX(XMVector3LengthSq(directionSum)) < 1e-8f)
         return result;
-    XMStoreFloat3(&result.direction, XMVector3Normalize(directionSum));
+    const XMVECTOR rotatedDirection = XMVector3TransformNormal(
+        XMVector3Normalize(directionSum),
+        XMMatrixRotationY(environmentRotationRadians));
+    XMStoreFloat3(&result.direction, rotatedDirection);
     const float averageR = static_cast<float>(colorR / weightSum);
     const float averageG = static_cast<float>(colorG / weightSum);
     const float averageB = static_cast<float>(colorB / weightSum);

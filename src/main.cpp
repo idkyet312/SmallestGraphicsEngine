@@ -6334,7 +6334,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cerr << "HDRI sky init failed (non-fatal)\n";
     }
     g_skyEnvironmentResource = skyRenderer.skyTexture.Get();
-    if (environmentIBL.Init(g_skyEnvironmentResource)) {
+    if (environmentIBL.Init(
+            g_skyEnvironmentResource, kSkyEnvironmentRotationRadians)) {
         g_specularEnvironmentResource =
             environmentIBL.prefilteredEnvironment.Get();
         g_brdfIntegrationResource = environmentIBL.brdfIntegrationLUT.Get();
@@ -6352,10 +6353,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_mipGen.FlushPending();
     DumpDX12DebugMessages();
     {
-        auto skySH = GLBImporter::ComputeSkyIrradianceSH(kSkyEnvironmentPath);
+        auto skySH = GLBImporter::ComputeSkyIrradianceSH(
+            kSkyEnvironmentPath, kSkyEnvironmentRotationRadians);
         mainShader.SetSkyIrradiance(skySH, 1.0f);
         const HDRISunLight hdriSun =
-            GLBImporter::ExtractHDRISunLight(kSkyEnvironmentPath, 2.1f);
+            GLBImporter::ExtractHDRISunLight(
+                kSkyEnvironmentPath, 2.1f,
+                kSkyEnvironmentRotationRadians);
         if (hdriSun.valid) {
             std::cout << "HDRI sun analyzed (scene defaults retained): direction=("
                       << hdriSun.direction.x << ", "
@@ -8018,12 +8022,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (renderedScene && scene.enableVolumetricFog && volumetricFog.initialized) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Volumetric Fog", g_dx12.commandList.Get());
+            ID3D12Resource* fogDepth =
+                msaaActive ? msaa.GetDepthResource()
+                           : g_dx12.depthStencilBuffer.Get();
+            bool fogDepthMSAA = msaaActive;
+            bool fogDepthAlreadyReadable = false;
+            if (grassMSAAActive && grassMSAA.GetCombinedDepthResource()) {
+                fogDepth = grassMSAA.GetCombinedDepthResource();
+                fogDepthMSAA = false;
+                fogDepthAlreadyReadable = true;
+            }
             volumetricFog.Render(scene, fogLightSpace, fogShadowResource,
-                msaaActive ? msaa.GetDepthResource() : g_dx12.depthStencilBuffer.Get(),
-                msaaActive,
+                fogDepth, fogDepthMSAA,
                 commonHDRValidationTarget ? visBuffer.GetOutputRTV()
                                           : D3D12_CPU_DESCRIPTOR_HANDLE{},
-                commonHDRValidationTarget);
+                commonHDRValidationTarget, fogDepthAlreadyReadable);
         }
 
         if (commonHDRValidationTarget) {

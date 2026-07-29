@@ -9,6 +9,7 @@ cbuffer IBLConstants : register(b0) {
     uint outputHeight;
     float roughness;
     uint sampleCount;
+    float environmentRotation;
 };
 
 static const float PI = 3.14159265359;
@@ -94,9 +95,10 @@ void PrefilterEnvironmentCS(uint3 dispatchThreadID : SV_DispatchThreadID) {
         float sampleSolidAngle = 1.0 / max(float(sampleCount) * pdf, 1e-5);
         float sourceMip = roughness <= 0.001 ? 0.0 :
             max(0.5 * log2(sampleSolidAngle / texelSolidAngle), 0.0);
+        float2 sourceUV = DirectionToEquirectangular(light);
+        sourceUV.x = frac(sourceUV.x + environmentRotation / (2.0 * PI));
         filtered += sourceEnvironment.SampleLevel(
-            environmentSampler, DirectionToEquirectangular(light), sourceMip).rgb *
-            nDotL;
+            environmentSampler, sourceUV, sourceMip).rgb * nDotL;
         totalWeight += nDotL;
     }
 

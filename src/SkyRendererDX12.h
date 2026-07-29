@@ -10,6 +10,7 @@
 // Poly Haven "Kloppenheim 06 (Pure Sky)", CC0.
 inline constexpr const char* kSkyEnvironmentPath =
     "Content/Models/Skyboxes/kloppenheim_06_puresky_2k.exr";
+inline constexpr float kSkyEnvironmentRotationRadians = XM_PIDIV2;
 
 struct alignas(256) SkyBufferDX12 {
     XMFLOAT3 cameraForward;
@@ -17,7 +18,7 @@ struct alignas(256) SkyBufferDX12 {
     XMFLOAT3 cameraRight;
     float aspectRatio;
     XMFLOAT3 cameraUp;
-    float time;
+    float environmentRotation;
     XMFLOAT3 sunDirection;
     float exposure;
 };
@@ -161,7 +162,7 @@ public:
         XMStoreFloat3(&data.cameraUp, up);
         data.tanHalfFov = tanf(XMConvertToRadians(fovDegrees) * 0.5f);
         data.aspectRatio = (float)g_dx12.screenWidth / (float)g_dx12.screenHeight;
-        data.time = time;
+        data.environmentRotation = kSkyEnvironmentRotationRadians;
         XMVECTOR sun = XMVector3Normalize(XMLoadFloat3(&lightDirection));
         XMStoreFloat3(&data.sunDirection, sun);
         data.exposure = 1.32f;
