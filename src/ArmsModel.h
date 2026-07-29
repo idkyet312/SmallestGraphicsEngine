@@ -31,10 +31,12 @@
 #include "DX12Core.h"
 #include "GLBImporter.h"
 #include "MeshShaderDX12.h"
+#include "ProceduralRunAnimation.h"
 #include "ShaderDX12.h"
 #include "SkinnedFBXImporter.h"
 #include <DirectXMath.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <filesystem>
@@ -76,6 +78,12 @@ public:
     // arms actually sit correctly at on the weapon.
     static XMFLOAT3& Offset() {
         static XMFLOAT3 offset = { -0.261f, 0.019f, -0.171f };
+        return offset;
+    }
+    // Extra run-only pull toward the camera. Positive values move the animated
+    // arms backwards along the gun's local Z axis without disturbing idle.
+    static float& RunBackOffset() {
+        static float offset = 0.0f;
         return offset;
     }
     static float& Scale() {
@@ -126,12 +134,13 @@ public:
         const XMFLOAT3& rotation = Rotation();
         const float scale = Scale() * NormaliseScale();
         const float mirror = MirrorX() ? -1.0f : 1.0f;
+        const float runBack = RunBlendWeight() * RunBackOffset();
         return XMMatrixTranslation(-Pivot().x, -Pivot().y, -Pivot().z) *
                XMMatrixRotationRollPitchYaw(XMConvertToRadians(rotation.x),
                                             XMConvertToRadians(rotation.y),
                                             XMConvertToRadians(rotation.z)) *
                XMMatrixScaling(scale * mirror, scale, scale) *
-               XMMatrixTranslation(offset.x, offset.y, offset.z);
+               XMMatrixTranslation(offset.x, offset.y, offset.z - runBack);
     }
 
     // Hide the character's own head. The camera sits at the eyes, so the skull
@@ -162,18 +171,39 @@ public:
         return time;
     }
 
-    // Advance the idle clip. Called once per frame from the main loop.
-    static void Update(float deltaTime) {
+    // Horizontal speed where the additive run layer reaches full strength.
+    // Zero makes any actual movement drive the layer to full strength.
+    static float& RunSpeedThreshold() {
+        static float speed = 0.0f;
+        return speed;
+    }
+
+    static float& RunBlendWeight() {
+        static float weight = 0.0f;
+        return weight;
+    }
+
+    static bool Running() { return RunBlendWeight() >= 0.5f; }
+
+    // Idle remains the base pose. Run supplies only motion relative to its first
+    // frame, blended smoothly by player speed.
+    static void Update(float deltaTime, float playerHorizontalSpeed = 0.0f) {
         if (!Loaded()) return;
+        UpdateRunBlend(deltaTime, playerHorizontalSpeed);
         if (Animate()) {
             Animation().Advance(deltaTime);
+            if (RunAnimation().clip && RunBlendWeight() > 0.0001f)
+                RunAnimation().Advance(deltaTime);
         } else {
             // Re-sampling every frame costs little and keeps the pose live while
             // PoseTime is dragged in the UI.
             Animation().time = PoseTime();
+            RunAnimation().time = 0.0f;
         }
-        Animation().ComputePalette(Source().skeleton, PaletteCPU());
-        Animation().ComputeGlobalMatrices(Source().skeleton, PoseGlobals());
+        Animation().ComputeAdditivePalette(
+            Source().skeleton, RunAnimation(), 0.0f,
+            RunBlendWeight() * kProceduralRunStrength,
+            PaletteCPU(), &PoseGlobals());
         if (HideHead()) CollapseHiddenBones();
     }
 
@@ -294,7 +324,8 @@ public:
         if (Source().clips.empty()) {
             std::cerr << "FPS view model has no animation clip\n";
         }
-
+        ProceduralRunClip() =
+            ProceduralRunAnimation::Build(Source().skeleton);
         DropUnskinnedPrimitives();
         ApplyEmbeddedTextures();
         if (!CreatePaletteBuffers()) {
@@ -304,10 +335,17 @@ public:
 
         // Pose first, THEN measure. Normalise() reads joint positions out of
         // PoseGlobals, so the clip has to be sampled before it runs.
-        if (const AnimationClip* clip = RichestClip()) Animation().Play(clip);
+        if (const AnimationClip* clip = IdleClip()) Animation().Play(clip);
+        if (const AnimationClip* clip = RunClip()) {
+            RunAnimation().Play(clip);
+            RunAnimation().loopBlendDuration = 0.08f;
+        }
         Animation().time = PoseTime();
-        Animation().ComputePalette(Source().skeleton, PaletteCPU());
-        Animation().ComputeGlobalMatrices(Source().skeleton, PoseGlobals());
+        RunAnimation().time = 0.0f;
+        RunBlendWeight() = 0.0f;
+        Animation().ComputeAdditivePalette(
+            Source().skeleton, RunAnimation(), 0.0f, 0.0f,
+            PaletteCPU(), &PoseGlobals());
 
         // The reference pose the weapon's motion is measured against. Captured
         // from the same frame the body was aligned at, so at that frame the
@@ -394,6 +432,10 @@ public:
     }
 
     static AnimationInstance& Animation() {
+        static AnimationInstance animation;
+        return animation;
+    }
+    static AnimationInstance& RunAnimation() {
         static AnimationInstance animation;
         return animation;
     }
@@ -528,8 +570,48 @@ private:
     // The AK is normalised to a 1.25 barrel, so an arm a little over half that
     // reads correctly against the weapon.
     static constexpr float kArmLength = 0.72f;
-
+    static constexpr float kProceduralRunStrength = 1.0f / 3.0f;
     static std::string Resolve(const std::string& rel) { return ResolvePath(rel); }
+
+    static const AnimationClip* IdleClip() {
+        if (const AnimationClip* clip =
+                Source().FindClip("Rifle Aiming Idle(1)"))
+            return clip;
+        return RichestClip();
+    }
+
+    static const AnimationClip* RunClip() {
+        return ProceduralRunClip().tracks.empty()
+            ? nullptr : &ProceduralRunClip();
+    }
+
+    static AnimationClip& ProceduralRunClip() {
+        static AnimationClip clip;
+        return clip;
+    }
+
+    static void UpdateRunBlend(float deltaTime, float horizontalSpeed) {
+        if (!RunAnimation().clip) {
+            RunBlendWeight() = 0.0f;
+            return;
+        }
+
+        const float fullSpeed = (std::max)(0.01f, RunSpeedThreshold());
+        const float blendStart = fullSpeed * 0.85f;
+        float target = (horizontalSpeed - blendStart) /
+                       (fullSpeed - blendStart);
+        target = (std::max)(0.0f, (std::min)(1.0f, target));
+        target = target * target * (3.0f - 2.0f * target);
+
+        const bool wasActive = RunBlendWeight() > 0.0001f;
+        const float response =
+            1.0f - std::exp(-10.0f * (std::max)(0.0f, deltaTime));
+        RunBlendWeight() += (target - RunBlendWeight()) * response;
+        if (std::abs(RunBlendWeight() - target) < 0.0001f)
+            RunBlendWeight() = target;
+        if (!wasActive && RunBlendWeight() > 0.0001f)
+            RunAnimation().time = 0.0f;
+    }
 
     // Pick the clip that actually animates.
     //

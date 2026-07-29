@@ -16,8 +16,6 @@ struct PrefabCollider {
     float yawRadians = 0.0f;
 };
 
-extern std::vector<PrefabCollider> g_prefabColliders;
-
 inline DirectX::XMFLOAT3 PrefabColliderToLocal(
     const PrefabCollider& collider, const DirectX::XMFLOAT3& point) {
     const float cosine = std::cos(-collider.yawRadians);

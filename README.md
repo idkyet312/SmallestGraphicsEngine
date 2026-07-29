@@ -152,6 +152,22 @@ src/
   ShadowMapDX12.h           directional shadow pass
   MeshShaderDX12.h          meshlet rendering and occlusion
   TerrainRendererDX12.h     mesh-shader terrain
+  RuntimeWorld.h            active level, terrain, and prefab runtime ownership
+  LevelRuntimeBuilder.h     authored-level to gameplay spawn/settings plan
+  GameSession.h             screen lifecycle and level timer
+  CombatSystem.h            prefab damage and combat interaction state
+  EnemySystem.h             enemy roster and encounter cooldown state
+  VehicleSystem.h           Humvee and helicopter state/damage rules
+  GameSystems.h             compatibility umbrella for game systems
+  GameRuntime.h             game composition root and shared lifecycle
+  GameCommandQueue.h        typed cross-frame gameplay/editor commands
+  LevelLoadingController.h  level-loading state machine and telemetry
+  PlayerState.h             player health, regeneration, ammo, and reload state
+  PlayerMovementTracker.h   horizontal locomotion speed and teleport filtering
+  AnimationClipUtils.h      cross-clip translation-origin normalization
+  FixedStepClock.h          bounded fixed-step destruction/physics clock
+  RenderCoordinator.h       forward/visibility/DXR path policy
+  DeferredReleaseQueue.h    fence-based GPU resource retirement
   DestructionDX12.*         Blast destruction and physics integration
   GLBImporter.*             glTF loading, textures, meshlets, scene merging
   FBXImporter.*             Assimp-backed FBX loading
@@ -175,8 +191,9 @@ CMakeLists.txt              DX12/DX11 targets and asset-copy rules
 
 - Windows-only
 - Main frame command recording is single-threaded
-- No automated test suite or CI configuration
-- Scene state is not serialized
+- Most gameplay functions still live in `main.cpp`; state ownership is separated first
+- Runtime/render integration coverage remains limited; data and world-state tests exist
+- Transient gameplay state is not serialized
 - Renderer uses shared global DX12 state
 - DX11 path lags behind DX12
 - Experimental features depend on GPU capability and driver support

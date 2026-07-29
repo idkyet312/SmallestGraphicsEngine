@@ -34,29 +34,32 @@ int main() {
     std::filesystem::create_directories(root);
     const auto previous = std::filesystem::current_path();
     std::filesystem::current_path(root);
-    Write("models/props/crate.glb", "model bytes");
-    Write("models/props/crate_copy.glb", "model bytes");
-    std::filesystem::last_write_time("models/props/crate_copy.glb",
-        std::filesystem::last_write_time("models/props/crate.glb"));
-    Write("models/props/albedo map.png", "not a real png");
-    Write("models/props/unreferenced.png", "not a real png");
-    Write("models/props/textured.gltf", TexturedGltf("albedo%20map.png"));
-    Write("models/props/missing_texture.gltf", TexturedGltf("missing.png"));
+    Write("Content/Models/props/crate.glb", "model bytes");
+    Write("Content/Models/props/crate_copy.glb", "model bytes");
+    std::filesystem::last_write_time("Content/Models/props/crate_copy.glb",
+        std::filesystem::last_write_time("Content/Models/props/crate.glb"));
+    Write("Content/Models/props/albedo map.png", "not a real png");
+    Write("Content/Models/props/unreferenced.png", "not a real png");
+    Write("Content/Models/props/textured.gltf", TexturedGltf("albedo%20map.png"));
+    Write("Content/Models/props/missing_texture.gltf", TexturedGltf("missing.png"));
 
     AssetRegistry registry;
     CHECK(registry.Refresh());
-    const AssetRecord* model = registry.FindPath("models/props/crate.glb");
+    const AssetRecord* model = registry.FindPath("Content/Models/props/crate.glb");
     CHECK(model != nullptr);
     const std::string guid = model ? model->guid : "";
     CHECK(!guid.empty());
-    const AssetRecord* copy = registry.FindPath("models/props/crate_copy.glb");
+    const AssetRecord* copy = registry.FindPath(
+        "Content/Models/props/crate_copy.glb");
     CHECK(copy != nullptr);
     if (copy) CHECK(copy->guid != guid);
     CHECK(std::filesystem::exists("assetcache/registry.json"));
-    const AssetRecord* albedo = registry.FindPath("models/props/albedo map.png");
+    const AssetRecord* albedo = registry.FindPath(
+        "Content/Models/props/albedo map.png");
     const AssetRecord* unreferenced = registry.FindPath(
-        "models/props/unreferenced.png");
-    const AssetRecord* textured = registry.FindPath("models/props/textured.gltf");
+        "Content/Models/props/unreferenced.png");
+    const AssetRecord* textured = registry.FindPath(
+        "Content/Models/props/textured.gltf");
     CHECK(albedo != nullptr);
     CHECK(unreferenced != nullptr);
     CHECK(textured != nullptr);
@@ -67,51 +70,57 @@ int main() {
                         unreferenced->guid) == textured->dependencies.end());
     }
     const AssetRecord* missingTexture = registry.FindPath(
-        "models/props/missing_texture.gltf");
+        "Content/Models/props/missing_texture.gltf");
     CHECK(missingTexture != nullptr);
     if (missingTexture) CHECK(std::find(missingTexture->missingDependencies.begin(),
         missingTexture->missingDependencies.end(),
-        "models/props/missing.png") != missingTexture->missingDependencies.end());
+        "Content/Models/props/missing.png") !=
+        missingTexture->missingDependencies.end());
 
-    Write("prefabs/crate.json", std::string(R"({"schemaVersion":2,
-      "id":"crate","components":{"staticMesh":{"path":"models/props/crate.glb",
+    Write("Content/Prefabs/crate.json", std::string(R"({"schemaVersion":2,
+      "id":"crate","components":{"staticMesh":{"path":"Content/Models/props/crate.glb",
       "assetGuid":")") + guid + R"("}}})");
     CHECK(registry.Refresh());
-    const AssetRecord* prefab = registry.FindPath("prefabs/crate.json");
+    const AssetRecord* prefab = registry.FindPath("Content/Prefabs/crate.json");
     CHECK(prefab != nullptr);
     if (prefab) CHECK(std::find(prefab->dependencies.begin(),
         prefab->dependencies.end(), guid) != prefab->dependencies.end());
-    Write("levels/dependency_chain.json", R"({"schemaVersion":1,
+    Write("Content/Levels/dependency_chain.json", R"({"schemaVersion":1,
       "name":"Dependency Chain","entities":[{"id":1,"type":"prefab",
       "name":"Crate","prefabId":"crate","transform":{
       "position":[0,0,0],"rotation":[0,0,0],"scale":[1,1,1]}}]})");
     CHECK(registry.Refresh());
-    prefab = registry.FindPath("prefabs/crate.json");
-    const AssetRecord* level = registry.FindPath("levels/dependency_chain.json");
+    prefab = registry.FindPath("Content/Prefabs/crate.json");
+    const AssetRecord* level = registry.FindPath(
+        "Content/Levels/dependency_chain.json");
     CHECK(prefab != nullptr);
     CHECK(level != nullptr);
     if (prefab && level) CHECK(std::find(level->dependencies.begin(),
         level->dependencies.end(), prefab->guid) != level->dependencies.end());
 
-    Write("prefabs/missing.json", R"({"schemaVersion":2,
+    Write("Content/Prefabs/missing.json", R"({"schemaVersion":2,
       "id":"missing","components":{"staticMesh":{
-      "path":"models/props/not_here.glb"}}})");
+      "path":"Content/Models/props/not_here.glb"}}})");
     CHECK(registry.Refresh());
-    const AssetRecord* missing = registry.FindPath("prefabs/missing.json");
+    const AssetRecord* missing = registry.FindPath(
+        "Content/Prefabs/missing.json");
     CHECK(missing != nullptr);
     if (missing) CHECK(std::find(missing->missingDependencies.begin(),
-        missing->missingDependencies.end(), "models/props/not_here.glb") !=
+        missing->missingDependencies.end(),
+        "Content/Models/props/not_here.glb") !=
         missing->missingDependencies.end());
 
-    std::filesystem::remove("models/props/crate_copy.glb");
+    std::filesystem::remove("Content/Models/props/crate_copy.glb");
     CHECK(registry.Refresh());
-    std::filesystem::rename("models/props/crate.glb", "models/props/crate_renamed.glb");
+    std::filesystem::rename("Content/Models/props/crate.glb",
+                            "Content/Models/props/crate_renamed.glb");
     CHECK(registry.Refresh());
-    const AssetRecord* renamed = registry.FindPath("models/props/crate_renamed.glb");
+    const AssetRecord* renamed = registry.FindPath(
+        "Content/Models/props/crate_renamed.glb");
     CHECK(renamed != nullptr);
     if (renamed) CHECK(renamed->guid == guid);
 
-    std::filesystem::remove("models/props/crate_renamed.glb");
+    std::filesystem::remove("Content/Models/props/crate_renamed.glb");
     CHECK(registry.Refresh());
     CHECK(registry.FindGuid(guid) == nullptr);
 

@@ -226,14 +226,14 @@ inline void RenderPlayerHUD(const Scene& scene) {
                       IM_COL32(145, 255, 170, lineAlpha), zoomLabel);
     }
 
-    if (scene.playerGodMode) {
+    if (scene.player.godMode) {
         const char* god = "GOD MODE";
         const ImVec2 size = ImGui::CalcTextSize(god);
         draw->AddText(ImVec2((io.DisplaySize.x - size.x) * 0.5f, 24.0f),
                       IM_COL32(255, 220, 65, 245), god);
     }
 
-    if (scene.playerHealth > 0.0f && scene.sniperScopeBlend < 0.25f) {
+    if (scene.player.health > 0.0f && scene.sniperScopeBlend < 0.25f) {
         const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
         constexpr float gap = 3.0f;
         constexpr float arm = 5.0f;
@@ -258,14 +258,15 @@ inline void RenderPlayerHUD(const Scene& scene) {
     }
 
     // Brief red hit flash. Draw first so HUD stays readable above it.
-    if (scene.playerDamageFlash > 0.0f) {
-        const float alpha = (std::min)(0.32f, scene.playerDamageFlash * 1.35f);
+    if (scene.player.damageFlash > 0.0f) {
+        const float alpha = (std::min)(0.32f, scene.player.damageFlash * 1.35f);
         draw->AddRectFilled(ImVec2(0.0f, 0.0f), io.DisplaySize,
                             ImGui::GetColorU32(ImVec4(0.75f, 0.0f, 0.0f, alpha)));
     }
 
-    const float maxHealth = (std::max)(1.0f, scene.playerMaxHealth);
-    const float fraction = (std::max)(0.0f, (std::min)(1.0f, scene.playerHealth / maxHealth));
+    const float maxHealth = (std::max)(1.0f, scene.player.maxHealth);
+    const float fraction = (std::max)(
+        0.0f, (std::min)(1.0f, scene.player.health / maxHealth));
     const ImVec2 min(24.0f, io.DisplaySize.y - 52.0f);
     const ImVec2 max(min.x + 270.0f, min.y + 26.0f);
     const ImVec2 fillMax(min.x + (max.x - min.x) * fraction, max.y);
@@ -279,7 +280,8 @@ inline void RenderPlayerHUD(const Scene& scene) {
     draw->AddRect(min, max, IM_COL32(255, 255, 255, 210), 2.0f, 0, 1.5f);
 
     char label[48];
-    snprintf(label, sizeof(label), "HEALTH  %.0f / %.0f", scene.playerHealth, maxHealth);
+    snprintf(label, sizeof(label), "HEALTH  %.0f / %.0f",
+             scene.player.health, maxHealth);
     const ImVec2 textSize = ImGui::CalcTextSize(label);
     draw->AddText(ImVec2(min.x + ((max.x - min.x) - textSize.x) * 0.5f,
                          min.y + ((max.y - min.y) - textSize.y) * 0.5f),
@@ -291,15 +293,15 @@ inline void RenderPlayerHUD(const Scene& scene) {
     // to show, so the HUD stays exactly as it was there.
     if (scene.AmmoEnforced()) {
         const int slot = GunModel::SelectedWeapon();
-        const int inMag = scene.magazine[slot];
-        const int spare = scene.reserve[slot];
+        const int inMag = scene.player.magazine[slot];
+        const int spare = scene.player.reserve[slot];
         char ammo[64];
         if (scene.Reloading())
             snprintf(ammo, sizeof(ammo), "RELOADING...");
         else
             snprintf(ammo, sizeof(ammo), "%d / %d", inMag, spare);
         // Red when the magazine is dry, amber at a quarter left, else white.
-        const int magSize = (std::max)(1, scene.magazineSize[slot]);
+        const int magSize = (std::max)(1, scene.player.magazineSize[slot]);
         ImU32 tint = IM_COL32(255, 255, 255, 255);
         if (!scene.Reloading() && inMag == 0)
             tint = IM_COL32(255, 70, 55, 255);
@@ -325,7 +327,7 @@ inline void RenderPlayerHUD(const Scene& scene) {
         }
     }
 
-    if (scene.playerHealth <= 0.0f) {
+    if (scene.player.health <= 0.0f) {
         const char* dead = "YOU DIED";
         const ImVec2 deadSize = ImGui::CalcTextSize(dead);
         draw->AddText(ImVec2((io.DisplaySize.x - deadSize.x) * 0.5f,
@@ -367,7 +369,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 g_destruction.GetRenderBatches().size(),
                 g_destruction.GetRenderItems().size(),
                 g_destruction.IsBatchBuildPending() ? "building" : "idle");
-    ImGui::Checkbox("God Mode", &scene.playerGodMode);
+    ImGui::Checkbox("God Mode", &scene.player.godMode);
     const StaticBufferStatsDX12 staticStats = GetStaticBufferStatsDX12();
     ImGui::Text("GPU-local static buffers: %u  %.1f MiB  Pending: %u",
                 staticStats.resources, staticStats.bytes / (1024.0 * 1024.0),
@@ -690,7 +692,17 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             // moment of the clip to align to, then enable Animate.
             ImGui::Checkbox("Animate", &ArmsModel::Animate());
             ImGui::SameLine();
-            ImGui::Text("t=%.2fs", ArmsModel::Animation().time);
+            ImGui::Text("IDLE + RUN %.0f%%  t=%.2fs",
+                ArmsModel::RunBlendWeight() * 100.0f,
+                ArmsModel::RunAnimation().time);
+            ImGui::DragFloat("Full Run Speed",
+                &ArmsModel::RunSpeedThreshold(), 0.1f, 0.0f, 30.0f,
+                "%.1f m/s");
+            ImGui::SliderFloat("Run Loop Blend",
+                &ArmsModel::RunAnimation().loopBlendDuration,
+                0.0f, 0.5f, "%.2f s");
+            ImGui::SliderFloat("Run Back Offset",
+                &ArmsModel::RunBackOffset(), 0.0f, 1.5f, "%.2f");
             if (!ArmsModel::Animate()) {
                 const float duration = ArmsModel::Animation().clip
                     ? ArmsModel::Animation().clip->duration : 1.0f;
@@ -773,9 +785,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     ImGui::Separator();
-    ImGui::TextColored(scene.playerHealth > 30.0f ? ImVec4(0.3f, 1.0f, 0.35f, 1.0f)
+    ImGui::TextColored(scene.player.health > 30.0f ? ImVec4(0.3f, 1.0f, 0.35f, 1.0f)
                                                    : ImVec4(1.0f, 0.2f, 0.12f, 1.0f),
-                       "Health: %.0f / %.0f", scene.playerHealth, scene.playerMaxHealth);
+                       "Health: %.0f / %.0f",
+                       scene.player.health, scene.player.maxHealth);
     ImGui::SameLine();
     if (ImGui::SmallButton("Restore")) scene.RestorePlayerHealth();
     ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);

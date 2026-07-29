@@ -62,7 +62,6 @@ extern UINT g_dxrDDGICellCount;
 extern UINT g_dxrDDGIIndexCount;
 extern float g_dxrDDGICellSize;
 extern DDGIRendererDX12 g_ddgiRenderer;
-extern DirectX::XMFLOAT3 g_helicopterPosition;
 extern bool g_stressTestMode;
 extern bool g_emptyLevelMode;
 DirectX::XMMATRIX HumveeWorldMatrix();
@@ -831,6 +830,7 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
 
 // Render the whole scene using the forward clustered path
 inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffers& geo,
+                           const std::vector<PrefabRenderBatch>& prefabRenderBatches,
                            const std::shared_ptr<SceneNode>& crateModel = nullptr,
                            const std::shared_ptr<SceneMaterial>& floorMaterial = nullptr,
                            XMMATRIX lightSpace = XMMatrixIdentity(),
@@ -1246,7 +1246,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
     }
 
-    for (const PrefabRenderBatch& batch : g_prefabRenderBatches) {
+    for (const PrefabRenderBatch& batch : prefabRenderBatches) {
         if (!batch.model) continue;
         for (const XMMATRIX& transform : batch.transforms)
             DrawSceneNode(batch.model, shader, transform,

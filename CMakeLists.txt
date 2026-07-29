@@ -80,6 +80,7 @@ include_directories(${CMAKE_SOURCE_DIR}/src)
 # Header files (for IDE support)
 set(HEADER_FILES
     src/CameraDX12.h
+    src/AnimationClipUtils.h
     src/ClusteredRenderer.h
     src/ClusteredRendererDX11.h
     src/ClusteredRendererDX12.h
@@ -92,6 +93,21 @@ set(HEADER_FILES
     src/PrefabRegistry.h
     src/PrefabRuntime.h
     src/PrefabColliders.h
+    src/RuntimeWorld.h
+    src/GameSession.h
+    src/FixedStepClock.h
+    src/RenderCoordinator.h
+    src/LevelRuntimeBuilder.h
+    src/GameSystems.h
+    src/CombatSystem.h
+    src/EnemySystem.h
+    src/VehicleSystem.h
+    src/GameRuntime.h
+    src/GameCommandQueue.h
+    src/LevelLoadingController.h
+    src/PlayerState.h
+    src/PlayerMovementTracker.h
+    src/DeferredReleaseQueue.h
     src/AssetRegistry.h
     src/AssetWatcher.h
     src/PrefabThumbnailGenerator.h
@@ -255,6 +271,7 @@ if(USE_DX12)
         src/DestructionDX12.cpp
         src/LevelDefinition.cpp
         src/LevelEditor.cpp
+        src/CombatSystem.cpp
         src/PrefabRegistry.cpp
         src/AssetRegistry.cpp
         src/AssetWatcher.cpp
@@ -306,6 +323,21 @@ if(BUILD_TESTING)
     target_link_libraries(LevelDefinitionTests PRIVATE nlohmann_json::nlohmann_json)
     add_test(NAME LevelDefinitionTests COMMAND LevelDefinitionTests)
 
+    add_executable(RuntimeWorldTests
+        tests/RuntimeWorldTests.cpp
+        src/LevelDefinition.cpp)
+    target_include_directories(RuntimeWorldTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(RuntimeWorldTests PRIVATE nlohmann_json::nlohmann_json)
+    add_test(NAME RuntimeWorldTests COMMAND RuntimeWorldTests)
+
+    add_executable(GameArchitectureTests
+        tests/GameArchitectureTests.cpp
+        src/CombatSystem.cpp
+        src/LevelDefinition.cpp)
+    target_include_directories(GameArchitectureTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(GameArchitectureTests PRIVATE nlohmann_json::nlohmann_json)
+    add_test(NAME GameArchitectureTests COMMAND GameArchitectureTests)
+
     add_executable(PrefabRegistryTests
         tests/PrefabRegistryTests.cpp
         src/PrefabRegistry.cpp)
@@ -351,7 +383,9 @@ endif()
 if(MSVC)
     # Compile independent translation units concurrently. Especially useful
     # after header changes that invalidate main.cpp and renderer sources.
-    target_compile_options(GraphicEngine PRIVATE /MP)
+    # /bigobj keeps Debug builds viable while the gameplay monolith is moved
+    # incrementally behind RuntimeWorld.
+    target_compile_options(GraphicEngine PRIVATE /MP /bigobj)
 endif()
 
 # Group files in IDE

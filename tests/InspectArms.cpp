@@ -82,12 +82,23 @@ int main(int argc, char** argv) {
                     clip->mTicksPerSecond, clip->mNumChannels);
         // The channel names must match the bone names the mesh is skinned to,
         // or the clip drives nothing and every vertex keeps its bind transform.
-        for (unsigned c = 0; c < clip->mNumChannels && c < 8; ++c)
+        for (unsigned c = 0; c < clip->mNumChannels && c < 8; ++c) {
             std::printf("    channel[%u] '%s' pos=%u rot=%u scale=%u\n", c,
                         clip->mChannels[c]->mNodeName.C_Str(),
                         clip->mChannels[c]->mNumPositionKeys,
                         clip->mChannels[c]->mNumRotationKeys,
                         clip->mChannels[c]->mNumScalingKeys);
+            if (clip->mChannels[c]->mNumPositionKeys > 0) {
+                const aiVector3D& first =
+                    clip->mChannels[c]->mPositionKeys[0].mValue;
+                const aiVector3D& last = clip->mChannels[c]->mPositionKeys[
+                    clip->mChannels[c]->mNumPositionKeys - 1].mValue;
+                std::printf("        position first=(%.3f, %.3f, %.3f)"
+                            " last=(%.3f, %.3f, %.3f)\n",
+                            first.x, first.y, first.z,
+                            last.x, last.y, last.z);
+            }
+        }
     }
 
     if (raw && scene->mNumMeshes > 0 && scene->mNumAnimations > 0) {

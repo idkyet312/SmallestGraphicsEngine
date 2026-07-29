@@ -6,6 +6,7 @@
 #include "SkinnedTypes.h"
 #include <DirectXMath.h>
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 class AnimationInstance {
@@ -13,6 +14,10 @@ public:
     const AnimationClip* clip = nullptr;
     float time = 0.0f;
     bool  loop = true;
+    // Seconds blended on each side of the loop seam. Zero preserves exact clip
+    // sampling. Non-zero crossfades the outgoing and incoming cycle so clips
+    // whose last pose differs from their first do not snap at fmod().
+    float loopBlendDuration = 0.0f;
 
     void Play(const AnimationClip* c) { clip = c; time = 0.0f; }
     void Advance(float dt) {
@@ -44,6 +49,104 @@ public:
             // Transpose of Assimp's column-vector formula:
             // inverseRoot * globalBone * inverseBind.
             const XMMATRIX skinMat = XMLoadFloat4x4(&skel.offset[b]) * globalScratch_[b] * globalInverse;
+            XMStoreFloat4x4(&palette[b], XMMatrixTranspose(skinMat));
+        }
+    }
+
+    // Layers only the motion in `additive` over this base animation. The
+    // additive clip's reference frame is subtracted per bone, so different
+    // authored origins and rest poses never replace or displace the base pose.
+    // Weight zero is exactly the base clip; weight one is base plus the full
+    // additive motion.
+    void ComputeAdditivePalette(
+        const Skeleton& skel, const AnimationInstance& additive,
+        float additiveReferenceTime, float weight,
+        std::vector<DirectX::XMFLOAT4X4>& palette,
+        std::vector<DirectX::XMFLOAT4X4>* modelMatrices = nullptr) const {
+        using namespace DirectX;
+        const size_t n = skel.BoneCount();
+        EnsureCache(skel);
+        additive.EnsureCache(skel);
+        palette.resize(n);
+        if (modelMatrices) modelMatrices->resize(n);
+        weight = (std::max)(0.0f, (std::min)(1.0f, weight));
+
+        for (size_t b = 0; b < n; ++b) {
+            XMMATRIX baseLocal = XMLoadFloat4x4(&skel.localBind[b]);
+            if (const BoneTrack* tr = trackByBone_[b])
+                baseLocal = SampleTrack(*tr, b);
+
+            XMMATRIX additiveLocal = XMLoadFloat4x4(&skel.localBind[b]);
+            XMMATRIX referenceLocal = additiveLocal;
+            if (const BoneTrack* tr = additive.trackByBone_[b]) {
+                additiveLocal = additive.SampleTrack(*tr, b);
+                referenceLocal =
+                    additive.SampleTrackAt(*tr, b, additiveReferenceTime);
+            }
+
+            XMVECTOR baseScale, baseRotation, baseTranslation;
+            XMVECTOR addScale, addRotation, addTranslation;
+            XMVECTOR refScale, refRotation, refTranslation;
+            if (!XMMatrixDecompose(&baseScale, &baseRotation, &baseTranslation,
+                                   baseLocal)) {
+                baseScale = XMVectorSplatOne();
+                baseRotation = XMQuaternionIdentity();
+                baseTranslation = XMVectorZero();
+            }
+            if (!XMMatrixDecompose(&addScale, &addRotation, &addTranslation,
+                                   additiveLocal) ||
+                !XMMatrixDecompose(&refScale, &refRotation, &refTranslation,
+                                   referenceLocal)) {
+                addScale = refScale = XMVectorSplatOne();
+                addRotation = refRotation = XMQuaternionIdentity();
+                addTranslation = refTranslation = XMVectorZero();
+            }
+
+            // Translation and scale use value deltas. Rotation uses the matrix
+            // delta reference^-1 * current, then blends that delta from identity
+            // before composing it after the base rotation.
+            const XMVECTOR translation = XMVectorAdd(
+                baseTranslation,
+                XMVectorScale(XMVectorSubtract(addTranslation, refTranslation),
+                              weight));
+            const XMVECTOR scale = XMVectorAdd(
+                baseScale,
+                XMVectorScale(XMVectorSubtract(addScale, refScale), weight));
+
+            const XMMATRIX deltaRotationMatrix =
+                XMMatrixTranspose(XMMatrixRotationQuaternion(refRotation)) *
+                XMMatrixRotationQuaternion(addRotation);
+            XMVECTOR ignoredScale, deltaRotation, ignoredTranslation;
+            if (!XMMatrixDecompose(&ignoredScale, &deltaRotation,
+                                   &ignoredTranslation, deltaRotationMatrix))
+                deltaRotation = XMQuaternionIdentity();
+            const XMVECTOR weightedDelta = XMQuaternionSlerp(
+                XMQuaternionIdentity(), XMQuaternionNormalize(deltaRotation),
+                weight);
+            const XMMATRIX combinedRotationMatrix =
+                XMMatrixRotationQuaternion(baseRotation) *
+                XMMatrixRotationQuaternion(weightedDelta);
+            XMVECTOR rotation;
+            if (!XMMatrixDecompose(&ignoredScale, &rotation,
+                                   &ignoredTranslation,
+                                   combinedRotationMatrix))
+                rotation = baseRotation;
+
+            const XMMATRIX local = XMMatrixAffineTransformation(
+                scale, XMVectorZero(), XMQuaternionNormalize(rotation),
+                translation);
+            const int parent = skel.parent[b];
+            globalScratch_[b] = parent < 0
+                ? local : XMMatrixMultiply(local, globalScratch_[parent]);
+        }
+
+        const XMMATRIX globalInverse = XMLoadFloat4x4(&skel.globalInverse);
+        for (size_t b = 0; b < n; ++b) {
+            const XMMATRIX modelSpace = globalScratch_[b] * globalInverse;
+            if (modelMatrices)
+                XMStoreFloat4x4(&(*modelMatrices)[b], modelSpace);
+            const XMMATRIX skinMat =
+                XMLoadFloat4x4(&skel.offset[b]) * modelSpace;
             XMStoreFloat4x4(&palette[b], XMMatrixTranspose(skinMat));
         }
     }
@@ -173,40 +276,97 @@ private:
     }
 
     DirectX::XMMATRIX SampleTrack(const BoneTrack& tr, size_t bone) const {
+        if (loop && clip && clip->duration > 1e-5f &&
+            loopBlendDuration > 1e-5f) {
+            const float blend = (std::min)(
+                loopBlendDuration, clip->duration * 0.25f);
+            const bool beforeSeam = time >= clip->duration - blend;
+            const bool afterSeam = time < blend;
+            if (beforeSeam || afterSeam) {
+                // Treat [duration-blend, duration] and [0, blend] as one
+                // continuous 2*blend interval. Both source cycles advance at
+                // half speed through it; the blend is therefore identical on
+                // both sides of fmod's wrap.
+                const float elapsed = beforeSeam
+                    ? time - (clip->duration - blend)
+                    : blend + time;
+                float alpha = elapsed / (2.0f * blend);
+                alpha = alpha * alpha * (3.0f - 2.0f * alpha);
+                const float outgoingTime =
+                    clip->duration - blend + elapsed * 0.5f;
+                const float incomingTime = elapsed * 0.5f;
+                return BlendLocalTransforms(
+                    SampleTrackAt(tr, bone, outgoingTime),
+                    SampleTrackAt(tr, bone, incomingTime), alpha);
+            }
+        }
+        return SampleTrackAt(tr, bone, time);
+    }
+
+    static DirectX::XMMATRIX BlendLocalTransforms(
+        const DirectX::XMMATRIX& from, const DirectX::XMMATRIX& to,
+        float weight) {
         using namespace DirectX;
-        const XMVECTOR t = SampleVec(tr.positions, XMLoadFloat3(&bindTranslation_[bone]));
-        const XMVECTOR r = SampleQuat(tr.rotations, XMLoadFloat4(&bindRotation_[bone]));
-        const XMVECTOR s = SampleVec(tr.scales, XMLoadFloat3(&bindScale_[bone]));
+        XMVECTOR fromScale, fromRotation, fromTranslation;
+        XMVECTOR toScale, toRotation, toTranslation;
+        if (!XMMatrixDecompose(
+                &fromScale, &fromRotation, &fromTranslation, from))
+            return to;
+        if (!XMMatrixDecompose(&toScale, &toRotation, &toTranslation, to))
+            return from;
+        return XMMatrixAffineTransformation(
+            XMVectorLerp(fromScale, toScale, weight), XMVectorZero(),
+            XMQuaternionSlerp(fromRotation, toRotation, weight),
+            XMVectorLerp(fromTranslation, toTranslation, weight));
+    }
+
+    DirectX::XMMATRIX SampleTrackAt(const BoneTrack& tr, size_t bone,
+                                    float sampleTime) const {
+        using namespace DirectX;
+        const XMVECTOR t = SampleVec(
+            tr.positions, XMLoadFloat3(&bindTranslation_[bone]), sampleTime);
+        const XMVECTOR r = SampleQuat(
+            tr.rotations, XMLoadFloat4(&bindRotation_[bone]), sampleTime);
+        const XMVECTOR s = SampleVec(
+            tr.scales, XMLoadFloat3(&bindScale_[bone]), sampleTime);
         return XMMatrixAffineTransformation(s, XMVectorZero(), r, t);
     }
 
     template <typename Keys>
-    DirectX::XMVECTOR SampleVec(const Keys& keys, DirectX::XMVECTOR fallback) const {
+    DirectX::XMVECTOR SampleVec(const Keys& keys, DirectX::XMVECTOR fallback,
+                                float sampleTime) const {
         using namespace DirectX;
         if (keys.empty()) return fallback;
         if (keys.size() == 1) return XMLoadFloat3(&keys[0].value);
-        if (time <= keys.front().time) return XMLoadFloat3(&keys.front().value);
-        const auto upper = std::lower_bound(keys.begin() + 1, keys.end(), time,
+        if (sampleTime <= keys.front().time)
+            return XMLoadFloat3(&keys.front().value);
+        const auto upper = std::lower_bound(
+            keys.begin() + 1, keys.end(), sampleTime,
             [](const auto& key, float sampleTime) { return key.time < sampleTime; });
         if (upper == keys.end()) return XMLoadFloat3(&keys.back().value);
         const auto& lower = *(upper - 1);
         const float span = upper->time - lower.time;
-        const float a = span > 1e-6f ? (time - lower.time) / span : 0.0f;
+        const float a =
+            span > 1e-6f ? (sampleTime - lower.time) / span : 0.0f;
         return XMVectorLerp(XMLoadFloat3(&lower.value), XMLoadFloat3(&upper->value), a);
     }
 
     DirectX::XMVECTOR SampleQuat(const std::vector<BoneTrack::QuatKey>& keys,
-                                 DirectX::XMVECTOR fallback) const {
+                                 DirectX::XMVECTOR fallback,
+                                 float sampleTime) const {
         using namespace DirectX;
         if (keys.empty()) return fallback;
         if (keys.size() == 1) return XMLoadFloat4(&keys[0].value);
-        if (time <= keys.front().time) return XMLoadFloat4(&keys.front().value);
-        const auto upper = std::lower_bound(keys.begin() + 1, keys.end(), time,
+        if (sampleTime <= keys.front().time)
+            return XMLoadFloat4(&keys.front().value);
+        const auto upper = std::lower_bound(
+            keys.begin() + 1, keys.end(), sampleTime,
             [](const BoneTrack::QuatKey& key, float sampleTime) { return key.time < sampleTime; });
         if (upper == keys.end()) return XMLoadFloat4(&keys.back().value);
         const auto& lower = *(upper - 1);
         const float span = upper->time - lower.time;
-        const float a = span > 1e-6f ? (time - lower.time) / span : 0.0f;
+        const float a =
+            span > 1e-6f ? (sampleTime - lower.time) / span : 0.0f;
         return XMQuaternionSlerp(XMLoadFloat4(&lower.value), XMLoadFloat4(&upper->value), a);
     }
 

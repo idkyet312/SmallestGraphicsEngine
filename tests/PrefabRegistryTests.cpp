@@ -186,7 +186,8 @@ int main() {
         std::filesystem::path importedPrefab;
         CHECK(PrefabRegistry::ImportModel("models/loose.fbx", importedPrefab).ok);
         CHECK(std::filesystem::exists(importedPrefab));
-        CHECK(std::filesystem::exists("models/Imported/loose/loose.fbx"));
+        CHECK(std::filesystem::exists(
+            "Content/Models/Imported/loose/loose.fbx"));
 
         PrefabAsset unsafe = crate;
         unsafe.id = "unsafe";

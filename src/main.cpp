@@ -68,6 +68,16 @@
 #include "PrefabRegistry.h"
 #include "PrefabRuntime.h"
 #include "PrefabColliders.h"
+#include "RuntimeWorld.h"
+#include "GameSession.h"
+#include "FixedStepClock.h"
+#include "RenderCoordinator.h"
+#include "LevelRuntimeBuilder.h"
+#include "CombatSystem.h"
+#include "EnemySystem.h"
+#include "VehicleSystem.h"
+#include "GameRuntime.h"
+#include "DeferredReleaseQueue.h"
 #include "AssetRegistry.h"
 #include "AssetWatcher.h"
 #include "PrefabThumbnailGenerator.h"
@@ -90,9 +100,12 @@ MeshShaderDX12              g_meshShader;
 bool                        g_useMeshShader = false;
 TerrainRendererDX12         g_terrain;
 DestructionDX12             g_destruction;
-std::vector<std::unique_ptr<SkinnedEnemy>> g_bandits;
-SkinnedEnemy*               g_heldBandit = nullptr;
-size_t                      g_heldBarrelIndex = SIZE_MAX;
+static GameRuntime          g_game;
+static EnemySystem          g_enemySystem;
+static std::vector<std::unique_ptr<SkinnedEnemy>>& g_bandits =
+    g_enemySystem.actors;
+static SkinnedEnemy*&       g_heldBandit = g_enemySystem.held;
+static size_t&              g_heldBarrelIndex = g_game.combat.heldBarrelIndex;
 std::shared_ptr<SceneNode>  g_explosiveBarrelModel;
 std::shared_ptr<SceneNode>  g_explosiveBarrelShadowModel;
 std::shared_ptr<SceneNode>  g_humveeModel;
@@ -103,13 +116,22 @@ std::vector<DandelionInstance> g_dandelionInstances;
 static XMFLOAT3             g_dandelionSourceCenter{};
 static float                g_dandelionSourceMinY = 0.0f;
 static float                g_dandelionSourceHeight = 1.0f;
-std::vector<PrefabRenderBatch> g_prefabRenderBatches;
-std::vector<PrefabCollider>    g_prefabColliders;
-std::vector<PrefabLightInstance> g_prefabLightInstances;
-std::vector<PrefabAudioEmitter> g_prefabAudioEmitters;
-std::vector<PrefabSpawnPoint> g_prefabSpawnPoints;
-std::vector<PrefabDestructibleInstance> g_prefabDestructibles;
-static std::unordered_map<uint64_t, float> g_prefabHealth;
+// Temporary translation-unit aliases keep the large prototype game loop
+// readable while RuntimeWorld remains the sole owner of compiled prefab state.
+static std::vector<PrefabRenderBatch>& g_prefabRenderBatches =
+    g_game.world.Prefabs().renderBatches;
+static std::vector<PrefabCollider>& g_prefabColliders =
+    g_game.world.Prefabs().colliders;
+static std::vector<PrefabLightInstance>& g_prefabLightInstances =
+    g_game.world.Prefabs().lights;
+static std::vector<PrefabAudioEmitter>& g_prefabAudioEmitters =
+    g_game.world.Prefabs().audioEmitters;
+static std::vector<PrefabSpawnPoint>& g_prefabSpawnPoints =
+    g_game.world.Prefabs().spawnPoints;
+static std::vector<PrefabDestructibleInstance>& g_prefabDestructibles =
+    g_game.world.Prefabs().destructibles;
+static std::unordered_map<uint64_t, float>& g_prefabHealth =
+    g_game.world.Prefabs().health;
 struct PrefabAudioPlayer {
     size_t emitterIndex = 0;
     std::unique_ptr<GunAudio> player;
@@ -124,6 +146,12 @@ struct PrefabModelCacheEntry {
     XMFLOAT3 boundsMaximum{};
 };
 static std::unordered_map<std::string, PrefabModelCacheEntry> g_prefabModelCache;
+struct RetiredPrefabResources {
+    std::vector<PrefabRenderBatch> renderBatches;
+    std::unordered_map<std::string, PrefabModelCacheEntry> models;
+};
+static DeferredReleaseQueue<RetiredPrefabResources>
+    g_retiredPrefabResources;
 static std::unordered_set<std::string> g_prefabMeshFallbackWarnings;
 static bool                 g_prefabRebuildRequested = true;
 static bool                 g_prefabRuntimeSmokeEnabled = false;
@@ -141,55 +169,60 @@ static std::shared_ptr<SceneNode> g_ddgiCornellModel;
 std::shared_ptr<SceneNode>  g_helicopterMainRotorNode;
 std::shared_ptr<SceneNode>  g_helicopterTailRotorNode;
 std::shared_ptr<SceneNode>  g_humveeTurretNode;
-XMFLOAT3                    g_humveeModelCenter{ 0.0f, 0.0f, 0.0f };
-float                       g_humveeModelMinY = 0.0f;
-float                       g_humveeModelScale = 1.0f;
-XMFLOAT3                    g_helicopterModelCenter{ 0.0f, 0.0f, 0.0f };
-float                       g_helicopterModelScale = 1.0f;
-float                       g_helicopterLevelScale = 1.0f;
-float                       g_helicopterMainRotorAngle = 0.0f;
-float                       g_helicopterTailRotorAngle = 0.0f;
-float                       g_helicopterYaw = 0.0f;
-float                       g_helicopterPitch = 0.0f;
-float                       g_helicopterRoll = 0.0f;
-float                       g_helicopterHoverTime = 0.0f;
-float                       g_helicopterFireCooldown = 0.0f;
-float                       g_helicopterFireCycleTime = 0.0f;
-XMFLOAT3                    g_helicopterPosition{ 0.0f, 14.0f, 0.0f };
-XMFLOAT3                    g_helicopterSpawn{ 0.0f, 14.0f, 0.0f };
-XMFLOAT3                    g_secondaryHelicopterPosition{ 42.0f, 14.0f, 0.0f };
+static XMFLOAT3&            g_humveeModelCenter = g_game.vehicles.humveeModelCenter;
+static float&               g_humveeModelMinY = g_game.vehicles.humveeModelMinY;
+static float&               g_humveeModelScale = g_game.vehicles.humveeModelScale;
+static XMFLOAT3&            g_helicopterModelCenter = g_game.vehicles.helicopterModelCenter;
+static float&               g_helicopterModelScale = g_game.vehicles.helicopterModelScale;
+static float&               g_helicopterLevelScale = g_game.vehicles.helicopterLevelScale;
+static float&               g_helicopterMainRotorAngle = g_game.vehicles.helicopterMainRotorAngle;
+static float&               g_helicopterTailRotorAngle = g_game.vehicles.helicopterTailRotorAngle;
+static float&               g_helicopterYaw = g_game.vehicles.helicopterYaw;
+static float&               g_helicopterPitch = g_game.vehicles.helicopterPitch;
+static float&               g_helicopterRoll = g_game.vehicles.helicopterRoll;
+static float&               g_helicopterHoverTime = g_game.vehicles.helicopterHoverTime;
+static float&               g_helicopterFireCooldown = g_game.vehicles.helicopterFireCooldown;
+static float&               g_helicopterFireCycleTime = g_game.vehicles.helicopterFireCycleTime;
+static XMFLOAT3&            g_helicopterPosition = g_game.vehicles.helicopterPosition;
+static XMFLOAT3&            g_helicopterSpawn = g_game.vehicles.helicopterSpawn;
+static XMFLOAT3&            g_secondaryHelicopterPosition =
+    g_game.vehicles.secondaryHelicopterPosition;
 constexpr float             kHelicopterPatrolRadius = 16.0f;
-float                       g_secondaryHelicopterYaw = 0.0f;
-float                       g_secondaryHelicopterPitch = 0.0f;
-float                       g_secondaryHelicopterRoll = 0.0f;
-float                       g_secondaryHelicopterHoverTime = 1.7f;
-float                       g_secondaryHelicopterFireCooldown = 0.0f;
-float                       g_secondaryHelicopterFireCycleTime = 3.5f;
-constexpr float             kHelicopterMaxHealth = 2000.0f;
+static float&               g_secondaryHelicopterYaw = g_game.vehicles.secondaryHelicopterYaw;
+static float&               g_secondaryHelicopterPitch = g_game.vehicles.secondaryHelicopterPitch;
+static float&               g_secondaryHelicopterRoll = g_game.vehicles.secondaryHelicopterRoll;
+static float&               g_secondaryHelicopterHoverTime = g_game.vehicles.secondaryHelicopterHoverTime;
+static float&               g_secondaryHelicopterFireCooldown =
+    g_game.vehicles.secondaryHelicopterFireCooldown;
+static float&               g_secondaryHelicopterFireCycleTime =
+    g_game.vehicles.secondaryHelicopterFireCycleTime;
+constexpr float             kHelicopterMaxHealth = VehicleSystem::HelicopterMaxHealth;
 constexpr float             kRocketHelicopterDamage = kHelicopterMaxHealth * 0.5f;
-float                       g_secondaryHelicopterHealth = kHelicopterMaxHealth;
-bool                        g_secondaryHelicopterDead = false;
-bool                        g_secondaryHelicopterCrashed = false;
-XMFLOAT3                    g_secondaryHelicopterCrashVelocity{ 0.0f, 0.0f, 0.0f };
-XMFLOAT3                    g_secondaryHumveePosition{ 42.0f, 2.5f, 3.0f };
-float                       g_helicopterHealth = kHelicopterMaxHealth;
-bool                        g_helicopterDead = false;
-bool                        g_helicopterCrashed = false;
-XMFLOAT3                    g_helicopterCrashVelocity{ 0.0f, 0.0f, 0.0f };
-XMFLOAT3                    g_humveeTurretLocal{ 0.0f, 0.35f, 0.0f };
-bool                        g_drivingHumvee = false;
-bool                        g_savedGunVisible = true;
-XMFLOAT3                    g_previousHumveePosition{};
-bool                        g_previousHumveePositionValid = false;
-float                       g_humveeHouseImpactCooldown = 0.0f;
-XMFLOAT3                    g_humveeAimPoint{};
-float                       g_humveeTurretYaw = 0.0f;
-float                       g_humveeTurretFireCooldown = 0.0f;
+static float&               g_secondaryHelicopterHealth = g_game.vehicles.secondaryHelicopterHealth;
+static bool&                g_secondaryHelicopterDead = g_game.vehicles.secondaryHelicopterDead;
+static bool&                g_secondaryHelicopterCrashed = g_game.vehicles.secondaryHelicopterCrashed;
+static XMFLOAT3&            g_secondaryHelicopterCrashVelocity =
+    g_game.vehicles.secondaryHelicopterCrashVelocity;
+static XMFLOAT3&            g_secondaryHumveePosition = g_game.vehicles.secondaryHumveePosition;
+static float&               g_helicopterHealth = g_game.vehicles.helicopterHealth;
+static bool&                g_helicopterDead = g_game.vehicles.helicopterDead;
+static bool&                g_helicopterCrashed = g_game.vehicles.helicopterCrashed;
+static XMFLOAT3&            g_helicopterCrashVelocity = g_game.vehicles.helicopterCrashVelocity;
+static XMFLOAT3&            g_humveeTurretLocal = g_game.vehicles.humveeTurretLocal;
+static bool&                g_drivingHumvee = g_game.vehicles.drivingHumvee;
+static bool&                g_savedGunVisible = g_game.vehicles.savedGunVisible;
+static XMFLOAT3&            g_previousHumveePosition = g_game.vehicles.previousHumveePosition;
+static bool&                g_previousHumveePositionValid =
+    g_game.vehicles.previousHumveePositionValid;
+static float&               g_humveeHouseImpactCooldown = g_game.vehicles.humveeHouseImpactCooldown;
+static XMFLOAT3&            g_humveeAimPoint = g_game.vehicles.humveeAimPoint;
+static float&               g_humveeTurretYaw = g_game.vehicles.humveeTurretYaw;
+static float&               g_humveeTurretFireCooldown = g_game.vehicles.humveeTurretFireCooldown;
 SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
 float                       g_banditLeftArmReach = 0.55f;
 float                       g_banditHeadYawOffsetDegrees = 20.4f;
-uint32_t                    g_banditSpawnSerial = 0;
+static uint32_t&            g_banditSpawnSerial = g_enemySystem.spawnSerial;
 GunAudio                    g_gunAudio;
 GunAudio                    g_rpgFireAudio;
 GunAudio                    g_reloadAudio;
@@ -202,18 +235,17 @@ GunAudio                    g_banditAttackAudio;
 GunAudio                    g_banditDeathAudio;
 GunAudio                    g_banditHitVoiceAudio;
 GunAudio                    g_helicopterHoverAudio;
-float                       g_banditVoiceCooldown = 0.0f;
-float                       g_banditPainCooldown = 0.0f;
-float                       g_fleshHitPitchMin = 0.9f;
-float                       g_fleshHitPitchMax = 1.1f;
-bool                        g_suppressFireUntilMouseRelease = false;
+static float&               g_banditVoiceCooldown = g_enemySystem.voiceCooldown;
+static float&               g_banditPainCooldown = g_enemySystem.painCooldown;
+static float&               g_fleshHitPitchMin = g_game.combat.fleshHitPitchMin;
+static float&               g_fleshHitPitchMax = g_game.combat.fleshHitPitchMax;
+static bool&                g_suppressFireUntilMouseRelease =
+    g_game.combat.suppressFireUntilMouseRelease;
 bool                        g_stressTestMode = false;
 bool                        g_emptyLevelMode = false;
 NavigationSystem            g_navigation;
 static LevelEditor          g_levelEditor;
 static Camera               g_editorCameraSnapshot;
-static LevelDefinition      g_runtimeLevel = MakeLevelOneTemplate();
-static std::vector<TerrainSculptStamp> g_runtimeTerrainSculpt;
 static bool                 g_customLevelMode = false;
 // Editor fly-camera speed multiplier, adjusted with the mouse wheel (Unreal
 // style). Persists across frames; clamped to a sane range.
@@ -221,8 +253,8 @@ static float                g_editorCameraSpeed = 1.0f;
 static bool                 g_pendingEnvironmentRebuild = false;
 static std::string          g_activeCustomLevelName;
 static std::string          g_mainMenuLevelStatus;
-static XMFLOAT3             g_primaryHumveeSpawn{ 0.0f, 3.45f, 0.0f };
-static float                g_primaryHumveeYaw = 0.0f;
+static XMFLOAT3&            g_primaryHumveeSpawn = g_game.vehicles.primaryHumveeSpawn;
+static float&               g_primaryHumveeYaw = g_game.vehicles.primaryHumveeYaw;
 static std::shared_ptr<SceneNode> g_houseTemplate;
 
 static constexpr size_t kEnemiesPerSpawner = 2;
@@ -248,8 +280,9 @@ static_assert(kStressBanditCount <= kSpawnerCount * kEnemiesPerSpawner);
 
 static size_t ActiveBanditSlotCount() {
     if (g_customLevelMode) {
-        size_t count = static_cast<size_t>(std::count_if(g_runtimeLevel.entities.begin(),
-            g_runtimeLevel.entities.end(), [](const LevelEntity& entity) {
+        size_t count = static_cast<size_t>(std::count_if(
+            g_game.world.Level().entities.begin(),
+            g_game.world.Level().entities.end(), [](const LevelEntity& entity) {
                 return entity.enabled && entity.type == LevelEntityType::EnemySpawn;
             }));
         for (const PrefabSpawnPoint& spawn : g_prefabSpawnPoints)
@@ -328,10 +361,8 @@ static void AddExplosionTerrainCrater(const XMFLOAT3& impact) {
     // At capacity, drop the OLDEST crater rather than rejecting the new one --
     // a barrel that explodes must always leave a hole. SetSculptStamps trims
     // from the front too, so CPU collision and the GPU buffer stay in sync.
-    if (g_runtimeTerrainSculpt.size() >= kMaxTerrainSculptStamps)
-        g_runtimeTerrainSculpt.erase(g_runtimeTerrainSculpt.begin());
-    g_runtimeTerrainSculpt.push_back(crater);
-    g_terrain.SetSculptStamps(g_runtimeTerrainSculpt);
+    g_game.world.AddRuntimeTerrainStamp(crater);
+    g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
     const float foliageRadius = crater.radius * 0.5f;
     g_grass.AddRuntimeExclusion(impact.x, impact.z, foliageRadius);
     g_trees.ApplyExplosion(impact, foliageRadius);
@@ -469,15 +500,11 @@ static bool ApplyDarkGreenToHumvee() {
 
 static void DamageHelicopter(float damage, const XMFLOAT3& hit) {
     if (damage <= 0.0f || g_helicopterDead || !g_helicopterModel) return;
-    g_helicopterHealth = (std::max)(0.0f, g_helicopterHealth - damage);
+    const VehicleSystem::DamageResult result =
+        g_game.vehicles.DamagePrimaryHelicopter(damage);
+    if (!result.applied) return;
     scene.SpawnSmokeBurst(hit, 0.22f, 0.10f);
-    if (g_helicopterHealth > 0.0f) return;
-    g_helicopterDead = true;
-    g_helicopterFireCooldown = 9999.0f;
-    g_helicopterCrashVelocity = {
-        std::sin(g_helicopterYaw) * 2.2f,
-        -0.8f,
-        std::cos(g_helicopterYaw) * 2.2f };
+    if (!result.destroyed) return;
     scene.SpawnExplosionFX(g_helicopterPosition, 7.0f, 1.0f);
     scene.SpawnSmokeBurst(g_helicopterPosition, 1.25f, 1.5f);
 }
@@ -485,16 +512,11 @@ static void DamageHelicopter(float damage, const XMFLOAT3& hit) {
 static void DamageSecondaryHelicopter(float damage, const XMFLOAT3& hit) {
     if (damage <= 0.0f || g_secondaryHelicopterDead || !g_helicopterModel ||
         !g_stressTestMode) return;
-    g_secondaryHelicopterHealth = (std::max)(
-        0.0f, g_secondaryHelicopterHealth - damage);
+    const VehicleSystem::DamageResult result =
+        g_game.vehicles.DamageSecondaryHelicopter(damage);
+    if (!result.applied) return;
     scene.SpawnSmokeBurst(hit, 0.22f, 0.10f);
-    if (g_secondaryHelicopterHealth > 0.0f) return;
-    g_secondaryHelicopterDead = true;
-    g_secondaryHelicopterFireCooldown = 9999.0f;
-    g_secondaryHelicopterCrashVelocity = {
-        std::sin(g_secondaryHelicopterYaw) * 2.2f,
-        -0.8f,
-        std::cos(g_secondaryHelicopterYaw) * 2.2f };
+    if (!result.destroyed) return;
     scene.SpawnExplosionFX(g_secondaryHelicopterPosition, 7.0f, 1.0f);
     scene.SpawnSmokeBurst(g_secondaryHelicopterPosition, 1.25f, 1.5f);
 }
@@ -691,7 +713,7 @@ static void UpdateHelicopter(float dt) {
         return;
     }
     g_helicopterFireCooldown -= dt;
-    if (scene.playerHealth <= 0.0f || g_helicopterFireCooldown > 0.0f) return;
+    if (scene.player.health <= 0.0f || g_helicopterFireCooldown > 0.0f) return;
     const XMFLOAT3 forward{
         std::sin(g_helicopterYaw), 0.0f, std::cos(g_helicopterYaw) };
     const XMFLOAT3 muzzle{
@@ -792,7 +814,8 @@ static void UpdateSecondaryHelicopter(float dt) {
         return;
     }
     g_secondaryHelicopterFireCooldown -= dt;
-    if (scene.playerHealth <= 0.0f || g_secondaryHelicopterFireCooldown > 0.0f)
+    if (scene.player.health <= 0.0f ||
+        g_secondaryHelicopterFireCooldown > 0.0f)
         return;
     const XMFLOAT3 forward{
         std::sin(g_secondaryHelicopterYaw), 0.0f,
@@ -969,7 +992,7 @@ static bool SpawnBandit() {
 
     if (g_customLevelMode) {
         size_t spawnIndex = 0;
-        for (const LevelEntity& entity : g_runtimeLevel.entities) {
+        for (const LevelEntity& entity : g_game.world.Level().entities) {
             if (!entity.enabled || entity.type != LevelEntityType::EnemySpawn) continue;
             if (spawnIndex++ != slot) continue;
             bandit->position = { entity.transform.position[0],
@@ -1724,28 +1747,7 @@ static std::vector<ComPtr<ID3D12Resource>> g_fireUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_explosionUploadHeaps;
 static bool                 fullLevelAssetsLoaded = false;
 static bool                 emptyLevelAssetsLoaded = false;
-enum class LevelLoadStage {
-    WorldAssets, Destruction, Environment, Weapons, Humvee, Helicopter,
-    BanditModel, BanditSpawn, GPUFinalize, ReleaseUploads, Complete
-};
-struct LevelLoadRecord {
-    std::string label;
-    double milliseconds = 0.0;
-    bool succeeded = true;
-};
-static uint32_t             levelLoadTaskCount = 10;
-static LevelLoadStage       levelLoadStage = LevelLoadStage::Complete;
-static bool                 levelLoadingActive = false;
-static float                levelLoadingProgress = 0.0f;
-static std::string          levelLoadingLabel = "Preparing level...";
-static std::string          levelLoadingAsset = "None";
-static uint32_t             levelLoadingTaskIndex = 0;
-static uint32_t             levelLoadingLastSubmittedUploads = 0;
-static uint32_t             levelLoadingSubmittedUploads = 0;
 static StaticBufferStatsDX12 levelLoadingUploadBaseline = {};
-static std::chrono::steady_clock::time_point levelLoadingStartedAt;
-static std::chrono::steady_clock::time_point levelLoadingTaskStartedAt;
-static std::vector<LevelLoadRecord> levelLoadingRecords;
 static std::future<bool> levelDestructionLoadFuture;
 static bool levelDestructionLoadInFlight = false;
 
@@ -1825,7 +1827,7 @@ static void AppendDXRDDGITerrain(std::vector<DXRProbeTriangle>& triangles,
     const float width = params.tilesX * params.tileSize;
     const float depth = params.tilesZ * params.tileSize;
     const float step = (std::max)(2.0f,
-        g_runtimeLevel.dxrDDGI.surfaceSpacing);
+        g_game.world.Level().dxrDDGI.surfaceSpacing);
     const uint32_t columns = static_cast<uint32_t>(std::ceil(width / step));
     const uint32_t rows = static_cast<uint32_t>(std::ceil(depth / step));
     // Grid min corner honours the tile origin offset so GI probes track an
@@ -1949,7 +1951,7 @@ static bool BuildDXRDDGIAccelerationScene() {
         const float width = params.tilesX * params.tileSize;
         const float depth = params.tilesZ * params.tileSize;
         const float step = (std::max)(2.0f,
-            g_runtimeLevel.dxrDDGI.surfaceSpacing);
+            g_game.world.Level().dxrDDGI.surfaceSpacing);
         const uint32_t columns =
             static_cast<uint32_t>(std::ceil(width / step));
         const uint32_t rows =
@@ -1999,9 +2001,9 @@ static bool BuildDXRDDGIAccelerationScene() {
 }
 
 static bool RebuildDXRDDGIProbeLayout(bool force) {
-    g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
-    scene.giMaxDistance = g_runtimeLevel.dxrDDGI.maxRayDistance;
-    if (!g_runtimeLevel.dxrDDGI.enabled) return false;
+    g_dxrDDGI.ApplySettings(g_game.world.Level().dxrDDGI);
+    scene.giMaxDistance = g_game.world.Level().dxrDDGI.maxRayDistance;
+    if (!g_game.world.Level().dxrDDGI.enabled) return false;
     if (!force && !g_dxrDDGI.LayoutDirty()) return true;
     // Probe/atlas buffers may still be referenced by an older in-flight frame.
     // Fence before replacing them and releasing their upload sources.
@@ -2057,7 +2059,7 @@ static bool RebuildDXRDDGIProbeLayout(bool force) {
 }
 
 static void DrawDXRDDGIProbeDebug(CXMMATRIX view, CXMMATRIX projection) {
-    if (!g_runtimeLevel.dxrDDGI.showProbes && !scene.showProbes) return;
+    if (!g_game.world.Level().dxrDDGI.showProbes && !scene.showProbes) return;
     const auto& probes = g_dxrDDGI.GetDebugProbes();
     if (probes.empty()) return;
     const XMMATRIX viewProjection = view * projection;
@@ -2081,55 +2083,23 @@ static void DrawDXRDDGIProbeDebug(CXMMATRIX view, CXMMATRIX projection) {
     }
 }
 
-static double LevelLoadElapsedMs(
-    std::chrono::steady_clock::time_point start) {
-    return std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - start).count();
-}
-
 static void BeginLevelLoading() {
-    const auto now = std::chrono::steady_clock::now();
-    levelLoadStage = LevelLoadStage::WorldAssets;
-    levelLoadingActive = true;
-    levelLoadingProgress = 0.02f;
-    levelLoadTaskCount = g_emptyLevelMode ? 5u : 10u;
-    levelLoadingLabel = g_emptyLevelMode
-        ? "Terrain material"
-        : "Terrain material and crate model";
-    levelLoadingAsset = g_emptyLevelMode ? "floor material" : "Content/Models/h2.glb";
-    levelLoadingTaskIndex = 1;
-    levelLoadingLastSubmittedUploads = 0;
-    levelLoadingSubmittedUploads = 0;
+    g_game.loading.Begin({
+        g_emptyLevelMode ? 5u : 10u,
+        g_emptyLevelMode ? "Terrain material"
+                         : "Terrain material and crate model",
+        g_emptyLevelMode ? "floor material" : "Content/Models/h2.glb"
+    });
     levelLoadingUploadBaseline = GetStaticBufferStatsDX12();
-    levelLoadingStartedAt = now;
-    levelLoadingTaskStartedAt = now;
-    levelLoadingRecords.clear();
 }
 
 static void AdvanceLevelLoading(LevelLoadStage next, const char* label,
                                 const char* asset, bool succeeded = true) {
-    levelLoadingRecords.push_back({ levelLoadingLabel,
-        LevelLoadElapsedMs(levelLoadingTaskStartedAt), succeeded });
-    if (levelLoadingRecords.size() > 6)
-        levelLoadingRecords.erase(levelLoadingRecords.begin());
-    levelLoadStage = next;
-    ++levelLoadingTaskIndex;
-    levelLoadingProgress = (std::min)(0.95f,
-        static_cast<float>(levelLoadingTaskIndex - 1) / levelLoadTaskCount);
-    levelLoadingLabel = label;
-    levelLoadingAsset = asset;
-    levelLoadingTaskStartedAt = std::chrono::steady_clock::now();
+    g_game.loading.Advance(next, label, asset, succeeded);
 }
 
 static void CompleteLevelLoading(bool succeeded = true) {
-    levelLoadingRecords.push_back({ levelLoadingLabel,
-        LevelLoadElapsedMs(levelLoadingTaskStartedAt), succeeded });
-    levelLoadStage = LevelLoadStage::Complete;
-    levelLoadingTaskIndex = levelLoadTaskCount;
-    levelLoadingProgress = 1.0f;
-    levelLoadingLabel = "Ready";
-    levelLoadingAsset = "None";
-    levelLoadingActive = false;
+    g_game.loading.Complete(succeeded);
 }
 
 static float lastX = SCR_WIDTH / 2.0f;
@@ -2138,32 +2108,23 @@ static bool  firstMouse   = true;
 static bool  ignoreNextMouseMove = false;
 static bool  showUI        = true;
 static bool  cameraLocked  = true;
-enum class GameScreen { MainMenu, Level1, LevelEditor, WinScreen };
-static GameScreen gameScreen = GameScreen::MainMenu;
 static bool IsEditorEditing() {
-    return gameScreen == GameScreen::LevelEditor && !g_levelEditor.IsPlaying();
+    return g_game.session.Screen() == GameScreen::LevelEditor &&
+           !g_levelEditor.IsPlaying();
 }
 static bool IsEditorPlaying() {
-    return gameScreen == GameScreen::LevelEditor && g_levelEditor.IsPlaying();
+    return g_game.session.Screen() == GameScreen::LevelEditor &&
+           g_levelEditor.IsPlaying();
 }
 static bool IsSceneScreen() {
-    return gameScreen == GameScreen::Level1 || gameScreen == GameScreen::LevelEditor;
+    return g_game.session.IsSceneScreen();
 }
 static bool IsGameplayScreen() {
-    return gameScreen == GameScreen::Level1 || IsEditorPlaying();
+    return g_game.session.Screen() == GameScreen::Level1 || IsEditorPlaying();
 }
-static float levelElapsedSeconds = 0.0f;
-static bool  levelTimerRunning = false;
 static bool  deathCursorReleased = false;
-static bool  pendingLevelRuntimeReset = false;
-static bool  pendingTurretGunnerRespawn = false;
-static bool  pendingEditorBeginPlay = false;
-static bool  pendingEditorStopPlay = false;
-static bool  pendingEditorReturnToMenu = false;
-static bool  pendingDXRDDGIRebuild = false;
-static bool  pendingDXRDDGIHistoryReset = false;
 void RequestLiveDXRDDGIRebuild() {
-    pendingDXRDDGIRebuild = true;
+    g_game.commands.Request(GameCommand::RebuildDDGI);
 }
 static bool  isFullscreen  = false;
 static RECT  windowedRect  = {};
@@ -2640,7 +2601,7 @@ static constexpr std::array<PalmSpawn, 6> kStressHousePalmSpawns = {{
 static void ResetPalmTrees() {
     g_trees.Initialize();
     if (g_customLevelMode) {
-        for (const LevelEntity& entity : g_runtimeLevel.entities) {
+        for (const LevelEntity& entity : g_game.world.Level().entities) {
             if (!entity.enabled || entity.type != LevelEntityType::Palm) continue;
             g_trees.Plant(entity.transform.position[0], entity.transform.position[2],
                 entity.transform.scale[1], entity.transform.rotation[2]);
@@ -2829,7 +2790,7 @@ static void ScatterDandelions(
         }
     }
     if (g_customLevelMode) {
-        for (const LevelEntity& entity : g_runtimeLevel.entities) {
+        for (const LevelEntity& entity : g_game.world.Level().entities) {
             if (!entity.enabled ||
                 entity.type != LevelEntityType::Dandelion) continue;
             const float x = entity.transform.position[0];
@@ -3085,14 +3046,9 @@ static std::shared_ptr<SceneNode> CreateDDGICornellBoxModel() {
 }
 
 static void RebuildPrefabRenderBatches() {
-    g_prefabRenderBatches.clear();
-    g_prefabColliders.clear();
+    g_game.world.Prefabs().ClearDerived();
     g_assetRegistry.Refresh();
     g_prefabRegistry.Refresh();
-    g_prefabLightInstances.clear();
-    g_prefabAudioEmitters.clear();
-    g_prefabSpawnPoints.clear();
-    g_prefabDestructibles.clear();
     g_prefabAudioPlayers.clear();
     std::unordered_map<std::string, size_t> batches;
     const auto addInstance = [&](const auto& self, const std::string& prefabId,
@@ -3225,7 +3181,7 @@ static void RebuildPrefabRenderBatches() {
                  nlohmann::json::object(), depth + 1);
         }
     };
-    for (const LevelEntity& entity : g_runtimeLevel.entities) {
+    for (const LevelEntity& entity : g_game.world.Level().entities) {
         if (!entity.enabled) continue;
         std::string prefabId;
         if (entity.type == LevelEntityType::Prefab) prefabId = entity.prefabId;
@@ -3367,37 +3323,26 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
 
 static void DamagePrefabEntity(uint64_t entityId, float damage,
                                const XMFLOAT3& hit) {
-    const auto definition = std::find_if(g_prefabDestructibles.begin(),
-        g_prefabDestructibles.end(), [&](const PrefabDestructibleInstance& value) {
-            return value.entityId == entityId;
-        });
-    if (definition == g_prefabDestructibles.end() || damage <= 0.0f) return;
-    float& health = g_prefabHealth.try_emplace(
-        entityId, definition->health).first->second;
-    health -= damage;
-    if (health > 0.0f) return;
-    for (LevelEntity& entity : g_runtimeLevel.entities) {
-        if (entity.id != entityId || !entity.enabled) continue;
-        entity.enabled = false;
+    const CombatSystem::PrefabDamageResult result =
+        g_game.combat.DamagePrefab(g_game.world, entityId, damage, hit);
+    if (result.destroyed) {
         scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
         g_prefabRebuildRequested = true;
         SGE_LOG("LogPrefab", EngineLog::Level::Display,
             "Destroyed prefab entity " + std::to_string(entityId));
-        break;
     }
 }
 
 static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
                                   float damage) {
-    if (radius <= 0.0f) return;
-    for (const PrefabDestructibleInstance& prefab : g_prefabDestructibles) {
-        const float dx = prefab.position.x - center.x;
-        const float dy = prefab.position.y - center.y;
-        const float dz = prefab.position.z - center.z;
-        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
-        if (distance >= radius) continue;
-        DamagePrefabEntity(prefab.entityId,
-            damage * (1.0f - distance / radius), prefab.position);
+    const auto results = g_game.combat.DamagePrefabsInRadius(
+        g_game.world, center, radius, damage);
+    for (const CombatSystem::PrefabDamageResult& result : results) {
+        if (!result.destroyed) continue;
+        scene.SpawnSmokeBurst(result.effectPosition, 1.2f, 0.45f);
+        g_prefabRebuildRequested = true;
+        SGE_LOG("LogPrefab", EngineLog::Level::Display,
+            "Destroyed prefab entity " + std::to_string(result.entityId));
     }
 }
 
@@ -3416,7 +3361,7 @@ static void RebuildScalableEnvironment() {
     if (g_customLevelMode) {
         obstacles.clear();
         obstacles.push_back({-29.0f, -27.0f, -15.0f, -13.0f});
-        for (const LevelEntity& entity : g_runtimeLevel.entities) {
+        for (const LevelEntity& entity : g_game.world.Level().entities) {
             if (!entity.enabled) continue;
             if (entity.type == LevelEntityType::WoodHouse ||
                 entity.type == LevelEntityType::MetalHouse) {
@@ -3533,7 +3478,7 @@ static void UpdateHelicopterHoverAudio() {
         !g_secondaryHelicopterDead && !g_secondaryHelicopterCrashed;
     const bool active = IsGameplayScreen() &&
         scene.showHelicopter && (primaryActive || secondaryActive) &&
-        (scene.playerGodMode || scene.playerHealth > 0.0f);
+        (scene.player.godMode || scene.player.health > 0.0f);
     auto distanceToCamera = [](const XMFLOAT3& position) {
         const float dx = position.x - scene.camera.Position.x;
         const float dy = position.y - scene.camera.Position.y;
@@ -3557,9 +3502,11 @@ static void SetCursorVisible(bool visible) {
 }
 
 static void OpenMainMenu() {
-    g_prefabRenderBatches.clear();
-    g_prefabColliders.clear();
-    gameScreen = GameScreen::MainMenu;
+    g_game.world.Prefabs().ClearDerived();
+    g_game.world.Prefabs().ResetGameplayState();
+    g_prefabAudioPlayers.clear();
+    g_game.session.SetScreen(GameScreen::MainMenu);
+    g_game.session.StopTimer();
     showUI = false;
     cameraLocked = true;
     ReleaseCapture();
@@ -3567,58 +3514,61 @@ static void OpenMainMenu() {
 }
 
 static const LevelEntity* FirstRuntimeEntity(LevelEntityType type) {
-    auto it = std::find_if(g_runtimeLevel.entities.begin(), g_runtimeLevel.entities.end(),
+    auto& entities = g_game.world.Level().entities;
+    auto it = std::find_if(entities.begin(), entities.end(),
         [&](const LevelEntity& entity) { return entity.enabled && entity.type == type; });
-    return it == g_runtimeLevel.entities.end() ? nullptr : &*it;
+    return it == entities.end() ? nullptr : &*it;
 }
 
 static void ApplyRuntimeLevelBasics(bool movePlayer) {
     if (!g_customLevelMode) return;
-    scene.terrainHeightScale = g_runtimeLevel.terrainHeightScale;
-    scene.terrainTilesX = g_runtimeLevel.terrainTilesX;
-    scene.terrainTilesZ = g_runtimeLevel.terrainTilesZ;
-    scene.terrainIslandScaleX = g_runtimeLevel.terrainIslandScaleX;
-    scene.terrainIslandScaleZ = g_runtimeLevel.terrainIslandScaleZ;
-    scene.terrainOriginTileX = g_runtimeLevel.terrainOriginTileX;
-    scene.terrainOriginTileZ = g_runtimeLevel.terrainOriginTileZ;
-    g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
-    scene.useDDGI = g_runtimeLevel.dxrDDGI.enabled &&
-                    g_dxrDDGI.GetStatus().dxrSupported;
-    scene.giIntensity = g_runtimeLevel.dxrDDGI.intensity;
-    scene.giMaxDistance = g_runtimeLevel.dxrDDGI.maxRayDistance;
-    scene.normalBias = g_runtimeLevel.dxrDDGI.normalBias;
-    scene.probeSpacing = g_runtimeLevel.dxrDDGI.surfaceSpacing;
+    const RuntimeLevelPlan plan =
+        LevelRuntimeBuilder::Build(g_game.world.Level());
+    scene.terrainHeightScale = plan.terrainHeightScale;
+    scene.terrainTilesX = plan.terrainTilesX;
+    scene.terrainTilesZ = plan.terrainTilesZ;
+    scene.terrainIslandScaleX = plan.terrainIslandScaleX;
+    scene.terrainIslandScaleZ = plan.terrainIslandScaleZ;
+    scene.terrainOriginTileX = plan.terrainOriginTileX;
+    scene.terrainOriginTileZ = plan.terrainOriginTileZ;
+    g_dxrDDGI.ApplySettings(plan.dxrDDGI);
+    scene.useDDGI = plan.dxrDDGI.enabled &&
+        g_dxrDDGI.GetStatus().dxrSupported;
+    scene.giIntensity = plan.dxrDDGI.intensity;
+    scene.giMaxDistance = plan.dxrDDGI.maxRayDistance;
+    scene.normalBias = plan.dxrDDGI.normalBias;
+    scene.probeSpacing = plan.dxrDDGI.surfaceSpacing;
     scene.explosiveBarrels.clear();
-    for (const LevelEntity& entity : g_runtimeLevel.entities) {
-        if (!entity.enabled || entity.type != LevelEntityType::ExplosiveBarrel) continue;
-        scene.explosiveBarrels.push_back({{ entity.transform.position[0],
-                                            entity.transform.position[1],
-                                            entity.transform.position[2] }});
+    for (const Transform& transform : plan.explosiveBarrels) {
+        scene.explosiveBarrels.push_back({{ transform.position[0],
+                                            transform.position[1],
+                                            transform.position[2] }});
     }
-    if (const LevelEntity* humvee = FirstRuntimeEntity(LevelEntityType::Humvee)) {
-        g_primaryHumveeSpawn = { humvee->transform.position[0],
-                                 humvee->transform.position[1],
-                                 humvee->transform.position[2] };
-        g_primaryHumveeYaw = humvee->transform.rotation[1];
+    if (plan.humveeSpawn) {
+        const Transform& humvee = *plan.humveeSpawn;
+        g_primaryHumveeSpawn = { humvee.position[0],
+                                 humvee.position[1],
+                                 humvee.position[2] };
+        g_primaryHumveeYaw = humvee.rotation[1];
     }
-    if (const LevelEntity* helicopter = FirstRuntimeEntity(LevelEntityType::Helicopter)) {
-        g_helicopterSpawn = { helicopter->transform.position[0],
-                              helicopter->transform.position[1],
-                              helicopter->transform.position[2] };
+    if (plan.helicopterSpawn) {
+        const Transform& helicopter = *plan.helicopterSpawn;
+        g_helicopterSpawn = { helicopter.position[0],
+                              helicopter.position[1],
+                              helicopter.position[2] };
         g_helicopterPosition = g_helicopterSpawn;
-        g_helicopterLevelScale = helicopter->transform.scale[0];
-        g_helicopterYaw = XMConvertToRadians(helicopter->transform.rotation[1]);
+        g_helicopterLevelScale = helicopter.scale[0];
+        g_helicopterYaw = XMConvertToRadians(helicopter.rotation[1]);
         scene.showHelicopter = true;
     } else { scene.showHelicopter = false; g_helicopterLevelScale = 1.0f; }
-    if (movePlayer) {
-        if (const LevelEntity* player = FirstRuntimeEntity(LevelEntityType::PlayerSpawn)) {
-            scene.camera = Camera({ player->transform.position[0],
-                                    player->transform.position[1],
-                                    player->transform.position[2] });
-            scene.camera.Yaw = player->transform.rotation[1] - 90.0f;
-            scene.camera.Pitch = player->transform.rotation[0];
+    if (movePlayer && plan.playerSpawn) {
+            const Transform& player = *plan.playerSpawn;
+            scene.camera = Camera({ player.position[0],
+                                    player.position[1],
+                                    player.position[2] });
+            scene.camera.Yaw = player.rotation[1] - 90.0f;
+            scene.camera.Pitch = player.rotation[0];
             scene.camera.ProcessMouseMovement(0.0f, 0.0f);
-        }
     }
 }
 
@@ -3627,8 +3577,8 @@ static void StartLevelEditor(HWND hwnd);
 static void StopEditorPlaytest();
 
 static void OpenWinScreen() {
-    levelTimerRunning = false;
-    gameScreen = GameScreen::WinScreen;
+    g_game.session.StopTimer();
+    g_game.session.SetScreen(GameScreen::WinScreen);
     showUI = false;
     cameraLocked = true;
     ReleaseCapture();
@@ -3661,82 +3611,43 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
             g_ddgiCornellPreviousAnimateDemoLights;
         scene.ambientStrength = 0.07f;
     }
-    gameScreen = GameScreen::Level1;
+    g_game.session.SetScreen(GameScreen::Level1);
     g_customLevelMode = !stressTest && !emptyLevel;
     if (customLevel) {
         g_customLevelMode = true;
-        g_runtimeLevel = *customLevel;
+        g_game.world.ReplaceLevel(*customLevel);
         g_activeCustomLevelName = customLevel->name;
     } else {
         g_activeCustomLevelName.clear();
-        if (g_customLevelMode) g_runtimeLevel = MakeLevelOneTemplate();
+        g_game.world.ReplaceLevel(
+            MakeLevelOneTemplate(),
+            g_customLevelMode ? RuntimeTerrainSource::Authored
+                              : RuntimeTerrainSource::Empty);
     }
-    g_runtimeTerrainSculpt = g_customLevelMode
-        ? g_runtimeLevel.terrainSculpt : std::vector<TerrainSculptStamp>{};
-    g_terrain.SetSculptStamps(g_runtimeTerrainSculpt);
+    g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
     g_grass.ClearRuntimeExclusions();
-    g_primaryHumveeSpawn = { 0.0f, 3.45f, 0.0f };
-    g_primaryHumveeYaw = 0.0f;
-    g_helicopterLevelScale = 1.0f;
+    g_game.ResetLevelState();
+    g_enemySystem.ResetLevelCounters();
     g_emptyLevelMode = emptyLevel;
     g_stressTestMode = stressTest && !emptyLevel;
     const bool modeAssetsLoaded = g_emptyLevelMode
         ? emptyLevelAssetsLoaded : fullLevelAssetsLoaded;
     if (modeAssetsLoaded)
         wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
-    levelElapsedSeconds = 0.0f;
-    levelTimerRunning = modeAssetsLoaded;
+    g_game.session.ResetTimer(modeAssetsLoaded);
     if (!modeAssetsLoaded) BeginLevelLoading();
     g_pendingEnvironmentRebuild = modeAssetsLoaded && g_customLevelMode;
-    scene.playerGodMode = godMode;
+    scene.player.godMode = godMode;
     scene.RestorePlayerHealth();
-    g_prefabHealth.clear();
+    g_game.world.Prefabs().ResetGameplayState();
     scene.ResetLevelRuntimeState();
     scene.camera = Camera(XMFLOAT3(0.0f, 5.0f, 10.0f));
     scene.gun.visible = true;
     scene.showHelicopter = !g_emptyLevelMode;
-    g_heldBandit = nullptr;
-    g_heldBarrelIndex = SIZE_MAX;
-    g_drivingHumvee = false;
-    g_savedGunVisible = true;
-    g_previousHumveePositionValid = false;
-    g_humveeHouseImpactCooldown = 0.0f;
-    g_humveeTurretYaw = 0.0f;
-    g_humveeTurretFireCooldown = 0.0f;
-    g_humveeAimPoint = {};
-    g_helicopterMainRotorAngle = 0.0f;
-    g_helicopterTailRotorAngle = 0.0f;
-    g_helicopterYaw = 0.0f;
-    g_helicopterPitch = 0.0f;
-    g_helicopterRoll = 0.0f;
-    g_helicopterHoverTime = 0.0f;
-    g_helicopterFireCooldown = 0.0f;
-    g_helicopterFireCycleTime = 0.0f;
-    g_helicopterHealth = kHelicopterMaxHealth;
-    g_helicopterDead = false;
-    g_helicopterCrashed = false;
-    g_helicopterPosition = { 0.0f, 14.0f, 0.0f };
-    g_helicopterSpawn = g_helicopterPosition;
-    g_helicopterCrashVelocity = { 0.0f, 0.0f, 0.0f };
-    g_secondaryHelicopterYaw = 0.0f;
-    g_secondaryHelicopterPitch = 0.0f;
-    g_secondaryHelicopterRoll = 0.0f;
-    g_secondaryHelicopterHoverTime = 1.7f;
-    g_secondaryHelicopterFireCooldown = 0.0f;
-    g_secondaryHelicopterFireCycleTime = 3.5f;
-    g_secondaryHelicopterHealth = kHelicopterMaxHealth;
-    g_secondaryHelicopterDead = false;
-    g_secondaryHelicopterCrashed = false;
-    g_secondaryHelicopterPosition = { 42.0f, 14.0f, 0.0f };
-    g_secondaryHelicopterCrashVelocity = { 0.0f, 0.0f, 0.0f };
-    g_banditSpawnSerial = 0;
-    g_banditVoiceCooldown = 0.0f;
-    g_banditPainCooldown = 0.0f;
-    g_suppressFireUntilMouseRelease = true;
     ApplyRuntimeLevelBasics(true);
     if (modeAssetsLoaded)
         scene.rebuildDestructionRequested = true;
-    pendingLevelRuntimeReset = modeAssetsLoaded;
+    g_game.commands.Set(GameCommand::ResetLevelRuntime, modeAssetsLoaded);
     deathCursorReleased = false;
     showUI = startWithUIAndMobileControls;
     virtualInput.showPad = startWithUIAndMobileControls;
@@ -3829,7 +3740,7 @@ static void BrowseAndStartCustomLevel(HWND hwnd) {
 
 static void RestartActiveLevel(HWND hwnd) {
     if (!g_activeCustomLevelName.empty()) {
-        const LevelDefinition custom = g_runtimeLevel;
+        const LevelDefinition custom = g_game.world.Level();
         StartLevelOne(hwnd, false, false, false, &custom);
     } else {
         StartLevelOne(hwnd, false);
@@ -3893,7 +3804,7 @@ static void RenderMainMenu(HWND hwnd) {
     if (ImGui::Button("QUIT", ImVec2(300.0f, 42.0f)))
         PostQuitMessage(0);
     ImGui::End();
-    if (levelLoadingActive) RenderLoadingScreen();
+    if (g_game.loading.Active()) RenderLoadingScreen();
 }
 
 static void RenderLoadingScreen() {
@@ -3908,7 +3819,8 @@ static void RenderLoadingScreen() {
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoInputs;
     ImGui::Begin("Loading Level", nullptr, flags);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    const char* title = gameScreen == GameScreen::LevelEditor ? "LOADING LEVEL EDITOR" :
+    const char* title =
+        g_game.session.Screen() == GameScreen::LevelEditor ? "LOADING LEVEL EDITOR" :
         (g_emptyLevelMode ? "LOADING EMPTY"
         : (g_stressTestMode ? "LOADING STRESS TEST" :
            (!g_activeCustomLevelName.empty() ? "LOADING CUSTOM LEVEL" : "LOADING LEVEL 1")));
@@ -3918,14 +3830,15 @@ static void RenderLoadingScreen() {
 
     char progressText[64];
     std::snprintf(progressText, sizeof(progressText), "Task %u / %u  (%.0f%%)",
-        levelLoadingTaskIndex, levelLoadTaskCount,
-        levelLoadingProgress * 100.0f);
-    ImGui::ProgressBar(levelLoadingProgress, ImVec2(-1.0f, 25.0f), progressText);
-    ImGui::Text("Current: %s", levelLoadingLabel.c_str());
-    ImGui::TextDisabled("Asset:   %s", levelLoadingAsset.c_str());
+        g_game.loading.TaskIndex(), g_game.loading.TaskCount(),
+        g_game.loading.Progress() * 100.0f);
+    ImGui::ProgressBar(g_game.loading.Progress(), ImVec2(-1.0f, 25.0f),
+        progressText);
+    ImGui::Text("Current: %s", g_game.loading.Label().c_str());
+    ImGui::TextDisabled("Asset:   %s", g_game.loading.Asset().c_str());
 
-    const double totalMs = LevelLoadElapsedMs(levelLoadingStartedAt);
-    const double taskMs = LevelLoadElapsedMs(levelLoadingTaskStartedAt);
+    const double totalMs = g_game.loading.TotalElapsedMilliseconds();
+    const double taskMs = g_game.loading.TaskElapsedMilliseconds();
     ImGui::Text("Elapsed: %.2f s total | %.2f s current task",
         totalMs / 1000.0, taskMs / 1000.0);
 
@@ -3938,7 +3851,8 @@ static void RenderLoadingScreen() {
     ImGui::Text("GPU buffers: %u resources | %.2f MiB queued/created",
         uploadResources, static_cast<double>(uploadBytes) / (1024.0 * 1024.0));
     ImGui::Text("Uploads: %u submitted total | %u last frame | %u pending",
-        levelLoadingSubmittedUploads, levelLoadingLastSubmittedUploads,
+        g_game.loading.SubmittedUploads(),
+        g_game.loading.LastSubmittedUploads(),
         uploads.pendingUploads);
 
     const StaticBufferDiagnosticDX12 resource = GetStaticBufferDiagnosticDX12();
@@ -3975,11 +3889,11 @@ static void RenderLoadingScreen() {
 
     ImGui::Separator();
     ImGui::TextUnformatted("Recent tasks");
-    if (levelLoadingRecords.empty()) {
+    const auto& loadRecords = g_game.loading.Records();
+    if (loadRecords.empty()) {
         ImGui::TextDisabled("Waiting for first task...");
     } else {
-        for (auto it = levelLoadingRecords.rbegin();
-             it != levelLoadingRecords.rend(); ++it) {
+        for (auto it = loadRecords.rbegin(); it != loadRecords.rend(); ++it) {
             ImGui::TextColored(it->succeeded
                 ? ImVec4(0.55f, 0.95f, 0.6f, 1.0f)
                 : ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
@@ -4041,7 +3955,7 @@ static void RenderWinScreen(HWND hwnd) {
     ImGui::SetCursorPosX((410.0f - ImGui::CalcTextSize(cleared).x) * 0.5f);
     ImGui::TextDisabled("%s", cleared);
     const int totalMilliseconds = static_cast<int>(
-        levelElapsedSeconds * 1000.0f + 0.5f);
+        g_game.session.ElapsedSeconds() * 1000.0f + 0.5f);
     const int minutes = totalMilliseconds / 60000;
     const int seconds = (totalMilliseconds / 1000) % 60;
     const int milliseconds = totalMilliseconds % 1000;
@@ -5147,7 +5061,7 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
 
     if (g_customLevelMode) {
         int groupOffset = 1000000;
-        for (const LevelEntity& entity : g_runtimeLevel.entities) {
+        for (const LevelEntity& entity : g_game.world.Level().entities) {
             if (!entity.enabled ||
                 (entity.type != LevelEntityType::WoodHouse &&
                  entity.type != LevelEntityType::MetalHouse)) continue;
@@ -5198,20 +5112,11 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
 // no WaitForGPU. Deliberately does NOT clear runtimeDirty_, so the full
 // SynchronizeEditorRuntime runs once when the interaction settles.
 static void SynchronizeEditorRuntimeLight() {
-    if (gameScreen != GameScreen::LevelEditor) return;
+    if (g_game.session.Screen() != GameScreen::LevelEditor) return;
     const LevelDefinition& edited = g_levelEditor.Level();
-    // Only a live transform update is safe here. If the entity set changed
-    // (add/delete/duplicate) the batches are stale; leave it for the full sync.
-    if (edited.entities.size() != g_runtimeLevel.entities.size()) return;
-
-    // Map entityId -> new world transform for prefab/rock entities.
-    for (size_t i = 0; i < edited.entities.size(); ++i) {
-        const LevelEntity& src = edited.entities[i];
-        LevelEntity& dst = g_runtimeLevel.entities[i];
-        if (dst.id != src.id) return;   // ordering changed -> defer to full sync
-        dst.transform = src.transform;
-        dst.enabled = src.enabled;
-    }
+    // Structural edits require the full synchronization path. RuntimeWorld
+    // validates the whole entity shape before applying any transform.
+    if (!g_game.world.SynchronizeEditorTransforms(edited)) return;
 
     // Rebuild the transform list of each prefab batch in place (same instances,
     // new matrices). entityIds were captured in build order per batch.
@@ -5219,7 +5124,7 @@ static void SynchronizeEditorRuntimeLight() {
         for (size_t j = 0; j < batch.entityIds.size(); ++j) {
             const uint64_t id = batch.entityIds[j];
             const LevelEntity* e = nullptr;
-            for (const LevelEntity& candidate : g_runtimeLevel.entities)
+            for (const LevelEntity& candidate : g_game.world.Level().entities)
                 if (candidate.id == id) { e = &candidate; break; }
             if (!e) continue;
             const Transform& t = e->transform;
@@ -5237,12 +5142,11 @@ static void SynchronizeEditorRuntimeLight() {
 }
 
 static void SynchronizeEditorRuntime(bool play) {
-    if (gameScreen != GameScreen::LevelEditor) return;
+    if (g_game.session.Screen() != GameScreen::LevelEditor) return;
     const bool foliageChanged = g_levelEditor.FoliageRuntimeDirty();
     const bool terrainChanged = g_levelEditor.TerrainRuntimeDirty();
-    g_runtimeLevel = g_levelEditor.Level();
-    g_runtimeTerrainSculpt = g_runtimeLevel.terrainSculpt;
-    g_terrain.SetSculptStamps(g_runtimeTerrainSculpt);
+    g_game.world.ReplaceFromEditor(g_levelEditor.Level());
+    g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
     g_grass.ClearRuntimeExclusions();
     g_customLevelMode = true;
     g_assetRegistry.Refresh();
@@ -5296,11 +5200,11 @@ static void SynchronizeEditorRuntime(bool play) {
 static void StartLevelEditor(HWND hwnd) {
     g_levelEditor.NewFromLevelOne();
     StartLevelOne(hwnd, true);
-    gameScreen = GameScreen::LevelEditor;
+    g_game.session.SetScreen(GameScreen::LevelEditor);
     g_customLevelMode = true;
-    g_runtimeLevel = g_levelEditor.Level();
+    g_game.world.ReplaceFromEditor(g_levelEditor.Level());
     g_pendingEnvironmentRebuild = false;
-    levelTimerRunning = false;
+    g_game.session.StopTimer();
     showUI = false;
     cameraLocked = true;
     scene.camera.FPSMode = false;
@@ -5310,16 +5214,17 @@ static void StartLevelEditor(HWND hwnd) {
 }
 
 static void BeginEditorPlaytest(HWND hwnd) {
-    if (gameScreen != GameScreen::LevelEditor || g_levelEditor.IsPlaying()) return;
+    if (g_game.session.Screen() != GameScreen::LevelEditor ||
+        g_levelEditor.IsPlaying()) return;
     g_editorCameraSnapshot = scene.camera;
     g_levelEditor.BeginPlay();
-    g_prefabHealth.clear();
+    g_game.world.Prefabs().ResetGameplayState();
     scene.ResetLevelRuntimeState();
     SynchronizeEditorRuntime(true);
-    scene.playerGodMode = true;
+    scene.player.godMode = true;
     scene.RestorePlayerHealth();
-    pendingLevelRuntimeReset = true;
-    levelTimerRunning = false;
+    g_game.commands.Request(GameCommand::ResetLevelRuntime);
+    g_game.session.StopTimer();
     cameraLocked = false;
     scene.camera.FPSMode = true;
     SetCapture(hwnd);
@@ -5334,11 +5239,11 @@ static void StopEditorPlaytest() {
     g_levelEditor.StopPlay();
     g_heldBandit = nullptr;
     g_bandits.clear();
-    g_prefabHealth.clear();
+    g_game.world.Prefabs().ResetGameplayState();
     scene.ResetLevelRuntimeState();
-    pendingLevelRuntimeReset = false;
-    pendingTurretGunnerRespawn = false;
-    levelTimerRunning = false;
+    g_game.commands.Set(GameCommand::ResetLevelRuntime, false);
+    g_game.commands.Set(GameCommand::RespawnTurretGunner, false);
+    g_game.session.StopTimer();
     scene.camera.FPSMode = false;
     scene.camera = g_editorCameraSnapshot;
     scene.camera.FPSMode = false;
@@ -5893,16 +5798,13 @@ static void ProcessInput(HWND) {
     // raises iron sights instead, so the button means the same thing in the
     // player's hands regardless of what they are holding.
     const bool aimRequested = IsGameplayScreen() &&
-        scene.playerHealth > 0.0f &&
+        scene.player.health > 0.0f &&
         !g_drivingHumvee && !cameraLocked &&
         !(showUI && ImGui::GetIO().WantCaptureMouse) &&
         (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
     const bool scopeRequested = aimRequested && GunModel::SVDSelected();
     scene.UpdateSniperScope(scopeRequested, deltaTime);
     scene.UpdateAimDownSights(aimRequested && !scopeRequested, deltaTime);
-    // Advance the view model's idle clip and rebuild its bone palette.
-    ArmsModel::Update(deltaTime);
-
     // Virtual controls are ImGui widgets, so WantCaptureKeyboard/cameraLocked
     // must not suppress the input those widgets produced on the previous frame.
     if (!g_drivingHumvee) ApplyVirtualInput();
@@ -6024,10 +5926,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     // ImGui gets first chance to consume menu clicks. Any unconsumed gameplay
     // mouse input stops here so it cannot rotate camera, fire, or change guns.
-    const bool blocksGameplayMouse = gameScreen == GameScreen::MainMenu ||
-        gameScreen == GameScreen::WinScreen ||
-        (gameScreen == GameScreen::Level1 && !scene.playerGodMode &&
-         scene.playerHealth <= 0.0f);
+    const bool blocksGameplayMouse =
+        g_game.session.Screen() == GameScreen::MainMenu ||
+        g_game.session.Screen() == GameScreen::WinScreen ||
+        (g_game.session.Screen() == GameScreen::Level1 &&
+         !scene.player.godMode && scene.player.health <= 0.0f);
     if (blocksGameplayMouse &&
         (msg == WM_MOUSEMOVE || msg == WM_MOUSEWHEEL ||
          msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
@@ -6161,11 +6064,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
-            if (IsEditorPlaying()) pendingEditorStopPlay = true;
+            if (IsEditorPlaying())
+                g_game.commands.Request(GameCommand::EditorStopPlay);
             else if (IsEditorEditing()) {
                 if (!g_levelEditor.IsDirty()) OpenMainMenu();
             }
-            else if (gameScreen != GameScreen::MainMenu) OpenMainMenu();
+            else if (g_game.session.Screen() != GameScreen::MainMenu)
+                OpenMainMenu();
             else PostQuitMessage(0);
         }
         else if (IsEditorEditing()) {
@@ -6590,7 +6495,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             rock.prefabId = "rock";
             rock.transform.position[0] = 6.0f;
             rock.transform.position[2] = 6.0f;
-            g_runtimeLevel.entities.push_back(std::move(rock));
+            g_game.world.Level().entities.push_back(std::move(rock));
             g_prefabRebuildRequested = true;
             SGE_LOG("LogPrefab", EngineLog::Level::Display,
                 "Prefab smoke test injected rock instance");
@@ -6604,7 +6509,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             "Prefab editor RTT smoke test started");
     }
     if (GetEnvironmentVariableA("SGE_DXR_DDGI_TEST", nullptr, 0) > 0) {
-        if (gameScreen != GameScreen::LevelEditor) StartLevelEditor(hwnd);
+        if (g_game.session.Screen() != GameScreen::LevelEditor)
+            StartLevelEditor(hwnd);
         LevelDXRDDGISettings& test = g_levelEditor.Level().dxrDDGI;
         test.enabled = true;
         test.showProbes = true;
@@ -6629,41 +6535,46 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         deltaTime = now - lastTime;
         lastTime  = now;
 
+        if (g_dx12.fence)
+            g_retiredPrefabResources.Collect(
+                g_dx12.fence->GetCompletedValue());
+
         if (IsEditorEditing() && !g_levelEditor.ImportInProgress() &&
             g_assetWatcher.ConsumeChange()) {
             const bool assetsChanged = g_assetRegistry.Refresh();
             if (assetsChanged || g_prefabRegistry.Refresh()) {
                 g_levelEditor.RefreshAssets();
-                WaitForGPU();
-                g_prefabRenderBatches.clear();
-                g_prefabModelCache.clear();
+                RetiredPrefabResources retired;
+                retired.renderBatches =
+                    std::move(g_game.world.Prefabs().renderBatches);
+                retired.models = std::move(g_prefabModelCache);
+                g_retiredPrefabResources.Retire(
+                    g_dx12.lastDirectFenceValue, std::move(retired));
+                g_game.world.Prefabs().ClearDerived();
                 g_prefabRebuildRequested = true;
                 SGE_LOG("LogPrefab", EngineLog::Level::Display,
                     "Asset change detected; prefab cache reloading");
             }
         }
 
-        if (pendingEditorStopPlay) {
-            pendingEditorStopPlay = false;
+        if (g_game.commands.Consume(GameCommand::EditorStopPlay)) {
             StopEditorPlaytest();
         }
-        if (pendingEditorBeginPlay) {
-            pendingEditorBeginPlay = false;
+        if (g_game.commands.Consume(GameCommand::EditorBeginPlay)) {
             BeginEditorPlaytest(hwnd);
         }
-        if (pendingEditorReturnToMenu) {
-            pendingEditorReturnToMenu = false;
+        if (g_game.commands.Consume(GameCommand::EditorReturnToMenu)) {
             g_customLevelMode = false;
             OpenMainMenu();
         }
         if (g_pendingEnvironmentRebuild && IsSceneScreen() &&
-            !levelLoadingActive && g_environmentInitialized) {
+            !g_game.loading.Active() && g_environmentInitialized) {
             WaitForGPU();
             RebuildScalableEnvironment();
             if (g_trees.IsInitialized()) ResetPalmTrees();
             g_pendingEnvironmentRebuild = false;
         }
-        if (IsEditorEditing() && !levelLoadingActive &&
+        if (IsEditorEditing() && !g_game.loading.Active() &&
             g_levelEditor.RuntimeDirty()) {
             // While the user is actively dragging/painting, do only the cheap
             // transform sync each frame so the object follows the gizmo without
@@ -6696,10 +6607,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         {
         ProfilerDX12::CpuScope updateProfile(g_profiler, "Update");
 
-        if (IsGameplayScreen() && !levelLoadingActive &&
-            (scene.playerGodMode || scene.playerHealth > 0.0f)) {
+        if (IsGameplayScreen() && !g_game.loading.Active() &&
+            (scene.player.godMode || scene.player.health > 0.0f)) {
 
-        if (pendingLevelRuntimeReset) {
+        if (g_game.commands.Consume(GameCommand::ResetLevelRuntime)) {
             // Restart is requested from ImGui after the previous frame's enemy
             // draws were recorded. Drain GPU use before destroying their buffers.
             WaitForGPU();
@@ -6711,21 +6622,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (!g_emptyLevelMode && g_environmentInitialized &&
                 g_environmentStressMode != g_stressTestMode)
                 RebuildScalableEnvironment();
-            pendingLevelRuntimeReset = false;
             if (!g_emptyLevelMode) {
                 for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
                     if (!SpawnBandit()) break;
-                pendingTurretGunnerRespawn = !g_customLevelMode ||
-                    FirstRuntimeEntity(LevelEntityType::Humvee) != nullptr;
+                g_game.commands.Set(GameCommand::RespawnTurretGunner,
+                    !g_customLevelMode ||
+                    FirstRuntimeEntity(LevelEntityType::Humvee) != nullptr);
             } else {
-                pendingTurretGunnerRespawn = false;
+                g_game.commands.Set(GameCommand::RespawnTurretGunner, false);
             }
             // Do not charge restart/reset stalls to completion time.
             lastTime = gameTimer.GetElapsed();
         }
 
-        if (levelTimerRunning)
-            levelElapsedSeconds += (std::min)(deltaTime, 0.25f);
+        g_game.session.Tick(deltaTime);
 
         ProcessInput(hwnd);
 
@@ -6753,6 +6663,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                       scene.camera.PlayerHeight);
 
         scene.Update(deltaTime, now);
+        const float playerHorizontalSpeed = g_game.playerMovement.Update(
+            scene.ViewmodelAnchorPosition(), deltaTime, !g_drivingHumvee);
+        ArmsModel::Update(deltaTime, playerHorizontalSpeed);
         if (!g_emptyLevelMode) {
             UpdateHelicopter(deltaTime);
             UpdateSecondaryHelicopter(deltaTime);
@@ -6769,8 +6682,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_banditAttackAudio.Update();
         g_banditDeathAudio.Update();
         g_banditHitVoiceAudio.Update();
-        g_banditVoiceCooldown = (std::max)(0.0f, g_banditVoiceCooldown - deltaTime);
-        g_banditPainCooldown = (std::max)(0.0f, g_banditPainCooldown - deltaTime);
+        g_enemySystem.TickCooldowns(deltaTime);
 
         if (scene.rebuildDestructionRequested && wallModel) {
             scene.rebuildDestructionRequested = false;
@@ -6798,11 +6710,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // Dead Bandits stay attached to their ragdolls. No mid-level respawns.
         if (!g_emptyLevelMode && g_banditLoaded) {
             ProfilerDX12::CpuScope banditProfile(g_profiler, "Bandit Update");
-            if (pendingTurretGunnerRespawn) {
+            if (g_game.commands.Pending(GameCommand::RespawnTurretGunner)) {
                 const bool firstReady = SpawnHumveeTurretGunner(0);
                 const bool secondReady = !g_stressTestMode ||
                     SpawnHumveeTurretGunner(1);
-                pendingTurretGunnerRespawn = !(firstReady && secondReady);
+                g_game.commands.Set(GameCommand::RespawnTurretGunner,
+                    !(firstReady && secondReady));
             }
             if (g_heldBandit && g_heldBandit->Dead()) g_heldBandit = nullptr;
             static std::unordered_map<SkinnedEnemy*, float> banditUpdateDebt;
@@ -6867,7 +6780,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // on the same line of sight the rifle uses so bandits do not lob
                 // through a wall. Mounted gunners keep to the turret.
                 if (!bandit->Dead() && !bandit->turretGunner &&
-                    !scene.playerGodMode && scene.playerHealth > 0.0f) {
+                    !scene.player.godMode && scene.player.health > 0.0f) {
                     bandit->grenadeCooldown -= deltaTime;
                     if (bandit->grenadeCooldown <= 0.0f) {
                         const float gx = bandit->position.x - scene.camera.Position.x;
@@ -6982,7 +6895,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
             {
                 ProfilerDX12::CpuScope profile(g_profiler, "Destruction Update");
-                g_destruction.Update(deltaTime);
+                g_game.physicsClock.Accumulate(deltaTime);
+                float physicsStep = 0.0f;
+                while (g_game.physicsClock.Consume(physicsStep))
+                    g_destruction.Update(physicsStep);
             }
             if (!g_emptyLevelMode) {
                 UpdateHumveeImpacts(deltaTime);
@@ -7384,8 +7300,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 }
             }
         }
-        if (gameScreen == GameScreen::Level1 && !g_emptyLevelMode && g_banditLoaded &&
-            !pendingTurretGunnerRespawn &&
+        if (g_game.session.Screen() == GameScreen::Level1 &&
+            !g_emptyLevelMode && g_banditLoaded &&
+            !g_game.commands.Pending(GameCommand::RespawnTurretGunner) &&
             LiveBanditCount() == 0 && g_helicopterDead &&
             (!g_stressTestMode || g_secondaryHelicopterDead))
             OpenWinScreen();
@@ -7415,42 +7332,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // Editor buttons are processed here, before any scene pass binds the
         // old probe atlases. Rebuilding from the late ImGui phase destroyed
         // resources still referenced by the open frame command list.
-        if (IsSceneScreen() && pendingDXRDDGIRebuild) {
-            pendingDXRDDGIRebuild = false;
-            if (gameScreen == GameScreen::LevelEditor) {
-                g_runtimeLevel = g_levelEditor.Level();
-                scene.useDDGI = g_runtimeLevel.dxrDDGI.enabled &&
+        if (IsSceneScreen() &&
+            g_game.commands.Consume(GameCommand::RebuildDDGI)) {
+            if (g_game.session.Screen() == GameScreen::LevelEditor) {
+                g_game.world.ReplaceLevel(
+                    g_levelEditor.Level(), RuntimeTerrainSource::Preserve);
+                scene.useDDGI = g_game.world.Level().dxrDDGI.enabled &&
                     g_dxrDDGI.GetStatus().dxrSupported;
                 scene.probeSpacing =
-                    g_runtimeLevel.dxrDDGI.surfaceSpacing;
+                    g_game.world.Level().dxrDDGI.surfaceSpacing;
             } else {
-                g_runtimeLevel.dxrDDGI.enabled = scene.useDDGI;
-                g_runtimeLevel.dxrDDGI.surfaceSpacing =
+                g_game.world.Level().dxrDDGI.enabled = scene.useDDGI;
+                g_game.world.Level().dxrDDGI.surfaceSpacing =
                     std::clamp(scene.probeSpacing, 0.25f, 50.0f);
-                g_runtimeLevel.dxrDDGI.maxRayDistance =
+                g_game.world.Level().dxrDDGI.maxRayDistance =
                     std::clamp(scene.giMaxDistance, 1.0f, 200.0f);
             }
-            g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
-            if (g_runtimeLevel.dxrDDGI.enabled &&
+            g_dxrDDGI.ApplySettings(g_game.world.Level().dxrDDGI);
+            if (g_game.world.Level().dxrDDGI.enabled &&
                 g_dxrDDGI.GetStatus().dxrSupported) {
                 g_dxrDDGI.MarkLayoutDirty();
                 if (!RebuildDXRDDGIProbeLayout(true)) {
-                    g_runtimeLevel.dxrDDGI.enabled = false;
+                    g_game.world.Level().dxrDDGI.enabled = false;
                     scene.useDDGI = false;
-                    g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
+                    g_dxrDDGI.ApplySettings(g_game.world.Level().dxrDDGI);
                 }
             } else {
                 scene.useDDGI = false;
                 g_dxrDDGI.ResetHistory();
             }
-            if (gameScreen == GameScreen::LevelEditor)
+            if (g_game.session.Screen() == GameScreen::LevelEditor)
                 g_levelEditor.MarkDXRDDGIRuntimeSynchronized();
         }
-        if (pendingDXRDDGIHistoryReset) {
-            pendingDXRDDGIHistoryReset = false;
+        if (g_game.commands.Consume(GameCommand::ResetDDGIHistory)) {
             g_dxrDDGI.ResetHistory();
         }
-        if (gameScreen == GameScreen::LevelEditor &&
+        if (g_game.session.Screen() == GameScreen::LevelEditor &&
             g_levelEditor.DXRDDGIRuntimeDirty()) {
             if (g_levelEditor.DXRDDGILayoutDirty())
                 g_dxrDDGI.MarkLayoutDirty();
@@ -7458,12 +7375,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_levelEditor.MarkDXRDDGIRuntimeSynchronized();
         }
         static uint32_t dxrDDGIFrame = 0;
-        if (g_runtimeLevel.dxrDDGI.enabled) {
-            if (std::abs(g_runtimeLevel.dxrDDGI.maxRayDistance -
+        if (g_game.world.Level().dxrDDGI.enabled) {
+            if (std::abs(g_game.world.Level().dxrDDGI.maxRayDistance -
                          scene.giMaxDistance) > 0.001f) {
-                g_runtimeLevel.dxrDDGI.maxRayDistance =
+                g_game.world.Level().dxrDDGI.maxRayDistance =
                     std::clamp(scene.giMaxDistance, 1.0f, 200.0f);
-                g_dxrDDGI.ApplySettings(g_runtimeLevel.dxrDDGI);
+                g_dxrDDGI.ApplySettings(g_game.world.Level().dxrDDGI);
             }
             if (g_dxrDDGI.HistoryDirty()) g_dxrDDGI.ResetHistory();
             ComPtr<ID3D12GraphicsCommandList4> dxrDDGICommands;
@@ -7492,7 +7409,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (dxrDDGIFrame == 30 &&
                 GetEnvironmentVariableA(
                     "SGE_DXR_DDGI_TEST", nullptr, 0) > 0) {
-                pendingDXRDDGIRebuild = true;
+                g_game.commands.Request(GameCommand::RebuildDDGI);
                 SGE_LOG("LogRenderer", EngineLog::Level::Display,
                     "DXR DDGI smoke rebuild queued");
             }
@@ -7533,8 +7450,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_profiler.BeginGpuFrame(g_dx12.frameIndex, g_dx12.commandList.Get());
 
         float cc[4] = { scene.clearColor.x, scene.clearColor.y, scene.clearColor.z, 1.0f };
-        if (visibilityTestPending && gameScreen == GameScreen::Level1 &&
-            !levelLoadingActive) {
+        if (visibilityTestPending &&
+            g_game.session.Screen() == GameScreen::Level1 &&
+            !g_game.loading.Active()) {
             ++visibilityTestForwardFrames;
             if (visibilityTestForwardFrames == 1) {
                 std::ofstream("visibility_smoke.log", std::ios::app)
@@ -7549,10 +7467,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     << "toggled\n";
             }
         }
-        const bool usingRaytracing =
-            scene.useRaytracing && g_rt.initialized;
+        const RenderPath renderPath = RenderCoordinator::Choose({
+            scene.useRaytracing,
+            scene.useVisibilityBuffer,
+            g_rt.initialized,
+            visBuffer.initialized
+        });
+        const bool usingRaytracing = renderPath == RenderPath::Raytracing;
         const bool usingVisibility =
-            !usingRaytracing && scene.useVisibilityBuffer && visBuffer.initialized;
+            renderPath == RenderPath::VisibilityBuffer;
         static bool visibilityWasActive = false;
         if (usingVisibility != visibilityWasActive) {
             visBuffer.InvalidateTemporalHistory();
@@ -7599,7 +7522,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         mainShader.SetPalmWindFrame(g_trees.GetWindFrame());
         g_meshShader.BeginFrame();
         hzbCaptureActive = IsSceneScreen() &&
-            !levelLoadingActive && !usingRaytracing && !msaaActive &&
+            !g_game.loading.Active() && !usingRaytracing && !msaaActive &&
             (g_useMeshShader || usingVisibility);
         if (!hzbCaptureActive) occlusionDepth.InvalidateCameraHistory();
         mainShader.SetPreviousViewProjection(previousHZBViewProjection);
@@ -7612,8 +7535,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             hzbHistoryUsable,
             occlusionDepth.GetMipCount());
 
-        if (IsSceneScreen() && levelLoadingActive) {
-        if (levelLoadStage == LevelLoadStage::WorldAssets) {
+        if (IsSceneScreen() && g_game.loading.Active()) {
+        if (g_game.loading.Stage() == LevelLoadStage::WorldAssets) {
             LoadFloorMudMaterial();
             if (!g_emptyLevelMode) {
                 std::cout << "Loading models/h2.glb...\n";
@@ -7624,7 +7547,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 "Destruction geometry and Blast actors",
                 "procedural house chunks + roof",
                 g_emptyLevelMode || crateModel != nullptr);
-        } else if (levelLoadStage == LevelLoadStage::Destruction) {
+        } else if (g_game.loading.Stage() == LevelLoadStage::Destruction) {
             if (!levelDestructionLoadInFlight) {
                 if (g_destruction.IsInitialized()) WaitForGPU();
                 // Build authored scene nodes on the render thread because their
@@ -7653,11 +7576,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // the loading screen update while thousands of chunks build.
                 const std::shared_ptr<SceneNode> destructionModel = wallModel;
                 ComPtr<ID3D12Device> destructionDevice = g_dx12.device;
-                levelLoadingLabel =
-                    "Build meshlet SRVs, Blast actors and depth-only batch";
-                levelLoadingAsset = g_stressTestMode
-                    ? "DestructionDX12: stressWallModel"
-                    : "DestructionDX12: normalWallModel";
+                g_game.loading.SetCurrent(
+                    "Build meshlet SRVs, Blast actors and depth-only batch",
+                    g_stressTestMode
+                        ? "DestructionDX12: stressWallModel"
+                        : "DestructionDX12: normalWallModel");
                 levelDestructionLoadFuture = std::async(std::launch::async,
                     [destructionModel, destructionDevice]() {
                         return g_destruction.Initialize(destructionModel,
@@ -7685,7 +7608,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                             : "level environment"),
                     initialized);
             }
-        } else if (levelLoadStage == LevelLoadStage::Environment) {
+        } else if (g_game.loading.Stage() == LevelLoadStage::Environment) {
             // Pool of water beside the house (on the clear -X side) with a
             // handful of wooden crates dropped in to bob on the surface.
             // Pool sunk into a dug-out terrain basin (see TerrainHeight): the
@@ -7757,7 +7680,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             AdvanceLevelLoading(LevelLoadStage::Weapons,
                 "Weapon and explosive barrel",
                 "AK47 + models/Barrel Explosive/barrel.FBX");
-        } else if (levelLoadStage == LevelLoadStage::Weapons) {
+        } else if (g_game.loading.Stage() == LevelLoadStage::Weapons) {
 
             // The AK47 view model. Loaded here so its texture uploads land in the
             // same command list the flush below submits.
@@ -7806,7 +7729,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     "Content/Models/Humvee/humvee.fbx",
                     g_explosiveBarrelModel != nullptr);
             }
-        } else if (levelLoadStage == LevelLoadStage::Humvee) {
+        } else if (g_game.loading.Stage() == LevelLoadStage::Humvee) {
             g_humveeModel = FBXImporter::Load(
                 "Content/Models/Humvee/humvee.fbx",
                 g_dx12.device, g_dx12.commandList, 1.0f, false, true);
@@ -7827,7 +7750,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             AdvanceLevelLoading(LevelLoadStage::Helicopter,
                 "OH-1 import, geometry LOD and rotor setup",
                 "Content/Models/OH-1_fbx/OH-1.fbx", g_humveeModel != nullptr);
-        } else if (levelLoadStage == LevelLoadStage::Helicopter) {
+        } else if (g_game.loading.Stage() == LevelLoadStage::Helicopter) {
 
             const std::string helicopterModelPath =
                 ResolveTexturePath("Content/Models/OH-1_fbx/OH-1.fbx");
@@ -7857,7 +7780,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 "Bandit mesh, skeleton, clips and physics asset",
                 "Content/Models/MilitaryMercenaryBandit/SK_Bandit.FBX",
                 g_helicopterModel != nullptr);
-        } else if (levelLoadStage == LevelLoadStage::BanditModel) {
+        } else if (g_game.loading.Stage() == LevelLoadStage::BanditModel) {
 
             // Skinned Bandit enemy: mesh + walk/idle/run clips. Texture uploads
             // ride the same command list flushed just below.
@@ -7884,7 +7807,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_stressTestMode ? "stress squad: enemies + 2 gunners"
                                  : "level squad: enemies + gunner",
                 g_banditModel.valid);
-        } else if (levelLoadStage == LevelLoadStage::BanditSpawn) {
+        } else if (g_game.loading.Stage() == LevelLoadStage::BanditSpawn) {
             if (g_banditModel.valid) {
                 for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
                     if (!SpawnBandit()) break;
@@ -7897,7 +7820,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             AdvanceLevelLoading(LevelLoadStage::GPUFinalize,
                 "Drain graphics uploads and generate texture mips",
                 "direct queue + compute queue", g_banditLoaded);
-        } else if (levelLoadStage == LevelLoadStage::GPUFinalize) {
+        } else if (g_game.loading.Stage() == LevelLoadStage::GPUFinalize) {
 
             // Flush the load/mip-generation commands now and print any D3D12
             // validation errors before continuing, so mip-related bugs surface
@@ -7912,7 +7835,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             AdvanceLevelLoading(LevelLoadStage::ReleaseUploads,
                 "Release staging heaps and validate DX12 device",
                 "material upload heaps");
-        } else if (levelLoadStage == LevelLoadStage::ReleaseUploads) {
+        } else if (g_game.loading.Stage() == LevelLoadStage::ReleaseUploads) {
             ReleaseMaterialUploadHeaps(g_helicopterModel);
             ReleaseMaterialUploadHeaps(g_humveeModel);
             ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
@@ -7936,7 +7859,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             CompleteLevelLoading(g_dx12.device &&
                 g_dx12.device->GetDeviceRemovedReason() == S_OK);
-            levelTimerRunning = true;
+            g_game.session.StartTimer();
             lastTime = gameTimer.GetElapsed();
         }
         }
@@ -7948,26 +7871,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // heaps. Record all copies before any pass consumes those resources.
         const uint32_t submittedUploads =
             FlushStaticBufferUploadsDX12(g_dx12.commandList.Get());
-        if (levelLoadingActive) {
-            levelLoadingLastSubmittedUploads = submittedUploads;
-            levelLoadingSubmittedUploads += submittedUploads;
-        }
+        if (g_game.loading.Active())
+            g_game.loading.RecordSubmittedUploads(submittedUploads);
 
         XMMATRIX fogLightSpace = XMMatrixIdentity();
         ID3D12Resource* fogShadowResource = nullptr;
         bool renderedScene = false;
-        if (IsSceneScreen() && !levelLoadingActive &&
+        if (IsSceneScreen() && !g_game.loading.Active() &&
             usingRaytracing) {
             ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());
             RenderRaytracing(scene);
-        } else if (IsSceneScreen() && !levelLoadingActive &&
+        } else if (IsSceneScreen() && !g_game.loading.Active() &&
                    usingVisibility) {
             ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
                 lightSpace = shadowMap.Render(
-                    scene, geo, (!g_emptyLevelMode && g_showH2Model)
+                    scene, geo, g_prefabRenderBatches,
+                    (!g_emptyLevelMode && g_showH2Model)
                         ? (crateShadowModel ? crateShadowModel : crateModel)
                         : nullptr,
                     (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr);
@@ -7986,16 +7908,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (!visibilityDebugActive) {
                 ProfilerDX12::Scope extensions(
                     g_profiler, "Forward Extensions", g_dx12.commandList.Get());
-                RenderForward(scene, mainShader, geo, crateModel, floorMaterial,
+                RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
+                    crateModel, floorMaterial,
                     lightSpace, shadowResource, true, !grassMSAAActive);
             }
-        } else if (IsSceneScreen() && !levelLoadingActive) {
+        } else if (IsSceneScreen() && !g_game.loading.Active()) {
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
                 ProfilerDX12::Scope profile(g_profiler, "Shadow", g_dx12.commandList.Get());
                 lightSpace = shadowMap.Render(
-                    scene, geo, (!g_emptyLevelMode && g_showH2Model)
+                    scene, geo, g_prefabRenderBatches,
+                    (!g_emptyLevelMode && g_showH2Model)
                         ? (crateShadowModel ? crateShadowModel : crateModel)
                         : nullptr,
                     (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr);
@@ -8013,7 +7937,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             {
                 ProfilerDX12::Scope profile(g_profiler, "Forward", g_dx12.commandList.Get());
-                RenderForward(scene, mainShader, geo, crateModel, floorMaterial, lightSpace, shadowResource);
+                RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
+                    crateModel, floorMaterial, lightSpace, shadowResource);
             }
         }
 
@@ -8160,13 +8085,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
         g_thumbnailUploadedThisFrame = false;
-        if (levelLoadingActive) {
+        if (g_game.loading.Active()) {
             RenderLoadingScreen();
-        } else if (gameScreen == GameScreen::MainMenu) {
+        } else if (g_game.session.Screen() == GameScreen::MainMenu) {
             RenderMainMenu(hwnd);
-        } else if (gameScreen == GameScreen::WinScreen) {
+        } else if (g_game.session.Screen() == GameScreen::WinScreen) {
             RenderWinScreen(hwnd);
-        } else if (gameScreen == GameScreen::LevelEditor) {
+        } else if (g_game.session.Screen() == GameScreen::LevelEditor) {
             const DXRDDGIRenderer::Status& ddgiStatus = g_dxrDDGI.GetStatus();
             g_levelEditor.SetDXRDDGIStatus({
                 ddgiStatus.dxrSupported, ddgiStatus.updatesActive,
@@ -8182,13 +8107,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     params.heightScale = scene.terrainHeightScale;
                     return TerrainRendererDX12::HeightAt(params, x, z);
                 }, PrefabThumbnailTexture);
-            pendingEditorBeginPlay = actions.beginPlay;
-            pendingEditorStopPlay = actions.stopPlay;
-            pendingEditorReturnToMenu = actions.returnToMenu;
+            g_game.commands.Set(
+                GameCommand::EditorBeginPlay, actions.beginPlay);
+            g_game.commands.Set(
+                GameCommand::EditorStopPlay, actions.stopPlay);
+            g_game.commands.Set(
+                GameCommand::EditorReturnToMenu, actions.returnToMenu);
             if (actions.rebuildDXRDDGI)
-                pendingDXRDDGIRebuild = true;
+                g_game.commands.Request(GameCommand::RebuildDDGI);
             if (actions.resetDXRDDGIHistory)
-                pendingDXRDDGIHistoryReset = true;
+                g_game.commands.Request(GameCommand::ResetDDGIHistory);
             DrawDXRDDGIProbeDebug(
                 scene.GetViewMatrix(), scene.GetProjectionMatrix());
             if (g_levelEditor.IsPlaying()) RenderPlayerHUD(scene);
@@ -8215,7 +8143,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 DrawDXRDDGIProbeDebug(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
             }
-            if (!scene.playerGodMode && scene.playerHealth <= 0.0f) {
+            if (!scene.player.godMode && scene.player.health <= 0.0f) {
                 RenderDeathScreen(hwnd);
             } else {
                 if (showUI) RenderUI(scene, visBuffer);
@@ -8289,7 +8217,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
 
         if (visibilityBenchmark && !visibilityBenchmarkComplete &&
-            gameScreen == GameScreen::Level1 && !levelLoadingActive) {
+            g_game.session.Screen() == GameScreen::Level1 &&
+            !g_game.loading.Active()) {
             const double gpuMs = g_profiler.GpuFrameMs();
             if (!usingVisibility) {
                 if (visibilityTestForwardFrames > 120 && gpuMs > 0.0) {

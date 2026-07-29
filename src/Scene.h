@@ -4,6 +4,7 @@
 #include "DX12Core.h"
 #include "CameraDX12.h"
 #include "ClusteredRendererDX12.h"
+#include "PlayerState.h"
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
@@ -187,87 +188,14 @@ struct Scene {
     float gunRecoilKick      = 0.0f;    // viewmodel pitch, degrees
     float recoilPitch        = 0.55f;   // camera climb per shot, degrees
     float recoilYaw          = 0.22f;   // random horizontal camera kick
-    float playerMaxHealth    = 100.0f;
-    float playerHealth       = 100.0f;
-    float playerDamageFlash  = 0.0f;
-    bool  playerGodMode      = false;
-    // Regenerating health. Any damage restarts the delay, so staying in a
-    // firefight never heals you -- breaking contact is what does. The rate is
-    // deliberately slower than sustained rifle fire, so regen rewards
-    // disengaging without trivialising a fight the player chooses to stand in.
-    bool  playerHealthRegen  = true;
-    float playerRegenDelay   = 5.0f;   // seconds after last hit before healing
-    float playerRegenRate    = 12.0f;  // health per second once it starts
-    float playerRegenTimer   = 0.0f;   // counts down to the delay above
+    PlayerState player;
 
-    // Ammo, per weapon slot (0 = AK47, 1 = shotgun, 2 = RPG-7, 3 = SVD) to match
-    // GunModel::SelectedWeapon(). Only enforced when playerGodMode is false --
-    // god mode keeps the old unlimited-fire behaviour so sandbox/debug levels
-    // are unchanged. magazine = rounds in the gun, reserve = spare rounds.
-    static constexpr int kWeaponSlots = 4;
-    int magazineSize[kWeaponSlots] = { 30,  8,  1, 10 };
-    int maxReserve  [kWeaponSlots] = { 240, 64, 8, 80 };
-    // Tuned around the reload clip (Content/Audio/... , 1.512s) so the
-    // sound lands close to when the magazine actually seats. The RPG and
-    // shotgun run longer deliberately -- they read as heavier reloads, and the
-    // audio simply finishes a little early there.
-    float reloadTime[kWeaponSlots] = { 1.55f, 2.4f, 2.8f, 1.75f };
-    int   magazine  [kWeaponSlots] = { 30,  8,  1, 10 };
-    int   reserve   [kWeaponSlots] = { 120, 32, 4, 40 };
-    float reloadTimer = 0.0f;   // >0 while reloading; blocks firing
-    int   reloadingSlot = -1;   // slot being reloaded, -1 when idle
-
-    bool AmmoEnforced() const { return !playerGodMode; }
-    bool Reloading() const { return reloadTimer > 0.0f; }
-
-    // Refill everything to a full magazine + full reserve. Used on level start
-    // so a fresh run never begins dry.
-    void RestoreAmmo() {
-        for (int i = 0; i < kWeaponSlots; ++i) {
-            magazine[i] = magazineSize[i];
-            reserve[i] = maxReserve[i];
-        }
-        reloadTimer = 0.0f;
-        reloadingSlot = -1;
-    }
-
-    // Begin a reload of `slot`. No-op when god mode is on, already reloading,
-    // the magazine is full, or there is nothing in reserve to load.
-    bool BeginReload(int slot) {
-        if (!AmmoEnforced() || Reloading()) return false;
-        if (slot < 0 || slot >= kWeaponSlots) return false;
-        if (magazine[slot] >= magazineSize[slot] || reserve[slot] <= 0)
-            return false;
-        reloadingSlot = slot;
-        reloadTimer = reloadTime[slot];
-        return true;
-    }
-
-    // Drive the reload timer. Ammo moves from reserve to magazine only on
-    // completion, so interrupting a reload (weapon swap) loses no rounds.
-    void UpdateReload(float dt) {
-        if (!Reloading()) return;
-        reloadTimer -= dt;
-        if (reloadTimer > 0.0f) return;
-        reloadTimer = 0.0f;
-        const int slot = reloadingSlot;
-        reloadingSlot = -1;
-        if (slot < 0 || slot >= kWeaponSlots) return;
-        const int needed = magazineSize[slot] - magazine[slot];
-        const int moved = (needed < reserve[slot]) ? needed : reserve[slot];
-        magazine[slot] += moved;
-        reserve[slot] -= moved;
-    }
-
-    // Consume one round from `slot`. Returns false (and fires nothing) when the
-    // magazine is empty, so the caller can skip the shot and its cooldown.
-    bool ConsumeAmmo(int slot) {
-        if (!AmmoEnforced()) return true;
-        if (slot < 0 || slot >= kWeaponSlots) return true;
-        if (Reloading() || magazine[slot] <= 0) return false;
-        --magazine[slot];
-        return true;
-    }
+    bool AmmoEnforced() const { return player.AmmoEnforced(); }
+    bool Reloading() const { return player.Reloading(); }
+    void RestoreAmmo() { player.RestoreAmmo(); }
+    bool BeginReload(int slot) { return player.BeginReload(slot); }
+    void UpdateReload(float dt) { player.UpdateReload(dt); }
+    bool ConsumeAmmo(int slot) { return player.ConsumeAmmo(slot); }
 
     // Grenade (press G): lobbed, arcs under gravity, radial blast on fuse.
     float grenadeThrowSpeed    = 16.0f;  // launch speed along aim
@@ -420,25 +348,25 @@ struct Scene {
         gunRecoilBack = 0.0f;
         gunRecoilKick = 0.0f;
         grenadeCooldown = 0.0f;
-        playerDamageFlash = 0.0f;
-        playerRegenTimer = 0.0f;
+        player.damageFlash = 0.0f;
+        player.regenTimer = 0.0f;
         adsBlend = 0.0f;
         adsActive = false;
     }
 
     void DamagePlayer(float damage) {
-        if (playerGodMode || damage <= 0.0f || playerHealth <= 0.0f) return;
-        playerHealth = (std::max)(0.0f, playerHealth - damage);
-        playerDamageFlash = 0.22f;
+        if (player.godMode || damage <= 0.0f || player.health <= 0.0f) return;
+        player.health = (std::max)(0.0f, player.health - damage);
+        player.damageFlash = 0.22f;
         // Restart the hold-off on every hit, including the one that kills, so a
         // revive does not inherit a nearly expired timer.
-        playerRegenTimer = playerRegenDelay;
+        player.regenTimer = player.regenDelay;
     }
 
     void RestorePlayerHealth() {
-        playerHealth = playerMaxHealth;
-        playerDamageFlash = 0.0f;
-        playerRegenTimer = 0.0f;
+        player.health = player.maxHealth;
+        player.damageFlash = 0.0f;
+        player.regenTimer = 0.0f;
         // Ammo rides along with health: every caller (level start, editor play,
         // the debug Restore button) wants a fully kitted player, and refilling
         // here keeps the two from drifting apart.
@@ -472,16 +400,16 @@ struct Scene {
         camera.Update(dt);
 
         muzzleFlashTime = (std::max)(0.0f, muzzleFlashTime - dt);
-        playerDamageFlash = (std::max)(0.0f, playerDamageFlash - dt);
+        player.damageFlash = (std::max)(0.0f, player.damageFlash - dt);
 
         // Health regen. Death is final: at zero health the timer stops rather
         // than quietly healing a corpse back to fighting strength.
-        if (playerHealthRegen && playerHealth > 0.0f &&
-            playerHealth < playerMaxHealth) {
-            playerRegenTimer = (std::max)(0.0f, playerRegenTimer - dt);
-            if (playerRegenTimer <= 0.0f) {
-                playerHealth = (std::min)(playerMaxHealth,
-                                          playerHealth + playerRegenRate * dt);
+        if (player.healthRegen && player.health > 0.0f &&
+            player.health < player.maxHealth) {
+            player.regenTimer = (std::max)(0.0f, player.regenTimer - dt);
+            if (player.regenTimer <= 0.0f) {
+                player.health = (std::min)(player.maxHealth,
+                                           player.health + player.regenRate * dt);
             }
         }
         // Sharp impulse, quick mechanical return. Camera aim stays displaced,

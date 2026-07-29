@@ -579,6 +579,7 @@ public:
 
     XMMATRIX Render(Scene& scene,
                     const GeometryBuffers& geo,
+                    const std::vector<PrefabRenderBatch>& prefabRenderBatches,
                     const std::shared_ptr<SceneNode>& crateModel,
                     const std::vector<std::unique_ptr<SkinnedEnemy>>* bandits = nullptr) {
         const auto cascadeMatrices = ComputeCascadeMatrices(scene);
@@ -684,7 +685,7 @@ public:
                 depthShader, humveeTransforms, lightSpace);
         }
 
-        for (const PrefabRenderBatch& batch : g_prefabRenderBatches) {
+        for (const PrefabRenderBatch& batch : prefabRenderBatches) {
             if (batch.model && batch.castShadow && !batch.transforms.empty())
                 DrawSceneNodeShadowInstances(batch.model, depthShader,
                     batch.transforms, lightSpace);

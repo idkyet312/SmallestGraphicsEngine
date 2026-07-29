@@ -1,10 +1,13 @@
 #ifndef PREFAB_RUNTIME_H
 #define PREFAB_RUNTIME_H
 
+#include "PrefabColliders.h"
 #include "SceneGraph.h"
 #include <DirectXMath.h>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct PrefabRenderBatch {
@@ -52,10 +55,30 @@ struct PrefabDestructibleInstance {
     float health = 100.0f;
 };
 
-extern std::vector<PrefabRenderBatch> g_prefabRenderBatches;
-extern std::vector<PrefabLightInstance> g_prefabLightInstances;
-extern std::vector<PrefabAudioEmitter> g_prefabAudioEmitters;
-extern std::vector<PrefabSpawnPoint> g_prefabSpawnPoints;
-extern std::vector<PrefabDestructibleInstance> g_prefabDestructibles;
+// Runtime-owned result of compiling prefab definitions into game-facing data.
+// Renderers receive the render batches explicitly; gameplay systems access the
+// remaining collections through RuntimeWorld. No subsystem owns free globals.
+struct PrefabRuntimeState {
+    std::vector<PrefabRenderBatch> renderBatches;
+    std::vector<PrefabCollider> colliders;
+    std::vector<PrefabLightInstance> lights;
+    std::vector<PrefabAudioEmitter> audioEmitters;
+    std::vector<PrefabSpawnPoint> spawnPoints;
+    std::vector<PrefabDestructibleInstance> destructibles;
+    std::unordered_map<uint64_t, float> health;
+
+    void ClearDerived() {
+        renderBatches.clear();
+        colliders.clear();
+        lights.clear();
+        audioEmitters.clear();
+        spawnPoints.clear();
+        destructibles.clear();
+    }
+
+    void ResetGameplayState() {
+        health.clear();
+    }
+};
 
 #endif
