@@ -45,7 +45,7 @@ public:
         static std::vector<PalmSlice> slices;
         return slices;
     }
-    // Everything above the trunk: the frond crown, as a single mesh.
+    // All leaf geometry: the frond crown, as a single mesh.
     static std::shared_ptr<SceneMesh>& Crown() {
         static std::shared_ptr<SceneMesh> crown;
         return crown;
@@ -162,7 +162,9 @@ public:
         // fronds splay out far past it.
         s_crownBaseY = FindCrownBase(prims);
 
-        // Trunk: slice the band [0, crownBaseY) into equal-height pieces.
+        // Trunk: slice only bark into equal-height pieces. Long crown cards hang
+        // below crownBaseY; putting their low triangles into trunk slices leaves
+        // detached leaf strips and stretched cards on a freshly cut stump.
         const float segLen = s_crownBaseY / std::max(1, segmentCount);
         TrunkSlices().clear();
         for (int i = 0; i < segmentCount; ++i) {
@@ -171,12 +173,15 @@ public:
             PalmSlice slice;
             slice.yLo = y0;
             slice.yHi = y1;
-            slice.mesh = SliceBand(prims, y0, y1);
+            slice.mesh = SliceBand(
+                prims, y0, y1, Materials()[0].get());
             TrunkSlices().push_back(std::move(slice));
         }
 
-        // Crown: everything from crownBaseY up, as one mesh.
-        Crown() = SliceBand(prims, s_crownBaseY, s_height + 1.0f);
+        // Crown: every leaf triangle, including cards that droop below the nominal
+        // crown base. This keeps the complete crown attached to the falling half.
+        Crown() = SliceBand(
+            prims, 0.0f, s_height + 1.0f, Materials()[1].get());
 
         s_loaded = !TrunkSlices().empty();
         std::cout << "Palm sliced: " << TrunkSlices().size() << " trunk segments, crown at y="
@@ -402,14 +407,17 @@ private:
     // and drawing each one per tree per frame was what exhausted the draw-call and
     // descriptor budgets. After AssignMaterials there are only two materials, so a
     // slice comes out as at most two primitives (bark + leaf).
-    static std::shared_ptr<SceneMesh> SliceBand(const std::vector<MeshPrimitive>& prims,
-                                                float y0, float y1) {
+    static std::shared_ptr<SceneMesh> SliceBand(
+        const std::vector<MeshPrimitive>& prims, float y0, float y1,
+        const SceneMaterial* requiredMaterial = nullptr) {
         auto mesh = std::make_shared<SceneMesh>();
 
         // material -> index of the merged output primitive in mesh->primitives
         std::vector<std::pair<SceneMaterial*, size_t>> outByMat;
 
         for (const MeshPrimitive& src : prims) {
+            if (requiredMaterial && src.material.get() != requiredMaterial)
+                continue;
             MeshPrimitive* out = nullptr;
             for (auto& [mat, idx] : outByMat)
                 if (mat == src.material.get()) { out = &mesh->primitives[idx]; break; }

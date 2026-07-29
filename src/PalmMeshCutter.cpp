@@ -19,6 +19,7 @@ namespace {
 
 constexpr size_t kVertexStride = 12;
 constexpr float kPlaneEpsilon = 1e-5f;
+constexpr float kCutTilt = 0.04f;
 
 using Vertex = std::array<float, kVertexStride>;
 
@@ -121,6 +122,14 @@ void CollectTriangleIntersections(const std::array<Vertex, 3>& triangle,
             intersections.push_back(a);
         }
     }
+}
+
+bool IsTrunkSurface(const MeshPrimitive& primitive) {
+    // PalmModel assigns shared, named materials before slicing. Only bark forms
+    // the closed trunk contour. Leaf cards can cross the cut plane far from the
+    // trunk; including those points in one convex cap creates the long stretched
+    // triangles seen after a split.
+    return primitive.material && primitive.material->name == "palm_bark";
 }
 
 std::shared_ptr<SceneMaterial> WoodCapMaterial() {
@@ -292,8 +301,8 @@ PalmMeshCut PalmMeshCutter::Cut(
     result.upper->name = source->name + "_upper";
 
     XMVECTOR planeNormal = XMVector3Normalize(XMVectorSet(
-        -impactDirectionXZ.x * 0.13f, 1.0f,
-        -impactDirectionXZ.y * 0.13f, 0.0f));
+        -impactDirectionXZ.x * kCutTilt, 1.0f,
+        -impactDirectionXZ.y * kCutTilt, 0.0f));
     XMFLOAT3 normal{};
     XMStoreFloat3(&normal, planeNormal);
     const float planeDistance = cutY * normal.y;
@@ -317,8 +326,10 @@ PalmMeshCut PalmMeshCutter::Cut(
                     : sourcePrimitive.indices[triangleIndex * 3 + corner];
                 triangle[corner] = ReadVertex(sourcePrimitive, index);
             }
-            CollectTriangleIntersections(
-                triangle, normal, planeDistance, intersections);
+            if (IsTrunkSurface(sourcePrimitive)) {
+                CollectTriangleIntersections(
+                    triangle, normal, planeDistance, intersections);
+            }
             AppendPolygon(lower, ClipTriangle(
                 triangle, normal, planeDistance, true));
             AppendPolygon(upper, ClipTriangle(

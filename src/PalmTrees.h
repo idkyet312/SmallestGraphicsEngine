@@ -488,7 +488,8 @@ private:
     static constexpr int   kTrunkSegments = 18;
     static constexpr float kSegmentLen    = 1.2f;
     static constexpr float kTrunkBase     = 0.17f;
-    static constexpr float kSegmentHealth = 45.0f;
+    // Default bullets deal 15 damage. Two hits sever the struck band.
+    static constexpr float kSegmentHealth = 30.0f;
     static constexpr int   kFronds        = 7;
     static constexpr float kFrondLen      = 2.6f;
     static constexpr float kFrondWidth    = 0.28f;
@@ -502,7 +503,7 @@ private:
     // them low -- gravity brings the tree down, the impulse only picks the
     // direction. Raising these launches the log instead of toppling it.
     static constexpr float kTopple = 0.6f;
-    static constexpr float kSpin   = 0.5f;
+    static constexpr float kToppleAngularSpeed = 0.8f;
     static constexpr float kExplosionPush = 2.8f;
 
     // Far above real wood (~700) on purpose: a palm trunk is thin, and at honest
@@ -551,6 +552,8 @@ private:
         std::vector<Piece>   pieces;
         std::vector<Segment> segments;   // parallel to the trunk pieces' seg indices
         std::shared_ptr<SceneMesh> trunkMesh;
+        XMFLOAT3 fallDirection{ 1.0f, 0.0f, 0.0f };
+        bool mustFall = true;
         bool asleep = false;
     };
 
@@ -806,16 +809,21 @@ private:
         log.pieces = std::move(pieces);
         log.segments = std::move(segments);
         log.trunkMesh = std::move(trunkMesh);
+        log.fallDirection = FallDir(dir);
 
         for (const Piece& p : log.pieces) AddPieceShape(log.body, p);
 
         const float mass = std::max(1.0f, b3Body_GetMass(log.body));
         const b3Vec3 imp = { dir.x * kTopple * mass, 0.0f, dir.z * kTopple * mass };
         b3Body_ApplyLinearImpulseToCenter(log.body, imp, true);
-        // Torque about the horizontal axis perpendicular to the fall, so it pivots
-        // over the break instead of sliding away flat.
-        const b3Vec3 spin = { -dir.z * kSpin * mass, 0.0f, dir.x * kSpin * mass };
-        b3Body_ApplyAngularImpulse(log.body, spin, true);
+        // Set a minimum angular speed instead of scaling an impulse by mass.
+        // Angular impulse divided by a tall trunk's large inertia was sometimes
+        // too small, leaving the new body balanced upright on its cut face.
+        const b3Vec3 spin = {
+            -log.fallDirection.z * kToppleAngularSpeed, 0.0f,
+             log.fallDirection.x * kToppleAngularSpeed
+        };
+        b3Body_SetAngularVelocity(log.body, spin);
 
         ++m_activeBodies;
         m_logs.push_back(std::move(log));
@@ -1103,6 +1111,30 @@ private:
             const b3Vec3 w = b3Body_GetAngularVelocity(log.body);
             const float lin = (float)(v.x * v.x + v.y * v.y + v.z * v.z);
             const float ang = (float)(w.x * w.x + w.y * w.y + w.z * w.z);
+
+            // Never freeze a freshly detached section while it is still standing.
+            // If collision friction kills its spin, wake it with the guaranteed
+            // topple speed until its trunk axis is close to the ground.
+            if (log.mustFall) {
+                const b3Quat q = b3Body_GetRotation(log.body);
+                const XMVECTOR up = XMVector3Rotate(
+                    XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f),
+                    XMVectorSet(q.v.x, q.v.y, q.v.z, q.s));
+                if (std::abs(XMVectorGetY(up)) <= 0.45f) {
+                    log.mustFall = false;
+                } else {
+                    constexpr float retrySpeedSq =
+                        kToppleAngularSpeed * kToppleAngularSpeed * 0.25f;
+                    if (ang < retrySpeedSq) {
+                        b3Body_SetAngularVelocity(log.body, {
+                            -log.fallDirection.z * kToppleAngularSpeed, 0.0f,
+                             log.fallDirection.x * kToppleAngularSpeed
+                        });
+                    }
+                    continue;
+                }
+            }
+
             if (lin < 0.03f && ang < 0.03f) {
                 b3Body_SetType(log.body, b3_staticBody);
                 log.asleep = true;
@@ -1220,17 +1252,10 @@ private:
                     // the cut, so we rebuild the slice's pose in the body's frame and
                     // let the body transform carry it. Uniform scale only: squashing
                     // a mesh to the box's extents would deform the trunk.
-                    float damageScale = 1.0f;
-                    if (!p.crown && p.seg >= 0 &&
-                        p.seg < static_cast<int>(log.segments.size())) {
-                        const float healthFraction = (std::max)(0.0f,
-                            log.segments[p.seg].health / kSegmentHealth);
-                        damageScale = 0.58f + 0.42f * healthFraction;
-                    }
                     const XMMATRIX local =
-                        XMMatrixScaling(p.modelScaleXZ * damageScale,
+                        XMMatrixScaling(p.modelScaleXZ,
                                         p.modelScale,
-                                        p.modelScaleXZ * damageScale) *
+                                        p.modelScaleXZ) *
                         XMMatrixTranslation(p.modelOrigin.x, p.modelOrigin.y, p.modelOrigin.z);
                     XMStoreFloat4x4(&item.transform, local * bodyXf);
                     item.segment = p.crown ? -1 : p.modelSeg;
@@ -1263,19 +1288,13 @@ private:
     // A standing tree's model slice: uniform scale, anchored at the trunk base.
     TreeItem ModelItem(const Tree& tree, const XMFLOAT4& rot, const XMFLOAT3& base,
                        int segment, bool crown, const XMFLOAT3& color) const {
-        float damageScale = 1.0f;
-        if (!crown && segment >= 0 &&
-            segment < static_cast<int>(tree.segments.size())) {
-            const float healthFraction = (std::max)(0.0f,
-                tree.segments[segment].health / kSegmentHealth);
-            // Each hit visibly narrows only the struck band. At zero health the
-            // upper section detaches and topples in the shot direction.
-            damageScale = 0.58f + 0.42f * healthFraction;
-        }
+        // Keep authored geometry rigid. Scaling one height slice independently
+        // opens seams and turns overhanging triangles into stretched spikes.
+        // Damage remains visible through TrunkColor without deforming the mesh.
         const XMMATRIX t =
-            XMMatrixScaling(tree.modelScaleXZ * damageScale,
+            XMMatrixScaling(tree.modelScaleXZ,
                             tree.modelScale,
-                            tree.modelScaleXZ * damageScale) *
+                            tree.modelScaleXZ) *
             XMMatrixRotationQuaternion(XMLoadFloat4(&rot)) *
             XMMatrixTranslation(base.x, base.y, base.z);
         TreeItem item;

@@ -781,7 +781,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     if (ImGui::CollapsingHeader("Palm Trees", ImGuiTreeNodeFlags_DefaultOpen)) {
-        // Absolute damage vs a section's 45 health: 15 => ~3 hits to sever.
+        // Absolute damage vs a section's 30 health: 15 => 2 hits to sever.
         ImGui::DragFloat("Tree Damage/Shot", &scene.treeDamagePerShot, 0.5f, 1.0f, 60.0f);
         ImGui::Text("Shoot a trunk to fell the tree above the hit.");
     }
