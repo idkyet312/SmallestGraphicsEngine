@@ -60,7 +60,7 @@ bool TraceReflection(float3 origin, float3 direction, float roughness,
                      float2 pixel, out float2 hitUV, out float confidence)
 {
     float maxDistance = ssrParams.x;
-    float stride = maxDistance / 32.0;
+    float stride = maxDistance / 48.0;
     float jitter = Hash(pixel);
     float previousDelta = -ssrParams.y;
     float previousT = ssrParams.y;
@@ -68,8 +68,8 @@ bool TraceReflection(float3 origin, float3 direction, float roughness,
     confidence = 0.0;
 
     [loop]
-    for (uint step = 1; step <= 32; ++step) {
-        float t = stride * (step - 0.7 + jitter);
+    for (uint rayStep = 1; rayStep <= 48; ++rayStep) {
+        float t = stride * (rayStep - 0.7 + jitter);
         float3 rayPosition = origin + direction * t;
         float4 clip = mul(float4(rayPosition, 1.0), viewProjection);
         if (clip.w <= 0.0) break;
@@ -85,12 +85,14 @@ bool TraceReflection(float3 origin, float3 direction, float roughness,
         float rayDistance = length(rayPosition - cameraNear.xyz);
         float sceneDistance = length(scenePosition - cameraNear.xyz);
         float delta = rayDistance - sceneDistance;
-        float thickness = ssrParams.y * (1.0 + t * 0.035 + roughness);
-        if (delta >= -thickness && previousDelta < 0.0) {
+        float thickness = ssrParams.y * (1.0 + t * 0.025 + roughness);
+        // Require a real front-to-back depth crossing. Accepting points merely
+        // close to the depth surface made forward-only walls self-reflect.
+        if (delta >= 0.0 && previousDelta < 0.0) {
             float lo = previousT;
             float hi = t;
             [unroll]
-            for (uint refine = 0; refine < 4; ++refine) {
+            for (uint refine = 0; refine < 5; ++refine) {
                 float mid = (lo + hi) * 0.5;
                 float3 midPosition = origin + direction * mid;
                 float4 midClip = mul(float4(midPosition, 1.0), viewProjection);
@@ -110,11 +112,35 @@ bool TraceReflection(float3 origin, float3 direction, float roughness,
                 mul(float4(finalPosition, 1.0), viewProjection);
             hitUV = (finalClip.xy / finalClip.w) *
                     float2(0.5, -0.5) + 0.5;
+            float hitDepth =
+                sceneDepth.SampleLevel(pointClamp, hitUV, 0.0);
+            float3 hitPosition = ReconstructWorld(hitUV, hitDepth);
+            float finalDelta =
+                abs(length(finalPosition - cameraNear.xyz) -
+                    length(hitPosition - cameraNear.xyz));
             float edge = min(min(hitUV.x, hitUV.y),
                              min(1.0 - hitUV.x, 1.0 - hitUV.y));
+            float pixelTravel =
+                length(hitUV * screenParams.xy - pixel);
+            float hitValidity = 1.0;
+            if (ssrParams.w > 0.5) {
+                float3 hitNormal =
+                    surfaceData.SampleLevel(pointClamp, hitUV, 0.0).xyz;
+                float hitNormalLength = dot(hitNormal, hitNormal);
+                hitValidity = step(0.25, hitNormalLength);
+                hitNormal *= rsqrt(max(hitNormalLength, 1e-5));
+                // Reject backfaces and depth from forward-only geometry that
+                // has no matching visibility-buffer surface.
+                hitValidity *= smoothstep(
+                    0.04, 0.30, dot(hitNormal, -direction));
+            }
             confidence = smoothstep(0.0, 0.08, edge) *
-                         saturate(1.0 - t / maxDistance);
-            return true;
+                         smoothstep(3.0, 18.0, pixelTravel) *
+                         saturate(1.0 - t / maxDistance) *
+                         (1.0 - smoothstep(
+                             thickness, thickness * 3.0, finalDelta)) *
+                         hitValidity;
+            if (confidence > 0.001) return true;
         }
         previousDelta = delta;
         previousT = t;
@@ -131,11 +157,17 @@ float4 PSMain(VSOutput input) : SV_TARGET
     float4 stored = surfaceData.SampleLevel(pointClamp, input.uv, 0.0);
     float storedValid = ssrParams.w * step(0.25, dot(stored.xyz, stored.xyz));
     float storedAgreement =
-        step(0.35, dot(normalize(stored.xyz + 1e-5), reconstructed));
+        step(0.60, dot(normalize(stored.xyz + 1e-5), reconstructed));
     storedValid *= storedAgreement;
+    // In visibility mode, missing/mismatched surface data means this pixel was
+    // drawn later by a forward extension. Its roughness is unknown, so IBL is
+    // safer than inventing a glossy SSR surface.
+    if (ssrParams.w > 0.5 && storedValid < 0.5) return 0.0;
     float3 normal = normalize(lerp(reconstructed, stored.xyz, storedValid));
     float roughness = lerp(0.22, stored.w, storedValid);
-    float smoothWeight = 1.0 - smoothstep(0.06, 0.72, roughness);
+    // SSR is a sharp-reflection solution. Rough materials retain their stable
+    // IBL response instead of showing stretched screen-color ghosts.
+    float smoothWeight = 1.0 - smoothstep(0.08, 0.50, roughness);
     if (smoothWeight <= 0.001) return 0.0;
 
     float3 toCamera = normalize(cameraNear.xyz - world);
@@ -161,6 +193,7 @@ float4 PSMain(VSOutput input) : SV_TARGET
     reflected += sceneColor.SampleLevel(
         linearClamp, hitUV - float2(0.0, texel.y), 0.0).rgb;
     reflected *= 0.2;
+    reflected = min(reflected, 8.0);
 
     float nDotV = saturate(dot(normal, toCamera));
     float fresnel = 0.04 + 0.96 * pow(1.0 - nDotV, 5.0);
