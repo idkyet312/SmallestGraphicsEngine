@@ -868,9 +868,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     if (scene.muzzleFlashTime > 0.0f && lightData.size() < 64) {
         PointLightDataDX12 flashLight = {};
         flashLight.position = scene.GetMuzzleWorldPosition();
-        flashLight.radius = 4.5f;
+        flashLight.radius = 6.0f;
         flashLight.color = XMFLOAT3(1.0f, 0.42f, 0.08f);
-        flashLight.intensity = 13.0f * (scene.muzzleFlashTime / scene.muzzleFlashDuration);
+        flashLight.intensity = 15.0f * (scene.muzzleFlashTime / scene.muzzleFlashDuration);
         lightData.push_back(flashLight);
     }
     for (const ExplosionFX& fx : scene.explosionFX) {
