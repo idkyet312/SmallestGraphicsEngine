@@ -62,8 +62,8 @@ float3 TonemapAgX(float3 color) {
     float luma = Luminance(color);
     // Match clustered_dx12_ps.hlsl exactly. Validation mode must compare
     // renderer ownership/lighting, not two different display transforms.
-    color = pow(saturate(color), 1.35);
-    color = luma + 1.4 * (color - luma);
+    color = pow(saturate(color), 1.18);
+    color = luma + 1.18 * (color - luma);
     return saturate(mul(agxOut, color));
 }
 

@@ -44,6 +44,8 @@ cbuffer ObjectBuffer : register(b3) {
     float viewFillStrength;
     float normalTexW;        // normal-map dimensions, precomputed on the CPU
     float normalTexH;
+    float specularScale;     // per-draw highlight control; viewmodels use less
+    float materialType;      // 0=ordinary, 1=pool water, 2=ocean
 };
 
 struct PointLightData {
@@ -548,8 +550,8 @@ float3 tonemapAgXPunchy(float3 color) {
     // Punchy look: lift saturation and gamma for a bolder image.
     const float3 lw = float3(0.2126, 0.7152, 0.0722);
     float luma = dot(color, lw);
-    color = pow(color, 1.35);                 // punchy contrast
-    color = luma + 1.4 * (color - luma);      // punchy saturation
+    color = pow(color, 1.18);                 // retain shadow texture detail
+    color = luma + 1.18 * (color - luma);     // restrained tropical saturation
 
     color = mul(agxOut, color);
     return ApplySceneColorGrade(color);       // already display-encoded
@@ -757,7 +759,42 @@ float4 main(PS_INPUT input) : SV_TARGET {
     if (dot(normal, viewDir) < 0.0)
         normal = -normal;
 
-    if (metal < 0.25) {
+    const bool isWater = materialType > 0.5 && materialType < 2.5;
+    const bool isOcean = materialType > 1.5 && materialType < 2.5;
+    float waterFoam = 0.0;
+    if (isWater) {
+        // Two world-space normal scales break the large CPU mesh waves into
+        // smaller capillary ripples without another texture or visible tiling.
+        float2 p = input.fragPos.xz;
+        float2 rippleA = float2(
+            sin(p.x * 1.73 + p.y * 1.11),
+            cos(p.x * 1.27 - p.y * 1.91));
+        float2 rippleB = float2(
+            sin(p.x * 4.63 - p.y * 3.77),
+            cos(p.x * 3.31 + p.y * 5.13));
+        float2 ripple = rippleA * 0.055 + rippleB * 0.022;
+        normal = normalize(normal + float3(ripple.x, 0.0, ripple.y));
+
+        float edge = min(min(input.texCoord.x, 1.0 - input.texCoord.x),
+                         min(input.texCoord.y, 1.0 - input.texCoord.y));
+        float edgeFoam = 1.0 - smoothstep(0.012, 0.072, edge);
+        float crestFoam = smoothstep(0.045, 0.19, 1.0 - normal.y);
+        float foamNoise = MatVarNoise(float3(p * 0.72, 4.8));
+        waterFoam = saturate((isOcean ? crestFoam : edgeFoam) *
+                              smoothstep(0.30, 0.72, foamNoise));
+
+        float fresnel = pow(1.0 - saturate(dot(normal, viewDir)), 4.0);
+        float3 deepColor = isOcean
+            ? float3(0.012, 0.075, 0.19)
+            : float3(0.025, 0.18, 0.30);
+        float3 grazingColor = float3(0.12, 0.38, 0.52);
+        albedo = lerp(deepColor, grazingColor, fresnel * 0.58);
+        albedo = lerp(albedo, float3(0.68, 0.80, 0.76), waterFoam * 0.72);
+        metal = 0.0;
+        rough = lerp(isOcean ? 0.16 : 0.11, 0.46, waterFoam);
+    }
+
+    if (!isWater && metal < 0.25) {
         float materialVariation = MatVarNoise(input.fragPos * 0.35);
         rough = clamp(rough * lerp(0.88, 1.10, materialVariation), 0.045, 1.0);
     }
@@ -843,7 +880,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float characterSpecularScale =
         !isFoliage && viewFillStrength > 0.25 ? 0.38 : 1.0;
     float surfaceSpecularScale =
-        isFoliage ? 0.12 : characterSpecularScale;
+        (isFoliage ? 0.12 : characterSpecularScale) *
+        max(specularScale, 0.0);
     float3 specular = numerator / denominator * surfaceSpecularScale;
     
     // Combine

@@ -178,7 +178,7 @@ public:
         // Asset uses layered alpha cards that only form a coherent crown near
         // its authored orientation. Large rotations expose isolated card groups.
         tree.crownYaw = XMConvertToRadians(
-            -8.0f + 16.0f * Variation01(x, z, seed + 1.0f));
+            -18.0f + 36.0f * Variation01(x, z, seed + 1.0f));
 
         // Slice the palm into `count` trunk pieces (once, on first plant). Uniform
         // model scale = planted height / the model's normalised height.

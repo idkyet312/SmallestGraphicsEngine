@@ -84,6 +84,8 @@ struct alignas(256) ObjectBufferDX12 {
     // GetDimensions per pixel.
     float normalTexW = 1.0f;
     float normalTexH = 1.0f;
+    float specularScale = 1.0f;
+    float materialType = 0.0f; // 0=ordinary, 1=pool water, 2=ocean
 };
 
 struct PointLightDataDX12 {
@@ -1173,7 +1175,7 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
     }
 
-    void SetTerrainMaterial() {
+    void SetTerrainMaterial(bool showAuthoredPaths = false) {
         const UINT bufferIndex = GetDrawCallIndex();
         ObjectBufferDX12 data = {};
         data.objectColor = XMFLOAT3(1.0f, 1.0f, 1.0f);
@@ -1184,6 +1186,7 @@ public:
         // Terrain scans use OpenGL normal maps. DX12 texture coordinates use
         // the opposite V direction, so flip tangent-space green.
         data.normalYSign = -1.0f;
+        data.materialType = showAuthoredPaths ? 3.0f : 0.0f;
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(
             3, objectBuffer.GetGPUAddress(bufferIndex));
@@ -1221,7 +1224,9 @@ public:
                           float ambientScale = 1.0f,
                           float occlusionStrength = 0.0f,
                           float normalYSign = 1.0f,
-                          float viewFillStrength = 0.0f) {
+                          float viewFillStrength = 0.0f,
+                          float specularScale = 1.0f,
+                          float materialType = 0.0f) {
         UINT bufferIndex = GetDrawCallIndex();
 
         ObjectBufferDX12 data;
@@ -1237,6 +1242,8 @@ public:
         data.occlusionStrength = occlusionStrength;
         data.normalYSign = normalYSign;
         data.viewFillStrength = viewFillStrength;
+        data.specularScale = specularScale;
+        data.materialType = materialType;
         if (useNorm && normal) {
             const D3D12_RESOURCE_DESC nd = normal->GetDesc();
             data.normalTexW = (float)nd.Width;
@@ -1318,6 +1325,14 @@ public:
              // Bind table
              g_dx12.commandList->SetGraphicsRootDescriptorTable(7, gpuHandle);
         }
+    }
+
+    void SetWaterMaterial(const XMFLOAT3& color, float roughness,
+                          float opacity, bool ocean) {
+        SetObjectMaterial(
+            color, false, false, 0.0f, roughness,
+            nullptr, nullptr, nullptr, false, opacity, false, nullptr, false,
+            1.0f, 0.0f, 1.0f, 0.0f, 0.82f, ocean ? 2.0f : 1.0f);
     }
 
     // Unlit soft-sprite material for smoke billboards: samples `smokeTex`'s alpha

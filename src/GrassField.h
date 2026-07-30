@@ -637,7 +637,7 @@ private:
     // popping in and out as the player walks.
     float m_fadeBand = 6.0f;
     // Fraction of each cell's blades actually drawn (1 = all).
-    float m_density = 1.0f;
+    float m_density = 0.72f;
     // Sparse grass casters still produce visible cascade/cell bands across the
     // terrain. Keep blade lighting, but leave terrain shadowing to solid props.
     float m_shadowDensity = 0.28f;

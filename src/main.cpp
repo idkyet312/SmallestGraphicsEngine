@@ -247,7 +247,7 @@ bool                        g_emptyLevelMode = false;
 NavigationSystem            g_navigation;
 static LevelEditor          g_levelEditor;
 static Camera               g_editorCameraSnapshot;
-static bool                 g_customLevelMode = false;
+bool                        g_customLevelMode = false;
 // Editor fly-camera speed multiplier, adjusted with the mouse wheel (Unreal
 // style). Persists across frames; clamped to a sane range.
 static float                g_editorCameraSpeed = 1.0f;
@@ -3489,6 +3489,11 @@ static void RebuildScalableEnvironment() {
         obstacles.push_back({39.4f, 1.5f, 44.6f, 4.5f});
         grassExclusions.push_back({39.0f, 1.1f, 45.0f, 4.9f});
     }
+    // Expose the material paths authored in terrain_pbr.hlsli. Two narrow
+    // crossing clearings connect the four house fronts and give the compound a
+    // readable route instead of an uninterrupted foreground grass wall.
+    grassExclusions.push_back({-1.15f, -15.0f, 1.15f, 15.0f});
+    grassExclusions.push_back({-15.0f, -1.15f, 15.0f, 1.15f});
     for (const PalmSpawn& palm : kPalmSpawns)
         obstacles.push_back(
             { palm.x - 0.55f, palm.z - 0.55f,

@@ -33,6 +33,19 @@ float4 TerrainLayerWeights(float3 worldPos, float3 geometricNormal) {
     float dirt = 0.08 + smoothstep(0.58, 0.79, noise) * 0.40 * flat +
                  smoothstep(0.12, 0.46, slope) * 0.32;
 
+    // Default compound has four deliberate footpaths between central clearing
+    // and house entrances. materialType=3 is set only for built-in levels, so
+    // custom maps keep full control over their ground composition.
+    if (materialType > 2.5) {
+        float axisDistance = min(abs(worldPos.x), abs(worldPos.z));
+        float pathReach = max(abs(worldPos.x), abs(worldPos.z));
+        float path = (1.0 - smoothstep(0.72, 1.28, axisDistance)) *
+                     (1.0 - smoothstep(13.2, 15.5, pathReach));
+        path *= 0.82 + TerrainBlendNoise(worldPos.xz * 1.8 + 29.0) * 0.18;
+        grass *= 1.0 - path * 0.92;
+        dirt += path * 2.6;
+    }
+
     sand *= 1.0 - rock;
     dirt *= (1.0 - rock) * (1.0 - sand * 0.75);
     grass *= (1.0 - rock) * (1.0 - sand);

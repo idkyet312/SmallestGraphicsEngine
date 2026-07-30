@@ -32,6 +32,7 @@ TerrainRendererDX12::Params CurrentTerrainParams();
 extern bool g_showH2Model;
 extern WaterVolume g_water;
 extern WaterVolume g_ocean;   // sea ringing the island
+extern bool g_customLevelMode;
 extern ComPtr<ID3D12Resource> g_smokeTexture;   // soft smoke sprite for billboards
 extern ComPtr<ID3D12Resource> g_bloodTexture;
 extern ComPtr<ID3D12Resource> g_muzzleFlashTexture;
@@ -341,7 +342,8 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
                        const XMMATRIX& lightSpace, bool colorNormalOnly = false,
                        bool visibilityExtensionsOnly = false,
                        ID3D12PipelineState* pipelineOverride = nullptr,
-                       XMFLOAT4 palmWindRoot = {}) {
+                       XMFLOAT4 palmWindRoot = {},
+                       float specularScale = 1.0f) {
     if (!mesh) return;
     shader.SetMatrices(model, view, proj, lightSpace, palmWindRoot);
 
@@ -371,7 +373,13 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
                 colorNormalOnly ? false : prim.material->roughnessOnlyTexture,
                 prim.material->baseColorFactor.w,
                 prim.material->alphaCutout,
-                prim.material.get());   // cache its descriptors: they never change
+                prim.material.get(),
+                prim.material->alphaFromLuminance,
+                prim.material->ambientScale,
+                prim.material->occlusionStrength,
+                prim.material->normalYSign,
+                prim.material->viewFillStrength,
+                specularScale);   // cache its descriptors: they never change
         } else {
             shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
         }
@@ -931,7 +939,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         : XMMatrixIdentity();
     shader.SetMatrices(model, view, proj, lightSpace);
     if (scene.useMeshTerrain && g_terrain.supported) {
-        shader.SetTerrainMaterial();
+        shader.SetTerrainMaterial(!g_customLevelMode);
     } else if (floorMaterial && floorMaterial->baseColorTexture) {
         shader.SetObjectMaterial(scene.floor.color,
                                  true,
@@ -1186,8 +1194,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             shader.UseTransparent();
             shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
             // Deeper and less transparent than the pool: open water reads darker.
-            shader.SetObjectMaterial(XMFLOAT3(0.03f, 0.18f, 0.38f), false, false,
-                                     0.04f, 0.05f, nullptr, nullptr, nullptr, false, 0.80f);
+            shader.SetWaterMaterial(
+                XMFLOAT3(0.03f, 0.18f, 0.38f), 0.16f, 0.84f, true);
             g_dx12.commandList->IASetVertexBuffers(0, 1, &ovbv);
             g_dx12.commandList->IASetIndexBuffer(&oibv);
             g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1216,8 +1224,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         if (waterIndices && wvbv.BufferLocation) {
             shader.UseTransparent();
             shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);  // verts are world-space
-            shader.SetObjectMaterial(XMFLOAT3(0.06f, 0.30f, 0.55f), false, false,
-                                     0.05f, 0.06f, nullptr, nullptr, nullptr, false, 0.62f);
+            shader.SetWaterMaterial(
+                XMFLOAT3(0.06f, 0.30f, 0.55f), 0.11f, 0.66f, false);
             g_dx12.commandList->IASetVertexBuffers(0, 1, &wvbv);
             g_dx12.commandList->IASetIndexBuffer(&wibv);
             g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1446,7 +1454,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             if (ArmsModel::WeaponFollowTransform(handFollow, S))
                 xf = weaponPlacement * handFollow * gunBase;
             shader.Use(scene.wireframeMode);
-            DrawMeshAt(GunModel::PlayerMesh(), shader, xf, view, proj, lightSpace);
+            DrawMeshAt(GunModel::PlayerMesh(), shader, xf, view, proj, lightSpace,
+                       false, false, nullptr, {}, 0.52f);
             shader.Use(scene.wireframeMode);
 
             // The body hangs off the same base transform as the weapon, so it

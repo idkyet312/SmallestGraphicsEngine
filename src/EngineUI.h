@@ -268,25 +268,26 @@ inline void RenderPlayerHUD(const Scene& scene) {
     const float maxHealth = (std::max)(1.0f, scene.player.maxHealth);
     const float fraction = (std::max)(
         0.0f, (std::min)(1.0f, scene.player.health / maxHealth));
-    const ImVec2 min(24.0f, io.DisplaySize.y - 52.0f);
-    const ImVec2 max(min.x + 270.0f, min.y + 26.0f);
+    const ImVec2 min(24.0f, io.DisplaySize.y - 42.0f);
+    const ImVec2 max(min.x + 208.0f, min.y + 18.0f);
     const ImVec2 fillMax(min.x + (max.x - min.x) * fraction, max.y);
 
     draw->AddRectFilled(ImVec2(min.x - 3.0f, min.y - 3.0f),
-                        ImVec2(max.x + 3.0f, max.y + 3.0f), IM_COL32(0, 0, 0, 190), 4.0f);
-    const int red = (int)(255.0f * (1.0f - fraction));
-    const int green = (int)(220.0f * fraction);
+                        ImVec2(max.x + 3.0f, max.y + 3.0f),
+                        IM_COL32(8, 12, 10, 180), 3.0f);
+    const int red = (int)(210.0f * (1.0f - fraction) + 38.0f * fraction);
+    const int green = (int)(72.0f * (1.0f - fraction) + 178.0f * fraction);
     if (fraction > 0.0f)
-        draw->AddRectFilled(min, fillMax, IM_COL32(red, green, 35, 235), 2.0f);
-    draw->AddRect(min, max, IM_COL32(255, 255, 255, 210), 2.0f, 0, 1.5f);
+        draw->AddRectFilled(min, fillMax, IM_COL32(red, green, 82, 225), 1.5f);
+    draw->AddRect(min, max, IM_COL32(176, 196, 181, 185), 1.5f, 0, 1.0f);
 
     char label[48];
-    snprintf(label, sizeof(label), "HEALTH  %.0f / %.0f",
+    snprintf(label, sizeof(label), "HP  %.0f / %.0f",
              scene.player.health, maxHealth);
     const ImVec2 textSize = ImGui::CalcTextSize(label);
     draw->AddText(ImVec2(min.x + ((max.x - min.x) - textSize.x) * 0.5f,
                          min.y + ((max.y - min.y) - textSize.y) * 0.5f),
-                  IM_COL32(255, 255, 255, 255), label);
+                  IM_COL32(226, 234, 225, 245), label);
 
     // Ammo readout, bottom-right corner, mirroring the health bar's inset so the
     // two read as one HUD band. Right-aligned: the text grows leftward, keeping
@@ -317,7 +318,7 @@ inline void RenderPlayerHUD(const Scene& scene) {
                              min.y + ((max.y - min.y) - ammoSize.y) * 0.5f);
         draw->AddRectFilled(ImVec2(ammoPos.x - 8.0f, min.y - 3.0f),
                             ImVec2(ammoRight + 8.0f, max.y + 3.0f),
-                            IM_COL32(0, 0, 0, 190), 4.0f);
+                            IM_COL32(8, 12, 10, 180), 3.0f);
         draw->AddText(ammoPos, tint, ammo);
 
         if (!scene.Reloading() && inMag == 0 && spare > 0) {
