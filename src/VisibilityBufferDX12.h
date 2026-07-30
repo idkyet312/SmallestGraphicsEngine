@@ -24,6 +24,7 @@ static const UINT VB_CLUSTER_COUNT = VB_CLUSTER_X * VB_CLUSTER_Y * VB_CLUSTER_Z;
 static const UINT VB_MAX_LIGHTS_PER_CLUSTER = 32;
 static const UINT VB_MAX_MATERIALS = 256;
 static const UINT VB_MAX_MATERIAL_TEXTURES = 64;
+static const UINT VB_BLOOM_MAX_MIPS = 6;
 
 // Must match the compute shader's DrawCallData
 struct VBDrawCallData {
@@ -139,6 +140,7 @@ public:
     ComPtr<ID3D12Resource> presentTexture;
     ComPtr<ID3D12Resource> motionTexture;
     ComPtr<ID3D12Resource> normalRoughnessTexture;
+    ComPtr<ID3D12Resource> bloomTexture;
     // Depth immediately after visibility resolve. Forward extensions can then
     // be detected and rejected from history when they lack motion vectors.
     ComPtr<ID3D12Resource> visibilityDepthTexture;
@@ -160,6 +162,10 @@ public:
     ComPtr<ID3D12RootSignature> postRootSig;
     ComPtr<ID3D12PipelineState> postPSO;
     ComPtr<ID3D12DescriptorHeap> postDescHeap;
+    ComPtr<ID3D12RootSignature> bloomRootSig;
+    ComPtr<ID3D12PipelineState> bloomDownsamplePSO;
+    ComPtr<ID3D12PipelineState> bloomUpsamplePSO;
+    ComPtr<ID3D12DescriptorHeap> bloomDescHeap;
     ComPtr<ID3D12RootSignature> exposureRootSig;
     ComPtr<ID3D12PipelineState> exposureResetPSO;
     ComPtr<ID3D12PipelineState> exposureAccumulatePSO;
@@ -225,6 +231,9 @@ public:
     float currentFarPlane = 1000.0f;
     int debugViewMode = 0; // 0=lit, 1=instance/primitive IDs, 2=depth
     bool validationMode = false;
+    UINT bloomMipCount = 1;
+    UINT bloomWidth = 1;
+    UINT bloomHeight = 1;
 
     UINT width = 0;
     UINT height = 0;
@@ -269,6 +278,7 @@ public:
         if (!require(CreateComputeDescriptorHeap(), "compute descriptors")) return false;
         if (!require(CreateVisPassPipeline(), "visibility shaders")) return false;
         if (!require(CreateResolvePipeline(), "resolve shader")) return false;
+        if (!require(CreateBloomPipeline(), "bloom pyramid shaders")) return false;
         if (!require(CreatePostPipeline(), "post-process shader")) return false;
         if (!require(CreateExposurePipeline(), "exposure shaders")) return false;
 
@@ -960,6 +970,8 @@ public:
 
     void PostProcess(ID3D12GraphicsCommandList* cmdList, bool allowHistory) {
         const UINT historyIndex = postFrameIndex & 1u;
+        if (!validationMode && debugViewMode == 0 && bloomStrength > 0.0f)
+            RenderBloom(cmdList);
         D3D12_RESOURCE_BARRIER barriers[2] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = presentTexture.Get();
@@ -1003,7 +1015,7 @@ public:
             postConstantBuffer.GetGPUAddress(g_dx12.frameIndex));
         D3D12_GPU_DESCRIPTOR_HANDLE table =
             postDescHeap->GetGPUDescriptorHandleForHeapStart();
-        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize * historyIndex * 9;
+        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize * historyIndex * 10;
         cmdList->SetComputeRootDescriptorTable(1, table);
         cmdList->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 
@@ -1062,6 +1074,7 @@ public:
         presentTexture.Reset();
         motionTexture.Reset();
         normalRoughnessTexture.Reset();
+        bloomTexture.Reset();
         visibilityDepthTexture.Reset();
         historyTextures[0].Reset();
         historyTextures[1].Reset();
@@ -1074,6 +1087,7 @@ public:
         CreateVisBufferRT();
         CreateOutputTexture();
         UpdateComputeDescriptors();
+        UpdateBloomDescriptors();
         UpdatePostDescriptors();
         UpdateExposureDescriptors();
     }
@@ -1214,7 +1228,37 @@ private:
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
             IID_PPV_ARGS(&exposureState));
         if (FAILED(hr)) return false;
-        return true;
+        return CreateBloomTexture();
+    }
+
+    bool CreateBloomTexture() {
+        bloomWidth = (std::max)(1u, width / 2u);
+        bloomHeight = (std::max)(1u, height / 2u);
+        bloomMipCount = 1;
+        UINT mipWidth = bloomWidth;
+        UINT mipHeight = bloomHeight;
+        while (bloomMipCount < VB_BLOOM_MAX_MIPS &&
+               (mipWidth > 1u || mipHeight > 1u)) {
+            mipWidth = (std::max)(1u, mipWidth / 2u);
+            mipHeight = (std::max)(1u, mipHeight / 2u);
+            ++bloomMipCount;
+        }
+
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = bloomWidth;
+        desc.Height = bloomHeight;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = static_cast<UINT16>(bloomMipCount);
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        return SUCCEEDED(g_dx12.device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+            IID_PPV_ARGS(&bloomTexture)));
     }
 
     bool CreateStructuredBuffers() {
@@ -2050,6 +2094,231 @@ private:
             exposureState.Get(), nullptr, &state, handle);
     }
 
+    bool CreateBloomPipeline() {
+        std::ifstream csFile("shaders/visbuf_bloom_cs.hlsl");
+        if (!csFile.is_open()) return false;
+        std::stringstream stream;
+        stream << csFile.rdbuf();
+        const std::string source = stream.str();
+        const UINT flags = D3DCOMPILE_ENABLE_STRICTNESS |
+                           D3DCOMPILE_OPTIMIZATION_LEVEL3;
+        ComPtr<ID3DBlob> downsample, upsample, errors;
+        HRESULT hr = D3DCompile(
+            source.data(), source.size(), "shaders/visbuf_bloom_cs.hlsl",
+            nullptr, nullptr, "Downsample", "cs_5_0", flags, 0,
+            &downsample, &errors);
+        if (FAILED(hr)) {
+            if (errors) std::cerr << "VB bloom downsample CS error: "
+                << (char*)errors->GetBufferPointer() << std::endl;
+            return false;
+        }
+        errors.Reset();
+        hr = D3DCompile(
+            source.data(), source.size(), "shaders/visbuf_bloom_cs.hlsl",
+            nullptr, nullptr, "Upsample", "cs_5_0", flags, 0,
+            &upsample, &errors);
+        if (FAILED(hr)) {
+            if (errors) std::cerr << "VB bloom upsample CS error: "
+                << (char*)errors->GetBufferPointer() << std::endl;
+            return false;
+        }
+
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors = 1;
+        ranges[0].BaseShaderRegister = 0;
+        ranges[0].OffsetInDescriptorsFromTableStart = 0;
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors = 1;
+        ranges[1].BaseShaderRegister = 0;
+        ranges[1].OffsetInDescriptorsFromTableStart = 1;
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants.ShaderRegister = 0;
+        params[0].Constants.Num32BitValues = 8;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable.NumDescriptorRanges = 2;
+        params[1].DescriptorTable.pDescriptorRanges = ranges;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC sampler = {};
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler.AddressU = sampler.AddressV = sampler.AddressW =
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.ShaderRegister = 0;
+        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        sampler.MinLOD = 0.0f;
+        sampler.MaxLOD = D3D12_FLOAT32_MAX;
+        D3D12_ROOT_SIGNATURE_DESC root = {};
+        root.NumParameters = 2;
+        root.pParameters = params;
+        root.NumStaticSamplers = 1;
+        root.pStaticSamplers = &sampler;
+        ComPtr<ID3DBlob> rootBlob;
+        hr = D3D12SerializeRootSignature(
+            &root, D3D_ROOT_SIGNATURE_VERSION_1, &rootBlob, &errors);
+        if (FAILED(hr)) return false;
+        hr = g_dx12.device->CreateRootSignature(
+            0, rootBlob->GetBufferPointer(), rootBlob->GetBufferSize(),
+            IID_PPV_ARGS(&bloomRootSig));
+        if (FAILED(hr)) return false;
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = bloomRootSig.Get();
+        pso.CS = {
+            downsample->GetBufferPointer(), downsample->GetBufferSize()
+        };
+        hr = g_dx12.device->CreateComputePipelineState(
+            &pso, IID_PPV_ARGS(&bloomDownsamplePSO));
+        if (FAILED(hr)) return false;
+        pso.CS = {
+            upsample->GetBufferPointer(), upsample->GetBufferSize()
+        };
+        hr = g_dx12.device->CreateComputePipelineState(
+            &pso, IID_PPV_ARGS(&bloomUpsamplePSO));
+        if (FAILED(hr)) return false;
+
+        D3D12_DESCRIPTOR_HEAP_DESC heap = {};
+        heap.NumDescriptors = (VB_BLOOM_MAX_MIPS * 2u - 1u) * 2u;
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = g_dx12.device->CreateDescriptorHeap(
+            &heap, IID_PPV_ARGS(&bloomDescHeap));
+        if (FAILED(hr)) return false;
+        UpdateBloomDescriptors();
+        return true;
+    }
+
+    void UpdateBloomDescriptors() {
+        if (!bloomDescHeap || !bloomTexture || !outputTexture) return;
+        const UINT descriptorSize =
+            g_dx12.device->GetDescriptorHandleIncrementSize(
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        auto writePass = [&](UINT pass, ID3D12Resource* source,
+                             UINT sourceMip, UINT destinationMip) {
+            D3D12_CPU_DESCRIPTOR_HANDLE handle =
+                bloomDescHeap->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += static_cast<SIZE_T>(descriptorSize) * pass * 2u;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MostDetailedMip = sourceMip;
+            srv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(source, &srv, handle);
+            handle.ptr += descriptorSize;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            uav.Texture2D.MipSlice = destinationMip;
+            g_dx12.device->CreateUnorderedAccessView(
+                bloomTexture.Get(), nullptr, &uav, handle);
+        };
+
+        for (UINT mip = 0; mip < bloomMipCount; ++mip) {
+            writePass(mip,
+                mip == 0 ? outputTexture.Get() : bloomTexture.Get(),
+                mip == 0 ? 0u : mip - 1u, mip);
+        }
+        for (int mip = static_cast<int>(bloomMipCount) - 2;
+             mip >= 0; --mip) {
+            const UINT pass = bloomMipCount +
+                (bloomMipCount - 2u - static_cast<UINT>(mip));
+            writePass(pass, bloomTexture.Get(),
+                      static_cast<UINT>(mip + 1),
+                      static_cast<UINT>(mip));
+        }
+    }
+
+    void RenderBloom(ID3D12GraphicsCommandList* cmdList) {
+        if (!bloomTexture || !bloomDescHeap || !bloomRootSig ||
+            bloomMipCount == 0) return;
+        struct BloomDispatchConstants {
+            UINT sourceWidth;
+            UINT sourceHeight;
+            UINT destinationWidth;
+            UINT destinationHeight;
+            float threshold;
+            float softKnee;
+            float scatter;
+            float padding;
+        };
+        auto mipSize = [](UINT base, UINT mip) {
+            return (std::max)(1u, base >> mip);
+        };
+        auto transitionMip = [&](UINT mip, D3D12_RESOURCE_STATES before,
+                                 D3D12_RESOURCE_STATES after) {
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = bloomTexture.Get();
+            barrier.Transition.StateBefore = before;
+            barrier.Transition.StateAfter = after;
+            barrier.Transition.Subresource = mip;
+            cmdList->ResourceBarrier(1, &barrier);
+        };
+        const UINT descriptorSize =
+            g_dx12.device->GetDescriptorHandleIncrementSize(
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        auto dispatchPass = [&](UINT pass, UINT destinationMip,
+                                const BloomDispatchConstants& constants,
+                                ID3D12PipelineState* pso) {
+            transitionMip(destinationMip,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            cmdList->SetPipelineState(pso);
+            cmdList->SetComputeRoot32BitConstants(
+                0, 8, &constants, 0);
+            D3D12_GPU_DESCRIPTOR_HANDLE table =
+                bloomDescHeap->GetGPUDescriptorHandleForHeapStart();
+            table.ptr += static_cast<UINT64>(descriptorSize) * pass * 2u;
+            cmdList->SetComputeRootDescriptorTable(1, table);
+            cmdList->Dispatch(
+                (constants.destinationWidth + 7u) / 8u,
+                (constants.destinationHeight + 7u) / 8u, 1);
+            transitionMip(destinationMip,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        };
+
+        cmdList->SetComputeRootSignature(bloomRootSig.Get());
+        ID3D12DescriptorHeap* heaps[] = { bloomDescHeap.Get() };
+        cmdList->SetDescriptorHeaps(1, heaps);
+        for (UINT mip = 0; mip < bloomMipCount; ++mip) {
+            BloomDispatchConstants constants = {};
+            constants.sourceWidth =
+                mip == 0 ? width : mipSize(bloomWidth, mip - 1u);
+            constants.sourceHeight =
+                mip == 0 ? height : mipSize(bloomHeight, mip - 1u);
+            constants.destinationWidth = mipSize(bloomWidth, mip);
+            constants.destinationHeight = mipSize(bloomHeight, mip);
+            constants.threshold = mip == 0 ? 1.0f : 0.0f;
+            constants.softKnee = 0.5f;
+            constants.scatter = 0.72f;
+            dispatchPass(mip, mip, constants, bloomDownsamplePSO.Get());
+        }
+        for (int mip = static_cast<int>(bloomMipCount) - 2;
+             mip >= 0; --mip) {
+            const UINT destinationMip = static_cast<UINT>(mip);
+            const UINT pass = bloomMipCount +
+                (bloomMipCount - 2u - destinationMip);
+            BloomDispatchConstants constants = {};
+            constants.sourceWidth =
+                mipSize(bloomWidth, destinationMip + 1u);
+            constants.sourceHeight =
+                mipSize(bloomHeight, destinationMip + 1u);
+            constants.destinationWidth =
+                mipSize(bloomWidth, destinationMip);
+            constants.destinationHeight =
+                mipSize(bloomHeight, destinationMip);
+            constants.scatter = 0.72f;
+            dispatchPass(pass, destinationMip, constants,
+                         bloomUpsamplePSO.Get());
+        }
+    }
+
     bool CreatePostPipeline() {
         std::ifstream csFile("shaders/visbuf_post_cs.hlsl");
         if (!csFile.is_open()) return false;
@@ -2071,13 +2340,13 @@ private:
 
         D3D12_DESCRIPTOR_RANGE ranges[2] = {};
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 7;
+        ranges[0].NumDescriptors = 8;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         ranges[1].NumDescriptors = 2;
         ranges[1].BaseShaderRegister = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 7;
+        ranges[1].OffsetInDescriptorsFromTableStart = 8;
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -2117,7 +2386,7 @@ private:
         if (FAILED(hr)) return false;
 
         D3D12_DESCRIPTOR_HEAP_DESC heap = {};
-        heap.NumDescriptors = 18;
+        heap.NumDescriptors = 20;
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = g_dx12.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&postDescHeap));
@@ -2133,7 +2402,7 @@ private:
         for (UINT parity = 0; parity < 2; ++parity) {
             D3D12_CPU_DESCRIPTOR_HANDLE handle =
                 postDescHeap->GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (SIZE_T)descriptorSize * parity * 9;
+            handle.ptr += (SIZE_T)descriptorSize * parity * 10;
 
             D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
             srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -2175,6 +2444,16 @@ private:
             handle.ptr += descriptorSize;
             g_dx12.device->CreateShaderResourceView(
                 visibilityDepthTexture.Get(), &depthSrv, handle);
+            handle.ptr += descriptorSize;
+            D3D12_SHADER_RESOURCE_VIEW_DESC bloomSrv = {};
+            bloomSrv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            bloomSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            bloomSrv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            bloomSrv.Texture2D.MostDetailedMip = 0;
+            bloomSrv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(
+                bloomTexture.Get(), &bloomSrv, handle);
             handle.ptr += descriptorSize;
 
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};

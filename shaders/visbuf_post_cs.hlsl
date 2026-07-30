@@ -5,6 +5,7 @@ ByteAddressBuffer exposureState : register(t3);
 Texture3D<float4> colorLUT : register(t4);
 Texture2D<float> sceneDepth : register(t5);
 Texture2D<float> visibilityDepth : register(t6);
+Texture2D<float4> bloomInput : register(t7);
 RWTexture2D<float4> ldrOutput : register(u0);
 RWTexture2D<float4> historyOutput : register(u1);
 SamplerState lutSampler : register(s0);
@@ -73,21 +74,8 @@ float3 TonemapSkyACES(float3 color) {
 }
 
 float3 Bloom(uint2 pixel) {
-    static const int2 offsets[9] = {
-        int2(0, 0), int2(-2, 0), int2(2, 0), int2(0, -2), int2(0, 2),
-        int2(-1, -1), int2(1, -1), int2(-1, 1), int2(1, 1)
-    };
-    static const float weights[9] = {
-        0.20, 0.075, 0.075, 0.075, 0.075, 0.125, 0.125, 0.125, 0.125
-    };
-    float3 bloom = 0.0;
-    [unroll]
-    for (uint i = 0; i < 9; ++i) {
-        int2 p = clamp(int2(pixel) + offsets[i], int2(0, 0), int2(outputSize) - 1);
-        float3 c = hdrInput.Load(int3(p, 0)).rgb;
-        bloom += c * saturate((Luminance(c) - 1.0) * 0.5) * weights[i];
-    }
-    return bloom;
+    float2 uv = (float2(pixel) + 0.5) / float2(outputSize);
+    return bloomInput.SampleLevel(lutSampler, uv, 0.0).rgb;
 }
 
 float LinearizeDepth(float depth) {
