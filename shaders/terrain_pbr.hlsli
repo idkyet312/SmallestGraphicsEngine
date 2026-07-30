@@ -139,7 +139,6 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     const float wetSand = layerWeights.z *
         (1.0 - smoothstep(0.55, 1.55, worldPos.y));
     result.albedo *= lerp(1.0, 0.68, wetSand);
-    result.roughness = lerp(result.roughness, 0.48, wetSand * 0.75);
     // Invalid/unbound SRVs return zero. Keep terrain readable and make binding
     // faults obvious as flat material colors instead of an all-black island.
     const float3 fallbackColors[4] = {
@@ -178,10 +177,20 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     result.normal = normalize(lerp(
         geometricNormal, normalize(result.normal),
         lerp(0.26, nearNormalStrength, normalDistanceFade)));
-    // Retain authored grass roughness variation instead of crushing every layer
-    // into the previous 0.65 floor.
-    result.roughness = clamp(result.roughness, 0.42, 1.0);
-    result.metallic = saturate(result.metallic);
+    // Natural ground is a dielectric. Some downloaded packed scans contain
+    // non-zero blue channels or over-smooth roughness values that turn broad
+    // terrain patches into polished metal under HDR sun/IBL. Preserve authored
+    // micro-variation above physically plausible layer floors, then allow only
+    // the waterline sand to become moderately smoother.
+    const float4 roughnessFloors = float4(0.84, 0.89, 0.76, 0.82);
+    float layerRoughness = dot(layerWeights, roughnessFloors);
+    layerRoughness += (macroA - 0.5) * 0.055;
+    const float dryRoughness =
+        max(saturate(result.roughness), layerRoughness);
+    const float wetRoughness = 0.58 + (macroB - 0.5) * 0.04;
+    result.roughness = clamp(
+        lerp(dryRoughness, wetRoughness, wetSand * 0.72), 0.54, 1.0);
+    result.metallic = 0.0;
     result.occlusion = saturate(result.occlusion);
     return result;
 }
