@@ -766,7 +766,10 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
             item.instanceKey ^= static_cast<uint64_t>(item.visibilityMeshID + 1u) *
                 0x9e3779b97f4a7c15ull;
         UINT materialID = vb.RegisterMaterial(item.material.get());
-        const UINT flags = item.doubleSided ? 1u : 0u;
+        const UINT flags =
+            (item.doubleSided ? 1u : 0u) |
+            (item.alphaCutout ? 2u : 0u) |
+            (item.alphaFromLuminance ? 4u : 0u);
         UINT dc = vb.RegisterInstance(item.visibilityMeshID,
             item.model, item.color, 0.0f, 0.5f, materialID, flags,
             item.instanceKey, item.palmWindRoot);

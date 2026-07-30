@@ -39,7 +39,7 @@ struct VBDrawCallData {
     UINT       indexOffset;
     UINT       indexCount;
     UINT       hasIndices;
-    UINT       flags;
+    UINT       flags; // bit 0 double-sided, bit 1 alpha cutout, bit 2 luminance cutout
     XMFLOAT4   palmWindRoot;
 };
 

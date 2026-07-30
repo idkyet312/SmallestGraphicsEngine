@@ -524,6 +524,7 @@ float3 agxDefaultContrastApprox(float3 x) {
 }
 
 #include "color_grade.hlsli"
+#include "foliage_brdf.hlsli"
 
 float3 tonemapAgXPunchy(float3 color) {
     // Input transform (sRGB primaries -> AgX working space).
@@ -591,6 +592,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
 
     float3 normal = normalize(input.normal);
     float3 viewDir = normalize(viewPos - input.fragPos);
+    const bool isFoliage = alphaCut > 0.5 && alphaCut < 1.5;
+    float foliageCoverage = 1.0;
 
     // Sample textures
     float3 albedo = objectColor;
@@ -613,6 +616,32 @@ float4 main(PS_INPUT input) : SV_TARGET {
         // Preserve thin palm rachises and leaflet stems. Higher cutoff detached
         // opaque leaf clusters from their nearly transparent connecting pixels.
         else if (alphaCut > 0.5) clip(texColor.a - 0.20);
+        if (isFoliage) {
+            foliageCoverage = texColor.a;
+            uint texWidth, texHeight, texLevels;
+            albedoMap.GetDimensions(0, texWidth, texHeight, texLevels);
+            float2 texel = 1.0 / max(float2(texWidth, texHeight), 1.0);
+            float4 neighbor0 = albedoMap.Sample(
+                texSampler, input.texCoord + float2(texel.x, 0.0));
+            float4 neighbor1 = albedoMap.Sample(
+                texSampler, input.texCoord - float2(texel.x, 0.0));
+            float4 neighbor2 = albedoMap.Sample(
+                texSampler, input.texCoord + float2(0.0, texel.y));
+            float4 neighbor3 = albedoMap.Sample(
+                texSampler, input.texCoord - float2(0.0, texel.y));
+            float totalCoverage = texColor.a + neighbor0.a + neighbor1.a +
+                                  neighbor2.a + neighbor3.a;
+            float3 coveredColor =
+                (texColor.rgb * texColor.a +
+                 neighbor0.rgb * neighbor0.a +
+                 neighbor1.rgb * neighbor1.a +
+                 neighbor2.rgb * neighbor2.a +
+                 neighbor3.rgb * neighbor3.a) /
+                max(totalCoverage, 1e-4);
+            float edgeBlend =
+                1.0 - smoothstep(0.34, 0.88, texColor.a);
+            texColor.rgb = lerp(texColor.rgb, coveredColor, edgeBlend * 0.88);
+        }
         // Textures are uploaded as UNORM, so decode authored sRGB before lighting.
         albedo = pow(max(texColor.rgb, 0.0), 2.2) * objectColor;
         // Palm-leaf photos carry near-black shadowed leaflets; gamma decode crushes
@@ -620,7 +649,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
         // darkest foliage texels toward a leafy green so they can catch light.
         // Blend the darkest leaflets toward a leafy green rather than just
         // clamping, so near-black photo pixels never survive as black tips.
-        if (alphaCut > 0.5 && alphaCut < 1.5) {
+        if (isFoliage) {
             float leafLum = dot(albedo, float3(0.299, 0.587, 0.114));
             float dark = 1.0 - smoothstep(0.02, 0.12, leafLum);
             albedo = lerp(albedo, float3(0.10, 0.20, 0.06), dark * 0.85);
@@ -674,6 +703,10 @@ float4 main(PS_INPUT input) : SV_TARGET {
     }
 #endif
     rough = clamp(rough, 0.045, 1.0); // avoid alpha->0 specular-aliasing spike
+    if (isFoliage) {
+        metal = 0.0;
+        rough = max(rough, 0.78);
+    }
     
     // Normal mapping through a stable vertex tangent frame. Imported meshes
     // without tangents get UV-derived tangents generated at load time.
@@ -757,7 +790,10 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float3 V = viewDir;
     float3 L = lightDir;
     float3 H = normalize(V + L);
-    float NdotL = max(dot(normal, L), 0.0);
+    float signedNdotL = dot(normal, L);
+    float NdotL = isFoliage
+        ? FoliageWrappedDiffuse(signedNdotL)
+        : max(signedNdotL, 0.0);
     float NdotV = max(dot(normal, V), 0.0);
     float NdotH = max(dot(normal, H), 0.0);
     float HdotV = max(dot(H, V), 0.0);
@@ -792,7 +828,9 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // cloth/polymer surfaces need much less HDRI grazing response than guns
     // and hard-surface assets, or the bright horizon creates a silver rim.
     float characterSpecularScale = viewFillStrength > 0.25 ? 0.38 : 1.0;
-    float3 specular = numerator / denominator * characterSpecularScale;
+    float surfaceSpecularScale =
+        isFoliage ? 0.20 : characterSpecularScale;
+    float3 specular = numerator / denominator * surfaceSpecularScale;
     
     // Combine
     float shadowVisibility = CalculateShadow(input.fragPos, normal, lightDir);
@@ -810,25 +848,16 @@ float4 main(PS_INPUT input) : SV_TARGET {
 
     result += Lo;
 
-    // Foliage back-light: thin palm fronds transmit sun through the side opposite
-    // their visible normal. This is normal-relative, so it works from every camera
-    // angle instead of only when view direction happens to align with the sun.
-    // Gated to alpha-cut leaf cards; skips luminance-cut hair.
-    if (alphaCut > 0.5 && alphaCut < 1.5)
+    // Thin-sheet vegetation BRDF: chlorophyll-tinted transmission plus diffuse
+    // sky arriving at both leaf faces. Coverage suppresses bright cutout rims.
+    if (isFoliage)
     {
-        float backLit = saturate(dot(-normal, lightDir));
-        float edgeGlow = pow(1.0 - saturate(abs(dot(normal, viewDir))), 2.0);
-        float3 transmissionTint = float3(0.72, 1.04, 0.42);
-        float3 transmission = albedo * transmissionTint * lightColor *
-                              (backLit * 0.62 + edgeGlow * 0.10) * attenuation *
-                              lerp(0.30, 1.0, shadowVisibility);
-        result += transmission;
-        // Sky-side fill so backlit fronds keep a readable green instead of
-        // silhouetting flat against a bright sky.
-        result += albedo * skyContribution * 0.78;
-        // Flat foliage floor: guarantee every frond, even fully backlit tips,
-        // shows some green and never renders as a pure-black silhouette.
-        result += albedo * 0.24;
+        result += EvaluateFoliageTransmission(
+            albedo, normal, viewDir, lightDir, lightColor,
+            foliageCoverage, attenuation, shadowVisibility);
+        result += EvaluateFoliageSkyScatter(
+            albedo, skyContribution, sampleSkyIrradiance(-normal),
+            ambientLightingIntensity);
     }
 
     // Point lights contribution (clustered forward)
@@ -847,7 +876,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
         texSampler, float2(NdotV, rough), 0.0);
     result += probeColor * (F0 * environmentBRDF.x + environmentBRDF.y) *
-              ambientOcclusion * characterSpecularScale *
+              ambientOcclusion * surfaceSpecularScale *
               ambientLightingIntensity;
 
     // AgX (Punchy) tone mapping; returns display-encoded sRGB.

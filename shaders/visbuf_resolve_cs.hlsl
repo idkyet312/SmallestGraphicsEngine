@@ -29,6 +29,7 @@ cbuffer FrameConstants : register(b0) {
 };
 
 #include "palm_wind.hlsli"
+#include "foliage_brdf.hlsli"
 
 cbuffer LightBuffer : register(b1) {
     float3 lightPos;
@@ -76,7 +77,7 @@ struct DrawCallData {
     uint     indexOffset;   // offset into global index buffer
     uint     indexCount;
     uint     hasIndices;    // 1 if indexed, 0 if non-indexed
-    uint     flags;         // bit 0: double-sided/mixed winding
+    uint     flags;         // bit 0 double-sided, bit 1 alpha cutout, bit 2 luminance cutout
     float4   palmWindRoot;
 };
 
@@ -645,6 +646,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     
     // Load draw call data
     DrawCallData dc = drawCalls[drawCallID];
+    const bool isFoliage =
+        (dc.flags & 2u) != 0u && (dc.flags & 4u) == 0u;
     
     // Get triangle vertices (in object space)
     float3 p0, p1, p2;
@@ -721,10 +724,46 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float metal = material.pbrParams.w > 0.5 ? material.pbrParams.x : dc.metalness;
     float rough = material.pbrParams.w > 0.5 ? material.pbrParams.y : dc.roughness;
     float materialAO = 1.0;
+    float foliageCoverage = 1.0;
     if (material.textureIndices.x < 64u) {
-        float3 authoredAlbedo = materialTextures[material.textureIndices.x].SampleGrad(
-            texSampler, texCoord, uvDx, uvDy).rgb;
-        albedo *= pow(max(authoredAlbedo, 0.0), 2.2);
+        uint albedoTextureIndex = material.textureIndices.x;
+        float4 authoredSample = materialTextures[albedoTextureIndex].SampleGrad(
+            texSampler, texCoord, uvDx, uvDy);
+        if (isFoliage) {
+            foliageCoverage = authoredSample.a;
+            uint texWidth, texHeight, texLevels;
+            materialTextures[albedoTextureIndex].GetDimensions(
+                0, texWidth, texHeight, texLevels);
+            float2 texel = 1.0 / max(float2(texWidth, texHeight), 1.0);
+            float4 neighbor0 = materialTextures[albedoTextureIndex].SampleGrad(
+                texSampler, texCoord + float2(texel.x, 0.0), uvDx, uvDy);
+            float4 neighbor1 = materialTextures[albedoTextureIndex].SampleGrad(
+                texSampler, texCoord - float2(texel.x, 0.0), uvDx, uvDy);
+            float4 neighbor2 = materialTextures[albedoTextureIndex].SampleGrad(
+                texSampler, texCoord + float2(0.0, texel.y), uvDx, uvDy);
+            float4 neighbor3 = materialTextures[albedoTextureIndex].SampleGrad(
+                texSampler, texCoord - float2(0.0, texel.y), uvDx, uvDy);
+            float totalCoverage = authoredSample.a + neighbor0.a + neighbor1.a +
+                                  neighbor2.a + neighbor3.a;
+            float3 coveredColor =
+                (authoredSample.rgb * authoredSample.a +
+                 neighbor0.rgb * neighbor0.a +
+                 neighbor1.rgb * neighbor1.a +
+                 neighbor2.rgb * neighbor2.a +
+                 neighbor3.rgb * neighbor3.a) /
+                max(totalCoverage, 1e-4);
+            float edgeBlend =
+                1.0 - smoothstep(0.34, 0.88, authoredSample.a);
+            authoredSample.rgb = lerp(
+                authoredSample.rgb, coveredColor, edgeBlend * 0.88);
+        }
+        albedo *= pow(max(authoredSample.rgb, 0.0), 2.2);
+        if (isFoliage) {
+            float leafLum = dot(albedo, float3(0.299, 0.587, 0.114));
+            float dark = 1.0 - smoothstep(0.02, 0.12, leafLum);
+            albedo = lerp(
+                albedo, float3(0.10, 0.20, 0.06), dark * 0.85);
+        }
     }
     if (material.textureIndices.z < 64u) {
         float4 mr = materialTextures[material.textureIndices.z].SampleGrad(
@@ -741,6 +780,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     }
     metal = saturate(metal);
     rough = clamp(rough, 0.04, 1.0);
+    if (isFoliage) {
+        metal = 0.0;
+        rough = max(rough, 0.78);
+    }
 
     if (material.textureIndices.y < 64u) {
         float3 tangentNormal = materialTextures[material.textureIndices.y].SampleGrad(
@@ -793,7 +836,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     
     float3 V = viewDir;
     float3 H = normalize(V + L);
-    float NdotL = max(dot(normal, L), 0.0);
+    float signedNdotL = dot(normal, L);
+    float NdotL = isFoliage
+        ? FoliageWrappedDiffuse(signedNdotL)
+        : max(signedNdotL, 0.0);
     float NdotV = max(dot(normal, V), 0.0);
     float NdotH = max(dot(normal, H), 0.0);
     float HdotV = max(dot(H, V), 0.0);
@@ -831,8 +877,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 reflectionIBL = SampleReflectionProbe(reflect(-V, normal), rough);
     float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
         texSampler, float2(NdotV, rough), 0.0);
+    float foliageSpecularScale = isFoliage ? 0.20 : 1.0;
     float3 specularIBL = reflectionIBL *
-        (F0 * environmentBRDF.x + environmentBRDF.y);
+        (F0 * environmentBRDF.x + environmentBRDF.y) *
+        foliageSpecularScale;
     result += (diffuseIBL + diffuseGI + specularIBL) * ambientOcclusion *
               ambientLightingIntensity;
     result += ambientStrength * diffuseAlbedo * ambientScale *
@@ -841,7 +889,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     
     float3 numerator = NDF * G * F;
     float denominator = 4.0 * NdotV * NdotL + 0.0001;
-    float3 specular = numerator / denominator;
+    float3 specular = numerator / denominator * foliageSpecularScale;
     
     float shadowVisibility = CalculateShadow(fragPos, normal, L);
     // Shadow map blocks direct sun only. IBL/DDGI are already low-frequency
@@ -852,6 +900,14 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor *
                 NdotL * atten * shadowVisibility;
     result += Lo;
+    if (isFoliage) {
+        result += EvaluateFoliageTransmission(
+            albedo, normal, viewDir, L, lightColor,
+            foliageCoverage, atten, shadowVisibility);
+        result += EvaluateFoliageSkyScatter(
+            albedo, SampleSkyIrradiance(normal),
+            SampleSkyIrradiance(-normal), ambientLightingIntensity);
+    }
     
     // Clustered point lights: at most 32 relevant lights instead of all 64.
     uint clusterX = min((pixel.x * 16u) / max((uint)screenWidth, 1u), 15u);
