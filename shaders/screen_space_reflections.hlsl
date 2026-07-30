@@ -141,6 +141,12 @@ bool TraceReflection(float3 origin, float3 direction, float roughness,
                              thickness, thickness * 3.0, finalDelta)) *
                          hitValidity;
             if (confidence > 0.001) return true;
+
+            // A rejected hit is still opaque. Forward extensions such as mesh
+            // terrain do not write surfaceData, so they cannot provide a valid
+            // reflection sample, but the ray must stop at their depth. Continuing
+            // here let SSR travel through hills and pick up grass/sky behind them.
+            return false;
         }
         previousDelta = delta;
         previousT = t;
