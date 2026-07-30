@@ -196,10 +196,21 @@ float4 main(PS_INPUT input) : SV_TARGET {
     result *= lerp(0.28, 1.0, shadowVisibility) *
               ambientLightingIntensity;
 
-    // Direct sun: Lambert only. Blade roughness is 0.85 -- the GGX lobe the
-    // main shader would compute is visually nil at that roughness.
-    float NdotL = saturate(dot(normal, lightDir));
-    result += albedo / 3.14159265 * lightColor * NdotL * shadowVisibility;
+    // Thin vegetation is not an opaque card. Wrap direct light around both sides
+    // and transmit warm sunlight through back-facing blades. This removes the
+    // near-black foreground silhouettes while retaining object/terrain shadows.
+    float signedNdotL = dot(normal, lightDir);
+    float wrappedNdotL = saturate((signedNdotL + 0.32) / 1.32);
+    float backNdotL = saturate(-signedNdotL);
+    result += albedo / 3.14159265 * lightColor *
+              wrappedNdotL * shadowVisibility;
+
+    float tipTransmission = lerp(0.55, 1.0, smoothstep(0.15, 0.92,
+                                                        input.texCoord.y));
+    float3 transmissionTint = float3(0.68, 1.05, 0.38);
+    result += albedo * transmissionTint * lightColor *
+              backNdotL * tipTransmission * 0.42 *
+              lerp(0.35, 1.0, shadowVisibility);
 
 #ifdef SGE_HDR_TARGET
     result = max(result, 0.0);

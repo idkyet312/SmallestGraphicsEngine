@@ -226,17 +226,17 @@ struct Scene {
     bool  enableGrassMSAA = true;
     bool  enableFXAA = false;
     bool  enableVolumetricFog = true;
-    float volumetricFogDensity = 0.0040f;      // lighter haze -> distant palms stay readable
+    float volumetricFogDensity = 0.0028f;      // preserve depth without washing out buildings
     float volumetricFogAnisotropy = 0.42f;     // stronger forward scatter -> backlit haze
     float volumetricFogHeightFalloff = 0.045f; // fog thins above the undergrowth, not over treetops
     float volumetricFogBaseHeight = 0.4f;      // haze pools low in the valley floor
     float volumetricFogDistance = 240.0f;      // pull back so far trees don't wash out
-    XMFLOAT3 volumetricFogTint = { 0.60f, 0.72f, 0.66f }; // warm-green humid haze
+    XMFLOAT3 volumetricFogTint = { 0.66f, 0.71f, 0.69f }; // neutral humid haze
     bool  enableAmbientOcclusion = true;
-    float ambientOcclusionRadius = 0.12f;
-    float ambientOcclusionStrength = 1.96f;
+    float ambientOcclusionRadius = 0.28f;
+    float ambientOcclusionStrength = 1.15f;
     float ambientOcclusionBias = 0.035f;
-    float contactShadowStrength = 0.0f;
+    float contactShadowStrength = 0.34f;
     int   destructionGridX = 4;
     int   destructionGridY = 3;
     int   destructionGridZ = 4;
@@ -248,7 +248,7 @@ struct Scene {
 
     // Palm trees. Damage here is absolute (against a section's health), not the
     // 0..1 bond fraction destructionDamage uses -- different system, different
-    // units. ~3 hits to sever one trunk section.
+    // units. Two default hits sever one trunk section.
     float treeDamagePerShot = 15.0f;
 
     // Clustered renderer

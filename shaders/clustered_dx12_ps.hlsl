@@ -665,8 +665,11 @@ float4 main(PS_INPUT input) : SV_TARGET {
             ambientOcclusion = lerp(1.0, mrSample.r, occlusionStrength);
         } else {
             // Standalone roughness maps are authored as final roughness, not a
-            // glTF multiplier. Never let dark texels turn metal mirror-smooth.
-            rough = max(rough, mrSample.g);
+            // glTF multiplier. Their R channel optionally carries AO after CPU
+            // packing for procedural/destructible building materials.
+            rough = clamp(mrSample.g, 0.08, 1.0);
+            ambientOcclusion = lerp(
+                1.0, mrSample.r, saturate(occlusionStrength));
         }
     }
 #endif
@@ -807,21 +810,25 @@ float4 main(PS_INPUT input) : SV_TARGET {
 
     result += Lo;
 
-    // Foliage back-light: thin palm fronds transmit sun coming from behind them,
-    // so a leaf between the camera and the sun should glow instead of silhouetting
-    // black. Gated to alpha-cut leaf cards; skips the hair (luminance) cutout.
+    // Foliage back-light: thin palm fronds transmit sun through the side opposite
+    // their visible normal. This is normal-relative, so it works from every camera
+    // angle instead of only when view direction happens to align with the sun.
+    // Gated to alpha-cut leaf cards; skips luminance-cut hair.
     if (alphaCut > 0.5 && alphaCut < 1.5)
     {
-        float backLit = pow(saturate(dot(viewDir, -lightDir)), 3.0);
-        float3 transmission = albedo * lightColor * backLit *
-                              attenuation * shadowVisibility * 0.5;
+        float backLit = saturate(dot(-normal, lightDir));
+        float edgeGlow = pow(1.0 - saturate(abs(dot(normal, viewDir))), 2.0);
+        float3 transmissionTint = float3(0.72, 1.04, 0.42);
+        float3 transmission = albedo * transmissionTint * lightColor *
+                              (backLit * 0.62 + edgeGlow * 0.10) * attenuation *
+                              lerp(0.30, 1.0, shadowVisibility);
         result += transmission;
         // Sky-side fill so backlit fronds keep a readable green instead of
         // silhouetting flat against a bright sky.
-        result += albedo * skyContribution * 0.6;
+        result += albedo * skyContribution * 0.78;
         // Flat foliage floor: guarantee every frond, even fully backlit tips,
         // shows some green and never renders as a pure-black silhouette.
-        result += albedo * 0.35;
+        result += albedo * 0.24;
     }
 
     // Point lights contribution (clustered forward)

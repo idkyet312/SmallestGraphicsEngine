@@ -38,6 +38,10 @@ float4 TerrainLayerWeights(float3 worldPos, float3 geometricNormal) {
     grass *= (1.0 - rock) * (1.0 - sand);
     float4 weights = float4(grass, dirt, sand, rock);
     weights += 0.0001;
+    // Height/slope masks should create readable material regions, not an even
+    // four-way soup. Mild contrast preserves soft natural boundaries while each
+    // scan keeps its authored colour and normal response.
+    weights = pow(weights, 1.35);
     return weights / dot(weights, 1.0);
 }
 
@@ -115,6 +119,27 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
         result.metallic += packedPBR.b * weight;
         result.occlusion += packedPBR.r * weight;
     }
+
+    // Broad, non-repeating biome modulation breaks the obvious scan tiling. Cool
+    // sheltered patches and dry sun-facing patches vary over tens of metres, well
+    // above the texture frequency. Grass gets a slight green bias so blade roots
+    // blend into the turf instead of sitting over pale ground.
+    const float macroA = TerrainBlendNoise(worldPos.xz * 0.18 + 17.0);
+    const float macroB = MatVarNoise(float3(
+        worldPos.xz * 0.018 + float2(31.0, -19.0), 6.7));
+    const float3 coolMacro = float3(0.86, 0.96, 0.84);
+    const float3 warmMacro = float3(1.08, 1.01, 0.88);
+    result.albedo *= lerp(coolMacro, warmMacro,
+                          saturate(macroA * 0.58 + macroB * 0.42));
+    result.albedo *= lerp(1.0.xxx, float3(0.88, 1.04, 0.78),
+                          layerWeights.x * 0.34);
+
+    // Damp sand around the waterline. Darker, smoother wet sand gives the coast
+    // a readable transition before the ocean/foam pass.
+    const float wetSand = layerWeights.z *
+        (1.0 - smoothstep(0.55, 1.55, worldPos.y));
+    result.albedo *= lerp(1.0, 0.68, wetSand);
+    result.roughness = lerp(result.roughness, 0.48, wetSand * 0.75);
     // Invalid/unbound SRVs return zero. Keep terrain readable and make binding
     // faults obvious as flat material colors instead of an all-black island.
     const float3 fallbackColors[4] = {

@@ -4219,6 +4219,57 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
         material->doubleSided = true;
         material->disableOcclusionCulling = true;
     }
+
+    // Pack standalone roughness + optional AO into the glTF-style channels the
+    // shared shaders already consume: R=AO, G=roughness, B=0. This preserves
+    // surface variation on destructible chunks without adding another descriptor
+    // or texture sample.
+    auto assignPackedRoughAO = [&](const std::string& base,
+                                   const std::shared_ptr<SceneMaterial>& mat) {
+        std::vector<unsigned char> roughPixels;
+        std::vector<unsigned char> aoPixels;
+        int roughW = 0, roughH = 0, aoW = 0, aoH = 0;
+        const std::string roughPath = ResolveTexturePath(
+            (base + "_roughness.jpg").c_str());
+        if (!GLBImporter::LoadPixelsRGBA(
+                roughPath, roughPixels, roughW, roughH) ||
+            roughW <= 0 || roughH <= 0) {
+            return false;
+        }
+
+        const std::string aoPath = ResolveTexturePath(
+            (base + "_ao.jpg").c_str());
+        const bool hasAO = GLBImporter::LoadPixelsRGBA(
+            aoPath, aoPixels, aoW, aoH) && aoW > 0 && aoH > 0;
+        std::vector<unsigned char> packed(
+            static_cast<size_t>(roughW) * roughH * 4, 255);
+        for (int y = 0; y < roughH; ++y) {
+            for (int x = 0; x < roughW; ++x) {
+                const size_t dst =
+                    (static_cast<size_t>(y) * roughW + x) * 4;
+                const size_t rough = dst;
+                unsigned char ao = 255;
+                if (hasAO) {
+                    const int ax = (std::min)(aoW - 1, x * aoW / roughW);
+                    const int ay = (std::min)(aoH - 1, y * aoH / roughH);
+                    ao = aoPixels[
+                        (static_cast<size_t>(ay) * aoW + ax) * 4];
+                }
+                packed[dst + 0] = ao;
+                packed[dst + 1] = roughPixels[rough + 0];
+                packed[dst + 2] = 0;
+                packed[dst + 3] = 255;
+            }
+        }
+
+        mat->metallicRoughnessTexture = GLBImporter::CreateTextureFromRGBA(
+            device, cmdList, packed, roughW, roughH, mat->uploadHeaps);
+        mat->roughnessOnlyTexture =
+            mat->metallicRoughnessTexture != nullptr;
+        mat->occlusionStrength = hasAO ? 0.82f : 0.0f;
+        return mat->metallicRoughnessTexture != nullptr;
+    };
+
     // Load the downloaded albedo + normal maps. Albedo falls back to the
     // procedural texture so the house never renders untextured; the normal map
     // is optional (skipped if the file is absent).
@@ -4229,15 +4280,16 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
         mat->baseColorTexture = GLBImporter::LoadTextureFromFile(base + ".jpg", device, cmdList, mat->uploadHeaps);
         if (!mat->baseColorTexture) {
             mat->baseColorTexture = GLBImporter::CreateTextureFromRGBA(
-                device, cmdList, missingFallback, kSize, kSize, mat->uploadHeaps);
+                device, cmdList, fallback, kSize, kSize, mat->uploadHeaps);
         }
         if (mat->baseColorTexture) mat->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
         mat->normalTexture = GLBImporter::LoadTextureFromFile(base + "_normal.jpg", device, cmdList, mat->uploadHeaps);
-        // Roughness map: grayscale JPG whose G channel the shader reads as
-        // roughness (glTF metallic-roughness convention). Metal stays 0.
-        mat->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
-            base + "_roughness.jpg", device, cmdList, mat->uploadHeaps);
-        mat->roughnessOnlyTexture = mat->metallicRoughnessTexture != nullptr;
+        if (!assignPackedRoughAO(base, mat)) {
+            mat->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
+                base + "_roughness.jpg", device, cmdList, mat->uploadHeaps);
+            mat->roughnessOnlyTexture =
+                mat->metallicRoughnessTexture != nullptr;
+        }
         if (mat->metallicRoughnessTexture) mat->metallicFactor = 0.0f;
     };
     auto assignFile = [&](const char* name, const std::string& colorPath,
@@ -4297,9 +4349,9 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
            HouseTex::Stone(kSize, { 0.62f, 0.62f, 0.64f }, { 0.34f, 0.34f, 0.36f }));
     assign("Stud", "Content/Models/house_pbr/stud_wood",
            HouseTex::Wood(kSize, { 0.60f, 0.42f, 0.25f }, { 0.34f, 0.22f, 0.12f }));
-    // Cladding uses the single-board wood (not the multi-plank field) so the
-    // grain reads as real boards when tiled.
-    assign("Cladding", "Content/Models/house_pbr/stud_wood",
+    // Use the authored plank field: seams, nail heads, colour shifts, and AO make
+    // broad walls read as construction instead of flat tan slabs.
+    assign("Cladding", "Content/Models/house_pbr/cladding_wood",
            HouseTex::Wood(kSize, { 0.84f, 0.68f, 0.46f }, { 0.55f, 0.40f, 0.24f }));
     // Corrugated metal sheets; no downloaded map for this one, so the
     // procedural ribbed texture always kicks in.

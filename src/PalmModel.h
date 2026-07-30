@@ -356,9 +356,16 @@ private:
         auto bark = makeMat("palm_bark", "Bark.png");
         auto leaf = makeMat("palm_leaf", "leaf alpha texture.png");
         Materials() = { bark, leaf };
-        // Untextured leaves read as grey plastic; give the flat colour a leafy
-        // green fallback in case the texture is missing.
-        leaf->baseColorFactor = XMFLOAT4(0.35f, 0.55f, 0.25f, 1.0f);
+        // Preserve the authored leaf photo. The old dark-green multiplier crushed
+        // already-shadowed texels and made every crown a silhouette. Keep a mild
+        // healthy-green grade when textured and a stronger fallback only when the
+        // texture is unavailable.
+        leaf->baseColorFactor = leaf->baseColorTexture
+            ? XMFLOAT4(0.82f, 1.00f, 0.76f, 1.0f)
+            : XMFLOAT4(0.35f, 0.55f, 0.25f, 1.0f);
+        leaf->roughnessFactor = 0.82f;
+        leaf->ambientScale = 1.15f;
+        leaf->doubleSided = true;
         // The leaf sheet shapes the cards through its alpha channel.
         leaf->alphaCutout = true;
 

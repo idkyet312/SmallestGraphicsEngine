@@ -730,8 +730,14 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         float4 mr = materialTextures[material.textureIndices.z].SampleGrad(
             texSampler, texCoord, uvDx, uvDy);
         materialAO = lerp(1.0, mr.r, saturate(material.emissiveOcclusion.w));
-        if (material.textureIndices.w != 0u) rough = max(rough, mr.g);
-        else { rough *= mr.g; metal *= mr.b; }
+        if (material.textureIndices.w != 0u) {
+            rough = clamp(mr.g, 0.08, 1.0);
+            materialAO = lerp(1.0, mr.r,
+                saturate(material.emissiveOcclusion.w));
+        } else {
+            rough *= mr.g;
+            metal *= mr.b;
+        }
     }
     metal = saturate(metal);
     rough = clamp(rough, 0.04, 1.0);
