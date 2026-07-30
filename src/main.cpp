@@ -1698,6 +1698,27 @@ WaterVolume                 g_water;
 WaterVolume                 g_ocean;   // sea ringing the island, surface at y = 0
 PalmTrees                   g_trees;
 GrassField                  g_grass;
+
+void MatchDandelionAlbedoToGrass() {
+    if (!g_dandelionModel) return;
+    const XMFLOAT3 grassAlbedo = g_grass.Albedo();
+    const auto updateMaterial = [&](const auto& self,
+                                    const std::shared_ptr<SceneNode>& node) -> void {
+        if (!node) return;
+        if (node->mesh) {
+            for (MeshPrimitive& primitive : node->mesh->primitives) {
+                if (primitive.material) {
+                    primitive.material->baseColorFactor =
+                        XMFLOAT4(grassAlbedo.x, grassAlbedo.y, grassAlbedo.z, 1.0f);
+                }
+            }
+        }
+        for (const auto& child : node->children)
+            self(self, child);
+    };
+    updateMaterial(updateMaterial, g_dandelionModel);
+}
+
 static SkyRendererDX12      skyRenderer;
 static EnvironmentIBLDX12   environmentIBL;
 DDGIRendererDX12            g_ddgiRenderer;
@@ -2633,6 +2654,9 @@ static bool LoadDandelionModel() {
 
     auto material = std::make_shared<SceneMaterial>();
     material->name = "Dandelion foliage";
+    const XMFLOAT3& grassAlbedo = g_grass.Albedo();
+    material->baseColorFactor =
+        XMFLOAT4(grassAlbedo.x, grassAlbedo.y, grassAlbedo.z, 1.0f);
     material->metallicFactor = 0.0f;
     material->roughnessFactor = 1.0f;
     material->doubleSided = true;
