@@ -152,6 +152,9 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
         fallbackAlbedo += fallbackColors[fallbackLayer] * layerWeights[fallbackLayer];
     if (dot(result.albedo, float3(0.2126, 0.7152, 0.0722)) < 0.002)
         result.albedo = fallbackAlbedo;
+    // Darken only turf-covered terrain so it sits beneath the grass blades.
+    // Weighting preserves seamless transitions into dirt, sand, and rock.
+    result.albedo *= lerp(1.0, 0.88, layerWeights.x);
     // Close-range detail: a high-frequency albedo modulation + normal
     // perturbation that fades out with distance. Breaks up the tiling repeat and
     // adds crispness underfoot without new textures. Fades to nothing by ~40 m
