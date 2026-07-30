@@ -1699,17 +1699,22 @@ WaterVolume                 g_ocean;   // sea ringing the island, surface at y =
 PalmTrees                   g_trees;
 GrassField                  g_grass;
 
-void MatchDandelionAlbedoToGrass() {
-    if (!g_dandelionModel) return;
+void MatchFoliageAlbedoToGrass() {
     const XMFLOAT3 grassAlbedo = g_grass.Albedo();
+    const XMFLOAT4 matchedAlbedo(
+        grassAlbedo.x, grassAlbedo.y, grassAlbedo.z, 1.0f);
+    for (const auto& material : PalmModel::Materials()) {
+        if (material && material->name == "palm_leaf")
+            material->baseColorFactor = matchedAlbedo;
+    }
+    if (!g_dandelionModel) return;
     const auto updateMaterial = [&](const auto& self,
                                     const std::shared_ptr<SceneNode>& node) -> void {
         if (!node) return;
         if (node->mesh) {
             for (MeshPrimitive& primitive : node->mesh->primitives) {
                 if (primitive.material) {
-                    primitive.material->baseColorFactor =
-                        XMFLOAT4(grassAlbedo.x, grassAlbedo.y, grassAlbedo.z, 1.0f);
+                    primitive.material->baseColorFactor = matchedAlbedo;
                 }
             }
         }
@@ -2623,6 +2628,7 @@ static constexpr std::array<PalmSpawn, 6> kStressHousePalmSpawns = {{
 
 static void ResetPalmTrees() {
     g_trees.Initialize();
+    MatchFoliageAlbedoToGrass();
     if (g_customLevelMode) {
         for (const LevelEntity& entity : g_game.world.Level().entities) {
             if (!entity.enabled || entity.type != LevelEntityType::Palm) continue;
