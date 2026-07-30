@@ -233,21 +233,23 @@ struct Scene {
     float atmosphereCloudCoverage = 0.42f;
     float atmosphereCloudDensity = 0.68f;
     float atmosphereCloudBaseHeight = 720.0f;
-    float atmosphereCloudThickness = 950.0f;
+    float atmosphereCloudThickness = 1250.0f;
     bool  enableVolumetricFog = true;
-    float volumetricFogDensity = 0.0028f;      // preserve depth without washing out buildings
-    float volumetricFogAnisotropy = 0.42f;     // stronger forward scatter -> backlit haze
+    float volumetricFogDensity = 0.0128f;
+    float volumetricFogAnisotropy = 0.90f;
     float volumetricFogHeightFalloff = 0.045f; // fog thins above the undergrowth, not over treetops
     float volumetricFogBaseHeight = 0.4f;      // haze pools low in the valley floor
     float volumetricFogDistance = 240.0f;      // pull back so far trees don't wash out
-    XMFLOAT3 volumetricFogTint = { 0.66f, 0.71f, 0.69f }; // neutral humid haze
+    XMFLOAT3 volumetricFogTint = {
+        168.0f / 255.0f, 181.0f / 255.0f, 176.0f / 255.0f
+    };
     bool  enableAmbientOcclusion = true;
-    float ambientOcclusionRadius = 0.28f;
-    float ambientOcclusionStrength = 1.15f;
+    float ambientOcclusionRadius = 0.69f;
+    float ambientOcclusionStrength = 2.50f;
     float ambientOcclusionBias = 0.035f;
-    float contactShadowStrength = 0.34f;
+    float contactShadowStrength = 0.56f;
     bool  enableScreenSpaceReflections = true;
-    float screenSpaceReflectionStrength = 0.48f;
+    float screenSpaceReflectionStrength = 0.35f;
     float screenSpaceReflectionDistance = 55.0f;
     float screenSpaceReflectionThickness = 0.08f;
     int   destructionGridX = 4;

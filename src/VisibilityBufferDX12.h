@@ -209,7 +209,7 @@ public:
     bool geometryDirty = false;
     UINT postFrameIndex = 0;
     float exposure = 1.15f;
-    float bloomStrength = 0.12f;
+    float bloomStrength = 0.16f;
     float vignetteStrength = 0.18f;
     float grainStrength = 0.012f;
     float taaFeedback = 0.86f;
