@@ -63,9 +63,24 @@ float SampleDepth(float2 uv, bool multisampled)
 
 float3 ReconstructNormal(float2 uv, float depth, bool multisampled)
 {
+    float3 stored = 0.0;
+    float storedValid = 0.0;
     if (filterParams.y > 0.5) {
-        float3 stored = surfaceData.SampleLevel(pointClamp, uv, 0.0).xyz;
-        if (dot(stored, stored) > 0.25) return normalize(stored);
+        stored = surfaceData.SampleLevel(pointClamp, uv, 0.0).xyz;
+        float depthMatch = 1.0;
+        if (filterParams.x > 0.5) {
+            // Mesh terrain and other forward extensions update sceneDepth after
+            // visibility resolve. Reject a stored normal when it belongs to
+            // geometry now hidden behind that forward surface.
+            float visibilityDepth =
+                staticCasterDepth.SampleLevel(pointClamp, uv, 0.0);
+            float sceneLinear = LinearDepth(depth);
+            float visibilityLinear = LinearDepth(visibilityDepth);
+            float tolerance = max(0.025, sceneLinear * 0.003);
+            depthMatch = step(
+                abs(sceneLinear - visibilityLinear), tolerance);
+        }
+        storedValid = depthMatch * step(0.25, dot(stored, stored));
     }
     float3 center = ReconstructWorld(uv, depth);
     float2 texel = screenParams.zw;
@@ -81,7 +96,8 @@ float3 ReconstructNormal(float2 uv, float depth, bool multisampled)
     float3 dy = length(dyU) < length(dyD) ? dyU : dyD;
     float3 normal = normalize(cross(dx, dy));
     float3 toCamera = normalize(cameraNearFar.xyz - center);
-    return dot(normal, toCamera) < 0.0 ? -normal : normal;
+    normal = dot(normal, toCamera) < 0.0 ? -normal : normal;
+    return storedValid > 0.5 ? normalize(stored) : normal;
 }
 
 float InterleavedNoise(float2 pixel)
@@ -144,9 +160,19 @@ bool IsViewModelDepth(float deviceDepth)
 
 float SampleContactCasterDepth(float2 uv, bool multisampled)
 {
-    if (filterParams.x > 0.5)
-        return staticCasterDepth.SampleLevel(pointClamp, saturate(uv), 0.0);
-    return SampleDepth(uv, multisampled);
+    float currentDepth = SampleDepth(uv, multisampled);
+    // Do not let first-person gun depth cast into the world.
+    if (IsViewModelDepth(currentDepth))
+        currentDepth = 1.0;
+    if (filterParams.x <= 0.5)
+        return currentDepth;
+
+    float casterDepth =
+        staticCasterDepth.SampleLevel(pointClamp, saturate(uv), 0.0);
+    // Static depth was captured before mesh terrain. Combining it with current
+    // depth preserves the view-model exclusion while letting terrain occlude
+    // objects hidden behind a hill instead of projecting them through it.
+    return min(casterDepth, currentDepth);
 }
 
 float ContactVisibility(float2 uv, float deviceDepth, bool multisampled)
@@ -154,6 +180,9 @@ float ContactVisibility(float2 uv, float deviceDepth, bool multisampled)
     if (deviceDepth >= 0.99999 || lightDirection.w <= 0.0 ||
         IsViewModelDepth(deviceDepth)) return 1.0;
     float3 world = ReconstructWorld(uv, deviceDepth);
+    float3 surfaceNormal =
+        ReconstructNormal(uv, deviceDepth, multisampled);
+    world += surfaceNormal * max(0.015, aoParams.x * 0.03);
     float3 rayDirection = normalize(lightDirection.xyz);
     const float maxDistance = max(aoParams.w * 0.004, 1.5);
     [unroll]
