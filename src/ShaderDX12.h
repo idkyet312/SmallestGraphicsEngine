@@ -10,6 +10,7 @@
 #include <sstream>
 #include <cstdio>
 #include <array>
+#include <algorithm>
 
 inline constexpr UINT SHADOW_CASCADE_COUNT = 3;
 inline std::array<XMMATRIX, SHADOW_CASCADE_COUNT> g_shadowCascadeMatrices = {
@@ -1183,6 +1184,25 @@ public:
         // Terrain scans use OpenGL normal maps. DX12 texture coordinates use
         // the opposite V direction, so flip tangent-space green.
         data.normalYSign = -1.0f;
+        objectBuffer.CopyData(bufferIndex, data);
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(
+            3, objectBuffer.GetGPUAddress(bufferIndex));
+    }
+
+    void SetGrassMaterial(const XMFLOAT3& albedo, float roughness,
+                          float ambientScale, float directLightScale,
+                          float transmissionStrength, float colorVariation) {
+        const UINT bufferIndex = GetDrawCallIndex();
+        ObjectBufferDX12 data = {};
+        data.objectColor = albedo;
+        data.roughness = std::clamp(roughness, 0.04f, 1.0f);
+        data.opacity = 1.0f;
+        data.ambientScale = (std::max)(ambientScale, 0.0f);
+        // Grass shader reuses otherwise inactive material slots. This keeps its
+        // cheap PSO compatible with the shared root signature and object buffer.
+        data.occlusionStrength = (std::max)(directLightScale, 0.0f);
+        data.normalYSign = (std::max)(transmissionStrength, 0.0f);
+        data.viewFillStrength = (std::max)(colorVariation, 0.0f);
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(
             3, objectBuffer.GetGPUAddress(bufferIndex));

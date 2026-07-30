@@ -239,6 +239,22 @@ public:
     // draw distance feeds both the cell cull and the shader's fade.
     float& Density()      { return m_density; }
     float& DrawDistance() { return m_drawDistance; }
+    // Material controls. These feed the grass-specific pixel shader every draw,
+    // so editor changes are immediate and require no blade-buffer rebuild.
+    XMFLOAT3& Albedo()             { return m_albedo; }
+    float& Roughness()             { return m_roughness; }
+    float& AmbientScale()          { return m_ambientScale; }
+    float& DirectLightScale()      { return m_directLightScale; }
+    float& TransmissionStrength()  { return m_transmissionStrength; }
+    float& ColorVariation()        { return m_colorVariation; }
+    void ResetMaterial() {
+        m_albedo = XMFLOAT3(0.126f, 0.178f, 0.040f);
+        m_roughness = 0.85f;
+        m_ambientScale = 1.0f;
+        m_directLightScale = 1.0f;
+        m_transmissionStrength = 0.34f;
+        m_colorVariation = 1.0f;
+    }
     // Authored curved cards overlap into large repeated silhouettes on nearby
     // vehicles and buildings. Grass receives lighting but never enters CSMs.
     bool CastShadows() const { return false; }
@@ -625,6 +641,12 @@ private:
     // Sparse grass casters still produce visible cascade/cell bands across the
     // terrain. Keep blade lighting, but leave terrain shadowing to solid props.
     float m_shadowDensity = 0.28f;
+    XMFLOAT3 m_albedo = { 0.126f, 0.178f, 0.040f };
+    float m_roughness = 0.85f;
+    float m_ambientScale = 1.0f;
+    float m_directLightScale = 1.0f;
+    float m_transmissionStrength = 0.34f;
+    float m_colorVariation = 1.0f;
     // Side of one draw-cell. Small enough that the cells hug the draw radius
     // without dragging in much grass the shader would only fade away, large enough
     // that the whole field stays a few dozen draws rather than hundreds.

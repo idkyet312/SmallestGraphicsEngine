@@ -161,7 +161,7 @@ float3 tonemapAgXPunchy(float3 color) {
 
     const float3 lw = float3(0.2126, 0.7152, 0.0722);
     float luma = dot(color, lw);
-    color = pow(color, 1.35);
+    color = pow(max(color, 0.0), 1.35);
     color = luma + 1.4 * (color - luma);
 
     color = mul(agxOut, color);
@@ -175,8 +175,15 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // Keep amplitude low to avoid noisy distant grass.
     float3 coolTint = float3(0.90, 1.03, 0.92);
     float3 warmTint = float3(1.06, 1.00, 0.78);
-    float3 tint = lerp(coolTint, warmTint, input.colorVariation);
-    float brightness = lerp(0.88, 1.10, input.colorVariation);
+    float variationStrength = max(viewFillStrength, 0.0);
+    float3 tint = lerp(
+        1.0.xxx,
+        lerp(coolTint, warmTint, input.colorVariation),
+        variationStrength);
+    float brightness = lerp(
+        1.0,
+        lerp(0.88, 1.10, input.colorVariation),
+        variationStrength);
     float3 albedo = saturate(objectColor * tint * brightness);
     float albedoLuma = dot(albedo, float3(0.2126, 0.7152, 0.0722));
     albedo = lerp(albedoLuma.xxx, albedo, 0.80);
@@ -205,13 +212,23 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float wrappedNdotL = saturate((signedNdotL + 0.32) / 1.32);
     float backNdotL = saturate(-signedNdotL);
     result += albedo / 3.14159265 * lightColor *
-              wrappedNdotL * shadowVisibility;
+              wrappedNdotL * shadowVisibility *
+              max(occlusionStrength, 0.0);
+
+    // Broad low-energy leaf sheen. Roughness now remains useful on the cheap
+    // grass shader without turning blades into metallic highlights.
+    float3 halfDir = normalize(lightDir + viewDir);
+    float specularPower = lerp(96.0, 10.0, saturate(roughness));
+    float specularLobe = pow(saturate(dot(normal, halfDir)), specularPower);
+    float specularEnergy = (1.0 - saturate(roughness)) * 0.08;
+    result += lightColor * specularLobe * specularEnergy *
+              shadowVisibility * max(occlusionStrength, 0.0);
 
     float tipTransmission = lerp(0.55, 1.0, smoothstep(0.15, 0.92,
                                                         input.texCoord.y));
     float3 transmissionTint = float3(0.72, 0.98, 0.50);
     result += albedo * transmissionTint * lightColor *
-              backNdotL * tipTransmission * 0.34 *
+              backNdotL * tipTransmission * max(normalYSign, 0.0) *
               lerp(0.35, 1.0, shadowVisibility);
 
 #ifdef SGE_HDR_TARGET
