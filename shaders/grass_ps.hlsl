@@ -178,6 +178,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float3 tint = lerp(coolTint, warmTint, input.colorVariation);
     float brightness = lerp(0.88, 1.10, input.colorVariation);
     float3 albedo = saturate(objectColor * tint * brightness);
+    float albedoLuma = dot(albedo, float3(0.2126, 0.7152, 0.0722));
+    albedo = lerp(albedoLuma.xxx, albedo, 0.80);
 
     // Blades are two-sided cards; flip the normal to face the camera so the
     // back of a blade doesn't go black.
@@ -207,9 +209,9 @@ float4 main(PS_INPUT input) : SV_TARGET {
 
     float tipTransmission = lerp(0.55, 1.0, smoothstep(0.15, 0.92,
                                                         input.texCoord.y));
-    float3 transmissionTint = float3(0.68, 1.05, 0.38);
+    float3 transmissionTint = float3(0.72, 0.98, 0.50);
     result += albedo * transmissionTint * lightColor *
-              backNdotL * tipTransmission * 0.42 *
+              backNdotL * tipTransmission * 0.34 *
               lerp(0.35, 1.0, shadowVisibility);
 
 #ifdef SGE_HDR_TARGET

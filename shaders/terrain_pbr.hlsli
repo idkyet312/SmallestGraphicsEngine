@@ -155,26 +155,29 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
         result.albedo = fallbackAlbedo;
     // Close-range detail: a high-frequency albedo modulation + normal
     // perturbation that fades out with distance. Breaks up the tiling repeat and
-    // adds crispness underfoot without new textures. Fades to nothing by ~60 m
+    // adds crispness underfoot without new textures. Fades to nothing by ~40 m
     // so distant coarse-ring ground stays clean and cheap.
-    const float detailFade = 1.0 - smoothstep(12.0, 60.0, cameraDistance);
+    const float detailFade = 1.0 - smoothstep(10.0, 40.0, cameraDistance);
     if (detailFade > 0.001) {
         const float d1 = MatVarNoise(float3(worldPos.xz * 1.7, 5.0));
         const float d2 = MatVarNoise(float3(worldPos.xz * 4.3, 9.0));
         const float detail = (d1 * 0.6 + d2 * 0.4) - 0.5;
         // Subtle albedo contrast + a tiny normal wobble for micro-relief.
-        result.albedo *= 1.0 + detail * 0.18 * detailFade;
+        result.albedo *= 1.0 + detail * 0.13 * detailFade;
         result.normal.xz += float2(
             MatVarNoise(float3(worldPos.xz * 3.1 + 2.0, 1.0)) - 0.5,
             MatVarNoise(float3(worldPos.zx * 3.1 + 7.0, 1.0)) - 0.5) *
-            0.35 * detailFade;
+            0.26 * detailFade;
         result.normal = normalize(result.normal);
     }
 
     const float grassResponse = layerWeights.x;
+    const float normalDistanceFade =
+        1.0 - smoothstep(24.0, 90.0, cameraDistance);
+    const float nearNormalStrength = lerp(0.62, 0.92, grassResponse);
     result.normal = normalize(lerp(
         geometricNormal, normalize(result.normal),
-        lerp(0.62, 0.92, grassResponse)));
+        lerp(0.26, nearNormalStrength, normalDistanceFade)));
     // Retain authored grass roughness variation instead of crushing every layer
     // into the previous 0.65 floor.
     result.roughness = clamp(result.roughness, 0.42, 1.0);

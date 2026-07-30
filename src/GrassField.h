@@ -364,7 +364,20 @@ private:
             const float smoothFalloff =
                 falloffT * falloffT * (3.0f - 2.0f * falloffT);
             const float radialDensity = 1.0f - smoothFalloff * 0.85f;
-            if (Rand(seed) > radialDensity) continue;
+
+            // Broad overlapping waves leave irregular open ground between dense
+            // stands. This avoids the uniform lawn look without adding a texture
+            // lookup or making individual tufts flicker between rebuilds.
+            const float densityWaveA = 0.5f + 0.5f *
+                std::sin(cx * 0.105f + std::sin(cz * 0.073f) * 1.6f);
+            const float densityWaveB = 0.5f + 0.5f *
+                std::sin(cz * 0.061f - std::cos(cx * 0.047f) * 1.9f);
+            const float densityShape = std::clamp(
+                densityWaveA * 0.62f + densityWaveB * 0.38f, 0.0f, 1.0f);
+            const float macroDensity = 0.58f + 0.42f *
+                (densityShape * densityShape *
+                 (3.0f - 2.0f * densityShape));
+            if (Rand(seed) > radialDensity * macroDensity) continue;
 
             // Test the CLUMP's centre once, not every blade: if the middle of the
             // tuft is in the sea or on a cliff, the whole tuft is rejected.
