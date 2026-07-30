@@ -225,6 +225,15 @@ struct Scene {
     bool  enableMSAA = true;
     bool  enableGrassMSAA = true;
     bool  enableFXAA = false;
+    bool  enablePhysicalAtmosphere = true;
+    float atmosphereRayleighStrength = 0.92f;
+    float atmosphereMieStrength = 0.58f;
+    float atmosphereMieAnisotropy = 0.76f;
+    float atmosphereAerialDensity = 0.72f;
+    float atmosphereCloudCoverage = 0.42f;
+    float atmosphereCloudDensity = 0.68f;
+    float atmosphereCloudBaseHeight = 720.0f;
+    float atmosphereCloudThickness = 950.0f;
     bool  enableVolumetricFog = true;
     float volumetricFogDensity = 0.0028f;      // preserve depth without washing out buildings
     float volumetricFogAnisotropy = 0.42f;     // stronger forward scatter -> backlit haze

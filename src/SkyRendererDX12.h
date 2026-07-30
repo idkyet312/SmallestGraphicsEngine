@@ -21,6 +21,10 @@ struct alignas(256) SkyBufferDX12 {
     float environmentRotation;
     XMFLOAT3 sunDirection;
     float exposure;
+    XMFLOAT3 cameraPosition;
+    float time;
+    XMFLOAT4 atmosphereParams;
+    XMFLOAT4 cloudParams;
 };
 
 class SkyRendererDX12 {
@@ -145,7 +149,10 @@ public:
 
     void SetHDRTargetEnabled(bool enabled) { hdrTargetEnabled = enabled; }
 
-    void Render(const Camera& camera, float fovDegrees, const XMFLOAT3& lightDirection, float time) {
+    void Render(const Camera& camera, float fovDegrees,
+                const XMFLOAT3& lightDirection, float time,
+                bool physicalAtmosphere, const XMFLOAT4& atmosphereParams,
+                const XMFLOAT4& cloudParams) {
         if (!initialized) return;
         // camera.Up is always world-up, not the camera's actual up. Building the
         // ray basis straight from it collapses the image plane as pitch nears
@@ -166,6 +173,12 @@ public:
         XMVECTOR sun = XMVector3Normalize(XMLoadFloat3(&lightDirection));
         XMStoreFloat3(&data.sunDirection, sun);
         data.exposure = 1.32f;
+        data.cameraPosition = camera.Position;
+        data.time = time;
+        data.atmosphereParams = atmosphereParams;
+        if (!physicalAtmosphere)
+            data.atmosphereParams.x = 0.0f;
+        data.cloudParams = cloudParams;
         constants.CopyData(g_dx12.frameIndex, data);
 
         g_dx12.commandList->SetPipelineState(hdrTargetEnabled

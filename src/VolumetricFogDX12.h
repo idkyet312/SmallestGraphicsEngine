@@ -120,6 +120,8 @@ private:
         XMFLOAT4 ambientFogColor;
         XMFLOAT4 shadowCascadeSplits;
         XMUINT4 clusterDimsLightCount;
+        XMFLOAT4 atmosphereParams;
+        XMFLOAT4 cloudParams;
     };
     static_assert(sizeof(FogConstants) <= ConstantsSize, "Fog constants exceed one CBV page");
 
@@ -336,6 +338,18 @@ private:
         constants.clusterDimsLightCount = { GridX, GridY, GridZ,
             static_cast<UINT>((std::min)(scene.clusteredRenderer.lights.size(),
                                         static_cast<size_t>(MaxLights))) };
+        constants.atmosphereParams = {
+            scene.enablePhysicalAtmosphere ? scene.atmosphereRayleighStrength : 0.0f,
+            scene.atmosphereMieStrength,
+            scene.atmosphereMieAnisotropy,
+            scene.atmosphereAerialDensity
+        };
+        constants.cloudParams = {
+            scene.atmosphereCloudCoverage,
+            scene.atmosphereCloudDensity,
+            scene.atmosphereCloudBaseHeight,
+            scene.atmosphereCloudThickness
+        };
         std::memcpy(constantsMapped_ + frame_ * ConstantsSize, &constants, sizeof(constants));
 
         GPUCluster* gpuClusters = reinterpret_cast<GPUCluster*>(

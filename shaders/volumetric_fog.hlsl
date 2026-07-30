@@ -24,6 +24,8 @@ cbuffer FogConstants : register(b0)
     float4 ambientFogColor;
     float4 shadowCascadeSplits;
     uint4 clusterDimsLightCount;  // x, y, z, source light count
+    float4 atmosphereParams;      // Rayleigh, Mie, Mie g, aerial density
+    float4 cloudParams;           // coverage, density, base height, thickness
 };
 
 StructuredBuffer<FogCluster> clusters : register(t0);
@@ -73,7 +75,9 @@ float SunVisibility(float3 worldPosition)
 float HenyeyGreenstein(float cosineTheta, float g)
 {
     float g2 = g * g;
-    return (1.0 - g2) / max(4.0 * 3.14159265 * pow(1.0 + g2 - 2.0 * g * cosineTheta, 1.5), 1e-4);
+    float denominator = max(1.0 + g2 - 2.0 * g * cosineTheta, 1e-4);
+    return (1.0 - g2) /
+        max(4.0 * 3.14159265 * pow(denominator, 1.5), 1e-4);
 }
 
 float FogNoise(float3 p)
@@ -84,6 +88,36 @@ float FogNoise(float3 p)
               sin(p.z * 0.093 - p.y * 0.17);
     n += sin((p.x + p.z) * 0.037 + ambientFogColor.w * 0.31) * 0.55;
     return saturate(n * 0.32 + 0.62);
+}
+
+float CloudSunVisibility(float3 worldPosition)
+{
+    if (atmosphereParams.x <= 0.001 || cloudParams.x <= 0.001)
+        return 1.0;
+    float2 wind = float2(ambientFogColor.w * 2.1,
+                         ambientFogColor.w * 1.0);
+    float2 projected = worldPosition.xz +
+        normalize(sunDirectionDensity.xz + 1e-4) *
+        max(cloudParams.z - worldPosition.y, 0.0);
+    float clouds = FogNoise(float3(projected * 0.014 + wind, 7.0));
+    float threshold = lerp(0.78, 0.26, cloudParams.x);
+    float opticalDepth = saturate((clouds - threshold) * 2.2) *
+                         cloudParams.y;
+    return exp(-opticalDepth * 0.75);
+}
+
+float3 AtmosphereAmbient(float3 ray, float aboveBase)
+{
+    if (atmosphereParams.x <= 0.001)
+        return ambientFogColor.xyz;
+    float horizon = pow(1.0 - saturate(ray.y), 2.0);
+    float3 rayleighColor = float3(0.46, 0.68, 1.0);
+    float3 sky = lerp(rayleighColor, ambientFogColor.xyz,
+                      0.35 + horizon * 0.45);
+    float3 groundBounce = float3(0.36, 0.44, 0.28) *
+        exp(-aboveBase * 0.055);
+    return sky * (0.52 + atmosphereParams.x * 0.26) +
+           groundBounce * atmosphereParams.w * 0.34;
 }
 
 [numthreads(8, 8, 1)]
@@ -122,10 +156,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float extinction = max(sunDirectionDensity.w * heightDensity, 0.00001);
         float segmentTransmittance = exp(-extinction * stepLength);
 
-        float shadow = SunVisibility(worldPosition);
+        float shadow = SunVisibility(worldPosition) *
+                       CloudSunVisibility(worldPosition);
         // Daylight fog must replace attenuated scene energy with sky irradiance.
         // A tiny ambient term made the former pass behave like red/brown smoke.
-        float3 lighting = ambientFogColor.xyz +
+        float3 lighting = AtmosphereAmbient(ray, aboveBase) +
             sunColorAnisotropy.xyz * phase * shadow * 0.55;
         uint clusterIndex = id.x + id.y * clusterDimsLightCount.x +
             z * clusterDimsLightCount.x * clusterDimsLightCount.y;

@@ -546,6 +546,31 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         if (scene.enableGrassMSAA && !scene.useVisibilityBuffer)
             ImGui::TextDisabled("Grass MSAA active only in Visibility Buffer");
         ImGui::Checkbox("FXAA", &scene.enableFXAA);
+        ImGui::Checkbox("Physical Atmosphere", &scene.enablePhysicalAtmosphere);
+        if (scene.enablePhysicalAtmosphere) {
+            ImGui::SliderFloat("Rayleigh", &scene.atmosphereRayleighStrength,
+                               0.0f, 2.0f, "%.2f");
+            ImGui::SliderFloat("Mie Haze", &scene.atmosphereMieStrength,
+                               0.0f, 2.0f, "%.2f");
+            ImGui::SliderFloat("Mie Directionality",
+                               &scene.atmosphereMieAnisotropy,
+                               0.0f, 0.92f, "%.2f");
+            ImGui::SliderFloat("Aerial Perspective",
+                               &scene.atmosphereAerialDensity,
+                               0.0f, 2.0f, "%.2f");
+            ImGui::SliderFloat("Cloud Coverage",
+                               &scene.atmosphereCloudCoverage,
+                               0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Cloud Density",
+                               &scene.atmosphereCloudDensity,
+                               0.0f, 1.5f, "%.2f");
+            ImGui::DragFloat("Cloud Base",
+                             &scene.atmosphereCloudBaseHeight,
+                             10.0f, 50.0f, 5000.0f, "%.0f m");
+            ImGui::DragFloat("Cloud Thickness",
+                             &scene.atmosphereCloudThickness,
+                             10.0f, 50.0f, 5000.0f, "%.0f m");
+        }
         ImGui::Checkbox("GTAO + Contact Shadows", &scene.enableAmbientOcclusion);
         if (scene.enableAmbientOcclusion) {
             ImGui::DragFloat("AO Radius", &scene.ambientOcclusionRadius,

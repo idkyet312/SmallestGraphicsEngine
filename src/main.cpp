@@ -7584,7 +7584,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 visBuffer.BeginHDRBackground(g_dx12.commandList.Get());
                 skyRenderer.SetHDRTargetEnabled(true);
             }
-            skyRenderer.Render(scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now);
+            skyRenderer.Render(
+                scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now,
+                scene.enablePhysicalAtmosphere,
+                XMFLOAT4(scene.atmosphereRayleighStrength,
+                         scene.atmosphereMieStrength,
+                         scene.atmosphereMieAnisotropy,
+                         scene.atmosphereAerialDensity),
+                XMFLOAT4(scene.atmosphereCloudCoverage,
+                         scene.atmosphereCloudDensity,
+                         scene.atmosphereCloudBaseHeight,
+                         scene.atmosphereCloudThickness));
             if (commonHDRValidationTarget) {
                 skyRenderer.SetHDRTargetEnabled(false);
                 visBuffer.EndHDRBackground(g_dx12.commandList.Get());
