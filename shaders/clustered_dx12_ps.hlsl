@@ -829,7 +829,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // and hard-surface assets, or the bright horizon creates a silver rim.
     float characterSpecularScale = viewFillStrength > 0.25 ? 0.38 : 1.0;
     float surfaceSpecularScale =
-        isFoliage ? 0.20 : characterSpecularScale;
+        isFoliage ? 0.12 : characterSpecularScale;
     float3 specular = numerator / denominator * surfaceSpecularScale;
     
     // Combine

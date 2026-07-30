@@ -361,10 +361,10 @@ private:
         // healthy-green grade when textured and a stronger fallback only when the
         // texture is unavailable.
         leaf->baseColorFactor = leaf->baseColorTexture
-            ? XMFLOAT4(0.82f, 1.00f, 0.76f, 1.0f)
+            ? XMFLOAT4(0.68f, 0.82f, 0.62f, 1.0f)
             : XMFLOAT4(0.35f, 0.55f, 0.25f, 1.0f);
         leaf->roughnessFactor = 0.82f;
-        leaf->ambientScale = 1.15f;
+        leaf->ambientScale = 0.90f;
         leaf->doubleSided = true;
         // The leaf sheet shapes the cards through its alpha channel.
         leaf->alphaCutout = true;

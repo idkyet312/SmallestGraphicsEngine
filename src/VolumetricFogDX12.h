@@ -92,10 +92,16 @@ public:
     }
 
 private:
-    static constexpr UINT GridX = ClusteredRendererDX12::CLUSTER_X;
-    static constexpr UINT GridY = ClusteredRendererDX12::CLUSTER_Y;
-    static constexpr UINT GridZ = ClusteredRendererDX12::CLUSTER_Z;
-    static constexpr UINT ClusterCount = GridX * GridY * GridZ;
+    // Fog needs substantially finer spatial/depth sampling than light clusters.
+    // Keeping it at 16x9x10 blurred palm silhouettes into uniform haze and
+    // prevented visible shafts through gaps in the fronds.
+    static constexpr UINT GridX = 64;
+    static constexpr UINT GridY = 36;
+    static constexpr UINT GridZ = 48;
+    static constexpr UINT ClusterCount =
+        ClusteredRendererDX12::CLUSTER_X *
+        ClusteredRendererDX12::CLUSTER_Y *
+        ClusteredRendererDX12::CLUSTER_Z;
     static constexpr UINT MaxLights = ClusteredRendererDX12::MAX_LIGHTS;
     static constexpr UINT ConstantsSize = 512;
 
@@ -120,6 +126,7 @@ private:
         XMFLOAT4 ambientFogColor;
         XMFLOAT4 shadowCascadeSplits;
         XMUINT4 clusterDimsLightCount;
+        XMUINT4 volumeDims;
         XMFLOAT4 atmosphereParams;
         XMFLOAT4 cloudParams;
     };
@@ -335,9 +342,13 @@ private:
             scene.volumetricFogTint.z,
             fogTime_ };
         constants.shadowCascadeSplits = g_shadowCascadeSplits;
-        constants.clusterDimsLightCount = { GridX, GridY, GridZ,
+        constants.clusterDimsLightCount = {
+            ClusteredRendererDX12::CLUSTER_X,
+            ClusteredRendererDX12::CLUSTER_Y,
+            ClusteredRendererDX12::CLUSTER_Z,
             static_cast<UINT>((std::min)(scene.clusteredRenderer.lights.size(),
                                         static_cast<size_t>(MaxLights))) };
+        constants.volumeDims = { GridX, GridY, GridZ, 0u };
         constants.atmosphereParams = {
             scene.enablePhysicalAtmosphere ? scene.atmosphereRayleighStrength : 0.0f,
             scene.atmosphereMieStrength,

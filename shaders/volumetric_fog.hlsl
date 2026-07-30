@@ -24,6 +24,7 @@ cbuffer FogConstants : register(b0)
     float4 ambientFogColor;
     float4 shadowCascadeSplits;
     uint4 clusterDimsLightCount;  // x, y, z, source light count
+    uint4 volumeDims;
     float4 atmosphereParams;      // Rayleigh, Mie, Mie g, aerial density
     float4 cloudParams;           // coverage, density, base height, thickness
 };
@@ -43,7 +44,7 @@ float SliceDepth(float slice)
 {
     const float nearZ = cameraPositionNear.w;
     const float farZ = min(cameraForwardFar.w, fogParams.z);
-    return nearZ * pow(farZ / nearZ, slice / clusterDimsLightCount.z);
+    return nearZ * pow(farZ / nearZ, slice / volumeDims.z);
 }
 
 float3 WorldRay(float2 uv)
@@ -123,19 +124,22 @@ float3 AtmosphereAmbient(float3 ray, float aboveBase)
 [numthreads(8, 8, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= clusterDimsLightCount.x || id.y >= clusterDimsLightCount.y)
+    if (id.x >= volumeDims.x || id.y >= volumeDims.y)
         return;
 
-    float2 uv = (float2(id.xy) + 0.5) / float2(clusterDimsLightCount.xy);
+    float2 uv = (float2(id.xy) + 0.5) / float2(volumeDims.xy);
     float3 ray = WorldRay(uv);
     float viewCos = max(dot(ray, normalize(cameraForwardFar.xyz)), 0.08);
     float3 accumulated = 0.0;
     float transmittance = 1.0;
     const float3 lightDirection = normalize(sunDirectionDensity.xyz);
-    const float phase = HenyeyGreenstein(dot(lightDirection, ray), sunColorAnisotropy.w);
+    // Preserve forward scattering without letting a g=0.9 sun-facing view
+    // explode into a white veil that erases trees in front of the sun.
+    const float phase = min(HenyeyGreenstein(
+        dot(lightDirection, ray), sunColorAnisotropy.w), 1.65);
 
     [loop]
-    for (uint z = 0; z < clusterDimsLightCount.z; ++z)
+    for (uint z = 0; z < volumeDims.z; ++z)
     {
         float nearDepth = SliceDepth((float)z);
         float farDepth = SliceDepth((float)z + 1.0);
@@ -161,9 +165,17 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // Daylight fog must replace attenuated scene energy with sky irradiance.
         // A tiny ambient term made the former pass behave like red/brown smoke.
         float3 lighting = AtmosphereAmbient(ray, aboveBase) +
-            sunColorAnisotropy.xyz * phase * shadow * 0.55;
-        uint clusterIndex = id.x + id.y * clusterDimsLightCount.x +
-            z * clusterDimsLightCount.x * clusterDimsLightCount.y;
+            sunColorAnisotropy.xyz * phase * shadow * 0.42;
+        uint3 clusterCoord = min(
+            uint3(
+                id.x * clusterDimsLightCount.x / volumeDims.x,
+                id.y * clusterDimsLightCount.y / volumeDims.y,
+                z * clusterDimsLightCount.z / volumeDims.z),
+            clusterDimsLightCount.xyz - 1u);
+        uint clusterIndex = clusterCoord.x +
+            clusterCoord.y * clusterDimsLightCount.x +
+            clusterCoord.z * clusterDimsLightCount.x *
+                clusterDimsLightCount.y;
         FogCluster cluster = clusters[clusterIndex];
         uint count = min(cluster.lightCount, 32u);
         [loop]

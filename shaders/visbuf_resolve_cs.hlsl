@@ -882,7 +882,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 reflectionIBL = SampleReflectionProbe(reflect(-V, normal), rough);
     float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
         texSampler, float2(NdotV, rough), 0.0);
-    float foliageSpecularScale = isFoliage ? 0.20 : 1.0;
+    float foliageSpecularScale = isFoliage ? 0.12 : 1.0;
     float3 specularIBL = reflectionIBL *
         (F0 * environmentBRDF.x + environmentBRDF.y) *
         foliageSpecularScale;

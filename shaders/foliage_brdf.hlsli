@@ -3,7 +3,7 @@
 
 float FoliageWrappedDiffuse(float signedNdotL)
 {
-    return saturate((signedNdotL + 0.14) / 1.14);
+    return saturate((signedNdotL + 0.08) / 1.08);
 }
 
 float3 EvaluateFoliageTransmission(
@@ -17,17 +17,17 @@ float3 EvaluateFoliageTransmission(
     // Mip-filtered card borders are geometrically thin but must not become
     // emissive outlines. Ramp transmission in only after stable leaf coverage.
     const float coverage = smoothstep(0.24, 0.72, alphaCoverage);
-    const float3 chlorophyllTint = float3(0.58, 0.92, 0.32);
-    const float scatter = backLight * 0.48 + forwardScatter * 0.13;
+    const float3 chlorophyllTint = float3(0.54, 0.82, 0.29);
+    const float scatter = backLight * 0.34 + forwardScatter * 0.08;
     return albedo * chlorophyllTint * lightRadiance * scatter * coverage *
-           attenuation * lerp(0.14, 1.0, shadowVisibility);
+           attenuation * lerp(0.38, 1.0, shadowVisibility);
 }
 
 float3 EvaluateFoliageSkyScatter(
     float3 albedo, float3 frontSky, float3 backSky,
     float ambientLightingIntensity)
 {
-    return albedo * (frontSky + backSky) * 0.24 *
+    return albedo * (frontSky + backSky) * 0.18 *
            ambientLightingIntensity;
 }
 
