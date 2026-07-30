@@ -1699,13 +1699,24 @@ WaterVolume                 g_ocean;   // sea ringing the island, surface at y =
 PalmTrees                   g_trees;
 GrassField                  g_grass;
 
-void MatchFoliageAlbedoToGrass() {
+void MatchFoliageMaterialToGrass() {
     const XMFLOAT3 grassAlbedo = g_grass.Albedo();
     const XMFLOAT4 matchedAlbedo(
         grassAlbedo.x, grassAlbedo.y, grassAlbedo.z, 1.0f);
+    const auto matchMaterial = [&](const std::shared_ptr<SceneMaterial>& material) {
+        if (!material) return;
+        material->baseColorFactor = matchedAlbedo;
+        material->roughnessFactor = g_grass.Roughness();
+        material->ambientScale = g_grass.AmbientScale();
+        // Alpha foliage has no ORM or normal map, so these packed material
+        // channels carry the grass direct, transmission, and variation controls.
+        material->occlusionStrength = g_grass.DirectLightScale();
+        material->normalYSign = g_grass.TransmissionStrength();
+        material->viewFillStrength = g_grass.ColorVariation();
+    };
     for (const auto& material : PalmModel::Materials()) {
         if (material && material->name == "palm_leaf")
-            material->baseColorFactor = matchedAlbedo;
+            matchMaterial(material);
     }
     if (!g_dandelionModel) return;
     const auto updateMaterial = [&](const auto& self,
@@ -1713,9 +1724,7 @@ void MatchFoliageAlbedoToGrass() {
         if (!node) return;
         if (node->mesh) {
             for (MeshPrimitive& primitive : node->mesh->primitives) {
-                if (primitive.material) {
-                    primitive.material->baseColorFactor = matchedAlbedo;
-                }
+                matchMaterial(primitive.material);
             }
         }
         for (const auto& child : node->children)
@@ -2628,7 +2637,7 @@ static constexpr std::array<PalmSpawn, 6> kStressHousePalmSpawns = {{
 
 static void ResetPalmTrees() {
     g_trees.Initialize();
-    MatchFoliageAlbedoToGrass();
+    MatchFoliageMaterialToGrass();
     if (g_customLevelMode) {
         for (const LevelEntity& entity : g_game.world.Level().entities) {
             if (!entity.enabled || entity.type != LevelEntityType::Palm) continue;
@@ -2753,6 +2762,7 @@ static bool LoadDandelionModel() {
     g_dandelionSourceMinY = boundsMin.y;
     g_dandelionSourceHeight = (std::max)(0.001f, boundsMax.y - boundsMin.y);
     g_dandelionModel = std::move(model);
+    MatchFoliageMaterialToGrass();
     std::cout << "Dandelion foliage model ready\n";
     return true;
 }

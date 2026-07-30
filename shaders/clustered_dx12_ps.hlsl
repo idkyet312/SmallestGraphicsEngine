@@ -652,10 +652,24 @@ float4 main(PS_INPUT input) : SV_TARGET {
         if (isFoliage) {
             float leafLum = dot(albedo, float3(0.299, 0.587, 0.114));
             float dark = 1.0 - smoothstep(0.02, 0.12, leafLum);
-            albedo = lerp(albedo, float3(0.10, 0.20, 0.06), dark * 0.85);
+            // Lift shadowed texels toward the live foliage albedo instead of a
+            // fixed bright green that overrides the grass-matching controls.
+            albedo = lerp(albedo, objectColor * 0.72, dark * 0.72);
         }
     }
 #endif
+    if (isFoliage) {
+        float variation = MatVarNoise(input.fragPos * 1.7);
+        float variationStrength = max(viewFillStrength, 0.0);
+        float3 tint = lerp(
+            1.0.xxx,
+            lerp(float3(0.90, 1.03, 0.92),
+                 float3(1.06, 1.00, 0.78), variation),
+            variationStrength);
+        float brightness = lerp(
+            1.0, lerp(0.88, 1.10, variation), variationStrength);
+        albedo = saturate(albedo * tint * brightness);
+    }
     float metal = metalness;
     float rough = roughness;
     float ambientOcclusion = 1.0;
@@ -705,7 +719,6 @@ float4 main(PS_INPUT input) : SV_TARGET {
     rough = clamp(rough, 0.045, 1.0); // avoid alpha->0 specular-aliasing spike
     if (isFoliage) {
         metal = 0.0;
-        rough = max(rough, 0.78);
     }
     
     // Normal mapping through a stable vertex tangent frame. Imported meshes
@@ -827,7 +840,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // Skinned enemy outfits share a positive view-fill tag. Their mostly
     // cloth/polymer surfaces need much less HDRI grazing response than guns
     // and hard-surface assets, or the bright horizon creates a silver rim.
-    float characterSpecularScale = viewFillStrength > 0.25 ? 0.38 : 1.0;
+    float characterSpecularScale =
+        !isFoliage && viewFillStrength > 0.25 ? 0.38 : 1.0;
     float surfaceSpecularScale =
         isFoliage ? 0.12 : characterSpecularScale;
     float3 specular = numerator / denominator * surfaceSpecularScale;
@@ -842,11 +856,12 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // Keep authored view fill present at silhouettes. The old 0.35 floor made
     // grazing surfaces lose most of their only indirect-light fallback.
     float frontFill = 0.65 + 0.35 * saturate(dot(normal, viewDir));
-    result += diffuseAlbedo * max(viewFillStrength, 0.0) * frontFill *
+    result += diffuseAlbedo *
+              (isFoliage ? 0.0 : max(viewFillStrength, 0.0)) * frontFill *
               ambientLightingIntensity;
     float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor * NdotL * attenuation * shadowVisibility; // No light intensity? lightColor should allow > 1.
 
-    result += Lo;
+    result += Lo * (isFoliage ? max(occlusionStrength, 0.0) : 1.0);
 
     // Thin-sheet vegetation BRDF: chlorophyll-tinted transmission plus diffuse
     // sky arriving at both leaf faces. Coverage suppresses bright cutout rims.
@@ -854,7 +869,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
     {
         result += EvaluateFoliageTransmission(
             albedo, normal, viewDir, lightDir, lightColor,
-            foliageCoverage, attenuation, shadowVisibility);
+            foliageCoverage, attenuation, shadowVisibility) *
+            max(normalYSign, 0.0);
         result += EvaluateFoliageSkyScatter(
             albedo, skyContribution, sampleSkyIrradiance(-normal),
             ambientLightingIntensity);

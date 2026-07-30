@@ -216,7 +216,7 @@ public:
     UINT postFrameIndex = 0;
     float exposure = 1.15f;
     float bloomStrength = 0.16f;
-    float vignetteStrength = 0.18f;
+    float vignetteStrength = 0.50f;
     float grainStrength = 0.012f;
     float taaFeedback = 0.86f;
     bool temporalEffectsEnabled = false;
@@ -318,17 +318,24 @@ public:
 
     UINT RegisterMaterial(const SceneMaterial* material) {
         if (!material) return 0;
+        const auto updateParameters = [material](VBMaterialData& data) {
+            data.baseColorFactor = material->baseColorFactor;
+            data.emissiveOcclusion.w = material->occlusionStrength;
+            data.pbrParams = XMFLOAT4(material->metallicFactor,
+                material->roughnessFactor, material->normalYSign, 1.0f);
+            data.shadingParams = XMFLOAT4(material->ambientScale,
+                material->viewFillStrength, 0.7f, 0.0f);
+        };
         auto found = materialLookup.find(material);
-        if (found != materialLookup.end()) return found->second;
+        if (found != materialLookup.end()) {
+            if (mappedMaterials)
+                updateParameters(mappedMaterials[found->second]);
+            return found->second;
+        }
         if (materialCount >= VB_MAX_MATERIALS) return 0;
 
         VBMaterialData data;
-        data.baseColorFactor = material->baseColorFactor;
-        data.emissiveOcclusion.w = material->occlusionStrength;
-        data.pbrParams = XMFLOAT4(material->metallicFactor,
-            material->roughnessFactor, material->normalYSign, 1.0f);
-        data.shadingParams = XMFLOAT4(material->ambientScale,
-            material->viewFillStrength, 0.7f, 0.0f);
+        updateParameters(data);
         auto addTexture = [&](ID3D12Resource* texture) -> UINT {
             if (!texture) return UINT_MAX;
             auto foundTexture = materialTextureLookup.find(texture);

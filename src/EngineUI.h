@@ -38,7 +38,7 @@ extern MeshShaderDX12 g_meshShader;
 // SkinnedEnemy type is complete.
 void BanditDebugText();
 void RequestLiveDXRDDGIRebuild();
-void MatchFoliageAlbedoToGrass();
+void MatchFoliageMaterialToGrass();
 
 // On-screen dual-stick controls: analog movement and analog camera look.
 inline void RenderMovementPad() {
@@ -776,20 +776,23 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     // -- Grass / wind --
     if (g_grass.IsInitialized() && ImGui::CollapsingHeader("Grass & Wind")) {
         ImGui::SeparatorText("Material");
-        if (ImGui::ColorEdit3("Grass Albedo", &g_grass.Albedo().x))
-            MatchFoliageAlbedoToGrass();
-        ImGui::SliderFloat("Grass Roughness", &g_grass.Roughness(), 0.04f, 1.0f);
-        ImGui::SliderFloat("Grass Ambient", &g_grass.AmbientScale(), 0.0f, 2.0f);
-        ImGui::SliderFloat(
+        bool foliageMaterialChanged =
+            ImGui::ColorEdit3("Grass Albedo", &g_grass.Albedo().x);
+        foliageMaterialChanged |= ImGui::SliderFloat(
+            "Grass Roughness", &g_grass.Roughness(), 0.04f, 1.0f);
+        foliageMaterialChanged |= ImGui::SliderFloat(
+            "Grass Ambient", &g_grass.AmbientScale(), 0.0f, 2.0f);
+        foliageMaterialChanged |= ImGui::SliderFloat(
             "Grass Direct Light", &g_grass.DirectLightScale(), 0.0f, 2.0f);
-        ImGui::SliderFloat(
+        foliageMaterialChanged |= ImGui::SliderFloat(
             "Grass Transmission", &g_grass.TransmissionStrength(), 0.0f, 1.0f);
-        ImGui::SliderFloat(
+        foliageMaterialChanged |= ImGui::SliderFloat(
             "Grass Color Variation", &g_grass.ColorVariation(), 0.0f, 1.5f);
         if (ImGui::Button("Reset Grass Material")) {
             g_grass.ResetMaterial();
-            MatchFoliageAlbedoToGrass();
+            foliageMaterialChanged = true;
         }
+        if (foliageMaterialChanged) MatchFoliageMaterialToGrass();
 
         ImGui::SeparatorText("Wind & Performance");
         ImGui::DragFloat("Wind Strength", &g_grass.WindStrength(), 0.01f, 0.0f, 1.0f);

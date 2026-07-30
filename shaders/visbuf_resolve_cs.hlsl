@@ -765,9 +765,24 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         if (isFoliage) {
             float leafLum = dot(albedo, float3(0.299, 0.587, 0.114));
             float dark = 1.0 - smoothstep(0.02, 0.12, leafLum);
-            albedo = lerp(
-                albedo, float3(0.10, 0.20, 0.06), dark * 0.85);
+            // Keep alpha-card shadow recovery tied to the selected foliage
+            // albedo; a fixed green lift made ferns ignore the grass controls.
+            float3 foliageBase =
+                dc.objectColor * material.baseColorFactor.rgb;
+            albedo = lerp(albedo, foliageBase * 0.72, dark * 0.72);
         }
+    }
+    if (isFoliage) {
+        float variation = MatVarNoise(fragPos * 1.7);
+        float variationStrength = max(material.shadingParams.y, 0.0);
+        float3 tint = lerp(
+            1.0.xxx,
+            lerp(float3(0.90, 1.03, 0.92),
+                 float3(1.06, 1.00, 0.78), variation),
+            variationStrength);
+        float brightness = lerp(
+            1.0, lerp(0.88, 1.10, variation), variationStrength);
+        albedo = saturate(albedo * tint * brightness);
     }
     if (material.textureIndices.z < 64u) {
         float4 mr = materialTextures[material.textureIndices.z].SampleGrad(
@@ -786,7 +801,6 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     rough = clamp(rough, 0.04, 1.0);
     if (isFoliage) {
         metal = 0.0;
-        rough = max(rough, 0.78);
     }
 
     if (material.textureIndices.y < 64u) {
@@ -900,15 +914,18 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // Shadow map blocks direct sun only. IBL/DDGI are already low-frequency
     // indirect terms and must stay present on occluded building/actor sides.
     float frontFill = 0.65 + 0.35 * saturate(dot(normal, viewDir));
-    result += diffuseAlbedo * material.shadingParams.y * frontFill *
+    result += diffuseAlbedo *
+              (isFoliage ? 0.0 : material.shadingParams.y) * frontFill *
               ambientLightingIntensity;
     float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor *
                 NdotL * atten * shadowVisibility;
-    result += Lo;
+    result += Lo * (isFoliage
+        ? max(material.emissiveOcclusion.w, 0.0) : 1.0);
     if (isFoliage) {
         result += EvaluateFoliageTransmission(
             albedo, normal, viewDir, L, lightColor,
-            foliageCoverage, atten, shadowVisibility);
+            foliageCoverage, atten, shadowVisibility) *
+            max(material.pbrParams.z, 0.0);
         result += EvaluateFoliageSkyScatter(
             albedo, SampleSkyIrradiance(normal),
             SampleSkyIrradiance(-normal), ambientLightingIntensity);
