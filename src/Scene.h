@@ -246,6 +246,10 @@ struct Scene {
     float ambientOcclusionStrength = 1.15f;
     float ambientOcclusionBias = 0.035f;
     float contactShadowStrength = 0.34f;
+    bool  enableScreenSpaceReflections = true;
+    float screenSpaceReflectionStrength = 0.48f;
+    float screenSpaceReflectionDistance = 55.0f;
+    float screenSpaceReflectionThickness = 0.08f;
     int   destructionGridX = 4;
     int   destructionGridY = 3;
     int   destructionGridZ = 4;

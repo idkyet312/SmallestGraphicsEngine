@@ -53,6 +53,7 @@
 #include "FXAADX12.h"
 #include "VolumetricFogDX12.h"
 #include "ScreenSpaceAODX12.h"
+#include "ScreenSpaceReflectionsDX12.h"
 #include "MSAADX12.h"
 #include "GrassMSAADX12.h"
 #include "DestructionDX12.h"
@@ -1719,6 +1720,7 @@ static bool                 hzbCaptureActive = false;
 static FXAADX12             fxaa;
 static VolumetricFogDX12    volumetricFog;
 static ScreenSpaceAODX12    screenSpaceAO;
+static ScreenSpaceReflectionsDX12 screenSpaceReflections;
 static MSAADX12             msaa;
 static GrassMSAADX12        grassMSAA;
 static bool                 msaaUsedLastFrame = false;
@@ -6448,6 +6450,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cerr << "Screen-space AO init failed (non-fatal)\n";
         scene.enableAmbientOcclusion = false;
     }
+    if (!screenSpaceReflections.Init()) {
+        std::cerr << "Screen-space reflections init failed (non-fatal)\n";
+        scene.enableScreenSpaceReflections = false;
+    }
     const bool msaaPipelinesReady =
         mainShader.msaaSupported &&
         (!g_useMeshShader || g_meshShader.msaaSupported) &&
@@ -8083,7 +8089,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 commonHDRValidationTarget ? visBuffer.GetOutputRTV()
                                           : D3D12_CPU_DESCRIPTOR_HANDLE{},
                 commonHDRValidationTarget,
-                usingVisibility ? visBuffer.GetVisibilityDepthResource() : nullptr);
+                usingVisibility ? visBuffer.GetVisibilityDepthResource() : nullptr,
+                usingVisibility ? visBuffer.GetNormalRoughnessResource() : nullptr);
+        }
+
+        if (renderedScene && commonHDRValidationTarget &&
+            scene.enableScreenSpaceReflections &&
+            screenSpaceReflections.initialized) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "Screen-Space Reflections",
+                g_dx12.commandList.Get());
+            screenSpaceReflections.Render(
+                scene, visBuffer.GetOutputResource(), visBuffer.GetOutputRTV(),
+                g_dx12.depthStencilBuffer.Get(),
+                usingVisibility ? visBuffer.GetNormalRoughnessResource()
+                                : nullptr);
         }
 
         const bool visibilityValidation = visibilityParityValidation;

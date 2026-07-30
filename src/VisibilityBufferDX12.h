@@ -138,6 +138,7 @@ public:
     ComPtr<ID3D12DescriptorHeap> outputRtvHeap;
     ComPtr<ID3D12Resource> presentTexture;
     ComPtr<ID3D12Resource> motionTexture;
+    ComPtr<ID3D12Resource> normalRoughnessTexture;
     // Depth immediately after visibility resolve. Forward extensions can then
     // be detected and rejected from history when they lack motion vectors.
     ComPtr<ID3D12Resource> visibilityDepthTexture;
@@ -704,10 +705,10 @@ public:
                  const PointLightsBufferDX12& pointLightData) {
         currentNearPlane = nearPlane;
         currentFarPlane = farPlane;
-        // Transition HDR and motion-vector outputs to UAV.
+        // Transition HDR, motion-vector, and surface outputs to UAV.
         {
-            D3D12_RESOURCE_BARRIER barriers[2] = {};
-            for (UINT i = 0; i < 2; ++i) {
+            D3D12_RESOURCE_BARRIER barriers[3] = {};
+            for (UINT i = 0; i < 3; ++i) {
                 barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                 barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -715,7 +716,8 @@ public:
             }
             barriers[0].Transition.pResource = outputTexture.Get();
             barriers[1].Transition.pResource = motionTexture.Get();
-            cmdList->ResourceBarrier(2, barriers);
+            barriers[2].Transition.pResource = normalRoughnessTexture.Get();
+            cmdList->ResourceBarrier(3, barriers);
         }
 
         // Also transition depth buffer to SRV for reading
@@ -790,10 +792,10 @@ public:
             cmdList->Dispatch(groupsX, groupsY, 1);
         }
 
-        // Keep linear HDR and motion vectors as SRVs for post processing.
+        // Keep linear HDR, motion vectors, and surface data as SRVs.
         {
-            D3D12_RESOURCE_BARRIER barriers[2] = {};
-            for (UINT i = 0; i < 2; ++i) {
+            D3D12_RESOURCE_BARRIER barriers[3] = {};
+            for (UINT i = 0; i < 3; ++i) {
                 barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                 barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
                 barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -801,7 +803,8 @@ public:
             }
             barriers[0].Transition.pResource = outputTexture.Get();
             barriers[1].Transition.pResource = motionTexture.Get();
-            cmdList->ResourceBarrier(2, barriers);
+            barriers[2].Transition.pResource = normalRoughnessTexture.Get();
+            cmdList->ResourceBarrier(3, barriers);
         }
 
         // Preserve visibility depth before forward-only animated/alpha-tested
@@ -948,6 +951,9 @@ public:
 
     ID3D12Resource* GetOutputResource() const { return outputTexture.Get(); }
     ID3D12Resource* GetMotionResource() const { return motionTexture.Get(); }
+    ID3D12Resource* GetNormalRoughnessResource() const {
+        return normalRoughnessTexture.Get();
+    }
     ID3D12Resource* GetVisibilityDepthResource() const {
         return visibilityDepthTexture.Get();
     }
@@ -1055,6 +1061,7 @@ public:
         outputTexture.Reset();
         presentTexture.Reset();
         motionTexture.Reset();
+        normalRoughnessTexture.Reset();
         visibilityDepthTexture.Reset();
         historyTextures[0].Reset();
         historyTextures[1].Reset();
@@ -1167,6 +1174,13 @@ private:
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
             IID_PPV_ARGS(&motionTexture));
+        if (FAILED(hr)) return false;
+
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        hr = g_dx12.device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+            IID_PPV_ARGS(&normalRoughnessTexture));
         if (FAILED(hr)) return false;
 
         D3D12_RESOURCE_DESC depthSnapshotDesc =
@@ -1360,7 +1374,7 @@ private:
 
     bool CreateComputeDescriptorHeap() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-        heapDesc.NumDescriptors = 85;
+        heapDesc.NumDescriptors = 86;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         HRESULT hr = g_dx12.device->CreateDescriptorHeap(
@@ -1609,9 +1623,9 @@ private:
         ranges[0].RegisterSpace = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
 
-        // UAVs u0..u1 (HDR + motion vectors)
+        // UAVs u0..u2 (HDR + motion vectors + world normal/roughness)
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ranges[1].NumDescriptors = 2;
+        ranges[1].NumDescriptors = 3;
         ranges[1].BaseShaderRegister = 0;
         ranges[1].RegisterSpace = 0;
         ranges[1].OffsetInDescriptorsFromTableStart = 79;
@@ -1621,7 +1635,7 @@ private:
         ranges[2].NumDescriptors = 4;
         ranges[2].BaseShaderRegister = 1;
         ranges[2].RegisterSpace = 0;
-        ranges[2].OffsetInDescriptorsFromTableStart = 81;
+        ranges[2].OffsetInDescriptorsFromTableStart = 82;
 
         D3D12_ROOT_PARAMETER resolveParams[2] = {};
 
@@ -1928,10 +1942,20 @@ private:
             cpuHandle.ptr += descSize;
         }
 
-        // [81] b1 - light buffer CBV
-        // [82] b2 - point lights CBV
-        // [83] b3 - sky SH CBV
-        // [84] b4 - DDGI CBV
+        // [81] u2 - world normal.xyz and final roughness
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+            uavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            g_dx12.device->CreateUnorderedAccessView(
+                normalRoughnessTexture.Get(), nullptr, &uavDesc, cpuHandle);
+            cpuHandle.ptr += descSize;
+        }
+
+        // [82] b1 - light buffer CBV
+        // [83] b2 - point lights CBV
+        // [84] b3 - sky SH CBV
+        // [85] b4 - DDGI CBV
         // These will be created in UpdateLightDescriptors
     }
 
@@ -2173,7 +2197,7 @@ public:
                                 D3D12_GPU_VIRTUAL_ADDRESS ddgiBufferAddr) {
         UINT descSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
-        cpuHandle.ptr += 81 * descSize;
+        cpuHandle.ptr += 82 * descSize;
 
         // [7] b1 - light buffer CBV
         {
@@ -2202,7 +2226,7 @@ public:
             cpuHandle.ptr += descSize;
         }
 
-        // [81] b4 - DDGI grid parameters
+        // b4 - DDGI grid parameters
         {
             D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
             cbvDesc.BufferLocation = ddgiBufferAddr;

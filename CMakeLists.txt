@@ -123,6 +123,7 @@ set(HEADER_FILES
     src/SceneGraph.h
     src/GLBImporter.h
     src/VisibilityBufferDX12.h
+    src/ScreenSpaceReflectionsDX12.h
     src/Scene.h
     src/LevelDefinition.h
     src/LevelEditor.h

@@ -163,6 +163,7 @@ StructuredBuffer<uint> sparseProbeIndices : register(t78);
 
 RWTexture2D<float4> outputColor : register(u0);
 RWTexture2D<float2> outputMotion : register(u1);
+RWTexture2D<float4> outputNormalRoughness : register(u2);
 
 SamplerState              texSampler    : register(s0);
 SamplerComparisonState    shadowSampler : register(s1);
@@ -604,6 +605,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     if (debugViewMode == 2u) {
         float rawDepth = depthBuffer.Load(int3(pixel, 0));
         outputColor[pixel] = float4(rawDepth.xxx, 1.0);
+        outputNormalRoughness[pixel] = float4(0.0, 0.0, 0.0, 1.0);
         if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
         return;
     }
@@ -617,12 +619,14 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                                     (key >> 16u) & 255u) / 255.0;
             outputColor[pixel] = float4(idColor, 1.0);
         }
+        outputNormalRoughness[pixel] = float4(0.0, 0.0, 0.0, 1.0);
         if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
         return;
     }
     
     // Zero instance ID means no geometry was written.
     if (visValue.x == 0u) {
+        outputNormalRoughness[pixel] = float4(0.0, 0.0, 0.0, 1.0);
         // HDR sky was rasterized into outputColor before this compute pass.
         // Preserve it instead of replacing it with a mismatched procedural sky.
         if (enableMotionVectors != 0u) {
@@ -819,6 +823,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         float variation = MatVarNoise(fragPos * 0.35);
         rough = clamp(rough * lerp(0.88, 1.10, variation), 0.04, 1.0);
     }
+    outputNormalRoughness[pixel] = float4(normal, rough);
     
     float3 result = 0.0;
     

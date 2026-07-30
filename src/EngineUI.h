@@ -580,6 +580,19 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::SliderFloat("Contact Shadows", &scene.contactShadowStrength,
                                0.0f, 1.0f, "%.2f");
         }
+        ImGui::Checkbox("Screen-Space Reflections",
+                        &scene.enableScreenSpaceReflections);
+        if (scene.enableScreenSpaceReflections) {
+            ImGui::SliderFloat("SSR Strength",
+                               &scene.screenSpaceReflectionStrength,
+                               0.0f, 1.5f, "%.2f");
+            ImGui::DragFloat("SSR Distance",
+                             &scene.screenSpaceReflectionDistance,
+                             0.5f, 5.0f, 150.0f, "%.1f m");
+            ImGui::DragFloat("SSR Thickness",
+                             &scene.screenSpaceReflectionThickness,
+                             0.005f, 0.01f, 0.5f, "%.3f m");
+        }
         ImGui::Checkbox("Volumetric Fog", &scene.enableVolumetricFog);
         if (scene.enableVolumetricFog) {
             ImGui::DragFloat("Fog Density", &scene.volumetricFogDensity,
