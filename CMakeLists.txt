@@ -142,6 +142,8 @@ set(HEADER_FILES
     src/OcclusionDepthDX12.h
     src/FXAADX12.h
     src/MSAADX12.h
+    src/OceanWaveSettings.h
+    src/WaterRendererDX12.h
     src/DestructionDX12.h
 )
 
@@ -230,6 +232,40 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMENT "Compiling wireframe pixel shader"
     )
     add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/water_vs.cso
+        COMMAND ${DXC_EXECUTABLE} -T vs_6_0 -E VSMain
+                ${CMAKE_SOURCE_DIR}/shaders/water_dx12.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/water_vs.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/water_dx12.hlsl
+        COMMENT "Compiling tropical water vertex shader"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/water_ps_hdr.cso
+        COMMAND ${DXC_EXECUTABLE} -T ps_6_0 -E PSMain
+                -D WATER_HDR_TARGET=1 -D WATER_MOTION_OUTPUT=1
+                ${CMAKE_SOURCE_DIR}/shaders/water_dx12.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/water_ps_hdr.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/water_dx12.hlsl
+        COMMENT "Compiling HDR tropical water pixel shader"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/water_ps_ldr.cso
+        COMMAND ${DXC_EXECUTABLE} -T ps_6_0 -E PSMain
+                ${CMAKE_SOURCE_DIR}/shaders/water_dx12.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/water_ps_ldr.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/water_dx12.hlsl
+        COMMENT "Compiling forward tropical water pixel shader"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/water_ps_ldr_msaa.cso
+        COMMAND ${DXC_EXECUTABLE} -T ps_6_0 -E PSMain
+                -D WATER_DEPTH_MSAA=1
+                ${CMAKE_SOURCE_DIR}/shaders/water_dx12.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/water_ps_ldr_msaa.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/water_dx12.hlsl
+        COMMENT "Compiling MSAA-depth tropical water pixel shader"
+    )
+    add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/dxr_ddgi.cso
         COMMAND ${DXC_EXECUTABLE} -T lib_6_3
                 ${CMAKE_SOURCE_DIR}/shaders/dxr_ddgi.hlsl
@@ -247,6 +283,10 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         ${CMAKE_BINARY_DIR}/terrain_ps.cso
         ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso
         ${CMAKE_BINARY_DIR}/wire_green_ps.cso
+        ${CMAKE_BINARY_DIR}/water_vs.cso
+        ${CMAKE_BINARY_DIR}/water_ps_hdr.cso
+        ${CMAKE_BINARY_DIR}/water_ps_ldr.cso
+        ${CMAKE_BINARY_DIR}/water_ps_ldr_msaa.cso
         ${CMAKE_BINARY_DIR}/dxr_ddgi.cso)
 else()
     message(STATUS "DXC not found; mesh shader path will use raster fallback")
@@ -428,6 +468,10 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps_hdr.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/wire_green_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/wire_green_ps.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/water_vs.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/water_vs.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/water_ps_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/water_ps_hdr.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/water_ps_ldr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/water_ps_ldr.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/water_ps_ldr_msaa.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/water_ps_ldr_msaa.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/dxr_ddgi.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/dxr_ddgi.cso
     )
     if(DXC_EXECUTABLE)

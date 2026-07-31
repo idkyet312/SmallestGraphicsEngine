@@ -139,6 +139,7 @@ public:
     ComPtr<ID3D12DescriptorHeap> outputRtvHeap;
     ComPtr<ID3D12Resource> presentTexture;
     ComPtr<ID3D12Resource> motionTexture;
+    ComPtr<ID3D12DescriptorHeap> motionRtvHeap;
     ComPtr<ID3D12Resource> normalRoughnessTexture;
     ComPtr<ID3D12Resource> bloomTexture;
     // Depth immediately after visibility resolve. Forward extensions can then
@@ -968,6 +969,11 @@ public:
 
     ID3D12Resource* GetOutputResource() const { return outputTexture.Get(); }
     ID3D12Resource* GetMotionResource() const { return motionTexture.Get(); }
+    D3D12_CPU_DESCRIPTOR_HANDLE GetMotionRTV() const {
+        return motionRtvHeap
+            ? motionRtvHeap->GetCPUDescriptorHandleForHeapStart()
+            : D3D12_CPU_DESCRIPTOR_HANDLE{};
+    }
     ID3D12Resource* GetNormalRoughnessResource() const {
         return normalRoughnessTexture.Get();
     }
@@ -1080,6 +1086,7 @@ public:
         outputTexture.Reset();
         presentTexture.Reset();
         motionTexture.Reset();
+        motionRtvHeap.Reset();
         normalRoughnessTexture.Reset();
         bloomTexture.Reset();
         visibilityDepthTexture.Reset();
@@ -1191,13 +1198,28 @@ private:
         }
 
         desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         hr = g_dx12.device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
             IID_PPV_ARGS(&motionTexture));
         if (FAILED(hr)) return false;
+        D3D12_DESCRIPTOR_HEAP_DESC motionHeap = {};
+        motionHeap.NumDescriptors = 1;
+        motionHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hr = g_dx12.device->CreateDescriptorHeap(
+            &motionHeap, IID_PPV_ARGS(&motionRtvHeap));
+        if (FAILED(hr)) return false;
+        D3D12_RENDER_TARGET_VIEW_DESC motionRtv = {};
+        motionRtv.Format = DXGI_FORMAT_R16G16_FLOAT;
+        motionRtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        g_dx12.device->CreateRenderTargetView(
+            motionTexture.Get(), &motionRtv,
+            motionRtvHeap->GetCPUDescriptorHandleForHeapStart());
 
         desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         hr = g_dx12.device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,

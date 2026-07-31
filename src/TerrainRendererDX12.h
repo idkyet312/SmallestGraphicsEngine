@@ -72,6 +72,10 @@ public:
     bool wireframe = false; // Z key: draw terrain tiles as wireframe
     bool hdrTargetEnabled = false;
 
+    void ReleaseUploadHeaps() {
+        for (auto& upload : terrainUploads) upload.Reset();
+    }
+
     bool Init(ShaderDX12& shader) {
         // Mesh shader tier support was already verified by MeshShaderDX12::Init;
         // if that failed these .cso files won't exist either, so just try to load.
@@ -522,9 +526,9 @@ public:
     }
 
     bool CreateTerrainTextureArrays(ShaderDX12& shader) {
-        // Keep the authored 1K scans intact. The previous 256px arrays erased
-        // most fine ground detail before mip filtering even began.
-        constexpr UINT side = 1024;
+        // Preserve 2K terrain scans at native resolution. Sand relies on fine
+        // wind-carved ridges that disappeared in the old 1K array.
+        constexpr UINT side = 2048;
         constexpr UINT layers = 4;
         constexpr UINT bytesPerPixel = 4;
         const size_t layerBytes = static_cast<size_t>(side) * side * bytesPerPixel;
@@ -683,10 +687,10 @@ public:
               "Grass004_2K-JPG_AmbientOcclusion.jpg" },
             { "terrain/dirt_floor", "dirt_floor_diff_1k.png",
               "dirt_floor_nor_gl_1k.png", "dirt_floor_rough_1k.png", nullptr },
-            { "terrain/aerial_beach_01", "aerial_beach_01_diff_1k.png",
-              "aerial_beach_01_nor_gl_1k.png",
-              "aerial_beach_01_rough_1k.png",
-              "aerial_beach_01_ao_1k.png" },
+            { "terrain/aerial_beach_01", "aerial_beach_01_diff_2k.png",
+              "aerial_beach_01_nor_gl_2k.png",
+              "aerial_beach_01_rough_2k.png",
+              "aerial_beach_01_ao_2k.png" },
             { "terrain/dark_rock", "dark_rock_diff_1k.png",
               "dark_rock_nor_gl_1k.png", "dark_rock_rough_1k.png", nullptr }
         };

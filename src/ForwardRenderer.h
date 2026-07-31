@@ -1184,30 +1184,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
     }
 
-    // The sea around the island. Drawn before the pool because it is the farther
-    // transparent surface, and blended surfaces have to go back-to-front.
-    if (!g_emptyLevelMode && g_ocean.IsInitialized()) {
-        const D3D12_VERTEX_BUFFER_VIEW& ovbv = g_ocean.UpdateAndGetVBV(g_dx12.frameIndex);
-        const D3D12_INDEX_BUFFER_VIEW& oibv = g_ocean.GetIBV();
-        const UINT oceanIndices = g_ocean.GetIndexCount();
-        if (oceanIndices && ovbv.BufferLocation) {
-            shader.UseTransparent();
-            shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
-            // Deeper and less transparent than the pool: open water reads darker.
-            shader.SetWaterMaterial(
-                XMFLOAT3(0.02f, 0.15f, 0.31f), 0.095f, 0.82f, true,
-                g_ocean.GetTime());
-            g_dx12.commandList->IASetVertexBuffers(0, 1, &ovbv);
-            g_dx12.commandList->IASetIndexBuffer(&oibv);
-            g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            g_dx12.commandList->DrawIndexedInstanced(oceanIndices, 1, 0, 0, 0);
-            shader.NextDrawCall();
-        }
-        shader.Use(scene.wireframeMode);
-    }
-
-    // Water pool: floating crates + any debris (opaque) drawn first, then the
-    // animated, undulating water surface on top so the floaters show through it.
+    // Pool floaters are opaque. Water surfaces render later through the dedicated
+    // depth-aware pass after all ordinary opaque geometry is complete.
     if (!g_emptyLevelMode && g_water.IsInitialized()) {
         shader.Use(scene.wireframeMode);
         if (!visibilityExtensionsOnly) for (const WaterFloaterItem& item : g_water.GetFloaterItems()) {
@@ -1216,25 +1194,6 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             DrawCube(geo);
             shader.NextDrawCall();
         }
-        // Wave surface: positions/normals recomputed on the CPU each frame into a
-        // per-frame upload buffer, drawn as a translucent glossy sheet so the
-        // moving swell catches the light.
-        const D3D12_VERTEX_BUFFER_VIEW& wvbv = g_water.UpdateAndGetVBV(g_dx12.frameIndex);
-        const D3D12_INDEX_BUFFER_VIEW& wibv = g_water.GetIBV();
-        const UINT waterIndices = g_water.GetIndexCount();
-        if (waterIndices && wvbv.BufferLocation) {
-            shader.UseTransparent();
-            shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);  // verts are world-space
-            shader.SetWaterMaterial(
-                XMFLOAT3(0.04f, 0.24f, 0.42f), 0.075f, 0.62f, false,
-                g_water.GetTime());
-            g_dx12.commandList->IASetVertexBuffers(0, 1, &wvbv);
-            g_dx12.commandList->IASetIndexBuffer(&wibv);
-            g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            g_dx12.commandList->DrawIndexedInstanced(waterIndices, 1, 0, 0, 0);
-            shader.NextDrawCall();
-        }
-        shader.Use(scene.wireframeMode);
     }
 
     // Cube 2

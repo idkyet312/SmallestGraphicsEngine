@@ -91,6 +91,11 @@ struct GunViewModel {
     XMFLOAT3 rotation = { 0.0f, 180.0f, 0.0f };
 };
 
+enum class WaterQuality : uint32_t {
+    Low = 0,
+    High = 1
+};
+
 // All mutable scene state lives here
 struct Scene {
     // Camera - positioned back so the imported model (a small building) is fully framed at spawn
@@ -252,6 +257,7 @@ struct Scene {
     float screenSpaceReflectionStrength = 0.35f;
     float screenSpaceReflectionDistance = 55.0f;
     float screenSpaceReflectionThickness = 0.08f;
+    WaterQuality waterQuality = WaterQuality::High;
     int   destructionGridX = 4;
     int   destructionGridY = 3;
     int   destructionGridZ = 4;

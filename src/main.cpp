@@ -63,6 +63,7 @@
 #include "T3DPhysicsAsset.h"
 #include "GunAudio.h"
 #include "WaterVolume.h"
+#include "WaterRendererDX12.h"
 #include "PalmTrees.h"
 #include "LevelDefinition.h"
 #include "LevelEditor.h"
@@ -1756,6 +1757,7 @@ static FXAADX12             fxaa;
 static VolumetricFogDX12    volumetricFog;
 static ScreenSpaceAODX12    screenSpaceAO;
 static ScreenSpaceReflectionsDX12 screenSpaceReflections;
+static WaterRendererDX12    waterRenderer;
 static MSAADX12             msaa;
 static GrassMSAADX12        grassMSAA;
 static bool                 msaaUsedLastFrame = false;
@@ -6072,6 +6074,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (msaa.initialized) msaa.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (visBuffer.initialized) visBuffer.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (grassMSAA.initialized) grassMSAA.Resize(SCR_WIDTH, SCR_HEIGHT);
+                if (waterRenderer.initialized)
+                    waterRenderer.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (g_rt.initialized) ResizeRaytracing(SCR_WIDTH, SCR_HEIGHT);
             }
         }
@@ -6498,6 +6502,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     if (!screenSpaceReflections.Init()) {
         std::cerr << "Screen-space reflections init failed (non-fatal)\n";
         scene.enableScreenSpaceReflections = false;
+    }
+    if (!waterRenderer.Init(SCR_WIDTH, SCR_HEIGHT)) {
+        std::cerr << "Tropical water renderer init failed (non-fatal)\n";
     }
     const bool msaaPipelinesReady =
         mainShader.msaaSupported &&
@@ -7765,11 +7772,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // the cheap flat tank rather than a heightfield basin.
                 constexpr float kSeaSpan = 600.0f;
                 constexpr float kSeaDepth = 12.0f;
-                // Ocean swell is low-frequency. 64 cells preserve it while
-                // cutting the old 98,304-index draw and CPU writes by 75%.
-                g_ocean.SetGridResolution(64);
+                // Near-shore reflections and wave/terrain intersections need
+                // enough vertices to avoid exposing individual ocean triangles.
+                // Half-rate updates keep the 128-cell surface inexpensive.
+                g_ocean.SetGridResolution(128);
                 g_ocean.SetOceanProfile();
-                // The grid costs 4k CPU sine evals per write; the swell
+                // The grid costs 16k CPU wave evaluations per write; the swell
                 // reads the same at half rate. The pool stays at full rate for
                 // its splash ripples.
                 g_ocean.SetUpdateInterval(2);
@@ -7981,6 +7989,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             for (const auto& material : g_banditModel.materialKeepAlive)
                 if (material) material->uploadHeaps.clear();
             ArmsModel::ReleaseUploadHeaps();
+            g_terrain.ReleaseUploadHeaps();
             ReleaseMaterialUploadHeaps(crateModel);
             ReleaseMaterialUploadHeaps(wallModel);
             DumpDX12DebugMessages();
@@ -8150,6 +8159,44 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_dx12.depthStencilBuffer.Get(),
                 usingVisibility ? visBuffer.GetNormalRoughnessResource()
                                 : nullptr);
+        }
+
+        if (renderedScene && !usingRaytracing &&
+            !g_emptyLevelMode && waterRenderer.initialized) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "Tropical Water",
+                g_dx12.commandList.Get());
+            ID3D12Resource* waterTarget = commonHDRValidationTarget
+                ? visBuffer.GetOutputResource()
+                : g_dx12.renderTargets[g_dx12.frameIndex].Get();
+            D3D12_CPU_DESCRIPTOR_HANDLE waterRTV =
+                commonHDRValidationTarget
+                ? visBuffer.GetOutputRTV()
+                : GetCPUDescriptorHandle(
+                    g_dx12.rtvHeap.Get(),
+                    g_dx12.rtvDescriptorSize,
+                    g_dx12.frameIndex);
+            ID3D12Resource* waterDepth = msaaActive
+                ? msaa.GetDepthResource()
+                : g_dx12.depthStencilBuffer.Get();
+            D3D12_RESOURCE_STATES waterDepthState =
+                D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            if (grassMSAAActive &&
+                grassMSAA.GetCombinedDepthResource()) {
+                waterDepth = grassMSAA.GetCombinedDepthResource();
+                waterDepthState =
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            }
+            waterRenderer.Render(
+                scene, g_ocean, g_water,
+                waterTarget, waterRTV, waterDepth,
+                g_specularEnvironmentResource,
+                commonHDRValidationTarget,
+                usingVisibility ? visBuffer.GetMotionResource()
+                                : nullptr,
+                usingVisibility ? visBuffer.GetMotionRTV()
+                                : D3D12_CPU_DESCRIPTOR_HANDLE{},
+                waterDepthState);
         }
 
         const bool visibilityValidation = visibilityParityValidation;
@@ -8418,6 +8465,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     WaitForGPU();
     g_assetWatcher.Stop();
+    waterRenderer.Shutdown();
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

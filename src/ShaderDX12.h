@@ -620,7 +620,7 @@ public:
         // plain trilinear only fixes minification along the view axis, not the
         // elongated footprint a shallow angle projects onto the texture.
         staticSamplers[1].Filter = D3D12_FILTER_ANISOTROPIC;
-        staticSamplers[1].MaxAnisotropy = 8;
+        staticSamplers[1].MaxAnisotropy = 16;
         staticSamplers[1].MipLODBias = 0.0f;
         staticSamplers[1].MinLOD = 0.0f;
         staticSamplers[1].MaxLOD = D3D12_FLOAT32_MAX;
@@ -1335,7 +1335,8 @@ public:
         SetObjectMaterial(
             color, false, false, 0.0f, roughness,
             nullptr, nullptr, nullptr, false, opacity, false, nullptr, false,
-            1.0f, 0.0f, 1.0f, 0.0f, 0.82f, ocean ? 2.0f : 1.0f, time);
+            1.0f, 0.0f, 1.0f, 0.0f, ocean ? 0.64f : 0.78f,
+            ocean ? 2.0f : 1.0f, time);
     }
 
     // Unlit soft-sprite material for smoke billboards: samples `smokeTex`'s alpha

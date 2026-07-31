@@ -390,7 +390,7 @@ private:
                 std::sin(cz * 0.061f - std::cos(cx * 0.047f) * 1.9f);
             const float densityShape = std::clamp(
                 densityWaveA * 0.62f + densityWaveB * 0.38f, 0.0f, 1.0f);
-            const float macroDensity = 0.58f + 0.42f *
+            const float macroDensity = 0.76f + 0.24f *
                 (densityShape * densityShape *
                  (3.0f - 2.0f * densityShape));
             if (Rand(seed) > radialDensity * macroDensity) continue;
@@ -622,12 +622,12 @@ private:
 
     // A blade must clear the waterline by this much to be planted, keeping grass
     // off the wet sand.
-    static constexpr float kShoreMargin = 0.9f;
+    static constexpr float kShoreMargin = 0.92f;
     // Steepest ground grass will grow on (rise over run).
-    static constexpr float kMaxSlope = 0.6f;
+    static constexpr float kMaxSlope = 1.10f;
     // Blades are clumped into tufts rather than scattered evenly -- see BuildBlades.
-    static constexpr int   kBladesPerTuft = 14;
-    static constexpr float kTuftRadius    = 0.28f;   // metres
+    static constexpr int   kBladesPerTuft = 8;
+    static constexpr float kTuftRadius    = 0.18f;   // metres
     // Blades shrink to nothing as they approach this range, so distant grass costs
     // no pixels and the field has no hard edge. Enforced in the vertex shader --
     // the geometry is static, so there is nothing to cull on the CPU. Runtime-
@@ -637,7 +637,7 @@ private:
     // popping in and out as the player walks.
     float m_fadeBand = 6.0f;
     // Fraction of each cell's blades actually drawn (1 = all).
-    float m_density = 0.72f;
+    float m_density = 0.92f;
     // Sparse grass casters still produce visible cascade/cell bands across the
     // terrain. Keep blade lighting, but leave terrain shadowing to solid props.
     float m_shadowDensity = 0.28f;

@@ -2,4 +2,4 @@ Aerial Beach 01 by Rob Tuytel / Poly Haven.
 Licensed CC0 1.0 Universal: https://creativecommons.org/publicdomain/zero/1.0/
 Source: https://polyhaven.com/a/aerial_beach_01
 
-Included maps: diffuse, OpenGL normal, roughness, ambient occlusion.
+Included 2K maps: diffuse, OpenGL normal, roughness, ambient occlusion.

@@ -111,12 +111,12 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     TerrainPBR result;
     const float3 projectionWeights = TerrainProjectionWeights(geometricNormal);
     const float4 layerWeights = TerrainLayerWeights(worldPos, geometricNormal);
-    // Grass004 uses one third of the original UV tiling, making each visible
-    // texture tile three times larger. Other layers retain scan dimensions.
-    const float scales[4] = { 0.16667, 0.4831, 0.03333, 0.4130 };
+    // The 2K sand scan repeats every 13.3 m. Its old 20-30 m projection enlarged
+    // individual ripples into soft dunes and hid most of the added resolution.
+    const float scales[4] = { 0.16667, 0.4831, 0.07500, 0.4130 };
     // Preserve fine leafy-grass relief. Other broad terrain layers stay softer
     // to avoid noisy distant slopes.
-    const float normalStrengths[4] = { 1.15, 0.72, 0.55, 0.92 };
+    const float normalStrengths[4] = { 1.15, 0.72, 0.64, 0.92 };
 
     result.albedo = 0.0;
     result.normal = 0.0;
@@ -156,7 +156,7 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     // a readable transition before the ocean/foam pass.
     const float wetSand = layerWeights.z *
         (1.0 - smoothstep(0.05, 0.45, worldPos.y));
-    result.albedo *= lerp(1.0, 0.68, wetSand);
+    result.albedo *= lerp(1.0, 0.76, wetSand);
     // Invalid/unbound SRVs return zero. Keep terrain readable and make binding
     // faults obvious as flat material colors instead of an all-black island.
     const float3 fallbackColors[4] = {
@@ -213,6 +213,12 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
         lerp(dryRoughness, wetRoughness, wetSand * 0.72), 0.54, 1.0);
     result.metallic = 0.0;
     result.occlusion = saturate(result.occlusion);
+    // The aerial sand AO is strong enough to turn ripple troughs nearly black
+    // under the restored high-contrast lighting. Retain its relief without
+    // double-darkening it through both albedo and ambient occlusion.
+    result.occlusion = lerp(
+        result.occlusion, max(result.occlusion, 0.68),
+        layerWeights.z * 0.82);
     return result;
 }
 

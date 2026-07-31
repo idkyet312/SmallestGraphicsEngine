@@ -595,6 +595,11 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                              &scene.screenSpaceReflectionThickness,
                              0.005f, 0.01f, 0.5f, "%.3f m");
         }
+        bool highWater =
+            scene.waterQuality == WaterQuality::High;
+        if (ImGui::Checkbox("High Quality Tropical Water", &highWater))
+            scene.waterQuality = highWater
+                ? WaterQuality::High : WaterQuality::Low;
         ImGui::Checkbox("Volumetric Fog", &scene.enableVolumetricFog);
         if (scene.enableVolumetricFog) {
             ImGui::DragFloat("Fog Density", &scene.volumetricFogDensity,

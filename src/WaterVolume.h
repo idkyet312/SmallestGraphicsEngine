@@ -20,6 +20,7 @@
 
 #include <DirectXMath.h>
 #include "DX12Core.h"
+#include "OceanWaveSettings.h"
 #include <box3d/box3d.h>
 #include <vector>
 #include <cmath>
@@ -62,6 +63,12 @@ public:
     // Surface mesh resolution (cells per side). Call before Initialize.
     void SetGridResolution(int n) { m_requestedGridN = std::max(8, n); }
     void SetOceanProfile(bool enabled = true) { m_oceanProfile = enabled; }
+    void SetOceanWaveSettings(const OceanWaveSettings& settings) {
+        m_oceanSettings = settings;
+    }
+    const OceanWaveSettings& GetOceanWaveSettings() const {
+        return m_oceanSettings;
+    }
 
     void Initialize(const XMFLOAT3& center, const XMFLOAT3& extents,
                     const std::function<float(float, float)>& terrainHeight = {}) {
@@ -249,10 +256,12 @@ public:
         const float hx = m_extents.x * 0.5f;
         const float hz = m_extents.z * 0.5f;
 
-        // Gaussian bell: waves tallest at the centre, tapering to zero at the banks.
+        // Pools taper at their banks. Open ocean uses an unbounded shared wave
+        // field so CPU hit/buoyancy queries match the GPU clipmap surface.
         const float nx = hx > 0.0f ? lx / hx : 0.0f;
         const float nz = hz > 0.0f ? lz / hz : 0.0f;
-        const float bell = std::exp(-2.2f * (nx * nx + nz * nz));
+        const float bell = m_oceanProfile
+            ? 1.0f : std::exp(-2.2f * (nx * nx + nz * nz));
         // d(bell)/dlx and /dlz. (nx = lx/hx, so dnx/dlx = 1/hx.)
         const float dbell_dx = hx > 0.0f ? bell * -4.4f * nx / hx : 0.0f;
         const float dbell_dz = hz > 0.0f ? bell * -4.4f * nz / hz : 0.0f;
@@ -268,12 +277,8 @@ public:
             dsdz += c * kz;
         };
         if (m_oceanProfile) {
-            // Broad swells remain above the large ocean grid's Nyquist limit.
-            // Fine wind ripples belong in the pixel shader.
-            wave(0.28f,  0.080f,  0.025f,  0.62f * m_time);
-            wave(0.16f, -0.045f,  0.145f, -0.91f * m_time);
-            wave(0.09f,  0.205f, -0.135f,  1.26f * m_time);
-            wave(0.05f, -0.255f, -0.090f, -1.54f * m_time);
+            s = m_oceanSettings.EvaluateHeightAndSlope(
+                lx, lz, m_time, dsdx, dsdz);
         } else {
             wave(0.14f, 0.90f, 0.00f,  1.30f * m_time);
             wave(0.10f, 0.60f, 0.70f, -1.70f * m_time);
@@ -557,6 +562,8 @@ private:
     int  m_gridN = 48;
     int  m_requestedGridN = 48;   // survives Shutdown(); applied on Initialize
     bool m_oceanProfile = false;  // broad swells; survives Shutdown()
+    OceanWaveSettings m_oceanSettings =
+        OceanWaveSettings::CalmTropical();
 
     // ---- shared ----
     XMFLOAT3 m_center{};

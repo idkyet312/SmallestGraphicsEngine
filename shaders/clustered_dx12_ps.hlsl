@@ -773,10 +773,10 @@ float4 main(PS_INPUT input) : SV_TARGET {
         float2 d2 = normalize(float2(0.22, -0.98));
         float2 d3 = normalize(float2(-0.79, -0.61));
         float2 ripple = 0.0;
-        ripple += d0 * cos(dot(p, d0) * 0.82 + materialTime * 0.72) * 0.050;
-        ripple += d1 * cos(dot(p, d1) * 1.37 - materialTime * 1.08) * 0.035;
-        ripple += d2 * cos(dot(p, d2) * 2.61 + materialTime * 1.64) * 0.018;
-        ripple += d3 * cos(dot(p, d3) * 4.73 - materialTime * 2.27) * 0.009;
+        ripple += d0 * cos(dot(p, d0) * 0.82 + materialTime * 0.72) * 0.040;
+        ripple += d1 * cos(dot(p, d1) * 1.37 - materialTime * 1.08) * 0.029;
+        ripple += d2 * cos(dot(p, d2) * 2.61 + materialTime * 1.64) * 0.015;
+        ripple += d3 * cos(dot(p, d3) * 4.73 - materialTime * 2.27) * 0.007;
         const float pixelFootprint = max(length(ddx(p)), length(ddy(p)));
         const float detailFade = 1.0 - smoothstep(0.30, 1.80, pixelFootprint);
         ripple *= detailFade * (isOcean ? 1.0 : 0.72);
@@ -799,19 +799,37 @@ float4 main(PS_INPUT input) : SV_TARGET {
         const float nDotVWater = saturate(dot(normal, viewDir));
         const float fresnel = 0.02037 +
             (1.0 - 0.02037) * pow(1.0 - nDotVWater, 5.0);
+        // Water has a dark absorbing body and gains sky colour toward grazing
+        // angles. Keep the ocean blue-green instead of allowing the gray terrain
+        // below it to become its dominant colour.
         float3 deepColor = isOcean
-            ? float3(0.008, 0.070, 0.135)
-            : float3(0.018, 0.145, 0.205);
-        float3 grazingColor = float3(0.075, 0.245, 0.325);
-        albedo = lerp(deepColor, grazingColor, fresnel * 0.42);
-        albedo = lerp(albedo, float3(0.72, 0.82, 0.79), waterFoam * 0.82);
+            ? float3(0.004, 0.052, 0.100)
+            : float3(0.014, 0.125, 0.185);
+        float3 grazingColor = isOcean
+            ? float3(0.045, 0.175, 0.235)
+            : float3(0.070, 0.225, 0.290);
+        const float grazingScatter =
+            saturate(fresnel * 0.58 + (1.0 - nDotVWater) * 0.10);
+        albedo = lerp(deepColor, grazingColor, grazingScatter);
+        albedo = lerp(albedo, float3(0.76, 0.84, 0.80), waterFoam * 0.86);
         metal = 0.0;
-        rough = lerp(isOcean ? 0.095 : 0.075, 0.42, waterFoam);
+        // A slightly broader ocean lobe produces a continuous sun path instead
+        // of a few overexposed mirror-like polygons.
+        rough = lerp(isOcean ? 0.135 : 0.085, 0.42, waterFoam);
         // Alpha blending approximates transmitted scene radiance. Water clears
         // head-on and becomes reflective/opaque toward grazing angles.
-        const float transmissionAlpha = opacity * (isOcean ? 0.70 : 0.56);
-        surfaceOpacity = lerp(transmissionAlpha, 0.97, fresnel);
-        surfaceOpacity = lerp(surfaceOpacity, 0.96, waterFoam);
+        // Open ocean has no scene-color refraction buffer. Keep its base layer
+        // dense enough that missing seabed beyond the terrain grid cannot show
+        // through as large gray polygons.
+        // No scene-colour refraction buffer exists for open water. Near-opaque
+        // ocean absorption is the stable physical fallback: it prevents missing
+        // or coarse seabed triangles from appearing as large gray sheets.
+        const float transmissionAlpha = isOcean
+            ? max(opacity, 0.985)
+            : opacity * 0.56;
+        surfaceOpacity = lerp(
+            transmissionAlpha, isOcean ? 0.998 : 0.97, fresnel);
+        surfaceOpacity = lerp(surfaceOpacity, isOcean ? 0.995 : 0.96, waterFoam);
     }
 
     if (!isWater && metal < 0.25) {
