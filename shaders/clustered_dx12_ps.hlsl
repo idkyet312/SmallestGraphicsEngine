@@ -732,6 +732,10 @@ float4 main(PS_INPUT input) : SV_TARGET {
          float normalStrength = 0.70;
          float3 mapNormal = normalMap.SampleBias(texSampler, input.texCoord, normalMipBias).xyz * 2.0 - 1.0;
          mapNormal.y *= normalYSign;
+         // Cooked normal maps use BC5 (XY only). Reconstructing Z also removes
+         // blue-channel block artifacts from legacy RGB normal maps.
+         mapNormal.z = sqrt(saturate(
+             1.0 - dot(mapNormal.xy, mapNormal.xy)));
          float normalMipLength = saturate(length(mapNormal));
          mapNormal.xy *= normalMipLength;
          mapNormal.z = sqrt(saturate(1.0 - dot(mapNormal.xy, mapNormal.xy)));

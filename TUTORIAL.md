@@ -310,9 +310,9 @@ class Shader {
 
 | File | Purpose |
 |------|---------|
-| `src/main.cpp` | Main application loop, setup, and render passes |
-| `src/Shader.h` | GLSL shader compilation and uniform management |
-| `src/Camera.h` | Free-look camera with WASD + mouse |
+| `src/app/main.cpp` | Main application loop, setup, and render passes |
+| `src/render/opengl/Shader.h` | Legacy GLSL shader compilation and uniform management |
+| `src/render/dx12/CameraDX12.h` | Free-look camera with WASD + mouse |
 | `shaders/depth.vert` | Transforms vertices into light space |
 | `shaders/depth.frag` | Depth-only output (auto) |
 | `shaders/shadow.vert` | Transforms vertices + computes shadow coords |

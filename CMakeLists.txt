@@ -74,77 +74,61 @@ if(NOT imgui_FOUND)
     message(FATAL_ERROR "imgui not found")
 endif()
 
-# Include directories
-include_directories(${CMAKE_SOURCE_DIR}/src)
+# Source layout. Headers keep basename includes for now; this interface target
+# exposes subsystem folders consistently to the engine, tests, and tools.
+set(SGE_SOURCE_ROOT "${CMAKE_SOURCE_DIR}/src")
+set(SGE_SOURCE_DIRS
+    "${SGE_SOURCE_ROOT}/animation"
+    "${SGE_SOURCE_ROOT}/app"
+    "${SGE_SOURCE_ROOT}/assets"
+    "${SGE_SOURCE_ROOT}/assets/cooked"
+    "${SGE_SOURCE_ROOT}/assets/importers"
+    "${SGE_SOURCE_ROOT}/assets/prefabs"
+    "${SGE_SOURCE_ROOT}/audio"
+    "${SGE_SOURCE_ROOT}/core"
+    "${SGE_SOURCE_ROOT}/editor"
+    "${SGE_SOURCE_ROOT}/gameplay"
+    "${SGE_SOURCE_ROOT}/gameplay/player"
+    "${SGE_SOURCE_ROOT}/gameplay/weapons"
+    "${SGE_SOURCE_ROOT}/level"
+    "${SGE_SOURCE_ROOT}/navigation"
+    "${SGE_SOURCE_ROOT}/physics"
+    "${SGE_SOURCE_ROOT}/render"
+    "${SGE_SOURCE_ROOT}/render/dx11"
+    "${SGE_SOURCE_ROOT}/render/dx12"
+    "${SGE_SOURCE_ROOT}/render/opengl"
+    "${SGE_SOURCE_ROOT}/scene"
+    "${SGE_SOURCE_ROOT}/world/structures"
+    "${SGE_SOURCE_ROOT}/world/terrain"
+    "${SGE_SOURCE_ROOT}/world/vegetation"
+    "${SGE_SOURCE_ROOT}/world/water"
+)
+add_library(SGEProjectHeaders INTERFACE)
+target_include_directories(SGEProjectHeaders INTERFACE ${SGE_SOURCE_DIRS})
 
-# Header files (for IDE support)
-set(HEADER_FILES
-    src/CameraDX12.h
-    src/AnimationClipUtils.h
-    src/ClusteredRenderer.h
-    src/ClusteredRendererDX11.h
-    src/ClusteredRendererDX12.h
-    src/DDGI_DX11.h
-    src/DX11Core.h
-    src/DX12Core.h
-    src/StaticBufferDX12.h
-    src/ProfilerDX12.h
-    src/EngineLogger.h
-    src/PrefabRegistry.h
-    src/PrefabRuntime.h
-    src/PrefabColliders.h
-    src/RuntimeWorld.h
-    src/GameSession.h
-    src/FixedStepClock.h
-    src/RenderCoordinator.h
-    src/LevelRuntimeBuilder.h
-    src/GameSystems.h
-    src/CombatSystem.h
-    src/EnemySystem.h
-    src/VehicleSystem.h
-    src/GameRuntime.h
-    src/GameCommandQueue.h
-    src/LevelLoadingController.h
-    src/PlayerState.h
-    src/PlayerMovementTracker.h
-    src/DeferredReleaseQueue.h
-    src/AssetRegistry.h
-    src/AssetWatcher.h
-    src/PrefabThumbnailGenerator.h
-    src/PalmMeshCutter.h
-    src/GunAudio.h
-    src/NavigationSystem.h
-    src/T3DPhysicsAsset.h
-    src/Model.h
-    src/ModelDX11.h
-    src/Shader.h
-    src/ShaderDX11.h
-    src/ShaderDX12.h
-    src/SceneGraph.h
-    src/GLBImporter.h
-    src/VisibilityBufferDX12.h
-    src/ScreenSpaceReflectionsDX12.h
-    src/Scene.h
-    src/LevelDefinition.h
-    src/LevelEditor.h
-    src/ForwardRenderer.h
-    src/ShadowMapDX12.h
-    src/IdTechRenderer.h
-    src/EngineUI.h
-    src/RaytracingDX12.h
-    src/DXRScene.h
-    src/DXRProbeLayout.h
-    src/DXRDDGIRenderer.h
-    src/MipGenerator.h
-    src/MeshShaderDX12.h
-    src/TerrainRendererDX12.h
-    src/SkyRendererDX12.h
-    src/OcclusionDepthDX12.h
-    src/FXAADX12.h
-    src/MSAADX12.h
-    src/OceanWaveSettings.h
-    src/WaterRendererDX12.h
-    src/DestructionDX12.h
+file(GLOB_RECURSE HEADER_FILES CONFIGURE_DEPENDS
+    "${SGE_SOURCE_ROOT}/*.h")
+file(GLOB_RECURSE SGE_CPP_FILES CONFIGURE_DEPENDS
+    "${SGE_SOURCE_ROOT}/*.cpp")
+
+set(SGE_RUNTIME_SOURCES
+    src/assets/AssetRegistry.cpp
+    src/assets/AssetWatcher.cpp
+    src/assets/cooked/CookedAssetLoader.cpp
+    src/assets/importers/FBXImporter.cpp
+    src/assets/importers/GLBImporter.cpp
+    src/assets/importers/SkinnedFBXImporter.cpp
+    src/assets/prefabs/PrefabRegistry.cpp
+    src/assets/prefabs/PrefabThumbnailGenerator.cpp
+    src/audio/DrMp3.cpp
+    src/audio/StbVorbis.cpp
+    src/editor/LevelEditor.cpp
+    src/gameplay/CombatSystem.cpp
+    src/gameplay/weapons/ArmsTextures.cpp
+    src/level/LevelDefinition.cpp
+    src/navigation/NavigationSystem.cpp
+    src/physics/DestructionDX12.cpp
+    src/world/vegetation/PalmMeshCutter.cpp
 )
 
 # Find tinygltf
@@ -302,27 +286,13 @@ set_source_files_properties(${SHADER_FILES} PROPERTIES
 if(USE_DX12)
     message(STATUS "Building with DirectX 12")
     add_executable(GraphicEngine WIN32
-        src/main.cpp
-        src/GLBImporter.cpp
-        src/FBXImporter.cpp
-        src/SkinnedFBXImporter.cpp
-        src/ArmsTextures.cpp
-        src/StbVorbis.cpp
-        src/DrMp3.cpp
-        src/NavigationSystem.cpp
-        src/DestructionDX12.cpp
-        src/LevelDefinition.cpp
-        src/LevelEditor.cpp
-        src/CombatSystem.cpp
-        src/PrefabRegistry.cpp
-        src/AssetRegistry.cpp
-        src/AssetWatcher.cpp
-        src/PrefabThumbnailGenerator.cpp
-        src/PalmMeshCutter.cpp
+        src/app/main.cpp
+        ${SGE_RUNTIME_SOURCES}
         ${HEADER_FILES}
         ${SHADER_FILES}
     )
     target_link_libraries(GraphicEngine
+        SGEProjectHeaders
         d3d12
         d3dcompiler
         dxgi
@@ -344,11 +314,12 @@ if(USE_DX12)
 else()
     message(STATUS "Building with DirectX 11")
     add_executable(GraphicEngine WIN32 
-        src/main_dx11.cpp
+        src/app/main_dx11.cpp
         ${HEADER_FILES}
         ${SHADER_FILES}
     )
     target_link_libraries(GraphicEngine 
+        SGEProjectHeaders
         d3d11
         d3dcompiler
         dxgi
@@ -361,56 +332,56 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(LevelDefinitionTests
         tests/LevelDefinitionTests.cpp
-        src/LevelDefinition.cpp)
-    target_include_directories(LevelDefinitionTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(LevelDefinitionTests PRIVATE nlohmann_json::nlohmann_json)
+        src/level/LevelDefinition.cpp)
+    target_link_libraries(LevelDefinitionTests PRIVATE
+        SGEProjectHeaders nlohmann_json::nlohmann_json)
     add_test(NAME LevelDefinitionTests COMMAND LevelDefinitionTests)
 
     add_executable(RuntimeWorldTests
         tests/RuntimeWorldTests.cpp
-        src/LevelDefinition.cpp)
-    target_include_directories(RuntimeWorldTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(RuntimeWorldTests PRIVATE nlohmann_json::nlohmann_json)
+        src/level/LevelDefinition.cpp)
+    target_link_libraries(RuntimeWorldTests PRIVATE
+        SGEProjectHeaders nlohmann_json::nlohmann_json)
     add_test(NAME RuntimeWorldTests COMMAND RuntimeWorldTests)
 
     add_executable(GameArchitectureTests
         tests/GameArchitectureTests.cpp
-        src/CombatSystem.cpp
-        src/LevelDefinition.cpp)
-    target_include_directories(GameArchitectureTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(GameArchitectureTests PRIVATE nlohmann_json::nlohmann_json)
+        src/gameplay/CombatSystem.cpp
+        src/level/LevelDefinition.cpp)
+    target_link_libraries(GameArchitectureTests PRIVATE
+        SGEProjectHeaders nlohmann_json::nlohmann_json)
     add_test(NAME GameArchitectureTests COMMAND GameArchitectureTests)
 
     add_executable(PrefabRegistryTests
         tests/PrefabRegistryTests.cpp
-        src/PrefabRegistry.cpp)
-    target_include_directories(PrefabRegistryTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(PrefabRegistryTests PRIVATE nlohmann_json::nlohmann_json)
-    target_link_libraries(PrefabRegistryTests PRIVATE assimp::assimp)
+        src/assets/prefabs/PrefabRegistry.cpp)
+    target_link_libraries(PrefabRegistryTests PRIVATE
+        SGEProjectHeaders nlohmann_json::nlohmann_json assimp::assimp)
     add_test(NAME PrefabRegistryTests COMMAND PrefabRegistryTests)
 
     add_executable(AssetRegistryTests
         tests/AssetRegistryTests.cpp
-        src/AssetRegistry.cpp)
+        src/assets/AssetRegistry.cpp)
     target_include_directories(AssetRegistryTests PRIVATE
-        ${CMAKE_SOURCE_DIR}/src ${TINYGLTF_INCLUDE_DIRS})
+        ${TINYGLTF_INCLUDE_DIRS})
     target_link_libraries(AssetRegistryTests PRIVATE
-        nlohmann_json::nlohmann_json assimp::assimp)
+        SGEProjectHeaders nlohmann_json::nlohmann_json assimp::assimp)
     add_test(NAME AssetRegistryTests COMMAND AssetRegistryTests)
 
     add_executable(PrefabThumbnailTests
         tests/PrefabThumbnailTests.cpp
         tests/StbImageWriteImpl.cpp
-        src/PrefabThumbnailGenerator.cpp)
+        src/assets/prefabs/PrefabThumbnailGenerator.cpp)
     target_include_directories(PrefabThumbnailTests PRIVATE
-        ${CMAKE_SOURCE_DIR}/src ${TINYGLTF_INCLUDE_DIRS})
-    target_link_libraries(PrefabThumbnailTests PRIVATE assimp::assimp)
+        ${TINYGLTF_INCLUDE_DIRS})
+    target_link_libraries(PrefabThumbnailTests PRIVATE
+        SGEProjectHeaders assimp::assimp)
     add_test(NAME PrefabThumbnailTests COMMAND PrefabThumbnailTests)
 
     add_executable(AssetWatcherTests
         tests/AssetWatcherTests.cpp
-        src/AssetWatcher.cpp)
-    target_include_directories(AssetWatcherTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        src/assets/AssetWatcher.cpp)
+    target_link_libraries(AssetWatcherTests PRIVATE SGEProjectHeaders)
     add_test(NAME AssetWatcherTests COMMAND AssetWatcherTests)
 
     # Diagnostic for the FPS arms asset: prints raw per-mesh bounds from Assimp.
@@ -418,9 +389,13 @@ if(BUILD_TESTING)
     target_link_libraries(InspectArms PRIVATE assimp::assimp)
 
     add_executable(DXRProbeLayoutTests tests/DXRProbeLayoutTests.cpp)
-    target_include_directories(DXRProbeLayoutTests PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(DXRProbeLayoutTests PRIVATE nlohmann_json::nlohmann_json)
+    target_link_libraries(DXRProbeLayoutTests PRIVATE
+        SGEProjectHeaders nlohmann_json::nlohmann_json)
     add_test(NAME DXRProbeLayoutTests COMMAND DXRProbeLayoutTests)
+
+    add_executable(CookedAssetFormatTests tests/CookedAssetFormatTests.cpp)
+    target_link_libraries(CookedAssetFormatTests PRIVATE SGEProjectHeaders)
+    add_test(NAME CookedAssetFormatTests COMMAND CookedAssetFormatTests)
 endif()
 
 if(MSVC)
@@ -431,9 +406,32 @@ if(MSVC)
     target_compile_options(GraphicEngine PRIVATE /MP /bigobj)
 endif()
 
-# Group files in IDE
-source_group("Header Files" FILES ${HEADER_FILES})
-source_group("Shader Files" FILES ${SHADER_FILES})
+# Offline source-asset ingestion. Runtime code prefers resulting versioned
+# .sgeasset files; source import remains an editor/development fallback.
+add_executable(AssetCooker
+    tools/AssetCooker.cpp
+    src/assets/cooked/CookedAssetFormat.h)
+target_link_libraries(AssetCooker PRIVATE
+    SGEProjectHeaders
+    assimp::assimp
+    meshoptimizer::meshoptimizer)
+if(MSVC)
+    target_compile_options(AssetCooker PRIVATE /MP /bigobj)
+endif()
+
+add_custom_target(CookAssets
+    COMMAND $<TARGET_FILE:AssetCooker>
+        --all "${CMAKE_SOURCE_DIR}/Content"
+        --out "${CMAKE_SOURCE_DIR}/Content/Cooked"
+    DEPENDS AssetCooker
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Cooking FBX/GLB/GLTF assets into runtime .sgeasset blobs")
+
+# Mirror physical subsystem folders in Visual Studio.
+source_group(TREE "${SGE_SOURCE_ROOT}" PREFIX "Source"
+    FILES ${HEADER_FILES} ${SGE_CPP_FILES})
+source_group(TREE "${CMAKE_SOURCE_DIR}/shaders" PREFIX "Shaders"
+    FILES ${SHADER_FILES})
 
 # Keep each CMake build tree self-contained. The default tree still produces
 # build/GraphicEngine.exe; alternate trees produce their own executable instead

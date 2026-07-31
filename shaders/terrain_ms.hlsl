@@ -117,7 +117,7 @@ static const float kBeachLow      = -0.25;
 
 // Flat arena under the four houses arranged around world centre. Applied after
 // everything else and faded out before the relocated pool basin.
-// kPadHeight is Ground::kBuildingPadY (src/GroundLevel.h) -- the houses and their
+// kPadHeight is Ground::kBuildingPadY (world/terrain/GroundLevel.h) -- the houses and their
 // roofs are all built up from that constant, so if this drifts they end up buried
 // in the sand or floating over it. Must match TerrainRendererDX12::HeightAt.
 static const float  kPadRadius = 14.0;   // dead flat through all four foundations

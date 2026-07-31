@@ -32,7 +32,7 @@ DirectX 12 is the primary path. A smaller legacy DirectX 11 target remains avail
 - Pool and ocean surfaces with waves, splashes, and buoyancy
 - Dense procedural grass with distance culling and wind
 - Projectile, impact-particle, smoke, muzzle-flash, and enemy-shot effects
-- GLB/glTF and FBX import
+- Offline FBX/GLB/glTF cooking with cooked-first runtime loading
 - Procedural fallback textures for missing house materials
 
 ## Controls
@@ -111,6 +111,23 @@ Convenience scripts:
 
 The scripts contain default Visual Studio and vcpkg paths. Edit them or use the manual commands above when your tools live elsewhere.
 
+### Asset cooking
+
+FBX, GLB, and glTF files are editor ingest formats. Build the cooker, then
+produce versioned runtime blobs:
+
+```powershell
+cmake --build build --config Release --target AssetCooker
+cmake --build build --config Release --target CookAssets
+```
+
+`CookAssets` writes `Content/Cooked/**/*.sgeasset`. Each blob contains
+cache/overdraw/fetch-optimized geometry, 16/32-bit indices, prebuilt meshlets
+and bounds, BC3/BC5 mip chains, and quantized animation tracks. Runtime maps and
+validates these blobs, uploads GPU-ready sections, and falls back to source
+import only when a cooked asset is missing or stale. Generated cooked content
+is ignored by Git and should be produced by build/package automation.
+
 ### Legacy DirectX 11 build
 
 ```powershell
@@ -143,55 +160,37 @@ The engine uses per-frame command allocators and fence values. Command recording
 
 ```text
 src/
-  main.cpp                  DX12 application and demo orchestration
-  DX12Core.h                device, swap chain, descriptors, frames, fences
-  ForwardRenderer.h         forward scene rendering
-  VisibilityBufferDX12.h    visibility-buffer passes and compute resolve
-  RaytracingDX12.h          DXR pipeline, acceleration structures, dispatch
-  DDGI_DX12.h               DDGI resources and probe updates
-  ShadowMapDX12.h           directional shadow pass
-  MeshShaderDX12.h          meshlet rendering and occlusion
-  TerrainRendererDX12.h     mesh-shader terrain
-  RuntimeWorld.h            active level, terrain, and prefab runtime ownership
-  LevelRuntimeBuilder.h     authored-level to gameplay spawn/settings plan
-  GameSession.h             screen lifecycle and level timer
-  CombatSystem.h            prefab damage and combat interaction state
-  EnemySystem.h             enemy roster and encounter cooldown state
-  VehicleSystem.h           Humvee and helicopter state/damage rules
-  GameSystems.h             compatibility umbrella for game systems
-  GameRuntime.h             game composition root and shared lifecycle
-  GameCommandQueue.h        typed cross-frame gameplay/editor commands
-  LevelLoadingController.h  level-loading state machine and telemetry
-  PlayerState.h             player health, regeneration, ammo, and reload state
-  PlayerMovementTracker.h   horizontal locomotion speed and teleport filtering
-  AnimationClipUtils.h      cross-clip translation-origin normalization
-  FixedStepClock.h          bounded fixed-step destruction/physics clock
-  RenderCoordinator.h       forward/visibility/DXR path policy
-  DeferredReleaseQueue.h    fence-based GPU resource retirement
-  DestructionDX12.*         Blast destruction and physics integration
-  GLBImporter.*             glTF loading, textures, meshlets, scene merging
-  FBXImporter.*             Assimp-backed FBX loading
-  Scene.h                   runtime scene and gameplay state
-  SceneGraph.h              scene hierarchy and mesh/material structures
-  EngineUI.h                ImGui controls
-  GrassField.h              grass generation and rendering
-  WaterVolume.h             water simulation, rendering, and buoyancy
-  PalmTrees.h               destructible palm simulation
-  RopeSwing.h               rope and payload simulation
+  animation/          clips, skeleton types, animation runtime
+  app/                DX12 entry point and legacy backend entry points
+  assets/             registry, watcher, cooked assets, importers, prefabs
+  audio/              decoder implementations and weapon audio
+  core/               logging, timing, commands, input, deferred release
+  editor/             ImGui editor and level-editing code
+  gameplay/           combat, actors, vehicles, player, weapons
+  level/              level data, loading, runtime construction and state
+  navigation/         Recast/Detour navigation
+  physics/            Blast destruction and physics asset data
+  render/             render policy plus DX11, DX12, and OpenGL backends
+  scene/              runtime scene and scene-graph structures
+  world/              terrain, vegetation, water, and structures
 
-shaders/                    HLSL shaders and legacy GLSL files
-models/                     runtime models and textures
-thirdparty/blast/           vendored NVIDIA Blast source
-CMakeLists.txt              DX12/DX11 targets and asset-copy rules
+shaders/              HLSL shaders and legacy GLSL files
+Content/              authored runtime assets and generated cooked data
+tests/                focused runtime and data tests
+tools/                offline asset cooker
+thirdparty/           vendored dependencies
+CMakeLists.txt        targets, shaders, tests, and content-copy rules
 ```
 
-`src/main_dx11.cpp` and `src/main_dx12_legacy.cpp` are legacy paths. The primary executable builds from `src/main.cpp`.
+See `src/README.md` for subsystem ownership. `src/app/main_dx11.cpp` and
+`src/app/main_dx12_legacy.cpp` are legacy paths. Primary executable builds from
+`src/app/main.cpp`.
 
 ## Known limitations
 
 - Windows-only
 - Main frame command recording is single-threaded
-- Most gameplay functions still live in `main.cpp`; state ownership is separated first
+- Most gameplay functions still live in `src/app/main.cpp`; state ownership is separated first
 - Runtime/render integration coverage remains limited; data and world-state tests exist
 - Transient gameplay state is not serialized
 - Renderer uses shared global DX12 state
@@ -214,7 +213,8 @@ DXR requires compatible hardware, Windows version, and driver. Use forward or vi
 
 ### Assets or shaders are missing
 
-Run from repository root or `build/`. CMake copies `models/` and `shaders/` beside the executable after a successful build.
+Run from repository root or `build/`. CMake syncs `Content/` and copies
+`shaders/` beside executable after a successful build.
 
 ### Black output or GPU validation errors
 

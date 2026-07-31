@@ -11,9 +11,9 @@
 #include <vector>
 
 #define STB_VORBIS_HEADER_ONLY
-#include "../thirdparty/stb/stb_vorbis.c"
+#include "../../thirdparty/stb/stb_vorbis.c"
 #undef STB_VORBIS_HEADER_ONLY
-#include "../thirdparty/dr_libs/dr_mp3.h"
+#include "../../thirdparty/dr_libs/dr_mp3.h"
 
 // Small overlapping-voice player for short PCM/float WAV effects.
 class GunAudio {

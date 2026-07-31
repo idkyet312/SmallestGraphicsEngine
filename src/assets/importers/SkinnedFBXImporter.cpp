@@ -1,4 +1,5 @@
 #include "SkinnedFBXImporter.h"
+#include "CookedAssetLoader.h"
 #include "GLBImporter.h"
 #include "StaticBufferDX12.h"
 #include <assimp/Importer.hpp>
@@ -503,6 +504,15 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
     // first, then each extra animation-only FBX.
     AppendClips(scene, out.skeleton, 1.0f, out.clips);
     for (const std::string& ap : animPaths) {
+        const size_t before = out.clips.size();
+        if (CookedAssetLoader::LoadAnimationsForSource(
+                ap, out.skeleton, out.clips)) {
+            const std::string stem = fs::path(ap).stem().string();
+            for (size_t i = before; i < out.clips.size(); ++i)
+                out.clips[i].name = stem;
+            std::cout << "Loaded cooked animation: " << stem << "\n";
+            continue;
+        }
         Assimp::Importer animImporter;
         const aiScene* as = animImporter.ReadFile(ap, aiProcess_Triangulate);
         if (!as || as->mNumAnimations == 0) {
@@ -511,7 +521,6 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
         }
         // Name the clip from its filename so callers can FindClip("Walk") etc.
         const std::string stem = fs::path(ap).stem().string();
-        const size_t before = out.clips.size();
         AppendClips(as, out.skeleton, 1.0f, out.clips);
         for (size_t i = before; i < out.clips.size(); ++i) out.clips[i].name = stem;
     }

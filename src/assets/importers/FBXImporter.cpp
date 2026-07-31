@@ -1,5 +1,6 @@
 #include "FBXImporter.h"
 #include "GLBImporter.h"
+#include "CookedAssetLoader.h"
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
@@ -26,6 +27,37 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
     bool loadMaterials,
     bool diffuseAndNormalOnly,
     bool buildMeshlets) {
+    const bool needsAuthoredHierarchy =
+        filepath.find("Humvee") != std::string::npos ||
+        filepath.find("humvee") != std::string::npos ||
+        filepath.find("OH-1") != std::string::npos;
+    if (device && !splitIntoDestructibleBoards && !diffuseAndNormalOnly &&
+        !needsAuthoredHierarchy) {
+        if (auto cooked = CookedAssetLoader::LoadForSource(
+                filepath, device, commandList)) {
+            cooked->scale = XMFLOAT3(
+                uniformScale, uniformScale, uniformScale);
+            cooked->UpdateLocalTransform();
+            XMFLOAT4X4 identity;
+            XMStoreFloat4x4(&identity, XMMatrixIdentity());
+            cooked->UpdateGlobalTransform(identity);
+            if (!loadMaterials) {
+                const auto clearMaterials = [&](const auto& self,
+                                                const std::shared_ptr<SceneNode>& node)
+                    -> void {
+                    if (!node) return;
+                    if (node->mesh)
+                        for (MeshPrimitive& primitive : node->mesh->primitives)
+                            primitive.material =
+                                std::make_shared<SceneMaterial>();
+                    for (const auto& child : node->children)
+                        self(self, child);
+                };
+                clearMaterials(clearMaterials, cooked);
+            }
+            return cooked;
+        }
+    }
     Assimp::Importer importer;
     const bool preserveOH1Rotors = filepath.find("OH-1") != std::string::npos;
     unsigned importFlags = aiProcess_Triangulate | aiProcess_JoinIdenticalVertices |

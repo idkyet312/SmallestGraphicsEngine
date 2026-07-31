@@ -43,6 +43,7 @@
 #include "VirtualInput.h"
 #include "EngineUI.h"
 #include "GLBImporter.h"
+#include "CookedAssetLoader.h"
 #include "MipGenerator.h"
 #include "ShadowMapDX12.h"
 #include "MeshShaderDX12.h"
@@ -2925,13 +2926,26 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
     auto cached = g_prefabModelCache.find(prefab.id);
     if (cached != g_prefabModelCache.end()) return &cached->second;
     const std::string extension = prefab.modelPath.extension().string();
-    std::shared_ptr<SceneNode> model;
-    if (_stricmp(extension.c_str(), ".fbx") == 0) {
-        model = FBXImporter::Load(prefab.modelPath.string(), g_dx12.device,
-            g_dx12.commandList, 1.0f, false, prefab.useMaterials, false, true);
+    std::string cookedError;
+    std::shared_ptr<SceneNode> model = CookedAssetLoader::LoadForSource(
+        prefab.modelPath, g_dx12.device, g_dx12.commandList, &cookedError);
+    if (model) {
+        SGE_LOG("LogPrefab", EngineLog::Level::Display,
+            "Loaded cooked asset for " + prefab.id);
     } else {
-        model = GLBImporter::LoadGLB(prefab.modelPath.string(), g_dx12.device,
-            g_dx12.commandList);
+        if (!cookedError.empty()) {
+            SGE_LOG("LogPrefab", EngineLog::Level::Warning,
+                "Cooked asset unavailable for " + prefab.id + ": " +
+                cookedError + "; using source importer");
+        }
+        if (_stricmp(extension.c_str(), ".fbx") == 0) {
+            model = FBXImporter::Load(prefab.modelPath.string(), g_dx12.device,
+                g_dx12.commandList, 1.0f, false, prefab.useMaterials, false,
+                true);
+        } else {
+            model = GLBImporter::LoadGLB(prefab.modelPath.string(),
+                g_dx12.device, g_dx12.commandList);
+        }
     }
     if (!model) {
         SGE_LOG("LogPrefab", EngineLog::Level::Error,
@@ -7839,9 +7853,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             } else {
                 // Authored explosive barrel. Source mesh is 2.08 m high; 0.72 keeps
                 // its in-game size aligned with existing 1.5 m gameplay collision.
-                g_explosiveBarrelModel = FBXImporter::Load(
-                    "Content/Models/Barrel Explosive/barrel.FBX",
-                    g_dx12.device, g_dx12.commandList, 0.72f, false, true);
+                const std::filesystem::path barrelSource =
+                    "Content/Models/Barrel Explosive/barrel.FBX";
+                std::string barrelCookError;
+                g_explosiveBarrelModel = CookedAssetLoader::LoadForSource(
+                    barrelSource, g_dx12.device, g_dx12.commandList,
+                    &barrelCookError);
+                if (g_explosiveBarrelModel) {
+                    g_explosiveBarrelModel->scale =
+                        XMFLOAT3(0.72f, 0.72f, 0.72f);
+                    g_explosiveBarrelModel->UpdateLocalTransform();
+                    XMFLOAT4X4 identity;
+                    XMStoreFloat4x4(&identity, XMMatrixIdentity());
+                    g_explosiveBarrelModel->UpdateGlobalTransform(identity);
+                    std::cout << "Explosive barrel cooked asset ready\n";
+                } else {
+                    g_explosiveBarrelModel = FBXImporter::Load(
+                        barrelSource.string(), g_dx12.device,
+                        g_dx12.commandList, 0.72f, false, true);
+                }
                 if (g_explosiveBarrelModel) {
                     // Asset provides only diffuse + normal maps. Treating its
                     // unmasked surface as smooth metal creates broad white IBL

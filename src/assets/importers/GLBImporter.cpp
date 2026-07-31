@@ -7,6 +7,7 @@
 #include <tiny_gltf.h>
 
 #include "GLBImporter.h"
+#include "CookedAssetLoader.h"
 #include "MipGenerator.h"
 #include "StaticBufferDX12.h"
 #include <iostream>
@@ -901,6 +902,11 @@ void ProcessNode(const tinygltf::Model& model, int nodeIndex, SceneNode* parentN
 }
 
 std::shared_ptr<SceneNode> GLBImporter::LoadGLB(const std::string& filepath, ComPtr<ID3D12Device> device, ComPtr<ID3D12GraphicsCommandList> commandList) {
+    if (device) {
+        if (auto cooked = CookedAssetLoader::LoadForSource(
+                filepath, device, commandList))
+            return cooked;
+    }
     tinygltf::Model model;
     tinygltf::TinyGLTF loader;
     std::string err;

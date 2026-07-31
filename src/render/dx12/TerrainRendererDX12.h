@@ -344,7 +344,7 @@ public:
 
         // Flat arenas under each house compound, applied LAST so neither noise nor
         // the pool rim can dent them. Must match terrain_ms.hlsl's TerrainHeight;
-        // padHeight is Ground::kBuildingPadY (src/GroundLevel.h), which the houses
+        // padHeight is Ground::kBuildingPadY (world/terrain/GroundLevel.h), which the houses
         // and roofs are built from -- change it there and here together.
         constexpr float padRadius = 14.0f, padFade = 18.0f, padHeight = 2.5f;
         static constexpr float padCenters[8][2] = {

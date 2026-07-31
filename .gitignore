@@ -1,6 +1,6 @@
 # Build artifacts
 build/
-build-perf/
+build-*/
 *.exe
 *.obj
 *.o
@@ -85,3 +85,4 @@ Thumbs.db
 
 # Tool output
 graphify-out/
+Content/Cooked/
