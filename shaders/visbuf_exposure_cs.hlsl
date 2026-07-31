@@ -52,11 +52,7 @@ void Finalize(uint3 unused : SV_DispatchThreadID) {
     if (count == 0) return;
     float encodedMean = exposureState.Load(0) / (float)count / 4095.0;
     float averageLuminance = exp2(encodedMean * 20.0 - 12.0);
-    // Keep sun-facing sky and dark interiors from driving extreme exposure
-    // swings. Scene lighting should remain legible without eye adaptation
-    // bleaching the horizon or turning a doorway into a black cutout.
-    float targetExposure = clamp(
-        middleGray / max(averageLuminance, 1e-4), 0.45, 2.50);
+    float targetExposure = clamp(middleGray / max(averageLuminance, 1e-4), 0.05, 16.0);
     float previousExposure = exposureState.Load(8) / 65536.0;
     if (previousExposure <= 0.0) previousExposure = 1.0;
     float adapted = lerp(previousExposure, targetExposure, saturate(adaptationRate));

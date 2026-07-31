@@ -86,6 +86,7 @@ struct alignas(256) ObjectBufferDX12 {
     float normalTexH = 1.0f;
     float specularScale = 1.0f;
     float materialType = 0.0f; // 0=ordinary, 1=pool water, 2=ocean
+    float materialTime = 0.0f; // animated procedural materials
 };
 
 struct PointLightDataDX12 {
@@ -1226,7 +1227,8 @@ public:
                           float normalYSign = 1.0f,
                           float viewFillStrength = 0.0f,
                           float specularScale = 1.0f,
-                          float materialType = 0.0f) {
+                          float materialType = 0.0f,
+                          float materialTime = 0.0f) {
         UINT bufferIndex = GetDrawCallIndex();
 
         ObjectBufferDX12 data;
@@ -1244,6 +1246,7 @@ public:
         data.viewFillStrength = viewFillStrength;
         data.specularScale = specularScale;
         data.materialType = materialType;
+        data.materialTime = materialTime;
         if (useNorm && normal) {
             const D3D12_RESOURCE_DESC nd = normal->GetDesc();
             data.normalTexW = (float)nd.Width;
@@ -1328,11 +1331,11 @@ public:
     }
 
     void SetWaterMaterial(const XMFLOAT3& color, float roughness,
-                          float opacity, bool ocean) {
+                          float opacity, bool ocean, float time) {
         SetObjectMaterial(
             color, false, false, 0.0f, roughness,
             nullptr, nullptr, nullptr, false, opacity, false, nullptr, false,
-            1.0f, 0.0f, 1.0f, 0.0f, 0.82f, ocean ? 2.0f : 1.0f);
+            1.0f, 0.0f, 1.0f, 0.0f, 0.82f, ocean ? 2.0f : 1.0f, time);
     }
 
     // Unlit soft-sprite material for smoke billboards: samples `smokeTex`'s alpha

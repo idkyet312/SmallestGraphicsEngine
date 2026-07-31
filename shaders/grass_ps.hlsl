@@ -161,8 +161,8 @@ float3 tonemapAgXPunchy(float3 color) {
 
     const float3 lw = float3(0.2126, 0.7152, 0.0722);
     float luma = dot(color, lw);
-    color = pow(max(color, 0.0), 1.18);
-    color = luma + 1.18 * (color - luma);
+    color = pow(max(color, 0.0), 1.35);
+    color = luma + 1.4 * (color - luma);
 
     color = mul(agxOut, color);
     return ApplySceneColorGrade(color);

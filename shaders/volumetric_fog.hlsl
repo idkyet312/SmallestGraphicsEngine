@@ -147,17 +147,16 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float stepLength = (farDepth - nearDepth) / viewCos;
         float3 worldPosition = cameraPositionNear.xyz + ray * (centerDepth / viewCos);
 
-        // Keep clear air around the camera, then build atmospheric depth toward
-        // the horizon. This preserves nearby material contrast while retaining
-        // silhouettes and shafts behind the compound.
-        float distanceFade = smoothstep(12.0, 58.0, centerDepth);
+        // Jungle gradient: a broad upper haze plus a softer, denser low ground
+        // layer that pools in the valley floor. The ground layer's falloff is kept
+        // gentle (2x, not a sharp spike) so it fades smoothly into the upper haze
+        // with no hard seam where it cuts off across tall grass and terrain.
         float aboveBase = max(worldPosition.y - fogParams.y, 0.0);
         float heightDensity = exp(-aboveBase * fogParams.x);
-        float groundLayer = exp(-aboveBase * (fogParams.x * 2.6)) * 0.45;
+        float groundLayer = exp(-aboveBase * (fogParams.x * 2.0)) * 0.9;
         float densityNoise = lerp(0.58, 1.28, FogNoise(worldPosition));
-        heightDensity = (heightDensity + groundLayer) * densityNoise *
-                        distanceFade;
-        heightDensity = max(heightDensity, 0.012 * distanceFade);
+        heightDensity = (heightDensity + groundLayer) * densityNoise;
+        heightDensity = max(heightDensity, 0.03);
         float extinction = max(sunDirectionDensity.w * heightDensity, 0.00001);
         float segmentTransmittance = exp(-extinction * stepLength);
 
@@ -166,7 +165,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // Daylight fog must replace attenuated scene energy with sky irradiance.
         // A tiny ambient term made the former pass behave like red/brown smoke.
         float3 lighting = AtmosphereAmbient(ray, aboveBase) +
-            sunColorAnisotropy.xyz * phase * shadow * 0.28;
+            sunColorAnisotropy.xyz * phase * shadow * 0.42;
         uint3 clusterCoord = min(
             uint3(
                 id.x * clusterDimsLightCount.x / volumeDims.x,

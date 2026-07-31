@@ -127,8 +127,8 @@ struct Scene {
     // Angled, HDR-strength warm sun. Lower elevation gives terrain and props
     // longer modelling shadows while cool sky irradiance keeps them readable.
     XMFLOAT3 lightPos    = { 4.735f, 3.095f, -8.246f };
-    XMFLOAT3 lightColor  = { 1.0f, 0.94f, 0.80f };
-    float    directionalLightIntensity = 9.75f;
+    XMFLOAT3 lightColor  = { 1.0f, 0.92f, 0.70f };
+    float    directionalLightIntensity = 12.18f;
     int      lightType   = 0;
     float    lightConstant  = 1.0f;
     float    lightLinear    = 0.09f;
@@ -136,7 +136,7 @@ struct Scene {
 
     // Material defaults
     float ambientStrength   = 0.07f;
-    float ambientLightingIntensity = 0.46f;
+    float ambientLightingIntensity = 0.356f;
     float specularStrength  = 0.5f;
     int   specularShininess = 32;
     float shadowBias        = 0.005f;
@@ -229,25 +229,25 @@ struct Scene {
     float atmosphereRayleighStrength = 0.92f;
     float atmosphereMieStrength = 0.58f;
     float atmosphereMieAnisotropy = 0.76f;
-    float atmosphereAerialDensity = 0.48f;
+    float atmosphereAerialDensity = 0.72f;
     float atmosphereCloudCoverage = 0.42f;
     float atmosphereCloudDensity = 0.68f;
     float atmosphereCloudBaseHeight = 720.0f;
     float atmosphereCloudThickness = 1250.0f;
     bool  enableVolumetricFog = true;
-    float volumetricFogDensity = 0.0072f;
-    float volumetricFogAnisotropy = 0.82f;
-    float volumetricFogHeightFalloff = 0.060f; // retain horizon haze without veiling nearby foliage
-    float volumetricFogBaseHeight = 0.1f;
-    float volumetricFogDistance = 320.0f;
+    float volumetricFogDensity = 0.0128f;
+    float volumetricFogAnisotropy = 0.90f;
+    float volumetricFogHeightFalloff = 0.045f; // fog thins above the undergrowth, not over treetops
+    float volumetricFogBaseHeight = 0.4f;      // haze pools low in the valley floor
+    float volumetricFogDistance = 240.0f;      // pull back so far trees don't wash out
     XMFLOAT3 volumetricFogTint = {
         168.0f / 255.0f, 181.0f / 255.0f, 176.0f / 255.0f
     };
     bool  enableAmbientOcclusion = true;
     float ambientOcclusionRadius = 0.69f;
-    float ambientOcclusionStrength = 1.75f;
+    float ambientOcclusionStrength = 2.50f;
     float ambientOcclusionBias = 0.035f;
-    float contactShadowStrength = 0.68f;
+    float contactShadowStrength = 0.56f;
     bool  enableScreenSpaceReflections = true;
     float screenSpaceReflectionStrength = 0.35f;
     float screenSpaceReflectionDistance = 55.0f;

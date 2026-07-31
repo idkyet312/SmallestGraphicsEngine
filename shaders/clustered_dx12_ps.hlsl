@@ -46,6 +46,7 @@ cbuffer ObjectBuffer : register(b3) {
     float normalTexH;
     float specularScale;     // per-draw highlight control; viewmodels use less
     float materialType;      // 0=ordinary, 1=pool water, 2=ocean
+    float materialTime;      // seconds; used by procedural water detail
 };
 
 struct PointLightData {
@@ -550,8 +551,8 @@ float3 tonemapAgXPunchy(float3 color) {
     // Punchy look: lift saturation and gamma for a bolder image.
     const float3 lw = float3(0.2126, 0.7152, 0.0722);
     float luma = dot(color, lw);
-    color = pow(color, 1.18);                 // retain shadow texture detail
-    color = luma + 1.18 * (color - luma);     // restrained tropical saturation
+    color = pow(color, 1.35);                 // punchy contrast
+    color = luma + 1.4 * (color - luma);      // punchy saturation
 
     color = mul(agxOut, color);
     return ApplySceneColorGrade(color);       // already display-encoded
@@ -762,36 +763,55 @@ float4 main(PS_INPUT input) : SV_TARGET {
     const bool isWater = materialType > 0.5 && materialType < 2.5;
     const bool isOcean = materialType > 1.5 && materialType < 2.5;
     float waterFoam = 0.0;
+    float surfaceOpacity = opacity;
     if (isWater) {
-        // Two world-space normal scales break the large CPU mesh waves into
-        // smaller capillary ripples without another texture or visible tiling.
+        // Directional, animated capillary waves add detail below the CPU mesh
+        // scale. Four incommensurate directions avoid a stationary cross-hatch.
         float2 p = input.fragPos.xz;
-        float2 rippleA = float2(
-            sin(p.x * 1.73 + p.y * 1.11),
-            cos(p.x * 1.27 - p.y * 1.91));
-        float2 rippleB = float2(
-            sin(p.x * 4.63 - p.y * 3.77),
-            cos(p.x * 3.31 + p.y * 5.13));
-        float2 ripple = rippleA * 0.055 + rippleB * 0.022;
-        normal = normalize(normal + float3(ripple.x, 0.0, ripple.y));
+        float2 d0 = normalize(float2(0.93, 0.37));
+        float2 d1 = normalize(float2(-0.48, 0.88));
+        float2 d2 = normalize(float2(0.22, -0.98));
+        float2 d3 = normalize(float2(-0.79, -0.61));
+        float2 ripple = 0.0;
+        ripple += d0 * cos(dot(p, d0) * 0.82 + materialTime * 0.72) * 0.050;
+        ripple += d1 * cos(dot(p, d1) * 1.37 - materialTime * 1.08) * 0.035;
+        ripple += d2 * cos(dot(p, d2) * 2.61 + materialTime * 1.64) * 0.018;
+        ripple += d3 * cos(dot(p, d3) * 4.73 - materialTime * 2.27) * 0.009;
+        const float pixelFootprint = max(length(ddx(p)), length(ddy(p)));
+        const float detailFade = 1.0 - smoothstep(0.30, 1.80, pixelFootprint);
+        ripple *= detailFade * (isOcean ? 1.0 : 0.72);
+        normal = normalize(normal + float3(-ripple.x, 0.0, -ripple.y));
 
         float edge = min(min(input.texCoord.x, 1.0 - input.texCoord.x),
                          min(input.texCoord.y, 1.0 - input.texCoord.y));
         float edgeFoam = 1.0 - smoothstep(0.012, 0.072, edge);
-        float crestFoam = smoothstep(0.045, 0.19, 1.0 - normal.y);
-        float foamNoise = MatVarNoise(float3(p * 0.72, 4.8));
-        waterFoam = saturate((isOcean ? crestFoam : edgeFoam) *
-                              smoothstep(0.30, 0.72, foamNoise));
+        float crestSlope = smoothstep(0.035, 0.14, 1.0 - normal.y);
+        float crestHeight = smoothstep(0.035, 0.24, input.fragPos.y);
+        float foamNoiseA = MatVarNoise(
+            float3(p * 0.34 + float2(materialTime * 0.06, 0.0), 4.8));
+        float foamNoiseB = MatVarNoise(
+            float3(p * 0.91 - float2(0.0, materialTime * 0.09), 9.3));
+        float foamBreakup = smoothstep(
+            0.42, 0.70, foamNoiseA * 0.68 + foamNoiseB * 0.32);
+        float crestFoam = crestSlope * crestHeight * foamBreakup;
+        waterFoam = saturate(isOcean ? crestFoam : edgeFoam * foamBreakup);
 
-        float fresnel = pow(1.0 - saturate(dot(normal, viewDir)), 4.0);
+        const float nDotVWater = saturate(dot(normal, viewDir));
+        const float fresnel = 0.02037 +
+            (1.0 - 0.02037) * pow(1.0 - nDotVWater, 5.0);
         float3 deepColor = isOcean
-            ? float3(0.012, 0.075, 0.19)
-            : float3(0.025, 0.18, 0.30);
-        float3 grazingColor = float3(0.12, 0.38, 0.52);
-        albedo = lerp(deepColor, grazingColor, fresnel * 0.58);
-        albedo = lerp(albedo, float3(0.68, 0.80, 0.76), waterFoam * 0.72);
+            ? float3(0.008, 0.070, 0.135)
+            : float3(0.018, 0.145, 0.205);
+        float3 grazingColor = float3(0.075, 0.245, 0.325);
+        albedo = lerp(deepColor, grazingColor, fresnel * 0.42);
+        albedo = lerp(albedo, float3(0.72, 0.82, 0.79), waterFoam * 0.82);
         metal = 0.0;
-        rough = lerp(isOcean ? 0.16 : 0.11, 0.46, waterFoam);
+        rough = lerp(isOcean ? 0.095 : 0.075, 0.42, waterFoam);
+        // Alpha blending approximates transmitted scene radiance. Water clears
+        // head-on and becomes reflective/opaque toward grazing angles.
+        const float transmissionAlpha = opacity * (isOcean ? 0.70 : 0.56);
+        surfaceOpacity = lerp(transmissionAlpha, 0.97, fresnel);
+        surfaceOpacity = lerp(surfaceOpacity, 0.96, waterFoam);
     }
 
     if (!isWater && metal < 0.25) {
@@ -849,7 +869,9 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float HdotV = max(dot(H, V), 0.0);
     
     // Fresnel (Schlick)
-    float3 F0 = float3(0.04, 0.04, 0.04); 
+    float3 F0 = isWater
+        ? float3(0.02037, 0.02037, 0.02037)
+        : float3(0.04, 0.04, 0.04);
     F0 = lerp(F0, albedo, metal);
     float3 F = F0 + (1.0 - F0) * pow(1.0 - HdotV, 5.0);
     
@@ -935,7 +957,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
 
     // AgX (Punchy) tone mapping; returns display-encoded sRGB.
     result = FinalizeOutput(result);
-    return float4(result, opacity);
+    return float4(result, surfaceOpacity);
 }
 
 

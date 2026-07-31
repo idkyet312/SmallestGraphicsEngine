@@ -61,6 +61,7 @@ public:
     // with the sloped terrain instead of an invisible box.
     // Surface mesh resolution (cells per side). Call before Initialize.
     void SetGridResolution(int n) { m_requestedGridN = std::max(8, n); }
+    void SetOceanProfile(bool enabled = true) { m_oceanProfile = enabled; }
 
     void Initialize(const XMFLOAT3& center, const XMFLOAT3& extents,
                     const std::function<float(float, float)>& terrainHeight = {}) {
@@ -266,10 +267,19 @@ public:
             dsdx += c * kx;
             dsdz += c * kz;
         };
-        wave(0.14f, 0.90f, 0.00f,  1.30f * m_time);
-        wave(0.10f, 0.60f, 0.70f, -1.70f * m_time);
-        wave(0.06f, 1.60f, 1.60f,  2.40f * m_time);
-        wave(0.04f, 2.30f, 1.30f, -2.90f * m_time);
+        if (m_oceanProfile) {
+            // Broad swells remain above the large ocean grid's Nyquist limit.
+            // Fine wind ripples belong in the pixel shader.
+            wave(0.28f,  0.080f,  0.025f,  0.62f * m_time);
+            wave(0.16f, -0.045f,  0.145f, -0.91f * m_time);
+            wave(0.09f,  0.205f, -0.135f,  1.26f * m_time);
+            wave(0.05f, -0.255f, -0.090f, -1.54f * m_time);
+        } else {
+            wave(0.14f, 0.90f, 0.00f,  1.30f * m_time);
+            wave(0.10f, 0.60f, 0.70f, -1.70f * m_time);
+            wave(0.06f, 1.60f, 1.60f,  2.40f * m_time);
+            wave(0.04f, 2.30f, 1.30f, -2.90f * m_time);
+        }
 
         // Product rule for (swell * bell).
         float h = s * bell;
@@ -337,6 +347,7 @@ public:
     XMFLOAT3 GetCenter() const { return m_center; }
     XMFLOAT3 GetExtents() const { return m_extents; }
     float    GetSurfaceY() const { return m_surfaceY; }
+    float    GetTime() const { return m_time; }
     bool     IsInitialized() const { return m_meshReady || !B3_IS_NULL(m_world); }
 
     void ResetSurface() {
@@ -545,6 +556,7 @@ private:
     UINT m_currentSlot = 0;      // last-written buffer; VBV always points here
     int  m_gridN = 48;
     int  m_requestedGridN = 48;   // survives Shutdown(); applied on Initialize
+    bool m_oceanProfile = false;  // broad swells; survives Shutdown()
 
     // ---- shared ----
     XMFLOAT3 m_center{};

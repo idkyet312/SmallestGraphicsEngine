@@ -1195,7 +1195,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
             // Deeper and less transparent than the pool: open water reads darker.
             shader.SetWaterMaterial(
-                XMFLOAT3(0.03f, 0.18f, 0.38f), 0.16f, 0.84f, true);
+                XMFLOAT3(0.02f, 0.15f, 0.31f), 0.095f, 0.82f, true,
+                g_ocean.GetTime());
             g_dx12.commandList->IASetVertexBuffers(0, 1, &ovbv);
             g_dx12.commandList->IASetIndexBuffer(&oibv);
             g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1225,7 +1226,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             shader.UseTransparent();
             shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);  // verts are world-space
             shader.SetWaterMaterial(
-                XMFLOAT3(0.06f, 0.30f, 0.55f), 0.11f, 0.66f, false);
+                XMFLOAT3(0.04f, 0.24f, 0.42f), 0.075f, 0.62f, false,
+                g_water.GetTime());
             g_dx12.commandList->IASetVertexBuffers(0, 1, &wvbv);
             g_dx12.commandList->IASetIndexBuffer(&wibv);
             g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1454,8 +1456,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             if (ArmsModel::WeaponFollowTransform(handFollow, S))
                 xf = weaponPlacement * handFollow * gunBase;
             shader.Use(scene.wireframeMode);
-            DrawMeshAt(GunModel::PlayerMesh(), shader, xf, view, proj, lightSpace,
-                       false, false, nullptr, {}, 0.52f);
+            DrawMeshAt(
+                GunModel::PlayerMesh(), shader, xf, view, proj, lightSpace);
             shader.Use(scene.wireframeMode);
 
             // The body hangs off the same base transform as the weapon, so it

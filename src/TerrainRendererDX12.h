@@ -279,12 +279,14 @@ public:
         float basin = 1.0f - bt * bt * (3.0f - 2.0f * bt);   // 1 at centre -> 0 past rim
         h -= poolDepth * basin;
 
-        // Island falloff -- must match terrain_ms.hlsl's TerrainHeight. Land is
-        // lifted above sea level (y = 0), then ramps down to a seabed past the
-        // shore, so the island is ringed by ocean.
+        // Island falloff -- must match terrain_ms.hlsl's TerrainHeight. Inland
+        // relief first flattens into a broad beach shelf. That shelf slopes
+        // gently through sea level, then curves down into the full-depth seabed.
         constexpr float landLift = 2.5f, seabed = -6.0f;
-        constexpr float shoreInner = 34.0f;
+        constexpr float beachStart = 28.0f, beachShelf = 35.0f;
+        constexpr float beachWaterline = 43.0f;
         constexpr float shoreOuter = 52.0f;
+        constexpr float beachHigh = 0.65f, beachLow = -0.25f;
         // Per-axis island size: normalise the coordinate by each axis' scale so
         // the coastline stretches independently on X and Z (oval / strip). The
         // shore thresholds stay at their base radii in this normalised space.
@@ -315,11 +317,26 @@ public:
                 sqrtf((nx - 35.0f) * (nx - 35.0f) +
                       (nz + 55.0f) * (nz + 55.0f)), 26.0f) * 11.0f;
         }
-        float st = (coastDistance - shoreInner) / (shoreOuter - shoreInner);
-        st = st < 0.0f ? 0.0f : (st > 1.0f ? 1.0f : st);
-        float shore = st * st * (3.0f - 2.0f * st);          // smoothstep
         float land = h + landLift;
-        h = land + (seabed - land) * shore;                  // lerp(land, seabed, shore)
+        float beachFlattenT =
+            (coastDistance - beachStart) / (beachShelf - beachStart);
+        beachFlattenT = beachFlattenT < 0.0f ? 0.0f :
+            (beachFlattenT > 1.0f ? 1.0f : beachFlattenT);
+        const float beachBlend = beachFlattenT * beachFlattenT *
+            (3.0f - 2.0f * beachFlattenT);
+        float st = (coastDistance - beachShelf) /
+                   (beachWaterline - beachShelf);
+        st = st < 0.0f ? 0.0f : (st > 1.0f ? 1.0f : st);
+        const float beachT = st * st * (3.0f - 2.0f * st);
+        const float beachHeight =
+            beachHigh + (beachLow - beachHigh) * beachT;
+        h = land + (beachHeight - land) * beachBlend;
+
+        float ut = (coastDistance - beachWaterline) /
+                   (shoreOuter - beachWaterline);
+        ut = ut < 0.0f ? 0.0f : (ut > 1.0f ? 1.0f : ut);
+        const float underwater = ut * ut * (3.0f - 2.0f * ut);
+        h = h + (seabed - h) * underwater;
 
         // Flat arenas under each house compound, applied LAST so neither noise nor
         // the pool rim can dent them. Must match terrain_ms.hlsl's TerrainHeight;
@@ -666,9 +683,10 @@ public:
               "Grass004_2K-JPG_AmbientOcclusion.jpg" },
             { "terrain/dirt_floor", "dirt_floor_diff_1k.png",
               "dirt_floor_nor_gl_1k.png", "dirt_floor_rough_1k.png", nullptr },
-            { "terrain/coast_sand_01", "coast_sand_01_diff_1k.png",
-              "coast_sand_01_nor_gl_1k.png",
-              "coast_sand_01_rough_1k.png", nullptr },
+            { "terrain/aerial_beach_01", "aerial_beach_01_diff_1k.png",
+              "aerial_beach_01_nor_gl_1k.png",
+              "aerial_beach_01_rough_1k.png",
+              "aerial_beach_01_ao_1k.png" },
             { "terrain/dark_rock", "dark_rock_diff_1k.png",
               "dark_rock_nor_gl_1k.png", "dark_rock_rough_1k.png", nullptr }
         };

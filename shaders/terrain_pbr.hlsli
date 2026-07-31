@@ -23,9 +23,14 @@ float4 TerrainLayerWeights(float3 worldPos, float3 geometricNormal) {
     const float noisyHeight = worldPos.y + (noise - 0.5) * 1.5;
 
     float rock = smoothstep(0.30, 0.68, slope + (noise - 0.5) * 0.12);
-    float sand = (1.0 - smoothstep(0.65, 2.35, noisyHeight)) *
-                 (1.0 - smoothstep(0.20, 0.52, slope));
     const float flat = 1.0 - smoothstep(0.18, 0.52, slope);
+    // The low beach shelf is a complete sand material. World height guarantees
+    // a solid coastal band; noisy height only breaks up its inland transition.
+    const float beachCore =
+        (1.0 - smoothstep(0.80, 1.20, worldPos.y)) * flat;
+    const float beachTransition =
+        (1.0 - smoothstep(0.75, 2.25, noisyHeight)) * flat;
+    float sand = max(beachCore, beachTransition);
     // Most playable island ground, including 2.5 m house pads, is grass.
     // Dirt is a broken-up secondary patch layer instead of a height band that
     // previously swallowed the downloaded grass texture across the whole level.
@@ -47,7 +52,7 @@ float4 TerrainLayerWeights(float3 worldPos, float3 geometricNormal) {
     }
 
     sand *= 1.0 - rock;
-    dirt *= (1.0 - rock) * (1.0 - sand * 0.75);
+    dirt *= (1.0 - rock) * (1.0 - sand);
     grass *= (1.0 - rock) * (1.0 - sand);
     float4 weights = float4(grass, dirt, sand, rock);
     weights += 0.0001;
@@ -108,7 +113,7 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     const float4 layerWeights = TerrainLayerWeights(worldPos, geometricNormal);
     // Grass004 uses one third of the original UV tiling, making each visible
     // texture tile three times larger. Other layers retain scan dimensions.
-    const float scales[4] = { 0.16667, 0.4831, 0.06667, 0.4130 };
+    const float scales[4] = { 0.16667, 0.4831, 0.03333, 0.4130 };
     // Preserve fine leafy-grass relief. Other broad terrain layers stay softer
     // to avoid noisy distant slopes.
     const float normalStrengths[4] = { 1.15, 0.72, 0.55, 0.92 };
@@ -150,7 +155,7 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     // Damp sand around the waterline. Darker, smoother wet sand gives the coast
     // a readable transition before the ocean/foam pass.
     const float wetSand = layerWeights.z *
-        (1.0 - smoothstep(0.55, 1.55, worldPos.y));
+        (1.0 - smoothstep(0.05, 0.45, worldPos.y));
     result.albedo *= lerp(1.0, 0.68, wetSand);
     // Invalid/unbound SRVs return zero. Keep terrain readable and make binding
     // faults obvious as flat material colors instead of an all-black island.

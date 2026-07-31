@@ -7768,6 +7768,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // Ocean swell is low-frequency. 64 cells preserve it while
                 // cutting the old 98,304-index draw and CPU writes by 75%.
                 g_ocean.SetGridResolution(64);
+                g_ocean.SetOceanProfile();
                 // The grid costs 4k CPU sine evals per write; the swell
                 // reads the same at half rate. The pool stays at full rate for
                 // its splash ripples.

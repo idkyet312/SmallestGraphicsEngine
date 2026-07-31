@@ -106,10 +106,14 @@ static const float  kPoolDepth  = 3.0;   // how far the floor drops below ground
 // lifted above it and the seabed dropped below it. The terrain grid spans +-128 m,
 // so the shore ramp must finish comfortably inside that or the mesh edge shows.
 // Must match TerrainRendererDX12::HeightAt.
-static const float kLandLift   =  2.5;   // how far the island sits above sea level
-static const float kSeabed     = -6.0;   // sea floor depth past the shore
-static const float kShoreInner = 34.0;   // Level 1 solid-land radius
-static const float kShoreOuter = 52.0;   // Level 1 outer-shore radius
+static const float kLandLift      =  2.5; // how far the island sits above sea level
+static const float kSeabed        = -6.0; // sea floor depth past the shore
+static const float kBeachStart    = 28.0; // terrain relief starts flattening
+static const float kBeachShelf    = 35.0; // broad, nearly flat sand begins
+static const float kBeachWaterline = 43.0; // beach finishes just below sea level
+static const float kShoreOuter    = 52.0; // full seabed reached inside mesh edge
+static const float kBeachHigh     =  0.65;
+static const float kBeachLow      = -0.25;
 
 // Flat arena under the four houses arranged around world centre. Applied after
 // everything else and faded out before the relocated pool basin.
@@ -136,11 +140,11 @@ float TerrainHeight(float2 xz) {
     float basin = 1.0 - smoothstep(kPoolRadius, kPoolRim, d);
     h -= kPoolDepth * basin;
 
-    // Island falloff: the ground is lifted well above the waterline out to
-    // kShoreInner, then ramps down past kShoreOuter to a seabed below sea level,
-    // so the land ends in a beach and the ocean takes over. The ramp finishes
-    // inside the terrain grid's own edge, so the mesh boundary is never visible
-    // above water. Must match TerrainRendererDX12::HeightAt.
+    // Island falloff: first remove inland relief into a broad, low beach shelf.
+    // The shelf slopes gently through sea level, then a second smooth curve
+    // carries the shallow seabed down to full depth. Splitting the old single
+    // ramp keeps the beach flat instead of turning the whole coast into a bank.
+    // Must match TerrainRendererDX12::HeightAt.
     // Per-axis island size: normalise the coordinate by each axis' scale so the
     // coastline stretches independently on X and Z. Shore thresholds stay at
     // their base radii in this normalised space. Must match HeightAt.
@@ -159,8 +163,15 @@ float TerrainHeight(float2 xz) {
         coastDistance += northwestBay * 13.0;
         coastDistance -= southeastHeadland * 11.0;
     }
-    float shore = smoothstep(kShoreInner, kShoreOuter, coastDistance);
-    h = lerp(h + kLandLift, kSeabed, shore);
+    float land = h + kLandLift;
+    float beachBlend = smoothstep(kBeachStart, kBeachShelf, coastDistance);
+    float beachT = smoothstep(kBeachShelf, kBeachWaterline, coastDistance);
+    float beachHeight = lerp(kBeachHigh, kBeachLow, beachT);
+    h = lerp(land, beachHeight, beachBlend);
+
+    float underwater = smoothstep(
+        kBeachWaterline, kShoreOuter, coastDistance);
+    h = lerp(h, kSeabed, underwater);
 
     // Building pad, applied LAST so nothing else can dent it. The pool rim was
     // biting into the house footprint and dropping one corner ~2 m; forcing the
