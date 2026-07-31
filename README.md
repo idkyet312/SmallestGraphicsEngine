@@ -86,7 +86,8 @@ vcpkg install `
   tinygltf:x64-windows
 ```
 
-Box2D is fetched by CMake. NVIDIA Blast source is vendored under `thirdparty/blast/`.
+Box2D and the cooker-only ufbx fallback are fetched by CMake. NVIDIA Blast
+source is vendored under `thirdparty/blast/`.
 
 ## Build and run
 
@@ -127,6 +128,8 @@ and bounds, BC3/BC5 mip chains, and quantized animation tracks. Runtime maps and
 validates these blobs, uploads GPU-ready sections, and falls back to source
 import only when a cooked asset is missing or stale. Generated cooked content
 is ignored by Git and should be produced by build/package automation.
+Legacy pre-2011 FBX files unsupported by Assimp are cooked as static geometry
+through ufbx.
 
 ### Legacy DirectX 11 build
 

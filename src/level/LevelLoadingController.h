@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iostream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -56,6 +57,13 @@ public:
     void Advance(LevelLoadStage next, std::string label, std::string asset,
                  bool succeeded = true, Clock::time_point now = Clock::now()) {
         RecordCurrent(succeeded, now);
+        // Every stage transition funnels through here, so this one line gives a
+        // complete load trace. Without it a stall mid-stage is invisible: the
+        // last thing logged is whatever the previous stage happened to print.
+        std::cout << "[LevelLoad] stage " << static_cast<int>(stage_)
+                  << " -> " << static_cast<int>(next) << "  " << label
+                  << "  (" << asset << ")"
+                  << (succeeded ? "" : "  [PREV STAGE FAILED]") << std::endl;
         stage_ = next;
         ++taskIndex_;
         progress_ = (std::min)(0.95f,

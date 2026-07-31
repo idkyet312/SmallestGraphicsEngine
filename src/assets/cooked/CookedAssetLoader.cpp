@@ -6,9 +6,11 @@
 #include <Windows.h>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <vector>
 
@@ -193,6 +195,16 @@ ComPtr<ID3D12Resource> CreateTexture(
                 sourceRowBytes);
     }
     upload->Unmap(0, nullptr);
+    // Park the upload heap in the caller's keep-alive list BEFORE the validity
+    // bailout. Bailing out here used to return with `upload` still local, so the
+    // ComPtr released the heap immediately -- while CopyTextureRegion commands
+    // already recorded into this same still-in-flight command list continued to
+    // reference it. The GPU then read freed memory and the driver reset
+    // (DEVICE_HUNG; DRED page fault on a recently freed allocation).
+    //
+    // Retaining it costs one staging buffer until the normal post-load release,
+    // which is exactly what the success path already does.
+    uploads.push_back(upload);
     if (!valid) return {};
 
     for (uint32_t mip = 0; mip < source.mipCount; ++mip) {
@@ -215,7 +227,7 @@ ComPtr<ID3D12Resource> CreateTexture(
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     commandList->ResourceBarrier(1, &barrier);
-    uploads.push_back(std::move(upload));
+    // `upload` was already added to `uploads` above, before the validity check.
     return texture;
 }
 
@@ -272,9 +284,54 @@ fs::path CookedAssetLoader::FindForSource(const fs::path& source) {
     return {};
 }
 
+// Bisect helper for the cooked-asset GPU hang.
+//
+//   SGE_NO_COOKED=1           -> no cooked assets at all
+//   SGE_COOKED_ONLY=ak47,SVD  -> cooked ONLY for sources matching a substring,
+//                                everything else falls back to the raw import
+//
+// Matching is case-insensitive on the full source path, so "ak47", "Models/RPG7"
+// and "shotgun" all work. Unset means normal behaviour (cooked for everything).
+static bool CookedEnabledFor(const fs::path& source) {
+    if (const char* disable = std::getenv("SGE_NO_COOKED");
+        disable && disable[0] == '1')
+        return false;
+
+    const char* only = std::getenv("SGE_COOKED_ONLY");
+    if (!only || !only[0]) return true;
+
+    std::string haystack = source.generic_string();
+    std::transform(haystack.begin(), haystack.end(), haystack.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+
+    std::string list(only);
+    std::transform(list.begin(), list.end(), list.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+
+    for (size_t start = 0; start <= list.size();) {
+        const size_t comma = list.find(',', start);
+        const size_t end = comma == std::string::npos ? list.size() : comma;
+        const std::string token = list.substr(start, end - start);
+        if (!token.empty() && haystack.find(token) != std::string::npos)
+            return true;
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return false;
+}
+
 std::shared_ptr<SceneNode> CookedAssetLoader::LoadForSource(
     const fs::path& source, ComPtr<ID3D12Device> device,
     ComPtr<ID3D12GraphicsCommandList> commandList, std::string* error) {
+    // Escape hatch: SGE_NO_COOKED=1 makes every caller fall back to importing
+    // the original FBX/GLB, which is how assets loaded before the cooked
+    // pipeline landed. Returning empty here is exactly the "no cooked asset"
+    // path each caller already handles, so no call site needs to change.
+    if (!CookedEnabledFor(source)) {
+        if (error) *error = "cooked assets disabled for this source";
+        return {};
+    }
+
     const fs::path cooked = FindForSource(source);
     if (cooked.empty()) return {};
     if (fs::exists(source)) {
@@ -474,6 +531,13 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
 bool CookedAssetLoader::LoadAnimationsForSource(
     const fs::path& sourcePath, const Skeleton& skeleton,
     std::vector<AnimationClip>& clips, std::string* error) {
+    // Same kill switch as LoadForSource, so SGE_NO_COOKED=1 gives a fully
+    // uncooked run rather than cooked animations on uncooked meshes.
+    if (!CookedEnabledFor(sourcePath)) {
+        if (error) *error = "cooked assets disabled for this source";
+        return false;
+    }
+
     const fs::path cookedPath = FindForSource(sourcePath);
     if (cookedPath.empty()) return false;
     if (fs::exists(sourcePath)) {

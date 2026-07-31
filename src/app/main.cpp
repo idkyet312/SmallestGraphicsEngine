@@ -6289,6 +6289,101 @@ static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* info) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// ?? boot loading screen ????????????????????????????????????????????????????
+//
+// Startup does ~30 blocking init steps (shader compiles, HDRI prefilter, DXR
+// BLAS builds) between CreateWindow and the message loop. Without this the
+// window stays blank and "Not Responding" for the whole time. BootStep()
+// presents one ImGui frame per step so the user sees progress, and pumps the
+// message queue so Windows keeps considering the window alive.
+namespace {
+
+struct BootProgress {
+    bool         active = false;
+    HWND         hwnd = nullptr;
+    uint32_t     stepIndex = 0;
+    uint32_t     stepCount = 1;
+    std::string  label;
+    std::chrono::steady_clock::time_point startedAt{};
+};
+
+BootProgress g_boot;
+
+void RenderBootScreen() {
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::GetBackgroundDrawList()->AddRectFilled(
+        ImVec2(0, 0), display, IM_COL32(4, 8, 12, 255));
+
+    const float width = 620.0f;
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+        ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(width, 190.0f), ImGuiCond_Always);
+    ImGui::Begin("Booting", nullptr,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings);
+
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    const char* title = "GRAPHICS ENGINE";
+    ImGui::SetCursorPosX((width - ImGui::CalcTextSize(title).x) * 0.5f);
+    ImGui::TextUnformatted(title);
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
+
+    const float progress = (std::min)(1.0f,
+        static_cast<float>(g_boot.stepIndex) /
+        static_cast<float>((std::max)(1u, g_boot.stepCount)));
+    char progressText[64];
+    std::snprintf(progressText, sizeof(progressText), "%u / %u  (%.0f%%)",
+        g_boot.stepIndex, g_boot.stepCount, progress * 100.0f);
+    ImGui::ProgressBar(progress, ImVec2(-1.0f, 26.0f), progressText);
+
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    ImGui::Text("%s", g_boot.label.c_str());
+
+    const double elapsedMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - g_boot.startedAt).count();
+    ImGui::TextDisabled("Elapsed: %.1f s", elapsedMs / 1000.0);
+
+    ImGui::End();
+}
+
+// Draws one boot frame with `label` as the current step. Safe to call before
+// the scene exists: it only clears the backbuffer and renders ImGui.
+void BootStep(const char* label) {
+    if (!g_boot.active) return;
+
+    g_boot.label = label ? label : "";
+    std::cout << "[Boot] " << g_boot.label << std::endl;
+
+    // Keep the window responsive. Boot init is single-threaded, so this is the
+    // only chance Windows gets to see the message queue drained.
+    MSG msg;
+    while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    BeginFrame();
+    const float clearColor[4] = { 0.016f, 0.031f, 0.047f, 1.0f };
+    ClearRenderTarget(clearColor);
+
+    ID3D12DescriptorHeap* heaps[] = { imguiSrvHeap.Get() };
+    g_dx12.commandList->SetDescriptorHeaps(1, heaps);
+
+    ImGui_ImplDX12_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+    RenderBootScreen();
+    ImGui::Render();
+    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_dx12.commandList.Get());
+
+    EndFrame();
+
+    ++g_boot.stepIndex;
+}
+
+} // namespace
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     SetUnhandledExceptionFilter(WriteCrashDump);
     AllocConsole();
@@ -6394,12 +6489,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         imguiSrvHeap->GetCPUDescriptorHandleForHeapStart(),
         imguiSrvHeap->GetGPUDescriptorHandleForHeapStart());
 
+    // ImGui is live now, so the remaining init can draw progress. stepCount is
+    // the number of BootStep() calls below; it only affects the bar's scale.
+    g_boot.active = true;
+    g_boot.hwnd = hwnd;
+    g_boot.stepCount = 21;
+    g_boot.startedAt = std::chrono::steady_clock::now();
+
     // Geometry
+    BootStep("Building geometry...");
     if (!CreateAllGeometry()) { std::cerr << "Geometry creation failed\n"; return -1; }
 
     // Shaders - the DX12-specific pair supports albedo/normal/metal-roughness texture
     // sampling (needed for imported GLB materials); the plain "clustered_*" pair is
     // color-only and silently ignores textures, so it's only a fallback.
+    BootStep("Compiling shaders...");
     if (!mainShader.Load("shaders/clustered_dx12_vs.hlsl", "shaders/clustered_dx12_ps.hlsl")) {
         std::cerr << "Trying fallback shaders...\n";
         if (!mainShader.Load("shaders/clustered_vs.hlsl", "shaders/clustered_ps.hlsl")) {
@@ -6409,12 +6513,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
     std::cout << "Shaders loaded\n";
 
+    BootStep("Initializing mesh shader pipeline...");
     g_useMeshShader = g_meshShader.Init(mainShader);
     std::cout << (g_useMeshShader
         ? "Mesh shader path enabled\n"
         : "Mesh shader path unavailable; using raster fallback\n");
 
     bool terrainReady = false;
+    BootStep("Loading terrain textures...");
     if (g_useMeshShader) {
         // Terrain initialization uploads its PBR texture arrays. InitDX12 leaves
         // the command list closed, so record and submit those copies explicitly;
@@ -6444,6 +6550,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     };
 
     // Mip generator (compute shader) for imported GLB textures
+    BootStep("Initializing mip generator...");
     if (!g_mipGen.Init()) {
         std::cerr << "Mip generator init failed (non-fatal, textures will have no mips)\n";
     }
@@ -6453,6 +6560,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // upload, so the list must be open while it runs and its work must be flushed
     // (executed + waited) before the list is closed again - otherwise the copy
     // never reaches the GPU and the sky texture stays black.
+    BootStep("Loading HDRI sky and prefiltering IBL...");
     ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
     ThrowIfFailed(g_dx12.commandList->Reset(g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
     if (!skyRenderer.Init()) {
@@ -6477,6 +6585,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     WaitForGPU();
     g_mipGen.FlushPending();
     DumpDX12DebugMessages();
+    BootStep("Computing sky irradiance...");
     {
         auto skySH = GLBImporter::ComputeSkyIrradianceSH(
             kSkyEnvironmentPath, kSkyEnvironmentRotationRadians);
@@ -6498,28 +6607,35 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             std::cerr << "HDRI sun extraction failed; using scene fallback light\n";
         }
     }
+    BootStep("Initializing occlusion depth...");
     if (!occlusionDepth.Init(SCR_WIDTH, SCR_HEIGHT)) {
         std::cerr << "Meshlet occlusion depth init failed (non-fatal)\n";
     }
+    BootStep("Initializing FXAA...");
     if (!fxaa.Init(SCR_WIDTH, SCR_HEIGHT)) {
         std::cerr << "FXAA init failed (non-fatal)\n";
         scene.enableFXAA = false;
     }
+    BootStep("Initializing volumetric fog...");
     if (!volumetricFog.Init()) {
         std::cerr << "Volumetric fog init failed (non-fatal)\n";
         scene.enableVolumetricFog = false;
     }
+    BootStep("Initializing ambient occlusion...");
     if (!screenSpaceAO.Init()) {
         std::cerr << "Screen-space AO init failed (non-fatal)\n";
         scene.enableAmbientOcclusion = false;
     }
+    BootStep("Initializing screen-space reflections...");
     if (!screenSpaceReflections.Init()) {
         std::cerr << "Screen-space reflections init failed (non-fatal)\n";
         scene.enableScreenSpaceReflections = false;
     }
+    BootStep("Initializing water renderer...");
     if (!waterRenderer.Init(SCR_WIDTH, SCR_HEIGHT)) {
         std::cerr << "Tropical water renderer init failed (non-fatal)\n";
     }
+    BootStep("Initializing MSAA...");
     const bool msaaPipelinesReady =
         mainShader.msaaSupported &&
         (!g_useMeshShader || g_meshShader.msaaSupported) &&
@@ -6533,6 +6649,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // Visibility buffer (id Tech path)
     // Init uploads the 3D colour LUT. Record and submit that work now; the
     // command list has been closed since the sky upload above.
+    BootStep("Initializing visibility buffer...");
     ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
     ThrowIfFailed(g_dx12.commandList->Reset(
         g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
@@ -6553,6 +6670,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cout << "Visibility Buffer ready\n";
     }
 
+    BootStep("Initializing grass MSAA...");
     if (!visibilityBufferReady || !mainShader.GetHDRMSAAGrassPipelineState() ||
         !grassMSAA.Init(SCR_WIDTH, SCR_HEIGHT)) {
         std::cerr << "Visibility grass 4x MSAA unavailable (non-fatal)\n";
@@ -6561,11 +6679,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cout << "Visibility grass 4x MSAA ready\n";
     }
 
+    BootStep("Initializing shadow maps...");
     if (!shadowMap.Init()) {
         std::cerr << "Shadow map init failed (non-fatal)\n";
         scene.enableShadows = false;
     }
 
+    BootStep("Initializing DDGI probes...");
     if (!g_ddgiRenderer.init(g_dx12.device.Get())) {
         std::cerr << "DDGI init failed (non-fatal)\n";
         scene.useDDGI = false;
@@ -6581,6 +6701,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
 
     // Raytracing (DXR path)
+    BootStep("Building raytracing acceleration structures...");
     g_dxrDDGI.Initialize(g_dx12.device.Get());
     if (!InitRaytracing(geo)) {
         std::cerr << "DXR init failed (non-fatal)\n";
@@ -6590,7 +6711,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
 
     // Scene lights
+    BootStep("Initializing scene lights...");
     scene.InitLights();
+
+    // Last boot frame, so the bar reaches 100% instead of stopping short.
+    BootStep("Ready");
+    g_boot.active = false;
 
     // Timer
     gameTimer.Start();
@@ -6630,7 +6756,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             GetEnvironmentVariableA("SGE_VISIBILITY_TEST_FULL", nullptr, 0) == 0;
         const bool stressVisibilityTest =
             GetEnvironmentVariableA("SGE_VISIBILITY_TEST_STRESS", nullptr, 0) > 0;
-        StartLevelOne(hwnd, true, stressVisibilityTest, emptyVisibilityTest);
+        // SGE_VISIBILITY_TEST_GODMODE=1 reproduces the "LEVEL 1 - GOD MODE"
+        // menu button, which starts with the full debug UI and mobile pad
+        // visible. That extra per-frame UI work is not exercised by the plain
+        // smoke-test path, so a fault that only appears there is otherwise
+        // invisible to automated runs.
+        const bool godModeUI =
+            GetEnvironmentVariableA("SGE_VISIBILITY_TEST_GODMODE", nullptr, 0) > 0;
+        StartLevelOne(hwnd, true, stressVisibilityTest, emptyVisibilityTest,
+                      nullptr, godModeUI);
         if (GetEnvironmentVariableA("SGE_PREFAB_SMOKE_TEST", nullptr, 0) > 0) {
             g_prefabRuntimeSmokeEnabled = true;
             LevelEntity rock;
@@ -8000,15 +8134,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // immediately instead of silently corrupting later frames.
             // Earlier stages were submitted as ordinary loading-screen frames.
             // Drain them before mip generation and staging-resource release.
-            WaitForGPU();
+            WaitForGPUAllFrames();
             g_mipGen.FlushPending();
             // Mip handoff is submitted by FlushPending. Wait once, then free
             // texture staging resources retained by imported scene materials.
-            WaitForGPU();
+            WaitForGPUAllFrames();
             AdvanceLevelLoading(LevelLoadStage::ReleaseUploads,
                 "Release staging heaps and validate DX12 device",
                 "material upload heaps");
         } else if (g_game.loading.Stage() == LevelLoadStage::ReleaseUploads) {
+            // The WaitForGPU in GPUFinalize drained the frame *before* this one,
+            // but each load stage runs in its own frame: a whole loading-screen
+            // frame was begun, submitted and presented in between, and its
+            // command list can still carry texture CopyTextureRegion work that
+            // reads these staging heaps. Freeing them while that copy is in
+            // flight page-faults the GPU (DEVICE_HUNG, DRED page fault on a
+            // recently freed allocation). Drain again so nothing references them.
+            //
+            // Must drain ALL frame slots: WaitForGPU() only proves the current
+            // slot is idle, and the loading-screen frame carrying those copies
+            // may have been submitted from the other slot.
+            WaitForGPUAllFrames();
             ReleaseMaterialUploadHeaps(g_helicopterModel);
             ReleaseMaterialUploadHeaps(g_humveeModel);
             ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
@@ -8402,10 +8548,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             std::cerr << "EndFrame: " << e.what()
                       << " deviceRemovedReason=0x" << std::hex
                       << static_cast<unsigned long>(removedReason) << std::dec << "\n";
-            std::ofstream("engine_runtime_error.log", std::ios::app)
-                << "EndFrame: " << e.what() << " deviceRemovedReason=0x"
-                << std::hex << static_cast<unsigned long>(removedReason)
-                << std::dec << '\n';
+            {
+                std::ofstream crashLog("engine_runtime_error.log", std::ios::app);
+                crashLog << "EndFrame: " << e.what() << " deviceRemovedReason=0x"
+                         << std::hex << static_cast<unsigned long>(removedReason)
+                         << std::dec << '\n';
+                // DEVICE_REMOVED/DEVICE_HUNG says only that the GPU stopped.
+                // The breadcrumbs name the op it stopped on.
+                if (FAILED(removedReason)) {
+                    DumpDX12DeviceRemovedData(crashLog);
+                    DumpDX12DeviceRemovedData(std::cerr);
+                }
+            }
             DumpDX12DebugMessages();
             break;
         }

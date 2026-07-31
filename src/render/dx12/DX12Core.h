@@ -9,6 +9,7 @@
 #include <d3dcompiler.h>
 #include <DirectXMath.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <iostream>
 #include <fstream>
 #include <cstdlib>
@@ -98,6 +99,7 @@ struct DX12Context {
     bool initialized = false;
     bool tearingSupported = false;
     bool debugLayerEnabled = false;   // D3D12 validation active (env/_DEBUG)
+    bool dredEnabled = false;         // DRED breadcrumbs/page faults active
     
     // Descriptor heap allocation tracking
     UINT cbvSrvUavHeapOffset = 0;
@@ -143,6 +145,38 @@ inline void WaitForGPU() {
     }
     
     g_dx12.fenceValues[g_dx12.frameIndex]++;
+}
+
+// Drain EVERY frame slot, not just the current one.
+//
+// WaitForGPU() signals and waits on fenceValues[frameIndex] alone, so it only
+// proves the current slot is idle -- work submitted from the other FRAME_COUNT-1
+// slots can still be executing. That is fine for ordinary per-frame pacing, but
+// it is not enough before final-releasing a resource: a staging heap freed while
+// an older slot's CopyTextureRegion still reads it page-faults the GPU
+// (DEVICE_HUNG / "referenced by GPU operations in-flight" corruption).
+//
+// Signal one value above the highest across all slots and wait for it. Because
+// the queue executes in submission order, that value retiring means every
+// previously submitted command list on this queue has completed.
+inline void WaitForGPUAllFrames() {
+    if (!g_dx12.commandQueue || !g_dx12.fence) return;
+
+    UINT64 target = 0;
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+        target = (std::max)(target, g_dx12.fenceValues[i]);
+    ++target;
+
+    ThrowIfFailed(g_dx12.commandQueue->Signal(g_dx12.fence.Get(), target));
+    if (g_dx12.fence->GetCompletedValue() < target) {
+        ThrowIfFailed(g_dx12.fence->SetEventOnCompletion(target, g_dx12.fenceEvent));
+        WaitForSingleObjectEx(g_dx12.fenceEvent, INFINITE, FALSE);
+    }
+
+    // Keep every slot at/above the drained value so later per-frame waits and
+    // MoveToNextFrame() never signal a value the fence has already passed.
+    for (UINT i = 0; i < FRAME_COUNT; ++i)
+        g_dx12.fenceValues[i] = target + 1;
 }
 
 inline void WaitForFenceCPU(ID3D12Fence* fence, UINT64 value) {
@@ -212,7 +246,36 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
         dxgiFactoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
     }
     g_dx12.debugLayerEnabled = enableD3D12Debug;
-    
+
+    // Device Removed Extended Data. A DEVICE_HUNG/DEVICE_REMOVED only tells us
+    // *that* the GPU stopped; the auto-breadcrumbs tell us which command-list
+    // operation was in flight, and the page-fault record tells us whether a
+    // resource was freed out from under in-flight work.
+    //
+    // Deliberately NOT gated on enableD3D12Debug: the debug layer slows loading
+    // enough to shift TDR timing and can mask the very race we are chasing.
+    // Must be set before D3D12CreateDevice to take effect.
+    {
+        // On by default. DRED's cost is negligible next to a crash that cannot
+        // be diagnosed: without it a device-removed report is just an HRESULT,
+        // with no indication of which GPU operation died. Set
+        // SGE_D3D12_DRED=0 to opt out.
+        char dredValue[8] = {};
+        size_t dredLen = 0;
+        bool enableDRED = true;
+        if (getenv_s(&dredLen, dredValue, sizeof(dredValue), "SGE_D3D12_DRED") == 0 &&
+            dredLen > 0 && dredValue[0] == '0')
+            enableDRED = false;
+
+        ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dredSettings;
+        if (enableDRED &&
+            SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings)))) {
+            dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            g_dx12.dredEnabled = true;
+        }
+    }
+
     // Create DXGI Factory
     ThrowIfFailed(CreateDXGIFactory2(dxgiFactoryFlags, IID_PPV_ARGS(&g_dx12.factory)));
     
@@ -232,13 +295,28 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
         adapter1->GetDesc1(&desc);
         
         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-        
+
+        // Virtual display adapters (Parsec, Sunshine, IDD mirror drivers) are
+        // not flagged SOFTWARE, so the loop above happily picks one when it
+        // enumerates first. They have no real 3D engine, and a heavy load-time
+        // submission on one hangs the display driver (nvlddmkm event 153 /
+        // LiveKernelEvent 141) instead of rendering. Skip anything with no
+        // dedicated video memory -- a real discrete GPU always reports some.
+        if (desc.DedicatedVideoMemory == 0) {
+            std::wcerr << L"Skipping adapter with no dedicated VRAM: "
+                       << desc.Description << L"\n";
+            continue;
+        }
+
         if (SUCCEEDED(D3D12CreateDevice(adapter1.Get(), D3D_FEATURE_LEVEL_12_0, _uuidof(ID3D12Device), nullptr))) {
             adapter1.As(&g_dx12.adapter);
+            std::wcerr << L"Selected GPU adapter: " << desc.Description
+                       << L" (" << (desc.DedicatedVideoMemory >> 20)
+                       << L" MB VRAM)\n";
             break;
         }
     }
-    
+
     if (!g_dx12.adapter) {
         std::cerr << "No DX12 compatible adapter found" << std::endl;
         return false;
@@ -430,6 +508,22 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
     
     g_dx12.initialized = true;
     
+    // Report the chosen GPU here rather than at selection time: this runs after
+    // the log file is open, so it actually lands in logs/GraphicEngine.log.
+    // Which adapter won matters -- picking a virtual display adapter over the
+    // real GPU is the difference between rendering and a driver TDR.
+    {
+        DXGI_ADAPTER_DESC1 chosen = {};
+        if (g_dx12.adapter && SUCCEEDED(g_dx12.adapter->GetDesc1(&chosen))) {
+            char name[128] = {};
+            WideCharToMultiByte(CP_UTF8, 0, chosen.Description, -1,
+                                name, sizeof(name) - 1, nullptr, nullptr);
+            std::cout << "GPU adapter: " << name << " ("
+                      << (chosen.DedicatedVideoMemory >> 20) << " MB VRAM)"
+                      << std::endl;
+        }
+    }
+
     std::cout << "DirectX 12 initialized: direct + compute + copy queues" << std::endl;
     
     return true;
@@ -573,6 +667,91 @@ inline void DumpDX12DebugMessages() {
     }
     infoQueue->ClearStoredMessages();
 #endif
+}
+
+// Decode a DEVICE_REMOVED/DEVICE_HUNG into something actionable.
+//
+// GetDeviceRemovedReason() only gives the category. DRED adds the two things
+// that actually identify the culprit: the auto-breadcrumb trail (which GPU op
+// each command list reached before it stopped) and the page-fault record (which
+// virtual address was touched, and whether it belongs to a recently freed
+// allocation -- the signature of a resource released while still in flight).
+//
+// Unlike DumpDX12DebugMessages this is NOT _DEBUG-only: the hang reproduces in
+// Release, which is exactly where we need the trail.
+inline void DumpDX12DeviceRemovedData(std::ostream& out) {
+    if (!g_dx12.device) return;
+
+    ComPtr<ID3D12DeviceRemovedExtendedData1> dred;
+    if (FAILED(g_dx12.device.As(&dred))) {
+        out << "[DRED] unavailable (not enabled? set SGE_D3D12_DRED=1)\n";
+        return;
+    }
+
+    static const char* kOpNames[] = {
+        "SetMarker", "BeginEvent", "EndEvent", "DrawInstanced",
+        "DrawIndexedInstanced", "ExecuteIndirect", "Dispatch",
+        "CopyBufferRegion", "CopyTextureRegion", "CopyResource", "CopyTiles",
+        "ResolveSubresource", "ClearRenderTargetView",
+        "ClearUnorderedAccessView", "ClearDepthStencilView",
+        "ResourceBarrier", "ExecuteBundle", "Present", "ResolveQueryData",
+        "BeginSubmission", "EndSubmission", "DecodeFrame", "ProcessFrames",
+        "AtomicCopyBufferUint", "AtomicCopyBufferUint64", "ResolveSubresourceRegion",
+        "WriteBufferImmediate", "DecodeFrame1", "SetProtectedResourceSession",
+        "DecodeFrame2", "ProcessFrames1", "BuildRaytracingAccelerationStructure",
+        "EmitRaytracingAccelerationStructurePostbuildInfo",
+        "CopyRaytracingAccelerationStructure", "DispatchRays",
+        "InitializeMetaCommand", "ExecuteMetaCommand", "EstimateMotion",
+        "ResolveMotionVectorHeap", "SetPipelineState1",
+        "InitializeExtensionCommand", "ExecuteExtensionCommand", "DispatchMesh",
+        "EncodeFrame", "ResolveEncoderOutputMetadata",
+    };
+    auto opName = [](UINT op) -> const char* {
+        return op < _countof(kOpNames) ? kOpNames[op] : "Unknown";
+    };
+
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbs = {};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput1(&breadcrumbs))) {
+        out << "[DRED] --- auto-breadcrumbs ---\n";
+        for (const auto* node = breadcrumbs.pHeadAutoBreadcrumbNode;
+             node; node = node->pNext) {
+            const UINT executed =
+                node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+            // A node whose executed count equals its op count finished cleanly;
+            // the first node that stopped short is the hang site.
+            if (executed == node->BreadcrumbCount) continue;
+
+            out << "[DRED] cmdlist=\""
+                << (node->pCommandListDebugNameA ? node->pCommandListDebugNameA : "?")
+                << "\" queue=\""
+                << (node->pCommandQueueDebugNameA ? node->pCommandQueueDebugNameA : "?")
+                << "\" completed " << executed << " of "
+                << node->BreadcrumbCount << " ops\n";
+
+            // Print a window around the stall so the failing op has context.
+            const UINT first = executed > 4 ? executed - 4 : 0;
+            const UINT last = (std::min)(node->BreadcrumbCount, executed + 4);
+            for (UINT i = first; i < last; ++i) {
+                out << "[DRED]   " << (i == executed ? ">> " : "   ") << i
+                    << ' ' << opName(node->pCommandHistory[i]) << '\n';
+            }
+        }
+    }
+
+    D3D12_DRED_PAGE_FAULT_OUTPUT pageFault = {};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pageFault))) {
+        out << "[DRED] --- page fault VA = 0x" << std::hex
+            << pageFault.PageFaultVA << std::dec << " ---\n";
+        auto dumpAllocations = [&](const char* label,
+                                   const D3D12_DRED_ALLOCATION_NODE* head) {
+            for (const auto* n = head; n; n = n->pNext)
+                out << "[DRED]   " << label << ": "
+                    << (n->ObjectNameA ? n->ObjectNameA : "<unnamed>") << '\n';
+        };
+        dumpAllocations("existing", pageFault.pHeadExistingAllocationNode);
+        dumpAllocations("recently freed", pageFault.pHeadRecentFreedAllocationNode);
+    }
+    out.flush();
 }
 
 // End frame - present

@@ -335,14 +335,24 @@ private:
     }
 
     static void LoadSVD() {
-        // Source FBX is version 6100 (FBX SDK 9.4), older than Assimp supports.
-        // SVD.obj is the equivalent static mesh converted with ufbx.
-        const std::string path = Resolve("Content/Models/SVD_v1.3/Models/SVD.obj");
-        std::cout << "Loading SVD " << path << "...\n";
-        auto root = FBXImporter::Load(path, g_dx12.device, g_dx12.commandList,
-                                      1.0f, false, false);
+        // Prefer the cooked blob generated from the original FBX. Runtime
+        // Assimp cannot parse this old FBX 6100 file, so retain the ufbx-made
+        // OBJ as a source fallback when cooked content is absent or stale.
+        const std::string sourcePath =
+            Resolve("Content/Models/SVD_v1.3/Models/SVD.FBX");
+        std::cout << "Loading SVD " << sourcePath << "...\n";
+        auto root = FBXImporter::Load(sourcePath, g_dx12.device,
+                                      g_dx12.commandList, 1.0f, false, false);
         if (!root) {
-            std::cerr << "SVD FBX unavailable\n";
+            const std::string fallbackPath =
+                Resolve("Content/Models/SVD_v1.3/Models/SVD.obj");
+            std::cout << "SVD cooked asset unavailable; using "
+                      << fallbackPath << "\n";
+            root = FBXImporter::Load(fallbackPath, g_dx12.device,
+                                     g_dx12.commandList, 1.0f, false, false);
+        }
+        if (!root) {
+            std::cerr << "SVD model unavailable\n";
             return;
         }
 

@@ -9,11 +9,13 @@
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 #include <meshoptimizer.h>
+#include <ufbx.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cfloat>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -104,6 +106,10 @@ struct Image {
     int height = 0;
     std::vector<uint8_t> rgba;
 };
+
+std::string UfbxString(ufbx_string value) {
+    return value.data ? std::string(value.data, value.length) : std::string();
+}
 
 struct EncodedTexture {
     Cooked::Texture record;
@@ -307,20 +313,23 @@ bool LoadExternalImage(const fs::path& path, Image& image) {
     return true;
 }
 
+bool LoadImageMemory(const void* data, size_t size, Image& image) {
+    if (!data || !size || size > static_cast<size_t>(INT_MAX)) return false;
+    int channels = 0;
+    unsigned char* pixels = stbi_load_from_memory(
+        static_cast<const unsigned char*>(data), static_cast<int>(size),
+        &image.width, &image.height, &channels, 4);
+    if (!pixels) return false;
+    image.rgba.assign(pixels, pixels +
+        static_cast<size_t>(image.width) * image.height * 4);
+    stbi_image_free(pixels);
+    return true;
+}
+
 bool LoadEmbeddedImage(const aiTexture* texture, Image& image) {
     if (!texture) return false;
-    if (texture->mHeight == 0) {
-        int channels = 0;
-        unsigned char* pixels = stbi_load_from_memory(
-            reinterpret_cast<const unsigned char*>(texture->pcData),
-            static_cast<int>(texture->mWidth), &image.width, &image.height,
-            &channels, 4);
-        if (!pixels) return false;
-        image.rgba.assign(pixels, pixels +
-            static_cast<size_t>(image.width) * image.height * 4);
-        stbi_image_free(pixels);
-        return true;
-    }
+    if (texture->mHeight == 0)
+        return LoadImageMemory(texture->pcData, texture->mWidth, image);
     image.width = static_cast<int>(texture->mWidth);
     image.height = static_cast<int>(texture->mHeight);
     image.rgba.resize(static_cast<size_t>(image.width) * image.height * 4);
@@ -459,6 +468,29 @@ bool IsModel(const fs::path& path) {
            extension == ".gltf";
 }
 
+// Sources deliberately left uncooked.
+//
+// The cooked AK47 reproducibly hangs the GPU during its texture upload: the
+// driver resets (nvlddmkm event 153 / DXGI_ERROR_DEVICE_HUNG) with a DRED page
+// fault on a recently freed allocation inside CopyTextureRegion. Bisecting the
+// cooked set one asset at a time pinned it to this model alone -- MetalRoof,
+// shotgun, RPG7 and SVD all cook and load fine. Re-cooking reproduces the file
+// byte for byte, so the asset is not corrupt; the defect is in the cook/load
+// path for this texture set and is still open.
+//
+// Until that is fixed, skip it here and let the engine import the original FBX,
+// which is the pre-cooked-pipeline behaviour and works.
+// The first-person arms are excluded alongside the AK47: the arms are posed
+// against the weapon's own local space, so cooking one but not the other leaves
+// the hands floating off the gun. They must stay on the same import path.
+bool IsCookExcluded(const fs::path& path) {
+    std::string generic = path.generic_string();
+    std::transform(generic.begin(), generic.end(), generic.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return generic.find("models/ak47/") != std::string::npos ||
+           generic.find("models/mainplayer/") != std::string::npos;
+}
+
 struct CookContext {
     fs::path sourcePath;
     const aiScene* scene = nullptr;
@@ -498,6 +530,51 @@ struct CookContext {
         return index;
     }
 
+    uint32_t AddTexture(const ufbx_texture* source,
+                        Cooked::TextureFormat format) {
+        if (!source) return Cooked::kInvalidIndex;
+        std::string raw = UfbxString(source->relative_filename);
+        if (raw.empty()) raw = UfbxString(source->filename);
+        if (raw.empty()) raw = UfbxString(source->name);
+        std::replace(raw.begin(), raw.end(), '\\', '/');
+        const std::string key = raw + "#" +
+            std::to_string(static_cast<uint32_t>(format));
+        auto found = textureByKey.find(key);
+        if (found != textureByKey.end()) return found->second;
+
+        Image image;
+        if (source->content.size) {
+            if (!LoadImageMemory(source->content.data,
+                                 source->content.size, image))
+                return Cooked::kInvalidIndex;
+        } else {
+            const fs::path reference = fs::path(raw);
+            std::array<fs::path, 3> candidates = {
+                reference.is_absolute()
+                    ? reference : sourcePath.parent_path() / reference,
+                sourcePath.parent_path() / reference.filename(),
+                sourcePath.parent_path().parent_path() /
+                    "Textures" / reference.filename()
+            };
+            bool loaded = false;
+            for (const fs::path& candidate : candidates) {
+                if (LoadExternalImage(candidate.lexically_normal(), image)) {
+                    loaded = true;
+                    break;
+                }
+            }
+            if (!loaded) return Cooked::kInvalidIndex;
+        }
+
+        EncodedTexture texture = EncodeTexture(image, format);
+        texture.record.name = strings.Add(fs::path(raw).filename().string());
+        texture.record.source = strings.Add(raw);
+        const uint32_t index = static_cast<uint32_t>(textures.size());
+        textures.push_back(std::move(texture));
+        textureByKey.emplace(key, index);
+        return index;
+    }
+
     uint32_t MaterialTexture(aiMaterial* material,
                              std::initializer_list<aiTextureType> types,
                              Cooked::TextureFormat format) {
@@ -509,6 +586,8 @@ struct CookContext {
         return Cooked::kInvalidIndex;
     }
 };
+
+bool WriteAsset(CookContext& context, const fs::path& destination);
 
 void ExtractMaterials(CookContext& context) {
     context.materials.reserve(context.scene->mNumMaterials);
@@ -546,6 +625,55 @@ void ExtractMaterials(CookContext& context) {
               aiTextureType_UNKNOWN }, Cooked::TextureFormat::BC3);
         context.materials.push_back(material);
     }
+}
+
+void FinalizePrimitive(PrimitiveData& result,
+                       const std::vector<Cooked::Material>& materials) {
+    if (!result.indices.empty() && !result.vertices.empty()) {
+        std::vector<uint32_t> cacheOptimized(result.indices.size());
+        meshopt_optimizeVertexCache(cacheOptimized.data(), result.indices.data(),
+                                    result.indices.size(), result.vertices.size());
+        std::vector<uint32_t> overdrawOptimized(result.indices.size());
+        meshopt_optimizeOverdraw(overdrawOptimized.data(), cacheOptimized.data(),
+            cacheOptimized.size(), result.vertices[0].position,
+            result.vertices.size(), sizeof(Cooked::Vertex), 1.05f);
+        std::vector<Cooked::Vertex> fetchOptimized(result.vertices.size());
+        const size_t vertexCount = meshopt_optimizeVertexFetch(
+            fetchOptimized.data(), overdrawOptimized.data(),
+            overdrawOptimized.size(), result.vertices.data(),
+            result.vertices.size(), sizeof(Cooked::Vertex));
+        fetchOptimized.resize(vertexCount);
+        result.vertices = std::move(fetchOptimized);
+        result.indices = std::move(overdrawOptimized);
+    }
+    float minimum[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
+    float maximum[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    for (const auto& vertex : result.vertices) {
+        for (uint32_t c = 0; c < 3; ++c) {
+            minimum[c] = std::min(minimum[c], vertex.position[c]);
+            maximum[c] = std::max(maximum[c], vertex.position[c]);
+        }
+    }
+    if (result.vertices.empty()) {
+        std::fill(minimum, minimum + 3, 0.0f);
+        std::fill(maximum, maximum + 3, 0.0f);
+    }
+    std::copy(minimum, minimum + 3, result.record.boundsMin);
+    std::copy(maximum, maximum + 3, result.record.boundsMax);
+    const bool doubleSided = result.record.material < materials.size() &&
+        (materials[result.record.material].flags & Cooked::DoubleSided);
+    result.meshlets = BuildMeshlets(
+        result.vertices, result.indices, doubleSided);
+    result.record.vertexCount = static_cast<uint32_t>(result.vertices.size());
+    result.record.indexCount = static_cast<uint32_t>(result.indices.size());
+    result.record.indexElementSize =
+        result.vertices.size() <= 65535 ? 2u : 4u;
+    result.record.meshletCount =
+        static_cast<uint32_t>(result.meshlets.descriptors.size());
+    result.record.meshletVertexCount =
+        static_cast<uint32_t>(result.meshlets.vertices.size());
+    result.record.meshletTriangleCount =
+        static_cast<uint32_t>(result.meshlets.triangles.size());
 }
 
 PrimitiveData ExtractPrimitive(const aiMesh& mesh, Strings& strings,
@@ -586,48 +714,241 @@ PrimitiveData ExtractPrimitive(const aiMesh& mesh, Strings& strings,
         result.indices.insert(result.indices.end(),
             source.mIndices, source.mIndices + 3);
     }
-    if (!result.indices.empty() && !result.vertices.empty()) {
-        std::vector<uint32_t> cacheOptimized(result.indices.size());
-        meshopt_optimizeVertexCache(cacheOptimized.data(), result.indices.data(),
-                                    result.indices.size(), result.vertices.size());
-        std::vector<uint32_t> overdrawOptimized(result.indices.size());
-        meshopt_optimizeOverdraw(overdrawOptimized.data(), cacheOptimized.data(),
-            cacheOptimized.size(), result.vertices[0].position,
-            result.vertices.size(), sizeof(Cooked::Vertex), 1.05f);
-        std::vector<Cooked::Vertex> fetchOptimized(result.vertices.size());
-        const size_t vertexCount = meshopt_optimizeVertexFetch(
-            fetchOptimized.data(), overdrawOptimized.data(),
-            overdrawOptimized.size(), result.vertices.data(),
-            result.vertices.size(), sizeof(Cooked::Vertex));
-        fetchOptimized.resize(vertexCount);
-        result.vertices = std::move(fetchOptimized);
-        result.indices = std::move(overdrawOptimized);
+    FinalizePrimitive(result, materials);
+    return result;
+}
+
+const ufbx_texture* FileTexture(const ufbx_material_map& map) {
+    const ufbx_texture* texture = map.texture;
+    if (!texture) return nullptr;
+    if (texture->type == UFBX_TEXTURE_FILE) return texture;
+    return texture->file_textures.count ? texture->file_textures.data[0]
+                                        : nullptr;
+}
+
+void ExtractLegacyMaterials(CookContext& context, const ufbx_scene& scene) {
+    context.materials.reserve(std::max<size_t>(1, scene.materials.count));
+    for (const ufbx_material* source : scene.materials) {
+        Cooked::Material material;
+        material.name = context.strings.Add(UfbxString(source->name));
+
+        const ufbx_material_map& color = source->pbr.base_color.has_value
+            ? source->pbr.base_color : source->fbx.diffuse_color;
+        material.baseColor[0] = static_cast<float>(color.value_vec4.x);
+        material.baseColor[1] = static_cast<float>(color.value_vec4.y);
+        material.baseColor[2] = static_cast<float>(color.value_vec4.z);
+        material.baseColor[3] = color.value_components >= 4
+            ? static_cast<float>(color.value_vec4.w) : 1.0f;
+        if (!color.has_value) {
+            material.baseColor[0] = 1.0f;
+            material.baseColor[1] = 1.0f;
+            material.baseColor[2] = 1.0f;
+            material.baseColor[3] = 1.0f;
+        }
+        if (source->pbr.opacity.has_value) {
+            material.baseColor[3] *= static_cast<float>(
+                source->pbr.opacity.value_real);
+        } else if (source->fbx.transparency_factor.has_value) {
+            material.baseColor[3] *= 1.0f - static_cast<float>(
+                source->fbx.transparency_factor.value_real);
+        }
+        material.metallic = source->pbr.metalness.has_value
+            ? static_cast<float>(source->pbr.metalness.value_real) : 0.0f;
+        material.roughness = source->pbr.roughness.has_value
+            ? static_cast<float>(source->pbr.roughness.value_real) : 1.0f;
+        if (source->features.double_sided.enabled)
+            material.flags |= Cooked::DoubleSided;
+        if (material.baseColor[3] < 0.999f)
+            material.flags |= Cooked::AlphaCutout;
+
+        const ufbx_material_map& baseMap =
+            source->pbr.base_color.texture
+                ? source->pbr.base_color : source->fbx.diffuse_color;
+        const ufbx_material_map& normalMap =
+            source->pbr.normal_map.texture
+                ? source->pbr.normal_map
+                : (source->fbx.normal_map.texture
+                    ? source->fbx.normal_map : source->fbx.bump);
+        material.baseColorTexture = context.AddTexture(
+            FileTexture(baseMap), Cooked::TextureFormat::BC3);
+        material.normalTexture = context.AddTexture(
+            FileTexture(normalMap), Cooked::TextureFormat::BC5);
+        material.metallicRoughnessTexture = context.AddTexture(
+            FileTexture(source->pbr.roughness),
+            Cooked::TextureFormat::BC3);
+        context.materials.push_back(material);
     }
-    float minimum[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
-    float maximum[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
-    for (const auto& vertex : result.vertices) {
-        for (uint32_t c = 0; c < 3; ++c) {
-            minimum[c] = std::min(minimum[c], vertex.position[c]);
-            maximum[c] = std::max(maximum[c], vertex.position[c]);
+    if (context.materials.empty())
+        context.materials.emplace_back();
+}
+
+ufbx_vec3 Normalize(ufbx_vec3 value, ufbx_vec3 fallback) {
+    const double lengthSquared =
+        value.x * value.x + value.y * value.y + value.z * value.z;
+    if (lengthSquared <= 1e-20) return fallback;
+    const double inverseLength = 1.0 / std::sqrt(lengthSquared);
+    value.x *= inverseLength;
+    value.y *= inverseLength;
+    value.z *= inverseLength;
+    return value;
+}
+
+void DeduplicateVertices(PrimitiveData& primitive) {
+    if (primitive.vertices.empty() || primitive.indices.empty()) return;
+    std::vector<uint32_t> remap(primitive.vertices.size());
+    const size_t vertexCount = meshopt_generateVertexRemap(
+        remap.data(), primitive.indices.data(), primitive.indices.size(),
+        primitive.vertices.data(), primitive.vertices.size(),
+        sizeof(Cooked::Vertex));
+    std::vector<Cooked::Vertex> vertices(vertexCount);
+    std::vector<uint32_t> indices(primitive.indices.size());
+    meshopt_remapVertexBuffer(vertices.data(), primitive.vertices.data(),
+                              primitive.vertices.size(),
+                              sizeof(Cooked::Vertex), remap.data());
+    meshopt_remapIndexBuffer(indices.data(), primitive.indices.data(),
+                             primitive.indices.size(), remap.data());
+    primitive.vertices = std::move(vertices);
+    primitive.indices = std::move(indices);
+}
+
+void ExtractLegacyPrimitives(CookContext& context, const ufbx_scene& scene) {
+    std::unordered_map<const ufbx_material*, uint32_t> materialIndices;
+    for (size_t i = 0; i < scene.materials.count; ++i)
+        materialIndices.emplace(scene.materials.data[i],
+                                static_cast<uint32_t>(i));
+
+    for (const ufbx_node* node : scene.nodes) {
+        const ufbx_mesh* mesh = node->mesh;
+        if (!mesh || !node->visible || !mesh->num_faces) continue;
+
+        const size_t slotCount = std::max<size_t>(1, node->materials.count);
+        std::vector<PrimitiveData> slots(slotCount);
+        for (size_t slot = 0; slot < slotCount; ++slot) {
+            PrimitiveData& primitive = slots[slot];
+            std::string name = UfbxString(node->name);
+            if (slotCount > 1) name += "_" + std::to_string(slot);
+            primitive.record.name = context.strings.Add(name);
+            if (slot < node->materials.count) {
+                auto found = materialIndices.find(node->materials.data[slot]);
+                primitive.record.material = found != materialIndices.end()
+                    ? found->second : 0;
+            } else {
+                primitive.record.material = 0;
+            }
+        }
+
+        std::vector<uint32_t> triangles(
+            std::max<size_t>(3, mesh->max_face_triangles * 3));
+        const ufbx_matrix normalToWorld =
+            ufbx_matrix_for_normals(&node->geometry_to_world);
+        for (size_t faceIndex = 0; faceIndex < mesh->num_faces; ++faceIndex) {
+            size_t slot = mesh->face_material.count
+                ? mesh->face_material.data[faceIndex] : 0;
+            if (slot >= slots.size()) slot = 0;
+            PrimitiveData& primitive = slots[slot];
+            const size_t triangleCount = ufbx_triangulate_face(
+                triangles.data(), triangles.size(), mesh,
+                mesh->faces.data[faceIndex]);
+            for (size_t triangle = 0; triangle < triangleCount; ++triangle) {
+                // Match Assimp's FBX winding flip.
+                constexpr uint32_t order[3] = { 0, 2, 1 };
+                for (uint32_t corner = 0; corner < 3; ++corner) {
+                    const uint32_t index =
+                        triangles[triangle * 3 + order[corner]];
+                    ufbx_vec3 position = ufbx_get_vertex_vec3(
+                        &mesh->skinned_position, index);
+                    ufbx_vec3 normal = mesh->skinned_normal.exists
+                        ? ufbx_get_vertex_vec3(&mesh->skinned_normal, index)
+                        : ufbx_vec3{ 0.0, 1.0, 0.0 };
+                    ufbx_vec3 tangent = mesh->vertex_tangent.exists
+                        ? ufbx_get_vertex_vec3(&mesh->vertex_tangent, index)
+                        : ufbx_vec3{ 1.0, 0.0, 0.0 };
+                    ufbx_vec3 bitangent = mesh->vertex_bitangent.exists
+                        ? ufbx_get_vertex_vec3(&mesh->vertex_bitangent, index)
+                        : ufbx_vec3{ 0.0, 0.0, 1.0 };
+                    if (mesh->skinned_is_local) {
+                        position = ufbx_transform_position(
+                            &node->geometry_to_world, position);
+                        normal = ufbx_transform_direction(
+                            &normalToWorld, normal);
+                        tangent = ufbx_transform_direction(
+                            &normalToWorld, tangent);
+                        bitangent = ufbx_transform_direction(
+                            &normalToWorld, bitangent);
+                    }
+                    normal = Normalize(normal, ufbx_vec3{ 0.0, 1.0, 0.0 });
+                    tangent = Normalize(tangent, ufbx_vec3{ 1.0, 0.0, 0.0 });
+                    bitangent = Normalize(
+                        bitangent, ufbx_vec3{ 0.0, 0.0, 1.0 });
+                    const ufbx_vec2 uv = mesh->vertex_uv.exists
+                        ? ufbx_get_vertex_vec2(&mesh->vertex_uv, index)
+                        : ufbx_vec2{};
+
+                    Cooked::Vertex vertex = {};
+                    vertex.position[0] = static_cast<float>(position.x);
+                    vertex.position[1] = static_cast<float>(position.y);
+                    vertex.position[2] = static_cast<float>(position.z);
+                    vertex.normal[0] = static_cast<float>(normal.x);
+                    vertex.normal[1] = static_cast<float>(normal.y);
+                    vertex.normal[2] = static_cast<float>(normal.z);
+                    vertex.uv[0] = static_cast<float>(uv.x);
+                    vertex.uv[1] = static_cast<float>(uv.y);
+                    vertex.tangent[0] = static_cast<float>(tangent.x);
+                    vertex.tangent[1] = static_cast<float>(tangent.y);
+                    vertex.tangent[2] = static_cast<float>(tangent.z);
+                    const double crossX =
+                        normal.y * tangent.z - normal.z * tangent.y;
+                    const double crossY =
+                        normal.z * tangent.x - normal.x * tangent.z;
+                    const double crossZ =
+                        normal.x * tangent.y - normal.y * tangent.x;
+                    vertex.tangent[3] =
+                        crossX * bitangent.x + crossY * bitangent.y +
+                        crossZ * bitangent.z < 0.0 ? -1.0f : 1.0f;
+                    primitive.indices.push_back(
+                        static_cast<uint32_t>(primitive.vertices.size()));
+                    primitive.vertices.push_back(vertex);
+                }
+            }
+        }
+
+        for (PrimitiveData& primitive : slots) {
+            if (primitive.indices.empty()) continue;
+            DeduplicateVertices(primitive);
+            FinalizePrimitive(primitive, context.materials);
+            context.primitives.push_back(std::move(primitive));
         }
     }
-    std::copy(minimum, minimum + 3, result.record.boundsMin);
-    std::copy(maximum, maximum + 3, result.record.boundsMax);
-    const bool doubleSided = result.record.material < materials.size() &&
-        (materials[result.record.material].flags & Cooked::DoubleSided);
-    result.meshlets = BuildMeshlets(
-        result.vertices, result.indices, doubleSided);
-    result.record.vertexCount = static_cast<uint32_t>(result.vertices.size());
-    result.record.indexCount = static_cast<uint32_t>(result.indices.size());
-    result.record.indexElementSize =
-        result.vertices.size() <= 65535 ? 2u : 4u;
-    result.record.meshletCount =
-        static_cast<uint32_t>(result.meshlets.descriptors.size());
-    result.record.meshletVertexCount =
-        static_cast<uint32_t>(result.meshlets.vertices.size());
-    result.record.meshletTriangleCount =
-        static_cast<uint32_t>(result.meshlets.triangles.size());
-    return result;
+}
+
+bool CookLegacyFbx(const fs::path& source, const fs::path& destination) {
+    ufbx_load_opts options = {};
+    options.generate_missing_normals = true;
+    options.evaluate_skinning = true;
+    ufbx_error error = {};
+    ufbx_scene* scene =
+        ufbx_load_file(source.string().c_str(), &options, &error);
+    if (!scene) {
+        std::array<char, 1024> message{};
+        ufbx_format_error(message.data(), message.size(), &error);
+        std::cerr << source.generic_string()
+                  << ": ufbx fallback failed: " << message.data() << "\n";
+        return false;
+    }
+
+    CookContext context;
+    context.sourcePath = source;
+    ExtractLegacyMaterials(context, *scene);
+    ExtractLegacyPrimitives(context, *scene);
+    ufbx_free_scene(scene);
+    if (context.primitives.empty()) {
+        std::cerr << source.generic_string()
+                  << ": ufbx fallback found no geometry\n";
+        return false;
+    }
+    std::cerr << source.generic_string()
+              << ": using legacy ufbx fallback\n";
+    return WriteAsset(context, destination);
 }
 
 template<class Key>
@@ -855,6 +1176,8 @@ bool Cook(const fs::path& source, const fs::path& destination) {
         animationImporter.ReadFile(source.string(), baseFlags);
     if (!animationScene ||
         (!animationScene->HasMeshes() && animationScene->mNumAnimations == 0)) {
+        if (LowerExtension(source) == ".fbx")
+            return CookLegacyFbx(source, destination);
         std::cerr << source.generic_string() << ": "
                   << animationImporter.GetErrorString() << "\n";
         return false;
@@ -893,6 +1216,11 @@ void Usage() {
 int main(int argc, char** argv) {
     try {
         if (argc == 3 && std::string(argv[1]) != "--all")
+            if (IsCookExcluded(fs::path(argv[1]))) {
+                std::cerr << "Refusing to cook excluded source: " << argv[1]
+                          << " (see IsCookExcluded)\n";
+                return 1;
+            }
             return Cook(fs::path(argv[1]), fs::path(argv[2])) ? 0 : 1;
         if (argc == 5 && std::string(argv[1]) == "--all" &&
             std::string(argv[3]) == "--out") {
@@ -903,6 +1231,11 @@ int main(int argc, char** argv) {
             for (const fs::directory_entry& entry :
                  fs::recursive_directory_iterator(root)) {
                 if (!entry.is_regular_file() || !IsModel(entry.path())) continue;
+                if (IsCookExcluded(entry.path())) {
+                    std::cout << "Skipping (excluded): "
+                              << entry.path().generic_string() << "\n";
+                    continue;
+                }
                 fs::path relative = fs::relative(entry.path(), root);
                 relative.replace_extension(".sgeasset");
                 if (Cook(entry.path(), output / relative)) ++cooked;

@@ -171,7 +171,8 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
     const std::vector<std::string>& animPaths,
     Microsoft::WRL::ComPtr<ID3D12Device> device,
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
-    float uniformScale) {
+    float uniformScale,
+    bool useCookedClips) {
 
     SkinnedModel out;
     Assimp::Importer importer;
@@ -500,12 +501,21 @@ SkinnedModel SkinnedFBXImporter::Load(const std::string& meshPath,
     }
 
     // Clips keep native-space translation keys (matching the unscaled skeleton);
-    // the 0.01 world scale is applied at draw. Clip baked into the mesh FBX
-    // first, then each extra animation-only FBX.
-    AppendClips(scene, out.skeleton, 1.0f, out.clips);
+    // the 0.01 world scale is applied at draw. Prefer compressed clips from the
+    // mesh's cooked blob, while retaining source parsing for stale/missing cooks.
+    // Base clips stay first, followed by each extra animation-only FBX.
+    // useCookedClips=false parses every clip from the source FBX instead.
+    if (useCookedClips && CookedAssetLoader::LoadAnimationsForSource(
+            meshPath, out.skeleton, out.clips)) {
+        std::cout << "Loaded " << out.clips.size()
+                  << " cooked embedded animation(s): "
+                  << fs::path(meshPath).stem().string() << "\n";
+    } else {
+        AppendClips(scene, out.skeleton, 1.0f, out.clips);
+    }
     for (const std::string& ap : animPaths) {
         const size_t before = out.clips.size();
-        if (CookedAssetLoader::LoadAnimationsForSource(
+        if (useCookedClips && CookedAssetLoader::LoadAnimationsForSource(
                 ap, out.skeleton, out.clips)) {
             const std::string stem = fs::path(ap).stem().string();
             for (size_t i = before; i < out.clips.size(); ++i)

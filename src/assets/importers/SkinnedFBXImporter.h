@@ -34,9 +34,15 @@ public:
     // meshPath: the SK_*.FBX skinned mesh. animPaths: extra clip FBX files whose
     // AnimStacks are appended to the model's clip list. uniformScale bakes into
     // the mesh vertices AND the skeleton bind transforms so both stay consistent.
+    //
+    // useCookedClips=false parses all clips from the source FBX and ignores the
+    // cooked blobs. The cooker's compression drops bone tracks (the player's
+    // rifle idle came back with 4 of 66), which leaves most of the skeleton in
+    // bind pose and visibly misaligns the mesh. Player assets pass false.
     static SkinnedModel Load(const std::string& meshPath,
                              const std::vector<std::string>& animPaths,
                              Microsoft::WRL::ComPtr<ID3D12Device> device,
                              Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
-                             float uniformScale = 0.01f);
+                             float uniformScale = 0.01f,
+                             bool useCookedClips = true);
 };

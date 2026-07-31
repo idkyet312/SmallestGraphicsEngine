@@ -86,3 +86,5 @@ Thumbs.db
 # Tool output
 graphify-out/
 Content/Cooked/
+assetcache/
+dumps/

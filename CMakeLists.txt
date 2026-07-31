@@ -14,6 +14,21 @@ if(MSVC)
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
 
+# Assimp no longer accepts pre-2011 binary FBX. Keep ufbx isolated to the
+# offline cooker as a static-geometry fallback for legacy source assets.
+FetchContent_Declare(ufbx
+    GIT_REPOSITORY https://github.com/ufbx/ufbx.git
+    GIT_TAG fcc5d6ba444cfd3eb80677dba5e37e493941abe5
+)
+FetchContent_MakeAvailable(ufbx)
+add_library(ufbx STATIC "${ufbx_SOURCE_DIR}/ufbx.c")
+target_include_directories(ufbx PUBLIC "${ufbx_SOURCE_DIR}")
+target_compile_features(ufbx PUBLIC c_std_99)
+if(MSVC)
+    set_property(TARGET ufbx PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
+
 file(GLOB NVBLAST_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/sdk/common/*.cpp"
     "${CMAKE_SOURCE_DIR}/thirdparty/blast/source/sdk/lowlevel/*.cpp"
@@ -414,7 +429,8 @@ add_executable(AssetCooker
 target_link_libraries(AssetCooker PRIVATE
     SGEProjectHeaders
     assimp::assimp
-    meshoptimizer::meshoptimizer)
+    meshoptimizer::meshoptimizer
+    ufbx)
 if(MSVC)
     target_compile_options(AssetCooker PRIVATE /MP /bigobj)
 endif()

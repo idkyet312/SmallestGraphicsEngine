@@ -322,8 +322,13 @@ public:
         // uniformScale 1 keeps the mesh in the skeleton's native centimetres,
         // which is what the palette matrices are built in; the conversion to
         // weapon-local size happens on the world matrix in Draw().
+        // useCookedClips=false: the cooked rifle idle came back with 4 bone
+        // tracks instead of 66, so 83 of the 87 bones stayed in bind pose and
+        // the arms hung off the weapon. Parse the source FBX, which carries the
+        // full track set. Nothing about the player is loaded from cooked data.
         Source() = SkinnedFBXImporter::Load(
-            path, animationPaths, g_dx12.device, g_dx12.commandList, 1.0f);
+            path, animationPaths, g_dx12.device, g_dx12.commandList, 1.0f,
+            false);
         if (!Source().valid || !Source().node || !Source().node->mesh) {
             std::cerr << "FPS view model unavailable; weapon draws without arms\n";
             return;

@@ -31,30 +31,27 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
         filepath.find("Humvee") != std::string::npos ||
         filepath.find("humvee") != std::string::npos ||
         filepath.find("OH-1") != std::string::npos;
-    if (device && !splitIntoDestructibleBoards && !diffuseAndNormalOnly &&
-        !needsAuthoredHierarchy) {
+    // loadMaterials=false callers (the AK47 and the other view models) assign
+    // their material by hand. The cooked loader has no way to skip material
+    // work: it creates every baked texture and records its upload into the open
+    // command list before we get the node back, and the clearMaterials pass
+    // below then drops the last owning reference. That final-releases resources
+    // the GPU is still about to copy into -- "referenced by GPU operations
+    // in-flight" corruption, then a device hang. Use the raw importer, which
+    // never creates those textures in the first place.
+    if (device && loadMaterials && !splitIntoDestructibleBoards &&
+        !diffuseAndNormalOnly && !needsAuthoredHierarchy) {
         if (auto cooked = CookedAssetLoader::LoadForSource(
                 filepath, device, commandList)) {
+            std::cout << "Loaded cooked model: "
+                      << CookedAssetLoader::FindForSource(filepath).string()
+                      << "\n";
             cooked->scale = XMFLOAT3(
                 uniformScale, uniformScale, uniformScale);
             cooked->UpdateLocalTransform();
             XMFLOAT4X4 identity;
             XMStoreFloat4x4(&identity, XMMatrixIdentity());
             cooked->UpdateGlobalTransform(identity);
-            if (!loadMaterials) {
-                const auto clearMaterials = [&](const auto& self,
-                                                const std::shared_ptr<SceneNode>& node)
-                    -> void {
-                    if (!node) return;
-                    if (node->mesh)
-                        for (MeshPrimitive& primitive : node->mesh->primitives)
-                            primitive.material =
-                                std::make_shared<SceneMaterial>();
-                    for (const auto& child : node->children)
-                        self(self, child);
-                };
-                clearMaterials(clearMaterials, cooked);
-            }
             return cooked;
         }
     }
