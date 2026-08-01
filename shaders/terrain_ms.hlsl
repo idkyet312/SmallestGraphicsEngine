@@ -111,7 +111,12 @@ static const float kSeabed        = -6.0; // sea floor depth past the shore
 static const float kBeachStart    = 28.0; // terrain relief starts flattening
 static const float kBeachShelf    = 35.0; // broad, nearly flat sand begins
 static const float kBeachWaterline = 43.0; // beach finishes just below sea level
-static const float kShoreOuter    = 52.0; // full seabed reached inside mesh edge
+// Full seabed depth is reached this far out. The drop used to finish at 52,
+// taking the floor from -0.25 to -6.0 in only 9 m -- a visible underwater cliff
+// right off the beach. Stretching it to 88 spreads the same 5.75 m over 45 m,
+// so the bottom shelves away gradually. The clipmap rings reach ~256 m, so this
+// still finishes well inside the drawn terrain.
+static const float kShoreOuter    = 88.0;
 static const float kBeachHigh     =  0.65;
 static const float kBeachLow      = -0.25;
 

@@ -240,6 +240,11 @@ struct Scene {
     float atmosphereCloudBaseHeight = 720.0f;
     float atmosphereCloudThickness = 1250.0f;
     bool  enableVolumetricFog = true;
+    // Doubles the froxel grid to 128x72x96. The default 64x36x48 gives one fog
+    // sample per ~30x30 screen pixels at 1080p, which makes sun shafts through
+    // palm fronds look blocky. 8x the froxels sharpens them at a real GPU cost,
+    // so it stays opt-in.
+    bool  volumetricFogHighRes = false;
     float volumetricFogDensity = 0.0128f;
     float volumetricFogAnisotropy = 0.90f;
     float volumetricFogHeightFalloff = 0.045f; // fog thins above the undergrowth, not over treetops

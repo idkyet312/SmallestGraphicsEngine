@@ -602,6 +602,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ? WaterQuality::High : WaterQuality::Low;
         ImGui::Checkbox("Volumetric Fog", &scene.enableVolumetricFog);
         if (scene.enableVolumetricFog) {
+            ImGui::Checkbox("High-Res Light Shafts",
+                            &scene.volumetricFogHighRes);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Doubles the fog grid to 128x72x96 (8x froxels).\n"
+                    "Sharpens sun shafts through foliage at a GPU cost.");
             ImGui::DragFloat("Fog Density", &scene.volumetricFogDensity,
                              0.0005f, 0.0001f, 0.05f, "%.4f");
             ImGui::SliderFloat("Fog Anisotropy", &scene.volumetricFogAnisotropy,

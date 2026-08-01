@@ -59,7 +59,7 @@ public:
         commandList->SetPipelineState(computePipeline_.Get());
         commandList->SetComputeRootSignature(rootSignature_.Get());
         BindComputeRoots(commandList);
-        commandList->Dispatch((GridX + 7) / 8, (GridY + 7) / 8, 1);
+        commandList->Dispatch((gridX_ + 7) / 8, (gridY_ + 7) / 8, 1);
         D3D12_RESOURCE_BARRIER uav = {};
         uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         uav.UAV.pResource = volume_.Get();
@@ -96,9 +96,24 @@ private:
     // Fog needs substantially finer spatial/depth sampling than light clusters.
     // Keeping it at 16x9x10 blurred palm silhouettes into uniform haze and
     // prevented visible shafts through gaps in the fronds.
+    //
+    // The high-res toggle doubles each axis (8x the froxels) to sharpen shafts
+    // further. The volume texture is always allocated at the high-res size so
+    // flipping the toggle never reallocates GPU resources mid-frame; only the
+    // dispatch extent and the dimensions handed to the shader change, and the
+    // shader derives its froxel UVs from those, so the unused tail of the
+    // texture is simply never sampled.
     static constexpr UINT GridX = 64;
     static constexpr UINT GridY = 36;
     static constexpr UINT GridZ = 48;
+    static constexpr UINT MaxGridX = GridX * 2;
+    static constexpr UINT MaxGridY = GridY * 2;
+    static constexpr UINT MaxGridZ = GridZ * 2;
+
+    UINT gridX_ = GridX;
+    UINT gridY_ = GridY;
+    UINT gridZ_ = GridZ;
+    UINT jitterFrame_ = 0;
     static constexpr UINT ClusterCount =
         ClusteredRendererDX12::CLUSTER_X *
         ClusteredRendererDX12::CLUSTER_Y *
@@ -130,6 +145,7 @@ private:
         XMUINT4 volumeDims;
         XMFLOAT4 atmosphereParams;
         XMFLOAT4 cloudParams;
+        XMUINT4 maxVolumeDims;
     };
     static_assert(sizeof(FogConstants) <= ConstantsSize, "Fog constants exceed one CBV page");
 
@@ -254,9 +270,9 @@ private:
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC volume = {};
         volume.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        volume.Width = GridX;
-        volume.Height = GridY;
-        volume.DepthOrArraySize = GridZ;
+        volume.Width = MaxGridX;
+        volume.Height = MaxGridY;
+        volume.DepthOrArraySize = MaxGridZ;
         volume.MipLevels = 1;
         volume.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         volume.SampleDesc.Count = 1;
@@ -269,7 +285,7 @@ private:
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
         uav.Format = volume.Format;
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
-        uav.Texture3D.WSize = GridZ;
+        uav.Texture3D.WSize = MaxGridZ;
         g_dx12.device->CreateUnorderedAccessView(volume_.Get(), nullptr, &uav, CpuHandle(1));
         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -313,6 +329,12 @@ private:
                          ID3D12Resource* shadowResource,
                          ID3D12Resource* depthResource, bool multisampledDepth) {
         frame_ = g_dx12.frameIndex;
+        // Picked per frame so the toggle takes effect immediately. The volume is
+        // allocated at the high-res size either way, so this only changes how
+        // much of it the dispatch fills and the shader samples.
+        gridX_ = scene.volumetricFogHighRes ? MaxGridX : GridX;
+        gridY_ = scene.volumetricFogHighRes ? MaxGridY : GridY;
+        gridZ_ = scene.volumetricFogHighRes ? MaxGridZ : GridZ;
         const XMMATRIX viewProjection = scene.GetViewMatrix() * scene.GetProjectionMatrix();
         FogConstants constants = {};
         XMStoreFloat4x4(&constants.inverseViewProjection,
@@ -349,7 +371,11 @@ private:
             ClusteredRendererDX12::CLUSTER_Z,
             static_cast<UINT>((std::min)(scene.clusteredRenderer.lights.size(),
                                         static_cast<size_t>(MaxLights))) };
-        constants.volumeDims = { GridX, GridY, GridZ, 0u };
+        // w carries a frame counter so the froxel sampling offset advances every
+        // frame; without it the dither would be a fixed pattern instead of
+        // averaging out over time.
+        constants.volumeDims = { gridX_, gridY_, gridZ_, jitterFrame_++ };
+        constants.maxVolumeDims = { MaxGridX, MaxGridY, MaxGridZ, 0u };
         constants.atmosphereParams = {
             scene.enablePhysicalAtmosphere ? scene.atmosphereRayleighStrength : 0.0f,
             scene.atmosphereMieStrength,

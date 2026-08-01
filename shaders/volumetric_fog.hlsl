@@ -27,6 +27,7 @@ cbuffer FogConstants : register(b0)
     uint4 volumeDims;
     float4 atmosphereParams;      // Rayleigh, Mie, Mie g, aerial density
     float4 cloudParams;           // coverage, density, base height, thickness
+    uint4 maxVolumeDims;          // allocated froxel volume size (>= volumeDims)
 };
 
 StructuredBuffer<FogCluster> clusters : register(t0);
@@ -79,6 +80,15 @@ float HenyeyGreenstein(float cosineTheta, float g)
     float denominator = max(1.0 + g2 - 2.0 * g * cosineTheta, 1e-4);
     return (1.0 - g2) /
         max(4.0 * 3.14159265 * pow(denominator, 1.5), 1e-4);
+}
+
+// Jimenez's interleaved gradient noise: a cheap hash whose values decorrelate
+// strongly between neighbouring pixels, which is what makes the froxel sampling
+// offset read as fine dither rather than as a pattern.
+float InterleavedGradientNoise(float2 pixel)
+{
+    return frac(52.9829189 *
+        frac(dot(pixel, float2(0.06711056, 0.00583715))));
 }
 
 float FogNoise(float3 p)
@@ -138,12 +148,21 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     const float phase = min(HenyeyGreenstein(
         dot(lightDirection, ray), sunColorAnisotropy.w), 1.65);
 
+    // Each froxel takes a single shadow sample, so a shaft edge that falls
+    // mid-slice snaps to the froxel boundary and the shaft reads as stepped.
+    // Raising the grid resolution shrinks those steps but never removes them.
+    // Offsetting the sample position within the slice, by a per-pixel amount
+    // that also changes each frame, turns the hard step into noise that the
+    // accumulation and frame-to-frame persistence average into a smooth edge.
+    float sliceJitter = frac(
+        InterleavedGradientNoise(float2(id.xy)) + float(volumeDims.w) * 0.618034);
+
     [loop]
     for (uint z = 0; z < volumeDims.z; ++z)
     {
         float nearDepth = SliceDepth((float)z);
         float farDepth = SliceDepth((float)z + 1.0);
-        float centerDepth = sqrt(nearDepth * farDepth);
+        float centerDepth = lerp(nearDepth, farDepth, sliceJitter);
         float stepLength = (farDepth - nearDepth) / viewCos;
         float3 worldPosition = cameraPositionNear.xyz + ray * (centerDepth / viewCos);
 
@@ -220,6 +239,19 @@ float LinearDepth(float depth)
     return nearZ * farZ / max(farZ - depth * (farZ - nearZ), 1e-5);
 }
 
+// The froxel volume is always allocated at the high-res size, but the compute
+// pass only fills volumeDims when the high-res toggle is off. Rescale the
+// normalised coordinate into the written region, and inset by half a texel so
+// bilinear filtering never reaches past the last written froxel into stale data.
+float3 FogVolumeUVW(float2 uv, float slice)
+{
+    float3 written = float3(volumeDims.xyz);
+    float3 allocated = float3(maxVolumeDims.xyz);
+    float3 scale = written / allocated;
+    float3 halfTexel = 0.5 / allocated;
+    return clamp(float3(uv, slice) * scale, halfTexel, scale - halfTexel);
+}
+
 float4 PSMain(VSOutput input) : SV_TARGET
 {
     float deviceDepth = sceneDepth.SampleLevel(linearClampSampler, input.uv, 0.0);
@@ -231,7 +263,7 @@ float4 PSMain(VSOutput input) : SV_TARGET
     float nearZ = cameraPositionNear.w;
     float fogFar = min(cameraForwardFar.w, fogParams.z);
     float slice = log(max(viewDepth, nearZ) / nearZ) / log(fogFar / nearZ);
-    float3 uvw = float3(input.uv, saturate(slice));
+    float3 uvw = FogVolumeUVW(input.uv, saturate(slice));
     float4 fog = fogVolume.SampleLevel(linearClampSampler, uvw, 0.0);
     return float4(fog.rgb, fog.a);
 }
@@ -250,6 +282,6 @@ float4 PSMainMSAA(VSOutput input) : SV_TARGET
     float fogFar = min(cameraForwardFar.w, fogParams.z);
     float slice = log(max(viewDepth, nearZ) / nearZ) / log(fogFar / nearZ);
     float4 fog = fogVolume.SampleLevel(
-        linearClampSampler, float3(input.uv, saturate(slice)), 0.0);
+        linearClampSampler, FogVolumeUVW(input.uv, saturate(slice)), 0.0);
     return float4(fog.rgb, fog.a);
 }

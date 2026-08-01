@@ -323,7 +323,9 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
         params.tilesX = kRingGrid;
         // Enough rings so the outermost reaches past the island shore. Ring r
         // half-span = G/2 * base * 2^r. Need it to cover kShoreOuter*scale + margin.
-        constexpr float kShoreOuter = 52.0f;
+        // Matches terrain_ms.hlsl's kShoreOuter, so the rings still reach past
+        // the point where the seabed finishes sloping down.
+        constexpr float kShoreOuter = 88.0f;
         constexpr float kOceanMargin = 40.0f;
         const float maxScale = (std::max)(params.islandScaleX, params.islandScaleZ);
         const float need = kShoreOuter * maxScale + kOceanMargin;

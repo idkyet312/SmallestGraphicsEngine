@@ -289,7 +289,9 @@ public:
         constexpr float landLift = 2.5f, seabed = -6.0f;
         constexpr float beachStart = 28.0f, beachShelf = 35.0f;
         constexpr float beachWaterline = 43.0f;
-        constexpr float shoreOuter = 52.0f;
+        // Must match terrain_ms.hlsl's kShoreOuter. Widened from 52 so the
+        // seabed slopes away over 45 m instead of dropping 5.75 m in 9 m.
+        constexpr float shoreOuter = 88.0f;
         constexpr float beachHigh = 0.65f, beachLow = -0.25f;
         // Per-axis island size: normalise the coordinate by each axis' scale so
         // the coastline stretches independently on X and Z (oval / strip). The

@@ -298,13 +298,29 @@ PSOutput PSMain(VSOutput input)
         float3(-micro.x, 0.0, -micro.y) *
         clipmapParams.z * microFade);
 
-    float3 opaqueWorld = opaqueDepth < 0.99999
-        ? ReconstructWorld(uv, opaqueDepth)
-        : input.worldPosition + normalize(input.worldPosition -
-              cameraTime.xyz) * 40.0;
     float waterDistance = length(input.worldPosition - cameraTime.xyz);
-    float opaqueDistance = length(opaqueWorld - cameraTime.xyz);
-    float thickness = clamp(opaqueDistance - waterDistance, 0.02, 30.0);
+    float thickness;
+    if (opaqueDepth < 0.99999) {
+        float3 opaqueWorld = ReconstructWorld(uv, opaqueDepth);
+        thickness = length(opaqueWorld - cameraTime.xyz) - waterDistance;
+    } else {
+        // No seabed behind this pixel. The terrain clipmap stops well short of
+        // the ocean mesh (~256 m of terrain against 420 m of water), so beyond
+        // its edge there is nothing to measure against. Substituting a fixed
+        // distance here made thickness jump straight to its clamped maximum the
+        // instant a pixel crossed the terrain boundary, and since thickness
+        // drives absorption, the shallow/deep colour blend, and foam, that
+        // discontinuity showed up as hard-edged blue and tan patches on the
+        // distant water.
+        //
+        // Ramp with horizontal distance from the shore instead: water gets
+        // deeper as it leaves the island, which is both physically sensible and
+        // continuous, so the seam has nothing to key off. The scale is chosen so
+        // the ramp saturates near the same depth the real seabed reaches.
+        float2 fromShore = input.worldPosition.xz - clipmapParams.xy;
+        thickness = 6.0 + smoothstep(0.0, 90.0, length(fromShore)) * 24.0;
+    }
+    thickness = clamp(thickness, 0.02, 30.0);
 
     // Convert only the horizontal surface slope into a bounded pixel offset.
     // Projecting the full one-metre normal and multiplying that UV displacement
