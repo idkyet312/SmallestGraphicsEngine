@@ -80,22 +80,9 @@ public:
         D3D12_CPU_DESCRIPTOR_HANDLE rawRtv =
             rawRtvHeap_->GetCPUDescriptorHandleForHeapStart();
         list->OMSetRenderTargets(1, &rawRtv, FALSE, nullptr);
-        // rawAO_ is half-res, so the trace needs a matching viewport. UVs are
-        // unaffected (the fullscreen triangle spans 0..1 either way) and the
-        // composite below restores the full-res viewport before sampling it.
-        D3D12_VIEWPORT halfViewport = {};
-        halfViewport.Width = static_cast<float>(targetWidth_);
-        halfViewport.Height = static_cast<float>(targetHeight_);
-        halfViewport.MaxDepth = 1.0f;
-        D3D12_RECT halfScissor = { 0, 0, static_cast<LONG>(targetWidth_),
-                                   static_cast<LONG>(targetHeight_) };
-        list->RSSetViewports(1, &halfViewport);
-        list->RSSetScissorRects(1, &halfScissor);
         list->SetPipelineState(multisampledDepth ? gtaoMSAAPipeline_.Get()
                                                 : gtaoPipeline_.Get());
         list->DrawInstanced(3, 1, 0, 0);
-        list->RSSetViewports(1, &g_dx12.viewport);
-        list->RSSetScissorRects(1, &g_dx12.scissorRect);
         Transition(list, rawAO_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
@@ -266,27 +253,22 @@ private:
     }
 
     bool EnsureRawTarget() {
-        if (rawAO_ && targetWidth_ == HalfDimension(g_dx12.screenWidth) &&
-            targetHeight_ == HalfDimension(g_dx12.screenHeight)) return true;
+        if (rawAO_ && targetWidth_ == g_dx12.screenWidth &&
+            targetHeight_ == g_dx12.screenHeight) return true;
         rawAO_.Reset();
         rawRtvHeap_.Reset();
         return CreateRawTarget();
     }
 
-    // The GTAO pass traces 8 slices x 4 steps per pixel and was 3.5 ms of a
-    // 7.1 ms frame at full resolution -- half the GPU budget for one effect.
-    // GTAO is low-frequency and its output already goes through a bilateral
-    // (depth+normal weighted) upsample in BilateralAO, so tracing it at half
-    // resolution costs 4x fewer rays for output that survives the filter. The
-    // composite pass stays full-res, so contact shadows and the final blend keep
-    // their sharpness.
-    static UINT HalfDimension(UINT value) {
-        return (std::max)(1u, (value + 1u) / 2u);
-    }
-
+    // The AO trace runs at full resolution. Tracing at half res saved ~2.3 ms
+    // but produced evenly spaced horizontal bands across the frame that scaled
+    // with AO strength -- i.e. they were in the AO signal itself, not the
+    // upsample. Rebasing the rotation dither and step offsets onto the trace
+    // resolution did not remove them, so the win is not worth the artifact. The
+    // frame-time gain came from the terrain sample-count fix regardless.
     bool CreateRawTarget() {
-        targetWidth_ = HalfDimension(g_dx12.screenWidth);
-        targetHeight_ = HalfDimension(g_dx12.screenHeight);
+        targetWidth_ = g_dx12.screenWidth;
+        targetHeight_ = g_dx12.screenHeight;
         D3D12_HEAP_PROPERTIES heap = {};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC desc = {};
