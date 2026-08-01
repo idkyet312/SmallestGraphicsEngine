@@ -82,6 +82,15 @@ float3 ReconstructNormal(float2 uv, float depth, bool multisampled)
         }
         storedValid = depthMatch * step(0.25, dot(stored, stored));
     }
+    // Return the stored G-buffer normal before reconstructing one from depth.
+    // The reconstruction below costs four SampleDepth calls, and the final line
+    // of this function discarded all of it whenever storedValid held -- which is
+    // essentially every pixel on the visibility path, where normalRoughness is
+    // always bound. BilateralAO calls this 25 times per pixel, so that was ~100
+    // wasted depth fetches per pixel. Output is unchanged: this returns exactly
+    // what the trailing select returned.
+    if (storedValid > 0.5) return normalize(stored);
+
     float3 center = ReconstructWorld(uv, depth);
     float2 texel = screenParams.zw;
     float depthL = SampleDepth(uv - float2(texel.x, 0.0), multisampled);
@@ -97,7 +106,7 @@ float3 ReconstructNormal(float2 uv, float depth, bool multisampled)
     float3 normal = normalize(cross(dx, dy));
     float3 toCamera = normalize(cameraNearFar.xyz - center);
     normal = dot(normal, toCamera) < 0.0 ? -normal : normal;
-    return storedValid > 0.5 ? normalize(stored) : normal;
+    return normal;
 }
 
 float InterleavedNoise(float2 pixel)
@@ -175,13 +184,15 @@ float SampleContactCasterDepth(float2 uv, bool multisampled)
     return min(casterDepth, currentDepth);
 }
 
-float ContactVisibility(float2 uv, float deviceDepth, bool multisampled)
+// surfaceNormal is supplied by the caller, which has already reconstructed it
+// for the bilateral filter. Recomputing it here repeated that work for an
+// identical result.
+float ContactVisibility(float2 uv, float deviceDepth, bool multisampled,
+                        float3 surfaceNormal)
 {
     if (deviceDepth >= 0.99999 || lightDirection.w <= 0.0 ||
         IsViewModelDepth(deviceDepth)) return 1.0;
     float3 world = ReconstructWorld(uv, deviceDepth);
-    float3 surfaceNormal =
-        ReconstructNormal(uv, deviceDepth, multisampled);
     world += surfaceNormal * max(0.015, aoParams.x * 0.03);
     float3 rayDirection = normalize(lightDirection.xyz);
     const float maxDistance = max(aoParams.w * 0.004, 1.5);
@@ -252,7 +263,7 @@ float4 Composite(float2 uv, bool multisampled)
     float3 normal = ReconstructNormal(uv, depth, multisampled);
     float visibility = BilateralAO(
         uv, LinearDepth(depth), normal, multisampled);
-    visibility *= ContactVisibility(uv, depth, multisampled);
+    visibility *= ContactVisibility(uv, depth, multisampled, normal);
     return float4(visibility.xxx, 1.0);
 }
 
