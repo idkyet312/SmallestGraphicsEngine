@@ -1,6 +1,7 @@
 #ifndef SHADOW_MAP_DX12_H
 #define SHADOW_MAP_DX12_H
 
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "ShaderDX12.h"
 #include "Scene.h"
@@ -59,7 +60,7 @@ public:
 
         ComPtr<ID3DBlob> vsBlob;
         ComPtr<ID3DBlob> errorBlob;
-        HRESULT hr = D3DCompile(vsCode.c_str(), vsCode.length(), vertexPath,
+        HRESULT hr = ShaderCacheDX12::CompileCached(vsCode.c_str(), vsCode.length(), vertexPath,
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "vs_5_0",
             compileFlags, 0, &vsBlob, &errorBlob);
         if (FAILED(hr)) {
@@ -175,7 +176,7 @@ public:
         const std::string grassVsCode = grassVsStream.str();
         ComPtr<ID3DBlob> grassVsBlob;
         errorBlob.Reset();
-        hr = D3DCompile(grassVsCode.c_str(), grassVsCode.length(),
+        hr = ShaderCacheDX12::CompileCached(grassVsCode.c_str(), grassVsCode.length(),
             "shaders/grass_shadow_vs.hlsl", nullptr,
             D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "vs_5_0",
             compileFlags, 0, &grassVsBlob, &errorBlob);
@@ -202,7 +203,7 @@ public:
             stream << file.rdbuf();
             const std::string code = stream.str();
             errorBlob.Reset();
-            const HRESULT result = D3DCompile(
+            const HRESULT result = ShaderCacheDX12::CompileCached(
                 code.c_str(), code.length(), path, nullptr,
                 D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", target,
                 compileFlags, 0, &blob, &errorBlob);

@@ -1,4 +1,5 @@
 #pragma once
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "ShaderDX12.h" // for UploadBuffer<T>
 #include <fstream>
@@ -51,7 +52,7 @@ public:
         compileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
 #endif
         ComPtr<ID3DBlob> csBlob, errorBlob;
-        HRESULT hr = D3DCompile(csCode.c_str(), csCode.length(), "generate_mips_cs.hlsl",
+        HRESULT hr = ShaderCacheDX12::CompileCached(csCode.c_str(), csCode.length(), "generate_mips_cs.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0",
             compileFlags, 0, &csBlob, &errorBlob);
         if (FAILED(hr)) {

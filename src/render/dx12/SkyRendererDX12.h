@@ -1,6 +1,7 @@
 #ifndef SKY_RENDERER_DX12_H
 #define SKY_RENDERER_DX12_H
 
+#include "ShaderCacheDX12.h"
 #include "ShaderDX12.h"
 #include "CameraDX12.h"
 #include "GLBImporter.h"
@@ -53,11 +54,11 @@ public:
 
         ComPtr<ID3DBlob> vs, ps, hdrPs, errors;
         UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
-        HRESULT hr = D3DCompile(vsSource.data(), vsSource.size(), "sky_vs.hlsl",
+        HRESULT hr = ShaderCacheDX12::CompileCached(vsSource.data(), vsSource.size(), "sky_vs.hlsl",
             nullptr, nullptr, "main", "vs_5_0", flags, 0, &vs, &errors);
         if (FAILED(hr)) { if (errors) std::cerr << (char*)errors->GetBufferPointer(); return false; }
         errors.Reset();
-        hr = D3DCompile(psSource.data(), psSource.size(), "shaders/sky_ps.hlsl",
+        hr = ShaderCacheDX12::CompileCached(psSource.data(), psSource.size(), "shaders/sky_ps.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
             "main", "ps_5_0", flags, 0, &ps, &errors);
         if (FAILED(hr)) { if (errors) std::cerr << (char*)errors->GetBufferPointer(); return false; }
@@ -65,7 +66,7 @@ public:
             { "SGE_HDR_TARGET", "1" }, { nullptr, nullptr }
         };
         errors.Reset();
-        hr = D3DCompile(psSource.data(), psSource.size(), "shaders/sky_ps.hlsl",
+        hr = ShaderCacheDX12::CompileCached(psSource.data(), psSource.size(), "shaders/sky_ps.hlsl",
             hdrDefines, D3D_COMPILE_STANDARD_FILE_INCLUDE,
             "main", "ps_5_0", flags, 0, &hdrPs, &errors);
         if (FAILED(hr)) { if (errors) std::cerr << (char*)errors->GetBufferPointer(); return false; }

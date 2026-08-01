@@ -1,6 +1,7 @@
 #ifndef OCCLUSION_DEPTH_DX12_H
 #define OCCLUSION_DEPTH_DX12_H
 
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include <cmath>
 #include <sstream>
@@ -230,7 +231,7 @@ private:
         const std::string code = stream.str();
         ComPtr<ID3DBlob> shader;
         ComPtr<ID3DBlob> errors;
-        if (FAILED(D3DCompile(code.data(), code.size(), "shaders/hzb_cs.hlsl",
+        if (FAILED(ShaderCacheDX12::CompileCached(code.data(), code.size(), "shaders/hzb_cs.hlsl",
                 nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0",
                 D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shader, &errors))) {
             if (errors) std::cerr << static_cast<const char*>(errors->GetBufferPointer());

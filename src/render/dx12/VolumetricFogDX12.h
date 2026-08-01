@@ -1,6 +1,7 @@
 #ifndef VOLUMETRIC_FOG_DX12_H
 #define VOLUMETRIC_FOG_DX12_H
 
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "Scene.h"
 #include <algorithm>
@@ -137,7 +138,7 @@ private:
     bool Compile(const std::string& source, const char* entry, const char* target,
                  UINT flags, ComPtr<ID3DBlob>& blob, ComPtr<ID3DBlob>& errors) {
         errors.Reset();
-        HRESULT hr = D3DCompile(source.data(), source.size(), "volumetric_fog.hlsl",
+        HRESULT hr = ShaderCacheDX12::CompileCached(source.data(), source.size(), "volumetric_fog.hlsl",
             nullptr, nullptr, entry, target, flags, 0, &blob, &errors);
         if (FAILED(hr)) {
             if (errors) std::cerr << static_cast<const char*>(errors->GetBufferPointer());

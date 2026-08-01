@@ -1,6 +1,7 @@
 #ifndef FXAA_DX12_H
 #define FXAA_DX12_H
 
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include <d3dcompiler.h>
 #include <fstream>
@@ -19,14 +20,14 @@ public:
 
         ComPtr<ID3DBlob> vs, ps, errors;
         const UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
-        HRESULT hr = D3DCompile(source.data(), source.size(), "fxaa.hlsl",
+        HRESULT hr = ShaderCacheDX12::CompileCached(source.data(), source.size(), "fxaa.hlsl",
             nullptr, nullptr, "VSMain", "vs_5_0", flags, 0, &vs, &errors);
         if (FAILED(hr)) {
             if (errors) std::cerr << static_cast<const char*>(errors->GetBufferPointer());
             return false;
         }
         errors.Reset();
-        hr = D3DCompile(source.data(), source.size(), "fxaa.hlsl",
+        hr = ShaderCacheDX12::CompileCached(source.data(), source.size(), "fxaa.hlsl",
             nullptr, nullptr, "PSMain", "ps_5_0", flags, 0, &ps, &errors);
         if (FAILED(hr)) {
             if (errors) std::cerr << static_cast<const char*>(errors->GetBufferPointer());

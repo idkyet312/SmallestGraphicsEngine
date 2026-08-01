@@ -1,6 +1,7 @@
 #ifndef SCREEN_SPACE_REFLECTIONS_DX12_H
 #define SCREEN_SPACE_REFLECTIONS_DX12_H
 
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "Scene.h"
 #include <d3dcompiler.h>
@@ -94,7 +95,7 @@ private:
     bool Compile(const std::string& source, const char* entry, const char* target,
                  UINT flags, ComPtr<ID3DBlob>& output,
                  ComPtr<ID3DBlob>& errors) {
-        HRESULT hr = D3DCompile(
+        HRESULT hr = ShaderCacheDX12::CompileCached(
             source.data(), source.size(), "screen_space_reflections.hlsl",
             nullptr, nullptr, entry, target, flags, 0, &output, &errors);
         if (FAILED(hr) && errors)

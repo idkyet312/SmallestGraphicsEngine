@@ -3,6 +3,7 @@
 
 #include "DX12Core.h"
 #include "Scene.h"
+#include "ShaderCacheDX12.h"
 #include <d3dcompiler.h>
 #include <cstring>
 #include <fstream>
@@ -122,7 +123,7 @@ private:
                  UINT flags, ComPtr<ID3DBlob>& output,
                  ComPtr<ID3DBlob>& errors) {
         errors.Reset();
-        HRESULT hr = D3DCompile(source.data(), source.size(),
+        HRESULT hr = ShaderCacheDX12::CompileCached(source.data(), source.size(),
             "screen_space_ao.hlsl", nullptr, nullptr, entry, target, flags, 0,
             &output, &errors);
         if (FAILED(hr) && errors)

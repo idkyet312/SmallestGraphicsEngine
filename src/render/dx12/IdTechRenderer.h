@@ -11,6 +11,7 @@
 // Here we orchestrate the full frame using that class and populate the light upload
 // buffers correctly so the compute pass reads them via descriptor table.
 
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "ShaderDX12.h"
 #include "VisibilityBufferDX12.h"
@@ -491,7 +492,7 @@ struct GPUDrivenVisibilityContext {
         stream << file.rdbuf();
         std::string source = stream.str();
         ComPtr<ID3DBlob> shader, errors;
-        HRESULT hr = D3DCompile(source.data(), source.size(),
+        HRESULT hr = ShaderCacheDX12::CompileCached(source.data(), source.size(),
             "visibility_cull_cs.hlsl", nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
             "main", "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS |
             D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shader, &errors);

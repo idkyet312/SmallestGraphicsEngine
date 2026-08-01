@@ -1,6 +1,7 @@
 #ifndef SHADER_DX12_H
 #define SHADER_DX12_H
 
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "DXRProbeLayout.h"
 #include "MSAADX12.h"
@@ -366,7 +367,7 @@ public:
         const std::string code = ss.str();
 
         ComPtr<ID3DBlob> errorBlob;
-        HRESULT hr = D3DCompile(code.c_str(), code.length(), path,
+        HRESULT hr = ShaderCacheDX12::CompileCached(code.c_str(), code.length(), path,
             defines, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", target,
             compileFlags, 0, &outBlob, &errorBlob);
         if (FAILED(hr)) {
@@ -405,7 +406,7 @@ public:
         compileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
 #endif
         
-        HRESULT hr = D3DCompile(vsCode.c_str(), vsCode.length(), vertexPath,
+        HRESULT hr = ShaderCacheDX12::CompileCached(vsCode.c_str(), vsCode.length(), vertexPath,
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "vs_5_0",
             compileFlags, 0, &vsBlob, &errorBlob);
         
@@ -419,7 +420,7 @@ public:
         // Compile pixel shader
         ComPtr<ID3DBlob> psBlob;
         errorBlob.Reset();
-        hr = D3DCompile(psCode.c_str(), psCode.length(), pixelPath,
+        hr = ShaderCacheDX12::CompileCached(psCode.c_str(), psCode.length(), pixelPath,
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "ps_5_0",
             compileFlags, 0, &psBlob, &errorBlob);
         
@@ -434,7 +435,7 @@ public:
         };
         ComPtr<ID3DBlob> hdrPsBlob;
         errorBlob.Reset();
-        hr = D3DCompile(psCode.c_str(), psCode.length(), pixelPath,
+        hr = ShaderCacheDX12::CompileCached(psCode.c_str(), psCode.length(), pixelPath,
             hdrDefines, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "ps_5_0",
             compileFlags, 0, &hdrPsBlob, &errorBlob);
         if (FAILED(hr)) {

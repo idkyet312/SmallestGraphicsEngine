@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "OceanWaveSettings.h"
 #include "Scene.h"
@@ -238,7 +239,7 @@ private:
         const UINT flags = D3DCOMPILE_ENABLE_STRICTNESS |
                            D3DCOMPILE_OPTIMIZATION_LEVEL3;
         ComPtr<ID3DBlob> errors;
-        const HRESULT hr = D3DCompile(
+        const HRESULT hr = ShaderCacheDX12::CompileCached(
             shaderSource_.data(), shaderSource_.size(),
             "water_dx12.hlsl", defines, nullptr, entry, target,
             flags, 0, &bytecode, &errors);

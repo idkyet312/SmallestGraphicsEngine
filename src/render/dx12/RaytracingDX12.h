@@ -1,6 +1,7 @@
 #ifndef RAYTRACING_DX12_H
 #define RAYTRACING_DX12_H
 
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "Scene.h"
 #include "ForwardRenderer.h"
@@ -233,7 +234,7 @@ inline bool CreateRaytracingPipeline() {
     )";
 
     ComPtr<ID3DBlob> rtBlob, errorBlob;
-    HRESULT hr = D3DCompile(rtShaderCode, strlen(rtShaderCode), "rt_shaders.hlsl",
+    HRESULT hr = ShaderCacheDX12::CompileCached(rtShaderCode, strlen(rtShaderCode), "rt_shaders.hlsl",
         nullptr, nullptr, "", "lib_6_3",
         D3DCOMPILE_ENABLE_STRICTNESS, 0, &rtBlob, &errorBlob);
     if (FAILED(hr)) {

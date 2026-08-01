@@ -1,6 +1,7 @@
 #ifndef GRASS_MSAA_DX12_H
 #define GRASS_MSAA_DX12_H
 
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "MSAADX12.h"
 #include <d3dcompiler.h>
@@ -204,7 +205,7 @@ private:
         stream << file.rdbuf();
         const std::string source = stream.str();
         ComPtr<ID3DBlob> shader, errors;
-        if (FAILED(D3DCompile(source.data(), source.size(),
+        if (FAILED(ShaderCacheDX12::CompileCached(source.data(), source.size(),
                 "grass_msaa_composite_cs.hlsl", nullptr,
                 D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0",
                 D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,

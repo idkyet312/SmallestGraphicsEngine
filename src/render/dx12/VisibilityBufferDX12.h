@@ -1,6 +1,7 @@
 #ifndef VISIBILITY_BUFFER_DX12_H
 #define VISIBILITY_BUFFER_DX12_H
 
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "ShaderDX12.h"
 #include "SceneGraph.h"
@@ -1484,7 +1485,7 @@ private:
 
         ComPtr<ID3DBlob> vsBlob, psBlob, alphaPsBlob, errorBlob;
 
-        HRESULT hr = D3DCompile(vsCode.c_str(), vsCode.length(),
+        HRESULT hr = ShaderCacheDX12::CompileCached(vsCode.c_str(), vsCode.length(),
             "shaders/visbuf_vs.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "vs_5_0",
             compileFlags, 0, &vsBlob, &errorBlob);
@@ -1494,7 +1495,7 @@ private:
         }
 
         errorBlob.Reset();
-        hr = D3DCompile(psCode.c_str(), psCode.length(),
+        hr = ShaderCacheDX12::CompileCached(psCode.c_str(), psCode.length(),
             "shaders/visbuf_ps.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "ps_5_0",
             compileFlags, 0, &psBlob, &errorBlob);
@@ -1504,7 +1505,7 @@ private:
         }
 
         errorBlob.Reset();
-        hr = D3DCompile(psCode.c_str(), psCode.length(),
+        hr = ShaderCacheDX12::CompileCached(psCode.c_str(), psCode.length(),
             "shaders/visbuf_ps.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "mainAlpha", "ps_5_0",
             compileFlags, 0, &alphaPsBlob, &errorBlob);
@@ -1657,7 +1658,7 @@ private:
 #endif
 
         ComPtr<ID3DBlob> csBlob, errorBlob;
-        HRESULT hr = D3DCompile(csCode.c_str(), csCode.length(),
+        HRESULT hr = ShaderCacheDX12::CompileCached(csCode.c_str(), csCode.length(),
             "shaders/visbuf_resolve_cs.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_1",
             compileFlags, 0, &csBlob, &errorBlob);
@@ -2071,7 +2072,7 @@ private:
                              ComPtr<ID3D12PipelineState>& result) -> bool {
             ComPtr<ID3DBlob> shader;
             errors.Reset();
-            HRESULT compile = D3DCompile(source.data(), source.size(),
+            HRESULT compile = ShaderCacheDX12::CompileCached(source.data(), source.size(),
                 "visbuf_exposure_cs.hlsl", nullptr,
                 D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, "cs_5_0",
                 D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
@@ -2132,7 +2133,7 @@ private:
         const UINT flags = D3DCOMPILE_ENABLE_STRICTNESS |
                            D3DCOMPILE_OPTIMIZATION_LEVEL3;
         ComPtr<ID3DBlob> downsample, upsample, errors;
-        HRESULT hr = D3DCompile(
+        HRESULT hr = ShaderCacheDX12::CompileCached(
             source.data(), source.size(), "shaders/visbuf_bloom_cs.hlsl",
             nullptr, nullptr, "Downsample", "cs_5_0", flags, 0,
             &downsample, &errors);
@@ -2142,7 +2143,7 @@ private:
             return false;
         }
         errors.Reset();
-        hr = D3DCompile(
+        hr = ShaderCacheDX12::CompileCached(
             source.data(), source.size(), "shaders/visbuf_bloom_cs.hlsl",
             nullptr, nullptr, "Upsample", "cs_5_0", flags, 0,
             &upsample, &errors);
@@ -2356,7 +2357,7 @@ private:
         const std::string source = stream.str();
 
         ComPtr<ID3DBlob> shaderBlob, errorBlob;
-        HRESULT hr = D3DCompile(source.data(), source.size(),
+        HRESULT hr = ShaderCacheDX12::CompileCached(source.data(), source.size(),
             "shaders/visbuf_post_cs.hlsl",
             nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0",
             D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,

@@ -1,6 +1,7 @@
 #ifndef ENVIRONMENT_IBL_DX12_H
 #define ENVIRONMENT_IBL_DX12_H
 
+#include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include <d3dcompiler.h>
 #include <fstream>
@@ -139,7 +140,7 @@ private:
     bool Compile(const std::string& source, const char* entry,
                  Microsoft::WRL::ComPtr<ID3DBlob>& blob) {
         Microsoft::WRL::ComPtr<ID3DBlob> errors;
-        const HRESULT result = D3DCompile(
+        const HRESULT result = ShaderCacheDX12::CompileCached(
             source.data(), source.size(), "environment_ibl_cs.hlsl", nullptr,
             D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, "cs_5_0",
             D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
