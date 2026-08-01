@@ -7,6 +7,7 @@
 
 struct VehicleSystem {
     static constexpr float HelicopterMaxHealth = 2000.0f;
+    static constexpr float BoatMaxHealth = 1200.0f;
 
     DirectX::XMFLOAT3 humveeModelCenter{};
     float humveeModelMinY = 0.0f;
@@ -55,6 +56,18 @@ struct VehicleSystem {
     DirectX::XMFLOAT3 primaryHumveeSpawn{ 0.0f, 3.45f, 0.0f };
     float primaryHumveeYaw = 0.0f;
 
+    // Boat: circles the island on the water surface. Sinks in place (rather
+    // than falling like a downed helicopter) once destroyed.
+    DirectX::XMFLOAT3 boatPosition{ 0.0f, 0.0f, 0.0f };
+    DirectX::XMFLOAT3 boatCenter{ 0.0f, 0.0f, 0.0f };
+    float boatYaw = 0.0f;
+    float boatRoll = 0.0f;
+    float boatPatrolTime = 0.0f;
+    float boatHealth = BoatMaxHealth;
+    bool boatDead = false;
+    bool boatSunk = false;
+    float boatSinkDepth = 0.0f;
+
     struct DamageResult {
         DirectX::XMFLOAT3 position{};
         bool applied = false;
@@ -90,6 +103,17 @@ struct VehicleSystem {
             std::sin(secondaryHelicopterYaw) * 2.2f,
             -0.8f,
             std::cos(secondaryHelicopterYaw) * 2.2f };
+        result.destroyed = true;
+        return result;
+    }
+
+    DamageResult DamageBoat(float damage) {
+        DamageResult result{ boatPosition };
+        if (damage <= 0.0f || boatDead) return result;
+        result.applied = true;
+        boatHealth = (std::max)(0.0f, boatHealth - damage);
+        if (boatHealth > 0.0f) return result;
+        boatDead = true;
         result.destroyed = true;
         return result;
     }
@@ -132,6 +156,15 @@ struct VehicleSystem {
         humveeTurretFireCooldown = 0.0f;
         primaryHumveeSpawn = { 0.0f, 3.45f, 0.0f };
         primaryHumveeYaw = 0.0f;
+
+        boatPosition = boatCenter;
+        boatYaw = 0.0f;
+        boatRoll = 0.0f;
+        boatPatrolTime = 0.0f;
+        boatHealth = BoatMaxHealth;
+        boatDead = false;
+        boatSunk = false;
+        boatSinkDepth = 0.0f;
     }
 };
 

@@ -16,6 +16,7 @@ enum class LevelLoadStage {
     Weapons,
     Humvee,
     Helicopter,
+    Boat,
     BanditModel,
     BanditSpawn,
     GPUFinalize,

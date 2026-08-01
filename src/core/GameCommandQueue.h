@@ -7,6 +7,7 @@
 enum class GameCommand : std::size_t {
     ResetLevelRuntime,
     RespawnTurretGunner,
+    RespawnBoatGunner,
     EditorBeginPlay,
     EditorStopPlay,
     EditorReturnToMenu,

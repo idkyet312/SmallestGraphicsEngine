@@ -48,10 +48,26 @@ public:
         XMVECTOR pos = XMLoadFloat3(&Position);
         XMVECTOR front = XMLoadFloat3(&Front);
         XMVECTOR up = XMLoadFloat3(&Up);
+        if (explosionTrauma_ > 0.001f) {
+            const float strength = explosionTrauma_ * explosionTrauma_;
+            const float yaw = std::sin(explosionShakeTime_ * 37.0f + 0.7f) *
+                              XMConvertToRadians(1.45f) * strength;
+            const float pitch = std::sin(explosionShakeTime_ * 53.0f + 2.1f) *
+                                XMConvertToRadians(1.05f) * strength;
+            const XMVECTOR right = XMVector3Normalize(XMVector3Cross(front, up));
+            front = XMVector3Normalize(front + right * std::tan(yaw) +
+                                       up * std::tan(pitch));
+            pos += right * (std::sin(explosionShakeTime_ * 43.0f) * 0.055f * strength);
+            pos += up * (std::sin(explosionShakeTime_ * 61.0f + 1.3f) * 0.035f * strength);
+        }
         return XMMatrixLookAtLH(pos, XMVectorAdd(pos, front), up);
     }
 
     void Update(float deltaTime) {
+        explosionShakeTime_ += deltaTime;
+        explosionTrauma_ = (std::max)(0.0f, explosionTrauma_ - deltaTime * 1.8f);
+        explosionFovKick_ *= std::exp(-8.5f * (std::max)(0.0f, deltaTime));
+        if (explosionFovKick_ < 0.01f) explosionFovKick_ = 0.0f;
         if (FPSMode) {
             if (IsSliding) {
                 Position.x += SlideDirection.x * SlideSpeed * deltaTime;
@@ -183,6 +199,21 @@ public:
         updateCameraVectors();
     }
 
+    void ApplyExplosionImpulse(const XMFLOAT3& source, float visualSize) {
+        const float dx = source.x - Position.x;
+        const float dy = source.y - Position.y;
+        const float dz = source.z - Position.z;
+        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const float reach = (std::max)(12.0f, visualSize * 5.5f);
+        const float falloff = (std::max)(0.0f, 1.0f - distance / reach);
+        if (falloff <= 0.0f) return;
+        explosionTrauma_ = (std::min)(1.0f, explosionTrauma_ +
+            falloff * (0.45f + visualSize * 0.055f));
+        explosionFovKick_ = (std::max)(explosionFovKick_, 3.2f * falloff);
+    }
+
+    float ExplosionFovKick() const { return explosionFovKick_; }
+
     void Jump() {
         if (FPSMode && IsGrounded && !IsCrouching) {
             VerticalVelocity = JumpStrength;
@@ -191,6 +222,10 @@ public:
     }
 
 private:
+    float explosionTrauma_ = 0.0f;
+    float explosionShakeTime_ = 0.0f;
+    float explosionFovKick_ = 0.0f;
+
     void updateCameraVectors() {
         float yawRad = XMConvertToRadians(Yaw);
         float pitchRad = XMConvertToRadians(Pitch);

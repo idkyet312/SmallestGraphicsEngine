@@ -118,6 +118,8 @@ std::shared_ptr<SceneNode>  g_explosiveBarrelShadowModel;
 std::shared_ptr<SceneNode>  g_humveeModel;
 std::shared_ptr<SceneNode>  g_humveeShadowModel;
 std::shared_ptr<SceneNode>  g_helicopterModel;
+std::shared_ptr<SceneNode>  g_boatModel;
+std::shared_ptr<SceneNode>  g_boatShadowModel;
 std::shared_ptr<SceneNode>  g_dandelionModel;
 std::vector<DandelionInstance> g_dandelionInstances;
 static XMFLOAT3             g_dandelionSourceCenter{};
@@ -225,6 +227,23 @@ static float&               g_humveeHouseImpactCooldown = g_game.vehicles.humvee
 static XMFLOAT3&            g_humveeAimPoint = g_game.vehicles.humveeAimPoint;
 static float&               g_humveeTurretYaw = g_game.vehicles.humveeTurretYaw;
 static float&               g_humveeTurretFireCooldown = g_game.vehicles.humveeTurretFireCooldown;
+static XMFLOAT3             g_boatModelCenter{};
+static float                g_boatModelMinY = 0.0f;
+static float                g_boatModelScale = 1.0f;
+static XMFLOAT3&            g_boatPosition = g_game.vehicles.boatPosition;
+static XMFLOAT3&            g_boatCenter = g_game.vehicles.boatCenter;
+static float&               g_boatYaw = g_game.vehicles.boatYaw;
+static float&               g_boatRoll = g_game.vehicles.boatRoll;
+static float&               g_boatPatrolTime = g_game.vehicles.boatPatrolTime;
+static float&               g_boatHealth = g_game.vehicles.boatHealth;
+static bool&                g_boatDead = g_game.vehicles.boatDead;
+static bool&                g_boatSunk = g_game.vehicles.boatSunk;
+static float&               g_boatSinkDepth = g_game.vehicles.boatSinkDepth;
+constexpr float              kBoatMaxHealth = VehicleSystem::BoatMaxHealth;
+// Shoreline (TerrainRendererDX12 island falloff) flattens into beach around
+// 28-43 units out and only reaches open seabed past ~88. Patrol well clear of
+// the beach/surf so the boat reads as sailing open water, not beached.
+constexpr float              kBoatPatrolRadius = 60.0f;
 SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
 float                       g_banditLeftArmReach = 0.55f;
@@ -235,6 +254,13 @@ GunAudio                    g_rpgFireAudio;
 GunAudio                    g_reloadAudio;
 GunAudio                    g_explosionAudio;
 GunAudio                    g_grenadeExplosionAudio;
+struct PendingExplosionAudio {
+    float delay = 0.0f;
+    float volume = 1.0f;
+    float pitch = 1.0f;
+    bool grenade = false;
+};
+std::vector<PendingExplosionAudio> g_pendingExplosionAudio;
 GunAudio                    g_hitAudio;
 GunAudio                    g_banditSpottedAudio1;
 GunAudio                    g_banditSpottedAudio2;
@@ -484,6 +510,57 @@ static void ConfigureHelicopterBounds() {
     g_helicopterModelScale = 10.0f / horizontalLength;
 }
 
+XMMATRIX BoatWorldMatrix() {
+    return XMMatrixTranslation(-g_boatModelCenter.x, -g_boatModelMinY,
+                               -g_boatModelCenter.z) *
+           XMMatrixScaling(g_boatModelScale, g_boatModelScale, g_boatModelScale) *
+           XMMatrixRotationZ(g_boatRoll) *
+           XMMatrixRotationY(g_boatYaw) *
+           XMMatrixTranslation(g_boatPosition.x,
+                               g_boatPosition.y - g_boatSinkDepth,
+                               g_boatPosition.z);
+}
+
+static XMFLOAT3 BoatTurretMountWorld() {
+    // Gunner sits low in the boat's seat well rather than standing on the
+    // hull rim, offset toward the stern seat instead of the bow tip.
+    const float sx = std::sin(g_boatYaw), cz = std::cos(g_boatYaw);
+    return { g_boatPosition.x + sx * 0.4f,
+             g_boatPosition.y - g_boatSinkDepth - 0.65f,
+             g_boatPosition.z + cz * 0.4f };
+}
+
+static void ConfigureBoatBounds() {
+    if (!g_boatModel || !g_boatModel->mesh) return;
+    XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
+    XMFLOAT3 maximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    for (const MeshPrimitive& primitive : g_boatModel->mesh->primitives) {
+        for (size_t vertex = 0; vertex + 11 < primitive.vertices.size(); vertex += 12) {
+            const float x = primitive.vertices[vertex];
+            const float y = primitive.vertices[vertex + 1];
+            const float z = primitive.vertices[vertex + 2];
+            minimum.x = (std::min)(minimum.x, x);
+            minimum.y = (std::min)(minimum.y, y);
+            minimum.z = (std::min)(minimum.z, z);
+            maximum.x = (std::max)(maximum.x, x);
+            maximum.y = (std::max)(maximum.y, y);
+            maximum.z = (std::max)(maximum.z, z);
+        }
+    }
+    const float horizontalLength = (std::max)(
+        maximum.x - minimum.x, maximum.z - minimum.z);
+    if (horizontalLength <= 0.001f) return;
+    g_boatModelCenter = {
+        (minimum.x + maximum.x) * 0.5f,
+        (minimum.y + maximum.y) * 0.5f,
+        (minimum.z + maximum.z) * 0.5f };
+    g_boatModelMinY = minimum.y;
+    // Waterline sits a little above the hull bottom so it reads as floating,
+    // not resting on the surface.
+    g_boatModelScale = 9.0f / horizontalLength;
+    g_boatModelMinY += 0.35f / g_boatModelScale;
+}
+
 static bool ApplyDarkGreenToHumvee() {
     if (!g_humveeModel) return false;
     bool changed = false;
@@ -530,6 +607,16 @@ static void DamageSecondaryHelicopter(float damage, const XMFLOAT3& hit) {
     scene.SpawnSmokeBurst(g_secondaryHelicopterPosition, 1.25f, 1.5f);
 }
 
+static void DamageBoat(float damage, const XMFLOAT3& hit) {
+    if (damage <= 0.0f || g_boatDead || !g_boatModel) return;
+    const VehicleSystem::DamageResult result = g_game.vehicles.DamageBoat(damage);
+    if (!result.applied) return;
+    scene.SpawnSmokeBurst(hit, 0.22f, 0.10f);
+    if (!result.destroyed) return;
+    scene.SpawnExplosionFX(g_boatPosition, 6.0f, 1.0f);
+    scene.SpawnSmokeBurst(g_boatPosition, 1.6f, 2.2f);
+}
+
 static bool HitHelicopterAtSegment(const XMFLOAT3& position, bool dead,
                                    const XMFLOAT3& start, const XMFLOAT3& end,
                                    float radius, XMFLOAT3& hit) {
@@ -563,6 +650,38 @@ static bool HitSecondaryHelicopterSegment(const XMFLOAT3& start,
     return g_stressTestMode && HitHelicopterAtSegment(
         g_secondaryHelicopterPosition, g_secondaryHelicopterDead,
         start, end, radius, hit);
+}
+
+static bool HitBoatSegment(const XMFLOAT3& start, const XMFLOAT3& end,
+                           float radius, XMFLOAT3& hit) {
+    if (!g_boatModel || g_boatDead) return false;
+    // Low, flat hull -- a single generous sphere at deck height would engulf
+    // the standing mounted gunner and steal shots aimed at his head/torso.
+    // Model the hull as an oriented box instead: long along the boat's yaw,
+    // narrow across the beam, and only as tall as the actual freeboard.
+    const XMVECTOR a = XMLoadFloat3(&start);
+    const XMVECTOR b = XMLoadFloat3(&end);
+    const XMVECTOR center = XMLoadFloat3(&g_boatPosition);
+    const XMVECTOR ab = b - a;
+    const float lengthSq = XMVectorGetX(XMVector3LengthSq(ab));
+    float t = lengthSq > 1e-6f
+        ? XMVectorGetX(XMVector3Dot(center - a, ab)) / lengthSq : 0.0f;
+    t = (std::max)(0.0f, (std::min)(1.0f, t));
+    const XMVECTOR closest = a + ab * t;
+    const XMVECTOR offset = closest - center;
+    const float sinYaw = std::sin(g_boatYaw), cosYaw = std::cos(g_boatYaw);
+    XMFLOAT3 offsetF; XMStoreFloat3(&offsetF, offset);
+    // Rotate the offset into the hull's local frame (X = beam, Z = length).
+    const float localX = offsetF.x * cosYaw - offsetF.z * sinYaw;
+    const float localZ = offsetF.x * sinYaw + offsetF.z * cosYaw;
+    const float localY = offsetF.y;
+    constexpr float halfBeam = 1.5f, halfLength = 4.5f, hullHeight = 1.1f;
+    if (std::fabs(localX) > halfBeam + radius ||
+        std::fabs(localZ) > halfLength + radius ||
+        localY < -hullHeight - radius || localY > radius)
+        return false;
+    XMStoreFloat3(&hit, closest);
+    return true;
 }
 
 static void PlayBanditDeathEvents();
@@ -854,6 +973,45 @@ static void UpdateSecondaryHelicopter(float dt) {
     g_secondaryHelicopterFireCooldown = 0.10f;
 }
 
+static void UpdateBoat(float dt) {
+    if (!g_boatModel) return;
+    if (g_boatDead) {
+        if (g_boatSunk) return;
+        // Settle into the water rather than falling: sink depth grows and
+        // levels off, with a slow list to one side as it goes under.
+        g_boatSinkDepth += dt * 0.9f;
+        g_boatRoll = (std::min)(0.55f, g_boatRoll + dt * 0.35f);
+        if (g_boatSinkDepth >= 3.2f) {
+            g_boatSinkDepth = 3.2f;
+            g_boatSunk = true;
+        }
+        return;
+    }
+
+    g_boatPatrolTime += dt;
+    // Slow circle around the island, water-level height with a light bob.
+    // Starts a quarter-turn around the circle (not phase 0, which sits right
+    // in front of the player's spawn point) so it isn't beside the player
+    // the moment the level loads.
+    const float patrolPhase = g_boatPatrolTime * 0.065f + XM_PIDIV2;
+    const float px = g_boatCenter.x + std::sin(patrolPhase) * kBoatPatrolRadius;
+    const float pz = g_boatCenter.z + std::cos(patrolPhase) * kBoatPatrolRadius;
+    g_boatPosition.x = px;
+    g_boatPosition.z = pz;
+    g_boatPosition.y = g_boatCenter.y + std::sin(g_boatPatrolTime * 0.9f) * 0.10f;
+
+    // Face along the direction of travel (tangent to the circle).
+    const float tangentX = std::cos(patrolPhase);
+    const float tangentZ = -std::sin(patrolPhase);
+    const float desiredYaw = std::atan2(tangentX, tangentZ);
+    const float yawDelta = std::atan2(
+        std::sin(desiredYaw - g_boatYaw), std::cos(desiredYaw - g_boatYaw));
+    g_boatYaw += yawDelta * (1.0f - std::exp(-1.2f * (std::max)(0.0f, dt)));
+    const float desiredRoll = std::sin(g_boatPatrolTime * 0.5f) * 0.035f;
+    g_boatRoll += (desiredRoll - g_boatRoll) *
+        (1.0f - std::exp(-2.0f * (std::max)(0.0f, dt)));
+}
+
 static XMFLOAT3 HumveeTurretMountWorld() {
     XMFLOAT4X4 physicsPose;
     if (!g_destruction.GetVehicleTransform(physicsPose))
@@ -1096,6 +1254,29 @@ static bool SpawnHumveeTurretGunner(int vehicleIndex) {
                     g_secondaryHumveePosition.z + g_humveeTurretLocal.z };
     bandit->turretGunner = true;
     bandit->mountedVehicleIndex = vehicleIndex;
+    bandit->spawnSlot = -1;
+    bandit->leftArmReach = g_banditLeftArmReach;
+    bandit->fireCooldown = 1.4f;
+    bandit->PlayClip("Idle");
+    g_bandits.push_back(std::move(bandit));
+    return true;
+}
+
+// Mounted gunner riding the patrol boat. Uses vehicle index 2 so it never
+// collides with the humvee's turret indices (0 primary, 1 secondary).
+static bool SpawnBoatTurretGunner() {
+    if (!g_banditModel.valid || !g_boatModel) return false;
+    for (const auto& existing : g_bandits)
+        if (existing && !existing->Dead() && existing->turretGunner &&
+            existing->mountedVehicleIndex == 2)
+            return true;
+    auto bandit = std::make_unique<SkinnedEnemy>();
+    if (!bandit->Init(g_banditModel)) return false;
+    bandit->grenadeCooldown = kBanditGrenadeCooldownMin +
+        RandomUnit() * (kBanditGrenadeCooldownMax - kBanditGrenadeCooldownMin);
+    bandit->position = BoatTurretMountWorld();
+    bandit->turretGunner = true;
+    bandit->mountedVehicleIndex = 2;
     bandit->spawnSlot = -1;
     bandit->leftArmReach = g_banditLeftArmReach;
     bandit->fireCooldown = 1.4f;
@@ -1622,6 +1803,9 @@ static void UpdateExplosiveBarrels(float dt) {
             if (!impact && HitSecondaryHelicopterSegment(
                     previous, barrel.position, 0.44f, impactPoint))
                 impact = true;
+            if (!impact && HitBoatSegment(
+                    previous, barrel.position, 0.44f, impactPoint))
+                impact = true;
             if (!impact && g_banditLoaded) {
                 for (const auto& bandit : g_bandits) {
                     if (bandit && !bandit->Dead() && bandit->BlocksProjectile(
@@ -1787,11 +1971,13 @@ ComPtr<ID3D12Resource> g_bloodTexture;
 ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 ComPtr<ID3D12Resource> g_fireTexture;
 ComPtr<ID3D12Resource> g_explosionTexture;
+ComPtr<ID3D12Resource> g_explosionCoreTexture;
 static std::vector<ComPtr<ID3D12Resource>> g_smokeUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_bloodUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_muzzleFlashUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_fireUploadHeaps;
 static std::vector<ComPtr<ID3D12Resource>> g_explosionUploadHeaps;
+static std::vector<ComPtr<ID3D12Resource>> g_explosionCoreUploadHeaps;
 static bool                 fullLevelAssetsLoaded = false;
 static bool                 emptyLevelAssetsLoaded = false;
 static StaticBufferStatsDX12 levelLoadingUploadBaseline = {};
@@ -2132,7 +2318,7 @@ static void DrawDXRDDGIProbeDebug(CXMMATRIX view, CXMMATRIX projection) {
 
 static void BeginLevelLoading() {
     g_game.loading.Begin({
-        g_emptyLevelMode ? 5u : 10u,
+        g_emptyLevelMode ? 5u : 11u,
         g_emptyLevelMode ? "Terrain material"
                          : "Terrain material and crate model",
         g_emptyLevelMode ? "floor material" : "Content/Models/h2.glb"
@@ -4149,6 +4335,12 @@ static void LoadFloorMudMaterial() {
         g_dx12.device, g_dx12.commandList, g_explosionUploadHeaps);
     if (!g_explosionTexture)
         std::cerr << "Explosion sheet (models/textures/explosion_soluna.png) unavailable\n";
+
+    g_explosionCoreTexture = GLBImporter::LoadTextureFromFile(
+        ResolveTexturePath("Content/Models/textures/explosion_boom3.png"),
+        g_dx12.device, g_dx12.commandList, g_explosionCoreUploadHeaps);
+    if (!g_explosionCoreTexture)
+        std::cerr << "Explosion core sheet (models/textures/explosion_boom3.png) unavailable\n";
 }
 
 // Crysis-style plank wall: the destructible is built from real structural
@@ -5373,6 +5565,7 @@ static void StopEditorPlaytest() {
     scene.ResetLevelRuntimeState();
     g_game.commands.Set(GameCommand::ResetLevelRuntime, false);
     g_game.commands.Set(GameCommand::RespawnTurretGunner, false);
+    g_game.commands.Set(GameCommand::RespawnBoatGunner, false);
     g_game.session.StopTimer();
     scene.camera.FPSMode = false;
     scene.camera = g_editorCameraSnapshot;
@@ -5614,6 +5807,22 @@ static bool CreateAllGeometry() {
         });
     }
     if (!CreateVertexBuffer(explosionVerts, geo.explosionVertexBuffer, geo.explosionVBV)) return false;
+
+    // CC0 white-hot core sheet: 8 columns x 8 rows, 64 frames at 128 px.
+    std::vector<VertexPosNormUV> explosionCoreVerts;
+    explosionCoreVerts.reserve(64 * 6);
+    for (int frame = 0; frame < 64; ++frame) {
+        const int column = frame % 8;
+        const int row = frame / 8;
+        const float u0 = column / 8.0f, u1 = (column + 1) / 8.0f;
+        const float v0 = row / 8.0f, v1 = (row + 1) / 8.0f;
+        explosionCoreVerts.insert(explosionCoreVerts.end(), {
+            {{-0.5f,-0.5f,0},{0,0,1},{u0,v1}}, {{ 0.5f,-0.5f,0},{0,0,1},{u1,v1}}, {{ 0.5f, 0.5f,0},{0,0,1},{u1,v0}},
+            {{-0.5f,-0.5f,0},{0,0,1},{u0,v1}}, {{ 0.5f, 0.5f,0},{0,0,1},{u1,v0}}, {{-0.5f, 0.5f,0},{0,0,1},{u0,v0}},
+        });
+    }
+    if (!CreateVertexBuffer(explosionCoreVerts, geo.explosionCoreVertexBuffer,
+                            geo.explosionCoreVBV)) return false;
     geo.sphereVertexCount = (UINT)sphereVerts.size();
     geo.capsuleVertexCount = (UINT)capsuleVerts.size();
 
@@ -6469,9 +6678,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         const float dz = position.z - scene.camera.Position.z;
         const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
         const float reach = 55.0f + size * 4.0f;
-        const float volume = (std::max)(0.08f, 1.0f - distance / reach);
+        const float volume = (std::max)(0.0f, 1.0f - distance / reach);
+        if (volume <= 0.01f) return;
         const float pitch = 0.92f + ((float)std::rand() / RAND_MAX) * 0.10f;
-        (grenade ? g_grenadeExplosionAudio : g_explosionAudio).Play(volume, pitch);
+        // Sound travels noticeably slower than light. Cap delay so distant
+        // gameplay feedback stays responsive while still selling scale.
+        g_pendingExplosionAudio.push_back({
+            (std::min)(0.35f, distance / 343.0f), volume, pitch, grenade });
     };
     g_hitAudio.Initialize("Content/Audio/bullet_flesh_hit.mp3");
     g_banditSpottedAudio1.Initialize("Content/Audio/bandit_spotted_01.wav");
@@ -6919,8 +7132,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_game.commands.Set(GameCommand::RespawnTurretGunner,
                     !g_customLevelMode ||
                     FirstRuntimeEntity(LevelEntityType::Humvee) != nullptr);
+                g_game.commands.Set(GameCommand::RespawnBoatGunner, true);
             } else {
                 g_game.commands.Set(GameCommand::RespawnTurretGunner, false);
+                g_game.commands.Set(GameCommand::RespawnBoatGunner, false);
             }
             // Do not charge restart/reset stalls to completion time.
             lastTime = gameTimer.GetElapsed();
@@ -6960,11 +7175,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (!g_emptyLevelMode) {
             UpdateHelicopter(deltaTime);
             UpdateSecondaryHelicopter(deltaTime);
+            UpdateBoat(deltaTime);
             UpdateExplosiveBarrels(deltaTime);
         }
         g_gunAudio.Update();
         g_rpgFireAudio.Update();
         g_reloadAudio.Update();
+        for (PendingExplosionAudio& sound : g_pendingExplosionAudio)
+            sound.delay -= deltaTime;
+        for (const PendingExplosionAudio& sound : g_pendingExplosionAudio) {
+            if (sound.delay <= 0.0f)
+                (sound.grenade ? g_grenadeExplosionAudio : g_explosionAudio)
+                    .Play(sound.volume, sound.pitch);
+        }
+        g_pendingExplosionAudio.erase(
+            std::remove_if(g_pendingExplosionAudio.begin(),
+                           g_pendingExplosionAudio.end(),
+                [](const PendingExplosionAudio& sound) { return sound.delay <= 0.0f; }),
+            g_pendingExplosionAudio.end());
         g_explosionAudio.Update();
         g_grenadeExplosionAudio.Update();
         g_hitAudio.Update();
@@ -7008,6 +7236,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_game.commands.Set(GameCommand::RespawnTurretGunner,
                     !(firstReady && secondReady));
             }
+            if (g_game.commands.Pending(GameCommand::RespawnBoatGunner)) {
+                g_game.commands.Set(GameCommand::RespawnBoatGunner,
+                    !SpawnBoatTurretGunner());
+            }
             if (g_heldBandit && g_heldBandit->Dead()) g_heldBandit = nullptr;
             static std::unordered_map<SkinnedEnemy*, float> banditUpdateDebt;
             for (auto& bandit : g_bandits) {
@@ -7041,6 +7273,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 if (updateBandit && bandit->turretGunner) {
                     const XMFLOAT3 mount = bandit->mountedVehicleIndex == 0
                         ? HumveeTurretMountWorld()
+                        : bandit->mountedVehicleIndex == 2
+                        ? BoatTurretMountWorld()
                         : XMFLOAT3{
                             g_secondaryHumveePosition.x + g_humveeTurretLocal.x,
                             g_humveeTurretLocal.y + 3.45f,
@@ -7283,6 +7517,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         impact = candidate;
                         struck = true;
                     }
+                    if (!struck && HitBoatSegment(
+                            projectile.previousPosition, projectile.position,
+                            radius, candidate)) {
+                        impact = candidate;
+                        struck = true;
+                        DamageBoat(kRocketHelicopterDamage, candidate);
+                    }
                     if (!struck && HitExplosiveBarrelSegment(
                             projectile.previousPosition, projectile.position,
                             radius, barrelIndex, candidate)) {
@@ -7373,6 +7614,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                     projectile.rocket ? kRocketHelicopterDamage
                                                       : scene.grenadeEnemyDamage * falloff,
                                     g_secondaryHelicopterPosition);
+                            }
+                        }
+                        if (!g_boatDead && g_boatModel) {
+                            const float dx = g_boatPosition.x - center.x;
+                            const float dy = g_boatPosition.y - center.y;
+                            const float dz = g_boatPosition.z - center.z;
+                            const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+                            const float reach = scene.grenadeEnemyRadius + 5.0f;
+                            if (distance < reach) {
+                                const float falloff = 1.0f - distance / reach;
+                                DamageBoat(
+                                    projectile.rocket ? kRocketHelicopterDamage
+                                                      : scene.grenadeEnemyDamage * falloff,
+                                    g_boatPosition);
                             }
                         }
                         // Grenades hurt the player too. Previously only enemies
@@ -7492,6 +7747,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     projectile.active = false;
                     continue;
                 }
+                XMFLOAT3 boatHit;
+                if (!projectile.hostile && HitBoatSegment(
+                        projectile.previousPosition, projectile.position,
+                        bulletRadius, boatHit)) {
+                    const XMFLOAT3 normal(-projectile.direction.x,
+                                          -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(boatHit, normal);
+                    DamageBoat(34.0f * projectile.damageMultiplier, boatHit);
+                    projectile.active = false;
+                    continue;
+                }
                 size_t barrelIndex = 0;
                 XMFLOAT3 barrelHit;
                 if (HitExplosiveBarrelSegment(
@@ -7594,6 +7861,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (g_game.session.Screen() == GameScreen::Level1 &&
             !g_emptyLevelMode && g_banditLoaded &&
             !g_game.commands.Pending(GameCommand::RespawnTurretGunner) &&
+            !g_game.commands.Pending(GameCommand::RespawnBoatGunner) &&
             LiveBanditCount() == 0 && g_helicopterDead &&
             (!g_stressTestMode || g_secondaryHelicopterDead))
             OpenWinScreen();
@@ -8095,6 +8363,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             else
                 std::cerr << "Humvee dark green material failed\n";
 
+            AdvanceLevelLoading(LevelLoadStage::Boat,
+                "Military boat import, bounds and patrol setup",
+                "Content/Models/MiltaryBoat/miltaryboat.glb",
+                g_helicopterModel != nullptr);
+        } else if (g_game.loading.Stage() == LevelLoadStage::Boat) {
+            g_boatModel = GLBImporter::LoadGLB(
+                "Content/Models/MiltaryBoat/miltaryboat.glb",
+                g_dx12.device, g_dx12.commandList);
+            if (g_boatModel) {
+                ConfigureBoatBounds();
+                g_boatShadowModel = GLBImporter::MergeSceneForDepth(
+                    g_boatModel, g_dx12.device);
+                g_boatCenter = { 0.0f, 0.0f, 0.0f };
+                g_boatPosition = g_boatCenter;
+                std::cout << "Military boat GLB ready, patrolling island\n";
+            } else {
+                std::cerr << "Military boat GLB failed to load\n";
+            }
+
             AdvanceLevelLoading(LevelLoadStage::BanditModel,
                 "Bandit mesh, skeleton, clips and physics asset",
                 "Content/Models/MilitaryMercenaryBandit/SK_Bandit.FBX",
@@ -8132,6 +8419,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     if (!SpawnBandit()) break;
                 SpawnHumveeTurretGunner(0);
                 if (g_stressTestMode) SpawnHumveeTurretGunner(1);
+                SpawnBoatTurretGunner();
                 g_banditLoaded = true;
                 std::cout << "Bandit squad ready: " << LiveBanditCount()
                           << " live enemies\n";
@@ -8169,6 +8457,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             WaitForGPUAllFrames();
             ReleaseMaterialUploadHeaps(g_helicopterModel);
             ReleaseMaterialUploadHeaps(g_humveeModel);
+            ReleaseMaterialUploadHeaps(g_boatModel);
             ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
             ReleaseMaterialUploadHeaps(g_dandelionModel);
             for (const auto& entry : g_prefabModelCache)

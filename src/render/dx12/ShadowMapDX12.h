@@ -694,6 +694,13 @@ public:
                 depthShader, humveeTransforms, lightSpace);
         }
 
+        if (!g_emptyLevelMode && g_boatModel) {
+            std::vector<XMMATRIX> boatTransforms = { BoatWorldMatrix() };
+            DrawSceneNodeShadowInstances(
+                g_boatShadowModel ? g_boatShadowModel : g_boatModel,
+                depthShader, boatTransforms, lightSpace);
+        }
+
         for (const PrefabRenderBatch& batch : prefabRenderBatches) {
             if (batch.model && batch.castShadow && !batch.transforms.empty())
                 DrawSceneNodeShadowInstances(batch.model, depthShader,

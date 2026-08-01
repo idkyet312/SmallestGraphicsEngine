@@ -40,10 +40,13 @@ extern ComPtr<ID3D12Resource> g_bloodTexture;
 extern ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 extern ComPtr<ID3D12Resource> g_fireTexture;
 extern ComPtr<ID3D12Resource> g_explosionTexture;   // 4x4 flipbook explosion sheet
+extern ComPtr<ID3D12Resource> g_explosionCoreTexture; // 8x8 white-hot core sheet
 extern std::shared_ptr<SceneNode> g_explosiveBarrelModel;
 extern std::shared_ptr<SceneNode> g_explosiveBarrelShadowModel;
 extern std::shared_ptr<SceneNode> g_humveeModel;
+extern std::shared_ptr<SceneNode> g_boatModel;
 extern std::shared_ptr<SceneNode> g_humveeShadowModel;
+extern std::shared_ptr<SceneNode> g_boatShadowModel;
 extern std::shared_ptr<SceneNode> g_helicopterModel;
 struct DandelionInstance {
     DirectX::XMFLOAT4X4 transform;
@@ -71,6 +74,7 @@ DirectX::XMMATRIX HumveeWorldMatrix();
 DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
 DirectX::XMMATRIX HelicopterWorldMatrix();
 DirectX::XMMATRIX SecondaryHelicopterWorldMatrix();
+DirectX::XMMATRIX BoatWorldMatrix();
 
 struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
@@ -81,6 +85,7 @@ struct GeometryBuffers {
     ComPtr<ID3D12Resource>   flashVertexBuffer;     // first cell of 4-frame VFX sheet
     ComPtr<ID3D12Resource>   fireVertexBuffer;      // 60 cells from 10x6 fire sheet
     ComPtr<ID3D12Resource>   explosionVertexBuffer; // 16 cells from 4x4 explosion sheet
+    ComPtr<ID3D12Resource>   explosionCoreVertexBuffer; // 64 cells from 8x8 core sheet
     D3D12_VERTEX_BUFFER_VIEW cubeVBV  = {};
     D3D12_VERTEX_BUFFER_VIEW planeVBV = {};
     D3D12_VERTEX_BUFFER_VIEW sphereVBV = {};
@@ -89,6 +94,7 @@ struct GeometryBuffers {
     D3D12_VERTEX_BUFFER_VIEW flashVBV = {};
     D3D12_VERTEX_BUFFER_VIEW fireVBV = {};
     D3D12_VERTEX_BUFFER_VIEW explosionVBV = {};
+    D3D12_VERTEX_BUFFER_VIEW explosionCoreVBV = {};
     UINT                     sphereVertexCount = 0;
     UINT                     capsuleVertexCount = 0;
 };
@@ -168,6 +174,12 @@ inline void DrawExplosionFrame(const GeometryBuffers& geo, UINT frame) {
     g_dx12.commandList->DrawInstanced(6, 1, (frame % 16) * 6, 0);
 }
 
+inline void DrawExplosionCoreFrame(const GeometryBuffers& geo, UINT frame) {
+    g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.explosionCoreVBV);
+    g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_dx12.commandList->DrawInstanced(6, 1, (frame % 64) * 6, 0);
+}
+
 inline void DrawSphere(const GeometryBuffers& geo) {
     if (!geo.sphereVertexCount) { DrawCube(geo); return; }
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.sphereVBV);
@@ -196,8 +208,24 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
     const XMVECTOR camFwd = XMVectorSetW(invRot.r[2], 0.0f);
 
     shader.UseTransparent();
-    for (auto& sp : scene.impactParticles) {
-        if (sp.spark) continue;
+    std::vector<const ImpactParticle*> transparentParticles;
+    transparentParticles.reserve(scene.impactParticles.size());
+    for (const ImpactParticle& particle : scene.impactParticles)
+        if (!particle.spark) transparentParticles.push_back(&particle);
+    const XMFLOAT3 cameraPosition = scene.camera.Position;
+    std::sort(transparentParticles.begin(), transparentParticles.end(),
+        [&](const ImpactParticle* a, const ImpactParticle* b) {
+            const float adx = a->position.x - cameraPosition.x;
+            const float ady = a->position.y - cameraPosition.y;
+            const float adz = a->position.z - cameraPosition.z;
+            const float bdx = b->position.x - cameraPosition.x;
+            const float bdy = b->position.y - cameraPosition.y;
+            const float bdz = b->position.z - cameraPosition.z;
+            return adx * adx + ady * ady + adz * adz >
+                   bdx * bdx + bdy * bdy + bdz * bdz;
+        });
+    for (const ImpactParticle* particle : transparentParticles) {
+        const ImpactParticle& sp = *particle;
         const float fade = sp.life / sp.maxLife;
         const float age = 1.0f - fade;
         const float fadeIn = age < 0.15f ? age / 0.15f : 1.0f;
@@ -205,7 +233,7 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
         const float opacity = sp.blood
             ? (std::min)(0.36f, fadeIn * fadeOut * 0.36f)
             : (std::min)(0.85f, fadeIn * fadeOut * 0.85f);
-        if (opacity <= 0.01f) { shader.NextDrawCall(); continue; }
+        if (opacity <= 0.01f) continue;
 
         const XMVECTOR pos = XMVectorSet(
             sp.position.x, sp.position.y, sp.position.z, 1.0f);
@@ -226,9 +254,75 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
         shader.NextDrawCall();
     }
 
-    // Animated explosion flipbooks: alpha-blended so the smoky tail frames of
-    // the sheet still read as smoke instead of washing out additively.
+    // Very short pressure shell and white flash. These are geometry, not another
+    // camera-facing card, so the blast reads as volume from every angle.
+    for (const ExplosionFX& fx : scene.explosionFX) {
+        const float flashT = fx.age / 0.065f;
+        const float shockDuration = (std::min)(0.24f, fx.duration * 0.30f);
+        const float shockT = fx.age / shockDuration;
+        if (flashT < 1.0f || shockT < 1.0f) {
+            shader.UseAdditive();
+            if (flashT < 1.0f) {
+                const float flash = 1.0f - flashT;
+                const float radius = fx.size * (0.10f + 0.13f * flashT);
+                const XMMATRIX model = XMMatrixScaling(
+                    radius * 2.0f, radius * 2.0f, radius * 2.0f) *
+                    XMMatrixTranslation(fx.position.x, fx.position.y, fx.position.z);
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetEmissiveMaterial(XMFLOAT3(18.0f, 7.0f, 1.8f),
+                                           flash * flash);
+                DrawSphere(geo);
+                shader.NextDrawCall();
+            }
+            if (shockT < 1.0f) {
+                const float eased = 1.0f - (1.0f - shockT) * (1.0f - shockT);
+                const float radius = fx.size * (0.12f + 0.76f * eased);
+                const XMMATRIX model = XMMatrixScaling(
+                    radius * 2.0f, radius * 2.0f, radius * 2.0f) *
+                    XMMatrixTranslation(fx.position.x, fx.position.y, fx.position.z);
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetEmissiveMaterial(XMFLOAT3(2.6f, 0.42f, 0.035f),
+                                           0.075f * (1.0f - shockT));
+                DrawSphere(geo);
+                shader.NextDrawCall();
+            }
+        }
+    }
+
+    // Higher-resolution white-hot core. Additive composition keeps its black
+    // atlas background invisible and lets HDR bloom carry the first instant.
+    if (g_explosionCoreTexture && geo.explosionCoreVBV.BufferLocation) {
+        shader.UseAdditive();
+        for (const ExplosionFX& fx : scene.explosionFX) {
+            const float coreDuration = fx.duration * 0.62f;
+            const float t = (std::min)(1.0f, fx.age / coreDuration);
+            if (t >= 1.0f) continue;
+            const UINT frame = (std::min)(63u, (UINT)(t * 64.0f));
+            const float fadeIn = (std::min)(1.0f, t * 14.0f);
+            const float fadeOut = t > 0.68f ? (1.0f - t) / 0.32f : 1.0f;
+            const float bloom = 0.10f + 0.90f *
+                (1.0f - (1.0f - (std::min)(1.0f, t * 3.8f)) *
+                         (1.0f - (std::min)(1.0f, t * 3.8f)));
+            const float size = fx.size * bloom * 0.82f;
+            const float c = std::cos(fx.rotation), s = std::sin(fx.rotation);
+            const XMVECTOR right = camRight * c + camUp * s;
+            const XMVECTOR up = camUp * c - camRight * s;
+            const XMVECTOR pos = XMVectorSet(
+                fx.position.x, fx.position.y, fx.position.z, 1.0f);
+            const XMMATRIX model(right * size, up * size,
+                                 camFwd * size, XMVectorSetW(pos, 1.0f));
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetSmokeMaterial(XMFLOAT3(2.6f, 1.35f, 0.55f),
+                                    fadeIn * fadeOut,
+                                    g_explosionCoreTexture.Get());
+            DrawExplosionCoreFrame(geo, frame);
+            shader.NextDrawCall();
+        }
+    }
+
+    // Alpha-blended outer fireball preserves the smoky tail frames.
     if (g_explosionTexture && geo.explosionVBV.BufferLocation) {
+        shader.UseTransparent();
         for (const ExplosionFX& fx : scene.explosionFX) {
             const float t = (std::min)(1.0f, fx.age / fx.duration);
             const UINT frame = (std::min)(15u, (UINT)(t * 16.0f));
@@ -238,7 +332,11 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
             const float size = fx.size * bloom;
             const XMVECTOR pos = XMVectorSet(
                 fx.position.x, fx.position.y, fx.position.z, 1.0f);
-            const XMMATRIX model(camRight * size, camUp * size,
+            const float c = std::cos(-fx.rotation * 0.45f);
+            const float s = std::sin(-fx.rotation * 0.45f);
+            const XMVECTOR right = camRight * c + camUp * s;
+            const XMVECTOR up = camUp * c - camRight * s;
+            const XMMATRIX model(right * size, up * size,
                                  camFwd * size, XMVectorSetW(pos, 1.0f));
             shader.SetMatrices(model, view, proj, lightSpace);
             shader.SetSmokeMaterial(XMFLOAT3(1.0f, 1.0f, 1.0f), opacity,
@@ -891,13 +989,16 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     for (const ExplosionFX& fx : scene.explosionFX) {
         if (lightData.size() >= 64) break;
         const float t = (std::min)(1.0f, fx.age / fx.duration);
-        const float energy = (1.0f - t) * (1.0f - t);
+        const float flash = 1.0f - (std::min)(1.0f, t / 0.075f);
+        const float afterglow = (1.0f - t) * (1.0f - t);
+        const float energy = 72.0f * flash * flash + 18.0f * afterglow;
         if (energy < 0.01f) continue;
         PointLightDataDX12 blastLight = {};
         blastLight.position = fx.position;
-        blastLight.radius = fx.size * (1.1f + t * 0.7f);
-        blastLight.color = XMFLOAT3(1.0f, 0.24f + t * 0.18f, 0.025f);
-        blastLight.intensity = 24.0f * energy;
+        blastLight.radius = fx.size * (1.35f + flash * 0.65f + t * 0.45f);
+        blastLight.color = XMFLOAT3(
+            1.0f, 0.30f + flash * 0.62f, 0.035f + flash * 0.48f);
+        blastLight.intensity = energy;
         lightData.push_back(blastLight);
     }
     shader.SetPointLights((int)lightData.size(), lightData);
@@ -1233,6 +1334,15 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 DrawSceneNode(g_humveeModel, shader, SecondaryHumveeWorldMatrix(),
                     view, proj, lightSpace);
         }
+    }
+
+    if (!g_emptyLevelMode && g_boatModel) {
+        if (visibilityExtensionsOnly) {
+            DrawSceneNode(g_boatModel, shader, BoatWorldMatrix(),
+                view, proj, lightSpace, true);
+        } else if (!staticBatches.Submit(g_boatModel, BoatWorldMatrix()))
+            DrawSceneNode(g_boatModel, shader, BoatWorldMatrix(),
+                view, proj, lightSpace);
     }
 
     for (const PrefabRenderBatch& batch : prefabRenderBatches) {

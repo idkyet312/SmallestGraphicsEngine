@@ -62,13 +62,14 @@ struct ImpactParticle {
     bool     blood = false;  // textured blood billboard with ballistic motion
 };
 
-// One-shot flipbook explosion billboard (8x8 CC0 sheet, see
-// models/textures/EXPLOSION_BOOM3_LICENSE.txt). Age drives frame selection.
+// Layered one-shot explosion. The 4x4 smoky sheet supplies the outer fireball;
+// an 8x8 white-hot core and pressure wave are added by the renderer.
 struct ExplosionFX {
     XMFLOAT3 position;
     float    size;      // world diameter at full bloom
     float    age = 0.0f;
     float    duration = 0.9f;
+    float    rotation = 0.0f;
 };
 
 struct ExplosiveBarrel {
@@ -582,7 +583,9 @@ struct Scene {
         fx.position = center;
         fx.size = size;
         fx.duration = duration;
+        fx.rotation = ((float)std::rand() / RAND_MAX) * XM_2PI;
         explosionFX.push_back(fx);
+        camera.ApplyExplosionImpulse(center, size);
         if (explosionAudioCallback) explosionAudioCallback(center, size, grenade);
 
         SpawnSmokeBurst(center, size * 0.18f, 1.35f);
@@ -603,6 +606,33 @@ struct Scene {
             spark.spark = true;
             impactParticles.push_back(spark);
         }
+
+        // Fast, ground-hugging dust ring. Its lateral velocity makes the blast
+        // read in world space even when the fireball billboard faces the camera.
+        constexpr int dustCount = 20;
+        for (int i = 0; i < dustCount; ++i) {
+            const float angle = XM_2PI * ((float)i + 0.35f * randomSigned()) /
+                                (float)dustCount;
+            const float radial = size * (0.08f + 0.025f * std::abs(randomSigned()));
+            const float speed = size * (0.75f + 0.25f * std::abs(randomSigned()));
+            ImpactParticle dust;
+            dust.position = { center.x + std::cos(angle) * radial,
+                              center.y + 0.06f + std::abs(randomSigned()) * size * 0.035f,
+                              center.z + std::sin(angle) * radial };
+            dust.velocity = { std::cos(angle) * speed,
+                              0.15f + std::abs(randomSigned()) * 0.35f,
+                              std::sin(angle) * speed };
+            dust.maxLife = dust.life = 1.0f + std::abs(randomSigned()) * 0.8f;
+            dust.size = size * (0.035f + std::abs(randomSigned()) * 0.025f);
+            dust.growth = size * (0.10f + std::abs(randomSigned()) * 0.06f);
+            const float grey = 0.16f + std::abs(randomSigned()) * 0.10f;
+            dust.color = { grey * 1.10f, grey, grey * 0.85f };
+            dust.spark = false;
+            impactParticles.push_back(dust);
+        }
+        if (impactParticles.size() > 1000)
+            impactParticles.erase(impactParticles.begin(),
+                impactParticles.begin() + (impactParticles.size() - 1000));
     }
 
     // Bullet impact: just a soft smoke puff kicked off the surface (no sparks).
@@ -779,7 +809,8 @@ struct Scene {
         // Scope wins when both are somehow non-zero, since it is the narrower
         // of the two and blending them would land between the sights.
         const float sighted = cameraFOV + (adsFOV - cameraFOV) * adsBlend;
-        return sighted + (sniperScopeFOV - sighted) * sniperScopeBlend;
+        return sighted + (sniperScopeFOV - sighted) * sniperScopeBlend +
+               camera.ExplosionFovKick();
     }
     float ScopeLookScale() const {
         // Sights slow the turn rate proportionally to the zoom so the sensitivity
