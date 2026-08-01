@@ -43,6 +43,11 @@ struct TinyDebrisParticle {
     float size = 0.08f;
 };
 
+struct DestructionCollisionSoundEvent {
+    DirectX::XMFLOAT3 position = {};
+    float approachSpeed = 0.0f;
+};
+
 struct DestructionStressStats {
     bool running = false;
     float elapsedSeconds = 0.0f;
@@ -185,6 +190,9 @@ public:
     // Take and clear the world positions where the building fractured pieces
     // loose since the last call, so the caller can spawn smoke at each break.
     std::vector<DirectX::XMFLOAT3> DrainBreakPoints();
+    // Take hard collision events involving at least one destruction fragment.
+    // Caller applies distance falloff, variation, and playback rate limiting.
+    std::vector<DestructionCollisionSoundEvent> DrainCollisionSoundEvents();
     // Snapshot of awake, fast-moving destructible chunks and authored ragdoll
     // limbs. Used by gameplay to make physical bodies strike characters.
     std::vector<DestructionDebrisHazard> GetDangerousDebris(

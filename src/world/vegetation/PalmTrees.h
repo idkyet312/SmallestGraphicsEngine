@@ -218,6 +218,17 @@ public:
         CollectRetiredMeshes();
         m_previousWindTime = m_windTime;
         m_windTime += dt;
+        bool burnedTreeFell = false;
+        for (Tree& tree : m_trees) {
+            if (tree.felled || tree.burningTime <= 0.0f) continue;
+            tree.burningTime -= dt;
+            if (tree.burningTime > 0.0f) continue;
+            const float windAngle = m_windTime * 0.075f + 0.65f;
+            FellTree(tree, 0, 0.0f,
+                { std::cos(windAngle), 0.0f, std::sin(windAngle) });
+            burnedTreeFell = true;
+        }
+        if (burnedTreeFell) RebuildItems();
         if (m_activeBodies == 0) {
             // Loaded palms now bend in the vertex shader, so standing-tree CPU
             // transforms stay immutable. Box fallback still needs CPU wind.
@@ -459,6 +470,30 @@ public:
         if (changed) RebuildItems();
     }
 
+    bool IgniteNear(const XMFLOAT3& center, float radius) {
+        if (radius <= 0.0f) return false;
+        bool ignited = false;
+        for (Tree& tree : m_trees) {
+            if (tree.felled) continue;
+            const float dx = tree.x - center.x;
+            const float dz = tree.z - center.z;
+            if (dx * dx + dz * dz > radius * radius) continue;
+            if (tree.burningTime > 0.0f) continue;
+            tree.burningTime = 10.0f;
+            ignited = true;
+        }
+        return ignited;
+    }
+
+    std::vector<XMFLOAT3> GetBurningPositions() const {
+        std::vector<XMFLOAT3> positions;
+        for (const Tree& tree : m_trees) {
+            if (tree.felled || tree.burningTime <= 0.0f) continue;
+            positions.push_back({ tree.x, tree.baseY + 1.25f, tree.z });
+        }
+        return positions;
+    }
+
     const std::vector<TreeItem>& GetItems() const { return m_items; }
     bool IsInitialized() const { return !B3_IS_NULL(m_world); }
 
@@ -570,6 +605,7 @@ private:
         float modelScaleXZ = 1.0f; // uniform with modelScale for authored proportions
         // Stable yaw breaks cloned silhouettes without separating crown from trunk.
         float crownYaw = 0.0f;
+        float burningTime = 0.0f;
     };
 
     struct RetiredMesh {

@@ -329,6 +329,28 @@ inline void RenderPlayerHUD(const Scene& scene) {
         }
     }
 
+    if (scene.player.health > 0.0f) {
+        const char* grenade = scene.selectedGrenade == GrenadeType::Molotov
+            ? "MOLOTOV" : "FRAG";
+        char grenadeLabel[64];
+        snprintf(grenadeLabel, sizeof(grenadeLabel),
+                 "GRENADE: %s   [B] SWITCH   [G] THROW", grenade);
+        const ImVec2 grenadeSize = ImGui::CalcTextSize(grenadeLabel);
+        const ImVec2 grenadePos(
+            (io.DisplaySize.x - grenadeSize.x) * 0.5f,
+            io.DisplaySize.y - 39.0f);
+        draw->AddRectFilled(
+            ImVec2(grenadePos.x - 8.0f, grenadePos.y - 4.0f),
+            ImVec2(grenadePos.x + grenadeSize.x + 8.0f,
+                   grenadePos.y + grenadeSize.y + 4.0f),
+            IM_COL32(8, 12, 10, 180), 3.0f);
+        draw->AddText(grenadePos,
+            scene.selectedGrenade == GrenadeType::Molotov
+                ? IM_COL32(255, 155, 55, 245)
+                : IM_COL32(220, 230, 215, 245),
+            grenadeLabel);
+    }
+
     if (scene.player.health <= 0.0f) {
         const char* dead = "YOU DIED";
         const ImVec2 deadSize = ImGui::CalcTextSize(dead);

@@ -166,7 +166,7 @@ inline void DrawFlashQuad(const GeometryBuffers& geo) {
 inline void DrawFireFrame(const GeometryBuffers& geo, UINT frame) {
     g_dx12.commandList->IASetVertexBuffers(0, 1, &geo.fireVBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    g_dx12.commandList->DrawInstanced(6, 1, (frame % 60) * 6, 0);
+    g_dx12.commandList->DrawInstanced(6, 1, (frame % 25) * 6, 0);
 }
 
 // One cell of the 4x4 explosion flipbook (frame 0 top-left, row-major).
@@ -361,15 +361,52 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
         for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
             if (!barrel.active || !barrel.burning) continue;
             const float age = 3.0f - barrel.fuse;
-            const UINT frame = static_cast<UINT>((std::max)(0.0f, age) * 24.0f) % 60;
+            const UINT frame = static_cast<UINT>((std::max)(0.0f, age) * 20.0f) % 25;
             const XMVECTOR pos = XMVectorSet(
                 barrel.position.x, barrel.position.y + 0.82f,
                 barrel.position.z, 1.0f);
-            const XMMATRIX model(camRight * 0.48f, camUp * 0.82f,
-                                 camFwd * 0.48f, XMVectorSetW(pos, 1.0f));
+            const XMMATRIX model(camRight * 0.96f, camUp * 1.64f,
+                                 camFwd * 0.96f, XMVectorSetW(pos, 1.0f));
             shader.SetMatrices(model, view, proj, lightSpace);
-            shader.SetSmokeMaterial(XMFLOAT3(1.0f, 0.72f, 0.38f), 0.92f,
+            shader.SetSmokeMaterial(XMFLOAT3(1.0f, 0.92f, 0.82f), 0.90f,
                                     g_fireTexture.Get());
+            DrawFireFrame(geo, frame);
+            shader.NextDrawCall();
+        }
+        for (const FirePatch& fire : scene.firePatches) {
+            if (fire.life <= 0.0f) continue;
+            const float age = fire.maxLife - fire.life;
+            const UINT frame = static_cast<UINT>(age * 20.0f) % 25;
+            const float fade = (std::min)(1.0f, fire.life / 0.7f);
+            const float width = fire.radius * 2.04f;
+            const float height = fire.radius * 2.96f;
+            const XMVECTOR pos = XMVectorSet(
+                fire.position.x, fire.position.y + height * 0.48f,
+                fire.position.z, 1.0f);
+            const XMMATRIX model(camRight * width, camUp * height,
+                                 camFwd * width, XMVectorSetW(pos, 1.0f));
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetSmokeMaterial(XMFLOAT3(1.0f, 0.94f, 0.82f),
+                                    0.90f * fade, g_fireTexture.Get());
+            DrawFireFrame(geo, frame);
+            shader.NextDrawCall();
+        }
+        for (const BurningTargetFX& target : scene.burningTargets) {
+            const UINT frame = static_cast<UINT>(
+                (std::max)(0.0f, target.animationTime) * 27.0f +
+                std::abs(target.position.x * 2.1f)) % 25;
+            const float pulse = 0.88f + 0.12f *
+                std::sin(target.animationTime * 17.0f + target.position.z);
+            const float width = target.size * 0.96f * pulse;
+            const float height = target.size * 2.0f * pulse;
+            const XMVECTOR pos = XMLoadFloat3(&target.position);
+            const XMMATRIX model(camRight * width, camUp * height,
+                                 camFwd * width, XMVectorSetW(pos, 1.0f));
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetSmokeMaterial(
+                XMFLOAT3(1.0f, 0.94f, 0.82f),
+                0.88f * (std::min)(1.0f, target.intensity),
+                g_fireTexture.Get());
             DrawFireFrame(geo, frame);
             shader.NextDrawCall();
         }
@@ -1011,6 +1048,22 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         blastLight.intensity = energy;
         lightData.push_back(blastLight);
     }
+    UINT fireLightCount = 0;
+    for (const FirePatch& fire : scene.firePatches) {
+        if (lightData.size() >= 64 || fireLightCount >= 8) break;
+        if (fire.life <= 0.0f) continue;
+        PointLightDataDX12 fireLight = {};
+        fireLight.position = {
+            fire.position.x, fire.position.y + 0.35f, fire.position.z };
+        fireLight.radius = 2.8f + fire.radius * 2.6f;
+        fireLight.color = XMFLOAT3(1.0f, 0.24f, 0.018f);
+        const float flicker = 0.82f + 0.18f *
+            std::sin((fire.maxLife - fire.life) * 19.0f + fire.position.x);
+        fireLight.intensity = 7.5f * flicker *
+            (std::min)(1.0f, fire.life / 0.6f);
+        lightData.push_back(fireLight);
+        ++fireLightCount;
+    }
     shader.SetPointLights((int)lightData.size(), lightData);
     shader.SetDDGI(scene.useDDGI, scene.giIntensity, scene.normalBias,
         scene.probeSpacing, g_dxrDDGIProbeCount, g_dxrDDGICellCount,
@@ -1440,13 +1493,31 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             continue;
         }
         if (p.grenade) {
-            model = XMMatrixScaling(scene.projectileScale * 1.6f, scene.projectileScale * 1.6f,
-                                    scene.projectileScale * 1.6f) *
-                    XMMatrixTranslation(p.position.x, p.position.y, p.position.z);
-            shader.SetMatrices(model, view, proj, lightSpace);
-            shader.SetObjectMaterial(XMFLOAT3(0.10f, 0.12f, 0.08f), false, false,
-                                     0.6f, 0.5f, nullptr, nullptr, nullptr);
-            DrawSphere(geo);
+            if (p.molotov) {
+                model = XMMatrixScaling(
+                            scene.projectileScale * 1.15f,
+                            scene.projectileScale * 2.7f,
+                            scene.projectileScale * 1.15f) *
+                        XMMatrixTranslation(
+                            p.position.x, p.position.y, p.position.z);
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetObjectMaterial(
+                    XMFLOAT3(0.14f, 0.20f, 0.08f), false, false,
+                    0.08f, 0.24f, nullptr, nullptr, nullptr);
+                DrawCapsule(geo);
+            } else {
+                model = XMMatrixScaling(
+                            scene.projectileScale * 1.6f,
+                            scene.projectileScale * 1.6f,
+                            scene.projectileScale * 1.6f) *
+                        XMMatrixTranslation(
+                            p.position.x, p.position.y, p.position.z);
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetObjectMaterial(
+                    XMFLOAT3(0.10f, 0.12f, 0.08f), false, false,
+                    0.6f, 0.5f, nullptr, nullptr, nullptr);
+                DrawSphere(geo);
+            }
             shader.NextDrawCall();
             continue;
         }

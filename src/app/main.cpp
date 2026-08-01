@@ -255,6 +255,12 @@ GunAudio                    g_rpgFireAudio;
 GunAudio                    g_reloadAudio;
 GunAudio                    g_explosionAudio;
 GunAudio                    g_grenadeExplosionAudio;
+GunAudio                    g_fireLoopAudio;
+GunAudio                    g_fireIgnitionAudio;
+std::array<GunAudio, 3>     g_destructionBreakAudio;
+std::array<GunAudio, 3>     g_destructionImpactAudio;
+static float                g_destructionBreakAudioCooldown = 0.0f;
+static float                g_destructionImpactAudioCooldown = 0.0f;
 struct PendingExplosionAudio {
     float delay = 0.0f;
     float volume = 1.0f;
@@ -1857,6 +1863,143 @@ static void UpdateExplosiveBarrels(float dt) {
         }
         if ((std::rand() % 4) == 0)
             scene.SpawnSmokeBurst(flameBase, 0.12f, 0.12f);
+    }
+}
+
+extern PalmTrees g_trees;
+
+static void UpdateMolotovFireDamage() {
+    constexpr float tickSeconds = 0.25f;
+
+    for (auto material = scene.burningMaterials.begin();
+         material != scene.burningMaterials.end();) {
+        const auto entity = std::find_if(
+            g_game.world.Level().entities.begin(),
+            g_game.world.Level().entities.end(),
+            [material](const LevelEntity& value) {
+                return value.id == material->entityId;
+            });
+        if (entity == g_game.world.Level().entities.end() || !entity->enabled) {
+            material = scene.burningMaterials.erase(material);
+            continue;
+        }
+
+        if (scene.burningTargets.size() < 32) {
+            const float fade = (std::min)(1.0f, material->life / 0.65f);
+            scene.burningTargets.push_back({
+                material->position, material->size, fade,
+                material->maxLife - material->life });
+        }
+
+        if (material->damageCooldown > 0.0f) {
+            ++material;
+            continue;
+        }
+        material->damageCooldown = tickSeconds;
+        const CombatSystem::PrefabDamageResult result =
+            g_game.combat.DamagePrefab(
+                g_game.world, material->entityId,
+                scene.molotovMaterialDamagePerSecond * tickSeconds,
+                material->position);
+        if (!result.applied) {
+            material = scene.burningMaterials.erase(material);
+            continue;
+        }
+        if (result.destroyed) {
+            scene.SpawnSmokeBurst(material->position, 1.35f, 0.55f);
+            g_prefabRebuildRequested = true;
+            SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                "Fire destroyed prefab entity " +
+                std::to_string(material->entityId));
+            material = scene.burningMaterials.erase(material);
+            continue;
+        }
+        ++material;
+    }
+
+    if (scene.firePatches.empty() || scene.molotovDamageCooldown > 0.0f)
+        return;
+    scene.molotovDamageCooldown = tickSeconds;
+    std::unordered_set<SkinnedEnemy*> testedBandits;
+    std::unordered_set<uint64_t> destructibleIds;
+    for (const PrefabDestructibleInstance& destructible :
+         g_prefabDestructibles)
+        destructibleIds.insert(destructible.entityId);
+    bool playerIgnited = false;
+    for (FirePatch& fire : scene.firePatches) {
+        if (fire.life <= 0.0f) continue;
+        const float reach = fire.radius + 0.58f;
+
+        if (g_banditLoaded) {
+            for (auto& bandit : g_bandits) {
+                if (!bandit || bandit->Dead() ||
+                    testedBandits.find(bandit.get()) != testedBandits.end())
+                    continue;
+                const float dx = bandit->position.x - fire.position.x;
+                const float dz = bandit->position.z - fire.position.z;
+                const float dy = bandit->position.y + bandit->footOffset +
+                    1.0f - fire.position.y;
+                if (std::abs(dy) >= 2.3f ||
+                    dx * dx + dz * dz >= reach * reach) continue;
+                bandit->Ignite(5.5f);
+                testedBandits.insert(bandit.get());
+            }
+        }
+
+        const float playerX = scene.camera.Position.x - fire.position.x;
+        const float playerZ = scene.camera.Position.z - fire.position.z;
+        const float playerHeight = std::abs(
+            scene.camera.Position.y - fire.position.y);
+        if (!playerIgnited && playerHeight < 2.2f &&
+            playerX * playerX + playerZ * playerZ < reach * reach) {
+            scene.playerBurnTime = (std::max)(scene.playerBurnTime, 3.2f);
+            playerIgnited = true;
+        }
+
+        if (!g_emptyLevelMode) {
+            if (scene.useDestruction && g_destruction.IsInitialized() &&
+                fire.structureDamageCooldown <= 0.0f) {
+                const XMFLOAT3 materialHit{
+                    fire.position.x, fire.position.y + 0.65f,
+                    fire.position.z };
+                g_destruction.ApplyRadialDamage(
+                    materialHit, reach + 0.35f,
+                    scene.molotovMaterialDamagePerSecond * tickSeconds);
+                fire.structureDamageCooldown = 1.25f;
+            }
+            g_trees.IgniteNear(fire.position, reach + 0.8f);
+            for (const PrefabCollider& collider : g_prefabColliders) {
+                if (destructibleIds.find(collider.entityId) ==
+                    destructibleIds.end()) continue;
+                const XMFLOAT3 local =
+                    PrefabColliderToLocal(collider, fire.position);
+                const float outsideX = (std::max)(
+                    std::abs(local.x) - collider.halfExtents.x, 0.0f);
+                const float outsideY = (std::max)(
+                    std::abs(local.y) - collider.halfExtents.y, 0.0f);
+                const float outsideZ = (std::max)(
+                    std::abs(local.z) - collider.halfExtents.z, 0.0f);
+                if (outsideX * outsideX + outsideY * outsideY +
+                    outsideZ * outsideZ > reach * reach) continue;
+                const XMFLOAT3 flamePosition{
+                    fire.position.x,
+                    fire.position.y + 0.62f,
+                    fire.position.z };
+                scene.IgniteMaterial(
+                    collider.entityId, flamePosition,
+                    (std::min)(2.1f, 1.15f + fire.radius * 0.55f));
+            }
+            for (ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+                if (!barrel.active || barrel.burning) continue;
+                const float dx = barrel.position.x - fire.position.x;
+                const float dz = barrel.position.z - fire.position.z;
+                const float barrelReach = reach + 0.5f;
+                if (dx * dx + dz * dz > barrelReach * barrelReach) continue;
+                barrel.burning = true;
+                barrel.fuse = 3.0f;
+                barrel.fireFxCooldown = 0.0f;
+            }
+        }
     }
 }
 
@@ -3751,6 +3894,39 @@ static void UpdateHelicopterHoverAudio() {
     g_helicopterHoverAudio.SetLoop(active, volume, 0.96f);
 }
 
+static void UpdateFireLoopAudio() {
+    if (!IsGameplayScreen() || g_game.loading.Active()) {
+        g_fireLoopAudio.SetLoop(false);
+        return;
+    }
+
+    float audibility = 0.0f;
+    auto addFire = [&audibility](const XMFLOAT3& position, float strength) {
+        const float dx = position.x - scene.camera.Position.x;
+        const float dy = position.y - scene.camera.Position.y;
+        const float dz = position.z - scene.camera.Position.z;
+        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const float falloff = (std::max)(0.0f, 1.0f - distance / 38.0f);
+        audibility += strength * falloff * falloff;
+    };
+
+    for (const FirePatch& fire : scene.firePatches) {
+        if (fire.life <= 0.0f) continue;
+        const float strength = (std::max)(0.35f,
+            fire.radius / (std::max)(0.01f, fire.maxRadius));
+        addFire(fire.position, strength);
+    }
+    for (const BurningMaterial& material : scene.burningMaterials)
+        if (material.life > 0.0f) addFire(material.position, 0.75f);
+    for (const ExplosiveBarrel& barrel : scene.explosiveBarrels)
+        if (barrel.active && barrel.burning) addFire(barrel.position, 0.85f);
+    for (const BurningTargetFX& target : scene.burningTargets)
+        addFire(target.position, 0.35f * target.intensity);
+
+    const float volume = 0.62f * (1.0f - std::exp(-0.80f * audibility));
+    g_fireLoopAudio.SetLoop(volume > 0.01f, volume, 0.98f);
+}
+
 static void SetCursorVisible(bool visible) {
     if (visible) {
         while (ShowCursor(TRUE) < 0) {}
@@ -4327,10 +4503,10 @@ static void LoadFloorMudMaterial() {
         std::cerr << "Muzzle flash (models/textures/muzzle_flash.png) unavailable\n";
 
     g_fireTexture = GLBImporter::LoadTextureFromFile(
-        ResolveTexturePath("Content/Models/textures/fire1_64.png"),
+        ResolveTexturePath("Content/Models/textures/fire_realistic_5x5.png"),
         g_dx12.device, g_dx12.commandList, g_fireUploadHeaps);
     if (!g_fireTexture)
-        std::cerr << "Fire sprite (models/textures/fire1_64.png) unavailable\n";
+        std::cerr << "Fire sprite (models/textures/fire_realistic_5x5.png) unavailable\n";
 
     g_explosionTexture = GLBImporter::LoadTextureFromFile(
         ResolveTexturePath("Content/Models/textures/explosion_soluna.png"),
@@ -5780,14 +5956,14 @@ static bool CreateAllGeometry() {
     };
     if (!CreateVertexBuffer(flashVerts, geo.flashVertexBuffer, geo.flashVBV)) return false;
 
-    // OpenGameArt CC0 fire sheet: 10 columns x 6 rows, 60 frames at 64 px.
+    // OpenGameArt CC0 realistic fire sheet: 5x5, 25 frames at 128 px.
     std::vector<VertexPosNormUV> fireVerts;
-    fireVerts.reserve(60 * 6);
-    for (int frame = 0; frame < 60; ++frame) {
-        const int column = frame % 10;
-        const int row = frame / 10;
-        const float u0 = column / 10.0f, u1 = (column + 1) / 10.0f;
-        const float v0 = row / 6.0f, v1 = (row + 1) / 6.0f;
+    fireVerts.reserve(25 * 6);
+    for (int frame = 0; frame < 25; ++frame) {
+        const int column = frame % 5;
+        const int row = frame / 5;
+        const float u0 = column / 5.0f, u1 = (column + 1) / 5.0f;
+        const float v0 = row / 5.0f, v1 = (row + 1) / 5.0f;
         fireVerts.insert(fireVerts.end(), {
             {{-0.5f,-0.5f,0},{0,0,1},{u0,v1}}, {{ 0.5f,-0.5f,0},{0,0,1},{u1,v1}}, {{ 0.5f, 0.5f,0},{0,0,1},{u1,v0}},
             {{-0.5f,-0.5f,0},{0,0,1},{u0,v1}}, {{ 0.5f, 0.5f,0},{0,0,1},{u1,v0}}, {{-0.5f, 0.5f,0},{0,0,1},{u0,v0}},
@@ -6449,6 +6625,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (wParam == 'V' && !(lParam & 0x40000000)) {
             scene.camera.FPSMode = !scene.camera.FPSMode;
         }
+        else if (wParam == 'B' && !(lParam & 0x40000000)) {
+            scene.selectedGrenade = scene.selectedGrenade == GrenadeType::Frag
+                ? GrenadeType::Molotov : GrenadeType::Frag;
+        }
         else if (wParam == 'M' && !(lParam & 0x40000000)) {
             if (visBuffer.initialized) {
                 scene.useVisibilityBuffer = !scene.useVisibilityBuffer;
@@ -6673,6 +6853,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_reloadAudio.Initialize("Content/Audio/dragon-studio-gun-reload-2-504027.mp3");
     g_explosionAudio.Initialize("Content/Audio/RocketExplosion3.mp3");
     g_grenadeExplosionAudio.Initialize("Content/Audio/explosion.ogg");
+    g_fireLoopAudio.Initialize("Content/Audio/Fire/fireplace_loop.wav");
+    g_fireIgnitionAudio.Initialize("Content/Audio/Fire/ignition.ogg");
+    g_destructionBreakAudio[0].Initialize(
+        "Content/Audio/Destruction/impact_03_wood.ogg");
+    g_destructionBreakAudio[1].Initialize(
+        "Content/Audio/Destruction/break_02_rock.ogg");
+    g_destructionBreakAudio[2].Initialize(
+        "Content/Audio/Destruction/break_03_wood.ogg");
+    g_destructionImpactAudio[0].Initialize(
+        "Content/Audio/Destruction/impact_01.ogg");
+    g_destructionImpactAudio[1].Initialize(
+        "Content/Audio/Destruction/impact_02_rock.ogg");
+    g_destructionImpactAudio[2].Initialize(
+        "Content/Audio/Destruction/impact_03_wood.ogg");
     scene.explosionAudioCallback = [](const XMFLOAT3& position, float size,
                                       bool grenade) {
         const float dx = position.x - scene.camera.Position.x;
@@ -6687,6 +6881,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // gameplay feedback stays responsive while still selling scale.
         g_pendingExplosionAudio.push_back({
             (std::min)(0.35f, distance / 343.0f), volume, pitch, grenade });
+    };
+    scene.fireIgnitionAudioCallback = [](const XMFLOAT3& position) {
+        const float dx = position.x - scene.camera.Position.x;
+        const float dy = position.y - scene.camera.Position.y;
+        const float dz = position.z - scene.camera.Position.z;
+        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const float volume = (std::max)(0.0f, 1.0f - distance / 42.0f);
+        if (volume <= 0.01f) return;
+        const float pitch = 0.94f +
+            ((float)std::rand() / (float)RAND_MAX) * 0.12f;
+        g_fireIgnitionAudio.Play(volume, pitch);
     };
     g_hitAudio.Initialize("Content/Audio/bullet_flesh_hit.mp3");
     g_banditSpottedAudio1.Initialize("Content/Audio/bandit_spotted_01.wav");
@@ -6975,6 +7180,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     UINT particleBenchmarkSamples = 0;
     double particleBenchmarkCpuMs = 0.0;
     double particleBenchmarkGpuMs = 0.0;
+    const bool molotovSmokeTest =
+        GetEnvironmentVariableA("SGE_MOLOTOV_TEST", nullptr, 0) > 0;
+    bool molotovSmokeInjected = false;
+    UINT molotovSmokeFrames = 0;
+    size_t molotovSmokePeakPatches = 0;
     if (GetEnvironmentVariableA("SGE_VISIBILITY_TEST", nullptr, 0) > 0) {
         visibilitySmokeEnabled = true;
         std::ofstream("visibility_smoke.log", std::ios::trunc)
@@ -7116,6 +7326,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
 
         UpdateHelicopterHoverAudio();
+        UpdateFireLoopAudio();
 
         g_profiler.BeginCpuFrame();
         {
@@ -7179,6 +7390,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                       scene.camera.PlayerHeight);
 
         scene.Update(deltaTime, now);
+        scene.burningTargets.clear();
+        if (molotovSmokeTest && !molotovSmokeInjected && IsSceneScreen() &&
+            !g_game.loading.Active()) {
+            const XMFLOAT3& eye = scene.camera.Position;
+            const XMFLOAT3& front = scene.camera.Front;
+            scene.SpawnMolotovFire({
+                eye.x + front.x * 4.5f, eye.y + front.y * 4.5f,
+                eye.z + front.z * 4.5f });
+            scene.selectedGrenade = GrenadeType::Molotov;
+            molotovSmokeInjected = true;
+        }
+        if (molotovSmokeInjected)
+            molotovSmokePeakPatches = (std::max)(
+                molotovSmokePeakPatches, scene.firePatches.size());
+        UpdateMolotovFireDamage();
         // Repeatable submission benchmark: 800 persistent smoke cards (runtime
         // cap). Isolates particle draw overhead from spawn/simulation cost.
         if (particleBenchmark && IsSceneScreen() && !g_game.loading.Active()) {
@@ -7232,6 +7458,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_pendingExplosionAudio.end());
         g_explosionAudio.Update();
         g_grenadeExplosionAudio.Update();
+        g_fireLoopAudio.Update();
+        g_fireIgnitionAudio.Update();
+        g_destructionBreakAudioCooldown = (std::max)(
+            0.0f, g_destructionBreakAudioCooldown - deltaTime);
+        g_destructionImpactAudioCooldown = (std::max)(
+            0.0f, g_destructionImpactAudioCooldown - deltaTime);
+        for (GunAudio& sound : g_destructionBreakAudio) sound.Update();
+        for (GunAudio& sound : g_destructionImpactAudio) sound.Update();
         g_hitAudio.Update();
         g_banditSpottedAudio1.Update();
         g_banditSpottedAudio2.Update();
@@ -7279,8 +7513,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             if (g_heldBandit && g_heldBandit->Dead()) g_heldBandit = nullptr;
             static std::unordered_map<SkinnedEnemy*, float> banditUpdateDebt;
+            bool burnedBanditDied = false;
             for (auto& bandit : g_bandits) {
-                if (!bandit || bandit->Dead()) continue;
+                if (!bandit) continue;
+                if (bandit->UpdateBurning(
+                        deltaTime, scene.molotovDamagePerSecond))
+                    burnedBanditDied = true;
+                if (bandit->Burning()) {
+                    scene.burningTargets.push_back({
+                        { bandit->position.x,
+                          bandit->position.y + bandit->footOffset + 1.0f,
+                          bandit->position.z },
+                        1.25f, bandit->BurnFraction(), now });
+                    if (bandit->ConsumeBurnSpreadEvent())
+                        scene.SpawnCarriedFire(bandit->position);
+                }
+                if (bandit->Dead()) continue;
                 if (bandit.get() == g_heldBandit) {
                     const XMFLOAT3& eye = scene.camera.Position;
                     const XMFLOAT3& front = scene.camera.Front;
@@ -7422,6 +7670,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     g_gunAudio.Play(volume, pitch);
                 }
             }
+            if (burnedBanditDied) PlayBanditDeathEvents();
             UpdateHelicopterRotorKills();
         }
         if (!g_emptyLevelMode) {
@@ -7437,6 +7686,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_helicopterPosition, primaryHelicopterActive,
             g_secondaryHelicopterPosition, secondaryHelicopterActive);
         g_trees.Update(deltaTime);
+        for (const XMFLOAT3& firePosition : g_trees.GetBurningPositions()) {
+            if (scene.burningTargets.size() >= 48) break;
+            scene.burningTargets.push_back(
+                { firePosition, 2.2f, 1.0f, now });
+        }
         XMFLOAT3 grassHelicopter = g_helicopterPosition;
         if (secondaryHelicopterActive) {
             const XMVECTOR camera = XMLoadFloat3(&scene.camera.Position);
@@ -7506,9 +7760,53 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 const float pitch = 0.88f + ((float)std::rand() / RAND_MAX) * 0.08f;
                 g_gunAudio.Play(volume, pitch);
             }
-            // Smoke at the actual fracture points where pieces broke loose.
-            for (const XMFLOAT3& bp : g_destruction.DrainBreakPoints())
+            // Smoke and a rate-limited break sound at actual fracture points.
+            for (const XMFLOAT3& bp : g_destruction.DrainBreakPoints()) {
                 scene.SpawnSmokeBurst(bp, 0.5f, 0.4f);
+                if (g_destructionBreakAudioCooldown <= 0.0f) {
+                    const float dx = bp.x - scene.camera.Position.x;
+                    const float dy = bp.y - scene.camera.Position.y;
+                    const float dz = bp.z - scene.camera.Position.z;
+                    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    const float volume = 0.78f * (std::max)(
+                        0.0f, 1.0f - distance / 48.0f);
+                    if (volume > 0.015f) {
+                        const float pitch = 0.88f +
+                            ((float)std::rand() / RAND_MAX) * 0.24f;
+                        g_destructionBreakAudio[std::rand() %
+                            g_destructionBreakAudio.size()].Play(volume, pitch);
+                        g_destructionBreakAudioCooldown = 0.085f;
+                    }
+                }
+            }
+            const std::vector<DestructionCollisionSoundEvent> collisionSounds =
+                g_destruction.DrainCollisionSoundEvents();
+            if (g_destructionImpactAudioCooldown <= 0.0f &&
+                !collisionSounds.empty()) {
+                const DestructionCollisionSoundEvent* loudest = nullptr;
+                float loudestVolume = 0.0f;
+                for (const DestructionCollisionSoundEvent& hit : collisionSounds) {
+                    const float dx = hit.position.x - scene.camera.Position.x;
+                    const float dy = hit.position.y - scene.camera.Position.y;
+                    const float dz = hit.position.z - scene.camera.Position.z;
+                    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    const float speed = (std::min)(1.0f,
+                        (std::max)(0.0f, (hit.approachSpeed - 3.0f) / 10.0f));
+                    const float volume = (0.14f + speed * 0.58f) *
+                        (std::max)(0.0f, 1.0f - distance / 36.0f);
+                    if (volume <= loudestVolume) continue;
+                    loudest = &hit;
+                    loudestVolume = volume;
+                }
+                if (loudest && loudestVolume > 0.015f) {
+                    const float pitch = 0.86f +
+                        ((float)std::rand() / RAND_MAX) * 0.28f;
+                    g_destructionImpactAudio[std::rand() %
+                        g_destructionImpactAudio.size()].Play(
+                            loudestVolume, pitch);
+                    g_destructionImpactAudioCooldown = 0.075f;
+                }
+            }
             for (const TinyDebrisParticle& tiny :
                  g_destruction.DrainTinyDebrisParticles()) {
                 ImpactParticle particle;
@@ -7526,7 +7824,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     scene.impactParticles.begin() +
                     (scene.impactParticles.size() - 800));
             for (auto& projectile : scene.projectiles) {
-                if (projectile.rocket && projectile.active) {
+                if ((projectile.rocket || projectile.molotov) && projectile.active) {
                     XMFLOAT3 impact = projectile.position;
                     bool struck = false;
                     const float radius = 0.22f;
@@ -7559,7 +7857,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             radius, candidate)) {
                         impact = candidate;
                         struck = true;
-                        DamageBoat(kRocketHelicopterDamage, candidate);
+                        if (projectile.rocket)
+                            DamageBoat(kRocketHelicopterDamage, candidate);
                     }
                     if (!struck && HitExplosiveBarrelSegment(
                             projectile.previousPosition, projectile.position,
@@ -7598,6 +7897,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     // Grenades use fuse; rockets detonate on first solid impact.
                     if (projectile.detonate) {
                         const XMFLOAT3 center = projectile.position;
+                        if (projectile.molotov) {
+                            scene.SpawnMolotovFire(center);
+                            if (!g_emptyLevelMode) {
+                                for (ExplosiveBarrel& barrel :
+                                     scene.explosiveBarrels) {
+                                    if (!barrel.active || barrel.burning) continue;
+                                    const float dx = barrel.position.x - center.x;
+                                    const float dy = barrel.position.y - center.y;
+                                    const float dz = barrel.position.z - center.z;
+                                    if (dx * dx + dy * dy + dz * dz > 2.4f * 2.4f)
+                                        continue;
+                                    barrel.burning = true;
+                                    barrel.fuse = 3.0f;
+                                    barrel.fireFxCooldown = 0.0f;
+                                }
+                            }
+                            projectile.active = false;
+                            projectile.detonate = false;
+                            continue;
+                        }
                         if (projectile.grenade)
                             AddExplosionTerrainCrater(center);
                         scene.SpawnExplosionFX(
@@ -8962,6 +9281,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 scene.GetViewMatrix() * scene.GetProjectionMatrix();
         msaaUsedLastFrame = msaaActive;
         g_profiler.EndCpuFrame();
+        if (molotovSmokeInjected && ++molotovSmokeFrames >= 240) {
+            std::ofstream smoke("molotov_smoke.log", std::ios::trunc);
+            smoke << "peak_patches=" << molotovSmokePeakPatches << '\n'
+                  << "active_patches=" << scene.firePatches.size() << '\n'
+                  << "particles=" << scene.impactParticles.size() << '\n';
+            PostQuitMessage(molotovSmokePeakPatches >= 10 ? 0 : 3);
+        }
         if (particleBenchmark && IsSceneScreen() && !g_game.loading.Active()) {
             ++particleBenchmarkFrames;
             if (particleBenchmarkFrames > 120) {

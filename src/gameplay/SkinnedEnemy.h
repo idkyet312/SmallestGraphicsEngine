@@ -695,6 +695,38 @@ public:
 
     bool Dead() const { return dead_; }
 
+    bool Ignite(float duration = 5.5f) {
+        if (dead_ || !visible || duration <= 0.0f) return false;
+        const bool newlyIgnited = burnTime_ <= 0.0f;
+        burnTime_ = (std::max)(burnTime_, duration);
+        if (newlyIgnited) burnSpreadCooldown_ = 0.55f;
+        return newlyIgnited;
+    }
+
+    bool UpdateBurning(float dt, float damagePerSecond) {
+        if (dead_ || burnTime_ <= 0.0f || dt <= 0.0f) return false;
+        burnTime_ = (std::max)(0.0f, burnTime_ - dt);
+        burnSpreadCooldown_ -= dt;
+        health -= (std::max)(0.0f, damagePerSecond) * dt;
+        if (health > 0.0f) return false;
+        const DirectX::XMFLOAT3 upward{ 0.0f, 1.0f, 0.0f };
+        const DirectX::XMFLOAT3 impact{
+            position.x, position.y + footOffset + 1.0f, position.z };
+        Kill(upward, impact, 0.35f);
+        burnTime_ = 0.0f;
+        return true;
+    }
+
+    bool Burning() const { return !dead_ && burnTime_ > 0.0f; }
+    float BurnFraction() const {
+        return (std::min)(1.0f, burnTime_ / 5.5f);
+    }
+    bool ConsumeBurnSpreadEvent() {
+        if (!Burning() || burnSpreadCooldown_ > 0.0f) return false;
+        burnSpreadCooldown_ = 1.05f;
+        return true;
+    }
+
     bool KillFromRotor(const DirectX::XMFLOAT3& direction,
                        const DirectX::XMFLOAT3& impact) {
         if (dead_ || !visible) return false;
@@ -826,6 +858,8 @@ private:
     DirectX::XMFLOAT4X4 deathWorld_ = {};
     DirectX::XMFLOAT3 knockbackVelocity_{ 0.0f, 0.0f, 0.0f };
     float stationaryAimTime_ = 0.0f;
+    float burnTime_ = 0.0f;
+    float burnSpreadCooldown_ = 0.0f;
     float mountedSightTime_ = 0.0f;
     float mountedLostSightTime_ = 0.0f;
     float debrisHitCooldown_ = 0.0f;

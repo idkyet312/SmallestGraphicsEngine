@@ -1,0 +1,19 @@
+Asset: Fireplace Sound loop
+Author: PagDev
+Source: https://opengameart.org/content/fireplace-sound-loop
+Direct file: https://opengameart.org/sites/default/files/fire.wav
+License: CC0 1.0 Universal
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Renamed file used by engine:
+- fire.wav -> fireplace_loop.wav
+
+Asset: Catching fire
+Author: themightyglider
+Source: https://opengameart.org/content/catching-fire
+Direct file: https://opengameart.org/sites/default/files/flame.ogg
+License: CC0 1.0 Universal
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Renamed file used by engine:
+- flame.ogg -> ignition.ogg

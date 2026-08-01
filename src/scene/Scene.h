@@ -8,6 +8,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
+#include <cstdint>
 #include <cmath>
 #include <functional>
 
@@ -31,6 +32,8 @@ struct SceneObject {
     }
 };
 
+enum class GrenadeType : uint8_t { Frag = 0, Molotov = 1 };
+
 struct Projectile {
     XMFLOAT3 position;
     XMFLOAT3 previousPosition;
@@ -42,11 +45,42 @@ struct Projectile {
     // Grenade: arcs under gravity and detonates (radial blast) on fuse timeout
     // or first impact. Regular bullets leave these at defaults.
     bool     grenade = false;
+    bool     molotov = false;
     bool     rocket = false;
     float    damageMultiplier = 1.0f;
     XMFLOAT3 velocity = { 0, 0, 0 };   // grenades integrate velocity + gravity
     float    fuse = 0.0f;              // seconds until it explodes
     bool     detonate = false;         // set the frame it should explode
+    float    fxCooldown = 0.0f;
+};
+
+struct FirePatch {
+    XMFLOAT3 position = {};
+    float life = 0.0f;
+    float maxLife = 0.0f;
+    float radius = 0.25f;
+    float maxRadius = 0.85f;
+    float spreadDelay = 0.45f;
+    float fxCooldown = 0.0f;
+    float structureDamageCooldown = 0.55f;
+    uint8_t generation = 0;
+    bool hasSpread = false;
+};
+
+struct BurningTargetFX {
+    XMFLOAT3 position = {};
+    float size = 0.8f;
+    float intensity = 1.0f;
+    float animationTime = 0.0f;
+};
+
+struct BurningMaterial {
+    uint64_t entityId = 0;
+    XMFLOAT3 position = {};
+    float life = 0.0f;
+    float maxLife = 0.0f;
+    float damageCooldown = 0.0f;
+    float size = 1.4f;
 };
 
 // A particle from a bullet impact: smoke, blood billboard, or spark/debris shard.
@@ -178,7 +212,11 @@ struct Scene {
     std::vector<Projectile> projectiles;
     std::vector<ImpactParticle> impactParticles;  // impact smoke puffs
     std::vector<ExplosionFX> explosionFX;         // animated explosion flipbooks
+    std::vector<FirePatch> firePatches;            // spreading Molotov ground fire
+    std::vector<BurningTargetFX> burningTargets;   // flames attached to actors/trees
+    std::vector<BurningMaterial> burningMaterials; // persistent prefab material fire
     std::function<void(const XMFLOAT3&, float, bool)> explosionAudioCallback;
+    std::function<void(const XMFLOAT3&)> fireIgnitionAudioCallback;
     std::vector<ExplosiveBarrel> explosiveBarrels;
     float projectileSpeed    = 300.0f;
     float projectileLifetime = 3.0f;
@@ -221,6 +259,12 @@ struct Scene {
     // without being an instant kill from full health.
     float grenadePlayerDamage  = 75.0f;
     float grenadeCooldown      = 0.0f;   // input debounce
+    GrenadeType selectedGrenade = GrenadeType::Frag;
+    float molotovFireDuration = 9.0f;
+    float molotovDamagePerSecond = 40.0f;
+    float molotovMaterialDamagePerSecond = 34.0f;
+    float molotovDamageCooldown = 0.0f;
+    float playerBurnTime = 0.0f;
     // Returns rendered ground height at world XZ. Installed by main so Scene
     // does not depend on terrain renderer implementation.
     std::function<float(float, float)> grenadeGroundHeight;
@@ -381,6 +425,9 @@ struct Scene {
         projectiles.clear();
         impactParticles.clear();
         explosionFX.clear();
+        firePatches.clear();
+        burningTargets.clear();
+        burningMaterials.clear();
         explosiveBarrels = {
             {{ 4.6f, 3.25f,  4.6f}},
             {{-4.6f, 3.25f,  4.6f}},
@@ -392,6 +439,9 @@ struct Scene {
         gunRecoilBack = 0.0f;
         gunRecoilKick = 0.0f;
         grenadeCooldown = 0.0f;
+        molotovDamageCooldown = 0.0f;
+        playerBurnTime = 0.0f;
+        selectedGrenade = GrenadeType::Frag;
         player.damageFlash = 0.0f;
         player.regenTimer = 0.0f;
         adsBlend = 0.0f;
@@ -444,7 +494,13 @@ struct Scene {
         camera.Update(dt);
 
         muzzleFlashTime = (std::max)(0.0f, muzzleFlashTime - dt);
+        molotovDamageCooldown = (std::max)(
+            0.0f, molotovDamageCooldown - dt);
         player.damageFlash = (std::max)(0.0f, player.damageFlash - dt);
+        if (playerBurnTime > 0.0f) {
+            playerBurnTime = (std::max)(0.0f, playerBurnTime - dt);
+            DamagePlayer(molotovDamagePerSecond * 0.62f * dt);
+        }
 
         // Health regen. Death is final: at zero health the timer stops rather
         // than quietly healing a corpse back to fighting strength.
@@ -487,8 +543,8 @@ struct Scene {
             if (!p.active) continue;
             p.previousPosition = p.position;
             if (p.grenade) {
-                // Ballistic arc with a damped ground bounce. Only the fuse can
-                // detonate it; impacts never shorten the two-second timer.
+                // Frag grenades bounce until fuse expiry. Molotovs break and
+                // ignite immediately on first ground contact.
                 p.velocity.y += -9.81f * grenadeGravityScale * dt;
                 p.position.x += p.velocity.x * dt;
                 p.position.y += p.velocity.y * dt;
@@ -498,13 +554,38 @@ struct Scene {
                 const float bounceY = surfaceY + grenadeGroundY;
                 if (p.position.y < bounceY) {
                     p.position.y = bounceY;
-                    if (p.velocity.y < 0.0f)
+                    if (p.molotov) {
+                        p.detonate = true;
+                        p.active = false;
+                    } else if (p.velocity.y < 0.0f) {
                         p.velocity.y = -p.velocity.y * 0.4f;
-                    p.velocity.x *= 0.7f;
-                    p.velocity.z *= 0.7f;
+                    }
+                    if (!p.molotov) {
+                        p.velocity.x *= 0.7f;
+                        p.velocity.z *= 0.7f;
+                    }
+                }
+                if (p.molotov && p.active) {
+                    p.fxCooldown -= dt;
+                    if (p.fxCooldown <= 0.0f) {
+                        p.fxCooldown = 0.045f;
+                        ImpactParticle wick;
+                        wick.position = {
+                            p.position.x, p.position.y + 0.18f, p.position.z };
+                        wick.velocity = { 0.0f, 2.5f, 0.0f };
+                        wick.maxLife = wick.life = 0.20f;
+                        wick.size = 0.055f;
+                        wick.growth = -0.08f;
+                        wick.color = { 1.0f, 0.25f, 0.01f };
+                        wick.spark = true;
+                        impactParticles.push_back(wick);
+                    }
                 }
                 p.fuse -= dt;
-                if (p.fuse <= 0.0f) { p.detonate = true; p.active = false; }
+                if (p.fuse <= 0.0f && !p.detonate) {
+                    p.detonate = true;
+                    p.active = false;
+                }
             } else {
                 if (p.rocket) {
                     // Battlefield 2-style wire guidance: rocket bends toward the
@@ -573,6 +654,118 @@ struct Scene {
             std::remove_if(explosionFX.begin(), explosionFX.end(),
                 [](const ExplosionFX& fx) { return fx.age >= fx.duration; }),
             explosionFX.end());
+
+        std::vector<FirePatch> spread;
+        for (FirePatch& fire : firePatches) {
+            fire.life -= dt;
+            fire.spreadDelay -= dt;
+            fire.fxCooldown -= dt;
+            fire.structureDamageCooldown -= dt;
+            fire.radius = (std::min)(fire.maxRadius, fire.radius + dt * 0.72f);
+
+            if (fire.fxCooldown <= 0.0f) {
+                fire.fxCooldown = 0.075f;
+                auto randomSigned = []() {
+                    return ((float)std::rand() / RAND_MAX) * 2.0f - 1.0f;
+                };
+                ImpactParticle ember;
+                ember.position = {
+                    fire.position.x + randomSigned() * fire.radius * 0.55f,
+                    fire.position.y + 0.10f,
+                    fire.position.z + randomSigned() * fire.radius * 0.55f };
+                ember.velocity = { randomSigned() * 0.28f,
+                    2.4f + std::abs(randomSigned()) * 1.6f,
+                    randomSigned() * 0.28f };
+                ember.maxLife = ember.life = 0.18f +
+                    std::abs(randomSigned()) * 0.24f;
+                ember.size = 0.035f + std::abs(randomSigned()) * 0.055f;
+                ember.growth = -0.07f;
+                ember.color = { 1.0f,
+                    0.18f + std::abs(randomSigned()) * 0.34f, 0.008f };
+                ember.spark = true;
+                impactParticles.push_back(ember);
+                if ((std::rand() % 7) == 0)
+                    SpawnSmokeBurst(fire.position, fire.radius * 0.16f, 0.12f);
+            }
+
+            if (!fire.hasSpread && fire.spreadDelay <= 0.0f &&
+                fire.generation < 2) {
+                fire.hasSpread = true;
+                const int children = fire.generation == 0 ? 6 : 2;
+                for (int childIndex = 0; childIndex < children; ++childIndex) {
+                    if (firePatches.size() + spread.size() >= 64) break;
+                    const float jitter = ((float)std::rand() / RAND_MAX - 0.5f) * 0.55f;
+                    const float angle = XM_2PI * childIndex / children + jitter;
+                    const XMFLOAT2 radial{ std::cos(angle), std::sin(angle) };
+                    const float windAngle = currentTime * 0.075f + 0.65f;
+                    XMFLOAT2 direction{
+                        radial.x * 0.78f + std::cos(windAngle) * 0.45f,
+                        radial.y * 0.78f + std::sin(windAngle) * 0.45f };
+                    const float directionLength = std::sqrt(
+                        direction.x * direction.x + direction.y * direction.y);
+                    if (directionLength > 0.001f) {
+                        direction.x /= directionLength;
+                        direction.y /= directionLength;
+                    }
+                    const float distance = 0.95f +
+                        ((float)std::rand() / RAND_MAX) * 0.55f;
+                    const float x = fire.position.x + direction.x * distance;
+                    const float z = fire.position.z + direction.y * distance;
+                    const float ground = grenadeGroundHeight
+                        ? grenadeGroundHeight(x, z) : 0.0f;
+                    if (ground < -0.35f) continue;
+                    bool overlaps = false;
+                    for (const FirePatch& existing : firePatches) {
+                        const float dx = existing.position.x - x;
+                        const float dz = existing.position.z - z;
+                        if (dx * dx + dz * dz < 0.36f * 0.36f) {
+                            overlaps = true;
+                            break;
+                        }
+                    }
+                    if (!overlaps) {
+                        for (const FirePatch& pending : spread) {
+                            const float dx = pending.position.x - x;
+                            const float dz = pending.position.z - z;
+                            if (dx * dx + dz * dz < 0.36f * 0.36f) {
+                                overlaps = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (overlaps) continue;
+                    FirePatch child;
+                    child.position = { x, ground + 0.05f, z };
+                    child.maxLife = child.life = molotovFireDuration -
+                        (fire.generation + 1) * 0.8f;
+                    child.radius = 0.22f;
+                    child.maxRadius = fire.generation == 0 ? 0.78f : 0.64f;
+                    child.spreadDelay = 0.45f +
+                        ((float)std::rand() / RAND_MAX) * 0.45f;
+                    child.generation = fire.generation + 1;
+                    spread.push_back(child);
+                }
+            }
+        }
+        firePatches.insert(firePatches.end(), spread.begin(), spread.end());
+        firePatches.erase(
+            std::remove_if(firePatches.begin(), firePatches.end(),
+                [](const FirePatch& fire) { return fire.life <= 0.0f; }),
+            firePatches.end());
+        for (BurningMaterial& material : burningMaterials) {
+            material.life -= dt;
+            material.damageCooldown = (std::max)(
+                0.0f, material.damageCooldown - dt);
+        }
+        burningMaterials.erase(
+            std::remove_if(burningMaterials.begin(), burningMaterials.end(),
+                [](const BurningMaterial& material) {
+                    return material.life <= 0.0f;
+                }),
+            burningMaterials.end());
+        if (impactParticles.size() > 1000)
+            impactParticles.erase(impactParticles.begin(),
+                impactParticles.begin() + (impactParticles.size() - 1000));
     }
 
     // Kick off one animated explosion flipbook centred on `center`.
@@ -735,13 +928,91 @@ struct Scene {
         p.previousPosition = p.position;
         p.direction = camera.Front;
         p.grenade   = true;
+        p.molotov   = selectedGrenade == GrenadeType::Molotov;
         p.active    = true;
-        p.fuse      = grenadeFuse;
+        p.fuse      = p.molotov ? 4.0f : grenadeFuse;
         // Launch along the aim direction plus a slight upward lob.
         p.velocity  = { camera.Front.x * grenadeThrowSpeed,
                         camera.Front.y * grenadeThrowSpeed + grenadeLob,
                         camera.Front.z * grenadeThrowSpeed };
         projectiles.push_back(p);
+    }
+
+    void SpawnMolotovFire(const XMFLOAT3& impact) {
+        const float ground = grenadeGroundHeight
+            ? grenadeGroundHeight(impact.x, impact.z) : impact.y;
+        if (ground < -0.35f) return;
+        FirePatch seed;
+        seed.position = { impact.x, ground + 0.05f, impact.z };
+        seed.maxLife = seed.life = molotovFireDuration;
+        seed.radius = 0.32f;
+        seed.maxRadius = 1.05f;
+        seed.spreadDelay = 0.30f;
+        if (firePatches.size() >= 64)
+            firePatches.erase(firePatches.begin());
+        firePatches.push_back(seed);
+        if (fireIgnitionAudioCallback)
+            fireIgnitionAudioCallback(seed.position);
+
+        camera.ApplyExplosionImpulse(seed.position, 1.35f);
+        for (int i = 0; i < 18; ++i) {
+            ImpactParticle ember;
+            const float angle = XM_2PI * (float)i / 18.0f;
+            const float speed = 1.2f + ((float)std::rand() / RAND_MAX) * 2.2f;
+            ember.position = { impact.x, ground + 0.18f, impact.z };
+            ember.velocity = { std::cos(angle) * speed,
+                2.0f + ((float)std::rand() / RAND_MAX) * 2.8f,
+                std::sin(angle) * speed };
+            ember.maxLife = ember.life = 0.30f +
+                ((float)std::rand() / RAND_MAX) * 0.45f;
+            ember.size = 0.04f + ((float)std::rand() / RAND_MAX) * 0.07f;
+            ember.growth = -0.06f;
+            ember.color = { 1.0f, 0.22f, 0.008f };
+            ember.spark = true;
+            impactParticles.push_back(ember);
+        }
+        SpawnSmokeBurst(seed.position, 0.28f, 0.32f);
+    }
+
+    bool SpawnCarriedFire(const XMFLOAT3& position) {
+        if (firePatches.size() >= 64) return false;
+        const float ground = grenadeGroundHeight
+            ? grenadeGroundHeight(position.x, position.z) : position.y;
+        if (ground < -0.35f) return false;
+        for (const FirePatch& existing : firePatches) {
+            const float dx = existing.position.x - position.x;
+            const float dz = existing.position.z - position.z;
+            if (dx * dx + dz * dz < 0.85f * 0.85f) return false;
+        }
+        FirePatch carried;
+        carried.position = { position.x, ground + 0.05f, position.z };
+        carried.maxLife = carried.life = molotovFireDuration * 0.72f;
+        carried.radius = 0.20f;
+        carried.maxRadius = 0.68f;
+        carried.spreadDelay = 0.55f;
+        carried.generation = 1;
+        firePatches.push_back(carried);
+        return true;
+    }
+
+    void IgniteMaterial(uint64_t entityId, const XMFLOAT3& position,
+                        float size = 1.4f) {
+        if (entityId == 0) return;
+        for (BurningMaterial& material : burningMaterials) {
+            if (material.entityId != entityId) continue;
+            material.position = position;
+            material.life = material.maxLife = 8.0f;
+            material.size = (std::max)(material.size, size);
+            return;
+        }
+        if (burningMaterials.size() >= 32)
+            burningMaterials.erase(burningMaterials.begin());
+        BurningMaterial material;
+        material.entityId = entityId;
+        material.position = position;
+        material.life = material.maxLife = 8.0f;
+        material.size = size;
+        burningMaterials.push_back(material);
     }
 
     void ShootSniperProjectile() {

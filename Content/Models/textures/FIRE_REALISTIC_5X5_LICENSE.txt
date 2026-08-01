@@ -1,0 +1,9 @@
+Asset: Animated flame / Fire sprite Sheet (fireSheet5x5.png)
+Author: highwizard
+Source: https://opengameart.org/content/flame-fire-sprite-sheet
+Direct archive: https://opengameart.org/sites/default/files/firespritesheet.zip
+License: CC0 1.0 Universal
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Downloaded source renamed to fire_realistic_5x5.png.
+25 frames, 5 columns by 5 rows, 128x128 pixels per frame.

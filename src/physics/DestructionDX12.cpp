@@ -419,6 +419,7 @@ struct DestructionDX12::Impl {
     // World positions where the building just fractured a piece loose this frame;
     // drained by the caller to spawn smoke at the actual break points.
     std::vector<XMFLOAT3> breakPoints;
+    std::vector<DestructionCollisionSoundEvent> collisionSoundEvents;
     std::vector<TinyDebrisParticle> tinyDebrisParticles;
     float accumulator = 0.0f;
     float maintenanceAccumulator = 0.0f;
@@ -2487,8 +2488,22 @@ void DestructionDX12::Update(float dt) {
         std::vector<XMFLOAT3> hitPoints;
         hitPoints.reserve(events.hitCount);
         for (int i = 0; i < events.hitCount; ++i) {
-            const b3Vec3& point = events.hitEvents[i].point;
+            const b3ContactHitEvent& hit = events.hitEvents[i];
+            const b3Vec3& point = hit.point;
             hitPoints.emplace_back((float)point.x, (float)point.y, (float)point.z);
+            const b3Filter filterA = b3Shape_GetFilter(hit.shapeIdA);
+            const b3Filter filterB = b3Shape_GetFilter(hit.shapeIdB);
+            const uint64_t debrisMask =
+                CollisionCategoryDebris | CollisionCategoryLodDebris;
+            const bool involvesDebris =
+                (filterA.categoryBits & debrisMask) != 0 ||
+                (filterB.categoryBits & debrisMask) != 0;
+            if (involvesDebris && hit.approachSpeed >= 3.0f &&
+                m->collisionSoundEvents.size() < 32) {
+                m->collisionSoundEvents.push_back({
+                    { (float)point.x, (float)point.y, (float)point.z },
+                    hit.approachSpeed });
+            }
         }
         int budget = 2;  // low impact damage: at most two cells per step
         for (const XMFLOAT3& point : hitPoints) {
@@ -3050,6 +3065,15 @@ std::vector<XMFLOAT3> DestructionDX12::DrainBreakPoints() {
     if (!m) return {};
     std::vector<XMFLOAT3> out = std::move(m->breakPoints);
     m->breakPoints.clear();
+    return out;
+}
+
+std::vector<DestructionCollisionSoundEvent>
+DestructionDX12::DrainCollisionSoundEvents() {
+    if (!m) return {};
+    std::vector<DestructionCollisionSoundEvent> out =
+        std::move(m->collisionSoundEvents);
+    m->collisionSoundEvents.clear();
     return out;
 }
 

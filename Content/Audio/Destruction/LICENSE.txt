@@ -1,0 +1,16 @@
+Asset pack: 75 CC0 breaking / falling / hit sfx
+Author: rubberduck
+Source: https://opengameart.org/content/75-cc0-breaking-falling-hit-sfx
+Direct archive: https://opengameart.org/sites/default/files/sfx_breaking_and_falling.zip
+License: CC0 1.0 Universal
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Renamed files used by engine:
+- bfh1_breaking_01.ogg -> break_01.ogg
+- bfh1_rock_breaking_02.ogg -> break_02_rock.ogg
+- bfh1_wood_breaking_04.ogg -> break_03_wood.ogg
+- bfh1_hit_03.ogg -> impact_01.ogg
+- bfh1_rock_hit_01.ogg -> impact_02_rock.ogg
+- bfh1_wood_hit_01.ogg -> impact_03_wood.ogg
+
+Runtime fracture bank uses impact_03_wood.ogg instead of break_01.ogg.
