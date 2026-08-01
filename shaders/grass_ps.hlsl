@@ -209,22 +209,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // and transmit warm sunlight through back-facing blades. This removes the
     // near-black foreground silhouettes while retaining object/terrain shadows.
     float signedNdotL = dot(normal, lightDir);
-    // Wrap the full sphere rather than cutting off at -0.32. A blade is a thin
-    // translucent strip, so the side facing away from the sun is still lit
-    // through the leaf; stopping the wrap early left those blades on ambient
-    // alone and turned every away-facing patch of the field near-black, with a
-    // hard line where the term reached zero. Wrapping across the whole range
-    // keeps the two sides within a plausible ratio of each other and removes
-    // that boundary.
-    float wrappedNdotL = saturate((signedNdotL + 1.0) / 2.0);
-    // Softened so it ramps in as the blade turns away instead of only counting
-    // once it is past perpendicular.
-    float backNdotL = saturate((-signedNdotL + 0.25) / 1.25);
-    // Wrapped diffuse spreads the same energy over the whole sphere, so it peaks
-    // lower than an unwrapped N.L would. Push the curve back up so the sun-facing
-    // side keeps the brightness it had before the wrap was widened, while the
-    // away-facing side keeps the lift the wrap gives it.
-    wrappedNdotL = wrappedNdotL * wrappedNdotL;
+    float wrappedNdotL = saturate((signedNdotL + 0.32) / 1.32);
+    float backNdotL = saturate(-signedNdotL);
     result += albedo / 3.14159265 * lightColor *
               wrappedNdotL * shadowVisibility *
               max(occlusionStrength, 0.0);
