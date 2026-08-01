@@ -68,42 +68,89 @@ float3 TerrainProjectionWeights(float3 normal) {
     return weights / max(dot(weights, 1.0), 1e-4);
 }
 
+// Triplanar axes whose weight rounds to nothing are skipped rather than sampled
+// and multiplied by ~0. TerrainProjectionWeights raises |normal| to the 5th
+// power and normalises, so on ground that is anywhere near flat the Y weight is
+// ~1 and X/Z collapse to ~0 -- two thirds of these fetches were feeding a
+// multiply by zero. The threshold is well below what an 8-bit texture can
+// resolve, so the output is unchanged.
+static const float kTriplanarEpsilon = 0.002;
+
+// Derivatives must be computed in uniform control flow: Sample() derives its mip
+// from neighbouring lanes in the 2x2 quad, and a quad that diverges at the
+// branches below would produce undefined LOD and visible seams. ddx/ddy are
+// therefore taken up front, unconditionally, and the fetches use SampleGrad.
+struct TriplanarGrads {
+    float2 zyDx; float2 zyDy;
+    float2 xzDx; float2 xzDy;
+    float2 xyDx; float2 xyDy;
+};
+
+TriplanarGrads TerrainTriplanarGrads(float3 worldPos, float scale) {
+    TriplanarGrads g;
+    g.zyDx = ddx(worldPos.zy * scale); g.zyDy = ddy(worldPos.zy * scale);
+    g.xzDx = ddx(worldPos.xz * scale); g.xzDy = ddy(worldPos.xz * scale);
+    g.xyDx = ddx(worldPos.xy * scale); g.xyDy = ddy(worldPos.xy * scale);
+    return g;
+}
+
 float4 SampleTerrainArray(Texture2DArray map, float3 worldPos,
-                          float3 projectionWeights, float layer, float scale) {
-    float4 x = map.Sample(texSampler, float3(worldPos.zy * scale, layer));
-    float4 y = map.Sample(texSampler, float3(worldPos.xz * scale, layer));
-    float4 z = map.Sample(texSampler, float3(worldPos.xy * scale, layer));
-    return x * projectionWeights.x + y * projectionWeights.y +
-           z * projectionWeights.z;
+                          float3 projectionWeights, float layer, float scale,
+                          TriplanarGrads g) {
+    float4 result = 0.0;
+    if (projectionWeights.x > kTriplanarEpsilon)
+        result += map.SampleGrad(texSampler, float3(worldPos.zy * scale, layer),
+                                 g.zyDx, g.zyDy) * projectionWeights.x;
+    if (projectionWeights.y > kTriplanarEpsilon)
+        result += map.SampleGrad(texSampler, float3(worldPos.xz * scale, layer),
+                                 g.xzDx, g.xzDy) * projectionWeights.y;
+    if (projectionWeights.z > kTriplanarEpsilon)
+        result += map.SampleGrad(texSampler, float3(worldPos.xy * scale, layer),
+                                 g.xyDx, g.xyDy) * projectionWeights.z;
+    return result;
 }
 
 float3 SampleTerrainNormalLayer(float3 worldPos, float3 geometricNormal,
                                 float3 projectionWeights, float layer,
-                                float scale, float strength) {
-    float3 nx = normalMap.Sample(texSampler,
-        float3(worldPos.zy * scale, layer)).xyz * 2.0 - 1.0;
-    float3 ny = normalMap.Sample(texSampler,
-        float3(worldPos.xz * scale, layer)).xyz * 2.0 - 1.0;
-    float3 nz = normalMap.Sample(texSampler,
-        float3(worldPos.xy * scale, layer)).xyz * 2.0 - 1.0;
-    nx.y *= normalYSign;
-    ny.y *= normalYSign;
-    nz.y *= normalYSign;
-    nx.xy *= strength;
-    ny.xy *= strength;
-    nz.xy *= strength;
-    nx = normalize(nx);
-    ny = normalize(ny);
-    nz = normalize(nz);
-
+                                float scale, float strength,
+                                TriplanarGrads g) {
+    // Same zero-weight axis skip as SampleTerrainArray. Each axis is still
+    // decoded, strength-scaled and normalised exactly as before being weighted,
+    // so a contributing axis produces bit-identical output; only axes that were
+    // being multiplied by ~0 are dropped.
     float sx = geometricNormal.x < 0.0 ? -1.0 : 1.0;
     float sy = geometricNormal.y < 0.0 ? -1.0 : 1.0;
     float sz = geometricNormal.z < 0.0 ? -1.0 : 1.0;
-    float3 wx = normalize(float3(nx.z * sx, nx.y, nx.x));
-    float3 wy = normalize(float3(ny.x, ny.z * sy, ny.y));
-    float3 wz = normalize(float3(nz.x, nz.y, nz.z * sz));
-    return normalize(wx * projectionWeights.x + wy * projectionWeights.y +
-                     wz * projectionWeights.z);
+    float3 blended = 0.0;
+
+    if (projectionWeights.x > kTriplanarEpsilon) {
+        float3 nx = normalMap.SampleGrad(texSampler,
+            float3(worldPos.zy * scale, layer), g.zyDx, g.zyDy).xyz * 2.0 - 1.0;
+        nx.y *= normalYSign;
+        nx.xy *= strength;
+        nx = normalize(nx);
+        blended += normalize(float3(nx.z * sx, nx.y, nx.x)) *
+                   projectionWeights.x;
+    }
+    if (projectionWeights.y > kTriplanarEpsilon) {
+        float3 ny = normalMap.SampleGrad(texSampler,
+            float3(worldPos.xz * scale, layer), g.xzDx, g.xzDy).xyz * 2.0 - 1.0;
+        ny.y *= normalYSign;
+        ny.xy *= strength;
+        ny = normalize(ny);
+        blended += normalize(float3(ny.x, ny.z * sy, ny.y)) *
+                   projectionWeights.y;
+    }
+    if (projectionWeights.z > kTriplanarEpsilon) {
+        float3 nz = normalMap.SampleGrad(texSampler,
+            float3(worldPos.xy * scale, layer), g.xyDx, g.xyDy).xyz * 2.0 - 1.0;
+        nz.y *= normalYSign;
+        nz.xy *= strength;
+        nz = normalize(nz);
+        blended += normalize(float3(nz.x, nz.y, nz.z * sz)) *
+                   projectionWeights.z;
+    }
+    return normalize(blended);
 }
 
 TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
@@ -123,16 +170,30 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     result.roughness = 0.0;
     result.metallic = 0.0;
     result.occlusion = 0.0;
+    // Layers are weighted by height/slope and normalised, so at any given pixel
+    // typically only one or two of the four contribute. Sampling all four cost
+    // 4 layers x 3 maps x 3 triplanar axes = 36 fetches per pixel regardless of
+    // weight, which dominated the frame on camera angles filled by terrain.
+    // Skipping a layer whose weight is below 8-bit resolution leaves the blend
+    // visually identical.
+    const float kLayerEpsilon = 0.002;
     [unroll] for (uint layer = 0; layer < 4; ++layer) {
         const float weight = layerWeights[layer];
+        // Gradients are taken before the weight test so every lane in the quad
+        // evaluates them, keeping the derivative uniform even when neighbouring
+        // pixels skip different layers.
+        const TriplanarGrads grads =
+            TerrainTriplanarGrads(worldPos, scales[layer]);
+        if (weight <= kLayerEpsilon) continue;
         result.albedo += SampleTerrainArray(
-            albedoMap, worldPos, projectionWeights, layer, scales[layer]).rgb * weight;
+            albedoMap, worldPos, projectionWeights, layer, scales[layer],
+            grads).rgb * weight;
         result.normal += SampleTerrainNormalLayer(
             worldPos, geometricNormal, projectionWeights, layer,
-            scales[layer], normalStrengths[layer]) * weight;
+            scales[layer], normalStrengths[layer], grads) * weight;
         const float4 packedPBR = SampleTerrainArray(
             metalRoughMap, worldPos, projectionWeights, layer,
-            scales[layer]);
+            scales[layer], grads);
         result.roughness += packedPBR.g * weight;
         result.metallic += packedPBR.b * weight;
         result.occlusion += packedPBR.r * weight;
