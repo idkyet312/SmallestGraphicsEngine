@@ -245,6 +245,10 @@ constexpr float              kBoatMaxHealth = VehicleSystem::BoatMaxHealth;
 // 28-43 units out and only reaches open seabed past ~88. Patrol well clear of
 // the beach/surf so the boat reads as sailing open water, not beached.
 constexpr float              kBoatPatrolRadius = 60.0f;
+constexpr float              kBoatDeckHalfBeam = 1.5f;
+constexpr float              kBoatDeckHalfLength = 4.5f;
+constexpr float              kBoatHullHeight = 1.1f;
+constexpr float              kBoatDeckOffset = 0.10f;
 SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
 float                       g_banditLeftArmReach = 0.55f;
@@ -980,8 +984,89 @@ static void UpdateSecondaryHelicopter(float dt) {
     g_secondaryHelicopterFireCooldown = 0.10f;
 }
 
+struct BoatPlatformPose {
+    XMFLOAT3 position = {};
+    float yaw = 0.0f;
+    float sinkDepth = 0.0f;
+};
+
+static BoatPlatformPose CurrentBoatPlatformPose() {
+    return { g_boatPosition, g_boatYaw, g_boatSinkDepth };
+}
+
+static float BoatDeckY(const BoatPlatformPose& pose) {
+    return pose.position.y - pose.sinkDepth + kBoatDeckOffset;
+}
+
+static bool BoatDeckSupports(const XMFLOAT3& position, float feetY,
+                             const BoatPlatformPose& pose, float padding,
+                             float verticalTolerance = 0.35f) {
+    const float dx = position.x - pose.position.x;
+    const float dz = position.z - pose.position.z;
+    const float sinYaw = std::sin(pose.yaw);
+    const float cosYaw = std::cos(pose.yaw);
+    const float localX = dx * cosYaw - dz * sinYaw;
+    const float localZ = dx * sinYaw + dz * cosYaw;
+    return std::abs(localX) <= kBoatDeckHalfBeam + padding &&
+           std::abs(localZ) <= kBoatDeckHalfLength + padding &&
+           std::abs(feetY - BoatDeckY(pose)) <= verticalTolerance;
+}
+
+static void TransformWithBoat(XMFLOAT3& position,
+                              const BoatPlatformPose& oldPose,
+                              const BoatPlatformPose& newPose) {
+    const float dx = position.x - oldPose.position.x;
+    const float dz = position.z - oldPose.position.z;
+    const float oldSin = std::sin(oldPose.yaw);
+    const float oldCos = std::cos(oldPose.yaw);
+    const float localX = dx * oldCos - dz * oldSin;
+    const float localZ = dx * oldSin + dz * oldCos;
+    const float newSin = std::sin(newPose.yaw);
+    const float newCos = std::cos(newPose.yaw);
+    position.x = newPose.position.x + localX * newCos + localZ * newSin;
+    position.z = newPose.position.z - localX * newSin + localZ * newCos;
+    position.y += BoatDeckY(newPose) - BoatDeckY(oldPose);
+}
+
+static void CarryBoatOccupants(const BoatPlatformPose& oldPose) {
+    const BoatPlatformPose newPose = CurrentBoatPlatformPose();
+    const float yawDelta = std::atan2(
+        std::sin(newPose.yaw - oldPose.yaw),
+        std::cos(newPose.yaw - oldPose.yaw));
+
+    const float playerFeet =
+        scene.camera.Position.y - scene.camera.PlayerHeight;
+    if (scene.camera.FPSMode && scene.camera.IsGrounded &&
+        BoatDeckSupports(scene.camera.Position, playerFeet, oldPose, 0.35f,
+                         0.28f)) {
+        const XMFLOAT3 previousPlayerPosition = scene.camera.Position;
+        TransformWithBoat(scene.camera.Position, oldPose, newPose);
+        g_game.playerMovement.ApplyPlatformDisplacement({
+            scene.camera.Position.x - previousPlayerPosition.x,
+            scene.camera.Position.y - previousPlayerPosition.y,
+            scene.camera.Position.z - previousPlayerPosition.z });
+        scene.camera.FloorY = BoatDeckY(newPose);
+    }
+
+    for (const auto& bandit : g_bandits) {
+        if (!bandit || bandit->Dead() || bandit.get() == g_heldBandit) continue;
+        if (bandit->turretGunner && bandit->mountedVehicleIndex == 2) {
+            bandit->position = BoatTurretMountWorld();
+            continue;
+        }
+        if (bandit->turretGunner ||
+            !BoatDeckSupports(bandit->position, bandit->position.y,
+                              oldPose, 0.20f, 0.42f))
+            continue;
+        TransformWithBoat(bandit->position, oldPose, newPose);
+        bandit->yaw += yawDelta;
+        bandit->aimYaw += yawDelta;
+    }
+}
+
 static void UpdateBoat(float dt) {
     if (!g_boatModel) return;
+    const BoatPlatformPose oldPose = CurrentBoatPlatformPose();
     if (g_boatDead) {
         if (g_boatSunk) return;
         // Settle into the water rather than falling: sink depth grows and
@@ -992,6 +1077,7 @@ static void UpdateBoat(float dt) {
             g_boatSinkDepth = 3.2f;
             g_boatSunk = true;
         }
+        CarryBoatOccupants(oldPose);
         return;
     }
 
@@ -1018,6 +1104,7 @@ static void UpdateBoat(float dt) {
     const float desiredRoll = std::sin(g_boatPatrolTime * 0.5f) * 0.035f;
     g_boatRoll += (desiredRoll - g_boatRoll) *
         (1.0f - std::exp(-2.0f * (std::max)(0.0f, dt)));
+    CarryBoatOccupants(oldPose);
 }
 
 static XMFLOAT3 HumveeTurretMountWorld() {
@@ -3776,20 +3863,16 @@ static void ResolvePlayerWorldObjectCollisions(
     // space as the patrol boat turns.
     if (!g_boatModel || g_boatSunk) return;
     const float boatY = g_boatPosition.y - g_boatSinkDepth;
-    constexpr float halfBeam = 1.5f;
-    constexpr float halfLength = 4.5f;
-    constexpr float hullHeight = 1.1f;
-    constexpr float deckOffset = 0.10f;
-    const float top = boatY + deckOffset;
-    const float bottom = boatY - hullHeight;
+    const float top = boatY + kBoatDeckOffset;
+    const float bottom = boatY - kBoatHullHeight;
     const float sinYaw = std::sin(g_boatYaw);
     const float cosYaw = std::cos(g_boatYaw);
     const float worldX = position.x - g_boatPosition.x;
     const float worldZ = position.z - g_boatPosition.z;
     float localX = worldX * cosYaw - worldZ * sinYaw;
     float localZ = worldX * sinYaw + worldZ * cosYaw;
-    const float expandedBeam = halfBeam + radius;
-    const float expandedLength = halfLength + radius;
+    const float expandedBeam = kBoatDeckHalfBeam + radius;
+    const float expandedLength = kBoatDeckHalfLength + radius;
     if (std::abs(localX) >= expandedBeam ||
         std::abs(localZ) >= expandedLength) return;
     if (top <= feet + kStepHeight && top >= feet - 0.25f) {
@@ -7777,6 +7860,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         tp.heightScale = scene.terrainHeightScale;
                         groundY = TerrainRendererDX12::HeightAt(
                             tp, bandit->position.x, bandit->position.z);
+                    }
+                    if (g_boatModel && !g_boatSunk) {
+                        const BoatPlatformPose boatPose =
+                            CurrentBoatPlatformPose();
+                        if (BoatDeckSupports(
+                                bandit->position, bandit->position.y,
+                                boatPose, 0.20f, 0.48f))
+                            groundY = (std::max)(groundY, BoatDeckY(boatPose));
                     }
                     bandit->Update(banditDeltaTime, scene.camera.Position, groundY);
                     ResolveBanditHumveeCollision(*bandit);

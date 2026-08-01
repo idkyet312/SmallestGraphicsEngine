@@ -32,6 +32,14 @@ public:
         valid_ = true;
     }
 
+    // Moving platforms translate the player without player locomotion. Shift the
+    // stored sample by that exact world delta so next frame measures only input.
+    void ApplyPlatformDisplacement(const DirectX::XMFLOAT3& displacement) {
+        if (!valid_) return;
+        previous_.x += displacement.x;
+        previous_.z += displacement.z;
+    }
+
     float HorizontalSpeed() const { return horizontalSpeed_; }
 
 private:

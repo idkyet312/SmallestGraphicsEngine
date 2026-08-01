@@ -168,6 +168,14 @@ int main() {
     CHECK(movement.Update({ 100.0f, 5.0f, 0.0f }, 0.1f) == 0.0f);
     CHECK(movement.Update({ 100.5f, 5.0f, 0.0f }, 0.1f, false) == 0.0f);
 
+    PlayerMovementTracker platformMovement;
+    CHECK(platformMovement.Update({ 0.0f, 0.0f, 0.0f }, 0.1f) == 0.0f);
+    CHECK(std::abs(platformMovement.Update(
+        { 0.2f, 0.0f, 0.0f }, 0.1f) - 2.0f) < 0.001f);
+    platformMovement.ApplyPlatformDisplacement({ 1.0f, 0.0f, 0.0f });
+    CHECK(std::abs(platformMovement.Update(
+        { 1.4f, 0.0f, 0.0f }, 0.1f) - 2.0f) < 0.001f);
+
     GameSession session;
     CHECK(session.Screen() == GameScreen::MainMenu);
     session.SetScreen(GameScreen::Level1);
