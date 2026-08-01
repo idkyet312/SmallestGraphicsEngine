@@ -253,10 +253,10 @@ public:
     float& NormalFalloff()         { return m_normalFalloff; }
     void ResetMaterial() {
         m_albedo = XMFLOAT3(0.078431f, 0.078431f, 0.078431f);
-        m_roughness = 0.705f;
-        m_ambientScale = 1.281f;
-        m_directLightScale = 1.0f;
-        m_transmissionStrength = 0.293f;
+        m_roughness = 1.0f;
+        m_ambientScale = 1.239f;
+        m_directLightScale = 2.0f;
+        m_transmissionStrength = 0.776f;
         m_colorVariation = 1.5f;
         m_normalFalloff = 1.0f;
     }
@@ -647,10 +647,10 @@ private:
     // terrain. Keep blade lighting, but leave terrain shadowing to solid props.
     float m_shadowDensity = 0.28f;
     XMFLOAT3 m_albedo = { 0.078431f, 0.078431f, 0.078431f };
-    float m_roughness = 0.705f;
-    float m_ambientScale = 1.281f;
-    float m_directLightScale = 1.0f;
-    float m_transmissionStrength = 0.293f;
+    float m_roughness = 1.0f;
+    float m_ambientScale = 1.239f;
+    float m_directLightScale = 2.0f;
+    float m_transmissionStrength = 0.776f;
     float m_normalFalloff = 1.0f;
     float m_colorVariation = 1.5f;
     // Side of one draw-cell. Small enough that the cells hug the draw radius
