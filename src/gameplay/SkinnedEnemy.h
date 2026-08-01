@@ -552,7 +552,8 @@ public:
                const DirectX::XMFLOAT3& direction, float radius,
                DirectX::XMFLOAT3* hitPoint = nullptr,
                bool* headshot = nullptr,
-               float bodyDamage = 20.0f) {
+               float bodyDamage = 20.0f,
+               bool allowHeadshotKill = true) {
         if (dead_ || !visible) return false;
         DirectX::XMFLOAT3 impact;
         bool hitHead = false;
@@ -561,7 +562,7 @@ public:
         if (headshot) *headshot = hitHead;
         // Standard rifle balance: one headshot, exactly five body hits from
         // full 100 health.
-        health -= hitHead ? health : bodyDamage;
+        health -= hitHead && allowHeadshotKill ? health : bodyDamage;
         if (health <= 0.0f) Kill(direction, impact);
         return true;
     }
@@ -694,6 +695,7 @@ public:
     }
 
     bool Dead() const { return dead_; }
+    uint32_t RagdollId() const { return ragdollId_; }
 
     bool Ignite(float duration = 5.5f) {
         if (dead_ || !visible || duration <= 0.0f) return false;

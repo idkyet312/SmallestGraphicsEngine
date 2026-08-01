@@ -51,6 +51,10 @@ struct Projectile {
     bool     laser = false;
     bool     remoteCharge = false;
     bool     flame = false;
+    bool     harpoon = false;
+    bool     harpoonExpired = false;
+    uint32_t harpoonId = 0;
+    uint8_t  harpoonPiercedCount = 0;
     float    damageMultiplier = 1.0f;
     XMFLOAT3 velocity = { 0, 0, 0 };   // grenades integrate velocity + gravity
     float    fuse = 0.0f;              // seconds until it explodes
@@ -63,6 +67,18 @@ struct LaserBeamFX {
     XMFLOAT3 end = {};
     float life = 0.0f;
     float maxLife = 0.085f;
+};
+
+struct HarpoonTetherFX {
+    XMFLOAT3 start = {};
+    XMFLOAT3 end = {};
+    float life = 0.0f;
+    float maxLife = 0.32f;
+};
+
+struct PinnedHarpoonFX {
+    XMFLOAT3 position = {};
+    XMFLOAT3 direction = { 0.0f, 0.0f, 1.0f };
 };
 
 struct RemoteCharge {
@@ -239,6 +255,8 @@ struct Scene {
     GunViewModel gun;
     std::vector<Projectile> projectiles;
     LaserBeamFX laserBeam;
+    HarpoonTetherFX harpoonTether;
+    std::vector<PinnedHarpoonFX> pinnedHarpoons;
     std::vector<RemoteCharge> remoteCharges;
     std::vector<ImpactParticle> impactParticles;  // impact smoke puffs
     std::vector<ExplosionFX> explosionFX;         // animated explosion flipbooks
@@ -260,6 +278,7 @@ struct Scene {
     float muzzleFlashTime    = 0.0f;    // short enough to read as one-frame light
     float muzzleFlashDuration = 0.055f;
     float flamethrowerAudioTime = 0.0f;
+    uint32_t nextHarpoonId = 1;
     bool c4DetonateHeld = false;
     float gunRecoilBack      = 0.0f;    // viewmodel translation, local metres
     float gunRecoilKick      = 0.0f;    // viewmodel pitch, degrees
@@ -459,8 +478,11 @@ struct Scene {
     void ResetLevelRuntimeState() {
         projectiles.clear();
         laserBeam.life = 0.0f;
+        harpoonTether.life = 0.0f;
+        pinnedHarpoons.clear();
         remoteCharges.clear();
         flamethrowerAudioTime = 0.0f;
+        nextHarpoonId = 1;
         c4DetonateHeld = false;
         impactParticles.clear();
         explosionFX.clear();
@@ -633,6 +655,14 @@ struct Scene {
                     p.detonate = true;
                     p.active = false;
                 }
+            } else if (p.harpoon) {
+                if (!p.harpoonExpired) {
+                    p.position.x += p.direction.x * p.speed * dt;
+                    p.position.y += p.direction.y * p.speed * dt;
+                    p.position.z += p.direction.z * p.speed * dt;
+                }
+                p.lifetime -= dt;
+                if (p.lifetime <= 0.0f) p.harpoonExpired = true;
             } else {
                 if (p.rocket) {
                     // Battlefield 2-style wire guidance: rocket bends toward the
@@ -668,6 +698,7 @@ struct Scene {
                 [](const Projectile& p) { return !p.active && !p.detonate; }),
             projectiles.end());
         laserBeam.life = (std::max)(0.0f, laserBeam.life - dt);
+        harpoonTether.life = (std::max)(0.0f, harpoonTether.life - dt);
         flamethrowerAudioTime = (std::max)(
             0.0f, flamethrowerAudioTime - dt);
 
@@ -1037,6 +1068,38 @@ struct Scene {
     void StopLaserBeamAt(const XMFLOAT3& hit) {
         laserBeam.end = hit;
         laserBeam.life = laserBeam.maxLife;
+    }
+
+    void ShootHarpoonProjectile() {
+        camera.ApplyRecoil(recoilPitch * 1.8f, 0.0f);
+        gunRecoilBack = (std::min)(0.14f, gunRecoilBack + 0.11f);
+        gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 3.2f);
+        muzzleFlashTime = muzzleFlashDuration;
+
+        Projectile p = {};
+        p.position = p.previousPosition = GetMuzzleWorldPosition();
+        p.direction = camera.Front;
+        p.speed = 92.0f;
+        p.lifetime = 0.85f;
+        p.active = true;
+        p.harpoon = true;
+        p.harpoonId = nextHarpoonId++;
+        if (nextHarpoonId == 0) nextHarpoonId = 1;
+        p.damageMultiplier = 1.25f;
+        projectiles.push_back(p);
+    }
+
+    void ShowHarpoonTether(const XMFLOAT3& hit) {
+        harpoonTether.start = GetMuzzleWorldPosition();
+        harpoonTether.end = hit;
+        harpoonTether.life = harpoonTether.maxLife;
+    }
+
+    void PinHarpoon(const XMFLOAT3& hit, const XMFLOAT3& direction) {
+        if (pinnedHarpoons.size() >= 24)
+            pinnedHarpoons.erase(pinnedHarpoons.begin());
+        pinnedHarpoons.push_back({ hit, direction });
+        ShowHarpoonTether(hit);
     }
 
     void ThrowRemoteCharge() {

@@ -73,7 +73,7 @@ public:
     static bool SVDLoaded() { return SVDMesh() != nullptr; }
 
     static int& SelectedWeapon() {
-        static int weapon = 0; // 0 AK, 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame
+        static int weapon = 0; // 0 AK, 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame, 7 harpoon
         return weapon;
     }
     static bool ShotgunSelected() { return SelectedWeapon() == 1 && ShotgunLoaded(); }
@@ -82,7 +82,9 @@ public:
     static bool LaserSelected() { return SelectedWeapon() == 4; }
     static bool C4Selected() { return SelectedWeapon() == 5; }
     static bool FlamethrowerSelected() { return SelectedWeapon() == 6; }
+    static bool HarpoonSelected() { return SelectedWeapon() == 7; }
     static const char* SelectedWeaponName() {
+        if (HarpoonSelected()) return "Mako Harpoon Gun";
         if (FlamethrowerSelected()) return "M2 Flamethrower";
         if (C4Selected()) return "Remote C4";
         if (LaserSelected()) return "ARC Laser Cutter";
@@ -91,7 +93,7 @@ public:
         return ShotgunSelected() ? "Mossberg 590A1" : "AK47";
     }
     static std::shared_ptr<SceneMesh>& PlayerMesh() {
-        if (FlamethrowerSelected())
+        if (FlamethrowerSelected() || HarpoonSelected())
             return ShotgunLoaded() ? ShotgunMesh() : Mesh();
         if (SVDSelected()) return SVDMesh();
         if (RPGSelected()) return RPGMesh();
@@ -101,7 +103,7 @@ public:
     // different distance from its rear bound to its support-hand grip, so one
     // shared offset cannot keep every weapon inside the same animated hands.
     static XMFLOAT3& WeaponOffset(int weapon) {
-        static std::array<XMFLOAT3, 7> offsets = {{
+        static std::array<XMFLOAT3, 8> offsets = {{
             { 0.000f, -0.100f, -0.440f }, // AK47 handguard
             { 0.045f, -0.100f, -0.290f }, // Mossberg pump
             { 0.020f, -0.030f, -0.330f }, // RPG forward grip
@@ -109,15 +111,17 @@ public:
             { 0.015f, -0.080f, -0.390f }, // laser emitter
             { 0.000f, -0.080f, -0.180f }, // C4 pack
             { 0.030f, -0.095f, -0.330f }, // flamethrower nozzle
+            { 0.020f, -0.085f, -0.345f }, // harpoon barrel
         }};
-        const int slot = (std::max)(0, (std::min)(weapon, 6));
+        const int slot = (std::max)(0, (std::min)(weapon, 7));
         return offsets[static_cast<size_t>(slot)];
     }
     static XMFLOAT3& PlayerOffset() {
         return WeaponOffset(SelectedWeapon());
     }
     static bool PlayerLoaded() {
-        return C4Selected() || FlamethrowerSelected() || PlayerMesh() != nullptr;
+        return C4Selected() || FlamethrowerSelected() || HarpoonSelected() ||
+            PlayerMesh() != nullptr;
     }
     static bool WeaponLoaded(int weapon) {
         switch (weapon) {
@@ -128,14 +132,15 @@ public:
         case 4: return true; // procedural viewmodel; no asset load required
         case 5: return true;
         case 6: return true;
+        case 7: return true;
         default: return false;
         }
     }
     static void CycleWeapon(int direction) {
         const int step = direction < 0 ? -1 : 1;
         int candidate = SelectedWeapon();
-        for (int attempt = 0; attempt < 7; ++attempt) {
-            candidate = (candidate + step + 7) % 7;
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            candidate = (candidate + step + 8) % 8;
             if (WeaponLoaded(candidate)) {
                 SelectedWeapon() = candidate;
                 return;

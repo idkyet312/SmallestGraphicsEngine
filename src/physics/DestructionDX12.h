@@ -170,7 +170,8 @@ public:
                  DirectX::XMFLOAT3& hitPosition) const;
     bool HitTestSegment(const DirectX::XMFLOAT3& worldStart,
                         const DirectX::XMFLOAT3& worldEnd, float radius,
-                        DirectX::XMFLOAT3& hitPosition) const;
+                        DirectX::XMFLOAT3& hitPosition,
+                        uint32_t ignoredHarpoonId = 0) const;
     void ApplyRadialDamage(const DirectX::XMFLOAT3& worldPosition,
                            float radius, float damage = 2.0f);
     // Laser-only hard cut: immediately severs the exact impacted chunk. Support
@@ -204,6 +205,23 @@ public:
     bool ApplyImpulse(const DirectX::XMFLOAT3& worldPosition,
                       const DirectX::XMFLOAT3& worldDirection,
                       float impulseStrength, float hitRadius = 0.5f);
+    // Yanks nearby dynamic debris, ragdolls, and physics barrels toward target.
+    bool ApplyHarpoonPull(const DirectX::XMFLOAT3& worldPosition,
+                          const DirectX::XMFLOAT3& target,
+                          float impulseStrength = 85.0f,
+                          float hitRadius = 1.0f);
+    bool AttachRagdollToHarpoon(uint32_t ragdollId, uint32_t harpoonId,
+                                const DirectX::XMFLOAT3& impactPosition,
+                                float shaftOffset);
+    void MoveHarpoonRagdolls(uint32_t harpoonId,
+                             const DirectX::XMFLOAT3& harpoonPosition,
+                             const DirectX::XMFLOAT3& direction);
+    void PinHarpoonRagdolls(uint32_t harpoonId,
+                            const DirectX::XMFLOAT3& impactPosition,
+                            const DirectX::XMFLOAT3& direction);
+    void ReleaseHarpoonRagdolls(uint32_t harpoonId,
+                                const DirectX::XMFLOAT3& direction,
+                                float speed = 12.0f);
     // Resolves the player against destruction/ragdoll boxes. Walls push the eye
     // out horizontally; low boxes the player is standing over raise `floorY` (so
     // the caller can stand the player on top) instead of shoving them sideways.

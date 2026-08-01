@@ -1573,6 +1573,70 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
     }
 
+    // Brief steel cable shows the harpoon connection while the impact impulse
+    // yanks the target back toward the player.
+    if (scene.harpoonTether.life > 0.0f) {
+        const XMVECTOR start = XMLoadFloat3(&scene.harpoonTether.start);
+        const XMVECTOR end = XMLoadFloat3(&scene.harpoonTether.end);
+        XMVECTOR fwd = end - start;
+        const float len = XMVectorGetX(XMVector3Length(fwd));
+        if (len > 0.02f) {
+            fwd = XMVector3Normalize(fwd);
+            const XMVECTOR up0 = fabsf(XMVectorGetY(fwd)) > 0.95f
+                ? XMVectorSet(1, 0, 0, 0) : XMVectorSet(0, 1, 0, 0);
+            const XMVECTOR right = XMVector3Normalize(XMVector3Cross(up0, fwd));
+            const XMVECTOR up = XMVector3Cross(fwd, right);
+            XMMATRIX basis = XMMatrixIdentity();
+            basis.r[0] = XMVectorSetW(right, 0.0f);
+            basis.r[1] = XMVectorSetW(up, 0.0f);
+            basis.r[2] = XMVectorSetW(fwd, 0.0f);
+            basis.r[3] = XMVectorSetW((start + end) * 0.5f, 1.0f);
+            const float fade = scene.harpoonTether.life /
+                               scene.harpoonTether.maxLife;
+            model = XMMatrixScaling(0.012f * fade, 0.012f * fade, len) * basis;
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetObjectMaterial(XMFLOAT3(0.055f, 0.060f, 0.065f),
+                                     false, false, 0.28f, 0.92f,
+                                     nullptr, nullptr, nullptr);
+            DrawCube(geo);
+            shader.NextDrawCall();
+
+            model = XMMatrixScaling(0.10f, 0.10f, 0.22f) * basis;
+            model.r[3] = XMVectorSetW(end, 1.0f);
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetObjectMaterial(XMFLOAT3(0.16f, 0.17f, 0.18f),
+                                     false, false, 0.22f, 0.96f,
+                                     nullptr, nullptr, nullptr);
+            DrawCapsule(geo);
+            shader.NextDrawCall();
+        }
+    }
+
+    for (const PinnedHarpoonFX& pin : scene.pinnedHarpoons) {
+        XMVECTOR fwd = XMLoadFloat3(&pin.direction);
+        if (XMVectorGetX(XMVector3LengthSq(fwd)) < 1e-6f)
+            fwd = XMVectorSet(0, 0, 1, 0);
+        fwd = XMVector3Normalize(fwd);
+        const XMVECTOR up0 = fabsf(XMVectorGetY(fwd)) > 0.95f
+            ? XMVectorSet(1, 0, 0, 0) : XMVectorSet(0, 1, 0, 0);
+        const XMVECTOR right = XMVector3Normalize(XMVector3Cross(up0, fwd));
+        const XMVECTOR up = XMVector3Cross(fwd, right);
+        XMMATRIX basis = XMMatrixIdentity();
+        basis.r[0] = XMVectorSetW(right, 0.0f);
+        basis.r[1] = XMVectorSetW(up, 0.0f);
+        basis.r[2] = XMVectorSetW(fwd, 0.0f);
+        basis.r[3] = XMVectorSet(
+            pin.position.x, pin.position.y, pin.position.z, 1.0f);
+        model = XMMatrixScaling(0.055f, 0.055f, 0.72f) *
+                XMMatrixTranslation(0.0f, 0.0f, -0.28f) * basis;
+        shader.SetMatrices(model, view, proj, lightSpace);
+        shader.SetObjectMaterial(XMFLOAT3(0.15f, 0.16f, 0.17f),
+                                 false, false, 0.20f, 0.96f,
+                                 nullptr, nullptr, nullptr);
+        DrawCube(geo);
+        shader.NextDrawCall();
+    }
+
     // Armed remote charges remain visible on their impact surfaces. Red status
     // LED blinks until right-click detonation.
     for (const RemoteCharge& charge : scene.remoteCharges) {
@@ -1652,6 +1716,64 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 shader.NextDrawCall();
             }
             shader.Use(scene.wireframeMode);
+            continue;
+        }
+        if (p.harpoon) {
+            const XMFLOAT3 muzzlePosition = scene.GetMuzzleWorldPosition();
+            const XMVECTOR cableStart = XMLoadFloat3(&muzzlePosition);
+            const XMVECTOR cableEnd = XMLoadFloat3(&p.position);
+            XMVECTOR cableForward = cableEnd - cableStart;
+            const float cableLength = XMVectorGetX(XMVector3Length(cableForward));
+            if (cableLength > 0.02f) {
+                cableForward = XMVector3Normalize(cableForward);
+                const XMVECTOR cableUp0 = fabsf(XMVectorGetY(cableForward)) > 0.95f
+                    ? XMVectorSet(1, 0, 0, 0) : XMVectorSet(0, 1, 0, 0);
+                const XMVECTOR cableRight = XMVector3Normalize(
+                    XMVector3Cross(cableUp0, cableForward));
+                const XMVECTOR cableUp = XMVector3Cross(
+                    cableForward, cableRight);
+                XMMATRIX cableBasis = XMMatrixIdentity();
+                cableBasis.r[0] = XMVectorSetW(cableRight, 0.0f);
+                cableBasis.r[1] = XMVectorSetW(cableUp, 0.0f);
+                cableBasis.r[2] = XMVectorSetW(cableForward, 0.0f);
+                cableBasis.r[3] = XMVectorSetW(
+                    (cableStart + cableEnd) * 0.5f, 1.0f);
+                model = XMMatrixScaling(0.012f, 0.012f, cableLength) *
+                        cableBasis;
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetObjectMaterial(XMFLOAT3(0.045f, 0.050f, 0.055f),
+                                         false, false, 0.28f, 0.94f,
+                                         nullptr, nullptr, nullptr);
+                DrawCube(geo);
+                shader.NextDrawCall();
+            }
+            XMVECTOR fwd = XMVector3Normalize(XMLoadFloat3(&p.direction));
+            const XMVECTOR up0 = fabsf(XMVectorGetY(fwd)) > 0.95f
+                ? XMVectorSet(1, 0, 0, 0) : XMVectorSet(0, 1, 0, 0);
+            const XMVECTOR right = XMVector3Normalize(XMVector3Cross(up0, fwd));
+            const XMVECTOR up = XMVector3Cross(fwd, right);
+            XMMATRIX basis = XMMatrixIdentity();
+            basis.r[0] = XMVectorSetW(right, 0.0f);
+            basis.r[1] = XMVectorSetW(up, 0.0f);
+            basis.r[2] = XMVectorSetW(fwd, 0.0f);
+            basis.r[3] = XMVectorSet(
+                p.position.x, p.position.y, p.position.z, 1.0f);
+
+            model = XMMatrixScaling(0.055f, 0.055f, 0.62f) * basis;
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetObjectMaterial(XMFLOAT3(0.15f, 0.16f, 0.17f),
+                                     false, false, 0.20f, 0.96f,
+                                     nullptr, nullptr, nullptr);
+            DrawCapsule(geo);
+            shader.NextDrawCall();
+            model = XMMatrixScaling(0.13f, 0.13f, 0.20f) *
+                    XMMatrixTranslation(0.0f, 0.0f, 0.38f) * basis;
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetObjectMaterial(XMFLOAT3(0.24f, 0.25f, 0.26f),
+                                     false, false, 0.16f, 0.98f,
+                                     nullptr, nullptr, nullptr);
+            DrawCapsule(geo);
+            shader.NextDrawCall();
             continue;
         }
         if (p.rocket) {
@@ -1855,6 +1977,33 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                                                  0.38f, 0.88f,
                                                  nullptr, nullptr, nullptr);
                     }
+                    DrawCube(geo);
+                    shader.NextDrawCall();
+                }
+                shader.Use(scene.wireframeMode);
+            } else if (GunModel::HarpoonSelected()) {
+                struct HarpoonPart { XMFLOAT3 center, size, color; };
+                const HarpoonPart harpoonParts[] = {
+                    {{ 0.00f,  0.015f, 0.53f}, {0.12f, 0.12f, 0.58f},
+                     {0.10f, 0.115f, 0.12f}},
+                    {{ 0.00f, -0.155f, 0.16f}, {0.30f, 0.26f, 0.15f},
+                     {0.055f, 0.065f, 0.070f}},
+                    {{-0.18f, -0.155f, 0.16f}, {0.055f, 0.32f, 0.055f},
+                     {0.17f, 0.18f, 0.19f}},
+                    {{ 0.18f, -0.155f, 0.16f}, {0.055f, 0.32f, 0.055f},
+                     {0.17f, 0.18f, 0.19f}},
+                    {{ 0.00f,  0.015f, 1.02f}, {0.19f, 0.19f, 0.13f},
+                     {0.25f, 0.26f, 0.27f}},
+                };
+                for (const HarpoonPart& part : harpoonParts) {
+                    model = XMMatrixScaling(
+                                part.size.x, part.size.y, part.size.z) *
+                            XMMatrixTranslation(
+                                part.center.x, part.center.y, part.center.z) * xf;
+                    shader.SetMatrices(model, view, proj, lightSpace);
+                    shader.SetObjectMaterial(part.color, false, false,
+                                             0.24f, 0.92f,
+                                             nullptr, nullptr, nullptr);
                     DrawCube(geo);
                     shader.NextDrawCall();
                 }

@@ -1384,7 +1384,8 @@ static bool SpawnBoatTurretGunner() {
 // and shotgun drop below unity, the AK sits near it, the SVD just above.
 static void PlayReloadSound() {
     float pitch = 1.0f;
-    if (GunModel::FlamethrowerSelected())  pitch = 0.74f;
+    if (GunModel::HarpoonSelected())       pitch = 0.68f;
+    else if (GunModel::FlamethrowerSelected())  pitch = 0.74f;
     else if (GunModel::C4Selected())       pitch = 1.18f;
     else if (GunModel::LaserSelected())    pitch = 1.28f;
     else if (GunModel::RPGSelected())      pitch = 0.72f;
@@ -1407,7 +1408,11 @@ static bool ShootPlayerWeapon() {
         if (scene.BeginReload(slot)) PlayReloadSound();
         return false;
     }
-    if (GunModel::C4Selected()) {
+    if (GunModel::HarpoonSelected()) {
+        scene.ShootHarpoonProjectile();
+        const float pitch = 0.62f + ((float)std::rand() / RAND_MAX) * 0.05f;
+        g_gunAudio.Play(1.0f, pitch);
+    } else if (GunModel::C4Selected()) {
         scene.ThrowRemoteCharge();
         g_reloadAudio.Play(0.38f, 1.24f);
     } else if (GunModel::FlamethrowerSelected()) {
@@ -1437,12 +1442,29 @@ static bool ShootPlayerWeapon() {
 }
 
 static float PlayerFireInterval() {
+    if (GunModel::HarpoonSelected()) return 1.25f;
     if (GunModel::C4Selected()) return 0.48f;
     if (GunModel::FlamethrowerSelected()) return 0.075f;
     if (GunModel::LaserSelected()) return 0.055f;
     if (GunModel::SVDSelected()) return 1.05f;
     if (GunModel::RPGSelected()) return 1.7f;
     return GunModel::ShotgunSelected() ? 0.8f : scene.fireInterval;
+}
+
+static void UpdateHarpoonAttachments() {
+    for (Projectile& projectile : scene.projectiles) {
+        if (!projectile.active || !projectile.harpoon) continue;
+        if (projectile.harpoonExpired) {
+            // Missed every pin surface. Corpses keep flying forward; never
+            // reverse toward player.
+            g_destruction.ReleaseHarpoonRagdolls(
+                projectile.harpoonId, projectile.direction, 12.0f);
+            projectile.active = false;
+            continue;
+        }
+        g_destruction.MoveHarpoonRagdolls(
+            projectile.harpoonId, projectile.position, projectile.direction);
+    }
 }
 
 static bool HitTerrainSegment(const XMFLOAT3& start, const XMFLOAT3& end,
@@ -8153,6 +8175,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 scene.impactParticles.erase(scene.impactParticles.begin(),
                     scene.impactParticles.begin() +
                     (scene.impactParticles.size() - 800));
+            UpdateHarpoonAttachments();
             for (auto& projectile : scene.projectiles) {
                 if ((projectile.rocket || projectile.molotov || projectile.vortex) &&
                     projectile.active) {
@@ -8455,6 +8478,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     }
                     continue;
                 }
+                const auto stopProjectileAt = [&](const XMFLOAT3& impact) {
+                    if (projectile.harpoon) {
+                        projectile.position = impact;
+                        g_destruction.PinHarpoonRagdolls(
+                            projectile.harpoonId, impact, projectile.direction);
+                        scene.PinHarpoon(impact, projectile.direction);
+                    }
+                    projectile.active = false;
+                };
 
                 XMFLOAT3 hit;
                 // Collision uses the bullet's own small radius so it must
@@ -8464,49 +8496,80 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 const float bulletRadius = projectile.flame
                     ? 0.24f
                     : std::max(0.12f, scene.projectileScale * 0.5f);
-                bool hitBandit = false;
-                bool killedBandit = false;
-                SkinnedEnemy* hitBanditActor = nullptr;
-                XMFLOAT3 banditHit = projectile.position;
+                struct BanditProjectileHit {
+                    SkinnedEnemy* enemy = nullptr;
+                    XMFLOAT3 position = {};
+                    bool killed = false;
+                };
+                std::vector<BanditProjectileHit> banditHits;
                 // Player shots damage any enemy. Hostile shots damage only the
                 // enemy currently used as a human shield, never squadmates.
                 if (g_banditLoaded && (!projectile.hostile || g_heldBandit)) {
                     for (auto& bandit : g_bandits) {
                         if (projectile.hostile && bandit.get() != g_heldBandit) continue;
-                        if (bandit && bandit->Shoot(
+                        if (!bandit) continue;
+                        XMFLOAT3 banditHit = projectile.position;
+                        if (bandit->Shoot(
                                 projectile.previousPosition, projectile.position,
                                 projectile.direction, bulletRadius, &banditHit, nullptr,
-                                20.0f * projectile.damageMultiplier)) {
-                            hitBandit = true;
-                            hitBanditActor = bandit.get();
-                            killedBandit = bandit->Dead();
-                            if (killedBandit && bandit.get() == g_heldBandit)
+                                projectile.harpoon ? 1000.0f :
+                                20.0f * projectile.damageMultiplier,
+                                true)) {
+                            const bool killed = bandit->Dead();
+                            banditHits.push_back({ bandit.get(), banditHit, killed });
+                            if (killed && bandit.get() == g_heldBandit)
                                 g_heldBandit = nullptr;
-                            break;
+                            if (!projectile.harpoon) break;
                         }
                     }
                 }
-                if (hitBandit) {
-                    if (projectile.laser)
-                        scene.StopLaserBeamAt(banditHit);
-                    if ((projectile.laser || projectile.flame) &&
-                        hitBanditActor && !hitBanditActor->Dead())
-                        hitBanditActor->Ignite(6.5f);
-                    const XMFLOAT3 normal(-projectile.direction.x, -projectile.direction.y,
-                                          -projectile.direction.z);
-                    scene.SpawnBloodBurst(banditHit, normal);
+                if (!banditHits.empty()) {
+                    for (BanditProjectileHit& banditHit : banditHits) {
+                        if (projectile.laser)
+                            scene.StopLaserBeamAt(banditHit.position);
+                        if ((projectile.laser || projectile.flame) &&
+                            banditHit.enemy && !banditHit.enemy->Dead())
+                            banditHit.enemy->Ignite(6.5f);
+                        if (projectile.harpoon && banditHit.enemy &&
+                            banditHit.enemy->Dead() &&
+                            projectile.harpoonPiercedCount < 6) {
+                            const float offset =
+                                projectile.harpoonPiercedCount * 0.58f;
+                            if (g_destruction.AttachRagdollToHarpoon(
+                                    banditHit.enemy->RagdollId(),
+                                    projectile.harpoonId,
+                                    banditHit.position, offset)) {
+                                ++projectile.harpoonPiercedCount;
+                            }
+                        }
+                        const XMFLOAT3 normal(
+                            -projectile.direction.x, -projectile.direction.y,
+                            -projectile.direction.z);
+                        scene.SpawnBloodBurst(banditHit.position, normal);
+                    }
                     const float hitPitch =
                         g_fleshHitPitchMin + ((float)std::rand() / RAND_MAX) *
                         (g_fleshHitPitchMax - g_fleshHitPitchMin);
                     g_hitAudio.Play(0.72f * 0.3f, hitPitch);
-                    if (!killedBandit && g_banditPainCooldown <= 0.0f) {
+                    if (!banditHits.front().killed &&
+                        g_banditPainCooldown <= 0.0f) {
                         const float painPitch =
                             0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
                         g_banditHitVoiceAudio.Play(
-                            BanditVoiceVolume(banditHit, 0.82f), painPitch);
+                            BanditVoiceVolume(
+                                banditHits.front().position, 0.82f), painPitch);
                         g_banditPainCooldown = 0.45f;
                     }
                     PlayBanditDeathEvents();
+                    if (projectile.harpoon) {
+                        scene.ShowHarpoonTether(banditHits.back().position);
+                        g_destruction.MoveHarpoonRagdolls(
+                            projectile.harpoonId, projectile.position,
+                            projectile.direction);
+                        // Kill and penetrate every enemy in this flight segment.
+                        // Next solid impact freezes all carried ragdolls there.
+                        continue;
+                    }
                     projectile.active = false;
                     continue;
                 }
@@ -8535,7 +8598,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     scene.SpawnBulletImpact(helicopterHit, normal);
                     DamageHelicopter(34.0f * projectile.damageMultiplier, helicopterHit);
                     if (projectile.laser) scene.StopLaserBeamAt(helicopterHit);
-                    projectile.active = false;
+                    if (projectile.harpoon) scene.ShowHarpoonTether(helicopterHit);
+                    stopProjectileAt(helicopterHit);
                     continue;
                 }
                 if (!projectile.hostile && HitSecondaryHelicopterSegment(
@@ -8548,7 +8612,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     DamageSecondaryHelicopter(
                         34.0f * projectile.damageMultiplier, helicopterHit);
                     if (projectile.laser) scene.StopLaserBeamAt(helicopterHit);
-                    projectile.active = false;
+                    if (projectile.harpoon) scene.ShowHarpoonTether(helicopterHit);
+                    stopProjectileAt(helicopterHit);
                     continue;
                 }
                 XMFLOAT3 boatHit;
@@ -8561,7 +8626,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     scene.SpawnBulletImpact(boatHit, normal);
                     DamageBoat(34.0f * projectile.damageMultiplier, boatHit);
                     if (projectile.laser) scene.StopLaserBeamAt(boatHit);
-                    projectile.active = false;
+                    if (projectile.harpoon) scene.ShowHarpoonTether(boatHit);
+                    stopProjectileAt(boatHit);
                     continue;
                 }
                 size_t barrelIndex = 0;
@@ -8570,12 +8636,40 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         projectile.previousPosition, projectile.position,
                         bulletRadius, barrelIndex, barrelHit)) {
                     ExplosiveBarrel& barrel = scene.explosiveBarrels[barrelIndex];
-                    barrel.hits += static_cast<int>(std::ceil(projectile.damageMultiplier));
+                    const bool carryingRagdolls = projectile.harpoon &&
+                        projectile.harpoonPiercedCount > 0;
+                    if (!carryingRagdolls)
+                        barrel.hits += static_cast<int>(
+                            std::ceil(projectile.damageMultiplier));
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(barrelHit, normal);
                     if (projectile.laser) scene.StopLaserBeamAt(barrelHit);
+                    if (projectile.harpoon && !carryingRagdolls) {
+                        scene.ShowHarpoonTether(barrelHit);
+                        XMVECTOR pull = XMLoadFloat3(&scene.camera.Position) -
+                            XMLoadFloat3(&barrel.position);
+                        if (XMVectorGetX(XMVector3LengthSq(pull)) > 1e-5f)
+                            pull = XMVector3Normalize(
+                                pull + XMVectorSet(0.0f, 0.12f, 0.0f, 0.0f));
+                        XMFLOAT3 velocity;
+                        XMStoreFloat3(&velocity, pull * 18.0f);
+                        // Preserve barrel rule: Box3D bodies exist only while a
+                        // vortex owns them. Harpoon flight uses manual velocity.
+                        if (barrel.vortexHoldTime > 0.0f &&
+                            barrel.physicsHandle != 0) {
+                            g_destruction.SetExplosiveBarrelVelocity(
+                                barrel.physicsHandle, velocity);
+                        } else {
+                            DestroyExplosiveBarrelBody(barrel);
+                            barrel.velocity = velocity;
+                        }
+                        barrel.held = false;
+                        barrel.thrown = true;
+                        if (g_heldBarrelIndex == barrelIndex)
+                            g_heldBarrelIndex = SIZE_MAX;
+                    }
                     if (projectile.flame && !barrel.burning) {
                         barrel.burning = true;
                         barrel.fuse = 3.0f;
@@ -8588,7 +8682,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         barrel.fuse = 3.0f;
                         barrel.fireFxCooldown = 0.0f;
                     }
-                    projectile.active = false;
+                    stopProjectileAt(barrelHit);
                     continue;
                 }
                 uint64_t prefabEntityId = 0;
@@ -8601,16 +8695,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(hit, normal);
                     if (projectile.laser) scene.StopLaserBeamAt(hit);
+                    if (projectile.harpoon) scene.ShowHarpoonTether(hit);
                     if (projectile.laser || projectile.flame) {
                         scene.IgniteMaterial(prefabEntityId, hit, 1.65f);
                     }
-                    DamagePrefabEntity(prefabEntityId,
-                        34.0f * projectile.damageMultiplier, hit);
-                    projectile.active = false;
+                    if (!projectile.harpoon ||
+                        projectile.harpoonPiercedCount == 0)
+                        DamagePrefabEntity(prefabEntityId,
+                            34.0f * projectile.damageMultiplier, hit);
+                    stopProjectileAt(hit);
                     continue;
                 }
+                XMFLOAT3 projectileForceDirection = projectile.direction;
+                if (projectile.harpoon) {
+                    XMVECTOR pull = XMLoadFloat3(&scene.camera.Position) -
+                        XMLoadFloat3(&projectile.position);
+                    if (XMVectorGetX(XMVector3LengthSq(pull)) > 1e-5f)
+                        XMStoreFloat3(&projectileForceDirection,
+                                      XMVector3Normalize(pull));
+                }
                 if (g_destruction.HitTestSegment(projectile.previousPosition, projectile.position,
-                                                 bulletRadius, hit)) {
+                                                 bulletRadius, hit,
+                                                 projectile.harpoon
+                                                     ? projectile.harpoonId : 0)) {
                     std::cout << "Projectile hit wall at " << hit.x << ", "
                               << hit.y << ", " << hit.z << "\n";
                     if (projectile.flame)
@@ -8618,15 +8725,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     if (projectile.laser) {
                         g_destruction.DestroyChunkAt(
                             hit, scene.destructionDamageRadius);
-                    } else {
+                    } else if (!projectile.harpoon ||
+                               projectile.harpoonPiercedCount == 0) {
                         g_destruction.ApplyRadialDamage(
                             hit, scene.destructionDamageRadius,
+                            projectile.harpoon ? 2.5f :
                             scene.destructionDamage * projectile.damageMultiplier);
                     }
-                    g_destruction.ApplyImpulse(hit, projectile.direction,
-                                               scene.destructionBulletImpulse *
-                                                   projectile.damageMultiplier,
-                                               scene.destructionDamageRadius);
+                    if (projectile.harpoon &&
+                        projectile.harpoonPiercedCount == 0) {
+                        scene.ShowHarpoonTether(hit);
+                        g_destruction.ApplyHarpoonPull(
+                            hit, scene.camera.Position, 105.0f, 1.15f);
+                    } else {
+                        g_destruction.ApplyImpulse(hit, projectile.direction,
+                                                   scene.destructionBulletImpulse *
+                                                       projectile.damageMultiplier,
+                                                   scene.destructionDamageRadius);
+                    }
                     // Impact FX: spark burst + hole decal. Surface normal is
                     // approximated as facing back along the bullet's travel.
                     const XMFLOAT3 normal(-projectile.direction.x,
@@ -8641,20 +8757,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     } else if (projectile.flame) {
                         scene.SpawnSmokeBurst(hit, 0.22f, 0.10f);
                     }
-                    projectile.active = false;
+                    stopProjectileAt(hit);
                 } else if (!g_emptyLevelMode && g_water.ShootFloaters(projectile.previousPosition,
-                                                 projectile.position, projectile.direction,
-                                                 bulletRadius, scene.destructionBulletImpulse)) {
+                                                 projectile.position,
+                                                 projectileForceDirection,
+                                                 bulletRadius,
+                                                 projectile.harpoon ? 85.0f :
+                                                 scene.destructionBulletImpulse)) {
                     // Bullet knocked a crate floating in the pool.
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(projectile.position, normal);
-                    projectile.active = false;
+                    if (projectile.harpoon)
+                        scene.ShowHarpoonTether(projectile.position);
+                    stopProjectileAt(projectile.position);
                 } else if (XMFLOAT3 treeHit;
                            !g_emptyLevelMode && g_trees.Shoot(projectile.previousPosition, projectile.position,
-                                         projectile.direction, bulletRadius,
-                                         scene.treeDamagePerShot * projectile.damageMultiplier,
+                                         projectileForceDirection,
+                                         bulletRadius,
+                                         projectile.harpoon &&
+                                             projectile.harpoonPiercedCount > 0
+                                             ? 0.0f
+                                             : scene.treeDamagePerShot *
+                                               projectile.damageMultiplier,
                                          treeHit)) {
                     // Chewed a palm trunk; enough rounds and it snaps and topples.
                     const XMFLOAT3 normal(-projectile.direction.x,
@@ -8663,30 +8789,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     scene.SpawnBulletImpact(treeHit, normal);
                     scene.SpawnSmokeBurst(treeHit, 0.25f, 0.1f);
                     if (projectile.laser) scene.StopLaserBeamAt(treeHit);
+                    if (projectile.harpoon) scene.ShowHarpoonTether(treeHit);
                     if (projectile.laser || projectile.flame) {
                         g_trees.IgniteNear(treeHit, 0.85f);
                     }
-                    projectile.active = false;
+                    stopProjectileAt(treeHit);
                 } else if (XMFLOAT3 waterHit;
                            !g_emptyLevelMode && g_water.ShootSurface(projectile.previousPosition,
                                                 projectile.position, waterHit)) {
                     projectile.position = waterHit;
                     if (projectile.laser) scene.StopLaserBeamAt(waterHit);
-                    projectile.active = false;
+                    if (projectile.harpoon) scene.ShowHarpoonTether(waterHit);
+                    stopProjectileAt(waterHit);
                 } else if (XMFLOAT3 oceanHit;
                            !g_emptyLevelMode && g_ocean.ShootSurface(projectile.previousPosition,
                                                 projectile.position, oceanHit, 0.28f)) {
                     projectile.position = oceanHit;
                     if (projectile.laser) scene.StopLaserBeamAt(oceanHit);
-                    projectile.active = false;
+                    if (projectile.harpoon) scene.ShowHarpoonTether(oceanHit);
+                    stopProjectileAt(oceanHit);
                 } else if (XMFLOAT3 terrainHit;
                            HitTerrainSegment(projectile.previousPosition,
                                              projectile.position,
                                              bulletRadius, terrainHit)) {
                     projectile.position = terrainHit;
                     if (projectile.laser) scene.StopLaserBeamAt(terrainHit);
+                    if (projectile.harpoon) scene.ShowHarpoonTether(terrainHit);
                     if (projectile.flame) scene.SpawnCarriedFire(terrainHit);
-                    projectile.active = false;
+                    stopProjectileAt(terrainHit);
                 } else if (projectile.hostile) {
                     // Player is tested last. Any world or character mesh in
                     // front consumes the shot first, preventing wall penetration.

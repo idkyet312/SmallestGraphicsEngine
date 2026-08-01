@@ -304,6 +304,17 @@ struct DestructionDX12::Impl {
         float damageCooldown = 0.45f;
     };
     std::vector<BurningChunk> burningChunks;
+    struct HarpoonRagdollPart {
+        size_t partIndex = 0;
+        XMFLOAT3 impactOffset = {};
+    };
+    struct HarpoonRagdollAttachment {
+        uint32_t harpoonId = 0;
+        uint32_t ragdollId = InvalidIndex;
+        float shaftOffset = 0.0f;
+        std::vector<HarpoonRagdollPart> parts;
+    };
+    std::vector<HarpoonRagdollAttachment> harpoonRagdolls;
     std::vector<BarrelRuntime> barrelBodies;
     std::vector<uint32_t> barrelImpactEvents;
     uint32_t nextBarrelHandle = 1;
@@ -2508,7 +2519,7 @@ void DestructionDX12::Shutdown() {
     m->chunks.clear(); m->renderItems.clear(); m->renderBatches.clear();
     m->batchCache.clear(); m->spatialBatchCache.clear(); m->ragdollParts.clear();
     m->barrelBodies.clear(); m->barrelImpactEvents.clear(); m->vortices.clear();
-    m->burningChunks.clear();
+    m->burningChunks.clear(); m->harpoonRagdolls.clear();
     for (auto& retired : m->retiredBatchNodes) retired.clear();
     m->authoredRagdolls.clear();
     m->ragdollRenderItems.clear(); m->initialized = false;
@@ -3059,7 +3070,8 @@ bool DestructionDX12::HitTest(const XMFLOAT3& worldPosition, float radius, XMFLO
 }
 
 bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3& worldEnd,
-                                     float radius, XMFLOAT3& hitPosition) const {
+                                     float radius, XMFLOAT3& hitPosition,
+                                     uint32_t ignoredHarpoonId) const {
     if (!m->initialized) return false;
     m->lastRagdollHit = -1;
     float closest = FLT_MAX;
@@ -3084,6 +3096,21 @@ bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3&
         }
     }
     for (size_t i = 0; i < m->ragdollParts.size(); ++i) {
+        if (ignoredHarpoonId != 0) {
+            bool carriedByThisHarpoon = false;
+            for (const Impl::HarpoonRagdollAttachment& attachment :
+                 m->harpoonRagdolls) {
+                if (attachment.harpoonId != ignoredHarpoonId) continue;
+                for (const Impl::HarpoonRagdollPart& attachedPart :
+                     attachment.parts) {
+                    if (attachedPart.partIndex != i) continue;
+                    carriedByThisHarpoon = true;
+                    break;
+                }
+                if (carriedByThisHarpoon) break;
+            }
+            if (carriedByThisHarpoon) continue;
+        }
         const Impl::RagdollPart& part = m->ragdollParts[i];
         const b3Vec3 a = b3Body_GetLocalPoint(part.body,
             { worldStart.x, worldStart.y, worldStart.z });
@@ -3491,6 +3518,181 @@ bool DestructionDX12::ApplyImpulse(const XMFLOAT3& worldPosition,
         applied = true;
     }
     return applied;
+}
+
+bool DestructionDX12::ApplyHarpoonPull(const XMFLOAT3& worldPosition,
+                                       const XMFLOAT3& target,
+                                       float impulseStrength, float hitRadius) {
+    if (!m->initialized || impulseStrength <= 0.0f || hitRadius <= 0.0f)
+        return false;
+    const XMVECTOR impact = XMLoadFloat3(&worldPosition);
+    const XMVECTOR pullTarget = XMLoadFloat3(&target);
+    const float radiusSquared = hitRadius * hitRadius;
+    bool applied = false;
+
+    const auto bodyWithinHitRadius = [&](b3BodyId body) {
+        if (B3_IS_NULL(body)) return false;
+        const b3Pos bodyPosition = b3Body_GetPosition(body);
+        const XMVECTOR position = XMVectorSet(
+            (float)bodyPosition.x, (float)bodyPosition.y,
+            (float)bodyPosition.z, 0.0f);
+        return XMVectorGetX(XMVector3LengthSq(position - impact)) <=
+               radiusSquared;
+    };
+
+    const auto pullBody = [&](b3BodyId body, float maximumDeltaVelocity) {
+        if (!bodyWithinHitRadius(body)) return;
+        const b3Pos bodyPosition = b3Body_GetPosition(body);
+        const XMVECTOR position = XMVectorSet(
+            (float)bodyPosition.x, (float)bodyPosition.y,
+            (float)bodyPosition.z, 0.0f);
+        const float hitDistanceSquared =
+            XMVectorGetX(XMVector3LengthSq(position - impact));
+        if (hitDistanceSquared > radiusSquared) return;
+        XMVECTOR direction = pullTarget - position;
+        if (XMVectorGetX(XMVector3LengthSq(direction)) < 1e-5f)
+            direction = XMVectorSet(0.0f, 0.25f, 1.0f, 0.0f);
+        direction = XMVector3Normalize(direction + XMVectorSet(0.0f, 0.10f, 0.0f, 0.0f));
+        const float falloff = (std::max)(0.25f,
+            1.0f - std::sqrt(hitDistanceSquared) / hitRadius);
+        const float mass = (std::max)(0.05f, b3Body_GetMass(body));
+        const float magnitude = (std::min)(
+            impulseStrength * falloff, maximumDeltaVelocity * mass);
+        XMFLOAT3 impulse;
+        XMStoreFloat3(&impulse, direction * magnitude);
+        b3Body_ApplyLinearImpulseToCenter(
+            body, { impulse.x, impulse.y, impulse.z }, true);
+        applied = true;
+    };
+
+    for (auto& runtime : m->actors) {
+        if (!runtime->dynamic ||
+            !bodyWithinHitRadius(runtime->body)) continue;
+        if (runtime->debrisCleanupEligible) m->WakeDebris(*runtime);
+        pullBody(runtime->body, 18.0f);
+    }
+    for (const Impl::RagdollPart& part : m->ragdollParts)
+        pullBody(part.body, 20.0f);
+    for (const Impl::BarrelRuntime& barrel : m->barrelBodies)
+        pullBody(barrel.body, 16.0f);
+
+    if (applied) {
+        m->lastRagdollHit = -1;
+        m->rebuiltWhileStill = false;
+    }
+    return applied;
+}
+
+bool DestructionDX12::AttachRagdollToHarpoon(
+    uint32_t ragdollId, uint32_t harpoonId,
+    const XMFLOAT3& impactPosition, float shaftOffset) {
+    if (!m->initialized || ragdollId == InvalidIndex || harpoonId == 0)
+        return false;
+    for (const Impl::HarpoonRagdollAttachment& attachment :
+         m->harpoonRagdolls)
+        if (attachment.ragdollId == ragdollId) return false;
+
+    Impl::HarpoonRagdollAttachment attachment;
+    attachment.harpoonId = harpoonId;
+    attachment.ragdollId = ragdollId;
+    attachment.shaftOffset = (std::max)(0.0f, shaftOffset);
+    for (size_t partIndex = 0;
+         partIndex < m->ragdollParts.size(); ++partIndex) {
+        Impl::RagdollPart& part = m->ragdollParts[partIndex];
+        if (part.authoredId != ragdollId || B3_IS_NULL(part.body)) continue;
+        const b3Pos position = b3Body_GetPosition(part.body);
+        attachment.parts.push_back({ partIndex, {
+            (float)position.x - impactPosition.x,
+            (float)position.y - impactPosition.y,
+            (float)position.z - impactPosition.z } });
+        b3Body_SetType(part.body, b3_kinematicBody);
+        b3Body_SetLinearVelocity(part.body, { 0.0f, 0.0f, 0.0f });
+        b3Body_SetAngularVelocity(part.body, { 0.0f, 0.0f, 0.0f });
+    }
+    if (attachment.parts.empty()) return false;
+    m->harpoonRagdolls.push_back(std::move(attachment));
+    m->rebuiltWhileStill = false;
+    return true;
+}
+
+void DestructionDX12::MoveHarpoonRagdolls(
+    uint32_t harpoonId, const XMFLOAT3& harpoonPosition,
+    const XMFLOAT3& direction) {
+    if (!m->initialized || harpoonId == 0) return;
+    for (const Impl::HarpoonRagdollAttachment& attachment :
+         m->harpoonRagdolls) {
+        if (attachment.harpoonId != harpoonId) continue;
+        const XMFLOAT3 anchor = {
+            harpoonPosition.x - direction.x * (0.45f + attachment.shaftOffset),
+            harpoonPosition.y - direction.y * (0.45f + attachment.shaftOffset),
+            harpoonPosition.z - direction.z * (0.45f + attachment.shaftOffset) };
+        for (const Impl::HarpoonRagdollPart& attachedPart : attachment.parts) {
+            if (attachedPart.partIndex >= m->ragdollParts.size()) continue;
+            const b3BodyId body = m->ragdollParts[attachedPart.partIndex].body;
+            if (B3_IS_NULL(body)) continue;
+            const b3Quat rotation = b3Body_GetRotation(body);
+            b3Body_SetTransform(body, {
+                anchor.x + attachedPart.impactOffset.x,
+                anchor.y + attachedPart.impactOffset.y,
+                anchor.z + attachedPart.impactOffset.z }, rotation);
+            b3Body_SetLinearVelocity(body, { 0.0f, 0.0f, 0.0f });
+            b3Body_SetAngularVelocity(body, { 0.0f, 0.0f, 0.0f });
+        }
+    }
+    m->rebuiltWhileStill = false;
+}
+
+void DestructionDX12::PinHarpoonRagdolls(
+    uint32_t harpoonId, const XMFLOAT3& impactPosition,
+    const XMFLOAT3& direction) {
+    if (!m->initialized || harpoonId == 0) return;
+    MoveHarpoonRagdolls(harpoonId, impactPosition, direction);
+    for (const Impl::HarpoonRagdollAttachment& attachment :
+         m->harpoonRagdolls) {
+        if (attachment.harpoonId != harpoonId) continue;
+        for (const Impl::HarpoonRagdollPart& attachedPart : attachment.parts) {
+            if (attachedPart.partIndex >= m->ragdollParts.size()) continue;
+            const b3BodyId body = m->ragdollParts[attachedPart.partIndex].body;
+            if (!B3_IS_NULL(body)) b3Body_SetType(body, b3_staticBody);
+        }
+    }
+    m->harpoonRagdolls.erase(
+        std::remove_if(m->harpoonRagdolls.begin(), m->harpoonRagdolls.end(),
+            [harpoonId](const Impl::HarpoonRagdollAttachment& attachment) {
+                return attachment.harpoonId == harpoonId;
+            }),
+        m->harpoonRagdolls.end());
+    m->RebuildRenderItems();
+}
+
+void DestructionDX12::ReleaseHarpoonRagdolls(
+    uint32_t harpoonId, const XMFLOAT3& direction, float speed) {
+    if (!m->initialized || harpoonId == 0) return;
+    XMVECTOR releaseDirection = XMLoadFloat3(&direction);
+    if (XMVectorGetX(XMVector3LengthSq(releaseDirection)) < 1e-5f)
+        releaseDirection = XMVectorSet(0.0f, 0.15f, 1.0f, 0.0f);
+    releaseDirection = XMVector3Normalize(releaseDirection);
+    XMFLOAT3 velocity;
+    XMStoreFloat3(&velocity, releaseDirection * (std::max)(0.0f, speed));
+    for (const Impl::HarpoonRagdollAttachment& attachment :
+         m->harpoonRagdolls) {
+        if (attachment.harpoonId != harpoonId) continue;
+        for (const Impl::HarpoonRagdollPart& attachedPart : attachment.parts) {
+            if (attachedPart.partIndex >= m->ragdollParts.size()) continue;
+            const b3BodyId body = m->ragdollParts[attachedPart.partIndex].body;
+            if (B3_IS_NULL(body)) continue;
+            b3Body_SetType(body, b3_dynamicBody);
+            b3Body_SetLinearVelocity(
+                body, { velocity.x, velocity.y, velocity.z });
+        }
+    }
+    m->harpoonRagdolls.erase(
+        std::remove_if(m->harpoonRagdolls.begin(), m->harpoonRagdolls.end(),
+            [harpoonId](const Impl::HarpoonRagdollAttachment& attachment) {
+                return attachment.harpoonId == harpoonId;
+            }),
+        m->harpoonRagdolls.end());
+    m->rebuiltWhileStill = false;
 }
 
 void DestructionDX12::SetWaterRegion(const XMFLOAT3& minCorner, const XMFLOAT3& maxCorner) {
