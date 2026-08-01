@@ -79,6 +79,7 @@ struct HarpoonTetherFX {
 struct PinnedHarpoonFX {
     XMFLOAT3 position = {};
     XMFLOAT3 direction = { 0.0f, 0.0f, 1.0f };
+    uint32_t harpoonId = 0;
 };
 
 struct RemoteCharge {
@@ -1095,10 +1096,11 @@ struct Scene {
         harpoonTether.life = harpoonTether.maxLife;
     }
 
-    void PinHarpoon(const XMFLOAT3& hit, const XMFLOAT3& direction) {
+    void PinHarpoon(const XMFLOAT3& hit, const XMFLOAT3& direction,
+                    uint32_t harpoonId = 0) {
         if (pinnedHarpoons.size() >= 24)
             pinnedHarpoons.erase(pinnedHarpoons.begin());
-        pinnedHarpoons.push_back({ hit, direction });
+        pinnedHarpoons.push_back({ hit, direction, harpoonId });
         ShowHarpoonTether(hit);
     }
 

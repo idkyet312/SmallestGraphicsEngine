@@ -315,6 +315,15 @@ struct DestructionDX12::Impl {
         std::vector<HarpoonRagdollPart> parts;
     };
     std::vector<HarpoonRagdollAttachment> harpoonRagdolls;
+    struct PinnedHarpoonRagdoll {
+        uint32_t harpoonId = 0;
+        uint32_t chunkIndex = InvalidIndex;
+        size_t partIndex = 0;
+        b3Vec3 ragdollLocalAnchor = {};
+        b3Vec3 ragdollLocalDirection = { 0.0f, 0.0f, 1.0f };
+        b3JointId joint = b3_nullJointId;
+    };
+    std::vector<PinnedHarpoonRagdoll> pinnedHarpoonRagdolls;
     std::vector<BarrelRuntime> barrelBodies;
     std::vector<uint32_t> barrelImpactEvents;
     uint32_t nextBarrelHandle = 1;
@@ -433,6 +442,7 @@ struct DestructionDX12::Impl {
     XMFLOAT3 enemyTarget = {};
     bool enemyTargetValid = false;
     mutable int lastRagdollHit = -1;
+    mutable uint32_t lastHitChunk = InvalidIndex;
     TkFramework* framework = nullptr;
     TkAsset* asset = nullptr;
     TkFamily* family = nullptr;
@@ -2199,6 +2209,50 @@ struct DestructionDX12::Impl {
         return nullptr;
     }
 
+    bool CreatePinnedHarpoonJoint(PinnedHarpoonRagdoll& pin) {
+        if (pin.partIndex >= ragdollParts.size() ||
+            pin.chunkIndex == InvalidIndex) return false;
+        RagdollPart& part = ragdollParts[pin.partIndex];
+        ActorRuntime* ownerRuntime = FindChunkOwner(pin.chunkIndex);
+        if (!ownerRuntime || B3_IS_NULL(ownerRuntime->body) ||
+            B3_IS_NULL(part.body)) return false;
+        if (!B3_IS_NULL(pin.joint) && b3Joint_IsValid(pin.joint)) return true;
+
+        const b3Pos anchor = b3Body_GetWorldPoint(
+            part.body, pin.ragdollLocalAnchor);
+        b3Body_SetType(part.body, b3_dynamicBody);
+        b3Body_SetLinearVelocity(part.body,
+            b3Body_GetWorldPointVelocity(ownerRuntime->body, anchor));
+        b3Body_SetAngularVelocity(part.body,
+            b3Body_GetAngularVelocity(ownerRuntime->body));
+
+        b3WeldJointDef weld = b3DefaultWeldJointDef();
+        weld.base.bodyIdA = ownerRuntime->body;
+        weld.base.bodyIdB = part.body;
+        weld.base.localFrameA.p = b3Body_GetLocalPoint(
+            ownerRuntime->body, anchor);
+        weld.base.localFrameB.p = pin.ragdollLocalAnchor;
+        const b3Quat ownerRotation = b3Body_GetRotation(ownerRuntime->body);
+        const b3Quat ragdollRotation = b3Body_GetRotation(part.body);
+        weld.base.localFrameA.q = b3Quat_identity;
+        weld.base.localFrameB.q = b3InvMulQuat(
+            ragdollRotation, ownerRotation);
+        weld.linearHertz = 0.0f;
+        weld.angularHertz = 0.0f;
+        weld.linearDampingRatio = 1.0f;
+        weld.angularDampingRatio = 1.0f;
+        pin.joint = b3CreateWeldJoint(world, &weld);
+        return !B3_IS_NULL(pin.joint) && b3Joint_IsValid(pin.joint);
+    }
+
+    void RefreshPinnedHarpoonJoints() {
+        for (PinnedHarpoonRagdoll& pin : pinnedHarpoonRagdolls) {
+            if (!B3_IS_NULL(pin.joint) && b3Joint_IsValid(pin.joint)) continue;
+            pin.joint = b3_nullJointId;
+            CreatePinnedHarpoonJoint(pin);
+        }
+    }
+
     bool ChunkWorldPosition(uint32_t chunkIndex, XMFLOAT3& position) const {
         if (chunkIndex >= chunks.size()) return false;
         const ActorRuntime* runtime = FindChunkOwner(chunkIndex);
@@ -2520,6 +2574,7 @@ void DestructionDX12::Shutdown() {
     m->batchCache.clear(); m->spatialBatchCache.clear(); m->ragdollParts.clear();
     m->barrelBodies.clear(); m->barrelImpactEvents.clear(); m->vortices.clear();
     m->burningChunks.clear(); m->harpoonRagdolls.clear();
+    m->pinnedHarpoonRagdolls.clear();
     for (auto& retired : m->retiredBatchNodes) retired.clear();
     m->authoredRagdolls.clear();
     m->ragdollRenderItems.clear(); m->initialized = false;
@@ -2723,6 +2778,7 @@ void DestructionDX12::Update(float dt) {
     const auto physicsBegin = std::chrono::steady_clock::now();
     while (m->accumulator >= step) {
         physicsStepped = true;
+        m->RefreshPinnedHarpoonJoints();
         m->ApplyWaterBuoyancy();
         m->ApplyVortices(step);
         m->ApplyEnemyHover(step);
@@ -3074,6 +3130,7 @@ bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3&
                                      uint32_t ignoredHarpoonId) const {
     if (!m->initialized) return false;
     m->lastRagdollHit = -1;
+    m->lastHitChunk = InvalidIndex;
     float closest = FLT_MAX;
     bool hit = false;
     for (const auto& runtime : m->actors) {
@@ -3091,7 +3148,9 @@ bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3&
             float t = 0.0f;
             if (SegmentAabb(modelStart, modelEnd, radius,
                             m->chunks[index].minimum, m->chunks[index].maximum, t) && t < closest) {
-                closest = t; hit = true;
+                closest = t;
+                hit = true;
+                m->lastHitChunk = index;
             }
         }
     }
@@ -3117,7 +3176,10 @@ bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3&
         if (SegmentAabb({ a.x, a.y, a.z }, { b.x, b.y, b.z }, radius,
                         { -part.half.x, -part.half.y, -part.half.z },
                         {  part.half.x,  part.half.y,  part.half.z }, t) && t < closest) {
-            closest = t; hit = true; m->lastRagdollHit = (int)i;
+            closest = t;
+            hit = true;
+            m->lastRagdollHit = (int)i;
+            m->lastHitChunk = InvalidIndex;
         }
     }
     if (hit) {
@@ -3657,16 +3719,37 @@ void DestructionDX12::MoveHarpoonRagdolls(
 
 void DestructionDX12::PinHarpoonRagdolls(
     uint32_t harpoonId, const XMFLOAT3& impactPosition,
-    const XMFLOAT3& direction) {
+    const XMFLOAT3& direction, bool attachToLastDestructible) {
     if (!m->initialized || harpoonId == 0) return;
     MoveHarpoonRagdolls(harpoonId, impactPosition, direction);
+    const uint32_t targetChunk = attachToLastDestructible
+        ? m->lastHitChunk : InvalidIndex;
     for (const Impl::HarpoonRagdollAttachment& attachment :
          m->harpoonRagdolls) {
         if (attachment.harpoonId != harpoonId) continue;
         for (const Impl::HarpoonRagdollPart& attachedPart : attachment.parts) {
             if (attachedPart.partIndex >= m->ragdollParts.size()) continue;
             const b3BodyId body = m->ragdollParts[attachedPart.partIndex].body;
-            if (!B3_IS_NULL(body)) b3Body_SetType(body, b3_staticBody);
+            if (B3_IS_NULL(body)) continue;
+            if (targetChunk != InvalidIndex &&
+                m->FindChunkOwner(targetChunk)) {
+                Impl::PinnedHarpoonRagdoll pin;
+                pin.harpoonId = harpoonId;
+                pin.chunkIndex = targetChunk;
+                pin.partIndex = attachedPart.partIndex;
+                pin.ragdollLocalAnchor = b3Body_GetLocalPoint(body, {
+                    impactPosition.x, impactPosition.y, impactPosition.z });
+                pin.ragdollLocalDirection = b3Body_GetLocalVector(body, {
+                    direction.x, direction.y, direction.z });
+                m->pinnedHarpoonRagdolls.push_back(pin);
+                if (!m->CreatePinnedHarpoonJoint(
+                        m->pinnedHarpoonRagdolls.back())) {
+                    m->pinnedHarpoonRagdolls.pop_back();
+                    b3Body_SetType(body, b3_staticBody);
+                }
+            } else {
+                b3Body_SetType(body, b3_staticBody);
+            }
         }
     }
     m->harpoonRagdolls.erase(
@@ -3675,7 +3758,34 @@ void DestructionDX12::PinHarpoonRagdolls(
                 return attachment.harpoonId == harpoonId;
             }),
         m->harpoonRagdolls.end());
+    m->lastHitChunk = InvalidIndex;
     m->RebuildRenderItems();
+}
+
+bool DestructionDX12::GetPinnedHarpoonPose(
+    uint32_t harpoonId, XMFLOAT3& position, XMFLOAT3& direction) const {
+    if (!m || !m->initialized || harpoonId == 0) return false;
+    for (const Impl::PinnedHarpoonRagdoll& pin :
+         m->pinnedHarpoonRagdolls) {
+        if (pin.harpoonId != harpoonId ||
+            pin.partIndex >= m->ragdollParts.size()) continue;
+        const b3BodyId body = m->ragdollParts[pin.partIndex].body;
+        if (B3_IS_NULL(body)) continue;
+        const b3Pos worldPosition = b3Body_GetWorldPoint(
+            body, pin.ragdollLocalAnchor);
+        const b3Vec3 worldDirection = b3Body_GetWorldVector(
+            body, pin.ragdollLocalDirection);
+        position = { (float)worldPosition.x, (float)worldPosition.y,
+                     (float)worldPosition.z };
+        XMVECTOR normalized = XMVectorSet(
+            worldDirection.x, worldDirection.y, worldDirection.z, 0.0f);
+        normalized = XMVectorGetX(XMVector3LengthSq(normalized)) < 1e-5f
+            ? XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f)
+            : XMVector3Normalize(normalized);
+        XMStoreFloat3(&direction, normalized);
+        return true;
+    }
+    return false;
 }
 
 void DestructionDX12::ReleaseHarpoonRagdolls(
@@ -3909,6 +4019,7 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
             m->actors.push_back(std::move(runtime));
         }
     }
+    m->RefreshPinnedHarpoonJoints();
 }
 
 std::vector<DestructionDebrisHazard> DestructionDX12::GetDangerousDebris(

@@ -218,7 +218,11 @@ public:
                              const DirectX::XMFLOAT3& direction);
     void PinHarpoonRagdolls(uint32_t harpoonId,
                             const DirectX::XMFLOAT3& impactPosition,
-                            const DirectX::XMFLOAT3& direction);
+                            const DirectX::XMFLOAT3& direction,
+                            bool attachToLastDestructible = false);
+    bool GetPinnedHarpoonPose(uint32_t harpoonId,
+                              DirectX::XMFLOAT3& position,
+                              DirectX::XMFLOAT3& direction) const;
     void ReleaseHarpoonRagdolls(uint32_t harpoonId,
                                 const DirectX::XMFLOAT3& direction,
                                 float speed = 12.0f);

@@ -1468,6 +1468,11 @@ static void UpdateHarpoonAttachments() {
         g_destruction.MoveHarpoonRagdolls(
             projectile.harpoonId, projectile.position, projectile.direction);
     }
+    for (PinnedHarpoonFX& pin : scene.pinnedHarpoons) {
+        if (pin.harpoonId == 0) continue;
+        g_destruction.GetPinnedHarpoonPose(
+            pin.harpoonId, pin.position, pin.direction);
+    }
 }
 
 static bool HitTerrainSegment(const XMFLOAT3& start, const XMFLOAT3& end,
@@ -8625,12 +8630,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     }
                     continue;
                 }
-                const auto stopProjectileAt = [&](const XMFLOAT3& impact) {
+                const auto stopProjectileAt = [&](const XMFLOAT3& impact,
+                                                   bool destructibleHit = false) {
                     if (projectile.harpoon) {
                         projectile.position = impact;
                         g_destruction.PinHarpoonRagdolls(
-                            projectile.harpoonId, impact, projectile.direction);
-                        scene.PinHarpoon(impact, projectile.direction);
+                            projectile.harpoonId, impact, projectile.direction,
+                            destructibleHit);
+                        scene.PinHarpoon(
+                            impact, projectile.direction, projectile.harpoonId);
                     }
                     projectile.active = false;
                 };
@@ -8912,7 +8920,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     } else if (projectile.flame) {
                         scene.SpawnSmokeBurst(hit, 0.22f, 0.10f);
                     }
-                    stopProjectileAt(hit);
+                    stopProjectileAt(hit, true);
                 } else if (!g_emptyLevelMode && g_water.ShootFloaters(projectile.previousPosition,
                                                  projectile.position,
                                                  projectileForceDirection,
