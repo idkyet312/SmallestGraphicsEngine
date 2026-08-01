@@ -245,6 +245,23 @@ struct Scene {
     // palm fronds look blocky. 8x the froxels sharpens them at a real GPU cost,
     // so it stays opt-in.
     bool  volumetricFogHighRes = false;
+    // How sun shafts are produced.
+    //
+    // Volumetric marches the froxel grid: correct occlusion from any geometry,
+    // shafts visible with the sun off-screen, but the grid is only 64 (or 128)
+    // froxels wide, so a column straddling a silhouette mixes the shadowed and
+    // unoccluded ray and bleeds brightness across the edge.
+    //
+    // Faux is a screen-space radial blur from the sun with a per-tap depth test.
+    // It has no grid, so it cannot bleed or quantise, but it needs the sun on
+    // screen and cannot show a shaft that starts behind the camera.
+    enum class LightShaftMode { Volumetric = 0, Faux = 1, Off = 2 };
+    LightShaftMode lightShaftMode = LightShaftMode::Volumetric;
+    float lightShaftDensity = 0.85f;   // how far along the sun ray taps march
+    float lightShaftDecay = 0.96f;     // per-tap falloff; <1 shortens the streak
+    float lightShaftWeight = 0.85f;    // overall contribution of the tap sum
+    float lightShaftExposure = 0.32f;  // final scale before it is added
+    float lightShaftIntensity = 1.0f;  // user-facing master strength
     float volumetricFogDensity = 0.0128f;
     float volumetricFogAnisotropy = 0.90f;
     float volumetricFogHeightFalloff = 0.045f; // fog thins above the undergrowth, not over treetops

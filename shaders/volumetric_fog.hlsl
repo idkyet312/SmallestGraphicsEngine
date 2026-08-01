@@ -56,7 +56,9 @@ float3 WorldRay(float2 uv)
     return normalize(world.xyz - cameraPositionNear.xyz);
 }
 
-float SunVisibility(float3 worldPosition)
+// rotation lets the caller decorrelate the tap pattern per froxel, so the filter
+// reads as soft gradient rather than as a repeated kernel shape.
+float SunVisibility(float3 worldPosition, float rotation)
 {
     if (fogParams.w < 0.5)
         return 1.0;
@@ -70,8 +72,35 @@ float SunVisibility(float3 worldPosition)
     float2 uv = projected.xy * float2(0.5, -0.5) + 0.5;
     if (any(uv < 0.0) || any(uv > 1.0) || projected.z <= 0.0 || projected.z >= 1.0)
         return 1.0;
-    return shadowMap.SampleCmpLevelZero(
+
+    // A single comparison tap makes every shaft edge a hard shadow-texel
+    // boundary swept along the view ray, which is what read as straight
+    // diagonal streaks radiating from the sun. Raising the froxel grid cannot
+    // help: the aliasing is in the shadow lookup, not the froxel spacing.
+    // Average a small rotated disc of taps so the boundary becomes a gradient
+    // the width of the filter.
+    const float2 kTaps[4] = {
+        float2( 0.936,  0.352), float2(-0.352,  0.936),
+        float2(-0.936, -0.352), float2( 0.352, -0.936)
+    };
+    float sine, cosine;
+    sincos(rotation, sine, cosine);
+    float2x2 rotate = float2x2(cosine, -sine, sine, cosine);
+    // Cascades cover progressively larger areas, so widen in texels, not world
+    // units, to keep the softness visually consistent across cascade splits.
+    // Kept narrow deliberately: widening this to 3 texels softened the occluder
+    // edge enough that sun-facing views bled a bright veil over the hillside in
+    // front of the sun -- the same failure the phase clamp below guards against.
+    float radius = 1.6 / 2048.0;
+    float visibility = shadowMap.SampleCmpLevelZero(
         shadowSampler, float3(uv, cascade), projected.z - 0.0025);
+    [unroll]
+    for (uint i = 0; i < 4; ++i)
+        visibility += shadowMap.SampleCmpLevelZero(
+            shadowSampler,
+            float3(uv + mul(kTaps[i], rotate) * radius, cascade),
+            projected.z - 0.0025);
+    return visibility * 0.2;
 }
 
 float HenyeyGreenstein(float cosineTheta, float g)
@@ -179,8 +208,22 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float extinction = max(sunDirectionDensity.w * heightDensity, 0.00001);
         float segmentTransmittance = exp(-extinction * stepLength);
 
-        float shadow = SunVisibility(worldPosition) *
-                       CloudSunVisibility(worldPosition);
+        // Two shadow evaluations per froxel, at different depths inside the
+        // slice. Slice thickness grows exponentially with distance, so a single
+        // sample makes a shaft edge crossing a far slice snap to that whole
+        // slab -- visible as banding across the shaft. Sampling near the front
+        // and back of the slice and averaging turns that step into a ramp.
+        // Rotate the PCF disc per froxel and per slice so neighbouring samples
+        // do not share a kernel orientation; combined with sliceJitter the
+        // residual pattern averages into smooth falloff.
+        float rotation = (sliceJitter + float(z) * 0.618034) * 6.2831853;
+        float secondDepth = lerp(nearDepth, farDepth, frac(sliceJitter + 0.5));
+        float3 secondPosition =
+            cameraPositionNear.xyz + ray * (secondDepth / viewCos);
+        float shadow = 0.5 * (
+            SunVisibility(worldPosition, rotation) +
+            SunVisibility(secondPosition, rotation + 1.5707963));
+        shadow *= CloudSunVisibility(worldPosition);
         // Daylight fog must replace attenuated scene energy with sky irradiance.
         // A tiny ambient term made the former pass behave like red/brown smoke.
         float3 lighting = AtmosphereAmbient(ray, aboveBase) +
@@ -249,7 +292,19 @@ float3 FogVolumeUVW(float2 uv, float slice)
     float3 allocated = float3(maxVolumeDims.xyz);
     float3 scale = written / allocated;
     float3 halfTexel = 0.5 / allocated;
-    return clamp(float3(uv, slice) * scale, halfTexel, scale - halfTexel);
+
+    // Froxel z accumulates the range [SliceDepth(z), SliceDepth(z+1)] and is
+    // stored at texel index z, i.e. texel centre (z + 0.5) / gridZ. Sampling the
+    // raw slice coordinate is therefore half a texel too far and bilinear blends
+    // in the NEXT froxel. Where the depth buffer stops at terrain, that next
+    // froxel is the unoccluded volume behind the hill, which bled full sunlight
+    // through the slope. Pull back by half a texel and clamp so the deepest
+    // sample can never reach past the froxel the surface actually occupies.
+    float sliceTexel = max(slice * written.z - 0.5, 0.0);
+    float sliceUV = min(sliceTexel, written.z - 1.0) / allocated.z;
+
+    float2 planar = clamp(uv * scale.xy, halfTexel.xy, scale.xy - halfTexel.xy);
+    return float3(planar, clamp(sliceUV, halfTexel.z, scale.z - halfTexel.z));
 }
 
 float4 PSMain(VSOutput input) : SV_TARGET

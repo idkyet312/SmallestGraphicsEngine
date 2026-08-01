@@ -53,6 +53,7 @@
 #include "OcclusionDepthDX12.h"
 #include "FXAADX12.h"
 #include "VolumetricFogDX12.h"
+#include "LightShaftsDX12.h"
 #include "ScreenSpaceAODX12.h"
 #include "ScreenSpaceReflectionsDX12.h"
 #include "MSAADX12.h"
@@ -1761,6 +1762,7 @@ static XMMATRIX             previousHZBViewProjection = XMMatrixIdentity();
 static bool                 hzbCaptureActive = false;
 static FXAADX12             fxaa;
 static VolumetricFogDX12    volumetricFog;
+static LightShaftsDX12      lightShafts;
 static ScreenSpaceAODX12    screenSpaceAO;
 static ScreenSpaceReflectionsDX12 screenSpaceReflections;
 static WaterRendererDX12    waterRenderer;
@@ -6624,6 +6626,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         scene.enableFXAA = false;
     }
     BootStep("Initializing volumetric fog...");
+    BootStep("Initializing light shafts...");
+    if (!lightShafts.Init())
+        std::cerr << "Light shafts init failed (non-fatal)\n";
     if (!volumetricFog.Init()) {
         std::cerr << "Volumetric fog init failed (non-fatal)\n";
         scene.enableVolumetricFog = false;
@@ -8396,7 +8401,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         const bool visibilityValidation = visibilityParityValidation;
         // Shared post-render pass. Normal forward composites to the resolved
         // swapchain target. Visibility and parity-forward composite to HDR.
-        if (renderedScene && scene.enableVolumetricFog && volumetricFog.initialized) {
+        const bool volumetricShafts =
+            scene.lightShaftMode == Scene::LightShaftMode::Volumetric;
+        const bool fauxShafts =
+            scene.lightShaftMode == Scene::LightShaftMode::Faux;
+        if (renderedScene && scene.enableVolumetricFog &&
+            volumetricFog.initialized && volumetricShafts) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Volumetric Fog", g_dx12.commandList.Get());
             ID3D12Resource* fogDepth =
@@ -8414,6 +8424,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 commonHDRValidationTarget ? visBuffer.GetOutputRTV()
                                           : D3D12_CPU_DESCRIPTOR_HANDLE{},
                 commonHDRValidationTarget, fogDepthAlreadyReadable);
+        }
+        // Faux shafts need the HDR target: they read the scene colour they are
+        // about to add onto, so the visibility buffer's output is both source
+        // and destination. Only run on the HDR path where that texture exists.
+        if (renderedScene && fauxShafts && lightShafts.initialized &&
+            commonHDRValidationTarget) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "Light Shafts", g_dx12.commandList.Get());
+            ID3D12Resource* shaftDepth = g_dx12.depthStencilBuffer.Get();
+            bool shaftDepthReadable = false;
+            if (grassMSAAActive && grassMSAA.GetCombinedDepthResource()) {
+                shaftDepth = grassMSAA.GetCombinedDepthResource();
+                shaftDepthReadable = true;
+            }
+            lightShafts.Render(scene, g_dx12.commandList.Get(), shaftDepth,
+                visBuffer.GetOutputRTV(), shaftDepthReadable);
         }
 
         if (commonHDRValidationTarget) {

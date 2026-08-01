@@ -600,14 +600,39 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         if (ImGui::Checkbox("High Quality Tropical Water", &highWater))
             scene.waterQuality = highWater
                 ? WaterQuality::High : WaterQuality::Low;
+        const char* shaftModes[] = { "Volumetric", "Faux (screen-space)", "Off" };
+        int shaftMode = static_cast<int>(scene.lightShaftMode);
+        if (ImGui::Combo("Light Shafts", &shaftMode, shaftModes, 3))
+            scene.lightShaftMode =
+                static_cast<Scene::LightShaftMode>(shaftMode);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Volumetric: marches a froxel grid. Occludes against any\n"
+                "geometry and works with the sun off screen, but the grid is\n"
+                "coarse, so brightness can bleed across a silhouette.\n\n"
+                "Faux: radial blur from the sun with a per-tap depth test.\n"
+                "No grid, so no bleeding or blockiness, but the sun must be\n"
+                "on screen.");
+        if (scene.lightShaftMode == Scene::LightShaftMode::Faux) {
+            ImGui::SliderFloat("Shaft Intensity", &scene.lightShaftIntensity,
+                               0.0f, 3.0f, "%.2f");
+            ImGui::SliderFloat("Shaft Length", &scene.lightShaftDensity,
+                               0.1f, 1.5f, "%.2f");
+            ImGui::SliderFloat("Shaft Decay", &scene.lightShaftDecay,
+                               0.80f, 1.0f, "%.3f");
+            ImGui::SliderFloat("Shaft Exposure", &scene.lightShaftExposure,
+                               0.0f, 1.0f, "%.2f");
+        }
         ImGui::Checkbox("Volumetric Fog", &scene.enableVolumetricFog);
         if (scene.enableVolumetricFog) {
-            ImGui::Checkbox("High-Res Light Shafts",
-                            &scene.volumetricFogHighRes);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(
-                    "Doubles the fog grid to 128x72x96 (8x froxels).\n"
-                    "Sharpens sun shafts through foliage at a GPU cost.");
+            if (scene.lightShaftMode == Scene::LightShaftMode::Volumetric) {
+                ImGui::Checkbox("High-Res Light Shafts",
+                                &scene.volumetricFogHighRes);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Doubles the fog grid to 128x72x96 (8x froxels).\n"
+                        "Sharpens sun shafts through foliage at a GPU cost.");
+            }
             ImGui::DragFloat("Fog Density", &scene.volumetricFogDensity,
                              0.0005f, 0.0001f, 0.05f, "%.4f");
             ImGui::SliderFloat("Fog Anisotropy", &scene.volumetricFogAnisotropy,
