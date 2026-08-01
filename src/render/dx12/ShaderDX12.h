@@ -1196,7 +1196,8 @@ public:
 
     void SetGrassMaterial(const XMFLOAT3& albedo, float roughness,
                           float ambientScale, float directLightScale,
-                          float transmissionStrength, float colorVariation) {
+                          float transmissionStrength, float colorVariation,
+                          bool uniformLighting = false) {
         const UINT bufferIndex = GetDrawCallIndex();
         ObjectBufferDX12 data = {};
         data.objectColor = albedo;
@@ -1208,6 +1209,7 @@ public:
         data.occlusionStrength = (std::max)(directLightScale, 0.0f);
         data.normalYSign = (std::max)(transmissionStrength, 0.0f);
         data.viewFillStrength = (std::max)(colorVariation, 0.0f);
+        data.normalTexW = uniformLighting ? 1.0f : 0.0f;
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(
             3, objectBuffer.GetGPUAddress(bufferIndex));

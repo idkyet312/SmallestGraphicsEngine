@@ -247,6 +247,9 @@ public:
     float& DirectLightScale()      { return m_directLightScale; }
     float& TransmissionStrength()  { return m_transmissionStrength; }
     float& ColorVariation()        { return m_colorVariation; }
+    // Lights every blade as if it faced the sun, removing the bright/dark split
+    // across the field at the cost of being non-physical.
+    bool& UniformLighting()        { return m_uniformLighting; }
     void ResetMaterial() {
         m_albedo = XMFLOAT3(0.078431f, 0.078431f, 0.078431f);
         m_roughness = 0.705f;
@@ -254,6 +257,7 @@ public:
         m_directLightScale = 1.0f;
         m_transmissionStrength = 0.533f;
         m_colorVariation = 1.0f;
+        m_uniformLighting = false;
     }
     // Authored curved cards overlap into large repeated silhouettes on nearby
     // vehicles and buildings. Grass receives lighting but never enters CSMs.
@@ -646,6 +650,7 @@ private:
     float m_ambientScale = 1.281f;
     float m_directLightScale = 1.0f;
     float m_transmissionStrength = 0.533f;
+    bool  m_uniformLighting = false;
     float m_colorVariation = 1.0f;
     // Side of one draw-cell. Small enough that the cells hug the draw radius
     // without dragging in much grass the shader would only fade away, large enough

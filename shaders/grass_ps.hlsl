@@ -49,7 +49,9 @@ cbuffer ObjectBuffer : register(b3) {
     float occlusionStrength;
     float normalYSign;
     float viewFillStrength;
-    float normalTexW;        // unused here, kept for layout parity
+    // Grass reuses this slot (unused by the cheap grass path) as the uniform
+    // lighting flag; see the direct-light block in main().
+    float uniformLighting;
     float normalTexH;
 };
 
@@ -208,32 +210,30 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // Thin vegetation is not an opaque card. Wrap direct light around both sides
     // and transmit warm sunlight through back-facing blades. This removes the
     // near-black foreground silhouettes while retaining object/terrain shadows.
-    // Direct sun is applied at its full sun-facing value regardless of which way
-    // a blade points. The wrapped N.L this replaces fell to zero once a blade
-    // turned 0.32 away from the light, so away-facing patches dropped to ambient
-    // and the field split into a bright half and a near-black half with a hard
-    // line between them. Holding the term at its peak gives every blade the lit
-    // appearance and removes the split entirely.
-    //
-    // This is deliberately not physical: a field of blades at every orientation
-    // now receives identical direct light. Shadowing, ambient occlusion and the
-    // sky term still vary, so the grass is not flat -- it just no longer darkens
-    // by facing.
-    const float wrappedNdotL = 1.0;
+    // uniformLighting > 0.5 lights every blade as though it faced the sun.
+    // The wrapped term below reaches zero once a blade turns 0.32 away from the
+    // light, so away-facing patches fall back to ambient and the field splits
+    // into a bright half and a dark half with a hard line between them. Holding
+    // the term at its sun-facing peak removes that split at the cost of being
+    // non-physical -- every orientation then receives identical direct light.
+    const bool uniformGrassLight = uniformLighting > 0.5;
+    float signedNdotL = dot(normal, lightDir);
+    float wrappedNdotL = uniformGrassLight
+        ? 1.0 : saturate((signedNdotL + 0.32) / 1.32);
+    float backNdotL = uniformGrassLight ? 1.0 : saturate(-signedNdotL);
     result += albedo / 3.14159265 * lightColor *
               wrappedNdotL * shadowVisibility *
               max(occlusionStrength, 0.0);
 
     // Broad low-energy leaf sheen. Roughness now remains useful on the cheap
     // grass shader without turning blades into metallic highlights.
-    //
-    // The lobe is taken against the absolute half-vector alignment so a blade
-    // facing away catches the same sheen as one facing the sun; leaving it
-    // signed would put a highlight on one half of the field only, which is the
-    // difference this change exists to remove.
     float3 halfDir = normalize(lightDir + viewDir);
     float specularPower = lerp(96.0, 10.0, saturate(roughness));
-    float specularLobe = pow(abs(dot(normal, halfDir)), specularPower);
+    // abs() in uniform mode so the sheen lands on both sides rather than only
+    // the half of the field turned toward the sun.
+    float specularAlignment = uniformGrassLight
+        ? abs(dot(normal, halfDir)) : saturate(dot(normal, halfDir));
+    float specularLobe = pow(specularAlignment, specularPower);
     float specularEnergy = (1.0 - saturate(roughness)) * 0.08;
     result += lightColor * specularLobe * specularEnergy *
               shadowVisibility * max(occlusionStrength, 0.0);
@@ -241,12 +241,8 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float tipTransmission = lerp(0.55, 1.0, smoothstep(0.15, 0.92,
                                                         input.texCoord.y));
     float3 transmissionTint = float3(0.72, 0.98, 0.50);
-    // backNdotL is dropped for the same reason as the wrap above: it only ever
-    // fired on away-facing blades, so leaving it in would tint exactly the half
-    // of the field this change is meant to match to the other. Applying the
-    // through-leaf green everywhere keeps the two sides identical.
     result += albedo * transmissionTint * lightColor *
-              tipTransmission * max(normalYSign, 0.0) *
+              backNdotL * tipTransmission * max(normalYSign, 0.0) *
               lerp(0.35, 1.0, shadowVisibility);
 
 #ifdef SGE_HDR_TARGET

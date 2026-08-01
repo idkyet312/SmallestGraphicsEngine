@@ -802,7 +802,8 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
             shader.SetGrassMaterial(
                 g_grass.Albedo(), g_grass.Roughness(),
                 g_grass.AmbientScale(), g_grass.DirectLightScale(),
-                g_grass.TransmissionStrength(), g_grass.ColorVariation());
+                g_grass.TransmissionStrength(), g_grass.ColorVariation(),
+                g_grass.UniformLighting());
 
             GrassField::Params gp = g_grass.GetParams(
                 scene.EffectiveCameraFOV(), static_cast<float>(g_dx12.screenHeight));
@@ -1158,7 +1159,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             shader.SetGrassMaterial(
                 g_grass.Albedo(), g_grass.Roughness(),
                 g_grass.AmbientScale(), g_grass.DirectLightScale(),
-                g_grass.TransmissionStrength(), g_grass.ColorVariation());
+                g_grass.TransmissionStrength(), g_grass.ColorVariation(),
+                g_grass.UniformLighting());
 
             // Wind parameters as root constants (b6), and the per-blade data as a
             // root SRV (t6). Both slots exist for the terrain mesh-shader path and
