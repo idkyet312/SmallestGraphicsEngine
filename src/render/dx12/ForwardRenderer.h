@@ -807,6 +807,13 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node,
             false);
 }
 
+// Spear.glb is authored two metres long on +Z, with its point at z=0.7973 and
+// its mesh node lifted by 0.0385. Rebase that point onto the projectile impact
+// position represented by `basis`; the shaft then extends back along -Z.
+inline XMMATRIX HarpoonSpearModelMatrix(const XMMATRIX& basis) {
+    return XMMatrixTranslation(0.0f, -0.0385f, -0.7973286f) * basis;
+}
+
 inline bool SceneNodeSupportsMeshInstancing(const std::shared_ptr<SceneNode>& node) {
     if (!node) return false;
     if (node->mesh) for (const auto& prim : node->mesh->primitives) {
@@ -1601,14 +1608,21 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             DrawCube(geo);
             shader.NextDrawCall();
 
-            model = XMMatrixScaling(0.10f, 0.10f, 0.22f) * basis;
-            model.r[3] = XMVectorSetW(end, 1.0f);
-            shader.SetMatrices(model, view, proj, lightSpace);
-            shader.SetObjectMaterial(XMFLOAT3(0.16f, 0.17f, 0.18f),
-                                     false, false, 0.22f, 0.96f,
-                                     nullptr, nullptr, nullptr);
-            DrawCapsule(geo);
-            shader.NextDrawCall();
+            if (GunModel::HarpoonSpearModel()) {
+                basis.r[3] = XMVectorSetW(end, 1.0f);
+                DrawSceneNode(GunModel::HarpoonSpearModel(), shader,
+                    HarpoonSpearModelMatrix(basis), view, proj, lightSpace);
+                shader.Use(scene.wireframeMode);
+            } else {
+                model = XMMatrixScaling(0.10f, 0.10f, 0.22f) * basis;
+                model.r[3] = XMVectorSetW(end, 1.0f);
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetObjectMaterial(XMFLOAT3(0.16f, 0.17f, 0.18f),
+                                         false, false, 0.22f, 0.96f,
+                                         nullptr, nullptr, nullptr);
+                DrawCapsule(geo);
+                shader.NextDrawCall();
+            }
         }
     }
 
@@ -1627,6 +1641,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         basis.r[2] = XMVectorSetW(fwd, 0.0f);
         basis.r[3] = XMVectorSet(
             pin.position.x, pin.position.y, pin.position.z, 1.0f);
+        if (GunModel::HarpoonSpearModel()) {
+            DrawSceneNode(GunModel::HarpoonSpearModel(), shader,
+                HarpoonSpearModelMatrix(basis), view, proj, lightSpace);
+            shader.Use(scene.wireframeMode);
+            continue;
+        }
         model = XMMatrixScaling(0.055f, 0.055f, 0.72f) *
                 XMMatrixTranslation(0.0f, 0.0f, -0.28f) * basis;
         shader.SetMatrices(model, view, proj, lightSpace);
@@ -1758,6 +1778,13 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             basis.r[2] = XMVectorSetW(fwd, 0.0f);
             basis.r[3] = XMVectorSet(
                 p.position.x, p.position.y, p.position.z, 1.0f);
+
+            if (GunModel::HarpoonSpearModel()) {
+                DrawSceneNode(GunModel::HarpoonSpearModel(), shader,
+                    HarpoonSpearModelMatrix(basis), view, proj, lightSpace);
+                shader.Use(scene.wireframeMode);
+                continue;
+            }
 
             model = XMMatrixScaling(0.055f, 0.055f, 0.62f) * basis;
             shader.SetMatrices(model, view, proj, lightSpace);
@@ -1981,7 +2008,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                     shader.NextDrawCall();
                 }
                 shader.Use(scene.wireframeMode);
-            } else if (GunModel::HarpoonSelected()) {
+            } else if (GunModel::HarpoonSelected() &&
+                       !GunModel::HarpoonGunLoaded()) {
                 struct HarpoonPart { XMFLOAT3 center, size, color; };
                 const HarpoonPart harpoonParts[] = {
                     {{ 0.00f,  0.015f, 0.53f}, {0.12f, 0.12f, 0.58f},

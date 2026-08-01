@@ -72,6 +72,17 @@ public:
     }
     static bool SVDLoaded() { return SVDMesh() != nullptr; }
 
+    static std::shared_ptr<SceneMesh>& HarpoonGunMesh() {
+        static std::shared_ptr<SceneMesh> mesh;
+        return mesh;
+    }
+    static bool HarpoonGunLoaded() { return HarpoonGunMesh() != nullptr; }
+
+    static std::shared_ptr<SceneNode>& HarpoonSpearModel() {
+        static std::shared_ptr<SceneNode> model;
+        return model;
+    }
+
     static int& SelectedWeapon() {
         static int weapon = 0; // 0 AK, 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame, 7 harpoon
         return weapon;
@@ -93,7 +104,10 @@ public:
         return ShotgunSelected() ? "Mossberg 590A1" : "AK47";
     }
     static std::shared_ptr<SceneMesh>& PlayerMesh() {
-        if (FlamethrowerSelected() || HarpoonSelected())
+        if (HarpoonSelected())
+            return HarpoonGunLoaded() ? HarpoonGunMesh() :
+                (ShotgunLoaded() ? ShotgunMesh() : Mesh());
+        if (FlamethrowerSelected())
             return ShotgunLoaded() ? ShotgunMesh() : Mesh();
         if (SVDSelected()) return SVDMesh();
         if (RPGSelected()) return RPGMesh();
@@ -111,7 +125,7 @@ public:
             { 0.015f, -0.080f, -0.390f }, // laser emitter
             { 0.000f, -0.080f, -0.180f }, // C4 pack
             { 0.030f, -0.095f, -0.330f }, // flamethrower nozzle
-            { 0.020f, -0.085f, -0.345f }, // harpoon barrel
+            { 0.020f, -0.085f, -0.305f }, // harpoon barrel
         }};
         const int slot = (std::max)(0, (std::min)(weapon, 7));
         return offsets[static_cast<size_t>(slot)];
@@ -155,6 +169,9 @@ public:
         static bool attempted = false;
         if (attempted) return;
         attempted = true;
+
+        LoadHarpoonGun();
+        LoadHarpoonSpear();
 
         const std::string path = Resolve("Content/Models/ak47/AK47.FBX");
         std::cout << "Loading AK47 " << path << "...\n";
@@ -238,6 +255,63 @@ private:
         for (const std::string& c : { rel, "build/" + rel, "../" + rel, "../../build/" + rel })
             if (std::filesystem::exists(c)) return c;
         return rel;
+    }
+
+    static void LoadHarpoonSpear() {
+        const std::string path = Resolve(
+            "Content/Models/HarpoonSpear/Spear.glb");
+        HarpoonSpearModel() = GLBImporter::LoadGLB(
+            path, g_dx12.device, g_dx12.commandList);
+        if (!HarpoonSpearModel()) {
+            std::cerr << "Harpoon spear GLB unavailable; using procedural spear\n";
+            return;
+        }
+        const auto disableMovingOcclusion = [&](const auto& self,
+                                                const std::shared_ptr<SceneNode>& node) -> void {
+            if (!node) return;
+            if (node->mesh) for (MeshPrimitive& primitive : node->mesh->primitives)
+                if (primitive.material)
+                    primitive.material->disableOcclusionCulling = true;
+            for (const auto& child : node->children) self(self, child);
+        };
+        disableMovingOcclusion(disableMovingOcclusion, HarpoonSpearModel());
+        std::cout << "Harpoon spear GLB ready\n";
+    }
+
+    static void LoadHarpoonGun() {
+        const std::string path = Resolve(
+            "Content/Models/HarpoonGun/HarpoonGun.glb");
+        auto root = GLBImporter::LoadGLB(
+            path, g_dx12.device, g_dx12.commandList);
+        if (!root) {
+            std::cerr << "Harpoon gun GLB unavailable; using shotgun fallback\n";
+            return;
+        }
+
+        std::vector<MeshPrimitive> primitives;
+        XMFLOAT4X4 identity;
+        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+        root->UpdateGlobalTransform(identity);
+        Flatten(root, primitives);
+        if (primitives.empty()) {
+            std::cerr << "Harpoon gun GLB had no geometry\n";
+            return;
+        }
+
+        // Rebase into the same grip-local frame as every other weapon: rear at
+        // z=0, barrel down +Z, normalized to the standard viewmodel length.
+        Orient(primitives);
+        FlipHarpoonGun180(primitives);
+        auto mesh = std::make_shared<SceneMesh>();
+        mesh->primitives = std::move(primitives);
+        for (MeshPrimitive& primitive : mesh->primitives) {
+            if (primitive.material)
+                primitive.material->disableOcclusionCulling = true;
+            GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get());
+        }
+        HarpoonGunMesh() = mesh;
+        std::cout << "Harpoon gun GLB ready: " << mesh->primitives.size()
+                  << " primitive(s)\n";
     }
 
     static void LoadShotgun() {
@@ -473,6 +547,22 @@ private:
                 primitive.vertices[v + 4] = -nx;
                 primitive.vertices[v + 8] = primitive.vertices[v + 9];
                 primitive.vertices[v + 9] = -tx;
+            }
+        }
+    }
+
+    static void FlipHarpoonGun180(std::vector<MeshPrimitive>& prims) {
+        // Rotate around local Y through the weapon centre. Keeping the same
+        // 0..kBarrelLength frame preserves the viewmodel grip placement.
+        for (MeshPrimitive& primitive : prims) {
+            for (size_t v = 0; v + 11 < primitive.vertices.size(); v += 12) {
+                primitive.vertices[v] = -primitive.vertices[v];
+                primitive.vertices[v + 2] =
+                    kBarrelLength - primitive.vertices[v + 2];
+                primitive.vertices[v + 3] = -primitive.vertices[v + 3];
+                primitive.vertices[v + 5] = -primitive.vertices[v + 5];
+                primitive.vertices[v + 8] = -primitive.vertices[v + 8];
+                primitive.vertices[v + 10] = -primitive.vertices[v + 10];
             }
         }
     }

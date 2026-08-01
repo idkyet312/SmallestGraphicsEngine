@@ -198,6 +198,7 @@ static XMFLOAT3&            g_helicopterSpawn = g_game.vehicles.helicopterSpawn;
 static XMFLOAT3&            g_secondaryHelicopterPosition =
     g_game.vehicles.secondaryHelicopterPosition;
 constexpr float             kHelicopterPatrolRadius = 16.0f;
+constexpr float             kHelicopterEngagementRange = 125.0f;
 static float&               g_secondaryHelicopterYaw = g_game.vehicles.secondaryHelicopterYaw;
 static float&               g_secondaryHelicopterPitch = g_game.vehicles.secondaryHelicopterPitch;
 static float&               g_secondaryHelicopterRoll = g_game.vehicles.secondaryHelicopterRoll;
@@ -861,7 +862,8 @@ static void UpdateHelicopter(float dt) {
         g_helicopterPosition.z + forward.z * 3.75f };
     XMVECTOR direction = XMLoadFloat3(&scene.camera.Position) - XMLoadFloat3(&muzzle);
     const float distanceSq = XMVectorGetX(XMVector3LengthSq(direction));
-    if (distanceSq < 4.0f || distanceSq > 75.0f * 75.0f) {
+    if (distanceSq < 4.0f ||
+        distanceSq > kHelicopterEngagementRange * kHelicopterEngagementRange) {
         g_helicopterFireCooldown = 0.10f;
         return;
     }
@@ -966,7 +968,8 @@ static void UpdateSecondaryHelicopter(float dt) {
     XMVECTOR direction =
         XMLoadFloat3(&scene.camera.Position) - XMLoadFloat3(&muzzle);
     const float distanceSq = XMVectorGetX(XMVector3LengthSq(direction));
-    if (distanceSq < 4.0f || distanceSq > 75.0f * 75.0f) {
+    if (distanceSq < 4.0f ||
+        distanceSq > kHelicopterEngagementRange * kHelicopterEngagementRange) {
         g_secondaryHelicopterFireCooldown = 0.10f;
         return;
     }
@@ -7901,7 +7904,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         const float playerHorizontalSpeed = g_game.playerMovement.Update(
             scene.ViewmodelAnchorPosition(), deltaTime, !g_drivingHumvee);
-        ArmsModel::Update(deltaTime, playerHorizontalSpeed);
+        ArmsModel::Update(deltaTime, playerHorizontalSpeed, scene.adsBlend);
         if (!g_emptyLevelMode) {
             UpdateHelicopter(deltaTime);
             UpdateSecondaryHelicopter(deltaTime);
@@ -8653,12 +8656,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         if (projectile.hostile && bandit.get() != g_heldBandit) continue;
                         if (!bandit) continue;
                         XMFLOAT3 banditHit = projectile.position;
-                        if (bandit->Shoot(
+                        const bool hitBandit = projectile.harpoon
+                            ? bandit->HitByHarpoon(
                                 projectile.previousPosition, projectile.position,
-                                projectile.direction, bulletRadius, &banditHit, nullptr,
-                                projectile.harpoon ? 1000.0f :
-                                20.0f * projectile.damageMultiplier,
-                                true)) {
+                                projectile.direction, bulletRadius, &banditHit)
+                            : bandit->Shoot(
+                                projectile.previousPosition, projectile.position,
+                                projectile.direction, bulletRadius, &banditHit,
+                                nullptr, 20.0f * projectile.damageMultiplier,
+                                true);
+                        if (hitBandit) {
                             const bool killed = bandit->Dead();
                             banditHits.push_back({ bandit.get(), banditHit, killed });
                             if (killed && bandit.get() == g_heldBandit)
@@ -8684,6 +8691,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                     projectile.harpoonId,
                                     banditHit.position, offset)) {
                                 ++projectile.harpoonPiercedCount;
+                                // Give the carried ragdoll enough forward flight
+                                // to reach and pin against geometry behind it.
+                                projectile.lifetime = (std::max)(
+                                    projectile.lifetime, 1.25f);
                             }
                         }
                         const XMFLOAT3 normal(

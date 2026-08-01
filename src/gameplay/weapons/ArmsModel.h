@@ -194,7 +194,8 @@ public:
 
     // Idle remains the base pose. Run supplies only motion relative to its first
     // frame, blended smoothly by player speed.
-    static void Update(float deltaTime, float playerHorizontalSpeed = 0.0f) {
+    static void Update(float deltaTime, float playerHorizontalSpeed = 0.0f,
+                       float adsBlend = 0.0f) {
         if (!Loaded()) return;
         UpdateRunBlend(deltaTime, playerHorizontalSpeed);
         if (Animate()) {
@@ -207,9 +208,11 @@ public:
             Animation().time = PoseTime();
             RunAnimation().time = 0.0f;
         }
+        const float sightedRunScale = 1.0f - 0.70f *
+            (std::max)(0.0f, (std::min)(1.0f, adsBlend));
         Animation().ComputeAdditivePalette(
             Source().skeleton, RunAnimation(), 0.0f,
-            RunBlendWeight() * kProceduralRunStrength,
+            RunBlendWeight() * sightedRunScale * kProceduralRunStrength,
             PaletteCPU(), &PoseGlobals());
         if (HideHead() || HideFreeHand()) CollapseHiddenBones();
     }

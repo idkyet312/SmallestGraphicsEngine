@@ -75,9 +75,9 @@ public:
 
     bool NeedsCoverQuery() const {
         if (dead_ || held_ || turretGunner || hasCoverTarget_ ||
-            coverReentryCooldown_ > 0.0f || coverQueryCooldown_ > 0.0f)
+            coverQueryCooldown_ > 0.0f)
             return false;
-        return health <= 65.0f || selfPreservation_ >= 0.45f;
+        return true;
     }
 
     void SetCoverTarget(const DirectX::XMFLOAT3& target, float holdSeconds) {
@@ -177,8 +177,6 @@ public:
         if (dead_) return;
         debrisHitCooldown_ = (std::max)(0.0f, debrisHitCooldown_ - dt);
         coverQueryCooldown_ = (std::max)(0.0f, coverQueryCooldown_ - dt);
-        coverReentryCooldown_ = (std::max)(0.0f, coverReentryCooldown_ - dt);
-        selfPreservation_ = (std::max)(0.0f, selfPreservation_ - dt * 0.055f);
         position.y = groundY;
         position.x += knockbackVelocity_.x * dt;
         position.z += knockbackVelocity_.z * dt;
@@ -193,8 +191,6 @@ public:
         navigationRepathTimer_ -= dt;
         const float dx = target.x - position.x, dz = target.z - position.z;
         const float distance = std::sqrt(dx*dx + dz*dz);
-        if (!turretGunner && distance < 4.5f)
-            selfPreservation_ = (std::max)(selfPreservation_, 0.82f);
         if (hasCoverTarget_) {
             const float coverDx = coverTarget_.x - position.x;
             const float coverDz = coverTarget_.z - position.z;
@@ -208,9 +204,8 @@ public:
             if (coverTravelTime_ <= 0.0f || (inCover_ && coverHoldTime_ <= 0.0f)) {
                 hasCoverTarget_ = false;
                 inCover_ = false;
-                coverReentryCooldown_ = 4.0f +
-                    ((float)std::rand() / (float)RAND_MAX) * 2.5f;
-                selfPreservation_ *= 0.35f;
+                // Survival remains the standing order. Query another cover
+                // position immediately instead of returning to pursuit.
                 navigationPath_.clear();
             }
         }
@@ -233,10 +228,13 @@ public:
             (preparingShot_ || laserCharge_ > 0.0f);
         float speed = 0.0f;
         const bool movingToCover = hasCoverTarget_ && !inCover_;
+        const float safeDistance = IsSniper() ? 24.0f :
+            (IsShotgunner() ? 10.0f : 16.0f);
         const bool evasiveRetreat = !hasCoverTarget_ &&
-            selfPreservation_ >= 0.45f && coverQueryCooldown_ > 0.0f &&
-            distance < 13.0f;
-        if ((distance > 0.1f || movingToCover) && !rooted && !inCover_) {
+            distance < safeDistance;
+        const bool holdingSafeRange = !hasCoverTarget_ && !evasiveRetreat;
+        if ((distance > 0.1f || movingToCover) && !rooted && !inCover_ &&
+            !holdingSafeRange) {
             const float inv = distance > 0.001f ? 1.0f / distance : 0.0f;
             const float inwardX = dx * inv;
             const float inwardZ = dz * inv;
@@ -659,6 +657,23 @@ public:
         return true;
     }
 
+    bool HitByHarpoon(const DirectX::XMFLOAT3& start,
+                      const DirectX::XMFLOAT3& end,
+                      const DirectX::XMFLOAT3& direction, float radius,
+                      DirectX::XMFLOAT3* hitPoint = nullptr) {
+        if (dead_ || !visible) return false;
+        DirectX::XMFLOAT3 impact;
+        if (!BlocksProjectile(start, end, radius, &impact)) return false;
+        if (hitPoint) *hitPoint = impact;
+        const float remainingHealth = health;
+        health = 0.0f;
+        RegisterThreat(remainingHealth);
+        // Harpoons always transition directly into the authored physics pose.
+        // The projectile attachment takes ownership of movement immediately.
+        Kill(direction, impact, 6.0f);
+        return true;
+    }
+
     bool BlocksProjectile(const DirectX::XMFLOAT3& start,
                           const DirectX::XMFLOAT3& end, float radius,
                           DirectX::XMFLOAT3* hitPoint = nullptr,
@@ -896,7 +911,13 @@ public:
                 g_meshShader.Draw(prim.vbv, (UINT)(prim.vertices.size() / 12), prim.indexCount,
                     prim.meshletCount, descA, boundsA, vidxA, triA,
                     paletteAddr, prim.skinBuffer->GetGPUVirtualAddress(),
-                    prim.material && prim.material->doubleSided);
+                    prim.material && prim.material->doubleSided,
+                    // A ragdoll can be carried far from deathWorld_ while its
+                    // meshlet bounds remain in the bind pose. Those stale bounds
+                    // can reject an on-screen corpse, especially after a harpoon
+                    // pins it to a wall. Dead bodies are few and already visible
+                    // candidates, so draw every posed meshlet.
+                    !dead_, dead_);
             }
             shader.NextDrawCall();
         }
@@ -955,9 +976,7 @@ private:
     DirectX::XMFLOAT4X4 deathWorld_ = {};
     DirectX::XMFLOAT3 knockbackVelocity_{ 0.0f, 0.0f, 0.0f };
     DirectX::XMFLOAT3 coverTarget_{ 0.0f, 0.0f, 0.0f };
-    float selfPreservation_ = 0.0f;
     float coverQueryCooldown_ = 0.0f;
-    float coverReentryCooldown_ = 0.0f;
     float coverTravelTime_ = 0.0f;
     float coverHoldTime_ = 0.0f;
     float stationaryAimTime_ = 0.0f;
@@ -987,8 +1006,6 @@ private:
 
     void RegisterThreat(float damage) {
         if (damage <= 0.0f || dead_) return;
-        const float urgency = 0.38f + (std::min)(1.0f, damage / 55.0f) * 0.62f;
-        selfPreservation_ = (std::max)(selfPreservation_, urgency);
         coverQueryCooldown_ = (std::min)(coverQueryCooldown_, 0.12f);
     }
 

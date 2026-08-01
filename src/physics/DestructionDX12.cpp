@@ -3100,14 +3100,11 @@ bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3&
             bool carriedByThisHarpoon = false;
             for (const Impl::HarpoonRagdollAttachment& attachment :
                  m->harpoonRagdolls) {
-                if (attachment.harpoonId != ignoredHarpoonId) continue;
-                for (const Impl::HarpoonRagdollPart& attachedPart :
-                     attachment.parts) {
-                    if (attachedPart.partIndex != i) continue;
+                if (attachment.harpoonId == ignoredHarpoonId &&
+                    attachment.ragdollId == m->ragdollParts[i].authoredId) {
                     carriedByThisHarpoon = true;
                     break;
                 }
-                if (carriedByThisHarpoon) break;
             }
             if (carriedByThisHarpoon) continue;
         }
@@ -3596,20 +3593,36 @@ bool DestructionDX12::AttachRagdollToHarpoon(
     attachment.harpoonId = harpoonId;
     attachment.ragdollId = ragdollId;
     attachment.shaftOffset = (std::max)(0.0f, shaftOffset);
+
+    // Anchor only the authored body nearest the actual spear impact. The rest
+    // of the ragdoll stays dynamic and is pulled through its joints, so an arm
+    // hit drags from the arm and a torso hit drags from the torso.
+    size_t hitPartIndex = SIZE_MAX;
+    float hitDistanceSq = FLT_MAX;
     for (size_t partIndex = 0;
          partIndex < m->ragdollParts.size(); ++partIndex) {
         Impl::RagdollPart& part = m->ragdollParts[partIndex];
         if (part.authoredId != ragdollId || B3_IS_NULL(part.body)) continue;
         const b3Pos position = b3Body_GetPosition(part.body);
-        attachment.parts.push_back({ partIndex, {
-            (float)position.x - impactPosition.x,
-            (float)position.y - impactPosition.y,
-            (float)position.z - impactPosition.z } });
-        b3Body_SetType(part.body, b3_kinematicBody);
-        b3Body_SetLinearVelocity(part.body, { 0.0f, 0.0f, 0.0f });
-        b3Body_SetAngularVelocity(part.body, { 0.0f, 0.0f, 0.0f });
+        const float dx = (float)position.x - impactPosition.x;
+        const float dy = (float)position.y - impactPosition.y;
+        const float dz = (float)position.z - impactPosition.z;
+        const float distanceSq = dx * dx + dy * dy + dz * dz;
+        if (distanceSq >= hitDistanceSq) continue;
+        hitDistanceSq = distanceSq;
+        hitPartIndex = partIndex;
     }
-    if (attachment.parts.empty()) return false;
+    if (hitPartIndex == SIZE_MAX) return false;
+
+    Impl::RagdollPart& hitPart = m->ragdollParts[hitPartIndex];
+    const b3Pos hitPartPosition = b3Body_GetPosition(hitPart.body);
+    attachment.parts.push_back({ hitPartIndex, {
+        (float)hitPartPosition.x - impactPosition.x,
+        (float)hitPartPosition.y - impactPosition.y,
+        (float)hitPartPosition.z - impactPosition.z } });
+    b3Body_SetType(hitPart.body, b3_kinematicBody);
+    b3Body_SetLinearVelocity(hitPart.body, { 0.0f, 0.0f, 0.0f });
+    b3Body_SetAngularVelocity(hitPart.body, { 0.0f, 0.0f, 0.0f });
     m->harpoonRagdolls.push_back(std::move(attachment));
     m->rebuiltWhileStill = false;
     return true;
