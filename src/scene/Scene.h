@@ -32,7 +32,7 @@ struct SceneObject {
     }
 };
 
-enum class GrenadeType : uint8_t { Frag = 0, Molotov = 1 };
+enum class GrenadeType : uint8_t { Frag = 0, Molotov = 1, Vortex = 2 };
 
 struct Projectile {
     XMFLOAT3 position;
@@ -46,6 +46,7 @@ struct Projectile {
     // or first impact. Regular bullets leave these at defaults.
     bool     grenade = false;
     bool     molotov = false;
+    bool     vortex = false;
     bool     rocket = false;
     float    damageMultiplier = 1.0f;
     XMFLOAT3 velocity = { 0, 0, 0 };   // grenades integrate velocity + gravity
@@ -106,13 +107,25 @@ struct ExplosionFX {
     float    rotation = 0.0f;
 };
 
+struct VortexFX {
+    XMFLOAT3 position = {};
+    float radius = 7.5f;
+    float age = 0.0f;
+    float duration = 3.0f;
+    float particleCooldown = 0.0f;
+};
+
 struct ExplosiveBarrel {
     XMFLOAT3 position = { 0.0f, 0.0f, 0.0f };
     XMFLOAT3 velocity = { 0.0f, 0.0f, 0.0f };
+    XMFLOAT4 rotation = { 0.0f, 0.0f, 0.0f, 1.0f };
+    uint32_t physicsHandle = 0;
     int hits = 0;
     bool active = true;
     bool held = false;
     bool thrown = false;
+    float vortexHoldTime = 0.0f;
+    XMFLOAT3 vortexCenter = { 0.0f, 0.0f, 0.0f };
     bool burning = false;
     float fuse = 0.0f;
     float fireFxCooldown = 0.0f;
@@ -212,6 +225,7 @@ struct Scene {
     std::vector<Projectile> projectiles;
     std::vector<ImpactParticle> impactParticles;  // impact smoke puffs
     std::vector<ExplosionFX> explosionFX;         // animated explosion flipbooks
+    std::vector<VortexFX> vortexFX;               // active debris-orbit fields
     std::vector<FirePatch> firePatches;            // spreading Molotov ground fire
     std::vector<BurningTargetFX> burningTargets;   // flames attached to actors/trees
     std::vector<BurningMaterial> burningMaterials; // persistent prefab material fire
@@ -264,6 +278,8 @@ struct Scene {
     float molotovDamagePerSecond = 40.0f;
     float molotovMaterialDamagePerSecond = 34.0f;
     float molotovDamageCooldown = 0.0f;
+    float vortexRadius = 7.5f;
+    float vortexDuration = 3.0f;
     float playerBurnTime = 0.0f;
     // Returns rendered ground height at world XZ. Installed by main so Scene
     // does not depend on terrain renderer implementation.
@@ -425,6 +441,7 @@ struct Scene {
         projectiles.clear();
         impactParticles.clear();
         explosionFX.clear();
+        vortexFX.clear();
         firePatches.clear();
         burningTargets.clear();
         burningMaterials.clear();
@@ -543,8 +560,8 @@ struct Scene {
             if (!p.active) continue;
             p.previousPosition = p.position;
             if (p.grenade) {
-                // Frag grenades bounce until fuse expiry. Molotovs break and
-                // ignite immediately on first ground contact.
+                // Frag grenades bounce until fuse expiry. Molotov and vortex
+                // grenades trigger immediately on first ground contact.
                 p.velocity.y += -9.81f * grenadeGravityScale * dt;
                 p.position.x += p.velocity.x * dt;
                 p.position.y += p.velocity.y * dt;
@@ -554,13 +571,13 @@ struct Scene {
                 const float bounceY = surfaceY + grenadeGroundY;
                 if (p.position.y < bounceY) {
                     p.position.y = bounceY;
-                    if (p.molotov) {
+                    if (p.molotov || p.vortex) {
                         p.detonate = true;
                         p.active = false;
                     } else if (p.velocity.y < 0.0f) {
                         p.velocity.y = -p.velocity.y * 0.4f;
                     }
-                    if (!p.molotov) {
+                    if (!p.molotov && !p.vortex) {
                         p.velocity.x *= 0.7f;
                         p.velocity.z *= 0.7f;
                     }
@@ -654,6 +671,46 @@ struct Scene {
             std::remove_if(explosionFX.begin(), explosionFX.end(),
                 [](const ExplosionFX& fx) { return fx.age >= fx.duration; }),
             explosionFX.end());
+
+        for (VortexFX& fx : vortexFX) {
+            fx.age += dt;
+            fx.particleCooldown -= dt;
+            if (fx.particleCooldown > 0.0f) continue;
+            // Sparse sparks only. Physical debris carries the effect; flooding
+            // the shell with cards made the vortex look voxelized.
+            fx.particleCooldown = 0.09f;
+            for (int particleIndex = 0; particleIndex < 2; ++particleIndex) {
+                const float phase = fx.age * 5.8f +
+                    XM_PI * static_cast<float>(particleIndex);
+                const float latitudePhase = fx.age * 2.3f +
+                    particleIndex * 2.1f;
+                const float latitude = std::sin(latitudePhase) * 0.82f;
+                const float latitudeRadius = std::cos(latitude);
+                const float ring = fx.radius * (0.30f + particleIndex * 0.13f);
+                const float centerY = fx.position.y + fx.radius * 0.35f;
+                ImpactParticle spark;
+                spark.position = {
+                    fx.position.x + std::cos(phase) * latitudeRadius * ring,
+                    centerY + std::sin(latitude) * ring,
+                    fx.position.z + std::sin(phase) * latitudeRadius * ring };
+                spark.velocity = {
+                    -std::sin(phase) * latitudeRadius * 3.4f,
+                    std::cos(latitudePhase) * 2.1f,
+                     std::cos(phase) * latitudeRadius * 3.4f };
+                spark.maxLife = spark.life = 0.34f;
+                spark.size = 0.055f;
+                spark.growth = -0.09f;
+                spark.color = particleIndex & 1
+                    ? XMFLOAT3{ 0.18f, 0.75f, 1.0f }
+                    : XMFLOAT3{ 0.62f, 0.18f, 1.0f };
+                spark.spark = true;
+                impactParticles.push_back(spark);
+            }
+        }
+        vortexFX.erase(
+            std::remove_if(vortexFX.begin(), vortexFX.end(),
+                [](const VortexFX& fx) { return fx.age >= fx.duration; }),
+            vortexFX.end());
 
         std::vector<FirePatch> spread;
         for (FirePatch& fire : firePatches) {
@@ -929,6 +986,7 @@ struct Scene {
         p.direction = camera.Front;
         p.grenade   = true;
         p.molotov   = selectedGrenade == GrenadeType::Molotov;
+        p.vortex    = selectedGrenade == GrenadeType::Vortex;
         p.active    = true;
         p.fuse      = p.molotov ? 4.0f : grenadeFuse;
         // Launch along the aim direction plus a slight upward lob.
@@ -936,6 +994,12 @@ struct Scene {
                         camera.Front.y * grenadeThrowSpeed + grenadeLob,
                         camera.Front.z * grenadeThrowSpeed };
         projectiles.push_back(p);
+    }
+
+    void SpawnVortexFX(const XMFLOAT3& center) {
+        if (vortexFX.size() >= 4) vortexFX.erase(vortexFX.begin());
+        vortexFX.push_back({ center, vortexRadius, 0.0f, vortexDuration, 0.0f });
+        camera.ApplyExplosionImpulse(center, 2.0f);
     }
 
     void SpawnMolotovFire(const XMFLOAT3& impact) {

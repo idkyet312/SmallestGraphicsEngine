@@ -48,6 +48,12 @@ struct DestructionCollisionSoundEvent {
     float approachSpeed = 0.0f;
 };
 
+struct DestructionBodyPose {
+    DirectX::XMFLOAT3 position = {};
+    DirectX::XMFLOAT4 rotation = { 0.0f, 0.0f, 0.0f, 1.0f };
+    DirectX::XMFLOAT3 linearVelocity = {};
+};
+
 struct DestructionStressStats {
     bool running = false;
     float elapsedSeconds = 0.0f;
@@ -166,6 +172,20 @@ public:
     // fragments radially outward from the blast centre.
     void ApplyExplosion(const DirectX::XMFLOAT3& worldPosition,
                         float radius, float damage, float impulse);
+    // Fully severs every house chunk intersecting the sphere, including
+    // supports, then holds freed debris in a controlled orbit for `duration`.
+    // At expiry the orbit velocity is released with an outward/upward kick.
+    void StartVortex(const DirectX::XMFLOAT3& worldPosition,
+                     float radius, float duration = 3.0f);
+    uint32_t CreateExplosiveBarrelBody(
+        const DirectX::XMFLOAT3& worldPosition);
+    bool GetExplosiveBarrelPose(uint32_t handle,
+                                DestructionBodyPose& pose) const;
+    bool SetExplosiveBarrelVelocity(
+        uint32_t handle, const DirectX::XMFLOAT3& linearVelocity,
+        const DirectX::XMFLOAT3& angularVelocity = {});
+    void DestroyExplosiveBarrelBody(uint32_t handle);
+    std::vector<uint32_t> DrainExplosiveBarrelImpactEvents();
     void ApplyRagdollExplosion(const DirectX::XMFLOAT3& worldPosition,
                                float radius, float impulse);
     bool ApplyImpulse(const DirectX::XMFLOAT3& worldPosition,

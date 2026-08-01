@@ -299,6 +299,70 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
         }
     }
 
+    // Vortex core and orbiting energy beads. Debris supplies the large-scale
+    // motion; these compact additive markers keep the force centre readable.
+    if (!scene.vortexFX.empty()) {
+        shader.UseAdditive();
+        for (const VortexFX& fx : scene.vortexFX) {
+            const float t = (std::min)(1.0f, fx.age / fx.duration);
+            const float fade = (std::min)(1.0f, (1.0f - t) * 8.0f);
+            const float pulse = 0.42f + std::sin(fx.age * 13.0f) * 0.08f;
+            const float centerY = fx.position.y + fx.radius * 0.35f;
+            XMMATRIX vortexModel = XMMatrixScaling(pulse, pulse, pulse) *
+                XMMatrixTranslation(
+                    fx.position.x, centerY, fx.position.z);
+            shader.SetMatrices(vortexModel, view, proj, lightSpace);
+            shader.SetEmissiveMaterial(
+                XMFLOAT3(0.18f, 1.8f, 3.4f), 0.80f * fade);
+            DrawSphere(geo);
+            shader.NextDrawCall();
+
+            // Faint spherical boundary reads as a volume instead of a flat ring.
+            const float shellRadius = fx.radius * 0.56f;
+            vortexModel = XMMatrixScaling(
+                    shellRadius, shellRadius, shellRadius) *
+                XMMatrixTranslation(fx.position.x, centerY, fx.position.z);
+            shader.SetMatrices(vortexModel, view, proj, lightSpace);
+            shader.SetEmissiveMaterial(
+                XMFLOAT3(0.08f, 0.42f, 0.82f), 0.026f * fade);
+            DrawSphere(geo);
+            shader.NextDrawCall();
+
+            constexpr int beadCount = 5;
+            for (int bead = 0; bead < beadCount; ++bead) {
+                const float sphereY = 1.0f -
+                    2.0f * (static_cast<float>(bead) + 0.5f) / beadCount;
+                const float sphereXZ = std::sqrt(
+                    (std::max)(0.0f, 1.0f - sphereY * sphereY));
+                const float phase = fx.age * (2.4f + bead * 0.07f) +
+                    bead * 2.399963f;
+                const float orbit = fx.radius *
+                    (0.34f + 0.045f * static_cast<float>(bead % 2));
+                const float beadSize = 0.10f + 0.025f * (bead & 1);
+                const float rawX = std::cos(phase) * sphereXZ;
+                const float rawZ = std::sin(phase) * sphereXZ;
+                const float tilt = fx.age * 0.85f + bead * 0.31f;
+                const float tiltedY = sphereY * std::cos(tilt) -
+                    rawZ * std::sin(tilt);
+                const float tiltedZ = sphereY * std::sin(tilt) +
+                    rawZ * std::cos(tilt);
+                vortexModel = XMMatrixScaling(
+                        beadSize, beadSize, beadSize) *
+                    XMMatrixTranslation(
+                        fx.position.x + rawX * orbit,
+                        centerY + tiltedY * orbit,
+                        fx.position.z + tiltedZ * orbit);
+                shader.SetMatrices(vortexModel, view, proj, lightSpace);
+                shader.SetEmissiveMaterial(
+                    bead & 1 ? XMFLOAT3(1.8f, 0.18f, 3.0f)
+                             : XMFLOAT3(0.15f, 2.2f, 3.6f),
+                    0.72f * fade);
+                DrawSphere(geo);
+                shader.NextDrawCall();
+            }
+        }
+    }
+
     // Higher-resolution white-hot core. Additive composition keeps its black
     // atlas background invisible and lets HDR bloom carry the first instant.
     if (g_explosionCoreTexture && geo.explosionCoreVBV.BufferLocation) {
@@ -1437,8 +1501,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     if (!g_emptyLevelMode && g_explosiveBarrelModel) {
         for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
             if (!barrel.active) continue;
-            const XMMATRIX barrelTransform = XMMatrixTranslation(
-                barrel.position.x, barrel.position.y - 0.75f, barrel.position.z);
+            const XMMATRIX barrelRotation = XMMatrixRotationQuaternion(
+                XMLoadFloat4(&barrel.rotation));
+            const XMMATRIX barrelTransform =
+                XMMatrixTranslation(0.0f, -0.75f, 0.0f) *
+                barrelRotation * XMMatrixTranslation(
+                    barrel.position.x, barrel.position.y, barrel.position.z);
             if (visibilityExtensionsOnly)
                 DrawSceneNode(g_explosiveBarrelModel, shader, barrelTransform,
                     view, proj, lightSpace, true);
@@ -1449,6 +1517,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     } else if (!g_emptyLevelMode) for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
         if (barrel.active) {
             model = XMMatrixScaling(1.6f, 1.5f, 1.6f) *
+                    XMMatrixRotationQuaternion(XMLoadFloat4(&barrel.rotation)) *
                     XMMatrixTranslation(barrel.position.x, barrel.position.y,
                                         barrel.position.z);
             shader.SetMatrices(model, view, proj, lightSpace);
@@ -1505,6 +1574,18 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                     XMFLOAT3(0.14f, 0.20f, 0.08f), false, false,
                     0.08f, 0.24f, nullptr, nullptr, nullptr);
                 DrawCapsule(geo);
+            } else if (p.vortex) {
+                model = XMMatrixScaling(
+                            scene.projectileScale * 1.85f,
+                            scene.projectileScale * 1.85f,
+                            scene.projectileScale * 1.85f) *
+                        XMMatrixTranslation(
+                            p.position.x, p.position.y, p.position.z);
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetObjectMaterial(
+                    XMFLOAT3(0.10f, 0.48f, 0.82f), false, false,
+                    0.18f, 0.15f, nullptr, nullptr, nullptr);
+                DrawSphere(geo);
             } else {
                 model = XMMatrixScaling(
                             scene.projectileScale * 1.6f,

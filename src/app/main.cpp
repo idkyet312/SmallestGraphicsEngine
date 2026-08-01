@@ -1594,6 +1594,23 @@ static ExplosiveBarrel* HeldBarrel() {
     return barrel.active && barrel.held ? &barrel : nullptr;
 }
 
+static bool EnsureExplosiveBarrelBody(ExplosiveBarrel& barrel) {
+    if (!g_destruction.IsInitialized()) return false;
+    DestructionBodyPose pose;
+    if (barrel.physicsHandle != 0 &&
+        g_destruction.GetExplosiveBarrelPose(barrel.physicsHandle, pose))
+        return true;
+    barrel.physicsHandle =
+        g_destruction.CreateExplosiveBarrelBody(barrel.position);
+    return barrel.physicsHandle != 0;
+}
+
+static void DestroyExplosiveBarrelBody(ExplosiveBarrel& barrel) {
+    if (barrel.physicsHandle != 0)
+        g_destruction.DestroyExplosiveBarrelBody(barrel.physicsHandle);
+    barrel.physicsHandle = 0;
+}
+
 static void ThrowHeldBarrel() {
     ExplosiveBarrel* barrel = HeldBarrel();
     if (!barrel) {
@@ -1638,9 +1655,12 @@ static void GrabOrThrowObject() {
     if (best != SIZE_MAX) {
         g_heldBandit = nullptr;
         ExplosiveBarrel& barrel = scene.explosiveBarrels[best];
+        DestroyExplosiveBarrelBody(barrel);
         barrel.held = true;
         barrel.thrown = false;
+        barrel.vortexHoldTime = 0.0f;
         barrel.velocity = { 0.0f, 0.0f, 0.0f };
+        barrel.rotation = { 0.0f, 0.0f, 0.0f, 1.0f };
         g_heldBarrelIndex = best;
         return;
     }
@@ -1658,9 +1678,11 @@ static void DetonateBarrel(size_t firstBarrel) {
 
     if (g_heldBarrelIndex == firstBarrel) g_heldBarrelIndex = SIZE_MAX;
     std::vector<size_t> pending{ firstBarrel };
+    DestroyExplosiveBarrelBody(scene.explosiveBarrels[firstBarrel]);
     scene.explosiveBarrels[firstBarrel].active = false;
     scene.explosiveBarrels[firstBarrel].held = false;
     scene.explosiveBarrels[firstBarrel].thrown = false;
+    scene.explosiveBarrels[firstBarrel].vortexHoldTime = 0.0f;
     for (size_t cursor = 0; cursor < pending.size(); ++cursor) {
         const XMFLOAT3 center = scene.explosiveBarrels[pending[cursor]].position;
         AddExplosionTerrainCrater(center);
@@ -1713,9 +1735,11 @@ static void DetonateBarrel(size_t firstBarrel) {
             const float dy = other.position.y - center.y;
             const float dz = other.position.z - center.z;
             if (dx*dx + dy*dy + dz*dz > 4.5f * 4.5f) continue;
+            DestroyExplosiveBarrelBody(other);
             other.active = false;
             other.held = false;
             other.thrown = false;
+            other.vortexHoldTime = 0.0f;
             if (g_heldBarrelIndex == i) g_heldBarrelIndex = SIZE_MAX;
             pending.push_back(i);
         }
@@ -1768,10 +1792,16 @@ static bool HitExplosiveBarrelSegment(const XMFLOAT3& start,
 }
 
 static void UpdateExplosiveBarrels(float dt) {
+    if (g_destruction.IsInitialized())
+        g_destruction.DrainExplosiveBarrelImpactEvents();
     for (size_t i = 0; i < scene.explosiveBarrels.size(); ++i) {
         ExplosiveBarrel& barrel = scene.explosiveBarrels[i];
         if (!barrel.active) continue;
+        const float previousVortexHoldTime = barrel.vortexHoldTime;
+        barrel.vortexHoldTime = (std::max)(
+            0.0f, barrel.vortexHoldTime - dt);
         if (barrel.held) {
+            DestroyExplosiveBarrelBody(barrel);
             const XMFLOAT3& eye = scene.camera.Position;
             const XMFLOAT3& front = scene.camera.Front;
             barrel.position = {
@@ -1779,6 +1809,33 @@ static void UpdateExplosiveBarrels(float dt) {
                 eye.y + front.y * 1.85f - 0.42f,
                 eye.z + front.z * 1.85f };
             barrel.velocity = { 0.0f, 0.0f, 0.0f };
+        } else if (barrel.physicsHandle != 0) {
+            DestructionBodyPose pose;
+            if (g_destruction.GetExplosiveBarrelPose(
+                    barrel.physicsHandle, pose)) {
+                barrel.position = pose.position;
+                barrel.rotation = pose.rotation;
+                barrel.velocity = pose.linearVelocity;
+            } else {
+                barrel.physicsHandle = 0;
+            }
+            if (barrel.physicsHandle != 0 &&
+                barrel.vortexHoldTime <= 0.0f) {
+                // Leave Box3D exactly when capture ends. Preserve orbital speed
+                // and add the vortex's final radial/upward release impulse; normal
+                // barrel flight resumes through the lightweight manual path.
+                if (previousVortexHoldTime > 0.0f) {
+                    XMVECTOR radial = XMLoadFloat3(&barrel.position) -
+                        XMLoadFloat3(&barrel.vortexCenter);
+                    if (XMVectorGetX(XMVector3LengthSq(radial)) < 0.0025f)
+                        radial = XMVectorSet(1.0f, 0.35f, 0.0f, 0.0f);
+                    radial = XMVector3Normalize(radial);
+                    XMVECTOR release = XMLoadFloat3(&barrel.velocity) +
+                        radial * 9.0f + XMVectorSet(0.0f, 3.0f, 0.0f, 0.0f);
+                    XMStoreFloat3(&barrel.velocity, release);
+                }
+                DestroyExplosiveBarrelBody(barrel);
+            }
         } else if (barrel.thrown) {
             const XMFLOAT3 previous = barrel.position;
             barrel.velocity.y -= 9.81f * dt;
@@ -3663,6 +3720,93 @@ static void UpdatePrefabLods() {
         for (const PrefabRenderBatch::LodModel& lod : batch.lods)
             if (nearest >= lod.distance) batch.model = lod.model;
     }
+}
+
+static void ResolvePlayerWorldObjectCollisions(
+        XMFLOAT3& position, float& floorY, float radius,
+        float playerHeight) {
+    if (!scene.camera.FPSMode || g_emptyLevelMode) return;
+    const float feet = position.y - playerHeight;
+    constexpr float kStepHeight = 1.0f / 3.0f;
+
+    // Explosive barrels use the same collision dimensions as bullet hit tests.
+    for (ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+        if (!barrel.active || barrel.held) continue;
+        constexpr float barrelRadius = 0.44f;
+        constexpr float barrelHalfHeight = 0.78f;
+        const float bottom = barrel.position.y - barrelHalfHeight;
+        const float top = barrel.position.y + barrelHalfHeight;
+        const float dx = position.x - barrel.position.x;
+        const float dz = position.z - barrel.position.z;
+        float distance = std::sqrt(dx * dx + dz * dz);
+        const float reach = radius + barrelRadius;
+        if (distance >= reach) continue;
+        if (top <= feet + kStepHeight && top >= feet - 0.20f) {
+            floorY = (std::max)(floorY, top);
+            continue;
+        }
+        if (position.y <= bottom || feet >= top) continue;
+        float normalX = 1.0f;
+        float normalZ = 0.0f;
+        if (distance > 0.0001f) {
+            normalX = dx / distance;
+            normalZ = dz / distance;
+        } else {
+            distance = 0.0f;
+        }
+        const float push = reach - distance + 0.002f;
+        position.x += normalX * push;
+        position.z += normalZ * push;
+        if (barrel.thrown) {
+            barrel.velocity.x -= normalX * 2.0f;
+            barrel.velocity.z -= normalZ * 2.0f;
+            if (barrel.physicsHandle != 0)
+                g_destruction.SetExplosiveBarrelVelocity(
+                    barrel.physicsHandle, barrel.velocity,
+                    { 1.5f * normalZ, 2.5f, -1.5f * normalX });
+        }
+    }
+
+    if (g_trees.IsInitialized())
+        g_trees.ResolvePlayerCollision(
+            position, floorY, radius, playerHeight);
+
+    // Low oriented hull box matches projectile collision. Deck top becomes a
+    // temporary floor when landing on it; sides push the player out in hull-local
+    // space as the patrol boat turns.
+    if (!g_boatModel || g_boatSunk) return;
+    const float boatY = g_boatPosition.y - g_boatSinkDepth;
+    constexpr float halfBeam = 1.5f;
+    constexpr float halfLength = 4.5f;
+    constexpr float hullHeight = 1.1f;
+    constexpr float deckOffset = 0.10f;
+    const float top = boatY + deckOffset;
+    const float bottom = boatY - hullHeight;
+    const float sinYaw = std::sin(g_boatYaw);
+    const float cosYaw = std::cos(g_boatYaw);
+    const float worldX = position.x - g_boatPosition.x;
+    const float worldZ = position.z - g_boatPosition.z;
+    float localX = worldX * cosYaw - worldZ * sinYaw;
+    float localZ = worldX * sinYaw + worldZ * cosYaw;
+    const float expandedBeam = halfBeam + radius;
+    const float expandedLength = halfLength + radius;
+    if (std::abs(localX) >= expandedBeam ||
+        std::abs(localZ) >= expandedLength) return;
+    if (top <= feet + kStepHeight && top >= feet - 0.25f) {
+        floorY = (std::max)(floorY, top);
+        return;
+    }
+    if (position.y <= bottom || feet >= top) return;
+    const float penetrationX = expandedBeam - std::abs(localX);
+    const float penetrationZ = expandedLength - std::abs(localZ);
+    if (penetrationX < penetrationZ)
+        localX = std::copysign(expandedBeam,
+            std::abs(localX) > 0.001f ? localX : 1.0f);
+    else
+        localZ = std::copysign(expandedLength,
+            std::abs(localZ) > 0.001f ? localZ : 1.0f);
+    position.x = g_boatPosition.x + localX * cosYaw + localZ * sinYaw;
+    position.z = g_boatPosition.z - localX * sinYaw + localZ * cosYaw;
 }
 
 static void ResolvePlayerPrefabCollisions(XMFLOAT3& position, float radius,
@@ -6626,8 +6770,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             scene.camera.FPSMode = !scene.camera.FPSMode;
         }
         else if (wParam == 'B' && !(lParam & 0x40000000)) {
-            scene.selectedGrenade = scene.selectedGrenade == GrenadeType::Frag
-                ? GrenadeType::Molotov : GrenadeType::Frag;
+            switch (scene.selectedGrenade) {
+            case GrenadeType::Frag:
+                scene.selectedGrenade = GrenadeType::Molotov;
+                break;
+            case GrenadeType::Molotov:
+                scene.selectedGrenade = GrenadeType::Vortex;
+                break;
+            default:
+                scene.selectedGrenade = GrenadeType::Frag;
+                break;
+            }
         }
         else if (wParam == 'M' && !(lParam & 0x40000000)) {
             if (visBuffer.initialized) {
@@ -7185,6 +7338,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     bool molotovSmokeInjected = false;
     UINT molotovSmokeFrames = 0;
     size_t molotovSmokePeakPatches = 0;
+    const bool vortexSmokeTest =
+        GetEnvironmentVariableA("SGE_VORTEX_TEST", nullptr, 0) > 0;
+    bool vortexSmokeInjected = false;
+    UINT vortexSmokeFrames = 0;
+    size_t vortexSmokePeakFX = 0;
+    uint32_t vortexSmokeActorsBefore = 0;
+    uint32_t vortexSmokePeakActors = 0;
+    size_t vortexSmokePeakBarrelBodies = 0;
     if (GetEnvironmentVariableA("SGE_VISIBILITY_TEST", nullptr, 0) > 0) {
         visibilitySmokeEnabled = true;
         std::ofstream("visibility_smoke.log", std::ios::trunc)
@@ -7386,6 +7547,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_destruction.ResolvePlayerCollision(scene.camera.Position,
                 scene.camera.FloorY, 0.35f, scene.camera.PlayerHeight);
         }
+        ResolvePlayerWorldObjectCollisions(
+            scene.camera.Position, scene.camera.FloorY,
+            0.35f, scene.camera.PlayerHeight);
         ResolvePlayerPrefabCollisions(scene.camera.Position, 0.35f,
                                       scene.camera.PlayerHeight);
 
@@ -7404,6 +7568,44 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (molotovSmokeInjected)
             molotovSmokePeakPatches = (std::max)(
                 molotovSmokePeakPatches, scene.firePatches.size());
+        if (vortexSmokeTest && !vortexSmokeInjected && IsSceneScreen() &&
+            !g_game.loading.Active() && g_destruction.IsInitialized()) {
+            const XMFLOAT3 center = { 0.0f, 3.0f, 0.0f };
+            vortexSmokeActorsBefore = g_destruction.GetDebugData().actorCount;
+            scene.SpawnVortexFX(center);
+            const float orbitCenterY = center.y + scene.vortexRadius * 0.35f;
+            const float capture = scene.vortexRadius * 1.35f;
+            for (ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+                const float dx = barrel.position.x - center.x;
+                const float dy = barrel.position.y - orbitCenterY;
+                const float dz = barrel.position.z - center.z;
+                if (!barrel.active || barrel.held ||
+                    dx * dx + dy * dy + dz * dz > capture * capture)
+                    continue;
+                if (EnsureExplosiveBarrelBody(barrel)) {
+                    barrel.thrown = true;
+                    barrel.vortexHoldTime = scene.vortexDuration;
+                    barrel.vortexCenter = { center.x, orbitCenterY, center.z };
+                }
+            }
+            g_destruction.StartVortex(
+                center, scene.vortexRadius, scene.vortexDuration);
+            scene.selectedGrenade = GrenadeType::Vortex;
+            vortexSmokeInjected = true;
+        }
+        if (vortexSmokeInjected) {
+            vortexSmokePeakFX = (std::max)(
+                vortexSmokePeakFX, scene.vortexFX.size());
+            vortexSmokePeakActors = (std::max)(vortexSmokePeakActors,
+                g_destruction.GetDebugData().actorCount);
+            const size_t activeBarrelBodies = static_cast<size_t>(std::count_if(
+                scene.explosiveBarrels.begin(), scene.explosiveBarrels.end(),
+                [](const ExplosiveBarrel& barrel) {
+                    return barrel.physicsHandle != 0;
+                }));
+            vortexSmokePeakBarrelBodies = (std::max)(
+                vortexSmokePeakBarrelBodies, activeBarrelBodies);
+        }
         UpdateMolotovFireDamage();
         // Repeatable submission benchmark: 800 persistent smoke cards (runtime
         // cap). Isolates particle draw overhead from spawn/simulation cost.
@@ -7824,7 +8026,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     scene.impactParticles.begin() +
                     (scene.impactParticles.size() - 800));
             for (auto& projectile : scene.projectiles) {
-                if ((projectile.rocket || projectile.molotov) && projectile.active) {
+                if ((projectile.rocket || projectile.molotov || projectile.vortex) &&
+                    projectile.active) {
                     XMFLOAT3 impact = projectile.position;
                     bool struck = false;
                     const float radius = 0.22f;
@@ -7913,6 +8116,46 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                     barrel.fireFxCooldown = 0.0f;
                                 }
                             }
+                            projectile.active = false;
+                            projectile.detonate = false;
+                            continue;
+                        }
+                        if (projectile.vortex) {
+                            scene.SpawnVortexFX(center);
+                            if (scene.explosionAudioCallback)
+                                scene.explosionAudioCallback(
+                                    center, scene.vortexRadius * 0.55f, true);
+                            for (ExplosiveBarrel& barrel :
+                                 scene.explosiveBarrels) {
+                                if (!barrel.active || barrel.held) continue;
+                                const float dx = barrel.position.x - center.x;
+                                const float orbitCenterY = center.y +
+                                    scene.vortexRadius * 0.35f;
+                                const float dy = barrel.position.y - orbitCenterY;
+                                const float dz = barrel.position.z - center.z;
+                                const float capture = scene.vortexRadius * 1.35f;
+                                if (dx * dx + dy * dy + dz * dz >
+                                    capture * capture)
+                                    continue;
+                                if (EnsureExplosiveBarrelBody(barrel)) {
+                                    barrel.thrown = true;
+                                    barrel.vortexHoldTime = scene.vortexDuration;
+                                    barrel.vortexCenter = {
+                                        center.x, orbitCenterY, center.z };
+                                }
+                            }
+                            if (scene.useDestruction &&
+                                g_destruction.IsInitialized()) {
+                                g_destruction.StartVortex(
+                                    center, scene.vortexRadius,
+                                    scene.vortexDuration);
+                            }
+                            if (!g_emptyLevelMode && g_trees.IsInitialized())
+                                g_trees.StartVortex(
+                                    center, scene.vortexRadius,
+                                    scene.vortexDuration);
+                            DamagePrefabsInRadius(
+                                center, scene.vortexRadius, 1000000.0f);
                             projectile.active = false;
                             projectile.detonate = false;
                             continue;
@@ -9287,6 +9530,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                   << "active_patches=" << scene.firePatches.size() << '\n'
                   << "particles=" << scene.impactParticles.size() << '\n';
             PostQuitMessage(molotovSmokePeakPatches >= 10 ? 0 : 3);
+        }
+        if (vortexSmokeInjected && ++vortexSmokeFrames >= 60 &&
+            scene.vortexFX.empty()) {
+            const size_t remainingBarrelBodies = static_cast<size_t>(std::count_if(
+                scene.explosiveBarrels.begin(), scene.explosiveBarrels.end(),
+                [](const ExplosiveBarrel& barrel) {
+                    return barrel.physicsHandle != 0;
+                }));
+            std::ofstream smoke("vortex_smoke.log", std::ios::trunc);
+            smoke << "peak_fx=" << vortexSmokePeakFX << '\n'
+                  << "actors_before=" << vortexSmokeActorsBefore << '\n'
+                  << "peak_actors=" << vortexSmokePeakActors << '\n'
+                  << "peak_barrel_bodies=" << vortexSmokePeakBarrelBodies << '\n'
+                  << "remaining_barrel_bodies=" << remainingBarrelBodies << '\n'
+                  << "active_fx=" << scene.vortexFX.size() << '\n';
+            PostQuitMessage(
+                vortexSmokePeakFX > 0 && vortexSmokePeakBarrelBodies > 0 &&
+                remainingBarrelBodies == 0 ? 0 : 3);
         }
         if (particleBenchmark && IsSceneScreen() && !g_game.loading.Active()) {
             ++particleBenchmarkFrames;

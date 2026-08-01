@@ -330,8 +330,9 @@ inline void RenderPlayerHUD(const Scene& scene) {
     }
 
     if (scene.player.health > 0.0f) {
-        const char* grenade = scene.selectedGrenade == GrenadeType::Molotov
-            ? "MOLOTOV" : "FRAG";
+        const char* grenade = "FRAG";
+        if (scene.selectedGrenade == GrenadeType::Molotov) grenade = "MOLOTOV";
+        else if (scene.selectedGrenade == GrenadeType::Vortex) grenade = "VORTEX";
         char grenadeLabel[64];
         snprintf(grenadeLabel, sizeof(grenadeLabel),
                  "GRENADE: %s   [B] SWITCH   [G] THROW", grenade);
@@ -344,11 +345,12 @@ inline void RenderPlayerHUD(const Scene& scene) {
             ImVec2(grenadePos.x + grenadeSize.x + 8.0f,
                    grenadePos.y + grenadeSize.y + 4.0f),
             IM_COL32(8, 12, 10, 180), 3.0f);
-        draw->AddText(grenadePos,
-            scene.selectedGrenade == GrenadeType::Molotov
-                ? IM_COL32(255, 155, 55, 245)
-                : IM_COL32(220, 230, 215, 245),
-            grenadeLabel);
+        ImU32 grenadeTint = IM_COL32(220, 230, 215, 245);
+        if (scene.selectedGrenade == GrenadeType::Molotov)
+            grenadeTint = IM_COL32(255, 155, 55, 245);
+        else if (scene.selectedGrenade == GrenadeType::Vortex)
+            grenadeTint = IM_COL32(105, 205, 255, 245);
+        draw->AddText(grenadePos, grenadeTint, grenadeLabel);
     }
 
     if (scene.player.health <= 0.0f) {

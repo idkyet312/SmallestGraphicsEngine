@@ -239,6 +239,7 @@ public:
         m_accumulator = std::min(0.1f, m_accumulator + dt);
         constexpr float step = 1.0f / 60.0f;
         while (m_accumulator >= step) {
+            ApplyVortices(step);
             b3World_Step(m_world, step, 8);
             m_accumulator -= step;
         }
@@ -308,6 +309,113 @@ public:
             }
         }
         return false;
+    }
+
+    void ResolvePlayerCollision(XMFLOAT3& eyePosition, float& floorY,
+                                float playerRadius = 0.35f,
+                                float playerHeight = 1.7f) {
+        if (B3_IS_NULL(m_world)) return;
+        const float feet = eyePosition.y - playerHeight;
+        constexpr float kStepHeight = 1.0f / 3.0f;
+
+        auto resolveCapsule = [&](const XMVECTOR& axisStart,
+                                  const XMVECTOR& axisEnd,
+                                  float trunkRadius, b3BodyId body,
+                                  bool dynamic) {
+            const XMVECTOR playerStart = XMVectorSet(
+                eyePosition.x, feet + playerRadius, eyePosition.z, 1.0f);
+            const XMVECTOR playerEnd = XMVectorSet(
+                eyePosition.x,
+                (std::max)(feet + playerRadius,
+                           eyePosition.y - playerRadius),
+                eyePosition.z, 1.0f);
+            float playerFraction = 0.0f;
+            float trunkFraction = 0.0f;
+            const float distanceSquared = ClosestSegmentDistanceSquared(
+                playerStart, playerEnd, axisStart, axisEnd,
+                playerFraction, trunkFraction);
+            const float reach = playerRadius + trunkRadius;
+            if (distanceSquared >= reach * reach) return;
+
+            const XMVECTOR playerClosest = playerStart +
+                (playerEnd - playerStart) * playerFraction;
+            const XMVECTOR trunkClosest = axisStart +
+                (axisEnd - axisStart) * trunkFraction;
+            XMFLOAT3 delta;
+            XMStoreFloat3(&delta, playerClosest - trunkClosest);
+
+            // Low fallen sections behave as steps so the player can walk over
+            // them instead of being blocked by every branch-sized log.
+            const float top = XMVectorGetY(trunkClosest) + trunkRadius;
+            if (dynamic && top <= feet + kStepHeight && top >= feet - 0.20f) {
+                floorY = (std::max)(floorY, top);
+                return;
+            }
+
+            float horizontalDistance = std::sqrt(
+                delta.x * delta.x + delta.z * delta.z);
+            if (horizontalDistance < 0.0001f) {
+                const XMVECTOR axis = axisEnd - axisStart;
+                XMFLOAT3 axisDirection;
+                XMStoreFloat3(&axisDirection, axis);
+                delta.x = -axisDirection.z;
+                delta.z = axisDirection.x;
+                horizontalDistance = std::sqrt(
+                    delta.x * delta.x + delta.z * delta.z);
+                if (horizontalDistance < 0.0001f) {
+                    delta.x = 1.0f;
+                    delta.z = 0.0f;
+                    horizontalDistance = 1.0f;
+                }
+            }
+            const float normalX = delta.x / horizontalDistance;
+            const float normalZ = delta.z / horizontalDistance;
+            const float push = reach - horizontalDistance + 0.002f;
+            if (push <= 0.0f) return;
+            eyePosition.x += normalX * push;
+            eyePosition.z += normalZ * push;
+
+            if (dynamic && !B3_IS_NULL(body)) {
+                const float mass = (std::max)(0.05f, b3Body_GetMass(body));
+                const float impulse = (std::min)(30.0f, mass * 1.5f);
+                b3Body_ApplyLinearImpulseToCenter(body, {
+                    -normalX * impulse, impulse * 0.05f,
+                    -normalZ * impulse }, true);
+            }
+        };
+
+        for (const Tree& tree : m_trees) {
+            const int standTop = tree.felled
+                ? tree.cutIndex : (int)tree.segments.size();
+            for (int segmentIndex = 0; segmentIndex < standTop; ++segmentIndex) {
+                const Segment& segment = tree.segments[segmentIndex];
+                const XMVECTOR center = XMVectorSet(
+                    tree.x + segment.offX, segment.centerY, tree.z, 1.0f);
+                const XMVECTOR half = XMVectorSet(
+                    0.0f, tree.segLen * 0.5f, 0.0f, 0.0f);
+                resolveCapsule(center - half, center + half,
+                               segment.radius, b3_nullBodyId, false);
+            }
+        }
+
+        for (Log& log : m_logs) {
+            if (B3_IS_NULL(log.body)) continue;
+            const XMMATRIX transform = BodyTransform(log.body);
+            for (const Piece& piece : log.pieces) {
+                if (piece.frond) continue;
+                const XMVECTOR localStart = XMVectorSet(
+                    piece.localPos.x, piece.localPos.y - piece.half.y,
+                    piece.localPos.z, 1.0f);
+                const XMVECTOR localEnd = XMVectorSet(
+                    piece.localPos.x, piece.localPos.y + piece.half.y,
+                    piece.localPos.z, 1.0f);
+                resolveCapsule(
+                    XMVector3Transform(localStart, transform),
+                    XMVector3Transform(localEnd, transform),
+                    (std::max)(piece.half.x, piece.half.z),
+                    log.body, true);
+            }
+        }
     }
 
     // Shoot the grove. Damages whichever trunk segment the bullet passes closest
@@ -470,6 +578,47 @@ public:
         if (changed) RebuildItems();
     }
 
+    void StartVortex(const XMFLOAT3& center, float radius,
+                     float duration = 3.0f) {
+        if (B3_IS_NULL(m_world) || radius <= 0.0f || duration <= 0.0f) return;
+        bool changed = false;
+        for (Tree& tree : m_trees) {
+            if (tree.felled || tree.segments.empty()) continue;
+            const float dx = tree.x - center.x;
+            const float dz = tree.z - center.z;
+            const float trunkTop = tree.baseY +
+                tree.segLen * static_cast<float>(tree.segments.size());
+            const float nearestY = std::clamp(center.y, tree.baseY, trunkTop);
+            const float dy = nearestY - center.y;
+            if (dx * dx + dy * dy + dz * dz > radius * radius) continue;
+            // Vortex tears trunk from root. Tangential fall direction starts spin.
+            FellTree(tree, 0, 0.0f, { -dz, 0.0f, dx });
+            changed = true;
+        }
+        if (changed) RebuildItems();
+
+        const float captureRadius = radius * 1.35f;
+        XMFLOAT3 orbitCenter = center;
+        orbitCenter.y += radius * 0.35f;
+        for (Log& log : m_logs) {
+            if (B3_IS_NULL(log.body)) continue;
+            const b3Pos p = b3Body_GetPosition(log.body);
+            const float dx = (float)p.x - orbitCenter.x;
+            const float dy = (float)p.y - orbitCenter.y;
+            const float dz = (float)p.z - orbitCenter.z;
+            if (dx * dx + dy * dy + dz * dz >
+                captureRadius * captureRadius) continue;
+            if (log.asleep) {
+                b3Body_SetType(log.body, b3_dynamicBody);
+                log.asleep = false;
+                ++m_activeBodies;
+            }
+            b3Body_SetAwake(log.body, true);
+        }
+        if (m_vortices.size() >= 4) m_vortices.erase(m_vortices.begin());
+        m_vortices.push_back({ orbitCenter, radius, 0.0f, duration });
+    }
+
     bool IgniteNear(const XMFLOAT3& center, float radius) {
         if (radius <= 0.0f) return false;
         bool ignited = false;
@@ -509,6 +658,7 @@ public:
         m_heights.clear();
         m_trees.clear();
         m_logs.clear();
+        m_vortices.clear();
         m_items.clear();
         m_retiredMeshes.clear();
         m_accumulator = 0.0f;
@@ -613,6 +763,13 @@ private:
         std::shared_ptr<SceneMesh> mesh;
     };
 
+    struct VortexRuntime {
+        XMFLOAT3 center = {};
+        float radius = 0.0f;
+        float age = 0.0f;
+        float duration = 3.0f;
+    };
+
     // ---- helpers ------------------------------------------------------------
 
     static XMMATRIX BodyTransform(b3BodyId body) {
@@ -620,6 +777,86 @@ private:
         const b3Quat q = b3Body_GetRotation(body);
         return XMMatrixRotationQuaternion(XMVectorSet(q.v.x, q.v.y, q.v.z, q.s)) *
                XMMatrixTranslation((float)p.x, (float)p.y, (float)p.z);
+    }
+
+    void ApplyVortices(float dt) {
+        for (VortexRuntime& vortex : m_vortices) {
+            vortex.age += dt;
+            const bool release = vortex.age >= vortex.duration;
+            const float captureRadius = vortex.radius * 1.35f;
+            const float targetRadius = (std::max)(1.4f, vortex.radius * 0.42f);
+            for (size_t i = 0; i < m_logs.size(); ++i) {
+                Log& log = m_logs[i];
+                if (B3_IS_NULL(log.body)) continue;
+                const b3Pos p = b3Body_GetPosition(log.body);
+                float radialX = (float)p.x - vortex.center.x;
+                float radialY = (float)p.y - vortex.center.y;
+                float radialZ = (float)p.z - vortex.center.z;
+                float distance = std::sqrt(radialX * radialX +
+                    radialY * radialY + radialZ * radialZ);
+                if (distance > captureRadius) continue;
+                if (log.asleep) {
+                    b3Body_SetType(log.body, b3_dynamicBody);
+                    log.asleep = false;
+                    ++m_activeBodies;
+                }
+                if (distance < 0.05f) {
+                    const float seed = static_cast<float>(i + 1) * 2.399963f;
+                    radialX = std::cos(seed);
+                    radialY = std::sin(seed * 0.73f) * 0.55f;
+                    radialZ = std::sin(seed);
+                    distance = std::sqrt(radialX * radialX +
+                        radialY * radialY + radialZ * radialZ);
+                }
+                radialX /= distance;
+                radialY /= distance;
+                radialZ /= distance;
+                const float seedAngle = static_cast<float>((i + 1) % 251u) *
+                    2.399963f;
+                const float axisX = std::cos(seedAngle) * 0.48f;
+                const float axisY = 0.72f;
+                const float axisZ = std::sin(seedAngle) * 0.48f;
+                float tangentX = axisY * radialZ - axisZ * radialY;
+                float tangentY = axisZ * radialX - axisX * radialZ;
+                float tangentZ = axisX * radialY - axisY * radialX;
+                const float tangentLength = (std::max)(0.001f,
+                    std::sqrt(tangentX * tangentX + tangentY * tangentY +
+                              tangentZ * tangentZ));
+                tangentX /= tangentLength;
+                tangentY /= tangentLength;
+                tangentZ /= tangentLength;
+                const b3Vec3 velocity = b3Body_GetLinearVelocity(log.body);
+                if (release) {
+                    b3Body_SetLinearVelocity(log.body, {
+                        velocity.x + radialX * 10.5f + tangentX * 4.0f,
+                        velocity.y + radialY * 10.5f + tangentY * 4.0f + 3.5f,
+                        velocity.z + radialZ * 10.5f + tangentZ * 4.0f });
+                    b3Body_SetAngularVelocity(log.body,
+                        { 4.5f, 8.5f, 3.8f });
+                    continue;
+                }
+                const float radialCorrection = (std::max)(-5.0f,
+                    (std::min)(8.0f, (distance - targetRadius) * 3.8f));
+                const b3Vec3 desired = {
+                    tangentX * 10.5f - radialX * radialCorrection,
+                    tangentY * 10.5f - radialY * radialCorrection,
+                    tangentZ * 10.5f - radialZ * radialCorrection };
+                const float blend = (std::min)(1.0f, dt * 11.0f);
+                b3Body_SetLinearVelocity(log.body, {
+                    velocity.x + (desired.x - velocity.x) * blend,
+                    velocity.y + (desired.y - velocity.y) * blend,
+                    velocity.z + (desired.z - velocity.z) * blend });
+                b3Body_SetAngularVelocity(log.body,
+                    { 3.2f + radialZ, 8.0f, 3.2f - radialX });
+                b3Body_SetAwake(log.body, true);
+            }
+        }
+        m_vortices.erase(
+            std::remove_if(m_vortices.begin(), m_vortices.end(),
+                [](const VortexRuntime& vortex) {
+                    return vortex.age >= vortex.duration;
+                }),
+            m_vortices.end());
     }
 
     static float Variation01(float x, float z, float salt) {
@@ -1369,6 +1606,7 @@ private:
     b3WorldId m_world = b3_nullWorldId;
     std::vector<Tree>     m_trees;
     std::vector<Log>      m_logs;
+    std::vector<VortexRuntime> m_vortices;
     std::vector<TreeItem> m_items;
     std::vector<RetiredMesh> m_retiredMeshes;
     std::function<float(float, float)> m_terrain;

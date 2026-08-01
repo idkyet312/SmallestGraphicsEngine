@@ -44,6 +44,7 @@ constexpr float SettledPileFreezeSeconds = 3.0f;
 constexpr uint64_t CollisionCategoryWorld = 1ull << 0;
 constexpr uint64_t CollisionCategoryDebris = 1ull << 1;
 constexpr uint64_t CollisionCategoryLodDebris = 1ull << 2;
+constexpr uint64_t CollisionCategoryBarrel = 1ull << 3;
 // Uniform starting health for every bond/chunk. A bullet's per-hit damage is a
 // fraction of this, so a joint takes several hits before it lets go.
 constexpr float kBondHealth = 1.0f;
@@ -264,6 +265,19 @@ struct DestructionDX12::Impl {
         bool batchBoundsValid = false;
     };
 
+    struct VortexRuntime {
+        XMFLOAT3 center = {};
+        float radius = 0.0f;
+        float age = 0.0f;
+        float duration = 3.0f;
+        std::unordered_set<uint64_t> capturedActorIds;
+    };
+
+    struct BarrelRuntime {
+        uint32_t handle = 0;
+        b3BodyId body = b3_nullBodyId;
+    };
+
     struct BodySeed {
         bool valid = false;
         XMFLOAT3 modelCenter = {};
@@ -282,6 +296,10 @@ struct DestructionDX12::Impl {
     std::vector<BondPair> bondPairs;              // for debug visualization
     std::vector<int> chunkGroupByAsset;           // asset-chunk-indexed plank id (root=[0]=-2)
     std::list<std::unique_ptr<ActorRuntime>> actors;
+    std::vector<VortexRuntime> vortices;
+    std::vector<BarrelRuntime> barrelBodies;
+    std::vector<uint32_t> barrelImpactEvents;
+    uint32_t nextBarrelHandle = 1;
     std::vector<DestructionRenderItem> renderItems;
     std::vector<DestructionRenderBatch> renderBatches;
     struct BatchCacheEntry {
@@ -766,7 +784,7 @@ struct DestructionDX12::Impl {
         runtime.collisionLod = lod;
     }
 
-    void WakeDebris(ActorRuntime& runtime) {
+    void WakeDebris(ActorRuntime& runtime, bool restoreFullCollision = true) {
         if (B3_IS_NULL(runtime.body) || !runtime.dynamic) return;
         if (runtime.frozen) {
             b3Body_SetType(runtime.body, b3_dynamicBody);
@@ -775,8 +793,120 @@ struct DestructionDX12::Impl {
         runtime.settledTime = 0.0f;
         runtime.restTime = 0.0f;
         runtime.debrisAge = 0.0f;
-        SetDebrisCollisionLod(runtime, false);
+        if (restoreFullCollision) SetDebrisCollisionLod(runtime, false);
         b3Body_SetAwake(runtime.body, true);
+    }
+
+    void ApplyVortices(float dt) {
+        for (VortexRuntime& vortex : vortices) {
+            vortex.age += dt;
+            const bool release = vortex.age >= vortex.duration;
+            const float captureRadius = vortex.radius * 1.35f;
+            const float targetRadius = (std::max)(1.4f, vortex.radius * 0.42f);
+
+            auto pullBody = [&](b3BodyId body, uint64_t seedValue) {
+                if (B3_IS_NULL(body)) return;
+                const b3Pos position = b3Body_GetPosition(body);
+                float radialX = (float)position.x - vortex.center.x;
+                float radialY = (float)position.y - vortex.center.y;
+                float radialZ = (float)position.z - vortex.center.z;
+                float distance = std::sqrt(radialX * radialX +
+                    radialY * radialY + radialZ * radialZ);
+                if (distance > captureRadius) return;
+
+                if (distance < 0.05f) {
+                    const float seed = static_cast<float>(
+                        seedValue % 997u) * 2.399963f;
+                    radialX = std::cos(seed);
+                    radialY = std::sin(seed * 0.73f) * 0.55f;
+                    radialZ = std::sin(seed);
+                    distance = std::sqrt(radialX * radialX +
+                        radialY * radialY + radialZ * radialZ);
+                }
+                radialX /= distance;
+                radialY /= distance;
+                radialZ /= distance;
+                const float seedAngle = static_cast<float>(seedValue % 251u) *
+                    2.399963f;
+                const float axisX = std::cos(seedAngle) * 0.48f;
+                const float axisY = 0.72f;
+                const float axisZ = std::sin(seedAngle) * 0.48f;
+                float tangentX = axisY * radialZ - axisZ * radialY;
+                float tangentY = axisZ * radialX - axisX * radialZ;
+                float tangentZ = axisX * radialY - axisY * radialX;
+                float tangentLength = std::sqrt(tangentX * tangentX +
+                    tangentY * tangentY + tangentZ * tangentZ);
+                if (tangentLength < 0.05f) {
+                    tangentX = -radialZ;
+                    tangentY = 0.0f;
+                    tangentZ = radialX;
+                    tangentLength = std::sqrt(tangentX * tangentX +
+                        tangentZ * tangentZ);
+                }
+                tangentX /= tangentLength;
+                tangentY /= tangentLength;
+                tangentZ /= tangentLength;
+                const b3Vec3 velocity = b3Body_GetLinearVelocity(body);
+
+                if (release) {
+                    b3Body_SetLinearVelocity(body, {
+                        velocity.x + radialX * 9.0f + tangentX * 3.5f,
+                        velocity.y + radialY * 9.0f + tangentY * 3.5f + 3.0f,
+                        velocity.z + radialZ * 9.0f + tangentZ * 3.5f });
+                    b3Body_SetAngularVelocity(body, {
+                        3.5f, 7.5f, 2.8f });
+                    return;
+                }
+
+                const float radialCorrection = (std::max)(-5.0f,
+                    (std::min)(8.0f,
+                        (distance - targetRadius) * 3.8f));
+                const float orbitSpeed = 9.5f;
+                const b3Vec3 desired = {
+                    tangentX * orbitSpeed - radialX * radialCorrection,
+                    tangentY * orbitSpeed - radialY * radialCorrection,
+                    tangentZ * orbitSpeed - radialZ * radialCorrection };
+                const float blend = (std::min)(1.0f, dt * 11.0f);
+                b3Body_SetLinearVelocity(body, {
+                    velocity.x + (desired.x - velocity.x) * blend,
+                    velocity.y + (desired.y - velocity.y) * blend,
+                    velocity.z + (desired.z - velocity.z) * blend });
+                b3Body_SetAngularVelocity(body, {
+                    2.4f + radialZ * 1.2f, 6.8f, 2.4f - radialX * 1.2f });
+                b3Body_SetAwake(body, true);
+            };
+
+            for (auto& runtime : actors) {
+                if (!runtime->dynamic || B3_IS_NULL(runtime->body)) continue;
+                const b3Pos p = b3Body_GetPosition(runtime->body);
+                const float dx = (float)p.x - vortex.center.x;
+                const float dy = (float)p.y - vortex.center.y;
+                const float dz = (float)p.z - vortex.center.z;
+                const bool inside = dx * dx + dy * dy + dz * dz <=
+                    captureRadius * captureRadius;
+                const bool captured = vortex.capturedActorIds.count(
+                    runtime->renderId) != 0;
+                if (!inside && !captured)
+                    continue;
+                if (inside) vortex.capturedActorIds.insert(runtime->renderId);
+                WakeDebris(*runtime, release);
+                // Hundreds of mutually colliding fragments turn a controlled
+                // spherical orbit into a solver storm. Keep world contacts but
+                // suppress debris-debris contacts until the outward release.
+                SetDebrisCollisionLod(*runtime, !release);
+                pullBody(runtime->body, runtime->renderId);
+            }
+            for (const BarrelRuntime& barrel : barrelBodies)
+                pullBody(barrel.body, 10000u + barrel.handle);
+            for (size_t i = 0; i < ragdollParts.size(); ++i)
+                pullBody(ragdollParts[i].body, 20000u + i);
+        }
+        vortices.erase(
+            std::remove_if(vortices.begin(), vortices.end(),
+                [](const VortexRuntime& vortex) {
+                    return vortex.age >= vortex.duration;
+                }),
+            vortices.end());
     }
 
     void EmitTinyDebris(const ActorRuntime& runtime, const BodySeed* seed) {
@@ -2272,6 +2402,7 @@ void DestructionDX12::Shutdown() {
     m->group = nullptr; m->asset = nullptr; m->framework = nullptr;
     m->chunks.clear(); m->renderItems.clear(); m->renderBatches.clear();
     m->batchCache.clear(); m->spatialBatchCache.clear(); m->ragdollParts.clear();
+    m->barrelBodies.clear(); m->barrelImpactEvents.clear(); m->vortices.clear();
     for (auto& retired : m->retiredBatchNodes) retired.clear();
     m->authoredRagdolls.clear();
     m->ragdollRenderItems.clear(); m->initialized = false;
@@ -2475,6 +2606,7 @@ void DestructionDX12::Update(float dt) {
     while (m->accumulator >= step) {
         physicsStepped = true;
         m->ApplyWaterBuoyancy();
+        m->ApplyVortices(step);
         m->ApplyEnemyHover(step);
         m->RelaxAuthoredRagdolls(step);
         b3World_Step(m->world, step, 4);
@@ -2493,8 +2625,8 @@ void DestructionDX12::Update(float dt) {
             hitPoints.emplace_back((float)point.x, (float)point.y, (float)point.z);
             const b3Filter filterA = b3Shape_GetFilter(hit.shapeIdA);
             const b3Filter filterB = b3Shape_GetFilter(hit.shapeIdB);
-            const uint64_t debrisMask =
-                CollisionCategoryDebris | CollisionCategoryLodDebris;
+            const uint64_t debrisMask = CollisionCategoryDebris |
+                CollisionCategoryLodDebris | CollisionCategoryBarrel;
             const bool involvesDebris =
                 (filterA.categoryBits & debrisMask) != 0 ||
                 (filterB.categoryBits & debrisMask) != 0;
@@ -2503,6 +2635,18 @@ void DestructionDX12::Update(float dt) {
                 m->collisionSoundEvents.push_back({
                     { (float)point.x, (float)point.y, (float)point.z },
                     hit.approachSpeed });
+            }
+            if (hit.approachSpeed >= 4.0f) {
+                const b3BodyId bodyA = b3Shape_GetBody(hit.shapeIdA);
+                const b3BodyId bodyB = b3Shape_GetBody(hit.shapeIdB);
+                for (const Impl::BarrelRuntime& barrel : m->barrelBodies) {
+                    if (!B3_ID_EQUALS(barrel.body, bodyA) &&
+                        !B3_ID_EQUALS(barrel.body, bodyB)) continue;
+                    if (std::find(m->barrelImpactEvents.begin(),
+                                  m->barrelImpactEvents.end(), barrel.handle) ==
+                        m->barrelImpactEvents.end())
+                        m->barrelImpactEvents.push_back(barrel.handle);
+                }
             }
         }
         int budget = 2;  // low impact damage: at most two cells per step
@@ -2961,6 +3105,151 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
         b3Body_ApplyLinearImpulse(runtime->body, { v.x, v.y, v.z }, { (float)bp.x, (float)bp.y, (float)bp.z }, true);
     }
     std::cout << "Grenade: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
+}
+
+void DestructionDX12::StartVortex(const XMFLOAT3& worldPosition, float radius,
+                                  float duration) {
+    if (!m->initialized || radius <= 0.0f || duration <= 0.0f) return;
+    m->lastDamagePosition = worldPosition;
+    m->lastDamageRadius = radius;
+
+    // Vortex damage is absolute: every intersecting cell loses all bonds.
+    // Supports are intentionally demoted so foundation blocks inside the sphere
+    // become physical debris instead of remaining pinned to the world.
+    std::list<std::vector<uint8_t>> masks;
+    std::list<IsolateChunksParams> paramStore;
+    std::unordered_set<uint32_t> damagedStructures;
+    const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
+    bool anyMarked = false;
+    for (auto& runtime : m->actors) {
+        if (!runtime->actor || B3_IS_NULL(runtime->body)) continue;
+        const b3Vec3 local = b3Body_GetLocalPoint(runtime->body,
+            { worldPosition.x, worldPosition.y, worldPosition.z });
+        const XMFLOAT3 modelCenter(local.x + runtime->center.x,
+                                   local.y + runtime->center.y,
+                                   local.z + runtime->center.z);
+        std::vector<uint8_t> mask(m->chunks.size() + 1, 0);
+        bool actorMarked = false;
+        for (uint32_t chunkIndex : runtime->chunks) {
+            Impl::Chunk& chunk = m->chunks[chunkIndex];
+            if (!SphereAabb(modelCenter, radius,
+                            chunk.minimum, chunk.maximum)) continue;
+            mask[chunkIndex + 1] = 1;
+            chunk.support = false;
+            actorMarked = true;
+            anyMarked = true;
+            damagedStructures.insert(chunk.structureId);
+        }
+        if (!actorMarked) continue;
+        masks.push_back(std::move(mask));
+        paramStore.push_back({ masks.back().data(),
+                               (uint32_t)masks.back().size() });
+        runtime->actor->damage(isolate, &paramStore.back());
+    }
+
+    const uint32_t actorsBefore = (uint32_t)m->actors.size();
+    if (anyMarked) {
+        m->group->process();
+        for (uint32_t structureId : damagedStructures)
+            m->MarkStructureDirty(structureId);
+        m->RebuildRenderItems();
+    }
+
+    if (m->vortices.size() >= 4) m->vortices.erase(m->vortices.begin());
+    XMFLOAT3 orbitCenter = worldPosition;
+    orbitCenter.y += radius * 0.35f;
+    m->vortices.push_back({ orbitCenter, radius, 0.0f, duration, {} });
+    std::cout << "Vortex: actors " << actorsBefore << " -> "
+              << m->actors.size() << ", duration " << duration << "s\n";
+}
+
+uint32_t DestructionDX12::CreateExplosiveBarrelBody(
+    const XMFLOAT3& worldPosition) {
+    if (!m || !m->initialized || B3_IS_NULL(m->world)) return 0;
+
+    b3BodyDef bodyDef = b3DefaultBodyDef();
+    bodyDef.type = b3_dynamicBody;
+    bodyDef.position = {
+        worldPosition.x, worldPosition.y, worldPosition.z };
+    bodyDef.linearDamping = 0.18f;
+    bodyDef.angularDamping = 0.12f;
+    bodyDef.allowFastRotation = true;
+    const b3BodyId body = b3CreateBody(m->world, &bodyDef);
+
+    b3ShapeDef shapeDef = b3DefaultShapeDef();
+    shapeDef.density = 115.0f;
+    shapeDef.baseMaterial.friction = 0.65f;
+    shapeDef.baseMaterial.restitution = 0.12f;
+    shapeDef.enableHitEvents = true;
+    shapeDef.filter.categoryBits = CollisionCategoryBarrel;
+    shapeDef.filter.maskBits = B3_DEFAULT_MASK_BITS;
+    const b3Capsule capsule = {
+        { 0.0f, -0.34f, 0.0f }, { 0.0f, 0.34f, 0.0f }, 0.44f };
+    b3CreateCapsuleShape(body, &shapeDef, &capsule);
+
+    uint32_t handle = m->nextBarrelHandle++;
+    if (handle == 0) handle = m->nextBarrelHandle++;
+    m->barrelBodies.push_back({ handle, body });
+    return handle;
+}
+
+bool DestructionDX12::GetExplosiveBarrelPose(
+    uint32_t handle, DestructionBodyPose& pose) const {
+    if (!m || handle == 0) return false;
+    const auto it = std::find_if(
+        m->barrelBodies.begin(), m->barrelBodies.end(),
+        [handle](const Impl::BarrelRuntime& barrel) {
+            return barrel.handle == handle;
+        });
+    if (it == m->barrelBodies.end() || B3_IS_NULL(it->body)) return false;
+    const b3Pos p = b3Body_GetPosition(it->body);
+    const b3Quat q = b3Body_GetRotation(it->body);
+    const b3Vec3 v = b3Body_GetLinearVelocity(it->body);
+    pose.position = { (float)p.x, (float)p.y, (float)p.z };
+    pose.rotation = { q.v.x, q.v.y, q.v.z, q.s };
+    pose.linearVelocity = { v.x, v.y, v.z };
+    return true;
+}
+
+bool DestructionDX12::SetExplosiveBarrelVelocity(
+    uint32_t handle, const XMFLOAT3& linearVelocity,
+    const XMFLOAT3& angularVelocity) {
+    if (!m || handle == 0) return false;
+    const auto it = std::find_if(
+        m->barrelBodies.begin(), m->barrelBodies.end(),
+        [handle](const Impl::BarrelRuntime& barrel) {
+            return barrel.handle == handle;
+        });
+    if (it == m->barrelBodies.end() || B3_IS_NULL(it->body)) return false;
+    b3Body_SetLinearVelocity(it->body,
+        { linearVelocity.x, linearVelocity.y, linearVelocity.z });
+    b3Body_SetAngularVelocity(it->body,
+        { angularVelocity.x, angularVelocity.y, angularVelocity.z });
+    b3Body_SetAwake(it->body, true);
+    return true;
+}
+
+void DestructionDX12::DestroyExplosiveBarrelBody(uint32_t handle) {
+    if (!m || handle == 0) return;
+    const auto it = std::find_if(
+        m->barrelBodies.begin(), m->barrelBodies.end(),
+        [handle](const Impl::BarrelRuntime& barrel) {
+            return barrel.handle == handle;
+        });
+    if (it == m->barrelBodies.end()) return;
+    if (!B3_IS_NULL(it->body)) b3DestroyBody(it->body);
+    m->barrelBodies.erase(it);
+    m->barrelImpactEvents.erase(
+        std::remove(m->barrelImpactEvents.begin(),
+                    m->barrelImpactEvents.end(), handle),
+        m->barrelImpactEvents.end());
+}
+
+std::vector<uint32_t> DestructionDX12::DrainExplosiveBarrelImpactEvents() {
+    if (!m) return {};
+    std::vector<uint32_t> events;
+    events.swap(m->barrelImpactEvents);
+    return events;
 }
 
 void DestructionDX12::ApplyRagdollExplosion(
