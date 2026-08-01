@@ -94,6 +94,9 @@ static unsigned int SCR_HEIGHT = 1080;
 static Scene               scene;
 static ShaderDX12           mainShader;
 ProfilerDX12                g_profiler;
+static bool                 g_profileDumpEnabled = false;
+static bool                 g_profileDumpWritten = false;
+static UINT                 g_profileDumpFrame = 0;
 UINT                        g_forwardDrawCalls = 0;
 UINT                        g_shadowDrawCalls = 0;
 UINT                        g_visibilityDrawCalls = 0;
@@ -6445,6 +6448,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     if (!g_profiler.Init(g_dx12.device.Get(), g_dx12.commandQueue.Get()))
         std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
+    g_profileDumpEnabled =
+        GetEnvironmentVariableA("SGE_PROFILE_DUMP", nullptr, 0) > 0;
     g_gunAudio.Initialize("Content/Audio/rifle_shot.wav");
     g_rpgFireAudio.Initialize("Content/Audio/rpg_fire.wav");
     // Lives under build/Sounds like the RPG explosion above, not models/audio --
@@ -8203,10 +8208,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             RenderRaytracing(scene);
         } else if (IsSceneScreen() && !g_game.loading.Active() &&
                    usingVisibility) {
-            ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
+            // Each pass gets its own sibling scope. ProfilerDX12::Scope is a flat
+            // begin/end timestamp pair with no nesting or child subtraction, so a
+            // scope that encloses another double-counts it: this block used to
+            // wrap the shadow render AND the forward extensions inside
+            // "Visibility Buffer", which reported 11.5 ms + 10.4 ms against a
+            // 16.4 ms frame. The explicit sub-blocks bound each scope's lifetime
+            // so the destructor (which emits the end timestamp) fires before the
+            // next scope is constructed.
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
             if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
+                ProfilerDX12::Scope profile(g_profiler, "Shadow", g_dx12.commandList.Get());
                 lightSpace = shadowMap.Render(
                     scene, geo, g_prefabRenderBatches,
                     (!g_emptyLevelMode && g_showH2Model)
@@ -8215,10 +8228,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr);
                 shadowResource = shadowMap.GetResource();
             }
-            RenderIdTech(scene, mainShader, visBuffer, geo, packed,
-                lightSpace, shadowResource, &occlusionDepth,
-                hzbHistoryUsable, previousHZBViewProjection, floorMaterial,
-                (!g_emptyLevelMode && g_showH2Model) ? crateModel : nullptr);
+            {
+                ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
+                RenderIdTech(scene, mainShader, visBuffer, geo, packed,
+                    lightSpace, shadowResource, &occlusionDepth,
+                    hzbHistoryUsable, previousHZBViewProjection, floorMaterial,
+                    (!g_emptyLevelMode && g_showH2Model) ? crateModel : nullptr);
+            }
             fogLightSpace = lightSpace;
             fogShadowResource = shadowResource;
             renderedScene = !visibilityDebugActive;
@@ -8441,7 +8457,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         {
         ProfilerDX12::Scope profile(g_profiler, "ImGui", g_dx12.commandList.Get());
         g_forwardDrawCalls = mainShader.currentDrawCall;
-        g_shadowDrawCalls = (!usingRaytracing && !usingVisibility &&
+        // The visibility path renders shadows too (main.cpp's visibility branch
+        // calls shadowMap.Render), so gating this on !usingVisibility made the
+        // HUD report "Shadow 0" while three cascades were actually drawing.
+        g_shadowDrawCalls = (!usingRaytracing &&
             scene.enableShadows && shadowMap.initialized && scene.lightType == 0)
             ? shadowMap.depthShader.currentDrawCall : 0;
         g_shadowBatches = g_shadowDrawCalls
@@ -8461,6 +8480,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 << " validation=" << (visBuffer.validationMode ? 1 : 0)
                 << '\n';
             visibilitySmokeReported = true;
+        }
+        // SGE_PROFILE_DUMP=1 writes one frame of GPU pass timings to disk after
+        // the scene has settled. The profiler is otherwise UI-only, which makes
+        // per-pass numbers unreadable from an automated/headless run.
+        if (g_profileDumpEnabled && !g_profileDumpWritten &&
+            IsSceneScreen() && !g_game.loading.Active()) {
+            if (++g_profileDumpFrame > 240) {
+                std::ofstream dump("profile_dump.log", std::ios::trunc);
+                dump << "GPU frame: " << g_profiler.GpuFrameMs()
+                     << " ms\nCPU frame: " << g_profiler.CpuFrameMs()
+                     << " ms\n--- GPU passes ---\n";
+                double total = 0.0;
+                for (const auto& sample : g_profiler.GpuSamples()) {
+                    dump << sample.name << ": " << sample.milliseconds << " ms\n";
+                    total += sample.milliseconds;
+                }
+                dump << "--- sum of passes: " << total << " ms ---\n";
+                g_profileDumpWritten = true;
+            }
         }
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();

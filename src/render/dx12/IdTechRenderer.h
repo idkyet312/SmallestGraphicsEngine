@@ -13,6 +13,7 @@
 
 #include "ShaderCacheDX12.h"
 #include "DX12Core.h"
+#include "ProfilerDX12.h"
 #include "ShaderDX12.h"
 #include "VisibilityBufferDX12.h"
 #include "OcclusionDepthDX12.h"
@@ -21,6 +22,9 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+
+// Defined in main.cpp, which includes this header before that definition.
+extern ProfilerDX12 g_profiler;
 
 // CPU-side flat vertex float arrays (pos3 norm3 uv2 = 8 floats per vert)
 struct PackedGeometry {
@@ -881,6 +885,12 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         }
     }
 
+    {
+    // Raster and resolve are separately timed: the resolve is a single
+    // full-screen compute dispatch whose cost scales with pixels and lighting
+    // complexity, while the raster scales with draw count. One combined number
+    // cannot tell you which to attack.
+    ProfilerDX12::Scope rasterScope(g_profiler, "VB Raster", g_dx12.commandList.Get());
     vb.BeginVisibilityPass(g_dx12.commandList.Get());
     g_dx12.commandList->SetGraphicsRootConstantBufferView(0, frameMatrixCBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -914,6 +924,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     }
 
     vb.EndVisibilityPass(g_dx12.commandList.Get());
+    }
 
     // Lighting setup
     {
@@ -977,10 +988,14 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
 
     LightBufferDX12 dummyLB = {};
     PointLightsBufferDX12 dummyPL = {};
-    vb.Resolve(g_dx12.commandList.Get(), view, proj, lightSpace,
-        previousViewProjection,
-        scene.camera.Position, scene.cameraNear, scene.cameraFar,
-        dummyLB, dummyPL);
+    {
+        ProfilerDX12::Scope resolveScope(
+            g_profiler, "VB Resolve", g_dx12.commandList.Get());
+        vb.Resolve(g_dx12.commandList.Get(), view, proj, lightSpace,
+            previousViewProjection,
+            scene.camera.Position, scene.cameraNear, scene.cameraFar,
+            dummyLB, dummyPL);
+    }
 
     vb.BeginForwardExtensions(g_dx12.commandList.Get());
 }

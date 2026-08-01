@@ -17,7 +17,10 @@ struct ProfilerSampleDX12 {
 class ProfilerDX12 {
 public:
     using Clock = std::chrono::steady_clock;
-    static constexpr UINT MaxGpuEvents = 24;
+    // Overflow is silent -- BeginGpuEvent returns InvalidQuery and the scope
+    // vanishes from the report rather than erroring -- so keep headroom above
+    // the number of live scopes.
+    static constexpr UINT MaxGpuEvents = 32;
     static constexpr UINT QueriesPerFrame = 2 + MaxGpuEvents * 2;
 
     bool Init(ID3D12Device* device, ID3D12CommandQueue* queue) {
@@ -163,8 +166,12 @@ public:
         Scope(ProfilerDX12& owner, const char* name, ID3D12GraphicsCommandList* list)
             : profiler(owner), commandList(list), label(name), begin(Clock::now()),
               eventIndex(owner.BeginGpuEvent(name, list)) {
+            // Metadata must be PIX_EVENT_ANSI_VERSION (1) for a char* label.
+            // Passing 0 declares the string UTF-16, so RenderDoc decoded each
+            // pair of ASCII bytes as one wide char and every marker showed up as
+            // CJK mojibake ("Visibility Buffer" -> a run of Chinese glyphs).
             if (commandList && label)
-                commandList->BeginEvent(0, label, static_cast<UINT>(std::strlen(label) + 1));
+                commandList->BeginEvent(1, label, static_cast<UINT>(std::strlen(label) + 1));
         }
         ~Scope() {
             if (commandList && label) commandList->EndEvent();

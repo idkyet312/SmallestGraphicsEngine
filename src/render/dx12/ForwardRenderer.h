@@ -5,6 +5,7 @@
 // Binds the clustered forward shader and draws each object with per-draw CBVs.
 
 #include "DX12Core.h"
+#include "ProfilerDX12.h"
 #include "ShaderDX12.h"
 #include "DDGI_DX12.h"
 #include "Scene.h"
@@ -25,6 +26,7 @@
 extern MeshShaderDX12 g_meshShader;
 extern bool g_useMeshShader;
 extern TerrainRendererDX12 g_terrain;
+extern ProfilerDX12 g_profiler;
 // Shared island-builder terrain params (island size, extent, origin offset,
 // GPU-safe clamps). Defined in main.cpp; declared here so the terrain draw
 // uses the same params as foliage/collision/GI instead of a stale default.
@@ -962,7 +964,14 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         // level's islandScale/extent, so the mesh never grew with the slider.
         TerrainRendererDX12::Params terrainParams = CurrentTerrainParams();
         terrainParams.heightScale = scene.terrainHeightScale;
-        g_terrain.Draw(shader, terrainParams);
+        {
+            // Terrain draws here by design (see the comment above): it has no
+            // visibility-ID path yet, so it rides the forward extensions pass.
+            // Time it separately so its share of that pass is visible.
+            ProfilerDX12::Scope terrainScope(
+                g_profiler, "Terrain", g_dx12.commandList.Get());
+            g_terrain.Draw(shader, terrainParams);
+        }
         // Terrain used the mesh pipeline; restore the IA pipeline for the
         // raster draws that follow (same pattern as imported-model draws).
         g_dx12.commandList->SetPipelineState(
