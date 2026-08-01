@@ -94,6 +94,7 @@ static unsigned int SCR_HEIGHT = 1080;
 
 static Scene               scene;
 static ShaderDX12           mainShader;
+ImpactParticleRendererDX12  g_particleRenderer;
 ProfilerDX12                g_profiler;
 static bool                 g_profileDumpEnabled = false;
 static bool                 g_profileDumpWritten = false;
@@ -990,10 +991,11 @@ static void UpdateBoat(float dt) {
 
     g_boatPatrolTime += dt;
     // Slow circle around the island, water-level height with a light bob.
-    // Starts a quarter-turn around the circle (not phase 0, which sits right
+    // Starts 125 degrees around the circle (not phase 0, which sits right
     // in front of the player's spawn point) so it isn't beside the player
     // the moment the level loads.
-    const float patrolPhase = g_boatPatrolTime * 0.065f + XM_PIDIV2;
+    const float patrolPhase = g_boatPatrolTime * 0.065f +
+                              XMConvertToRadians(125.0f);
     const float px = g_boatCenter.x + std::sin(patrolPhase) * kBoatPatrolRadius;
     const float pz = g_boatCenter.z + std::cos(patrolPhase) * kBoatPatrolRadius;
     g_boatPosition.x = px;
@@ -6734,6 +6736,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
     }
     std::cout << "Shaders loaded\n";
+    if (!g_particleRenderer.Init())
+        std::cerr << "GPU particle renderer unavailable; using draw fallback\n";
 
     BootStep("Initializing mesh shader pipeline...");
     g_useMeshShader = g_meshShader.Init(mainShader);
@@ -6965,6 +6969,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     double visibilityBenchmarkForwardMs = 0.0;
     double visibilityBenchmarkVBMs = 0.0;
     bool visibilityBenchmarkComplete = false;
+    const bool particleBenchmark =
+        GetEnvironmentVariableA("SGE_PARTICLE_BENCHMARK", nullptr, 0) > 0;
+    UINT particleBenchmarkFrames = 0;
+    UINT particleBenchmarkSamples = 0;
+    double particleBenchmarkCpuMs = 0.0;
+    double particleBenchmarkGpuMs = 0.0;
     if (GetEnvironmentVariableA("SGE_VISIBILITY_TEST", nullptr, 0) > 0) {
         visibilitySmokeEnabled = true;
         std::ofstream("visibility_smoke.log", std::ios::trunc)
@@ -7169,6 +7179,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                       scene.camera.PlayerHeight);
 
         scene.Update(deltaTime, now);
+        // Repeatable submission benchmark: 800 persistent smoke cards (runtime
+        // cap). Isolates particle draw overhead from spawn/simulation cost.
+        if (particleBenchmark && IsSceneScreen() && !g_game.loading.Active()) {
+            scene.impactParticles.clear();
+            scene.impactParticles.reserve(800);
+            const XMVECTOR camera = XMLoadFloat3(&scene.camera.Position);
+            const XMVECTOR forward = XMVector3Normalize(
+                XMLoadFloat3(&scene.camera.Front));
+            const XMVECTOR right = XMVector3Normalize(XMVector3Cross(
+                XMLoadFloat3(&scene.camera.Up), forward));
+            const XMVECTOR up = XMVector3Normalize(XMVector3Cross(forward, right));
+            for (UINT i = 0; i < 800; ++i) {
+                const float x = (static_cast<float>(i % 40) - 19.5f) * 0.42f;
+                const float y = (static_cast<float>((i / 40) % 25) - 12.0f) * 0.28f;
+                const float z = 7.0f + static_cast<float>(i % 7) * 0.12f;
+                ImpactParticle particle;
+                XMStoreFloat3(&particle.position,
+                    camera + forward * z + right * x + up * y);
+                particle.velocity = {};
+                particle.maxLife = 1000.0f;
+                particle.life = 800.0f;
+                particle.size = 0.16f;
+                particle.growth = 0.0f;
+                particle.color = { 0.34f, 0.31f, 0.27f };
+                scene.impactParticles.push_back(particle);
+            }
+        }
         const float playerHorizontalSpeed = g_game.playerMovement.Update(
             scene.ViewmodelAnchorPosition(), deltaTime, !g_drivingHumvee);
         ArmsModel::Update(deltaTime, playerHorizontalSpeed);
@@ -8773,7 +8810,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // ?? ImGui ??
         {
         ProfilerDX12::Scope profile(g_profiler, "ImGui", g_dx12.commandList.Get());
-        g_forwardDrawCalls = mainShader.currentDrawCall;
+        g_forwardDrawCalls = mainShader.currentDrawCall +
+            g_particleRenderer.DrawCallsThisFrame();
         // The visibility path renders shadows too (main.cpp's visibility branch
         // calls shadowMap.Render), so gating this on !usingVisibility made the
         // HUD report "Shadow 0" while three cascades were actually drawing.
@@ -8924,6 +8962,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 scene.GetViewMatrix() * scene.GetProjectionMatrix();
         msaaUsedLastFrame = msaaActive;
         g_profiler.EndCpuFrame();
+        if (particleBenchmark && IsSceneScreen() && !g_game.loading.Active()) {
+            ++particleBenchmarkFrames;
+            if (particleBenchmarkFrames > 120) {
+                double cpuMs = -1.0;
+                double gpuMs = -1.0;
+                for (const ProfilerSampleDX12& sample : g_profiler.CpuSamples())
+                    if (sample.name == "Impact Particles") cpuMs = sample.milliseconds;
+                for (const ProfilerSampleDX12& sample : g_profiler.GpuSamples())
+                    if (sample.name == "Impact Particles") gpuMs = sample.milliseconds;
+                if (cpuMs >= 0.0 && gpuMs >= 0.0) {
+                    particleBenchmarkCpuMs += cpuMs;
+                    particleBenchmarkGpuMs += gpuMs;
+                    ++particleBenchmarkSamples;
+                }
+            }
+            if (particleBenchmarkSamples >= 300) {
+                std::ofstream benchmark("particle_benchmark.log", std::ios::trunc);
+                benchmark << "particles=800\n"
+                          << "samples=" << particleBenchmarkSamples << '\n'
+                          << "cpu_ms=" << particleBenchmarkCpuMs /
+                                particleBenchmarkSamples << '\n'
+                          << "gpu_ms=" << particleBenchmarkGpuMs /
+                                particleBenchmarkSamples << '\n'
+                          << "forward_draws=" << g_forwardDrawCalls << '\n';
+                PostQuitMessage(0);
+            }
+        }
         if (g_prefabEditorSmokeEnabled && !g_prefabEditorSmokeFinished) {
             for (auto& [id, thumbnail] : g_prefabThumbnails) {
                 if (!thumbnail.cacheWrite.valid() ||

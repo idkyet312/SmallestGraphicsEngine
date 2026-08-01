@@ -243,9 +243,9 @@ struct Scene {
     bool  enableVolumetricFog = true;
     // Doubles the froxel grid to 128x72x96. The default 64x36x48 gives one fog
     // sample per ~30x30 screen pixels at 1080p, which makes sun shafts through
-    // palm fronds look blocky. 8x the froxels sharpens them at a real GPU cost,
-    // so it stays opt-in.
-    bool  volumetricFogHighRes = false;
+    // palm fronds look blocky. High quality is the default; the UI can still
+    // disable it on slower GPUs.
+    bool  volumetricFogHighRes = true;
     // How sun shafts are produced.
     //
     // Volumetric marches the froxel grid: correct occlusion from any geometry,

@@ -7,6 +7,7 @@
 #include "DX12Core.h"
 #include "ProfilerDX12.h"
 #include "ShaderDX12.h"
+#include "ImpactParticleRendererDX12.h"
 #include "DDGI_DX12.h"
 #include "Scene.h"
 #include "SceneGraph.h"
@@ -27,6 +28,7 @@ extern MeshShaderDX12 g_meshShader;
 extern bool g_useMeshShader;
 extern TerrainRendererDX12 g_terrain;
 extern ProfilerDX12 g_profiler;
+extern ImpactParticleRendererDX12 g_particleRenderer;
 // Shared island-builder terrain params (island size, extent, origin offset,
 // GPU-safe clamps). Defined in main.cpp; declared here so the terrain draw
 // uses the same params as foliage/collision/GI instead of a stale default.
@@ -208,6 +210,13 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
     const XMVECTOR camFwd = XMVectorSetW(invRot.r[2], 0.0f);
 
     shader.UseTransparent();
+    if (g_particleRenderer.initialized) {
+        g_particleRenderer.Render(scene, g_smokeTexture.Get(),
+            g_bloodTexture.Get(), shader.hdrTargetEnabled, shader.msaaEnabled);
+        // Dedicated particle root signature/heap invalidates cached main bindings.
+        shader.InvalidateGraphicsRootBinding();
+        shader.UseTransparent();
+    } else {
     std::vector<const ImpactParticle*> transparentParticles;
     transparentParticles.reserve(scene.impactParticles.size());
     for (const ImpactParticle& particle : scene.impactParticles)
@@ -252,6 +261,7 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
         shader.SetSmokeMaterial(tint, opacity, texture);
         DrawQuad(geo);
         shader.NextDrawCall();
+    }
     }
 
     // Very short pressure shell and white flash. These are geometry, not another
@@ -1491,16 +1501,19 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Opaque sparks stay in Forward. Transparent smoke/blood runs after the
     // separate skinned-enemy pass via RenderImpactBillboards().
     shader.Use(scene.wireframeMode);
-    for (auto& sp : scene.impactParticles) {
-        if (!sp.spark) continue;
-        const float fade = sp.life / sp.maxLife;
-        model = XMMatrixScaling(sp.size, sp.size, sp.size) *
-                XMMatrixTranslation(sp.position.x, sp.position.y, sp.position.z);
-        shader.SetMatrices(model, view, proj, lightSpace);
-        const float b = 0.6f + 0.4f * fade;
-        shader.SetObjectColor(XMFLOAT3(sp.color.x * b, sp.color.y * b, sp.color.z * b));
-        DrawCube(geo);
-        shader.NextDrawCall();
+    if (!g_particleRenderer.initialized) {
+        for (auto& sp : scene.impactParticles) {
+            if (!sp.spark) continue;
+            const float fade = sp.life / sp.maxLife;
+            model = XMMatrixScaling(sp.size, sp.size, sp.size) *
+                    XMMatrixTranslation(sp.position.x, sp.position.y, sp.position.z);
+            shader.SetMatrices(model, view, proj, lightSpace);
+            const float b = 0.6f + 0.4f * fade;
+            shader.SetObjectColor(XMFLOAT3(
+                sp.color.x * b, sp.color.y * b, sp.color.z * b));
+            DrawCube(geo);
+            shader.NextDrawCall();
+        }
     }
 
     // Gun: the AK47 model, drawn in the gun's local space (+Z down the barrel)
