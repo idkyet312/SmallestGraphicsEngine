@@ -73,6 +73,35 @@ public:
     bool IsSniper() const { return weapon == BanditWeapon::Sniper; }
     bool IsShotgunner() const { return weapon == BanditWeapon::Shotgun; }
 
+    bool NeedsCoverQuery() const {
+        if (dead_ || held_ || turretGunner || hasCoverTarget_ ||
+            coverReentryCooldown_ > 0.0f || coverQueryCooldown_ > 0.0f)
+            return false;
+        return health <= 65.0f || selfPreservation_ >= 0.45f;
+    }
+
+    void SetCoverTarget(const DirectX::XMFLOAT3& target, float holdSeconds) {
+        coverTarget_ = target;
+        hasCoverTarget_ = true;
+        inCover_ = false;
+        coverTravelTime_ = 8.0f;
+        coverHoldTime_ = (std::max)(2.5f, holdSeconds);
+        coverQueryCooldown_ = 0.75f;
+        navigationPath_.clear();
+        navigationRepathTimer_ = 0.0f;
+        preparingShot_ = false;
+        stationaryAimTime_ = 0.0f;
+        laserCharge_ = 0.0f;
+        burstShotsRemaining = 0;
+    }
+
+    void MarkCoverQueryFailed(float retrySeconds = 1.0f) {
+        coverQueryCooldown_ = (std::max)(coverQueryCooldown_, retrySeconds);
+    }
+
+    bool TakingCover() const { return hasCoverTarget_; }
+    bool InCover() const { return hasCoverTarget_ && inCover_; }
+
     // True while the red beam should be drawn. Laser only exists during the
     // charge; it disappears the instant the shot goes out.
     bool LaserActive() const {
@@ -147,6 +176,9 @@ public:
     void Update(float dt, const DirectX::XMFLOAT3& target, float groundY) {
         if (dead_) return;
         debrisHitCooldown_ = (std::max)(0.0f, debrisHitCooldown_ - dt);
+        coverQueryCooldown_ = (std::max)(0.0f, coverQueryCooldown_ - dt);
+        coverReentryCooldown_ = (std::max)(0.0f, coverReentryCooldown_ - dt);
+        selfPreservation_ = (std::max)(0.0f, selfPreservation_ - dt * 0.055f);
         position.y = groundY;
         position.x += knockbackVelocity_.x * dt;
         position.z += knockbackVelocity_.z * dt;
@@ -161,26 +193,72 @@ public:
         navigationRepathTimer_ -= dt;
         const float dx = target.x - position.x, dz = target.z - position.z;
         const float distance = std::sqrt(dx*dx + dz*dz);
+        if (!turretGunner && distance < 4.5f)
+            selfPreservation_ = (std::max)(selfPreservation_, 0.82f);
+        if (hasCoverTarget_) {
+            const float coverDx = coverTarget_.x - position.x;
+            const float coverDz = coverTarget_.z - position.z;
+            const float coverDistanceSq = coverDx * coverDx + coverDz * coverDz;
+            if (!inCover_) {
+                coverTravelTime_ -= dt;
+                if (coverDistanceSq <= 0.65f * 0.65f) inCover_ = true;
+            } else {
+                coverHoldTime_ -= dt;
+            }
+            if (coverTravelTime_ <= 0.0f || (inCover_ && coverHoldTime_ <= 0.0f)) {
+                hasCoverTarget_ = false;
+                inCover_ = false;
+                coverReentryCooldown_ = 4.0f +
+                    ((float)std::rand() / (float)RAND_MAX) * 2.5f;
+                selfPreservation_ *= 0.35f;
+                navigationPath_.clear();
+            }
+        }
         if (distance > 0.1f) {
             aimYaw = std::atan2(dx, dz);
             const float gunHeight = position.y + footOffset + 1.48f;
             aimPitch = (std::max)(-0.55f, (std::min)(
                 0.55f, std::atan2(target.y - gunHeight, distance)));
+            if (inCover_) {
+                const float turn = std::atan2(
+                    std::sin(aimYaw - yaw), std::cos(aimYaw - yaw));
+                const float maxTurn = 5.5f * dt;
+                yaw += (std::max)(-maxTurn, (std::min)(maxTurn, turn));
+            }
         }
         if (preparingShot_) stationaryAimTime_ += dt;
         // A sniper walking while its laser is up would drag the beam across the
         // world and make the telegraph unreadable. Plant it for the wind-up.
-        const bool rooted = preparingShot_ || laserCharge_ > 0.0f;
+        const bool rooted = !hasCoverTarget_ &&
+            (preparingShot_ || laserCharge_ > 0.0f);
         float speed = 0.0f;
-        if (distance > 0.1f && !rooted) {
-            const float inv = 1.0f / distance;
+        const bool movingToCover = hasCoverTarget_ && !inCover_;
+        const bool evasiveRetreat = !hasCoverTarget_ &&
+            selfPreservation_ >= 0.45f && coverQueryCooldown_ > 0.0f &&
+            distance < 13.0f;
+        if ((distance > 0.1f || movingToCover) && !rooted && !inCover_) {
+            const float inv = distance > 0.001f ? 1.0f / distance : 0.0f;
             const float inwardX = dx * inv;
             const float inwardZ = dz * inv;
             float moveX = inwardX;
             float moveZ = inwardZ;
             bool orbiting = false;
 
-            if (distance <= orbitRadius + 2.2f) {
+            if (movingToCover) {
+                const float coverDx = coverTarget_.x - position.x;
+                const float coverDz = coverTarget_.z - position.z;
+                const float coverDistance = std::sqrt(
+                    coverDx * coverDx + coverDz * coverDz);
+                if (coverDistance > 0.001f) {
+                    moveX = coverDx / coverDistance;
+                    moveZ = coverDz / coverDistance;
+                }
+                speed = moveSpeed * 1.65f;
+            } else if (evasiveRetreat) {
+                moveX = -inwardX;
+                moveZ = -inwardZ;
+                speed = moveSpeed * 1.65f;
+            } else if (distance <= orbitRadius + 2.2f) {
                 // Grounded version of old hover-enemy controller: preserve a
                 // combat ring while moving tangentially around player.
                 const float tangentX = -inwardZ * orbitDirection;
@@ -202,10 +280,15 @@ public:
 
             // Detour supplies corridor-safe steering. Near combat ring, query a
             // short tangent destination; farther away, path toward player.
-            XMFLOAT3 requestedDestination = orbiting
-                ? XMFLOAT3(position.x + moveX * 3.0f, position.y,
-                           position.z + moveZ * 3.0f)
-                : XMFLOAT3(target.x, position.y, target.z);
+            XMFLOAT3 requestedDestination = movingToCover
+                ? coverTarget_
+                : evasiveRetreat
+                    ? XMFLOAT3(position.x + moveX * 4.5f, position.y,
+                               position.z + moveZ * 4.5f)
+                : orbiting
+                    ? XMFLOAT3(position.x + moveX * 3.0f, position.y,
+                               position.z + moveZ * 3.0f)
+                    : XMFLOAT3(target.x, position.y, target.z);
             const float navDx = requestedDestination.x - navigationDestination_.x;
             const float navDz = requestedDestination.z - navigationDestination_.z;
             if (g_navigation.Ready() &&
@@ -357,6 +440,13 @@ public:
         using namespace DirectX;
         if (dead_ || held_ || !visible || !HasGunPose()) return false;
         fireCooldown -= dt;
+        if (hasCoverTarget_ && !inCover_) {
+            preparingShot_ = false;
+            stationaryAimTime_ = 0.0f;
+            laserCharge_ = 0.0f;
+            burstShotsRemaining = 0;
+            return false;
+        }
         if (turretGunner) {
             if (!hasLineOfSight) {
                 if (!mountedFiring_) {
@@ -562,7 +652,9 @@ public:
         if (headshot) *headshot = hitHead;
         // Standard rifle balance: one headshot, exactly five body hits from
         // full 100 health.
-        health -= hitHead && allowHeadshotKill ? health : bodyDamage;
+        const float appliedDamage = hitHead && allowHeadshotKill ? health : bodyDamage;
+        health -= appliedDamage;
+        RegisterThreat(appliedDamage);
         if (health <= 0.0f) Kill(direction, impact);
         return true;
     }
@@ -619,7 +711,9 @@ public:
         if (distance < 0.001f) away = XMVectorSet(0.0f, 0.4f, 1.0f, 0.0f);
         away = XMVector3Normalize(away + XMVectorSet(0.0f, 0.35f, 0.0f, 0.0f));
         const float falloff = (std::max)(0.2f, 1.0f - distance / radius);
-        health -= damage * falloff;
+        const float appliedDamage = damage * falloff;
+        health -= appliedDamage;
+        RegisterThreat(appliedDamage);
 
         XMFLOAT3 direction;
         XMStoreFloat3(&direction, away);
@@ -683,6 +777,7 @@ public:
                 (speed - 2.5f) * 7.0f +
                 std::sqrt((std::max)(0.05f, debris.mass)) * 3.0f));
         health -= damage;
+        RegisterThreat(damage);
         debrisHitCooldown_ = 0.45f;
         if (health <= 0.0f) {
             Kill(direction, impact);
@@ -859,6 +954,12 @@ private:
     std::vector<DirectX::XMFLOAT4X4> bodyLocal_;
     DirectX::XMFLOAT4X4 deathWorld_ = {};
     DirectX::XMFLOAT3 knockbackVelocity_{ 0.0f, 0.0f, 0.0f };
+    DirectX::XMFLOAT3 coverTarget_{ 0.0f, 0.0f, 0.0f };
+    float selfPreservation_ = 0.0f;
+    float coverQueryCooldown_ = 0.0f;
+    float coverReentryCooldown_ = 0.0f;
+    float coverTravelTime_ = 0.0f;
+    float coverHoldTime_ = 0.0f;
     float stationaryAimTime_ = 0.0f;
     float burnTime_ = 0.0f;
     float burnSpreadCooldown_ = 0.0f;
@@ -881,6 +982,15 @@ private:
     bool dead_ = false;
     bool held_ = false;
     bool mountedFiring_ = false;
+    bool hasCoverTarget_ = false;
+    bool inCover_ = false;
+
+    void RegisterThreat(float damage) {
+        if (damage <= 0.0f || dead_) return;
+        const float urgency = 0.38f + (std::min)(1.0f, damage / 55.0f) * 0.62f;
+        selfPreservation_ = (std::max)(selfPreservation_, urgency);
+        coverQueryCooldown_ = (std::min)(coverQueryCooldown_, 0.12f);
+    }
 
     static bool ContainsNoCase(const std::string& value, const char* needle) {
         std::string lower = value;

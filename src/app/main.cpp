@@ -1505,6 +1505,11 @@ static bool HitTerrainSegment(const XMFLOAT3& start, const XMFLOAT3& end,
     return false;
 }
 
+static bool HitPrefabColliderSegment(const XMFLOAT3& start,
+                                     const XMFLOAT3& end, float radius,
+                                     XMFLOAT3& hit,
+                                     uint64_t* hitEntityId = nullptr);
+
 static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
                                  const XMFLOAT3& target) {
     const XMFLOAT3 origin = shooter.AimRayOrigin();
@@ -1513,6 +1518,7 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
     if (scene.useDestruction && g_destruction.IsInitialized() &&
         g_destruction.HitTestSegment(origin, target, rayRadius, hit))
         return false;
+    if (HitPrefabColliderSegment(origin, target, rayRadius, hit)) return false;
     if (HitTerrainSegment(origin, target, rayRadius, hit)) return false;
     if (g_trees.BlocksSegment(origin, target, rayRadius)) return false;
     for (const auto& bandit : g_bandits) {
@@ -3964,7 +3970,7 @@ static void ResolvePlayerPrefabCollisions(XMFLOAT3& position, float radius,
 
 static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
                                      float radius, XMFLOAT3& hit,
-                                     uint64_t* hitEntityId = nullptr) {
+                                     uint64_t* hitEntityId) {
     float closestDistanceSquared = FLT_MAX;
     bool struck = false;
     for (const PrefabCollider& collider : g_prefabColliders) {
@@ -3983,6 +3989,129 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
         }
     }
     return struck;
+}
+
+// Small Environment Query System-style cover test. Candidate points must be
+// reachable on the navmesh and hide both torso and head behind nearby world
+// geometry. Only one enemy runs this search per frame; selected points cache.
+static bool CoverRayBlockedNear(const XMFLOAT3& start, const XMFLOAT3& end,
+                                float& blockerDistance) {
+    blockerDistance = FLT_MAX;
+    bool blocked = false;
+    const auto accept = [&](const XMFLOAT3& hit) {
+        const float dx = end.x - hit.x;
+        const float dy = end.y - hit.y;
+        const float dz = end.z - hit.z;
+        blockerDistance = (std::min)(blockerDistance,
+            std::sqrt(dx * dx + dy * dy + dz * dz));
+        blocked = true;
+    };
+
+    XMFLOAT3 hit;
+    if (scene.useDestruction && g_destruction.IsInitialized() &&
+        g_destruction.HitTestSegment(start, end, 0.08f, hit))
+        accept(hit);
+    if (HitPrefabColliderSegment(start, end, 0.08f, hit)) accept(hit);
+    if (HitTerrainSegment(start, end, 0.08f, hit)) accept(hit);
+    if (g_trees.BlocksSegment(start, end, 0.08f)) {
+        blocked = true;
+        blockerDistance = (std::min)(blockerDistance, 2.5f);
+    }
+    return blocked && blockerDistance <= 4.75f;
+}
+
+static bool QueryBanditCover(const SkinnedEnemy& bandit,
+                             const XMFLOAT3& playerPosition,
+                             XMFLOAT3& bestPosition) {
+    if (!g_navigation.Ready()) return false;
+
+    float bestScore = -FLT_MAX;
+    bool found = false;
+    const float fromPlayerX = bandit.position.x - playerPosition.x;
+    const float fromPlayerZ = bandit.position.z - playerPosition.z;
+    const float fromPlayerLength = std::sqrt(
+        fromPlayerX * fromPlayerX + fromPlayerZ * fromPlayerZ);
+    const float awayX = fromPlayerLength > 0.001f
+        ? fromPlayerX / fromPlayerLength : 1.0f;
+    const float awayZ = fromPlayerLength > 0.001f
+        ? fromPlayerZ / fromPlayerLength : 0.0f;
+    const float angleOffset = static_cast<float>(bandit.spawnSlot + 1) * 0.731f;
+    constexpr float rings[] = { 3.5f, 6.5f, 9.5f };
+    constexpr int directions = 12;
+
+    auto terrainParams = CurrentTerrainParams();
+    terrainParams.heightScale = scene.terrainHeightScale;
+    for (float ring : rings) {
+        for (int direction = 0; direction < directions; ++direction) {
+            const float angle = angleOffset + XM_2PI *
+                static_cast<float>(direction) / static_cast<float>(directions);
+            XMFLOAT3 requested{
+                bandit.position.x + std::sin(angle) * ring,
+                bandit.position.y,
+                bandit.position.z + std::cos(angle) * ring };
+            if (scene.useMeshTerrain && g_terrain.supported)
+                requested.y = TerrainRendererDX12::HeightAt(
+                    terrainParams, requested.x, requested.z);
+
+            XMFLOAT3 torso{ requested.x, requested.y + 1.12f, requested.z };
+            XMFLOAT3 head{ requested.x, requested.y + 1.72f, requested.z };
+            float torsoBlocker = FLT_MAX, headBlocker = FLT_MAX;
+            if (!CoverRayBlockedNear(playerPosition, torso, torsoBlocker) ||
+                !CoverRayBlockedNear(playerPosition, head, headBlocker))
+                continue;
+
+            std::vector<XMFLOAT3> path;
+            if (!g_navigation.FindPath(bandit.position, requested, path) ||
+                path.empty())
+                continue;
+            XMFLOAT3 candidate = path.back();
+            const float snapX = candidate.x - requested.x;
+            const float snapZ = candidate.z - requested.z;
+            if (snapX * snapX + snapZ * snapZ > 1.8f * 1.8f) continue;
+
+            float pathLength = 0.0f;
+            XMFLOAT3 previous = bandit.position;
+            for (const XMFLOAT3& point : path) {
+                const float px = point.x - previous.x;
+                const float pz = point.z - previous.z;
+                pathLength += std::sqrt(px * px + pz * pz);
+                previous = point;
+            }
+            const float playerDx = candidate.x - playerPosition.x;
+            const float playerDz = candidate.z - playerPosition.z;
+            const float playerDistance = std::sqrt(
+                playerDx * playerDx + playerDz * playerDz);
+            if (playerDistance < 5.0f) continue;
+
+            const float moveDx = candidate.x - bandit.position.x;
+            const float moveDz = candidate.z - bandit.position.z;
+            const float moveLength = std::sqrt(moveDx * moveDx + moveDz * moveDz);
+            const float retreatAlignment = moveLength > 0.001f
+                ? (moveDx * awayX + moveDz * awayZ) / moveLength : 0.0f;
+            float crowdPenalty = 0.0f;
+            bool occupied = false;
+            for (const auto& other : g_bandits) {
+                if (!other || other.get() == &bandit || other->Dead()) continue;
+                const float ox = candidate.x - other->position.x;
+                const float oz = candidate.z - other->position.z;
+                const float separation = std::sqrt(ox * ox + oz * oz);
+                if (separation < 1.25f) { occupied = true; break; }
+                if (separation < 3.0f) crowdPenalty += (3.0f - separation) * 2.2f;
+            }
+            if (occupied) continue;
+
+            const float desiredRange = bandit.health <= 40.0f ? 17.0f : 12.0f;
+            const float score = playerDistance * 0.38f - pathLength * 0.82f +
+                retreatAlignment * 3.2f -
+                std::abs(playerDistance - desiredRange) * 0.16f -
+                (torsoBlocker + headBlocker) * 0.12f - crowdPenalty;
+            if (score <= bestScore) continue;
+            bestScore = score;
+            bestPosition = candidate;
+            found = true;
+        }
+    }
+    return found;
 }
 
 static void DamagePrefabEntity(uint64_t entityId, float damage,
@@ -7852,6 +7981,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (g_heldBandit && g_heldBandit->Dead()) g_heldBandit = nullptr;
             static std::unordered_map<SkinnedEnemy*, float> banditUpdateDebt;
             bool burnedBanditDied = false;
+            bool coverQuerySpent = false;
             for (auto& bandit : g_bandits) {
                 if (!bandit) continue;
                 if (bandit->UpdateBurning(
@@ -7893,6 +8023,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     updateDebt >= updateInterval;
                 const float banditDeltaTime = updateBandit ? updateDebt : 0.0f;
                 if (updateBandit) updateDebt = 0.0f;
+                if (updateBandit && !coverQuerySpent &&
+                    bandit->NeedsCoverQuery()) {
+                    XMFLOAT3 coverPosition;
+                    if (QueryBanditCover(
+                            *bandit, scene.camera.Position, coverPosition)) {
+                        const float holdTime = 3.25f +
+                            (100.0f - (std::max)(0.0f, bandit->health)) * 0.035f +
+                            RandomUnit() * 1.5f;
+                        bandit->SetCoverTarget(coverPosition, holdTime);
+                    } else {
+                        bandit->MarkCoverQueryFailed(0.8f + RandomUnit() * 0.7f);
+                    }
+                    coverQuerySpent = true;
+                }
                 if (updateBandit && bandit->turretGunner) {
                     const XMFLOAT3 mount = bandit->mountedVehicleIndex == 0
                         ? HumveeTurretMountWorld()
