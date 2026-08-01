@@ -208,18 +208,32 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // Thin vegetation is not an opaque card. Wrap direct light around both sides
     // and transmit warm sunlight through back-facing blades. This removes the
     // near-black foreground silhouettes while retaining object/terrain shadows.
-    float signedNdotL = dot(normal, lightDir);
-    float wrappedNdotL = saturate((signedNdotL + 0.32) / 1.32);
-    float backNdotL = saturate(-signedNdotL);
+    // Direct sun is applied at its full sun-facing value regardless of which way
+    // a blade points. The wrapped N.L this replaces fell to zero once a blade
+    // turned 0.32 away from the light, so away-facing patches dropped to ambient
+    // and the field split into a bright half and a near-black half with a hard
+    // line between them. Holding the term at its peak gives every blade the lit
+    // appearance and removes the split entirely.
+    //
+    // This is deliberately not physical: a field of blades at every orientation
+    // now receives identical direct light. Shadowing, ambient occlusion and the
+    // sky term still vary, so the grass is not flat -- it just no longer darkens
+    // by facing.
+    const float wrappedNdotL = 1.0;
     result += albedo / 3.14159265 * lightColor *
               wrappedNdotL * shadowVisibility *
               max(occlusionStrength, 0.0);
 
     // Broad low-energy leaf sheen. Roughness now remains useful on the cheap
     // grass shader without turning blades into metallic highlights.
+    //
+    // The lobe is taken against the absolute half-vector alignment so a blade
+    // facing away catches the same sheen as one facing the sun; leaving it
+    // signed would put a highlight on one half of the field only, which is the
+    // difference this change exists to remove.
     float3 halfDir = normalize(lightDir + viewDir);
     float specularPower = lerp(96.0, 10.0, saturate(roughness));
-    float specularLobe = pow(saturate(dot(normal, halfDir)), specularPower);
+    float specularLobe = pow(abs(dot(normal, halfDir)), specularPower);
     float specularEnergy = (1.0 - saturate(roughness)) * 0.08;
     result += lightColor * specularLobe * specularEnergy *
               shadowVisibility * max(occlusionStrength, 0.0);
@@ -227,8 +241,12 @@ float4 main(PS_INPUT input) : SV_TARGET {
     float tipTransmission = lerp(0.55, 1.0, smoothstep(0.15, 0.92,
                                                         input.texCoord.y));
     float3 transmissionTint = float3(0.72, 0.98, 0.50);
+    // backNdotL is dropped for the same reason as the wrap above: it only ever
+    // fired on away-facing blades, so leaving it in would tint exactly the half
+    // of the field this change is meant to match to the other. Applying the
+    // through-leaf green everywhere keeps the two sides identical.
     result += albedo * transmissionTint * lightColor *
-              backNdotL * tipTransmission * max(normalYSign, 0.0) *
+              tipTransmission * max(normalYSign, 0.0) *
               lerp(0.35, 1.0, shadowVisibility);
 
 #ifdef SGE_HDR_TARGET
