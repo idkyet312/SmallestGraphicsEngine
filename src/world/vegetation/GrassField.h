@@ -247,17 +247,18 @@ public:
     float& DirectLightScale()      { return m_directLightScale; }
     float& TransmissionStrength()  { return m_transmissionStrength; }
     float& ColorVariation()        { return m_colorVariation; }
-    // Lights every blade as if it faced the sun, removing the bright/dark split
-    // across the field at the cost of being non-physical.
-    bool& UniformLighting()        { return m_uniformLighting; }
+    // How strongly a blade's orientation darkens it. 1 is the physical
+    // response; 0 lights every blade as though it faced the sun, removing the
+    // bright/dark split across the field.
+    float& NormalFalloff()         { return m_normalFalloff; }
     void ResetMaterial() {
-        m_albedo = XMFLOAT3(0.078431f, 0.078431f, 0.078431f);
+        m_albedo = XMFLOAT3(0.113725f, 0.113725f, 0.113725f);
         m_roughness = 0.705f;
         m_ambientScale = 1.281f;
         m_directLightScale = 1.0f;
-        m_transmissionStrength = 0.533f;
-        m_colorVariation = 1.0f;
-        m_uniformLighting = false;
+        m_transmissionStrength = 0.293f;
+        m_colorVariation = 1.5f;
+        m_normalFalloff = 1.0f;
     }
     // Authored curved cards overlap into large repeated silhouettes on nearby
     // vehicles and buildings. Grass receives lighting but never enters CSMs.
@@ -645,13 +646,13 @@ private:
     // Sparse grass casters still produce visible cascade/cell bands across the
     // terrain. Keep blade lighting, but leave terrain shadowing to solid props.
     float m_shadowDensity = 0.28f;
-    XMFLOAT3 m_albedo = { 0.078431f, 0.078431f, 0.078431f };
+    XMFLOAT3 m_albedo = { 0.113725f, 0.113725f, 0.113725f };
     float m_roughness = 0.705f;
     float m_ambientScale = 1.281f;
     float m_directLightScale = 1.0f;
-    float m_transmissionStrength = 0.533f;
-    bool  m_uniformLighting = false;
-    float m_colorVariation = 1.0f;
+    float m_transmissionStrength = 0.293f;
+    float m_normalFalloff = 1.0f;
+    float m_colorVariation = 1.5f;
     // Side of one draw-cell. Small enough that the cells hug the draw radius
     // without dragging in much grass the shader would only fade away, large enough
     // that the whole field stays a few dozen draws rather than hundreds.

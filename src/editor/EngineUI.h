@@ -825,14 +825,16 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             "Grass Transmission", &g_grass.TransmissionStrength(), 0.0f, 1.0f);
         foliageMaterialChanged |= ImGui::SliderFloat(
             "Grass Color Variation", &g_grass.ColorVariation(), 0.0f, 1.5f);
-        foliageMaterialChanged |= ImGui::Checkbox(
-            "Grass Uniform Lighting", &g_grass.UniformLighting());
+        foliageMaterialChanged |= ImGui::SliderFloat(
+            "Grass Normal Falloff", &g_grass.NormalFalloff(), 0.0f, 1.0f);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                "Lights every blade as if it faced the sun.\n"
-                "Removes the bright/dark split across the field, at the\n"
-                "cost of being non-physical: all orientations receive the\n"
-                "same direct light. Shadows and sky ambient still vary.");
+                "How strongly a blade's facing darkens it.\n"
+                "1 = physical: blades turned away from the sun fall to\n"
+                "ambient, which splits the field into a bright and a dark\n"
+                "half. 0 = every blade lit as if it faced the sun, which\n"
+                "removes the split but is not physical.\n"
+                "Shadows and sky ambient still vary at any setting.");
         if (ImGui::Button("Reset Grass Material")) {
             g_grass.ResetMaterial();
             foliageMaterialChanged = true;

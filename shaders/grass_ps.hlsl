@@ -49,9 +49,9 @@ cbuffer ObjectBuffer : register(b3) {
     float occlusionStrength;
     float normalYSign;
     float viewFillStrength;
-    // Grass reuses this slot (unused by the cheap grass path) as the uniform
-    // lighting flag; see the direct-light block in main().
-    float uniformLighting;
+    // Grass reuses this slot (unused by the cheap grass path) as the normal
+    // falloff strength; see the direct-light block in main().
+    float normalFalloff;
     float normalTexH;
 };
 
@@ -187,8 +187,23 @@ float4 main(PS_INPUT input) : SV_TARGET {
         lerp(0.88, 1.10, input.colorVariation),
         variationStrength);
     float3 albedo = saturate(objectColor * tint * brightness);
+    // The authored grass albedo is neutral grey (R=G=B), so all of the field's
+    // green came from transmissionTint below -- which is gated on backNdotL and
+    // therefore only ever reached blades facing AWAY from the sun. That left the
+    // sun-facing half rendering the raw grey while the shaded half looked
+    // correct. Fold the same leaf tint into the albedo so both sides carry the
+    // colour, and let transmission add its warmth on top rather than being the
+    // only source of it.
+    // Normalised to unit luminance so it recolours without darkening: the raw
+    // tint averages well below 1 and would dim the whole field.
+    static const float3 kLeafTint = float3(0.72, 0.98, 0.50);
+    static const float kLeafTintLuma =
+        dot(kLeafTint, float3(0.2126, 0.7152, 0.0722));
+    albedo *= kLeafTint / kLeafTintLuma;
     float albedoLuma = dot(albedo, float3(0.2126, 0.7152, 0.0722));
-    albedo = lerp(albedoLuma.xxx, albedo, 0.80);
+    // Desaturating toward luminance is what greyed the lit side: on the dim half
+    // it is invisible, but direct sun amplifies it. Keep the blades' own colour.
+    albedo = lerp(albedoLuma.xxx, albedo, 0.95);
 
     // Blades are two-sided cards; flip the normal to face the camera so the
     // back of a blade doesn't go black.
@@ -210,17 +225,19 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // Thin vegetation is not an opaque card. Wrap direct light around both sides
     // and transmit warm sunlight through back-facing blades. This removes the
     // near-black foreground silhouettes while retaining object/terrain shadows.
-    // uniformLighting > 0.5 lights every blade as though it faced the sun.
-    // The wrapped term below reaches zero once a blade turns 0.32 away from the
-    // light, so away-facing patches fall back to ambient and the field splits
-    // into a bright half and a dark half with a hard line between them. Holding
-    // the term at its sun-facing peak removes that split at the cost of being
-    // non-physical -- every orientation then receives identical direct light.
-    const bool uniformGrassLight = uniformLighting > 0.5;
+    // normalFalloff scales how much a blade's orientation darkens it.
+    //
+    // At 1 this is the physical response: the wrapped term reaches zero once a
+    // blade turns 0.32 away from the light, so away-facing patches drop to
+    // ambient and the field splits into a bright half and a dark half. At 0
+    // every blade is lit as though it faced the sun, which removes the split
+    // entirely but is not physical. Values between fade one into the other, so
+    // the split can be softened without flattening the field completely.
+    float falloff = saturate(normalFalloff);
     float signedNdotL = dot(normal, lightDir);
-    float wrappedNdotL = uniformGrassLight
-        ? 1.0 : saturate((signedNdotL + 0.32) / 1.32);
-    float backNdotL = uniformGrassLight ? 1.0 : saturate(-signedNdotL);
+    float wrappedNdotL = lerp(1.0, saturate((signedNdotL + 0.32) / 1.32),
+                              falloff);
+    float backNdotL = lerp(1.0, saturate(-signedNdotL), falloff);
     result += albedo / 3.14159265 * lightColor *
               wrappedNdotL * shadowVisibility *
               max(occlusionStrength, 0.0);
@@ -229,10 +246,11 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // grass shader without turning blades into metallic highlights.
     float3 halfDir = normalize(lightDir + viewDir);
     float specularPower = lerp(96.0, 10.0, saturate(roughness));
-    // abs() in uniform mode so the sheen lands on both sides rather than only
+    // Blend toward abs() as falloff drops so the sheen stops being confined to
     // the half of the field turned toward the sun.
-    float specularAlignment = uniformGrassLight
-        ? abs(dot(normal, halfDir)) : saturate(dot(normal, halfDir));
+    float rawAlignment = dot(normal, halfDir);
+    float specularAlignment = lerp(abs(rawAlignment), saturate(rawAlignment),
+                                   falloff);
     float specularLobe = pow(specularAlignment, specularPower);
     float specularEnergy = (1.0 - saturate(roughness)) * 0.08;
     result += lightColor * specularLobe * specularEnergy *
@@ -240,8 +258,9 @@ float4 main(PS_INPUT input) : SV_TARGET {
 
     float tipTransmission = lerp(0.55, 1.0, smoothstep(0.15, 0.92,
                                                         input.texCoord.y));
-    float3 transmissionTint = float3(0.72, 0.98, 0.50);
-    result += albedo * transmissionTint * lightColor *
+    // albedo already carries kLeafTint, so tinting again here would push the
+    // back-lit half doubly green against the front.
+    result += albedo * lightColor *
               backNdotL * tipTransmission * max(normalYSign, 0.0) *
               lerp(0.35, 1.0, shadowVisibility);
 
