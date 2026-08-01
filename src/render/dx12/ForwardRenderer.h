@@ -867,8 +867,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                     scene.ambientStrength, scene.ambientLightingIntensity,
                     scene.specularStrength, scene.specularShininess,
                     scene.shadowBias, scene.enableShadows && shadowMap != nullptr,
+                    // Fallback only; the live path reads the resource's width,
+                    // so this tracks SHADOW_MAP_SIZE by convention.
                     shadowMap ? 1.0f / (float)shadowMap->GetDesc().Width
-                              : 1.0f / 2048.0f);
+                              : 1.0f / 4096.0f);
     shader.SetCamera(scene.camera.Position);
 
     // Clustered light cull

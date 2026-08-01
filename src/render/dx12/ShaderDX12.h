@@ -1126,7 +1126,10 @@ public:
                   float ambient, float ambientIntensity,
                   float specular, int shininess,
                   float shadowBias, bool enableShadows,
-                  float shadowTexelSize = 1.0f / 2048.0f) {
+                  // Fallback only; live callers pass the shadow resource's own
+                  // width. Keep in step with SHADOW_MAP_SIZE in ShadowMapDX12.h,
+                  // which cannot be included here (it includes this header).
+                  float shadowTexelSize = 1.0f / 4096.0f) {
         LightBufferDX12 data;
         data.lightPos = pos;
         data.lightType = type;

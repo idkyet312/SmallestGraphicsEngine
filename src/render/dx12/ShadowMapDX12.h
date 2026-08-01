@@ -14,7 +14,15 @@
 #include <fstream>
 #include <sstream>
 
-static const UINT SHADOW_MAP_SIZE = 2048;
+// 4096 rather than 2048: at 2048 a cascade-1/2 texel covered enough wall that
+// building edges rasterised as visible stair-steps. Doubling the axis quarters
+// the world size of a texel and removes most of that without touching the PCF
+// kernel. Costs 3 cascades x 4096^2 x 4 bytes = 192 MB of depth (up from 48).
+//
+// Nothing else needs updating for this: the per-cascade texelWorld used for
+// slope bias is derived from this value in ComputeCascadeMatrices, and the PCF
+// tap spacing comes from the live resource via GetDesc().Width.
+static const UINT SHADOW_MAP_SIZE = 4096;
 static const UINT SHADOW_MAX_DRAWS = 12288;
 static const UINT SHADOW_MAX_INSTANCES = 12288;
 static constexpr D3D12_RESOURCE_STATES SHADOW_SHADER_READ_STATE =
