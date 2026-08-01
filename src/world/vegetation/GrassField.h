@@ -252,7 +252,7 @@ public:
     // bright/dark split across the field.
     float& NormalFalloff()         { return m_normalFalloff; }
     void ResetMaterial() {
-        m_albedo = XMFLOAT3(0.113725f, 0.113725f, 0.113725f);
+        m_albedo = XMFLOAT3(0.078431f, 0.078431f, 0.078431f);
         m_roughness = 0.705f;
         m_ambientScale = 1.281f;
         m_directLightScale = 1.0f;
@@ -646,7 +646,7 @@ private:
     // Sparse grass casters still produce visible cascade/cell bands across the
     // terrain. Keep blade lighting, but leave terrain shadowing to solid props.
     float m_shadowDensity = 0.28f;
-    XMFLOAT3 m_albedo = { 0.113725f, 0.113725f, 0.113725f };
+    XMFLOAT3 m_albedo = { 0.078431f, 0.078431f, 0.078431f };
     float m_roughness = 0.705f;
     float m_ambientScale = 1.281f;
     float m_directLightScale = 1.0f;
