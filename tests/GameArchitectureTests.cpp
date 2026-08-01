@@ -243,6 +243,15 @@ int main() {
     player.UpdateReload(10.0f);
     CHECK(player.magazine[0] == 5);
     CHECK(player.reserve[0] == 0);
+    CHECK(PlayerState::kWeaponSlots == 7);
+    player.magazine[4] = 1;
+    CHECK(player.ConsumeAmmo(4));
+    CHECK(player.magazine[4] == 0);
+    player.reserve[4] = 7;
+    CHECK(player.BeginReload(4));
+    player.UpdateReload(10.0f);
+    CHECK(player.magazine[4] == 7);
+    CHECK(player.reserve[4] == 0);
 
     DeferredReleaseQueue<int> releases;
     releases.Retire(4, 10);

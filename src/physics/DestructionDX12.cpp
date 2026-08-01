@@ -297,6 +297,13 @@ struct DestructionDX12::Impl {
     std::vector<int> chunkGroupByAsset;           // asset-chunk-indexed plank id (root=[0]=-2)
     std::list<std::unique_ptr<ActorRuntime>> actors;
     std::vector<VortexRuntime> vortices;
+    struct BurningChunk {
+        uint32_t chunkIndex = InvalidIndex;
+        float life = 3.0f;
+        float spreadCooldown = 0.25f;
+        float damageCooldown = 0.45f;
+    };
+    std::vector<BurningChunk> burningChunks;
     std::vector<BarrelRuntime> barrelBodies;
     std::vector<uint32_t> barrelImpactEvents;
     uint32_t nextBarrelHandle = 1;
@@ -2089,7 +2096,9 @@ struct DestructionDX12::Impl {
 
     bool FindNearestBreakableCell(const XMFLOAT3& worldPosition,
                                   ActorRuntime*& hitActor,
-                                  uint32_t& hitChunk) {
+                                  uint32_t& hitChunk,
+                                  bool includeSupport = false,
+                                  bool includeSingle = false) {
         hitActor = nullptr;
         hitChunk = InvalidIndex;
         float bestDistanceSquared = FLT_MAX;
@@ -2114,18 +2123,20 @@ struct DestructionDX12::Impl {
             }
         }
         if (!hitActor || !hitActor->actor || hitChunk == InvalidIndex) return false;
-        if (chunks[hitChunk].support) return false;        // anchored pieces shrug it off
-        if (hitActor->chunks.size() <= 1) return false;    // lone cell: nothing left to sever
+        if (!includeSupport && chunks[hitChunk].support) return false;
+        if (!includeSingle && hitActor->chunks.size() <= 1) return false;
         return true;
     }
 
     // Sever the bonds of the single non-support cell nearest `worldPosition`
     // so it splits off. Shared by bullet strikes and physics-impact damage.
     // Caller marks the structural graph dirty and rebuilds render items.
-    bool BreakNearestCell(const XMFLOAT3& worldPosition) {
+    bool BreakNearestCell(const XMFLOAT3& worldPosition,
+                          bool includeSupport = false) {
         ActorRuntime* hitActor = nullptr;
         uint32_t hitChunk = InvalidIndex;
-        if (!FindNearestBreakableCell(worldPosition, hitActor, hitChunk)) return false;
+        if (!FindNearestBreakableCell(
+                worldPosition, hitActor, hitChunk, includeSupport)) return false;
         lastBrokenStructure = chunks[hitChunk].structureId;
         if (hitActor->debrisCleanupEligible) {
             WakeDebris(*hitActor);
@@ -2166,6 +2177,100 @@ struct DestructionDX12::Impl {
         hitActor->actor->damage(isolate, &isolateParams);
         group->process();
         return true;
+    }
+
+    ActorRuntime* FindChunkOwner(uint32_t chunkIndex) const {
+        for (const auto& runtime : actors) {
+            if (std::find(runtime->chunks.begin(), runtime->chunks.end(),
+                          chunkIndex) != runtime->chunks.end())
+                return runtime.get();
+        }
+        return nullptr;
+    }
+
+    bool ChunkWorldPosition(uint32_t chunkIndex, XMFLOAT3& position) const {
+        if (chunkIndex >= chunks.size()) return false;
+        const ActorRuntime* runtime = FindChunkOwner(chunkIndex);
+        if (!runtime || B3_IS_NULL(runtime->body)) return false;
+        XMStoreFloat3(&position, XMVector3TransformCoord(
+            XMLoadFloat3(&chunks[chunkIndex].center),
+            BoxTransform(runtime->body, runtime->center)));
+        return true;
+    }
+
+    void IgniteChunk(uint32_t chunkIndex, float life = 3.0f) {
+        for (BurningChunk& burning : burningChunks) {
+            if (burning.chunkIndex != chunkIndex) continue;
+            burning.life = (std::max)(burning.life, life);
+            return;
+        }
+        if (burningChunks.size() >= 72) burningChunks.erase(burningChunks.begin());
+        burningChunks.push_back({ chunkIndex, life, 0.25f, 0.45f });
+    }
+
+    bool UpdateBurningChunks(float dt) {
+        if (burningChunks.empty()) return false;
+        std::vector<uint32_t> spread;
+        std::vector<XMFLOAT3> damagePoints;
+        std::unordered_set<uint32_t> alreadyBurning;
+        for (const BurningChunk& burning : burningChunks)
+            alreadyBurning.insert(burning.chunkIndex);
+
+        for (BurningChunk& burning : burningChunks) {
+            burning.life -= dt;
+            burning.spreadCooldown -= dt;
+            burning.damageCooldown -= dt;
+            XMFLOAT3 source;
+            if (burning.life <= 0.0f ||
+                !ChunkWorldPosition(burning.chunkIndex, source)) continue;
+
+            if (burning.damageCooldown <= 0.0f) {
+                burning.damageCooldown = 0.85f;
+                if (damagePoints.size() < 3) damagePoints.push_back(source);
+            }
+            if (burning.spreadCooldown > 0.0f || spread.size() >= 4) continue;
+            burning.spreadCooldown = 0.55f;
+
+            // World-space lookup makes fire carried by moving debris ignite any
+            // destructible piece it passes, including pieces from other buildings.
+            float closestDistanceSquared = 1.75f * 1.75f;
+            uint32_t closest = InvalidIndex;
+            for (uint32_t candidate = 0;
+                 candidate < static_cast<uint32_t>(chunks.size()); ++candidate) {
+                if (candidate == burning.chunkIndex ||
+                    alreadyBurning.count(candidate) != 0) continue;
+                XMFLOAT3 candidatePosition;
+                if (!ChunkWorldPosition(candidate, candidatePosition)) continue;
+                const float dx = candidatePosition.x - source.x;
+                const float dy = candidatePosition.y - source.y;
+                const float dz = candidatePosition.z - source.z;
+                const float distanceSquared = dx * dx + dy * dy + dz * dz;
+                if (distanceSquared >= closestDistanceSquared) continue;
+                closestDistanceSquared = distanceSquared;
+                closest = candidate;
+            }
+            if (closest != InvalidIndex) {
+                spread.push_back(closest);
+                alreadyBurning.insert(closest);
+            }
+        }
+        for (uint32_t chunkIndex : spread) IgniteChunk(chunkIndex, 3.0f);
+        burningChunks.erase(
+            std::remove_if(burningChunks.begin(), burningChunks.end(),
+                [this](const BurningChunk& burning) {
+                    XMFLOAT3 ignored;
+                    return burning.life <= 0.0f ||
+                        !ChunkWorldPosition(burning.chunkIndex, ignored);
+                }),
+            burningChunks.end());
+
+        bool broke = false;
+        for (const XMFLOAT3& point : damagePoints) {
+            if (!BreakNearestCell(point, true)) continue;
+            MarkStructureDirty(lastBrokenStructure);
+            broke = true;
+        }
+        return broke;
     }
 
     void MarkStructureDirty(uint32_t structureId, float delay = 0.15f) {
@@ -2403,6 +2508,7 @@ void DestructionDX12::Shutdown() {
     m->chunks.clear(); m->renderItems.clear(); m->renderBatches.clear();
     m->batchCache.clear(); m->spatialBatchCache.clear(); m->ragdollParts.clear();
     m->barrelBodies.clear(); m->barrelImpactEvents.clear(); m->vortices.clear();
+    m->burningChunks.clear();
     for (auto& retired : m->retiredBatchNodes) retired.clear();
     m->authoredRagdolls.clear();
     m->ragdollRenderItems.clear(); m->initialized = false;
@@ -2559,6 +2665,7 @@ void DestructionDX12::Update(float dt) {
     const bool batchCompleted = m->PollBatchBuild();
     const bool spatialBatchCompleted = m->PollSpatialBatchBuild();
     const bool structuralBroke = m->UpdateStructuralSolver(dt);
+    const bool fireBroke = m->UpdateBurningChunks(dt);
     const bool heavyDestructionScene = m->actors.size() > 512;
     const float maintenanceStep = 1.0f / 30.0f;
     bool maintenanceDue = true;
@@ -2722,14 +2829,14 @@ void DestructionDX12::Update(float dt) {
     // one final rebuild the render items would be frozen at wherever the debris was
     // a frame before it came to rest.
     const bool motionStateChanged = physicsStepped || sleepStateChanged ||
-        anyImpactBroke || structuralBroke || debrisBudgetChanged;
+        anyImpactBroke || structuralBroke || fireBroke || debrisBudgetChanged;
     const bool moving = motionStateChanged
         ? m->AnythingMoving() : !m->rebuiltWhileStill;
     const bool movingGeometryChanged = physicsStepped && moving;
     const bool finalSettleRebuild = motionStateChanged && !moving &&
         !m->rebuiltWhileStill;
     if (movingGeometryChanged || finalSettleRebuild || anyImpactBroke ||
-        structuralBroke || debrisBudgetChanged ||
+        structuralBroke || fireBroke || debrisBudgetChanged ||
         batchCompleted || spatialBatchCompleted) {
         const auto rebuildBegin = std::chrono::steady_clock::now();
         m->RebuildRenderItems();
@@ -3003,13 +3110,13 @@ void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float rad
     if (m->lastRagdollHit >= 0) return;
     m->lastDamagePosition = worldPosition;
     m->lastDamageRadius = radius;
-    // Bullets chip a cell first, then the second hit severs it. Physics impacts
-    // and explosions still break immediately through their separate paths.
-    (void)damage;
+    // Ordinary bullets chip a cell first, then a second hit severs it. High-energy
+    // rounds (sniper and laser) cut the nearest cell immediately.
     Impl::ActorRuntime* hitActor = nullptr;
     uint32_t hitChunk = InvalidIndex;
     if (!m->FindNearestBreakableCell(worldPosition, hitActor, hitChunk)) return;
-    if (m->bulletWeakenedChunks.insert(hitChunk).second) {
+    const bool highEnergy = damage >= 2.0f;
+    if (!highEnergy && m->bulletWeakenedChunks.insert(hitChunk).second) {
         std::cout << "Blast hit: chunk weakened\n";
         return;
     }
@@ -3105,6 +3212,61 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
         b3Body_ApplyLinearImpulse(runtime->body, { v.x, v.y, v.z }, { (float)bp.x, (float)bp.y, (float)bp.z }, true);
     }
     std::cout << "Grenade: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
+}
+
+void DestructionDX12::DestroyChunkAt(const XMFLOAT3& worldPosition, float radius) {
+    if (!m->initialized || m->lastRagdollHit >= 0) return;
+    m->lastDamagePosition = worldPosition;
+    m->lastDamageRadius = radius;
+
+    Impl::ActorRuntime* hitActor = nullptr;
+    uint32_t hitChunk = InvalidIndex;
+    if (!m->FindNearestBreakableCell(
+            worldPosition, hitActor, hitChunk, true, true)) return;
+    m->bulletWeakenedChunks.erase(hitChunk);
+    const uint32_t structureId = m->chunks[hitChunk].structureId;
+
+    if (hitActor->chunks.size() == 1) {
+        const auto runtime = std::find_if(
+            m->actors.begin(), m->actors.end(),
+            [hitActor](const std::unique_ptr<Impl::ActorRuntime>& value) {
+                return value.get() == hitActor;
+            });
+        if (runtime == m->actors.end()) return;
+        if (!B3_IS_NULL((*runtime)->body)) b3DestroyBody((*runtime)->body);
+        if ((*runtime)->actor) {
+            (*runtime)->actor->removeFromGroup();
+            (*runtime)->actor->release();
+        }
+        m->actors.erase(runtime);
+    } else {
+        m->BreakNearestCell(worldPosition, true);
+    }
+    m->MarkStructureDirty(structureId);
+    m->RebuildRenderItems();
+}
+
+void DestructionDX12::IgniteChunkAt(const XMFLOAT3& worldPosition) {
+    if (!m->initialized || m->lastRagdollHit >= 0) return;
+    Impl::ActorRuntime* actor = nullptr;
+    uint32_t chunkIndex = InvalidIndex;
+    if (!m->FindNearestBreakableCell(
+            worldPosition, actor, chunkIndex, true, true)) return;
+    m->IgniteChunk(chunkIndex);
+}
+
+std::vector<DestructionBurningPoint>
+DestructionDX12::GetBurningChunkPoints() const {
+    std::vector<DestructionBurningPoint> points;
+    if (!m || !m->initialized) return points;
+    points.reserve(m->burningChunks.size());
+    for (const Impl::BurningChunk& burning : m->burningChunks) {
+        XMFLOAT3 position;
+        if (!m->ChunkWorldPosition(burning.chunkIndex, position)) continue;
+        const float fade = (std::min)(1.0f, burning.life / 0.75f);
+        points.push_back({ position, 1.55f, fade });
+    }
+    return points;
 }
 
 void DestructionDX12::StartVortex(const XMFLOAT3& worldPosition, float radius,

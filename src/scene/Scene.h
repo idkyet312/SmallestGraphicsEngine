@@ -48,11 +48,26 @@ struct Projectile {
     bool     molotov = false;
     bool     vortex = false;
     bool     rocket = false;
+    bool     laser = false;
+    bool     remoteCharge = false;
+    bool     flame = false;
     float    damageMultiplier = 1.0f;
     XMFLOAT3 velocity = { 0, 0, 0 };   // grenades integrate velocity + gravity
     float    fuse = 0.0f;              // seconds until it explodes
     bool     detonate = false;         // set the frame it should explode
     float    fxCooldown = 0.0f;
+};
+
+struct LaserBeamFX {
+    XMFLOAT3 start = {};
+    XMFLOAT3 end = {};
+    float life = 0.0f;
+    float maxLife = 0.085f;
+};
+
+struct RemoteCharge {
+    XMFLOAT3 position = {};
+    XMFLOAT3 normal = { 0.0f, 1.0f, 0.0f };
 };
 
 struct FirePatch {
@@ -223,6 +238,8 @@ struct Scene {
     // Gun & projectiles
     GunViewModel gun;
     std::vector<Projectile> projectiles;
+    LaserBeamFX laserBeam;
+    std::vector<RemoteCharge> remoteCharges;
     std::vector<ImpactParticle> impactParticles;  // impact smoke puffs
     std::vector<ExplosionFX> explosionFX;         // animated explosion flipbooks
     std::vector<VortexFX> vortexFX;               // active debris-orbit fields
@@ -242,6 +259,8 @@ struct Scene {
     float fireCooldown       = 0.0f;    // time left before next shot may fire
     float muzzleFlashTime    = 0.0f;    // short enough to read as one-frame light
     float muzzleFlashDuration = 0.055f;
+    float flamethrowerAudioTime = 0.0f;
+    bool c4DetonateHeld = false;
     float gunRecoilBack      = 0.0f;    // viewmodel translation, local metres
     float gunRecoilKick      = 0.0f;    // viewmodel pitch, degrees
     float recoilPitch        = 0.55f;   // camera climb per shot, degrees
@@ -439,6 +458,10 @@ struct Scene {
 
     void ResetLevelRuntimeState() {
         projectiles.clear();
+        laserBeam.life = 0.0f;
+        remoteCharges.clear();
+        flamethrowerAudioTime = 0.0f;
+        c4DetonateHeld = false;
         impactParticles.clear();
         explosionFX.clear();
         vortexFX.clear();
@@ -559,7 +582,14 @@ struct Scene {
         for (auto& p : projectiles) {
             if (!p.active) continue;
             p.previousPosition = p.position;
-            if (p.grenade) {
+            if (p.remoteCharge) {
+                p.velocity.y += -9.81f * dt;
+                p.position.x += p.velocity.x * dt;
+                p.position.y += p.velocity.y * dt;
+                p.position.z += p.velocity.z * dt;
+                p.lifetime -= dt;
+                if (p.lifetime <= 0.0f) p.active = false;
+            } else if (p.grenade) {
                 // Frag grenades bounce until fuse expiry. Molotov and vortex
                 // grenades trigger immediately on first ground contact.
                 p.velocity.y += -9.81f * grenadeGravityScale * dt;
@@ -637,6 +667,9 @@ struct Scene {
             std::remove_if(projectiles.begin(), projectiles.end(),
                 [](const Projectile& p) { return !p.active && !p.detonate; }),
             projectiles.end());
+        laserBeam.life = (std::max)(0.0f, laserBeam.life - dt);
+        flamethrowerAudioTime = (std::max)(
+            0.0f, flamethrowerAudioTime - dt);
 
         // Impact particles: sparks/blood fall; smoke rises and expands.
         for (auto& ip : impactParticles) {
@@ -977,6 +1010,98 @@ struct Scene {
         p.lifetime  = projectileLifetime;
         p.active    = true;
         projectiles.push_back(p);
+    }
+
+    void ShootLaserProjectile() {
+        gunRecoilBack = (std::min)(0.055f, gunRecoilBack + 0.012f);
+        gunRecoilKick = (std::min)(2.0f, gunRecoilKick + 0.18f);
+
+        Projectile p = {};
+        p.position = p.previousPosition = GetMuzzleWorldPosition();
+        p.direction = camera.Front;
+        p.speed = 1800.0f;
+        p.lifetime = 0.075f;
+        p.active = true;
+        p.laser = true;
+        p.damageMultiplier = 6.0f;
+        projectiles.push_back(p);
+
+        laserBeam.start = p.position;
+        laserBeam.end = {
+            p.position.x + p.direction.x * 135.0f,
+            p.position.y + p.direction.y * 135.0f,
+            p.position.z + p.direction.z * 135.0f };
+        laserBeam.life = laserBeam.maxLife;
+    }
+
+    void StopLaserBeamAt(const XMFLOAT3& hit) {
+        laserBeam.end = hit;
+        laserBeam.life = laserBeam.maxLife;
+    }
+
+    void ThrowRemoteCharge() {
+        Projectile p = {};
+        p.position = p.previousPosition = GetMuzzleWorldPosition();
+        p.direction = camera.Front;
+        p.velocity = {
+            camera.Front.x * 18.0f,
+            camera.Front.y * 18.0f + 2.2f,
+            camera.Front.z * 18.0f };
+        p.lifetime = 4.0f;
+        p.active = true;
+        p.remoteCharge = true;
+        projectiles.push_back(p);
+        gunRecoilBack = (std::min)(0.08f, gunRecoilBack + 0.035f);
+    }
+
+    void StickRemoteCharge(const XMFLOAT3& position, const XMFLOAT3& normal) {
+        if (remoteCharges.size() >= 12) remoteCharges.erase(remoteCharges.begin());
+        RemoteCharge charge;
+        charge.position = {
+            position.x + normal.x * 0.035f,
+            position.y + normal.y * 0.035f,
+            position.z + normal.z * 0.035f };
+        charge.normal = normal;
+        remoteCharges.push_back(charge);
+    }
+
+    void DetonateRemoteCharges() {
+        for (const RemoteCharge& charge : remoteCharges) {
+            Projectile blast = {};
+            blast.position = blast.previousPosition = charge.position;
+            blast.grenade = true;
+            blast.remoteCharge = true;
+            blast.detonate = true;
+            blast.active = false;
+            projectiles.push_back(blast);
+        }
+        remoteCharges.clear();
+    }
+
+    void ShootFlameBurst() {
+        const XMFLOAT3 muzzle = GetMuzzleWorldPosition();
+        const XMVECTOR forward = XMLoadFloat3(&camera.Front);
+        const XMVECTOR up = XMLoadFloat3(&camera.Up);
+        const XMVECTOR right = XMVector3Normalize(XMVector3Cross(up, forward));
+        for (int flameIndex = 0; flameIndex < 2; ++flameIndex) {
+            const float jitterX = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) * 0.045f;
+            const float jitterY = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) * 0.035f;
+            const XMVECTOR direction = XMVector3Normalize(
+                forward + right * jitterX + up * jitterY);
+            Projectile p = {};
+            p.position = p.previousPosition = muzzle;
+            XMStoreFloat3(&p.direction, direction);
+            p.speed = 24.0f + ((float)std::rand() / RAND_MAX) * 5.0f;
+            p.lifetime = 0.55f;
+            p.active = true;
+            p.flame = true;
+            p.damageMultiplier = 0.18f;
+            projectiles.push_back(p);
+        }
+        if (flamethrowerAudioTime <= 0.0f && fireIgnitionAudioCallback)
+            fireIgnitionAudioCallback(muzzle);
+        flamethrowerAudioTime = 0.14f;
+        gunRecoilBack = (std::min)(0.045f, gunRecoilBack + 0.006f);
     }
 
     void ThrowGrenade() {

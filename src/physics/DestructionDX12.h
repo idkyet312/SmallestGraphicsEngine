@@ -43,6 +43,12 @@ struct TinyDebrisParticle {
     float size = 0.08f;
 };
 
+struct DestructionBurningPoint {
+    DirectX::XMFLOAT3 position = {};
+    float size = 1.4f;
+    float intensity = 1.0f;
+};
+
 struct DestructionCollisionSoundEvent {
     DirectX::XMFLOAT3 position = {};
     float approachSpeed = 0.0f;
@@ -167,6 +173,13 @@ public:
                         DirectX::XMFLOAT3& hitPosition) const;
     void ApplyRadialDamage(const DirectX::XMFLOAT3& worldPosition,
                            float radius, float damage = 2.0f);
+    // Laser-only hard cut: immediately severs the exact impacted chunk. Support
+    // cells and already-detached single chunks do not resist this path.
+    void DestroyChunkAt(const DirectX::XMFLOAT3& worldPosition, float radius);
+    // Attaches persistent fire to the impacted Blast chunk. Attachment follows
+    // that chunk through actor splits and physics motion.
+    void IgniteChunkAt(const DirectX::XMFLOAT3& worldPosition);
+    std::vector<DestructionBurningPoint> GetBurningChunkPoints() const;
     // Grenade-style explosion: breaks every piece whose centre is within radius
     // of the blast (a whole sphere of the building), then shoves the freed
     // fragments radially outward from the blast centre.

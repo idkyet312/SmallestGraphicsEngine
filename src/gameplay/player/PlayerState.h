@@ -11,12 +11,12 @@ struct PlayerState {
     float regenRate = 12.0f;
     float regenTimer = 0.0f;
 
-    static constexpr int kWeaponSlots = 4;
-    int magazineSize[kWeaponSlots] = { 30, 8, 1, 10 };
-    int maxReserve[kWeaponSlots] = { 240, 64, 8, 80 };
-    float reloadTime[kWeaponSlots] = { 1.55f, 2.4f, 2.8f, 1.75f };
-    int magazine[kWeaponSlots] = { 30, 8, 1, 10 };
-    int reserve[kWeaponSlots] = { 120, 32, 4, 40 };
+    static constexpr int kWeaponSlots = 7;
+    int magazineSize[kWeaponSlots] = { 30, 8, 1, 10, 120, 6, 100 };
+    int maxReserve[kWeaponSlots] = { 240, 64, 8, 80, 600, 24, 500 };
+    float reloadTime[kWeaponSlots] = { 1.55f, 2.4f, 2.8f, 1.75f, 2.1f, 1.8f, 2.6f };
+    int magazine[kWeaponSlots] = { 30, 8, 1, 10, 120, 6, 100 };
+    int reserve[kWeaponSlots] = { 120, 32, 4, 40, 360, 12, 300 };
     float reloadTimer = 0.0f;
     int reloadingSlot = -1;
 

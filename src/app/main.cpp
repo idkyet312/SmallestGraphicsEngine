@@ -1384,7 +1384,10 @@ static bool SpawnBoatTurretGunner() {
 // and shotgun drop below unity, the AK sits near it, the SVD just above.
 static void PlayReloadSound() {
     float pitch = 1.0f;
-    if (GunModel::RPGSelected())           pitch = 0.72f;
+    if (GunModel::FlamethrowerSelected())  pitch = 0.74f;
+    else if (GunModel::C4Selected())       pitch = 1.18f;
+    else if (GunModel::LaserSelected())    pitch = 1.28f;
+    else if (GunModel::RPGSelected())      pitch = 0.72f;
     else if (GunModel::ShotgunSelected())  pitch = 0.85f;
     else if (GunModel::SVDSelected())      pitch = 1.06f;
     pitch += ((float)std::rand() / RAND_MAX) * 0.05f;
@@ -1404,7 +1407,16 @@ static bool ShootPlayerWeapon() {
         if (scene.BeginReload(slot)) PlayReloadSound();
         return false;
     }
-    if (GunModel::SVDSelected()) {
+    if (GunModel::C4Selected()) {
+        scene.ThrowRemoteCharge();
+        g_reloadAudio.Play(0.38f, 1.24f);
+    } else if (GunModel::FlamethrowerSelected()) {
+        scene.ShootFlameBurst();
+    } else if (GunModel::LaserSelected()) {
+        scene.ShootLaserProjectile();
+        const float pitch = 1.65f + ((float)std::rand() / RAND_MAX) * 0.10f;
+        g_gunAudio.Play(0.30f, pitch);
+    } else if (GunModel::SVDSelected()) {
         scene.ShootSniperProjectile();
         const float pitch = 0.70f + ((float)std::rand() / RAND_MAX) * 0.04f;
         g_gunAudio.Play(1.0f, pitch);
@@ -1425,6 +1437,9 @@ static bool ShootPlayerWeapon() {
 }
 
 static float PlayerFireInterval() {
+    if (GunModel::C4Selected()) return 0.48f;
+    if (GunModel::FlamethrowerSelected()) return 0.075f;
+    if (GunModel::LaserSelected()) return 0.055f;
     if (GunModel::SVDSelected()) return 1.05f;
     if (GunModel::RPGSelected()) return 1.7f;
     return GunModel::ShotgunSelected() ? 0.8f : scene.fireInterval;
@@ -2109,6 +2124,7 @@ static void UpdateMolotovFireDamage() {
                 g_destruction.ApplyRadialDamage(
                     materialHit, reach + 0.35f,
                     scene.molotovMaterialDamagePerSecond * tickSeconds);
+                g_destruction.IgniteChunkAt(materialHit);
                 fire.structureDamageCooldown = 1.25f;
             }
             g_trees.IgniteNear(fire.position, reach + 0.8f);
@@ -2161,6 +2177,9 @@ void BanditDebugText() {
                 LiveBanditCount(), g_bandits.size(),
                 g_banditModel.skeleton.BoneCount(), parts, textured);
     ImGui::Text("Weapon: %s  (mouse wheel)", GunModel::SelectedWeaponName());
+    if (GunModel::C4Selected())
+        ImGui::Text("C4: LMB throw | RMB detonate | armed=%zu",
+                    scene.remoteCharges.size());
     ImGui::SliderFloat("Left arm reach", &g_banditLeftArmReach,
                        0.20f, 0.85f, "%.2f m");
     ImGui::SliderFloat("Head/torso yaw offset",
@@ -4149,6 +4168,8 @@ static void UpdateFireLoopAudio() {
         if (barrel.active && barrel.burning) addFire(barrel.position, 0.85f);
     for (const BurningTargetFX& target : scene.burningTargets)
         addFire(target.position, 0.35f * target.intensity);
+    if (scene.flamethrowerAudioTime > 0.0f)
+        audibility += 2.2f;
 
     const float volume = 0.62f * (1.0f - std::exp(-0.80f * audibility));
     g_fireLoopAudio.SetLoop(volume > 0.01f, volume, 0.98f);
@@ -6541,11 +6562,21 @@ static void ProcessInput(HWND) {
     // Right mouse aims. The SVD goes to its scope overlay; every other weapon
     // raises iron sights instead, so the button means the same thing in the
     // player's hands regardless of what they are holding.
+    const bool rightMouseHeld =
+        (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    const bool c4DetonateRequested = IsGameplayScreen() &&
+        scene.player.health > 0.0f && !g_drivingHumvee &&
+        !cameraLocked && !ImGui::GetIO().WantCaptureMouse &&
+        GunModel::C4Selected() && rightMouseHeld;
+    if (c4DetonateRequested && !scene.c4DetonateHeld)
+        scene.DetonateRemoteCharges();
+    scene.c4DetonateHeld = c4DetonateRequested;
+
     const bool aimRequested = IsGameplayScreen() &&
         scene.player.health > 0.0f &&
         !g_drivingHumvee && !cameraLocked &&
         !(showUI && ImGui::GetIO().WantCaptureMouse) &&
-        (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        !GunModel::C4Selected() && rightMouseHeld;
     const bool scopeRequested = aimRequested && GunModel::SVDSelected();
     scene.UpdateSniperScope(scopeRequested, deltaTime);
     scene.UpdateAimDownSights(aimRequested && !scopeRequested, deltaTime);
@@ -8009,6 +8040,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 while (g_game.physicsClock.Consume(physicsStep))
                     g_destruction.Update(physicsStep);
             }
+            for (const DestructionBurningPoint& fire :
+                 g_destruction.GetBurningChunkPoints()) {
+                if (scene.burningTargets.size() >= 72) break;
+                scene.burningTargets.push_back({
+                    fire.position, fire.size, fire.intensity, now });
+            }
             if (!g_emptyLevelMode) {
                 UpdateHumveeImpacts(deltaTime);
                 UpdateHumveeChaseCamera(deltaTime);
@@ -8191,6 +8228,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     // Grenades use fuse; rockets detonate on first solid impact.
                     if (projectile.detonate) {
                         const XMFLOAT3 center = projectile.position;
+                        const bool c4Blast = projectile.remoteCharge;
+                        const float blastRadius = c4Blast
+                            ? 5.4f : scene.grenadeBlastRadius;
+                        const float enemyRadius = c4Blast
+                            ? 8.5f : scene.grenadeEnemyRadius;
+                        const float enemyDamage = c4Blast
+                            ? 650.0f : scene.grenadeEnemyDamage;
+                        const float enemyPush = c4Blast
+                            ? 14.0f : scene.grenadeEnemyPush;
+                        const float blastDamage = c4Blast
+                            ? 1000000.0f : scene.grenadeDamage;
+                        const float blastImpulse = c4Blast
+                            ? 230.0f : scene.grenadeImpulse;
                         if (projectile.molotov) {
                             scene.SpawnMolotovFire(center);
                             if (!g_emptyLevelMode) {
@@ -8255,7 +8305,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             AddExplosionTerrainCrater(center);
                         scene.SpawnExplosionFX(
                             { center.x, center.y + 0.6f, center.z },
-                            scene.grenadeBlastRadius * 1.6f, 0.9f,
+                            blastRadius * 1.6f, c4Blast ? 1.05f : 0.9f,
                             projectile.grenade);
                         if (!g_emptyLevelMode)
                         for (size_t i = 0; i < scene.explosiveBarrels.size(); ++i) {
@@ -8265,15 +8315,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             const float dy = barrel.position.y - center.y;
                             const float dz = barrel.position.z - center.z;
                             if (dx*dx + dy*dy + dz*dz <=
-                                scene.grenadeBlastRadius * scene.grenadeBlastRadius)
+                                blastRadius * blastRadius)
                                 DetonateBarrel(i);
                         }
                         if (g_banditLoaded) {
                             for (auto& bandit : g_bandits) {
                                 if (bandit) bandit->ApplyExplosion(
-                                    center, scene.grenadeEnemyRadius,
-                                    scene.grenadeEnemyDamage,
-                                    scene.grenadeEnemyPush);
+                                    center, enemyRadius,
+                                    enemyDamage, enemyPush);
                             }
                             PlayBanditDeathEvents();
                         }
@@ -8282,12 +8331,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             const float dy = g_helicopterPosition.y - center.y;
                             const float dz = g_helicopterPosition.z - center.z;
                             const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
-                            const float reach = scene.grenadeEnemyRadius + 5.0f;
+                            const float reach = enemyRadius + 5.0f;
                             if (distance < reach) {
                                 const float falloff = 1.0f - distance / reach;
                                 DamageHelicopter(
                                     projectile.rocket ? kRocketHelicopterDamage
-                                                      : scene.grenadeEnemyDamage * falloff,
+                                                      : enemyDamage * falloff,
                                     g_helicopterPosition);
                             }
                         }
@@ -8297,12 +8346,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             const float dy = g_secondaryHelicopterPosition.y - center.y;
                             const float dz = g_secondaryHelicopterPosition.z - center.z;
                             const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
-                            const float reach = scene.grenadeEnemyRadius + 5.0f;
+                            const float reach = enemyRadius + 5.0f;
                             if (distance < reach) {
                                 const float falloff = 1.0f - distance / reach;
                                 DamageSecondaryHelicopter(
                                     projectile.rocket ? kRocketHelicopterDamage
-                                                      : scene.grenadeEnemyDamage * falloff,
+                                                      : enemyDamage * falloff,
                                     g_secondaryHelicopterPosition);
                             }
                         }
@@ -8311,12 +8360,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             const float dy = g_boatPosition.y - center.y;
                             const float dz = g_boatPosition.z - center.z;
                             const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
-                            const float reach = scene.grenadeEnemyRadius + 5.0f;
+                            const float reach = enemyRadius + 5.0f;
                             if (distance < reach) {
                                 const float falloff = 1.0f - distance / reach;
                                 DamageBoat(
                                     projectile.rocket ? kRocketHelicopterDamage
-                                                      : scene.grenadeEnemyDamage * falloff,
+                                                      : enemyDamage * falloff,
                                     g_boatPosition);
                             }
                         }
@@ -8331,36 +8380,93 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             const float ez = scene.camera.Position.z - center.z;
                             const float playerRange =
                                 std::sqrt(ex * ex + ey * ey + ez * ez);
-                            const float reach = scene.grenadeEnemyRadius;
+                            const float reach = enemyRadius;
                             if (playerRange < reach) {
                                 const float falloff = 1.0f - playerRange / reach;
                                 scene.DamagePlayer(
-                                    scene.grenadePlayerDamage * falloff);
+                                    (c4Blast ? 100.0f
+                                             : scene.grenadePlayerDamage) * falloff);
                             }
                         }
                         // Run after Bandit damage. Newly killed enemies have
                         // ragdolls now, so same blast launches their limbs too.
-                        g_destruction.ApplyExplosion(center, scene.grenadeBlastRadius,
-                                                     scene.grenadeDamage, scene.grenadeImpulse);
+                        g_destruction.ApplyExplosion(
+                            center, blastRadius, blastDamage, blastImpulse);
                         g_destruction.ApplyRagdollExplosion(
-                            center, scene.grenadeEnemyRadius,
-                            scene.grenadeEnemyImpulse);
-                        DamagePrefabsInRadius(center, scene.grenadeBlastRadius,
-                            scene.grenadeDamage);
+                            center, enemyRadius,
+                            c4Blast ? 175.0f : scene.grenadeEnemyImpulse);
+                        DamagePrefabsInRadius(
+                            center, blastRadius, blastDamage);
                         projectile.active = false;
                         projectile.detonate = false;
                     }
                     continue;
                 }
                 if (!projectile.active) continue;
+
+                if (projectile.remoteCharge) {
+                    constexpr float chargeRadius = 0.16f;
+                    XMFLOAT3 chargeHit = projectile.position;
+                    bool stuck = false;
+                    uint64_t ignoredEntity = 0;
+                    size_t ignoredBarrel = 0;
+                    if (g_destruction.HitTestSegment(
+                            projectile.previousPosition, projectile.position,
+                            chargeRadius, chargeHit)) {
+                        stuck = true;
+                    } else if (HitPrefabColliderSegment(
+                            projectile.previousPosition, projectile.position,
+                            chargeRadius, chargeHit, &ignoredEntity)) {
+                        stuck = true;
+                    } else if (HitHelicopterSegment(
+                            projectile.previousPosition, projectile.position,
+                            chargeRadius, chargeHit) ||
+                               HitSecondaryHelicopterSegment(
+                            projectile.previousPosition, projectile.position,
+                            chargeRadius, chargeHit) ||
+                               HitBoatSegment(
+                            projectile.previousPosition, projectile.position,
+                            chargeRadius, chargeHit) ||
+                               HitExplosiveBarrelSegment(
+                            projectile.previousPosition, projectile.position,
+                            chargeRadius, ignoredBarrel, chargeHit)) {
+                        stuck = true;
+                    } else if (!g_emptyLevelMode && g_trees.BlocksSegment(
+                            projectile.previousPosition, projectile.position,
+                            chargeRadius)) {
+                        chargeHit = projectile.position;
+                        stuck = true;
+                    } else if (HitTerrainSegment(
+                            projectile.previousPosition, projectile.position,
+                            chargeRadius, chargeHit)) {
+                        stuck = true;
+                    } else if (!scene.useMeshTerrain &&
+                               projectile.position.y <= scene.grenadeGroundY) {
+                        chargeHit.y = scene.grenadeGroundY;
+                        stuck = true;
+                    }
+                    if (stuck) {
+                        const XMFLOAT3 normal{
+                            -projectile.direction.x,
+                            -projectile.direction.y,
+                            -projectile.direction.z };
+                        scene.StickRemoteCharge(chargeHit, normal);
+                        projectile.active = false;
+                    }
+                    continue;
+                }
+
                 XMFLOAT3 hit;
                 // Collision uses the bullet's own small radius so it must
                 // actually reach the surface before it registers -- the wider
                 // damage radius only governs how far the fracture spreads once
                 // the bullet has struck. Otherwise the wall breaks at a distance.
-                const float bulletRadius = std::max(0.12f, scene.projectileScale * 0.5f);
+                const float bulletRadius = projectile.flame
+                    ? 0.24f
+                    : std::max(0.12f, scene.projectileScale * 0.5f);
                 bool hitBandit = false;
                 bool killedBandit = false;
+                SkinnedEnemy* hitBanditActor = nullptr;
                 XMFLOAT3 banditHit = projectile.position;
                 // Player shots damage any enemy. Hostile shots damage only the
                 // enemy currently used as a human shield, never squadmates.
@@ -8372,6 +8478,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                 projectile.direction, bulletRadius, &banditHit, nullptr,
                                 20.0f * projectile.damageMultiplier)) {
                             hitBandit = true;
+                            hitBanditActor = bandit.get();
                             killedBandit = bandit->Dead();
                             if (killedBandit && bandit.get() == g_heldBandit)
                                 g_heldBandit = nullptr;
@@ -8380,6 +8487,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     }
                 }
                 if (hitBandit) {
+                    if (projectile.laser)
+                        scene.StopLaserBeamAt(banditHit);
+                    if ((projectile.laser || projectile.flame) &&
+                        hitBanditActor && !hitBanditActor->Dead())
+                        hitBanditActor->Ignite(6.5f);
                     const XMFLOAT3 normal(-projectile.direction.x, -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBloodBurst(banditHit, normal);
@@ -8422,6 +8534,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(helicopterHit, normal);
                     DamageHelicopter(34.0f * projectile.damageMultiplier, helicopterHit);
+                    if (projectile.laser) scene.StopLaserBeamAt(helicopterHit);
                     projectile.active = false;
                     continue;
                 }
@@ -8434,6 +8547,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     scene.SpawnBulletImpact(helicopterHit, normal);
                     DamageSecondaryHelicopter(
                         34.0f * projectile.damageMultiplier, helicopterHit);
+                    if (projectile.laser) scene.StopLaserBeamAt(helicopterHit);
                     projectile.active = false;
                     continue;
                 }
@@ -8446,6 +8560,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(boatHit, normal);
                     DamageBoat(34.0f * projectile.damageMultiplier, boatHit);
+                    if (projectile.laser) scene.StopLaserBeamAt(boatHit);
                     projectile.active = false;
                     continue;
                 }
@@ -8460,6 +8575,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(barrelHit, normal);
+                    if (projectile.laser) scene.StopLaserBeamAt(barrelHit);
+                    if (projectile.flame && !barrel.burning) {
+                        barrel.burning = true;
+                        barrel.fuse = 3.0f;
+                        barrel.fireFxCooldown = 0.0f;
+                    }
                     if (barrel.hits >= 4) {
                         DetonateBarrel(barrelIndex);
                     } else if (barrel.hits == 2 && !barrel.burning) {
@@ -8479,6 +8600,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(hit, normal);
+                    if (projectile.laser) scene.StopLaserBeamAt(hit);
+                    if (projectile.laser || projectile.flame) {
+                        scene.IgniteMaterial(prefabEntityId, hit, 1.65f);
+                    }
                     DamagePrefabEntity(prefabEntityId,
                         34.0f * projectile.damageMultiplier, hit);
                     projectile.active = false;
@@ -8488,9 +8613,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                                  bulletRadius, hit)) {
                     std::cout << "Projectile hit wall at " << hit.x << ", "
                               << hit.y << ", " << hit.z << "\n";
-                    g_destruction.ApplyRadialDamage(
-                        hit, scene.destructionDamageRadius,
-                        scene.destructionDamage * projectile.damageMultiplier);
+                    if (projectile.flame)
+                        g_destruction.IgniteChunkAt(hit);
+                    if (projectile.laser) {
+                        g_destruction.DestroyChunkAt(
+                            hit, scene.destructionDamageRadius);
+                    } else {
+                        g_destruction.ApplyRadialDamage(
+                            hit, scene.destructionDamageRadius,
+                            scene.destructionDamage * projectile.damageMultiplier);
+                    }
                     g_destruction.ApplyImpulse(hit, projectile.direction,
                                                scene.destructionBulletImpulse *
                                                    projectile.damageMultiplier,
@@ -8503,6 +8635,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     // One small dust puff right at the hit; the bigger cloud
                     // comes from the actual fracture (DrainBreakPoints).
                     scene.SpawnSmokeBurst(hit, 0.3f, 0.1f);
+                    if (projectile.laser) {
+                        scene.StopLaserBeamAt(hit);
+                        scene.SpawnSmokeBurst(hit, 0.46f, 0.22f);
+                    } else if (projectile.flame) {
+                        scene.SpawnSmokeBurst(hit, 0.22f, 0.10f);
+                    }
                     projectile.active = false;
                 } else if (!g_emptyLevelMode && g_water.ShootFloaters(projectile.previousPosition,
                                                  projectile.position, projectile.direction,
@@ -8524,22 +8662,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(treeHit, normal);
                     scene.SpawnSmokeBurst(treeHit, 0.25f, 0.1f);
+                    if (projectile.laser) scene.StopLaserBeamAt(treeHit);
+                    if (projectile.laser || projectile.flame) {
+                        g_trees.IgniteNear(treeHit, 0.85f);
+                    }
                     projectile.active = false;
                 } else if (XMFLOAT3 waterHit;
                            !g_emptyLevelMode && g_water.ShootSurface(projectile.previousPosition,
                                                 projectile.position, waterHit)) {
                     projectile.position = waterHit;
+                    if (projectile.laser) scene.StopLaserBeamAt(waterHit);
                     projectile.active = false;
                 } else if (XMFLOAT3 oceanHit;
                            !g_emptyLevelMode && g_ocean.ShootSurface(projectile.previousPosition,
                                                 projectile.position, oceanHit, 0.28f)) {
                     projectile.position = oceanHit;
+                    if (projectile.laser) scene.StopLaserBeamAt(oceanHit);
                     projectile.active = false;
                 } else if (XMFLOAT3 terrainHit;
                            HitTerrainSegment(projectile.previousPosition,
                                              projectile.position,
                                              bulletRadius, terrainHit)) {
                     projectile.position = terrainHit;
+                    if (projectile.laser) scene.StopLaserBeamAt(terrainHit);
+                    if (projectile.flame) scene.SpawnCarriedFire(terrainHit);
                     projectile.active = false;
                 } else if (projectile.hostile) {
                     // Player is tested last. Any world or character mesh in

@@ -1528,6 +1528,74 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
     }
 
+    // Sustained laser beam. Two additive layers make a cyan heat halo around a
+    // white-hot core; depth testing keeps the beam clipped by its impact point.
+    if (scene.laserBeam.life > 0.0f) {
+        const XMVECTOR start = XMLoadFloat3(&scene.laserBeam.start);
+        const XMVECTOR end = XMLoadFloat3(&scene.laserBeam.end);
+        XMVECTOR fwd = end - start;
+        const float len = XMVectorGetX(XMVector3Length(fwd));
+        if (len > 0.01f) {
+            fwd = XMVector3Normalize(fwd);
+            const XMVECTOR up0 = fabsf(XMVectorGetY(fwd)) > 0.95f
+                ? XMVectorSet(1, 0, 0, 0) : XMVectorSet(0, 1, 0, 0);
+            const XMVECTOR right = XMVector3Normalize(XMVector3Cross(up0, fwd));
+            const XMVECTOR up = XMVector3Cross(fwd, right);
+            XMMATRIX basis = XMMatrixIdentity();
+            basis.r[0] = XMVectorSetW(right, 0.0f);
+            basis.r[1] = XMVectorSetW(up, 0.0f);
+            basis.r[2] = XMVectorSetW(fwd, 0.0f);
+            basis.r[3] = XMVectorSetW((start + end) * 0.5f, 1.0f);
+            const float fade = scene.laserBeam.life / scene.laserBeam.maxLife;
+
+            shader.UseAdditive();
+            model = XMMatrixScaling(0.075f, 0.075f, len) * basis;
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetEmissiveMaterial(XMFLOAT3(0.02f, 3.8f, 8.0f), 0.22f * fade);
+            DrawCube(geo);
+            shader.NextDrawCall();
+
+            model = XMMatrixScaling(0.018f, 0.018f, len * 0.997f) * basis;
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetEmissiveMaterial(XMFLOAT3(4.0f, 11.0f, 14.0f), 0.96f * fade);
+            DrawCube(geo);
+            shader.NextDrawCall();
+
+            model = XMMatrixScaling(0.16f, 0.16f, 0.16f) *
+                    XMMatrixTranslation(scene.laserBeam.end.x,
+                                        scene.laserBeam.end.y,
+                                        scene.laserBeam.end.z);
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetEmissiveMaterial(XMFLOAT3(1.5f, 7.0f, 11.0f), 0.72f * fade);
+            DrawSphere(geo);
+            shader.NextDrawCall();
+            shader.Use(scene.wireframeMode);
+        }
+    }
+
+    // Armed remote charges remain visible on their impact surfaces. Red status
+    // LED blinks until right-click detonation.
+    for (const RemoteCharge& charge : scene.remoteCharges) {
+        model = XMMatrixScaling(0.30f, 0.08f, 0.42f) *
+                XMMatrixTranslation(charge.position.x, charge.position.y,
+                                    charge.position.z);
+        shader.SetMatrices(model, view, proj, lightSpace);
+        shader.SetObjectMaterial(XMFLOAT3(0.055f, 0.065f, 0.045f), false, false,
+                                 0.82f, 0.18f, nullptr, nullptr, nullptr);
+        DrawCube(geo);
+        shader.NextDrawCall();
+
+        model = XMMatrixScaling(0.055f, 0.055f, 0.055f) *
+                XMMatrixTranslation(charge.position.x, charge.position.y + 0.07f,
+                                    charge.position.z);
+        shader.UseAdditive();
+        shader.SetMatrices(model, view, proj, lightSpace);
+        shader.SetEmissiveMaterial(XMFLOAT3(8.0f, 0.03f, 0.01f), 0.82f);
+        DrawCube(geo);
+        shader.NextDrawCall();
+        shader.Use(scene.wireframeMode);
+    }
+
     // Projectiles. Grenades: dark spheres. Bullets: bright tracer rounds -- a
     // thin streak stretched along the flight direction, glowing hot so it reads
     // like a real tracer whipping downrange.
@@ -1537,6 +1605,55 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     shader.Use(scene.wireframeMode);
     for (auto& p : scene.projectiles) {
         if (!p.active) continue;
+        if (p.laser) continue; // laser owns its full-length beam above
+        if (p.remoteCharge) {
+            model = XMMatrixScaling(0.24f, 0.10f, 0.34f) *
+                    XMMatrixTranslation(p.position.x, p.position.y, p.position.z);
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetObjectMaterial(XMFLOAT3(0.06f, 0.07f, 0.045f), false, false,
+                                     0.82f, 0.16f, nullptr, nullptr, nullptr);
+            DrawCube(geo);
+            shader.NextDrawCall();
+            continue;
+        }
+        if (p.flame) {
+            const float age = (std::max)(0.0f, 0.55f - p.lifetime);
+            const float size = 0.34f + age * 0.72f;
+            if (g_fireTexture) {
+                const XMMATRIX inverseViewRotation = XMMatrixTranspose(view);
+                const XMVECTOR cameraRight = XMVectorSetW(
+                    inverseViewRotation.r[0], 0.0f);
+                const XMVECTOR cameraUp = XMVectorSetW(
+                    inverseViewRotation.r[1], 0.0f);
+                const XMVECTOR cameraForward = XMVectorSetW(
+                    inverseViewRotation.r[2], 0.0f);
+                const XMVECTOR position = XMVectorSet(
+                    p.position.x, p.position.y, p.position.z, 1.0f);
+                model = XMMATRIX(
+                    cameraRight * size,
+                    cameraUp * (size * 1.35f),
+                    cameraForward * size,
+                    position);
+                shader.UseAdditive();
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetSmokeMaterial(
+                    XMFLOAT3(1.0f, 0.24f, 0.015f), 0.86f,
+                    g_fireTexture.Get());
+                DrawFireFrame(geo, static_cast<UINT>(age * 42.0f));
+                shader.NextDrawCall();
+            } else {
+                shader.UseAdditive();
+                model = XMMatrixScaling(size, size, size) *
+                        XMMatrixTranslation(p.position.x, p.position.y, p.position.z);
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetEmissiveMaterial(
+                    XMFLOAT3(8.0f, 1.25f, 0.025f), 0.68f);
+                DrawSphere(geo);
+                shader.NextDrawCall();
+            }
+            shader.Use(scene.wireframeMode);
+            continue;
+        }
         if (p.rocket) {
             XMVECTOR fwd = XMVector3Normalize(XMLoadFloat3(&p.direction));
             XMVECTOR up0 = fabsf(XMVectorGetY(fwd)) > 0.95f ? XMVectorSet(1, 0, 0, 0)
@@ -1703,9 +1820,97 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             if (ArmsModel::WeaponFollowTransform(handFollow, S))
                 xf = weaponPlacement * handFollow * gunBase;
             shader.Use(scene.wireframeMode);
-            DrawMeshAt(
-                GunModel::PlayerMesh(), shader, xf, view, proj, lightSpace);
+            if (!GunModel::C4Selected() && GunModel::PlayerMesh())
+                DrawMeshAt(
+                    GunModel::PlayerMesh(), shader, xf, view, proj, lightSpace);
             shader.Use(scene.wireframeMode);
+
+            if (GunModel::LaserSelected()) {
+                // Procedural emitter conversion around the rifle silhouette:
+                // power cell, focusing rails, and glowing chamber.
+                struct LaserPart { XMFLOAT3 center, size, color; bool emissive; };
+                const LaserPart laserParts[] = {
+                    {{ 0.00f,  0.065f, 0.34f}, {0.13f, 0.10f, 0.48f},
+                     {0.035f, 0.055f, 0.07f}, false},
+                    {{-0.085f, 0.060f, 0.54f}, {0.025f, 0.025f, 0.48f},
+                     {0.02f, 2.8f, 6.5f}, true},
+                    {{ 0.085f, 0.060f, 0.54f}, {0.025f, 0.025f, 0.48f},
+                     {0.02f, 2.8f, 6.5f}, true},
+                    {{ 0.00f,  0.070f, 0.82f}, {0.105f, 0.105f, 0.09f},
+                     {0.3f, 7.0f, 11.0f}, true},
+                    {{ 0.00f, -0.135f, 0.08f}, {0.10f, 0.20f, 0.12f},
+                     {0.02f, 1.6f, 3.4f}, true},
+                };
+                for (const LaserPart& part : laserParts) {
+                    model = XMMatrixScaling(part.size.x, part.size.y, part.size.z) *
+                            XMMatrixTranslation(part.center.x, part.center.y,
+                                                part.center.z) * xf;
+                    shader.SetMatrices(model, view, proj, lightSpace);
+                    if (part.emissive) {
+                        shader.UseAdditive();
+                        shader.SetEmissiveMaterial(part.color, 0.84f);
+                    } else {
+                        shader.Use(scene.wireframeMode);
+                        shader.SetObjectMaterial(part.color, false, false,
+                                                 0.38f, 0.88f,
+                                                 nullptr, nullptr, nullptr);
+                    }
+                    DrawCube(geo);
+                    shader.NextDrawCall();
+                }
+                shader.Use(scene.wireframeMode);
+            }
+
+            if (GunModel::C4Selected()) {
+                const XMFLOAT3 c4Body(0.055f, 0.070f, 0.040f);
+                model = XMMatrixScaling(0.34f, 0.18f, 0.46f) *
+                        XMMatrixTranslation(0.0f, -0.02f, 0.28f) * xf;
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetObjectMaterial(c4Body, false, false, 0.88f, 0.12f,
+                                         nullptr, nullptr, nullptr);
+                DrawCube(geo);
+                shader.NextDrawCall();
+                model = XMMatrixScaling(0.07f, 0.035f, 0.09f) *
+                        XMMatrixTranslation(0.0f, 0.09f, 0.29f) * xf;
+                shader.UseAdditive();
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetEmissiveMaterial(XMFLOAT3(8.0f, 0.04f, 0.01f), 0.9f);
+                DrawCube(geo);
+                shader.NextDrawCall();
+                shader.Use(scene.wireframeMode);
+            } else if (GunModel::FlamethrowerSelected()) {
+                const struct FlamePart {
+                    XMFLOAT3 center, size, color;
+                    bool glow;
+                } flameParts[] = {
+                    {{ 0.00f, -0.08f, 0.42f}, {0.16f, 0.16f, 0.58f},
+                     {0.10f, 0.085f, 0.055f}, false},
+                    {{ 0.00f,  0.01f, 0.78f}, {0.075f, 0.075f, 0.34f},
+                     {0.15f, 0.13f, 0.09f}, false},
+                    {{-0.13f, -0.18f, 0.02f}, {0.17f, 0.34f, 0.18f},
+                     {0.34f, 0.16f, 0.045f}, false},
+                    {{ 0.00f,  0.01f, 0.97f}, {0.10f, 0.10f, 0.10f},
+                     {8.0f, 1.0f, 0.02f}, true},
+                };
+                for (const FlamePart& part : flameParts) {
+                    model = XMMatrixScaling(part.size.x, part.size.y, part.size.z) *
+                            XMMatrixTranslation(part.center.x, part.center.y,
+                                                part.center.z) * xf;
+                    shader.SetMatrices(model, view, proj, lightSpace);
+                    if (part.glow) {
+                        shader.UseAdditive();
+                        shader.SetEmissiveMaterial(part.color, 0.72f);
+                    } else {
+                        shader.Use(scene.wireframeMode);
+                        shader.SetObjectMaterial(part.color, false, false,
+                                                 0.48f, 0.72f,
+                                                 nullptr, nullptr, nullptr);
+                    }
+                    DrawCube(geo);
+                    shader.NextDrawCall();
+                }
+                shader.Use(scene.wireframeMode);
+            }
 
             // The body hangs off the same base transform as the weapon, so it
             // inherits recoil, the ADS slide and the hip offset for free. This
