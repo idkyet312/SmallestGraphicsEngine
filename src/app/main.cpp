@@ -8129,7 +8129,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 const float banditDeltaTime = updateBandit ? updateDebt : 0.0f;
                 if (updateBandit) updateDebt = 0.0f;
                 if (updateBandit && !coverQuerySpent &&
-                    bandit->NeedsCoverQuery()) {
+                    bandit->NeedsCoverQuery(scene.camera.Position)) {
                     XMFLOAT3 coverPosition;
                     if (QueryBanditCover(
                             *bandit, scene.camera.Position, coverPosition)) {

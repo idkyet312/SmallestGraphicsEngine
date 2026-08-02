@@ -76,11 +76,22 @@ public:
     bool IsSniper() const { return weapon == BanditWeapon::Sniper; }
     bool IsShotgunner() const { return weapon == BanditWeapon::Shotgun; }
 
-    bool NeedsCoverQuery() const {
+    float BackoffRange() const {
+        return IsSniper() ? 24.0f : (IsShotgunner() ? 10.0f : 16.0f);
+    }
+
+    bool PlayerInBackoffRange(const DirectX::XMFLOAT3& playerPosition) const {
+        const float dx = playerPosition.x - position.x;
+        const float dz = playerPosition.z - position.z;
+        const float range = BackoffRange();
+        return dx * dx + dz * dz <= range * range;
+    }
+
+    bool NeedsCoverQuery(const DirectX::XMFLOAT3& playerPosition) const {
         if (dead_ || held_ || turretGunner || hasCoverTarget_ ||
             coverQueryCooldown_ > 0.0f)
             return false;
-        return true;
+        return PlayerInBackoffRange(playerPosition);
     }
 
     void SetCoverTarget(const DirectX::XMFLOAT3& target, float holdSeconds) {
@@ -231,8 +242,7 @@ public:
             (preparingShot_ || laserCharge_ > 0.0f);
         float speed = 0.0f;
         const bool movingToCover = hasCoverTarget_ && !inCover_;
-        const float safeDistance = IsSniper() ? 24.0f :
-            (IsShotgunner() ? 10.0f : 16.0f);
+        const float safeDistance = BackoffRange();
         const bool evasiveRetreat = !hasCoverTarget_ &&
             distance < safeDistance;
         const bool holdingSafeRange = !hasCoverTarget_ && !evasiveRetreat;
