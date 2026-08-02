@@ -77,6 +77,12 @@ int main() {
     Check(PhysicsImpactPolicy::CanFracture(
               PhysicsImpactPolicy::Vehicle, PhysicsImpactPolicy::World),
           "vehicle must retain impact fracture");
+    const int corpseA = PhysicsImpactPolicy::RagdollCollisionGroup(0);
+    const int corpseB = PhysicsImpactPolicy::RagdollCollisionGroup(1);
+    Check(corpseA < 0 && corpseB < 0,
+          "ragdoll self-collision groups must be negative");
+    Check(corpseA != corpseB,
+          "different ragdolls must retain collision with each other");
 
     if (failures == 0) std::cout << "Ragdoll asset tests passed\n";
     return failures == 0 ? 0 : 1;

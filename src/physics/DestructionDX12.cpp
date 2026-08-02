@@ -3190,6 +3190,8 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
         sd.baseMaterial.restitution = 0.0f;
         sd.filter.categoryBits = CollisionCategoryRagdoll;
         sd.filter.maskBits = UINT64_MAX;
+        sd.filter.groupIndex = PhysicsImpactPolicy::RagdollCollisionGroup(
+            ragdollId);
         sd.enableHitEvents = true;
         for (const RagdollShapeSpec& shape : src.shapes) {
             const b3Quat shapeRotation = ToB3Quat(shape.rotation);
