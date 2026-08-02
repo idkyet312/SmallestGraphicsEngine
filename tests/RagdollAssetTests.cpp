@@ -26,11 +26,15 @@ int main() {
     const RagdollBodySpec* torso = nullptr;
     const RagdollBodySpec* thigh = nullptr;
     const RagdollBodySpec* calf = nullptr;
+    const RagdollBodySpec* rightFoot = nullptr;
+    const RagdollBodySpec* leftFoot = nullptr;
     for (const RagdollBodySpec& body : ragdoll.bodies) {
         massFraction += body.massFraction;
         if (body.bone == "spine_02") torso = &body;
         if (body.bone == "thigh_r") thigh = &body;
         if (body.bone == "calf_r") calf = &body;
+        if (body.bone == "foot_r") rightFoot = &body;
+        if (body.bone == "foot_l") leftFoot = &body;
     }
     Check(std::abs(massFraction - 1.0f) < 0.0001f,
           "human body mass fractions must sum to one");
@@ -44,8 +48,10 @@ int main() {
     }
     Check(thigh && thigh->shapes.size() == 1,
           "right thigh capsule missing");
-    Check(thigh && thigh->shapes[0].radius < 0.085f,
+    Check(thigh && thigh->shapes[0].radius < 0.075f,
           "thigh capsule radius must be reduced for self-collision");
+    Check(thigh && thigh->shapes[0].radius > 0.073f,
+          "thigh capsule radius reduction must preserve limb volume");
     Check(thigh && thigh->shapes[0].length > 0.23f,
           "thigh capsule must preserve authored bone coverage");
     if (thigh && !thigh->shapes.empty()) {
@@ -71,6 +77,22 @@ int main() {
             DirectX::XMLoadFloat4(&calf->shapes[0].rotation)));
         Check(std::abs(axis.x) > 0.95f,
               "calf capsule long axis must follow calf bone");
+    }
+    Check(rightFoot && rightFoot->shapes.size() == 1,
+          "right foot collider missing");
+    Check(leftFoot && leftFoot->shapes.size() == 1,
+          "left foot collider missing");
+    if (rightFoot && !rightFoot->shapes.empty()) {
+        Check(rightFoot->shapes[0].type == RagdollShapeType::Box,
+              "right foot collider must remain a box");
+        Check(rightFoot->shapes[0].center.x < -0.095f,
+              "right foot collider must be flipped 180 degrees around bone Y");
+    }
+    if (leftFoot && !leftFoot->shapes.empty()) {
+        Check(leftFoot->shapes[0].type == RagdollShapeType::Box,
+              "left foot collider must remain a box");
+        Check(leftFoot->shapes[0].center.x > 0.095f,
+              "left foot collider must be flipped 180 degrees around bone Y");
     }
 
     int hingeCount = 0;

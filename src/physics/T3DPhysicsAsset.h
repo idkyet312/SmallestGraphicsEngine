@@ -23,7 +23,7 @@ public:
             body.bone = (*it)[2].str();
             body.massFraction = HumanMassFraction(body.bone);
             ParseShapes(geom, body.shapes);
-            ApplyHumanColliderSizing(body);
+            ApplyHumanColliderAdjustments(body);
             if (!body.shapes.empty()) result.bodies.push_back(std::move(body));
         }
 
@@ -91,14 +91,30 @@ private:
         return 0.01f;
     }
 
-    static void ApplyHumanColliderSizing(RagdollBodySpec& body) {
+    static void ApplyHumanColliderAdjustments(RagdollBodySpec& body) {
         float radiusScale = 1.0f;
-        if (Contains(body.bone, "thigh")) radiusScale = 0.78f;
+        if (Contains(body.bone, "thigh")) radiusScale = 0.70f;
         else if (Contains(body.bone, "calf")) radiusScale = 0.82f;
-        if (radiusScale == 1.0f) return;
         for (RagdollShapeSpec& shape : body.shapes) {
-            if (shape.type == RagdollShapeType::Capsule)
+            if (radiusScale != 1.0f &&
+                shape.type == RagdollShapeType::Capsule)
                 shape.radius *= radiusScale;
+
+            if (Contains(body.bone, "foot")) {
+                const DirectX::XMMATRIX shapeLocal =
+                    DirectX::XMMatrixRotationQuaternion(
+                        DirectX::XMLoadFloat4(&shape.rotation)) *
+                    DirectX::XMMatrixTranslation(
+                        shape.center.x, shape.center.y, shape.center.z) *
+                    DirectX::XMMatrixRotationY(DirectX::XM_PI);
+                DirectX::XMVECTOR scale, rotation, translation;
+                if (DirectX::XMMatrixDecompose(
+                        &scale, &rotation, &translation, shapeLocal)) {
+                    DirectX::XMStoreFloat3(&shape.center, translation);
+                    DirectX::XMStoreFloat4(&shape.rotation,
+                        DirectX::XMQuaternionNormalize(rotation));
+                }
+            }
         }
     }
 
