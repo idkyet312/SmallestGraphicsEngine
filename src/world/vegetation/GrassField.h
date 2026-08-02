@@ -625,9 +625,10 @@ private:
         return true;
     }
 
-    // A blade must clear the waterline by this much to be planted, keeping grass
-    // off the wet sand.
-    static constexpr float kShoreMargin = 0.92f;
+    // Terrain's noisy sand transition reaches 2.25 m above the waterline. Keep
+    // blade roots above it so distant minimum-width cards cannot become black
+    // dashes across the beach.
+    static constexpr float kShoreMargin = 2.35f;
     // Steepest ground grass will grow on (rise over run).
     static constexpr float kMaxSlope = 1.10f;
     // Blades are clumped into tufts rather than scattered evenly -- see BuildBlades.
