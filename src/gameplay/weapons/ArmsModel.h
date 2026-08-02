@@ -208,12 +208,15 @@ public:
             Animation().time = PoseTime();
             RunAnimation().time = 0.0f;
         }
-        const float sightedRunScale = 1.0f - 0.70f *
+        const float sighted =
             (std::max)(0.0f, (std::min)(1.0f, adsBlend));
+        const float sightedRunScale = 1.0f - 0.70f * sighted;
+        const float idleMotionRange =
+            1.0f - (1.0f - kAdsIdleMotionRange) * sighted;
         Animation().ComputeAdditivePalette(
             Source().skeleton, RunAnimation(), 0.0f,
             RunBlendWeight() * sightedRunScale * kProceduralRunStrength,
-            PaletteCPU(), &PoseGlobals());
+            PaletteCPU(), &PoseGlobals(), idleMotionRange, 0.0f);
         if (HideHead() || HideFreeHand()) CollapseHiddenBones();
     }
 
@@ -587,6 +590,8 @@ private:
     // reads correctly against the weapon.
     static constexpr float kArmLength = 0.72f;
     static constexpr float kProceduralRunStrength = 1.0f / 3.0f;
+    // ADS keeps only 20% of breathing-idle displacement around frame zero.
+    static constexpr float kAdsIdleMotionRange = 0.2f;
     static std::string Resolve(const std::string& rel) { return ResolvePath(rel); }
 
     static const AnimationClip* IdleClip() {

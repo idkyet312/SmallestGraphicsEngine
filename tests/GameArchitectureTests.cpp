@@ -59,6 +59,22 @@ int main() {
         additivePalette, &additiveGlobals);
     CHECK(std::abs(additiveGlobals[0]._42 - 12.0f) < 0.0001f);
 
+    AnimationClip rangedIdleClip;
+    rangedIdleClip.duration = 1.0f;
+    BoneTrack rangedIdleTrack;
+    rangedIdleTrack.bone = 0;
+    rangedIdleTrack.positions.push_back({ 0.0f, { 0.0f, 0.0f, 0.0f } });
+    rangedIdleTrack.positions.push_back({ 1.0f, { 0.0f, 10.0f, 0.0f } });
+    rangedIdleClip.tracks.push_back(rangedIdleTrack);
+    AnimationInstance rangedIdleAnimation;
+    AnimationInstance noAdditiveAnimation;
+    rangedIdleAnimation.Play(&rangedIdleClip);
+    rangedIdleAnimation.time = 1.0f;
+    rangedIdleAnimation.ComputeAdditivePalette(
+        additiveSkeleton, noAdditiveAnimation, 0.0f, 0.0f,
+        additivePalette, &additiveGlobals, 0.2f, 0.0f);
+    CHECK(std::abs(additiveGlobals[0]._42 - 2.0f) < 0.0001f);
+
     AnimationClip discontinuousLoop;
     discontinuousLoop.duration = 1.0f;
     BoneTrack loopTrack;

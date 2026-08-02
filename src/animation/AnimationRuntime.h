@@ -62,7 +62,9 @@ public:
         const Skeleton& skel, const AnimationInstance& additive,
         float additiveReferenceTime, float weight,
         std::vector<DirectX::XMFLOAT4X4>& palette,
-        std::vector<DirectX::XMFLOAT4X4>* modelMatrices = nullptr) const {
+        std::vector<DirectX::XMFLOAT4X4>* modelMatrices = nullptr,
+        float baseMotionWeight = 1.0f,
+        float baseReferenceTime = 0.0f) const {
         using namespace DirectX;
         const size_t n = skel.BoneCount();
         EnsureCache(skel);
@@ -70,11 +72,20 @@ public:
         palette.resize(n);
         if (modelMatrices) modelMatrices->resize(n);
         weight = (std::max)(0.0f, (std::min)(1.0f, weight));
+        baseMotionWeight =
+            (std::max)(0.0f, (std::min)(1.0f, baseMotionWeight));
 
         for (size_t b = 0; b < n; ++b) {
             XMMATRIX baseLocal = XMLoadFloat4x4(&skel.localBind[b]);
-            if (const BoneTrack* tr = trackByBone_[b])
+            if (const BoneTrack* tr = trackByBone_[b]) {
                 baseLocal = SampleTrack(*tr, b);
+                if (baseMotionWeight < 0.9999f) {
+                    const XMMATRIX reference =
+                        SampleTrackAt(*tr, b, baseReferenceTime);
+                    baseLocal = BlendLocalTransforms(
+                        reference, baseLocal, baseMotionWeight);
+                }
+            }
 
             XMMATRIX additiveLocal = XMLoadFloat4x4(&skel.localBind[b]);
             XMMATRIX referenceLocal = additiveLocal;
