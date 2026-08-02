@@ -37,6 +37,7 @@ extern MeshShaderDX12 g_meshShader;
 // BanditDebugText renders a one-line status; defined in main.cpp where the
 // SkinnedEnemy type is complete.
 void BanditDebugText();
+extern bool g_showEnemyVisionCones;
 void RequestLiveDXRDDGIRebuild();
 void MatchFoliageMaterialToGrass();
 
@@ -145,6 +146,12 @@ inline void RenderMovementPad() {
 inline void RenderPlayerHUD(const Scene& scene) {
     const ImGuiIO& io = ImGui::GetIO();
     ImDrawList* draw = ImGui::GetForegroundDrawList();
+
+    if (g_showEnemyVisionCones) {
+        draw->AddText(ImVec2(16.0f, io.DisplaySize.y - 28.0f),
+                      IM_COL32(210, 235, 210, 220),
+                      "Enemy vision cones: ON  (N to toggle)");
+    }
 
     if (scene.sniperScopeBlend > 0.01f) {
         const float blend = (std::min)(1.0f, scene.sniperScopeBlend);

@@ -294,7 +294,7 @@ public:
                     yaw = std::atan2(pdx, pdz);
                     aimYaw = yaw;
                     moveSpeedThisTick = moveSpeed *
-                        (awareness_ == AwarenessState::Alert ? 1.2f : 0.55f);
+                        (awareness_ == AwarenessState::Alert ? 1.2f : 1.0f);
                     const DirectX::XMFLOAT3 dest{ moveTarget.x, position.y, moveTarget.z };
                     const float navDx = dest.x - navigationDestination_.x;
                     const float navDz = dest.z - navigationDestination_.z;

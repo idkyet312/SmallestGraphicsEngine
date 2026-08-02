@@ -7374,6 +7374,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (wParam == 'V' && !(lParam & 0x40000000)) {
             scene.camera.FPSMode = !scene.camera.FPSMode;
         }
+        else if (wParam == 'N' && !(lParam & 0x40000000)) {
+            g_showEnemyVisionCones = !g_showEnemyVisionCones;
+        }
         else if (wParam == 'B' && !(lParam & 0x40000000)) {
             switch (scene.selectedGrenade) {
             case GrenadeType::Frag:
@@ -10372,7 +10375,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_game.commands.Request(GameCommand::ResetDDGIHistory);
             DrawDXRDDGIProbeDebug(
                 scene.GetViewMatrix(), scene.GetProjectionMatrix());
-            if (g_levelEditor.IsPlaying()) RenderPlayerHUD(scene);
+            if (g_levelEditor.IsPlaying()) {
+                RenderPlayerHUD(scene);
+                DrawEnemyVisionCones(scene.GetViewMatrix(), scene.GetProjectionMatrix());
+            }
         } else {
             RenderPlayerHUD(scene);
             DrawEnemyVisionCones(scene.GetViewMatrix(), scene.GetProjectionMatrix());
