@@ -89,8 +89,13 @@ int main() {
         DirectX::XMStoreFloat3(&axis, DirectX::XMVector3Rotate(
             DirectX::XMVectorSet(0, 0, 1, 0),
             DirectX::XMLoadFloat4(&rightFoot->shapes[0].rotation)));
-        Check(std::abs(axis.x) > 0.95f,
-              "right foot box long axis must follow foot bone");
+        Check(std::abs(axis.y) > 0.95f,
+              "right foot box long axis must follow foot mesh");
+        Check(rightFoot->shapes[0].center.x > 0.052f &&
+              rightFoot->shapes[0].center.x < 0.054f &&
+              rightFoot->shapes[0].center.y > 0.058f &&
+              rightFoot->shapes[0].center.y < 0.060f,
+              "right foot box center must overlap weighted boot mesh");
     }
     if (leftFoot && !leftFoot->shapes.empty()) {
         Check(leftFoot->shapes[0].type == RagdollShapeType::Box,
@@ -99,8 +104,13 @@ int main() {
         DirectX::XMStoreFloat3(&axis, DirectX::XMVector3Rotate(
             DirectX::XMVectorSet(0, 0, 1, 0),
             DirectX::XMLoadFloat4(&leftFoot->shapes[0].rotation)));
-        Check(std::abs(axis.x) > 0.95f,
-              "left foot box long axis must follow foot bone");
+        Check(std::abs(axis.y) > 0.95f,
+              "left foot box long axis must follow foot mesh");
+        Check(leftFoot->shapes[0].center.x < -0.052f &&
+              leftFoot->shapes[0].center.x > -0.054f &&
+              leftFoot->shapes[0].center.y < -0.058f &&
+              leftFoot->shapes[0].center.y > -0.060f,
+              "left foot box center must overlap weighted boot mesh");
     }
 
     int hingeCount = 0;

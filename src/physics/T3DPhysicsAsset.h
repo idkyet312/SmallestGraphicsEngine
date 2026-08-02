@@ -106,12 +106,18 @@ private:
                         DirectX::XMLoadFloat4(&shape.rotation)) *
                     DirectX::XMMatrixTranslation(
                         shape.center.x, shape.center.y, shape.center.z) *
-                    DirectX::XMMatrixRotationY(DirectX::XM_PI) *
-                    DirectX::XMMatrixRotationZ(DirectX::XM_PIDIV2);
+                    DirectX::XMMatrixRotationX(DirectX::XM_PI);
                 DirectX::XMVECTOR scale, rotation, translation;
                 if (DirectX::XMMatrixDecompose(
                         &scale, &rotation, &translation, shapeLocal)) {
                     DirectX::XMStoreFloat3(&shape.center, translation);
+                    // Assimp's Bandit foot-weight bounds center at roughly
+                    // 55% authored X and 63% authored Y after the axis flip.
+                    // Pull the box onto the visible boot instead of leaving it
+                    // offset beside the skin.
+                    shape.center.x *= 0.55f;
+                    shape.center.y *= 0.63f;
+                    shape.center.z = 0.0f;
                     DirectX::XMStoreFloat4(&shape.rotation,
                         DirectX::XMQuaternionNormalize(rotation));
                 }
