@@ -54,26 +54,53 @@ struct AnimationClip {
 };
 
 // --- Authored ragdoll (Phy_Bandit_PhysicsAsset.T3D) --------------------------
-// One rigid body attached to a skeleton bone. Dimensions already scaled to
-// engine metres. Center/rotation are in that bone's local space; the builder
-// composes them with the bind-pose global transform of the bone to place the
-// body in world space at spawn.
-struct RagdollBodySpec {
-    std::string bone;
-    uint8_t     shape = 1;                  // 1 capsule (Sphyl), 0 box
-    DirectX::XMFLOAT3 center = {};          // bone-local, native skeleton units (UE cm)
-    DirectX::XMFLOAT4 rotation = { 0,0,0,1 }; // bone-local quaternion
-    float       radius = 0.1f;              // capsule radius (metres)
-    float       length = 0.2f;              // capsule segment length (metres)
-    DirectX::XMFLOAT3 halfExtent = {};      // box half-extents (metres)
+enum class RagdollShapeType : uint8_t { Box = 0, Capsule = 1, Sphere = 2 };
+enum class RagdollMotion : uint8_t { Locked = 0, Limited = 1, Free = 2 };
+enum class RagdollJointType : uint8_t { Spherical = 0, Hinge = 1 };
+
+// Shape frame is bone-local. All distances are converted to engine metres by
+// the T3D importer. Keeping every primitive matters for compound torso bodies.
+struct RagdollShapeSpec {
+    RagdollShapeType type = RagdollShapeType::Capsule;
+    DirectX::XMFLOAT3 center = {};
+    DirectX::XMFLOAT4 rotation = { 0,0,0,1 };
+    float radius = 0.1f;
+    float length = 0.2f;
+    DirectX::XMFLOAT3 halfExtent = {};
 };
 
-// One constraint joining two bodies (referenced by bone name).
+struct RagdollBodySpec {
+    std::string bone;
+    std::vector<RagdollShapeSpec> shapes;
+    float massFraction = 0.0f;
+};
+
+// Unreal constraint frame. Primary is twist axis, secondary is swing-1 axis,
+// and their cross product is swing-2. Position is bone-local metres.
+struct RagdollJointFrame {
+    DirectX::XMFLOAT3 position = {};
+    DirectX::XMFLOAT3 primary = { 1,0,0 };
+    DirectX::XMFLOAT3 secondary = { 0,1,0 };
+};
+
 struct RagdollConstraintSpec {
     std::string boneA;
     std::string boneB;
-    float coneAngle = DirectX::XM_PIDIV4;
-    float twistAngle = DirectX::XM_PIDIV4;
+    RagdollJointFrame frameA;
+    RagdollJointFrame frameB;
+    RagdollMotion swing1Motion = RagdollMotion::Limited;
+    RagdollMotion swing2Motion = RagdollMotion::Limited;
+    RagdollMotion twistMotion = RagdollMotion::Limited;
+    float swing1Angle = DirectX::XM_PIDIV4;
+    float swing2Angle = DirectX::XM_PIDIV4;
+    float lowerTwistAngle = -DirectX::XM_PIDIV4;
+    float upperTwistAngle = DirectX::XM_PIDIV4;
+    RagdollJointType jointType = RagdollJointType::Spherical;
+    // Hinge limits are measured from authored reference pose.
+    float lowerHingeAngle = -0.0872665f;
+    float upperHingeAngle = 2.5307274f;
+    // 1 = Unreal swing-1/secondary axis, 2 = swing-2/cross axis.
+    uint8_t hingeAxis = 1;
 };
 
 struct RagdollSpec {

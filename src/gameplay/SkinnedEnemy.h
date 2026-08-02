@@ -9,6 +9,9 @@
 #include "DestructionDX12.h"
 #include "NavigationSystem.h"
 #include <DirectXMath.h>
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
 #include <cctype>
 #include <cstdlib>
 #include <cstdint>
@@ -138,7 +141,7 @@ public:
         // Prime with the bind pose so the very first frame renders upright even
         // before any clip is assigned.
         ConfigureGunLayer();
-        ComputePose();
+        ComputePose(0.0f);
         return true;
     }
 
@@ -342,7 +345,7 @@ public:
             ? (std::max)(0.75f, (std::min)(1.15f, speed / referenceSpeed))
             : 1.0f;
         anim.Advance(dt * playbackRate);
-        ComputePose();
+        ComputePose(dt);
     }
 
     void HoldAt(float dt, const DirectX::XMFLOAT3& holdPosition, float facingYaw) {
@@ -360,7 +363,7 @@ public:
         navigationPath_.clear();
         PlayClip("Idle");
         anim.Advance(dt * 0.35f);
-        ComputePose();
+        ComputePose(dt);
     }
 
     void UpdateMounted(float dt, const DirectX::XMFLOAT3& mountPosition,
@@ -382,7 +385,7 @@ public:
         navigationPath_.clear();
         PlayClip("Idle");
         anim.Advance(dt);
-        ComputePose();
+        ComputePose(dt);
     }
 
     void SetHeld(bool held) {
@@ -400,7 +403,8 @@ public:
         if (dead_ || !held_) return false;
         const DirectX::XMFLOAT3 impact = {
             position.x, position.y + footOffset + 1.15f, position.z };
-        Kill(direction, impact, strength, true);
+        Kill(direction, impact, strength, true,
+             RagdollImpactSource::Throw, "pelvis");
         return true;
     }
 
@@ -606,9 +610,7 @@ public:
             const XMMATRIX scaledBodyWorld =
                 XMMatrixScaling(modelScale, modelScale, modelScale) *
                 XMLoadFloat4x4(&body.bodyTransform);
-            const XMMATRIX recovered =
-                XMMatrixInverse(nullptr, XMLoadFloat4x4(&bodyLocal_[bone])) *
-                scaledBodyWorld * inverseWorld;
+            const XMMATRIX recovered = scaledBodyWorld * inverseWorld;
             XMVECTOR scale, rotation, translation;
             if (!XMMatrixDecompose(&scale, &rotation, &translation, recovered)) continue;
             XMStoreFloat4x4(&globals[bone],
@@ -645,7 +647,9 @@ public:
         if (dead_ || !visible) return false;
         DirectX::XMFLOAT3 impact;
         bool hitHead = false;
-        if (!BlocksProjectile(start, end, radius, &impact, &hitHead)) return false;
+        std::string hitBody;
+        if (!BlocksProjectile(start, end, radius, &impact, &hitHead,
+                              &hitBody)) return false;
         if (hitPoint) *hitPoint = impact;
         if (headshot) *headshot = hitHead;
         // Standard rifle balance: one headshot, exactly five body hits from
@@ -653,63 +657,149 @@ public:
         const float appliedDamage = hitHead && allowHeadshotKill ? health : bodyDamage;
         health -= appliedDamage;
         RegisterThreat(appliedDamage);
-        if (health <= 0.0f) Kill(direction, impact);
+        if (health <= 0.0f)
+            Kill(direction, impact, 1.0f, false,
+                 RagdollImpactSource::Bullet, hitBody);
         return true;
     }
 
     bool HitByHarpoon(const DirectX::XMFLOAT3& start,
                       const DirectX::XMFLOAT3& end,
                       const DirectX::XMFLOAT3& direction, float radius,
-                      DirectX::XMFLOAT3* hitPoint = nullptr) {
+                      DirectX::XMFLOAT3* hitPoint = nullptr,
+                      std::string* hitBone = nullptr) {
         if (dead_ || !visible) return false;
         DirectX::XMFLOAT3 impact;
-        if (!BlocksProjectile(start, end, radius, &impact)) return false;
+        std::string struckBody;
+        if (!BlocksProjectile(start, end, radius, &impact, nullptr,
+                              &struckBody)) return false;
         if (hitPoint) *hitPoint = impact;
+        if (hitBone) *hitBone = struckBody;
         const float remainingHealth = health;
         health = 0.0f;
         RegisterThreat(remainingHealth);
         // Harpoons always transition directly into the authored physics pose.
         // The projectile attachment takes ownership of movement immediately.
-        Kill(direction, impact, 6.0f);
+        Kill(direction, impact, 6.0f, false,
+             RagdollImpactSource::Harpoon, struckBody);
         return true;
     }
 
     bool BlocksProjectile(const DirectX::XMFLOAT3& start,
                           const DirectX::XMFLOAT3& end, float radius,
                           DirectX::XMFLOAT3* hitPoint = nullptr,
-                          bool* headshot = nullptr) const {
+                          bool* headshot = nullptr,
+                          std::string* hitBone = nullptr) const {
         using namespace DirectX;
         if (dead_ || !visible) return false;
-        const XMVECTOR a = XMLoadFloat3(&start), b = XMLoadFloat3(&end);
+        const XMVECTOR a = XMLoadFloat3(&start);
+        const XMVECTOR b = XMLoadFloat3(&end);
         const XMVECTOR ab = b - a;
         const float lengthSq = XMVectorGetX(XMVector3LengthSq(ab));
-        auto hitSphere = [&](const XMVECTOR center, float sphereRadius,
-                             XMFLOAT3* impact) {
-            float t = lengthSq > 1e-6f
+        float bestT = FLT_MAX;
+        std::string bestBone;
+
+        auto sphereT = [&](FXMVECTOR center, float sphereRadius, float& t) {
+            t = lengthSq > 1e-6f
                 ? XMVectorGetX(XMVector3Dot(center - a, ab)) / lengthSq : 0.0f;
             t = (std::max)(0.0f, (std::min)(1.0f, t));
-            const XMVECTOR closest = a + ab * t;
-            const float hitRadius = sphereRadius + radius;
-            if (XMVectorGetX(XMVector3LengthSq(closest - center)) >
-                hitRadius * hitRadius) return false;
-            if (impact) XMStoreFloat3(impact, closest);
+            const float expanded = sphereRadius + radius;
+            return XMVectorGetX(XMVector3LengthSq(a + ab*t - center)) <=
+                   expanded * expanded;
+        };
+        auto boxT = [&](FXMMATRIX shapeWorld, const XMFLOAT3& half, float& t) {
+            const XMMATRIX inverse = XMMatrixInverse(nullptr, shapeWorld);
+            XMFLOAT3 localStart, localEnd;
+            XMStoreFloat3(&localStart, XMVector3TransformCoord(a, inverse));
+            XMStoreFloat3(&localEnd, XMVector3TransformCoord(b, inverse));
+            const float s[3] = { localStart.x, localStart.y, localStart.z };
+            const float d[3] = { localEnd.x-localStart.x,
+                                 localEnd.y-localStart.y,
+                                 localEnd.z-localStart.z };
+            const float h[3] = { half.x+radius, half.y+radius, half.z+radius };
+            float lo = 0.0f, hi = 1.0f;
+            for (int axis = 0; axis < 3; ++axis) {
+                if (std::abs(d[axis]) < 1e-6f) {
+                    if (s[axis] < -h[axis] || s[axis] > h[axis]) return false;
+                    continue;
+                }
+                float t0 = (-h[axis]-s[axis])/d[axis];
+                float t1 = ( h[axis]-s[axis])/d[axis];
+                if (t0 > t1) std::swap(t0, t1);
+                lo = (std::max)(lo, t0); hi = (std::min)(hi, t1);
+                if (lo > hi) return false;
+            }
+            t = lo;
+            return true;
+        };
+        auto capsuleT = [&](FXMVECTOR c0, FXMVECTOR c1,
+                            float capsuleRadius, float& t) {
+            const XMVECTOR v = c1-c0;
+            const XMVECTOR w = a-c0;
+            const float aa = lengthSq;
+            const float bb = XMVectorGetX(XMVector3Dot(ab, v));
+            const float cc = XMVectorGetX(XMVector3Dot(v, v));
+            const float dd = XMVectorGetX(XMVector3Dot(ab, w));
+            const float ee = XMVectorGetX(XMVector3Dot(v, w));
+            const float denom = aa*cc-bb*bb;
+            float shotT = denom > 1e-6f ? (bb*ee-cc*dd)/denom : 0.0f;
+            shotT = (std::max)(0.0f, (std::min)(1.0f, shotT));
+            float limbT = cc > 1e-6f ? (bb*shotT+ee)/cc : 0.0f;
+            limbT = (std::max)(0.0f, (std::min)(1.0f, limbT));
+            if (aa > 1e-6f)
+                shotT = (std::max)(0.0f, (std::min)(1.0f,
+                    (bb*limbT-dd)/aa));
+            const XMVECTOR shotPoint = a+ab*shotT;
+            const XMVECTOR limbPoint = c0+v*limbT;
+            const float expanded = capsuleRadius+radius;
+            if (XMVectorGetX(XMVector3LengthSq(shotPoint-limbPoint)) >
+                expanded*expanded) return false;
+            t = shotT;
             return true;
         };
 
-        if (headshot) *headshot = false;
-        if (headBone_ >= 0 && static_cast<size_t>(headBone_) < poseGlobals_.size()) {
-            XMVECTOR head = XMVector3TransformCoord(
-                XMVectorZero(), XMLoadFloat4x4(&poseGlobals_[headBone_]) * WorldMatrix());
-            head += XMVectorSet(0.0f, 0.12f, 0.0f, 0.0f);
-            if (hitSphere(head, 0.24f, hitPoint)) {
-                if (headshot) *headshot = true;
-                return true;
+        for (const RagdollBodySpec& body : model.ragdoll.bodies) {
+            const int bone = model.skeleton.Find(body.bone);
+            if (bone < 0 || (size_t)bone >= poseGlobals_.size()) continue;
+            const XMMATRIX scaledBoneWorld =
+                XMLoadFloat4x4(&poseGlobals_[bone]) * WorldMatrix();
+            XMVECTOR boneScale, boneRotation, boneTranslation;
+            if (!XMMatrixDecompose(&boneScale, &boneRotation,
+                                   &boneTranslation, scaledBoneWorld)) continue;
+            const XMMATRIX boneWorld = XMMatrixRotationQuaternion(
+                XMQuaternionNormalize(boneRotation)) *
+                XMMatrixTranslationFromVector(boneTranslation);
+            for (const RagdollShapeSpec& shape : body.shapes) {
+                const XMMATRIX shapeWorld =
+                    XMMatrixRotationQuaternion(XMLoadFloat4(&shape.rotation)) *
+                    XMMatrixTranslation(shape.center.x, shape.center.y,
+                                        shape.center.z) * boneWorld;
+                float t = FLT_MAX;
+                bool hit = false;
+                if (shape.type == RagdollShapeType::Box) {
+                    hit = boxT(shapeWorld, shape.halfExtent, t);
+                } else if (shape.type == RagdollShapeType::Sphere) {
+                    hit = sphereT(XMVector3TransformCoord(XMVectorZero(),
+                                  shapeWorld), shape.radius, t);
+                } else {
+                    hit = capsuleT(
+                        XMVector3TransformCoord(XMVectorSet(0,-shape.length*0.5f,0,1),
+                                                shapeWorld),
+                        XMVector3TransformCoord(XMVectorSet(0, shape.length*0.5f,0,1),
+                                                shapeWorld),
+                        shape.radius, t);
+                }
+                if (hit && t < bestT) {
+                    bestT = t;
+                    bestBone = body.bone;
+                }
             }
         }
-
-        const XMVECTOR body = XMVectorSet(
-            position.x, position.y + footOffset + 1.0f, position.z, 0.0f);
-        return hitSphere(body, 0.72f, hitPoint);
+        if (bestT == FLT_MAX) return false;
+        if (hitPoint) XMStoreFloat3(hitPoint, a + ab*bestT);
+        if (hitBone) *hitBone = bestBone;
+        if (headshot) *headshot = bestBone.find("head") != std::string::npos;
+        return true;
     }
 
     bool ApplyExplosion(const DirectX::XMFLOAT3& center, float radius,
@@ -735,7 +825,8 @@ public:
         if (health <= 0.0f) {
             XMFLOAT3 impactPosition;
             XMStoreFloat3(&impactPosition, body);
-            Kill(direction, impactPosition);
+            Kill(direction, impactPosition, 1.0f, false,
+                 RagdollImpactSource::Explosion, "pelvis");
         } else {
             knockbackVelocity_.x += direction.x * pushSpeed * falloff;
             knockbackVelocity_.z += direction.z * pushSpeed * falloff;
@@ -795,7 +886,8 @@ public:
         RegisterThreat(damage);
         debrisHitCooldown_ = 0.45f;
         if (health <= 0.0f) {
-            Kill(direction, impact);
+            Kill(direction, impact, 1.0f, debris.lethalImpact,
+                 RagdollImpactSource::Debris);
         } else {
             const float push = (std::min)(7.0f, speed * 0.65f);
             knockbackVelocity_.x += direction.x * push;
@@ -842,7 +934,8 @@ public:
     bool KillFromRotor(const DirectX::XMFLOAT3& direction,
                        const DirectX::XMFLOAT3& impact) {
         if (dead_ || !visible) return false;
-        Kill(direction, impact, 22.0f, true);
+        Kill(direction, impact, 22.0f, true,
+             RagdollImpactSource::Debris);
         return true;
     }
 
@@ -929,7 +1022,9 @@ private:
     void Kill(const DirectX::XMFLOAT3& impulseDirection,
               const DirectX::XMFLOAT3& impactPosition,
               float impulseMultiplier = 1.0f,
-              bool lethalImpact = false) {
+              bool lethalImpact = false,
+              RagdollImpactSource source = RagdollImpactSource::Bullet,
+              const std::string& struckBone = {}) {
         using namespace DirectX;
         dead_ = true;
         held_ = false;
@@ -945,22 +1040,60 @@ private:
         for (const RagdollBodySpec& spec : model.ragdoll.bodies) {
             const int bone = model.skeleton.Find(spec.bone);
             if (bone < 0 || (size_t)bone >= globals.size()) continue;
-            const XMMATRIX local = XMMatrixRotationQuaternion(XMLoadFloat4(&spec.rotation)) *
-                                   XMMatrixTranslation(spec.center.x, spec.center.y, spec.center.z);
-            XMStoreFloat4x4(&bodyLocal_[bone], local);
-            const XMMATRIX bodyWorld = local * XMLoadFloat4x4(&globals[bone]) * WorldMatrix();
+            const XMMATRIX bodyWorld = XMLoadFloat4x4(&globals[bone]) * WorldMatrix();
             XMVECTOR scale, rotation, translation;
             if (!XMMatrixDecompose(&scale, &rotation, &translation, bodyWorld)) continue;
             AuthoredRagdollBody body;
-            body.name = spec.bone; body.halfExtent = spec.halfExtent;
-            body.radius = spec.radius; body.length = spec.length; body.shape = spec.shape;
+            body.name = spec.bone;
+            body.shapes = spec.shapes;
+            body.targetMass = 78.0f * spec.massFraction;
             XMStoreFloat3(&body.position, translation);
             XMStoreFloat4(&body.rotation, XMQuaternionNormalize(rotation));
+
+            if (previousPoseDt_ > 1e-4f && previousPoseDt_ <= 0.1f &&
+                (size_t)bone < previousPoseGlobals_.size()) {
+                const XMMATRIX previousWorld =
+                    XMLoadFloat4x4(&previousPoseGlobals_[bone]) *
+                    XMLoadFloat4x4(&previousPoseWorld_);
+                XMVECTOR previousScale, previousRotation, previousTranslation;
+                if (XMMatrixDecompose(&previousScale, &previousRotation,
+                                      &previousTranslation, previousWorld)) {
+                    XMVECTOR linear = (translation - previousTranslation) /
+                                      previousPoseDt_;
+                    const float linearSpeed = XMVectorGetX(XMVector3Length(linear));
+                    if (linearSpeed > 7.0f) linear *= 7.0f / linearSpeed;
+                    XMStoreFloat3(&body.linearVelocity, linear);
+
+                    XMVECTOR delta = XMQuaternionNormalize(XMQuaternionMultiply(
+                        XMQuaternionInverse(previousRotation), rotation));
+                    if (XMVectorGetW(delta) < 0.0f) delta = XMVectorNegate(delta);
+                    const float w = (std::max)(-1.0f, (std::min)(1.0f,
+                        XMVectorGetW(delta)));
+                    float angle = 2.0f * std::acos(w);
+                    const float sinHalf = std::sqrt((std::max)(0.0f, 1.0f - w*w));
+                    XMVECTOR angular = XMVectorZero();
+                    if (sinHalf > 1e-4f)
+                        angular = XMVectorSet(
+                            XMVectorGetX(delta) / sinHalf,
+                            XMVectorGetY(delta) / sinHalf,
+                            XMVectorGetZ(delta) / sinHalf, 0.0f) *
+                            (angle / previousPoseDt_);
+                    const float angularSpeed = XMVectorGetX(XMVector3Length(angular));
+                    if (angularSpeed > 20.0f) angular *= 20.0f / angularSpeed;
+                    XMStoreFloat3(&body.angularVelocity, angular);
+                }
+            }
             bodies.push_back(body);
         }
+        RagdollImpact impact;
+        impact.source = source;
+        impact.bodyName = struckBone;
+        impact.position = impactPosition;
+        impact.direction = impulseDirection;
+        impact.impulseMultiplier = impulseMultiplier;
+        impact.lethalHazard = lethalImpact;
         ragdollId_ = g_destruction.SpawnAuthoredRagdoll(
-            bodies, model.ragdoll.constraints, impulseDirection, impactPosition,
-            impulseMultiplier, lethalImpact);
+            bodies, model.ragdoll.constraints, impact);
     }
 
     Microsoft::WRL::ComPtr<ID3D12Resource> palette_[FRAME_COUNT];
@@ -971,8 +1104,12 @@ private:
     std::vector<float> upperBodyMask_;
     std::vector<DirectX::XMFLOAT4> gunPoseOffsets_;
     std::vector<DirectX::XMFLOAT4X4> poseGlobals_;
+    std::vector<DirectX::XMFLOAT4X4> previousPoseGlobals_;
     std::vector<DirectX::XMFLOAT4X4> deathGlobals_;
     std::vector<DirectX::XMFLOAT4X4> bodyLocal_;
+    DirectX::XMFLOAT4X4 poseWorld_ = {};
+    DirectX::XMFLOAT4X4 previousPoseWorld_ = {};
+    float previousPoseDt_ = 0.0f;
     DirectX::XMFLOAT4X4 deathWorld_ = {};
     DirectX::XMFLOAT3 knockbackVelocity_{ 0.0f, 0.0f, 0.0f };
     DirectX::XMFLOAT3 coverTarget_{ 0.0f, 0.0f, 0.0f };
@@ -1061,7 +1198,10 @@ private:
         SetPoseOffset("spine_03", -4.0f, 0.0f, 0.0f);
     }
 
-    void ComputePose() {
+    void ComputePose(float dt) {
+        previousPoseGlobals_ = poseGlobals_;
+        previousPoseWorld_ = poseWorld_;
+        previousPoseDt_ = dt;
         if (upperBodyGunLayer && upperBodyAnim_.clip) {
             anim.ComputeLayeredPalette(model.skeleton, upperBodyAnim_, upperBodyMask_,
                                        gunPoseOffsets_, paletteCPU_, &poseGlobals_);
@@ -1070,6 +1210,7 @@ private:
             anim.ComputePalette(model.skeleton, paletteCPU_);
             anim.ComputeGlobalMatrices(model.skeleton, poseGlobals_);
         }
+        DirectX::XMStoreFloat4x4(&poseWorld_, WorldMatrix());
     }
 
     DirectX::XMFLOAT3 GunOriginWorld() const {

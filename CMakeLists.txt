@@ -411,6 +411,12 @@ if(BUILD_TESTING)
     add_executable(CookedAssetFormatTests tests/CookedAssetFormatTests.cpp)
     target_link_libraries(CookedAssetFormatTests PRIVATE SGEProjectHeaders)
     add_test(NAME CookedAssetFormatTests COMMAND CookedAssetFormatTests)
+
+    add_executable(RagdollAssetTests tests/RagdollAssetTests.cpp)
+    target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
+    target_compile_definitions(RagdollAssetTests PRIVATE
+        SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    add_test(NAME RagdollAssetTests COMMAND RagdollAssetTests)
 endif()
 
 if(MSVC)

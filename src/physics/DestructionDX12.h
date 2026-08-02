@@ -8,6 +8,7 @@
 #include <vector>
 #include "NvBlastTkEvent.h"
 #include "SceneGraph.h"
+#include "SkinnedTypes.h"
 
 struct DestructionRenderItem {
     std::shared_ptr<SceneNode> node;
@@ -100,10 +101,23 @@ struct AuthoredRagdollBody {
     std::string name;
     DirectX::XMFLOAT3 position;
     DirectX::XMFLOAT4 rotation;
-    DirectX::XMFLOAT3 halfExtent;
-    float radius = 0.1f;
-    float length = 0.2f;
-    uint8_t shape = 1;
+    std::vector<RagdollShapeSpec> shapes;
+    DirectX::XMFLOAT3 linearVelocity = {};
+    DirectX::XMFLOAT3 angularVelocity = {};
+    float targetMass = 1.0f;
+};
+
+enum class RagdollImpactSource : uint8_t {
+    Bullet, Explosion, Throw, Harpoon, Debris
+};
+
+struct RagdollImpact {
+    RagdollImpactSource source = RagdollImpactSource::Bullet;
+    std::string bodyName;
+    DirectX::XMFLOAT3 position = {};
+    DirectX::XMFLOAT3 direction = { 0,0,1 };
+    float impulseMultiplier = 1.0f;
+    bool lethalHazard = false;
 };
 
 struct AuthoredRagdollPose {
@@ -160,10 +174,7 @@ public:
     std::vector<EnemyShot> DrainEnemyShots();
     uint32_t SpawnAuthoredRagdoll(const std::vector<AuthoredRagdollBody>& bodies,
                                   const std::vector<RagdollConstraintSpec>& constraints,
-                                  const DirectX::XMFLOAT3& impulseDirection,
-                                  const DirectX::XMFLOAT3& impactPosition,
-                                  float impulseMultiplier = 1.0f,
-                                  bool lethalImpact = false);
+                                  const RagdollImpact& impact);
     bool GetAuthoredRagdollPose(uint32_t ragdollId,
                                std::vector<AuthoredRagdollPose>& pose) const;
     bool HitTest(const DirectX::XMFLOAT3& worldPosition, float radius,
@@ -212,7 +223,8 @@ public:
                           float hitRadius = 1.0f);
     bool AttachRagdollToHarpoon(uint32_t ragdollId, uint32_t harpoonId,
                                 const DirectX::XMFLOAT3& impactPosition,
-                                float shaftOffset);
+                                float shaftOffset,
+                                const std::string& struckBone = {});
     void MoveHarpoonRagdolls(uint32_t harpoonId,
                              const DirectX::XMFLOAT3& harpoonPosition,
                              const DirectX::XMFLOAT3& direction);

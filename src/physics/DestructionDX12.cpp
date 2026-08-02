@@ -10,6 +10,7 @@
 #include "NvBlastTkFramework.h"
 #include "NvBlastTkGroup.h"
 #include "NvBlastTypes.h"
+#include "PhysicsImpactPolicy.h"
 #include <box3d/box3d.h>
 
 #include <algorithm>
@@ -41,10 +42,12 @@ constexpr float DebrisCollisionLodAge = 3.0f;
 constexpr float DebrisCollisionLodVolume = 0.035f;
 constexpr float TinyDebrisMaxExtent = 0.20f;
 constexpr float SettledPileFreezeSeconds = 3.0f;
-constexpr uint64_t CollisionCategoryWorld = 1ull << 0;
-constexpr uint64_t CollisionCategoryDebris = 1ull << 1;
-constexpr uint64_t CollisionCategoryLodDebris = 1ull << 2;
-constexpr uint64_t CollisionCategoryBarrel = 1ull << 3;
+constexpr uint64_t CollisionCategoryWorld = PhysicsImpactPolicy::World;
+constexpr uint64_t CollisionCategoryDebris = PhysicsImpactPolicy::Debris;
+constexpr uint64_t CollisionCategoryLodDebris = PhysicsImpactPolicy::LodDebris;
+constexpr uint64_t CollisionCategoryBarrel = PhysicsImpactPolicy::Barrel;
+constexpr uint64_t CollisionCategoryRagdoll = PhysicsImpactPolicy::Ragdoll;
+constexpr uint64_t CollisionCategoryVehicle = PhysicsImpactPolicy::Vehicle;
 // Uniform starting health for every bond/chunk. A bullet's per-hit damage is a
 // fraction of this, so a joint takes several hits before it lets go.
 constexpr float kBondHealth = 1.0f;
@@ -223,6 +226,61 @@ bool SegmentAabb(const XMFLOAT3& start, const XMFLOAT3& end, float radius,
     hitT = t0;
     return true;
 }
+
+b3Quat ToB3Quat(const XMFLOAT4& q) {
+    return b3NormalizeQuat({ { q.x, q.y, q.z }, q.w });
+}
+
+b3Quat RagdollFrameRotation(const RagdollJointFrame& frame,
+                            RagdollJointType type, uint8_t hingeAxis) {
+    XMVECTOR primary = XMVector3Normalize(XMLoadFloat3(&frame.primary));
+    if (XMVectorGetX(XMVector3LengthSq(primary)) < 1e-5f)
+        primary = XMVectorSet(1,0,0,0);
+    XMVECTOR secondary = XMLoadFloat3(&frame.secondary);
+    secondary -= primary * XMVectorGetX(XMVector3Dot(primary, secondary));
+    if (XMVectorGetX(XMVector3LengthSq(secondary)) < 1e-5f)
+        secondary = XMVectorSet(0,1,0,0);
+    secondary = XMVector3Normalize(secondary);
+    XMVECTOR tertiary = XMVector3Normalize(XMVector3Cross(primary, secondary));
+
+    XMVECTOR x = secondary, y = tertiary, z = primary;
+    if (type == RagdollJointType::Hinge && hingeAxis == 1) {
+        x = tertiary; y = primary; z = secondary;
+    } else if (type == RagdollJointType::Hinge && hingeAxis == 2) {
+        x = primary; y = secondary; z = tertiary;
+    }
+    const XMMATRIX basis(x, y, z, XMVectorSet(0,0,0,1));
+    XMFLOAT4 q;
+    XMStoreFloat4(&q, XMQuaternionNormalize(XMQuaternionRotationMatrix(basis)));
+    return ToB3Quat(q);
+}
+
+XMFLOAT3 RagdollBodyHalfExtent(const AuthoredRagdollBody& body) {
+    XMFLOAT3 half = { 0.05f, 0.05f, 0.05f };
+    for (const RagdollShapeSpec& shape : body.shapes) {
+        const float bound = shape.type == RagdollShapeType::Capsule
+            ? shape.radius + shape.length * 0.5f
+            : shape.type == RagdollShapeType::Sphere
+                ? shape.radius
+                : std::sqrt(shape.halfExtent.x * shape.halfExtent.x +
+                            shape.halfExtent.y * shape.halfExtent.y +
+                            shape.halfExtent.z * shape.halfExtent.z);
+        half.x = std::max(half.x, std::abs(shape.center.x) + bound);
+        half.y = std::max(half.y, std::abs(shape.center.y) + bound);
+        half.z = std::max(half.z, std::abs(shape.center.z) + bound);
+    }
+    return half;
+}
+
+float PassiveJointTorque(const std::string& bone) {
+    if (bone.find("spine") != std::string::npos ||
+        bone.find("head") != std::string::npos) return 10.0f;
+    if (bone.find("thigh") != std::string::npos ||
+        bone.find("upperarm") != std::string::npos) return 7.0f;
+    if (bone.find("calf") != std::string::npos ||
+        bone.find("lowerarm") != std::string::npos) return 4.0f;
+    return 2.0f;
+}
 }
 
 struct DestructionDX12::Impl {
@@ -306,7 +364,11 @@ struct DestructionDX12::Impl {
     std::vector<BurningChunk> burningChunks;
     struct HarpoonRagdollPart {
         size_t partIndex = 0;
-        XMFLOAT3 impactOffset = {};
+        b3Vec3 ragdollLocalAnchor = {};
+        b3Vec3 ragdollLocalDirection = { 0.0f, 0.0f, 1.0f };
+        b3BodyId anchorBody = b3_nullBodyId;
+        b3JointId joint = b3_nullJointId;
+        XMFLOAT3 desiredAnchor = {};
     };
     struct HarpoonRagdollAttachment {
         uint32_t harpoonId = 0;
@@ -321,6 +383,11 @@ struct DestructionDX12::Impl {
         size_t partIndex = 0;
         b3Vec3 ragdollLocalAnchor = {};
         b3Vec3 ragdollLocalDirection = { 0.0f, 0.0f, 1.0f };
+        b3Vec3 targetLocalAnchor = {};
+        b3Vec3 targetLocalDirection = { 0.0f, 0.0f, 1.0f };
+        b3BodyId staticAnchorBody = b3_nullBodyId;
+        b3BodyId targetBody = b3_nullBodyId;
+        bool targetFrameValid = false;
         b3JointId joint = b3_nullJointId;
     };
     std::vector<PinnedHarpoonRagdoll> pinnedHarpoonRagdolls;
@@ -419,7 +486,21 @@ struct DestructionDX12::Impl {
     struct AuthoredRagdollRuntime {
         uint32_t id = InvalidIndex;
         float muscleTime = 0.0f;
-        std::vector<b3JointId> joints;
+        struct MuscleJoint {
+            b3JointId id = b3_nullJointId;
+            RagdollJointType type = RagdollJointType::Spherical;
+            float passiveTorque = 4.0f;
+        };
+        std::vector<MuscleJoint> joints;
+        struct SoftAngularLimit {
+            b3BodyId bodyA = b3_nullBodyId;
+            b3BodyId bodyB = b3_nullBodyId;
+            b3Quat localFrameA = b3Quat_identity;
+            b3Quat localFrameB = b3Quat_identity;
+            float swing1 = 0.0f;
+            float swing2 = 0.0f;
+        };
+        std::vector<SoftAngularLimit> softLimits;
     };
     std::vector<AuthoredRagdollRuntime> authoredRagdolls;
     struct HoverEnemy {
@@ -508,15 +589,91 @@ struct DestructionDX12::Impl {
                  p.y - 1.0f > waterMax.y);
     }
 
-    // Brief muscle tension preserves the animated hit pose, then releases into
-    // passive physics. This avoids an instant rubber collapse on the kill frame.
+    // Brief pose matching preserves animation continuity. Stiffness fades instead
+    // of switching off in one frame; a weak zero-speed motor then supplies the
+    // passive resistance of tissue and clothing.
     void RelaxAuthoredRagdolls(float dt) {
         for (AuthoredRagdollRuntime& ragdoll : authoredRagdolls) {
             if (ragdoll.muscleTime <= 0.0f) continue;
-            ragdoll.muscleTime -= dt;
-            if (ragdoll.muscleTime > 0.0f) continue;
-            for (b3JointId joint : ragdoll.joints)
-                b3SphericalJoint_EnableSpring(joint, false);
+            ragdoll.muscleTime = std::max(0.0f, ragdoll.muscleTime - dt);
+            const float blend = ragdoll.muscleTime / 0.20f;
+            for (const AuthoredRagdollRuntime::MuscleJoint& joint : ragdoll.joints) {
+                if (B3_IS_NULL(joint.id) || !b3Joint_IsValid(joint.id)) continue;
+                if (joint.type == RagdollJointType::Hinge) {
+                    if (blend > 0.0f) {
+                        b3RevoluteJoint_SetSpringHertz(joint.id, 1.0f + 3.0f * blend);
+                    } else {
+                        b3RevoluteJoint_EnableSpring(joint.id, false);
+                        b3RevoluteJoint_EnableMotor(joint.id, true);
+                        b3RevoluteJoint_SetMotorSpeed(joint.id, 0.0f);
+                        b3RevoluteJoint_SetMaxMotorTorque(joint.id, joint.passiveTorque);
+                    }
+                } else {
+                    if (blend > 0.0f) {
+                        b3SphericalJoint_SetSpringHertz(joint.id, 1.0f + 3.0f * blend);
+                    } else {
+                        b3SphericalJoint_EnableSpring(joint.id, false);
+                        b3SphericalJoint_EnableMotor(joint.id, true);
+                        b3SphericalJoint_SetMotorVelocity(joint.id, { 0,0,0 });
+                        b3SphericalJoint_SetMaxMotorTorque(joint.id, joint.passiveTorque);
+                    }
+                }
+            }
+        }
+    }
+
+    void ApplyAnatomicalResistance() {
+        for (const AuthoredRagdollRuntime& ragdoll : authoredRagdolls) {
+            for (const AuthoredRagdollRuntime::SoftAngularLimit& limit :
+                 ragdoll.softLimits) {
+                if (B3_IS_NULL(limit.bodyA) || B3_IS_NULL(limit.bodyB)) continue;
+                const b3Quat frameA = b3MulQuat(
+                    b3Body_GetRotation(limit.bodyA), limit.localFrameA);
+                const b3Quat frameB = b3MulQuat(
+                    b3Body_GetRotation(limit.bodyB), limit.localFrameB);
+                // Joint frame B relative to A. Frame axes are arranged so local
+                // x is Unreal swing-1 and local y is swing-2.
+                const b3Quat relative = b3InvMulQuat(
+                    frameA, frameB);
+                b3Quat q = relative.s < 0.0f ? b3NegateQuat(relative) : relative;
+                q = b3NormalizeQuat(q);
+                const float angle = 2.0f * std::acos(std::clamp(q.s, -1.0f, 1.0f));
+                const float sinHalf = std::sqrt(std::max(0.0f, 1.0f - q.s*q.s));
+                b3Vec3 rotationVector = {};
+                if (sinHalf > 1e-4f)
+                    rotationVector = b3MulSV(angle / sinHalf, q.v);
+                const b3Vec3 relativeVelocity = b3InvRotateVector(frameA,
+                    b3Sub(b3Body_GetAngularVelocity(limit.bodyB),
+                          b3Body_GetAngularVelocity(limit.bodyA)));
+                b3Vec3 localTorque = {};
+                const auto resistance = [](float value, float velocity,
+                                           float maximum) {
+                    const float excess = std::abs(value) - maximum;
+                    if (excess <= 0.0f) return 0.0f;
+                    return std::clamp(-std::copysign(18.0f * excess, value) -
+                                      1.8f * velocity, -24.0f, 24.0f);
+                };
+                localTorque.x = resistance(rotationVector.x,
+                                           relativeVelocity.x, limit.swing1);
+                localTorque.y = resistance(rotationVector.y,
+                                           relativeVelocity.y, limit.swing2);
+                if (localTorque.x == 0.0f && localTorque.y == 0.0f) continue;
+                const b3Vec3 worldTorque = b3RotateVector(frameA, localTorque);
+                b3Body_ApplyTorque(limit.bodyA, b3Neg(worldTorque), true);
+                b3Body_ApplyTorque(limit.bodyB, worldTorque, true);
+            }
+        }
+    }
+
+    void UpdateHarpoonAttachments(float step) {
+        for (HarpoonRagdollAttachment& attachment : harpoonRagdolls) {
+            for (HarpoonRagdollPart& part : attachment.parts) {
+                if (B3_IS_NULL(part.anchorBody)) continue;
+                const b3WorldTransform target = {
+                    { part.desiredAnchor.x, part.desiredAnchor.y, part.desiredAnchor.z },
+                    b3Quat_identity };
+                b3Body_SetTargetTransform(part.anchorBody, target, step, true);
+            }
         }
     }
 
@@ -2210,38 +2367,44 @@ struct DestructionDX12::Impl {
     }
 
     bool CreatePinnedHarpoonJoint(PinnedHarpoonRagdoll& pin) {
-        if (pin.partIndex >= ragdollParts.size() ||
-            pin.chunkIndex == InvalidIndex) return false;
+        if (pin.partIndex >= ragdollParts.size()) return false;
         RagdollPart& part = ragdollParts[pin.partIndex];
-        ActorRuntime* ownerRuntime = FindChunkOwner(pin.chunkIndex);
-        if (!ownerRuntime || B3_IS_NULL(ownerRuntime->body) ||
-            B3_IS_NULL(part.body)) return false;
+        ActorRuntime* ownerRuntime = pin.chunkIndex == InvalidIndex
+            ? nullptr : FindChunkOwner(pin.chunkIndex);
+        const b3BodyId targetBody = ownerRuntime
+            ? ownerRuntime->body : pin.staticAnchorBody;
+        if (B3_IS_NULL(targetBody) || B3_IS_NULL(part.body)) return false;
         if (!B3_IS_NULL(pin.joint) && b3Joint_IsValid(pin.joint)) return true;
 
         const b3Pos anchor = b3Body_GetWorldPoint(
             part.body, pin.ragdollLocalAnchor);
         b3Body_SetType(part.body, b3_dynamicBody);
         b3Body_SetLinearVelocity(part.body,
-            b3Body_GetWorldPointVelocity(ownerRuntime->body, anchor));
+            b3Body_GetWorldPointVelocity(targetBody, anchor));
         b3Body_SetAngularVelocity(part.body,
-            b3Body_GetAngularVelocity(ownerRuntime->body));
+            b3Body_GetAngularVelocity(targetBody));
+        // Actor splits replace the target body and move its origin. Rebuild the
+        // target frame from the wound's current world position so the pin stays
+        // on the same visible chunk without snapping the corpse.
+        const bool targetChanged = !B3_IS_NULL(pin.targetBody) &&
+            !B3_ID_EQUALS(pin.targetBody, targetBody);
+        if (!pin.targetFrameValid || targetChanged) {
+            pin.targetLocalAnchor = b3Body_GetLocalPoint(targetBody, anchor);
+            const b3Vec3 worldDirection = b3Body_GetWorldVector(
+                part.body, pin.ragdollLocalDirection);
+            pin.targetLocalDirection = b3Body_GetLocalVector(
+                targetBody, worldDirection);
+            pin.targetFrameValid = true;
+        }
+        pin.targetBody = targetBody;
 
-        b3WeldJointDef weld = b3DefaultWeldJointDef();
-        weld.base.bodyIdA = ownerRuntime->body;
-        weld.base.bodyIdB = part.body;
-        weld.base.localFrameA.p = b3Body_GetLocalPoint(
-            ownerRuntime->body, anchor);
-        weld.base.localFrameB.p = pin.ragdollLocalAnchor;
-        const b3Quat ownerRotation = b3Body_GetRotation(ownerRuntime->body);
-        const b3Quat ragdollRotation = b3Body_GetRotation(part.body);
-        weld.base.localFrameA.q = b3Quat_identity;
-        weld.base.localFrameB.q = b3InvMulQuat(
-            ragdollRotation, ownerRotation);
-        weld.linearHertz = 0.0f;
-        weld.angularHertz = 0.0f;
-        weld.linearDampingRatio = 1.0f;
-        weld.angularDampingRatio = 1.0f;
-        pin.joint = b3CreateWeldJoint(world, &weld);
+        b3SphericalJointDef point = b3DefaultSphericalJointDef();
+        point.base.bodyIdA = targetBody;
+        point.base.bodyIdB = part.body;
+        point.base.localFrameA.p = pin.targetLocalAnchor;
+        point.base.localFrameB.p = pin.ragdollLocalAnchor;
+        point.base.collideConnected = false;
+        pin.joint = b3CreateSphericalJoint(world, &point);
         return !B3_IS_NULL(pin.joint) && b3Joint_IsValid(pin.joint);
     }
 
@@ -2251,6 +2414,26 @@ struct DestructionDX12::Impl {
             pin.joint = b3_nullJointId;
             CreatePinnedHarpoonJoint(pin);
         }
+    }
+
+    int RagdollSolverSubsteps() const {
+        if (!harpoonRagdolls.empty()) return 8;
+        for (const PinnedHarpoonRagdoll& pin : pinnedHarpoonRagdolls) {
+            if (pin.partIndex < ragdollParts.size() &&
+                !B3_IS_NULL(ragdollParts[pin.partIndex].body) &&
+                b3Body_IsAwake(ragdollParts[pin.partIndex].body)) return 8;
+        }
+        for (const RagdollPart& part : ragdollParts) {
+            if (part.authoredId == InvalidIndex || B3_IS_NULL(part.body) ||
+                !b3Body_IsAwake(part.body)) continue;
+            if (!enemyTargetValid) return 6;
+            const b3Pos p = b3Body_GetPosition(part.body);
+            const float dx = (float)p.x - enemyTarget.x;
+            const float dy = (float)p.y - enemyTarget.y;
+            const float dz = (float)p.z - enemyTarget.z;
+            if (dx*dx + dy*dy + dz*dz <= 25.0f*25.0f) return 6;
+        }
+        return 4;
     }
 
     bool ChunkWorldPosition(uint32_t chunkIndex, XMFLOAT3& position) const {
@@ -2606,6 +2789,8 @@ bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter,
     chassisShape.baseMaterial.friction = 0.75f;
     chassisShape.baseMaterial.restitution = 0.02f;
     chassisShape.enableHitEvents = true;
+    chassisShape.filter.categoryBits = CollisionCategoryVehicle;
+    chassisShape.filter.maskBits = UINT64_MAX;
     b3BoxHull chassisHull = b3MakeBoxHull(2.20f, 0.55f, 1.0f);
     b3CreateHullShape(m->vehicleChassis, &chassisShape, &chassisHull.base);
 
@@ -2634,6 +2819,8 @@ bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter,
     wheelShape.density = 65.0f;
     wheelShape.baseMaterial.friction = 4.0f;
     wheelShape.baseMaterial.restitution = 0.01f;
+    wheelShape.filter.categoryBits = CollisionCategoryVehicle;
+    wheelShape.filter.maskBits = UINT64_MAX;
     b3Sphere wheelSphere = { b3Vec3_zero, 0.48f };
 
     b3WheelJointDef joint = b3DefaultWheelJointDef();
@@ -2783,7 +2970,9 @@ void DestructionDX12::Update(float dt) {
         m->ApplyVortices(step);
         m->ApplyEnemyHover(step);
         m->RelaxAuthoredRagdolls(step);
-        b3World_Step(m->world, step, 4);
+        m->ApplyAnatomicalResistance();
+        m->UpdateHarpoonAttachments(step);
+        b3World_Step(m->world, step, m->RagdollSolverSubsteps());
         m->accumulator -= step;
         // Physics impact damage: collisions above the world's hit-event speed
         // threshold (debris slamming the house, pieces crashing onto the
@@ -2796,14 +2985,19 @@ void DestructionDX12::Update(float dt) {
         for (int i = 0; i < events.hitCount; ++i) {
             const b3ContactHitEvent& hit = events.hitEvents[i];
             const b3Vec3& point = hit.point;
-            hitPoints.emplace_back((float)point.x, (float)point.y, (float)point.z);
             const b3Filter filterA = b3Shape_GetFilter(hit.shapeIdA);
             const b3Filter filterB = b3Shape_GetFilter(hit.shapeIdB);
-            const uint64_t debrisMask = CollisionCategoryDebris |
-                CollisionCategoryLodDebris | CollisionCategoryBarrel;
+            const uint64_t debrisMask = PhysicsImpactPolicy::FractureDealerMask;
             const bool involvesDebris =
                 (filterA.categoryBits & debrisMask) != 0 ||
                 (filterB.categoryBits & debrisMask) != 0;
+            // Ragdolls remain solid and can hurt enemies, but never enter the
+            // Blast bond-damage path. Only explicitly destructive categories
+            // contribute fracture points.
+            if (PhysicsImpactPolicy::CanFracture(
+                    filterA.categoryBits, filterB.categoryBits))
+                hitPoints.emplace_back((float)point.x, (float)point.y,
+                                       (float)point.z);
             if (involvesDebris && hit.approachSpeed >= 3.0f &&
                 m->collisionSoundEvents.size() < 32) {
                 m->collisionSoundEvents.push_back({
@@ -2969,10 +3163,7 @@ std::vector<EnemyShot> DestructionDX12::DrainEnemyShots() {
 uint32_t DestructionDX12::SpawnAuthoredRagdoll(
     const std::vector<AuthoredRagdollBody>& bodies,
     const std::vector<RagdollConstraintSpec>& constraints,
-    const XMFLOAT3& impulseDirection,
-    const XMFLOAT3& impactPosition,
-    float impulseMultiplier,
-    bool lethalImpact) {
+    const RagdollImpact& impact) {
     if (!m || !m->initialized || B3_IS_NULL(m->world) || bodies.empty()) return InvalidIndex;
     const uint32_t ragdollId = m->nextAuthoredRagdollId++;
     const size_t base = m->ragdollParts.size();
@@ -2983,110 +3174,146 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
         b3BodyDef bd = b3DefaultBodyDef();
         bd.type = b3_dynamicBody;
         bd.position = { src.position.x, src.position.y, src.position.z };
-        bd.rotation = { { src.rotation.x, src.rotation.y, src.rotation.z }, src.rotation.w };
-        // Human tissue/clothing loses energy quickly. Extra angular damping
-        // removes rubber-doll spinning while leaving limbs responsive.
-        bd.linearDamping = 0.42f;
-        bd.angularDamping = 1.35f;
+        bd.rotation = ToB3Quat(src.rotation);
+        bd.linearVelocity = { src.linearVelocity.x, src.linearVelocity.y,
+                              src.linearVelocity.z };
+        bd.angularVelocity = { src.angularVelocity.x, src.angularVelocity.y,
+                               src.angularVelocity.z };
+        bd.linearDamping = 0.08f;
+        bd.angularDamping = 0.35f;
+        bd.sleepThreshold = 0.08f;
+        bd.enableContactRecycling = false;
         const b3BodyId body = b3CreateBody(m->world, &bd);
         b3ShapeDef sd = b3DefaultShapeDef();
-        float density = 420.0f;
-        if (src.name.find("pelvis") != std::string::npos ||
-            src.name.find("spine") != std::string::npos) density = 620.0f;
-        else if (src.name.find("head") != std::string::npos) density = 480.0f;
-        else if (src.name.find("thigh") != std::string::npos) density = 520.0f;
-        else if (src.name.find("hand") != std::string::npos ||
-                 src.name.find("foot") != std::string::npos) density = 280.0f;
-        sd.density = density;
-        sd.baseMaterial.friction = 0.82f;
-        sd.baseMaterial.restitution = 0.02f;
+        sd.density = 1000.0f;
+        sd.baseMaterial.friction = 0.65f;
+        sd.baseMaterial.restitution = 0.0f;
+        sd.filter.categoryBits = CollisionCategoryRagdoll;
+        sd.filter.maskBits = UINT64_MAX;
         sd.enableHitEvents = true;
-        if (src.shape == 1) {
-            b3Capsule capsule = {};
-            capsule.center1 = { 0.0f, -src.length * 0.5f, 0.0f };
-            capsule.center2 = { 0.0f,  src.length * 0.5f, 0.0f };
-            capsule.radius = src.radius;
-            b3CreateCapsuleShape(body, &sd, &capsule);
-        } else {
-            b3BoxHull box = b3MakeBoxHull(src.halfExtent.x, src.halfExtent.y, src.halfExtent.z);
-            b3CreateHullShape(body, &sd, &box.base);
+        for (const RagdollShapeSpec& shape : src.shapes) {
+            const b3Quat shapeRotation = ToB3Quat(shape.rotation);
+            const b3Vec3 center = { shape.center.x, shape.center.y, shape.center.z };
+            if (shape.type == RagdollShapeType::Capsule) {
+                const b3Vec3 axis = b3RotateVector(shapeRotation, { 0,1,0 });
+                b3Capsule capsule = {};
+                capsule.center1 = b3MulSub(center, shape.length * 0.5f, axis);
+                capsule.center2 = b3MulAdd(center, shape.length * 0.5f, axis);
+                capsule.radius = shape.radius;
+                b3CreateCapsuleShape(body, &sd, &capsule);
+            } else if (shape.type == RagdollShapeType::Sphere) {
+                const b3Sphere sphere = { center, shape.radius };
+                b3CreateSphereShape(body, &sd, &sphere);
+            } else {
+                const b3Transform transform = { center, shapeRotation };
+                b3BoxHull box = b3MakeTransformedBoxHull(
+                    shape.halfExtent.x, shape.halfExtent.y,
+                    shape.halfExtent.z, transform);
+                b3CreateHullShape(body, &sd, &box.base);
+            }
         }
-        m->ragdollParts.push_back({ body, src.halfExtent, cloth, src.shape,
-                                    false, ragdollId, src.name, lethalImpact });
+        b3MassData mass = b3Body_GetMassData(body);
+        if (mass.mass > 1e-5f) {
+            const float scale = std::max(0.05f, src.targetMass) / mass.mass;
+            mass.mass *= scale;
+            mass.inertia.cx = b3MulSV(scale, mass.inertia.cx);
+            mass.inertia.cy = b3MulSV(scale, mass.inertia.cy);
+            mass.inertia.cz = b3MulSV(scale, mass.inertia.cz);
+            b3Body_SetMassData(body, mass);
+        }
+        m->ragdollParts.push_back({ body, RagdollBodyHalfExtent(src), cloth, 1,
+                                    false, ragdollId, src.name,
+                                    impact.lethalHazard });
         indices[src.name] = i;
     }
     Impl::AuthoredRagdollRuntime runtime;
     runtime.id = ragdollId;
-    runtime.muscleTime = 0.42f;
+    runtime.muscleTime = 0.20f;
     runtime.joints.reserve(constraints.size());
     for (const RagdollConstraintSpec& link : constraints) {
         auto a = indices.find(link.boneA), b = indices.find(link.boneB);
         if (a == indices.end() || b == indices.end()) continue;
         const b3BodyId bodyA = m->ragdollParts[base + a->second].body;
         const b3BodyId bodyB = m->ragdollParts[base + b->second].body;
-        const b3Pos pa = b3Body_GetPosition(bodyA), pb = b3Body_GetPosition(bodyB);
-        const b3Pos anchor = { float((pa.x + pb.x) * 0.5), float((pa.y + pb.y) * 0.5),
-                               float((pa.z + pb.z) * 0.5) };
-        b3SphericalJointDef jd = b3DefaultSphericalJointDef();
-        jd.base.bodyIdA = bodyA; jd.base.bodyIdB = bodyB;
-        jd.base.localFrameA.p = b3Body_GetLocalPoint(bodyA, anchor);
-        jd.base.localFrameB.p = b3Body_GetLocalPoint(bodyB, anchor);
-        jd.base.collideConnected = false;
-        jd.enableConeLimit = true;
-        jd.coneAngle = (std::max)(0.035f, link.coneAngle);
-        jd.enableTwistLimit = true;
-        jd.lowerTwistAngle = -(std::max)(0.035f, link.twistAngle);
-        jd.upperTwistAngle =  (std::max)(0.035f, link.twistAngle);
-        jd.enableSpring = true;
-        jd.hertz = 2.4f;
-        jd.dampingRatio = 1.05f;
-        jd.targetRotation = b3InvMulQuat(
-            b3Body_GetRotation(bodyA), b3Body_GetRotation(bodyB));
-        runtime.joints.push_back(b3CreateSphericalJoint(m->world, &jd));
+        const b3Transform frameA = {
+            { link.frameA.position.x, link.frameA.position.y, link.frameA.position.z },
+            RagdollFrameRotation(link.frameA, link.jointType, link.hingeAxis) };
+        const b3Transform frameB = {
+            { link.frameB.position.x, link.frameB.position.y, link.frameB.position.z },
+            RagdollFrameRotation(link.frameB, link.jointType, link.hingeAxis) };
+        const float passiveTorque = PassiveJointTorque(link.boneA);
+        if (link.jointType == RagdollJointType::Hinge) {
+            b3RevoluteJointDef jd = b3DefaultRevoluteJointDef();
+            jd.base.bodyIdA = bodyA; jd.base.bodyIdB = bodyB;
+            jd.base.localFrameA = frameA; jd.base.localFrameB = frameB;
+            jd.base.collideConnected = false;
+            jd.enableLimit = true;
+            jd.lowerAngle = link.lowerHingeAngle;
+            jd.upperAngle = link.upperHingeAngle;
+            jd.enableSpring = true;
+            jd.hertz = 4.0f;
+            jd.dampingRatio = 1.0f;
+            const b3JointId joint = b3CreateRevoluteJoint(m->world, &jd);
+            if (!B3_IS_NULL(joint)) {
+                b3RevoluteJoint_SetTargetAngle(joint,
+                    b3RevoluteJoint_GetAngle(joint));
+                runtime.joints.push_back({ joint, link.jointType, passiveTorque });
+            }
+        } else {
+            b3SphericalJointDef jd = b3DefaultSphericalJointDef();
+            jd.base.bodyIdA = bodyA; jd.base.bodyIdB = bodyB;
+            jd.base.localFrameA = frameA; jd.base.localFrameB = frameB;
+            jd.base.collideConnected = false;
+            jd.enableConeLimit = link.swing1Motion != RagdollMotion::Free ||
+                                 link.swing2Motion != RagdollMotion::Free;
+            jd.coneAngle = std::max(0.035f,
+                std::max(link.swing1Angle, link.swing2Angle));
+            jd.enableTwistLimit = link.twistMotion != RagdollMotion::Free;
+            jd.lowerTwistAngle = link.lowerTwistAngle;
+            jd.upperTwistAngle = link.upperTwistAngle;
+            jd.enableSpring = true;
+            jd.hertz = 4.0f;
+            jd.dampingRatio = 1.0f;
+            const b3Quat worldA = b3MulQuat(b3Body_GetRotation(bodyA), frameA.q);
+            const b3Quat worldB = b3MulQuat(b3Body_GetRotation(bodyB), frameB.q);
+            jd.targetRotation = b3InvMulQuat(worldA, worldB);
+            const b3JointId joint = b3CreateSphericalJoint(m->world, &jd);
+            if (!B3_IS_NULL(joint)) {
+                runtime.joints.push_back({ joint, link.jointType, passiveTorque });
+                runtime.softLimits.push_back({ bodyA, bodyB, frameA.q, frameB.q,
+                    std::max(0.035f, link.swing1Angle),
+                    std::max(0.035f, link.swing2Angle) });
+            }
+        }
     }
     m->authoredRagdolls.push_back(std::move(runtime));
-    XMVECTOR dir = XMVector3Normalize(XMLoadFloat3(&impulseDirection));
+    XMVECTOR dir = XMVector3Normalize(XMLoadFloat3(&impact.direction));
     if (XMVectorGetX(XMVector3LengthSq(dir)) < 1e-5f) dir = XMVectorSet(0, 0.2f, 1, 0);
     size_t nearest = 0;
     float nearestDistanceSq = FLT_MAX;
     for (size_t i = 0; i < bodies.size(); ++i) {
-        const float dx = bodies[i].position.x - impactPosition.x;
-        const float dy = bodies[i].position.y - impactPosition.y;
-        const float dz = bodies[i].position.z - impactPosition.z;
+        if (!impact.bodyName.empty() && bodies[i].name == impact.bodyName) {
+            nearest = i;
+            nearestDistanceSq = 0.0f;
+            break;
+        }
+        const float dx = bodies[i].position.x - impact.position.x;
+        const float dy = bodies[i].position.y - impact.position.y;
+        const float dz = bodies[i].position.z - impact.position.z;
         const float distanceSq = dx*dx + dy*dy + dz*dz;
         if (distanceSq < nearestDistanceSq) {
             nearestDistanceSq = distanceSq;
             nearest = i;
         }
     }
-    for (size_t i = 0; i < bodies.size(); ++i) {
-        const b3BodyId body = m->ragdollParts[base + i].body;
-        const float mass = (std::max)(0.05f, b3Body_GetMass(body));
-        const std::string& bone = bodies[i].name;
-        const bool core = bone.find("pelvis") != std::string::npos ||
-                          bone.find("spine") != std::string::npos;
-        const float dx = bodies[i].position.x - impactPosition.x;
-        const float dy = bodies[i].position.y - impactPosition.y;
-        const float dz = bodies[i].position.z - impactPosition.z;
-        const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
-        const float localReaction = (i == nearest) ? 2.8f :
-            0.85f * (std::max)(0.0f, 1.0f - distance / 0.9f);
-        const float impulseScale =
-            (0.22f + (core ? 0.28f : 0.0f) + localReaction) *
-            (std::max)(0.0f, impulseMultiplier);
-        XMFLOAT3 impulse;
-        XMStoreFloat3(&impulse, dir * (mass * impulseScale));
-        const b3Vec3 hitImpulse = {
-            impulse.x,
-            impulse.y + mass * (core ? 0.14f : 0.04f) * impulseMultiplier,
-            impulse.z };
-        if (i == nearest) {
-            b3Body_ApplyLinearImpulse(body, hitImpulse,
-                { impactPosition.x, impactPosition.y, impactPosition.z }, true);
-        } else {
-            b3Body_ApplyLinearImpulseToCenter(body, hitImpulse, true);
-        }
-    }
+    const b3BodyId hitBody = m->ragdollParts[base + nearest].body;
+    const float hitMass = std::max(0.05f, b3Body_GetMass(hitBody));
+    const float impulseScale = std::max(0.0f, impact.impulseMultiplier);
+    XMFLOAT3 impulse;
+    XMStoreFloat3(&impulse, dir * (hitMass * impulseScale));
+    b3Body_ApplyLinearImpulse(hitBody,
+        { impulse.x, impulse.y + hitMass * 0.06f * impulseScale, impulse.z },
+        { impact.position.x, impact.position.y, impact.position.z }, true);
     m->RebuildRenderItems();
     return ragdollId;
 }
@@ -3644,7 +3871,8 @@ bool DestructionDX12::ApplyHarpoonPull(const XMFLOAT3& worldPosition,
 
 bool DestructionDX12::AttachRagdollToHarpoon(
     uint32_t ragdollId, uint32_t harpoonId,
-    const XMFLOAT3& impactPosition, float shaftOffset) {
+    const XMFLOAT3& impactPosition, float shaftOffset,
+    const std::string& struckBone) {
     if (!m->initialized || ragdollId == InvalidIndex || harpoonId == 0)
         return false;
     for (const Impl::HarpoonRagdollAttachment& attachment :
@@ -3656,15 +3884,19 @@ bool DestructionDX12::AttachRagdollToHarpoon(
     attachment.ragdollId = ragdollId;
     attachment.shaftOffset = (std::max)(0.0f, shaftOffset);
 
-    // Anchor only the authored body nearest the actual spear impact. The rest
-    // of the ragdoll stays dynamic and is pulled through its joints, so an arm
-    // hit drags from the arm and a torso hit drags from the torso.
+    // Exact live-shape hit selects the body. Nearest-body fallback supports old
+    // callers and malformed assets without returning to whole-body dragging.
     size_t hitPartIndex = SIZE_MAX;
     float hitDistanceSq = FLT_MAX;
     for (size_t partIndex = 0;
          partIndex < m->ragdollParts.size(); ++partIndex) {
         Impl::RagdollPart& part = m->ragdollParts[partIndex];
         if (part.authoredId != ragdollId || B3_IS_NULL(part.body)) continue;
+        if (!struckBone.empty() && part.authoredBone == struckBone) {
+            hitPartIndex = partIndex;
+            hitDistanceSq = 0.0f;
+            break;
+        }
         const b3Pos position = b3Body_GetPosition(part.body);
         const float dx = (float)position.x - impactPosition.x;
         const float dy = (float)position.y - impactPosition.y;
@@ -3677,14 +3909,30 @@ bool DestructionDX12::AttachRagdollToHarpoon(
     if (hitPartIndex == SIZE_MAX) return false;
 
     Impl::RagdollPart& hitPart = m->ragdollParts[hitPartIndex];
-    const b3Pos hitPartPosition = b3Body_GetPosition(hitPart.body);
-    attachment.parts.push_back({ hitPartIndex, {
-        (float)hitPartPosition.x - impactPosition.x,
-        (float)hitPartPosition.y - impactPosition.y,
-        (float)hitPartPosition.z - impactPosition.z } });
-    b3Body_SetType(hitPart.body, b3_kinematicBody);
-    b3Body_SetLinearVelocity(hitPart.body, { 0.0f, 0.0f, 0.0f });
-    b3Body_SetAngularVelocity(hitPart.body, { 0.0f, 0.0f, 0.0f });
+    Impl::HarpoonRagdollPart carried;
+    carried.partIndex = hitPartIndex;
+    carried.ragdollLocalAnchor = b3Body_GetLocalPoint(hitPart.body,
+        { impactPosition.x, impactPosition.y, impactPosition.z });
+    carried.desiredAnchor = impactPosition;
+    b3BodyDef anchorDef = b3DefaultBodyDef();
+    anchorDef.type = b3_kinematicBody;
+    anchorDef.position = { impactPosition.x, impactPosition.y, impactPosition.z };
+    anchorDef.enableSleep = false;
+    carried.anchorBody = b3CreateBody(m->world, &anchorDef);
+    if (B3_IS_NULL(carried.anchorBody)) return false;
+    b3SphericalJointDef point = b3DefaultSphericalJointDef();
+    point.base.bodyIdA = carried.anchorBody;
+    point.base.bodyIdB = hitPart.body;
+    point.base.localFrameA.p = { 0,0,0 };
+    point.base.localFrameB.p = carried.ragdollLocalAnchor;
+    point.base.collideConnected = false;
+    carried.joint = b3CreateSphericalJoint(m->world, &point);
+    if (B3_IS_NULL(carried.joint)) {
+        b3DestroyBody(carried.anchorBody);
+        return false;
+    }
+
+    attachment.parts.push_back(carried);
     m->harpoonRagdolls.push_back(std::move(attachment));
     m->rebuiltWhileStill = false;
     return true;
@@ -3694,25 +3942,15 @@ void DestructionDX12::MoveHarpoonRagdolls(
     uint32_t harpoonId, const XMFLOAT3& harpoonPosition,
     const XMFLOAT3& direction) {
     if (!m->initialized || harpoonId == 0) return;
-    for (const Impl::HarpoonRagdollAttachment& attachment :
+    for (Impl::HarpoonRagdollAttachment& attachment :
          m->harpoonRagdolls) {
         if (attachment.harpoonId != harpoonId) continue;
         const XMFLOAT3 anchor = {
             harpoonPosition.x - direction.x * (0.45f + attachment.shaftOffset),
             harpoonPosition.y - direction.y * (0.45f + attachment.shaftOffset),
             harpoonPosition.z - direction.z * (0.45f + attachment.shaftOffset) };
-        for (const Impl::HarpoonRagdollPart& attachedPart : attachment.parts) {
-            if (attachedPart.partIndex >= m->ragdollParts.size()) continue;
-            const b3BodyId body = m->ragdollParts[attachedPart.partIndex].body;
-            if (B3_IS_NULL(body)) continue;
-            const b3Quat rotation = b3Body_GetRotation(body);
-            b3Body_SetTransform(body, {
-                anchor.x + attachedPart.impactOffset.x,
-                anchor.y + attachedPart.impactOffset.y,
-                anchor.z + attachedPart.impactOffset.z }, rotation);
-            b3Body_SetLinearVelocity(body, { 0.0f, 0.0f, 0.0f });
-            b3Body_SetAngularVelocity(body, { 0.0f, 0.0f, 0.0f });
-        }
+        for (Impl::HarpoonRagdollPart& attachedPart : attachment.parts)
+            attachedPart.desiredAnchor = anchor;
     }
     m->rebuiltWhileStill = false;
 }
@@ -3724,31 +3962,55 @@ void DestructionDX12::PinHarpoonRagdolls(
     MoveHarpoonRagdolls(harpoonId, impactPosition, direction);
     const uint32_t targetChunk = attachToLastDestructible
         ? m->lastHitChunk : InvalidIndex;
-    for (const Impl::HarpoonRagdollAttachment& attachment :
+    for (Impl::HarpoonRagdollAttachment& attachment :
          m->harpoonRagdolls) {
         if (attachment.harpoonId != harpoonId) continue;
-        for (const Impl::HarpoonRagdollPart& attachedPart : attachment.parts) {
+        for (Impl::HarpoonRagdollPart& attachedPart : attachment.parts) {
             if (attachedPart.partIndex >= m->ragdollParts.size()) continue;
             const b3BodyId body = m->ragdollParts[attachedPart.partIndex].body;
             if (B3_IS_NULL(body)) continue;
-            if (targetChunk != InvalidIndex &&
-                m->FindChunkOwner(targetChunk)) {
-                Impl::PinnedHarpoonRagdoll pin;
-                pin.harpoonId = harpoonId;
-                pin.chunkIndex = targetChunk;
-                pin.partIndex = attachedPart.partIndex;
-                pin.ragdollLocalAnchor = b3Body_GetLocalPoint(body, {
-                    impactPosition.x, impactPosition.y, impactPosition.z });
-                pin.ragdollLocalDirection = b3Body_GetLocalVector(body, {
-                    direction.x, direction.y, direction.z });
-                m->pinnedHarpoonRagdolls.push_back(pin);
-                if (!m->CreatePinnedHarpoonJoint(
-                        m->pinnedHarpoonRagdolls.back())) {
-                    m->pinnedHarpoonRagdolls.pop_back();
-                    b3Body_SetType(body, b3_staticBody);
+            if (!B3_IS_NULL(attachedPart.joint) &&
+                b3Joint_IsValid(attachedPart.joint))
+                b3DestroyJoint(attachedPart.joint, true);
+            if (!B3_IS_NULL(attachedPart.anchorBody))
+                b3DestroyBody(attachedPart.anchorBody);
+
+            Impl::PinnedHarpoonRagdoll pin;
+            pin.harpoonId = harpoonId;
+            pin.chunkIndex = targetChunk;
+            pin.partIndex = attachedPart.partIndex;
+            pin.ragdollLocalAnchor = attachedPart.ragdollLocalAnchor;
+            pin.ragdollLocalDirection = b3Body_GetLocalVector(body, {
+                direction.x, direction.y, direction.z });
+            if (targetChunk != InvalidIndex) {
+                Impl::ActorRuntime* owner = m->FindChunkOwner(targetChunk);
+                if (owner && !B3_IS_NULL(owner->body)) {
+                    pin.targetBody = owner->body;
+                    pin.targetLocalAnchor = b3Body_GetLocalPoint(owner->body, {
+                        impactPosition.x, impactPosition.y, impactPosition.z });
+                    pin.targetLocalDirection = b3Body_GetLocalVector(owner->body, {
+                        direction.x, direction.y, direction.z });
+                    pin.targetFrameValid = true;
                 }
-            } else {
-                b3Body_SetType(body, b3_staticBody);
+            }
+            if (!pin.targetFrameValid) {
+                b3BodyDef staticDef = b3DefaultBodyDef();
+                staticDef.type = b3_staticBody;
+                staticDef.position = { impactPosition.x, impactPosition.y,
+                                       impactPosition.z };
+                pin.staticAnchorBody = b3CreateBody(m->world, &staticDef);
+                pin.targetBody = pin.staticAnchorBody;
+                pin.targetLocalAnchor = { 0,0,0 };
+                pin.targetLocalDirection = { direction.x, direction.y, direction.z };
+                pin.targetFrameValid = !B3_IS_NULL(pin.staticAnchorBody);
+                pin.chunkIndex = InvalidIndex;
+            }
+            m->pinnedHarpoonRagdolls.push_back(pin);
+            if (!m->CreatePinnedHarpoonJoint(
+                    m->pinnedHarpoonRagdolls.back())) {
+                if (!B3_IS_NULL(m->pinnedHarpoonRagdolls.back().staticAnchorBody))
+                    b3DestroyBody(m->pinnedHarpoonRagdolls.back().staticAnchorBody);
+                m->pinnedHarpoonRagdolls.pop_back();
             }
         }
     }
@@ -3769,12 +4031,14 @@ bool DestructionDX12::GetPinnedHarpoonPose(
          m->pinnedHarpoonRagdolls) {
         if (pin.harpoonId != harpoonId ||
             pin.partIndex >= m->ragdollParts.size()) continue;
-        const b3BodyId body = m->ragdollParts[pin.partIndex].body;
-        if (B3_IS_NULL(body)) continue;
+        const Impl::ActorRuntime* owner = pin.chunkIndex == InvalidIndex
+            ? nullptr : m->FindChunkOwner(pin.chunkIndex);
+        const b3BodyId body = owner ? owner->body : pin.staticAnchorBody;
+        if (B3_IS_NULL(body) || !pin.targetFrameValid) continue;
         const b3Pos worldPosition = b3Body_GetWorldPoint(
-            body, pin.ragdollLocalAnchor);
+            body, pin.targetLocalAnchor);
         const b3Vec3 worldDirection = b3Body_GetWorldVector(
-            body, pin.ragdollLocalDirection);
+            body, pin.targetLocalDirection);
         position = { (float)worldPosition.x, (float)worldPosition.y,
                      (float)worldPosition.z };
         XMVECTOR normalized = XMVectorSet(
@@ -3797,7 +4061,7 @@ void DestructionDX12::ReleaseHarpoonRagdolls(
     releaseDirection = XMVector3Normalize(releaseDirection);
     XMFLOAT3 velocity;
     XMStoreFloat3(&velocity, releaseDirection * (std::max)(0.0f, speed));
-    for (const Impl::HarpoonRagdollAttachment& attachment :
+    for (Impl::HarpoonRagdollAttachment& attachment :
          m->harpoonRagdolls) {
         if (attachment.harpoonId != harpoonId) continue;
         for (const Impl::HarpoonRagdollPart& attachedPart : attachment.parts) {
@@ -3807,6 +4071,11 @@ void DestructionDX12::ReleaseHarpoonRagdolls(
             b3Body_SetType(body, b3_dynamicBody);
             b3Body_SetLinearVelocity(
                 body, { velocity.x, velocity.y, velocity.z });
+            if (!B3_IS_NULL(attachedPart.joint) &&
+                b3Joint_IsValid(attachedPart.joint))
+                b3DestroyJoint(attachedPart.joint, true);
+            if (!B3_IS_NULL(attachedPart.anchorBody))
+                b3DestroyBody(attachedPart.anchorBody);
         }
     }
     m->harpoonRagdolls.erase(

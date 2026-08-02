@@ -8654,6 +8654,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 struct BanditProjectileHit {
                     SkinnedEnemy* enemy = nullptr;
                     XMFLOAT3 position = {};
+                    std::string bone;
                     bool killed = false;
                 };
                 std::vector<BanditProjectileHit> banditHits;
@@ -8664,10 +8665,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         if (projectile.hostile && bandit.get() != g_heldBandit) continue;
                         if (!bandit) continue;
                         XMFLOAT3 banditHit = projectile.position;
+                        std::string banditBone;
                         const bool hitBandit = projectile.harpoon
                             ? bandit->HitByHarpoon(
                                 projectile.previousPosition, projectile.position,
-                                projectile.direction, bulletRadius, &banditHit)
+                                projectile.direction, bulletRadius, &banditHit,
+                                &banditBone)
                             : bandit->Shoot(
                                 projectile.previousPosition, projectile.position,
                                 projectile.direction, bulletRadius, &banditHit,
@@ -8675,7 +8678,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                 true);
                         if (hitBandit) {
                             const bool killed = bandit->Dead();
-                            banditHits.push_back({ bandit.get(), banditHit, killed });
+                            banditHits.push_back({ bandit.get(), banditHit,
+                                                  std::move(banditBone), killed });
                             if (killed && bandit.get() == g_heldBandit)
                                 g_heldBandit = nullptr;
                             if (!projectile.harpoon) break;
@@ -8697,7 +8701,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             if (g_destruction.AttachRagdollToHarpoon(
                                     banditHit.enemy->RagdollId(),
                                     projectile.harpoonId,
-                                    banditHit.position, offset)) {
+                                    banditHit.position, offset,
+                                    banditHit.bone)) {
                                 ++projectile.harpoonPiercedCount;
                                 // Give the carried ragdoll enough forward flight
                                 // to reach and pin against geometry behind it.
@@ -8900,7 +8905,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         scene.ShowHarpoonTether(hit);
                         g_destruction.ApplyHarpoonPull(
                             hit, scene.camera.Position, 105.0f, 1.15f);
-                    } else {
+                    } else if (!projectile.harpoon) {
                         g_destruction.ApplyImpulse(hit, projectile.direction,
                                                    scene.destructionBulletImpulse *
                                                        projectile.damageMultiplier,
