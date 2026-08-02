@@ -18,6 +18,7 @@ struct VehicleSystem {
     float helicopterLevelScale = 1.0f;
     float helicopterMainRotorAngle = 0.0f;
     float helicopterTailRotorAngle = 0.0f;
+    float helicopterRotorSpeedScale = 1.0f;
     float helicopterYaw = 0.0f;
     float helicopterPitch = 0.0f;
     float helicopterRoll = 0.0f;
@@ -74,6 +75,15 @@ struct VehicleSystem {
         bool destroyed = false;
     };
 
+    static float StepHelicopterRotorSpeed(float current, bool powered,
+                                          float deltaTime) {
+        const float target = powered ? 1.0f : 0.0f;
+        const float rate = powered ? 2.0f : 0.2f;
+        const float step = rate * (std::max)(0.0f, deltaTime);
+        if (current < target) return (std::min)(target, current + step);
+        return (std::max)(target, current - step);
+    }
+
     DamageResult DamagePrimaryHelicopter(float damage) {
         DamageResult result{ helicopterPosition };
         if (damage <= 0.0f || helicopterDead) return result;
@@ -122,6 +132,7 @@ struct VehicleSystem {
         helicopterLevelScale = 1.0f;
         helicopterMainRotorAngle = 0.0f;
         helicopterTailRotorAngle = 0.0f;
+        helicopterRotorSpeedScale = 1.0f;
         helicopterYaw = 0.0f;
         helicopterPitch = 0.0f;
         helicopterRoll = 0.0f;

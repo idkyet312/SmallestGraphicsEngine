@@ -213,12 +213,22 @@ int main() {
     CHECK(!plan.playerSpawn.has_value());
 
     VehicleSystem vehicles;
+    float rotorSpeed = 1.0f;
+    for (int frame = 0; frame < 150; ++frame)
+        rotorSpeed = VehicleSystem::StepHelicopterRotorSpeed(
+            rotorSpeed, false, 1.0f / 60.0f);
+    CHECK(std::abs(rotorSpeed - 0.5f) < 0.001f);
+    for (int frame = 0; frame < 150; ++frame)
+        rotorSpeed = VehicleSystem::StepHelicopterRotorSpeed(
+            rotorSpeed, false, 1.0f / 60.0f);
+    CHECK(rotorSpeed < 0.001f);
     vehicles.humveeModelScale = 3.0f;
     vehicles.helicopterDead = true;
     vehicles.drivingHumvee = true;
     vehicles.ResetLevel();
     CHECK(vehicles.humveeModelScale == 3.0f);
     CHECK(!vehicles.helicopterDead);
+    CHECK(vehicles.helicopterRotorSpeedScale == 1.0f);
     CHECK(!vehicles.drivingHumvee);
     auto vehicleDamage = vehicles.DamagePrimaryHelicopter(500.0f);
     CHECK(vehicleDamage.applied);

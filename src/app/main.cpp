@@ -187,6 +187,8 @@ static float&               g_helicopterModelScale = g_game.vehicles.helicopterM
 static float&               g_helicopterLevelScale = g_game.vehicles.helicopterLevelScale;
 static float&               g_helicopterMainRotorAngle = g_game.vehicles.helicopterMainRotorAngle;
 static float&               g_helicopterTailRotorAngle = g_game.vehicles.helicopterTailRotorAngle;
+static float&               g_helicopterRotorSpeedScale =
+    g_game.vehicles.helicopterRotorSpeedScale;
 static float&               g_helicopterYaw = g_game.vehicles.helicopterYaw;
 static float&               g_helicopterPitch = g_game.vehicles.helicopterPitch;
 static float&               g_helicopterRoll = g_game.vehicles.helicopterRoll;
@@ -763,20 +765,24 @@ static void UpdateHelicopterRotorKills() {
 
 static void UpdateHelicopter(float dt) {
     if (!g_helicopterModel || !scene.showHelicopter) return;
-    if (!g_helicopterDead || (g_stressTestMode && !g_secondaryHelicopterDead)) {
-        g_helicopterMainRotorAngle = std::fmod(
-            g_helicopterMainRotorAngle + dt * 24.0f, XM_2PI);
-        g_helicopterTailRotorAngle = std::fmod(
-            g_helicopterTailRotorAngle + dt * 38.0f, XM_2PI);
-        if (g_helicopterMainRotorNode)
-            XMStoreFloat4(&g_helicopterMainRotorNode->rotation,
-                XMQuaternionRotationAxis(XMVectorSet(0, 1, 0, 0),
-                                         g_helicopterMainRotorAngle));
-        if (g_helicopterTailRotorNode)
-            XMStoreFloat4(&g_helicopterTailRotorNode->rotation,
-                XMQuaternionRotationAxis(XMVectorSet(1, 0, 0, 0),
-                                         g_helicopterTailRotorAngle));
-    }
+    const bool rotorPowered = !g_helicopterDead ||
+        (g_stressTestMode && !g_secondaryHelicopterDead);
+    g_helicopterRotorSpeedScale = VehicleSystem::StepHelicopterRotorSpeed(
+        g_helicopterRotorSpeedScale, rotorPowered, dt);
+    g_helicopterMainRotorAngle = std::fmod(
+        g_helicopterMainRotorAngle +
+            dt * 24.0f * g_helicopterRotorSpeedScale, XM_2PI);
+    g_helicopterTailRotorAngle = std::fmod(
+        g_helicopterTailRotorAngle +
+            dt * 38.0f * g_helicopterRotorSpeedScale, XM_2PI);
+    if (g_helicopterMainRotorNode)
+        XMStoreFloat4(&g_helicopterMainRotorNode->rotation,
+            XMQuaternionRotationAxis(XMVectorSet(0, 1, 0, 0),
+                                     g_helicopterMainRotorAngle));
+    if (g_helicopterTailRotorNode)
+        XMStoreFloat4(&g_helicopterTailRotorNode->rotation,
+            XMQuaternionRotationAxis(XMVectorSet(1, 0, 0, 0),
+                                     g_helicopterTailRotorAngle));
     if (g_helicopterDead) {
         if (g_helicopterCrashed) return;
         g_helicopterCrashVelocity.y -= 9.81f * dt;
