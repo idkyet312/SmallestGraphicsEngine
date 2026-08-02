@@ -6287,6 +6287,103 @@ static void DrawDestructionDebug(Scene& scene) {
     ImGui::End();
 }
 
+// X-ray wire overlay of exact authored Box3D primitives. Drawn through ImGui so
+// colliders remain visible inside the skinned corpse and behind nearby foliage.
+static void DrawRagdollPhysicsDebug(Scene& scene) {
+    if (!scene.showRagdollPhysicsShapes || !g_destruction.IsInitialized()) return;
+    const std::vector<RagdollPhysicsDebugShape> shapes =
+        g_destruction.GetRagdollPhysicsDebugShapes();
+    const XMMATRIX viewProj = scene.GetViewMatrix() * scene.GetProjectionMatrix();
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    constexpr float pi = 3.14159265358979323846f;
+
+    auto project = [&](const RagdollPhysicsDebugShape& shape,
+                       const XMFLOAT3& local, ImVec2& screen) {
+        const XMVECTOR world = XMVector3TransformCoord(
+            XMLoadFloat3(&local), XMLoadFloat4x4(&shape.transform));
+        const XMVECTOR clip = XMVector3Transform(world, viewProj);
+        const float clipW = XMVectorGetW(clip);
+        if (clipW <= 0.0001f) return false;
+        const float x = XMVectorGetX(clip) / clipW;
+        const float y = XMVectorGetY(clip) / clipW;
+        screen = { (x * 0.5f + 0.5f) * display.x,
+                   (1.0f - (y * 0.5f + 0.5f)) * display.y };
+        return true;
+    };
+    auto line = [&](const RagdollPhysicsDebugShape& shape,
+                    const XMFLOAT3& a, const XMFLOAT3& b, ImU32 color) {
+        ImVec2 pa, pb;
+        if (project(shape, a, pa) && project(shape, b, pb))
+            draw->AddLine(pa, pb, color, 1.8f);
+    };
+    auto circle = [&](const RagdollPhysicsDebugShape& shape, int plane,
+                      float offset, float radius, ImU32 color) {
+        constexpr int segments = 24;
+        for (int i = 0; i < segments; ++i) {
+            const float a = 2.0f*pi*i/segments;
+            const float b = 2.0f*pi*(i+1)/segments;
+            auto point = [&](float angle) {
+                const float c = std::cos(angle)*radius;
+                const float s = std::sin(angle)*radius;
+                if (plane == 0) return XMFLOAT3(c, s, offset);
+                if (plane == 1) return XMFLOAT3(c, offset, s);
+                return XMFLOAT3(offset, c, s);
+            };
+            line(shape, point(a), point(b), color);
+        }
+    };
+
+    for (const RagdollPhysicsDebugShape& shape : shapes) {
+        if (shape.type == RagdollShapeType::Box) {
+            const XMFLOAT3& h = shape.halfExtent;
+            const XMFLOAT3 c[8] = {
+                {-h.x,-h.y,-h.z},{h.x,-h.y,-h.z},{h.x,h.y,-h.z},{-h.x,h.y,-h.z},
+                {-h.x,-h.y,h.z},{h.x,-h.y,h.z},{h.x,h.y,h.z},{-h.x,h.y,h.z} };
+            const int edges[12][2] = {
+                {0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},
+                {0,4},{1,5},{2,6},{3,7} };
+            for (const auto& edge : edges)
+                line(shape, c[edge[0]], c[edge[1]], IM_COL32(0,220,255,235));
+        } else if (shape.type == RagdollShapeType::Sphere) {
+            for (int plane = 0; plane < 3; ++plane)
+                circle(shape, plane, 0.0f, shape.radius,
+                       IM_COL32(255,220,30,235));
+        } else {
+            const ImU32 green = IM_COL32(70,255,90,240);
+            const float bottom = -shape.length*0.5f;
+            const float top = shape.length*0.5f;
+            circle(shape, 1, bottom, shape.radius, green);
+            circle(shape, 1, top, shape.radius, green);
+            constexpr int sides = 12;
+            for (int i = 0; i < sides; ++i) {
+                const float angle = 2.0f*pi*i/sides;
+                const float x = std::cos(angle)*shape.radius;
+                const float z = std::sin(angle)*shape.radius;
+                line(shape, {x,bottom,z}, {x,top,z}, green);
+            }
+            constexpr int arcs = 12;
+            for (int plane = 0; plane < 3; ++plane) {
+                const float theta = pi*plane/3.0f;
+                const float ux = std::cos(theta), uz = std::sin(theta);
+                for (int i = 0; i < arcs; ++i) {
+                    const float a = pi*i/arcs, b = pi*(i+1)/arcs;
+                    auto cap = [&](float angle, float y, float sign) {
+                        return XMFLOAT3(ux*std::cos(angle)*shape.radius,
+                            y + sign*std::sin(angle)*shape.radius,
+                            uz*std::cos(angle)*shape.radius);
+                    };
+                    line(shape, cap(a, top, 1.0f), cap(b, top, 1.0f), green);
+                    line(shape, cap(a, bottom, -1.0f),
+                         cap(b, bottom, -1.0f), green);
+                }
+            }
+        }
+    }
+    draw->AddText(ImVec2(18.0f, 92.0f), IM_COL32(70,255,90,255),
+                  "RAGDOLL PHYSICS SHAPES");
+}
+
 // ?? timer ????????????????????????????????????????????????????????????????????
 class Timer {
     std::chrono::high_resolution_clock::time_point t0;
@@ -10019,6 +10116,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             } else {
                 if (showUI) RenderUI(scene, visBuffer);
                 DrawDestructionDebug(scene);
+                DrawRagdollPhysicsDebug(scene);
             }
         }
         ImGui::Render();

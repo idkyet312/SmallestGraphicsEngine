@@ -396,6 +396,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 g_destruction.GetRenderItems().size(),
                 g_destruction.IsBatchBuildPending() ? "building" : "idle");
     ImGui::Checkbox("God Mode", &scene.player.godMode);
+    if (ImGui::Button(scene.showRagdollPhysicsShapes
+            ? "Hide Ragdoll Physics Shapes"
+            : "Show Ragdoll Physics Shapes"))
+        scene.showRagdollPhysicsShapes = !scene.showRagdollPhysicsShapes;
     const StaticBufferStatsDX12 staticStats = GetStaticBufferStatsDX12();
     ImGui::Text("GPU-local static buffers: %u  %.1f MiB  Pending: %u",
                 staticStats.resources, staticStats.bytes / (1024.0 * 1024.0),

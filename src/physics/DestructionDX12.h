@@ -107,6 +107,14 @@ struct AuthoredRagdollBody {
     float targetMass = 1.0f;
 };
 
+struct RagdollPhysicsDebugShape {
+    DirectX::XMFLOAT4X4 transform;
+    RagdollShapeType type = RagdollShapeType::Capsule;
+    DirectX::XMFLOAT3 halfExtent = {};
+    float radius = 0.0f;
+    float length = 0.0f;
+};
+
 enum class RagdollImpactSource : uint8_t {
     Bullet, Explosion, Throw, Harpoon, Debris
 };
@@ -282,6 +290,7 @@ public:
     const std::vector<DestructionRenderItem>& GetRenderItems() const;
     const std::vector<DestructionRenderBatch>& GetRenderBatches() const;
     const std::vector<RagdollRenderItem>& GetRagdollRenderItems() const;
+    std::vector<RagdollPhysicsDebugShape> GetRagdollPhysicsDebugShapes() const;
     const std::vector<EnemyGunRenderItem>& GetEnemyGunRenderItems() const;
     DestructionDebugData GetDebugData() const;
 

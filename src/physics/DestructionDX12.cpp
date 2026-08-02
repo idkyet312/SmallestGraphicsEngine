@@ -479,6 +479,7 @@ struct DestructionDX12::Impl {
         uint32_t authoredId = InvalidIndex;
         std::string authoredBone;
         bool lethalHazard = false;
+        std::vector<RagdollShapeSpec> physicsShapes;
     };
     std::vector<RagdollPart> ragdollParts;
     std::vector<RagdollRenderItem> ragdollRenderItems;
@@ -3223,7 +3224,7 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
         }
         m->ragdollParts.push_back({ body, RagdollBodyHalfExtent(src), cloth, 1,
                                     false, ragdollId, src.name,
-                                    impact.lethalHazard });
+                                    impact.lethalHazard, src.shapes });
         indices[src.name] = i;
     }
     Impl::AuthoredRagdollRuntime runtime;
@@ -4479,6 +4480,32 @@ bool DestructionDX12::IsBatchBuildPending() const {
 const std::vector<DestructionRenderItem>& DestructionDX12::GetRenderItems() const { return m->renderItems; }
 const std::vector<DestructionRenderBatch>& DestructionDX12::GetRenderBatches() const { return m->renderBatches; }
 const std::vector<RagdollRenderItem>& DestructionDX12::GetRagdollRenderItems() const { return m->ragdollRenderItems; }
+std::vector<RagdollPhysicsDebugShape>
+DestructionDX12::GetRagdollPhysicsDebugShapes() const {
+    std::vector<RagdollPhysicsDebugShape> result;
+    if (!m) return result;
+    for (const Impl::RagdollPart& part : m->ragdollParts) {
+        if (part.authoredId == InvalidIndex || B3_IS_NULL(part.body)) continue;
+        const b3Pos p = b3Body_GetPosition(part.body);
+        const b3Quat q = b3Body_GetRotation(part.body);
+        const XMMATRIX bodyWorld =
+            XMMatrixRotationQuaternion(XMVectorSet(q.v.x, q.v.y, q.v.z, q.s)) *
+            XMMatrixTranslation((float)p.x, (float)p.y, (float)p.z);
+        for (const RagdollShapeSpec& shape : part.physicsShapes) {
+            RagdollPhysicsDebugShape debug;
+            debug.type = shape.type;
+            debug.halfExtent = shape.halfExtent;
+            debug.radius = shape.radius;
+            debug.length = shape.length;
+            XMStoreFloat4x4(&debug.transform,
+                XMMatrixRotationQuaternion(XMLoadFloat4(&shape.rotation)) *
+                XMMatrixTranslation(shape.center.x, shape.center.y,
+                                    shape.center.z) * bodyWorld);
+            result.push_back(debug);
+        }
+    }
+    return result;
+}
 const std::vector<EnemyGunRenderItem>& DestructionDX12::GetEnemyGunRenderItems() const { return m->enemyGunRenderItems; }
 
 DestructionDebugData DestructionDX12::GetDebugData() const {

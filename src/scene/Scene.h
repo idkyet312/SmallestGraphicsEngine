@@ -388,6 +388,7 @@ struct Scene {
     float destructionBulletImpulse = 260.0f;
     bool  rebuildDestructionRequested = false;
     bool  showDestructionDebug = false;
+    bool  showRagdollPhysicsShapes = false;
 
     // Palm trees. Damage here is absolute (against a section's health), not the
     // 0..1 bond fraction destructionDamage uses -- different system, different
