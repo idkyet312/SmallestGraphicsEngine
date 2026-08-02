@@ -9,6 +9,7 @@
 #include <iostream>
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -257,11 +258,6 @@ bool                        g_banditLoaded = false;
 float                       g_banditLeftArmReach = 0.55f;
 float                       g_banditHeadYawOffsetDegrees = 20.4f;
 bool                        g_showEnemyVisionCones = false;
-// No authored gun-grip socket exists on the asset, so the gun is attached to
-// hand_r with this tunable local offset instead of a fixed constant -- nudge
-// live via the bandit debug panel until it lines up with the model's hand.
-XMFLOAT3                    g_banditGunGripOffsetPos{ 0.0f, 0.0f, 0.0f };
-XMFLOAT3                    g_banditGunGripOffsetEuler{ 0.0f, 0.0f, 0.0f };
 static uint32_t&            g_banditSpawnSerial = g_enemySystem.spawnSerial;
 GunAudio                    g_gunAudio;
 GunAudio                    g_rpgFireAudio;
@@ -2245,11 +2241,6 @@ void BanditDebugText() {
                        &g_banditHeadYawOffsetDegrees,
                        -90.0f, 90.0f, "%.1f deg");
     ImGui::Checkbox("Show enemy vision cones", &g_showEnemyVisionCones);
-    if (ImGui::CollapsingHeader("Enemy Gun Grip Offset")) {
-        ImGui::TextDisabled("No authored socket -- tune until gun sits in hand_r.");
-        ImGui::DragFloat3("Grip position", &g_banditGunGripOffsetPos.x, 0.01f);
-        ImGui::DragFloat3("Grip rotation (deg)", &g_banditGunGripOffsetEuler.x, 1.0f);
-    }
     if (ImGui::CollapsingHeader("Enemy Audio", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::SliderFloat("Flesh hit pitch min", &g_fleshHitPitchMin,
                                0.5f, 2.0f, "%.2f"))
@@ -6645,6 +6636,44 @@ public:
 };
 static Timer gameTimer;
 
+// Frame times spike randomly and unpredictably in play; the ImGui profiler
+// overlay only shows the current frame, so nothing captures what a spike
+// actually was once it's passed. This appends one line per spike (frame time
+// over 1.5x the 60fps budget) with a timestamp and the slowest CPU/GPU scopes
+// from that frame, so a spike caught during normal play leaves a trail.
+static void LogFrameSpike(float deltaTimeSeconds) {
+    constexpr double kSpikeThresholdMs = (1000.0 / 60.0) * 1.5; // ~25ms
+    const double frameMs = double(deltaTimeSeconds) * 1000.0;
+    if (frameMs < kSpikeThresholdMs) return;
+
+    std::ofstream log("logs/frame_spikes.log", std::ios::app);
+    if (!log) return;
+
+    const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm localNow{};
+    localtime_s(&localNow, &now);
+
+    log << std::put_time(&localNow, "%H:%M:%S") << " frame=" << std::fixed
+        << std::setprecision(2) << frameMs << "ms";
+
+    auto logTopSamples = [&](const char* label, const std::vector<ProfilerSampleDX12>& samples) {
+        std::vector<ProfilerSampleDX12> sorted(samples.begin(), samples.end());
+        std::sort(sorted.begin(), sorted.end(),
+            [](const ProfilerSampleDX12& a, const ProfilerSampleDX12& b) {
+                return a.milliseconds > b.milliseconds;
+            });
+        log << " " << label << "=[";
+        for (size_t i = 0; i < sorted.size() && i < 5; ++i) {
+            if (i) log << ", ";
+            log << sorted[i].name << ":" << std::setprecision(2) << sorted[i].milliseconds << "ms";
+        }
+        log << "]";
+    };
+    logTopSamples("cpu", g_profiler.CpuSamples());
+    logTopSamples("gpu", g_profiler.GpuSamples());
+    log << "\n";
+}
+
 // ?? forward decls ????????????????????????????????????????????????????????????
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -8371,8 +8400,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 bandit->leftArmReach = g_banditLeftArmReach;
                 bandit->headTorsoYawOffsetDegrees =
                     g_banditHeadYawOffsetDegrees;
-                bandit->gunGripOffsetPos = g_banditGunGripOffsetPos;
-                bandit->gunGripOffsetEulerDegrees = g_banditGunGripOffsetEuler;
                 const float cameraDx = bandit->position.x - scene.camera.Position.x;
                 const float cameraDz = bandit->position.z - scene.camera.Position.z;
                 const float cameraDistanceSq = cameraDx * cameraDx + cameraDz * cameraDz;
@@ -10471,6 +10498,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 scene.GetViewMatrix() * scene.GetProjectionMatrix();
         msaaUsedLastFrame = msaaActive;
         g_profiler.EndCpuFrame();
+        LogFrameSpike(deltaTime);
         if (molotovSmokeInjected && ++molotovSmokeFrames >= 240) {
             std::ofstream smoke("molotov_smoke.log", std::ios::trunc);
             smoke << "peak_patches=" << molotovSmokePeakPatches << '\n'

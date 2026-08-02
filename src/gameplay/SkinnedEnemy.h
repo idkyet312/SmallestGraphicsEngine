@@ -791,31 +791,18 @@ public:
         return true;
     }
 
-    // Weapon rides the hand bone's actual animated pose (world = local grip
-    // offset * hand bone model-space transform * mesh world matrix), so gun
-    // idle sway, walk/run arm swing, and IK all show up on the gun for free
-    // instead of the gun computing an independent position that only agreed
-    // with the hand when Combat's arm IK was specifically solved to match it.
-    // gunGripOffsetPos/gunGripOffsetEuler are tunable in the bandit debug
-    // panel -- there's no authored socket in the asset, so these start at a
-    // reasonable guess and are meant to be nudged live until the grip lines
-    // up with the model's actual hand.
-    DirectX::XMFLOAT3 gunGripOffsetPos{ 0.0f, 0.0f, 0.0f };
-    DirectX::XMFLOAT3 gunGripOffsetEulerDegrees{ 0.0f, 0.0f, 0.0f };
+    // Weapon frame follows the same chest/arm yaw and pitch the IK solve just
+    // aimed the arms at (gunYaw/gunPitch_, kept in sync by ApplyGunIK every
+    // frame in every awareness state), so the gun always rides where the
+    // hands actually are instead of floating at an independently aimed spot.
     DirectX::XMMATRIX GunWorldMatrix() const {
         using namespace DirectX;
         if (!HasGunPose()) return XMMatrixIdentity();
-        if (handBone_ < 0 || static_cast<size_t>(handBone_) >= poseGlobals_.size())
-            return XMMatrixIdentity();
-        const XMMATRIX gripLocal =
-            XMMatrixScaling(0.6f, 0.6f, 0.6f) *
-            XMMatrixRotationRollPitchYaw(
-                XMConvertToRadians(gunGripOffsetEulerDegrees.x),
-                XMConvertToRadians(gunGripOffsetEulerDegrees.y),
-                XMConvertToRadians(gunGripOffsetEulerDegrees.z)) *
-            XMMatrixTranslation(gunGripOffsetPos.x, gunGripOffsetPos.y,
-                                gunGripOffsetPos.z);
-        return gripLocal * XMLoadFloat4x4(&poseGlobals_[handBone_]) * MeshWorldMatrix();
+        const XMFLOAT3 origin = GunOriginWorld(gunYaw_);
+        return XMMatrixScaling(0.6f, 0.6f, 0.6f) *
+               XMMatrixRotationX(-gunPitch_) *
+               XMMatrixRotationY(gunYaw_) *
+               XMMatrixTranslation(origin.x, origin.y, origin.z);
     }
 
     void SyncRagdoll() {
