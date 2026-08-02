@@ -761,15 +761,12 @@ float4 main(PS_INPUT input) : SV_TARGET {
     // At grazing angles, high-frequency terrain normals can tip behind the
     // camera. The generic two-sided correction below would then flip them
     // downward, turning sand ripples into moving black reflection flecks.
-    // Fade terrain detail toward its geometric normal before that can happen.
+    // Mirror only the backward view component. This preserves full normal-map
+    // detail instead of fading it with camera angle.
 #ifdef SGE_TERRAIN_PBR
-    float3 terrainGeometricNormal = normalize(input.normal);
-    if (dot(terrainGeometricNormal, viewDir) < 0.0)
-        terrainGeometricNormal = -terrainGeometricNormal;
-    float terrainNormalFade = smoothstep(
-        0.25, 0.65, saturate(dot(terrainGeometricNormal, viewDir)));
-    normal = normalize(lerp(
-        terrainGeometricNormal, normal, terrainNormalFade));
+    float terrainNdotV = dot(normal, viewDir);
+    if (terrainNdotV < 0.0)
+        normal = normalize(normal - 2.0 * terrainNdotV * viewDir);
 #endif
 
     // Forward imports use a no-cull PSO so foliage cards, rotor blades, and
