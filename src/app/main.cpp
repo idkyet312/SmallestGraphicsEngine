@@ -198,7 +198,7 @@ static XMFLOAT3&            g_helicopterSpawn = g_game.vehicles.helicopterSpawn;
 static XMFLOAT3&            g_secondaryHelicopterPosition =
     g_game.vehicles.secondaryHelicopterPosition;
 constexpr float             kHelicopterPatrolRadius = 16.0f;
-constexpr float             kHelicopterEngagementRange = 125.0f;
+constexpr float             kHelicopterEngagementRange = 90.0f;
 static float&               g_secondaryHelicopterYaw = g_game.vehicles.secondaryHelicopterYaw;
 static float&               g_secondaryHelicopterPitch = g_game.vehicles.secondaryHelicopterPitch;
 static float&               g_secondaryHelicopterRoll = g_game.vehicles.secondaryHelicopterRoll;
