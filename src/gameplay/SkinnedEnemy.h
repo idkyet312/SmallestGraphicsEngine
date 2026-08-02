@@ -32,6 +32,13 @@ extern EnemyLineOfSightFn g_enemyLineOfSightFn;
 struct EnemyNoiseEvent { DirectX::XMFLOAT3 position; float radius; };
 extern std::vector<EnemyNoiseEvent> g_enemyNoiseEvents;
 
+// Pushed by an enemy the instant it takes damage, so squadmates within radius
+// are yanked straight to Combat even without their own line of sight or
+// hearing check -- getting shot next to a friend is unmissable. Cleared each
+// frame alongside noise events.
+struct EnemyAlertEvent { DirectX::XMFLOAT3 position; float radius; };
+extern std::vector<EnemyAlertEvent> g_enemyAlertEvents;
+
 // Loadout class. Rifle is the original bandit behaviour; the other two change
 // engagement range, damage, and the shape of a shot rather than the model.
 enum class BanditWeapon {
@@ -585,6 +592,12 @@ public:
             const float nz = noise.position.z - position.z;
             const float radius = noise.radius;
             if (nx * nx + nz * nz <= radius * radius) return true;
+        }
+        for (const EnemyAlertEvent& alert : g_enemyAlertEvents) {
+            const float ax = alert.position.x - position.x;
+            const float az = alert.position.z - position.z;
+            const float radius = alert.radius;
+            if (ax * ax + az * az <= radius * radius) return true;
         }
         return false;
     }
@@ -1356,11 +1369,16 @@ private:
     float patrolPauseTimer_ = 0.0f;
     static constexpr float kVisionRange = 28.0f;
     static constexpr float kVisionHalfFovCos = 0.5f; // cos(60 deg): ~120 deg cone
-    static constexpr float kNoiseAlertRadiusSq = 20.0f * 20.0f;
+    static constexpr float kAlertBroadcastRadius = 10.0f;
 
     void RegisterThreat(float damage) {
         if (damage <= 0.0f || dead_) return;
         coverQueryCooldown_ = (std::min)(coverQueryCooldown_, 0.12f);
+        // Getting shot is unmissable even without line of sight or hearing the
+        // shot itself: snap straight to Combat and pull in nearby squadmates.
+        awareness_ = AwarenessState::Combat;
+        combatMemoryTimer_ = 4.0f;
+        g_enemyAlertEvents.push_back({ position, kAlertBroadcastRadius });
     }
 
     static bool ContainsNoCase(const std::string& value, const char* needle) {

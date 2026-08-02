@@ -1551,6 +1551,7 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
 
 EnemyLineOfSightFn g_enemyLineOfSightFn = &BanditHasLineOfSight;
 std::vector<EnemyNoiseEvent> g_enemyNoiseEvents;
+std::vector<EnemyAlertEvent> g_enemyAlertEvents;
 
 // Ballistic lob from the thrower toward the target. Solves the launch elevation
 // for a fixed speed under gravity, so grenades arc onto the player instead of
@@ -8329,6 +8330,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             bool burnedBanditDied = false;
             bool coverQuerySpent = false;
             g_enemyNoiseEvents.clear();
+            g_enemyAlertEvents.clear();
             for (auto& bandit : g_bandits) {
                 if (!bandit) continue;
                 if (bandit->UpdateBurning(
