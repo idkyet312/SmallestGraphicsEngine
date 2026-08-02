@@ -234,6 +234,9 @@ int main() {
     CHECK(combat.suppressFireUntilMouseRelease);
 
     PlayerState player;
+    CHECK(std::abs(player.HealthRegenPerSecond() - 50.0f) < 0.0001f);
+    CHECK(std::abs(player.HealthRegenPerSecond() * player.regenDuration -
+                   player.maxHealth) < 0.0001f);
     player.magazine[0] = 1;
     CHECK(player.ConsumeAmmo(0));
     CHECK(player.magazine[0] == 0);

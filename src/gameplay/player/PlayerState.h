@@ -8,8 +8,12 @@ struct PlayerState {
     bool godMode = false;
     bool healthRegen = true;
     float regenDelay = 5.0f;
-    float regenRate = 12.0f;
+    float regenDuration = 2.0f;
     float regenTimer = 0.0f;
+
+    float HealthRegenPerSecond() const {
+        return regenDuration > 0.0f ? maxHealth / regenDuration : maxHealth;
+    }
 
     static constexpr int kWeaponSlots = 8;
     int magazineSize[kWeaponSlots] = { 30, 8, 1, 10, 120, 6, 100, 1 };

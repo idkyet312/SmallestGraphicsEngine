@@ -573,7 +573,7 @@ struct Scene {
             player.regenTimer = (std::max)(0.0f, player.regenTimer - dt);
             if (player.regenTimer <= 0.0f) {
                 player.health = (std::min)(player.maxHealth,
-                                           player.health + player.regenRate * dt);
+                    player.health + player.HealthRegenPerSecond() * dt);
             }
         }
         // Sharp impulse, quick mechanical return. Camera aim stays displaced,
