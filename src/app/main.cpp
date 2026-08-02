@@ -1449,8 +1449,11 @@ static bool ShootPlayerWeapon() {
         g_gunAudio.Play(0.82f, pitch);
     }
     // Gunfire is loud enough for nearby enemies to hear through walls, even
-    // ones that can't currently see the player.
-    g_enemyNoiseEvents.push_back({ scene.camera.Position, 35.0f });
+    // ones that can't currently see the player. Same radius as the squad-alert
+    // broadcast so "heard the shot" and "saw a squadmate get hit" read as the
+    // same kind of event.
+    g_enemyNoiseEvents.push_back(
+        { scene.camera.Position, SkinnedEnemy::AlertBroadcastRadius() });
     return true;
 }
 
@@ -8329,8 +8332,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             static std::unordered_map<SkinnedEnemy*, float> banditUpdateDebt;
             bool burnedBanditDied = false;
             bool coverQuerySpent = false;
-            g_enemyNoiseEvents.clear();
-            g_enemyAlertEvents.clear();
             for (auto& bandit : g_bandits) {
                 if (!bandit) continue;
                 if (bandit->UpdateBurning(
@@ -8513,6 +8514,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             if (burnedBanditDied) PlayBanditDeathEvents();
             UpdateHelicopterRotorKills();
+            // Clear after every enemy has had a chance to read this frame's
+            // noise/alert events (pushed earlier in the frame by player shots,
+            // or below by projectile-vs-bandit hits), not before -- clearing
+            // up front wiped a shot's own noise event before any bandit ever
+            // saw it, since ShootPlayerWeapon runs earlier in the frame.
+            g_enemyNoiseEvents.clear();
+            g_enemyAlertEvents.clear();
         }
         if (!g_emptyLevelMode) {
         g_water.Update(deltaTime);

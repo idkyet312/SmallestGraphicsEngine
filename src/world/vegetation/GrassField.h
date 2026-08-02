@@ -638,7 +638,7 @@ private:
     // no pixels and the field has no hard edge. Enforced in the vertex shader --
     // the geometry is static, so there is nothing to cull on the CPU. Runtime-
     // tunable (with kFadeBand and density) via the UI perf sliders.
-    float m_drawDistance = 28.0f;
+    float m_drawDistance = 32.0f;
     // Width of that shrink, so the fade edge does not read as a ring of grass
     // popping in and out as the player walks.
     float m_fadeBand = 6.0f;

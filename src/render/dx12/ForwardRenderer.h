@@ -1342,7 +1342,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         visibleDandelions.clear();
         visibleDandelions.reserve(g_dandelionInstances.size());
         const float maxDandelionDistance = g_grass.IsInitialized()
-            ? g_grass.DrawDistance() : 28.0f;
+            ? g_grass.DrawDistance() : 32.0f;
         for (const DandelionInstance& dandelion : g_dandelionInstances) {
             const float dx = dandelion.center.x - scene.camera.Position.x;
             const float dz = dandelion.center.z - scene.camera.Position.z;

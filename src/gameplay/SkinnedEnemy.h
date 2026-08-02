@@ -107,6 +107,7 @@ public:
     // Vision cone parameters for debug visualization. Half-angle in radians
     // (not the stored cosine) so callers can build cone geometry directly.
     float VisionRange() const { return kVisionRange; }
+    static float AlertBroadcastRadius() { return kAlertBroadcastRadius; }
     float VisionHalfFovRadians() const { return std::acos(kVisionHalfFovCos); }
 
     // Optional authored patrol path. Leave unset and an enemy wanders in a
