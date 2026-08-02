@@ -48,6 +48,7 @@ constexpr uint64_t CollisionCategoryLodDebris = PhysicsImpactPolicy::LodDebris;
 constexpr uint64_t CollisionCategoryBarrel = PhysicsImpactPolicy::Barrel;
 constexpr uint64_t CollisionCategoryRagdoll = PhysicsImpactPolicy::Ragdoll;
 constexpr uint64_t CollisionCategoryVehicle = PhysicsImpactPolicy::Vehicle;
+constexpr uint64_t CollisionCategoryGrenade = PhysicsImpactPolicy::Grenade;
 // Uniform starting health for every bond/chunk. A bullet's per-hit damage is a
 // fraction of this, so a joint takes several hits before it lets go.
 constexpr float kBondHealth = 1.0f;
@@ -336,6 +337,11 @@ struct DestructionDX12::Impl {
         b3BodyId body = b3_nullBodyId;
     };
 
+    struct GrenadeRuntime {
+        uint32_t handle = 0;
+        b3BodyId body = b3_nullBodyId;
+    };
+
     struct BodySeed {
         bool valid = false;
         XMFLOAT3 modelCenter = {};
@@ -394,6 +400,9 @@ struct DestructionDX12::Impl {
     std::vector<BarrelRuntime> barrelBodies;
     std::vector<uint32_t> barrelImpactEvents;
     uint32_t nextBarrelHandle = 1;
+    std::vector<GrenadeRuntime> grenadeBodies;
+    std::vector<uint32_t> grenadeContactEvents;
+    uint32_t nextGrenadeHandle = 1;
     std::vector<DestructionRenderItem> renderItems;
     std::vector<DestructionRenderBatch> renderBatches;
     struct BatchCacheEntry {
@@ -2757,6 +2766,7 @@ void DestructionDX12::Shutdown() {
     m->chunks.clear(); m->renderItems.clear(); m->renderBatches.clear();
     m->batchCache.clear(); m->spatialBatchCache.clear(); m->ragdollParts.clear();
     m->barrelBodies.clear(); m->barrelImpactEvents.clear(); m->vortices.clear();
+    m->grenadeBodies.clear(); m->grenadeContactEvents.clear();
     m->burningChunks.clear(); m->harpoonRagdolls.clear();
     m->pinnedHarpoonRagdolls.clear();
     for (auto& retired : m->retiredBatchNodes) retired.clear();
@@ -2979,6 +2989,19 @@ void DestructionDX12::Update(float dt) {
         // threshold (debris slamming the house, pieces crashing onto the
         // ground) fracture the cell they land on, same as a bullet strike.
         const b3ContactEvents events = b3World_GetContactEvents(m->world);
+        for (int i = 0; i < events.beginCount; ++i) {
+            const b3ContactBeginTouchEvent& contact = events.beginEvents[i];
+            const b3BodyId bodyA = b3Shape_GetBody(contact.shapeIdA);
+            const b3BodyId bodyB = b3Shape_GetBody(contact.shapeIdB);
+            for (const Impl::GrenadeRuntime& grenade : m->grenadeBodies) {
+                if (!B3_ID_EQUALS(grenade.body, bodyA) &&
+                    !B3_ID_EQUALS(grenade.body, bodyB)) continue;
+                if (std::find(m->grenadeContactEvents.begin(),
+                              m->grenadeContactEvents.end(), grenade.handle) ==
+                    m->grenadeContactEvents.end())
+                    m->grenadeContactEvents.push_back(grenade.handle);
+            }
+        }
         // Splitting an actor destroys its Box3D body. Copy event points before
         // doing that because Box3D owns the contact-event buffer.
         std::vector<XMFLOAT3> hitPoints;
@@ -3738,6 +3761,138 @@ std::vector<uint32_t> DestructionDX12::DrainExplosiveBarrelImpactEvents() {
     if (!m) return {};
     std::vector<uint32_t> events;
     events.swap(m->barrelImpactEvents);
+    return events;
+}
+
+uint32_t DestructionDX12::CreateGrenadeBody(
+    const XMFLOAT3& worldPosition, const XMFLOAT3& linearVelocity,
+    bool capsuleShape, float gravityScale) {
+    if (!m || !m->initialized || B3_IS_NULL(m->world)) return 0;
+
+    b3BodyDef bodyDef = b3DefaultBodyDef();
+    bodyDef.type = b3_dynamicBody;
+    bodyDef.position = {
+        worldPosition.x, worldPosition.y, worldPosition.z };
+    bodyDef.linearVelocity = {
+        linearVelocity.x, linearVelocity.y, linearVelocity.z };
+    bodyDef.angularVelocity = {
+        linearVelocity.z * 0.72f, 5.5f, -linearVelocity.x * 0.72f };
+    bodyDef.gravityScale = std::max(0.0f, gravityScale);
+    bodyDef.linearDamping = 0.045f;
+    bodyDef.angularDamping = 0.16f;
+    bodyDef.isBullet = true;
+    bodyDef.allowFastRotation = true;
+    const b3BodyId body = b3CreateBody(m->world, &bodyDef);
+
+    b3ShapeDef shapeDef = b3DefaultShapeDef();
+    // Roughly 0.42 kg for a fragmentation grenade and 0.46 kg for the bottle.
+    shapeDef.density = 100.0f;
+    shapeDef.baseMaterial.friction = 0.68f;
+    shapeDef.baseMaterial.restitution = 0.30f;
+    shapeDef.baseMaterial.rollingResistance = capsuleShape ? 0.10f : 0.055f;
+    shapeDef.enableContactEvents = true;
+    shapeDef.enableHitEvents = true;
+    shapeDef.filter.categoryBits = CollisionCategoryGrenade;
+    shapeDef.filter.maskBits = B3_DEFAULT_MASK_BITS;
+    if (capsuleShape) {
+        const b3Capsule capsule = {
+            { 0.0f, -0.10f, 0.0f }, { 0.0f, 0.10f, 0.0f }, 0.07f };
+        b3CreateCapsuleShape(body, &shapeDef, &capsule);
+    } else {
+        const b3Sphere sphere = { { 0.0f, 0.0f, 0.0f }, 0.10f };
+        b3CreateSphereShape(body, &shapeDef, &sphere);
+    }
+
+    uint32_t handle = m->nextGrenadeHandle++;
+    if (handle == 0) handle = m->nextGrenadeHandle++;
+    m->grenadeBodies.push_back({ handle, body });
+    return handle;
+}
+
+bool DestructionDX12::GetGrenadeBodyPose(
+    uint32_t handle, DestructionBodyPose& pose) const {
+    if (!m || handle == 0) return false;
+    const auto it = std::find_if(
+        m->grenadeBodies.begin(), m->grenadeBodies.end(),
+        [handle](const Impl::GrenadeRuntime& grenade) {
+            return grenade.handle == handle;
+        });
+    if (it == m->grenadeBodies.end() || B3_IS_NULL(it->body) ||
+        !b3Body_IsValid(it->body)) return false;
+    const b3Pos position = b3Body_GetPosition(it->body);
+    const b3Quat rotation = b3Body_GetRotation(it->body);
+    const b3Vec3 velocity = b3Body_GetLinearVelocity(it->body);
+    pose.position = {
+        (float)position.x, (float)position.y, (float)position.z };
+    pose.rotation = {
+        rotation.v.x, rotation.v.y, rotation.v.z, rotation.s };
+    pose.linearVelocity = { velocity.x, velocity.y, velocity.z };
+    return true;
+}
+
+bool DestructionDX12::ResolveGrenadeBodyCollision(
+    uint32_t handle, const XMFLOAT3& position,
+    const XMFLOAT3& surfaceNormal) {
+    if (!m || handle == 0) return false;
+    const auto it = std::find_if(
+        m->grenadeBodies.begin(), m->grenadeBodies.end(),
+        [handle](const Impl::GrenadeRuntime& grenade) {
+            return grenade.handle == handle;
+        });
+    if (it == m->grenadeBodies.end() || B3_IS_NULL(it->body) ||
+        !b3Body_IsValid(it->body)) return false;
+
+    b3Vec3 normal = {
+        surfaceNormal.x, surfaceNormal.y, surfaceNormal.z };
+    const float normalLength = b3Length(normal);
+    if (normalLength < 1e-5f) normal = { 0.0f, 1.0f, 0.0f };
+    else normal = b3MulSV(1.0f / normalLength, normal);
+    b3Vec3 velocity = b3Body_GetLinearVelocity(it->body);
+    const float incoming = b3Dot(velocity, normal);
+    if (incoming < 0.0f) {
+        constexpr float restitution = 0.30f;
+        constexpr float tangentRetention = 0.76f;
+        velocity = b3Sub(
+            velocity, b3MulSV((1.0f + restitution) * incoming, normal));
+        const b3Vec3 normalVelocity = b3MulSV(b3Dot(velocity, normal), normal);
+        const b3Vec3 tangentVelocity = b3Sub(velocity, normalVelocity);
+        velocity = b3Add(
+            normalVelocity, b3MulSV(tangentRetention, tangentVelocity));
+        b3Body_SetLinearVelocity(it->body, velocity);
+        const b3Vec3 spin = b3Cross(normal, tangentVelocity);
+        b3Body_ApplyAngularImpulse(it->body, b3MulSV(0.018f, spin), true);
+    }
+    const b3Quat rotation = b3Body_GetRotation(it->body);
+    const b3Pos corrected = {
+        position.x + normal.x * 0.018f,
+        position.y + normal.y * 0.018f,
+        position.z + normal.z * 0.018f };
+    b3Body_SetTransform(it->body, corrected, rotation);
+    b3Body_SetAwake(it->body, true);
+    return true;
+}
+
+void DestructionDX12::DestroyGrenadeBody(uint32_t handle) {
+    if (!m || handle == 0) return;
+    const auto it = std::find_if(
+        m->grenadeBodies.begin(), m->grenadeBodies.end(),
+        [handle](const Impl::GrenadeRuntime& grenade) {
+            return grenade.handle == handle;
+        });
+    if (it == m->grenadeBodies.end()) return;
+    if (!B3_IS_NULL(it->body) && b3Body_IsValid(it->body))
+        b3DestroyBody(it->body);
+    m->grenadeBodies.erase(it);
+    m->grenadeContactEvents.erase(
+        std::remove(m->grenadeContactEvents.begin(),
+                    m->grenadeContactEvents.end(), handle),
+        m->grenadeContactEvents.end());
+}
+
+std::vector<uint32_t> DestructionDX12::DrainGrenadeContactEvents() {
+    if (!m) return {};
+    std::vector<uint32_t> events;
+    events.swap(m->grenadeContactEvents);
     return events;
 }
 

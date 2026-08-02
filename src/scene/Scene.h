@@ -59,6 +59,8 @@ struct Projectile {
     XMFLOAT3 velocity = { 0, 0, 0 };   // grenades integrate velocity + gravity
     float    fuse = 0.0f;              // seconds until it explodes
     float    grenadeCollisionGrace = 0.0f; // clears thrower's body before collision
+    uint32_t grenadePhysicsHandle = 0; // live Box3D rigid body after throw
+    XMFLOAT4 rotation = { 0, 0, 0, 1 };
     bool     detonate = false;         // set the frame it should explode
     float    fxCooldown = 0.0f;
 };
@@ -617,26 +619,31 @@ struct Scene {
             } else if (p.grenade) {
                 // Frag grenades bounce until fuse expiry. Molotov and vortex
                 // grenades trigger immediately on first ground contact.
-                p.velocity.y += -9.81f * grenadeGravityScale * dt;
                 p.grenadeCollisionGrace = (std::max)(
                     0.0f, p.grenadeCollisionGrace - dt);
-                p.position.x += p.velocity.x * dt;
-                p.position.y += p.velocity.y * dt;
-                p.position.z += p.velocity.z * dt;
-                const float surfaceY = grenadeGroundHeight
-                    ? grenadeGroundHeight(p.position.x, p.position.z) : 0.0f;
-                const float bounceY = surfaceY + grenadeGroundY;
-                if (p.position.y < bounceY) {
-                    p.position.y = bounceY;
-                    if (p.molotov || p.vortex) {
-                        p.detonate = true;
-                        p.active = false;
-                    } else if (p.velocity.y < 0.0f) {
-                        p.velocity.y = -p.velocity.y * 0.4f;
-                    }
-                    if (!p.molotov && !p.vortex) {
-                        p.velocity.x *= 0.7f;
-                        p.velocity.z *= 0.7f;
+                // Box3D owns gravity, contact response, friction, spin, and
+                // sleeping once the runtime creates the thrown rigid body.
+                // Keep the original ground fallback for levels without physics.
+                if (p.grenadePhysicsHandle == 0) {
+                    p.velocity.y += -9.81f * grenadeGravityScale * dt;
+                    p.position.x += p.velocity.x * dt;
+                    p.position.y += p.velocity.y * dt;
+                    p.position.z += p.velocity.z * dt;
+                    const float surfaceY = grenadeGroundHeight
+                        ? grenadeGroundHeight(p.position.x, p.position.z) : 0.0f;
+                    const float bounceY = surfaceY + grenadeGroundY;
+                    if (p.position.y < bounceY) {
+                        p.position.y = bounceY;
+                        if (p.molotov || p.vortex) {
+                            p.detonate = true;
+                            p.active = false;
+                        } else if (p.velocity.y < 0.0f) {
+                            p.velocity.y = -p.velocity.y * 0.4f;
+                        }
+                        if (!p.molotov && !p.vortex) {
+                            p.velocity.x *= 0.7f;
+                            p.velocity.z *= 0.7f;
+                        }
                     }
                 }
                 if (p.molotov && p.active) {

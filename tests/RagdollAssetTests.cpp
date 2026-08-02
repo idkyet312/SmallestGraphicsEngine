@@ -151,6 +151,12 @@ int main() {
     Check(PhysicsImpactPolicy::CanFracture(
               PhysicsImpactPolicy::Vehicle, PhysicsImpactPolicy::World),
           "vehicle must retain impact fracture");
+    Check(!PhysicsImpactPolicy::CanFracture(
+              PhysicsImpactPolicy::Grenade, PhysicsImpactPolicy::World),
+          "grenade body impact must not fracture before detonation");
+    Check(!PhysicsImpactPolicy::CanFracture(
+              PhysicsImpactPolicy::Grenade, PhysicsImpactPolicy::Debris),
+          "grenade contact must suppress debris-driven bond damage");
     if (failures == 0) std::cout << "Ragdoll asset tests passed\n";
     return failures == 0 ? 0 : 1;
 }

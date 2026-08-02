@@ -1828,13 +1828,16 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             continue;
         }
         if (p.grenade) {
+            const XMMATRIX grenadeRotation = XMMatrixRotationQuaternion(
+                XMQuaternionNormalize(XMLoadFloat4(&p.rotation)));
+            const XMMATRIX grenadeTranslation = XMMatrixTranslation(
+                p.position.x, p.position.y, p.position.z);
             if (p.molotov) {
                 model = XMMatrixScaling(
                             scene.projectileScale * 1.15f,
                             scene.projectileScale * 2.7f,
                             scene.projectileScale * 1.15f) *
-                        XMMatrixTranslation(
-                            p.position.x, p.position.y, p.position.z);
+                        grenadeRotation * grenadeTranslation;
                 shader.SetMatrices(model, view, proj, lightSpace);
                 shader.SetObjectMaterial(
                     XMFLOAT3(0.14f, 0.20f, 0.08f), false, false,
@@ -1845,8 +1848,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                             scene.projectileScale * 1.85f,
                             scene.projectileScale * 1.85f,
                             scene.projectileScale * 1.85f) *
-                        XMMatrixTranslation(
-                            p.position.x, p.position.y, p.position.z);
+                        grenadeRotation * grenadeTranslation;
                 shader.SetMatrices(model, view, proj, lightSpace);
                 shader.SetObjectMaterial(
                     XMFLOAT3(0.10f, 0.48f, 0.82f), false, false,
@@ -1857,8 +1859,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                             scene.projectileScale * 1.6f,
                             scene.projectileScale * 1.6f,
                             scene.projectileScale * 1.6f) *
-                        XMMatrixTranslation(
-                            p.position.x, p.position.y, p.position.z);
+                        grenadeRotation * grenadeTranslation;
                 shader.SetMatrices(model, view, proj, lightSpace);
                 shader.SetObjectMaterial(
                     XMFLOAT3(0.10f, 0.12f, 0.08f), false, false,

@@ -219,6 +219,17 @@ public:
         const DirectX::XMFLOAT3& angularVelocity = {});
     void DestroyExplosiveBarrelBody(uint32_t handle);
     std::vector<uint32_t> DrainExplosiveBarrelImpactEvents();
+    uint32_t CreateGrenadeBody(
+        const DirectX::XMFLOAT3& worldPosition,
+        const DirectX::XMFLOAT3& linearVelocity,
+        bool capsuleShape = false, float gravityScale = 1.0f);
+    bool GetGrenadeBodyPose(uint32_t handle,
+                            DestructionBodyPose& pose) const;
+    bool ResolveGrenadeBodyCollision(
+        uint32_t handle, const DirectX::XMFLOAT3& position,
+        const DirectX::XMFLOAT3& surfaceNormal);
+    void DestroyGrenadeBody(uint32_t handle);
+    std::vector<uint32_t> DrainGrenadeContactEvents();
     void ApplyRagdollExplosion(const DirectX::XMFLOAT3& worldPosition,
                                float radius, float impulse);
     bool ApplyImpulse(const DirectX::XMFLOAT3& worldPosition,

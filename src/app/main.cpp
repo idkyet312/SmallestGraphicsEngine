@@ -4015,12 +4015,43 @@ static XMFLOAT3 GrenadeFallbackNormal(const Projectile& grenade) {
     return normal;
 }
 
+static void SyncGrenadePhysicsBodies(bool advancePreviousPosition) {
+    if (!scene.useDestruction || !g_destruction.IsInitialized()) return;
+    for (Projectile& grenade : scene.projectiles) {
+        if (!grenade.grenade) continue;
+        if (grenade.grenadePhysicsHandle == 0 && grenade.active) {
+            grenade.grenadePhysicsHandle = g_destruction.CreateGrenadeBody(
+                grenade.position, grenade.velocity, grenade.molotov,
+                scene.grenadeGravityScale);
+        }
+        if (grenade.grenadePhysicsHandle == 0) continue;
+        DestructionBodyPose pose;
+        if (!g_destruction.GetGrenadeBodyPose(
+                grenade.grenadePhysicsHandle, pose)) {
+            grenade.grenadePhysicsHandle = 0;
+            if (!grenade.active) continue;
+            grenade.grenadePhysicsHandle = g_destruction.CreateGrenadeBody(
+                grenade.position, grenade.velocity, grenade.molotov,
+                scene.grenadeGravityScale);
+            if (grenade.grenadePhysicsHandle == 0 ||
+                !g_destruction.GetGrenadeBodyPose(
+                    grenade.grenadePhysicsHandle, pose)) continue;
+        }
+        if (advancePreviousPosition)
+            grenade.previousPosition = grenade.position;
+        grenade.position = pose.position;
+        grenade.rotation = pose.rotation;
+        grenade.velocity = pose.linearVelocity;
+    }
+}
+
 // Swept grenade collision against every solid gameplay surface. Hit helpers
 // already expand their shapes by radius, so fast throws cannot tunnel through
 // thin walls between frames.
 static bool HitGrenadeCollision(const Projectile& grenade, float radius,
                                 XMFLOAT3& closestHit,
-                                XMFLOAT3& closestNormal) {
+                                XMFLOAT3& closestNormal,
+                                bool includePhysicsWorld) {
     const XMFLOAT3 start = grenade.previousPosition;
     const XMFLOAT3 end = grenade.position;
     const XMFLOAT3 fallback = GrenadeFallbackNormal(grenade);
@@ -4091,16 +4122,20 @@ static bool HitGrenadeCollision(const Projectile& grenade, float radius,
 
     size_t barrelIndex = 0;
     if (HitExplosiveBarrelSegment(
-            start, end, radius, barrelIndex, candidate))
+            start, end, radius, barrelIndex, candidate) &&
+        (includePhysicsWorld ||
+         scene.explosiveBarrels[barrelIndex].physicsHandle == 0))
         accept(candidate, radialNormal(
             candidate, scene.explosiveBarrels[barrelIndex].position));
-    if (g_destruction.HitTestSegment(start, end, radius, candidate))
+    if (includePhysicsWorld &&
+        g_destruction.HitTestSegment(start, end, radius, candidate))
         accept(candidate, fallback);
     if (g_trees.BlocksSegment(start, end, radius))
-        accept(end, fallback);
+        accept(start, fallback);
     if (HitPrefabColliderSegment(start, end, radius, candidate))
         accept(candidate, fallback);
-    if (HitTerrainSegment(start, end, radius, candidate)) {
+    if (includePhysicsWorld &&
+        HitTerrainSegment(start, end, radius, candidate)) {
         auto params = CurrentTerrainParams();
         params.heightScale = scene.terrainHeightScale;
         constexpr float sampleOffset = 0.20f;
@@ -8037,6 +8072,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_game.session.Tick(deltaTime);
 
         ProcessInput(hwnd);
+        // Player throws happen during input. Create the rigid body before
+        // Scene::Update so manual projectile gravity never runs for one frame.
+        SyncGrenadePhysicsBodies(false);
 
         // Walking collision: ground level follows the mesh-shader terrain at
         // the camera's XZ so gravity settles the player onto the hills.
@@ -8445,6 +8483,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
+            // Enemy throws happen after Scene::Update. Capture them before this
+            // frame's fixed physics steps as well.
+            SyncGrenadePhysicsBodies(false);
             {
                 ProfilerDX12::CpuScope profile(g_profiler, "Destruction Update");
                 g_game.physicsClock.Accumulate(deltaTime);
@@ -8452,6 +8493,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 while (g_game.physicsClock.Consume(physicsStep))
                     g_destruction.Update(physicsStep);
             }
+            SyncGrenadePhysicsBodies(true);
+            const std::vector<uint32_t> grenadeContactEvents =
+                g_destruction.DrainGrenadeContactEvents();
             for (const DestructionBurningPoint& fire :
                  g_destruction.GetBurningChunkPoints()) {
                 if (scene.burningTargets.size() >= 72) break;
@@ -8568,14 +8612,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             UpdateHarpoonAttachments();
             for (auto& projectile : scene.projectiles) {
                 if (projectile.grenade && projectile.active) {
+                    if ((projectile.molotov || projectile.vortex) &&
+                        std::find(grenadeContactEvents.begin(),
+                                  grenadeContactEvents.end(),
+                                  projectile.grenadePhysicsHandle) !=
+                            grenadeContactEvents.end()) {
+                        projectile.active = false;
+                        projectile.detonate = true;
+                    }
                     XMFLOAT3 impact;
                     XMFLOAT3 normal;
-                    if (HitGrenadeCollision(
-                            projectile, 0.20f, impact, normal)) {
+                    if (projectile.active && HitGrenadeCollision(
+                            projectile, 0.11f, impact, normal,
+                            projectile.grenadePhysicsHandle == 0)) {
                         if (projectile.molotov || projectile.vortex) {
                             projectile.position = impact;
                             projectile.active = false;
                             projectile.detonate = true;
+                        } else if (projectile.grenadePhysicsHandle != 0) {
+                            g_destruction.ResolveGrenadeBodyCollision(
+                                projectile.grenadePhysicsHandle,
+                                impact, normal);
+                            DestructionBodyPose pose;
+                            if (g_destruction.GetGrenadeBodyPose(
+                                    projectile.grenadePhysicsHandle, pose)) {
+                                projectile.position = pose.position;
+                                projectile.rotation = pose.rotation;
+                                projectile.velocity = pose.linearVelocity;
+                            }
                         } else {
                             BounceGrenade(projectile, impact, normal);
                         }
@@ -8654,6 +8718,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     // Grenades use fuse; rockets detonate on first solid impact.
                     if (projectile.detonate) {
                         const XMFLOAT3 center = projectile.position;
+                        if (projectile.grenadePhysicsHandle != 0) {
+                            g_destruction.DestroyGrenadeBody(
+                                projectile.grenadePhysicsHandle);
+                            projectile.grenadePhysicsHandle = 0;
+                        }
                         const bool c4Blast = projectile.remoteCharge;
                         const float blastRadius = c4Blast
                             ? 5.4f : scene.grenadeBlastRadius;
