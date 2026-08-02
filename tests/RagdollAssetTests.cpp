@@ -48,12 +48,30 @@ int main() {
           "thigh capsule radius must be reduced for self-collision");
     Check(thigh && thigh->shapes[0].length > 0.23f,
           "thigh capsule must preserve authored bone coverage");
+    if (thigh && !thigh->shapes.empty()) {
+        DirectX::XMFLOAT3 axis;
+        DirectX::XMStoreFloat3(&axis, DirectX::XMVector3Rotate(
+            DirectX::XMVectorSet(0, 1, 0, 0),
+            DirectX::XMLoadFloat4(&thigh->shapes[0].rotation)));
+        Check(std::abs(axis.x) > 0.95f,
+              "thigh capsule long axis must follow thigh bone");
+        Check(std::abs(axis.y) < 0.10f && std::abs(axis.z) < 0.10f,
+              "thigh capsule must not stand across thigh bone");
+    }
     Check(calf && calf->shapes.size() == 1,
           "right calf capsule missing");
     Check(calf && calf->shapes[0].radius < 0.075f,
           "calf capsule radius must be reduced for self-collision");
     Check(calf && calf->shapes[0].length > 0.20f,
           "calf capsule must preserve authored bone coverage");
+    if (calf && !calf->shapes.empty()) {
+        DirectX::XMFLOAT3 axis;
+        DirectX::XMStoreFloat3(&axis, DirectX::XMVector3Rotate(
+            DirectX::XMVectorSet(0, 1, 0, 0),
+            DirectX::XMLoadFloat4(&calf->shapes[0].rotation)));
+        Check(std::abs(axis.x) > 0.95f,
+              "calf capsule long axis must follow calf bone");
+    }
 
     int hingeCount = 0;
     bool foundKneeFrame = false;

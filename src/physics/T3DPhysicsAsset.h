@@ -103,11 +103,14 @@ private:
     }
 
     static DirectX::XMFLOAT4 Rotation(const std::string& text) {
-        const DirectX::XMFLOAT3 euler = Vec3(text, "Rotation");
         const float d = DirectX::XM_PI / 180.0f;
+        const float pitch = Field(text, "Pitch") * d;
+        const float yaw = Field(text, "Yaw") * d;
+        const float roll = Field(text, "Roll") * d;
         DirectX::XMFLOAT4 result;
         DirectX::XMStoreFloat4(&result,
-            DirectX::XMQuaternionRotationRollPitchYaw(euler.z*d, euler.x*d, euler.y*d));
+            // Unreal Rotator: roll around X, pitch around Y, yaw around Z.
+            DirectX::XMQuaternionRotationRollPitchYaw(roll, pitch, yaw));
         return result;
     }
 
