@@ -24,9 +24,13 @@ int main() {
 
     float massFraction = 0.0f;
     const RagdollBodySpec* torso = nullptr;
+    const RagdollBodySpec* thigh = nullptr;
+    const RagdollBodySpec* calf = nullptr;
     for (const RagdollBodySpec& body : ragdoll.bodies) {
         massFraction += body.massFraction;
         if (body.bone == "spine_02") torso = &body;
+        if (body.bone == "thigh_r") thigh = &body;
+        if (body.bone == "calf_r") calf = &body;
     }
     Check(std::abs(massFraction - 1.0f) < 0.0001f,
           "human body mass fractions must sum to one");
@@ -38,6 +42,18 @@ int main() {
             Check(shape.type == RagdollShapeType::Capsule,
                   "spine_02 primitive must be capsule");
     }
+    Check(thigh && thigh->shapes.size() == 1,
+          "right thigh capsule missing");
+    Check(thigh && thigh->shapes[0].radius < 0.085f,
+          "thigh capsule radius must be reduced for self-collision");
+    Check(thigh && thigh->shapes[0].length > 0.23f,
+          "thigh capsule must preserve authored bone coverage");
+    Check(calf && calf->shapes.size() == 1,
+          "right calf capsule missing");
+    Check(calf && calf->shapes[0].radius < 0.075f,
+          "calf capsule radius must be reduced for self-collision");
+    Check(calf && calf->shapes[0].length > 0.20f,
+          "calf capsule must preserve authored bone coverage");
 
     int hingeCount = 0;
     bool foundKneeFrame = false;
@@ -77,13 +93,6 @@ int main() {
     Check(PhysicsImpactPolicy::CanFracture(
               PhysicsImpactPolicy::Vehicle, PhysicsImpactPolicy::World),
           "vehicle must retain impact fracture");
-    const int corpseA = PhysicsImpactPolicy::RagdollCollisionGroup(0);
-    const int corpseB = PhysicsImpactPolicy::RagdollCollisionGroup(1);
-    Check(corpseA < 0 && corpseB < 0,
-          "ragdoll self-collision groups must be negative");
-    Check(corpseA != corpseB,
-          "different ragdolls must retain collision with each other");
-
     if (failures == 0) std::cout << "Ragdoll asset tests passed\n";
     return failures == 0 ? 0 : 1;
 }

@@ -23,6 +23,7 @@ public:
             body.bone = (*it)[2].str();
             body.massFraction = HumanMassFraction(body.bone);
             ParseShapes(geom, body.shapes);
+            ApplyHumanColliderSizing(body);
             if (!body.shapes.empty()) result.bodies.push_back(std::move(body));
         }
 
@@ -88,6 +89,17 @@ private:
         if (Contains(bone, "calf")) return 0.045f;
         if (Contains(bone, "foot")) return 0.013f;
         return 0.01f;
+    }
+
+    static void ApplyHumanColliderSizing(RagdollBodySpec& body) {
+        float radiusScale = 1.0f;
+        if (Contains(body.bone, "thigh")) radiusScale = 0.78f;
+        else if (Contains(body.bone, "calf")) radiusScale = 0.82f;
+        if (radiusScale == 1.0f) return;
+        for (RagdollShapeSpec& shape : body.shapes) {
+            if (shape.type == RagdollShapeType::Capsule)
+                shape.radius *= radiusScale;
+        }
     }
 
     static DirectX::XMFLOAT4 Rotation(const std::string& text) {
