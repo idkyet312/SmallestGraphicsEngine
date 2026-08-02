@@ -3260,9 +3260,23 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
                 runtime.joints.push_back({ joint, link.jointType, passiveTorque });
             }
         } else {
+            // T3D often omits one side's orientation frame. Center Box3D's
+            // angular limits on the actual death pose so the cone solver cannot
+            // snap thighs (or other limbs) toward an unrelated bind-pose frame.
+            const b3Quat worldA = b3MulQuat(
+                b3Body_GetRotation(bodyA), frameA.q);
+            const b3Quat worldB = b3MulQuat(
+                b3Body_GetRotation(bodyB), frameB.q);
+            const b3Quat spawnRelative = b3NormalizeQuat(
+                b3InvMulQuat(worldA, worldB));
+            b3Transform centeredFrameB = frameB;
+            centeredFrameB.q = b3NormalizeQuat(b3MulQuat(
+                frameB.q, b3Conjugate(spawnRelative)));
+
             b3SphericalJointDef jd = b3DefaultSphericalJointDef();
             jd.base.bodyIdA = bodyA; jd.base.bodyIdB = bodyB;
-            jd.base.localFrameA = frameA; jd.base.localFrameB = frameB;
+            jd.base.localFrameA = frameA;
+            jd.base.localFrameB = centeredFrameB;
             jd.base.collideConnected = false;
             jd.enableConeLimit = link.swing1Motion != RagdollMotion::Free ||
                                  link.swing2Motion != RagdollMotion::Free;
@@ -3274,13 +3288,12 @@ uint32_t DestructionDX12::SpawnAuthoredRagdoll(
             jd.enableSpring = true;
             jd.hertz = 4.0f;
             jd.dampingRatio = 1.0f;
-            const b3Quat worldA = b3MulQuat(b3Body_GetRotation(bodyA), frameA.q);
-            const b3Quat worldB = b3MulQuat(b3Body_GetRotation(bodyB), frameB.q);
-            jd.targetRotation = b3InvMulQuat(worldA, worldB);
+            jd.targetRotation = b3Quat_identity;
             const b3JointId joint = b3CreateSphericalJoint(m->world, &jd);
             if (!B3_IS_NULL(joint)) {
                 runtime.joints.push_back({ joint, link.jointType, passiveTorque });
-                runtime.softLimits.push_back({ bodyA, bodyB, frameA.q, frameB.q,
+                runtime.softLimits.push_back({ bodyA, bodyB, frameA.q,
+                    centeredFrameB.q,
                     std::max(0.035f, link.swing1Angle),
                     std::max(0.035f, link.swing2Angle) });
             }

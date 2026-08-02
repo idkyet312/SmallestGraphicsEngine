@@ -178,8 +178,10 @@ private:
             link.swing1Angle = 70*d; link.swing2Angle = 55*d;
             link.lowerTwistAngle = -35*d; link.upperTwistAngle = 35*d;
         } else if (Contains(link.boneA, "thigh")) {
-            link.swing1Angle = 50*d; link.swing2Angle = 35*d;
-            link.lowerTwistAngle = -25*d; link.upperTwistAngle = 25*d;
+            // Keep hip flexion useful while limiting sideways abduction. The
+            // previous 35 degree secondary swing made both legs splay on death.
+            link.swing1Angle = 45*d; link.swing2Angle = 18*d;
+            link.lowerTwistAngle = -20*d; link.upperTwistAngle = 20*d;
         }
     }
 

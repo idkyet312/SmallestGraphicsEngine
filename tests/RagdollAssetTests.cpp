@@ -41,8 +41,16 @@ int main() {
 
     int hingeCount = 0;
     bool foundKneeFrame = false;
+    int hipCount = 0;
     for (const RagdollConstraintSpec& joint : ragdoll.constraints) {
         if (joint.jointType == RagdollJointType::Hinge) ++hingeCount;
+        if (joint.boneA.find("thigh") != std::string::npos) {
+            ++hipCount;
+            Check(joint.swing2Angle <= 18.01f * DirectX::XM_PI / 180.0f,
+                  "hip abduction must prevent death-pose leg splay");
+            Check(joint.upperTwistAngle <= 20.01f * DirectX::XM_PI / 180.0f,
+                  "hip twist must stay anatomical");
+        }
         if (joint.boneA == "calf_r" && joint.boneB == "thigh_r") {
             foundKneeFrame = true;
             Check(std::abs(joint.frameB.position.x - 0.43508488f) < 0.0001f,
@@ -54,6 +62,7 @@ int main() {
         }
     }
     Check(hingeCount == 4, "knees and elbows must use four hinge joints");
+    Check(hipCount == 2, "both hip constraints must be calibrated");
     Check(foundKneeFrame, "right knee constraint missing");
 
     Check(!PhysicsImpactPolicy::CanFracture(
