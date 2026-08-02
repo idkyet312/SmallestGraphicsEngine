@@ -1368,8 +1368,8 @@ private:
     DirectX::XMFLOAT3 patrolWaypoint_{ 0.0f, 0.0f, 0.0f };
     float patrolPauseTimer_ = 0.0f;
     static constexpr float kVisionRange = 28.0f;
-    static constexpr float kVisionHalfFovCos = 0.5f; // cos(60 deg): ~120 deg cone
-    static constexpr float kAlertBroadcastRadius = 10.0f;
+    static constexpr float kVisionHalfFovCos = 0.173648f; // cos(80 deg): 160 deg cone
+    static constexpr float kAlertBroadcastRadius = 19.0f;
 
     void RegisterThreat(float damage) {
         if (damage <= 0.0f || dead_) return;
