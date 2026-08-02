@@ -257,6 +257,11 @@ bool                        g_banditLoaded = false;
 float                       g_banditLeftArmReach = 0.55f;
 float                       g_banditHeadYawOffsetDegrees = 20.4f;
 bool                        g_showEnemyVisionCones = false;
+// No authored gun-grip socket exists on the asset, so the gun is attached to
+// hand_r with this tunable local offset instead of a fixed constant -- nudge
+// live via the bandit debug panel until it lines up with the model's hand.
+XMFLOAT3                    g_banditGunGripOffsetPos{ 0.0f, 0.0f, 0.0f };
+XMFLOAT3                    g_banditGunGripOffsetEuler{ 0.0f, 0.0f, 0.0f };
 static uint32_t&            g_banditSpawnSerial = g_enemySystem.spawnSerial;
 GunAudio                    g_gunAudio;
 GunAudio                    g_rpgFireAudio;
@@ -2240,6 +2245,11 @@ void BanditDebugText() {
                        &g_banditHeadYawOffsetDegrees,
                        -90.0f, 90.0f, "%.1f deg");
     ImGui::Checkbox("Show enemy vision cones", &g_showEnemyVisionCones);
+    if (ImGui::CollapsingHeader("Enemy Gun Grip Offset")) {
+        ImGui::TextDisabled("No authored socket -- tune until gun sits in hand_r.");
+        ImGui::DragFloat3("Grip position", &g_banditGunGripOffsetPos.x, 0.01f);
+        ImGui::DragFloat3("Grip rotation (deg)", &g_banditGunGripOffsetEuler.x, 1.0f);
+    }
     if (ImGui::CollapsingHeader("Enemy Audio", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::SliderFloat("Flesh hit pitch min", &g_fleshHitPitchMin,
                                0.5f, 2.0f, "%.2f"))
@@ -8361,6 +8371,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 bandit->leftArmReach = g_banditLeftArmReach;
                 bandit->headTorsoYawOffsetDegrees =
                     g_banditHeadYawOffsetDegrees;
+                bandit->gunGripOffsetPos = g_banditGunGripOffsetPos;
+                bandit->gunGripOffsetEulerDegrees = g_banditGunGripOffsetEuler;
                 const float cameraDx = bandit->position.x - scene.camera.Position.x;
                 const float cameraDz = bandit->position.z - scene.camera.Position.z;
                 const float cameraDistanceSq = cameraDx * cameraDx + cameraDz * cameraDz;
