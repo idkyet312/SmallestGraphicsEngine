@@ -1369,10 +1369,14 @@ private:
         // The target angle is clamped to a natural range and eased toward over
         // time so the torso doesn't instantly snap to large twists; it still
         // reaches full aim angle given a few frames, so the gun keeps tracking.
+        // While sprinting, only the legs should move: ease the twist back to
+        // zero and skip head aim so the whole upper body rides the masked
+        // idle/rifle pose rigidly instead of reacting to aim.
         const int spine = model.skeleton.Find("spine_01");
         if (spine >= 0) {
-            float targetYaw =
-                std::atan2(std::sin(aimYaw - yaw), std::cos(aimYaw - yaw));
+            float targetYaw = isRunning_
+                ? 0.0f
+                : std::atan2(std::sin(aimYaw - yaw), std::cos(aimYaw - yaw));
             const float limit = XMConvertToRadians(maxSpineTwistDegrees);
             targetYaw = (std::max)(-limit, (std::min)(limit, targetYaw));
             const float maxStep = XMConvertToRadians(spineTwistSpeedDegrees) * dt;
@@ -1383,7 +1387,7 @@ private:
             RotateBranchWorld(spine, pivot, XMMatrixRotationY(spineTwistCurrent_));
         }
 
-        FaceHeadTowardAim();
+        if (!isRunning_) FaceHeadTowardAim();
 
         // Arms/gun must match the torso direction the spine twist actually
         // produced, not the raw aim vector, or the IK targets fight the pose
