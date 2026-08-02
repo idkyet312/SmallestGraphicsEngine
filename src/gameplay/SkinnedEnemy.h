@@ -1586,6 +1586,31 @@ private:
         const int handL = model.skeleton.Find("hand_l");
         if (handBone_ < 0 || handL < 0) return;
 
+        // Outside Combat there's no confirmed target to aim at: leave the gun
+        // hanging in the masked idle/rifle pose (still rigged to the hand bone
+        // via skinning, just not raised or tracking) instead of running the
+        // aim solve below. Ease spineTwistCurrent_ back to neutral so a
+        // Combat->Patrol transition relaxes smoothly rather than snapping.
+        if (awareness_ != AwarenessState::Combat) {
+            const int spine = model.skeleton.Find("spine_01");
+            if (spine >= 0) {
+                const float maxStep = XMConvertToRadians(spineTwistSpeedDegrees) * dt;
+                const float delta = -spineTwistCurrent_;
+                spineTwistCurrent_ += (std::max)(-maxStep, (std::min)(maxStep, delta));
+                if (spineTwistCurrent_ != 0.0f) {
+                    const XMVECTOR pivot =
+                        XMLoadFloat4x4(&poseGlobals_[spine]).r[3];
+                    RotateBranchWorld(spine, pivot, XMMatrixRotationY(spineTwistCurrent_));
+                }
+            }
+            for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
+                const XMMATRIX skin = XMLoadFloat4x4(&model.skeleton.offset[bone]) *
+                                      XMLoadFloat4x4(&poseGlobals_[bone]);
+                XMStoreFloat4x4(&paletteCPU_[bone], XMMatrixTranspose(skin));
+            }
+            return;
+        }
+
         // Legs follow locomotion yaw. Twist full spine branch back toward player
         // before arm IK so chest, shoulders, neck, head, and arms share weapon aim.
         // The target angle is clamped to a natural range and eased toward over
@@ -1626,9 +1651,7 @@ private:
             origin.x - cz * 0.07f + forward.x * leftArmReach,
             origin.y - 0.03f + forward.y * leftArmReach,
             origin.z + sx * 0.07f + forward.z * leftArmReach, 1.0f);
-        // Arms hold the gun aimed at the target in every locomotion state
-        // (idle, walk, or sprint) so enemies visibly aim while running instead
-        // of just swinging their arms.
+        // Arms hold the gun aimed at the target while in Combat.
         const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, MeshWorldMatrix());
         // UE bone labels appear mirrored after asset-axis conversion. Route the
         // visual trigger arm to rear grip and visual support arm to foregrip.
