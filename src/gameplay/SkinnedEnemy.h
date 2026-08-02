@@ -791,17 +791,17 @@ public:
         return true;
     }
 
-    // Weapon frame follows the same chest/arm yaw the IK solve used (yaw +
-    // spineTwistCurrent_), not the raw aim vector, so the gun visually rides
-    // the arms instead of pointing at the target independently of the pose.
+    // Weapon frame follows the same chest/arm yaw and pitch the IK solve just
+    // aimed the arms at (gunYaw/gunPitch_, kept in sync by ApplyGunIK every
+    // frame in every awareness state), so the gun always rides where the
+    // hands actually are instead of floating at an independently aimed spot.
     DirectX::XMMATRIX GunWorldMatrix() const {
         using namespace DirectX;
         if (!HasGunPose()) return XMMatrixIdentity();
-        const float gunYaw = yaw + spineTwistCurrent_;
-        const XMFLOAT3 origin = GunOriginWorld(gunYaw);
+        const XMFLOAT3 origin = GunOriginWorld(gunYaw_);
         return XMMatrixScaling(0.6f, 0.6f, 0.6f) *
-               XMMatrixRotationX(-aimPitch) *
-               XMMatrixRotationY(gunYaw) *
+               XMMatrixRotationX(-gunPitch_) *
+               XMMatrixRotationY(gunYaw_) *
                XMMatrixTranslation(origin.x, origin.y, origin.z);
     }
 
@@ -1321,6 +1321,11 @@ private:
     std::vector<DirectX::XMFLOAT4X4> poseGlobals_;
     std::vector<DirectX::XMFLOAT4X4> previousPoseGlobals_;
     float spineTwistCurrent_ = 0.0f;
+    // World yaw/pitch the gun mesh renders at. Set by ApplyGunIK each frame to
+    // match wherever the arm IK just placed the hands, so GunWorldMatrix never
+    // computes a position independent of the actual arm pose.
+    float gunYaw_ = 0.0f;
+    float gunPitch_ = 0.0f;
     std::vector<DirectX::XMFLOAT4X4> deathGlobals_;
     std::vector<DirectX::XMFLOAT4X4> bodyLocal_;
     DirectX::XMFLOAT4X4 poseWorld_ = {};
@@ -1586,11 +1591,11 @@ private:
         const int handL = model.skeleton.Find("hand_l");
         if (handBone_ < 0 || handL < 0) return;
 
-        // Outside Combat there's no confirmed target to aim at: leave the gun
-        // hanging in the masked idle/rifle pose (still rigged to the hand bone
-        // via skinning, just not raised or tracking) instead of running the
-        // aim solve below. Ease spineTwistCurrent_ back to neutral so a
-        // Combat->Patrol transition relaxes smoothly rather than snapping.
+        // Outside Combat there's no confirmed target to aim at: relax the
+        // torso (ease spineTwistCurrent_ back to neutral) and hold the gun
+        // low against the body instead of raised, but keep solving the arm
+        // IK toward that lowered grip so the hands -- and the separately
+        // rendered gun mesh, which reads gunYaw_/gunPitch_ -- stay together.
         if (awareness_ != AwarenessState::Combat) {
             const int spine = model.skeleton.Find("spine_01");
             if (spine >= 0) {
@@ -1603,6 +1608,26 @@ private:
                     RotateBranchWorld(spine, pivot, XMMatrixRotationY(spineTwistCurrent_));
                 }
             }
+
+            gunYaw_ = yaw + spineTwistCurrent_;
+            gunPitch_ = -0.9f; // pointed down and forward, carried at ease
+            const XMFLOAT3 origin = GunOriginWorld(gunYaw_);
+            const float sx = std::sin(gunYaw_), cz = std::cos(gunYaw_);
+            const float cp = std::cos(gunPitch_), sp = std::sin(gunPitch_);
+            const XMFLOAT3 forward{ sx * cp, sp, cz * cp };
+            const XMVECTOR rightGripWorld = XMVectorSet(
+                origin.x + cz * 0.08f, origin.y - 0.02f,
+                origin.z - sx * 0.08f, 1.0f);
+            const XMVECTOR foreGripWorld = XMVectorSet(
+                origin.x - cz * 0.07f + forward.x * leftArmReach,
+                origin.y - 0.03f + forward.y * leftArmReach,
+                origin.z + sx * 0.07f + forward.z * leftArmReach, 1.0f);
+            const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, MeshWorldMatrix());
+            SolveArmIK(upperR, lowerR, handBone_,
+                       XMVector3TransformCoord(foreGripWorld, inverseWorld));
+            SolveArmIK(upperL, lowerL, handL,
+                       XMVector3TransformCoord(rightGripWorld, inverseWorld));
+
             for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
                 const XMMATRIX skin = XMLoadFloat4x4(&model.skeleton.offset[bone]) *
                                       XMLoadFloat4x4(&poseGlobals_[bone]);
@@ -1639,10 +1664,12 @@ private:
         // Arms/gun must match the torso direction the spine twist actually
         // produced, not the raw aim vector, or the IK targets fight the pose
         // and the elbows/wrists distort.
-        const float gunYaw = yaw + spineTwistCurrent_;
+        gunYaw_ = yaw + spineTwistCurrent_;
+        gunPitch_ = aimPitch;
+        const float gunYaw = gunYaw_;
         const XMFLOAT3 origin = GunOriginWorld(gunYaw);
         const float sx = std::sin(gunYaw), cz = std::cos(gunYaw);
-        const float cp = std::cos(aimPitch), sp = std::sin(aimPitch);
+        const float cp = std::cos(gunPitch_), sp = std::sin(gunPitch_);
         const XMFLOAT3 forward{ sx * cp, sp, cz * cp };
         const XMVECTOR rightGripWorld = XMVectorSet(
             origin.x + cz * 0.08f, origin.y - 0.02f,
