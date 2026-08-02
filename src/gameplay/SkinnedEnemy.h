@@ -77,7 +77,7 @@ public:
     bool IsShotgunner() const { return weapon == BanditWeapon::Shotgun; }
 
     float BackoffRange() const {
-        return IsSniper() ? 24.0f : (IsShotgunner() ? 10.0f : 16.0f);
+        return 30.0f;
     }
 
     bool PlayerInBackoffRange(const DirectX::XMFLOAT3& playerPosition) const {
