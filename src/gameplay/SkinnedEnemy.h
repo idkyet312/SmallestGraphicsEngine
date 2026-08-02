@@ -53,6 +53,8 @@ public:
     bool              upperBodyGunLayer = true;
     float             leftArmReach = 0.55f;
     float             headTorsoYawOffsetDegrees = 20.4f;
+    float             maxSpineTwistDegrees = 85.0f;
+    float             spineTwistSpeedDegrees = 220.0f;
     float             orbitRadius = 4.8f;
     float             orbitDirection = 1.0f;
     float             fireCooldown = 1.0f;
@@ -335,20 +337,18 @@ public:
             const float travel = (std::min)(speed * dt, 0.45f);
             position.x += moveX * travel;
             position.z += moveZ * travel;
-            const float movementYaw = std::atan2(moveX, moveZ);
             const auto angleDelta = [](float from, float to) {
                 return std::atan2(std::sin(to - from), std::cos(to - from));
             };
-            // Let legs turn into orbit instead of playing a forward walk while
-            // sliding fully sideways. Keep torso close enough to weapon aim for IK.
-            const float desiredYaw = orbiting
-                ? aimYaw + angleDelta(aimYaw, movementYaw) * 0.48f
-                : movementYaw;
-            const float turn = angleDelta(yaw, desiredYaw);
+            // Legs always face the player regardless of travel direction (strafe,
+            // retreat, or approach), so body and aim yaw already agree and the
+            // spine barely needs to twist.
+            const float turn = angleDelta(yaw, aimYaw);
             const float maxTurn = 5.5f * dt;
             yaw += (std::max)(-maxTurn, (std::min)(maxTurn, turn));
         }
         const bool running = speed > moveSpeed * 1.2f;
+        isRunning_ = running;
         PlayClip(running ? "Run" : speed > 0.01f ? "Walk" : "Idle");
         const float referenceSpeed = running ? moveSpeed * 1.65f : moveSpeed;
         const float playbackRate = speed > 0.01f
@@ -588,15 +588,17 @@ public:
         return true;
     }
 
-    // Weapon uses a stable character-facing frame. Arm IK places both hands on
-    // this same frame, so walk animation cannot roll the barrel toward ground.
+    // Weapon frame follows the same chest/arm yaw the IK solve used (yaw +
+    // spineTwistCurrent_), not the raw aim vector, so the gun visually rides
+    // the arms instead of pointing at the target independently of the pose.
     DirectX::XMMATRIX GunWorldMatrix() const {
         using namespace DirectX;
         if (!HasGunPose()) return XMMatrixIdentity();
-        const XMFLOAT3 origin = GunOriginWorld();
+        const float gunYaw = yaw + spineTwistCurrent_;
+        const XMFLOAT3 origin = GunOriginWorld(gunYaw);
         return XMMatrixScaling(0.6f, 0.6f, 0.6f) *
                XMMatrixRotationX(-aimPitch) *
-               XMMatrixRotationY(aimYaw) *
+               XMMatrixRotationY(gunYaw) *
                XMMatrixTranslation(origin.x, origin.y, origin.z);
     }
 
@@ -1115,6 +1117,8 @@ private:
     std::vector<DirectX::XMFLOAT4> gunPoseOffsets_;
     std::vector<DirectX::XMFLOAT4X4> poseGlobals_;
     std::vector<DirectX::XMFLOAT4X4> previousPoseGlobals_;
+    float spineTwistCurrent_ = 0.0f;
+    bool isRunning_ = false;
     std::vector<DirectX::XMFLOAT4X4> deathGlobals_;
     std::vector<DirectX::XMFLOAT4X4> bodyLocal_;
     DirectX::XMFLOAT4X4 poseWorld_ = {};
@@ -1215,7 +1219,7 @@ private:
         if (upperBodyGunLayer && upperBodyAnim_.clip) {
             anim.ComputeLayeredPalette(model.skeleton, upperBodyAnim_, upperBodyMask_,
                                        gunPoseOffsets_, paletteCPU_, &poseGlobals_);
-            ApplyGunIK();
+            ApplyGunIK(dt);
         } else {
             anim.ComputePalette(model.skeleton, paletteCPU_);
             anim.ComputeGlobalMatrices(model.skeleton, poseGlobals_);
@@ -1224,7 +1228,11 @@ private:
     }
 
     DirectX::XMFLOAT3 GunOriginWorld() const {
-        const float sx = std::sin(aimYaw), cz = std::cos(aimYaw);
+        return GunOriginWorld(aimYaw);
+    }
+
+    DirectX::XMFLOAT3 GunOriginWorld(float yawForGun) const {
+        const float sx = std::sin(yawForGun), cz = std::cos(yawForGun);
         return { position.x + cz * 0.12f + sx * 0.10f,
                  position.y + footOffset + 1.48f,
                  position.z - sx * 0.12f + cz * 0.10f };
@@ -1347,7 +1355,7 @@ private:
         RotateBranch(lower, elbow, RotationFromTo(handPos - elbow, target - elbow));
     }
 
-    void ApplyGunIK() {
+    void ApplyGunIK(float dt) {
         using namespace DirectX;
         const int upperR = model.skeleton.Find("upperarm_r");
         const int lowerR = model.skeleton.Find("lowerarm_r");
@@ -1358,19 +1366,31 @@ private:
 
         // Legs follow locomotion yaw. Twist full spine branch back toward player
         // before arm IK so chest, shoulders, neck, head, and arms share weapon aim.
+        // The target angle is clamped to a natural range and eased toward over
+        // time so the torso doesn't instantly snap to large twists; it still
+        // reaches full aim angle given a few frames, so the gun keeps tracking.
         const int spine = model.skeleton.Find("spine_01");
         if (spine >= 0) {
-            const float upperBodyYaw =
+            float targetYaw =
                 std::atan2(std::sin(aimYaw - yaw), std::cos(aimYaw - yaw));
+            const float limit = XMConvertToRadians(maxSpineTwistDegrees);
+            targetYaw = (std::max)(-limit, (std::min)(limit, targetYaw));
+            const float maxStep = XMConvertToRadians(spineTwistSpeedDegrees) * dt;
+            const float delta = targetYaw - spineTwistCurrent_;
+            spineTwistCurrent_ += (std::max)(-maxStep, (std::min)(maxStep, delta));
             const XMVECTOR pivot =
                 XMLoadFloat4x4(&poseGlobals_[spine]).r[3];
-            RotateBranchWorld(spine, pivot, XMMatrixRotationY(upperBodyYaw));
+            RotateBranchWorld(spine, pivot, XMMatrixRotationY(spineTwistCurrent_));
         }
 
         FaceHeadTowardAim();
 
-        const XMFLOAT3 origin = GunOriginWorld();
-        const float sx = std::sin(aimYaw), cz = std::cos(aimYaw);
+        // Arms/gun must match the torso direction the spine twist actually
+        // produced, not the raw aim vector, or the IK targets fight the pose
+        // and the elbows/wrists distort.
+        const float gunYaw = yaw + spineTwistCurrent_;
+        const XMFLOAT3 origin = GunOriginWorld(gunYaw);
+        const float sx = std::sin(gunYaw), cz = std::cos(gunYaw);
         const float cp = std::cos(aimPitch), sp = std::sin(aimPitch);
         const XMFLOAT3 forward{ sx * cp, sp, cz * cp };
         const XMVECTOR rightGripWorld = XMVectorSet(
@@ -1380,13 +1400,19 @@ private:
             origin.x - cz * 0.07f + forward.x * leftArmReach,
             origin.y - 0.03f + forward.y * leftArmReach,
             origin.z + sx * 0.07f + forward.z * leftArmReach, 1.0f);
-        const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, MeshWorldMatrix());
-        // UE bone labels appear mirrored after asset-axis conversion. Route the
-        // visual trigger arm to rear grip and visual support arm to foregrip.
-        SolveArmIK(upperR, lowerR, handBone_,
-                   XMVector3TransformCoord(foreGripWorld, inverseWorld));
-        SolveArmIK(upperL, lowerL, handL,
-                   XMVector3TransformCoord(rightGripWorld, inverseWorld));
+        // Sprinting reuses the run cycle's own arm swing; solving the gun-grip
+        // IK on top of it made the arms visibly jitter/re-aim every frame.
+        // Hold the masked rifle-ready pose instead and only re-engage aim IK
+        // once the enemy isn't running.
+        if (!isRunning_) {
+            const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, MeshWorldMatrix());
+            // UE bone labels appear mirrored after asset-axis conversion. Route the
+            // visual trigger arm to rear grip and visual support arm to foregrip.
+            SolveArmIK(upperR, lowerR, handBone_,
+                       XMVector3TransformCoord(foreGripWorld, inverseWorld));
+            SolveArmIK(upperL, lowerL, handL,
+                       XMVector3TransformCoord(rightGripWorld, inverseWorld));
+        }
 
         for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
             const XMMATRIX skin = XMLoadFloat4x4(&model.skeleton.offset[bone]) *
