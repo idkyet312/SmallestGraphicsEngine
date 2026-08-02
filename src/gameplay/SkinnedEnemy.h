@@ -20,6 +20,18 @@
 
 extern MeshShaderDX12 g_meshShader;
 
+class SkinnedEnemy;
+
+// Occlusion test reused from the existing bullet line-of-sight raycast so
+// perception respects the same walls/terrain/trees a shot would.
+using EnemyLineOfSightFn = bool(*)(const SkinnedEnemy&, const DirectX::XMFLOAT3&);
+extern EnemyLineOfSightFn g_enemyLineOfSightFn;
+
+// A loud, momentary sound (gunfire, explosion) enemies can hear through walls.
+// Populated fresh each frame by main.cpp and drained by every enemy's Update.
+struct EnemyNoiseEvent { DirectX::XMFLOAT3 position; float radius; };
+extern std::vector<EnemyNoiseEvent> g_enemyNoiseEvents;
+
 // Loadout class. Rifle is the original bandit behaviour; the other two change
 // engagement range, damage, and the shape of a shot rather than the model.
 enum class BanditWeapon {
@@ -77,6 +89,25 @@ public:
 
     bool IsSniper() const { return weapon == BanditWeapon::Sniper; }
     bool IsShotgunner() const { return weapon == BanditWeapon::Shotgun; }
+
+    // Patrol: no target perceived, walking an authored route or wandering near
+    // spawn. Alert: heard/glimpsed the player but lost them, investigating the
+    // last known position. Combat: player currently perceived; full engagement
+    // (today's aim/orbit/cover/fire behavior).
+    enum class AwarenessState { Patrol, Alert, Combat };
+    AwarenessState Awareness() const { return awareness_; }
+
+    // Vision cone parameters for debug visualization. Half-angle in radians
+    // (not the stored cosine) so callers can build cone geometry directly.
+    float VisionRange() const { return kVisionRange; }
+    float VisionHalfFovRadians() const { return std::acos(kVisionHalfFovCos); }
+
+    // Optional authored patrol path. Leave unset and an enemy wanders in a
+    // loose loop around its spawn point instead.
+    void SetPatrolRoute(const std::vector<DirectX::XMFLOAT3>& route) {
+        patrolRoute_ = route;
+        patrolIndex_ = 0;
+    }
 
     float BackoffRange() const {
         return 30.0f;
@@ -205,6 +236,106 @@ public:
             knockbackVelocity_.z = 0.0f;
         }
         navigationRepathTimer_ -= dt;
+        if (!spawnCaptured_) {
+            spawnPosition_ = position;
+            patrolWaypoint_ = position;
+            spawnCaptured_ = true;
+        }
+
+        const bool perceived = PerceivePlayer(target);
+        switch (awareness_) {
+        case AwarenessState::Patrol:
+            if (perceived) {
+                awareness_ = AwarenessState::Combat;
+                combatMemoryTimer_ = 4.0f;
+                lastKnownTarget_ = target;
+            }
+            break;
+        case AwarenessState::Alert:
+            if (perceived) {
+                awareness_ = AwarenessState::Combat;
+                combatMemoryTimer_ = 4.0f;
+                lastKnownTarget_ = target;
+            } else {
+                alertTimer_ -= dt;
+                if (alertTimer_ <= 0.0f) awareness_ = AwarenessState::Patrol;
+            }
+            break;
+        case AwarenessState::Combat:
+            if (perceived) {
+                combatMemoryTimer_ = 4.0f;
+                lastKnownTarget_ = target;
+            } else {
+                combatMemoryTimer_ -= dt;
+                if (combatMemoryTimer_ <= 0.0f) {
+                    awareness_ = AwarenessState::Alert;
+                    alertTimer_ = 6.0f;
+                }
+            }
+            break;
+        }
+
+        if (awareness_ != AwarenessState::Combat) {
+            aimPitch = 0.0f;
+            DirectX::XMFLOAT3 moveTarget = position;
+            bool haveMoveTarget = false;
+            if (awareness_ == AwarenessState::Alert) {
+                moveTarget = lastKnownTarget_;
+                haveMoveTarget = true;
+            } else {
+                haveMoveTarget = UpdatePatrolWaypoint(dt, moveTarget);
+            }
+            float moveSpeedThisTick = 0.0f;
+            if (haveMoveTarget) {
+                const float pdx = moveTarget.x - position.x;
+                const float pdz = moveTarget.z - position.z;
+                const float pdist = std::sqrt(pdx * pdx + pdz * pdz);
+                if (pdist > 0.35f) {
+                    yaw = std::atan2(pdx, pdz);
+                    aimYaw = yaw;
+                    moveSpeedThisTick = moveSpeed *
+                        (awareness_ == AwarenessState::Alert ? 1.2f : 0.55f);
+                    const DirectX::XMFLOAT3 dest{ moveTarget.x, position.y, moveTarget.z };
+                    const float navDx = dest.x - navigationDestination_.x;
+                    const float navDz = dest.z - navigationDestination_.z;
+                    if (g_navigation.Ready() &&
+                        (navigationRepathTimer_ <= 0.0f ||
+                         navDx * navDx + navDz * navDz > 2.25f)) {
+                        if (g_navigation.FindPath(position, dest, navigationPath_)) {
+                            navigationWaypoint_ = navigationPath_.size() > 1 ? 1 : 0;
+                            navigationDestination_ = dest;
+                        } else {
+                            navigationPath_.clear();
+                            navigationWaypoint_ = 0;
+                        }
+                        navigationRepathTimer_ = 0.45f +
+                            ((float)std::rand() / (float)RAND_MAX) * 0.18f;
+                    }
+                    float moveX = pdx / (std::max)(pdist, 0.001f);
+                    float moveZ = pdz / (std::max)(pdist, 0.001f);
+                    while (navigationWaypoint_ < navigationPath_.size()) {
+                        const float wx = navigationPath_[navigationWaypoint_].x - position.x;
+                        const float wz = navigationPath_[navigationWaypoint_].z - position.z;
+                        if (wx * wx + wz * wz > 0.30f) break;
+                        ++navigationWaypoint_;
+                    }
+                    if (navigationWaypoint_ < navigationPath_.size()) {
+                        const float wx = navigationPath_[navigationWaypoint_].x - position.x;
+                        const float wz = navigationPath_[navigationWaypoint_].z - position.z;
+                        const float wd = std::sqrt(wx * wx + wz * wz);
+                        if (wd > 0.001f) { moveX = wx / wd; moveZ = wz / wd; }
+                    }
+                    const float travel = (std::min)(moveSpeedThisTick * dt, 0.45f);
+                    position.x += moveX * travel;
+                    position.z += moveZ * travel;
+                }
+            }
+            PlayClip(moveSpeedThisTick > 0.01f ? "Walk" : "Idle");
+            anim.Advance(dt);
+            ComputePose(dt);
+            return;
+        }
+
         const float dx = target.x - position.x, dz = target.z - position.z;
         const float distance = std::sqrt(dx*dx + dz*dz);
         if (hasCoverTarget_) {
@@ -432,7 +563,65 @@ public:
         return origin;
     }
 
+    // Vision cone + hearing gate. Cheap distance/angle checks first, the
+    // occlusion raycast only when a target already falls inside range and
+    // FOV -- mirrors NeedsLineOfSightCheck's cheap-before-expensive ordering.
+    // Turret gunners keep their original always-aware behavior unchanged.
+    bool PerceivePlayer(const DirectX::XMFLOAT3& target) const {
+        if (dead_ || held_) return false;
+        if (turretGunner) return true;
+        const float dx = target.x - position.x, dz = target.z - position.z;
+        const float distSq = dx * dx + dz * dz;
+        if (distSq <= kVisionRange * kVisionRange && distSq > 1e-6f) {
+            const float invLen = 1.0f / std::sqrt(distSq);
+            const float facingX = std::sin(yaw), facingZ = std::cos(yaw);
+            const float dot = (dx * invLen) * facingX + (dz * invLen) * facingZ;
+            if (dot >= kVisionHalfFovCos &&
+                g_enemyLineOfSightFn && g_enemyLineOfSightFn(*this, target))
+                return true;
+        }
+        for (const EnemyNoiseEvent& noise : g_enemyNoiseEvents) {
+            const float nx = noise.position.x - position.x;
+            const float nz = noise.position.z - position.z;
+            const float radius = noise.radius;
+            if (nx * nx + nz * nz <= radius * radius) return true;
+        }
+        return false;
+    }
+
+    // Returns true and writes `outTarget` when there's somewhere to walk this
+    // tick; false means stand idle (mid-pause, or no route/navmesh yet).
+    bool UpdatePatrolWaypoint(float dt, DirectX::XMFLOAT3& outTarget) {
+        if (patrolPauseTimer_ > 0.0f) { patrolPauseTimer_ -= dt; return false; }
+        if (!patrolRoute_.empty()) {
+            if (patrolIndex_ >= patrolRoute_.size()) patrolIndex_ = 0;
+            outTarget = patrolRoute_[patrolIndex_];
+            const float dx = outTarget.x - position.x, dz = outTarget.z - position.z;
+            if (dx * dx + dz * dz <= 0.6f * 0.6f) {
+                patrolIndex_ = (patrolIndex_ + 1) % patrolRoute_.size();
+                patrolPauseTimer_ = 2.0f + ((float)std::rand() / RAND_MAX) * 2.0f;
+                return false;
+            }
+            return true;
+        }
+        // No authored route: wander in a loose loop around the spawn point.
+        const float dx = patrolWaypoint_.x - position.x;
+        const float dz = patrolWaypoint_.z - position.z;
+        if (dx * dx + dz * dz <= 0.6f * 0.6f) {
+            const float angle = ((float)std::rand() / RAND_MAX) * 6.2831853f;
+            const float radius = 3.0f + ((float)std::rand() / RAND_MAX) * 5.0f;
+            patrolWaypoint_ = { spawnPosition_.x + std::cos(angle) * radius,
+                                spawnPosition_.y,
+                                spawnPosition_.z + std::sin(angle) * radius };
+            patrolPauseTimer_ = 2.0f + ((float)std::rand() / RAND_MAX) * 3.0f;
+            return false;
+        }
+        outTarget = patrolWaypoint_;
+        return true;
+    }
+
     bool NeedsLineOfSightCheck() const {
+        if (awareness_ != AwarenessState::Combat && !turretGunner) return false;
         if (dead_ || held_ || !visible || !HasGunPose()) return false;
         if (turretGunner) return true;
         // The sniper needs a truthful sight test every frame it is charging, not
@@ -449,6 +638,7 @@ public:
                    bool hasLineOfSight,
                    DirectX::XMFLOAT3& origin, DirectX::XMFLOAT3& direction) {
         using namespace DirectX;
+        if (awareness_ != AwarenessState::Combat && !turretGunner) return false;
         if (dead_ || held_ || !visible || !HasGunPose()) return false;
         fireCooldown -= dt;
         if (hasCoverTarget_ && !inCover_) {
@@ -1152,6 +1342,21 @@ private:
     bool mountedFiring_ = false;
     bool hasCoverTarget_ = false;
     bool inCover_ = false;
+
+    // Perception / patrol state. See AwarenessState for the meaning of each.
+    AwarenessState awareness_ = AwarenessState::Patrol;
+    DirectX::XMFLOAT3 lastKnownTarget_{ 0.0f, 0.0f, 0.0f };
+    float alertTimer_ = 0.0f;
+    float combatMemoryTimer_ = 0.0f;
+    bool spawnCaptured_ = false;
+    DirectX::XMFLOAT3 spawnPosition_{ 0.0f, 0.0f, 0.0f };
+    std::vector<DirectX::XMFLOAT3> patrolRoute_;
+    size_t patrolIndex_ = 0;
+    DirectX::XMFLOAT3 patrolWaypoint_{ 0.0f, 0.0f, 0.0f };
+    float patrolPauseTimer_ = 0.0f;
+    static constexpr float kVisionRange = 28.0f;
+    static constexpr float kVisionHalfFovCos = 0.5f; // cos(60 deg): ~120 deg cone
+    static constexpr float kNoiseAlertRadiusSq = 20.0f * 20.0f;
 
     void RegisterThreat(float damage) {
         if (damage <= 0.0f || dead_) return;

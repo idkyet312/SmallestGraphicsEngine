@@ -256,6 +256,7 @@ SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
 float                       g_banditLeftArmReach = 0.55f;
 float                       g_banditHeadYawOffsetDegrees = 20.4f;
+bool                        g_showEnemyVisionCones = false;
 static uint32_t&            g_banditSpawnSerial = g_enemySystem.spawnSerial;
 GunAudio                    g_gunAudio;
 GunAudio                    g_rpgFireAudio;
@@ -1447,6 +1448,9 @@ static bool ShootPlayerWeapon() {
         const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
         g_gunAudio.Play(0.82f, pitch);
     }
+    // Gunfire is loud enough for nearby enemies to hear through walls, even
+    // ones that can't currently see the player.
+    g_enemyNoiseEvents.push_back({ scene.camera.Position, 35.0f });
     return true;
 }
 
@@ -1544,6 +1548,9 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
     }
     return true;
 }
+
+EnemyLineOfSightFn g_enemyLineOfSightFn = &BanditHasLineOfSight;
+std::vector<EnemyNoiseEvent> g_enemyNoiseEvents;
 
 // Ballistic lob from the thrower toward the target. Solves the launch elevation
 // for a fixed speed under gravity, so grenades arc onto the player instead of
@@ -2228,6 +2235,7 @@ void BanditDebugText() {
     ImGui::SliderFloat("Head/torso yaw offset",
                        &g_banditHeadYawOffsetDegrees,
                        -90.0f, 90.0f, "%.1f deg");
+    ImGui::Checkbox("Show enemy vision cones", &g_showEnemyVisionCones);
     if (ImGui::CollapsingHeader("Enemy Audio", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::SliderFloat("Flesh hit pitch min", &g_fleshHitPitchMin,
                                0.5f, 2.0f, "%.2f"))
@@ -2664,6 +2672,57 @@ static void DrawDXRDDGIProbeDebug(CXMMATRIX view, CXMMATRIX projection) {
                 : IM_COL32(245, 180, 45, 220));
         draw->AddCircleFilled(ImVec2(x, y), 3.5f, color);
         draw->AddCircle(ImVec2(x, y), 5.0f, IM_COL32(0, 0, 0, 180));
+    }
+}
+
+// Debug overlay: each enemy's vision cone (facing direction, FOV, range),
+// color-coded by awareness state so patrol/alert/combat is readable at a
+// glance. Projects the cone edges and arc into screen space the same way
+// DrawDXRDDGIProbeDebug projects probe markers.
+static void DrawEnemyVisionCones(CXMMATRIX view, CXMMATRIX projection) {
+    if (!g_showEnemyVisionCones || g_bandits.empty()) return;
+    const XMMATRIX viewProjection = view * projection;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    auto project = [&](const XMFLOAT3& world, ImVec2& out) -> bool {
+        const XMVECTOR clip = XMVector3Transform(XMLoadFloat3(&world), viewProjection);
+        const float w = XMVectorGetW(clip);
+        if (w <= 0.01f) return false;
+        out.x = (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x;
+        out.y = (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y;
+        return true;
+    };
+    for (const auto& bandit : g_bandits) {
+        if (!bandit || bandit->Dead() || bandit->turretGunner) continue;
+        const ImU32 color = bandit->Awareness() == SkinnedEnemy::AwarenessState::Combat
+            ? IM_COL32(235, 60, 55, 200)
+            : (bandit->Awareness() == SkinnedEnemy::AwarenessState::Alert
+                ? IM_COL32(245, 190, 40, 200)
+                : IM_COL32(80, 210, 110, 170));
+        const float range = bandit->VisionRange();
+        const float halfFov = bandit->VisionHalfFovRadians();
+        const XMFLOAT3 apex{ bandit->position.x,
+                             bandit->position.y + bandit->footOffset + 1.5f,
+                             bandit->position.z };
+        constexpr int kArcSegments = 16;
+        ImVec2 apexScreen;
+        if (!project(apex, apexScreen)) continue;
+        ImVec2 previous;
+        bool havePrevious = false;
+        for (int i = 0; i <= kArcSegments; ++i) {
+            const float t = (float)i / (float)kArcSegments;
+            const float angle = bandit->yaw - halfFov + t * (2.0f * halfFov);
+            const XMFLOAT3 rim{ apex.x + std::sin(angle) * range,
+                                apex.y,
+                                apex.z + std::cos(angle) * range };
+            ImVec2 rimScreen;
+            if (!project(rim, rimScreen)) { havePrevious = false; continue; }
+            if (i == 0 || i == kArcSegments)
+                draw->AddLine(apexScreen, rimScreen, color, 1.5f);
+            if (havePrevious) draw->AddLine(previous, rimScreen, color, 1.5f);
+            previous = rimScreen;
+            havePrevious = true;
+        }
     }
 }
 
@@ -8266,6 +8325,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             static std::unordered_map<SkinnedEnemy*, float> banditUpdateDebt;
             bool burnedBanditDied = false;
             bool coverQuerySpent = false;
+            g_enemyNoiseEvents.clear();
             for (auto& bandit : g_bandits) {
                 if (!bandit) continue;
                 if (bandit->UpdateBurning(
@@ -8362,8 +8422,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
                 // Grenade throw: mid-range only, on its own cooldown, and gated
                 // on the same line of sight the rifle uses so bandits do not lob
-                // through a wall. Mounted gunners keep to the turret.
+                // through a wall. Mounted gunners keep to the turret. Patrol/
+                // Alert bandits have no confirmed target to throw at.
                 if (!bandit->Dead() && !bandit->turretGunner &&
+                    bandit->Awareness() == SkinnedEnemy::AwarenessState::Combat &&
                     !scene.player.godMode && scene.player.health > 0.0f) {
                     bandit->grenadeCooldown -= deltaTime;
                     if (bandit->grenadeCooldown <= 0.0f) {
@@ -10313,6 +10375,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (g_levelEditor.IsPlaying()) RenderPlayerHUD(scene);
         } else {
             RenderPlayerHUD(scene);
+            DrawEnemyVisionCones(scene.GetViewMatrix(), scene.GetProjectionMatrix());
             if (g_ddgiCornellTestMode) {
                 const DXRDDGIRenderer::Status& status = g_dxrDDGI.GetStatus();
                 ImGui::SetNextWindowPos(ImVec2(18.0f, 18.0f), ImGuiCond_Always);
