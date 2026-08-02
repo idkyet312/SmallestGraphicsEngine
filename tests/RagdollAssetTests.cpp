@@ -85,14 +85,22 @@ int main() {
     if (rightFoot && !rightFoot->shapes.empty()) {
         Check(rightFoot->shapes[0].type == RagdollShapeType::Box,
               "right foot collider must remain a box");
-        Check(rightFoot->shapes[0].center.x < -0.095f,
-              "right foot collider must be flipped 180 degrees around bone Y");
+        DirectX::XMFLOAT3 axis;
+        DirectX::XMStoreFloat3(&axis, DirectX::XMVector3Rotate(
+            DirectX::XMVectorSet(0, 0, 1, 0),
+            DirectX::XMLoadFloat4(&rightFoot->shapes[0].rotation)));
+        Check(std::abs(axis.x) > 0.95f,
+              "right foot box long axis must follow foot bone");
     }
     if (leftFoot && !leftFoot->shapes.empty()) {
         Check(leftFoot->shapes[0].type == RagdollShapeType::Box,
               "left foot collider must remain a box");
-        Check(leftFoot->shapes[0].center.x > 0.095f,
-              "left foot collider must be flipped 180 degrees around bone Y");
+        DirectX::XMFLOAT3 axis;
+        DirectX::XMStoreFloat3(&axis, DirectX::XMVector3Rotate(
+            DirectX::XMVectorSet(0, 0, 1, 0),
+            DirectX::XMLoadFloat4(&leftFoot->shapes[0].rotation)));
+        Check(std::abs(axis.x) > 0.95f,
+              "left foot box long axis must follow foot bone");
     }
 
     int hingeCount = 0;

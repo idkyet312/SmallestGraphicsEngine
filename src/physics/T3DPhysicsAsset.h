@@ -106,7 +106,8 @@ private:
                         DirectX::XMLoadFloat4(&shape.rotation)) *
                     DirectX::XMMatrixTranslation(
                         shape.center.x, shape.center.y, shape.center.z) *
-                    DirectX::XMMatrixRotationY(DirectX::XM_PI);
+                    DirectX::XMMatrixRotationY(DirectX::XM_PI) *
+                    DirectX::XMMatrixRotationZ(DirectX::XM_PIDIV2);
                 DirectX::XMVECTOR scale, rotation, translation;
                 if (DirectX::XMMatrixDecompose(
                         &scale, &rotation, &translation, shapeLocal)) {
