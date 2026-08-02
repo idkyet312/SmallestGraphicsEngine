@@ -58,6 +58,7 @@ struct Projectile {
     float    damageMultiplier = 1.0f;
     XMFLOAT3 velocity = { 0, 0, 0 };   // grenades integrate velocity + gravity
     float    fuse = 0.0f;              // seconds until it explodes
+    float    grenadeCollisionGrace = 0.0f; // clears thrower's body before collision
     bool     detonate = false;         // set the frame it should explode
     float    fxCooldown = 0.0f;
 };
@@ -617,6 +618,8 @@ struct Scene {
                 // Frag grenades bounce until fuse expiry. Molotov and vortex
                 // grenades trigger immediately on first ground contact.
                 p.velocity.y += -9.81f * grenadeGravityScale * dt;
+                p.grenadeCollisionGrace = (std::max)(
+                    0.0f, p.grenadeCollisionGrace - dt);
                 p.position.x += p.velocity.x * dt;
                 p.position.y += p.velocity.y * dt;
                 p.position.z += p.velocity.z * dt;
@@ -1180,6 +1183,7 @@ struct Scene {
         p.vortex    = selectedGrenade == GrenadeType::Vortex;
         p.active    = true;
         p.fuse      = p.molotov ? 4.0f : grenadeFuse;
+        p.grenadeCollisionGrace = 0.18f;
         // Launch along the aim direction plus a slight upward lob.
         p.velocity  = { camera.Front.x * grenadeThrowSpeed,
                         camera.Front.y * grenadeThrowSpeed + grenadeLob,

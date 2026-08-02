@@ -1586,6 +1586,7 @@ static void BanditThrowGrenade(const SkinnedEnemy& bandit) {
     grenade.hostile = true;
     grenade.active = true;
     grenade.fuse = scene.grenadeFuse;
+    grenade.grenadeCollisionGrace = 0.18f;
     grenade.velocity = { dx * inverseHorizontal * horizontalSpeed,
                          verticalSpeed,
                          dz * inverseHorizontal * horizontalSpeed };
@@ -4003,6 +4004,140 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
         }
     }
     return struck;
+}
+
+static XMFLOAT3 GrenadeFallbackNormal(const Projectile& grenade) {
+    XMVECTOR velocity = XMLoadFloat3(&grenade.velocity);
+    if (XMVectorGetX(XMVector3LengthSq(velocity)) < 1e-6f)
+        return { 0.0f, 1.0f, 0.0f };
+    XMFLOAT3 normal;
+    XMStoreFloat3(&normal, -XMVector3Normalize(velocity));
+    return normal;
+}
+
+// Swept grenade collision against every solid gameplay surface. Hit helpers
+// already expand their shapes by radius, so fast throws cannot tunnel through
+// thin walls between frames.
+static bool HitGrenadeCollision(const Projectile& grenade, float radius,
+                                XMFLOAT3& closestHit,
+                                XMFLOAT3& closestNormal) {
+    const XMFLOAT3 start = grenade.previousPosition;
+    const XMFLOAT3 end = grenade.position;
+    const XMFLOAT3 fallback = GrenadeFallbackNormal(grenade);
+    float closestDistanceSquared = FLT_MAX;
+    bool struck = false;
+    const auto accept = [&](const XMFLOAT3& hit, XMFLOAT3 normal) {
+        const float dx = hit.x - start.x;
+        const float dy = hit.y - start.y;
+        const float dz = hit.z - start.z;
+        const float distanceSquared = dx * dx + dy * dy + dz * dz;
+        if (distanceSquared >= closestDistanceSquared) return;
+        XMVECTOR n = XMLoadFloat3(&normal);
+        if (XMVectorGetX(XMVector3LengthSq(n)) < 1e-6f)
+            n = XMLoadFloat3(&fallback);
+        XMStoreFloat3(&closestNormal, XMVector3Normalize(n));
+        closestHit = hit;
+        closestDistanceSquared = distanceSquared;
+        struck = true;
+    };
+    const auto radialNormal = [&](const XMFLOAT3& hit,
+                                  const XMFLOAT3& center) {
+        XMFLOAT3 normal{ hit.x - center.x, hit.y - center.y,
+                        hit.z - center.z };
+        const XMVECTOR n = XMLoadFloat3(&normal);
+        if (XMVectorGetX(XMVector3LengthSq(n)) < 1e-6f) return fallback;
+        XMStoreFloat3(&normal, XMVector3Normalize(n));
+        return normal;
+    };
+
+    XMFLOAT3 candidate;
+    if (grenade.grenadeCollisionGrace <= 0.0f && g_banditLoaded) {
+        for (const auto& bandit : g_bandits) {
+            if (bandit && bandit->BlocksProjectile(
+                    start, end, radius, &candidate))
+                accept(candidate, fallback);
+        }
+    }
+
+    // Hostile grenades collide with player body after leaving thrower.
+    if (grenade.hostile && grenade.grenadeCollisionGrace <= 0.0f) {
+        const XMFLOAT3 playerCenter{
+            scene.camera.Position.x, scene.camera.Position.y - 0.82f,
+            scene.camera.Position.z };
+        const XMVECTOR a = XMLoadFloat3(&start);
+        const XMVECTOR ab = XMLoadFloat3(&end) - a;
+        const XMVECTOR center = XMLoadFloat3(&playerCenter);
+        const float lengthSquared = XMVectorGetX(XMVector3LengthSq(ab));
+        float t = lengthSquared > 1e-6f
+            ? XMVectorGetX(XMVector3Dot(center - a, ab)) / lengthSquared
+            : 0.0f;
+        t = (std::max)(0.0f, (std::min)(1.0f, t));
+        XMVECTOR point = a + ab * t;
+        constexpr float playerRadius = 0.58f;
+        const float expanded = playerRadius + radius;
+        if (XMVectorGetX(XMVector3LengthSq(point - center)) <=
+            expanded * expanded) {
+            XMStoreFloat3(&candidate, point);
+            accept(candidate, radialNormal(candidate, playerCenter));
+        }
+    }
+
+    if (HitHelicopterSegment(start, end, radius, candidate))
+        accept(candidate, radialNormal(candidate, g_helicopterPosition));
+    if (HitSecondaryHelicopterSegment(start, end, radius, candidate))
+        accept(candidate, radialNormal(candidate, g_secondaryHelicopterPosition));
+    if (HitBoatSegment(start, end, radius, candidate))
+        accept(candidate, radialNormal(candidate, g_boatPosition));
+
+    size_t barrelIndex = 0;
+    if (HitExplosiveBarrelSegment(
+            start, end, radius, barrelIndex, candidate))
+        accept(candidate, radialNormal(
+            candidate, scene.explosiveBarrels[barrelIndex].position));
+    if (g_destruction.HitTestSegment(start, end, radius, candidate))
+        accept(candidate, fallback);
+    if (g_trees.BlocksSegment(start, end, radius))
+        accept(end, fallback);
+    if (HitPrefabColliderSegment(start, end, radius, candidate))
+        accept(candidate, fallback);
+    if (HitTerrainSegment(start, end, radius, candidate)) {
+        auto params = CurrentTerrainParams();
+        params.heightScale = scene.terrainHeightScale;
+        constexpr float sampleOffset = 0.20f;
+        const float left = TerrainRendererDX12::HeightAt(
+            params, candidate.x - sampleOffset, candidate.z);
+        const float right = TerrainRendererDX12::HeightAt(
+            params, candidate.x + sampleOffset, candidate.z);
+        const float back = TerrainRendererDX12::HeightAt(
+            params, candidate.x, candidate.z - sampleOffset);
+        const float front = TerrainRendererDX12::HeightAt(
+            params, candidate.x, candidate.z + sampleOffset);
+        XMFLOAT3 terrainNormal{
+            left - right, sampleOffset * 2.0f, back - front };
+        accept(candidate, terrainNormal);
+    }
+    return struck;
+}
+
+static void BounceGrenade(Projectile& grenade, const XMFLOAT3& hit,
+                          const XMFLOAT3& surfaceNormal) {
+    XMVECTOR normal = XMVector3Normalize(XMLoadFloat3(&surfaceNormal));
+    XMVECTOR velocity = XMLoadFloat3(&grenade.velocity);
+    const float incomingSpeed = XMVectorGetX(XMVector3Dot(velocity, normal));
+    if (incomingSpeed < 0.0f) {
+        constexpr float restitution = 0.42f;
+        constexpr float tangentRetention = 0.72f;
+        velocity -= normal * ((1.0f + restitution) * incomingSpeed);
+        const XMVECTOR normalVelocity =
+            normal * XMVectorGetX(XMVector3Dot(velocity, normal));
+        velocity = normalVelocity +
+                   (velocity - normalVelocity) * tangentRetention;
+        if (XMVectorGetX(XMVector3LengthSq(velocity)) < 0.04f)
+            velocity = XMVectorZero();
+        XMStoreFloat3(&grenade.velocity, velocity);
+    }
+    XMVECTOR corrected = XMLoadFloat3(&hit) + normal * 0.025f;
+    XMStoreFloat3(&grenade.position, corrected);
 }
 
 // Small Environment Query System-style cover test. Candidate points must be
@@ -8432,8 +8567,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     (scene.impactParticles.size() - 800));
             UpdateHarpoonAttachments();
             for (auto& projectile : scene.projectiles) {
-                if ((projectile.rocket || projectile.molotov || projectile.vortex) &&
-                    projectile.active) {
+                if (projectile.grenade && projectile.active) {
+                    XMFLOAT3 impact;
+                    XMFLOAT3 normal;
+                    if (HitGrenadeCollision(
+                            projectile, 0.20f, impact, normal)) {
+                        if (projectile.molotov || projectile.vortex) {
+                            projectile.position = impact;
+                            projectile.active = false;
+                            projectile.detonate = true;
+                        } else {
+                            BounceGrenade(projectile, impact, normal);
+                        }
+                    }
+                }
+                if (projectile.rocket && projectile.active) {
                     XMFLOAT3 impact = projectile.position;
                     bool struck = false;
                     const float radius = 0.22f;
