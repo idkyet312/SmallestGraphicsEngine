@@ -79,6 +79,13 @@ public:
     float             gunScale = 0.6f;
     float             gunGripForward = 0.16f;
     float             gunGripRise = -0.04f;
+    // Trigger-hand placement relative to the trigger shoulder, used by
+    // ComputeGripTargets. gunShoulderOffset only applies when the shoulder
+    // bone is missing and the anchor falls back to the body centerline.
+    float             gunShoulderOffset = 0.18f;
+    float             gunRearGripForward = 0.16f;
+    float             gunRearGripInboard = -0.06f;
+    float             gunRearGripDrop = -0.18f;
     float             headTorsoYawOffsetDegrees = 20.4f;
     float             maxSpineTwistDegrees = 85.0f;
     float             spineTwistSpeedDegrees = 220.0f;
@@ -1734,6 +1741,49 @@ private:
                         XMMatrixScaling(gunScale, gunScale, gunScale) * frame);
     }
 
+    // Where the two hands should sit to hold a rifle aimed along yaw/pitch.
+    //
+    // Anchored to the trigger-side shoulder rather than a fixed point on the
+    // body centerline: a centerline anchor pulled the trigger hand across the
+    // chest, which hunched the shoulders and left the rifle lying diagonally
+    // across the body instead of shouldered. Starting from the actual posed
+    // shoulder keeps the near arm relaxed at its own side and lets the barrel
+    // run parallel to the aim rather than across it.
+    void ComputeGripTargets(float gunYaw, float gunPitch,
+                            DirectX::XMVECTOR& rearGripWorld,
+                            DirectX::XMVECTOR& foreGripWorld) const {
+        using namespace DirectX;
+        const float sx = std::sin(gunYaw), cz = std::cos(gunYaw);
+        const float cp = std::cos(gunPitch), sp = std::sin(gunPitch);
+        // Aim direction, and the horizontal axis to the trigger side of it.
+        const XMVECTOR forward = XMVectorSet(sx * cp, sp, cz * cp, 0.0f);
+        const XMVECTOR right = XMVectorSet(cz, 0.0f, -sx, 0.0f);
+
+        // Shoulder height on the body centerline, then stepped out to the
+        // trigger shoulder. Falls back to a measured offset when the shoulder
+        // bone is missing so the grip never collapses to the centerline.
+        const int shoulder = model.skeleton.Find("upperarm_l");
+        XMVECTOR anchor;
+        if (shoulder >= 0 &&
+            static_cast<size_t>(shoulder) < poseGlobals_.size()) {
+            anchor = XMVector3TransformCoord(
+                XMLoadFloat4x4(&poseGlobals_[shoulder]).r[3], MeshWorldMatrix());
+        } else {
+            anchor = XMVectorSet(position.x, position.y + footOffset + 1.40f,
+                                 position.z, 1.0f);
+            anchor = anchor + right * gunShoulderOffset;
+        }
+
+        // Trigger hand rides just below and slightly ahead of the shoulder,
+        // pulled a little inboard so the stock meets the chest.
+        rearGripWorld = anchor
+                      + forward * gunRearGripForward
+                      + right * gunRearGripInboard
+                      + XMVectorSet(0.0f, gunRearGripDrop, 0.0f, 0.0f);
+        // Support hand out along the barrel from the trigger hand.
+        foreGripWorld = rearGripWorld + forward * leftArmReach;
+    }
+
     void ApplyGunIK(float dt) {
         using namespace DirectX;
         const int upperR = model.skeleton.Find("upperarm_r");
@@ -1762,18 +1812,9 @@ private:
             }
 
             gunYaw_ = yaw + spineTwistCurrent_;
-            gunPitch_ = -0.9f; // pointed down and forward, carried at ease
-            const XMFLOAT3 origin = GunOriginWorld(gunYaw_);
-            const float sx = std::sin(gunYaw_), cz = std::cos(gunYaw_);
-            const float cp = std::cos(gunPitch_), sp = std::sin(gunPitch_);
-            const XMFLOAT3 forward{ sx * cp, sp, cz * cp };
-            const XMVECTOR rightGripWorld = XMVectorSet(
-                origin.x + cz * 0.08f, origin.y - 0.02f,
-                origin.z - sx * 0.08f, 1.0f);
-            const XMVECTOR foreGripWorld = XMVectorSet(
-                origin.x - cz * 0.07f + forward.x * leftArmReach,
-                origin.y - 0.03f + forward.y * leftArmReach,
-                origin.z + sx * 0.07f + forward.z * leftArmReach, 1.0f);
+            gunPitch_ = -0.55f; // muzzle down and forward, carried at ease
+            XMVECTOR rightGripWorld, foreGripWorld;
+            ComputeGripTargets(gunYaw_, gunPitch_, rightGripWorld, foreGripWorld);
             const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, MeshWorldMatrix());
             SolveArmIK(upperR, lowerR, handBone_,
                        XMVector3TransformCoord(foreGripWorld, inverseWorld));
@@ -1819,18 +1860,8 @@ private:
         // and the elbows/wrists distort.
         gunYaw_ = yaw + spineTwistCurrent_;
         gunPitch_ = aimPitch;
-        const float gunYaw = gunYaw_;
-        const XMFLOAT3 origin = GunOriginWorld(gunYaw);
-        const float sx = std::sin(gunYaw), cz = std::cos(gunYaw);
-        const float cp = std::cos(gunPitch_), sp = std::sin(gunPitch_);
-        const XMFLOAT3 forward{ sx * cp, sp, cz * cp };
-        const XMVECTOR rightGripWorld = XMVectorSet(
-            origin.x + cz * 0.08f, origin.y - 0.02f,
-            origin.z - sx * 0.08f, 1.0f);
-        const XMVECTOR foreGripWorld = XMVectorSet(
-            origin.x - cz * 0.07f + forward.x * leftArmReach,
-            origin.y - 0.03f + forward.y * leftArmReach,
-            origin.z + sx * 0.07f + forward.z * leftArmReach, 1.0f);
+        XMVECTOR rightGripWorld, foreGripWorld;
+        ComputeGripTargets(gunYaw_, gunPitch_, rightGripWorld, foreGripWorld);
         // Arms hold the gun aimed at the target while in Combat.
         const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, MeshWorldMatrix());
         // UE bone labels appear mirrored after asset-axis conversion. Route the
