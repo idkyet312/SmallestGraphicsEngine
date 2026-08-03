@@ -1,0 +1,243 @@
+Begin Object Class=/Script/Engine.PhysicsAsset Name="Phy_Bandit_PhysicsAsset" ExportPath="/Script/Engine.PhysicsAsset'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset'"
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_128" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_128'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_127" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_127'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_126" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_126'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_125" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_125'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_124" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_124'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_123" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_123'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_122" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_122'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_121" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_121'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_120" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_120'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_119" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_119'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_117" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_117'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_116" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_116'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_115" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_115'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_112" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_112'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_111" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_111'"
+   End Object
+   Begin Object Class=/Script/Engine.SkeletalBodySetup Name="SkeletalBodySetup_110" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_110'"
+   End Object
+   Begin Object Class=/Script/UnrealEd.SceneThumbnailInfo Name="SceneThumbnailInfo_0" ExportPath="/Script/UnrealEd.SceneThumbnailInfo'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SceneThumbnailInfo_0'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_120" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_120'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_119" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_119'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_118" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_118'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_117" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_117'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_116" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_116'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_115" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_115'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_114" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_114'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_113" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_113'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_112" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_112'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_111" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_111'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_109" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_109'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_108" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_108'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_107" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_107'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_104" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_104'"
+   End Object
+   Begin Object Class=/Script/Engine.PhysicsConstraintTemplate Name="PhysicsConstraintTemplate_103" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_103'"
+   End Object
+   Begin Object Name="SkeletalBodySetup_128" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_128'"
+      AggGeom=(BoxElems=((Center=(X=9.603586,Y=-9.319313,Z=-0.420845),Rotation=(Pitch=0.446011,Yaw=-1.183630,Roll=-87.906738),X=8.854359,Y=10.809546,Z=27.044302)))
+      BoneName="foot_r"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_127" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_127'"
+      AggGeom=(SphylElems=((Center=(X=18.193876,Y=1.750887,Z=1.533340),Rotation=(Pitch=0.000007,Yaw=92.327469,Roll=-87.663139),Radius=8.824958,Length=20.527712)))
+      BoneName="calf_r"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_126" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_126'"
+      AggGeom=(SphylElems=((Center=(X=19.765408,Y=-0.875567,Z=0.171264),Rotation=(Pitch=-1.333540,Yaw=-91.550850,Roll=-89.420517),Radius=10.582737,Length=23.570822)))
+      BoneName="thigh_r"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_125" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_125'"
+      AggGeom=(BoxElems=((Center=(X=-9.673150,Y=9.342443,Z=0.425834),Rotation=(Pitch=0.467281,Yaw=-1.069568,Roll=-87.704155),X=8.376099,Y=11.848228,Z=26.535925)))
+      BoneName="foot_l"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_124" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_124'"
+      AggGeom=(SphylElems=((Center=(X=-18.166023,Y=-2.279492,Z=-1.484955),Rotation=(Pitch=-0.000007,Yaw=92.540817,Roll=-87.570992),Radius=9.293576,Length=20.540506)))
+      BoneName="calf_l"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_123" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_123'"
+      AggGeom=(SphylElems=((Center=(X=-21.498878,Y=0.798715,Z=0.644903),Rotation=(Pitch=0.400529,Yaw=-92.261139,Roll=-88.230415),Radius=9.973872,Length=23.486906)))
+      BoneName="thigh_l"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_122" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_122'"
+      AggGeom=(SphylElems=((Center=(X=2.923295,Y=2.459252,Z=-0.095760),Rotation=(Pitch=4.868975,Yaw=-94.801651,Roll=-89.999947),Radius=10.670582,Length=12.167117)))
+      BoneName="head"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_121" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_121'"
+      AggGeom=(SphylElems=((Center=(X=-8.347480,Y=2.269771,Z=0.718203),Rotation=(Pitch=0.000007,Yaw=79.502861,Roll=-89.407181),Radius=5.624784,Length=9.802382)))
+      BoneName="hand_r"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_120" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_120'"
+      AggGeom=(SphylElems=((Center=(X=-13.402077,Y=-0.114412,Z=0.375051),Rotation=(Pitch=0.051561,Yaw=-92.000618,Roll=-88.950249),Radius=7.233662,Length=13.860443)))
+      BoneName="lowerarm_r"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_119" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_119'"
+      AggGeom=(SphylElems=((Center=(X=-10.900596,Y=-1.400750,Z=1.657851),Rotation=(Pitch=-0.577240,Yaw=-89.746178,Roll=-92.304947),Radius=8.648135,Length=18.032345)))
+      BoneName="upperarm_r"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_117" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_117'"
+      AggGeom=(SphylElems=((Center=(X=8.577526,Y=-2.361578,Z=-0.810676),Rotation=(Pitch=0.000000,Yaw=81.604538,Roll=-87.690338),Radius=5.591031,Length=9.549503)))
+      BoneName="hand_l"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_116" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_116'"
+      AggGeom=(SphylElems=((Center=(X=13.495448,Y=0.078802,Z=-0.203462),Rotation=(Pitch=0.008825,Yaw=-93.559349,Roll=-89.820648),Radius=7.178439,Length=13.810147)))
+      BoneName="lowerarm_l"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_115" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_115'"
+      AggGeom=(SphylElems=((Center=(X=10.799339,Y=1.290054,Z=-1.683683),Rotation=(Pitch=-1.110445,Yaw=-88.354134,Roll=-94.438225),Radius=8.401591,Length=17.982372)))
+      BoneName="upperarm_l"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_112" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_112'"
+      AggGeom=(SphylElems=((Center=(X=11.042551,Y=0.564172,Z=-0.039292),Rotation=(Pitch=2.256851,Yaw=-89.999489,Roll=-0.872033),Radius=15.800934,Length=9.159369),(Center=(X=29.026163,Y=1.618777,Z=0.199160),Rotation=(Pitch=0.188862,Yaw=-57.385059,Roll=-89.029343),Radius=10.929554,Length=10.027546),(Center=(X=22.588882,Y=2.299716,Z=-13.379533),Rotation=(Pitch=-44.179562,Yaw=110.446106,Roll=-171.595734),Radius=8.560623,Length=11.318468),(Center=(X=22.748604,Y=2.366659,Z=13.706591),Rotation=(Pitch=-44.414280,Yaw=-70.820152,Roll=-172.270599),Radius=8.339145,Length=11.232455)))
+      BoneName="spine_02"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_111" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_111'"
+      AggGeom=(SphylElems=((Center=(X=10.451649,Y=0.549051,Z=-0.103172),Rotation=(Pitch=88.290611,Yaw=125.978928,Roll=-141.209122),Radius=16.971756,Length=5.517633)))
+      BoneName="spine_01"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SkeletalBodySetup_110" ExportPath="/Script/Engine.SkeletalBodySetup'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SkeletalBodySetup_110'"
+      AggGeom=(SphylElems=((Center=(X=12.480632,Y=-0.311875,Z=0.031911),Rotation=(Pitch=0.829301,Yaw=-89.999992,Roll=0.199793),Radius=14.286781,Length=9.947830)))
+      BoneName="pelvis"
+      CollisionTraceFlag=CTF_UseSimpleAsComplex
+   End Object
+   Begin Object Name="SceneThumbnailInfo_0" ExportPath="/Script/UnrealEd.SceneThumbnailInfo'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:SceneThumbnailInfo_0'"
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_120" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_120'"
+      DefaultInstance=(JointName="foot_r",ConstraintBone1="foot_r",ConstraintBone2="calf_r",Pos2=(X=38.336395,Y=-0.000007,Z=-0.000007),PriAxis2=(X=0.959569,Y=0.279042,Z=0.036915),SecAxis2=(X=-0.262634,Y=0.840439,Z=0.474009),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=25.000000,Swing2LimitDegrees=5.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Limited),TwistLimit=(TwistLimitDegrees=3.000000,TwistMotion=ACM_Locked)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_119" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_119'"
+      DefaultInstance=(JointName="calf_r",ConstraintBone1="calf_r",ConstraintBone2="thigh_r",Pos1=(X=0.000000,Y=-0.000000,Z=0.000001),PriAxis1=(X=1.000000,Y=0.000000,Z=-0.000000),SecAxis1=(X=-0.000000,Y=0.831469,Z=0.555571),Pos2=(X=43.508488,Y=-0.000010,Z=-0.000006),PriAxis2=(X=0.516086,Y=0.721294,Z=0.461941),SecAxis2=(X=-0.855974,Y=0.414775,Z=0.308658),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=30.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Locked),TwistLimit=(TwistMotion=ACM_Locked)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_118" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_118'"
+      DefaultInstance=(JointName="thigh_r",ConstraintBone1="thigh_r",ConstraintBone2="pelvis",Pos2=(X=10.612208,Y=0.194362,Z=9.272617),PriAxis2=(X=-0.927888,Y=0.235046,Z=0.289443),SecAxis2=(X=-0.360747,Y=-0.762179,Z=-0.537535),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=40.000000,Swing2LimitDegrees=20.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Limited),TwistLimit=(TwistMotion=ACM_Locked)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_117" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_117'"
+      DefaultInstance=(JointName="foot_l",ConstraintBone1="foot_l",ConstraintBone2="calf_l",Pos2=(X=-38.336388,Y=-0.000004,Z=-0.007387),PriAxis2=(X=0.959562,Y=0.279042,Z=0.037099),SecAxis2=(X=-0.262726,Y=0.840439,Z=0.473959),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=25.000000,Swing2LimitDegrees=5.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Limited),TwistLimit=(TwistLimitDegrees=3.000000,TwistMotion=ACM_Locked)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_116" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_116'"
+      DefaultInstance=(JointName="calf_l",ConstraintBone1="calf_l",ConstraintBone2="thigh_l",Pos1=(X=-0.000000,Y=0.000004,Z=-0.000004),PriAxis1=(X=1.000000,Y=-0.000000,Z=0.000000),SecAxis1=(X=0.000000,Y=0.831429,Z=0.555632),Pos2=(X=-43.508480,Y=0.000006,Z=-0.000007),PriAxis2=(X=0.516177,Y=0.721266,Z=0.461884),SecAxis2=(X=-0.855914,Y=0.414756,Z=0.308852),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=30.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Locked),TwistLimit=(TwistMotion=ACM_Locked)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_115" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_115'"
+      DefaultInstance=(JointName="thigh_l",ConstraintBone1="thigh_l",ConstraintBone2="pelvis",Pos2=(X=10.612215,Y=0.190446,Z=-9.272699),PriAxis2=(X=0.927888,Y=-0.234924,Z=0.289542),SecAxis2=(X=0.360747,Y=0.761953,Z=-0.537857),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=40.000000,Swing2LimitDegrees=20.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Limited),TwistLimit=(TwistMotion=ACM_Locked)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_114" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_114'"
+      DefaultInstance=(JointName="head",ConstraintBone1="head",ConstraintBone2="spine_02",Pos2=(X=42.585930,Y=6.434471,Z=-0.005268),PriAxis2=(X=0.991678,Y=0.128739,Z=-0.000122),SecAxis2=(X=-0.128739,Y=0.991678,Z=0.000067),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=5.000000,Swing2LimitDegrees=5.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Limited),TwistLimit=(TwistLimitDegrees=25.000000,TwistMotion=ACM_Limited)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_113" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_113'"
+      DefaultInstance=(JointName="hand_r",ConstraintBone1="hand_r",ConstraintBone2="lowerarm_r",Pos2=(X=-26.479275,Y=-0.000010,Z=0.028772),PriAxis2=(X=0.989130,Y=-0.122250,Z=-0.081714),SecAxis2=(X=0.055885,Y=-0.201480,Z=0.977897),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=35.000000,Swing2LimitDegrees=25.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Limited),TwistLimit=(TwistMotion=ACM_Locked)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_112" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_112'"
+      DefaultInstance=(JointName="lowerarm_r",ConstraintBone1="lowerarm_r",ConstraintBone2="upperarm_r",Pos2=(X=-24.461542,Y=-0.000008,Z=0.000032),PriAxis2=(X=0.674576,Y=0.738204,Z=0.000956),SecAxis2=(X=-0.738204,Y=0.674577,Z=-0.000511),ProfileInstance=(ConeLimit=(Swing1Motion=ACM_Limited,Swing2Motion=ACM_Locked),TwistLimit=(TwistMotion=ACM_Locked)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_111" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_111'"
+      DefaultInstance=(JointName="upperarm_r",ConstraintBone1="upperarm_r",ConstraintBone2="spine_02",Pos2=(X=22.525505,Y=-1.743208,Z=21.284260),PriAxis2=(X=0.436531,Y=-0.231453,Z=-0.869408),SecAxis2=(X=0.033771,Y=-0.961446,Z=0.272912),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=55.000000,Swing2LimitDegrees=28.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Limited),TwistLimit=(TwistLimitDegrees=20.000000,TwistMotion=ACM_Limited)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_109" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_109'"
+      DefaultInstance=(JointName="hand_l",ConstraintBone1="hand_l",ConstraintBone2="lowerarm_l",Pos2=(X=26.479290,Y=0.000015,Z=0.000006),PriAxis2=(X=0.989228,Y=-0.122178,Z=-0.080626),SecAxis2=(X=0.054823,Y=-0.201480,Z=0.977957),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=35.000000,Swing2LimitDegrees=25.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Limited),TwistLimit=(TwistMotion=ACM_Locked)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_108" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_108'"
+      DefaultInstance=(JointName="lowerarm_l",ConstraintBone1="lowerarm_l",ConstraintBone2="upperarm_l",Pos2=(X=24.461525,Y=0.000007,Z=0.000023),PriAxis2=(X=0.674541,Y=0.738238,Z=0.000000),SecAxis2=(X=-0.738238,Y=0.674541,Z=0.000000),ProfileInstance=(ConeLimit=(Swing1Motion=ACM_Limited,Swing2Motion=ACM_Locked),TwistLimit=(TwistMotion=ACM_Locked)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_107" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_107'"
+      DefaultInstance=(JointName="upperarm_l",ConstraintBone1="upperarm_l",ConstraintBone2="spine_02",Pos2=(X=22.520327,Y=-1.743917,Z=-21.289660),PriAxis2=(X=-0.436743,Y=0.231424,Z=-0.869310),SecAxis2=(X=-0.033705,Y=0.961455,Z=0.272888),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=55.000000,Swing2LimitDegrees=28.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Limited),TwistLimit=(TwistLimitDegrees=20.000000,TwistMotion=ACM_Limited)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_104" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_104'"
+      DefaultInstance=(JointName="spine_02",ConstraintBone1="spine_02",ConstraintBone2="spine_01",Pos2=(X=16.525633,Y=-3.528866,Z=0.004960),PriAxis2=(X=0.986644,Y=-0.162894,Z=0.000106),SecAxis2=(X=0.162891,Y=0.986622,Z=-0.006630),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=5.000000,Swing2LimitDegrees=10.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Limited),TwistLimit=(TwistLimitDegrees=15.000000,TwistMotion=ACM_Limited)))
+   End Object
+   Begin Object Name="PhysicsConstraintTemplate_103" ExportPath="/Script/Engine.PhysicsConstraintTemplate'/Game/MilitaryMercenaryBandit/Meshes/Phy_Bandit_PhysicsAsset.Phy_Bandit_PhysicsAsset:PhysicsConstraintTemplate_103'"
+      DefaultInstance=(JointName="spine_01",ConstraintBone1="spine_01",ConstraintBone2="pelvis",Pos2=(X=21.699511,Y=0.171899,Z=-0.000037),PriAxis2=(X=0.959958,Y=0.280133,Z=0.002595),SecAxis2=(X=-0.280143,Y=0.959940,Z=0.005878),ProfileInstance=(ConeLimit=(Swing1LimitDegrees=25.000000,Swing2LimitDegrees=10.000000,Swing1Motion=ACM_Limited,Swing2Motion=ACM_Limited),TwistLimit=(TwistLimitDegrees=20.000000,TwistMotion=ACM_Limited)))
+   End Object
+   PreviewSkeletalMesh="/Game/MilitaryMercenaryBandit/Meshes/SK_Bandit.SK_Bandit"
+   BoundsBodies(0)=0
+   BoundsBodies(1)=1
+   BoundsBodies(2)=2
+   BoundsBodies(3)=3
+   BoundsBodies(4)=4
+   BoundsBodies(5)=5
+   BoundsBodies(6)=6
+   BoundsBodies(7)=7
+   BoundsBodies(8)=8
+   BoundsBodies(9)=9
+   BoundsBodies(10)=10
+   BoundsBodies(11)=11
+   BoundsBodies(12)=12
+   BoundsBodies(13)=13
+   BoundsBodies(14)=14
+   BoundsBodies(15)=15
+   SkeletalBodySetups(0)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_110'"
+   SkeletalBodySetups(1)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_111'"
+   SkeletalBodySetups(2)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_112'"
+   SkeletalBodySetups(3)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_115'"
+   SkeletalBodySetups(4)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_116'"
+   SkeletalBodySetups(5)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_117'"
+   SkeletalBodySetups(6)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_119'"
+   SkeletalBodySetups(7)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_120'"
+   SkeletalBodySetups(8)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_121'"
+   SkeletalBodySetups(9)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_122'"
+   SkeletalBodySetups(10)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_123'"
+   SkeletalBodySetups(11)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_124'"
+   SkeletalBodySetups(12)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_125'"
+   SkeletalBodySetups(13)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_126'"
+   SkeletalBodySetups(14)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_127'"
+   SkeletalBodySetups(15)="/Script/Engine.SkeletalBodySetup'SkeletalBodySetup_128'"
+   ConstraintSetup(0)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_103'"
+   ConstraintSetup(1)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_104'"
+   ConstraintSetup(2)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_107'"
+   ConstraintSetup(3)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_108'"
+   ConstraintSetup(4)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_109'"
+   ConstraintSetup(5)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_111'"
+   ConstraintSetup(6)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_112'"
+   ConstraintSetup(7)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_113'"
+   ConstraintSetup(8)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_114'"
+   ConstraintSetup(9)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_115'"
+   ConstraintSetup(10)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_116'"
+   ConstraintSetup(11)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_117'"
+   ConstraintSetup(12)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_118'"
+   ConstraintSetup(13)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_119'"
+   ConstraintSetup(14)="/Script/Engine.PhysicsConstraintTemplate'PhysicsConstraintTemplate_120'"
+   SolverSettings=(CullDistance=1.000000,bUseLinearJointSolver=False,bUseManifolds=False)
+   ThumbnailInfo="/Script/UnrealEd.SceneThumbnailInfo'SceneThumbnailInfo_0'"
+End Object
