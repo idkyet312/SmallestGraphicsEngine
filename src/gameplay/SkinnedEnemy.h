@@ -86,6 +86,10 @@ public:
     float             gunRearGripForward = 0.16f;
     float             gunRearGripInboard = -0.06f;
     float             gunRearGripDrop = -0.18f;
+    // Support-hand placement. Distance down the barrel is leftArmReach; these
+    // two shift it across and above the barrel in the gun's own frame.
+    float             gunForeGripLateral = 0.0f;
+    float             gunForeGripRise = 0.0f;
     float             headTorsoYawOffsetDegrees = 20.4f;
     float             maxSpineTwistDegrees = 85.0f;
     float             spineTwistSpeedDegrees = 220.0f;
@@ -1780,8 +1784,16 @@ private:
                       + forward * gunRearGripForward
                       + right * gunRearGripInboard
                       + XMVectorSet(0.0f, gunRearGripDrop, 0.0f, 0.0f);
-        // Support hand out along the barrel from the trigger hand.
-        foreGripWorld = rearGripWorld + forward * leftArmReach;
+
+        // Support hand out along the barrel, then offset across and above it.
+        // Those two offsets are applied in the gun's own frame (barrel-relative
+        // right/up), not world axes, so the fore hand keeps its position on the
+        // weapon at any pitch instead of sliding off as the muzzle rises.
+        const XMVECTOR barrelUp = XMVectorSet(-sx * sp, cp, -cz * sp, 0.0f);
+        foreGripWorld = rearGripWorld
+                      + forward * leftArmReach
+                      + right * gunForeGripLateral
+                      + barrelUp * gunForeGripRise;
     }
 
     void ApplyGunIK(float dt) {

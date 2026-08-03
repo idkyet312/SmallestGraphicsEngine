@@ -266,6 +266,8 @@ float                       g_banditGunGripRise = -0.04f;
 float                       g_banditGunRearGripForward = 0.16f;
 float                       g_banditGunRearGripInboard = -0.06f;
 float                       g_banditGunRearGripDrop = -0.18f;
+float                       g_banditGunForeGripLateral = 0.0f;
+float                       g_banditGunForeGripRise = 0.0f;
 bool                        g_showEnemyVisionCones = false;
 static uint32_t&            g_banditSpawnSerial = g_enemySystem.spawnSerial;
 GunAudio                    g_gunAudio;
@@ -2348,20 +2350,27 @@ void BanditDebugText() {
     if (GunModel::C4Selected())
         ImGui::Text("C4: LMB throw | RMB detonate | armed=%zu",
                     scene.remoteCharges.size());
-    ImGui::SliderFloat("Left arm reach", &g_banditLeftArmReach,
-                       0.20f, 0.85f, "%.2f m");
     ImGui::SliderFloat("Head/torso yaw offset",
                        &g_banditHeadYawOffsetDegrees,
                        -90.0f, 90.0f, "%.1f deg");
 
     if (ImGui::CollapsingHeader("Rifle grip")) {
-        ImGui::TextDisabled("Hand placement (drives the whole hold)");
-        ImGui::SliderFloat("Rear grip forward", &g_banditGunRearGripForward,
+        ImGui::TextDisabled("Trigger hand (from the shoulder)");
+        ImGui::SliderFloat("Rear forward", &g_banditGunRearGripForward,
                            -0.20f, 0.50f, "%.3f m");
-        ImGui::SliderFloat("Rear grip inboard", &g_banditGunRearGripInboard,
+        ImGui::SliderFloat("Rear inboard", &g_banditGunRearGripInboard,
                            -0.30f, 0.30f, "%.3f m");
-        ImGui::SliderFloat("Rear grip drop", &g_banditGunRearGripDrop,
+        ImGui::SliderFloat("Rear drop", &g_banditGunRearGripDrop,
                            -0.50f, 0.20f, "%.3f m");
+
+        ImGui::TextDisabled("Support hand (from the trigger hand)");
+        ImGui::SliderFloat("Fore reach", &g_banditLeftArmReach,
+                           0.20f, 0.85f, "%.3f m");
+        ImGui::SliderFloat("Fore lateral", &g_banditGunForeGripLateral,
+                           -0.30f, 0.30f, "%.3f m");
+        ImGui::SliderFloat("Fore rise", &g_banditGunForeGripRise,
+                           -0.30f, 0.30f, "%.3f m");
+
         ImGui::TextDisabled("Mesh seating in the hands");
         ImGui::SliderFloat("Gun along barrel", &g_banditGunGripForward,
                            -0.40f, 0.60f, "%.3f m");
@@ -2377,6 +2386,8 @@ void BanditDebugText() {
             g_banditGunRearGripForward = 0.16f;
             g_banditGunRearGripInboard = -0.06f;
             g_banditGunRearGripDrop = -0.18f;
+            g_banditGunForeGripLateral = 0.0f;
+            g_banditGunForeGripRise = 0.0f;
         }
     }
     ImGui::Checkbox("Show enemy vision cones", &g_showEnemyVisionCones);
@@ -8560,6 +8571,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 bandit->gunRearGripForward = g_banditGunRearGripForward;
                 bandit->gunRearGripInboard = g_banditGunRearGripInboard;
                 bandit->gunRearGripDrop = g_banditGunRearGripDrop;
+                bandit->gunForeGripLateral = g_banditGunForeGripLateral;
+                bandit->gunForeGripRise = g_banditGunForeGripRise;
                 if (bandit.get() == g_heldBandit) {
                     const XMFLOAT3& eye = scene.camera.Position;
                     const XMFLOAT3& front = scene.camera.Front;
