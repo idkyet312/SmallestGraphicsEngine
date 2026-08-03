@@ -256,18 +256,18 @@ constexpr float              kBoatDeckOffset = 0.10f;
 SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
 SkinnedModel                g_marineModel;
-float                       g_banditLeftArmReach = 0.55f;
+float                       g_banditLeftArmReach = 0.85f;
 float                       g_banditHeadYawOffsetDegrees = 20.4f;
 // Rifle grip tuning, pushed to every bandit each frame so the sliders in
 // BanditDebugText retune the hold live. Defaults mirror SkinnedEnemy's.
-float                       g_banditGunScale = 0.6f;
-float                       g_banditGunGripForward = 0.16f;
+float                       g_banditGunScale = 0.62f;
+float                       g_banditGunGripForward = -0.183f;
 float                       g_banditGunGripRise = -0.04f;
 float                       g_banditGunRearGripForward = 0.16f;
 float                       g_banditGunRearGripInboard = -0.06f;
 float                       g_banditGunRearGripDrop = -0.18f;
-float                       g_banditGunForeGripLateral = 0.0f;
-float                       g_banditGunForeGripRise = 0.0f;
+float                       g_banditGunForeGripLateral = 0.253f;
+float                       g_banditGunForeGripRise = -0.206f;
 bool                        g_showEnemyVisionCones = false;
 static uint32_t&            g_banditSpawnSerial = g_enemySystem.spawnSerial;
 GunAudio                    g_gunAudio;
@@ -2365,7 +2365,7 @@ void BanditDebugText() {
 
         ImGui::TextDisabled("Support hand (from the trigger hand)");
         ImGui::SliderFloat("Fore reach", &g_banditLeftArmReach,
-                           0.20f, 0.85f, "%.3f m");
+                           0.20f, 1.10f, "%.3f m");
         ImGui::SliderFloat("Fore lateral", &g_banditGunForeGripLateral,
                            -0.30f, 0.30f, "%.3f m");
         ImGui::SliderFloat("Fore rise", &g_banditGunForeGripRise,
@@ -2379,15 +2379,15 @@ void BanditDebugText() {
         ImGui::SliderFloat("Gun scale", &g_banditGunScale,
                            0.20f, 1.50f, "%.2f x");
         if (ImGui::Button("Reset rifle grip")) {
-            g_banditLeftArmReach = 0.55f;
-            g_banditGunScale = 0.6f;
-            g_banditGunGripForward = 0.16f;
+            g_banditLeftArmReach = 0.85f;
+            g_banditGunScale = 0.62f;
+            g_banditGunGripForward = -0.183f;
             g_banditGunGripRise = -0.04f;
             g_banditGunRearGripForward = 0.16f;
             g_banditGunRearGripInboard = -0.06f;
             g_banditGunRearGripDrop = -0.18f;
-            g_banditGunForeGripLateral = 0.0f;
-            g_banditGunForeGripRise = 0.0f;
+            g_banditGunForeGripLateral = 0.253f;
+            g_banditGunForeGripRise = -0.206f;
         }
     }
     ImGui::Checkbox("Show enemy vision cones", &g_showEnemyVisionCones);

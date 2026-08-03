@@ -73,11 +73,11 @@ public:
     float             meshRoll = 0.0f;
     float             meshYaw  = 0.0f;
     bool              upperBodyGunLayer = true;
-    float             leftArmReach = 0.55f;
+    float             leftArmReach = 0.85f;
     // Gun mesh seating relative to the trigger hand, applied along the barrel
     // and the gun's own up axis in UpdateGunFromHands.
-    float             gunScale = 0.6f;
-    float             gunGripForward = 0.16f;
+    float             gunScale = 0.62f;
+    float             gunGripForward = -0.183f;
     float             gunGripRise = -0.04f;
     // Trigger-hand placement relative to the trigger shoulder, used by
     // ComputeGripTargets. gunShoulderOffset only applies when the shoulder
@@ -88,8 +88,8 @@ public:
     float             gunRearGripDrop = -0.18f;
     // Support-hand placement. Distance down the barrel is leftArmReach; these
     // two shift it across and above the barrel in the gun's own frame.
-    float             gunForeGripLateral = 0.0f;
-    float             gunForeGripRise = 0.0f;
+    float             gunForeGripLateral = 0.253f;
+    float             gunForeGripRise = -0.206f;
     float             headTorsoYawOffsetDegrees = 20.4f;
     float             maxSpineTwistDegrees = 85.0f;
     float             spineTwistSpeedDegrees = 220.0f;
