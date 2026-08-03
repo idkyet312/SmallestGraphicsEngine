@@ -63,6 +63,7 @@ const char* LevelEntityTypeName(LevelEntityType type) {
     case LevelEntityType::Palm: return "palm";
     case LevelEntityType::ExplosiveBarrel: return "explosive_barrel";
     case LevelEntityType::EnemySpawn: return "enemy_spawn";
+    case LevelEntityType::AllySpawn: return "ally_spawn";
     case LevelEntityType::Humvee: return "humvee";
     case LevelEntityType::Helicopter: return "helicopter";
     case LevelEntityType::GrassPatch: return "grass_patch";

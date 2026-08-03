@@ -14,6 +14,7 @@ enum class LevelEntityType {
     Palm,
     ExplosiveBarrel,
     EnemySpawn,
+    AllySpawn,
     Humvee,
     Helicopter,
     GrassPatch,

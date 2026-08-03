@@ -47,6 +47,7 @@ float PickRadius(LevelEntityType type) {
 
 bool SupportsScale(LevelEntityType type) {
     return type == LevelEntityType::Palm || type == LevelEntityType::EnemySpawn ||
+           type == LevelEntityType::AllySpawn ||
            type == LevelEntityType::Helicopter || type == LevelEntityType::GrassPatch ||
            type == LevelEntityType::Dandelion || type == LevelEntityType::Rock ||
            type == LevelEntityType::Prefab;
@@ -62,6 +63,7 @@ ImU32 TypeColor(LevelEntityType type, bool selected) {
     switch (type) {
     case LevelEntityType::PlayerSpawn: return IM_COL32(70, 220, 255, 230);
     case LevelEntityType::EnemySpawn: return IM_COL32(255, 75, 75, 230);
+    case LevelEntityType::AllySpawn: return IM_COL32(75, 130, 255, 230);
     case LevelEntityType::WoodHouse:
     case LevelEntityType::MetalHouse: return IM_COL32(255, 170, 70, 230);
     case LevelEntityType::Palm: return IM_COL32(70, 220, 100, 230);
@@ -1510,6 +1512,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::SeparatorText("Create");
     const LevelEntityType types[] = { LevelEntityType::WoodHouse, LevelEntityType::MetalHouse,
         LevelEntityType::Palm, LevelEntityType::ExplosiveBarrel, LevelEntityType::EnemySpawn,
+        LevelEntityType::AllySpawn,
         LevelEntityType::Humvee, LevelEntityType::Helicopter, LevelEntityType::PlayerSpawn,
         LevelEntityType::GrassPatch, LevelEntityType::Dandelion, LevelEntityType::Rock };
     for (auto type : types) {

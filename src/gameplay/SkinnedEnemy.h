@@ -15,6 +15,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -46,6 +47,8 @@ enum class BanditWeapon {
     Shotgun,
     Sniper,
 };
+
+enum class Faction : uint8_t { Bandit, Marine };
 
 class SkinnedEnemy {
 public:
@@ -88,6 +91,13 @@ public:
     // Loadout. Set at spawn; drives engagement range, aim delay, and how main
     // turns a "fired" result into projectiles.
     BanditWeapon      weapon = BanditWeapon::Rifle;
+    // Default keeps every existing bandit spawn/call site correct unchanged.
+    Faction           faction = Faction::Bandit;
+    // When set, Patrol/Alert wandering (UpdatePatrolWaypoint) circles this
+    // point instead of the actor's own spawn position -- lets a marine loiter
+    // near the player instead of near wherever it was placed. Left unset
+    // (nullopt) for bandits, who should keep wandering their own spawn point.
+    std::optional<DirectX::XMFLOAT3> leashPosition;
 
     // Sniper telegraph: how long the laser paints the player before the shot.
     // Long on purpose -- the beam IS the warning, so the player needs time to
@@ -103,6 +113,15 @@ public:
     // (today's aim/orbit/cover/fire behavior).
     enum class AwarenessState { Patrol, Alert, Combat };
     AwarenessState Awareness() const { return awareness_; }
+
+    // TEMP DEBUG: exposes the rifle firing gate so the ImGui panel can show
+    // why an actor is or is not shooting. Remove once marine fire is verified.
+    bool DebugPreparingShot() const { return preparingShot_; }
+    float DebugStationaryAimTime() const { return stationaryAimTime_; }
+    bool DebugHasCoverTarget() const { return hasCoverTarget_; }
+    bool DebugInCover() const { return inCover_; }
+    bool DebugHasGunPose() const { return HasGunPose(); }
+    int DebugBurstShots() const { return burstShotsRemaining; }
 
     // Vision cone parameters for debug visualization. Half-angle in radians
     // (not the stored cosine) so callers can build cone geometry directly.
@@ -132,6 +151,14 @@ public:
         if (dead_ || held_ || turretGunner || hasCoverTarget_ ||
             coverQueryCooldown_ > 0.0f)
             return false;
+        // Marines take cover and shoot from it. The hazard is that vision range
+        // (28) is shorter than BackoffRange (30), so any target a marine can
+        // see is also inside the cover-query range -- left unguarded it would
+        // re-query every 0.75s and SetCoverTarget's stationaryAimTime_ reset
+        // would starve the aim-up so it never fired. Once settled in cover it
+        // stops asking for a new spot and holds there shooting; it only looks
+        // for fresh cover after the current one is given up.
+        if (faction == Faction::Marine && inCover_) return false;
         return PlayerInBackoffRange(playerPosition);
     }
 
@@ -287,7 +314,11 @@ public:
             aimPitch = 0.0f;
             DirectX::XMFLOAT3 moveTarget = position;
             bool haveMoveTarget = false;
-            if (awareness_ == AwarenessState::Alert) {
+            // A leashed follower stays with its anchor even while Alert --
+            // investigating a last-known position for six seconds is enemy
+            // behavior, and would leave a marine standing in a field while the
+            // player walks off.
+            if (awareness_ == AwarenessState::Alert && !leashPosition) {
                 moveTarget = lastKnownTarget_;
                 haveMoveTarget = true;
             } else {
@@ -384,9 +415,16 @@ public:
         float speed = 0.0f;
         const bool movingToCover = hasCoverTarget_ && !inCover_;
         const float safeDistance = BackoffRange();
+        // Backing off is bandit behavior for keeping the player at arm's
+        // length. A marine that did it would retreat from every bandit it
+        // spots (vision range 28 is inside the 30 backoff range), never
+        // closing to engage -- allies push in and orbit instead.
         const bool evasiveRetreat = !hasCoverTarget_ &&
-            distance < safeDistance;
-        const bool holdingSafeRange = !hasCoverTarget_ && !evasiveRetreat;
+            faction == Faction::Bandit && distance < safeDistance;
+        // Bandits hold at their safe distance; marines always close on the
+        // target so they can actually orbit and shoot it.
+        const bool holdingSafeRange = !hasCoverTarget_ && !evasiveRetreat &&
+            faction == Faction::Bandit;
         if ((distance > 0.1f || movingToCover) && !rooted && !inCover_ &&
             !holdingSafeRange) {
             const float inv = distance > 0.001f ? 1.0f / distance : 0.0f;
@@ -575,6 +613,10 @@ public:
     // occlusion raycast only when a target already falls inside range and
     // FOV -- mirrors NeedsLineOfSightCheck's cheap-before-expensive ordering.
     // Turret gunners keep their original always-aware behavior unchanged.
+    // target is whatever main.cpp decides this actor's nearest hostile is --
+    // the player's position for a bandit, or a marine's position for a bandit
+    // targeting an ally, or a bandit's position for a marine. No player-specific
+    // logic lives in here despite the name.
     bool PerceivePlayer(const DirectX::XMFLOAT3& target) const {
         if (dead_ || held_) return false;
         if (turretGunner) return true;
@@ -584,9 +626,15 @@ public:
             const float invLen = 1.0f / std::sqrt(distSq);
             const float facingX = std::sin(yaw), facingZ = std::cos(yaw);
             const float dot = (dx * invLen) * facingX + (dz * invLen) * facingZ;
-            if (dot >= kVisionHalfFovCos &&
-                g_enemyLineOfSightFn && g_enemyLineOfSightFn(*this, target))
-                return true;
+            // Marines get squad awareness -- range and the occlusion raycast
+            // still apply, only the forward cone is waived. A follower's yaw
+            // tracks whatever it is walking toward, so a cone would blind it to
+            // exactly the flanking bandits it exists to deal with.
+            const bool ignoreFov = faction == Faction::Marine;
+            if (dot >= kVisionHalfFovCos || ignoreFov) {
+                if (g_enemyLineOfSightFn && g_enemyLineOfSightFn(*this, target))
+                    return true;
+            }
         }
         for (const EnemyNoiseEvent& noise : g_enemyNoiseEvents) {
             const float nx = noise.position.x - position.x;
@@ -606,6 +654,21 @@ public:
     // Returns true and writes `outTarget` when there's somewhere to walk this
     // tick; false means stand idle (mid-pause, or no route/navmesh yet).
     bool UpdatePatrolWaypoint(float dt, DirectX::XMFLOAT3& outTarget) {
+        // Leashed (a marine following the player): walk straight at the anchor
+        // whenever it drifts beyond the follow distance, and hold position
+        // inside it. Checked before the pause timer and the authored route so
+        // neither can strand a follower -- a stale pause from earlier wandering
+        // would otherwise freeze it for seconds while the player walks away.
+        if (leashPosition) {
+            constexpr float kFollowDistance = 4.0f;
+            patrolPauseTimer_ = 0.0f;
+            const float ldx = leashPosition->x - position.x;
+            const float ldz = leashPosition->z - position.z;
+            if (ldx * ldx + ldz * ldz <= kFollowDistance * kFollowDistance)
+                return false;
+            outTarget = *leashPosition;
+            return true;
+        }
         if (patrolPauseTimer_ > 0.0f) { patrolPauseTimer_ -= dt; return false; }
         if (!patrolRoute_.empty()) {
             if (patrolIndex_ >= patrolRoute_.size()) patrolIndex_ = 0;
@@ -618,7 +681,8 @@ public:
             }
             return true;
         }
-        // No authored route: wander in a loose loop around the spawn point.
+        // No authored route: wander in a loose loop around the spawn point
+        // (a bandit holding the ground it was placed on).
         const float dx = patrolWaypoint_.x - position.x;
         const float dz = patrolWaypoint_.z - position.z;
         if (dx * dx + dz * dz <= 0.6f * 0.6f) {
@@ -634,6 +698,12 @@ public:
         return true;
     }
 
+    // Bandits telegraph for two seconds so the player can react. Nobody has to
+    // dodge friendly fire, so allies snap up far faster.
+    float AimUpSeconds() const {
+        return faction == Faction::Marine ? 0.5f : 2.0f;
+    }
+
     bool NeedsLineOfSightCheck() const {
         if (awareness_ != AwarenessState::Combat && !turretGunner) return false;
         if (dead_ || held_ || !visible || !HasGunPose()) return false;
@@ -645,7 +715,7 @@ public:
         if (burstShotsRemaining > 0)
             return fireCooldown <= 0.0f;
         return fireCooldown <= 0.0f &&
-               preparingShot_ && stationaryAimTime_ >= 2.0f;
+               preparingShot_ && stationaryAimTime_ >= AimUpSeconds();
     }
 
     bool TryFireAt(float dt, const DirectX::XMFLOAT3& target,
@@ -724,7 +794,7 @@ public:
                     spottedEventPending_ = true;
                     return false;
                 }
-                if (stationaryAimTime_ < 2.0f) return false;
+                if (stationaryAimTime_ < AimUpSeconds()) return false;
             } else if (fireCooldown > 0.0f) {
                 return false;
             }
@@ -741,8 +811,30 @@ public:
         // four perfectly accurate automatic turrets. The sniper spent five
         // seconds lining the shot up on a visible beam, so it gets a much
         // tighter cone -- the telegraph is the counterplay, not bad aim.
-        const float spread = IsSniper() ? 0.004f : 0.018f;
-        const float verticalSpread = IsSniper() ? 0.003f : 0.012f;
+        float spread = IsSniper() ? 0.004f : 0.018f;
+        float verticalSpread = IsSniper() ? 0.003f : 0.012f;
+        // Marines miss a lot on purpose: allies that shot as well as bandits
+        // trivialized fights the player is supposed to carry. Only the cone is
+        // widened -- damage is untouched, so a landed hit still does the normal
+        // 20 and five connected hits still kill. The budget is ~30 rounds
+        // fired per kill, i.e. roughly one shot in six connects.
+        //
+        // The offset below is added to a non-normalized aim vector, so a fixed
+        // spread shrinks with range -- marines would spray point-blank and
+        // tighten up at distance, backwards from how bad aim reads. Scaling by
+        // the range makes it a true angular cone that holds the same hit rate
+        // at every distance, which is what makes a shots-per-kill budget mean
+        // anything.
+        if (faction == Faction::Marine) {
+            // Hit chance falls as the cone area grows, so ~1-in-6 needs the
+            // linear spread at roughly sqrt(6) times the width that would put
+            // the cone edge on a torso.
+            constexpr float kMarineSpreadScale = 6.0f;
+            const float range = std::sqrt(
+                XMVectorGetX(XMVector3LengthSq(aim)));
+            spread *= kMarineSpreadScale * range;
+            verticalSpread *= kMarineSpreadScale * range;
+        }
         aim += XMVectorSet(randomSigned() * spread,
                            randomSigned() * verticalSpread,
                            randomSigned() * spread, 0.0f);

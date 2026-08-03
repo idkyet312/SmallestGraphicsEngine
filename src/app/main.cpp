@@ -255,6 +255,7 @@ constexpr float              kBoatHullHeight = 1.1f;
 constexpr float              kBoatDeckOffset = 0.10f;
 SkinnedModel                g_banditModel;
 bool                        g_banditLoaded = false;
+SkinnedModel                g_marineModel;
 float                       g_banditLeftArmReach = 0.55f;
 float                       g_banditHeadYawOffsetDegrees = 20.4f;
 bool                        g_showEnemyVisionCones = false;
@@ -422,8 +423,52 @@ static void AddExplosionTerrainCrater(const XMFLOAT3& impact) {
 static size_t LiveBanditCount() {
     size_t count = 0;
     for (const auto& bandit : g_bandits)
-        if (bandit && !bandit->Dead()) ++count;
+        if (bandit && !bandit->Dead() && bandit->faction == Faction::Bandit) ++count;
     return count;
+}
+
+static size_t LiveMarineCount() {
+    size_t count = 0;
+    for (const auto& bandit : g_bandits)
+        if (bandit && !bandit->Dead() && bandit->faction == Faction::Marine) ++count;
+    return count;
+}
+
+// Nearest position this actor should perceive/aim/shoot at: bandits target the
+// nearest of {player, each live marine}; marines target the nearest live bandit
+// and never the player. Ties favor the player so behavior is unchanged when no
+// marines are alive/nearby.
+static DirectX::XMFLOAT3 NearestHostileTarget(const SkinnedEnemy& actor,
+                                               const DirectX::XMFLOAT3& playerPosition,
+                                               const std::vector<DirectX::XMFLOAT3>& marinePositions,
+                                               const std::vector<DirectX::XMFLOAT3>& banditPositions) {
+    auto distSq = [&](const DirectX::XMFLOAT3& p) {
+        const float dx = p.x - actor.position.x;
+        const float dy = p.y - actor.position.y;
+        const float dz = p.z - actor.position.z;
+        return dx * dx + dy * dy + dz * dz;
+    };
+    if (actor.faction == Faction::Bandit) {
+        DirectX::XMFLOAT3 best = playerPosition;
+        float bestDistSq = distSq(best);
+        for (const auto& p : marinePositions) {
+            const float d = distSq(p);
+            if (d < bestDistSq) { bestDistSq = d; best = p; }
+        }
+        return best;
+    }
+    // Marine: nearest live bandit, or its own current position (no perceivable
+    // target) if none are alive. Candidate positions are torso-height, so the
+    // no-target fallback matches -- PerceivePlayer treats a target at its own
+    // position as unperceivable either way, but keeping the height consistent
+    // avoids a phantom vertical offset in the distance test.
+    DirectX::XMFLOAT3 best = actor.position;
+    float bestDistSq = FLT_MAX;
+    for (const auto& p : banditPositions) {
+        const float d = distSq(p);
+        if (d < bestDistSq) { bestDistSq = d; best = p; }
+    }
+    return best;
 }
 
 static void ReleaseMaterialUploadHeaps(const std::shared_ptr<SceneNode>& node) {
@@ -1341,6 +1386,41 @@ static bool SpawnBandit() {
     return true;
 }
 
+// Drops one marine at the given position/yaw. No slot rotation, no respawn --
+// one-shot per AllySpawn level entity, called once at level load.
+static bool SpawnMarine(const XMFLOAT3& position, float yaw) {
+    if (!g_marineModel.valid) return false;
+    auto marine = std::make_unique<SkinnedEnemy>();
+    if (!marine->Init(g_marineModel)) return false;
+    marine->faction = Faction::Marine;
+    marine->position = position;
+    marine->yaw = yaw;
+    marine->leftArmReach = g_banditLeftArmReach;
+    // 4x a bandit's 100. Allies fight outnumbered and cannot take cover as
+    // cleverly as the player, so they need the buffer to stay useful.
+    marine->health = 400.0f;
+    marine->fireCooldown = 0.7f + ((float)std::rand() / (float)RAND_MAX) * 2.8f;
+    // No ApplyBanditLoadout(): marines stay on the default Rifle loadout for v1.
+    marine->PlayClip("Walk");
+    g_bandits.push_back(std::move(marine));
+    return true;
+}
+
+// Data-driven only: spawns one marine per enabled AllySpawn entity in the
+// current level. Levels with none (including the non-custom default level)
+// get zero marines -- mirrors how EnemySpawn entities drive SpawnBandit()'s
+// custom-level branch.
+static void SpawnMarinesFromLevel() {
+    if (!g_customLevelMode) return;
+    for (const LevelEntity& entity : g_game.world.Level().entities) {
+        if (!entity.enabled || entity.type != LevelEntityType::AllySpawn) continue;
+        const XMFLOAT3 position{ entity.transform.position[0],
+                                 entity.transform.position[1],
+                                 entity.transform.position[2] };
+        SpawnMarine(position, XMConvertToRadians(entity.transform.rotation[1]));
+    }
+}
+
 static bool SpawnHumveeTurretGunner(int vehicleIndex) {
     if (!g_banditModel.valid || !g_humveeModel) return false;
     for (const auto& existing : g_bandits)
@@ -1548,6 +1628,17 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
         // Human shield must not stop enemies from taking the shot. The hostile
         // projectile collision path damages the held Bandit before the player.
         if (bandit->Held()) continue;
+        // The actor being aimed at cannot occlude the shot at itself. When the
+        // target is another actor (marine aiming at a bandit, or vice versa)
+        // the ray ends inside that actor's own ragdoll, which would otherwise
+        // report a block every frame and stall the aim-up before any shot.
+        // The tolerance is body-sized on purpose: the target position is a
+        // snapshot taken earlier in the frame, so the actor has usually moved
+        // a little by now, and anyone standing that close to the endpoint is
+        // the target rather than something meaningfully in the way.
+        const float tdx = bandit->position.x - target.x;
+        const float tdz = bandit->position.z - target.z;
+        if (tdx * tdx + tdz * tdz < 1.0f) continue;
         if (bandit->BlocksProjectile(origin, target, rayRadius)) return false;
     }
     return true;
@@ -1723,6 +1814,7 @@ static void GrabOrThrowBandit() {
     float bestScore = FLT_MAX;
     for (const auto& bandit : g_bandits) {
         if (!bandit || bandit->Dead()) continue;
+        if (bandit->faction != Faction::Bandit) continue; // never grab a marine as a shield
         const XMFLOAT3 chest = {
             bandit->position.x,
             bandit->position.y + bandit->footOffset + 1.1f,
@@ -2228,9 +2320,22 @@ void BanditDebugText() {
             if (p.material && p.material->baseColorTexture) ++textured;
         }
     }
-    ImGui::Text("Bandits: live=%zu total=%zu bones=%zu parts=%d tex=%d",
-                LiveBanditCount(), g_bandits.size(),
+    ImGui::Text("Bandits: live=%zu marines=%zu total=%zu bones=%zu parts=%d tex=%d",
+                LiveBanditCount(), LiveMarineCount(), g_bandits.size(),
                 g_banditModel.skeleton.BoneCount(), parts, textured);
+    // TEMP DEBUG: per-marine firing gate state.
+    for (const auto& actor : g_bandits) {
+        if (!actor || actor->faction != Faction::Marine || actor->Dead()) continue;
+        const char* state =
+            actor->Awareness() == SkinnedEnemy::AwarenessState::Combat ? "COMBAT"
+            : actor->Awareness() == SkinnedEnemy::AwarenessState::Alert ? "Alert"
+            : "Patrol";
+        ImGui::Text("  marine %s cd=%.2f prep=%d aim=%.2f cover=%d/%d pose=%d burst=%d",
+                    state, actor->fireCooldown, (int)actor->DebugPreparingShot(),
+                    actor->DebugStationaryAimTime(), (int)actor->DebugHasCoverTarget(),
+                    (int)actor->DebugInCover(), (int)actor->DebugHasGunPose(),
+                    actor->DebugBurstShots());
+    }
     ImGui::Text("Weapon: %s  (mouse wheel)", GunModel::SelectedWeaponName());
     if (GunModel::C4Selected())
         ImGui::Text("C4: LMB throw | RMB detonate | armed=%zu",
@@ -8162,6 +8267,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (!g_emptyLevelMode) {
                 for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
                     if (!SpawnBandit()) break;
+                // The reset cleared g_bandits, which holds both factions, so
+                // the allies have to be rebuilt here too -- the load-stage
+                // spawn only runs on a cold load, not on a restart.
+                SpawnMarinesFromLevel();
                 g_game.commands.Set(GameCommand::RespawnTurretGunner,
                     !g_customLevelMode ||
                     FirstRuntimeEntity(LevelEntityType::Humvee) != nullptr);
@@ -8371,6 +8480,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             static std::unordered_map<SkinnedEnemy*, float> banditUpdateDebt;
             bool burnedBanditDied = false;
             bool coverQuerySpent = false;
+            // Gathered once per frame so each actor's target can be resolved
+            // without rescanning g_bandits per actor: bandits aim at the
+            // nearest of {player, live marine}, marines aim at the nearest
+            // live bandit.
+            std::vector<XMFLOAT3> liveMarinePositions;
+            std::vector<XMFLOAT3> liveBanditPositions;
+            for (const auto& b : g_bandits) {
+                if (!b || b->Dead()) continue;
+                // Torso, not feet. position.y is the ground the actor stands
+                // on, and the LOS raycast starts at the shooter's chest -- a
+                // ray from chest height down to ground level dives into the
+                // terrain over any real distance, so every actor-vs-actor
+                // sight test failed and the aim-up could never complete. The
+                // player never hit this because camera.Position is eye height.
+                const XMFLOAT3 torso{
+                    b->position.x, b->position.y + b->footOffset + 1.35f,
+                    b->position.z };
+                if (b->faction == Faction::Marine) liveMarinePositions.push_back(torso);
+                else liveBanditPositions.push_back(torso);
+            }
             for (auto& bandit : g_bandits) {
                 if (!bandit) continue;
                 if (bandit->UpdateBurning(
@@ -8400,6 +8529,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 bandit->leftArmReach = g_banditLeftArmReach;
                 bandit->headTorsoYawOffsetDegrees =
                     g_banditHeadYawOffsetDegrees;
+                // Marines loiter near the player instead of near their own
+                // spawn point, so they end up close enough to notice a bandit
+                // and tag along as the player moves through the level. The
+                // leash drops the moment one engages: following forces yaw
+                // toward the player, which both aims the marine at the wrong
+                // thing and keeps its vision cone off the bandit, so a leashed
+                // marine could never hold an aim long enough to fire.
+                if (bandit->faction == Faction::Marine) {
+                    if (bandit->Awareness() ==
+                        SkinnedEnemy::AwarenessState::Combat)
+                        bandit->leashPosition.reset();
+                    else
+                        bandit->leashPosition = scene.camera.Position;
+                }
+                const XMFLOAT3 target = NearestHostileTarget(
+                    *bandit, scene.camera.Position, liveMarinePositions, liveBanditPositions);
                 const float cameraDx = bandit->position.x - scene.camera.Position.x;
                 const float cameraDz = bandit->position.z - scene.camera.Position.z;
                 const float cameraDistanceSq = cameraDx * cameraDx + cameraDz * cameraDz;
@@ -8413,13 +8558,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 const float banditDeltaTime = updateBandit ? updateDebt : 0.0f;
                 if (updateBandit) updateDebt = 0.0f;
                 if (updateBandit && !coverQuerySpent &&
-                    bandit->NeedsCoverQuery(scene.camera.Position)) {
+                    bandit->NeedsCoverQuery(target)) {
                     XMFLOAT3 coverPosition;
                     if (QueryBanditCover(
-                            *bandit, scene.camera.Position, coverPosition)) {
-                        const float holdTime = 3.25f +
-                            (100.0f - (std::max)(0.0f, bandit->health)) * 0.035f +
-                            RandomUnit() * 1.5f;
+                            *bandit, target, coverPosition)) {
+                        // Bandits hold longer the more hurt they are. That term
+                        // is tuned around 100 max health and goes negative for a
+                        // marine's 400, collapsing the hold onto SetCoverTarget's
+                        // 2.5s floor -- barely longer than the aim-up plus one
+                        // burst, so an ally would pop out mid-firefight. Give
+                        // marines a flat hold long enough to actually shoot from.
+                        const float holdTime =
+                            bandit->faction == Faction::Marine
+                            ? 7.0f + RandomUnit() * 3.0f
+                            : 3.25f +
+                              (100.0f - (std::max)(0.0f, bandit->health)) * 0.035f +
+                              RandomUnit() * 1.5f;
                         bandit->SetCoverTarget(coverPosition, holdTime);
                     } else {
                         bandit->MarkCoverQueryFailed(0.8f + RandomUnit() * 0.7f);
@@ -8438,7 +8592,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     bandit->UpdateMounted(
                         banditDeltaTime, mount,
                         (g_drivingHumvee && bandit->mountedVehicleIndex == 0)
-                            ? g_humveeAimPoint : scene.camera.Position);
+                            ? g_humveeAimPoint : target);
                 } else if (updateBandit) {
                     float groundY = 0.0f;
                     if (scene.useMeshTerrain && g_terrain.supported) {
@@ -8455,7 +8609,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                 boatPose, 0.20f, 0.48f))
                             groundY = (std::max)(groundY, BoatDeckY(boatPose));
                     }
-                    bandit->Update(banditDeltaTime, scene.camera.Position, groundY);
+                    bandit->Update(banditDeltaTime, target, groundY);
                     ResolveBanditHumveeCollision(*bandit);
                 }
                 XMFLOAT3 shotOrigin, shotDirection;
@@ -8463,19 +8617,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // is actually ready, not every frame of the two-second aim pause.
                 const bool hasLineOfSight =
                     !bandit->NeedsLineOfSightCheck() ||
-                    BanditHasLineOfSight(*bandit, scene.camera.Position);
+                    BanditHasLineOfSight(*bandit, target);
 
                 // Grenade throw: mid-range only, on its own cooldown, and gated
                 // on the same line of sight the rifle uses so bandits do not lob
                 // through a wall. Mounted gunners keep to the turret. Patrol/
-                // Alert bandits have no confirmed target to throw at.
+                // Alert bandits have no confirmed target to throw at. Marines
+                // don't grenade in v1 -- keep this gated to bandits only.
                 if (!bandit->Dead() && !bandit->turretGunner &&
+                    bandit->faction == Faction::Bandit &&
                     bandit->Awareness() == SkinnedEnemy::AwarenessState::Combat &&
                     !scene.player.godMode && scene.player.health > 0.0f) {
                     bandit->grenadeCooldown -= deltaTime;
                     if (bandit->grenadeCooldown <= 0.0f) {
-                        const float gx = bandit->position.x - scene.camera.Position.x;
-                        const float gz = bandit->position.z - scene.camera.Position.z;
+                        const float gx = bandit->position.x - target.x;
+                        const float gz = bandit->position.z - target.z;
                         const float range = std::sqrt(gx * gx + gz * gz);
                         const bool inBand = range >= kBanditGrenadeMinRange &&
                                             range <= kBanditGrenadeMaxRange;
@@ -8493,7 +8649,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 const bool fired = !(g_drivingHumvee && bandit->turretGunner &&
                                      bandit->mountedVehicleIndex == 0) &&
                     bandit->TryFireAt(
-                        deltaTime, scene.camera.Position, hasLineOfSight,
+                        deltaTime, target, hasLineOfSight,
                         shotOrigin, shotDirection);
                 if (bandit->ConsumeSpottedEvent() && g_banditVoiceCooldown <= 0.0f) {
                     const float volume = BanditVoiceVolume(bandit->position);
@@ -8537,9 +8693,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         // standing there.
                         scene.SpawnHostileProjectile(
                             shotOrigin, shotDirection, 18.0f, 2.2f);
-                    } else {
+                    } else if (bandit->faction == Faction::Bandit) {
                         scene.SpawnHostileProjectile(shotOrigin, shotDirection);
+                    } else {
+                        // Marine rifle shot: behaves like a player shot for
+                        // hit-testing -- damages bandits only, never the player.
+                        scene.SpawnPlayerProjectile(shotOrigin, shotDirection);
                     }
+                    // Any actor's gunfire is audible to the AI, not just the
+                    // player's. Without this a marine could only ever notice a
+                    // bandit inside its 160-degree vision cone -- and a
+                    // following marine faces the player, so bandits shooting
+                    // from its flank went unheard. Marines now turn and engage
+                    // when a firefight starts nearby.
+                    g_enemyNoiseEvents.push_back(
+                        { shotOrigin, SkinnedEnemy::AlertBroadcastRadius() });
                     const float dx = shotOrigin.x - scene.camera.Position.x;
                     const float dy = shotOrigin.y - scene.camera.Position.y;
                     const float dz = shotOrigin.z - scene.camera.Position.z;
@@ -9096,8 +9264,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // enemy currently used as a human shield, never squadmates.
                 if (g_banditLoaded && (!projectile.hostile || g_heldBandit)) {
                     for (auto& bandit : g_bandits) {
-                        if (projectile.hostile && bandit.get() != g_heldBandit) continue;
                         if (!bandit) continue;
+                        if (projectile.hostile) {
+                            // Bandit-fired shot: only ever damages the held human shield.
+                            if (bandit.get() != g_heldBandit) continue;
+                        } else if (bandit->faction != Faction::Bandit) {
+                            // Player- or marine-fired shot: never hits a marine
+                            // (no friendly fire), only ever damages bandits.
+                            continue;
+                        }
                         XMFLOAT3 banditHit = projectile.position;
                         std::string banditBone;
                         const bool hitBandit = projectile.harpoon
@@ -9975,6 +10150,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     std::cerr << "Bandit squad failed to load\n";
                 }
 
+                // Same mesh/clip pipeline, recolored textures: the player's two
+                // marine allies.
+                const std::string marineDir = "Content/Models/MarineAlly/";
+                const std::string marineAnimDir = marineDir + "Animations/Demo/";
+                std::vector<std::string> marineClips = {
+                    marineAnimDir + "ThirdPersonIdle.FBX",
+                    marineAnimDir + "ThirdPersonWalk.FBX",
+                    marineAnimDir + "ThirdPersonRun.FBX",
+                };
+                SkinnedModel mm = SkinnedFBXImporter::Load(
+                    marineDir + "SK_Bandit.FBX", marineClips, g_dx12.device, g_dx12.commandList);
+                mm.ragdoll = T3DPhysicsAsset::Load(marineDir + "Phy_Bandit_PhysicsAsset.T3D");
+                if (mm.valid) {
+                    g_marineModel = std::move(mm);
+                } else {
+                    std::cerr << "Marine allies failed to load\n";
+                }
             }
             AdvanceLevelLoading(LevelLoadStage::BanditSpawn,
                 "Spawn squad and turret gunners",
@@ -9991,6 +10183,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_banditLoaded = true;
                 std::cout << "Bandit squad ready: " << LiveBanditCount()
                           << " live enemies\n";
+            }
+            if (g_marineModel.valid) {
+                SpawnMarinesFromLevel();
+                std::cout << "Marine allies ready: " << LiveMarineCount()
+                          << " live marines\n";
             }
             AdvanceLevelLoading(LevelLoadStage::GPUFinalize,
                 "Drain graphics uploads and generate texture mips",
