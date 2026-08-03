@@ -258,6 +258,14 @@ bool                        g_banditLoaded = false;
 SkinnedModel                g_marineModel;
 float                       g_banditLeftArmReach = 0.55f;
 float                       g_banditHeadYawOffsetDegrees = 20.4f;
+// Rifle grip tuning, pushed to every bandit each frame so the sliders in
+// BanditDebugText retune the hold live. Defaults mirror SkinnedEnemy's.
+float                       g_banditGunScale = 0.6f;
+float                       g_banditGunGripForward = 0.16f;
+float                       g_banditGunGripRise = -0.04f;
+float                       g_banditGunRearGripForward = 0.16f;
+float                       g_banditGunRearGripInboard = -0.06f;
+float                       g_banditGunRearGripDrop = -0.18f;
 bool                        g_showEnemyVisionCones = false;
 static uint32_t&            g_banditSpawnSerial = g_enemySystem.spawnSerial;
 GunAudio                    g_gunAudio;
@@ -2345,6 +2353,32 @@ void BanditDebugText() {
     ImGui::SliderFloat("Head/torso yaw offset",
                        &g_banditHeadYawOffsetDegrees,
                        -90.0f, 90.0f, "%.1f deg");
+
+    if (ImGui::CollapsingHeader("Rifle grip")) {
+        ImGui::TextDisabled("Hand placement (drives the whole hold)");
+        ImGui::SliderFloat("Rear grip forward", &g_banditGunRearGripForward,
+                           -0.20f, 0.50f, "%.3f m");
+        ImGui::SliderFloat("Rear grip inboard", &g_banditGunRearGripInboard,
+                           -0.30f, 0.30f, "%.3f m");
+        ImGui::SliderFloat("Rear grip drop", &g_banditGunRearGripDrop,
+                           -0.50f, 0.20f, "%.3f m");
+        ImGui::TextDisabled("Mesh seating in the hands");
+        ImGui::SliderFloat("Gun along barrel", &g_banditGunGripForward,
+                           -0.40f, 0.60f, "%.3f m");
+        ImGui::SliderFloat("Gun rise", &g_banditGunGripRise,
+                           -0.30f, 0.30f, "%.3f m");
+        ImGui::SliderFloat("Gun scale", &g_banditGunScale,
+                           0.20f, 1.50f, "%.2f x");
+        if (ImGui::Button("Reset rifle grip")) {
+            g_banditLeftArmReach = 0.55f;
+            g_banditGunScale = 0.6f;
+            g_banditGunGripForward = 0.16f;
+            g_banditGunGripRise = -0.04f;
+            g_banditGunRearGripForward = 0.16f;
+            g_banditGunRearGripInboard = -0.06f;
+            g_banditGunRearGripDrop = -0.18f;
+        }
+    }
     ImGui::Checkbox("Show enemy vision cones", &g_showEnemyVisionCones);
     if (ImGui::CollapsingHeader("Enemy Audio", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::SliderFloat("Flesh hit pitch min", &g_fleshHitPitchMin,
@@ -8515,6 +8549,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         scene.SpawnCarriedFire(bandit->position);
                 }
                 if (bandit->Dead()) continue;
+                // Pushed before the held/turret early-outs below so every live
+                // actor picks up live slider edits, not just the ones that
+                // reach the general movement path.
+                bandit->leftArmReach = g_banditLeftArmReach;
+                bandit->headTorsoYawOffsetDegrees = g_banditHeadYawOffsetDegrees;
+                bandit->gunScale = g_banditGunScale;
+                bandit->gunGripForward = g_banditGunGripForward;
+                bandit->gunGripRise = g_banditGunGripRise;
+                bandit->gunRearGripForward = g_banditGunRearGripForward;
+                bandit->gunRearGripInboard = g_banditGunRearGripInboard;
+                bandit->gunRearGripDrop = g_banditGunRearGripDrop;
                 if (bandit.get() == g_heldBandit) {
                     const XMFLOAT3& eye = scene.camera.Position;
                     const XMFLOAT3& front = scene.camera.Front;
@@ -8526,9 +8571,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     bandit->HoldAt(deltaTime, holdPosition, facingYaw);
                     continue;
                 }
-                bandit->leftArmReach = g_banditLeftArmReach;
-                bandit->headTorsoYawOffsetDegrees =
-                    g_banditHeadYawOffsetDegrees;
                 // Marines loiter near the player instead of near their own
                 // spawn point, so they end up close enough to notice a bandit
                 // and tag along as the player moves through the level. The
