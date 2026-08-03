@@ -899,11 +899,12 @@ public:
         return true;
     }
 
-    // Weapon frame is built from the posed hand bones themselves (see
+    // Weapon frame is seated on the posed trigger hand (see
     // UpdateGunFromHands, run at the end of every ApplyGunIK path), so the gun
-    // is rigidly defined by wherever the arms actually ended up: it inherits
-    // arm swing, spine twist and locomotion bob for free and can never drift
-    // away from the grip the way an independently recomputed transform did.
+    // travels with the arms -- inheriting arm swing, spine twist and
+    // locomotion bob -- instead of floating at an independently computed spot.
+    // Its orientation stays on the aimed body angles the mesh was authored
+    // against, which is what keeps the weapon reading upright and untilted.
     DirectX::XMMATRIX GunWorldMatrix() const {
         using namespace DirectX;
         if (!HasGunPose()) return XMMatrixIdentity();
@@ -1691,58 +1692,47 @@ private:
         RotateBranch(lower, elbow, RotationFromTo(handPos - elbow, target - elbow));
     }
 
-    // Build the gun frame from the hands the IK just posed. The rear (trigger)
-    // hand supplies the origin and the foregrip hand supplies the barrel
-    // direction, so the mesh spans the actual grip instead of being recomputed
-    // from body yaw/pitch -- that recomputation was what let the gun drift off
-    // the hands and stay rigid while the arms moved.
+    // Position the gun on the trigger hand the IK just posed, keeping the
+    // mesh's original orientation convention.
+    //
+    // Split responsibility on purpose: the origin tracks the hand, so the
+    // weapon travels with the arms, while the orientation stays on the aimed
+    // body angles the mesh was authored against. Taking orientation from the
+    // hand-to-hand vector instead re-rolled the mesh and let small IK
+    // differences between the two wrists tilt the weapon off true.
     //
     // Bone routing follows ApplyGunIK: after this asset's axis conversion the
-    // UE labels read mirrored, so hand_l holds the rear grip and hand_r
-    // (handBone_) holds the foregrip.
-    void UpdateGunFromHands(int rearHand, int foreHand) {
+    // UE labels read mirrored, so hand_l is the rear (trigger) hand.
+    void UpdateGunFromHands(int rearHand) {
         using namespace DirectX;
-        if (rearHand < 0 || foreHand < 0) return;
-        if (static_cast<size_t>(rearHand) >= poseGlobals_.size() ||
-            static_cast<size_t>(foreHand) >= poseGlobals_.size()) return;
+        if (rearHand < 0) return;
+        if (static_cast<size_t>(rearHand) >= poseGlobals_.size()) return;
 
         const XMMATRIX world = MeshWorldMatrix();
         const XMVECTOR rear = XMVector3TransformCoord(
             XMLoadFloat4x4(&poseGlobals_[rearHand]).r[3], world);
-        const XMVECTOR fore = XMVector3TransformCoord(
-            XMLoadFloat4x4(&poseGlobals_[foreHand]).r[3], world);
 
-        // Barrel runs rear grip -> foregrip. If the hands land on top of each
-        // other the direction is meaningless; fall back to the aim vector the
-        // IK targeted so the gun still points somewhere sensible.
-        XMVECTOR forward = fore - rear;
-        if (XMVectorGetX(XMVector3LengthSq(forward)) < 1e-6f) {
-            const float cp = std::cos(gunPitch_), sp = std::sin(gunPitch_);
-            forward = XMVectorSet(std::sin(gunYaw_) * cp, sp,
-                                  std::cos(gunYaw_) * cp, 0.0f);
-        }
-        forward = XMVector3Normalize(forward);
-
-        // Roll the gun upright around its own barrel: world up, minus whatever
-        // component runs along the barrel, keeps the sights on top at any pitch.
-        XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-        up = up - forward * XMVector3Dot(up, forward);
-        if (XMVectorGetX(XMVector3LengthSq(up)) < 1e-6f)
-            up = XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
-        up = XMVector3Normalize(up);
-        const XMVECTOR right = XMVector3Normalize(XMVector3Cross(up, forward));
+        // Orientation uses the original RotationX(-pitch) * RotationY(yaw)
+        // convention off the aimed body angles, not a basis built from the
+        // hand-to-hand vector. Deriving it from the hands re-rolled the mesh
+        // and let small IK differences between the wrists tilt the weapon;
+        // the body angles are what the mesh was authored against, so the gun
+        // reads the way it originally did. Only the origin comes from the
+        // hands, which is what keeps it travelling with the arms.
+        const float cp = std::cos(gunPitch_), sp = std::sin(gunPitch_);
+        const float sy = std::sin(gunYaw_), cy = std::cos(gunYaw_);
+        const XMVECTOR forward = XMVectorSet(sy * cp, sp, cy * cp, 0.0f);
+        const XMVECTOR up = XMVectorSet(-sy * sp, cp, -cy * sp, 0.0f);
 
         // Seat the receiver slightly forward of and below the trigger hand so
         // the grip sits inside the fist rather than at its pivot.
         const XMVECTOR origin = rear + forward * gunGripForward + up * gunGripRise;
 
-        XMMATRIX frame = XMMatrixIdentity();
-        frame.r[0] = right;
-        frame.r[1] = up;
-        frame.r[2] = forward;
-        frame.r[3] = XMVectorSetW(origin, 1.0f);
         XMStoreFloat4x4(&gunWorld_,
-                        XMMatrixScaling(gunScale, gunScale, gunScale) * frame);
+                        XMMatrixScaling(gunScale, gunScale, gunScale) *
+                        XMMatrixRotationX(-gunPitch_) *
+                        XMMatrixRotationY(gunYaw_) *
+                        XMMatrixTranslationFromVector(origin));
     }
 
     // Where the two hands should sit to hold a rifle aimed along yaw/pitch.
@@ -1832,7 +1822,7 @@ private:
                        XMVector3TransformCoord(foreGripWorld, inverseWorld));
             SolveArmIK(upperL, lowerL, handL,
                        XMVector3TransformCoord(rightGripWorld, inverseWorld));
-            UpdateGunFromHands(handL, handBone_);
+            UpdateGunFromHands(handL);
 
             for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
                 const XMMATRIX skin = XMLoadFloat4x4(&model.skeleton.offset[bone]) *
@@ -1882,7 +1872,7 @@ private:
                    XMVector3TransformCoord(foreGripWorld, inverseWorld));
         SolveArmIK(upperL, lowerL, handL,
                    XMVector3TransformCoord(rightGripWorld, inverseWorld));
-        UpdateGunFromHands(handL, handBone_);
+        UpdateGunFromHands(handL);
 
         for (size_t bone = 0; bone < poseGlobals_.size(); ++bone) {
             const XMMATRIX skin = XMLoadFloat4x4(&model.skeleton.offset[bone]) *
