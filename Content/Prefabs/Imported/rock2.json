@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 2,
+  "id": "imported/rock2",
+  "name": "rock2",
+  "components": {
+    "staticMesh": {
+      "path": "Content/Models/Imported/rock2/rock2.glb",
+      "assetGuid": "ad3cf9e3f71155e2f76148010f58a305",
+      "defaultScale": [1.0, 1.0, 1.0],
+      "targetSize": 2.0,
+      "castShadow": true,
+      "useMaterials": true,
+      "materialAmbientScale": 1.0,
+      "materialViewFillStrength": 0.0
+    },
+    "collision": {
+      "shape": "box"
+    }
+  }
+}
