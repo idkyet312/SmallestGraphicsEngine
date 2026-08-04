@@ -294,8 +294,17 @@ GunAudio                    g_banditSpottedAudio2;
 GunAudio                    g_banditAttackAudio;
 GunAudio                    g_banditDeathAudio;
 GunAudio                    g_banditHitVoiceAudio;
+// Marines share the bark logic but not the voice: a different speaker from
+// the same CC0 pack, so allies and bandits are tellable apart by ear alone.
+GunAudio                    g_marineSpottedAudio1;
+GunAudio                    g_marineSpottedAudio2;
+GunAudio                    g_marineAttackAudio1;
+GunAudio                    g_marineAttackAudio2;
 GunAudio                    g_helicopterHoverAudio;
 static float&               g_banditVoiceCooldown = g_enemySystem.voiceCooldown;
+// Allies bark on their own cooldown so a chatty firefight on one side
+// can't mute the other.
+float                       g_marineVoiceCooldown = 0.0f;
 static float&               g_banditPainCooldown = g_enemySystem.painCooldown;
 static float&               g_fleshHitPitchMin = g_game.combat.fleshHitPitchMin;
 static float&               g_fleshHitPitchMax = g_game.combat.fleshHitPitchMax;
@@ -1289,7 +1298,11 @@ static float BanditVoiceVolume(const XMFLOAT3& position, float peak = 0.78f) {
 static void PlayBanditDeathEvents() {
     for (auto& bandit : g_bandits) {
         if (!bandit || !bandit->ConsumeDeathEvent()) continue;
-        const float pitch = 0.94f + ((float)std::rand() / RAND_MAX) * 0.10f;
+        float pitch = 0.94f + ((float)std::rand() / RAND_MAX) * 0.10f;
+        // Death cries are wordless, so there is no separate ally recording to
+        // switch to. Drop the marines' a few semitones instead -- enough to
+        // read as a different man going down, without needing a new asset.
+        if (bandit->faction == Faction::Marine) pitch *= 0.86f;
         g_banditDeathAudio.Play(BanditVoiceVolume(bandit->position, 0.9f), pitch);
     }
 }
@@ -7853,6 +7866,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_banditAttackAudio.Initialize("Content/Audio/bandit_attack.wav");
     g_banditDeathAudio.Initialize("Content/Audio/bandit_death.wav");
     g_banditHitVoiceAudio.Initialize("Content/Audio/bandit_hit_voice.wav");
+    g_marineSpottedAudio1.Initialize("Content/Audio/marine_spotted_01.wav");
+    g_marineSpottedAudio2.Initialize("Content/Audio/marine_spotted_02.wav");
+    g_marineAttackAudio1.Initialize("Content/Audio/marine_attack_01.wav");
+    g_marineAttackAudio2.Initialize("Content/Audio/marine_attack_02.wav");
     g_helicopterHoverAudio.Initialize("Content/Audio/helicopter_hover_loop.mp3");
 
     // ImGui
@@ -8482,7 +8499,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_banditAttackAudio.Update();
         g_banditDeathAudio.Update();
         g_banditHitVoiceAudio.Update();
+        g_marineSpottedAudio1.Update();
+        g_marineSpottedAudio2.Update();
+        g_marineAttackAudio1.Update();
+        g_marineAttackAudio2.Update();
         g_enemySystem.TickCooldowns(deltaTime);
+        g_marineVoiceCooldown = (std::max)(
+            0.0f, g_marineVoiceCooldown - deltaTime);
 
         if (scene.rebuildDestructionRequested && wallModel) {
             scene.rebuildDestructionRequested = false;
@@ -8706,17 +8729,35 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     bandit->TryFireAt(
                         deltaTime, target, hasLineOfSight,
                         shotOrigin, shotDirection);
-                if (bandit->ConsumeSpottedEvent() && g_banditVoiceCooldown <= 0.0f) {
+                // Barks are routed by faction: allies previously shouted the
+                // bandit lines, so a marine spotting a target sounded exactly
+                // like an enemy spotting the player -- actively misleading.
+                const bool isMarine = bandit->faction == Faction::Marine;
+                float& voiceCooldown =
+                    isMarine ? g_marineVoiceCooldown : g_banditVoiceCooldown;
+                if (bandit->ConsumeSpottedEvent() && voiceCooldown <= 0.0f) {
                     const float volume = BanditVoiceVolume(bandit->position);
                     const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
-                    if (std::rand() & 1) g_banditSpottedAudio1.Play(volume, pitch);
-                    else g_banditSpottedAudio2.Play(volume, pitch);
-                    g_banditVoiceCooldown = 3.5f;
+                    if (isMarine) {
+                        if (std::rand() & 1) g_marineSpottedAudio1.Play(volume, pitch);
+                        else g_marineSpottedAudio2.Play(volume, pitch);
+                    } else if (std::rand() & 1) {
+                        g_banditSpottedAudio1.Play(volume, pitch);
+                    } else {
+                        g_banditSpottedAudio2.Play(volume, pitch);
+                    }
+                    voiceCooldown = 3.5f;
                 }
-                if (bandit->ConsumeAttackEvent() && g_banditVoiceCooldown <= 0.0f) {
+                if (bandit->ConsumeAttackEvent() && voiceCooldown <= 0.0f) {
+                    const float volume = BanditVoiceVolume(bandit->position);
                     const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
-                    g_banditAttackAudio.Play(BanditVoiceVolume(bandit->position), pitch);
-                    g_banditVoiceCooldown = 4.5f;
+                    if (isMarine) {
+                        if (std::rand() & 1) g_marineAttackAudio1.Play(volume, pitch);
+                        else g_marineAttackAudio2.Play(volume, pitch);
+                    } else {
+                        g_banditAttackAudio.Play(volume, pitch);
+                    }
+                    voiceCooldown = 4.5f;
                 }
                 if (fired) {
                     if (bandit->IsShotgunner()) {
@@ -8862,8 +8903,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             0.9f + ((float)std::rand() / RAND_MAX) * 0.2f;
                         g_hitAudio.Play(0.72f * 0.3f, pitch);
                         if (!bandit->Dead() && g_banditPainCooldown <= 0.0f) {
+                            const float painPitch =
+                                bandit->faction == Faction::Marine
+                                    ? pitch * 0.86f : pitch;
                             g_banditHitVoiceAudio.Play(
-                                BanditVoiceVolume(impact, 0.72f), pitch);
+                                BanditVoiceVolume(impact, 0.72f), painPitch);
                             g_banditPainCooldown = 0.45f;
                         }
                         break; // one moving chunk damages one character per frame
@@ -9385,8 +9429,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     g_hitAudio.Play(0.72f * 0.3f, hitPitch);
                     if (!banditHits.front().killed &&
                         g_banditPainCooldown <= 0.0f) {
-                        const float painPitch =
+                        float painPitch =
                             0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
+                        const SkinnedEnemy* hurt = banditHits.front().enemy;
+                        if (hurt && hurt->faction == Faction::Marine)
+                            painPitch *= 0.86f;
                         g_banditHitVoiceAudio.Play(
                             BanditVoiceVolume(
                                 banditHits.front().position, 0.82f), painPitch);
@@ -10889,6 +10936,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ImGui::DestroyContext();
     g_destruction.Shutdown();
     g_banditHitVoiceAudio.Shutdown();
+    g_marineSpottedAudio1.Shutdown();
+    g_marineSpottedAudio2.Shutdown();
+    g_marineAttackAudio1.Shutdown();
+    g_marineAttackAudio2.Shutdown();
     g_banditDeathAudio.Shutdown();
     g_banditAttackAudio.Shutdown();
     g_banditSpottedAudio2.Shutdown();

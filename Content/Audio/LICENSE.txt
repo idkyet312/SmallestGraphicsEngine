@@ -50,6 +50,21 @@ License URL: https://creativecommons.org/publicdomain/zero/1.0/
 Downloaded July 17, 2026. Attribution is not legally required. Source and
 creator retained here for provenance.
 
+marine_spotted_01.wav, marine_spotted_02.wav, marine_attack_01.wav,
+marine_attack_02.wav
+
+Title: Steampunk Fantasy Voices (Archer and Crossbowman voice files)
+Creator: xathien
+Source: https://opengameart.org/content/steampunk-fantasy-voices
+License: CC0 1.0 Universal
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Downloaded August 4, 2026. Attribution is not legally required. Source and
+creator retained here for provenance. Same pack as the bandit voices above,
+but different speakers, so allies and enemies are distinguishable by ear.
+Source files: Archer_See_001.wav, Crossbowman_See_001_0.wav,
+Archer_Attack_001.wav, Archer_Attack_002.wav.
+
 flesh_hit.ogg
 
 Title: Impact (qubodupImpactMeat01.ogg)
