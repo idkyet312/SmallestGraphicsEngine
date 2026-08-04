@@ -149,6 +149,12 @@ struct PrefabAudioPlayer {
 };
 static std::vector<PrefabAudioPlayer> g_prefabAudioPlayers;
 static PrefabRegistry       g_prefabRegistry;
+// Canonical asset roots, matching what AssetRegistry scans. PrefabRegistry's
+// own defaults ("prefabs"/"models") describe a layout this project does not
+// use, so refreshing without these scans two empty directories and every
+// prefab lookup misses.
+static const std::filesystem::path kPrefabRoot = "Content/Prefabs";
+static const std::filesystem::path kModelRoot = "Content/Models";
 static AssetRegistry        g_assetRegistry;
 static AssetWatcher         g_assetWatcher;
 struct PrefabModelCacheEntry {
@@ -3910,7 +3916,7 @@ static std::shared_ptr<SceneNode> CreateDDGICornellBoxModel() {
 static void RebuildPrefabRenderBatches() {
     g_game.world.Prefabs().ClearDerived();
     g_assetRegistry.Refresh();
-    g_prefabRegistry.Refresh();
+    g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
     g_prefabAudioPlayers.clear();
     std::unordered_map<std::string, size_t> batches;
     const auto addInstance = [&](const auto& self, const std::string& prefabId,
@@ -6493,7 +6499,7 @@ static void SynchronizeEditorRuntime(bool play) {
     g_grass.ClearRuntimeExclusions();
     g_customLevelMode = true;
     g_assetRegistry.Refresh();
-    g_prefabRegistry.Refresh();
+    g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
     ApplyRuntimeLevelBasics(play);
     g_prefabRebuildRequested = true;
     if (!play && terrainChanged && !foliageChanged) {
@@ -8274,7 +8280,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (IsEditorEditing() && !g_levelEditor.ImportInProgress() &&
             g_assetWatcher.ConsumeChange()) {
             const bool assetsChanged = g_assetRegistry.Refresh();
-            if (assetsChanged || g_prefabRegistry.Refresh()) {
+            if (assetsChanged ||
+                g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot)) {
                 g_levelEditor.RefreshAssets();
                 RetiredPrefabResources retired;
                 retired.renderBatches =

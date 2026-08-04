@@ -21,6 +21,13 @@ using namespace DirectX;
 
 namespace {
 
+// Canonical asset roots, matching what AssetRegistry scans. PrefabRegistry's
+// own defaults ("prefabs"/"models") describe a layout this project does not
+// use -- refreshing without these scanned two empty directories, so the
+// content browser's Prefabs tab came up empty and no prefab could be placed.
+const std::filesystem::path kPrefabRoot = "Content/Prefabs";
+const std::filesystem::path kModelRoot = "Content/Models";
+
 XMMATRIX EntityMatrix(const LevelEntity& entity) {
     const auto& t = entity.transform;
     return XMMatrixScaling(t.scale[0], t.scale[1], t.scale[2]) *
@@ -181,13 +188,13 @@ void LevelEditor::NewFromLevelOne() {
     dxrDDGILayoutDirty_ = true; playing_ = false;
     status_ = "New level created from Level 1";
     RefreshLevelFiles();
-    prefabRegistry_.Refresh();
+    prefabRegistry_.Refresh(kPrefabRoot, kModelRoot);
     assetRegistry_.Refresh();
 }
 
 void LevelEditor::RefreshAssets() {
     assetRegistry_.Refresh();
-    prefabRegistry_.Refresh();
+    prefabRegistry_.Refresh(kPrefabRoot, kModelRoot);
 }
 
 LevelEntity* LevelEditor::Selected() {
@@ -482,7 +489,7 @@ bool LevelEditor::BrowseImportModel() {
         output.result = PrefabRegistry::ImportModel(source, output.savedPrefab);
         if (output.result.ok) {
             output.assetRegistry.Refresh(true);
-            output.prefabRegistry.Refresh();
+            output.prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
         }
         return output;
     });
@@ -1098,7 +1105,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         ImGui::EndDisabled();
         ImGui::SameLine();
         if (ImGui::Button("Refresh")) {
-            prefabRegistry_.Refresh();
+            prefabRegistry_.Refresh(kPrefabRoot, kModelRoot);
             assetRegistry_.Refresh(true);
             selectedPrefab_ = -1;
         }
@@ -1385,7 +1392,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                     FinishAssetChange(std::move(assetChange));
                     status_ = "Saved prefab " + destination.string();
                     const std::string savedId = prefabDraft_.id;
-                    prefabRegistry_.Refresh();
+                    prefabRegistry_.Refresh(kPrefabRoot, kModelRoot);
                     selectedPrefab_ = -1;
                     const auto& refreshed = prefabRegistry_.Assets();
                     for (size_t i = 0; i < refreshed.size(); ++i)
