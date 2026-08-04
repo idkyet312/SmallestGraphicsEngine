@@ -1233,12 +1233,12 @@ static constexpr float kBanditGrenadeCooldownMax = 16.0f;
 // Chance to actually throw once in range and off cooldown. Keeps grenades feeling
 // like an occasional decision rather than a metronome.
 static constexpr float kBanditGrenadeChance = 0.35f;
-// Marines throw semi-rarely: roughly a third as often as bandits once the
-// longer cooldown and lower roll are combined. Frequent enough to read as a
-// real squad capability, rare enough that it stays a moment rather than a
-// steady stream of explosions from the friendly side.
-static constexpr float kMarineGrenadeCooldownMin = 18.0f;
-static constexpr float kMarineGrenadeCooldownMax = 30.0f;
+// Marines throw semi-rarely: still less often than bandits once the lower
+// roll is combined with the cooldown. Frequent enough to read as a real
+// squad capability, rare enough that it stays a moment rather than a steady
+// stream of explosions from the friendly side.
+static constexpr float kMarineGrenadeCooldownMin = 9.0f;
+static constexpr float kMarineGrenadeCooldownMax = 15.0f;
 static constexpr float kMarineGrenadeChance = 0.25f;
 // Nobody on the player's side should be inside a friendly blast. Checked
 // against the impact point before an ally commits to the throw; the grenade
