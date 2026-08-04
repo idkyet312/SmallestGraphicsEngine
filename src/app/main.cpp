@@ -1233,6 +1233,17 @@ static constexpr float kBanditGrenadeCooldownMax = 16.0f;
 // Chance to actually throw once in range and off cooldown. Keeps grenades feeling
 // like an occasional decision rather than a metronome.
 static constexpr float kBanditGrenadeChance = 0.35f;
+// Marines throw semi-rarely: roughly a third as often as bandits once the
+// longer cooldown and lower roll are combined. Frequent enough to read as a
+// real squad capability, rare enough that it stays a moment rather than a
+// steady stream of explosions from the friendly side.
+static constexpr float kMarineGrenadeCooldownMin = 18.0f;
+static constexpr float kMarineGrenadeCooldownMax = 30.0f;
+static constexpr float kMarineGrenadeChance = 0.25f;
+// Nobody on the player's side should be inside a friendly blast. Checked
+// against the impact point before an ally commits to the throw; the grenade
+// blast radius itself is scene.grenadeEnemyRadius, so this carries margin.
+static constexpr float kAllyGrenadeSafeRadius = 9.0f;
 
 static float RandomUnit() {
     return (float)std::rand() / (float)RAND_MAX;
@@ -1410,6 +1421,10 @@ static bool SpawnMarine(const XMFLOAT3& position, float yaw) {
     // cleverly as the player, so they need the buffer to stay useful.
     marine->health = 400.0f;
     marine->fireCooldown = 0.7f + ((float)std::rand() / (float)RAND_MAX) * 2.8f;
+    // Stagger the first grenade across the whole window so a squad spawning
+    // together does not throw its opening volley in lockstep.
+    marine->grenadeCooldown = kMarineGrenadeCooldownMin +
+        RandomUnit() * (kMarineGrenadeCooldownMax - kMarineGrenadeCooldownMin);
     // No ApplyBanditLoadout(): marines stay on the default Rifle loadout for v1.
     marine->PlayClip("Walk");
     g_bandits.push_back(std::move(marine));
@@ -1658,12 +1673,43 @@ EnemyLineOfSightFn g_enemyLineOfSightFn = &BanditHasLineOfSight;
 std::vector<EnemyNoiseEvent> g_enemyNoiseEvents;
 std::vector<EnemyAlertEvent> g_enemyAlertEvents;
 
+// Would an ally's grenade at `target` catch someone on the player's side?
+//
+// Grenade blast damage is indiscriminate by design -- the explosion handler
+// damages every actor in radius and the player too, regardless of who threw
+// it. That is correct for the player's own throws, but an ally choosing to
+// throw has to answer for it, so check the impact point against the player
+// and every other live marine first. The thrower itself is excluded: it is
+// already standing where it is, and the range band keeps it clear.
+static bool AllyGrenadeBlastIsSafe(const SkinnedEnemy& thrower,
+                                   const XMFLOAT3& target) {
+    const float safeSq = kAllyGrenadeSafeRadius * kAllyGrenadeSafeRadius;
+    const float px = scene.camera.Position.x - target.x;
+    const float pz = scene.camera.Position.z - target.z;
+    if (px * px + pz * pz < safeSq) return false;
+
+    for (const auto& other : g_bandits) {
+        if (!other || other.get() == &thrower || other->Dead()) continue;
+        if (other->faction != Faction::Marine) continue;
+        const float mx = other->position.x - target.x;
+        const float mz = other->position.z - target.z;
+        if (mx * mx + mz * mz < safeSq) return false;
+    }
+    return true;
+}
+
 // Ballistic lob from the thrower toward the target. Solves the launch elevation
-// for a fixed speed under gravity, so grenades arc onto the player instead of
+// for a fixed speed under gravity, so grenades arc onto the target instead of
 // being flung flat past them.
-static void BanditThrowGrenade(const SkinnedEnemy& bandit) {
+//
+// Target is passed in rather than read from the camera: marines throw at the
+// bandit they are fighting, not at the player. hostile follows the thrower --
+// a hostile grenade's projectile body can strike the player directly, while a
+// marine's passes them by. The blast itself is deliberately indiscriminate for
+// both (see the explosion handler), so anyone standing too close still pays.
+static void BanditThrowGrenade(const SkinnedEnemy& bandit,
+                               const XMFLOAT3& target, bool hostile) {
     const XMFLOAT3 origin = bandit.AimRayOrigin();
-    const XMFLOAT3& target = scene.camera.Position;
 
     const float dx = target.x - origin.x;
     const float dz = target.z - origin.z;
@@ -1696,7 +1742,7 @@ static void BanditThrowGrenade(const SkinnedEnemy& bandit) {
     grenade.position = grenade.previousPosition = origin;
     grenade.direction = { dx * inverseHorizontal, 0.0f, dz * inverseHorizontal };
     grenade.grenade = true;
-    grenade.hostile = true;
+    grenade.hostile = hostile;
     grenade.active = true;
     grenade.fuse = scene.grenadeFuse;
     grenade.grenadeCollisionGrace = 0.18f;
@@ -8675,14 +8721,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     BanditHasLineOfSight(*bandit, target);
 
                 // Grenade throw: mid-range only, on its own cooldown, and gated
-                // on the same line of sight the rifle uses so bandits do not lob
+                // on the same line of sight the rifle uses so nobody lobs
                 // through a wall. Mounted gunners keep to the turret. Patrol/
-                // Alert bandits have no confirmed target to throw at. Marines
-                // don't grenade in v1 -- keep this gated to bandits only.
-                if (!bandit->Dead() && !bandit->turretGunner &&
-                    bandit->faction == Faction::Bandit &&
-                    bandit->Awareness() == SkinnedEnemy::AwarenessState::Combat &&
-                    !scene.player.godMode && scene.player.health > 0.0f) {
+                // Alert actors have no confirmed target to throw at.
+                //
+                // Bandits throw at the player, so a dead/godmode player disarms
+                // them. Marines throw at bandits, which is independent of player
+                // state -- gate each on what its own throw actually needs.
+                const bool marineThrower = bandit->faction == Faction::Marine;
+                const bool throwerReady = marineThrower
+                    ? true
+                    : (!scene.player.godMode && scene.player.health > 0.0f);
+                if (!bandit->Dead() && !bandit->turretGunner && throwerReady &&
+                    bandit->Awareness() == SkinnedEnemy::AwarenessState::Combat) {
                     bandit->grenadeCooldown -= deltaTime;
                     if (bandit->grenadeCooldown <= 0.0f) {
                         const float gx = bandit->position.x - target.x;
@@ -8690,14 +8741,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         const float range = std::sqrt(gx * gx + gz * gz);
                         const bool inBand = range >= kBanditGrenadeMinRange &&
                                             range <= kBanditGrenadeMaxRange;
-                        if (inBand && hasLineOfSight) {
-                            if (RandomUnit() < kBanditGrenadeChance)
-                                BanditThrowGrenade(*bandit);
-                            // Re-arm whether or not the roll passed, so a bandit
-                            // that declines does not retry every single frame.
-                            bandit->grenadeCooldown = kBanditGrenadeCooldownMin +
-                                RandomUnit() * (kBanditGrenadeCooldownMax -
-                                                kBanditGrenadeCooldownMin);
+                        // The blast damages everyone in radius, so an ally must
+                        // check its own side of the impact before committing.
+                        // Without this a marine will cheerfully frag the player
+                        // or a squadmate who is pushing the same target.
+                        const bool blastSafe =
+                            !marineThrower ||
+                            AllyGrenadeBlastIsSafe(*bandit, target);
+                        if (inBand && hasLineOfSight && blastSafe) {
+                            const float chance = marineThrower
+                                ? kMarineGrenadeChance : kBanditGrenadeChance;
+                            if (RandomUnit() < chance)
+                                BanditThrowGrenade(
+                                    *bandit, target, !marineThrower);
+                            // Re-arm whether or not the roll passed, so a
+                            // thrower that declines does not retry every frame.
+                            const float cooldownMin = marineThrower
+                                ? kMarineGrenadeCooldownMin
+                                : kBanditGrenadeCooldownMin;
+                            const float cooldownMax = marineThrower
+                                ? kMarineGrenadeCooldownMax
+                                : kBanditGrenadeCooldownMax;
+                            bandit->grenadeCooldown = cooldownMin +
+                                RandomUnit() * (cooldownMax - cooldownMin);
                         }
                     }
                 }
