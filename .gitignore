@@ -86,6 +86,9 @@ Thumbs.db
 # Tool output
 graphify-out/
 Content/Cooked/
+# Baked DDGI probe caches, written next to the levels they belong to. Derived
+# from level content and keyed by hash, so they regenerate on demand.
+Content/Levels/.ddgi/
 assetcache/
 dumps/
 Content/Models/ship.glb

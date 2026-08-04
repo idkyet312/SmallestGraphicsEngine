@@ -1,0 +1,787 @@
+{
+  "entities": [
+    {
+      "enabled": true,
+      "id": 1,
+      "name": "Player Spawn",
+      "transform": {
+        "position": [
+          0.0,
+          5.0,
+          10.0
+        ],
+        "rotation": [
+          0.0,
+          180.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "player_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 2,
+      "name": "North Wood House",
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          9.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "wood_house"
+    },
+    {
+      "enabled": true,
+      "id": 3,
+      "name": "East Metal House",
+      "transform": {
+        "position": [
+          9.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          90.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "metal_house"
+    },
+    {
+      "enabled": true,
+      "id": 4,
+      "name": "South Wood House",
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          -9.0
+        ],
+        "rotation": [
+          0.0,
+          180.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "wood_house"
+    },
+    {
+      "enabled": true,
+      "id": 5,
+      "name": "West Metal House",
+      "transform": {
+        "position": [
+          -9.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          -90.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "metal_house"
+    },
+    {
+      "enabled": true,
+      "id": 6,
+      "name": "Palm 1",
+      "transform": {
+        "position": [
+          -15.5,
+          0.0,
+          -13.800000190734863
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.5
+        ],
+        "scale": [
+          1.0,
+          15.0,
+          1.0
+        ]
+      },
+      "type": "palm"
+    },
+    {
+      "enabled": true,
+      "id": 7,
+      "name": "Palm 2",
+      "transform": {
+        "position": [
+          -3.5,
+          0.0,
+          -18.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.4000000059604645
+        ],
+        "scale": [
+          1.0,
+          12.800000190734863,
+          1.0
+        ]
+      },
+      "type": "palm"
+    },
+    {
+      "enabled": true,
+      "id": 8,
+      "name": "Palm 3",
+      "transform": {
+        "position": [
+          14.800000190734863,
+          0.0,
+          -14.199999809265137
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.699999988079071
+        ],
+        "scale": [
+          1.0,
+          16.399999618530273,
+          1.0
+        ]
+      },
+      "type": "palm"
+    },
+    {
+      "enabled": true,
+      "id": 10,
+      "name": "Palm 5",
+      "transform": {
+        "position": [
+          14.199999809265137,
+          0.0,
+          14.800000190734863
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.30000001192092896
+        ],
+        "scale": [
+          1.0,
+          14.199999809265137,
+          1.0
+        ]
+      },
+      "type": "palm"
+    },
+    {
+      "enabled": true,
+      "id": 11,
+      "name": "Palm 6",
+      "transform": {
+        "position": [
+          3.200000047683716,
+          0.0,
+          18.200000762939453
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          -0.5
+        ],
+        "scale": [
+          1.0,
+          12.0,
+          1.0
+        ]
+      },
+      "type": "palm"
+    },
+    {
+      "enabled": true,
+      "id": 12,
+      "name": "Palm 7",
+      "transform": {
+        "position": [
+          -14.5,
+          0.0,
+          14.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.6000000238418579
+        ],
+        "scale": [
+          1.0,
+          15.600000381469727,
+          1.0
+        ]
+      },
+      "type": "palm"
+    },
+    {
+      "enabled": true,
+      "id": 13,
+      "name": "Palm 8",
+      "transform": {
+        "position": [
+          -18.0,
+          3.3196675777435303,
+          4.0
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          -0.2999952435493469
+        ],
+        "scale": [
+          1.0,
+          13.199999809265137,
+          1.0
+        ]
+      },
+      "type": "palm"
+    },
+    {
+      "enabled": true,
+      "id": 14,
+      "name": "Barrel 1",
+      "transform": {
+        "position": [
+          12.100000381469727,
+          3.25,
+          4.599999904632568
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "explosive_barrel"
+    },
+    {
+      "enabled": true,
+      "id": 15,
+      "name": "Barrel 2",
+      "transform": {
+        "position": [
+          0.40000009536743164,
+          3.25,
+          2.0999999046325684
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "explosive_barrel"
+    },
+    {
+      "enabled": true,
+      "id": 16,
+      "name": "Barrel 3",
+      "transform": {
+        "position": [
+          4.599999904632568,
+          3.25,
+          -8.100000381469727
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "explosive_barrel"
+    },
+    {
+      "enabled": true,
+      "id": 17,
+      "name": "Barrel 4",
+      "transform": {
+        "position": [
+          -4.599999904632568,
+          3.25,
+          -4.599999904632568
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "explosive_barrel"
+    },
+    {
+      "enabled": true,
+      "id": 18,
+      "name": "Enemy Spawn 1",
+      "transform": {
+        "position": [
+          -0.8500000238418579,
+          0.0,
+          17.5
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 19,
+      "name": "Enemy Spawn 2",
+      "transform": {
+        "position": [
+          0.8500000238418579,
+          0.0,
+          17.5
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 20,
+      "name": "Enemy Spawn 3",
+      "transform": {
+        "position": [
+          17.5,
+          0.0,
+          0.8500000238418579
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 21,
+      "name": "Enemy Spawn 4",
+      "transform": {
+        "position": [
+          17.5,
+          0.0,
+          -0.8500000238418579
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 22,
+      "name": "Enemy Spawn 5",
+      "transform": {
+        "position": [
+          0.8500000238418579,
+          0.0,
+          -17.5
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 23,
+      "name": "Enemy Spawn 6",
+      "transform": {
+        "position": [
+          -0.8500000238418579,
+          0.0,
+          -17.5
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 24,
+      "name": "Enemy Spawn 7",
+      "transform": {
+        "position": [
+          -17.5,
+          0.0,
+          -0.8500000238418579
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 25,
+      "name": "Enemy Spawn 8",
+      "transform": {
+        "position": [
+          -17.5,
+          0.0,
+          0.8500000238418579
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 26,
+      "name": "Humvee",
+      "transform": {
+        "position": [
+          0.0,
+          3.450000047683716,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "humvee"
+    },
+    {
+      "enabled": true,
+      "id": 27,
+      "name": "Helicopter",
+      "transform": {
+        "position": [
+          0.0,
+          14.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "helicopter"
+    },
+    {
+      "enabled": true,
+      "id": 28,
+      "name": "explosive_barrel 28",
+      "transform": {
+        "position": [
+          6.5,
+          3.25,
+          5.0
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "explosive_barrel"
+    },
+    {
+      "enabled": true,
+      "id": 29,
+      "name": "enemy_spawn 29",
+      "transform": {
+        "position": [
+          -1.5,
+          3.2428908348083496,
+          -19.5
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 30,
+      "name": "enemy_spawn 30",
+      "transform": {
+        "position": [
+          3.5,
+          2.723397731781006,
+          -17.0
+        ],
+        "rotation": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "enemy_spawn"
+    },
+    {
+      "enabled": true,
+      "id": 31,
+      "name": "Tree 31",
+      "transform": {
+        "position": [
+          3.4218578338623047,
+          2.5,
+          -2.555767774581909
+        ],
+        "rotation": [
+          0.0,
+          182.40411376953125,
+          0.21982036530971527
+        ],
+        "scale": [
+          1.0,
+          13.681375503540039,
+          1.0
+        ]
+      },
+      "type": "palm"
+    },
+    {
+      "enabled": true,
+      "id": 32,
+      "name": "Tree 32",
+      "transform": {
+        "position": [
+          5.6118974685668945,
+          2.5,
+          -10.274648666381836
+        ],
+        "rotation": [
+          0.0,
+          245.69590759277344,
+          0.17005595564842224
+        ],
+        "scale": [
+          1.0,
+          10.367531776428223,
+          1.0
+        ]
+      },
+      "type": "palm"
+    },
+    {
+      "enabled": true,
+      "id": 33,
+      "name": "wood_house 33",
+      "transform": {
+        "position": [
+          9.5,
+          0.2914386987686157,
+          10.0
+        ],
+        "rotation": [
+          0.0,
+          -89.97196960449219,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "wood_house"
+    },
+    {
+      "enabled": true,
+      "id": 34,
+      "name": "rock2",
+      "prefab": "imported/rock2",
+      "transform": {
+        "position": [
+          10.66956901550293,
+          2.5,
+          -6.3899383544921875
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "type": "prefab"
+    }
+  ],
+  "lighting": {
+    "dxrDDGI": {
+      "enabled": true,
+      "hysteresis": 0.949999988079071,
+      "intensity": 1.0570000410079956,
+      "maxProbes": 200,
+      "maxRayDistance": 24.0,
+      "multiBounceStrength": 0.3499999940395355,
+      "normalBias": 0.18000000715255737,
+      "probesPerFrame": 16,
+      "raysPerProbe": 64,
+      "showProbes": false,
+      "surfaceOffset": 0.3499999940395355,
+      "surfaceSpacing": 3.0,
+      "viewBias": 0.05000000074505806
+    }
+  },
+  "name": "Level 1 Copy",
+  "schemaVersion": 1,
+  "terrain": {
+    "heightScale": 5.0,
+    "sculpt": []
+  }
+}
