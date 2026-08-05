@@ -701,6 +701,13 @@ public:
                 depthShader, boatTransforms, lightSpace);
         }
 
+        if (!g_emptyLevelMode && g_blackHawkModel) {
+            std::vector<XMMATRIX> blackHawkTransforms = { BlackHawkWorldMatrix() };
+            DrawSceneNodeShadowInstances(
+                g_blackHawkShadowModel ? g_blackHawkShadowModel : g_blackHawkModel,
+                depthShader, blackHawkTransforms, lightSpace);
+        }
+
         for (const PrefabRenderBatch& batch : prefabRenderBatches) {
             if (batch.model && batch.castShadow && !batch.transforms.empty())
                 DrawSceneNodeShadowInstances(batch.model, depthShader,

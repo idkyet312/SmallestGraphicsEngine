@@ -87,6 +87,35 @@ std::shared_ptr<SceneNode> FBXImporter::Load(const std::string& filepath,
     auto loadTexture = [&](const aiString& texturePath, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploads)
         -> Microsoft::WRL::ComPtr<ID3D12Resource> {
         std::string rawPath = texturePath.C_Str();
+        // Textures embedded in the FBX are referenced as "*N", an index into
+        // mTextures, and have no file on disk. Decode them straight from the
+        // in-memory blob before any path resolution runs.
+        if (const aiTexture* embedded = scene->GetEmbeddedTexture(rawPath.c_str())) {
+            std::vector<unsigned char> rgba;
+            int width = 0;
+            int height = 0;
+            // mHeight == 0 marks a compressed payload (PNG/JPEG) of mWidth
+            // bytes; otherwise it is raw uncompressed BGRA texels.
+            if (embedded->mHeight == 0) {
+                if (!GLBImporter::LoadPixelsRGBAFromMemory(
+                        reinterpret_cast<const unsigned char*>(embedded->pcData),
+                        embedded->mWidth, rgba, width, height))
+                    return nullptr;
+            } else {
+                width = static_cast<int>(embedded->mWidth);
+                height = static_cast<int>(embedded->mHeight);
+                rgba.resize(static_cast<size_t>(width) * height * 4);
+                for (size_t texel = 0; texel < rgba.size() / 4; ++texel) {
+                    const aiTexel& source = embedded->pcData[texel];
+                    rgba[texel * 4 + 0] = source.r;
+                    rgba[texel * 4 + 1] = source.g;
+                    rgba[texel * 4 + 2] = source.b;
+                    rgba[texel * 4 + 3] = source.a;
+                }
+            }
+            return GLBImporter::CreateTextureFromRGBA(device.Get(), commandList.Get(),
+                rgba, width, height, uploads);
+        }
         std::replace(rawPath.begin(), rawPath.end(), '\\', '/');
         fs::path path(rawPath);
         if (path.is_absolute() && fs::exists(path))

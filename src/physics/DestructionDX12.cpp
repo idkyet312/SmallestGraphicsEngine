@@ -4299,7 +4299,8 @@ std::vector<TinyDebrisParticle> DestructionDX12::DrainTinyDebrisParticles() {
 }
 
 void DestructionDX12::ResolvePlayerCollision(XMFLOAT3& eyePosition, float& floorY,
-                                             float radius, float height) {
+                                             float radius, float height,
+                                             bool collideVehicle) {
     if (!m->initialized) return;
     const float feet = eyePosition.y - height;
     constexpr float kStepHeight = 1.0f / 3.0f;   // max ledge the player can step up onto
@@ -4369,6 +4370,28 @@ void DestructionDX12::ResolvePlayerCollision(XMFLOAT3& eyePosition, float& floor
         resolveBox({(float)p.x-part.half.x,(float)p.y-part.half.y,(float)p.z-part.half.z},
                    {(float)p.x+part.half.x,(float)p.y+part.half.y,(float)p.z+part.half.z},
                    part.body, true);
+    }
+    // The vehicle lives outside the destructible-actor list, so without this the
+    // player walks straight through the parked humvee. Its chassis hull is
+    // yaw-driven, so sweep the oriented corners into a world AABB rather than
+    // assuming an axis-aligned box.
+    if (collideVehicle && VehicleReady()) {
+        const XMMATRIX chassis = BoxTransform(m->vehicleChassis, { 0.0f, 0.0f, 0.0f });
+        constexpr float kChassisHalfX = 2.20f;
+        constexpr float kChassisHalfY = 0.55f;
+        constexpr float kChassisHalfZ = 1.0f;
+        XMFLOAT3 lo(FLT_MAX, FLT_MAX, FLT_MAX), hi(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        for (float x : { -kChassisHalfX, kChassisHalfX })
+        for (float y : { -kChassisHalfY, kChassisHalfY })
+        for (float z : { -kChassisHalfZ, kChassisHalfZ }) {
+            XMFLOAT3 corner;
+            XMStoreFloat3(&corner, XMVector3TransformCoord(
+                XMVectorSet(x, y, z, 1.0f), chassis));
+            lo.x = (std::min)(lo.x, corner.x); hi.x = (std::max)(hi.x, corner.x);
+            lo.y = (std::min)(lo.y, corner.y); hi.y = (std::max)(hi.y, corner.y);
+            lo.z = (std::min)(lo.z, corner.z); hi.z = (std::max)(hi.z, corner.z);
+        }
+        resolveBox(lo, hi, m->vehicleChassis, true);
     }
 }
 

@@ -69,6 +69,43 @@ struct VehicleSystem {
     bool boatSunk = false;
     float boatSinkDepth = 0.0f;
 
+    // BlackHawk: starts hovering high above the map centre on level start and
+    // descends under its own power until it touches down, then idles on the
+    // ground. Purely scripted -- it carries no health or damage state.
+    static constexpr float BlackHawkStartHeight = 90.0f;
+    static constexpr float BlackHawkDescentSpeed = 6.5f;
+    DirectX::XMFLOAT3 blackHawkModelCenter{};
+    float blackHawkModelMinY = 0.0f;
+    float blackHawkModelScale = 1.0f;
+    DirectX::XMFLOAT3 blackHawkPosition{ 0.0f, BlackHawkStartHeight, 0.0f };
+    float blackHawkGroundY = 0.0f;
+    float blackHawkYaw = 0.0f;
+    float blackHawkRotorSpin = 0.0f;
+    bool blackHawkLanded = false;
+
+    // Descends toward groundY, easing out over the last few metres so the
+    // touchdown reads as a controlled landing rather than a drop.
+    void UpdateBlackHawk(float deltaTime) {
+        const float dt = (std::max)(0.0f, deltaTime);
+        blackHawkRotorSpin += dt * (blackHawkLanded ? 6.0f : 34.0f);
+        if (blackHawkLanded) return;
+        const float remaining = blackHawkPosition.y - blackHawkGroundY;
+        if (remaining <= 0.01f) {
+            blackHawkPosition.y = blackHawkGroundY;
+            blackHawkLanded = true;
+            return;
+        }
+        // Full speed while high, tapering to a slow flare inside the last 12 m.
+        const float flare = (std::min)(1.0f, remaining / 12.0f);
+        const float speed = BlackHawkDescentSpeed * (0.12f + 0.88f * flare);
+        blackHawkPosition.y =
+            (std::max)(blackHawkGroundY, blackHawkPosition.y - speed * dt);
+        if (blackHawkPosition.y <= blackHawkGroundY + 0.01f) {
+            blackHawkPosition.y = blackHawkGroundY;
+            blackHawkLanded = true;
+        }
+    }
+
     struct DamageResult {
         DirectX::XMFLOAT3 position{};
         bool applied = false;
@@ -176,6 +213,12 @@ struct VehicleSystem {
         boatDead = false;
         boatSunk = false;
         boatSinkDepth = 0.0f;
+
+        // Send the BlackHawk back up so it flies the landing again on reload.
+        blackHawkPosition = { 0.0f, BlackHawkStartHeight, 0.0f };
+        blackHawkYaw = 0.0f;
+        blackHawkRotorSpin = 0.0f;
+        blackHawkLanded = false;
     }
 };
 

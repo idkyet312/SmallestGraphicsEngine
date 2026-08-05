@@ -49,6 +49,8 @@ extern std::shared_ptr<SceneNode> g_humveeModel;
 extern std::shared_ptr<SceneNode> g_boatModel;
 extern std::shared_ptr<SceneNode> g_humveeShadowModel;
 extern std::shared_ptr<SceneNode> g_boatShadowModel;
+extern std::shared_ptr<SceneNode> g_blackHawkModel;
+extern std::shared_ptr<SceneNode> g_blackHawkShadowModel;
 extern std::shared_ptr<SceneNode> g_helicopterModel;
 struct DandelionInstance {
     DirectX::XMFLOAT4X4 transform;
@@ -77,6 +79,7 @@ DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
 DirectX::XMMATRIX HelicopterWorldMatrix();
 DirectX::XMMATRIX SecondaryHelicopterWorldMatrix();
 DirectX::XMMATRIX BoatWorldMatrix();
+DirectX::XMMATRIX BlackHawkWorldMatrix();
 
 struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
@@ -1477,6 +1480,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         } else if (!staticBatches.Submit(g_boatModel, BoatWorldMatrix()))
             DrawSceneNode(g_boatModel, shader, BoatWorldMatrix(),
                 view, proj, lightSpace);
+    }
+
+    // Descends every frame until touchdown, so it never joins the static batch.
+    if (!g_emptyLevelMode && g_blackHawkModel) {
+        DrawSceneNode(g_blackHawkModel, shader, BlackHawkWorldMatrix(),
+            view, proj, lightSpace, visibilityExtensionsOnly);
     }
 
     for (const PrefabRenderBatch& batch : prefabRenderBatches) {

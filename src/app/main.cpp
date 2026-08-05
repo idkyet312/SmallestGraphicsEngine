@@ -122,6 +122,8 @@ std::shared_ptr<SceneNode>  g_humveeShadowModel;
 std::shared_ptr<SceneNode>  g_helicopterModel;
 std::shared_ptr<SceneNode>  g_boatModel;
 std::shared_ptr<SceneNode>  g_boatShadowModel;
+std::shared_ptr<SceneNode>  g_blackHawkModel;
+std::shared_ptr<SceneNode>  g_blackHawkShadowModel;
 std::shared_ptr<SceneNode>  g_dandelionModel;
 std::vector<DandelionInstance> g_dandelionInstances;
 static XMFLOAT3             g_dandelionSourceCenter{};
@@ -241,6 +243,12 @@ static float&               g_humveeTurretFireCooldown = g_game.vehicles.humveeT
 static XMFLOAT3             g_boatModelCenter{};
 static float                g_boatModelMinY = 0.0f;
 static float                g_boatModelScale = 1.0f;
+static XMFLOAT3&            g_blackHawkModelCenter = g_game.vehicles.blackHawkModelCenter;
+static float&               g_blackHawkModelMinY = g_game.vehicles.blackHawkModelMinY;
+static float&               g_blackHawkModelScale = g_game.vehicles.blackHawkModelScale;
+static XMFLOAT3&            g_blackHawkPosition = g_game.vehicles.blackHawkPosition;
+static float&               g_blackHawkYaw = g_game.vehicles.blackHawkYaw;
+static float&               g_blackHawkRotorSpin = g_game.vehicles.blackHawkRotorSpin;
 static XMFLOAT3&            g_boatPosition = g_game.vehicles.boatPosition;
 static XMFLOAT3&            g_boatCenter = g_game.vehicles.boatCenter;
 static float&               g_boatYaw = g_game.vehicles.boatYaw;
@@ -587,6 +595,44 @@ static void ConfigureHelicopterBounds() {
     g_helicopterModelScale = 10.0f / horizontalLength;
 }
 
+XMMATRIX BlackHawkWorldMatrix() {
+    return XMMatrixTranslation(-g_blackHawkModelCenter.x, -g_blackHawkModelMinY,
+                               -g_blackHawkModelCenter.z) *
+           XMMatrixScaling(g_blackHawkModelScale, g_blackHawkModelScale,
+                           g_blackHawkModelScale) *
+           XMMatrixRotationY(g_blackHawkYaw) *
+           XMMatrixTranslation(g_blackHawkPosition.x,
+                               g_blackHawkPosition.y,
+                               g_blackHawkPosition.z);
+}
+
+// Scaled to a ~1.6 m rotor span and pinned by its skids, so the landed pose
+// rests on the terrain rather than sinking to the model's centre.
+static void ConfigureBlackHawkBounds() {
+    if (!g_blackHawkModel || !g_blackHawkModel->mesh) return;
+    XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
+    XMFLOAT3 maximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    for (const MeshPrimitive& primitive : g_blackHawkModel->mesh->primitives) {
+        for (size_t vertex = 0; vertex + 11 < primitive.vertices.size(); vertex += 12) {
+            minimum.x = (std::min)(minimum.x, primitive.vertices[vertex]);
+            minimum.y = (std::min)(minimum.y, primitive.vertices[vertex + 1]);
+            minimum.z = (std::min)(minimum.z, primitive.vertices[vertex + 2]);
+            maximum.x = (std::max)(maximum.x, primitive.vertices[vertex]);
+            maximum.y = (std::max)(maximum.y, primitive.vertices[vertex + 1]);
+            maximum.z = (std::max)(maximum.z, primitive.vertices[vertex + 2]);
+        }
+    }
+    const float horizontalLength = (std::max)(
+        maximum.x - minimum.x, maximum.z - minimum.z);
+    if (horizontalLength <= 0.001f) return;
+    g_blackHawkModelCenter = {
+        (minimum.x + maximum.x) * 0.5f,
+        (minimum.y + maximum.y) * 0.5f,
+        (minimum.z + maximum.z) * 0.5f };
+    g_blackHawkModelMinY = minimum.y;
+    g_blackHawkModelScale = 1.6f / horizontalLength;
+}
+
 XMMATRIX BoatWorldMatrix() {
     return XMMatrixTranslation(-g_boatModelCenter.x, -g_boatModelMinY,
                                -g_boatModelCenter.z) *
@@ -638,6 +684,11 @@ static void ConfigureBoatBounds() {
     g_boatModelMinY += 0.35f / g_boatModelScale;
 }
 
+// The humvee ships its base colour map embedded in the source FBX. Where that
+// texture resolved, leave the material alone -- tinting baseColorFactor would
+// multiply into the sampled texel and clearing srvHeapSlot would unbind it.
+// Materials with no texture (and the authored wheel material's black) keep the
+// flat dark green so an export without the map still reads as a vehicle.
 static bool ApplyDarkGreenToHumvee() {
     if (!g_humveeModel) return false;
     bool changed = false;
@@ -648,6 +699,7 @@ static bool ApplyDarkGreenToHumvee() {
             for (MeshPrimitive& primitive : node->mesh->primitives) {
                 if (!primitive.material) continue;
                 if (primitive.material->name == "HumveeWheel") continue;
+                if (primitive.material->baseColorTexture) continue;
                 primitive.material->baseColorFactor.x = 0.18f;
                 primitive.material->baseColorFactor.y = 0.30f;
                 primitive.material->baseColorFactor.z = 0.12f;
@@ -8406,7 +8458,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // standing, and avoids a one-frame lag that would drop the player.
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.ResolvePlayerCollision(scene.camera.Position,
-                scene.camera.FloorY, 0.35f, scene.camera.PlayerHeight);
+                scene.camera.FloorY, 0.35f, scene.camera.PlayerHeight,
+                !g_drivingHumvee);
         }
         ResolvePlayerWorldObjectCollisions(
             scene.camera.Position, scene.camera.FloorY,
@@ -8502,6 +8555,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             UpdateHelicopter(deltaTime);
             UpdateSecondaryHelicopter(deltaTime);
             UpdateBoat(deltaTime);
+            g_game.vehicles.UpdateBlackHawk(deltaTime);
             UpdateExplosiveBarrels(deltaTime);
         }
         g_gunAudio.Update();
@@ -10230,9 +10284,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 std::cerr << "OH-1 helicopter FBX failed to load\n";
             }
             if (ApplyDarkGreenToHumvee())
-                std::cout << "Humvee dark green material ready\n";
+                std::cout << "Humvee dark green fallback applied to untextured materials\n";
             else
-                std::cerr << "Humvee dark green material failed\n";
+                std::cout << "Humvee using embedded base colour texture\n";
 
             AdvanceLevelLoading(LevelLoadStage::Boat,
                 "Military boat import, bounds and patrol setup",
@@ -10251,6 +10305,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 std::cout << "Military boat GLB ready, patrolling island\n";
             } else {
                 std::cerr << "Military boat GLB failed to load\n";
+            }
+
+            g_blackHawkModel = GLBImporter::LoadGLB(
+                "Content/Models/BlackHawk/blackhawk.glb",
+                g_dx12.device, g_dx12.commandList);
+            if (g_blackHawkModel) {
+                ConfigureBlackHawkBounds();
+                g_blackHawkShadowModel = GLBImporter::MergeSceneForDepth(
+                    g_blackHawkModel, g_dx12.device);
+                // Touch down on the terrain at the map centre, clear of the
+                // water plane if the centre happens to sit below it.
+                auto params = CurrentTerrainParams();
+                params.heightScale = scene.terrainHeightScale;
+                g_game.vehicles.blackHawkGroundY = (std::max)(0.0f,
+                    TerrainRendererDX12::HeightAt(params, 0.0f, 0.0f));
+                g_blackHawkPosition = { 0.0f,
+                    g_game.vehicles.blackHawkGroundY +
+                        VehicleSystem::BlackHawkStartHeight,
+                    0.0f };
+                g_game.vehicles.blackHawkLanded = false;
+                std::cout << "BlackHawk GLB ready, inbound to map centre\n";
+            } else {
+                std::cerr << "BlackHawk GLB failed to load\n";
             }
 
             AdvanceLevelLoading(LevelLoadStage::BanditModel,
@@ -10351,6 +10428,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ReleaseMaterialUploadHeaps(g_helicopterModel);
             ReleaseMaterialUploadHeaps(g_humveeModel);
             ReleaseMaterialUploadHeaps(g_boatModel);
+            ReleaseMaterialUploadHeaps(g_blackHawkModel);
             ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
             ReleaseMaterialUploadHeaps(g_dandelionModel);
             for (const auto& entry : g_prefabModelCache)

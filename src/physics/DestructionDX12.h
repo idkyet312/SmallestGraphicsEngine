@@ -260,8 +260,11 @@ public:
     // Resolves the player against destruction/ragdoll boxes. Walls push the eye
     // out horizontally; low boxes the player is standing over raise `floorY` (so
     // the caller can stand the player on top) instead of shoving them sideways.
+    // `collideVehicle` blocks the player against the humvee chassis; pass false
+    // while driving, when the camera legitimately sits inside that hull.
     void ResolvePlayerCollision(DirectX::XMFLOAT3& eyePosition, float& floorY,
-                                float radius = 0.35f, float height = 1.7f);
+                                float radius = 0.35f, float height = 1.7f,
+                                bool collideVehicle = true);
     // Define a water region (AABB, with the surface at max.y). Dynamic
     // fragments knocked into it get buoyancy so house debris floats.
     void SetWaterRegion(const DirectX::XMFLOAT3& minCorner,
