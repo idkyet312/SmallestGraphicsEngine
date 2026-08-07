@@ -465,6 +465,55 @@ static void AddExplosionTerrainCrater(const XMFLOAT3& impact) {
     g_trees.ApplyExplosion(impact, foliageRadius);
 }
 
+// Gouges the ground where the BlackHawk went in. Three overlapping stamps laid
+// along the heading rather than one circle: the wreck slides in nose-first at
+// speed, so the scar it leaves is an elongated furrow, deepest at the point of
+// impact and shallowing out ahead of it.
+static void AddBlackHawkCrashCraters(const XMFLOAT3& impact, float yaw) {
+    if (!scene.useMeshTerrain || !g_terrain.supported) return;
+
+    // Same island-scale reasoning as the explosion crater: a fixed dimple
+    // vanishes on a stretched island and the coarse outer clipmap rings cannot
+    // resolve a small radius.
+    const TerrainRendererDX12::Params terrainParams = CurrentTerrainParams();
+    const float islandScale = (std::max)(1.0f,
+        (std::max)(terrainParams.islandScaleX, terrainParams.islandScaleZ));
+    const float scale = (std::min)(3.0f, sqrtf(islandScale));
+
+    // Forward is (sin, cos), matching the rest of the BlackHawk code.
+    const float forwardX = std::sin(yaw);
+    const float forwardZ = std::cos(yaw);
+
+    // Offset along the heading, radius, and depth. The middle stamp sits on the
+    // impact point and bites deepest; the trailing one is where it first
+    // touched down, the leading one where it ploughed to a stop.
+    struct Gouge { float along, radius, depth; };
+    static constexpr Gouge kGouges[] = {
+        { -5.5f, 4.0f, -0.9f },
+        {  0.0f, 5.5f, -1.7f },
+        {  5.0f, 4.5f, -1.1f },
+    };
+
+    for (const Gouge& gouge : kGouges) {
+        TerrainSculptStamp stamp;
+        stamp.x = impact.x + forwardX * gouge.along * scale;
+        stamp.z = impact.z + forwardZ * gouge.along * scale;
+        stamp.radius = gouge.radius * scale;
+        stamp.operation = TerrainSculptOperation::Add;
+        stamp.value = gouge.depth * scale;
+        stamp.strength = 1.0f;
+        g_game.world.AddRuntimeTerrainStamp(stamp);
+
+        // Scrub foliage out of the furrow so grass and palms are not left
+        // standing in a trench the helicopter just carved.
+        g_grass.AddRuntimeExclusion(stamp.x, stamp.z, stamp.radius * 0.6f);
+        g_trees.ApplyExplosion({ stamp.x, impact.y, stamp.z },
+                               stamp.radius * 0.6f);
+    }
+    // One upload for all three, rather than re-syncing per stamp.
+    g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
+}
+
 static size_t LiveBanditCount() {
     size_t count = 0;
     for (const auto& bandit : g_bandits)
@@ -782,6 +831,10 @@ static void RidePlayerInBlackHawk() {
 
 // Fires the crash FX and hurts anyone still strapped in. Runs off the one-frame
 // flag the vehicle update raises, so it happens exactly once per wreck.
+// Defined with the collision code further down; called here the frame the wreck
+// settles, once its final pose is written.
+static void BakeBlackHawkCollisionMesh();
+
 static void UpdateBlackHawkCrashEffects(float deltaTime) {
     VehicleSystem& vehicles = g_game.vehicles;
 
@@ -816,6 +869,13 @@ static void UpdateBlackHawkCrashEffects(float deltaTime) {
     if (!vehicles.blackHawkJustCrashed) return;
 
     const XMFLOAT3 impact = vehicles.blackHawkPosition;
+    // Carve the furrow before baking collision: the stamps move the ground, and
+    // the wreck's triangles are only correct against the terrain as it ends up.
+    AddBlackHawkCrashCraters(impact, vehicles.blackHawkYaw);
+    // The wreck is static from here, so bake its mesh once for collision. Runs
+    // after the vehicle update has written the final resting pose.
+    BakeBlackHawkCollisionMesh();
+
     scene.SpawnExplosionFX({ impact.x, impact.y + 1.6f, impact.z }, 11.0f, 1.2f);
     scene.SpawnSmokeBurst(impact, 3.2f, 3.5f);
     if (g_destruction.IsInitialized())
@@ -4549,6 +4609,394 @@ static void UpdatePrefabLods() {
         batch.model = batch.baseModel;
         for (const PrefabRenderBatch::LodModel& lod : batch.lods)
             if (nearest >= lod.distance) batch.model = lod.model;
+    }
+}
+
+// World-space collision triangles baked from the wreck's mesh. The airframe is
+// static once it is down, so the mesh can be transformed through the world
+// matrix once at impact and collided against directly -- far more faithful than
+// any box approximation, and free per frame beyond the triangle test itself.
+struct BlackHawkCollisionMesh {
+    struct Triangle {
+        XMFLOAT3 a, b, c;
+        XMFLOAT3 normal;   // unit, faces out of the hull
+    };
+    std::vector<Triangle> triangles;
+    XMFLOAT3 boundsMin{}, boundsMax{};
+    // Uniform XZ grid over the bounds. The airframe is ~38k triangles, so
+    // testing them all per frame is far too slow to do while merely standing
+    // next to the wreck; each cell lists only the triangles overlapping it.
+    static constexpr float kCellSize = 1.0f;
+    int cellsX = 0, cellsZ = 0;
+    std::vector<std::vector<int>> cells;
+    bool valid = false;
+
+    void Clear() {
+        triangles.clear();
+        cells.clear();
+        cellsX = cellsZ = 0;
+        valid = false;
+    }
+
+    const std::vector<int>* CellAt(float x, float z) const {
+        if (!valid) return nullptr;
+        const int ix = int((x - boundsMin.x) / kCellSize);
+        const int iz = int((z - boundsMin.z) / kCellSize);
+        if (ix < 0 || iz < 0 || ix >= cellsX || iz >= cellsZ) return nullptr;
+        return &cells[size_t(iz) * cellsX + ix];
+    }
+};
+
+static BlackHawkCollisionMesh g_blackHawkCollisionMesh;
+
+// Walks the model's primitives, transforms every triangle into world space and
+// keeps the ones that can matter to a walking player. Called once, the frame
+// the wreck settles.
+static void BakeBlackHawkCollisionMesh() {
+    g_blackHawkCollisionMesh.Clear();
+    if (!g_blackHawkModel) return;
+
+    const XMMATRIX world = BlackHawkWorldMatrix();
+    XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
+    XMFLOAT3 maximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+
+    // The rotor is skinned and its blades sweep 16 m; collide against the
+    // airframe only, matching what a player can actually walk into.
+    std::function<void(const SceneNode*, const XMMATRIX&)> collect =
+        [&](const SceneNode* node, const XMMATRIX& parentToRoot) {
+        if (!node) return;
+        const XMMATRIX localToRoot =
+            XMLoadFloat4x4(&node->localTransform) * parentToRoot;
+        if (node->mesh) {
+            for (const MeshPrimitive& primitive : node->mesh->primitives) {
+                if (primitive.material &&
+                    (primitive.material->name == "rotor" ||
+                     primitive.material->name == "rotorhead")) continue;
+                if (primitive.vertices.empty()) continue;
+                const XMMATRIX toWorld = localToRoot * world;
+                auto vertexAt = [&](unsigned int index) {
+                    const size_t base = size_t(index) * 12;
+                    XMFLOAT3 out{};
+                    if (base + 2 >= primitive.vertices.size()) return out;
+                    XMStoreFloat3(&out, XMVector3TransformCoord(
+                        XMVectorSet(primitive.vertices[base],
+                                    primitive.vertices[base + 1],
+                                    primitive.vertices[base + 2], 1.0f),
+                        toWorld));
+                    return out;
+                };
+                const size_t indexCount = primitive.indices.size();
+                for (size_t i = 0; i + 2 < indexCount; i += 3) {
+                    BlackHawkCollisionMesh::Triangle triangle;
+                    triangle.a = vertexAt(primitive.indices[i]);
+                    triangle.b = vertexAt(primitive.indices[i + 1]);
+                    triangle.c = vertexAt(primitive.indices[i + 2]);
+                    const XMVECTOR va = XMLoadFloat3(&triangle.a);
+                    const XMVECTOR edge1 = XMLoadFloat3(&triangle.b) - va;
+                    const XMVECTOR edge2 = XMLoadFloat3(&triangle.c) - va;
+                    const XMVECTOR cross = XMVector3Cross(edge1, edge2);
+                    // Drop degenerate slivers: they contribute no surface and
+                    // their normals are numerical noise.
+                    if (XMVectorGetX(XMVector3LengthSq(cross)) < 1e-10f) continue;
+                    XMStoreFloat3(&triangle.normal, XMVector3Normalize(cross));
+                    g_blackHawkCollisionMesh.triangles.push_back(triangle);
+                    for (const XMFLOAT3* point :
+                         { &triangle.a, &triangle.b, &triangle.c }) {
+                        minimum.x = (std::min)(minimum.x, point->x);
+                        minimum.y = (std::min)(minimum.y, point->y);
+                        minimum.z = (std::min)(minimum.z, point->z);
+                        maximum.x = (std::max)(maximum.x, point->x);
+                        maximum.y = (std::max)(maximum.y, point->y);
+                        maximum.z = (std::max)(maximum.z, point->z);
+                    }
+                }
+            }
+        }
+        for (const auto& child : node->children) collect(child.get(), localToRoot);
+    };
+    collect(g_blackHawkModel.get(), XMMatrixIdentity());
+
+    if (g_blackHawkCollisionMesh.triangles.empty()) return;
+    g_blackHawkCollisionMesh.boundsMin = minimum;
+    g_blackHawkCollisionMesh.boundsMax = maximum;
+
+    // Bucket triangles into the XZ grid so a lookup touches a handful instead
+    // of all ~38k. Each triangle goes into every cell its XZ footprint covers.
+    BlackHawkCollisionMesh& mesh = g_blackHawkCollisionMesh;
+    const float spanX = maximum.x - minimum.x;
+    const float spanZ = maximum.z - minimum.z;
+    mesh.cellsX = (std::max)(1, int(spanX / mesh.kCellSize) + 1);
+    mesh.cellsZ = (std::max)(1, int(spanZ / mesh.kCellSize) + 1);
+    mesh.cells.assign(size_t(mesh.cellsX) * mesh.cellsZ, {});
+    for (int index = 0; index < int(mesh.triangles.size()); ++index) {
+        const BlackHawkCollisionMesh::Triangle& triangle = mesh.triangles[index];
+        const float lowX = (std::min)({ triangle.a.x, triangle.b.x, triangle.c.x });
+        const float highX = (std::max)({ triangle.a.x, triangle.b.x, triangle.c.x });
+        const float lowZ = (std::min)({ triangle.a.z, triangle.b.z, triangle.c.z });
+        const float highZ = (std::max)({ triangle.a.z, triangle.b.z, triangle.c.z });
+        const int fromX = (std::max)(0,
+            int((lowX - minimum.x) / mesh.kCellSize));
+        const int toX = (std::min)(mesh.cellsX - 1,
+            int((highX - minimum.x) / mesh.kCellSize));
+        const int fromZ = (std::max)(0,
+            int((lowZ - minimum.z) / mesh.kCellSize));
+        const int toZ = (std::min)(mesh.cellsZ - 1,
+            int((highZ - minimum.z) / mesh.kCellSize));
+        for (int iz = fromZ; iz <= toZ; ++iz)
+            for (int ix = fromX; ix <= toX; ++ix)
+                mesh.cells[size_t(iz) * mesh.cellsX + ix].push_back(index);
+    }
+    mesh.valid = true;
+    std::cout << "BlackHawk wreck collision: " << mesh.triangles.size()
+              << " triangles in " << mesh.cellsX << "x" << mesh.cellsZ
+              << " cells\n";
+}
+
+// Closest point on a triangle to a point, by barycentric region test.
+static XMVECTOR ClosestPointOnTriangle(FXMVECTOR point, FXMVECTOR a,
+                                       FXMVECTOR b, FXMVECTOR c) {
+    const XMVECTOR ab = b - a;
+    const XMVECTOR ac = c - a;
+    const XMVECTOR ap = point - a;
+    const float d1 = XMVectorGetX(XMVector3Dot(ab, ap));
+    const float d2 = XMVectorGetX(XMVector3Dot(ac, ap));
+    if (d1 <= 0.0f && d2 <= 0.0f) return a;
+
+    const XMVECTOR bp = point - b;
+    const float d3 = XMVectorGetX(XMVector3Dot(ab, bp));
+    const float d4 = XMVectorGetX(XMVector3Dot(ac, bp));
+    if (d3 >= 0.0f && d4 <= d3) return b;
+
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f)
+        return a + ab * (d1 / (d1 - d3));
+
+    const XMVECTOR cp = point - c;
+    const float d5 = XMVectorGetX(XMVector3Dot(ab, cp));
+    const float d6 = XMVectorGetX(XMVector3Dot(ac, cp));
+    if (d6 >= 0.0f && d5 <= d6) return c;
+
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f)
+        return a + ac * (d2 / (d2 - d6));
+
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+
+    const float denominator = 1.0f / (va + vb + vc);
+    return a + ab * (vb * denominator) + ac * (vc * denominator);
+}
+
+// One segment of the BlackHawk's collision hull, in the aircraft's own frame:
+// a box spanning [forwardMin, forwardMax] along the nose axis, halfWidth to each
+// side, and [heightMin, heightMax] vertically. Measured off the GLB's body
+// materials (rotor and rotorhead excluded). Used while the bird is airborne,
+// where the mesh moves every frame and baking it would be wasted work.
+struct BlackHawkHullSegment {
+    float forwardMin, forwardMax;
+    float halfWidth;
+    float heightMin, heightMax;
+};
+
+// The airframe is nothing like a box: the cabin bulges to ~2.0 m half-width, the
+// tail boom pinches to ~0.55 m, and the stabilizer flares back out to ~2.5 m.
+// A single box either swallowed the gap under the boom or fenced off open air
+// beside it, which is obvious once a wreck is lying on the ground and walkable.
+// These segments trace the real silhouette instead.
+//
+// The rotor disc is deliberately excluded: it sweeps 16 m and would fence the
+// player out of the whole landing zone.
+static constexpr BlackHawkHullSegment kBlackHawkHull[] = {
+    // Tail fin and stabilizer: tall, narrow, flares wide at the very back.
+    { -10.95f, -9.35f, 2.54f, 0.90f, 3.60f },
+    // Tail boom: thin tube, sits high off the ground.
+    {  -9.35f, -4.70f, 0.60f, 1.05f, 2.35f },
+    // Rear fuselage stepping up into the cabin.
+    {  -4.70f, -1.55f, 1.60f, 0.30f, 3.10f },
+    // Cabin: the widest walkable mass.
+    {  -1.55f,  1.60f, 1.75f, 0.10f, 3.30f },
+    // Cockpit and nose, sponsons included.
+    {   1.60f,  4.70f, 2.00f, 0.15f, 3.05f },
+    // Nose cone tapering off.
+    {   4.70f,  6.25f, 1.25f, 0.35f, 2.45f },
+};
+
+// Blocks the player against the BlackHawk's fuselage, segment by segment. Uses
+// the full roll/pitch/yaw the airframe is drawn with, so a wreck lying on its
+// side blocks along the shape it actually has rather than an upright box.
+// Collides the player capsule against the baked wreck triangles. Runs only for
+// a downed airframe, where the mesh is static and the bake stays valid.
+static void ResolvePlayerBlackHawkMeshCollision(
+        XMFLOAT3& position, float& floorY, float radius, float playerHeight) {
+    const BlackHawkCollisionMesh& mesh = g_blackHawkCollisionMesh;
+    if (!mesh.valid) return;
+
+    // Broad phase against the wreck's bounds, expanded by the capsule.
+    const float feet = position.y - playerHeight;
+    if (position.x + radius < mesh.boundsMin.x ||
+        position.x - radius > mesh.boundsMax.x ||
+        position.z + radius < mesh.boundsMin.z ||
+        position.z - radius > mesh.boundsMax.z ||
+        position.y < mesh.boundsMin.y || feet > mesh.boundsMax.y) return;
+
+    // The player is a vertical capsule from feet to eyes. Iterating a few times
+    // settles contacts that push into one another, e.g. a corner of the hull.
+    constexpr int kIterations = 3;
+    constexpr float kStepHeight = 1.0f / 3.0f;
+    for (int iteration = 0; iteration < kIterations; ++iteration) {
+        bool moved = false;
+        const float segmentBottom = position.y - playerHeight + radius;
+        const float segmentTop = position.y - radius;
+
+        // Gather the cells the capsule's footprint touches, deduplicated.
+        static std::vector<int> candidates;
+        candidates.clear();
+        const int spanCells =
+            int(radius / BlackHawkCollisionMesh::kCellSize) + 1;
+        for (int oz = -spanCells; oz <= spanCells; ++oz) {
+            for (int ox = -spanCells; ox <= spanCells; ++ox) {
+                const std::vector<int>* cell = mesh.CellAt(
+                    position.x + ox * BlackHawkCollisionMesh::kCellSize,
+                    position.z + oz * BlackHawkCollisionMesh::kCellSize);
+                if (cell) candidates.insert(candidates.end(),
+                                            cell->begin(), cell->end());
+            }
+        }
+        if (candidates.empty()) break;
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                         candidates.end());
+
+        for (int triangleIndex : candidates) {
+            const BlackHawkCollisionMesh::Triangle& triangle =
+                mesh.triangles[triangleIndex];
+            // Clamp the capsule's axis to the triangle's height band, then test
+            // the sphere at that height. Cheap stand-in for a full capsule test
+            // and accurate enough at player scale.
+            const float triangleMidY =
+                (triangle.a.y + triangle.b.y + triangle.c.y) / 3.0f;
+            const float sampleY =
+                (std::max)(segmentBottom, (std::min)(segmentTop, triangleMidY));
+            const XMVECTOR centre =
+                XMVectorSet(position.x, sampleY, position.z, 0.0f);
+            const XMVECTOR closest = ClosestPointOnTriangle(
+                centre, XMLoadFloat3(&triangle.a), XMLoadFloat3(&triangle.b),
+                XMLoadFloat3(&triangle.c));
+            const XMVECTOR delta = centre - closest;
+            const float distanceSq = XMVectorGetX(XMVector3LengthSq(delta));
+            if (distanceSq >= radius * radius) continue;
+
+            XMFLOAT3 contact{};
+            XMStoreFloat3(&contact, closest);
+
+            // Walkable surface underfoot: stand on it rather than be pushed.
+            if (triangle.normal.y > 0.5f && contact.y <= feet + kStepHeight &&
+                contact.y >= feet - 0.5f) {
+                floorY = (std::max)(floorY, contact.y);
+                continue;
+            }
+
+            const float distance = std::sqrt((std::max)(distanceSq, 0.0f));
+            XMFLOAT3 push{};
+            if (distance > 1e-4f) {
+                XMStoreFloat3(&push, XMVector3Normalize(delta));
+            } else {
+                // Dead centre on the face: fall back to the surface normal.
+                push = triangle.normal;
+            }
+            const float depth = radius - distance;
+            position.x += push.x * depth;
+            position.z += push.z * depth;
+            moved = true;
+        }
+        if (!moved) break;
+    }
+}
+
+static void ResolvePlayerBlackHawkCollision(
+        XMFLOAT3& position, float& floorY, float radius, float playerHeight) {
+    const VehicleSystem& vehicles = g_game.vehicles;
+    if (!vehicles.blackHawkVisible || vehicles.blackHawkCarryingPlayer) return;
+
+    // Down and static: collide against the real mesh instead of the boxes.
+    if (vehicles.BlackHawkIsDown() && g_blackHawkCollisionMesh.valid) {
+        ResolvePlayerBlackHawkMeshCollision(position, floorY, radius,
+                                            playerHeight);
+        return;
+    }
+
+    // Cheap reject: the hull never reaches beyond ~11 m from the origin.
+    const float toX = position.x - vehicles.blackHawkPosition.x;
+    const float toZ = position.z - vehicles.blackHawkPosition.z;
+    const float toY = position.y - vehicles.blackHawkPosition.y;
+    if (toX * toX + toY * toY + toZ * toZ > 14.0f * 14.0f) return;
+
+    // Into the aircraft's frame. Inverse of the same roll/pitch/yaw the world
+    // matrix applies, so the collider tracks the wreck's final attitude.
+    const XMMATRIX orientation = XMMatrixRotationRollPitchYaw(
+        vehicles.blackHawkPitch, vehicles.blackHawkYaw, vehicles.blackHawkRoll);
+    const XMMATRIX toLocal = XMMatrixTranspose(orientation); // pure rotation
+    XMFLOAT3 local{};
+    XMStoreFloat3(&local, XMVector3TransformNormal(
+        XMVectorSet(toX, toY, toZ, 0.0f), toLocal));
+
+    // The player is a capsule; approximate it in local space as a sphere at the
+    // body's mid height so a tilted wreck still blocks the whole body.
+    const float halfBody = playerHeight * 0.5f;
+    const float feetWorld = position.y - playerHeight;
+
+    for (const BlackHawkHullSegment& segment : kBlackHawkHull) {
+        // Nearest point on this segment's box, in local space.
+        const float centreForward =
+            (segment.forwardMin + segment.forwardMax) * 0.5f;
+        const float halfForward =
+            (segment.forwardMax - segment.forwardMin) * 0.5f;
+        const float centreHeight =
+            (segment.heightMin + segment.heightMax) * 0.5f;
+        const float halfHeight =
+            (segment.heightMax - segment.heightMin) * 0.5f;
+
+        const float dForward = local.z - centreForward;
+        const float dRight = local.x;
+        const float dUp = local.y - centreHeight;
+
+        const float overForward = halfForward + radius - std::abs(dForward);
+        const float overRight = segment.halfWidth + radius - std::abs(dRight);
+        const float overUp = halfHeight + halfBody - std::abs(dUp);
+        if (overForward <= 0.0f || overRight <= 0.0f || overUp <= 0.0f) continue;
+
+        // Standing on top of this segment: hold the player up instead of
+        // shoving them out. Only meaningful while the hull is roughly level.
+        constexpr float kStepHeight = 1.0f / 3.0f;
+        const float segmentTopWorld =
+            vehicles.blackHawkPosition.y + segment.heightMax;
+        const bool level = std::abs(vehicles.blackHawkPitch) < 0.5f &&
+                           std::abs(vehicles.blackHawkRoll) < 0.5f;
+        if (level && segmentTopWorld <= feetWorld + kStepHeight &&
+            segmentTopWorld >= feetWorld - 0.30f) {
+            floorY = (std::max)(floorY, segmentTopWorld);
+            continue;
+        }
+
+        // Push out along the least-penetrated axis so the player slides along
+        // the hull rather than popping through or over it.
+        XMFLOAT3 pushLocal{ 0.0f, 0.0f, 0.0f };
+        if (overRight <= overForward && overRight <= overUp)
+            pushLocal.x = dRight >= 0.0f ? overRight : -overRight;
+        else if (overUp <= overForward)
+            pushLocal.y = dUp >= 0.0f ? overUp : -overUp;
+        else
+            pushLocal.z = dForward >= 0.0f ? overForward : -overForward;
+
+        XMFLOAT3 pushWorld{};
+        XMStoreFloat3(&pushWorld, XMVector3TransformNormal(
+            XMLoadFloat3(&pushLocal), orientation));
+        position.x += pushWorld.x;
+        position.z += pushWorld.z;
+        // Vertical push only lifts; dropping the player is gravity's job.
+        if (pushWorld.y > 0.0f)
+            floorY = (std::max)(floorY, position.y - playerHeight + pushWorld.y);
     }
 }
 
@@ -8906,6 +9354,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 0.35f, scene.camera.PlayerHeight);
             ResolvePlayerPrefabCollisions(scene.camera.Position, 0.35f,
                                           scene.camera.PlayerHeight);
+            if (!g_emptyLevelMode)
+                ResolvePlayerBlackHawkCollision(
+                    scene.camera.Position, scene.camera.FloorY,
+                    0.35f, scene.camera.PlayerHeight);
         }
 
         scene.Update(deltaTime, now);
@@ -8989,8 +9441,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 scene.impactParticles.push_back(particle);
             }
         }
+        // Riding a vehicle moves the camera without the player taking a step,
+        // and the tracker measures raw camera displacement -- left enabled, the
+        // insertion flight reads as a full sprint and plays the run animation.
+        const bool carriedByVehicle =
+            g_drivingHumvee || g_game.vehicles.blackHawkCarryingPlayer;
         const float playerHorizontalSpeed = g_game.playerMovement.Update(
-            scene.ViewmodelAnchorPosition(), deltaTime, !g_drivingHumvee);
+            scene.ViewmodelAnchorPosition(), deltaTime, !carriedByVehicle);
         ArmsModel::Update(deltaTime, playerHorizontalSpeed, scene.adsBlend);
         if (!g_emptyLevelMode) {
             UpdateHelicopter(deltaTime);
@@ -9008,6 +9465,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_blackHawkInsertionRestartPending = false;
                 StartBlackHawkInsertionAtPlayerSpawn();
                 armedInsertionThisFrame = true;
+                // The old wreck's triangles describe a helicopter that no
+                // longer exists; drop them so the fresh run is not blocked by
+                // the ghost of the previous crash.
+                g_blackHawkCollisionMesh.Clear();
             }
             // Terrain under the wreck, so it stops on the actual ground rather
             // than the drop-off's elevation. Sampled before the update so the
