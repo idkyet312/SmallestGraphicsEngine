@@ -161,6 +161,17 @@ public:
             child->UpdateGlobalTransform(globalTransform, depth + 1);
         }
     }
+
+    // Recomputes this subtree treating the node as its own root. Prefer this to
+    // UpdateGlobalTransform(self->localTransform): that idiom passes the node's
+    // own local as if it were the parent's global, so the local transform gets
+    // applied twice and every child inherits the doubled basis. It only looks
+    // harmless because most importer roots happen to be identity.
+    void RefreshHierarchy() {
+        DirectX::XMFLOAT4X4 identity;
+        DirectX::XMStoreFloat4x4(&identity, DirectX::XMMatrixIdentity());
+        UpdateGlobalTransform(identity);
+    }
 };
 
 class SceneGraph {

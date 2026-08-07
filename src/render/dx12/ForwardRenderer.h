@@ -80,6 +80,10 @@ DirectX::XMMATRIX HelicopterWorldMatrix();
 DirectX::XMMATRIX SecondaryHelicopterWorldMatrix();
 DirectX::XMMATRIX BoatWorldMatrix();
 DirectX::XMMATRIX BlackHawkWorldMatrix();
+// False once the insertion helicopter has climbed out of sight.
+bool BlackHawkVisible();
+// Uploads this frame's rotor bone palette; 0 when the model carries no rig.
+D3D12_GPU_VIRTUAL_ADDRESS UploadBlackHawkPalette();
 
 struct GeometryBuffers {
     ComPtr<ID3D12Resource>   cubeVertexBuffer;
@@ -706,7 +710,8 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
                               const XMMATRIX& worldTransform,
                               const XMMATRIX& view, const XMMATRIX& proj,
                               const XMMATRIX& lightSpace,
-                              bool visibilityExtensionsOnly) {
+                              bool visibilityExtensionsOnly,
+                              D3D12_GPU_VIRTUAL_ADDRESS bonePalette = 0) {
     if (!node) return;
 
     if (node->mesh) {
@@ -759,19 +764,40 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
                 shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
             }
 
+            // Skinned primitives pose on the GPU from the bone palette. Their
+            // meshlet bounds are bind-pose, so occlusion culling would reject
+            // blades that have swung away from where the bounds say they are.
+            const D3D12_GPU_VIRTUAL_ADDRESS skinAddress =
+                (bonePalette && prim.skinBuffer)
+                    ? prim.skinBuffer->GetGPUVirtualAddress() : 0;
+            const bool skinned = bonePalette && skinAddress;
+
             if (meshShaderDraw) {
                 g_meshShader.Draw(prim.vbv,
                     (UINT)(prim.vertices.size() / 12), prim.indexCount,
                     prim.meshletCount, meshletDescAddress, boundsAddress,
                     vertexIndexAddress, triangleAddress,
-                    0, 0, prim.material && prim.material->doubleSided,
-                    !prim.material || !prim.material->disableOcclusionCulling);
+                    skinned ? bonePalette : 0, skinAddress,
+                    prim.material && prim.material->doubleSided,
+                    !skinned &&
+                        (!prim.material || !prim.material->disableOcclusionCulling));
             } else {
                 // A previous mesh draw leaves the mesh PSO bound. Restore the
                 // conventional VS/PS pipeline before issuing IA draw calls.
                 g_dx12.commandList->SetPipelineState(transparent
                     ? shader.GetTransparentPipelineState()
                     : shader.GetPipelineState(false));
+                // The IA vertex shader skins from the same palette/skin SRVs as
+                // the mesh path, so skinned models still turn on hardware
+                // without mesh shader support. Written on every IA draw, not
+                // just skinned ones, so the flag never leaks into the next mesh.
+                shader.SetSkinningEnabled(skinned);
+                if (skinned) {
+                    g_dx12.commandList->SetGraphicsRootShaderResourceView(
+                        16, bonePalette);
+                    g_dx12.commandList->SetGraphicsRootShaderResourceView(
+                        17, skinAddress);
+                }
                 g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
                 g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 if (prim.ibv.BufferLocation != 0) {
@@ -793,21 +819,22 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node,
                           const XMMATRIX& worldTransform,
                           const XMMATRIX& view, const XMMATRIX& proj,
                           const XMMATRIX& lightSpace,
-                          bool visibilityExtensionsOnly = false) {
+                          bool visibilityExtensionsOnly = false,
+                          D3D12_GPU_VIRTUAL_ADDRESS bonePalette = 0) {
     if (!node) return;
     if (visibilityExtensionsOnly) {
         const std::vector<SceneNode*>& extensionNodes =
             GetForwardExtensionNodes(node);
         for (SceneNode* extensionNode : extensionNodes)
             DrawSceneNodeMesh(extensionNode, shader, worldTransform, view,
-                proj, lightSpace, true);
+                proj, lightSpace, true, bonePalette);
         return;
     }
     DrawSceneNodeMesh(node.get(), shader, worldTransform, view, proj,
-        lightSpace, false);
+        lightSpace, false, bonePalette);
     for (const std::shared_ptr<SceneNode>& child : node->children)
         DrawSceneNode(child, shader, worldTransform, view, proj, lightSpace,
-            false);
+            false, bonePalette);
 }
 
 // Spear.glb is authored two metres long on +Z, with its point at z=0.7973 and
@@ -1482,10 +1509,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 view, proj, lightSpace);
     }
 
-    // Descends every frame until touchdown, so it never joins the static batch.
-    if (!g_emptyLevelMode && g_blackHawkModel) {
+    // Flies its insertion every frame, so it never joins the static batch. The
+    // bone palette spins its rotor.
+    if (!g_emptyLevelMode && g_blackHawkModel && BlackHawkVisible()) {
         DrawSceneNode(g_blackHawkModel, shader, BlackHawkWorldMatrix(),
-            view, proj, lightSpace, visibilityExtensionsOnly);
+            view, proj, lightSpace, visibilityExtensionsOnly,
+            UploadBlackHawkPalette());
     }
 
     for (const PrefabRenderBatch& batch : prefabRenderBatches) {

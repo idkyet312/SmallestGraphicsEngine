@@ -4,6 +4,7 @@
 #include <vector>
 #include <array>
 #include "SceneGraph.h"
+#include "SkinnedTypes.h"
 #include <d3d12.h>
 #include <wrl/client.h>
 #include <DirectXMath.h>
@@ -18,6 +19,17 @@ struct HDRISunLight {
 class GLBImporter {
 public:
     static std::shared_ptr<SceneNode> LoadGLB(const std::string& filepath, Microsoft::WRL::ComPtr<ID3D12Device> device, Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList);
+
+    // Same load, but also fills a Skeleton from the file's first glTF skin (bone
+    // names, parents, inverse-bind matrices and bind-pose locals). Primitives
+    // carrying JOINTS_0/WEIGHTS_0 get their skin buffers either way; this is
+    // what a caller needs to drive them, since posing requires the hierarchy.
+    // outSkeleton is left empty for unskinned files.
+    static std::shared_ptr<SceneNode> LoadGLBSkinned(
+        const std::string& filepath,
+        Microsoft::WRL::ComPtr<ID3D12Device> device,
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
+        Skeleton& outSkeleton);
     static Microsoft::WRL::ComPtr<ID3D12Resource> LoadTextureFromFile(const std::string& filepath, Microsoft::WRL::ComPtr<ID3D12Device> device, Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& uploadHeaps);
     static Microsoft::WRL::ComPtr<ID3D12Resource> LoadTextureFromMemory(
         const unsigned char* data, size_t size,
@@ -92,4 +104,13 @@ public:
     static bool LoadPixelsRGBAFromMemory(const unsigned char* data, size_t size,
                                          std::vector<unsigned char>& outRGBA,
                                          int& outWidth, int& outHeight);
+
+private:
+    // Shared body of LoadGLB/LoadGLBSkinned. outSkeleton is null for the plain
+    // static load, which also lets that path use the cooked asset cache.
+    static std::shared_ptr<SceneNode> LoadGLBInternal(
+        const std::string& filepath,
+        Microsoft::WRL::ComPtr<ID3D12Device> device,
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
+        Skeleton* outSkeleton);
 };

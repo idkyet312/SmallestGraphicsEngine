@@ -456,7 +456,7 @@ public:
         // 6: Descriptor table - Global SRVs (t0, t2, t3)
         // 7: Descriptor table - Material SRVs (t1, t4, t5)
         
-        D3D12_ROOT_PARAMETER rootParams[20] = {};
+        D3D12_ROOT_PARAMETER rootParams[21] = {};
         
         // CBVs (root descriptors)
         for (int i = 0; i < 6; i++) {
@@ -602,6 +602,18 @@ public:
         rootParams[19].Descriptor.RegisterSpace = 0;
         rootParams[19].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+        // Skinning toggle for the IA raster path (b9). This gets its own root
+        // parameter on purpose: b6 is shared by grass, terrain, instancing and
+        // the mesh shader, each writing a different struct, so a flag read from
+        // there picks up whatever that pass happened to store -- grass puts a
+        // world coordinate in that slot, which reads as "skinning on" and
+        // shreds every static mesh drawn afterwards.
+        rootParams[20].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rootParams[20].Constants.ShaderRegister = 9;
+        rootParams[20].Constants.RegisterSpace = 0;
+        rootParams[20].Constants.Num32BitValues = 1;
+        rootParams[20].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
         // Static samplers
         D3D12_STATIC_SAMPLER_DESC staticSamplers[2] = {};
         
@@ -633,7 +645,7 @@ public:
         staticSamplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        rootSigDesc.NumParameters = 20;
+        rootSigDesc.NumParameters = 21;
         rootSigDesc.pParameters = rootParams;
         rootSigDesc.NumStaticSamplers = 2;
         rootSigDesc.pStaticSamplers = staticSamplers;
@@ -961,6 +973,15 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(g_dx12.frameIndex));
         g_dx12.commandList->SetGraphicsRootConstantBufferView(19,
             shadowCascadeBuffer.GetGPUAddress(g_dx12.frameIndex));
+    }
+
+    // Toggles GPU skinning for the conventional IA vertex shader (b9). Every IA
+    // draw must set this explicitly -- root constants persist across draws, so
+    // leaving it unwritten lets a skinned mesh's flag carry over to the next
+    // static one, which would then pose against a stale palette.
+    void SetSkinningEnabled(bool enabled) {
+        const UINT value = enabled ? 1u : 0u;
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(20, 1, &value, 0);
     }
 
     void UseTransparent() {

@@ -44,6 +44,77 @@ void CopyBufferData(const tinygltf::Model& model, int accessorIndex, std::vector
     }
 }
 
+// Reads a JOINTS_n accessor. glTF allows unsigned byte or short here, and the
+// two show up interchangeably depending on the exporter, so both are widened to
+// the uint32 the SkinVertex palette index expects.
+static void CopyJointIndices(const tinygltf::Model& model, int accessorIndex,
+                             std::vector<std::array<uint32_t, 4>>& outData) {
+    if (accessorIndex < 0) return;
+    const tinygltf::Accessor& accessor = model.accessors[accessorIndex];
+    if (accessor.bufferView < 0) return;
+    const tinygltf::BufferView& bufferView = model.bufferViews[accessor.bufferView];
+    const tinygltf::Buffer& buffer = model.buffers[bufferView.buffer];
+
+    const unsigned char* dataStart =
+        &buffer.data[bufferView.byteOffset + accessor.byteOffset];
+    const size_t dataStep = accessor.ByteStride(bufferView);
+
+    outData.reserve(accessor.count);
+    for (size_t i = 0; i < accessor.count; i++) {
+        const unsigned char* element = dataStart + i * dataStep;
+        std::array<uint32_t, 4> joints{ 0, 0, 0, 0 };
+        for (int c = 0; c < 4; c++) {
+            if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
+                joints[c] = element[c];
+            } else if (accessor.componentType ==
+                       TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
+                unsigned short value = 0;
+                memcpy(&value, element + c * sizeof(unsigned short),
+                       sizeof(value));
+                joints[c] = value;
+            }
+        }
+        outData.push_back(joints);
+    }
+}
+
+// Reads a WEIGHTS_n accessor. Floats are the common case; the normalized
+// integer forms are also legal and are scaled back into 0..1 here.
+static void CopyJointWeights(const tinygltf::Model& model, int accessorIndex,
+                             std::vector<DirectX::XMFLOAT4>& outData) {
+    if (accessorIndex < 0) return;
+    const tinygltf::Accessor& accessor = model.accessors[accessorIndex];
+    if (accessor.bufferView < 0) return;
+    const tinygltf::BufferView& bufferView = model.bufferViews[accessor.bufferView];
+    const tinygltf::Buffer& buffer = model.buffers[bufferView.buffer];
+
+    const unsigned char* dataStart =
+        &buffer.data[bufferView.byteOffset + accessor.byteOffset];
+    const size_t dataStep = accessor.ByteStride(bufferView);
+
+    outData.reserve(accessor.count);
+    for (size_t i = 0; i < accessor.count; i++) {
+        const unsigned char* element = dataStart + i * dataStep;
+        float weights[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (int c = 0; c < 4; c++) {
+            if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
+                memcpy(&weights[c], element + c * sizeof(float), sizeof(float));
+            } else if (accessor.componentType ==
+                       TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
+                weights[c] = element[c] / 255.0f;
+            } else if (accessor.componentType ==
+                       TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
+                unsigned short value = 0;
+                memcpy(&value, element + c * sizeof(unsigned short),
+                       sizeof(value));
+                weights[c] = value / 65535.0f;
+            }
+        }
+        outData.push_back(
+            DirectX::XMFLOAT4(weights[0], weights[1], weights[2], weights[3]));
+    }
+}
+
 static DirectX::XMFLOAT3 Add3(const DirectX::XMFLOAT3& a, const DirectX::XMFLOAT3& b) {
     return DirectX::XMFLOAT3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
@@ -737,17 +808,27 @@ std::shared_ptr<SceneMesh> ProcessMesh(const tinygltf::Model& model, const tinyg
             texIdx = primitive.attributes.at("TEXCOORD_0");
         if (primitive.attributes.find("TANGENT") != primitive.attributes.end())
             tangentIdx = primitive.attributes.at("TANGENT");
-            
+        int jointsIdx = -1;
+        int weightsIdx = -1;
+        if (primitive.attributes.find("JOINTS_0") != primitive.attributes.end())
+            jointsIdx = primitive.attributes.at("JOINTS_0");
+        if (primitive.attributes.find("WEIGHTS_0") != primitive.attributes.end())
+            weightsIdx = primitive.attributes.at("WEIGHTS_0");
+
         // Extract data
         std::vector<XMFLOAT3> positions;
         std::vector<XMFLOAT3> normals;
         std::vector<XMFLOAT2> texCoords;
         std::vector<XMFLOAT4> tangents;
-        
+        std::vector<std::array<uint32_t, 4>> jointIndices;
+        std::vector<XMFLOAT4> jointWeights;
+
         if (posIdx >= 0) CopyBufferData(model, posIdx, positions);
         if (normIdx >= 0) CopyBufferData(model, normIdx, normals);
         if (texIdx >= 0) CopyBufferData(model, texIdx, texCoords);
         if (tangentIdx >= 0) CopyBufferData(model, tangentIdx, tangents);
+        CopyJointIndices(model, jointsIdx, jointIndices);
+        CopyJointWeights(model, weightsIdx, jointWeights);
         
         // Resize to match positions
         if (normals.empty() && !positions.empty()) normals.resize(positions.size(), XMFLOAT3(0, 1, 0));
@@ -798,7 +879,31 @@ std::shared_ptr<SceneMesh> ProcessMesh(const tinygltf::Model& model, const tinyg
             meshPrim.vertices.push_back(tangents[i].z);
             meshPrim.vertices.push_back(tangents[i].w);
         }
-        
+
+        // Per-vertex skin attributes, parallel to the interleaved stream above.
+        // Weights are renormalized: exporters often leave them summing slightly
+        // off 1, which would shrink or inflate the skinned mesh.
+        if (!jointIndices.empty() && jointIndices.size() == positions.size() &&
+            jointWeights.size() == positions.size()) {
+            meshPrim.skin.resize(positions.size());
+            for (size_t i = 0; i < positions.size(); i++) {
+                SkinVertex& vertex = meshPrim.skin[i];
+                const float weights[4] = {
+                    jointWeights[i].x, jointWeights[i].y,
+                    jointWeights[i].z, jointWeights[i].w };
+                float total = 0.0f;
+                for (int c = 0; c < 4; c++) total += weights[c];
+                for (int c = 0; c < 4; c++) {
+                    vertex.boneIndex[c] = jointIndices[i][c];
+                    vertex.boneWeight[c] =
+                        total > 1e-6f ? weights[c] / total : 0.0f;
+                }
+                // A vertex with no influences would collapse to the origin, so
+                // pin it to its first joint at full weight instead.
+                if (total <= 1e-6f) vertex.boneWeight[0] = 1.0f;
+            }
+        }
+
         meshPrim.indexCount = (UINT)meshPrim.indices.size();
         
         // Create Buffers (Upload Heap for simplicity)
@@ -858,6 +963,29 @@ std::shared_ptr<SceneMesh> ProcessMesh(const tinygltf::Model& model, const tinyg
                     meshPrim.ibv.Format = DXGI_FORMAT_R32_UINT;
                 }
             }
+
+            // Skin Buffer: the StructuredBuffer<SkinVertex> the vertex and mesh
+            // shaders read at t13. skinVertexCount is what marks the primitive
+            // as skinned, so it is only set once the upload succeeds.
+            if (!meshPrim.skin.empty()) {
+                UINT skinSize = (UINT)(meshPrim.skin.size() * sizeof(SkinVertex));
+                bufferDesc.Width = skinSize;
+
+                hr = device->CreateCommittedResource(
+                    &heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    IID_PPV_ARGS(&meshPrim.skinBuffer));
+
+                if (SUCCEEDED(hr)) {
+                    void* mappedData;
+                    meshPrim.skinBuffer->Map(0, nullptr, &mappedData);
+                    memcpy(mappedData, meshPrim.skin.data(), skinSize);
+                    meshPrim.skinBuffer->Unmap(0, nullptr);
+                    meshPrim.skinVertexCount = (UINT)meshPrim.skin.size();
+                } else {
+                    meshPrim.skinBuffer.Reset();
+                }
+            }
         }
         
         sceneMesh->primitives.push_back(meshPrim);
@@ -901,8 +1029,110 @@ void ProcessNode(const tinygltf::Model& model, int nodeIndex, SceneNode* parentN
     }
 }
 
+// Builds a Skeleton from a glTF skin. Bone ids follow the skin's joint order,
+// which is also the order JOINTS_0 indexes into, so the palette the shader
+// reads lines up with the per-vertex indices without any remapping.
+static void BuildSkeletonFromSkin(const tinygltf::Model& model,
+                                  const tinygltf::Skin& skin,
+                                  Skeleton& outSkeleton) {
+    const size_t boneCount = skin.joints.size();
+    if (boneCount == 0) return;
+
+    outSkeleton.names.resize(boneCount);
+    outSkeleton.parent.assign(boneCount, -1);
+    outSkeleton.offset.resize(boneCount);
+    outSkeleton.localBind.resize(boneCount);
+    XMStoreFloat4x4(&outSkeleton.globalInverse, XMMatrixIdentity());
+
+    // glTF node index -> bone id, so parent links can be resolved below.
+    std::unordered_map<int, int> nodeToBone;
+    for (size_t bone = 0; bone < boneCount; bone++)
+        nodeToBone[skin.joints[bone]] = (int)bone;
+
+    // Inverse-bind matrices are optional; identity is the spec's default.
+    std::vector<XMFLOAT4X4> inverseBind(boneCount);
+    for (auto& matrix : inverseBind) XMStoreFloat4x4(&matrix, XMMatrixIdentity());
+    if (skin.inverseBindMatrices >= 0) {
+        const tinygltf::Accessor& accessor =
+            model.accessors[skin.inverseBindMatrices];
+        if (accessor.bufferView >= 0) {
+            const tinygltf::BufferView& bufferView =
+                model.bufferViews[accessor.bufferView];
+            const tinygltf::Buffer& buffer = model.buffers[bufferView.buffer];
+            const unsigned char* dataStart =
+                &buffer.data[bufferView.byteOffset + accessor.byteOffset];
+            const size_t dataStep = accessor.ByteStride(bufferView);
+            const size_t available = (std::min)(boneCount, accessor.count);
+            for (size_t bone = 0; bone < available; bone++)
+                memcpy(&inverseBind[bone], dataStart + bone * dataStep,
+                       sizeof(XMFLOAT4X4));
+        }
+    }
+
+    for (size_t bone = 0; bone < boneCount; bone++) {
+        const int nodeIndex = skin.joints[bone];
+        const tinygltf::Node& node = model.nodes[nodeIndex];
+        outSkeleton.names[bone] = node.name;
+        outSkeleton.index[node.name] = (int)bone;
+        outSkeleton.offset[bone] = inverseBind[bone];
+
+        // Bind-pose local transform, from TRS or an explicit matrix.
+        XMMATRIX local = XMMatrixIdentity();
+        if (node.matrix.size() == 16) {
+            XMFLOAT4X4 matrix{};
+            for (int e = 0; e < 16; e++)
+                (&matrix._11)[e] = (float)node.matrix[e];
+            local = XMLoadFloat4x4(&matrix);
+        } else {
+            const XMVECTOR translation = node.translation.size() == 3
+                ? XMVectorSet((float)node.translation[0],
+                              (float)node.translation[1],
+                              (float)node.translation[2], 0.0f)
+                : XMVectorZero();
+            const XMVECTOR rotation = node.rotation.size() == 4
+                ? XMVectorSet((float)node.rotation[0], (float)node.rotation[1],
+                              (float)node.rotation[2], (float)node.rotation[3])
+                : XMQuaternionIdentity();
+            const XMVECTOR scale = node.scale.size() == 3
+                ? XMVectorSet((float)node.scale[0], (float)node.scale[1],
+                              (float)node.scale[2], 0.0f)
+                : XMVectorSplatOne();
+            local = XMMatrixAffineTransformation(scale, XMVectorZero(), rotation,
+                                                 translation);
+        }
+        XMStoreFloat4x4(&outSkeleton.localBind[bone], local);
+    }
+
+    // Parent links: a joint's parent is the nearest ancestor that is also a
+    // joint. Joints whose parent sits outside the skin stay roots (-1).
+    for (size_t node = 0; node < model.nodes.size(); node++) {
+        auto parentBone = nodeToBone.find((int)node);
+        for (int childNode : model.nodes[node].children) {
+            auto childBone = nodeToBone.find(childNode);
+            if (childBone == nodeToBone.end()) continue;
+            if (parentBone != nodeToBone.end())
+                outSkeleton.parent[childBone->second] = parentBone->second;
+        }
+    }
+}
+
+std::shared_ptr<SceneNode> GLBImporter::LoadGLBSkinned(
+    const std::string& filepath, ComPtr<ID3D12Device> device,
+    ComPtr<ID3D12GraphicsCommandList> commandList, Skeleton& outSkeleton) {
+    outSkeleton = Skeleton{};
+    return LoadGLBInternal(filepath, device, commandList, &outSkeleton);
+}
+
 std::shared_ptr<SceneNode> GLBImporter::LoadGLB(const std::string& filepath, ComPtr<ID3D12Device> device, ComPtr<ID3D12GraphicsCommandList> commandList) {
-    if (device) {
+    return LoadGLBInternal(filepath, device, commandList, nullptr);
+}
+
+std::shared_ptr<SceneNode> GLBImporter::LoadGLBInternal(
+    const std::string& filepath, ComPtr<ID3D12Device> device,
+    ComPtr<ID3D12GraphicsCommandList> commandList, Skeleton* outSkeleton) {
+    // The cooked cache stores baked static geometry only, so a caller asking
+    // for a skeleton has to go through the source glTF.
+    if (device && !outSkeleton) {
         if (auto cooked = CookedAssetLoader::LoadForSource(
                 filepath, device, commandList)) {
             std::cout << "Loaded cooked model: "
@@ -988,6 +1218,9 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLB(const std::string& filepath, Com
 
     // Initial update
     rootNode->UpdateGlobalTransform(rootNode->localTransform);
+
+    if (outSkeleton && !model.skins.empty())
+        BuildSkeletonFromSkin(model, model.skins[0], *outSkeleton);
 
     return rootNode;
 }

@@ -374,7 +374,8 @@ public:
 inline void DrawSceneNodeShadow(const std::shared_ptr<SceneNode>& node,
                                 DepthOnlyShaderDX12& shader,
                                 const XMMATRIX& worldTransform,
-                                const XMMATRIX& lightSpace) {
+                                const XMMATRIX& lightSpace,
+                                D3D12_GPU_VIRTUAL_ADDRESS bonePalette = 0) {
     if (!node) return;
 
     if (node->mesh) {
@@ -384,6 +385,13 @@ inline void DrawSceneNodeShadow(const std::shared_ptr<SceneNode>& node,
         for (const auto& prim : node->mesh->primitives) {
             if (prim.vbv.BufferLocation == 0) continue;
             if (prim.material && prim.material->baseColorFactor.w < 0.5f) continue;
+
+            // Pose the shadow from the same palette as the colour pass, so a
+            // spinning rotor casts a spinning shadow instead of a frozen one.
+            shader.SetSkinning(
+                (bonePalette && prim.skinBuffer) ? bonePalette : 0,
+                (bonePalette && prim.skinBuffer)
+                    ? prim.skinBuffer->GetGPUVirtualAddress() : 0);
 
             g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
             g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -399,7 +407,8 @@ inline void DrawSceneNodeShadow(const std::shared_ptr<SceneNode>& node,
     }
 
     for (auto& child : node->children) {
-        DrawSceneNodeShadow(child, shader, worldTransform, lightSpace);
+        DrawSceneNodeShadow(child, shader, worldTransform, lightSpace,
+                            bonePalette);
     }
 }
 
@@ -701,11 +710,11 @@ public:
                 depthShader, boatTransforms, lightSpace);
         }
 
-        if (!g_emptyLevelMode && g_blackHawkModel) {
-            std::vector<XMMATRIX> blackHawkTransforms = { BlackHawkWorldMatrix() };
-            DrawSceneNodeShadowInstances(
-                g_blackHawkShadowModel ? g_blackHawkShadowModel : g_blackHawkModel,
-                depthShader, blackHawkTransforms, lightSpace);
+        if (!g_emptyLevelMode && g_blackHawkModel && BlackHawkVisible()) {
+            // Skinned, so it takes the per-node path with the rotor palette
+            // rather than the instanced fast path.
+            DrawSceneNodeShadow(g_blackHawkModel, depthShader,
+                BlackHawkWorldMatrix(), lightSpace, UploadBlackHawkPalette());
         }
 
         for (const PrefabRenderBatch& batch : prefabRenderBatches) {

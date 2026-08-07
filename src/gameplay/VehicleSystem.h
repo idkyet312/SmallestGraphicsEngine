@@ -69,42 +69,185 @@ struct VehicleSystem {
     bool boatSunk = false;
     float boatSinkDepth = 0.0f;
 
-    // BlackHawk: starts hovering high above the map centre on level start and
-    // descends under its own power until it touches down, then idles on the
-    // ground. Purely scripted -- it carries no health or damage state.
+    // BlackHawk: flies the player in at level start. It comes in level and fast
+    // from a point offset from the player spawn, flares into a hover over the
+    // spawn, sets down, holds long enough to drop the player off, then pulls
+    // pitch and leaves. Purely scripted -- it carries no health or damage state.
+    enum class BlackHawkPhase { Inbound, Descending, Unloading, Departing, Gone };
+
     static constexpr float BlackHawkStartHeight = 90.0f;
     static constexpr float BlackHawkDescentSpeed = 6.5f;
+    // Where the approach begins relative to the drop-off point, and how fast it
+    // covers that ground.
+    static constexpr float BlackHawkApproachDistance = 220.0f;
+    static constexpr float BlackHawkApproachHeight = 55.0f;
+    static constexpr float BlackHawkApproachSpeed = 42.0f;
+    // Radius inside which the approach is considered finished and the descent
+    // takes over.
+    static constexpr float BlackHawkHoverRadius = 1.5f;
+    // Seconds spent on the ground with the doors open before lifting off.
+    static constexpr float BlackHawkUnloadTime = 3.0f;
+    static constexpr float BlackHawkDepartSpeed = 18.0f;
+    // Height above the drop-off point at which the bird stops being drawn.
+    static constexpr float BlackHawkDepartHeight = 140.0f;
+
     DirectX::XMFLOAT3 blackHawkModelCenter{};
     float blackHawkModelMinY = 0.0f;
     float blackHawkModelScale = 1.0f;
     DirectX::XMFLOAT3 blackHawkPosition{ 0.0f, BlackHawkStartHeight, 0.0f };
+    // Drop-off point: the player spawn, projected onto the terrain.
+    DirectX::XMFLOAT3 blackHawkDropOff{ 0.0f, 0.0f, 0.0f };
     float blackHawkGroundY = 0.0f;
     float blackHawkYaw = 0.0f;
+    float blackHawkPitch = 0.0f;
+    float blackHawkRoll = 0.0f;
     float blackHawkRotorSpin = 0.0f;
+    float blackHawkUnloadTimer = 0.0f;
+    BlackHawkPhase blackHawkPhase = BlackHawkPhase::Inbound;
     bool blackHawkLanded = false;
+    // Set for the single frame the skids touch down, so the caller can release
+    // the player at the drop-off point.
+    bool blackHawkDroppedPlayer = false;
+    bool blackHawkVisible = true;
+    // True while the player is riding in the cabin, before the drop-off.
+    bool blackHawkCarryingPlayer = false;
 
-    // Descends toward groundY, easing out over the last few metres so the
-    // touchdown reads as a controlled landing rather than a drop.
+    // Where the player's eyes sit while riding, in the helicopter's local
+    // frame: back from the nose, off to the port door, seated height.
+    static constexpr float BlackHawkSeatSide = -1.6f;
+    static constexpr float BlackHawkSeatForward = 0.4f;
+    static constexpr float BlackHawkSeatHeight = 2.1f;
+
+    // Eye position for the riding player, given the current pose.
+    DirectX::XMFLOAT3 BlackHawkSeatPosition() const {
+        const float sinYaw = std::sin(blackHawkYaw);
+        const float cosYaw = std::cos(blackHawkYaw);
+        // Forward is (sin, cos); right is (cos, -sin).
+        return {
+            blackHawkPosition.x + sinYaw * BlackHawkSeatForward
+                                + cosYaw * BlackHawkSeatSide,
+            blackHawkPosition.y + BlackHawkSeatHeight,
+            blackHawkPosition.z + cosYaw * BlackHawkSeatForward
+                                - sinYaw * BlackHawkSeatSide };
+    }
+
+    // Places the drop-off at the player spawn and parks the helicopter at the
+    // start of its approach run, inbound on the given heading (radians, the
+    // direction it flies toward).
+    void BeginBlackHawkInsertion(const DirectX::XMFLOAT3& dropOff,
+                                 float groundY, float approachHeading) {
+        blackHawkDropOff = dropOff;
+        blackHawkGroundY = groundY;
+        blackHawkYaw = approachHeading;
+        blackHawkPitch = 0.0f;
+        blackHawkRoll = 0.0f;
+        blackHawkPhase = BlackHawkPhase::Inbound;
+        blackHawkLanded = false;
+        blackHawkDroppedPlayer = false;
+        blackHawkVisible = true;
+        blackHawkCarryingPlayer = true;
+        blackHawkUnloadTimer = 0.0f;
+        // Back the bird up along its heading so it flies in toward the spawn.
+        blackHawkPosition = {
+            dropOff.x - std::sin(approachHeading) * BlackHawkApproachDistance,
+            groundY + BlackHawkApproachHeight,
+            dropOff.z - std::cos(approachHeading) * BlackHawkApproachDistance };
+    }
+
+    // Advances the insertion: closes on the drop-off, descends with a flare,
+    // holds while the player gets out, then climbs away.
     void UpdateBlackHawk(float deltaTime) {
         const float dt = (std::max)(0.0f, deltaTime);
-        blackHawkRotorSpin += dt * (blackHawkLanded ? 6.0f : 34.0f);
-        if (blackHawkLanded) return;
-        const float remaining = blackHawkPosition.y - blackHawkGroundY;
-        if (remaining <= 0.01f) {
-            blackHawkPosition.y = blackHawkGroundY;
-            blackHawkLanded = true;
-            return;
+        const bool idling = blackHawkPhase == BlackHawkPhase::Unloading;
+        blackHawkRotorSpin += dt * (idling ? 22.0f : 34.0f);
+        blackHawkDroppedPlayer = false;
+
+        switch (blackHawkPhase) {
+        case BlackHawkPhase::Inbound: {
+            const float dx = blackHawkDropOff.x - blackHawkPosition.x;
+            const float dz = blackHawkDropOff.z - blackHawkPosition.z;
+            const float distance = std::sqrt(dx * dx + dz * dz);
+            if (distance > 0.001f) blackHawkYaw = std::atan2(dx, dz);
+            // Ease off the throttle as the drop-off comes up, and bleed the
+            // approach altitude off along with the speed.
+            const float closing =
+                (std::min)(1.0f, distance / BlackHawkApproachDistance);
+            const float speed =
+                BlackHawkApproachSpeed * (0.14f + 0.86f * closing);
+            const float step = (std::min)(distance, speed * dt);
+            if (distance > 0.001f) {
+                blackHawkPosition.x += dx / distance * step;
+                blackHawkPosition.z += dz / distance * step;
+            }
+            // Nose down while running in, levelling out into the flare.
+            blackHawkPitch = -0.16f * closing;
+            const float hoverY = blackHawkGroundY + 14.0f;
+            const float cruiseY = blackHawkGroundY + BlackHawkApproachHeight;
+            blackHawkPosition.y = hoverY + (cruiseY - hoverY) * closing;
+            if (distance <= BlackHawkHoverRadius) {
+                blackHawkPosition.x = blackHawkDropOff.x;
+                blackHawkPosition.z = blackHawkDropOff.z;
+                blackHawkPitch = 0.0f;
+                blackHawkPhase = BlackHawkPhase::Descending;
+            }
+            break;
         }
-        // Full speed while high, tapering to a slow flare inside the last 12 m.
-        const float flare = (std::min)(1.0f, remaining / 12.0f);
-        const float speed = BlackHawkDescentSpeed * (0.12f + 0.88f * flare);
-        blackHawkPosition.y =
-            (std::max)(blackHawkGroundY, blackHawkPosition.y - speed * dt);
-        if (blackHawkPosition.y <= blackHawkGroundY + 0.01f) {
-            blackHawkPosition.y = blackHawkGroundY;
-            blackHawkLanded = true;
+        case BlackHawkPhase::Descending: {
+            const float remaining = blackHawkPosition.y - blackHawkGroundY;
+            if (remaining <= 0.01f) {
+                TouchDown();
+                break;
+            }
+            // Full speed while high, tapering to a slow flare in the last 12 m.
+            const float flare = (std::min)(1.0f, remaining / 12.0f);
+            const float speed = BlackHawkDescentSpeed * (0.12f + 0.88f * flare);
+            blackHawkPosition.y =
+                (std::max)(blackHawkGroundY, blackHawkPosition.y - speed * dt);
+            if (blackHawkPosition.y <= blackHawkGroundY + 0.01f) TouchDown();
+            break;
+        }
+        case BlackHawkPhase::Unloading: {
+            blackHawkUnloadTimer += dt;
+            if (blackHawkUnloadTimer >= BlackHawkUnloadTime) {
+                blackHawkPhase = BlackHawkPhase::Departing;
+                blackHawkLanded = false;
+            }
+            break;
+        }
+        case BlackHawkPhase::Departing: {
+            // Climb out along the heading it arrived on, nose up and banking.
+            const float climbed = blackHawkPosition.y - blackHawkGroundY;
+            const float ramp = (std::min)(1.0f, climbed / 20.0f);
+            blackHawkPosition.y += BlackHawkDepartSpeed * (0.35f + 0.65f * ramp) * dt;
+            const float forward = BlackHawkDepartSpeed * ramp * dt;
+            blackHawkPosition.x += std::sin(blackHawkYaw) * forward;
+            blackHawkPosition.z += std::cos(blackHawkYaw) * forward;
+            blackHawkPitch = 0.20f * ramp;
+            blackHawkRoll = 0.18f * ramp;
+            if (climbed >= BlackHawkDepartHeight) {
+                blackHawkPhase = BlackHawkPhase::Gone;
+                blackHawkVisible = false;
+            }
+            break;
+        }
+        case BlackHawkPhase::Gone:
+            break;
         }
     }
+
+private:
+    void TouchDown() {
+        blackHawkPosition.y = blackHawkGroundY;
+        blackHawkPitch = 0.0f;
+        blackHawkRoll = 0.0f;
+        blackHawkLanded = true;
+        blackHawkDroppedPlayer = blackHawkCarryingPlayer;
+        blackHawkCarryingPlayer = false;
+        blackHawkUnloadTimer = 0.0f;
+        blackHawkPhase = BlackHawkPhase::Unloading;
+    }
+
+public:
 
     struct DamageResult {
         DirectX::XMFLOAT3 position{};
@@ -214,11 +357,10 @@ struct VehicleSystem {
         boatSunk = false;
         boatSinkDepth = 0.0f;
 
-        // Send the BlackHawk back up so it flies the landing again on reload.
-        blackHawkPosition = { 0.0f, BlackHawkStartHeight, 0.0f };
-        blackHawkYaw = 0.0f;
+        // Put the BlackHawk back at the start of its run so it flies the whole
+        // insertion again on reload.
         blackHawkRotorSpin = 0.0f;
-        blackHawkLanded = false;
+        BeginBlackHawkInsertion(blackHawkDropOff, blackHawkGroundY, blackHawkYaw);
     }
 };
 

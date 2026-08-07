@@ -19,6 +19,16 @@ cbuffer MatrixBuffer : register(b0) {
 
 #include "palm_wind.hlsli"
 
+// Skeletal skinning for the IA raster path, so skinned meshes still pose on
+// hardware without mesh shaders. This flag gets its own register: b1 is the
+// pixel shader's LightBuffer, and b6 is shared by grass, terrain, instancing
+// and the mesh shader with a different struct each, so a flag read from either
+// would be whatever the last pass happened to store there.
+cbuffer SkinningToggle : register(b9) { uint skinningEnabled; };
+StructuredBuffer<float4x4> bonePalette : register(t12);
+struct SkinVtx { uint4 boneIndex; float4 boneWeight; };
+StructuredBuffer<SkinVtx> skinData : register(t13);
+
 struct VS_INPUT {
     float3 position : POSITION;
     float3 normal : NORMAL;
@@ -35,12 +45,26 @@ struct VS_OUTPUT {
     float4 fragPosLightSpace : TEXCOORD4;
 };
 
-VS_OUTPUT main(VS_INPUT input) {
+VS_OUTPUT main(VS_INPUT input, uint vertexID : SV_VertexID) {
     VS_OUTPUT output;
 
     float3 localPosition = input.position;
     float3 localNormal = input.normal;
     float3 localTangent = input.tangent.xyz;
+    if (skinningEnabled) {
+        SkinVtx s = skinData[vertexID];
+        float4x4 skinMat =
+            s.boneWeight.x * bonePalette[s.boneIndex.x] +
+            s.boneWeight.y * bonePalette[s.boneIndex.y] +
+            s.boneWeight.z * bonePalette[s.boneIndex.z] +
+            s.boneWeight.w * bonePalette[s.boneIndex.w];
+        localPosition = mul(float4(localPosition, 1.0), skinMat).xyz;
+        // Rotating the basis with the bones keeps lighting correct as the
+        // blades turn. Uniform bone scales here, so the 3x3 needs no inverse
+        // transpose.
+        localNormal = mul(localNormal, (float3x3)skinMat);
+        localTangent = mul(localTangent, (float3x3)skinMat);
+    }
     ApplyPalmWind(localPosition, localNormal, localTangent, palmRoot,
                   palmWind, palmPrimary, palmSecondary, palmParams);
 
