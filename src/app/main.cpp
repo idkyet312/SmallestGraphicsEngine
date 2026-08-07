@@ -124,6 +124,12 @@ std::shared_ptr<SceneNode>  g_humveeShadowModel;
 std::shared_ptr<SceneNode>  g_helicopterModel;
 std::shared_ptr<SceneNode>  g_boatModel;
 std::shared_ptr<SceneNode>  g_boatShadowModel;
+// Insertion boat: same hull asset as the patrol boat, drawn with its own pose.
+std::shared_ptr<SceneNode>  g_insertionBoatModel;
+std::shared_ptr<SceneNode>  g_insertionBoatShadowModel;
+// Mirrors g_blackHawkInsertionRestartPending: aiming the run needs the settled
+// player spawn and terrain, which are not ready at model load time.
+static bool                 g_insertionBoatRestartPending = false;
 std::shared_ptr<SceneNode>  g_blackHawkModel;
 std::shared_ptr<SceneNode>  g_blackHawkShadowModel;
 // Rig for the rotor: the GLB's skin, the id of the joint driving the blades,
@@ -698,6 +704,8 @@ XMFLOAT3 BlackHawkModelCentre() {
 }
 float BlackHawkModelScale() { return g_blackHawkModelScale; }
 
+static LevelInsertionMode ResolvedInsertionMode();
+
 // Sends the BlackHawk on an insertion run that ends at the player's spawn. It
 // runs in from behind the direction the player is facing, so the approach
 // crosses their view before it flares and sets down on top of them.
@@ -711,6 +719,8 @@ static void StartBlackHawkInsertionAtPlayerSpawn() {
     // Camera yaw is degrees measured from +X; convert to the +Z-relative
     // heading the helicopter flies along, then come in over the player's back.
     const float facing = XMConvertToRadians(90.0f - scene.camera.Yaw);
+    // Only called when this level inserts by helicopter, so the run always
+    // carries the player. See ResolvedInsertionMode.
     g_game.vehicles.BeginBlackHawkInsertion(
         { spawn.x, groundY, spawn.z }, groundY, facing);
 }
@@ -827,6 +837,154 @@ static void RidePlayerInBlackHawk() {
         scene.camera.VerticalVelocity = 0.0f;
         scene.camera.IsGrounded = true;
     }
+}
+
+// What the player picked when a map leaves the insertion vehicle up to them.
+// Only consulted for LevelInsertionMode::PlayerChoice maps; the other modes are
+// settled in the level file. Holds the last answer so ResolvedInsertionMode has
+// something to read for the rest of the run, but the prompt is re-raised on
+// every restart rather than reusing it silently.
+static bool g_playerPrefersBoatInsertion = false;
+// Raised when a PlayerChoice map starts or restarts, cleared once the player
+// answers, so the prompt shows exactly once per level start.
+static bool g_insertionChoicePending = false;
+// Whether the choice screen has already freed the pointer for its buttons. A
+// file-scope flag rather than a static local so a restart can clear it: the
+// restart re-grabs the cursor for mouse-look, and a stale "already released"
+// would leave the next prompt up with no usable pointer.
+static bool g_insertionChoiceCursorReleased = false;
+
+// The mode this level actually runs with, after folding in the player's pick.
+// Never returns PlayerChoice: that is a level-file setting, not a runtime state.
+static LevelInsertionMode ResolvedInsertionMode() {
+    // Stock (non-custom) levels have no level file, so they keep the original
+    // helicopter insertion.
+    if (!g_customLevelMode) return LevelInsertionMode::Helicopter;
+    const LevelInsertionMode mode = g_game.world.Level().insertionMode;
+    if (mode != LevelInsertionMode::PlayerChoice) return mode;
+    return g_playerPrefersBoatInsertion ? LevelInsertionMode::Boat
+                                        : LevelInsertionMode::Helicopter;
+}
+
+// Sends the insertion boat in toward the player's spawn. The seaborne twin of
+// StartBlackHawkInsertionAtPlayerSpawn: it runs in across the water on the
+// heading the player is facing away from, so the approach crosses their view.
+static void StartInsertionBoatRunAtPlayerSpawn() {
+    const XMFLOAT3& spawn = scene.camera.Position;
+    auto params = CurrentTerrainParams();
+    params.heightScale = scene.terrainHeightScale;
+    const float groundY =
+        TerrainRendererDX12::HeightAt(params, spawn.x, spawn.z);
+    // Boats ride the water plane, never the terrain under it.
+    const float waterY = (std::max)(0.0f, groundY);
+    const float facing = XMConvertToRadians(90.0f - scene.camera.Yaw);
+    // Only called when this level inserts by boat, so the run always carries
+    // the player. See ResolvedInsertionMode.
+    g_game.vehicles.BeginInsertionBoatRun(
+        { spawn.x, waterY, spawn.z }, waterY, facing);
+}
+
+// Keeps the player glued to the deck while riding, and puts them ashore (or in
+// the water) when the run ends. Mirrors RidePlayerInBlackHawk.
+static void RidePlayerInInsertionBoat() {
+    VehicleSystem& vehicles = g_game.vehicles;
+    if (vehicles.insertionBoatCarryingPlayer) {
+        const XMFLOAT3 centre = vehicles.InsertionBoatRidePosition();
+        scene.camera.Position = { centre.x,
+                                  centre.y + scene.camera.PlayerHeight * 0.5f,
+                                  centre.z };
+        scene.camera.VerticalVelocity = 0.0f;
+        scene.camera.IsGrounded = true;
+        scene.camera.FloorY =
+            scene.camera.Position.y - scene.camera.PlayerHeight;
+        return;
+    }
+
+    // Bailing out early: step off to starboard wherever the boat happens to be,
+    // rather than teleporting to the landing point.
+    if (vehicles.insertionBoatBailedOut) {
+        vehicles.insertionBoatBailedOut = false;
+        const float rightX = std::cos(vehicles.insertionBoatYaw);
+        const float rightZ = -std::sin(vehicles.insertionBoatYaw);
+        constexpr float clearDistance = 3.5f;
+        const XMFLOAT3 centre = vehicles.InsertionBoatRidePosition();
+        scene.camera.Position = { centre.x + rightX * clearDistance,
+                                  centre.y + scene.camera.PlayerHeight * 0.5f,
+                                  centre.z + rightZ * clearDistance };
+        scene.camera.VerticalVelocity = 0.0f;
+        return;
+    }
+
+    if (!vehicles.insertionBoatDroppedPlayer) return;
+
+    // Went down with the boat: dumped in the water beside the wreck.
+    if (vehicles.insertionBoatJustSank) {
+        const float rightX = std::cos(vehicles.insertionBoatYaw);
+        const float rightZ = -std::sin(vehicles.insertionBoatYaw);
+        constexpr float thrownClear = 4.0f;
+        scene.camera.Position = {
+            vehicles.insertionBoatPosition.x + rightX * thrownClear,
+            vehicles.insertionBoatWaterY + scene.camera.PlayerHeight,
+            vehicles.insertionBoatPosition.z + rightZ * thrownClear };
+        scene.camera.VerticalVelocity = 0.0f;
+        scene.camera.IsGrounded = true;
+        return;
+    }
+
+    // Normal landing: step off the bow onto the shore.
+    const float forwardX = std::sin(vehicles.insertionBoatYaw);
+    const float forwardZ = std::cos(vehicles.insertionBoatYaw);
+    constexpr float exitDistance = 4.0f;
+    auto params = CurrentTerrainParams();
+    params.heightScale = scene.terrainHeightScale;
+    const float exitX = vehicles.insertionBoatLanding.x + forwardX * exitDistance;
+    const float exitZ = vehicles.insertionBoatLanding.z + forwardZ * exitDistance;
+    const float shoreY = (std::max)(vehicles.insertionBoatWaterY,
+        TerrainRendererDX12::HeightAt(params, exitX, exitZ));
+    scene.camera.Position = { exitX, shoreY + scene.camera.PlayerHeight, exitZ };
+    scene.camera.VerticalVelocity = 0.0f;
+    scene.camera.IsGrounded = true;
+}
+
+// Smoke trail as the hull fails, then the FX when it finally goes under. Same
+// read-it-at-a-glance smoke ramp the BlackHawk uses.
+static void UpdateInsertionBoatDamageEffects(float deltaTime) {
+    VehicleSystem& vehicles = g_game.vehicles;
+
+    static float smokeTimer = 0.0f;
+    const float severity = vehicles.InsertionBoatDamageSeverity();
+    if (severity > 0.0f && !vehicles.InsertionBoatIsSunk()) {
+        smokeTimer -= deltaTime;
+        if (smokeTimer <= 0.0f) {
+            smokeTimer = 0.34f - 0.29f * severity;
+            const float radius = 0.35f + 0.95f * severity;
+            const float intensity = 0.35f + 1.15f * severity;
+            // Trail from the engine well, aft of the model origin.
+            const float backX = -std::sin(vehicles.insertionBoatYaw) * 1.2f;
+            const float backZ = -std::cos(vehicles.insertionBoatYaw) * 1.2f;
+            scene.SpawnSmokeBurst(
+                { vehicles.insertionBoatPosition.x + backX,
+                  vehicles.insertionBoatPosition.y -
+                      vehicles.insertionBoatSinkOffset + 0.8f,
+                  vehicles.insertionBoatPosition.z + backZ },
+                radius, intensity);
+        }
+    } else {
+        smokeTimer = 0.0f;
+    }
+
+    if (!vehicles.insertionBoatJustSank) return;
+
+    // No crater or collision bake here, unlike the BlackHawk: the hull goes
+    // under open water, so there is no terrain to gouge and no wreck to walk on.
+    const XMFLOAT3 wentDown = vehicles.insertionBoatPosition;
+    scene.SpawnExplosionFX({ wentDown.x, wentDown.y + 1.0f, wentDown.z },
+                           8.0f, 1.1f);
+    scene.SpawnSmokeBurst(wentDown, 3.0f, 3.2f);
+
+    // Going down with it hurts, but less than riding a helicopter in: the water
+    // breaks the fall.
+    scene.DamagePlayer(30.0f);
 }
 
 // Fires the crash FX and hurts anyone still strapped in. Runs off the one-frame
@@ -1105,6 +1263,65 @@ static void ConfigureBoatBounds() {
     // not resting on the surface.
     g_boatModelScale = 9.0f / horizontalLength;
     g_boatModelMinY += 0.35f / g_boatModelScale;
+}
+
+XMMATRIX InsertionBoatWorldMatrix() {
+    VehicleSystem& vehicles = g_game.vehicles;
+    return XMMatrixTranslation(-vehicles.insertionBoatModelCenter.x,
+                               -vehicles.insertionBoatModelMinY,
+                               -vehicles.insertionBoatModelCenter.z) *
+           XMMatrixScaling(vehicles.insertionBoatModelScale,
+                           vehicles.insertionBoatModelScale,
+                           vehicles.insertionBoatModelScale) *
+           XMMatrixRotationZ(vehicles.insertionBoatRoll) *
+           XMMatrixRotationY(vehicles.insertionBoatYaw) *
+           XMMatrixTranslation(
+               vehicles.insertionBoatPosition.x,
+               vehicles.insertionBoatPosition.y - vehicles.insertionBoatSinkOffset,
+               vehicles.insertionBoatPosition.z);
+}
+
+bool InsertionBoatVisible() { return g_game.vehicles.insertionBoatVisible; }
+
+XMFLOAT3 InsertionBoatRideWorldPosition() {
+    return g_game.vehicles.InsertionBoatRidePosition();
+}
+
+// Shares the patrol boat's normalization so both hulls come out the same size.
+static void ConfigureInsertionBoatBounds() {
+    if (!g_insertionBoatModel || !g_insertionBoatModel->mesh) return;
+    XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
+    XMFLOAT3 maximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    for (const MeshPrimitive& primitive : g_insertionBoatModel->mesh->primitives) {
+        for (size_t vertex = 0; vertex + 11 < primitive.vertices.size(); vertex += 12) {
+            const float x = primitive.vertices[vertex];
+            const float y = primitive.vertices[vertex + 1];
+            const float z = primitive.vertices[vertex + 2];
+            minimum.x = (std::min)(minimum.x, x);
+            minimum.y = (std::min)(minimum.y, y);
+            minimum.z = (std::min)(minimum.z, z);
+            maximum.x = (std::max)(maximum.x, x);
+            maximum.y = (std::max)(maximum.y, y);
+            maximum.z = (std::max)(maximum.z, z);
+        }
+    }
+    const float horizontalLength = (std::max)(
+        maximum.x - minimum.x, maximum.z - minimum.z);
+    if (horizontalLength <= 0.001f) return;
+    VehicleSystem& vehicles = g_game.vehicles;
+    vehicles.insertionBoatModelCenter = {
+        (minimum.x + maximum.x) * 0.5f,
+        (minimum.y + maximum.y) * 0.5f,
+        (minimum.z + maximum.z) * 0.5f };
+    vehicles.insertionBoatModelMinY = minimum.y;
+    vehicles.insertionBoatModelScale = 9.0f / horizontalLength;
+    // Waterline a little above the hull bottom, so it floats rather than rests.
+    vehicles.insertionBoatModelMinY += 0.35f / vehicles.insertionBoatModelScale;
+    // Stand the passenger on the deck of the normalized hull, a little aft of
+    // centre so they are not perched on the bow.
+    vehicles.insertionBoatRideForward =
+        -(maximum.z - minimum.z) * vehicles.insertionBoatModelScale * 0.18f;
+    vehicles.insertionBoatRideHeight = 0.9f;
 }
 
 // The humvee ships its base colour map embedded in the source FBX. Where that
@@ -2978,6 +3195,9 @@ ID3D12Resource*             g_ddgiVisibilityResource = nullptr;
 ID3D12Resource*             g_dxrDDGIProbeResource = nullptr;
 ID3D12Resource*             g_dxrDDGICellResource = nullptr;
 ID3D12Resource*             g_dxrDDGIIndexResource = nullptr;
+// Published for the UI: DXR Tier 1.1 (inline RayQuery) support, which gates
+// the enhanced-visuals tier. Set once the device is up.
+bool                        g_inlineRaytracingSupported = false;
 UINT                        g_dxrDDGIProbeCount = 0;
 UINT                        g_dxrDDGICellCount = 0;
 UINT                        g_dxrDDGIIndexCount = 0;
@@ -5832,8 +6052,26 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     // on a cold load the model does not exist yet: the flag is consumed once
     // the terrain is up, which covers both the first load and every restart.
     g_blackHawkInsertionRestartPending = !g_emptyLevelMode;
+    g_insertionBoatRestartPending = !g_emptyLevelMode;
+    // Maps flagged PlayerChoice ask which craft brings the player in, on every
+    // start and restart -- the previous answer is not carried over, since a
+    // retry is exactly when someone wants to try arriving the other way. Only
+    // the craft that is picked flies; the other stands down entirely.
+    g_insertionChoicePending = !g_emptyLevelMode && g_customLevelMode &&
+        g_game.world.Level().insertionMode == LevelInsertionMode::PlayerChoice;
+    // Put both craft down until the arming step revives the picked one. A
+    // restart otherwise leaves last run's wreck or a mid-air pose on screen
+    // while the prompt is up, and the choice screen is the first thing the
+    // player sees.
+    if (g_insertionChoicePending) {
+        g_game.vehicles.DisableBlackHawkInsertion();
+        g_game.vehicles.DisableInsertionBoat();
+    }
     g_game.commands.Set(GameCommand::ResetLevelRuntime, modeAssetsLoaded);
     deathCursorReleased = false;
+    // The cursor is re-grabbed for mouse-look below, so the next prompt has to
+    // release it again rather than assuming it is already free.
+    g_insertionChoiceCursorReleased = false;
     showUI = startWithUIAndMobileControls;
     virtualInput.showPad = startWithUIAndMobileControls;
     cameraLocked = false;
@@ -6118,6 +6356,50 @@ static void RenderDeathScreen(HWND hwnd) {
     ImGui::SetCursorPosX(45.0f);
     if (ImGui::Button("MAIN MENU", ImVec2(300.0f, 45.0f)))
         OpenMainMenu();
+    ImGui::End();
+}
+
+// Asks which craft brings the player in. Shown only on maps flagged
+// player_choice, and only until answered: both insertion runs are held until
+// then, so whichever is picked is the one that actually carries the player.
+static void RenderInsertionChoiceScreen(HWND hwnd) {
+    // Free the pointer so the buttons can be clicked, the way the death screen
+    // does. Recaptured below once the choice is made.
+    if (!g_insertionChoiceCursorReleased) {
+        cameraLocked = true;
+        ReleaseCapture();
+        SetCursorVisible(true);
+        g_insertionChoiceCursorReleased = true;
+    }
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::GetBackgroundDrawList()->AddRectFilled(
+        ImVec2(0, 0), display, IM_COL32(6, 14, 26, 200));
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(390.0f, 250.0f), ImGuiCond_Always);
+    ImGui::Begin("Insertion Choice", nullptr, ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoCollapse);
+    ImGui::Dummy(ImVec2(0.0f, 15.0f));
+    const char* title = "CHOOSE INSERTION";
+    ImGui::SetCursorPosX((390.0f - ImGui::CalcTextSize(title).x) * 0.5f);
+    ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "%s", title);
+    ImGui::Dummy(ImVec2(0.0f, 20.0f));
+    // Hand the pointer back to mouse-look and let the held runs arm.
+    const auto choose = [&](bool boat) {
+        g_playerPrefersBoatInsertion = boat;
+        g_insertionChoicePending = false;
+        g_insertionChoiceCursorReleased = false;
+        cameraLocked = false;
+        SetCapture(hwnd);
+        SetCursorVisible(false);
+        firstMouse = true;
+    };
+    ImGui::SetCursorPosX(45.0f);
+    if (ImGui::Button("BY HELICOPTER", ImVec2(300.0f, 55.0f))) choose(false);
+    ImGui::Dummy(ImVec2(0.0f, 9.0f));
+    ImGui::SetCursorPosX(45.0f);
+    if (ImGui::Button("BY BOAT", ImVec2(300.0f, 55.0f))) choose(true);
     ImGui::End();
 }
 
@@ -8553,9 +8835,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         else if (!g_emptyLevelMode && wParam == 'E' &&
                  !(lParam & 0x40000000)) {
-            // Riding the insertion helicopter takes priority: E jumps out.
+            // Riding an insertion vehicle takes priority: E jumps out. Only one
+            // can be carrying the player, so the chain short-circuits on it.
             // Otherwise E keeps its usual job of getting in/out of the Humvee.
-            if (!g_game.vehicles.BailOutOfBlackHawk())
+            if (!g_game.vehicles.BailOutOfBlackHawk() &&
+                !g_game.vehicles.BailOutOfInsertionBoat())
                 ToggleHumveeDriving();
         }
         // Bit 30 = key was already down (autorepeat); toggle once per press.
@@ -9066,6 +9350,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // Raytracing (DXR path)
     BootStep("Building raytracing acceleration structures...");
     g_dxrDDGI.Initialize(g_dx12.device.Get());
+    g_inlineRaytracingSupported =
+        g_dxrDDGI.GetStatus().inlineRaytracingSupported;
+    std::cout << "DXR inline raytracing (Tier 1.1): "
+              << (g_inlineRaytracingSupported ? "supported" : "unavailable")
+              << "\n";
     if (!InitRaytracing(geo)) {
         std::cerr << "DXR init failed (non-fatal)\n";
         scene.useRaytracing = false;
@@ -9460,10 +9749,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // delta still spans the load, and charging it against a run that
             // only just started is what made reloads crash early.
             bool armedInsertionThisFrame = false;
+            // Hold the run until a PlayerChoice map has its answer, then arm
+            // only the craft that was picked -- the other one does not fly at
+            // all, so the level opens with a single insertion, not a convoy.
             if (g_blackHawkInsertionRestartPending && g_blackHawkModel &&
-                !g_game.loading.Active()) {
+                !g_insertionChoicePending && !g_game.loading.Active()) {
                 g_blackHawkInsertionRestartPending = false;
-                StartBlackHawkInsertionAtPlayerSpawn();
+                if (ResolvedInsertionMode() == LevelInsertionMode::Helicopter)
+                    StartBlackHawkInsertionAtPlayerSpawn();
+                else
+                    g_game.vehicles.DisableBlackHawkInsertion();
                 armedInsertionThisFrame = true;
                 // The old wreck's triangles describe a helicopter that no
                 // longer exists; drop them so the fresh run is not blocked by
@@ -9490,6 +9785,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             SpinBlackHawkRotor();
             RidePlayerInBlackHawk();
             UpdateBlackHawkCrashEffects(deltaTime);
+
+            // Insertion boat, armed and stepped the same way: the frame that
+            // starts a run skips its drain tick, since that delta spans the
+            // load and would otherwise hole the hull before it gets going.
+            bool armedBoatRunThisFrame = false;
+            if (g_insertionBoatRestartPending && g_insertionBoatModel &&
+                !g_insertionChoicePending && !g_game.loading.Active()) {
+                g_insertionBoatRestartPending = false;
+                if (ResolvedInsertionMode() == LevelInsertionMode::Boat)
+                    StartInsertionBoatRunAtPlayerSpawn();
+                else
+                    g_game.vehicles.DisableInsertionBoat();
+                armedBoatRunThisFrame = true;
+            }
+            if (g_insertionBoatModel) {
+                g_game.vehicles.UpdateInsertionBoat(
+                    armedBoatRunThisFrame ? 0.0f : deltaTime);
+                RidePlayerInInsertionBoat();
+                UpdateInsertionBoatDamageEffects(deltaTime);
+            }
             UpdateExplosiveBarrels(deltaTime);
         }
         g_gunAudio.Update();
@@ -10902,6 +11217,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         scene.temporalJitterPixels = usingVisibility
             ? visBuffer.GetTemporalJitterPixels()
             : XMFLOAT2(0.0f, 0.0f);
+        // Enhanced visuals: ray-traced tier layered on the visibility buffer.
+        // Needs the static TLAS, which is normally built as a side effect of
+        // enabling probe GI -- build it here too so the two features are
+        // independent, and only once, since the acceleration structure is
+        // static geometry that does not change per frame.
+        {
+            const auto& ddgiStatus = g_dxrDDGI.GetStatus();
+            const bool wantEnhanced = scene.enhancedVisuals && usingVisibility &&
+                !visBuffer.validationMode && ddgiStatus.dxrSupported &&
+                ddgiStatus.inlineRaytracingSupported &&
+                visBuffer.EnhancedVisualsReady();
+            static bool enhancedSceneBuilt = false;
+            if (wantEnhanced && !enhancedSceneBuilt &&
+                !g_game.loading.Active() && IsSceneScreen()) {
+                // Returns false when there is no static geometry yet; retry
+                // next frame rather than latching a failure.
+                enhancedSceneBuilt = BuildDXRDDGIAccelerationScene();
+            }
+            if (!IsSceneScreen()) enhancedSceneBuilt = false;
+            visBuffer.SetEnhancedVisuals(
+                wantEnhanced, scene.enhancedRTShadows,
+                scene.enhancedRayClassify, scene.enhancedConfidenceThreshold,
+                g_dxrDDGI.Scene().TLASAddress());
+            scene.enhancedRayFraction = wantEnhanced
+                ? visBuffer.EnhancedRayFraction() : 0.0f;
+        }
         const bool visibilityDebugActive =
             usingVisibility && visBuffer.debugViewMode != 0;
         // Validation is a cross-renderer comparison mode. Keep both sides on
@@ -11241,6 +11582,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 std::cerr << "Military boat GLB failed to load\n";
             }
 
+            // Insertion boat: a second instance of the same hull, posed by its
+            // own run rather than the patrol circuit. Loaded separately so the
+            // two never share a scene node (one transform per node).
+            g_insertionBoatModel = GLBImporter::LoadGLB(
+                "Content/Models/MiltaryBoat/miltaryboat.glb",
+                g_dx12.device, g_dx12.commandList);
+            if (g_insertionBoatModel) {
+                ConfigureInsertionBoatBounds();
+                g_insertionBoatShadowModel = GLBImporter::MergeSceneForDepth(
+                    g_insertionBoatModel, g_dx12.device);
+                g_insertionBoatRestartPending = !g_emptyLevelMode;
+                std::cout << "Insertion boat GLB ready\n";
+            } else {
+                std::cerr << "Insertion boat GLB failed to load\n";
+            }
+
             g_blackHawkModel = GLBImporter::LoadGLBSkinned(
                 "Content/Models/BlackHawk/blackhawk.glb",
                 g_dx12.device, g_dx12.commandList, g_blackHawkSkeleton);
@@ -11362,6 +11719,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ReleaseMaterialUploadHeaps(g_helicopterModel);
             ReleaseMaterialUploadHeaps(g_humveeModel);
             ReleaseMaterialUploadHeaps(g_boatModel);
+            ReleaseMaterialUploadHeaps(g_insertionBoatModel);
             ReleaseMaterialUploadHeaps(g_blackHawkModel);
             ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
             ReleaseMaterialUploadHeaps(g_dandelionModel);
@@ -11481,18 +11839,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         // Hybrid visibility and pure forward both establish global forward
         // resources before skinned/transparent extension passes.
+        // Passes below draw after the visibility resolve and emit no motion
+        // vectors, so TAA cannot reproject them. Jittering them would shake the
+        // image with nothing to cancel it -- see GetUnjitteredProjectionMatrix.
+        const XMMATRIX extensionProj = scene.GetUnjitteredProjectionMatrix();
         if (renderedScene && !g_emptyLevelMode && g_banditLoaded) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Bandits", g_dx12.commandList.Get());
             for (auto& bandit : g_bandits) {
                 if (!bandit) continue;
                 bandit->Draw(mainShader, scene.GetViewMatrix(),
-                             scene.GetProjectionMatrix(), fogLightSpace);
+                             extensionProj, fogLightSpace);
                 if (bandit->HasGunPose() && GunModel::Loaded()) {
                     mainShader.Use(false);
                     DrawMeshAt(GunModel::Mesh(), mainShader,
                         bandit->GunWorldMatrix(), scene.GetViewMatrix(),
-                        scene.GetProjectionMatrix(), fogLightSpace, true);
+                        extensionProj, fogLightSpace, true);
                 }
                 DrawSniperLaser(*bandit, scene, mainShader, geo, fogLightSpace);
             }
@@ -11509,7 +11871,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_profiler, "Grass 4x MSAA", g_dx12.commandList.Get());
             grassMSAA.Begin(g_dx12.commandList.Get());
             RenderGrassForward(scene, mainShader, scene.GetViewMatrix(),
-                scene.GetProjectionMatrix(), fogLightSpace, fogShadowResource,
+                extensionProj, fogLightSpace, fogShadowResource,
                 mainShader.GetHDRMSAAGrassPipelineState());
 
             // Resolve the independently sampled grass against opaque scene
@@ -11791,6 +12153,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             if (!scene.player.godMode && scene.player.health <= 0.0f) {
                 RenderDeathScreen(hwnd);
+            } else if (g_insertionChoicePending) {
+                // Takes over the frame the same way the death screen does: the
+                // insertion runs are held until this is answered.
+                RenderInsertionChoiceScreen(hwnd);
             } else {
                 if (showUI) RenderUI(scene, visBuffer);
                 DrawDestructionDebug(scene);

@@ -81,9 +81,24 @@ struct LevelDXRDDGISettings {
     bool showProbes = false;
 };
 
+// How the player arrives at the start of a level.
+enum class LevelInsertionMode : uint32_t {
+    // Flown in by the BlackHawk. The historical behaviour, and the default for
+    // levels saved before this field existed.
+    Helicopter = 0,
+    // Brought in by the insertion boat instead. For maps that start on water.
+    Boat = 1,
+    // Both craft run in, and the player picks which one carries them before the
+    // level starts. Only maps that set this offer the choice.
+    PlayerChoice = 2
+};
+
 struct LevelDefinition {
     uint32_t schemaVersion = 1;
     std::string name = "Untitled Level";
+    // Which insertion vehicle delivers the player. PlayerChoice puts the map's
+    // arrival up to the player; the other two settle it in the level file.
+    LevelInsertionMode insertionMode = LevelInsertionMode::Helicopter;
     float terrainHeightScale = 5.0f;
     // Island builder: terrain drawn extent (tile grid) and coastline scale. The
     // ocean is procedurally ringed around the land, so growing tiles + island
@@ -124,6 +139,8 @@ struct LevelSaveResult {
 
 const char* LevelEntityTypeName(LevelEntityType type);
 bool ParseLevelEntityType(const std::string& text, LevelEntityType& type);
+const char* LevelInsertionModeName(LevelInsertionMode mode);
+bool ParseLevelInsertionMode(const std::string& text, LevelInsertionMode& mode);
 LevelDefinition MakeLevelOneTemplate();
 LevelValidationResult ValidateLevel(const LevelDefinition& level);
 LevelLoadResult LoadLevel(const std::filesystem::path& path);

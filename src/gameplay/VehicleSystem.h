@@ -70,6 +70,341 @@ struct VehicleSystem {
     bool boatSunk = false;
     float boatSinkDepth = 0.0f;
 
+    // Insertion boat: the seaborne counterpart to the BlackHawk, for levels that
+    // land the player from the water. It runs in across the surface, slows onto
+    // the drop-off point, holds while the player steps off, then turns and heads
+    // back out. Kept entirely separate from the patrol boat above, which circles
+    // the island on its own schedule.
+    enum class InsertionBoatPhase {
+        Inbound, Slowing, Unloading, Departing, Foundering, Sunk, Gone };
+
+    // Where the run begins relative to the landing point, and how fast it covers
+    // that water.
+    static constexpr float InsertionBoatApproachDistance = 180.0f;
+    static constexpr float InsertionBoatApproachSpeed = 24.0f;
+    // Radius inside which the approach hands over to the final slow-in.
+    static constexpr float InsertionBoatArrivalRadius = 12.0f;
+    // How close to the landing point it noses in before the player steps off.
+    static constexpr float InsertionBoatDropRadius = 1.2f;
+    static constexpr float InsertionBoatUnloadTime = 3.0f;
+    static constexpr float InsertionBoatDepartSpeed = 20.0f;
+    // Distance back out from the landing point at which it stops being drawn.
+    static constexpr float InsertionBoatDepartDistance = 200.0f;
+
+    // Same failure model as the insertion helicopter: roll how long the hull
+    // stays afloat and derive the drain rate from that, so the failure point is
+    // uniform across the window rather than bunched at the fast end.
+    static constexpr float InsertionBoatMaxHealth = 100.0f;
+    static constexpr float InsertionBoatMinFailSeconds = 7.0f;
+    static constexpr float InsertionBoatMaxFailSeconds = 35.0f;
+    // Below this fraction the hull starts trailing smoke.
+    static constexpr float InsertionBoatSmokeThreshold = 0.55f;
+    // How fast a holed hull settles, and how far down before it is gone.
+    static constexpr float InsertionBoatSinkRate = 0.85f;
+    static constexpr float InsertionBoatSinkDepth = 3.2f;
+    static constexpr float InsertionBoatFounderRoll = 0.62f;
+    static constexpr float InsertionBoatFounderRollRate = 0.30f;
+
+    float insertionBoatHealth = InsertionBoatMaxHealth;
+    float insertionBoatDrainRate = 0.0f;
+    // Raised for the single frame the hull goes under, so the caller can fire
+    // the effects and dunk whoever is still aboard.
+    bool insertionBoatJustSank = false;
+
+    DirectX::XMFLOAT3 insertionBoatModelCenter{};
+    float insertionBoatModelMinY = 0.0f;
+    float insertionBoatModelScale = 1.0f;
+    DirectX::XMFLOAT3 insertionBoatPosition{ 0.0f, 0.0f, 0.0f };
+    // Landing point: the player spawn, projected onto the shore.
+    DirectX::XMFLOAT3 insertionBoatLanding{ 0.0f, 0.0f, 0.0f };
+    // The heading the run was set up on. Kept apart from the live yaw, which
+    // swings on approach and on the way out, so a reset restores the real
+    // starting pose rather than whatever heading it ended on.
+    float insertionBoatApproachHeading = 0.0f;
+    bool insertionBoatRouteValid = false;
+    // Height of the water the boat rides on.
+    float insertionBoatWaterY = 0.0f;
+    float insertionBoatYaw = 0.0f;
+    float insertionBoatRoll = 0.0f;
+    float insertionBoatSinkOffset = 0.0f;
+    float insertionBoatBobTime = 0.0f;
+    float insertionBoatUnloadTimer = 0.0f;
+    InsertionBoatPhase insertionBoatPhase = InsertionBoatPhase::Inbound;
+    bool insertionBoatLanded = false;
+    // Set for the single frame the bow touches the landing point, so the caller
+    // can release the player ashore.
+    bool insertionBoatDroppedPlayer = false;
+    bool insertionBoatVisible = true;
+    // True while the player is riding the deck, before the drop-off.
+    bool insertionBoatCarryingPlayer = false;
+    // Set for the single frame the player jumps off early.
+    bool insertionBoatBailedOut = false;
+
+    // Ride-along spot in the boat's local frame: side (positive to starboard,
+    // since right is (cos, -sin)), forward from the model centre, and height
+    // above the waterline. World metres against the normalized hull.
+    float insertionBoatRideSide = 0.0f;
+    float insertionBoatRideForward = -1.2f;
+    float insertionBoatRideHeight = 0.9f;
+
+    // Where the passenger's centre sits for the current pose. Rotated by roll
+    // and yaw both, so they lean with the hull as it founders instead of
+    // hovering upright over a capsizing deck.
+    DirectX::XMFLOAT3 InsertionBoatRidePosition() const {
+        const DirectX::XMVECTOR offset = DirectX::XMVectorSet(
+            insertionBoatRideSide, insertionBoatRideHeight,
+            insertionBoatRideForward, 0.0f);
+        const DirectX::XMMATRIX orientation =
+            DirectX::XMMatrixRotationRollPitchYaw(0.0f, insertionBoatYaw,
+                                                  insertionBoatRoll);
+        DirectX::XMFLOAT3 rotated{};
+        DirectX::XMStoreFloat3(&rotated,
+                               DirectX::XMVector3TransformNormal(offset, orientation));
+        return { insertionBoatPosition.x + rotated.x,
+                 insertionBoatPosition.y - insertionBoatSinkOffset + rotated.y,
+                 insertionBoatPosition.z + rotated.z };
+    }
+
+    // Lets the player jump off mid-run. Safe to call straight off a keypress:
+    // it does nothing when they are not aboard. The boat carries on its route.
+    bool BailOutOfInsertionBoat() {
+        if (!insertionBoatCarryingPlayer) return false;
+        insertionBoatCarryingPlayer = false;
+        insertionBoatBailedOut = true;
+        return true;
+    }
+
+    // Places the landing at the player spawn and parks the boat at the start of
+    // its run, inbound on the given heading (radians, the direction it travels).
+    // Started only for a level that inserts by boat, so the run always carries
+    // the player. A level using some other craft calls DisableInsertionBoat
+    // instead -- only one insertion vehicle may be live, since two both writing
+    // the camera each frame would fight over it.
+    void BeginInsertionBoatRun(const DirectX::XMFLOAT3& landing,
+                               float waterY, float approachHeading) {
+        insertionBoatLanding = landing;
+        insertionBoatWaterY = waterY;
+        insertionBoatApproachHeading = approachHeading;
+        insertionBoatRouteValid = true;
+        insertionBoatYaw = approachHeading;
+        insertionBoatRoll = 0.0f;
+        insertionBoatPhase = InsertionBoatPhase::Inbound;
+        insertionBoatLanded = false;
+        insertionBoatDroppedPlayer = false;
+        insertionBoatBailedOut = false;
+        insertionBoatJustSank = false;
+        insertionBoatVisible = true;
+        insertionBoatCarryingPlayer = true;
+        insertionBoatSinkOffset = 0.0f;
+        insertionBoatBobTime = 0.0f;
+        // Fresh hull, fresh roll: the drain rate decides how far into the run it
+        // gets before the hull gives out.
+        insertionBoatHealth = InsertionBoatMaxHealth;
+        const float roll = (float)std::rand() / (float)RAND_MAX;
+        const float failSeconds = InsertionBoatMinFailSeconds +
+            roll * (InsertionBoatMaxFailSeconds - InsertionBoatMinFailSeconds);
+        insertionBoatDrainRate = InsertionBoatMaxHealth / failSeconds;
+        insertionBoatUnloadTimer = 0.0f;
+        // Back the boat up along its heading so it runs in toward the landing.
+        insertionBoatPosition = {
+            landing.x - std::sin(approachHeading) * InsertionBoatApproachDistance,
+            waterY,
+            landing.z - std::cos(approachHeading) * InsertionBoatApproachDistance };
+    }
+
+    // Advances the run: closes on the landing, slows onto it, holds while the
+    // player gets off, then turns and heads back out.
+    void UpdateInsertionBoat(float deltaTime) {
+        const float dt = (std::max)(0.0f, deltaTime);
+        const bool underway = insertionBoatPhase != InsertionBoatPhase::Foundering &&
+                              insertionBoatPhase != InsertionBoatPhase::Sunk &&
+                              insertionBoatPhase != InsertionBoatPhase::Gone;
+        insertionBoatBobTime += dt;
+        insertionBoatDroppedPlayer = false;
+        insertionBoatJustSank = false;
+        // insertionBoatBailedOut is deliberately NOT cleared here: it is raised
+        // from the input handler, which runs earlier in the frame, so clearing
+        // it now would drop the event before the release code sees it. The
+        // consumer clears it instead.
+
+        // Hull failure: bleed health while underway. Hitting zero drops it out
+        // of whatever it was doing and starts it going down.
+        if (underway && insertionBoatDrainRate > 0.0f) {
+            insertionBoatHealth = (std::max)(
+                0.0f, insertionBoatHealth - insertionBoatDrainRate * dt);
+            if (insertionBoatHealth <= 0.0f) BeginInsertionBoatFounder();
+        }
+
+        // Gentle swell everywhere except on the bottom.
+        const float bob = insertionBoatPhase == InsertionBoatPhase::Sunk
+            ? 0.0f : std::sin(insertionBoatBobTime * 0.9f) * 0.10f;
+
+        switch (insertionBoatPhase) {
+        case InsertionBoatPhase::Inbound: {
+            const float dx = insertionBoatLanding.x - insertionBoatPosition.x;
+            const float dz = insertionBoatLanding.z - insertionBoatPosition.z;
+            const float distance = std::sqrt(dx * dx + dz * dz);
+            if (distance > 0.001f) insertionBoatYaw = std::atan2(dx, dz);
+            const float step = (std::min)(distance,
+                                          InsertionBoatApproachSpeed * dt);
+            if (distance > 0.001f) {
+                insertionBoatPosition.x += dx / distance * step;
+                insertionBoatPosition.z += dz / distance * step;
+            }
+            insertionBoatPosition.y = insertionBoatWaterY + bob;
+            // Heel into the run, easing off as the landing comes up.
+            insertionBoatRoll = std::sin(insertionBoatBobTime * 0.5f) * 0.05f;
+            if (distance <= InsertionBoatArrivalRadius)
+                insertionBoatPhase = InsertionBoatPhase::Slowing;
+            break;
+        }
+        case InsertionBoatPhase::Slowing: {
+            const float dx = insertionBoatLanding.x - insertionBoatPosition.x;
+            const float dz = insertionBoatLanding.z - insertionBoatPosition.z;
+            const float distance = std::sqrt(dx * dx + dz * dz);
+            if (distance <= InsertionBoatDropRadius) {
+                PutAshore();
+                break;
+            }
+            if (distance > 0.001f) insertionBoatYaw = std::atan2(dx, dz);
+            // Taper the last stretch so the bow noses in rather than ramming.
+            const float closing =
+                (std::min)(1.0f, distance / InsertionBoatArrivalRadius);
+            const float speed =
+                InsertionBoatApproachSpeed * (0.10f + 0.90f * closing);
+            const float step = (std::min)(distance, speed * dt);
+            if (distance > 0.001f) {
+                insertionBoatPosition.x += dx / distance * step;
+                insertionBoatPosition.z += dz / distance * step;
+            }
+            insertionBoatPosition.y = insertionBoatWaterY + bob;
+            insertionBoatRoll *= (std::max)(0.0f, 1.0f - 2.0f * dt);
+            break;
+        }
+        case InsertionBoatPhase::Unloading: {
+            insertionBoatPosition.y = insertionBoatWaterY + bob;
+            insertionBoatUnloadTimer += dt;
+            if (insertionBoatUnloadTimer >= InsertionBoatUnloadTime) {
+                insertionBoatPhase = InsertionBoatPhase::Departing;
+                insertionBoatLanded = false;
+                // Turn about and run back out the way it came in.
+                insertionBoatYaw = insertionBoatApproachHeading +
+                                   3.14159265358979323846f;
+            }
+            break;
+        }
+        case InsertionBoatPhase::Departing: {
+            const float forward = InsertionBoatDepartSpeed * dt;
+            insertionBoatPosition.x += std::sin(insertionBoatYaw) * forward;
+            insertionBoatPosition.z += std::cos(insertionBoatYaw) * forward;
+            insertionBoatPosition.y = insertionBoatWaterY + bob;
+            const float dx = insertionBoatPosition.x - insertionBoatLanding.x;
+            const float dz = insertionBoatPosition.z - insertionBoatLanding.z;
+            if (std::sqrt(dx * dx + dz * dz) >= InsertionBoatDepartDistance) {
+                insertionBoatPhase = InsertionBoatPhase::Gone;
+                insertionBoatVisible = false;
+            }
+            break;
+        }
+        case InsertionBoatPhase::Foundering: {
+            // Settles in place with a list, rather than falling like a downed
+            // helicopter: the water holds it up until the hull fills.
+            insertionBoatSinkOffset += InsertionBoatSinkRate * dt;
+            insertionBoatRoll = (std::min)(InsertionBoatFounderRoll,
+                insertionBoatRoll + InsertionBoatFounderRollRate * dt);
+            insertionBoatPosition.y = insertionBoatWaterY + bob * 0.4f;
+            if (insertionBoatSinkOffset >= InsertionBoatSinkDepth) {
+                insertionBoatSinkOffset = InsertionBoatSinkDepth;
+                insertionBoatPhase = InsertionBoatPhase::Sunk;
+                insertionBoatLanded = true;
+                insertionBoatJustSank = true;
+                // Anyone still aboard goes in the water; the caller reads this
+                // to place and hurt them.
+                insertionBoatDroppedPlayer = insertionBoatCarryingPlayer;
+                insertionBoatCarryingPlayer = false;
+            }
+            break;
+        }
+        case InsertionBoatPhase::Sunk:
+            // Hull stays under, listing where it went down.
+            break;
+        case InsertionBoatPhase::Gone:
+            break;
+        }
+    }
+
+    // Stands the boat down for a level that inserts by some other means. It is
+    // not merely hidden: the route is dropped and the drain switched off, so a
+    // reset does not resurrect a run this level never wanted, and nothing is
+    // left parked at the origin waiting to be drawn.
+    void DisableInsertionBoat() {
+        insertionBoatRouteValid = false;
+        insertionBoatVisible = false;
+        insertionBoatCarryingPlayer = false;
+        insertionBoatDroppedPlayer = false;
+        insertionBoatBailedOut = false;
+        insertionBoatJustSank = false;
+        insertionBoatDrainRate = 0.0f;
+        insertionBoatHealth = InsertionBoatMaxHealth;
+        insertionBoatSinkOffset = 0.0f;
+        insertionBoatRoll = 0.0f;
+        insertionBoatPhase = InsertionBoatPhase::Gone;
+    }
+
+    // Hulls the boat and starts it going down, from whatever phase it was in.
+    void BeginInsertionBoatFounder() {
+        if (insertionBoatPhase == InsertionBoatPhase::Foundering ||
+            insertionBoatPhase == InsertionBoatPhase::Sunk) return;
+        insertionBoatHealth = 0.0f;
+        insertionBoatPhase = InsertionBoatPhase::Foundering;
+        insertionBoatLanded = false;
+    }
+
+    // Remaining hull integrity as 0..1.
+    float InsertionBoatHealthFraction() const {
+        return InsertionBoatMaxHealth > 0.0f
+            ? (std::max)(0.0f, (std::min)(1.0f,
+                  insertionBoatHealth / InsertionBoatMaxHealth))
+            : 0.0f;
+    }
+
+    // How far past the smoking threshold the hull is, 0 at the first wisp and 1
+    // at zero health, so the smoke reads as a health bar.
+    float InsertionBoatDamageSeverity() const {
+        if (InsertionBoatSmokeThreshold <= 0.0f) return 0.0f;
+        const float fraction = InsertionBoatHealthFraction();
+        if (fraction >= InsertionBoatSmokeThreshold) return 0.0f;
+        return (InsertionBoatSmokeThreshold - fraction) /
+               InsertionBoatSmokeThreshold;
+    }
+
+    bool InsertionBoatSmoking() const {
+        return insertionBoatPhase != InsertionBoatPhase::Gone &&
+               insertionBoatHealth <
+                   InsertionBoatMaxHealth * InsertionBoatSmokeThreshold;
+    }
+    bool InsertionBoatIsSunk() const {
+        return insertionBoatPhase == InsertionBoatPhase::Sunk;
+    }
+    bool InsertionBoatIsFoundering() const {
+        return insertionBoatPhase == InsertionBoatPhase::Foundering;
+    }
+
+private:
+    void PutAshore() {
+        insertionBoatPosition.x = insertionBoatLanding.x;
+        insertionBoatPosition.z = insertionBoatLanding.z;
+        insertionBoatPosition.y = insertionBoatWaterY;
+        insertionBoatRoll = 0.0f;
+        insertionBoatLanded = true;
+        insertionBoatDroppedPlayer = insertionBoatCarryingPlayer;
+        insertionBoatCarryingPlayer = false;
+        insertionBoatUnloadTimer = 0.0f;
+        insertionBoatPhase = InsertionBoatPhase::Unloading;
+    }
+
+public:
+
     // BlackHawk: flies the player in at level start. It comes in level and fast
     // from a point offset from the player spawn, flares into a hover over the
     // spawn, sets down, holds long enough to drop the player off, then pulls
@@ -196,6 +531,9 @@ struct VehicleSystem {
     // Places the drop-off at the player spawn and parks the helicopter at the
     // start of its approach run, inbound on the given heading (radians, the
     // direction it flies toward).
+    // Started only for a level that inserts by helicopter, so the run always
+    // carries the player. A level using some other craft calls
+    // DisableBlackHawkInsertion instead.
     void BeginBlackHawkInsertion(const DirectX::XMFLOAT3& dropOff,
                                  float groundY, float approachHeading) {
         blackHawkDropOff = dropOff;
@@ -356,6 +694,23 @@ struct VehicleSystem {
         case BlackHawkPhase::Gone:
             break;
         }
+    }
+
+    // Stands the helicopter down for a level that inserts by some other means.
+    // Mirrors DisableInsertionBoat: the route is dropped and the drain switched
+    // off, so a reset does not resurrect a run this level never wanted.
+    void DisableBlackHawkInsertion() {
+        blackHawkRouteValid = false;
+        blackHawkVisible = false;
+        blackHawkCarryingPlayer = false;
+        blackHawkDroppedPlayer = false;
+        blackHawkBailedOut = false;
+        blackHawkJustCrashed = false;
+        blackHawkLanded = false;
+        blackHawkDrainRate = 0.0f;
+        blackHawkHealth = BlackHawkMaxHealth;
+        blackHawkCrashVelocity = { 0.0f, 0.0f, 0.0f };
+        blackHawkPhase = BlackHawkPhase::Gone;
     }
 
     // Kills the engine and starts the spiral, carrying whatever momentum the
@@ -526,6 +881,18 @@ public:
         boatDead = false;
         boatSunk = false;
         boatSinkDepth = 0.0f;
+
+        // Same for the insertion boat: re-run it from the heading the route was
+        // set up on, not the live yaw, which the turn-out and a founder list
+        // both leave pointing somewhere arbitrary.
+        insertionBoatRoll = 0.0f;
+        insertionBoatSinkOffset = 0.0f;
+        insertionBoatBobTime = 0.0f;
+        insertionBoatJustSank = false;
+        if (insertionBoatRouteValid) {
+            BeginInsertionBoatRun(insertionBoatLanding, insertionBoatWaterY,
+                                  insertionBoatApproachHeading);
+        }
 
         // Put the BlackHawk back at the start of its run so it flies the whole
         // insertion again on reload. Reuses the heading the route was set up

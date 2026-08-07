@@ -1549,6 +1549,18 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     const bool terrainChanged = ImGui::DragFloat("Terrain Height",
         &level_.terrainHeightScale, 0.1f, 0.0f, 50.0f);
     TrackItemEdit(terrainBefore, terrainChanged);
+    {
+        // How the player arrives. "Player choice" runs both craft in and lets
+        // the player pick which one carries them when the level starts.
+        const LevelDefinition insertionBefore = level_;
+        const char* modes[] = { "Helicopter", "Boat", "Player choice" };
+        int mode = static_cast<int>(level_.insertionMode);
+        const bool insertionChanged =
+            ImGui::Combo("Insertion", &mode, modes, IM_ARRAYSIZE(modes));
+        if (insertionChanged)
+            level_.insertionMode = static_cast<LevelInsertionMode>(mode);
+        TrackItemEdit(insertionBefore, insertionChanged);
+    }
     ImGui::Separator();
     LevelEntity* entity = Selected();
     if (entity) {

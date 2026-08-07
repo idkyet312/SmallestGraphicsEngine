@@ -51,6 +51,7 @@ int main() {
     level.dxrDDGI.probesPerFrame = 8;
     level.dxrDDGI.maxRayDistance = 42.0f;
     level.dxrDDGI.hysteresis = 0.9f;
+    level.insertionMode = LevelInsertionMode::PlayerChoice;
 
     const auto root = std::filesystem::temp_directory_path() /
                       "smallest-graphics-engine-level-tests";
@@ -82,6 +83,14 @@ int main() {
     CHECK(loaded.level.dxrDDGI.probesPerFrame == 8);
     CHECK(loaded.level.dxrDDGI.maxRayDistance == 42.0f);
     CHECK(loaded.level.dxrDDGI.hysteresis == 0.9f);
+    CHECK(loaded.level.insertionMode == LevelInsertionMode::PlayerChoice);
+    LevelInsertionMode insertion = LevelInsertionMode::Helicopter;
+    CHECK(ParseLevelInsertionMode("boat", insertion));
+    CHECK(insertion == LevelInsertionMode::Boat);
+    CHECK(std::string(LevelInsertionModeName(insertion)) == "boat");
+    CHECK(!ParseLevelInsertionMode("submarine", insertion));
+    // Unchanged by the failed parse.
+    CHECK(insertion == LevelInsertionMode::Boat);
 
     LevelDefinition duplicate = level;
     duplicate.entities[1].id = duplicate.entities[0].id;
@@ -120,6 +129,19 @@ int main() {
     LevelLoadResult legacyLoaded = LoadLevel(legacy);
     CHECK(legacyLoaded.ok);
     CHECK(!legacyLoaded.level.dxrDDGI.enabled);
+    // Files saved before insertion modes existed all arrived by helicopter.
+    CHECK(legacyLoaded.level.insertionMode == LevelInsertionMode::Helicopter);
+
+    // An unknown mode is rejected rather than silently falling back, so a typo
+    // in a hand-edited level is caught at load.
+    const auto badInsertion = root / "bad-insertion.json";
+    { std::ofstream stream(badInsertion); stream << R"({
+      "schemaVersion":1,"name":"Bad","insertionMode":"submarine",
+      "terrain":{"heightScale":5},
+      "entities":[{"id":1,"type":"player_spawn","name":"Player",
+      "transform":{"position":[0,1.7,0],"rotation":[0,0,0],
+      "scale":[1,1,1]}}]})"; }
+    CHECK(!LoadLevel(badInsertion).ok);
 
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);

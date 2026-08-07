@@ -47,6 +47,8 @@ extern std::shared_ptr<SceneNode> g_explosiveBarrelModel;
 extern std::shared_ptr<SceneNode> g_explosiveBarrelShadowModel;
 extern std::shared_ptr<SceneNode> g_humveeModel;
 extern std::shared_ptr<SceneNode> g_boatModel;
+extern std::shared_ptr<SceneNode> g_insertionBoatModel;
+extern std::shared_ptr<SceneNode> g_insertionBoatShadowModel;
 extern std::shared_ptr<SceneNode> g_humveeShadowModel;
 extern std::shared_ptr<SceneNode> g_boatShadowModel;
 extern std::shared_ptr<SceneNode> g_blackHawkModel;
@@ -79,6 +81,8 @@ DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
 DirectX::XMMATRIX HelicopterWorldMatrix();
 DirectX::XMMATRIX SecondaryHelicopterWorldMatrix();
 DirectX::XMMATRIX BoatWorldMatrix();
+DirectX::XMMATRIX InsertionBoatWorldMatrix();
+bool InsertionBoatVisible();
 DirectX::XMMATRIX BlackHawkWorldMatrix();
 // False once the insertion helicopter has climbed out of sight.
 bool BlackHawkVisible();
@@ -1107,7 +1111,13 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                            bool visibilityExtensionsOnly = false,
                            bool includeGrass = true) {
     XMMATRIX view = scene.GetViewMatrix();
-    XMMATRIX proj = scene.GetProjectionMatrix();
+    // Extension geometry (weapon viewmodel, skinned actors, foliage) writes no
+    // motion vectors, so TAA cannot reproject it and the sub-pixel jitter never
+    // cancels -- it reads as the whole view shaking. Draw it unjittered until
+    // those passes emit real per-object motion.
+    XMMATRIX proj = visibilityExtensionsOnly
+        ? scene.GetUnjitteredProjectionMatrix()
+        : scene.GetProjectionMatrix();
 
     shader.Use(scene.wireframeMode);
     shader.BindGlobalResources(shadowMap, g_ddgiIrradianceResource,
@@ -1517,6 +1527,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         } else if (!staticBatches.Submit(g_boatModel, BoatWorldMatrix()))
             DrawSceneNode(g_boatModel, shader, BoatWorldMatrix(),
                 view, proj, lightSpace);
+    }
+
+    // Runs its insertion every frame, so it never joins the static batch.
+    if (!g_emptyLevelMode && g_insertionBoatModel && InsertionBoatVisible()) {
+        DrawSceneNode(g_insertionBoatModel, shader, InsertionBoatWorldMatrix(),
+            view, proj, lightSpace, visibilityExtensionsOnly);
     }
 
     // Flies its insertion every frame, so it never joins the static batch. The

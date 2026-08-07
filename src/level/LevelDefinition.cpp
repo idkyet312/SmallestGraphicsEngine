@@ -90,6 +90,27 @@ bool ParseLevelEntityType(const std::string& text, LevelEntityType& type) {
     return false;
 }
 
+const char* LevelInsertionModeName(LevelInsertionMode mode) {
+    switch (mode) {
+    case LevelInsertionMode::Helicopter: return "helicopter";
+    case LevelInsertionMode::Boat: return "boat";
+    case LevelInsertionMode::PlayerChoice: return "player_choice";
+    }
+    return "helicopter";
+}
+
+bool ParseLevelInsertionMode(const std::string& text, LevelInsertionMode& mode) {
+    for (uint32_t i = static_cast<uint32_t>(LevelInsertionMode::Helicopter);
+         i <= static_cast<uint32_t>(LevelInsertionMode::PlayerChoice); ++i) {
+        const auto candidate = static_cast<LevelInsertionMode>(i);
+        if (text == LevelInsertionModeName(candidate)) {
+            mode = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
 LevelDefinition MakeLevelOneTemplate() {
     LevelDefinition level;
     level.name = "Level 1 Copy";
@@ -246,6 +267,17 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         LevelDefinition level;
         level.schemaVersion = root.at("schemaVersion").get<uint32_t>();
         level.name = root.at("name").get<std::string>();
+        // Absent on levels saved before insertion modes existed, which all
+        // arrived by helicopter.
+        if (root.contains("insertionMode")) {
+            const json& mode = root.at("insertionMode");
+            if (!mode.is_string())
+                throw std::runtime_error("insertionMode must be a string");
+            if (!ParseLevelInsertionMode(mode.get<std::string>(),
+                                         level.insertionMode))
+                throw std::runtime_error("unknown insertionMode '" +
+                                         mode.get<std::string>() + "'");
+        }
         level.terrainHeightScale = root.at("terrain").at("heightScale").get<float>();
         {
             const json& terrainRoot = root.at("terrain");
@@ -369,6 +401,7 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
         }
         const json root = {
             {"schemaVersion", level.schemaVersion}, {"name", level.name},
+            {"insertionMode", LevelInsertionModeName(level.insertionMode)},
             {"terrain", {{"heightScale", level.terrainHeightScale},
                          {"tilesX", level.terrainTilesX},
                          {"tilesZ", level.terrainTilesZ},
