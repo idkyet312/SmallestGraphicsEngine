@@ -116,6 +116,8 @@ struct alignas(256) VBPostConstants {
     float farPlane;
     UINT debugViewMode;
     UINT validationMode;
+    UINT surfaceHistoryValid;
+    UINT historyDebugView;
 };
 
 struct alignas(256) VBExposureConstants {
@@ -129,6 +131,18 @@ class VisibilityBufferDX12 {
 public:
     // Full-width instance and primitive IDs (R32G32_UINT).
     ComPtr<ID3D12Resource> visBufferRT;
+    // Previous frame's IDs. This is what makes temporal reuse exact: a pixel
+    // whose instance+primitive match last frame's is provably the same surface,
+    // rather than "depth and normal look similar". Screen-space heuristics
+    // cannot express that, which is the whole point.
+    ComPtr<ID3D12Resource> visBufferHistory;
+    bool surfaceHistoryValid = false;
+    // Use exact surface IDs for temporal validity instead of the depth
+    // heuristic. On by default: it is strictly better information, costs one
+    // texture fetch, and the fallback stays for the frame after a resize.
+    bool surfaceIDTemporalEnabled = true;
+    // Debug view colouring pixels by why history was kept or rejected.
+    bool historyDebugView = false;
     ComPtr<ID3D12DescriptorHeap> visRtvHeap;    // RTV for visibility pass
     ComPtr<ID3D12DescriptorHeap> visSrvUavHeap; // SRV/UAV for compute resolve
 
@@ -161,9 +175,50 @@ public:
     // Compute resolve PSO + root signature
     ComPtr<ID3D12RootSignature> resolveRootSig;
     ComPtr<ID3D12PipelineState> resolvePSO;
+
+    // Enhanced-visuals resolve: same shader source compiled at cs_6_5 with
+    // SGE_ENHANCED_VISUALS, adding inline RayQuery. Null when unavailable
+    // (no DXC, no Tier 1.1, or a compile failure), which is the signal the
+    // enhanced tier cannot be enabled.
+    ComPtr<ID3D12RootSignature> enhancedResolveRootSig;
+    ComPtr<ID3D12PipelineState> enhancedResolvePSO;
+    // Per-pixel record of which pixels were routed to RT (u3), plus the
+    // readback used to report the ray fraction to the UI.
+    ComPtr<ID3D12Resource> rayMaskTexture;
+    ComPtr<ID3D12Resource> rayMaskReadback;
+    ComPtr<ID3D12Resource> enhancedConstantBuffer;
+    void* enhancedConstantMapped = nullptr;
+    bool enhancedPipelineReady = false;
+    // Mirrors the default compute heap and appends TLAS / ray mask / enhanced
+    // constants, so the default layout's hardcoded slot indices stay valid.
+    ComPtr<ID3D12DescriptorHeap> enhancedComputeDescHeap;
+    // Set per frame by the caller from scene.enhancedVisuals. Kept separate
+    // from enhancedPipelineReady (a capability) so the UI can toggle freely
+    // without rebuilding anything.
+    bool enhancedVisualsActive = false;
+    bool enhancedRTShadowsActive = true;
+    bool enhancedRayClassifyActive = true;
+    float enhancedConfidenceThreshold = 0.35f;
+    float enhancedShadowRayLength = 220.0f;
+    // TLAS this frame. Re-registered whenever it changes, since the
+    // acceleration structure is rebuilt as geometry streams in.
+    D3D12_GPU_VIRTUAL_ADDRESS enhancedTLASAddress = 0;
+    // Ray-fraction statistic. Sampled from a few scanlines every N frames
+    // rather than reduced over the full mask -- it only needs to be indicative,
+    // and a full-screen reduction would cost more than the rays it measures.
+    static constexpr UINT kRayMaskSampleRows = 8;
+    static constexpr UINT kRayMaskSampleInterval = 30;
+    UINT rayMaskRowPitch = 0;
+    UINT rayMaskFrameCounter = 0;
+    bool rayMaskCopyPending = false;
+    float rayMaskFraction = 0.0f;
     ComPtr<ID3D12RootSignature> postRootSig;
     ComPtr<ID3D12PipelineState> postPSO;
     ComPtr<ID3D12DescriptorHeap> postDescHeap;
+    // Descriptors per parity in postDescHeap: 8 SRVs (hdr, motion, history,
+    // exposure, LUT, depth, visDepth, bloom) + 2 surface-ID SRVs + 2 UAVs
+    // (present, history). The heap holds two of these, one per history parity.
+    static constexpr UINT kPostDescriptorsPerParity = 12;
     ComPtr<ID3D12RootSignature> bloomRootSig;
     ComPtr<ID3D12PipelineState> bloomDownsamplePSO;
     ComPtr<ID3D12PipelineState> bloomUpsamplePSO;
@@ -775,12 +830,23 @@ public:
         fc.palmParams = palmWindFrame.params;
         frameConstantBuffer.CopyData(g_dx12.frameIndex, fc);
 
-        // Set compute pipeline
-        cmdList->SetComputeRootSignature(resolveRootSig.Get());
-        cmdList->SetPipelineState(resolvePSO.Get());
+        // Set compute pipeline. The enhanced variant is used only when it built
+        // successfully AND the caller asked for it this frame; otherwise this
+        // is bit-for-bit the original path.
+        const bool useEnhanced = enhancedVisualsActive && enhancedPipelineReady &&
+                                 enhancedResolvePSO && enhancedComputeDescHeap;
+        if (useEnhanced) {
+            UpdateEnhancedConstants();
+            cmdList->SetComputeRootSignature(enhancedResolveRootSig.Get());
+            cmdList->SetPipelineState(enhancedResolvePSO.Get());
+        } else {
+            cmdList->SetComputeRootSignature(resolveRootSig.Get());
+            cmdList->SetPipelineState(resolvePSO.Get());
+        }
 
         // Set descriptor heap
-        ID3D12DescriptorHeap* heaps[] = { computeDescHeap.Get() };
+        ID3D12DescriptorHeap* heaps[] = {
+            useEnhanced ? enhancedComputeDescHeap.Get() : computeDescHeap.Get() };
         cmdList->SetDescriptorHeaps(1, heaps);
 
         // Bind root parameters
@@ -795,7 +861,9 @@ public:
 
         // Descriptor table at root param 1 (SRVs + UAV)
         cmdList->SetComputeRootDescriptorTable(1,
-            computeDescHeap->GetGPUDescriptorHandleForHeapStart());
+            useEnhanced
+                ? enhancedComputeDescHeap->GetGPUDescriptorHandleForHeapStart()
+                : computeDescHeap->GetGPUDescriptorHandleForHeapStart());
 
         // Dispatch (GPU-driven via ExecuteIndirect)
         UINT groupsX = (width + 7) / 8;
@@ -811,6 +879,10 @@ public:
             cmdList->Dispatch(groupsX, groupsY, 1);
         }
 
+        // Sample how much of the screen went to RT. Only meaningful when the
+        // enhanced resolve actually wrote the mask this frame.
+        if (useEnhanced) UpdateRayMaskStatistic(cmdList);
+
         // Keep linear HDR, motion vectors, and surface data as SRVs.
         {
             D3D12_RESOURCE_BARRIER barriers[3] = {};
@@ -825,6 +897,11 @@ public:
             barriers[2].Transition.pResource = normalRoughnessTexture.Get();
             cmdList->ResourceBarrier(3, barriers);
         }
+
+        // Snapshot this frame's surface IDs for next frame's temporal validity
+        // test. The resolve above has finished reading visBufferRT, so nothing
+        // races the copy.
+        CaptureSurfaceHistory(cmdList);
 
         // Preserve visibility depth before forward-only animated/alpha-tested
         // geometry modifies it. Post uses the difference as a reactive mask.
@@ -1019,6 +1096,13 @@ public:
         constants.farPlane = currentFarPlane;
         constants.debugViewMode = static_cast<UINT>(debugViewMode);
         constants.validationMode = validationMode ? 1u : 0u;
+        // Exact surface correspondence is available once a history frame has
+        // been captured. Suppressed in parity mode, which compares against the
+        // Forward renderer and must not gain a temporal advantage.
+        constants.surfaceHistoryValid =
+            (surfaceHistoryValid && surfaceIDTemporalEnabled && !validationMode)
+                ? 1u : 0u;
+        constants.historyDebugView = historyDebugView ? 1u : 0u;
         postConstantBuffer.CopyData(g_dx12.frameIndex, constants);
 
         cmdList->SetComputeRootSignature(postRootSig.Get());
@@ -1029,7 +1113,8 @@ public:
             postConstantBuffer.GetGPUAddress(g_dx12.frameIndex));
         D3D12_GPU_DESCRIPTOR_HANDLE table =
             postDescHeap->GetGPUDescriptorHandleForHeapStart();
-        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize * historyIndex * 10;
+        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize * historyIndex *
+                     kPostDescriptorsPerParity;
         cmdList->SetComputeRootDescriptorTable(1, table);
         cmdList->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 
@@ -1084,6 +1169,8 @@ public:
         height = newHeight;
 
         visBufferRT.Reset();
+        visBufferHistory.Reset();
+        surfaceHistoryValid = false;
         outputTexture.Reset();
         presentTexture.Reset();
         motionTexture.Reset();
@@ -1098,9 +1185,19 @@ public:
         exposureReadable = false;
         visRtvHeap.Reset();
         outputRtvHeap.Reset();
+        // Screen-sized like the rest; without this the enhanced resolve would
+        // keep writing its mask at the old dimensions after a window resize.
+        rayMaskTexture.Reset();
+        rayMaskReadback.Reset();
 
         CreateVisBufferRT();
         CreateOutputTexture();
+        if (enhancedPipelineReady) {
+            CreateRayMaskResources();
+            // The descriptor heap points at the destroyed mask texture, so it
+            // has to be rebuilt before the next enhanced dispatch.
+            enhancedComputeDescHeap.Reset();
+        }
         UpdateComputeDescriptors();
         UpdateBloomDescriptors();
         UpdatePostDescriptors();
@@ -1148,7 +1245,56 @@ private:
         g_dx12.device->CreateRenderTargetView(visBufferRT.Get(), &rtvDesc,
             visRtvHeap->GetCPUDescriptorHandleForHeapStart());
 
+        // Surface-ID history: last frame's instance/primitive IDs.
+        //
+        // A straight copy of visBufferRT rather than a second render target
+        // with alternating RTVs -- the visibility pass and every consumer keep
+        // referring to one resource, and the copy is ~8 MB of bandwidth once
+        // per frame. Cheaper in complexity than ping-ponging the RTV, and the
+        // GPU copy does not stall anything.
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&visBufferHistory)))) {
+            std::cerr << "Failed to create visibility history buffer\n";
+            return false;
+        }
+        surfaceHistoryValid = false;
+
         return true;
+    }
+
+    // Copies this frame's IDs into the history texture, for next frame's
+    // temporal validity test. Runs after the resolve has consumed the current
+    // vis buffer, so the copy never races a reader.
+    void CaptureSurfaceHistory(ID3D12GraphicsCommandList* cmdList) {
+        if (!visBufferRT || !visBufferHistory) return;
+
+        D3D12_RESOURCE_BARRIER barriers[2] = {};
+        for (UINT i = 0; i < 2; ++i) {
+            barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[i].Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        barriers[0].Transition.pResource = visBufferRT.Get();
+        barriers[0].Transition.StateBefore =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barriers[1].Transition.pResource = visBufferHistory.Get();
+        barriers[1].Transition.StateBefore =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        cmdList->ResourceBarrier(2, barriers);
+
+        cmdList->CopyResource(visBufferHistory.Get(), visBufferRT.Get());
+
+        std::swap(barriers[0].Transition.StateBefore,
+                  barriers[0].Transition.StateAfter);
+        std::swap(barriers[1].Transition.StateBefore,
+                  barriers[1].Transition.StateAfter);
+        cmdList->ResourceBarrier(2, barriers);
+        surfaceHistoryValid = true;
     }
 
     bool CreateOutputTexture() {
@@ -1638,6 +1784,393 @@ private:
         return true;
     }
 
+    // Uploads the per-frame enhanced constants (b5).
+    void UpdateEnhancedConstants() {
+        if (!enhancedConstantMapped) return;
+        struct EnhancedConstants {
+            UINT  rtShadows;
+            UINT  rayClassify;
+            float shadowRayLength;
+            float confidenceThreshold;
+        } constants;
+        constants.rtShadows = enhancedRTShadowsActive ? 1u : 0u;
+        constants.rayClassify = enhancedRayClassifyActive ? 1u : 0u;
+        constants.shadowRayLength = enhancedShadowRayLength;
+        constants.confidenceThreshold = enhancedConfidenceThreshold;
+        memcpy(enhancedConstantMapped, &constants, sizeof(constants));
+    }
+
+    // Builds the SM 6.5 resolve variant. Mirrors the root signature of the
+    // default resolve and extends it with the TLAS SRV (t79), the ray-mask UAV
+    // (u3) and the enhanced constants (b5).
+    //
+    // Every failure path leaves enhancedPipelineReady false and returns without
+    // disturbing the default PSO, so an old driver or a missing dxcompiler.dll
+    // costs nothing but the feature.
+    void CreateEnhancedResolvePipeline(const std::string& csCode,
+                                       const D3D12_DESCRIPTOR_RANGE* baseRanges,
+                                       const D3D12_STATIC_SAMPLER_DESC* samplers) {
+        enhancedPipelineReady = false;
+        if (!ShaderCacheDX12::DxcAvailable()) {
+            std::cout << "Enhanced visuals: dxcompiler.dll unavailable\n";
+            return;
+        }
+
+        // Prepend the define rather than passing -D so the cache key (which
+        // hashes the source text) separates the two variants automatically.
+        const std::string enhancedSource =
+            "#define SGE_ENHANCED_VISUALS 1\n" + csCode;
+
+        const std::wstring shaderDirectory =
+            ShaderCacheDX12::ExecutableDirectory() + L"shaders";
+        ComPtr<ID3DBlob> csBlob;
+        std::string errors;
+        if (!ShaderCacheDX12::CompileCachedDXC(
+                enhancedSource, L"visbuf_resolve_cs.hlsl", L"main", L"cs_6_5",
+                shaderDirectory, &csBlob, &errors)) {
+            std::cerr << "Enhanced visuals: resolve compile failed\n";
+            if (!errors.empty()) {
+                std::cerr << errors << std::endl;
+                std::ofstream log("enhanced_resolve_shader_error.log",
+                                  std::ios::trunc);
+                log << errors;
+            }
+            return;
+        }
+
+        // The enhanced variant gets its OWN descriptor heap, mirroring the
+        // default layout in slots [0..85] and appending the three new
+        // descriptors after it. Widening the shared heap in place would mean
+        // renumbering every hardcoded slot index the default resolve depends
+        // on -- exactly the kind of churn that could regress the default path.
+        //
+        //   [0..78]  t0..t78  as the default resolve
+        //   [79..81] u0..u2   as the default resolve
+        //   [82..85] b1..b4   as the default resolve
+        //   [86]     t79      TLAS               (new)
+        //   [87]     u3       ray mask           (new)
+        //   [88]     b5       enhanced constants (new)
+        D3D12_DESCRIPTOR_RANGE ranges[6] = {};
+        ranges[0] = baseRanges[0];                          // t0..t78
+        ranges[1] = baseRanges[1];                          // u0..u2 @ 79
+        ranges[2] = baseRanges[2];                          // b1..b4 @ 82
+
+        ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[3].NumDescriptors = 1;
+        ranges[3].BaseShaderRegister = 79;                  // t79 TLAS
+        ranges[3].RegisterSpace = 0;
+        ranges[3].OffsetInDescriptorsFromTableStart = 86;
+
+        ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[4].NumDescriptors = 1;
+        ranges[4].BaseShaderRegister = 3;                   // u3 ray mask
+        ranges[4].RegisterSpace = 0;
+        ranges[4].OffsetInDescriptorsFromTableStart = 87;
+
+        ranges[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+        ranges[5].NumDescriptors = 1;
+        ranges[5].BaseShaderRegister = 5;                   // b5 constants
+        ranges[5].RegisterSpace = 0;
+        ranges[5].OffsetInDescriptorsFromTableStart = 88;
+
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[0].Descriptor.RegisterSpace = 0;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable.NumDescriptorRanges = _countof(ranges);
+        params[1].DescriptorTable.pDescriptorRanges = ranges;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
+        rootSigDesc.NumParameters = 2;
+        rootSigDesc.pParameters = params;
+        rootSigDesc.NumStaticSamplers = 2;
+        rootSigDesc.pStaticSamplers = samplers;
+
+        ComPtr<ID3DBlob> sigBlob, sigError;
+        if (FAILED(D3D12SerializeRootSignature(&rootSigDesc,
+                D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, &sigError))) {
+            if (sigError)
+                std::cerr << "Enhanced resolve root sig: "
+                          << (const char*)sigError->GetBufferPointer() << "\n";
+            return;
+        }
+        if (FAILED(g_dx12.device->CreateRootSignature(
+                0, sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(),
+                IID_PPV_ARGS(&enhancedResolveRootSig))))
+            return;
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+        psoDesc.pRootSignature = enhancedResolveRootSig.Get();
+        psoDesc.CS = { csBlob->GetBufferPointer(), csBlob->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateComputePipelineState(
+                &psoDesc, IID_PPV_ARGS(&enhancedResolvePSO)))) {
+            std::cerr << "Enhanced visuals: resolve PSO creation failed\n";
+            enhancedResolveRootSig.Reset();
+            return;
+        }
+
+        // 256-byte aligned upload CBV for the enhanced constants, persistently
+        // mapped like the other per-frame buffers here.
+        D3D12_HEAP_PROPERTIES heapProps = {};
+        heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bufferDesc = {};
+        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufferDesc.Width = 256;
+        bufferDesc.Height = 1;
+        bufferDesc.DepthOrArraySize = 1;
+        bufferDesc.MipLevels = 1;
+        bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+        bufferDesc.SampleDesc.Count = 1;
+        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&enhancedConstantBuffer)))) {
+            enhancedResolvePSO.Reset();
+            enhancedResolveRootSig.Reset();
+            return;
+        }
+        D3D12_RANGE noRead = { 0, 0 };
+        enhancedConstantBuffer->Map(0, &noRead, &enhancedConstantMapped);
+
+        if (!CreateRayMaskResources()) {
+            enhancedResolvePSO.Reset();
+            enhancedResolveRootSig.Reset();
+            return;
+        }
+
+        enhancedPipelineReady = true;
+        std::cout << "Enhanced visuals: SM6.5 resolve ready (inline RayQuery)\n";
+    }
+
+    // Ray-mask texture (u3) plus the staging buffer used to read back what
+    // fraction of the screen was routed to RT.
+    bool CreateRayMaskResources() {
+        D3D12_HEAP_PROPERTIES defaultHeap = {};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = width;
+        desc.Height = height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R8_UINT;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                IID_PPV_ARGS(&rayMaskTexture))))
+            return false;
+
+        // Readback of a single scanline, sampled every few frames. The
+        // statistic only needs to be indicative -- copying the whole mask each
+        // frame would cost more bandwidth than the rays it is measuring.
+        rayMaskRowPitch =
+            (width + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
+            ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+        D3D12_HEAP_PROPERTIES readbackHeap = {};
+        readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bufferDesc = {};
+        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufferDesc.Width = (UINT64)rayMaskRowPitch * kRayMaskSampleRows;
+        bufferDesc.Height = 1;
+        bufferDesc.DepthOrArraySize = 1;
+        bufferDesc.MipLevels = 1;
+        bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+        bufferDesc.SampleDesc.Count = 1;
+        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &readbackHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&rayMaskReadback))))
+            return false;
+        rayMaskCopyPending = false;
+        rayMaskFrameCounter = 0;
+        return true;
+    }
+
+    // Copies a few scanlines of the mask for the CPU to sample, and reduces
+    // whatever the *previous* copy left in the readback buffer.
+    //
+    // Never maps a resource the GPU might still be writing: the copy issued
+    // this frame is read some frames later, by which point the frame fence has
+    // long since passed it. That is why this is a statistic and not a
+    // synchronisation point.
+    void UpdateRayMaskStatistic(ID3D12GraphicsCommandList* cmdList) {
+        if (!rayMaskTexture || !rayMaskReadback) return;
+
+        // Reduce the previous copy first, before overwriting it.
+        if (rayMaskCopyPending &&
+            rayMaskFrameCounter % kRayMaskSampleInterval == 0) {
+            D3D12_RANGE readRange = {
+                0, (SIZE_T)rayMaskRowPitch * kRayMaskSampleRows };
+            void* mapped = nullptr;
+            if (SUCCEEDED(rayMaskReadback->Map(0, &readRange, &mapped)) && mapped) {
+                const auto* bytes = static_cast<const uint8_t*>(mapped);
+                uint32_t traced = 0, total = 0;
+                for (UINT row = 0; row < kRayMaskSampleRows; ++row) {
+                    const uint8_t* line = bytes + (size_t)row * rayMaskRowPitch;
+                    for (UINT x = 0; x < width; ++x) {
+                        traced += line[x] != 0 ? 1u : 0u;
+                        ++total;
+                    }
+                }
+                D3D12_RANGE noWrite = { 0, 0 };
+                rayMaskReadback->Unmap(0, &noWrite);
+                rayMaskFraction = total ? (float)traced / (float)total : 0.0f;
+            }
+            rayMaskCopyPending = false;
+        }
+
+        ++rayMaskFrameCounter;
+        if (rayMaskFrameCounter % kRayMaskSampleInterval != 0) return;
+
+        // Sample rows spread down the screen rather than a contiguous band, so
+        // the statistic is not dominated by whatever happens to be at the top.
+        D3D12_RESOURCE_BARRIER toCopy = {};
+        toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toCopy.Transition.pResource = rayMaskTexture.Get();
+        toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &toCopy);
+
+        for (UINT row = 0; row < kRayMaskSampleRows; ++row) {
+            const UINT sourceY =
+                (UINT)((uint64_t)height * (row * 2u + 1u) /
+                       (kRayMaskSampleRows * 2u));
+            D3D12_TEXTURE_COPY_LOCATION source = {};
+            source.pResource = rayMaskTexture.Get();
+            source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            source.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION destination = {};
+            destination.pResource = rayMaskReadback.Get();
+            destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            destination.PlacedFootprint.Offset =
+                (UINT64)rayMaskRowPitch * row;
+            destination.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UINT;
+            destination.PlacedFootprint.Footprint.Width = width;
+            destination.PlacedFootprint.Footprint.Height = 1;
+            destination.PlacedFootprint.Footprint.Depth = 1;
+            destination.PlacedFootprint.Footprint.RowPitch = rayMaskRowPitch;
+            D3D12_BOX box = {};
+            box.left = 0;
+            box.right = width;
+            box.top = sourceY;
+            box.bottom = sourceY + 1u;
+            box.front = 0;
+            box.back = 1;
+            cmdList->CopyTextureRegion(&destination, 0, 0, 0, &source, &box);
+        }
+
+        toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        cmdList->ResourceBarrier(1, &toCopy);
+        rayMaskCopyPending = true;
+    }
+
+    // Builds the enhanced heap: a copy of the default resolve heap's 86
+    // descriptors, then TLAS / ray mask / enhanced constants appended.
+    //
+    // Called after the default heap is populated and whenever the TLAS address
+    // changes. Copying rather than sharing keeps the default layout's
+    // hardcoded indices untouched.
+    void RefreshEnhancedDescriptors() {
+        if (!enhancedPipelineReady || !computeDescHeap) return;
+
+        if (!enhancedComputeDescHeap) {
+            D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+            heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            heapDesc.NumDescriptors = 89;   // 86 mirrored + 3 appended
+            heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            if (FAILED(g_dx12.device->CreateDescriptorHeap(
+                    &heapDesc, IID_PPV_ARGS(&enhancedComputeDescHeap))))
+                return;
+        }
+
+        const UINT descSize = g_dx12.cbvSrvUavDescriptorSize;
+        // Mirror the default heap. CopyDescriptorsSimple needs a non-shader-
+        // visible source, so this copies through the CPU handle of the shader-
+        // visible heap, which is legal for CBV_SRV_UAV heaps.
+        g_dx12.device->CopyDescriptorsSimple(86,
+            enhancedComputeDescHeap->GetCPUDescriptorHandleForHeapStart(),
+            computeDescHeap->GetCPUDescriptorHandleForHeapStart(),
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            enhancedComputeDescHeap->GetCPUDescriptorHandleForHeapStart();
+
+        // [86] t79 - TLAS. The slot must hold a valid descriptor even when
+        // there is no acceleration structure yet: the runtime requires every
+        // slot in a bound table to be populated, and an untouched slot is
+        // garbage rather than null. A zero Location is the documented way to
+        // express a null TLAS binding.
+        {
+            D3D12_CPU_DESCRIPTOR_HANDLE tlasHandle = handle;
+            tlasHandle.ptr += (UINT64)descSize * 86;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.RaytracingAccelerationStructure.Location = enhancedTLASAddress;
+            // A TLAS SRV is always created against a null resource -- the GPU
+            // address in the desc is the entire binding.
+            g_dx12.device->CreateShaderResourceView(nullptr, &srv, tlasHandle);
+        }
+
+        // [87] u3 - ray mask
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = DXGI_FORMAT_R8_UINT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            D3D12_CPU_DESCRIPTOR_HANDLE maskHandle = handle;
+            maskHandle.ptr += (UINT64)descSize * 87;
+            g_dx12.device->CreateUnorderedAccessView(
+                rayMaskTexture.Get(), nullptr, &uav, maskHandle);
+        }
+
+        // [88] b5 - enhanced constants
+        {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv = {};
+            cbv.BufferLocation =
+                enhancedConstantBuffer->GetGPUVirtualAddress();
+            cbv.SizeInBytes = 256;
+            D3D12_CPU_DESCRIPTOR_HANDLE cbvHandle = handle;
+            cbvHandle.ptr += (UINT64)descSize * 88;
+            g_dx12.device->CreateConstantBufferView(&cbv, cbvHandle);
+        }
+    }
+
+public:
+    // Called per frame with the current toggle state and TLAS. Rebuilding the
+    // descriptors only when the TLAS moves keeps this close to free.
+    void SetEnhancedVisuals(bool active, bool rtShadows, bool rayClassify,
+                            float confidenceThreshold,
+                            D3D12_GPU_VIRTUAL_ADDRESS tlasAddress) {
+        enhancedRTShadowsActive = rtShadows;
+        enhancedRayClassifyActive = rayClassify;
+        enhancedConfidenceThreshold = confidenceThreshold;
+        // Without a TLAS there is nothing to trace against, so the enhanced
+        // path would just be a slower way to get the same image.
+        const bool wantActive = active && tlasAddress != 0;
+        const bool tlasChanged = tlasAddress != enhancedTLASAddress;
+        enhancedTLASAddress = tlasAddress;
+        if (wantActive && (tlasChanged || !enhancedComputeDescHeap))
+            RefreshEnhancedDescriptors();
+        enhancedVisualsActive = wantActive;
+    }
+
+    bool EnhancedVisualsReady() const { return enhancedPipelineReady; }
+    // Fraction of sampled pixels routed to RT last time the statistic updated.
+    // 0..1; indicative rather than exact (see UpdateRayMaskStatistic).
+    float EnhancedRayFraction() const { return rayMaskFraction; }
+
+private:
+
     bool CreateResolvePipeline() {
         // Read and compile compute shader
         std::ifstream csFile("shaders/visbuf_resolve_cs.hlsl");
@@ -1779,6 +2312,19 @@ private:
             std::cerr << "Failed to create VB resolve compute PSO" << std::endl;
             return false;
         }
+
+        // ---- Enhanced (SM 6.5) resolve variant ----
+        //
+        // Built alongside the FXC PSO above rather than replacing it. The
+        // default frame keeps running the exact shader it always has, compiled
+        // by the same compiler; the enhanced variant is a second PSO selected
+        // at dispatch time. That containment is deliberate: this shader runs
+        // for every pixel, so a DXC codegen difference must not be able to
+        // regress the default path.
+        //
+        // Failure here is non-fatal and simply leaves enhanced visuals
+        // unavailable (no DXC, no Tier 1.1, or a compile error).
+        CreateEnhancedResolvePipeline(csCode, ranges, staticSamplers);
 
         // Create indirect dispatch command signature + args buffer
         {
@@ -2369,14 +2915,15 @@ private:
         }
 
         D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+        // t0..t9: the original eight plus current/previous surface IDs.
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 8;
+        ranges[0].NumDescriptors = 10;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         ranges[1].NumDescriptors = 2;
         ranges[1].BaseShaderRegister = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 8;
+        ranges[1].OffsetInDescriptorsFromTableStart = 10;
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -2416,7 +2963,7 @@ private:
         if (FAILED(hr)) return false;
 
         D3D12_DESCRIPTOR_HEAP_DESC heap = {};
-        heap.NumDescriptors = 20;
+        heap.NumDescriptors = kPostDescriptorsPerParity * 2u;
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = g_dx12.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&postDescHeap));
@@ -2432,7 +2979,8 @@ private:
         for (UINT parity = 0; parity < 2; ++parity) {
             D3D12_CPU_DESCRIPTOR_HANDLE handle =
                 postDescHeap->GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (SIZE_T)descriptorSize * parity * 10;
+            handle.ptr += (SIZE_T)descriptorSize * parity *
+                          kPostDescriptorsPerParity;
 
             D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
             srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -2484,6 +3032,20 @@ private:
             bloomSrv.Texture2D.MipLevels = 1;
             g_dx12.device->CreateShaderResourceView(
                 bloomTexture.Get(), &bloomSrv, handle);
+            handle.ptr += descriptorSize;
+            // t8/t9 - current and previous surface IDs, for exact temporal
+            // validity. Both are R32G32_UINT: instance in .x, primitive in .y.
+            D3D12_SHADER_RESOURCE_VIEW_DESC idSrv = {};
+            idSrv.Format = DXGI_FORMAT_R32G32_UINT;
+            idSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            idSrv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            idSrv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(
+                visBufferRT.Get(), &idSrv, handle);
+            handle.ptr += descriptorSize;
+            g_dx12.device->CreateShaderResourceView(
+                visBufferHistory.Get(), &idSrv, handle);
             handle.ptr += descriptorSize;
 
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};

@@ -28,6 +28,10 @@ extern UINT g_shadowBatchInstances;
 extern UINT g_destructionBatchesThisFrame;
 extern UINT g_destructionChunksSubmittedThisFrame;
 extern UINT g_destructionCulledThisFrame;
+// True when the device reports DXR Tier 1.1 (inline RayQuery), which the
+// enhanced-visuals tier requires. Published from main so the UI does not need
+// the renderer object.
+extern bool g_inlineRaytracingSupported;
 extern UINT g_dxrDDGIProbeCount;
 extern UINT g_dxrDDGICellCount;
 extern float g_dxrDDGICellSize;
@@ -595,9 +599,61 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ImGui::SliderFloat("VB Vignette", &vb.vignetteStrength, 0.0f, 1.0f, "%.2f");
                 ImGui::SliderFloat("VB Film Grain", &vb.grainStrength, 0.0f, 0.08f, "%.3f");
             }
+            // Ray-traced tier on top of the visibility buffer. Reports why it
+            // is unavailable rather than silently doing nothing -- the two
+            // requirements (Tier 1.1 hardware, a DXC-compiled SM6.5 resolve)
+            // fail independently.
+            ImGui::Separator();
+            if (!g_inlineRaytracingSupported) {
+                ImGui::TextDisabled("Enhanced Visuals: needs DXR Tier 1.1");
+            } else if (!vb.EnhancedVisualsReady()) {
+                ImGui::TextDisabled("Enhanced Visuals: SM6.5 resolve unavailable");
+                ImGui::TextDisabled("  (dxcompiler.dll missing or compile failed)");
+            } else {
+                ImGui::Checkbox("Enhanced Visuals (RT)", &scene.enhancedVisuals);
+                if (scene.enhancedVisuals) {
+                    if (vb.validationMode) {
+                        ImGui::TextDisabled("  Suspended: parity mode active");
+                    } else if (!scene.useVisibilityBuffer) {
+                        ImGui::TextDisabled("  Needs the VB path");
+                    }
+                    ImGui::Checkbox("  RT Sun Shadows", &scene.enhancedRTShadows);
+                    ImGui::Checkbox("  Ray Classification",
+                                    &scene.enhancedRayClassify);
+                    if (scene.enhancedRayClassify) {
+                        ImGui::SliderFloat("  RT Threshold",
+                            &scene.enhancedConfidenceThreshold,
+                            0.05f, 1.0f, "%.2f");
+                        ImGui::TextDisabled(
+                            "  Cheap tier resolves most pixels; rays go");
+                        ImGui::TextDisabled(
+                            "  only where confidence is below this.");
+                    } else {
+                        ImGui::TextDisabled("  Tracing every lit pixel (slow)");
+                    }
+                    // The headline "is classification earning its keep"
+                    // number. Sampled from scanlines every 30 frames, so it
+                    // settles rather than tracking instantly.
+                    ImGui::Text("  Rays: %.1f%% of sampled pixels",
+                                scene.enhancedRayFraction * 100.0f);
+                }
+            }
+            ImGui::Separator();
+
             if (ImGui::Checkbox("Temporal AA (TAA)",
                                 &vb.temporalEffectsEnabled))
                 vb.InvalidateTemporalHistory();
+            // Exact instance+primitive history validity. The visibility buffer
+            // knows which triangle produced each pixel, so temporal reuse can
+            // prove correspondence instead of inferring it from depth/normal.
+            ImGui::Checkbox("Surface-ID Temporal Validity",
+                            &vb.surfaceIDTemporalEnabled);
+            if (vb.surfaceIDTemporalEnabled) {
+                ImGui::Checkbox("  History Debug View", &vb.historyDebugView);
+                if (vb.historyDebugView)
+                    ImGui::TextDisabled(
+                        "  green=reused  red=rejected  blue=offscreen");
+            }
             if (vb.temporalEffectsEnabled) {
                 ImGui::SliderFloat("TAA History Weight", &vb.taaFeedback,
                                    0.70f, 0.95f, "%.2f");

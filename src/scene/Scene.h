@@ -423,6 +423,31 @@ struct Scene {
     bool useVisibilityBuffer = true; // Fast hybrid default; M toggles Forward fallback
     bool useRaytracing       = false; // DXR raytracing mode
 
+    // Upgraded visuals: the hybrid ray-traced tier layered on top of the
+    // visibility buffer. Off by default because it costs several ms and needs
+    // DXR Tier 1.1 (inline RayQuery) -- EnhancedVisualsAvailable() gates it on
+    // the hardware actually reporting that. Everything under this flag degrades
+    // to the existing raster path when it is off, so the default frame is
+    // byte-for-byte what it was before.
+    //
+    // Structured as a cheap-tier-first hybrid rather than "ray trace
+    // everything": screen-space, probes and temporal history resolve most
+    // pixels, and rays are spent only where those report low confidence. See
+    // enhancedRayFraction for what that costs in practice.
+    bool enhancedVisuals     = false;
+    // Sub-toggles, so the expensive parts can be bisected when profiling. Each
+    // is a no-op unless enhancedVisuals is on.
+    bool enhancedRTShadows   = true;   // RayQuery sun shadows, replaces CSM
+    bool enhancedRayClassify = true;   // Spend rays only on low-confidence pixels
+    // Confidence below which a pixel is handed to RT. Raising it traces more
+    // pixels (better, slower). Live-tunable so the split can be dialled in
+    // against a real scene rather than guessed.
+    float enhancedConfidenceThreshold = 0.35f;
+    // Read back from the classify pass: fraction of pixels routed to RT last
+    // frame. Displayed in the UI as the headline "is classification earning its
+    // keep" number -- expect 0.05-0.20 on typical scenes.
+    float enhancedRayFraction = 0.0f;
+
     // DXGI present sync interval: 0 uncapped (tearing allowed), 1 every vblank,
     // 2+ divides the refresh rate (2 = half, 3 = a third...). Kept as the raw
     // interval rather than a bool so the UI can expose the divisors.
@@ -1365,10 +1390,7 @@ struct Scene {
     }
     XMMATRIX GetViewMatrix()       const { return const_cast<Camera&>(camera).GetViewMatrix(); }
     XMMATRIX GetProjectionMatrix() const {
-        XMMATRIX projection = XMMatrixPerspectiveFovLH(
-            XMConvertToRadians(EffectiveCameraFOV()),
-            (float)g_dx12.screenWidth / (float)g_dx12.screenHeight,
-            cameraNear, cameraFar);
+        XMMATRIX projection = GetUnjitteredProjectionMatrix();
         if (g_dx12.screenWidth > 0 && g_dx12.screenHeight > 0) {
             const float jitterX = 2.0f * temporalJitterPixels.x /
                                   static_cast<float>(g_dx12.screenWidth);
@@ -1378,6 +1400,24 @@ struct Scene {
                 projection.r[2], XMVectorSet(jitterX, jitterY, 0.0f, 0.0f));
         }
         return projection;
+    }
+
+    // Projection without the TAA sub-pixel offset.
+    //
+    // Jitter is only safe on geometry TAA can reproject: the resolve pass
+    // writes motion vectors for visibility-buffer surfaces, so their history
+    // lands on the right texel and the offset averages out into antialiasing.
+    // Geometry drawn in the forward extension pass -- the weapon viewmodel,
+    // skinned actors, foliage -- emits no motion vectors, so the jitter has
+    // nothing to cancel it and reads as the whole view shaking.
+    //
+    // Those passes use this instead. Remove the distinction only once the
+    // extensions emit real per-object motion.
+    XMMATRIX GetUnjitteredProjectionMatrix() const {
+        return XMMatrixPerspectiveFovLH(
+            XMConvertToRadians(EffectiveCameraFOV()),
+            (float)g_dx12.screenWidth / (float)g_dx12.screenHeight,
+            cameraNear, cameraFar);
     }
 
     // -- Ejected free camera (Unreal's F8) --------------------------------------
