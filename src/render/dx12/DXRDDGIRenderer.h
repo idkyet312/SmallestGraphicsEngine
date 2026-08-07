@@ -15,6 +15,9 @@ class DXRDDGIRenderer {
 public:
     struct Status {
         bool dxrSupported = false;
+        // Tier 1.1 / inline RayQuery. Enhanced visuals require this; probe GI
+        // does not.
+        bool inlineRaytracingSupported = false;
         bool updatesActive = false;
         uint32_t probeCount = 0;
         uint32_t raysPerFrame = 0;
@@ -25,6 +28,7 @@ public:
     bool Initialize(ID3D12Device* device) {
         device_ = device;
         status_.dxrSupported = scene_.Initialize(device);
+        status_.inlineRaytracingSupported = scene_.InlineSupported();
         if (status_.dxrSupported &&
             SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxrDevice_))))
             pipelineReady_ = CreateRaytracingPipeline();

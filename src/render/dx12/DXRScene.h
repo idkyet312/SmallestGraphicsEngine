@@ -45,10 +45,19 @@ public:
             options.RaytracingTier < D3D12_RAYTRACING_TIER_1_0)
             return false;
         supported_ = true;
+        // Tier 1.1 is what inline raytracing (RayQuery in a compute shader)
+        // requires. Tier 1.0 hardware can still run the DispatchRays probe path,
+        // so this is tracked separately rather than raising the bar for
+        // everyone -- the enhanced-visuals tier checks this, the probe GI does
+        // not.
+        inlineSupported_ = options.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1;
         return true;
     }
 
     bool Supported() const { return supported_; }
+    // True when the device can run RayQuery from compute. Gates enhanced
+    // visuals; everything else works without it.
+    bool InlineSupported() const { return inlineSupported_; }
     ID3D12Resource* TLAS() const { return tlas_.Get(); }
     D3D12_GPU_VIRTUAL_ADDRESS TLASAddress() const {
         return tlas_ ? tlas_->GetGPUVirtualAddress() : 0;
@@ -249,6 +258,7 @@ private:
     ComPtr<ID3D12Resource> terrainVertices_;
     ComPtr<ID3D12Resource> terrainIndices_;
     bool supported_ = false;
+    bool inlineSupported_ = false;
     bool topologyDirty_ = true;
 
     bool CreateBuffer(uint64_t bytes, D3D12_RESOURCE_FLAGS flags,

@@ -165,6 +165,25 @@ RWTexture2D<float4> outputColor : register(u0);
 RWTexture2D<float2> outputMotion : register(u1);
 RWTexture2D<float4> outputNormalRoughness : register(u2);
 
+#if SGE_ENHANCED_VISUALS
+// Static-geometry TLAS, shared with the probe GI path. Bound only for the
+// enhanced variant; the default resolve never references t79 and its root
+// signature does not declare it.
+RaytracingAccelerationStructure sceneTLAS : register(t79);
+
+cbuffer EnhancedVisualsBuffer : register(b5) {
+    uint  enhancedRTShadows;        // master switch for the RT shadow term
+    uint  enhancedRayClassify;      // spend rays only on low-confidence pixels
+    float enhancedShadowRayLength;  // TMax for shadow rays, world units
+    float enhancedConfidenceThreshold;
+};
+
+// Per-pixel record of where the rays went, for the debug view and the
+// ray-fraction readback. One uint per pixel: 0 = cheap tier resolved it,
+// 1 = classified as needing RT and traced.
+RWTexture2D<uint> outputRayMask : register(u3);
+#endif
+
 SamplerState              texSampler    : register(s0);
 SamplerComparisonState    shadowSampler : register(s1);
 
@@ -451,6 +470,42 @@ float ScreenSpaceAO(uint2 pixel, float3 worldPos, float3 normal) {
     return saturate(1.0 - occlusion / 8.0);
 }
 
+#if SGE_ENHANCED_VISUALS
+// Inline ray-traced sun shadow. Only compiled into the SM6.5 variant of this
+// shader -- FXC cannot compile RayQuery at any profile, so the default build
+// never sees this code.
+//
+// Returns sun visibility in 0..1 against the static TLAS.
+//
+// A miss is deliberately NOT treated as proof the pixel is lit: the TLAS holds
+// static geometry only, so a dynamic actor could still be casting here. The
+// caller therefore blends this against the cascade term rather than replacing
+// it -- see the call site, where `min()` keeps whichever occluder either source
+// found.
+float RayTracedShadow(float3 worldPos, float3 normal, float3 lightDir) {
+    if (enhancedRTShadows == 0) return 1.0;
+
+    RayDesc ray;
+    // Offset along the normal to avoid self-intersection at the origin. Scaled
+    // by grazing angle for the same reason the cascade path slope-scales bias.
+    float grazing = 1.0 - saturate(dot(normal, lightDir));
+    ray.Origin = worldPos + normal * (0.02 + 0.10 * grazing);
+    ray.Direction = lightDir;
+    ray.TMin = 0.0;
+    ray.TMax = enhancedShadowRayLength;
+
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+             RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
+             RAY_FLAG_CULL_NON_OPAQUE> query;
+    query.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff, ray);
+    query.Proceed();
+
+    // Occluded by static geometry, or nothing in the way as far as the TLAS
+    // knows. Either way the caller decides how much to trust it.
+    return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
+}
+#endif
+
 float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
     if (enableShadows == 0) return 1.0;
 
@@ -601,6 +656,13 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     }
     
     uint2 visValue = visBuffer.Load(int3(pixel, 0));
+
+#if SGE_ENHANCED_VISUALS
+    // Clear up front so every early-out below leaves a defined value. The mask
+    // is read back for the ray-fraction statistic, and a stale value from a
+    // previous frame would quietly inflate it.
+    outputRayMask[pixel] = 0u;
+#endif
 
     if (debugViewMode == 2u) {
         float rawDepth = depthBuffer.Load(int3(pixel, 0));
@@ -911,6 +973,49 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 specular = numerator / denominator * foliageSpecularScale;
     
     float shadowVisibility = CalculateShadow(fragPos, normal, L);
+#if SGE_ENHANCED_VISUALS
+    // ---- Cheap tier first, rays only where it is uncertain ----
+    //
+    // The cascade lookup above is the cheap tier. It is confident in the middle
+    // of a lit region and in the middle of a shadowed one; it is least reliable
+    // in the penumbra, at grazing angles (where slope bias is doing the most
+    // work), and past the last cascade split. Confidence here is exactly that:
+    // distance from the 0/1 rails, damped at grazing incidence.
+    //
+    // Only low-confidence pixels get a ray, which is what keeps this affordable
+    // -- on a typical frame it is a small fraction of the screen rather than
+    // all of it.
+    {
+        float rail = min(shadowVisibility, 1.0 - shadowVisibility) * 2.0;
+        float grazing = saturate(dot(normal, L));
+        float cascadeConfidence = saturate(rail + 0.35 * grazing);
+        // Past the final split the cascades have nothing to say at all.
+        float viewDepth = mul(float4(fragPos, 1.0), viewMatrix).z;
+        if (viewDepth >= shadowCascadeSplits.z) cascadeConfidence = 0.0;
+
+        bool trace = enableShadows != 0 && enhancedRTShadows != 0 &&
+                     (enhancedRayClassify == 0 ||
+                      cascadeConfidence < enhancedConfidenceThreshold);
+        if (trace) {
+            float traced = RayTracedShadow(fragPos, normal, L);
+            // Combine with min(): the TLAS is static-only, so the cascade term
+            // still carries every dynamic caster, and taking the darker of the
+            // two keeps those shadows rather than erasing them.
+            float combined = min(shadowVisibility, traced);
+            // Ease in near the threshold so the classification boundary is not
+            // a visible edge, but commit fully below it. The earlier
+            // 1 - confidence/threshold ramp discarded most of the traced result
+            // on the very pixels it had just paid to trace -- at threshold 1.0
+            // a confidence-0.9 pixel kept only 10% of its ray, which is why RT
+            // shadows were barely visible while still costing full price.
+            float blend = smoothstep(
+                enhancedConfidenceThreshold,
+                enhancedConfidenceThreshold * 0.6, cascadeConfidence);
+            shadowVisibility = lerp(shadowVisibility, combined, blend);
+            outputRayMask[pixel] = 1u;  // cleared to 0 at entry
+        }
+    }
+#endif
     // Shadow map blocks direct sun only. IBL/DDGI are already low-frequency
     // indirect terms and must stay present on occluded building/actor sides.
     float frontFill = 0.65 + 0.35 * saturate(dot(normal, viewDir));

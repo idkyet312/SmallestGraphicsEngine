@@ -23,6 +23,10 @@
 
 #include <d3dcompiler.h>
 #include <windows.h>
+// Ships in the Windows SDK (10.0.19041 and later). Needed for the SM6 path:
+// FXC cannot compile inline raytracing at any profile.
+#include <dxcapi.h>
+#include <wrl/client.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -172,6 +176,121 @@ inline HRESULT CompileCached(const void* source, size_t sourceSize,
     if (SUCCEEDED(hr) && *blob)
         D3DWriteBlobToFile(*blob, path.c_str(), TRUE);
     return hr;
+}
+
+// ---------------------------------------------------------------------------
+// DXC (shader model 6) compilation.
+//
+// The renderers above target shader model 5.x through FXC (D3DCompile), which
+// cannot compile inline raytracing at all -- RayQuery needs SM 6.5. Rather than
+// migrate every runtime-compiled shader to DXC, this compiles the specific
+// shaders that need SM6 while leaving the FXC path untouched for everything
+// else. That keeps the default frame on exactly the compiler it has always
+// used, which matters because the resolve shader runs for every pixel.
+//
+// dxcompiler.dll is loaded lazily and only when an SM6 shader is actually
+// requested, so a machine without it still boots and simply reports the
+// enhanced tier as unavailable.
+// ---------------------------------------------------------------------------
+
+// Returns true when dxcompiler.dll loaded and exposes DxcCreateInstance.
+inline bool DxcAvailable() {
+    static const bool available = [] {
+        const HMODULE module = LoadLibraryW(L"dxcompiler.dll");
+        return module != nullptr &&
+               GetProcAddress(module, "DxcCreateInstance") != nullptr;
+    }();
+    return available;
+}
+
+// Compile `source` with DXC at an SM6 profile (e.g. "cs_6_5"), caching the DXIL
+// on disk under the same scheme as CompileCached.
+//
+// `errorText` receives the compiler diagnostics on failure. Returns false when
+// DXC is unavailable, which callers treat as "this optional feature is off"
+// rather than a fatal error.
+inline bool CompileCachedDXC(const std::string& source,
+                             const wchar_t* sourceName,
+                             const wchar_t* entry, const wchar_t* target,
+                             const std::wstring& includeDirectory,
+                             ID3DBlob** blob, std::string* errorText) {
+    if (!blob) return false;
+    *blob = nullptr;
+
+    // Key on the same inputs FXC uses, plus a salt so an SM6 blob can never be
+    // confused with an FXC blob compiled from identical text.
+    uint64_t key = HashBytes(source.data(), source.size(), IncludeHash());
+    key = HashBytes(entry, wcslen(entry) * sizeof(wchar_t), key);
+    key = HashBytes(target, wcslen(target) * sizeof(wchar_t), key);
+    key = HashString("dxc-sm6", key);
+
+    const std::wstring path = CachePath(key);
+    if (SUCCEEDED(D3DReadFileToBlob(path.c_str(), blob)) && *blob)
+        return true;
+
+    if (!DxcAvailable()) {
+        if (errorText)
+            *errorText = "dxcompiler.dll not available; SM6 shaders disabled";
+        return false;
+    }
+
+    const HMODULE module = LoadLibraryW(L"dxcompiler.dll");
+    if (!module) return false;
+    const auto createInstance = reinterpret_cast<DxcCreateInstanceProc>(
+        GetProcAddress(module, "DxcCreateInstance"));
+    if (!createInstance) return false;
+
+    Microsoft::WRL::ComPtr<IDxcCompiler> compiler;
+    Microsoft::WRL::ComPtr<IDxcLibrary> library;
+    if (FAILED(createInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))) ||
+        FAILED(createInstance(CLSID_DxcLibrary, IID_PPV_ARGS(&library))))
+        return false;
+
+    Microsoft::WRL::ComPtr<IDxcBlobEncoding> sourceBlob;
+    // 65001 = UTF-8.
+    if (FAILED(library->CreateBlobWithEncodingOnHeapCopy(
+            source.data(), static_cast<UINT32>(source.size()), 65001,
+            &sourceBlob)))
+        return false;
+
+    // Resolves #include from the shaders/ directory, matching how the FXC path
+    // uses D3D_COMPILE_STANDARD_FILE_INCLUDE.
+    Microsoft::WRL::ComPtr<IDxcIncludeHandler> includeHandler;
+    library->CreateIncludeHandler(&includeHandler);
+
+    const std::wstring includeArg = L"-I" + includeDirectory;
+    const wchar_t* arguments[] = { L"-O3", includeArg.c_str() };
+
+    Microsoft::WRL::ComPtr<IDxcOperationResult> operation;
+    const HRESULT hr = compiler->Compile(
+        sourceBlob.Get(), sourceName, entry, target,
+        arguments, _countof(arguments), nullptr, 0,
+        includeHandler.Get(), &operation);
+    if (FAILED(hr) || !operation) return false;
+
+    HRESULT status = E_FAIL;
+    operation->GetStatus(&status);
+    if (FAILED(status)) {
+        if (errorText) {
+            Microsoft::WRL::ComPtr<IDxcBlobEncoding> errorBlob;
+            if (SUCCEEDED(operation->GetErrorBuffer(&errorBlob)) && errorBlob) {
+                errorText->assign(
+                    static_cast<const char*>(errorBlob->GetBufferPointer()),
+                    errorBlob->GetBufferSize());
+            }
+        }
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDxcBlob> dxil;
+    if (FAILED(operation->GetResult(&dxil)) || !dxil) return false;
+    // Copy into an ID3DBlob so callers stay on a single blob type.
+    if (FAILED(D3DCreateBlob(dxil->GetBufferSize(), blob)) || !*blob)
+        return false;
+    memcpy((*blob)->GetBufferPointer(), dxil->GetBufferPointer(),
+           dxil->GetBufferSize());
+    D3DWriteBlobToFile(*blob, path.c_str(), TRUE);
+    return true;
 }
 
 } // namespace ShaderCacheDX12
