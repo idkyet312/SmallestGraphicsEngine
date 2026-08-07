@@ -17,6 +17,8 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <ctime>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -127,6 +129,13 @@ std::shared_ptr<SceneNode>  g_blackHawkShadowModel;
 // Rig for the rotor: the GLB's skin, the id of the joint driving the blades,
 // and the bone palette the skinning shaders read. Empty for an unrigged model,
 // which just leaves the blades static.
+// Raw mesh-space position of the PlayerRide empty, kept for the debug readout.
+XMFLOAT3                    g_blackHawkRideMeshPosition{};
+// Set when a level starts or restarts; consumed once the player spawn and
+// terrain are settled, which is when the insertion route can be aimed. Deferred
+// because a cold load has no BlackHawk model yet, while a restart has the model
+// but never re-runs the load stages.
+static bool                 g_blackHawkInsertionRestartPending = false;
 Skeleton                    g_blackHawkSkeleton;
 static int                  g_blackHawkRotorBone = -1;
 std::vector<XMFLOAT4X4>     g_blackHawkPalette;
@@ -318,6 +327,9 @@ GunAudio                    g_banditAttackAudio;
 GunAudio                    g_banditDeathAudio;
 GunAudio                    g_banditHitVoiceAudio;
 GunAudio                    g_helicopterHoverAudio;
+// Cockpit alarm on the insertion BlackHawk, looped while it is critically
+// damaged so the player hears the failure before they see the ground.
+GunAudio                    g_blackHawkAlarmAudio;
 static float&               g_banditVoiceCooldown = g_enemySystem.voiceCooldown;
 static float&               g_banditPainCooldown = g_enemySystem.painCooldown;
 static float&               g_fleshHitPitchMin = g_game.combat.fleshHitPitchMin;
@@ -619,6 +631,24 @@ XMMATRIX BlackHawkWorldMatrix() {
 
 bool BlackHawkVisible() { return g_game.vehicles.blackHawkVisible; }
 
+XMFLOAT3 BlackHawkRideWorldPosition() {
+    return g_game.vehicles.BlackHawkRidePosition();
+}
+
+XMFLOAT3 BlackHawkRideDebugInfo(XMFLOAT3& outLocal) {
+    const VehicleSystem& vehicles = g_game.vehicles;
+    outLocal = { vehicles.blackHawkRideSide, vehicles.blackHawkRideHeight,
+                 vehicles.blackHawkRideForward };
+    return vehicles.BlackHawkRidePosition();
+}
+
+XMFLOAT3 BlackHawkRideMeshPosition() { return g_blackHawkRideMeshPosition; }
+XMFLOAT3 BlackHawkModelCentre() {
+    return { g_blackHawkModelCenter.x, g_blackHawkModelMinY,
+             g_blackHawkModelCenter.z };
+}
+float BlackHawkModelScale() { return g_blackHawkModelScale; }
+
 // Sends the BlackHawk on an insertion run that ends at the player's spawn. It
 // runs in from behind the direction the player is facing, so the approach
 // crosses their view before it flares and sets down on top of them.
@@ -689,31 +719,117 @@ D3D12_GPU_VIRTUAL_ADDRESS UploadBlackHawkPalette() {
 static void RidePlayerInBlackHawk() {
     VehicleSystem& vehicles = g_game.vehicles;
     if (vehicles.blackHawkCarryingPlayer) {
-        scene.camera.Position = vehicles.BlackHawkSeatPosition();
+        // The attach point is the player's centre, but the camera is the eye,
+        // which rides PlayerHeight above the feet -- so lift by half a body to
+        // put the middle of the player on the authored spot.
+        const XMFLOAT3 centre = vehicles.BlackHawkRidePosition();
+        scene.camera.Position = { centre.x,
+                                  centre.y + scene.camera.PlayerHeight * 0.5f,
+                                  centre.z };
         scene.camera.VerticalVelocity = 0.0f;
         scene.camera.IsGrounded = true;
         scene.camera.FloorY = scene.camera.Position.y - scene.camera.PlayerHeight;
         return;
     }
+    // Bailing out mid-flight leaves the player where the aircraft is, stepped
+    // out the right-hand door and falling. Unlike the scripted drop-off this
+    // must not teleport them to the landing zone -- the whole point is to get
+    // out early, wherever the bird happens to be.
+    if (vehicles.blackHawkBailedOut) {
+        vehicles.blackHawkBailedOut = false;
+        const float rightX = std::cos(vehicles.blackHawkYaw);
+        const float rightZ = -std::sin(vehicles.blackHawkYaw);
+        constexpr float clearance = 2.5f;
+        const XMFLOAT3 centre = vehicles.BlackHawkRidePosition();
+        scene.camera.Position = {
+            centre.x + rightX * clearance,
+            centre.y + scene.camera.PlayerHeight * 0.5f,
+            centre.z + rightZ * clearance };
+        // Hand them over to gravity: clearing IsGrounded lets the normal fall
+        // and landing code take it from here.
+        scene.camera.VerticalVelocity = 0.0f;
+        scene.camera.IsGrounded = false;
+        return;
+    }
+    // Thrown clear of the wreck on impact. Uses the crash site rather than the
+    // planned drop-off, which the bird never reached.
+    if (vehicles.blackHawkJustCrashed && vehicles.blackHawkDroppedPlayer) {
+        const float rightX = std::cos(vehicles.blackHawkYaw);
+        const float rightZ = -std::sin(vehicles.blackHawkYaw);
+        constexpr float thrownClear = 4.0f;
+        scene.camera.Position = {
+            vehicles.blackHawkPosition.x + rightX * thrownClear,
+            vehicles.blackHawkCrashGroundY + scene.camera.PlayerHeight,
+            vehicles.blackHawkPosition.z + rightZ * thrownClear };
+        scene.camera.VerticalVelocity = 0.0f;
+        scene.camera.IsGrounded = true;
+        return;
+    }
     if (vehicles.blackHawkDroppedPlayer) {
-        // Step out the left-hand door, clear of the hull. Forward is
-        // (sin, cos), so left is the negated right vector (-cos, sin).
-        const float leftX = -std::cos(vehicles.blackHawkYaw);
-        const float leftZ = std::sin(vehicles.blackHawkYaw);
+        // Step out the right-hand door, clear of the hull, on the same side the
+        // player rode on. Forward is (sin, cos), so right is (cos, -sin).
+        const float rightX = std::cos(vehicles.blackHawkYaw);
+        const float rightZ = -std::sin(vehicles.blackHawkYaw);
         constexpr float exitDistance = 5.0f;
         scene.camera.Position = {
-            vehicles.blackHawkDropOff.x + leftX * exitDistance,
+            vehicles.blackHawkDropOff.x + rightX * exitDistance,
             vehicles.blackHawkGroundY + scene.camera.PlayerHeight,
-            vehicles.blackHawkDropOff.z + leftZ * exitDistance };
+            vehicles.blackHawkDropOff.z + rightZ * exitDistance };
         scene.camera.VerticalVelocity = 0.0f;
         scene.camera.IsGrounded = true;
     }
 }
 
-// Normalized to a real BlackHawk's ~16 m rotor span (so the cabin is big enough
-// to carry the player in) and pinned by its skids, so the landed pose rests on
-// the terrain rather than sinking to the model's centre. The normalization
-// makes the on-screen size independent of however the source GLB is scaled.
+// Fires the crash FX and hurts anyone still strapped in. Runs off the one-frame
+// flag the vehicle update raises, so it happens exactly once per wreck.
+static void UpdateBlackHawkCrashEffects(float deltaTime) {
+    VehicleSystem& vehicles = g_game.vehicles;
+
+    // The smoke trail IS the health readout: it starts as thin intermittent
+    // wisps at the damage threshold and builds to a thick continuous plume as
+    // the airframe approaches zero, so the state can be read at a glance from
+    // outside without a HUD element.
+    static float smokeTimer = 0.0f;
+    const float severity = vehicles.BlackHawkDamageSeverity();
+    if (severity > 0.0f && !vehicles.BlackHawkIsDown()) {
+        smokeTimer -= deltaTime;
+        if (smokeTimer <= 0.0f) {
+            // Puff spacing tightens from a lazy 0.34 s to a near-continuous
+            // 0.05 s, which is what sells "about to go down".
+            smokeTimer = 0.34f - 0.29f * severity;
+            // Small light wisps early, big dark billows late.
+            const float radius = 0.35f + 0.95f * severity;
+            const float intensity = 0.35f + 1.15f * severity;
+            // Trail from the engine deck, slightly aft of the model origin.
+            const float backX = -std::sin(vehicles.blackHawkYaw) * 0.6f;
+            const float backZ = -std::cos(vehicles.blackHawkYaw) * 0.6f;
+            scene.SpawnSmokeBurst(
+                { vehicles.blackHawkPosition.x + backX,
+                  vehicles.blackHawkPosition.y + 1.1f,
+                  vehicles.blackHawkPosition.z + backZ },
+                radius, intensity);
+        }
+    } else {
+        smokeTimer = 0.0f;
+    }
+
+    if (!vehicles.blackHawkJustCrashed) return;
+
+    const XMFLOAT3 impact = vehicles.blackHawkPosition;
+    scene.SpawnExplosionFX({ impact.x, impact.y + 1.6f, impact.z }, 11.0f, 1.2f);
+    scene.SpawnSmokeBurst(impact, 3.2f, 3.5f);
+    if (g_destruction.IsInitialized())
+        g_destruction.ApplyExplosion(impact, 5.5f, 65.0f, 14.0f);
+
+    // Riding it down hurts. Not instantly lethal at full health, so a healthy
+    // player walks away from the wreck.
+    scene.DamagePlayer(55.0f);
+}
+
+// Normalized to a fixed footprint (so the cabin is big enough to carry the
+// player in) and pinned by its skids, so the landed pose rests on the terrain
+// rather than sinking to the model's centre. The normalization makes the
+// on-screen size independent of however the source GLB is scaled.
 // Accumulates a node subtree's vertex bounds in model-root space, folding each
 // node's local transform in on the way down. The GLB's mesh hangs off a child of
 // ModelRoot with its own rotation and scale, so bounds taken from the root's own
@@ -762,7 +878,59 @@ static void ConfigureBlackHawkBounds() {
         (minimum.y + maximum.y) * 0.5f,
         (minimum.z + maximum.z) * 0.5f };
     g_blackHawkModelMinY = minimum.y;
-    g_blackHawkModelScale = 16.0f / horizontalLength;
+    // Target the longest horizontal axis, which on this model is nose-to-tail
+    // including the rotor overhang. 20 m there puts the aircraft at real UH-60
+    // proportions: ~16 m rotor span and ~5 m to the rotor head.
+    g_blackHawkModelScale = 20.0f / horizontalLength;
+}
+
+// Depth-first search for a node by name.
+static std::shared_ptr<SceneNode> FindNodeByName(
+    const std::shared_ptr<SceneNode>& node, const std::string& name) {
+    if (!node) return nullptr;
+    if (node->name == name) return node;
+    for (const auto& child : node->children)
+        if (auto found = FindNodeByName(child, name)) return found;
+    return nullptr;
+}
+
+// Attaches the riding player to the "PlayerRide" empty authored in the GLB, so
+// the spot is placed in Blender rather than tuned by hand here. Silently keeps
+// the hand-tuned fallbacks when the model has no such node.
+//
+// Must run after ConfigureBlackHawkBounds: the empty's position is in raw mesh
+// space, and BlackHawkWorldMatrix re-centres the model and pins it by its skids
+// before scaling, so the offset has to go through that same transform to land in
+// the aircraft's local frame.
+static void ConfigureBlackHawkRideFromModel() {
+    if (!g_blackHawkModel) return;
+    std::shared_ptr<SceneNode> ride =
+        FindNodeByName(g_blackHawkModel, "PlayerRide");
+    if (!ride) return;
+
+    g_blackHawkModel->RefreshHierarchy();
+    XMFLOAT3 meshPosition{};
+    XMStoreFloat3(&meshPosition,
+                  XMVector3TransformCoord(
+                      XMVectorZero(), XMLoadFloat4x4(&ride->globalTransform)));
+
+    VehicleSystem& vehicles = g_game.vehicles;
+    vehicles.blackHawkRideSide =
+        (meshPosition.x - g_blackHawkModelCenter.x) * g_blackHawkModelScale;
+    vehicles.blackHawkRideForward =
+        (meshPosition.z - g_blackHawkModelCenter.z) * g_blackHawkModelScale;
+    vehicles.blackHawkRideHeight =
+        (meshPosition.y - g_blackHawkModelMinY) * g_blackHawkModelScale;
+
+    g_blackHawkRideMeshPosition = meshPosition;
+    std::cout << "BlackHawk PlayerRide mesh pos " << meshPosition.x << ", "
+              << meshPosition.y << ", " << meshPosition.z
+              << " | centre " << g_blackHawkModelCenter.x << ", "
+              << g_blackHawkModelMinY << ", " << g_blackHawkModelCenter.z
+              << " | scale " << g_blackHawkModelScale
+              << " -> side " << vehicles.blackHawkRideSide << ", forward "
+              << vehicles.blackHawkRideForward << ", height "
+              << vehicles.blackHawkRideHeight << "\n";
 }
 
 // Depth-first search for the first node carrying a mesh.
@@ -4976,8 +5144,10 @@ static void UpdateHelicopterHoverAudio() {
     // The insertion BlackHawk turns its rotor from the moment it comes in
     // until it climbs out of sight, so it feeds the same loop.
     const VehicleSystem& vehicles = g_game.vehicles;
+    // A downed wreck has no rotor left to turn, so it drops out of the loop.
     const bool blackHawkActive = vehicles.blackHawkVisible &&
-        vehicles.blackHawkPhase != VehicleSystem::BlackHawkPhase::Gone;
+        vehicles.blackHawkPhase != VehicleSystem::BlackHawkPhase::Gone &&
+        !vehicles.BlackHawkIsDown();
     const bool active = IsGameplayScreen() && alive &&
         (primaryActive || secondaryActive || blackHawkActive);
     auto distanceToCamera = [](const XMFLOAT3& position) {
@@ -5000,6 +5170,23 @@ static void UpdateHelicopterHoverAudio() {
     }
     const float volume = 0.72f * (std::max)(0.0f, 1.0f - distance / 95.0f);
     g_helicopterHoverAudio.SetLoop(active, volume, 0.96f);
+
+    // Cockpit alarm below 30% health. Runs until the wreck is on the ground,
+    // so it carries through the spiral. Riding along puts the player inside the
+    // cabin with it, hence the same clamped falloff as the rotor loop.
+    const bool alarming = IsGameplayScreen() && alive && blackHawkActive &&
+        vehicles.BlackHawkHealthFraction() < 0.30f;
+    float alarmVolume = 0.0f;
+    if (alarming) {
+        const float alarmDistance = vehicles.blackHawkCarryingPlayer
+            ? 3.0f
+            : (std::max)(4.0f, distanceToCamera(vehicles.blackHawkPosition));
+        // Tighter falloff than the rotor: an in-cabin warning should not carry
+        // across the whole island.
+        alarmVolume = 0.62f * (std::max)(0.0f, 1.0f - alarmDistance / 55.0f);
+    }
+    g_blackHawkAlarmAudio.SetLoop(alarming && alarmVolume > 0.001f,
+                                  alarmVolume, 1.0f);
 }
 
 static void UpdateFireLoopAudio() {
@@ -5191,6 +5378,12 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     ApplyRuntimeLevelBasics(true);
     if (modeAssetsLoaded)
         scene.rebuildDestructionRequested = true;
+    // Re-aim the insertion at the spawn the player actually got. ResetLevelState
+    // above ran before the camera was placed, so the route it rebuilt still
+    // pointed at the previous position. Deferred rather than done here because
+    // on a cold load the model does not exist yet: the flag is consumed once
+    // the terrain is up, which covers both the first load and every restart.
+    g_blackHawkInsertionRestartPending = !g_emptyLevelMode;
     g_game.commands.Set(GameCommand::ResetLevelRuntime, modeAssetsLoaded);
     deathCursorReleased = false;
     showUI = startWithUIAndMobileControls;
@@ -7912,7 +8105,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         else if (!g_emptyLevelMode && wParam == 'E' &&
                  !(lParam & 0x40000000)) {
-            ToggleHumveeDriving();
+            // Riding the insertion helicopter takes priority: E jumps out.
+            // Otherwise E keeps its usual job of getting in/out of the Humvee.
+            if (!g_game.vehicles.BailOutOfBlackHawk())
+                ToggleHumveeDriving();
         }
         // Bit 30 = key was already down (autorepeat); toggle once per press.
         else if (wParam == 'Z' && !(lParam & 0x40000000)) {
@@ -8056,6 +8252,17 @@ void BootStep(const char* label) {
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     SetUnhandledExceptionFilter(WriteCrashDump);
+    // std::rand() defaults to seed 1, so every launch replayed the identical
+    // sequence: the BlackHawk's first insertion always drew the same roll and
+    // failed at the same second. Everything else using rand() (muzzle spread,
+    // smoke jitter, audio pitch) was repeating per launch for the same reason.
+    //
+    // The warm-up matters: MSVC's generator returns almost the same first value
+    // for adjacent seeds, so a time() seed alone leaves the first draw
+    // effectively constant across launches -- and the BlackHawk's failure roll
+    // is the first draw. Discarding a few values decorrelates it.
+    std::srand(static_cast<unsigned>(std::time(nullptr)));
+    for (int warmUp = 0; warmUp < 16; ++warmUp) (void)std::rand();
     AllocConsole();
     FILE* fp;
     freopen_s(&fp, "CONOUT$", "w", stdout);
@@ -8172,6 +8379,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_banditDeathAudio.Initialize("Content/Audio/bandit_death.wav");
     g_banditHitVoiceAudio.Initialize("Content/Audio/bandit_hit_voice.wav");
     g_helicopterHoverAudio.Initialize("Content/Audio/helicopter_hover_loop.mp3");
+    g_blackHawkAlarmAudio.Initialize(
+        "Content/Audio/freesound_community-siren-alert-96052.mp3");
 
     // ImGui
     D3D12_DESCRIPTOR_HEAP_DESC ihd = {};
@@ -8538,6 +8747,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         float now = gameTimer.GetElapsed();
         deltaTime = now - lastTime;
         lastTime  = now;
+        // A level load, GPU drain or alt-tab stalls the loop for seconds, and
+        // that whole stall lands in one frame's delta. Feeding it raw into
+        // fixed-rate systems teleports them -- the BlackHawk's health drain
+        // burned most of its life on the first frame after a reload, crashing
+        // the bird seconds into a run that should last 7-20. Clamp to a very
+        // long frame: above any legitimate one, far below a stall. The
+        // lastTime resets after the reset/load blocks still help the frame
+        // *after* a stall; this covers the stall frame itself.
+        deltaTime = (std::min)(deltaTime, 0.1f);
 
         if (g_dx12.fence)
             g_retiredPrefabResources.Collect(
@@ -8778,9 +8996,39 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             UpdateHelicopter(deltaTime);
             UpdateSecondaryHelicopter(deltaTime);
             UpdateBoat(deltaTime);
-            g_game.vehicles.UpdateBlackHawk(deltaTime);
+            // Aim the insertion once the level is actually up. Waits for the
+            // model and for loading to finish, so the drop-off is taken from
+            // the settled player spawn and the failure time is rolled fresh.
+            // The frame that arms it skips its own drain tick: that frame's
+            // delta still spans the load, and charging it against a run that
+            // only just started is what made reloads crash early.
+            bool armedInsertionThisFrame = false;
+            if (g_blackHawkInsertionRestartPending && g_blackHawkModel &&
+                !g_game.loading.Active()) {
+                g_blackHawkInsertionRestartPending = false;
+                StartBlackHawkInsertionAtPlayerSpawn();
+                armedInsertionThisFrame = true;
+            }
+            // Terrain under the wreck, so it stops on the actual ground rather
+            // than the drop-off's elevation. Sampled before the update so the
+            // impact test this frame uses a height for where it already is.
+            {
+                VehicleSystem& vehicles = g_game.vehicles;
+                float crashGround = 0.0f;
+                if (scene.useMeshTerrain && g_terrain.supported) {
+                    auto params = CurrentTerrainParams();
+                    params.heightScale = scene.terrainHeightScale;
+                    crashGround = TerrainRendererDX12::HeightAt(
+                        params, vehicles.blackHawkPosition.x,
+                        vehicles.blackHawkPosition.z);
+                }
+                vehicles.blackHawkCrashGroundY = crashGround;
+            }
+            g_game.vehicles.UpdateBlackHawk(
+                armedInsertionThisFrame ? 0.0f : deltaTime);
             SpinBlackHawkRotor();
             RidePlayerInBlackHawk();
+            UpdateBlackHawkCrashEffects(deltaTime);
             UpdateExplosiveBarrels(deltaTime);
         }
         g_gunAudio.Update();
@@ -10541,13 +10789,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     std::cerr << "BlackHawk rotor bone missing; blades static\n";
                 UpdateBlackHawkPalette();
                 ConfigureBlackHawkBounds();
+                ConfigureBlackHawkRideFromModel();
                 // No merged depth proxy: merging bakes the bind pose into flat
                 // geometry, which would leave the shadow's blades frozen while
                 // the lit ones turn. The shadow pass skins the real model.
                 g_blackHawkShadowModel.reset();
-                // Fly the player in: set down where they spawn, on the terrain
-                // and clear of the water plane if the spawn sits below it.
-                StartBlackHawkInsertionAtPlayerSpawn();
+                // The run itself is armed by the pending flag once loading
+                // finishes, so the drop-off is taken from the settled spawn.
+                // Starting it here would aim at whatever the camera was mid-load.
+                g_blackHawkInsertionRestartPending = true;
                 std::cout << "BlackHawk GLB ready, inbound to player spawn\n";
             } else {
                 std::cerr << "BlackHawk GLB failed to load\n";
@@ -11095,6 +11345,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         // ?? end frame ??
         g_profiler.EndGpuFrame(g_dx12.commandList.Get());
+        // Present reads the interval off g_dx12, so mirror the scene setting
+        // here rather than only when the slider moves -- that way a value
+        // loaded with a level applies too.
+        g_dx12.syncInterval = static_cast<UINT>(
+            (std::max)(0, (std::min)(4, scene.vsyncInterval)));
         try { EndFrame(); }
         catch (const std::exception& e) {
             const HRESULT removedReason = g_dx12.device

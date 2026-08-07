@@ -82,6 +82,16 @@ DirectX::XMMATRIX BoatWorldMatrix();
 DirectX::XMMATRIX BlackHawkWorldMatrix();
 // False once the insertion helicopter has climbed out of sight.
 bool BlackHawkVisible();
+// World position the riding player is pinned to, from the model's PlayerRide
+// empty. Exposed as a function because g_game has internal linkage in main.cpp.
+DirectX::XMFLOAT3 BlackHawkRideWorldPosition();
+// Same, plus the aircraft-local offset packed as (side, up, forward), for the
+// debug readout.
+DirectX::XMFLOAT3 BlackHawkRideDebugInfo(DirectX::XMFLOAT3& outLocal);
+// Raw inputs behind that offset, so the readout can show where a mismatch is.
+DirectX::XMFLOAT3 BlackHawkRideMeshPosition();
+DirectX::XMFLOAT3 BlackHawkModelCentre();
+float BlackHawkModelScale();
 // Uploads this frame's rotor bone palette; 0 when the model carries no rig.
 D3D12_GPU_VIRTUAL_ADDRESS UploadBlackHawkPalette();
 
@@ -1515,6 +1525,25 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         DrawSceneNode(g_blackHawkModel, shader, BlackHawkWorldMatrix(),
             view, proj, lightSpace, visibilityExtensionsOnly,
             UploadBlackHawkPalette());
+
+        // Debug: mark where the PlayerRide empty resolves to, so the authored
+        // spot can be checked against the airframe without riding along.
+        if (scene.showBlackHawkRideMarker && !visibilityExtensionsOnly) {
+            // The BlackHawk draw above is skinned, and the skinning flag is a
+            // root constant that persists. Without clearing it this sphere gets
+            // posed by the rotor palette and smears across the airframe.
+            shader.SetSkinningEnabled(false);
+            g_dx12.commandList->SetPipelineState(shader.GetPipelineState(false));
+            const XMFLOAT3 ride = BlackHawkRideWorldPosition();
+            const XMMATRIX marker =
+                XMMatrixScaling(0.18f, 0.18f, 0.18f) *
+                XMMatrixTranslation(ride.x, ride.y, ride.z);
+            shader.SetMatrices(marker, view, proj, lightSpace);
+            shader.SetEmissiveMaterial(XMFLOAT3(12.0f, 1.0f, 1.0f), 1.0f);
+            DrawSphere(geo);
+            shader.NextDrawCall();
+            shader.Use(scene.wireframeMode);
+        }
     }
 
     for (const PrefabRenderBatch& batch : prefabRenderBatches) {

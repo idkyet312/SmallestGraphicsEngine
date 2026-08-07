@@ -423,6 +423,15 @@ struct Scene {
     bool useVisibilityBuffer = true; // Fast hybrid default; M toggles Forward fallback
     bool useRaytracing       = false; // DXR raytracing mode
 
+    // DXGI present sync interval: 0 uncapped (tearing allowed), 1 every vblank,
+    // 2+ divides the refresh rate (2 = half, 3 = a third...). Kept as the raw
+    // interval rather than a bool so the UI can expose the divisors.
+    int vsyncInterval        = 0;
+
+    // Draws a sphere where the BlackHawk's "PlayerRide" empty resolves to, for
+    // checking the authored ride point against the airframe.
+    bool showBlackHawkRideMarker = false;
+
     // Mesh-shader tessellated terrain (replaces the flat floor plane when on)
     bool  useMeshTerrain     = true;
     float terrainHeightScale = 5.0f;

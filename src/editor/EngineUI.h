@@ -500,7 +500,38 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::SliderFloat("Terrain Height", &scene.terrainHeightScale, 0.0f, 15.0f);
         }
         ImGui::DragFloat("Specular", &scene.specularStrength, 0.01f, 0.0f, 1.0f);
+
+        // VSync. 0 is uncapped; 1+ waits that many vblanks, so 2 is half the
+        // refresh rate and 3 a third. The label spells the divisor out because
+        // a bare "2" reads like "more vsync" rather than "half framerate".
+        {
+            const char* vsyncLabel =
+                scene.vsyncInterval == 0 ? "Off (uncapped)" :
+                scene.vsyncInterval == 1 ? "On (every vblank)" :
+                scene.vsyncInterval == 2 ? "On (1/2 refresh)" :
+                scene.vsyncInterval == 3 ? "On (1/3 refresh)" :
+                                           "On (1/4 refresh)";
+            // The main loop mirrors this into g_dx12.syncInterval each frame.
+            ImGui::SliderInt("VSync", &scene.vsyncInterval, 0, 4, vsyncLabel);
+            if (scene.vsyncInterval == 0 && !g_dx12.tearingSupported)
+                ImGui::TextDisabled("  Tearing unsupported; driver may still cap");
+        }
+
         ImGui::Checkbox("Show Helicopter", &scene.showHelicopter);
+        ImGui::Checkbox("BlackHawk Ride Marker", &scene.showBlackHawkRideMarker);
+        if (scene.showBlackHawkRideMarker) {
+            DirectX::XMFLOAT3 local{};
+            const DirectX::XMFLOAT3 ride = BlackHawkRideDebugInfo(local);
+            const DirectX::XMFLOAT3 mesh = BlackHawkRideMeshPosition();
+            const DirectX::XMFLOAT3 centre = BlackHawkModelCentre();
+            ImGui::Text("  empty mesh pos: %.3f, %.3f, %.3f",
+                        mesh.x, mesh.y, mesh.z);
+            ImGui::Text("  model centre/minY: %.3f, %.3f, %.3f  scale %.4f",
+                        centre.x, centre.y, centre.z, BlackHawkModelScale());
+            ImGui::Text("  local: side %.2f  fwd %.2f  up %.2f",
+                        local.x, local.z, local.y);
+            ImGui::Text("  world: %.2f, %.2f, %.2f", ride.x, ride.y, ride.z);
+        }
         ImGui::Checkbox("Enable Shadows", &scene.enableShadows);
         if (scene.enableShadows) {
             ImGui::DragFloat("Shadow Bias", &scene.shadowBias, 0.0005f, 0.0f, 0.05f, "%.4f");

@@ -100,6 +100,10 @@ struct DX12Context {
     bool tearingSupported = false;
     bool debugLayerEnabled = false;   // D3D12 validation active (env/_DEBUG)
     bool dredEnabled = false;         // DRED breadcrumbs/page faults active
+    // Present sync interval: 0 uncapped, 1 every vblank, 2+ divides the refresh
+    // rate. Mirrored here from the scene settings so Present() stays free of
+    // any scene dependency.
+    UINT syncInterval = 0;
     
     // Descriptor heap allocation tracking
     UINT cbvSrvUavHeapOffset = 0;
@@ -772,9 +776,11 @@ inline void EndFrame() {
     ID3D12CommandList* commandLists[] = { g_dx12.commandList.Get() };
     g_dx12.commandQueue->ExecuteCommandLists(1, commandLists);
     
-    // Present
-    UINT syncInterval = 0; // VSync off for uncapped framerate
-    UINT presentFlags = g_dx12.tearingSupported ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    // Present. ALLOW_TEARING is only legal on an unsynchronised present, so it
+    // has to come off the moment vsync is on -- passing both fails Present.
+    const UINT syncInterval = g_dx12.syncInterval;
+    const UINT presentFlags =
+        (syncInterval == 0 && g_dx12.tearingSupported) ? DXGI_PRESENT_ALLOW_TEARING : 0;
     ThrowIfFailed(g_dx12.swapChain->Present(syncInterval, presentFlags));
     
     MoveToNextFrame();
