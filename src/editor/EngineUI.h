@@ -963,6 +963,29 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     vb.currentDrawCall, vb.persistentVertexCount);
                 ImGui::Text("  Persistent meshes: %u",
                     static_cast<UINT>(vb.meshes.size()));
+                // Texture-array occupancy: the fixed materialTextures[64] array
+                // is the wall a bindless heap would remove, so show how close
+                // this scene actually is to it rather than guessing.
+                {
+                    const UINT used = vb.MaterialTextureCount();
+                    const UINT capacity = vb.MaterialTextureCapacity();
+                    const UINT rejected = vb.RejectedTextureCount();
+                    if (rejected > 0) {
+                        // Overflow is otherwise invisible: the material still
+                        // registers and just renders untextured, which reads as
+                        // an authoring mistake rather than a capacity limit.
+                        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                            "  Textures: %u/%u FULL - %u dropped (needs %u)",
+                            used, capacity, rejected, capacity + rejected);
+                    } else if (used * 10u >= capacity * 8u) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.35f, 1.0f),
+                            "  Textures: %u/%u (near limit)", used, capacity);
+                    } else {
+                        ImGui::Text("  Textures: %u/%u", used, capacity);
+                    }
+                    ImGui::Text("  Materials: %u/%u",
+                        vb.MaterialCount(), vb.MaterialCapacity());
+                }
                 const char* debugViews[] = {
                     "Lit resolve", "Instance / primitive IDs", "Raw depth",
                     "Edge mask", "RT reflection rays", "SVGF denoiser",

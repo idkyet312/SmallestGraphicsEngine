@@ -1723,16 +1723,26 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         0.1f, 0.25f, 50.0f, "%.2f m");
     ddgiChanged |= ImGui::DragFloat("Surface offset", &ddgi.surfaceOffset,
         0.02f, 0.0f, 5.0f, "%.2f m");
+    // Upper bound matches DXRProbeLayout's own cap, not the old 2048: a level
+    // saved with more probes than the slider could represent snapped back down
+    // the moment the control was touched, silently discarding the setting.
     int maximumProbes = static_cast<int>(ddgi.maxProbes);
-    if (ImGui::DragInt("Maximum probes", &maximumProbes, 8.0f, 1, 2048)) {
+    if (ImGui::DragInt("Maximum probes", &maximumProbes, 8.0f, 1, 16384)) {
         ddgi.maxProbes = static_cast<uint32_t>(maximumProbes);
         ddgiChanged = true;
     }
+    // Hard-capped at 64 by the renderer: the irradiance atlas has an 8x8
+    // directional interior, and more rays than texels would race writing the
+    // same ones. The slider stops where the clamp does so the number shown is
+    // the number used -- it previously accepted values up to 256 that
+    // ApplySettings silently reduced.
     int raysPerProbe = static_cast<int>(ddgi.raysPerProbe);
     if (ImGui::DragInt("Rays per probe", &raysPerProbe, 1.0f, 8, 64)) {
         ddgi.raysPerProbe = static_cast<uint32_t>(raysPerProbe);
         ddgiChanged = true;
     }
+    if (ddgi.raysPerProbe > 64u)
+        ImGui::TextDisabled("  Clamped to 64 (8x8 directional atlas).");
     int probesPerFrame = static_cast<int>(ddgi.probesPerFrame);
     if (ImGui::DragInt("Probes per frame", &probesPerFrame, 1.0f, 1,
                        static_cast<int>(ddgi.maxProbes))) {

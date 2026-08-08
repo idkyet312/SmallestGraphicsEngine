@@ -11,6 +11,7 @@
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Defined in main.cpp. Same pattern as ForwardRenderer.h / IdTechRenderer.h:
@@ -380,6 +381,11 @@ public:
     std::unordered_map<ID3D12Resource*, UINT> materialTextureLookup;
     UINT materialCount = 1;
     UINT materialTextureCount = 0;
+    // Distinct textures turned away because the fixed 64-slot array was full.
+    // A set, not a counter: the useful number is how many UNIQUE textures did
+    // not fit, since that is how much larger the array would have to be (or how
+    // much a bindless heap would buy).
+    std::unordered_set<ID3D12Resource*> materialTexturesRejected;
     UINT currentDrawCall = 0;
     UINT previousDrawCount = 0;
     UINT drawCallDirtyMin = UINT_MAX;
@@ -519,8 +525,14 @@ public:
             auto foundTexture = materialTextureLookup.find(texture);
             if (foundTexture != materialTextureLookup.end())
                 return foundTexture->second;
-            if (materialTextureCount >= VB_MAX_MATERIAL_TEXTURES)
+            if (materialTextureCount >= VB_MAX_MATERIAL_TEXTURES) {
+                // The array is full. The material still registers, it just
+                // renders untextured -- a silent quality loss that looks like
+                // an authoring mistake rather than a capacity limit, so count
+                // the rejects and surface them in the UI.
+                materialTexturesRejected.insert(texture);
                 return UINT_MAX;
+            }
             const UINT textureIndex = materialTextureCount++;
             D3D12_RESOURCE_BARRIER barrier = {};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3734,6 +3746,19 @@ public:
     }
 
     bool EnhancedVisualsReady() const { return enhancedPipelineReady; }
+
+    // Material/texture residency, for judging whether the fixed-size binding
+    // model is actually a constraint yet. MaterialTextureCount() saturates at
+    // VB_MAX_MATERIAL_TEXTURES; RejectedTextureCount() is how many distinct
+    // textures were turned away after that, which is the number that says how
+    // much a bindless heap would buy.
+    UINT MaterialTextureCount() const { return materialTextureCount; }
+    UINT MaterialTextureCapacity() const { return VB_MAX_MATERIAL_TEXTURES; }
+    UINT RejectedTextureCount() const {
+        return static_cast<UINT>(materialTexturesRejected.size());
+    }
+    UINT MaterialCount() const { return materialCount; }
+    UINT MaterialCapacity() const { return VB_MAX_MATERIALS; }
     // Fraction of sampled pixels routed to RT last time the statistic updated.
     // 0..1; indicative rather than exact (see UpdateRayMaskStatistic).
     float EnhancedRayFraction() const { return rayMaskFraction; }
