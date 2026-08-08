@@ -92,3 +92,8 @@ Content/Levels/.ddgi/
 assetcache/
 dumps/
 Content/Models/ship.glb
+
+# Ad hoc shader disassembly captured when verifying a refactor is pure
+# (compile before/after, compare sizes). Derived output, never source.
+*.dxil
+temp_dxil/
