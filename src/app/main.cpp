@@ -3544,10 +3544,15 @@ static bool RebuildDXRDDGIProbeLayout(bool force) {
         AppendDXRDDGITerrain(triangles, geometryHash);
     const std::filesystem::path cache = std::filesystem::path("Content/Levels") /
         ".ddgi" / (std::to_string(geometryHash) + ".ddgi");
-    if (!g_dxrDDGI.BuildProbeLayout(triangles, geometryHash, cache))
+    if (!g_dxrDDGI.BuildProbeLayout(triangles, geometryHash, cache)) {
+        std::cerr << "[DDGI] BuildProbeLayout failed (triangles="
+                  << triangles.size() << ")" << std::endl;
         return false;
-    if (!g_dxrDDGI.UploadProbeBuffers(g_dx12.commandList.Get()))
+    }
+    if (!g_dxrDDGI.UploadProbeBuffers(g_dx12.commandList.Get())) {
+        std::cerr << "[DDGI] UploadProbeBuffers failed" << std::endl;
         return false;
+    }
     g_dxrDDGIProbeResource = g_dxrDDGI.ProbeBuffer();
     g_dxrDDGICellResource = g_dxrDDGI.CellBuffer();
     g_dxrDDGIIndexResource = g_dxrDDGI.IndexBuffer();

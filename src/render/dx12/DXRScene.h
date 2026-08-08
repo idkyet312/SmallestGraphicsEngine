@@ -96,6 +96,15 @@ public:
                        uint64_t meshId, uint64_t sourceHash,
                        const std::vector<Geometry>& geometries) {
         if (!supported_ || !commandList || geometries.empty()) return false;
+        // Unchanged geometry: keep the existing BLAS.
+        //
+        // This assumes the caller's vertex/index buffers are still alive at the
+        // addresses recorded in meshes_[meshId].geometries, because those
+        // addresses are reused verbatim for the hit records. True for meshes,
+        // whose buffers are owned by MeshPrimitive and outlive the call. A
+        // caller that OWNS its buffers must do its own hash check before
+        // reallocating them -- see BuildTerrainBLAS, where allocating first
+        // freed the very buffers this early-out then kept pointing at.
         auto current = meshes_.find(meshId);
         if (current != meshes_.end() && current->second.sourceHash == sourceHash)
             return true;
@@ -117,10 +126,19 @@ public:
                 geometry.vertexStride;
             description.Triangles.VertexCount = geometry.vertexCount;
             description.Triangles.VertexFormat = geometry.vertexFormat;
-            description.Triangles.IndexBuffer = geometry.indexAddress;
-            description.Triangles.IndexCount = geometry.indexCount;
-            description.Triangles.IndexFormat = geometry.indexCount
-                ? geometry.indexFormat : DXGI_FORMAT_UNKNOWN;
+            // Address and count must agree. A caller can supply indexCount
+            // from the source primitive while leaving indexAddress 0 because
+            // the index buffer was never created (main.cpp's node walk does
+            // exactly this), which would otherwise produce a desc carrying a
+            // real IndexFormat and IndexCount over a null index buffer -- a
+            // non-indexed triangle list described as indexed.
+            const bool indexed =
+                geometry.indexAddress != 0 && geometry.indexCount != 0;
+            description.Triangles.IndexBuffer =
+                indexed ? geometry.indexAddress : 0;
+            description.Triangles.IndexCount = indexed ? geometry.indexCount : 0;
+            description.Triangles.IndexFormat =
+                indexed ? geometry.indexFormat : DXGI_FORMAT_UNKNOWN;
             descriptions.push_back(description);
         }
         if (descriptions.empty()) return false;
@@ -180,6 +198,27 @@ public:
         const std::vector<DirectX::XMFLOAT3>& vertices,
         const std::vector<uint32_t>& indices) {
         if (vertices.empty() || indices.empty()) return false;
+        // Hash check BEFORE allocating, because this is the one builder that
+        // OWNS its geometry buffers.
+        //
+        // CreateBuffer ends in IID_PPV_ARGS(&terrainVertices_), and
+        // ComPtr::operator& releases first -- so allocating here frees the
+        // previous buffers. BuildMeshBLAS would then early-out on the
+        // unchanged hash and return without rebuilding, leaving
+        // meshes_[kTerrainMeshId].geometries holding the GPU addresses of the
+        // memory just released. Those addresses are copied into hitRecords_
+        // and written into the shader table as root SRVs, so the next
+        // DispatchRays dereferences freed memory: device hang, DRED page fault
+        // at VA 0. Terrain geometry is deterministic, so the hash matches on
+        // every rebuild and this fired every time the acceleration scene was
+        // built twice -- which a level load does (probe layout + enhanced
+        // visuals each build it once).
+        //
+        // Returning here keeps the existing buffers and BLAS intact and makes
+        // the repeat build genuinely free.
+        auto existing = meshes_.find(kTerrainMeshId);
+        if (existing != meshes_.end() && existing->second.sourceHash == sourceHash)
+            return true;
         const uint64_t vertexBytes = vertices.size() * sizeof(vertices[0]);
         const uint64_t indexBytes = indices.size() * sizeof(indices[0]);
         if (!CreateBuffer(vertexBytes, D3D12_RESOURCE_FLAG_NONE,
@@ -296,7 +335,15 @@ public:
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
         device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+        // Test BOTH buffers. The scratch requirement grows with instance count,
+        // but topologyDirty_ is set only by BuildMeshBLAS/RemoveMesh, so adding
+        // instances of an already-built mesh does not raise it. With only the
+        // result buffer tested, a grown instance list whose result still fits
+        // (CreateBuffer rounds up to 256B) would build against a scratch buffer
+        // sized for the smaller list and overrun it.
         if (!tlas_ || tlas_->GetDesc().Width < info.ResultDataMaxSizeInBytes ||
+            !tlasScratch_ ||
+            tlasScratch_->GetDesc().Width < info.ScratchDataSizeInBytes ||
             topologyDirty_) {
             if (!CreateBuffer(info.ResultDataMaxSizeInBytes,
                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
@@ -308,6 +355,10 @@ public:
                     D3D12_HEAP_TYPE_DEFAULT, tlasScratch_))
                 return false;
         }
+        // Both must exist: the branch above is conditional, so an earlier
+        // failed allocation would otherwise reach GetGPUVirtualAddress() on a
+        // null ComPtr and crash on the CPU instead of reporting a failure.
+        if (!tlas_ || !tlasScratch_) return false;
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build{};
         build.Inputs = inputs;
         build.DestAccelerationStructureData = tlas_->GetGPUVirtualAddress();

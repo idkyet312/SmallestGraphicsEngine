@@ -114,6 +114,10 @@ bool ParseLevelInsertionMode(const std::string& text, LevelInsertionMode& mode) 
 LevelDefinition MakeLevelOneTemplate() {
     LevelDefinition level;
     level.name = "Level 1 Copy";
+    // Level 1 is built here in code, not loaded from Content/Levels, so it
+    // does not pick up the dxrDDGI block the island JSONs carry and keeps the
+    // struct default of enabled=false: it runs on the legacy grid. Sparse DXR
+    // DDGI is opt-in via the UI or a JSON level.
     uint64_t id = 1;
     level.entities.push_back(MakeEntity(id++, LevelEntityType::PlayerSpawn,
         "Player Spawn", 0.0f, 5.0f, 10.0f, 180.0f));
