@@ -449,27 +449,6 @@ float3 RenderProceduralSky(uint2 pixel) {
     return sky + lightColor * (sun * 18.0 + halo * 0.22);
 }
 
-float ScreenSpaceAO(uint2 pixel, float3 worldPos, float3 normal) {
-    static const int2 directions[8] = {
-        int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1),
-        int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1)
-    };
-    float occlusion = 0.0;
-    [unroll]
-    for (uint i = 0; i < 8; ++i) {
-        int2 samplePixel = clamp(int2(pixel) + directions[i] * 4,
-                                 int2(0, 0), int2(screenWidth - 1, screenHeight - 1));
-        float sampleDepth = depthBuffer.Load(int3(samplePixel, 0));
-        if (sampleDepth >= 1.0) continue;
-        float3 samplePosition = ReconstructWorldPos(samplePixel, sampleDepth);
-        float3 delta = samplePosition - worldPos;
-        float distanceToSample = length(delta);
-        float horizon = saturate((dot(normal, delta / max(distanceToSample, 0.001)) - 0.08) * 3.0);
-        occlusion += horizon * saturate(1.0 - distanceToSample / 2.5);
-    }
-    return saturate(1.0 - occlusion / 8.0);
-}
-
 #if SGE_ENHANCED_VISUALS
 // Inline ray-traced sun shadow. Only compiled into the SM6.5 variant of this
 // shader -- FXC cannot compile RayQuery at any profile, so the default build
