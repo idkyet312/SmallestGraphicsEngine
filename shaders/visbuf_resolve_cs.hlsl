@@ -190,8 +190,10 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     // SVGF temporal accumulation for RT reflections. Append only.
     uint  svgfTemporalEnabled;     // toggle: off by default
     uint  svgfMaxAccumFrames;      // max N for alpha = 1/N ramp
-    uint  svgfPadding0;
-    uint  svgfPadding1;
+    uint  svgfAtrousEnabled;       // toggle: spatial à-trous filter
+    uint  svgfAtrousIterations;    // number of à-trous passes
+    uint  svgfHistoryValid;        // false on first frame/resize/toggle
+    uint3 svgfPadding;
 };
 
 // Per-pixel record of where the rays went, for the debug view and the
@@ -210,6 +212,12 @@ Texture2D<float4> svgfHistoryMoments : register(t81);
 // Current frame's accumulated colour and moments, written to the other side.
 RWTexture2D<float4> svgfHistoryColorWrite  : register(u4);
 RWTexture2D<float4> svgfHistoryMomentsWrite : register(u5);
+
+// BRDF-modulated specular IBL contribution from RT reflections, written so
+// the spatial à-trous filter can operate on it separately from the main
+// lit output. RGB is the signal; alpha is matching signal variance. Zero for
+// pixels where RT reflections are not active.
+RWTexture2D<float4> outputReflectionSrc  : register(u6);
 #endif
 
 SamplerState              texSampler    : register(s0);
@@ -548,8 +556,9 @@ float3 ImportanceSampleGGX(float2 xi, float3 normal, float roughness) {
 // One stochastic GGX-importance-sampled reflection ray against the static
 // TLAS.
 //
-// `hit` reports whether the ray committed a triangle. On a miss the caller
-// keeps the environment probe, so a miss costs nothing but the ray.
+// `hit` reports whether the ray committed a triangle. The return value is a
+// complete sample on both hit and miss, so temporal accumulation never jumps
+// between a stochastic path and a deterministic fallback.
 //
 // This is deliberately ONE sample per pixel per frame, rotated by frame index:
 // that is what makes the signal genuinely stochastic, and therefore what makes
@@ -577,8 +586,9 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
 
     float3 h = ImportanceSampleGGX(xi, normal, roughness);
     float3 rayDir = reflect(-viewDir, h);
-    // Sample landed below the horizon; nothing sensible to trace.
-    if (dot(rayDir, normal) <= 0.0) return float3(0.0, 0.0, 0.0);
+    // Sample landed below the surface. It contributes zero to this lobe, but
+    // remains a valid every-frame sample for the temporal accumulator.
+    if (dot(rayDir, normal) <= 0.0) return 0.0;
 
     RayDesc ray;
     float grazing = 1.0 - saturate(dot(normal, rayDir));
@@ -594,10 +604,10 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
     query.Proceed();
 
     if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
-        // Miss: the environment along the sampled direction is the answer, and
-        // it is already what the probe would give. Report no hit so the caller
-        // keeps its existing term rather than double-counting.
-        return float3(0.0, 0.0, 0.0);
+        // Miss: sample the environment along this stochastic direction. Using
+        // the deterministic mirror direction here biases the estimator and
+        // recreates hit/miss flicker outside the accumulator.
+        return SampleReflectionProbe(rayDir, roughness);
     }
 
     hit = true;
@@ -627,8 +637,19 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
 //
 // Returns the denoised (temporally blended) reflection colour.
 float3 SVGF_TemporalAccumulate(float3 currentSample, uint2 pixel,
-                               uint currentVisID, bool writeHistory) {
+                               uint2 currentVisID, bool writeHistory,
+                               out float3 variance) {
+    variance = 0.0;
     if (svgfTemporalEnabled == 0) return currentSample;
+
+    if (svgfHistoryValid == 0) {
+        if (writeHistory) {
+            svgfHistoryColorWrite[pixel] = float4(currentSample, 0.0);
+            svgfHistoryMomentsWrite[pixel] =
+                float4(currentSample * currentSample, 1.0);
+        }
+        return currentSample;
+    }
 
     float2 currentUV = (float2(pixel) + 0.5) / float2(screenWidth, screenHeight);
     float2 motion = outputMotion[pixel];
@@ -650,9 +671,10 @@ float3 SVGF_TemporalAccumulate(float3 currentSample, uint2 pixel,
                           int2(screenWidth - 1, screenHeight - 1));
 
     uint2 previousID = visBufferHistoryTex.Load(int3(previousPixel, 0));
-    // 5a's exact surface-ID test: same instance at the reprojected position
-    // means this is provably the same surface across frames.
-    if (previousID.x != currentVisID) {
+    // Reflection history uses strict instance+primitive identity. Reusing a
+    // different triangle from the same mesh smears high-frequency specular
+    // detail across folds and silhouettes.
+    if (any(previousID != currentVisID)) {
         if (writeHistory) {
             svgfHistoryColorWrite[pixel] = float4(currentSample, 0.0);
             svgfHistoryMomentsWrite[pixel] =
@@ -670,6 +692,7 @@ float3 SVGF_TemporalAccumulate(float3 currentSample, uint2 pixel,
 
     float3 blendedColor = lerp(prevColor.rgb, currentSample, alpha);
     float3 blendedSq = lerp(prevMoments.rgb, currentSample * currentSample, alpha);
+    variance = max(blendedSq - blendedColor * blendedColor, 0.0);
 
     if (writeHistory) {
         svgfHistoryColorWrite[pixel] = float4(blendedColor, 0.0);
@@ -981,11 +1004,32 @@ Surface EvaluateSurface(float3 fragPos,
     return surface;
 }
 
+#if SGE_ENHANCED_VISUALS
+struct ShadeResult {
+    float3 color;
+    float3 specularIBL;
+    float  specularVariance;
+};
+#endif
+
 // `commitTemporalHistory` is false for edge-AA sub-samples, which call this
 // twice for one pixel; see SVGF_TemporalAccumulate.
+#if SGE_ENHANCED_VISUALS
+ShadeResult ShadeSurface(uint2 pixel, Surface surface,
+                         bool commitTemporalHistory = true) {
+#else
+// Keep the unused defaulted parameter: dropping it changes the default
+// variant's DXBC (42020 -> 42024), and byte-identical output with the feature
+// off is the contract that catches silently-broken PSOs.
 float3 ShadeSurface(uint2 pixel, Surface surface,
                     bool commitTemporalHistory = true) {
+#endif
     float3 result = 0.0;
+#if SGE_ENHANCED_VISUALS
+    float3 outSpecularIBL = 0.0;
+    float outSpecularVariance = 0.0;
+    float3 reflectionVariance = 0.0;
+#endif
     
     // Main light
     float3 L;
@@ -1053,7 +1097,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
         // A miss is a real sample of the reflection integral -- it means "sky
         // along that direction" -- so it carries the probe value rather than
         // no value at all.
-        float3 thisFrameSample = reflectionHit ? traced : reflectionIBL;
+        float3 thisFrameSample = traced;
         if (svgfTemporalEnabled != 0) {
             // Accumulate EVERY frame, hit or miss. Accumulating only on hits
             // reads as unfixable grain no matter how many frames are allowed:
@@ -1064,8 +1108,8 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
             // accumulation count can damp that because half the frames never
             // reach the accumulator.
             reflectionIBL = SVGF_TemporalAccumulate(
-                thisFrameSample, pixel, visBuffer.Load(int3(pixel, 0)).x,
-                commitTemporalHistory);
+                thisFrameSample, pixel, visBuffer.Load(int3(pixel, 0)),
+                commitTemporalHistory, reflectionVariance);
         } else {
             reflectionIBL = thisFrameSample;
         }
@@ -1074,11 +1118,37 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
     float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
         texSampler, float2(NdotV, surface.rough), 0.0);
     float foliageSpecularScale = surface.isFoliage ? 0.12 : 1.0;
+#if SGE_ENHANCED_VISUALS
+    // Decomposed so the à-trous pass can isolate the specular contribution and
+    // its variance. Kept inside the guard: the default variant must retain the
+    // original single expression below, because regrouping the arithmetic
+    // changes its DXBC (42020 -> 42024) and byte-identical output with the
+    // feature off is the contract that catches silently-broken PSOs.
+    float3 specularScale =
+        (F0 * environmentBRDF.x + environmentBRDF.y) *
+        foliageSpecularScale;
+    float3 specularIBL = reflectionIBL * specularScale;
+    float3 specularContrib = specularIBL * ambientOcclusion * ambientLightingIntensity;
+    result += (diffuseIBL + diffuseGI) * ambientOcclusion * ambientLightingIntensity +
+              specularContrib;
+    if (enhancedRTReflections != 0 &&
+        surface.rough <= enhancedReflectionRoughnessCut &&
+        !surface.isFoliage) {
+        outSpecularIBL = specularContrib;
+        float3 contributionScale = specularScale * ambientOcclusion *
+                                   ambientLightingIntensity;
+        float3 contributionVariance = reflectionVariance *
+                                      contributionScale * contributionScale;
+        outSpecularVariance = dot(
+            contributionVariance, float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0));
+    }
+#else
     float3 specularIBL = reflectionIBL *
         (F0 * environmentBRDF.x + environmentBRDF.y) *
         foliageSpecularScale;
     result += (diffuseIBL + diffuseGI + specularIBL) * ambientOcclusion *
               ambientLightingIntensity;
+#endif
     result += ambientStrength * diffuseAlbedo * ambientScale *
               ambientOcclusion * ambientLightingIntensity;
     result += surface.material.emissiveOcclusion.rgb;
@@ -1166,7 +1236,15 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
                                           surface.viewDir, surface.rough) * surface.albedo;
     }
     
+#if SGE_ENHANCED_VISUALS
+    ShadeResult shadeResult;
+    shadeResult.color = result;
+    shadeResult.specularIBL = outSpecularIBL;
+    shadeResult.specularVariance = outSpecularVariance;
+    return shadeResult;
+#else
     return result;
+#endif
 }
 
 // ---- Main ----
@@ -1186,6 +1264,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // is read back for the ray-fraction statistic, and a stale value from a
     // previous frame would quietly inflate it.
     outputRayMask[pixel] = 0u;
+    outputReflectionSrc[pixel] = 0.0;
 #endif
 
     if (debugViewMode == 2u) {
@@ -1353,6 +1432,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                 float2(0.25, 0.25), float2(0.75, 0.75)
             };
             float3 sampleColors[2];
+            float3 sampleSpecular[2];
+            float sampleSpecularVariance[2];
             
             [unroll]
             for (uint s = 0; s < 2; ++s) {
@@ -1443,11 +1524,24 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                     uv0s, uv1s, uv2s, baryUsed);
                 // Sub-samples must not commit temporal history: two calls for
                 // one pixel would double-blend and double-advance the count.
-                sampleColors[s] = ShadeSurface(pixel, surfaceS, false);
+                ShadeResult srS = ShadeSurface(pixel, surfaceS, false);
+                sampleColors[s] = srS.color;
+                sampleSpecular[s] = srS.specularIBL;
+                sampleSpecularVariance[s] = srS.specularVariance;
             }
             
             float3 finalColor = (sampleColors[0] + sampleColors[1]) * 0.5;
             outputColor[pixel] = float4(finalColor, 1.0);
+            float3 avgSpecular = (sampleSpecular[0] + sampleSpecular[1]) * 0.5;
+            float avgSecondMoment = 0.5 * (
+                sampleSpecularVariance[0] +
+                dot(sampleSpecular[0] * sampleSpecular[0], 1.0 / 3.0) +
+                sampleSpecularVariance[1] +
+                dot(sampleSpecular[1] * sampleSpecular[1], 1.0 / 3.0));
+            float avgVariance = max(
+                avgSecondMoment - dot(avgSpecular * avgSpecular, 1.0 / 3.0),
+                0.0);
+            outputReflectionSrc[pixel] = float4(avgSpecular, avgVariance);
             edgeAAApplied = true;
         }
     }
@@ -1512,14 +1606,49 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                 surface.viewDir, surface.rough, pixel, reflectionHit);
             // Mirror the lit path: misses carry the probe, so this view shows
             // what shading actually uses rather than a hit-only subset.
-            float3 sample = reflectionHit
-                ? traced
-                : SampleReflectionProbe(
-                      reflect(-surface.viewDir, surface.normal), surface.rough);
+            float3 sample = traced;
             // Debug view only: never commit, or switching to this view would
             // corrupt the history the lit path is accumulating.
+            float3 debugVariance;
             debugColor = SVGF_TemporalAccumulate(
-                sample, pixel, visBuffer.Load(int3(pixel, 0)).x, false);
+                sample, pixel, visBuffer.Load(int3(pixel, 0)), false,
+                debugVariance);
+        }
+        outputColor[pixel] = float4(debugColor, 1.0);
+        if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
+        return;
+    }
+
+    // Debug view 6: specular IBL contribution (BRDF-modulated) that feeds
+    // into the spatial à-trous filter. Shows the pre-filter reflection signal,
+    // coloured white where RT reflections are active. Compare against view 5
+    // — the same signal, pre-BRDF vs post-BRDF.
+    if (debugViewMode == 6u) {
+        float3 debugColor = float3(0.0, 0.0, 0.0);
+        bool eligible = enhancedRTReflections != 0 &&
+                        surface.rough <= enhancedReflectionRoughnessCut &&
+                        !surface.isFoliage;
+        if (eligible) {
+            bool reflectionHit = false;
+            float3 traced = RayTracedReflection(
+                surface.fragPos, surface.normal,
+                surface.viewDir, surface.rough, pixel, reflectionHit);
+            float3 thisFrameSample = traced;
+            float3 debugVariance;
+            float3 reflIBL = svgfTemporalEnabled != 0
+                ? SVGF_TemporalAccumulate(thisFrameSample, pixel,
+                    visBuffer.Load(int3(pixel, 0)), false, debugVariance)
+                : thisFrameSample;
+            // Apply BRDF mirroring the lit path so the debug view matches
+            // what the spatial filter receives.
+            float2 envBRDF = brdfIntegrationLUT.SampleLevel(
+                texSampler,
+                float2(max(dot(surface.normal, surface.viewDir), 0.0),
+                       surface.rough), 0.0);
+            float foliageScale = surface.isFoliage ? 0.12 : 1.0;
+            float3 F0 = lerp(float3(0.04, 0.04, 0.04), surface.albedo, surface.metal);
+            debugColor = reflIBL *
+                (F0 * envBRDF.x + envBRDF.y) * foliageScale;
         }
         outputColor[pixel] = float4(debugColor, 1.0);
         if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
@@ -1529,8 +1658,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
 
 #if SGE_ENHANCED_VISUALS
     if (!edgeAAApplied) {
-        float3 result = ShadeSurface(pixel, surface);
-        outputColor[pixel] = float4(result, 1.0);
+        ShadeResult sr = ShadeSurface(pixel, surface);
+        outputColor[pixel] = float4(sr.color, 1.0);
+        outputReflectionSrc[pixel] =
+            float4(sr.specularIBL, sr.specularVariance);
     } else if (svgfTemporalEnabled != 0 && enhancedRTReflections != 0 &&
                surface.rough <= enhancedReflectionRoughnessCut &&
                !surface.isFoliage) {
@@ -1548,12 +1679,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         // Commit on misses too, matching ShadeSurface: a miss contributes the
         // probe value, and skipping those frames is what made the accumulator
         // flicker between converged and raw.
-        float3 centreSample = centreHit
-            ? centreTraced
-            : SampleReflectionProbe(reflect(-surface.viewDir, surface.normal),
-                                    surface.rough);
+        float3 centreSample = centreTraced;
+        float3 centreVariance;
         SVGF_TemporalAccumulate(centreSample, pixel,
-                                visBuffer.Load(int3(pixel, 0)).x, true);
+                                visBuffer.Load(int3(pixel, 0)), true,
+                                centreVariance);
     }
 #else
     float3 result = ShadeSurface(pixel, surface);

@@ -663,6 +663,16 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                             else
                                 ImGui::TextDisabled(
                                     "    Waiting for first history frame");
+                            ImGui::Checkbox("    SVGF A-Trous Spatial Filter",
+                                            &vb.svgfAtrousEnabled);
+                            if (vb.svgfAtrousEnabled) {
+                                ImGui::SliderInt("      A-Trous Iterations",
+                                    (int*)&vb.svgfAtrousIterations, 1, 5);
+                                ImGui::TextDisabled(
+                                    "      Variance-driven edge stopping.");
+                                ImGui::TextDisabled(
+                                    "      Lets Max Accum Frames come down.");
+                            }
                         }
                     }
                     ImGui::Checkbox("  Ray Classification",
