@@ -621,6 +621,17 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                         ImGui::TextDisabled("  Needs the VB path");
                     }
                     ImGui::Checkbox("  RT Sun Shadows", &scene.enhancedRTShadows);
+                    ImGui::Checkbox("  RT Reflections (noisy)",
+                                    &scene.enhancedRTReflections);
+                    if (scene.enhancedRTReflections) {
+                        ImGui::SliderFloat("  Refl Roughness Cut",
+                            &vb.enhancedReflectionRoughnessCut,
+                            0.05f, 1.0f, "%.2f");
+                        ImGui::TextDisabled(
+                            "  1 GGX ray/pixel/frame: noisy by design.");
+                        ImGui::TextDisabled(
+                            "  Phase 5b denoiser resolves it.");
+                    }
                     ImGui::Checkbox("  Ray Classification",
                                     &scene.enhancedRayClassify);
                     if (scene.enhancedRayClassify) {

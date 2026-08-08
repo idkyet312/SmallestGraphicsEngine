@@ -439,6 +439,10 @@ struct Scene {
     // is a no-op unless enhancedVisuals is on.
     bool enhancedRTShadows   = true;   // RayQuery sun shadows, replaces CSM
     bool enhancedRayClassify = true;   // Spend rays only on low-confidence pixels
+    // Stochastic RT reflections: one GGX ray per pixel per frame. Off by
+    // default -- the raw signal is noisy on purpose and wants the Phase 5b
+    // temporal denoiser to resolve it.
+    bool enhancedRTReflections = false;
     // Confidence below which a pixel is handed to RT. Raising it traces more
     // pixels (better, slower). Live-tunable so the split can be dialled in
     // against a real scene rather than guessed.

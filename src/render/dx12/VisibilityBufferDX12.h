@@ -209,6 +209,18 @@ public:
     bool enhancedRayClassifyActive = true;
     float enhancedConfidenceThreshold = 0.35f;
     float enhancedShadowRayLength = 220.0f;
+    // Stochastic ray-traced reflections. One GGX-importance-sampled ray per
+    // pixel per frame, rotated by frame index -- deliberately noisy, because
+    // the temporal denoiser (Phase 5b) is what resolves it. Off by default.
+    bool enhancedRTReflectionsActive = false;
+    float enhancedReflectionRayLength = 120.0f;
+    // Above this roughness the GGX lobe is wide enough that one sample per
+    // frame is mostly variance and the environment probe is already close.
+    float enhancedReflectionRoughnessCut = 0.35f;
+    // Radiance scale applied to an occluded reflection hit. Without a
+    // hit-shading path this stands in for "something blocked the sky here".
+    float enhancedReflectionOcclusion = 0.25f;
+    UINT enhancedReflectionFrameCounter = 0;
     // TLAS this frame. Re-registered whenever it changes, since the
     // acceleration structure is rebuilt as geometry streams in.
     D3D12_GPU_VIRTUAL_ADDRESS enhancedTLASAddress = 0;
@@ -1847,16 +1859,37 @@ private:
     // Uploads the per-frame enhanced constants (b5).
     void UpdateEnhancedConstants() {
         if (!enhancedConstantMapped) return;
+        // Field-for-field mirror of EnhancedVisualsBuffer (b5) in
+        // visbuf_resolve_cs.hlsl. Append only -- inserting shifts every field
+        // after it and silently corrupts unrelated state.
         struct EnhancedConstants {
             UINT  rtShadows;
             UINT  rayClassify;
             float shadowRayLength;
             float confidenceThreshold;
+            UINT  rtReflections;
+            float reflectionRayLength;
+            float reflectionRoughnessCut;
+            UINT  frameIndex;
+            float reflectionOcclusion;
+            float pad0;
+            float pad1;
+            float pad2;
         } constants;
         constants.rtShadows = enhancedRTShadowsActive ? 1u : 0u;
         constants.rayClassify = enhancedRayClassifyActive ? 1u : 0u;
         constants.shadowRayLength = enhancedShadowRayLength;
         constants.confidenceThreshold = enhancedConfidenceThreshold;
+        constants.rtReflections = enhancedRTReflectionsActive ? 1u : 0u;
+        constants.reflectionRayLength = enhancedReflectionRayLength;
+        constants.reflectionRoughnessCut = enhancedReflectionRoughnessCut;
+        // Rotates the sampling sequence so consecutive frames draw different
+        // samples; this is the variance a temporal denoiser resolves.
+        constants.frameIndex = enhancedReflectionFrameCounter++;
+        constants.reflectionOcclusion = enhancedReflectionOcclusion;
+        constants.pad0 = 0.0f;
+        constants.pad1 = 0.0f;
+        constants.pad2 = 0.0f;
         memcpy(enhancedConstantMapped, &constants, sizeof(constants));
     }
 
@@ -2210,10 +2243,12 @@ public:
     // descriptors only when the TLAS moves keeps this close to free.
     void SetEnhancedVisuals(bool active, bool rtShadows, bool rayClassify,
                             float confidenceThreshold,
-                            D3D12_GPU_VIRTUAL_ADDRESS tlasAddress) {
+                            D3D12_GPU_VIRTUAL_ADDRESS tlasAddress,
+                            bool rtReflections = false) {
         enhancedRTShadowsActive = rtShadows;
         enhancedRayClassifyActive = rayClassify;
         enhancedConfidenceThreshold = confidenceThreshold;
+        enhancedRTReflectionsActive = rtReflections;
         // Without a TLAS there is nothing to trace against, so the enhanced
         // path would just be a slower way to get the same image.
         const bool wantActive = active && tlasAddress != 0;

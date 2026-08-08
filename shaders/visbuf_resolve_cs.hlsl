@@ -177,6 +177,16 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     uint  enhancedRayClassify;      // spend rays only on low-confidence pixels
     float enhancedShadowRayLength;  // TMax for shadow rays, world units
     float enhancedConfidenceThreshold;
+    // Appended, never inserted: the C++ mirror in VisibilityBufferDX12.h
+    // (UpdateEnhancedConstants) must match field-for-field in order.
+    uint  enhancedRTReflections;    // master switch for RT reflections
+    float enhancedReflectionRayLength;   // TMax for reflection rays
+    float enhancedReflectionRoughnessCut; // skip rays above this roughness
+    uint  enhancedFrameIndex;       // per-frame seed for the sampling sequence
+    float enhancedReflectionOcclusion;   // radiance scale for an occluded hit
+    float enhancedReflectionPad0;
+    float enhancedReflectionPad1;
+    float enhancedReflectionPad2;
 };
 
 // Per-pixel record of where the rays went, for the debug view and the
@@ -487,6 +497,97 @@ float RayTracedShadow(float3 worldPos, float3 normal, float3 lightDir) {
     // Occluded by static geometry, or nothing in the way as far as the TLAS
     // knows. Either way the caller decides how much to trust it.
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
+}
+
+// Hammersley point, radical-inverse base 2. Deterministic per index.
+float2 Hammersley2D(uint i, uint count) {
+    uint bits = i;
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xaaaaaaaau) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xccccccccu) >> 2u);
+    bits = ((bits & 0x0f0f0f0fu) << 4u) | ((bits & 0xf0f0f0f0u) >> 4u);
+    bits = ((bits & 0x00ff00ffu) << 8u) | ((bits & 0xff00ff00u) >> 8u);
+    return float2((float)i / (float)count, (float)bits * 2.3283064365386963e-10);
+}
+
+// GGX/Trowbridge-Reitz importance sample: returns a half-vector in world space
+// distributed by the NDF for `roughness`. Standard Karis mapping.
+float3 ImportanceSampleGGX(float2 xi, float3 normal, float roughness) {
+    float a = roughness * roughness;
+    float phi = 6.2831853071 * xi.x;
+    float cosTheta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
+    float sinTheta = sqrt(saturate(1.0 - cosTheta * cosTheta));
+
+    float3 h = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+
+    // Tangent basis around the surface normal.
+    float3 up = abs(normal.z) < 0.999 ? float3(0.0, 0.0, 1.0)
+                                      : float3(1.0, 0.0, 0.0);
+    float3 tangentX = normalize(cross(up, normal));
+    float3 tangentY = cross(normal, tangentX);
+    return normalize(tangentX * h.x + tangentY * h.y + normal * h.z);
+}
+
+// One stochastic GGX-importance-sampled reflection ray against the static
+// TLAS.
+//
+// `hit` reports whether the ray committed a triangle. On a miss the caller
+// keeps the environment probe, so a miss costs nothing but the ray.
+//
+// This is deliberately ONE sample per pixel per frame, rotated by frame index:
+// that is what makes the signal genuinely stochastic, and therefore what makes
+// a temporal denoiser (Phase 5b) both necessary and measurable. A multi-sample
+// loop here would trade the denoiser's job for raw cost and hide the variance
+// the denoiser is supposed to resolve.
+//
+// The TLAS holds static geometry only, so this cannot reflect dynamic actors.
+// Shading the hit is out of scope for this pass -- the hit position is shaded
+// from the environment probe along the reflected direction, which is a coarse
+// but stable approximation that keeps this pass a single ray with no recursion.
+float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
+                           float roughness, uint2 pixel, out bool hit) {
+    hit = false;
+    if (enhancedRTReflections == 0) return float3(0.0, 0.0, 0.0);
+
+    // Decorrelate pixels, then rotate the sequence per frame so consecutive
+    // frames draw different samples -- the temporal accumulation in 5b is what
+    // turns that into a converged image.
+    uint pixelSeed = MatVarHashUint(pixel.x * 73856093u ^ pixel.y * 19349663u);
+    uint sampleIndex = (pixelSeed + enhancedFrameIndex) & 63u;
+    float2 xi = Hammersley2D(sampleIndex, 64u);
+    // Cheap per-pixel decorrelation of the first dimension too.
+    xi.x = frac(xi.x + (float)(pixelSeed & 0xffffu) * 1.52587890625e-5);
+
+    float3 h = ImportanceSampleGGX(xi, normal, roughness);
+    float3 rayDir = reflect(-viewDir, h);
+    // Sample landed below the horizon; nothing sensible to trace.
+    if (dot(rayDir, normal) <= 0.0) return float3(0.0, 0.0, 0.0);
+
+    RayDesc ray;
+    float grazing = 1.0 - saturate(dot(normal, rayDir));
+    ray.Origin = worldPos + normal * (0.02 + 0.10 * grazing);
+    ray.Direction = rayDir;
+    ray.TMin = 0.0;
+    ray.TMax = enhancedReflectionRayLength;
+
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+             RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
+             RAY_FLAG_CULL_NON_OPAQUE> query;
+    query.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff, ray);
+    query.Proceed();
+
+    if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
+        // Miss: the environment along the sampled direction is the answer, and
+        // it is already what the probe would give. Report no hit so the caller
+        // keeps its existing term rather than double-counting.
+        return float3(0.0, 0.0, 0.0);
+    }
+
+    hit = true;
+    // Occluded by static geometry. Without a hit-shading path, approximate the
+    // reflected radiance by darkening the probe along the ray -- an occluded
+    // reflection is strictly less bright than the open-sky probe value.
+    return SampleReflectionProbe(rayDir, roughness) * enhancedReflectionOcclusion;
 }
 #endif
 
@@ -847,6 +948,20 @@ float3 ShadeSurface(uint2 pixel, Surface surface) {
     float3 diffuseGI = SampleDDGIIrradiance(surface.fragPos, surface.normal) *
         diffuseAlbedo * ambientScale;
     float3 reflectionIBL = SampleReflectionProbe(reflect(-V, surface.normal), surface.rough);
+#if SGE_ENHANCED_VISUALS
+    // Stochastic RT reflection replaces the probe only where a ray actually
+    // hit static geometry. Rough surfaces are skipped: their lobe is wide
+    // enough that one sample per frame is mostly variance, and the probe is
+    // already a reasonable answer there.
+    if (enhancedRTReflections != 0 &&
+        surface.rough <= enhancedReflectionRoughnessCut &&
+        !surface.isFoliage) {
+        bool reflectionHit = false;
+        float3 traced = RayTracedReflection(surface.fragPos, surface.normal, V,
+                                            surface.rough, pixel, reflectionHit);
+        if (reflectionHit) reflectionIBL = traced;
+    }
+#endif
     float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
         texSampler, float2(NdotV, surface.rough), 0.0);
     float foliageSpecularScale = surface.isFoliage ? 0.12 : 1.0;

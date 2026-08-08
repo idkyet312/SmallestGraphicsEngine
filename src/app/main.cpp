@@ -11258,7 +11258,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             visBuffer.SetEnhancedVisuals(
                 wantEnhanced, scene.enhancedRTShadows,
                 scene.enhancedRayClassify, scene.enhancedConfidenceThreshold,
-                g_dxrDDGI.Scene().TLASAddress());
+                g_dxrDDGI.Scene().TLASAddress(),
+                scene.enhancedRTReflections);
             scene.enhancedRayFraction = wantEnhanced
                 ? visBuffer.EnhancedRayFraction() : 0.0f;
         }
