@@ -246,7 +246,11 @@ public:
     bool enhancedProbeMissGIActive = false;
     // 0 = fill probe misses only (cheapest, rays only where the grid failed),
     // 1 = full RT GI (every pixel traces, probes unused).
-    float enhancedProbeMissGIStrength = 0.0f;
+    // GI ray budget: the probability that a probe-resolved pixel spends a ray
+    // this frame. 0 traces only where the probe grid has nothing, 1 traces
+    // every pixel. At 0.5 half the pixels trace each frame and the half rotates
+    // per frame, so cost is halved and temporal accumulation fills the gaps.
+    float enhancedProbeMissGIStrength = 0.5f;
     UINT enhancedReflectionFrameCounter = 0;
     // SVGF temporal accumulation for RT reflections. Ping-pong history pair:
     // colour (E[x]), moments (E[x^2]) + sample count, one side read (SRV) and

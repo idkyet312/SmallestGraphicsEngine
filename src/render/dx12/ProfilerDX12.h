@@ -138,6 +138,14 @@ public:
 
     const std::vector<ProfilerSampleDX12>& CpuSamples() const { return cpuSamples; }
     const std::vector<ProfilerSampleDX12>& GpuSamples() const { return gpuSamples; }
+    // GPU milliseconds for one named scope, or 0 when it did not run this
+    // frame. Linear scan: the sample list is short and this is UI-rate.
+    double GpuScopeMs(const char* name) const {
+        if (!name) return 0.0;
+        for (const ProfilerSampleDX12& sample : gpuSamples)
+            if (sample.name == name) return sample.milliseconds;
+        return 0.0;
+    }
     double CpuFrameMs() const { return cpuFrameMs; }
     double GpuFrameMs() const { return gpuFrameMs; }
     double GpuFrameP95Ms() const {

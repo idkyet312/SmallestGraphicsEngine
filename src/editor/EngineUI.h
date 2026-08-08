@@ -963,7 +963,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                         ImGui::Checkbox("  RT GI (probe misses)",
                                         &vb.enhancedProbeMissGIActive);
                         if (vb.enhancedProbeMissGIActive) {
-                            ImGui::SliderFloat("  RT GI Strength",
+                            // A ray budget, not a blend weight: the value is
+                            // the probability a probe-resolved pixel traces
+                            // this frame, so cost scales with the slider.
+                            ImGui::SliderFloat("  RT GI Ray Budget",
                                 &vb.enhancedProbeMissGIStrength,
                                 0.0f, 1.0f, "%.2f");
                             if (vb.enhancedProbeMissGIStrength <= 0.001f)
@@ -974,7 +977,20 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                                     "  Full RT GI: every pixel traces.");
                             else
                                 ImGui::TextDisabled(
-                                    "  Blending probe and traced bounce.");
+                                    "  %.0f%% of probed pixels trace/frame; "
+                                    "rest use probes.",
+                                    vb.enhancedProbeMissGIStrength * 100.0f);
+                            // Whole-pass cost, not the GI rays alone: the
+                            // resolve is one GPU scope covering all lighting,
+                            // so there is no timestamp around the GI trace by
+                            // itself. Useful as a before/after when moving the
+                            // budget slider -- the delta is the ray cost --
+                            // rather than as an absolute GI figure.
+                            ImGui::TextDisabled(
+                                "  VB Resolve: %.2f ms (whole pass, GI %.1f%% "
+                                "of rays)",
+                                g_profiler.GpuScopeMs("VB Resolve"),
+                                vb.EnhancedGIRayFraction() * 100.0f);
                         }
                         ImGui::Checkbox("  Refl Ray Classification",
                                         &vb.enhancedReflectionClassifyActive);

@@ -1484,30 +1484,41 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
         bool probeResolved = false;
         giIrradiance = SampleSparseDDGIClassified(
             surface.fragPos, surface.normal, probeResolved);
-        // enhancedProbeMissGIStrength selects how much of the GI comes from
-        // rays rather than probes:
+        // enhancedProbeMissGIStrength is a RAY BUDGET, not a blend weight:
         //   0   fill misses only -- rays where the grid has nothing
-        //   1   full RT GI -- trace every pixel, probes unused
-        // Between the two, traced and probe irradiance are blended, so the
-        // slider walks from "cheap tier with an RT safety net" to "ray traced
-        // throughout" without a discontinuity at either end.
+        //   1   full RT GI -- every pixel traces, probes unused
+        // Between the two it is the probability that a probe-resolved pixel
+        // spends a ray this frame, so cost scales linearly with the slider.
+        //
+        // Gating stochastically rather than weighting the blend is what makes
+        // 0.5 cost half. Weighting alone traced every pixel and then halved the
+        // result: full price for half the light. The estimator stays unbiased
+        // because a traced pixel contributes its FULL traced value -- scaling
+        // it by strength as well would halve twice and darken the bounce to a
+        // quarter.
+        //
+        // Rotating the hash per frame is what makes this work with the SVGF
+        // accumulator: a different half of the screen traces each frame, and a
+        // pixel that skipped this frame still carries history from the frames
+        // it did trace. Without the rotation the same pixels would never trace
+        // and the gaps would be permanent.
+        uint giGateSeed = MatVarHashUint(
+            (pixel.x * 0x9e3779b9u) ^ (pixel.y * 0x85ebca6bu) ^
+            (enhancedFrameIndex * 0xc2b2ae35u));
+        float giGate = (float)(giGateSeed & 0xffffffu) * 5.96046448e-8;
+        // A probe miss has no fallback value, so it always traces regardless of
+        // the budget -- that is the original probe-miss guarantee, and skipping
+        // it would leave those pixels with no bounce light at all.
         const bool traceThisPixel =
-            !probeResolved || enhancedProbeMissGIStrength > 0.0;
+            !probeResolved || giGate < enhancedProbeMissGIStrength;
         if (traceThisPixel) {
             float3 traced = RayTracedProbeMissGI(
                 surface.fragPos, surface.normal, pixel);
-            // A miss has no probe value to blend against, so it takes the
-            // traced result outright whatever the strength.
-            giIrradiance = probeResolved
-                ? lerp(giIrradiance, traced, enhancedProbeMissGIStrength)
-                : traced;
-            // The traced share of the blend above. A probe miss takes the ray
-            // outright, so all of it is traced; a resolved probe contributes
-            // only the lerp weight. Publishing exactly this much keeps the
-            // denoised quantity equal to the noisy quantity.
-            tracedGIIrradiance = probeResolved
-                ? traced * enhancedProbeMissGIStrength
-                : traced;
+            // Traced pixels take the ray outright. The probe value is what the
+            // pixels that did NOT trace fall back to, so the screen-wide mix of
+            // probe and traced irradiance is set by the gate, not by a lerp.
+            giIrradiance = traced;
+            tracedGIIrradiance = traced;
             giTraced = true;
             // Denoise the irradiance, not the final contribution. The
             // accumulator should see the raw ray estimate before albedo and AO
