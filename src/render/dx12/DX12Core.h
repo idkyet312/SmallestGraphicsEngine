@@ -50,7 +50,8 @@ struct DX12Context {
     ComPtr<ID3D12CommandAllocator> commandAllocators[FRAME_COUNT];
     ComPtr<ID3D12GraphicsCommandList> commandList;
     ComPtr<ID3D12CommandQueue> computeQueue;
-    ComPtr<ID3D12CommandAllocator> computeAllocator;
+    ComPtr<ID3D12CommandAllocator> computeAllocator;              // legacy shared allocator
+    ComPtr<ID3D12CommandAllocator> computeAllocators[FRAME_COUNT]; // async path, one per frame slot
     ComPtr<ID3D12GraphicsCommandList> computeCommandList;
     ComPtr<ID3D12CommandQueue> copyQueue;
     ComPtr<ID3D12CommandAllocator> copyAllocators[FRAME_COUNT];
@@ -78,6 +79,13 @@ struct DX12Context {
     HANDLE fenceEvent = nullptr;
     ComPtr<ID3D12Fence> computeFence;
     UINT64 computeFenceValue = 0;
+    // Last value signaled by SubmitComputeFrame(); the consumer side waits on
+    // this via GraphicsWaitCompute() rather than at submit time.
+    UINT64 computeCompletedFenceValue = 0;
+    // Escape hatch for bisecting async-compute artefacts: when true,
+    // SubmitComputeFrame behaves like the legacy path and makes the graphics
+    // queue wait immediately. SGE_SERIAL_COMPUTE=1 sets this at startup.
+    bool forceSerialCompute = false;
     ComPtr<ID3D12Fence> copyFence;
     UINT64 copyFenceValue = 0;
     UINT64 copyAllocatorFenceValues[FRAME_COUNT] = {};
@@ -196,7 +204,61 @@ inline ID3D12GraphicsCommandList* BeginComputeCommands() {
     return g_dx12.computeCommandList.Get();
 }
 
-// Submit async compute and make subsequent direct work wait on the GPU. CPU keeps running.
+// ---- Async compute primitives (Phase 2a) ----
+//
+// The legacy Begin/Submit pair above serialises: Begin blocks the CPU on the
+// compute fence, Submit makes the graphics queue wait immediately. The pair
+// below keeps the same list but schedules against per-frame allocators and a
+// fence pair, so compute work can overlap the graphics queue:
+//
+//   BeginComputeFrame()           -- no CPU wait; frame pacing already
+//                                    guarantees this slot's allocator retired
+//   ComputeWaitGraphics(value)    -- compute waits on a graphics signal when
+//                                    it consumes a graphics-queued resource
+//   SubmitComputeFrame()          -- close/execute/signal; graphics does NOT
+//                                    wait here
+//   GraphicsWaitCompute()         -- graphics waits at the actual consumer
+//
+// forceSerialCompute collapses Submit back to the legacy behaviour for
+// bisection.
+
+inline ID3D12GraphicsCommandList* BeginComputeFrame() {
+    ThrowIfFailed(g_dx12.computeAllocators[g_dx12.frameIndex]->Reset());
+    ThrowIfFailed(g_dx12.computeCommandList->Reset(
+        g_dx12.computeAllocators[g_dx12.frameIndex].Get(), nullptr));
+    return g_dx12.computeCommandList.Get();
+}
+
+// Make the compute queue wait until the graphics queue reaches `value`.
+// Pass the value the graphics queue signaled after its producer pass.
+inline void ComputeWaitGraphics(UINT64 graphicsFenceValue) {
+    if (graphicsFenceValue == 0) return;
+    ThrowIfFailed(g_dx12.computeQueue->Wait(g_dx12.fence.Get(), graphicsFenceValue));
+}
+
+// Close + execute + signal. Graphics keeps running unless forceSerialCompute
+// is set; consumers call GraphicsWaitCompute() where they need the result.
+inline UINT64 SubmitComputeFrame() {
+    ThrowIfFailed(g_dx12.computeCommandList->Close());
+    ID3D12CommandList* lists[] = { g_dx12.computeCommandList.Get() };
+    g_dx12.computeQueue->ExecuteCommandLists(1, lists);
+    const UINT64 value = ++g_dx12.computeFenceValue;
+    ThrowIfFailed(g_dx12.computeQueue->Signal(g_dx12.computeFence.Get(), value));
+    g_dx12.computeCompletedFenceValue = value;
+    if (g_dx12.forceSerialCompute)
+        ThrowIfFailed(g_dx12.commandQueue->Wait(g_dx12.computeFence.Get(), value));
+    return value;
+}
+
+// Graphics queue waits on the last submitted compute batch. Call at the
+// point the graphics queue first samples a compute-produced resource.
+inline void GraphicsWaitCompute() {
+    if (g_dx12.computeCompletedFenceValue == 0 || g_dx12.forceSerialCompute) return;
+    ThrowIfFailed(g_dx12.commandQueue->Wait(
+        g_dx12.computeFence.Get(), g_dx12.computeCompletedFenceValue));
+}
+
+// Legacy: Submit async compute and make subsequent direct work wait on the GPU.
 inline UINT64 SubmitComputeCommands() {
     ThrowIfFailed(g_dx12.computeCommandList->Close());
     ID3D12CommandList* lists[] = { g_dx12.computeCommandList.Get() };
@@ -471,10 +533,17 @@ inline bool InitDX12(HWND hwnd, UINT width, UINT height) {
 
     ThrowIfFailed(g_dx12.device->CreateCommandAllocator(
         D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&g_dx12.computeAllocator)));
+    for (UINT i = 0; i < FRAME_COUNT; ++i) {
+        ThrowIfFailed(g_dx12.device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            IID_PPV_ARGS(&g_dx12.computeAllocators[i])));
+    }
     ThrowIfFailed(g_dx12.device->CreateCommandList(
         0, D3D12_COMMAND_LIST_TYPE_COMPUTE, g_dx12.computeAllocator.Get(), nullptr,
         IID_PPV_ARGS(&g_dx12.computeCommandList)));
     ThrowIfFailed(g_dx12.computeCommandList->Close());
+    g_dx12.forceSerialCompute =
+        GetEnvironmentVariableW(L"SGE_SERIAL_COMPUTE", nullptr, 0) != 0;
 
     for (UINT i = 0; i < FRAME_COUNT; ++i) {
         ThrowIfFailed(g_dx12.device->CreateCommandAllocator(

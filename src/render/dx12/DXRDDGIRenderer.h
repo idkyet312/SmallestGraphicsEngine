@@ -110,7 +110,19 @@ public:
 
     bool UpdateTLAS(ID3D12GraphicsCommandList4* commandList,
                     const std::vector<DXRScene::Instance>& instances) {
-        return scene_.UpdateTLAS(commandList, instances);
+        if (!scene_.UpdateTLAS(commandList, instances)) {
+            hitRecordCount_ = 0;
+            return false;
+        }
+        // The shader table is persistently mapped and WriteHitRecords rewrites
+        // it on the CPU. A DispatchRays from any still-in-flight frame slot
+        // would read the table mid-write (crashed the live editor DDGI
+        // rebuild). TLAS rebuilds are rare scene-load events, so draining all
+        // frame slots here is cheap insurance on every caller, including the
+        // enhanced-visuals path that builds the TLAS without its own fence.
+        WaitForGPUAllFrames();
+        WriteHitRecords();
+        return true;
     }
 
     // Schedules a bounded probe batch. Dispatch integration consumes StartProbe
@@ -127,7 +139,7 @@ public:
                       float pointLightIntensity = 0.0f) {
         if (!settings_.enabled || !status_.dxrSupported ||
             !pipelineReady_ || !commandList || !scene_.TLAS() ||
-            layout_.probes.empty() || historyDirty_)
+            layout_.probes.empty() || historyDirty_ || hitRecordCount_ == 0)
             return;
         const uint32_t remaining =
             static_cast<uint32_t>(layout_.probes.size()) - updateCursor_;
@@ -216,8 +228,9 @@ public:
         dispatch.MissShaderTable.SizeInBytes = shaderRecordSize_ * 2u;
         dispatch.MissShaderTable.StrideInBytes = shaderRecordSize_;
         dispatch.HitGroupTable.StartAddress = table + shaderRecordSize_ * 3u;
-        dispatch.HitGroupTable.SizeInBytes = shaderRecordSize_;
-        dispatch.HitGroupTable.StrideInBytes = shaderRecordSize_;
+        dispatch.HitGroupTable.SizeInBytes =
+            static_cast<uint64_t>(hitRecordStride_) * hitRecordCount_;
+        dispatch.HitGroupTable.StrideInBytes = hitRecordStride_;
         dispatch.Width = settings_.raysPerProbe;
         dispatch.Height = count;
         dispatch.Depth = 1;
@@ -320,8 +333,16 @@ private:
     std::vector<ComPtr<ID3D12Resource>> pendingUploads_;
     ComPtr<ID3D12Device5> dxrDevice_;
     ComPtr<ID3D12RootSignature> globalRootSignature_;
+    ComPtr<ID3D12RootSignature> localRootSignature_;
     ComPtr<ID3D12StateObject> stateObject_;
     ComPtr<ID3D12Resource> shaderTable_;
+    uint8_t* shaderTableMapped_ = nullptr;
+    uint8_t hitGroupIdentifier_[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES] = {};
+    // Fixed records (raygen + 2 miss) use shaderRecordSize_; hit-group records
+    // carry local root arguments and use the wider hitRecordStride_.
+    uint32_t hitRecordStride_ = 0;
+    uint32_t hitRecordCount_ = 0;
+    static constexpr uint32_t kMaxHitRecords = 2048;
     ComPtr<ID3D12Resource> constantBuffer_;
     ComPtr<ID3D12DescriptorHeap> raytracingHeap_;
     uint32_t shaderRecordSize_ = 0;
@@ -425,13 +446,45 @@ private:
         hitGroup.HitGroupExport = L"ProbeHitGroup";
         hitGroup.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
         hitGroup.ClosestHitShaderImport = L"SurfaceClosestHit";
+
+        // Local root signature for the hit group: per-geometry vertex/index
+        // buffers as root SRVs plus 8 inline material constants. This is what
+        // lets SurfaceClosestHit know what it hit -- before this, every ray in
+        // the engine landed in one record-less shader that faked the normal.
+        D3D12_ROOT_PARAMETER localParams[3] = {};
+        localParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        localParams[0].Descriptor.ShaderRegister = 10;
+        localParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        localParams[1].Descriptor.ShaderRegister = 11;
+        localParams[2].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        localParams[2].Constants.ShaderRegister = 1;
+        localParams[2].Constants.RegisterSpace = 0;
+        localParams[2].Constants.Num32BitValues = 8;
+        for (auto& parameter : localParams)
+            parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC localRoot{};
+        localRoot.NumParameters = 3;
+        localRoot.pParameters = localParams;
+        localRoot.Flags = D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE;
+        ComPtr<ID3DBlob> localBlob;
+        ComPtr<ID3DBlob> localErrors;
+        if (FAILED(D3D12SerializeRootSignature(&localRoot,
+                D3D_ROOT_SIGNATURE_VERSION_1, &localBlob, &localErrors)) ||
+            FAILED(device_->CreateRootSignature(0, localBlob->GetBufferPointer(),
+                localBlob->GetBufferSize(),
+                IID_PPV_ARGS(&localRootSignature_))))
+            return false;
+
         D3D12_RAYTRACING_SHADER_CONFIG shaderConfig{};
         shaderConfig.MaxPayloadSizeInBytes = 16;
         shaderConfig.MaxAttributeSizeInBytes = 8;
         ID3D12RootSignature* global = globalRootSignature_.Get();
+        ID3D12RootSignature* local = localRootSignature_.Get();
+        const wchar_t* hitGroupName = L"ProbeHitGroup";
         D3D12_RAYTRACING_PIPELINE_CONFIG pipeline{};
         pipeline.MaxTraceRecursionDepth = 2;
-        D3D12_STATE_SUBOBJECT subobjects[5] = {};
+        D3D12_STATE_SUBOBJECT subobjects[7] = {};
         subobjects[0] = { D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &dxil };
         subobjects[1] = { D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hitGroup };
         subobjects[2] = {
@@ -442,6 +495,17 @@ private:
         };
         subobjects[4] = {
             D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pipeline
+        };
+        subobjects[5] = {
+            D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &local
+        };
+        D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION association{};
+        association.pSubobjectToAssociate = &subobjects[5];
+        association.NumExports = 1;
+        association.pExports = &hitGroupName;
+        subobjects[6] = {
+            D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION,
+            &association
         };
         D3D12_STATE_OBJECT_DESC state{};
         state.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
@@ -466,32 +530,65 @@ private:
 
         ComPtr<ID3D12StateObjectProperties> properties;
         if (FAILED(stateObject_.As(&properties))) return false;
-        const wchar_t* identifiers[4] = {
-            L"ProbeRayGen", L"RadianceMiss", L"ShadowMiss", L"ProbeHitGroup"
+        const wchar_t* identifiers[3] = {
+            L"ProbeRayGen", L"RadianceMiss", L"ShadowMiss"
         };
         shaderRecordSize_ = (D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES +
             D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT - 1u) &
             ~(D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT - 1u);
-        if (!CreateBuffer(static_cast<uint64_t>(shaderRecordSize_) * 4u,
+        hitRecordStride_ = (D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES +
+            static_cast<uint32_t>(sizeof(DXRScene::HitRecordData)) +
+            D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT - 1u) &
+            ~(D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT - 1u);
+        const uint64_t tableBytes =
+            static_cast<uint64_t>(shaderRecordSize_) * 3u +
+            static_cast<uint64_t>(hitRecordStride_) * kMaxHitRecords;
+        if (!CreateBuffer(tableBytes,
                 D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
                 shaderTable_))
             return false;
-        uint8_t* table = nullptr;
+        // Persistently mapped: hit records are rewritten on every TLAS build.
         if (FAILED(shaderTable_->Map(
-                0, nullptr, reinterpret_cast<void**>(&table))))
+                0, nullptr, reinterpret_cast<void**>(&shaderTableMapped_))))
             return false;
-        for (uint32_t i = 0; i < 4; ++i) {
+        for (uint32_t i = 0; i < 3; ++i) {
             const void* identifier =
                 properties->GetShaderIdentifier(identifiers[i]);
-            if (!identifier) {
-                shaderTable_->Unmap(0, nullptr);
-                return false;
-            }
-            memcpy(table + static_cast<size_t>(shaderRecordSize_) * i,
+            if (!identifier) return false;
+            memcpy(shaderTableMapped_ +
+                static_cast<size_t>(shaderRecordSize_) * i,
                 identifier, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
         }
-        shaderTable_->Unmap(0, nullptr);
+        const void* hitIdentifier =
+            properties->GetShaderIdentifier(L"ProbeHitGroup");
+        if (!hitIdentifier) return false;
+        memcpy(hitGroupIdentifier_, hitIdentifier,
+               D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
         return true;
+    }
+
+    // Writes one hit-group record per BLAS geometry after the fixed records.
+    // InstanceContributionToHitGroupIndex + GeometryIndex() address into this
+    // table; TraceRay's geometry multiplier must be 1 for that to line up.
+    void WriteHitRecords() {
+        hitRecordCount_ = 0;
+        if (!shaderTableMapped_) return;
+        const auto& records = scene_.HitRecords();
+        if (records.size() > kMaxHitRecords) {
+            std::cerr << "DXR DDGI: hit record overflow (" << records.size()
+                      << " > " << kMaxHitRecords << ") -- truncating\n";
+        }
+        hitRecordCount_ = static_cast<uint32_t>(
+            (std::min)(records.size(), static_cast<size_t>(kMaxHitRecords)));
+        uint8_t* dst = shaderTableMapped_ +
+            static_cast<size_t>(shaderRecordSize_) * 3u;
+        for (uint32_t i = 0; i < hitRecordCount_; ++i) {
+            memcpy(dst, hitGroupIdentifier_,
+                   D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+            memcpy(dst + D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES, &records[i],
+                   sizeof(DXRScene::HitRecordData));
+            dst += hitRecordStride_;
+        }
     }
 
     void UpdateRaytracingDescriptors(uint32_t previousIndex,

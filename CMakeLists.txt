@@ -408,6 +408,11 @@ if(BUILD_TESTING)
         SGEProjectHeaders nlohmann_json::nlohmann_json)
     add_test(NAME DXRProbeLayoutTests COMMAND DXRProbeLayoutTests)
 
+    # Perf benchmark for the CPU clustered cull (Phase 2 decision input). Not
+    # registered with ctest -- it prints timings, it does not assert.
+    add_executable(ClusteredCullBench tests/ClusteredCullBench.cpp)
+    target_link_libraries(ClusteredCullBench PRIVATE SGEProjectHeaders)
+
     add_executable(CookedAssetFormatTests tests/CookedAssetFormatTests.cpp)
     target_link_libraries(CookedAssetFormatTests PRIVATE SGEProjectHeaders)
     add_test(NAME CookedAssetFormatTests COMMAND CookedAssetFormatTests)

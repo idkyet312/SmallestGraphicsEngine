@@ -21,6 +21,11 @@ public:
         uint32_t indexCount = 0;
         DXGI_FORMAT indexFormat = DXGI_FORMAT_R32_UINT;
         bool opaque = true;
+        // Material snapshot for the hit record. The DispatchRays path has no
+        // other way to know what a ray landed on.
+        float baseColor[4] = { 0.72f, 0.70f, 0.66f, 1.0f };
+        float metallic = 0.0f;
+        float roughness = 0.9f;
     };
     struct Instance {
         uint64_t meshId = 0;
@@ -32,6 +37,23 @@ public:
         ComPtr<ID3D12Resource> result;
         ComPtr<ID3D12Resource> scratch;
         uint64_t sourceHash = 0;
+        std::vector<Geometry> geometries;
+        uint32_t recordBase = 0;
+    };
+    // Local root arguments carried by one hit-group shader record, after the
+    // 32-byte shader identifier. Mirrors the local root signature in
+    // DXRDDGIRenderer: root SRV t10 (vertices), root SRV t11 (indices),
+    // then 8 inline 32-bit constants at b1.
+    struct HitRecordData {
+        D3D12_GPU_VIRTUAL_ADDRESS vertexAddress = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS indexAddress = 0;
+        float baseColor[4] = { 0.72f, 0.70f, 0.66f, 1.0f };
+        float metallic = 0.0f;
+        float roughness = 0.9f;
+        // bit0: 16-bit indices, bit1: 12-byte float3 terrain layout,
+        // bit2: non-indexed geometry. Mirrors HitMaterial.hitFlags.
+        uint32_t flags = 0;
+        uint32_t pad = 0;
     };
 
     bool Initialize(ID3D12Device* device) {
@@ -64,6 +86,11 @@ public:
     }
     size_t BLASCount() const { return meshes_.size(); }
     static constexpr uint64_t TerrainMeshId() { return ~uint64_t(0); }
+    // Flat per-geometry hit records for the DispatchRays path, rebuilt by
+    // UpdateTLAS. Record N carries the vertex/index/material binding for one
+    // BLAS geometry; InstanceContributionToHitGroupIndex + GeometryIndex()
+    // select it in the shader.
+    const std::vector<HitRecordData>& HitRecords() const { return hitRecords_; }
 
     bool BuildMeshBLAS(ID3D12GraphicsCommandList4* commandList,
                        uint64_t meshId, uint64_t sourceHash,
@@ -74,9 +101,11 @@ public:
             return true;
 
         std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> descriptions;
+        std::vector<Geometry> validGeometries;
         descriptions.reserve(geometries.size());
         for (const Geometry& geometry : geometries) {
             if (!geometry.vertexAddress || geometry.vertexCount < 3) continue;
+            validGeometries.push_back(geometry);
             D3D12_RAYTRACING_GEOMETRY_DESC description{};
             description.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
             description.Flags = geometry.opaque
@@ -131,6 +160,10 @@ public:
         barrier.UAV.pResource = next.result.Get();
         commandList->ResourceBarrier(1, &barrier);
         next.sourceHash = sourceHash;
+        // Only geometries that passed validation made it into the BLAS, and
+        // GeometryIndex() counts those -- keep the same filtered list so hit
+        // records line up.
+        next.geometries = std::move(validGeometries);
         meshes_[meshId] = std::move(next);
         topologyDirty_ = true;
         return true;
@@ -169,6 +202,11 @@ public:
         geometry.vertexStride = sizeof(DirectX::XMFLOAT3);
         geometry.indexAddress = terrainIndices_->GetGPUVirtualAddress();
         geometry.indexCount = static_cast<uint32_t>(indices.size());
+        // Grass/earth average; terrain textures are not bound in the DXR path.
+        geometry.baseColor[0] = 0.32f;
+        geometry.baseColor[1] = 0.38f;
+        geometry.baseColor[2] = 0.20f;
+        geometry.roughness = 0.95f;
         return BuildTerrainBLAS(commandList, sourceHash, geometry);
     }
 
@@ -181,14 +219,50 @@ public:
         if (!supported_ || !commandList) return false;
         std::vector<D3D12_RAYTRACING_INSTANCE_DESC> descriptions;
         descriptions.reserve(instances.size());
+        // Rebuild the flat hit-record table alongside the TLAS: each instance
+        // points at the first record of its mesh, and GeometryIndex() offsets
+        // within it (TraceRay's geometry multiplier is 1).
+        //
+        // Records are emitted once per MESH, not per instance. The records
+        // carry only mesh-local data -- vertex/index addresses and material --
+        // so every instance of a palm or a barrel addresses the same run. This
+        // scene instances heavily, and emitting per instance would multiply the
+        // table by the instance count and hit kMaxHitRecords on scene geometry
+        // that comfortably fits otherwise.
+        hitRecords_.clear();
+        std::unordered_map<uint64_t, uint32_t> recordBaseByMesh;
         for (const Instance& source : instances) {
             const auto found = meshes_.find(source.meshId);
             if (found == meshes_.end() || !found->second.result) continue;
+            BLAS& blas = const_cast<BLAS&>(found->second);
+            const auto existing = recordBaseByMesh.find(source.meshId);
+            if (existing == recordBaseByMesh.end()) {
+                blas.recordBase = static_cast<uint32_t>(hitRecords_.size());
+                recordBaseByMesh.emplace(source.meshId, blas.recordBase);
+                for (const Geometry& geometry : blas.geometries) {
+                    HitRecordData record;
+                    record.vertexAddress = geometry.vertexAddress;
+                    record.indexAddress = geometry.indexAddress;
+                    memcpy(record.baseColor, geometry.baseColor,
+                           sizeof(record.baseColor));
+                    record.metallic = geometry.metallic;
+                    record.roughness = geometry.roughness;
+                    record.flags =
+                        (geometry.indexFormat == DXGI_FORMAT_R16_UINT ? 1u : 0u) |
+                        (geometry.vertexStride == sizeof(DirectX::XMFLOAT3)
+                            ? 2u : 0u) |
+                        (geometry.indexAddress == 0 || geometry.indexCount == 0
+                            ? 4u : 0u);
+                    hitRecords_.push_back(record);
+                }
+            } else {
+                blas.recordBase = existing->second;
+            }
             D3D12_RAYTRACING_INSTANCE_DESC instance{};
             StoreDXRTransform(source.transform, instance.Transform);
             instance.InstanceID = static_cast<uint32_t>(source.entityId);
             instance.InstanceMask = source.mask;
-            instance.InstanceContributionToHitGroupIndex = 0;
+            instance.InstanceContributionToHitGroupIndex = blas.recordBase;
             instance.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
             instance.AccelerationStructure =
                 found->second.result->GetGPUVirtualAddress();
@@ -260,6 +334,7 @@ private:
     bool supported_ = false;
     bool inlineSupported_ = false;
     bool topologyDirty_ = true;
+    std::vector<HitRecordData> hitRecords_;
 
     bool CreateBuffer(uint64_t bytes, D3D12_RESOURCE_FLAGS flags,
                       D3D12_RESOURCE_STATES state, D3D12_HEAP_TYPE heapType,

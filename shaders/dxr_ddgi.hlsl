@@ -43,6 +43,44 @@ struct RadiancePayload {
 };
 struct ShadowPayload { uint visible; };
 
+// ---- Per-geometry hit record (local root signature) ----
+// Filled from DXRScene::HitRecordData. Record selection is
+// InstanceContributionToHitGroupIndex + GeometryIndex() (the primary ray's
+// geometry multiplier is 1). This is how the hit shader knows what it hit.
+ByteAddressBuffer hitVertices : register(t10);
+ByteAddressBuffer hitIndices : register(t11);
+cbuffer HitMaterial : register(b1) {
+    float4 hitBaseColor;
+    float hitMetallic;
+    float hitRoughness;
+    uint hitFlags;  // bit0: 16-bit indices, bit1: terrain layout, bit2: non-indexed
+    uint hitPad;
+};
+
+uint LoadHitIndex(uint slot) {
+    if ((hitFlags & 4u) != 0u) return slot;              // non-indexed
+    if ((hitFlags & 1u) != 0u) {                         // 16-bit indices
+        uint wordOffset = slot * 2u;
+        uint aligned = wordOffset & ~3u;
+        uint packed = hitIndices.Load(aligned);
+        return (wordOffset & 2u) != 0u ? (packed >> 16u) : (packed & 0xffffu);
+    }
+    return hitIndices.Load(slot * 4u);
+}
+
+// Mesh vertices are 48 bytes: float3 pos, float3 normal, float2 uv, float4
+// tangent. Terrain is 12-byte float3 positions with face normals.
+void LoadHitVertex(uint vertexIndex, out float3 position, out float3 normal) {
+    if ((hitFlags & 2u) != 0u) {
+        position = asfloat(hitVertices.Load3(vertexIndex * 12u));
+        normal = float3(0.0, 1.0, 0.0);
+        return;
+    }
+    uint base = vertexIndex * 48u;
+    position = asfloat(hitVertices.Load3(base));
+    normal = asfloat(hitVertices.Load3(base + 12u));
+}
+
 float3 FibonacciDirection(uint index, uint count, uint scramble) {
     const float golden = 2.39996323;
     float y = 1.0 - 2.0 * ((index + 0.5) / max((float)count, 1.0));
@@ -94,7 +132,9 @@ void ProbeRayGen() {
     RadiancePayload payload;
     payload.radiance = float3(0.0, 0.0, 0.0);
     payload.distance = maxRayDistance;
-    TraceRay(StaticScene, RAY_FLAG_NONE, 0xff, 0, 0, 0, ray, payload);
+    // Geometry multiplier 1: GeometryIndex() offsets into this instance's
+    // hit-record run (see InstanceContributionToHitGroupIndex).
+    TraceRay(StaticScene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, payload);
 
     uint2 probeTile = uint2(probeIndex % atlasColumns,
                             probeIndex / atlasColumns);
@@ -129,10 +169,32 @@ void ShadowMiss(inout ShadowPayload payload) { payload.visible = 1; }
 [shader("closesthit")]
 void SurfaceClosestHit(inout RadiancePayload payload,
                        BuiltInTriangleIntersectionAttributes attributes) {
-    // DXR still traces the real static BLAS/TLAS. Until material-local hit
-    // records are added, use a stable diffuse approximation at the real hit.
-    float3 normal = normalize(-WorldRayDirection());
-    float3 baseColor = float3(0.72, 0.70, 0.66);
+    // Resolve the real hit from the per-geometry record: vertex fetch,
+    // barycentric normal, material base colour. Replaces the old fake (a
+    // ray-facing normal and hardcoded concrete) that made DDGI meaningless.
+    uint primitive = PrimitiveIndex();
+    uint i0 = LoadHitIndex(primitive * 3u + 0u);
+    uint i1 = LoadHitIndex(primitive * 3u + 1u);
+    uint i2 = LoadHitIndex(primitive * 3u + 2u);
+    float3 p0, n0, p1, n1, p2, n2;
+    LoadHitVertex(i0, p0, n0);
+    LoadHitVertex(i1, p1, n1);
+    LoadHitVertex(i2, p2, n2);
+    float2 bary = attributes.barycentrics;
+    float w0 = 1.0 - bary.x - bary.y;
+    float3 localNormal;
+    if ((hitFlags & 2u) != 0u) {
+        // Terrain has no stored normals; use the geometric face normal.
+        localNormal = normalize(cross(p1 - p0, p2 - p0));
+    } else {
+        localNormal = normalize(w0 * n0 + bary.x * n1 + bary.y * n2);
+    }
+    float3 normal = normalize(mul(localNormal,
+        (float3x3)ObjectToWorld3x4()));
+    // GI rays arrive from both sides; face the normal towards the ray so
+    // double-sided surfaces (foliage cards, walls) light consistently.
+    if (dot(normal, WorldRayDirection()) > 0.0) normal = -normal;
+    float3 baseColor = hitBaseColor.rgb;
     float3 hit = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
     float3 lightDirection = normalize(-sunDirection);
     float lightDistance = maxRayDistance;

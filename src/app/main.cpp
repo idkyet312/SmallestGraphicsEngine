@@ -3388,6 +3388,16 @@ static void BuildDXRDDGINodeScene(
             geometry.indexFormat = primitive.ibv.Format;
             geometry.opaque = !primitive.material ||
                               !primitive.material->alphaCutout;
+            // Snapshot the material into the hit record so the DXR closest-hit
+            // shader shades with the real base colour instead of a constant.
+            if (primitive.material) {
+                geometry.baseColor[0] = primitive.material->baseColorFactor.x;
+                geometry.baseColor[1] = primitive.material->baseColorFactor.y;
+                geometry.baseColor[2] = primitive.material->baseColorFactor.z;
+                geometry.baseColor[3] = primitive.material->baseColorFactor.w;
+                geometry.metallic = primitive.material->metallicFactor;
+                geometry.roughness = primitive.material->roughnessFactor;
+            }
             geometries.push_back(geometry);
             sourceHash = DXRDDGIHash(sourceHash, geometry.vertexCount);
             sourceHash = DXRDDGIHash(sourceHash, geometry.indexCount);
@@ -3424,6 +3434,12 @@ static bool BuildDXRDDGIAccelerationScene() {
     if (!g_dxrDDGI.Scene().Supported() ||
         FAILED(g_dx12.commandList.As(&commandList)))
         return false;
+    // BLAS/TLAS resources and the persistently-mapped shader table are
+    // replaced below. Any still-in-flight frame may be tracing against the
+    // old ones (DispatchRays or the enhanced RayQuery resolve), so drain all
+    // frame slots before touching any of it. Rare event; the sync is cheap
+    // relative to a scene rebuild.
+    WaitForGPUAllFrames();
     std::vector<DXRScene::Instance> instances;
     for (const PrefabRenderBatch& batch : g_prefabRenderBatches) {
         uint32_t nodeOrdinal = 0;
@@ -3500,8 +3516,11 @@ static bool RebuildDXRDDGIProbeLayout(bool force) {
     if (!g_game.world.Level().dxrDDGI.enabled) return false;
     if (!force && !g_dxrDDGI.LayoutDirty()) return true;
     // Probe/atlas buffers may still be referenced by an older in-flight frame.
-    // Fence before replacing them and releasing their upload sources.
-    WaitForGPU();
+    // Drain EVERY frame slot, not just the current one: the DXR shader table
+    // is persistently mapped and rewritten by the scene build below, so any
+    // still-running DispatchRays from a previous slot would read it mid-write
+    // (this crashed the live DDGI toggle).
+    WaitForGPUAllFrames();
     g_dxrDDGI.ReleaseCompletedUploads();
     std::vector<DXRProbeTriangle> triangles;
     uint64_t geometryHash = 1469598103934665603ull;

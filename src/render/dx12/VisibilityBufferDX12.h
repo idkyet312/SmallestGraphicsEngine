@@ -2159,7 +2159,12 @@ public:
         const bool wantActive = active && tlasAddress != 0;
         const bool tlasChanged = tlasAddress != enhancedTLASAddress;
         enhancedTLASAddress = tlasAddress;
-        if (wantActive && (tlasChanged || !enhancedComputeDescHeap))
+        // Refresh whenever the address changes or the heap is missing. The
+        // heap is created shader-visible and every slot must be populated
+        // before binding; RefreshEnhancedDescriptors null-fills the TLAS slot
+        // when the address is 0, so this is also the path that writes a
+        // documented null binding instead of leaving slot 86 as garbage.
+        if (tlasChanged || !enhancedComputeDescHeap)
             RefreshEnhancedDescriptors();
         enhancedVisualsActive = wantActive;
     }
