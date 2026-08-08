@@ -373,6 +373,73 @@ inline void RenderPlayerHUD(const Scene& scene) {
     }
 }
 
+// Flips every RT effect at once, for A/B comparison.
+//
+// scene.enhancedVisuals alone only stops the enhanced resolve from running; the
+// individual toggles keep whatever state they had. This remembers them, clears
+// them, and restores them on the way back, so turning RT off and on returns to
+// the exact configuration rather than to the defaults.
+//
+// Lives here rather than inside RenderUI so the checkbox and the keyboard
+// shortcut drive the same state -- function-local statics would give the two
+// entry points separate saved configurations, and whichever ran second would
+// restore the wrong one.
+inline bool& AllRTEffectsSavedFlag() {
+    static bool saved = false;
+    return saved;
+}
+
+inline void ToggleAllRTEffects(Scene& scene, VisibilityBufferDX12& vb,
+                               bool enable) {
+    static bool savedRTShadows = false;
+    static bool savedRTReflections = false;
+    static bool savedProbeMissGI = false;
+    static bool savedReflClassify = false;
+    static bool savedRayClassify = false;
+    static bool savedSvgfTemporal = false;
+    static bool savedSvgfAtrous = false;
+    bool& saved = AllRTEffectsSavedFlag();
+
+    if (!enable) {
+        savedRTShadows = scene.enhancedRTShadows;
+        savedRTReflections = scene.enhancedRTReflections;
+        savedProbeMissGI = vb.enhancedProbeMissGIActive;
+        savedReflClassify = vb.enhancedReflectionClassifyActive;
+        savedRayClassify = scene.enhancedRayClassify;
+        savedSvgfTemporal = vb.svgfTemporalEnabled;
+        savedSvgfAtrous = vb.svgfAtrousEnabled;
+        saved = true;
+        scene.enhancedRTShadows = false;
+        scene.enhancedRTReflections = false;
+        vb.enhancedProbeMissGIActive = false;
+        scene.enhancedVisuals = false;
+        return;
+    }
+
+    scene.enhancedVisuals = true;
+    if (saved) {
+        scene.enhancedRTShadows = savedRTShadows;
+        scene.enhancedRTReflections = savedRTReflections;
+        vb.enhancedProbeMissGIActive = savedProbeMissGI;
+        vb.enhancedReflectionClassifyActive = savedReflClassify;
+        scene.enhancedRayClassify = savedRayClassify;
+        vb.svgfTemporalEnabled = savedSvgfTemporal;
+        vb.svgfAtrousEnabled = savedSvgfAtrous;
+    } else {
+        // Turned on before it was ever turned off, so there is no previous
+        // configuration to return to. Without this the switch would read "(on)"
+        // while every effect stayed off, which looks exactly like RT being
+        // broken. Enable the full set, which is what the switch says it does.
+        scene.enhancedRTShadows = true;
+        scene.enhancedRTReflections = true;
+        vb.enhancedProbeMissGIActive = true;
+        vb.enhancedReflectionClassifyActive = true;
+        scene.enhancedRayClassify = true;
+        vb.svgfTemporalEnabled = true;
+        vb.svgfAtrousEnabled = true;
+    }
+}
+
 inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     struct RTDebugSettings {
         bool active = false;
@@ -944,55 +1011,15 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ImGui::TextDisabled("Enhanced Visuals: SM6.5 resolve unavailable");
                 ImGui::TextDisabled("  (dxcompiler.dll missing or compile failed)");
             } else {
-                // One switch for every RT effect at once, for A/B comparison.
-                //
-                // scene.enhancedVisuals alone only stops the enhanced resolve
-                // from running; the individual toggles keep whatever state they
-                // had. This remembers them, clears them all, and restores them
-                // on the way back, so flipping RT off and on returns to the
-                // exact configuration rather than to the defaults.
-                static bool rtMasterSaved = false;
-                static bool savedRTShadows = false;
-                static bool savedRTReflections = false;
-                static bool savedProbeMissGI = false;
-                static bool savedReflClassify = false;
-                static bool savedRayClassify = false;
-                static bool savedSvgfTemporal = false;
-                static bool savedSvgfAtrous = false;
                 bool rtEffectsOn = scene.enhancedVisuals;
                 if (ImGui::Checkbox("All RT Effects", &rtEffectsOn)) {
-                    if (!rtEffectsOn) {
-                        savedRTShadows = scene.enhancedRTShadows;
-                        savedRTReflections = scene.enhancedRTReflections;
-                        savedProbeMissGI = vb.enhancedProbeMissGIActive;
-                        savedReflClassify = vb.enhancedReflectionClassifyActive;
-                        savedRayClassify = scene.enhancedRayClassify;
-                        savedSvgfTemporal = vb.svgfTemporalEnabled;
-                        savedSvgfAtrous = vb.svgfAtrousEnabled;
-                        rtMasterSaved = true;
-                        scene.enhancedRTShadows = false;
-                        scene.enhancedRTReflections = false;
-                        vb.enhancedProbeMissGIActive = false;
-                        scene.enhancedVisuals = false;
-                    } else {
-                        scene.enhancedVisuals = true;
-                        if (rtMasterSaved) {
-                            scene.enhancedRTShadows = savedRTShadows;
-                            scene.enhancedRTReflections = savedRTReflections;
-                            vb.enhancedProbeMissGIActive = savedProbeMissGI;
-                            vb.enhancedReflectionClassifyActive =
-                                savedReflClassify;
-                            scene.enhancedRayClassify = savedRayClassify;
-                            vb.svgfTemporalEnabled = savedSvgfTemporal;
-                            vb.svgfAtrousEnabled = savedSvgfAtrous;
-                        }
-                    }
                     // SetEnhancedVisuals already clears svgfHistoryValid when
                     // the active state or the reflection toggle changes, so the
                     // history reset comes for free on the next frame.
+                    ToggleAllRTEffects(scene, vb, rtEffectsOn);
                 }
                 ImGui::SameLine();
-                ImGui::TextDisabled(rtEffectsOn ? "(on)" : "(off)");
+                ImGui::TextDisabled(rtEffectsOn ? "(on) [F5]" : "(off) [F5]");
                 ImGui::Checkbox("Enhanced Visuals (RT)", &scene.enhancedVisuals);
                 if (scene.enhancedVisuals) {
                     if (vb.validationMode) {

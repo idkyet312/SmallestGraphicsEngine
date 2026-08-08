@@ -8880,6 +8880,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (wParam == 'N' && !(lParam & 0x40000000)) {
             g_showEnemyVisionCones = !g_showEnemyVisionCones;
         }
+        // F5: flip every RT effect at once. Shares ToggleAllRTEffects with the
+        // "All RT Effects" checkbox, so the two agree on the saved
+        // configuration and either can restore what the other stored.
+        //
+        // A function key rather than a letter: this fires during gameplay, so
+        // it must not collide with movement or weapon handling, and it is safe
+        // to press mid-combat.
+        //
+        // The repeat filter matters here: without it, holding the key would
+        // toggle every frame and the saved configuration would be overwritten
+        // with the cleared one.
+        else if (wParam == VK_F5 && !(lParam & 0x40000000)) {
+            if (g_inlineRaytracingSupported && visBuffer.EnhancedVisualsReady())
+                ToggleAllRTEffects(scene, visBuffer, !scene.enhancedVisuals);
+        }
         else if (wParam == 'B' && !(lParam & 0x40000000)) {
             switch (scene.selectedGrenade) {
             case GrenadeType::Frag:
