@@ -63,3 +63,14 @@ Beyond the standing list in [AGENTS.md](../AGENTS.md):
 What landed, what did not, and any measurement the task asked for. State
 failures plainly with the output. If something was skipped, say so and why —
 scaling the task down is the reviewer's call, not the implementer's.
+
+**Every measurement gets a baseline next to it.** A bare number with no
+before-value cannot be judged, and a large delta presented without one reads
+as though it were unremarkable. If a number crosses a threshold the task set,
+say so explicitly rather than leaving the reader to compute it.
+
+**Say when you departed from the spec, and why.** Going beyond the task is
+sometimes correct — the spec is written without having compiled anything, so
+a measurement can prove it wrong. But an unannounced deviation costs the
+reviewer the time to rediscover it, and risks being "corrected" back to the
+worse behaviour. State the deviation and the evidence for it.
