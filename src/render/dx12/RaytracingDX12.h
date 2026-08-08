@@ -233,12 +233,20 @@ inline bool CreateRaytracingPipeline() {
         }
     )";
 
-    ComPtr<ID3DBlob> rtBlob, errorBlob;
-    HRESULT hr = ShaderCacheDX12::CompileCached(rtShaderCode, strlen(rtShaderCode), "rt_shaders.hlsl",
-        nullptr, nullptr, "", "lib_6_3",
-        D3DCOMPILE_ENABLE_STRICTNESS, 0, &rtBlob, &errorBlob);
-    if (FAILED(hr)) {
-        if (errorBlob) std::cerr << "RT shader compile error: " << (char*)errorBlob->GetBufferPointer() << std::endl;
+    // DXIL libraries must go through DXC: FXC has no lib_6_3 target and fails
+    // with "unrecognized compiler target", which took the whole DXR pipeline
+    // down as a non-fatal init error. A library has no single entry point, so
+    // the entry name is empty and exports are named in the state object below.
+    ComPtr<ID3DBlob> rtBlob;
+    std::string rtErrors;
+    const std::wstring rtShaderDirectory =
+        ShaderCacheDX12::ExecutableDirectory() + L"shaders";
+    if (!ShaderCacheDX12::CompileCachedDXC(
+            std::string(rtShaderCode), L"rt_shaders.hlsl",
+            L"", L"lib_6_3", rtShaderDirectory, &rtBlob, &rtErrors)) {
+        std::cerr << "RT shader compile error: "
+                  << (rtErrors.empty() ? "dxcompiler unavailable" : rtErrors)
+                  << std::endl;
         return false;
     }
 
@@ -312,7 +320,7 @@ inline bool CreateRaytracingPipeline() {
     stateObjectDesc.NumSubobjects = (UINT)subobjects.size();
     stateObjectDesc.pSubobjects = subobjects.data();
 
-    hr = g_rt.dxrDevice->CreateStateObject(&stateObjectDesc, IID_PPV_ARGS(&g_rt.rtPipelineState));
+    HRESULT hr = g_rt.dxrDevice->CreateStateObject(&stateObjectDesc, IID_PPV_ARGS(&g_rt.rtPipelineState));
     if (FAILED(hr)) {
         std::cerr << "Failed to create RT pipeline state, HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
         return false;
