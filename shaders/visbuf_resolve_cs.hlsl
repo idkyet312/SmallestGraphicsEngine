@@ -1350,6 +1350,39 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     outputNormalRoughness[pixel] = float4(surface.normal, surface.rough);
 
 #if SGE_ENHANCED_VISUALS
+    // Debug view 4: why a pixel did or did not get a ray-traced reflection.
+    // Answers the three questions the raw noisy image cannot:
+    //   is this pixel eligible, did its ray hit, and is the sample changing?
+    //
+    //   black   no geometry / not eligible (too rough, or foliage)
+    //   blue    eligible, ray missed -- environment probe kept
+    //   green   eligible, ray hit -- traced radiance used
+    //   red channel: this frame's sample index, so a still camera should
+    //           visibly cycle. Frozen red = the frame rotation is broken,
+    //           which is the failure mode that silently defeats the denoiser.
+    if (debugViewMode == 4u) {
+        float3 debugColor = float3(0.0, 0.0, 0.0);
+        bool eligible = enhancedRTReflections != 0 &&
+                        surface.rough <= enhancedReflectionRoughnessCut &&
+                        !surface.isFoliage;
+        if (eligible) {
+            bool reflectionHit = false;
+            RayTracedReflection(surface.fragPos, surface.normal,
+                                surface.viewDir, surface.rough, pixel,
+                                reflectionHit);
+            debugColor = reflectionHit ? float3(0.0, 1.0, 0.0)
+                                       : float3(0.0, 0.0, 1.0);
+            uint pixelSeed =
+                MatVarHashUint(pixel.x * 73856093u ^ pixel.y * 19349663u);
+            debugColor.r = (float)((pixelSeed + enhancedFrameIndex) & 63u) / 63.0;
+        }
+        outputColor[pixel] = float4(debugColor, 1.0);
+        if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
+        return;
+    }
+#endif
+
+#if SGE_ENHANCED_VISUALS
     if (!edgeAAApplied) {
         float3 result = ShadeSurface(pixel, surface);
         outputColor[pixel] = float4(result, 1.0);
