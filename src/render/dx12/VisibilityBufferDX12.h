@@ -90,7 +90,8 @@ struct alignas(256) VBFrameConstants {
     float    farPlane;
     UINT     debugViewMode;
     UINT     enableMotionVectors;
-    UINT     padding[3];
+    UINT     edgeAAEnabled;
+    UINT     padding[2];
     XMFLOAT4 palmWind;
     XMFLOAT4 palmPrimary;
     XMFLOAT4 palmSecondary;
@@ -143,6 +144,9 @@ public:
     bool surfaceIDTemporalEnabled = true;
     // Debug view colouring pixels by why history was kept or rejected.
     bool historyDebugView = false;
+    // Edge AA: shade 2 sub-pixel samples on silhouette edges and average.
+    // Off by default; interior pixels are unchanged.
+    bool edgeAAEnabled = false;
     ComPtr<ID3D12DescriptorHeap> visRtvHeap;    // RTV for visibility pass
     ComPtr<ID3D12DescriptorHeap> visSrvUavHeap; // SRV/UAV for compute resolve
 
@@ -822,6 +826,7 @@ public:
         fc.farPlane = farPlane;
         fc.debugViewMode = static_cast<UINT>(debugViewMode);
         fc.enableMotionVectors = temporalEffectsEnabled ? 1u : 0u;
+        fc.edgeAAEnabled = edgeAAEnabled ? 1u : 0u;
         fc.palmWind = palmWindFrame.wind;
         fc.palmPrimary = palmWindFrame.primary;
         fc.palmSecondary = palmWindFrame.secondary;

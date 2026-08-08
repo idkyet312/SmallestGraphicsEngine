@@ -19,7 +19,8 @@ cbuffer FrameConstants : register(b0) {
     float  farPlane;
     uint   debugViewMode;
     uint   enableMotionVectors;
-    uint3  framePadding;
+    uint   edgeAAEnabled;
+    uint2  framePadding;
     float4 palmWind;
     float4 palmPrimary;
     float4 palmSecondary;
@@ -223,14 +224,18 @@ float MatVarNoise(float3 position) {
     return lerp(lerp(n00, n10, blend.y), lerp(n01, n11, blend.y), blend.z);
 }
 
-float3 ReconstructWorldPos(uint2 pixel, float depth) {
-    float2 uv = (float2(pixel) + 0.5) / float2(screenWidth, screenHeight);
+float3 ReconstructWorldPosOffset(uint2 pixel, float2 offset, float depth) {
+    float2 uv = (float2(pixel) + offset) / float2(screenWidth, screenHeight);
     float2 ndc = uv * 2.0 - 1.0;
-    ndc.y = -ndc.y; // DX convention: Y up in NDC
+    ndc.y = -ndc.y;
     
     float4 clipPos = float4(ndc, depth, 1.0);
     float4 worldPos = mul(clipPos, invViewProj);
     return worldPos.xyz / worldPos.w;
+}
+
+float3 ReconstructWorldPos(uint2 pixel, float depth) {
+    return ReconstructWorldPosOffset(pixel, float2(0.5, 0.5), depth);
 }
 
 float3 SampleSkyIrradiance(float3 normal) {
@@ -1097,12 +1102,145 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         outputMotion[pixel] = currentUV - previousUV;
     }
     
+#if SGE_ENHANCED_VISUALS
+    // Edge AA: shade 2 sub-pixel samples on silhouette edges and average.
+    // Interior pixels are unchanged. Motion vectors and normal/roughness stay
+    // with the centre sample — an averaged normal across a silhouette corrupts
+    // the deferred/temporal consumers that expect one surface per pixel.
+    bool edgeAAApplied = false;
+    if (edgeAAEnabled != 0u) {
+        bool isEdge = false;
+        const int2 neighOffsets[4] = {
+            int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)
+        };
+        [unroll]
+        for (int i = 0; i < 4; ++i) {
+            int2 tap = clamp(int2(pixel) + neighOffsets[i],
+                             int2(0, 0),
+                             int2(screenWidth - 1, screenHeight - 1));
+            if (visBuffer.Load(int3(tap, 0)).x != visValue.x) {
+                isEdge = true;
+                break;
+            }
+        }
+        
+        if (isEdge) {
+            const float2 sampleOffsets[2] = {
+                float2(0.25, 0.25), float2(0.75, 0.75)
+            };
+            float3 sampleColors[2];
+            
+            [unroll]
+            for (uint s = 0; s < 2; ++s) {
+                float3 worldPosS = ReconstructWorldPosOffset(
+                    pixel, sampleOffsets[s], depth);
+                
+                float3 baryS = ComputeBarycentrics(worldPosS, wp0, wp1, wp2);
+                float3 baryUsed = baryS;
+                float3 wp0s = wp0, wp1s = wp1, wp2s = wp2;
+                DrawCallData dcs = dc;
+                bool isFoliageS = isFoliage;
+                float3 n0s = n0, n1s = n1, n2s = n2;
+                float2 uv0s = uv0, uv1s = uv1, uv2s = uv2;
+                
+                if (any(baryS < 0.0)) {
+                    bool found = false;
+                    [unroll]
+                    for (int n = 0; n < 4 && !found; ++n) {
+                        int2 tap = clamp(int2(pixel) + neighOffsets[n],
+                                         int2(0, 0),
+                                         int2(screenWidth - 1,
+                                              screenHeight - 1));
+                        uint2 visNeighbour = visBuffer.Load(int3(tap, 0));
+                        if (visNeighbour.x != 0u &&
+                            visNeighbour.x != visValue.x) {
+                            uint nbrDrawCallID = visNeighbour.x - 1u;
+                            uint nbrTriangleID = visNeighbour.y;
+                            DrawCallData dcn = drawCalls[nbrDrawCallID];
+                            
+                            float3 np0, np1, np2;
+                            float3 nn0, nn1, nn2;
+                            float2 nuv0, nuv1, nuv2;
+                            GetTriangleVertices(
+                                dcn, nbrTriangleID,
+                                np0, np1, np2, nn0, nn1, nn2,
+                                nuv0, nuv1, nuv2);
+                            
+                            float3 tnDummy = float3(1.0, 0.0, 0.0);
+                            ApplyPalmWind(np0, nn0, tnDummy,
+                                          dcn.palmWindRoot, palmWind,
+                                          palmPrimary, palmSecondary,
+                                          palmParams);
+                            tnDummy = float3(1.0, 0.0, 0.0);
+                            ApplyPalmWind(np1, nn1, tnDummy,
+                                          dcn.palmWindRoot, palmWind,
+                                          palmPrimary, palmSecondary,
+                                          palmParams);
+                            tnDummy = float3(1.0, 0.0, 0.0);
+                            ApplyPalmWind(np2, nn2, tnDummy,
+                                          dcn.palmWindRoot, palmWind,
+                                          palmPrimary, palmSecondary,
+                                          palmParams);
+                            
+                            float3 nwp0 = mul(float4(np0, 1.0),
+                                              dcn.modelMatrix).xyz;
+                            float3 nwp1 = mul(float4(np1, 1.0),
+                                              dcn.modelMatrix).xyz;
+                            float3 nwp2 = mul(float4(np2, 1.0),
+                                              dcn.modelMatrix).xyz;
+                            
+                            float3 nBary = ComputeBarycentrics(
+                                worldPosS, nwp0, nwp1, nwp2);
+                            if (all(nBary >= 0.0)) {
+                                baryUsed = nBary;
+                                wp0s = nwp0; wp1s = nwp1; wp2s = nwp2;
+                                dcs = dcn;
+                                isFoliageS = (dcn.flags & 2u) != 0u &&
+                                             (dcn.flags & 4u) == 0u;
+                                n0s = nn0; n1s = nn1; n2s = nn2;
+                                uv0s = nuv0; uv1s = nuv1; uv2s = nuv2;
+                                found = true;
+                            }
+                        }
+                    }
+                    if (!found) {
+                        baryUsed = saturate(baryS);
+                        baryUsed /= max(baryUsed.x + baryUsed.y +
+                                        baryUsed.z, 1e-10);
+                    }
+                }
+                
+                float3 fragPosS = baryUsed.x * wp0s +
+                                  baryUsed.y * wp1s +
+                                  baryUsed.z * wp2s;
+                Surface surfaceS = EvaluateSurface(
+                    fragPosS, dcs, isFoliageS,
+                    wp0s, wp1s, wp2s, n0s, n1s, n2s,
+                    uv0s, uv1s, uv2s, baryUsed);
+                sampleColors[s] = ShadeSurface(pixel, surfaceS);
+            }
+            
+            float3 finalColor = (sampleColors[0] + sampleColors[1]) * 0.5;
+            outputColor[pixel] = float4(finalColor, 1.0);
+            edgeAAApplied = true;
+        }
+    }
+#endif // SGE_ENHANCED_VISUALS
+    
+    // Centre surface always evaluated: normal/roughness and motion feed
+    // deferred/temporal consumers that expect one surface per pixel.
     Surface surface = EvaluateSurface(fragPos, dc, isFoliage,
                                        wp0, wp1, wp2, n0, n1, n2,
                                        uv0, uv1, uv2, bary);
     outputNormalRoughness[pixel] = float4(surface.normal, surface.rough);
 
+#if SGE_ENHANCED_VISUALS
+    if (!edgeAAApplied) {
+        float3 result = ShadeSurface(pixel, surface);
+        outputColor[pixel] = float4(result, 1.0);
+    }
+#else
     float3 result = ShadeSurface(pixel, surface);
-
     outputColor[pixel] = float4(result, 1.0);
+#endif
 }

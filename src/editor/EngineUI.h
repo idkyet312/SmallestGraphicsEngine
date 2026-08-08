@@ -657,6 +657,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     ImGui::TextDisabled(
                         "  green=reused  red=rejected  blue=offscreen");
             }
+            // Edge AA shades 2 sub-pixel samples on silhouette edges and
+            // averages. TAA is off by default, so this is the first AA the VB
+            // path has. ~2.5% of pixels (silhouettes only).
+            ImGui::Checkbox("Edge AA (N=2)", &vb.edgeAAEnabled);
             if (vb.temporalEffectsEnabled) {
                 ImGui::SliderFloat("TAA History Weight", &vb.taaFeedback,
                                    0.70f, 0.95f, "%.2f");
