@@ -187,12 +187,29 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     float enhancedReflectionPad0;
     float enhancedReflectionPad1;
     float enhancedReflectionPad2;
+    // SVGF temporal accumulation for RT reflections. Append only.
+    uint  svgfTemporalEnabled;     // toggle: off by default
+    uint  svgfMaxAccumFrames;      // max N for alpha = 1/N ramp
+    uint  svgfPadding0;
+    uint  svgfPadding1;
 };
 
 // Per-pixel record of where the rays went, for the debug view and the
 // ray-fraction readback. One uint per pixel: 0 = cheap tier resolved it,
 // 1 = classified as needing RT and traced.
 RWTexture2D<uint> outputRayMask : register(u3);
+
+// Previous frame's surface IDs for exact temporal validation. 5a's rule:
+// same instance ID at the reprojected pixel = same surface = history valid.
+Texture2D<uint2> visBufferHistoryTex : register(t82);
+
+// SVGF temporal accumulation: previous frame's denoised colour and moments,
+// read from one side of the ping-pong pair.
+Texture2D<float4> svgfHistoryColor  : register(t80);
+Texture2D<float4> svgfHistoryMoments : register(t81);
+// Current frame's accumulated colour and moments, written to the other side.
+RWTexture2D<float4> svgfHistoryColorWrite  : register(u4);
+RWTexture2D<float4> svgfHistoryMomentsWrite : register(u5);
 #endif
 
 SamplerState              texSampler    : register(s0);
@@ -589,6 +606,78 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
     // reflection is strictly less bright than the open-sky probe value.
     return SampleReflectionProbe(rayDir, roughness) * enhancedReflectionOcclusion;
 }
+
+// SVGF temporal accumulation for the stochastic RT reflection signal.
+// Reprojects history through the motion buffer, validates against 5a's
+// surface-ID test, blends with an EMA whose alpha ramps 1/n, and stores
+// updated moments for the variance estimate that Phase 5c consumes.
+//
+// currentSample: this frame's raw-traced reflection radiance
+// pixel:         screen coordinate
+// currentVisID:  this pixel's instance ID (visValue.x)
+// writeHistory:  commit the blended result to the history textures.
+//
+// `writeHistory` exists because edge AA calls ShadeSurface TWICE for the same
+// pixel (two sub-samples). Committing on both would blend this pixel's history
+// into itself a second time within one frame and advance the accumulation
+// count twice, so the EMA converges at the wrong rate wherever edge AA is
+// active -- silhouettes, exactly where reprojection is least reliable. Only
+// the centre surface commits; the edge samples read the same history and
+// return a blended colour without storing it.
+//
+// Returns the denoised (temporally blended) reflection colour.
+float3 SVGF_TemporalAccumulate(float3 currentSample, uint2 pixel,
+                               uint currentVisID, bool writeHistory) {
+    if (svgfTemporalEnabled == 0) return currentSample;
+
+    float2 currentUV = (float2(pixel) + 0.5) / float2(screenWidth, screenHeight);
+    float2 motion = outputMotion[pixel];
+    float2 previousUV = currentUV - motion;
+
+    // History was invalidated (e.g. resize) or the reprojection landed
+    // off-screen. Reset accumulation.
+    if (any(previousUV < 0.0) || any(previousUV >= 1.0)) {
+        if (writeHistory) {
+            svgfHistoryColorWrite[pixel] = float4(currentSample, 0.0);
+            svgfHistoryMomentsWrite[pixel] =
+                float4(currentSample * currentSample, 1.0);
+        }
+        return currentSample;
+    }
+
+    int2 previousPixel = int2(previousUV * float2(screenWidth, screenHeight));
+    previousPixel = clamp(previousPixel, int2(0, 0),
+                          int2(screenWidth - 1, screenHeight - 1));
+
+    uint2 previousID = visBufferHistoryTex.Load(int3(previousPixel, 0));
+    // 5a's exact surface-ID test: same instance at the reprojected position
+    // means this is provably the same surface across frames.
+    if (previousID.x != currentVisID) {
+        if (writeHistory) {
+            svgfHistoryColorWrite[pixel] = float4(currentSample, 0.0);
+            svgfHistoryMomentsWrite[pixel] =
+                float4(currentSample * currentSample, 1.0);
+        }
+        return currentSample;
+    }
+
+    float4 prevColor = svgfHistoryColor.Load(int3(previousPixel, 0));
+    float4 prevMoments = svgfHistoryMoments.Load(int3(previousPixel, 0));
+    float prevCount = prevMoments.w;
+
+    float newCount = min(prevCount + 1.0, max((float)svgfMaxAccumFrames, 1.0));
+    float alpha = 1.0 / newCount;
+
+    float3 blendedColor = lerp(prevColor.rgb, currentSample, alpha);
+    float3 blendedSq = lerp(prevMoments.rgb, currentSample * currentSample, alpha);
+
+    if (writeHistory) {
+        svgfHistoryColorWrite[pixel] = float4(blendedColor, 0.0);
+        svgfHistoryMomentsWrite[pixel] = float4(blendedSq, newCount);
+    }
+
+    return blendedColor;
+}
 #endif
 
 float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
@@ -892,7 +981,10 @@ Surface EvaluateSurface(float3 fragPos,
     return surface;
 }
 
-float3 ShadeSurface(uint2 pixel, Surface surface) {
+// `commitTemporalHistory` is false for edge-AA sub-samples, which call this
+// twice for one pixel; see SVGF_TemporalAccumulate.
+float3 ShadeSurface(uint2 pixel, Surface surface,
+                    bool commitTemporalHistory = true) {
     float3 result = 0.0;
     
     // Main light
@@ -959,7 +1051,15 @@ float3 ShadeSurface(uint2 pixel, Surface surface) {
         bool reflectionHit = false;
         float3 traced = RayTracedReflection(surface.fragPos, surface.normal, V,
                                             surface.rough, pixel, reflectionHit);
-        if (reflectionHit) reflectionIBL = traced;
+        if (reflectionHit) {
+            if (svgfTemporalEnabled != 0) {
+                reflectionIBL = SVGF_TemporalAccumulate(
+                    traced, pixel, visBuffer.Load(int3(pixel, 0)).x,
+                    commitTemporalHistory);
+            } else {
+                reflectionIBL = traced;
+            }
+        }
     }
 #endif
     float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
@@ -1332,7 +1432,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                     fragPosS, dcs, isFoliageS,
                     wp0s, wp1s, wp2s, n0s, n1s, n2s,
                     uv0s, uv1s, uv2s, baryUsed);
-                sampleColors[s] = ShadeSurface(pixel, surfaceS);
+                // Sub-samples must not commit temporal history: two calls for
+                // one pixel would double-blend and double-advance the count.
+                sampleColors[s] = ShadeSurface(pixel, surfaceS, false);
             }
             
             float3 finalColor = (sampleColors[0] + sampleColors[1]) * 0.5;
@@ -1384,12 +1486,56 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
         return;
     }
+
+    // Debug view 5: SVGF temporal denoiser output. Shows the denoised
+    // reflection colour for hit pixels; black otherwise. Compare against
+    // debug view 4 — the noise in 4's green pixels should be visibly reduced
+    // here as the temporal accumulation converges.
+    if (debugViewMode == 5u) {
+        float3 debugColor = float3(0.0, 0.0, 0.0);
+        bool eligible = enhancedRTReflections != 0 &&
+                        surface.rough <= enhancedReflectionRoughnessCut &&
+                        !surface.isFoliage;
+        if (eligible) {
+            bool reflectionHit = false;
+            float3 traced = RayTracedReflection(
+                surface.fragPos, surface.normal,
+                surface.viewDir, surface.rough, pixel, reflectionHit);
+            if (reflectionHit) {
+                // Debug view only: never commit, or switching to this view
+                // would corrupt the history the lit path is accumulating.
+                debugColor = SVGF_TemporalAccumulate(
+                    traced, pixel, visBuffer.Load(int3(pixel, 0)).x, false);
+            }
+        }
+        outputColor[pixel] = float4(debugColor, 1.0);
+        if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
+        return;
+    }
 #endif
 
 #if SGE_ENHANCED_VISUALS
     if (!edgeAAApplied) {
         float3 result = ShadeSurface(pixel, surface);
         outputColor[pixel] = float4(result, 1.0);
+    } else if (svgfTemporalEnabled != 0 && enhancedRTReflections != 0 &&
+               surface.rough <= enhancedReflectionRoughnessCut &&
+               !surface.isFoliage) {
+        // Edge AA shaded this pixel from its sub-samples, and those
+        // deliberately do not commit temporal history. Without this, history
+        // would never advance on silhouette pixels: the accumulation count
+        // would stay pinned and the denoiser would silently stop converging
+        // exactly where the signal is noisiest. Commit once from the centre
+        // surface, discarding the colour -- outputColor already holds the
+        // edge-AA result.
+        bool centreHit = false;
+        float3 centreTraced = RayTracedReflection(
+            surface.fragPos, surface.normal, surface.viewDir,
+            surface.rough, pixel, centreHit);
+        if (centreHit) {
+            SVGF_TemporalAccumulate(centreTraced, pixel,
+                                    visBuffer.Load(int3(pixel, 0)).x, true);
+        }
     }
 #else
     float3 result = ShadeSurface(pixel, surface);

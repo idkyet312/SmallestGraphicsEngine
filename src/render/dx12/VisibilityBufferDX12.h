@@ -221,6 +221,15 @@ public:
     // hit-shading path this stands in for "something blocked the sky here".
     float enhancedReflectionOcclusion = 0.25f;
     UINT enhancedReflectionFrameCounter = 0;
+    // SVGF temporal accumulation for RT reflections. Ping-pong history pair:
+    // colour (E[x]), moments (E[x^2]) + sample count, one side read (SRV) and
+    // the other side written (UAV), swapped every frame. Off by default.
+    bool svgfTemporalEnabled = false;
+    UINT svgfMaxAccumFrames = 32;
+    UINT svgfHistoryPing = 0;
+    bool svgfHistoryValid = false;
+    ComPtr<ID3D12Resource> svgfHistoryColor[2];
+    ComPtr<ID3D12Resource> svgfHistoryMoments[2];
     // TLAS this frame. Re-registered whenever it changes, since the
     // acceleration structure is rebuilt as geometry streams in.
     D3D12_GPU_VIRTUAL_ADDRESS enhancedTLASAddress = 0;
@@ -866,6 +875,28 @@ public:
             cmdList->SetPipelineState(resolvePSO.Get());
         }
 
+        // Transition SVGF write-side history to UAV before the enhanced
+        // resolve reads the previous frame's history and writes the current.
+        if (useEnhanced && svgfTemporalEnabled) {
+            svgfHistoryPing ^= 1;
+            RefreshSVGFDescriptors();
+            D3D12_RESOURCE_BARRIER svgfBarriers[2] = {};
+            for (UINT i = 0; i < 2; ++i) {
+                svgfBarriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                svgfBarriers[i].Transition.StateBefore =
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                svgfBarriers[i].Transition.StateAfter =
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                svgfBarriers[i].Transition.Subresource =
+                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            }
+            svgfBarriers[0].Transition.pResource =
+                svgfHistoryColor[svgfHistoryPing].Get();
+            svgfBarriers[1].Transition.pResource =
+                svgfHistoryMoments[svgfHistoryPing].Get();
+            cmdList->ResourceBarrier(2, svgfBarriers);
+        }
+
         // Set descriptor heap
         ID3D12DescriptorHeap* heaps[] = {
             useEnhanced ? enhancedComputeDescHeap.Get() : computeDescHeap.Get() };
@@ -904,6 +935,26 @@ public:
         // Sample how much of the screen went to RT. Only meaningful when the
         // enhanced resolve actually wrote the mask this frame.
         if (useEnhanced) UpdateRayMaskStatistic(cmdList);
+
+        // Transition SVGF write-side history back to SRV for next frame.
+        if (useEnhanced && svgfTemporalEnabled) {
+            D3D12_RESOURCE_BARRIER svgfBarriers[2] = {};
+            for (UINT i = 0; i < 2; ++i) {
+                svgfBarriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                svgfBarriers[i].Transition.StateBefore =
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                svgfBarriers[i].Transition.StateAfter =
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                svgfBarriers[i].Transition.Subresource =
+                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            }
+            svgfBarriers[0].Transition.pResource =
+                svgfHistoryColor[svgfHistoryPing].Get();
+            svgfBarriers[1].Transition.pResource =
+                svgfHistoryMoments[svgfHistoryPing].Get();
+            cmdList->ResourceBarrier(2, svgfBarriers);
+            svgfHistoryValid = true;
+        }
 
         // Keep linear HDR, motion vectors, and surface data as SRVs.
         {
@@ -1252,6 +1303,12 @@ public:
         visibilityDepthTexture.Reset();
         historyTextures[0].Reset();
         historyTextures[1].Reset();
+        svgfHistoryColor[0].Reset();
+        svgfHistoryColor[1].Reset();
+        svgfHistoryMoments[0].Reset();
+        svgfHistoryMoments[1].Reset();
+        svgfHistoryPing = 0;
+        svgfHistoryValid = false;
         exposureState.Reset();
         temporalHistoryValid = false;
         exposureReadable = false;
@@ -1461,6 +1518,25 @@ private:
                 IID_PPV_ARGS(&historyTextures[i]));
             if (FAILED(hr)) return false;
         }
+
+        // SVGF temporal accumulation: ping-pong history for denoised colour
+        // (E[x]) and moments (E[x^2] + sample count in alpha).
+        // Created in SRV state; the Resolve transitions the write-side to UAV
+        // each frame and back to SRV afterwards.
+        for (UINT i = 0; i < 2; ++i) {
+            hr = g_dx12.device->CreateCommittedResource(
+                &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&svgfHistoryColor[i]));
+            if (FAILED(hr)) return false;
+            hr = g_dx12.device->CreateCommittedResource(
+                &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&svgfHistoryMoments[i]));
+            if (FAILED(hr)) return false;
+        }
+        svgfHistoryPing = 0;
+        svgfHistoryValid = false;
 
         D3D12_RESOURCE_DESC exposureDesc = {};
         exposureDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1875,6 +1951,10 @@ private:
             float pad0;
             float pad1;
             float pad2;
+            UINT  svgfTemporalEnable;
+            UINT  svgfMaxAccum;
+            UINT  svgfPad0;
+            UINT  svgfPad1;
         } constants;
         constants.rtShadows = enhancedRTShadowsActive ? 1u : 0u;
         constants.rayClassify = enhancedRayClassifyActive ? 1u : 0u;
@@ -1890,6 +1970,10 @@ private:
         constants.pad0 = 0.0f;
         constants.pad1 = 0.0f;
         constants.pad2 = 0.0f;
+        constants.svgfTemporalEnable = svgfTemporalEnabled ? 1u : 0u;
+        constants.svgfMaxAccum = svgfMaxAccumFrames;
+        constants.svgfPad0 = 0u;
+        constants.svgfPad1 = 0u;
         memcpy(enhancedConstantMapped, &constants, sizeof(constants));
     }
 
@@ -1932,7 +2016,7 @@ private:
         }
 
         // The enhanced variant gets its OWN descriptor heap, mirroring the
-        // default layout in slots [0..85] and appending the three new
+        // default layout in slots [0..85] and appending the feature-specific
         // descriptors after it. Widening the shared heap in place would mean
         // renumbering every hardcoded slot index the default resolve depends
         // on -- exactly the kind of churn that could regress the default path.
@@ -1940,10 +2024,15 @@ private:
         //   [0..78]  t0..t78  as the default resolve
         //   [79..81] u0..u2   as the default resolve
         //   [82..85] b1..b4   as the default resolve
-        //   [86]     t79      TLAS               (new)
-        //   [87]     u3       ray mask           (new)
-        //   [88]     b5       enhanced constants (new)
-        D3D12_DESCRIPTOR_RANGE ranges[6] = {};
+        //   [86]     t79      TLAS                     (Phase 5)
+        //   [87]     u3       ray mask                 (Phase 5)
+        //   [88]     b5       enhanced constants       (Phase 5)
+        //   [89]     t80      svgf history colour      (Phase 5b)
+        //   [90]     t81      svgf history moments     (Phase 5b)
+        //   [91]     t82      vis buffer history       (Phase 5b)
+        //   [92]     u4       svgf colour write        (Phase 5b)
+        //   [93]     u5       svgf moments write        (Phase 5b)
+        D3D12_DESCRIPTOR_RANGE ranges[11] = {};
         ranges[0] = baseRanges[0];                          // t0..t78
         ranges[1] = baseRanges[1];                          // u0..u2 @ 79
         ranges[2] = baseRanges[2];                          // b1..b4 @ 82
@@ -1965,6 +2054,36 @@ private:
         ranges[5].BaseShaderRegister = 5;                   // b5 constants
         ranges[5].RegisterSpace = 0;
         ranges[5].OffsetInDescriptorsFromTableStart = 88;
+
+        ranges[6].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[6].NumDescriptors = 1;
+        ranges[6].BaseShaderRegister = 80;                  // t80 svgfHistoryColor
+        ranges[6].RegisterSpace = 0;
+        ranges[6].OffsetInDescriptorsFromTableStart = 89;
+
+        ranges[7].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[7].NumDescriptors = 1;
+        ranges[7].BaseShaderRegister = 81;                  // t81 svgfHistoryMoments
+        ranges[7].RegisterSpace = 0;
+        ranges[7].OffsetInDescriptorsFromTableStart = 90;
+
+        ranges[8].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[8].NumDescriptors = 1;
+        ranges[8].BaseShaderRegister = 82;                  // t82 visBufferHistory
+        ranges[8].RegisterSpace = 0;
+        ranges[8].OffsetInDescriptorsFromTableStart = 91;
+
+        ranges[9].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[9].NumDescriptors = 1;
+        ranges[9].BaseShaderRegister = 4;                   // u4 svgfHistoryColorWrite
+        ranges[9].RegisterSpace = 0;
+        ranges[9].OffsetInDescriptorsFromTableStart = 92;
+
+        ranges[10].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[10].NumDescriptors = 1;
+        ranges[10].BaseShaderRegister = 5;                  // u5 svgfHistoryMomentsWrite
+        ranges[10].RegisterSpace = 0;
+        ranges[10].OffsetInDescriptorsFromTableStart = 93;
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -2170,6 +2289,77 @@ private:
     // Builds the enhanced heap: a copy of the default resolve heap's 86
     // descriptors, then TLAS / ray mask / enhanced constants appended.
     //
+    // Updates just the SVGF descriptor slots (89-93) to point at the current
+    // ping-pong side. Called every frame when temporal accumulation is active,
+    // before the enhanced resolve dispatch.
+    void RefreshSVGFDescriptors() {
+        if (!enhancedComputeDescHeap || !svgfHistoryColor[0]) return;
+        const UINT descSize = g_dx12.cbvSrvUavDescriptorSize;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            enhancedComputeDescHeap->GetCPUDescriptorHandleForHeapStart();
+
+        // [89] t80 - svgf history colour read (previous frame's ping)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 89;
+            g_dx12.device->CreateShaderResourceView(
+                svgfHistoryColor[svgfHistoryPing ^ 1].Get(), &srv, h);
+        }
+
+        // [90] t81 - svgf history moments read
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 90;
+            g_dx12.device->CreateShaderResourceView(
+                svgfHistoryMoments[svgfHistoryPing ^ 1].Get(), &srv, h);
+        }
+
+        // [91] t82 - vis buffer history (static, but refresh for safety)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R32G32_UINT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 91;
+            g_dx12.device->CreateShaderResourceView(
+                visBufferHistory.Get(), &srv, h);
+        }
+
+        // [92] u4 - svgf colour write (current frame's ping)
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 92;
+            g_dx12.device->CreateUnorderedAccessView(
+                svgfHistoryColor[svgfHistoryPing].Get(), nullptr, &uav, h);
+        }
+
+        // [93] u5 - svgf moments write
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 93;
+            g_dx12.device->CreateUnorderedAccessView(
+                svgfHistoryMoments[svgfHistoryPing].Get(), nullptr, &uav, h);
+        }
+    }
+
     // Called after the default heap is populated and whenever the TLAS address
     // changes. Copying rather than sharing keeps the default layout's
     // hardcoded indices untouched.
@@ -2179,7 +2369,7 @@ private:
         if (!enhancedComputeDescHeap) {
             D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
             heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            heapDesc.NumDescriptors = 89;   // 86 mirrored + 3 appended
+            heapDesc.NumDescriptors = 94;   // 86 mirrored + 8 appended
             heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             if (FAILED(g_dx12.device->CreateDescriptorHeap(
                     &heapDesc, IID_PPV_ARGS(&enhancedComputeDescHeap))))
@@ -2210,8 +2400,6 @@ private:
             srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.RaytracingAccelerationStructure.Location = enhancedTLASAddress;
-            // A TLAS SRV is always created against a null resource -- the GPU
-            // address in the desc is the entire binding.
             g_dx12.device->CreateShaderResourceView(nullptr, &srv, tlasHandle);
         }
 
@@ -2235,6 +2423,67 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE cbvHandle = handle;
             cbvHandle.ptr += (UINT64)descSize * 88;
             g_dx12.device->CreateConstantBufferView(&cbv, cbvHandle);
+        }
+
+        // [89] t80 - svgf history colour (SRV, read side of ping-pong)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 89;
+            g_dx12.device->CreateShaderResourceView(
+                svgfHistoryColor[svgfHistoryPing ^ 1].Get(), &srv, h);
+        }
+
+        // [90] t81 - svgf history moments (SRV, read side of ping-pong)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 90;
+            g_dx12.device->CreateShaderResourceView(
+                svgfHistoryMoments[svgfHistoryPing ^ 1].Get(), &srv, h);
+        }
+
+        // [91] t82 - vis buffer history (SRV, surface-ID validation)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R32G32_UINT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 91;
+            g_dx12.device->CreateShaderResourceView(
+                visBufferHistory.Get(), &srv, h);
+        }
+
+        // [92] u4 - svgf colour write (UAV, write side of ping-pong)
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 92;
+            g_dx12.device->CreateUnorderedAccessView(
+                svgfHistoryColor[svgfHistoryPing].Get(), nullptr, &uav, h);
+        }
+
+        // [93] u5 - svgf moments write (UAV, write side of ping-pong)
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 93;
+            g_dx12.device->CreateUnorderedAccessView(
+                svgfHistoryMoments[svgfHistoryPing].Get(), nullptr, &uav, h);
         }
     }
 

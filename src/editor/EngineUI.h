@@ -590,7 +590,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     static_cast<UINT>(vb.meshes.size()));
                 const char* debugViews[] = {
                     "Lit resolve", "Instance / primitive IDs", "Raw depth",
-                    "Edge mask", "RT reflection rays"
+                    "Edge mask", "RT reflection rays", "SVGF denoiser"
                 };
                 ImGui::Combo("VB Debug View", &vb.debugViewMode,
                     debugViews, IM_ARRAYSIZE(debugViews));
@@ -606,6 +606,16 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                         ImGui::TextDisabled("  green=ray hit  blue=ray missed");
                         ImGui::TextDisabled("  black=not eligible (rough/foliage)");
                         ImGui::TextDisabled("  red ramp=sample index, must cycle");
+                    }
+                }
+                if (vb.debugViewMode == 5) {
+                    if (!vb.EnhancedVisualsReady()) {
+                        ImGui::TextDisabled("  Needs the SM6.5 resolve");
+                    } else if (!scene.enhancedRTReflections) {
+                        ImGui::TextDisabled("  RT Reflections is off: all black");
+                    } else {
+                        ImGui::TextDisabled("  Denoised reflection colour");
+                        ImGui::TextDisabled("  black=no hit  coloured=denoised");
                     }
                 }
                 ImGui::SliderFloat("VB Exposure", &vb.exposure, 0.25f, 4.0f, "%.2f");
@@ -641,8 +651,19 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                             0.05f, 1.0f, "%.2f");
                         ImGui::TextDisabled(
                             "  1 GGX ray/pixel/frame: noisy by design.");
-                        ImGui::TextDisabled(
-                            "  Phase 5b denoiser resolves it.");
+                        ImGui::Checkbox("  SVGF Temporal Accumulation",
+                                        &vb.svgfTemporalEnabled);
+                        if (vb.svgfTemporalEnabled) {
+                            ImGui::SliderInt("    Max Accum Frames",
+                                (int*)&vb.svgfMaxAccumFrames,
+                                4, 64);
+                            if (vb.svgfHistoryValid)
+                                ImGui::TextDisabled(
+                                    "    Reprojects + blends via 1/N EMA");
+                            else
+                                ImGui::TextDisabled(
+                                    "    Waiting for first history frame");
+                        }
                     }
                     ImGui::Checkbox("  Ray Classification",
                                     &scene.enhancedRayClassify);
