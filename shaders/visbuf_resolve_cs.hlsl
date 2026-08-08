@@ -624,6 +624,322 @@ float3 calculatePointLight(int index, float3 fragPos, float3 normal,
     return (diff * radiance + specular) * attenuation;
 }
 
+struct Surface {
+    float3 fragPos;
+    float3 normal;
+    float3 viewDir;
+    float3 albedo;
+    float  metal;
+    float  rough;
+    float  materialAO;
+    float  foliageCoverage;
+    bool   isFoliage;
+    MaterialData material;
+    DrawCallData dc;
+};
+
+Surface EvaluateSurface(float3 fragPos,
+                        DrawCallData dc, bool isFoliage,
+                        float3 wp0, float3 wp1, float3 wp2,
+                        float3 n0, float3 n1, float3 n2,
+                        float2 uv0, float2 uv1, float2 uv2,
+                        float3 bary) {
+    float3 viewDir = normalize(cameraPos - fragPos);
+    float3 objNormal = normalize(bary.x * n0 + bary.y * n1 + bary.z * n2);
+    // Transform normal to world space
+    float3 normal = normalize(mul(objNormal, (float3x3)dc.modelMatrix));
+    if ((dc.flags & 1u) != 0u && dot(normal, viewDir) < 0.0)
+        normal = -normal;
+
+    float2 texCoord = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
+    float2 uvDx, uvDy;
+    ComputeUVGradients(wp0, wp1, wp2, uv0, uv1, uv2, uvDx, uvDy);
+
+    // Material
+    MaterialData material = materials[min(dc.materialID, 255u)];
+    float3 albedo = dc.objectColor * material.baseColorFactor.rgb;
+    float metal = material.pbrParams.w > 0.5 ? material.pbrParams.x : dc.metalness;
+    float rough = material.pbrParams.w > 0.5 ? material.pbrParams.y : dc.roughness;
+    float materialAO = 1.0;
+    float foliageCoverage = 1.0;
+    if (material.textureIndices.x < 64u) {
+        uint albedoTextureIndex = material.textureIndices.x;
+        float4 authoredSample = materialTextures[albedoTextureIndex].SampleGrad(
+            texSampler, texCoord, uvDx, uvDy);
+        if (isFoliage) {
+            foliageCoverage = authoredSample.a;
+            uint texWidth, texHeight, texLevels;
+            materialTextures[albedoTextureIndex].GetDimensions(
+                0, texWidth, texHeight, texLevels);
+            float2 texel = 1.0 / max(float2(texWidth, texHeight), 1.0);
+            float4 neighbor0 = materialTextures[albedoTextureIndex].SampleGrad(
+                texSampler, texCoord + float2(texel.x, 0.0), uvDx, uvDy);
+            float4 neighbor1 = materialTextures[albedoTextureIndex].SampleGrad(
+                texSampler, texCoord - float2(texel.x, 0.0), uvDx, uvDy);
+            float4 neighbor2 = materialTextures[albedoTextureIndex].SampleGrad(
+                texSampler, texCoord + float2(0.0, texel.y), uvDx, uvDy);
+            float4 neighbor3 = materialTextures[albedoTextureIndex].SampleGrad(
+                texSampler, texCoord - float2(0.0, texel.y), uvDx, uvDy);
+            float totalCoverage = authoredSample.a + neighbor0.a + neighbor1.a +
+                                  neighbor2.a + neighbor3.a;
+            float3 coveredColor =
+                (authoredSample.rgb * authoredSample.a +
+                 neighbor0.rgb * neighbor0.a +
+                 neighbor1.rgb * neighbor1.a +
+                 neighbor2.rgb * neighbor2.a +
+                 neighbor3.rgb * neighbor3.a) /
+                max(totalCoverage, 1e-4);
+            float edgeBlend =
+                1.0 - smoothstep(0.34, 0.88, authoredSample.a);
+            authoredSample.rgb = lerp(
+                authoredSample.rgb, coveredColor, edgeBlend * 0.88);
+        }
+        albedo *= pow(max(authoredSample.rgb, 0.0), 2.2);
+        if (isFoliage) {
+            float leafLum = dot(albedo, float3(0.299, 0.587, 0.114));
+            float dark = 1.0 - smoothstep(0.02, 0.12, leafLum);
+            // Keep alpha-card shadow recovery tied to the selected foliage
+            // albedo; a fixed green lift made ferns ignore the grass controls.
+            float3 foliageBase =
+                dc.objectColor * material.baseColorFactor.rgb;
+            albedo = lerp(albedo, foliageBase * 0.72, dark * 0.72);
+        }
+    }
+    if (isFoliage) {
+        float variation = MatVarNoise(fragPos * 1.7);
+        float variationStrength = max(material.shadingParams.y, 0.0);
+        float3 tint = lerp(
+            1.0.xxx,
+            lerp(float3(0.90, 1.03, 0.92),
+                 float3(1.06, 1.00, 0.78), variation),
+            variationStrength);
+        float brightness = lerp(
+            1.0, lerp(0.88, 1.10, variation), variationStrength);
+        albedo = saturate(albedo * tint * brightness);
+    }
+    if (material.textureIndices.z < 64u) {
+        float4 mr = materialTextures[material.textureIndices.z].SampleGrad(
+            texSampler, texCoord, uvDx, uvDy);
+        materialAO = lerp(1.0, mr.r, saturate(material.emissiveOcclusion.w));
+        if (material.textureIndices.w != 0u) {
+            rough = clamp(mr.g, 0.08, 1.0);
+            materialAO = lerp(1.0, mr.r,
+                saturate(material.emissiveOcclusion.w));
+        } else {
+            rough *= mr.g;
+            metal *= mr.b;
+        }
+    }
+    metal = saturate(metal);
+    rough = clamp(rough, 0.04, 1.0);
+    if (isFoliage) {
+        metal = 0.0;
+    }
+
+    if (material.textureIndices.y < 64u) {
+        float3 tangentNormal = materialTextures[material.textureIndices.y].SampleGrad(
+            texSampler, texCoord, uvDx, uvDy).xyz * 2.0 - 1.0;
+        tangentNormal.y *= material.pbrParams.z;
+        float tangentLength = saturate(length(tangentNormal));
+        tangentNormal.xy *= tangentLength;
+        tangentNormal.z = sqrt(saturate(1.0 - dot(tangentNormal.xy,
+                                                  tangentNormal.xy)));
+        float3 edge1 = wp1 - wp0;
+        float3 edge2 = wp2 - wp0;
+        float2 deltaUV1 = uv1 - uv0;
+        float2 deltaUV2 = uv2 - uv0;
+        float uvDet = deltaUV1.x * deltaUV2.y - deltaUV1.y * deltaUV2.x;
+        if (abs(uvDet) > 1e-6) {
+            float3 tangent = normalize((edge1 * deltaUV2.y - edge2 * deltaUV1.y) / uvDet);
+            tangent = normalize(tangent - normal * dot(normal, tangent));
+            float3 bitangent = normalize(cross(normal, tangent));
+            float3 mappedNormal = normalize(tangentNormal.x * tangent +
+                                            tangentNormal.y * bitangent +
+                                            tangentNormal.z * normal);
+            float grazingFade = smoothstep(0.25, 0.65, saturate(abs(dot(
+                normal, normalize(cameraPos - fragPos)))));
+            normal = normalize(lerp(normal, mappedNormal,
+                material.shadingParams.z * grazingFade));
+        }
+    }
+    
+    if ((dc.flags & 1u) != 0u && dot(normal, viewDir) < 0.0)
+        normal = -normal;
+
+    if (metal < 0.25) {
+        float variation = MatVarNoise(fragPos * 0.35);
+        rough = clamp(rough * lerp(0.88, 1.10, variation), 0.04, 1.0);
+    }
+    
+    Surface surface;
+    surface.fragPos = fragPos;
+    surface.normal = normal;
+    surface.viewDir = viewDir;
+    surface.albedo = albedo;
+    surface.metal = metal;
+    surface.rough = rough;
+    surface.materialAO = materialAO;
+    surface.foliageCoverage = foliageCoverage;
+    surface.isFoliage = isFoliage;
+    surface.material = material;
+    surface.dc = dc;
+    return surface;
+}
+
+float3 ShadeSurface(uint2 pixel, Surface surface) {
+    float3 result = 0.0;
+    
+    // Main light
+    float3 L;
+    float atten = 1.0;
+    
+    if (lightType == 0) {
+        L = normalize(lightPos);
+    } else {
+        L = normalize(lightPos - surface.fragPos);
+        float dist = length(lightPos - surface.fragPos);
+        atten = 1.0 / (attConstant + attLinear * dist + attQuadratic * dist * dist);
+    }
+    
+    float3 V = surface.viewDir;
+    float3 H = normalize(V + L);
+    float signedNdotL = dot(surface.normal, L);
+    float NdotL = surface.isFoliage
+        ? FoliageWrappedDiffuse(signedNdotL)
+        : max(signedNdotL, 0.0);
+    float NdotV = max(dot(surface.normal, V), 0.0);
+    float NdotH = max(dot(surface.normal, H), 0.0);
+    float HdotV = max(dot(H, V), 0.0);
+    
+    // Fresnel (Schlick)
+    float3 F0 = float3(0.04, 0.04, 0.04);
+    F0 = lerp(F0, surface.albedo, surface.metal);
+    float3 F = F0 + (1.0 - F0) * pow(1.0 - HdotV, 5.0);
+    
+    // NDF (GGX)
+    float alpha = surface.rough * surface.rough;
+    float alpha2 = alpha * alpha;
+    float NdotH2 = NdotH * NdotH;
+    float num = alpha2;
+    float denom = (NdotH2 * (alpha2 - 1.0) + 1.0);
+    denom = 3.14159265 * denom * denom;
+    float NDF = num / max(denom, 0.000001);
+    
+    // Geometry (Smith)
+    float k = (surface.rough + 1.0) * (surface.rough + 1.0) / 8.0;
+    float ggx1 = NdotV / (NdotV * (1.0 - k) + k);
+    float ggx2 = NdotL / (NdotL * (1.0 - k) + k);
+    float G = ggx1 * ggx2;
+    
+    float3 kS = F;
+    float3 kD = float3(1.0, 1.0, 1.0) - kS;
+    kD *= 1.0 - surface.metal;
+
+    float ambientOcclusion = surface.materialAO;
+    float3 diffuseAlbedo = surface.albedo * (1.0 - surface.metal);
+    float ambientScale = surface.material.shadingParams.x;
+    float3 diffuseIBL = SampleSkyIrradiance(surface.normal) * diffuseAlbedo * ambientScale;
+    float3 diffuseGI = SampleDDGIIrradiance(surface.fragPos, surface.normal) *
+        diffuseAlbedo * ambientScale;
+    float3 reflectionIBL = SampleReflectionProbe(reflect(-V, surface.normal), surface.rough);
+    float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
+        texSampler, float2(NdotV, surface.rough), 0.0);
+    float foliageSpecularScale = surface.isFoliage ? 0.12 : 1.0;
+    float3 specularIBL = reflectionIBL *
+        (F0 * environmentBRDF.x + environmentBRDF.y) *
+        foliageSpecularScale;
+    result += (diffuseIBL + diffuseGI + specularIBL) * ambientOcclusion *
+              ambientLightingIntensity;
+    result += ambientStrength * diffuseAlbedo * ambientScale *
+              ambientOcclusion * ambientLightingIntensity;
+    result += surface.material.emissiveOcclusion.rgb;
+    
+    float3 numerator = NDF * G * F;
+    float denominator = 4.0 * NdotV * NdotL + 0.0001;
+    float3 specular = numerator / denominator * foliageSpecularScale;
+    
+    float shadowVisibility = CalculateShadow(surface.fragPos, surface.normal, L);
+#if SGE_ENHANCED_VISUALS
+    // ---- Cheap tier first, rays only where it is uncertain ----
+    //
+    // The cascade lookup above is the cheap tier. It is confident in the middle
+    // of a lit region and in the middle of a shadowed one; it is least reliable
+    // in the penumbra, at grazing angles (where slope bias is doing the most
+    // work), and past the last cascade split. Confidence here is exactly that:
+    // distance from the 0/1 rails, damped at grazing incidence.
+    //
+    // Only low-confidence pixels get a ray, which is what keeps this affordable
+    // -- on a typical frame it is a small fraction of the screen rather than
+    // all of it.
+    {
+        float rail = min(shadowVisibility, 1.0 - shadowVisibility) * 2.0;
+        float grazing = saturate(dot(surface.normal, L));
+        float cascadeConfidence = saturate(rail + 0.35 * grazing);
+        // Past the final split the cascades have nothing to say at all.
+        float viewDepth = mul(float4(surface.fragPos, 1.0), viewMatrix).z;
+        if (viewDepth >= shadowCascadeSplits.z) cascadeConfidence = 0.0;
+
+        bool trace = enableShadows != 0 && enhancedRTShadows != 0 &&
+                     (enhancedRayClassify == 0 ||
+                      cascadeConfidence < enhancedConfidenceThreshold);
+        if (trace) {
+            float traced = RayTracedShadow(surface.fragPos, surface.normal, L);
+            // Combine with min(): the TLAS is static-only, so the cascade term
+            // still carries every dynamic caster, and taking the darker of the
+            // two keeps those shadows rather than erasing them.
+            float combined = min(shadowVisibility, traced);
+            // Ease in near the threshold so the classification boundary is not
+            // a visible edge, but commit fully below it. The earlier
+            // 1 - confidence/threshold ramp discarded most of the traced result
+            // on the very pixels it had just paid to trace -- at threshold 1.0
+            // a confidence-0.9 pixel kept only 10% of its ray, which is why RT
+            // shadows were barely visible while still costing full price.
+            float blend = smoothstep(
+                enhancedConfidenceThreshold,
+                enhancedConfidenceThreshold * 0.6, cascadeConfidence);
+            shadowVisibility = lerp(shadowVisibility, combined, blend);
+            outputRayMask[pixel] = 1u;  // cleared to 0 at entry
+        }
+    }
+#endif
+    // Shadow map blocks direct sun only. IBL/DDGI are already low-frequency
+    // indirect terms and must stay present on occluded building/actor sides.
+    float frontFill = 0.65 + 0.35 * saturate(dot(surface.normal, surface.viewDir));
+    result += diffuseAlbedo *
+              (surface.isFoliage ? 0.0 : surface.material.shadingParams.y) * frontFill *
+              ambientLightingIntensity;
+    float3 Lo = (kD * surface.albedo / 3.14159265 + specular) * lightColor *
+                NdotL * atten * shadowVisibility;
+    result += Lo * (surface.isFoliage
+        ? max(surface.material.emissiveOcclusion.w, 0.0) : 1.0);
+    if (surface.isFoliage) {
+        result += EvaluateFoliageTransmission(
+            surface.albedo, surface.normal, surface.viewDir, L, lightColor,
+            surface.foliageCoverage, atten, shadowVisibility) *
+            max(surface.material.pbrParams.z, 0.0);
+        result += EvaluateFoliageSkyScatter(
+            surface.albedo, SampleSkyIrradiance(surface.normal),
+            SampleSkyIrradiance(-surface.normal), ambientLightingIntensity);
+    }
+    
+    // Clustered point lights: at most 32 relevant lights instead of all 64.
+    uint clusterX = min((pixel.x * 16u) / max((uint)screenWidth, 1u), 15u);
+    uint clusterY = min((pixel.y * 9u) / max((uint)screenHeight, 1u), 8u);
+    float viewDepth = max(abs(mul(float4(surface.fragPos, 1.0), viewMatrix).z), nearPlane);
+    float depthScale = log(viewDepth / nearPlane) / log(farPlane / nearPlane);
+    uint clusterZ = min((uint)(saturate(depthScale) * 10.0), 9u);
+    ClusterData cluster = clusters[clusterX + clusterY * 16u + clusterZ * 144u];
+    [loop]
+    for (uint listIndex = 0; listIndex < min(cluster.lightCount, 32u); ++listIndex) {
+        uint lightIndex = cluster.lightIndices[listIndex];
+        if (lightIndex < (uint)numPointLights && lightIndex < 64u)
+            result += calculatePointLight(lightIndex, surface.fragPos, surface.normal,
+                                          surface.viewDir, surface.rough) * surface.albedo;
+    }
+    
+    return result;
+}
+
 // ---- Main ----
 
 [numthreads(8, 8, 1)]
@@ -752,283 +1068,12 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         outputMotion[pixel] = currentUV - previousUV;
     }
     
-    float3 viewDir = normalize(cameraPos - fragPos);
-    float3 objNormal = normalize(bary.x * n0 + bary.y * n1 + bary.z * n2);
-    // Transform normal to world space
-    float3 normal = normalize(mul(objNormal, (float3x3)dc.modelMatrix));
-    if ((dc.flags & 1u) != 0u && dot(normal, viewDir) < 0.0)
-        normal = -normal;
+    Surface surface = EvaluateSurface(fragPos, dc, isFoliage,
+                                       wp0, wp1, wp2, n0, n1, n2,
+                                       uv0, uv1, uv2, bary);
+    outputNormalRoughness[pixel] = float4(surface.normal, surface.rough);
 
-    float2 texCoord = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
-    float2 uvDx, uvDy;
-    ComputeUVGradients(wp0, wp1, wp2, uv0, uv1, uv2, uvDx, uvDy);
+    float3 result = ShadeSurface(pixel, surface);
 
-    // Material
-    MaterialData material = materials[min(dc.materialID, 255u)];
-    float3 albedo = dc.objectColor * material.baseColorFactor.rgb;
-    float metal = material.pbrParams.w > 0.5 ? material.pbrParams.x : dc.metalness;
-    float rough = material.pbrParams.w > 0.5 ? material.pbrParams.y : dc.roughness;
-    float materialAO = 1.0;
-    float foliageCoverage = 1.0;
-    if (material.textureIndices.x < 64u) {
-        uint albedoTextureIndex = material.textureIndices.x;
-        float4 authoredSample = materialTextures[albedoTextureIndex].SampleGrad(
-            texSampler, texCoord, uvDx, uvDy);
-        if (isFoliage) {
-            foliageCoverage = authoredSample.a;
-            uint texWidth, texHeight, texLevels;
-            materialTextures[albedoTextureIndex].GetDimensions(
-                0, texWidth, texHeight, texLevels);
-            float2 texel = 1.0 / max(float2(texWidth, texHeight), 1.0);
-            float4 neighbor0 = materialTextures[albedoTextureIndex].SampleGrad(
-                texSampler, texCoord + float2(texel.x, 0.0), uvDx, uvDy);
-            float4 neighbor1 = materialTextures[albedoTextureIndex].SampleGrad(
-                texSampler, texCoord - float2(texel.x, 0.0), uvDx, uvDy);
-            float4 neighbor2 = materialTextures[albedoTextureIndex].SampleGrad(
-                texSampler, texCoord + float2(0.0, texel.y), uvDx, uvDy);
-            float4 neighbor3 = materialTextures[albedoTextureIndex].SampleGrad(
-                texSampler, texCoord - float2(0.0, texel.y), uvDx, uvDy);
-            float totalCoverage = authoredSample.a + neighbor0.a + neighbor1.a +
-                                  neighbor2.a + neighbor3.a;
-            float3 coveredColor =
-                (authoredSample.rgb * authoredSample.a +
-                 neighbor0.rgb * neighbor0.a +
-                 neighbor1.rgb * neighbor1.a +
-                 neighbor2.rgb * neighbor2.a +
-                 neighbor3.rgb * neighbor3.a) /
-                max(totalCoverage, 1e-4);
-            float edgeBlend =
-                1.0 - smoothstep(0.34, 0.88, authoredSample.a);
-            authoredSample.rgb = lerp(
-                authoredSample.rgb, coveredColor, edgeBlend * 0.88);
-        }
-        albedo *= pow(max(authoredSample.rgb, 0.0), 2.2);
-        if (isFoliage) {
-            float leafLum = dot(albedo, float3(0.299, 0.587, 0.114));
-            float dark = 1.0 - smoothstep(0.02, 0.12, leafLum);
-            // Keep alpha-card shadow recovery tied to the selected foliage
-            // albedo; a fixed green lift made ferns ignore the grass controls.
-            float3 foliageBase =
-                dc.objectColor * material.baseColorFactor.rgb;
-            albedo = lerp(albedo, foliageBase * 0.72, dark * 0.72);
-        }
-    }
-    if (isFoliage) {
-        float variation = MatVarNoise(fragPos * 1.7);
-        float variationStrength = max(material.shadingParams.y, 0.0);
-        float3 tint = lerp(
-            1.0.xxx,
-            lerp(float3(0.90, 1.03, 0.92),
-                 float3(1.06, 1.00, 0.78), variation),
-            variationStrength);
-        float brightness = lerp(
-            1.0, lerp(0.88, 1.10, variation), variationStrength);
-        albedo = saturate(albedo * tint * brightness);
-    }
-    if (material.textureIndices.z < 64u) {
-        float4 mr = materialTextures[material.textureIndices.z].SampleGrad(
-            texSampler, texCoord, uvDx, uvDy);
-        materialAO = lerp(1.0, mr.r, saturate(material.emissiveOcclusion.w));
-        if (material.textureIndices.w != 0u) {
-            rough = clamp(mr.g, 0.08, 1.0);
-            materialAO = lerp(1.0, mr.r,
-                saturate(material.emissiveOcclusion.w));
-        } else {
-            rough *= mr.g;
-            metal *= mr.b;
-        }
-    }
-    metal = saturate(metal);
-    rough = clamp(rough, 0.04, 1.0);
-    if (isFoliage) {
-        metal = 0.0;
-    }
-
-    if (material.textureIndices.y < 64u) {
-        float3 tangentNormal = materialTextures[material.textureIndices.y].SampleGrad(
-            texSampler, texCoord, uvDx, uvDy).xyz * 2.0 - 1.0;
-        tangentNormal.y *= material.pbrParams.z;
-        float tangentLength = saturate(length(tangentNormal));
-        tangentNormal.xy *= tangentLength;
-        tangentNormal.z = sqrt(saturate(1.0 - dot(tangentNormal.xy,
-                                                  tangentNormal.xy)));
-        float3 edge1 = wp1 - wp0;
-        float3 edge2 = wp2 - wp0;
-        float2 deltaUV1 = uv1 - uv0;
-        float2 deltaUV2 = uv2 - uv0;
-        float uvDet = deltaUV1.x * deltaUV2.y - deltaUV1.y * deltaUV2.x;
-        if (abs(uvDet) > 1e-6) {
-            float3 tangent = normalize((edge1 * deltaUV2.y - edge2 * deltaUV1.y) / uvDet);
-            tangent = normalize(tangent - normal * dot(normal, tangent));
-            float3 bitangent = normalize(cross(normal, tangent));
-            float3 mappedNormal = normalize(tangentNormal.x * tangent +
-                                            tangentNormal.y * bitangent +
-                                            tangentNormal.z * normal);
-            float grazingFade = smoothstep(0.25, 0.65, saturate(abs(dot(
-                normal, normalize(cameraPos - fragPos)))));
-            normal = normalize(lerp(normal, mappedNormal,
-                material.shadingParams.z * grazingFade));
-        }
-    }
-    
-    if ((dc.flags & 1u) != 0u && dot(normal, viewDir) < 0.0)
-        normal = -normal;
-
-    if (metal < 0.25) {
-        float variation = MatVarNoise(fragPos * 0.35);
-        rough = clamp(rough * lerp(0.88, 1.10, variation), 0.04, 1.0);
-    }
-    outputNormalRoughness[pixel] = float4(normal, rough);
-    
-    float3 result = 0.0;
-    
-    // Main light
-    float3 L;
-    float atten = 1.0;
-    
-    if (lightType == 0) {
-        L = normalize(lightPos);
-    } else {
-        L = normalize(lightPos - fragPos);
-        float dist = length(lightPos - fragPos);
-        atten = 1.0 / (attConstant + attLinear * dist + attQuadratic * dist * dist);
-    }
-    
-    float3 V = viewDir;
-    float3 H = normalize(V + L);
-    float signedNdotL = dot(normal, L);
-    float NdotL = isFoliage
-        ? FoliageWrappedDiffuse(signedNdotL)
-        : max(signedNdotL, 0.0);
-    float NdotV = max(dot(normal, V), 0.0);
-    float NdotH = max(dot(normal, H), 0.0);
-    float HdotV = max(dot(H, V), 0.0);
-    
-    // Fresnel (Schlick)
-    float3 F0 = float3(0.04, 0.04, 0.04);
-    F0 = lerp(F0, albedo, metal);
-    float3 F = F0 + (1.0 - F0) * pow(1.0 - HdotV, 5.0);
-    
-    // NDF (GGX)
-    float alpha = rough * rough;
-    float alpha2 = alpha * alpha;
-    float NdotH2 = NdotH * NdotH;
-    float num = alpha2;
-    float denom = (NdotH2 * (alpha2 - 1.0) + 1.0);
-    denom = 3.14159265 * denom * denom;
-    float NDF = num / max(denom, 0.000001);
-    
-    // Geometry (Smith)
-    float k = (rough + 1.0) * (rough + 1.0) / 8.0;
-    float ggx1 = NdotV / (NdotV * (1.0 - k) + k);
-    float ggx2 = NdotL / (NdotL * (1.0 - k) + k);
-    float G = ggx1 * ggx2;
-    
-    float3 kS = F;
-    float3 kD = float3(1.0, 1.0, 1.0) - kS;
-    kD *= 1.0 - metal;
-
-    float ambientOcclusion = materialAO;
-    float3 diffuseAlbedo = albedo * (1.0 - metal);
-    float ambientScale = material.shadingParams.x;
-    float3 diffuseIBL = SampleSkyIrradiance(normal) * diffuseAlbedo * ambientScale;
-    float3 diffuseGI = SampleDDGIIrradiance(fragPos, normal) *
-        diffuseAlbedo * ambientScale;
-    float3 reflectionIBL = SampleReflectionProbe(reflect(-V, normal), rough);
-    float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
-        texSampler, float2(NdotV, rough), 0.0);
-    float foliageSpecularScale = isFoliage ? 0.12 : 1.0;
-    float3 specularIBL = reflectionIBL *
-        (F0 * environmentBRDF.x + environmentBRDF.y) *
-        foliageSpecularScale;
-    result += (diffuseIBL + diffuseGI + specularIBL) * ambientOcclusion *
-              ambientLightingIntensity;
-    result += ambientStrength * diffuseAlbedo * ambientScale *
-              ambientOcclusion * ambientLightingIntensity;
-    result += material.emissiveOcclusion.rgb;
-    
-    float3 numerator = NDF * G * F;
-    float denominator = 4.0 * NdotV * NdotL + 0.0001;
-    float3 specular = numerator / denominator * foliageSpecularScale;
-    
-    float shadowVisibility = CalculateShadow(fragPos, normal, L);
-#if SGE_ENHANCED_VISUALS
-    // ---- Cheap tier first, rays only where it is uncertain ----
-    //
-    // The cascade lookup above is the cheap tier. It is confident in the middle
-    // of a lit region and in the middle of a shadowed one; it is least reliable
-    // in the penumbra, at grazing angles (where slope bias is doing the most
-    // work), and past the last cascade split. Confidence here is exactly that:
-    // distance from the 0/1 rails, damped at grazing incidence.
-    //
-    // Only low-confidence pixels get a ray, which is what keeps this affordable
-    // -- on a typical frame it is a small fraction of the screen rather than
-    // all of it.
-    {
-        float rail = min(shadowVisibility, 1.0 - shadowVisibility) * 2.0;
-        float grazing = saturate(dot(normal, L));
-        float cascadeConfidence = saturate(rail + 0.35 * grazing);
-        // Past the final split the cascades have nothing to say at all.
-        float viewDepth = mul(float4(fragPos, 1.0), viewMatrix).z;
-        if (viewDepth >= shadowCascadeSplits.z) cascadeConfidence = 0.0;
-
-        bool trace = enableShadows != 0 && enhancedRTShadows != 0 &&
-                     (enhancedRayClassify == 0 ||
-                      cascadeConfidence < enhancedConfidenceThreshold);
-        if (trace) {
-            float traced = RayTracedShadow(fragPos, normal, L);
-            // Combine with min(): the TLAS is static-only, so the cascade term
-            // still carries every dynamic caster, and taking the darker of the
-            // two keeps those shadows rather than erasing them.
-            float combined = min(shadowVisibility, traced);
-            // Ease in near the threshold so the classification boundary is not
-            // a visible edge, but commit fully below it. The earlier
-            // 1 - confidence/threshold ramp discarded most of the traced result
-            // on the very pixels it had just paid to trace -- at threshold 1.0
-            // a confidence-0.9 pixel kept only 10% of its ray, which is why RT
-            // shadows were barely visible while still costing full price.
-            float blend = smoothstep(
-                enhancedConfidenceThreshold,
-                enhancedConfidenceThreshold * 0.6, cascadeConfidence);
-            shadowVisibility = lerp(shadowVisibility, combined, blend);
-            outputRayMask[pixel] = 1u;  // cleared to 0 at entry
-        }
-    }
-#endif
-    // Shadow map blocks direct sun only. IBL/DDGI are already low-frequency
-    // indirect terms and must stay present on occluded building/actor sides.
-    float frontFill = 0.65 + 0.35 * saturate(dot(normal, viewDir));
-    result += diffuseAlbedo *
-              (isFoliage ? 0.0 : material.shadingParams.y) * frontFill *
-              ambientLightingIntensity;
-    float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor *
-                NdotL * atten * shadowVisibility;
-    result += Lo * (isFoliage
-        ? max(material.emissiveOcclusion.w, 0.0) : 1.0);
-    if (isFoliage) {
-        result += EvaluateFoliageTransmission(
-            albedo, normal, viewDir, L, lightColor,
-            foliageCoverage, atten, shadowVisibility) *
-            max(material.pbrParams.z, 0.0);
-        result += EvaluateFoliageSkyScatter(
-            albedo, SampleSkyIrradiance(normal),
-            SampleSkyIrradiance(-normal), ambientLightingIntensity);
-    }
-    
-    // Clustered point lights: at most 32 relevant lights instead of all 64.
-    uint clusterX = min((pixel.x * 16u) / max((uint)screenWidth, 1u), 15u);
-    uint clusterY = min((pixel.y * 9u) / max((uint)screenHeight, 1u), 8u);
-    float viewDepth = max(abs(mul(float4(fragPos, 1.0), viewMatrix).z), nearPlane);
-    float depthScale = log(viewDepth / nearPlane) / log(farPlane / nearPlane);
-    uint clusterZ = min((uint)(saturate(depthScale) * 10.0), 9u);
-    ClusterData cluster = clusters[clusterX + clusterY * 16u + clusterZ * 144u];
-    [loop]
-    for (uint listIndex = 0; listIndex < min(cluster.lightCount, 32u); ++listIndex) {
-        uint lightIndex = cluster.lightIndices[listIndex];
-        if (lightIndex < (uint)numPointLights && lightIndex < 64u)
-            result += calculatePointLight(lightIndex, fragPos, normal,
-                                          viewDir, rough) * albedo;
-    }
-    
     outputColor[pixel] = float4(result, 1.0);
 }
