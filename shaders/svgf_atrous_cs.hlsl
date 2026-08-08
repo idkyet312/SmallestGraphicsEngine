@@ -88,12 +88,16 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
 
         colourSum += tap.rgb * weight;
         weightSum += weight;
-        const float varianceWeight = weight * weight;
-        varianceSum += max(tap.a, 0.0) * varianceWeight;
-        varianceWeightSum += varianceWeight;
+        varianceSum += max(tap.a, 0.0) * weight * weight;
     }
 
+    // Variance of a weighted mean sum(w*x)/sum(w) is
+    // sum(w^2 * var) / (sum(w))^2 -- the SQUARE of the weight sum, not the
+    // sum of squared weights. Dividing by the latter inflates the filtered
+    // variance, which keeps the luminance tolerance wide on later iterations
+    // and over-blurs detail that earlier passes had already resolved.
+    const float normalisedWeight = max(weightSum, 1e-8);
     outputReflection[pixel] = float4(
-        max(colourSum / max(weightSum, 1e-8), 0.0),
-        varianceSum / max(varianceWeightSum, 1e-8));
+        max(colourSum / normalisedWeight, 0.0),
+        varianceSum / (normalisedWeight * normalisedWeight));
 }

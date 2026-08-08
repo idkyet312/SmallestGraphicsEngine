@@ -575,36 +575,23 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
     hit = false;
     if (enhancedRTReflections == 0) return float3(0.0, 0.0, 0.0);
 
-    // Spatiotemporal blue-noise sample placement.
+    // Per-pixel hash, rotated per frame so consecutive frames draw different
+    // samples -- temporal accumulation is what turns that into a converged
+    // image.
     //
-    // A per-pixel hash gives WHITE noise: neighbouring pixels draw
-    // uncorrelated samples, so the error spectrum has energy at every spatial
-    // frequency including the low ones. Low-frequency error is precisely what
-    // a spatial filter cannot remove -- it survives as blotches -- and it is
-    // also what the eye is most sensitive to.
-    //
-    // Blue noise instead pushes the error into high spatial frequencies, where
-    // neighbouring pixels disagree in a structured way that averages out over
-    // a small kernel. That is what makes the à-trous pass effective at low
-    // sample counts.
-    //
-    // Implemented as a Cranley-Patterson rotation of the Hammersley sequence
-    // by a spatial blue-noise offset (R2 low-discrepancy lattice over pixel
-    // coordinates) plus a golden-ratio advance per frame. The R2 lattice is
-    // Roberts' generalisation of the golden ratio to 2D: cheap, needs no
-    // texture, and gives a well-distributed pattern across the screen.
-    const float kR2X = 0.7548776662466927;   // 1/phi2
-    const float kR2Y = 0.5698402909980532;   // 1/phi2^2
-    float2 blueNoise = frac(float2(kR2X * (float)pixel.x + kR2Y * (float)pixel.y,
-                                   kR2Y * (float)pixel.x + kR2X * (float)pixel.y));
-    // Golden-ratio increment per frame keeps successive frames maximally
-    // spread rather than repeating on a short cycle.
-    const float kGolden = 0.6180339887498949;
-    float temporalOffset = frac((float)enhancedFrameIndex * kGolden);
-
-    uint sampleIndex = enhancedFrameIndex & 63u;
+    // This is white noise, deliberately. An attempt to place samples on an R2
+    // low-discrepancy lattice produced a visible structured pattern in the
+    // reflection: the offset was built as a linear function of x and y, which
+    // is a plane rather than a high-frequency field, so it read as banding.
+    // Real blue noise needs a precomputed void-and-cluster mask; an analytic
+    // substitute that gets it wrong is worse than the hash, because
+    // structured error is far more visible than random error at the same
+    // magnitude.
+    uint pixelSeed = MatVarHashUint(pixel.x * 73856093u ^ pixel.y * 19349663u);
+    uint sampleIndex = (pixelSeed + enhancedFrameIndex) & 63u;
     float2 xi = Hammersley2D(sampleIndex, 64u);
-    xi = frac(xi + blueNoise + temporalOffset);
+    // Cheap per-pixel decorrelation of the first dimension too.
+    xi.x = frac(xi.x + (float)(pixelSeed & 0xffffu) * 1.52587890625e-5);
 
     float3 h = ImportanceSampleGGX(xi, normal, roughness);
     float3 rayDir = reflect(-viewDir, h);
@@ -720,23 +707,25 @@ float3 SVGF_TemporalAccumulate(float3 currentSample, uint2 pixel,
     float alpha = 1.0 / newCount;
 
     float3 blendedColor = lerp(prevColor.rgb, currentSample, alpha);
-    float3 blendedSq = lerp(prevMoments.rgb, currentSample * currentSample, alpha);
 
-    // Variance of the RAW per-frame samples, not of the converged mean.
+    // Moments use a FLOORED alpha, unlike the colour above.
     //
-    // blendedSq - blendedColor^2 measures how much the *running average*
-    // still moves, and after N frames of a 1/N EMA that is tiny by
-    // construction -- it shrinks as the estimate converges even when each
-    // individual sample is still extremely noisy. Feeding that to the à-trous
-    // luminance term collapses its tolerance to near zero, every neighbouring
-    // tap is rejected, and the spatial filter silently becomes a no-op that
-    // still costs its dispatches.
+    // With a pure 1/N blend the moments stop tracking as N grows, so
+    // E[x^2] - E[x]^2 decays toward zero even while each incoming sample is
+    // still very noisy. The à-trous luminance tolerance then collapses and the
+    // spatial pass turns itself off. Clamping alpha keeps the moments
+    // responsive to recent samples, which is what makes the variance describe
+    // the signal rather than the age of the average.
     //
-    // What the filter needs is the spread of the samples themselves. Compare
-    // this frame's sample against the running mean: that stays large while the
-    // signal is genuinely noisy and only falls when the samples agree.
-    float3 sampleDelta = currentSample - blendedColor;
-    variance = sampleDelta * sampleDelta;
+    // Deriving variance from the stored moments (rather than from this frame's
+    // deviation) also keeps it stable between frames: a per-frame delta swings
+    // with every new sample, and a filter width driven by that oscillates,
+    // which reads as flashing.
+    const float momentAlpha = max(alpha, 0.0625);
+    float3 blendedSq =
+        lerp(prevMoments.rgb, currentSample * currentSample, momentAlpha);
+    float3 momentMean = lerp(prevColor.rgb, currentSample, momentAlpha);
+    variance = max(blendedSq - momentMean * momentMean, 0.0);
 
     if (writeHistory) {
         svgfHistoryColorWrite[pixel] = float4(blendedColor, 0.0);
