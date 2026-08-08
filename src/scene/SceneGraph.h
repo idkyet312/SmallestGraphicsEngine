@@ -70,6 +70,13 @@ struct SceneMaterial {
 struct MeshPrimitive {
     std::vector<float> vertices; // Interleaved: Pos(3), Normal(3), Tex(2), Tangent(4) -> 12 floats per vertex
     std::vector<unsigned int> indices;
+    // Optional persistent identity for each indexed triangle. Destruction
+    // geometry carries its original chunk/local-triangle key through later
+    // material merges, while ordinary meshes leave this empty and use their
+    // current local triangle index. This is temporal metadata only; raster and
+    // shading still use the current index buffer and SV_PrimitiveID.
+    std::vector<unsigned int> stableTriangleIDs;
+    unsigned int stableTriangleNamespace = 0;
     int materialIndex = -1;
     std::shared_ptr<SceneMaterial> material;
 

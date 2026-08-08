@@ -218,6 +218,13 @@ RWTexture2D<float4> svgfHistoryMomentsWrite : register(u5);
 // lit output. RGB is the signal; alpha is matching signal variance. Zero for
 // pixels where RT reflections are not active.
 RWTexture2D<float4> outputReflectionSrc  : register(u6);
+
+// Enhanced-only temporal identity. SV_PrimitiveID stays local so it can index
+// the current geometry; this lookup preserves the authored triangle identity
+// when destruction rebuilds a primitive in a different order.
+StructuredBuffer<uint> stableTriangleIDs : register(t83);
+Texture2D<uint2> svgfStableSurfaceHistory : register(t84);
+RWTexture2D<uint2> svgfStableSurfaceCurrent : register(u7);
 #endif
 
 SamplerState              texSampler    : register(s0);
@@ -633,7 +640,7 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
 //
 // currentSample: this frame's raw-traced reflection radiance
 // pixel:         screen coordinate
-// currentVisID:  this pixel's instance ID (visValue.x)
+// currentSurfaceID: persistent namespace + authored triangle ID
 // writeHistory:  commit the blended result to the history textures.
 //
 // `writeHistory` exists because edge AA calls ShadeSurface TWICE for the same
@@ -646,7 +653,7 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
 //
 // Returns the denoised (temporally blended) reflection colour.
 float3 SVGF_TemporalAccumulate(float3 currentSample, uint2 pixel,
-                               uint2 currentVisID, bool writeHistory,
+                               uint2 currentSurfaceID, bool writeHistory,
                                out float3 variance) {
     // Reset paths below (no history, off-screen reprojection, surface-ID
     // mismatch) all fall through to this value. A pixel with NO history is the
@@ -686,11 +693,33 @@ float3 SVGF_TemporalAccumulate(float3 currentSample, uint2 pixel,
     previousPixel = clamp(previousPixel, int2(0, 0),
                           int2(screenWidth - 1, screenHeight - 1));
 
-    uint2 previousID = visBufferHistoryTex.Load(int3(previousPixel, 0));
-    // Reflection history uses strict instance+primitive identity. Reusing a
-    // different triangle from the same mesh smears high-frequency specular
-    // detail across folds and silhouettes.
-    if (any(previousID != currentVisID)) {
+    uint2 previousID = svgfStableSurfaceHistory.Load(
+        int3(previousPixel, 0));
+    // Rasterization can move a reprojected pixel across a shared triangle edge
+    // even when it still addresses the same physical surface. Requiring the
+    // primitive at exactly one texel therefore resets history across large
+    // triangulated planes during ordinary camera motion. Keep the namespace as
+    // the load-bearing identity and accept the current triangle from the four
+    // neighbouring history texels, matching the post TAA validity rule.
+    bool sameNamespace = previousID.x == currentSurfaceID.x;
+    bool sameTriangle = previousID.y == currentSurfaceID.y;
+    if (sameNamespace && !sameTriangle) {
+        const int2 identityOffsets[4] = {
+            int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+        [unroll]
+        for (int identityTap = 0; identityTap < 4; ++identityTap) {
+            int2 tap = clamp(previousPixel + identityOffsets[identityTap],
+                             int2(0, 0),
+                             int2(screenWidth - 1, screenHeight - 1));
+            uint2 neighbourID = svgfStableSurfaceHistory.Load(int3(tap, 0));
+            if (neighbourID.x == currentSurfaceID.x &&
+                neighbourID.y == currentSurfaceID.y) {
+                sameTriangle = true;
+                break;
+            }
+        }
+    }
+    if (!sameNamespace || !sameTriangle) {
         if (writeHistory) {
             svgfHistoryColorWrite[pixel] = float4(currentSample, 0.0);
             svgfHistoryMomentsWrite[pixel] =
@@ -1049,6 +1078,7 @@ struct ShadeResult {
 // twice for one pixel; see SVGF_TemporalAccumulate.
 #if SGE_ENHANCED_VISUALS
 ShadeResult ShadeSurface(uint2 pixel, Surface surface,
+                         uint2 stableSurfaceID,
                          bool commitTemporalHistory = true) {
 #else
 // Keep the unused defaulted parameter: dropping it changes the default
@@ -1141,7 +1171,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
             // accumulation count can damp that because half the frames never
             // reach the accumulator.
             reflectionIBL = SVGF_TemporalAccumulate(
-                thisFrameSample, pixel, visBuffer.Load(int3(pixel, 0)),
+                thisFrameSample, pixel, stableSurfaceID,
                 commitTemporalHistory, reflectionVariance);
         } else {
             reflectionIBL = thisFrameSample;
@@ -1298,6 +1328,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // previous frame would quietly inflate it.
     outputRayMask[pixel] = 0u;
     outputReflectionSrc[pixel] = 0.0;
+    svgfStableSurfaceCurrent[pixel] = uint2(0u, 0u);
 #endif
 
     if (debugViewMode == 2u) {
@@ -1377,6 +1408,12 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     
     // Load draw call data
     DrawCallData dc = drawCalls[drawCallID];
+#if SGE_ENHANCED_VISUALS
+    uint2 stableSurfaceID = uint2(
+        asuint(dc.useNormalMap),
+        stableTriangleIDs[asuint(dc.useTexture) + triangleID]);
+    svgfStableSurfaceCurrent[pixel] = stableSurfaceID;
+#endif
     const bool isFoliage =
         (dc.flags & 2u) != 0u && (dc.flags & 4u) == 0u;
     
@@ -1477,6 +1514,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                 float3 baryUsed = baryS;
                 float3 wp0s = wp0, wp1s = wp1, wp2s = wp2;
                 DrawCallData dcs = dc;
+                uint2 stableSurfaceS = stableSurfaceID;
                 bool isFoliageS = isFoliage;
                 float3 n0s = n0, n1s = n1, n2s = n2;
                 float2 uv0s = uv0, uv1s = uv1, uv2s = uv2;
@@ -1533,6 +1571,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                                 baryUsed = nBary;
                                 wp0s = nwp0; wp1s = nwp1; wp2s = nwp2;
                                 dcs = dcn;
+                                stableSurfaceS = uint2(
+                                    asuint(dcn.useNormalMap),
+                                    stableTriangleIDs[
+                                        asuint(dcn.useTexture) +
+                                        nbrTriangleID]);
                                 isFoliageS = (dcn.flags & 2u) != 0u &&
                                              (dcn.flags & 4u) == 0u;
                                 n0s = nn0; n1s = nn1; n2s = nn2;
@@ -1557,7 +1600,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                     uv0s, uv1s, uv2s, baryUsed);
                 // Sub-samples must not commit temporal history: two calls for
                 // one pixel would double-blend and double-advance the count.
-                ShadeResult srS = ShadeSurface(pixel, surfaceS, false);
+                ShadeResult srS = ShadeSurface(
+                    pixel, surfaceS, stableSurfaceS, false);
                 sampleColors[s] = srS.color;
                 sampleSpecular[s] = srS.specularIBL;
                 sampleSpecularVariance[s] = srS.specularVariance;
@@ -1644,7 +1688,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
             // corrupt the history the lit path is accumulating.
             float3 debugVariance;
             debugColor = SVGF_TemporalAccumulate(
-                sample, pixel, visBuffer.Load(int3(pixel, 0)), false,
+                sample, pixel, stableSurfaceID, false,
                 debugVariance);
         }
         outputColor[pixel] = float4(debugColor, 1.0);
@@ -1671,7 +1715,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
             float3 debugVariance = thisFrameSample * thisFrameSample;
             float3 reflIBL = svgfTemporalEnabled != 0
                 ? SVGF_TemporalAccumulate(thisFrameSample, pixel,
-                    visBuffer.Load(int3(pixel, 0)), false, debugVariance)
+                    stableSurfaceID, false, debugVariance)
                 : thisFrameSample;
             // Apply BRDF mirroring the lit path so the debug view matches
             // what the spatial filter receives.
@@ -1704,7 +1748,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
 
 #if SGE_ENHANCED_VISUALS
     if (!edgeAAApplied) {
-        ShadeResult sr = ShadeSurface(pixel, surface);
+        ShadeResult sr = ShadeSurface(pixel, surface, stableSurfaceID);
         outputColor[pixel] = float4(sr.color, 1.0);
         outputReflectionSrc[pixel] =
             float4(sr.specularIBL, sr.specularVariance);
@@ -1728,7 +1772,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         float3 centreSample = centreTraced;
         float3 centreVariance;
         SVGF_TemporalAccumulate(centreSample, pixel,
-                                visBuffer.Load(int3(pixel, 0)), true,
+                                stableSurfaceID, true,
                                 centreVariance);
     }
 #else

@@ -490,7 +490,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     const bool historyResourcesReady =
         vb.svgfHistoryColor[0] && vb.svgfHistoryColor[1] &&
         vb.svgfHistoryMoments[0] && vb.svgfHistoryMoments[1] &&
-        vb.svgfReflectionSrc;
+        vb.svgfReflectionSrc && vb.stableTriangleDataBuffer &&
+        vb.svgfStableSurfaceCurrent && vb.svgfStableSurfaceHistory;
     const bool atrousObjectsReady = vb.svgfAtrousPipelineReady &&
         vb.svgfAtrousPSO && vb.svgfAtrousRootSig &&
         vb.svgfCompositePSO && vb.svgfCompositeRootSig &&
@@ -502,6 +503,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ++rtxTest.framesObserved;
         const bool runtimeFrameGood =
             vb.enhancedResolveExecutedLastFrame &&
+            vb.svgfMotionVectorsEnabledLastFrame &&
             vb.svgfTemporalExecutedLastFrame &&
             vb.svgfAtrousExecutedLastFrame &&
             vb.svgfCompositeExecutedLastFrame &&
@@ -787,11 +789,15 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             testLine(enhancedHeapsReady,
                      "Enhanced descriptors for both frame slots");
             testLine(historyResourcesReady,
-                     "SVGF history, moments, and reflection resources");
+                     "SVGF history, stable IDs, moments, and reflection resources");
+            testLine(vb.persistentAuthoredTriangleCount > 0,
+                     "Persistent destruction triangle IDs uploaded");
             testLine(atrousObjectsReady,
                      "A-trous + composite shaders, PSOs, CBs, and heaps");
             testLine(vb.enhancedResolveExecutedLastFrame,
                      "Enhanced resolve recorded last frame");
+            testLine(vb.svgfMotionVectorsEnabledLastFrame,
+                     "Motion vectors generated for SVGF");
             if (vb.debugViewMode == 5 || vb.debugViewMode == 6) {
                 testLine(vb.svgfHistoryValid,
                          "Temporal history valid (paused in debug view)");

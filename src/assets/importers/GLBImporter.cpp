@@ -1463,6 +1463,19 @@ static std::shared_ptr<SceneNode> MergeSceneGeometry(
             for (unsigned int idx : src->indices) {
                 merged.indices.push_back(baseVertex + idx);
             }
+            const size_t triangleCount = src->indices.size() / 3u;
+            const size_t stableTriangleBase =
+                merged.stableTriangleIDs.size();
+            if (merged.stableTriangleNamespace == 0u)
+                merged.stableTriangleNamespace =
+                    src->stableTriangleNamespace;
+            for (size_t triangle = 0; triangle < triangleCount; ++triangle) {
+                merged.stableTriangleIDs.push_back(
+                    triangle < src->stableTriangleIDs.size()
+                        ? src->stableTriangleIDs[triangle]
+                        : static_cast<unsigned int>(
+                              stableTriangleBase + triangle));
+            }
         }
 
         GLBImporter::BuildMeshletData(merged, device.Get(), preserveMaterials);

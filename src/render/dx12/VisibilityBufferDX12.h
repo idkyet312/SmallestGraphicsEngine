@@ -25,6 +25,7 @@ static const UINT VB_MAX_DRAW_CALLS = MAX_DRAW_CALLS_PER_FRAME;
 static const UINT VB_MAX_VERTICES = 1024 * 1024;
 // Maximum total indices across all draw calls
 static const UINT VB_MAX_INDICES = 1024 * 1024 * 3;
+static const UINT VB_MAX_TRIANGLES = VB_MAX_INDICES / 3;
 static const UINT VB_CLUSTER_X = 16;
 static const UINT VB_CLUSTER_Y = 9;
 static const UINT VB_CLUSTER_Z = 10;
@@ -58,6 +59,8 @@ struct VBMeshData {
     UINT indexOffset = 0;
     UINT indexCount = 0;
     UINT hasIndices = 0;
+    UINT stableTriangleOffset = 0;
+    UINT stableTriangleNamespace = 0;
 };
 
 struct VBClusterData {
@@ -219,30 +222,34 @@ public:
     float enhancedShadowRayLength = 220.0f;
     // Stochastic ray-traced reflections. One GGX-importance-sampled ray per
     // pixel per frame, rotated by frame index -- deliberately noisy, because
-    // the temporal denoiser (Phase 5b) is what resolves it. Off by default.
+    // the temporal denoiser (Phase 5b) is what resolves it. The Scene startup
+    // setting enables this through SetEnhancedVisuals each frame.
     bool enhancedRTReflectionsActive = false;
     float enhancedReflectionRayLength = 120.0f;
     // Above this roughness the GGX lobe is wide enough that one sample per
     // frame is mostly variance and the environment probe is already close.
-    float enhancedReflectionRoughnessCut = 0.35f;
+    float enhancedReflectionRoughnessCut = 0.52f;
     // Radiance scale applied to an occluded reflection hit. Without a
     // hit-shading path this stands in for "something blocked the sky here".
     float enhancedReflectionOcclusion = 0.25f;
     UINT enhancedReflectionFrameCounter = 0;
     // SVGF temporal accumulation for RT reflections. Ping-pong history pair:
     // colour (E[x]), moments (E[x^2]) + sample count, one side read (SRV) and
-    // the other side written (UAV), swapped every frame. Off by default.
-    bool svgfTemporalEnabled = false;
+    // the other side written (UAV), swapped every frame. Enabled during the
+    // current RT/SVGF tuning pass.
+    bool svgfTemporalEnabled = true;
     UINT svgfMaxAccumFrames = 32;
     UINT svgfHistoryPing = 0;
     bool svgfHistoryValid = false;
     bool svgfTemporalEnabledLastFrame = false;
     ComPtr<ID3D12Resource> svgfHistoryColor[2];
     ComPtr<ID3D12Resource> svgfHistoryMoments[2];
+    ComPtr<ID3D12Resource> svgfStableSurfaceCurrent;
+    ComPtr<ID3D12Resource> svgfStableSurfaceHistory;
     // SVGF à-trous spatial filter (Phase 5c). Multi-iteration wavelet
     // filter applied to the specular IBL signal after the temporal pass
     // converges it in time. Ping-pong scratch pair for the iterations.
-    bool svgfAtrousEnabled = false;
+    bool svgfAtrousEnabled = true;
     UINT svgfAtrousIterations = 5;
     UINT svgfAtrousDiagnosticMode = 0;
     static constexpr UINT kSVGFAtrousMaxIterations = 5;
@@ -266,6 +273,7 @@ public:
     bool svgfTemporalExecutedLastFrame = false;
     bool svgfAtrousExecutedLastFrame = false;
     bool svgfCompositeExecutedLastFrame = false;
+    bool svgfMotionVectorsEnabledLastFrame = false;
     UINT svgfAtrousDispatchesLastFrame = 0;
     // TLAS this frame. Re-registered whenever it changes, since the
     // acceleration structure is rebuilt as geometry streams in.
@@ -303,6 +311,8 @@ public:
     ComPtr<ID3D12Resource> vertexDataUpload;
     ComPtr<ID3D12Resource> indexDataBuffer;       // StructuredBuffer<uint>
     ComPtr<ID3D12Resource> indexDataUpload;
+    ComPtr<ID3D12Resource> stableTriangleDataBuffer;
+    ComPtr<ID3D12Resource> stableTriangleDataUpload;
     ComPtr<ID3D12Resource> clusterDataBuffer;     // StructuredBuffer<ClusterData>
     ComPtr<ID3D12Resource> clusterDataUpload;
     ComPtr<ID3D12Resource> materialDataBuffer;
@@ -320,6 +330,7 @@ public:
     std::vector<VBDrawCallData> cpuDrawCalls;
     std::vector<VBPackedVertex> cpuVertices;
     std::vector<UINT>           cpuIndices;
+    std::vector<UINT>           cpuStableTriangleIDs;
     std::vector<VBClusterData>  cpuClusters;
     std::vector<XMFLOAT4X4>     previousModels;
     std::unordered_map<uint64_t, XMFLOAT4X4> previousModelByInstance;
@@ -335,13 +346,15 @@ public:
     UINT drawCallDirtyMax = 0;
     UINT persistentVertexCount = 0;
     UINT persistentIndexCount = 0;
+    UINT persistentTriangleCount = 0;
+    UINT persistentAuthoredTriangleCount = 0;
     bool geometryUploaded = false;
     bool geometryDirty = false;
     UINT postFrameIndex = 0;
     float exposure = 1.15f;
     float bloomStrength = 0.16f;
     float vignetteStrength = 0.50f;
-    float grainStrength = 0.012f;
+    float grainStrength = 0.0f;
     float taaFeedback = 0.86f;
     bool temporalEffectsEnabled = false;
     bool temporalHistoryValid = false;
@@ -413,6 +426,7 @@ public:
         cpuDrawCalls.resize(VB_MAX_DRAW_CALLS);
         cpuVertices.resize(VB_MAX_VERTICES);
         cpuIndices.resize(VB_MAX_INDICES);
+        cpuStableTriangleIDs.resize(VB_MAX_TRIANGLES);
         cpuClusters.resize(VB_CLUSTER_COUNT);
         previousModels.resize(VB_MAX_DRAW_CALLS);
         if (mappedMaterials) mappedMaterials[0] = VBMaterialData{};
@@ -505,10 +519,17 @@ public:
     // every frame instead of duplicating vertices per draw.
     UINT RegisterMesh(const float* vertexData, UINT vertexCount,
                       const UINT* indexData, UINT indexCount,
-                      UINT vertexStrideFloats = 8) {
+                      UINT vertexStrideFloats = 8,
+                      const UINT* stableTriangleIDs = nullptr,
+                      UINT stableTriangleCount = 0,
+                      UINT stableTriangleNamespace = 0) {
+        const UINT triangleCount = indexData && indexCount > 0
+            ? indexCount / 3u : vertexCount / 3u;
         if (!vertexData || vertexCount == 0 ||
             persistentVertexCount + vertexCount > VB_MAX_VERTICES ||
-            persistentIndexCount + indexCount > VB_MAX_INDICES) {
+            persistentIndexCount + indexCount > VB_MAX_INDICES ||
+            persistentTriangleCount + triangleCount > VB_MAX_TRIANGLES ||
+            (stableTriangleIDs && stableTriangleCount != triangleCount)) {
             return VB_INVALID_MESH;
         }
 
@@ -518,6 +539,8 @@ public:
         mesh.indexOffset = persistentIndexCount;
         mesh.indexCount = indexCount;
         mesh.hasIndices = (indexData && indexCount > 0) ? 1u : 0u;
+        mesh.stableTriangleOffset = persistentTriangleCount;
+        mesh.stableTriangleNamespace = stableTriangleNamespace;
 
         for (UINT i = 0; i < vertexCount; ++i) {
             const float* v = vertexData + i * vertexStrideFloats;
@@ -529,9 +552,16 @@ public:
             memcpy(cpuIndices.data() + persistentIndexCount, indexData,
                    indexCount * sizeof(UINT));
         }
+        for (UINT triangle = 0; triangle < triangleCount; ++triangle) {
+            cpuStableTriangleIDs[persistentTriangleCount + triangle] =
+                stableTriangleIDs ? stableTriangleIDs[triangle] : triangle;
+        }
 
         persistentVertexCount += vertexCount;
         persistentIndexCount += indexCount;
+        persistentTriangleCount += triangleCount;
+        if (stableTriangleIDs)
+            persistentAuthoredTriangleCount += triangleCount;
         meshes.push_back(mesh);
         geometryDirty = true;
         return static_cast<UINT>(meshes.size() - 1);
@@ -553,7 +583,11 @@ public:
         const UINT mesh = RegisterMesh(primitive->vertices.data(),
             static_cast<UINT>(primitive->vertices.size() / 12),
             primitive->indices.empty() ? nullptr : primitive->indices.data(),
-            static_cast<UINT>(primitive->indices.size()), 12);
+            static_cast<UINT>(primitive->indices.size()), 12,
+            primitive->stableTriangleIDs.empty()
+                ? nullptr : primitive->stableTriangleIDs.data(),
+            static_cast<UINT>(primitive->stableTriangleIDs.size()),
+            primitive->stableTriangleNamespace);
         if (mesh != VB_INVALID_MESH) {
             primitiveMeshLookup.emplace(primitive, mesh);
             primitive->visibilityMeshID = mesh;
@@ -577,10 +611,11 @@ public:
 
         XMMATRIX transposed = XMMatrixTranspose(modelMatrix);
         XMStoreFloat4x4(&next.modelMatrix, transposed);
-        auto previous = temporalEffectsEnabled && instanceKey
+        const bool motionVectorsRequired = MotionVectorsRequired();
+        auto previous = motionVectorsRequired && instanceKey
             ? previousModelByInstance.find(instanceKey)
             : previousModelByInstance.end();
-        if (!temporalEffectsEnabled) {
+        if (!motionVectorsRequired) {
             next.previousModelMatrix = next.modelMatrix;
         } else if (previous != previousModelByInstance.end()) {
             next.previousModelMatrix = previous->second;
@@ -590,14 +625,26 @@ public:
             next.previousModelMatrix = next.modelMatrix;
         }
         previousModels[dcID] = next.modelMatrix;
-        if (temporalEffectsEnabled && instanceKey)
+        if (motionVectorsRequired && instanceKey)
             previousModelByInstance[instanceKey] = next.modelMatrix;
 
         next.objectColor = color;
-        next.useTexture = 0.0f;
+        // These two legacy float fields are unused by the resolve. Preserve
+        // the cbuffer layout, but carry the enhanced-only stable surface map
+        // metadata in their exact uint bit patterns.
+        UINT stableNamespace = mesh.stableTriangleNamespace;
+        if (stableNamespace == 0u) {
+            uint64_t identity = instanceKey != 0
+                ? instanceKey
+                : (static_cast<uint64_t>(meshID + 1u) << 32u) |
+                      static_cast<uint64_t>(materialID + 1u);
+            stableNamespace = static_cast<UINT>(identity ^ (identity >> 32u));
+            if (stableNamespace == 0u) stableNamespace = 1u;
+        }
+        memcpy(&next.useTexture, &mesh.stableTriangleOffset, sizeof(UINT));
         next.metalness = metalness;
         next.roughness = roughness;
-        next.useNormalMap = 0.0f;
+        memcpy(&next.useNormalMap, &stableNamespace, sizeof(UINT));
         next.materialID = materialID;
         next.vertexOffset = mesh.vertexOffset;
         next.indexOffset = mesh.indexOffset;
@@ -639,8 +686,8 @@ public:
         // Geometry changes only when a mesh is added. DEFAULT buffers stay SRVs
         // between frames, eliminating per-instance vertex/index uploads.
         if (geometryDirty && geometryUploaded) {
-            D3D12_RESOURCE_BARRIER geometryToCopy[2] = {};
-            for (UINT i = 0; i < 2; ++i) {
+            D3D12_RESOURCE_BARRIER geometryToCopy[3] = {};
+            for (UINT i = 0; i < 3; ++i) {
                 geometryToCopy[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                 geometryToCopy[i].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 geometryToCopy[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -648,7 +695,9 @@ public:
             }
             geometryToCopy[0].Transition.pResource = vertexDataBuffer.Get();
             geometryToCopy[1].Transition.pResource = indexDataBuffer.Get();
-            cmdList->ResourceBarrier(2, geometryToCopy);
+            geometryToCopy[2].Transition.pResource =
+                stableTriangleDataBuffer.Get();
+            cmdList->ResourceBarrier(3, geometryToCopy);
         }
 
 
@@ -688,8 +737,21 @@ public:
                 indexDataUpload.Get(), 0, persistentIndexCount * sizeof(UINT));
         }
 
+        if (geometryDirty && persistentTriangleCount > 0) {
+            void* mapped = nullptr;
+            D3D12_RANGE readRange = { 0, 0 };
+            stableTriangleDataUpload->Map(0, &readRange, &mapped);
+            memcpy(mapped, cpuStableTriangleIDs.data(),
+                persistentTriangleCount * sizeof(UINT));
+            stableTriangleDataUpload->Unmap(0, nullptr);
+
+            cmdList->CopyBufferRegion(stableTriangleDataBuffer.Get(), 0,
+                stableTriangleDataUpload.Get(), 0,
+                persistentTriangleCount * sizeof(UINT));
+        }
+
         // Barriers: transition structured buffers from copy dest to SRV
-        D3D12_RESOURCE_BARRIER barriers[4] = {};
+        D3D12_RESOURCE_BARRIER barriers[5] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = drawCallBuffer.Get();
         barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -705,7 +767,9 @@ public:
             barriers[2].Transition.pResource = vertexDataBuffer.Get();
             barriers[3] = barriers[0];
             barriers[3].Transition.pResource = indexDataBuffer.Get();
-            barrierCount = 4;
+            barriers[4] = barriers[0];
+            barriers[4].Transition.pResource = stableTriangleDataBuffer.Get();
+            barrierCount = 5;
             geometryUploaded = true;
             geometryDirty = false;
         }
@@ -888,7 +952,11 @@ public:
         fc.nearPlane = nearPlane;
         fc.farPlane = farPlane;
         fc.debugViewMode = static_cast<UINT>(debugViewMode);
-        fc.enableMotionVectors = temporalEffectsEnabled ? 1u : 0u;
+        const bool motionVectorsRequired = MotionVectorsRequired();
+        fc.enableMotionVectors = motionVectorsRequired ? 1u : 0u;
+        svgfMotionVectorsEnabledLastFrame =
+            motionVectorsRequired && enhancedVisualsActive &&
+            enhancedRTReflectionsActive && svgfTemporalEnabled;
         fc.edgeAAEnabled = edgeAAEnabled ? 1u : 0u;
         fc.palmWind = palmWindFrame.wind;
         fc.palmPrimary = palmWindFrame.primary;
@@ -1002,6 +1070,34 @@ public:
 
         // Transition SVGF write-side history back to SRV for next frame.
         if (svgfWillWriteHistory) {
+            D3D12_RESOURCE_BARRIER stableToCopy[2] = {};
+            for (UINT i = 0; i < 2; ++i) {
+                stableToCopy[i].Type =
+                    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                stableToCopy[i].Transition.Subresource =
+                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            }
+            stableToCopy[0].Transition.pResource =
+                svgfStableSurfaceCurrent.Get();
+            stableToCopy[0].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            stableToCopy[0].Transition.StateAfter =
+                D3D12_RESOURCE_STATE_COPY_SOURCE;
+            stableToCopy[1].Transition.pResource =
+                svgfStableSurfaceHistory.Get();
+            stableToCopy[1].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            stableToCopy[1].Transition.StateAfter =
+                D3D12_RESOURCE_STATE_COPY_DEST;
+            cmdList->ResourceBarrier(2, stableToCopy);
+            cmdList->CopyResource(svgfStableSurfaceHistory.Get(),
+                                  svgfStableSurfaceCurrent.Get());
+            std::swap(stableToCopy[0].Transition.StateBefore,
+                      stableToCopy[0].Transition.StateAfter);
+            std::swap(stableToCopy[1].Transition.StateBefore,
+                      stableToCopy[1].Transition.StateAfter);
+            cmdList->ResourceBarrier(2, stableToCopy);
+
             D3D12_RESOURCE_BARRIER svgfBarriers[2] = {};
             for (UINT i = 0; i < 2; ++i) {
                 svgfBarriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1779,6 +1875,8 @@ public:
         svgfHistoryColor[1].Reset();
         svgfHistoryMoments[0].Reset();
         svgfHistoryMoments[1].Reset();
+        svgfStableSurfaceCurrent.Reset();
+        svgfStableSurfaceHistory.Reset();
         // À-trous scratch and the reflection source are screen-sized too, so
         // they must be released here or the next Init recreates everything
         // else at the new resolution while these keep the old dimensions --
@@ -1788,6 +1886,7 @@ public:
         svgfAtrousScratch[1].Reset();
         svgfHistoryPing = 0;
         svgfHistoryValid = false;
+
         exposureState.Reset();
         temporalHistoryValid = false;
         exposureReadable = false;
@@ -1842,6 +1941,16 @@ public:
     }
 
 private:
+    bool MotionVectorsRequired() const {
+        // TAA owns post-process history, but SVGF independently needs the
+        // visibility motion buffer to reproject reflection history. Capture
+        // mode deliberately disables TAA, so tying this data to the TAA switch
+        // pins SVGF history to screen space as soon as the camera moves.
+        return temporalEffectsEnabled ||
+            (enhancedVisualsActive && enhancedRTReflectionsActive &&
+             svgfTemporalEnabled);
+    }
+
     bool CreateVisBufferRT() {
         D3D12_HEAP_PROPERTIES heapProps = {};
         heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -2046,6 +2155,25 @@ private:
         svgfHistoryPing = 0;
         svgfHistoryValid = false;
 
+        // The visibility target keeps local SV_PrimitiveID for vertex lookup.
+        // SVGF writes a separate persistent key so destruction can regroup the
+        // same source triangles without invalidating their temporal identity.
+        desc.Format = DXGI_FORMAT_R32G32_UINT;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        hr = g_dx12.device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(&svgfStableSurfaceCurrent));
+        if (FAILED(hr)) return false;
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        hr = g_dx12.device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+            IID_PPV_ARGS(&svgfStableSurfaceHistory));
+        if (FAILED(hr)) return false;
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
         // SVGF à-trous: specular IBL output from the resolve + ping-pong scratch.
         // The reflection src is written by the enhanced resolve as a UAV and
         // read by the à-trous pass as an SRV. Scratch textures alternate state
@@ -2154,6 +2282,11 @@ private:
 
         if (!CreateDefaultAndUpload(VB_MAX_INDICES * sizeof(UINT),
                                      indexDataBuffer, indexDataUpload))
+            return false;
+
+        if (!CreateDefaultAndUpload(VB_MAX_TRIANGLES * sizeof(UINT),
+                                     stableTriangleDataBuffer,
+                                     stableTriangleDataUpload))
             return false;
 
         if (!CreateDefaultAndUpload(VB_CLUSTER_COUNT * sizeof(VBClusterData),
@@ -2572,7 +2705,10 @@ private:
         //   [92]     u4       svgf colour write        (Phase 5b)
         //   [93]     u5       svgf moments write       (Phase 5b)
         //   [94]     u6       reflection src           (Phase 5c)
-        D3D12_DESCRIPTOR_RANGE ranges[12] = {};
+        //   [95]     t83      local-to-stable triangle map
+        //   [96]     t84      stable surface history
+        //   [97]     u7       current stable surfaces
+        D3D12_DESCRIPTOR_RANGE ranges[15] = {};
         ranges[0] = baseRanges[0];                          // t0..t78
         ranges[1] = baseRanges[1];                          // u0..u2 @ 79
         ranges[2] = baseRanges[2];                          // b1..b4 @ 82
@@ -2630,6 +2766,24 @@ private:
         ranges[11].BaseShaderRegister = 6;                  // u6 outputReflectionSrc
         ranges[11].RegisterSpace = 0;
         ranges[11].OffsetInDescriptorsFromTableStart = 94;
+
+        ranges[12].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[12].NumDescriptors = 1;
+        ranges[12].BaseShaderRegister = 83;
+        ranges[12].RegisterSpace = 0;
+        ranges[12].OffsetInDescriptorsFromTableStart = 95;
+
+        ranges[13].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[13].NumDescriptors = 1;
+        ranges[13].BaseShaderRegister = 84;
+        ranges[13].RegisterSpace = 0;
+        ranges[13].OffsetInDescriptorsFromTableStart = 96;
+
+        ranges[14].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[14].NumDescriptors = 1;
+        ranges[14].BaseShaderRegister = 7;
+        ranges[14].RegisterSpace = 0;
+        ranges[14].OffsetInDescriptorsFromTableStart = 97;
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -3192,7 +3346,7 @@ private:
         if (!enhancedComputeDescHeaps[frameSlot]) {
             D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
             heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            heapDesc.NumDescriptors = 95;   // 86 mirrored + 9 appended (5c adds u6)
+            heapDesc.NumDescriptors = 98;
             heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             if (FAILED(g_dx12.device->CreateDescriptorHeap(
                     &heapDesc,
@@ -3323,6 +3477,45 @@ private:
             h.ptr += (UINT64)descSize * 94;
             g_dx12.device->CreateUnorderedAccessView(
                 svgfReflectionSrc.Get(), nullptr, &uav, h);
+        }
+
+        // [95] t83 - current primitive index to persistent triangle ID.
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_UNKNOWN;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Buffer.FirstElement = 0;
+            srv.Buffer.NumElements = VB_MAX_TRIANGLES;
+            srv.Buffer.StructureByteStride = sizeof(UINT);
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 95;
+            g_dx12.device->CreateShaderResourceView(
+                stableTriangleDataBuffer.Get(), &srv, h);
+        }
+
+        // [96] t84 - last committed stable surface key.
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R32G32_UINT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 96;
+            g_dx12.device->CreateShaderResourceView(
+                svgfStableSurfaceHistory.Get(), &srv, h);
+        }
+
+        // [97] u7 - stable key emitted by this enhanced resolve.
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = DXGI_FORMAT_R32G32_UINT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 97;
+            g_dx12.device->CreateUnorderedAccessView(
+                svgfStableSurfaceCurrent.Get(), nullptr, &uav, h);
         }
         enhancedHeapTLASAddresses[frameSlot] = enhancedTLASAddress;
     }

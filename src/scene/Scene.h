@@ -424,8 +424,8 @@ struct Scene {
     bool useRaytracing       = false; // DXR raytracing mode
 
     // Upgraded visuals: the hybrid ray-traced tier layered on top of the
-    // visibility buffer. Off by default because it costs several ms and needs
-    // DXR Tier 1.1 (inline RayQuery) -- EnhancedVisualsAvailable() gates it on
+    // visibility buffer. Temporarily on by default while the RT/SVGF path is
+    // being tuned; DXR Tier 1.1 (inline RayQuery) still gates it on
     // the hardware actually reporting that. Everything under this flag degrades
     // to the existing raster path when it is off, so the default frame is
     // byte-for-byte what it was before.
@@ -434,19 +434,19 @@ struct Scene {
     // everything": screen-space, probes and temporal history resolve most
     // pixels, and rays are spent only where those report low confidence. See
     // enhancedRayFraction for what that costs in practice.
-    bool enhancedVisuals     = false;
+    bool enhancedVisuals     = true;
     // Sub-toggles, so the expensive parts can be bisected when profiling. Each
     // is a no-op unless enhancedVisuals is on.
     bool enhancedRTShadows   = true;   // RayQuery sun shadows, replaces CSM
     bool enhancedRayClassify = true;   // Spend rays only on low-confidence pixels
-    // Stochastic RT reflections: one GGX ray per pixel per frame. Off by
-    // default -- the raw signal is noisy on purpose and wants the Phase 5b
-    // temporal denoiser to resolve it.
-    bool enhancedRTReflections = false;
+    // Stochastic RT reflections: one GGX ray per pixel per frame. Enabled for
+    // the current SVGF tuning pass; the raw signal is noisy on purpose and
+    // wants the temporal denoiser to resolve it.
+    bool enhancedRTReflections = true;
     // Confidence below which a pixel is handed to RT. Raising it traces more
     // pixels (better, slower). Live-tunable so the split can be dialled in
     // against a real scene rather than guessed.
-    float enhancedConfidenceThreshold = 0.35f;
+    float enhancedConfidenceThreshold = 1.0f;
     // Read back from the classify pass: fraction of pixels routed to RT last
     // frame. Displayed in the UI as the headline "is classification earning its
     // keep" number -- expect 0.05-0.20 on typical scenes.

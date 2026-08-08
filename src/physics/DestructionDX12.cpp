@@ -34,6 +34,7 @@ using namespace Nv::Blast;
 
 namespace {
 constexpr uint32_t InvalidIndex = 0xFFFFFFFFu;
+constexpr uint32_t DestructionTriangleNamespace = 0x44535452u; // "DSTR"
 constexpr uint32_t MaxAwakeDebrisBodies = 256;
 constexpr float StructuralSolverStep = 1.0f / 15.0f;
 constexpr double StructuralSolverBudgetMs = 0.35;
@@ -48,6 +49,22 @@ constexpr uint64_t CollisionCategoryLodDebris = PhysicsImpactPolicy::LodDebris;
 constexpr uint64_t CollisionCategoryBarrel = PhysicsImpactPolicy::Barrel;
 constexpr uint64_t CollisionCategoryRagdoll = PhysicsImpactPolicy::Ragdoll;
 constexpr uint64_t CollisionCategoryVehicle = PhysicsImpactPolicy::Vehicle;
+
+uint32_t StableDestructionTriangleID(uint32_t ownerNamespace,
+                                     uint32_t chunkIndex,
+                                     uint32_t primitiveIndex,
+                                     uint32_t triangleIndex) {
+    uint32_t hash = 2166136261u;
+    auto mix = [&](uint32_t value) {
+        hash ^= value;
+        hash *= 16777619u;
+    };
+    mix(ownerNamespace);
+    mix(chunkIndex + 1u);
+    mix(primitiveIndex + 1u);
+    mix(triangleIndex + 1u);
+    return hash != 0u ? hash : 1u;
+}
 constexpr uint64_t CollisionCategoryGrenade = PhysicsImpactPolicy::Grenade;
 // Uniform starting health for every bond/chunk. A bullet's per-hit damage is a
 // fraction of this, so a joint takes several hits before it lets go.
@@ -1133,6 +1150,14 @@ struct DestructionDX12::Impl {
     bool BuildChunks() {
         if (!source || !device) return false;
 
+        // Fold this object's lifetime-stable identity into every authored
+        // triangle key. Later material/spatial merges retain those keys, while
+        // another destructible made from the same mesh still gets distinct IDs.
+        const uintptr_t owner = reinterpret_cast<uintptr_t>(this);
+        uint32_t triangleNamespace = static_cast<uint32_t>(
+            owner ^ (owner >> 32u) ^ 0x44535452u);
+        if (triangleNamespace == 0u) triangleNamespace = 1u;
+
         auto buildChunkResources = [&]() {
             if (chunks.empty()) return false;
             std::atomic<size_t> nextChunk{0};
@@ -1203,11 +1228,24 @@ struct DestructionDX12::Impl {
                 chunk.maximum = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
                 chunk.node = std::make_shared<SceneNode>("VoronoiChunk");
                 chunk.node->mesh = std::make_shared<SceneMesh>();
+                uint32_t sourcePrimitiveIndex = 0;
                 for (const MeshPrimitive& sourcePrimitive : sourceChunk->mesh->primitives) {
                     if (sourcePrimitive.indices.empty()) continue;
                     MeshPrimitive primitive;
                     primitive.vertices = sourcePrimitive.vertices;
                     primitive.indices = sourcePrimitive.indices;
+                    primitive.stableTriangleNamespace =
+                        DestructionTriangleNamespace;
+                    const uint32_t triangleCount =
+                        static_cast<uint32_t>(primitive.indices.size() / 3u);
+                    primitive.stableTriangleIDs.reserve(triangleCount);
+                    for (uint32_t triangle = 0; triangle < triangleCount;
+                         ++triangle) {
+                        primitive.stableTriangleIDs.push_back(
+                            StableDestructionTriangleID(
+                                triangleNamespace, chunkIndex,
+                                sourcePrimitiveIndex, triangle));
+                    }
                     primitive.material = sourcePrimitive.material;
                     primitive.materialIndex = sourcePrimitive.materialIndex;
                     for (size_t v = 0; v + 11 < primitive.vertices.size(); v += 12) {
@@ -1221,6 +1259,7 @@ struct DestructionDX12::Impl {
                             primitive.vertices[v + 1], primitive.vertices[v + 2] });
                     }
                     chunk.node->mesh->primitives.push_back(std::move(primitive));
+                    ++sourcePrimitiveIndex;
                 }
                 if (chunk.minimum.x == FLT_MAX) continue;
                 if (simpleRoofBox && !chunk.collisionPoints.empty()) {
@@ -1313,12 +1352,20 @@ struct DestructionDX12::Impl {
                 MeshPrimitive& dst = cell.primitives[material];
                 dst.material = src.material;
                 dst.materialIndex = src.materialIndex;
+                dst.stableTriangleNamespace =
+                    DestructionTriangleNamespace;
                 for (UINT sourceIndex : { i0, i1, i2 }) {
                     const UINT newIndex = (UINT)(dst.vertices.size() / 12);
                     const float* vertex = &src.vertices[(size_t)sourceIndex * 12];
                     dst.vertices.insert(dst.vertices.end(), vertex, vertex + 12);
                     dst.indices.push_back(newIndex);
                 }
+                dst.stableTriangleIDs.push_back(
+                    StableDestructionTriangleID(
+                        triangleNamespace,
+                        static_cast<uint32_t>(nearestSite),
+                        static_cast<uint32_t>(material),
+                        static_cast<uint32_t>(tri / 3u)));
                 cell.occupied = true;
             }
         }
