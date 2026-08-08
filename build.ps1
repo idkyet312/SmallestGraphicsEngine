@@ -3,11 +3,24 @@ param(
     [string]$Configuration = "Release",
     [ValidateRange(1, 256)]
     [int]$Jobs = [Environment]::ProcessorCount,
-    [switch]$NoRun
+    [switch]$NoRun,
+    # Build the agent worktree (../Engine-Agent) instead of this checkout.
+    # That tree holds in-progress feature branches, so its build/ is separate
+    # and this checkout is left untouched.
+    [switch]$Agent
 )
 
 $ErrorActionPreference = "Stop"
-$projectDir = $PSScriptRoot
+if ($Agent) {
+    $projectDir = Join-Path (Split-Path -Parent $PSScriptRoot) "Engine-Agent"
+    if (-not (Test-Path -LiteralPath (Join-Path $projectDir "CMakeLists.txt"))) {
+        Write-Error "Agent worktree not found at $projectDir. Create it with: git worktree add ../Engine-Agent <branch>"
+    }
+    $branch = (& git -C $projectDir rev-parse --abbrev-ref HEAD 2>$null)
+    Write-Host "Agent worktree: $projectDir ($branch)" -ForegroundColor Yellow
+} else {
+    $projectDir = $PSScriptRoot
+}
 $buildDir = Join-Path $projectDir "build"
 
 $cmakeCommand = Get-Command cmake.exe -ErrorAction SilentlyContinue
