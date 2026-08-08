@@ -944,6 +944,55 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ImGui::TextDisabled("Enhanced Visuals: SM6.5 resolve unavailable");
                 ImGui::TextDisabled("  (dxcompiler.dll missing or compile failed)");
             } else {
+                // One switch for every RT effect at once, for A/B comparison.
+                //
+                // scene.enhancedVisuals alone only stops the enhanced resolve
+                // from running; the individual toggles keep whatever state they
+                // had. This remembers them, clears them all, and restores them
+                // on the way back, so flipping RT off and on returns to the
+                // exact configuration rather than to the defaults.
+                static bool rtMasterSaved = false;
+                static bool savedRTShadows = false;
+                static bool savedRTReflections = false;
+                static bool savedProbeMissGI = false;
+                static bool savedReflClassify = false;
+                static bool savedRayClassify = false;
+                static bool savedSvgfTemporal = false;
+                static bool savedSvgfAtrous = false;
+                bool rtEffectsOn = scene.enhancedVisuals;
+                if (ImGui::Checkbox("All RT Effects", &rtEffectsOn)) {
+                    if (!rtEffectsOn) {
+                        savedRTShadows = scene.enhancedRTShadows;
+                        savedRTReflections = scene.enhancedRTReflections;
+                        savedProbeMissGI = vb.enhancedProbeMissGIActive;
+                        savedReflClassify = vb.enhancedReflectionClassifyActive;
+                        savedRayClassify = scene.enhancedRayClassify;
+                        savedSvgfTemporal = vb.svgfTemporalEnabled;
+                        savedSvgfAtrous = vb.svgfAtrousEnabled;
+                        rtMasterSaved = true;
+                        scene.enhancedRTShadows = false;
+                        scene.enhancedRTReflections = false;
+                        vb.enhancedProbeMissGIActive = false;
+                        scene.enhancedVisuals = false;
+                    } else {
+                        scene.enhancedVisuals = true;
+                        if (rtMasterSaved) {
+                            scene.enhancedRTShadows = savedRTShadows;
+                            scene.enhancedRTReflections = savedRTReflections;
+                            vb.enhancedProbeMissGIActive = savedProbeMissGI;
+                            vb.enhancedReflectionClassifyActive =
+                                savedReflClassify;
+                            scene.enhancedRayClassify = savedRayClassify;
+                            vb.svgfTemporalEnabled = savedSvgfTemporal;
+                            vb.svgfAtrousEnabled = savedSvgfAtrous;
+                        }
+                    }
+                    // SetEnhancedVisuals already clears svgfHistoryValid when
+                    // the active state or the reflection toggle changes, so the
+                    // history reset comes for free on the next frame.
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled(rtEffectsOn ? "(on)" : "(off)");
                 ImGui::Checkbox("Enhanced Visuals (RT)", &scene.enhancedVisuals);
                 if (scene.enhancedVisuals) {
                     if (vb.validationMode) {
@@ -960,6 +1009,14 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                             0.05f, 1.0f, "%.2f");
                         ImGui::TextDisabled(
                             "  1 GGX ray/pixel/frame: noisy by design.");
+                    }
+                    // RT GI, reflection classification and SVGF are siblings of
+                    // RT Reflections, not children of it. They were nested
+                    // inside its `if`, which hid and disabled all three
+                    // whenever reflections were switched off -- GI in
+                    // particular traces its own bounce ray and has nothing to
+                    // do with the reflection path.
+                    {
                         ImGui::Checkbox("  RT GI (probe misses)",
                                         &vb.enhancedProbeMissGIActive);
                         if (vb.enhancedProbeMissGIActive) {
@@ -991,9 +1048,13 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                                 g_profiler.GpuScopeMs("VB Resolve"),
                                 vb.EnhancedGIRayFraction() * 100.0f);
                         }
-                        ImGui::Checkbox("  Refl Ray Classification",
-                                        &vb.enhancedReflectionClassifyActive);
-                        if (vb.enhancedReflectionClassifyActive) {
+                        // This one really does gate reflection rays, so it stays
+                        // tied to the reflection toggle.
+                        if (scene.enhancedRTReflections)
+                            ImGui::Checkbox("  Refl Ray Classification",
+                                            &vb.enhancedReflectionClassifyActive);
+                        if (scene.enhancedRTReflections &&
+                            vb.enhancedReflectionClassifyActive) {
                             ImGui::SliderFloat("  Refl Confidence Cut",
                                 &vb.enhancedReflectionConfidenceCut,
                                 0.05f, 1.0f, "%.2f");

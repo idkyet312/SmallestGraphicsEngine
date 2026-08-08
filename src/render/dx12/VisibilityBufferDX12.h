@@ -236,14 +236,20 @@ public:
     // expected to be wrong. Rough and face-on pixels score high confidence and
     // keep the probe; grazing near-mirror pixels score low and get a ray.
     bool enhancedReflectionClassifyActive = false;
-    // 0.8 from measurement, not theory: below this the classified reflection
-    // fraction drops without the probe visibly taking over on surfaces that
-    // wanted a ray. 0.5 was too aggressive and gave the probe pixels a mirror
-    // should have traced.
-    float enhancedReflectionConfidenceCut = 0.8f;
+    // Trace only where confidence in the probe is below this. 0.8 was measured
+    // when a ray hit returned dimmed sky rather than real surface colour, and
+    // 0.5 was rejected then for handing the probe pixels a mirror should have
+    // traced. Now that hits shade from the actual geometry, a traced pixel is
+    // worth more than it was and a probe pixel costs more by comparison, so the
+    // tighter cut is worth spending fewer rays on: they go to the grazing
+    // near-mirror pixels where the probe is most obviously wrong.
+    float enhancedReflectionConfidenceCut = 0.5f;
     // Trace a diffuse bounce where the sparse probe grid reports a miss. Those
     // pixels otherwise keep sky ambient only and lose all bounce light.
-    bool enhancedProbeMissGIActive = false;
+    // On by default now that ray hits shade from real geometry: before that a
+    // traced bounce returned dimmed sky and was not worth the ray. Falls back
+    // to the probe grid wherever the acceleration structure has no binding.
+    bool enhancedProbeMissGIActive = true;
     // 0 = fill probe misses only (cheapest, rays only where the grid failed),
     // 1 = full RT GI (every pixel traces, probes unused).
     // How much of the GI comes from rays rather than probes. 0 traces only
