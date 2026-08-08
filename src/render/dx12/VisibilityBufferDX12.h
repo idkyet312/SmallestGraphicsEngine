@@ -236,7 +236,11 @@ public:
     // expected to be wrong. Rough and face-on pixels score high confidence and
     // keep the probe; grazing near-mirror pixels score low and get a ray.
     bool enhancedReflectionClassifyActive = false;
-    float enhancedReflectionConfidenceCut = 0.5f;
+    // 0.8 from measurement, not theory: below this the classified reflection
+    // fraction drops without the probe visibly taking over on surfaces that
+    // wanted a ray. 0.5 was too aggressive and gave the probe pixels a mirror
+    // should have traced.
+    float enhancedReflectionConfidenceCut = 0.8f;
     UINT enhancedReflectionFrameCounter = 0;
     // SVGF temporal accumulation for RT reflections. Ping-pong history pair:
     // colour (E[x]), moments (E[x^2]) + sample count, one side read (SRV) and
