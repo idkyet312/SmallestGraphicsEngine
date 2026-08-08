@@ -6848,9 +6848,13 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
         mat->metallicFactor = metallic;
         mat->roughnessFactor = roughness;
     };
+    // roughnessScale multiplies the ARM map's roughness channel rather than
+    // replacing it, so texture variation survives while the material sits in a
+    // smoother or rougher band overall.
     auto assignPackedPBR = [&](const char* name, const std::string& colorPath,
                                const std::string& normalPath, const std::string& armPath,
-                               std::vector<unsigned char> fallback) {
+                               std::vector<unsigned char> fallback,
+                               float roughnessScale = 1.0f) {
         auto it = mats.find(name);
         if (it == mats.end()) return;
         auto& mat = it->second;
@@ -6868,7 +6872,7 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
         // Poly Haven ARM is R=AO, G=roughness, B=metallic: exact glTF layout.
         mat->roughnessOnlyTexture = false;
         mat->metallicFactor = 1.0f;
-        mat->roughnessFactor = 1.0f;
+        mat->roughnessFactor = roughnessScale;
     };
     assign("Foundation", "Content/Models/house_pbr/foundation_brick",
            HouseTex::Stone(kSize, { 0.62f, 0.62f, 0.64f }, { 0.34f, 0.34f, 0.36f }));
@@ -6885,11 +6889,17 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
     assignGeneratedMetal("MetalWall",
                "Content/Models/Corrugated metal pack/Wall/A/A Roughness rusted 2.jpg",
                HouseTex::Corrugated(kSize, { 0.30f, 0.34f, 0.31f }, { 0.43f, 0.22f, 0.10f }), 0.82f, 0.66f);
+    // Galvanised steel roofing is fairly reflective, so 0.45 reads truer than a
+    // flat 1.0 -- and it keeps the sheets under the RT reflection roughness cut
+    // (0.52), above which the one-GGX-ray-per-frame reflection is mostly
+    // variance and the surface is handed to the environment probe instead.
+    // Matches RoofModel.h, which dresses the same corrugated-iron ARM set.
     assignPackedPBR("MetalRoof",
                "Content/Models/polyhaven/corrugated_iron/corrugated_iron_diff_2k.jpg",
                "Content/Models/polyhaven/corrugated_iron/corrugated_iron_nor_dx_2k.jpg",
                "Content/Models/polyhaven/corrugated_iron/corrugated_iron_arm_2k.jpg",
-               HouseTex::Corrugated(kSize, { 0.42f, 0.46f, 0.48f }, { 0.38f, 0.18f, 0.08f }));
+               HouseTex::Corrugated(kSize, { 0.42f, 0.46f, 0.48f }, { 0.38f, 0.18f, 0.08f }),
+               0.45f);
 }
 
 // Basic modular destructible house built from real structural pieces: a
@@ -6936,12 +6946,19 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     auto matMetalWall = std::make_shared<SceneMaterial>();
     matMetalWall->name = "MetalWall";
     matMetalWall->baseColorFactor = XMFLOAT4(0.62f, 0.63f, 0.62f, 1.0f);
-    matMetalWall->metallicFactor = 0.80f; matMetalWall->roughnessFactor = 0.62f;
+    // 0.62 -> 0.48: corrugated sheet metal, weathered but still specular. The
+    // old value sat just above the RT reflection roughness cut (0.52), so these
+    // walls were handed to the environment probe and never resolved a real
+    // reflection despite being the most reflective large surfaces in the level.
+    matMetalWall->metallicFactor = 0.80f; matMetalWall->roughnessFactor = 0.48f;
     matMetalWall->ambientScale = 1.14f; matMetalWall->viewFillStrength = 0.12f;
     auto matMetalRoof = std::make_shared<SceneMaterial>();
     matMetalRoof->name = "MetalRoof";
     matMetalRoof->baseColorFactor = XMFLOAT4(0.58f, 0.58f, 0.56f, 1.0f);
-    matMetalRoof->metallicFactor = 0.85f; matMetalRoof->roughnessFactor = 0.58f;
+    // 0.58 -> 0.44: galvanised roofing, the smoothest of the sheet metals here
+    // and now under the reflection cut with it. Matches RoofModel.h and the
+    // MetalRoof packed-PBR set, which dress the same corrugated iron.
+    matMetalRoof->metallicFactor = 0.85f; matMetalRoof->roughnessFactor = 0.44f;
     matMetalRoof->ambientScale = 1.08f; matMetalRoof->viewFillStrength = 0.08f;
     auto matDarkMetal = std::make_shared<SceneMaterial>();
     matDarkMetal->name = "DarkMetal";

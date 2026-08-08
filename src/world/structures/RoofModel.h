@@ -66,7 +66,17 @@ inline void EnsureRoofModelLoaded() {
             g_dx12.device, g_dx12.commandList, material.uploadHeaps);
         material.baseColorFactor = { 1, 1, 1, 1 };
         material.metallicFactor = 1.0f;
-        material.roughnessFactor = 1.0f;
+        // Scales the ARM map's roughness channel rather than replacing it, so
+        // the corrugation and grime variation survive -- the sheets just sit in
+        // a smoother band overall. Galvanised steel is genuinely fairly
+        // reflective, so this reads truer than the flat 1.0 it replaces.
+        //
+        // It also keeps the sheets under the RT reflection roughness cut
+        // (0.52), which matters because the stochastic reflection is one GGX
+        // ray per pixel per frame: above the cut the lobe is wide enough that a
+        // single sample is mostly variance, so rough surfaces are handed to the
+        // environment probe instead and never resolve a real reflection.
+        material.roughnessFactor = 0.45f;
         material.roughnessOnlyTexture = false;
         // Thin overlapping roof sheets need conservative culling.
         material.doubleSided = true;
