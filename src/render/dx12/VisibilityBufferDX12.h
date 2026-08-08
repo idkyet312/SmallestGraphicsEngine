@@ -232,6 +232,11 @@ public:
     // Radiance scale applied to an occluded reflection hit. Without a
     // hit-shading path this stands in for "something blocked the sky here".
     float enhancedReflectionOcclusion = 0.25f;
+    // Reflection ray classification: trace only where the environment probe is
+    // expected to be wrong. Rough and face-on pixels score high confidence and
+    // keep the probe; grazing near-mirror pixels score low and get a ray.
+    bool enhancedReflectionClassifyActive = false;
+    float enhancedReflectionConfidenceCut = 0.5f;
     UINT enhancedReflectionFrameCounter = 0;
     // SVGF temporal accumulation for RT reflections. Ping-pong history pair:
     // colour (E[x]), moments (E[x^2]) + sample count, one side read (SRV) and
@@ -2606,8 +2611,8 @@ private:
             float reflectionRoughnessCut;
             UINT  frameIndex;
             float reflectionOcclusion;
-            float pad0;
-            float pad1;
+            UINT  reflectionClassify;
+            float reflectionConfidenceCut;
             float pad2;
             UINT  svgfTemporalEnable;
             UINT  svgfMaxAccum;
@@ -2631,8 +2636,8 @@ private:
         // samples; this is the variance a temporal denoiser resolves.
         constants.frameIndex = enhancedReflectionFrameCounter++;
         constants.reflectionOcclusion = enhancedReflectionOcclusion;
-        constants.pad0 = 0.0f;
-        constants.pad1 = 0.0f;
+        constants.reflectionClassify = enhancedReflectionClassifyActive ? 1u : 0u;
+        constants.reflectionConfidenceCut = enhancedReflectionConfidenceCut;
         constants.pad2 = 0.0f;
         constants.svgfTemporalEnable = svgfTemporalEnabled ? 1u : 0u;
         constants.svgfMaxAccum = svgfMaxAccumFrames;

@@ -960,6 +960,17 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                             0.05f, 1.0f, "%.2f");
                         ImGui::TextDisabled(
                             "  1 GGX ray/pixel/frame: noisy by design.");
+                        ImGui::Checkbox("  Refl Ray Classification",
+                                        &vb.enhancedReflectionClassifyActive);
+                        if (vb.enhancedReflectionClassifyActive) {
+                            ImGui::SliderFloat("  Refl Confidence Cut",
+                                &vb.enhancedReflectionConfidenceCut,
+                                0.05f, 1.0f, "%.2f");
+                            ImGui::TextDisabled(
+                                "  Probe keeps rough/face-on pixels;");
+                            ImGui::TextDisabled(
+                                "  rays go to grazing near-mirror ones.");
+                        }
                         ImGui::Checkbox("  SVGF Temporal Accumulation",
                                         &vb.svgfTemporalEnabled);
                         if (vb.svgfTemporalEnabled) {

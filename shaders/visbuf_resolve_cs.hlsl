@@ -184,8 +184,10 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     float enhancedReflectionRoughnessCut; // skip rays above this roughness
     uint  enhancedFrameIndex;       // per-frame seed for the sampling sequence
     float enhancedReflectionOcclusion;   // radiance scale for an occluded hit
-    float enhancedReflectionPad0;
-    float enhancedReflectionPad1;
+    // Reflection ray classification (Phase 4). Claimed from the reserved pad
+    // slots, so the buffer size and every field offset after it are unchanged.
+    uint  enhancedReflectionClassify;    // gate rays on cheap-tier confidence
+    float enhancedReflectionConfidenceCut; // trace below this confidence
     float enhancedReflectionPad2;
     // SVGF temporal accumulation for RT reflections. Append only.
     uint  svgfTemporalEnabled;     // toggle: off by default
@@ -1151,9 +1153,42 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
     // Stochastic RT reflection. Rough surfaces are skipped: their lobe is wide
     // enough that one sample per frame is mostly variance, and the probe is
     // already a reasonable answer there.
-    if (enhancedRTReflections != 0 &&
+    // Cheap-tier confidence for the reflection: how well the environment probe
+    // is expected to answer this pixel, so rays are spent only where it will
+    // not.
+    //
+    // Two terms, multiplied like the SSR confidence they mirror:
+    //   roughness -- a wide lobe averages the environment anyway, so the probe
+    //                is close to correct and a single stochastic ray mostly
+    //                adds variance.
+    //   grazing   -- at glancing angles the reflection direction sweeps far
+    //                from the surface normal, where a distant-environment
+    //                assumption breaks down and nearby geometry dominates.
+    //
+    // Deliberately NOT the SSR confidence at screen_space_reflections.hlsl:137:
+    // that value is computed in a separate post-pass that runs after this one
+    // and is discarded there. Wiring it here means exporting it to a texture
+    // this pass can read next frame -- worth doing, but a bigger change than
+    // this gate, and a frame-late signal has its own failure modes.
+    float reflectionConfidence = 1.0;
+    if (enhancedReflectionClassify != 0) {
+        float roughTerm = saturate(surface.rough /
+                                   max(enhancedReflectionRoughnessCut, 1e-4));
+        float grazingTerm = saturate(dot(surface.normal, V));
+        reflectionConfidence = saturate(roughTerm * 0.75 + grazingTerm * 0.25);
+    }
+    const bool reflectionEligible =
+        enhancedRTReflections != 0 &&
         surface.rough <= enhancedReflectionRoughnessCut &&
-        !surface.isFoliage) {
+        !surface.isFoliage &&
+        (enhancedReflectionClassify == 0 ||
+         reflectionConfidence < enhancedReflectionConfidenceCut);
+    if (reflectionEligible) {
+        // Count this pixel in the ray-fraction statistic and the debug view.
+        // Without it the UI reports only shadow rays and reads 0% while
+        // reflections are tracing, which is misleading rather than merely
+        // incomplete.
+        outputRayMask[pixel] = 1u;
         bool reflectionHit = false;
         float3 traced = RayTracedReflection(surface.fragPos, surface.normal, V,
                                             surface.rough, pixel, reflectionHit);
@@ -1194,9 +1229,11 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
     float3 specularContrib = specularIBL * ambientOcclusion * ambientLightingIntensity;
     result += (diffuseIBL + diffuseGI) * ambientOcclusion * ambientLightingIntensity +
               specularContrib;
-    if (enhancedRTReflections != 0 &&
-        surface.rough <= enhancedReflectionRoughnessCut &&
-        !surface.isFoliage) {
+    // Must match reflectionEligible above: publishing the reflection signal
+    // for a pixel that never traced hands the denoiser a converged probe value
+    // labelled as ray output, and the à-trous pass then filters a signal with
+    // no variance behind it.
+    if (reflectionEligible) {
         outSpecularIBL = specularContrib;
         float3 contributionScale = specularScale * ambientOcclusion *
                                    ambientLightingIntensity;
