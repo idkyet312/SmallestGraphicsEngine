@@ -92,9 +92,22 @@ public:
         uint32_t hasIndices = 0;
         uint32_t materialID = 0;
         // 0 when this geometry has no visibility-buffer registration, which is
-        // the shader's signal to fall back rather than read a wrong triangle.
+        // the shader's signal not to read a triangle it cannot address.
         uint32_t valid = 0;
-        uint32_t pad[3] = { 0, 0, 0 };
+        // Snapshot albedo for geometry with no VB binding, so a hit still
+        // returns the surface's colour rather than dimmed sky. Terrain is the
+        // case that matters: it owns its own buffers and is generated for the
+        // acceleration structure rather than registered with the visibility
+        // buffer, yet it is the largest surface in an outdoor scene and takes a
+        // large share of downward bounce rays. Without this those rays come
+        // back grey instead of sand or grass.
+        //
+        // Only read when valid == 0; a VB-bound hit fetches the real material.
+        float fallbackColor[3] = { 0.0f, 0.0f, 0.0f };
+        // 1 when fallbackColor is meaningful. Distinguishes "no binding and no
+        // colour either" (keep the old sky approximation) from "no binding but
+        // a known albedo".
+        uint32_t hasFallbackColor = 0;
     };
 
     bool Initialize(ID3D12Device* device) {
@@ -352,6 +365,15 @@ public:
                     binding.hasIndices = geometry.vbHasIndices;
                     binding.materialID = geometry.vbMaterialID;
                     binding.valid = geometry.vbMeshValid ? 1u : 0u;
+                    // The same material snapshot the DispatchRays hit record
+                    // carries, so unbound geometry still shades with its own
+                    // colour. Every geometry sets baseColor -- terrain to a
+                    // grass/earth average, meshes from their material -- so
+                    // this is always meaningful.
+                    binding.fallbackColor[0] = geometry.baseColor[0];
+                    binding.fallbackColor[1] = geometry.baseColor[1];
+                    binding.fallbackColor[2] = geometry.baseColor[2];
+                    binding.hasFallbackColor = 1u;
                     hitGeometry_.push_back(binding);
                 }
             } else {

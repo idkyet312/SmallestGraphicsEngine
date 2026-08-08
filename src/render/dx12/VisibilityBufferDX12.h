@@ -2369,9 +2369,10 @@ private:
             uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
             D3D12_RESOURCE_DESC bufDesc = {};
             bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            // 32 bytes per entry, matching DXRScene::HitGeometryData and the
-            // shader's HitGeometry. Sized here rather than from the C++ type so
-            // this header does not have to include DXRScene.h.
+            // Matches DXRScene::HitGeometryData and the shader's HitGeometry.
+            // Sized from the constant rather than the C++ type so this header
+            // does not have to include DXRScene.h; UploadHitGeometry asserts
+            // the two agree.
             bufDesc.Width =
                 static_cast<UINT64>(VB_MAX_HIT_GEOMETRY) * kHitGeometryStride;
             bufDesc.Height = 1;
@@ -3665,7 +3666,10 @@ public:
     // Byte stride of one hit-geometry entry. Must equal both
     // sizeof(DXRScene::HitGeometryData) and the shader's HitGeometry; asserted
     // in UploadHitGeometry, where the real type is visible.
-    static const UINT kHitGeometryStride = 32;
+    //
+    // 9 x 4 bytes: vertexOffset, indexOffset, hasIndices, materialID, valid,
+    // fallbackColor[3], hasFallbackColor.
+    static const UINT kHitGeometryStride = 36;
 
     // Uploads the per-geometry hit bindings produced by the acceleration
     // rebuild. Entry N must describe the same geometry as DXRScene hit record

@@ -252,7 +252,11 @@ struct HitGeometry {
     uint hasIndices;
     uint materialID;
     uint valid;      // 0 when this geometry has no visibility-buffer mesh
-    uint3 pad;
+    // Snapshot albedo for geometry with no VB binding -- terrain above all,
+    // which owns its own buffers and never enters the visibility buffer, yet
+    // takes a large share of the downward bounce rays in an outdoor scene.
+    float3 fallbackColor;
+    uint hasFallbackColor;
 };
 StructuredBuffer<HitGeometry> hitGeometry : register(t85);
 #endif
@@ -665,6 +669,16 @@ float3 ImportanceSampleGGX(float2 xi, float3 normal, float roughness) {
     return normalize(tangentX * h.x + tangentY * h.y + normal * h.z);
 }
 
+// Damping on the sky term at a ray hit.
+//
+// The resolve already adds sky ambient to the shaded pixel separately, so an
+// undamped hemisphere value here makes every bounce a second sky light. At GI
+// strength 1 -- where every pixel traces -- that dominates the reflected sun and
+// washes indirect light toward flat sky blue instead of picking up the colour of
+// whatever the ray actually hit. A bounce should be mostly reflected sunlight
+// tinted by the hit albedo; the sky is the smaller ambient part of it.
+static const float kBounceSkyDamping = 0.25;
+
 // Radiance leaving a committed ray hit, shaded from the real surface.
 //
 // This is what the hit-geometry table buys. Without it a hit can only be
@@ -703,7 +717,49 @@ float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
         return float3(0.0, 0.0, 0.0);
 
     HitGeometry binding = hitGeometry[bindingIndex];
-    if (binding.valid == 0) return float3(0.0, 0.0, 0.0);
+    if (binding.valid == 0) {
+        // No visibility-buffer binding, so the triangle cannot be addressed --
+        // but the geometry still carries a snapshot albedo, which is enough for
+        // a diffuse bounce. Terrain is the case this exists for: it owns its
+        // own buffers and is generated straight into the acceleration structure
+        // rather than registered with the visibility buffer, yet it is the
+        // largest surface in an outdoor scene and absorbs most of the downward
+        // bounce rays. Without this those rays return dimmed sky and the ground
+        // bounce reads grey instead of sand or grass.
+        if (binding.hasFallbackColor == 0) return float3(0.0, 0.0, 0.0);
+        // The surface normal is unavailable without vertex data. Facing the
+        // normal back along the ray is exact for the cosine-weighted bounce
+        // this mostly serves -- the ray was drawn about the SHADING point's
+        // hemisphere, so the hit is being asked "how much light leaves you
+        // toward me", and -rayDir is that direction. It is only approximate for
+        // the sky term, which is the smaller part.
+        float3 fallbackNormal = -rayDir;
+        float3 fallbackIncoming =
+            SampleSkyIrradiance(fallbackNormal) * kBounceSkyDamping;
+        if (lightType == 0) {
+            float3 sunDir = normalize(lightPos);
+            float sunNdotL = saturate(dot(fallbackNormal, sunDir));
+            if (sunNdotL > 0.0) {
+                float3 fallbackPos = query.WorldRayOrigin() +
+                                     rayDir * query.CommittedRayT();
+                RayDesc fallbackShadow;
+                fallbackShadow.Origin = fallbackPos + fallbackNormal * 0.02;
+                fallbackShadow.Direction = sunDir;
+                fallbackShadow.TMin = 0.0;
+                fallbackShadow.TMax = enhancedShadowRayLength;
+                RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+                         RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
+                         RAY_FLAG_CULL_NON_OPAQUE> fallbackQuery;
+                fallbackQuery.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff,
+                                             fallbackShadow);
+                fallbackQuery.Proceed();
+                if (fallbackQuery.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+                    fallbackIncoming += lightColor * sunNdotL;
+            }
+        }
+        resolved = true;
+        return fallbackIncoming * binding.fallbackColor;
+    }
 
     // The BLAS and the visibility buffer consume the same index array in the
     // same order, so the committed primitive index addresses the same triangle
@@ -764,16 +820,7 @@ float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
     float3 hitPos = query.WorldRayOrigin() +
                     rayDir * query.CommittedRayT();
 
-    // Sky seen by the hit surface, damped.
-    //
-    // The full hemisphere value would double-count: the resolve already adds
-    // sky ambient to the shaded pixel separately, so returning an undamped sky
-    // term here makes every bounce a second sky light. At GI strength 1 -- where
-    // every pixel traces -- that dominates the reflected sun and washes indirect
-    // light toward flat sky blue instead of picking up the colour of whatever
-    // the ray actually hit. A bounce should be mostly reflected sunlight tinted
-    // by the hit albedo; the sky is the smaller ambient part of it.
-    const float kBounceSkyDamping = 0.25;
+    // Sky seen by the hit surface, damped -- see kBounceSkyDamping above.
     float3 incoming = SampleSkyIrradiance(worldNormal) * kBounceSkyDamping;
 
     // Direct sun at the hit, shadowed by a second ray. Without this test every
