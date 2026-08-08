@@ -475,6 +475,11 @@ add_custom_command(TARGET GraphicEngine POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
     ${CMAKE_SOURCE_DIR}/shaders
     $<TARGET_FILE_DIR:GraphicEngine>/shaders
+    # scripts/ is gitignored and may not exist at all in a fresh clone or a
+    # git worktree. copy_directory_if_different fails hard on a missing
+    # source, which broke the build in a worktree while the already-built exe
+    # kept running -- so make the directory first and copy what is there.
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_SOURCE_DIR}/scripts
     COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
     ${CMAKE_SOURCE_DIR}/scripts
     $<TARGET_FILE_DIR:GraphicEngine>/scripts
