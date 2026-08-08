@@ -900,11 +900,15 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
 //
 // One cosine-weighted hemisphere ray per miss pixel per frame, sharing the
 // reflection sampler's sequence rotation so consecutive frames draw different
-// directions. A hit is shaded from the environment along the bounce direction
-// and scaled by the occlusion factor -- the same coarse approximation the
-// reflection path uses, for the same reason: there is no hit-shading path in
-// the resolve, and a bounce that struck geometry is strictly dimmer than open
-// sky. A miss is open sky, which the probe grid would have reported as zero.
+// directions. A hit is shaded from the real surface via ShadeRayHit, so the
+// bounce carries the colour of what it struck; geometry with no
+// visibility-buffer binding falls back to the darkened probe. A miss is open
+// sky, which the probe grid would have reported as zero.
+//
+// ONE sample per pixel per frame is a deliberately noisy estimator -- the same
+// choice the reflection path makes, and for the same reason: the variance is
+// what the SVGF temporal pass is there to resolve. The caller feeds this raw
+// sample to the accumulator rather than averaging here.
 float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
     uint pixelSeed = MatVarHashUint(pixel.x * 2654435761u ^
                                     pixel.y * 2246822519u);
@@ -1469,6 +1473,12 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
     // sparse grid is not in use or the toggle is off, so behaviour is
     // unchanged in every other configuration.
     float3 giIrradiance;
+    // How much of giIrradiance came from rays rather than probes. Only the
+    // traced part is noisy, so only it is published to the denoiser: handing
+    // the filter a converged probe value labelled as ray output is the same
+    // mistake reflectionEligible exists to prevent on the specular side.
+    float3 tracedGIIrradiance = 0.0;
+    bool giTraced = false;
     if (enhancedProbeMissGI != 0 && ddgiEnabled != 0 &&
         sparseProbeCount > 0 && sparseCellCount > 0) {
         bool probeResolved = false;
@@ -1491,6 +1501,24 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
             giIrradiance = probeResolved
                 ? lerp(giIrradiance, traced, enhancedProbeMissGIStrength)
                 : traced;
+            // The traced share of the blend above. A probe miss takes the ray
+            // outright, so all of it is traced; a resolved probe contributes
+            // only the lerp weight. Publishing exactly this much keeps the
+            // denoised quantity equal to the noisy quantity.
+            tracedGIIrradiance = probeResolved
+                ? traced * enhancedProbeMissGIStrength
+                : traced;
+            giTraced = true;
+            // Denoise the irradiance, not the final contribution. The
+            // accumulator should see the raw ray estimate before albedo and AO
+            // scale it: those are per-pixel constants, so filtering after they
+            // are applied would let an albedo edge look like signal variance
+            // and stop the filter exactly where two materials meet.
+            //
+            // The GI and reflection signals share one history pair. They are
+            // summed into a single accumulated quantity below rather than
+            // accumulated twice: two calls would both write the same history
+            // texel, and the second would clobber the first.
             // Bit 2 = probe-miss GI ray, distinct from shadow and reflection
             // so the statistic shows what each tier costs.
             outputRayMask[pixel] |= 4u;
@@ -1498,7 +1526,15 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
     } else {
         giIrradiance = SampleDDGIIrradiance(surface.fragPos, surface.normal);
     }
-    float3 diffuseGI = giIrradiance * diffuseAlbedo * ambientScale;
+    // diffuseGI is deliberately NOT computed here in the enhanced variant: the
+    // traced part of giIrradiance is still raw at this point, and the temporal
+    // accumulator runs further down (it shares its history with the reflection
+    // signal, so both must reach it together). Computing the contribution here
+    // would bake the noisy value into the lit result while the denoised value
+    // went to the filter, and the composite pass would then subtract a
+    // different quantity than it adds back.
+    float3 accumulatedGIIrradiance = 0.0;
+    float3 tracedGIVariance = 0.0;
 #else
     float3 diffuseGI = SampleDDGIIrradiance(surface.fragPos, surface.normal) *
         diffuseAlbedo * ambientScale;
@@ -1558,13 +1594,48 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
             // value. The image then flickers BETWEEN the two paths, and no
             // accumulation count can damp that because half the frames never
             // reach the accumulator.
-            reflectionIBL = SVGF_TemporalAccumulate(
-                thisFrameSample, pixel, stableSurfaceID,
-                commitTemporalHistory, reflectionVariance);
+            //
+            // GI rides along in the same call. The two signals share one
+            // history texel, so they must enter the accumulator as one sample:
+            // packing them into a single vector and subtracting the GI part out
+            // afterwards keeps one accumulation count and one history write,
+            // which is what makes a shared pair correct rather than a race.
+            // Temporal accumulation is linear -- E[a + b] = E[a] + E[b] -- so
+            // the blended sum equals the sum of the separately blended parts.
+            float3 combined = thisFrameSample + tracedGIIrradiance;
+            float3 combinedVariance;
+            float3 accumulated = SVGF_TemporalAccumulate(
+                combined, pixel, stableSurfaceID,
+                commitTemporalHistory, combinedVariance);
+            // Split the accumulated sum back apart. The GI share is recovered
+            // by its ratio in this frame's sample, which is the best available
+            // estimate of its share of the converged value.
+            float combinedLuma = dot(combined, float3(0.2126, 0.7152, 0.0722));
+            float giLuma = dot(tracedGIIrradiance,
+                               float3(0.2126, 0.7152, 0.0722));
+            float giShare = combinedLuma > 1e-5
+                ? saturate(giLuma / combinedLuma) : 0.0;
+            accumulatedGIIrradiance = accumulated * giShare;
+            tracedGIVariance = combinedVariance * giShare;
+            reflectionIBL = accumulated * (1.0 - giShare);
+            reflectionVariance = combinedVariance * (1.0 - giShare);
         } else {
             reflectionIBL = thisFrameSample;
         }
+    } else if (giTraced && svgfTemporalEnabled != 0) {
+        // No reflection ray on this pixel -- rough, foliage, or classified out
+        // -- so GI owns the history texel outright and accumulates alone.
+        accumulatedGIIrradiance = SVGF_TemporalAccumulate(
+            tracedGIIrradiance, pixel, stableSurfaceID,
+            commitTemporalHistory, tracedGIVariance);
     }
+    // Use the denoised irradiance from here on, so the lit result and the
+    // signal handed to the à-trous pass describe the same quantity.
+    if (giTraced && svgfTemporalEnabled != 0) {
+        giIrradiance += accumulatedGIIrradiance - tracedGIIrradiance;
+        tracedGIIrradiance = accumulatedGIIrradiance;
+    }
+    float3 diffuseGI = giIrradiance * diffuseAlbedo * ambientScale;
 #endif
     float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
         texSampler, float2(NdotV, surface.rough), 0.0);
@@ -1594,6 +1665,34 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
                                       contributionScale * contributionScale;
         outSpecularVariance = dot(
             contributionVariance, float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0));
+    }
+    // Traced GI joins the SAME denoised signal as the specular contribution
+    // rather than getting its own history pair.
+    //
+    // Legitimate because the composite pass is linear -- lit - source +
+    // filtered -- so swapping a summed signal swaps both contributions at once.
+    // A second history pair would cost two more RGBA16F targets, four
+    // descriptor slots and a second à-trous chain to separate two signals the
+    // filter treats identically anyway: it edge-stops on depth, normal and
+    // luminance, none of which are specular-specific.
+    //
+    // The GI part was already temporally accumulated above, on the irradiance
+    // rather than here on the contribution, so that the accumulator sees the
+    // raw ray estimate before it is scaled by albedo and AO. What is added here
+    // is the already-denoised quantity; only the spatial filter still applies.
+    //
+    // Variance adds in quadrature: the GI ray and the reflection ray are drawn
+    // from independent sequences, so Var[a + b] = Var[a] + Var[b].
+    if (giTraced) {
+        float3 giContributionScale =
+            diffuseAlbedo * ambientScale * ambientOcclusion *
+            ambientLightingIntensity;
+        outSpecularIBL += tracedGIIrradiance * giContributionScale;
+        float3 giContributionVariance = tracedGIVariance *
+                                        giContributionScale *
+                                        giContributionScale;
+        outSpecularVariance += dot(
+            giContributionVariance, float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0));
     }
 #else
     float3 specularIBL = reflectionIBL *
