@@ -11763,6 +11763,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             CompleteLevelLoading(g_dx12.device &&
                 g_dx12.device->GetDeviceRemovedReason() == S_OK);
+            // Build the sparse probe layout now the level's geometry exists.
+            // Every rebuild path was editor- or button-driven, so a level
+            // loaded through normal play never built one: sparseProbeCount
+            // stayed 0, SampleDDGIIrradiance fell back to the legacy grid, and
+            // the DXR probe pass never dispatched despite every island level
+            // setting dxrDDGI.enabled = true. The request is a no-op when the
+            // level has it disabled or DXR is unsupported.
+            if (!g_emptyLevelMode && g_game.world.Level().dxrDDGI.enabled)
+                RequestLiveDXRDDGIRebuild();
             g_game.session.StartTimer();
             lastTime = gameTimer.GetElapsed();
         }
