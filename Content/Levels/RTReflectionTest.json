@@ -1,0 +1,233 @@
+{
+  "entities": [
+    {
+      "enabled": true,
+      "id": 1,
+      "name": "Player Spawn",
+      "transform": {
+        "position": [0.0, 3.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "player_spawn"
+    },
+
+    {
+      "enabled": true,
+      "id": 10,
+      "name": "Ring N Metal",
+      "transform": {
+        "position": [0.0, 0.0, 12.0],
+        "rotation": [0.0, 180.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "metal_house"
+    },
+    {
+      "enabled": true,
+      "id": 11,
+      "name": "Ring NE Metal",
+      "transform": {
+        "position": [8.5, 0.0, 8.5],
+        "rotation": [0.0, 225.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "metal_house"
+    },
+    {
+      "enabled": true,
+      "id": 12,
+      "name": "Ring E Metal",
+      "transform": {
+        "position": [12.0, 0.0, 0.0],
+        "rotation": [0.0, 270.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "metal_house"
+    },
+    {
+      "enabled": true,
+      "id": 13,
+      "name": "Ring SE Metal",
+      "transform": {
+        "position": [8.5, 0.0, -8.5],
+        "rotation": [0.0, 315.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "metal_house"
+    },
+    {
+      "enabled": true,
+      "id": 14,
+      "name": "Ring S Metal",
+      "transform": {
+        "position": [0.0, 0.0, -12.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "metal_house"
+    },
+    {
+      "enabled": true,
+      "id": 15,
+      "name": "Ring SW Metal",
+      "transform": {
+        "position": [-8.5, 0.0, -8.5],
+        "rotation": [0.0, 45.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "metal_house"
+    },
+    {
+      "enabled": true,
+      "id": 16,
+      "name": "Ring W Metal",
+      "transform": {
+        "position": [-12.0, 0.0, 0.0],
+        "rotation": [0.0, 90.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "metal_house"
+    },
+    {
+      "enabled": true,
+      "id": 17,
+      "name": "Ring NW Metal",
+      "transform": {
+        "position": [-8.5, 0.0, 8.5],
+        "rotation": [0.0, 135.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "metal_house"
+    },
+
+    {
+      "enabled": true,
+      "id": 20,
+      "name": "Outer N Wood",
+      "transform": {
+        "position": [0.0, 0.0, 26.0],
+        "rotation": [0.0, 180.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "wood_house"
+    },
+    {
+      "enabled": true,
+      "id": 21,
+      "name": "Outer E Wood",
+      "transform": {
+        "position": [26.0, 0.0, 0.0],
+        "rotation": [0.0, 270.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "wood_house"
+    },
+    {
+      "enabled": true,
+      "id": 22,
+      "name": "Outer S Wood",
+      "transform": {
+        "position": [0.0, 0.0, -26.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "wood_house"
+    },
+    {
+      "enabled": true,
+      "id": 23,
+      "name": "Outer W Wood",
+      "transform": {
+        "position": [-26.0, 0.0, 0.0],
+        "rotation": [0.0, 90.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "wood_house"
+    },
+
+    {
+      "enabled": true,
+      "id": 30,
+      "name": "Centre Humvee",
+      "transform": {
+        "position": [3.5, 0.0, 3.5],
+        "rotation": [0.0, 35.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "humvee"
+    },
+    {
+      "enabled": true,
+      "id": 31,
+      "name": "Second Humvee",
+      "transform": {
+        "position": [-4.0, 0.0, -3.0],
+        "rotation": [0.0, 200.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "humvee"
+    },
+    {
+      "enabled": true,
+      "id": 32,
+      "name": "Helicopter",
+      "transform": {
+        "position": [-6.0, 0.0, 7.0],
+        "rotation": [0.0, 300.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "helicopter"
+    },
+
+    {
+      "enabled": true,
+      "id": 40,
+      "name": "Barrel Cluster A",
+      "transform": {
+        "position": [2.0, 0.0, -5.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "explosive_barrel"
+    },
+    {
+      "enabled": true,
+      "id": 41,
+      "name": "Barrel Cluster B",
+      "transform": {
+        "position": [3.0, 0.0, -5.6],
+        "rotation": [0.0, 40.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "explosive_barrel"
+    },
+    {
+      "enabled": true,
+      "id": 42,
+      "name": "Barrel Cluster C",
+      "transform": {
+        "position": [2.4, 0.0, -6.4],
+        "rotation": [0.0, 80.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "explosive_barrel"
+    },
+    {
+      "enabled": true,
+      "id": 43,
+      "name": "Barrel Lone W",
+      "transform": {
+        "position": [-5.5, 0.0, 1.5],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "type": "explosive_barrel"
+    }
+  ],
+  "name": "RT Reflection Test",
+  "schemaVersion": 1,
+  "terrain": {
+    "heightScale": 0.0
+  }
+}

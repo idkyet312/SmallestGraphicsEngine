@@ -1372,9 +1372,13 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                                 reflectionHit);
             debugColor = reflectionHit ? float3(0.0, 1.0, 0.0)
                                        : float3(0.0, 0.0, 1.0);
-            uint pixelSeed =
-                MatVarHashUint(pixel.x * 73856093u ^ pixel.y * 19349663u);
-            debugColor.r = (float)((pixelSeed + enhancedFrameIndex) & 63u) / 63.0;
+            // Screen-uniform, frame-index only: every eligible pixel gets the
+            // SAME red this frame, so the whole image pulses through a visible
+            // 64-frame cycle when the sequence rotates. A per-pixel value here
+            // is useless for this test -- static per-pixel noise and correctly
+            // rotating noise look identical in a still frame. Flat red means
+            // rotation is dead, and 5b could never converge.
+            debugColor.r = (float)(enhancedFrameIndex & 63u) / 63.0;
         }
         outputColor[pixel] = float4(debugColor, 1.0);
         if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
