@@ -1041,8 +1041,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
         diffuseAlbedo * ambientScale;
     float3 reflectionIBL = SampleReflectionProbe(reflect(-V, surface.normal), surface.rough);
 #if SGE_ENHANCED_VISUALS
-    // Stochastic RT reflection replaces the probe only where a ray actually
-    // hit static geometry. Rough surfaces are skipped: their lobe is wide
+    // Stochastic RT reflection. Rough surfaces are skipped: their lobe is wide
     // enough that one sample per frame is mostly variance, and the probe is
     // already a reasonable answer there.
     if (enhancedRTReflections != 0 &&
@@ -1051,14 +1050,24 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
         bool reflectionHit = false;
         float3 traced = RayTracedReflection(surface.fragPos, surface.normal, V,
                                             surface.rough, pixel, reflectionHit);
-        if (reflectionHit) {
-            if (svgfTemporalEnabled != 0) {
-                reflectionIBL = SVGF_TemporalAccumulate(
-                    traced, pixel, visBuffer.Load(int3(pixel, 0)).x,
-                    commitTemporalHistory);
-            } else {
-                reflectionIBL = traced;
-            }
+        // A miss is a real sample of the reflection integral -- it means "sky
+        // along that direction" -- so it carries the probe value rather than
+        // no value at all.
+        float3 thisFrameSample = reflectionHit ? traced : reflectionIBL;
+        if (svgfTemporalEnabled != 0) {
+            // Accumulate EVERY frame, hit or miss. Accumulating only on hits
+            // reads as unfixable grain no matter how many frames are allowed:
+            // a pixel's hit/miss status flips frame to frame (that is what the
+            // stochastic ray does), so miss frames bypassed the accumulator and
+            // showed the raw probe, while hit frames showed the converged
+            // value. The image then flickers BETWEEN the two paths, and no
+            // accumulation count can damp that because half the frames never
+            // reach the accumulator.
+            reflectionIBL = SVGF_TemporalAccumulate(
+                thisFrameSample, pixel, visBuffer.Load(int3(pixel, 0)).x,
+                commitTemporalHistory);
+        } else {
+            reflectionIBL = thisFrameSample;
         }
     }
 #endif
@@ -1501,12 +1510,16 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
             float3 traced = RayTracedReflection(
                 surface.fragPos, surface.normal,
                 surface.viewDir, surface.rough, pixel, reflectionHit);
-            if (reflectionHit) {
-                // Debug view only: never commit, or switching to this view
-                // would corrupt the history the lit path is accumulating.
-                debugColor = SVGF_TemporalAccumulate(
-                    traced, pixel, visBuffer.Load(int3(pixel, 0)).x, false);
-            }
+            // Mirror the lit path: misses carry the probe, so this view shows
+            // what shading actually uses rather than a hit-only subset.
+            float3 sample = reflectionHit
+                ? traced
+                : SampleReflectionProbe(
+                      reflect(-surface.viewDir, surface.normal), surface.rough);
+            // Debug view only: never commit, or switching to this view would
+            // corrupt the history the lit path is accumulating.
+            debugColor = SVGF_TemporalAccumulate(
+                sample, pixel, visBuffer.Load(int3(pixel, 0)).x, false);
         }
         outputColor[pixel] = float4(debugColor, 1.0);
         if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
@@ -1532,10 +1545,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         float3 centreTraced = RayTracedReflection(
             surface.fragPos, surface.normal, surface.viewDir,
             surface.rough, pixel, centreHit);
-        if (centreHit) {
-            SVGF_TemporalAccumulate(centreTraced, pixel,
-                                    visBuffer.Load(int3(pixel, 0)).x, true);
-        }
+        // Commit on misses too, matching ShadeSurface: a miss contributes the
+        // probe value, and skipping those frames is what made the accumulator
+        // flicker between converged and raw.
+        float3 centreSample = centreHit
+            ? centreTraced
+            : SampleReflectionProbe(reflect(-surface.viewDir, surface.normal),
+                                    surface.rough);
+        SVGF_TemporalAccumulate(centreSample, pixel,
+                                visBuffer.Load(int3(pixel, 0)).x, true);
     }
 #else
     float3 result = ShadeSurface(pixel, surface);
