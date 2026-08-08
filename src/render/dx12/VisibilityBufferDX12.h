@@ -241,6 +241,12 @@ public:
     // wanted a ray. 0.5 was too aggressive and gave the probe pixels a mirror
     // should have traced.
     float enhancedReflectionConfidenceCut = 0.8f;
+    // Trace a diffuse bounce where the sparse probe grid reports a miss. Those
+    // pixels otherwise keep sky ambient only and lose all bounce light.
+    bool enhancedProbeMissGIActive = false;
+    // 0 = fill probe misses only (cheapest, rays only where the grid failed),
+    // 1 = full RT GI (every pixel traces, probes unused).
+    float enhancedProbeMissGIStrength = 0.0f;
     UINT enhancedReflectionFrameCounter = 0;
     // SVGF temporal accumulation for RT reflections. Ping-pong history pair:
     // colour (E[x]), moments (E[x^2]) + sample count, one side read (SRV) and
@@ -301,6 +307,7 @@ public:
     // whether reflection classification is doing anything at all.
     float rayMaskShadowFraction = 0.0f;
     float rayMaskReflectionFraction = 0.0f;
+    float rayMaskGIFraction = 0.0f;
     ComPtr<ID3D12RootSignature> postRootSig;
     ComPtr<ID3D12PipelineState> postPSO;
     ComPtr<ID3D12DescriptorHeap> postDescHeap;
@@ -2622,13 +2629,13 @@ private:
             float reflectionOcclusion;
             UINT  reflectionClassify;
             float reflectionConfidenceCut;
-            float pad2;
+            UINT  probeMissGI;
             UINT  svgfTemporalEnable;
             UINT  svgfMaxAccum;
             UINT  svgfAtrousEnable;
             UINT  svgfAtrousIters;
             UINT  svgfHistoryValid;
-            UINT  svgfPad0;
+            float probeMissGIStrength;
             UINT  svgfPad1;
             UINT  svgfPad2;
         } constants;
@@ -2647,14 +2654,14 @@ private:
         constants.reflectionOcclusion = enhancedReflectionOcclusion;
         constants.reflectionClassify = enhancedReflectionClassifyActive ? 1u : 0u;
         constants.reflectionConfidenceCut = enhancedReflectionConfidenceCut;
-        constants.pad2 = 0.0f;
+        constants.probeMissGI = enhancedProbeMissGIActive ? 1u : 0u;
         constants.svgfTemporalEnable = svgfTemporalEnabled ? 1u : 0u;
         constants.svgfMaxAccum = svgfMaxAccumFrames;
         constants.svgfAtrousEnable = svgfAtrousEnabled ? 1u : 0u;
         constants.svgfAtrousIters = std::clamp(
             svgfAtrousIterations, 1u, kSVGFAtrousMaxIterations);
         constants.svgfHistoryValid = svgfHistoryValid ? 1u : 0u;
-        constants.svgfPad0 = 0u;
+        constants.probeMissGIStrength = enhancedProbeMissGIStrength;
         constants.svgfPad1 = 0u;
         constants.svgfPad2 = 0u;
         const UINT64 constantOffset =
@@ -3210,6 +3217,7 @@ private:
             if (SUCCEEDED(rayMaskReadback->Map(0, &readRange, &mapped)) && mapped) {
                 const auto* bytes = static_cast<const uint8_t*>(mapped);
                 uint32_t traced = 0, shadowTraced = 0, reflectionTraced = 0;
+                uint32_t giTraced = 0;
                 uint32_t total = 0;
                 for (UINT row = 0; row < kRayMaskSampleRows; ++row) {
                     const uint8_t* line = bytes + (size_t)row * rayMaskRowPitch;
@@ -3222,6 +3230,7 @@ private:
                         // reflection fraction unreadable.
                         shadowTraced += (mask & 1u) ? 1u : 0u;
                         reflectionTraced += (mask & 2u) ? 1u : 0u;
+                        giTraced += (mask & 4u) ? 1u : 0u;
                         ++total;
                     }
                 }
@@ -3232,6 +3241,8 @@ private:
                     total ? (float)shadowTraced / (float)total : 0.0f;
                 rayMaskReflectionFraction =
                     total ? (float)reflectionTraced / (float)total : 0.0f;
+                rayMaskGIFraction =
+                    total ? (float)giTraced / (float)total : 0.0f;
             }
             rayMaskCopyPending = false;
         }
@@ -3583,6 +3594,7 @@ public:
     float EnhancedReflectionRayFraction() const {
         return rayMaskReflectionFraction;
     }
+    float EnhancedGIRayFraction() const { return rayMaskGIFraction; }
 
 private:
 

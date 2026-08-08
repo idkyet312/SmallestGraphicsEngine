@@ -960,6 +960,22 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                             0.05f, 1.0f, "%.2f");
                         ImGui::TextDisabled(
                             "  1 GGX ray/pixel/frame: noisy by design.");
+                        ImGui::Checkbox("  RT GI (probe misses)",
+                                        &vb.enhancedProbeMissGIActive);
+                        if (vb.enhancedProbeMissGIActive) {
+                            ImGui::SliderFloat("  RT GI Strength",
+                                &vb.enhancedProbeMissGIStrength,
+                                0.0f, 1.0f, "%.2f");
+                            if (vb.enhancedProbeMissGIStrength <= 0.001f)
+                                ImGui::TextDisabled(
+                                    "  Rays only where probes miss.");
+                            else if (vb.enhancedProbeMissGIStrength >= 0.999f)
+                                ImGui::TextDisabled(
+                                    "  Full RT GI: every pixel traces.");
+                            else
+                                ImGui::TextDisabled(
+                                    "  Blending probe and traced bounce.");
+                        }
                         ImGui::Checkbox("  Refl Ray Classification",
                                         &vb.enhancedReflectionClassifyActive);
                         if (vb.enhancedReflectionClassifyActive) {
@@ -1016,9 +1032,11 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     // Split by type: the combined figure saturates once the
                     // shadow gate traces most lit pixels, which hides whether
                     // reflection classification is changing anything.
-                    ImGui::TextDisabled("    shadow %.1f%%   reflection %.1f%%",
-                                        vb.EnhancedShadowRayFraction() * 100.0f,
-                                        vb.EnhancedReflectionRayFraction() * 100.0f);
+                    ImGui::TextDisabled(
+                        "    shadow %.1f%%  reflection %.1f%%  GI %.1f%%",
+                        vb.EnhancedShadowRayFraction() * 100.0f,
+                        vb.EnhancedReflectionRayFraction() * 100.0f,
+                        vb.EnhancedGIRayFraction() * 100.0f);
                 }
             }
             ImGui::Separator();

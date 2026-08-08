@@ -188,14 +188,17 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     // slots, so the buffer size and every field offset after it are unchanged.
     uint  enhancedReflectionClassify;    // gate rays on cheap-tier confidence
     float enhancedReflectionConfidenceCut; // trace below this confidence
-    float enhancedReflectionPad2;
+    uint  enhancedProbeMissGI;           // trace a bounce where probes miss
     // SVGF temporal accumulation for RT reflections. Append only.
     uint  svgfTemporalEnabled;     // toggle: off by default
     uint  svgfMaxAccumFrames;      // max N for alpha = 1/N ramp
     uint  svgfAtrousEnabled;       // toggle: spatial à-trous filter
     uint  svgfAtrousIterations;    // number of à-trous passes
     uint  svgfHistoryValid;        // false on first frame/resize/toggle
-    uint3 svgfPadding;
+    // Claimed from svgfPadding, so the buffer stays 80 bytes and no field
+    // offset moves. 0 = fill probe misses only, 1 = full RT GI.
+    float enhancedProbeMissGIStrength;
+    uint2 svgfPadding;
 };
 
 // Per-pixel record of where the rays went, for the debug view and the
@@ -440,6 +443,81 @@ float3 SampleSparseDDGI(float3 worldPos, float3 normal) {
         ? irradiance / totalWeight * giIntensity : 0.0;
 }
 
+// As above, but reports whether any probe had weight. A miss means the sparse
+// grid has nothing to say here -- the pixel is outside the probe layout, or
+// every nearby probe was rejected on visibility or normal alignment -- and the
+// enhanced variant traces a ray to fill it. Kept separate from
+// SampleSparseDDGI so the default variant's code path is untouched.
+float3 SampleSparseDDGIClassified(float3 worldPos, float3 normal,
+                                  out bool resolved) {
+    float3 biased = worldPos + normal * normalBias;
+    int3 center = (int3)floor(biased / sparseCellSize);
+    uint nearestIndices[8];
+    float nearestDistanceSq[8];
+    uint nearestCount = 0;
+
+    [loop] for (int z = -1; z <= 1; ++z)
+    [loop] for (int y = -1; y <= 1; ++y)
+    [loop] for (int x = -1; x <= 1; ++x) {
+        int3 coordinate = center + int3(x, y, z);
+        uint slot = DDGICellHash(coordinate) & (sparseCellCount - 1);
+        [loop] for (uint search = 0;
+                    search < (uint)sparseCellCount; ++search) {
+            SparseProbeCell cell = sparseProbeCells[slot];
+            if (cell.count == 0) break;
+            if (all(cell.coordinate == coordinate)) {
+                [loop] for (uint i = 0; i < cell.count; ++i) {
+                    uint index = sparseProbeIndices[cell.offset + i];
+                    SparseProbeData probe = sparseProbes[index];
+                    if (probe.state == 2) continue;
+                    float distanceSq =
+                        dot(biased - probe.position, biased - probe.position);
+                    uint insertAt = nearestCount;
+                    if (nearestCount < 8) {
+                        ++nearestCount;
+                    } else {
+                        float worst = 0.0;
+                        uint worstAt = 0;
+                        for (uint w = 0; w < 8; ++w) {
+                            if (nearestDistanceSq[w] > worst) {
+                                worst = nearestDistanceSq[w];
+                                worstAt = w;
+                            }
+                        }
+                        if (distanceSq >= worst) continue;
+                        insertAt = worstAt;
+                    }
+                    nearestIndices[insertAt] = index;
+                    nearestDistanceSq[insertAt] = distanceSq;
+                }
+                break;
+            }
+            slot = (slot + 1) & (sparseCellCount - 1);
+        }
+    }
+
+    float3 irradiance = 0.0;
+    float totalWeight = 0.0;
+    for (uint i = 0; i < nearestCount; ++i) {
+        uint index = nearestIndices[i];
+        SparseProbeData probe = sparseProbes[index];
+        float3 delta = biased - probe.position;
+        float distance = sqrt(nearestDistanceSq[i]);
+        float alignment = saturate(dot(normal, probe.normal));
+        float normalWeight = 0.04 + 0.96 * alignment * alignment;
+        float rangeWeight = saturate(
+            1.0 - distance / max(sparseCellSize * 1.75, 0.1));
+        rangeWeight *= rangeWeight;
+        float weight = normalWeight * rangeWeight *
+            SparseProbeVisibility(index, delta, distance) /
+            max(nearestDistanceSq[i], 0.09);
+        irradiance += SampleDDGIProbe(index, normal) * weight;
+        totalWeight += weight;
+    }
+    resolved = totalWeight > 1e-5;
+    return resolved ? irradiance / totalWeight * giIntensity : 0.0;
+}
+
 float3 SampleDDGIIrradiance(float3 worldPos, float3 normal) {
     if (ddgiEnabled == 0) return 0.0;
     if (sparseProbeCount > 0 && sparseCellCount > 0)
@@ -633,6 +711,61 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
     // reflected radiance by darkening the probe along the ray -- an occluded
     // reflection is strictly less bright than the open-sky probe value.
     return SampleReflectionProbe(rayDir, roughness) * enhancedReflectionOcclusion;
+}
+
+// Fills a sparse-probe miss with a traced bounce.
+//
+// Where the probe grid has nothing -- outside the layout, or every nearby
+// probe rejected on visibility or normal alignment -- SampleSparseDDGI returns
+// zero and the pixel keeps only sky ambient, losing all bounce light. That is
+// the "returns 0 outside the grid" miss signal the classification design calls
+// out: a cheap tier reporting failure rather than inventing an answer.
+//
+// One cosine-weighted hemisphere ray per miss pixel per frame, sharing the
+// reflection sampler's sequence rotation so consecutive frames draw different
+// directions. A hit is shaded from the environment along the bounce direction
+// and scaled by the occlusion factor -- the same coarse approximation the
+// reflection path uses, for the same reason: there is no hit-shading path in
+// the resolve, and a bounce that struck geometry is strictly dimmer than open
+// sky. A miss is open sky, which the probe grid would have reported as zero.
+float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
+    uint pixelSeed = MatVarHashUint(pixel.x * 2654435761u ^
+                                    pixel.y * 2246822519u);
+    uint sampleIndex = (pixelSeed + enhancedFrameIndex) & 63u;
+    float2 xi = Hammersley2D(sampleIndex, 64u);
+    xi.x = frac(xi.x + (float)(pixelSeed & 0xffffu) * 1.52587890625e-5);
+
+    // Cosine-weighted hemisphere about the normal: matches the diffuse lobe
+    // being estimated, so no extra weighting is needed at the call site.
+    float phi = 6.2831853071 * xi.x;
+    float cosTheta = sqrt(1.0 - xi.y);
+    float sinTheta = sqrt(xi.y);
+    float3 tangentSpace = float3(sinTheta * cos(phi), sinTheta * sin(phi),
+                                 cosTheta);
+    float3 up = abs(normal.z) < 0.999 ? float3(0.0, 0.0, 1.0)
+                                      : float3(1.0, 0.0, 0.0);
+    float3 tangentX = normalize(cross(up, normal));
+    float3 tangentY = cross(normal, tangentX);
+    float3 rayDir = normalize(tangentX * tangentSpace.x +
+                              tangentY * tangentSpace.y +
+                              normal * tangentSpace.z);
+
+    RayDesc ray;
+    ray.Origin = worldPos + normal * (normalBias + 0.02);
+    ray.Direction = rayDir;
+    ray.TMin = 0.0;
+    ray.TMax = enhancedReflectionRayLength;
+
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+             RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
+             RAY_FLAG_CULL_NON_OPAQUE> query;
+    query.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff, ray);
+    query.Proceed();
+
+    float3 incoming = SampleReflectionProbe(rayDir, 1.0);
+    if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+        incoming *= enhancedReflectionOcclusion;
+    return incoming * giIntensity;
 }
 
 // SVGF temporal accumulation for the stochastic RT reflection signal.
@@ -1146,8 +1279,47 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
     float3 diffuseAlbedo = surface.albedo * (1.0 - surface.metal);
     float ambientScale = surface.material.shadingParams.x;
     float3 diffuseIBL = SampleSkyIrradiance(surface.normal) * diffuseAlbedo * ambientScale;
+#if SGE_ENHANCED_VISUALS
+    // Probe-miss RT fallback: trace a bounce only where the sparse grid
+    // reported it had nothing, so cost scales with the miss fraction rather
+    // than with screen area. Falls back to the unclassified path whenever the
+    // sparse grid is not in use or the toggle is off, so behaviour is
+    // unchanged in every other configuration.
+    float3 giIrradiance;
+    if (enhancedProbeMissGI != 0 && ddgiEnabled != 0 &&
+        sparseProbeCount > 0 && sparseCellCount > 0) {
+        bool probeResolved = false;
+        giIrradiance = SampleSparseDDGIClassified(
+            surface.fragPos, surface.normal, probeResolved);
+        // enhancedProbeMissGIStrength selects how much of the GI comes from
+        // rays rather than probes:
+        //   0   fill misses only -- rays where the grid has nothing
+        //   1   full RT GI -- trace every pixel, probes unused
+        // Between the two, traced and probe irradiance are blended, so the
+        // slider walks from "cheap tier with an RT safety net" to "ray traced
+        // throughout" without a discontinuity at either end.
+        const bool traceThisPixel =
+            !probeResolved || enhancedProbeMissGIStrength > 0.0;
+        if (traceThisPixel) {
+            float3 traced = RayTracedProbeMissGI(
+                surface.fragPos, surface.normal, pixel);
+            // A miss has no probe value to blend against, so it takes the
+            // traced result outright whatever the strength.
+            giIrradiance = probeResolved
+                ? lerp(giIrradiance, traced, enhancedProbeMissGIStrength)
+                : traced;
+            // Bit 2 = probe-miss GI ray, distinct from shadow and reflection
+            // so the statistic shows what each tier costs.
+            outputRayMask[pixel] |= 4u;
+        }
+    } else {
+        giIrradiance = SampleDDGIIrradiance(surface.fragPos, surface.normal);
+    }
+    float3 diffuseGI = giIrradiance * diffuseAlbedo * ambientScale;
+#else
     float3 diffuseGI = SampleDDGIIrradiance(surface.fragPos, surface.normal) *
         diffuseAlbedo * ambientScale;
+#endif
     float3 reflectionIBL = SampleReflectionProbe(reflect(-V, surface.normal), surface.rough);
 #if SGE_ENHANCED_VISUALS
     // Stochastic RT reflection. Rough surfaces are skipped: their lobe is wide
