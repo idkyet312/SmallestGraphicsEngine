@@ -11258,7 +11258,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             visBuffer.SetEnhancedVisuals(
                 wantEnhanced, scene.enhancedRTShadows,
                 scene.enhancedRayClassify, scene.enhancedConfidenceThreshold,
-                g_dxrDDGI.Scene().TLASAddress());
+                g_dxrDDGI.Scene().TLASAddress(),
+                scene.enhancedRTReflections);
             scene.enhancedRayFraction = wantEnhanced
                 ? visBuffer.EnhancedRayFraction() : 0.0f;
         }
@@ -11819,12 +11820,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             mainShader.SetHDRTargetEnabled(true);
             g_meshShader.SetHDRTargetEnabled(true);
             g_terrain.SetHDRTargetEnabled(true);
+            const bool jitterExtensions = visBuffer.extensionMotionVectors;
+            // RenderForward draws terrain, floor and foliage, none of which
+            // have motion PSOs, and only the colour RTV is bound here. Leaving
+            // extension motion on would hand those draws a 2-RT PSO against 1
+            // bound target, and D3D12 silently drops every such draw -- the
+            // terrain disappears. It is enabled later, only around the bandit
+            // draws that own motion PSOs.
+            mainShader.SetExtensionMotionEnabled(false);
+            g_meshShader.SetExtensionMotionEnabled(false);
             if (!visibilityDebugActive) {
                 ProfilerDX12::Scope extensions(
                     g_profiler, "Forward Extensions", g_dx12.commandList.Get());
                 RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
                     crateModel, floorMaterial,
-                    lightSpace, shadowResource, true, !grassMSAAActive);
+                    lightSpace, shadowResource, true, !grassMSAAActive,
+                    jitterExtensions);
             }
         } else if (IsSceneScreen() && !g_game.loading.Active()) {
             XMMATRIX lightSpace = XMMatrixIdentity();
@@ -11848,6 +11859,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 mainShader.SetHDRTargetEnabled(true);
                 g_meshShader.SetHDRTargetEnabled(true);
                 g_terrain.SetHDRTargetEnabled(true);
+                // Same reasoning as the hybrid path above: RenderForward's
+                // draws have no motion PSOs and only the colour RTV is bound,
+                // so motion selection stays off here.
+                mainShader.SetExtensionMotionEnabled(false);
+                g_meshShader.SetExtensionMotionEnabled(false);
             }
             {
                 ProfilerDX12::Scope profile(g_profiler, "Forward", g_dx12.commandList.Get());
@@ -11858,13 +11874,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         // Hybrid visibility and pure forward both establish global forward
         // resources before skinned/transparent extension passes.
-        // Passes below draw after the visibility resolve and emit no motion
-        // vectors, so TAA cannot reproject them. Jittering them would shake the
-        // image with nothing to cancel it -- see GetUnjitteredProjectionMatrix.
-        const XMMATRIX extensionProj = scene.GetUnjitteredProjectionMatrix();
+        // Passes below draw after the visibility resolve. When extension motion
+        // vectors are off, TAA cannot reproject them and the sub-pixel jitter
+        // never cancels -- it reads as shaking. The toggle restores the jittered
+        // projection because the matching motion vectors make the jitter sum to
+        // zero again.
+        const XMMATRIX extensionProj = visBuffer.extensionMotionVectors
+            ? scene.GetProjectionMatrix()
+            : scene.GetUnjitteredProjectionMatrix();
         if (renderedScene && !g_emptyLevelMode && g_banditLoaded) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Bandits", g_dx12.commandList.Get());
+            // Bandits and their guns are the draws that own motion PSOs, so
+            // the motion RTV and the matching PSO selection are switched on
+            // only around them. The rest of this pass keeps a single render
+            // target and its ordinary single-RT pipelines.
+            const bool banditMotion = visBuffer.extensionMotionVectors;
+            mainShader.SetExtensionMotionEnabled(banditMotion);
+            g_meshShader.SetExtensionMotionEnabled(banditMotion);
+            visBuffer.BeginMotionDraws(g_dx12.commandList.Get());
             for (auto& bandit : g_bandits) {
                 if (!bandit) continue;
                 bandit->Draw(mainShader, scene.GetViewMatrix(),
@@ -11877,6 +11905,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 }
                 DrawSniperLaser(*bandit, scene, mainShader, geo, fogLightSpace);
             }
+            visBuffer.EndMotionDraws(g_dx12.commandList.Get());
+            mainShader.SetExtensionMotionEnabled(false);
+            g_meshShader.SetExtensionMotionEnabled(false);
             mainShader.Use(scene.wireframeMode);
         }
         if (renderedScene) {
@@ -12032,6 +12063,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             mainShader.SetHDRTargetEnabled(false);
             g_meshShader.SetHDRTargetEnabled(false);
             g_terrain.SetHDRTargetEnabled(false);
+            mainShader.SetExtensionMotionEnabled(false);
+            g_meshShader.SetExtensionMotionEnabled(false);
         }
 
         // Preserve this frame's depth for next-frame amplification-shader

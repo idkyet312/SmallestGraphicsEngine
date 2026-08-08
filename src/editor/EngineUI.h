@@ -589,13 +589,36 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ImGui::Text("  Persistent meshes: %u",
                     static_cast<UINT>(vb.meshes.size()));
                 const char* debugViews[] = {
-                    "Lit resolve", "Instance / primitive IDs", "Raw depth", "Edge mask"
+                    "Lit resolve", "Instance / primitive IDs", "Raw depth",
+                    "Edge mask", "RT reflection rays", "SVGF denoiser",
+                    "SVGF a-trous output"
                 };
                 ImGui::Combo("VB Debug View", &vb.debugViewMode,
                     debugViews, IM_ARRAYSIZE(debugViews));
                 if (vb.debugViewMode == 3 && vb.EnhancedVisualsReady())
                     ImGui::Text("  Edge fraction: %.1f%% of sampled pixels",
                                 vb.EnhancedRayFraction() * 100.0f);
+                if (vb.debugViewMode == 4) {
+                    if (!vb.EnhancedVisualsReady()) {
+                        ImGui::TextDisabled("  Needs the SM6.5 resolve");
+                    } else if (!scene.enhancedRTReflections) {
+                        ImGui::TextDisabled("  RT Reflections is off: all black");
+                    } else {
+                        ImGui::TextDisabled("  green=ray hit  blue=ray missed");
+                        ImGui::TextDisabled("  black=not eligible (rough/foliage)");
+                        ImGui::TextDisabled("  red ramp=sample index, must cycle");
+                    }
+                }
+                if (vb.debugViewMode == 5) {
+                    if (!vb.EnhancedVisualsReady()) {
+                        ImGui::TextDisabled("  Needs the SM6.5 resolve");
+                    } else if (!scene.enhancedRTReflections) {
+                        ImGui::TextDisabled("  RT Reflections is off: all black");
+                    } else {
+                        ImGui::TextDisabled("  Denoised reflection colour");
+                        ImGui::TextDisabled("  black=no hit  coloured=denoised");
+                    }
+                }
                 ImGui::SliderFloat("VB Exposure", &vb.exposure, 0.25f, 4.0f, "%.2f");
                 ImGui::SliderFloat("VB Eye Adaptation", &vb.exposureAdaptation, 0.005f, 0.25f, "%.3f");
                 ImGui::SliderFloat("VB Bloom", &vb.bloomStrength, 0.0f, 1.0f, "%.2f");
@@ -621,6 +644,38 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                         ImGui::TextDisabled("  Needs the VB path");
                     }
                     ImGui::Checkbox("  RT Sun Shadows", &scene.enhancedRTShadows);
+                    ImGui::Checkbox("  RT Reflections (noisy)",
+                                    &scene.enhancedRTReflections);
+                    if (scene.enhancedRTReflections) {
+                        ImGui::SliderFloat("  Refl Roughness Cut",
+                            &vb.enhancedReflectionRoughnessCut,
+                            0.05f, 1.0f, "%.2f");
+                        ImGui::TextDisabled(
+                            "  1 GGX ray/pixel/frame: noisy by design.");
+                        ImGui::Checkbox("  SVGF Temporal Accumulation",
+                                        &vb.svgfTemporalEnabled);
+                        if (vb.svgfTemporalEnabled) {
+                            ImGui::SliderInt("    Max Accum Frames",
+                                (int*)&vb.svgfMaxAccumFrames,
+                                4, 64);
+                            if (vb.svgfHistoryValid)
+                                ImGui::TextDisabled(
+                                    "    Reprojects + blends via 1/N EMA");
+                            else
+                                ImGui::TextDisabled(
+                                    "    Waiting for first history frame");
+                            ImGui::Checkbox("    SVGF A-Trous Spatial Filter",
+                                            &vb.svgfAtrousEnabled);
+                            if (vb.svgfAtrousEnabled) {
+                                ImGui::SliderInt("      A-Trous Iterations",
+                                    (int*)&vb.svgfAtrousIterations, 1, 5);
+                                ImGui::TextDisabled(
+                                    "      Variance-driven edge stopping.");
+                                ImGui::TextDisabled(
+                                    "      Lets Max Accum Frames come down.");
+                            }
+                        }
+                    }
                     ImGui::Checkbox("  Ray Classification",
                                     &scene.enhancedRayClassify);
                     if (scene.enhancedRayClassify) {
@@ -661,6 +716,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             // averages. TAA is off by default, so this is the first AA the VB
             // path has. ~2.5% of pixels (silhouettes only).
             ImGui::Checkbox("Edge AA (N=2)", &vb.edgeAAEnabled);
+            ImGui::Checkbox("Extension Motion Vectors",
+                            &vb.extensionMotionVectors);
             if (vb.temporalEffectsEnabled) {
                 ImGui::SliderFloat("TAA History Weight", &vb.taaFeedback,
                                    0.70f, 0.95f, "%.2f");

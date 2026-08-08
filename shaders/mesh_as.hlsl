@@ -6,6 +6,14 @@ cbuffer MatrixBuffer : register(b0) {
     matrix modelView;
     matrix modelViewProjection;
     matrix previousViewProjection;
+    float4 palmWind;
+    float4 palmPrimary;
+    float4 palmSecondary;
+    float4 palmPreviousPrimary;
+    float4 palmPreviousSecondary;
+    float4 palmParams;
+    float4 palmRoot;
+    matrix previousModel;
 };
 
 cbuffer MeshDrawBuffer : register(b6) {

@@ -41,6 +41,7 @@ struct alignas(256) MatrixBufferDX12 {
     XMFLOAT4 palmPreviousSecondary;
     XMFLOAT4 palmParams;
     XMFLOAT4 palmRoot;
+    XMMATRIX previousModel;
 };
 
 inline float g_currentModelMaxScale = 1.0f;
@@ -272,11 +273,17 @@ public:
     ComPtr<ID3D12PipelineState> hdrTransparentPipelineState;
     ComPtr<ID3D12PipelineState> hdrAdditivePipelineState;
     ComPtr<ID3D12PipelineState> hdrGrassPipelineState;
+    // Extension-motion PSOs: compiled with SGE_EXTENSION_MOTION, output to
+    // SV_Target0 (colour) and SV_Target1 (motion R16G16_FLOAT).
+    ComPtr<ID3D12PipelineState> hdrMotionPipelineState;
+    ComPtr<ID3D12PipelineState> hdrMotionTransparentPipelineState;
+    ComPtr<ID3D12PipelineState> hdrMotionAdditivePipelineState;
     ComPtr<ID3DBlob> pixelShaderBlob;
     bool msaaSupported = false;
     bool msaaEnabled = false;
     bool hdrTargetEnabled = false;
     bool graphicsRootBound = false;
+    bool extensionMotionEnabled = false;
     
     // Per-draw-call constant buffers (need enough for all objects)
     UploadBuffer<MatrixBufferDX12> matrixBuffer;
@@ -443,6 +450,30 @@ public:
                 << (char*)errorBlob->GetBufferPointer() << std::endl;
             return false;
         }
+
+        // Extension motion PS: same source compiled with SV_Target1 motion
+        // output. Needed only for HDR passes (forward extensions), so compile
+        // with both SGE_EXTENSION_MOTION and SGE_HDR_TARGET.
+        const D3D_SHADER_MACRO motionDefines[] = {
+            { "SGE_HDR_TARGET", "1" },
+            { "SGE_EXTENSION_MOTION", "1" },
+            { nullptr, nullptr }
+        };
+        ComPtr<ID3DBlob> motionPsBlob;
+        errorBlob.Reset();
+        HRESULT motionHr = ShaderCacheDX12::CompileCached(
+            psCode.c_str(), psCode.length(), pixelPath,
+            motionDefines, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "ps_5_0",
+            compileFlags, 0, &motionPsBlob, &errorBlob);
+        if (FAILED(motionHr)) {
+            if (errorBlob) {
+                std::cerr << "Extension-motion pixel shader compilation error: "
+                    << (char*)errorBlob->GetBufferPointer() << std::endl;
+            }
+            // Non-fatal: motion PSOs won't be created; the toggle stays off.
+            motionPsBlob.Reset();
+        }
+
         pixelShaderBlob = psBlob;
         
         // Create root signature using version 1.0 for maximum compatibility
@@ -456,7 +487,7 @@ public:
         // 6: Descriptor table - Global SRVs (t0, t2, t3)
         // 7: Descriptor table - Material SRVs (t1, t4, t5)
         
-        D3D12_ROOT_PARAMETER rootParams[21] = {};
+        D3D12_ROOT_PARAMETER rootParams[22] = {};
         
         // CBVs (root descriptors)
         for (int i = 0; i < 6; i++) {
@@ -597,10 +628,17 @@ public:
         rootParams[18].Descriptor.RegisterSpace = 0;
         rootParams[18].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-        rootParams[19].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-        rootParams[19].Descriptor.ShaderRegister = 8;
+        // Previous-frame bone palette (t20), used with extension motion vectors
+        // to skin the previous pose so skinned limbs report proper motion.
+        rootParams[19].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParams[19].Descriptor.ShaderRegister = 20;
         rootParams[19].Descriptor.RegisterSpace = 0;
-        rootParams[19].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        rootParams[19].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        rootParams[20].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        rootParams[20].Descriptor.ShaderRegister = 8;
+        rootParams[20].Descriptor.RegisterSpace = 0;
+        rootParams[20].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         // Skinning toggle for the IA raster path (b9). This gets its own root
         // parameter on purpose: b6 is shared by grass, terrain, instancing and
@@ -608,11 +646,11 @@ public:
         // there picks up whatever that pass happened to store -- grass puts a
         // world coordinate in that slot, which reads as "skinning on" and
         // shreds every static mesh drawn afterwards.
-        rootParams[20].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        rootParams[20].Constants.ShaderRegister = 9;
-        rootParams[20].Constants.RegisterSpace = 0;
-        rootParams[20].Constants.Num32BitValues = 1;
-        rootParams[20].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rootParams[21].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rootParams[21].Constants.ShaderRegister = 9;
+        rootParams[21].Constants.RegisterSpace = 0;
+        rootParams[21].Constants.Num32BitValues = 1;
+        rootParams[21].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         // Static samplers
         D3D12_STATIC_SAMPLER_DESC staticSamplers[2] = {};
@@ -645,7 +683,7 @@ public:
         staticSamplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        rootSigDesc.NumParameters = 21;
+        rootSigDesc.NumParameters = 22;
         rootSigDesc.pParameters = rootParams;
         rootSigDesc.NumStaticSamplers = 2;
         rootSigDesc.pStaticSamplers = staticSamplers;
@@ -856,6 +894,52 @@ public:
         psoDesc.InputLayout = { inputLayout, _countof(inputLayout) };
         psoDesc.VS = { vsBlob->GetBufferPointer(), vsBlob->GetBufferSize() };
 
+        // Extension-motion PSOs: opaque HDR output (SV_Target0) + motion
+        // vectors (SV_Target1 R16G16_FLOAT). Opaque blend for both targets;
+        // motion is additive-overwrite (no blending needed). Only the HDR
+        // opaque, transparent, and additive variants are created because
+        // forward extensions always render to the HDR target.
+        if (motionPsBlob) {
+            psoDesc.PS = { motionPsBlob->GetBufferPointer(), motionPsBlob->GetBufferSize() };
+            psoDesc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            psoDesc.RTVFormats[1] = DXGI_FORMAT_R16G16_FLOAT;
+            psoDesc.NumRenderTargets = 2;
+            psoDesc.BlendState.RenderTarget[0].BlendEnable = FALSE;
+            psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+            if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                    &psoDesc, IID_PPV_ARGS(&hdrMotionPipelineState))))
+                hdrMotionPipelineState.Reset();
+
+            // Transparent motion variant
+            psoDesc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+            psoDesc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            psoDesc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            psoDesc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+            psoDesc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+            psoDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            psoDesc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                    &psoDesc, IID_PPV_ARGS(&hdrMotionTransparentPipelineState))))
+                hdrMotionTransparentPipelineState.Reset();
+
+            // Additive motion variant
+            psoDesc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            psoDesc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+            psoDesc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ZERO;
+            psoDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
+            if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                    &psoDesc, IID_PPV_ARGS(&hdrMotionAdditivePipelineState))))
+                hdrMotionAdditivePipelineState.Reset();
+
+            // Restore PS and RTV to the normal non-motion setup
+            psoDesc.PS = { pixelShaderBlob->GetBufferPointer(), pixelShaderBlob->GetBufferSize() };
+            psoDesc.NumRenderTargets = 1;
+            psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            psoDesc.BlendState.RenderTarget[0].BlendEnable = FALSE;
+            psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        }
+
         // Create constant buffers
         // Per-draw-call buffers need enough slots for all objects per frame
         if (!matrixBuffer.Create(FRAME_COUNT * MAX_DRAW_CALLS_PER_FRAME)) return false;
@@ -888,10 +972,14 @@ public:
 
     void SetHDRTargetEnabled(bool enabled) { hdrTargetEnabled = enabled; }
 
+    void SetExtensionMotionEnabled(bool enabled) { extensionMotionEnabled = enabled; }
+
     ID3D12PipelineState* GetPipelineState(bool wireframe = false) const {
         if (hdrTargetEnabled) {
             if (wireframe && hdrWireframePipelineState)
                 return hdrWireframePipelineState.Get();
+            if (extensionMotionEnabled && hdrMotionPipelineState)
+                return hdrMotionPipelineState.Get();
             return hdrPipelineState.Get();
         }
         if (msaaEnabled) {
@@ -905,14 +993,22 @@ public:
     }
 
     ID3D12PipelineState* GetTransparentPipelineState() const {
-        if (hdrTargetEnabled) return hdrTransparentPipelineState.Get();
+        if (hdrTargetEnabled) {
+            if (extensionMotionEnabled && hdrMotionTransparentPipelineState)
+                return hdrMotionTransparentPipelineState.Get();
+            return hdrTransparentPipelineState.Get();
+        }
         return msaaEnabled
             ? msaaTransparentPipelineState.Get()
             : transparentPipelineState.Get();
     }
 
     ID3D12PipelineState* GetAdditivePipelineState() const {
-        if (hdrTargetEnabled) return hdrAdditivePipelineState.Get();
+        if (hdrTargetEnabled) {
+            if (extensionMotionEnabled && hdrMotionAdditivePipelineState)
+                return hdrMotionAdditivePipelineState.Get();
+            return hdrAdditivePipelineState.Get();
+        }
         return msaaEnabled
             ? msaaAdditivePipelineState.Get()
             : additivePipelineState.Get();
@@ -971,7 +1067,7 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
         g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
         g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(g_dx12.frameIndex));
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(19,
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(20,
             shadowCascadeBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
 
@@ -981,7 +1077,7 @@ public:
     // static one, which would then pose against a stale palette.
     void SetSkinningEnabled(bool enabled) {
         const UINT value = enabled ? 1u : 0u;
-        g_dx12.commandList->SetGraphicsRoot32BitConstants(20, 1, &value, 0);
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(21, 1, &value, 0);
     }
 
     void UseTransparent() {
@@ -1105,7 +1201,8 @@ public:
     
     void SetMatrices(const XMMATRIX& model, const XMMATRIX& view,
                      const XMMATRIX& proj, const XMMATRIX& lightSpace,
-                     XMFLOAT4 palmRoot = {}) {
+                     XMFLOAT4 palmRoot = {},
+                     const XMMATRIX& previousModel = XMMATRIX{}) {
         UINT bufferIndex = GetDrawCallIndex();
         
         MatrixBufferDX12 data;
@@ -1124,6 +1221,14 @@ public:
         data.palmPreviousSecondary = palmWindFrame.previousSecondary;
         data.palmParams = palmWindFrame.params;
         data.palmRoot = palmRoot;
+        bool hasPreviousModel = false;
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                if (previousModel.r[i].m128_f32[j] != 0.0f) { hasPreviousModel = true; break; }
+            }
+            if (hasPreviousModel) break;
+        }
+        data.previousModel = XMMatrixTranspose(hasPreviousModel ? previousModel : model);
         g_currentModelMaxScale = (std::max)({
             XMVectorGetX(XMVector3Length(model.r[0])),
             XMVectorGetX(XMVector3Length(model.r[1])),
@@ -1174,7 +1279,7 @@ public:
         cascades.texelWorld = g_shadowCascadeTexelWorld;
         cascades.depthRange = g_shadowCascadeDepthRange;
         shadowCascadeBuffer.CopyData(g_dx12.frameIndex, cascades);
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(19,
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(20,
             shadowCascadeBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
     

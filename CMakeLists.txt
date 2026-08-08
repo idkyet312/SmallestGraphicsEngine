@@ -187,6 +187,16 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMENT "Compiling HDR mesh-path pixel shader"
     )
     add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/mesh_ps_motion.cso
+        COMMAND ${DXC_EXECUTABLE} -T ps_6_5 -E main
+                -D SGE_EXTENSION_MOTION=1
+                -D SGE_HDR_TARGET=1
+                ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/mesh_ps_motion.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/clustered_dx12_ps.hlsl
+        COMMENT "Compiling extension-motion mesh-path HDR pixel shader"
+    )
+    add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/terrain_as.cso
         COMMAND ${DXC_EXECUTABLE} -T as_6_5 -E ASMain
                 ${CMAKE_SOURCE_DIR}/shaders/terrain_as.hlsl
@@ -277,6 +287,7 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         ${CMAKE_BINARY_DIR}/mesh_ms.cso
         ${CMAKE_BINARY_DIR}/mesh_ps.cso
         ${CMAKE_BINARY_DIR}/mesh_ps_hdr.cso
+        ${CMAKE_BINARY_DIR}/mesh_ps_motion.cso
         ${CMAKE_BINARY_DIR}/terrain_as.cso
         ${CMAKE_BINARY_DIR}/terrain_ms.cso
         ${CMAKE_BINARY_DIR}/terrain_ps.cso
@@ -493,6 +504,7 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/mesh_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ms.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/mesh_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ps.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/mesh_ps_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ps_hdr.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/mesh_ps_motion.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/mesh_ps_motion.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_as.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_as.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ms.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps.cso

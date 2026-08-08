@@ -177,12 +177,47 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     uint  enhancedRayClassify;      // spend rays only on low-confidence pixels
     float enhancedShadowRayLength;  // TMax for shadow rays, world units
     float enhancedConfidenceThreshold;
+    // Appended, never inserted: the C++ mirror in VisibilityBufferDX12.h
+    // (UpdateEnhancedConstants) must match field-for-field in order.
+    uint  enhancedRTReflections;    // master switch for RT reflections
+    float enhancedReflectionRayLength;   // TMax for reflection rays
+    float enhancedReflectionRoughnessCut; // skip rays above this roughness
+    uint  enhancedFrameIndex;       // per-frame seed for the sampling sequence
+    float enhancedReflectionOcclusion;   // radiance scale for an occluded hit
+    float enhancedReflectionPad0;
+    float enhancedReflectionPad1;
+    float enhancedReflectionPad2;
+    // SVGF temporal accumulation for RT reflections. Append only.
+    uint  svgfTemporalEnabled;     // toggle: off by default
+    uint  svgfMaxAccumFrames;      // max N for alpha = 1/N ramp
+    uint  svgfAtrousEnabled;       // toggle: spatial à-trous filter
+    uint  svgfAtrousIterations;    // number of à-trous passes
+    uint  svgfHistoryValid;        // false on first frame/resize/toggle
+    uint3 svgfPadding;
 };
 
 // Per-pixel record of where the rays went, for the debug view and the
 // ray-fraction readback. One uint per pixel: 0 = cheap tier resolved it,
 // 1 = classified as needing RT and traced.
 RWTexture2D<uint> outputRayMask : register(u3);
+
+// Previous frame's surface IDs for exact temporal validation. 5a's rule:
+// same instance ID at the reprojected pixel = same surface = history valid.
+Texture2D<uint2> visBufferHistoryTex : register(t82);
+
+// SVGF temporal accumulation: previous frame's denoised colour and moments,
+// read from one side of the ping-pong pair.
+Texture2D<float4> svgfHistoryColor  : register(t80);
+Texture2D<float4> svgfHistoryMoments : register(t81);
+// Current frame's accumulated colour and moments, written to the other side.
+RWTexture2D<float4> svgfHistoryColorWrite  : register(u4);
+RWTexture2D<float4> svgfHistoryMomentsWrite : register(u5);
+
+// BRDF-modulated specular IBL contribution from RT reflections, written so
+// the spatial à-trous filter can operate on it separately from the main
+// lit output. RGB is the signal; alpha is matching signal variance. Zero for
+// pixels where RT reflections are not active.
+RWTexture2D<float4> outputReflectionSrc  : register(u6);
 #endif
 
 SamplerState              texSampler    : register(s0);
@@ -488,6 +523,217 @@ float RayTracedShadow(float3 worldPos, float3 normal, float3 lightDir) {
     // knows. Either way the caller decides how much to trust it.
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
 }
+
+// Hammersley point, radical-inverse base 2. Deterministic per index.
+float2 Hammersley2D(uint i, uint count) {
+    uint bits = i;
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xaaaaaaaau) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xccccccccu) >> 2u);
+    bits = ((bits & 0x0f0f0f0fu) << 4u) | ((bits & 0xf0f0f0f0u) >> 4u);
+    bits = ((bits & 0x00ff00ffu) << 8u) | ((bits & 0xff00ff00u) >> 8u);
+    return float2((float)i / (float)count, (float)bits * 2.3283064365386963e-10);
+}
+
+// GGX/Trowbridge-Reitz importance sample: returns a half-vector in world space
+// distributed by the NDF for `roughness`. Standard Karis mapping.
+float3 ImportanceSampleGGX(float2 xi, float3 normal, float roughness) {
+    float a = roughness * roughness;
+    float phi = 6.2831853071 * xi.x;
+    float cosTheta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
+    float sinTheta = sqrt(saturate(1.0 - cosTheta * cosTheta));
+
+    float3 h = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+
+    // Tangent basis around the surface normal.
+    float3 up = abs(normal.z) < 0.999 ? float3(0.0, 0.0, 1.0)
+                                      : float3(1.0, 0.0, 0.0);
+    float3 tangentX = normalize(cross(up, normal));
+    float3 tangentY = cross(normal, tangentX);
+    return normalize(tangentX * h.x + tangentY * h.y + normal * h.z);
+}
+
+// One stochastic GGX-importance-sampled reflection ray against the static
+// TLAS.
+//
+// `hit` reports whether the ray committed a triangle. The return value is a
+// complete sample on both hit and miss, so temporal accumulation never jumps
+// between a stochastic path and a deterministic fallback.
+//
+// This is deliberately ONE sample per pixel per frame, rotated by frame index:
+// that is what makes the signal genuinely stochastic, and therefore what makes
+// a temporal denoiser (Phase 5b) both necessary and measurable. A multi-sample
+// loop here would trade the denoiser's job for raw cost and hide the variance
+// the denoiser is supposed to resolve.
+//
+// The TLAS holds static geometry only, so this cannot reflect dynamic actors.
+// Shading the hit is out of scope for this pass -- the hit position is shaded
+// from the environment probe along the reflected direction, which is a coarse
+// but stable approximation that keeps this pass a single ray with no recursion.
+float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
+                           float roughness, uint2 pixel, out bool hit) {
+    hit = false;
+    if (enhancedRTReflections == 0) return float3(0.0, 0.0, 0.0);
+
+    // Per-pixel hash, rotated per frame so consecutive frames draw different
+    // samples -- temporal accumulation is what turns that into a converged
+    // image.
+    //
+    // This is white noise, deliberately. An attempt to place samples on an R2
+    // low-discrepancy lattice produced a visible structured pattern in the
+    // reflection: the offset was built as a linear function of x and y, which
+    // is a plane rather than a high-frequency field, so it read as banding.
+    // Real blue noise needs a precomputed void-and-cluster mask; an analytic
+    // substitute that gets it wrong is worse than the hash, because
+    // structured error is far more visible than random error at the same
+    // magnitude.
+    uint pixelSeed = MatVarHashUint(pixel.x * 73856093u ^ pixel.y * 19349663u);
+    uint sampleIndex = (pixelSeed + enhancedFrameIndex) & 63u;
+    float2 xi = Hammersley2D(sampleIndex, 64u);
+    // Cheap per-pixel decorrelation of the first dimension too.
+    xi.x = frac(xi.x + (float)(pixelSeed & 0xffffu) * 1.52587890625e-5);
+
+    float3 h = ImportanceSampleGGX(xi, normal, roughness);
+    float3 rayDir = reflect(-viewDir, h);
+    // Sample landed below the surface. It contributes zero to this lobe, but
+    // remains a valid every-frame sample for the temporal accumulator.
+    if (dot(rayDir, normal) <= 0.0) return 0.0;
+
+    RayDesc ray;
+    float grazing = 1.0 - saturate(dot(normal, rayDir));
+    ray.Origin = worldPos + normal * (0.02 + 0.10 * grazing);
+    ray.Direction = rayDir;
+    ray.TMin = 0.0;
+    ray.TMax = enhancedReflectionRayLength;
+
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+             RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
+             RAY_FLAG_CULL_NON_OPAQUE> query;
+    query.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff, ray);
+    query.Proceed();
+
+    if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
+        // Miss: sample the environment along this stochastic direction. Using
+        // the deterministic mirror direction here biases the estimator and
+        // recreates hit/miss flicker outside the accumulator.
+        return SampleReflectionProbe(rayDir, roughness);
+    }
+
+    hit = true;
+    // Occluded by static geometry. Without a hit-shading path, approximate the
+    // reflected radiance by darkening the probe along the ray -- an occluded
+    // reflection is strictly less bright than the open-sky probe value.
+    return SampleReflectionProbe(rayDir, roughness) * enhancedReflectionOcclusion;
+}
+
+// SVGF temporal accumulation for the stochastic RT reflection signal.
+// Reprojects history through the motion buffer, validates against 5a's
+// surface-ID test, blends with an EMA whose alpha ramps 1/n, and stores
+// updated moments for the variance estimate that Phase 5c consumes.
+//
+// currentSample: this frame's raw-traced reflection radiance
+// pixel:         screen coordinate
+// currentVisID:  this pixel's instance ID (visValue.x)
+// writeHistory:  commit the blended result to the history textures.
+//
+// `writeHistory` exists because edge AA calls ShadeSurface TWICE for the same
+// pixel (two sub-samples). Committing on both would blend this pixel's history
+// into itself a second time within one frame and advance the accumulation
+// count twice, so the EMA converges at the wrong rate wherever edge AA is
+// active -- silhouettes, exactly where reprojection is least reliable. Only
+// the centre surface commits; the edge samples read the same history and
+// return a blended colour without storing it.
+//
+// Returns the denoised (temporally blended) reflection colour.
+float3 SVGF_TemporalAccumulate(float3 currentSample, uint2 pixel,
+                               uint2 currentVisID, bool writeHistory,
+                               out float3 variance) {
+    // Reset paths below (no history, off-screen reprojection, surface-ID
+    // mismatch) all fall through to this value. A pixel with NO history is the
+    // noisiest case there is -- one raw sample, nothing averaged -- so it must
+    // report high variance, which is what tells the à-trous pass to filter it
+    // hard. Reporting zero there says "fully converged, leave alone" and is
+    // exactly backwards: disoccluded pixels would keep their raw single-sample
+    // noise forever.
+    variance = currentSample * currentSample;
+    if (svgfTemporalEnabled == 0) return currentSample;
+
+    if (svgfHistoryValid == 0) {
+        if (writeHistory) {
+            svgfHistoryColorWrite[pixel] = float4(currentSample, 0.0);
+            svgfHistoryMomentsWrite[pixel] =
+                float4(currentSample * currentSample, 1.0);
+        }
+        return currentSample;
+    }
+
+    float2 currentUV = (float2(pixel) + 0.5) / float2(screenWidth, screenHeight);
+    float2 motion = outputMotion[pixel];
+    float2 previousUV = currentUV - motion;
+
+    // History was invalidated (e.g. resize) or the reprojection landed
+    // off-screen. Reset accumulation.
+    if (any(previousUV < 0.0) || any(previousUV >= 1.0)) {
+        if (writeHistory) {
+            svgfHistoryColorWrite[pixel] = float4(currentSample, 0.0);
+            svgfHistoryMomentsWrite[pixel] =
+                float4(currentSample * currentSample, 1.0);
+        }
+        return currentSample;
+    }
+
+    int2 previousPixel = int2(previousUV * float2(screenWidth, screenHeight));
+    previousPixel = clamp(previousPixel, int2(0, 0),
+                          int2(screenWidth - 1, screenHeight - 1));
+
+    uint2 previousID = visBufferHistoryTex.Load(int3(previousPixel, 0));
+    // Reflection history uses strict instance+primitive identity. Reusing a
+    // different triangle from the same mesh smears high-frequency specular
+    // detail across folds and silhouettes.
+    if (any(previousID != currentVisID)) {
+        if (writeHistory) {
+            svgfHistoryColorWrite[pixel] = float4(currentSample, 0.0);
+            svgfHistoryMomentsWrite[pixel] =
+                float4(currentSample * currentSample, 1.0);
+        }
+        return currentSample;
+    }
+
+    float4 prevColor = svgfHistoryColor.Load(int3(previousPixel, 0));
+    float4 prevMoments = svgfHistoryMoments.Load(int3(previousPixel, 0));
+    float prevCount = prevMoments.w;
+
+    float newCount = min(prevCount + 1.0, max((float)svgfMaxAccumFrames, 1.0));
+    float alpha = 1.0 / newCount;
+
+    float3 blendedColor = lerp(prevColor.rgb, currentSample, alpha);
+
+    // Moments use a FLOORED alpha, unlike the colour above.
+    //
+    // With a pure 1/N blend the moments stop tracking as N grows, so
+    // E[x^2] - E[x]^2 decays toward zero even while each incoming sample is
+    // still very noisy. The à-trous luminance tolerance then collapses and the
+    // spatial pass turns itself off. Clamping alpha keeps the moments
+    // responsive to recent samples, which is what makes the variance describe
+    // the signal rather than the age of the average.
+    //
+    // Deriving variance from the stored moments (rather than from this frame's
+    // deviation) also keeps it stable between frames: a per-frame delta swings
+    // with every new sample, and a filter width driven by that oscillates,
+    // which reads as flashing.
+    const float momentAlpha = max(alpha, 0.0625);
+    float3 blendedSq =
+        lerp(prevMoments.rgb, currentSample * currentSample, momentAlpha);
+    float3 momentMean = lerp(prevColor.rgb, currentSample, momentAlpha);
+    variance = max(blendedSq - momentMean * momentMean, 0.0);
+
+    if (writeHistory) {
+        svgfHistoryColorWrite[pixel] = float4(blendedColor, 0.0);
+        svgfHistoryMomentsWrite[pixel] = float4(blendedSq, newCount);
+    }
+
+    return blendedColor;
+}
 #endif
 
 float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
@@ -791,8 +1037,32 @@ Surface EvaluateSurface(float3 fragPos,
     return surface;
 }
 
-float3 ShadeSurface(uint2 pixel, Surface surface) {
+#if SGE_ENHANCED_VISUALS
+struct ShadeResult {
+    float3 color;
+    float3 specularIBL;
+    float  specularVariance;
+};
+#endif
+
+// `commitTemporalHistory` is false for edge-AA sub-samples, which call this
+// twice for one pixel; see SVGF_TemporalAccumulate.
+#if SGE_ENHANCED_VISUALS
+ShadeResult ShadeSurface(uint2 pixel, Surface surface,
+                         bool commitTemporalHistory = true) {
+#else
+// Keep the unused defaulted parameter: dropping it changes the default
+// variant's DXBC (42020 -> 42024), and byte-identical output with the feature
+// off is the contract that catches silently-broken PSOs.
+float3 ShadeSurface(uint2 pixel, Surface surface,
+                    bool commitTemporalHistory = true) {
+#endif
     float3 result = 0.0;
+#if SGE_ENHANCED_VISUALS
+    float3 outSpecularIBL = 0.0;
+    float outSpecularVariance = 0.0;
+    float3 reflectionVariance = 0.0;
+#endif
     
     // Main light
     float3 L;
@@ -847,14 +1117,71 @@ float3 ShadeSurface(uint2 pixel, Surface surface) {
     float3 diffuseGI = SampleDDGIIrradiance(surface.fragPos, surface.normal) *
         diffuseAlbedo * ambientScale;
     float3 reflectionIBL = SampleReflectionProbe(reflect(-V, surface.normal), surface.rough);
+#if SGE_ENHANCED_VISUALS
+    // Stochastic RT reflection. Rough surfaces are skipped: their lobe is wide
+    // enough that one sample per frame is mostly variance, and the probe is
+    // already a reasonable answer there.
+    if (enhancedRTReflections != 0 &&
+        surface.rough <= enhancedReflectionRoughnessCut &&
+        !surface.isFoliage) {
+        bool reflectionHit = false;
+        float3 traced = RayTracedReflection(surface.fragPos, surface.normal, V,
+                                            surface.rough, pixel, reflectionHit);
+        // A miss is a real sample of the reflection integral -- it means "sky
+        // along that direction" -- so it carries the probe value rather than
+        // no value at all.
+        float3 thisFrameSample = traced;
+        if (svgfTemporalEnabled != 0) {
+            // Accumulate EVERY frame, hit or miss. Accumulating only on hits
+            // reads as unfixable grain no matter how many frames are allowed:
+            // a pixel's hit/miss status flips frame to frame (that is what the
+            // stochastic ray does), so miss frames bypassed the accumulator and
+            // showed the raw probe, while hit frames showed the converged
+            // value. The image then flickers BETWEEN the two paths, and no
+            // accumulation count can damp that because half the frames never
+            // reach the accumulator.
+            reflectionIBL = SVGF_TemporalAccumulate(
+                thisFrameSample, pixel, visBuffer.Load(int3(pixel, 0)),
+                commitTemporalHistory, reflectionVariance);
+        } else {
+            reflectionIBL = thisFrameSample;
+        }
+    }
+#endif
     float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
         texSampler, float2(NdotV, surface.rough), 0.0);
     float foliageSpecularScale = surface.isFoliage ? 0.12 : 1.0;
+#if SGE_ENHANCED_VISUALS
+    // Decomposed so the à-trous pass can isolate the specular contribution and
+    // its variance. Kept inside the guard: the default variant must retain the
+    // original single expression below, because regrouping the arithmetic
+    // changes its DXBC (42020 -> 42024) and byte-identical output with the
+    // feature off is the contract that catches silently-broken PSOs.
+    float3 specularScale =
+        (F0 * environmentBRDF.x + environmentBRDF.y) *
+        foliageSpecularScale;
+    float3 specularIBL = reflectionIBL * specularScale;
+    float3 specularContrib = specularIBL * ambientOcclusion * ambientLightingIntensity;
+    result += (diffuseIBL + diffuseGI) * ambientOcclusion * ambientLightingIntensity +
+              specularContrib;
+    if (enhancedRTReflections != 0 &&
+        surface.rough <= enhancedReflectionRoughnessCut &&
+        !surface.isFoliage) {
+        outSpecularIBL = specularContrib;
+        float3 contributionScale = specularScale * ambientOcclusion *
+                                   ambientLightingIntensity;
+        float3 contributionVariance = reflectionVariance *
+                                      contributionScale * contributionScale;
+        outSpecularVariance = dot(
+            contributionVariance, float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0));
+    }
+#else
     float3 specularIBL = reflectionIBL *
         (F0 * environmentBRDF.x + environmentBRDF.y) *
         foliageSpecularScale;
     result += (diffuseIBL + diffuseGI + specularIBL) * ambientOcclusion *
               ambientLightingIntensity;
+#endif
     result += ambientStrength * diffuseAlbedo * ambientScale *
               ambientOcclusion * ambientLightingIntensity;
     result += surface.material.emissiveOcclusion.rgb;
@@ -942,7 +1269,15 @@ float3 ShadeSurface(uint2 pixel, Surface surface) {
                                           surface.viewDir, surface.rough) * surface.albedo;
     }
     
+#if SGE_ENHANCED_VISUALS
+    ShadeResult shadeResult;
+    shadeResult.color = result;
+    shadeResult.specularIBL = outSpecularIBL;
+    shadeResult.specularVariance = outSpecularVariance;
+    return shadeResult;
+#else
     return result;
+#endif
 }
 
 // ---- Main ----
@@ -962,6 +1297,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // is read back for the ray-fraction statistic, and a stale value from a
     // previous frame would quietly inflate it.
     outputRayMask[pixel] = 0u;
+    outputReflectionSrc[pixel] = 0.0;
 #endif
 
     if (debugViewMode == 2u) {
@@ -1129,6 +1465,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                 float2(0.25, 0.25), float2(0.75, 0.75)
             };
             float3 sampleColors[2];
+            float3 sampleSpecular[2];
+            float sampleSpecularVariance[2];
             
             [unroll]
             for (uint s = 0; s < 2; ++s) {
@@ -1217,11 +1555,26 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                     fragPosS, dcs, isFoliageS,
                     wp0s, wp1s, wp2s, n0s, n1s, n2s,
                     uv0s, uv1s, uv2s, baryUsed);
-                sampleColors[s] = ShadeSurface(pixel, surfaceS);
+                // Sub-samples must not commit temporal history: two calls for
+                // one pixel would double-blend and double-advance the count.
+                ShadeResult srS = ShadeSurface(pixel, surfaceS, false);
+                sampleColors[s] = srS.color;
+                sampleSpecular[s] = srS.specularIBL;
+                sampleSpecularVariance[s] = srS.specularVariance;
             }
             
             float3 finalColor = (sampleColors[0] + sampleColors[1]) * 0.5;
             outputColor[pixel] = float4(finalColor, 1.0);
+            float3 avgSpecular = (sampleSpecular[0] + sampleSpecular[1]) * 0.5;
+            float avgSecondMoment = 0.5 * (
+                sampleSpecularVariance[0] +
+                dot(sampleSpecular[0] * sampleSpecular[0], 1.0 / 3.0) +
+                sampleSpecularVariance[1] +
+                dot(sampleSpecular[1] * sampleSpecular[1], 1.0 / 3.0));
+            float avgVariance = max(
+                avgSecondMoment - dot(avgSpecular * avgSpecular, 1.0 / 3.0),
+                0.0);
+            outputReflectionSrc[pixel] = float4(avgSpecular, avgVariance);
             edgeAAApplied = true;
         }
     }
@@ -1235,9 +1588,135 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     outputNormalRoughness[pixel] = float4(surface.normal, surface.rough);
 
 #if SGE_ENHANCED_VISUALS
+    // Debug view 4: why a pixel did or did not get a ray-traced reflection.
+    // Answers the three questions the raw noisy image cannot:
+    //   is this pixel eligible, did its ray hit, and is the sample changing?
+    //
+    //   black   no geometry / not eligible (too rough, or foliage)
+    //   blue    eligible, ray missed -- environment probe kept
+    //   green   eligible, ray hit -- traced radiance used
+    //   red channel: this frame's sample index, so a still camera should
+    //           visibly cycle. Frozen red = the frame rotation is broken,
+    //           which is the failure mode that silently defeats the denoiser.
+    if (debugViewMode == 4u) {
+        float3 debugColor = float3(0.0, 0.0, 0.0);
+        bool eligible = enhancedRTReflections != 0 &&
+                        surface.rough <= enhancedReflectionRoughnessCut &&
+                        !surface.isFoliage;
+        if (eligible) {
+            bool reflectionHit = false;
+            RayTracedReflection(surface.fragPos, surface.normal,
+                                surface.viewDir, surface.rough, pixel,
+                                reflectionHit);
+            debugColor = reflectionHit ? float3(0.0, 1.0, 0.0)
+                                       : float3(0.0, 0.0, 1.0);
+            // Screen-uniform, frame-index only: every eligible pixel gets the
+            // SAME red this frame, so the whole image pulses through a visible
+            // 64-frame cycle when the sequence rotates. A per-pixel value here
+            // is useless for this test -- static per-pixel noise and correctly
+            // rotating noise look identical in a still frame. Flat red means
+            // rotation is dead, and 5b could never converge.
+            debugColor.r = (float)(enhancedFrameIndex & 63u) / 63.0;
+        }
+        outputColor[pixel] = float4(debugColor, 1.0);
+        if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
+        return;
+    }
+
+    // Debug view 5: SVGF temporal denoiser output. Shows the denoised
+    // reflection colour for hit pixels; black otherwise. Compare against
+    // debug view 4 — the noise in 4's green pixels should be visibly reduced
+    // here as the temporal accumulation converges.
+    if (debugViewMode == 5u) {
+        float3 debugColor = float3(0.0, 0.0, 0.0);
+        bool eligible = enhancedRTReflections != 0 &&
+                        surface.rough <= enhancedReflectionRoughnessCut &&
+                        !surface.isFoliage;
+        if (eligible) {
+            bool reflectionHit = false;
+            float3 traced = RayTracedReflection(
+                surface.fragPos, surface.normal,
+                surface.viewDir, surface.rough, pixel, reflectionHit);
+            // Mirror the lit path: misses carry the probe, so this view shows
+            // what shading actually uses rather than a hit-only subset.
+            float3 sample = traced;
+            // Debug view only: never commit, or switching to this view would
+            // corrupt the history the lit path is accumulating.
+            float3 debugVariance;
+            debugColor = SVGF_TemporalAccumulate(
+                sample, pixel, visBuffer.Load(int3(pixel, 0)), false,
+                debugVariance);
+        }
+        outputColor[pixel] = float4(debugColor, 1.0);
+        if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
+        return;
+    }
+
+    // Debug view 6: specular IBL contribution (BRDF-modulated) that feeds
+    // into the spatial à-trous filter. Shows the pre-filter reflection signal,
+    // coloured white where RT reflections are active. Compare against view 5
+    // — the same signal, pre-BRDF vs post-BRDF.
+    if (debugViewMode == 6u) {
+        float3 debugColor = float3(0.0, 0.0, 0.0);
+        bool eligible = enhancedRTReflections != 0 &&
+                        surface.rough <= enhancedReflectionRoughnessCut &&
+                        !surface.isFoliage;
+        if (eligible) {
+            bool reflectionHit = false;
+            float3 traced = RayTracedReflection(
+                surface.fragPos, surface.normal,
+                surface.viewDir, surface.rough, pixel, reflectionHit);
+            float3 thisFrameSample = traced;
+            float3 debugVariance;
+            float3 reflIBL = svgfTemporalEnabled != 0
+                ? SVGF_TemporalAccumulate(thisFrameSample, pixel,
+                    visBuffer.Load(int3(pixel, 0)), false, debugVariance)
+                : thisFrameSample;
+            // Apply BRDF mirroring the lit path so the debug view matches
+            // what the spatial filter receives.
+            float2 envBRDF = brdfIntegrationLUT.SampleLevel(
+                texSampler,
+                float2(max(dot(surface.normal, surface.viewDir), 0.0),
+                       surface.rough), 0.0);
+            float foliageScale = surface.isFoliage ? 0.12 : 1.0;
+            float3 F0 = lerp(float3(0.04, 0.04, 0.04), surface.albedo, surface.metal);
+            debugColor = reflIBL *
+                (F0 * envBRDF.x + envBRDF.y) * foliageScale;
+        }
+        outputColor[pixel] = float4(debugColor, 1.0);
+        if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
+        return;
+    }
+#endif
+
+#if SGE_ENHANCED_VISUALS
     if (!edgeAAApplied) {
-        float3 result = ShadeSurface(pixel, surface);
-        outputColor[pixel] = float4(result, 1.0);
+        ShadeResult sr = ShadeSurface(pixel, surface);
+        outputColor[pixel] = float4(sr.color, 1.0);
+        outputReflectionSrc[pixel] =
+            float4(sr.specularIBL, sr.specularVariance);
+    } else if (svgfTemporalEnabled != 0 && enhancedRTReflections != 0 &&
+               surface.rough <= enhancedReflectionRoughnessCut &&
+               !surface.isFoliage) {
+        // Edge AA shaded this pixel from its sub-samples, and those
+        // deliberately do not commit temporal history. Without this, history
+        // would never advance on silhouette pixels: the accumulation count
+        // would stay pinned and the denoiser would silently stop converging
+        // exactly where the signal is noisiest. Commit once from the centre
+        // surface, discarding the colour -- outputColor already holds the
+        // edge-AA result.
+        bool centreHit = false;
+        float3 centreTraced = RayTracedReflection(
+            surface.fragPos, surface.normal, surface.viewDir,
+            surface.rough, pixel, centreHit);
+        // Commit on misses too, matching ShadeSurface: a miss contributes the
+        // probe value, and skipping those frames is what made the accumulator
+        // flicker between converged and raw.
+        float3 centreSample = centreTraced;
+        float3 centreVariance;
+        SVGF_TemporalAccumulate(centreSample, pixel,
+                                visBuffer.Load(int3(pixel, 0)), true,
+                                centreVariance);
     }
 #else
     float3 result = ShadeSurface(pixel, surface);

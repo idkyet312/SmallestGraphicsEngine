@@ -143,6 +143,16 @@ struct PS_INPUT {
     float2 texCoord : TEXCOORD2;
     float4 tangent : TEXCOORD3;
     float4 fragPosLightSpace : TEXCOORD4;
+#ifdef SGE_EXTENSION_MOTION
+    // Only the extension-motion variant reads these. Declaring them
+    // unconditionally breaks every other consumer of this pixel shader: this
+    // file is also compiled as terrain_ps/terrain_ps_hdr, and terrain_ms.hlsl
+    // emits no clip positions, so the PS input signature stops matching the
+    // mesh shader output and PSO creation fails -- terrain then silently never
+    // draws because TerrainRendererDX12 leaves `supported` false.
+    float4 currentClip : TEXCOORD5;
+    float4 previousClip : TEXCOORD6;
+#endif
 };
 
 // Smooth 3D value noise from integer avalanche hashing (same mixer as
@@ -566,14 +576,35 @@ float3 FinalizeOutput(float3 color) {
 #endif
 }
 
+#ifdef SGE_EXTENSION_MOTION
+struct PS_OUTPUT {
+    float4 color : SV_Target0;
+    float2 motion : SV_Target1;
+};
+
+float2 ComputeMotion(PS_INPUT input) {
+    float2 currentUV = (input.currentClip.xy / input.currentClip.w) * float2(0.5, -0.5) + 0.5;
+    float2 previousUV = (input.previousClip.xy / input.previousClip.w) * float2(0.5, -0.5) + 0.5;
+    return currentUV - previousUV;
+}
+#define RETURN_COLOR(albedo, alphaV) { PS_OUTPUT o; o.color = float4(albedo, alphaV); o.motion = ComputeMotion(input); return o; }
+#else
+#define RETURN_COLOR(albedo, alphaV) return float4(albedo, alphaV)
+#endif
+
 #ifdef SGE_TERRAIN_PBR
 #include "terrain_pbr.hlsli"
 #endif
 
-float4 main(PS_INPUT input) : SV_TARGET {
+#ifdef SGE_EXTENSION_MOTION
+PS_OUTPUT main(PS_INPUT input)
+#else
+float4 main(PS_INPUT input) : SV_TARGET
+#endif
+{
     // Solid unlit emissive geometry. Additive PSO turns opacity into glow weight.
     if (smokeMode > 1.5) {
-        return float4(FinalizeOutput(objectColor), opacity);
+        RETURN_COLOR(FinalizeOutput(objectColor), opacity);
     }
 
     // Unlit soft smoke sprite: sample the puff texture, tint by objectColor, and
@@ -590,7 +621,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
         // Tone-map/encode to match the rest of the frame's output.
         float3 c = smoke.rgb * objectColor;
         c = FinalizeOutput(c);
-        return float4(c, a);
+        RETURN_COLOR(c, a);
     }
 
     float3 normal = normalize(input.normal);
@@ -990,7 +1021,7 @@ float4 main(PS_INPUT input) : SV_TARGET {
 
     // AgX (Punchy) tone mapping; returns display-encoded sRGB.
     result = FinalizeOutput(result);
-    return float4(result, surfaceOpacity);
+    RETURN_COLOR(result, surfaceOpacity);
 }
 
 
