@@ -452,6 +452,17 @@ struct Scene {
     // keep" number -- expect 0.05-0.20 on typical scenes.
     float enhancedRayFraction = 0.0f;
 
+    // Bindless material textures: SceneMaterial geometry samples its maps
+    // through ResourceDescriptorHeap[] instead of a per-draw descriptor table.
+    // This removes the 64-distinct-texture ceiling the visibility resolve
+    // inherits from its fixed-size table, and drops one root-descriptor-table
+    // set per textured draw.
+    //
+    // Off by default: it needs SM 6.6 + Resource Binding Tier 3, and it stays
+    // opt-in until visual parity and PIX validation are signed off. With it
+    // off, the legacy heaps, shaders and FXC resolve run exactly as before.
+    bool bindlessMaterials   = false;
+
     // DXGI present sync interval: 0 uncapped (tearing allowed), 1 every vblank,
     // 2+ divides the refresh rate (2 = half, 3 = a third...). Kept as the raw
     // interval rather than a bool so the UI can expose the divisors.

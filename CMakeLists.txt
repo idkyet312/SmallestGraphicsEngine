@@ -428,6 +428,13 @@ if(BUILD_TESTING)
     target_link_libraries(CookedAssetFormatTests PRIVATE SGEProjectHeaders)
     add_test(NAME CookedAssetFormatTests COMMAND CookedAssetFormatTests)
 
+    # Pure CPU test for the bindless descriptor index allocator. Links no D3D
+    # libraries on purpose -- BindlessHeapDX12.h keeps the range arithmetic
+    # free of device calls so it can be tested without a GPU.
+    add_executable(BindlessHeapTests tests/BindlessHeapTests.cpp)
+    target_link_libraries(BindlessHeapTests PRIVATE SGEProjectHeaders)
+    add_test(NAME BindlessHeapTests COMMAND BindlessHeapTests)
+
     add_executable(RagdollAssetTests tests/RagdollAssetTests.cpp)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
     target_compile_definitions(RagdollAssetTests PRIVATE

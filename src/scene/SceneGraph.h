@@ -62,6 +62,32 @@ struct SceneMaterial {
     // See ShaderDX12::SetObjectMaterial.
     UINT srvHeapSlot = ~0u;
 
+    // Bindless tier: absolute indices into the separate bindless descriptor
+    // heap, valid only while bindlessGeneration matches the allocator's current
+    // generation. Unlike srvHeapSlot these are three independent indices, not a
+    // 3-descriptor table base, because the bindless heap deduplicates on the
+    // texture resource -- two materials sharing an albedo share its descriptor.
+    //
+    // Generation-stamped rather than cleared on scene teardown: a material can
+    // outlive the scene that registered it, and walking every material to clear
+    // stale indices is both slower and easy to miss a path in.
+    UINT bindlessAlbedoIndex = ~0u;
+    UINT bindlessNormalIndex = ~0u;
+    UINT bindlessMetalRoughIndex = ~0u;
+    UINT bindlessGeneration = 0;
+
+    // Drop every cached texture binding, legacy and bindless alike. Texture
+    // overrides must call this rather than clearing srvHeapSlot by hand --
+    // missing the bindless fields there leaves the material sampling its old
+    // texture through a stale descriptor index.
+    void InvalidateTextureBindings() {
+        srvHeapSlot = ~0u;
+        bindlessAlbedoIndex = ~0u;
+        bindlessNormalIndex = ~0u;
+        bindlessMetalRoughIndex = ~0u;
+        bindlessGeneration = 0;
+    }
+
     // Keep upload heaps alive until GPU finishes
     std::vector<ComPtr<ID3D12Resource>> uploadHeaps;
 };

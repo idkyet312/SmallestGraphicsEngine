@@ -1343,7 +1343,7 @@ static bool ApplyDarkGreenToHumvee() {
                 primitive.material->baseColorFactor.x = 0.18f;
                 primitive.material->baseColorFactor.y = 0.30f;
                 primitive.material->baseColorFactor.z = 0.12f;
-                primitive.material->srvHeapSlot = ~0u;
+                primitive.material->InvalidateTextureBindings();
                 changed = true;
             }
         }
@@ -4469,7 +4469,9 @@ static void ApplyPrefabMaterialOverrides(const PrefabAsset& prefab,
                     material->baseColorTexture = GLBImporter::LoadTextureFromFile(
                         overrideValue.texture.string(), g_dx12.device,
                         g_dx12.commandList, material->uploadHeaps);
-                    material->srvHeapSlot = ~0u;
+                    // The copy inherits the source material's cached bindings,
+                    // which point at the *old* albedo. Drop all of them.
+                    material->InvalidateTextureBindings();
                     primitive.material = std::move(material);
                 }
             }
