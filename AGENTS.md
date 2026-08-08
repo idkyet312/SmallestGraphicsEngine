@@ -101,6 +101,27 @@ probe-layout) — there is no GPU test harness.
 - `SGE_SERIAL_COMPUTE=1` forces async compute to serialise — the bisection
   tool for telling a scheduling bug from a shading bug.
 
+## Which model runs a task
+
+Each task file states the model to use. The deciding question is not task
+size, it is **what happens when the model gets it subtly wrong**.
+
+The automated gates here are weak in one specific way: `ctest` is CPU-only
+and **cannot see the frame**. Shader disassembly size catches large
+structural mistakes, not two-line semantic ones. So a task that can silently
+change the rendered image needs the stronger model however few lines it
+touches.
+
+- **Cheaper/faster model** — the design is fully specified and the change is
+  mechanical, so a wrong answer surfaces as a compile error or a failed test.
+- **Stronger model** — the task touches the default resolve path, requires
+  choosing an algorithm or a fallback, is judged by eye rather than by a
+  test, or carries a "leave this alone" clause. That clause always means
+  something *looks* redundant and is not.
+
+When unsure, use the stronger model. The price difference is cents; a silent
+frame regression costs an afternoon of bisecting.
+
 ## Escalate before doing these
 
 Stop and ask rather than deciding alone:
