@@ -3398,6 +3398,28 @@ static void BuildDXRDDGINodeScene(
                 geometry.metallic = primitive.material->metallicFactor;
                 geometry.roughness = primitive.material->roughnessFactor;
             }
+            // Bind this geometry to the visibility buffer's persistent copy of
+            // the same mesh, so the inline RayQuery path can shade a hit from
+            // the real triangle instead of approximating it with sky.
+            //
+            // Read rather than register: this runs during an acceleration
+            // rebuild, which is not a frame, and RegisterPrimitive would upload
+            // geometry outside the renderer's own ordering. A primitive the
+            // rasterizer has not drawn yet simply stays invalid until the next
+            // rebuild picks it up -- those rays keep today's approximation.
+            UINT vbVertexOffset = 0, vbIndexOffset = 0, vbHasIndices = 0;
+            if (visBuffer.MeshGeometryBinding(primitive.visibilityMeshID,
+                    vbVertexOffset, vbIndexOffset, vbHasIndices)) {
+                geometry.vbVertexOffset = vbVertexOffset;
+                geometry.vbIndexOffset = vbIndexOffset;
+                geometry.vbHasIndices = vbHasIndices;
+                geometry.vbMeshValid = true;
+                UINT materialID = 0;
+                if (primitive.material &&
+                    visBuffer.ExistingMaterialID(primitive.material.get(),
+                                                 materialID))
+                    geometry.vbMaterialID = materialID;
+            }
             geometries.push_back(geometry);
             sourceHash = DXRDDGIHash(sourceHash, geometry.vertexCount);
             sourceHash = DXRDDGIHash(sourceHash, geometry.indexCount);
@@ -3507,7 +3529,13 @@ static bool BuildDXRDDGIAccelerationScene() {
             instances.push_back(terrain);
         }
     }
-    return g_dxrDDGI.UpdateTLAS(commandList.Get(), instances);
+    const bool updated = g_dxrDDGI.UpdateTLAS(commandList.Get(), instances);
+    // Publish the per-geometry hit bindings the TLAS build just produced, so
+    // the inline RayQuery path can shade a hit from the real triangle. Safe to
+    // write in place here: WaitForGPUAllFrames above drained every frame slot.
+    if (updated)
+        visBuffer.UploadHitGeometry(g_dxrDDGI.Scene().HitGeometry());
+    return updated;
 }
 
 static bool RebuildDXRDDGIProbeLayout(bool force) {

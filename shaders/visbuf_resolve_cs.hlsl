@@ -198,7 +198,11 @@ cbuffer EnhancedVisualsBuffer : register(b5) {
     // Claimed from svgfPadding, so the buffer stays 80 bytes and no field
     // offset moves. 0 = fill probe misses only, 1 = full RT GI.
     float enhancedProbeMissGIStrength;
-    uint2 svgfPadding;
+    // Entries in hitGeometry. Zero means the acceleration structure carries no
+    // visibility-buffer bindings, so ray hits fall back to the sky
+    // approximation instead of reading a wrong triangle.
+    uint  enhancedHitGeometryCount;
+    uint  svgfPadding;
 };
 
 // Per-pixel record of where the rays went, for the debug view and the
@@ -230,6 +234,27 @@ RWTexture2D<float4> outputReflectionSrc  : register(u6);
 StructuredBuffer<uint> stableTriangleIDs : register(t83);
 Texture2D<uint2> svgfStableSurfaceHistory : register(t84);
 RWTexture2D<uint2> svgfStableSurfaceCurrent : register(u7);
+
+// Binds a raytracing hit to this shader's persistent geometry.
+//
+// The TLAS is built from per-primitive vertex buffers while this shader reads
+// the global packed vertices/indices addressed by vertexOffset/indexOffset --
+// two independent indexes over the same source data. This table is what lets a
+// ray hit reach the same triangle the rasterizer would have shaded, which is
+// what makes bounce light carry real surface colour instead of dimmed sky.
+//
+// Indexed by CommittedInstanceContributionToHitGroupIndex() +
+// CommittedGeometryIndex(), the same addressing the DispatchRays shader table
+// uses. Mirrors DXRScene::HitGeometryData; keep the two in step.
+struct HitGeometry {
+    uint vertexOffset;
+    uint indexOffset;
+    uint hasIndices;
+    uint materialID;
+    uint valid;      // 0 when this geometry has no visibility-buffer mesh
+    uint3 pad;
+};
+StructuredBuffer<HitGeometry> hitGeometry : register(t85);
 #endif
 
 SamplerState              texSampler    : register(s0);
@@ -640,6 +665,151 @@ float3 ImportanceSampleGGX(float2 xi, float3 normal, float roughness) {
     return normalize(tangentX * h.x + tangentY * h.y + normal * h.z);
 }
 
+// Radiance leaving a committed ray hit, shaded from the real surface.
+//
+// This is what the hit-geometry table buys. Without it a hit can only be
+// approximated -- the sky probe along the ray, scaled by a constant -- so a
+// ray striking a red wall returns dimmed grey instead of red. That is why
+// bounce light carried no surface colour, and it is the reason the plan calls
+// the missing hit binding the gating blocker for GI and reflections.
+//
+// The shading is deliberately single-bounce and direct-only:
+//   * albedo comes from the material's base colour factor,
+//   * the geometric normal comes from the hit triangle's interpolated normals,
+//   * incident light is the sun (shadowed by a second ray) plus sky irradiance.
+// No recursion, no texture fetch. Textures need UV gradients, which do not
+// exist for a ray -- a ray has no screen-space derivative, so a mip level would
+// have to be invented. The base colour factor already carries most of the
+// low-frequency colour that bounce lighting depends on, and this signal is
+// consumed by a diffuse integrator that cannot resolve texture detail anyway.
+//
+// `resolved` reports whether real surface data was found. When false the caller
+// keeps its existing approximation rather than substituting a wrong answer:
+// the geometry may predate the hit-geometry upload, or be terrain, which has no
+// visibility-buffer registration.
+float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+                            RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
+                            RAY_FLAG_CULL_NON_OPAQUE> query,
+                   float3 rayDir, out bool resolved) {
+    resolved = false;
+    if (enhancedHitGeometryCount == 0) return float3(0.0, 0.0, 0.0);
+
+    // Same addressing the DispatchRays shader table uses: the instance's
+    // contribution selects its mesh's first record, the geometry index offsets
+    // within it.
+    uint bindingIndex = query.CommittedInstanceContributionToHitGroupIndex() +
+                        query.CommittedGeometryIndex();
+    if (bindingIndex >= enhancedHitGeometryCount)
+        return float3(0.0, 0.0, 0.0);
+
+    HitGeometry binding = hitGeometry[bindingIndex];
+    if (binding.valid == 0) return float3(0.0, 0.0, 0.0);
+
+    // The BLAS and the visibility buffer consume the same index array in the
+    // same order, so the committed primitive index addresses the same triangle
+    // in both.
+    // Named hitTriangle, not triangle: the latter is an HLSL keyword (geometry
+    // shader input modifier) and does not parse as an identifier.
+    uint hitTriangle = query.CommittedPrimitiveIndex();
+    uint i0, i1, i2;
+    if (binding.hasIndices) {
+        i0 = indices[binding.indexOffset + hitTriangle * 3 + 0];
+        i1 = indices[binding.indexOffset + hitTriangle * 3 + 1];
+        i2 = indices[binding.indexOffset + hitTriangle * 3 + 2];
+    } else {
+        i0 = hitTriangle * 3 + 0;
+        i1 = hitTriangle * 3 + 1;
+        i2 = hitTriangle * 3 + 2;
+    }
+
+    PackedVertex pv0 = vertices[binding.vertexOffset + i0];
+    PackedVertex pv1 = vertices[binding.vertexOffset + i1];
+    PackedVertex pv2 = vertices[binding.vertexOffset + i2];
+
+    // Barycentrics come straight from the intersection -- no need to
+    // reconstruct them from a world position as the primary hit does.
+    float2 bary = query.CommittedTriangleBarycentrics();
+    float3 weights = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
+
+    float3 n0 = float3(pv0.d0.w, pv0.d1.xy);
+    float3 n1 = float3(pv1.d0.w, pv1.d1.xy);
+    float3 n2 = float3(pv2.d0.w, pv2.d1.xy);
+    float3 objectNormal = n0 * weights.x + n1 * weights.y + n2 * weights.z;
+
+    // Vertices are object space; the hit is in world space. The instance
+    // transform is available from the query, and its inverse-transpose is what
+    // a normal needs -- but for the rigid, uniformly scaled transforms this
+    // scene instances with, the 3x3 itself is correct up to the normalize
+    // below. Non-uniform scale would skew this; it would show as slightly
+    // wrong bounce falloff, not as a structural error.
+    float3x4 objectToWorld = query.CommittedObjectToWorld3x4();
+    float3 worldNormal = normalize(float3(
+        dot(objectToWorld[0].xyz, objectNormal),
+        dot(objectToWorld[1].xyz, objectNormal),
+        dot(objectToWorld[2].xyz, objectNormal)));
+    // Face the normal against the incoming ray. Back faces are reached through
+    // double-sided geometry, where the stored normal points away from the ray
+    // and would otherwise light the surface from behind -- the same failure the
+    // old faked normal had, just less often.
+    if (dot(worldNormal, rayDir) > 0.0) worldNormal = -worldNormal;
+
+    // Base colour factor only. textureIndices are deliberately not sampled:
+    // see the note above on missing UV gradients.
+    float3 albedo = float3(0.72, 0.70, 0.66);
+    if (binding.materialID != 0) {
+        MaterialData hitMaterial = materials[binding.materialID];
+        albedo = hitMaterial.baseColorFactor.rgb;
+    }
+
+    float3 hitPos = query.WorldRayOrigin() +
+                    rayDir * query.CommittedRayT();
+
+    // Sky seen by the hit surface, damped.
+    //
+    // The full hemisphere value would double-count: the resolve already adds
+    // sky ambient to the shaded pixel separately, so returning an undamped sky
+    // term here makes every bounce a second sky light. At GI strength 1 -- where
+    // every pixel traces -- that dominates the reflected sun and washes indirect
+    // light toward flat sky blue instead of picking up the colour of whatever
+    // the ray actually hit. A bounce should be mostly reflected sunlight tinted
+    // by the hit albedo; the sky is the smaller ambient part of it.
+    const float kBounceSkyDamping = 0.25;
+    float3 incoming = SampleSkyIrradiance(worldNormal) * kBounceSkyDamping;
+
+    // Direct sun at the hit, shadowed by a second ray. Without this test every
+    // bounce surface is lit as though unoccluded, which reads as light leaking
+    // through walls -- most visible in exactly the interior spaces where the
+    // probe grid misses and this path is doing the work.
+    if (lightType == 0) {
+        // Same convention the primary lighting uses: for a directional light
+        // lightPos IS the direction toward the sun, not a position. Negating it
+        // here lit every bounce surface from the wrong side, leaving the sky
+        // term to dominate and washing indirect light blue.
+        float3 sunDir = normalize(lightPos);
+        float sunNdotL = saturate(dot(worldNormal, sunDir));
+        if (sunNdotL > 0.0) {
+            RayDesc shadowRay;
+            shadowRay.Origin = hitPos + worldNormal * 0.02;
+            shadowRay.Direction = sunDir;
+            shadowRay.TMin = 0.0;
+            shadowRay.TMax = enhancedShadowRayLength;
+            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+                     RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
+                     RAY_FLAG_CULL_NON_OPAQUE> shadowQuery;
+            shadowQuery.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff,
+                                       shadowRay);
+            shadowQuery.Proceed();
+            if (shadowQuery.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+                incoming += lightColor * sunNdotL;
+        }
+    }
+
+    resolved = true;
+    // Lambertian reflectance. The albedo is what makes this carry colour, and
+    // it is the whole point of the table.
+    return incoming * albedo;
+}
+
 // One stochastic GGX-importance-sampled reflection ray against the static
 // TLAS.
 //
@@ -707,9 +877,16 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
     }
 
     hit = true;
-    // Occluded by static geometry. Without a hit-shading path, approximate the
-    // reflected radiance by darkening the probe along the ray -- an occluded
-    // reflection is strictly less bright than the open-sky probe value.
+    // Shade the hit surface where its geometry is bound, so a reflection shows
+    // what it actually reflects rather than a dimmed sky. Reflections are where
+    // this matters most: they are high-contrast and directly visible, so a
+    // wrong colour reads as an obviously wrong mirror.
+    bool resolved = false;
+    float3 shaded = ShadeRayHit(query, rayDir, resolved);
+    if (resolved) return shaded;
+    // Unbound geometry (terrain, or a mesh registered after the last
+    // acceleration rebuild): fall back to darkening the probe along the ray --
+    // an occluded reflection is strictly less bright than the open-sky value.
     return SampleReflectionProbe(rayDir, roughness) * enhancedReflectionOcclusion;
 }
 
@@ -763,8 +940,14 @@ float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
     query.Proceed();
 
     float3 incoming = SampleReflectionProbe(rayDir, 1.0);
-    if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
-        incoming *= enhancedReflectionOcclusion;
+    if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        // Real hit shading where the geometry is bound, so a bounce off a
+        // coloured surface carries that colour. This is the difference between
+        // GI that only darkens and GI that bleeds colour.
+        bool resolved = false;
+        float3 shaded = ShadeRayHit(query, rayDir, resolved);
+        incoming = resolved ? shaded : incoming * enhancedReflectionOcclusion;
+    }
     return incoming * giIntensity;
 }
 

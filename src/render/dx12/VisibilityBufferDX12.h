@@ -334,6 +334,12 @@ public:
     ComPtr<ID3D12Resource> indexDataUpload;
     ComPtr<ID3D12Resource> stableTriangleDataBuffer;
     ComPtr<ID3D12Resource> stableTriangleDataUpload;
+    // Per-geometry binding from a raytracing hit to this buffer's persistent
+    // geometry. Written only when the acceleration structure is rebuilt, which
+    // is a rare, already-GPU-drained event, so it lives on an upload heap and
+    // is written in place rather than staged through a copy.
+    ComPtr<ID3D12Resource> hitGeometryBuffer;
+    UINT hitGeometryCount = 0;
     ComPtr<ID3D12Resource> clusterDataBuffer;     // StructuredBuffer<ClusterData>
     ComPtr<ID3D12Resource> clusterDataUpload;
     ComPtr<ID3D12Resource> materialDataBuffer;
@@ -614,6 +620,34 @@ public:
             primitive->visibilityMeshID = mesh;
         }
         return mesh;
+    }
+
+    // Persistent geometry residency for a registered mesh.
+    //
+    // Exposed for the raytracing hit path: the TLAS is built from
+    // MeshPrimitive::vertexBuffer while the resolve reads the global packed
+    // buffers addressed by these offsets, so a ray hit needs this to reach the
+    // same triangle. Safe to snapshot at acceleration-structure build time
+    // because RegisterMesh is upload-once -- these offsets never move for the
+    // lifetime of a mesh.
+    bool MeshGeometryBinding(UINT meshID, UINT& vertexOffset,
+                             UINT& indexOffset, UINT& hasIndices) const {
+        if (meshID == VB_INVALID_MESH || meshID >= meshes.size()) return false;
+        const VBMeshData& mesh = meshes[meshID];
+        vertexOffset = mesh.vertexOffset;
+        indexOffset = mesh.indexOffset;
+        hasIndices = mesh.hasIndices;
+        return true;
+    }
+
+    // Material slot a SceneMaterial already occupies, without registering one.
+    // Returns false before the material has been seen by RegisterMaterial,
+    // which is the common case during an early acceleration-structure build.
+    bool ExistingMaterialID(const SceneMaterial* material, UINT& id) const {
+        const auto found = materialLookup.find(material);
+        if (found == materialLookup.end()) return false;
+        id = found->second;
+        return true;
     }
 
     // Register only mutable instance/material data for this frame.
@@ -2314,6 +2348,32 @@ private:
                                      clusterDataBuffer, clusterDataUpload))
             return false;
 
+        // Hit-geometry bindings for the raytracing hit path. Upload heap only:
+        // it is written on acceleration rebuilds, never per frame, so the extra
+        // copy a default heap would need buys nothing.
+        {
+            D3D12_HEAP_PROPERTIES uploadHeap = {};
+            uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC bufDesc = {};
+            bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            // 32 bytes per entry, matching DXRScene::HitGeometryData and the
+            // shader's HitGeometry. Sized here rather than from the C++ type so
+            // this header does not have to include DXRScene.h.
+            bufDesc.Width =
+                static_cast<UINT64>(VB_MAX_HIT_GEOMETRY) * kHitGeometryStride;
+            bufDesc.Height = 1;
+            bufDesc.DepthOrArraySize = 1;
+            bufDesc.MipLevels = 1;
+            bufDesc.Format = DXGI_FORMAT_UNKNOWN;
+            bufDesc.SampleDesc.Count = 1;
+            bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(g_dx12.device->CreateCommittedResource(
+                    &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    IID_PPV_ARGS(&hitGeometryBuffer))))
+                return false;
+        }
+
         D3D12_HEAP_PROPERTIES materialHeap = {};
         materialHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC materialDesc = {};
@@ -2636,7 +2696,10 @@ private:
             UINT  svgfAtrousIters;
             UINT  svgfHistoryValid;
             float probeMissGIStrength;
-            UINT  svgfPad1;
+            // Entries in the hit-geometry table. Zero disables real hit
+            // shading, so a scene whose acceleration structure has not been
+            // rebuilt since this feature landed keeps the sky approximation.
+            UINT  hitGeometryCount;
             UINT  svgfPad2;
         } constants;
         static_assert(sizeof(EnhancedConstants) == 80,
@@ -2662,7 +2725,7 @@ private:
             svgfAtrousIterations, 1u, kSVGFAtrousMaxIterations);
         constants.svgfHistoryValid = svgfHistoryValid ? 1u : 0u;
         constants.probeMissGIStrength = enhancedProbeMissGIStrength;
-        constants.svgfPad1 = 0u;
+        constants.hitGeometryCount = hitGeometryCount;
         constants.svgfPad2 = 0u;
         const UINT64 constantOffset =
             static_cast<UINT64>(frameSlot) * 256ull;
@@ -2729,7 +2792,8 @@ private:
         //   [95]     t83      local-to-stable triangle map
         //   [96]     t84      stable surface history
         //   [97]     u7       current stable surfaces
-        D3D12_DESCRIPTOR_RANGE ranges[15] = {};
+        //   [98]     t85      raytracing hit geometry bindings
+        D3D12_DESCRIPTOR_RANGE ranges[16] = {};
         ranges[0] = baseRanges[0];                          // t0..t78
         ranges[1] = baseRanges[1];                          // u0..u2 @ 79
         ranges[2] = baseRanges[2];                          // b1..b4 @ 82
@@ -2805,6 +2869,12 @@ private:
         ranges[14].BaseShaderRegister = 7;
         ranges[14].RegisterSpace = 0;
         ranges[14].OffsetInDescriptorsFromTableStart = 97;
+
+        ranges[15].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[15].NumDescriptors = 1;
+        ranges[15].BaseShaderRegister = 85;                 // t85 hitGeometry
+        ranges[15].RegisterSpace = 0;
+        ranges[15].OffsetInDescriptorsFromTableStart = 98;
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -3383,7 +3453,7 @@ private:
         if (!enhancedComputeDescHeaps[frameSlot]) {
             D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
             heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            heapDesc.NumDescriptors = 98;
+            heapDesc.NumDescriptors = 99;
             heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             if (FAILED(g_dx12.device->CreateDescriptorHeap(
                     &heapDesc,
@@ -3554,10 +3624,70 @@ private:
             g_dx12.device->CreateUnorderedAccessView(
                 svgfStableSurfaceCurrent.Get(), nullptr, &uav, h);
         }
+
+        // [98] t85 - per-geometry raytracing hit bindings. NumElements follows
+        // the uploaded count so an out-of-range hit index reads nothing rather
+        // than a stale entry from a previous scene; the shader range-checks
+        // against hitGeometryCount as well.
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_UNKNOWN;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Buffer.FirstElement = 0;
+            srv.Buffer.NumElements = (std::max)(hitGeometryCount, 1u);
+            srv.Buffer.StructureByteStride = kHitGeometryStride;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 98;
+            g_dx12.device->CreateShaderResourceView(
+                hitGeometryBuffer.Get(), &srv, h);
+        }
         enhancedHeapTLASAddresses[frameSlot] = enhancedTLASAddress;
     }
 
 public:
+    // Maximum hit-geometry entries. One per BLAS geometry, not per instance,
+    // matching how DXRScene emits hit records.
+    static const UINT VB_MAX_HIT_GEOMETRY = 4096;
+    // Byte stride of one hit-geometry entry. Must equal both
+    // sizeof(DXRScene::HitGeometryData) and the shader's HitGeometry; asserted
+    // in UploadHitGeometry, where the real type is visible.
+    static const UINT kHitGeometryStride = 32;
+
+    // Uploads the per-geometry hit bindings produced by the acceleration
+    // rebuild. Entry N must describe the same geometry as DXRScene hit record
+    // N; the shader indexes both by
+    // CommittedInstanceContributionToHitGroupIndex() + CommittedGeometryIndex().
+    //
+    // Called only on an acceleration-structure rebuild, which drains every
+    // frame slot first, so writing this upload-heap buffer in place cannot race
+    // an in-flight resolve.
+    template <typename HitGeometryEntry>
+    void UploadHitGeometry(const std::vector<HitGeometryEntry>& entries) {
+        static_assert(sizeof(HitGeometryEntry) == kHitGeometryStride,
+                      "Hit geometry entry must match the shader's stride");
+        hitGeometryCount = 0;
+        if (!hitGeometryBuffer || entries.empty()) return;
+        const UINT count =
+            (std::min)(static_cast<UINT>(entries.size()), VB_MAX_HIT_GEOMETRY);
+        void* mapped = nullptr;
+        D3D12_RANGE readRange = { 0, 0 };
+        if (FAILED(hitGeometryBuffer->Map(0, &readRange, &mapped)) || !mapped)
+            return;
+        memcpy(mapped, entries.data(),
+               static_cast<size_t>(count) * sizeof(HitGeometryEntry));
+        hitGeometryBuffer->Unmap(0, nullptr);
+        hitGeometryCount = count;
+        // The descriptor is rebuilt with the rest of the enhanced heap; force
+        // that refresh so a stale element count cannot outlive this upload.
+        for (UINT i = 0; i < FRAME_COUNT; ++i)
+            enhancedHeapTLASAddresses[i] = 0;
+    }
+
+    // True once real per-geometry bindings exist. The shader also checks each
+    // entry's valid flag, so this is only the coarse gate.
+    bool HitGeometryReady() const { return hitGeometryCount > 0; }
+
     // Called per frame with the current toggle state and TLAS. Rebuilding the
     // descriptors only when the TLAS moves keeps this close to free.
     void SetEnhancedVisuals(bool active, bool rtShadows, bool rayClassify,

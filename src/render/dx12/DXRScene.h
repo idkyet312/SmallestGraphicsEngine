@@ -26,6 +26,25 @@ public:
         float baseColor[4] = { 0.72f, 0.70f, 0.66f, 1.0f };
         float metallic = 0.0f;
         float roughness = 0.9f;
+        // Binding into the visibility buffer's persistent geometry, for the
+        // inline RayQuery path in the resolve. The TLAS is built from
+        // MeshPrimitive::vertexBuffer (per-primitive, 12-float stride) while
+        // the resolve reads a global packed vertex/index buffer addressed by
+        // these offsets -- two independent indexes over the same source data.
+        // Carrying the offsets here is what lets a ray hit resolve to the same
+        // triangle the rasterizer would have shaded.
+        //
+        // Safe to snapshot because VisibilityBufferDX12::RegisterMesh is
+        // upload-once: a mesh's vertexOffset/indexOffset are fixed for its
+        // lifetime, unlike drawCallID, which is reassigned every frame.
+        // vbMeshValid stays false when the primitive was never registered with
+        // the visibility buffer, and the shader falls back to the sky
+        // approximation for that geometry rather than reading a wrong triangle.
+        uint32_t vbVertexOffset = 0;
+        uint32_t vbIndexOffset = 0;
+        uint32_t vbHasIndices = 0;
+        uint32_t vbMaterialID = 0;
+        bool vbMeshValid = false;
     };
     struct Instance {
         uint64_t meshId = 0;
@@ -54,6 +73,28 @@ public:
         // bit2: non-indexed geometry. Mirrors HitMaterial.hitFlags.
         uint32_t flags = 0;
         uint32_t pad = 0;
+    };
+
+    // Per-geometry binding into the visibility buffer's persistent geometry,
+    // for the inline RayQuery path in the resolve.
+    //
+    // Kept separate from HitRecordData rather than appended to it: that struct
+    // is copied verbatim into the DispatchRays shader table, where its layout
+    // is fixed by DXRDDGIRenderer's local root signature. Widening it would
+    // silently shift every root argument the closest-hit shader reads. This
+    // table has no such constraint -- it is an ordinary SRV -- so it is indexed
+    // in parallel instead, entry N describing the same geometry as record N.
+    //
+    // Mirrors HitGeometry in visbuf_resolve_cs.hlsl; keep the two in step.
+    struct HitGeometryData {
+        uint32_t vertexOffset = 0;
+        uint32_t indexOffset = 0;
+        uint32_t hasIndices = 0;
+        uint32_t materialID = 0;
+        // 0 when this geometry has no visibility-buffer registration, which is
+        // the shader's signal to fall back rather than read a wrong triangle.
+        uint32_t valid = 0;
+        uint32_t pad[3] = { 0, 0, 0 };
     };
 
     bool Initialize(ID3D12Device* device) {
@@ -91,6 +132,14 @@ public:
     // BLAS geometry; InstanceContributionToHitGroupIndex + GeometryIndex()
     // select it in the shader.
     const std::vector<HitRecordData>& HitRecords() const { return hitRecords_; }
+    // Parallel to HitRecords(): entry N binds record N's geometry to the
+    // visibility buffer's persistent vertex/index/material data, so the inline
+    // RayQuery path can shade a hit from the same triangle the rasterizer uses.
+    // Indexed by CommittedInstanceContributionToHitGroupIndex() +
+    // CommittedGeometryIndex(), matching how the shader table is addressed.
+    const std::vector<HitGeometryData>& HitGeometry() const {
+        return hitGeometry_;
+    }
 
     bool BuildMeshBLAS(ID3D12GraphicsCommandList4* commandList,
                        uint64_t meshId, uint64_t sourceHash,
@@ -269,6 +318,7 @@ public:
         // table by the instance count and hit kMaxHitRecords on scene geometry
         // that comfortably fits otherwise.
         hitRecords_.clear();
+        hitGeometry_.clear();
         std::unordered_map<uint64_t, uint32_t> recordBaseByMesh;
         for (const Instance& source : instances) {
             const auto found = meshes_.find(source.meshId);
@@ -293,6 +343,16 @@ public:
                         (geometry.indexAddress == 0 || geometry.indexCount == 0
                             ? 4u : 0u);
                     hitRecords_.push_back(record);
+                    // Same push order, same index: hitGeometry_[N] describes
+                    // hitRecords_[N]. Both are addressed by recordBase +
+                    // GeometryIndex(), so they must stay the same length.
+                    HitGeometryData binding;
+                    binding.vertexOffset = geometry.vbVertexOffset;
+                    binding.indexOffset = geometry.vbIndexOffset;
+                    binding.hasIndices = geometry.vbHasIndices;
+                    binding.materialID = geometry.vbMaterialID;
+                    binding.valid = geometry.vbMeshValid ? 1u : 0u;
+                    hitGeometry_.push_back(binding);
                 }
             } else {
                 blas.recordBase = existing->second;
@@ -386,6 +446,7 @@ private:
     bool inlineSupported_ = false;
     bool topologyDirty_ = true;
     std::vector<HitRecordData> hitRecords_;
+    std::vector<HitGeometryData> hitGeometry_;
 
     bool CreateBuffer(uint64_t bytes, D3D12_RESOURCE_FLAGS flags,
                       D3D12_RESOURCE_STATES state, D3D12_HEAP_TYPE heapType,
