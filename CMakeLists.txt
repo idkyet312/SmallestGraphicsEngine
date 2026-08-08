@@ -428,6 +428,16 @@ if(BUILD_TESTING)
     target_link_libraries(CookedAssetFormatTests PRIVATE SGEProjectHeaders)
     add_test(NAME CookedAssetFormatTests COMMAND CookedAssetFormatTests)
 
+    # Pins the DXBC of the default (FXC, non-bindless) visibility resolve, so a
+    # refactor behind a feature guard cannot silently reshape the shader every
+    # pixel goes through. Compiles HLSL only -- no device needed.
+    add_executable(ResolveShaderCanaryTests tests/ResolveShaderCanaryTests.cpp)
+    target_link_libraries(ResolveShaderCanaryTests PRIVATE
+        SGEProjectHeaders d3dcompiler)
+    target_compile_definitions(ResolveShaderCanaryTests PRIVATE
+        SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    add_test(NAME ResolveShaderCanaryTests COMMAND ResolveShaderCanaryTests)
+
     # Pure CPU test for the bindless descriptor index allocator. Links no D3D
     # libraries on purpose -- BindlessHeapDX12.h keeps the range arithmetic
     # free of device calls so it can be tested without a GPU.

@@ -4,6 +4,7 @@
 #include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "ShaderDX12.h"
+#include "BindlessHeapDeviceDX12.h"
 #include "SceneGraph.h"
 #include "ProfilerDX12.h"
 #include <DirectXPackedVector.h>
@@ -32,7 +33,19 @@ static const UINT VB_CLUSTER_Y = 9;
 static const UINT VB_CLUSTER_Z = 10;
 static const UINT VB_CLUSTER_COUNT = VB_CLUSTER_X * VB_CLUSTER_Y * VB_CLUSTER_Z;
 static const UINT VB_MAX_LIGHTS_PER_CLUSTER = 32;
-static const UINT VB_MAX_MATERIALS = 256;
+// Raised from 256 once bindless removed the per-material descriptor-table cost.
+// The record is 96 bytes, so 4096 records is a 384 KB buffer -- cheap next to
+// silently dropping materials past the limit. VBMaterialData's shader-side
+// layout is unchanged, so the default FXC resolve is unaffected by this.
+static const UINT VB_MAX_MATERIALS = 4096;
+// What the *legacy* resolve can actually address. Its shader clamps the fetch
+// to 255 (widening that clamp would change the default variant's DXBC, which
+// the resolve canary test pins), so registering beyond this would not raise the
+// ceiling -- it would silently shade materials 256+ as material 255. Bindless
+// uses the full VB_MAX_MATERIALS.
+static const UINT VB_MAX_LEGACY_MATERIALS = 256;
+// Legacy tier only: the fixed-size t8..t71 texture table the FXC resolve reads.
+// Bindless materials index the bindless heap directly and are not bound by this.
 static const UINT VB_MAX_MATERIAL_TEXTURES = 64;
 static const UINT VB_BLOOM_MAX_MIPS = 6;
 
@@ -391,6 +404,21 @@ public:
     // not fit, since that is how much larger the array would have to be (or how
     // much a bindless heap would buy).
     std::unordered_set<ID3D12Resource*> materialTexturesRejected;
+
+    // Bindless tier. Kept in a parallel buffer rather than reusing the legacy
+    // records because textureIndices means something different in each: a slot
+    // in the 64-entry t8..t71 table for legacy, an absolute bindless heap index
+    // for bindless. Sharing one buffer would make a stale record from the other
+    // tier sample an arbitrary texture rather than fail visibly.
+    ComPtr<ID3D12Resource> bindlessMaterialDataBuffer;
+    VBMaterialData* mappedBindlessMaterials = nullptr;
+    std::unordered_map<const SceneMaterial*, UINT> bindlessMaterialLookup;
+    UINT bindlessMaterialCount = 1;
+    // Set once per frame from the scene toggle. Registration consults this so a
+    // material registered while bindless is off does not poison the bindless
+    // table, and vice versa.
+    bool bindlessActive = false;
+
     UINT currentDrawCall = 0;
     UINT previousDrawCount = 0;
     UINT drawCallDirtyMin = UINT_MAX;
@@ -521,7 +549,7 @@ public:
                 updateParameters(mappedMaterials[found->second]);
             return found->second;
         }
-        if (materialCount >= VB_MAX_MATERIALS) return 0;
+        if (materialCount >= VB_MAX_LEGACY_MATERIALS) return 0;
 
         VBMaterialData data;
         updateParameters(data);
@@ -570,6 +598,84 @@ public:
         mappedMaterials[id] = data;
         materialLookup.emplace(material, id);
         return id;
+    }
+
+    // Bindless counterpart to RegisterMaterial. Writes absolute bindless heap
+    // indices into textureIndices instead of 0..63 table slots, and caches them
+    // on the material so repeat draws are a hash lookup rather than three
+    // descriptor registrations.
+    //
+    // `heap` must outlive the frame. Returns 0 (the default material) when
+    // bindless is unavailable so callers never need a null check.
+    UINT RegisterMaterialBindless(SceneMaterial* material,
+                                  BindlessHeapDX12& heap) {
+        if (!material || !heap.Initialized() || !mappedBindlessMaterials) return 0;
+
+        const auto updateParameters = [material](VBMaterialData& data) {
+            data.baseColorFactor = material->baseColorFactor;
+            data.emissiveOcclusion.w = material->occlusionStrength;
+            data.pbrParams = XMFLOAT4(material->metallicFactor,
+                material->roughnessFactor, material->normalYSign, 1.0f);
+            data.shadingParams = XMFLOAT4(material->ambientScale,
+                material->viewFillStrength, 0.7f, 0.0f);
+        };
+
+        // The material's cached indices are only meaningful for the allocator
+        // generation that issued them. After a scene reset the generation moves
+        // on and every surviving material re-registers here.
+        const UINT generation = heap.Allocator().Generation();
+        if (material->bindlessGeneration != generation) {
+            material->InvalidateTextureBindings();
+            material->bindlessGeneration = generation;
+            material->bindlessAlbedoIndex =
+                heap.RegisterTexture(material->baseColorTexture.Get(),
+                                     BINDLESS_FALLBACK_WHITE);
+            material->bindlessNormalIndex =
+                heap.RegisterTexture(material->normalTexture.Get(),
+                                     BINDLESS_FALLBACK_NORMAL);
+            material->bindlessMetalRoughIndex =
+                heap.RegisterTexture(material->metallicRoughnessTexture.Get(),
+                                     BINDLESS_FALLBACK_METALROUGH);
+        }
+
+        auto found = bindlessMaterialLookup.find(material);
+        if (found != bindlessMaterialLookup.end()) {
+            VBMaterialData& record = mappedBindlessMaterials[found->second];
+            updateParameters(record);
+            // Live-tunable material edits can swap a texture mid-session, so
+            // refresh the indices too rather than trusting the first write.
+            record.textureIndices[0] = material->bindlessAlbedoIndex;
+            record.textureIndices[1] = material->bindlessNormalIndex;
+            record.textureIndices[2] = material->bindlessMetalRoughIndex;
+            return found->second;
+        }
+
+        if (bindlessMaterialCount >= VB_MAX_MATERIALS) return 0;
+
+        VBMaterialData data;
+        updateParameters(data);
+        data.textureIndices[0] = material->bindlessAlbedoIndex;
+        data.textureIndices[1] = material->bindlessNormalIndex;
+        data.textureIndices[2] = material->bindlessMetalRoughIndex;
+        data.textureIndices[3] = material->roughnessOnlyTexture ? 1u : 0u;
+
+        const UINT id = bindlessMaterialCount++;
+        mappedBindlessMaterials[id] = data;
+        bindlessMaterialLookup.emplace(material, id);
+        return id;
+    }
+
+    void SetBindlessActive(bool active) { bindlessActive = active; }
+    bool BindlessActive() const { return bindlessActive; }
+    UINT BindlessMaterialCount() const { return bindlessMaterialCount; }
+
+    // Drops bindless material records so they re-register against the new
+    // allocator generation. Called at scene teardown, after the GPU is idle.
+    void ResetBindlessMaterials() {
+        bindlessMaterialLookup.clear();
+        bindlessMaterialCount = 1;
+        if (mappedBindlessMaterials)
+            mappedBindlessMaterials[0] = VBMaterialData{};
     }
 
     // Upload-once mesh registration. Instances reference this immutable geometry
@@ -2424,6 +2530,19 @@ private:
         hr = materialDataBuffer->Map(0, &noRead,
             reinterpret_cast<void**>(&mappedMaterials));
         if (FAILED(hr)) return false;
+
+        // Parallel bindless material table. Allocated unconditionally -- it is
+        // 384 KB and allocating it up front means toggling bindless at runtime
+        // never has to create a resource mid-frame.
+        hr = g_dx12.device->CreateCommittedResource(
+            &materialHeap, D3D12_HEAP_FLAG_NONE, &materialDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&bindlessMaterialDataBuffer));
+        if (FAILED(hr)) return false;
+        hr = bindlessMaterialDataBuffer->Map(0, &noRead,
+            reinterpret_cast<void**>(&mappedBindlessMaterials));
+        if (FAILED(hr)) return false;
+        mappedBindlessMaterials[0] = VBMaterialData{};
 
         return true;
     }

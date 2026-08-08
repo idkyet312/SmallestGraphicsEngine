@@ -145,6 +145,33 @@ struct MaterialData {
 };
 StructuredBuffer<MaterialData> materials : register(t7);
 Texture2D<float4> materialTextures[64] : register(t8);
+
+// Material texture access, indirected so the same source builds both tiers.
+//
+// Legacy (no SGE_BINDLESS_MATERIALS): expands to exactly the array indexing
+// this shader has always used, so FXC still emits byte-identical DXBC.
+//
+// Bindless (SM 6.6): the index is an absolute slot in the bindless descriptor
+// heap instead of 0..63. NonUniformResourceIndex is required because
+// neighbouring pixels in a wave resolve different triangles and therefore
+// different materials; without it the compiler may assume one index per wave
+// and sample the wrong texture for every lane but the first.
+//
+// MAT_TEX_BOUND is the "does this material have this map" test. Legacy compares
+// against the 64-entry table size; bindless treats the fallback descriptors
+// (0..3) as "no authored texture", which is what RegisterTexture returns for a
+// null map. That keeps an untextured material multiplying by white rather than
+// sampling descriptor 0 as if it were authored content.
+// ResourceDescriptorHeap[] yields an untyped handle, so the element type must be
+// named at the point of use; the local binding keeps that to one place per site.
+#ifdef SGE_BINDLESS_MATERIALS
+#define MAT_TEX(index) \
+    (ResourceDescriptorHeap[NonUniformResourceIndex(index)])
+#define MAT_TEX_BOUND(index) ((index) >= 4u)
+#else
+#define MAT_TEX(index) materialTextures[index]
+#define MAT_TEX_BOUND(index) ((index) < 64u)
+#endif
 Texture2D<float4> environmentMap : register(t72);
 Texture2D<float2> brdfIntegrationLUT : register(t73);
 Texture2D<float4> ddgiIrradianceMap : register(t74);
@@ -1305,29 +1332,40 @@ Surface EvaluateSurface(float3 fragPos,
     ComputeUVGradients(wp0, wp1, wp2, uv0, uv1, uv2, uvDx, uvDy);
 
     // Material
+    // The clamp bounds the fetch against the material table. The legacy tier
+    // keeps 255u: its table is still 256 records, and widening the clamp would
+    // change the default variant's DXBC. The bindless tier registers into the
+    // 4096-record table, so clamping it to 255 would alias every material past
+    // the 256th onto record 255 -- the exact capacity ceiling bindless exists
+    // to remove.
+#ifdef SGE_BINDLESS_MATERIALS
+    MaterialData material = materials[min(dc.materialID, 4095u)];
+#else
     MaterialData material = materials[min(dc.materialID, 255u)];
+#endif
     float3 albedo = dc.objectColor * material.baseColorFactor.rgb;
     float metal = material.pbrParams.w > 0.5 ? material.pbrParams.x : dc.metalness;
     float rough = material.pbrParams.w > 0.5 ? material.pbrParams.y : dc.roughness;
     float materialAO = 1.0;
     float foliageCoverage = 1.0;
-    if (material.textureIndices.x < 64u) {
+    if (MAT_TEX_BOUND(material.textureIndices.x)) {
         uint albedoTextureIndex = material.textureIndices.x;
-        float4 authoredSample = materialTextures[albedoTextureIndex].SampleGrad(
+        Texture2D<float4> albedoTexture = MAT_TEX(albedoTextureIndex);
+        float4 authoredSample = albedoTexture.SampleGrad(
             texSampler, texCoord, uvDx, uvDy);
         if (isFoliage) {
             foliageCoverage = authoredSample.a;
             uint texWidth, texHeight, texLevels;
-            materialTextures[albedoTextureIndex].GetDimensions(
+            albedoTexture.GetDimensions(
                 0, texWidth, texHeight, texLevels);
             float2 texel = 1.0 / max(float2(texWidth, texHeight), 1.0);
-            float4 neighbor0 = materialTextures[albedoTextureIndex].SampleGrad(
+            float4 neighbor0 = albedoTexture.SampleGrad(
                 texSampler, texCoord + float2(texel.x, 0.0), uvDx, uvDy);
-            float4 neighbor1 = materialTextures[albedoTextureIndex].SampleGrad(
+            float4 neighbor1 = albedoTexture.SampleGrad(
                 texSampler, texCoord - float2(texel.x, 0.0), uvDx, uvDy);
-            float4 neighbor2 = materialTextures[albedoTextureIndex].SampleGrad(
+            float4 neighbor2 = albedoTexture.SampleGrad(
                 texSampler, texCoord + float2(0.0, texel.y), uvDx, uvDy);
-            float4 neighbor3 = materialTextures[albedoTextureIndex].SampleGrad(
+            float4 neighbor3 = albedoTexture.SampleGrad(
                 texSampler, texCoord - float2(0.0, texel.y), uvDx, uvDy);
             float totalCoverage = authoredSample.a + neighbor0.a + neighbor1.a +
                                   neighbor2.a + neighbor3.a;
@@ -1366,8 +1404,8 @@ Surface EvaluateSurface(float3 fragPos,
             1.0, lerp(0.88, 1.10, variation), variationStrength);
         albedo = saturate(albedo * tint * brightness);
     }
-    if (material.textureIndices.z < 64u) {
-        float4 mr = materialTextures[material.textureIndices.z].SampleGrad(
+    if (MAT_TEX_BOUND(material.textureIndices.z)) {
+        float4 mr = MAT_TEX(material.textureIndices.z).SampleGrad(
             texSampler, texCoord, uvDx, uvDy);
         materialAO = lerp(1.0, mr.r, saturate(material.emissiveOcclusion.w));
         if (material.textureIndices.w != 0u) {
@@ -1385,8 +1423,8 @@ Surface EvaluateSurface(float3 fragPos,
         metal = 0.0;
     }
 
-    if (material.textureIndices.y < 64u) {
-        float3 tangentNormal = materialTextures[material.textureIndices.y].SampleGrad(
+    if (MAT_TEX_BOUND(material.textureIndices.y)) {
+        float3 tangentNormal = MAT_TEX(material.textureIndices.y).SampleGrad(
             texSampler, texCoord, uvDx, uvDy).xyz * 2.0 - 1.0;
         tangentNormal.y *= material.pbrParams.z;
         float tangentLength = saturate(length(tangentNormal));
