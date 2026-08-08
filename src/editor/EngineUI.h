@@ -374,6 +374,168 @@ inline void RenderPlayerHUD(const Scene& scene) {
 }
 
 inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
+    struct RTDebugSettings {
+        bool active = false;
+        bool useVisibilityBuffer = true;
+        bool useRaytracing = false;
+        bool validationMode = false;
+        bool enhancedVisuals = false;
+        bool enhancedRTShadows = true;
+        bool enhancedRayClassify = true;
+        bool enhancedRTReflections = false;
+        float enhancedConfidenceThreshold = 0.35f;
+        float enhancedReflectionRoughnessCut = 0.35f;
+        bool svgfTemporalEnabled = false;
+        UINT svgfMaxAccumFrames = 32;
+        bool svgfAtrousEnabled = false;
+        UINT svgfAtrousIterations = 5;
+        bool temporalEffectsEnabled = false;
+        bool enableFXAA = false;
+        float bloomStrength = 0.16f;
+        float grainStrength = 0.012f;
+        float motionBlurStrength = 0.0f;
+        int debugViewMode = 0;
+    };
+    static RTDebugSettings rtDebug;
+
+    struct RTXSelfTestState {
+        bool running = false;
+        bool passed = false;
+        bool failed = false;
+        UINT framesObserved = 0;
+        UINT consecutiveRuntimeFrames = 0;
+        UINT gpuAtrousMask = 0;
+        bool gpuCompositeSeen = false;
+    };
+    static RTXSelfTestState rtxTest;
+
+    auto saveRTDebugSettings = [&]() {
+        rtDebug.useVisibilityBuffer = scene.useVisibilityBuffer;
+        rtDebug.useRaytracing = scene.useRaytracing;
+        rtDebug.validationMode = vb.validationMode;
+        rtDebug.enhancedVisuals = scene.enhancedVisuals;
+        rtDebug.enhancedRTShadows = scene.enhancedRTShadows;
+        rtDebug.enhancedRayClassify = scene.enhancedRayClassify;
+        rtDebug.enhancedRTReflections = scene.enhancedRTReflections;
+        rtDebug.enhancedConfidenceThreshold =
+            scene.enhancedConfidenceThreshold;
+        rtDebug.enhancedReflectionRoughnessCut =
+            vb.enhancedReflectionRoughnessCut;
+        rtDebug.svgfTemporalEnabled = vb.svgfTemporalEnabled;
+        rtDebug.svgfMaxAccumFrames = vb.svgfMaxAccumFrames;
+        rtDebug.svgfAtrousEnabled = vb.svgfAtrousEnabled;
+        rtDebug.svgfAtrousIterations = vb.svgfAtrousIterations;
+        rtDebug.temporalEffectsEnabled = vb.temporalEffectsEnabled;
+        rtDebug.enableFXAA = scene.enableFXAA;
+        rtDebug.bloomStrength = vb.bloomStrength;
+        rtDebug.grainStrength = vb.grainStrength;
+        rtDebug.motionBlurStrength = vb.motionBlurStrength;
+        rtDebug.debugViewMode = vb.debugViewMode;
+    };
+
+    auto applyRTDebugSettings = [&]() {
+        scene.useVisibilityBuffer = true;
+        scene.useRaytracing = false;
+        g_rt.enabled = false;
+        vb.validationMode = false;
+        scene.enhancedVisuals = true;
+        scene.enhancedRTShadows = false;
+        scene.enhancedRayClassify = false;
+        scene.enhancedRTReflections = true;
+        scene.enhancedConfidenceThreshold = 1.0f;
+        vb.enhancedReflectionRoughnessCut = 1.0f;
+        vb.svgfTemporalEnabled = true;
+        vb.svgfMaxAccumFrames = 64;
+        vb.svgfAtrousEnabled = true;
+        vb.svgfAtrousIterations = VisibilityBufferDX12::kSVGFAtrousMaxIterations;
+        vb.temporalEffectsEnabled = false;
+        scene.enableFXAA = false;
+        vb.bloomStrength = 0.0f;
+        vb.grainStrength = 0.0f;
+        vb.motionBlurStrength = 0.0f;
+    };
+
+    auto restoreRTDebugSettings = [&]() {
+        scene.useVisibilityBuffer = rtDebug.useVisibilityBuffer;
+        scene.useRaytracing = rtDebug.useRaytracing;
+        g_rt.enabled = rtDebug.useRaytracing;
+        vb.validationMode = rtDebug.validationMode;
+        scene.enhancedVisuals = rtDebug.enhancedVisuals;
+        scene.enhancedRTShadows = rtDebug.enhancedRTShadows;
+        scene.enhancedRayClassify = rtDebug.enhancedRayClassify;
+        scene.enhancedRTReflections = rtDebug.enhancedRTReflections;
+        scene.enhancedConfidenceThreshold =
+            rtDebug.enhancedConfidenceThreshold;
+        vb.enhancedReflectionRoughnessCut =
+            rtDebug.enhancedReflectionRoughnessCut;
+        vb.svgfTemporalEnabled = rtDebug.svgfTemporalEnabled;
+        vb.svgfMaxAccumFrames = rtDebug.svgfMaxAccumFrames;
+        vb.svgfAtrousEnabled = rtDebug.svgfAtrousEnabled;
+        vb.svgfAtrousIterations = rtDebug.svgfAtrousIterations;
+        vb.temporalEffectsEnabled = rtDebug.temporalEffectsEnabled;
+        scene.enableFXAA = rtDebug.enableFXAA;
+        vb.bloomStrength = rtDebug.bloomStrength;
+        vb.grainStrength = rtDebug.grainStrength;
+        vb.motionBlurStrength = rtDebug.motionBlurStrength;
+        vb.debugViewMode = rtDebug.debugViewMode;
+    };
+
+    bool enhancedHeapsReady = true;
+    bool atrousHeapsReady = true;
+    for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
+        enhancedHeapsReady &= vb.enhancedComputeDescHeaps[frame] != nullptr;
+        atrousHeapsReady &= vb.svgfAtrousDescHeaps[frame] != nullptr &&
+                           vb.svgfCompositeDescHeaps[frame] != nullptr;
+    }
+    const bool historyResourcesReady =
+        vb.svgfHistoryColor[0] && vb.svgfHistoryColor[1] &&
+        vb.svgfHistoryMoments[0] && vb.svgfHistoryMoments[1] &&
+        vb.svgfReflectionSrc;
+    const bool atrousObjectsReady = vb.svgfAtrousPipelineReady &&
+        vb.svgfAtrousPSO && vb.svgfAtrousRootSig &&
+        vb.svgfCompositePSO && vb.svgfCompositeRootSig &&
+        vb.svgfAtrousConstantBuffer && vb.svgfCompositeConstantBuffer &&
+        vb.svgfAtrousScratch[0] && vb.svgfAtrousScratch[1] &&
+        atrousHeapsReady;
+
+    if (rtxTest.running) {
+        ++rtxTest.framesObserved;
+        const bool runtimeFrameGood =
+            vb.enhancedResolveExecutedLastFrame &&
+            vb.svgfTemporalExecutedLastFrame &&
+            vb.svgfAtrousExecutedLastFrame &&
+            vb.svgfCompositeExecutedLastFrame &&
+            vb.svgfAtrousDispatchesLastFrame ==
+                VisibilityBufferDX12::kSVGFAtrousMaxIterations;
+        rtxTest.consecutiveRuntimeFrames = runtimeFrameGood
+            ? rtxTest.consecutiveRuntimeFrames + 1u : 0u;
+
+        for (const auto& sample : g_profiler.GpuSamples()) {
+            for (UINT iter = 0;
+                 iter < VisibilityBufferDX12::kSVGFAtrousMaxIterations;
+                 ++iter) {
+                if (sample.name == "SVGF Atrous " + std::to_string(iter))
+                    rtxTest.gpuAtrousMask |= 1u << iter;
+            }
+            if (sample.name == "SVGF Composite")
+                rtxTest.gpuCompositeSeen = true;
+        }
+
+        const bool staticChecksReady = g_inlineRaytracingSupported &&
+            vb.EnhancedVisualsReady() && vb.enhancedTLASAddress != 0 &&
+            enhancedHeapsReady && historyResourcesReady && atrousObjectsReady;
+        if (staticChecksReady &&
+            rtxTest.consecutiveRuntimeFrames >= 64u &&
+            rtxTest.gpuAtrousMask == 0x1fu &&
+            rtxTest.gpuCompositeSeen) {
+            rtxTest.running = false;
+            rtxTest.passed = true;
+        } else if (rtxTest.framesObserved >= 240u) {
+            rtxTest.running = false;
+            rtxTest.failed = true;
+        }
+    }
+
     RenderMovementPad();
 
     ImGui::Begin("Scene Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
@@ -548,6 +710,146 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // -- Rendering Pipeline Selection --
         ImGui::Separator();
         ImGui::Text("Rendering Pipeline");
+
+        if (g_inlineRaytracingSupported && vb.EnhancedVisualsReady()) {
+            if (ImGui::Checkbox("RT/SVGF Capture Mode", &rtDebug.active)) {
+                if (rtDebug.active) {
+                    saveRTDebugSettings();
+                    applyRTDebugSettings();
+                    vb.debugViewMode = 0;
+                } else {
+                    restoreRTDebugSettings();
+                }
+                vb.InvalidateTemporalHistory();
+                vb.svgfHistoryValid = false;
+            }
+            if (rtDebug.active) {
+                ImGui::TextDisabled(
+                    "  Clean capture: RT shadows/TAA/FXAA/post noise off");
+                ImGui::TextDisabled(
+                    "  Reflections + 64-frame SVGF + 5 a-trous passes on");
+                ImGui::TextDisabled(
+                    "  Hold still in Lit, then select debug view 5 or 6");
+            }
+        }
+
+        if (ImGui::CollapsingHeader(
+                "RTX / SVGF Self-Test", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextDisabled(
+                "Recommended map: Custom Levels > RTSVGFTest.json");
+            if (ImGui::Button("Run 64-frame RTX Test")) {
+                if (!rtDebug.active) {
+                    saveRTDebugSettings();
+                    rtDebug.active = true;
+                }
+                applyRTDebugSettings();
+                vb.debugViewMode = 0;
+                vb.InvalidateTemporalHistory();
+                vb.svgfHistoryValid = false;
+                rtxTest = {};
+                rtxTest.running = true;
+            }
+            if (rtxTest.running) {
+                ImGui::SameLine();
+                if (ImGui::Button("Stop Test")) {
+                    rtxTest.running = false;
+                    rtxTest.failed = true;
+                }
+            }
+
+            if (rtxTest.running) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                    "RUNNING: %u/64 consecutive frames",
+                    (std::min)(rtxTest.consecutiveRuntimeFrames, 64u));
+                ImGui::ProgressBar(
+                    (std::min)(rtxTest.consecutiveRuntimeFrames / 64.0f, 1.0f),
+                    ImVec2(-1.0f, 0.0f));
+            } else if (rtxTest.passed) {
+                ImGui::TextColored(ImVec4(0.25f, 1.0f, 0.35f, 1.0f),
+                    "PASS: enhanced + temporal + 5 a-trous + composite");
+            } else if (rtxTest.failed) {
+                ImGui::TextColored(ImVec4(1.0f, 0.25f, 0.2f, 1.0f),
+                    "FAIL: inspect the first unchecked stage below");
+            } else {
+                ImGui::TextDisabled(
+                    "Applies capture mode and verifies GPU timestamps.");
+            }
+
+            auto testLine = [](bool ready, const char* label) {
+                ImGui::TextColored(
+                    ready ? ImVec4(0.25f, 1.0f, 0.35f, 1.0f)
+                          : ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                    "%s %s", ready ? "[OK]" : "[--]", label);
+            };
+            testLine(g_inlineRaytracingSupported, "DXR Tier 1.1");
+            testLine(vb.EnhancedVisualsReady(), "SM6.5 enhanced resolve PSO");
+            testLine(vb.enhancedTLASAddress != 0, "TLAS address registered");
+            testLine(enhancedHeapsReady,
+                     "Enhanced descriptors for both frame slots");
+            testLine(historyResourcesReady,
+                     "SVGF history, moments, and reflection resources");
+            testLine(atrousObjectsReady,
+                     "A-trous + composite shaders, PSOs, CBs, and heaps");
+            testLine(vb.enhancedResolveExecutedLastFrame,
+                     "Enhanced resolve recorded last frame");
+            if (vb.debugViewMode == 5 || vb.debugViewMode == 6) {
+                testLine(vb.svgfHistoryValid,
+                         "Temporal history valid (paused in debug view)");
+            } else {
+                testLine(vb.svgfTemporalExecutedLastFrame &&
+                             vb.svgfHistoryValid,
+                         "Fused temporal history recorded last frame");
+            }
+
+            const bool atrousDispatchCountGood =
+                vb.svgfAtrousExecutedLastFrame &&
+                vb.svgfAtrousDispatchesLastFrame ==
+                    VisibilityBufferDX12::kSVGFAtrousMaxIterations;
+            ImGui::TextColored(
+                atrousDispatchCountGood
+                    ? ImVec4(0.25f, 1.0f, 0.35f, 1.0f)
+                    : ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                "%s A-trous recorded last frame: %u/5 dispatches",
+                atrousDispatchCountGood ? "[OK]" : "[--]",
+                vb.svgfAtrousDispatchesLastFrame);
+            testLine(vb.svgfCompositeExecutedLastFrame,
+                     "Composite recorded last frame");
+            testLine(rtxTest.gpuAtrousMask == 0x1fu,
+                     "GPU timestamps returned for A-trous 0,1,2,3,4");
+            testLine(rtxTest.gpuCompositeSeen,
+                     "GPU timestamp returned for composite");
+
+            if (ImGui::Button("Lit##rtxtest")) vb.debugViewMode = 0;
+            ImGui::SameLine();
+            if (ImGui::Button("Temporal##rtxtest")) vb.debugViewMode = 5;
+            ImGui::SameLine();
+            if (ImGui::Button("A-Trous##rtxtest")) {
+                vb.svgfAtrousDiagnosticMode = 0;
+                vb.debugViewMode = 6;
+            }
+            const char* atrousDiagnostics[] = {
+                "Filtered reflection", "Variance", "Centre-tap share",
+                "Normal acceptance", "Depth acceptance",
+                "Luminance acceptance", "Temporal history count"
+            };
+            int atrousDiagnostic =
+                static_cast<int>(vb.svgfAtrousDiagnosticMode);
+            if (ImGui::Combo("A-Trous Diagnostic", &atrousDiagnostic,
+                    atrousDiagnostics, IM_ARRAYSIZE(atrousDiagnostics))) {
+                vb.svgfAtrousDiagnosticMode =
+                    static_cast<UINT>((std::max)(0, atrousDiagnostic));
+                vb.debugViewMode = 6;
+            }
+            if (vb.svgfAtrousDiagnosticMode == 2)
+                ImGui::TextDisabled("  red=center only  green=neighbours accepted");
+            else if (vb.svgfAtrousDiagnosticMode >= 3 &&
+                     vb.svgfAtrousDiagnosticMode <= 5)
+                ImGui::TextDisabled("  black=rejected  white=accepted");
+            else if (vb.svgfAtrousDiagnosticMode == 6)
+                ImGui::TextDisabled("  red=fresh history  green=64 frames");
+            ImGui::TextDisabled(
+                "PIX: expand Visibility Buffer > VB Resolve for child markers.");
+        }
         
         // Raytracing option
         if (g_rt.supported) {
@@ -1088,6 +1390,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
     
     const char* renderer = "Forward Clustered";
+    // Keep capture-critical settings locked while still allowing the debug-view
+    // selector to move from Lit to the temporal and a-trous inspection views.
+    if (rtDebug.active)
+        applyRTDebugSettings();
     if (scene.useRaytracing) renderer = "DXR Raytracing";
     else if (scene.useVisibilityBuffer) renderer = "id Tech VB+Deferred";
     ImGui::Text("Renderer: DirectX 12 (%s)", renderer);

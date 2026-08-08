@@ -7,6 +7,7 @@
 #include "SceneGraph.h"
 #include "ProfilerDX12.h"
 #include <DirectXPackedVector.h>
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
@@ -206,7 +207,8 @@ public:
     bool enhancedPipelineReady = false;
     // Mirrors the default compute heap and appends TLAS / ray mask / enhanced
     // constants, so the default layout's hardcoded slot indices stay valid.
-    ComPtr<ID3D12DescriptorHeap> enhancedComputeDescHeap;
+    ComPtr<ID3D12DescriptorHeap> enhancedComputeDescHeaps[FRAME_COUNT];
+    D3D12_GPU_VIRTUAL_ADDRESS enhancedHeapTLASAddresses[FRAME_COUNT] = {};
     // Set per frame by the caller from scene.enhancedVisuals. Kept separate
     // from enhancedPipelineReady (a capability) so the UI can toggle freely
     // without rebuilding anything.
@@ -234,6 +236,7 @@ public:
     UINT svgfMaxAccumFrames = 32;
     UINT svgfHistoryPing = 0;
     bool svgfHistoryValid = false;
+    bool svgfTemporalEnabledLastFrame = false;
     ComPtr<ID3D12Resource> svgfHistoryColor[2];
     ComPtr<ID3D12Resource> svgfHistoryMoments[2];
     // SVGF à-trous spatial filter (Phase 5c). Multi-iteration wavelet
@@ -241,19 +244,29 @@ public:
     // converges it in time. Ping-pong scratch pair for the iterations.
     bool svgfAtrousEnabled = false;
     UINT svgfAtrousIterations = 5;
+    UINT svgfAtrousDiagnosticMode = 0;
+    static constexpr UINT kSVGFAtrousMaxIterations = 5;
     ComPtr<ID3D12Resource> svgfReflectionSrc;      // specular IBL from resolve
     ComPtr<ID3D12Resource> svgfAtrousScratch[2];   // ping-pong for à-trous
     ComPtr<ID3D12RootSignature> svgfAtrousRootSig;
     ComPtr<ID3D12PipelineState> svgfAtrousPSO;
-    ComPtr<ID3D12DescriptorHeap> svgfAtrousDescHeap;
+    ComPtr<ID3D12DescriptorHeap> svgfAtrousDescHeaps[FRAME_COUNT];
     ComPtr<ID3D12Resource> svgfAtrousConstantBuffer;
     void* svgfAtrousConstantMapped = nullptr;
     ComPtr<ID3D12RootSignature> svgfCompositeRootSig;
     ComPtr<ID3D12PipelineState> svgfCompositePSO;
-    ComPtr<ID3D12DescriptorHeap> svgfCompositeDescHeap;
+    ComPtr<ID3D12DescriptorHeap> svgfCompositeDescHeaps[FRAME_COUNT];
     ComPtr<ID3D12Resource> svgfCompositeConstantBuffer;
     void* svgfCompositeConstantMapped = nullptr;
     bool svgfAtrousPipelineReady = false;
+    // Last-frame execution facts for the in-app RTX/SVGF self-test. These are
+    // set where commands are recorded, so the UI can distinguish an enabled
+    // checkbox from a pass that actually reached the command list.
+    bool enhancedResolveExecutedLastFrame = false;
+    bool svgfTemporalExecutedLastFrame = false;
+    bool svgfAtrousExecutedLastFrame = false;
+    bool svgfCompositeExecutedLastFrame = false;
+    UINT svgfAtrousDispatchesLastFrame = 0;
     // TLAS this frame. Re-registered whenever it changes, since the
     // acceleration structure is rebuilt as geometry streams in.
     D3D12_GPU_VIRTUAL_ADDRESS enhancedTLASAddress = 0;
@@ -885,13 +898,26 @@ public:
         fc.palmParams = palmWindFrame.params;
         frameConstantBuffer.CopyData(g_dx12.frameIndex, fc);
 
+        const UINT frameSlot = g_dx12.frameIndex % FRAME_COUNT;
+        ID3D12DescriptorHeap* enhancedDescHeap =
+            enhancedComputeDescHeaps[frameSlot].Get();
+
+        // A toggle can leave old history describing samples from a different
+        // mode. Invalidate before uploading b5 so the shader sees the reset on
+        // the first frame after the transition.
+        if (svgfTemporalEnabled != svgfTemporalEnabledLastFrame) {
+            svgfHistoryValid = false;
+            svgfTemporalEnabledLastFrame = svgfTemporalEnabled;
+        }
+
         // Set compute pipeline. The enhanced variant is used only when it built
         // successfully AND the caller asked for it this frame; otherwise this
         // is bit-for-bit the original path.
         const bool useEnhanced = enhancedVisualsActive && enhancedPipelineReady &&
-                                 enhancedResolvePSO && enhancedComputeDescHeap;
+                                 enhancedResolvePSO && enhancedDescHeap;
+        enhancedResolveExecutedLastFrame = useEnhanced;
         if (useEnhanced) {
-            UpdateEnhancedConstants();
+            UpdateEnhancedConstants(frameSlot);
             cmdList->SetComputeRootSignature(enhancedResolveRootSig.Get());
             cmdList->SetPipelineState(enhancedResolvePSO.Get());
         } else {
@@ -899,11 +925,25 @@ public:
             cmdList->SetPipelineState(resolvePSO.Get());
         }
 
+        // Debug views inspect the latest completed history without advancing
+        // it. Only normal shading commits a new ping-pong side.
+        const bool svgfWillWriteHistory =
+            useEnhanced && svgfTemporalEnabled && debugViewMode == 0;
+        svgfTemporalExecutedLastFrame = svgfWillWriteHistory;
+        UINT svgfHistoryRead = svgfHistoryPing;
+        UINT svgfHistoryWrite = svgfHistoryPing ^ 1u;
+        if (svgfWillWriteHistory) {
+            svgfHistoryPing ^= 1;
+            svgfHistoryRead = svgfHistoryPing ^ 1u;
+            svgfHistoryWrite = svgfHistoryPing;
+        }
+        if (useEnhanced && svgfTemporalEnabled)
+            RefreshSVGFDescriptors(frameSlot, svgfHistoryRead,
+                                   svgfHistoryWrite);
+
         // Transition SVGF write-side history to UAV before the enhanced
         // resolve reads the previous frame's history and writes the current.
-        if (useEnhanced && svgfTemporalEnabled) {
-            svgfHistoryPing ^= 1;
-            RefreshSVGFDescriptors();
+        if (svgfWillWriteHistory) {
             D3D12_RESOURCE_BARRIER svgfBarriers[2] = {};
             for (UINT i = 0; i < 2; ++i) {
                 svgfBarriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -915,15 +955,15 @@ public:
                     D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             }
             svgfBarriers[0].Transition.pResource =
-                svgfHistoryColor[svgfHistoryPing].Get();
+                svgfHistoryColor[svgfHistoryWrite].Get();
             svgfBarriers[1].Transition.pResource =
-                svgfHistoryMoments[svgfHistoryPing].Get();
+                svgfHistoryMoments[svgfHistoryWrite].Get();
             cmdList->ResourceBarrier(2, svgfBarriers);
         }
 
         // Set descriptor heap
         ID3D12DescriptorHeap* heaps[] = {
-            useEnhanced ? enhancedComputeDescHeap.Get() : computeDescHeap.Get() };
+            useEnhanced ? enhancedDescHeap : computeDescHeap.Get() };
         cmdList->SetDescriptorHeaps(1, heaps);
 
         // Bind root parameters
@@ -939,7 +979,7 @@ public:
         // Descriptor table at root param 1 (SRVs + UAV)
         cmdList->SetComputeRootDescriptorTable(1,
             useEnhanced
-                ? enhancedComputeDescHeap->GetGPUDescriptorHandleForHeapStart()
+                ? enhancedDescHeap->GetGPUDescriptorHandleForHeapStart()
                 : computeDescHeap->GetGPUDescriptorHandleForHeapStart());
 
         // Dispatch (GPU-driven via ExecuteIndirect)
@@ -961,7 +1001,7 @@ public:
         if (useEnhanced) UpdateRayMaskStatistic(cmdList);
 
         // Transition SVGF write-side history back to SRV for next frame.
-        if (useEnhanced && svgfTemporalEnabled) {
+        if (svgfWillWriteHistory) {
             D3D12_RESOURCE_BARRIER svgfBarriers[2] = {};
             for (UINT i = 0; i < 2; ++i) {
                 svgfBarriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -973,9 +1013,9 @@ public:
                     D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             }
             svgfBarriers[0].Transition.pResource =
-                svgfHistoryColor[svgfHistoryPing].Get();
+                svgfHistoryColor[svgfHistoryWrite].Get();
             svgfBarriers[1].Transition.pResource =
-                svgfHistoryMoments[svgfHistoryPing].Get();
+                svgfHistoryMoments[svgfHistoryWrite].Get();
             cmdList->ResourceBarrier(2, svgfBarriers);
             svgfHistoryValid = true;
         }
@@ -984,36 +1024,44 @@ public:
         // applied to the specular IBL signal, then composited back into the
         // lit output. Only runs when the enhanced resolve ran with both
         // temporal and spatial SVGF enabled.
-        if (useEnhanced && svgfAtrousEnabled && svgfAtrousPipelineReady &&
-            svgfAtrousPSO && svgfAtrousRootSig && svgfAtrousDescHeap &&
-            svgfCompositePSO && svgfCompositeRootSig && svgfCompositeDescHeap) {
+        const UINT atrousIterationCount = std::clamp(
+            svgfAtrousIterations, 1u, kSVGFAtrousMaxIterations);
+        ID3D12DescriptorHeap* atrousDescHeap =
+            svgfAtrousDescHeaps[frameSlot].Get();
+        ID3D12DescriptorHeap* compositeDescHeap =
+            svgfCompositeDescHeaps[frameSlot].Get();
+        const bool atrousRan =
+            useEnhanced && svgfTemporalEnabled && svgfAtrousEnabled &&
+            (debugViewMode == 0 || debugViewMode == 6) &&
+            svgfAtrousPipelineReady && svgfAtrousPSO && svgfAtrousRootSig &&
+            atrousDescHeap && svgfCompositePSO && svgfCompositeRootSig &&
+            compositeDescHeap;
+        svgfAtrousExecutedLastFrame = atrousRan;
+        svgfCompositeExecutedLastFrame = atrousRan;
+        svgfAtrousDispatchesLastFrame = atrousRan
+            ? atrousIterationCount : 0u;
+        if (atrousRan) {
             const UINT descSize = g_dx12.cbvSrvUavDescriptorSize;
 
             // Transition reflectionSrc from UAV (resolve write) to SRV (atrous read).
-            // Scratch textures transition from SRV to UAV for atrous writes.
+            // Scratch textures stay in UAV state between frames; the iteration
+            // barriers publish only the texture the next dispatch reads.
             {
-                D3D12_RESOURCE_BARRIER atrousInBarriers[3] = {};
-                atrousInBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                atrousInBarriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-                atrousInBarriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                atrousInBarriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                atrousInBarriers[0].Transition.pResource = svgfReflectionSrc.Get();
-
-                for (UINT i = 0; i < 2; ++i) {
-                    atrousInBarriers[i + 1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                    atrousInBarriers[i + 1].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                    atrousInBarriers[i + 1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-                    atrousInBarriers[i + 1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                    atrousInBarriers[i + 1].Transition.pResource = svgfAtrousScratch[i].Get();
-                }
-                cmdList->ResourceBarrier(3, atrousInBarriers);
+                D3D12_RESOURCE_BARRIER reflectionToSRV = {};
+                reflectionToSRV.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                reflectionToSRV.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                reflectionToSRV.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                reflectionToSRV.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                reflectionToSRV.Transition.pResource = svgfReflectionSrc.Get();
+                cmdList->ResourceBarrier(1, &reflectionToSRV);
             }
 
             // Build atrous descriptor heap.
             // [0..3] t0..t3: reflectionSrc, depth, normalRoughness, svgfMoments
             // [4..5] u0..u1: scratchA, scratchB
             {
-                D3D12_CPU_DESCRIPTOR_HANDLE h = svgfAtrousDescHeap->GetCPUDescriptorHandleForHeapStart();
+                D3D12_CPU_DESCRIPTOR_HANDLE h =
+                    atrousDescHeap->GetCPUDescriptorHandleForHeapStart();
 
                 D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
                 srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -1108,18 +1156,22 @@ public:
                     float sigmaNormal;
                     float sigmaLuminance;
                     UINT iterationIndex;
-                    UINT debugViewMode;
-                    float pad0;
+                    UINT diagnosticMode;
+                    UINT iterationCount;
+                    float maxAccumFrames;
+                    UINT pad0;
+                    UINT pad1;
+                    UINT pad2;
                 };
 
                 cmdList->SetComputeRootSignature(svgfAtrousRootSig.Get());
                 cmdList->SetPipelineState(svgfAtrousPSO.Get());
-                ID3D12DescriptorHeap* atrousHeaps[] = { svgfAtrousDescHeap.Get() };
+                ID3D12DescriptorHeap* atrousHeaps[] = { atrousDescHeap };
                 cmdList->SetDescriptorHeaps(1, atrousHeaps);
                 const D3D12_GPU_DESCRIPTOR_HANDLE atrousTableBase =
-                    svgfAtrousDescHeap->GetGPUDescriptorHandleForHeapStart();
+                    atrousDescHeap->GetGPUDescriptorHandleForHeapStart();
 
-                for (UINT iter = 0; iter < svgfAtrousIterations; ++iter) {
+                for (UINT iter = 0; iter < atrousIterationCount; ++iter) {
                     // Set 0 (offset 0)  : reflectionSrc -> scratchA
                     // Set 1 (offset 6)  : scratchA      -> scratchB
                     // Set 2 (offset 12) : scratchB      -> scratchA
@@ -1141,11 +1193,23 @@ public:
                     ac.sigmaNormal = 128.0f;
                     ac.sigmaLuminance = 4.0f;
                     ac.iterationIndex = iter;
-                    ac.debugViewMode = (UINT)debugViewMode;
-                    ac.pad0 = 0.0f;
-                    memcpy(svgfAtrousConstantMapped, &ac, sizeof(ac));
+                    ac.diagnosticMode = debugViewMode == 6
+                        ? svgfAtrousDiagnosticMode : 0u;
+                    ac.iterationCount = atrousIterationCount;
+                    ac.maxAccumFrames =
+                        static_cast<float>((std::max)(svgfMaxAccumFrames, 1u));
+                    ac.pad0 = 0u;
+                    ac.pad1 = 0u;
+                    ac.pad2 = 0u;
+                    const UINT64 constantOffset =
+                        (static_cast<UINT64>(frameSlot) *
+                             kSVGFAtrousMaxIterations + iter) * 256ull;
+                    memcpy(static_cast<BYTE*>(svgfAtrousConstantMapped) +
+                               constantOffset,
+                           &ac, sizeof(ac));
                     cmdList->SetComputeRootConstantBufferView(0,
-                        svgfAtrousConstantBuffer->GetGPUVirtualAddress());
+                        svgfAtrousConstantBuffer->GetGPUVirtualAddress() +
+                            constantOffset);
 
                     cmdList->Dispatch(groupsX, groupsY, 1);
 
@@ -1157,7 +1221,7 @@ public:
                     // undefined. The buffer the next pass writes is transitioned
                     // back to UNORDERED_ACCESS in the same call.
                     const UINT written = writeIdx;
-                    if (iter + 1 < svgfAtrousIterations) {
+                    if (iter + 1 < atrousIterationCount) {
                         const UINT nextWrite = written ^ 1u;
                         D3D12_RESOURCE_BARRIER iterBarriers[2] = {};
                         iterBarriers[0].Type =
@@ -1191,7 +1255,7 @@ public:
             // writes scratchB. Iteration 0 uses set 0; thereafter
             // setIndex = 2 - (iter & 1), so odd iterations use set 1.
             // => iteration 0 lands in A, and after that odd->B, even->A.
-            const UINT lastIter = svgfAtrousIterations - 1u;
+            const UINT lastIter = atrousIterationCount - 1u;
             const UINT finalIdx =
                 (lastIter == 0u) ? 0u : ((lastIter & 1u) ? 1u : 0u);
             const UINT compOutIdx = finalIdx ^ 1u;
@@ -1210,7 +1274,7 @@ public:
                 // than one iteration the per-iteration barriers left it in
                 // NON_PIXEL_SHADER_RESOURCE, so it has to come back. With a
                 // single iteration it was never moved and is already UAV.
-                if (svgfAtrousIterations > 1u) {
+                if (atrousIterationCount > 1u) {
                     atrousOutBarriers[1] = atrousOutBarriers[0];
                     atrousOutBarriers[1].Transition.pResource =
                         svgfAtrousScratch[compOutIdx].Get();
@@ -1238,7 +1302,8 @@ public:
             // [0] t0: outputTexture   [1] t1: srcReflection
             // [2] t2: filteredReflection   [3] u0: compositeOutput (compOutIdx scratch)
             {
-                D3D12_CPU_DESCRIPTOR_HANDLE h = svgfCompositeDescHeap->GetCPUDescriptorHandleForHeapStart();
+                D3D12_CPU_DESCRIPTOR_HANDLE h =
+                    compositeDescHeap->GetCPUDescriptorHandleForHeapStart();
 
                 D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
                 srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -1280,16 +1345,21 @@ public:
                 cc.screenHeight = height;
                 cc.debugViewMode = (UINT)debugViewMode;
                 cc.pad0 = 0u;
-                memcpy(svgfCompositeConstantMapped, &cc, sizeof(cc));
+                const UINT64 constantOffset =
+                    static_cast<UINT64>(frameSlot) * 256ull;
+                memcpy(static_cast<BYTE*>(svgfCompositeConstantMapped) +
+                           constantOffset,
+                       &cc, sizeof(cc));
 
                 cmdList->SetComputeRootSignature(svgfCompositeRootSig.Get());
                 cmdList->SetPipelineState(svgfCompositePSO.Get());
-                ID3D12DescriptorHeap* compHeaps[] = { svgfCompositeDescHeap.Get() };
+                ID3D12DescriptorHeap* compHeaps[] = { compositeDescHeap };
                 cmdList->SetDescriptorHeaps(1, compHeaps);
                 cmdList->SetComputeRootConstantBufferView(0,
-                    svgfCompositeConstantBuffer->GetGPUVirtualAddress());
+                    svgfCompositeConstantBuffer->GetGPUVirtualAddress() +
+                        constantOffset);
                 cmdList->SetComputeRootDescriptorTable(1,
-                    svgfCompositeDescHeap->GetGPUDescriptorHandleForHeapStart());
+                    compositeDescHeap->GetGPUDescriptorHandleForHeapStart());
 
                 cmdList->Dispatch(groupsX, groupsY, 1);
             }
@@ -1362,9 +1432,6 @@ public:
                 barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             }
-            const bool atrousRan = useEnhanced && svgfAtrousEnabled && svgfAtrousPipelineReady &&
-                                   svgfAtrousPSO && svgfAtrousRootSig && svgfAtrousDescHeap &&
-                                   svgfCompositePSO && svgfCompositeRootSig && svgfCompositeDescHeap;
             barriers[0].Transition.StateBefore = atrousRan
                 ? D3D12_RESOURCE_STATE_COPY_DEST
                 : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -1735,9 +1802,38 @@ public:
         CreateOutputTexture();
         if (enhancedPipelineReady) {
             CreateRayMaskResources();
-            // The descriptor heap points at the destroyed mask texture, so it
-            // has to be rebuilt before the next enhanced dispatch.
-            enhancedComputeDescHeap.Reset();
+            // Each frame heap points at destroyed screen-sized resources, so
+            // all slots must be rebuilt as they become current.
+            for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
+                enhancedComputeDescHeaps[frame].Reset();
+                enhancedHeapTLASAddresses[frame] = 0;
+            }
+        }
+        if (svgfAtrousPipelineReady) {
+            D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+            heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            bool heapRebuildFailed = false;
+            for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
+                svgfAtrousDescHeaps[frame].Reset();
+                heapDesc.NumDescriptors = 18;
+                if (FAILED(g_dx12.device->CreateDescriptorHeap(
+                        &heapDesc,
+                        IID_PPV_ARGS(&svgfAtrousDescHeaps[frame])))) {
+                    heapRebuildFailed = true;
+                    break;
+                }
+                svgfCompositeDescHeaps[frame].Reset();
+                heapDesc.NumDescriptors = 4;
+                if (FAILED(g_dx12.device->CreateDescriptorHeap(
+                        &heapDesc,
+                        IID_PPV_ARGS(&svgfCompositeDescHeaps[frame])))) {
+                    heapRebuildFailed = true;
+                    break;
+                }
+            }
+            if (heapRebuildFailed)
+                svgfAtrousPipelineReady = false;
         }
         UpdateComputeDescriptors();
         UpdateBloomDescriptors();
@@ -1956,13 +2052,13 @@ private:
         // per iteration then the final result is read by the composite pass.
         hr = g_dx12.device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
             IID_PPV_ARGS(&svgfReflectionSrc));
         if (FAILED(hr)) return false;
         for (UINT i = 0; i < 2; ++i) {
             hr = g_dx12.device->CreateCommittedResource(
                 &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                 IID_PPV_ARGS(&svgfAtrousScratch[i]));
             if (FAILED(hr)) return false;
         }
@@ -2362,7 +2458,7 @@ private:
     }
 
     // Uploads the per-frame enhanced constants (b5).
-    void UpdateEnhancedConstants() {
+    void UpdateEnhancedConstants(UINT frameSlot) {
         if (!enhancedConstantMapped) return;
         // Field-for-field mirror of EnhancedVisualsBuffer (b5) in
         // visbuf_resolve_cs.hlsl. Append only -- inserting shifts every field
@@ -2384,7 +2480,13 @@ private:
             UINT  svgfMaxAccum;
             UINT  svgfAtrousEnable;
             UINT  svgfAtrousIters;
+            UINT  svgfHistoryValid;
+            UINT  svgfPad0;
+            UINT  svgfPad1;
+            UINT  svgfPad2;
         } constants;
+        static_assert(sizeof(EnhancedConstants) == 80,
+                      "EnhancedVisualsBuffer C++ mirror is out of sync");
         constants.rtShadows = enhancedRTShadowsActive ? 1u : 0u;
         constants.rayClassify = enhancedRayClassifyActive ? 1u : 0u;
         constants.shadowRayLength = enhancedShadowRayLength;
@@ -2402,8 +2504,16 @@ private:
         constants.svgfTemporalEnable = svgfTemporalEnabled ? 1u : 0u;
         constants.svgfMaxAccum = svgfMaxAccumFrames;
         constants.svgfAtrousEnable = svgfAtrousEnabled ? 1u : 0u;
-        constants.svgfAtrousIters = svgfAtrousIterations;
-        memcpy(enhancedConstantMapped, &constants, sizeof(constants));
+        constants.svgfAtrousIters = std::clamp(
+            svgfAtrousIterations, 1u, kSVGFAtrousMaxIterations);
+        constants.svgfHistoryValid = svgfHistoryValid ? 1u : 0u;
+        constants.svgfPad0 = 0u;
+        constants.svgfPad1 = 0u;
+        constants.svgfPad2 = 0u;
+        const UINT64 constantOffset =
+            static_cast<UINT64>(frameSlot) * 256ull;
+        memcpy(static_cast<BYTE*>(enhancedConstantMapped) + constantOffset,
+               &constants, sizeof(constants));
     }
 
     // Builds the SM 6.5 resolve variant. Mirrors the root signature of the
@@ -2566,7 +2676,7 @@ private:
         heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bufferDesc = {};
         bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bufferDesc.Width = 256;
+        bufferDesc.Width = 256ull * FRAME_COUNT;
         bufferDesc.Height = 1;
         bufferDesc.DepthOrArraySize = 1;
         bufferDesc.MipLevels = 1;
@@ -2608,10 +2718,26 @@ private:
         // Compile the à-trous shader
         const std::wstring shaderDirectory =
             ShaderCacheDX12::ExecutableDirectory() + L"shaders";
+        auto loadShaderSource = [](const std::wstring& path,
+                                   std::string& source) {
+            std::ifstream file(path, std::ios::binary);
+            if (!file) return false;
+            std::stringstream stream;
+            stream << file.rdbuf();
+            source = stream.str();
+            return !source.empty();
+        };
+
+        std::string atrousSource;
+        if (!loadShaderSource(
+                shaderDirectory + L"\\svgf_atrous_cs.hlsl", atrousSource)) {
+            std::cerr << "SVGF a-trous: shader source unavailable\n";
+            return;
+        }
         ComPtr<ID3DBlob> atrousBlob;
         std::string errors;
         if (!ShaderCacheDX12::CompileCachedDXC(
-                "shaders/svgf_atrous_cs.hlsl", L"svgf_atrous_cs.hlsl",
+                atrousSource, L"svgf_atrous_cs.hlsl",
                 L"main", L"cs_6_5", shaderDirectory, &atrousBlob, &errors)) {
             std::cerr << "SVGF à-trous: compile failed\n";
             if (!errors.empty()) {
@@ -2623,9 +2749,17 @@ private:
         }
 
         // Compile the composite shader
+        std::string compositeSource;
+        if (!loadShaderSource(
+                shaderDirectory + L"\\svgf_atrous_composite_cs.hlsl",
+                compositeSource)) {
+            std::cerr << "SVGF a-trous composite: shader source unavailable\n";
+            return;
+        }
         ComPtr<ID3DBlob> compositeBlob;
+        errors.clear();
         if (!ShaderCacheDX12::CompileCachedDXC(
-                "shaders/svgf_atrous_composite_cs.hlsl",
+                compositeSource,
                 L"svgf_atrous_composite_cs.hlsl",
                 L"main", L"cs_6_5", shaderDirectory, &compositeBlob, &errors)) {
             std::cerr << "SVGF à-trous composite: compile failed\n";
@@ -2703,7 +2837,7 @@ private:
             }
         }
 
-        // À-trous descriptor heap: 6 descriptors (4 SRV + 2 UAV)
+        // À-trous descriptor heaps: one mutable heap per frame slot.
         {
             D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
             // Three 6-descriptor sets, one per ping-pong parity:
@@ -2713,9 +2847,12 @@ private:
             heapDesc.NumDescriptors = 18;
             heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
             heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-            if (FAILED(g_dx12.device->CreateDescriptorHeap(
-                    &heapDesc, IID_PPV_ARGS(&svgfAtrousDescHeap))))
-                return;
+            for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
+                if (FAILED(g_dx12.device->CreateDescriptorHeap(
+                        &heapDesc,
+                        IID_PPV_ARGS(&svgfAtrousDescHeaps[frame]))))
+                    return;
+            }
         }
 
         // À-trous constant upload buffer
@@ -2724,7 +2861,8 @@ private:
             heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
             D3D12_RESOURCE_DESC bufferDesc = {};
             bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bufferDesc.Width = 256;
+            bufferDesc.Width = 256ull * FRAME_COUNT *
+                               kSVGFAtrousMaxIterations;
             bufferDesc.Height = 1;
             bufferDesc.DepthOrArraySize = 1;
             bufferDesc.MipLevels = 1;
@@ -2796,15 +2934,18 @@ private:
             }
         }
 
-        // Composite descriptor heap: 4 descriptors (3 SRV + 1 UAV)
+        // Composite descriptor heaps: one mutable heap per frame slot.
         {
             D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
             heapDesc.NumDescriptors = 4;
             heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
             heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-            if (FAILED(g_dx12.device->CreateDescriptorHeap(
-                    &heapDesc, IID_PPV_ARGS(&svgfCompositeDescHeap))))
-                return;
+            for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
+                if (FAILED(g_dx12.device->CreateDescriptorHeap(
+                        &heapDesc,
+                        IID_PPV_ARGS(&svgfCompositeDescHeaps[frame]))))
+                    return;
+            }
         }
 
         // Composite constant upload buffer
@@ -2813,7 +2954,7 @@ private:
             heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
             D3D12_RESOURCE_DESC bufferDesc = {};
             bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bufferDesc.Width = 256;
+            bufferDesc.Width = 256ull * FRAME_COUNT;
             bufferDesc.Height = 1;
             bufferDesc.DepthOrArraySize = 1;
             bufferDesc.MipLevels = 1;
@@ -2965,14 +3106,18 @@ private:
     // Builds the enhanced heap: a copy of the default resolve heap's 86
     // descriptors, then TLAS / ray mask / enhanced constants appended.
     //
-    // Updates just the SVGF descriptor slots (89-93) to point at the current
-    // ping-pong side. Called every frame when temporal accumulation is active,
-    // before the enhanced resolve dispatch.
-    void RefreshSVGFDescriptors() {
-        if (!enhancedComputeDescHeap || !svgfHistoryColor[0]) return;
+    // Updates just the current frame heap's SVGF slots (89-93). Normal shading
+    // supplies previous/current ping indices; read-only debug views instead
+    // keep the latest completed side bound without advancing history.
+    void RefreshSVGFDescriptors(UINT frameSlot, UINT readIndex,
+                                UINT writeIndex) {
+        if (frameSlot >= FRAME_COUNT ||
+            !enhancedComputeDescHeaps[frameSlot] || !svgfHistoryColor[0])
+            return;
         const UINT descSize = g_dx12.cbvSrvUavDescriptorSize;
         D3D12_CPU_DESCRIPTOR_HANDLE handle =
-            enhancedComputeDescHeap->GetCPUDescriptorHandleForHeapStart();
+            enhancedComputeDescHeaps[frameSlot]
+                ->GetCPUDescriptorHandleForHeapStart();
 
         // [89] t80 - svgf history colour read (previous frame's ping)
         {
@@ -2984,7 +3129,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 89;
             g_dx12.device->CreateShaderResourceView(
-                svgfHistoryColor[svgfHistoryPing ^ 1].Get(), &srv, h);
+                svgfHistoryColor[readIndex].Get(), &srv, h);
         }
 
         // [90] t81 - svgf history moments read
@@ -2997,7 +3142,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 90;
             g_dx12.device->CreateShaderResourceView(
-                svgfHistoryMoments[svgfHistoryPing ^ 1].Get(), &srv, h);
+                svgfHistoryMoments[readIndex].Get(), &srv, h);
         }
 
         // [91] t82 - vis buffer history (static, but refresh for safety)
@@ -3021,7 +3166,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 92;
             g_dx12.device->CreateUnorderedAccessView(
-                svgfHistoryColor[svgfHistoryPing].Get(), nullptr, &uav, h);
+                svgfHistoryColor[writeIndex].Get(), nullptr, &uav, h);
         }
 
         // [93] u5 - svgf moments write
@@ -3032,37 +3177,43 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 93;
             g_dx12.device->CreateUnorderedAccessView(
-                svgfHistoryMoments[svgfHistoryPing].Get(), nullptr, &uav, h);
+                svgfHistoryMoments[writeIndex].Get(), nullptr, &uav, h);
         }
     }
 
     // Called after the default heap is populated and whenever the TLAS address
     // changes. Copying rather than sharing keeps the default layout's
     // hardcoded indices untouched.
-    void RefreshEnhancedDescriptors() {
-        if (!enhancedPipelineReady || !computeDescHeap) return;
+    void RefreshEnhancedDescriptors(UINT frameSlot) {
+        if (frameSlot >= FRAME_COUNT || !enhancedPipelineReady ||
+            !computeDescHeap)
+            return;
 
-        if (!enhancedComputeDescHeap) {
+        if (!enhancedComputeDescHeaps[frameSlot]) {
             D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
             heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
             heapDesc.NumDescriptors = 95;   // 86 mirrored + 9 appended (5c adds u6)
             heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             if (FAILED(g_dx12.device->CreateDescriptorHeap(
-                    &heapDesc, IID_PPV_ARGS(&enhancedComputeDescHeap))))
+                    &heapDesc,
+                    IID_PPV_ARGS(&enhancedComputeDescHeaps[frameSlot]))))
                 return;
         }
+
+        ID3D12DescriptorHeap* enhancedHeap =
+            enhancedComputeDescHeaps[frameSlot].Get();
 
         const UINT descSize = g_dx12.cbvSrvUavDescriptorSize;
         // Mirror the default heap. CopyDescriptorsSimple needs a non-shader-
         // visible source, so this copies through the CPU handle of the shader-
         // visible heap, which is legal for CBV_SRV_UAV heaps.
         g_dx12.device->CopyDescriptorsSimple(86,
-            enhancedComputeDescHeap->GetCPUDescriptorHandleForHeapStart(),
+            enhancedHeap->GetCPUDescriptorHandleForHeapStart(),
             computeDescHeap->GetCPUDescriptorHandleForHeapStart(),
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
         D3D12_CPU_DESCRIPTOR_HANDLE handle =
-            enhancedComputeDescHeap->GetCPUDescriptorHandleForHeapStart();
+            enhancedHeap->GetCPUDescriptorHandleForHeapStart();
 
         // [86] t79 - TLAS. The slot must hold a valid descriptor even when
         // there is no acceleration structure yet: the runtime requires every
@@ -3094,7 +3245,8 @@ private:
         {
             D3D12_CONSTANT_BUFFER_VIEW_DESC cbv = {};
             cbv.BufferLocation =
-                enhancedConstantBuffer->GetGPUVirtualAddress();
+                enhancedConstantBuffer->GetGPUVirtualAddress() +
+                static_cast<UINT64>(frameSlot) * 256ull;
             cbv.SizeInBytes = 256;
             D3D12_CPU_DESCRIPTOR_HANDLE cbvHandle = handle;
             cbvHandle.ptr += (UINT64)descSize * 88;
@@ -3111,7 +3263,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 89;
             g_dx12.device->CreateShaderResourceView(
-                svgfHistoryColor[svgfHistoryPing ^ 1].Get(), &srv, h);
+                svgfHistoryColor[svgfHistoryPing].Get(), &srv, h);
         }
 
         // [90] t81 - svgf history moments (SRV, read side of ping-pong)
@@ -3124,7 +3276,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 90;
             g_dx12.device->CreateShaderResourceView(
-                svgfHistoryMoments[svgfHistoryPing ^ 1].Get(), &srv, h);
+                svgfHistoryMoments[svgfHistoryPing].Get(), &srv, h);
         }
 
         // [91] t82 - vis buffer history (SRV, surface-ID validation)
@@ -3148,7 +3300,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 92;
             g_dx12.device->CreateUnorderedAccessView(
-                svgfHistoryColor[svgfHistoryPing].Get(), nullptr, &uav, h);
+                svgfHistoryColor[svgfHistoryPing ^ 1u].Get(), nullptr, &uav, h);
         }
 
         // [93] u5 - svgf moments write (UAV, write side of ping-pong)
@@ -3159,7 +3311,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 93;
             g_dx12.device->CreateUnorderedAccessView(
-                svgfHistoryMoments[svgfHistoryPing].Get(), nullptr, &uav, h);
+                svgfHistoryMoments[svgfHistoryPing ^ 1u].Get(), nullptr, &uav, h);
         }
 
         // [94] u6 - reflection source (UAV, specular IBL from resolve)
@@ -3172,6 +3324,7 @@ private:
             g_dx12.device->CreateUnorderedAccessView(
                 svgfReflectionSrc.Get(), nullptr, &uav, h);
         }
+        enhancedHeapTLASAddresses[frameSlot] = enhancedTLASAddress;
     }
 
 public:
@@ -3181,6 +3334,8 @@ public:
                             float confidenceThreshold,
                             D3D12_GPU_VIRTUAL_ADDRESS tlasAddress,
                             bool rtReflections = false) {
+        const bool rtReflectionsChanged =
+            enhancedRTReflectionsActive != rtReflections;
         enhancedRTShadowsActive = rtShadows;
         enhancedRayClassifyActive = rayClassify;
         enhancedConfidenceThreshold = confidenceThreshold;
@@ -3188,15 +3343,16 @@ public:
         // Without a TLAS there is nothing to trace against, so the enhanced
         // path would just be a slower way to get the same image.
         const bool wantActive = active && tlasAddress != 0;
-        const bool tlasChanged = tlasAddress != enhancedTLASAddress;
+        if (rtReflectionsChanged || wantActive != enhancedVisualsActive)
+            svgfHistoryValid = false;
         enhancedTLASAddress = tlasAddress;
-        // Refresh whenever the address changes or the heap is missing. The
-        // heap is created shader-visible and every slot must be populated
-        // before binding; RefreshEnhancedDescriptors null-fills the TLAS slot
-        // when the address is 0, so this is also the path that writes a
-        // documented null binding instead of leaving slot 86 as garbage.
-        if (tlasChanged || !enhancedComputeDescHeap)
-            RefreshEnhancedDescriptors();
+        const UINT frameSlot = g_dx12.frameIndex % FRAME_COUNT;
+        // The current frame slot is idle by the time its allocator is reused,
+        // so only its descriptors may be rewritten. Other slots refresh when
+        // they become current rather than while the GPU may still read them.
+        if (!enhancedComputeDescHeaps[frameSlot] ||
+            enhancedHeapTLASAddresses[frameSlot] != enhancedTLASAddress)
+            RefreshEnhancedDescriptors(frameSlot);
         enhancedVisualsActive = wantActive;
     }
 

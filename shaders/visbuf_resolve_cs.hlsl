@@ -1658,6 +1658,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // — the same signal, pre-BRDF vs post-BRDF.
     if (debugViewMode == 6u) {
         float3 debugColor = float3(0.0, 0.0, 0.0);
+        float debugSignalVariance = 0.0;
         bool eligible = enhancedRTReflections != 0 &&
                         surface.rough <= enhancedReflectionRoughnessCut &&
                         !surface.isFoliage;
@@ -1667,7 +1668,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                 surface.fragPos, surface.normal,
                 surface.viewDir, surface.rough, pixel, reflectionHit);
             float3 thisFrameSample = traced;
-            float3 debugVariance;
+            float3 debugVariance = thisFrameSample * thisFrameSample;
             float3 reflIBL = svgfTemporalEnabled != 0
                 ? SVGF_TemporalAccumulate(thisFrameSample, pixel,
                     visBuffer.Load(int3(pixel, 0)), false, debugVariance)
@@ -1680,9 +1681,21 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                        surface.rough), 0.0);
             float foliageScale = surface.isFoliage ? 0.12 : 1.0;
             float3 F0 = lerp(float3(0.04, 0.04, 0.04), surface.albedo, surface.metal);
-            debugColor = reflIBL *
-                (F0 * envBRDF.x + envBRDF.y) * foliageScale;
+            float3 contributionScale =
+                (F0 * envBRDF.x + envBRDF.y) * foliageScale *
+                surface.materialAO * ambientLightingIntensity;
+            debugColor = reflIBL * contributionScale;
+            float3 contributionVariance =
+                debugVariance * contributionScale * contributionScale;
+            debugSignalVariance = dot(
+                contributionVariance,
+                float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0));
         }
+        // The composite pass replaces this pre-filter preview with the actual
+        // filtered signal. Populate its input before returning; the up-front
+        // clear otherwise makes debug view 6 black whenever a-trous runs.
+        outputReflectionSrc[pixel] =
+            float4(debugColor, debugSignalVariance);
         outputColor[pixel] = float4(debugColor, 1.0);
         if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
         return;

@@ -1,0 +1,188 @@
+{
+  "schemaVersion": 1,
+  "name": "RTX SVGF Target Range",
+  "insertionMode": "helicopter",
+  "terrain": {
+    "heightScale": 0.0,
+    "tilesX": 4,
+    "tilesZ": 4,
+    "islandScaleX": 0.5,
+    "islandScaleZ": 0.5,
+    "originTileX": 0,
+    "originTileZ": 0,
+    "sculpt": []
+  },
+  "lighting": {
+    "dxrDDGI": {
+      "enabled": false,
+      "surfaceSpacing": 3.0,
+      "surfaceOffset": 0.35,
+      "maxProbes": 256,
+      "raysPerProbe": 64,
+      "probesPerFrame": 16,
+      "maxRayDistance": 24.0,
+      "intensity": 0.45,
+      "normalBias": 0.18,
+      "viewBias": 0.05,
+      "hysteresis": 0.95,
+      "multiBounceStrength": 0.35,
+      "showProbes": false
+    }
+  },
+  "entities": [
+    {
+      "id": 1,
+      "type": "player_spawn",
+      "name": "Fixed SVGF Camera",
+      "enabled": true,
+      "transform": {
+        "position": [0.0, 3.0, -10.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      }
+    },
+    {
+      "id": 10,
+      "type": "metal_house",
+      "name": "Left Reflective Backdrop",
+      "enabled": true,
+      "transform": {
+        "position": [-7.0, 0.0, 13.0],
+        "rotation": [0.0, 180.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      }
+    },
+    {
+      "id": 11,
+      "type": "wood_house",
+      "name": "Right Rough Backdrop",
+      "enabled": true,
+      "transform": {
+        "position": [7.0, 0.0, 13.0],
+        "rotation": [0.0, 180.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      }
+    },
+    {
+      "id": 20,
+      "type": "humvee",
+      "name": "Near Glossy Curves",
+      "enabled": true,
+      "transform": {
+        "position": [-3.2, 0.0, 1.5],
+        "rotation": [0.0, 25.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      }
+    },
+    {
+      "id": 21,
+      "type": "humvee",
+      "name": "Far Glossy Curves",
+      "enabled": true,
+      "transform": {
+        "position": [3.5, 0.0, 7.0],
+        "rotation": [0.0, 205.0, 0.0],
+        "scale": [0.75, 0.75, 0.75]
+      }
+    },
+    {
+      "id": 30,
+      "type": "explosive_barrel",
+      "name": "Depth Step 1 Near",
+      "enabled": true,
+      "transform": {
+        "position": [-6.0, 0.0, -1.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      }
+    },
+    {
+      "id": 31,
+      "type": "explosive_barrel",
+      "name": "Depth Step 2",
+      "enabled": true,
+      "transform": {
+        "position": [-5.2, 0.0, 1.5],
+        "rotation": [0.0, 20.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      }
+    },
+    {
+      "id": 32,
+      "type": "explosive_barrel",
+      "name": "Depth Step 3",
+      "enabled": true,
+      "transform": {
+        "position": [-4.4, 0.0, 4.0],
+        "rotation": [0.0, 40.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      }
+    },
+    {
+      "id": 33,
+      "type": "explosive_barrel",
+      "name": "Depth Step 4 Far",
+      "enabled": true,
+      "transform": {
+        "position": [-3.6, 0.0, 6.5],
+        "rotation": [0.0, 60.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      }
+    },
+    {
+      "id": 40,
+      "type": "rock",
+      "name": "Normal Discontinuity Large",
+      "enabled": true,
+      "transform": {
+        "position": [5.5, 0.0, -0.5],
+        "rotation": [0.0, 15.0, 0.0],
+        "scale": [2.2, 1.4, 2.2]
+      }
+    },
+    {
+      "id": 41,
+      "type": "rock",
+      "name": "Normal Discontinuity Small",
+      "enabled": true,
+      "transform": {
+        "position": [6.2, 0.0, 3.0],
+        "rotation": [0.0, 75.0, 0.0],
+        "scale": [0.65, 1.4, 0.65]
+      }
+    },
+    {
+      "id": 50,
+      "type": "palm",
+      "name": "Thin Silhouette Left",
+      "enabled": true,
+      "transform": {
+        "position": [-10.0, 0.0, 4.0],
+        "rotation": [0.0, 25.0, 0.35],
+        "scale": [1.0, 10.0, 1.0]
+      }
+    },
+    {
+      "id": 51,
+      "type": "palm",
+      "name": "Thin Silhouette Right",
+      "enabled": true,
+      "transform": {
+        "position": [10.0, 0.0, 5.5],
+        "rotation": [0.0, 210.0, -0.3],
+        "scale": [1.0, 12.0, 1.0]
+      }
+    },
+    {
+      "id": 60,
+      "type": "helicopter",
+      "name": "Fine Geometry Overhead",
+      "enabled": true,
+      "transform": {
+        "position": [0.0, 5.0, 8.5],
+        "rotation": [0.0, 90.0, 0.0],
+        "scale": [0.65, 0.65, 0.65]
+      }
+    }
+  ]
+}

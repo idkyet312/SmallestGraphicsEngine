@@ -12,12 +12,16 @@ cbuffer AtrousConstants : register(b0) {
     float sigmaNormal;
     float sigmaLuminance;
     uint  iterationIndex;
-    uint2 padding;
+    uint  diagnosticMode;
+    uint  iterationCount;
+    float maxAccumFrames;
+    uint3 padding;
 };
 
 Texture2D<float4> inputReflection : register(t0); // rgb=signal, a=variance
 Texture2D<float>  depthBuffer     : register(t1); // device depth
 Texture2D<float4> normalRoughness : register(t2);
+Texture2D<float4> historyMoments  : register(t3); // rgb=E[x^2], a=count
 RWTexture2D<float4> outputReflection : register(u0);
 
 static const int2 kOffsets[25] = {
@@ -63,7 +67,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     float3 colourSum = 0.0;
     float weightSum = 0.0;
     float varianceSum = 0.0;
-    float varianceWeightSum = 0.0;
+    float centreWeight = 0.0;
+    float kernelWeightSum = 0.0;
+    float normalAcceptanceSum = 0.0;
+    float depthAcceptanceSum = 0.0;
+    float luminanceAcceptanceSum = 0.0;
 
     [unroll]
     for (uint i = 0; i < 25; ++i) {
@@ -89,6 +97,11 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         colourSum += tap.rgb * weight;
         weightSum += weight;
         varianceSum += max(tap.a, 0.0) * weight * weight;
+        kernelWeightSum += kernelWeight;
+        normalAcceptanceSum += kernelWeight * normalWeight;
+        depthAcceptanceSum += kernelWeight * depthWeight;
+        luminanceAcceptanceSum += kernelWeight * luminanceWeight;
+        if (all(offset == int2(0, 0))) centreWeight = weight;
     }
 
     // Variance of a weighted mean sum(w*x)/sum(w) is
@@ -97,7 +110,36 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // variance, which keeps the luminance tolerance wide on later iterations
     // and over-blurs detail that earlier passes had already resolved.
     const float normalisedWeight = max(weightSum, 1e-8);
-    outputReflection[pixel] = float4(
-        max(colourSum / normalisedWeight, 0.0),
-        varianceSum / (normalisedWeight * normalisedWeight));
+    const float3 filteredColour = max(colourSum / normalisedWeight, 0.0);
+    const float filteredVariance =
+        varianceSum / (normalisedWeight * normalisedWeight);
+
+    if (diagnosticMode != 0u && iterationIndex + 1u == iterationCount) {
+        float3 diagnostic = 0.0;
+        if (diagnosticMode == 1u) {
+            // White means enough residual variance to keep spatial filtering
+            // active; black means the temporal moments claim convergence.
+            float varianceLevel = 1.0 - exp(-sqrt(max(filteredVariance, 0.0)) * 8.0);
+            diagnostic = varianceLevel.xxx;
+        } else if (diagnosticMode == 2u) {
+            // Red means almost all accepted weight came from the centre tap;
+            // green means neighbouring pixels materially contributed.
+            float centreShare = saturate(centreWeight / normalisedWeight);
+            diagnostic = float3(centreShare, 1.0 - centreShare, 0.0);
+        } else if (diagnosticMode == 3u) {
+            diagnostic = (normalAcceptanceSum / max(kernelWeightSum, 1e-8)).xxx;
+        } else if (diagnosticMode == 4u) {
+            diagnostic = (depthAcceptanceSum / max(kernelWeightSum, 1e-8)).xxx;
+        } else if (diagnosticMode == 5u) {
+            diagnostic = (luminanceAcceptanceSum / max(kernelWeightSum, 1e-8)).xxx;
+        } else if (diagnosticMode == 6u) {
+            float history = saturate(
+                historyMoments.Load(int3(pixel, 0)).w / max(maxAccumFrames, 1.0));
+            diagnostic = float3(1.0 - history, history, 0.0);
+        }
+        outputReflection[pixel] = float4(diagnostic, filteredVariance);
+        return;
+    }
+
+    outputReflection[pixel] = float4(filteredColour, filteredVariance);
 }
