@@ -232,6 +232,13 @@ public:
                 return false;
             D3D12_RANGE none{ 0, 0 };
             if (FAILED(palette_[i]->Map(0, &none, &mapped_[i]))) return false;
+            // Previous-frame bone palette for motion vectors.
+            if (FAILED(g_dx12.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    IID_PPV_ARGS(&palettePrevious_[i]))))
+                return false;
+            if (FAILED(palettePrevious_[i]->Map(0, &none, &mappedPrevious_[i])))
+                return false;
         }
         // Prime with the bind pose so the very first frame renders upright even
         // before any clip is assigned.
@@ -269,6 +276,18 @@ public:
         const UINT frame = g_dx12.frameIndex % FRAME_COUNT;
         memcpy(mapped_[frame], paletteCPU_.data(), paletteBytes_);
         return palette_[frame]->GetGPUVirtualAddress();
+    }
+
+    D3D12_GPU_VIRTUAL_ADDRESS UploadPreviousPalette() {
+        if (!CanRender()) return 0;
+        const UINT frame = g_dx12.frameIndex % FRAME_COUNT;
+        if (!previousPoseGlobals_.empty()) {
+            memcpy(mappedPrevious_[frame], previousPoseGlobals_.data(), paletteBytes_);
+        } else {
+            // No history yet (first frame): use current pose so motion is zero.
+            memcpy(mappedPrevious_[frame], paletteCPU_.data(), paletteBytes_);
+        }
+        return palettePrevious_[frame]->GetGPUVirtualAddress();
     }
 
     void Update(float dt, const DirectX::XMFLOAT3& target, float groundY) {
@@ -1286,11 +1305,13 @@ public:
         using namespace DirectX;
         if (!CanRender()) return;
         const D3D12_GPU_VIRTUAL_ADDRESS paletteAddr = UploadPalette();
+        const D3D12_GPU_VIRTUAL_ADDRESS prevPaletteAddr = UploadPreviousPalette();
 
         // Mesh gets an extra independent rotation (debug) pre-applied in its own
         // local space so it can be aligned against the skeleton overlay.
         const XMMATRIX world = MeshWorldMatrix();
-        shader.SetMatrices(world, view, proj, lightSpace);
+        const XMMATRIX prevWorld = XMLoadFloat4x4(&previousMeshWorld_);
+        shader.SetMatrices(world, view, proj, lightSpace, {}, prevWorld);
 
         for (const auto& prim : model.node->mesh->primitives) {
             if (prim.vbv.BufferLocation == 0 || !prim.skinBuffer) continue;
@@ -1331,7 +1352,8 @@ public:
                     // can reject an on-screen corpse, especially after a harpoon
                     // pins it to a wall. Dead bodies are few and already visible
                     // candidates, so draw every posed meshlet.
-                    !dead_, dead_);
+                    !dead_, dead_,
+                    prevPaletteAddr);
             }
             shader.NextDrawCall();
         }
@@ -1419,6 +1441,8 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D12Resource> palette_[FRAME_COUNT];
     void* mapped_[FRAME_COUNT] = {};
+    Microsoft::WRL::ComPtr<ID3D12Resource> palettePrevious_[FRAME_COUNT];
+    void* mappedPrevious_[FRAME_COUNT] = {};
     UINT  paletteBytes_ = 0;
     std::vector<DirectX::XMFLOAT4X4> paletteCPU_;
     AnimationInstance upperBodyAnim_;
@@ -1440,6 +1464,7 @@ private:
     std::vector<DirectX::XMFLOAT4X4> bodyLocal_;
     DirectX::XMFLOAT4X4 poseWorld_ = {};
     DirectX::XMFLOAT4X4 previousPoseWorld_ = {};
+    DirectX::XMFLOAT4X4 previousMeshWorld_ = {};
     float previousPoseDt_ = 0.0f;
     DirectX::XMFLOAT4X4 deathWorld_ = {};
     DirectX::XMFLOAT3 knockbackVelocity_{ 0.0f, 0.0f, 0.0f };
@@ -1553,6 +1578,9 @@ private:
         previousPoseGlobals_ = poseGlobals_;
         previousPoseWorld_ = poseWorld_;
         previousPoseDt_ = dt;
+        if (model.valid) {
+            DirectX::XMStoreFloat4x4(&previousMeshWorld_, MeshWorldMatrix());
+        }
         if (upperBodyGunLayer && upperBodyAnim_.clip) {
             anim.ComputeLayeredPalette(model.skeleton, upperBodyAnim_, upperBodyMask_,
                                        gunPoseOffsets_, paletteCPU_, &poseGlobals_);

@@ -11819,12 +11819,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             mainShader.SetHDRTargetEnabled(true);
             g_meshShader.SetHDRTargetEnabled(true);
             g_terrain.SetHDRTargetEnabled(true);
+            const bool jitterExtensions = visBuffer.extensionMotionVectors;
+            mainShader.SetExtensionMotionEnabled(jitterExtensions);
+            g_meshShader.SetExtensionMotionEnabled(jitterExtensions);
             if (!visibilityDebugActive) {
                 ProfilerDX12::Scope extensions(
                     g_profiler, "Forward Extensions", g_dx12.commandList.Get());
                 RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
                     crateModel, floorMaterial,
-                    lightSpace, shadowResource, true, !grassMSAAActive);
+                    lightSpace, shadowResource, true, !grassMSAAActive,
+                    jitterExtensions);
             }
         } else if (IsSceneScreen() && !g_game.loading.Active()) {
             XMMATRIX lightSpace = XMMatrixIdentity();
@@ -11848,6 +11852,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 mainShader.SetHDRTargetEnabled(true);
                 g_meshShader.SetHDRTargetEnabled(true);
                 g_terrain.SetHDRTargetEnabled(true);
+                const bool jitterExt = visBuffer.extensionMotionVectors;
+                mainShader.SetExtensionMotionEnabled(jitterExt);
+                g_meshShader.SetExtensionMotionEnabled(jitterExt);
             }
             {
                 ProfilerDX12::Scope profile(g_profiler, "Forward", g_dx12.commandList.Get());
@@ -11858,10 +11865,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         // Hybrid visibility and pure forward both establish global forward
         // resources before skinned/transparent extension passes.
-        // Passes below draw after the visibility resolve and emit no motion
-        // vectors, so TAA cannot reproject them. Jittering them would shake the
-        // image with nothing to cancel it -- see GetUnjitteredProjectionMatrix.
-        const XMMATRIX extensionProj = scene.GetUnjitteredProjectionMatrix();
+        // Passes below draw after the visibility resolve. When extension motion
+        // vectors are off, TAA cannot reproject them and the sub-pixel jitter
+        // never cancels -- it reads as shaking. The toggle restores the jittered
+        // projection because the matching motion vectors make the jitter sum to
+        // zero again.
+        const XMMATRIX extensionProj = visBuffer.extensionMotionVectors
+            ? scene.GetProjectionMatrix()
+            : scene.GetUnjitteredProjectionMatrix();
         if (renderedScene && !g_emptyLevelMode && g_banditLoaded) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Bandits", g_dx12.commandList.Get());
@@ -12032,6 +12043,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             mainShader.SetHDRTargetEnabled(false);
             g_meshShader.SetHDRTargetEnabled(false);
             g_terrain.SetHDRTargetEnabled(false);
+            mainShader.SetExtensionMotionEnabled(false);
+            g_meshShader.SetExtensionMotionEnabled(false);
         }
 
         // Preserve this frame's depth for next-frame amplification-shader

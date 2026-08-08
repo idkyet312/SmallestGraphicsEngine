@@ -147,6 +147,11 @@ public:
     // Edge AA: shade 2 sub-pixel samples on silhouette edges and average.
     // Off by default; interior pixels are unchanged.
     bool edgeAAEnabled = false;
+    // Write motion vectors from forward extension passes (bandits, guns,
+    // impact billboards) into motionTexture so temporal consumers (TAA, SVGF)
+    // can reproject them. Off by default; takes a second RTV and a PSO
+    // variant with SGE_EXTENSION_MOTION compiled in.
+    bool extensionMotionVectors = false;
     ComPtr<ID3D12DescriptorHeap> visRtvHeap;    // RTV for visibility pass
     ComPtr<ID3D12DescriptorHeap> visSrvUavHeap; // SRV/UAV for compute resolve
 
@@ -1014,7 +1019,9 @@ public:
     }
 
     void BeginForwardExtensions(ID3D12GraphicsCommandList* cmdList) {
-        D3D12_RESOURCE_BARRIER barriers[2] = {};
+        const bool useMotion = extensionMotionVectors;
+        UINT barrierCount = useMotion ? 3u : 2u;
+        D3D12_RESOURCE_BARRIER barriers[3] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = outputTexture.Get();
         barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -1023,18 +1030,34 @@ public:
         barriers[1] = barriers[0];
         barriers[1].Transition.pResource = g_dx12.depthStencilBuffer.Get();
         barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        cmdList->ResourceBarrier(2, barriers);
+        if (useMotion) {
+            barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[2].Transition.pResource = motionTexture.Get();
+            barriers[2].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            barriers[2].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barriers[2].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        cmdList->ResourceBarrier(barrierCount, barriers);
 
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetOutputRTV();
-        D3D12_CPU_DESCRIPTOR_HANDLE dsv =
-            g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-        cmdList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        if (useMotion) {
+            D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = { GetOutputRTV(), GetMotionRTV() };
+            D3D12_CPU_DESCRIPTOR_HANDLE dsv =
+                g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            cmdList->OMSetRenderTargets(2, rtvs, FALSE, &dsv);
+        } else {
+            D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetOutputRTV();
+            D3D12_CPU_DESCRIPTOR_HANDLE dsv =
+                g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            cmdList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        }
         cmdList->RSSetViewports(1, &g_dx12.viewport);
         cmdList->RSSetScissorRects(1, &g_dx12.scissorRect);
     }
 
     void EndForwardExtensions(ID3D12GraphicsCommandList* cmdList) {
-        D3D12_RESOURCE_BARRIER barriers[2] = {};
+        const bool useMotion = extensionMotionVectors;
+        UINT barrierCount = useMotion ? 3u : 2u;
+        D3D12_RESOURCE_BARRIER barriers[3] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = outputTexture.Get();
         barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -1043,7 +1066,14 @@ public:
         barriers[1] = barriers[0];
         barriers[1].Transition.pResource = g_dx12.depthStencilBuffer.Get();
         barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        cmdList->ResourceBarrier(2, barriers);
+        if (useMotion) {
+            barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[2].Transition.pResource = motionTexture.Get();
+            barriers[2].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barriers[2].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            barriers[2].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        cmdList->ResourceBarrier(barrierCount, barriers);
     }
 
     D3D12_CPU_DESCRIPTOR_HANDLE GetOutputRTV() const {

@@ -1109,13 +1109,14 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                            XMMATRIX lightSpace = XMMatrixIdentity(),
                            ID3D12Resource* shadowMap = nullptr,
                            bool visibilityExtensionsOnly = false,
-                           bool includeGrass = true) {
+                           bool includeGrass = true,
+                           bool jitteredExtensions = false) {
     XMMATRIX view = scene.GetViewMatrix();
     // Extension geometry (weapon viewmodel, skinned actors, foliage) writes no
     // motion vectors, so TAA cannot reproject it and the sub-pixel jitter never
     // cancels -- it reads as the whole view shaking. Draw it unjittered until
-    // those passes emit real per-object motion.
-    XMMATRIX proj = visibilityExtensionsOnly
+    // those passes emit real per-object motion (extensionMotionVectors toggle).
+    XMMATRIX proj = visibilityExtensionsOnly && !jitteredExtensions
         ? scene.GetUnjitteredProjectionMatrix()
         : scene.GetProjectionMatrix();
 

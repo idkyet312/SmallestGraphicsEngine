@@ -661,6 +661,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             // averages. TAA is off by default, so this is the first AA the VB
             // path has. ~2.5% of pixels (silhouettes only).
             ImGui::Checkbox("Edge AA (N=2)", &vb.edgeAAEnabled);
+            ImGui::Checkbox("Extension Motion Vectors",
+                            &vb.extensionMotionVectors);
             if (vb.temporalEffectsEnabled) {
                 ImGui::SliderFloat("TAA History Weight", &vb.taaFeedback,
                                    0.70f, 0.95f, "%.2f");

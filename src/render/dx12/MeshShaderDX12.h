@@ -41,12 +41,16 @@ public:
     ComPtr<ID3D12PipelineState> psoHDR;
     ComPtr<ID3D12PipelineState> psoDoubleSidedHDR;
     ComPtr<ID3D12PipelineState> psoWireframeHDR;
+    // Extension-motion PSOs: 2 RTVs (HDR colour + R16G16_FLOAT motion).
+    ComPtr<ID3D12PipelineState> psoHDRMotion;
+    ComPtr<ID3D12PipelineState> psoDoubleSidedHDRMotion;
     ComPtr<ID3D12GraphicsCommandList6> commandList6;
     bool supported = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
     bool wireframe = false; // Z key: draw meshlets as wireframe
     bool hdrTargetEnabled = false;
+    bool extensionMotionEnabled = false;
     bool occlusionEnabled = false;
     UINT occlusionMipCount = 1;
     D3D12_GPU_DESCRIPTOR_HANDLE occlusionDepthHandle = {};
@@ -121,6 +125,9 @@ public:
             std::cerr << "HDR mesh pixel shader DXIL missing: shaders/mesh_ps_hdr.cso\n";
             return false;
         }
+        ComPtr<ID3DBlob> motionPs;
+        const bool motionPsAvailable =
+            SUCCEEDED(ReadCompiledShaderDX12(L"shaders/mesh_ps_motion.cso", &motionPs));
         if (!shader.rootSignature) return false;
 
         using Root = MeshPSOSubobjectDX12<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*>;
@@ -226,6 +233,31 @@ public:
             stream.raster.value.MultisampleEnable = FALSE;
         }
 
+        // Extension-motion HDR PSOs: 2 render targets (colour + motion).
+        // Bandits are forward extensions drawn after the visibility resolve,
+        // so these mirror the HDR solid and double-sided variants but with a
+        // motion-target pixel shader and NumRenderTargets=2.
+        if (motionPsAvailable) {
+            stream.raster.value.CullMode = D3D12_CULL_MODE_BACK;
+            stream.raster.value.FillMode = D3D12_FILL_MODE_SOLID;
+            stream.rt.value.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            stream.rt.value.RTFormats[1] = DXGI_FORMAT_R16G16_FLOAT;
+            stream.rt.value.NumRenderTargets = 2;
+            stream.ps.value = { motionPs->GetBufferPointer(), motionPs->GetBufferSize() };
+            if (FAILED(device2->CreatePipelineState(
+                    &streamDesc, IID_PPV_ARGS(&psoHDRMotion))))
+                psoHDRMotion.Reset();
+            stream.raster.value.CullMode = D3D12_CULL_MODE_NONE;
+            if (FAILED(device2->CreatePipelineState(
+                    &streamDesc, IID_PPV_ARGS(&psoDoubleSidedHDRMotion))))
+                psoDoubleSidedHDRMotion.Reset();
+            // Restore to single-RT LDR defaults
+            stream.ps.value = { ps->GetBufferPointer(), ps->GetBufferSize() };
+            stream.rt.value.NumRenderTargets = 1;
+            stream.rt.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            stream.raster.value.CullMode = D3D12_CULL_MODE_BACK;
+        }
+
         if (!instanceBuffer.Create(FRAME_COUNT * MaxInstancesPerFrame)) {
             std::cerr << "Mesh instance upload buffer creation failed\n";
             return false;
@@ -241,6 +273,8 @@ public:
 
     void SetHDRTargetEnabled(bool enabled) { hdrTargetEnabled = enabled; }
 
+    void SetExtensionMotionEnabled(bool enabled) { extensionMotionEnabled = enabled; }
+
     void Draw(const D3D12_VERTEX_BUFFER_VIEW& vbv,
               UINT vertexCount, UINT indexCount, UINT totalMeshlets,
               D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress,
@@ -253,11 +287,16 @@ public:
               bool allowOcclusion = true,
               // View model: bind-pose meshlet bounds say nothing about where
               // this ends up on screen, so exempt it from meshlet culling.
-              bool disableCulling = false) {
+              bool disableCulling = false,
+              D3D12_GPU_VIRTUAL_ADDRESS previousBonePaletteAddress = 0) {
         if (!CanDraw(totalMeshlets, meshletDescAddress, meshletBoundsAddress,
                      meshletVertexIndexAddress, meshletTriangleAddress)) return;
         ID3D12PipelineState* solid = hdrTargetEnabled
-            ? (doubleSided ? psoDoubleSidedHDR.Get() : psoHDR.Get())
+            ? (extensionMotionEnabled && psoHDRMotion
+                ? (doubleSided
+                    ? (psoDoubleSidedHDRMotion ? psoDoubleSidedHDRMotion.Get() : psoDoubleSidedHDR.Get())
+                    : psoHDRMotion.Get())
+                : (doubleSided ? psoDoubleSidedHDR.Get() : psoHDR.Get()))
             : (doubleSided
                 ? (msaaEnabled ? psoDoubleSidedMSAA.Get() : psoDoubleSided.Get())
                 : (msaaEnabled ? psoMSAA.Get() : pso.Get()));
@@ -286,6 +325,9 @@ public:
         if (skinning) {
             commandList6->SetGraphicsRootShaderResourceView(16, bonePaletteAddress);
             commandList6->SetGraphicsRootShaderResourceView(17, skinDataAddress);
+            // Previous bone palette for motion-vector skinning (root param 19, t20).
+            commandList6->SetGraphicsRootShaderResourceView(19,
+                previousBonePaletteAddress ? previousBonePaletteAddress : bonePaletteAddress);
         }
         const UINT maxMeshletsPerDispatch = 65535u * 32u;
         UINT firstMeshlet = 0;

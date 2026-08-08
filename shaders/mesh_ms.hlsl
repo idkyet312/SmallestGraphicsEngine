@@ -3,6 +3,17 @@ cbuffer MatrixBuffer : register(b0) {
     matrix view;
     matrix projection;
     matrix lightSpaceMatrix;
+    matrix modelView;
+    matrix modelViewProjection;
+    matrix previousViewProjection;
+    float4 palmWind;
+    float4 palmPrimary;
+    float4 palmSecondary;
+    float4 palmPreviousPrimary;
+    float4 palmPreviousSecondary;
+    float4 palmParams;
+    float4 palmRoot;
+    matrix previousModel;
 };
 
 cbuffer MeshDrawBuffer : register(b6) {
@@ -37,6 +48,8 @@ StructuredBuffer<uint> meshletTriangles : register(t11);
 StructuredBuffer<float4x4> bonePalette : register(t12);
 struct SkinVtx { uint4 boneIndex; float4 boneWeight; };
 StructuredBuffer<SkinVtx> skinData : register(t13);
+// Previous-frame bone palette for motion-vector skinning.
+StructuredBuffer<float4x4> previousBonePalette : register(t20);
 struct MeshInstanceData {
     float4x4 model;
     float modelMaxScale;
@@ -58,6 +71,8 @@ struct OutVertex {
     float2 texCoord : TEXCOORD2;
     float4 tangent : TEXCOORD3;
     float4 fragPosLightSpace : TEXCOORD4;
+    float4 currentClip : TEXCOORD5;
+    float4 previousClip : TEXCOORD6;
 };
 
 float LoadF(uint address) { return asfloat(vertexData.Load(address)); }
@@ -90,6 +105,8 @@ void MSMain(uint3 id : SV_GroupThreadID,
     if (id.x < meshlet.vertexCount) {
         uint sourceVertex = meshletVertexIndices[meshlet.vertexOffset + id.x];
         Vertex v = LoadVertex(sourceVertex);
+        float3 skinnedPos = v.position;
+        float3 prevLocal = v.position;
         if (skinningEnabled) {
             SkinVtx s = skinData[sourceVertex];
             float4x4 skinMat =
@@ -97,18 +114,31 @@ void MSMain(uint3 id : SV_GroupThreadID,
                 s.boneWeight.y * bonePalette[s.boneIndex.y] +
                 s.boneWeight.z * bonePalette[s.boneIndex.z] +
                 s.boneWeight.w * bonePalette[s.boneIndex.w];
-            v.position = mul(float4(v.position, 1), skinMat).xyz;
+            skinnedPos = mul(float4(v.position, 1), skinMat).xyz;
             v.normal = mul(v.normal, (float3x3)skinMat);
             v.tangent.xyz = mul(v.tangent.xyz, (float3x3)skinMat);
+            float4x4 prevSkin =
+                s.boneWeight.x * previousBonePalette[s.boneIndex.x] +
+                s.boneWeight.y * previousBonePalette[s.boneIndex.y] +
+                s.boneWeight.z * previousBonePalette[s.boneIndex.z] +
+                s.boneWeight.w * previousBonePalette[s.boneIndex.w];
+            prevLocal = mul(float4(prevLocal, 1), prevSkin).xyz;
         }
-        float4 world = mul(float4(v.position, 1), drawModel);
+        float4 world = mul(float4(skinnedPos, 1), drawModel);
         float4 viewPosition = mul(world, view);
-        verts[id.x].position = mul(viewPosition, projection);
+        // Keep the clip position in a local: reading back out of the vertex
+        // output array (verts[id.x].position) makes the DXIL validator reject
+        // MSMain outright ("parameter is not permitted, it should be inlined").
+        float4 clipPosition = mul(viewPosition, projection);
+        verts[id.x].position = clipPosition;
         verts[id.x].fragPos = world.xyz;
         verts[id.x].normal = normalize(mul(v.normal, (float3x3)drawModel));
         verts[id.x].texCoord = v.uv;
         verts[id.x].tangent = float4(normalize(mul(v.tangent.xyz, (float3x3)drawModel)), v.tangent.w);
         verts[id.x].fragPosLightSpace = mul(world, lightSpaceMatrix);
+        verts[id.x].currentClip = clipPosition;
+        float4 prevWorld = mul(float4(prevLocal, 1), previousModel);
+        verts[id.x].previousClip = mul(prevWorld, previousViewProjection);
     }
 
     if (id.x < meshlet.triangleCount) {
