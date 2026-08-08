@@ -143,8 +143,16 @@ struct PS_INPUT {
     float2 texCoord : TEXCOORD2;
     float4 tangent : TEXCOORD3;
     float4 fragPosLightSpace : TEXCOORD4;
+#ifdef SGE_EXTENSION_MOTION
+    // Only the extension-motion variant reads these. Declaring them
+    // unconditionally breaks every other consumer of this pixel shader: this
+    // file is also compiled as terrain_ps/terrain_ps_hdr, and terrain_ms.hlsl
+    // emits no clip positions, so the PS input signature stops matching the
+    // mesh shader output and PSO creation fails -- terrain then silently never
+    // draws because TerrainRendererDX12 leaves `supported` false.
     float4 currentClip : TEXCOORD5;
     float4 previousClip : TEXCOORD6;
+#endif
 };
 
 // Smooth 3D value noise from integer avalanche hashing (same mixer as

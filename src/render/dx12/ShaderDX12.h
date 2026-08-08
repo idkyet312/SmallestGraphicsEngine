@@ -1067,7 +1067,7 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
         g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
         g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(g_dx12.frameIndex));
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(19,
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(20,
             shadowCascadeBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
 
@@ -1077,7 +1077,7 @@ public:
     // static one, which would then pose against a stale palette.
     void SetSkinningEnabled(bool enabled) {
         const UINT value = enabled ? 1u : 0u;
-        g_dx12.commandList->SetGraphicsRoot32BitConstants(20, 1, &value, 0);
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(21, 1, &value, 0);
     }
 
     void UseTransparent() {
@@ -1279,7 +1279,7 @@ public:
         cascades.texelWorld = g_shadowCascadeTexelWorld;
         cascades.depthRange = g_shadowCascadeDepthRange;
         shadowCascadeBuffer.CopyData(g_dx12.frameIndex, cascades);
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(19,
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(20,
             shadowCascadeBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
     

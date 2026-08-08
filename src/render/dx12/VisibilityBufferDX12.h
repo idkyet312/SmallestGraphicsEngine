@@ -1039,19 +1039,44 @@ public:
         }
         cmdList->ResourceBarrier(barrierCount, barriers);
 
+        // Clear motion to zero up front. Only the passes that own a motion PSO
+        // (skinned actors, viewmodel) bind the second RTV via
+        // BeginMotionDraws; everything else in this pass -- terrain, water,
+        // SSR, fog, light shafts -- still has single-RT PSOs, and D3D12 drops
+        // a draw whose PSO render-target count disagrees with the bound
+        // targets. Geometry disappearing is the visible symptom. Pixels left
+        // uncovered keep the zero written here, which reads as "no motion".
         if (useMotion) {
-            D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = { GetOutputRTV(), GetMotionRTV() };
-            D3D12_CPU_DESCRIPTOR_HANDLE dsv =
-                g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-            cmdList->OMSetRenderTargets(2, rtvs, FALSE, &dsv);
-        } else {
-            D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetOutputRTV();
-            D3D12_CPU_DESCRIPTOR_HANDLE dsv =
-                g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-            cmdList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+            const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            cmdList->ClearRenderTargetView(GetMotionRTV(), zero, 0, nullptr);
         }
+
+        // Default to colour-only so untouched passes keep working.
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetOutputRTV();
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv =
+            g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        cmdList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         cmdList->RSSetViewports(1, &g_dx12.viewport);
         cmdList->RSSetScissorRects(1, &g_dx12.scissorRect);
+    }
+
+    // Bind colour + motion for draws that use an extension-motion PSO. No-op
+    // when the toggle is off, so callers can bracket unconditionally.
+    void BeginMotionDraws(ID3D12GraphicsCommandList* cmdList) {
+        if (!extensionMotionVectors) return;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = { GetOutputRTV(), GetMotionRTV() };
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv =
+            g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        cmdList->OMSetRenderTargets(2, rtvs, FALSE, &dsv);
+    }
+
+    // Restore colour-only for the single-RT passes that follow.
+    void EndMotionDraws(ID3D12GraphicsCommandList* cmdList) {
+        if (!extensionMotionVectors) return;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetOutputRTV();
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv =
+            g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        cmdList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
     }
 
     void EndForwardExtensions(ID3D12GraphicsCommandList* cmdList) {

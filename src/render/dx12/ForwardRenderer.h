@@ -725,7 +725,8 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
                               const XMMATRIX& view, const XMMATRIX& proj,
                               const XMMATRIX& lightSpace,
                               bool visibilityExtensionsOnly,
-                              D3D12_GPU_VIRTUAL_ADDRESS bonePalette = 0) {
+                              D3D12_GPU_VIRTUAL_ADDRESS bonePalette = 0,
+                              D3D12_GPU_VIRTUAL_ADDRESS previousBonePalette = 0) {
     if (!node) return;
 
     if (node->mesh) {
@@ -811,6 +812,15 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
                         16, bonePalette);
                     g_dx12.commandList->SetGraphicsRootShaderResourceView(
                         17, skinAddress);
+                    // t20 must be bound whenever the VS skins: it reads
+                    // previousBonePalette unconditionally under
+                    // skinningEnabled, and an unbound root SRV reads as
+                    // address 0 -- a GPU page fault at VA 0. Callers without
+                    // pose history fall back to the current palette, which
+                    // yields zero motion rather than a hang.
+                    g_dx12.commandList->SetGraphicsRootShaderResourceView(
+                        19, previousBonePalette ? previousBonePalette
+                                                : bonePalette);
                 }
                 g_dx12.commandList->IASetVertexBuffers(0, 1, &prim.vbv);
                 g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -834,21 +844,22 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node,
                           const XMMATRIX& view, const XMMATRIX& proj,
                           const XMMATRIX& lightSpace,
                           bool visibilityExtensionsOnly = false,
-                          D3D12_GPU_VIRTUAL_ADDRESS bonePalette = 0) {
+                          D3D12_GPU_VIRTUAL_ADDRESS bonePalette = 0,
+                          D3D12_GPU_VIRTUAL_ADDRESS previousBonePalette = 0) {
     if (!node) return;
     if (visibilityExtensionsOnly) {
         const std::vector<SceneNode*>& extensionNodes =
             GetForwardExtensionNodes(node);
         for (SceneNode* extensionNode : extensionNodes)
             DrawSceneNodeMesh(extensionNode, shader, worldTransform, view,
-                proj, lightSpace, true, bonePalette);
+                proj, lightSpace, true, bonePalette, previousBonePalette);
         return;
     }
     DrawSceneNodeMesh(node.get(), shader, worldTransform, view, proj,
-        lightSpace, false, bonePalette);
+        lightSpace, false, bonePalette, previousBonePalette);
     for (const std::shared_ptr<SceneNode>& child : node->children)
         DrawSceneNode(child, shader, worldTransform, view, proj, lightSpace,
-            false, bonePalette);
+            false, bonePalette, previousBonePalette);
 }
 
 // Spear.glb is authored two metres long on +Z, with its point at z=0.7973 and
