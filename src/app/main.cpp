@@ -9437,7 +9437,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         char visibilityDebugMode[8] = {};
         if (GetEnvironmentVariableA("SGE_VISIBILITY_DEBUG", visibilityDebugMode,
                 static_cast<DWORD>(sizeof(visibilityDebugMode))) > 0) {
-            visBuffer.debugViewMode = (std::max)(0, (std::min)(2,
+            visBuffer.debugViewMode = (std::max)(0, (std::min)(3,
                 atoi(visibilityDebugMode)));
         }
         scene.useVisibilityBuffer = false;

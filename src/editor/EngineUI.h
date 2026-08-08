@@ -589,10 +589,13 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ImGui::Text("  Persistent meshes: %u",
                     static_cast<UINT>(vb.meshes.size()));
                 const char* debugViews[] = {
-                    "Lit resolve", "Instance / primitive IDs", "Raw depth"
+                    "Lit resolve", "Instance / primitive IDs", "Raw depth", "Edge mask"
                 };
                 ImGui::Combo("VB Debug View", &vb.debugViewMode,
                     debugViews, IM_ARRAYSIZE(debugViews));
+                if (vb.debugViewMode == 3 && vb.EnhancedVisualsReady())
+                    ImGui::Text("  Edge fraction: %.1f%% of sampled pixels",
+                                vb.EnhancedRayFraction() * 100.0f);
                 ImGui::SliderFloat("VB Exposure", &vb.exposure, 0.25f, 4.0f, "%.2f");
                 ImGui::SliderFloat("VB Eye Adaptation", &vb.exposureAdaptation, 0.005f, 0.25f, "%.3f");
                 ImGui::SliderFloat("VB Bloom", &vb.bloomStrength, 0.0f, 1.0f, "%.2f");

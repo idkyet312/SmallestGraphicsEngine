@@ -967,6 +967,35 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         return;
     }
 
+    if (debugViewMode == 3u) {
+        if (visValue.x == 0u) {
+            outputColor[pixel] = float4(0.0, 0.0, 0.0, 1.0);
+        } else {
+            bool isEdge = false;
+            const int2 offsets[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+            [unroll]
+            for (int i = 0; i < 4; ++i) {
+                int2 tap = clamp(int2(pixel) + offsets[i], int2(0, 0),
+                                 int2(screenWidth - 1, screenHeight - 1));
+                if (visBuffer.Load(int3(tap, 0)).x != visValue.x) {
+                    isEdge = true;
+                    break;
+                }
+            }
+            if (isEdge) {
+                outputColor[pixel] = float4(1.0, 1.0, 1.0, 1.0);
+#if SGE_ENHANCED_VISUALS
+                outputRayMask[pixel] = 1u;
+#endif
+            } else {
+                outputColor[pixel] = float4(0.2, 0.2, 0.2, 1.0);
+            }
+        }
+        outputNormalRoughness[pixel] = float4(0.0, 0.0, 0.0, 1.0);
+        if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
+        return;
+    }
+
     if (debugViewMode == 1u) {
         if (visValue.x == 0u) {
             outputColor[pixel] = float4(0.0, 0.0, 0.0, 1.0);
