@@ -236,7 +236,12 @@ public:
     // Reflection ray classification: trace only where the environment probe is
     // expected to be wrong. Rough and face-on pixels score high confidence and
     // keep the probe; grazing near-mirror pixels score low and get a ray.
-    bool enhancedReflectionClassifyActive = false;
+    //
+    // On by default: this is the cheap-tier-first structure the whole ray
+    // budget rests on, and measurement backs it -- the classified path traced
+    // 8.9% of pixels at 1.76 ms where the unclassified one traced 35.7% at
+    // 6.22 ms on the same scene.
+    bool enhancedReflectionClassifyActive = true;
     // Trace only where confidence in the probe is below this. 0.8 was measured
     // when a ray hit returned dimmed sky rather than real surface colour, and
     // 0.5 was rejected then for handing the probe pixels a mirror should have
