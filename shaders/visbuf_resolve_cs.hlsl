@@ -1184,11 +1184,9 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
         (enhancedReflectionClassify == 0 ||
          reflectionConfidence < enhancedReflectionConfidenceCut);
     if (reflectionEligible) {
-        // Count this pixel in the ray-fraction statistic and the debug view.
-        // Without it the UI reports only shadow rays and reads 0% while
-        // reflections are tracing, which is misleading rather than merely
-        // incomplete.
-        outputRayMask[pixel] = 1u;
+        // Bit 1 = reflection ray, kept distinct from the shadow bit so the two
+        // fractions can be reported separately.
+        outputRayMask[pixel] |= 2u;
         bool reflectionHit = false;
         float3 traced = RayTracedReflection(surface.fragPos, surface.normal, V,
                                             surface.rough, pixel, reflectionHit);
@@ -1297,7 +1295,12 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
                 enhancedConfidenceThreshold,
                 enhancedConfidenceThreshold * 0.6, cascadeConfidence);
             shadowVisibility = lerp(shadowVisibility, combined, blend);
-            outputRayMask[pixel] = 1u;  // cleared to 0 at entry
+            // Bit 0 = shadow ray. Reflection rays set bit 1 separately, so the
+            // statistic can report them apart: a single flag made the two ray
+            // types indistinguishable, and with the shadow threshold high
+            // enough to trace most lit pixels the mask saturated and the
+            // reflection fraction became unreadable.
+            outputRayMask[pixel] |= 1u;  // cleared to 0 at entry
         }
     }
 #endif

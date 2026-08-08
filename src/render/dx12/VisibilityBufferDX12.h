@@ -292,6 +292,11 @@ public:
     UINT rayMaskFrameCounter = 0;
     bool rayMaskCopyPending = false;
     float rayMaskFraction = 0.0f;
+    // Split by ray type: bit 0 shadow, bit 1 reflection. The combined figure
+    // saturates once the shadow gate traces most lit pixels, which hides
+    // whether reflection classification is doing anything at all.
+    float rayMaskShadowFraction = 0.0f;
+    float rayMaskReflectionFraction = 0.0f;
     ComPtr<ID3D12RootSignature> postRootSig;
     ComPtr<ID3D12PipelineState> postPSO;
     ComPtr<ID3D12DescriptorHeap> postDescHeap;
@@ -3200,17 +3205,29 @@ private:
             void* mapped = nullptr;
             if (SUCCEEDED(rayMaskReadback->Map(0, &readRange, &mapped)) && mapped) {
                 const auto* bytes = static_cast<const uint8_t*>(mapped);
-                uint32_t traced = 0, total = 0;
+                uint32_t traced = 0, shadowTraced = 0, reflectionTraced = 0;
+                uint32_t total = 0;
                 for (UINT row = 0; row < kRayMaskSampleRows; ++row) {
                     const uint8_t* line = bytes + (size_t)row * rayMaskRowPitch;
                     for (UINT x = 0; x < width; ++x) {
-                        traced += line[x] != 0 ? 1u : 0u;
+                        const uint8_t mask = line[x];
+                        traced += mask != 0 ? 1u : 0u;
+                        // Bit 0 shadow, bit 1 reflection. Reported apart
+                        // because the shadow gate can trace most lit pixels,
+                        // which saturates the combined figure and makes the
+                        // reflection fraction unreadable.
+                        shadowTraced += (mask & 1u) ? 1u : 0u;
+                        reflectionTraced += (mask & 2u) ? 1u : 0u;
                         ++total;
                     }
                 }
                 D3D12_RANGE noWrite = { 0, 0 };
                 rayMaskReadback->Unmap(0, &noWrite);
                 rayMaskFraction = total ? (float)traced / (float)total : 0.0f;
+                rayMaskShadowFraction =
+                    total ? (float)shadowTraced / (float)total : 0.0f;
+                rayMaskReflectionFraction =
+                    total ? (float)reflectionTraced / (float)total : 0.0f;
             }
             rayMaskCopyPending = false;
         }
@@ -3558,6 +3575,10 @@ public:
     // Fraction of sampled pixels routed to RT last time the statistic updated.
     // 0..1; indicative rather than exact (see UpdateRayMaskStatistic).
     float EnhancedRayFraction() const { return rayMaskFraction; }
+    float EnhancedShadowRayFraction() const { return rayMaskShadowFraction; }
+    float EnhancedReflectionRayFraction() const {
+        return rayMaskReflectionFraction;
+    }
 
 private:
 

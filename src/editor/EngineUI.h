@@ -1013,6 +1013,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     // settles rather than tracking instantly.
                     ImGui::Text("  Rays: %.1f%% of sampled pixels",
                                 scene.enhancedRayFraction * 100.0f);
+                    // Split by type: the combined figure saturates once the
+                    // shadow gate traces most lit pixels, which hides whether
+                    // reflection classification is changing anything.
+                    ImGui::TextDisabled("    shadow %.1f%%   reflection %.1f%%",
+                                        vb.EnhancedShadowRayFraction() * 100.0f,
+                                        vb.EnhancedReflectionRayFraction() * 100.0f);
                 }
             }
             ImGui::Separator();
