@@ -286,7 +286,7 @@ public:
     float aperture = 0.0f;
     float currentNearPlane = 0.1f;
     float currentFarPlane = 1000.0f;
-    int debugViewMode = 0; // 0=lit, 1=instance/primitive IDs, 2=depth
+    int debugViewMode = 0; // 0=lit, 1=instance/primitive IDs, 2=depth, 3=edge mask
     bool validationMode = false;
     UINT bloomMipCount = 1;
     UINT bloomWidth = 1;
