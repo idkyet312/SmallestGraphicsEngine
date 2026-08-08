@@ -575,14 +575,36 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
     hit = false;
     if (enhancedRTReflections == 0) return float3(0.0, 0.0, 0.0);
 
-    // Decorrelate pixels, then rotate the sequence per frame so consecutive
-    // frames draw different samples -- the temporal accumulation in 5b is what
-    // turns that into a converged image.
-    uint pixelSeed = MatVarHashUint(pixel.x * 73856093u ^ pixel.y * 19349663u);
-    uint sampleIndex = (pixelSeed + enhancedFrameIndex) & 63u;
+    // Spatiotemporal blue-noise sample placement.
+    //
+    // A per-pixel hash gives WHITE noise: neighbouring pixels draw
+    // uncorrelated samples, so the error spectrum has energy at every spatial
+    // frequency including the low ones. Low-frequency error is precisely what
+    // a spatial filter cannot remove -- it survives as blotches -- and it is
+    // also what the eye is most sensitive to.
+    //
+    // Blue noise instead pushes the error into high spatial frequencies, where
+    // neighbouring pixels disagree in a structured way that averages out over
+    // a small kernel. That is what makes the à-trous pass effective at low
+    // sample counts.
+    //
+    // Implemented as a Cranley-Patterson rotation of the Hammersley sequence
+    // by a spatial blue-noise offset (R2 low-discrepancy lattice over pixel
+    // coordinates) plus a golden-ratio advance per frame. The R2 lattice is
+    // Roberts' generalisation of the golden ratio to 2D: cheap, needs no
+    // texture, and gives a well-distributed pattern across the screen.
+    const float kR2X = 0.7548776662466927;   // 1/phi2
+    const float kR2Y = 0.5698402909980532;   // 1/phi2^2
+    float2 blueNoise = frac(float2(kR2X * (float)pixel.x + kR2Y * (float)pixel.y,
+                                   kR2Y * (float)pixel.x + kR2X * (float)pixel.y));
+    // Golden-ratio increment per frame keeps successive frames maximally
+    // spread rather than repeating on a short cycle.
+    const float kGolden = 0.6180339887498949;
+    float temporalOffset = frac((float)enhancedFrameIndex * kGolden);
+
+    uint sampleIndex = enhancedFrameIndex & 63u;
     float2 xi = Hammersley2D(sampleIndex, 64u);
-    // Cheap per-pixel decorrelation of the first dimension too.
-    xi.x = frac(xi.x + (float)(pixelSeed & 0xffffu) * 1.52587890625e-5);
+    xi = frac(xi + blueNoise + temporalOffset);
 
     float3 h = ImportanceSampleGGX(xi, normal, roughness);
     float3 rayDir = reflect(-viewDir, h);
@@ -639,7 +661,14 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
 float3 SVGF_TemporalAccumulate(float3 currentSample, uint2 pixel,
                                uint2 currentVisID, bool writeHistory,
                                out float3 variance) {
-    variance = 0.0;
+    // Reset paths below (no history, off-screen reprojection, surface-ID
+    // mismatch) all fall through to this value. A pixel with NO history is the
+    // noisiest case there is -- one raw sample, nothing averaged -- so it must
+    // report high variance, which is what tells the à-trous pass to filter it
+    // hard. Reporting zero there says "fully converged, leave alone" and is
+    // exactly backwards: disoccluded pixels would keep their raw single-sample
+    // noise forever.
+    variance = currentSample * currentSample;
     if (svgfTemporalEnabled == 0) return currentSample;
 
     if (svgfHistoryValid == 0) {
@@ -692,7 +721,22 @@ float3 SVGF_TemporalAccumulate(float3 currentSample, uint2 pixel,
 
     float3 blendedColor = lerp(prevColor.rgb, currentSample, alpha);
     float3 blendedSq = lerp(prevMoments.rgb, currentSample * currentSample, alpha);
-    variance = max(blendedSq - blendedColor * blendedColor, 0.0);
+
+    // Variance of the RAW per-frame samples, not of the converged mean.
+    //
+    // blendedSq - blendedColor^2 measures how much the *running average*
+    // still moves, and after N frames of a 1/N EMA that is tiny by
+    // construction -- it shrinks as the estimate converges even when each
+    // individual sample is still extremely noisy. Feeding that to the à-trous
+    // luminance term collapses its tolerance to near zero, every neighbouring
+    // tap is rejected, and the spatial filter silently becomes a no-op that
+    // still costs its dispatches.
+    //
+    // What the filter needs is the spread of the samples themselves. Compare
+    // this frame's sample against the running mean: that stays large while the
+    // signal is genuinely noisy and only falls when the samples agree.
+    float3 sampleDelta = currentSample - blendedColor;
+    variance = sampleDelta * sampleDelta;
 
     if (writeHistory) {
         svgfHistoryColorWrite[pixel] = float4(blendedColor, 0.0);

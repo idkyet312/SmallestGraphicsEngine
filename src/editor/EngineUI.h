@@ -590,7 +590,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     static_cast<UINT>(vb.meshes.size()));
                 const char* debugViews[] = {
                     "Lit resolve", "Instance / primitive IDs", "Raw depth",
-                    "Edge mask", "RT reflection rays", "SVGF denoiser"
+                    "Edge mask", "RT reflection rays", "SVGF denoiser",
+                    "SVGF a-trous output"
                 };
                 ImGui::Combo("VB Debug View", &vb.debugViewMode,
                     debugViews, IM_ARRAYSIZE(debugViews));
