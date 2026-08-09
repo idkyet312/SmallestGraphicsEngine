@@ -115,7 +115,11 @@ struct alignas(256) VBFrameConstants {
     UINT     debugViewMode;
     UINT     enableMotionVectors;
     UINT     edgeAAEnabled;
-    UINT     padding[2];
+    float    contactShadowStrength;
+    float    contactShadowMaxDistance;
+    UINT     contactShadowLinearDepth;
+    UINT     contactShadowNoiseFrame;
+    UINT     contactPadding[2];
     XMFLOAT4 palmWind;
     XMFLOAT4 palmPrimary;
     XMFLOAT4 palmSecondary;
@@ -1218,6 +1222,9 @@ public:
                  const XMMATRIX& previousViewProj,
                  const XMFLOAT3& cameraPos,
                  float nearPlane, float farPlane,
+                 float contactShadowStrength,
+                 float contactShadowMaxDistance,
+                 bool contactShadowLinearDepth,
                  const LightBufferDX12& lightData,
                  const PointLightsBufferDX12& pointLightData) {
         currentNearPlane = nearPlane;
@@ -1249,7 +1256,7 @@ public:
         }
 
         // Upload frame constants
-        VBFrameConstants fc;
+        VBFrameConstants fc = {};
         fc.viewMatrix = XMMatrixTranspose(view);
         fc.projMatrix = XMMatrixTranspose(proj);
         XMMATRIX invVP = XMMatrixInverse(nullptr, view * proj);
@@ -1270,6 +1277,11 @@ public:
             motionVectorsRequired && enhancedVisualsActive &&
             enhancedRTReflectionsActive && svgfTemporalEnabled;
         fc.edgeAAEnabled = edgeAAEnabled ? 1u : 0u;
+        fc.contactShadowStrength = contactShadowStrength;
+        fc.contactShadowMaxDistance = contactShadowMaxDistance;
+        fc.contactShadowLinearDepth = contactShadowLinearDepth ? 1u : 0u;
+        fc.contactShadowNoiseFrame = temporalEffectsEnabled
+            ? postFrameIndex : 0u;
         fc.palmWind = palmWindFrame.wind;
         fc.palmPrimary = palmWindFrame.primary;
         fc.palmSecondary = palmWindFrame.secondary;

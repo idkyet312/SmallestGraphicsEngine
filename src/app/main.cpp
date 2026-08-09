@@ -3153,9 +3153,16 @@ void MatchFoliageMaterialToGrass() {
     const XMFLOAT3 grassAlbedo = g_grass.Albedo();
     const XMFLOAT4 matchedAlbedo(
         grassAlbedo.x, grassAlbedo.y, grassAlbedo.z, 1.0f);
-    const auto matchMaterial = [&](const std::shared_ptr<SceneMaterial>& material) {
+    const auto matchMaterial = [&](const std::shared_ptr<SceneMaterial>& material,
+                                   bool preserveAuthoredLeafColor) {
         if (!material) return;
-        material->baseColorFactor = matchedAlbedo;
+        // Palm textures already contain shadowed leaflet colour. Multiplying
+        // them by the near-black procedural-grass albedo turns the cards into
+        // silhouettes and undoes PalmModel's foliage grade. Dandelions remain
+        // grass-matched; palms keep a bright chlorophyll tint for transmission.
+        material->baseColorFactor = preserveAuthoredLeafColor
+            ? XMFLOAT4(0.68f, 0.82f, 0.62f, 1.0f)
+            : matchedAlbedo;
         material->roughnessFactor = g_grass.Roughness();
         material->ambientScale = g_grass.AmbientScale();
         // Alpha foliage has no ORM or normal map, so these packed material
@@ -3166,7 +3173,7 @@ void MatchFoliageMaterialToGrass() {
     };
     for (const auto& material : PalmModel::Materials()) {
         if (material && material->name == "palm_leaf")
-            matchMaterial(material);
+            matchMaterial(material, true);
     }
     if (!g_dandelionModel) return;
     const auto updateMaterial = [&](const auto& self,
@@ -3174,7 +3181,7 @@ void MatchFoliageMaterialToGrass() {
         if (!node) return;
         if (node->mesh) {
             for (MeshPrimitive& primitive : node->mesh->primitives) {
-                matchMaterial(primitive.material);
+                matchMaterial(primitive.material, false);
             }
         }
         for (const auto& child : node->children)
@@ -12223,7 +12230,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 commonHDRValidationTarget,
                 usingVisibility ? visBuffer.GetVisibilityDepthResource() : nullptr,
                 usingVisibility ? visBuffer.GetNormalRoughnessResource() : nullptr,
-                aoDepthAlreadyReadable);
+                aoDepthAlreadyReadable,
+                scene.grassInScreenSpaceAO && grassMSAAActive
+                    ? grassMSAA.GetCoverageResource() : nullptr,
+                usingVisibility,
+                usingVisibility && visBuffer.temporalEffectsEnabled
+                    ? visBuffer.postFrameIndex : 0u);
         }
 
         if (renderedScene && commonHDRValidationTarget &&

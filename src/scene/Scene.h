@@ -224,7 +224,7 @@ struct Scene {
 
     // Material defaults
     float ambientStrength   = 0.07f;
-    float ambientLightingIntensity = 0.356f;
+    float ambientLightingIntensity = 0.42f;
     float specularStrength  = 0.5f;
     int   specularShininess = 32;
     float shadowBias        = 0.005f;
@@ -365,8 +365,8 @@ struct Scene {
     float lightShaftWeight = 0.85f;    // overall contribution of the tap sum
     float lightShaftExposure = 0.32f;  // final scale before it is added
     float lightShaftIntensity = 1.0f;  // user-facing master strength
-    float volumetricFogDensity = 0.0128f;
-    float volumetricFogAnisotropy = 0.90f;
+    float volumetricFogDensity = 0.009f;
+    float volumetricFogAnisotropy = 0.82f;
     float volumetricFogHeightFalloff = 0.045f; // fog thins above the undergrowth, not over treetops
     float volumetricFogBaseHeight = 0.4f;      // haze pools low in the valley floor
     float volumetricFogDistance = 240.0f;      // pull back so far trees don't wash out
@@ -375,9 +375,9 @@ struct Scene {
     };
     bool  enableAmbientOcclusion = true;
     float ambientOcclusionRadius = 0.69f;
-    float ambientOcclusionStrength = 2.50f;
+    float ambientOcclusionStrength = 1.50f;
     float ambientOcclusionBias = 0.035f;
-    float contactShadowStrength = 0.88f;
+    float contactShadowStrength = 0.65f;
     // Test the contact-shadow occluder slab in linear depth instead of device
     // depth.
     //

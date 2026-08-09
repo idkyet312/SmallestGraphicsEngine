@@ -7,6 +7,7 @@ cbuffer AOConstants : register(b0)
     float4 aoParams;      // radius, strength, bias, far
     float4 screenParams;  // width, height, inv width, inv height
     float4 filterParams;  // static depth, surface buffer
+    float4 contactParams; // grass coverage, direct-lit contact, noise frame
 };
 
 Texture2D<float> sceneDepth : register(t0);
@@ -14,6 +15,7 @@ Texture2DMS<float, 4> sceneDepthMS : register(t1);
 Texture2D<float> staticCasterDepth : register(t2);
 Texture2D<float4> surfaceData : register(t3);
 Texture2D<float> rawAO : register(t4);
+Texture2D<float> grassCoverage : register(t5);
 SamplerState pointClamp : register(s0);
 SamplerState linearClamp : register(s1);
 
@@ -240,7 +242,13 @@ float ContactVisibility(float2 uv, float deviceDepth, bool multisampled,
     }
     [unroll]
     for (uint step = 1; step <= 10; ++step) {
-        float t = maxDistance * (step / 10.0);
+        // Animate only when temporal accumulation is active (the CPU leaves
+        // the frame value at zero otherwise). The stable per-pixel component
+        // breaks coherent marching bands; the frame component lets TAA
+        // converge those samples instead of preserving a fixed stipple.
+        float rayJitter = InterleavedNoise(
+            uv * screenParams.xy + contactParams.z * float2(19.0, 47.0));
+        float t = maxDistance * ((step - 0.45 + rayJitter * 0.9) / 10.0);
         float4 projected =
             mul(float4(world + rayDirection * t, 1.0), viewProjection);
         if (projected.w <= 0.0) continue;
@@ -356,7 +364,39 @@ float4 Composite(float2 uv, bool multisampled)
     float3 normal = ReconstructNormal(uv, depth, multisampled);
     float visibility = BilateralAO(
         uv, LinearDepth(depth), normal, multisampled);
-    visibility *= ContactVisibility(uv, depth, multisampled, normal);
+    float coverage = contactParams.x > 0.5
+        ? grassCoverage.SampleLevel(pointClamp, uv, 0.0) : 0.0;
+    float forwardSurface = 0.0;
+    float grassSurface = 0.0;
+    if (filterParams.x > 0.5) {
+        float staticDepth =
+            staticCasterDepth.SampleLevel(pointClamp, uv, 0.0);
+        float tolerance = max(0.025, LinearDepth(depth) * 0.003);
+        float depthChanged = step(
+            tolerance, abs(LinearDepth(depth) - LinearDepth(staticDepth)));
+        grassSurface = depthChanged * step(0.001, coverage);
+        forwardSurface = depthChanged * (1.0 - step(0.001, coverage));
+    }
+    // A nearest covered MSAA sample represents only its occupied fraction.
+    // Weight the grass AO contribution instead of darkening the background as
+    // though a single thin blade covered the entire pixel.
+    visibility = lerp(visibility,
+        lerp(1.0, visibility, coverage), grassSurface);
+
+    float contactWeight = 1.0;
+    if (contactParams.y > 0.5) {
+        // Visibility-buffer surfaces received contact visibility inside their
+        // direct-sun term. Retain this post fallback only for later forward
+        // extensions and for the covered fraction of independently resolved
+        // grass, avoiding a second darkening of opaque/foliage lighting.
+        contactWeight = saturate(forwardSurface + grassSurface * coverage);
+    }
+    // Avoid paying for a second ten-step ray on visibility-resolved pixels;
+    // contactWeight is zero there because direct lighting already owns it.
+    if (contactWeight > 0.001) {
+        float contact = ContactVisibility(uv, depth, multisampled, normal);
+        visibility *= lerp(1.0, contact, contactWeight);
+    }
     return float4(visibility.xxx, 1.0);
 }
 

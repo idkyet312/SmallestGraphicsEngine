@@ -83,13 +83,8 @@ struct PS_INPUT {
 
 // One comparison tap: the linear-filtered comparison sampler gives hardware
 // 2x2 PCF, which is plenty of softness for a 1-2 cm wide blade.
-float CalculateShadowCheap(float3 worldPos, float3 normal, float3 lightDir) {
-    if (enableShadows == 0) return 1.0;
-
-    float viewDepth = mul(float4(worldPos, 1.0), view).z;
-    uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
-                   (viewDepth < shadowCascadeSplits.y ? 1u : 2u);
-
+float SampleShadowCascadeCheap(float3 worldPos, float3 normal,
+                               float3 lightDir, uint cascade) {
     // Same normal-offset + per-cascade bias as clustered_dx12_ps.hlsl so the
     // field's shadow response matches the turf underneath.
     float ndotl = saturate(dot(normal, lightDir));
@@ -112,6 +107,28 @@ float CalculateShadowCheap(float3 worldPos, float3 normal, float3 lightDir) {
                  max(shadowCascadeDepthRange[cascade], 1e-3);
     return shadowMap.SampleCmpLevelZero(
         shadowSampler, float3(shadowUV, cascade), projCoords.z - bias);
+}
+
+float CalculateShadowCheap(float3 worldPos, float3 normal, float3 lightDir) {
+    if (enableShadows == 0) return 1.0;
+
+    float viewDepth = mul(float4(worldPos, 1.0), view).z;
+    uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
+                   (viewDepth < shadowCascadeSplits.y ? 1u : 2u);
+    float visibility = SampleShadowCascadeCheap(
+        worldPos, normal, lightDir, cascade);
+    if (cascade < 2u) {
+        float nearSplit = cascade == 0u ? 0.0 :
+            (cascade == 1u ? shadowCascadeSplits.x : shadowCascadeSplits.y);
+        float farSplit = cascade == 0u ? shadowCascadeSplits.x :
+            shadowCascadeSplits.y;
+        float blend = smoothstep(
+            lerp(nearSplit, farSplit, 0.90), farSplit, viewDepth);
+        if (blend > 0.0)
+            visibility = lerp(visibility, SampleShadowCascadeCheap(
+                worldPos, normal, lightDir, cascade + 1u), blend);
+    }
+    return visibility;
 }
 
 // Identical to clustered_dx12_ps.hlsl so the field's ambient matches the turf.

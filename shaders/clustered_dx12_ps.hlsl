@@ -192,13 +192,8 @@ float MatVarNoise(float3 position) {
     return lerp(lerp(n00, n10, blend.y), lerp(n01, n11, blend.y), blend.z);
 }
 
-float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
-    if (enableShadows == 0) return 1.0;
-
-    float viewDepth = mul(float4(worldPos, 1.0), view).z;
-    uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
-                   (viewDepth < shadowCascadeSplits.y ? 1u : 2u);
-
+float SampleShadowCascade(float3 worldPos, float3 normal, float3 lightDir,
+                          uint cascade) {
     // Normal-offset + per-cascade slope-scaled bias. A single [0,1]-depth bias
     // constant cannot fit all three cascades (different world extents), which
     // left grazing-angle acne bands across distant terrain at low sun.
@@ -231,11 +226,34 @@ float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
         for (int x = -1; x <= 1; x++) {
             visibility += shadowMap.SampleCmpLevelZero(
                 shadowSampler,
-                float3(shadowUV + float2(x, y) * texelSize, cascade), depth);
+                float3(shadowUV + float2(x, y) * texelSize * 1.25, cascade),
+                depth);
         }
     }
 
     return visibility / 9.0;
+}
+
+float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
+    if (enableShadows == 0) return 1.0;
+
+    float viewDepth = mul(float4(worldPos, 1.0), view).z;
+    uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
+                   (viewDepth < shadowCascadeSplits.y ? 1u : 2u);
+    float visibility = SampleShadowCascade(
+        worldPos, normal, lightDir, cascade);
+    if (cascade < 2u) {
+        float nearSplit = cascade == 0u ? 0.0 :
+            (cascade == 1u ? shadowCascadeSplits.x : shadowCascadeSplits.y);
+        float farSplit = cascade == 0u ? shadowCascadeSplits.x :
+            shadowCascadeSplits.y;
+        float blend = smoothstep(
+            lerp(nearSplit, farSplit, 0.90), farSplit, viewDepth);
+        if (blend > 0.0)
+            visibility = lerp(visibility, SampleShadowCascade(
+                worldPos, normal, lightDir, cascade + 1u), blend);
+    }
+    return visibility;
 }
 
 // Octahedral encoding helper (direction to UV)

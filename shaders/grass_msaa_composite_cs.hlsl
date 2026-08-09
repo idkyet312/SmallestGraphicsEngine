@@ -4,6 +4,7 @@ Texture2D<float> sceneDepth : register(t2);
 RWTexture2D<float4> sceneColor : register(u0);
 RWTexture2D<float2> sceneMotion : register(u1);
 RWTexture2D<float> combinedDepth : register(u2);
+RWTexture2D<float> grassCoverage : register(u3);
 
 cbuffer CompositeConstants : register(b0) {
     uint2 outputSize;
@@ -35,6 +36,10 @@ void main(uint3 threadId : SV_DispatchThreadID) {
     // Fog runs after this pass. Preserve the nearest visible grass sample so
     // fog integrates only to the blade, not to terrain hidden behind it.
     combinedDepth[pixel] = nearestDepth;
+    // Keep the actual MSAA sample occupancy. Screen-space effects can then
+    // weight a one-sample blade by 25% instead of treating its nearest depth as
+    // though the blade filled the whole pixel.
+    grassCoverage[pixel] = coverage;
 
     if (coverage > 0.0) {
         const float3 background = sceneColor[pixel].rgb;

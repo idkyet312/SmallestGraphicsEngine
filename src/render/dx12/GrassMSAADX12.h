@@ -23,6 +23,7 @@ public:
         colorTarget_.Reset();
         depthTarget_.Reset();
         combinedDepth_.Reset();
+        coverageTarget_.Reset();
         width_ = width;
         height_ = height;
         readable_ = true;
@@ -63,7 +64,7 @@ public:
                    ID3D12Resource* sceneDepth) {
         if (!initialized || !sceneColor || !sceneMotion || !sceneDepth) return;
 
-        D3D12_RESOURCE_BARRIER barriers[5] = {};
+        D3D12_RESOURCE_BARRIER barriers[6] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = colorTarget_.Get();
         barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -82,7 +83,9 @@ public:
         barriers[4].Transition.pResource = combinedDepth_.Get();
         barriers[4].Transition.StateBefore =
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        commandList->ResourceBarrier(5, barriers);
+        barriers[5] = barriers[4];
+        barriers[5].Transition.pResource = coverageTarget_.Get();
+        commandList->ResourceBarrier(6, barriers);
         readable_ = true;
 
         UpdateDescriptors(sceneColor, sceneMotion, sceneDepth);
@@ -96,25 +99,32 @@ public:
         commandList->SetComputeRoot32BitConstants(1, 2, size, 0);
         commandList->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
 
-        D3D12_RESOURCE_BARRIER uav[3] = {};
-        for (UINT i = 0; i < 3; ++i) {
+        D3D12_RESOURCE_BARRIER uav[4] = {};
+        for (UINT i = 0; i < 4; ++i) {
             uav[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
             uav[i].UAV.pResource =
                 i == 0 ? sceneColor :
-                (i == 1 ? sceneMotion : combinedDepth_.Get());
+                (i == 1 ? sceneMotion :
+                 (i == 2 ? combinedDepth_.Get() : coverageTarget_.Get()));
         }
-        commandList->ResourceBarrier(3, uav);
+        commandList->ResourceBarrier(4, uav);
         std::swap(barriers[2].Transition.StateBefore,
                   barriers[2].Transition.StateAfter);
         std::swap(barriers[3].Transition.StateBefore,
                   barriers[3].Transition.StateAfter);
         std::swap(barriers[4].Transition.StateBefore,
                   barriers[4].Transition.StateAfter);
-        commandList->ResourceBarrier(3, &barriers[2]);
+        std::swap(barriers[5].Transition.StateBefore,
+                  barriers[5].Transition.StateAfter);
+        commandList->ResourceBarrier(4, &barriers[2]);
     }
 
     ID3D12Resource* GetCombinedDepthResource() const {
         return combinedDepth_.Get();
+    }
+
+    ID3D12Resource* GetCoverageResource() const {
+        return coverageTarget_.Get();
     }
 
 private:
@@ -130,7 +140,7 @@ private:
                 &dsv, IID_PPV_ARGS(&dsvHeap_)))) return false;
         D3D12_DESCRIPTOR_HEAP_DESC descriptors = {};
         descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        descriptors.NumDescriptors = 6;
+        descriptors.NumDescriptors = 7;
         descriptors.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         return SUCCEEDED(g_dx12.device->CreateDescriptorHeap(
             &descriptors, IID_PPV_ARGS(&descriptorHeap_)));
@@ -194,6 +204,11 @@ private:
                 &heap, D3D12_HEAP_FLAG_NONE, &desc,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
                 IID_PPV_ARGS(&combinedDepth_)))) return false;
+        desc.Format = DXGI_FORMAT_R8_UNORM;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&coverageTarget_)))) return false;
         readable_ = true;
         return true;
     }
@@ -221,7 +236,7 @@ private:
         ranges[0].BaseShaderRegister = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ranges[1].NumDescriptors = 3;
+        ranges[1].NumDescriptors = 4;
         ranges[1].BaseShaderRegister = 0;
         ranges[1].OffsetInDescriptorsFromTableStart = 3;
         D3D12_ROOT_PARAMETER params[2] = {};
@@ -280,6 +295,10 @@ private:
         uav.Format = DXGI_FORMAT_R32_FLOAT;
         g_dx12.device->CreateUnorderedAccessView(
             combinedDepth_.Get(), nullptr, &uav, handle);
+        handle.ptr += stride;
+        uav.Format = DXGI_FORMAT_R8_UNORM;
+        g_dx12.device->CreateUnorderedAccessView(
+            coverageTarget_.Get(), nullptr, &uav, handle);
     }
 
     UINT width_ = 0;
@@ -288,6 +307,7 @@ private:
     ComPtr<ID3D12Resource> colorTarget_;
     ComPtr<ID3D12Resource> depthTarget_;
     ComPtr<ID3D12Resource> combinedDepth_;
+    ComPtr<ID3D12Resource> coverageTarget_;
     ComPtr<ID3D12DescriptorHeap> rtvHeap_;
     ComPtr<ID3D12DescriptorHeap> dsvHeap_;
     ComPtr<ID3D12DescriptorHeap> descriptorHeap_;

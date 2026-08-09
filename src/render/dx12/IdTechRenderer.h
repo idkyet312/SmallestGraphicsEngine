@@ -996,6 +996,8 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         vb.Resolve(g_dx12.commandList.Get(), view, proj, lightSpace,
             previousViewProjection,
             scene.camera.Position, scene.cameraNear, scene.cameraFar,
+            scene.contactShadowStrength, scene.ambientOcclusionRadius,
+            scene.contactShadowLinearDepth,
             dummyLB, dummyPL);
     }
 

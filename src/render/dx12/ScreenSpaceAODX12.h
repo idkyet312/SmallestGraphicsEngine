@@ -46,11 +46,15 @@ public:
                  bool hdrTarget = false,
                  ID3D12Resource* staticCasterDepth = nullptr,
                  ID3D12Resource* normalRoughness = nullptr,
-                 bool depthAlreadyReadable = false) {
+                 bool depthAlreadyReadable = false,
+                 ID3D12Resource* grassCoverage = nullptr,
+                 bool contactAppliedInDirectLighting = false,
+                 UINT temporalNoiseFrame = 0) {
         if (!initialized || !depthResource || !g_dx12.commandList) return;
         if (!EnsureRawTarget()) return;
         Update(scene, depthResource, multisampledDepth, staticCasterDepth,
-               normalRoughness);
+               normalRoughness, grassCoverage,
+               contactAppliedInDirectLighting, temporalNoiseFrame);
 
         ID3D12GraphicsCommandList* list = g_dx12.commandList.Get();
         // GrassMSAADX12's combined depth is produced by compute and handed off
@@ -124,6 +128,7 @@ private:
         XMFLOAT4 aoParams;
         XMFLOAT4 screenParams;
         XMFLOAT4 filterParams;
+        XMFLOAT4 contactParams;
     };
 
     bool Compile(const std::string& source, const char* entry, const char* target,
@@ -141,7 +146,7 @@ private:
     bool CreateRootSignature() {
         D3D12_DESCRIPTOR_RANGE range = {};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = 5;
+        range.NumDescriptors = 6;
         range.BaseShaderRegister = 0;
         D3D12_ROOT_PARAMETER roots[2] = {};
         roots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -232,7 +237,7 @@ private:
     bool CreateResources() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 5;
+        heapDesc.NumDescriptors = 6;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_dx12.device->CreateDescriptorHeap(
                 &heapDesc, IID_PPV_ARGS(&descriptorHeap_)))) return false;
@@ -307,7 +312,10 @@ private:
 
     void Update(const Scene& scene, ID3D12Resource* depth, bool multisampled,
                 ID3D12Resource* staticCasterDepth,
-                ID3D12Resource* normalRoughness) {
+                ID3D12Resource* normalRoughness,
+                ID3D12Resource* grassCoverage,
+                bool contactAppliedInDirectLighting,
+                UINT temporalNoiseFrame) {
         Constants constants = {};
         XMMATRIX vp = scene.GetViewMatrix() * scene.GetProjectionMatrix();
         XMStoreFloat4x4(&constants.inverseViewProjection,
@@ -335,6 +343,10 @@ private:
             staticCasterDepth && staticCasterDepth != depth ? 1.0f : 0.0f,
             normalRoughness ? 1.0f : 0.0f,
             scene.contactShadowLinearDepth ? 1.0f : 0.0f, 0.0f };
+        constants.contactParams = {
+            grassCoverage ? 1.0f : 0.0f,
+            contactAppliedInDirectLighting ? 1.0f : 0.0f,
+            static_cast<float>(temporalNoiseFrame), 0.0f };
         std::memcpy(mappedConstants_ + g_dx12.frameIndex * 256u,
                     &constants, sizeof(constants));
 
@@ -366,6 +378,9 @@ private:
         handle.ptr += descriptorSize_;
         srv.Format = DXGI_FORMAT_R8_UNORM;
         g_dx12.device->CreateShaderResourceView(rawAO_.Get(), &srv, handle);
+        handle.ptr += descriptorSize_;
+        g_dx12.device->CreateShaderResourceView(
+            grassCoverage, &srv, handle);
     }
 
     static void Transition(ID3D12GraphicsCommandList* list,

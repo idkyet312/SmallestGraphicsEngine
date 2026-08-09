@@ -20,7 +20,11 @@ cbuffer FrameConstants : register(b0) {
     uint   debugViewMode;
     uint   enableMotionVectors;
     uint   edgeAAEnabled;
-    uint2  framePadding;
+    float  contactShadowStrength;
+    float  contactShadowMaxDistance;
+    uint   contactShadowLinearDepth;
+    uint   contactShadowNoiseFrame;
+    uint2  contactPadding;
     float4 palmWind;
     float4 palmPrimary;
     float4 palmSecondary;
@@ -1302,12 +1306,8 @@ float3 SVGF_TemporalAccumulate(float3 currentSample, uint2 pixel,
 }
 #endif
 
-float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
-    if (enableShadows == 0) return 1.0;
-
-    float viewDepth = mul(float4(worldPos, 1.0), viewMatrix).z;
-    uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
-                   (viewDepth < shadowCascadeSplits.y ? 1u : 2u);
+float SampleShadowCascade(float3 worldPos, float3 normal, float3 lightDir,
+                          uint cascade) {
     float4 lightClip = mul(float4(worldPos, 1.0),
                            shadowCascadeMatrices[cascade]);
     if (lightClip.w <= 0.0) return 1.0;
@@ -1327,11 +1327,123 @@ float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
         [unroll]
         for (int x = -1; x <= 1; ++x) {
             visibility += shadowMapTex.SampleCmpLevelZero(
-                shadowSampler, float3(uv + float2(x, y) * texel, cascade),
+                shadowSampler,
+                float3(uv + float2(x, y) * texel * 1.25, cascade),
                 projected.z - slopeBias);
         }
     }
     return visibility / 9.0;
+}
+
+float CalculateShadow(float3 worldPos, float3 normal, float3 lightDir) {
+    if (enableShadows == 0) return 1.0;
+
+    float viewDepth = mul(float4(worldPos, 1.0), viewMatrix).z;
+    uint cascade = viewDepth < shadowCascadeSplits.x ? 0u :
+                   (viewDepth < shadowCascadeSplits.y ? 1u : 2u);
+    float visibility = SampleShadowCascade(
+        worldPos, normal, lightDir, cascade);
+    if (cascade < 2u) {
+        float nearSplit = cascade == 0u ? nearPlane :
+            (cascade == 1u ? shadowCascadeSplits.x : shadowCascadeSplits.y);
+        float farSplit = cascade == 0u ? shadowCascadeSplits.x :
+            shadowCascadeSplits.y;
+        float blend = smoothstep(
+            lerp(nearSplit, farSplit, 0.90), farSplit, viewDepth);
+        if (blend > 0.0)
+            visibility = lerp(visibility, SampleShadowCascade(
+                worldPos, normal, lightDir, cascade + 1u), blend);
+    }
+    return visibility;
+}
+
+float ContactLinearDepth(float deviceDepth) {
+    return nearPlane * farPlane /
+        max(farPlane - deviceDepth * (farPlane - nearPlane), 1e-5);
+}
+
+float ContactNoise(uint2 pixel) {
+    uint seed = pixel.x * 73856093u ^ pixel.y * 19349663u ^
+                contactShadowNoiseFrame * 83492791u;
+    return (MatVarHashUint(seed) & 0x00ffffffu) / 16777216.0;
+}
+
+// Screen-space contact is evaluated while the direct-sun term is still
+// separate. Sky irradiance, DDGI, emissive light, and foliage sky scatter are
+// therefore preserved instead of being multiplied after the frame is lit.
+float CalculateContactVisibility(uint2 pixel, float3 worldPos,
+                                 float3 normal, float3 lightDir) {
+    if (lightType != 0 || contactShadowStrength <= 0.0)
+        return 1.0;
+
+    float maxDistance = clamp(contactShadowMaxDistance, 0.25, 1.0);
+    float originOffset = max(0.015, maxDistance * 0.03);
+    float3 origin = worldPos + normal * originOffset;
+    float3 rayDirection = normalize(lightDir);
+
+    float4 originView = mul(float4(origin, 1.0), viewMatrix);
+    float4 endView = mul(
+        float4(origin + rayDirection * maxDistance, 1.0), viewMatrix);
+    float4 originClip = mul(originView, projMatrix);
+    float4 endClip = mul(endView, projMatrix);
+    if (originClip.w <= 0.0 || endClip.w <= 0.0) return 1.0;
+
+    float2 originNDC = originClip.xy / originClip.w;
+    float2 endNDC = endClip.xy / endClip.w;
+    float projectedPixels = length(
+        (endNDC - originNDC) * float2(screenWidth, screenHeight) * 0.5);
+    maxDistance *= min(1.0, 20.0 / max(projectedPixels, 1e-4));
+    maxDistance = max(maxDistance, originOffset * 4.0);
+
+    float rayDepthStride = abs(endView.z - originView.z) / 10.0;
+    float receiverDepth = mul(float4(worldPos, 1.0), viewMatrix).z;
+    float previousGap = originView.z - receiverDepth;
+    float previousT = 0.0;
+    float jitter = ContactNoise(pixel);
+
+    [unroll]
+    for (uint step = 1; step <= 10; ++step) {
+        float t = maxDistance * ((step - 0.45 + jitter * 0.9) / 10.0);
+        float4 rayView = mul(
+            float4(origin + rayDirection * t, 1.0), viewMatrix);
+        float4 rayClip = mul(rayView, projMatrix);
+        if (rayClip.w <= 0.0) continue;
+        float3 ndc = rayClip.xyz / rayClip.w;
+        float2 uv = ndc.xy * float2(0.5, -0.5) + 0.5;
+        if (any(uv <= 0.0) || any(uv >= 1.0)) break;
+        uint2 samplePixel = min(
+            uint2(uv * float2(screenWidth, screenHeight)),
+            uint2((uint)screenWidth - 1u, (uint)screenHeight - 1u));
+        float sampledDepth = depthBuffer.Load(int3(samplePixel, 0));
+
+        bool occluded = false;
+        float shadowT = t;
+        if (contactShadowLinearDepth != 0) {
+            float depthGap = rayView.z - ContactLinearDepth(sampledDepth);
+            float surfaceBias = originOffset * 0.25;
+            float slabThickness = max(originOffset * 2.0,
+                                      rayDepthStride * 1.25);
+            occluded = previousGap <= surfaceBias &&
+                       depthGap > surfaceBias && depthGap < slabThickness;
+            if (occluded) {
+                float crossing = saturate((surfaceBias - previousGap) /
+                    max(depthGap - previousGap, 1e-5));
+                shadowT = lerp(previousT, t, crossing);
+            }
+            previousGap = depthGap;
+            previousT = t;
+        } else {
+            float thickness = 0.00035 + t * 0.000035;
+            occluded = sampledDepth + thickness < ndc.z;
+        }
+        if (occluded) {
+            float fade = saturate(1.0 - shadowT / maxDistance);
+            fade *= fade * smoothstep(
+                0.02, 0.20, saturate(dot(normal, rayDirection)));
+            return 1.0 - contactShadowStrength * fade;
+        }
+    }
+    return 1.0;
 }
 
 void GetTriangleVertices(DrawCallData dc, uint triangleID,
@@ -1957,6 +2069,8 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
     float3 specular = numerator / denominator * foliageSpecularScale;
     
     float shadowVisibility = CalculateShadow(surface.fragPos, surface.normal, L);
+    shadowVisibility *= CalculateContactVisibility(
+        pixel, surface.fragPos, surface.normal, L);
 #if SGE_ENHANCED_VISUALS
     // ---- Cheap tier first, rays only where it is uncertain ----
     //

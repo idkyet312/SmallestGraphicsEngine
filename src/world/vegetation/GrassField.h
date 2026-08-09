@@ -257,7 +257,7 @@ public:
         m_ambientScale = 1.239f;
         m_directLightScale = 2.0f;
         m_transmissionStrength = 0.776f;
-        m_colorVariation = 1.5f;
+        m_colorVariation = 0.85f;
         m_normalFalloff = 1.0f;
     }
     // Authored curved cards overlap into large repeated silhouettes on nearby
@@ -653,7 +653,7 @@ private:
     float m_directLightScale = 2.0f;
     float m_transmissionStrength = 0.776f;
     float m_normalFalloff = 1.0f;
-    float m_colorVariation = 1.5f;
+    float m_colorVariation = 0.85f;
     // Side of one draw-cell. Small enough that the cells hug the draw radius
     // without dragging in much grass the shader would only fade away, large enough
     // that the whole field stays a few dozen draws rather than hundreds.
