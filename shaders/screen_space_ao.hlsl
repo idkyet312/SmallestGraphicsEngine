@@ -193,7 +193,8 @@ float ContactVisibility(float2 uv, float deviceDepth, bool multisampled,
     if (deviceDepth >= 0.99999 || lightDirection.w <= 0.0 ||
         IsViewModelDepth(deviceDepth)) return 1.0;
     float3 world = ReconstructWorld(uv, deviceDepth);
-    world += surfaceNormal * max(0.015, aoParams.x * 0.03);
+    const float originOffset = max(0.015, aoParams.x * 0.03);
+    world += surfaceNormal * originOffset;
     float3 rayDirection = normalize(lightDirection.xyz);
     const float maxDistance = max(aoParams.w * 0.004, 1.5);
     const bool linearThickness = filterParams.z > 0.5;
@@ -238,11 +239,20 @@ float ContactVisibility(float2 uv, float deviceDepth, bool multisampled,
             // ray side of the comparison costs no reciprocal.
             float rayLinear = projected.w;
             float occluderLinear = LinearDepth(sampledDepth);
-            // 0.02 m stays just under the normal offset applied above, so the
-            // ray cannot immediately hit the surface it started on, and 0.18 m
-            // at the far end stays under the step size, so the slab never
-            // swallows the receiver.
-            float thickness = 0.02 + t * 0.05;
+            // The slab must stay BELOW the origin offset, or the ray registers
+            // the surface it started on as its own occluder. Whether it does
+            // then depends on local slope and the dither, so the error lands
+            // per-pixel and reads as speckle rather than as a shadow -- which is
+            // exactly what `0.02 + t * 0.05` did: 0.036 m at the first step
+            // against a 0.021 m offset, already over the line before the march
+            // had gone anywhere.
+            //
+            // Scaling from the offset keeps the relationship intact when
+            // aoParams.x moves the offset, instead of pinning a constant that is
+            // only correct at one AO radius. Half the offset at the first step,
+            // growing gently with distance so a real occluder further along the
+            // ray still has depth to be found in.
+            float thickness = originOffset * (0.5 + t * 0.35);
             // The far bound gives an occluder finite thickness. Device space did
             // not need one because its epsilon exploded with distance; in metres
             // an unbounded test lets a surface hundreds of metres nearer than
