@@ -634,6 +634,99 @@ float3 RenderProceduralSky(uint2 pixel) {
 }
 
 #if SGE_ENHANCED_VISUALS
+// Ray flag sets, named because the difference between them is a correctness
+// property and not a tuning knob.
+//
+// SHADOW: a visibility query. Any occluder proves the point is shadowed, so
+// ACCEPT_FIRST_HIT lets traversal stop at the first triangle instead of finding
+// the nearest one. CULL_NON_OPAQUE is right here too -- resolving alpha-tested
+// foliage would need per-candidate alpha evaluation in a Proceed() loop. Foliage
+// therefore casts no RT shadow; the cascade term blended in at the call site
+// still shadows it.
+#define SGE_RAY_FLAGS_SHADOW (RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | \
+                              RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | \
+                              RAY_FLAG_CULL_NON_OPAQUE)
+
+// Both radiance sets below drop ACCEPT_FIRST_HIT, because a reflection or bounce
+// ray asks "what is the NEAREST surface along this direction". Traversal order is
+// spatial, not sorted by distance, so under ACCEPT_FIRST_HIT a ray passing near
+// two surfaces commits whichever the BVH reached first -- intermittently the
+// farther one. That is view-dependent, so it flickers under camera motion, and
+// the temporal accumulator averages the flicker into a smear rather than
+// resolving it.
+//
+// SKIP_CLOSEST_HIT_SHADER is kept in both: these are inline queries shaded by
+// ShadeRayHit through the Committed* accessors, so no hit group ever runs.
+//
+// The two sets differ ONLY on alpha-tested geometry, and that split is a
+// variance decision rather than a correctness one -- it is the per-ray-role
+// principle applied to a ray flag.
+//
+// REFLECTION keeps alpha-tested geometry visible. Reflections are few and
+// high-contrast, so a palm frond missing from a reflection reads as an obviously
+// absent object. These triangles trace as fully opaque, ignoring their cutout,
+// so a frond reflects as its full quad -- wrong, but a far smaller error than
+// the frond not being there at all.
+#define SGE_RAY_FLAGS_REFLECTION (RAY_FLAG_SKIP_CLOSEST_HIT_SHADER)
+
+// GI culls it, and this is the important one in vegetated scenes. A diffuse
+// bounce is low-frequency: once converged, grass detail inside it is invisible,
+// so admitting foliage buys no visible quality. What it does buy is enormous
+// variance -- in a grass field, one pixel's ray hits a blade (dark, near) while
+// its neighbour slips between blades (bright ground or sky, far). At one sample
+// per pixel per frame that is several times the variance SVGF was tuned for, and
+// it surfaced as a clearly grainier image across the whole frame. Culling
+// non-opaque geometry here restores the smooth signal without giving up the
+// nearest-hit fix, which is the half of this that was actually a correctness bug.
+#define SGE_RAY_FLAGS_GI (RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | \
+                          RAY_FLAG_CULL_NON_OPAQUE)
+
+// Committed hit data, copied out of a RayQuery so shading is independent of the
+// query's flag set.
+//
+// RayQuery<F> is a distinct type per F, and the two radiance sets above are
+// different types, so a function taking one cannot be handed the other. The
+// natural fix -- template<uint FLAGS> on the shading function -- turns a
+// clean-compiling shader into a DXC internal compiler error (access violation)
+// on 10.0.26100, with and without -HV 2021. Copying the ten accessor results
+// into a plain struct sidesteps the type coupling entirely, and costs nothing:
+// every field was already being read.
+struct RayHit {
+    uint  contribution;   // CommittedInstanceContributionToHitGroupIndex
+    uint  geometryIndex;  // CommittedGeometryIndex
+    uint  primitiveIndex; // CommittedPrimitiveIndex
+    float2 barycentrics;  // CommittedTriangleBarycentrics
+    float3 rayOrigin;     // WorldRayOrigin
+    float  rayT;          // CommittedRayT
+    float3x4 objectToWorld; // CommittedObjectToWorld3x4
+};
+
+// One per flag set: identical bodies, but each needs the concrete query type.
+// See the RayHit comment for why this is not a template.
+RayHit ReadReflectionHit(RayQuery<SGE_RAY_FLAGS_REFLECTION> query) {
+    RayHit hit;
+    hit.contribution = query.CommittedInstanceContributionToHitGroupIndex();
+    hit.geometryIndex = query.CommittedGeometryIndex();
+    hit.primitiveIndex = query.CommittedPrimitiveIndex();
+    hit.barycentrics = query.CommittedTriangleBarycentrics();
+    hit.rayOrigin = query.WorldRayOrigin();
+    hit.rayT = query.CommittedRayT();
+    hit.objectToWorld = query.CommittedObjectToWorld3x4();
+    return hit;
+}
+
+RayHit ReadGIHit(RayQuery<SGE_RAY_FLAGS_GI> query) {
+    RayHit hit;
+    hit.contribution = query.CommittedInstanceContributionToHitGroupIndex();
+    hit.geometryIndex = query.CommittedGeometryIndex();
+    hit.primitiveIndex = query.CommittedPrimitiveIndex();
+    hit.barycentrics = query.CommittedTriangleBarycentrics();
+    hit.rayOrigin = query.WorldRayOrigin();
+    hit.rayT = query.CommittedRayT();
+    hit.objectToWorld = query.CommittedObjectToWorld3x4();
+    return hit;
+}
+
 // Inline ray-traced sun shadow. Only compiled into the SM6.5 variant of this
 // shader -- FXC cannot compile RayQuery at any profile, so the default build
 // never sees this code.
@@ -657,9 +750,7 @@ float RayTracedShadow(float3 worldPos, float3 normal, float3 lightDir) {
     ray.TMin = 0.0;
     ray.TMax = enhancedShadowRayLength;
 
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
-             RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
-             RAY_FLAG_CULL_NON_OPAQUE> query;
+    RayQuery<SGE_RAY_FLAGS_SHADOW> query;
     query.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff, ray);
     query.Proceed();
 
@@ -728,18 +819,17 @@ static const float kBounceSkyDamping = 0.25;
 // keeps its existing approximation rather than substituting a wrong answer:
 // the geometry may predate the hit-geometry upload, or be terrain, which has no
 // visibility-buffer registration.
-float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
-                            RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
-                            RAY_FLAG_CULL_NON_OPAQUE> query,
-                   float3 rayDir, out bool resolved) {
+// Takes already-read hit data rather than a RayQuery, so the same shading serves
+// both radiance flag sets -- see the RayHit declaration for why that indirection
+// exists. Shadow queries are visibility-only and never reach here.
+float3 ShadeRayHit(RayHit hit, float3 rayDir, out bool resolved) {
     resolved = false;
     if (enhancedHitGeometryCount == 0) return float3(0.0, 0.0, 0.0);
 
     // Same addressing the DispatchRays shader table uses: the instance's
     // contribution selects its mesh's first record, the geometry index offsets
     // within it.
-    uint bindingIndex = query.CommittedInstanceContributionToHitGroupIndex() +
-                        query.CommittedGeometryIndex();
+    uint bindingIndex = hit.contribution + hit.geometryIndex;
     if (bindingIndex >= enhancedHitGeometryCount)
         return float3(0.0, 0.0, 0.0);
 
@@ -767,16 +857,13 @@ float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
             float3 sunDir = normalize(lightPos);
             float sunNdotL = saturate(dot(fallbackNormal, sunDir));
             if (sunNdotL > 0.0) {
-                float3 fallbackPos = query.WorldRayOrigin() +
-                                     rayDir * query.CommittedRayT();
+                float3 fallbackPos = hit.rayOrigin + rayDir * hit.rayT;
                 RayDesc fallbackShadow;
                 fallbackShadow.Origin = fallbackPos + fallbackNormal * 0.02;
                 fallbackShadow.Direction = sunDir;
                 fallbackShadow.TMin = 0.0;
                 fallbackShadow.TMax = enhancedShadowRayLength;
-                RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
-                         RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
-                         RAY_FLAG_CULL_NON_OPAQUE> fallbackQuery;
+                RayQuery<SGE_RAY_FLAGS_SHADOW> fallbackQuery;
                 fallbackQuery.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff,
                                              fallbackShadow);
                 fallbackQuery.Proceed();
@@ -793,7 +880,7 @@ float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
     // in both.
     // Named hitTriangle, not triangle: the latter is an HLSL keyword (geometry
     // shader input modifier) and does not parse as an identifier.
-    uint hitTriangle = query.CommittedPrimitiveIndex();
+    uint hitTriangle = hit.primitiveIndex;
     uint i0, i1, i2;
     if (binding.hasIndices) {
         i0 = indices[binding.indexOffset + hitTriangle * 3 + 0];
@@ -811,7 +898,7 @@ float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
 
     // Barycentrics come straight from the intersection -- no need to
     // reconstruct them from a world position as the primary hit does.
-    float2 bary = query.CommittedTriangleBarycentrics();
+    float2 bary = hit.barycentrics;
     float3 weights = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
 
     float3 n0 = float3(pv0.d0.w, pv0.d1.xy);
@@ -825,7 +912,7 @@ float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
     // scene instances with, the 3x3 itself is correct up to the normalize
     // below. Non-uniform scale would skew this; it would show as slightly
     // wrong bounce falloff, not as a structural error.
-    float3x4 objectToWorld = query.CommittedObjectToWorld3x4();
+    float3x4 objectToWorld = hit.objectToWorld;
     float3 worldNormal = normalize(float3(
         dot(objectToWorld[0].xyz, objectNormal),
         dot(objectToWorld[1].xyz, objectNormal),
@@ -860,8 +947,7 @@ float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
             uint texWidth, texHeight, texLevels;
             albedoTexture.GetDimensions(0, texWidth, texHeight, texLevels);
 
-            float3x4 hitObjectToWorld =
-                query.CommittedObjectToWorld3x4();
+            float3x4 hitObjectToWorld = hit.objectToWorld;
             float3 wp0 = float3(
                 dot(hitObjectToWorld[0], float4(pv0.d0.xyz, 1.0)),
                 dot(hitObjectToWorld[1], float4(pv0.d0.xyz, 1.0)),
@@ -878,7 +964,7 @@ float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
                 length(uv1 - uv0) / max(length(wp1 - wp0), 1e-4),
                 length(uv2 - uv0) / max(length(wp2 - wp0), 1e-4));
             float worldFootprint =
-                2.0 * query.CommittedRayT() /
+                2.0 * hit.rayT /
                 max(screenHeight * abs(projMatrix[1][1]), 1.0);
             float textureFootprint = worldFootprint * uvPerWorld *
                 max((float)texWidth, (float)texHeight);
@@ -890,8 +976,7 @@ float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
         }
     }
 
-    float3 hitPos = query.WorldRayOrigin() +
-                    rayDir * query.CommittedRayT();
+    float3 hitPos = hit.rayOrigin + rayDir * hit.rayT;
 
     // Sky seen by the hit surface, damped -- see kBounceSkyDamping above.
     float3 incoming = SampleSkyIrradiance(worldNormal) * kBounceSkyDamping;
@@ -913,9 +998,7 @@ float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
             shadowRay.Direction = sunDir;
             shadowRay.TMin = 0.0;
             shadowRay.TMax = enhancedShadowRayLength;
-            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
-                     RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
-                     RAY_FLAG_CULL_NON_OPAQUE> shadowQuery;
+            RayQuery<SGE_RAY_FLAGS_SHADOW> shadowQuery;
             shadowQuery.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff,
                                        shadowRay);
             shadowQuery.Proceed();
@@ -983,11 +1066,18 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
     ray.TMin = 0.0;
     ray.TMax = enhancedReflectionRayLength;
 
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
-             RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
-             RAY_FLAG_CULL_NON_OPAQUE> query;
+    RayQuery<SGE_RAY_FLAGS_REFLECTION> query;
     query.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff, ray);
-    query.Proceed();
+    // Traversal to completion, so the COMMITTED hit is the NEAREST one.
+    //
+    // A single unconditional Proceed() was correct only under
+    // ACCEPT_FIRST_HIT_AND_END_SEARCH, which ends traversal at the first
+    // triangle. A closest-hit search may return control repeatedly, so it must
+    // be driven in a loop. Nothing in the loop body: alpha-tested candidates are
+    // accepted as opaque here rather than evaluated, so there is no per-candidate
+    // work -- the loop itself is what guarantees nearest rather than
+    // first-reached.
+    while (query.Proceed()) {}
 
     if (query.CommittedStatus() != COMMITTED_TRIANGLE_HIT) {
         // Miss: sample the environment along this stochastic direction. Using
@@ -1002,7 +1092,7 @@ float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
     // this matters most: they are high-contrast and directly visible, so a
     // wrong colour reads as an obviously wrong mirror.
     bool resolved = false;
-    float3 shaded = ShadeRayHit(query, rayDir, resolved);
+    float3 shaded = ShadeRayHit(ReadReflectionHit(query), rayDir, resolved);
     if (resolved) return shaded;
     // Unbound geometry (terrain, or a mesh registered after the last
     // acceleration rebuild): fall back to darkening the probe along the ray --
@@ -1057,11 +1147,16 @@ float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
     ray.TMin = 0.0;
     ray.TMax = enhancedReflectionRayLength;
 
-    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
-             RAY_FLAG_SKIP_CLOSEST_HIT_SHADER |
-             RAY_FLAG_CULL_NON_OPAQUE> query;
+    // Culls alpha-tested geometry, unlike the reflection path -- see
+    // SGE_RAY_FLAGS_GI. Grass and foliage in a diffuse bounce contribute
+    // invisible detail and enormous variance.
+    RayQuery<SGE_RAY_FLAGS_GI> query;
     query.TraceRayInline(sceneTLAS, RAY_FLAG_NONE, 0xff, ray);
-    query.Proceed();
+    // Nearest hit, not first-reached -- see the reflection path above. A bounce
+    // that commits a farther surface than the one actually occluding it leaks
+    // light through geometry, which is most visible in exactly the interiors
+    // where the probe grid misses and this path is doing the work.
+    while (query.Proceed()) {}
 
     float3 incoming = SampleReflectionProbe(rayDir, 1.0);
     if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
@@ -1069,7 +1164,7 @@ float3 RayTracedProbeMissGI(float3 worldPos, float3 normal, uint2 pixel) {
         // coloured surface carries that colour. This is the difference between
         // GI that only darkens and GI that bleeds colour.
         bool resolved = false;
-        float3 shaded = ShadeRayHit(query, rayDir, resolved);
+        float3 shaded = ShadeRayHit(ReadGIHit(query), rayDir, resolved);
         incoming = resolved ? shaded : incoming * enhancedReflectionOcclusion;
     }
     return incoming * giIntensity;
