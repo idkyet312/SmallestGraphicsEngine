@@ -1290,6 +1290,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 scene.contactShadowLinearDepth
                     ? "  Screen-capped AO range; refined crossings."
                     : "  Device-depth slab: doubles on flat ground.");
+            ImGui::Checkbox("  Grass Depth in GTAO + Contact",
+                            &scene.grassInScreenSpaceAO);
+            if (scene.grassInScreenSpaceAO &&
+                (!scene.enableGrassMSAA || !scene.useVisibilityBuffer))
+                ImGui::TextDisabled(
+                    "  Requires 4x MSAA Grass and Visibility Buffer.");
         }
         ImGui::Checkbox("Screen-Space Reflections",
                         &scene.enableScreenSpaceReflections);

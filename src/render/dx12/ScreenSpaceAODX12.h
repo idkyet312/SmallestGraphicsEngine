@@ -43,17 +43,22 @@ public:
 
     void Render(const Scene& scene, ID3D12Resource* depthResource,
                 bool multisampledDepth, D3D12_CPU_DESCRIPTOR_HANDLE targetRtv = {},
-                bool hdrTarget = false,
-                ID3D12Resource* staticCasterDepth = nullptr,
-                ID3D12Resource* normalRoughness = nullptr) {
+                 bool hdrTarget = false,
+                 ID3D12Resource* staticCasterDepth = nullptr,
+                 ID3D12Resource* normalRoughness = nullptr,
+                 bool depthAlreadyReadable = false) {
         if (!initialized || !depthResource || !g_dx12.commandList) return;
         if (!EnsureRawTarget()) return;
         Update(scene, depthResource, multisampledDepth, staticCasterDepth,
                normalRoughness);
 
         ID3D12GraphicsCommandList* list = g_dx12.commandList.Get();
-        Transition(list, depthResource, D3D12_RESOURCE_STATE_DEPTH_WRITE,
-                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        // GrassMSAADX12's combined depth is produced by compute and handed off
+        // in PIXEL_SHADER_RESOURCE. Its owner keeps that state for water/fog;
+        // only transition depth resources whose contract starts at DEPTH_WRITE.
+        if (!depthAlreadyReadable)
+            Transition(list, depthResource, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         if (staticCasterDepth && staticCasterDepth != depthResource)
             Transition(list, staticCasterDepth,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -96,8 +101,10 @@ public:
                                : compositePipeline_.Get()));
         list->DrawInstanced(3, 1, 0, 0);
 
-        Transition(list, depthResource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                   D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        if (!depthAlreadyReadable)
+            Transition(list, depthResource,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_DEPTH_WRITE);
         if (staticCasterDepth && staticCasterDepth != depthResource)
             Transition(list, staticCasterDepth,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,

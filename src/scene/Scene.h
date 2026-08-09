@@ -393,6 +393,9 @@ struct Scene {
     // Keep the legacy path behind the toggle for A/B diagnosis, but use the
     // distance-stable linear test by default.
     bool  contactShadowLinearDepth = true;
+    // The independently resolved 4x grass depth can drive GTAO/contact so grass
+    // receives and casts the screen-space effect. Off by default for visual A/B.
+    bool  grassInScreenSpaceAO = false;
     bool  enableScreenSpaceReflections = true;
     float screenSpaceReflectionStrength = 0.35f;
     float screenSpaceReflectionDistance = 55.0f;

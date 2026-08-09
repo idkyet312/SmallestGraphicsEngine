@@ -12207,14 +12207,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             screenSpaceAO.initialized) {
             ProfilerDX12::Scope profile(
                 g_profiler, "GTAO + Contact Shadows", g_dx12.commandList.Get());
-            screenSpaceAO.Render(scene,
-                msaaActive ? msaa.GetDepthResource() : g_dx12.depthStencilBuffer.Get(),
-                msaaActive,
+            ID3D12Resource* aoDepth = msaaActive
+                ? msaa.GetDepthResource() : g_dx12.depthStencilBuffer.Get();
+            bool aoDepthMSAA = msaaActive;
+            bool aoDepthAlreadyReadable = false;
+            if (scene.grassInScreenSpaceAO && grassMSAAActive &&
+                grassMSAA.GetCombinedDepthResource()) {
+                aoDepth = grassMSAA.GetCombinedDepthResource();
+                aoDepthMSAA = false;
+                aoDepthAlreadyReadable = true;
+            }
+            screenSpaceAO.Render(scene, aoDepth, aoDepthMSAA,
                 commonHDRValidationTarget ? visBuffer.GetOutputRTV()
                                           : D3D12_CPU_DESCRIPTOR_HANDLE{},
                 commonHDRValidationTarget,
                 usingVisibility ? visBuffer.GetVisibilityDepthResource() : nullptr,
-                usingVisibility ? visBuffer.GetNormalRoughnessResource() : nullptr);
+                usingVisibility ? visBuffer.GetNormalRoughnessResource() : nullptr,
+                aoDepthAlreadyReadable);
         }
 
         if (renderedScene && commonHDRValidationTarget &&
