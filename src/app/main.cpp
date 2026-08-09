@@ -6999,6 +6999,19 @@ static void ApplyHouseTextures(const std::shared_ptr<SceneNode>& house,
     // procedural ribbed texture always kicks in.
     assign("Roof", "Content/Models/house_pbr/roof_metal",
            HouseTex::Corrugated(kSize, { 0.72f, 0.74f, 0.76f }, { 0.42f, 0.25f, 0.16f }));
+    // roughnessFactor is INERT here, unlike everywhere else: roughnessOnlyTexture
+    // makes the resolve replace roughness with the map's green channel outright
+    // (`rough = clamp(mr.g, ...)`) rather than scaling by the factor. The rusted
+    // map reads rough almost everywhere, so this wall sits above the 0.52 RT
+    // reflection cut whatever the factor says, and the 0.66 that used to be here
+    // was only documenting an intent the shader never applied.
+    //
+    // Dropping roughnessOnly for this material would hand it the scaling path,
+    // but the map has no metallic or AO channel to supply -- so the honest fix is
+    // to author the corrugated wall against the same galvanised-steel ARM set the
+    // roof uses, which does carry all three. Left as-is deliberately rather than
+    // pretending the factor does something: see matDarkMetal for the untextured
+    // case, where the factors really are live.
     assignGeneratedMetal("MetalWall",
                "Content/Models/Corrugated metal pack/Wall/A/A Roughness rusted 2.jpg",
                HouseTex::Corrugated(kSize, { 0.30f, 0.34f, 0.31f }, { 0.43f, 0.22f, 0.10f }), 0.82f, 0.66f);
@@ -7075,8 +7088,23 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     matMetalRoof->ambientScale = 1.08f; matMetalRoof->viewFillStrength = 0.08f;
     auto matDarkMetal = std::make_shared<SceneMaterial>();
     matDarkMetal->name = "DarkMetal";
-    matDarkMetal->baseColorFactor = XMFLOAT4(0.015f, 0.018f, 0.017f, 1.0f);
-    matDarkMetal->metallicFactor = 0.60f; matDarkMetal->roughnessFactor = 0.72f;
+    // Untextured, so both factors are live and directly control the BRDF -- no
+    // metallicRoughness map overrides them the way MetalWall's rusted-roughness
+    // JPG overrides its factor.
+    //
+    // Previously 0.015 base / 0.60 metallic / 0.72 rough, which was three
+    // mutually inconsistent values rather than dark metal:
+    //   * For a metal, base colour IS specular reflectance (F0). At 0.015 the
+    //     surface returns ~1.5% of what hits it, so it could not read as metal
+    //     at any roughness -- it was authored as a light absorber.
+    //   * Metallic is physically 0 or 1; 0.60 blends two BRDFs and matches no
+    //     real material.
+    //   * 0.72 sat above the 0.52 RT reflection cut, so the surface was always
+    //     handed to the environment probe and never resolved a real reflection.
+    // Dark oxidised steel is still a metal: fully metallic, with a low but not
+    // black F0 and enough smoothness to carry a blurred reflection.
+    matDarkMetal->baseColorFactor = XMFLOAT4(0.10f, 0.105f, 0.10f, 1.0f);
+    matDarkMetal->metallicFactor = 1.0f; matDarkMetal->roughnessFactor = 0.42f;
     matDarkMetal->ambientScale = 1.12f; matDarkMetal->viewFillStrength = 0.10f;
     auto matTrim = std::make_shared<SceneMaterial>();
     matTrim->name = "MetalTrim";
