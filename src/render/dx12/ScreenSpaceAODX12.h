@@ -322,9 +322,12 @@ private:
             static_cast<float>(g_dx12.screenWidth),
             static_cast<float>(g_dx12.screenHeight),
             1.0f / g_dx12.screenWidth, 1.0f / g_dx12.screenHeight };
+        // .z claims one of the two reserved pad slots, so the constant buffer
+        // size and every field offset before it are unchanged.
         constants.filterParams = {
             staticCasterDepth && staticCasterDepth != depth ? 1.0f : 0.0f,
-            normalRoughness ? 1.0f : 0.0f, 0.0f, 0.0f };
+            normalRoughness ? 1.0f : 0.0f,
+            scene.contactShadowLinearDepth ? 1.0f : 0.0f, 0.0f };
         std::memcpy(mappedConstants_ + g_dx12.frameIndex * 256u,
                     &constants, sizeof(constants));
 

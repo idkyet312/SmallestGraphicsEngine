@@ -378,6 +378,22 @@ struct Scene {
     float ambientOcclusionStrength = 2.50f;
     float ambientOcclusionBias = 0.035f;
     float contactShadowStrength = 0.56f;
+    // Test the contact-shadow occluder slab in linear depth instead of device
+    // depth.
+    //
+    // The device-depth form is distance-dependent to the point of being three
+    // different effects in one frame: on a 0.1/800 non-reversed projection the
+    // fixed epsilon is ~4 mm of world space at 1 m and ~29 m at 100 m. Once it
+    // outgrows the march step the receiver falls inside its own slab and flat
+    // ground self-shadows into a second, sun-offset copy of the caster; further
+    // out the test can never pass and contact shadows stop along an
+    // iso-distance contour, which on flat terrain reads as a hard straight line
+    // anchored to no geometry.
+    //
+    // Opt-in rather than replacing the old path outright: contact shadows are
+    // default-on, so this changes the default frame wherever it is enabled and
+    // wants an A/B against the current look before it becomes the default.
+    bool  contactShadowLinearDepth = false;
     bool  enableScreenSpaceReflections = true;
     float screenSpaceReflectionStrength = 0.35f;
     float screenSpaceReflectionDistance = 55.0f;

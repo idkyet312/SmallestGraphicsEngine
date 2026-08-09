@@ -196,9 +196,23 @@ float ContactVisibility(float2 uv, float deviceDepth, bool multisampled,
     world += surfaceNormal * max(0.015, aoParams.x * 0.03);
     float3 rayDirection = normalize(lightDirection.xyz);
     const float maxDistance = max(aoParams.w * 0.004, 1.5);
+    const bool linearThickness = filterParams.z > 0.5;
+    // Offset the march per pixel. Ten identical world-space steps for every
+    // pixel put the terminator on a shared set of loci one step apart, which on
+    // a smooth flat receiver reads as hard contour bands rather than a shadow
+    // edge. HorizonVisibility above already dithers both its slice rotation and
+    // its steps for the same reason; this path never did.
+    //
+    // Only applied on the linear-depth path so the device-depth path stays
+    // bit-identical while it is still the default.
+    float dither = linearThickness
+        ? InterleavedNoise(uv * screenParams.xy) : 0.0;
     [unroll]
     for (uint step = 1; step <= 10; ++step) {
-        float t = maxDistance * (step / 10.0);
+        // (step - dither) also makes the last sample do work: at dither 0 the
+        // step==10 case gives t == maxDistance exactly, so the falloff below is
+        // 0.0 and the march pays for ten samples but can only ever return nine.
+        float t = maxDistance * ((step - dither) / 10.0);
         float4 projected =
             mul(float4(world + rayDirection * t, 1.0), viewProjection);
         if (projected.w <= 0.0) continue;
@@ -208,8 +222,38 @@ float ContactVisibility(float2 uv, float deviceDepth, bool multisampled,
         float sampledDepth =
             SampleContactCasterDepth(rayUV, multisampled);
         if (IsViewModelDepth(sampledDepth)) continue;
-        float thickness = 0.00035 + t * 0.000035;
-        if (sampledDepth + thickness < ndc.z)
+        bool occluded;
+        if (linearThickness) {
+            // Compare in metres, not device depth. The device-depth epsilon
+            // below is fixed, but device depth is not linear: on this
+            // 0.1/800 non-reversed projection the same constant is ~4 mm of
+            // world space at 1 m and ~29 m at 100 m. Past the point where it
+            // outgrows the step size the receiver's own depth lands inside its
+            // own slab and flat ground self-shadows into a second, sun-offset
+            // silhouette; further out nothing can satisfy the test at all and
+            // contact shadows stop along an iso-distance contour -- a straight
+            // line across flat terrain, attached to no geometry.
+            //
+            // projected.w IS view-space Z for a standard LH perspective, so the
+            // ray side of the comparison costs no reciprocal.
+            float rayLinear = projected.w;
+            float occluderLinear = LinearDepth(sampledDepth);
+            // 0.02 m stays just under the normal offset applied above, so the
+            // ray cannot immediately hit the surface it started on, and 0.18 m
+            // at the far end stays under the step size, so the slab never
+            // swallows the receiver.
+            float thickness = 0.02 + t * 0.05;
+            // The far bound gives an occluder finite thickness. Device space did
+            // not need one because its epsilon exploded with distance; in metres
+            // an unbounded test lets a surface hundreds of metres nearer than
+            // the receiver cast a contact shadow onto it.
+            occluded = occluderLinear < rayLinear - thickness &&
+                       occluderLinear > rayLinear - maxDistance;
+        } else {
+            float thickness = 0.00035 + t * 0.000035;
+            occluded = sampledDepth + thickness < ndc.z;
+        }
+        if (occluded)
             return 1.0 - lightDirection.w *
                 saturate(1.0 - t / maxDistance);
     }

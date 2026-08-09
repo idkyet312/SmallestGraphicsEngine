@@ -1284,6 +1284,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                                0.0f, 2.5f, "%.2f");
             ImGui::SliderFloat("Contact Shadows", &scene.contactShadowStrength,
                                0.0f, 1.0f, "%.2f");
+            ImGui::Checkbox("  Linear-Depth Occluder Test",
+                            &scene.contactShadowLinearDepth);
+            ImGui::TextDisabled(
+                scene.contactShadowLinearDepth
+                    ? "  Slab in metres; dithered march."
+                    : "  Device-depth slab: doubles on flat ground.");
         }
         ImGui::Checkbox("Screen-Space Reflections",
                         &scene.enableScreenSpaceReflections);
