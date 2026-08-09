@@ -55,14 +55,41 @@ groupshared TerrainPayload payloadData;
 groupshared uint visibleCount;
 
 bool TileIntersectsFrustum(float3 center, float radius) {
-    float4 clip = mul(float4(center, 1), modelViewProjection);
-    float radiusX = radius * abs(projection[0][0]);
-    float radiusY = radius * abs(projection[1][1]);
-    float radiusZ = radius *
-        (abs(projection[2][2]) + abs(projection[2][3]));
-    return clip.x + radiusX >= -clip.w && clip.x - radiusX <= clip.w &&
-           clip.y + radiusY >= -clip.w && clip.y - radiusY <= clip.w &&
-           clip.z + radiusZ >= 0.0 && clip.z - radiusZ <= clip.w + radiusZ;
+    // Clip inequalities include w, so expanding x/y/z alone is not a
+    // conservative sphere test. Extract the six planes from the complete MVP;
+    // otherwise tiles at the view edge can be rejected while their geometry is
+    // still on screen, especially when the camera is close to a coarse ring.
+    float4 planes[6] = {
+        float4(modelViewProjection[0][0] + modelViewProjection[0][3],
+               modelViewProjection[1][0] + modelViewProjection[1][3],
+               modelViewProjection[2][0] + modelViewProjection[2][3],
+               modelViewProjection[3][0] + modelViewProjection[3][3]),
+        float4(modelViewProjection[0][3] - modelViewProjection[0][0],
+               modelViewProjection[1][3] - modelViewProjection[1][0],
+               modelViewProjection[2][3] - modelViewProjection[2][0],
+               modelViewProjection[3][3] - modelViewProjection[3][0]),
+        float4(modelViewProjection[0][1] + modelViewProjection[0][3],
+               modelViewProjection[1][1] + modelViewProjection[1][3],
+               modelViewProjection[2][1] + modelViewProjection[2][3],
+               modelViewProjection[3][1] + modelViewProjection[3][3]),
+        float4(modelViewProjection[0][3] - modelViewProjection[0][1],
+               modelViewProjection[1][3] - modelViewProjection[1][1],
+               modelViewProjection[2][3] - modelViewProjection[2][1],
+               modelViewProjection[3][3] - modelViewProjection[3][1]),
+        float4(modelViewProjection[0][2], modelViewProjection[1][2],
+               modelViewProjection[2][2], modelViewProjection[3][2]),
+        float4(modelViewProjection[0][3] - modelViewProjection[0][2],
+               modelViewProjection[1][3] - modelViewProjection[1][2],
+               modelViewProjection[2][3] - modelViewProjection[2][2],
+               modelViewProjection[3][3] - modelViewProjection[3][2])
+    };
+    [unroll]
+    for (uint planeIndex = 0; planeIndex < 6; ++planeIndex) {
+        float4 plane = planes[planeIndex];
+        float distance = dot(float4(center, 1.0), plane);
+        if (distance < -radius * length(plane.xyz)) return false;
+    }
+    return true;
 }
 
 // Resolve a linear clipmap tile index into its world min-corner + tile size.
@@ -149,12 +176,19 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
     }
 
     if (valid) {
-        float verticalReach = heightScale + sculptMaxDisplacement;
+        // TerrainHeight adds a 2.5 m land lift and sinks the seabed to -6 m;
+        // skirts and sculpt stamps extend that range further. The old
+        // [-skirtDepth, heightScale] bound excluded most underwater geometry,
+        // so a tile could be culled while the part under the crosshair remained
+        // visible.
+        const float terrainMin = -6.0 - skirtDepth - sculptMaxDisplacement;
+        const float terrainMax =
+            heightScale + 2.5 + sculptMaxDisplacement;
         float3 center3 = float3(originXZ.x + tsize * 0.5,
-            (verticalReach - skirtDepth) * 0.5,
+            (terrainMin + terrainMax) * 0.5,
             originXZ.y + tsize * 0.5);
         float3 halfExtent = float3(tsize * 0.5,
-            (verticalReach + skirtDepth) * 0.5, tsize * 0.5);
+            (terrainMax - terrainMin) * 0.5, tsize * 0.5);
 
         if (TileIntersectsFrustum(center3, length(halfExtent))) {
             float2 center = originXZ + tsize * 0.5;

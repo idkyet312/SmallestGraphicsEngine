@@ -1288,7 +1288,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                             &scene.contactShadowLinearDepth);
             ImGui::TextDisabled(
                 scene.contactShadowLinearDepth
-                    ? "  Slab in metres; dithered march."
+                    ? "  Screen-capped AO range; refined crossings."
                     : "  Device-depth slab: doubles on flat ground.");
         }
         ImGui::Checkbox("Screen-Space Reflections",

@@ -196,24 +196,51 @@ float ContactVisibility(float2 uv, float deviceDepth, bool multisampled,
     const float originOffset = max(0.015, aoParams.x * 0.03);
     world += surfaceNormal * originOffset;
     float3 rayDirection = normalize(lightDirection.xyz);
-    const float maxDistance = max(aoParams.w * 0.004, 1.5);
     const bool linearThickness = filterParams.z > 0.5;
-    // Offset the march per pixel. Ten identical world-space steps for every
-    // pixel put the terminator on a shared set of loci one step apart, which on
-    // a smooth flat receiver reads as hard contour bands rather than a shadow
-    // edge. HorizonVisibility above already dithers both its slice rotation and
-    // its steps for the same reason; this path never did.
-    //
-    // Only applied on the linear-depth path so the device-depth path stays
-    // bit-identical while it is still the default.
-    float dither = linearThickness
-        ? InterleavedNoise(uv * screenParams.xy) : 0.0;
+    // A contact effect must stay local. Basing its range on the camera far
+    // plane made the default 800 m projection cast hard foliage silhouettes
+    // over 3.2 m of terrain. The linear path shares the world-space AO radius,
+    // capped at one metre; leave the legacy device-depth path byte-identical.
+    float maxDistance = linearThickness
+        ? clamp(aoParams.x, 0.25, 1.0)
+        : max(aoParams.w * 0.004, 1.5);
+    float linearRayDepthStride = 0.0;
+    float previousLinearDepthGap = 0.0;
+    float previousLinearT = 0.0;
+    if (linearThickness) {
+        float4 projectedOrigin =
+            mul(float4(world, 1.0), viewProjection);
+        float4 projectedEnd = mul(
+            float4(world + rayDirection * maxDistance, 1.0),
+            viewProjection);
+        if (projectedOrigin.w > 0.0 && projectedEnd.w > 0.0) {
+            float2 originNDC = projectedOrigin.xy / projectedOrigin.w;
+            float2 endNDC = projectedEnd.xy / projectedEnd.w;
+            float2 pixelDelta = (endNDC - originNDC) *
+                screenParams.xy * 0.5;
+            // Ten fixed world-space taps can be tens of pixels apart on a
+            // nearby receiver but sub-pixel farther away. Limit the projected
+            // footprint so adjacent taps stay within two pixels without adding
+            // samples; distant rays still retain the full world-space radius.
+            const float maxRayPixels = 20.0;
+            float projectedPixels = length(pixelDelta);
+            float screenScale = min(
+                1.0, maxRayPixels / max(projectedPixels, 1e-4));
+            maxDistance = max(
+                maxDistance * screenScale, originOffset * 4.0);
+        }
+        // projected.w is view-space Z. A real crossing cannot advance farther
+        // in view depth between two taps than the ray itself does; using the
+        // whole ray length admitted unrelated foreground surfaces as casters.
+        linearRayDepthStride = abs(mul(float4(
+            rayDirection * (maxDistance / 10.0), 0.0),
+            viewProjection).w);
+        previousLinearDepthGap =
+            projectedOrigin.w - LinearDepth(deviceDepth);
+    }
     [unroll]
     for (uint step = 1; step <= 10; ++step) {
-        // (step - dither) also makes the last sample do work: at dither 0 the
-        // step==10 case gives t == maxDistance exactly, so the falloff below is
-        // 0.0 and the march pays for ten samples but can only ever return nine.
-        float t = maxDistance * ((step - dither) / 10.0);
+        float t = maxDistance * (step / 10.0);
         float4 projected =
             mul(float4(world + rayDirection * t, 1.0), viewProjection);
         if (projected.w <= 0.0) continue;
@@ -224,48 +251,60 @@ float ContactVisibility(float2 uv, float deviceDepth, bool multisampled,
             SampleContactCasterDepth(rayUV, multisampled);
         if (IsViewModelDepth(sampledDepth)) continue;
         bool occluded;
+        float shadowT = t;
         if (linearThickness) {
-            // Compare in metres, not device depth. The device-depth epsilon
-            // below is fixed, but device depth is not linear: on this
-            // 0.1/800 non-reversed projection the same constant is ~4 mm of
-            // world space at 1 m and ~29 m at 100 m. Past the point where it
-            // outgrows the step size the receiver's own depth lands inside its
-            // own slab and flat ground self-shadows into a second, sun-offset
-            // silhouette; further out nothing can satisfy the test at all and
-            // contact shadows stop along an iso-distance contour -- a straight
-            // line across flat terrain, attached to no geometry.
+            // Compare in metres, not device depth. On this 0.1/800 projection
+            // the legacy fixed epsilon represents ~4 mm at 1 m but ~29 m at
+            // 100 m, so its bias and effective hit range change across one flat
+            // receiver and end on contours unrelated to caster geometry.
             //
             // projected.w IS view-space Z for a standard LH perspective, so the
             // ray side of the comparison costs no reciprocal.
             float rayLinear = projected.w;
             float occluderLinear = LinearDepth(sampledDepth);
-            // The slab must stay BELOW the origin offset, or the ray registers
-            // the surface it started on as its own occluder. Whether it does
-            // then depends on local slope and the dither, so the error lands
-            // per-pixel and reads as speckle rather than as a shadow -- which is
-            // exactly what `0.02 + t * 0.05` did: 0.036 m at the first step
-            // against a 0.021 m offset, already over the line before the march
-            // had gone anywhere.
-            //
-            // Scaling from the offset keeps the relationship intact when
-            // aoParams.x moves the offset, instead of pinning a constant that is
-            // only correct at one AO radius. Half the offset at the first step,
-            // growing gently with distance so a real occluder further along the
-            // ray still has depth to be found in.
-            float thickness = originOffset * (0.5 + t * 0.35);
-            // The far bound gives an occluder finite thickness. Device space did
-            // not need one because its epsilon exploded with distance; in metres
-            // an unbounded test lets a surface hundreds of metres nearer than
-            // the receiver cast a contact shadow onto it.
-            occluded = occluderLinear < rayLinear - thickness &&
-                       occluderLinear > rayLinear - maxDistance;
+            float depthGap = rayLinear - occluderLinear;
+            const float surfaceBias = originOffset * 0.25;
+            // This is a finite slab BEHIND the sampled surface: the ray must be
+            // past the front face, but still close enough to have crossed it in
+            // the current step. The old test used this interval backwards -- it
+            // rejected nearby crossings and accepted gaps up to maxDistance,
+            // turning unrelated foreground depth into the dotted shadow bands.
+            float slabThickness = max(
+                originOffset * 2.0, linearRayDepthStride * 1.25);
+            bool crossedSurface = previousLinearDepthGap <= surfaceBias &&
+                                  depthGap > surfaceBias;
+            occluded = crossedSurface && depthGap < slabThickness;
+            if (occluded) {
+                // Refine the hit continuously between the two samples. A
+                // binary result at t would quantise the falloff into ten
+                // parallel bands; static per-pixel dither only converted those
+                // bands into dots because it never changed between frames.
+                float gapRange = max(
+                    depthGap - previousLinearDepthGap, 1e-5);
+                float crossing = saturate(
+                    (surfaceBias - previousLinearDepthGap) / gapRange);
+                shadowT = lerp(previousLinearT, t, crossing);
+            }
+            previousLinearDepthGap = depthGap;
+            previousLinearT = t;
         } else {
             float thickness = 0.00035 + t * 0.000035;
             occluded = sampledDepth + thickness < ndc.z;
         }
-        if (occluded)
-            return 1.0 - lightDirection.w *
-                saturate(1.0 - t / maxDistance);
+        if (occluded) {
+            float distanceFade = saturate(1.0 - shadowT / maxDistance);
+            if (linearThickness) {
+                // This post effect multiplies the lit frame rather than only
+                // the direct-sun term. Suppress it on surfaces receiving little
+                // or no sun, and square the range fade so distant intersections
+                // cannot read as detached opaque copies of thin foliage.
+                float receiverLight = saturate(
+                    dot(surfaceNormal, rayDirection));
+                distanceFade *= distanceFade *
+                    smoothstep(0.02, 0.20, receiverLight);
+            }
+            return 1.0 - lightDirection.w * distanceFade;
+        }
     }
     return 1.0;
 }

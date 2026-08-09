@@ -377,7 +377,7 @@ struct Scene {
     float ambientOcclusionRadius = 0.69f;
     float ambientOcclusionStrength = 2.50f;
     float ambientOcclusionBias = 0.035f;
-    float contactShadowStrength = 0.56f;
+    float contactShadowStrength = 0.88f;
     // Test the contact-shadow occluder slab in linear depth instead of device
     // depth.
     //
@@ -390,10 +390,9 @@ struct Scene {
     // iso-distance contour, which on flat terrain reads as a hard straight line
     // anchored to no geometry.
     //
-    // Opt-in rather than replacing the old path outright: contact shadows are
-    // default-on, so this changes the default frame wherever it is enabled and
-    // wants an A/B against the current look before it becomes the default.
-    bool  contactShadowLinearDepth = false;
+    // Keep the legacy path behind the toggle for A/B diagnosis, but use the
+    // distance-stable linear test by default.
+    bool  contactShadowLinearDepth = true;
     bool  enableScreenSpaceReflections = true;
     float screenSpaceReflectionStrength = 0.35f;
     float screenSpaceReflectionDistance = 55.0f;
@@ -488,10 +487,10 @@ struct Scene {
     // inherits from its fixed-size table, and drops one root-descriptor-table
     // set per textured draw.
     //
-    // Off by default: it needs SM 6.6 + Resource Binding Tier 3, and it stays
-    // opt-in until visual parity and PIX validation are signed off. With it
-    // off, the legacy heaps, shaders and FXC resolve run exactly as before.
-    bool bindlessMaterials   = false;
+    // Requested by default when SM 6.6 and Resource Binding Tier 3 are present;
+    // runtime capability checks fall back to the legacy heaps and shaders on
+    // unsupported adapters.
+    bool bindlessMaterials   = true;
 
     // DXGI present sync interval: 0 uncapped (tearing allowed), 1 every vblank,
     // 2+ divides the refresh rate (2 = half, 3 = a third...). Kept as the raw
