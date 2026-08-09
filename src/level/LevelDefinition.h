@@ -65,6 +65,24 @@ struct TerrainSculptStamp {
 // still only a 32 KB buffer.
 inline constexpr size_t kMaxTerrainSculptStamps = 1024;
 
+// Upper bound on the DDGI probe count a level may request.
+//
+// This is a budget ceiling, not a hardware or format limit: DXRDDGIRenderer
+// sizes the irradiance and visibility atlases from the ACTUAL probe count
+// (CreateAtlases lays probes out in a ceil(sqrt(n)) grid of 10x10 and 18x18
+// texel tiles), so nothing in the GPU path assumes a maximum.
+//
+// It was 2048, which is under one probe per 8m tile on a 128x128m island at the
+// default 3.0m spacing -- so large outdoor levels silently ran out of probes,
+// most of the ground fell outside the layout, and SampleSparseDDGI returned zero
+// there. Those pixels then fell through to one stochastic GI ray each, which is
+// far noisier and more expensive than the probes would have been.
+//
+// 8192 costs roughly 35 MB of atlas across both double-buffered targets, which
+// is in line with what the visibility buffer already owns. Raise it further only
+// with that arithmetic redone -- the atlases grow linearly in probe count.
+inline constexpr uint32_t kMaxDDGIProbes = 8192;
+
 struct LevelDXRDDGISettings {
     bool enabled = false;
     float surfaceSpacing = 3.0f;

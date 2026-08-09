@@ -199,7 +199,7 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
     if (!std::isfinite(gi.surfaceSpacing) || gi.surfaceSpacing < 0.25f ||
         gi.surfaceSpacing > 50.0f || !std::isfinite(gi.surfaceOffset) ||
         gi.surfaceOffset < 0.0f || gi.surfaceOffset > 5.0f ||
-        gi.maxProbes == 0 || gi.maxProbes > 2048 ||
+        gi.maxProbes == 0 || gi.maxProbes > kMaxDDGIProbes ||
         gi.raysPerProbe < 8 || gi.raysPerProbe > 64 ||
         gi.probesPerFrame == 0 || gi.probesPerFrame > gi.maxProbes ||
         !std::isfinite(gi.maxRayDistance) || gi.maxRayDistance < 1.0f ||

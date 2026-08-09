@@ -1723,11 +1723,13 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         0.1f, 0.25f, 50.0f, "%.2f m");
     ddgiChanged |= ImGui::DragFloat("Surface offset", &ddgi.surfaceOffset,
         0.02f, 0.0f, 5.0f, "%.2f m");
-    // Upper bound matches DXRProbeLayout's own cap, not the old 2048: a level
-    // saved with more probes than the slider could represent snapped back down
-    // the moment the control was touched, silently discarding the setting.
+    // Bounded by the same constant the level validator enforces. These were
+    // previously inconsistent -- the slider went to 16384 while the validator
+    // rejected anything over 2048, so the editor would happily author a probe
+    // count that made the saved level fail to load.
     int maximumProbes = static_cast<int>(ddgi.maxProbes);
-    if (ImGui::DragInt("Maximum probes", &maximumProbes, 8.0f, 1, 16384)) {
+    if (ImGui::DragInt("Maximum probes", &maximumProbes, 8.0f, 1,
+                       static_cast<int>(kMaxDDGIProbes))) {
         ddgi.maxProbes = static_cast<uint32_t>(maximumProbes);
         ddgiChanged = true;
     }

@@ -107,9 +107,15 @@ int main() {
     LevelDefinition missingPrefabId = level;
     missingPrefabId.entities.back().prefabId.clear();
     CHECK(!ValidateLevel(missingPrefabId).ok);
+    // Keyed to the cap rather than a literal: the previous 4096 became a valid
+    // probe count when the ceiling rose, so the case silently stopped testing
+    // rejection and started asserting the opposite of what it claimed.
     LevelDefinition invalidGI = level;
-    invalidGI.dxrDDGI.maxProbes = 4096;
+    invalidGI.dxrDDGI.maxProbes = kMaxDDGIProbes + 1u;
     CHECK(!ValidateLevel(invalidGI).ok);
+    LevelDefinition boundaryGI = level;
+    boundaryGI.dxrDDGI.maxProbes = kMaxDDGIProbes;
+    CHECK(ValidateLevel(boundaryGI).ok);
 
     std::filesystem::create_directories(root);
     const auto malformed = root / "malformed.json";
