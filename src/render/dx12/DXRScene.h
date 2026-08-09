@@ -3,13 +3,20 @@
 
 #include "DX12Core.h"
 #include <DirectXMath.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
 
-// Shared static-geometry acceleration structure used by probe GI and
-// screen-space raytracing. Dynamic gameplay objects deliberately never enter it.
+// Shared acceleration structure used by probe GI and screen-space raytracing.
+//
+// Topology (which meshes, how many instances, their hit-group bindings) is
+// established by UpdateTLAS, which is a rare scene-rebuild event. Instance
+// TRANSFORMS can then be updated per frame through RefitTLAS, so moving actors
+// are traced where they actually are rather than where they were at load. The
+// BLASes themselves stay static -- a skinned mesh refits its instance transform
+// but keeps its bind-pose triangles.
 class DXRScene {
 public:
     struct Geometry {
@@ -321,6 +328,14 @@ public:
         topologyDirty_ |= meshes_.erase(meshId) != 0;
     }
 
+    // Whether a built BLAS exists for this mesh id. The refit transform gather
+    // uses it to reproduce the build's instance set without re-running any
+    // acceleration-structure work.
+    bool HasMesh(uint64_t meshId) const {
+        const auto found = meshes_.find(meshId);
+        return found != meshes_.end() && found->second.result;
+    }
+
     bool UpdateTLAS(ID3D12GraphicsCommandList4* commandList,
                     const std::vector<Instance>& instances) {
         if (!supported_ || !commandList) return false;
@@ -399,6 +414,9 @@ public:
         }
         if (descriptions.empty()) {
             tlas_.Reset();
+            // The cached descriptors point at a TLAS that no longer exists.
+            refitReady_ = false;
+            refitDescriptions_.clear();
             return false;
         }
         const uint64_t instanceBytes =
@@ -431,15 +449,23 @@ public:
         // result buffer tested, a grown instance list whose result still fits
         // (CreateBuffer rounds up to 256B) would build against a scratch buffer
         // sized for the smaller list and overrun it.
+        //
+        // Scratch is sized to the LARGER of the build and update requirements.
+        // A refit reuses this same buffer, and while an update's scratch is
+        // normally the smaller of the two, the API reports them separately and
+        // nothing guarantees the ordering -- taking the max costs nothing and
+        // removes the assumption.
+        const uint64_t scratchBytes = (std::max)(info.ScratchDataSizeInBytes,
+                                                 info.UpdateScratchDataSizeInBytes);
         if (!tlas_ || tlas_->GetDesc().Width < info.ResultDataMaxSizeInBytes ||
             !tlasScratch_ ||
-            tlasScratch_->GetDesc().Width < info.ScratchDataSizeInBytes ||
+            tlasScratch_->GetDesc().Width < scratchBytes ||
             topologyDirty_) {
             if (!CreateBuffer(info.ResultDataMaxSizeInBytes,
                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
                     D3D12_HEAP_TYPE_DEFAULT, tlas_) ||
-                !CreateBuffer(info.ScratchDataSizeInBytes,
+                !CreateBuffer(scratchBytes,
                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_HEAP_TYPE_DEFAULT, tlasScratch_))
@@ -460,18 +486,117 @@ public:
         barrier.UAV.pResource = tlas_.Get();
         commandList->ResourceBarrier(1, &barrier);
         topologyDirty_ = false;
+        // Snapshot the descriptor list so RefitTLAS can rewrite transforms
+        // without re-deriving record bases. Refit is only legal against the
+        // exact instance set this build used -- see RefitTLAS.
+        refitDescriptions_ = std::move(descriptions);
+        refitReady_ = true;
         return true;
     }
 
+    // Per-frame transform update. Rewrites the instance transforms of the
+    // already-built TLAS and re-runs the build as a PERFORM_UPDATE refit, so
+    // moving actors cast RT shadows and appear in reflections instead of being
+    // frozen at whatever pose the last full build snapshotted.
+    //
+    // Deliberately NOT a call to UpdateTLAS. That function stalls every frame
+    // slot (WaitForGPUAllFrames, via the DDGI wrapper) and rewrites the
+    // persistently-mapped shader table, both of which are correct for a rare
+    // scene rebuild and ruinous per frame. Neither is needed here: a transform
+    // change does not touch topology, so the hit records, the record bases and
+    // the geometry bindings are all still valid.
+    //
+    // `transforms` must be the same length and the same order as the instance
+    // list the last successful UpdateTLAS consumed. A refit may only move the
+    // instances a build already placed -- changing their count, their BLAS or
+    // their hit-group contribution requires a full rebuild, and D3D does not
+    // validate that for us. Callers that add or remove geometry must go back
+    // through UpdateTLAS; a mismatched length is rejected here rather than
+    // producing a silently corrupt acceleration structure.
+    bool RefitTLAS(ID3D12GraphicsCommandList4* commandList,
+                   const std::vector<DirectX::XMFLOAT4X4>& transforms,
+                   uint32_t frameSlot) {
+        if (!supported_ || !commandList || !refitReady_ || !tlas_ ||
+            !tlasScratch_ || topologyDirty_)
+            return false;
+        if (transforms.size() != refitDescriptions_.size()) return false;
+        for (size_t i = 0; i < transforms.size(); ++i)
+            StoreDXRTransform(transforms[i], refitDescriptions_[i].Transform);
+
+        // Per-frame-slot upload buffers. The single instanceUpload_ the full
+        // build uses is safe only because that path drains the GPU first; here
+        // the previous frame's refit may still be reading its descriptors while
+        // the CPU writes the next one, so each slot needs its own.
+        const uint64_t instanceBytes =
+            refitDescriptions_.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+        const uint32_t slot = frameSlot % kRefitSlots;
+        if (!refitUpload_[slot] ||
+            refitUpload_[slot]->GetDesc().Width < instanceBytes) {
+            if (!CreateBuffer(instanceBytes, D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    D3D12_HEAP_TYPE_UPLOAD, refitUpload_[slot]))
+                return false;
+        }
+        void* mapped = nullptr;
+        if (FAILED(refitUpload_[slot]->Map(0, nullptr, &mapped))) return false;
+        memcpy(mapped, refitDescriptions_.data(),
+               static_cast<size_t>(instanceBytes));
+        refitUpload_[slot]->Unmap(0, nullptr);
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+        inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+        inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        inputs.NumDescs = static_cast<uint32_t>(refitDescriptions_.size());
+        inputs.InstanceDescs = refitUpload_[slot]->GetGPUVirtualAddress();
+        // Same flags as the build, plus PERFORM_UPDATE. The flag set must match
+        // the original build's or the refit is invalid, which is why
+        // ALLOW_UPDATE is on the build unconditionally.
+        inputs.Flags =
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build{};
+        build.Inputs = inputs;
+        build.DestAccelerationStructureData = tlas_->GetGPUVirtualAddress();
+        // In-place refit: source and destination are the same buffer, which the
+        // spec permits for an update and which avoids a second TLAS allocation.
+        build.SourceAccelerationStructureData = tlas_->GetGPUVirtualAddress();
+        build.ScratchAccelerationStructureData =
+            tlasScratch_->GetGPUVirtualAddress();
+        commandList->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource = tlas_.Get();
+        commandList->ResourceBarrier(1, &barrier);
+        return true;
+    }
+
+    // Number of instances the last build placed; callers size their transform
+    // list against this so a mismatch is caught before the refit.
+    size_t RefitInstanceCount() const {
+        return refitReady_ ? refitDescriptions_.size() : 0;
+    }
+
 private:
+    // Matches FRAME_COUNT. Kept local rather than including DX12Core so this
+    // header stays independent of the swap-chain configuration.
+    static constexpr uint32_t kRefitSlots = 3;
+
     static constexpr uint64_t kTerrainMeshId = ~uint64_t(0);
     ComPtr<ID3D12Device5> device_;
     std::unordered_map<uint64_t, BLAS> meshes_;
     ComPtr<ID3D12Resource> tlas_;
     ComPtr<ID3D12Resource> tlasScratch_;
     ComPtr<ID3D12Resource> instanceUpload_;
+    ComPtr<ID3D12Resource> refitUpload_[kRefitSlots];
     ComPtr<ID3D12Resource> terrainVertices_;
     ComPtr<ID3D12Resource> terrainIndices_;
+    // Descriptors from the last successful full build. Refit rewrites only the
+    // Transform of each, leaving the BLAS address and hit-group contribution as
+    // the build computed them.
+    std::vector<D3D12_RAYTRACING_INSTANCE_DESC> refitDescriptions_;
+    bool refitReady_ = false;
     bool supported_ = false;
     bool inlineSupported_ = false;
     bool topologyDirty_ = true;
