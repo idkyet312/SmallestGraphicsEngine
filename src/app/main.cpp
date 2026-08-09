@@ -3417,11 +3417,15 @@ static void BuildDXRDDGINodeScene(
                 geometry.vbIndexOffset = vbIndexOffset;
                 geometry.vbHasIndices = vbHasIndices;
                 geometry.vbMeshValid = true;
-                UINT materialID = 0;
-                if (primitive.material &&
-                    visBuffer.ExistingMaterialID(primitive.material.get(),
-                                                 materialID))
+                if (primitive.material) {
+                    UINT materialID = 0;
+                    UINT bindlessMaterialID = 0;
+                    visBuffer.RegisterRaytracingMaterial(
+                        primitive.material.get(), materialID,
+                        bindlessMaterialID);
                     geometry.vbMaterialID = materialID;
+                    geometry.vbBindlessMaterialID = bindlessMaterialID;
+                }
             }
             geometries.push_back(geometry);
             sourceHash = DXRDDGIHash(sourceHash, geometry.vertexCount);

@@ -867,6 +867,21 @@ public:
         return true;
     }
 
+    // Register both material record encodings used by enhanced RayQuery hit
+    // shading.  The hit-geometry table is scene-lived while the renderer can
+    // switch between legacy and bindless resolves every frame, so storing only
+    // whichever ID happened to be active when the TLAS was built makes the
+    // other mode interpret texture indices in the wrong address space.
+    void RegisterRaytracingMaterial(SceneMaterial* material,
+                                    UINT& legacyID,
+                                    UINT& bindlessID) {
+        legacyID = RegisterMaterial(material);
+        bindlessID = 0;
+        if (material && bindlessHeap && bindlessHeap->Initialized() &&
+            BindlessResolveReady())
+            bindlessID = RegisterMaterialBindless(material, *bindlessHeap);
+    }
+
     // Register only mutable instance/material data for this frame.
     UINT RegisterInstance(UINT meshID, const XMMATRIX& modelMatrix,
                           const XMFLOAT3& color, float metalness, float roughness,
@@ -4146,9 +4161,9 @@ public:
     // sizeof(DXRScene::HitGeometryData) and the shader's HitGeometry; asserted
     // in UploadHitGeometry, where the real type is visible.
     //
-    // 9 x 4 bytes: vertexOffset, indexOffset, hasIndices, materialID, valid,
-    // fallbackColor[3], hasFallbackColor.
-    static const UINT kHitGeometryStride = 36;
+    // 10 x 4 bytes: vertexOffset, indexOffset, hasIndices, legacy material ID,
+    // bindless material ID, valid, fallbackColor[3], hasFallbackColor.
+    static const UINT kHitGeometryStride = 40;
 
     // Uploads the per-geometry hit bindings produced by the acceleration
     // rebuild. Entry N must describe the same geometry as DXRScene hit record

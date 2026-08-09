@@ -44,6 +44,11 @@ public:
         uint32_t vbIndexOffset = 0;
         uint32_t vbHasIndices = 0;
         uint32_t vbMaterialID = 0;
+        // The legacy and bindless material buffers deliberately use separate
+        // record spaces because textureIndices mean table-relative slots in
+        // one and absolute heap indices in the other.  Keep both IDs with the
+        // geometry so toggling bindless does not require rebuilding the TLAS.
+        uint32_t vbBindlessMaterialID = 0;
         bool vbMeshValid = false;
     };
     struct Instance {
@@ -91,6 +96,7 @@ public:
         uint32_t indexOffset = 0;
         uint32_t hasIndices = 0;
         uint32_t materialID = 0;
+        uint32_t bindlessMaterialID = 0;
         // 0 when this geometry has no visibility-buffer registration, which is
         // the shader's signal not to read a triangle it cannot address.
         uint32_t valid = 0;
@@ -364,6 +370,8 @@ public:
                     binding.indexOffset = geometry.vbIndexOffset;
                     binding.hasIndices = geometry.vbHasIndices;
                     binding.materialID = geometry.vbMaterialID;
+                    binding.bindlessMaterialID =
+                        geometry.vbBindlessMaterialID;
                     binding.valid = geometry.vbMeshValid ? 1u : 0u;
                     // The same material snapshot the DispatchRays hit record
                     // carries, so unbound geometry still shades with its own

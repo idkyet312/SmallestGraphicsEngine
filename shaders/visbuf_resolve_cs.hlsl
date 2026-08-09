@@ -278,6 +278,7 @@ struct HitGeometry {
     uint indexOffset;
     uint hasIndices;
     uint materialID;
+    uint bindlessMaterialID;
     uint valid;      // 0 when this geometry has no visibility-buffer mesh
     // Snapshot albedo for geometry with no VB binding -- terrain above all,
     // which owns its own buffers and never enters the visibility buffer, yet
@@ -715,14 +716,13 @@ static const float kBounceSkyDamping = 0.25;
 // the missing hit binding the gating blocker for GI and reflections.
 //
 // The shading is deliberately single-bounce and direct-only:
-//   * albedo comes from the material's base colour factor,
+//   * albedo comes from the material's base colour factor and authored map,
 //   * the geometric normal comes from the hit triangle's interpolated normals,
 //   * incident light is the sun (shadowed by a second ray) plus sky irradiance.
-// No recursion, no texture fetch. Textures need UV gradients, which do not
-// exist for a ray -- a ray has no screen-space derivative, so a mip level would
-// have to be invented. The base colour factor already carries most of the
-// low-frequency colour that bounce lighting depends on, and this signal is
-// consumed by a diffuse integrator that cannot resolve texture detail anyway.
+// A ray has no screen-space UV derivatives, so texture LOD is estimated from
+// the ray footprint at the hit and the triangle's UV density. This is less
+// exact than raster gradients but avoids mip-0 shimmer in the noisy one-ray
+// reflection signal that SVGF receives.
 //
 // `resolved` reports whether real surface data was found. When false the caller
 // keeps its existing approximation rather than substituting a wrong answer:
@@ -836,12 +836,58 @@ float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
     // old faked normal had, just less often.
     if (dot(worldNormal, rayDir) > 0.0) worldNormal = -worldNormal;
 
-    // Base colour factor only. textureIndices are deliberately not sampled:
-    // see the note above on missing UV gradients.
+    // Select the record whose texture indices match the active heap model.
+    // Both IDs are scene-stable, so toggling bindless never requires a TLAS
+    // rebuild or changes the hit-record addressing.
+#ifdef SGE_BINDLESS_MATERIALS
+    uint hitMaterialID = binding.bindlessMaterialID;
+#else
+    uint hitMaterialID = binding.materialID;
+#endif
     float3 albedo = float3(0.72, 0.70, 0.66);
-    if (binding.materialID != 0) {
-        MaterialData hitMaterial = materials[binding.materialID];
+    if (hitMaterialID != 0) {
+        MaterialData hitMaterial = materials[hitMaterialID];
         albedo = hitMaterial.baseColorFactor.rgb;
+
+        float2 uv0 = pv0.d1.zw;
+        float2 uv1 = pv1.d1.zw;
+        float2 uv2 = pv2.d1.zw;
+        float2 hitUV = uv0 * weights.x + uv1 * weights.y + uv2 * weights.z;
+
+        if (MAT_TEX_BOUND(hitMaterial.textureIndices.x)) {
+            Texture2D<float4> albedoTexture =
+                MAT_TEX(hitMaterial.textureIndices.x);
+            uint texWidth, texHeight, texLevels;
+            albedoTexture.GetDimensions(0, texWidth, texHeight, texLevels);
+
+            float3x4 hitObjectToWorld =
+                query.CommittedObjectToWorld3x4();
+            float3 wp0 = float3(
+                dot(hitObjectToWorld[0], float4(pv0.d0.xyz, 1.0)),
+                dot(hitObjectToWorld[1], float4(pv0.d0.xyz, 1.0)),
+                dot(hitObjectToWorld[2], float4(pv0.d0.xyz, 1.0)));
+            float3 wp1 = float3(
+                dot(hitObjectToWorld[0], float4(pv1.d0.xyz, 1.0)),
+                dot(hitObjectToWorld[1], float4(pv1.d0.xyz, 1.0)),
+                dot(hitObjectToWorld[2], float4(pv1.d0.xyz, 1.0)));
+            float3 wp2 = float3(
+                dot(hitObjectToWorld[0], float4(pv2.d0.xyz, 1.0)),
+                dot(hitObjectToWorld[1], float4(pv2.d0.xyz, 1.0)),
+                dot(hitObjectToWorld[2], float4(pv2.d0.xyz, 1.0)));
+            float uvPerWorld = max(
+                length(uv1 - uv0) / max(length(wp1 - wp0), 1e-4),
+                length(uv2 - uv0) / max(length(wp2 - wp0), 1e-4));
+            float worldFootprint =
+                2.0 * query.CommittedRayT() /
+                max(screenHeight * abs(projMatrix[1][1]), 1.0);
+            float textureFootprint = worldFootprint * uvPerWorld *
+                max((float)texWidth, (float)texHeight);
+            float lod = clamp(log2(max(textureFootprint, 1.0)), 0.0,
+                              max((float)texLevels - 1.0, 0.0));
+            float3 authoredAlbedo = albedoTexture.SampleLevel(
+                texSampler, hitUV, lod).rgb;
+            albedo *= pow(max(authoredAlbedo, 0.0), 2.2);
+        }
     }
 
     float3 hitPos = query.WorldRayOrigin() +
@@ -898,9 +944,9 @@ float3 ShadeRayHit(RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
 // the denoiser is supposed to resolve.
 //
 // The TLAS holds static geometry only, so this cannot reflect dynamic actors.
-// Shading the hit is out of scope for this pass -- the hit position is shaded
-// from the environment probe along the reflected direction, which is a coarse
-// but stable approximation that keeps this pass a single ray with no recursion.
+// Bound geometry is shaded from its real triangle, material factor, and albedo
+// map. Unbound geometry keeps the coarse environment fallback, preserving a
+// single ray with no recursive reflection path.
 float3 RayTracedReflection(float3 worldPos, float3 normal, float3 viewDir,
                            float roughness, uint2 pixel, out bool hit) {
     hit = false;
