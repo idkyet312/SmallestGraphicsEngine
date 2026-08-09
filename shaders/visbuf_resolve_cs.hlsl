@@ -1405,8 +1405,15 @@ Surface EvaluateSurface(float3 fragPos,
         albedo = saturate(albedo * tint * brightness);
     }
     if (MAT_TEX_BOUND(material.textureIndices.z)) {
+#ifdef SGE_BINDLESS_MATERIALS
+        Texture2D<float4> metalRoughTexture =
+            MAT_TEX(material.textureIndices.z);
+        float4 mr = metalRoughTexture.SampleGrad(
+            texSampler, texCoord, uvDx, uvDy);
+#else
         float4 mr = MAT_TEX(material.textureIndices.z).SampleGrad(
             texSampler, texCoord, uvDx, uvDy);
+#endif
         materialAO = lerp(1.0, mr.r, saturate(material.emissiveOcclusion.w));
         if (material.textureIndices.w != 0u) {
             rough = clamp(mr.g, 0.08, 1.0);
@@ -1424,8 +1431,14 @@ Surface EvaluateSurface(float3 fragPos,
     }
 
     if (MAT_TEX_BOUND(material.textureIndices.y)) {
+#ifdef SGE_BINDLESS_MATERIALS
+        Texture2D<float4> normalTexture = MAT_TEX(material.textureIndices.y);
+        float3 tangentNormal = normalTexture.SampleGrad(
+            texSampler, texCoord, uvDx, uvDy).xyz * 2.0 - 1.0;
+#else
         float3 tangentNormal = MAT_TEX(material.textureIndices.y).SampleGrad(
             texSampler, texCoord, uvDx, uvDy).xyz * 2.0 - 1.0;
+#endif
         tangentNormal.y *= material.pbrParams.z;
         float tangentLength = saturate(length(tangentNormal));
         tangentNormal.xy *= tangentLength;

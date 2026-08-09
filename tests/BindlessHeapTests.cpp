@@ -13,8 +13,10 @@ static int failures = 0;
 
 // Distinct fake resource pointers. Only their identity matters.
 static const void* FakeResource(size_t i) {
-    static std::vector<char> storage(4096);
-    return storage.data() + i;
+    // Allocator tests compare identity only and never dereference resources.
+    // Spacing the synthetic values avoids null while allowing the overflow
+    // test to cover all 57,280 persistent entries.
+    return reinterpret_cast<const void*>((i + 1u) * 16u);
 }
 
 int main() {
@@ -117,6 +119,24 @@ int main() {
         CHECK(allocator.AllocateTransient(1) != BINDLESS_INVALID_INDEX);
 
         CHECK(allocator.AllocateTransient(0) == BINDLESS_INVALID_INDEX);
+    }
+
+    {
+        BindlessDescriptorAllocator allocator;
+        bool created = false;
+        for (uint32_t i = 0; i < BINDLESS_PERSISTENT_CAPACITY; ++i) {
+            const uint32_t index = allocator.RegisterPersistent(
+                FakeResource(i), BINDLESS_FALLBACK_WHITE, &created);
+            CHECK(index == BINDLESS_PERSISTENT_BEGIN + i);
+            CHECK(created);
+        }
+        const uint32_t overflow = allocator.RegisterPersistent(
+            FakeResource(BINDLESS_PERSISTENT_CAPACITY),
+            BINDLESS_FALLBACK_NORMAL, &created);
+        CHECK(overflow == BINDLESS_FALLBACK_NORMAL);
+        CHECK(!created);
+        CHECK(allocator.PersistentCount() == BINDLESS_PERSISTENT_CAPACITY);
+        CHECK(allocator.OverflowCount() == 1);
     }
 
     // --- Generation invalidation ------------------------------------------

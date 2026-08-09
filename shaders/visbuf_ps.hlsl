@@ -24,7 +24,13 @@ uint2 main(PS_INPUT input) : SV_Target0 {
 }
 
 uint2 mainAlpha(PS_INPUT input) : SV_Target0 {
+#ifdef SGE_BINDLESS_MATERIALS
+    Texture2D<float4> bindlessAlphaTexture =
+        ResourceDescriptorHeap[NonUniformResourceIndex(vbPadding2)];
+    float4 sampleValue = bindlessAlphaTexture.Sample(alphaSampler, input.texCoord);
+#else
     float4 sampleValue = alphaTexture.Sample(alphaSampler, input.texCoord);
+#endif
     if (alphaFromLuminance != 0u)
         clip(max(sampleValue.r, max(sampleValue.g, sampleValue.b)) - 0.38);
     else

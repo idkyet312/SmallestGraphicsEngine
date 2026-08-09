@@ -134,6 +134,7 @@ public:
     void BeginTransientFrame(uint32_t frameSlot) {
         currentSlot = frameSlot % BINDLESS_TRANSIENT_SLICES;
         transientCount = 0;
+        transientPeak = 0;
     }
 
     // Allocates `count` contiguous transient descriptors in the current slice

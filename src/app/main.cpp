@@ -3198,6 +3198,8 @@ ID3D12Resource*             g_dxrDDGIIndexResource = nullptr;
 // Published for the UI: DXR Tier 1.1 (inline RayQuery) support, which gates
 // the enhanced-visuals tier. Set once the device is up.
 bool                        g_inlineRaytracingSupported = false;
+bool                        g_bindlessMaterialsReady = false;
+bool                        g_bindlessMaterialsActive = false;
 UINT                        g_dxrDDGIProbeCount = 0;
 UINT                        g_dxrDDGICellCount = 0;
 UINT                        g_dxrDDGIIndexCount = 0;
@@ -3214,6 +3216,7 @@ static WaterRendererDX12    waterRenderer;
 static MSAADX12             msaa;
 static GrassMSAADX12        grassMSAA;
 static bool                 msaaUsedLastFrame = false;
+static BindlessHeapDX12     bindlessHeap;
 static VisibilityBufferDX12 visBuffer;
 static ShadowMapDX12        shadowMap;
 static GeometryBuffers      geo;
@@ -6042,6 +6045,11 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
                           bool emptyLevel = false,
                           const LevelDefinition* customLevel = nullptr,
                           bool startWithUIAndMobileControls = false) {
+    if (bindlessHeap.Initialized()) {
+        WaitForGPUAllFrames();
+        bindlessHeap.ResetForNewScene();
+        visBuffer.ResetBindlessMaterials();
+    }
     const bool wasCornellTest = g_ddgiCornellTestMode;
     g_ddgiCornellTestMode = customLevel &&
         customLevel->name == "DXR DDGI Cornell Box";
@@ -9221,17 +9229,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // the number of BootStep() calls below; it only affects the bar's scale.
     g_boot.active = true;
     g_boot.hwnd = hwnd;
-    g_boot.stepCount = 21;
+    g_boot.stepCount = 22;
     g_boot.startedAt = std::chrono::steady_clock::now();
 
     // Geometry
     BootStep("Building geometry...");
     if (!CreateAllGeometry()) { std::cerr << "Geometry creation failed\n"; return -1; }
 
+    BootStep("Initializing bindless material heap...");
+    ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
+    ThrowIfFailed(g_dx12.commandList->Reset(
+        g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
+    const bool bindlessHeapReady = bindlessHeap.Init();
+    ThrowIfFailed(g_dx12.commandList->Close());
+    {
+        ID3D12CommandList* bindlessLists[] = { g_dx12.commandList.Get() };
+        g_dx12.commandQueue->ExecuteCommandLists(1, bindlessLists);
+    }
+    WaitForGPU();
+    DumpDX12DebugMessages();
+    std::cout << (bindlessHeapReady ? "Bindless material heap ready\n"
+                                    : "Bindless material tier unavailable\n");
+
     // Shaders - the DX12-specific pair supports albedo/normal/metal-roughness texture
     // sampling (needed for imported GLB materials); the plain "clustered_*" pair is
     // color-only and silently ignores textures, so it's only a fallback.
     BootStep("Compiling shaders...");
+    mainShader.SetBindlessHeap(&bindlessHeap);
     if (!mainShader.Load("shaders/clustered_dx12_vs.hlsl", "shaders/clustered_dx12_ps.hlsl")) {
         std::cerr << "Trying fallback shaders...\n";
         if (!mainShader.Load("shaders/clustered_vs.hlsl", "shaders/clustered_ps.hlsl")) {
@@ -9383,6 +9407,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // Init uploads the 3D colour LUT. Record and submit that work now; the
     // command list has been closed since the sky upload above.
     BootStep("Initializing visibility buffer...");
+    visBuffer.SetBindlessHeap(&bindlessHeap);
     ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
     ThrowIfFailed(g_dx12.commandList->Reset(
         g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
@@ -9402,6 +9427,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_specularEnvironmentResource, g_brdfIntegrationResource);
         std::cout << "Visibility Buffer ready\n";
     }
+    g_bindlessMaterialsReady = bindlessHeapReady && mainShader.BindlessReady() &&
+        visBuffer.BindlessResolveReady() &&
+        (!g_useMeshShader || g_meshShader.bindlessReady);
 
     BootStep("Initializing grass MSAA...");
     if (!visibilityBufferReady || !mainShader.GetHDRMSAAGrassPipelineState() ||
@@ -11135,6 +11163,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 << "BeginFrame: " << e.what() << '\n';
             std::cerr << "BeginFrame: " << e.what() << "\n"; break;
         }
+        bindlessHeap.BeginFrame(g_dx12.frameIndex);
         if (IsSceneScreen() && g_prefabRebuildRequested) {
             // Rebuilding prefab batches recreates model/GPU resources. If the
             // previous frame's command list still references the old ones, the
@@ -11295,6 +11324,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         const bool usingRaytracing = renderPath == RenderPath::Raytracing;
         const bool usingVisibility =
             renderPath == RenderPath::VisibilityBuffer;
+        visBuffer.PrepareBindlessFrame(g_dx12.frameIndex,
+            scene.bindlessMaterials && g_bindlessMaterialsReady &&
+            usingVisibility);
+        const bool bindlessMaterialsActive = scene.bindlessMaterials &&
+            g_bindlessMaterialsReady &&
+            (!usingVisibility || (visBuffer.BindlessResolveReady() &&
+                visBuffer.BindlessFrameReady(g_dx12.frameIndex)));
+        g_bindlessMaterialsActive = bindlessMaterialsActive;
+        mainShader.SetBindlessActive(bindlessMaterialsActive);
+        visBuffer.SetBindlessActive(bindlessMaterialsActive && usingVisibility);
         static bool visibilityWasActive = false;
         if (usingVisibility != visibilityWasActive) {
             visBuffer.InvalidateTemporalHistory();
@@ -11386,10 +11425,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             occlusionDepth.CanUseHistory(
                 scene.camera.Position, scene.camera.Front) &&
             !msaaUsedLastFrame;
+        D3D12_GPU_DESCRIPTOR_HANDLE bindlessOcclusionHandle = {};
+        if (g_bindlessMaterialsActive) {
+            bindlessOcclusionHandle =
+                bindlessHeap.GpuHandleAt(BINDLESS_FALLBACK_WHITE);
+            const D3D12_CPU_DESCRIPTOR_HANDLE source =
+                occlusionDepth.GetCPUHandle();
+            const UINT index = bindlessHeap.AllocateTransientTable(&source, 1);
+            if (index != BINDLESS_INVALID_INDEX)
+                bindlessOcclusionHandle = bindlessHeap.GpuHandleAt(index);
+        }
         g_meshShader.SetOcclusionDepth(
-            occlusionDepth.GetGPUHandle(),
-            hzbHistoryUsable,
-            occlusionDepth.GetMipCount());
+            occlusionDepth.GetGPUHandle(), hzbHistoryUsable,
+            occlusionDepth.GetMipCount(), bindlessOcclusionHandle);
 
         if (IsSceneScreen() && g_game.loading.Active()) {
         if (g_game.loading.Stage() == LevelLoadStage::WorldAssets) {

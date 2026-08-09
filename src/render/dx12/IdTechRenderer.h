@@ -770,7 +770,8 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         if (item.instanceKey)
             item.instanceKey ^= static_cast<uint64_t>(item.visibilityMeshID + 1u) *
                 0x9e3779b97f4a7c15ull;
-        UINT materialID = vb.RegisterMaterial(item.material.get());
+        UINT materialID =
+            vb.RegisterMaterialForCurrentPath(item.material.get());
         const UINT flags =
             (item.doubleSided ? 1u : 0u) |
             (item.alphaCutout ? 2u : 0u) |
@@ -891,6 +892,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     // complexity, while the raster scales with draw count. One combined number
     // cannot tell you which to attack.
     ProfilerDX12::Scope rasterScope(g_profiler, "VB Raster", g_dx12.commandList.Get());
+    vb.FlushBindlessTextureTransitions(g_dx12.commandList.Get());
     vb.BeginVisibilityPass(g_dx12.commandList.Get());
     g_dx12.commandList->SetGraphicsRootConstantBufferView(0, frameMatrixCBV);
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

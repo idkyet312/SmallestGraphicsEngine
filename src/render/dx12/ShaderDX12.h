@@ -3,6 +3,7 @@
 
 #include "ShaderCacheDX12.h"
 #include "DX12Core.h"
+#include "BindlessHeapDeviceDX12.h"
 #include "DXRProbeLayout.h"
 #include "MSAADX12.h"
 #include "SceneGraph.h"   // SceneMaterial: caches its descriptor slot (see SetObjectMaterial)
@@ -89,6 +90,10 @@ struct alignas(256) ObjectBufferDX12 {
     float specularScale = 1.0f;
     float materialType = 0.0f; // 0=ordinary, 1=pool water, 2=ocean
     float materialTime = 0.0f; // animated procedural materials
+    UINT bindlessTextureIndices[4] = {
+        BINDLESS_FALLBACK_WHITE, BINDLESS_FALLBACK_NORMAL,
+        BINDLESS_FALLBACK_METALROUGH, BINDLESS_FALLBACK_BLACK
+    };
 };
 
 struct PointLightDataDX12 {
@@ -253,6 +258,7 @@ static const UINT MAX_DRAW_CALLS_PER_FRAME = 16384;
 class ShaderDX12 {
 public:
     ComPtr<ID3D12RootSignature> rootSignature;
+    ComPtr<ID3D12RootSignature> bindlessRootSignature;
     ComPtr<ID3D12PipelineState> pipelineState;
     ComPtr<ID3D12PipelineState> wireframePipelineState;
     ComPtr<ID3D12PipelineState> transparentPipelineState;
@@ -279,6 +285,33 @@ public:
     ComPtr<ID3D12PipelineState> hdrMotionTransparentPipelineState;
     ComPtr<ID3D12PipelineState> hdrMotionAdditivePipelineState;
     ComPtr<ID3DBlob> pixelShaderBlob;
+    ComPtr<ID3DBlob> bindlessPixelShaderBlob;
+    ComPtr<ID3DBlob> bindlessHDRPixelShaderBlob;
+    ComPtr<ID3DBlob> bindlessMotionPixelShaderBlob;
+    ComPtr<ID3D12PipelineState> bindlessPipelineState;
+    ComPtr<ID3D12PipelineState> bindlessWireframePipelineState;
+    ComPtr<ID3D12PipelineState> bindlessTransparentPipelineState;
+    ComPtr<ID3D12PipelineState> bindlessAdditivePipelineState;
+    ComPtr<ID3D12PipelineState> bindlessHDRPipelineState;
+    ComPtr<ID3D12PipelineState> bindlessHDRWireframePipelineState;
+    ComPtr<ID3D12PipelineState> bindlessHDRTransparentPipelineState;
+    ComPtr<ID3D12PipelineState> bindlessHDRAdditivePipelineState;
+    ComPtr<ID3D12PipelineState> bindlessHDRMotionPipelineState;
+    ComPtr<ID3D12PipelineState> bindlessHDRMotionTransparentPipelineState;
+    ComPtr<ID3D12PipelineState> bindlessHDRMotionAdditivePipelineState;
+    ComPtr<ID3D12PipelineState> bindlessMSAAPipelineState;
+    ComPtr<ID3D12PipelineState> bindlessMSAAWireframePipelineState;
+    ComPtr<ID3D12PipelineState> bindlessMSAATransparentPipelineState;
+    ComPtr<ID3D12PipelineState> bindlessMSAAAdditivePipelineState;
+    bool bindlessPipelineReady = false;
+    bool bindlessRequested = false;
+    bool currentDrawBindless = false;
+    bool forceLegacyNextMaterial = false;
+    BindlessHeapDX12* bindlessHeap = nullptr;
+    UINT bindlessGlobalTableBase = BINDLESS_INVALID_INDEX;
+    enum class DrawPipelineKind { Opaque, Transparent, Additive };
+    DrawPipelineKind drawPipelineKind = DrawPipelineKind::Opaque;
+    bool drawWireframe = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
     bool hdrTargetEnabled = false;
@@ -940,6 +973,155 @@ public:
             psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         }
 
+        // Optional material-bindless twins. They deliberately reuse the exact
+        // root-parameter numbering and fixed-function state above; only the
+        // directly-indexed heap flag and SM 6.6 shaders differ.
+        bindlessPipelineReady = false;
+        if (bindlessHeap && bindlessHeap->Supported() &&
+            std::string(pixelPath).find("clustered_dx12_ps.hlsl") !=
+                std::string::npos) {
+            const std::wstring shaderDirectory =
+                ShaderCacheDX12::ExecutableDirectory() + L"shaders";
+            const std::string bindlessPS =
+                "#define SGE_BINDLESS_MATERIALS 1\n" + psCode;
+            const std::string bindlessHDRPS =
+                "#define SGE_BINDLESS_MATERIALS 1\n"
+                "#define SGE_HDR_TARGET 1\n" + psCode;
+            const std::string bindlessMotionPS =
+                "#define SGE_BINDLESS_MATERIALS 1\n"
+                "#define SGE_HDR_TARGET 1\n"
+                "#define SGE_EXTENSION_MOTION 1\n" + psCode;
+            ComPtr<ID3DBlob> bindlessVSBlob;
+            std::string errors;
+            const bool shadersReady =
+                ShaderCacheDX12::CompileCachedDXC(
+                    vsCode, L"clustered_dx12_vs.hlsl", L"main", L"vs_6_6",
+                    shaderDirectory, &bindlessVSBlob, &errors) &&
+                ShaderCacheDX12::CompileCachedDXC(
+                    bindlessPS, L"clustered_dx12_ps.hlsl", L"main", L"ps_6_6",
+                    shaderDirectory, &bindlessPixelShaderBlob, &errors) &&
+                ShaderCacheDX12::CompileCachedDXC(
+                    bindlessHDRPS, L"clustered_dx12_ps.hlsl", L"main", L"ps_6_6",
+                    shaderDirectory, &bindlessHDRPixelShaderBlob, &errors) &&
+                ShaderCacheDX12::CompileCachedDXC(
+                    bindlessMotionPS, L"clustered_dx12_ps.hlsl", L"main", L"ps_6_6",
+                    shaderDirectory, &bindlessMotionPixelShaderBlob, &errors);
+            if (!shadersReady) {
+                std::cerr << "Bindless forward shader compile failed\n"
+                          << errors << std::endl;
+            } else {
+                D3D12_ROOT_SIGNATURE_DESC bindlessRootDesc = rootSigDesc;
+                bindlessRootDesc.Flags =
+                    D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+                    D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+                ComPtr<ID3DBlob> bindlessSignature, bindlessSignatureError;
+                if (SUCCEEDED(D3D12SerializeRootSignature(
+                        &bindlessRootDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                        &bindlessSignature, &bindlessSignatureError)) &&
+                    SUCCEEDED(g_dx12.device->CreateRootSignature(
+                        0, bindlessSignature->GetBufferPointer(),
+                        bindlessSignature->GetBufferSize(),
+                        IID_PPV_ARGS(&bindlessRootSignature)))) {
+                    enum class BlendKind { Opaque, Transparent, Additive };
+                    auto createBindlessPSO = [&](ComPtr<ID3D12PipelineState>& target,
+                            ID3DBlob* ps, DXGI_FORMAT format, BlendKind blend,
+                            bool wireframe, bool motion, bool multisampled) {
+                        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = psoDesc;
+                        desc.pRootSignature = bindlessRootSignature.Get();
+                        desc.InputLayout = { inputLayout, _countof(inputLayout) };
+                        desc.VS = { bindlessVSBlob->GetBufferPointer(),
+                                    bindlessVSBlob->GetBufferSize() };
+                        desc.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+                        desc.RasterizerState.FillMode = wireframe
+                            ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
+                        desc.RasterizerState.MultisampleEnable = multisampled;
+                        desc.SampleDesc.Count = multisampled
+                            ? MSAADX12::SampleCount : 1;
+                        desc.SampleDesc.Quality = 0;
+                        desc.NumRenderTargets = motion ? 2 : 1;
+                        desc.RTVFormats[0] = format;
+                        desc.RTVFormats[1] = motion
+                            ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_UNKNOWN;
+                        desc.BlendState.RenderTarget[0].BlendEnable =
+                            blend != BlendKind::Opaque;
+                        desc.DepthStencilState.DepthWriteMask =
+                            blend == BlendKind::Opaque
+                                ? D3D12_DEPTH_WRITE_MASK_ALL
+                                : D3D12_DEPTH_WRITE_MASK_ZERO;
+                        if (blend == BlendKind::Transparent) {
+                            desc.BlendState.RenderTarget[0].SrcBlend =
+                                D3D12_BLEND_SRC_ALPHA;
+                            desc.BlendState.RenderTarget[0].DestBlend =
+                                D3D12_BLEND_INV_SRC_ALPHA;
+                            desc.BlendState.RenderTarget[0].SrcBlendAlpha =
+                                D3D12_BLEND_ONE;
+                            desc.BlendState.RenderTarget[0].DestBlendAlpha =
+                                D3D12_BLEND_INV_SRC_ALPHA;
+                        } else if (blend == BlendKind::Additive) {
+                            desc.BlendState.RenderTarget[0].SrcBlend =
+                                D3D12_BLEND_SRC_ALPHA;
+                            desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+                            desc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ZERO;
+                            desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
+                        }
+                        return SUCCEEDED(g_dx12.device->CreateGraphicsPipelineState(
+                            &desc, IID_PPV_ARGS(&target)));
+                    };
+                    bool ok = true;
+                    ok = ok && createBindlessPSO(bindlessPipelineState,
+                        bindlessPixelShaderBlob.Get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+                        BlendKind::Opaque, false, false, false);
+                    ok = ok && createBindlessPSO(bindlessWireframePipelineState,
+                        bindlessPixelShaderBlob.Get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+                        BlendKind::Opaque, true, false, false);
+                    ok = ok && createBindlessPSO(bindlessTransparentPipelineState,
+                        bindlessPixelShaderBlob.Get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+                        BlendKind::Transparent, false, false, false);
+                    ok = ok && createBindlessPSO(bindlessAdditivePipelineState,
+                        bindlessPixelShaderBlob.Get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+                        BlendKind::Additive, false, false, false);
+                    ok = ok && createBindlessPSO(bindlessHDRPipelineState,
+                        bindlessHDRPixelShaderBlob.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        BlendKind::Opaque, false, false, false);
+                    ok = ok && createBindlessPSO(bindlessHDRWireframePipelineState,
+                        bindlessHDRPixelShaderBlob.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        BlendKind::Opaque, true, false, false);
+                    ok = ok && createBindlessPSO(bindlessHDRTransparentPipelineState,
+                        bindlessHDRPixelShaderBlob.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        BlendKind::Transparent, false, false, false);
+                    ok = ok && createBindlessPSO(bindlessHDRAdditivePipelineState,
+                        bindlessHDRPixelShaderBlob.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        BlendKind::Additive, false, false, false);
+                    ok = ok && createBindlessPSO(bindlessHDRMotionPipelineState,
+                        bindlessMotionPixelShaderBlob.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        BlendKind::Opaque, false, true, false);
+                    ok = ok && createBindlessPSO(bindlessHDRMotionTransparentPipelineState,
+                        bindlessMotionPixelShaderBlob.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        BlendKind::Transparent, false, true, false);
+                    ok = ok && createBindlessPSO(bindlessHDRMotionAdditivePipelineState,
+                        bindlessMotionPixelShaderBlob.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        BlendKind::Additive, false, true, false);
+                    ok = ok && createBindlessPSO(bindlessMSAAPipelineState,
+                        bindlessPixelShaderBlob.Get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+                        BlendKind::Opaque, false, false, true);
+                    ok = ok && createBindlessPSO(bindlessMSAAWireframePipelineState,
+                        bindlessPixelShaderBlob.Get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+                        BlendKind::Opaque, true, false, true);
+                    ok = ok && createBindlessPSO(bindlessMSAATransparentPipelineState,
+                        bindlessPixelShaderBlob.Get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+                        BlendKind::Transparent, false, false, true);
+                    ok = ok && createBindlessPSO(bindlessMSAAAdditivePipelineState,
+                        bindlessPixelShaderBlob.Get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+                        BlendKind::Additive, false, false, true);
+                    bindlessPipelineReady = ok;
+                } else if (bindlessSignatureError) {
+                    std::cerr << "Bindless forward root signature failed: "
+                        << (const char*)bindlessSignatureError->GetBufferPointer()
+                        << std::endl;
+                }
+            }
+        }
+
         // Create constant buffers
         // Per-draw-call buffers need enough slots for all objects per frame
         if (!matrixBuffer.Create(FRAME_COUNT * MAX_DRAW_CALLS_PER_FRAME)) return false;
@@ -974,7 +1156,30 @@ public:
 
     void SetExtensionMotionEnabled(bool enabled) { extensionMotionEnabled = enabled; }
 
+    void SetBindlessHeap(BindlessHeapDX12* heap) { bindlessHeap = heap; }
+    void SetBindlessActive(bool enabled) { bindlessRequested = enabled; }
+    bool BindlessReady() const { return bindlessPipelineReady; }
+    bool BindlessDrawActive() const { return currentDrawBindless; }
+    void ForceLegacyNextMaterial() { forceLegacyNextMaterial = true; }
+
     ID3D12PipelineState* GetPipelineState(bool wireframe = false) const {
+        if (currentDrawBindless) {
+            if (hdrTargetEnabled) {
+                if (wireframe && bindlessHDRWireframePipelineState)
+                    return bindlessHDRWireframePipelineState.Get();
+                if (extensionMotionEnabled && bindlessHDRMotionPipelineState)
+                    return bindlessHDRMotionPipelineState.Get();
+                return bindlessHDRPipelineState.Get();
+            }
+            if (msaaEnabled) {
+                if (wireframe && bindlessMSAAWireframePipelineState)
+                    return bindlessMSAAWireframePipelineState.Get();
+                return bindlessMSAAPipelineState.Get();
+            }
+            if (wireframe && bindlessWireframePipelineState)
+                return bindlessWireframePipelineState.Get();
+            return bindlessPipelineState.Get();
+        }
         if (hdrTargetEnabled) {
             if (wireframe && hdrWireframePipelineState)
                 return hdrWireframePipelineState.Get();
@@ -993,6 +1198,16 @@ public:
     }
 
     ID3D12PipelineState* GetTransparentPipelineState() const {
+        if (currentDrawBindless) {
+            if (hdrTargetEnabled) {
+                if (extensionMotionEnabled &&
+                    bindlessHDRMotionTransparentPipelineState)
+                    return bindlessHDRMotionTransparentPipelineState.Get();
+                return bindlessHDRTransparentPipelineState.Get();
+            }
+            return msaaEnabled ? bindlessMSAATransparentPipelineState.Get()
+                               : bindlessTransparentPipelineState.Get();
+        }
         if (hdrTargetEnabled) {
             if (extensionMotionEnabled && hdrMotionTransparentPipelineState)
                 return hdrMotionTransparentPipelineState.Get();
@@ -1004,6 +1219,16 @@ public:
     }
 
     ID3D12PipelineState* GetAdditivePipelineState() const {
+        if (currentDrawBindless) {
+            if (hdrTargetEnabled) {
+                if (extensionMotionEnabled &&
+                    bindlessHDRMotionAdditivePipelineState)
+                    return bindlessHDRMotionAdditivePipelineState.Get();
+                return bindlessHDRAdditivePipelineState.Get();
+            }
+            return msaaEnabled ? bindlessMSAAAdditivePipelineState.Get()
+                               : bindlessAdditivePipelineState.Get();
+        }
         if (hdrTargetEnabled) {
             if (extensionMotionEnabled && hdrMotionAdditivePipelineState)
                 return hdrMotionAdditivePipelineState.Get();
@@ -1023,6 +1248,8 @@ public:
     
     void Use(bool wireframe = false) {
         if (!loaded) return;
+        drawPipelineKind = DrawPipelineKind::Opaque;
+        drawWireframe = wireframe;
         EnsureGraphicsRootBound();
         g_dx12.commandList->SetPipelineState(GetPipelineState(wireframe));
     }
@@ -1040,12 +1267,44 @@ public:
     void EnsureGraphicsRootBound() {
         if (graphicsRootBound) return;
         ID3D12DescriptorHeap* heaps[] = {
-            g_dx12.cbvSrvUavHeap.Get(), g_dx12.samplerHeap.Get()
+            currentDrawBindless && bindlessHeap
+                ? bindlessHeap->Heap() : g_dx12.cbvSrvUavHeap.Get(),
+            g_dx12.samplerHeap.Get()
         };
         g_dx12.commandList->SetDescriptorHeaps(2, heaps);
-        g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
+        g_dx12.commandList->SetGraphicsRootSignature(currentDrawBindless
+            ? bindlessRootSignature.Get() : rootSignature.Get());
         BindFrameConstants();
+        if (currentDrawCall < MAX_DRAW_CALLS_PER_FRAME)
+            g_dx12.commandList->SetGraphicsRootConstantBufferView(
+                0, matrixBuffer.GetGPUAddress(GetDrawCallIndex()));
+        if (currentDrawBindless && bindlessHeap) {
+            if (bindlessGlobalTableBase != BINDLESS_INVALID_INDEX)
+                g_dx12.commandList->SetGraphicsRootDescriptorTable(
+                    6, bindlessHeap->GpuHandleAt(bindlessGlobalTableBase));
+            g_dx12.commandList->SetGraphicsRootDescriptorTable(
+                7, bindlessHeap->GpuHandleAt(BINDLESS_FALLBACK_WHITE));
+        }
         graphicsRootBound = true;
+    }
+
+    void ActivateMaterialBinding(bool enableBindless) {
+        const bool desired = enableBindless && bindlessRequested &&
+            bindlessPipelineReady && bindlessHeap && bindlessHeap->Initialized() &&
+            bindlessGlobalTableBase != BINDLESS_INVALID_INDEX;
+        if (desired != currentDrawBindless) {
+            currentDrawBindless = desired;
+            graphicsRootBound = false;
+        }
+        EnsureGraphicsRootBound();
+        ID3D12PipelineState* pso = nullptr;
+        if (drawPipelineKind == DrawPipelineKind::Transparent)
+            pso = GetTransparentPipelineState();
+        else if (drawPipelineKind == DrawPipelineKind::Additive)
+            pso = GetAdditivePipelineState();
+        else
+            pso = GetPipelineState(drawWireframe);
+        if (pso) g_dx12.commandList->SetPipelineState(pso);
     }
 
     // Compute passes such as DDGI bind private descriptor heaps. Descriptor-table
@@ -1054,11 +1313,21 @@ public:
     // heaps and the global texture table before any following graphics dispatch.
     void RebindGraphicsResourceTables() {
         ID3D12DescriptorHeap* heaps[] = {
-            g_dx12.cbvSrvUavHeap.Get(), g_dx12.samplerHeap.Get()
+            currentDrawBindless && bindlessHeap
+                ? bindlessHeap->Heap() : g_dx12.cbvSrvUavHeap.Get(),
+            g_dx12.samplerHeap.Get()
         };
         g_dx12.commandList->SetDescriptorHeaps(2, heaps);
-        g_dx12.commandList->SetGraphicsRootDescriptorTable(
-            6, g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart());
+        if (currentDrawBindless && bindlessHeap &&
+            bindlessGlobalTableBase != BINDLESS_INVALID_INDEX) {
+            g_dx12.commandList->SetGraphicsRootDescriptorTable(
+                6, bindlessHeap->GpuHandleAt(bindlessGlobalTableBase));
+            g_dx12.commandList->SetGraphicsRootDescriptorTable(
+                7, bindlessHeap->GpuHandleAt(BINDLESS_FALLBACK_WHITE));
+        } else {
+            g_dx12.commandList->SetGraphicsRootDescriptorTable(
+                6, g_dx12.cbvSrvUavHeap->GetGPUDescriptorHandleForHeapStart());
+        }
     }
 
     void BindFrameConstants() {
@@ -1082,6 +1351,8 @@ public:
 
     void UseTransparent() {
         if (!loaded) return;
+        drawPipelineKind = DrawPipelineKind::Transparent;
+        drawWireframe = false;
         EnsureGraphicsRootBound();
         if (GetTransparentPipelineState())
             g_dx12.commandList->SetPipelineState(GetTransparentPipelineState());
@@ -1089,6 +1360,8 @@ public:
 
     void UseAdditive() {
         if (!loaded) return;
+        drawPipelineKind = DrawPipelineKind::Additive;
+        drawWireframe = false;
         EnsureGraphicsRootBound();
         if (GetAdditivePipelineState())
             g_dx12.commandList->SetPipelineState(GetAdditivePipelineState());
@@ -1174,6 +1447,19 @@ public:
             cpuHandle.ptr += descriptorSize;
         }
 
+        bindlessGlobalTableBase = BINDLESS_INVALID_INDEX;
+        if (bindlessRequested && bindlessHeap && bindlessHeap->Initialized()) {
+            D3D12_CPU_DESCRIPTOR_HANDLE sources[8] = {};
+            D3D12_CPU_DESCRIPTOR_HANDLE source =
+                g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
+            for (UINT i = 0; i < 8; ++i) {
+                sources[i] = source;
+                source.ptr += descriptorSize;
+            }
+            bindlessGlobalTableBase =
+                bindlessHeap->AllocateTransientTable(sources, _countof(sources));
+        }
+
         RebindGraphicsResourceTables();
     }
     
@@ -1188,6 +1474,9 @@ public:
         srvCacheHitsThisFrame = 0;
         currentDrawCall = 0;
         graphicsRootBound = false;
+        currentDrawBindless = false;
+        bindlessGlobalTableBase = BINDLESS_INVALID_INDEX;
+        forceLegacyNextMaterial = false;
         // The per-frame scratch region starts ABOVE the persistent one -- resetting
         // to 64 here would hand out slots already owned by cached materials and
         // scribble over their descriptors.
@@ -1291,6 +1580,7 @@ public:
     }
     
     void SetObjectColor(const XMFLOAT3& color) {
+        ActivateMaterialBinding(false);
         UINT bufferIndex = GetDrawCallIndex();
         
         ObjectBufferDX12 data;
@@ -1307,6 +1597,7 @@ public:
     }
 
     void SetTerrainMaterial(bool showAuthoredPaths = false) {
+        ActivateMaterialBinding(false);
         const UINT bufferIndex = GetDrawCallIndex();
         ObjectBufferDX12 data = {};
         data.objectColor = XMFLOAT3(1.0f, 1.0f, 1.0f);
@@ -1327,6 +1618,7 @@ public:
                           float ambientScale, float directLightScale,
                           float transmissionStrength, float colorVariation,
                           float normalFalloff = 1.0f) {
+        ActivateMaterialBinding(false);
         const UINT bufferIndex = GetDrawCallIndex();
         ObjectBufferDX12 data = {};
         data.objectColor = albedo;
@@ -1385,8 +1677,37 @@ public:
             data.normalTexH = (float)nd.Height;
         }
 
+        const bool allowBindless = cacheOwner && !forceLegacyNextMaterial;
+        forceLegacyNextMaterial = false;
+        if (allowBindless && bindlessRequested && bindlessPipelineReady &&
+            bindlessHeap && bindlessHeap->Initialized()) {
+            const UINT generation = bindlessHeap->Allocator().Generation();
+            if (cacheOwner->bindlessGeneration != generation) {
+                cacheOwner->InvalidateTextureBindings();
+                cacheOwner->bindlessGeneration = generation;
+                cacheOwner->bindlessAlbedoIndex = bindlessHeap->RegisterTexture(
+                    cacheOwner->baseColorTexture.Get(),
+                    BINDLESS_FALLBACK_WHITE);
+                cacheOwner->bindlessNormalIndex = bindlessHeap->RegisterTexture(
+                    cacheOwner->normalTexture.Get(),
+                    BINDLESS_FALLBACK_NORMAL);
+                cacheOwner->bindlessMetalRoughIndex =
+                    bindlessHeap->RegisterTexture(
+                        cacheOwner->metallicRoughnessTexture.Get(),
+                        BINDLESS_FALLBACK_METALROUGH);
+            }
+            data.bindlessTextureIndices[0] = cacheOwner->bindlessAlbedoIndex;
+            data.bindlessTextureIndices[1] = cacheOwner->bindlessNormalIndex;
+            data.bindlessTextureIndices[2] = cacheOwner->bindlessMetalRoughIndex;
+            data.bindlessTextureIndices[3] = BINDLESS_FALLBACK_BLACK;
+        }
+
+        ActivateMaterialBinding(allowBindless);
+
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
+
+        if (currentDrawBindless) return;
 
         // Textures
         if (useTex || useNorm) {
@@ -1475,6 +1796,7 @@ public:
     // to shape a translucent puff tinted by `color`, faded by `opacity`. Use with
     // UseTransparent(). Binds the sprite as albedo (t1) and flags smokeMode.
     void SetSmokeMaterial(const XMFLOAT3& color, float opacity, ID3D12Resource* smokeTex) {
+        ActivateMaterialBinding(false);
         UINT bufferIndex = GetDrawCallIndex();
         ObjectBufferDX12 data;
         data.objectColor = color;
@@ -1512,6 +1834,7 @@ public:
     // Unlit solid glow for tracers. smokeMode=2 selects the emissive shader path;
     // UseAdditive() controls how it is composited over the scene.
     void SetEmissiveMaterial(const XMFLOAT3& color, float opacity) {
+        ActivateMaterialBinding(false);
         UINT bufferIndex = GetDrawCallIndex();
         ObjectBufferDX12 data = {};
         data.objectColor = color;

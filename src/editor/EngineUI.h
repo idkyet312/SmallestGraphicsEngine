@@ -32,6 +32,8 @@ extern UINT g_destructionCulledThisFrame;
 // enhanced-visuals tier requires. Published from main so the UI does not need
 // the renderer object.
 extern bool g_inlineRaytracingSupported;
+extern bool g_bindlessMaterialsReady;
+extern bool g_bindlessMaterialsActive;
 extern UINT g_dxrDDGIProbeCount;
 extern UINT g_dxrDDGICellCount;
 extern float g_dxrDDGICellSize;
@@ -955,6 +957,42 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::Checkbox("VB/Forward Parity Mode", &vb.validationMode);
             if (vb.validationMode)
                 ImGui::TextDisabled("  MSAA / fog / FXAA / TAA / bloom disabled");
+            if (vb.bindlessHeap && vb.bindlessHeap->Supported() &&
+                g_bindlessMaterialsReady) {
+                ImGui::Checkbox("Bindless Materials (SM 6.6)",
+                                &scene.bindlessMaterials);
+                ImGui::SameLine();
+                ImGui::TextDisabled(g_bindlessMaterialsActive
+                    ? "(active)" : "(opt-in; inactive on this path)");
+                const BindlessDescriptorAllocator& allocator =
+                    vb.bindlessHeap->Allocator();
+                ImGui::Text("  Persistent: %u/%u  Transient peak: %u/%u",
+                    allocator.PersistentCount(), allocator.PersistentCapacity(),
+                    allocator.TransientPeak(), allocator.TransientCapacity());
+                ImGui::Text("  Cache hits: %llu  Creates: %llu  Overflows: %llu",
+                    static_cast<unsigned long long>(allocator.CacheHits()),
+                    static_cast<unsigned long long>(allocator.DescriptorCreations()),
+                    static_cast<unsigned long long>(allocator.OverflowCount()));
+                ImGui::Text("  VB bindless materials: %u/%u",
+                    vb.BindlessMaterialCount(), VB_MAX_MATERIALS);
+                if (scene.bindlessMaterials && vb.RejectedTextureCount() > 0) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.35f, 1.0f),
+                        "  Legacy dropped %u maps; bindless now shows authored PBR",
+                        vb.RejectedTextureCount());
+                }
+                if (vb.BindlessTransientOverflowed())
+                    ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                        "  Current frame transient descriptor overflow");
+            } else {
+                scene.bindlessMaterials = false;
+                std::string reason = vb.bindlessHeap
+                    ? vb.bindlessHeap->Caps().Reason()
+                    : "bindless heap was not initialized";
+                if (vb.bindlessHeap && vb.bindlessHeap->Supported())
+                    reason = "one or more SM 6.6 material PSOs failed";
+                ImGui::TextDisabled("Bindless Materials: unavailable (%s)",
+                                    reason.c_str());
+            }
             if (scene.useVisibilityBuffer) {
                 ImGui::Text("  Pass 1: Visibility rasterise");
                 ImGui::Text("  Pass 2: G-Buffer fill (compute)");

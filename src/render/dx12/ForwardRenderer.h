@@ -590,6 +590,8 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
         if (visibilityExtensionsOnly && visibilityOwned) continue;
         if (prim.material) {
             if (transparent) shader.UseTransparent(); else shader.Use(false);
+            if (pipelineOverride && !transparent)
+                shader.ForceLegacyNextMaterial();
             XMFLOAT3 color(prim.material->baseColorFactor.x,
                            prim.material->baseColorFactor.y,
                            prim.material->baseColorFactor.z);
@@ -788,6 +790,7 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
             const bool skinned = bonePalette && skinAddress;
 
             if (meshShaderDraw) {
+                g_meshShader.SetBindlessActive(shader.BindlessDrawActive());
                 g_meshShader.Draw(prim.vbv,
                     (UINT)(prim.vertices.size() / 12), prim.indexCount,
                     prim.meshletCount, meshletDescAddress, boundsAddress,
@@ -951,6 +954,7 @@ inline void DrawSceneNodeInstances(const std::shared_ptr<SceneNode>& node,
                     0.0f, 0.5f, nullptr, nullptr, nullptr);
             }
 
+            g_meshShader.SetBindlessActive(shader.BindlessDrawActive());
             g_meshShader.DrawInstanced(prim.vbv,
                 static_cast<UINT>(prim.vertices.size() / 12), prim.indexCount,
                 prim.meshletCount,

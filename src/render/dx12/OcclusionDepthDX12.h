@@ -75,6 +75,13 @@ public:
         return gpu;
     }
 
+    D3D12_CPU_DESCRIPTOR_HANDLE GetCPUHandle() const {
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+            g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += (SIZE_T)DescriptorSlot * g_dx12.cbvSrvUavDescriptorSize;
+        return cpu;
+    }
+
     UINT GetMipCount() const { return mipCount; }
 
     void InvalidateCameraHistory() { cameraHistoryValid = false; }

@@ -44,6 +44,17 @@ public:
     // Extension-motion PSOs: 2 RTVs (HDR colour + R16G16_FLOAT motion).
     ComPtr<ID3D12PipelineState> psoHDRMotion;
     ComPtr<ID3D12PipelineState> psoDoubleSidedHDRMotion;
+    ComPtr<ID3D12PipelineState> psoBindless;
+    ComPtr<ID3D12PipelineState> psoBindlessDoubleSided;
+    ComPtr<ID3D12PipelineState> psoBindlessWireframe;
+    ComPtr<ID3D12PipelineState> psoBindlessMSAA;
+    ComPtr<ID3D12PipelineState> psoBindlessDoubleSidedMSAA;
+    ComPtr<ID3D12PipelineState> psoBindlessWireframeMSAA;
+    ComPtr<ID3D12PipelineState> psoBindlessHDR;
+    ComPtr<ID3D12PipelineState> psoBindlessDoubleSidedHDR;
+    ComPtr<ID3D12PipelineState> psoBindlessWireframeHDR;
+    ComPtr<ID3D12PipelineState> psoBindlessHDRMotion;
+    ComPtr<ID3D12PipelineState> psoBindlessDoubleSidedHDRMotion;
     ComPtr<ID3D12GraphicsCommandList6> commandList6;
     bool supported = false;
     bool msaaSupported = false;
@@ -51,9 +62,12 @@ public:
     bool wireframe = false; // Z key: draw meshlets as wireframe
     bool hdrTargetEnabled = false;
     bool extensionMotionEnabled = false;
+    bool bindlessReady = false;
+    bool bindlessActive = false;
     bool occlusionEnabled = false;
     UINT occlusionMipCount = 1;
     D3D12_GPU_DESCRIPTOR_HANDLE occlusionDepthHandle = {};
+    D3D12_GPU_DESCRIPTOR_HANDLE bindlessOcclusionDepthHandle = {};
     UINT dispatchesThisFrame = 0;
     UINT meshletsThisFrame = 0;
     UINT batchesThisFrame = 0;
@@ -73,8 +87,10 @@ public:
     }
 
     void SetOcclusionDepth(D3D12_GPU_DESCRIPTOR_HANDLE handle, bool enabled,
-                           UINT mipCount = 1) {
+                           UINT mipCount = 1,
+                           D3D12_GPU_DESCRIPTOR_HANDLE bindlessHandle = {}) {
         occlusionDepthHandle = handle;
+        bindlessOcclusionDepthHandle = bindlessHandle;
         occlusionEnabled = enabled;
         occlusionMipCount = (std::max)(1u, mipCount);
     }
@@ -258,6 +274,66 @@ public:
             stream.raster.value.CullMode = D3D12_CULL_MODE_BACK;
         }
 
+        if (shader.bindlessRootSignature && shader.bindlessPixelShaderBlob &&
+            shader.bindlessHDRPixelShaderBlob &&
+            shader.bindlessMotionPixelShaderBlob) {
+            stream.root.value = shader.bindlessRootSignature.Get();
+            auto createBindless = [&](ComPtr<ID3D12PipelineState>& target,
+                    ID3DBlob* pixel, DXGI_FORMAT format, bool doubleSided,
+                    bool wire, bool multisampled, bool motion) {
+                stream.ps.value = {
+                    pixel->GetBufferPointer(), pixel->GetBufferSize() };
+                stream.raster.value.CullMode = doubleSided
+                    ? D3D12_CULL_MODE_NONE : D3D12_CULL_MODE_BACK;
+                stream.raster.value.FillMode = wire
+                    ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
+                stream.raster.value.MultisampleEnable = multisampled;
+                stream.sample.value.Count = multisampled
+                    ? MSAADX12::SampleCount : 1;
+                stream.rt.value.NumRenderTargets = motion ? 2 : 1;
+                stream.rt.value.RTFormats[0] = format;
+                stream.rt.value.RTFormats[1] = motion
+                    ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_UNKNOWN;
+                return SUCCEEDED(device2->CreatePipelineState(
+                    &streamDesc, IID_PPV_ARGS(&target)));
+            };
+            bool ok = true;
+            ok = ok && createBindless(psoBindless,
+                shader.bindlessPixelShaderBlob.Get(),
+                DXGI_FORMAT_R8G8B8A8_UNORM, false, false, false, false);
+            ok = ok && createBindless(psoBindlessDoubleSided,
+                shader.bindlessPixelShaderBlob.Get(),
+                DXGI_FORMAT_R8G8B8A8_UNORM, true, false, false, false);
+            ok = ok && createBindless(psoBindlessWireframe,
+                shader.bindlessPixelShaderBlob.Get(),
+                DXGI_FORMAT_R8G8B8A8_UNORM, false, true, false, false);
+            ok = ok && createBindless(psoBindlessHDR,
+                shader.bindlessHDRPixelShaderBlob.Get(),
+                DXGI_FORMAT_R16G16B16A16_FLOAT, false, false, false, false);
+            ok = ok && createBindless(psoBindlessDoubleSidedHDR,
+                shader.bindlessHDRPixelShaderBlob.Get(),
+                DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, false, false);
+            ok = ok && createBindless(psoBindlessWireframeHDR,
+                shader.bindlessHDRPixelShaderBlob.Get(),
+                DXGI_FORMAT_R16G16B16A16_FLOAT, false, true, false, false);
+            ok = ok && createBindless(psoBindlessMSAA,
+                shader.bindlessPixelShaderBlob.Get(),
+                DXGI_FORMAT_R8G8B8A8_UNORM, false, false, true, false);
+            ok = ok && createBindless(psoBindlessDoubleSidedMSAA,
+                shader.bindlessPixelShaderBlob.Get(),
+                DXGI_FORMAT_R8G8B8A8_UNORM, true, false, true, false);
+            ok = ok && createBindless(psoBindlessWireframeMSAA,
+                shader.bindlessPixelShaderBlob.Get(),
+                DXGI_FORMAT_R8G8B8A8_UNORM, false, true, true, false);
+            ok = ok && createBindless(psoBindlessHDRMotion,
+                shader.bindlessMotionPixelShaderBlob.Get(),
+                DXGI_FORMAT_R16G16B16A16_FLOAT, false, false, false, true);
+            ok = ok && createBindless(psoBindlessDoubleSidedHDRMotion,
+                shader.bindlessMotionPixelShaderBlob.Get(),
+                DXGI_FORMAT_R16G16B16A16_FLOAT, true, false, false, true);
+            bindlessReady = ok;
+        }
+
         if (!instanceBuffer.Create(FRAME_COUNT * MaxInstancesPerFrame)) {
             std::cerr << "Mesh instance upload buffer creation failed\n";
             return false;
@@ -274,6 +350,9 @@ public:
     void SetHDRTargetEnabled(bool enabled) { hdrTargetEnabled = enabled; }
 
     void SetExtensionMotionEnabled(bool enabled) { extensionMotionEnabled = enabled; }
+    void SetBindlessActive(bool enabled) {
+        bindlessActive = enabled && bindlessReady;
+    }
 
     void Draw(const D3D12_VERTEX_BUFFER_VIEW& vbv,
               UINT vertexCount, UINT indexCount, UINT totalMeshlets,
@@ -291,7 +370,19 @@ public:
               D3D12_GPU_VIRTUAL_ADDRESS previousBonePaletteAddress = 0) {
         if (!CanDraw(totalMeshlets, meshletDescAddress, meshletBoundsAddress,
                      meshletVertexIndexAddress, meshletTriangleAddress)) return;
-        ID3D12PipelineState* solid = hdrTargetEnabled
+        ID3D12PipelineState* solid = bindlessActive
+            ? (hdrTargetEnabled
+                ? (extensionMotionEnabled && psoBindlessHDRMotion
+                    ? (doubleSided ? psoBindlessDoubleSidedHDRMotion.Get()
+                                   : psoBindlessHDRMotion.Get())
+                    : (doubleSided ? psoBindlessDoubleSidedHDR.Get()
+                                   : psoBindlessHDR.Get()))
+                : (doubleSided
+                    ? (msaaEnabled ? psoBindlessDoubleSidedMSAA.Get()
+                                   : psoBindlessDoubleSided.Get())
+                    : (msaaEnabled ? psoBindlessMSAA.Get()
+                                   : psoBindless.Get())))
+            : (hdrTargetEnabled
             ? (extensionMotionEnabled && psoHDRMotion
                 ? (doubleSided
                     ? (psoDoubleSidedHDRMotion ? psoDoubleSidedHDRMotion.Get() : psoDoubleSidedHDR.Get())
@@ -299,10 +390,13 @@ public:
                 : (doubleSided ? psoDoubleSidedHDR.Get() : psoHDR.Get()))
             : (doubleSided
                 ? (msaaEnabled ? psoDoubleSidedMSAA.Get() : psoDoubleSided.Get())
-                : (msaaEnabled ? psoMSAA.Get() : pso.Get()));
-        ID3D12PipelineState* wire = hdrTargetEnabled
-            ? psoWireframeHDR.Get()
-            : (msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get());
+                : (msaaEnabled ? psoMSAA.Get() : pso.Get())));
+        ID3D12PipelineState* wire = bindlessActive
+            ? (hdrTargetEnabled ? psoBindlessWireframeHDR.Get()
+                : (msaaEnabled ? psoBindlessWireframeMSAA.Get()
+                               : psoBindlessWireframe.Get()))
+            : (hdrTargetEnabled ? psoWireframeHDR.Get()
+                : (msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get()));
         commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
         commandList6->SetGraphicsRootShaderResourceView(9, vbv.BufferLocation);
         commandList6->SetGraphicsRootShaderResourceView(10, meshletDescAddress);
@@ -315,8 +409,11 @@ public:
         commandList6->SetGraphicsRootShaderResourceView(18,
             instanceBuffer.GetGPUAddress(
                 g_dx12.frameIndex * MaxInstancesPerFrame));
-        if (occlusionDepthHandle.ptr) {
-            commandList6->SetGraphicsRootDescriptorTable(12, occlusionDepthHandle);
+        const D3D12_GPU_DESCRIPTOR_HANDLE activeOcclusionHandle =
+            bindlessActive && bindlessOcclusionDepthHandle.ptr
+                ? bindlessOcclusionDepthHandle : occlusionDepthHandle;
+        if (activeOcclusionHandle.ptr) {
+            commandList6->SetGraphicsRootDescriptorTable(12, activeOcclusionHandle);
         }
         // 2 selects the skinned-and-unculled path in mesh_as.hlsl; the mesh
         // shader treats any non-zero value as "skin this".
@@ -380,14 +477,26 @@ public:
             ++currentInstance;
         }
 
-        ID3D12PipelineState* solid = hdrTargetEnabled
+        ID3D12PipelineState* solid = bindlessActive
+            ? (hdrTargetEnabled
+                ? (doubleSided ? psoBindlessDoubleSidedHDR.Get()
+                               : psoBindlessHDR.Get())
+                : (doubleSided
+                    ? (msaaEnabled ? psoBindlessDoubleSidedMSAA.Get()
+                                   : psoBindlessDoubleSided.Get())
+                    : (msaaEnabled ? psoBindlessMSAA.Get()
+                                   : psoBindless.Get())))
+            : (hdrTargetEnabled
             ? (doubleSided ? psoDoubleSidedHDR.Get() : psoHDR.Get())
             : (doubleSided
                 ? (msaaEnabled ? psoDoubleSidedMSAA.Get() : psoDoubleSided.Get())
-                : (msaaEnabled ? psoMSAA.Get() : pso.Get()));
-        ID3D12PipelineState* wire = hdrTargetEnabled
-            ? psoWireframeHDR.Get()
-            : (msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get());
+                : (msaaEnabled ? psoMSAA.Get() : pso.Get())));
+        ID3D12PipelineState* wire = bindlessActive
+            ? (hdrTargetEnabled ? psoBindlessWireframeHDR.Get()
+                : (msaaEnabled ? psoBindlessWireframeMSAA.Get()
+                               : psoBindlessWireframe.Get()))
+            : (hdrTargetEnabled ? psoWireframeHDR.Get()
+                : (msaaEnabled ? psoWireframeMSAA.Get() : psoWireframe.Get()));
         commandList6->SetPipelineState((wireframe && wire) ? wire : solid);
         commandList6->SetGraphicsRootShaderResourceView(9, vbv.BufferLocation);
         commandList6->SetGraphicsRootShaderResourceView(10, meshletDescAddress);
@@ -396,8 +505,11 @@ public:
         commandList6->SetGraphicsRootShaderResourceView(14, meshletTriangleAddress);
         commandList6->SetGraphicsRootShaderResourceView(
             18, instanceBuffer.GetGPUAddress(frameBase + instanceBase));
-        if (occlusionDepthHandle.ptr)
-            commandList6->SetGraphicsRootDescriptorTable(12, occlusionDepthHandle);
+        const D3D12_GPU_DESCRIPTOR_HANDLE activeOcclusionHandle =
+            bindlessActive && bindlessOcclusionDepthHandle.ptr
+                ? bindlessOcclusionDepthHandle : occlusionDepthHandle;
+        if (activeOcclusionHandle.ptr)
+            commandList6->SetGraphicsRootDescriptorTable(12, activeOcclusionHandle);
 
         const UINT instanceCount = static_cast<UINT>(models.size());
         const UINT totalWorkItems = totalMeshlets * instanceCount;

@@ -204,6 +204,12 @@ public:
     ComPtr<ID3D12PipelineState> visPassDoubleSidedPSO;
     ComPtr<ID3D12PipelineState> visPassAlphaPSO;
     ComPtr<ID3D12PipelineState> visPassAlphaDoubleSidedPSO;
+    ComPtr<ID3D12RootSignature> bindlessVisPassRootSig;
+    ComPtr<ID3D12PipelineState> bindlessVisPassPSO;
+    ComPtr<ID3D12PipelineState> bindlessVisPassDoubleSidedPSO;
+    ComPtr<ID3D12PipelineState> bindlessVisPassAlphaPSO;
+    ComPtr<ID3D12PipelineState> bindlessVisPassAlphaDoubleSidedPSO;
+    bool bindlessVisPassReady = false;
 
     // Compute resolve PSO + root signature
     ComPtr<ID3D12RootSignature> resolveRootSig;
@@ -215,6 +221,23 @@ public:
     // enhanced tier cannot be enabled.
     ComPtr<ID3D12RootSignature> enhancedResolveRootSig;
     ComPtr<ID3D12PipelineState> enhancedResolvePSO;
+
+    // Bindless resolve variants: the same two shaders again with
+    // SGE_BINDLESS_MATERIALS, at cs_6_6 (ResourceDescriptorHeap needs 6.6).
+    // Their root signatures carry CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED and keep
+    // every existing root parameter number, so only the material texture access
+    // differs. Null when DXC, SM 6.6 or Tier 3 is missing -- which is exactly
+    // the condition that keeps the bindless toggle unavailable.
+    ComPtr<ID3D12RootSignature> bindlessResolveRootSig;
+    ComPtr<ID3D12PipelineState> bindlessResolvePSO;
+    ComPtr<ID3D12RootSignature> bindlessEnhancedResolveRootSig;
+    ComPtr<ID3D12PipelineState> bindlessEnhancedResolvePSO;
+    bool bindlessResolveReady = false;
+    bool bindlessEnhancedResolveReady = false;
+    // Not owned. Supplied by the renderer before Init so the resolve pipelines
+    // can be gated on real adapter support rather than built and then found
+    // unusable.
+    BindlessHeapDX12* bindlessHeap = nullptr;
     // Per-pixel record of which pixels were routed to RT (u3), plus the
     // readback used to report the ray fraction to the UI.
     ComPtr<ID3D12Resource> rayMaskTexture;
@@ -418,6 +441,10 @@ public:
     // material registered while bindless is off does not poison the bindless
     // table, and vice versa.
     bool bindlessActive = false;
+    bool bindlessTransientOverflowLastFrame = false;
+    UINT bindlessResolveTableBases[FRAME_COUNT] = {
+        BINDLESS_INVALID_INDEX, BINDLESS_INVALID_INDEX
+    };
 
     UINT currentDrawCall = 0;
     UINT previousDrawCount = 0;
@@ -575,6 +602,8 @@ public:
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             g_dx12.commandList->ResourceBarrier(1, &barrier);
+            if (bindlessHeap)
+                bindlessHeap->MarkTextureComputeReadable(texture);
             UINT descriptorSize = g_dx12.cbvSrvUavDescriptorSize;
             D3D12_CPU_DESCRIPTOR_HANDLE handle =
                 computeDescHeap->GetCPUDescriptorHandleForHeapStart();
@@ -627,20 +656,31 @@ public:
         if (material->bindlessGeneration != generation) {
             material->InvalidateTextureBindings();
             material->bindlessGeneration = generation;
+            const auto needsComputeTransition = [this](ID3D12Resource* texture) {
+                return texture && materialTextureLookup.find(texture) ==
+                    materialTextureLookup.end();
+            };
             material->bindlessAlbedoIndex =
                 heap.RegisterTexture(material->baseColorTexture.Get(),
-                                     BINDLESS_FALLBACK_WHITE);
+                    BINDLESS_FALLBACK_WHITE,
+                    needsComputeTransition(material->baseColorTexture.Get()));
             material->bindlessNormalIndex =
                 heap.RegisterTexture(material->normalTexture.Get(),
-                                     BINDLESS_FALLBACK_NORMAL);
+                    BINDLESS_FALLBACK_NORMAL,
+                    needsComputeTransition(material->normalTexture.Get()));
             material->bindlessMetalRoughIndex =
                 heap.RegisterTexture(material->metallicRoughnessTexture.Get(),
-                                     BINDLESS_FALLBACK_METALROUGH);
+                    BINDLESS_FALLBACK_METALROUGH,
+                    needsComputeTransition(
+                        material->metallicRoughnessTexture.Get()));
         }
 
         auto found = bindlessMaterialLookup.find(material);
         if (found != bindlessMaterialLookup.end()) {
-            VBMaterialData& record = mappedBindlessMaterials[found->second];
+            const UINT recordIndex =
+                (g_dx12.frameIndex % FRAME_COUNT) * VB_MAX_MATERIALS +
+                found->second;
+            VBMaterialData& record = mappedBindlessMaterials[recordIndex];
             updateParameters(record);
             // Live-tunable material edits can swap a texture mid-session, so
             // refresh the indices too rather than trusting the first write.
@@ -660,22 +700,63 @@ public:
         data.textureIndices[3] = material->roughnessOnlyTexture ? 1u : 0u;
 
         const UINT id = bindlessMaterialCount++;
-        mappedBindlessMaterials[id] = data;
+        const UINT recordIndex =
+            (g_dx12.frameIndex % FRAME_COUNT) * VB_MAX_MATERIALS + id;
+        mappedBindlessMaterials[recordIndex] = data;
         bindlessMaterialLookup.emplace(material, id);
         return id;
     }
 
+    UINT RegisterMaterialForCurrentPath(SceneMaterial* material) {
+        if (bindlessActive && bindlessHeap && BindlessResolveReady())
+            return RegisterMaterialBindless(material, *bindlessHeap);
+        return RegisterMaterial(material);
+    }
+
+    void SetBindlessHeap(BindlessHeapDX12* heap) { bindlessHeap = heap; }
     void SetBindlessActive(bool active) { bindlessActive = active; }
     bool BindlessActive() const { return bindlessActive; }
+    bool BindlessResolveReady() const {
+        return bindlessResolveReady && bindlessVisPassReady;
+    }
+    bool BindlessEnhancedResolveReady() const {
+        return bindlessEnhancedResolveReady;
+    }
     UINT BindlessMaterialCount() const { return bindlessMaterialCount; }
+    bool BindlessTransientOverflowed() const {
+        return bindlessTransientOverflowLastFrame;
+    }
+    bool PrepareBindlessFrame(UINT frameSlot, bool enabled) {
+        const UINT slot = frameSlot % FRAME_COUNT;
+        bindlessResolveTableBases[slot] = BINDLESS_INVALID_INDEX;
+        bindlessTransientOverflowLastFrame = false;
+        if (!enabled || !bindlessHeap || !bindlessHeap->Initialized())
+            return false;
+        bindlessResolveTableBases[slot] =
+            bindlessHeap->Allocator().AllocateTransient(99u);
+        bindlessTransientOverflowLastFrame =
+            bindlessResolveTableBases[slot] == BINDLESS_INVALID_INDEX;
+        return !bindlessTransientOverflowLastFrame;
+    }
+    bool BindlessFrameReady(UINT frameSlot) const {
+        return bindlessResolveTableBases[frameSlot % FRAME_COUNT] !=
+            BINDLESS_INVALID_INDEX;
+    }
+    void FlushBindlessTextureTransitions(ID3D12GraphicsCommandList* cmdList) {
+        if (bindlessActive && bindlessHeap)
+            bindlessHeap->FlushTextureTransitions(cmdList);
+    }
 
     // Drops bindless material records so they re-register against the new
     // allocator generation. Called at scene teardown, after the GPU is idle.
     void ResetBindlessMaterials() {
         bindlessMaterialLookup.clear();
         bindlessMaterialCount = 1;
-        if (mappedBindlessMaterials)
-            mappedBindlessMaterials[0] = VBMaterialData{};
+        if (mappedBindlessMaterials) {
+            for (UINT frame = 0; frame < FRAME_COUNT; ++frame)
+                mappedBindlessMaterials[frame * VB_MAX_MATERIALS] =
+                    VBMaterialData{};
+        }
     }
 
     // Upload-once mesh registration. Instances reference this immutable geometry
@@ -1009,25 +1090,50 @@ public:
         cmdList->RSSetScissorRects(1, &g_dx12.scissorRect);
 
         // Set pipeline
-        ID3D12DescriptorHeap* heaps[] = { computeDescHeap.Get() };
+        const bool useBindless = bindlessActive && BindlessResolveReady() &&
+            bindlessHeap && bindlessHeap->Initialized();
+        ID3D12DescriptorHeap* heaps[] = {
+            useBindless ? bindlessHeap->Heap() : computeDescHeap.Get()
+        };
         cmdList->SetDescriptorHeaps(1, heaps);
-        cmdList->SetGraphicsRootSignature(visPassRootSig.Get());
+        cmdList->SetGraphicsRootSignature(useBindless
+            ? bindlessVisPassRootSig.Get() : visPassRootSig.Get());
         cmdList->SetGraphicsRootShaderResourceView(3,
             drawCallBuffer->GetGPUVirtualAddress());
-        D3D12_GPU_DESCRIPTOR_HANDLE defaultTexture =
-            computeDescHeap->GetGPUDescriptorHandleForHeapStart();
-        defaultTexture.ptr += static_cast<UINT64>(
-            g_dx12.cbvSrvUavDescriptorSize) * 8u;
+        D3D12_GPU_DESCRIPTOR_HANDLE defaultTexture = useBindless
+            ? bindlessHeap->GpuHandleAt(BINDLESS_FALLBACK_WHITE)
+            : computeDescHeap->GetGPUDescriptorHandleForHeapStart();
+        if (!useBindless)
+            defaultTexture.ptr += static_cast<UINT64>(
+                g_dx12.cbvSrvUavDescriptorSize) * 8u;
         cmdList->SetGraphicsRootDescriptorTable(2, defaultTexture);
-        cmdList->SetPipelineState(visPassPSO.Get());
+        cmdList->SetPipelineState(useBindless
+            ? bindlessVisPassPSO.Get() : visPassPSO.Get());
     }
 
     void SetVisPassDraw(ID3D12GraphicsCommandList* cmdList, UINT drawCallID,
                         UINT materialID, bool doubleSided, bool alphaCutout,
                         bool alphaFromLuminance) {
+        const bool useBindless = bindlessActive && BindlessResolveReady() &&
+            bindlessHeap && bindlessHeap->Initialized();
+        UINT albedoIndex = BINDLESS_FALLBACK_WHITE;
+        if (useBindless && materialID < bindlessMaterialCount) {
+            const UINT recordIndex =
+                (g_dx12.frameIndex % FRAME_COUNT) * VB_MAX_MATERIALS + materialID;
+            albedoIndex = mappedBindlessMaterials[recordIndex].textureIndices[0];
+        }
         const UINT constants[4] = { drawCallID, alphaCutout ? 1u : 0u,
-            alphaFromLuminance ? 1u : 0u, 0u };
+            alphaFromLuminance ? 1u : 0u, albedoIndex };
         cmdList->SetGraphicsRoot32BitConstants(1, 4, constants, 0);
+
+        if (useBindless) {
+            cmdList->SetPipelineState(alphaCutout
+                ? (doubleSided ? bindlessVisPassAlphaDoubleSidedPSO.Get()
+                               : bindlessVisPassAlphaPSO.Get())
+                : (doubleSided ? bindlessVisPassDoubleSidedPSO.Get()
+                               : bindlessVisPassPSO.Get()));
+            return;
+        }
 
         UINT textureIndex = 0;
         if (materialID < materialCount &&
@@ -1175,13 +1281,16 @@ public:
         const bool useEnhanced = enhancedVisualsActive && enhancedPipelineReady &&
                                  enhancedResolvePSO && enhancedDescHeap;
         enhancedResolveExecutedLastFrame = useEnhanced;
+
+        // Four selections: legacy lit, legacy enhanced, bindless lit, bindless
+        // enhanced. Bindless requires the material table to have been populated
+        // through the bindless path this frame, so the flag is the renderer's
+        // per-frame decision rather than the raw scene toggle.
+        bool useBindless = bindlessActive && BindlessResolveReady() &&
+                           (!useEnhanced || BindlessEnhancedResolveReady()) &&
+                           bindlessHeap && bindlessHeap->Initialized();
         if (useEnhanced) {
             UpdateEnhancedConstants(frameSlot);
-            cmdList->SetComputeRootSignature(enhancedResolveRootSig.Get());
-            cmdList->SetPipelineState(enhancedResolvePSO.Get());
-        } else {
-            cmdList->SetComputeRootSignature(resolveRootSig.Get());
-            cmdList->SetPipelineState(resolvePSO.Get());
         }
 
         // Debug views inspect the latest completed history without advancing
@@ -1220,10 +1329,39 @@ public:
             cmdList->ResourceBarrier(2, svgfBarriers);
         }
 
-        // Set descriptor heap
-        ID3D12DescriptorHeap* heaps[] = {
-            useEnhanced ? enhancedDescHeap : computeDescHeap.Get() };
+        UINT bindlessTableBase = BINDLESS_INVALID_INDEX;
+        if (useBindless) {
+            bindlessTableBase = BuildBindlessResolveTable(
+                useEnhanced ? enhancedDescHeap : computeDescHeap.Get(),
+                useEnhanced ? 99u : 86u, frameSlot);
+            if (bindlessTableBase == BINDLESS_INVALID_INDEX) {
+                bindlessTransientOverflowLastFrame = true;
+            } else {
+                bindlessTransientOverflowLastFrame = false;
+            }
+        } else {
+            bindlessTransientOverflowLastFrame = false;
+        }
+
+        ID3D12RootSignature* selectedRoot = useBindless
+            ? (useEnhanced ? bindlessEnhancedResolveRootSig.Get()
+                           : bindlessResolveRootSig.Get())
+            : (useEnhanced ? enhancedResolveRootSig.Get()
+                           : resolveRootSig.Get());
+        ID3D12PipelineState* selectedPSO = useBindless
+            ? (useEnhanced ? bindlessEnhancedResolvePSO.Get()
+                           : bindlessResolvePSO.Get())
+            : (useEnhanced ? enhancedResolvePSO.Get() : resolvePSO.Get());
+
+        // SM 6.6 directly-indexed root signatures require the heap to be set
+        // first so the driver captures the correct heap base in the signature.
+        ID3D12DescriptorHeap* selectedHeap = useBindless
+            ? bindlessHeap->Heap()
+            : (useEnhanced ? enhancedDescHeap : computeDescHeap.Get());
+        ID3D12DescriptorHeap* heaps[] = { selectedHeap };
         cmdList->SetDescriptorHeaps(1, heaps);
+        cmdList->SetComputeRootSignature(selectedRoot);
+        cmdList->SetPipelineState(selectedPSO);
 
         // Bind root parameters
         // b0 - frame constants
@@ -1237,9 +1375,11 @@ public:
 
         // Descriptor table at root param 1 (SRVs + UAV)
         cmdList->SetComputeRootDescriptorTable(1,
-            useEnhanced
-                ? enhancedDescHeap->GetGPUDescriptorHandleForHeapStart()
-                : computeDescHeap->GetGPUDescriptorHandleForHeapStart());
+            useBindless
+                ? bindlessHeap->GpuHandleAt(bindlessTableBase)
+                : (useEnhanced
+                    ? enhancedDescHeap->GetGPUDescriptorHandleForHeapStart()
+                    : computeDescHeap->GetGPUDescriptorHandleForHeapStart()));
 
         // Dispatch (GPU-driven via ExecuteIndirect)
         UINT groupsX = (width + 7) / 8;
@@ -2132,6 +2272,39 @@ public:
     }
 
 private:
+    UINT BuildBindlessResolveTable(ID3D12DescriptorHeap* sourceHeap,
+                                   UINT descriptorCount, UINT frameSlot) {
+        if (!bindlessHeap || !bindlessHeap->Initialized() || !sourceHeap ||
+            descriptorCount <= 7)
+            return BINDLESS_INVALID_INDEX;
+
+        std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> sources(descriptorCount);
+        D3D12_CPU_DESCRIPTOR_HANDLE source =
+            sourceHeap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT i = 0; i < descriptorCount; ++i) {
+            sources[i] = source;
+            source.ptr += g_dx12.cbvSrvUavDescriptorSize;
+        }
+        const UINT base = bindlessResolveTableBases[frameSlot % FRAME_COUNT];
+        if (base == BINDLESS_INVALID_INDEX) return base;
+        bindlessHeap->CopyTransientTable(base, sources.data(), descriptorCount);
+
+        // Slot 7 is t7. Point it at this frame's bindless material-record slice;
+        // all other entries mirror the already-refreshed legacy/enhanced table.
+        D3D12_SHADER_RESOURCE_VIEW_DESC materials = {};
+        materials.Format = DXGI_FORMAT_UNKNOWN;
+        materials.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        materials.Shader4ComponentMapping =
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        materials.Buffer.FirstElement = frameSlot * VB_MAX_MATERIALS;
+        materials.Buffer.NumElements = VB_MAX_MATERIALS;
+        materials.Buffer.StructureByteStride = sizeof(VBMaterialData);
+        g_dx12.device->CreateShaderResourceView(
+            bindlessMaterialDataBuffer.Get(), &materials,
+            bindlessHeap->CpuHandleAt(base + 7));
+        return base;
+    }
+
     bool MotionVectorsRequired() const {
         // TAA owns post-process history, but SVGF independently needs the
         // visibility motion buffer to reproject reflection history. Capture
@@ -2532,17 +2705,23 @@ private:
         if (FAILED(hr)) return false;
 
         // Parallel bindless material table. Allocated unconditionally -- it is
-        // 384 KB and allocating it up front means toggling bindless at runtime
+        // 640 KB across two frame slots, and allocating it up front means
+        // toggling bindless at runtime
         // never has to create a resource mid-frame.
+        D3D12_RESOURCE_DESC bindlessMaterialDesc = materialDesc;
+        bindlessMaterialDesc.Width = static_cast<UINT64>(FRAME_COUNT) *
+            VB_MAX_MATERIALS * sizeof(VBMaterialData);
         hr = g_dx12.device->CreateCommittedResource(
-            &materialHeap, D3D12_HEAP_FLAG_NONE, &materialDesc,
+            &materialHeap, D3D12_HEAP_FLAG_NONE, &bindlessMaterialDesc,
             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
             IID_PPV_ARGS(&bindlessMaterialDataBuffer));
         if (FAILED(hr)) return false;
         hr = bindlessMaterialDataBuffer->Map(0, &noRead,
             reinterpret_cast<void**>(&mappedBindlessMaterials));
         if (FAILED(hr)) return false;
-        mappedBindlessMaterials[0] = VBMaterialData{};
+        for (UINT frame = 0; frame < FRAME_COUNT; ++frame)
+            mappedBindlessMaterials[frame * VB_MAX_MATERIALS] =
+                VBMaterialData{};
 
         return true;
     }
@@ -2817,6 +2996,70 @@ private:
             &psoDesc, IID_PPV_ARGS(&visPassAlphaDoubleSidedPSO));
         if (FAILED(hr)) return false;
 
+        bindlessVisPassReady = false;
+        if (bindlessHeap && bindlessHeap->Supported() &&
+            ShaderCacheDX12::DxcAvailable()) {
+            const std::wstring shaderDirectory =
+                ShaderCacheDX12::ExecutableDirectory() + L"shaders";
+            const std::string bindlessPS =
+                "#define SGE_BINDLESS_MATERIALS 1\n" + psCode;
+            ComPtr<ID3DBlob> bindlessVSBlob, bindlessPSBlob,
+                bindlessAlphaPSBlob;
+            std::string errors;
+            const bool shadersReady =
+                ShaderCacheDX12::CompileCachedDXC(
+                    vsCode, L"visbuf_vs.hlsl", L"main", L"vs_6_6",
+                    shaderDirectory, &bindlessVSBlob, &errors) &&
+                ShaderCacheDX12::CompileCachedDXC(
+                    bindlessPS, L"visbuf_ps.hlsl", L"main", L"ps_6_6",
+                    shaderDirectory, &bindlessPSBlob, &errors) &&
+                ShaderCacheDX12::CompileCachedDXC(
+                    bindlessPS, L"visbuf_ps.hlsl", L"mainAlpha", L"ps_6_6",
+                    shaderDirectory, &bindlessAlphaPSBlob, &errors);
+            if (!shadersReady) {
+                std::cerr << "Bindless visibility shader compile failed\n"
+                          << errors << std::endl;
+            } else {
+                D3D12_ROOT_SIGNATURE_DESC bindlessRootDesc = visRootSigDesc;
+                bindlessRootDesc.Flags =
+                    D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+                    D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+                ComPtr<ID3DBlob> bindlessSig, bindlessSigError;
+                if (SUCCEEDED(D3D12SerializeRootSignature(
+                        &bindlessRootDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                        &bindlessSig, &bindlessSigError)) &&
+                    SUCCEEDED(g_dx12.device->CreateRootSignature(
+                        0, bindlessSig->GetBufferPointer(),
+                        bindlessSig->GetBufferSize(),
+                        IID_PPV_ARGS(&bindlessVisPassRootSig)))) {
+                    psoDesc.pRootSignature = bindlessVisPassRootSig.Get();
+                    psoDesc.VS = { bindlessVSBlob->GetBufferPointer(),
+                                   bindlessVSBlob->GetBufferSize() };
+                    psoDesc.PS = { bindlessPSBlob->GetBufferPointer(),
+                                   bindlessPSBlob->GetBufferSize() };
+                    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+                    bool ok = SUCCEEDED(g_dx12.device->CreateGraphicsPipelineState(
+                        &psoDesc, IID_PPV_ARGS(&bindlessVisPassPSO)));
+                    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                    ok = ok && SUCCEEDED(g_dx12.device->CreateGraphicsPipelineState(
+                        &psoDesc, IID_PPV_ARGS(&bindlessVisPassDoubleSidedPSO)));
+                    psoDesc.PS = { bindlessAlphaPSBlob->GetBufferPointer(),
+                                   bindlessAlphaPSBlob->GetBufferSize() };
+                    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+                    ok = ok && SUCCEEDED(g_dx12.device->CreateGraphicsPipelineState(
+                        &psoDesc, IID_PPV_ARGS(&bindlessVisPassAlphaPSO)));
+                    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                    ok = ok && SUCCEEDED(g_dx12.device->CreateGraphicsPipelineState(
+                        &psoDesc, IID_PPV_ARGS(&bindlessVisPassAlphaDoubleSidedPSO)));
+                    bindlessVisPassReady = ok;
+                } else if (bindlessSigError) {
+                    std::cerr << "Bindless visibility root signature failed: "
+                        << (const char*)bindlessSigError->GetBufferPointer()
+                        << std::endl;
+                }
+            }
+        }
+
         std::cout << "Visibility pass pipeline created" << std::endl;
         return true;
     }
@@ -2890,31 +3133,112 @@ private:
     // Every failure path leaves enhancedPipelineReady false and returns without
     // disturbing the default PSO, so an old driver or a missing dxcompiler.dll
     // costs nothing but the feature.
+    // Bindless twin of the default (non-enhanced) resolve. Same descriptor
+    // ranges and same two root parameters as the FXC PSO -- only the compiler
+    // (DXC at cs_6_6), the define, and the directly-indexed-heap root flag
+    // differ. Failure leaves bindlessResolveReady false, which keeps the
+    // bindless toggle unavailable rather than breaking the frame.
+    void CreateBindlessResolvePipeline(const std::string& csCode,
+                                       const D3D12_DESCRIPTOR_RANGE* ranges,
+                                       const D3D12_STATIC_SAMPLER_DESC* samplers,
+                                       const D3D12_ROOT_PARAMETER* params) {
+        bindlessResolveReady = false;
+        if (!ShaderCacheDX12::DxcAvailable()) {
+            std::cout << "Bindless materials: dxcompiler.dll unavailable\n";
+            return;
+        }
+
+        const std::string source = "#define SGE_BINDLESS_MATERIALS 1\n" + csCode;
+        const std::wstring shaderDirectory =
+            ShaderCacheDX12::ExecutableDirectory() + L"shaders";
+        ComPtr<ID3DBlob> csBlob;
+        std::string errors;
+        if (!ShaderCacheDX12::CompileCachedDXC(
+                source, L"visbuf_resolve_cs.hlsl", L"main", L"cs_6_6",
+                shaderDirectory, &csBlob, &errors)) {
+            std::cerr << "Bindless materials: resolve compile failed\n";
+            if (!errors.empty()) {
+                std::cerr << errors << std::endl;
+                std::ofstream log("bindless_resolve_shader_error.log",
+                                  std::ios::trunc);
+                log << errors;
+            }
+            return;
+        }
+
+        D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
+        rootSigDesc.NumParameters = 2;
+        rootSigDesc.pParameters = params;
+        rootSigDesc.NumStaticSamplers = 2;
+        rootSigDesc.pStaticSamplers = samplers;
+        rootSigDesc.Flags =
+            D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+
+        ComPtr<ID3DBlob> sigBlob, sigError;
+        if (FAILED(D3D12SerializeRootSignature(&rootSigDesc,
+                D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, &sigError))) {
+            if (sigError)
+                std::cerr << "Bindless resolve root sig: "
+                          << (const char*)sigError->GetBufferPointer() << "\n";
+            return;
+        }
+        if (FAILED(g_dx12.device->CreateRootSignature(
+                0, sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(),
+                IID_PPV_ARGS(&bindlessResolveRootSig))))
+            return;
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+        psoDesc.pRootSignature = bindlessResolveRootSig.Get();
+        psoDesc.CS = { csBlob->GetBufferPointer(), csBlob->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateComputePipelineState(
+                &psoDesc, IID_PPV_ARGS(&bindlessResolvePSO)))) {
+            std::cerr << "Bindless materials: resolve PSO creation failed\n";
+            bindlessResolveRootSig.Reset();
+            return;
+        }
+        bindlessResolveReady = true;
+    }
+
+    // `bindless` selects the SGE_BINDLESS_MATERIALS variant, which compiles at
+    // cs_6_6 (ResourceDescriptorHeap needs 6.6) and adds
+    // CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED to the root signature. Everything else
+    // -- descriptor layout, root parameter numbering, samplers -- is identical,
+    // so the two variants stay in lockstep by construction instead of by two
+    // copies that drift.
     void CreateEnhancedResolvePipeline(const std::string& csCode,
                                        const D3D12_DESCRIPTOR_RANGE* baseRanges,
-                                       const D3D12_STATIC_SAMPLER_DESC* samplers) {
-        enhancedPipelineReady = false;
+                                       const D3D12_STATIC_SAMPLER_DESC* samplers,
+                                       bool bindless = false) {
+        const char* tierName = bindless ? "Bindless enhanced visuals"
+                                        : "Enhanced visuals";
+        if (bindless) bindlessEnhancedResolveReady = false;
+        else enhancedPipelineReady = false;
         if (!ShaderCacheDX12::DxcAvailable()) {
-            std::cout << "Enhanced visuals: dxcompiler.dll unavailable\n";
+            std::cout << tierName << ": dxcompiler.dll unavailable\n";
             return;
         }
 
         // Prepend the define rather than passing -D so the cache key (which
         // hashes the source text) separates the two variants automatically.
-        const std::string enhancedSource =
+        std::string enhancedSource =
             "#define SGE_ENHANCED_VISUALS 1\n" + csCode;
+        if (bindless)
+            enhancedSource = "#define SGE_BINDLESS_MATERIALS 1\n" + enhancedSource;
 
         const std::wstring shaderDirectory =
             ShaderCacheDX12::ExecutableDirectory() + L"shaders";
         ComPtr<ID3DBlob> csBlob;
         std::string errors;
         if (!ShaderCacheDX12::CompileCachedDXC(
-                enhancedSource, L"visbuf_resolve_cs.hlsl", L"main", L"cs_6_5",
+                enhancedSource, L"visbuf_resolve_cs.hlsl", L"main",
+                bindless ? L"cs_6_6" : L"cs_6_5",
                 shaderDirectory, &csBlob, &errors)) {
-            std::cerr << "Enhanced visuals: resolve compile failed\n";
+            std::cerr << tierName << ": resolve compile failed\n";
             if (!errors.empty()) {
                 std::cerr << errors << std::endl;
-                std::ofstream log("enhanced_resolve_shader_error.log",
+                std::ofstream log(bindless
+                                      ? "bindless_enhanced_resolve_shader_error.log"
+                                      : "enhanced_resolve_shader_error.log",
                                   std::ios::trunc);
                 log << errors;
             }
@@ -3041,27 +3365,46 @@ private:
         rootSigDesc.pParameters = params;
         rootSigDesc.NumStaticSamplers = 2;
         rootSigDesc.pStaticSamplers = samplers;
+        // The flag that makes ResourceDescriptorHeap[] legal in the shader.
+        // Samplers stay static, so SAMPLER_HEAP_DIRECTLY_INDEXED is not needed.
+        if (bindless)
+            rootSigDesc.Flags =
+                D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+
+        ComPtr<ID3D12RootSignature>& targetRootSig =
+            bindless ? bindlessEnhancedResolveRootSig : enhancedResolveRootSig;
+        ComPtr<ID3D12PipelineState>& targetPSO =
+            bindless ? bindlessEnhancedResolvePSO : enhancedResolvePSO;
 
         ComPtr<ID3DBlob> sigBlob, sigError;
         if (FAILED(D3D12SerializeRootSignature(&rootSigDesc,
                 D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, &sigError))) {
             if (sigError)
-                std::cerr << "Enhanced resolve root sig: "
+                std::cerr << tierName << " resolve root sig: "
                           << (const char*)sigError->GetBufferPointer() << "\n";
             return;
         }
         if (FAILED(g_dx12.device->CreateRootSignature(
                 0, sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(),
-                IID_PPV_ARGS(&enhancedResolveRootSig))))
+                IID_PPV_ARGS(&targetRootSig))))
             return;
 
         D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
-        psoDesc.pRootSignature = enhancedResolveRootSig.Get();
+        psoDesc.pRootSignature = targetRootSig.Get();
         psoDesc.CS = { csBlob->GetBufferPointer(), csBlob->GetBufferSize() };
         if (FAILED(g_dx12.device->CreateComputePipelineState(
-                &psoDesc, IID_PPV_ARGS(&enhancedResolvePSO)))) {
-            std::cerr << "Enhanced visuals: resolve PSO creation failed\n";
-            enhancedResolveRootSig.Reset();
+                &psoDesc, IID_PPV_ARGS(&targetPSO)))) {
+            std::cerr << tierName << ": resolve PSO creation failed\n";
+            targetRootSig.Reset();
+            return;
+        }
+
+        // The bindless variant shares the enhanced tier's descriptor heap and
+        // constant buffer, both already built by the non-bindless call. It
+        // needs nothing further, so it reports ready here rather than falling
+        // through to the enhanced-only resource creation below.
+        if (bindless) {
+            bindlessEnhancedResolveReady = true;
             return;
         }
 
@@ -4049,6 +4392,21 @@ private:
         // unavailable (no DXC, no Tier 1.1, or a compile error).
         CreateEnhancedResolvePipeline(csCode, ranges, staticSamplers);
         CreateSVGFAtrousPipeline();
+
+        // ---- Bindless (SM 6.6) resolve variants ----
+        //
+        // Two more PSOs, lit and enhanced, compiled from the same source with
+        // SGE_BINDLESS_MATERIALS. Four selections exist in total and the
+        // dispatch picks between them; none of them can perturb the FXC PSO
+        // above, which is what keeps "bindless off" identical to before.
+        //
+        // Gated on the adapter actually reporting SM 6.6 and Tier 3: without
+        // both, ResourceDescriptorHeap[] is not merely slow but invalid.
+        if (bindlessHeap && bindlessHeap->Supported()) {
+            CreateBindlessResolvePipeline(csCode, ranges, staticSamplers,
+                                          resolveParams);
+            CreateEnhancedResolvePipeline(csCode, ranges, staticSamplers, true);
+        }
 
         // Create indirect dispatch command signature + args buffer
         {

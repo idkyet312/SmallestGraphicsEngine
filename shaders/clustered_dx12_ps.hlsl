@@ -47,6 +47,9 @@ cbuffer ObjectBuffer : register(b3) {
     float specularScale;     // per-draw highlight control; viewmodels use less
     float materialType;      // 0=ordinary, 1=pool water, 2=ocean
     float materialTime;      // seconds; used by procedural water detail
+#ifdef SGE_BINDLESS_MATERIALS
+    uint4 bindlessTextureIndices;
+#endif
 };
 
 struct PointLightData {
@@ -602,6 +605,21 @@ PS_OUTPUT main(PS_INPUT input)
 float4 main(PS_INPUT input) : SV_TARGET
 #endif
 {
+#if defined(SGE_BINDLESS_MATERIALS) && !defined(SGE_TERRAIN_PBR)
+    Texture2D<float4> bindlessAlbedoMap = ResourceDescriptorHeap[
+        NonUniformResourceIndex(bindlessTextureIndices.x)];
+    Texture2D<float4> bindlessNormalMap = ResourceDescriptorHeap[
+        NonUniformResourceIndex(bindlessTextureIndices.y)];
+    Texture2D<float4> bindlessMetalRoughMap = ResourceDescriptorHeap[
+        NonUniformResourceIndex(bindlessTextureIndices.z)];
+#define SGE_MATERIAL_ALBEDO bindlessAlbedoMap
+#define SGE_MATERIAL_NORMAL bindlessNormalMap
+#define SGE_MATERIAL_METAL_ROUGH bindlessMetalRoughMap
+#else
+#define SGE_MATERIAL_ALBEDO albedoMap
+#define SGE_MATERIAL_NORMAL normalMap
+#define SGE_MATERIAL_METAL_ROUGH metalRoughMap
+#endif
     // Solid unlit emissive geometry. Additive PSO turns opacity into glow weight.
     if (smokeMode > 1.5) {
         RETURN_COLOR(FinalizeOutput(objectColor), opacity);
@@ -614,7 +632,7 @@ float4 main(PS_INPUT input) : SV_TARGET
 #ifdef SGE_TERRAIN_PBR
         float4 smoke = albedoMap.Sample(texSampler, float3(input.texCoord, 0));
 #else
-        float4 smoke = albedoMap.Sample(texSampler, input.texCoord);
+        float4 smoke = SGE_MATERIAL_ALBEDO.Sample(texSampler, input.texCoord);
 #endif
         float a = smoke.a * opacity;
         if (a <= 0.003) discard;
@@ -638,7 +656,7 @@ float4 main(PS_INPUT input) : SV_TARGET
     albedo = max(terrain.albedo, 0.0) * objectColor;
 #else
     if (useTexture > 0.5) {
-        float4 texColor = albedoMap.Sample(texSampler, input.texCoord);
+        float4 texColor = SGE_MATERIAL_ALBEDO.Sample(texSampler, input.texCoord);
         // Alpha cutout for foliage cards (palm fronds), opt-in per material.
         // clip() disables early-Z for the draw, which is expensive scene-wide --
         // an unconditional clip here once pushed heavy-overdraw frames past the
@@ -653,15 +671,15 @@ float4 main(PS_INPUT input) : SV_TARGET
         if (isFoliage) {
             foliageCoverage = texColor.a;
             uint texWidth, texHeight, texLevels;
-            albedoMap.GetDimensions(0, texWidth, texHeight, texLevels);
+            SGE_MATERIAL_ALBEDO.GetDimensions(0, texWidth, texHeight, texLevels);
             float2 texel = 1.0 / max(float2(texWidth, texHeight), 1.0);
-            float4 neighbor0 = albedoMap.Sample(
+            float4 neighbor0 = SGE_MATERIAL_ALBEDO.Sample(
                 texSampler, input.texCoord + float2(texel.x, 0.0));
-            float4 neighbor1 = albedoMap.Sample(
+            float4 neighbor1 = SGE_MATERIAL_ALBEDO.Sample(
                 texSampler, input.texCoord - float2(texel.x, 0.0));
-            float4 neighbor2 = albedoMap.Sample(
+            float4 neighbor2 = SGE_MATERIAL_ALBEDO.Sample(
                 texSampler, input.texCoord + float2(0.0, texel.y));
-            float4 neighbor3 = albedoMap.Sample(
+            float4 neighbor3 = SGE_MATERIAL_ALBEDO.Sample(
                 texSampler, input.texCoord - float2(0.0, texel.y));
             float totalCoverage = texColor.a + neighbor0.a + neighbor1.a +
                                   neighbor2.a + neighbor3.a;
@@ -721,7 +739,7 @@ float4 main(PS_INPUT input) : SV_TARGET
         // Actually, let's just sample it. If not bound, it returns 0.
         // We can use a flag for it, but I didn't add one.
         // Let's rely on 'useTexture' for now.
-        float4 mrSample = metalRoughMap.Sample(texSampler, input.texCoord);
+        float4 mrSample = SGE_MATERIAL_METAL_ROUGH.Sample(texSampler, input.texCoord);
         // GLTF: Blue = Metal, Green = Roughness
         // If the map is present (not black/empty), use it?
         // But we don't know if it is present in shader. 
@@ -761,7 +779,7 @@ float4 main(PS_INPUT input) : SV_TARGET
     if (useNormalMap > 0.5) {
          float normalMipBias = 1.5;
          float normalStrength = 0.70;
-         float3 mapNormal = normalMap.SampleBias(texSampler, input.texCoord, normalMipBias).xyz * 2.0 - 1.0;
+         float3 mapNormal = SGE_MATERIAL_NORMAL.SampleBias(texSampler, input.texCoord, normalMipBias).xyz * 2.0 - 1.0;
          mapNormal.y *= normalYSign;
          // Cooked normal maps use BC5 (XY only). Reconstructing Z also removes
          // blue-channel block artifacts from legacy RGB normal maps.

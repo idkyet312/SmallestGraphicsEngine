@@ -14,6 +14,7 @@
 
 #include <iostream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 class BindlessHeapDX12 {
@@ -117,7 +118,8 @@ public:
     // Textures are transitioned once to the combined pixel/non-pixel SRV state
     // because the visibility resolve samples them from a compute shader while
     // the forward path samples them from a pixel shader.
-    uint32_t RegisterTexture(ID3D12Resource* texture, uint32_t fallback) {
+    uint32_t RegisterTexture(ID3D12Resource* texture, uint32_t fallback,
+                             bool transitionToNonPixel = true) {
         if (!initialized) return fallback;
         if (!texture) return fallback;
 
@@ -134,8 +136,26 @@ public:
         srv.Texture2D.MipLevels = resourceDesc.MipLevels;
         g_dx12.device->CreateShaderResourceView(texture, &srv, CpuHandleAt(index));
 
-        pendingTransitions.push_back(texture);
+        // A descriptor does not own the resource it names. Keep every
+        // scene-registered texture alive until the synchronized scene reset so
+        // an override cannot release an in-flight texture or recycle its COM
+        // pointer into a false allocator cache hit.
+        persistentResources.emplace_back(texture);
+        if (transitionToNonPixel &&
+            computeReadableTextures.find(texture) ==
+                computeReadableTextures.end())
+            pendingTransitions.push_back(texture);
+        else
+            computeReadableTextures.insert(texture);
         return index;
+    }
+
+    void MarkTextureComputeReadable(ID3D12Resource* texture) {
+        if (!texture) return;
+        computeReadableTextures.insert(texture);
+        pendingTransitions.erase(std::remove(
+            pendingTransitions.begin(), pendingTransitions.end(), texture),
+            pendingTransitions.end());
     }
 
     // Emits the state transitions accumulated by RegisterTexture. Called once
@@ -157,6 +177,8 @@ public:
             barriers.push_back(barrier);
         }
         commandList->ResourceBarrier((UINT)barriers.size(), barriers.data());
+        for (ID3D12Resource* texture : pendingTransitions)
+            computeReadableTextures.insert(texture);
         pendingTransitions.clear();
     }
 
@@ -182,6 +204,17 @@ public:
         return base;
     }
 
+    void CopyTransientTable(uint32_t base,
+                            const D3D12_CPU_DESCRIPTOR_HANDLE* sources,
+                            uint32_t count) {
+        if (!initialized || base == BINDLESS_INVALID_INDEX || !sources) return;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (sources[i].ptr == 0) continue;
+            g_dx12.device->CopyDescriptorsSimple(1, CpuHandleAt(base + i),
+                sources[i], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+    }
+
     // Scene teardown. The caller MUST have waited for GPU idle first: these
     // descriptors may still be referenced by in-flight command lists, and the
     // generation bump silently re-points every surviving material at new slots.
@@ -189,6 +222,8 @@ public:
         if (!initialized) return;
         allocator.ResetPersistent();
         pendingTransitions.clear();
+        computeReadableTextures.clear();
+        persistentResources.clear();
     }
 
     BindlessDescriptorAllocator& Allocator() { return allocator; }
@@ -315,5 +350,7 @@ private:
     bool initialized = false;
     std::vector<ComPtr<ID3D12Resource>> fallbackTextures;
     std::vector<ComPtr<ID3D12Resource>> fallbackUploads;
+    std::vector<ComPtr<ID3D12Resource>> persistentResources;
     std::vector<ID3D12Resource*> pendingTransitions;
+    std::unordered_set<ID3D12Resource*> computeReadableTextures;
 };
