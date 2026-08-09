@@ -1175,6 +1175,16 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                             }
                         }
                     }
+                    // Off = the acceleration structure is a load-time snapshot,
+                    // so moving actors cast shadows from where they used to be
+                    // and appear in no reflection. The toggle is the bisection
+                    // tool for telling a stale-TLAS artefact from a shading one.
+                    ImGui::Checkbox("  Per-Frame TLAS Refit",
+                                    &scene.enhancedTLASRefit);
+                    ImGui::TextDisabled(
+                        scene.enhancedTLASRefit
+                            ? "  Moving actors traced where they are."
+                            : "  Static snapshot: movers frozen at load pose.");
                     ImGui::Checkbox("  Ray Classification",
                                     &scene.enhancedRayClassify);
                     if (scene.enhancedRayClassify) {

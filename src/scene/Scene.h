@@ -443,6 +443,20 @@ struct Scene {
     // the current SVGF tuning pass; the raw signal is noisy on purpose and
     // wants the temporal denoiser to resolve it.
     bool enhancedRTReflections = true;
+    // Refit the TLAS instance transforms every frame, so moving actors are
+    // traced where they are rather than where they stood when the acceleration
+    // structure was first built.
+    //
+    // With this off the TLAS is a one-time snapshot: helicopters and vehicles
+    // cast a shadow from a position they have left, and appear in no reflection
+    // at all once they move. That is what made RT shadows look detached from
+    // dynamic geometry. The refit is a PERFORM_UPDATE over instance descriptors
+    // only -- BLASes are untouched, so it costs far less than a rebuild.
+    //
+    // Kept as a toggle because it is the bisection tool for "is this artefact a
+    // stale acceleration structure or a shading bug": turning it off restores
+    // the previous static behaviour exactly.
+    bool enhancedTLASRefit = true;
     // Confidence below which a pixel is handed to RT. Raising it traces more
     // pixels (better, slower). Live-tunable so the split can be dialled in
     // against a real scene rather than guessed.

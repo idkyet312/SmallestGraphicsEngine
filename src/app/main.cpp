@@ -3458,6 +3458,105 @@ static void BuildDXRDDGINodeScene(
             nodeOrdinal, commandList, instances);
 }
 
+// Transform-only counterpart to BuildDXRDDGINodeScene, for the per-frame TLAS
+// refit.
+//
+// This MUST visit nodes and instances in exactly the order the build did, since
+// the refit matches transforms to instance descriptors positionally. The two
+// traversals are therefore kept structurally identical: same recursion order,
+// same `worlds` loop, same skip conditions. The one condition that cannot be
+// mirrored is `BuildMeshBLAS` succeeding -- so instead of re-testing it, this
+// checks that a BLAS for the mesh id already exists, which is exactly what a
+// successful build left behind.
+//
+// If the two ever diverge the refit is rejected on a count mismatch rather than
+// silently shuffling transforms between instances, which is why the caller
+// treats a false return as "fall back to the static TLAS" and not as an error.
+static void GatherDXRDDGINodeTransforms(
+    const std::shared_ptr<SceneNode>& node, uint64_t meshNamespace,
+    const std::vector<XMMATRIX>& worlds, uint32_t& nodeOrdinal,
+    std::vector<XMFLOAT4X4>& transforms) {
+    if (!node) return;
+    const uint32_t ordinal = nodeOrdinal++;
+    if (node->mesh) {
+        // Mirrors the build's "did any primitive qualify" test. A mesh whose
+        // primitives were all skipped produced no BLAS and therefore no
+        // instances, so it must contribute none here either.
+        bool anyGeometry = false;
+        for (const MeshPrimitive& primitive : node->mesh->primitives) {
+            if (!primitive.vertexBuffer || primitive.vertices.size() < 36)
+                continue;
+            anyGeometry = true;
+            break;
+        }
+        if (anyGeometry) {
+            const uint64_t meshId = DXRProbeLayout::Hash64(
+                meshNamespace ^ ordinal);
+            if (g_dxrDDGI.Scene().HasMesh(meshId)) {
+                const XMMATRIX nodeWorld =
+                    XMLoadFloat4x4(&node->globalTransform);
+                for (size_t i = 0; i < worlds.size(); ++i) {
+                    XMFLOAT4X4 matrix;
+                    XMStoreFloat4x4(&matrix, nodeWorld * worlds[i]);
+                    transforms.push_back(matrix);
+                }
+            }
+        }
+    }
+    for (const auto& child : node->children)
+        GatherDXRDDGINodeTransforms(child, meshNamespace, worlds, nodeOrdinal,
+                                    transforms);
+}
+
+// Per-frame TLAS transform refit. Cheap enough to run unconditionally: it walks
+// the prefab batches, rebuilds the instance transform list, and issues a
+// PERFORM_UPDATE over the existing acceleration structure. No BLAS work, no
+// shader-table rewrite, no GPU stall.
+//
+// Returns false when the gathered list does not match the built instance count
+// -- geometry was added or removed since the build, which needs the full
+// rebuild path. The caller keeps tracing the previous structure in that case,
+// which is stale but valid.
+static bool RefitDXRDDGIAccelerationScene() {
+    ComPtr<ID3D12GraphicsCommandList4> commandList;
+    if (!g_dxrDDGI.Scene().Supported() ||
+        g_dxrDDGI.Scene().RefitInstanceCount() == 0 ||
+        FAILED(g_dx12.commandList.As(&commandList)))
+        return false;
+
+    std::vector<XMFLOAT4X4> transforms;
+    transforms.reserve(g_dxrDDGI.Scene().RefitInstanceCount());
+    for (const PrefabRenderBatch& batch : g_prefabRenderBatches) {
+        uint32_t nodeOrdinal = 0;
+        GatherDXRDDGINodeTransforms(batch.baseModel,
+            DXRDDGIStringHash(batch.prefabId), batch.baseTransforms,
+            nodeOrdinal, transforms);
+    }
+    if (wallModel && !g_ddgiCornellTestMode) {
+        uint32_t nodeOrdinal = 0;
+        const std::vector<XMMATRIX> worlds{ XMMatrixIdentity() };
+        GatherDXRDDGINodeTransforms(wallModel, 0x484f555345ull, worlds,
+            nodeOrdinal, transforms);
+    }
+    // Terrain is the last instance the build appends, and it never moves -- but
+    // its identity transform still has to be re-emitted so the positional match
+    // with the descriptor list holds through to the end of the list.
+    //
+    // Mirrors the build's own condition rather than inferring terrain's presence
+    // from a count difference: an off-by-one from any other cause would look
+    // identical to "terrain is missing" and would silently shift every
+    // transform by one instance.
+    if (scene.useMeshTerrain && g_terrain.supported && !g_ddgiCornellTestMode &&
+        g_dxrDDGI.Scene().HasMesh(DXRScene::TerrainMeshId())) {
+        XMFLOAT4X4 identity;
+        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+        transforms.push_back(identity);
+    }
+
+    return g_dxrDDGI.Scene().RefitTLAS(commandList.Get(), transforms,
+                                       g_dx12.frameIndex);
+}
+
 static bool BuildDXRDDGIAccelerationScene() {
     ComPtr<ID3D12GraphicsCommandList4> commandList;
     if (!g_dxrDDGI.Scene().Supported() ||
@@ -11363,6 +11462,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // Returns false when there is no static geometry yet; retry
                 // next frame rather than latching a failure.
                 enhancedSceneBuilt = BuildDXRDDGIAccelerationScene();
+            } else if (wantEnhanced && enhancedSceneBuilt &&
+                       scene.enhancedTLASRefit && !g_game.loading.Active() &&
+                       IsSceneScreen()) {
+                // Transforms only -- see RefitDXRDDGIAccelerationScene. Skipped
+                // on the frame of the full build, which already placed every
+                // instance at its current transform.
+                ProfilerDX12::Scope refitScope(g_profiler, "TLAS Refit",
+                                               g_dx12.commandList.Get());
+                RefitDXRDDGIAccelerationScene();
             }
             if (!IsSceneScreen()) enhancedSceneBuilt = false;
             visBuffer.SetEnhancedVisuals(
