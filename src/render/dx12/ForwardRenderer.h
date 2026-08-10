@@ -110,7 +110,7 @@ struct GeometryBuffers {
     ComPtr<ID3D12Resource>   sphereVertexBuffer;
     ComPtr<ID3D12Resource>   capsuleVertexBuffer;
     ComPtr<ID3D12Resource>   quadVertexBuffer;      // unit XY billboard quad
-    ComPtr<ID3D12Resource>   flashVertexBuffer;     // first cell of 4-frame VFX sheet
+    ComPtr<ID3D12Resource>   flashVertexBuffer;     // full-frame muzzle VFX sprite
     ComPtr<ID3D12Resource>   fireVertexBuffer;      // 60 cells from 10x6 fire sheet
     ComPtr<ID3D12Resource>   explosionVertexBuffer; // 16 cells from 4x4 explosion sheet
     ComPtr<ID3D12Resource>   explosionCoreVertexBuffer; // 64 cells from 8x8 core sheet
@@ -2295,22 +2295,38 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     staticBatches.Flush(shader, view, proj, lightSpace);
 
 
-        // Downloaded CC0 muzzle-flash sheet. One random-looking star frame is
-        // enough because real rifle flashes last only a few milliseconds.
+        // The CC0 flash is rotated per shot and drawn in two additive layers:
+        // a broad orange envelope plus the white-hot core that sells ignition.
         if (scene.muzzleFlashTime > 0.0f && g_muzzleFlashTexture) {
             const XMFLOAT3 muzzle = scene.GetMuzzleWorldPosition();
-            const float fade = scene.muzzleFlashTime / scene.muzzleFlashDuration;
-            const float size = scene.GunModelScale() * (0.32f + 0.10f * fade);
+            const float fade = (std::min)(
+                1.0f, scene.muzzleFlashTime / scene.muzzleFlashDuration);
+            const float size = scene.GunModelScale() * scene.muzzleFlashScale *
+                (0.30f + 0.11f * fade);
             const XMVECTOR pos = XMVectorSet(muzzle.x, muzzle.y, muzzle.z, 1.0f);
             const XMMATRIX invRot = XMMatrixTranspose(view);
             const XMVECTOR camRight = XMVectorSetW(invRot.r[0], 0.0f);
             const XMVECTOR camUp = XMVectorSetW(invRot.r[1], 0.0f);
             const XMVECTOR camFwd = XMVectorSetW(invRot.r[2], 0.0f);
-            model = XMMATRIX(camRight * size, camUp * size, camFwd * size,
+            const float rotationCos = std::cos(scene.muzzleFlashRotation);
+            const float rotationSin = std::sin(scene.muzzleFlashRotation);
+            const XMVECTOR flashRight =
+                camRight * rotationCos + camUp * rotationSin;
+            const XMVECTOR flashUp =
+                camUp * rotationCos - camRight * rotationSin;
+            model = XMMATRIX(flashRight * size, flashUp * size, camFwd * size,
                              XMVectorSetW(pos, 1.0f));
             shader.UseAdditive();
             shader.SetMatrices(model, view, proj, lightSpace);
-            shader.SetSmokeMaterial(XMFLOAT3(1.0f, 0.34f, 0.035f), fade,
+            shader.SetSmokeMaterial(XMFLOAT3(2.8f, 0.82f, 0.08f), fade * 0.82f,
+                                    g_muzzleFlashTexture.Get());
+            DrawFlashQuad(geo);
+            shader.NextDrawCall();
+            const float coreSize = size * 0.58f;
+            model = XMMATRIX(flashRight * coreSize, flashUp * coreSize,
+                             camFwd * coreSize, XMVectorSetW(pos, 1.0f));
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetSmokeMaterial(XMFLOAT3(4.0f, 1.85f, 0.42f), fade,
                                     g_muzzleFlashTexture.Get());
             DrawFlashQuad(geo);
             shader.NextDrawCall();

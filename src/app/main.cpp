@@ -1779,7 +1779,7 @@ static void UpdateHelicopter(float dt) {
     XMFLOAT3 shotDirection;
     XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
     scene.SpawnHostileProjectile(muzzle, shotDirection);
-    scene.SpawnSmokeBurst(muzzle, 0.10f, 0.13f);
+    scene.SpawnWeaponSmoke(muzzle, shotDirection, 0.8f);
     const float distance = std::sqrt(distanceSq);
     const float volume = (std::max)(0.10f, 0.68f * (1.0f - distance / 90.0f));
     g_gunAudio.Play(volume, 0.82f + ((float)std::rand() / RAND_MAX) * 0.08f);
@@ -1885,7 +1885,7 @@ static void UpdateSecondaryHelicopter(float dt) {
     XMFLOAT3 shotDirection;
     XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
     scene.SpawnHostileProjectile(muzzle, shotDirection);
-    scene.SpawnSmokeBurst(muzzle, 0.10f, 0.13f);
+    scene.SpawnWeaponSmoke(muzzle, shotDirection, 0.8f);
     const float distance = std::sqrt(distanceSq);
     g_gunAudio.Play((std::max)(0.10f, 0.68f * (1.0f - distance / 90.0f)),
                     0.82f + ((float)std::rand() / RAND_MAX) * 0.08f);
@@ -8754,11 +8754,10 @@ static bool CreateAllGeometry() {
     };
     if (!CreateVertexBuffer(quadVerts, geo.quadVertexBuffer, geo.quadVBV)) return false;
 
-    // OpenGameArt sheet contains four 128x128 frames across one row. Sample the
-    // first cell; additive blending removes its conventional black background.
+    // Kenney CC0 muzzle flash is one transparent full-frame sprite.
     std::vector<VertexPosNormUV> flashVerts = {
-        {{-0.5f,-0.5f,0},{0,0,1},{0.00f,1}}, {{ 0.5f,-0.5f,0},{0,0,1},{0.25f,1}}, {{ 0.5f, 0.5f,0},{0,0,1},{0.25f,0}},
-        {{-0.5f,-0.5f,0},{0,0,1},{0.00f,1}}, {{ 0.5f, 0.5f,0},{0,0,1},{0.25f,0}}, {{-0.5f, 0.5f,0},{0,0,1},{0.00f,0}},
+        {{-0.5f,-0.5f,0},{0,0,1},{0,1}}, {{ 0.5f,-0.5f,0},{0,0,1},{1,1}}, {{ 0.5f, 0.5f,0},{0,0,1},{1,0}},
+        {{-0.5f,-0.5f,0},{0,0,1},{0,1}}, {{ 0.5f, 0.5f,0},{0,0,1},{1,0}}, {{-0.5f, 0.5f,0},{0,0,1},{0,0}},
     };
     if (!CreateVertexBuffer(flashVerts, geo.flashVertexBuffer, geo.flashVBV)) return false;
 
@@ -8964,7 +8963,7 @@ static void FireHumveeTurret() {
     XMFLOAT3 shotDirection;
     XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
     scene.SpawnPlayerProjectile(muzzle, shotDirection, 1.35f);
-    scene.SpawnSmokeBurst(muzzle, 0.08f, 0.10f);
+    scene.SpawnWeaponSmoke(muzzle, shotDirection, 1.15f);
     g_gunAudio.Play(0.72f, 0.90f + ((float)std::rand() / RAND_MAX) * 0.06f);
     g_humveeTurretFireCooldown = 0.12f;
 }

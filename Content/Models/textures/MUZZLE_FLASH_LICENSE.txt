@@ -1,6 +1,11 @@
-Muzzle Flash particle sheet
-Author: leftshoe18
-Source: https://opengameart.org/content/muzzle-flash-particle-sheet
-Asset: https://opengameart.org/sites/default/files/muzzleFlash0_0.png
+Smoke particle pack
+Author: Kenney Vleugels (Kenney.nl)
+Source: https://opengameart.org/content/smoke-particle-assets
+Archive: https://opengameart.org/sites/default/files/smokeParticleAssets.zip
+Assets used:
+- PNG/Flash/flash03.png -> muzzle_flash.png
+- PNG/White puff/whitePuff03.png -> smoke.png
 License: CC0 1.0 Universal (public domain dedication)
 https://creativecommons.org/publicdomain/zero/1.0/
+
+Attribution is optional. Credit: Kenney or www.kenney.nl

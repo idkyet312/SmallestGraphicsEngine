@@ -288,6 +288,8 @@ struct Scene {
     float fireCooldown       = 0.0f;    // time left before next shot may fire
     float muzzleFlashTime    = 0.0f;    // short enough to read as one-frame light
     float muzzleFlashDuration = 0.055f;
+    float muzzleFlashScale   = 1.0f;
+    float muzzleFlashRotation = 0.0f;
     float flamethrowerAudioTime = 0.0f;
     uint32_t nextHarpoonId = 1;
     bool c4DetonateHeld = false;
@@ -594,6 +596,8 @@ struct Scene {
         };
         fireCooldown = 0.0f;
         muzzleFlashTime = 0.0f;
+        muzzleFlashScale = 1.0f;
+        muzzleFlashRotation = 0.0f;
         gunRecoilBack = 0.0f;
         gunRecoilKick = 0.0f;
         grenadeCooldown = 0.0f;
@@ -1096,6 +1100,42 @@ struct Scene {
             impactParticles.erase(impactParticles.begin(), impactParticles.begin() + spawned);
     }
 
+    void TriggerMuzzleFlash(float durationScale, float sizeScale) {
+        muzzleFlashTime = muzzleFlashDuration * durationScale;
+        muzzleFlashScale = sizeScale;
+        muzzleFlashRotation = ((float)std::rand() / RAND_MAX) * XM_2PI;
+    }
+
+    void SpawnWeaponSmoke(const XMFLOAT3& muzzle, const XMFLOAT3& direction,
+                          float intensity) {
+        const int puffCount = (std::max)(1, (int)std::ceil(intensity));
+        auto unit = [&]() { return (float)std::rand() / RAND_MAX; };
+        auto signedUnit = [&]() { return unit() * 2.0f - 1.0f; };
+        for (int puffIndex = 0; puffIndex < puffCount; ++puffIndex) {
+            const float forwardOffset = 0.025f + unit() * 0.075f;
+            ImpactParticle smoke = {};
+            smoke.position = {
+                muzzle.x + direction.x * forwardOffset + signedUnit() * 0.012f,
+                muzzle.y + direction.y * forwardOffset + signedUnit() * 0.010f,
+                muzzle.z + direction.z * forwardOffset + signedUnit() * 0.012f };
+            const float forwardSpeed = 0.35f + unit() * (0.65f + intensity * 0.2f);
+            smoke.velocity = {
+                direction.x * forwardSpeed + signedUnit() * 0.08f,
+                direction.y * forwardSpeed + 0.18f + unit() * 0.22f,
+                direction.z * forwardSpeed + signedUnit() * 0.08f };
+            smoke.maxLife = smoke.life = 0.34f + unit() * 0.30f;
+            smoke.size = 0.028f * std::sqrt(intensity) * (0.8f + unit() * 0.5f);
+            smoke.growth = 0.10f + intensity * 0.035f + unit() * 0.045f;
+            const float grey = 0.58f + unit() * 0.18f;
+            smoke.color = { grey, grey * 0.98f, grey * 0.94f };
+            impactParticles.push_back(smoke);
+        }
+        if (impactParticles.size() > 900) {
+            impactParticles.erase(impactParticles.begin(),
+                impactParticles.begin() + (impactParticles.size() - 900));
+        }
+    }
+
     void SpawnBloodBurst(const XMFLOAT3& point, const XMFLOAT3& normal) {
         auto rnd = [&]() { return (float)std::rand() / RAND_MAX * 2.0f - 1.0f; };
         constexpr int droplets = 8;
@@ -1135,7 +1175,8 @@ struct Scene {
         camera.ApplyRecoil(recoilPitch * recoilScale, randomYaw);
         gunRecoilBack = (std::min)(0.12f, gunRecoilBack + 0.075f);
         gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 4.2f * recoilScale);
-        muzzleFlashTime = muzzleFlashDuration;
+        TriggerMuzzleFlash(1.0f, 1.0f);
+        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front, 1.0f);
 
         Projectile p;
         p.position  = GetMuzzleWorldPosition();
@@ -1178,7 +1219,8 @@ struct Scene {
         camera.ApplyRecoil(recoilPitch * 1.8f, 0.0f);
         gunRecoilBack = (std::min)(0.14f, gunRecoilBack + 0.11f);
         gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 3.2f);
-        muzzleFlashTime = muzzleFlashDuration;
+        TriggerMuzzleFlash(0.9f, 0.72f);
+        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front, 0.55f);
 
         Projectile p = {};
         p.position = p.previousPosition = GetMuzzleWorldPosition();
@@ -1378,7 +1420,8 @@ struct Scene {
         camera.ApplyRecoil(recoilPitch * 4.2f, 0.0f);
         gunRecoilBack = (std::min)(0.16f, gunRecoilBack + 0.12f);
         gunRecoilKick = (std::min)(12.0f, gunRecoilKick + 7.0f);
-        muzzleFlashTime = muzzleFlashDuration * 1.35f;
+        TriggerMuzzleFlash(1.35f, 1.35f);
+        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front, 1.5f);
 
         Projectile p = {};
         p.position = p.previousPosition = GetMuzzleWorldPosition();
@@ -1394,7 +1437,8 @@ struct Scene {
         camera.ApplyRecoil(recoilPitch * 4.0f, 0.0f);
         gunRecoilBack = (std::min)(0.20f, gunRecoilBack + 0.16f);
         gunRecoilKick = (std::min)(14.0f, gunRecoilKick + 9.0f);
-        muzzleFlashTime = muzzleFlashDuration * 1.8f;
+        TriggerMuzzleFlash(1.8f, 1.75f);
+        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front, 2.4f);
 
         Projectile p = {};
         p.position = p.previousPosition = GetMuzzleWorldPosition();
@@ -1628,7 +1672,8 @@ struct Scene {
         camera.ApplyRecoil(recoilPitch * 2.8f, randomYaw);
         gunRecoilBack = (std::min)(0.16f, gunRecoilBack + 0.13f);
         gunRecoilKick = (std::min)(11.0f, gunRecoilKick + 7.5f);
-        muzzleFlashTime = muzzleFlashDuration * 1.35f;
+        TriggerMuzzleFlash(1.35f, 1.45f);
+        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front, 1.8f);
 
         const XMFLOAT3 muzzle = GetMuzzleWorldPosition();
         const XMVECTOR cameraFront = XMLoadFloat3(&camera.Front);
