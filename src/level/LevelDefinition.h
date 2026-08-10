@@ -106,16 +106,19 @@ enum class LevelInsertionMode : uint32_t {
     Helicopter = 0,
     // Brought in by the insertion boat instead. For maps that start on water.
     Boat = 1,
-    // Both craft run in, and the player picks which one carries them before the
+    // A double-speed BlackHawk run that holds above the spawn while the player
+    // rappels down, instead of landing.
+    FastRappel = 2,
+    // The player picks between both helicopter runs and the boat before the
     // level starts. Only maps that set this offer the choice.
-    PlayerChoice = 2
+    PlayerChoice = 3
 };
 
 struct LevelDefinition {
     uint32_t schemaVersion = 1;
     std::string name = "Untitled Level";
-    // Which insertion vehicle delivers the player. PlayerChoice puts the map's
-    // arrival up to the player; the other two settle it in the level file.
+    // Which insertion delivers the player. PlayerChoice puts the map's arrival
+    // up to the player; the other modes settle it in the level file.
     LevelInsertionMode insertionMode = LevelInsertionMode::Helicopter;
     float terrainHeightScale = 5.0f;
     // Island builder: terrain drawn extent (tile grid) and coastline scale. The

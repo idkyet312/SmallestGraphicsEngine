@@ -7,6 +7,7 @@
 #include "GameSession.h"
 #include "CombatSystem.h"
 #include "VehicleSystem.h"
+#include "DeploymentPlanner.h"
 #include "LevelLoadingController.h"
 #include "LevelRuntimeBuilder.h"
 #include "PlayerState.h"
@@ -253,6 +254,73 @@ int main() {
     CHECK(vehicleDamage.destroyed);
     CHECK(vehicles.helicopterDead);
 
+    vehicles.insertionBoatPhase = VehicleSystem::InsertionBoatPhase::Inbound;
+    vehicles.insertionBoatHealth = VehicleSystem::InsertionBoatMaxHealth;
+    vehicles.UpdateInsertionBoat(10.0f);
+    CHECK(vehicles.insertionBoatHealth == VehicleSystem::InsertionBoatMaxHealth);
+    vehicleDamage = vehicles.DamageInsertionBoatFromEnemyFire(
+        VehicleSystem::InsertionBoatMaxHealth * 0.35f);
+    CHECK(vehicleDamage.applied);
+    CHECK(!vehicleDamage.destroyed);
+    CHECK(std::abs(vehicles.insertionBoatHealth -
+        VehicleSystem::InsertionBoatMaxHealth * 0.65f) < 0.001f);
+    vehicleDamage = vehicles.DamageInsertionBoatFromEnemyFire(
+        VehicleSystem::InsertionBoatMaxHealth * 0.65f);
+    CHECK(vehicleDamage.destroyed);
+    CHECK(vehicles.InsertionBoatIsFoundering());
+    CHECK(!vehicles.DamageInsertionBoatFromEnemyFire(1.0f).applied);
+
+    vehicles.blackHawkPhase = VehicleSystem::BlackHawkPhase::Inbound;
+    vehicles.blackHawkHealth = VehicleSystem::BlackHawkMaxHealth;
+    vehicles.UpdateBlackHawk(10.0f);
+    CHECK(vehicles.blackHawkHealth == VehicleSystem::BlackHawkMaxHealth);
+
+    VehicleSystem normalInsertion;
+    VehicleSystem fastInsertion;
+    normalInsertion.BeginBlackHawkInsertion({ 0.0f, 0.0f, 0.0f },
+                                             0.0f, 0.0f, false);
+    fastInsertion.BeginBlackHawkInsertion({ 0.0f, 0.0f, 0.0f },
+                                           0.0f, 0.0f, true);
+    normalInsertion.UpdateBlackHawk(1.0f);
+    fastInsertion.UpdateBlackHawk(1.0f);
+    const float normalTravel = normalInsertion.blackHawkPosition.z +
+        VehicleSystem::BlackHawkApproachDistance;
+    const float fastTravel = fastInsertion.blackHawkPosition.z +
+        VehicleSystem::BlackHawkApproachDistance;
+    CHECK(std::abs(fastTravel - normalTravel *
+        VehicleSystem::BlackHawkFastSpeedMultiplier) < 0.001f);
+    for (int stepIndex = 0;
+         stepIndex < 1000 &&
+             fastInsertion.blackHawkPhase ==
+                 VehicleSystem::BlackHawkPhase::Inbound;
+         ++stepIndex)
+        fastInsertion.UpdateBlackHawk(0.05f);
+    CHECK(fastInsertion.BlackHawkIsRappelling());
+    CHECK(std::abs(fastInsertion.blackHawkPosition.y -
+        VehicleSystem::BlackHawkRappelHoverHeight) < 0.001f);
+    fastInsertion.UpdateBlackHawk(
+        VehicleSystem::BlackHawkRappelTime * 0.5f);
+    CHECK(std::abs(fastInsertion.blackHawkRappelProgress - 0.5f) < 0.001f);
+    CHECK(fastInsertion.blackHawkCarryingPlayer);
+    fastInsertion.UpdateBlackHawk(
+        VehicleSystem::BlackHawkRappelTime * 0.5f);
+    CHECK(fastInsertion.blackHawkDroppedPlayer);
+    CHECK(!fastInsertion.blackHawkCarryingPlayer);
+    CHECK(fastInsertion.blackHawkPhase ==
+        VehicleSystem::BlackHawkPhase::Departing);
+
+    vehicleDamage = vehicles.DamageInsertionBlackHawkFromEnemyFire(
+        VehicleSystem::BlackHawkMaxHealth * 0.40f);
+    CHECK(vehicleDamage.applied);
+    CHECK(!vehicleDamage.destroyed);
+    CHECK(std::abs(vehicles.blackHawkHealth -
+        VehicleSystem::BlackHawkMaxHealth * 0.60f) < 0.001f);
+    vehicleDamage = vehicles.DamageInsertionBlackHawkFromEnemyFire(
+        VehicleSystem::BlackHawkMaxHealth * 0.60f);
+    CHECK(vehicleDamage.destroyed);
+    CHECK(vehicles.BlackHawkIsCrashing());
+    CHECK(!vehicles.DamageInsertionBlackHawkFromEnemyFire(1.0f).applied);
+
     CombatSystem combat;
     combat.heldBarrelIndex = 4;
     combat.ResetLevel();
@@ -282,7 +350,37 @@ int main() {
     CHECK(player.magazine[4] == 7);
     CHECK(player.reserve[4] == 0);
     CHECK(player.magazineSize[7] == 1);
+
+    PlayerState fastRappelLoadout;
+    fastRappelLoadout.magazine[0] = 5;
+    fastRappelLoadout.reserve[0] = 9;
+    fastRappelLoadout.magazine[2] = 1;
+    fastRappelLoadout.reserve[2] = 5;
+    fastRappelLoadout.reloadTimer = 1.0f;
+    fastRappelLoadout.reloadingSlot = 0;
+    fastRappelLoadout.HalveAmmo();
+    CHECK(fastRappelLoadout.magazine[0] == 2);
+    CHECK(fastRappelLoadout.reserve[0] == 4);
+    CHECK(fastRappelLoadout.magazine[2] == 0);
+    CHECK(fastRappelLoadout.reserve[2] == 2);
+    CHECK(!fastRappelLoadout.Reloading());
+    CHECK(fastRappelLoadout.reloadingSlot == -1);
     CHECK(player.maxReserve[7] == 24);
+
+    const auto deploymentZones = DeploymentPlanner::BuildPerimeterZones(
+        34.0f, 68.0f, 8,
+        [](float x, float z) { return x * 0.25f + z * 0.5f; });
+    CHECK(deploymentZones.size() == 8);
+    CHECK(std::abs(deploymentZones[0].x) < 0.001f);
+    CHECK(std::abs(deploymentZones[0].z - 68.0f) < 0.001f);
+    CHECK(std::abs(deploymentZones[0].y - 34.0f) < 0.001f);
+    CHECK(std::abs(deploymentZones[2].x - 34.0f) < 0.001f);
+    CHECK(std::abs(deploymentZones[2].z) < 0.001f);
+    const float westwardHeading =
+        DeploymentPlanner::HeadingTowardIslandCenter({ 10.0f, 0.0f, 0.0f });
+    CHECK(std::abs(westwardHeading + DirectX::XM_PIDIV2) < 0.001f);
+    CHECK(std::abs(std::sin(westwardHeading) + 1.0f) < 0.001f);
+    CHECK(std::abs(std::cos(westwardHeading)) < 0.001f);
 
     DeferredReleaseQueue<int> releases;
     releases.Retire(4, 10);

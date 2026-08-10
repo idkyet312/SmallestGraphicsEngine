@@ -1550,10 +1550,11 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         &level_.terrainHeightScale, 0.1f, 0.0f, 50.0f);
     TrackItemEdit(terrainBefore, terrainChanged);
     {
-        // How the player arrives. "Player choice" runs both craft in and lets
-        // the player pick which one carries them when the level starts.
+        // How the player arrives. "Player choice" offers both BlackHawk runs
+        // and the boat when the level starts.
         const LevelDefinition insertionBefore = level_;
-        const char* modes[] = { "Helicopter", "Boat", "Player choice" };
+        const char* modes[] = {
+            "Helicopter", "Boat", "Fast helicopter rappel", "Player choice" };
         int mode = static_cast<int>(level_.insertionMode);
         const bool insertionChanged =
             ImGui::Combo("Insertion", &mode, modes, IM_ARRAYSIZE(modes));

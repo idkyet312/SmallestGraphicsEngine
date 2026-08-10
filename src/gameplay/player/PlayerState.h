@@ -36,6 +36,15 @@ struct PlayerState {
         reloadingSlot = -1;
     }
 
+    void HalveAmmo() {
+        for (int i = 0; i < kWeaponSlots; ++i) {
+            magazine[i] /= 2;
+            reserve[i] /= 2;
+        }
+        reloadTimer = 0.0f;
+        reloadingSlot = -1;
+    }
+
     bool BeginReload(int slot) {
         if (!AmmoEnforced() || Reloading()) return false;
         if (slot < 0 || slot >= kWeaponSlots) return false;

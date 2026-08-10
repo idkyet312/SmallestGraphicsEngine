@@ -88,9 +88,12 @@ int main() {
     CHECK(ParseLevelInsertionMode("boat", insertion));
     CHECK(insertion == LevelInsertionMode::Boat);
     CHECK(std::string(LevelInsertionModeName(insertion)) == "boat");
+    CHECK(ParseLevelInsertionMode("fast_rappel", insertion));
+    CHECK(insertion == LevelInsertionMode::FastRappel);
+    CHECK(std::string(LevelInsertionModeName(insertion)) == "fast_rappel");
     CHECK(!ParseLevelInsertionMode("submarine", insertion));
     // Unchanged by the failed parse.
-    CHECK(insertion == LevelInsertionMode::Boat);
+    CHECK(insertion == LevelInsertionMode::FastRappel);
 
     LevelDefinition duplicate = level;
     duplicate.entities[1].id = duplicate.entities[0].id;

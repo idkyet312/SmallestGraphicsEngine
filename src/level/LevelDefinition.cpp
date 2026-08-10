@@ -94,6 +94,7 @@ const char* LevelInsertionModeName(LevelInsertionMode mode) {
     switch (mode) {
     case LevelInsertionMode::Helicopter: return "helicopter";
     case LevelInsertionMode::Boat: return "boat";
+    case LevelInsertionMode::FastRappel: return "fast_rappel";
     case LevelInsertionMode::PlayerChoice: return "player_choice";
     }
     return "helicopter";

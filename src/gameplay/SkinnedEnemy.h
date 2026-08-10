@@ -130,6 +130,16 @@ public:
     enum class AwarenessState { Patrol, Alert, Combat };
     AwarenessState Awareness() const { return awareness_; }
 
+    // An occupied insertion craft is an unmistakable battlefield target. This
+    // bypasses the pedestrian vision cone while main still performs the real
+    // world line-of-sight test before allowing a shot.
+    void ForceCombatTarget(const DirectX::XMFLOAT3& target) {
+        if (dead_ || held_) return;
+        awareness_ = AwarenessState::Combat;
+        combatMemoryTimer_ = 4.0f;
+        lastKnownTarget_ = target;
+    }
+
     // TEMP DEBUG: exposes the rifle firing gate so the ImGui panel can show
     // why an actor is or is not shooting. Remove once marine fire is verified.
     bool DebugPreparingShot() const { return preparingShot_; }

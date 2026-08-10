@@ -83,6 +83,7 @@
 #include "CombatSystem.h"
 #include "EnemySystem.h"
 #include "VehicleSystem.h"
+#include "DeploymentPlanner.h"
 #include "GameRuntime.h"
 #include "DeferredReleaseQueue.h"
 #include "AssetRegistry.h"
@@ -534,6 +535,25 @@ static size_t LiveMarineCount() {
     return count;
 }
 
+// While the player is still aboard, enemies attack the transport rather than
+// the camera point tucked inside it. A hull-centred aim point makes hits land
+// on the craft's collision volume and feed its existing failure health.
+static bool OccupiedInsertionVehicleTarget(XMFLOAT3& target) {
+    const VehicleSystem& vehicles = g_game.vehicles;
+    if (vehicles.blackHawkVisible && vehicles.blackHawkCarryingPlayer) {
+        target = vehicles.blackHawkPosition;
+        target.y += 2.2f;
+        return true;
+    }
+    if (vehicles.insertionBoatVisible &&
+        vehicles.insertionBoatCarryingPlayer) {
+        target = vehicles.insertionBoatPosition;
+        target.y -= vehicles.insertionBoatSinkOffset;
+        return true;
+    }
+    return false;
+}
+
 // Nearest position this actor should perceive/aim/shoot at: bandits target the
 // nearest of {player, each live marine}; marines target the nearest live bandit
 // and never the player. Ties favor the player so behavior is unchanged when no
@@ -690,6 +710,22 @@ XMFLOAT3 BlackHawkRideWorldPosition() {
     return g_game.vehicles.BlackHawkRidePosition();
 }
 
+bool BlackHawkRappelActive() {
+    return g_game.vehicles.BlackHawkIsRappelling();
+}
+
+XMFLOAT3 BlackHawkRappelPlayerWorldPosition() {
+    const VehicleSystem& vehicles = g_game.vehicles;
+    const XMFLOAT3 anchor = vehicles.BlackHawkRidePosition();
+    const float groundCentre =
+        vehicles.blackHawkGroundY + scene.camera.PlayerHeight * 0.5f;
+    const float progress = (std::max)(0.0f, (std::min)(
+        1.0f, vehicles.blackHawkRappelProgress));
+    return { anchor.x,
+             anchor.y + (groundCentre - anchor.y) * progress,
+             anchor.z };
+}
+
 XMFLOAT3 BlackHawkRideDebugInfo(XMFLOAT3& outLocal) {
     const VehicleSystem& vehicles = g_game.vehicles;
     outLocal = { vehicles.blackHawkRideSide, vehicles.blackHawkRideHeight,
@@ -706,23 +742,46 @@ float BlackHawkModelScale() { return g_blackHawkModelScale; }
 
 static LevelInsertionMode ResolvedInsertionMode();
 
+static LevelInsertionMode g_playerInsertionChoice =
+    LevelInsertionMode::Helicopter;
+static bool g_insertionChoicePending = false;
+static bool g_insertionChoiceCursorReleased = false;
+static std::vector<XMFLOAT3> g_deploymentZones;
+static int g_selectedDeploymentZone = -1;
+static XMFLOAT3 g_deploymentTarget{};
+static bool g_deploymentTargetValid = false;
+static float g_deploymentFlythroughTime = 0.0f;
+
+bool DeploymentPlanningActive() { return g_insertionChoicePending; }
+const std::vector<XMFLOAT3>& DeploymentZonePositions() {
+    return g_deploymentZones;
+}
+int SelectedDeploymentZoneIndex() { return g_selectedDeploymentZone; }
+
 // Sends the BlackHawk on an insertion run that ends at the player's spawn. It
 // runs in from behind the direction the player is facing, so the approach
 // crosses their view before it flares and sets down on top of them.
 static void StartBlackHawkInsertionAtPlayerSpawn() {
-    const XMFLOAT3& spawn = scene.camera.Position;
+    const XMFLOAT3 spawn = g_deploymentTargetValid
+        ? g_deploymentTarget : scene.camera.Position;
     auto params = CurrentTerrainParams();
     params.heightScale = scene.terrainHeightScale;
     // Never below the water plane, so the skids stay dry on a low spawn.
     const float groundY = (std::max)(0.0f,
         TerrainRendererDX12::HeightAt(params, spawn.x, spawn.z));
-    // Camera yaw is degrees measured from +X; convert to the +Z-relative
-    // heading the helicopter flies along, then come in over the player's back.
-    const float facing = XMConvertToRadians(90.0f - scene.camera.Yaw);
+    // The craft starts outside the selected perimeter point and flies inward.
+    const float facing =
+        DeploymentPlanner::HeadingTowardIslandCenter(spawn);
     // Only called when this level inserts by helicopter, so the run always
     // carries the player. See ResolvedInsertionMode.
+    const bool fastRappel =
+        ResolvedInsertionMode() == LevelInsertionMode::FastRappel;
+    // Fast insertion trades preparation time for supplies. StartLevelOne has
+    // just restored the full loadout, and this arming function runs once per
+    // attempt, so restarts cannot compound the reduction.
+    if (fastRappel) scene.player.HalveAmmo();
     g_game.vehicles.BeginBlackHawkInsertion(
-        { spawn.x, groundY, spawn.z }, groundY, facing);
+        { spawn.x, groundY, spawn.z }, groundY, facing, fastRappel);
 }
 
 static void UpdateBlackHawkPalette();
@@ -781,7 +840,9 @@ static void RidePlayerInBlackHawk() {
         // The attach point is the player's centre, but the camera is the eye,
         // which rides PlayerHeight above the feet -- so lift by half a body to
         // put the middle of the player on the authored spot.
-        const XMFLOAT3 centre = vehicles.BlackHawkRidePosition();
+        const XMFLOAT3 centre = BlackHawkRappelActive()
+            ? BlackHawkRappelPlayerWorldPosition()
+            : vehicles.BlackHawkRidePosition();
         scene.camera.Position = { centre.x,
                                   centre.y + scene.camera.PlayerHeight * 0.5f,
                                   centre.z };
@@ -799,7 +860,11 @@ static void RidePlayerInBlackHawk() {
         const float rightX = std::cos(vehicles.blackHawkYaw);
         const float rightZ = -std::sin(vehicles.blackHawkYaw);
         constexpr float clearance = 2.5f;
-        const XMFLOAT3 centre = vehicles.BlackHawkRidePosition();
+        const XMFLOAT3 centre =
+            vehicles.blackHawkFastRappel &&
+                vehicles.blackHawkRappelProgress > 0.0f
+            ? BlackHawkRappelPlayerWorldPosition()
+            : vehicles.BlackHawkRidePosition();
         scene.camera.Position = {
             centre.x + rightX * clearance,
             centre.y + scene.camera.PlayerHeight * 0.5f,
@@ -825,6 +890,16 @@ static void RidePlayerInBlackHawk() {
         return;
     }
     if (vehicles.blackHawkDroppedPlayer) {
+        if (vehicles.blackHawkFastRappel) {
+            const XMFLOAT3 anchor = vehicles.BlackHawkRidePosition();
+            scene.camera.Position = {
+                anchor.x,
+                vehicles.blackHawkGroundY + scene.camera.PlayerHeight,
+                anchor.z };
+            scene.camera.VerticalVelocity = 0.0f;
+            scene.camera.IsGrounded = true;
+            return;
+        }
         // Step out the right-hand door, clear of the hull, on the same side the
         // player rode on. Forward is (sin, cos), so right is (cos, -sin).
         const float rightX = std::cos(vehicles.blackHawkYaw);
@@ -839,45 +914,76 @@ static void RidePlayerInBlackHawk() {
     }
 }
 
-// What the player picked when a map leaves the insertion vehicle up to them.
-// Only consulted for LevelInsertionMode::PlayerChoice maps; the other modes are
-// settled in the level file. Holds the last answer so ResolvedInsertionMode has
-// something to read for the rest of the run, but the prompt is re-raised on
-// every restart rather than reusing it silently.
-static bool g_playerPrefersBoatInsertion = false;
-// Raised when a PlayerChoice map starts or restarts, cleared once the player
-// answers, so the prompt shows exactly once per level start.
-static bool g_insertionChoicePending = false;
-// Whether the choice screen has already freed the pointer for its buttons. A
-// file-scope flag rather than a static local so a restart can clear it: the
-// restart re-grabs the cursor for mouse-look, and a stale "already released"
-// would leave the next prompt up with no usable pointer.
-static bool g_insertionChoiceCursorReleased = false;
-
-// The mode this level actually runs with, after folding in the player's pick.
-// Never returns PlayerChoice: that is a level-file setting, not a runtime state.
+// The deployment screen always resolves PlayerChoice before either run arms.
 static LevelInsertionMode ResolvedInsertionMode() {
-    // Stock (non-custom) levels have no level file, so they keep the original
-    // helicopter insertion.
-    if (!g_customLevelMode) return LevelInsertionMode::Helicopter;
-    const LevelInsertionMode mode = g_game.world.Level().insertionMode;
-    if (mode != LevelInsertionMode::PlayerChoice) return mode;
-    return g_playerPrefersBoatInsertion ? LevelInsertionMode::Boat
-                                        : LevelInsertionMode::Helicopter;
+    return g_playerInsertionChoice;
+}
+
+static void BeginDeploymentPlanning() {
+    auto params = CurrentTerrainParams();
+    params.heightScale = scene.terrainHeightScale;
+    constexpr float deploymentRadius = 34.0f;
+    g_deploymentZones = DeploymentPlanner::BuildPerimeterZones(
+        deploymentRadius * params.islandScaleX,
+        deploymentRadius * params.islandScaleZ, 8,
+        [&](float x, float z) {
+            return (std::max)(0.0f,
+                TerrainRendererDX12::HeightAt(params, x, z));
+        });
+    g_selectedDeploymentZone = -1;
+    g_deploymentTarget = {};
+    g_deploymentTargetValid = false;
+    g_deploymentFlythroughTime = 0.0f;
+    LevelInsertionMode authored = g_customLevelMode
+        ? g_game.world.Level().insertionMode
+        : LevelInsertionMode::Helicopter;
+    if (authored == LevelInsertionMode::PlayerChoice)
+        authored = LevelInsertionMode::Helicopter;
+    g_playerInsertionChoice = authored;
+    g_insertionChoicePending = true;
+    g_game.session.StopTimer();
+    scene.camera.FPSMode = false;
+}
+
+static void UpdateDeploymentPlanningCamera(float deltaTime) {
+    if (!g_insertionChoicePending || g_game.loading.Active()) return;
+    g_deploymentFlythroughTime += (std::max)(0.0f, deltaTime);
+    auto params = CurrentTerrainParams();
+    const float islandRadius = 43.0f * (std::max)(
+        params.islandScaleX, params.islandScaleZ);
+    const float orbitRadius = (std::max)(95.0f, islandRadius * 1.75f);
+    const float angle = g_deploymentFlythroughTime * 0.13f;
+    scene.camera.Position = {
+        std::sin(angle) * orbitRadius,
+        (std::max)(62.0f, islandRadius * 0.78f),
+        std::cos(angle) * orbitRadius };
+    const XMFLOAT3 toCenter{
+        -scene.camera.Position.x,
+        4.0f - scene.camera.Position.y,
+        -scene.camera.Position.z };
+    const float horizontal = std::sqrt(
+        toCenter.x * toCenter.x + toCenter.z * toCenter.z);
+    scene.camera.Yaw = XMConvertToDegrees(
+        std::atan2(toCenter.z, toCenter.x));
+    scene.camera.Pitch = XMConvertToDegrees(
+        std::atan2(toCenter.y, horizontal));
+    scene.camera.ProcessMouseMovement(0.0f, 0.0f);
 }
 
 // Sends the insertion boat in toward the player's spawn. The seaborne twin of
 // StartBlackHawkInsertionAtPlayerSpawn: it runs in across the water on the
 // heading the player is facing away from, so the approach crosses their view.
 static void StartInsertionBoatRunAtPlayerSpawn() {
-    const XMFLOAT3& spawn = scene.camera.Position;
+    const XMFLOAT3 spawn = g_deploymentTargetValid
+        ? g_deploymentTarget : scene.camera.Position;
     auto params = CurrentTerrainParams();
     params.heightScale = scene.terrainHeightScale;
     const float groundY =
         TerrainRendererDX12::HeightAt(params, spawn.x, spawn.z);
     // Boats ride the water plane, never the terrain under it.
     const float waterY = (std::max)(0.0f, groundY);
-    const float facing = XMConvertToRadians(90.0f - scene.camera.Yaw);
+    const float facing =
+        DeploymentPlanner::HeadingTowardIslandCenter(spawn);
     // Only called when this level inserts by boat, so the run always carries
     // the player. See ResolvedInsertionMode.
     g_game.vehicles.BeginInsertionBoatRun(
@@ -1386,25 +1492,33 @@ static void DamageBoat(float damage, const XMFLOAT3& hit) {
     scene.SpawnSmokeBurst(g_boatPosition, 1.6f, 2.2f);
 }
 
-static bool HitHelicopterAtSegment(const XMFLOAT3& position, bool dead,
-                                   const XMFLOAT3& start, const XMFLOAT3& end,
-                                   float radius, XMFLOAT3& hit) {
-    if (g_emptyLevelMode || !scene.showHelicopter ||
-        !g_helicopterModel || dead) return false;
+static bool HitSphereAtSegment(const XMFLOAT3& centerPosition,
+                               float hitRadius,
+                               const XMFLOAT3& start, const XMFLOAT3& end,
+                               float radius, XMFLOAT3& hit) {
     const XMVECTOR a = XMLoadFloat3(&start);
     const XMVECTOR b = XMLoadFloat3(&end);
-    const XMVECTOR center = XMLoadFloat3(&position);
+    const XMVECTOR center = XMLoadFloat3(&centerPosition);
     const XMVECTOR ab = b - a;
     const float lengthSq = XMVectorGetX(XMVector3LengthSq(ab));
     float t = lengthSq > 1e-6f
         ? XMVectorGetX(XMVector3Dot(center - a, ab)) / lengthSq : 0.0f;
     t = (std::max)(0.0f, (std::min)(1.0f, t));
     const XMVECTOR closest = a + ab * t;
-    const float hitRadius = 5.0f + radius;
-    if (XMVectorGetX(XMVector3LengthSq(center - closest)) > hitRadius * hitRadius)
+    const float combinedRadius = hitRadius + radius;
+    if (XMVectorGetX(XMVector3LengthSq(center - closest)) >
+        combinedRadius * combinedRadius)
         return false;
     XMStoreFloat3(&hit, closest);
     return true;
+}
+
+static bool HitHelicopterAtSegment(const XMFLOAT3& position, bool dead,
+                                   const XMFLOAT3& start, const XMFLOAT3& end,
+                                   float radius, XMFLOAT3& hit) {
+    if (g_emptyLevelMode || !scene.showHelicopter ||
+        !g_helicopterModel || dead) return false;
+    return HitSphereAtSegment(position, 5.0f, start, end, radius, hit);
 }
 
 static bool HitHelicopterSegment(const XMFLOAT3& start, const XMFLOAT3& end,
@@ -1421,16 +1535,26 @@ static bool HitSecondaryHelicopterSegment(const XMFLOAT3& start,
         start, end, radius, hit);
 }
 
-static bool HitBoatSegment(const XMFLOAT3& start, const XMFLOAT3& end,
-                           float radius, XMFLOAT3& hit) {
-    if (!g_boatModel || g_boatDead) return false;
+static bool HitOccupiedInsertionBlackHawkSegment(
+        const XMFLOAT3& start, const XMFLOAT3& end,
+        float radius, XMFLOAT3& hit) {
+    const VehicleSystem& vehicles = g_game.vehicles;
+    if (!g_blackHawkModel || !vehicles.blackHawkVisible ||
+        !vehicles.blackHawkCarryingPlayer)
+        return false;
+    XMFLOAT3 center = vehicles.blackHawkPosition;
+    center.y += 2.2f;
+    return HitSphereAtSegment(center, 5.0f, start, end, radius, hit);
+}
+
+static bool HitBoatHullAtSegment(const XMFLOAT3& position, float yaw,
+                                 const XMFLOAT3& start, const XMFLOAT3& end,
+                                 float radius, XMFLOAT3& hit) {
     // Low, flat hull -- a single generous sphere at deck height would engulf
-    // the standing mounted gunner and steal shots aimed at his head/torso.
-    // Model the hull as an oriented box instead: long along the boat's yaw,
-    // narrow across the beam, and only as tall as the actual freeboard.
+    // passengers and steal shots aimed over the gunwale.
     const XMVECTOR a = XMLoadFloat3(&start);
     const XMVECTOR b = XMLoadFloat3(&end);
-    const XMVECTOR center = XMLoadFloat3(&g_boatPosition);
+    const XMVECTOR center = XMLoadFloat3(&position);
     const XMVECTOR ab = b - a;
     const float lengthSq = XMVectorGetX(XMVector3LengthSq(ab));
     float t = lengthSq > 1e-6f
@@ -1438,9 +1562,8 @@ static bool HitBoatSegment(const XMFLOAT3& start, const XMFLOAT3& end,
     t = (std::max)(0.0f, (std::min)(1.0f, t));
     const XMVECTOR closest = a + ab * t;
     const XMVECTOR offset = closest - center;
-    const float sinYaw = std::sin(g_boatYaw), cosYaw = std::cos(g_boatYaw);
+    const float sinYaw = std::sin(yaw), cosYaw = std::cos(yaw);
     XMFLOAT3 offsetF; XMStoreFloat3(&offsetF, offset);
-    // Rotate the offset into the hull's local frame (X = beam, Z = length).
     const float localX = offsetF.x * cosYaw - offsetF.z * sinYaw;
     const float localZ = offsetF.x * sinYaw + offsetF.z * cosYaw;
     const float localY = offsetF.y;
@@ -1451,6 +1574,26 @@ static bool HitBoatSegment(const XMFLOAT3& start, const XMFLOAT3& end,
         return false;
     XMStoreFloat3(&hit, closest);
     return true;
+}
+
+static bool HitBoatSegment(const XMFLOAT3& start, const XMFLOAT3& end,
+                           float radius, XMFLOAT3& hit) {
+    if (!g_boatModel || g_boatDead) return false;
+    return HitBoatHullAtSegment(
+        g_boatPosition, g_boatYaw, start, end, radius, hit);
+}
+
+static bool HitOccupiedInsertionBoatSegment(
+        const XMFLOAT3& start, const XMFLOAT3& end,
+        float radius, XMFLOAT3& hit) {
+    const VehicleSystem& vehicles = g_game.vehicles;
+    if (!g_insertionBoatModel || !vehicles.insertionBoatVisible ||
+        !vehicles.insertionBoatCarryingPlayer)
+        return false;
+    XMFLOAT3 position = vehicles.insertionBoatPosition;
+    position.y -= vehicles.insertionBoatSinkOffset;
+    return HitBoatHullAtSegment(
+        position, vehicles.insertionBoatYaw, start, end, radius, hit);
 }
 
 static void PlayBanditDeathEvents();
@@ -6163,6 +6306,10 @@ static void OpenMainMenu() {
     g_prefabAudioPlayers.clear();
     g_game.session.SetScreen(GameScreen::MainMenu);
     g_game.session.StopTimer();
+    g_insertionChoicePending = false;
+    g_deploymentZones.clear();
+    g_selectedDeploymentZone = -1;
+    g_deploymentTargetValid = false;
     showUI = false;
     cameraLocked = true;
     ReleaseCapture();
@@ -6315,19 +6462,18 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     // the terrain is up, which covers both the first load and every restart.
     g_blackHawkInsertionRestartPending = !g_emptyLevelMode;
     g_insertionBoatRestartPending = !g_emptyLevelMode;
-    // Maps flagged PlayerChoice ask which craft brings the player in, on every
-    // start and restart -- the previous answer is not carried over, since a
-    // retry is exactly when someone wants to try arriving the other way. Only
-    // the craft that is picked flies; the other stands down entirely.
-    g_insertionChoicePending = !g_emptyLevelMode && g_customLevelMode &&
-        g_game.world.Level().insertionMode == LevelInsertionMode::PlayerChoice;
-    // Put both craft down until the arming step revives the picked one. A
-    // restart otherwise leaves last run's wreck or a mid-air pose on screen
-    // while the prompt is up, and the choice screen is the first thing the
-    // player sees.
-    if (g_insertionChoicePending) {
+    // Every playable map opens on the deployment fly-through. The authored mode
+    // is the initial selection, but the player can pick any of the three routes
+    // and one of the perimeter zones before the run and timer begin.
+    if (!g_emptyLevelMode) {
+        BeginDeploymentPlanning();
         g_game.vehicles.DisableBlackHawkInsertion();
         g_game.vehicles.DisableInsertionBoat();
+    } else {
+        g_insertionChoicePending = false;
+        g_deploymentZones.clear();
+        g_selectedDeploymentZone = -1;
+        g_deploymentTargetValid = false;
     }
     g_game.commands.Set(GameCommand::ResetLevelRuntime, modeAssetsLoaded);
     deathCursorReleased = false;
@@ -6336,10 +6482,11 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_insertionChoiceCursorReleased = false;
     showUI = startWithUIAndMobileControls;
     virtualInput.showPad = startWithUIAndMobileControls;
-    cameraLocked = false;
-    if (startWithUIAndMobileControls) {
+    cameraLocked = g_insertionChoicePending;
+    if (g_insertionChoicePending || startWithUIAndMobileControls) {
         ReleaseCapture();
         SetCursorVisible(true);
+        g_insertionChoiceCursorReleased = g_insertionChoicePending;
     } else {
         SetCapture(hwnd);
         SetCursorVisible(false);
@@ -6621,9 +6768,8 @@ static void RenderDeathScreen(HWND hwnd) {
     ImGui::End();
 }
 
-// Asks which craft brings the player in. Shown only on maps flagged
-// player_choice, and only until answered: both insertion runs are held until
-// then, so whichever is picked is the one that actually carries the player.
+// Deployment fly-through: pick a green perimeter zone and one insertion type.
+// Both runs stay held until DEPLOY, so the chosen target is authoritative.
 static void RenderInsertionChoiceScreen(HWND hwnd) {
     // Free the pointer so the buttons can be clicked, the way the death screen
     // does. Recaptured below once the choice is made.
@@ -6635,33 +6781,117 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     }
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     ImGui::GetBackgroundDrawList()->AddRectFilled(
-        ImVec2(0, 0), display, IM_COL32(6, 14, 26, 200));
-    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(390.0f, 250.0f), ImGuiCond_Always);
-    ImGui::Begin("Insertion Choice", nullptr, ImGuiWindowFlags_NoTitleBar |
+        ImVec2(0, 0), ImVec2(display.x, 64.0f), IM_COL32(4, 12, 20, 175));
+
+    const XMMATRIX viewProjection =
+        scene.GetViewMatrix() * scene.GetProjectionMatrix();
+    ImDrawList* foreground = ImGui::GetForegroundDrawList();
+    const ImVec2 mouse = ImGui::GetMousePos();
+    const bool selectClick = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    for (size_t index = 0; index < g_deploymentZones.size(); ++index) {
+        XMFLOAT3 marker = g_deploymentZones[index];
+        marker.y += 1.3f;
+        const XMVECTOR clip = XMVector3Transform(
+            XMLoadFloat3(&marker), viewProjection);
+        const float w = XMVectorGetW(clip);
+        if (w <= 0.01f) continue;
+        const ImVec2 screen{
+            (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+            (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y };
+        const bool selected = static_cast<int>(index) ==
+                              g_selectedDeploymentZone;
+        const float radius = selected ? 18.0f : 13.0f;
+        const float dx = mouse.x - screen.x;
+        const float dy = mouse.y - screen.y;
+        if (selectClick && screen.x < display.x - 430.0f &&
+            dx * dx + dy * dy <= 24.0f * 24.0f) {
+            g_selectedDeploymentZone = static_cast<int>(index);
+        }
+        const ImU32 fill = selected ? IM_COL32(90, 255, 105, 235)
+                                    : IM_COL32(35, 220, 75, 205);
+        foreground->AddCircleFilled(screen, radius, fill);
+        foreground->AddCircle(screen, radius + 3.0f,
+                              IM_COL32(205, 255, 210, 240), 0, 2.0f);
+        const std::string number = std::to_string(index + 1);
+        const ImVec2 labelSize = ImGui::CalcTextSize(number.c_str());
+        foreground->AddText(
+            ImVec2(screen.x - labelSize.x * 0.5f,
+                   screen.y - labelSize.y * 0.5f),
+            IM_COL32(0, 45, 10, 255), number.c_str());
+    }
+
+    const char* instruction =
+        "SELECT A GREEN DEPLOYMENT ZONE, THEN CHOOSE YOUR INSERTION";
+    foreground->AddText(
+        ImVec2((display.x - ImGui::CalcTextSize(instruction).x) * 0.5f, 23.0f),
+        IM_COL32(190, 255, 205, 255), instruction);
+
+    ImGui::SetNextWindowPos(ImVec2(display.x - 20.0f, display.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(1.0f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(390.0f, 410.0f), ImGuiCond_Always);
+    ImGui::Begin("Deployment Planning", nullptr, ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse);
     ImGui::Dummy(ImVec2(0.0f, 15.0f));
-    const char* title = "CHOOSE INSERTION";
+    const char* title = "DEPLOYMENT PLAN";
     ImGui::SetCursorPosX((390.0f - ImGui::CalcTextSize(title).x) * 0.5f);
     ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "%s", title);
-    ImGui::Dummy(ImVec2(0.0f, 20.0f));
-    // Hand the pointer back to mouse-look and let the held runs arm.
-    const auto choose = [&](bool boat) {
-        g_playerPrefersBoatInsertion = boat;
+    ImGui::Dummy(ImVec2(0.0f, 12.0f));
+    if (g_selectedDeploymentZone >= 0)
+        ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f),
+            "Zone %d selected", g_selectedDeploymentZone + 1);
+    else
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f),
+            "Click a green zone on the map");
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+
+    const auto modeButton = [&](const char* label, LevelInsertionMode mode) {
+        const bool selected = g_playerInsertionChoice == mode;
+        if (selected) {
+            ImGui::PushStyleColor(
+                ImGuiCol_Button, ImVec4(0.12f, 0.48f, 0.22f, 1.0f));
+            ImGui::PushStyleColor(
+                ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.58f, 0.28f, 1.0f));
+        }
+        ImGui::SetCursorPosX(45.0f);
+        if (ImGui::Button(label, ImVec2(300.0f, 48.0f)))
+            g_playerInsertionChoice = mode;
+        if (selected) ImGui::PopStyleColor(2);
+    };
+    modeButton("HELICOPTER LANDING", LevelInsertionMode::Helicopter);
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    modeButton("FAST HELI RAPPEL (-50% AMMO)", LevelInsertionMode::FastRappel);
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    modeButton("BOAT INSERTION", LevelInsertionMode::Boat);
+    ImGui::Dummy(ImVec2(0.0f, 15.0f));
+
+    ImGui::BeginDisabled(g_selectedDeploymentZone < 0);
+    ImGui::SetCursorPosX(45.0f);
+    if (ImGui::Button("DEPLOY", ImVec2(300.0f, 58.0f))) {
+        g_deploymentTarget = g_deploymentZones[
+            static_cast<size_t>(g_selectedDeploymentZone)];
+        g_deploymentTargetValid = true;
         g_insertionChoicePending = false;
         g_insertionChoiceCursorReleased = false;
         cameraLocked = false;
+        scene.camera.FPSMode = true;
+        scene.camera.Position = {
+            g_deploymentTarget.x,
+            g_deploymentTarget.y + scene.camera.PlayerHeight,
+            g_deploymentTarget.z };
+        scene.camera.FloorY = g_deploymentTarget.y;
+        scene.camera.VerticalVelocity = 0.0f;
+        scene.camera.IsGrounded = true;
+        g_game.session.ResetTimer(true);
+        // The planning camera teleports to the selected insertion. None of the
+        // fly-through's temporal lighting or visibility history is valid there.
+        visBuffer.InvalidateTemporalHistory();
+        g_game.commands.Request(GameCommand::ResetDDGIHistory);
         SetCapture(hwnd);
         SetCursorVisible(false);
         firstMouse = true;
-    };
-    ImGui::SetCursorPosX(45.0f);
-    if (ImGui::Button("BY HELICOPTER", ImVec2(300.0f, 55.0f))) choose(false);
-    ImGui::Dummy(ImVec2(0.0f, 9.0f));
-    ImGui::SetCursorPosX(45.0f);
-    if (ImGui::Button("BY BOAT", ImVec2(300.0f, 55.0f))) choose(true);
+    }
+    ImGui::EndDisabled();
     ImGui::End();
 }
 
@@ -8786,6 +9016,12 @@ static void ApplyVirtualInput() {
 }
 
 static void ProcessInput(HWND) {
+    if (g_insertionChoicePending) {
+        scene.c4DetonateHeld = false;
+        scene.UpdateSniperScope(false, deltaTime);
+        scene.UpdateAimDownSights(false, deltaTime);
+        return;
+    }
     // Right mouse aims. The SVD goes to its scope overlay; every other weapon
     // raises iron sights instead, so the button means the same thing in the
     // player's hands regardless of what they are holding.
@@ -9963,6 +10199,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_game.session.Tick(deltaTime);
 
         ProcessInput(hwnd);
+        UpdateDeploymentPlanningCamera(deltaTime);
         // Player throws happen during input. Create the rigid body before
         // Scene::Update so manual projectile gravity never runs for one frame.
         SyncGrenadePhysicsBodies(false);
@@ -9972,7 +10209,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // while riding the insertion helicopter, where the seat drives the
         // camera and terrain/world collision would drag the player out of it.
         const bool ridingBlackHawk = g_game.vehicles.blackHawkCarryingPlayer;
-        if (ridingBlackHawk) {
+        const bool deploymentPlanning = g_insertionChoicePending;
+        if (deploymentPlanning) {
+            scene.camera.FloorY = 0.0f;
+        } else if (ridingBlackHawk) {
             // Keep the floor under the cabin so gravity has nothing to pull on.
             scene.camera.FloorY =
                 scene.camera.Position.y - scene.camera.PlayerHeight;
@@ -9990,7 +10230,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // ground snap in the same frame stands the player on them instead of
         // falling through. Uses last frame's body transforms -- fine for
         // standing, and avoids a one-frame lag that would drop the player.
-        if (!ridingBlackHawk) {
+        if (!ridingBlackHawk && !deploymentPlanning) {
             if (scene.useDestruction && g_destruction.IsInitialized()) {
                 g_destruction.ResolvePlayerCollision(scene.camera.Position,
                     scene.camera.FloorY, 0.35f, scene.camera.PlayerHeight,
@@ -10105,10 +10345,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             UpdateBoat(deltaTime);
             // Aim the insertion once the level is actually up. Waits for the
             // model and for loading to finish, so the drop-off is taken from
-            // the settled player spawn and the failure time is rolled fresh.
-            // The frame that arms it skips its own drain tick: that frame's
-            // delta still spans the load, and charging it against a run that
-            // only just started is what made reloads crash early.
+            // the settled player spawn. The arming frame uses zero delta so a
+            // load-sized step cannot advance a run that only just started.
             bool armedInsertionThisFrame = false;
             // Hold the run until a PlayerChoice map has its answer, then arm
             // only the craft that was picked -- the other one does not fly at
@@ -10116,7 +10354,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             if (g_blackHawkInsertionRestartPending && g_blackHawkModel &&
                 !g_insertionChoicePending && !g_game.loading.Active()) {
                 g_blackHawkInsertionRestartPending = false;
-                if (ResolvedInsertionMode() == LevelInsertionMode::Helicopter)
+                const LevelInsertionMode mode = ResolvedInsertionMode();
+                if (mode == LevelInsertionMode::Helicopter ||
+                    mode == LevelInsertionMode::FastRappel)
                     StartBlackHawkInsertionAtPlayerSpawn();
                 else
                     g_game.vehicles.DisableBlackHawkInsertion();
@@ -10147,9 +10387,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             RidePlayerInBlackHawk();
             UpdateBlackHawkCrashEffects(deltaTime);
 
-            // Insertion boat, armed and stepped the same way: the frame that
-            // starts a run skips its drain tick, since that delta spans the
-            // load and would otherwise hole the hull before it gets going.
+            // Insertion boat, armed and stepped the same way so a load-sized
+            // delta cannot advance a run that only just started.
             bool armedBoatRunThisFrame = false;
             if (g_insertionBoatRestartPending && g_insertionBoatModel &&
                 !g_insertionChoicePending && !g_game.loading.Active()) {
@@ -10225,7 +10464,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
         }
         // Dead Bandits stay attached to their ragdolls. No mid-level respawns.
-        if (!g_emptyLevelMode && g_banditLoaded) {
+        if (!g_emptyLevelMode && g_banditLoaded &&
+            !g_insertionChoicePending) {
             ProfilerDX12::CpuScope banditProfile(g_profiler, "Bandit Update");
             if (g_game.commands.Pending(GameCommand::RespawnTurretGunner)) {
                 const bool firstReady = SpawnHumveeTurretGunner(0);
@@ -10248,6 +10488,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // live bandit.
             std::vector<XMFLOAT3> liveMarinePositions;
             std::vector<XMFLOAT3> liveBanditPositions;
+            XMFLOAT3 insertionVehicleTarget{};
+            const bool insertionVehicleOccupied =
+                OccupiedInsertionVehicleTarget(insertionVehicleTarget);
             for (const auto& b : g_bandits) {
                 if (!b || b->Dead()) continue;
                 // Torso, not feet. position.y is the ground the actor stands
@@ -10315,8 +10558,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     else
                         bandit->leashPosition = scene.camera.Position;
                 }
-                const XMFLOAT3 target = NearestHostileTarget(
-                    *bandit, scene.camera.Position, liveMarinePositions, liveBanditPositions);
+                const bool attackingInsertionVehicle =
+                    insertionVehicleOccupied &&
+                    bandit->faction == Faction::Bandit;
+                const XMFLOAT3 target = attackingInsertionVehicle
+                    ? insertionVehicleTarget
+                    : NearestHostileTarget(
+                        *bandit, scene.camera.Position,
+                        liveMarinePositions, liveBanditPositions);
+                if (attackingInsertionVehicle)
+                    bandit->ForceCombatTarget(target);
                 const float cameraDx = bandit->position.x - scene.camera.Position.x;
                 const float cameraDz = bandit->position.z - scene.camera.Position.z;
                 const float cameraDistanceSq = cameraDx * cameraDx + cameraDz * cameraDz;
@@ -10404,6 +10655,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     ? true
                     : (!scene.player.godMode && scene.player.health > 0.0f);
                 if (!bandit->Dead() && !bandit->turretGunner && throwerReady &&
+                    !attackingInsertionVehicle &&
                     bandit->Awareness() == SkinnedEnemy::AwarenessState::Combat) {
                     bandit->grenadeCooldown -= deltaTime;
                     if (bandit->grenadeCooldown <= 0.0f) {
@@ -11156,6 +11408,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         projectile.active = false;
                         continue;
                     }
+                }
+                XMFLOAT3 insertionVehicleHit;
+                if (projectile.hostile &&
+                    HitOccupiedInsertionBlackHawkSegment(
+                        projectile.previousPosition, projectile.position,
+                        bulletRadius, insertionVehicleHit)) {
+                    const XMFLOAT3 normal(-projectile.direction.x,
+                                          -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(insertionVehicleHit, normal);
+                    g_game.vehicles.DamageInsertionBlackHawkFromEnemyFire(
+                        2.4f * projectile.damageMultiplier);
+                    stopProjectileAt(insertionVehicleHit);
+                    continue;
+                }
+                if (projectile.hostile &&
+                    HitOccupiedInsertionBoatSegment(
+                        projectile.previousPosition, projectile.position,
+                        bulletRadius, insertionVehicleHit)) {
+                    const XMFLOAT3 normal(-projectile.direction.x,
+                                          -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(insertionVehicleHit, normal);
+                    g_game.vehicles.DamageInsertionBoatFromEnemyFire(
+                        2.4f * projectile.damageMultiplier);
+                    stopProjectileAt(insertionVehicleHit);
+                    continue;
                 }
                 XMFLOAT3 helicopterHit;
                 if (!projectile.hostile && HitHelicopterSegment(
@@ -12608,8 +12887,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 DrawEnemyVisionCones(scene.GetViewMatrix(), scene.GetProjectionMatrix());
             }
         } else {
-            RenderPlayerHUD(scene);
-            DrawEnemyVisionCones(scene.GetViewMatrix(), scene.GetProjectionMatrix());
+            if (!g_insertionChoicePending) {
+                RenderPlayerHUD(scene);
+                DrawEnemyVisionCones(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
+            }
             if (g_ddgiCornellTestMode) {
                 const DXRDDGIRenderer::Status& status = g_dxrDDGI.GetStatus();
                 ImGui::SetNextWindowPos(ImVec2(18.0f, 18.0f), ImGuiCond_Always);

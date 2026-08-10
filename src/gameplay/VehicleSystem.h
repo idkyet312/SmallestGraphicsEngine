@@ -4,7 +4,6 @@
 #include <DirectXMath.h>
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 
 struct VehicleSystem {
     static constexpr float HelicopterMaxHealth = 2000.0f;
@@ -91,12 +90,8 @@ struct VehicleSystem {
     // Distance back out from the landing point at which it stops being drawn.
     static constexpr float InsertionBoatDepartDistance = 200.0f;
 
-    // Same failure model as the insertion helicopter: roll how long the hull
-    // stays afloat and derive the drain rate from that, so the failure point is
-    // uniform across the window rather than bunched at the fast end.
-    static constexpr float InsertionBoatMaxHealth = 100.0f;
-    static constexpr float InsertionBoatMinFailSeconds = 7.0f;
-    static constexpr float InsertionBoatMaxFailSeconds = 35.0f;
+    // Enemy fire is the only thing that reduces insertion hull integrity.
+    static constexpr float InsertionBoatMaxHealth = 300.0f;
     // Below this fraction the hull starts trailing smoke.
     static constexpr float InsertionBoatSmokeThreshold = 0.55f;
     // How fast a holed hull settles, and how far down before it is gone.
@@ -106,7 +101,6 @@ struct VehicleSystem {
     static constexpr float InsertionBoatFounderRollRate = 0.30f;
 
     float insertionBoatHealth = InsertionBoatMaxHealth;
-    float insertionBoatDrainRate = 0.0f;
     // Raised for the single frame the hull goes under, so the caller can fire
     // the effects and dunk whoever is still aboard.
     bool insertionBoatJustSank = false;
@@ -197,13 +191,7 @@ struct VehicleSystem {
         insertionBoatCarryingPlayer = true;
         insertionBoatSinkOffset = 0.0f;
         insertionBoatBobTime = 0.0f;
-        // Fresh hull, fresh roll: the drain rate decides how far into the run it
-        // gets before the hull gives out.
         insertionBoatHealth = InsertionBoatMaxHealth;
-        const float roll = (float)std::rand() / (float)RAND_MAX;
-        const float failSeconds = InsertionBoatMinFailSeconds +
-            roll * (InsertionBoatMaxFailSeconds - InsertionBoatMinFailSeconds);
-        insertionBoatDrainRate = InsertionBoatMaxHealth / failSeconds;
         insertionBoatUnloadTimer = 0.0f;
         // Back the boat up along its heading so it runs in toward the landing.
         insertionBoatPosition = {
@@ -216,9 +204,6 @@ struct VehicleSystem {
     // player gets off, then turns and heads back out.
     void UpdateInsertionBoat(float deltaTime) {
         const float dt = (std::max)(0.0f, deltaTime);
-        const bool underway = insertionBoatPhase != InsertionBoatPhase::Foundering &&
-                              insertionBoatPhase != InsertionBoatPhase::Sunk &&
-                              insertionBoatPhase != InsertionBoatPhase::Gone;
         insertionBoatBobTime += dt;
         insertionBoatDroppedPlayer = false;
         insertionBoatJustSank = false;
@@ -226,14 +211,6 @@ struct VehicleSystem {
         // from the input handler, which runs earlier in the frame, so clearing
         // it now would drop the event before the release code sees it. The
         // consumer clears it instead.
-
-        // Hull failure: bleed health while underway. Hitting zero drops it out
-        // of whatever it was doing and starts it going down.
-        if (underway && insertionBoatDrainRate > 0.0f) {
-            insertionBoatHealth = (std::max)(
-                0.0f, insertionBoatHealth - insertionBoatDrainRate * dt);
-            if (insertionBoatHealth <= 0.0f) BeginInsertionBoatFounder();
-        }
 
         // Gentle swell everywhere except on the bottom.
         const float bob = insertionBoatPhase == InsertionBoatPhase::Sunk
@@ -334,9 +311,8 @@ struct VehicleSystem {
     }
 
     // Stands the boat down for a level that inserts by some other means. It is
-    // not merely hidden: the route is dropped and the drain switched off, so a
-    // reset does not resurrect a run this level never wanted, and nothing is
-    // left parked at the origin waiting to be drawn.
+    // not merely hidden: the route is dropped, so a reset does not resurrect a
+    // run this level never wanted or leave one parked at the origin.
     void DisableInsertionBoat() {
         insertionBoatRouteValid = false;
         insertionBoatVisible = false;
@@ -344,7 +320,6 @@ struct VehicleSystem {
         insertionBoatDroppedPlayer = false;
         insertionBoatBailedOut = false;
         insertionBoatJustSank = false;
-        insertionBoatDrainRate = 0.0f;
         insertionBoatHealth = InsertionBoatMaxHealth;
         insertionBoatSinkOffset = 0.0f;
         insertionBoatRoll = 0.0f;
@@ -405,12 +380,12 @@ private:
 
 public:
 
-    // BlackHawk: flies the player in at level start. It comes in level and fast
-    // from a point offset from the player spawn, flares into a hover over the
-    // spawn, sets down, holds long enough to drop the player off, then pulls
-    // pitch and leaves. Purely scripted -- it carries no health or damage state.
+    // BlackHawk: flies the player in at level start. The normal run lands; the
+    // fast run holds above the spawn while the player rappels down. Enemy fire
+    // can send either route through the same crash sequence.
     enum class BlackHawkPhase {
-        Inbound, Descending, Unloading, Departing, Crashing, Down, Gone };
+        Inbound, Descending, Rappelling, Unloading, Departing, Crashing, Down,
+        Gone };
 
     static constexpr float BlackHawkStartHeight = 90.0f;
     static constexpr float BlackHawkDescentSpeed = 6.5f;
@@ -419,6 +394,9 @@ public:
     static constexpr float BlackHawkApproachDistance = 220.0f;
     static constexpr float BlackHawkApproachHeight = 55.0f;
     static constexpr float BlackHawkApproachSpeed = 42.0f;
+    static constexpr float BlackHawkFastSpeedMultiplier = 2.0f;
+    static constexpr float BlackHawkRappelHoverHeight = 14.0f;
+    static constexpr float BlackHawkRappelTime = 2.25f;
     // Radius inside which the approach is considered finished and the descent
     // takes over.
     static constexpr float BlackHawkHoverRadius = 1.5f;
@@ -428,14 +406,8 @@ public:
     // Height above the drop-off point at which the bird stops being drawn.
     static constexpr float BlackHawkDepartHeight = 140.0f;
 
-    // The insertion bird is losing its engine. Each flight rolls how long it
-    // survives, and the drain rate is derived from that -- rolling the time
-    // directly keeps the failure point uniform across the window, which rolling
-    // the rate would not (a flat rate range bunches the outcomes at the fast
-    // end, since time is 1/rate).
-    static constexpr float BlackHawkMaxHealth = 100.0f;
-    static constexpr float BlackHawkMinFailSeconds = 7.0f;
-    static constexpr float BlackHawkMaxFailSeconds = 35.0f;
+    // Enemy fire is the only thing that reduces insertion airframe integrity.
+    static constexpr float BlackHawkMaxHealth = 300.0f;
     // Below this fraction the airframe starts trailing smoke.
     static constexpr float BlackHawkSmokeThreshold = 0.55f;
     // Downward acceleration and tumble rates once the engine quits.
@@ -445,7 +417,6 @@ public:
     static constexpr float BlackHawkCrashYawRate = 0.55f;
 
     float blackHawkHealth = BlackHawkMaxHealth;
-    float blackHawkDrainRate = 0.0f;
     DirectX::XMFLOAT3 blackHawkCrashVelocity{};
     // Terrain height under the falling wreck, refreshed by the caller each
     // frame while crashing -- the drop-off elevation is no use out here.
@@ -472,6 +443,7 @@ public:
     float blackHawkRoll = 0.0f;
     float blackHawkRotorSpin = 0.0f;
     float blackHawkUnloadTimer = 0.0f;
+    float blackHawkRappelProgress = 0.0f;
     BlackHawkPhase blackHawkPhase = BlackHawkPhase::Inbound;
     bool blackHawkLanded = false;
     // Set for the single frame the skids touch down, so the caller can release
@@ -480,6 +452,7 @@ public:
     bool blackHawkVisible = true;
     // True while the player is riding in the cabin, before the drop-off.
     bool blackHawkCarryingPlayer = false;
+    bool blackHawkFastRappel = false;
 
     // The ride-along attach point in the helicopter's local frame: side
     // (positive is starboard, since right is (cos, -sin)), forward from the
@@ -528,6 +501,11 @@ public:
         return true;
     }
 
+    bool BlackHawkIsRappelling() const {
+        return blackHawkPhase == BlackHawkPhase::Rappelling &&
+               blackHawkCarryingPlayer;
+    }
+
     // Places the drop-off at the player spawn and parks the helicopter at the
     // start of its approach run, inbound on the given heading (radians, the
     // direction it flies toward).
@@ -535,7 +513,8 @@ public:
     // carries the player. A level using some other craft calls
     // DisableBlackHawkInsertion instead.
     void BeginBlackHawkInsertion(const DirectX::XMFLOAT3& dropOff,
-                                 float groundY, float approachHeading) {
+                                 float groundY, float approachHeading,
+                                 bool fastRappel = false) {
         blackHawkDropOff = dropOff;
         blackHawkGroundY = groundY;
         blackHawkApproachHeading = approachHeading;
@@ -550,15 +529,11 @@ public:
         blackHawkJustCrashed = false;
         blackHawkVisible = true;
         blackHawkCarryingPlayer = true;
-        // Fresh airframe, fresh roll: the drain rate decides how far into the
-        // run it gets before the engine gives out.
+        blackHawkFastRappel = fastRappel;
         blackHawkHealth = BlackHawkMaxHealth;
         blackHawkCrashVelocity = { 0.0f, 0.0f, 0.0f };
-        const float roll = (float)std::rand() / (float)RAND_MAX;
-        const float failSeconds = BlackHawkMinFailSeconds +
-            roll * (BlackHawkMaxFailSeconds - BlackHawkMinFailSeconds);
-        blackHawkDrainRate = BlackHawkMaxHealth / failSeconds;
         blackHawkUnloadTimer = 0.0f;
+        blackHawkRappelProgress = 0.0f;
         // Back the bird up along its heading so it flies in toward the spawn.
         blackHawkPosition = {
             dropOff.x - std::sin(approachHeading) * BlackHawkApproachDistance,
@@ -570,9 +545,6 @@ public:
     // holds while the player gets out, then climbs away.
     void UpdateBlackHawk(float deltaTime) {
         const float dt = (std::max)(0.0f, deltaTime);
-        const bool flying = blackHawkPhase != BlackHawkPhase::Crashing &&
-                            blackHawkPhase != BlackHawkPhase::Down &&
-                            blackHawkPhase != BlackHawkPhase::Gone;
         const bool idling = blackHawkPhase == BlackHawkPhase::Unloading;
         // The rotor winds down once the engine quits instead of holding revs.
         const float rotorRate =
@@ -587,14 +559,6 @@ public:
         // update, so clearing it now would drop the event before the release
         // code ever sees it. The consumer clears it instead.
 
-        // Engine failure: bleed health while under power. Hitting zero drops it
-        // out of whatever it was doing and into the spiral.
-        if (flying && blackHawkDrainRate > 0.0f) {
-            blackHawkHealth =
-                (std::max)(0.0f, blackHawkHealth - blackHawkDrainRate * dt);
-            if (blackHawkHealth <= 0.0f) BeginBlackHawkCrash();
-        }
-
         switch (blackHawkPhase) {
         case BlackHawkPhase::Inbound: {
             const float dx = blackHawkDropOff.x - blackHawkPosition.x;
@@ -605,8 +569,10 @@ public:
             // approach altitude off along with the speed.
             const float closing =
                 (std::min)(1.0f, distance / BlackHawkApproachDistance);
-            const float speed =
-                BlackHawkApproachSpeed * (0.14f + 0.86f * closing);
+            const float speedScale = blackHawkFastRappel
+                ? BlackHawkFastSpeedMultiplier : 1.0f;
+            const float speed = BlackHawkApproachSpeed * speedScale *
+                (0.14f + 0.86f * closing);
             const float step = (std::min)(distance, speed * dt);
             if (distance > 0.001f) {
                 blackHawkPosition.x += dx / distance * step;
@@ -614,14 +580,18 @@ public:
             }
             // Nose down while running in, levelling out into the flare.
             blackHawkPitch = -0.16f * closing;
-            const float hoverY = blackHawkGroundY + 14.0f;
+            const float hoverY =
+                blackHawkGroundY + BlackHawkRappelHoverHeight;
             const float cruiseY = blackHawkGroundY + BlackHawkApproachHeight;
             blackHawkPosition.y = hoverY + (cruiseY - hoverY) * closing;
             if (distance <= BlackHawkHoverRadius) {
                 blackHawkPosition.x = blackHawkDropOff.x;
+                blackHawkPosition.y = hoverY;
                 blackHawkPosition.z = blackHawkDropOff.z;
                 blackHawkPitch = 0.0f;
-                blackHawkPhase = BlackHawkPhase::Descending;
+                blackHawkPhase = blackHawkFastRappel
+                    ? BlackHawkPhase::Rappelling
+                    : BlackHawkPhase::Descending;
             }
             break;
         }
@@ -639,6 +609,16 @@ public:
             if (blackHawkPosition.y <= blackHawkGroundY + 0.01f) TouchDown();
             break;
         }
+        case BlackHawkPhase::Rappelling: {
+            blackHawkRappelProgress = (std::min)(
+                1.0f, blackHawkRappelProgress + dt / BlackHawkRappelTime);
+            if (blackHawkRappelProgress >= 1.0f) {
+                blackHawkDroppedPlayer = blackHawkCarryingPlayer;
+                blackHawkCarryingPlayer = false;
+                blackHawkPhase = BlackHawkPhase::Departing;
+            }
+            break;
+        }
         case BlackHawkPhase::Unloading: {
             blackHawkUnloadTimer += dt;
             if (blackHawkUnloadTimer >= BlackHawkUnloadTime) {
@@ -651,8 +631,11 @@ public:
             // Climb out along the heading it arrived on, nose up and banking.
             const float climbed = blackHawkPosition.y - blackHawkGroundY;
             const float ramp = (std::min)(1.0f, climbed / 20.0f);
-            blackHawkPosition.y += BlackHawkDepartSpeed * (0.35f + 0.65f * ramp) * dt;
-            const float forward = BlackHawkDepartSpeed * ramp * dt;
+            const float speedScale = blackHawkFastRappel
+                ? BlackHawkFastSpeedMultiplier : 1.0f;
+            blackHawkPosition.y += BlackHawkDepartSpeed * speedScale *
+                (0.35f + 0.65f * ramp) * dt;
+            const float forward = BlackHawkDepartSpeed * speedScale * ramp * dt;
             blackHawkPosition.x += std::sin(blackHawkYaw) * forward;
             blackHawkPosition.z += std::cos(blackHawkYaw) * forward;
             blackHawkPitch = 0.20f * ramp;
@@ -697,8 +680,8 @@ public:
     }
 
     // Stands the helicopter down for a level that inserts by some other means.
-    // Mirrors DisableInsertionBoat: the route is dropped and the drain switched
-    // off, so a reset does not resurrect a run this level never wanted.
+    // Mirrors DisableInsertionBoat: dropping the route keeps reset from
+    // resurrecting a run this level never wanted.
     void DisableBlackHawkInsertion() {
         blackHawkRouteValid = false;
         blackHawkVisible = false;
@@ -707,7 +690,8 @@ public:
         blackHawkBailedOut = false;
         blackHawkJustCrashed = false;
         blackHawkLanded = false;
-        blackHawkDrainRate = 0.0f;
+        blackHawkFastRappel = false;
+        blackHawkRappelProgress = 0.0f;
         blackHawkHealth = BlackHawkMaxHealth;
         blackHawkCrashVelocity = { 0.0f, 0.0f, 0.0f };
         blackHawkPhase = BlackHawkPhase::Gone;
@@ -718,6 +702,13 @@ public:
     void BeginBlackHawkCrash() {
         if (blackHawkPhase == BlackHawkPhase::Crashing ||
             blackHawkPhase == BlackHawkPhase::Down) return;
+        // A passenger already on the rope is released into normal falling
+        // movement instead of snapping back inside the crashing airframe.
+        if (blackHawkPhase == BlackHawkPhase::Rappelling &&
+            blackHawkCarryingPlayer) {
+            blackHawkCarryingPlayer = false;
+            blackHawkBailedOut = true;
+        }
         blackHawkHealth = 0.0f;
         blackHawkPhase = BlackHawkPhase::Crashing;
         blackHawkLanded = false;
@@ -787,6 +778,37 @@ public:
         const float step = rate * (std::max)(0.0f, deltaTime);
         if (current < target) return (std::min)(target, current + step);
         return (std::max)(target, current - step);
+    }
+
+    DamageResult DamageInsertionBoatFromEnemyFire(float damage) {
+        DamageResult result{ insertionBoatPosition };
+        if (damage <= 0.0f ||
+            insertionBoatPhase == InsertionBoatPhase::Foundering ||
+            insertionBoatPhase == InsertionBoatPhase::Sunk ||
+            insertionBoatPhase == InsertionBoatPhase::Gone)
+            return result;
+        result.applied = true;
+        insertionBoatHealth =
+            (std::max)(0.0f, insertionBoatHealth - damage);
+        if (insertionBoatHealth > 0.0f) return result;
+        BeginInsertionBoatFounder();
+        result.destroyed = true;
+        return result;
+    }
+
+    DamageResult DamageInsertionBlackHawkFromEnemyFire(float damage) {
+        DamageResult result{ blackHawkPosition };
+        if (damage <= 0.0f ||
+            blackHawkPhase == BlackHawkPhase::Crashing ||
+            blackHawkPhase == BlackHawkPhase::Down ||
+            blackHawkPhase == BlackHawkPhase::Gone)
+            return result;
+        result.applied = true;
+        blackHawkHealth = (std::max)(0.0f, blackHawkHealth - damage);
+        if (blackHawkHealth > 0.0f) return result;
+        BeginBlackHawkCrash();
+        result.destroyed = true;
+        return result;
     }
 
     DamageResult DamagePrimaryHelicopter(float damage) {
@@ -905,7 +927,8 @@ public:
         blackHawkJustCrashed = false;
         if (blackHawkRouteValid) {
             BeginBlackHawkInsertion(blackHawkDropOff, blackHawkGroundY,
-                                    blackHawkApproachHeading);
+                                    blackHawkApproachHeading,
+                                    blackHawkFastRappel);
         }
     }
 };

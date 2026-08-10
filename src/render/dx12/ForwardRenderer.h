@@ -89,6 +89,11 @@ bool BlackHawkVisible();
 // World position the riding player is pinned to, from the model's PlayerRide
 // empty. Exposed as a function because g_game has internal linkage in main.cpp.
 DirectX::XMFLOAT3 BlackHawkRideWorldPosition();
+bool BlackHawkRappelActive();
+DirectX::XMFLOAT3 BlackHawkRappelPlayerWorldPosition();
+bool DeploymentPlanningActive();
+const std::vector<DirectX::XMFLOAT3>& DeploymentZonePositions();
+int SelectedDeploymentZoneIndex();
 // Same, plus the aircraft-local offset packed as (side, up, forward), for the
 // debug readout.
 DirectX::XMFLOAT3 BlackHawkRideDebugInfo(DirectX::XMFLOAT3& outLocal);
@@ -1551,12 +1556,59 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             view, proj, lightSpace, visibilityExtensionsOnly);
     }
 
+    if (DeploymentPlanningActive()) {
+        shader.SetSkinningEnabled(false);
+        g_dx12.commandList->SetPipelineState(shader.GetPipelineState(false));
+        const auto& zones = DeploymentZonePositions();
+        const int selectedZone = SelectedDeploymentZoneIndex();
+        for (size_t index = 0; index < zones.size(); ++index) {
+            const bool selected = static_cast<int>(index) == selectedZone;
+            const float scale = selected ? 1.25f : 0.82f;
+            const XMFLOAT3& zone = zones[index];
+            const XMMATRIX marker =
+                XMMatrixScaling(scale, scale, scale) *
+                XMMatrixTranslation(zone.x, zone.y + 1.3f, zone.z);
+            shader.SetMatrices(marker, view, proj, lightSpace);
+            shader.SetEmissiveMaterial(
+                selected ? XMFLOAT3(0.08f, 8.0f, 0.25f)
+                         : XMFLOAT3(0.04f, 3.5f, 0.12f),
+                selected ? 1.0f : 0.72f);
+            DrawSphere(geo);
+            shader.NextDrawCall();
+        }
+        shader.Use(scene.wireframeMode);
+    }
+
     // Flies its insertion every frame, so it never joins the static batch. The
     // bone palette spins its rotor.
     if (!g_emptyLevelMode && g_blackHawkModel && BlackHawkVisible()) {
         DrawSceneNode(g_blackHawkModel, shader, BlackHawkWorldMatrix(),
             view, proj, lightSpace, visibilityExtensionsOnly,
             UploadBlackHawkPalette());
+
+        if (BlackHawkRappelActive()) {
+            const XMFLOAT3 anchor = BlackHawkRideWorldPosition();
+            const XMFLOAT3 player = BlackHawkRappelPlayerWorldPosition();
+            const float length = anchor.y - player.y;
+            if (length > 0.02f) {
+                // The skinned helicopter leaves its root flag set. Clear it so
+                // the procedural rope cannot inherit the rotor palette.
+                shader.SetSkinningEnabled(false);
+                g_dx12.commandList->SetPipelineState(
+                    shader.GetPipelineState(false));
+                const XMMATRIX rope =
+                    XMMatrixScaling(0.025f, length, 0.025f) *
+                    XMMatrixTranslation(
+                        anchor.x, (anchor.y + player.y) * 0.5f, anchor.z);
+                shader.SetMatrices(rope, view, proj, lightSpace);
+                shader.SetObjectMaterial(
+                    XMFLOAT3(0.12f, 0.095f, 0.055f), false, false,
+                    0.92f, 0.12f, nullptr, nullptr, nullptr);
+                DrawCube(geo);
+                shader.NextDrawCall();
+                shader.Use(scene.wireframeMode);
+            }
+        }
 
         // Debug: mark where the PlayerRide empty resolves to, so the authored
         // spot can be checked against the airframe without riding along.
