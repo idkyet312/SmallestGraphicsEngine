@@ -119,7 +119,8 @@ struct alignas(256) VBFrameConstants {
     float    contactShadowMaxDistance;
     UINT     contactShadowLinearDepth;
     UINT     contactShadowNoiseFrame;
-    UINT     contactPadding[2];
+    UINT     bentNormalGTAOEnabled;
+    UINT     bentNormalGTAOFlags;
     XMFLOAT4 palmWind;
     XMFLOAT4 palmPrimary;
     XMFLOAT4 palmSecondary;
@@ -147,6 +148,7 @@ struct alignas(256) VBPostConstants {
     UINT validationMode;
     UINT surfaceHistoryValid;
     UINT historyDebugView;
+    UINT surfaceIdentityEnabled;
 };
 
 struct alignas(256) VBExposureConstants {
@@ -160,15 +162,9 @@ class VisibilityBufferDX12 {
 public:
     // Full-width instance and primitive IDs (R32G32_UINT).
     ComPtr<ID3D12Resource> visBufferRT;
-    // Previous frame's IDs. This is what makes temporal reuse exact: a pixel
-    // whose instance+primitive match last frame's is provably the same surface,
-    // rather than "depth and normal look similar". Screen-space heuristics
-    // cannot express that, which is the whole point.
-    ComPtr<ID3D12Resource> visBufferHistory;
     bool surfaceHistoryValid = false;
-    // Use exact surface IDs for temporal validity instead of the depth
-    // heuristic. On by default: it is strictly better information, costs one
-    // texture fetch, and the fallback stays for the frame after a resize.
+    // Use authored namespace/triangle keys for temporal validity instead of
+    // the depth heuristic. The fallback stays for the frame after invalidation.
     bool surfaceIDTemporalEnabled = true;
     // Debug view colouring pixels by why history was kept or rejected.
     bool historyDebugView = false;
@@ -180,6 +176,22 @@ public:
     // can reproject them. Off by default; takes a second RTV and a PSO
     // variant with SGE_EXTENSION_MOTION compiled in.
     bool extensionMotionVectors = false;
+    // GTAO can request primary-surface motion without enabling cinematic TAA.
+    bool aoTemporalMotionVectors = false;
+    // Non-owning previous-frame GTAO history. ScreenSpaceAODX12 retains the
+    // resource and supplies it before visibility resolve.
+    ID3D12Resource* bentNormalGTAOHistory = nullptr;
+    bool bentNormalGTAORequested = false;
+    bool bentNormalGTAOHistoryValid = false;
+    bool bentNormalGTAOAppliedLastResolve = false;
+    enum class BentNormalGTAODebugMode : UINT {
+        Lit = 0,
+        Direction = 1,
+        Visibility = 2,
+        TemporalConfidence = 3
+    };
+    BentNormalGTAODebugMode bentNormalGTAODebugMode =
+        BentNormalGTAODebugMode::Lit;
     ComPtr<ID3D12DescriptorHeap> visRtvHeap;    // RTV for visibility pass
     ComPtr<ID3D12DescriptorHeap> visSrvUavHeap; // SRV/UAV for compute resolve
 
@@ -252,6 +264,9 @@ public:
     // Mirrors the default compute heap and appends TLAS / ray mask / enhanced
     // constants, so the default layout's hardcoded slot indices stay valid.
     ComPtr<ID3D12DescriptorHeap> enhancedComputeDescHeaps[FRAME_COUNT];
+    // The history resource ping-pongs every frame. A heap per frame slot keeps
+    // t86 updates away from descriptors an earlier frame may still consume.
+    ComPtr<ID3D12DescriptorHeap> bentNormalComputeDescHeaps[FRAME_COUNT];
     D3D12_GPU_VIRTUAL_ADDRESS enhancedHeapTLASAddresses[FRAME_COUNT] = {};
     // Set per frame by the caller from scene.enhancedVisuals. Kept separate
     // from enhancedPipelineReady (a capability) so the UI can toggle freely
@@ -318,8 +333,14 @@ public:
     bool svgfTemporalEnabledLastFrame = false;
     ComPtr<ID3D12Resource> svgfHistoryColor[2];
     ComPtr<ID3D12Resource> svgfHistoryMoments[2];
+    // Shared authored surface identity. The write side is current-frame UAV;
+    // the other side remains the previous-frame SRV until post has consumed it.
     ComPtr<ID3D12Resource> svgfStableSurfaceCurrent;
     ComPtr<ID3D12Resource> svgfStableSurfaceHistory;
+    UINT stableSurfaceWriteIndex = 0;
+    bool stableSurfaceIdentityActive = false;
+    bool stableSurfaceIdentityActiveThisFrame = false;
+    UINT stableSurfaceModeSignature = ~0u;
     // SVGF à-trous spatial filter (Phase 5c). Multi-iteration wavelet
     // filter applied to the specular IBL signal after the temporal pass
     // converges it in time. Ping-pong scratch pair for the iterations.
@@ -370,10 +391,10 @@ public:
     ComPtr<ID3D12RootSignature> postRootSig;
     ComPtr<ID3D12PipelineState> postPSO;
     ComPtr<ID3D12DescriptorHeap> postDescHeap;
-    // Descriptors per parity in postDescHeap: 8 SRVs (hdr, motion, history,
-    // exposure, LUT, depth, visDepth, bloom) + 2 surface-ID SRVs + 2 UAVs
-    // (present, history). The heap holds two of these, one per history parity.
-    static constexpr UINT kPostDescriptorsPerParity = 12;
+    // Four immutable variants cover colour-history parity and stable-surface
+    // write parity independently. Each holds 12 SRVs and 3 UAVs.
+    static constexpr UINT kPostDescriptorsPerVariant = 15;
+    static constexpr UINT kPostDescriptorVariantCount = 4;
     ComPtr<ID3D12RootSignature> bloomRootSig;
     ComPtr<ID3D12PipelineState> bloomDownsamplePSO;
     ComPtr<ID3D12PipelineState> bloomUpsamplePSO;
@@ -386,13 +407,13 @@ public:
 
     // GPU-visible structured buffers
     ComPtr<ID3D12Resource> drawCallBuffer;       // StructuredBuffer<DrawCallData>
-    ComPtr<ID3D12Resource> drawCallUpload;
+    ComPtr<ID3D12Resource> drawCallUpload[FRAME_COUNT];
     ComPtr<ID3D12Resource> vertexDataBuffer;     // StructuredBuffer<PackedVertex>
     ComPtr<ID3D12Resource> vertexDataUpload;
     ComPtr<ID3D12Resource> indexDataBuffer;       // StructuredBuffer<uint>
     ComPtr<ID3D12Resource> indexDataUpload;
     ComPtr<ID3D12Resource> stableTriangleDataBuffer;
-    ComPtr<ID3D12Resource> stableTriangleDataUpload;
+    ComPtr<ID3D12Resource> stableTriangleDataUpload[FRAME_COUNT];
     // Per-geometry binding from a raytracing hit to this buffer's persistent
     // geometry. Written only when the acceleration structure is rebuilt, which
     // is a rare, already-GPU-drained event, so it lives on an upload heap and
@@ -504,7 +525,49 @@ public:
         return sequence[postFrameIndex & 7u];
     }
 
-    void InvalidateTemporalHistory() { temporalHistoryValid = false; }
+    void InvalidateTemporalHistory() {
+        temporalHistoryValid = false;
+        surfaceHistoryValid = false;
+        svgfHistoryValid = false;
+    }
+
+    ID3D12Resource* StableSurfaceResource(UINT index) const {
+        return index == 0u ? svgfStableSurfaceCurrent.Get()
+                           : svgfStableSurfaceHistory.Get();
+    }
+
+    bool StableSurfaceIdentityRequired(bool enhancedResolve) const {
+        if (validationMode || debugViewMode != 0 ||
+            BentNormalGTAODiagnosticActive())
+            return false;
+        return (surfaceIDTemporalEnabled && temporalEffectsEnabled) ||
+               historyDebugView ||
+               (enhancedResolve && svgfTemporalEnabled);
+    }
+
+    UINT StableSurfaceModeSignature(bool visibilityPath,
+                                    bool enhancedResolve) const {
+        return (visibilityPath ? 1u : 0u) |
+               (surfaceIDTemporalEnabled ? 1u << 1u : 0u) |
+               (temporalEffectsEnabled ? 1u << 2u : 0u) |
+               (historyDebugView ? 1u << 3u : 0u) |
+               (enhancedResolve ? 1u << 4u : 0u) |
+               (svgfTemporalEnabled ? 1u << 5u : 0u) |
+               (validationMode ? 1u << 6u : 0u) |
+               (debugViewMode != 0 ? 1u << 7u : 0u) |
+               (BentNormalGTAODiagnosticActive() ? 1u << 8u : 0u);
+    }
+
+    void PrepareStableSurfaceHistory(bool active, UINT modeSignature) {
+        if (active != stableSurfaceIdentityActive ||
+            modeSignature != stableSurfaceModeSignature) {
+            surfaceHistoryValid = false;
+            svgfHistoryValid = false;
+            stableSurfaceIdentityActive = active;
+            stableSurfaceModeSignature = modeSignature;
+        }
+        stableSurfaceIdentityActiveThisFrame = active;
+    }
 
     bool Init(UINT screenWidth, UINT screenHeight) {
         width = screenWidth;
@@ -737,7 +800,7 @@ public:
         if (!enabled || !bindlessHeap || !bindlessHeap->Initialized())
             return false;
         bindlessResolveTableBases[slot] =
-            bindlessHeap->Allocator().AllocateTransient(99u);
+            bindlessHeap->Allocator().AllocateTransient(100u);
         bindlessTransientOverflowLastFrame =
             bindlessResolveTableBases[slot] == BINDLESS_INVALID_INDEX;
         return !bindlessTransientOverflowLastFrame;
@@ -745,6 +808,18 @@ public:
     bool BindlessFrameReady(UINT frameSlot) const {
         return bindlessResolveTableBases[frameSlot % FRAME_COUNT] !=
             BINDLESS_INVALID_INDEX;
+    }
+    void SetBentNormalGTAOHistory(ID3D12Resource* history,
+                                 bool requested, bool historyValid) {
+        bentNormalGTAOHistory = history;
+        bentNormalGTAORequested = requested;
+        bentNormalGTAOHistoryValid = historyValid && history;
+    }
+    bool BentNormalGTAOAppliedLastResolve() const {
+        return bentNormalGTAOAppliedLastResolve;
+    }
+    bool BentNormalGTAODiagnosticActive() const {
+        return bentNormalGTAODebugMode != BentNormalGTAODebugMode::Lit;
     }
     void FlushBindlessTextureTransitions(ID3D12GraphicsCommandList* cmdList) {
         if (bindlessActive && bindlessHeap)
@@ -956,6 +1031,8 @@ public:
 
     // Upload all CPU-side data to GPU before the resolve pass
     void UploadBuffers(ID3D12GraphicsCommandList* cmdList) {
+        const UINT frameSlot = g_dx12.frameIndex % FRAME_COUNT;
+
         // Upload draw calls
         if (drawCallDirtyMin != UINT_MAX) {
             const UINT64 offset = static_cast<UINT64>(drawCallDirtyMin) *
@@ -965,13 +1042,13 @@ public:
                 sizeof(VBDrawCallData);
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
-            drawCallUpload->Map(0, &readRange, &mapped);
+            drawCallUpload[frameSlot]->Map(0, &readRange, &mapped);
             memcpy(static_cast<uint8_t*>(mapped) + offset,
                 cpuDrawCalls.data() + drawCallDirtyMin, size);
-            drawCallUpload->Unmap(0, nullptr);
+            drawCallUpload[frameSlot]->Unmap(0, nullptr);
 
             cmdList->CopyBufferRegion(drawCallBuffer.Get(), offset,
-                drawCallUpload.Get(), offset, size);
+                drawCallUpload[frameSlot].Get(), offset, size);
         }
 
         // Geometry changes only when a mesh is added. DEFAULT buffers stay SRVs
@@ -1031,13 +1108,13 @@ public:
         if (geometryDirty && persistentTriangleCount > 0) {
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
-            stableTriangleDataUpload->Map(0, &readRange, &mapped);
+            stableTriangleDataUpload[frameSlot]->Map(0, &readRange, &mapped);
             memcpy(mapped, cpuStableTriangleIDs.data(),
                 persistentTriangleCount * sizeof(UINT));
-            stableTriangleDataUpload->Unmap(0, nullptr);
+            stableTriangleDataUpload[frameSlot]->Unmap(0, nullptr);
 
             cmdList->CopyBufferRegion(stableTriangleDataBuffer.Get(), 0,
-                stableTriangleDataUpload.Get(), 0,
+                stableTriangleDataUpload[frameSlot].Get(), 0,
                 persistentTriangleCount * sizeof(UINT));
         }
 
@@ -1229,6 +1306,44 @@ public:
                  const PointLightsBufferDX12& pointLightData) {
         currentNearPlane = nearPlane;
         currentFarPlane = farPlane;
+        const UINT frameSlot = g_dx12.frameIndex % FRAME_COUNT;
+        ID3D12DescriptorHeap* enhancedDescHeap =
+            enhancedComputeDescHeaps[frameSlot].Get();
+        const bool useEnhanced = enhancedVisualsActive && enhancedPipelineReady &&
+                                 enhancedResolvePSO && enhancedDescHeap;
+        enhancedResolveExecutedLastFrame = useEnhanced;
+        PrepareStableSurfaceHistory(
+            StableSurfaceIdentityRequired(useEnhanced),
+            StableSurfaceModeSignature(true, useEnhanced));
+        ID3D12DescriptorHeap* standardDescHeap = computeDescHeap.Get();
+        bool bentNormalHistoryActive = bentNormalGTAORequested &&
+            bentNormalGTAOHistoryValid && bentNormalGTAOHistory &&
+            !validationMode && debugViewMode == 0;
+        if (bentNormalHistoryActive && !useEnhanced) {
+            ID3D12DescriptorHeap* bentHeap =
+                PrepareBentNormalResolveHeap(frameSlot);
+            if (bentHeap)
+                standardDescHeap = bentHeap;
+            else
+                bentNormalHistoryActive = false;
+        }
+        if (useEnhanced) {
+            WriteBentNormalHistoryDescriptor(enhancedDescHeap, 99,
+                bentNormalHistoryActive ? bentNormalGTAOHistory : nullptr);
+        }
+        bentNormalGTAOAppliedLastResolve = bentNormalHistoryActive;
+        if (bentNormalHistoryActive) {
+            D3D12_RESOURCE_BARRIER historyBarrier = {};
+            historyBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            historyBarrier.Transition.pResource = bentNormalGTAOHistory;
+            historyBarrier.Transition.StateBefore =
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            historyBarrier.Transition.StateAfter =
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            historyBarrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cmdList->ResourceBarrier(1, &historyBarrier);
+        }
         // Transition HDR, motion-vector, and surface outputs to UAV.
         {
             D3D12_RESOURCE_BARRIER barriers[3] = {};
@@ -1282,6 +1397,11 @@ public:
         fc.contactShadowLinearDepth = contactShadowLinearDepth ? 1u : 0u;
         fc.contactShadowNoiseFrame = temporalEffectsEnabled
             ? postFrameIndex : 0u;
+        fc.bentNormalGTAOEnabled = bentNormalHistoryActive ? 1u : 0u;
+        const UINT bentDebugMode = static_cast<UINT>(
+            bentNormalGTAODebugMode);
+        fc.bentNormalGTAOFlags = bentNormalHistoryActive
+            ? 1u | ((bentDebugMode & 3u) << 1u) : 0u;
         fc.palmWind = palmWindFrame.wind;
         fc.palmPrimary = palmWindFrame.primary;
         fc.palmSecondary = palmWindFrame.secondary;
@@ -1290,10 +1410,6 @@ public:
         fc.palmParams = palmWindFrame.params;
         frameConstantBuffer.CopyData(g_dx12.frameIndex, fc);
 
-        const UINT frameSlot = g_dx12.frameIndex % FRAME_COUNT;
-        ID3D12DescriptorHeap* enhancedDescHeap =
-            enhancedComputeDescHeaps[frameSlot].Get();
-
         // A toggle can leave old history describing samples from a different
         // mode. Invalidate before uploading b5 so the shader sees the reset on
         // the first frame after the transition.
@@ -1301,13 +1417,6 @@ public:
             svgfHistoryValid = false;
             svgfTemporalEnabledLastFrame = svgfTemporalEnabled;
         }
-
-        // Set compute pipeline. The enhanced variant is used only when it built
-        // successfully AND the caller asked for it this frame; otherwise this
-        // is bit-for-bit the original path.
-        const bool useEnhanced = enhancedVisualsActive && enhancedPipelineReady &&
-                                 enhancedResolvePSO && enhancedDescHeap;
-        enhancedResolveExecutedLastFrame = useEnhanced;
 
         // Four selections: legacy lit, legacy enhanced, bindless lit, bindless
         // enhanced. Bindless requires the material table to have been populated
@@ -1332,7 +1441,7 @@ public:
             svgfHistoryRead = svgfHistoryPing ^ 1u;
             svgfHistoryWrite = svgfHistoryPing;
         }
-        if (useEnhanced && svgfTemporalEnabled)
+        if (useEnhanced)
             RefreshSVGFDescriptors(frameSlot, svgfHistoryRead,
                                    svgfHistoryWrite);
 
@@ -1359,8 +1468,8 @@ public:
         UINT bindlessTableBase = BINDLESS_INVALID_INDEX;
         if (useBindless) {
             bindlessTableBase = BuildBindlessResolveTable(
-                useEnhanced ? enhancedDescHeap : computeDescHeap.Get(),
-                useEnhanced ? 99u : 86u, frameSlot);
+                useEnhanced ? enhancedDescHeap : standardDescHeap,
+                useEnhanced ? 100u : 87u, frameSlot);
             if (bindlessTableBase == BINDLESS_INVALID_INDEX) {
                 bindlessTransientOverflowLastFrame = true;
             } else {
@@ -1384,7 +1493,7 @@ public:
         // first so the driver captures the correct heap base in the signature.
         ID3D12DescriptorHeap* selectedHeap = useBindless
             ? bindlessHeap->Heap()
-            : (useEnhanced ? enhancedDescHeap : computeDescHeap.Get());
+            : (useEnhanced ? enhancedDescHeap : standardDescHeap);
         ID3D12DescriptorHeap* heaps[] = { selectedHeap };
         cmdList->SetDescriptorHeaps(1, heaps);
         cmdList->SetComputeRootSignature(selectedRoot);
@@ -1406,7 +1515,7 @@ public:
                 ? bindlessHeap->GpuHandleAt(bindlessTableBase)
                 : (useEnhanced
                     ? enhancedDescHeap->GetGPUDescriptorHandleForHeapStart()
-                    : computeDescHeap->GetGPUDescriptorHandleForHeapStart()));
+                    : standardDescHeap->GetGPUDescriptorHandleForHeapStart()));
 
         // Dispatch (GPU-driven via ExecuteIndirect)
         UINT groupsX = (width + 7) / 8;
@@ -1422,40 +1531,27 @@ public:
             cmdList->Dispatch(groupsX, groupsY, 1);
         }
 
+        if (bentNormalHistoryActive) {
+            D3D12_RESOURCE_BARRIER historyBarrier = {};
+            historyBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            historyBarrier.Transition.pResource = bentNormalGTAOHistory;
+            historyBarrier.Transition.StateBefore =
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            historyBarrier.Transition.StateAfter =
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            historyBarrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cmdList->ResourceBarrier(1, &historyBarrier);
+        }
+
         // Sample how much of the screen went to RT. Only meaningful when the
         // enhanced resolve actually wrote the mask this frame.
         if (useEnhanced) UpdateRayMaskStatistic(cmdList);
 
-        // Transition SVGF write-side history back to SRV for next frame.
+        // Transition SVGF colour/moment history back to SRV for next frame.
+        // Stable-surface roles remain unchanged until post has read the same
+        // previous frame and finished writing the current authored keys.
         if (svgfWillWriteHistory) {
-            D3D12_RESOURCE_BARRIER stableToCopy[2] = {};
-            for (UINT i = 0; i < 2; ++i) {
-                stableToCopy[i].Type =
-                    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                stableToCopy[i].Transition.Subresource =
-                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            }
-            stableToCopy[0].Transition.pResource =
-                svgfStableSurfaceCurrent.Get();
-            stableToCopy[0].Transition.StateBefore =
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            stableToCopy[0].Transition.StateAfter =
-                D3D12_RESOURCE_STATE_COPY_SOURCE;
-            stableToCopy[1].Transition.pResource =
-                svgfStableSurfaceHistory.Get();
-            stableToCopy[1].Transition.StateBefore =
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            stableToCopy[1].Transition.StateAfter =
-                D3D12_RESOURCE_STATE_COPY_DEST;
-            cmdList->ResourceBarrier(2, stableToCopy);
-            cmdList->CopyResource(svgfStableSurfaceHistory.Get(),
-                                  svgfStableSurfaceCurrent.Get());
-            std::swap(stableToCopy[0].Transition.StateBefore,
-                      stableToCopy[0].Transition.StateAfter);
-            std::swap(stableToCopy[1].Transition.StateBefore,
-                      stableToCopy[1].Transition.StateAfter);
-            cmdList->ResourceBarrier(2, stableToCopy);
-
             D3D12_RESOURCE_BARRIER svgfBarriers[2] = {};
             for (UINT i = 0; i < 2; ++i) {
                 svgfBarriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1897,11 +1993,6 @@ public:
             cmdList->ResourceBarrier(3, barriers);
         }
 
-        // Snapshot this frame's surface IDs for next frame's temporal validity
-        // test. The resolve above has finished reading visBufferRT, so nothing
-        // races the copy.
-        CaptureSurfaceHistory(cmdList);
-
         // Preserve visibility depth before forward-only animated/alpha-tested
         // geometry modifies it. Post uses the difference as a reactive mask.
         {
@@ -2110,7 +2201,14 @@ public:
 
     void PostProcess(ID3D12GraphicsCommandList* cmdList, bool allowHistory) {
         const UINT historyIndex = postFrameIndex & 1u;
-        if (!validationMode && debugViewMode == 0 && bloomStrength > 0.0f)
+        const bool preserveDebugOutput =
+            debugViewMode != 0 || BentNormalGTAODiagnosticActive();
+        PrepareStableSurfaceHistory(
+            allowHistory && StableSurfaceIdentityRequired(
+                enhancedResolveExecutedLastFrame),
+            StableSurfaceModeSignature(
+                allowHistory, allowHistory && enhancedResolveExecutedLastFrame));
+        if (!validationMode && !preserveDebugOutput && bloomStrength > 0.0f)
             RenderBloom(cmdList);
         D3D12_RESOURCE_BARRIER barriers[2] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -2132,7 +2230,8 @@ public:
         constants.grainStrength = validationMode ? 0.0f : grainStrength;
         constants.frameIndex = postFrameIndex++;
         constants.historyValid = (temporalEffectsEnabled && !validationMode &&
-            allowHistory && temporalHistoryValid) ? 1u : 0u;
+            !preserveDebugOutput && allowHistory && temporalHistoryValid)
+                ? 1u : 0u;
         constants.taaFeedback = (temporalEffectsEnabled && !validationMode)
             ? taaFeedback : 0.0f;
         constants.motionBlurStrength = (temporalEffectsEnabled &&
@@ -2143,15 +2242,19 @@ public:
         constants.aperture = 0.0f;
         constants.nearPlane = currentNearPlane;
         constants.farPlane = currentFarPlane;
-        constants.debugViewMode = static_cast<UINT>(debugViewMode);
+        constants.debugViewMode = preserveDebugOutput
+            ? (std::max)(1u, static_cast<UINT>(debugViewMode)) : 0u;
         constants.validationMode = validationMode ? 1u : 0u;
         // Exact surface correspondence is available once a history frame has
         // been captured. Suppressed in parity mode, which compares against the
         // Forward renderer and must not gain a temporal advantage.
         constants.surfaceHistoryValid =
-            (surfaceHistoryValid && surfaceIDTemporalEnabled && !validationMode)
+            (surfaceHistoryValid && stableSurfaceIdentityActiveThisFrame &&
+             (surfaceIDTemporalEnabled || historyDebugView) && !validationMode)
                 ? 1u : 0u;
         constants.historyDebugView = historyDebugView ? 1u : 0u;
+        constants.surfaceIdentityEnabled =
+            stableSurfaceIdentityActiveThisFrame ? 1u : 0u;
         postConstantBuffer.CopyData(g_dx12.frameIndex, constants);
 
         cmdList->SetComputeRootSignature(postRootSig.Get());
@@ -2162,10 +2265,39 @@ public:
             postConstantBuffer.GetGPUAddress(g_dx12.frameIndex));
         D3D12_GPU_DESCRIPTOR_HANDLE table =
             postDescHeap->GetGPUDescriptorHandleForHeapStart();
-        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize * historyIndex *
-                     kPostDescriptorsPerParity;
+        const UINT descriptorVariant =
+            historyIndex * 2u + stableSurfaceWriteIndex;
+        table.ptr += (UINT64)g_dx12.cbvSrvUavDescriptorSize *
+                     descriptorVariant * kPostDescriptorsPerVariant;
         cmdList->SetComputeRootDescriptorTable(1, table);
         cmdList->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+
+        if (stableSurfaceIdentityActiveThisFrame) {
+            D3D12_RESOURCE_BARRIER stableBarriers[2] = {};
+            for (UINT i = 0; i < 2; ++i) {
+                stableBarriers[i].Type =
+                    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                stableBarriers[i].Transition.Subresource =
+                    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            }
+            stableBarriers[0].Transition.pResource =
+                StableSurfaceResource(stableSurfaceWriteIndex);
+            stableBarriers[0].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            stableBarriers[0].Transition.StateAfter =
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            stableBarriers[1].Transition.pResource =
+                StableSurfaceResource(stableSurfaceWriteIndex ^ 1u);
+            stableBarriers[1].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            stableBarriers[1].Transition.StateAfter =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdList->ResourceBarrier(2, stableBarriers);
+            stableSurfaceWriteIndex ^= 1u;
+            surfaceHistoryValid = true;
+        } else {
+            surfaceHistoryValid = false;
+        }
 
         barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -2179,7 +2311,9 @@ public:
         depth.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
         depth.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         cmdList->ResourceBarrier(1, &depth);
-        temporalHistoryValid = temporalEffectsEnabled;
+        // Debug colours are not scene radiance. Never seed lit TAA history
+        // with them; the first frame after returning to Lit starts cleanly.
+        temporalHistoryValid = temporalEffectsEnabled && !preserveDebugOutput;
     }
 
     // Copy the resolved output to the back buffer
@@ -2218,7 +2352,6 @@ public:
         height = newHeight;
 
         visBufferRT.Reset();
-        visBufferHistory.Reset();
         surfaceHistoryValid = false;
         outputTexture.Reset();
         presentTexture.Reset();
@@ -2235,6 +2368,10 @@ public:
         svgfHistoryMoments[1].Reset();
         svgfStableSurfaceCurrent.Reset();
         svgfStableSurfaceHistory.Reset();
+        stableSurfaceWriteIndex = 0;
+        stableSurfaceIdentityActive = false;
+        stableSurfaceIdentityActiveThisFrame = false;
+        stableSurfaceModeSignature = ~0u;
         // À-trous scratch and the reflection source are screen-sized too, so
         // they must be released here or the next Init recreates everything
         // else at the new resolution while these keep the old dimensions --
@@ -2332,12 +2469,42 @@ private:
         return base;
     }
 
+    void WriteBentNormalHistoryDescriptor(ID3D12DescriptorHeap* heap,
+                                          UINT slot,
+                                          ID3D12Resource* history) {
+        if (!heap) return;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            heap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(
+            g_dx12.cbvSrvUavDescriptorSize) * slot;
+        g_dx12.device->CreateShaderResourceView(history, &srv, handle);
+    }
+
+    ID3D12DescriptorHeap* PrepareBentNormalResolveHeap(UINT frameSlot) {
+        ID3D12DescriptorHeap* heap =
+            bentNormalComputeDescHeaps[frameSlot % FRAME_COUNT].Get();
+        if (!heap || !computeDescHeap) return nullptr;
+        // Slots 0..85 include this frame's CBVs, refreshed immediately before
+        // Resolve. Only the current frame slot is rewritten.
+        g_dx12.device->CopyDescriptorsSimple(86,
+            heap->GetCPUDescriptorHandleForHeapStart(),
+            computeDescHeap->GetCPUDescriptorHandleForHeapStart(),
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        WriteBentNormalHistoryDescriptor(heap, 86, bentNormalGTAOHistory);
+        return heap;
+    }
+
     bool MotionVectorsRequired() const {
         // TAA owns post-process history, but SVGF independently needs the
         // visibility motion buffer to reproject reflection history. Capture
         // mode deliberately disables TAA, so tying this data to the TAA switch
         // pins SVGF history to screen space as soon as the camera moves.
-        return temporalEffectsEnabled ||
+        return temporalEffectsEnabled || aoTemporalMotionVectors ||
             (enhancedVisualsActive && enhancedRTReflectionsActive &&
              svgfTemporalEnabled);
     }
@@ -2382,56 +2549,9 @@ private:
         g_dx12.device->CreateRenderTargetView(visBufferRT.Get(), &rtvDesc,
             visRtvHeap->GetCPUDescriptorHandleForHeapStart());
 
-        // Surface-ID history: last frame's instance/primitive IDs.
-        //
-        // A straight copy of visBufferRT rather than a second render target
-        // with alternating RTVs -- the visibility pass and every consumer keep
-        // referring to one resource, and the copy is ~8 MB of bandwidth once
-        // per frame. Cheaper in complexity than ping-ponging the RTV, and the
-        // GPU copy does not stall anything.
-        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-        if (FAILED(g_dx12.device->CreateCommittedResource(
-                &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-                IID_PPV_ARGS(&visBufferHistory)))) {
-            std::cerr << "Failed to create visibility history buffer\n";
-            return false;
-        }
         surfaceHistoryValid = false;
 
         return true;
-    }
-
-    // Copies this frame's IDs into the history texture, for next frame's
-    // temporal validity test. Runs after the resolve has consumed the current
-    // vis buffer, so the copy never races a reader.
-    void CaptureSurfaceHistory(ID3D12GraphicsCommandList* cmdList) {
-        if (!visBufferRT || !visBufferHistory) return;
-
-        D3D12_RESOURCE_BARRIER barriers[2] = {};
-        for (UINT i = 0; i < 2; ++i) {
-            barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barriers[i].Transition.Subresource =
-                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        }
-        barriers[0].Transition.pResource = visBufferRT.Get();
-        barriers[0].Transition.StateBefore =
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        barriers[1].Transition.pResource = visBufferHistory.Get();
-        barriers[1].Transition.StateBefore =
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        cmdList->ResourceBarrier(2, barriers);
-
-        cmdList->CopyResource(visBufferHistory.Get(), visBufferRT.Get());
-
-        std::swap(barriers[0].Transition.StateBefore,
-                  barriers[0].Transition.StateAfter);
-        std::swap(barriers[1].Transition.StateBefore,
-                  barriers[1].Transition.StateAfter);
-        cmdList->ResourceBarrier(2, barriers);
-        surfaceHistoryValid = true;
     }
 
     bool CreateOutputTexture() {
@@ -2547,8 +2667,8 @@ private:
         svgfHistoryValid = false;
 
         // The visibility target keeps local SV_PrimitiveID for vertex lookup.
-        // SVGF writes a separate persistent key so destruction can regroup the
-        // same source triangles without invalidating their temporal identity.
+        // These UAV-capable peers ping-pong the authored identity so destruction
+        // can regroup source triangles without invalidating temporal history.
         desc.Format = DXGI_FORMAT_R32G32_UINT;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         hr = g_dx12.device->CreateCommittedResource(
@@ -2556,12 +2676,16 @@ private:
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
             IID_PPV_ARGS(&svgfStableSurfaceCurrent));
         if (FAILED(hr)) return false;
-        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
         hr = g_dx12.device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
             IID_PPV_ARGS(&svgfStableSurfaceHistory));
         if (FAILED(hr)) return false;
+        stableSurfaceWriteIndex = 0;
+        stableSurfaceIdentityActive = false;
+        stableSurfaceIdentityActiveThisFrame = false;
+        stableSurfaceModeSignature = ~0u;
+        surfaceHistoryValid = false;
         desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
@@ -2630,13 +2754,32 @@ private:
     }
 
     bool CreateStructuredBuffers() {
-        auto CreateDefaultAndUpload = [](UINT64 size,
+        auto CreateUpload = [](UINT64 size,
+                               ComPtr<ID3D12Resource>& uploadBuf) -> bool {
+            D3D12_HEAP_PROPERTIES uploadHeap = {};
+            uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+            D3D12_RESOURCE_DESC bufDesc = {};
+            bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bufDesc.Width = size;
+            bufDesc.Height = 1;
+            bufDesc.DepthOrArraySize = 1;
+            bufDesc.MipLevels = 1;
+            bufDesc.Format = DXGI_FORMAT_UNKNOWN;
+            bufDesc.SampleDesc.Count = 1;
+            bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+            return SUCCEEDED(g_dx12.device->CreateCommittedResource(
+                &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&uploadBuf)));
+        };
+
+        auto CreateDefaultAndUpload = [&CreateUpload](UINT64 size,
                                           ComPtr<ID3D12Resource>& defaultBuf,
                                           ComPtr<ID3D12Resource>& uploadBuf) -> bool {
             D3D12_HEAP_PROPERTIES defaultHeap = {};
             defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_HEAP_PROPERTIES uploadHeap = {};
-            uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
 
             D3D12_RESOURCE_DESC bufDesc = {};
             bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -2654,17 +2797,11 @@ private:
                 IID_PPV_ARGS(&defaultBuf));
             if (FAILED(hr)) return false;
 
-            hr = g_dx12.device->CreateCommittedResource(
-                &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
-                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                IID_PPV_ARGS(&uploadBuf));
-            if (FAILED(hr)) return false;
-
-            return true;
+            return CreateUpload(size, uploadBuf);
         };
 
         if (!CreateDefaultAndUpload(VB_MAX_DRAW_CALLS * sizeof(VBDrawCallData),
-                                     drawCallBuffer, drawCallUpload))
+                                     drawCallBuffer, drawCallUpload[0]))
             return false;
 
         if (!CreateDefaultAndUpload(VB_MAX_VERTICES * sizeof(VBPackedVertex),
@@ -2677,8 +2814,19 @@ private:
 
         if (!CreateDefaultAndUpload(VB_MAX_TRIANGLES * sizeof(UINT),
                                      stableTriangleDataBuffer,
-                                     stableTriangleDataUpload))
+                                     stableTriangleDataUpload[0]))
             return false;
+
+        // Destruction can replace draw metadata and append authored triangle
+        // keys every frame. Keep those upload sources tied to the fenced frame
+        // slot so CPU writes cannot race the preceding frame's queued copy.
+        for (UINT frame = 1; frame < FRAME_COUNT; ++frame) {
+            if (!CreateUpload(VB_MAX_DRAW_CALLS * sizeof(VBDrawCallData),
+                              drawCallUpload[frame]) ||
+                !CreateUpload(VB_MAX_TRIANGLES * sizeof(UINT),
+                              stableTriangleDataUpload[frame]))
+                return false;
+        }
 
         if (!CreateDefaultAndUpload(VB_CLUSTER_COUNT * sizeof(VBClusterData),
                                      clusterDataBuffer, clusterDataUpload))
@@ -2837,7 +2985,7 @@ private:
 
     bool CreateComputeDescriptorHeap() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-        heapDesc.NumDescriptors = 86;
+        heapDesc.NumDescriptors = 87;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         HRESULT hr = g_dx12.device->CreateDescriptorHeap(
@@ -2845,6 +2993,14 @@ private:
         if (FAILED(hr)) {
             std::cerr << "Failed to create visibility compute descriptor heap\n";
             return false;
+        }
+        for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
+            if (FAILED(g_dx12.device->CreateDescriptorHeap(
+                    &heapDesc,
+                    IID_PPV_ARGS(&bentNormalComputeDescHeaps[frame])))) {
+                std::cerr << "Failed to create bent-normal resolve heap\n";
+                return false;
+            }
         }
         UpdateComputeDescriptors();
         return true;
@@ -3294,7 +3450,8 @@ private:
         //   [96]     t84      stable surface history
         //   [97]     u7       current stable surfaces
         //   [98]     t85      raytracing hit geometry bindings
-        D3D12_DESCRIPTOR_RANGE ranges[16] = {};
+        //   [99]     t86      bent-normal GTAO history
+        D3D12_DESCRIPTOR_RANGE ranges[17] = {};
         ranges[0] = baseRanges[0];                          // t0..t78
         ranges[1] = baseRanges[1];                          // u0..u2 @ 79
         ranges[2] = baseRanges[2];                          // b1..b4 @ 82
@@ -3376,6 +3533,12 @@ private:
         ranges[15].BaseShaderRegister = 85;                 // t85 hitGeometry
         ranges[15].RegisterSpace = 0;
         ranges[15].OffsetInDescriptorsFromTableStart = 98;
+
+        ranges[16].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[16].NumDescriptors = 1;
+        ranges[16].BaseShaderRegister = 86;                 // t86 bent GTAO
+        ranges[16].RegisterSpace = 0;
+        ranges[16].OffsetInDescriptorsFromTableStart = 99;
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -3884,12 +4047,11 @@ private:
         rayMaskCopyPending = true;
     }
 
-    // Builds the enhanced heap: a copy of the default resolve heap's 86
-    // descriptors, then TLAS / ray mask / enhanced constants appended.
+    // Builds the enhanced heap: a copy of the default resolve heap's original
+    // 86 descriptors, then TLAS / ray mask / enhanced constants appended.
     //
-    // Updates just the current frame heap's SVGF slots (89-93). Normal shading
-    // supplies previous/current ping indices; read-only debug views instead
-    // keep the latest completed side bound without advancing history.
+    // Updates just the current frame heap's SVGF slots. Normal shading supplies
+    // colour/moment ping indices; authored identity uses the post-owned roles.
     void RefreshSVGFDescriptors(UINT frameSlot, UINT readIndex,
                                 UINT writeIndex) {
         if (frameSlot >= FRAME_COUNT ||
@@ -3926,7 +4088,8 @@ private:
                 svgfHistoryMoments[readIndex].Get(), &srv, h);
         }
 
-        // [91] t82 - vis buffer history (static, but refresh for safety)
+        // [91] t82 - obsolete raw-ID history binding kept null so the enhanced
+        // root layout and all later hardcoded slots remain unchanged.
         {
             D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
             srv.Format = DXGI_FORMAT_R32G32_UINT;
@@ -3935,8 +4098,7 @@ private:
             srv.Texture2D.MipLevels = 1;
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 91;
-            g_dx12.device->CreateShaderResourceView(
-                visBufferHistory.Get(), &srv, h);
+            g_dx12.device->CreateShaderResourceView(nullptr, &srv, h);
         }
 
         // [92] u4 - svgf colour write (current frame's ping)
@@ -3960,6 +4122,31 @@ private:
             g_dx12.device->CreateUnorderedAccessView(
                 svgfHistoryMoments[writeIndex].Get(), nullptr, &uav, h);
         }
+
+        // [96]/[97] - the same previous/current authored identity pair post
+        // consumes later on this command list.
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R32G32_UINT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 96;
+            g_dx12.device->CreateShaderResourceView(
+                StableSurfaceResource(stableSurfaceWriteIndex ^ 1u), &srv, h);
+        }
+        {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = DXGI_FORMAT_R32G32_UINT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
+            h.ptr += (UINT64)descSize * 97;
+            g_dx12.device->CreateUnorderedAccessView(
+                StableSurfaceResource(stableSurfaceWriteIndex), nullptr,
+                &uav, h);
+        }
     }
 
     // Called after the default heap is populated and whenever the TLAS address
@@ -3973,7 +4160,7 @@ private:
         if (!enhancedComputeDescHeaps[frameSlot]) {
             D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
             heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            heapDesc.NumDescriptors = 99;
+            heapDesc.NumDescriptors = 100;
             heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             if (FAILED(g_dx12.device->CreateDescriptorHeap(
                     &heapDesc,
@@ -4060,7 +4247,7 @@ private:
                 svgfHistoryMoments[svgfHistoryPing].Get(), &srv, h);
         }
 
-        // [91] t82 - vis buffer history (SRV, surface-ID validation)
+        // [91] t82 - obsolete raw-ID history binding, intentionally null.
         {
             D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
             srv.Format = DXGI_FORMAT_R32G32_UINT;
@@ -4069,8 +4256,7 @@ private:
             srv.Texture2D.MipLevels = 1;
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 91;
-            g_dx12.device->CreateShaderResourceView(
-                visBufferHistory.Get(), &srv, h);
+            g_dx12.device->CreateShaderResourceView(nullptr, &srv, h);
         }
 
         // [92] u4 - svgf colour write (UAV, write side of ping-pong)
@@ -4131,7 +4317,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 96;
             g_dx12.device->CreateShaderResourceView(
-                svgfStableSurfaceHistory.Get(), &srv, h);
+                StableSurfaceResource(stableSurfaceWriteIndex ^ 1u), &srv, h);
         }
 
         // [97] u7 - stable key emitted by this enhanced resolve.
@@ -4142,7 +4328,8 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 97;
             g_dx12.device->CreateUnorderedAccessView(
-                svgfStableSurfaceCurrent.Get(), nullptr, &uav, h);
+                StableSurfaceResource(stableSurfaceWriteIndex), nullptr,
+                &uav, h);
         }
 
         // [98] t85 - per-geometry raytracing hit bindings. NumElements follows
@@ -4162,6 +4349,11 @@ private:
             g_dx12.device->CreateShaderResourceView(
                 hitGeometryBuffer.Get(), &srv, h);
         }
+        // [99] t86 - common bent-normal GTAO history. It is refreshed again
+        // for the current frame immediately before dispatch when history is
+        // valid; a null descriptor keeps the inactive branch well-defined.
+        WriteBentNormalHistoryDescriptor(
+            enhancedHeap, 99, nullptr);
         enhancedHeapTLASAddresses[frameSlot] = enhancedTLASAddress;
     }
 
@@ -4315,7 +4507,7 @@ private:
         //   [8] b1 - light buffer CBV
         //   [9] b2 - point lights CBV
 
-        D3D12_DESCRIPTOR_RANGE ranges[3] = {};
+        D3D12_DESCRIPTOR_RANGE ranges[4] = {};
         // SRVs t0..t78: frame/geometry, materials, IBL, DDGI, sparse lookup.
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[0].NumDescriptors = 79;
@@ -4337,6 +4529,15 @@ private:
         ranges[2].RegisterSpace = 0;
         ranges[2].OffsetInDescriptorsFromTableStart = 82;
 
+        // Previous-frame bent-normal GTAO history. Kept outside t0..t78 so the
+        // established material/IBL layout and every existing heap offset stay
+        // unchanged when the toggle is off.
+        ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[3].NumDescriptors = 1;
+        ranges[3].BaseShaderRegister = 86;
+        ranges[3].RegisterSpace = 0;
+        ranges[3].OffsetInDescriptorsFromTableStart = 86;
+
         D3D12_ROOT_PARAMETER resolveParams[2] = {};
 
         // b0 - frame constants (root CBV)
@@ -4347,7 +4548,7 @@ private:
 
         // Descriptor table
         resolveParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        resolveParams[1].DescriptorTable.NumDescriptorRanges = 3;
+        resolveParams[1].DescriptorTable.NumDescriptorRanges = 4;
         resolveParams[1].DescriptorTable.pDescriptorRanges = ranges;
         resolveParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
@@ -4686,6 +4887,10 @@ private:
         // [84] b3 - sky SH CBV
         // [85] b4 - DDGI CBV
         // These will be created in UpdateLightDescriptors
+
+        // [86] t86 - bent-normal GTAO history. The per-frame resolve heap
+        // overwrites this null descriptor only while valid history is active.
+        WriteBentNormalHistoryDescriptor(computeDescHeap.Get(), 86, nullptr);
     }
 
     bool CreateExposurePipeline() {
@@ -5024,15 +5229,16 @@ private:
         }
 
         D3D12_DESCRIPTOR_RANGE ranges[2] = {};
-        // t0..t9: the original eight plus current/previous surface IDs.
+        // t0..t11: post inputs, raw visibility, previous authored identity,
+        // current draw metadata, and the local-to-authored triangle map.
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 10;
+        ranges[0].NumDescriptors = 12;
         ranges[0].BaseShaderRegister = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ranges[1].NumDescriptors = 2;
+        ranges[1].NumDescriptors = 3;
         ranges[1].BaseShaderRegister = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 10;
+        ranges[1].OffsetInDescriptorsFromTableStart = 12;
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -5072,7 +5278,8 @@ private:
         if (FAILED(hr)) return false;
 
         D3D12_DESCRIPTOR_HEAP_DESC heap = {};
-        heap.NumDescriptors = kPostDescriptorsPerParity * 2u;
+        heap.NumDescriptors = kPostDescriptorsPerVariant *
+                              kPostDescriptorVariantCount;
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = g_dx12.device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&postDescHeap));
@@ -5086,10 +5293,12 @@ private:
         UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         for (UINT parity = 0; parity < 2; ++parity) {
+          for (UINT stableWrite = 0; stableWrite < 2; ++stableWrite) {
             D3D12_CPU_DESCRIPTOR_HANDLE handle =
                 postDescHeap->GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (SIZE_T)descriptorSize * parity *
-                          kPostDescriptorsPerParity;
+            const UINT variant = parity * 2u + stableWrite;
+            handle.ptr += (SIZE_T)descriptorSize * variant *
+                          kPostDescriptorsPerVariant;
 
             D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
             srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -5142,8 +5351,8 @@ private:
             g_dx12.device->CreateShaderResourceView(
                 bloomTexture.Get(), &bloomSrv, handle);
             handle.ptr += descriptorSize;
-            // t8/t9 - current and previous surface IDs, for exact temporal
-            // validity. Both are R32G32_UINT: instance in .x, primitive in .y.
+            // t8 is raw visibility for local geometry addressing. t9 is the
+            // prior authored key, independent of draw and primitive ordering.
             D3D12_SHADER_RESOURCE_VIEW_DESC idSrv = {};
             idSrv.Format = DXGI_FORMAT_R32G32_UINT;
             idSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -5154,7 +5363,29 @@ private:
                 visBufferRT.Get(), &idSrv, handle);
             handle.ptr += descriptorSize;
             g_dx12.device->CreateShaderResourceView(
-                visBufferHistory.Get(), &idSrv, handle);
+                StableSurfaceResource(stableWrite ^ 1u), &idSrv, handle);
+            handle.ptr += descriptorSize;
+
+            D3D12_SHADER_RESOURCE_VIEW_DESC drawSrv = {};
+            drawSrv.Format = DXGI_FORMAT_UNKNOWN;
+            drawSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            drawSrv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            drawSrv.Buffer.NumElements = VB_MAX_DRAW_CALLS;
+            drawSrv.Buffer.StructureByteStride = sizeof(VBDrawCallData);
+            g_dx12.device->CreateShaderResourceView(
+                drawCallBuffer.Get(), &drawSrv, handle);
+            handle.ptr += descriptorSize;
+
+            D3D12_SHADER_RESOURCE_VIEW_DESC stableTriangleSrv = {};
+            stableTriangleSrv.Format = DXGI_FORMAT_UNKNOWN;
+            stableTriangleSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            stableTriangleSrv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            stableTriangleSrv.Buffer.NumElements = VB_MAX_TRIANGLES;
+            stableTriangleSrv.Buffer.StructureByteStride = sizeof(UINT);
+            g_dx12.device->CreateShaderResourceView(
+                stableTriangleDataBuffer.Get(), &stableTriangleSrv, handle);
             handle.ptr += descriptorSize;
 
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
@@ -5166,6 +5397,11 @@ private:
             uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
             g_dx12.device->CreateUnorderedAccessView(
                 historyTextures[parity].Get(), nullptr, &uav, handle);
+            handle.ptr += descriptorSize;
+            uav.Format = DXGI_FORMAT_R32G32_UINT;
+            g_dx12.device->CreateUnorderedAccessView(
+                StableSurfaceResource(stableWrite), nullptr, &uav, handle);
+          }
         }
     }
 

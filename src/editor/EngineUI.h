@@ -1290,6 +1290,39 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 scene.contactShadowLinearDepth
                     ? "  Screen-capped AO range; refined crossings."
                     : "  Device-depth slab: doubles on flat ground.");
+            ImGui::Checkbox("  Temporal Bent-Normal GTAO",
+                            &scene.temporalBentNormalGTAO);
+            if (scene.temporalBentNormalGTAO) {
+                if (!scene.useVisibilityBuffer)
+                    ImGui::TextDisabled(
+                        "  Requires Visibility Buffer motion vectors.");
+                else if (vb.BentNormalGTAOAppliedLastResolve())
+                    ImGui::TextDisabled(
+                        "  Active: bent sky/GI and accumulated diffuse AO.");
+                else
+                    ImGui::TextDisabled(
+                        "  Warming up temporal history (one frame).");
+                const char* bentDebugModes[] = {
+                    "Lit", "Bent Direction", "AO Visibility",
+                    "Temporal Confidence"
+                };
+                int bentDebugMode = static_cast<int>(
+                    vb.bentNormalGTAODebugMode);
+                if (ImGui::Combo("  Bent GTAO Diagnostic", &bentDebugMode,
+                        bentDebugModes, IM_ARRAYSIZE(bentDebugModes))) {
+                    bentDebugMode = (std::max)(0, (std::min)(3,
+                        bentDebugMode));
+                    vb.bentNormalGTAODebugMode =
+                        static_cast<VisibilityBufferDX12::
+                            BentNormalGTAODebugMode>(bentDebugMode);
+                }
+                if (bentDebugMode == 1)
+                    ImGui::TextDisabled("  RGB = world-space bent direction.");
+                else if (bentDebugMode == 2)
+                    ImGui::TextDisabled("  White = open; black = occluded.");
+                else if (bentDebugMode == 3)
+                    ImGui::TextDisabled("  Green = accepted; red = rejected.");
+            }
             ImGui::Checkbox("  Grass Depth in GTAO + Contact",
                             &scene.grassInScreenSpaceAO);
             if (scene.grassInScreenSpaceAO &&

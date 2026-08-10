@@ -24,7 +24,8 @@ cbuffer FrameConstants : register(b0) {
     float  contactShadowMaxDistance;
     uint   contactShadowLinearDepth;
     uint   contactShadowNoiseFrame;
-    uint2  contactPadding;
+    uint   bentNormalGTAOEnabled;
+    uint   bentNormalGTAOFlags; // bit 0 history valid, bits 1..2 debug mode
     float4 palmWind;
     float4 palmPrimary;
     float4 palmSecondary;
@@ -192,6 +193,10 @@ struct SparseProbeCell {
 StructuredBuffer<SparseProbeData> sparseProbes : register(t76);
 StructuredBuffer<SparseProbeCell> sparseProbeCells : register(t77);
 StructuredBuffer<uint> sparseProbeIndices : register(t78);
+// Previous frame's temporally accumulated world-space bent normal, scalar
+// visibility, and linear depth. This is common to default and enhanced resolve
+// variants; their descriptor tables place t86 at different heap offsets.
+Texture2D<float4> bentNormalGTAOHistory : register(t86);
 
 RWTexture2D<float4> outputColor : register(u0);
 RWTexture2D<float2> outputMotion : register(u1);
@@ -1567,6 +1572,81 @@ struct Surface {
     DrawCallData dc;
 };
 
+float3 DecodeBentNormalGTAO(float2 encoded) {
+    float2 f = encoded * 2.0 - 1.0;
+    float3 normal = float3(f, 1.0 - abs(f.x) - abs(f.y));
+    if (normal.z < 0.0) {
+        normal.xy = (1.0 - abs(normal.yx)) *
+            float2(normal.x >= 0.0 ? 1.0 : -1.0,
+                   normal.y >= 0.0 ? 1.0 : -1.0);
+    }
+    return normalize(normal);
+}
+
+float LinearizeResolveDepth(float depth) {
+    return nearPlane * farPlane /
+        max(farPlane - depth * (farPlane - nearPlane), 1e-5);
+}
+
+struct BentAmbientGTAO {
+    float3 normal;
+    float visibility;
+    float confidence;
+};
+
+bool BentNormalGTAOHistoryValid() {
+    return (bentNormalGTAOFlags & 1u) != 0u;
+}
+
+uint BentNormalGTAODebugMode() {
+    return (bentNormalGTAOFlags >> 1u) & 3u;
+}
+
+BentAmbientGTAO SampleBentAmbientGTAO(
+        uint2 pixel, Surface surface, float2 motion) {
+    BentAmbientGTAO result = { surface.normal, 1.0, 0.0 };
+    if (bentNormalGTAOEnabled == 0u ||
+        !BentNormalGTAOHistoryValid())
+        return result;
+
+    float2 resolution = float2(screenWidth, screenHeight);
+    float2 currentUV = (float2(pixel) + 0.5) / resolution;
+    float2 previousUV = currentUV - motion;
+    if (any(previousUV <= 0.0) || any(previousUV >= 1.0))
+        return result;
+
+    // The AO history stores linear depth from the previous camera. Static
+    // surfaces can predict that depth exactly from their world position;
+    // animated geometry naturally fails this test instead of dragging an old
+    // bent direction across the frame.
+    float4 previousClip = mul(float4(surface.fragPos, 1.0), previousViewProj);
+    if (previousClip.w <= 0.001)
+        return result;
+    float expectedDepth = LinearizeResolveDepth(
+        saturate(previousClip.z / previousClip.w));
+    int2 previousPixel = clamp(int2(previousUV * resolution), int2(0, 0),
+                               int2(resolution) - 1);
+    float4 signal = bentNormalGTAOHistory.Load(int3(previousPixel, 0));
+    float depthTolerance = max(0.05, expectedDepth * 0.02);
+    float depthConfidence = saturate(
+        1.0 - abs(signal.w - expectedDepth) / depthTolerance);
+    float3 bentNormal = DecodeBentNormalGTAO(signal.xy);
+    float hemisphereConfidence = smoothstep(
+        0.05, 0.35, dot(surface.normal, bentNormal));
+    float confidence = depthConfidence * hemisphereConfidence;
+    if (confidence <= 0.001 || signal.w >= farPlane * 0.999)
+        return result;
+
+    // Alpha foliage has less reliable screen-space depth than opaque geometry.
+    // Keep the directional cue, but soften it so fronds retain transmission
+    // and do not regress to black cards in dense canopies.
+    float influence = (surface.isFoliage ? 0.5 : 1.0) * confidence;
+    result.normal = normalize(lerp(surface.normal, bentNormal, influence));
+    result.visibility = lerp(1.0, saturate(signal.z), influence);
+    result.confidence = confidence;
+    return result;
+}
+
 Surface EvaluateSurface(float3 fragPos,
                         DrawCallData dc, bool isFoliage,
                         float3 wp0, float3 wp1, float3 wp2,
@@ -1750,17 +1830,23 @@ struct ShadeResult {
 // `commitTemporalHistory` is false for edge-AA sub-samples, which call this
 // twice for one pixel; see SVGF_TemporalAccumulate.
 #if SGE_ENHANCED_VISUALS
-ShadeResult ShadeSurface(uint2 pixel, Surface surface,
+ShadeResult ShadeSurface(uint2 pixel, Surface surface, float2 motion,
                          uint2 stableSurfaceID,
                          bool commitTemporalHistory = true) {
 #else
 // Keep the unused defaulted parameter: dropping it changes the default
 // variant's DXBC (42020 -> 42024), and byte-identical output with the feature
 // off is the contract that catches silently-broken PSOs.
-float3 ShadeSurface(uint2 pixel, Surface surface,
+float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
                     bool commitTemporalHistory = true) {
 #endif
     float3 result = 0.0;
+    const bool bentGTAOLightingActive =
+        bentNormalGTAOEnabled != 0u && BentNormalGTAOHistoryValid();
+    BentAmbientGTAO bentAmbient =
+        SampleBentAmbientGTAO(pixel, surface, motion);
+    float3 ambientNormal = bentAmbient.normal;
+    float screenAmbientVisibility = bentAmbient.visibility;
 #if SGE_ENHANCED_VISUALS
     float3 outSpecularIBL = 0.0;
     float outSpecularVariance = 0.0;
@@ -1814,9 +1900,11 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
     kD *= 1.0 - surface.metal;
 
     float ambientOcclusion = surface.materialAO;
+    float diffuseAmbientOcclusion =
+        ambientOcclusion * screenAmbientVisibility;
     float3 diffuseAlbedo = surface.albedo * (1.0 - surface.metal);
     float ambientScale = surface.material.shadingParams.x;
-    float3 diffuseIBL = SampleSkyIrradiance(surface.normal) * diffuseAlbedo * ambientScale;
+    float3 diffuseIBL = SampleSkyIrradiance(ambientNormal) * diffuseAlbedo * ambientScale;
 #if SGE_ENHANCED_VISUALS
     // Probe-miss RT fallback: trace a bounce only where the sparse grid
     // reported it had nothing, so cost scales with the miss fraction rather
@@ -1834,7 +1922,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
         sparseProbeCount > 0 && sparseCellCount > 0) {
         bool probeResolved = false;
         giIrradiance = SampleSparseDDGIClassified(
-            surface.fragPos, surface.normal, probeResolved);
+            surface.fragPos, ambientNormal, probeResolved);
         // enhancedProbeMissGIStrength blends probe and traced irradiance:
         //   0   fill misses only -- rays where the grid has nothing
         //   1   full RT GI -- trace every pixel, probes unused
@@ -1854,7 +1942,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
             !probeResolved || enhancedProbeMissGIStrength > 0.0;
         if (traceThisPixel) {
             float3 traced = RayTracedProbeMissGI(
-                surface.fragPos, surface.normal, pixel);
+                surface.fragPos, ambientNormal, pixel);
             // A miss has no probe value to blend against, so it takes the
             // traced result outright whatever the strength.
             giIrradiance = probeResolved
@@ -1883,7 +1971,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
             outputRayMask[pixel] |= 4u;
         }
     } else {
-        giIrradiance = SampleDDGIIrradiance(surface.fragPos, surface.normal);
+        giIrradiance = SampleDDGIIrradiance(surface.fragPos, ambientNormal);
     }
     // diffuseGI is deliberately NOT computed here in the enhanced variant: the
     // traced part of giIrradiance is still raw at this point, and the temporal
@@ -1895,7 +1983,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
     float3 accumulatedGIIrradiance = 0.0;
     float3 tracedGIVariance = 0.0;
 #else
-    float3 diffuseGI = SampleDDGIIrradiance(surface.fragPos, surface.normal) *
+    float3 diffuseGI = SampleDDGIIrradiance(surface.fragPos, ambientNormal) *
         diffuseAlbedo * ambientScale;
 #endif
     float3 reflectionIBL = SampleReflectionProbe(reflect(-V, surface.normal), surface.rough);
@@ -2010,8 +2098,13 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
         foliageSpecularScale;
     float3 specularIBL = reflectionIBL * specularScale;
     float3 specularContrib = specularIBL * ambientOcclusion * ambientLightingIntensity;
-    result += (diffuseIBL + diffuseGI) * ambientOcclusion * ambientLightingIntensity +
-              specularContrib;
+    if (bentGTAOLightingActive) {
+        result += (diffuseIBL + diffuseGI) * diffuseAmbientOcclusion *
+                  ambientLightingIntensity + specularContrib;
+    } else {
+        result += (diffuseIBL + diffuseGI) * ambientOcclusion * ambientLightingIntensity +
+                  specularContrib;
+    }
     // Must match reflectionEligible above: publishing the reflection signal
     // for a pixel that never traced hands the denoiser a converged probe value
     // labelled as ray output, and the à-trous pass then filters a signal with
@@ -2044,7 +2137,9 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
     // from independent sequences, so Var[a + b] = Var[a] + Var[b].
     if (giTraced) {
         float3 giContributionScale =
-            diffuseAlbedo * ambientScale * ambientOcclusion *
+            diffuseAlbedo * ambientScale *
+            (bentGTAOLightingActive ? diffuseAmbientOcclusion
+                                    : ambientOcclusion) *
             ambientLightingIntensity;
         outSpecularIBL += tracedGIIrradiance * giContributionScale;
         float3 giContributionVariance = tracedGIVariance *
@@ -2057,11 +2152,22 @@ float3 ShadeSurface(uint2 pixel, Surface surface,
     float3 specularIBL = reflectionIBL *
         (F0 * environmentBRDF.x + environmentBRDF.y) *
         foliageSpecularScale;
-    result += (diffuseIBL + diffuseGI + specularIBL) * ambientOcclusion *
-              ambientLightingIntensity;
+    if (bentGTAOLightingActive) {
+        result += (diffuseIBL + diffuseGI) * diffuseAmbientOcclusion *
+                  ambientLightingIntensity +
+                  specularIBL * ambientOcclusion * ambientLightingIntensity;
+    } else {
+        result += (diffuseIBL + diffuseGI + specularIBL) * ambientOcclusion *
+                  ambientLightingIntensity;
+    }
 #endif
-    result += ambientStrength * diffuseAlbedo * ambientScale *
-              ambientOcclusion * ambientLightingIntensity;
+    if (bentGTAOLightingActive) {
+        result += ambientStrength * diffuseAlbedo * ambientScale *
+                  diffuseAmbientOcclusion * ambientLightingIntensity;
+    } else {
+        result += ambientStrength * diffuseAlbedo * ambientScale *
+                  ambientOcclusion * ambientLightingIntensity;
+    }
     result += surface.material.emissiveOcclusion.rgb;
     
     float3 numerator = NDF * G * F;
@@ -2305,6 +2411,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     
     // Interpolate attributes
     float3 fragPos = bary.x * wp0 + bary.y * wp1 + bary.z * wp2;
+    float2 primaryMotion = 0.0;
     if (enableMotionVectors != 0u) {
         float4 previousWind = palmWind;
         previousWind.x = palmWind.y;
@@ -2327,7 +2434,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         if (previousClip.w > 0.001) {
             previousUV = (previousClip.xy / previousClip.w) * float2(0.5, -0.5) + 0.5;
         }
-        outputMotion[pixel] = currentUV - previousUV;
+        primaryMotion = currentUV - previousUV;
+        outputMotion[pixel] = primaryMotion;
     }
     
 #if SGE_ENHANCED_VISUALS
@@ -2336,7 +2444,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     // with the centre sample — an averaged normal across a silhouette corrupts
     // the deferred/temporal consumers that expect one surface per pixel.
     bool edgeAAApplied = false;
-    if (edgeAAEnabled != 0u) {
+    if (edgeAAEnabled != 0u && BentNormalGTAODebugMode() == 0u) {
         bool isEdge = false;
         const int2 neighOffsets[4] = {
             int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)
@@ -2456,7 +2564,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                 // Sub-samples must not commit temporal history: two calls for
                 // one pixel would double-blend and double-advance the count.
                 ShadeResult srS = ShadeSurface(
-                    pixel, surfaceS, stableSurfaceS, false);
+                    pixel, surfaceS, primaryMotion, stableSurfaceS, false);
                 sampleColors[s] = srS.color;
                 sampleSpecular[s] = srS.specularIBL;
                 sampleSpecularVariance[s] = srS.specularVariance;
@@ -2485,6 +2593,28 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                                        wp0, wp1, wp2, n0, n1, n2,
                                        uv0, uv1, uv2, bary);
     outputNormalRoughness[pixel] = float4(surface.normal, surface.rough);
+
+    // Bent-normal diagnostics use the same reprojected history and confidence
+    // as lit shading. Keeping this separate from debugViewMode lets GTAO keep
+    // producing motion/history while the signal is inspected.
+    uint bentDebugMode = BentNormalGTAODebugMode();
+    if (bentNormalGTAOEnabled != 0u && BentNormalGTAOHistoryValid() &&
+        bentDebugMode != 0u) {
+        BentAmbientGTAO debugBent =
+            SampleBentAmbientGTAO(pixel, surface, primaryMotion);
+        float3 debugColor;
+        if (bentDebugMode == 1u) {
+            debugColor = debugBent.normal * 0.5 + 0.5;
+        } else if (bentDebugMode == 2u) {
+            debugColor = debugBent.visibility.xxx;
+        } else {
+            debugColor = float3(
+                1.0 - debugBent.confidence,
+                debugBent.confidence, 0.0);
+        }
+        outputColor[pixel] = float4(debugColor, 1.0);
+        return;
+    }
 
 #if SGE_ENHANCED_VISUALS
     // Debug view 4: why a pixel did or did not get a ray-traced reflection.
@@ -2603,7 +2733,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
 
 #if SGE_ENHANCED_VISUALS
     if (!edgeAAApplied) {
-        ShadeResult sr = ShadeSurface(pixel, surface, stableSurfaceID);
+        ShadeResult sr = ShadeSurface(
+            pixel, surface, primaryMotion, stableSurfaceID);
         outputColor[pixel] = float4(sr.color, 1.0);
         outputReflectionSrc[pixel] =
             float4(sr.specularIBL, sr.specularVariance);
@@ -2631,7 +2762,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
                                 centreVariance);
     }
 #else
-    float3 result = ShadeSurface(pixel, surface);
+    float3 result = ShadeSurface(pixel, surface, primaryMotion);
     outputColor[pixel] = float4(result, 1.0);
 #endif
 }

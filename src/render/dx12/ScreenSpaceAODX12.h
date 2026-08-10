@@ -25,7 +25,9 @@ public:
         const std::string source = stream.str();
         const UINT flags = D3DCOMPILE_ENABLE_STRICTNESS |
                            D3DCOMPILE_OPTIMIZATION_LEVEL3;
-        ComPtr<ID3DBlob> vs, gtao, gtaoMSAA, composite, compositeMSAA, errors;
+        ComPtr<ID3DBlob> vs, gtao, gtaoMSAA, composite, compositeMSAA;
+        ComPtr<ID3DBlob> bentGtao, bentGtaoMSAA;
+        ComPtr<ID3DBlob> bentComposite, bentCompositeMSAA, errors;
         if (!Compile(source, "VSMain", "vs_5_0", flags, vs, errors) ||
             !Compile(source, "PSGTAO", "ps_5_0", flags, gtao, errors) ||
             !Compile(source, "PSGTAOMSAA", "ps_5_0", flags, gtaoMSAA, errors) ||
@@ -33,12 +35,34 @@ public:
                      composite, errors) ||
             !Compile(source, "PSBlurCompositeMSAA", "ps_5_0", flags,
                      compositeMSAA, errors) ||
+            !Compile(source, "PSBentGTAO", "ps_5_0", flags,
+                     bentGtao, errors) ||
+            !Compile(source, "PSBentGTAOMSAA", "ps_5_0", flags,
+                     bentGtaoMSAA, errors) ||
+            !Compile(source, "PSBentBlurComposite", "ps_5_0", flags,
+                     bentComposite, errors) ||
+            !Compile(source, "PSBentBlurCompositeMSAA", "ps_5_0", flags,
+                     bentCompositeMSAA, errors) ||
             !CreateRootSignature() ||
             !CreatePipelines(vs.Get(), gtao.Get(), gtaoMSAA.Get(),
                              composite.Get(), compositeMSAA.Get()) ||
+            !CreateTemporalPipelines(
+                vs.Get(), bentGtao.Get(), bentGtaoMSAA.Get(),
+                bentComposite.Get(), bentCompositeMSAA.Get()) ||
             !CreateResources()) return false;
         initialized = true;
         return true;
+    }
+
+    bool HasTemporalBentNormalHistory(UINT nextFrame) const {
+        return historyValid_ && aoHistory_[historyReadIndex_] &&
+            targetWidth_ == g_dx12.screenWidth &&
+            targetHeight_ == g_dx12.screenHeight &&
+            lastTemporalFrame_ + 1u == nextFrame;
+    }
+
+    ID3D12Resource* GetTemporalBentNormalHistory() const {
+        return historyValid_ ? aoHistory_[historyReadIndex_].Get() : nullptr;
     }
 
     void Render(const Scene& scene, ID3D12Resource* depthResource,
@@ -49,12 +73,31 @@ public:
                  bool depthAlreadyReadable = false,
                  ID3D12Resource* grassCoverage = nullptr,
                  bool contactAppliedInDirectLighting = false,
-                 UINT temporalNoiseFrame = 0) {
+                 UINT temporalNoiseFrame = 0,
+                 ID3D12Resource* motionVectors = nullptr,
+                 D3D12_RESOURCE_STATES motionState =
+                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                 bool temporalBentNormal = false,
+                 bool bentAmbientAppliedInLighting = false) {
         if (!initialized || !depthResource || !g_dx12.commandList) return;
         if (!EnsureRawTarget()) return;
+        bool temporalActive = temporalBentNormal && motionVectors;
+        if (temporalActive && !EnsureTemporalTargets())
+            temporalActive = false;
+        if (temporalActive != temporalEnabledLastFrame_) {
+            historyValid_ = false;
+            temporalEnabledLastFrame_ = temporalActive;
+        }
+        if (temporalActive && historyValid_ &&
+            temporalNoiseFrame != lastTemporalFrame_ + 1u)
+            historyValid_ = false;
+        const UINT historyWriteIndex = historyReadIndex_ ^ 1u;
         Update(scene, depthResource, multisampledDepth, staticCasterDepth,
                normalRoughness, grassCoverage,
-               contactAppliedInDirectLighting, temporalNoiseFrame);
+               contactAppliedInDirectLighting, temporalNoiseFrame,
+               temporalActive ? aoHistory_[historyReadIndex_].Get() : nullptr,
+               temporalActive ? motionVectors : nullptr,
+               temporalActive, historyValid_, bentAmbientAppliedInLighting);
 
         ID3D12GraphicsCommandList* list = g_dx12.commandList.Get();
         // GrassMSAADX12's combined depth is produced by compute and handed off
@@ -71,39 +114,78 @@ public:
             Transition(list, normalRoughness,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (temporalActive)
+            Transition(list, motionVectors, motionState,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-        ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
+        ID3D12DescriptorHeap* activeDescriptorHeap =
+            descriptorHeaps_[g_dx12.frameIndex % FRAME_COUNT].Get();
+        ID3D12DescriptorHeap* heaps[] = { activeDescriptorHeap };
         list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootSignature(rootSignature_.Get());
         list->SetGraphicsRootConstantBufferView(
             0, constantBuffer_->GetGPUVirtualAddress() +
                g_dx12.frameIndex * 256u);
         list->SetGraphicsRootDescriptorTable(
-            1, descriptorHeap_->GetGPUDescriptorHandleForHeapStart());
+            1, activeDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->RSSetViewports(1, &g_dx12.viewport);
         list->RSSetScissorRects(1, &g_dx12.scissorRect);
 
-        Transition(list, rawAO_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        ID3D12Resource* rawSignal = temporalActive ? bentAO_.Get() : rawAO_.Get();
+        Transition(list, rawSignal, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_RENDER_TARGET);
-        D3D12_CPU_DESCRIPTOR_HANDLE rawRtv =
-            rawRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        D3D12_CPU_DESCRIPTOR_HANDLE rawRtv = temporalActive
+            ? temporalRtvHeap_->GetCPUDescriptorHandleForHeapStart()
+            : rawRtvHeap_->GetCPUDescriptorHandleForHeapStart();
         list->OMSetRenderTargets(1, &rawRtv, FALSE, nullptr);
-        list->SetPipelineState(multisampledDepth ? gtaoMSAAPipeline_.Get()
-                                                : gtaoPipeline_.Get());
+        list->SetPipelineState(temporalActive
+            ? (multisampledDepth ? bentGtaoMSAAPipeline_.Get()
+                                 : bentGtaoPipeline_.Get())
+            : (multisampledDepth ? gtaoMSAAPipeline_.Get()
+                                 : gtaoPipeline_.Get()));
         list->DrawInstanced(3, 1, 0, 0);
-        Transition(list, rawAO_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+        Transition(list, rawSignal, D3D12_RESOURCE_STATE_RENDER_TARGET,
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = targetRtv.ptr ? targetRtv :
             GetCPUDescriptorHandle(g_dx12.rtvHeap.Get(),
                                    g_dx12.rtvDescriptorSize,
                                    g_dx12.frameIndex);
-        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        list->SetPipelineState(hdrTarget ? compositeHDRPipeline_.Get() :
-            (multisampledDepth ? compositeMSAAPipeline_.Get()
-                               : compositePipeline_.Get()));
+        if (temporalActive) {
+            Transition(list, aoHistory_[historyWriteIndex].Get(),
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_RENDER_TARGET);
+            D3D12_CPU_DESCRIPTOR_HANDLE historyRtv =
+                temporalRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+            historyRtv.ptr += static_cast<SIZE_T>(
+                g_dx12.device->GetDescriptorHandleIncrementSize(
+                    D3D12_DESCRIPTOR_HEAP_TYPE_RTV)) *
+                (historyWriteIndex + 1u);
+            D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = { rtv, historyRtv };
+            list->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
+            list->SetPipelineState(hdrTarget
+                ? bentCompositeHDRPipeline_.Get()
+                : (multisampledDepth ? bentCompositeMSAAPipeline_.Get()
+                                     : bentCompositePipeline_.Get()));
+        } else {
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->SetPipelineState(hdrTarget ? compositeHDRPipeline_.Get() :
+                (multisampledDepth ? compositeMSAAPipeline_.Get()
+                                   : compositePipeline_.Get()));
+        }
         list->DrawInstanced(3, 1, 0, 0);
+        if (temporalActive) {
+            Transition(list, aoHistory_[historyWriteIndex].Get(),
+                       D3D12_RESOURCE_STATE_RENDER_TARGET,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            historyReadIndex_ = historyWriteIndex;
+            historyValid_ = true;
+            lastTemporalFrame_ = temporalNoiseFrame;
+        } else {
+            historyValid_ = false;
+            lastTemporalFrame_ = UINT_MAX;
+        }
 
         if (!depthAlreadyReadable)
             Transition(list, depthResource,
@@ -117,6 +199,10 @@ public:
             Transition(list, normalRoughness,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (temporalActive)
+            Transition(list, motionVectors,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                       motionState);
     }
 
 private:
@@ -146,7 +232,7 @@ private:
     bool CreateRootSignature() {
         D3D12_DESCRIPTOR_RANGE range = {};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = 6;
+        range.NumDescriptors = 9;
         range.BaseShaderRegister = 0;
         D3D12_ROOT_PARAMETER roots[2] = {};
         roots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -234,13 +320,75 @@ private:
             &desc, IID_PPV_ARGS(&compositeMSAAPipeline_)));
     }
 
+    bool CreateTemporalPipelines(
+            ID3DBlob* vs, ID3DBlob* gtao, ID3DBlob* gtaoMSAA,
+            ID3DBlob* composite, ID3DBlob* compositeMSAA) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+        desc.pRootSignature = rootSignature_.Get();
+        desc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+        desc.PS = { gtao->GetBufferPointer(), gtao->GetBufferSize() };
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.RasterizerState.DepthClipEnable = TRUE;
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+            D3D12_COLOR_WRITE_ENABLE_ALL;
+        desc.DepthStencilState.DepthEnable = FALSE;
+        desc.DepthStencilState.StencilEnable = FALSE;
+        desc.SampleMask = UINT_MAX;
+        desc.PrimitiveTopologyType =
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.NumRenderTargets = 1;
+        desc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc.SampleDesc.Count = 1;
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &desc, IID_PPV_ARGS(&bentGtaoPipeline_)))) return false;
+
+        desc.PS = { gtaoMSAA->GetBufferPointer(),
+                    gtaoMSAA->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &desc, IID_PPV_ARGS(&bentGtaoMSAAPipeline_)))) return false;
+
+        desc.NumRenderTargets = 2;
+        desc.BlendState.IndependentBlendEnable = TRUE;
+        auto& blend = desc.BlendState.RenderTarget[0];
+        blend.BlendEnable = TRUE;
+        blend.SrcBlend = D3D12_BLEND_ZERO;
+        blend.DestBlend = D3D12_BLEND_SRC_COLOR;
+        blend.BlendOp = D3D12_BLEND_OP_ADD;
+        blend.SrcBlendAlpha = D3D12_BLEND_ZERO;
+        blend.DestBlendAlpha = D3D12_BLEND_ONE;
+        blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED |
+            D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+        auto& historyBlend = desc.BlendState.RenderTarget[1];
+        historyBlend.BlendEnable = FALSE;
+        historyBlend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc.PS = { composite->GetBufferPointer(),
+                    composite->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &desc, IID_PPV_ARGS(&bentCompositePipeline_)))) return false;
+        desc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &desc, IID_PPV_ARGS(&bentCompositeHDRPipeline_)))) return false;
+        desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.PS = { compositeMSAA->GetBufferPointer(),
+                    compositeMSAA->GetBufferSize() };
+        return SUCCEEDED(g_dx12.device->CreateGraphicsPipelineState(
+            &desc, IID_PPV_ARGS(&bentCompositeMSAAPipeline_)));
+    }
+
     bool CreateResources() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 6;
+        heapDesc.NumDescriptors = 9;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if (FAILED(g_dx12.device->CreateDescriptorHeap(
-                &heapDesc, IID_PPV_ARGS(&descriptorHeap_)))) return false;
+        for (UINT i = 0; i < FRAME_COUNT; ++i) {
+            if (FAILED(g_dx12.device->CreateDescriptorHeap(
+                    &heapDesc, IID_PPV_ARGS(&descriptorHeaps_[i]))))
+                return false;
+        }
         descriptorSize_ = g_dx12.device->GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
@@ -269,7 +417,20 @@ private:
             targetHeight_ == g_dx12.screenHeight) return true;
         rawAO_.Reset();
         rawRtvHeap_.Reset();
+        bentAO_.Reset();
+        aoHistory_[0].Reset();
+        aoHistory_[1].Reset();
+        temporalRtvHeap_.Reset();
+        historyReadIndex_ = 0;
+        historyValid_ = false;
+        lastTemporalFrame_ = UINT_MAX;
         return CreateRawTarget();
+    }
+
+    bool EnsureTemporalTargets() {
+        if (bentAO_ && aoHistory_[0] && aoHistory_[1] && temporalRtvHeap_)
+            return true;
+        return CreateTemporalTargets();
     }
 
     // The AO trace runs at full resolution. Tracing at half res saved ~2.3 ms
@@ -310,12 +471,63 @@ private:
         return true;
     }
 
+    bool CreateTemporalTargets() {
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = targetWidth_;
+        desc.Height = targetHeight_;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&bentAO_)))) return false;
+        for (UINT i = 0; i < 2; ++i) {
+            if (FAILED(g_dx12.device->CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                    IID_PPV_ARGS(&aoHistory_[i])))) return false;
+        }
+
+        D3D12_DESCRIPTOR_HEAP_DESC rtvHeap = {};
+        rtvHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rtvHeap.NumDescriptors = 3;
+        if (FAILED(g_dx12.device->CreateDescriptorHeap(
+                &rtvHeap, IID_PPV_ARGS(&temporalRtvHeap_)))) return false;
+        D3D12_RENDER_TARGET_VIEW_DESC rtv = {};
+        rtv.Format = desc.Format;
+        rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            temporalRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        const UINT stride = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        g_dx12.device->CreateRenderTargetView(bentAO_.Get(), &rtv, handle);
+        for (UINT i = 0; i < 2; ++i) {
+            handle.ptr += stride;
+            g_dx12.device->CreateRenderTargetView(
+                aoHistory_[i].Get(), &rtv, handle);
+        }
+        historyReadIndex_ = 0;
+        historyValid_ = false;
+        return true;
+    }
+
     void Update(const Scene& scene, ID3D12Resource* depth, bool multisampled,
                 ID3D12Resource* staticCasterDepth,
                 ID3D12Resource* normalRoughness,
                 ID3D12Resource* grassCoverage,
                 bool contactAppliedInDirectLighting,
-                UINT temporalNoiseFrame) {
+                UINT temporalNoiseFrame,
+                ID3D12Resource* aoHistory,
+                ID3D12Resource* motionVectors,
+                bool temporalActive,
+                bool temporalHistoryValid,
+                bool bentAmbientAppliedInLighting) {
         Constants constants = {};
         XMMATRIX vp = scene.GetViewMatrix() * scene.GetProjectionMatrix();
         XMStoreFloat4x4(&constants.inverseViewProjection,
@@ -342,15 +554,19 @@ private:
         constants.filterParams = {
             staticCasterDepth && staticCasterDepth != depth ? 1.0f : 0.0f,
             normalRoughness ? 1.0f : 0.0f,
-            scene.contactShadowLinearDepth ? 1.0f : 0.0f, 0.0f };
+            scene.contactShadowLinearDepth ? 1.0f : 0.0f,
+            temporalActive
+                ? (temporalHistoryValid ? 0.90f : -0.90f) : 0.0f };
         constants.contactParams = {
             grassCoverage ? 1.0f : 0.0f,
             contactAppliedInDirectLighting ? 1.0f : 0.0f,
-            static_cast<float>(temporalNoiseFrame), 0.0f };
+            static_cast<float>(temporalNoiseFrame),
+            bentAmbientAppliedInLighting ? 1.0f : 0.0f };
         std::memcpy(mappedConstants_ + g_dx12.frameIndex * 256u,
                     &constants, sizeof(constants));
 
-        auto handle = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
+        auto handle = descriptorHeaps_[g_dx12.frameIndex % FRAME_COUNT]
+            ->GetCPUDescriptorHandleForHeapStart();
         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
         srv.Shader4ComponentMapping =
             D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -379,8 +595,20 @@ private:
         srv.Format = DXGI_FORMAT_R8_UNORM;
         g_dx12.device->CreateShaderResourceView(rawAO_.Get(), &srv, handle);
         handle.ptr += descriptorSize_;
+        srv.Format = DXGI_FORMAT_R8_UNORM;
         g_dx12.device->CreateShaderResourceView(
             grassCoverage, &srv, handle);
+        handle.ptr += descriptorSize_;
+        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g_dx12.device->CreateShaderResourceView(aoHistory, &srv, handle);
+        handle.ptr += descriptorSize_;
+        srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+        g_dx12.device->CreateShaderResourceView(
+            motionVectors, &srv, handle);
+        handle.ptr += descriptorSize_;
+        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g_dx12.device->CreateShaderResourceView(
+            temporalActive ? bentAO_.Get() : nullptr, &srv, handle);
     }
 
     static void Transition(ID3D12GraphicsCommandList* list,
@@ -401,12 +629,23 @@ private:
     ComPtr<ID3D12PipelineState> gtaoPipeline_, gtaoMSAAPipeline_;
     ComPtr<ID3D12PipelineState> compositePipeline_, compositeHDRPipeline_;
     ComPtr<ID3D12PipelineState> compositeMSAAPipeline_;
-    ComPtr<ID3D12DescriptorHeap> descriptorHeap_, rawRtvHeap_;
+    ComPtr<ID3D12PipelineState> bentGtaoPipeline_, bentGtaoMSAAPipeline_;
+    ComPtr<ID3D12PipelineState> bentCompositePipeline_;
+    ComPtr<ID3D12PipelineState> bentCompositeHDRPipeline_;
+    ComPtr<ID3D12PipelineState> bentCompositeMSAAPipeline_;
+    ComPtr<ID3D12DescriptorHeap> descriptorHeaps_[FRAME_COUNT];
+    ComPtr<ID3D12DescriptorHeap> rawRtvHeap_;
+    ComPtr<ID3D12DescriptorHeap> temporalRtvHeap_;
     ComPtr<ID3D12Resource> constantBuffer_, rawAO_;
+    ComPtr<ID3D12Resource> bentAO_, aoHistory_[2];
     BYTE* mappedConstants_ = nullptr;
     UINT descriptorSize_ = 0;
     UINT targetWidth_ = 0;
     UINT targetHeight_ = 0;
+    UINT historyReadIndex_ = 0;
+    bool historyValid_ = false;
+    bool temporalEnabledLastFrame_ = false;
+    UINT lastTemporalFrame_ = UINT_MAX;
 };
 
 #endif

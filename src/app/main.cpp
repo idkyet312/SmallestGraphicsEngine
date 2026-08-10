@@ -2548,6 +2548,91 @@ static bool GrabPathClear(const XMFLOAT3& target) {
     return true;
 }
 
+static Projectile* HeldGrenade() {
+    for (Projectile& projectile : scene.projectiles) {
+        if (projectile.active && projectile.grenade && projectile.held)
+            return &projectile;
+    }
+    return nullptr;
+}
+
+static XMFLOAT3 GrenadeHoldPosition() {
+    const XMFLOAT3& eye = scene.camera.Position;
+    const XMFLOAT3& front = scene.camera.Front;
+    return { eye.x + front.x * 1.35f,
+             eye.y + front.y * 1.35f - 0.28f,
+             eye.z + front.z * 1.35f };
+}
+
+static void ReleaseGrenadePhysicsBody(Projectile& grenade) {
+    if (grenade.grenadePhysicsHandle != 0 && g_destruction.IsInitialized())
+        g_destruction.DestroyGrenadeBody(grenade.grenadePhysicsHandle);
+    grenade.grenadePhysicsHandle = 0;
+}
+
+static void UpdateHeldGrenade() {
+    Projectile* grenade = HeldGrenade();
+    if (!grenade) return;
+    ReleaseGrenadePhysicsBody(*grenade);
+    grenade->position = GrenadeHoldPosition();
+    grenade->previousPosition = grenade->position;
+    grenade->velocity = { 0.0f, 0.0f, 0.0f };
+}
+
+static void ThrowHeldGrenade() {
+    Projectile* grenade = HeldGrenade();
+    if (!grenade) return;
+
+    XMVECTOR direction = XMVector3Normalize(
+        XMLoadFloat3(&scene.camera.Front) +
+        XMVectorSet(0.0f, 0.12f, 0.0f, 0.0f));
+    XMFLOAT3 directionF;
+    XMStoreFloat3(&directionF, direction);
+    grenade->position = GrenadeHoldPosition();
+    grenade->previousPosition = grenade->position;
+    grenade->direction = directionF;
+    XMStoreFloat3(&grenade->velocity,
+        direction * 19.0f + XMVectorSet(0.0f, 1.4f, 0.0f, 0.0f));
+    grenade->held = false;
+    // The returned grenade must not immediately collide with the player who
+    // caught it. Blast damage remains indiscriminate once its original fuse ends.
+    grenade->hostile = false;
+    grenade->grenadeCollisionGrace = 0.18f;
+}
+
+static bool GrabEnemyGrenade() {
+    const XMVECTOR eye = XMLoadFloat3(&scene.camera.Position);
+    const XMVECTOR front = XMVector3Normalize(XMLoadFloat3(&scene.camera.Front));
+    Projectile* best = nullptr;
+    float bestScore = FLT_MAX;
+    for (Projectile& grenade : scene.projectiles) {
+        if (!grenade.active || !grenade.grenade || !grenade.hostile ||
+            grenade.held || grenade.detonate)
+            continue;
+        const XMVECTOR toTarget = XMLoadFloat3(&grenade.position) - eye;
+        const float forward = XMVectorGetX(XMVector3Dot(toTarget, front));
+        if (forward < 0.15f || forward > 4.0f) continue;
+        const float distanceSq = XMVectorGetX(XMVector3LengthSq(toTarget));
+        const float sideSq = (std::max)(0.0f, distanceSq - forward * forward);
+        if (sideSq > 0.90f * 0.90f || !GrabPathClear(grenade.position)) continue;
+        const float score = sideSq * 5.0f + forward * 0.05f;
+        if (score < bestScore) {
+            bestScore = score;
+            best = &grenade;
+        }
+    }
+    if (!best) return false;
+
+    g_heldBandit = nullptr;
+    g_heldBarrelIndex = SIZE_MAX;
+    ReleaseGrenadePhysicsBody(*best);
+    best->held = true;
+    best->velocity = { 0.0f, 0.0f, 0.0f };
+    best->position = GrenadeHoldPosition();
+    best->previousPosition = best->position;
+    return true;
+}
+
 static void GrabOrThrowBandit() {
     using namespace DirectX;
     if (g_heldBandit && g_heldBandit->Held()) {
@@ -2630,6 +2715,10 @@ static void ThrowHeldBarrel() {
 }
 
 static void GrabOrThrowObject() {
+    if (HeldGrenade()) {
+        ThrowHeldGrenade();
+        return;
+    }
     if (HeldBarrel()) {
         ThrowHeldBarrel();
         return;
@@ -2638,6 +2727,10 @@ static void GrabOrThrowObject() {
         GrabOrThrowBandit();
         return;
     }
+
+    // Live hostile grenades get first refusal: catching one is timing-sensitive,
+    // while barrels and actors remain available after it passes.
+    if (GrabEnemyGrenade()) return;
 
     const XMVECTOR eye = XMLoadFloat3(&scene.camera.Position);
     const XMVECTOR front = XMVector3Normalize(XMLoadFloat3(&scene.camera.Front));
@@ -3153,16 +3246,9 @@ void MatchFoliageMaterialToGrass() {
     const XMFLOAT3 grassAlbedo = g_grass.Albedo();
     const XMFLOAT4 matchedAlbedo(
         grassAlbedo.x, grassAlbedo.y, grassAlbedo.z, 1.0f);
-    const auto matchMaterial = [&](const std::shared_ptr<SceneMaterial>& material,
-                                   bool preserveAuthoredLeafColor) {
+    const auto matchMaterial = [&](const std::shared_ptr<SceneMaterial>& material) {
         if (!material) return;
-        // Palm textures already contain shadowed leaflet colour. Multiplying
-        // them by the near-black procedural-grass albedo turns the cards into
-        // silhouettes and undoes PalmModel's foliage grade. Dandelions remain
-        // grass-matched; palms keep a bright chlorophyll tint for transmission.
-        material->baseColorFactor = preserveAuthoredLeafColor
-            ? XMFLOAT4(0.68f, 0.82f, 0.62f, 1.0f)
-            : matchedAlbedo;
+        material->baseColorFactor = matchedAlbedo;
         material->roughnessFactor = g_grass.Roughness();
         material->ambientScale = g_grass.AmbientScale();
         // Alpha foliage has no ORM or normal map, so these packed material
@@ -3173,7 +3259,7 @@ void MatchFoliageMaterialToGrass() {
     };
     for (const auto& material : PalmModel::Materials()) {
         if (material && material->name == "palm_leaf")
-            matchMaterial(material, true);
+            matchMaterial(material);
     }
     if (!g_dandelionModel) return;
     const auto updateMaterial = [&](const auto& self,
@@ -3181,7 +3267,7 @@ void MatchFoliageMaterialToGrass() {
         if (!node) return;
         if (node->mesh) {
             for (MeshPrimitive& primitive : node->mesh->primitives) {
-                matchMaterial(primitive.material, false);
+                matchMaterial(primitive.material);
             }
         }
         for (const auto& child : node->children)
@@ -5535,6 +5621,10 @@ static void SyncGrenadePhysicsBodies(bool advancePreviousPosition) {
     if (!scene.useDestruction || !g_destruction.IsInitialized()) return;
     for (Projectile& grenade : scene.projectiles) {
         if (!grenade.grenade) continue;
+        if (grenade.held) {
+            ReleaseGrenadePhysicsBody(grenade);
+            continue;
+        }
         if (grenade.grenadePhysicsHandle == 0 && grenade.active) {
             grenade.grenadePhysicsHandle = g_destruction.CreateGrenadeBody(
                 grenade.position, grenade.velocity, grenade.molotov,
@@ -9638,6 +9728,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         GetEnvironmentVariableA("SGE_VISIBILITY_BENCHMARK", nullptr, 0) > 0;
     const bool visibilityForwardOnly =
         GetEnvironmentVariableA("SGE_VISIBILITY_FORWARD_ONLY", nullptr, 0) > 0;
+    const bool temporalGTAOSmokeTest =
+        GetEnvironmentVariableA("SGE_TEMPORAL_GTAO_TEST", nullptr, 0) > 0;
     UINT visibilityBenchmarkVBFrames = 0;
     UINT visibilityBenchmarkForwardSamples = 0;
     UINT visibilityBenchmarkVBSamples = 0;
@@ -9674,6 +9766,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 atoi(visibilityDebugMode)));
         }
         scene.useVisibilityBuffer = false;
+        if (temporalGTAOSmokeTest) {
+            scene.enableAmbientOcclusion = true;
+            scene.temporalBentNormalGTAO = true;
+            char bentDebugMode[8] = {};
+            if (GetEnvironmentVariableA(
+                    "SGE_BENT_GTAO_DEBUG", bentDebugMode,
+                    static_cast<DWORD>(sizeof(bentDebugMode))) > 0) {
+                const UINT mode = static_cast<UINT>((std::max)(0,
+                    (std::min)(3, atoi(bentDebugMode))));
+                visBuffer.bentNormalGTAODebugMode =
+                    static_cast<VisibilityBufferDX12::
+                        BentNormalGTAODebugMode>(mode);
+            }
+        }
         visibilityTestPending = true;
         const bool emptyVisibilityTest =
             GetEnvironmentVariableA("SGE_VISIBILITY_TEST_FULL", nullptr, 0) == 0;
@@ -9901,6 +10007,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     0.35f, scene.camera.PlayerHeight);
         }
 
+        // Held grenades follow the final collision-resolved camera pose. Scene
+        // still advances their fuse below, so waiting too long remains lethal.
+        UpdateHeldGrenade();
         scene.Update(deltaTime, now);
         scene.burningTargets.clear();
         if (molotovSmokeTest && !molotovSmokeInjected && IsSceneScreen() &&
@@ -10576,7 +10685,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     (scene.impactParticles.size() - 800));
             UpdateHarpoonAttachments();
             for (auto& projectile : scene.projectiles) {
-                if (projectile.grenade && projectile.active) {
+                if (projectile.grenade && projectile.active && !projectile.held) {
                     if ((projectile.molotov || projectile.vortex) &&
                         std::find(grenadeContactEvents.begin(),
                                   grenadeContactEvents.end(),
@@ -11472,6 +11581,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_bindlessMaterialsActive = bindlessMaterialsActive;
         mainShader.SetBindlessActive(bindlessMaterialsActive);
         visBuffer.SetBindlessActive(bindlessMaterialsActive && usingVisibility);
+        visBuffer.aoTemporalMotionVectors = usingVisibility &&
+            scene.enableAmbientOcclusion && scene.temporalBentNormalGTAO;
+        const bool bentNormalGTAORequested = usingVisibility &&
+            scene.enableAmbientOcclusion && scene.temporalBentNormalGTAO;
+        const bool bentNormalHistoryValid = bentNormalGTAORequested &&
+            screenSpaceAO.HasTemporalBentNormalHistory(
+                visBuffer.postFrameIndex);
+        visBuffer.SetBentNormalGTAOHistory(
+            bentNormalHistoryValid
+                ? screenSpaceAO.GetTemporalBentNormalHistory() : nullptr,
+            bentNormalGTAORequested, bentNormalHistoryValid);
         static bool visibilityWasActive = false;
         if (usingVisibility != visibilityWasActive) {
             visBuffer.InvalidateTemporalHistory();
@@ -11518,6 +11638,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         const bool visibilityDebugActive =
             usingVisibility && visBuffer.debugViewMode != 0;
+        const bool bentGTAODiagnosticActive = usingVisibility &&
+            scene.enableAmbientOcclusion && scene.temporalBentNormalGTAO &&
+            visBuffer.BentNormalGTAODiagnosticActive();
         // Validation is a cross-renderer comparison mode. Keep both sides on
         // the same baseline while M toggles ownership: no MSAA, fog, or FXAA.
         const bool visibilityParityValidation =
@@ -11529,6 +11652,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             !usingRaytracing && !usingVisibility && !visibilityParityValidation;
         const bool grassMSAAActive =
             usingVisibility && !visibilityDebugActive &&
+            !bentGTAODiagnosticActive &&
             scene.enableGrassMSAA && grassMSAA.initialized &&
             mainShader.GetHDRMSAAGrassPipelineState() != nullptr;
         mainShader.SetMSAAEnabled(msaaActive);
@@ -12100,7 +12224,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // draws that own motion PSOs.
             mainShader.SetExtensionMotionEnabled(false);
             g_meshShader.SetExtensionMotionEnabled(false);
-            if (!visibilityDebugActive) {
+            if (!visibilityDebugActive && !bentGTAODiagnosticActive) {
                 ProfilerDX12::Scope extensions(
                     g_profiler, "Forward Extensions", g_dx12.commandList.Get());
                 RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
@@ -12153,7 +12277,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         const XMMATRIX extensionProj = visBuffer.extensionMotionVectors
             ? scene.GetProjectionMatrix()
             : scene.GetUnjitteredProjectionMatrix();
-        if (renderedScene && !g_emptyLevelMode && g_banditLoaded) {
+        if (renderedScene && !bentGTAODiagnosticActive &&
+            !g_emptyLevelMode && g_banditLoaded) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Bandits", g_dx12.commandList.Get());
             // Bandits and their guns are the draws that own motion PSOs, so
@@ -12181,13 +12306,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_meshShader.SetExtensionMotionEnabled(false);
             mainShader.Use(scene.wireframeMode);
         }
-        if (renderedScene) {
+        if (renderedScene && !bentGTAODiagnosticActive) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Impact Particles", g_dx12.commandList.Get());
             RenderImpactBillboards(scene, mainShader, geo, fogLightSpace);
         }
 
-        if (renderedScene && grassMSAAActive) {
+        if (renderedScene && !bentGTAODiagnosticActive && grassMSAAActive) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Grass 4x MSAA", g_dx12.commandList.Get());
             grassMSAA.Begin(g_dx12.commandList.Get());
@@ -12234,11 +12359,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 scene.grassInScreenSpaceAO && grassMSAAActive
                     ? grassMSAA.GetCoverageResource() : nullptr,
                 usingVisibility,
-                usingVisibility && visBuffer.temporalEffectsEnabled
-                    ? visBuffer.postFrameIndex : 0u);
+                usingVisibility && scene.temporalBentNormalGTAO
+                    ? visBuffer.postFrameIndex : 0u,
+                usingVisibility ? visBuffer.GetMotionResource() : nullptr,
+                usingVisibility && visBuffer.extensionMotionVectors
+                    ? D3D12_RESOURCE_STATE_RENDER_TARGET
+                    : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                usingVisibility && scene.temporalBentNormalGTAO,
+                usingVisibility &&
+                    visBuffer.BentNormalGTAOAppliedLastResolve());
         }
 
-        if (renderedScene && commonHDRValidationTarget &&
+        if (renderedScene && !bentGTAODiagnosticActive &&
+            commonHDRValidationTarget &&
             scene.enableScreenSpaceReflections &&
             screenSpaceReflections.initialized) {
             ProfilerDX12::Scope profile(
@@ -12251,7 +12384,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                 : nullptr);
         }
 
-        if (renderedScene && !usingRaytracing &&
+        if (renderedScene && !bentGTAODiagnosticActive && !usingRaytracing &&
             !g_emptyLevelMode && waterRenderer.initialized) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Tropical Water",
@@ -12296,7 +12429,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             scene.lightShaftMode == Scene::LightShaftMode::Volumetric;
         const bool fauxShafts =
             scene.lightShaftMode == Scene::LightShaftMode::Faux;
-        if (renderedScene && scene.enableVolumetricFog &&
+        if (renderedScene && !bentGTAODiagnosticActive &&
+            scene.enableVolumetricFog &&
             volumetricFog.initialized && volumetricShafts) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Volumetric Fog", g_dx12.commandList.Get());
@@ -12319,7 +12453,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // Faux shafts need the HDR target: they read the scene colour they are
         // about to add onto, so the visibility buffer's output is both source
         // and destination. Only run on the HDR path where that texture exists.
-        if (renderedScene && fauxShafts && lightShafts.initialized &&
+        if (renderedScene && !bentGTAODiagnosticActive && fauxShafts &&
+            lightShafts.initialized &&
             commonHDRValidationTarget) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Light Shafts", g_dx12.commandList.Get());
@@ -12337,7 +12472,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Common HDR Post", g_dx12.commandList.Get());
             visBuffer.EndForwardExtensions(g_dx12.commandList.Get());
-            if (usingVisibility && !visBuffer.validationMode)
+            if (usingVisibility && !visBuffer.validationMode &&
+                !bentGTAODiagnosticActive)
                 visBuffer.UpdateExposure(g_dx12.commandList.Get());
             // TAA reprojection remains valid during ordinary camera movement;
             // HZB history is intentionally stricter and must not gate it.
@@ -12359,7 +12495,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             occlusionDepth.PrepareCapture(g_dx12.commandList.Get());
         }
 
-        if (scene.enableFXAA && fxaa.initialized && !visibilityValidation) {
+        if (scene.enableFXAA && fxaa.initialized && !visibilityValidation &&
+            !bentGTAODiagnosticActive) {
             ProfilerDX12::Scope profile(g_profiler, "FXAA", g_dx12.commandList.Get());
             fxaa.Apply(g_dx12.commandList.Get());
         }
@@ -12391,7 +12528,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             ? shadowMap.depthShader.instancesThisFrame : 0;
         g_visibilityDrawCalls = usingVisibility ? visBuffer.currentDrawCall : 0;
         if (visibilitySmokeEnabled && usingVisibility &&
-            !visibilitySmokeReported) {
+            !visibilitySmokeReported &&
+            (!temporalGTAOSmokeTest ||
+             visBuffer.BentNormalGTAOAppliedLastResolve())) {
             std::ofstream("visibility_smoke.log", std::ios::app)
                 << "active draws=" << visBuffer.currentDrawCall
                 << " materials=" << visBuffer.materialCount
@@ -12400,6 +12539,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 << " indices=" << visBuffer.persistentIndexCount
                 << " debug=" << visBuffer.debugViewMode
                 << " validation=" << (visBuffer.validationMode ? 1 : 0)
+                << " bent_gtao="
+                << (visBuffer.BentNormalGTAOAppliedLastResolve() ? 1 : 0)
+                << " bent_debug="
+                << static_cast<UINT>(visBuffer.bentNormalGTAODebugMode)
                 << '\n';
             visibilitySmokeReported = true;
         }

@@ -45,6 +45,9 @@ struct Projectile {
     // Grenade: arcs under gravity and detonates (radial blast) on fuse timeout
     // or first impact. Regular bullets leave these at defaults.
     bool     grenade = false;
+    // F-grabbed grenades keep burning their fuse while main owns their pose.
+    // Physics and collision resume when the player throws them back.
+    bool     held = false;
     bool     molotov = false;
     bool     vortex = false;
     bool     rocket = false;
@@ -393,6 +396,9 @@ struct Scene {
     // Keep the legacy path behind the toggle for A/B diagnosis, but use the
     // distance-stable linear test by default.
     bool  contactShadowLinearDepth = true;
+    // Accumulate directional GTAO through motion/depth/normal history. Off by
+    // default so the established single-frame path remains the baseline.
+    bool  temporalBentNormalGTAO = false;
     // The independently resolved 4x grass depth can drive GTAO/contact so grass
     // receives and casts the screen-space effect. Off by default for visual A/B.
     bool  grassInScreenSpaceAO = false;
@@ -705,7 +711,7 @@ struct Scene {
                 // Box3D owns gravity, contact response, friction, spin, and
                 // sleeping once the runtime creates the thrown rigid body.
                 // Keep the original ground fallback for levels without physics.
-                if (p.grenadePhysicsHandle == 0) {
+                if (!p.held && p.grenadePhysicsHandle == 0) {
                     p.velocity.y += -9.81f * grenadeGravityScale * dt;
                     p.position.x += p.velocity.x * dt;
                     p.position.y += p.velocity.y * dt;
@@ -745,6 +751,7 @@ struct Scene {
                 }
                 p.fuse -= dt;
                 if (p.fuse <= 0.0f && !p.detonate) {
+                    p.held = false;
                     p.detonate = true;
                     p.active = false;
                 }

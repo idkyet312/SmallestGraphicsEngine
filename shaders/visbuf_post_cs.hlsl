@@ -6,12 +6,34 @@ Texture3D<float4> colorLUT : register(t4);
 Texture2D<float> sceneDepth : register(t5);
 Texture2D<float> visibilityDepth : register(t6);
 Texture2D<float4> bloomInput : register(t7);
-// Surface identity, this frame and last. R32G32_UINT: .x is drawCallID+1 (0 =
-// background), .y is SV_PrimitiveID. Together they name an exact triangle.
+// The visibility buffer stays local to the current draw so resolve can address
+// geometry directly. Post translates it to the authored identity consumed by
+// temporal effects: namespace in .x, stable triangle ID in .y, with zero kept
+// for background.
 Texture2D<uint2> surfaceIDs : register(t8);
-Texture2D<uint2> surfaceIDHistory : register(t9);
+Texture2D<uint2> stableSurfaceHistory : register(t9);
+
+struct DrawCallData {
+    float4x4 modelMatrix;
+    float4x4 previousModelMatrix;
+    float3   objectColor;
+    float    useTexture;
+    float    metalness;
+    float    roughness;
+    float    useNormalMap;
+    uint     materialID;
+    uint     vertexOffset;
+    uint     indexOffset;
+    uint     indexCount;
+    uint     hasIndices;
+    uint     flags;
+    float4   palmWindRoot;
+};
+StructuredBuffer<DrawCallData> drawCalls : register(t10);
+StructuredBuffer<uint> stableTriangleIDs : register(t11);
 RWTexture2D<float4> ldrOutput : register(u0);
 RWTexture2D<float4> historyOutput : register(u1);
+RWTexture2D<uint2> stableSurfaceOutput : register(u2);
 SamplerState lutSampler : register(s0);
 
 #include "color_grade.hlsli"
@@ -37,6 +59,9 @@ cbuffer PostConstants : register(b0) {
     uint surfaceHistoryValid;
     // Debug: visualise why history was accepted or rejected.
     uint historyDebugView;
+    // Generate the current authored identity even when colour history is not
+    // valid yet, so this frame can seed the next one.
+    uint surfaceIdentityEnabled;
 };
 
 float Luminance(float3 color) { return dot(color, float3(0.2126, 0.7152, 0.0722)); }
@@ -135,7 +160,16 @@ float3 CinematicInput(uint2 pixel) {
     return color;
 }
 
-float3 TemporalResolve(uint2 pixel, float3 currentColor) {
+uint2 StableSurfaceID(uint2 pixel) {
+    uint2 rawID = surfaceIDs.Load(int3(pixel, 0));
+    if (rawID.x == 0u) return uint2(0u, 0u);
+
+    DrawCallData dc = drawCalls[rawID.x - 1u];
+    return uint2(asuint(dc.useNormalMap),
+                 stableTriangleIDs[asuint(dc.useTexture) + rawID.y]);
+}
+
+float3 TemporalResolve(uint2 pixel, float3 currentColor, uint2 currentID) {
     if (historyValid == 0) return currentColor;
     float2 uv = (float2(pixel) + 0.5) / float2(outputSize);
     float2 motion = motionInput.Load(int3(pixel, 0));
@@ -181,19 +215,18 @@ float3 TemporalResolve(uint2 pixel, float3 currentColor) {
     // available it replaces the heuristic entirely.
     float extensionConfidence;
     if (surfaceHistoryValid != 0) {
-        uint2 currentID = surfaceIDs.Load(int3(pixel, 0));
         int2 previousPixel = int2(previousUV * float2(outputSize));
-        uint2 previousID = surfaceIDHistory.Load(int3(previousPixel, 0));
+        uint2 previousID = stableSurfaceHistory.Load(int3(previousPixel, 0));
         // Background (id 0) has no surface to match, so fall back to accepting
         // it -- sky history is reprojected separately and is safe to keep.
         bool background = currentID.x == 0u;
 
-        // Instance match is the load-bearing test. Primitive equality is NOT
+        // Namespace match is the load-bearing test. Triangle equality is NOT
         // required: a flat wall is many triangles, and a sub-pixel camera shift
         // slides a pixel across a shared edge every frame. Demanding an exact
         // triangle match rejected history on every large flat surface, which
         // showed up as a shimmer that looked like TAA "moving too much".
-        bool sameInstance = currentID.x == previousID.x;
+        bool sameNamespace = currentID.x == previousID.x;
 
         // Within an instance, accept a neighbouring triangle too. Scanning the
         // 4-neighbourhood for the exact primitive distinguishes "the pixel
@@ -201,14 +234,14 @@ float3 TemporalResolve(uint2 pixel, float3 currentColor) {
         // part of the mesh folded over itself" (reject) without needing stored
         // barycentrics.
         bool samePrimitive = currentID.y == previousID.y;
-        if (sameInstance && !samePrimitive) {
+        if (sameNamespace && !samePrimitive) {
             [unroll]
             for (int i = 0; i < 4; ++i) {
                 const int2 offsets[4] = {
                     int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
                 int2 tap = clamp(previousPixel + offsets[i], int2(0, 0),
                                  int2(outputSize) - 1);
-                uint2 neighbour = surfaceIDHistory.Load(int3(tap, 0));
+                uint2 neighbour = stableSurfaceHistory.Load(int3(tap, 0));
                 if (neighbour.x == currentID.x && neighbour.y == currentID.y) {
                     samePrimitive = true;
                     break;
@@ -216,7 +249,7 @@ float3 TemporalResolve(uint2 pixel, float3 currentColor) {
             }
         }
         extensionConfidence =
-            (background || (sameInstance && samePrimitive)) ? 1.0 : 0.0;
+            (background || (sameNamespace && samePrimitive)) ? 1.0 : 0.0;
     } else {
         // Trees, rotor blades, skinned actors, and other forward extensions do
         // not yet emit per-object motion. Reject their stale underlying VB
@@ -234,13 +267,18 @@ float3 TemporalResolve(uint2 pixel, float3 currentColor) {
 void main(uint3 threadID : SV_DispatchThreadID) {
     uint2 pixel = threadID.xy;
     if (any(pixel >= outputSize)) return;
+    uint2 currentID = uint2(0u, 0u);
+    if (surfaceIdentityEnabled != 0u) {
+        currentID = StableSurfaceID(pixel);
+        stableSurfaceOutput[pixel] = currentID;
+    }
     if (debugViewMode != 0u) {
         float4 debugColor = hdrInput.Load(int3(pixel, 0));
         historyOutput[pixel] = debugColor;
         ldrOutput[pixel] = debugColor;
         return;
     }
-    float3 hdr = TemporalResolve(pixel, CinematicInput(pixel));
+    float3 hdr = TemporalResolve(pixel, CinematicInput(pixel), currentID);
     historyOutput[pixel] = float4(hdr, 1.0);
 
     // History-validity debug view. Temporal quality is a motion property, so
@@ -262,7 +300,6 @@ void main(uint3 threadID : SV_DispatchThreadID) {
         float2 motionDebug = motionInput.Load(int3(pixel, 0));
         float2 previousUVDebug = uvDebug - motionDebug;
         float3 marker;
-        uint2 currentID = surfaceIDs.Load(int3(pixel, 0));
         if (currentID.x == 0u) {
             marker = float3(0.25, 0.25, 0.25);
         } else if (surfaceHistoryValid == 0u) {
@@ -275,17 +312,17 @@ void main(uint3 threadID : SV_DispatchThreadID) {
             // neighbour scan -- a debug view that reports a stricter test than
             // the shader actually applies is worse than none.
             int2 previousPixel = int2(previousUVDebug * float2(outputSize));
-            uint2 previousID = surfaceIDHistory.Load(int3(previousPixel, 0));
-            bool sameInstance = currentID.x == previousID.x;
+            uint2 previousID = stableSurfaceHistory.Load(int3(previousPixel, 0));
+            bool sameNamespace = currentID.x == previousID.x;
             bool samePrimitive = currentID.y == previousID.y;
-            if (sameInstance && !samePrimitive) {
+            if (sameNamespace && !samePrimitive) {
                 [unroll]
                 for (int i = 0; i < 4; ++i) {
                     const int2 offsets[4] = {
                         int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
                     int2 tap = clamp(previousPixel + offsets[i], int2(0, 0),
                                      int2(outputSize) - 1);
-                    uint2 neighbour = surfaceIDHistory.Load(int3(tap, 0));
+                    uint2 neighbour = stableSurfaceHistory.Load(int3(tap, 0));
                     if (neighbour.x == currentID.x &&
                         neighbour.y == currentID.y) {
                         samePrimitive = true;
@@ -293,7 +330,7 @@ void main(uint3 threadID : SV_DispatchThreadID) {
                     }
                 }
             }
-            marker = (sameInstance && samePrimitive)
+            marker = (sameNamespace && samePrimitive)
                 ? float3(0.1, 0.9, 0.2) : float3(1.0, 0.1, 0.1);
         }
         ldrOutput[pixel] = float4(marker, 1.0);

@@ -7,7 +7,7 @@ cbuffer AOConstants : register(b0)
     float4 aoParams;      // radius, strength, bias, far
     float4 screenParams;  // width, height, inv width, inv height
     float4 filterParams;  // static depth, surface buffer
-    float4 contactParams; // grass coverage, direct-lit contact, noise frame
+    float4 contactParams; // grass, direct contact, noise frame, ambient in resolve
 };
 
 Texture2D<float> sceneDepth : register(t0);
@@ -16,6 +16,9 @@ Texture2D<float> staticCasterDepth : register(t2);
 Texture2D<float4> surfaceData : register(t3);
 Texture2D<float> rawAO : register(t4);
 Texture2D<float> grassCoverage : register(t5);
+Texture2D<float4> aoHistory : register(t6);
+Texture2D<float2> motionVectors : register(t7);
+Texture2D<float4> bentAO : register(t8);
 SamplerState pointClamp : register(s0);
 SamplerState linearClamp : register(s1);
 
@@ -117,6 +120,110 @@ float InterleavedNoise(float2 pixel)
         frac(dot(pixel, float2(0.06711056, 0.00583715))));
 }
 
+float2 EncodeBentNormal(float3 normal)
+{
+    normal /= abs(normal.x) + abs(normal.y) + abs(normal.z) + 1e-6;
+    float2 encoded = normal.xy;
+    if (normal.z < 0.0)
+        encoded = (1.0 - abs(encoded.yx)) *
+            float2(encoded.x >= 0.0 ? 1.0 : -1.0,
+                   encoded.y >= 0.0 ? 1.0 : -1.0);
+    return encoded * 0.5 + 0.5;
+}
+
+float3 DecodeBentNormal(float2 encoded)
+{
+    float2 f = encoded * 2.0 - 1.0;
+    float3 normal = float3(f, 1.0 - abs(f.x) - abs(f.y));
+    if (normal.z < 0.0) {
+        float2 folded = (1.0 - abs(normal.yx)) *
+            float2(normal.x >= 0.0 ? 1.0 : -1.0,
+                   normal.y >= 0.0 ? 1.0 : -1.0);
+        normal.xy = folded;
+    }
+    return normalize(normal);
+}
+
+// xy = octahedral bent normal, z = visibility, w = linear depth.
+float4 HorizonSignal(float2 uv, float deviceDepth, bool multisampled)
+{
+    if (deviceDepth >= 0.99999)
+        return float4(0.5, 0.5, 1.0, aoParams.w);
+    float3 center = ReconstructWorld(uv, deviceDepth);
+    float3 normal = ReconstructNormal(uv, deviceDepth, multisampled);
+    float centerDepth = LinearDepth(deviceDepth);
+    float radius = aoParams.x;
+    float pixelRadius = clamp(radius * screenParams.y /
+        max(centerDepth * 1.15, 0.1), 3.0, 56.0);
+    float rotation = InterleavedNoise(
+        uv * screenParams.xy + contactParams.z * float2(23.0, 59.0)) *
+        6.2831853;
+    float2x2 rotate = float2x2(cos(rotation), -sin(rotation),
+                               sin(rotation), cos(rotation));
+    float occlusion = 0.0;
+    float3 openTangentSum = 0.0;
+    float openWeightSum = 0.0;
+
+    [unroll]
+    for (uint slice = 0; slice < 8; ++slice) {
+        float angle = (slice + 0.5) * (6.2831853 / 8.0);
+        float2 direction = mul(float2(cos(angle), sin(angle)), rotate);
+        float horizon = 0.0;
+        [unroll]
+        for (uint step = 1; step <= 4; ++step) {
+            float stepScale = (step - 0.35 + InterleavedNoise(
+                uv * screenParams.xy + step * 17.0 +
+                contactParams.z * float2(11.0, 31.0))) / 4.0;
+            float2 sampleUV =
+                uv + direction * pixelRadius * stepScale * screenParams.zw;
+            if (any(sampleUV <= 0.0) || any(sampleUV >= 1.0)) continue;
+            float sampleDepth = SampleDepth(sampleUV, multisampled);
+            if (sampleDepth >= 0.99999) continue;
+            float3 delta = ReconstructWorld(sampleUV, sampleDepth) - center;
+            float distanceToSample = length(delta);
+            if (distanceToSample < 1e-4 || distanceToSample > radius * 2.0)
+                continue;
+            float cosine = dot(normal, delta / distanceToSample);
+            float distanceFalloff =
+                saturate(1.0 - distanceToSample / max(radius, 1e-3));
+            horizon = max(horizon,
+                saturate(cosine - aoParams.z) * distanceFalloff);
+        }
+        occlusion += horizon;
+
+        // Project the screen-space slice into the receiver tangent plane.
+        // Accumulating full hemisphere vectors made their large normal terms
+        // dominate the directional imbalance: one blocked slice bent the
+        // result by only a few degrees and was visually indistinguishable from
+        // scalar AO. Accumulate only the open tangent imbalance here, then add
+        // the receiver normal once below.
+        float2 tangentUV = uv + direction * screenParams.zw * 2.0;
+        float3 tangentDelta =
+            ReconstructWorld(tangentUV, deviceDepth) - center;
+        tangentDelta -= normal * dot(tangentDelta, normal);
+        float tangentLength = length(tangentDelta);
+        if (tangentLength > 1e-5) {
+            float openWeight = saturate(1.0 - horizon);
+            openTangentSum += tangentDelta / tangentLength * openWeight;
+            openWeightSum += openWeight;
+        }
+    }
+    occlusion *= aoParams.y / 8.0;
+    float visibility = saturate(1.0 - occlusion);
+    float directionalImbalance =
+        length(openTangentSum) / max(openWeightSum, 1.0);
+    float3 bentOffset = directionalImbalance > 1e-5
+        ? normalize(openTangentSum) *
+          min(directionalImbalance * 3.0, 1.0)
+        : 0.0;
+    float3 bentNormal = normalize(normal + bentOffset);
+    return float4(
+        EncodeBentNormal(bentNormal), visibility, centerDepth);
+}
+
+// Baseline scalar GTAO retained for the toggle-off path. Keep its arithmetic
+// independent of bent-normal accumulation so opting out preserves the existing
+// image and resource footprint.
 float HorizonVisibility(float2 uv, float deviceDepth, bool multisampled)
 {
     if (deviceDepth >= 0.99999) return 1.0;
@@ -345,6 +452,45 @@ float BilateralAO(float2 uv, float centerDepth, float3 centerNormal,
     return sum / max(weightSum, 1e-4);
 }
 
+float4 BilateralSignal(float2 uv, float centerDepth, float3 centerNormal,
+                       bool multisampled)
+{
+    float visibilitySum = 0.0;
+    float3 bentSum = 0.0;
+    float weightSum = 0.0;
+    [unroll]
+    for (int y = -2; y <= 2; ++y) {
+        [unroll]
+        for (int x = -2; x <= 2; ++x) {
+            float2 offset = float2(x, y);
+            float2 sampleUV = uv + offset * screenParams.zw;
+            float sampleDeviceDepth = SampleDepth(sampleUV, multisampled);
+            float sampleLinearDepth = LinearDepth(sampleDeviceDepth);
+            float3 sampleNormal =
+                ReconstructNormal(sampleUV, sampleDeviceDepth, multisampled);
+            float spatial = exp(-dot(offset, offset) * 0.32);
+            float depthWeight = exp(-abs(sampleLinearDepth - centerDepth) *
+                                    18.0 / max(centerDepth, 0.25));
+            float normalWeight =
+                pow(saturate(dot(centerNormal, sampleNormal)), 8.0);
+            float4 sampleSignal =
+                bentAO.SampleLevel(linearClamp, sampleUV, 0.0);
+            float3 sampleBent = DecodeBentNormal(sampleSignal.xy);
+            float bentWeight = pow(
+                saturate(dot(centerNormal, sampleBent)), 2.0);
+            float weight = spatial * depthWeight * normalWeight * bentWeight;
+            visibilitySum += sampleSignal.z * weight;
+            bentSum += sampleBent * weight;
+            weightSum += weight;
+        }
+    }
+    float inverseWeight = rcp(max(weightSum, 1e-4));
+    float3 bentNormal = weightSum > 1e-4
+        ? normalize(bentSum * inverseWeight) : centerNormal;
+    return float4(EncodeBentNormal(bentNormal),
+                  visibilitySum * inverseWeight, centerDepth);
+}
+
 float4 PSGTAO(VSOutput input) : SV_TARGET
 {
     float depth = SampleDepth(input.uv, false);
@@ -355,6 +501,126 @@ float4 PSGTAOMSAA(VSOutput input) : SV_TARGET
 {
     float depth = SampleDepth(input.uv, true);
     return HorizonVisibility(input.uv, depth, true).xxxx;
+}
+
+float4 PSBentGTAO(VSOutput input) : SV_TARGET
+{
+    float depth = SampleDepth(input.uv, false);
+    return HorizonSignal(input.uv, depth, false);
+}
+
+float4 PSBentGTAOMSAA(VSOutput input) : SV_TARGET
+{
+    float depth = SampleDepth(input.uv, true);
+    return HorizonSignal(input.uv, depth, true);
+}
+
+float4 TemporalSignal(float2 uv, float4 currentSignal)
+{
+    float temporalSetting = filterParams.w;
+    bool temporalEnabled = abs(temporalSetting) > 0.001;
+    bool historyValid = temporalSetting > 0.0;
+    if (!temporalEnabled || !historyValid || currentSignal.w >= aoParams.w)
+        return currentSignal;
+
+    int2 pixel = clamp(int2(uv * screenParams.xy), int2(0, 0),
+                       int2(screenParams.xy) - 1);
+    float2 motion = motionVectors.Load(int3(pixel, 0));
+    float2 previousUV = uv - motion;
+    if (any(previousUV <= 0.0) || any(previousUV >= 1.0))
+        return currentSignal;
+
+    float4 previousSignal =
+        aoHistory.SampleLevel(linearClamp, previousUV, 0.0);
+    float depthTolerance = max(0.035, currentSignal.w * 0.012);
+    float depthConfidence = saturate(
+        1.0 - abs(previousSignal.w - currentSignal.w) / depthTolerance);
+    float3 currentBent = DecodeBentNormal(currentSignal.xy);
+    float3 previousBent = DecodeBentNormal(previousSignal.xy);
+    float normalConfidence = smoothstep(
+        0.72, 0.96, dot(currentBent, previousBent));
+    float motionPixels = length(motion * screenParams.xy);
+    float motionConfidence = saturate(1.0 - motionPixels * 0.08);
+
+    // Clip reprojected visibility to the current 3x3 signal. This contains
+    // disocclusion errors without washing out valid accumulated crevice AO.
+    float minimumVisibility = currentSignal.z;
+    float maximumVisibility = currentSignal.z;
+    [unroll]
+    for (int y = -1; y <= 1; ++y) {
+        [unroll]
+        for (int x = -1; x <= 1; ++x) {
+            float2 sampleUV = uv + float2(x, y) * screenParams.zw;
+            float visibility =
+                bentAO.SampleLevel(pointClamp, sampleUV, 0.0).z;
+            minimumVisibility = min(minimumVisibility, visibility);
+            maximumVisibility = max(maximumVisibility, visibility);
+        }
+    }
+    previousSignal.z = clamp(
+        previousSignal.z, minimumVisibility, maximumVisibility);
+
+    float feedback = abs(temporalSetting) * depthConfidence *
+                     normalConfidence * motionConfidence;
+    float3 accumulatedBent = normalize(
+        lerp(currentBent, previousBent, feedback));
+    return float4(EncodeBentNormal(accumulatedBent),
+                  lerp(currentSignal.z, previousSignal.z, feedback),
+                  currentSignal.w);
+}
+
+struct CompositeOutput
+{
+    float4 multiplier : SV_TARGET0;
+    float4 history : SV_TARGET1;
+};
+
+float ApplyCoverageAndContact(float2 uv, float depth, bool multisampled,
+                              float3 normal, float visibility)
+{
+    float coverage = contactParams.x > 0.5
+        ? grassCoverage.SampleLevel(pointClamp, uv, 0.0) : 0.0;
+    float forwardSurface = 0.0;
+    float grassSurface = 0.0;
+    if (filterParams.x > 0.5) {
+        float staticDepth =
+            staticCasterDepth.SampleLevel(pointClamp, uv, 0.0);
+        float tolerance = max(0.025, LinearDepth(depth) * 0.003);
+        float depthChanged = step(
+            tolerance, abs(LinearDepth(depth) - LinearDepth(staticDepth)));
+        grassSurface = depthChanged * step(0.001, coverage);
+        forwardSurface = depthChanged * (1.0 - step(0.001, coverage));
+    }
+    if (contactParams.w > 0.5) {
+        // Visibility-buffer surfaces already consumed the accumulated GTAO in
+        // their ambient diffuse term. Retain the post multiplier only for
+        // later forward draws and for the covered fraction of MSAA grass.
+        float postAOWeight = saturate(
+            forwardSurface + grassSurface * coverage);
+        visibility = lerp(1.0, visibility, postAOWeight);
+    } else {
+        // A nearest covered MSAA sample represents only its occupied fraction.
+        // Weight the grass AO contribution instead of darkening the background
+        // as though a single thin blade covered the entire pixel.
+        visibility = lerp(visibility,
+            lerp(1.0, visibility, coverage), grassSurface);
+    }
+
+    float contactWeight = 1.0;
+    if (contactParams.y > 0.5) {
+        // Visibility-buffer surfaces received contact visibility inside their
+        // direct-sun term. Retain this post fallback only for later forward
+        // extensions and for the covered fraction of independently resolved
+        // grass, avoiding a second darkening of opaque/foliage lighting.
+        contactWeight = saturate(forwardSurface + grassSurface * coverage);
+    }
+    // Avoid paying for a second ten-step ray on visibility-resolved pixels;
+    // contactWeight is zero there because direct lighting already owns it.
+    if (contactWeight > 0.001) {
+        float contact = ContactVisibility(uv, depth, multisampled, normal);
+        visibility *= lerp(1.0, contact, contactWeight);
+    }
+    return visibility;
 }
 
 float4 Composite(float2 uv, bool multisampled)
@@ -400,6 +666,26 @@ float4 Composite(float2 uv, bool multisampled)
     return float4(visibility.xxx, 1.0);
 }
 
+CompositeOutput CompositeTemporal(float2 uv, bool multisampled)
+{
+    CompositeOutput output;
+    float depth = SampleDepth(uv, multisampled);
+    if (depth >= 0.99999) {
+        output.multiplier = 1.0;
+        output.history = float4(0.5, 0.5, 1.0, aoParams.w);
+        return output;
+    }
+    float3 normal = ReconstructNormal(uv, depth, multisampled);
+    float4 signal = BilateralSignal(
+        uv, LinearDepth(depth), normal, multisampled);
+    signal = TemporalSignal(uv, signal);
+    float visibility = ApplyCoverageAndContact(
+        uv, depth, multisampled, normal, signal.z);
+    output.multiplier = float4(visibility.xxx, 1.0);
+    output.history = signal;
+    return output;
+}
+
 float4 PSBlurComposite(VSOutput input) : SV_TARGET
 {
     return Composite(input.uv, false);
@@ -408,4 +694,14 @@ float4 PSBlurComposite(VSOutput input) : SV_TARGET
 float4 PSBlurCompositeMSAA(VSOutput input) : SV_TARGET
 {
     return Composite(input.uv, true);
+}
+
+CompositeOutput PSBentBlurComposite(VSOutput input)
+{
+    return CompositeTemporal(input.uv, false);
+}
+
+CompositeOutput PSBentBlurCompositeMSAA(VSOutput input)
+{
+    return CompositeTemporal(input.uv, true);
 }
