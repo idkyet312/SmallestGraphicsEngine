@@ -5,6 +5,7 @@
 #include "GameCommandQueue.h"
 #include "GameRuntime.h"
 #include "GameSession.h"
+#include "MissionSystem.h"
 #include "CombatSystem.h"
 #include "VehicleSystem.h"
 #include "DeploymentPlanner.h"
@@ -178,6 +179,44 @@ int main() {
     CHECK(runtime.combat.heldBarrelIndex == SIZE_MAX);
     CHECK(!runtime.vehicles.drivingHumvee);
     CHECK(!runtime.commands.Pending(GameCommand::ResetDDGIHistory));
+    CHECK(runtime.mission.Loadout().Valid());
+    runtime.mission.Loadout().SelectWeapon(0, 4);
+    runtime.mission.Loadout().SelectWeapon(1, 7);
+    runtime.mission.RecordWeaponFired(4, 3);
+    runtime.ResetLevelState();
+    CHECK(runtime.mission.Loadout().weapons[0] == 4);
+    CHECK(runtime.mission.Loadout().weapons[1] == 7);
+    CHECK(runtime.mission.Stats().shotsFired == 0);
+
+    MissionLoadout loadout;
+    loadout.SelectWeapon(0, 2);
+    CHECK(loadout.weapons[0] == 2);
+    loadout.SelectWeapon(1, 2);
+    CHECK(loadout.weapons[0] == 1);
+    CHECK(loadout.weapons[1] == 2);
+    CHECK(loadout.Valid());
+    loadout.grenade = GrenadeType::Vortex;
+    loadout.insertion = LevelInsertionMode::Boat;
+
+    MissionRunStats missionStats;
+    missionStats.weaponsUsedMask = (1u << 1) | (1u << 2);
+    missionStats.shotsFired = 10;
+    missionStats.shotsHit = 5;
+    missionStats.friendliesDeployed = 4;
+    missionStats.grenadesThrown = 1;
+    missionStats.destructionEvents = MissionSystem::kDestructionScoreTarget;
+    const MissionReport missionReport = MissionSystem::Grade(
+        loadout, missionStats, 200.0f, 3);
+    CHECK(std::abs(missionReport.accuracyPercent - 50.0f) < 0.001f);
+    CHECK(missionReport.casualties == 1);
+    CHECK(missionReport.optionalObjectivesCompleted == 3);
+    CHECK(missionReport.timeScore == 20);
+    CHECK(missionReport.accuracyScore == 13);
+    CHECK(missionReport.casualtyScore == 15);
+    CHECK(missionReport.optionalScore == 20);
+    CHECK(missionReport.destructionScore == 15);
+    CHECK(missionReport.totalScore == 83);
+    CHECK(missionReport.rank == MissionRank::A);
 
     PlayerMovementTracker movement;
     CHECK(movement.Update({ 0.0f, 0.0f, 0.0f }, 0.1f) == 0.0f);

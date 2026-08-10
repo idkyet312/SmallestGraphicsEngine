@@ -347,8 +347,12 @@ inline void RenderPlayerHUD(const Scene& scene) {
         if (scene.selectedGrenade == GrenadeType::Molotov) grenade = "MOLOTOV";
         else if (scene.selectedGrenade == GrenadeType::Vortex) grenade = "VORTEX";
         char grenadeLabel[64];
-        snprintf(grenadeLabel, sizeof(grenadeLabel),
-                 "GRENADE: %s   [B] SWITCH   [G] THROW", grenade);
+        if (scene.player.godMode)
+            snprintf(grenadeLabel, sizeof(grenadeLabel),
+                     "GRENADE: %s   [B] SWITCH   [G] THROW", grenade);
+        else
+            snprintf(grenadeLabel, sizeof(grenadeLabel),
+                     "GRENADE: %s   [G] THROW", grenade);
         const ImVec2 grenadeSize = ImGui::CalcTextSize(grenadeLabel);
         const ImVec2 grenadePos(
             (io.DisplaySize.x - grenadeSize.x) * 0.5f,

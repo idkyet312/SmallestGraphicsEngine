@@ -742,8 +742,8 @@ float BlackHawkModelScale() { return g_blackHawkModelScale; }
 
 static LevelInsertionMode ResolvedInsertionMode();
 
-static LevelInsertionMode g_playerInsertionChoice =
-    LevelInsertionMode::Helicopter;
+static LevelInsertionMode& g_playerInsertionChoice =
+    g_game.mission.Loadout().insertion;
 static bool g_insertionChoicePending = false;
 static bool g_insertionChoiceCursorReleased = false;
 static std::vector<XMFLOAT3> g_deploymentZones;
@@ -940,6 +940,7 @@ static void BeginDeploymentPlanning() {
     if (authored == LevelInsertionMode::PlayerChoice)
         authored = LevelInsertionMode::Helicopter;
     g_playerInsertionChoice = authored;
+    scene.selectedGrenade = g_game.mission.Loadout().grenade;
     g_insertionChoicePending = true;
     g_game.session.StopTimer();
     scene.camera.FPSMode = false;
@@ -2269,6 +2270,7 @@ static bool SpawnMarine(const XMFLOAT3& position, float yaw) {
     // No ApplyBanditLoadout(): marines stay on the default Rifle loadout for v1.
     marine->PlayClip("Walk");
     g_bandits.push_back(std::move(marine));
+    g_game.mission.RecordFriendlyDeployed();
     return true;
 }
 
@@ -2365,6 +2367,7 @@ static bool ShootPlayerWeapon() {
         if (scene.BeginReload(slot)) PlayReloadSound();
         return false;
     }
+    const size_t projectileStart = scene.projectiles.size();
     if (GunModel::HarpoonSelected()) {
         scene.ShootHarpoonProjectile();
         const float pitch = 0.62f + ((float)std::rand() / RAND_MAX) * 0.05f;
@@ -2395,6 +2398,12 @@ static bool ShootPlayerWeapon() {
         const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
         g_gunAudio.Play(0.82f, pitch);
     }
+    const uint32_t projectileCount = static_cast<uint32_t>(
+        scene.projectiles.size() - projectileStart);
+    for (size_t index = projectileStart; index < scene.projectiles.size(); ++index)
+        scene.projectiles[index].playerOwned = true;
+    if (g_game.session.TimerRunning())
+        g_game.mission.RecordWeaponFired(slot, projectileCount);
     // Gunfire is loud enough for nearby enemies to hear through walls, even
     // ones that can't currently see the player. Same radius as the squad-alert
     // broadcast so "heard the shot" and "saw a squadmate get hit" read as the
@@ -2983,6 +2992,8 @@ static void DetonateBarrel(size_t firstBarrel) {
             pending.push_back(i);
         }
     }
+    if (g_game.session.TimerRunning())
+        g_game.mission.RecordDestruction(static_cast<uint32_t>(pending.size()));
 }
 
 static bool HitExplosiveBarrelSegment(const XMFLOAT3& start,
@@ -6052,6 +6063,8 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
     const CombatSystem::PrefabDamageResult result =
         g_game.combat.DamagePrefab(g_game.world, entityId, damage, hit);
     if (result.destroyed) {
+        if (g_game.session.TimerRunning())
+            g_game.mission.RecordDestruction();
         scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
         g_prefabRebuildRequested = true;
         SGE_LOG("LogPrefab", EngineLog::Level::Display,
@@ -6065,6 +6078,8 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
         g_game.world, center, radius, damage);
     for (const CombatSystem::PrefabDamageResult& result : results) {
         if (!result.destroyed) continue;
+        if (g_game.session.TimerRunning())
+            g_game.mission.RecordDestruction();
         scene.SpawnSmokeBurst(result.effectPosition, 1.2f, 0.45f);
         g_prefabRebuildRequested = true;
         SGE_LOG("LogPrefab", EngineLog::Level::Display,
@@ -6380,6 +6395,8 @@ static void StartLevelEditor(HWND hwnd);
 static void StopEditorPlaytest();
 
 static void OpenWinScreen() {
+    g_game.mission.Finish(
+        g_game.session.ElapsedSeconds(), static_cast<uint32_t>(LiveMarineCount()));
     g_game.session.StopTimer();
     g_game.session.SetScreen(GameScreen::WinScreen);
     showUI = false;
@@ -6449,6 +6466,9 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     scene.RestorePlayerHealth();
     g_game.world.Prefabs().ResetGameplayState();
     scene.ResetLevelRuntimeState();
+    scene.selectedGrenade = g_game.mission.Loadout().grenade;
+    if (g_emptyLevelMode)
+        GunModel::DisableLoadoutRestriction();
     scene.camera = Camera(XMFLOAT3(0.0f, 5.0f, 10.0f));
     scene.gun.visible = true;
     scene.showHelicopter = !g_emptyLevelMode;
@@ -6768,8 +6788,8 @@ static void RenderDeathScreen(HWND hwnd) {
     ImGui::End();
 }
 
-// Deployment fly-through: pick a green perimeter zone and one insertion type.
-// Both runs stay held until DEPLOY, so the chosen target is authoritative.
+// Deployment fly-through owns every decision that changes the run. Nothing is
+// applied until DEPLOY, so restarting always returns to one authoritative plan.
 static void RenderInsertionChoiceScreen(HWND hwnd) {
     // Free the pointer so the buttons can be clicked, the way the death screen
     // does. Recaptured below once the choice is made.
@@ -6821,20 +6841,21 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     }
 
     const char* instruction =
-        "SELECT A GREEN DEPLOYMENT ZONE, THEN CHOOSE YOUR INSERTION";
+        "SELECT A ZONE, TWO WEAPONS, A GRENADE, AND YOUR INSERTION";
     foreground->AddText(
         ImVec2((display.x - ImGui::CalcTextSize(instruction).x) * 0.5f, 23.0f),
         IM_COL32(190, 255, 205, 255), instruction);
 
     ImGui::SetNextWindowPos(ImVec2(display.x - 20.0f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(1.0f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(390.0f, 410.0f), ImGuiCond_Always);
+    const float panelHeight = (std::min)(650.0f, display.y - 20.0f);
+    ImGui::SetNextWindowSize(ImVec2(430.0f, panelHeight), ImGuiCond_Always);
     ImGui::Begin("Deployment Planning", nullptr, ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse);
-    ImGui::Dummy(ImVec2(0.0f, 15.0f));
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
     const char* title = "DEPLOYMENT PLAN";
-    ImGui::SetCursorPosX((390.0f - ImGui::CalcTextSize(title).x) * 0.5f);
+    ImGui::SetCursorPosX((430.0f - ImGui::CalcTextSize(title).x) * 0.5f);
     ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "%s", title);
     ImGui::Dummy(ImVec2(0.0f, 12.0f));
     if (g_selectedDeploymentZone >= 0)
@@ -6843,7 +6864,34 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     else
         ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f),
             "Click a green zone on the map");
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    ImGui::Dummy(ImVec2(0.0f, 7.0f));
+
+    MissionLoadout& loadout = g_game.mission.Loadout();
+    static constexpr const char* weaponNames[MissionLoadout::kWeaponCount] = {
+        "AK47", "Mossberg 590A1", "RPG-7", "SVD Sniper",
+        "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
+        "Mako Harpoon Gun"
+    };
+    ImGui::SeparatorText("LOADOUT");
+    int primary = loadout.weapons[0];
+    if (ImGui::Combo("Primary", &primary, weaponNames,
+                     MissionLoadout::kWeaponCount))
+        loadout.SelectWeapon(0, primary);
+    int secondary = loadout.weapons[1];
+    if (ImGui::Combo("Secondary", &secondary, weaponNames,
+                     MissionLoadout::kWeaponCount))
+        loadout.SelectWeapon(1, secondary);
+    int grenade = static_cast<int>(loadout.grenade);
+    static constexpr const char* grenadeNames[] = { "Frag", "Molotov", "Vortex" };
+    if (ImGui::Combo("Grenade", &grenade, grenadeNames,
+                     static_cast<int>(std::size(grenadeNames)))) {
+        loadout.grenade = static_cast<GrenadeType>(grenade);
+        scene.selectedGrenade = loadout.grenade;
+    }
+    if (scene.player.godMode)
+        ImGui::TextDisabled("God mode keeps all weapons available after deployment.");
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    ImGui::SeparatorText("INSERTION");
 
     const auto modeButton = [&](const char* label, LevelInsertionMode mode) {
         const bool selected = g_playerInsertionChoice == mode;
@@ -6854,20 +6902,40 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                 ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.58f, 0.28f, 1.0f));
         }
         ImGui::SetCursorPosX(45.0f);
-        if (ImGui::Button(label, ImVec2(300.0f, 48.0f)))
+        if (ImGui::Button(label, ImVec2(340.0f, 36.0f)))
             g_playerInsertionChoice = mode;
         if (selected) ImGui::PopStyleColor(2);
     };
     modeButton("HELICOPTER LANDING", LevelInsertionMode::Helicopter);
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    ImGui::Dummy(ImVec2(0.0f, 3.0f));
     modeButton("FAST HELI RAPPEL (-50% AMMO)", LevelInsertionMode::FastRappel);
-    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    ImGui::Dummy(ImVec2(0.0f, 3.0f));
     modeButton("BOAT INSERTION", LevelInsertionMode::Boat);
-    ImGui::Dummy(ImVec2(0.0f, 15.0f));
+    ImGui::Dummy(ImVec2(0.0f, 5.0f));
 
-    ImGui::BeginDisabled(g_selectedDeploymentZone < 0);
+    ImGui::SeparatorText("OPTIONAL OBJECTIVES");
+    ImGui::TextDisabled("Use both selected weapons");
+    ImGui::TextDisabled("Throw your selected grenade");
+    ImGui::TextDisabled("Cause at least %u destruction events",
+                        MissionSystem::kDemolitionObjectiveEvents);
+    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+
+    const bool weaponsReady = loadout.Valid() &&
+        GunModel::WeaponLoaded(loadout.weapons[0]) &&
+        GunModel::WeaponLoaded(loadout.weapons[1]);
+    if (!weaponsReady)
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.2f, 1.0f),
+                           "Selected weapon asset is unavailable");
+    ImGui::BeginDisabled(g_selectedDeploymentZone < 0 || !weaponsReady);
     ImGui::SetCursorPosX(45.0f);
-    if (ImGui::Button("DEPLOY", ImVec2(300.0f, 58.0f))) {
+    if (ImGui::Button("DEPLOY", ImVec2(340.0f, 48.0f))) {
+        if (scene.player.godMode) {
+            GunModel::DisableLoadoutRestriction();
+            GunModel::SelectedWeapon() = loadout.weapons[0];
+        } else {
+            GunModel::ConfigureLoadout(loadout.weapons[0], loadout.weapons[1]);
+        }
+        scene.selectedGrenade = loadout.grenade;
         g_deploymentTarget = g_deploymentZones[
             static_cast<size_t>(g_selectedDeploymentZone)];
         g_deploymentTargetValid = true;
@@ -6901,37 +6969,70 @@ static void RenderWinScreen(HWND hwnd) {
         ImVec2(0, 0), display, IM_COL32(0, 22, 12, 215));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(410.0f, 292.0f), ImGuiCond_Always);
+    const float panelHeight = (std::min)(620.0f, display.y - 20.0f);
+    ImGui::SetNextWindowSize(ImVec2(540.0f, panelHeight), ImGuiCond_Always);
     ImGui::Begin("Win Screen", nullptr, ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse);
-    ImGui::Dummy(ImVec2(0.0f, 14.0f));
-    const char* won = "LEVEL 1 COMPLETE";
-    ImGui::SetCursorPosX((410.0f - ImGui::CalcTextSize(won).x) * 0.5f);
-    ImGui::TextColored(ImVec4(0.25f, 1.0f, 0.42f, 1.0f), "%s", won);
+    const MissionReport& report = g_game.mission.Report();
+    const MissionLoadout& loadout = g_game.mission.Loadout();
+    const MissionRunStats& stats = g_game.mission.Stats();
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    const char* cleared = "ALL ENEMIES ELIMINATED";
-    ImGui::SetCursorPosX((410.0f - ImGui::CalcTextSize(cleared).x) * 0.5f);
-    ImGui::TextDisabled("%s", cleared);
+    const char* won = "MISSION COMPLETE";
+    ImGui::SetCursorPosX((540.0f - ImGui::CalcTextSize(won).x) * 0.5f);
+    ImGui::TextColored(ImVec4(0.25f, 1.0f, 0.42f, 1.0f), "%s", won);
+    const char* rank = MissionRankName(report.rank);
+    ImGui::SetWindowFontScale(2.2f);
+    ImGui::SetCursorPosX((540.0f - ImGui::CalcTextSize(rank).x) * 0.5f);
+    ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.24f, 1.0f), "%s", rank);
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::SetCursorPosX(195.0f);
+    ImGui::Text("%d / 100", report.totalScore);
+
+    ImGui::SeparatorText("DEPLOYMENT");
+    ImGui::Text("%s + %s", GunModel::WeaponName(loadout.weapons[0]),
+                GunModel::WeaponName(loadout.weapons[1]));
+    ImGui::TextDisabled("%s | %s", GrenadeTypeName(loadout.grenade),
+                        LevelInsertionModeName(loadout.insertion));
+
     const int totalMilliseconds = static_cast<int>(
-        g_game.session.ElapsedSeconds() * 1000.0f + 0.5f);
+        report.elapsedSeconds * 1000.0f + 0.5f);
     const int minutes = totalMilliseconds / 60000;
     const int seconds = (totalMilliseconds / 1000) % 60;
     const int milliseconds = totalMilliseconds % 1000;
-    char timeText[48];
-    std::snprintf(timeText, sizeof(timeText), "TIME  %02d:%02d.%03d",
-                  minutes, seconds, milliseconds);
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::SetCursorPosX((410.0f - ImGui::CalcTextSize(timeText).x) * 0.5f);
-    ImGui::TextUnformatted(timeText);
-    ImGui::Dummy(ImVec2(0.0f, 14.0f));
-    ImGui::SetCursorPosX(55.0f);
+    ImGui::SeparatorText("SCORE BREAKDOWN");
+    ImGui::Text("Time             %02d:%02d.%03d", minutes, seconds, milliseconds);
+    ImGui::SameLine(410.0f); ImGui::Text("%2d / 20", report.timeScore);
+    ImGui::Text("Accuracy         %.1f%%  (%u / %u)", report.accuracyPercent,
+                stats.shotsHit, stats.shotsFired);
+    ImGui::SameLine(410.0f); ImGui::Text("%2d / 25", report.accuracyScore);
+    ImGui::Text("Casualties       %u / %u", report.casualties,
+                stats.friendliesDeployed);
+    ImGui::SameLine(410.0f); ImGui::Text("%2d / 20", report.casualtyScore);
+    ImGui::Text("Optional         %u / %u", report.optionalObjectivesCompleted,
+                report.optionalObjectivesTotal);
+    ImGui::SameLine(410.0f); ImGui::Text("%2d / 20", report.optionalScore);
+    ImGui::Text("Destruction      %u events", report.destructionEvents);
+    ImGui::SameLine(410.0f); ImGui::Text("%2d / 15", report.destructionScore);
+
+    const auto objective = [](bool complete, const char* label) {
+        ImGui::TextColored(complete
+                ? ImVec4(0.35f, 1.0f, 0.45f, 1.0f)
+                : ImVec4(0.58f, 0.62f, 0.60f, 1.0f),
+            "%s  %s", complete ? "[X]" : "[ ]", label);
+    };
+    ImGui::SeparatorText("OPTIONAL OBJECTIVES");
+    objective(report.usedBothWeapons, "Field versatility - use both weapons");
+    objective(report.usedSelectedGrenade, "Grenadier - throw selected grenade");
+    objective(report.demolitionObjective, "Demolition - cause 5 destruction events");
+
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    ImGui::SetCursorPosX(45.0f);
     if (ImGui::Button(g_activeCustomLevelName.empty() ? "REPLAY LEVEL 1" :
-            "REPLAY CUSTOM LEVEL", ImVec2(300.0f, 55.0f)))
+            "REPLAY CUSTOM LEVEL", ImVec2(215.0f, 45.0f)))
         RestartActiveLevel(hwnd);
-    ImGui::Dummy(ImVec2(0.0f, 9.0f));
-    ImGui::SetCursorPosX(55.0f);
-    if (ImGui::Button("MAIN MENU", ImVec2(300.0f, 45.0f)))
+    ImGui::SameLine();
+    if (ImGui::Button("MAIN MENU", ImVec2(215.0f, 45.0f)))
         OpenMainMenu();
     ImGui::End();
 }
@@ -9158,7 +9259,12 @@ static void ProcessInput(HWND) {
     // Grenade: press G to lob one. Cooldown debounces the held key.
     scene.grenadeCooldown -= deltaTime;
     if ((GetAsyncKeyState('G') & 0x8000) && scene.grenadeCooldown <= 0.0f) {
+        const size_t projectileStart = scene.projectiles.size();
         scene.ThrowGrenade();
+        for (size_t index = projectileStart; index < scene.projectiles.size(); ++index)
+            scene.projectiles[index].playerOwned = true;
+        if (g_game.session.TimerRunning())
+            g_game.mission.RecordGrenadeThrown();
         scene.grenadeCooldown = 0.6f;
     }
 }
@@ -9369,7 +9475,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_inlineRaytracingSupported && visBuffer.EnhancedVisualsReady())
                 ToggleAllRTEffects(scene, visBuffer, !scene.enhancedVisuals);
         }
-        else if (wParam == 'B' && !(lParam & 0x40000000)) {
+        else if (scene.player.godMode && wParam == 'B' &&
+                 !(lParam & 0x40000000)) {
             switch (scene.selectedGrenade) {
             case GrenadeType::Frag:
                 scene.selectedGrenade = GrenadeType::Molotov;
@@ -10874,7 +10981,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 g_gunAudio.Play(volume, pitch);
             }
             // Smoke and a rate-limited break sound at actual fracture points.
-            for (const XMFLOAT3& bp : g_destruction.DrainBreakPoints()) {
+            const auto breakPoints = g_destruction.DrainBreakPoints();
+            if (g_game.session.TimerRunning() && !breakPoints.empty())
+                g_game.mission.RecordDestruction(
+                    static_cast<uint32_t>(breakPoints.size()));
+            for (const XMFLOAT3& bp : breakPoints) {
                 scene.SpawnSmokeBurst(bp, 0.5f, 0.4f);
                 if (g_destructionBreakAudioCooldown <= 0.0f) {
                     const float dx = bp.x - scene.camera.Position.x;
@@ -10938,6 +11049,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     (scene.impactParticles.size() - 800));
             UpdateHarpoonAttachments();
             for (auto& projectile : scene.projectiles) {
+                const auto recordAccuracyHit = [&]() {
+                    if (projectile.playerOwned &&
+                        !projectile.accuracyHitRecorded &&
+                        g_game.session.TimerRunning()) {
+                        projectile.accuracyHitRecorded = true;
+                        g_game.mission.RecordHit();
+                    }
+                };
                 if (projectile.grenade && projectile.active && !projectile.held) {
                     if ((projectile.molotov || projectile.vortex) &&
                         std::find(grenadeContactEvents.begin(),
@@ -10975,6 +11094,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 if (projectile.rocket && projectile.active) {
                     XMFLOAT3 impact = projectile.position;
                     bool struck = false;
+                    bool hostileTargetStruck = false;
                     const float radius = 0.22f;
                     size_t barrelIndex = 0;
                     XMFLOAT3 candidate;
@@ -10984,6 +11104,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                     projectile.previousPosition, projectile.position,
                                     radius)) {
                                 struck = true;
+                                hostileTargetStruck =
+                                    bandit->faction == Faction::Bandit;
                                 break;
                             }
                         }
@@ -10993,18 +11115,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             radius, candidate)) {
                         impact = candidate;
                         struck = true;
+                        hostileTargetStruck = true;
                     }
                     if (!struck && HitSecondaryHelicopterSegment(
                             projectile.previousPosition, projectile.position,
                             radius, candidate)) {
                         impact = candidate;
                         struck = true;
+                        hostileTargetStruck = true;
                     }
                     if (!struck && HitBoatSegment(
                             projectile.previousPosition, projectile.position,
                             radius, candidate)) {
                         impact = candidate;
                         struck = true;
+                        hostileTargetStruck = true;
                         if (projectile.rocket)
                             DamageBoat(kRocketHelicopterDamage, candidate);
                     }
@@ -11036,6 +11161,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         struck = true;
                     }
                     if (struck) {
+                        if (hostileTargetStruck) recordAccuracyHit();
                         projectile.position = impact;
                         projectile.active = false;
                         projectile.detonate = true;
@@ -11341,6 +11467,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     }
                 }
                 if (!banditHits.empty()) {
+                    recordAccuracyHit();
                     for (BanditProjectileHit& banditHit : banditHits) {
                         if (projectile.laser)
                             scene.StopLaserBeamAt(banditHit.position);
@@ -11441,6 +11568,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 if (!projectile.hostile && HitHelicopterSegment(
                         projectile.previousPosition, projectile.position,
                         bulletRadius, helicopterHit)) {
+                    recordAccuracyHit();
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
@@ -11454,6 +11582,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 if (!projectile.hostile && HitSecondaryHelicopterSegment(
                         projectile.previousPosition, projectile.position,
                         bulletRadius, helicopterHit)) {
+                    recordAccuracyHit();
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
@@ -11469,6 +11598,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 if (!projectile.hostile && HitBoatSegment(
                         projectile.previousPosition, projectile.position,
                         bulletRadius, boatHit)) {
+                    recordAccuracyHit();
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);

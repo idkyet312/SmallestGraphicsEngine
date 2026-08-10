@@ -87,6 +87,14 @@ public:
         static int weapon = 0; // 0 AK, 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame, 7 harpoon
         return weapon;
     }
+    static const char* WeaponName(int weapon) {
+        static constexpr const char* names[8] = {
+            "AK47", "Mossberg 590A1", "RPG-7", "SVD Sniper",
+            "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
+            "Mako Harpoon Gun"
+        };
+        return names[(std::max)(0, (std::min)(weapon, 7))];
+    }
     static bool ShotgunSelected() { return SelectedWeapon() == 1 && ShotgunLoaded(); }
     static bool RPGSelected() { return SelectedWeapon() == 2 && RPGLoaded(); }
     static bool SVDSelected() { return SelectedWeapon() == 3 && SVDLoaded(); }
@@ -95,13 +103,7 @@ public:
     static bool FlamethrowerSelected() { return SelectedWeapon() == 6; }
     static bool HarpoonSelected() { return SelectedWeapon() == 7; }
     static const char* SelectedWeaponName() {
-        if (HarpoonSelected()) return "Mako Harpoon Gun";
-        if (FlamethrowerSelected()) return "M2 Flamethrower";
-        if (C4Selected()) return "Remote C4";
-        if (LaserSelected()) return "ARC Laser Cutter";
-        if (SVDSelected()) return "SVD Sniper";
-        if (RPGSelected()) return "RPG-7";
-        return ShotgunSelected() ? "Mossberg 590A1" : "AK47";
+        return WeaponName(SelectedWeapon());
     }
     static std::shared_ptr<SceneMesh>& PlayerMesh() {
         if (HarpoonSelected())
@@ -150,7 +152,31 @@ public:
         default: return false;
         }
     }
+    static std::array<int, 2>& LoadoutWeapons() {
+        static std::array<int, 2> weapons{{ 0, 1 }};
+        return weapons;
+    }
+    static bool& LoadoutRestricted() {
+        static bool restricted = false;
+        return restricted;
+    }
+    static bool ConfigureLoadout(int primary, int secondary) {
+        if (primary == secondary || !WeaponLoaded(primary) ||
+            !WeaponLoaded(secondary))
+            return false;
+        LoadoutWeapons() = {{ primary, secondary }};
+        LoadoutRestricted() = true;
+        SelectedWeapon() = primary;
+        return true;
+    }
+    static void DisableLoadoutRestriction() { LoadoutRestricted() = false; }
     static void CycleWeapon(int direction) {
+        if (LoadoutRestricted()) {
+            const auto& weapons = LoadoutWeapons();
+            SelectedWeapon() = SelectedWeapon() == weapons[0]
+                ? weapons[1] : weapons[0];
+            return;
+        }
         const int step = direction < 0 ? -1 : 1;
         int candidate = SelectedWeapon();
         for (int attempt = 0; attempt < 8; ++attempt) {

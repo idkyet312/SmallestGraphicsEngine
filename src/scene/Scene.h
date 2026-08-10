@@ -5,6 +5,7 @@
 #include "CameraDX12.h"
 #include "ClusteredRendererDX12.h"
 #include "PlayerState.h"
+#include "MissionSystem.h"
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
@@ -32,8 +33,6 @@ struct SceneObject {
     }
 };
 
-enum class GrenadeType : uint8_t { Frag = 0, Molotov = 1, Vortex = 2 };
-
 struct Projectile {
     XMFLOAT3 position;
     XMFLOAT3 previousPosition;
@@ -42,6 +41,11 @@ struct Projectile {
     float    lifetime;
     bool     active;
     bool     hostile = false;
+    // Statistics only count projectiles emitted by the local player's weapon.
+    // Marine rounds share the friendly collision path, so hostile=false alone
+    // cannot identify ownership.
+    bool     playerOwned = false;
+    bool     accuracyHitRecorded = false;
     // Grenade: arcs under gravity and detonates (radial blast) on fuse timeout
     // or first impact. Regular bullets leave these at defaults.
     bool     grenade = false;
