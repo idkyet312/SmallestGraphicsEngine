@@ -10331,13 +10331,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 scene.impactParticles.push_back(particle);
             }
         }
-        // Riding a vehicle moves the camera without the player taking a step,
-        // and the tracker measures raw camera displacement -- left enabled, the
-        // insertion flight reads as a full sprint and plays the run animation.
-        const bool carriedByVehicle =
+        // Vehicles and the deployment fly-through move the camera without the
+        // player taking a step. The tracker measures raw camera displacement;
+        // left enabled, either motion reads as a sprint in the viewmodel.
+        const bool nonLocomotionCameraMotion = g_insertionChoicePending ||
             g_drivingHumvee || g_game.vehicles.blackHawkCarryingPlayer;
         const float playerHorizontalSpeed = g_game.playerMovement.Update(
-            scene.ViewmodelAnchorPosition(), deltaTime, !carriedByVehicle);
+            scene.ViewmodelAnchorPosition(), deltaTime,
+            !nonLocomotionCameraMotion);
         ArmsModel::Update(deltaTime, playerHorizontalSpeed, scene.adsBlend);
         if (!g_emptyLevelMode) {
             UpdateHelicopter(deltaTime);
