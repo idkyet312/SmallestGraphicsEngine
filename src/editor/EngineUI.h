@@ -47,6 +47,11 @@ extern bool g_showEnemyVisionCones;
 void RequestLiveDXRDDGIRebuild();
 void MatchFoliageMaterialToGrass();
 
+// Comm-tower objective status for the HUD. Returns false when the level has no
+// tower (or it has already been destroyed), so the readout only appears on maps
+// that actually carry one. Defined in main.cpp, which owns the prefab runtime.
+bool CommTowerObjectiveStatus(float& health, float& maxHealth);
+
 // On-screen dual-stick controls: analog movement and analog camera look.
 inline void RenderMovementPad() {
     virtualInput.moveX = virtualInput.moveY = 0.0f;
@@ -157,6 +162,57 @@ inline void RenderPlayerHUD(const Scene& scene) {
         draw->AddText(ImVec2(16.0f, io.DisplaySize.y - 28.0f),
                       IM_COL32(210, 235, 210, 220),
                       "Enemy vision cones: ON  (N to toggle)");
+    }
+
+    // Comm-tower objective readout, centred at the top. Only drawn on levels that
+    // carry a tower, and hidden behind the sniper scope like the rest of the HUD
+    // so it cannot sit on top of the reticle.
+    {
+        float towerHealth = 0.0f, towerMaxHealth = 0.0f;
+        if (scene.sniperScopeBlend < 0.25f &&
+            CommTowerObjectiveStatus(towerHealth, towerMaxHealth)) {
+            const float towerFraction = (std::max)(0.0f, (std::min)(1.0f,
+                towerHealth / (std::max)(1.0f, towerMaxHealth)));
+            constexpr float barWidth = 260.0f;
+            constexpr float barHeight = 16.0f;
+            const ImVec2 barMin((io.DisplaySize.x - barWidth) * 0.5f, 22.0f);
+            const ImVec2 barMax(barMin.x + barWidth, barMin.y + barHeight);
+            const ImVec2 barFill(
+                barMin.x + barWidth * towerFraction, barMax.y);
+
+            const char* title = "COMM TOWER";
+            const ImVec2 titleSize = ImGui::CalcTextSize(title);
+            draw->AddText(
+                ImVec2(barMin.x + (barWidth - titleSize.x) * 0.5f,
+                       barMin.y - titleSize.y - 3.0f),
+                IM_COL32(226, 234, 225, 235), title);
+
+            draw->AddRectFilled(ImVec2(barMin.x - 3.0f, barMin.y - 3.0f),
+                                ImVec2(barMax.x + 3.0f, barMax.y + 3.0f),
+                                IM_COL32(8, 12, 10, 180), 3.0f);
+            // Amber-to-red as it comes apart: distinct from the player's green
+            // health bar so the two are never confused at a glance.
+            const int towerRed = 226;
+            const int towerGreen = (int)(58.0f + 128.0f * towerFraction);
+            if (towerFraction > 0.0f)
+                draw->AddRectFilled(barMin, barFill,
+                                    IM_COL32(towerRed, towerGreen, 46, 225), 1.5f);
+            draw->AddRect(barMin, barMax, IM_COL32(176, 196, 181, 185),
+                          1.5f, 0, 1.0f);
+
+            // Percentage, not the raw health pair: 2400 is an authored tuning
+            // number that means nothing on screen, and since a demolition charge
+            // deals far more than the tower's total health, the pair only ever
+            // reads "2400 / 2400" or "0 / 2400" -- never anything between.
+            char towerLabel[48];
+            snprintf(towerLabel, sizeof(towerLabel), "%.0f%%",
+                     towerFraction * 100.0f);
+            const ImVec2 towerTextSize = ImGui::CalcTextSize(towerLabel);
+            draw->AddText(
+                ImVec2(barMin.x + (barWidth - towerTextSize.x) * 0.5f,
+                       barMin.y + (barHeight - towerTextSize.y) * 0.5f),
+                IM_COL32(226, 234, 225, 245), towerLabel);
+        }
     }
 
     if (scene.sniperScopeBlend > 0.01f) {

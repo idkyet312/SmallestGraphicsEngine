@@ -16,6 +16,16 @@ struct AssetWatcher::Watch {
 AssetWatcher::AssetWatcher() = default;
 AssetWatcher::~AssetWatcher() { Stop(); }
 
+const std::vector<std::filesystem::path>& AssetWatcherDefaultRoots() {
+    // See the note in AssetWatcher.h: Content/Levels must not be listed here.
+    static const std::vector<std::filesystem::path> roots = {
+        "Content/Models", "Content/Textures", "Content/Audio",
+        "Content/Prefabs" };
+    return roots;
+}
+
+void AssetWatcher::Start() { Start(AssetWatcherDefaultRoots()); }
+
 void AssetWatcher::Start(const std::vector<std::filesystem::path>& roots) {
     Stop();
     stopping_ = false;

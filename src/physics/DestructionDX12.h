@@ -191,11 +191,49 @@ public:
                         const DirectX::XMFLOAT3& worldEnd, float radius,
                         DirectX::XMFLOAT3& hitPosition,
                         uint32_t ignoredHarpoonId = 0) const;
+    // Chunks whose node name contains this marker are objective geometry: blasts
+    // and radial damage from anything other than a deliberate call pass straight
+    // through them. Lets the comm tower stand in the enemy helicopter's patrol
+    // path (and beside explosive barrels) without being felled by either.
+    static constexpr const char* ProtectedChunkMarker = "#Protected";
+    // True when the chunk nearest `worldPosition` is a corrugated metal roof
+    // sheet, so a caller can pick the right impact sound for the surface it
+    // just hit. Cheap nearest-cell lookup; no physics query.
+    bool IsMetalSheetAt(const DirectX::XMFLOAT3& worldPosition) const;
+    // True when the chunk the last hit test resolved is objective geometry
+    // (ProtectedChunkMarker). Such a hit must not chip the chunk directly: the
+    // caller routes the damage to the owning prefab's health instead, so the
+    // structure only comes apart once that health is spent.
+    bool IsProtectedChunkAt(const DirectX::XMFLOAT3& worldPosition) const;
+    // `sparesProtected` marks the damage as indirect (spreading fire, debris
+    // impact), which leaves ProtectedChunkMarker geometry untouched. A direct
+    // player hit leaves it false so the player can still cut those chunks.
     void ApplyRadialDamage(const DirectX::XMFLOAT3& worldPosition,
-                           float radius, float damage = 2.0f);
+                           float radius, float damage = 2.0f,
+                           bool sparesProtected = false);
     // Laser-only hard cut: immediately severs the exact impacted chunk. Support
     // cells and already-detached single chunks do not resist this path.
-    void DestroyChunkAt(const DirectX::XMFLOAT3& worldPosition, float radius);
+    //
+    // `allowProtected` is the demolition opt-in for ProtectedChunkMarker
+    // geometry. It defaults to false so this stays safe for every ordinary
+    // caller: only the authorised demolition of an objective (a comm tower with a
+    // charge planted on it) passes true. Without that, a laser cut or any future
+    // caller could carve up a structure that is meant to be invulnerable.
+    void DestroyChunkAt(const DirectX::XMFLOAT3& worldPosition, float radius,
+                        bool allowProtected = false);
+    // Demolition of objective geometry: clears ProtectedChunkMarker status on
+    // every chunk within `radius`, drops the anchoring of any support chunk
+    // among them, and severs the lot so the whole structure comes down.
+    //
+    // DestroyChunkAt only ever frees the single nearest chunk, so felling a
+    // 12-band mast that way left half of it standing -- and still protected,
+    // which meant permanently invulnerable. This releases the geometry instead:
+    // once cleared, the pieces are ordinary destructible structure.
+    //
+    // One-way and deliberate. Nothing re-protects a released chunk, and only an
+    // authorised demolition (a comm tower with a charge planted on it) calls it.
+    void ReleaseProtectedChunks(const DirectX::XMFLOAT3& worldPosition,
+                                float radius);
     // Attaches persistent fire to the impacted Blast chunk. Attachment follows
     // that chunk through actor splits and physics motion.
     void IgniteChunkAt(const DirectX::XMFLOAT3& worldPosition);

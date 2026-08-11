@@ -69,6 +69,12 @@ constexpr uint64_t CollisionCategoryGrenade = PhysicsImpactPolicy::Grenade;
 // Uniform starting health for every bond/chunk. A bullet's per-hit damage is a
 // fraction of this, so a joint takes several hits before it lets go.
 constexpr float kBondHealth = 1.0f;
+// Starting health for bonds and chunks of objective geometry (the comm tower).
+// Deliberately enormous relative to kBondHealth: no accumulation of stray rifle
+// fire, blast fractions or debris impacts can ever drain it, while the authored
+// demolition is unaffected because it severs chunks outright instead of damaging
+// them. Kept separate from kBondHealth so ordinary destructibles stay tunable.
+constexpr float kProtectedBondHealth = 90000.0f;
 TkFramework* SharedTkFramework = nullptr;
 uint32_t SharedTkFrameworkUsers = 0;
 
@@ -316,6 +322,11 @@ struct DestructionDX12::Impl {
         int plankGroup = -1;
         bool glass = false;    // window pane cell: any hit shatters the whole pane
         bool sheet = false;    // corrugated roof sheet: a hit tears the whole sheet off
+        // Objective geometry (the comm tower): immune to *indirect* damage, so a
+        // helicopter crashing beside it or a barrel chain going off cannot bring
+        // it down. Only an explicit DestroyChunkAt/ApplyRadialDamage from the
+        // player's own hit gets through -- see kProtectedChunkPrefix.
+        bool protectedChunk = false;
         uint32_t structureId = 0;
     };
 
@@ -1223,6 +1234,12 @@ struct DestructionDX12::Impl {
                 }
                 chunk.glass = sourceChunk->name.rfind("Glass@", 0) == 0;
                 chunk.sheet = sourceChunk->name.rfind("Roof@", 0) == 0;
+                // Objective pieces opt out of indirect damage by name. The
+                // prefix survives the Support:/@group decorations above, so a
+                // protected support chunk still reads as both.
+                chunk.protectedChunk =
+                    sourceChunk->name.find(ProtectedChunkMarker) !=
+                    std::string::npos;
                 const bool simpleRoofBox = sourceChunk->name.rfind("ImportedRoof@", 0) == 0;
                 chunk.minimum = { FLT_MAX, FLT_MAX, FLT_MAX };
                 chunk.maximum = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
@@ -1457,8 +1474,15 @@ struct DestructionDX12::Impl {
             // stubs and cladding edges framing the window). Normal and area are
             // nominal: these bonds are only ever severed outright and bond
             // healths are uniform anyway.
+            // Objective geometry (the comm-tower mast) is sliced into stacked
+            // bands, and its long diagonal lattice braces stretch each band's
+            // AABB past its own slice. Neighbouring bands therefore interpenetrate
+            // instead of meeting flush, and the seam test below rejects them --
+            // leaving mast sections with no bonds at all. Bond protected chunks
+            // that touch, on the same reasoning as the same-plank case above.
             if ((ca.plankGroup >= 0 && ca.plankGroup == cb.plankGroup) ||
-                ca.glass || cb.glass) {
+                ca.glass || cb.glass ||
+                (ca.protectedChunk && cb.protectedChunk)) {
                 float nx = cb.center.x - ca.center.x, ny = cb.center.y - ca.center.y,
                       nz = cb.center.z - ca.center.z;
                 const float distSq = nx * nx + ny * ny + nz * nz;
@@ -1556,6 +1580,21 @@ struct DestructionDX12::Impl {
         // near-zero health and shatter the whole house in one shot.
         std::vector<float> bondHealths(bonds.size(), kBondHealth);
         std::vector<float> chunkHealths(chunks.size(), kBondHealth);
+        // Objective geometry holds together far harder than ordinary structure.
+        // Scoped to protected chunks on purpose: kBondHealth is the global seed
+        // every damage value is authored as a fraction of, so raising *it* would
+        // make every house, wall and barrel on the level indestructible. Only
+        // the authorised demolition severs these, and it cuts chunks outright
+        // through DestroyChunkAt(allowProtected=true) rather than draining bonds.
+        // bondPairs is built in the same order as bonds, so indices match.
+        for (size_t i = 0; i < bondHealths.size() && i < bondPairs.size(); ++i) {
+            const uint32_t a = bondPairs[i].a, b = bondPairs[i].b;
+            if (a < chunks.size() && b < chunks.size() &&
+                chunks[a].protectedChunk && chunks[b].protectedChunk)
+                bondHealths[i] = kProtectedBondHealth;
+        }
+        for (size_t i = 0; i < chunkHealths.size() && i < chunks.size(); ++i)
+            if (chunks[i].protectedChunk) chunkHealths[i] = kProtectedBondHealth;
         TkActorDesc actorDesc(asset);
         actorDesc.initialBondHealths = bondHealths.empty() ? nullptr : bondHealths.data();
         actorDesc.initialSupportChunkHealths = chunkHealths.empty() ? nullptr : chunkHealths.data();
@@ -2329,11 +2368,18 @@ struct DestructionDX12::Impl {
         }
     }
 
+    // `includeProtected` is the opt-out for objective geometry. It defaults to
+    // false so that every path -- including ones added later -- spares protected
+    // chunks unless it deliberately says otherwise. Note this is the opposite
+    // polarity to the public ApplyRadialDamage(..., sparesProtected): that one
+    // describes a direct player hit and defaults to "allowed through", while this
+    // internal sink defaults to "denied".
     bool FindNearestBreakableCell(const XMFLOAT3& worldPosition,
                                   ActorRuntime*& hitActor,
                                   uint32_t& hitChunk,
                                   bool includeSupport = false,
-                                  bool includeSingle = false) {
+                                  bool includeSingle = false,
+                                  bool includeProtected = false) {
         hitActor = nullptr;
         hitChunk = InvalidIndex;
         float bestDistanceSquared = FLT_MAX;
@@ -2345,6 +2391,17 @@ struct DestructionDX12::Impl {
                                     local.z + runtime->center.z);
             for (uint32_t chunkIndex : runtime->chunks) {
                 const Chunk& chunk = chunks[chunkIndex];
+                // Skipped *during* the search rather than rejected after it, so
+                // objective geometry is transparent to indirect damage: an impact
+                // beside the comm tower still fractures the house behind it. Post-
+                // rejecting would make the tower project a "destruction shadow" in
+                // which nothing nearby could break at all.
+                //
+                // Deliberately asymmetric with the `support` filter below, which
+                // *does* post-reject: a blow landing on a foundation is absorbed by
+                // it, which is the desired physical read. Here the blow must pass
+                // through. Different semantics, different placement.
+                if (!includeProtected && chunk.protectedChunk) continue;
                 const float x = std::max(chunk.minimum.x, std::min(modelHit.x, chunk.maximum.x));
                 const float y = std::max(chunk.minimum.y, std::min(modelHit.y, chunk.maximum.y));
                 const float z = std::max(chunk.minimum.z, std::min(modelHit.z, chunk.maximum.z));
@@ -2367,11 +2424,13 @@ struct DestructionDX12::Impl {
     // so it splits off. Shared by bullet strikes and physics-impact damage.
     // Caller marks the structural graph dirty and rebuilds render items.
     bool BreakNearestCell(const XMFLOAT3& worldPosition,
-                          bool includeSupport = false) {
+                          bool includeSupport = false,
+                          bool includeProtected = false) {
         ActorRuntime* hitActor = nullptr;
         uint32_t hitChunk = InvalidIndex;
         if (!FindNearestBreakableCell(
-                worldPosition, hitActor, hitChunk, includeSupport)) return false;
+                worldPosition, hitActor, hitChunk, includeSupport,
+                /*includeSingle=*/false, includeProtected)) return false;
         lastBrokenStructure = chunks[hitChunk].structureId;
         if (hitActor->debrisCleanupEligible) {
             WakeDebris(*hitActor);
@@ -2504,6 +2563,14 @@ struct DestructionDX12::Impl {
     }
 
     void IgniteChunk(uint32_t chunkIndex, float life = 3.0f) {
+        // Objective geometry never catches fire. This is the single funnel for
+        // fire spread, IgniteChunkAt, and any future ignition source, so one
+        // guard covers them all. It matters beyond the visual: a burning chunk
+        // feeds UpdateBurningChunks, which calls BreakNearestCell from that
+        // chunk's own position -- which would then chew on whatever neighbouring
+        // chunk is next-nearest once the sink starts sparing this one.
+        if (chunkIndex < chunks.size() && chunks[chunkIndex].protectedChunk)
+            return;
         for (BurningChunk& burning : burningChunks) {
             if (burning.chunkIndex != chunkIndex) continue;
             burning.life = (std::max)(burning.life, life);
@@ -2625,6 +2692,12 @@ struct DestructionDX12::Impl {
                 std::unordered_map<int, uint32_t> externalGroupBonds;
                 std::unordered_set<int> actorGroups;
                 for (uint32_t chunkIndex : runtime->chunks) {
+                    // Objective geometry never enters the group-isolation rule
+                    // below. Each comm-tower band is its own single-chunk group,
+                    // so every bond it has counts as external, and a vertical
+                    // chain always fails the >= 2 test -- which would peel the
+                    // mast apart from the top down without a shot being fired.
+                    if (chunks[chunkIndex].protectedChunk) continue;
                     const int plankGroup = chunks[chunkIndex].plankGroup;
                     if (plankGroup >= 0) actorGroups.insert(plankGroup);
                 }
@@ -3501,7 +3574,51 @@ bool DestructionDX12::HitTestSegment(const XMFLOAT3& worldStart, const XMFLOAT3&
     return hit;
 }
 
-void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float radius, float damage) {
+bool DestructionDX12::IsMetalSheetAt(const XMFLOAT3& worldPosition) const {
+    if (!m->initialized) return false;
+    // Prefer the chunk the last segment test already resolved: it is the exact
+    // cell the bullet struck, and it costs nothing to reuse. A ragdoll hit
+    // clears it to InvalidIndex, which correctly reports "not metal".
+    if (m->lastRagdollHit >= 0) return false;
+    if (m->lastHitChunk != InvalidIndex &&
+        m->lastHitChunk < m->chunks.size())
+        return m->chunks[m->lastHitChunk].sheet;
+
+    // No cached hit (explosion, fire, or a caller that never ran a segment
+    // test): fall back to the nearest cell at this point. Sees protected chunks
+    // because this is a material query, not damage -- it must describe the world
+    // as it is.
+    Impl::ActorRuntime* hitActor = nullptr;
+    uint32_t hitChunk = InvalidIndex;
+    if (!m->FindNearestBreakableCell(worldPosition, hitActor, hitChunk,
+                                     true, true, /*includeProtected=*/true))
+        return false;
+    return hitChunk < m->chunks.size() && m->chunks[hitChunk].sheet;
+}
+
+bool DestructionDX12::IsProtectedChunkAt(const XMFLOAT3& worldPosition) const {
+    if (!m->initialized) return false;
+    if (m->lastRagdollHit >= 0) return false;
+    // Prefer the chunk the last segment test resolved -- the exact cell the
+    // bullet struck -- and fall back to the nearest cell for callers that ran no
+    // segment test.
+    if (m->lastHitChunk != InvalidIndex &&
+        m->lastHitChunk < m->chunks.size())
+        return m->chunks[m->lastHitChunk].protectedChunk;
+    Impl::ActorRuntime* hitActor = nullptr;
+    uint32_t hitChunk = InvalidIndex;
+    // Must see protected chunks or this inverts: the answer below *is* "was the
+    // found chunk protected", so a search that skipped them could only ever
+    // return false, silently disabling the caller-side gate that stops bullets
+    // damaging the tower.
+    if (!m->FindNearestBreakableCell(worldPosition, hitActor, hitChunk,
+                                     true, true, /*includeProtected=*/true))
+        return false;
+    return hitChunk < m->chunks.size() && m->chunks[hitChunk].protectedChunk;
+}
+
+void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float radius,
+                                        float damage, bool sparesProtected) {
     if (!m->initialized) return;
     // Bullet struck a person, not a Blast chunk. Preserve building bonds.
     if (m->lastRagdollHit >= 0) return;
@@ -3512,6 +3629,10 @@ void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float rad
     Impl::ActorRuntime* hitActor = nullptr;
     uint32_t hitChunk = InvalidIndex;
     if (!m->FindNearestBreakableCell(worldPosition, hitActor, hitChunk)) return;
+    // Indirect damage (spreading fire, debris impacts) leaves objective
+    // geometry alone; a direct player hit does not pass this flag.
+    if (sparesProtected && hitChunk < m->chunks.size() &&
+        m->chunks[hitChunk].protectedChunk) return;
     const bool highEnergy = damage >= 2.0f;
     if (!highEnergy && m->bulletWeakenedChunks.insert(hitChunk).second) {
         std::cout << "Blast hit: chunk weakened\n";
@@ -3552,6 +3673,9 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
         for (uint32_t chunkIndex : runtime->chunks) {
             const Impl::Chunk& chunk = m->chunks[chunkIndex];
             if (chunk.support) continue;  // anchored pieces resist the blast
+            // Objective geometry ignores blasts entirely: a helicopter crashing
+            // at its feet or a barrel chain next to it must not fell it.
+            if (chunk.protectedChunk) continue;
             const float dx = chunk.center.x - modelHit.x;
             const float dy = chunk.center.y - modelHit.y;
             const float dz = chunk.center.z - modelHit.z;
@@ -3611,15 +3735,76 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
     std::cout << "Grenade: actors " << actorsBefore << " -> " << m->actors.size() << "\n";
 }
 
-void DestructionDX12::DestroyChunkAt(const XMFLOAT3& worldPosition, float radius) {
+void DestructionDX12::ReleaseProtectedChunks(const XMFLOAT3& worldPosition,
+                                             float radius) {
+    if (!m->initialized) return;
+    const float radiusSquared = radius * radius;
+
+    // Pass 1: strip protection in world space. Chunk bounds live in destruction
+    // model space, which for the baked tower bands is world space (they are
+    // appended with the vertex bake already applied), so a direct centre test is
+    // the right measure here. Dropping `support` on the base band matters as
+    // much as clearing the marker: an anchored chunk resists blasts and is never
+    // auto-dropped, so leaving it set would keep the stump rooted.
+    std::unordered_set<uint32_t> released;
+    for (uint32_t chunkIndex = 0; chunkIndex < m->chunks.size(); ++chunkIndex) {
+        Impl::Chunk& chunk = m->chunks[chunkIndex];
+        if (!chunk.protectedChunk) continue;
+        const float dx = chunk.center.x - worldPosition.x;
+        const float dy = chunk.center.y - worldPosition.y;
+        const float dz = chunk.center.z - worldPosition.z;
+        if (dx * dx + dy * dy + dz * dz > radiusSquared) continue;
+        chunk.protectedChunk = false;
+        chunk.support = false;
+        released.insert(chunkIndex);
+    }
+    if (released.empty()) return;
+
+    // Pass 2: sever them. Protected bonds were seeded at kProtectedBondHealth,
+    // and clearing the flag does not lower health Blast already holds, so bond
+    // damage would not touch them -- isolate the chunks outright instead, the
+    // same way ApplyExplosion frees a sphere of a building.
+    std::list<std::vector<uint8_t>> masks;
+    std::list<IsolateChunksParams> paramStore;
+    std::unordered_set<uint32_t> damagedStructures;
+    const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
+    for (auto& runtime : m->actors) {
+        if (!runtime->actor) continue;
+        std::vector<uint8_t> mask(m->chunks.size() + 1, 0);  // asset chunk index; 0 = root
+        bool marked = false;
+        for (uint32_t chunkIndex : runtime->chunks) {
+            if (released.count(chunkIndex) == 0) continue;
+            mask[chunkIndex + 1] = 1;
+            marked = true;
+            damagedStructures.insert(m->chunks[chunkIndex].structureId);
+        }
+        if (marked) {
+            masks.push_back(std::move(mask));
+            paramStore.push_back({ masks.back().data(),
+                                   (uint32_t)masks.back().size() });
+            runtime->actor->damage(isolate, &paramStore.back());
+        }
+    }
+    m->group->process();
+    for (uint32_t structureId : damagedStructures)
+        m->MarkStructureDirty(structureId);
+    m->RebuildRenderItems();
+}
+
+void DestructionDX12::DestroyChunkAt(const XMFLOAT3& worldPosition, float radius,
+                                     bool allowProtected) {
     if (!m->initialized || m->lastRagdollHit >= 0) return;
     m->lastDamagePosition = worldPosition;
     m->lastDamageRadius = radius;
 
     Impl::ActorRuntime* hitActor = nullptr;
     uint32_t hitChunk = InvalidIndex;
+    // Only an authorised demolition reaches protected geometry. Every other
+    // caller (the laser cut in particular) leaves allowProtected false and so
+    // cannot touch a comm tower's chunks at all.
     if (!m->FindNearestBreakableCell(
-            worldPosition, hitActor, hitChunk, true, true)) return;
+            worldPosition, hitActor, hitChunk, true, true,
+            allowProtected)) return;
     m->bulletWeakenedChunks.erase(hitChunk);
     const uint32_t structureId = m->chunks[hitChunk].structureId;
 
@@ -3637,7 +3822,11 @@ void DestructionDX12::DestroyChunkAt(const XMFLOAT3& worldPosition, float radius
         }
         m->actors.erase(runtime);
     } else {
-        m->BreakNearestCell(worldPosition, true);
+        // Must carry the same permission: the find above may have resolved a
+        // protected chunk, and a default-spared break here would leave the mast
+        // standing through its own demolition on every band that is not a
+        // single-chunk actor.
+        m->BreakNearestCell(worldPosition, true, allowProtected);
     }
     m->MarkStructureDirty(structureId);
     m->RebuildRenderItems();
@@ -3691,6 +3880,12 @@ void DestructionDX12::StartVortex(const XMFLOAT3& worldPosition, float radius,
         bool actorMarked = false;
         for (uint32_t chunkIndex : runtime->chunks) {
             Impl::Chunk& chunk = m->chunks[chunkIndex];
+            // Objective geometry resists the vortex outright. This must precede
+            // the support demotion below: clearing `support` is permanent, so a
+            // single overlapping vortex would otherwise leave the comm tower
+            // unanchored for the rest of the run and topple it on the next
+            // structural pass -- long after the grenade went off.
+            if (chunk.protectedChunk) continue;
             if (!SphereAabb(modelCenter, radius,
                             chunk.minimum, chunk.maximum)) continue;
             mask[chunkIndex + 1] = 1;

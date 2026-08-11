@@ -117,8 +117,9 @@ std::vector<std::string> ValidateImportedModel(
     static std::mutex cacheMutex;
     static std::unordered_map<std::string, std::vector<std::string>> cache;
     std::error_code error;
+    const uintmax_t fileSize = std::filesystem::file_size(path, error);
     const std::string key = Generic(path) + ':' +
-        std::to_string(std::filesystem::file_size(path, error)) + ':' +
+        std::to_string(fileSize) + ':' +
         std::to_string(std::filesystem::last_write_time(path, error)
             .time_since_epoch().count());
     {
@@ -127,6 +128,21 @@ std::vector<std::string> ValidateImportedModel(
         if (found != cache.end()) return found->second;
     }
     std::vector<std::string> warnings;
+    // These findings are advisory (triangle budget, missing UVs, missing
+    // textures) but the check costs a full Assimp import of the mesh. This runs
+    // for every model in Content/Models on a cache miss, on the main thread,
+    // while the editor is mid-frame -- and this tree holds several 80-128 MB
+    // assets, which together stalled the editor for over a second. Anything past
+    // the budget is skipped rather than allowed to block interaction: an
+    // oversized model is exactly the case the warning would have flagged anyway.
+    constexpr uintmax_t kMaxValidationBytes = 32ull * 1024ull * 1024ull;
+    if (!error && fileSize > kMaxValidationBytes) {
+        warnings.push_back("Model too large to validate inline (" +
+            std::to_string(fileSize / (1024ull * 1024ull)) + " MB)");
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        cache[key] = warnings;
+        return warnings;
+    }
     Assimp::Importer importer;
     const aiScene* scene = importer.ReadFile(path.string(), aiProcess_Triangulate);
     if (!scene || !scene->HasMeshes()) {

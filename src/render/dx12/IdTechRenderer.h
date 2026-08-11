@@ -320,6 +320,13 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items
                 true, MAT_CUBE, false });
     }
 
+    // Rappel rope links. This path carries no shape enum, only isCube, so the
+    // links draw as boxes here rather than capsules -- they are thin enough that
+    // the difference does not read at rappel distance.
+    for (const RopeItem& link : BlackHawkRopeItems())
+        items.push_back({ XMLoadFloat4x4(&link.transform), link.color,
+            true, MAT_CUBE, false });
+
     if (!g_emptyLevelMode && g_humveeModel) {
         AppendOpaqueSceneNodeDrawItems(g_humveeModel, HumveeWorldMatrix(), items);
         if (g_stressTestMode)

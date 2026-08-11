@@ -194,6 +194,28 @@ int main() {
         unsafe.modelPath = "../outside.glb";
         CHECK(!PrefabRegistry::Save(unsafe, "prefabs/unsafe.json").ok);
     }
+
+    // The shipped prefabs, loaded from the real content tree. A prefab whose
+    // model file is missing is dropped silently (see test/missing above), so a
+    // typo in a path or a moved asset would otherwise only show up as a prop
+    // that quietly fails to appear in the level.
+    if (const char* sourceDir = SGE_SOURCE_DIR) {
+        ScopedCurrentPath current(sourceDir);
+        PrefabRegistry shipped;
+        shipped.Refresh("Content/Prefabs", "Content/Models");
+
+        const PrefabAsset* tower = shipped.Find("props/comm_tower");
+        CHECK(tower != nullptr);
+        if (tower) {
+            CHECK(tower->error.empty());
+            CHECK(tower->collision != "none");        // else bullets pass through
+            CHECK(tower->destructible.enabled);
+            CHECK(tower->destructible.health > 0.0f);
+            CHECK(tower->targetSize > 0.0f);
+            CHECK(std::filesystem::exists(tower->modelPath));
+        }
+    }
+
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
     return failures ? 1 : 0;

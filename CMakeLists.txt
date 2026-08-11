@@ -381,6 +381,10 @@ if(BUILD_TESTING)
     add_executable(PrefabRegistryTests
         tests/PrefabRegistryTests.cpp
         src/assets/prefabs/PrefabRegistry.cpp)
+    # Lets the test reach the real Content/ tree to validate shipped prefabs,
+    # independent of the working directory ctest happens to run it from.
+    target_compile_definitions(PrefabRegistryTests PRIVATE
+        SGE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(PrefabRegistryTests PRIVATE
         SGEProjectHeaders nlohmann_json::nlohmann_json assimp::assimp)
     add_test(NAME PrefabRegistryTests COMMAND PrefabRegistryTests)

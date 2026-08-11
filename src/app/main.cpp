@@ -83,6 +83,7 @@
 #include "CombatSystem.h"
 #include "EnemySystem.h"
 #include "VehicleSystem.h"
+#include "RopeSwing.h"
 #include "DeploymentPlanner.h"
 #include "GameRuntime.h"
 #include "DeferredReleaseQueue.h"
@@ -182,6 +183,14 @@ static PrefabRegistry       g_prefabRegistry;
 // prefab lookup misses.
 static const std::filesystem::path kPrefabRoot = "Content/Prefabs";
 static const std::filesystem::path kModelRoot = "Content/Models";
+// The comm tower is a steel lattice ~26 m tall, so it neither sounds nor dies
+// like the rocks that share the prefab path: bullets ring off it, and bringing it
+// down is a landmark event rather than a puff of dust. Identified by prefab id so
+// no new entity type or engine plumbing is needed.
+static constexpr const char* kCommTowerPrefabId = "props/comm_tower";
+// Defined with the prefab damage code further down; needed earlier by the
+// burning-material tick, which must not let fire fell a player objective.
+static bool FindCommTower(uint64_t entityId, DirectX::XMFLOAT3& base);
 static AssetRegistry        g_assetRegistry;
 static AssetWatcher         g_assetWatcher;
 struct PrefabModelCacheEntry {
@@ -328,6 +337,14 @@ struct PendingExplosionAudio {
 };
 std::vector<PendingExplosionAudio> g_pendingExplosionAudio;
 GunAudio                    g_hitAudio;
+// Bullet striking sheet metal: enemy fire hitting a vehicle hull, or the
+// player's rounds hitting a metal roof. Pitch is randomised per shot so a
+// sustained burst does not sound like one sample retriggering.
+GunAudio                    g_metalHitAudio;
+// Metal-hit pitch window. Randomised per shot inside this range so a sustained
+// burst reads as many separate impacts rather than one sample retriggering.
+static constexpr float      kMetalHitPitchMin = 0.80f;
+static constexpr float      kMetalHitPitchMax = 1.00f;
 GunAudio                    g_banditSpottedAudio1;
 GunAudio                    g_banditSpottedAudio2;
 GunAudio                    g_banditAttackAudio;
@@ -714,13 +731,128 @@ bool BlackHawkRappelActive() {
     return g_game.vehicles.BlackHawkIsRappelling();
 }
 
+// The rappel rope's box3d world. Owned here rather than in VehicleSystem so that
+// header stays free of box3d -- see the forward declaration in VehicleSystem.h.
+// vehicles.blackHawkRope points at this while a rope is out and is null the rest
+// of the time, which is what every rope call site tests.
+static RopeSwing g_blackHawkRope;
+
+// Hangs the rope from the aircraft's anchor, long enough to reach the ground from
+// the hover height. Link count follows the actual gap rather than RopeSwing's
+// 3 m default, which would leave the rope dangling well short of the terrain.
+static void SpawnBlackHawkRope() {
+    VehicleSystem& vehicles = g_game.vehicles;
+    const XMFLOAT3 anchor = vehicles.BlackHawkRopeAnchorPosition();
+    // Reach from the anchor to the ground, with a little slack so the bottom of
+    // the rope lies on the terrain instead of stopping taut above it.
+    const float drop = (std::max)(2.0f,
+        anchor.y - vehicles.blackHawkGroundY) * 1.08f;
+    // Fewer, longer links: every extra ball joint is more constraint error for
+    // the solver, and RopeSwing's own notes prefer length over count.
+    constexpr float kTargetLinkLength = 1.5f;
+    const int linkCount = (std::max)(4, (std::min)(14,
+        (int)std::lround(drop / kTargetLinkLength)));
+    const float linkLength = drop / (float)linkCount;
+
+    g_blackHawkRope.SetGroundY(vehicles.blackHawkGroundY);
+    g_blackHawkRope.Initialize(anchor, linkCount, linkLength, 0.0f,
+                               RopeSwing::Payload::None);
+    vehicles.blackHawkRope = &g_blackHawkRope;
+}
+
+static void ReleaseBlackHawkRope() {
+    g_blackHawkRope.Shutdown();
+    g_game.vehicles.blackHawkRope = nullptr;
+}
+
+// Drawable rope links for the renderers, which are separate translation units
+// and cannot see g_blackHawkRope directly. Empty while no rope is out.
+const std::vector<RopeItem>& BlackHawkRopeItems() {
+    static const std::vector<RopeItem> kNone;
+    return g_game.vehicles.blackHawkRope ? g_blackHawkRope.GetItems() : kNone;
+}
+
+// Services the rope requests VehicleSystem raises, and steps the simulation.
+// Runs straight after UpdateBlackHawk so the rope sees the pose it was just
+// given, and before the player is placed from it.
+static void UpdateBlackHawkRope(float deltaTime) {
+    VehicleSystem& vehicles = g_game.vehicles;
+
+    if (vehicles.blackHawkRopeReleaseRequested) {
+        vehicles.blackHawkRopeReleaseRequested = false;
+        ReleaseBlackHawkRope();
+    }
+    if (vehicles.blackHawkRopeSpawnRequested) {
+        vehicles.blackHawkRopeSpawnRequested = false;
+        SpawnBlackHawkRope();
+    }
+    if (!vehicles.blackHawkRope) return;
+
+    g_blackHawkRope.Update(deltaTime);
+
+    // A severed rope is kept alive only long enough to be seen falling.
+    if (vehicles.blackHawkRopeCut && g_blackHawkRope.CutSectionSettled())
+        ReleaseBlackHawkRope();
+}
+
+// The rope has been shot through with the player on it. Hands them from the
+// rope to ordinary falling movement and charges them for the drop.
+//
+// Deliberately does NOT tear the rope down: the severed section keeps simulating
+// so the break is visible, and UpdateBlackHawkRope releases it once it settles.
+// The player must have a position on every frame of this handover -- the rope
+// supplies it up to the cut, gravity from the cut on, and neither leaves a gap.
+static void HandleBlackHawkRopeCut() {
+    VehicleSystem& vehicles = g_game.vehicles;
+    if (!vehicles.NotifyBlackHawkRopeCut()) return;
+
+    // Height still to fall, from wherever on the rope they had got to.
+    const float remaining = (std::max)(0.0f,
+        scene.camera.Position.y - scene.camera.PlayerHeight -
+        vehicles.blackHawkGroundY);
+
+    // Hand over to gravity. Seeding the descent rate rather than starting from
+    // rest keeps the fall continuous instead of hitching at the cut.
+    scene.camera.IsGrounded = false;
+    scene.camera.VerticalVelocity =
+        -(VehicleSystem::BlackHawkRappelHoverHeight /
+          VehicleSystem::BlackHawkRappelTime);
+
+    // Scaled by how far there was left to fall, so a cut just above the ground
+    // barely stings and one straight out of the door hurts.
+    constexpr float kSafeFall = 3.0f;      // free below this
+    constexpr float kDamagePerMetre = 7.5f;
+    if (remaining > kSafeFall)
+        scene.DamagePlayer((remaining - kSafeFall) * kDamagePerMetre);
+
+    std::cout << "BlackHawk rappel rope cut at progress "
+              << vehicles.blackHawkRopeCutProgress << ", "
+              << remaining << " m to fall\n";
+}
+
 XMFLOAT3 BlackHawkRappelPlayerWorldPosition() {
     const VehicleSystem& vehicles = g_game.vehicles;
-    const XMFLOAT3 anchor = vehicles.BlackHawkRidePosition();
-    const float groundCentre =
-        vehicles.blackHawkGroundY + scene.camera.PlayerHeight * 0.5f;
     const float progress = (std::max)(0.0f, (std::min)(
         1.0f, vehicles.blackHawkRappelProgress));
+
+    // Ride the live rope when there is one, so the player swings with it in X and
+    // Z instead of sliding down a straight line. PositionAlongRope returns the
+    // player's centre, which is what the caller lifts to eye height.
+    if (vehicles.blackHawkRope && !vehicles.blackHawkRopeCut) {
+        const XMFLOAT3 onRope = vehicles.blackHawkRope->PositionAlongRope(progress);
+        // Never let the rope drive the player below standing height on the
+        // terrain: the chain's bottom tip rests slightly into the ground plane.
+        const float floorCentre =
+            vehicles.blackHawkGroundY + scene.camera.PlayerHeight * 0.5f;
+        return { onRope.x, (std::max)(floorCentre, onRope.y), onRope.z };
+    }
+
+    // No rope (or it has been cut): fall back to the original straight-line
+    // descent from the anchor, which is also what a model with no rope anchor and
+    // a build with the rope disabled will use.
+    const XMFLOAT3 anchor = vehicles.BlackHawkRopeAnchorPosition();
+    const float groundCentre =
+        vehicles.blackHawkGroundY + scene.camera.PlayerHeight * 0.5f;
     return { anchor.x,
              anchor.y + (groundCentre - anchor.y) * progress,
              anchor.z };
@@ -836,6 +968,14 @@ D3D12_GPU_VIRTUAL_ADDRESS UploadBlackHawkPalette() {
 // of the aircraft.
 static void RidePlayerInBlackHawk() {
     VehicleSystem& vehicles = g_game.vehicles;
+    // A cut rope means the player is already falling under their own gravity.
+    // Pinning the camera here would suspend them in mid-air and undo the cut, so
+    // the ride code stands aside and lets the normal fall carry on.
+    if (vehicles.blackHawkRopeCut && !vehicles.blackHawkCarryingPlayer &&
+        !vehicles.blackHawkDroppedPlayer) {
+        vehicles.blackHawkBailedOut = false;
+        return;
+    }
     if (vehicles.blackHawkCarryingPlayer) {
         // The attach point is the player's centre, but the camera is the eye,
         // which rides PlayerHeight above the feet -- so lift by half a body to
@@ -918,6 +1058,25 @@ static void RidePlayerInBlackHawk() {
 static LevelInsertionMode ResolvedInsertionMode() {
     return g_playerInsertionChoice;
 }
+
+// Bullet-on-sheet-metal impact, attenuated by distance from the ear and pitched
+// randomly within the metal-hit window. Shared by the vehicle-hull and
+// metal-roof hits so both sound like the same material being struck.
+static void PlayMetalHitAudio(const XMFLOAT3& position, float volumeScale = 1.0f) {
+    const float dx = position.x - scene.camera.Position.x;
+    const float dy = position.y - scene.camera.Position.y;
+    const float dz = position.z - scene.camera.Position.z;
+    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    // Sheet metal rings; audible a good way off, but not across the island.
+    constexpr float kReach = 65.0f;
+    const float volume = (std::max)(0.0f, 1.0f - distance / kReach) * volumeScale;
+    if (volume <= 0.01f) return;
+    const float pitch = kMetalHitPitchMin +
+        ((float)std::rand() / (float)RAND_MAX) *
+            (kMetalHitPitchMax - kMetalHitPitchMin);
+    g_metalHitAudio.Play(volume, pitch);
+}
+
 
 static void BeginDeploymentPlanning() {
     auto params = CurrentTerrainParams();
@@ -1256,6 +1415,47 @@ static void ConfigureBlackHawkRideFromModel() {
               << " -> side " << vehicles.blackHawkRideSide << ", forward "
               << vehicles.blackHawkRideForward << ", height "
               << vehicles.blackHawkRideHeight << "\n";
+}
+
+// Ties the rappel rope to the "RopeAnchor" empty authored in the GLB, so the
+// rope hangs from the door frame rather than from the seat. Same mesh-space to
+// aircraft-local conversion as ConfigureBlackHawkRideFromModel, and the same
+// ordering requirement: must run after ConfigureBlackHawkBounds.
+//
+// With no such node the rope falls back to the ride point, which is inside the
+// cabin -- close enough to look right on a model that was never authored for
+// this, and blackHawkRopeAnchorValid records that the fallback is in use.
+static void ConfigureBlackHawkRopeAnchorFromModel() {
+    if (!g_blackHawkModel) return;
+    VehicleSystem& vehicles = g_game.vehicles;
+
+    std::shared_ptr<SceneNode> anchor =
+        FindNodeByName(g_blackHawkModel, "RopeAnchor");
+    if (!anchor) {
+        vehicles.blackHawkRopeSide = vehicles.blackHawkRideSide;
+        vehicles.blackHawkRopeForward = vehicles.blackHawkRideForward;
+        vehicles.blackHawkRopeHeight = vehicles.blackHawkRideHeight;
+        vehicles.blackHawkRopeAnchorValid = false;
+        return;
+    }
+
+    g_blackHawkModel->RefreshHierarchy();
+    XMFLOAT3 meshPosition{};
+    XMStoreFloat3(&meshPosition,
+                  XMVector3TransformCoord(
+                      XMVectorZero(), XMLoadFloat4x4(&anchor->globalTransform)));
+
+    vehicles.blackHawkRopeSide =
+        (meshPosition.x - g_blackHawkModelCenter.x) * g_blackHawkModelScale;
+    vehicles.blackHawkRopeForward =
+        (meshPosition.z - g_blackHawkModelCenter.z) * g_blackHawkModelScale;
+    vehicles.blackHawkRopeHeight =
+        (meshPosition.y - g_blackHawkModelMinY) * g_blackHawkModelScale;
+    vehicles.blackHawkRopeAnchorValid = true;
+
+    std::cout << "BlackHawk RopeAnchor -> side " << vehicles.blackHawkRopeSide
+              << ", forward " << vehicles.blackHawkRopeForward
+              << ", height " << vehicles.blackHawkRopeHeight << "\n";
 }
 
 // Depth-first search for the first node carrying a mesh.
@@ -1660,6 +1860,44 @@ static void UpdateHelicopterRotorKills() {
             SecondaryHelicopterWorldMatrix(), g_secondaryHelicopterDead);
     }
     if (killed) PlayBanditDeathEvents();
+}
+
+// Battle-damage smoke on the enemy gunships, matching the insertion BlackHawk's
+// trail in UpdateBlackHawkCrashEffects: intermittent wisps at the threshold
+// building to a near-continuous plume near zero health, so an airframe about to
+// go down reads the same whichever aircraft it is.
+//
+// A crashed wreck stops trailing (its engine is gone) but a dead-and-still-
+// falling one keeps smoking all the way in, which is what sells the kill.
+static void UpdateEnemyHelicopterDamageSmoke(float deltaTime) {
+    if (!g_helicopterModel || !scene.showHelicopter) return;
+    const VehicleSystem& vehicles = g_game.vehicles;
+
+    const auto trail = [&](float severity, bool crashed, float& timer,
+                           const XMFLOAT3& position, float yaw) {
+        if (severity <= 0.0f || crashed) { timer = 0.0f; return; }
+        timer -= deltaTime;
+        if (timer > 0.0f) return;
+        timer = 0.34f - 0.29f * severity;
+        const float radius = 0.35f + 0.95f * severity;
+        const float intensity = 0.35f + 1.15f * severity;
+        // Off the engine deck, just aft of the model origin.
+        const float backX = -std::sin(yaw) * 0.6f;
+        const float backZ = -std::cos(yaw) * 0.6f;
+        scene.SpawnSmokeBurst({ position.x + backX, position.y + 1.1f,
+                                position.z + backZ }, radius, intensity);
+    };
+
+    static float primaryTimer = 0.0f;
+    trail(vehicles.HelicopterDamageSeverity(), g_helicopterCrashed,
+          primaryTimer, g_helicopterPosition, g_helicopterYaw);
+
+    if (g_stressTestMode) {
+        static float secondaryTimer = 0.0f;
+        trail(vehicles.SecondaryHelicopterDamageSeverity(),
+              g_secondaryHelicopterCrashed, secondaryTimer,
+              g_secondaryHelicopterPosition, g_secondaryHelicopterYaw);
+    }
 }
 
 static void UpdateHelicopter(float dt) {
@@ -3203,6 +3441,16 @@ static void UpdateMolotovFireDamage() {
             continue;
         }
         material->damageCooldown = tickSeconds;
+        // Fire spreads and burns unattended, so it is not a player action even
+        // when the player lit it. The comm tower is a player-only objective and
+        // must not burn down on its own; stop tracking it as a burning material.
+        {
+            XMFLOAT3 ignoredBase{};
+            if (FindCommTower(material->entityId, ignoredBase)) {
+                material = scene.burningMaterials.erase(material);
+                continue;
+            }
+        }
         const CombatSystem::PrefabDamageResult result =
             g_game.combat.DamagePrefab(
                 g_game.world, material->entityId,
@@ -3271,7 +3519,8 @@ static void UpdateMolotovFireDamage() {
                     fire.position.z };
                 g_destruction.ApplyRadialDamage(
                     materialHit, reach + 0.35f,
-                    scene.molotovMaterialDamagePerSecond * tickSeconds);
+                    scene.molotovMaterialDamagePerSecond * tickSeconds,
+                    /*sparesProtected=*/true);   // spreading fire is indirect
                 g_destruction.IgniteChunkAt(materialHit);
                 fire.structureDamageCooldown = 1.25f;
             }
@@ -3289,6 +3538,11 @@ static void UpdateMolotovFireDamage() {
                     std::abs(local.z) - collider.halfExtents.z, 0.0f);
                 if (outsideX * outsideX + outsideY * outsideY +
                     outsideZ * outsideZ > reach * reach) continue;
+                // Never set the comm tower alight: fire cannot damage it (it is
+                // a player-only objective), so burning it would only paint
+                // flames on a mast that never loses health.
+                XMFLOAT3 ignoredTowerBase{};
+                if (FindCommTower(collider.entityId, ignoredTowerBase)) continue;
                 const XMFLOAT3 flamePosition{
                     fire.position.x,
                     fire.position.y + 0.62f,
@@ -5021,10 +5275,18 @@ static void RebuildPrefabRenderBatches() {
     g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
     g_prefabAudioPlayers.clear();
     std::unordered_map<std::string, size_t> batches;
+    // `skipRenderBatch` suppresses only the drawing of an instance, leaving its
+    // collision, light, audio, destructible and spawner components registered
+    // like any other prefab's. The comm tower needs exactly that: it is drawn
+    // from its destruction chunks, so emitting a batch too would render the mast
+    // twice -- but skipping the whole instance (as this did before) also dropped
+    // its "destructible" health, which left DamagePrefab unable to find it and
+    // made the tower impervious to the C4 that is supposed to fell it.
     const auto addInstance = [&](const auto& self, const std::string& prefabId,
                                  const XMMATRIX& world, uint64_t entityId,
                                  const nlohmann::json& overrides,
-                                 unsigned depth) -> void {
+                                 unsigned depth,
+                                 bool skipRenderBatch = false) -> void {
         if (depth > 16) {
             SGE_LOG("LogPrefab", EngineLog::Level::Error,
                 "Prefab nesting depth exceeded at: " + prefabId);
@@ -5043,37 +5305,43 @@ static void RebuildPrefabRenderBatches() {
         const bool castShadow = components.contains("staticMesh")
             ? components.at("staticMesh").value("castShadow", prefab->castShadow)
             : prefab->castShadow;
-        const std::string batchKey = prefabId + (castShadow ? "#shadow" : "#noshadow");
-        size_t index = 0;
-        auto found = batches.find(batchKey);
-        if (found == batches.end()) {
-            index = g_prefabRenderBatches.size();
-            batches[batchKey] = index;
-            PrefabRenderBatch batch;
-            batch.prefabId = prefabId;
-            batch.model = cachedModel->model;
-            batch.baseModel = cachedModel->model;
-            batch.castShadow = castShadow;
-            for (size_t lodIndex = 0; lodIndex < prefab->lods.size(); ++lodIndex) {
-                PrefabAsset lodPrefab = *prefab;
-                lodPrefab.id = prefab->id + "#lod" + std::to_string(lodIndex);
-                lodPrefab.modelPath = prefab->lods[lodIndex].path;
-                lodPrefab.modelGuid = prefab->lods[lodIndex].assetGuid;
-                lodPrefab.lods.clear();
-                if (PrefabModelCacheEntry* lodModel = LoadPrefabModel(lodPrefab))
-                    batch.lods.push_back({ prefab->lods[lodIndex].distance,
-                                           lodModel->model });
-            }
-            g_prefabRenderBatches.push_back(std::move(batch));
-        } else index = found->second;
-        g_prefabRenderBatches[index].baseTransforms.push_back(world);
-        g_prefabRenderBatches[index].transforms.push_back(world);
-        g_prefabRenderBatches[index].entityIds.push_back(entityId);
+        if (!skipRenderBatch) {
+            const std::string batchKey =
+                prefabId + (castShadow ? "#shadow" : "#noshadow");
+            size_t index = 0;
+            auto found = batches.find(batchKey);
+            if (found == batches.end()) {
+                index = g_prefabRenderBatches.size();
+                batches[batchKey] = index;
+                PrefabRenderBatch batch;
+                batch.prefabId = prefabId;
+                batch.model = cachedModel->model;
+                batch.baseModel = cachedModel->model;
+                batch.castShadow = castShadow;
+                for (size_t lodIndex = 0; lodIndex < prefab->lods.size(); ++lodIndex) {
+                    PrefabAsset lodPrefab = *prefab;
+                    lodPrefab.id = prefab->id + "#lod" + std::to_string(lodIndex);
+                    lodPrefab.modelPath = prefab->lods[lodIndex].path;
+                    lodPrefab.modelGuid = prefab->lods[lodIndex].assetGuid;
+                    lodPrefab.lods.clear();
+                    if (PrefabModelCacheEntry* lodModel = LoadPrefabModel(lodPrefab))
+                        batch.lods.push_back({ prefab->lods[lodIndex].distance,
+                                               lodModel->model });
+                }
+                g_prefabRenderBatches.push_back(std::move(batch));
+            } else index = found->second;
+            g_prefabRenderBatches[index].baseTransforms.push_back(world);
+            g_prefabRenderBatches[index].transforms.push_back(world);
+            g_prefabRenderBatches[index].entityIds.push_back(entityId);
+        }
 
         const std::string collision = components.contains("collision")
             ? components.at("collision").value("shape", prefab->collision)
             : prefab->collision;
-        if (collision != "none") {
+        // An instance drawn by the destruction system owns its collision there
+        // too, as chunk geometry. Adding the prefab's bounds box on top would
+        // put a second, coarser collider around the same mast.
+        if (collision != "none" && !skipRenderBatch) {
             if (collision == "mesh" &&
                 g_prefabMeshFallbackWarnings.insert(prefabId).second) {
                 SGE_LOG("LogPrefab", EngineLog::Level::Warning,
@@ -5157,12 +5425,22 @@ static void RebuildPrefabRenderBatches() {
         if (entity.type == LevelEntityType::Prefab) prefabId = entity.prefabId;
         else if (entity.type == LevelEntityType::Rock) prefabId = "rock";
         else continue;
+        // Comm towers are baked into the destruction model instead
+        // (AppendCommTowersToDestruction), which draws their chunks. Emitting a
+        // prefab batch as well would render the mast twice -- and the intact
+        // copy would still be standing after the fractured one fell. Suppress
+        // only the drawing: skipping the instance outright also skipped its
+        // "destructible" registration, so the tower never entered the health map
+        // and DamagePrefab could not find it to damage at all.
+        const bool towerDrawnByDestruction =
+            prefabId == kCommTowerPrefabId && g_destruction.IsInitialized();
         const Transform& t = entity.transform;
         const XMMATRIX world = XMMatrixScaling(t.scale[0], t.scale[1], t.scale[2]) *
             XMMatrixRotationRollPitchYaw(XMConvertToRadians(t.rotation[0]),
                 XMConvertToRadians(t.rotation[1]), XMConvertToRadians(t.rotation[2])) *
             XMMatrixTranslation(t.position[0], t.position[1], t.position[2]);
-        addInstance(addInstance, prefabId, world, entity.id, entity.overrides, 0);
+        addInstance(addInstance, prefabId, world, entity.id, entity.overrides, 0,
+                    towerDrawnByDestruction);
     }
     if (g_ddgiCornellTestMode) {
         const bool createModel = !g_ddgiCornellModel;
@@ -6058,14 +6336,179 @@ static bool QueryBanditCover(const SkinnedEnemy& bandit,
     return found;
 }
 
+// Base position and height of a comm-tower entity, or false when the id is not
+// one. Height comes from the prefab's authored targetSize; the level transform
+// carries the base, since LoadPrefabModel grounds the mesh at local Y=0.
+static bool FindCommTower(uint64_t entityId, XMFLOAT3& base) {
+    for (const LevelEntity& entity : g_game.world.Level().entities) {
+        if (entity.id != entityId) continue;
+        if (entity.type != LevelEntityType::Prefab ||
+            entity.prefabId != kCommTowerPrefabId) return false;
+        base = { entity.transform.position[0], entity.transform.position[1],
+                 entity.transform.position[2] };
+        return true;
+    }
+    return false;
+}
+
+// Brings the tower down: a blast at the base, a column of smoke up the mast so
+// the collapse reads at distance, a crater, and a physics shove that knocks over
+// whatever is standing nearby. Reuses the barrel-grade FX rather than inventing
+// any new system -- there is no real fracture here, and this does not pretend
+// otherwise (see the note in the summary).
+static void CollapseCommTower(const XMFLOAT3& base) {
+    constexpr float kTowerHeight = 26.0f;   // matches prefab targetSize
+    const XMFLOAT3 mid(base.x, base.y + kTowerHeight * 0.45f, base.z);
+
+    scene.SpawnExplosionFX(XMFLOAT3(base.x, base.y + 1.2f, base.z), 8.0f, 1.0f);
+    // Dust climbing the mast: five bursts up the height, growing as they rise so
+    // the top of the tower is the last thing to disappear.
+    for (int step = 0; step < 5; ++step) {
+        const float t = (float)step / 4.0f;
+        scene.SpawnSmokeBurst(
+            XMFLOAT3(base.x, base.y + kTowerHeight * t, base.z),
+            1.1f + t * 1.5f, 1.2f + t * 1.1f);
+    }
+    AddExplosionTerrainCrater(base);
+    // Cut the mast's own chunks loose so the sections fall under Blast/Box3D
+    // rather than the mesh simply disappearing. The tower is drawn from these
+    // chunks, not from a prefab batch (RebuildPrefabRenderBatches skips it), so
+    // this -- not the prefab health hitting zero -- is what the player sees.
+    if (g_destruction.IsInitialized()) {
+        // The one authorised demolition: reached only after the tower's health
+        // was spent by a charge planted on it. Release the whole mast at once
+        // rather than walking DestroyChunkAt up it -- that call frees only the
+        // single nearest chunk, so six calls left half the twelve bands standing,
+        // and still protected, which meant standing forever. The sphere is
+        // centred halfway up so it covers the mast from base to mast head.
+        const XMFLOAT3 mastCenter(base.x, base.y + kTowerHeight * 0.5f, base.z);
+        g_destruction.ReleaseProtectedChunks(mastCenter, kTowerHeight * 0.5f + 4.0f);
+    }
+    // Shove the surroundings: nearby structures shed chunks, ragdolls and
+    // standing bandits are thrown clear.
+    g_destruction.ApplyExplosion(mid, 9.0f, 4.0f, 200.0f);
+    g_destruction.ApplyRagdollExplosion(mid, 9.0f, 130.0f);
+    for (const auto& bandit : g_bandits)
+        if (bandit) bandit->ApplyExplosion(base, 8.0f, 320.0f, 9.0f);
+    g_pendingExplosionAudio.push_back({ 0.0f, 1.0f, 0.72f, false });
+}
+
+// The comm tower is a player objective: only the player may bring it down.
+// Enemy rifle fire, enemy grenades, stray explosions, and spreading fire all
+// reach the same prefab-damage entry points, so without this the tower could
+// collapse on its own while the player was elsewhere -- and the mission would
+// credit them for destruction they never caused.
+//
+// Every damage source funnels through the two wrappers below plus the burning-
+// material tick, so gating those three covers bullets, blasts, and fire alike.
+// Live comm-tower health for the HUD readout. Reports the first enabled tower on
+// the level; false when there is none, so maps without one show no bar and a
+// felled tower's bar disappears with it.
+bool CommTowerObjectiveStatus(float& health, float& maxHealth) {
+    const PrefabRuntimeState& prefabs = g_game.world.Prefabs();
+    for (const LevelEntity& entity : g_game.world.Level().entities) {
+        if (!entity.enabled || entity.type != LevelEntityType::Prefab ||
+            entity.prefabId != kCommTowerPrefabId) continue;
+        // The authored value is the maximum; the runtime map holds what is left
+        // and is only populated once the tower has actually taken a hit.
+        const auto definition = std::find_if(
+            prefabs.destructibles.begin(), prefabs.destructibles.end(),
+            [&entity](const PrefabDestructibleInstance& value) {
+                return value.entityId == entity.id;
+            });
+        if (definition == prefabs.destructibles.end()) continue;
+        maxHealth = definition->health;
+        const auto live = prefabs.health.find(entity.id);
+        health = live != prefabs.health.end() ? live->second : definition->health;
+        health = (std::max)(0.0f, health);
+        return true;
+    }
+    return false;
+}
+
+// The comm-tower entity whose mast contains `position`, or 0 for none. Used to
+// route a hit on the tower's destruction chunks back to the prefab health that
+// governs it, so the structure only comes apart when that health is spent.
+static uint64_t CommTowerEntityAt(const XMFLOAT3& position) {
+    constexpr float kTowerHeight = 26.0f;   // matches the prefab targetSize
+    // Generous horizontal reach: the mast is a wide lattice at the base and the
+    // hit lands on whichever leg the round struck.
+    constexpr float kReach = 9.0f;
+    for (const LevelEntity& entity : g_game.world.Level().entities) {
+        if (!entity.enabled || entity.type != LevelEntityType::Prefab ||
+            entity.prefabId != kCommTowerPrefabId) continue;
+        const float dx = position.x - entity.transform.position[0];
+        const float dz = position.z - entity.transform.position[2];
+        const float dy = position.y - entity.transform.position[1];
+        if (dx * dx + dz * dz > kReach * kReach) continue;
+        if (dy < -2.0f || dy > kTowerHeight + 2.0f) continue;
+        return entity.id;
+    }
+    return 0;
+}
+
+// Comm towers that had a charge stuck to them when the detonator was pressed.
+//
+// This is the whole rule: a tower is invulnerable until the player walks up and
+// plants a charge on it. Filtering by damage *source* was not enough -- every
+// attempt leaked, because damage reaches the tower from paths that do not know
+// what caused them (physics contacts, structural passes, blast radii). Requiring
+// an attached charge inverts the test into something the tower itself owns, so a
+// path nobody has thought of still cannot hurt it.
+//
+// Populated at detonation time because DetonateRemoteCharges clears
+// scene.remoteCharges before the blast it queues is resolved. Cleared on level
+// reset so a rigged tower does not stay demolishable across a restart.
+static std::unordered_set<uint64_t> g_commTowersRiggedForDemolition;
+
+static void MarkCommTowersRiggedForDemolition() {
+    for (const RemoteCharge& charge : scene.remoteCharges) {
+        const uint64_t tower = CommTowerEntityAt(charge.position);
+        if (tower != 0) g_commTowersRiggedForDemolition.insert(tower);
+    }
+}
+
+// Only a charge planted on the tower can damage it. Everything else -- rifle
+// fire, rockets, frag grenades, enemy fire, fire, a crashing helicopter, a barrel
+// chain, debris impacts -- leaves it standing, including a C4 blast that went off
+// somewhere else on the map.
+static bool CommTowerDamageAllowed(uint64_t entityId, bool fromRemoteCharge) {
+    XMFLOAT3 ignored{};
+    if (!FindCommTower(entityId, ignored)) return true;   // not a tower
+    return fromRemoteCharge &&
+        g_commTowersRiggedForDemolition.count(entityId) != 0;
+}
+
 static void DamagePrefabEntity(uint64_t entityId, float damage,
-                               const XMFLOAT3& hit) {
+                               const XMFLOAT3& hit, bool fromRemoteCharge) {
+    if (!CommTowerDamageAllowed(entityId, fromRemoteCharge)) return;
+    XMFLOAT3 towerBase{};
+    const bool isCommTower = FindCommTower(entityId, towerBase);
     const CombatSystem::PrefabDamageResult result =
         g_game.combat.DamagePrefab(g_game.world, entityId, damage, hit);
+    // Any damage that reaches a tower is worth a line in the log: it should only
+    // ever happen with a charge planted on it, so an entry that appears at level
+    // start (or from anything else) names the path that is still leaking.
+    //
+    // Logged after the call and carrying `applied`, because a line printed
+    // beforehand only says damage was attempted. An unregistered destructible
+    // makes DamagePrefab a no-op, and reading "taking 1000000 damage" on a tower
+    // that was never in the health map sent two investigations the wrong way.
+    if (isCommTower)
+        SGE_LOG("LogPrefab", EngineLog::Level::Display,
+            "Comm tower taking " + std::to_string(damage) +
+            " damage (fromRemoteCharge=" + std::to_string(fromRemoteCharge) +
+            ", rigged=" +
+            std::to_string(g_commTowersRiggedForDemolition.count(entityId)) +
+            ", applied=" + std::to_string(result.applied) +
+            ", destroyed=" + std::to_string(result.destroyed) + ")");
+    // Steel lattice: every round that lands on it rings, destroyed or not.
+    if (isCommTower && result.applied) PlayMetalHitAudio(hit, 0.9f);
     if (result.destroyed) {
         if (g_game.session.TimerRunning())
             g_game.mission.RecordDestruction();
-        scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
+        if (isCommTower) CollapseCommTower(towerBase);
+        else scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
         g_prefabRebuildRequested = true;
         SGE_LOG("LogPrefab", EngineLog::Level::Display,
             "Destroyed prefab entity " + std::to_string(entityId));
@@ -6073,11 +6516,24 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
 }
 
 static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
-                                  float damage) {
+                                  float damage, bool fromRemoteCharge) {
     const auto results = g_game.combat.DamagePrefabsInRadius(
-        g_game.world, center, radius, damage);
+        g_game.world, center, radius, damage,
+        [fromRemoteCharge](uint64_t entityId) {
+            return CommTowerDamageAllowed(entityId, fromRemoteCharge);
+        });
     for (const CombatSystem::PrefabDamageResult& result : results) {
         if (!result.destroyed) continue;
+        // A tower felled through the radius path still needs its collapse, not
+        // the generic puff of smoke every other prefab gets.
+        XMFLOAT3 towerBase{};
+        if (FindCommTower(result.entityId, towerBase)) {
+            if (g_game.session.TimerRunning())
+                g_game.mission.RecordDestruction();
+            CollapseCommTower(towerBase);
+            g_prefabRebuildRequested = true;
+            continue;
+        }
         if (g_game.session.TimerRunning())
             g_game.mission.RecordDestruction();
         scene.SpawnSmokeBurst(result.effectPosition, 1.2f, 0.45f);
@@ -6466,6 +6922,8 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     scene.RestorePlayerHealth();
     g_game.world.Prefabs().ResetGameplayState();
     scene.ResetLevelRuntimeState();
+    // A tower rigged last run must not start the next one already demolishable.
+    g_commTowersRiggedForDemolition.clear();
     scene.selectedGrenade = g_game.mission.Loadout().grenade;
     if (g_emptyLevelMode)
         GunModel::DisableLoadoutRestriction();
@@ -6592,7 +7050,21 @@ static void BrowseAndStartCustomLevel(HWND hwnd) {
 
 static void RestartActiveLevel(HWND hwnd) {
     if (!g_activeCustomLevelName.empty()) {
-        const LevelDefinition custom = g_game.world.Level();
+        // Snapshot the live level, but undo the gameplay damage first: a
+        // destructible that was killed last run has entity.enabled == false
+        // (CombatSystem::DamagePrefab disables it), and restarting from that
+        // snapshot would leave the comm tower -- and every prop destroyed that
+        // run -- permanently missing.
+        //
+        // Restricted to prefab-backed entities because those are the only ones
+        // DamagePrefab can disable. No level in Content/Levels currently authors
+        // a disabled entity, but scoping it this way means a future one that does
+        // is not silently switched back on by a restart.
+        LevelDefinition custom = g_game.world.Level();
+        for (LevelEntity& entity : custom.entities)
+            if (entity.type == LevelEntityType::Prefab ||
+                entity.type == LevelEntityType::Rock)
+                entity.enabled = true;
         StartLevelOne(hwnd, false, false, false, &custom);
     } else {
         StartLevelOne(hwnd, false);
@@ -6881,6 +7353,10 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     if (ImGui::Combo("Secondary", &secondary, weaponNames,
                      MissionLoadout::kWeaponCount))
         loadout.SelectWeapon(1, secondary);
+    // C4 is demolition kit rather than a weapon pick, so it is carried on every
+    // mission without spending a slot -- otherwise a player who chose two rifles
+    // would have no way to take down a demolition objective.
+    ImGui::TextDisabled("Remote C4 is always carried (demolition charge).");
     int grenade = static_cast<int>(loadout.grenade);
     static constexpr const char* grenadeNames[] = { "Frag", "Molotov", "Vortex" };
     if (ImGui::Combo("Grenade", &grenade, grenadeNames,
@@ -8141,6 +8617,167 @@ static std::shared_ptr<SceneNode> CloneSceneTree(
     return clone;
 }
 
+// Bakes every enabled comm-tower prefab into the destruction model so NvBlast
+// fractures it for real, instead of the mesh vanishing with a smoke puff.
+//
+// The GLB is one node with one mesh, so it carries none of the "Support:" /
+// "<piece>@<id>" structure BuildChunks reads from authored houses. This slices it
+// into horizontal bands by triangle centroid and names them to that convention:
+// the bottom band becomes Support: (anchored, holding the mast up) and each band
+// above is its own bonded group. Shoot the base out and the sections above lose
+// their support chain and come down -- a mast toppling rather than a box popping.
+//
+// Called with the world-space vertex bake already applied, exactly like addHouse,
+// because chunk bounds are read in destruction-model space.
+static void AppendCommTowersToDestruction(
+        const std::shared_ptr<SceneNode>& root, int groupOffset) {
+    if (!root) return;
+
+    // Slicing a 26 m mast into bands ~2.2 m tall reads as sections without
+    // handing Blast an unreasonable chunk count.
+    constexpr int kBandCount = 12;
+
+    for (const LevelEntity& entity : g_game.world.Level().entities) {
+        if (!entity.enabled || entity.type != LevelEntityType::Prefab ||
+            entity.prefabId != kCommTowerPrefabId) continue;
+
+        // Same model the renderer uses, so the fractured geometry matches what
+        // was standing there a frame earlier.
+        const PrefabAsset* prefab = g_prefabRegistry.Find(kCommTowerPrefabId);
+        if (!prefab) continue;
+        PrefabModelCacheEntry* cached = LoadPrefabModel(*prefab);
+        if (!cached || !cached->model) continue;
+        const std::shared_ptr<SceneNode>& model = cached->model;
+
+        // World transform for this instance, matching RebuildPrefabRenderBatches.
+        const Transform& t = entity.transform;
+        const XMMATRIX world =
+            XMMatrixScaling(t.scale[0], t.scale[1], t.scale[2]) *
+            XMMatrixRotationRollPitchYaw(XMConvertToRadians(t.rotation[0]),
+                                         XMConvertToRadians(t.rotation[1]),
+                                         XMConvertToRadians(t.rotation[2])) *
+            XMMatrixTranslation(t.position[0], t.position[1], t.position[2]);
+        const XMMATRIX rotationOnly =
+            XMMatrixRotationRollPitchYaw(XMConvertToRadians(t.rotation[0]),
+                                         XMConvertToRadians(t.rotation[1]),
+                                         XMConvertToRadians(t.rotation[2]));
+
+        // Flatten the model's primitives into world space first, so band
+        // assignment and the emitted chunks share one coordinate system.
+        struct WorldPrimitive {
+            std::vector<float> vertices;
+            std::vector<UINT> indices;
+            std::shared_ptr<SceneMaterial> material;
+            int materialIndex = 0;
+        };
+        std::vector<WorldPrimitive> flattened;
+        float minY = FLT_MAX, maxY = -FLT_MAX;
+
+        const std::function<void(const std::shared_ptr<SceneNode>&, const XMMATRIX&)>
+            gather = [&](const std::shared_ptr<SceneNode>& node,
+                         const XMMATRIX& parent) {
+            if (!node) return;
+            const XMMATRIX local = XMLoadFloat4x4(&node->localTransform) * parent;
+            if (node->mesh) {
+                for (const MeshPrimitive& source : node->mesh->primitives) {
+                    if (source.indices.empty()) continue;
+                    WorldPrimitive out;
+                    out.vertices = source.vertices;
+                    out.indices = source.indices;
+                    out.material = source.material;
+                    out.materialIndex = source.materialIndex;
+                    const XMMATRIX toWorld = local * world;
+                    for (size_t v = 0; v + 11 < out.vertices.size(); v += 12) {
+                        XMVECTOR p = XMVectorSet(out.vertices[v],
+                            out.vertices[v + 1], out.vertices[v + 2], 1.0f);
+                        XMVECTOR n = XMVectorSet(out.vertices[v + 3],
+                            out.vertices[v + 4], out.vertices[v + 5], 0.0f);
+                        XMVECTOR tan = XMVectorSet(out.vertices[v + 8],
+                            out.vertices[v + 9], out.vertices[v + 10], 0.0f);
+                        p = XMVector3TransformCoord(p, toWorld);
+                        n = XMVector3Normalize(XMVector3TransformNormal(n, rotationOnly));
+                        tan = XMVector3Normalize(
+                            XMVector3TransformNormal(tan, rotationOnly));
+                        XMFLOAT3 pf, nf, tf;
+                        XMStoreFloat3(&pf, p);
+                        XMStoreFloat3(&nf, n);
+                        XMStoreFloat3(&tf, tan);
+                        out.vertices[v] = pf.x;
+                        out.vertices[v + 1] = pf.y;
+                        out.vertices[v + 2] = pf.z;
+                        out.vertices[v + 3] = nf.x;
+                        out.vertices[v + 4] = nf.y;
+                        out.vertices[v + 5] = nf.z;
+                        out.vertices[v + 8] = tf.x;
+                        out.vertices[v + 9] = tf.y;
+                        out.vertices[v + 10] = tf.z;
+                        minY = (std::min)(minY, pf.y);
+                        maxY = (std::max)(maxY, pf.y);
+                    }
+                    flattened.push_back(std::move(out));
+                }
+            }
+            for (const auto& child : node->children) gather(child, local);
+        };
+        XMFLOAT4X4 identity;
+        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+        model->UpdateGlobalTransform(identity);
+        gather(model, XMMatrixIdentity());
+        if (flattened.empty() || maxY <= minY) continue;
+
+        // One child node per band, each carrying that band's triangles.
+        const float bandHeight = (maxY - minY) / (float)kBandCount;
+        for (int band = 0; band < kBandCount; ++band) {
+            // Bottom band anchors the mast; the rest are ordinary bonded pieces.
+            // Every band carries ProtectedChunkMarker so indirect damage -- the
+            // enemy helicopter crashing inside its patrol box, a barrel chain
+            // next door, spreading fire -- cannot fell a player objective.
+            const std::string marker = DestructionDX12::ProtectedChunkMarker;
+            const std::string name = band == 0
+                ? ("Support:CommTowerBase" + marker + "@" +
+                   std::to_string(groupOffset))
+                : ("CommTower" + marker + "@" +
+                   std::to_string(groupOffset + band));
+            auto chunk = std::make_shared<SceneNode>(name);
+            chunk->mesh = std::make_shared<SceneMesh>();
+            bool any = false;
+
+            for (const WorldPrimitive& source : flattened) {
+                MeshPrimitive primitive;
+                primitive.material = source.material;
+                primitive.materialIndex = source.materialIndex;
+                for (size_t tri = 0; tri + 2 < source.indices.size(); tri += 3) {
+                    const UINT i0 = source.indices[tri];
+                    const UINT i1 = source.indices[tri + 1];
+                    const UINT i2 = source.indices[tri + 2];
+                    if ((size_t)(std::max)({ i0, i1, i2 }) * 12 + 11 >=
+                        source.vertices.size()) continue;
+                    const float cy = (source.vertices[(size_t)i0 * 12 + 1] +
+                                      source.vertices[(size_t)i1 * 12 + 1] +
+                                      source.vertices[(size_t)i2 * 12 + 1]) / 3.0f;
+                    int owner = (int)((cy - minY) / (std::max)(0.0001f, bandHeight));
+                    owner = (std::max)(0, (std::min)(kBandCount - 1, owner));
+                    if (owner != band) continue;
+                    for (UINT sourceIndex : { i0, i1, i2 }) {
+                        const UINT newIndex =
+                            (UINT)(primitive.vertices.size() / 12);
+                        const float* vertex =
+                            &source.vertices[(size_t)sourceIndex * 12];
+                        primitive.vertices.insert(primitive.vertices.end(),
+                                                  vertex, vertex + 12);
+                        primitive.indices.push_back(newIndex);
+                    }
+                    any = true;
+                }
+                if (!primitive.indices.empty())
+                    chunk->mesh->primitives.push_back(std::move(primitive));
+            }
+            if (any) root->AddChild(chunk);
+        }
+        groupOffset += 1000000;
+    }
+}
+
 static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
                                  bool stressTest) {
     if (!root) return;
@@ -8244,6 +8881,7 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
                 XMConvertToRadians(entity.transform.rotation[1]), groupOffset);
             groupOffset += 1000000;
         }
+        AppendCommTowersToDestruction(root, groupOffset);
         XMFLOAT4X4 identity;
         XMStoreFloat4x4(&identity, XMMatrixIdentity());
         root->UpdateGlobalTransform(identity);
@@ -9131,8 +9769,15 @@ static void ProcessInput(HWND) {
         scene.player.health > 0.0f && !g_drivingHumvee &&
         !cameraLocked && !ImGui::GetIO().WantCaptureMouse &&
         GunModel::C4Selected() && rightMouseHeld;
-    if (c4DetonateRequested && !scene.c4DetonateHeld)
+    if (c4DetonateRequested && !scene.c4DetonateHeld) {
+        // Record which towers were rigged before the charges are cleared.
+        // DetonateRemoteCharges empties scene.remoteCharges immediately, but the
+        // blast it queues is not resolved until the projectile pass later this
+        // frame -- by which time the charge that authorised the demolition is
+        // already gone. See CommTowerDamageAllowed.
+        MarkCommTowersRiggedForDemolition();
         scene.DetonateRemoteCharges();
+    }
     scene.c4DetonateHeld = c4DetonateRequested;
 
     const bool aimRequested = IsGameplayScreen() &&
@@ -9769,6 +10414,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_fireIgnitionAudio.Play(volume, pitch);
     };
     g_hitAudio.Initialize("Content/Audio/bullet_flesh_hit.mp3");
+    g_metalHitAudio.Initialize(
+        "Content/Audio/Bullet/floraphonic-metal-hit-95-200424.mp3");
     g_banditSpottedAudio1.Initialize("Content/Audio/bandit_spotted_01.wav");
     g_banditSpottedAudio2.Initialize("Content/Audio/bandit_spotted_02.wav");
     g_banditAttackAudio.Initialize("Content/Audio/bandit_attack.wav");
@@ -10449,6 +11096,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (!g_emptyLevelMode) {
             UpdateHelicopter(deltaTime);
             UpdateSecondaryHelicopter(deltaTime);
+            UpdateEnemyHelicopterDamageSmoke(deltaTime);
             UpdateBoat(deltaTime);
             // Aim the insertion once the level is actually up. Waits for the
             // model and for loading to finish, so the drop-off is taken from
@@ -10490,6 +11138,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             }
             g_game.vehicles.UpdateBlackHawk(
                 armedInsertionThisFrame ? 0.0f : deltaTime);
+            // Between the airframe and the player: the rope needs the pose the
+            // update just produced, and the player is then placed from the rope.
+            // Shares the arming guard, so a load-sized delta cannot be dumped
+            // into a 16-iteration solver on the frame the run starts.
+            UpdateBlackHawkRope(armedInsertionThisFrame ? 0.0f : deltaTime);
             SpinBlackHawkRotor();
             RidePlayerInBlackHawk();
             UpdateBlackHawkCrashEffects(deltaTime);
@@ -10540,6 +11193,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         for (GunAudio& sound : g_destructionBreakAudio) sound.Update();
         for (GunAudio& sound : g_destructionImpactAudio) sound.Update();
         g_hitAudio.Update();
+        g_metalHitAudio.Update();
         g_banditSpottedAudio1.Update();
         g_banditSpottedAudio2.Update();
         g_banditAttackAudio.Update();
@@ -10553,6 +11207,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             // still be rendering last frame's chunk meshes, so drain it first
             // or those buffers get destroyed in flight and crash.
             WaitForGPU();
+            // Rebuild the destructible set from the level as it stands now.
+            // normalWallModel/stressWallModel are baked once at asset-load time
+            // from whatever level was current then, so re-initializing straight
+            // from them would resurrect the previous level's comm towers (at the
+            // previous level's coordinates) and miss this one's. Re-cloning the
+            // house template and re-running the arrangement is what the editor's
+            // SynchronizeEditorRuntime already does for the same reason.
+            if (g_customLevelMode && g_houseTemplate) {
+                wallModel = CloneSceneTree(g_houseTemplate);
+                ArrangeHousesInCross(wallModel, g_stressTestMode);
+            }
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
             // Re-init rebuilds physics with a flat ground; restore the terrain
             // heightfield collider so debris keeps colliding with real ground.
@@ -11242,8 +11907,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                 g_trees.StartVortex(
                                     center, scene.vortexRadius,
                                     scene.vortexDuration);
+                            // Vortex is not a demolition charge: it tears
+                            // ordinary props apart but leaves the tower alone.
                             DamagePrefabsInRadius(
-                                center, scene.vortexRadius, 1000000.0f);
+                                center, scene.vortexRadius, 1000000.0f, false);
                             projectile.active = false;
                             projectile.detonate = false;
                             continue;
@@ -11342,8 +12009,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         g_destruction.ApplyRagdollExplosion(
                             center, enemyRadius,
                             c4Blast ? 175.0f : scene.grenadeEnemyImpulse);
+                        // Only a remote charge can fell the comm tower; frag
+                        // grenades and rockets leave it standing.
                         DamagePrefabsInRadius(
-                            center, blastRadius, blastDamage);
+                            center, blastRadius, blastDamage, c4Blast);
+                        // A charge stuck to the mast is a demolition, and one
+                        // charge is enough. The radius pass above cannot do it:
+                        // it measures to the entity origin, which for a 26 m
+                        // tower is the base, so a charge planted anywhere up the
+                        // mast falls outside blastRadius and is skipped. Reuse
+                        // the mast-volume test that authorised the demolition in
+                        // the first place -- if the charge rigged the tower, that
+                        // same charge brings it down.
+                        if (c4Blast) {
+                            const uint64_t riggedTower = CommTowerEntityAt(center);
+                            if (riggedTower != 0)
+                                DamagePrefabEntity(riggedTower, blastDamage,
+                                                   center, true);
+                        }
                         projectile.active = false;
                         projectile.detonate = false;
                     }
@@ -11536,6 +12219,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         continue;
                     }
                 }
+                // Tested before the airframe: the rope hangs outboard of the
+                // hull, so a shot reaching it should cut it rather than be
+                // swallowed by the fuselage behind. Only a hostile round on an
+                // occupied descent counts -- see NotifyBlackHawkRopeCut.
+                XMFLOAT3 ropeHit;
+                if (projectile.hostile &&
+                    g_game.vehicles.blackHawkRope &&
+                    g_game.vehicles.BlackHawkIsRappelling() &&
+                    g_blackHawkRope.Shoot(
+                        projectile.previousPosition, projectile.position,
+                        projectile.direction, bulletRadius, 40.0f, ropeHit)) {
+                    const XMFLOAT3 normal(-projectile.direction.x,
+                                          -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(ropeHit, normal);
+                    // Shoot only cuts when a link was the closest thing struck;
+                    // a graze that merely shoved the chain leaves IsCut false.
+                    if (g_blackHawkRope.IsCut())
+                        HandleBlackHawkRopeCut();
+                    stopProjectileAt(ropeHit);
+                    continue;
+                }
                 XMFLOAT3 insertionVehicleHit;
                 if (projectile.hostile &&
                     HitOccupiedInsertionBlackHawkSegment(
@@ -11545,6 +12250,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(insertionVehicleHit, normal);
+                    // Rounds on the airframe: the player is inside it, so this
+                    // is the loudest metal hit in the game.
+                    PlayMetalHitAudio(insertionVehicleHit, 1.0f);
                     g_game.vehicles.DamageInsertionBlackHawkFromEnemyFire(
                         2.4f * projectile.damageMultiplier);
                     stopProjectileAt(insertionVehicleHit);
@@ -11558,6 +12266,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(insertionVehicleHit, normal);
+                    PlayMetalHitAudio(insertionVehicleHit, 1.0f);
                     g_game.vehicles.DamageInsertionBoatFromEnemyFire(
                         2.4f * projectile.damageMultiplier);
                     stopProjectileAt(insertionVehicleHit);
@@ -11572,6 +12281,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(helicopterHit, normal);
+                    // Player rounds on the gunship's hull -- same sheet metal.
+                    PlayMetalHitAudio(helicopterHit, 0.85f);
                     DamageHelicopter(34.0f * projectile.damageMultiplier, helicopterHit);
                     if (projectile.laser) scene.StopLaserBeamAt(helicopterHit);
                     if (projectile.harpoon) scene.ShowHarpoonTether(helicopterHit);
@@ -11586,6 +12297,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(helicopterHit, normal);
+                    PlayMetalHitAudio(helicopterHit, 0.85f);
                     DamageSecondaryHelicopter(
                         34.0f * projectile.damageMultiplier, helicopterHit);
                     if (projectile.laser) scene.StopLaserBeamAt(helicopterHit);
@@ -11602,6 +12314,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                           -projectile.direction.y,
                                           -projectile.direction.z);
                     scene.SpawnBulletImpact(boatHit, normal);
+                    PlayMetalHitAudio(boatHit, 0.85f);
                     DamageBoat(34.0f * projectile.damageMultiplier, boatHit);
                     if (projectile.laser) scene.StopLaserBeamAt(boatHit);
                     if (projectile.harpoon) scene.ShowHarpoonTether(boatHit);
@@ -11675,12 +12388,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     if (projectile.laser) scene.StopLaserBeamAt(hit);
                     if (projectile.harpoon) scene.ShowHarpoonTether(hit);
                     if (projectile.laser || projectile.flame) {
-                        scene.IgniteMaterial(prefabEntityId, hit, 1.65f);
+                        // Steel lattice does not burn, and fire deals it no
+                        // damage, so skip the flames rather than painting a
+                        // fire on a mast that will never lose health to it.
+                        // The direct hit below still damages it.
+                        XMFLOAT3 ignoredTowerBase{};
+                        if (!FindCommTower(prefabEntityId, ignoredTowerBase))
+                            scene.IgniteMaterial(prefabEntityId, hit, 1.65f);
                     }
                     if (!projectile.harpoon ||
                         projectile.harpoonPiercedCount == 0)
                         DamagePrefabEntity(prefabEntityId,
-                            34.0f * projectile.damageMultiplier, hit);
+                            34.0f * projectile.damageMultiplier, hit,
+                            projectile.remoteCharge);
                     stopProjectileAt(hit);
                     continue;
                 }
@@ -11698,9 +12418,36 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                                      ? projectile.harpoonId : 0)) {
                     std::cout << "Projectile hit wall at " << hit.x << ", "
                               << hit.y << ", " << hit.z << "\n";
-                    if (projectile.flame)
+                    // Sampled here, before any damage below can tear the sheet
+                    // off and leave the cached hit chunk pointing elsewhere.
+                    const bool metalSheetHit = g_destruction.IsMetalSheetAt(hit);
+                    // Objective geometry does not chip, and only a remote charge
+                    // damages it at all. Rounds ring off the lattice and stop
+                    // there -- the mast comes apart in one piece when the charge
+                    // it is rigged with goes off, not from small-arms fire.
+                    const bool protectedHit =
+                        g_destruction.IsProtectedChunkAt(hit);
+                    const uint64_t protectedOwner =
+                        protectedHit ? CommTowerEntityAt(hit) : 0;
+                    if (protectedHit) {
+                        if (protectedOwner != 0 && projectile.remoteCharge &&
+                            (!projectile.harpoon ||
+                             projectile.harpoonPiercedCount == 0)) {
+                            DamagePrefabEntity(
+                                protectedOwner,
+                                34.0f * projectile.damageMultiplier, hit,
+                                /*fromRemoteCharge=*/true);
+                        }
+                        // A round that is not a charge still rings off the steel.
+                        if (!projectile.remoteCharge)
+                            PlayMetalHitAudio(hit, 0.9f);
+                    } else if (projectile.flame) {
                         g_destruction.IgniteChunkAt(hit);
-                    if (projectile.laser) {
+                    }
+                    if (protectedHit) {
+                        // No chunk chipping, no impulse: the lattice stands rigid
+                        // until its health is gone.
+                    } else if (projectile.laser) {
                         g_destruction.DestroyChunkAt(
                             hit, scene.destructionDamageRadius);
                     } else if (!projectile.harpoon ||
@@ -11710,7 +12457,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             projectile.harpoon ? 2.5f :
                             scene.destructionDamage * projectile.damageMultiplier);
                     }
-                    if (projectile.harpoon &&
+                    if (protectedHit) {
+                        // Nothing to pull or shove: see above.
+                    } else if (projectile.harpoon &&
                         projectile.harpoonPiercedCount == 0) {
                         scene.ShowHarpoonTether(hit);
                         g_destruction.ApplyHarpoonPull(
@@ -11726,6 +12475,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
+                    // Corrugated iron rings when it is struck, unlike the wood
+                    // and rock that share this path. Queried before the damage
+                    // above can tear the sheet loose and invalidate the chunk.
+                    // Protected hits already rang inside DamagePrefabEntity, so
+                    // only the roof-sheet case needs the sound here.
+                    if (metalSheetHit) PlayMetalHitAudio(hit, 0.9f);
                     // One small dust puff right at the hit; the bigger cloud
                     // comes from the actual fracture (DrainBreakPoints).
                     scene.SpawnSmokeBurst(hit, 0.3f, 0.1f);
@@ -12423,6 +13178,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 UpdateBlackHawkPalette();
                 ConfigureBlackHawkBounds();
                 ConfigureBlackHawkRideFromModel();
+                // After the ride point, which it falls back to when the model
+                // carries no dedicated rope anchor.
+                ConfigureBlackHawkRopeAnchorFromModel();
                 // No merged depth proxy: merging bakes the bind pose into flat
                 // geometry, which would leave the shadow's blades frozen while
                 // the lit ones turn. The shadow pass skins the real model.
@@ -13241,6 +13999,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_banditAttackAudio.Shutdown();
     g_banditSpottedAudio2.Shutdown();
     g_banditSpottedAudio1.Shutdown();
+    g_metalHitAudio.Shutdown();
     g_hitAudio.Shutdown();
     g_grenadeExplosionAudio.Shutdown();
     g_explosionAudio.Shutdown();

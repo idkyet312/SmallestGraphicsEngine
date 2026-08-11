@@ -5,6 +5,18 @@
 #include <algorithm>
 #include <cmath>
 
+// The rappel rope is a box3d simulation, referenced here by forward-declared
+// pointer on purpose. This header is included by GameArchitectureTests, which
+// links neither box3d nor the renderer; a by-value member would drag the physics
+// library into that target and break its link step. A non-owning raw pointer
+// (rather than unique_ptr) also keeps this struct implicitly destructible
+// without RopeSwing being a complete type -- the rope itself is owned by the
+// app layer, which is the only place that knows what box3d is.
+//
+// The pointer stays null in the test build and every rope call site is guarded,
+// so the phase logic the test drives runs unchanged with no rope present.
+class RopeSwing;
+
 struct VehicleSystem {
     static constexpr float HelicopterMaxHealth = 2000.0f;
     static constexpr float BoatMaxHealth = 1200.0f;
@@ -44,6 +56,39 @@ struct VehicleSystem {
     bool secondaryHelicopterCrashed = false;
     DirectX::XMFLOAT3 secondaryHelicopterCrashVelocity{};
     DirectX::XMFLOAT3 secondaryHumveePosition{ 42.0f, 2.5f, 3.0f };
+
+    // Battle-damage smoke on the enemy gunships, read the same way as the
+    // insertion BlackHawk's: below the threshold the airframe trails smoke, and
+    // severity ramps 0..1 from the first wisp to zero health. Sharing the curve
+    // keeps "that thing is nearly dead" looking identical on either aircraft.
+    static constexpr float HelicopterSmokeThreshold = 0.55f;
+
+    float HelicopterHealthFraction() const {
+        return HelicopterMaxHealth > 0.0f
+            ? (std::max)(0.0f, (std::min)(1.0f,
+                  helicopterHealth / HelicopterMaxHealth))
+            : 0.0f;
+    }
+    float SecondaryHelicopterHealthFraction() const {
+        return HelicopterMaxHealth > 0.0f
+            ? (std::max)(0.0f, (std::min)(1.0f,
+                  secondaryHelicopterHealth / HelicopterMaxHealth))
+            : 0.0f;
+    }
+    // 0 at the first wisp, 1 at zero health. Same shape as
+    // BlackHawkDamageSeverity so both aircraft read alike.
+    static float HelicopterSeverityFromFraction(float fraction) {
+        if (HelicopterSmokeThreshold <= 0.0f) return 0.0f;
+        if (fraction >= HelicopterSmokeThreshold) return 0.0f;
+        return (HelicopterSmokeThreshold - fraction) / HelicopterSmokeThreshold;
+    }
+    float HelicopterDamageSeverity() const {
+        return HelicopterSeverityFromFraction(HelicopterHealthFraction());
+    }
+    float SecondaryHelicopterDamageSeverity() const {
+        return HelicopterSeverityFromFraction(
+            SecondaryHelicopterHealthFraction());
+    }
 
     DirectX::XMFLOAT3 humveeTurretLocal{ 0.0f, 0.35f, 0.0f };
     bool drivingHumvee = false;
@@ -466,6 +511,32 @@ public:
     float blackHawkRideForward = 0.4f;
     float blackHawkRideHeight = 2.1f;
 
+    // Where the rappel rope is tied on, in the same local frame as the ride
+    // point above. Taken from a "RopeAnchor" empty in the GLB when the model has
+    // one; otherwise it falls back to the ride point, so a model without the
+    // node still hangs a rope from somewhere sensible rather than from the
+    // origin. blackHawkRopeAnchorValid records which of the two is in use.
+    float blackHawkRopeSide = 1.15f;
+    float blackHawkRopeForward = 0.4f;
+    float blackHawkRopeHeight = 2.1f;
+    bool blackHawkRopeAnchorValid = false;
+
+    // The live rope, owned by the app layer (see the forward declaration above).
+    // Null whenever no rope is out, which is every phase but Rappelling and the
+    // tail of a cut rope still falling.
+    RopeSwing* blackHawkRope = nullptr;
+    // Raised for the single frame the rope should be hung, so the owner can
+    // build the box3d world without this header knowing how. Paired with
+    // blackHawkRopeReleaseRequested, which asks for it to be torn down.
+    bool blackHawkRopeSpawnRequested = false;
+    bool blackHawkRopeReleaseRequested = false;
+    // True once the rope has been cut from under a descending player: the
+    // descent stops being rope-driven and the player is handed to gravity.
+    bool blackHawkRopeCut = false;
+    // How far down the rope the player had got when it was cut, 0..1. Drives
+    // fall damage -- a cut near the ground should barely sting.
+    float blackHawkRopeCutProgress = 0.0f;
+
     // Where the player's centre sits while riding, given the current pose. The
     // offset is rotated by the full roll/pitch/yaw the airframe is drawn with,
     // not yaw alone: the bird runs in nose-down and banks on departure, and
@@ -475,6 +546,23 @@ public:
         // BlackHawkWorldMatrix rotates, so the two stay in step.
         const DirectX::XMVECTOR offset = DirectX::XMVectorSet(
             blackHawkRideSide, blackHawkRideHeight, blackHawkRideForward, 0.0f);
+        const DirectX::XMMATRIX orientation =
+            DirectX::XMMatrixRotationRollPitchYaw(blackHawkPitch, blackHawkYaw,
+                                                  blackHawkRoll);
+        DirectX::XMFLOAT3 rotated{};
+        DirectX::XMStoreFloat3(&rotated,
+                               DirectX::XMVector3TransformNormal(offset, orientation));
+        return { blackHawkPosition.x + rotated.x,
+                 blackHawkPosition.y + rotated.y,
+                 blackHawkPosition.z + rotated.z };
+    }
+
+    // Where the rappel rope is tied on, given the current pose. Same basis and
+    // the same full roll/pitch/yaw rotation as BlackHawkRidePosition, so the
+    // rope stays on the airframe through the flare and the departure bank.
+    DirectX::XMFLOAT3 BlackHawkRopeAnchorPosition() const {
+        const DirectX::XMVECTOR offset = DirectX::XMVectorSet(
+            blackHawkRopeSide, blackHawkRopeHeight, blackHawkRopeForward, 0.0f);
         const DirectX::XMMATRIX orientation =
             DirectX::XMMatrixRotationRollPitchYaw(blackHawkPitch, blackHawkYaw,
                                                   blackHawkRoll);
@@ -506,6 +594,25 @@ public:
                blackHawkCarryingPlayer;
     }
 
+    // Records that the rope was shot through while the player was on it. Latches
+    // the progress at the moment of the cut, which is what the fall height and so
+    // the damage are worked out from. Ignored unless a descent is actually in
+    // progress, so a stray hit on a departing aircraft cannot fake a cut.
+    bool NotifyBlackHawkRopeCut() {
+        if (!BlackHawkIsRappelling() || blackHawkRopeCut) return false;
+        blackHawkRopeCut = true;
+        blackHawkRopeCutProgress = blackHawkRappelProgress;
+        return true;
+    }
+
+    // True while a rope is out and still worth simulating: either the player is
+    // riding it down, or it has been cut and the severed section is still
+    // falling. The owner uses this to decide whether to step the simulation.
+    bool BlackHawkRopeActive() const {
+        return blackHawkRope != nullptr &&
+               (blackHawkPhase == BlackHawkPhase::Rappelling || blackHawkRopeCut);
+    }
+
     // Places the drop-off at the player spawn and parks the helicopter at the
     // start of its approach run, inbound on the given heading (radians, the
     // direction it flies toward).
@@ -534,6 +641,11 @@ public:
         blackHawkCrashVelocity = { 0.0f, 0.0f, 0.0f };
         blackHawkUnloadTimer = 0.0f;
         blackHawkRappelProgress = 0.0f;
+        // A restart must not inherit the last run's rope, cut or otherwise.
+        blackHawkRopeSpawnRequested = false;
+        blackHawkRopeReleaseRequested = true;
+        blackHawkRopeCut = false;
+        blackHawkRopeCutProgress = 0.0f;
         // Back the bird up along its heading so it flies in toward the spawn.
         blackHawkPosition = {
             dropOff.x - std::sin(approachHeading) * BlackHawkApproachDistance,
@@ -592,6 +704,10 @@ public:
                 blackHawkPhase = blackHawkFastRappel
                     ? BlackHawkPhase::Rappelling
                     : BlackHawkPhase::Descending;
+                // Only the fast route rappels, so only it gets a rope. The
+                // normal route lands on its skids and never hangs one.
+                if (blackHawkPhase == BlackHawkPhase::Rappelling)
+                    blackHawkRopeSpawnRequested = true;
             }
             break;
         }
@@ -610,12 +726,23 @@ public:
             break;
         }
         case BlackHawkPhase::Rappelling: {
+            // A cut rope stops driving the descent: the player is falling under
+            // gravity now, so advancing progress would keep pulling them down a
+            // rope that is no longer there. Release them and let the bird go.
+            if (blackHawkRopeCut) {
+                blackHawkDroppedPlayer = blackHawkCarryingPlayer;
+                blackHawkCarryingPlayer = false;
+                blackHawkPhase = BlackHawkPhase::Departing;
+                break;
+            }
             blackHawkRappelProgress = (std::min)(
                 1.0f, blackHawkRappelProgress + dt / BlackHawkRappelTime);
             if (blackHawkRappelProgress >= 1.0f) {
                 blackHawkDroppedPlayer = blackHawkCarryingPlayer;
                 blackHawkCarryingPlayer = false;
                 blackHawkPhase = BlackHawkPhase::Departing;
+                // Rope has done its job; the freed chain is not needed.
+                blackHawkRopeReleaseRequested = true;
             }
             break;
         }
@@ -695,6 +822,11 @@ public:
         blackHawkHealth = BlackHawkMaxHealth;
         blackHawkCrashVelocity = { 0.0f, 0.0f, 0.0f };
         blackHawkPhase = BlackHawkPhase::Gone;
+        // Never leak a box3d world across a level reset.
+        blackHawkRopeSpawnRequested = false;
+        blackHawkRopeReleaseRequested = true;
+        blackHawkRopeCut = false;
+        blackHawkRopeCutProgress = 0.0f;
     }
 
     // Kills the engine and starts the spiral, carrying whatever momentum the
@@ -709,6 +841,9 @@ public:
             blackHawkCarryingPlayer = false;
             blackHawkBailedOut = true;
         }
+        // The rope goes down with the aircraft either way: a wreck spiralling
+        // away from a rope still tied to it looks worse than no rope at all.
+        blackHawkRopeReleaseRequested = true;
         blackHawkHealth = 0.0f;
         blackHawkPhase = BlackHawkPhase::Crashing;
         blackHawkLanded = false;

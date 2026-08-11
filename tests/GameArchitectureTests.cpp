@@ -337,6 +337,11 @@ int main() {
     CHECK(fastInsertion.BlackHawkIsRappelling());
     CHECK(std::abs(fastInsertion.blackHawkPosition.y -
         VehicleSystem::BlackHawkRappelHoverHeight) < 0.001f);
+    // Entering the rappel asks the owner to hang a rope. The normal route,
+    // which lands on its skids, must never ask for one.
+    CHECK(fastInsertion.blackHawkRopeSpawnRequested);
+    CHECK(!normalInsertion.blackHawkRopeSpawnRequested);
+    fastInsertion.blackHawkRopeSpawnRequested = false;
     fastInsertion.UpdateBlackHawk(
         VehicleSystem::BlackHawkRappelTime * 0.5f);
     CHECK(std::abs(fastInsertion.blackHawkRappelProgress - 0.5f) < 0.001f);
@@ -347,6 +352,37 @@ int main() {
     CHECK(!fastInsertion.blackHawkCarryingPlayer);
     CHECK(fastInsertion.blackHawkPhase ==
         VehicleSystem::BlackHawkPhase::Departing);
+    // A completed descent releases the rope rather than leaking the world.
+    CHECK(fastInsertion.blackHawkRopeReleaseRequested);
+
+    // Rope cut mid-descent. NotifyBlackHawkRopeCut latches the progress the cut
+    // happened at (which the fall damage is scaled from), refuses to fire twice,
+    // and refuses to fire at all when no descent is in progress.
+    VehicleSystem cutRun;
+    cutRun.BeginBlackHawkInsertion({ 0.0f, 0.0f, 0.0f }, 0.0f, 0.0f, true);
+    CHECK(!cutRun.NotifyBlackHawkRopeCut());   // still inbound, nothing to cut
+    for (int stepIndex = 0;
+         stepIndex < 1000 &&
+             cutRun.blackHawkPhase == VehicleSystem::BlackHawkPhase::Inbound;
+         ++stepIndex)
+        cutRun.UpdateBlackHawk(0.05f);
+    CHECK(cutRun.BlackHawkIsRappelling());
+    cutRun.UpdateBlackHawk(VehicleSystem::BlackHawkRappelTime * 0.25f);
+    CHECK(cutRun.NotifyBlackHawkRopeCut());
+    CHECK(cutRun.blackHawkRopeCut);
+    CHECK(std::abs(cutRun.blackHawkRopeCutProgress - 0.25f) < 0.001f);
+    CHECK(!cutRun.NotifyBlackHawkRopeCut());   // one cut only
+    // The cut releases the player and stops the rope driving the descent, so
+    // progress must not keep advancing toward a rope that is no longer there.
+    const float progressAtCut = cutRun.blackHawkRappelProgress;
+    cutRun.UpdateBlackHawk(VehicleSystem::BlackHawkRappelTime * 0.5f);
+    CHECK(std::abs(cutRun.blackHawkRappelProgress - progressAtCut) < 0.001f);
+    CHECK(!cutRun.blackHawkCarryingPlayer);
+    CHECK(cutRun.blackHawkPhase == VehicleSystem::BlackHawkPhase::Departing);
+    // Standing the run down must always ask for a teardown.
+    cutRun.DisableBlackHawkInsertion();
+    CHECK(cutRun.blackHawkRopeReleaseRequested);
+    CHECK(!cutRun.blackHawkRopeCut);
 
     vehicleDamage = vehicles.DamageInsertionBlackHawkFromEnemyFire(
         VehicleSystem::BlackHawkMaxHealth * 0.40f);
@@ -447,6 +483,80 @@ int main() {
         combatWorld, 500, 60.0f, { 1.0f, 0.0f, 0.0f });
     CHECK(damageResult.destroyed);
     CHECK(!combatWorld.Level().entities.back().enabled);
+
+    // Radius damage honours the caller's immunity predicate. This is what keeps
+    // the comm tower a player-only objective: enemy grenades and stray blasts
+    // run through DamagePrefabsInRadius, and without the filter one landing at
+    // its feet would fell it and wrongly credit the player for the destruction.
+    RuntimeWorld immuneWorld;
+    LevelEntity objective;
+    objective.id = 700;
+    objective.type = LevelEntityType::Prefab;
+    objective.prefabId = "props/comm_tower";
+    immuneWorld.Level().entities.push_back(objective);
+    LevelEntity ordinary;
+    ordinary.id = 701;
+    ordinary.type = LevelEntityType::Prefab;
+    ordinary.prefabId = "test/destructible";
+    immuneWorld.Level().entities.push_back(ordinary);
+    immuneWorld.Prefabs().destructibles.push_back(
+        { 700, { 0.0f, 0.0f, 0.0f }, 100.0f });
+    immuneWorld.Prefabs().destructibles.push_back(
+        { 701, { 0.0f, 0.0f, 0.0f }, 100.0f });
+
+    // Look entities up by id: the level may carry entities of its own, so
+    // front()/back() are not the ones pushed above.
+    const auto towerEnabled = [&immuneWorld]() {
+        for (const LevelEntity& e : immuneWorld.Level().entities)
+            if (e.id == 700) return e.enabled;
+        return false;
+    };
+
+    // Non-demolition blast (frag grenade, rocket, enemy fire, a crashing
+    // helicopter): the objective is skipped, the ordinary prop still dies.
+    auto radiusResults = combat.DamagePrefabsInRadius(
+        immuneWorld, { 0.0f, 0.0f, 0.0f }, 10.0f, 100000.0f,
+        [](uint64_t entityId) { return entityId != 700; });
+    bool touchedObjective = false;
+    bool destroyedOrdinary = false;
+    for (const auto& r : radiusResults) {
+        if (r.entityId == 700) touchedObjective = true;
+        if (r.entityId == 701 && r.destroyed) destroyedOrdinary = true;
+    }
+    CHECK(!touchedObjective);
+    CHECK(destroyedOrdinary);
+    CHECK(towerEnabled());   // tower still standing
+
+    // Remote charge (no predicate): only this brings the objective down.
+    radiusResults = combat.DamagePrefabsInRadius(
+        immuneWorld, { 0.0f, 0.0f, 0.0f }, 10.0f, 100000.0f);
+    bool destroyedObjective = false;
+    for (const auto& r : radiusResults)
+        if (r.entityId == 700 && r.destroyed) destroyedObjective = true;
+    CHECK(destroyedObjective);
+    CHECK(!towerEnabled());
+
+    // Restarting the level must bring destroyed props back. DamagePrefab clears
+    // entity.enabled, and the restart path snapshots the *live* level, so without
+    // re-enabling prefab entities the comm tower (and every barrel destroyed that
+    // run) would stay missing for the rest of the session. This mirrors what
+    // RestartActiveLevel does before handing the snapshot to StartLevelOne.
+    LevelDefinition restarted = immuneWorld.Level();
+    for (LevelEntity& entity : restarted.entities)
+        if (entity.type == LevelEntityType::Prefab ||
+            entity.type == LevelEntityType::Rock)
+            entity.enabled = true;
+    bool towerBack = false;
+    for (const LevelEntity& entity : restarted.entities)
+        if (entity.id == 700) towerBack = entity.enabled;
+    CHECK(towerBack);
+    // And clearing runtime health restores it to full on the next run.
+    immuneWorld.Prefabs().ResetGameplayState();
+    CHECK(immuneWorld.Prefabs().health.empty());
+
+    // (The always-carried C4 rule lives in GunModel, which pulls in DX12Core and
+    // the asset importers -- too heavy for this renderer-free target to link.
+    // Verified by inspection and in-game instead.)
 
     return failures ? 1 : 0;
 }

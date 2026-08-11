@@ -22,6 +22,7 @@
 #include "GunModel.h"
 #include "ArmsModel.h"
 #include "GrassField.h"
+#include "RopeSwing.h"   // RopeItem, for the rappel rope draw
 #include <unordered_map>
 
 extern MeshShaderDX12 g_meshShader;
@@ -91,6 +92,10 @@ bool BlackHawkVisible();
 DirectX::XMFLOAT3 BlackHawkRideWorldPosition();
 bool BlackHawkRappelActive();
 DirectX::XMFLOAT3 BlackHawkRappelPlayerWorldPosition();
+// The rappel rope's drawable links, empty whenever no rope is out. Same
+// transform+colour+shape layout as the water floaters and ragdoll parts, so it
+// draws through the ordinary textured-primitive path.
+const std::vector<RopeItem>& BlackHawkRopeItems();
 bool DeploymentPlanningActive();
 const std::vector<DirectX::XMFLOAT3>& DeploymentZonePositions();
 int SelectedDeploymentZoneIndex();
@@ -1349,6 +1354,21 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             else if (item.shape == 1) DrawCapsule(geo);
             else DrawCube(geo);
             shader.NextDrawCall();
+        }
+        // Rappel rope. Same item layout and shape encoding as the ragdoll parts
+        // above, so it needs no geometry or shader of its own. The list is empty
+        // whenever no rope is out, which is every phase but the fast-rappel
+        // descent and the tail of a cut rope still falling.
+        if (!visibilityExtensionsOnly) {
+            for (const RopeItem& item : BlackHawkRopeItems()) {
+                shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj,
+                                   lightSpace);
+                shader.SetObjectColor(item.color);
+                if (item.shape == 2) DrawSphere(geo);
+                else if (item.shape == 1) DrawCapsule(geo);
+                else DrawCube(geo);
+                shader.NextDrawCall();
+            }
         }
         // Hover enemies carry the same imported AK as the player. Gun transforms
         // are aimed independently while ragdoll limbs trail under physics.

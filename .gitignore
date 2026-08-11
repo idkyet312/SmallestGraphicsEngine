@@ -97,3 +97,9 @@ Content/Models/ship.glb
 # (compile before/after, compare sizes). Derived output, never source.
 *.dxil
 temp_dxil/
+
+# PIX GPU captures and the exports taken alongside them. A single .wpix runs to
+# hundreds of MB and is a recording of one run, not source.
+*.wpix
+GPU*-events.csv
+GPU*-screenshot.png

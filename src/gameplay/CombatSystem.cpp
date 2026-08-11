@@ -38,7 +38,8 @@ CombatSystem::PrefabDamageResult CombatSystem::DamagePrefab(
 std::vector<CombatSystem::PrefabDamageResult>
 CombatSystem::DamagePrefabsInRadius(
         RuntimeWorld& world, const DirectX::XMFLOAT3& center,
-        float radius, float damage) {
+        float radius, float damage,
+        const std::function<bool(uint64_t)>& damageable) {
     std::vector<PrefabDamageResult> results;
     if (radius <= 0.0f || damage <= 0.0f) return results;
 
@@ -46,6 +47,10 @@ CombatSystem::DamagePrefabsInRadius(
     const std::vector<PrefabDestructibleInstance> destructibles =
         world.Prefabs().destructibles;
     for (const PrefabDestructibleInstance& prefab : destructibles) {
+        // Lets the caller hold specific props immune to this blast -- used to
+        // keep the comm tower a player-only objective, so an enemy grenade
+        // landing at its feet cannot fell it.
+        if (damageable && !damageable(prefab.entityId)) continue;
         const float dx = prefab.position.x - center.x;
         const float dy = prefab.position.y - center.y;
         const float dz = prefab.position.z - center.z;

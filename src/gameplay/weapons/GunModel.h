@@ -152,6 +152,14 @@ public:
         default: return false;
         }
     }
+    // Remote C4 (slot 5) is demolition kit, not a weapon choice: it rides along
+    // with every loadout so the player always has the means to bring down a
+    // demolition objective, whatever two weapons they picked. Carrying it costs
+    // neither of the two slots.
+    static constexpr int kRemoteChargeWeapon = 5;
+
+    // The two chosen weapons. C4 is carried on top of these -- see
+    // LoadoutAllows/CycleWeapon, which treat it as always available.
     static std::array<int, 2>& LoadoutWeapons() {
         static std::array<int, 2> weapons{{ 0, 1 }};
         return weapons;
@@ -159,6 +167,13 @@ public:
     static bool& LoadoutRestricted() {
         static bool restricted = false;
         return restricted;
+    }
+    // True when `weapon` may be selected under the current restriction.
+    static bool LoadoutAllows(int weapon) {
+        if (!LoadoutRestricted()) return WeaponLoaded(weapon);
+        if (weapon == kRemoteChargeWeapon) return true;
+        const auto& weapons = LoadoutWeapons();
+        return weapon == weapons[0] || weapon == weapons[1];
     }
     static bool ConfigureLoadout(int primary, int secondary) {
         if (primary == secondary || !WeaponLoaded(primary) ||
@@ -172,9 +187,22 @@ public:
     static void DisableLoadoutRestriction() { LoadoutRestricted() = false; }
     static void CycleWeapon(int direction) {
         if (LoadoutRestricted()) {
+            // Cycle the two chosen weapons plus the always-carried charge, in a
+            // stable order so the control feels the same every mission.
             const auto& weapons = LoadoutWeapons();
-            SelectedWeapon() = SelectedWeapon() == weapons[0]
-                ? weapons[1] : weapons[0];
+            std::array<int, 3> carried{{ weapons[0], weapons[1],
+                                         kRemoteChargeWeapon }};
+            int count = 2;
+            if (weapons[0] != kRemoteChargeWeapon &&
+                weapons[1] != kRemoteChargeWeapon)
+                count = 3;
+            int index = 0;
+            for (int i = 0; i < count; ++i)
+                if (carried[static_cast<size_t>(i)] == SelectedWeapon())
+                    index = i;
+            const int step = direction < 0 ? -1 : 1;
+            index = (index + step + count) % count;
+            SelectedWeapon() = carried[static_cast<size_t>(index)];
             return;
         }
         const int step = direction < 0 ? -1 : 1;

@@ -18,7 +18,6 @@
 // which a rope wants -- so this keeps its own rather than contaminate that one.
 
 #include <DirectXMath.h>
-#include "DX12Core.h"
 #include <box3d/box3d.h>
 #include <vector>
 #include <cmath>
@@ -43,6 +42,7 @@ public:
     enum class Payload {
         Block,     // a heavy stone cube
         Ragdoll,   // a jointed body, strung up by the torso
+        None,      // nothing welded on: the bottom link is the attach point
     };
 
     // `anchor` is the fixed point the rope hangs from (e.g. under a beam).
@@ -135,12 +135,16 @@ public:
             // Join block to the bottom link. Ball joint again, so it can sway.
             if (!m_links.empty())
                 m_joints.push_back(MakeBallJoint(prev, m_block, m_linkHalfY, blockHalf));
-        } else {
+        } else if (payload == Payload::Ragdoll) {
             // Ragdoll strung up by the torso. The rope's last link ball-joints to
             // the torso, so the body dangles and swings; cut the rope and it drops
             // in a heap.
             BuildRagdoll(XMFLOAT3(anchor.x, y - m_linkHalfY, anchor.z), prev);
         }
+        // Payload::None hangs nothing on the end. A rappelling player is driven
+        // from the rope's shape rather than simulated as a body on it, so there
+        // is no payload to weld: the free bottom link is the attach point, and
+        // the chain still swings under its own mass.
 
         // Ground plane, so the payload has something to land on when cut loose.
         b3BodyDef gd = b3DefaultBodyDef();
@@ -150,6 +154,9 @@ public:
         b3ShapeDef gsd = b3DefaultShapeDef();
         gsd.baseMaterial.friction = 0.8f;
         b3CreateHullShape(ground, &gsd, &ghull.base);
+
+        m_pathScratch.reserve(m_links.size() + 2);
+        m_spanScratch.reserve(m_links.size() + 2);
 
         RebuildItems();
     }
@@ -283,6 +290,92 @@ public:
     bool IsInitialized() const { return !B3_IS_NULL(m_world); }
     bool IsCut() const { return m_cut; }
 
+    // A point on the rope, `t` running 0 at the anchor to 1 at the free end.
+    // Used to slide a rappelling player down the live rope instead of down a
+    // straight line, so they swing with it in X and Z as well as descending.
+    //
+    // The path is anchor -> every link centre -> the bottom link's lower tip,
+    // rather than the centres alone: a chain of N centres spans only from half a
+    // link below the anchor to half a link above the end, which would lose a
+    // whole link's length across the descent and leave the player hanging short
+    // of the ground.
+    XMFLOAT3 PositionAlongRope(float t) const {
+        if (m_links.empty()) return m_anchor;
+
+        // Scratch buffers are members, not locals: this runs every frame of a
+        // descent and must not allocate.
+        std::vector<XMFLOAT3>& path = m_pathScratch;
+        path.clear();
+        path.push_back(m_anchor);
+        for (b3BodyId link : m_links) {
+            if (B3_IS_NULL(link)) continue;
+            const b3Pos p = b3Body_GetPosition(link);
+            path.push_back(XMFLOAT3((float)p.x, (float)p.y, (float)p.z));
+        }
+        if (path.size() < 2) return m_anchor;
+
+        // Extend past the last centre by half a link, along the direction the
+        // final segment is already running, so the tip follows the rope's lean
+        // instead of always pointing straight down.
+        {
+            const XMVECTOR last = XMLoadFloat3(&path[path.size() - 1]);
+            const XMVECTOR prev = XMLoadFloat3(&path[path.size() - 2]);
+            XMVECTOR dir = last - prev;
+            if (XMVectorGetX(XMVector3LengthSq(dir)) < 1e-8f)
+                dir = XMVectorSet(0.0f, -1.0f, 0.0f, 0.0f);
+            dir = XMVector3Normalize(dir);
+            XMFLOAT3 tip{};
+            XMStoreFloat3(&tip, last + dir * m_linkHalfY);
+            path.push_back(tip);
+        }
+
+        // Walk by arc length, so an unevenly stretched chain still maps `t`
+        // onto a proportional distance down the rope.
+        float total = 0.0f;
+        std::vector<float>& spans = m_spanScratch;
+        spans.clear();
+        for (size_t i = 0; i + 1 < path.size(); ++i) {
+            const float d = XMVectorGetX(XMVector3Length(
+                XMLoadFloat3(&path[i + 1]) - XMLoadFloat3(&path[i])));
+            spans.push_back(d);
+            total += d;
+        }
+        if (total <= 1e-6f) return path.front();
+
+        const float clamped = std::max(0.0f, std::min(1.0f, t));
+        float travelled = clamped * total;
+        for (size_t i = 0; i < spans.size(); ++i) {
+            if (travelled > spans[i] && i + 1 < spans.size()) {
+                travelled -= spans[i];
+                continue;
+            }
+            const float frac = spans[i] > 1e-6f
+                ? std::min(1.0f, travelled / spans[i]) : 0.0f;
+            XMFLOAT3 out{};
+            XMStoreFloat3(&out, XMVectorLerp(XMLoadFloat3(&path[i]),
+                                             XMLoadFloat3(&path[i + 1]), frac));
+            return out;
+        }
+        return path.back();
+    }
+
+    // World-space anchor the rope was hung from.
+    const XMFLOAT3& Anchor() const { return m_anchor; }
+
+    // True once a cut rope has stopped moving, so the caller knows the fall has
+    // finished playing out and the world can be torn down. Checks the freed
+    // section only -- an uncut rope hanging in the breeze never reports settled.
+    bool CutSectionSettled() const {
+        if (!m_cut) return false;
+        constexpr float kRestSpeedSq = 0.04f;   // ~0.2 m/s
+        for (b3BodyId link : m_links) {
+            if (B3_IS_NULL(link)) continue;
+            const b3Vec3 v = b3Body_GetLinearVelocity(link);
+            if (v.x * v.x + v.y * v.y + v.z * v.z > kRestSpeedSq) return false;
+        }
+        return true;
+    }
+
     // Re-hang the payload: rebuild from the original anchor. Keeps the payload
     // kind, or a reset gibbet would silently come back as a block.
     void Reset() {
@@ -292,7 +385,7 @@ public:
         const float half = m_blockHalf.x;
         const Payload payload = m_payload;
         Initialize(anchor, links ? links : 6, linkLen > 0.0f ? linkLen : 0.5f,
-                   half, payload);
+                   half > 0.0f ? half : 0.55f, payload);
     }
 
     void Shutdown() {
@@ -304,6 +397,8 @@ public:
         m_joints.clear();
         m_ragdoll.clear();
         m_items.clear();
+        m_pathScratch.clear();
+        m_spanScratch.clear();
         m_accumulator = 0.0f;
         m_cut = false;
     }
@@ -425,7 +520,6 @@ private:
 
     void RebuildItems() {
         m_items.clear();
-        m_items.reserve(m_links.size() + 1);
 
         auto push = [&](b3BodyId body, const XMFLOAT3& half, const XMFLOAT3& color,
                         uint8_t shape = 0) {
@@ -471,6 +565,9 @@ private:
     std::vector<b3JointId> m_joints;   // m_joints[i] holds up m_links[i]
     std::vector<BodyPart>  m_ragdoll;  // empty unless Payload::Ragdoll
     std::vector<RopeItem>  m_items;
+    // Scratch for PositionAlongRope, which is const but runs per frame.
+    mutable std::vector<XMFLOAT3> m_pathScratch;
+    mutable std::vector<float>    m_spanScratch;
 
     Payload  m_payload = Payload::Block;
     XMFLOAT3 m_anchor{ 0.0f, 0.0f, 0.0f };
@@ -480,6 +577,3 @@ private:
     float m_accumulator = 0.0f;
     bool  m_cut = false;
 };
-
-extern RopeSwing g_rope;     // stone block on a rope
-extern RopeSwing g_gibbet;   // ragdoll strung up on a rope
