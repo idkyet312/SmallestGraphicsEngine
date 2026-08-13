@@ -378,6 +378,18 @@ if(BUILD_TESTING)
         SGEProjectHeaders nlohmann_json::nlohmann_json)
     add_test(NAME GameArchitectureTests COMMAND GameArchitectureTests)
 
+    # Backs the enemy scatter test mode. Links Recast/Detour directly because it
+    # builds a real navmesh rather than stubbing one -- the guarantee under test
+    # is Detour's, so a fake mesh would verify nothing.
+    add_executable(NavigationRandomPointTests
+        tests/NavigationRandomPointTests.cpp
+        src/navigation/NavigationSystem.cpp)
+    target_link_libraries(NavigationRandomPointTests PRIVATE
+        SGEProjectHeaders
+        RecastNavigation::Recast
+        RecastNavigation::Detour)
+    add_test(NAME NavigationRandomPointTests COMMAND NavigationRandomPointTests)
+
     add_executable(PrefabRegistryTests
         tests/PrefabRegistryTests.cpp
         src/assets/prefabs/PrefabRegistry.cpp)

@@ -210,13 +210,53 @@ int main() {
     CHECK(std::abs(missionReport.accuracyPercent - 50.0f) < 0.001f);
     CHECK(missionReport.casualties == 1);
     CHECK(missionReport.optionalObjectivesCompleted == 3);
-    CHECK(missionReport.timeScore == 20);
-    CHECK(missionReport.accuracyScore == 13);
-    CHECK(missionReport.casualtyScore == 15);
-    CHECK(missionReport.optionalScore == 20);
-    CHECK(missionReport.destructionScore == 15);
-    CHECK(missionReport.totalScore == 83);
+    CHECK(missionReport.timeScore == 15);
+    CHECK(missionReport.accuracyScore == 10);
+    CHECK(missionReport.casualtyScore == 11);
+    CHECK(missionReport.optionalScore == 15);
+    CHECK(missionReport.destructionScore == 10);
+    // No tower authored on this run, so the primary objective pays in full --
+    // otherwise a map without one could never grade above a C.
+    CHECK(!missionReport.primaryObjectivePresent);
+    CHECK(missionReport.primaryObjectiveComplete);
+    CHECK(missionReport.primaryScore == MissionSystem::kPrimaryObjectiveScore);
+    CHECK(missionReport.totalScore == 86);
     CHECK(missionReport.rank == MissionRank::A);
+
+    // Comm-tower objective: the mission is the tower. A run that leaves it
+    // standing forfeits the primary score and is not a complete mission, and a
+    // partial clear on a two-tower map takes half credit.
+    MissionRunStats towerStats = missionStats;
+    towerStats.commTowersTotal = 1;
+    const MissionReport towerMissed = MissionSystem::Grade(
+        loadout, towerStats, 200.0f, 3);
+    CHECK(towerMissed.primaryObjectivePresent);
+    CHECK(!towerMissed.primaryObjectiveComplete);
+    CHECK(towerMissed.primaryScore == 0);
+    CHECK(towerMissed.totalScore == 61);
+
+    towerStats.commTowersDestroyed = 1;
+    const MissionReport towerFelled = MissionSystem::Grade(
+        loadout, towerStats, 200.0f, 3);
+    CHECK(towerFelled.primaryObjectiveComplete);
+    CHECK(towerFelled.primaryScore == MissionSystem::kPrimaryObjectiveScore);
+    CHECK(towerFelled.totalScore == 86);
+
+    MissionRunStats twoTowers = missionStats;
+    twoTowers.commTowersTotal = 2;
+    twoTowers.commTowersDestroyed = 1;
+    const MissionReport halfCleared = MissionSystem::Grade(
+        loadout, twoTowers, 200.0f, 3);
+    CHECK(!halfCleared.primaryObjectiveComplete);
+    CHECK(halfCleared.primaryScore == 13);   // lround(25 * 1/2)
+
+    // A stray extra report cannot credit a tower the level never authored.
+    MissionSystem overCounted;
+    overCounted.SetCommTowerCount(1);
+    overCounted.RecordCommTowerDestroyed();
+    overCounted.RecordCommTowerDestroyed();
+    CHECK(overCounted.Stats().commTowersDestroyed == 1);
+    CHECK(overCounted.CommTowerObjectiveComplete());
 
     PlayerMovementTracker movement;
     CHECK(movement.Update({ 0.0f, 0.0f, 0.0f }, 0.1f) == 0.0f);
@@ -442,6 +482,65 @@ int main() {
     CHECK(fastRappelLoadout.reloadingSlot == -1);
     CHECK(player.maxReserve[7] == 24);
 
+    // AA emplacement. The gun is only a threat if it leads a moving aircraft
+    // and slews at a finite rate, so both are pinned here.
+    VehicleSystem aa;
+    CHECK(!aa.AATurretActive());          // absent until a level places one
+    aa.PlaceAATurret({ 0.0f, 0.0f, 0.0f });
+    CHECK(aa.AATurretActive());
+    CHECK(std::abs(aa.AATurretHealthFraction() - 1.0f) < 0.001f);
+
+    // Lead point sits ahead of a crossing target, along its travel.
+    const DirectX::XMFLOAT3 crossing{ 0.0f, 40.0f, 90.0f };
+    const DirectX::XMFLOAT3 crossingVelocity{ 25.0f, 0.0f, 0.0f };
+    const DirectX::XMFLOAT3 lead =
+        aa.AATurretLeadPoint(crossing, crossingVelocity, 240.0f);
+    CHECK(lead.x > crossing.x);
+    CHECK(std::abs(lead.z - crossing.z) < 0.001f);
+    // A stationary target needs no lead at all.
+    const DirectX::XMFLOAT3 still =
+        aa.AATurretLeadPoint(crossing, { 0.0f, 0.0f, 0.0f }, 240.0f);
+    CHECK(std::abs(still.x - crossing.x) < 0.001f);
+
+    // The mount cannot snap onto a target behind it: one short tick turns it by
+    // at most AATurretYawRate * dt, which is what makes flying wide of the gun
+    // a real option rather than a formality.
+    aa.aaTurretYaw = 0.0f;
+    aa.UpdateAATurret(0.05f, { 0.0f, 20.0f, -80.0f }, true);
+    CHECK(std::abs(aa.aaTurretYaw) <=
+          VehicleSystem::AATurretYawRate * 0.05f + 0.0001f);
+    // No target: the gun holds fire rather than emptying a burst into empty sky.
+    CHECK(!aa.UpdateAATurret(0.05f, {}, false));
+
+    // Elevation is clamped to the gun's arc, so it cannot fold over backwards
+    // tracking something directly overhead.
+    for (int i = 0; i < 200; ++i)
+        aa.UpdateAATurret(0.05f, { 0.0f, 500.0f, 0.1f }, true);
+    CHECK(aa.aaTurretPitch <= VehicleSystem::AATurretMaxPitch + 0.0001f);
+    CHECK(aa.aaTurretPitch >= VehicleSystem::AATurretMinPitch - 0.0001f);
+
+    // The ground dead zone has to clear the closest deployment zone the
+    // perimeter ring can produce. On the shipping island that zone sits ~6.7 m
+    // from the emplacement, so anything at or under that distance must fall
+    // inside the dead zone or landing there means being shot on arrival.
+    CHECK(VehicleSystem::AATurretGroundMinRange > 6.7f);
+    CHECK(VehicleSystem::AATurretGroundMinRange <
+          VehicleSystem::AATurretGroundRange);
+
+    // Destroying it silences it: a dead gun never reports another shot.
+    CHECK(!aa.DamageAATurret(VehicleSystem::AATurretMaxHealth * 0.5f).destroyed);
+    CHECK(aa.DamageAATurret(VehicleSystem::AATurretMaxHealth).destroyed);
+    CHECK(!aa.AATurretActive());
+    CHECK(!aa.UpdateAATurret(0.05f, { 0.0f, 40.0f, 40.0f }, true));
+    // And a further hit on the wreck is not a second kill.
+    CHECK(!aa.DamageAATurret(100.0f).applied);
+
+    // ResetLevel clears the emplacement, so the next map does not inherit it.
+    aa.PlaceAATurret({ 5.0f, 1.0f, 5.0f });
+    aa.ResetLevel();
+    CHECK(!aa.aaTurretPresent);
+    CHECK(!aa.AATurretActive());
+
     const auto deploymentZones = DeploymentPlanner::BuildPerimeterZones(
         34.0f, 68.0f, 8,
         [](float x, float z) { return x * 0.25f + z * 0.5f; });
@@ -557,6 +656,61 @@ int main() {
     // (The always-carried C4 rule lives in GunModel, which pulls in DX12Core and
     // the asset importers -- too heavy for this renderer-free target to link.
     // Verified by inspection and in-game instead.)
+
+    // ---- Enemy reinforcement dropship ---------------------------------------
+    // The wave flies in on the shared secondary-helicopter fields, so the state
+    // machine has to hand the airframe back cleanly or the patrol path and the
+    // dropship fight over the same position every frame.
+    {
+        VehicleSystem vehicles;
+        CHECK(!vehicles.DropshipActive());
+        CHECK(vehicles.DropshipAvailable());
+
+        const DirectX::XMFLOAT3 entry{ 200.0f, 30.0f, 0.0f };
+        const DirectX::XMFLOAT3 drop{ 0.0f, 0.0f, 0.0f };
+        vehicles.BeginDropshipRun(entry, drop, 3);
+        CHECK(vehicles.DropshipActive());
+        CHECK(vehicles.dropshipTroopsLeft == 3);
+        CHECK(vehicles.dropshipWavesCalled == 1);
+        // The slot is taken: a second call-in must not preempt the first.
+        CHECK(!vehicles.DropshipAvailable());
+        vehicles.BeginDropshipRun(entry, drop, 5);
+        CHECK(vehicles.dropshipTroopsLeft == 3);   // unchanged
+        CHECK(vehicles.dropshipWavesCalled == 1);  // and not counted
+
+        // Fly the whole run at a fixed step, counting what it unloads. The cap
+        // guards against a state that never terminates.
+        int released = 0;
+        int steps = 0;
+        while (vehicles.DropshipActive() && steps++ < 4000)
+            released += vehicles.UpdateDropship(1.0f / 60.0f, 0.0f);
+
+        CHECK(released == 3);                 // every troop left the craft
+        CHECK(vehicles.dropshipTroopsLeft == 0);
+        CHECK(!vehicles.DropshipActive());    // and the slot came back
+        CHECK(vehicles.DropshipAvailable());
+        CHECK(steps < 4000);                  // terminated on its own
+
+        // Second wave is allowed once the first has cleared, and escalates.
+        vehicles.BeginDropshipRun(entry, drop, 4);
+        CHECK(vehicles.dropshipWavesCalled == 2);
+
+        // A gunship shot down mid-run stops unloading immediately -- the rest of
+        // the squad goes down with the aircraft rather than spawning in midair.
+        vehicles.secondaryHelicopterDead = true;
+        const int afterDeath = vehicles.UpdateDropship(1.0f / 60.0f, 0.0f);
+        CHECK(afterDeath == 0);
+        CHECK(!vehicles.DropshipActive());
+        CHECK(vehicles.dropshipTroopsLeft == 0);
+        // And a downed airframe cannot be sent back up.
+        CHECK(!vehicles.DropshipAvailable());
+        vehicles.BeginDropshipRun(entry, drop, 3);
+        CHECK(!vehicles.DropshipActive());
+
+        // Reset clears the wave counter so a restarted run starts from wave 1.
+        vehicles.ResetDropship();
+        CHECK(vehicles.dropshipWavesCalled == 0);
+    }
 
     return failures ? 1 : 0;
 }

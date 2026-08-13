@@ -81,6 +81,9 @@ DirectX::XMMATRIX HumveeWorldMatrix();
 DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
 DirectX::XMMATRIX HelicopterWorldMatrix();
 DirectX::XMMATRIX SecondaryHelicopterWorldMatrix();
+// True when the second airframe should be drawn: the stress-test patrol
+// gunship, or a reinforcement dropship flying a wave in.
+bool SecondaryHelicopterVisible();
 DirectX::XMMATRIX BoatWorldMatrix();
 DirectX::XMMATRIX InsertionBoatWorldMatrix();
 bool InsertionBoatVisible();
@@ -96,6 +99,9 @@ DirectX::XMFLOAT3 BlackHawkRappelPlayerWorldPosition();
 // transform+colour+shape layout as the water floaters and ragdoll parts, so it
 // draws through the ordinary textured-primitive path.
 const std::vector<RopeItem>& BlackHawkRopeItems();
+// Fast-ropes hanging under the enemy reinforcement dropship, one per troop
+// still descending. Empty whenever no wave is unloading.
+const std::vector<RopeItem>& DropshipRopeItems();
 bool DeploymentPlanningActive();
 const std::vector<DirectX::XMFLOAT3>& DeploymentZonePositions();
 int SelectedDeploymentZoneIndex();
@@ -1369,6 +1375,16 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 else DrawCube(geo);
                 shader.NextDrawCall();
             }
+            // Enemy fast-ropes. Same layout, so they share the path above.
+            for (const RopeItem& item : DropshipRopeItems()) {
+                shader.SetMatrices(XMLoadFloat4x4(&item.transform), view, proj,
+                                   lightSpace);
+                shader.SetObjectColor(item.color);
+                if (item.shape == 2) DrawSphere(geo);
+                else if (item.shape == 1) DrawCapsule(geo);
+                else DrawCube(geo);
+                shader.NextDrawCall();
+            }
         }
         // Hover enemies carry the same imported AK as the player. Gun transforms
         // are aimed independently while ragdoll limbs trail under physics.
@@ -1668,7 +1684,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         g_useMeshShader = false;
         DrawSceneNode(g_helicopterModel, shader, HelicopterWorldMatrix(),
                       view, proj, lightSpace, visibilityExtensionsOnly);
-        if (g_stressTestMode)
+        if (SecondaryHelicopterVisible())
             DrawSceneNode(g_helicopterModel, shader, SecondaryHelicopterWorldMatrix(),
                           view, proj, lightSpace, visibilityExtensionsOnly);
         g_useMeshShader = meshShadersWereEnabled;

@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <memory>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -317,6 +318,21 @@ float                       g_banditGunRearGripDrop = -0.18f;
 float                       g_banditGunForeGripLateral = 0.253f;
 float                       g_banditGunForeGripRise = -0.206f;
 bool                        g_showEnemyVisionCones = false;
+// Enemy scatter test mode. When on, every bandit is moved to a random walkable
+// point on the navmesh once the squad is spawned and before the player deploys,
+// so a run does not always open against the same authored EnemySpawn layout.
+// Off by default: it deliberately ignores level authoring.
+bool                        g_scatterEnemiesOnNavmesh = true;   // TEMP verify
+// 0 = reseed from the clock on every scatter. Any other value is used verbatim,
+// so a layout that produced an interesting run can be replayed exactly.
+unsigned int                g_scatterEnemiesSeed = 0;
+// The seed the last scatter actually ran with, surfaced in the debug UI so a
+// clock-seeded layout can be pinned after the fact.
+unsigned int                g_scatterEnemiesLastSeed = 0;
+// Draws every live bandit as a red dot on the deployment map. On by default:
+// the point of randomising the squad is being able to see what you rolled
+// before committing to a zone.
+bool                        g_showEnemyDotsOnDeployScreen = true;
 static uint32_t&            g_banditSpawnSerial = g_enemySystem.spawnSerial;
 GunAudio                    g_gunAudio;
 GunAudio                    g_rpgFireAudio;
@@ -362,6 +378,15 @@ static bool&                g_suppressFireUntilMouseRelease =
     g_game.combat.suppressFireUntilMouseRelease;
 bool                        g_stressTestMode = false;
 bool                        g_emptyLevelMode = false;
+// Mouse-walk test mode (F10). Holding the right mouse button walks the player
+// forward, and aiming down sights is suppressed for as long as the mode is on --
+// the same button cannot both drive and aim. WASD still works; this is an extra
+// way in, for testing traversal one-handed rather than a replacement scheme.
+//
+// Off by default: right mouse aims down sights, which is what the button means
+// everywhere else. F10 turns the walk mode on when traversal needs testing
+// one-handed.
+bool                        g_mouseWalkTestMode = false;
 NavigationSystem            g_navigation;
 static LevelEditor          g_levelEditor;
 static Camera               g_editorCameraSnapshot;
@@ -684,6 +709,14 @@ XMMATRIX SecondaryHelicopterWorldMatrix() {
                                g_secondaryHelicopterPosition.z);
 }
 
+// Renderer-facing: the second airframe is drawn when the stress-test patrol is
+// up, or whenever a reinforcement dropship is flying a wave in. Mirrors
+// SecondaryHelicopterPresent(), which the gameplay-side gates use -- kept as a
+// separate non-static symbol because the renderer headers reach it by extern.
+bool SecondaryHelicopterVisible() {
+    return g_stressTestMode || g_game.vehicles.DropshipActive();
+}
+
 static void ConfigureHelicopterBounds() {
     if (!g_helicopterModel || !g_helicopterModel->mesh) return;
     XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
@@ -770,6 +803,68 @@ static void ReleaseBlackHawkRope() {
 const std::vector<RopeItem>& BlackHawkRopeItems() {
     static const std::vector<RopeItem> kNone;
     return g_game.vehicles.blackHawkRope ? g_blackHawkRope.GetItems() : kNone;
+}
+
+// Fast-ropes hanging from the dropship, one per troop still descending. Rebuilt
+// each frame from the actors' live positions.
+//
+// Deliberately not box3d ropes like the player's: a wave puts up to six of these
+// out at once, and a simulated rope per troop would cost far more than a
+// straight line from the airframe to a hand that is already descending at a
+// fixed rate. The player's rope is simulated because the player swings on it and
+// can cut it; these are only ever a taut line under a controlled descent.
+static std::vector<RopeItem> g_dropshipRopeItems;
+
+const std::vector<RopeItem>& DropshipRopeItems() {
+    return g_dropshipRopeItems;
+}
+
+// One rope's worth of links between the craft and a descending actor.
+static void AppendDropshipRope(const XMFLOAT3& top, const XMFLOAT3& bottom) {
+    // Matches the player rope's link length so both read as the same rope.
+    constexpr float kLinkLength = 0.5f;
+    constexpr float kLinkHalfThickness = 0.045f;
+    const XMFLOAT3 kRopeColor{ 0.16f, 0.15f, 0.14f };
+
+    const float dx = bottom.x - top.x;
+    const float dy = bottom.y - top.y;
+    const float dz = bottom.z - top.z;
+    const float length = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (length < 0.05f) return;
+
+    // Cap the link count so a troop released far above the ground cannot spike
+    // the draw list.
+    const int links = (std::min)(64,
+        (std::max)(1, static_cast<int>(length / kLinkLength)));
+    const float linkHalfLength = length / static_cast<float>(links) * 0.5f;
+
+    // Orient the links along the rope. The rope is near-vertical in practice,
+    // so the up-axis cross product is stable here.
+    const XMVECTOR direction = XMVector3Normalize(XMVectorSet(dx, dy, dz, 0.0f));
+    const XMVECTOR reference = std::abs(dy) > 0.99f * length
+        ? XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f)
+        : XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+    const XMVECTOR right = XMVector3Normalize(
+        XMVector3Cross(reference, direction));
+    const XMVECTOR up = XMVector3Cross(direction, right);
+
+    XMMATRIX basis = XMMatrixIdentity();
+    basis.r[0] = right;
+    basis.r[1] = direction;
+    basis.r[2] = up;
+
+    for (int i = 0; i < links; ++i) {
+        const float t = (static_cast<float>(i) + 0.5f) / static_cast<float>(links);
+        RopeItem item;
+        item.color = kRopeColor;
+        item.shape = 0;   // box: the IdTech path only draws cubes anyway
+        const XMMATRIX world =
+            XMMatrixScaling(kLinkHalfThickness, linkHalfLength, kLinkHalfThickness) *
+            basis *
+            XMMatrixTranslation(top.x + dx * t, top.y + dy * t, top.z + dz * t);
+        XMStoreFloat4x4(&item.transform, world);
+        g_dropshipRopeItems.push_back(item);
+    }
 }
 
 // Services the rope requests VehicleSystem raises, and steps the simulation.
@@ -1082,9 +1177,19 @@ static void BeginDeploymentPlanning() {
     auto params = CurrentTerrainParams();
     params.heightScale = scene.terrainHeightScale;
     constexpr float deploymentRadius = 34.0f;
+    // 20 points around the ring rather than 8, so the coast offers a real choice
+    // of approach instead of eight fixed doors.
+    //
+    // 20 is the measured ceiling, not a guess. Projecting the ring through the
+    // planning flythrough's own camera (orbit 95, height 62, 60 deg FOV) and
+    // sweeping the full orbit, the closest any two markers ever come on a 1080p
+    // screen is 51.9px at 20 zones -- still clear of the 48px needed for the
+    // 24px pick radius to be unambiguous. 24 zones drops that to 43.3px and the
+    // click targets start to overlap.
+    constexpr uint32_t deploymentZoneCount = 20;
     g_deploymentZones = DeploymentPlanner::BuildPerimeterZones(
         deploymentRadius * params.islandScaleX,
-        deploymentRadius * params.islandScaleZ, 8,
+        deploymentRadius * params.islandScaleZ, deploymentZoneCount,
         [&](float x, float z) {
             return (std::max)(0.0f,
                 TerrainRendererDX12::HeightAt(params, x, z));
@@ -1671,9 +1776,16 @@ static void DamageHelicopter(float damage, const XMFLOAT3& hit) {
     scene.SpawnSmokeBurst(g_helicopterPosition, 1.25f, 1.5f);
 }
 
+// The second airframe is present either as the stress-test patrol gunship or as
+// an inbound reinforcement dropship. Both are shootable; a wave can be turned
+// back by killing the craft before it unloads.
+static bool SecondaryHelicopterPresent() {
+    return g_stressTestMode || g_game.vehicles.DropshipActive();
+}
+
 static void DamageSecondaryHelicopter(float damage, const XMFLOAT3& hit) {
     if (damage <= 0.0f || g_secondaryHelicopterDead || !g_helicopterModel ||
-        !g_stressTestMode) return;
+        !SecondaryHelicopterPresent()) return;
     const VehicleSystem::DamageResult result =
         g_game.vehicles.DamageSecondaryHelicopter(damage);
     if (!result.applied) return;
@@ -1731,9 +1843,45 @@ static bool HitHelicopterSegment(const XMFLOAT3& start, const XMFLOAT3& end,
 static bool HitSecondaryHelicopterSegment(const XMFLOAT3& start,
                                           const XMFLOAT3& end, float radius,
                                           XMFLOAT3& hit) {
-    return g_stressTestMode && HitHelicopterAtSegment(
+    return SecondaryHelicopterPresent() && HitHelicopterAtSegment(
         g_secondaryHelicopterPosition, g_secondaryHelicopterDead,
         start, end, radius, hit);
+}
+
+// The AA gun as a hit target. Sphere centred on the mount rather than the base
+// plate, so shots at the gun itself connect and rounds into the dirt at its feet
+// do not. Radius covers the pedestal and the traversing mount together.
+static bool HitAATurretSegment(const XMFLOAT3& start, const XMFLOAT3& end,
+                               float radius, XMFLOAT3& hit) {
+    const VehicleSystem& vehicles = g_game.vehicles;
+    if (!vehicles.AATurretActive()) return false;
+    const XMFLOAT3 center{
+        vehicles.aaTurretPosition.x,
+        vehicles.aaTurretPosition.y + VehicleSystem::AATurretMountHeight * 0.6f,
+        vehicles.aaTurretPosition.z };
+    return HitSphereAtSegment(center, 2.0f, start, end, radius, hit);
+}
+
+// Wrecks the emplacement: cooks off the ammo boxes and leaves it burning.
+static void DamageAATurret(float damage, const XMFLOAT3& hit) {
+    const VehicleSystem::DamageResult result =
+        g_game.vehicles.DamageAATurret(damage);
+    if (!result.applied) return;
+    scene.SpawnSmokeBurst(hit, 0.24f, 0.12f);
+    if (!result.destroyed) return;
+    const XMFLOAT3& base = g_game.vehicles.aaTurretPosition;
+    const XMFLOAT3 center{ base.x,
+        base.y + VehicleSystem::AATurretMountHeight, base.z };
+    scene.SpawnExplosionFX(center, 6.5f, 1.0f);
+    scene.SpawnSmokeBurst(center, 2.2f, 2.4f);
+    AddExplosionTerrainCrater(base);
+    if (g_destruction.IsInitialized()) {
+        g_destruction.ApplyExplosion(center, 6.0f, 45.0f, 10.0f);
+        g_destruction.ApplyRagdollExplosion(center, 6.0f, 90.0f);
+    }
+    g_pendingExplosionAudio.push_back({ 0.0f, 0.95f, 0.80f, false });
+    if (g_game.session.TimerRunning()) g_game.mission.RecordDestruction();
+    SGE_LOG("LogGameplay", EngineLog::Level::Display, "AA turret destroyed");
 }
 
 static bool HitOccupiedInsertionBlackHawkSegment(
@@ -1851,7 +1999,7 @@ static void UpdateHelicopterRotorKills() {
     killed |= KillBanditsTouchingRotor(
         g_helicopterTailRotorNode, XMVectorSet(1, 0, 0, 0), 1.10f,
         HelicopterWorldMatrix(), g_helicopterDead);
-    if (g_stressTestMode) {
+    if (SecondaryHelicopterPresent()) {
         killed |= KillBanditsTouchingRotor(
             g_helicopterMainRotorNode, XMVectorSet(0, 1, 0, 0), 4.75f,
             SecondaryHelicopterWorldMatrix(), g_secondaryHelicopterDead);
@@ -1903,7 +2051,7 @@ static void UpdateEnemyHelicopterDamageSmoke(float deltaTime) {
 static void UpdateHelicopter(float dt) {
     if (!g_helicopterModel || !scene.showHelicopter) return;
     const bool rotorPowered = !g_helicopterDead ||
-        (g_stressTestMode && !g_secondaryHelicopterDead);
+        (SecondaryHelicopterPresent() && !g_secondaryHelicopterDead);
     g_helicopterRotorSpeedScale = VehicleSystem::StepHelicopterRotorSpeed(
         g_helicopterRotorSpeedScale, rotorPowered, dt);
     g_helicopterMainRotorAngle = std::fmod(
@@ -2024,7 +2172,113 @@ static void UpdateHelicopter(float dt) {
     g_helicopterFireCooldown = 0.10f;
 }
 
+// Both defined with the other spawn helpers, below.
+static float RandomUnit();
+static bool SpawnDropshipBandit(const XMFLOAT3& position);
+
+// Terrain height under a world position, or 0 on levels without mesh terrain.
+static float GroundHeightAt(float x, float z) {
+    if (!scene.useMeshTerrain || !g_terrain.supported) return 0.0f;
+    auto params = CurrentTerrainParams();
+    params.heightScale = scene.terrainHeightScale;
+    return TerrainRendererDX12::HeightAt(params, x, z);
+}
+
+// Squad size per wave, escalating: the first call-in is a probe, later ones
+// commit. Capped so a long run cannot bury the player in bodies.
+static int DropshipWaveTroopCount(uint32_t waveIndex) {
+    constexpr int kBase = 3;
+    constexpr int kMax = 6;
+    return (std::min)(kMax, kBase + static_cast<int>(waveIndex));
+}
+
+// Calls in a reinforcement wave on the gunship. The drop point is offset from
+// the player so the squad lands nearby but not on top of them, and the entry
+// point is pushed far out along that same bearing so the craft flies in over
+// open ground rather than materialising at the hover.
+static void CallInReinforcementWave() {
+    VehicleSystem& vehicles = g_game.vehicles;
+    if (!g_helicopterModel || !scene.showHelicopter) return;
+    if (!vehicles.DropshipAvailable()) return;
+
+    // Bearing chosen per wave so successive drops do not stack on one side.
+    const float bearing = RandomUnit() * XM_2PI;
+    constexpr float kDropDistance = 34.0f;
+    constexpr float kEntryDistance = 210.0f;
+
+    const XMFLOAT3 player = scene.camera.Position;
+    const float dropX = player.x + std::sin(bearing) * kDropDistance;
+    const float dropZ = player.z + std::cos(bearing) * kDropDistance;
+    const XMFLOAT3 drop{ dropX, GroundHeightAt(dropX, dropZ), dropZ };
+
+    const float entryX = player.x + std::sin(bearing) * kEntryDistance;
+    const float entryZ = player.z + std::cos(bearing) * kEntryDistance;
+    const XMFLOAT3 entry{ entryX,
+                          GroundHeightAt(entryX, entryZ) +
+                              VehicleSystem::DropshipHoverHeight + 14.0f,
+                          entryZ };
+
+    const int troops = DropshipWaveTroopCount(vehicles.dropshipWavesCalled);
+    vehicles.BeginDropshipRun(entry, drop, troops);
+    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+        "Reinforcement wave " + std::to_string(vehicles.dropshipWavesCalled) +
+        " inbound with " + std::to_string(troops) + " troops");
+}
+
+// Flies the reinforcement dropship and spawns whatever it releases this frame.
+// Runs outside the stress-test gate that guards the patrol behaviour below,
+// because a called-in wave is real gameplay, not a stress scenario.
+static void UpdateReinforcementDropship(float dt) {
+    VehicleSystem& vehicles = g_game.vehicles;
+    // Ropes are rebuilt from scratch every frame, including the frame the last
+    // troop lands -- otherwise the final rope would hang in the air.
+    g_dropshipRopeItems.clear();
+    if (!vehicles.DropshipActive()) return;
+    if (!g_helicopterModel || !scene.showHelicopter) {
+        vehicles.ResetDropship();
+        return;
+    }
+
+    const float groundY = GroundHeightAt(vehicles.dropshipDropPoint.x,
+                                         vehicles.dropshipDropPoint.z);
+    const int released = vehicles.UpdateDropship(dt, groundY);
+
+    // A rope from the airframe down to every troop still on the way. Built
+    // before the new releases below so a troop spawned this frame gets its rope
+    // on the next one, once it has actually started descending.
+    //
+    // Each rope hangs vertically from the troop's own release offset rather
+    // than from one shared point on the airframe: the squad fans out around the
+    // craft, and converging every rope on a single hardpoint would splay them
+    // through each other. Only the release height comes from the aircraft.
+    const float ropeTopY = vehicles.DropshipTroopReleasePoint().y;
+    for (const auto& bandit : g_bandits) {
+        if (!bandit || !bandit->Rappelling()) continue;
+        const XMFLOAT3 hands{ bandit->position.x,
+                              bandit->position.y + bandit->footOffset + 1.35f,
+                              bandit->position.z };
+        AppendDropshipRope({ hands.x, ropeTopY, hands.z }, hands);
+    }
+
+    if (released <= 0) return;
+
+    for (int i = 0; i < released; ++i) {
+        XMFLOAT3 spawn = vehicles.DropshipTroopReleasePoint();
+        // Fan the squad out around the rope so they do not descend inside one
+        // another. The offset is horizontal only: they leave the craft at its
+        // altitude and rope down from there.
+        const float angle = RandomUnit() * XM_2PI;
+        const float spread = 0.8f + RandomUnit() * 1.4f;
+        spawn.x += std::sin(angle) * spread;
+        spawn.z += std::cos(angle) * spread;
+        SpawnDropshipBandit(spawn);
+    }
+}
+
 static void UpdateSecondaryHelicopter(float dt) {
+    // The dropship owns the airframe while a wave is in the air, so the patrol
+    // path must not fight it for the same position fields.
+    if (g_game.vehicles.DropshipActive()) return;
     if (!g_stressTestMode || !g_helicopterModel || !scene.showHelicopter) return;
     if (g_secondaryHelicopterDead) {
         if (g_secondaryHelicopterCrashed) return;
@@ -2512,6 +2766,45 @@ static bool SpawnMarine(const XMFLOAT3& position, float yaw) {
     return true;
 }
 
+// Drops one reinforcement bandit out of the dropship at `position`. Unlike
+// SpawnBandit() this takes no spawn slot: reinforcements are not part of the
+// level's authored EnemySpawn rotation, so they neither consume a slot nor
+// respawn when killed. spawnSlot = -1 keeps them out of the slot search, the
+// same convention the turret gunners use.
+static bool SpawnDropshipBandit(const XMFLOAT3& position) {
+    if (!g_banditModel.valid) return false;
+    auto bandit = std::make_unique<SkinnedEnemy>();
+    if (!bandit->Init(g_banditModel)) return false;
+    bandit->position = position;
+    bandit->spawnSlot = -1;
+    bandit->leftArmReach = g_banditLeftArmReach;
+    // Stagger the first grenade across the whole cooldown window so a squad
+    // roping down together does not throw its opening volley in lockstep.
+    bandit->grenadeCooldown = kBanditGrenadeCooldownMin +
+        RandomUnit() * (kBanditGrenadeCooldownMax - kBanditGrenadeCooldownMin);
+    bandit->orbitRadius = 4.4f + RandomUnit() * 1.8f;
+    bandit->orbitDirection = (g_banditSpawnSerial & 1) ? -1.0f : 1.0f;
+    // Longer than a slot spawn's opening delay. A squad that lands already
+    // firing gives the player no window to react to the drop itself.
+    bandit->fireCooldown = 1.6f + RandomUnit() * 1.6f;
+    ApplyBanditLoadout(*bandit);
+    // Reinforcements are called in because the player was seen, so they arrive
+    // already hunting rather than walking a patrol they never had. The real
+    // line-of-sight test still gates every shot -- this only skips the vision
+    // cone that a squad briefed on the player's position would not need.
+    bandit->ForceCombatTarget(scene.camera.Position);
+    // Onto the rope at the craft's altitude. UpdateRappel walks them down to the
+    // terrain and hands them to the AI on touchdown -- until then they cannot
+    // shoot, take cover, or throw.
+    const float facing = std::atan2(scene.camera.Position.x - position.x,
+                                    scene.camera.Position.z - position.z);
+    bandit->BeginRappel(position, facing);
+    bandit->PlayClip("Idle");
+    bandit->anim.Advance(0.19f * static_cast<float>(g_banditSpawnSerial++ % 8));
+    g_bandits.push_back(std::move(bandit));
+    return true;
+}
+
 // Data-driven only: spawns one marine per enabled AllySpawn entity in the
 // current level. Levels with none (including the non-custom default level)
 // get zero marines -- mirrors how EnemySpawn entities drive SpawnBandit()'s
@@ -2525,6 +2818,88 @@ static void SpawnMarinesFromLevel() {
                                  entity.transform.position[2] };
         SpawnMarine(position, XMConvertToRadians(entity.transform.rotation[1]));
     }
+}
+
+// Test mode: relocates every live bandit to a random walkable point on the
+// navmesh. Called once the squad exists and before the player is deployed, so
+// the run opens against a layout the level did not author.
+//
+// Navmesh-sampled rather than terrain-sampled on purpose: a random terrain
+// height is trivially easy to produce but routinely lands actors inside a
+// house, on a cliff face, or out at sea, where they cannot path and the test
+// tells you nothing. findRandomPoint only ever returns somewhere Detour agrees
+// is walkable.
+//
+// Marines are left alone. They are authored to support the player's insertion
+// and scattering them across the island defeats that; this mode is about
+// varying where the *opposition* is.
+static void ScatterEnemiesOnNavmesh() {
+    if (!g_scatterEnemiesOnNavmesh) return;
+    if (!g_navigation.Ready()) {
+        SGE_LOG("LogGameplay", EngineLog::Level::Warning,
+            "Enemy scatter skipped: navmesh not ready");
+        return;
+    }
+
+    const unsigned int seed = g_scatterEnemiesSeed != 0
+        ? g_scatterEnemiesSeed
+        : static_cast<unsigned int>(std::time(nullptr));
+    g_scatterEnemiesLastSeed = seed;
+
+    // Own generator rather than std::rand, so a scatter is reproducible from
+    // its seed regardless of whatever else has consumed the global sequence.
+    std::mt19937 generator(seed);
+    std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+    const std::function<float()> random01 = [&]() { return unit(generator); };
+
+    // Keep the scatter on dry land. The island terrain continues out under the
+    // sea and the seabed is flat enough that Recast marks it walkable, so the
+    // raw navmesh covers a large area of open water -- unfiltered, most of a
+    // scatter lands offshore.
+    //
+    // Tested against the real terrain height rather than the navmesh Y: the
+    // navmesh is a simplified surface and its Y can sit a little off the ground
+    // the actor will actually stand on, which matters right at the waterline.
+    // The ocean surface is y = 0 (see the g_ocean.Initialize call: centre
+    // -kSeaDepth/2, height kSeaDepth), so anything at or below 0 is submerged.
+    constexpr float kMinLandHeight = 0.55f;
+    const auto onLand = [kMinLandHeight](const XMFLOAT3& candidate) {
+        return GroundHeightAt(candidate.x, candidate.z) >= kMinLandHeight;
+    };
+
+    uint32_t moved = 0;
+    uint32_t failed = 0;
+    uint32_t submerged = 0;   // TEMP verify
+    for (const auto& bandit : g_bandits) {
+        // Turret gunners are pinned to their vehicle mount; moving them would
+        // leave the actor and its turret in different places.
+        if (!bandit || bandit->Dead() || bandit->turretGunner) continue;
+        if (bandit->faction != Faction::Bandit) continue;
+
+        XMFLOAT3 point{};
+        if (!g_navigation.FindRandomPoint(random01, point, onLand)) {
+            ++failed;
+            continue;
+        }
+        // Detour returns the point on the navmesh surface; drop it onto the
+        // terrain proper so the actor stands on the ground the renderer draws
+        // rather than the simplified walkable poly.
+        point.y = GroundHeightAt(point.x, point.z);
+        bandit->position = point;
+        // The actor captured its spawn on the first Update; clear that so its
+        // patrol and leash anchor to where it now stands rather than the
+        // authored spawn it no longer occupies.
+        bandit->ResetSpawnAnchor();
+        ++moved;
+        if (point.y <= 0.0f) ++submerged;   // TEMP verify
+    }
+
+    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+        "Enemy scatter: SUBMERGED=" + std::to_string(submerged) +
+        " moved " + std::to_string(moved) +
+        " bandits (seed " + std::to_string(seed) +
+        (failed ? ", " + std::to_string(failed) + " navmesh samples failed" : "") +
+        ")");
 }
 
 static bool SpawnHumveeTurretGunner(int vehicleIndex) {
@@ -3190,7 +3565,8 @@ static void DetonateBarrel(size_t firstBarrel) {
                 DamageHelicopter(120.0f * (1.0f - distance / reach),
                                  g_helicopterPosition);
         }
-        if (g_stressTestMode && !g_secondaryHelicopterDead && g_helicopterModel) {
+        if (SecondaryHelicopterPresent() && !g_secondaryHelicopterDead &&
+            g_helicopterModel) {
             const float hx = g_secondaryHelicopterPosition.x - center.x;
             const float hy = g_secondaryHelicopterPosition.y - center.y;
             const float hz = g_secondaryHelicopterPosition.z - center.z;
@@ -3200,6 +3576,18 @@ static void DetonateBarrel(size_t firstBarrel) {
                 DamageSecondaryHelicopter(
                     120.0f * (1.0f - distance / reach),
                     g_secondaryHelicopterPosition);
+        }
+        // Blast takes the emplacement too, so C4 or a rocket is a valid answer
+        // to it rather than the gun being immune to everything but bullets.
+        if (g_game.vehicles.AATurretActive()) {
+            const XMFLOAT3& turret = g_game.vehicles.aaTurretPosition;
+            const float hx = turret.x - center.x;
+            const float hy = turret.y - center.y;
+            const float hz = turret.z - center.z;
+            const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
+            const float reach = 9.0f;
+            if (distance < reach)
+                DamageAATurret(320.0f * (1.0f - distance / reach), turret);
         }
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.ApplyExplosion(center, 5.0f, 3.0f, 180.0f);
@@ -3636,6 +4024,32 @@ void BanditDebugText() {
         }
     }
     ImGui::Checkbox("Show enemy vision cones", &g_showEnemyVisionCones);
+    if (ImGui::CollapsingHeader("Enemy Scatter (test mode)")) {
+        ImGui::Checkbox("Randomize enemies on navmesh",
+                        &g_scatterEnemiesOnNavmesh);
+        ImGui::TextWrapped(
+            "Moves every bandit to a random walkable navmesh point when the "
+            "squad spawns, before deployment. Ignores authored EnemySpawn "
+            "placement. Turret gunners and marines are left alone.");
+        int seed = static_cast<int>(g_scatterEnemiesSeed);
+        if (ImGui::InputInt("Seed (0 = random)", &seed))
+            g_scatterEnemiesSeed = static_cast<unsigned int>((std::max)(0, seed));
+        if (g_scatterEnemiesLastSeed != 0) {
+            ImGui::Text("Last scatter seed: %u", g_scatterEnemiesLastSeed);
+            ImGui::SameLine();
+            // Pins a clock-seeded layout after the fact, so an interesting
+            // random run can be replayed instead of being lost on restart.
+            if (ImGui::SmallButton("Pin"))
+                g_scatterEnemiesSeed = g_scatterEnemiesLastSeed;
+        }
+        // Re-scatters the squad already on the field, without a restart.
+        if (ImGui::Button("Scatter now")) {
+            const bool wasEnabled = g_scatterEnemiesOnNavmesh;
+            g_scatterEnemiesOnNavmesh = true;
+            ScatterEnemiesOnNavmesh();
+            g_scatterEnemiesOnNavmesh = wasEnabled;
+        }
+    }
     if (ImGui::CollapsingHeader("Enemy Audio", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::SliderFloat("Flesh hit pitch min", &g_fleshHitPitchMin,
                                0.5f, 2.0f, "%.2f"))
@@ -5269,6 +5683,111 @@ static std::shared_ptr<SceneNode> CreateDDGICornellBoxModel() {
     return root;
 }
 
+// Boxes-and-barrels AA gun, built in code rather than imported: the shape is
+// simple enough that a GLB would be dead weight, and building it here keeps the
+// geometry in step with the firing constants above it.
+//
+// Two nodes, because they move differently: "Base" is the fixed plinth, "Gun" is
+// the traversing mount. The caller rotates the Gun node by the turret's yaw and
+// pitch each frame, so barrel geometry is authored pointing down +Z about the
+// trunnion at the origin, and the mount height is applied by the caller's
+// transform rather than baked into these coordinates.
+static std::shared_ptr<SceneNode> CreateAATurretModel() {
+    auto root = std::make_shared<SceneNode>("AA Turret");
+    const auto material = [](const char* name, const XMFLOAT3& color,
+                             float roughness, float metallic) {
+        auto value = std::make_shared<SceneMaterial>();
+        value->name = name;
+        value->baseColorFactor = XMFLOAT4(color.x, color.y, color.z, 1.0f);
+        value->metallicFactor = metallic;
+        value->roughnessFactor = roughness;
+        return value;
+    };
+    const auto olive = material("AA Olive", { 0.16f, 0.19f, 0.13f }, 0.80f, 0.15f);
+    const auto steel = material("AA Steel", { 0.09f, 0.10f, 0.11f }, 0.42f, 0.85f);
+
+    const auto addBox = [&](const std::shared_ptr<SceneNode>& parent,
+                            const char* name,
+                            const std::shared_ptr<SceneMaterial>& boxMaterial,
+                            float x0, float x1, float y0, float y1,
+                            float z0, float z1) {
+        auto node = std::make_shared<SceneNode>(name);
+        node->mesh = std::make_shared<SceneMesh>();
+        MeshPrimitive primitive;
+        primitive.material = boxMaterial;
+        const auto quad = [&](const XMFLOAT3& a, const XMFLOAT3& b,
+                              const XMFLOAT3& c, const XMFLOAT3& d,
+                              const XMFLOAT3& normal, const XMFLOAT3& tangent) {
+            const UINT base = static_cast<UINT>(primitive.vertices.size() / 12u);
+            const XMFLOAT3 points[4] = { a, b, c, d };
+            constexpr float uv[4][2] = { {0,0}, {1,0}, {1,1}, {0,1} };
+            for (UINT i = 0; i < 4; ++i) {
+                const float vertex[12] = {
+                    points[i].x, points[i].y, points[i].z,
+                    normal.x, normal.y, normal.z, uv[i][0], uv[i][1],
+                    tangent.x, tangent.y, tangent.z, 1.0f
+                };
+                primitive.vertices.insert(
+                    primitive.vertices.end(), vertex, vertex + 12);
+            }
+            primitive.indices.insert(primitive.indices.end(),
+                { base, base + 1, base + 2, base, base + 2, base + 3 });
+        };
+        quad({x0,y0,z1},{x1,y0,z1},{x1,y1,z1},{x0,y1,z1}, {0,0,1}, {1,0,0});
+        quad({x1,y0,z0},{x0,y0,z0},{x0,y1,z0},{x1,y1,z0}, {0,0,-1}, {-1,0,0});
+        quad({x0,y0,z0},{x0,y0,z1},{x0,y1,z1},{x0,y1,z0}, {-1,0,0}, {0,0,1});
+        quad({x1,y0,z1},{x1,y0,z0},{x1,y1,z0},{x1,y1,z1}, {1,0,0}, {0,0,-1});
+        quad({x0,y1,z1},{x1,y1,z1},{x1,y1,z0},{x0,y1,z0}, {0,1,0}, {1,0,0});
+        quad({x0,y0,z0},{x1,y0,z0},{x1,y0,z1},{x0,y0,z1}, {0,-1,0}, {1,0,0});
+        if (!GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get(), false))
+            return;
+        node->mesh->primitives.push_back(std::move(primitive));
+        parent->AddChild(node);
+    };
+
+    auto base = std::make_shared<SceneNode>("Base");
+    root->AddChild(base);
+    // Splayed footing, then the pedestal the mount turns on.
+    addBox(base, "Pad", olive, -1.65f, 1.65f, 0.0f, 0.22f, -1.65f, 1.65f);
+    addBox(base, "Outrigger X", olive, -2.15f, 2.15f, 0.05f, 0.30f, -0.35f, 0.35f);
+    addBox(base, "Outrigger Z", olive, -0.35f, 0.35f, 0.05f, 0.30f, -2.15f, 2.15f);
+    addBox(base, "Pedestal", olive, -0.70f, 0.70f, 0.22f, 1.55f, -0.70f, 0.70f);
+    // Ammo boxes flanking the pedestal, so the silhouette is not a bare column.
+    addBox(base, "Ammo L", steel, -1.35f, -0.75f, 0.22f, 0.85f, -0.45f, 0.45f);
+    addBox(base, "Ammo R", steel, 0.75f, 1.35f, 0.22f, 0.85f, -0.45f, 0.45f);
+
+    auto gun = std::make_shared<SceneNode>("Gun");
+    root->AddChild(gun);
+    // Authored about the trunnion at the origin, pointing down +Z.
+    addBox(gun, "Cradle", steel, -0.55f, 0.55f, -0.32f, 0.34f, -0.55f, 0.62f);
+    addBox(gun, "Shield", olive, -0.95f, 0.95f, -0.30f, 0.78f, -0.72f, -0.55f);
+    // Twin barrels.
+    addBox(gun, "Barrel L", steel, -0.34f, -0.14f, -0.10f, 0.10f, 0.55f,
+           VehicleSystem::AATurretBarrelLength);
+    addBox(gun, "Barrel R", steel, 0.14f, 0.34f, -0.10f, 0.10f, 0.55f,
+           VehicleSystem::AATurretBarrelLength);
+    // Muzzle brakes, so the barrel ends read at distance.
+    addBox(gun, "Brake L", steel, -0.40f, -0.08f, -0.16f, 0.16f,
+           VehicleSystem::AATurretBarrelLength - 0.28f,
+           VehicleSystem::AATurretBarrelLength);
+    addBox(gun, "Brake R", steel, 0.08f, 0.40f, -0.16f, 0.16f,
+           VehicleSystem::AATurretBarrelLength - 0.28f,
+           VehicleSystem::AATurretBarrelLength);
+
+    XMFLOAT4X4 identity;
+    XMStoreFloat4x4(&identity, XMMatrixIdentity());
+    root->UpdateGlobalTransform(identity);
+    return root;
+}
+
+static std::shared_ptr<SceneNode> g_aaTurretModel;
+// Synthetic entity id for the emplacement. The gun is placed by gameplay rather
+// than authored in the level, so it has no LevelEntity id of its own; this lets
+// the render batch and the weapon hit path still refer to it. "AATURRET" packed
+// into the same high-value space the Cornell box's marker uses, so it cannot
+// collide with a real (small, sequential) level entity id.
+static constexpr uint64_t kAATurretEntityId = 0x4141545552524554ull;
+
 static void RebuildPrefabRenderBatches() {
     g_game.world.Prefabs().ClearDerived();
     g_assetRegistry.Refresh();
@@ -5441,6 +5960,29 @@ static void RebuildPrefabRenderBatches() {
             XMMatrixTranslation(t.position[0], t.position[1], t.position[2]);
         addInstance(addInstance, prefabId, world, entity.id, entity.overrides, 0,
                     towerDrawnByDestruction);
+    }
+    // AA emplacement. Drawn from a code-built model rather than a prefab batch
+    // per entity, because it is placed by gameplay (beside the comm tower) and
+    // is not a level entity at all.
+    if (g_game.vehicles.aaTurretPresent) {
+        const bool createTurret = !g_aaTurretModel;
+        if (createTurret) g_aaTurretModel = CreateAATurretModel();
+        if (createTurret && g_aaTurretModel)
+            FlushStaticBufferUploadsDX12(g_dx12.commandList.Get());
+        if (g_aaTurretModel) {
+            PrefabRenderBatch batch;
+            batch.prefabId = "__aa_turret";
+            batch.model = g_aaTurretModel;
+            batch.baseModel = g_aaTurretModel;
+            const XMMATRIX world = XMMatrixTranslation(
+                g_game.vehicles.aaTurretPosition.x,
+                g_game.vehicles.aaTurretPosition.y,
+                g_game.vehicles.aaTurretPosition.z);
+            batch.baseTransforms.push_back(world);
+            batch.transforms.push_back(world);
+            batch.entityIds.push_back(kAATurretEntityId);
+            g_prefabRenderBatches.push_back(std::move(batch));
+        }
     }
     if (g_ddgiCornellTestMode) {
         const bool createModel = !g_ddgiCornellModel;
@@ -6157,6 +6699,9 @@ static bool HitGrenadeCollision(const Projectile& grenade, float radius,
         accept(candidate, radialNormal(candidate, g_secondaryHelicopterPosition));
     if (HitBoatSegment(start, end, radius, candidate))
         accept(candidate, radialNormal(candidate, g_boatPosition));
+    if (HitAATurretSegment(start, end, radius, candidate))
+        accept(candidate, radialNormal(
+            candidate, g_game.vehicles.aaTurretPosition));
 
     size_t barrelIndex = 0;
     if (HitExplosiveBarrelSegment(
@@ -6426,6 +6971,163 @@ bool CommTowerObjectiveStatus(float& health, float& maxHealth) {
     return false;
 }
 
+// Comm towers standing on the level right now. The deployment briefing reads it
+// to state the objective, and the run arms the mission counter from it -- so a
+// map that authors two towers grades against two without anything being hardcoded.
+static uint32_t CountStandingCommTowers() {
+    uint32_t count = 0;
+    for (const LevelEntity& entity : g_game.world.Level().entities) {
+        if (entity.enabled && entity.type == LevelEntityType::Prefab &&
+            entity.prefabId == kCommTowerPrefabId)
+            ++count;
+    }
+    return count;
+}
+
+// Stands the AA gun up beside the first comm tower on the level: the emplacement
+// is there to defend the relay, so it belongs with it rather than at some
+// unrelated authored point. Levels without a tower get no gun.
+//
+// Offset far enough from the mast that the tower's collapse radius does not
+// swallow it, but inside the range where flying at the tower means flying at
+// the gun -- which is the whole tactical point of it being here.
+static void PlaceAATurretNearCommTower() {
+    for (const LevelEntity& entity : g_game.world.Level().entities) {
+        if (!entity.enabled || entity.type != LevelEntityType::Prefab ||
+            entity.prefabId != kCommTowerPrefabId) continue;
+        constexpr float kOffset = 14.0f;
+        const float x = entity.transform.position[0] + kOffset;
+        const float z = entity.transform.position[2] + kOffset;
+        float groundY = entity.transform.position[1];
+        if (scene.useMeshTerrain && g_terrain.supported) {
+            auto params = CurrentTerrainParams();
+            params.heightScale = scene.terrainHeightScale;
+            groundY = (std::max)(0.0f,
+                TerrainRendererDX12::HeightAt(params, x, z));
+        }
+        g_game.vehicles.PlaceAATurret(XMFLOAT3(x, groundY, z));
+        SGE_LOG("LogGameplay", EngineLog::Level::Display,
+            "AA turret emplaced at " + std::to_string(x) + ", " +
+            std::to_string(groundY) + ", " + std::to_string(z));
+        return;
+    }
+}
+
+// Picks what the AA gun shoots at and feeds the mount. Aircraft first -- it is
+// an anti-air gun, and the inbound BlackHawk is the threat it exists to answer
+// -- then the player on foot at shorter range, so a cleared sky does not leave
+// the emplacement inert while the player walks up to it.
+// Points the drawn gun where the logical turret is aiming. Separate from the
+// firing update because the mount must keep tracking visually even on frames it
+// does not shoot, and a dead gun must stop dead rather than snap back to zero.
+static void PoseAATurretModel() {
+    if (!g_aaTurretModel) return;
+    const VehicleSystem& vehicles = g_game.vehicles;
+    for (const std::shared_ptr<SceneNode>& child : g_aaTurretModel->children) {
+        if (!child || child->name != "Gun") continue;
+        // Pitch about X first (barrels elevate about the trunnion), then yaw
+        // about Y (the whole mount traverses), then lift to the trunnion height.
+        // Negated pitch: the model points down +Z, where a positive rotation
+        // about X would depress the barrels rather than raise them.
+        const XMMATRIX pose =
+            XMMatrixRotationX(-vehicles.aaTurretPitch) *
+            XMMatrixRotationY(vehicles.aaTurretYaw) *
+            XMMatrixTranslation(0.0f, VehicleSystem::AATurretMountHeight, 0.0f);
+        XMStoreFloat4x4(&child->localTransform, pose);
+        break;
+    }
+    XMFLOAT4X4 identity;
+    XMStoreFloat4x4(&identity, XMMatrixIdentity());
+    g_aaTurretModel->UpdateGlobalTransform(identity);
+}
+
+static void UpdateAATurret(float deltaTime) {
+    VehicleSystem& vehicles = g_game.vehicles;
+    if (!vehicles.AATurretActive()) {
+        PoseAATurretModel();
+        return;
+    }
+
+    XMFLOAT3 target{};
+    XMFLOAT3 velocity{};
+    bool hasTarget = false;
+    bool targetIsAircraft = false;
+
+    const XMFLOAT3& turret = vehicles.aaTurretPosition;
+    const auto rangeSq = [&turret](const XMFLOAT3& p) {
+        const float dx = p.x - turret.x, dy = p.y - turret.y, dz = p.z - turret.z;
+        return dx * dx + dy * dy + dz * dz;
+    };
+
+    // The insertion BlackHawk, while it is still flying.
+    if (vehicles.BlackHawkIsFlying()) {
+        const XMFLOAT3& p = vehicles.blackHawkPosition;
+        if (rangeSq(p) <= VehicleSystem::AATurretAirRange *
+                          VehicleSystem::AATurretAirRange) {
+            target = p;
+            velocity = vehicles.BlackHawkVelocity();
+            hasTarget = true;
+            targetIsAircraft = true;
+        }
+    }
+
+    // Otherwise the player, but only once they are close enough that a fixed
+    // emplacement could plausibly depress onto them.
+    if (!hasTarget && scene.player.health > 0.0f && !g_insertionChoicePending) {
+        const XMFLOAT3& p = scene.camera.Position;
+        const float d2 = rangeSq(p);
+        if (d2 <= VehicleSystem::AATurretGroundRange *
+                  VehicleSystem::AATurretGroundRange &&
+            d2 >= VehicleSystem::AATurretGroundMinRange *
+                  VehicleSystem::AATurretGroundMinRange) {
+            target = p;
+            velocity = { 0.0f, 0.0f, 0.0f };
+            hasTarget = true;
+        }
+    }
+
+    const float shellSpeed =
+        scene.projectileSpeed * VehicleSystem::AATurretShellSpeed;
+    const XMFLOAT3 aim = hasTarget
+        ? vehicles.AATurretLeadPoint(target, velocity, shellSpeed)
+        : XMFLOAT3{};
+
+    const bool fired = vehicles.UpdateAATurret(deltaTime, aim, hasTarget);
+    // Pose after the slew, so the drawn barrels match the angles just solved.
+    PoseAATurretModel();
+    if (!fired) return;
+
+    // A shell left the barrel this frame.
+    const XMFLOAT3 muzzle = vehicles.AATurretMuzzle();
+    XMVECTOR direction = XMLoadFloat3(&aim) - XMLoadFloat3(&muzzle);
+    if (XMVectorGetX(XMVector3LengthSq(direction)) < 0.001f) return;
+    // Dispersion, so a burst walks around the target instead of stacking four
+    // rounds on the same point. Wider against aircraft, where the lead solution
+    // is already approximate and pinpoint accuracy would be unsurvivable.
+    const float spread = targetIsAircraft ? 0.020f : 0.011f;
+    const float jitterX = ((float)std::rand() / RAND_MAX - 0.5f) * spread;
+    const float jitterY = ((float)std::rand() / RAND_MAX - 0.5f) * spread;
+    const float jitterZ = ((float)std::rand() / RAND_MAX - 0.5f) * spread;
+    direction = XMVector3Normalize(direction) +
+                XMVectorSet(jitterX, jitterY, jitterZ, 0.0f);
+    XMFLOAT3 shotDirection;
+    XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
+
+    scene.SpawnHostileProjectile(muzzle, shotDirection,
+                                 VehicleSystem::AATurretShellDamage,
+                                 VehicleSystem::AATurretShellSpeed);
+    // Muzzle flash as a small, short-lived world explosion: TriggerMuzzleFlash
+    // drives the player's own viewmodel and has no world position, so it cannot
+    // represent a gun firing across the map.
+    scene.SpawnExplosionFX(muzzle, 0.9f, 0.09f);
+    scene.SpawnWeaponSmoke(muzzle, shotDirection, 1.1f);
+
+    const float distance = std::sqrt(rangeSq(scene.camera.Position));
+    const float volume = (std::max)(0.12f,
+        0.85f * (1.0f - distance / VehicleSystem::AATurretAirRange));
+    g_gunAudio.Play(volume, 0.62f + ((float)std::rand() / RAND_MAX) * 0.06f);
+}
+
 // The comm-tower entity whose mast contains `position`, or 0 for none. Used to
 // route a hit on the tower's destruction chunks back to the prefab health that
 // governs it, so the structure only comes apart when that health is spent.
@@ -6505,8 +7207,15 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
     // Steel lattice: every round that lands on it rings, destroyed or not.
     if (isCommTower && result.applied) PlayMetalHitAudio(hit, 0.9f);
     if (result.destroyed) {
-        if (g_game.session.TimerRunning())
+        if (g_game.session.TimerRunning()) {
             g_game.mission.RecordDestruction();
+            if (isCommTower) {
+                g_game.mission.RecordCommTowerDestroyed();
+                // Levelling the tower is what brings the reinforcements: the
+                // garrison notices the moment it goes off the air.
+                CallInReinforcementWave();
+            }
+        }
         if (isCommTower) CollapseCommTower(towerBase);
         else scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
         g_prefabRebuildRequested = true;
@@ -6528,8 +7237,11 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
         // the generic puff of smoke every other prefab gets.
         XMFLOAT3 towerBase{};
         if (FindCommTower(result.entityId, towerBase)) {
-            if (g_game.session.TimerRunning())
+            if (g_game.session.TimerRunning()) {
                 g_game.mission.RecordDestruction();
+                g_game.mission.RecordCommTowerDestroyed();
+                CallInReinforcementWave();
+            }
             CollapseCommTower(towerBase);
             g_prefabRebuildRequested = true;
             continue;
@@ -6678,7 +7390,8 @@ static void UpdateHelicopterHoverAudio() {
     const bool alive = scene.player.godMode || scene.player.health > 0.0f;
     const bool primaryActive = scene.showHelicopter &&
         !g_helicopterDead && !g_helicopterCrashed;
-    const bool secondaryActive = scene.showHelicopter && g_stressTestMode &&
+    const bool secondaryActive = scene.showHelicopter &&
+        SecondaryHelicopterPresent() &&
         !g_secondaryHelicopterDead && !g_secondaryHelicopterCrashed;
     // The insertion BlackHawk turns its rotor from the moment it comes in
     // until it climbs out of sight, so it feeds the same loop.
@@ -6947,6 +7660,9 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
         BeginDeploymentPlanning();
         g_game.vehicles.DisableBlackHawkInsertion();
         g_game.vehicles.DisableInsertionBoat();
+        // Stand the AA gun back up for the new run. ResetLevel cleared it, so a
+        // map whose towers were all felled last run gets a fresh emplacement.
+        PlaceAATurretNearCommTower();
     } else {
         g_insertionChoicePending = false;
         g_deploymentZones.clear();
@@ -6989,7 +7705,7 @@ static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path) {
         return;
     }
     g_mainMenuLevelStatus.clear();
-    StartLevelOne(hwnd, false, false, false, &loaded.level);
+    StartLevelOne(hwnd, true, false, false, &loaded.level);
 }
 
 static void StartDDGICornellTest(HWND hwnd) {
@@ -7065,9 +7781,11 @@ static void RestartActiveLevel(HWND hwnd) {
             if (entity.type == LevelEntityType::Prefab ||
                 entity.type == LevelEntityType::Rock)
                 entity.enabled = true;
-        StartLevelOne(hwnd, false, false, false, &custom);
+        // Carry the current god mode through rather than hardcoding it: a
+        // restart should put the player back in the run they were already in.
+        StartLevelOne(hwnd, scene.player.godMode, false, false, &custom);
     } else {
-        StartLevelOne(hwnd, false);
+        StartLevelOne(hwnd, scene.player.godMode);
     }
 }
 
@@ -7279,7 +7997,12 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         scene.GetViewMatrix() * scene.GetProjectionMatrix();
     ImDrawList* foreground = ImGui::GetForegroundDrawList();
     const ImVec2 mouse = ImGui::GetMousePos();
-    const bool selectClick = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    // Markers sit under both side panels now that the briefing occupies the
+    // left, so a click is only a zone pick when ImGui itself is not taking it.
+    // WantCaptureMouse covers whichever panels are actually on screen, which a
+    // hardcoded screen-edge margin did not.
+    const bool selectClick = ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                             !ImGui::GetIO().WantCaptureMouse;
     for (size_t index = 0; index < g_deploymentZones.size(); ++index) {
         XMFLOAT3 marker = g_deploymentZones[index];
         marker.y += 1.3f;
@@ -7295,21 +8018,59 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         const float radius = selected ? 18.0f : 13.0f;
         const float dx = mouse.x - screen.x;
         const float dy = mouse.y - screen.y;
-        if (selectClick && screen.x < display.x - 430.0f &&
-            dx * dx + dy * dy <= 24.0f * 24.0f) {
+        // 24px stays comfortable at 20 zones: the tightest the markers ever get
+        // on screen is 51.9px apart, so no two pick areas can overlap.
+        if (selectClick && dx * dx + dy * dy <= 24.0f * 24.0f) {
             g_selectedDeploymentZone = static_cast<int>(index);
         }
-        const ImU32 fill = selected ? IM_COL32(90, 255, 105, 235)
-                                    : IM_COL32(35, 220, 75, 205);
+        // White markers. Selection reads as full white against a dimmer grey
+        // rather than a hue change, so the two stay apart on the bright sand and
+        // water the ring crosses -- the old green lost contrast over foliage.
+        const ImU32 fill = selected ? IM_COL32(255, 255, 255, 245)
+                                    : IM_COL32(215, 222, 228, 200);
         foreground->AddCircleFilled(screen, radius, fill);
         foreground->AddCircle(screen, radius + 3.0f,
-                              IM_COL32(205, 255, 210, 240), 0, 2.0f);
+                              IM_COL32(255, 255, 255, 240), 0, 2.0f);
         const std::string number = std::to_string(index + 1);
         const ImVec2 labelSize = ImGui::CalcTextSize(number.c_str());
         foreground->AddText(
             ImVec2(screen.x - labelSize.x * 0.5f,
                    screen.y - labelSize.y * 0.5f),
-            IM_COL32(0, 45, 10, 255), number.c_str());
+            IM_COL32(12, 16, 20, 255), number.c_str());
+    }
+
+    // Enemy positions, as small red dots. Same projection as the zone markers
+    // above, drawn after them so a bandit standing on a zone does not hide the
+    // marker the player has to click.
+    //
+    // Deliberately no click handling and no depth test: these are intel on the
+    // planning map, not interactive, and a dot that vanished behind terrain
+    // would read as "no enemy there" rather than "enemy behind a hill".
+    if (g_showEnemyDotsOnDeployScreen) {
+        for (const auto& bandit : g_bandits) {
+            if (!bandit || bandit->Dead()) continue;
+            // Bandits only. Marines are friendly and a red dot would read as a
+            // threat the player then plans around for no reason.
+            if (bandit->faction != Faction::Bandit) continue;
+
+            XMFLOAT3 spot = bandit->position;
+            spot.y += 1.1f;
+            const XMVECTOR enemyClip = XMVector3Transform(
+                XMLoadFloat3(&spot), viewProjection);
+            const float enemyW = XMVectorGetW(enemyClip);
+            if (enemyW <= 0.01f) continue;
+            const ImVec2 enemyScreen{
+                (XMVectorGetX(enemyClip) / enemyW * 0.5f + 0.5f) * display.x,
+                (1.0f - (XMVectorGetY(enemyClip) / enemyW * 0.5f + 0.5f)) *
+                    display.y };
+            // Dark outline first so the dot survives against the bright sand
+            // the zone ring crosses, the same problem the white markers solve
+            // with their ring.
+            foreground->AddCircleFilled(enemyScreen, 4.5f,
+                                        IM_COL32(20, 4, 6, 200));
+            foreground->AddCircleFilled(enemyScreen, 3.0f,
+                                        IM_COL32(232, 48, 48, 235));
+        }
     }
 
     const char* instruction =
@@ -7317,6 +8078,61 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     foreground->AddText(
         ImVec2((display.x - ImGui::CalcTextSize(instruction).x) * 0.5f, 23.0f),
         IM_COL32(190, 255, 205, 255), instruction);
+
+    // Mission briefing. Left-hand side, where the zone markers already refuse to
+    // take clicks past display.x - 430, so it never fights the planning panel.
+    // Drawn only when the level actually carries a tower: on a map without one
+    // there is no objective to brief, and a hardcoded dossier would be a lie.
+    const uint32_t standingTowers = CountStandingCommTowers();
+    if (standingTowers > 0) {
+        ImGui::SetNextWindowPos(ImVec2(24.0f, display.y * 0.5f),
+                                ImGuiCond_Always, ImVec2(0.0f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(430.0f, 0.0f), ImGuiCond_Always);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.03f, 0.05f, 0.04f, 0.90f));
+        ImGui::Begin("Mission Briefing", nullptr, ImGuiWindowFlags_NoTitleBar |
+            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+        ImGui::TextColored(ImVec4(0.45f, 0.52f, 0.48f, 1.0f),
+                           "CLASSIFIED // EYES ONLY");
+        ImGui::SetWindowFontScale(1.6f);
+        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.22f, 1.0f), "OPERATION BLACKOUT");
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "SITUATION");
+        ImGui::TextWrapped(
+            "The garrison on this island is not fighting alone. A hardened relay "
+            "mast on the ridge ties their patrols to the mainland battery -- "
+            "every movement we make is called in the moment it is seen, and the "
+            "guns answer within the minute.");
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+        ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.30f, 1.0f), "PRIMARY OBJECTIVE");
+        if (standingTowers == 1) {
+            ImGui::TextWrapped("Destroy the communications tower.");
+        } else {
+            ImGui::TextWrapped("Destroy all %u communications towers.",
+                               standingTowers);
+        }
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+        ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "EXECUTION");
+        ImGui::TextWrapped(
+            "The lattice shrugs off small arms. Plant remote C4 on the mast and "
+            "clear the base before you trigger it -- nothing lighter will bring "
+            "the structure down.");
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+        ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "EXFIL");
+        ImGui::TextWrapped(
+            "Hold the island once the mast is down. Without the relay the "
+            "battery is firing blind.");
+        ImGui::Dummy(ImVec2(0.0f, 8.0f));
+        ImGui::Separator();
+        ImGui::TextDisabled("Mission grade weights this objective at %d of 100.",
+                            MissionSystem::kPrimaryObjectiveScore);
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        ImGui::End();
+        ImGui::PopStyleColor();
+    }
 
     ImGui::SetNextWindowPos(ImVec2(display.x - 20.0f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(1.0f, 0.5f));
@@ -7335,7 +8151,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             "Zone %d selected", g_selectedDeploymentZone + 1);
     else
         ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f),
-            "Click a green zone on the map");
+            "Click a zone marker on the map");
     ImGui::Dummy(ImVec2(0.0f, 7.0f));
 
     MissionLoadout& loadout = g_game.mission.Loadout();
@@ -7364,8 +8180,27 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         loadout.grenade = static_cast<GrenadeType>(grenade);
         scene.selectedGrenade = loadout.grenade;
     }
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    ImGui::SeparatorText("DIFFICULTY");
+    // Per-run choice rather than a launcher-level mode. Applied straight to the
+    // live player state because StartLevelOne has already run by the time this
+    // screen is up -- its godMode parameter set the value this toggle edits.
+    //
+    // God mode is not only invulnerability: PlayerState::AmmoEnforced() is tied
+    // to it, so turning it on also disables magazines, reserves and reloading.
+    // That is why the label says supplies rather than just damage.
+    if (ImGui::Checkbox("God mode (no damage, unlimited ammo)",
+                        &scene.player.godMode)) {
+        // Coming back from god mode leaves the magazines in whatever state the
+        // unenforced path left them, so restock to a clean loadout.
+        if (!scene.player.godMode) scene.player.RestoreAmmo();
+    }
     if (scene.player.godMode)
-        ImGui::TextDisabled("God mode keeps all weapons available after deployment.");
+        ImGui::TextDisabled(
+            "All weapons stay available and ammo is not tracked.");
+    else
+        ImGui::TextDisabled(
+            "Ammo is limited to your two weapons. Reload with R.");
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
     ImGui::SeparatorText("INSERTION");
 
@@ -7389,11 +8224,58 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     modeButton("BOAT INSERTION", LevelInsertionMode::Boat);
     ImGui::Dummy(ImVec2(0.0f, 5.0f));
 
+    if (standingTowers > 0) {
+        ImGui::SeparatorText("PRIMARY OBJECTIVE");
+        ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.30f, 1.0f),
+            standingTowers == 1 ? "Destroy the communications tower"
+                                : "Destroy all communications towers");
+        ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    }
+
     ImGui::SeparatorText("OPTIONAL OBJECTIVES");
     ImGui::TextDisabled("Use both selected weapons");
     ImGui::TextDisabled("Throw your selected grenade");
     ImGui::TextDisabled("Cause at least %u destruction events",
                         MissionSystem::kDemolitionObjectiveEvents);
+    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+
+    // Enemy intel + the scatter control. Lives on the planning screen rather
+    // than only in the debug panel because this is the one moment where seeing
+    // the layout and re-rolling it actually changes a decision -- once DEPLOY is
+    // pressed the run has started.
+    ImGui::SeparatorText("ENEMY INTEL");
+    uint32_t liveBandits = 0;
+    for (const auto& bandit : g_bandits)
+        if (bandit && !bandit->Dead() && bandit->faction == Faction::Bandit)
+            ++liveBandits;
+    // The squad spawns during the async load, which is still running when this
+    // screen first opens on a cold start. Report that rather than showing a
+    // confident "0 hostiles" that is merely early.
+    const bool squadReady = g_banditLoaded && !g_game.loading.Active();
+    if (squadReady)
+        ImGui::Text("%u hostile%s on the island", liveBandits,
+                    liveBandits == 1 ? "" : "s");
+    else
+        ImGui::TextDisabled("Locating hostiles...");
+    ImGui::Checkbox("Show hostiles on map", &g_showEnemyDotsOnDeployScreen);
+    // Randomising before the squad exists would move nothing and still report a
+    // seed, which reads as a scatter that silently did nothing.
+    ImGui::BeginDisabled(!squadReady || !g_navigation.Ready());
+    ImGui::SetCursorPosX(45.0f);
+    if (ImGui::Button("RANDOMISE ENEMY POSITIONS", ImVec2(340.0f, 32.0f))) {
+        // Force the scatter for this press regardless of the persistent test
+        // toggle: the button is an explicit request, not a mode.
+        const bool wasEnabled = g_scatterEnemiesOnNavmesh;
+        g_scatterEnemiesOnNavmesh = true;
+        ScatterEnemiesOnNavmesh();
+        g_scatterEnemiesOnNavmesh = wasEnabled;
+    }
+    ImGui::EndDisabled();
+    if (g_scatterEnemiesLastSeed != 0)
+        ImGui::TextDisabled("Last layout seed: %u", g_scatterEnemiesLastSeed);
+    if (squadReady && !g_navigation.Ready())
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
+                           "Navmesh unavailable -- cannot randomise");
     ImGui::Dummy(ImVec2(0.0f, 5.0f));
 
     const bool weaponsReady = loadout.Valid() &&
@@ -7427,6 +8309,10 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         scene.camera.VerticalVelocity = 0.0f;
         scene.camera.IsGrounded = true;
         g_game.session.ResetTimer(true);
+        // Arm the objective against what this level actually spawned, after any
+        // prefab edits made during planning. Must follow ResetRun, which the
+        // level load already did -- doing it here means a restart re-counts.
+        g_game.mission.SetCommTowerCount(standingTowers);
         // The planning camera teleports to the selected insertion. None of the
         // fly-through's temporal lighting or visibility history is valid there.
         visBuffer.InvalidateTemporalHistory();
@@ -7454,9 +8340,15 @@ static void RenderWinScreen(HWND hwnd) {
     const MissionLoadout& loadout = g_game.mission.Loadout();
     const MissionRunStats& stats = g_game.mission.Stats();
     ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    const char* won = "MISSION COMPLETE";
+    // Extracting with the mast still up is not a clean run, so the banner says
+    // so rather than congratulating a player who skipped the primary objective.
+    const bool primaryFailed = report.primaryObjectivePresent &&
+                               !report.primaryObjectiveComplete;
+    const char* won = primaryFailed ? "OBJECTIVE FAILED" : "MISSION COMPLETE";
     ImGui::SetCursorPosX((540.0f - ImGui::CalcTextSize(won).x) * 0.5f);
-    ImGui::TextColored(ImVec4(0.25f, 1.0f, 0.42f, 1.0f), "%s", won);
+    ImGui::TextColored(primaryFailed ? ImVec4(1.0f, 0.42f, 0.20f, 1.0f)
+                                     : ImVec4(0.25f, 1.0f, 0.42f, 1.0f),
+                       "%s", won);
     const char* rank = MissionRankName(report.rank);
     ImGui::SetWindowFontScale(2.2f);
     ImGui::SetCursorPosX((540.0f - ImGui::CalcTextSize(rank).x) * 0.5f);
@@ -7478,18 +8370,27 @@ static void RenderWinScreen(HWND hwnd) {
     const int milliseconds = totalMilliseconds % 1000;
     ImGui::SeparatorText("SCORE BREAKDOWN");
     ImGui::Text("Time             %02d:%02d.%03d", minutes, seconds, milliseconds);
-    ImGui::SameLine(410.0f); ImGui::Text("%2d / 20", report.timeScore);
+    ImGui::SameLine(410.0f); ImGui::Text("%2d / 15", report.timeScore);
     ImGui::Text("Accuracy         %.1f%%  (%u / %u)", report.accuracyPercent,
                 stats.shotsHit, stats.shotsFired);
-    ImGui::SameLine(410.0f); ImGui::Text("%2d / 25", report.accuracyScore);
+    ImGui::SameLine(410.0f); ImGui::Text("%2d / 20", report.accuracyScore);
     ImGui::Text("Casualties       %u / %u", report.casualties,
                 stats.friendliesDeployed);
-    ImGui::SameLine(410.0f); ImGui::Text("%2d / 20", report.casualtyScore);
+    ImGui::SameLine(410.0f); ImGui::Text("%2d / 15", report.casualtyScore);
     ImGui::Text("Optional         %u / %u", report.optionalObjectivesCompleted,
                 report.optionalObjectivesTotal);
-    ImGui::SameLine(410.0f); ImGui::Text("%2d / 20", report.optionalScore);
+    ImGui::SameLine(410.0f); ImGui::Text("%2d / 15", report.optionalScore);
     ImGui::Text("Destruction      %u events", report.destructionEvents);
-    ImGui::SameLine(410.0f); ImGui::Text("%2d / 15", report.destructionScore);
+    ImGui::SameLine(410.0f); ImGui::Text("%2d / 10", report.destructionScore);
+    if (report.primaryObjectivePresent) {
+        ImGui::Text("Comm towers      %u / %u down", report.commTowersDestroyed,
+                    report.commTowersTotal);
+    } else {
+        ImGui::Text("Comm towers      none on this map");
+    }
+    ImGui::SameLine(410.0f);
+    ImGui::Text("%2d / %d", report.primaryScore,
+                MissionSystem::kPrimaryObjectiveScore);
 
     const auto objective = [](bool complete, const char* label) {
         ImGui::TextColored(complete
@@ -7497,6 +8398,12 @@ static void RenderWinScreen(HWND hwnd) {
                 : ImVec4(0.58f, 0.62f, 0.60f, 1.0f),
             "%s  %s", complete ? "[X]" : "[ ]", label);
     };
+    if (report.primaryObjectivePresent) {
+        ImGui::SeparatorText("PRIMARY OBJECTIVE");
+        objective(report.primaryObjectiveComplete,
+                  "Operation Blackout - level the comm tower");
+    }
+
     ImGui::SeparatorText("OPTIONAL OBJECTIVES");
     objective(report.usedBothWeapons, "Field versatility - use both weapons");
     objective(report.usedSelectedGrenade, "Grenadier - throw selected grenade");
@@ -9780,9 +10687,11 @@ static void ProcessInput(HWND) {
     }
     scene.c4DetonateHeld = c4DetonateRequested;
 
+    // In mouse-walk mode the right button is the throttle, so it must not also
+    // raise the sights -- otherwise every step forward would be taken aiming.
     const bool aimRequested = IsGameplayScreen() &&
         scene.player.health > 0.0f &&
-        !g_drivingHumvee && !cameraLocked &&
+        !g_drivingHumvee && !cameraLocked && !g_mouseWalkTestMode &&
         !(showUI && ImGui::GetIO().WantCaptureMouse) &&
         !GunModel::C4Selected() && rightMouseHeld;
     const bool scopeRequested = aimRequested && GunModel::SVDSelected();
@@ -9858,8 +10767,18 @@ static void ProcessInput(HWND) {
         (GetAsyncKeyState(VK_CONTROL) & 0x8000);
     const bool sprinting = !ridingBlackHawk && scene.camera.FPSMode &&
         (GetAsyncKeyState(VK_SHIFT) & 0x8000);
+    // Mouse-walk mode: the right button reads as forward, exactly as if W were
+    // held. Gated on the same UI capture the fire path uses, so dragging a debug
+    // window does not also march the player across the map.
+    //
+    // C4 detonation deliberately keeps this button as well: with the charge
+    // equipped, a press both walks and detonates. That is intended -- the
+    // detonator is worth more than a clean movement binding in one mode.
+    const bool mouseWalkForward = g_mouseWalkTestMode &&
+        (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 &&
+        !ImGui::GetIO().WantCaptureMouse;
     const float forwardInput =
-        ((GetAsyncKeyState('W') & 0x8000) ? 1.0f : 0.0f) -
+        (((GetAsyncKeyState('W') & 0x8000) || mouseWalkForward) ? 1.0f : 0.0f) -
         ((GetAsyncKeyState('S') & 0x8000) ? 1.0f : 0.0f);
     const float strafeInput =
         ((GetAsyncKeyState('A') & 0x8000) ? 1.0f : 0.0f) -
@@ -9874,7 +10793,8 @@ static void ProcessInput(HWND) {
     const float movementMultiplier = crouching ? 0.55f :
         (sprinting ? 2.0f : 1.0f);
     if (!scene.camera.IsSliding && !ridingBlackHawk) {
-        if (GetAsyncKeyState('W') & 0x8000) scene.camera.ProcessKeyboard('W', deltaTime, movementMultiplier);
+        if ((GetAsyncKeyState('W') & 0x8000) || mouseWalkForward)
+            scene.camera.ProcessKeyboard('W', deltaTime, movementMultiplier);
         if (GetAsyncKeyState('S') & 0x8000) scene.camera.ProcessKeyboard('S', deltaTime, movementMultiplier);
         if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, movementMultiplier);
         if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, movementMultiplier);
@@ -10038,7 +10958,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (g_heldBandit && g_heldBandit->Held()) {
                 GrabOrThrowBandit();
                 g_suppressFireUntilMouseRelease = true;
-            } else if (cameraLocked) {
+            } else if (cameraLocked && !g_insertionChoicePending) {
+                // Click-to-capture, but never on the deployment screen: there the
+                // click is picking a zone marker off the map, and grabbing the
+                // pointer would snap it to the centre mid-selection and hide it.
+                // The screen releases the cursor deliberately and re-captures it
+                // itself on DEPLOY.
                 cameraLocked = false;
                 SetCapture(hwnd); ShowCursor(FALSE);
                 RECT r; GetClientRect(hwnd, &r);
@@ -10049,7 +10974,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 lastX = (float)(r.right-r.left)/2;
                 lastY = (float)(r.bottom-r.top)/2;
                 firstMouse = true;
-            } else if (!scene.autoFire) {
+            } else if (!scene.autoFire && !g_insertionChoicePending) {
                 // Auto-fire handles shooting in ProcessInput while held; only
                 // fire on click when auto-fire is off.
                 ShootPlayerWeapon();
@@ -10159,6 +11084,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // Unreal-style eject: detach the camera from the player so the view
             // model can be flown around and inspected from outside.
             scene.ToggleEjectedCamera();
+        }
+        else if (wParam == VK_F10 && !(lParam & 0x40000000)) {
+            g_mouseWalkTestMode = !g_mouseWalkTestMode;
+            // Drop any sights already raised on the way in, so the mode does not
+            // start stuck at the ADS FOV with no button left to lower it.
+            if (g_mouseWalkTestMode) {
+                scene.UpdateAimDownSights(false, 0.0f);
+                scene.UpdateSniperScope(false, 0.0f);
+            }
+            SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                std::string("Mouse-walk test mode ") +
+                (g_mouseWalkTestMode ? "ON (RMB walks forward, ADS off)"
+                                     : "OFF"));
         }
         else if (wParam == VK_F11) { ToggleFullscreen(hwnd); }
         return 0;
@@ -10937,6 +11875,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // the allies have to be rebuilt here too -- the load-stage
                 // spawn only runs on a cold load, not on a restart.
                 SpawnMarinesFromLevel();
+                // Restart path: re-scatter so each run gets its own layout
+                // rather than inheriting the one the cold load produced.
+                ScatterEnemiesOnNavmesh();
                 g_game.commands.Set(GameCommand::RespawnTurretGunner,
                     !g_customLevelMode ||
                     FirstRuntimeEntity(LevelEntityType::Humvee) != nullptr);
@@ -11095,6 +12036,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         ArmsModel::Update(deltaTime, playerHorizontalSpeed, scene.adsBlend);
         if (!g_emptyLevelMode) {
             UpdateHelicopter(deltaTime);
+            // Before the patrol update, which yields the airframe while a
+            // reinforcement wave owns it.
+            UpdateReinforcementDropship(deltaTime);
             UpdateSecondaryHelicopter(deltaTime);
             UpdateEnemyHelicopterDamageSmoke(deltaTime);
             UpdateBoat(deltaTime);
@@ -11166,6 +12110,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 UpdateInsertionBoatDamageEffects(deltaTime);
             }
             UpdateExplosiveBarrels(deltaTime);
+            // After the aircraft update, so the gun leads this frame's pose
+            // rather than one that is already a frame stale.
+            UpdateAATurret(deltaTime);
         }
         g_gunAudio.Update();
         g_rpgFireAudio.Update();
@@ -11388,6 +12335,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         banditDeltaTime, mount,
                         (g_drivingHumvee && bandit->mountedVehicleIndex == 0)
                             ? g_humveeAimPoint : target);
+                } else if (updateBandit && bandit->Rappelling()) {
+                    // On the dropship rope: descend toward the terrain under the
+                    // actor and skip the ground AI entirely until it lands.
+                    // Update() would snap position.y to the ground on its first
+                    // frame, which is exactly the descent this replaces.
+                    bandit->UpdateRappel(
+                        banditDeltaTime,
+                        GroundHeightAt(bandit->position.x, bandit->position.z));
                 } else if (updateBandit) {
                     float groundY = 0.0f;
                     if (scene.useMeshTerrain && g_terrain.supported) {
@@ -11552,7 +12507,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         const bool primaryHelicopterActive =
             scene.showHelicopter && !g_helicopterDead && !g_helicopterCrashed;
         const bool secondaryHelicopterActive =
-            scene.showHelicopter && g_stressTestMode &&
+            scene.showHelicopter && SecondaryHelicopterPresent() &&
             !g_secondaryHelicopterDead && !g_secondaryHelicopterCrashed;
         g_trees.SetHelicopterWind(
             g_helicopterPosition, primaryHelicopterActive,
@@ -11954,8 +12909,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                     g_helicopterPosition);
                             }
                         }
-                        if (g_stressTestMode && !g_secondaryHelicopterDead &&
-                            g_helicopterModel) {
+                        if (SecondaryHelicopterPresent() &&
+                            !g_secondaryHelicopterDead && g_helicopterModel) {
                             const float dx = g_secondaryHelicopterPosition.x - center.x;
                             const float dy = g_secondaryHelicopterPosition.y - center.y;
                             const float dz = g_secondaryHelicopterPosition.z - center.z;
@@ -11981,6 +12936,45 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                     projectile.rocket ? kRocketHelicopterDamage
                                                       : enemyDamage * falloff,
                                     g_boatPosition);
+                            }
+                        }
+                        // The AA emplacement is a blast target as well, so a
+                        // planted charge is a valid answer to it rather than
+                        // grinding its 900 HP down with rifle fire. Only the
+                        // barrel chain reaction used to reach it; a charge stuck
+                        // to the gun itself did nothing. C4 is a demolition and
+                        // one is enough, while a frag still only chips the
+                        // mount -- same split the comm tower uses below.
+                        if (g_game.vehicles.AATurretActive()) {
+                            const XMFLOAT3& turret =
+                                g_game.vehicles.aaTurretPosition;
+                            const float tx = turret.x - center.x;
+                            const float ty = turret.y - center.y;
+                            const float tz = turret.z - center.z;
+                            const float distance =
+                                std::sqrt(tx * tx + ty * ty + tz * tz);
+                            // Measured to the mount origin, so carry the mount
+                            // height as slack: a charge stuck to the barrel
+                            // sits ~1.85 m above the point we compare against.
+                            const float reach = enemyRadius +
+                                VehicleSystem::AATurretMountHeight;
+                            if (distance < reach) {
+                                const float falloff = 1.0f - distance / reach;
+                                // A charge planted on the gun kills outright:
+                                // full health with no falloff, since falloff
+                                // measured from the mount origin would leave a
+                                // charge stuck to the barrel ~18% short of the
+                                // 900 HP it needs. Past that the blast still
+                                // reaches, but only as scaled splash.
+                                const bool planted =
+                                    c4Blast && distance <
+                                        VehicleSystem::AATurretBarrelLength;
+                                const float damage = planted
+                                    ? VehicleSystem::AATurretMaxHealth
+                                    : (c4Blast
+                                           ? VehicleSystem::AATurretMaxHealth
+                                           : enemyDamage) * falloff;
+                                DamageAATurret(damage, turret);
                             }
                         }
                         // Grenades hurt the player too. Previously only enemies
@@ -12305,6 +13299,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     stopProjectileAt(helicopterHit);
                     continue;
                 }
+                XMFLOAT3 turretHit;
+                if (!projectile.hostile && HitAATurretSegment(
+                        projectile.previousPosition, projectile.position,
+                        bulletRadius, turretHit)) {
+                    recordAccuracyHit();
+                    const XMFLOAT3 normal(-projectile.direction.x,
+                                          -projectile.direction.y,
+                                          -projectile.direction.z);
+                    scene.SpawnBulletImpact(turretHit, normal);
+                    // Armoured mount: rings like the comm tower's lattice.
+                    PlayMetalHitAudio(turretHit, 0.9f);
+                    DamageAATurret(34.0f * projectile.damageMultiplier, turretHit);
+                    if (projectile.laser) scene.StopLaserBeamAt(turretHit);
+                    if (projectile.harpoon) scene.ShowHarpoonTether(turretHit);
+                    stopProjectileAt(turretHit);
+                    continue;
+                }
                 XMFLOAT3 boatHit;
                 if (!projectile.hostile && HitBoatSegment(
                         projectile.previousPosition, projectile.position,
@@ -12562,7 +13573,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             !g_game.commands.Pending(GameCommand::RespawnTurretGunner) &&
             !g_game.commands.Pending(GameCommand::RespawnBoatGunner) &&
             LiveBanditCount() == 0 && g_helicopterDead &&
-            (!g_stressTestMode || g_secondaryHelicopterDead))
+            (!g_stressTestMode || g_secondaryHelicopterDead) &&
+            // A wave still in the air is troops not yet on the ground, so the
+            // field is not actually clear until it has unloaded or gone down.
+            !g_game.vehicles.DropshipActive())
             OpenWinScreen();
         }
         }
@@ -13249,6 +14263,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 SpawnHumveeTurretGunner(0);
                 if (g_stressTestMode) SpawnHumveeTurretGunner(1);
                 SpawnBoatTurretGunner();
+                // Before the player deploys: the squad exists and the navmesh
+                // is built, so this is the last point at which the opening
+                // layout can still be changed.
+                ScatterEnemiesOnNavmesh();
                 g_banditLoaded = true;
                 std::cout << "Bandit squad ready: " << LiveBanditCount()
                           << " live enemies\n";

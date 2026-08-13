@@ -5,6 +5,11 @@ struct PlayerState {
     float maxHealth = 100.0f;
     float health = 100.0f;
     float damageFlash = 0.0f;
+    // Off by default: a run is meant to be survivable, not unlosable, and the
+    // ammo/reload systems below only do anything when it is off (see
+    // AmmoEnforced). The deployment screen offers it as an explicit choice per
+    // run, StartLevelOne still takes it as a parameter, and the debug UI
+    // checkbox toggles it live.
     bool godMode = false;
     bool healthRegen = true;
     float regenDelay = 5.0f;

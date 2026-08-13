@@ -174,7 +174,7 @@ public:
     }
 
     bool NeedsCoverQuery(const DirectX::XMFLOAT3& playerPosition) const {
-        if (dead_ || held_ || turretGunner || hasCoverTarget_ ||
+        if (dead_ || held_ || rappelling_ || turretGunner || hasCoverTarget_ ||
             coverQueryCooldown_ > 0.0f)
             return false;
         // Marines take cover and shoot from it. The hazard is that vision range
@@ -619,6 +619,80 @@ public:
         ComputePose(dt);
     }
 
+    // ---- Rappel descent -----------------------------------------------------
+    // A reinforcement roping down from the dropship. While descending the actor
+    // is off the AI path entirely: it cannot shoot, cannot be pushed around, and
+    // holds its own Y rather than being snapped to the terrain the way Update()
+    // does. The rope itself is drawn by the app layer -- this only owns the
+    // actor's descent along it.
+    //
+    // Modelled on UpdateMounted (pin position, skip AI, still pose the model)
+    // because that is the established way to take an actor off the ground path
+    // without inventing a second update contract.
+    static constexpr float RappelDescentSpeed = 7.5f;
+    // Held at the bottom before the actor is released to the AI, so a squad does
+    // not sprint off the instant its boots touch down.
+    static constexpr float RappelReleaseDelay = 0.28f;
+
+    // Puts the actor on the rope at `from`, descending to ground level.
+    void BeginRappel(const DirectX::XMFLOAT3& from, float facingYaw) {
+        if (dead_) return;
+        rappelling_ = true;
+        rappelReleaseTimer_ = RappelReleaseDelay;
+        position = from;
+        yaw = facingYaw;
+        aimYaw = facingYaw;
+        aimPitch = 0.0f;
+        knockbackVelocity_ = { 0.0f, 0.0f, 0.0f };
+        preparingShot_ = false;
+        stationaryAimTime_ = 0.0f;
+        burstShotsRemaining = 0;
+        navigationPath_.clear();
+    }
+
+    bool Rappelling() const { return rappelling_ && !dead_; }
+
+    // Steps the descent. Returns true once the actor has landed and been
+    // released, so the caller can hand it back to the normal AI update.
+    //
+    // Dying on the rope drops the actor immediately -- the ragdoll takes over
+    // from wherever it was, which is the whole point of shooting someone on a
+    // rope.
+    bool UpdateRappel(float dt, float groundY) {
+        if (dead_) { rappelling_ = false; return true; }
+        if (!rappelling_) return true;
+
+        if (position.y > groundY) {
+            position.y = (std::max)(groundY, position.y - RappelDescentSpeed * dt);
+            // Feet-first, hanging: no walk cycle while on the rope.
+            PlayClip("Idle");
+            anim.Advance(dt * 0.4f);
+            ComputePose(dt);
+            return false;
+        }
+
+        position.y = groundY;
+        rappelReleaseTimer_ -= dt;
+        if (rappelReleaseTimer_ > 0.0f) {
+            PlayClip("Idle");
+            anim.Advance(dt);
+            ComputePose(dt);
+            return false;
+        }
+        rappelling_ = false;
+        return true;
+    }
+
+    // Re-anchors patrol and leash to wherever the actor now stands. Update()
+    // captures the spawn once, on its first tick; anything that teleports an
+    // actor after that (the navmesh scatter test mode) has to clear the capture
+    // or the actor keeps wandering back toward a spawn it no longer occupies.
+    void ResetSpawnAnchor() {
+        spawnCaptured_ = false;
+        navigationPath_.clear();
+        navigationWaypoint_ = 0;
+    }
+
     void SetHeld(bool held) {
         if (dead_) return;
         held_ = held;
@@ -751,7 +825,8 @@ public:
 
     bool NeedsLineOfSightCheck() const {
         if (awareness_ != AwarenessState::Combat && !turretGunner) return false;
-        if (dead_ || held_ || !visible || !HasGunPose()) return false;
+        if (dead_ || held_ || rappelling_ || !visible || !HasGunPose())
+            return false;
         if (turretGunner) return true;
         // The sniper needs a truthful sight test every frame it is charging, not
         // just on the firing frame: the beam is only fair if breaking cover
@@ -768,7 +843,8 @@ public:
                    DirectX::XMFLOAT3& origin, DirectX::XMFLOAT3& direction) {
         using namespace DirectX;
         if (awareness_ != AwarenessState::Combat && !turretGunner) return false;
-        if (dead_ || held_ || !visible || !HasGunPose()) return false;
+        if (dead_ || held_ || rappelling_ || !visible || !HasGunPose())
+            return false;
         fireCooldown -= dt;
         if (hasCoverTarget_ && !inCover_) {
             preparingShot_ = false;
@@ -1503,6 +1579,9 @@ private:
     int headBone_ = -1;
     bool dead_ = false;
     bool held_ = false;
+    // On the dropship rope, descending. See BeginRappel/UpdateRappel.
+    bool rappelling_ = false;
+    float rappelReleaseTimer_ = 0.0f;
     bool mountedFiring_ = false;
     bool hasCoverTarget_ = false;
     bool inCover_ = false;

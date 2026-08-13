@@ -326,6 +326,10 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items
     for (const RopeItem& link : BlackHawkRopeItems())
         items.push_back({ XMLoadFloat4x4(&link.transform), link.color,
             true, MAT_CUBE, false });
+    // Enemy fast-ropes under the reinforcement dropship, same encoding.
+    for (const RopeItem& link : DropshipRopeItems())
+        items.push_back({ XMLoadFloat4x4(&link.transform), link.color,
+            true, MAT_CUBE, false });
 
     if (!g_emptyLevelMode && g_humveeModel) {
         AppendOpaqueSceneNodeDrawItems(g_humveeModel, HumveeWorldMatrix(), items);
@@ -336,7 +340,7 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items
 
     if (!g_emptyLevelMode && g_helicopterModel && scene.showHelicopter) {
         AppendOpaqueSceneNodeDrawItems(g_helicopterModel, HelicopterWorldMatrix(), items);
-        if (g_stressTestMode)
+        if (SecondaryHelicopterVisible())
             AppendOpaqueSceneNodeDrawItems(g_helicopterModel,
                 SecondaryHelicopterWorldMatrix(), items);
     }

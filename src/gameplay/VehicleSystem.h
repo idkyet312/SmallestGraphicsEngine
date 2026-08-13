@@ -21,6 +21,159 @@ struct VehicleSystem {
     static constexpr float HelicopterMaxHealth = 2000.0f;
     static constexpr float BoatMaxHealth = 1200.0f;
 
+    // ---- Anti-air emplacement ------------------------------------------------
+    // A fixed twin-barrel AA gun. It leads and engages aircraft (the insertion
+    // BlackHawk above all) and, at closer range, the player on foot.
+    //
+    // Tuned to threaten rather than delete: the whole point is that an insertion
+    // flown straight over the gun goes badly, and that the player has a reason
+    // to deal with the emplacement before calling anything in.
+    static constexpr float AATurretMaxHealth = 900.0f;
+    static constexpr float AATurretAirRange = 190.0f;    // vs aircraft
+    static constexpr float AATurretGroundRange = 85.0f;  // vs the player
+    // Dead zone against ground targets. A fixed AA mount cannot depress onto
+    // something at the foot of its own pedestal, and the perimeter deployment
+    // ring can put a player as close as ~7 m to the gun -- without this, picking
+    // that zone means being shot before the run is playable. Aircraft are
+    // exempt: nothing flies inside this radius without having already hit it.
+    static constexpr float AATurretGroundMinRange = 18.0f;
+    static constexpr float AATurretBurstShots = 4.0f;    // rounds per burst
+    static constexpr float AATurretShotInterval = 0.11f; // within a burst
+    static constexpr float AATurretBurstPause = 1.45f;   // between bursts
+    static constexpr float AATurretShellSpeed = 2.4f;    // vs small arms
+    static constexpr float AATurretShellDamage = 2.2f;
+    static constexpr float AATurretYawRate = 1.5f;       // rad/s traverse
+    static constexpr float AATurretPitchRate = 1.1f;     // rad/s elevation
+    static constexpr float AATurretMinPitch = -0.12f;
+    static constexpr float AATurretMaxPitch = 1.30f;     // ~75 deg, near vertical
+    // Muzzle sits at the end of the barrels, measured from the turret origin.
+    static constexpr float AATurretBarrelLength = 2.35f;
+    static constexpr float AATurretMountHeight = 1.85f;
+
+    bool aaTurretPresent = false;
+    DirectX::XMFLOAT3 aaTurretPosition{};
+    float aaTurretYaw = 0.0f;
+    float aaTurretPitch = 0.0f;
+    float aaTurretHealth = AATurretMaxHealth;
+    bool aaTurretDead = false;
+    float aaTurretShotTimer = 0.0f;
+    int aaTurretShotsLeftInBurst = 0;
+    // Barrels spin down after firing; purely cosmetic, drives the muzzle glow.
+    float aaTurretHeat = 0.0f;
+
+    // Where the shells leave the gun, following the current barrel attitude.
+    DirectX::XMFLOAT3 AATurretMuzzle() const {
+        const float horizontal = std::cos(aaTurretPitch) * AATurretBarrelLength;
+        return DirectX::XMFLOAT3{
+            aaTurretPosition.x + std::sin(aaTurretYaw) * horizontal,
+            aaTurretPosition.y + AATurretMountHeight +
+                std::sin(aaTurretPitch) * AATurretBarrelLength,
+            aaTurretPosition.z + std::cos(aaTurretYaw) * horizontal };
+    }
+
+    float AATurretHealthFraction() const {
+        return AATurretMaxHealth > 0.0f
+            ? (std::max)(0.0f, (std::min)(1.0f, aaTurretHealth / AATurretMaxHealth))
+            : 0.0f;
+    }
+
+    bool AATurretActive() const { return aaTurretPresent && !aaTurretDead; }
+
+    void PlaceAATurret(const DirectX::XMFLOAT3& position) {
+        aaTurretPresent = true;
+        aaTurretPosition = position;
+        aaTurretYaw = 0.0f;
+        aaTurretPitch = 0.35f;
+        aaTurretHealth = AATurretMaxHealth;
+        aaTurretDead = false;
+        aaTurretShotTimer = 0.0f;
+        aaTurretShotsLeftInBurst = 0;
+        aaTurretHeat = 0.0f;
+    }
+
+    // Slews the gun toward `target` and reports true on the frames a shell
+    // leaves the barrel, so the caller can spawn the projectile and effects.
+    //
+    // `target` is where the gun should shoot, already led by the caller -- it
+    // knows the shell speed and the target's velocity, and leading a helicopter
+    // is the difference between a threat and a firework display.
+    bool UpdateAATurret(float deltaTime, const DirectX::XMFLOAT3& target,
+                        bool hasTarget) {
+        if (!AATurretActive()) return false;
+        const float dt = (std::max)(0.0f, deltaTime);
+        aaTurretHeat = (std::max)(0.0f, aaTurretHeat - dt * 1.6f);
+        if (!hasTarget) {
+            // Nothing to shoot: stop mid-burst rather than emptying into air.
+            aaTurretShotsLeftInBurst = 0;
+            return false;
+        }
+
+        const float dx = target.x - aaTurretPosition.x;
+        const float dz = target.z - aaTurretPosition.z;
+        const float dy = target.y - (aaTurretPosition.y + AATurretMountHeight);
+        const float horizontal = std::sqrt(dx * dx + dz * dz);
+
+        // Traverse and elevate at a finite rate. A turret that snaps to its
+        // target is both trivial to dodge-check and reads as a hitscan cheat;
+        // the slew is what makes flying wide of the gun a real option.
+        const float desiredYaw = std::atan2(dx, dz);
+        float yawDelta = std::atan2(std::sin(desiredYaw - aaTurretYaw),
+                                    std::cos(desiredYaw - aaTurretYaw));
+        const float maxYawStep = AATurretYawRate * dt;
+        yawDelta = (std::max)(-maxYawStep, (std::min)(maxYawStep, yawDelta));
+        aaTurretYaw += yawDelta;
+
+        const float desiredPitch = std::atan2(dy, (std::max)(0.001f, horizontal));
+        float pitchDelta = desiredPitch - aaTurretPitch;
+        const float maxPitchStep = AATurretPitchRate * dt;
+        pitchDelta = (std::max)(-maxPitchStep, (std::min)(maxPitchStep, pitchDelta));
+        aaTurretPitch = (std::max)(AATurretMinPitch,
+            (std::min)(AATurretMaxPitch, aaTurretPitch + pitchDelta));
+
+        // Only fire once roughly on target, so the burst does not spray while
+        // the mount is still swinging around.
+        const bool onTarget = std::fabs(yawDelta) < 0.05f &&
+                              std::fabs(desiredPitch - aaTurretPitch) < 0.06f;
+
+        aaTurretShotTimer -= dt;
+        if (aaTurretShotTimer > 0.0f) return false;
+        if (!onTarget) return false;
+
+        if (aaTurretShotsLeftInBurst <= 0) {
+            aaTurretShotsLeftInBurst = static_cast<int>(AATurretBurstShots);
+            aaTurretShotTimer = AATurretShotInterval;
+            --aaTurretShotsLeftInBurst;
+            aaTurretHeat = 1.0f;
+            return true;
+        }
+        --aaTurretShotsLeftInBurst;
+        aaTurretShotTimer = aaTurretShotsLeftInBurst > 0
+            ? AATurretShotInterval : AATurretBurstPause;
+        aaTurretHeat = 1.0f;
+        return true;
+    }
+
+    // Where to aim to hit a target moving at `velocity`. Solves the intercept
+    // iteratively: the flight time depends on the lead point, which depends on
+    // the flight time. Two passes is plenty at these ranges and speeds.
+    DirectX::XMFLOAT3 AATurretLeadPoint(const DirectX::XMFLOAT3& target,
+                                        const DirectX::XMFLOAT3& velocity,
+                                        float shellSpeed) const {
+        DirectX::XMFLOAT3 aim = target;
+        if (shellSpeed <= 0.001f) return aim;
+        const DirectX::XMFLOAT3 muzzle = AATurretMuzzle();
+        for (int i = 0; i < 2; ++i) {
+            const float dx = aim.x - muzzle.x;
+            const float dy = aim.y - muzzle.y;
+            const float dz = aim.z - muzzle.z;
+            const float t = std::sqrt(dx * dx + dy * dy + dz * dz) / shellSpeed;
+            aim = { target.x + velocity.x * t,
+                    target.y + velocity.y * t,
+                    target.z + velocity.z * t };
+        }
+        return aim;
+    }
+
     DirectX::XMFLOAT3 humveeModelCenter{};
     float humveeModelMinY = 0.0f;
     float humveeModelScale = 1.0f;
@@ -56,6 +209,208 @@ struct VehicleSystem {
     bool secondaryHelicopterCrashed = false;
     DirectX::XMFLOAT3 secondaryHelicopterCrashVelocity{};
     DirectX::XMFLOAT3 secondaryHumveePosition{ 42.0f, 2.5f, 3.0f };
+
+    // ---- Enemy reinforcement dropship ---------------------------------------
+    // Reinforcements arrive on the craft the player's own insertion uses: the
+    // gunship flies in, holds a hover, and fast-ropes a squad down. It reuses
+    // the secondaryHelicopter* fields above rather than adding a second
+    // airframe, so only one wave is ever in the air -- a second call-in waits
+    // for the current craft to clear. That cap is the whole reason this is a
+    // state enum on shared fields instead of a pool.
+    enum class DropshipState : uint8_t {
+        // Nothing inbound. secondaryHelicopter* is owned by the patrol path.
+        Idle = 0,
+        // Flying from the map edge toward the drop point.
+        Inbound = 1,
+        // Holding over the drop point, releasing troops on an interval.
+        Unloading = 2,
+        // Empty and climbing out toward the edge it came from.
+        Departing = 3
+    };
+
+    // Cruise speed on the way in and out (m/s). Inbound is the slower of the
+    // two: the approach is meant to be seen and shot at, the exit is not.
+    static constexpr float DropshipInboundSpeed = 26.0f;
+    static constexpr float DropshipDepartSpeed = 34.0f;
+    // Hover altitude above the drop point's terrain height. High enough to
+    // clear the palms, low enough that the rope reads as reaching the ground.
+    static constexpr float DropshipHoverHeight = 18.0f;
+    // Horizontal distance at which the approach is considered arrived.
+    static constexpr float DropshipArriveRadius = 3.5f;
+    // Seconds between troops leaving the craft. Paces a squad down the rope
+    // instead of teleporting the whole wave in one frame.
+    static constexpr float DropshipUnloadInterval = 0.85f;
+    // Held after the last troop before the craft leaves, so the airframe does
+    // not snap from unloading to departing on the same frame the squad lands.
+    static constexpr float DropshipUnloadTrailSeconds = 1.1f;
+    // Distance from the drop point at which a departing craft is done and the
+    // slot returns to Idle.
+    static constexpr float DropshipDepartDistance = 190.0f;
+    // Where troops leave the craft, relative to the hover. They fall the rest
+    // of the way -- see the fast-rope note in the update.
+    static constexpr float DropshipRopeDropHeight = 1.6f;
+
+    DropshipState dropshipState = DropshipState::Idle;
+    DirectX::XMFLOAT3 dropshipDropPoint{};
+    DirectX::XMFLOAT3 dropshipEntryPoint{};
+    float dropshipUnloadTimer = 0.0f;
+    int dropshipTroopsLeft = 0;
+    // Counts waves called this run. Drives the escalating squad size so the
+    // second call-in is heavier than the first.
+    uint32_t dropshipWavesCalled = 0;
+
+    bool DropshipActive() const { return dropshipState != DropshipState::Idle; }
+
+    // A wave can only be called when the slot is free and the airframe is
+    // still flyable -- a downed gunship stays down for the rest of the run.
+    bool DropshipAvailable() const {
+        return dropshipState == DropshipState::Idle && !secondaryHelicopterDead;
+    }
+
+    // Arms a wave. `entry` is where the craft comes from (map edge), `drop` is
+    // the hover it unloads over. Caller supplies both because only the app
+    // layer knows the terrain and the player's position.
+    void BeginDropshipRun(const DirectX::XMFLOAT3& entry,
+                          const DirectX::XMFLOAT3& drop, int troops) {
+        if (!DropshipAvailable() || troops <= 0) return;
+        dropshipEntryPoint = entry;
+        dropshipDropPoint = drop;
+        dropshipTroopsLeft = troops;
+        dropshipUnloadTimer = DropshipUnloadInterval;
+        dropshipState = DropshipState::Inbound;
+        ++dropshipWavesCalled;
+        // Take the airframe off the patrol path and put it at the entry point.
+        secondaryHelicopterPosition = entry;
+        secondaryHelicopterCrashed = false;
+    }
+
+    void ResetDropship() {
+        dropshipState = DropshipState::Idle;
+        dropshipDropPoint = {};
+        dropshipEntryPoint = {};
+        dropshipUnloadTimer = 0.0f;
+        dropshipTroopsLeft = 0;
+        dropshipWavesCalled = 0;
+    }
+
+    // Steps the dropship flight. Returns the number of troops that should be
+    // released this frame -- the caller spawns them, because spawning needs the
+    // model and bandit list this struct deliberately does not know about.
+    //
+    // Position is integrated here rather than lerped along a fixed path so a
+    // craft knocked around by damage still flies a sane line.
+    int UpdateDropship(float dt, float dropPointGroundY) {
+        if (dropshipState == DropshipState::Idle) return 0;
+        // A gunship shot down mid-run stops being a dropship immediately; the
+        // crash path in the app layer takes the airframe from here.
+        if (secondaryHelicopterDead) {
+            dropshipState = DropshipState::Idle;
+            dropshipTroopsLeft = 0;
+            return 0;
+        }
+        if (dt <= 0.0f) return 0;
+
+        const float hoverY = dropPointGroundY + DropshipHoverHeight;
+        int released = 0;
+
+        switch (dropshipState) {
+        case DropshipState::Inbound: {
+            const bool arrived = StepDropshipToward(
+                { dropshipDropPoint.x, hoverY, dropshipDropPoint.z },
+                DropshipInboundSpeed, dt);
+            if (arrived) dropshipState = DropshipState::Unloading;
+            break;
+        }
+        case DropshipState::Unloading: {
+            // Hold station. Small drift keeps the hover from looking frozen.
+            StepDropshipToward({ dropshipDropPoint.x, hoverY, dropshipDropPoint.z },
+                               DropshipInboundSpeed * 0.35f, dt);
+            dropshipUnloadTimer -= dt;
+            if (dropshipUnloadTimer <= 0.0f) {
+                if (dropshipTroopsLeft > 0) {
+                    --dropshipTroopsLeft;
+                    ++released;
+                    dropshipUnloadTimer = dropshipTroopsLeft > 0
+                        ? DropshipUnloadInterval
+                        : DropshipUnloadTrailSeconds;
+                } else {
+                    dropshipState = DropshipState::Departing;
+                }
+            }
+            break;
+        }
+        case DropshipState::Departing: {
+            // Climb out toward the entry point. Not a hard arrival test: the
+            // craft is done once it is far enough away to be off the play area.
+            StepDropshipToward({ dropshipEntryPoint.x,
+                                 hoverY + 12.0f,
+                                 dropshipEntryPoint.z },
+                               DropshipDepartSpeed, dt);
+            const float dx = secondaryHelicopterPosition.x - dropshipDropPoint.x;
+            const float dz = secondaryHelicopterPosition.z - dropshipDropPoint.z;
+            if (dx * dx + dz * dz >=
+                    DropshipDepartDistance * DropshipDepartDistance)
+                dropshipState = DropshipState::Idle;
+            break;
+        }
+        case DropshipState::Idle:
+        default:
+            break;
+        }
+        return released;
+    }
+
+    // Where a released troop leaves the airframe.
+    DirectX::XMFLOAT3 DropshipTroopReleasePoint() const {
+        return DirectX::XMFLOAT3{
+            secondaryHelicopterPosition.x,
+            secondaryHelicopterPosition.y - DropshipRopeDropHeight,
+            secondaryHelicopterPosition.z };
+    }
+
+private:
+    // Moves the airframe toward `target` at `speed`, turning to face the way it
+    // is going. Returns true once within DropshipArriveRadius horizontally.
+    bool StepDropshipToward(const DirectX::XMFLOAT3& target, float speed,
+                            float dt) {
+        const float dx = target.x - secondaryHelicopterPosition.x;
+        const float dy = target.y - secondaryHelicopterPosition.y;
+        const float dz = target.z - secondaryHelicopterPosition.z;
+        const float horizontal = std::sqrt(dx * dx + dz * dz);
+
+        // Vertical is always eased toward the target height, so the craft
+        // settles onto the hover altitude even while station-keeping.
+        const float verticalLerp = 1.0f - std::exp(-1.35f * dt);
+        secondaryHelicopterPosition.y += dy * verticalLerp;
+
+        if (horizontal > 0.001f) {
+            const float step = (std::min)(speed * dt, horizontal);
+            secondaryHelicopterPosition.x += dx / horizontal * step;
+            secondaryHelicopterPosition.z += dz / horizontal * step;
+
+            // Face the direction of travel, and bank into the turn.
+            const float desiredYaw = std::atan2(dx, dz);
+            const float yawDelta = std::atan2(
+                std::sin(desiredYaw - secondaryHelicopterYaw),
+                std::cos(desiredYaw - secondaryHelicopterYaw));
+            const float yawLerp = 1.0f - std::exp(-2.1f * dt);
+            secondaryHelicopterYaw += yawDelta * yawLerp;
+
+            const float attitudeLerp = 1.0f - std::exp(-2.4f * dt);
+            const float desiredRoll = (std::max)(-0.22f,
+                (std::min)(0.22f, -yawDelta * 0.55f));
+            // Nose down under way, level in the hover.
+            const float desiredPitch = horizontal > DropshipArriveRadius
+                ? -0.09f : 0.0f;
+            secondaryHelicopterRoll +=
+                (desiredRoll - secondaryHelicopterRoll) * attitudeLerp;
+            secondaryHelicopterPitch +=
+                (desiredPitch - secondaryHelicopterPitch) * attitudeLerp;
+        }
+        return horizontal <= DropshipArriveRadius;
+    }
+
+public:
 
     // Battle-damage smoke on the enemy gunships, read the same way as the
     // insertion BlackHawk's: below the threshold the airframe trails smoke, and
@@ -489,6 +844,8 @@ public:
     float blackHawkRotorSpin = 0.0f;
     float blackHawkUnloadTimer = 0.0f;
     float blackHawkRappelProgress = 0.0f;
+    // Differenced each UpdateBlackHawk; see BlackHawkVelocity().
+    DirectX::XMFLOAT3 blackHawkVelocity{};
     BlackHawkPhase blackHawkPhase = BlackHawkPhase::Inbound;
     bool blackHawkLanded = false;
     // Set for the single frame the skids touch down, so the caller can release
@@ -657,6 +1014,8 @@ public:
     // holds while the player gets out, then climbs away.
     void UpdateBlackHawk(float deltaTime) {
         const float dt = (std::max)(0.0f, deltaTime);
+        // Snapshot for the velocity difference taken at the end of this update.
+        const DirectX::XMFLOAT3 poseAtEntry = blackHawkPosition;
         const bool idling = blackHawkPhase == BlackHawkPhase::Unloading;
         // The rotor winds down once the engine quits instead of holding revs.
         const float rotorRate =
@@ -804,6 +1163,17 @@ public:
         case BlackHawkPhase::Gone:
             break;
         }
+
+        // Velocity by difference, for anything that needs to lead the airframe
+        // (the AA gun). Guarded on dt: the insertion is stepped with dt == 0 on
+        // the frame it arms, and dividing by that would produce an infinity that
+        // sends a lead solution off to nowhere.
+        if (dt > 1e-5f) {
+            blackHawkVelocity = {
+                (blackHawkPosition.x - poseAtEntry.x) / dt,
+                (blackHawkPosition.y - poseAtEntry.y) / dt,
+                (blackHawkPosition.z - poseAtEntry.z) / dt };
+        }
     }
 
     // Stands the helicopter down for a level that inserts by some other means.
@@ -821,6 +1191,7 @@ public:
         blackHawkRappelProgress = 0.0f;
         blackHawkHealth = BlackHawkMaxHealth;
         blackHawkCrashVelocity = { 0.0f, 0.0f, 0.0f };
+        blackHawkVelocity = { 0.0f, 0.0f, 0.0f };
         blackHawkPhase = BlackHawkPhase::Gone;
         // Never leak a box3d world across a level reset.
         blackHawkRopeSpawnRequested = false;
@@ -884,6 +1255,24 @@ public:
     }
     bool BlackHawkIsCrashing() const {
         return blackHawkPhase == BlackHawkPhase::Crashing;
+    }
+
+    // Airborne and still under power, so a gun has something worth shooting at.
+    // Excludes Crashing and Down (already dealt with) and Gone (off the map).
+    bool BlackHawkIsFlying() const {
+        return blackHawkPhase != BlackHawkPhase::Crashing &&
+               blackHawkPhase != BlackHawkPhase::Down &&
+               blackHawkPhase != BlackHawkPhase::Gone &&
+               !blackHawkLanded;
+    }
+
+    // Per-frame velocity, differenced from the previous pose rather than stored
+    // by the flight code: the BlackHawk is driven by phase-based position
+    // assignment, not by an integrated velocity there is any way to read.
+    // Needed so the AA gun can lead its shots instead of firing where the
+    // helicopter already was.
+    const DirectX::XMFLOAT3& BlackHawkVelocity() const {
+        return blackHawkVelocity;
     }
 
 private:
@@ -979,6 +1368,18 @@ public:
         return result;
     }
 
+    DamageResult DamageAATurret(float damage) {
+        DamageResult result{ aaTurretPosition };
+        if (damage <= 0.0f || !aaTurretPresent || aaTurretDead) return result;
+        result.applied = true;
+        aaTurretHealth = (std::max)(0.0f, aaTurretHealth - damage);
+        if (aaTurretHealth > 0.0f) return result;
+        aaTurretDead = true;
+        aaTurretShotsLeftInBurst = 0;
+        result.destroyed = true;
+        return result;
+    }
+
     DamageResult DamageBoat(float damage) {
         DamageResult result{ boatPosition };
         if (damage <= 0.0f || boatDead) return result;
@@ -991,6 +1392,18 @@ public:
     }
 
     void ResetLevel() {
+        // Cleared rather than re-placed: the level decides whether it has an AA
+        // gun and where, so a map without one must not inherit the last map's.
+        aaTurretPresent = false;
+        aaTurretPosition = {};
+        aaTurretYaw = 0.0f;
+        aaTurretPitch = 0.35f;
+        aaTurretHealth = AATurretMaxHealth;
+        aaTurretDead = false;
+        aaTurretShotTimer = 0.0f;
+        aaTurretShotsLeftInBurst = 0;
+        aaTurretHeat = 0.0f;
+
         helicopterLevelScale = 1.0f;
         helicopterMainRotorAngle = 0.0f;
         helicopterTailRotorAngle = 0.0f;
@@ -1019,6 +1432,7 @@ public:
         secondaryHelicopterDead = false;
         secondaryHelicopterCrashed = false;
         secondaryHelicopterCrashVelocity = {};
+        ResetDropship();
 
         drivingHumvee = false;
         savedGunVisible = true;
