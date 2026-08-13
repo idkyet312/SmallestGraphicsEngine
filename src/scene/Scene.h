@@ -378,7 +378,9 @@ struct Scene {
     float volumetricFogAnisotropy = 0.82f;
     float volumetricFogHeightFalloff = 0.045f; // fog thins above the undergrowth, not over treetops
     float volumetricFogBaseHeight = 0.4f;      // haze pools low in the valley floor
-    float volumetricFogDistance = 240.0f;      // pull back so far trees don't wash out
+    // Match the camera far plane so the volume reaches every edge and corner of
+    // the 600 m ocean instead of ending in a visible ring inside the map.
+    float volumetricFogDistance = 800.0f;
     XMFLOAT3 volumetricFogTint = {
         168.0f / 255.0f, 181.0f / 255.0f, 176.0f / 255.0f
     };

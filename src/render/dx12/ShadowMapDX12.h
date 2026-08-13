@@ -719,6 +719,15 @@ public:
                 depthShader, insertionBoatTransforms, lightSpace);
         }
 
+        if (!g_emptyLevelMode && g_insertionBoatModel && EscapeBoatVisible()) {
+            std::vector<XMMATRIX> escapeBoatTransforms = {
+                EscapeBoatWorldMatrix() };
+            DrawSceneNodeShadowInstances(
+                g_insertionBoatShadowModel ? g_insertionBoatShadowModel
+                                           : g_insertionBoatModel,
+                depthShader, escapeBoatTransforms, lightSpace);
+        }
+
         if (!g_emptyLevelMode && g_blackHawkModel && BlackHawkVisible()) {
             // Skinned, so it takes the per-node path with the rotor palette
             // rather than the instanced fast path.

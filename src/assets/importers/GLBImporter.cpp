@@ -451,17 +451,64 @@ ComPtr<ID3D12Resource> GLBImporter::CreateTextureFromRGBA(ID3D12Device* device,
     return CreateTexture(device, commandList, image, uploadHeaps);
 }
 
-ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& filepath, ComPtr<ID3D12Device> device,
-    ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
+namespace {
+// Decodes an HDR environment map to RGBA32F. Two container formats are in use:
+// OpenEXR (.exr) via tinyexr and Radiance (.hdr) via stb_image. Both produce the
+// same 4-float-per-pixel layout, so every consumer below shares this and only
+// the decode differs.
+//
+// Selected by extension because that is what the asset actually is -- feeding a
+// Radiance file to LoadEXR fails with a confusing "read version info" error,
+// which is exactly how a night sky silently lost its irradiance.
+//
+// `outIsStbAllocation` tells the caller which free to use: stb_image has its own
+// allocator, tinyexr hands back a malloc'd block.
+float* LoadHDRPixels(const std::string& filepath, const char* usage,
+                     int& width, int& height, bool& outIsStbAllocation) {
+    outIsStbAllocation = filepath.size() >= 4 &&
+        _stricmp(filepath.c_str() + filepath.size() - 4, ".hdr") == 0;
+
+    if (outIsStbAllocation) {
+        int channels = 0;
+        // Force 4 channels: every consumer assumes a 4-float stride, and
+        // Radiance maps are usually 3-channel RGBE.
+        float* pixels =
+            stbi_loadf(filepath.c_str(), &width, &height, &channels, 4);
+        if (!pixels) {
+            std::cerr << "Failed to load HDR for " << usage << ": " << filepath
+                      << " (" << (stbi_failure_reason()
+                                      ? stbi_failure_reason() : "unknown")
+                      << ")" << std::endl;
+        }
+        return pixels;
+    }
+
     float* pixels = nullptr;
-    int width = 0, height = 0;
     const char* err = nullptr;
-    if (LoadEXR(&pixels, &width, &height, filepath.c_str(), &err) != TINYEXR_SUCCESS) {
-        std::cerr << "Failed to load EXR texture: " << filepath
+    if (LoadEXR(&pixels, &width, &height, filepath.c_str(), &err) !=
+            TINYEXR_SUCCESS) {
+        std::cerr << "Failed to load EXR for " << usage << ": " << filepath
                   << (err ? (std::string(" (") + err + ")") : "") << std::endl;
         if (err) FreeEXRErrorMessage(err);
         return nullptr;
     }
+    return pixels;
+}
+
+void FreeHDRPixels(float* pixels, bool isStbAllocation) {
+    if (!pixels) return;
+    if (isStbAllocation) stbi_image_free(pixels);
+    else free(pixels);
+}
+}  // namespace
+
+ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& filepath, ComPtr<ID3D12Device> device,
+    ComPtr<ID3D12GraphicsCommandList> commandList, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {
+    int width = 0, height = 0;
+    bool isRadianceHDR = false;
+    float* pixels =
+        LoadHDRPixels(filepath, "texture", width, height, isRadianceHDR);
+    if (!pixels) return nullptr;
     // Build a full CPU mip chain (RGBA float). Box filter: wrap in U (longitude)
     // and clamp in V (latitude), matching how an equirect map tiles. Doing this on
     // the CPU (one-time load cost) avoids needing typed-UAV float support the GPU
@@ -475,7 +522,7 @@ ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& fi
     std::vector<UINT> mipW(mipLevels), mipH(mipLevels);
     mipW[0] = baseW; mipH[0] = baseH;
     mips[0].assign(pixels, pixels + (size_t)baseW * baseH * 4);
-    free(pixels);
+    FreeHDRPixels(pixels, isRadianceHDR);
 
     for (UINT16 level = 1; level < mipLevels; ++level) {
         UINT sw = mipW[level - 1], sh = mipH[level - 1];
@@ -593,16 +640,11 @@ std::array<XMFLOAT3, 9> GLBImporter::ComputeSkyIrradianceSH(
     std::array<XMFLOAT3, 9> coeffs{};
     for (auto& c : coeffs) c = XMFLOAT3(0, 0, 0);
 
-    float* pixels = nullptr;
     int width = 0, height = 0;
-    const char* err = nullptr;
-    int ret = LoadEXR(&pixels, &width, &height, filepath.c_str(), &err);
-    if (ret != TINYEXR_SUCCESS) {
-        std::cerr << "Failed to load EXR for sky SH: " << filepath
-                   << (err ? (std::string(" (") + err + ")") : "") << std::endl;
-        if (err) FreeEXRErrorMessage(err);
-        return coeffs;
-    }
+    bool isStbAllocation = false;
+    float* pixels =
+        LoadHDRPixels(filepath, "sky SH", width, height, isStbAllocation);
+    if (!pixels) return coeffs;
 
     // Real SH basis function values (unnormalized-direction form), L0-L2.
     double sh[9];
@@ -660,7 +702,7 @@ std::array<XMFLOAT3, 9> GLBImporter::ComputeSkyIrradianceSH(
             weightSum += weight;
         }
     }
-    free(pixels);
+    FreeHDRPixels(pixels, isStbAllocation);
 
     if (weightSum <= 0.0) return coeffs;
 
@@ -685,16 +727,12 @@ HDRISunLight GLBImporter::ExtractHDRISunLight(const std::string& filepath,
                                               float targetLuminance,
                                               float environmentRotationRadians) {
     HDRISunLight result;
-    float* pixels = nullptr;
     int width = 0, height = 0;
-    const char* err = nullptr;
-    if (LoadEXR(&pixels, &width, &height, filepath.c_str(), &err) !=
-        TINYEXR_SUCCESS) {
-        std::cerr << "Failed to analyze HDRI sun: " << filepath
-                  << (err ? (std::string(" (") + err + ")") : "") << '\n';
-        if (err) FreeEXRErrorMessage(err);
-        return result;
-    }
+    bool isStbAllocation = false;
+    float* pixels =
+        LoadHDRPixels(filepath, "HDRI sun analysis", width, height,
+                      isStbAllocation);
+    if (!pixels) return result;
 
     const size_t pixelCount = static_cast<size_t>(width) * height;
     std::vector<float> luminance(pixelCount, 0.0f);
@@ -748,7 +786,7 @@ HDRISunLight GLBImporter::ExtractHDRISunLight(const std::string& filepath,
             weightSum += weight;
         }
     }
-    free(pixels);
+    FreeHDRPixels(pixels, isStbAllocation);
 
     if (weightSum <= 0.0 || XMVectorGetX(XMVector3LengthSq(directionSum)) < 1e-8f)
         return result;

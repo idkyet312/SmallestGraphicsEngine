@@ -27,6 +27,8 @@ cbuffer FogConstants : register(b0)
     uint4 volumeDims;
     float4 atmosphereParams;      // Rayleigh, Mie, Mie g, aerial density
     float4 cloudParams;           // coverage, density, base height, thickness
+    float4 oceanBounds0;          // center.x, surface y, center.z, enabled
+    float4 oceanBounds1;          // half x, half z, edge blend width, unused
     uint4 maxVolumeDims;          // allocated froxel volume size (>= volumeDims)
 };
 
@@ -156,8 +158,20 @@ float3 AtmosphereAmbient(float3 ray, float aboveBase)
                       0.35 + horizon * 0.45);
     float3 groundBounce = float3(0.36, 0.44, 0.28) *
         exp(-aboveBase * 0.055);
-    return sky * (0.52 + atmosphereParams.x * 0.26) +
-           groundBounce * atmosphereParams.w * 0.34;
+    float3 daylightAmbient = sky * (0.52 + atmosphereParams.x * 0.26) +
+        groundBounce * atmosphereParams.w * 0.34;
+    // The Rayleigh colour above is daylight irradiance. Reusing it after the sun
+    // drops below the horizon turns even low-density fog into a white-blue veil.
+    // Keep daylight and dusk on their untouched path; only true night fades to
+    // the authored cool fog tint.
+    if (sunDirectionDensity.y < 0.06)
+    {
+        float nightBlend = 1.0 - smoothstep(
+            -0.10, 0.06, sunDirectionDensity.y);
+        return lerp(
+            daylightAmbient, ambientFogColor.xyz * 0.12, nightBlend);
+    }
+    return daylightAmbient;
 }
 
 [numthreads(8, 8, 1)]
@@ -307,20 +321,81 @@ float3 FogVolumeUVW(float2 uv, float slice)
     return float3(planar, clamp(sliceUV, halfTexel.z, scale.z - halfTexel.z));
 }
 
+float4 FadeFogAtRange(float4 fog, float viewDepth, float fogFar)
+{
+    // Fog composites as `scattering + scene * transmittance`. Fade toward that
+    // operation's neutral value (0 scattering, 1 transmittance), otherwise
+    // fading RGB alone leaves a dark band where the volume ends.
+    float fade = 1.0 - smoothstep(fogFar * 0.80, fogFar, viewDepth);
+    return float4(fog.rgb * fade, lerp(1.0, fog.a, fade));
+}
+
+float4 FogAtViewDepth(float2 uv, float viewDepth)
+{
+    float nearZ = cameraPositionNear.w;
+    float fogFar = min(cameraForwardFar.w, fogParams.z);
+    float clampedDepth = min(viewDepth, fogFar);
+    float slice = log(max(clampedDepth, nearZ) / nearZ) /
+                  log(fogFar / nearZ);
+    float4 fog = fogVolume.SampleLevel(
+        linearClampSampler, FogVolumeUVW(uv, saturate(slice)), 0.0);
+    return FadeFogAtRange(fog, viewDepth, fogFar);
+}
+
+float OceanSurfaceViewDepth(float2 uv, out float coverage)
+{
+    coverage = 0.0;
+    if (oceanBounds0.w < 0.5)
+        return 0.0;
+
+    float3 ray = WorldRay(uv);
+    if (abs(ray.y) < 1e-5)
+        return 0.0;
+    float distanceAlongRay =
+        (oceanBounds0.y - cameraPositionNear.y) / ray.y;
+    if (distanceAlongRay <= 0.0)
+        return 0.0;
+
+    float3 hit = cameraPositionNear.xyz + ray * distanceAlongRay;
+    float2 fromCenter = abs(hit.xz - oceanBounds0.xz);
+    float edgeDistance = min(
+        oceanBounds1.x - fromCenter.x,
+        oceanBounds1.y - fromCenter.y);
+    if (edgeDistance <= 0.0)
+        return 0.0;
+
+    // Water has no DSV, so opaque seabed depth abruptly becomes depth=1 at the
+    // terrain clipmap edge. Intersect the actual ocean footprint instead and
+    // softly retire that replacement depth only at the ocean's own map edge.
+    coverage = smoothstep(
+        0.0, max(oceanBounds1.z, 1e-3), edgeDistance);
+    return distanceAlongRay * max(
+        dot(ray, normalize(cameraForwardFar.xyz)), 0.08);
+}
+
+float4 CompositeFog(float2 uv, float deviceDepth)
+{
+    const float4 neutralFog = float4(0.0, 0.0, 0.0, 1.0);
+    bool hasOpaqueDepth = deviceDepth < 0.99999;
+    float opaqueViewDepth = hasOpaqueDepth
+        ? LinearDepth(deviceDepth) : cameraForwardFar.w;
+    float4 opaqueFog = hasOpaqueDepth
+        ? FogAtViewDepth(uv, opaqueViewDepth) : neutralFog;
+
+    float oceanCoverage;
+    float oceanViewDepth = OceanSurfaceViewDepth(uv, oceanCoverage);
+    if (oceanCoverage <= 0.0 ||
+        (hasOpaqueDepth && oceanViewDepth >= opaqueViewDepth))
+        return opaqueFog;
+
+    float4 oceanFog = FogAtViewDepth(uv, oceanViewDepth);
+    return lerp(opaqueFog, oceanFog, oceanCoverage);
+}
+
 float4 PSMain(VSOutput input) : SV_TARGET
 {
     float deviceDepth = sceneDepth.SampleLevel(linearClampSampler, input.uv, 0.0);
-    // Procedural sky already contains atmospheric scattering. Fogging depth=1
-    // applied the full 180 m extinction to it and tinted the entire frame.
-    if (deviceDepth >= 0.99999)
-        return float4(0.0, 0.0, 0.0, 1.0);
-    float viewDepth = min(LinearDepth(deviceDepth), fogParams.z);
-    float nearZ = cameraPositionNear.w;
-    float fogFar = min(cameraForwardFar.w, fogParams.z);
-    float slice = log(max(viewDepth, nearZ) / nearZ) / log(fogFar / nearZ);
-    float3 uvw = FogVolumeUVW(input.uv, saturate(slice));
-    float4 fog = fogVolume.SampleLevel(linearClampSampler, uvw, 0.0);
-    return float4(fog.rgb, fog.a);
+    return CompositeFog(input.uv, deviceDepth);
 }
 
 float4 PSMainMSAA(VSOutput input) : SV_TARGET
@@ -330,13 +405,5 @@ float4 PSMainMSAA(VSOutput input) : SV_TARGET
     [unroll]
     for (uint sampleIndex = 1; sampleIndex < 4; ++sampleIndex)
         deviceDepth = min(deviceDepth, sceneDepthMS.Load(pixel, sampleIndex));
-    if (deviceDepth >= 0.99999)
-        return float4(0.0, 0.0, 0.0, 1.0);
-    float viewDepth = min(LinearDepth(deviceDepth), fogParams.z);
-    float nearZ = cameraPositionNear.w;
-    float fogFar = min(cameraForwardFar.w, fogParams.z);
-    float slice = log(max(viewDepth, nearZ) / nearZ) / log(fogFar / nearZ);
-    float4 fog = fogVolume.SampleLevel(
-        linearClampSampler, FogVolumeUVW(input.uv, saturate(slice)), 0.0);
-    return float4(fog.rgb, fog.a);
+    return CompositeFog(input.uv, deviceDepth);
 }

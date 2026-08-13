@@ -171,6 +171,18 @@ inline void WaitForGPU() {
 // Signal one value above the highest across all slots and wait for it. Because
 // the queue executes in submission order, that value retiring means every
 // previously submitted command list on this queue has completed.
+// PRECONDITION: a frame's MoveToNextFrame() must follow this call.
+//
+// The loop at the end leaves every slot of fenceValues[] holding `target + 1`,
+// a value that has NOT been signalled -- only `target` was. MoveToNextFrame()
+// re-establishes the invariant by signalling fenceValues[frameIndex] before
+// anything waits on it, so every in-frame caller is safe.
+//
+// Called outside a frame (or twice in a row without an intervening frame), the
+// slots drift ahead of what the fence has actually reached and the next
+// MoveToNextFrame() waits INFINITE on a value nothing will ever signal. That
+// deadlocked the runtime sky swap; it now uses a private fence instead -- see
+// SkyRendererDX12::BeginEnvironmentSwap.
 inline void WaitForGPUAllFrames() {
     if (!g_dx12.commandQueue || !g_dx12.fence) return;
 

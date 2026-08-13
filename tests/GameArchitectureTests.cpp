@@ -12,6 +12,7 @@
 #include "LevelLoadingController.h"
 #include "LevelRuntimeBuilder.h"
 #include "PlayerState.h"
+#include "TimeOfDay.h"
 #include "PlayerMovementTracker.h"
 #include "ProceduralRunAnimation.h"
 #include "RenderCoordinator.h"
@@ -710,6 +711,182 @@ int main() {
         // Reset clears the wave counter so a restarted run starts from wave 1.
         vehicles.ResetDropship();
         CHECK(vehicles.dropshipWavesCalled == 0);
+    }
+
+    // ---- Escape boat ---------------------------------------------------------
+    // Exfil sits offshore under the lane the dropship flies in along, so the way
+    // out points back along the direction the enemy keeps arriving from.
+    {
+        VehicleSystem vehicles;
+        CHECK(!vehicles.EscapeBoatReady());
+
+        // No wave called yet: there is no lane to sit under, so nothing places.
+        vehicles.PlaceEscapeBoatOnDropshipLane(0.0f);
+        CHECK(!vehicles.EscapeBoatReady());
+
+        // Drop at the origin, aircraft entering from +X: the boat belongs out
+        // along +X, on the water.
+        vehicles.BeginDropshipRun({ 200.0f, 30.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, 3);
+        vehicles.PlaceEscapeBoatOnDropshipLane(0.0f);
+        CHECK(vehicles.EscapeBoatReady());
+        CHECK(std::abs(vehicles.escapeBoatPosition.x -
+                       VehicleSystem::EscapeBoatShoreDistance) < 0.001f);
+        CHECK(std::abs(vehicles.escapeBoatPosition.z) < 0.001f);
+        CHECK(std::abs(vehicles.escapeBoatPosition.y) < 0.001f);
+        // On water, not on the beach. The terrain profile crosses the waterline
+        // between 40 m (y = +0.04) and 42 m (y = -0.21), so the boat has to sit
+        // beyond that band or it grounds on the shelf. The upper bound keeps it
+        // swimmable from shore rather than a hike across open sea.
+        CHECK(VehicleSystem::EscapeBoatShoreDistance >= 41.0f);
+        CHECK(VehicleSystem::EscapeBoatShoreDistance < 70.0f);
+
+        // Idempotent: a later wave must not move an exfil the player may
+        // already be swimming toward.
+        const float placedX = vehicles.escapeBoatPosition.x;
+        vehicles.dropshipState = VehicleSystem::DropshipState::Idle;
+        vehicles.BeginDropshipRun({ 0.0f, 30.0f, -200.0f }, { 0.0f, 0.0f, 0.0f }, 3);
+        vehicles.PlaceEscapeBoatOnDropshipLane(0.0f);
+        CHECK(std::abs(vehicles.escapeBoatPosition.x - placedX) < 0.001f);
+
+        // Boarding is a horizontal test: the player may be swimming or on deck,
+        // so height must not decide it.
+        const DirectX::XMFLOAT3 boat = vehicles.escapeBoatPosition;
+        CHECK(vehicles.PlayerCanBoardEscapeBoat(boat));
+        CHECK(vehicles.PlayerCanBoardEscapeBoat(
+            { boat.x, boat.y + 40.0f, boat.z }));
+        CHECK(vehicles.PlayerCanBoardEscapeBoat(
+            { boat.x + VehicleSystem::EscapeBoatBoardRadius - 0.5f,
+              boat.y, boat.z }));
+        CHECK(!vehicles.PlayerCanBoardEscapeBoat(
+            { boat.x + VehicleSystem::EscapeBoatBoardRadius + 1.0f,
+              boat.y, boat.z }));
+        CHECK(!vehicles.PlayerCanBoardEscapeBoat({ 0.0f, 0.0f, 0.0f }));
+
+        // The bob rides the swell rather than drifting the hull away.
+        vehicles.UpdateEscapeBoat(0.5f);
+        vehicles.UpdateEscapeBoat(0.5f);
+        CHECK(std::abs(vehicles.EscapeBoatBobOffset()) < 0.5f);
+        CHECK(std::abs(vehicles.escapeBoatPosition.x - placedX) < 0.001f);
+
+        // A boat that is not out cannot be boarded -- the win condition must not
+        // fire on a level that never placed one.
+        vehicles.ResetEscapeBoat();
+        CHECK(!vehicles.EscapeBoatReady());
+        CHECK(!vehicles.PlayerCanBoardEscapeBoat(boat));
+    }
+
+    // ---- Time of day ---------------------------------------------------------
+    // The presets drive the sky, volumetric fog and DDGI off one sun direction,
+    // so the values have to be internally consistent: a "night" that leaves the
+    // sun above the horizon renders a lit sky over a dark island.
+    {
+        // Afternoon is the historical look and the default, so it must keep the
+        // exact values every level shipped with before the choice existed.
+        const TimeOfDaySettings afternoon =
+            MakeTimeOfDaySettings(TimeOfDay::Afternoon);
+        CHECK(std::abs(afternoon.lightPos.x - 4.735f) < 0.0001f);
+        CHECK(std::abs(afternoon.lightPos.y - 3.095f) < 0.0001f);
+        CHECK(std::abs(afternoon.lightPos.z + 8.246f) < 0.0001f);
+        CHECK(std::abs(afternoon.directionalLightIntensity - 12.18f) < 0.0001f);
+        CHECK(std::abs(afternoon.ambientStrength - 0.07f) < 0.0001f);
+        CHECK(std::abs(afternoon.volumetricFogDensity - 0.009f) < 0.0001f);
+        CHECK(std::abs(afternoon.volumetricFogDistance - 800.0f) < 0.0001f);
+
+        const TimeOfDaySettings noon = MakeTimeOfDaySettings(TimeOfDay::Noon);
+        const TimeOfDaySettings dusk = MakeTimeOfDaySettings(TimeOfDay::Dusk);
+        const TimeOfDaySettings night = MakeTimeOfDaySettings(TimeOfDay::Night);
+
+        // Sun elevation orders the presets: overhead at noon, on the horizon at
+        // dusk, below it at night. This is the property the sky actually reads.
+        const float noonSun = TimeOfDaySunElevation(noon);
+        const float afternoonSun = TimeOfDaySunElevation(afternoon);
+        const float duskSun = TimeOfDaySunElevation(dusk);
+        const float nightSun = TimeOfDaySunElevation(night);
+        CHECK(noonSun > afternoonSun);
+        CHECK(afternoonSun > duskSun);
+        CHECK(duskSun > nightSun);
+        // Dusk is a low sun, not a set one -- it still lights the island.
+        CHECK(duskSun > 0.0f);
+        CHECK(duskSun < 0.2f);
+        // Night is genuinely below the horizon, which is what makes it night
+        // rather than a dimmed afternoon.
+        CHECK(nightSun < 0.0f);
+        // Noon is high overhead, so shadows fall short rather than long.
+        CHECK(noonSun > 0.9f);
+
+        // Key light dims monotonically toward night.
+        CHECK(noon.directionalLightIntensity >
+              afternoon.directionalLightIntensity);
+        CHECK(afternoon.directionalLightIntensity >
+              dusk.directionalLightIntensity);
+        CHECK(dusk.directionalLightIntensity >
+              night.directionalLightIntensity);
+
+        // Night keeps a non-zero floor for silhouettes, but is authored close
+        // to black so local lights and muzzle flashes define the scene.
+        CHECK(night.ambientStrength > 0.0f);
+        CHECK(night.ambientLightingIntensity > 0.0f);
+        CHECK(night.directionalLightIntensity < 0.05f);
+        CHECK(night.ambientStrength < 0.002f);
+        CHECK(night.ambientLightingIntensity < 0.01f);
+        // ...but darker than every daylight preset, or it is not night.
+        CHECK(night.ambientStrength < dusk.ambientStrength);
+        CHECK(night.ambientLightingIntensity < dusk.ambientLightingIntensity);
+        // Night uses the established Afternoon fog volume. Its illumination is
+        // darkened in the fog shader rather than by changing these physical
+        // controls, so the volume behaves consistently across both presets.
+        CHECK(std::abs(night.volumetricFogDensity -
+                       afternoon.volumetricFogDensity) < 0.0001f);
+        CHECK(std::abs(night.volumetricFogAnisotropy -
+                       afternoon.volumetricFogAnisotropy) < 0.0001f);
+        CHECK(std::abs(night.volumetricFogDistance -
+                       afternoon.volumetricFogDistance) < 0.0001f);
+        CHECK(std::abs(night.volumetricFogTint.x -
+                       afternoon.volumetricFogTint.x) < 0.0001f);
+        CHECK(std::abs(night.volumetricFogTint.y -
+                       afternoon.volumetricFogTint.y) < 0.0001f);
+        CHECK(std::abs(night.volumetricFogTint.z -
+                       afternoon.volumetricFogTint.z) < 0.0001f);
+
+        // Night sky is near-black, and cool rather than warm: the clear colour
+        // is what shows through wherever the atmosphere does not cover.
+        CHECK(night.clearColor.x < 0.1f);
+        CHECK(night.clearColor.y < 0.1f);
+        CHECK(night.clearColor.z < 0.1f);
+        CHECK(night.clearColor.z > night.clearColor.x);   // blue-biased
+        // Dusk swings warm: red key well above blue.
+        CHECK(dusk.lightColor.x > dusk.lightColor.z);
+        // Night key is moonlight -- cool, the opposite bias.
+        CHECK(night.lightColor.z > night.lightColor.x);
+
+        // Only Night reports as dark, so anything gating on low light (and the
+        // deployment screen's warning) fires exactly once.
+        CHECK(TimeOfDayIsDark(TimeOfDay::Night));
+        CHECK(!TimeOfDayIsDark(TimeOfDay::Dusk));
+        CHECK(!TimeOfDayIsDark(TimeOfDay::Noon));
+        CHECK(!TimeOfDayIsDark(TimeOfDay::Afternoon));
+
+        // Every preset needs a name and a briefing for the deployment screen,
+        // and no two may share a name or the buttons become ambiguous.
+        const TimeOfDay all[] = { TimeOfDay::Noon, TimeOfDay::Afternoon,
+                                  TimeOfDay::Dusk, TimeOfDay::Night };
+        for (const TimeOfDay time : all) {
+            CHECK(TimeOfDayName(time) != nullptr);
+            CHECK(TimeOfDayName(time)[0] != '\0');
+            CHECK(TimeOfDayBriefing(time) != nullptr);
+            CHECK(TimeOfDayBriefing(time)[0] != '\0');
+            // Sun direction must be non-degenerate, or the sky normalises a
+            // zero vector and the atmosphere breaks.
+            const TimeOfDaySettings s = MakeTimeOfDaySettings(time);
+            const float lengthSq = s.lightPos.x * s.lightPos.x +
+                                   s.lightPos.y * s.lightPos.y +
+                                   s.lightPos.z * s.lightPos.z;
+            CHECK(lengthSq > 1e-4f);
+        }
+        for (size_t i = 0; i < std::size(all); ++i)
+            for (size_t j = i + 1; j < std::size(all); ++j)
+                CHECK(std::string(TimeOfDayName(all[i])) !=
+                      std::string(TimeOfDayName(all[j])));
     }
 
     return failures ? 1 : 0;

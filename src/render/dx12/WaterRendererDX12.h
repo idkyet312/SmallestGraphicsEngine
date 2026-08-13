@@ -6,6 +6,7 @@
 #include "Scene.h"
 #include "WaterVolume.h"
 #include <d3dcompiler.h>
+#include <algorithm>
 #include <array>
 #include <fstream>
 #include <iostream>
@@ -670,12 +671,23 @@ private:
             XMLoadFloat3(&scene.lightPos));
         XMFLOAT3 lightDirection;
         XMStoreFloat3(&lightDirection, light);
+        // Water samples the raw HDRI rather than the exposed sky render. Match
+        // the sky's below-horizon fade here so its reflection does not remain
+        // photographic-white after the visible sky has become night.
+        const float nightBlend = (std::max)(0.0f, (std::min)(1.0f,
+            (-lightDirection.y - 0.10f) / 0.18f));
+        const float reflectionIntensity =
+            1.0f + (0.006f - 1.0f) * nightBlend;
+        const float waterIntensity =
+            1.0f + (0.03f - 1.0f) * nightBlend;
         constants.lightDirection = {
-            lightDirection.x, lightDirection.y, lightDirection.z, 0.0f
+            lightDirection.x, lightDirection.y, lightDirection.z,
+            reflectionIntensity
         };
         const XMFLOAT3 effectiveLight = scene.EffectiveLightColor();
         constants.lightColor = {
-            effectiveLight.x, effectiveLight.y, effectiveLight.z, 0.0f
+            effectiveLight.x, effectiveLight.y, effectiveLight.z,
+            waterIntensity
         };
         for (size_t i = 0; i < OceanWaveSettings::WaveCount; ++i) {
             const OceanWave& wave = settings.waves[i];

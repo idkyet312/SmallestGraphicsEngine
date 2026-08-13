@@ -2,7 +2,7 @@ cbuffer ParticleFrame : register(b0)
 {
     float4x4 viewProjection;
     float3 cameraRight;
-    float framePadding0;
+    float smokeIllumination;
     float3 cameraUp;
     float framePadding1;
 };
@@ -78,6 +78,8 @@ float4 PSMain(VSOutput input) : SV_TARGET
     }
     clip(alpha - 0.003);
     float3 color = input.color;
+    if (input.kind == 0)
+        color *= smokeIllumination;
 #ifndef SGE_HDR_TARGET
     color = pow(color / (1.0 + color), 1.0 / 2.2);
 #endif

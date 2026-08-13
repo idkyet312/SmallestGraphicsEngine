@@ -23,11 +23,16 @@ struct PSInput {
     float2 uv : TEXCOORD0;
 };
 
-// Narkowicz ACES approximation; the EXR is linear HDR and the backbuffer is
-// 8-bit non-sRGB, so tonemap + gamma happen here.
-float3 TonemapACES(float3 x) {
-    return saturate((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14));
-}
+// AgX (Punchy), shared with the clustered and grass passes. The EXR is linear
+// HDR and the backbuffer is 8-bit non-sRGB, so tonemap + gamma happen here --
+// tonemapAgXPunchy returns display-encoded colour with the grade applied, so
+// this pass must not gamma-correct or grade again on top of it.
+//
+// Was Narkowicz ACES while everything below the horizon was already AgX, which
+// left the sky and the terrain it meets rolling off differently: ACES clips
+// bright sun and sky to white far harder, so the horizon showed a seam and the
+// sun disc blew out where the terrain held detail.
+#include "agx_tonemap.hlsli"
 
 float Hash21(float2 p) {
     p = frac(p * float2(123.34, 456.21));
@@ -158,8 +163,33 @@ float3 PhysicalSky(float3 ray, float3 source) {
     // wavelength-dependent atmospheric extinction and in-scattering.
     const float physicalBlend = saturate(
         0.22 * rayleighStrength + horizon * atmosphereParams.w * 0.46);
-    float3 physical = source * extinction + scattering * (2.4 + horizon * 1.8);
-    return lerp(source, physical, physicalBlend);
+
+    // Night: once the sun is below the horizon it cannot light the atmosphere,
+    // so the in-scattering has to fall away with it. Without this the analytic
+    // sky keeps adding a lit horizon band on top of the night HDRI and the
+    // result reads as dusk no matter how dark the environment map is.
+    //
+    // Fades over the last few degrees above the horizon rather than switching at
+    // zero, so dusk still gets its warm scatter and only true night loses it.
+    const float sunUp = smoothstep(-0.10, 0.06, sunDirection.y);
+    // A little residual airglow keeps the night sky from going flat black where
+    // the HDRI itself is dark, but it is scaled far below the daylight term.
+    const float scatterScale = lerp(0.002, 1.0, sunUp);
+
+    // The HDRI passes through `source * extinction`, and at night the thinned
+    // atmosphere makes extinction ~1, so the environment map's own bright
+    // horizon survives untouched -- then AgX's punchy curve lifts it further
+    // into the pale band that reads as dusk. Scaling the source with the same
+    // sun fade is what actually darkens it; the scattering fix above only
+    // removed the analytic half of the problem.
+    //
+    // Applied to both sides of the blend so the horizon comes down whether the
+    // physical path is mixed in or not.
+    const float3 attenuated = source * lerp(0.004, 1.0, sunUp);
+
+    float3 physical = attenuated * extinction +
+                      scattering * (2.4 + horizon * 1.8) * scatterScale;
+    return lerp(attenuated, physical, physicalBlend);
 }
 
 float4 RaymarchClouds(float3 ray) {
@@ -177,6 +207,10 @@ float4 RaymarchClouds(float3 ray) {
     float3 accumulated = 0.0;
     float transmittance = 1.0;
     const float sunAmount = saturate(sunDirection.y * 1.8 + 0.25);
+    // Matches PhysicalSky's sunUp fade, so cloud and sky brightness fall off
+    // together instead of leaving lit clouds over an unlit sky.
+    const float nightCloudScale =
+        lerp(0.004, 1.0, smoothstep(-0.10, 0.06, sunDirection.y));
     const float3 shadowColor = lerp(float3(0.20, 0.28, 0.40),
                                     float3(0.42, 0.48, 0.56), sunAmount);
     const float3 sunColor = lerp(float3(1.0, 0.43, 0.16),
@@ -199,6 +233,10 @@ float4 RaymarchClouds(float3 ray) {
             (p.xz + sunDirection.xz * 180.0) * 0.00055 + wind);
         float3 lighting = lerp(shadowColor, sunColor,
                                0.38 + 0.62 * lightMarch);
+        // Unlit clouds still rendered at their daylight shadow colour, which put
+        // pale grey slabs across a night sky. Fade them down with the sun on the
+        // same curve the atmosphere uses.
+        lighting *= nightCloudScale;
         accumulated += transmittance * segmentAlpha * lighting;
         transmittance *= 1.0 - segmentAlpha;
     }
@@ -237,13 +275,22 @@ float4 main(PSInput input) : SV_Target {
     const float4 distantIslands = DistantIslandSilhouettes(ray, hdr);
     hdr = lerp(hdr, distantIslands.rgb, distantIslands.a);
 
+    // The night EXR contains a photographic horizon many stops brighter than
+    // its star field. Exposure alone cannot tame it reliably because that band
+    // is still HDR and the final tone mapper rolls it back toward white. Cap the
+    // fully-composited night sky to a blue-black ceiling; daylight and dusk have
+    // a zero blend and remain byte-identical through this branch.
+    const float nightBlend = 1.0 - smoothstep(-0.10, 0.06, sunDirection.y);
+    const float3 nightCeiling = float3(0.035, 0.045, 0.065);
+    hdr = lerp(hdr, min(hdr, nightCeiling), nightBlend);
+
     float3 color;
 #ifdef SGE_HDR_TARGET
     color = hdr * exposure;
 #else
-    color = TonemapACES(hdr * exposure);
-    color = pow(color, 1.0 / 2.2);
-    color = ApplySceneColorGrade(color);
+    // AgX already returns display-encoded, graded colour, so no pow(1/2.2) and
+    // no second ApplySceneColorGrade here -- either would double-apply.
+    color = tonemapAgXPunchy(max(hdr * exposure, 0.0));
 #endif
     return float4(color, 1.0);
 }

@@ -40,6 +40,7 @@
 #include "VisibilityBufferDX12.h"
 #include "StaticBufferDX12.h"
 #include "Scene.h"
+#include "TimeOfDay.h"
 #include "ForwardRenderer.h"
 #include "IdTechRenderer.h"
 #include "RaytracingDX12.h"
@@ -329,6 +330,25 @@ unsigned int                g_scatterEnemiesSeed = 0;
 // The seed the last scatter actually ran with, surfaced in the debug UI so a
 // clock-seeded layout can be pinned after the fact.
 unsigned int                g_scatterEnemiesLastSeed = 0;
+// Time of day for the next run, chosen on the deployment screen and applied at
+// DEPLOY. Afternoon is the look every level shipped with before the choice
+// existed, so it stays the default.
+TimeOfDay                   g_selectedTimeOfDay = TimeOfDay::Afternoon;
+struct NightVolumetricFogSettings {
+    float density;
+    float anisotropy;
+    float distance;
+    XMFLOAT3 tint;
+};
+
+static NightVolumetricFogSettings MakeDefaultNightVolumetricFogSettings() {
+    const TimeOfDaySettings night = MakeTimeOfDaySettings(TimeOfDay::Night);
+    return {night.volumetricFogDensity, night.volumetricFogAnisotropy,
+            night.volumetricFogDistance, night.volumetricFogTint};
+}
+
+NightVolumetricFogSettings g_nightVolumetricFog =
+    MakeDefaultNightVolumetricFogSettings();
 // Draws every live bandit as a red dot on the deployment map. On by default:
 // the point of randomising the squad is being able to see what you rolled
 // before committing to a zone.
@@ -1173,6 +1193,11 @@ static void PlayMetalHitAudio(const XMFLOAT3& position, float volumeScale = 1.0f
 }
 
 
+// Both defined with the other scene helpers, below.
+static void ApplyTimeOfDay(TimeOfDay time);
+// Defined next to the sky renderer, which is declared later than ApplyTimeOfDay.
+static void RequestTimeOfDaySkyEnvironment(TimeOfDay time);
+
 static void BeginDeploymentPlanning() {
     auto params = CurrentTerrainParams();
     params.heightScale = scene.terrainHeightScale;
@@ -1208,6 +1233,10 @@ static void BeginDeploymentPlanning() {
     g_insertionChoicePending = true;
     g_game.session.StopTimer();
     scene.camera.FPSMode = false;
+    // Open the planning fly-through in the light the last choice selected, so
+    // restarting a night mission does not put the player back over a sunlit
+    // island with NIGHT still highlighted.
+    ApplyTimeOfDay(g_selectedTimeOfDay);
 }
 
 static void UpdateDeploymentPlanningCamera(float deltaTime) {
@@ -1695,6 +1724,25 @@ XMMATRIX InsertionBoatWorldMatrix() {
 
 bool InsertionBoatVisible() { return g_game.vehicles.insertionBoatVisible; }
 
+// Escape boat. Reuses the insertion boat's mesh and its model-fit constants --
+// it is the same craft, waiting offshore rather than running the player in.
+XMMATRIX EscapeBoatWorldMatrix() {
+    const VehicleSystem& vehicles = g_game.vehicles;
+    return XMMatrixTranslation(-vehicles.insertionBoatModelCenter.x,
+                               -vehicles.insertionBoatModelMinY,
+                               -vehicles.insertionBoatModelCenter.z) *
+           XMMatrixScaling(vehicles.insertionBoatModelScale,
+                           vehicles.insertionBoatModelScale,
+                           vehicles.insertionBoatModelScale) *
+           XMMatrixRotationY(vehicles.escapeBoatYaw) *
+           XMMatrixTranslation(
+               vehicles.escapeBoatPosition.x,
+               vehicles.escapeBoatPosition.y + vehicles.EscapeBoatBobOffset(),
+               vehicles.escapeBoatPosition.z);
+}
+
+bool EscapeBoatVisible() { return g_game.vehicles.EscapeBoatReady(); }
+
 XMFLOAT3 InsertionBoatRideWorldPosition() {
     return g_game.vehicles.InsertionBoatRidePosition();
 }
@@ -2176,6 +2224,47 @@ static void UpdateHelicopter(float dt) {
 static float RandomUnit();
 static bool SpawnDropshipBandit(const XMFLOAT3& position);
 
+// Pushes a time-of-day preset onto the live scene. Every field moves together:
+// the sky, volumetric fog and DDGI all read scene.lightPos as the sun
+// direction, so changing the key light without the atmosphere alongside it
+// gives a midnight sun over a blue afternoon sky.
+static void ApplyTimeOfDay(TimeOfDay time) {
+    TimeOfDaySettings settings = MakeTimeOfDaySettings(time);
+    if (time == TimeOfDay::Night) {
+        settings.volumetricFogDensity = g_nightVolumetricFog.density;
+        settings.volumetricFogAnisotropy = g_nightVolumetricFog.anisotropy;
+        settings.volumetricFogDistance = g_nightVolumetricFog.distance;
+        settings.volumetricFogTint = g_nightVolumetricFog.tint;
+    }
+    scene.lightPos = settings.lightPos;
+    scene.lightColor = settings.lightColor;
+    scene.directionalLightIntensity = settings.directionalLightIntensity;
+    scene.ambientStrength = settings.ambientStrength;
+    scene.ambientLightingIntensity = settings.ambientLightingIntensity;
+    scene.clearColor = settings.clearColor;
+    scene.atmosphereRayleighStrength = settings.atmosphereRayleighStrength;
+    scene.atmosphereMieStrength = settings.atmosphereMieStrength;
+    scene.atmosphereAerialDensity = settings.atmosphereAerialDensity;
+    scene.volumetricFogDensity = settings.volumetricFogDensity;
+    scene.volumetricFogAnisotropy = settings.volumetricFogAnisotropy;
+    scene.volumetricFogDistance = settings.volumetricFogDistance;
+    scene.volumetricFogTint = settings.volumetricFogTint;
+    // The demo light animation walks lightPos around on its own, which would
+    // drag a chosen sun back out of place within a few seconds.
+    scene.animateDemoLights = false;
+
+    // Night swaps the environment map too. Only requested here: replacing a
+    // texture still sampled by in-flight frames has to run between frames rather
+    // than from the UI callback that picked the preset.
+    RequestTimeOfDaySkyEnvironment(time);
+    // Indirect light is cached across frames, so a sun that moves this far in
+    // one frame leaves the old bounce baked in until it converges out.
+    g_game.commands.Request(GameCommand::ResetDDGIHistory);
+    g_game.commands.Request(GameCommand::RebuildDDGI);
+    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+        std::string("Time of day set to ") + TimeOfDayName(time));
+}
+
 // Terrain height under a world position, or 0 on levels without mesh terrain.
 static float GroundHeightAt(float x, float z) {
     if (!scene.useMeshTerrain || !g_terrain.supported) return 0.0f;
@@ -2220,6 +2309,10 @@ static void CallInReinforcementWave() {
 
     const int troops = DropshipWaveTroopCount(vehicles.dropshipWavesCalled);
     vehicles.BeginDropshipRun(entry, drop, troops);
+    // Exfil appears with the first wave, out along the lane the aircraft just
+    // came in on. Ocean surface is y = 0 -- see the g_ocean.Initialize call
+    // (centre -kSeaDepth/2, height kSeaDepth).
+    vehicles.PlaceEscapeBoatOnDropshipLane(0.0f);
     SGE_LOG("LogGameplay", EngineLog::Level::Display,
         "Reinforcement wave " + std::to_string(vehicles.dropshipWavesCalled) +
         " inbound with " + std::to_string(troops) + " troops");
@@ -4099,12 +4192,111 @@ void MatchFoliageMaterialToGrass() {
 }
 
 static SkyRendererDX12      skyRenderer;
+
 static EnvironmentIBLDX12   environmentIBL;
 DDGIRendererDX12            g_ddgiRenderer;
 static DXRDDGIRenderer       g_dxrDDGI;
 ID3D12Resource*             g_skyEnvironmentResource = nullptr;
 ID3D12Resource*             g_specularEnvironmentResource = nullptr;
 ID3D12Resource*             g_brdfIntegrationResource = nullptr;
+
+// Night gets its own environment map: a sun direction below the horizon dims the
+// analytic sky, but the starfield and moon can only come from the HDRI. The
+// image-based lighting is baked from that same map, so the irradiance has to be
+// recomputed alongside it -- otherwise the island keeps its daylight ambient
+// bounce under a night sky.
+//
+// Separated from ApplyTimeOfDay only because skyRenderer is declared here, well
+// after the rest of the lighting helpers.
+// Set when the time of day picks a different sky. The swap itself cannot run
+// from the UI: it resets the frame's command allocator and drains the GPU, and
+// the render loop is midway through recording into that same list -- doing it
+// inline reset the allocator out from under the open frame and then waited on a
+// fence that frame would never signal, which hung on the spot.
+//
+// Serviced from the same early-frame point as the DDGI rebuild, before any pass
+// binds the resources it replaces.
+static bool g_skyEnvironmentSwapPending = false;
+// Seconds still to wait before the queued swap runs. The preset's lighting is
+// applied immediately; the environment map follows a beat later.
+//
+// The swap drains every GPU frame slot, decodes a 70 MB EXR and re-prefilters
+// the IBL, so it costs a visible stall wherever it lands. Letting the cheap
+// lighting change land first means the scene has already gone dark by the time
+// that stall happens, instead of the frozen frame being the old daylight one.
+static float g_skyEnvironmentSwapDelay = 0.0f;
+static constexpr float kSkyEnvironmentSwapDelaySeconds = 1.0f;
+
+static void RequestTimeOfDaySkyEnvironment(TimeOfDay time) {
+    const char* environment = TimeOfDayIsDark(time) ? kSkyNightEnvironmentPath
+                                                    : kSkyEnvironmentPath;
+    if (!skyRenderer.initialized) return;
+    if (skyRenderer.EnvironmentPath() == environment) {
+        // Already showing the sky this preset wants. Cancels a queued swap too:
+        // picking Night then Afternoon inside the delay window would otherwise
+        // fire a swap that has nothing left to change.
+        g_skyEnvironmentSwapPending = false;
+        g_skyEnvironmentSwapDelay = 0.0f;
+        return;
+    }
+    g_skyEnvironmentSwapPending = true;
+    g_skyEnvironmentSwapDelay = kSkyEnvironmentSwapDelaySeconds;
+}
+
+// Runs between frames only. See g_skyEnvironmentSwapPending.
+static void ApplyTimeOfDaySkyEnvironment(TimeOfDay time) {
+    const char* environment = TimeOfDayIsDark(time) ? kSkyNightEnvironmentPath
+                                                    : kSkyEnvironmentPath;
+    if (!skyRenderer.initialized) return;
+    if (skyRenderer.EnvironmentPath() == environment) return;
+
+    // One recording session on the sky renderer's *private* direct list covers
+    // the whole swap: the texture upload and the IBL prefilter share a single
+    // reset/close/execute.
+    //
+    // Nothing here touches g_dx12.commandAllocators or the frame fence. Earlier
+    // versions reset the frame allocator and drained with WaitForGPUAllFrames,
+    // which leaves fenceValues[] holding values it never signalled -- safe only
+    // when a frame's MoveToNextFrame() follows to re-sync it. Run between
+    // frames, twice, it deadlocked the next frame's wait. See
+    // SkyRendererDX12::BeginEnvironmentSwap.
+    ID3D12GraphicsCommandList* list = skyRenderer.BeginEnvironmentSwap();
+    if (!list) {
+        SGE_LOG("LogRender", EngineLog::Level::Warning,
+            "Sky swap command list unavailable; keeping current environment");
+        return;
+    }
+
+    if (!skyRenderer.SetEnvironment(environment, list)) {
+        // Keep the current sky rather than failing the run: the preset's
+        // lighting still applies, the map just does not change. The list was
+        // reset above, so it still has to be closed and submitted.
+        skyRenderer.EndEnvironmentSwap();
+        SGE_LOG("LogRender", EngineLog::Level::Warning,
+            std::string("Failed to load sky environment ") + environment +
+            "; keeping " + skyRenderer.EnvironmentPath());
+        return;
+    }
+
+    // Do not rebuild the GGX prefilter here. At 4K that dispatch performs
+    // hundreds of millions of samples and can exceed Windows' TDR timeout; the
+    // following fence then never retires after device removal and the deployment
+    // screen appears to hang. The uploaded HDRI already has a full box-filtered
+    // mip chain, which is a safe runtime approximation and, unlike retaining the
+    // boot prefilter, still gives night reflections the correct environment.
+    g_skyEnvironmentResource = skyRenderer.skyTexture.Get();
+    skyRenderer.EndEnvironmentSwap();
+
+    // CPU-side, so it runs after the GPU work rather than racing it.
+    const auto skySH = GLBImporter::ComputeSkyIrradianceSH(
+        environment, kSkyEnvironmentRotationRadians);
+    mainShader.SetSkyIrradiance(skySH, 1.0f);
+
+    g_specularEnvironmentResource = g_skyEnvironmentResource;
+
+    SGE_LOG("LogRender", EngineLog::Level::Display,
+        std::string("Sky environment swapped to ") + environment);
+}
 ID3D12Resource*             g_ddgiIrradianceResource = nullptr;
 ID3D12Resource*             g_ddgiVisibilityResource = nullptr;
 ID3D12Resource*             g_dxrDDGIProbeResource = nullptr;
@@ -4648,6 +4840,53 @@ static void DrawDXRDDGIProbeDebug(CXMMATRIX view, CXMMATRIX projection) {
         draw->AddCircleFilled(ImVec2(x, y), 3.5f, color);
         draw->AddCircle(ImVec2(x, y), 5.0f, IM_COL32(0, 0, 0, 180));
     }
+}
+
+// Exfil marker. The escape boat sits 62 m offshore, well past the point where
+// a small hull reads against open water, so without a marker it is a win
+// condition the player cannot find. Drawn only once boarding would actually
+// work, so it never promises an exit that is still gated on the objective.
+static void DrawEscapeBoatMarker(CXMMATRIX view, CXMMATRIX projection) {
+    const VehicleSystem& vehicles = g_game.vehicles;
+    if (!vehicles.EscapeBoatReady()) return;
+    if (g_game.session.Screen() != GameScreen::Level1) return;
+    if (g_emptyLevelMode || !g_game.session.TimerRunning()) return;
+    // Same gate the boarding test uses, so the marker and the trigger agree.
+    const bool objectiveMet = g_game.mission.Stats().commTowersTotal == 0 ||
+                              g_game.mission.CommTowerObjectiveComplete();
+    if (!objectiveMet) return;
+
+    const XMFLOAT3 anchor{ vehicles.escapeBoatPosition.x,
+                           vehicles.escapeBoatPosition.y + 3.4f,
+                           vehicles.escapeBoatPosition.z };
+    const XMVECTOR clip = XMVector3Transform(
+        XMLoadFloat3(&anchor), view * projection);
+    const float w = XMVectorGetW(clip);
+    if (w <= 0.01f) return;   // behind the camera
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const ImVec2 screen{
+        (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+        (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y };
+
+    const float dx = scene.camera.Position.x - vehicles.escapeBoatPosition.x;
+    const float dz = scene.camera.Position.z - vehicles.escapeBoatPosition.z;
+    const float distance = std::sqrt(dx * dx + dz * dz);
+
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    const ImU32 green = IM_COL32(70, 235, 120, 235);
+    draw->AddCircle(screen, 13.0f, green, 0, 2.5f);
+    draw->AddCircleFilled(screen, 4.0f, green);
+    char label[64];
+    std::snprintf(label, sizeof(label), "EXFIL  %.0f m", distance);
+    const ImVec2 size = ImGui::CalcTextSize(label);
+    // Dark plate behind the text: it is read against open water and sky.
+    draw->AddRectFilled(
+        ImVec2(screen.x - size.x * 0.5f - 4.0f, screen.y + 17.0f),
+        ImVec2(screen.x + size.x * 0.5f + 4.0f, screen.y + 21.0f + size.y),
+        IM_COL32(6, 18, 12, 170), 3.0f);
+    draw->AddText(ImVec2(screen.x - size.x * 0.5f, screen.y + 19.0f),
+                  green, label);
 }
 
 // Debug overlay: each enemy's vision cone (facing direction, FOV, range),
@@ -8103,8 +8342,8 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "SITUATION");
         ImGui::TextWrapped(
             "The garrison on this island is not fighting alone. A hardened relay "
-            "mast on the ridge ties their patrols to the mainland battery -- "
-            "every movement we make is called in the moment it is seen, and the "
+            "mast on the ridge ties their patrols to the mainland battery. "
+            "Every movement we make is called in the moment it is seen, and the "
             "guns answer within the minute.");
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
         ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.30f, 1.0f), "PRIMARY OBJECTIVE");
@@ -8118,7 +8357,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "EXECUTION");
         ImGui::TextWrapped(
             "The lattice shrugs off small arms. Plant remote C4 on the mast and "
-            "clear the base before you trigger it -- nothing lighter will bring "
+            "clear the base before you trigger it. Nothing lighter will bring "
             "the structure down.");
         ImGui::Dummy(ImVec2(0.0f, 6.0f));
         ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "EXFIL");
@@ -8202,6 +8441,74 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         ImGui::TextDisabled(
             "Ammo is limited to your two weapons. Reload with R.");
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
+
+    // Time of day. Applied live as it is picked rather than waiting for DEPLOY,
+    // so the planning fly-through shows the light the run will actually be
+    // fought in -- picking Night and then dropping into daylight would make the
+    // choice meaningless on the one screen that can preview it.
+    ImGui::SeparatorText("TIME OF DAY");
+    const auto timeButton = [&](TimeOfDay time, float width) {
+        const bool selected = g_selectedTimeOfDay == time;
+        if (selected) {
+            ImGui::PushStyleColor(
+                ImGuiCol_Button, ImVec4(0.12f, 0.48f, 0.22f, 1.0f));
+            ImGui::PushStyleColor(
+                ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.58f, 0.28f, 1.0f));
+        }
+        if (ImGui::Button(TimeOfDayName(time), ImVec2(width, 30.0f)) &&
+            !selected) {
+            g_selectedTimeOfDay = time;
+            ApplyTimeOfDay(time);
+        }
+        if (selected) ImGui::PopStyleColor(2);
+    };
+    // Two rows of two: four across a 430 px panel leaves the labels cramped.
+    constexpr float kTimeButtonWidth = 166.0f;
+    ImGui::SetCursorPosX(45.0f);
+    timeButton(TimeOfDay::Noon, kTimeButtonWidth);
+    ImGui::SameLine();
+    timeButton(TimeOfDay::Afternoon, kTimeButtonWidth);
+    ImGui::SetCursorPosX(45.0f);
+    timeButton(TimeOfDay::Dusk, kTimeButtonWidth);
+    ImGui::SameLine();
+    timeButton(TimeOfDay::Night, kTimeButtonWidth);
+    ImGui::TextWrapped("%s", TimeOfDayBriefing(g_selectedTimeOfDay));
+    if (TimeOfDayIsDark(g_selectedTimeOfDay))
+        ImGui::TextDisabled(
+            "Enemies see no better in the dark than they do at noon.");
+    if (g_selectedTimeOfDay == TimeOfDay::Night) {
+        ImGui::SeparatorText("NIGHT VOLUMETRIC FOG");
+        bool fogChanged = false;
+        ImGui::SetNextItemWidth(-1.0f);
+        fogChanged |= ImGui::DragFloat(
+            "Density##NightFog", &g_nightVolumetricFog.density,
+            0.0001f, 0.0001f, 0.05f, "%.4f");
+        ImGui::SetNextItemWidth(-1.0f);
+        fogChanged |= ImGui::SliderFloat(
+            "Anisotropy##NightFog", &g_nightVolumetricFog.anisotropy,
+            0.0f, 0.9f, "%.2f");
+        ImGui::SetNextItemWidth(-1.0f);
+        fogChanged |= ImGui::DragFloat(
+            "Distance##NightFog", &g_nightVolumetricFog.distance,
+            5.0f, 20.0f, scene.cameraFar, "%.0f m");
+        fogChanged |= ImGui::ColorEdit3(
+            "Tint##NightFog", &g_nightVolumetricFog.tint.x);
+
+        if (fogChanged) {
+            scene.volumetricFogDensity = g_nightVolumetricFog.density;
+            scene.volumetricFogAnisotropy = g_nightVolumetricFog.anisotropy;
+            scene.volumetricFogDistance = g_nightVolumetricFog.distance;
+            scene.volumetricFogTint = g_nightVolumetricFog.tint;
+        }
+        if (ImGui::Button("Reset night fog")) {
+            g_nightVolumetricFog = MakeDefaultNightVolumetricFogSettings();
+            scene.volumetricFogDensity = g_nightVolumetricFog.density;
+            scene.volumetricFogAnisotropy = g_nightVolumetricFog.anisotropy;
+            scene.volumetricFogDistance = g_nightVolumetricFog.distance;
+            scene.volumetricFogTint = g_nightVolumetricFog.tint;
+        }
+    }
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
     ImGui::SeparatorText("INSERTION");
 
     const auto modeButton = [&](const char* label, LevelInsertionMode mode) {
@@ -8275,7 +8582,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         ImGui::TextDisabled("Last layout seed: %u", g_scatterEnemiesLastSeed);
     if (squadReady && !g_navigation.Ready())
         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
-                           "Navmesh unavailable -- cannot randomise");
+                           "Navmesh unavailable, cannot randomise");
     ImGui::Dummy(ImVec2(0.0f, 5.0f));
 
     const bool weaponsReady = loadout.Valid() &&
@@ -8294,6 +8601,10 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             GunModel::ConfigureLoadout(loadout.weapons[0], loadout.weapons[1]);
         }
         scene.selectedGrenade = loadout.grenade;
+        // Re-applied on the way out even though picking already applied it: the
+        // planning screen is not the only thing that touches the lights, and
+        // this is the last point before the run where the choice is authoritative.
+        ApplyTimeOfDay(g_selectedTimeOfDay);
         g_deploymentTarget = g_deploymentZones[
             static_cast<size_t>(g_selectedDeploymentZone)];
         g_deploymentTargetValid = true;
@@ -13568,6 +13879,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 }
             }
         }
+        // Exfil. Reaching the boat ends the run, but only once the mission is
+        // actually done -- otherwise the boat that appears with the first
+        // reinforcement wave would be a way to skip the objective it was meant
+        // to make harder. Levels with no tower authored have nothing to gate on,
+        // so there the boat is a straight way out.
+        if (g_game.session.Screen() == GameScreen::Level1 &&
+            !g_emptyLevelMode && g_game.session.TimerRunning() &&
+            g_game.vehicles.EscapeBoatReady() &&
+            scene.player.health > 0.0f) {
+            g_game.vehicles.UpdateEscapeBoat(deltaTime);
+            const bool objectiveMet =
+                g_game.mission.Stats().commTowersTotal == 0 ||
+                g_game.mission.CommTowerObjectiveComplete();
+            if (objectiveMet &&
+                g_game.vehicles.PlayerCanBoardEscapeBoat(scene.camera.Position)) {
+                SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                    "Player reached the escape boat -- exfil complete");
+                OpenWinScreen();
+            }
+        }
+
         if (g_game.session.Screen() == GameScreen::Level1 &&
             !g_emptyLevelMode && g_banditLoaded &&
             !g_game.commands.Pending(GameCommand::RespawnTurretGunner) &&
@@ -13579,6 +13911,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             !g_game.vehicles.DropshipActive())
             OpenWinScreen();
         }
+        }
+
+        // Sky environment swap. Must land here, before BeginFrame opens the
+        // frame's command list: the swap drains every frame slot, then records
+        // the replacement texture upload on its private list. Done with a list
+        // already open it reset the allocator out from under the frame and then
+        // waited on a fence that frame would never signal -- an instant hang on
+        // picking Night.
+        //
+        // Held for a second after the preset's lighting has been applied, so the
+        // scene visibly goes dark first and the swap's stall lands on an already
+        // night-lit frame rather than freezing on the old daylight one.
+        if (g_skyEnvironmentSwapPending) {
+            // Clamped: a load-sized frame would otherwise burn the whole delay
+            // in one step and put the stall right back where it started.
+            g_skyEnvironmentSwapDelay -= (std::min)(deltaTime, 0.05f);
+            if (g_skyEnvironmentSwapDelay <= 0.0f) {
+                g_skyEnvironmentSwapPending = false;
+                g_skyEnvironmentSwapDelay = 0.0f;
+                // The swap releases the old sky texture, which frames still in
+                // flight may be sampling. Drain here rather than inside the swap:
+                // this call sits in the frame
+                // loop, so the frame that follows re-syncs the fence through its
+                // own MoveToNextFrame() -- the precondition WaitForGPUAllFrames
+                // silently requires.
+                WaitForGPUAllFrames();
+                ApplyTimeOfDaySkyEnvironment(g_selectedTimeOfDay);
+            }
         }
 
         // ?? begin frame ??
@@ -14629,7 +14989,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 fogDepthMSAA = false;
                 fogDepthAlreadyReadable = true;
             }
-            volumetricFog.Render(scene, fogLightSpace, fogShadowResource,
+            volumetricFog.Render(scene, g_ocean, fogLightSpace, fogShadowResource,
                 fogDepth, fogDepthMSAA,
                 commonHDRValidationTarget ? visBuffer.GetOutputRTV()
                                           : D3D12_CPU_DESCRIPTOR_HANDLE{},
@@ -14795,6 +15155,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         } else {
             if (!g_insertionChoicePending) {
                 RenderPlayerHUD(scene);
+                DrawEscapeBoatMarker(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawEnemyVisionCones(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
             }

@@ -13,8 +13,8 @@ cbuffer WaterConstants : register(b0)
     float4 absorption;
     float4 shallowScatter;
     float4 deepScatter;
-    float4 lightDirection;
-    float4 lightColor;
+    float4 lightDirection; // xyz direction, w night reflection intensity
+    float4 lightColor;     // rgb direct light, w night water intensity
     float4 waves[4];      // direction.xy, amplitude, wavelength
     float4 waveExtra[4];  // steepness, unused...
 };
@@ -105,6 +105,30 @@ VSOutput VSMain(VSInput input)
                       currentNormal, currentCrest);
         EvaluateOcean(previousXZ, previousCameraTime.w, previousPosition,
                       previousNormal, previousCrest);
+
+        // The last clipmap ring spans 128..420 m, far more per triangle than
+        // every inner ring. Preserve the exact inner-edge waves, then ease their
+        // geometric displacement out across that ring so coarse interpolation
+        // cannot reveal its square boundary. Per-pixel micro normals already
+        // perform their own footprint fade below.
+        if (input.tangent.w > 4.5) {
+            const float ringDistance = max(
+                abs(input.position.x), abs(input.position.z));
+            const float waveFade =
+                1.0 - smoothstep(128.0, 320.0, ringDistance);
+            currentPosition = lerp(
+                float3(currentXZ.x, volume0.y, currentXZ.y),
+                currentPosition, waveFade);
+            previousPosition = lerp(
+                float3(previousXZ.x, volume0.y, previousXZ.y),
+                previousPosition, waveFade);
+            currentNormal = normalize(lerp(
+                float3(0.0, 1.0, 0.0), currentNormal, waveFade));
+            previousNormal = normalize(lerp(
+                float3(0.0, 1.0, 0.0), previousNormal, waveFade));
+            currentCrest *= waveFade;
+            previousCrest *= waveFade;
+        }
     } else {
         currentPosition = input.position;
         previousPosition = input.position;
@@ -300,25 +324,20 @@ PSOutput PSMain(VSOutput input)
 
     float waterDistance = length(input.worldPosition - cameraTime.xyz);
     float thickness;
+    float verticalDepth;
     if (opaqueDepth < 0.99999) {
         float3 opaqueWorld = ReconstructWorld(uv, opaqueDepth);
+        verticalDepth = max(input.worldPosition.y - opaqueWorld.y, 0.02);
         thickness = length(opaqueWorld - cameraTime.xyz) - waterDistance;
     } else {
-        // No seabed behind this pixel. The terrain clipmap stops well short of
-        // the ocean mesh (~256 m of terrain against 420 m of water), so beyond
-        // its edge there is nothing to measure against. Substituting a fixed
-        // distance here made thickness jump straight to its clamped maximum the
-        // instant a pixel crossed the terrain boundary, and since thickness
-        // drives absorption, the shallow/deep colour blend, and foam, that
-        // discontinuity showed up as hard-edged blue and tan patches on the
-        // distant water.
-        //
-        // Ramp with horizontal distance from the shore instead: water gets
-        // deeper as it leaves the island, which is both physically sensible and
-        // continuous, so the seam has nothing to key off. The scale is chosen so
-        // the ramp saturates near the same depth the real seabed reaches.
-        float2 fromShore = input.worldPosition.xz - clipmapParams.xy;
-        thickness = 6.0 + smoothstep(0.0, 90.0, length(fromShore)) * 24.0;
+        // The camera-centred terrain clipmap eventually ends after the authored
+        // seabed has reached its flat -6 m shelf. `thickness` is distance along
+        // the view ray, not vertical water depth: using a constant 6 m outside
+        // the grid disagreed with the reconstructed ray length inside it and
+        // exposed the square terrain boundary from the high deployment camera.
+        // Intersect the same ray with the continued -6 m seabed instead.
+        verticalDepth = max(input.worldPosition.y + 6.0, 0.02);
+        thickness = verticalDepth / max(abs(viewDirection.y), 0.05);
     }
     thickness = clamp(thickness, 0.02, 30.0);
 
@@ -356,12 +375,18 @@ PSOutput PSMain(VSOutput input)
     if (rejectRefraction)
         refractedUV = uv;
 
-    float3 behind = sceneColor.SampleLevel(
-        linearClamp, refractedUV, 0.0).rgb;
-    float3 transmittance = exp(-absorption.rgb * thickness);
     float depthBlend = smoothstep(0.35, 8.0, thickness);
     float3 scatterColor =
         lerp(shallowScatter.rgb, deepScatter.rgb, depthBlend);
+    float3 behind = sceneColor.SampleLevel(
+        linearClamp, refractedUV, 0.0).rgb;
+    // Past the sloping shelf, transmitted scenery is fully replaced by the
+    // authored deep-water medium before the rasterised seabed ends at 6 m.
+    // Consequently the missing-depth side no longer switches to refracted sky;
+    // both sides have already converged to the same colour over a broad band.
+    const float openOceanBlend = smoothstep(3.25, 5.75, verticalDepth);
+    behind = lerp(behind, deepScatter.rgb, openOceanBlend);
+    float3 transmittance = exp(-absorption.rgb * thickness);
     float3 transmitted = behind * transmittance +
         scatterColor * (1.0 - transmittance);
 
@@ -389,6 +414,10 @@ PSOutput PSMain(VSOutput input)
             reflection, screenReflection,
             reflectionConfidence * opticalParams.w);
     }
+    // Daylight is exactly 1 and takes the untouched path. At night both the
+    // environment fallback and SSR must follow the exposed sky down together.
+    if (lightDirection.w < 0.999)
+        reflection *= lightDirection.w;
 
     // GGX sun path. Analytic wave normals plus roughness keep this continuous
     // instead of exposing individual triangles as white wedges.
@@ -432,6 +461,11 @@ PSOutput PSMain(VSOutput input)
     float3 color = lerp(transmitted, reflection, reflectionWeight);
     color += sunSpecular;
     color = lerp(color, foamColor, foam * 0.82);
+    // Reflection is only one contributor; transmission, authored scatter and
+    // foam otherwise stay at daylight strength and turn the whole night ocean
+    // pale. Keep daylight on the untouched path.
+    if (lightColor.w < 0.999)
+        color *= lightColor.w;
 
 #ifndef WATER_HDR_TARGET
     color = ToneMapWater(color);

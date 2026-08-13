@@ -87,6 +87,10 @@ bool SecondaryHelicopterVisible();
 DirectX::XMMATRIX BoatWorldMatrix();
 DirectX::XMMATRIX InsertionBoatWorldMatrix();
 bool InsertionBoatVisible();
+// Exfil boat waiting offshore under the reinforcement lane. Shares the
+// insertion boat's mesh; visible only once a wave has placed it.
+DirectX::XMMATRIX EscapeBoatWorldMatrix();
+bool EscapeBoatVisible();
 DirectX::XMMATRIX BlackHawkWorldMatrix();
 // False once the insertion helicopter has climbed out of sight.
 bool BlackHawkVisible();
@@ -1589,6 +1593,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Runs its insertion every frame, so it never joins the static batch.
     if (!g_emptyLevelMode && g_insertionBoatModel && InsertionBoatVisible()) {
         DrawSceneNode(g_insertionBoatModel, shader, InsertionBoatWorldMatrix(),
+            view, proj, lightSpace, visibilityExtensionsOnly);
+    }
+    if (!g_emptyLevelMode && g_insertionBoatModel && EscapeBoatVisible()) {
+        DrawSceneNode(g_insertionBoatModel, shader, EscapeBoatWorldMatrix(),
             view, proj, lightSpace, visibilityExtensionsOnly);
     }
 

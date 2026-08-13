@@ -20,7 +20,7 @@ static_assert(sizeof(ImpactParticleInstanceDX12) == 48);
 struct alignas(256) ImpactParticleFrameDX12 {
     XMMATRIX viewProjection;
     XMFLOAT3 cameraRight;
-    float padding0;
+    float smokeIllumination;
     XMFLOAT3 cameraUp;
     float padding1;
 };
@@ -171,6 +171,11 @@ public:
             XMVector3Normalize(XMVectorSetW(inverseView.r[0], 0.0f)));
         XMStoreFloat3(&frameData.cameraUp,
             XMVector3Normalize(XMVectorSetW(inverseView.r[1], 0.0f)));
+        // Smoke is translucent rather than emissive. Retain a small night floor
+        // so its silhouette remains readable, while daylight keeps the exact
+        // authored tint. Sparks stay emissive and blood keeps its own colour.
+        frameData.smokeIllumination = (std::min)(
+            1.0f, 0.08f + scene.ambientLightingIntensity * 2.2f);
         frames_.CopyData(frame, frameData);
 
         ID3D12GraphicsCommandList* commandList = g_dx12.commandList.Get();

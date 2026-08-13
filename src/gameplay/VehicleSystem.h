@@ -259,6 +259,76 @@ struct VehicleSystem {
     // second call-in is heavier than the first.
     uint32_t dropshipWavesCalled = 0;
 
+    // ---- Escape boat ---------------------------------------------------------
+    // Exfil. Sits on the water out past the shoreline, under the lane the
+    // reinforcement dropship flies in along, so the way out is the same
+    // direction the enemy keeps arriving from. Reaching it finishes the level.
+    //
+    // Placed once per run, the first time a wave is called: before that there is
+    // no inbound lane to sit under, and an exfil boat on the water from the
+    // opening second would advertise the ending before the mission has one.
+    static constexpr float EscapeBoatBoardRadius = 6.5f;
+    // How far out along the dropship's approach bearing the boat waits.
+    //
+    // 42 m sits just past where the terrain drops under the waterline: sampling
+    // the beach profile gives y = +0.04 at 40 m and y = -0.21 at 42 m, so this
+    // is the near edge of genuinely floating water rather than wet sand. Closer
+    // than this and the hull grounds on the beach shelf.
+    static constexpr float EscapeBoatShoreDistance = 42.0f;
+
+    bool escapeBoatActive = false;
+    DirectX::XMFLOAT3 escapeBoatPosition{};
+    float escapeBoatYaw = 0.0f;
+    // Drives the idle bob so the hull sits on the swell rather than frozen.
+    float escapeBoatBobTime = 0.0f;
+
+    bool EscapeBoatReady() const { return escapeBoatActive; }
+
+    // Anchors the boat on the bearing the dropship flies in along. Idempotent:
+    // later waves do not move an exfil the player may already be swimming for.
+    void PlaceEscapeBoatOnDropshipLane(float waterY) {
+        if (escapeBoatActive) return;
+        const float dx = dropshipEntryPoint.x - dropshipDropPoint.x;
+        const float dz = dropshipEntryPoint.z - dropshipDropPoint.z;
+        const float length = std::sqrt(dx * dx + dz * dz);
+        if (length < 0.001f) return;
+        const float nx = dx / length, nz = dz / length;
+        escapeBoatPosition = {
+            nx * EscapeBoatShoreDistance, waterY, nz * EscapeBoatShoreDistance };
+        // Bow pointed out to sea, the way it would leave.
+        escapeBoatYaw = std::atan2(nx, nz);
+        escapeBoatBobTime = 0.0f;
+        escapeBoatActive = true;
+    }
+
+    void UpdateEscapeBoat(float dt) {
+        if (!escapeBoatActive || dt <= 0.0f) return;
+        escapeBoatBobTime += dt;
+    }
+
+    // Vertical bob, applied at render so the hull rides the swell.
+    float EscapeBoatBobOffset() const {
+        return std::sin(escapeBoatBobTime * 0.9f) * 0.22f +
+               std::sin(escapeBoatBobTime * 1.7f) * 0.08f;
+    }
+
+    // True once the player is close enough to board. Horizontal only: the boat
+    // sits at water level and the player may be swimming or standing on deck.
+    bool PlayerCanBoardEscapeBoat(const DirectX::XMFLOAT3& player) const {
+        if (!escapeBoatActive) return false;
+        const float dx = player.x - escapeBoatPosition.x;
+        const float dz = player.z - escapeBoatPosition.z;
+        return dx * dx + dz * dz <=
+               EscapeBoatBoardRadius * EscapeBoatBoardRadius;
+    }
+
+    void ResetEscapeBoat() {
+        escapeBoatActive = false;
+        escapeBoatPosition = {};
+        escapeBoatYaw = 0.0f;
+        escapeBoatBobTime = 0.0f;
+    }
+
     bool DropshipActive() const { return dropshipState != DropshipState::Idle; }
 
     // A wave can only be called when the slot is free and the airframe is
@@ -1433,6 +1503,7 @@ public:
         secondaryHelicopterCrashed = false;
         secondaryHelicopterCrashVelocity = {};
         ResetDropship();
+        ResetEscapeBoat();
 
         drivingHumvee = false;
         savedGunVisible = true;

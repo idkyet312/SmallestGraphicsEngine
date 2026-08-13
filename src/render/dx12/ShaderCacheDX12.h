@@ -83,6 +83,7 @@ inline std::wstring ExecutableDirectory() {
 inline uint64_t IncludeHash() {
     static const uint64_t hash = [] {
         static const wchar_t* kIncludes[] = {
+            L"shaders/agx_tonemap.hlsli",
             L"shaders/color_grade.hlsli",
             L"shaders/foliage_brdf.hlsli",
             L"shaders/palm_wind.hlsli",

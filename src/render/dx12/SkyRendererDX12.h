@@ -5,12 +5,20 @@
 #include "ShaderDX12.h"
 #include "CameraDX12.h"
 #include "GLBImporter.h"
+#include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <string>
+#include <vector>
 
-// Poly Haven "Kloppenheim 06 (Pure Sky)", CC0.
+// Poly Haven "Kloppenheim 06 (Pure Sky)", CC0. The daylight default.
 inline constexpr const char* kSkyEnvironmentPath =
     "Content/Models/Skyboxes/kloppenheim_06_puresky_2k.exr";
+// Poly Haven "Qwantani Night (Pure Sky)", CC0. Swapped in for the Night
+// time-of-day preset -- a night sun direction alone cannot produce a starfield,
+// so the environment map has to change with it.
+inline constexpr const char* kSkyNightEnvironmentPath =
+    "Content/Textures/Sky/qwantani_night_puresky_4k.exr";
 inline constexpr float kSkyEnvironmentRotationRadians = XM_PIDIV2;
 
 struct alignas(256) SkyBufferDX12 {
@@ -39,6 +47,26 @@ public:
     std::vector<ComPtr<ID3D12Resource>> uploadHeaps;
     UploadBuffer<SkyBufferDX12> constants;
     bool initialized = false;
+    // Which environment map is currently resident, so SetEnvironment can skip a
+    // reload when nothing changed.
+    std::string loadedEnvironmentPath;
+    // Dedicated direct list + fence for runtime environment swaps, owned here
+    // rather than borrowing the frame's.
+    //
+    // The swap runs between frames and has to reset whatever allocator it
+    // records into. Using g_dx12.commandAllocators[frameIndex] meant resetting
+    // the frame's own allocator and draining with WaitForGPUAllFrames, whose
+    // fence bookkeeping left fenceValues[] holding values it never signalled --
+    // the next MoveToNextFrame() then waited forever and picking Night hung.
+    //
+    // A private allocator/list/fence keeps the swap entirely off the frame
+    // pacing path. Direct rather than compute because the IBL prefilter
+    // transitions its output to PIXEL_SHADER_RESOURCE, which a COMPUTE queue
+    // cannot express. Mirrors MipGenerator's graphicsHandoff* members.
+    ComPtr<ID3D12CommandAllocator> swapAllocator;
+    ComPtr<ID3D12GraphicsCommandList> swapCommandList;
+    ComPtr<ID3D12Fence> swapFence;
+    UINT64 swapFenceValue = 0;
     bool msaaSupported = false;
     bool msaaEnabled = false;
     bool hdrTargetEnabled = false;
@@ -133,6 +161,7 @@ public:
             kSkyEnvironmentPath, g_dx12.device,
             g_dx12.commandList, uploadHeaps);
         if (!skyTexture) return false;
+        loadedEnvironmentPath = kSkyEnvironmentPath;
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heapDesc.NumDescriptors = 1;
@@ -140,9 +169,88 @@ public:
         if (FAILED(g_dx12.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&srvHeap)))) return false;
         g_dx12.device->CreateShaderResourceView(
             skyTexture.Get(), nullptr, srvHeap->GetCPUDescriptorHandleForHeapStart());
+
+        // Private submission path for runtime environment swaps. Non-fatal: a
+        // failure here only costs the ability to change sky at runtime, so the
+        // level still boots on whatever map loaded above.
+        if (SUCCEEDED(g_dx12.device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&swapAllocator))) &&
+            SUCCEEDED(g_dx12.device->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, swapAllocator.Get(), nullptr,
+                IID_PPV_ARGS(&swapCommandList)))) {
+            if (FAILED(swapCommandList->Close())) swapCommandList.Reset();
+            g_dx12.device->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&swapFence));
+        }
+
         initialized = true;
         return true;
     }
+
+    // Swaps the environment map. Handles both .exr and .hdr; no-ops when the
+    // requested map is already resident, so callers can set it unconditionally.
+    //
+    // Returns false and keeps the current sky on a failed load rather than
+    // leaving the renderer with no environment -- a missing night map should
+    // cost the player the starfield, not the sky.
+    // Opens the private swap command list for recording. Returns null when the
+    // swap path is unavailable, in which case the environment cannot change.
+    //
+    // Split from SetEnvironment so the caller can record its own work (the IBL
+    // prefilter) onto the same list and pay for one submit rather than two.
+    ID3D12GraphicsCommandList* BeginEnvironmentSwap() {
+        if (!initialized || !swapCommandList || !swapFence) return nullptr;
+        // Wait for the previous swap only -- this fence is private, so this
+        // cannot interact with frame pacing.
+        WaitForFenceCPU(swapFence.Get(), swapFenceValue);
+        if (FAILED(swapAllocator->Reset())) return nullptr;
+        if (FAILED(swapCommandList->Reset(swapAllocator.Get(), nullptr)))
+            return nullptr;
+        return swapCommandList.Get();
+    }
+
+    // Closes, submits and blocks until the swap's GPU work has completed. The
+    // texture copy and the prefilter must both be done before the next frame
+    // samples them, and a swap is a rare, already-stalling event.
+    void EndEnvironmentSwap() {
+        if (!swapCommandList || !swapFence) return;
+        if (FAILED(swapCommandList->Close())) return;
+        ID3D12CommandList* lists[] = { swapCommandList.Get() };
+        g_dx12.commandQueue->ExecuteCommandLists(1, lists);
+        const UINT64 value = ++swapFenceValue;
+        if (FAILED(g_dx12.commandQueue->Signal(swapFence.Get(), value))) return;
+        WaitForFenceCPU(swapFence.Get(), value);
+    }
+
+    // Loads a new environment map, recording the upload onto `commandList` --
+    // which must come from BeginEnvironmentSwap and be submitted with
+    // EndEnvironmentSwap once the caller has finished recording.
+    //
+    // Takes the list explicitly rather than using g_dx12.commandList: the swap
+    // runs between frames, when the frame's list is closed, and recording onto a
+    // closed list is invalid.
+    bool SetEnvironment(const std::string& path,
+                        ID3D12GraphicsCommandList* commandList) {
+        if (!initialized || path.empty() || !commandList) return false;
+        if (path == loadedEnvironmentPath) return true;
+
+        std::vector<ComPtr<ID3D12Resource>> pendingUploads;
+        ComPtr<ID3D12Resource> loaded = GLBImporter::LoadEXRTextureFromFile(
+            path, g_dx12.device, commandList, pendingUploads);
+        if (!loaded) return false;
+
+        skyTexture = loaded;
+        // The staging buffers must outlive the copy just queued, so they replace
+        // the previous set rather than being dropped here.
+        uploadHeaps = std::move(pendingUploads);
+        g_dx12.device->CreateShaderResourceView(
+            skyTexture.Get(), nullptr,
+            srvHeap->GetCPUDescriptorHandleForHeapStart());
+        loadedEnvironmentPath = path;
+        return true;
+    }
+
+    const std::string& EnvironmentPath() const { return loadedEnvironmentPath; }
 
     void SetMSAAEnabled(bool enabled) {
         msaaEnabled = enabled && msaaSupported;
@@ -173,7 +281,13 @@ public:
         data.environmentRotation = kSkyEnvironmentRotationRadians;
         XMVECTOR sun = XMVector3Normalize(XMLoadFloat3(&lightDirection));
         XMStoreFloat3(&data.sunDirection, sun);
-        data.exposure = 1.32f;
+        // The night HDRI has a bright photographic horizon. Feeding it through
+        // the daylight exposure makes AgX lift that band almost to white even
+        // after atmospheric attenuation. Fade only once the sun is well below
+        // the horizon so Noon/Afternoon/Dusk keep their historical exposure.
+        const float nightBlend = (std::max)(0.0f, (std::min)(1.0f,
+            (-XMVectorGetY(sun) - 0.10f) / 0.18f));
+        data.exposure = 1.32f + (0.10f - 1.32f) * nightBlend;
         data.cameraPosition = camera.Position;
         data.time = time;
         data.atmosphereParams = atmosphereParams;

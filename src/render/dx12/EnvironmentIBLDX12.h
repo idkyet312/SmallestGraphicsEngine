@@ -13,10 +13,19 @@ public:
     Microsoft::WRL::ComPtr<ID3D12Resource> prefilteredEnvironment;
     Microsoft::WRL::ComPtr<ID3D12Resource> brdfIntegrationLUT;
 
+    // `commandList` defaults to the frame's list, which is what the boot path
+    // wants. Runtime sky swaps pass their own: they run between frames, when the
+    // frame's list is closed and recording onto it would be invalid.
+    //
+    // Must be a DIRECT list -- the output is transitioned to
+    // PIXEL_SHADER_RESOURCE below, which a COMPUTE queue cannot express.
     bool Init(ID3D12Resource* sourceEnvironment,
-              float environmentRotationRadians = 0.0f) {
-        if (!sourceEnvironment || !g_dx12.device || !g_dx12.commandList)
-            return false;
+              float environmentRotationRadians = 0.0f,
+              ID3D12GraphicsCommandList* commandList = nullptr) {
+        if (!sourceEnvironment || !g_dx12.device) return false;
+        ID3D12GraphicsCommandList* list =
+            commandList ? commandList : g_dx12.commandList.Get();
+        if (!list) return false;
         const D3D12_RESOURCE_DESC sourceDesc = sourceEnvironment->GetDesc();
         mipLevels_ = sourceDesc.MipLevels;
         if (mipLevels_ == 0) return false;
@@ -24,8 +33,6 @@ public:
         if (!CreateResources(sourceDesc) || !CreatePipelines() ||
             !CreateDescriptors(sourceEnvironment, sourceDesc))
             return false;
-
-        ID3D12GraphicsCommandList* list = g_dx12.commandList.Get();
         D3D12_RESOURCE_BARRIER sourceBarrier = {};
         sourceBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         sourceBarrier.Transition.pResource = sourceEnvironment;

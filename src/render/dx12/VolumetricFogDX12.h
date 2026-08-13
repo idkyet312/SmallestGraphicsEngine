@@ -4,6 +4,7 @@
 #include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "Scene.h"
+#include "WaterVolume.h"
 #include <algorithm>
 #include <cstring>
 #include <fstream>
@@ -40,7 +41,8 @@ public:
         return true;
     }
 
-    void Render(const Scene& scene, const XMMATRIX& lightSpace,
+    void Render(const Scene& scene, const WaterVolume& ocean,
+                const XMMATRIX& lightSpace,
                 ID3D12Resource* shadowResource, ID3D12Resource* depthResource,
                 bool multisampledDepth,
                 D3D12_CPU_DESCRIPTOR_HANDLE targetRtv = {},
@@ -48,7 +50,7 @@ public:
                 bool depthAlreadyReadable = false) {
         if (!initialized || !g_dx12.commandList || !depthResource) return;
         fogTime_ += 1.0f / 60.0f;
-        UpdateFrameData(scene, lightSpace, shadowResource, depthResource,
+        UpdateFrameData(scene, ocean, lightSpace, shadowResource, depthResource,
                         multisampledDepth);
         ID3D12GraphicsCommandList* commandList = g_dx12.commandList.Get();
         ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
@@ -145,6 +147,8 @@ private:
         XMUINT4 volumeDims;
         XMFLOAT4 atmosphereParams;
         XMFLOAT4 cloudParams;
+        XMFLOAT4 oceanBounds0;
+        XMFLOAT4 oceanBounds1;
         XMUINT4 maxVolumeDims;
     };
     static_assert(sizeof(FogConstants) <= ConstantsSize, "Fog constants exceed one CBV page");
@@ -325,7 +329,8 @@ private:
         return SUCCEEDED(resource->Map(0, nullptr, mapped));
     }
 
-    void UpdateFrameData(const Scene& scene, const XMMATRIX& lightSpace,
+    void UpdateFrameData(const Scene& scene, const WaterVolume& ocean,
+                         const XMMATRIX& lightSpace,
                          ID3D12Resource* shadowResource,
                          ID3D12Resource* depthResource, bool multisampledDepth) {
         frame_ = g_dx12.frameIndex;
@@ -387,6 +392,20 @@ private:
             scene.atmosphereCloudDensity,
             scene.atmosphereCloudBaseHeight,
             scene.atmosphereCloudThickness
+        };
+        const XMFLOAT3 oceanCenter = ocean.GetCenter();
+        const XMFLOAT3 oceanExtents = ocean.GetExtents();
+        const float oceanHalfX = oceanExtents.x * 0.5f;
+        const float oceanHalfZ = oceanExtents.z * 0.5f;
+        constants.oceanBounds0 = {
+            oceanCenter.x, ocean.GetSurfaceY(), oceanCenter.z,
+            ocean.IsInitialized() ? 1.0f : 0.0f
+        };
+        constants.oceanBounds1 = {
+            oceanHalfX, oceanHalfZ,
+            (std::min)(16.0f, (std::max)(2.0f,
+                (std::min)(oceanHalfX, oceanHalfZ) * 0.04f)),
+            0.0f
         };
         std::memcpy(constantsMapped_ + frame_ * ConstantsSize, &constants, sizeof(constants));
 
