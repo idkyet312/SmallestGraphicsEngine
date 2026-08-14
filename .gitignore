@@ -103,3 +103,9 @@ temp_dxil/
 *.wpix
 GPU*-events.csv
 GPU*-screenshot.png
+
+# Redistributable packages built by scripts/package-release.ps1. The staged tree
+# carries a copy of Content, so this runs to several GB -- it is build output,
+# rebuildable from the script, and must never enter history.
+dist/
+dist-test/
