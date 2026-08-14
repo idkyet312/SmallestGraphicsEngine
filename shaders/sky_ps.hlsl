@@ -11,10 +11,17 @@ cbuffer SkyBuffer : register(b0) {
     float time;
     float4 atmosphereParams; // Rayleigh, Mie, Mie g, aerial density
     float4 cloudParams;      // coverage, density, base height, thickness
+    float  cloudVolumetric;  // 1 = march the 3D volumes, 0 = 2D fallback
+    float3 cloudPadding;
 };
 
 Texture2D skyEquirectangular : register(t0);
+// Baked once at startup by cloud_noise_gen.hlsl. Shape carries the cloud form
+// (R Perlin-Worley, GBA Worley), detail erodes its edges into wisps.
+Texture3D cloudShapeVolume : register(t1);
+Texture3D cloudDetailVolume : register(t2);
 SamplerState skySampler : register(s0);
+SamplerState cloudSampler : register(s1);
 
 #include "color_grade.hlsli"
 
@@ -192,10 +199,199 @@ float3 PhysicalSky(float3 ray, float3 source) {
     return lerp(attenuated, physical, physicalBlend);
 }
 
+// -- Volumetric clouds --------------------------------------------------------
+// Follows Schneider & Vos, "The Real-time Volumetric Cloudscapes of Horizon
+// Zero Dawn" (SIGGRAPH 2015), reduced to what a test needs: 3D shape and detail
+// volumes, height gradients per cloud type, cheap/expensive stepping and a cone
+// light march. No weather map (coverage is a uniform) and no temporal
+// reprojection -- see the note at the march loop for what that costs.
+
+// Remaps a value from one range to another, the presentation's workhorse for
+// carving one noise field into another.
+float Remap(float value, float lowIn, float highIn, float lowOut, float highOut) {
+    return lowOut +
+        (value - lowIn) / max(highIn - lowIn, 0.0001) * (highOut - lowOut);
+}
+
+// Vertical density profile per cloud type. The same 3D noise reads as a flat
+// stratus deck, a billowing cumulus or a tall cumulonimbus purely by which
+// altitudes are allowed to hold density.
+float HeightGradient(float height, float cloudType) {
+    // Stratus: thin and low. Cumulus: mid, rounded. Cumulonimbus: full column.
+    const float stratus = saturate(Remap(height, 0.0, 0.10, 0.0, 1.0)) *
+                          saturate(Remap(height, 0.15, 0.25, 1.0, 0.0));
+    const float cumulus = saturate(Remap(height, 0.02, 0.22, 0.0, 1.0)) *
+                          saturate(Remap(height, 0.60, 0.90, 1.0, 0.0));
+    const float cumulonimbus = saturate(Remap(height, 0.0, 0.12, 0.0, 1.0)) *
+                               saturate(Remap(height, 0.85, 1.0, 1.0, 0.0));
+    // cloudType 0..0.5 blends stratus->cumulus, 0.5..1 cumulus->cumulonimbus.
+    const float lower = lerp(stratus, cumulus, saturate(cloudType * 2.0));
+    return lerp(lower, cumulonimbus, saturate((cloudType - 0.5) * 2.0));
+}
+
+// Density at a world point. `cheap` skips the detail volume, which is the
+// optimisation the whole march is built around: most samples are in empty air
+// and only need to answer "is there anything here at all".
+float SampleCloudDensity(float3 p, float baseHeight, float thickness,
+                         float coverage, float2 wind, bool cheap) {
+    const float height = saturate((p.y - baseHeight) / thickness);
+    // Wind shears with altitude, so the deck leans rather than sliding rigidly.
+    float3 samplePos = p;
+    samplePos.xz += wind * (1.0 + height * 0.4);
+
+    // Base shape. R is the Perlin-Worley form; the Worley octaves in GBA carve
+    // it into billows.
+    const float4 shape = cloudShapeVolume.SampleLevel(
+        cloudSampler, samplePos * 0.00035, 0.0);
+    const float billows = shape.g * 0.625 + shape.b * 0.25 + shape.a * 0.125;
+    float density = Remap(shape.r, billows - 1.0, 1.0, 0.0, 1.0);
+
+    // Cloud type varies across the sky so one frame holds several forms rather
+    // than a uniform deck. A weather map would author this; a second low
+    // frequency noise stands in for the test.
+    const float cloudType = saturate(
+        ValueNoise(p.xz * 0.00008 + 41.0) * 1.6 - 0.25);
+    density *= HeightGradient(height, cloudType);
+
+    // Coverage. Subtracting then rescaling keeps edges soft instead of
+    // clipping the field flat.
+    const float coverageThreshold = lerp(0.92, 0.30, coverage);
+    density = saturate(Remap(density, coverageThreshold, 1.0, 0.0, 1.0));
+
+    if (cheap || density <= 0.0) return density;
+
+    // Detail erosion. Worley subtracted from the edges turns round blobs into
+    // wisps, and inverting it near the cloud top gives the wispier crown real
+    // clouds have.
+    const float3 detail = cloudDetailVolume.SampleLevel(
+        cloudSampler, samplePos * 0.0028, 0.0).rgb;
+    float detailFBM = detail.r * 0.625 + detail.g * 0.25 + detail.b * 0.125;
+    detailFBM = lerp(detailFBM, 1.0 - detailFBM, saturate(height * 4.0));
+    density = saturate(Remap(density, detailFBM * 0.45, 1.0, 0.0, 1.0));
+    return density;
+}
+
+// Henyey-Greenstein phase. Forward scattering is what puts the bright silver
+// rim on a cloud you are looking through toward the sun.
+float HenyeyGreenstein(float cosAngle, float g) {
+    const float g2 = g * g;
+    return (1.0 - g2) /
+        (4.0 * 3.14159265 * pow(max(1.0 + g2 - 2.0 * g * cosAngle, 0.0001), 1.5));
+}
+
+float4 RaymarchVolumetricClouds(float3 ray) {
+    const float baseHeight = max(cloudParams.z, cameraPosition.y + 20.0);
+    const float thickness = max(cloudParams.w, 50.0);
+    const float coverage = cloudParams.x;
+
+    const float nearT = max((baseHeight - cameraPosition.y) / ray.y, 0.0);
+    const float farT = max(
+        (baseHeight + thickness - cameraPosition.y) / ray.y, nearT + 1.0);
+
+    // Sample count scales with how obliquely the ray crosses the slab: straight
+    // up is a short traverse, toward the horizon is a long one. The
+    // presentation ramps 64 at the zenith to 128 at the horizon; halved here
+    // because this test has no temporal reprojection to amortise the cost over
+    // 16 frames, and a full-rate 128-step march is several milliseconds.
+    const int sampleCount = (int)lerp(64.0, 32.0, saturate(ray.y * 1.4));
+    const float stepLength = (farT - nearT) / float(sampleCount);
+    const float2 wind = float2(time * 12.0, time * 5.5);
+
+    const float sunAmount = saturate(sunDirection.y * 1.8 + 0.25);
+    const float nightCloudScale =
+        lerp(0.004, 1.0, smoothstep(-0.10, 0.06, sunDirection.y));
+    const float3 shadowColor = lerp(float3(0.20, 0.28, 0.40),
+                                    float3(0.42, 0.48, 0.56), sunAmount);
+    const float3 sunColor = lerp(float3(1.0, 0.43, 0.16),
+                                 float3(1.0, 0.92, 0.74), sunAmount);
+    const float cosAngle = dot(ray, sunDirection);
+    // Two lobes: a strong forward one for the silver lining, a weak backward
+    // one so clouds away from the sun are not flatly dark.
+    const float phase = max(HenyeyGreenstein(cosAngle, 0.72),
+                            HenyeyGreenstein(cosAngle, -0.15) * 0.35);
+
+    // Cone offsets for the light march. Spreading the six taps into a cone
+    // toward the sun rather than a straight line approximates light arriving
+    // from the whole solid angle of the cloud, which is what softens
+    // self-shadowing instead of leaving hard bands.
+    const float3 coneOffsets[6] = {
+        float3( 0.16, 0.15,  0.16), float3(-0.19, 0.15,  0.13),
+        float3( 0.14, 0.15, -0.18), float3(-0.16, 0.15, -0.15),
+        float3( 0.02, 0.30,  0.02), float3(-0.02, 0.60, -0.02)
+    };
+
+    float3 accumulated = 0.0;
+    float transmittance = 1.0;
+    int emptySamples = 0;
+    bool cheapMarch = true;
+
+    for (int i = 0; i < sampleCount; ++i) {
+        const float t = nearT + (float(i) + 0.5) * stepLength;
+        const float3 p = cameraPosition + ray * t;
+
+        // Cheap/expensive switching. While the ray is in empty air it only
+        // samples the shape volume; the first hit switches to full detail plus
+        // lighting, and several consecutive empty expensive samples switch back.
+        if (cheapMarch) {
+            const float cheapDensity = SampleCloudDensity(
+                p, baseHeight, thickness, coverage, wind, true);
+            if (cheapDensity > 0.0) {
+                // Switch to full sampling and evaluate this same point as an
+                // expensive sample below. Deliberately not stepping the loop
+                // index backwards: mutating the counter to re-test a point
+                // that just returned non-zero is how a march like this hangs.
+                cheapMarch = false;
+                emptySamples = 0;
+            } else {
+                continue;
+            }
+        }
+
+        const float density = SampleCloudDensity(
+            p, baseHeight, thickness, coverage, wind, false);
+        if (density <= 0.0) {
+            if (++emptySamples > 8) { cheapMarch = true; }
+            continue;
+        }
+        emptySamples = 0;
+
+        // Light march: six cone taps toward the sun, accumulating the density
+        // between this point and the light.
+        float lightDensity = 0.0;
+        [unroll] for (int c = 0; c < 6; ++c) {
+            const float3 conePos = p + sunDirection * (float(c + 1) * 90.0) +
+                                   coneOffsets[c] * (float(c + 1) * 90.0);
+            lightDensity += SampleCloudDensity(
+                conePos, baseHeight, thickness, coverage, wind, true);
+        }
+
+        // Beer-Powder. Beer alone darkens cloud edges, which is backwards --
+        // thin edges scatter light forward and read brighter. The powder term
+        // restores that.
+        const float beer = exp(-lightDensity * 0.85);
+        const float powder = 1.0 - exp(-lightDensity * 2.0);
+        const float lightEnergy = 2.0 * beer * powder * phase;
+
+        const float3 lighting =
+            lerp(shadowColor, sunColor, saturate(lightEnergy)) *
+            nightCloudScale;
+        const float segmentAlpha =
+            1.0 - exp(-density * stepLength * 0.0055 * cloudParams.y);
+        accumulated += transmittance * segmentAlpha * lighting;
+        transmittance *= 1.0 - segmentAlpha;
+        // Nothing behind a fully opaque cloud can contribute.
+        if (transmittance < 0.01) break;
+    }
+    return float4(accumulated, saturate(1.0 - transmittance));
+}
+
 float4 RaymarchClouds(float3 ray) {
     if (atmosphereParams.x <= 0.001 || ray.y <= 0.015 ||
         cloudParams.x <= 0.001 || cloudParams.y <= 0.001)
         return 0.0;
+
+    if (cloudVolumetric > 0.5)
+        return RaymarchVolumetricClouds(ray);
 
     const float baseHeight = max(cloudParams.z, cameraPosition.y + 20.0);
     const float thickness = max(cloudParams.w, 50.0);

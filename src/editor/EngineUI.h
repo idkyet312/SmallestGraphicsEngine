@@ -1313,6 +1313,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::Checkbox("FXAA", &scene.enableFXAA);
         ImGui::Checkbox("Physical Atmosphere", &scene.enablePhysicalAtmosphere);
         if (scene.enablePhysicalAtmosphere) {
+            ImGui::Checkbox("Volumetric Clouds (3D)",
+                            &scene.enableVolumetricClouds);
+            if (!scene.enableVolumetricClouds)
+                ImGui::TextDisabled("Using legacy 2D cloud fallback");
             ImGui::SliderFloat("Rayleigh", &scene.atmosphereRayleighStrength,
                                0.0f, 2.0f, "%.2f");
             ImGui::SliderFloat("Mie Haze", &scene.atmosphereMieStrength,

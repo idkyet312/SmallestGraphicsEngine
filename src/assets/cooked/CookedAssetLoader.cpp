@@ -65,12 +65,34 @@ struct MappedFile {
     }
 };
 
+// Large cooked assets are loaded synchronously because their texture copies
+// record onto the render thread's active command list. Keep the window's
+// message queue moving while validation and CPU-to-upload copies run; otherwise
+// Windows classifies the process as hung and can terminate it before the first
+// level-load task completes.
+void PumpPendingWindowMessages() {
+    MSG message = {};
+    const auto pumpRange = [&message](UINT first, UINT last) {
+        while (PeekMessageW(&message, nullptr, first, last, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    };
+    // WM_SIZE rebuilds swap-chain and renderer resources. Leave it queued for
+    // the main loop, which will handle it after the loading frame's command
+    // list has been submitted rather than resetting that list mid-recording.
+    pumpRange(0, WM_SIZE - 1);
+    pumpRange(WM_SIZE + 1, (std::numeric_limits<UINT>::max)());
+}
+
 uint64_t HashBytes(const void* data, size_t size,
                    uint64_t hash = 1469598103934665603ull) {
     const auto* bytes = static_cast<const uint8_t*>(data);
     for (size_t i = 0; i < size; ++i) {
         hash ^= bytes[i];
         hash *= 1099511628211ull;
+        if ((i & ((4u * 1024u * 1024u) - 1u)) == 0u && i != 0u)
+            PumpPendingWindowMessages();
     }
     return hash;
 }
@@ -84,6 +106,7 @@ uint64_t HashFile(const fs::path& path) {
         stream.read(block.data(), block.size());
         hash = HashBytes(block.data(),
             static_cast<size_t>(stream.gcount()), hash);
+        PumpPendingWindowMessages();
     }
     return hash;
 }
@@ -394,9 +417,11 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
 
     std::vector<ComPtr<ID3D12Resource>> textureUploads;
     std::vector<ComPtr<ID3D12Resource>> textures(header.textureCount);
-    for (uint32_t i = 0; i < header.textureCount; ++i)
+    for (uint32_t i = 0; i < header.textureCount; ++i) {
         textures[i] = CreateTexture(map, textureRecords[i], device.Get(),
                                     commandList.Get(), textureUploads);
+        PumpPendingWindowMessages();
+    }
 
     std::vector<std::shared_ptr<SceneMaterial>> materials;
     materials.reserve((std::max)(1u, header.materialCount));
@@ -523,6 +548,7 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             "CookedMeshletTriangles");
         root->mesh->primitives.push_back(std::move(primitive));
+        PumpPendingWindowMessages();
     }
     root->UpdateGlobalTransform(root->localTransform);
     return root;

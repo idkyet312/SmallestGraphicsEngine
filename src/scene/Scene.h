@@ -343,12 +343,15 @@ struct Scene {
     bool  enableGrassMSAA = true;
     bool  enableFXAA = false;
     bool  enablePhysicalAtmosphere = true;
+    // Selects the baked 3D noise raymarch. Off keeps the legacy 2D cloud slab
+    // as a cheap fallback, so the toggle never removes weather entirely.
+    bool  enableVolumetricClouds = true;
     float atmosphereRayleighStrength = 0.92f;
     float atmosphereMieStrength = 0.58f;
     float atmosphereMieAnisotropy = 0.76f;
     float atmosphereAerialDensity = 0.72f;
-    float atmosphereCloudCoverage = 0.42f;
-    float atmosphereCloudDensity = 0.68f;
+    float atmosphereCloudCoverage = 0.62f;
+    float atmosphereCloudDensity = 0.90f;
     float atmosphereCloudBaseHeight = 720.0f;
     float atmosphereCloudThickness = 1250.0f;
     // -- Weather ---------------------------------------------------------

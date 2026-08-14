@@ -73,6 +73,7 @@
 #include "WaterVolume.h"
 #include "WaterRendererDX12.h"
 #include "RainRendererDX12.h"
+#include "CloudNoiseDX12.h"
 #include "PalmTrees.h"
 #include "LevelDefinition.h"
 #include "LevelEditor.h"
@@ -4268,6 +4269,7 @@ void MatchFoliageMaterialToGrass() {
 }
 
 static SkyRendererDX12      skyRenderer;
+static CloudNoiseDX12       g_cloudNoise;
 
 static EnvironmentIBLDX12   environmentIBL;
 DDGIRendererDX12            g_ddgiRenderer;
@@ -11945,7 +11947,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // upload, so the list must be open while it runs and its work must be flushed
     // (executed + waited) before the list is closed again - otherwise the copy
     // never reaches the GPU and the sky texture stays black.
-    BootStep("Loading HDRI sky and prefiltering IBL...");
+    // Keep this as one boot frame: HDRI upload, IBL prefilter, and cloud-noise
+    // generation all record onto the command list opened below. BootStep()
+    // starts a frame and resets that same list, so calling it again before the
+    // batch is submitted invalidates the active recording and Close() fails.
+    BootStep("Loading HDRI, prefiltering IBL, and baking cloud noise...");
     ThrowIfFailed(g_dx12.commandAllocators[g_dx12.frameIndex]->Reset());
     ThrowIfFailed(g_dx12.commandList->Reset(g_dx12.commandAllocators[g_dx12.frameIndex].Get(), nullptr));
     if (!skyRenderer.Init()) {
@@ -11962,12 +11968,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_specularEnvironmentResource = g_skyEnvironmentResource;
         std::cerr << "Specular IBL prefilter failed (using raw HDRI fallback)\n";
     }
+    // Bake the cloud noise onto this same list. It is pure compute into two
+    // textures nothing else touches, and the flush below already waits, so it
+    // costs one dispatch pair at boot rather than a second submit.
+    if (g_cloudNoise.Init()) {
+        g_cloudNoise.Generate(g_dx12.commandList.Get());
+    } else {
+        std::cerr << "Cloud noise generation failed; clouds stay on the 2D path\n";
+    }
     ThrowIfFailed(g_dx12.commandList->Close());
     {
         ID3D12CommandList* skyLists[] = { g_dx12.commandList.Get() };
         g_dx12.commandQueue->ExecuteCommandLists(1, skyLists);
     }
     WaitForGPU();
+    // Only point the sky at the volumes once the dispatches have actually
+    // completed -- sampling a volume still being written gives noise that
+    // changes under the camera on the first frames.
+    if (g_cloudNoise.Generated()) {
+        skyRenderer.SetCloudVolumes(
+            g_cloudNoise.ShapeVolume(), g_cloudNoise.DetailVolume());
+    }
     g_mipGen.FlushPending();
     DumpDX12DebugMessages();
     BootStep("Computing sky irradiance...");
@@ -14376,6 +14397,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             skyRenderer.Render(
                 scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now,
                 scene.enablePhysicalAtmosphere,
+                scene.enableVolumetricClouds,
                 XMFLOAT4(scene.atmosphereRayleighStrength,
                          scene.atmosphereMieStrength,
                          scene.atmosphereMieAnisotropy,

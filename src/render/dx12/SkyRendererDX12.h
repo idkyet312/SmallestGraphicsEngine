@@ -34,6 +34,10 @@ struct alignas(256) SkyBufferDX12 {
     float time;
     XMFLOAT4 atmosphereParams;
     XMFLOAT4 cloudParams;
+    // 1 when the 3D noise volumes are bound and the shader should run the
+    // volumetric march; 0 keeps it on the cheaper 2D-noise slab.
+    float cloudVolumetric;
+    float cloudPadding[3];
 };
 
 class SkyRendererDX12 {
@@ -47,6 +51,8 @@ public:
     std::vector<ComPtr<ID3D12Resource>> uploadHeaps;
     UploadBuffer<SkyBufferDX12> constants;
     bool initialized = false;
+    UINT srvDescriptorSize = 0;
+    bool cloudVolumesReady = false;
     // Which environment map is currently resident, so SetEnvironment can skip a
     // reload when nothing changed.
     std::string loadedEnvironmentPath;
@@ -99,7 +105,7 @@ public:
             "main", "ps_5_0", flags, 0, &hdrPs, &errors);
         if (FAILED(hr)) { if (errors) std::cerr << (char*)errors->GetBufferPointer(); return false; }
 
-        D3D12_ROOT_PARAMETER roots[2] = {};
+        D3D12_ROOT_PARAMETER roots[3] = {};
         roots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         roots[0].Descriptor.ShaderRegister = 0;
         roots[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
@@ -112,17 +118,35 @@ public:
         roots[1].DescriptorTable.NumDescriptorRanges = 1;
         roots[1].DescriptorTable.pDescriptorRanges = &textureRange;
         roots[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        D3D12_STATIC_SAMPLER_DESC sampler = {};
-        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        sampler.MaxLOD = D3D12_FLOAT32_MAX;
-        sampler.ShaderRegister = 0;
-        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        // Cloud shape + detail volumes at t1/t2. They live in the same heap as
+        // the environment map -- only one CBV/SRV/UAV heap can be bound at a
+        // time -- but in their own table, so a runtime sky swap rewrites
+        // descriptor 0 without disturbing the cloud views at 1 and 2.
+        D3D12_DESCRIPTOR_RANGE cloudRange = {};
+        cloudRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        cloudRange.NumDescriptors = 2;
+        cloudRange.BaseShaderRegister = 1;
+        cloudRange.OffsetInDescriptorsFromTableStart = 0;
+        roots[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        roots[2].DescriptorTable.NumDescriptorRanges = 1;
+        roots[2].DescriptorTable.pDescriptorRanges = &cloudRange;
+        roots[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
+        samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplers[0].MaxLOD = D3D12_FLOAT32_MAX;
+        samplers[0].ShaderRegister = 0;
+        samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        // The noise volumes are generated to tile, so they wrap on every axis.
+        // Clamping any one of them would streak the edge voxel across the sky.
+        samplers[1] = samplers[0];
+        samplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplers[1].ShaderRegister = 1;
         D3D12_ROOT_SIGNATURE_DESC rs = {};
-        rs.NumParameters = 2; rs.pParameters = roots;
-        rs.NumStaticSamplers = 1; rs.pStaticSamplers = &sampler;
+        rs.NumParameters = 3; rs.pParameters = roots;
+        rs.NumStaticSamplers = 2; rs.pStaticSamplers = samplers;
         ComPtr<ID3DBlob> signature;
         hr = D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &errors);
         if (FAILED(hr)) return false;
@@ -162,11 +186,14 @@ public:
             g_dx12.commandList, uploadHeaps);
         if (!skyTexture) return false;
         loadedEnvironmentPath = kSkyEnvironmentPath;
+        // 0 = environment map, 1 = cloud shape volume, 2 = cloud detail volume.
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 1;
+        heapDesc.NumDescriptors = 3;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_dx12.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&srvHeap)))) return false;
+        srvDescriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         g_dx12.device->CreateShaderResourceView(
             skyTexture.Get(), nullptr, srvHeap->GetCPUDescriptorHandleForHeapStart());
 
@@ -258,9 +285,33 @@ public:
 
     void SetHDRTargetEnabled(bool enabled) { hdrTargetEnabled = enabled; }
 
+    // Points the cloud raymarch at the baked noise volumes. Copies the views
+    // into this renderer's own heap because only one CBV/SRV/UAV heap can be
+    // bound at a time and the sky pass binds its own. Call once after the
+    // volumes are generated; until then the shader falls back to the cheap 2D
+    // cloud path, so a failure here costs detail rather than the sky.
+    void SetCloudVolumes(ID3D12Resource* shape, ID3D12Resource* detail) {
+        if (!initialized || !shape || !detail) return;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        srv.Texture3D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            srvHeap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(srvDescriptorSize);
+        g_dx12.device->CreateShaderResourceView(shape, &srv, handle);
+        handle.ptr += static_cast<SIZE_T>(srvDescriptorSize);
+        g_dx12.device->CreateShaderResourceView(detail, &srv, handle);
+        cloudVolumesReady = true;
+    }
+
+    bool CloudVolumesReady() const { return cloudVolumesReady; }
+
     void Render(const Camera& camera, float fovDegrees,
                 const XMFLOAT3& lightDirection, float time,
-                bool physicalAtmosphere, const XMFLOAT4& atmosphereParams,
+                bool physicalAtmosphere, bool volumetricClouds,
+                const XMFLOAT4& atmosphereParams,
                 const XMFLOAT4& cloudParams) {
         if (!initialized) return;
         // camera.Up is always world-up, not the camera's actual up. Building the
@@ -294,6 +345,11 @@ public:
         if (!physicalAtmosphere)
             data.atmosphereParams.x = 0.0f;
         data.cloudParams = cloudParams;
+        // Tells the shader whether the 3D volumes are bound and worth marching.
+        // Zero keeps it on the cheap 2D path it used before the volumes
+        // existed, which is also the fallback if noise generation failed.
+        data.cloudVolumetric =
+            volumetricClouds && cloudVolumesReady ? 1.0f : 0.0f;
         constants.CopyData(g_dx12.frameIndex, data);
 
         g_dx12.commandList->SetPipelineState(hdrTargetEnabled
@@ -304,6 +360,10 @@ public:
         g_dx12.commandList->SetDescriptorHeaps(1, heaps);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(0, constants.GetGPUAddress(g_dx12.frameIndex));
         g_dx12.commandList->SetGraphicsRootDescriptorTable(1, srvHeap->GetGPUDescriptorHandleForHeapStart());
+        D3D12_GPU_DESCRIPTOR_HANDLE cloudTable =
+            srvHeap->GetGPUDescriptorHandleForHeapStart();
+        cloudTable.ptr += static_cast<UINT64>(srvDescriptorSize);
+        g_dx12.commandList->SetGraphicsRootDescriptorTable(2, cloudTable);
         g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_dx12.commandList->DrawInstanced(3, 1, 0, 0);
     }
