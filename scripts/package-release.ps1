@@ -30,7 +30,35 @@ $stage = Join-Path $repo "$OutputDir\SmallestGraphicsEngine"
 $zipPath = Join-Path $repo "$OutputDir\SmallestGraphicsEngine.zip"
 
 Write-Host "Staging to $stage" -ForegroundColor Cyan
-if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+
+# A previously packaged build still running holds its assets open, and every
+# file it has mapped refuses to delete. This has to happen before the wipe
+# below rather than later on: the wipe is the first thing to touch the old
+# staging tree, so it is the first thing a stale process breaks.
+$running = Get-Process GraphicEngine -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path.StartsWith($stage, 'OrdinalIgnoreCase') }
+if ($running) {
+    Write-Warning "Stopping $($running.Count) GraphicEngine process(es) running from the staging directory."
+    $running | Stop-Process -Force
+    $running | ForEach-Object { $_.WaitForExit(10000) | Out-Null }
+}
+
+# Even after the process exits, Windows can hold its mapped files briefly.
+# Retry rather than failing the run on a lock that clears itself in a second.
+if (Test-Path $stage) {
+    for ($attempt = 1; $attempt -le 5; ++$attempt) {
+        try {
+            Remove-Item $stage -Recurse -Force -ErrorAction Stop
+            break
+        } catch {
+            if ($attempt -eq 5) {
+                throw "Could not clear $stage after 5 attempts. Close anything using it and re-run. Last error: $($_.Exception.Message)"
+            }
+            Write-Warning "Staging directory locked (attempt $attempt/5); retrying in 3s..."
+            Start-Sleep -Seconds 3
+        }
+    }
+}
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
 # -- Executable ---------------------------------------------------------------
@@ -159,9 +187,16 @@ if (Test-Path $stagedModels) {
         if ($keepModelDirs -contains $dir.Name) { continue }
         $bytes = (Get-ChildItem $dir.FullName -Recurse -File -ErrorAction SilentlyContinue |
                   Measure-Object Length -Sum).Sum
-        $freed += $bytes
-        Write-Host ("  pruned Models/{0} ({1:N0} MB)" -f $dir.Name, ($bytes / 1MB)) -ForegroundColor DarkYellow
-        Remove-Item $dir.FullName -Recurse -Force
+        # Count the bytes only once the delete succeeds, and keep going if one
+        # directory is locked -- a single stuck file should not cost the whole
+        # package. The warning names it so the shipped size can be explained.
+        try {
+            Remove-Item $dir.FullName -Recurse -Force -ErrorAction Stop
+            $freed += $bytes
+            Write-Host ("  pruned Models/{0} ({1:N0} MB)" -f $dir.Name, ($bytes / 1MB)) -ForegroundColor DarkYellow
+        } catch {
+            Write-Warning "Could not prune Models/$($dir.Name): $($_.Exception.Message)"
+        }
     }
     # Loose files sitting directly under Models/ get the same treatment. Only
     # h2.glb, gun.glb and gun.obj are referenced from main.cpp; the rest
@@ -170,9 +205,13 @@ if (Test-Path $stagedModels) {
     $keepModelFiles = @('h2.glb', 'gun.glb', 'gun.obj')
     foreach ($file in (Get-ChildItem $stagedModels -File)) {
         if ($keepModelFiles -contains $file.Name) { continue }
-        $freed += $file.Length
-        Write-Host ("  pruned Models/{0} ({1:N0} MB)" -f $file.Name, ($file.Length / 1MB)) -ForegroundColor DarkYellow
-        Remove-Item $file.FullName -Force
+        try {
+            Remove-Item $file.FullName -Force -ErrorAction Stop
+            $freed += $file.Length
+            Write-Host ("  pruned Models/{0} ({1:N0} MB)" -f $file.Name, ($file.Length / 1MB)) -ForegroundColor DarkYellow
+        } catch {
+            Write-Warning "Could not prune Models/$($file.Name): $($_.Exception.Message)"
+        }
     }
     Write-Host ("  pruning freed {0:N2} GB" -f ($freed / 1GB)) -ForegroundColor Green
 }
