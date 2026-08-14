@@ -20,12 +20,15 @@ struct PlayerState {
         return regenDuration > 0.0f ? maxHealth / regenDuration : maxHealth;
     }
 
-    static constexpr int kWeaponSlots = 8;
-    int magazineSize[kWeaponSlots] = { 30, 8, 1, 10, 120, 6, 100, 1 };
-    int maxReserve[kWeaponSlots] = { 240, 64, 8, 80, 600, 24, 500, 24 };
-    float reloadTime[kWeaponSlots] = { 1.55f, 2.4f, 2.8f, 1.75f, 2.1f, 1.8f, 2.6f, 1.35f };
-    int magazine[kWeaponSlots] = { 30, 8, 1, 10, 120, 6, 100, 1 };
-    int reserve[kWeaponSlots] = { 120, 32, 4, 40, 360, 12, 300, 12 };
+    // Slot 8 is the suppressed SVD. It carries less than the standard rifle --
+    // 5-round magazines and a thin reserve -- because the quiet is the weapon's
+    // advantage and it should not also out-supply the loud one.
+    static constexpr int kWeaponSlots = 9;
+    int magazineSize[kWeaponSlots] = { 30, 8, 1, 10, 120, 6, 100, 1, 5 };
+    int maxReserve[kWeaponSlots] = { 240, 64, 8, 80, 600, 24, 500, 24, 40 };
+    float reloadTime[kWeaponSlots] = { 1.55f, 2.4f, 2.8f, 1.75f, 2.1f, 1.8f, 2.6f, 1.35f, 2.05f };
+    int magazine[kWeaponSlots] = { 30, 8, 1, 10, 120, 6, 100, 1, 5 };
+    int reserve[kWeaponSlots] = { 120, 32, 4, 40, 360, 12, 300, 12, 20 };
     float reloadTimer = 0.0f;
     int reloadingSlot = -1;
 

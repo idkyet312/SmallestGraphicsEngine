@@ -83,21 +83,35 @@ public:
         return model;
     }
 
+    // Highest valid weapon id. Several parallel tables are sized to this, so
+    // adding a weapon means extending every one of them.
+    static constexpr int kMaxWeapon = 8;
+
     static int& SelectedWeapon() {
-        static int weapon = 0; // 0 AK, 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame, 7 harpoon
+        // 0 AK, 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame, 7 harpoon,
+        // 8 suppressed SVD
+        static int weapon = 0;
         return weapon;
     }
     static const char* WeaponName(int weapon) {
-        static constexpr const char* names[8] = {
+        static constexpr const char* names[kMaxWeapon + 1] = {
             "AK47", "Mossberg 590A1", "RPG-7", "SVD Sniper",
             "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
-            "Mako Harpoon Gun"
+            "Mako Harpoon Gun", "SVD Suppressed"
         };
-        return names[(std::max)(0, (std::min)(weapon, 7))];
+        return names[(std::max)(0, (std::min)(weapon, kMaxWeapon))];
     }
     static bool ShotgunSelected() { return SelectedWeapon() == 1 && ShotgunLoaded(); }
     static bool RPGSelected() { return SelectedWeapon() == 2 && RPGLoaded(); }
-    static bool SVDSelected() { return SelectedWeapon() == 3 && SVDLoaded(); }
+    // Both SVD variants share one imported mesh: the suppressor is drawn as an
+    // extra tube rather than a separate model, so anything asking "is the
+    // player holding an SVD" -- viewmodel, scope, offsets -- must accept both.
+    static bool SVDSuppressedSelected() {
+        return SelectedWeapon() == 8 && SVDLoaded();
+    }
+    static bool SVDSelected() {
+        return (SelectedWeapon() == 3 || SelectedWeapon() == 8) && SVDLoaded();
+    }
     static bool LaserSelected() { return SelectedWeapon() == 4; }
     static bool C4Selected() { return SelectedWeapon() == 5; }
     static bool FlamethrowerSelected() { return SelectedWeapon() == 6; }
@@ -119,7 +133,7 @@ public:
     // different distance from its rear bound to its support-hand grip, so one
     // shared offset cannot keep every weapon inside the same animated hands.
     static XMFLOAT3& WeaponOffset(int weapon) {
-        static std::array<XMFLOAT3, 8> offsets = {{
+        static std::array<XMFLOAT3, kMaxWeapon + 1> offsets = {{
             { 0.000f, -0.100f, -0.440f }, // AK47 handguard
             { 0.045f, -0.100f, -0.290f }, // Mossberg pump
             { 0.020f, -0.030f, -0.330f }, // RPG forward grip
@@ -128,8 +142,12 @@ public:
             { 0.000f, -0.080f, -0.180f }, // C4 pack
             { 0.030f, -0.095f, -0.330f }, // flamethrower nozzle
             { 0.020f, -0.085f, -0.305f }, // harpoon barrel
+            // Same mesh and so the same grip as the standard SVD. The
+            // suppressor hangs off the muzzle, forward of the support hand,
+            // and does not move where the rifle is held.
+            { 0.030f, -0.060f, -0.490f }, // SVD suppressed handguard
         }};
-        const int slot = (std::max)(0, (std::min)(weapon, 7));
+        const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
     }
     static XMFLOAT3& PlayerOffset() {
@@ -149,6 +167,7 @@ public:
         case 5: return true;
         case 6: return true;
         case 7: return true;
+        case 8: return SVDLoaded(); // suppressed variant of the same rifle
         default: return false;
         }
     }

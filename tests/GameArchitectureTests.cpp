@@ -199,6 +199,32 @@ int main() {
     loadout.grenade = GrenadeType::Vortex;
     loadout.insertion = LevelInsertionMode::Boat;
 
+    // The suppressed SVD is a real loadout pick, not a hidden variant: it has
+    // to be selectable and gradeable like any other weapon. Slot 8 sits at the
+    // top of the range, so this also pins kWeaponCount against a table that was
+    // extended in one place but not another.
+    constexpr int kSuppressedSVD = 8;
+    CHECK(kSuppressedSVD < MissionLoadout::kWeaponCount);
+    MissionLoadout stealth;
+    stealth.SelectWeapon(0, kSuppressedSVD);
+    CHECK(stealth.weapons[0] == kSuppressedSVD);
+    CHECK(stealth.Valid());
+    CHECK(stealth.ContainsWeapon(kSuppressedSVD));
+    // Ammo tables must cover it, or firing it reads uninitialised memory.
+    CHECK(PlayerState::kWeaponSlots > kSuppressedSVD);
+    PlayerState stealthAmmo;
+    CHECK(stealthAmmo.magazineSize[kSuppressedSVD] > 0);
+    CHECK(stealthAmmo.maxReserve[kSuppressedSVD] > 0);
+    CHECK(stealthAmmo.reloadTime[kSuppressedSVD] > 0.0f);
+    // Quiet is the advantage, so it must not also carry more than the loud
+    // rifle it shares a round with.
+    CHECK(stealthAmmo.magazineSize[kSuppressedSVD] <=
+          stealthAmmo.magazineSize[3]);
+    CHECK(stealthAmmo.maxReserve[kSuppressedSVD] <
+          stealthAmmo.maxReserve[3]);
+    // Weapon-used tracking is a bitmask; slot 8 has to fit in it.
+    CHECK((1u << kSuppressedSVD) != 0u);
+
     MissionRunStats missionStats;
     missionStats.weaponsUsedMask = (1u << 1) | (1u << 2);
     missionStats.shotsFired = 10;

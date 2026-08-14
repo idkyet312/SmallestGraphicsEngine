@@ -1421,13 +1421,22 @@ struct Scene {
         burningMaterials.push_back(material);
     }
 
-    void ShootSniperProjectile() {
+    // suppressed shrinks the flash and softens the recoil rather than changing
+    // the round: a can traps most of the muzzle blast, which is what produces
+    // both the flash and part of the kick. Damage and velocity are untouched --
+    // the suppressed rifle hits exactly as hard as the bare one.
+    void ShootSniperProjectile(bool suppressed = false) {
         const XMFLOAT3 aimDirection = camera.Front;
-        camera.ApplyRecoil(recoilPitch * 4.2f, 0.0f);
+        camera.ApplyRecoil(recoilPitch * (suppressed ? 3.6f : 4.2f), 0.0f);
         gunRecoilBack = (std::min)(0.16f, gunRecoilBack + 0.12f);
         gunRecoilKick = (std::min)(12.0f, gunRecoilKick + 7.0f);
-        TriggerMuzzleFlash(1.35f, 1.35f);
-        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front, 1.5f);
+        // A suppressed muzzle still flares, just far less. Killing it outright
+        // would make the rifle read as a laser rather than a firearm, and at
+        // night the faint flash is a fair tell for an enemy who is looking.
+        if (suppressed) TriggerMuzzleFlash(0.55f, 0.35f);
+        else TriggerMuzzleFlash(1.35f, 1.35f);
+        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front,
+                         suppressed ? 0.7f : 1.5f);
 
         Projectile p = {};
         p.position = p.previousPosition = GetMuzzleWorldPosition();

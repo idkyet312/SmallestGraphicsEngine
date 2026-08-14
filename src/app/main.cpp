@@ -3093,6 +3093,11 @@ static bool SpawnBoatTurretGunner() {
     return true;
 }
 
+// How far a suppressed shot carries, against an unsuppressed one. A quarter of
+// the 19 m alert radius puts it under 5 m: close enough that a man beside the
+// target still reacts, far short of waking the rest of a patrol.
+static constexpr float kSuppressedNoiseScale = 0.25f;
+
 // Reload click. Pitched per weapon so the heavier guns sound heavier: the RPG
 // and shotgun drop below unity, the AK sits near it, the SVD just above.
 static void PlayReloadSound() {
@@ -3136,9 +3141,15 @@ static bool ShootPlayerWeapon() {
         const float pitch = 1.65f + ((float)std::rand() / RAND_MAX) * 0.10f;
         g_gunAudio.Play(0.30f, pitch);
     } else if (GunModel::SVDSelected()) {
-        scene.ShootSniperProjectile();
-        const float pitch = 0.70f + ((float)std::rand() / RAND_MAX) * 0.04f;
-        g_gunAudio.Play(1.0f, pitch);
+        // Same round and the same damage either way -- the suppressor changes
+        // what the shot sounds like, not what it does. Quieter and pitched up:
+        // a can takes the bass out of a report, leaving a flat crack rather
+        // than the boom the unsuppressed rifle makes.
+        const bool suppressed = GunModel::SVDSuppressedSelected();
+        scene.ShootSniperProjectile(suppressed);
+        const float pitch = (suppressed ? 1.24f : 0.70f) +
+            ((float)std::rand() / RAND_MAX) * 0.04f;
+        g_gunAudio.Play(suppressed ? 0.34f : 1.0f, pitch);
     } else if (GunModel::RPGSelected()) {
         scene.ShootRocket();
         const float pitch = 0.68f + ((float)std::rand() / RAND_MAX) * 0.05f;
@@ -3162,8 +3173,19 @@ static bool ShootPlayerWeapon() {
     // ones that can't currently see the player. Same radius as the squad-alert
     // broadcast so "heard the shot" and "saw a squadmate get hit" read as the
     // same kind of event.
-    g_enemyNoiseEvents.push_back(
-        { scene.camera.Position, SkinnedEnemy::AlertBroadcastRadius() });
+    //
+    // The suppressed SVD cuts that radius hard. This is the whole weapon: it
+    // fires the same round for the same damage as the standard rifle, and buys
+    // its advantage entirely in how far the shot carries. A quarter radius
+    // means a kill at range no longer wakes the squad around the target, which
+    // is what lets a sniper work through a patrol one man at a time.
+    //
+    // Not silent, deliberately. A suppressed rifle is still loud enough to
+    // notice from close by, so a man standing next to the one you drop will
+    // still turn -- picking targets on the edge of a group remains the skill.
+    const float noiseRadius = SkinnedEnemy::AlertBroadcastRadius() *
+        (GunModel::SVDSuppressedSelected() ? kSuppressedNoiseScale : 1.0f);
+    g_enemyNoiseEvents.push_back({ scene.camera.Position, noiseRadius });
     return true;
 }
 
@@ -8481,7 +8503,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     static constexpr const char* weaponNames[MissionLoadout::kWeaponCount] = {
         "AK47", "Mossberg 590A1", "RPG-7", "SVD Sniper",
         "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
-        "Mako Harpoon Gun"
+        "Mako Harpoon Gun", "SVD Suppressed"
     };
     ImGui::SeparatorText("LOADOUT");
     int primary = loadout.weapons[0];
