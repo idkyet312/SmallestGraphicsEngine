@@ -88,6 +88,65 @@ inline bool TimeOfDayIsDark(TimeOfDay time) {
     return time == TimeOfDay::Night;
 }
 
+// How far anything can see, as a multiplier on a clear-noon baseline.
+//
+// Two things reduce it, and they are genuinely different: light level sets how
+// much there is to see at all, and fog sets how far that light carries. A
+// moonless night and a thick daytime fog both hide a man at 30 m, but only the
+// first is fixed by night vision, so they are kept as separate terms rather
+// than folded into one number.
+//
+// Lighting term. Directional intensity runs 14.6 at noon down to 0.035 at
+// night -- four orders of magnitude once ambient is included -- so this is
+// deliberately compressive. Eyes adapt: night is not 400x worse than noon for
+// a human, it is a few times worse. The curve maps that huge physical range
+// onto a playable one, and the floor keeps the darkest night from blinding
+// anyone completely, because an enemy who cannot see a player standing in
+// front of them reads as broken rather than as dark.
+//
+// Returns 1.0 for the clear-afternoon baseline the levels were built around, so
+// existing tuning (vision ranges, engagement distances) is unchanged until a
+// preset actually differs.
+inline float TimeOfDayVisibilityFactor(const TimeOfDaySettings& settings) {
+    // Total illumination reaching the scene. Ambient matters more than its
+    // small numbers suggest: it is what fills shadow, and a night with no
+    // ambient is much darker than the directional term alone implies.
+    const float light = settings.directionalLightIntensity +
+                        settings.ambientLightingIntensity * 8.0f;
+    // Afternoon: 12.18 + 0.42*8 = 15.54, the reference.
+    constexpr float kReferenceLight = 15.54f;
+    const float lightRatio = light / kReferenceLight;
+    // Fourth root: compresses a 400:1 physical range into roughly 4:1 of
+    // seeing distance, which is about how a dark-adapted eye actually behaves.
+    const float lightTerm =
+        std::sqrt(std::sqrt(lightRatio < 0.0f ? 0.0f : lightRatio));
+
+    // Fog term. Density is the dominant control -- distance only bounds where
+    // the volume stops, and at the authored 800 m it is far beyond any sight
+    // line that matters here. Referenced against the authored 0.009 so the
+    // shipping presets sit at 1.0 and only a deliberately foggier preset pulls
+    // sight in.
+    float fogTerm = 1.0f;
+    if (settings.enableVolumetricFog) {
+        constexpr float kReferenceDensity = 0.009f;
+        const float density = settings.volumetricFogDensity > 0.0f
+            ? settings.volumetricFogDensity : 0.0f;
+        // Inverse-ish falloff: double the density, roughly two thirds the
+        // sight line. Clamped at 1 so thin fog never grants better than clear
+        // vision.
+        fogTerm = kReferenceDensity / (kReferenceDensity + density * 0.5f) * 1.5f;
+        if (fogTerm > 1.0f) fogTerm = 1.0f;
+    }
+
+    const float visibility = lightTerm * fogTerm;
+    // Floor at a quarter: see the note above about enemies being blind at
+    // arm's length. Ceiling at 1 so no preset sees further than clear noon.
+    if (visibility < 0.25f) return 0.25f;
+    if (visibility > 1.0f) return 1.0f;
+    return visibility;
+}
+
+
 inline TimeOfDaySettings MakeTimeOfDaySettings(TimeOfDay time) {
     TimeOfDaySettings settings;
     switch (time) {
@@ -154,6 +213,11 @@ inline TimeOfDaySettings MakeTimeOfDaySettings(TimeOfDay time) {
         break;
     }
     return settings;
+}
+
+// Convenience overload. Defined after MakeTimeOfDaySettings because it calls it.
+inline float TimeOfDayVisibilityFactor(TimeOfDay time) {
+    return TimeOfDayVisibilityFactor(MakeTimeOfDaySettings(time));
 }
 
 #endif

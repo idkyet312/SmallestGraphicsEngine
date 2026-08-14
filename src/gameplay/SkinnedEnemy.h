@@ -28,6 +28,17 @@ class SkinnedEnemy;
 using EnemyLineOfSightFn = bool(*)(const SkinnedEnemy&, const DirectX::XMFLOAT3&);
 extern EnemyLineOfSightFn g_enemyLineOfSightFn;
 
+// How far anything can see this run, as a multiplier on the clear-daylight
+// baseline: 1.0 at noon, ~0.25 on a moonless night. Set by main.cpp from the
+// chosen time of day (see TimeOfDayVisibilityFactor) rather than computed here,
+// so this header keeps knowing nothing about Scene or the atmosphere.
+//
+// Only sight is scaled. Hearing deliberately is not: darkness and fog hide a
+// man, they do not quiet his rifle, and keeping the noise channel at full range
+// is what stops a dark preset from being a free win. Sneaking in unseen still
+// means not shooting.
+extern float g_enemyVisionScale;
+
 // A loud, momentary sound (gunfire, explosion) enemies can hear through walls.
 // Populated fresh each frame by main.cpp and drained by every enemy's Update.
 struct EnemyNoiseEvent { DirectX::XMFLOAT3 position; float radius; };
@@ -151,7 +162,20 @@ public:
 
     // Vision cone parameters for debug visualization. Half-angle in radians
     // (not the stored cosine) so callers can build cone geometry directly.
-    float VisionRange() const { return kVisionRange; }
+    //
+    // Scaled by the run's visibility, so this is the range perception actually
+    // uses and the debug cone drawn from it shrinks at night to match. The
+    // scale is clamped rather than trusted: an unset or garbage global would
+    // otherwise silently blind every enemy or let them see across the island.
+    float VisionRange() const {
+        const float scale = (g_enemyVisionScale > 0.05f &&
+                             g_enemyVisionScale <= 1.0f)
+            ? g_enemyVisionScale : 1.0f;
+        return kVisionRange * scale;
+    }
+    // The clear-daylight range, before visibility scaling. Exposed so UI can
+    // quote a distance without duplicating the constant.
+    static constexpr float BaseVisionRange() { return kVisionRange; }
     static float AlertBroadcastRadius() { return kAlertBroadcastRadius; }
     float VisionHalfFovRadians() const { return std::acos(kVisionHalfFovCos); }
 
@@ -741,7 +765,8 @@ public:
         if (turretGunner) return true;
         const float dx = target.x - position.x, dz = target.z - position.z;
         const float distSq = dx * dx + dz * dz;
-        if (distSq <= kVisionRange * kVisionRange && distSq > 1e-6f) {
+        const float sightRange = VisionRange();
+        if (distSq <= sightRange * sightRange && distSq > 1e-6f) {
             const float invLen = 1.0f / std::sqrt(distSq);
             const float facingX = std::sin(yaw), facingZ = std::cos(yaw);
             const float dot = (dx * invLen) * facingX + (dz * invLen) * facingZ;

@@ -832,6 +832,47 @@ int main() {
         CHECK(dusk.directionalLightIntensity >
               night.directionalLightIntensity);
 
+        // Visibility, which scales how far enemies can see.
+        const float noonVis = TimeOfDayVisibilityFactor(noon);
+        const float afternoonVis = TimeOfDayVisibilityFactor(afternoon);
+        const float duskVis = TimeOfDayVisibilityFactor(dusk);
+        const float nightVis = TimeOfDayVisibilityFactor(night);
+
+        // Never better than clear daylight, never a total blackout: an enemy
+        // who cannot see a player in front of them reads as broken, not dark.
+        for (float v : { noonVis, afternoonVis, duskVis, nightVis }) {
+            CHECK(v <= 1.0f);
+            CHECK(v >= 0.25f);
+        }
+
+        // Afternoon is the baseline every level was tuned against, so it must
+        // stay at full range or existing engagement distances all shift.
+        CHECK(afternoonVis == 1.0f);
+        CHECK(noonVis == 1.0f);
+
+        // Darker means shorter sight, and night is the dramatic step. Dusk is
+        // still daylight, so it should barely differ -- if dusk ever drops far
+        // it means the curve got too aggressive and daytime stealth is free.
+        CHECK(duskVis <= afternoonVis);
+        CHECK(duskVis > 0.75f);
+        CHECK(nightVis < duskVis);
+        // Night has to be a real change to be worth choosing: at least a
+        // halving of how far a bandit picks the player out.
+        CHECK(nightVis < 0.5f);
+
+        // Fog pulls sight in independently of the light, which is the property
+        // a weather preset would rely on. Same afternoon sun, thicker fog.
+        TimeOfDaySettings foggy = afternoon;
+        foggy.volumetricFogDensity = afternoon.volumetricFogDensity * 5.0f;
+        const float foggyVis = TimeOfDayVisibilityFactor(foggy);
+        CHECK(foggyVis < afternoonVis);
+        CHECK(foggyVis >= 0.25f);
+
+        // Fog switched off cannot make the world darker than clear.
+        TimeOfDaySettings noFog = afternoon;
+        noFog.enableVolumetricFog = false;
+        CHECK(TimeOfDayVisibilityFactor(noFog) >= afternoonVis);
+
         // Night keeps a non-zero floor for silhouettes, but is authored close
         // to black so local lights and muzzle flashes define the scene.
         CHECK(night.ambientStrength > 0.0f);

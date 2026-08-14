@@ -2296,8 +2296,21 @@ static void ApplyTimeOfDay(TimeOfDay time) {
     // one frame leaves the old bounce baked in until it converges out.
     g_game.commands.Request(GameCommand::ResetDDGIHistory);
     g_game.commands.Request(GameCommand::RebuildDDGI);
+
+    // Sight range follows the light and the fog. Computed from the settings
+    // actually applied -- fog comes from the player's per-time override, not
+    // the preset -- so tuning the fog on the deployment screen moves enemy
+    // perception with it rather than leaving the two disagreeing.
+    TimeOfDaySettings applied = settings;
+    const VolumetricFogSettings& fog = VolumetricFogFor(time);
+    applied.enableVolumetricFog = fog.enabled;
+    applied.volumetricFogDensity = fog.density;
+    applied.volumetricFogDistance = fog.distance;
+    g_enemyVisionScale = TimeOfDayVisibilityFactor(applied);
+
     SGE_LOG("LogGameplay", EngineLog::Level::Display,
-        std::string("Time of day set to ") + TimeOfDayName(time));
+        std::string("Time of day set to ") + TimeOfDayName(time) +
+        " (enemy sight x" + std::to_string(g_enemyVisionScale) + ")");
 }
 
 // Terrain height under a world position, or 0 on levels without mesh terrain.
@@ -3263,6 +3276,10 @@ static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
 EnemyLineOfSightFn g_enemyLineOfSightFn = &BanditHasLineOfSight;
 std::vector<EnemyNoiseEvent> g_enemyNoiseEvents;
 std::vector<EnemyAlertEvent> g_enemyAlertEvents;
+// Clear daylight until a time of day says otherwise. ApplyTimeOfDay overwrites
+// this, and every level start runs through there, so the default only stands
+// for the frames before the first preset lands.
+float g_enemyVisionScale = 1.0f;
 
 // Would an ally's grenade at `target` catch someone on the player's side?
 //
@@ -8555,9 +8572,26 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     ImGui::SameLine();
     timeButton(TimeOfDay::Night, kTimeButtonWidth);
     ImGui::TextWrapped("%s", TimeOfDayBriefing(g_selectedTimeOfDay));
-    if (TimeOfDayIsDark(g_selectedTimeOfDay))
+    // Spell out the perception the choice actually buys. This used to say
+    // enemies see no better in the dark, which was true when the sight range
+    // was a constant and is now the opposite of what happens.
+    {
+        TimeOfDaySettings preview =
+            MakeTimeOfDaySettings(g_selectedTimeOfDay);
+        const VolumetricFogSettings& previewFog =
+            VolumetricFogFor(g_selectedTimeOfDay);
+        preview.enableVolumetricFog = previewFog.enabled;
+        preview.volumetricFogDensity = previewFog.density;
+        preview.volumetricFogDistance = previewFog.distance;
+        const float visibility = TimeOfDayVisibilityFactor(preview);
         ImGui::TextDisabled(
-            "Enemies see no better in the dark than they do at noon.");
+            "Enemy sight range %.0f%% of daylight (~%.0f m).",
+            visibility * 100.0f,
+            SkinnedEnemy::BaseVisionRange() * visibility);
+        if (visibility < 0.5f)
+            ImGui::TextDisabled(
+                "They still hear gunfire at full range.");
+    }
     // Volumetric fog for the selected time. Edits apply live for the same reason
     // the time buttons do: this is the one screen that previews the run's light,
     // so the fog has to be tunable against what is actually on screen.
