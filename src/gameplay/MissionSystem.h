@@ -19,12 +19,27 @@ inline const char* GrenadeTypeName(GrenadeType type) {
     }
 }
 
+// Equipment carried in the gear slot, separate from the two weapon slots and
+// the grenade. None is a real choice rather than an empty default: the slot
+// exists to be deliberately left open as often as it is filled.
+enum class GearType : uint8_t { None = 0, NightVisionGoggles = 1 };
+
+inline const char* GearTypeName(GearType gear) {
+    switch (gear) {
+    case GearType::NightVisionGoggles: return "NVG";
+    default: return "None";
+    }
+}
+
 struct MissionLoadout {
     static constexpr int kWeaponCount = 8;
     static constexpr size_t kWeaponSlotCount = 2;
 
     std::array<int, kWeaponSlotCount> weapons{{ 0, 1 }};
     GrenadeType grenade = GrenadeType::Frag;
+    // Empty by default: the slot is an opt-in, and NVG is only worth a pick on
+    // the dark times of day.
+    GearType gear = GearType::None;
     LevelInsertionMode insertion = LevelInsertionMode::Helicopter;
 
     bool Valid() const {

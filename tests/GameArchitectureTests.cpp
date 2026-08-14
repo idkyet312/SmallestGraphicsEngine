@@ -528,6 +528,16 @@ int main() {
     CHECK(VehicleSystem::AATurretGroundMinRange <
           VehicleSystem::AATurretGroundRange);
 
+    // The gun only engages the player once they are clear of the ground, and
+    // the bar for that has to sit above a jump. A jump peaks at
+    // JumpStrength^2 / (2 * Gravity) = 5.0^2 / 19.6 = 1.28 m with the camera's
+    // shipping constants; if the threshold ever slips under that, hopping past
+    // the emplacement would draw AA fire.
+    constexpr float kJumpApex = (5.0f * 5.0f) / (2.0f * 9.8f);
+    CHECK(VehicleSystem::AATurretMinTargetAltitude > kJumpApex);
+    // And it must stay low enough that a rope or a rooftop still counts.
+    CHECK(VehicleSystem::AATurretMinTargetAltitude < 10.0f);
+
     // Destroying it silences it: a dead gun never reports another shot.
     CHECK(!aa.DamageAATurret(VehicleSystem::AATurretMaxHealth * 0.5f).destroyed);
     CHECK(aa.DamageAATurret(VehicleSystem::AATurretMaxHealth).destroyed);

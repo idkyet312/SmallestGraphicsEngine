@@ -57,6 +57,7 @@
 #include "EnvironmentIBLDX12.h"
 #include "OcclusionDepthDX12.h"
 #include "FXAADX12.h"
+#include "NightVisionDX12.h"
 #include "VolumetricFogDX12.h"
 #include "LightShaftsDX12.h"
 #include "ScreenSpaceAODX12.h"
@@ -334,21 +335,62 @@ unsigned int                g_scatterEnemiesLastSeed = 0;
 // DEPLOY. Afternoon is the look every level shipped with before the choice
 // existed, so it stays the default.
 TimeOfDay                   g_selectedTimeOfDay = TimeOfDay::Afternoon;
-struct NightVolumetricFogSettings {
+// Player-tunable volumetric fog, kept per time of day. Each preset authors a
+// look that only holds together as a set (a night density over a noon sun reads
+// as smog), so an edit made under one sun must not follow the player to
+// another: every time of day carries its own override, seeded from that
+// preset's authored values and edited independently.
+struct VolumetricFogSettings {
+    bool enabled;
     float density;
     float anisotropy;
+    float heightFalloff;
+    float baseHeight;
     float distance;
     XMFLOAT3 tint;
 };
 
-static NightVolumetricFogSettings MakeDefaultNightVolumetricFogSettings() {
-    const TimeOfDaySettings night = MakeTimeOfDaySettings(TimeOfDay::Night);
-    return {night.volumetricFogDensity, night.volumetricFogAnisotropy,
-            night.volumetricFogDistance, night.volumetricFogTint};
+static VolumetricFogSettings MakeDefaultVolumetricFogSettings(TimeOfDay time) {
+    const TimeOfDaySettings preset = MakeTimeOfDaySettings(time);
+    return {preset.enableVolumetricFog,
+            preset.volumetricFogDensity,
+            preset.volumetricFogAnisotropy,
+            preset.volumetricFogHeightFalloff,
+            preset.volumetricFogBaseHeight,
+            preset.volumetricFogDistance,
+            preset.volumetricFogTint};
 }
 
-NightVolumetricFogSettings g_nightVolumetricFog =
-    MakeDefaultNightVolumetricFogSettings();
+constexpr int kTimeOfDayCount = 4;
+
+// Indexed by TimeOfDay. Written by the deployment-screen sliders and read back
+// by ApplyTimeOfDay, so a tuned look survives switching away and back.
+VolumetricFogSettings g_volumetricFogByTime[kTimeOfDayCount] = {
+    MakeDefaultVolumetricFogSettings(TimeOfDay::Noon),
+    MakeDefaultVolumetricFogSettings(TimeOfDay::Afternoon),
+    MakeDefaultVolumetricFogSettings(TimeOfDay::Dusk),
+    MakeDefaultVolumetricFogSettings(TimeOfDay::Night),
+};
+
+static VolumetricFogSettings& VolumetricFogFor(TimeOfDay time) {
+    const int index = static_cast<int>(time);
+    return g_volumetricFogByTime[
+        (index >= 0 && index < kTimeOfDayCount) ? index
+                                                : static_cast<int>(TimeOfDay::Afternoon)];
+}
+
+// Pushes one time's fog override onto the live scene. Used both by
+// ApplyTimeOfDay and by the deployment sliders, which edit the currently
+// selected time and expect the change to show immediately.
+static void ApplyVolumetricFogSettings(const VolumetricFogSettings& fog) {
+    scene.enableVolumetricFog = fog.enabled;
+    scene.volumetricFogDensity = fog.density;
+    scene.volumetricFogAnisotropy = fog.anisotropy;
+    scene.volumetricFogHeightFalloff = fog.heightFalloff;
+    scene.volumetricFogBaseHeight = fog.baseHeight;
+    scene.volumetricFogDistance = fog.distance;
+    scene.volumetricFogTint = fog.tint;
+}
 // Draws every live bandit as a red dot on the deployment map. On by default:
 // the point of randomising the squad is being able to see what you rolled
 // before committing to a zone.
@@ -2230,12 +2272,6 @@ static bool SpawnDropshipBandit(const XMFLOAT3& position);
 // gives a midnight sun over a blue afternoon sky.
 static void ApplyTimeOfDay(TimeOfDay time) {
     TimeOfDaySettings settings = MakeTimeOfDaySettings(time);
-    if (time == TimeOfDay::Night) {
-        settings.volumetricFogDensity = g_nightVolumetricFog.density;
-        settings.volumetricFogAnisotropy = g_nightVolumetricFog.anisotropy;
-        settings.volumetricFogDistance = g_nightVolumetricFog.distance;
-        settings.volumetricFogTint = g_nightVolumetricFog.tint;
-    }
     scene.lightPos = settings.lightPos;
     scene.lightColor = settings.lightColor;
     scene.directionalLightIntensity = settings.directionalLightIntensity;
@@ -2245,10 +2281,9 @@ static void ApplyTimeOfDay(TimeOfDay time) {
     scene.atmosphereRayleighStrength = settings.atmosphereRayleighStrength;
     scene.atmosphereMieStrength = settings.atmosphereMieStrength;
     scene.atmosphereAerialDensity = settings.atmosphereAerialDensity;
-    scene.volumetricFogDensity = settings.volumetricFogDensity;
-    scene.volumetricFogAnisotropy = settings.volumetricFogAnisotropy;
-    scene.volumetricFogDistance = settings.volumetricFogDistance;
-    scene.volumetricFogTint = settings.volumetricFogTint;
+    // Fog comes from the per-time override rather than the preset, so values
+    // tuned on the deployment screen survive DEPLOY and any later re-apply.
+    ApplyVolumetricFogSettings(VolumetricFogFor(time));
     // The demo light animation walks lightPos around on its own, which would
     // drag a chosen sun back out of place within a few seconds.
     scene.animateDemoLights = false;
@@ -4315,6 +4350,12 @@ static OcclusionDepthDX12   occlusionDepth;
 static XMMATRIX             previousHZBViewProjection = XMMatrixIdentity();
 static bool                 hzbCaptureActive = false;
 static FXAADX12             fxaa;
+static NightVisionDX12      nightVision;
+// Goggles up/down, toggled with J when NVG is in the gear slot. Ramped rather
+// than switched: raising goggles is a hand movement, and an instant cut to full
+// green reads as a filter being applied rather than equipment being used.
+static bool                 g_nightVisionActive = false;
+static float                g_nightVisionBlend = 0.0f;
 static VolumetricFogDX12    volumetricFog;
 static LightShaftsDX12      lightShafts;
 static ScreenSpaceAODX12    screenSpaceAO;
@@ -7254,8 +7295,8 @@ static void PlaceAATurretNearCommTower() {
 
 // Picks what the AA gun shoots at and feeds the mount. Aircraft first -- it is
 // an anti-air gun, and the inbound BlackHawk is the threat it exists to answer
-// -- then the player on foot at shorter range, so a cleared sky does not leave
-// the emplacement inert while the player walks up to it.
+// -- then the player, but only while they are airborne. A player on foot is not
+// a target: walking up to the emplacement is how it is meant to be silenced.
 // Points the drawn gun where the logical turret is aiming. Separate from the
 // firing update because the mount must keep tracking visually even on frames it
 // does not shoot, and a dead gun must stop dead rather than snap back to zero.
@@ -7310,18 +7351,44 @@ static void UpdateAATurret(float deltaTime) {
         }
     }
 
-    // Otherwise the player, but only once they are close enough that a fixed
-    // emplacement could plausibly depress onto them.
+    // Otherwise the player, but only while they are airborne: this is an
+    // anti-air gun, and its barrels do not depress onto a man on foot. Walking
+    // up to the emplacement is the way it is meant to be taken out, so a player
+    // on the ground is deliberately safe from it.
+    //
+    // "Airborne" is not simply !IsGrounded. A jump leaves the ground for a
+    // fraction of a second, and letting that draw AA fire would mean the gun
+    // engages a player who is sprinting past it on foot. What counts is being
+    // carried or roped by the BlackHawk, or standing clear of the terrain by
+    // more than a jump's height -- a cliff, a rooftop, a fall.
     if (!hasTarget && scene.player.health > 0.0f && !g_insertionChoicePending) {
         const XMFLOAT3& p = scene.camera.Position;
+        // Camera sits PlayerHeight above whatever it stands on, so that has to
+        // come off before the remainder reads as clearance above the terrain.
+        const float altitude = p.y - scene.camera.PlayerHeight -
+                               GroundHeightAt(p.x, p.z);
+        const bool playerAirborne =
+            vehicles.blackHawkCarryingPlayer ||
+            vehicles.BlackHawkIsRappelling() ||
+            (!scene.camera.IsGrounded &&
+             altitude >= VehicleSystem::AATurretMinTargetAltitude);
+        // Engaged out to the same 85 m it always used against the player. The
+        // gun reaches much further against aircraft, but a player -- airborne
+        // or not -- is a small target, and the shorter range keeps the
+        // emplacement a local threat rather than one that covers the map.
         const float d2 = rangeSq(p);
-        if (d2 <= VehicleSystem::AATurretGroundRange *
+        if (playerAirborne &&
+            d2 <= VehicleSystem::AATurretGroundRange *
                   VehicleSystem::AATurretGroundRange &&
             d2 >= VehicleSystem::AATurretGroundMinRange *
                   VehicleSystem::AATurretGroundMinRange) {
             target = p;
-            velocity = { 0.0f, 0.0f, 0.0f };
+            // Lead the fall/ride rather than the last position: a player under
+            // canopy or on a rope is moving, and a gun that aims where they
+            // were would never connect.
+            velocity = { 0.0f, scene.camera.VerticalVelocity, 0.0f };
             hasTarget = true;
+            targetIsAircraft = true;
         }
     }
 
@@ -8419,6 +8486,21 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         loadout.grenade = static_cast<GrenadeType>(grenade);
         scene.selectedGrenade = loadout.grenade;
     }
+    // Gear slot: carried equipment that costs neither a weapon slot nor the
+    // grenade pick. Empty is a valid choice, so None is the first entry rather
+    // than a placeholder.
+    int gear = static_cast<int>(loadout.gear);
+    static constexpr const char* gearNames[] = {
+        "None", "NVG (Night Vision Goggles)"
+    };
+    if (ImGui::Combo("Gear", &gear, gearNames,
+                     static_cast<int>(std::size(gearNames))))
+        loadout.gear = static_cast<GearType>(gear);
+    if (loadout.gear == GearType::NightVisionGoggles) {
+        ImGui::TextDisabled("Press J in the field to raise or lower goggles.");
+        if (!TimeOfDayIsDark(g_selectedTimeOfDay))
+            ImGui::TextDisabled("Little use at this time of day.");
+    }
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
     ImGui::SeparatorText("DIFFICULTY");
     // Per-run choice rather than a launcher-level mode. Applied straight to the
@@ -8476,37 +8558,50 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     if (TimeOfDayIsDark(g_selectedTimeOfDay))
         ImGui::TextDisabled(
             "Enemies see no better in the dark than they do at noon.");
-    if (g_selectedTimeOfDay == TimeOfDay::Night) {
-        ImGui::SeparatorText("NIGHT VOLUMETRIC FOG");
-        bool fogChanged = false;
-        ImGui::SetNextItemWidth(-1.0f);
-        fogChanged |= ImGui::DragFloat(
-            "Density##NightFog", &g_nightVolumetricFog.density,
-            0.0001f, 0.0001f, 0.05f, "%.4f");
-        ImGui::SetNextItemWidth(-1.0f);
-        fogChanged |= ImGui::SliderFloat(
-            "Anisotropy##NightFog", &g_nightVolumetricFog.anisotropy,
-            0.0f, 0.9f, "%.2f");
-        ImGui::SetNextItemWidth(-1.0f);
-        fogChanged |= ImGui::DragFloat(
-            "Distance##NightFog", &g_nightVolumetricFog.distance,
-            5.0f, 20.0f, scene.cameraFar, "%.0f m");
-        fogChanged |= ImGui::ColorEdit3(
-            "Tint##NightFog", &g_nightVolumetricFog.tint.x);
+    // Volumetric fog for the selected time. Edits apply live for the same reason
+    // the time buttons do: this is the one screen that previews the run's light,
+    // so the fog has to be tunable against what is actually on screen.
+    {
+        char fogHeader[64];
+        std::snprintf(fogHeader, sizeof(fogHeader), "VOLUMETRIC FOG (%s)",
+                      TimeOfDayName(g_selectedTimeOfDay));
+        ImGui::SeparatorText(fogHeader);
 
-        if (fogChanged) {
-            scene.volumetricFogDensity = g_nightVolumetricFog.density;
-            scene.volumetricFogAnisotropy = g_nightVolumetricFog.anisotropy;
-            scene.volumetricFogDistance = g_nightVolumetricFog.distance;
-            scene.volumetricFogTint = g_nightVolumetricFog.tint;
+        VolumetricFogSettings& fog = VolumetricFogFor(g_selectedTimeOfDay);
+        bool fogChanged =
+            ImGui::Checkbox("Enable Volumetric Fog##TodFog", &fog.enabled);
+        if (fog.enabled) {
+            ImGui::SetNextItemWidth(-1.0f);
+            fogChanged |= ImGui::DragFloat(
+                "Density##TodFog", &fog.density,
+                0.0001f, 0.0001f, 0.05f, "%.4f");
+            ImGui::SetNextItemWidth(-1.0f);
+            fogChanged |= ImGui::SliderFloat(
+                "Anisotropy##TodFog", &fog.anisotropy,
+                0.0f, 0.9f, "%.2f");
+            ImGui::SetNextItemWidth(-1.0f);
+            fogChanged |= ImGui::SliderFloat(
+                "Height Falloff##TodFog", &fog.heightFalloff,
+                0.01f, 0.25f, "%.3f");
+            ImGui::SetNextItemWidth(-1.0f);
+            fogChanged |= ImGui::DragFloat(
+                "Base Height##TodFog", &fog.baseHeight,
+                0.1f, -5.0f, 30.0f, "%.1f m");
+            ImGui::SetNextItemWidth(-1.0f);
+            fogChanged |= ImGui::DragFloat(
+                "Distance##TodFog", &fog.distance,
+                5.0f, 20.0f, scene.cameraFar, "%.0f m");
+            fogChanged |= ImGui::ColorEdit3("Tint##TodFog", &fog.tint.x);
         }
-        if (ImGui::Button("Reset night fog")) {
-            g_nightVolumetricFog = MakeDefaultNightVolumetricFogSettings();
-            scene.volumetricFogDensity = g_nightVolumetricFog.density;
-            scene.volumetricFogAnisotropy = g_nightVolumetricFog.anisotropy;
-            scene.volumetricFogDistance = g_nightVolumetricFog.distance;
-            scene.volumetricFogTint = g_nightVolumetricFog.tint;
+
+        char fogReset[64];
+        std::snprintf(fogReset, sizeof(fogReset), "Reset %s fog",
+                      TimeOfDayName(g_selectedTimeOfDay));
+        if (ImGui::Button(fogReset)) {
+            fog = MakeDefaultVolumetricFogSettings(g_selectedTimeOfDay);
+            fogChanged = true;
         }
+        if (fogChanged) ApplyVolumetricFogSettings(fog);
     }
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
     ImGui::SeparatorText("INSERTION");
@@ -8671,7 +8766,8 @@ static void RenderWinScreen(HWND hwnd) {
     ImGui::SeparatorText("DEPLOYMENT");
     ImGui::Text("%s + %s", GunModel::WeaponName(loadout.weapons[0]),
                 GunModel::WeaponName(loadout.weapons[1]));
-    ImGui::TextDisabled("%s | %s", GrenadeTypeName(loadout.grenade),
+    ImGui::TextDisabled("%s | %s | %s", GrenadeTypeName(loadout.grenade),
+                        GearTypeName(loadout.gear),
                         LevelInsertionModeName(loadout.insertion));
 
     const int totalMilliseconds = static_cast<int>(
@@ -11186,6 +11282,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ResizeDX12(SCR_WIDTH, SCR_HEIGHT);
                 if (occlusionDepth.initialized) occlusionDepth.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (fxaa.initialized) fxaa.Resize(SCR_WIDTH, SCR_HEIGHT);
+                if (nightVision.initialized)
+                    nightVision.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (msaa.initialized) msaa.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (visBuffer.initialized) visBuffer.Resize(SCR_WIDTH, SCR_HEIGHT);
                 if (grassMSAA.initialized) grassMSAA.Resize(SCR_WIDTH, SCR_HEIGHT);
@@ -11339,6 +11437,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         else if (wParam == 'N' && !(lParam & 0x40000000)) {
             g_showEnemyVisionCones = !g_showEnemyVisionCones;
+        }
+        // J raises and lowers the goggles, but only when they were actually
+        // brought on the mission: the gear slot is the whole point of the
+        // choice, so night vision cannot be conjured mid-run without it.
+        else if (wParam == 'J' && !(lParam & 0x40000000)) {
+            if (g_game.mission.Loadout().gear == GearType::NightVisionGoggles)
+                g_nightVisionActive = !g_nightVisionActive;
         }
         // F5: flip every RT effect at once. Shares ToggleAllRTEffects with the
         // "All RT Effects" checkbox, so the two agree on the saved
@@ -11836,6 +11941,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         std::cerr << "FXAA init failed (non-fatal)\n";
         scene.enableFXAA = false;
     }
+    BootStep("Initializing night vision...");
+    if (!nightVision.Init(SCR_WIDTH, SCR_HEIGHT))
+        std::cerr << "Night vision init failed (non-fatal)\n";
     BootStep("Initializing volumetric fog...");
     BootStep("Initializing light shafts...");
     if (!lightShafts.Init())
@@ -15044,6 +15152,41 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             !bentGTAODiagnosticActive) {
             ProfilerDX12::Scope profile(g_profiler, "FXAA", g_dx12.commandList.Get());
             fxaa.Apply(g_dx12.commandList.Get());
+        }
+
+        // Night vision, after FXAA so the goggles intensify the finished image
+        // and before ImGui so the HUD stays legible through them.
+        //
+        // The ramp is driven here rather than in ProcessInput because that
+        // function returns early while the UI has the keyboard or the camera is
+        // locked -- the goggles would freeze half-raised on any frame the menu
+        // was open. Dropping is quicker than raising: pulling goggles off the
+        // eye is a faster motion than settling them onto it.
+        {
+            const bool nvgEquipped =
+                g_game.mission.Loadout().gear == GearType::NightVisionGoggles;
+            // Losing the goggles (death, or a loadout without them) stows them
+            // rather than leaving the screen green.
+            if (!nvgEquipped || scene.player.health <= 0.0f)
+                g_nightVisionActive = false;
+            const float rampRate = g_nightVisionActive ? 4.0f : 7.0f;
+            const float target = g_nightVisionActive ? 1.0f : 0.0f;
+            g_nightVisionBlend +=
+                std::clamp(target - g_nightVisionBlend,
+                           -rampRate * deltaTime, rampRate * deltaTime);
+            g_nightVisionBlend = std::clamp(g_nightVisionBlend, 0.0f, 1.0f);
+
+            if (g_nightVisionBlend > 0.001f && nightVision.initialized &&
+                !visibilityValidation && !bentGTAODiagnosticActive) {
+                ProfilerDX12::Scope profile(
+                    g_profiler, "Night Vision", g_dx12.commandList.Get());
+                // Wrapped: the shader feeds this to sin(), which loses its
+                // grain-scrambling precision once the value grows large.
+                const float noiseTime =
+                    std::fmod(gameTimer.GetElapsed(), 1000.0f);
+                nightVision.Apply(g_dx12.commandList.Get(), noiseTime,
+                                  g_nightVisionBlend);
+            }
         }
 
         // Ensure ImGui renders to the swapchain backbuffer (VB path changes OM target)

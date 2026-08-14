@@ -22,21 +22,39 @@ struct VehicleSystem {
     static constexpr float BoatMaxHealth = 1200.0f;
 
     // ---- Anti-air emplacement ------------------------------------------------
-    // A fixed twin-barrel AA gun. It leads and engages aircraft (the insertion
-    // BlackHawk above all) and, at closer range, the player on foot.
+    // A fixed twin-barrel AA gun. It leads and engages anything in the air --
+    // the insertion BlackHawk above all, and the player too while they are
+    // roped, carried or otherwise clear of the ground.
+    //
+    // It does not engage a player on foot. The barrels do not depress that far,
+    // and it makes the emplacement something you approach on the ground and
+    // destroy, rather than something that shoots you all the way in.
     //
     // Tuned to threaten rather than delete: the whole point is that an insertion
     // flown straight over the gun goes badly, and that the player has a reason
     // to deal with the emplacement before calling anything in.
     static constexpr float AATurretMaxHealth = 900.0f;
     static constexpr float AATurretAirRange = 190.0f;    // vs aircraft
-    static constexpr float AATurretGroundRange = 85.0f;  // vs the player
+    // Reach against the player, who is only ever engaged while airborne. Much
+    // shorter than the range used against aircraft: a man on a rope is a small
+    // target, and holding this in keeps the emplacement a threat you walk into
+    // rather than one that covers the whole map.
+    static constexpr float AATurretGroundRange = 85.0f;
     // Dead zone against ground targets. A fixed AA mount cannot depress onto
     // something at the foot of its own pedestal, and the perimeter deployment
     // ring can put a player as close as ~7 m to the gun -- without this, picking
     // that zone means being shot before the run is playable. Aircraft are
     // exempt: nothing flies inside this radius without having already hit it.
     static constexpr float AATurretGroundMinRange = 18.0f;
+    // How far clear of the terrain the player must be before the gun will
+    // engage them. The barrels do not depress onto men on foot, so anything at
+    // walking height is not a target at all.
+    //
+    // 2.5 m rather than "off the ground": a jump peaks at JumpStrength^2 / 2g
+    // = 5.0^2 / 19.6 = 1.28 m, so a threshold below that would let hopping past
+    // the emplacement call down a burst. This clears the apex with margin while
+    // still catching a rope, a rooftop or a fall.
+    static constexpr float AATurretMinTargetAltitude = 2.5f;
     static constexpr float AATurretBurstShots = 4.0f;    // rounds per burst
     static constexpr float AATurretShotInterval = 0.11f; // within a burst
     static constexpr float AATurretBurstPause = 1.45f;   // between bursts

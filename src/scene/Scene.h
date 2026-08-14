@@ -408,8 +408,12 @@ struct Scene {
     // default so the established single-frame path remains the baseline.
     bool  temporalBentNormalGTAO = false;
     // The independently resolved 4x grass depth can drive GTAO/contact so grass
-    // receives and casts the screen-space effect. Off by default for visual A/B.
-    bool  grassInScreenSpaceAO = false;
+    // receives and casts the screen-space effect. On by default: grass that is
+    // absent from the AO depth neither occludes nor is occluded, so blades sit
+    // on the ground without contact darkening. Falls back automatically when
+    // 4x MSAA grass or the visibility buffer is unavailable (see the guards at
+    // the GTAO dispatch), so enabling it here cannot break the other renderers.
+    bool  grassInScreenSpaceAO = true;
     bool  enableScreenSpaceReflections = true;
     float screenSpaceReflectionStrength = 0.35f;
     float screenSpaceReflectionDistance = 55.0f;

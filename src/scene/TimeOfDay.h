@@ -63,8 +63,11 @@ struct TimeOfDaySettings {
     float atmosphereRayleighStrength = 0.92f;
     float atmosphereMieStrength = 0.58f;
     float atmosphereAerialDensity = 0.72f;
+    bool  enableVolumetricFog = true;
     float volumetricFogDensity = 0.009f;
     float volumetricFogAnisotropy = 0.82f;
+    float volumetricFogHeightFalloff = 0.045f;
+    float volumetricFogBaseHeight = 0.4f;
     float volumetricFogDistance = 800.0f;
     DirectX::XMFLOAT3 volumetricFogTint{
         168.0f / 255.0f, 181.0f / 255.0f, 176.0f / 255.0f
@@ -137,6 +140,8 @@ inline TimeOfDaySettings MakeTimeOfDaySettings(TimeOfDay time) {
         // reach, phase and tint restores natural fog without relighting it.
         settings.volumetricFogDensity = 0.009f;
         settings.volumetricFogAnisotropy = 0.82f;
+        settings.volumetricFogHeightFalloff = 0.045f;
+        settings.volumetricFogBaseHeight = 0.4f;
         settings.volumetricFogDistance = 800.0f;
         settings.volumetricFogTint = {
             168.0f / 255.0f, 181.0f / 255.0f, 176.0f / 255.0f
