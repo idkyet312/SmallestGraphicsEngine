@@ -1215,13 +1215,18 @@ void Usage() {
 
 int main(int argc, char** argv) {
     try {
-        if (argc == 3 && std::string(argv[1]) != "--all")
+        // Braces matter here: without them the Cook call below binds to the
+        // inner if rather than the outer one, so it runs for every argument
+        // count and swallows "--all" as an input filename. That made the
+        // batch mode unreachable -- it failed with "Unable to open --all".
+        if (argc == 3 && std::string(argv[1]) != "--all") {
             if (IsCookExcluded(fs::path(argv[1]))) {
                 std::cerr << "Refusing to cook excluded source: " << argv[1]
                           << " (see IsCookExcluded)\n";
                 return 1;
             }
             return Cook(fs::path(argv[1]), fs::path(argv[2])) ? 0 : 1;
+        }
         if (argc == 5 && std::string(argv[1]) == "--all" &&
             std::string(argv[3]) == "--out") {
             const fs::path root = fs::absolute(argv[2]).lexically_normal();

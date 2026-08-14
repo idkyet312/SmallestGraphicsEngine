@@ -112,6 +112,57 @@ foreach ($sub in (Get-ChildItem $contentSrc -Directory)) {
     Copy-Item $sub.FullName (Join-Path $contentDst $sub.Name) -Recurse -Force
 }
 
+# -- Prune unreferenced source art from the staged copy ------------------------
+# Content/Models accumulated directories that nothing loads: earlier versions of
+# meshes that were replaced, and imports that were tried and abandoned. They are
+# kept in the repo -- deleting source art is the author's call, not the
+# packager's -- but there is no reason to ship them.
+#
+# The keep list is every Models/ directory referenced from the engine or from
+# level/prefab data, gathered by grepping for Content/Models paths rather than
+# by inspection. The remainder was checked against src, Content/Levels, levels,
+# prefabs and Content/Prefabs and appears in none of them.
+#
+# assetcache/registry.json still carries entries for some pruned directories.
+# That is harmless: registry lookups resolve a GUID to a path inside catch(...)
+# and return empty on a miss, so a stale entry is never loaded.
+#
+# Anything not on this list is deleted from the PACKAGE ONLY. If a mesh turns
+# out to be needed, add its directory here -- do not assume the list is complete
+# for a level set this script has not seen.
+$keepModelDirs = @(
+    'Barrel Explosive', 'BlackHawk', 'CommunicationTower',
+    'Corrugated metal pack', 'HarpoonGun', 'HarpoonSpear', 'house_pbr',
+    'Humvee', 'Imported', 'MainPlayer', 'MarineAlly', 'MetalRoof',
+    'MilitaryMercenaryBandit', 'MiltaryBoat', 'OH-1_fbx', 'palmtree',
+    'polyhaven', 'Rock1', 'RPG7', 'shotgun_fbx', 'Skyboxes', 'SVD_v1.3',
+    'ak47', 'fbx_Dandelion', 'grass', 'textures'
+)
+$stagedModels = Join-Path $contentDst 'Models'
+if (Test-Path $stagedModels) {
+    $freed = 0
+    foreach ($dir in (Get-ChildItem $stagedModels -Directory)) {
+        if ($keepModelDirs -contains $dir.Name) { continue }
+        $bytes = (Get-ChildItem $dir.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                  Measure-Object Length -Sum).Sum
+        $freed += $bytes
+        Write-Host ("  pruned Models/{0} ({1:N0} MB)" -f $dir.Name, ($bytes / 1MB)) -ForegroundColor DarkYellow
+        Remove-Item $dir.FullName -Recurse -Force
+    }
+    # Loose files sitting directly under Models/ get the same treatment. Only
+    # h2.glb, gun.glb and gun.obj are referenced from main.cpp; the rest
+    # (crate, h1, level, ship, test and a stray displacement map) are scratch
+    # imports totalling ~260 MB that nothing opens.
+    $keepModelFiles = @('h2.glb', 'gun.glb', 'gun.obj')
+    foreach ($file in (Get-ChildItem $stagedModels -File)) {
+        if ($keepModelFiles -contains $file.Name) { continue }
+        $freed += $file.Length
+        Write-Host ("  pruned Models/{0} ({1:N0} MB)" -f $file.Name, ($file.Length / 1MB)) -ForegroundColor DarkYellow
+        Remove-Item $file.FullName -Force
+    }
+    Write-Host ("  pruning freed {0:N2} GB" -f ($freed / 1GB)) -ForegroundColor Green
+}
+
 # -- Launcher and readme ------------------------------------------------------
 # A .bat rather than asking the user to run the exe directly: it pins the
 # working directory to the package root, which is what every relative asset
