@@ -119,9 +119,19 @@ foreach ($sub in (Get-ChildItem $contentSrc -Directory)) {
 # packager's -- but there is no reason to ship them.
 #
 # The keep list is every Models/ directory referenced from the engine or from
-# level/prefab data, gathered by grepping for Content/Models paths rather than
-# by inspection. The remainder was checked against src, Content/Levels, levels,
-# prefabs and Content/Prefabs and appears in none of them.
+# level/prefab data. Two forms of reference have to be searched, and missing
+# the second is what broke terrain the first time this ran:
+#
+#   1. Full paths, "Content/Models/<dir>/...", which most call sites use.
+#   2. Bare relative folders that are joined to kModelRoot at the call site.
+#      TerrainRendererDX12 names its splat layers as "terrain/dark_rock" and
+#      "Grass3/Grass004_2K-JPG" with no Content/Models prefix, so a search for
+#      the full path finds nothing and both directories look unused. Pruning
+#      them left the terrain untextured.
+#
+# Before adding to the pruned set, grep for the bare directory name as well as
+# the full path. The remainder here was checked both ways against src, shaders,
+# Content/Levels, levels, prefabs and Content/Prefabs and appears in none.
 #
 # assetcache/registry.json still carries entries for some pruned directories.
 # That is harmless: registry lookups resolve a GUID to a path inside catch(...)
@@ -136,7 +146,11 @@ $keepModelDirs = @(
     'Humvee', 'Imported', 'MainPlayer', 'MarineAlly', 'MetalRoof',
     'MilitaryMercenaryBandit', 'MiltaryBoat', 'OH-1_fbx', 'palmtree',
     'polyhaven', 'Rock1', 'RPG7', 'shotgun_fbx', 'Skyboxes', 'SVD_v1.3',
-    'ak47', 'fbx_Dandelion', 'grass', 'textures'
+    'ak47', 'fbx_Dandelion', 'grass', 'textures',
+    # Terrain splat layers, referenced bare rather than by full path -- see the
+    # note above. Grass3 is the terrain's grass layer and is distinct from the
+    # 'grass' directory used by the grass field.
+    'terrain', 'Grass3'
 )
 $stagedModels = Join-Path $contentDst 'Models'
 if (Test-Path $stagedModels) {
