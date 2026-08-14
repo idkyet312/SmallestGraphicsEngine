@@ -72,6 +72,7 @@
 #include "GunAudio.h"
 #include "WaterVolume.h"
 #include "WaterRendererDX12.h"
+#include "RainRendererDX12.h"
 #include "PalmTrees.h"
 #include "LevelDefinition.h"
 #include "LevelEditor.h"
@@ -103,6 +104,7 @@ static unsigned int SCR_HEIGHT = 1080;
 static Scene               scene;
 static ShaderDX12           mainShader;
 ImpactParticleRendererDX12  g_particleRenderer;
+RainRendererDX12            g_rainRenderer;
 ProfilerDX12                g_profiler;
 static bool                 g_profileDumpEnabled = false;
 static bool                 g_profileDumpWritten = false;
@@ -11893,6 +11895,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     std::cout << "Shaders loaded\n";
     if (!g_particleRenderer.Init())
         std::cerr << "GPU particle renderer unavailable; using draw fallback\n";
+    if (!g_rainRenderer.Init())
+        std::cerr << "Rain renderer unavailable (non-fatal)\n";
 
     BootStep("Initializing mesh shader pipeline...");
     g_useMeshShader = g_meshShader.Init(mainShader);
@@ -15129,6 +15133,50 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 usingVisibility ? visBuffer.GetMotionRTV()
                                 : D3D12_CPU_DESCRIPTOR_HANDLE{},
                 waterDepthState);
+        }
+
+        // Rain. After the opaque scene and the water so it depth-tests against
+        // both, and before the fog so the fog tints it like anything else out
+        // there -- rain drawn after the fog would hang in front of a fogged
+        // hillside instead of receding into it.
+        if (renderedScene && !bentGTAODiagnosticActive &&
+            scene.rainIntensity > 0.001f && g_rainRenderer.initialized) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "Rain", g_dx12.commandList.Get());
+            const bool hdrTarget = commonHDRValidationTarget;
+            const bool rainMSAA = !hdrTarget && msaaActive;
+            // Bind colour + depth explicitly. The water pass above leaves a
+            // target bound with no depth buffer, and rain has to test against
+            // the scene or it falls through walls and terrain.
+            //
+            // On the visibility path this must go through EndMotionDraws
+            // rather than a hand-rolled OMSetRenderTargets. When extension
+            // motion vectors are on, two RTVs are bound, and D3D12 silently
+            // drops any draw whose PSO render-target count disagrees with the
+            // binding -- a single-RT pass like this one produces no pixels and
+            // no error. EndMotionDraws is the engine's own "restore colour
+            // only" and is a no-op when the toggle is off.
+            if (rainMSAA) {
+                msaa.Bind();
+            } else if (hdrTarget) {
+                visBuffer.EndMotionDraws(g_dx12.commandList.Get());
+                g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
+                g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+            } else {
+                D3D12_CPU_DESCRIPTOR_HANDLE rainRTV = GetCPUDescriptorHandle(
+                    g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize,
+                    g_dx12.frameIndex);
+                D3D12_CPU_DESCRIPTOR_HANDLE rainDSV =
+                    g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+                g_dx12.commandList->OMSetRenderTargets(
+                    1, &rainRTV, FALSE, &rainDSV);
+                g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
+                g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+            }
+            g_rainRenderer.Render(
+                scene, gameTimer.GetElapsed(), scene.rainIntensity,
+                { scene.windVelocity.x, 0.0f, scene.windVelocity.y },
+                hdrTarget, rainMSAA, g_dx12.frameIndex);
         }
 
         const bool visibilityValidation = visibilityParityValidation;

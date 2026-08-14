@@ -351,6 +351,17 @@ struct Scene {
     float atmosphereCloudDensity = 0.68f;
     float atmosphereCloudBaseHeight = 720.0f;
     float atmosphereCloudThickness = 1250.0f;
+    // -- Weather ---------------------------------------------------------
+    // Rainfall, 0 clear to 1 downpour. Drives the rain renderer's drop count
+    // and, through the deployment screen, the fog density that decides how far
+    // anything can see -- so weather is a gameplay setting, not only a visual
+    // one. Off by default: every level was authored dry.
+    float rainIntensity = 0.0f;
+    // Horizontal drift applied to falling drops, world units/sec. Rain is
+    // stretched along its travel direction, so this visibly slants the sheet
+    // rather than only sliding it sideways.
+    XMFLOAT2 windVelocity = { 1.6f, 0.7f };
+
     bool  enableVolumetricFog = true;
     // Doubles the froxel grid to 128x72x96. The default 64x36x48 gives one fog
     // sample per ~30x30 screen pixels at 1080p, which makes sun shafts through

@@ -1431,6 +1431,15 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::SliderFloat("Shaft Exposure", &scene.lightShaftExposure,
                                0.0f, 1.0f, "%.2f");
         }
+        ImGui::SliderFloat("Rain", &scene.rainIntensity, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Rainfall, 0 clear to 1 downpour. Scales the number of drops\n"
+                "rather than fading them, so light rain is sparse instead of\n"
+                "transparent. Costs nothing at 0.");
+        if (scene.rainIntensity > 0.0f)
+            ImGui::DragFloat2("Wind", &scene.windVelocity.x,
+                              0.05f, -8.0f, 8.0f, "%.2f m/s");
         ImGui::Checkbox("Volumetric Fog", &scene.enableVolumetricFog);
         if (scene.enableVolumetricFog) {
             if (scene.lightShaftMode == Scene::LightShaftMode::Volumetric) {
