@@ -27,18 +27,38 @@ public:
         text << file.rdbuf();
         const std::string source = text.str();
         const UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
-        ComPtr<ID3DBlob> cs, vs, ps, psMSAA, errors;
+        ComPtr<ID3DBlob> cs, cloudCS, vs, ps, cloudPS, psMSAA, cloudPSMSAA,
+            errors;
+        const D3D_SHADER_MACRO cloudDefines[] = {
+            { "SGE_WORLD_CLOUDS", "1" },
+            { nullptr, nullptr }
+        };
         if (!Compile(source, "CSMain", "cs_5_0", flags, cs, errors) ||
+            !Compile(source, "CSMain", "cs_5_0", flags, cloudCS, errors,
+                     cloudDefines) ||
             !Compile(source, "VSMain", "vs_5_0", flags, vs, errors) ||
             !Compile(source, "PSMain", "ps_5_0", flags, ps, errors) ||
-            !Compile(source, "PSMainMSAA", "ps_5_0", flags, psMSAA, errors))
+            !Compile(source, "PSMain", "ps_5_0", flags, cloudPS, errors,
+                     cloudDefines) ||
+            !Compile(source, "PSMainMSAA", "ps_5_0", flags, psMSAA, errors) ||
+            !Compile(source, "PSMainMSAA", "ps_5_0", flags, cloudPSMSAA,
+                     errors, cloudDefines))
             return false;
         if (!CreateRootSignature() ||
-            !CreatePipelines(cs.Get(), vs.Get(), ps.Get(), psMSAA.Get()) ||
+            !CreatePipelines(cs.Get(), cloudCS.Get(), vs.Get(), ps.Get(),
+                             cloudPS.Get(), psMSAA.Get(), cloudPSMSAA.Get()) ||
             !CreateHeapAndVolume() || !CreateUploadBuffers())
             return false;
         initialized = true;
         return true;
+    }
+
+    // CloudNoiseDX12 owns these immutable resources. This renderer only keeps
+    // SRV descriptors, installed after the boot fence has completed generation.
+    void SetCloudVolumes(ID3D12Resource* shape, ID3D12Resource* detail) {
+        cloudVolumesReady_ = shape && detail && descriptorHeap_;
+        CreateCloudVolumeSRV(shape, CpuHandle(5));
+        CreateCloudVolumeSRV(detail, CpuHandle(6));
     }
 
     void Render(const Scene& scene, const WaterVolume& ocean,
@@ -58,7 +78,8 @@ public:
 
         Transition(commandList, volume_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        commandList->SetPipelineState(computePipeline_.Get());
+        commandList->SetPipelineState(scene.enableFlyableClouds
+            ? cloudComputePipeline_.Get() : computePipeline_.Get());
         commandList->SetComputeRootSignature(rootSignature_.Get());
         BindComputeRoots(commandList);
         commandList->Dispatch((gridX_ + 7) / 8, (gridY_ + 7) / 8, 1);
@@ -80,10 +101,18 @@ public:
         commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
         commandList->RSSetViewports(1, &g_dx12.viewport);
         commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
-        commandList->SetPipelineState(hdrTarget
-            ? graphicsPipelineHDR_.Get()
-            : (multisampledDepth
-                ? graphicsPipelineMSAA_.Get() : graphicsPipeline_.Get()));
+        ID3D12PipelineState* compositePipeline = nullptr;
+        if (multisampledDepth)
+            compositePipeline = scene.enableFlyableClouds
+                ? cloudGraphicsPipelineMSAA_.Get()
+                : graphicsPipelineMSAA_.Get();
+        else if (hdrTarget)
+            compositePipeline = scene.enableFlyableClouds
+                ? cloudGraphicsPipelineHDR_.Get() : graphicsPipelineHDR_.Get();
+        else
+            compositePipeline = scene.enableFlyableClouds
+                ? cloudGraphicsPipeline_.Get() : graphicsPipeline_.Get();
+        commandList->SetPipelineState(compositePipeline);
         commandList->SetGraphicsRootSignature(rootSignature_.Get());
         BindGraphicsRoots(commandList);
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -150,16 +179,20 @@ private:
         XMFLOAT4 oceanBounds0;
         XMFLOAT4 oceanBounds1;
         XMUINT4 maxVolumeDims;
+        // base height, thickness, density, coverage. Density <= 0 disables the
+        // layer, so the branch costs nothing when the feature is off.
+        XMFLOAT4 flyableCloudParams;
     };
     static_assert(sizeof(FogConstants) <= ConstantsSize, "Fog constants exceed one CBV page");
 
     static UINT Align256(UINT size) { return (size + 255u) & ~255u; }
 
     bool Compile(const std::string& source, const char* entry, const char* target,
-                 UINT flags, ComPtr<ID3DBlob>& blob, ComPtr<ID3DBlob>& errors) {
+                 UINT flags, ComPtr<ID3DBlob>& blob, ComPtr<ID3DBlob>& errors,
+                 const D3D_SHADER_MACRO* defines = nullptr) {
         errors.Reset();
         HRESULT hr = ShaderCacheDX12::CompileCached(source.data(), source.size(), "volumetric_fog.hlsl",
-            nullptr, nullptr, entry, target, flags, 0, &blob, &errors);
+            defines, nullptr, entry, target, flags, 0, &blob, &errors);
         if (FAILED(hr)) {
             if (errors) std::cerr << static_cast<const char*>(errors->GetBufferPointer());
             return false;
@@ -168,26 +201,29 @@ private:
     }
 
     bool CreateRootSignature() {
-        D3D12_DESCRIPTOR_RANGE ranges[5] = {};
+        D3D12_DESCRIPTOR_RANGE ranges[6] = {};
         ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2, 0, 0 };
         ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
         ranges[2] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3, 0, 0 };
         ranges[3] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4, 0, 0 };
         ranges[4] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5, 0, 0 };
-        D3D12_ROOT_PARAMETER roots[8] = {};
+        // Append the immutable shape/detail pair. Existing root indices remain
+        // unchanged; both SRVs are one contiguous table at t6-t7.
+        ranges[5] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 6, 0, 0 };
+        D3D12_ROOT_PARAMETER roots[9] = {};
         roots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         roots[0].Descriptor.ShaderRegister = 0;
         roots[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         roots[1].Descriptor.ShaderRegister = 0;
         roots[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         roots[2].Descriptor.ShaderRegister = 1;
-        for (UINT i = 0; i < 5; ++i) {
+        for (UINT i = 0; i < 6; ++i) {
             roots[3 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
             roots[3 + i].DescriptorTable.NumDescriptorRanges = 1;
             roots[3 + i].DescriptorTable.pDescriptorRanges = &ranges[i];
         }
 
-        D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
+        D3D12_STATIC_SAMPLER_DESC samplers[3] = {};
         samplers[0].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
         samplers[0].AddressU = samplers[0].AddressV = samplers[0].AddressW =
             D3D12_TEXTURE_ADDRESS_MODE_BORDER;
@@ -200,6 +236,10 @@ private:
             D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         samplers[1].MaxLOD = D3D12_FLOAT32_MAX;
         samplers[1].ShaderRegister = 1;
+        samplers[2] = samplers[1];
+        samplers[2].AddressU = samplers[2].AddressV = samplers[2].AddressW =
+            D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samplers[2].ShaderRegister = 2;
 
         D3D12_ROOT_SIGNATURE_DESC desc = {};
         desc.NumParameters = _countof(roots);
@@ -217,13 +257,17 @@ private:
             IID_PPV_ARGS(&rootSignature_)));
     }
 
-    bool CreatePipelines(ID3DBlob* cs, ID3DBlob* vs, ID3DBlob* ps,
-                         ID3DBlob* psMSAA) {
+    bool CreatePipelines(ID3DBlob* cs, ID3DBlob* cloudCS, ID3DBlob* vs,
+                         ID3DBlob* ps, ID3DBlob* cloudPS,
+                         ID3DBlob* psMSAA, ID3DBlob* cloudPSMSAA) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC compute = {};
         compute.pRootSignature = rootSignature_.Get();
         compute.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
         if (FAILED(g_dx12.device->CreateComputePipelineState(
                 &compute, IID_PPV_ARGS(&computePipeline_)))) return false;
+        compute.CS = { cloudCS->GetBufferPointer(), cloudCS->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateComputePipelineState(
+                &compute, IID_PPV_ARGS(&cloudComputePipeline_)))) return false;
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics = {};
         graphics.pRootSignature = rootSignature_.Get();
@@ -251,19 +295,30 @@ private:
         graphics.SampleDesc.Count = 1;
         if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
                 &graphics, IID_PPV_ARGS(&graphicsPipeline_)))) return false;
+        graphics.PS = { cloudPS->GetBufferPointer(), cloudPS->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &graphics, IID_PPV_ARGS(&cloudGraphicsPipeline_)))) return false;
         graphics.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &graphics, IID_PPV_ARGS(&cloudGraphicsPipelineHDR_)))) return false;
+        graphics.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
         if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
                 &graphics, IID_PPV_ARGS(&graphicsPipelineHDR_)))) return false;
         graphics.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         graphics.PS = { psMSAA->GetBufferPointer(), psMSAA->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &graphics, IID_PPV_ARGS(&graphicsPipelineMSAA_)))) return false;
+        graphics.PS = {
+            cloudPSMSAA->GetBufferPointer(), cloudPSMSAA->GetBufferSize()
+        };
         return SUCCEEDED(g_dx12.device->CreateGraphicsPipelineState(
-            &graphics, IID_PPV_ARGS(&graphicsPipelineMSAA_)));
+            &graphics, IID_PPV_ARGS(&cloudGraphicsPipelineMSAA_)));
     }
 
     bool CreateHeapAndVolume() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 5;
+        heapDesc.NumDescriptors = 7;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_dx12.device->CreateDescriptorHeap(
                 &heapDesc, IID_PPV_ARGS(&descriptorHeap_)))) return false;
@@ -297,7 +352,19 @@ private:
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
         srv.Texture3D.MipLevels = 1;
         g_dx12.device->CreateShaderResourceView(volume_.Get(), &srv, CpuHandle(3));
+        CreateCloudVolumeSRV(nullptr, CpuHandle(5));
+        CreateCloudVolumeSRV(nullptr, CpuHandle(6));
         return true;
+    }
+
+    void CreateCloudVolumeSRV(ID3D12Resource* resource,
+                              D3D12_CPU_DESCRIPTOR_HANDLE target) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        srv.Texture3D.MipLevels = 1;
+        g_dx12.device->CreateShaderResourceView(resource, &srv, target);
     }
 
     bool CreateUploadBuffers() {
@@ -337,9 +404,11 @@ private:
         // Picked per frame so the toggle takes effect immediately. The volume is
         // allocated at the high-res size either way, so this only changes how
         // much of it the dispatch fills and the shader samples.
-        gridX_ = scene.volumetricFogHighRes ? MaxGridX : GridX;
-        gridY_ = scene.volumetricFogHighRes ? MaxGridY : GridY;
-        gridZ_ = scene.volumetricFogHighRes ? MaxGridZ : GridZ;
+        const bool highResolution = scene.volumetricFogHighRes ||
+            (scene.enableFlyableClouds && cloudVolumesReady_);
+        gridX_ = highResolution ? MaxGridX : GridX;
+        gridY_ = highResolution ? MaxGridY : GridY;
+        gridZ_ = highResolution ? MaxGridZ : GridZ;
         const XMMATRIX viewProjection = scene.GetViewMatrix() * scene.GetProjectionMatrix();
         FogConstants constants = {};
         XMStoreFloat4x4(&constants.inverseViewProjection,
@@ -354,8 +423,11 @@ private:
         XMVECTOR sun = XMVector3Normalize(XMLoadFloat3(&scene.lightPos));
         XMFLOAT3 sunDirection;
         XMStoreFloat3(&sunDirection, sun);
-        constants.sunDirectionDensity = { sunDirection.x, sunDirection.y, sunDirection.z,
-            scene.volumetricFogDensity };
+        constants.sunDirectionDensity = {
+            sunDirection.x, sunDirection.y, sunDirection.z,
+            scene.enableVolumetricFog
+                ? scene.volumetricFogDensity : 0.0f
+        };
         const XMFLOAT3 effectiveLightColor = scene.EffectiveLightColor();
         constants.sunColorAnisotropy = {
             effectiveLightColor.x, effectiveLightColor.y,
@@ -388,10 +460,18 @@ private:
             scene.atmosphereAerialDensity
         };
         constants.cloudParams = {
-            scene.atmosphereCloudCoverage,
+            scene.enableFlyableClouds ? 0.0f
+                                       : scene.atmosphereCloudCoverage,
             scene.atmosphereCloudDensity,
             scene.atmosphereCloudBaseHeight,
             scene.atmosphereCloudThickness
+        };
+        constants.flyableCloudParams = {
+            scene.flyableCloudBaseHeight,
+            scene.flyableCloudThickness,
+            scene.enableFlyableClouds && cloudVolumesReady_
+                ? scene.flyableCloudDensity : 0.0f,
+            scene.flyableCloudCoverage
         };
         const XMFLOAT3 oceanCenter = ocean.GetCenter();
         const XMFLOAT3 oceanExtents = ocean.GetExtents();
@@ -467,6 +547,7 @@ private:
             lightBuffer_->GetGPUVirtualAddress() + frame_ * lightFrameSize_);
         for (UINT i = 0; i < 5; ++i)
             list->SetComputeRootDescriptorTable(3 + i, GpuHandle(i));
+        list->SetComputeRootDescriptorTable(8, GpuHandle(5));
     }
     void BindGraphicsRoots(ID3D12GraphicsCommandList* list) {
         list->SetGraphicsRootConstantBufferView(0,
@@ -477,6 +558,7 @@ private:
             lightBuffer_->GetGPUVirtualAddress() + frame_ * lightFrameSize_);
         for (UINT i = 0; i < 5; ++i)
             list->SetGraphicsRootDescriptorTable(3 + i, GpuHandle(i));
+        list->SetGraphicsRootDescriptorTable(8, GpuHandle(5));
     }
 
     D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle(UINT index) const {
@@ -502,9 +584,13 @@ private:
 
     ComPtr<ID3D12RootSignature> rootSignature_;
     ComPtr<ID3D12PipelineState> computePipeline_;
+    ComPtr<ID3D12PipelineState> cloudComputePipeline_;
     ComPtr<ID3D12PipelineState> graphicsPipeline_;
+    ComPtr<ID3D12PipelineState> cloudGraphicsPipeline_;
     ComPtr<ID3D12PipelineState> graphicsPipelineHDR_;
+    ComPtr<ID3D12PipelineState> cloudGraphicsPipelineHDR_;
     ComPtr<ID3D12PipelineState> graphicsPipelineMSAA_;
+    ComPtr<ID3D12PipelineState> cloudGraphicsPipelineMSAA_;
     ComPtr<ID3D12DescriptorHeap> descriptorHeap_;
     ComPtr<ID3D12Resource> volume_;
     ComPtr<ID3D12Resource> constantBuffer_;
@@ -518,6 +604,7 @@ private:
     UINT lightFrameSize_ = 0;
     UINT frame_ = 0;
     float fogTime_ = 0.0f;
+    bool cloudVolumesReady_ = false;
 };
 
 #endif

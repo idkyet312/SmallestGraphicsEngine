@@ -60,9 +60,9 @@ struct TimeOfDaySettings {
     float ambientStrength = 0.07f;
     float ambientLightingIntensity = 0.42f;
     DirectX::XMFLOAT3 clearColor{ 0.35f, 0.58f, 0.82f };
-    float atmosphereRayleighStrength = 0.92f;
-    float atmosphereMieStrength = 0.58f;
-    float atmosphereAerialDensity = 0.72f;
+    float atmosphereRayleighStrength = 1.35f;
+    float atmosphereMieStrength = 0.80f;
+    float atmosphereAerialDensity = 0.00f;
     bool  enableVolumetricFog = true;
     float volumetricFogDensity = 0.009f;
     float volumetricFogAnisotropy = 0.82f;
@@ -208,8 +208,7 @@ inline TimeOfDaySettings MakeTimeOfDaySettings(TimeOfDay time) {
         break;
     case TimeOfDay::Afternoon:
     default:
-        // The historical look: this is what every level shipped with before the
-        // choice existed, so it stays the default and keeps its exact values.
+        // The baseline values above are the authored default afternoon look.
         break;
     }
     return settings;

@@ -1313,10 +1313,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::Checkbox("FXAA", &scene.enableFXAA);
         ImGui::Checkbox("Physical Atmosphere", &scene.enablePhysicalAtmosphere);
         if (scene.enablePhysicalAtmosphere) {
-            ImGui::Checkbox("Volumetric Clouds (3D)",
+            ImGui::Checkbox("Sky Clouds: 3D Quality",
                             &scene.enableVolumetricClouds);
             if (!scene.enableVolumetricClouds)
-                ImGui::TextDisabled("Using legacy 2D cloud fallback");
+                ImGui::TextDisabled("Sky clouds use the legacy 2D fallback");
             ImGui::SliderFloat("Rayleigh", &scene.atmosphereRayleighStrength,
                                0.0f, 2.0f, "%.2f");
             ImGui::SliderFloat("Mie Haze", &scene.atmosphereMieStrength,
@@ -1339,6 +1339,28 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::DragFloat("Cloud Thickness",
                              &scene.atmosphereCloudThickness,
                              10.0f, 50.0f, 5000.0f, "%.0f m");
+        }
+        ImGui::Checkbox("World Volumetric Clouds",
+                        &scene.enableFlyableClouds);
+        if (scene.enableFlyableClouds) {
+            ImGui::TextDisabled("Replaces sky clouds; depth-occluded and fly-through");
+            ImGui::DragFloat("World Cloud Base",
+                             &scene.flyableCloudBaseHeight,
+                             1.0f, 0.0f, 0.0f, "%.1f m");
+            ImGui::DragFloat("World Cloud Thickness",
+                             &scene.flyableCloudThickness,
+                             1.0f, 0.0f, 0.0f, "%.1f m");
+            ImGui::DragFloat("World Cloud Density",
+                             &scene.flyableCloudDensity,
+                             0.01f, 0.0f, 0.0f, "%.3f");
+            ImGui::DragFloat("World Cloud Coverage",
+                             &scene.flyableCloudCoverage,
+                             0.01f, 0.0f, 0.0f, "%.3f");
+            const float cloudTop = scene.flyableCloudBaseHeight +
+                (std::max)(scene.flyableCloudThickness, 1.0f);
+            if (scene.camera.Position.y >= scene.flyableCloudBaseHeight &&
+                scene.camera.Position.y <= cloudTop)
+                ImGui::TextDisabled("Camera is inside the cloud volume");
         }
         ImGui::Checkbox("GTAO + Contact Shadows", &scene.enableAmbientOcclusion);
         if (scene.enableAmbientOcclusion) {

@@ -11,9 +11,9 @@
 #include <string>
 #include <vector>
 
-// Poly Haven "Kloppenheim 06 (Pure Sky)", CC0. The daylight default.
+// Poly Haven "Qwantani Dawn (Pure Sky)", CC0. Temporary daylight test sky.
 inline constexpr const char* kSkyEnvironmentPath =
-    "Content/Models/Skyboxes/kloppenheim_06_puresky_2k.exr";
+    "Content/Textures/Sky/qwantani_dawn_puresky_4k.exr";
 // Poly Haven "Qwantani Night (Pure Sky)", CC0. Swapped in for the Night
 // time-of-day preset -- a night sun direction alone cannot produce a starfield,
 // so the environment map has to change with it.

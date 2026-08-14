@@ -12032,6 +12032,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     if (!volumetricFog.Init()) {
         std::cerr << "Volumetric fog init failed (non-fatal)\n";
         scene.enableVolumetricFog = false;
+    } else if (g_cloudNoise.Generated()) {
+        volumetricFog.SetCloudVolumes(
+            g_cloudNoise.ShapeVolume(), g_cloudNoise.DetailVolume());
     }
     BootStep("Initializing ambient occlusion...");
     if (!screenSpaceAO.Init()) {
@@ -14394,6 +14397,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 visBuffer.BeginHDRBackground(g_dx12.commandList.Get());
                 skyRenderer.SetHDRTargetEnabled(true);
             }
+            const XMFLOAT4 skyCloudParams = scene.enableFlyableClouds
+                ? XMFLOAT4(0.0f, 0.0f,
+                           scene.atmosphereCloudBaseHeight,
+                           scene.atmosphereCloudThickness)
+                : XMFLOAT4(scene.atmosphereCloudCoverage,
+                           scene.atmosphereCloudDensity,
+                           scene.atmosphereCloudBaseHeight,
+                           scene.atmosphereCloudThickness);
             skyRenderer.Render(
                 scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now,
                 scene.enablePhysicalAtmosphere,
@@ -14402,10 +14413,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                          scene.atmosphereMieStrength,
                          scene.atmosphereMieAnisotropy,
                          scene.atmosphereAerialDensity),
-                XMFLOAT4(scene.atmosphereCloudCoverage,
-                         scene.atmosphereCloudDensity,
-                         scene.atmosphereCloudBaseHeight,
-                         scene.atmosphereCloudThickness));
+                skyCloudParams);
             if (commonHDRValidationTarget) {
                 skyRenderer.SetHDRTargetEnabled(false);
                 visBuffer.EndHDRBackground(g_dx12.commandList.Get());
@@ -15208,11 +15216,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             scene.lightShaftMode == Scene::LightShaftMode::Volumetric;
         const bool fauxShafts =
             scene.lightShaftMode == Scene::LightShaftMode::Faux;
+        const bool renderFroxelVolume =
+            (scene.enableVolumetricFog && volumetricShafts) ||
+            scene.enableFlyableClouds;
         if (renderedScene && !bentGTAODiagnosticActive &&
-            scene.enableVolumetricFog &&
-            volumetricFog.initialized && volumetricShafts) {
+            renderFroxelVolume && volumetricFog.initialized) {
             ProfilerDX12::Scope profile(
-                g_profiler, "Volumetric Fog", g_dx12.commandList.Get());
+                g_profiler, "Volumetric Fog / Clouds",
+                g_dx12.commandList.Get());
             ID3D12Resource* fogDepth =
                 msaaActive ? msaa.GetDepthResource()
                            : g_dx12.depthStencilBuffer.Get();

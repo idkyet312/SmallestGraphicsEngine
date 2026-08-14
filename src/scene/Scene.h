@@ -345,15 +345,15 @@ struct Scene {
     bool  enablePhysicalAtmosphere = true;
     // Selects the baked 3D noise raymarch. Off keeps the legacy 2D cloud slab
     // as a cheap fallback, so the toggle never removes weather entirely.
-    bool  enableVolumetricClouds = true;
-    float atmosphereRayleighStrength = 0.92f;
-    float atmosphereMieStrength = 0.58f;
+    bool  enableVolumetricClouds = false;
+    float atmosphereRayleighStrength = 1.35f;
+    float atmosphereMieStrength = 0.80f;
     float atmosphereMieAnisotropy = 0.76f;
-    float atmosphereAerialDensity = 0.72f;
-    float atmosphereCloudCoverage = 0.62f;
-    float atmosphereCloudDensity = 0.90f;
-    float atmosphereCloudBaseHeight = 720.0f;
-    float atmosphereCloudThickness = 1250.0f;
+    float atmosphereAerialDensity = 0.00f;
+    float atmosphereCloudCoverage = 0.47f;
+    float atmosphereCloudDensity = 0.86f;
+    float atmosphereCloudBaseHeight = 1240.0f;
+    float atmosphereCloudThickness = 1530.0f;
     // -- Weather ---------------------------------------------------------
     // Rainfall, 0 clear to 1 downpour. Drives the rain renderer's drop count
     // and, through the deployment screen, the fog density that decides how far
@@ -392,6 +392,14 @@ struct Scene {
     float volumetricFogAnisotropy = 0.82f;
     float volumetricFogHeightFalloff = 0.045f; // fog thins above the undergrowth, not over treetops
     float volumetricFogBaseHeight = 0.4f;      // haze pools low in the valley floor
+    // World clouds live inside the froxel volume, so scene depth occludes them
+    // and the player can pass through their 3D density. When enabled they
+    // replace the sky-pass cloud layer instead of drawing a duplicate behind it.
+    bool  enableFlyableClouds = true;
+    float flyableCloudBaseHeight = 9.0f;
+    float flyableCloudThickness = 30.0f;
+    float flyableCloudDensity = 2.250f;
+    float flyableCloudCoverage = 1.960f;
     // Match the camera far plane so the volume reaches every edge and corner of
     // the 600 m ocean instead of ending in a visible ring inside the map.
     float volumetricFogDistance = 800.0f;

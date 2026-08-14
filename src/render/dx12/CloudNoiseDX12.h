@@ -23,9 +23,8 @@ public:
     static constexpr UINT DetailResolution = 32;
     bool initialized = false;
 
-    // Baked once. The raymarch samples these every frame but nothing ever
-    // writes them again, so after Generate they live in PIXEL_SHADER_RESOURCE
-    // for the life of the process.
+    // Baked once. Sky pixels and the world-cloud compute pass share the result,
+    // so Generate leaves both shader-read state bits set for its whole lifetime.
     ID3D12Resource* ShapeVolume() const { return shape_.Get(); }
     ID3D12Resource* DetailVolume() const { return detail_.Get(); }
 
@@ -139,7 +138,8 @@ private:
         D3D12_RESOURCE_BARRIER toSRV = toUAV;
         toSRV.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         toSRV.Transition.StateAfter =
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         commandList->ResourceBarrier(1, &toSRV);
     }
 

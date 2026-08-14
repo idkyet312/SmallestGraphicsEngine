@@ -30,6 +30,9 @@ cbuffer FogConstants : register(b0)
     float4 oceanBounds0;          // center.x, surface y, center.z, enabled
     float4 oceanBounds1;          // half x, half z, edge blend width, unused
     uint4 maxVolumeDims;          // allocated froxel volume size (>= volumeDims)
+#ifdef SGE_WORLD_CLOUDS
+    float4 flyableCloudParams;    // base height, thickness, density, coverage
+#endif
 };
 
 StructuredBuffer<FogCluster> clusters : register(t0);
@@ -38,10 +41,17 @@ Texture2DArray<float> shadowMap : register(t2);
 Texture2D<float> sceneDepth : register(t3);
 Texture3D<float4> fogVolume : register(t4);
 Texture2DMS<float, 4> sceneDepthMS : register(t5);
+#ifdef SGE_WORLD_CLOUDS
+Texture3D<float4> cloudShapeVolume : register(t6);
+Texture3D<float4> cloudDetailVolume : register(t7);
+#endif
 RWTexture3D<float4> fogVolumeOut : register(u0);
 
 SamplerComparisonState shadowSampler : register(s0);
 SamplerState linearClampSampler : register(s1);
+#ifdef SGE_WORLD_CLOUDS
+SamplerState cloudNoiseSampler : register(s2);
+#endif
 
 float SliceDepth(float slice)
 {
@@ -113,6 +123,28 @@ float HenyeyGreenstein(float cosineTheta, float g)
         max(4.0 * 3.14159265 * pow(denominator, 1.5), 1e-4);
 }
 
+#ifdef SGE_WORLD_CLOUDS
+// Draine's phase function adds the broad water-droplet lobe that HG misses.
+// The fixed parameters approximate a 12 um cloud droplet distribution; the HG
+// peak supplies the narrow silver lining while Draine carries the bulk energy.
+float DrainePhase(float cosineTheta, float g, float alpha)
+{
+    const float g2 = g * g;
+    const float correction = (1.0 + alpha * cosineTheta * cosineTheta) /
+        (1.0 + alpha * (1.0 + 2.0 * g2) / 3.0);
+    return HenyeyGreenstein(cosineTheta, g) * correction;
+}
+
+float CloudWaterDropletPhase(float cosineTheta)
+{
+    const float forwardPeak = HenyeyGreenstein(cosineTheta, 0.9904);
+    const float dropletBulk = DrainePhase(cosineTheta, 0.4417, 23.38);
+    // A froxel represents a finite solid angle, so cap the unresolved forward
+    // singularity instead of allowing one sun-facing cell to flash white.
+    return min(lerp(forwardPeak, dropletBulk, 0.283), 4.0);
+}
+#endif
+
 // Jimenez's interleaved gradient noise: a cheap hash whose values decorrelate
 // strongly between neighbouring pixels, which is what makes the froxel sampling
 // offset read as fine dither rather than as a pattern.
@@ -131,6 +163,200 @@ float FogNoise(float3 p)
     n += sin((p.x + p.z) * 0.037 + ambientFogColor.w * 0.31) * 0.55;
     return saturate(n * 0.32 + 0.62);
 }
+
+#ifdef SGE_WORLD_CLOUDS
+float CloudRemap(float value, float lowIn, float highIn,
+                 float lowOut, float highOut)
+{
+    return lowOut + (value - lowIn) /
+        max(highIn - lowIn, 0.0001) * (highOut - lowOut);
+}
+
+static const float kCloudExtinctionScale = 0.04;
+
+// The old analytic fog modulation was a small stack of sines, so its peaks and
+// valleys inevitably repeated across the island. Combine differently rotated
+// and incommensurately scaled samples from the generated 3D volumes instead.
+// Each source texture still wraps, but their product has no visible tile period
+// within the rendered volume.
+float FogDensityTexture(float3 worldPosition)
+{
+    const float wind = ambientFogColor.w;
+    const float3 advected = worldPosition +
+        float3(wind * 0.31, wind * 0.04, wind * 0.17);
+    const float3 broadUVW = advected * 0.0021;
+    const float3 rotatedUVW = float3(
+        advected.z * 0.00137 + 17.31,
+        -advected.x * 0.00137 + 5.73,
+        advected.y * 0.00137 + 11.19);
+    const float broad = cloudShapeVolume.SampleLevel(
+        cloudNoiseSampler, broadUVW, 0.0).r;
+    const float rotated = cloudShapeVolume.SampleLevel(
+        cloudNoiseSampler, rotatedUVW, 0.0).g;
+    const float fine = cloudDetailVolume.SampleLevel(
+        cloudNoiseSampler,
+        float3(advected.y, advected.z, -advected.x) * 0.0083 + 23.7,
+        0.0).r;
+    return saturate(broad * 0.50 + rotated * 0.34 + fine * 0.16);
+}
+
+// Density of the world cloud field at a world position. This lives in the
+// froxel volume rather than the sky pass, so it is depth-tested against scene
+// geometry and the camera can pass through it.
+//
+// Shape R is Perlin-Worley; GBA are rising-frequency Worley octaves. Detail RGB
+// are higher-frequency Worley fields used only after the cheap shape test hits.
+float FlyableCloudDensityInternal(float3 worldPosition, bool includeDetail)
+{
+    const float density = flyableCloudParams.z;
+    if (density <= 0.001)
+        return 0.0;
+
+    const float base = flyableCloudParams.x;
+    const float thickness = max(flyableCloudParams.y, 1.0);
+    const float height = worldPosition.y - base;
+    if (height < 0.0 || height > thickness)
+        return 0.0;
+
+    const float normalizedHeight = height / thickness;
+    // A compact cumulus envelope: a relatively level condensation base and a
+    // longer crown falloff whose silhouette is broken up by the 3D shape field.
+    const float profile = smoothstep(0.0, 0.12, normalizedHeight) *
+        (1.0 - smoothstep(0.58, 1.0, normalizedHeight));
+
+    // Do not shrink horizontal weather cells with very thin layers. At the
+    // 30 m test thickness the old proportional scale repeated every ~43 m.
+    // A world-scale floor plus a rotated second sample keeps the same field
+    // coherent across the island while the vertical profile remains thin.
+    const float shapePeriod = max(thickness / 0.70, 180.0);
+    const float shapeFrequency = 1.0 / shapePeriod;
+    const float wind = ambientFogColor.w;
+    float3 samplePosition = float3(
+        worldPosition.x + wind * 0.85,
+        height * 0.85,
+        worldPosition.z + wind * 0.32);
+    const float3 shapeUVW = samplePosition * shapeFrequency;
+    const float4 primaryShape = cloudShapeVolume.SampleLevel(
+        cloudNoiseSampler, shapeUVW, 0.0);
+    const float4 rotatedShape = cloudShapeVolume.SampleLevel(
+        cloudNoiseSampler,
+        float3(shapeUVW.z * 0.731 + 13.7,
+               -shapeUVW.x * 0.731 + 3.1,
+               shapeUVW.y * 0.731 + 9.2), 0.0);
+    const float4 shape = lerp(primaryShape, rotatedShape, 0.32);
+    const float worleyFBM =
+        shape.g * 0.625 + shape.b * 0.25 + shape.a * 0.125;
+    float cloud = saturate(CloudRemap(
+        shape.r, worleyFBM - 1.0, 1.0, 0.0, 1.0));
+
+    const float threshold = lerp(
+        0.88, 0.20, saturate(flyableCloudParams.w));
+    cloud = saturate(CloudRemap(cloud, threshold, 1.0, 0.0, 1.0));
+    cloud *= profile;
+    if (!includeDetail || cloud <= 0.001)
+        return cloud * density;
+
+    const float3 primaryDetail = cloudDetailVolume.SampleLevel(
+        cloudNoiseSampler, shapeUVW * 8.0, 0.0).rgb;
+    const float3 rotatedDetail = cloudDetailVolume.SampleLevel(
+        cloudNoiseSampler,
+        float3(-shapeUVW.z * 9.13 + 4.7,
+               shapeUVW.x * 9.13 + 15.3,
+               shapeUVW.y * 9.13 + 2.9), 0.0).rgb;
+    const float3 detail = lerp(primaryDetail, rotatedDetail, 0.27);
+    float detailFBM = detail.r * 0.625 +
+        detail.g * 0.25 + detail.b * 0.125;
+    // Inverting erosion toward the crown produces cauliflower tops while the
+    // lower half keeps heavier, darker bodies instead of dissolving into fog.
+    detailFBM = lerp(detailFBM, 1.0 - detailFBM,
+                     saturate(normalizedHeight * 3.0));
+    cloud = saturate(CloudRemap(
+        cloud, detailFBM * 0.38, 1.0, 0.0, 1.0));
+    return cloud * density;
+}
+
+float FlyableCloudDensity(float3 worldPosition)
+{
+    return FlyableCloudDensityInternal(worldPosition, true);
+}
+
+float FlyableCloudDensityLowDetail(float3 worldPosition)
+{
+    return FlyableCloudDensityInternal(worldPosition, false);
+}
+
+// Return the portion of a ray segment that is physically inside the horizontal
+// cloud slab. Logarithmic froxels become long at distance; applying one density
+// sample to the whole cell makes a cell that only grazes the cloud base behave
+// like hundreds of metres of cloud when viewed from below.
+float2 FlyableCloudRayInterval(float3 ray, float segmentStart,
+                              float segmentEnd)
+{
+    const float base = flyableCloudParams.x;
+    const float top = base + max(flyableCloudParams.y, 1.0);
+    if (abs(ray.y) < 0.00001)
+    {
+        const bool inside = cameraPositionNear.y >= base &&
+                            cameraPositionNear.y <= top;
+        return inside ? float2(segmentStart, segmentEnd)
+                      : float2(segmentEnd, segmentStart);
+    }
+
+    const float firstPlane = (base - cameraPositionNear.y) / ray.y;
+    const float secondPlane = (top - cameraPositionNear.y) / ray.y;
+    const float slabStart = min(firstPlane, secondPlane);
+    const float slabEnd = max(firstPlane, secondPlane);
+    return float2(max(segmentStart, slabStart),
+                  min(segmentEnd, slabEnd));
+}
+
+float3 FlyableCloudGradientNormal(float3 worldPosition)
+{
+    const float epsilon = max(flyableCloudParams.y * 0.0125, 0.35);
+    const float center = FlyableCloudDensityLowDetail(worldPosition);
+    const float3 gradient = float3(
+        FlyableCloudDensityLowDetail(
+            worldPosition + float3(epsilon, 0.0, 0.0)) - center,
+        FlyableCloudDensityLowDetail(
+            worldPosition + float3(0.0, epsilon, 0.0)) - center,
+        FlyableCloudDensityLowDetail(
+            worldPosition + float3(0.0, 0.0, epsilon)) - center);
+    const float gradientLength = length(gradient);
+    return gradientLength > 0.0001
+        ? -gradient / gradientLength : float3(0.0, 1.0, 0.0);
+}
+
+// Short secondary march through the same density field toward the sun. This is
+// the directional cue a vertical-only shadow cannot provide: lobes facing the
+// light stay bright while density behind them falls into Beer-Lambert shadow.
+float CloudLightTransmittance(float3 worldPosition, float3 lightDirection)
+{
+    if (lightDirection.y <= 0.01)
+        return 0.0;
+
+    const float thickness = max(flyableCloudParams.y, 1.0);
+    const float layerTop = flyableCloudParams.x + thickness;
+    float travel = (layerTop - worldPosition.y) /
+        max(lightDirection.y, 0.05);
+    travel = clamp(travel, 0.0, thickness * 4.0);
+    if (travel <= 0.01)
+        return 1.0;
+
+    const float stepLength = travel * 0.125;
+    float opticalDepth = 0.0;
+    [unroll]
+    for (uint sampleIndex = 0; sampleIndex < 8; ++sampleIndex)
+    {
+        // Midpoint samples avoid the systematic bright leak produced by
+        // sampling the near face of each large light-march interval.
+        const float distanceToSample =
+            (float(sampleIndex) + 0.5) * stepLength;
+        opticalDepth += FlyableCloudDensityLowDetail(
+            worldPosition + lightDirection * distanceToSample) * stepLength;
+    }
+    return exp(-opticalDepth * kCloudExtinctionScale);
+}
+#endif
 
 float CloudSunVisibility(float3 worldPosition)
 {
@@ -208,6 +434,44 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float centerDepth = lerp(nearDepth, farDepth, sliceJitter);
         float stepLength = (farDepth - nearDepth) / viewCos;
         float3 worldPosition = cameraPositionNear.xyz + ray * (centerDepth / viewCos);
+#ifdef SGE_WORLD_CLOUDS
+        float secondDepth = lerp(
+            nearDepth, farDepth, frac(sliceJitter + 0.3333333));
+        float thirdDepth = lerp(
+            nearDepth, farDepth, frac(sliceJitter + 0.6666667));
+        float3 secondPosition =
+            cameraPositionNear.xyz + ray * (secondDepth / viewCos);
+        float3 thirdPosition =
+            cameraPositionNear.xyz + ray * (thirdDepth / viewCos);
+
+        const float segmentStart = nearDepth / viewCos;
+        const float segmentEnd = farDepth / viewCos;
+        const float2 cloudInterval = FlyableCloudRayInterval(
+            ray, segmentStart, segmentEnd);
+        const float cloudSegmentLength =
+            max(cloudInterval.y - cloudInterval.x, 0.0);
+        const float cloudSampleJitter =
+            InterleavedGradientNoise(float2(id.xy));
+        const float cloudSampleStep = cloudSegmentLength * 0.25;
+        const float cloudFirstDistance = cloudInterval.x +
+            cloudSampleStep * cloudSampleJitter;
+        const float cloudSecondDistance = cloudInterval.x +
+            cloudSampleStep * (1.0 + cloudSampleJitter);
+        const float cloudThirdDistance = cloudInterval.x +
+            cloudSampleStep * (2.0 + cloudSampleJitter);
+        const float cloudFourthDistance = cloudInterval.x +
+            cloudSampleStep * (3.0 + cloudSampleJitter);
+        const float3 cloudFirstPosition = cameraPositionNear.xyz +
+            ray * cloudFirstDistance;
+        const float3 cloudSecondPosition = cameraPositionNear.xyz +
+            ray * cloudSecondDistance;
+        const float3 cloudThirdPosition = cameraPositionNear.xyz +
+            ray * cloudThirdDistance;
+        const float3 cloudFourthPosition = cameraPositionNear.xyz +
+            ray * cloudFourthDistance;
+        const float3 cloudPosition = cameraPositionNear.xyz +
+            ray * ((cloudInterval.x + cloudInterval.y) * 0.5);
+#endif
 
         // Jungle gradient: a broad upper haze plus a softer, denser low ground
         // layer that pools in the valley floor. The ground layer's falloff is kept
@@ -216,11 +480,50 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float aboveBase = max(worldPosition.y - fogParams.y, 0.0);
         float heightDensity = exp(-aboveBase * fogParams.x);
         float groundLayer = exp(-aboveBase * (fogParams.x * 2.0)) * 0.9;
+#ifdef SGE_WORLD_CLOUDS
+        // Texture-driven modulation removes the periodic sine cells. Reduce the
+        // former 1.9x near-ground pile-up and bound only the local modulation;
+        // the user-facing master density remains unrestricted.
+        float densityNoise = lerp(
+            0.72, 1.10, FogDensityTexture(worldPosition));
+        heightDensity = (heightDensity + groundLayer * 0.55) * densityNoise;
+        heightDensity = clamp(heightDensity, 0.03, 1.20);
+#else
         float densityNoise = lerp(0.58, 1.28, FogNoise(worldPosition));
         heightDensity = (heightDensity + groundLayer) * densityNoise;
         heightDensity = max(heightDensity, 0.03);
+#endif
+#ifdef SGE_WORLD_CLOUDS
+        // Zero remains exact because this variant can run with fog disabled.
+        float extinction = max(sunDirectionDensity.w * heightDensity, 0.0);
+
+        // Four stable strata integrate only the part of this logarithmic cell
+        // that intersects the cloud slab. Keeping the jitter spatial (not
+        // frame-varying) avoids crawl because this pass has no cloud history
+        // buffer in which temporal noise could converge.
+        float cloudDensity = 0.0;
+        if (flyableCloudParams.z > 0.001 && cloudSegmentLength > 0.0)
+            cloudDensity = (
+                FlyableCloudDensity(cloudFirstPosition) +
+                FlyableCloudDensity(cloudSecondPosition) +
+                FlyableCloudDensity(cloudThirdPosition) +
+                FlyableCloudDensity(cloudFourthPosition)) * 0.25;
+
+        const float cloudExtinction =
+            cloudDensity * kCloudExtinctionScale;
+        // Beer-Lambert on the view segment. The same law is evaluated along the
+        // light ray below; cloud optical depth uses its exact in-slab distance,
+        // while ordinary fog continues to occupy the complete froxel.
+        const float fogOpticalDepth = extinction * stepLength;
+        const float cloudOpticalDepth =
+            cloudExtinction * cloudSegmentLength;
+        const float totalOpticalDepth = fogOpticalDepth + cloudOpticalDepth;
+        float segmentTransmittance = exp(-totalOpticalDepth);
+        float cloudSegmentTransmittance = exp(-cloudOpticalDepth);
+#else
         float extinction = max(sunDirectionDensity.w * heightDensity, 0.00001);
         float segmentTransmittance = exp(-extinction * stepLength);
+#endif
 
         // Two shadow evaluations per froxel, at different depths inside the
         // slice. Slice thickness grows exponentially with distance, so a single
@@ -231,9 +534,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // do not share a kernel orientation; combined with sliceJitter the
         // residual pattern averages into smooth falloff.
         float rotation = (sliceJitter + float(z) * 0.618034) * 6.2831853;
+#ifndef SGE_WORLD_CLOUDS
         float secondDepth = lerp(nearDepth, farDepth, frac(sliceJitter + 0.5));
         float3 secondPosition =
             cameraPositionNear.xyz + ray * (secondDepth / viewCos);
+#endif
         float shadow = 0.5 * (
             SunVisibility(worldPosition, rotation) +
             SunVisibility(secondPosition, rotation + 1.5707963));
@@ -242,6 +547,47 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // A tiny ambient term made the former pass behave like red/brown smoke.
         float3 lighting = AtmosphereAmbient(ray, aboveBase) +
             sunColorAnisotropy.xyz * phase * shadow * 0.42;
+
+#ifdef SGE_WORLD_CLOUDS
+        // Dense interiors transition from forward Mie scattering toward a broad
+        // backscatter lobe, approximating energy returned by multiple scattering.
+        // Beer-powder restores soft bright edges without flattening dark cores.
+        if (cloudDensity > 0.001)
+        {
+            const float lightTransmittance = CloudLightTransmittance(
+                cloudPosition, lightDirection);
+            const float cosineTheta = dot(lightDirection, ray);
+            const float phaseDepth = saturate(
+                lightTransmittance * cloudSegmentTransmittance);
+            const float forwardPhase = CloudWaterDropletPhase(cosineTheta);
+            const float multipleScatterPhase =
+                HenyeyGreenstein(cosineTheta, -0.15) * 2.16;
+            const float cloudPhase = lerp(
+                multipleScatterPhase, forwardPhase, phaseDepth);
+            const float powder = 1.0 -
+                cloudSegmentTransmittance * cloudSegmentTransmittance;
+            const float beerPowder =
+                lightTransmittance * (1.0 + powder);
+            const float ambientVisibility = lerp(
+                0.32, 0.92, sqrt(lightTransmittance));
+            const float3 cloudNormal =
+                FlyableCloudGradientNormal(cloudPosition);
+            const float lobeLighting = lerp(
+                0.58, 1.25,
+                saturate(dot(cloudNormal, lightDirection) * 0.5 + 0.5));
+            float3 cloudLight =
+                AtmosphereAmbient(
+                    ray, max(cloudPosition.y - fogParams.y, 0.0)) *
+                    ambientVisibility +
+                sunColorAnisotropy.xyz * cloudPhase * shadow *
+                    beerPowder * lobeLighting * 1.35;
+            // Mix participating media by their contribution to optical depth,
+            // not by the size of the enclosing froxel. This remains correct for
+            // a very thin cloud crossing and for ordinary fog being disabled.
+            lighting = lerp(lighting, cloudLight,
+                saturate(cloudOpticalDepth / max(totalOpticalDepth, 0.00001)));
+        }
+#endif
         uint3 clusterCoord = min(
             uint3(
                 id.x * clusterDimsLightCount.x / volumeDims.x,
@@ -379,8 +725,18 @@ float4 CompositeFog(float2 uv, float deviceDepth)
     bool hasOpaqueDepth = deviceDepth < 0.99999;
     float opaqueViewDepth = hasOpaqueDepth
         ? LinearDepth(deviceDepth) : cameraForwardFar.w;
+#ifdef SGE_WORLD_CLOUDS
+    // Unlike height fog, the world-cloud volume must also composite over pixels
+    // whose depth is the sky. Returning the neutral value there cut an exact
+    // horizon-shaped hole through the cloud whenever the camera entered it.
+    float4 opaqueFog = hasOpaqueDepth
+        ? FogAtViewDepth(uv, opaqueViewDepth)
+        : fogVolume.SampleLevel(
+            linearClampSampler, FogVolumeUVW(uv, 1.0), 0.0);
+#else
     float4 opaqueFog = hasOpaqueDepth
         ? FogAtViewDepth(uv, opaqueViewDepth) : neutralFog;
+#endif
 
     float oceanCoverage;
     float oceanViewDepth = OceanSurfaceViewDepth(uv, oceanCoverage);
@@ -394,7 +750,14 @@ float4 CompositeFog(float2 uv, float deviceDepth)
 
 float4 PSMain(VSOutput input) : SV_TARGET
 {
+#ifdef SGE_WORLD_CLOUDS
+    // Filtered depth invents intermediate surfaces along thin silhouettes.
+    // With dense clouds behind them those false depths expose alternating
+    // cloud/no-cloud pixels, which is especially obvious in palm fronds.
+    float deviceDepth = sceneDepth.Load(int3(int2(input.position.xy), 0));
+#else
     float deviceDepth = sceneDepth.SampleLevel(linearClampSampler, input.uv, 0.0);
+#endif
     return CompositeFog(input.uv, deviceDepth);
 }
 
