@@ -1712,11 +1712,17 @@ XMMATRIX BoatWorldMatrix() {
 }
 
 static XMFLOAT3 BoatTurretMountWorld() {
-    // Gunner sits low in the boat's seat well rather than standing on the
-    // hull rim, offset toward the stern seat instead of the bow tip.
+    // Stand the gunner on the deck, offset toward the stern seat rather than
+    // the bow tip.
+    //
+    // This was -0.65 m, which is not a seat well: the normalized keel sits at
+    // -0.35 m, so that put the gunner 0.30 m underneath the hull and left him
+    // visibly half-sunk through the boat. Use the same kBoatDeckOffset that
+    // BoatDeckY and the deck collision use, so the gunner stands on exactly the
+    // surface the player walks on rather than on a second, disagreeing height.
     const float sx = std::sin(g_boatYaw), cz = std::cos(g_boatYaw);
     return { g_boatPosition.x + sx * 0.4f,
-             g_boatPosition.y - g_boatSinkDepth - 0.65f,
+             g_boatPosition.y - g_boatSinkDepth + kBoatDeckOffset,
              g_boatPosition.z + cz * 0.4f };
 }
 
