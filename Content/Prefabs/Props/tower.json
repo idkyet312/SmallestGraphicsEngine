@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 2,
+  "id": "props/tower",
+  "name": "Tower",
+  "components": {
+    "staticMesh": {
+      "path": "Content/Models/Tower/Tower.fbx",
+      "defaultScale": [1.0, 1.0, 1.0],
+      "targetSize": 18.0,
+      "castShadow": true,
+      "useMaterials": true,
+      "materialAmbientScale": 1.0,
+      "materialViewFillStrength": 0.0
+    },
+    "collision": {
+      "shape": "box"
+    },
+    "destructible": {
+      "health": 1800.0
+    }
+  }
+}

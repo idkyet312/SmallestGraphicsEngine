@@ -7,6 +7,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -1849,6 +1850,86 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus;
         ImGui::Begin("##ScenePrefabDropTarget", nullptr, dropFlags);
         ImGui::InvisibleButton("##SceneDropSurface", ImGui::GetContentRegionAvail());
+
+        // Ghost preview. Dropping used to be blind: the prefab only appeared on
+        // release, so placing anything precise meant drop, look, undo, retry.
+        // Draw the footprint snapped to the terrain under the cursor for the
+        // whole drag, so the drop lands where the marker already is.
+        {
+            XMFLOAT3 ghost;
+            if (TerrainPointUnderMouse(view, projection, terrainHeight, ghost)) {
+                const PrefabAsset* dragged = nullptr;
+                if (dragging->Data)
+                    dragged = prefabRegistry_.Find(
+                        static_cast<const char*>(dragging->Data));
+                // Footprint radius from the prefab's authored size, so a tower
+                // reads as a tower and a rock as a rock. Half of targetSize is
+                // the model's own half-span, which is what it will occupy.
+                const float radius = (dragged && dragged->targetSize > 0.0f)
+                    ? (std::max)(0.6f, dragged->targetSize * 0.5f)
+                    : 1.5f;
+                const XMMATRIX ghostViewProjection = view * projection;
+                const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+                ImDrawList* ghostDraw = ImGui::GetForegroundDrawList();
+
+                // Project a world point to screen. Returns false behind the eye,
+                // where the perspective divide flips the result.
+                const auto project = [&](float wx, float wy, float wz,
+                                         ImVec2& out) {
+                    const XMVECTOR clip = XMVector3Transform(
+                        XMVectorSet(wx, wy, wz, 1.0f), ghostViewProjection);
+                    const float w = XMVectorGetW(clip);
+                    if (w <= 0.01f) return false;
+                    out = ImVec2(
+                        (XMVectorGetX(clip) / w * 0.5f + 0.5f) * displaySize.x,
+                        (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) *
+                            displaySize.y);
+                    return true;
+                };
+
+                // Base ring, following the ground rather than sitting on a flat
+                // disc, so the preview reads correctly on a slope.
+                ImVec2 ring[33];
+                int ringCount = 0;
+                for (int i = 0; i <= 32; ++i) {
+                    const float angle = XM_2PI * static_cast<float>(i) / 32.0f;
+                    const float px = ghost.x + std::cos(angle) * radius;
+                    const float pz = ghost.z + std::sin(angle) * radius;
+                    ImVec2 screen;
+                    if (project(px, terrainHeight(px, pz) + 0.05f, pz, screen))
+                        ring[ringCount++] = screen;
+                }
+                const ImU32 ghostColour = IM_COL32(90, 185, 255, 235);
+                if (ringCount > 1)
+                    ghostDraw->AddPolyline(ring, ringCount, ghostColour,
+                                           ImDrawFlags_None, 2.0f);
+
+                // Vertical extent, so tall props announce their height before
+                // they are committed.
+                const float height = (dragged && dragged->targetSize > 0.0f)
+                    ? dragged->targetSize : 2.0f;
+                ImVec2 base, top;
+                const bool haveBase = project(ghost.x, ghost.y, ghost.z, base);
+                if (haveBase &&
+                    project(ghost.x, ghost.y + height, ghost.z, top)) {
+                    ghostDraw->AddLine(base, top,
+                                       IM_COL32(90, 185, 255, 150), 1.5f);
+                    ghostDraw->AddCircleFilled(base, 4.0f, ghostColour);
+                }
+
+                // Readout of the exact drop point, so a placement can be matched
+                // to a coordinate without committing it first.
+                if (dragged && haveBase) {
+                    char label[128];
+                    std::snprintf(label, sizeof(label), "%s  %.1f, %.1f, %.1f",
+                                  dragged->name.c_str(), ghost.x, ghost.y,
+                                  ghost.z);
+                    ghostDraw->AddText(ImVec2(base.x + 10.0f, base.y + 6.0f),
+                                       ghostColour, label);
+                }
+            }
+        }
+
         if (ImGui::BeginDragDropTarget()) {
             if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(
                     "SGE_PREFAB_ID")) {

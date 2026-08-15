@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 2,
+  "id": "props/turret",
+  "name": "Turret",
+  "components": {
+    "staticMesh": {
+      "path": "Content/Models/Turret/Turret.glb",
+      "defaultScale": [1.0, 1.0, 1.0],
+      "targetSize": 4.5,
+      "castShadow": true,
+      "useMaterials": true,
+      "materialAmbientScale": 1.0,
+      "materialViewFillStrength": 0.0
+    },
+    "collision": {
+      "shape": "box"
+    },
+    "aaTurret": {}
+  }
+}
