@@ -328,11 +328,125 @@ inline void RenderPlayerHUD(const Scene& scene) {
             draw->AddLine(segment[0], segment[1], reticle, 1.0f);
     }
 
-    // Brief red hit flash. Draw first so HUD stays readable above it.
-    if (scene.player.damageFlash > 0.0f) {
-        const float alpha = (std::min)(0.32f, scene.player.damageFlash * 1.35f);
-        draw->AddRectFilled(ImVec2(0.0f, 0.0f), io.DisplaySize,
-                            ImGui::GetColorU32(ImVec4(0.75f, 0.0f, 0.0f, alpha)));
+    // Hit feedback. Drawn before the HUD so the bar and reticle stay readable
+    // on top of it.
+    //
+    // A flat full-screen rectangle was the whole of this: the same wash however
+    // hard the hit landed, and no clue where it came from. Three layers now do
+    // the work -- an edge vignette that leaves the centre of the screen clear,
+    // a directional wedge pointing at whatever hit you, and a low-health pulse
+    // that ramps in as you approach death.
+    {
+        const PlayerState& player = scene.player;
+        const float severity = player.damageFlashSeverity;
+        const ImVec2 screen = io.DisplaySize;
+        const ImVec2 centre(screen.x * 0.5f, screen.y * 0.5f);
+
+        // Vignette: banded rings from the edge inward, strongest at the border
+        // and fading to nothing well before the crosshair. Keeping the middle
+        // clear is what lets this be much stronger than the old flat wash
+        // without blinding the player at the moment they most need to see.
+        if (player.damageFlash > 0.0f) {
+            const float fade = (std::min)(1.0f, player.damageFlash * 2.4f);
+            const float peak = (0.30f + severity * 0.55f) * fade;
+            constexpr int kBands = 7;
+            // Widest band reaches ~30% of the screen's short side inward.
+            const float depth = (std::min)(screen.x, screen.y) * 0.30f;
+            for (int band = 0; band < kBands; ++band) {
+                const float t = static_cast<float>(band) / (kBands - 1);
+                const float inset = depth * t;
+                // Quadratic falloff so the ramp is soft near the middle and
+                // concentrated at the edge, which reads as a vignette rather
+                // than a series of visible rings.
+                const float alpha = peak * (1.0f - t) * (1.0f - t);
+                if (alpha <= 0.004f) continue;
+                draw->AddRect(
+                    ImVec2(inset, inset),
+                    ImVec2(screen.x - inset, screen.y - inset),
+                    ImGui::GetColorU32(ImVec4(0.62f, 0.02f, 0.02f, alpha)),
+                    0.0f, 0, depth / kBands * 2.0f);
+            }
+            // A light centre wash only for hits hard enough to warrant it, so a
+            // grenade still whites out the view while a rifle graze does not.
+            if (severity > 0.45f) {
+                const float wash = (severity - 0.45f) * 0.30f * fade;
+                draw->AddRectFilled(
+                    ImVec2(0.0f, 0.0f), screen,
+                    ImGui::GetColorU32(ImVec4(0.70f, 0.0f, 0.0f, wash)));
+            }
+        }
+
+        // Directional indicator: a wedge at the screen edge on the bearing the
+        // damage came from, so the player can turn to face it. Outlives the
+        // flash (see hitIndicator) because a marker that vanishes in a fifth of
+        // a second cannot be acted on.
+        if (player.hitIndicator > 0.0f &&
+            (player.lastHitDirX != 0.0f || player.lastHitDirZ != 0.0f)) {
+            // Bearing of the hit relative to where the player is looking.
+            const float forwardX = scene.camera.Front.x;
+            const float forwardZ = scene.camera.Front.z;
+            const float forwardLen =
+                std::sqrt(forwardX * forwardX + forwardZ * forwardZ);
+            if (forwardLen > 1e-4f) {
+                const float fx = forwardX / forwardLen;
+                const float fz = forwardZ / forwardLen;
+                // Screen-right on the XZ plane.
+                //
+                // Must match the camera's own handedness, which is not the
+                // textbook one: Camera::ProcessKeyboard computes
+                // cross(front, up) and then SUBTRACTS it to strafe right, so
+                // that cross product points screen-LEFT. Deriving right as
+                // (-fz, fx) -- the usual formula -- put every hit marker on the
+                // wrong side of the screen.
+                const float rx = fz;
+                const float rz = -fx;
+                const float along = player.lastHitDirX * fx +
+                                    player.lastHitDirZ * fz;
+                const float lateral = player.lastHitDirX * rx +
+                                      player.lastHitDirZ * rz;
+                // Screen angle: 0 is straight up (dead ahead), growing
+                // clockwise, so a hit from the right puts the wedge on the
+                // right.
+                const float angle = std::atan2(lateral, along);
+                const float radius = (std::min)(screen.x, screen.y) * 0.30f;
+                const float alpha =
+                    (std::min)(1.0f, player.hitIndicator) * 0.85f;
+                const float spread = 0.20f;   // radians, half-width of the wedge
+                const auto pointAt = [&](float a, float r) {
+                    return ImVec2(centre.x + std::sin(a) * r,
+                                  centre.y - std::cos(a) * r);
+                };
+                const ImU32 colour =
+                    ImGui::GetColorU32(ImVec4(0.95f, 0.13f, 0.10f, alpha));
+                draw->AddTriangleFilled(
+                    pointAt(angle, radius * 1.24f),
+                    pointAt(angle - spread, radius * 0.94f),
+                    pointAt(angle + spread, radius * 0.94f), colour);
+            }
+        }
+
+        // Low health: a steady dark-red vignette with a heartbeat throb. Unlike
+        // the hit flash this does not fade -- it stays until health recovers,
+        // so the state is readable without watching the HP bar.
+        if (player.lowHealthPulse > 0.001f) {
+            const float beat =
+                0.72f + 0.28f * std::sin(static_cast<float>(ImGui::GetTime()) *
+                                         (4.2f + player.lowHealthPulse * 2.6f));
+            const float peak = player.lowHealthPulse * 0.44f * beat;
+            constexpr int kBands = 6;
+            const float depth = (std::min)(screen.x, screen.y) * 0.26f;
+            for (int band = 0; band < kBands; ++band) {
+                const float t = static_cast<float>(band) / (kBands - 1);
+                const float inset = depth * t;
+                const float alpha = peak * (1.0f - t) * (1.0f - t);
+                if (alpha <= 0.004f) continue;
+                draw->AddRect(
+                    ImVec2(inset, inset),
+                    ImVec2(screen.x - inset, screen.y - inset),
+                    ImGui::GetColorU32(ImVec4(0.44f, 0.0f, 0.0f, alpha)),
+                    0.0f, 0, depth / kBands * 2.0f);
+            }
+        }
     }
 
     const float maxHealth = (std::max)(1.0f, scene.player.maxHealth);

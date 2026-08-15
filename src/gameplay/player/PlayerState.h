@@ -5,6 +5,23 @@ struct PlayerState {
     float maxHealth = 100.0f;
     float health = 100.0f;
     float damageFlash = 0.0f;
+    // How hard the last hit landed, 0..1, relative to a full-health kill. Drives
+    // the strength of every hit reaction rather than each one re-deriving it, so
+    // a rifle graze and a point-blank grenade read as different events instead
+    // of firing the same canned flash.
+    float damageFlashSeverity = 0.0f;
+    // Where the hit came from, in world space, normalised and pointing from the
+    // player toward the attacker. Zero when the source is unknown (burning,
+    // falling), which the indicator treats as "no direction to show".
+    float lastHitDirX = 0.0f;
+    float lastHitDirZ = 0.0f;
+    // Separate, slower timer than damageFlash: the directional wedge has to
+    // outlive the screen flash to be readable, or it is gone before the eye
+    // finds it.
+    float hitIndicator = 0.0f;
+    // Low-health state. Ramps in below a threshold and drives the vignette and
+    // heartbeat, so being nearly dead is legible without reading the HP bar.
+    float lowHealthPulse = 0.0f;
     // Off by default: a run is meant to be survivable, not unlosable, and the
     // ammo/reload systems below only do anything when it is off (see
     // AmmoEnforced). The deployment screen offers it as an explicit choice per

@@ -328,6 +328,10 @@ struct Scene {
     GrenadeType selectedGrenade = GrenadeType::Frag;
     float molotovFireDuration = 9.0f;
     float molotovDamagePerSecond = 40.0f;
+    // Difficulty dial from the deployment screen: scales every source of enemy
+    // damage against the player. 1.0 is the balance the levels were tuned at.
+    // Applied through DamagePlayerFromEnemy, never to self-inflicted damage.
+    float enemyDamageMultiplier = 1.0f;
     float molotovMaterialDamagePerSecond = 34.0f;
     float molotovDamageCooldown = 0.0f;
     float vortexRadius = 7.5f;
@@ -668,16 +672,85 @@ struct Scene {
     void DamagePlayer(float damage) {
         if (player.godMode || damage <= 0.0f || player.health <= 0.0f) return;
         player.health = (std::max)(0.0f, player.health - damage);
-        player.damageFlash = 0.22f;
+
+        // Severity drives every hit reaction, on a curve rather than a ratio.
+        //
+        // A plain damage/reference ratio does not work across this range: the
+        // sources span 2.4 (rifle round) to 100 (point-blank C4), a factor of
+        // 40. Divide by a quarter of max health and everything above 25 damage
+        // saturates, so a grenade and a C4 charge feel identical; divide by full
+        // health instead and a rifle round lands at 0.024 and feels like
+        // nothing. The square root compresses the top of the range while
+        // lifting the bottom, keeping all of it distinguishable.
+        //
+        // Held rather than overwritten while a stronger flash is still fading,
+        // so a graze cannot cancel the kick from a grenade.
+        const float normalized =
+            damage / (std::max)(1.0f, player.maxHealth);
+        const float severity = (std::min)(1.0f, std::sqrt(normalized));
+        player.damageFlashSeverity =
+            (std::max)(player.damageFlashSeverity, severity);
+        // Bigger hits flash longer as well as harder.
+        player.damageFlash = (std::max)(player.damageFlash,
+                                        0.22f + severity * 0.30f);
+
+        // Camera kick, scaled the same way. Reuses the explosion trauma channel
+        // the shake already reads, so a hit physically jolts the view instead of
+        // only tinting it. Capped below a full explosion: taking a rifle round
+        // should stagger the aim, not throw it off the target entirely.
+        camera.AddHitTrauma(0.14f + severity * 0.42f);
+
+        player.damageFlash = (std::min)(player.damageFlash, 0.55f);
         // Restart the hold-off on every hit, including the one that kills, so a
         // revive does not inherit a nearly expired timer.
         player.regenTimer = player.regenDelay;
+    }
+
+    // Damage with a known origin: records the direction so the HUD can show
+    // where it came from. Everything else is identical to DamagePlayer.
+    void DamagePlayerFrom(float damage, const XMFLOAT3& source) {
+        if (player.godMode || damage <= 0.0f || player.health <= 0.0f) return;
+        const float dx = source.x - camera.Position.x;
+        const float dz = source.z - camera.Position.z;
+        const float lengthSq = dx * dx + dz * dz;
+        if (lengthSq > 1e-4f) {
+            const float inverse = 1.0f / std::sqrt(lengthSq);
+            player.lastHitDirX = dx * inverse;
+            player.lastHitDirZ = dz * inverse;
+            player.hitIndicator = 1.0f;
+        }
+        DamagePlayer(damage);
+    }
+
+    // Damage dealt to the player *by the enemy* -- bullets, grenades, molotovs.
+    // Scaled by the deployment screen's difficulty multiplier.
+    //
+    // Deliberately separate from DamagePlayer rather than folding the multiplier
+    // in there, because several callers are not the enemy hurting the player:
+    // fall damage from a cut rappel rope, riding a helicopter into the ground,
+    // going down with the sinking boat, and barrels the player usually shot
+    // themselves. Scaling those would make a "harder enemies" dial quietly
+    // change how far the player can safely fall, which is not what it says.
+    void DamagePlayerFromEnemy(float damage) {
+        DamagePlayer(damage * enemyDamageMultiplier);
+    }
+
+    // Enemy damage with a known origin, for the directional hit indicator.
+    void DamagePlayerFromEnemyAt(float damage, const XMFLOAT3& source) {
+        DamagePlayerFrom(damage * enemyDamageMultiplier, source);
     }
 
     void RestorePlayerHealth() {
         player.health = player.maxHealth;
         player.damageFlash = 0.0f;
         player.regenTimer = 0.0f;
+        // Clear the hit reactions too, or a respawn inherits the vignette,
+        // heartbeat and direction wedge from however the last life ended.
+        player.damageFlashSeverity = 0.0f;
+        player.hitIndicator = 0.0f;
+        player.lowHealthPulse = 0.0f;
+        player.lastHitDirX = 0.0f;
+        player.lastHitDirZ = 0.0f;
         // Ammo rides along with health: every caller (level start, editor play,
         // the debug Restore button) wants a fully kitted player, and refilling
         // here keeps the two from drifting apart.
@@ -702,7 +775,14 @@ struct Scene {
         // Rifle rounds stay at the long-standing 2.4 chip damage. Enemy shotgun
         // pellets and sniper rounds carry a multiplier so one hit means something
         // without needing a separate hit path.
-        DamagePlayer(2.4f * p.damageMultiplier);
+        //
+        // Back along the round's own travel to find the shooter: the projectile
+        // carries no origin, but its direction is exactly the bearing the shot
+        // came from, which is all the indicator needs.
+        const XMFLOAT3 origin{ p.position.x - p.direction.x * 8.0f,
+                               p.position.y - p.direction.y * 8.0f,
+                               p.position.z - p.direction.z * 8.0f };
+        DamagePlayerFromEnemyAt(2.4f * p.damageMultiplier, origin);
         p.active = false;
         return true;
     }
@@ -714,9 +794,30 @@ struct Scene {
         molotovDamageCooldown = (std::max)(
             0.0f, molotovDamageCooldown - dt);
         player.damageFlash = (std::max)(0.0f, player.damageFlash - dt);
+        // Severity follows the flash down so the next hit starts from a clean
+        // slate; without this a single grenade would keep every later graze at
+        // grenade strength for the rest of the run.
+        if (player.damageFlash <= 0.0f) player.damageFlashSeverity = 0.0f;
+        // Slower than the flash on purpose -- see the field comment.
+        player.hitIndicator = (std::max)(0.0f, player.hitIndicator - dt * 0.55f);
+
+        // Low-health ramp. Eases in and out rather than snapping at the
+        // threshold, so crossing it is a mood change and not a light switch.
+        {
+            const float fraction = player.maxHealth > 0.0f
+                ? player.health / player.maxHealth : 1.0f;
+            constexpr float kLowHealthThreshold = 0.35f;
+            const float target = (player.health > 0.0f &&
+                                  fraction < kLowHealthThreshold)
+                ? 1.0f - fraction / kLowHealthThreshold
+                : 0.0f;
+            const float rate = target > player.lowHealthPulse ? 2.4f : 1.1f;
+            player.lowHealthPulse += (target - player.lowHealthPulse) *
+                                     (std::min)(1.0f, rate * dt);
+        }
         if (playerBurnTime > 0.0f) {
             playerBurnTime = (std::max)(0.0f, playerBurnTime - dt);
-            DamagePlayer(molotovDamagePerSecond * 0.62f * dt);
+            DamagePlayerFromEnemy(molotovDamagePerSecond * 0.62f * dt);
         }
 
         // Health regen. Death is final: at zero health the timer stops rather

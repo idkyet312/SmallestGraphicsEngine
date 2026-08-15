@@ -294,6 +294,13 @@ public:
         explosionFovKick_ = (std::max)(explosionFovKick_, 3.2f * falloff);
     }
 
+    // Sharp jolt from taking a hit. Feeds the same shake the explosion uses so
+    // there is one place that moves the view, but capped well below a blast:
+    // being shot should punch the aim off, not blind the player.
+    void AddHitTrauma(float amount) {
+        explosionTrauma_ = (std::min)(0.72f, explosionTrauma_ + amount);
+    }
+
     float ExplosionFovKick() const { return explosionFovKick_; }
 
     void Jump() {

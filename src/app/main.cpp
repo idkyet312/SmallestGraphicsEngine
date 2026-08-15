@@ -334,6 +334,10 @@ unsigned int                g_scatterEnemiesSeed = 0;
 // The seed the last scatter actually ran with, surfaced in the debug UI so a
 // clock-seeded layout can be pinned after the fact.
 unsigned int                g_scatterEnemiesLastSeed = 0;
+// Seed of the last deployment-screen randomize roll. Distinct from the scatter
+// seed above: this one covers the whole roll (time, weather, fog and layout),
+// and the scatter seed is one value derived from it. 0 = never rolled.
+unsigned int                g_lastDeploymentRollSeed = 0;
 // Time of day for the next run, chosen on the deployment screen and applied at
 // DEPLOY. Afternoon is the look every level shipped with before the choice
 // existed, so it stays the default.
@@ -437,6 +441,9 @@ GunAudio                    g_helicopterHoverAudio;
 GunAudio                    g_blackHawkAlarmAudio;
 static float&               g_banditVoiceCooldown = g_enemySystem.voiceCooldown;
 static float&               g_banditPainCooldown = g_enemySystem.painCooldown;
+// Lockout on the player's own hit sound, so a burst lands as one impact rather
+// than several overlapping copies of the same sample.
+static float                g_playerPainCooldown = 0.0f;
 static float&               g_fleshHitPitchMin = g_game.combat.fleshHitPitchMin;
 static float&               g_fleshHitPitchMax = g_game.combat.fleshHitPitchMax;
 static bool&                g_suppressFireUntilMouseRelease =
@@ -2740,6 +2747,11 @@ static void ConfigureHumveeBounds() {
 // left. Raise grenadeThrowSpeed or grenadeFuse before raising this.
 static constexpr float kBanditGrenadeMinRange = 12.0f;
 static constexpr float kBanditGrenadeMaxRange = 22.0f;
+// How much further a bandit picks out an occupied insertion craft than a man on
+// foot. A helicopter or boat is large, loud and against open sky or water, so it
+// is spotted well beyond infantry range -- but through the same visibility
+// scaling, so fog and darkness still cover the approach.
+static constexpr float kInsertionVehicleSpotRangeScale = 2.6f;
 // Seconds between throws for one bandit, randomised per throw so a group does not
 // settle into a synchronised rhythm.
 static constexpr float kBanditGrenadeCooldownMin = 9.0f;
@@ -3080,6 +3092,65 @@ static void ScatterEnemiesOnNavmesh() {
         " bandits (seed " + std::to_string(seed) +
         (failed ? ", " + std::to_string(failed) + " navmesh samples failed" : "") +
         ")");
+}
+
+// One-button run randomizer for the deployment screen.
+//
+// Rolls the conditions that change how a run plays -- light, weather, fog and
+// enemy layout -- from a single seed, so a roll is reproducible and can be
+// shared or replayed by typing the seed back into the debug field. Returns the
+// seed it used.
+//
+// Deliberately does not touch the loadout or insertion mode: those are the
+// player's tactical answer to the conditions, and rolling them too would leave
+// nothing to decide on this screen.
+static unsigned int RandomizeDeployment(unsigned int seed = 0) {
+    if (seed == 0) seed = static_cast<unsigned int>(std::time(nullptr));
+    std::mt19937 generator(seed);
+
+    // Time of day: all four presets are equally likely.
+    std::uniform_int_distribution<int> pickTime(
+        0, static_cast<int>(TimeOfDay::Night));
+    g_selectedTimeOfDay = static_cast<TimeOfDay>(pickTime(generator));
+    ApplyTimeOfDay(g_selectedTimeOfDay);
+
+    // Weather: Clear..Storm only. Custom is the sentinel meaning "fog sliders
+    // were hand-edited", not a preset, so rolling it would apply whatever fog
+    // happened to be left over and read as the randomizer doing nothing.
+    std::uniform_int_distribution<int> pickWeather(
+        0, static_cast<int>(WeatherState::Storm));
+    const auto weather = static_cast<WeatherState>(pickWeather(generator));
+    ApplyLiveWeatherState(weather);
+
+    // Fog density, jittered around whatever the rolled weather set. Scaling the
+    // preset rather than picking an absolute keeps a Clear roll thin and a Fog
+    // roll thick, so the weather choice still means something.
+    {
+        VolumetricFogSettings& fog = VolumetricFogFor(g_selectedTimeOfDay);
+        if (fog.enabled) {
+            std::uniform_real_distribution<float> jitter(0.65f, 1.55f);
+            fog.density = std::clamp(fog.density * jitter(generator),
+                                     0.0001f, 0.05f);
+            ApplyVolumetricFogSettings(fog);
+        }
+        // Enemy sight keys off light and fog, so it has to be recomputed after
+        // the density lands rather than left on ApplyLiveWeatherState's value.
+        UpdateEnemyVisionForCurrentConditions();
+    }
+
+    // Enemy layout. Derived from the same generator so the whole roll travels
+    // under one seed; a zero would mean "reseed from the clock" to the scatter
+    // and break that, hence the 1-based range.
+    std::uniform_int_distribution<unsigned int> pickScatter(
+        1u, 0xfffffffeu);
+    g_scatterEnemiesSeed = pickScatter(generator);
+    ScatterEnemiesOnNavmesh();
+
+    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+        std::string("Deployment randomized (seed ") + std::to_string(seed) +
+        "): " + TimeOfDayName(g_selectedTimeOfDay) + ", " +
+        WeatherStateName(weather));
+    return seed;
 }
 
 static bool SpawnHumveeTurretGunner(int vehicleIndex) {
@@ -8601,12 +8672,54 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     else
         ImGui::TextDisabled(
             "Ammo is limited to your two weapons. Reload with R.");
+
+    // Enemy lethality. Scales incoming fire, grenades and molotovs only --
+    // falls, crashes and your own grenades are unaffected, so this stays a
+    // statement about the enemy rather than a global fragility slider.
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::SliderFloat("Enemy damage##DeploymentEnemyDamage",
+                       &scene.enemyDamageMultiplier, 0.25f, 3.0f, "x%.2f");
+    {
+        // Quote the practical consequence rather than the raw factor: rifle
+        // chip damage is the number the player actually feels, and shots-to-kill
+        // is what the multiplier really changes.
+        const float perShot = 2.4f * scene.enemyDamageMultiplier;
+        const int shots = perShot > 0.0f
+            ? static_cast<int>(std::ceil(scene.player.maxHealth / perShot))
+            : 0;
+        if (scene.player.godMode)
+            ImGui::TextDisabled("No effect while god mode is on.");
+        else
+            ImGui::TextDisabled(
+                "%.1f damage per rifle hit -- %d to drop you from full health.",
+                perShot, shots);
+    }
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
 
     // Time of day. Applied live as it is picked rather than waiting for DEPLOY,
     // so the planning fly-through shows the light the run will actually be
     // fought in -- picking Night and then dropping into daylight would make the
     // choice meaningless on the one screen that can preview it.
+    // One roll for every condition below: time, weather, fog density and the
+    // enemy layout. Sits above them so it reads as covering the whole section,
+    // and the controls it drives stay editable afterwards -- a roll is a
+    // starting point, not a lock.
+    ImGui::SeparatorText("RANDOMIZE");
+    ImGui::SetCursorPosX(45.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.28f, 0.10f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                          ImVec4(0.54f, 0.36f, 0.14f, 1.0f));
+    if (ImGui::Button("RANDOMIZE CONDITIONS", ImVec2(340.0f, 34.0f)))
+        g_lastDeploymentRollSeed = RandomizeDeployment();
+    ImGui::PopStyleColor(2);
+    if (g_lastDeploymentRollSeed != 0)
+        ImGui::TextDisabled("Roll seed %u -- reuse it to replay this layout.",
+                            g_lastDeploymentRollSeed);
+    else
+        ImGui::TextDisabled("Rolls time, weather, fog and enemy positions.");
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+
     ImGui::SeparatorText("TIME OF DAY");
     const auto timeButton = [&](TimeOfDay time, float width) {
         const bool selected = g_selectedTimeOfDay == time;
@@ -12722,6 +12835,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         g_banditDeathAudio.Update();
         g_banditHitVoiceAudio.Update();
         g_enemySystem.TickCooldowns(deltaTime);
+        g_playerPainCooldown = (std::max)(0.0f, g_playerPainCooldown - deltaTime);
 
         if (scene.rebuildDestructionRequested && wallModel) {
             scene.rebuildDestructionRequested = false;
@@ -12852,9 +12966,37 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     else
                         bandit->leashPosition = scene.camera.Position;
                 }
-                const bool attackingInsertionVehicle =
+                // Shooting at the insertion craft needs the same perception a
+                // shot at anything else does: close enough to make it out, and
+                // an unobstructed line to it.
+                //
+                // This used to be occupancy plus faction alone, so the moment
+                // the craft carried the player every bandit on the island
+                // opened up on it -- through fog, through hillsides, at night,
+                // from the far shore. That made the weather and time-of-day
+                // choice worthless on approach, which is the one stretch where
+                // cover matters most: the player cannot shoot back or break
+                // away from the flight path.
+                //
+                // Aircraft read from further off than a man on foot: they are
+                // large, loud and skylined, so the range gets a multiplier
+                // rather than reusing the infantry figure unchanged. It is
+                // still scaled by g_enemyVisionScale, which already folds in
+                // both the light level and the fog density -- so dense fog or
+                // a night insertion genuinely hides the approach.
+                bool attackingInsertionVehicle =
                     insertionVehicleOccupied &&
                     bandit->faction == Faction::Bandit;
+                if (attackingInsertionVehicle) {
+                    const float vdx = insertionVehicleTarget.x - bandit->position.x;
+                    const float vdy = insertionVehicleTarget.y - bandit->position.y;
+                    const float vdz = insertionVehicleTarget.z - bandit->position.z;
+                    const float distanceSq = vdx * vdx + vdy * vdy + vdz * vdz;
+                    const float spotRange =
+                        bandit->VisionRange() * kInsertionVehicleSpotRangeScale;
+                    attackingInsertionVehicle = distanceSq <= spotRange * spotRange &&
+                        BanditHasLineOfSight(*bandit, insertionVehicleTarget);
+                }
                 const XMFLOAT3 target = attackingInsertionVehicle
                     ? insertionVehicleTarget
                     : NearestHostileTarget(
@@ -13566,9 +13708,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                             const float reach = enemyRadius;
                             if (playerRange < reach) {
                                 const float falloff = 1.0f - playerRange / reach;
-                                scene.DamagePlayer(
+                                const float blast =
                                     (c4Blast ? 100.0f
-                                             : scene.grenadePlayerDamage) * falloff);
+                                             : scene.grenadePlayerDamage) * falloff;
+                                // Only an enemy throw answers to the difficulty
+                                // multiplier. Standing on your own grenade is a
+                                // mistake the player made, and scaling it would
+                                // punish them for a dial about enemy lethality.
+                                if (projectile.hostile)
+                                    scene.DamagePlayerFromEnemyAt(blast, center);
+                                else
+                                    scene.DamagePlayer(blast);
                             }
                         }
                         // Run after Bandit damage. Newly killed enemies have
@@ -14139,7 +14289,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 } else if (projectile.hostile) {
                     // Player is tested last. Any world or character mesh in
                     // front consumes the shot first, preventing wall penetration.
-                    scene.HitPlayerProjectile(projectile);
+                    if (scene.HitPlayerProjectile(projectile) &&
+                        g_playerPainCooldown <= 0.0f) {
+                        // Rounds landing on the player were silent: enemies grunt
+                        // when hit and the player did not, so incoming fire read
+                        // as weightless. Same flesh sample the enemies use,
+                        // pitched down and played loud -- it is your own body, so
+                        // it is the closest sound in the mix.
+                        const float painPitch =
+                            0.78f + ((float)std::rand() / RAND_MAX) * 0.10f;
+                        g_hitAudio.Play(0.95f, painPitch);
+                        // Short lockout so a burst or a shotgun spread does not
+                        // stack into a single clipped roar.
+                        g_playerPainCooldown = 0.18f;
+                    }
                 }
             }
         }
