@@ -6,6 +6,7 @@
 #include "ClusteredRendererDX12.h"
 #include "PlayerState.h"
 #include "MissionSystem.h"
+#include "Weather.h"
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
@@ -355,6 +356,7 @@ struct Scene {
     float atmosphereCloudBaseHeight = 1240.0f;
     float atmosphereCloudThickness = 1530.0f;
     // -- Weather ---------------------------------------------------------
+    WeatherState weatherState = WeatherState::Cloudy;
     // Rainfall, 0 clear to 1 downpour. Drives the rain renderer's drop count
     // and, through the deployment screen, the fog density that decides how far
     // anything can see -- so weather is a gameplay setting, not only a visual
@@ -406,6 +408,31 @@ struct Scene {
     XMFLOAT3 volumetricFogTint = {
         168.0f / 255.0f, 181.0f / 255.0f, 176.0f / 255.0f
     };
+
+    void ApplyWeatherPreset(WeatherState state) {
+        weatherState = state;
+        if (state == WeatherState::Custom) return;
+
+        const WeatherSettings weather = MakeWeatherSettings(state);
+        rainIntensity = weather.rainIntensity;
+        windVelocity = weather.windVelocity;
+        atmosphereCloudCoverage = weather.skyCloudCoverage;
+        atmosphereCloudDensity = weather.skyCloudDensity;
+        atmosphereCloudBaseHeight = weather.skyCloudBaseHeight;
+        atmosphereCloudThickness = weather.skyCloudThickness;
+        enableFlyableClouds = weather.worldClouds;
+        flyableCloudBaseHeight = weather.worldCloudBaseHeight;
+        flyableCloudThickness = weather.worldCloudThickness;
+        flyableCloudDensity = weather.worldCloudDensity;
+        flyableCloudCoverage = weather.worldCloudCoverage;
+        enableVolumetricFog = weather.volumetricFog;
+        volumetricFogDensity = weather.fogDensity;
+        volumetricFogAnisotropy = weather.fogAnisotropy;
+        volumetricFogHeightFalloff = weather.fogHeightFalloff;
+        volumetricFogBaseHeight = weather.fogBaseHeight;
+        volumetricFogDistance = weather.fogDistance;
+        volumetricFogTint = weather.fogTint;
+    }
     bool  enableAmbientOcclusion = true;
     float ambientOcclusionRadius = 0.69f;
     float ambientOcclusionStrength = 1.50f;

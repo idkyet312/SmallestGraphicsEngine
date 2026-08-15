@@ -13,6 +13,7 @@
 #include "LevelRuntimeBuilder.h"
 #include "PlayerState.h"
 #include "TimeOfDay.h"
+#include "Weather.h"
 #include "PlayerMovementTracker.h"
 #include "ProceduralRunAnimation.h"
 #include "RenderCoordinator.h"
@@ -964,6 +965,46 @@ int main() {
             for (size_t j = i + 1; j < std::size(all); ++j)
                 CHECK(std::string(TimeOfDayName(all[i])) !=
                       std::string(TimeOfDayName(all[j])));
+    }
+
+    // ---- Weather -------------------------------------------------------------
+    {
+        const WeatherSettings clear =
+            MakeWeatherSettings(WeatherState::Clear);
+        const WeatherSettings cloudy =
+            MakeWeatherSettings(WeatherState::Cloudy);
+        const WeatherSettings fog =
+            MakeWeatherSettings(WeatherState::Fog);
+        const WeatherSettings rain =
+            MakeWeatherSettings(WeatherState::Rain);
+        const WeatherSettings storm =
+            MakeWeatherSettings(WeatherState::Storm);
+
+        CHECK(clear.rainIntensity == 0.0f);
+        CHECK(!clear.worldClouds);
+        CHECK(!clear.volumetricFog);
+        CHECK(cloudy.worldClouds);
+        CHECK(cloudy.worldCloudThickness > 0.0f);
+        CHECK(fog.volumetricFog);
+        CHECK(!fog.worldClouds);
+        CHECK(fog.fogDensity > cloudy.fogDensity);
+        CHECK(rain.rainIntensity > 0.0f);
+        CHECK(storm.rainIntensity > rain.rainIntensity);
+        CHECK(storm.fogDensity > rain.fogDensity);
+        CHECK(storm.worldCloudCoverage > rain.worldCloudCoverage);
+
+        const WeatherState all[] = {
+            WeatherState::Clear, WeatherState::Cloudy, WeatherState::Fog,
+            WeatherState::Rain, WeatherState::Storm, WeatherState::Custom
+        };
+        for (const WeatherState state : all) {
+            CHECK(WeatherStateName(state)[0] != '\0');
+            CHECK(WeatherStateBriefing(state)[0] != '\0');
+        }
+        for (size_t i = 0; i < std::size(all); ++i)
+            for (size_t j = i + 1; j < std::size(all); ++j)
+                CHECK(std::string(WeatherStateName(all[i])) !=
+                      std::string(WeatherStateName(all[j])));
     }
 
     return failures ? 1 : 0;

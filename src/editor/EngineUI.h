@@ -46,6 +46,7 @@ void BanditDebugText();
 extern bool g_showEnemyVisionCones;
 void RequestLiveDXRDDGIRebuild();
 void MatchFoliageMaterialToGrass();
+void ApplyLiveWeatherState(WeatherState state);
 
 // Comm-tower objective status for the HUD. Returns false when the level has no
 // tower (or it has already been destroyed), so the readout only appears on maps
@@ -1311,6 +1312,17 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         if (scene.enableGrassMSAA && !scene.useVisibilityBuffer)
             ImGui::TextDisabled("Grass MSAA active only in Visibility Buffer");
         ImGui::Checkbox("FXAA", &scene.enableFXAA);
+
+        static constexpr const char* kWeatherNames[] = {
+            "Clear", "Cloudy", "Dense Fog", "Rain", "Storm", "Custom"
+        };
+        int weatherIndex = static_cast<int>(scene.weatherState);
+        if (ImGui::Combo("Weather State", &weatherIndex, kWeatherNames,
+                         IM_ARRAYSIZE(kWeatherNames))) {
+            ApplyLiveWeatherState(static_cast<WeatherState>(weatherIndex));
+        }
+        ImGui::TextDisabled("%s", WeatherStateBriefing(scene.weatherState));
+
         ImGui::Checkbox("Physical Atmosphere", &scene.enablePhysicalAtmosphere);
         if (scene.enablePhysicalAtmosphere) {
             ImGui::Checkbox("Sky Clouds: 3D Quality",
@@ -1327,35 +1339,40 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::SliderFloat("Aerial Perspective",
                                &scene.atmosphereAerialDensity,
                                0.0f, 2.0f, "%.2f");
-            ImGui::SliderFloat("Cloud Coverage",
-                               &scene.atmosphereCloudCoverage,
-                               0.0f, 1.0f, "%.2f");
-            ImGui::SliderFloat("Cloud Density",
-                               &scene.atmosphereCloudDensity,
-                               0.0f, 1.5f, "%.2f");
-            ImGui::DragFloat("Cloud Base",
-                             &scene.atmosphereCloudBaseHeight,
-                             10.0f, 50.0f, 5000.0f, "%.0f m");
-            ImGui::DragFloat("Cloud Thickness",
-                             &scene.atmosphereCloudThickness,
-                             10.0f, 50.0f, 5000.0f, "%.0f m");
+            bool weatherChanged = ImGui::SliderFloat(
+                "Cloud Coverage", &scene.atmosphereCloudCoverage,
+                0.0f, 1.0f, "%.2f");
+            weatherChanged |= ImGui::SliderFloat(
+                "Cloud Density", &scene.atmosphereCloudDensity,
+                0.0f, 1.5f, "%.2f");
+            weatherChanged |= ImGui::DragFloat(
+                "Cloud Base", &scene.atmosphereCloudBaseHeight,
+                10.0f, 50.0f, 5000.0f, "%.0f m");
+            weatherChanged |= ImGui::DragFloat(
+                "Cloud Thickness", &scene.atmosphereCloudThickness,
+                10.0f, 50.0f, 5000.0f, "%.0f m");
+            if (weatherChanged)
+                ApplyLiveWeatherState(WeatherState::Custom);
         }
-        ImGui::Checkbox("World Volumetric Clouds",
-                        &scene.enableFlyableClouds);
+        if (ImGui::Checkbox("World Volumetric Clouds",
+                            &scene.enableFlyableClouds))
+            ApplyLiveWeatherState(WeatherState::Custom);
         if (scene.enableFlyableClouds) {
             ImGui::TextDisabled("Replaces sky clouds; depth-occluded and fly-through");
-            ImGui::DragFloat("World Cloud Base",
-                             &scene.flyableCloudBaseHeight,
-                             1.0f, 0.0f, 0.0f, "%.1f m");
-            ImGui::DragFloat("World Cloud Thickness",
-                             &scene.flyableCloudThickness,
-                             1.0f, 0.0f, 0.0f, "%.1f m");
-            ImGui::DragFloat("World Cloud Density",
-                             &scene.flyableCloudDensity,
-                             0.01f, 0.0f, 0.0f, "%.3f");
-            ImGui::DragFloat("World Cloud Coverage",
-                             &scene.flyableCloudCoverage,
-                             0.01f, 0.0f, 0.0f, "%.3f");
+            bool weatherChanged = ImGui::DragFloat(
+                "World Cloud Base", &scene.flyableCloudBaseHeight,
+                1.0f, 0.0f, 0.0f, "%.1f m");
+            weatherChanged |= ImGui::DragFloat(
+                "World Cloud Thickness", &scene.flyableCloudThickness,
+                1.0f, 0.0f, 0.0f, "%.1f m");
+            weatherChanged |= ImGui::DragFloat(
+                "World Cloud Density", &scene.flyableCloudDensity,
+                0.01f, 0.0f, 0.0f, "%.3f");
+            weatherChanged |= ImGui::DragFloat(
+                "World Cloud Coverage", &scene.flyableCloudCoverage,
+                0.01f, 0.0f, 0.0f, "%.3f");
+            if (weatherChanged)
+                ApplyLiveWeatherState(WeatherState::Custom);
             const float cloudTop = scene.flyableCloudBaseHeight +
                 (std::max)(scene.flyableCloudThickness, 1.0f);
             if (scene.camera.Position.y >= scene.flyableCloudBaseHeight &&
@@ -1457,16 +1474,20 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::SliderFloat("Shaft Exposure", &scene.lightShaftExposure,
                                0.0f, 1.0f, "%.2f");
         }
-        ImGui::SliderFloat("Rain", &scene.rainIntensity, 0.0f, 1.0f, "%.2f");
+        if (ImGui::SliderFloat("Rain", &scene.rainIntensity,
+                               0.0f, 1.0f, "%.2f"))
+            ApplyLiveWeatherState(WeatherState::Custom);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
                 "Rainfall, 0 clear to 1 downpour. Scales the number of drops\n"
                 "rather than fading them, so light rain is sparse instead of\n"
                 "transparent. Costs nothing at 0.");
-        if (scene.rainIntensity > 0.0f)
+        if (scene.rainIntensity > 0.0f &&
             ImGui::DragFloat2("Wind", &scene.windVelocity.x,
-                              0.05f, -8.0f, 8.0f, "%.2f m/s");
-        ImGui::Checkbox("Volumetric Fog", &scene.enableVolumetricFog);
+                              0.05f, -8.0f, 8.0f, "%.2f m/s"))
+            ApplyLiveWeatherState(WeatherState::Custom);
+        if (ImGui::Checkbox("Volumetric Fog", &scene.enableVolumetricFog))
+            ApplyLiveWeatherState(WeatherState::Custom);
         if (scene.enableVolumetricFog) {
             if (scene.lightShaftMode == Scene::LightShaftMode::Volumetric) {
                 ImGui::Checkbox("High-Res Light Shafts",
@@ -1476,17 +1497,25 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                         "Doubles the fog grid to 128x72x96 (8x froxels).\n"
                         "Sharpens sun shafts through foliage at a GPU cost.");
             }
-            ImGui::DragFloat("Fog Density", &scene.volumetricFogDensity,
-                             0.0005f, 0.0001f, 0.05f, "%.4f");
-            ImGui::SliderFloat("Fog Anisotropy", &scene.volumetricFogAnisotropy,
-                               0.0f, 0.9f, "%.2f");
-            ImGui::ColorEdit3("Fog Tint", &scene.volumetricFogTint.x);
-            ImGui::SliderFloat("Fog Height Falloff", &scene.volumetricFogHeightFalloff,
-                               0.01f, 0.25f, "%.3f");
-            ImGui::DragFloat("Fog Base Height", &scene.volumetricFogBaseHeight,
-                             0.1f, -5.0f, 30.0f, "%.1f m");
-            ImGui::DragFloat("Fog Distance", &scene.volumetricFogDistance,
-                             5.0f, 20.0f, scene.cameraFar, "%.0f m");
+            bool weatherChanged = ImGui::DragFloat(
+                "Fog Density", &scene.volumetricFogDensity,
+                0.0005f, 0.0001f, 0.05f, "%.4f");
+            weatherChanged |= ImGui::SliderFloat(
+                "Fog Anisotropy", &scene.volumetricFogAnisotropy,
+                0.0f, 0.9f, "%.2f");
+            weatherChanged |= ImGui::ColorEdit3(
+                "Fog Tint", &scene.volumetricFogTint.x);
+            weatherChanged |= ImGui::SliderFloat(
+                "Fog Height Falloff", &scene.volumetricFogHeightFalloff,
+                0.01f, 0.25f, "%.3f");
+            weatherChanged |= ImGui::DragFloat(
+                "Fog Base Height", &scene.volumetricFogBaseHeight,
+                0.1f, -5.0f, 30.0f, "%.1f m");
+            weatherChanged |= ImGui::DragFloat(
+                "Fog Distance", &scene.volumetricFogDistance,
+                5.0f, 20.0f, scene.cameraFar, "%.0f m");
+            if (weatherChanged)
+                ApplyLiveWeatherState(WeatherState::Custom);
         }
         if (scene.enableMSAA &&
             (scene.useVisibilityBuffer || scene.useRaytracing)) {
