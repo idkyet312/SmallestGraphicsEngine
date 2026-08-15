@@ -187,23 +187,24 @@ inline TimeOfDaySettings MakeTimeOfDaySettings(TimeOfDay time) {
         settings.lightColor = { 0.42f, 0.54f, 0.92f };
         settings.directionalLightIntensity = 0.035f;
         settings.ambientStrength = 0.001f;
-        settings.ambientLightingIntensity = 0.004f;
+        settings.ambientLightingIntensity = 0.0f;
         settings.clearColor = { 0.0002f, 0.0005f, 0.0015f };
         // Thin the atmosphere hard: these scale the in-scattering that would
         // otherwise relight the night HDRI back to dusk.
         settings.atmosphereRayleighStrength = 0.035f;
         settings.atmosphereMieStrength = 0.01f;
         settings.atmosphereAerialDensity = 0.05f;
-        // Use the same authored volume as Afternoon. The fog shader supplies
-        // night illumination separately, so matching the daytime density,
-        // reach, phase and tint restores natural fog without relighting it.
-        settings.volumetricFogDensity = 0.009f;
-        settings.volumetricFogAnisotropy = 0.82f;
-        settings.volumetricFogHeightFalloff = 0.045f;
+        // Night needs a denser, nearly black ground layer than the daylight
+        // presets. Keep this authored separately so Reset Night fog restores
+        // the intended low-visibility look without changing other times.
+        settings.enableVolumetricFog = true;
+        settings.volumetricFogDensity = 0.0116f;
+        settings.volumetricFogAnisotropy = 0.31f;
+        settings.volumetricFogHeightFalloff = 0.107f;
         settings.volumetricFogBaseHeight = 0.4f;
         settings.volumetricFogDistance = 800.0f;
         settings.volumetricFogTint = {
-            168.0f / 255.0f, 181.0f / 255.0f, 176.0f / 255.0f
+            5.0f / 255.0f, 5.0f / 255.0f, 5.0f / 255.0f
         };
         break;
     case TimeOfDay::Afternoon:

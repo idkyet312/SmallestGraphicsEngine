@@ -4506,6 +4506,12 @@ static NightVisionDX12      nightVision;
 // green reads as a filter being applied rather than equipment being used.
 static bool                 g_nightVisionActive = false;
 static float                g_nightVisionBlend = 0.0f;
+// Automatic gain control state, carried between frames because adaptation is a
+// temporal effect the per-pixel shader has no memory to run itself. Starts wide
+// open, which is where a tube sits before it has seen any light.
+static float                g_nightVisionGain = 9.0f;
+// 0 in usable darkness, 1 when the scene is bright enough to wash the tube out.
+static float                g_nightVisionOverload = 0.0f;
 static VolumetricFogDX12    volumetricFog;
 static LightShaftsDX12      lightShafts;
 static ScreenSpaceAODX12    screenSpaceAO;
@@ -15151,6 +15157,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (g_game.loading.Active())
             g_game.loading.RecordSubmittedUploads(submittedUploads);
 
+        // NVG needs some real pre-tonemap surface signal to amplify. Temporarily
+        // add the requested world-ambient boost while goggles are raised,
+        // ramped with the eyepiece transition. Night uses 0.3; the brighter
+        // presets use 0.2. Restore the authored value before volumetric fog so
+        // the extra fill reveals geometry without lighting a screen-sized slab
+        // of atmosphere.
+        const float authoredAmbientLightingIntensity =
+            scene.ambientLightingIntensity;
+        const bool nvgWorldAmbientBoosted =
+            IsSceneScreen() && !g_game.loading.Active() &&
+            g_game.mission.Loadout().gear == GearType::NightVisionGoggles &&
+            scene.player.health > 0.0f &&
+            (g_nightVisionActive || g_nightVisionBlend > 0.001f);
+        if (nvgWorldAmbientBoosted) {
+            const float ambientBoostBlend = (std::max)(
+                g_nightVisionBlend, g_nightVisionActive ? 0.18f : 0.0f);
+            // Night has no authored base ambient, so its larger boost is the
+            // entire indirect signal available to the intensifier.
+            const float ambientBoost =
+                g_selectedTimeOfDay == TimeOfDay::Night ? 0.3f : 0.2f;
+            scene.ambientLightingIntensity +=
+                ambientBoost * ambientBoostBlend;
+        }
+
         XMMATRIX fogLightSpace = XMMatrixIdentity();
         ID3D12Resource* fogShadowResource = nullptr;
         bool renderedScene = false;
@@ -15557,7 +15587,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 const float noiseTime =
                     std::fmod(gameTimer.GetElapsed(), 1000.0f);
                 nightVision.Apply(g_dx12.commandList.Get(), noiseTime,
-                                  g_nightVisionBlend);
+                                  g_nightVisionBlend, g_nightVisionGain,
+                                  g_nightVisionOverload);
             }
         }
 

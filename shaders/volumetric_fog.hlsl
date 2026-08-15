@@ -394,8 +394,11 @@ float3 AtmosphereAmbient(float3 ray, float aboveBase)
     {
         float nightBlend = 1.0 - smoothstep(
             -0.10, 0.06, sunDirectionDensity.y);
+        // At night the weather tint describes hue, not a daylight-strength
+        // light source. Keep only a near-black trace so fog still has volume
+        // around silhouettes without becoming a self-lit grey veil under NVG.
         return lerp(
-            daylightAmbient, ambientFogColor.xyz * 0.12, nightBlend);
+            daylightAmbient, ambientFogColor.xyz * 0.035, nightBlend);
     }
     return daylightAmbient;
 }

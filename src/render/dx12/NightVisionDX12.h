@@ -10,8 +10,8 @@
 // Night vision goggles post-process. Structured exactly like FXAADX12: copy the
 // backbuffer aside, then draw a fullscreen triangle that samples the copy and
 // writes the intensified image back over the top. Sharing that shape keeps the
-// two passes interchangeable in the frame's post chain -- NVG runs after FXAA
-// and before ImGui, so the goggles never blur the HUD.
+// two passes interchangeable in the frame's post chain. NVG replaces FXAA while
+// raised and runs before ImGui, so source detail and HUD text both stay sharp.
 class NightVisionDX12 {
 public:
     bool initialized = false;
@@ -57,11 +57,14 @@ public:
         // float2 inverseScreenSize + float time + float strength.
         roots[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         roots[1].Constants.ShaderRegister = 0;
-        roots[1].Constants.Num32BitValues = 4;
+        roots[1].Constants.Num32BitValues = 8;
         roots[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_STATIC_SAMPLER_DESC sampler = {};
-        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        // This is a same-resolution scene copy. Point sampling preserves the
+        // exact source pixel; linear filtering made already-dark silhouettes
+        // look optically defocused before the intensifier curve even ran.
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
         sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -126,8 +129,13 @@ public:
 
     // strength is the 0..1 ramp; time drives the grain and is wrapped by the
     // caller so it never grows large enough to lose float precision in sin().
+    //
+    // gain is the automatic gain control level the caller has settled on for the
+    // current scene brightness, and overload is how far the tube is being driven
+    // past what it can handle -- 0 in proper darkness, rising toward 1 in
+    // daylight, where it washes the image out the way real goggles do.
     void Apply(ID3D12GraphicsCommandList* commandList, float time,
-               float strength) {
+               float strength, float gain, float overload) {
         if (!initialized || !commandList || !sceneCopy_) return;
         if (strength <= 0.0f) return;
         ID3D12Resource* backBuffer =
@@ -153,13 +161,17 @@ public:
         commandList->SetDescriptorHeaps(1, heaps);
         commandList->SetGraphicsRootDescriptorTable(
             0, srvHeap_->GetGPUDescriptorHandleForHeapStart());
-        const float constants[4] = {
+        const float constants[8] = {
             1.0f / static_cast<float>(width_),
             1.0f / static_cast<float>(height_),
             time,
-            strength
+            strength,
+            gain,
+            overload,
+            0.0f,
+            0.0f
         };
-        commandList->SetGraphicsRoot32BitConstants(1, 4, constants, 0);
+        commandList->SetGraphicsRoot32BitConstants(1, 8, constants, 0);
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         commandList->DrawInstanced(3, 1, 0, 0);
 
