@@ -7,53 +7,54 @@
 #include <fstream>
 #include <sstream>
 
-// Falling rain as a camera-following particle volume.
+// Falling rain as a world-anchored particle volume.
 //
 // Structured deliberately unlike ImpactParticleRendererDX12, which uploads one
 // instance record per particle from a CPU-simulated list and caps out at 1024.
 // Rain needs an order of magnitude more drops and none of them need individual
 // state: a drop's position is a pure function of its instance id and the clock.
 // So there is no instance buffer at all -- one DrawInstanced with a vertex
-// count of 6 and an instance count of however many drops the intensity calls
-// for, and the only per-frame upload is the constant buffer.
+// count of 18 and an instance count of however many drops the intensity calls
+// for. Each instance is a narrow triangular prism, not a camera-facing quad,
+// and the only per-frame upload is the constant buffer.
 //
 // Drawn after the opaque scene and the water so it can depth-test against both,
 // and before the fog and post chain so the fog tints it like anything else in
 // the world.
 struct alignas(256) RainFrameDX12 {
     XMMATRIX viewProjection;
-    XMFLOAT3 cameraPosition;
+    XMFLOAT3 lightDirection;
     float    time;
-    XMFLOAT3 cameraRight;
-    float    intensity;
-    XMFLOAT3 cameraUp;
-    float    fallSpeed;
     XMFLOAT3 windVelocity;
-    float    boxExtent;
+    float    intensity;
     XMFLOAT3 tint;
+    float    fallSpeed;
+    float    worldExtentX;
+    float    worldExtentZ;
     float    dropLength;
-    float    dropWidth;
-    float    boxHeight;
+    float    dropRadius;
     float    opacity;
+    float    worldBottom;
+    float    worldHeight;
     float    padding;
 };
 // Each float3 is followed by a float, so every one packs into a single 16-byte
 // register exactly as HLSL lays the matching cbuffer out. Reordering a field on
 // one side and not the other reads garbage rather than failing, so pin the size
-// the layout implies: 64 for the matrix plus six 16-byte rows.
-static_assert(offsetof(RainFrameDX12, cameraPosition) == 64);
-static_assert(offsetof(RainFrameDX12, cameraRight) == 80);
-static_assert(offsetof(RainFrameDX12, cameraUp) == 96);
-static_assert(offsetof(RainFrameDX12, windVelocity) == 112);
-static_assert(offsetof(RainFrameDX12, tint) == 128);
-static_assert(offsetof(RainFrameDX12, dropWidth) == 144);
+// the layout implies: 64 for the matrix plus five 16-byte rows.
+static_assert(offsetof(RainFrameDX12, lightDirection) == 64);
+static_assert(offsetof(RainFrameDX12, windVelocity) == 80);
+static_assert(offsetof(RainFrameDX12, tint) == 96);
+static_assert(offsetof(RainFrameDX12, worldExtentX) == 112);
+static_assert(offsetof(RainFrameDX12, opacity) == 128);
 
 class RainRendererDX12 {
 public:
     // Drops at full intensity. Each is 6 vertices with no instance data, so
     // this is cheap enough to leave high and scale down rather than resize
     // any buffer when the weather changes.
-    static constexpr UINT MaxDrops = 24000;
+    static constexpr UINT MaxDrops = 96000;
+    static constexpr UINT VerticesPerDrop = 18;
     bool initialized = false;
 
     bool Init() {
@@ -126,25 +127,32 @@ public:
         const XMMATRIX view = scene.GetViewMatrix();
         data.viewProjection =
             XMMatrixTranspose(view * scene.GetProjectionMatrix());
-        data.cameraPosition = scene.camera.Position;
+        XMStoreFloat3(&data.lightDirection, XMVector3Normalize(
+            XMLoadFloat3(&scene.lightPos)));
         data.time = time;
-        const XMMATRIX inverseView = XMMatrixTranspose(view);
-        XMStoreFloat3(&data.cameraRight,
-            XMVector3Normalize(XMVectorSetW(inverseView.r[0], 0.0f)));
-        XMStoreFloat3(&data.cameraUp,
-            XMVector3Normalize(XMVectorSetW(inverseView.r[1], 0.0f)));
         data.intensity = intensity;
         data.fallSpeed = kFallSpeed;
         data.windVelocity = windVelocity;
-        data.boxExtent = kBoxExtent;
-        data.boxHeight = kBoxHeight;
+        data.worldExtentX = kBaseWorldExtent * (std::max)(
+            0.5f, (std::min)(scene.terrainIslandScaleX, 12.0f));
+        data.worldExtentZ = kBaseWorldExtent * (std::max)(
+            0.5f, (std::min)(scene.terrainIslandScaleZ, 12.0f));
         data.dropLength = kDropLength;
-        data.dropWidth = kDropWidth;
+        data.dropRadius = kDropRadius;
+        data.worldBottom = kWorldBottom;
+        data.worldHeight = kWorldHeight;
         // Rain is lit by the sky, not by its own colour, so it takes the
         // ambient level with it: a downpour at noon is bright grey, the same
         // rain at night is barely visible except against lights.
-        const float ambient =
-            (std::min)(1.0f, 0.10f + scene.ambientLightingIntensity * 1.9f);
+        //
+        // The floor has to stay well under the night ambient (0.004) or it
+        // becomes the only term that matters and night rain renders at day
+        // brightness. 0.03 leaves the streaks as faint silhouettes -- readable
+        // against muzzle flashes and local lights, invisible against the sky --
+        // while daylight is unchanged, since 0.34 ambient upward already
+        // saturates the sum.
+        const float ambient = (std::min)(
+            1.0f, 0.03f + scene.ambientLightingIntensity * 1.9f);
         data.tint = { 0.62f * ambient, 0.70f * ambient, 0.80f * ambient };
         data.opacity = kOpacity;
         frames_.CopyData(frame, data);
@@ -162,18 +170,21 @@ public:
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const UINT target = hdrTarget ? 1u : (msaaTarget ? 2u : 0u);
         commandList->SetPipelineState(pipelines_[target].Get());
-        commandList->DrawInstanced(6, drops, 0, 0);
+        commandList->DrawInstanced(VerticesPerDrop, drops, 0, 0);
     }
 
 private:
     // Tuning. Held here rather than in Scene because these describe what rain
     // is, not what this run's weather is -- intensity and wind are the dials
     // the game actually turns.
-    static constexpr float kFallSpeed = 18.0f;   // m/s, terminal-ish for a drop
-    static constexpr float kBoxExtent = 26.0f;   // half-width of the volume
-    static constexpr float kBoxHeight = 34.0f;
+    static constexpr float kFallSpeed = 54.0f;   // 3x the original 18 m/s rate
+    // The procedural shore ends around 88 m at scale 1. The extra margin keeps
+    // the precipitation boundary beyond the water immediately around it.
+    static constexpr float kBaseWorldExtent = 104.0f;
+    static constexpr float kWorldBottom = -12.0f;
+    static constexpr float kWorldHeight = 220.0f;
     static constexpr float kDropLength = 0.85f;
-    static constexpr float kDropWidth = 0.014f;
+    static constexpr float kDropRadius = 0.018f;
     static constexpr float kOpacity = 0.55f;
 
     bool CreatePipelines(ID3DBlob* vs, ID3DBlob* ps) {

@@ -1240,6 +1240,7 @@ static void PlayMetalHitAudio(const XMFLOAT3& position, float volumeScale = 1.0f
 
 // Both defined with the other scene helpers, below.
 static void ApplyTimeOfDay(TimeOfDay time);
+void ApplyLiveWeatherState(WeatherState state);
 // Defined next to the sky renderer, which is declared later than ApplyTimeOfDay.
 static void RequestTimeOfDaySkyEnvironment(TimeOfDay time);
 
@@ -2275,6 +2276,37 @@ static void UpdateHelicopter(float dt) {
 static float RandomUnit();
 static bool SpawnDropshipBandit(const XMFLOAT3& position);
 
+static void UpdateEnemyVisionForCurrentConditions() {
+    TimeOfDaySettings applied = MakeTimeOfDaySettings(g_selectedTimeOfDay);
+    applied.enableVolumetricFog = scene.enableVolumetricFog;
+    applied.volumetricFogDensity = scene.volumetricFogDensity;
+    applied.volumetricFogDistance = scene.volumetricFogDistance;
+    g_enemyVisionScale = TimeOfDayVisibilityFactor(applied);
+}
+
+// Weather is an authored group rather than a rain toggle: every preset moves
+// precipitation, wind, both cloud layers and fog together. The fog copy is
+// kept with the selected time so switching the sun away and back does not
+// silently replace the chosen weather with that time's previous fog override.
+void ApplyLiveWeatherState(WeatherState state) {
+    scene.ApplyWeatherPreset(state);
+    if (state != WeatherState::Custom) {
+        VolumetricFogSettings& fog =
+            VolumetricFogFor(g_selectedTimeOfDay);
+        fog = {scene.enableVolumetricFog,
+               scene.volumetricFogDensity,
+               scene.volumetricFogAnisotropy,
+               scene.volumetricFogHeightFalloff,
+               scene.volumetricFogBaseHeight,
+               scene.volumetricFogDistance,
+               scene.volumetricFogTint};
+    }
+    UpdateEnemyVisionForCurrentConditions();
+    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+        std::string("Weather set to ") + WeatherStateName(state) +
+        " (enemy sight x" + std::to_string(g_enemyVisionScale) + ")");
+}
+
 // Pushes a time-of-day preset onto the live scene. Every field moves together:
 // the sky, volumetric fog and DDGI all read scene.lightPos as the sun
 // direction, so changing the key light without the atmosphere alongside it
@@ -2293,6 +2325,9 @@ static void ApplyTimeOfDay(TimeOfDay time) {
     // Fog comes from the per-time override rather than the preset, so values
     // tuned on the deployment screen survive DEPLOY and any later re-apply.
     ApplyVolumetricFogSettings(VolumetricFogFor(time));
+    // Weather remains authoritative over its fog component when the sun moves.
+    // Custom retains the per-time fog that was just restored above.
+    ApplyLiveWeatherState(scene.weatherState);
     // The demo light animation walks lightPos around on its own, which would
     // drag a chosen sun back out of place within a few seconds.
     scene.animateDemoLights = false;
@@ -2310,12 +2345,7 @@ static void ApplyTimeOfDay(TimeOfDay time) {
     // actually applied -- fog comes from the player's per-time override, not
     // the preset -- so tuning the fog on the deployment screen moves enemy
     // perception with it rather than leaving the two disagreeing.
-    TimeOfDaySettings applied = settings;
-    const VolumetricFogSettings& fog = VolumetricFogFor(time);
-    applied.enableVolumetricFog = fog.enabled;
-    applied.volumetricFogDensity = fog.density;
-    applied.volumetricFogDistance = fog.distance;
-    g_enemyVisionScale = TimeOfDayVisibilityFactor(applied);
+    UpdateEnemyVisionForCurrentConditions();
 
     SGE_LOG("LogGameplay", EngineLog::Level::Display,
         std::string("Time of day set to ") + TimeOfDayName(time) +
@@ -8604,6 +8634,18 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     ImGui::SameLine();
     timeButton(TimeOfDay::Night, kTimeButtonWidth);
     ImGui::TextWrapped("%s", TimeOfDayBriefing(g_selectedTimeOfDay));
+
+    ImGui::SeparatorText("WEATHER");
+    static constexpr const char* kWeatherNames[] = {
+        "Clear", "Cloudy", "Dense Fog", "Rain", "Storm", "Custom"
+    };
+    int weatherIndex = static_cast<int>(scene.weatherState);
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::Combo("State##DeploymentWeather", &weatherIndex,
+                     kWeatherNames, IM_ARRAYSIZE(kWeatherNames))) {
+        ApplyLiveWeatherState(static_cast<WeatherState>(weatherIndex));
+    }
+    ImGui::TextWrapped("%s", WeatherStateBriefing(scene.weatherState));
     // Spell out the perception the choice actually buys. This used to say
     // enemies see no better in the dark, which was true when the sight range
     // was a constant and is now the opposite of what happens.
@@ -8667,7 +8709,11 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             fog = MakeDefaultVolumetricFogSettings(g_selectedTimeOfDay);
             fogChanged = true;
         }
-        if (fogChanged) ApplyVolumetricFogSettings(fog);
+        if (fogChanged) {
+            scene.weatherState = WeatherState::Custom;
+            ApplyVolumetricFogSettings(fog);
+            ApplyLiveWeatherState(WeatherState::Custom);
+        }
     }
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
     ImGui::SeparatorText("INSERTION");
