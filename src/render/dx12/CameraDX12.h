@@ -33,6 +33,32 @@ public:
     float Gravity;
     float JumpStrength;
 
+    // Swimming. WaterSurfaceY is pushed in each frame by the caller, which owns
+    // the ocean; the camera only compares against it. NoWater parks the surface
+    // below every level so the check is a no-op until someone sets it.
+    static constexpr float NoWater = -1e9f;
+    float WaterSurfaceY = NoWater;
+    bool IsSwimming = false;
+    // Vertical swim input for this frame: +1 rising, -1 diving, 0 coasting.
+    float SwimInput = 0.0f;
+
+    // Swim tuning. Water this shallow is waded, not swum -- as a fraction of
+    // player height, so crouching does not change where the beach becomes sea.
+    static constexpr float kWadeDepthFraction = 0.75f;
+    // How far the eyes ride below the surface while treading water. Small, so
+    // the waterline sits at chin height and the view stays clear.
+    static constexpr float kEyesUnderSurface = 0.22f;
+    static constexpr float kBuoyancyStiffness = 7.0f;   // 1/s^2 toward float line
+    // Gentler restoring pull once the head clears the surface -- a body out of
+    // the water is not being buoyed, it is just falling back to the line.
+    static constexpr float kAboveSurfaceBuoyancyScale = 0.55f;
+    static constexpr float kSwimVerticalAccel = 9.0f;   // m/s^2 from Space/Q
+    static constexpr float kWaterDrag = 3.4f;           // 1/s velocity decay
+    static constexpr float kMaxSwimSpeed = 3.2f;        // m/s vertical clamp
+    // Swimming is slower than running, and the stroke carries you level rather
+    // than letting the look direction drive depth.
+    static constexpr float kSwimSpeedScale = 0.55f;
+
     Camera(XMFLOAT3 position = XMFLOAT3(0.0f, 5.0f, 10.0f))
         : Position(position), Front(XMFLOAT3(0.0f, 0.0f, -1.0f)), Up(XMFLOAT3(0.0f, 1.0f, 0.0f)),
           Yaw(-90.0f), Pitch(-5.0f), MovementSpeed(5.0f), MouseSensitivity(0.1f),
@@ -81,19 +107,65 @@ public:
                 }
             }
 
-            // Apply gravity
-            float groundLevel = FloorY + PlayerHeight;
-            VerticalVelocity -= Gravity * deltaTime;
-            Position.y += VerticalVelocity * deltaTime;
-            
-            // Ground collision
-            if (Position.y <= groundLevel) {
-                Position.y = groundLevel;
-                VerticalVelocity = 0.0f;
-                IsGrounded = true;
-            } else {
+            const float groundLevel = FloorY + PlayerHeight;
+
+            // Swimming starts once the feet are under the surface and the
+            // seabed is too deep to stand on. Wading in the shallows keeps
+            // normal walking, which is what stops the player from breaking into
+            // a swim while still ankle-deep on the beach.
+            const float feetY = Position.y - PlayerHeight;
+            const bool standingDepth =
+                WaterSurfaceY - FloorY < PlayerHeight * kWadeDepthFraction;
+            IsSwimming = feetY < WaterSurfaceY && !standingDepth;
+
+            if (IsSwimming) {
+                // Buoyancy toward a float line that keeps the eyes just above
+                // the surface, so the default state is treading water with the
+                // head out rather than bobbing under it.
+                const float floatLine =
+                    WaterSurfaceY + PlayerHeight - kEyesUnderSurface;
+                const float toSurface = floatLine - Position.y;
+                // Two-sided spring, so treading water settles on the float line
+                // instead of coasting to a stop wherever drag happens to win.
+                // Submerged, buoyancy is full strength; above the line it only
+                // has to cancel the overshoot, and it yields entirely to a dive
+                // so holding crouch actually takes the player under.
+                float buoyancy = toSurface * kBuoyancyStiffness;
+                if (toSurface < 0.0f) buoyancy *= kAboveSurfaceBuoyancyScale;
+                if (SwimInput < 0.0f) buoyancy = (std::min)(buoyancy, 0.0f);
+                VerticalVelocity += (buoyancy + SwimInput * kSwimVerticalAccel) *
+                                    deltaTime;
+                // Water drag. Heavy enough that vertical motion settles instead
+                // of oscillating around the float line.
+                VerticalVelocity *= std::exp(-kWaterDrag * deltaTime);
+                VerticalVelocity = (std::max)(-kMaxSwimSpeed,
+                    (std::min)(kMaxSwimSpeed, VerticalVelocity));
+                Position.y += VerticalVelocity * deltaTime;
+
+                // The seabed still stops the player, so diving to the bottom
+                // stands on it rather than sinking through.
+                if (Position.y <= groundLevel) {
+                    Position.y = groundLevel;
+                    if (VerticalVelocity < 0.0f) VerticalVelocity = 0.0f;
+                }
+                // Never grounded while swimming: jump, slide and step-up all
+                // gate on IsGrounded and none of them should fire mid-water.
                 IsGrounded = false;
+            } else {
+                // Apply gravity
+                VerticalVelocity -= Gravity * deltaTime;
+                Position.y += VerticalVelocity * deltaTime;
+
+                // Ground collision
+                if (Position.y <= groundLevel) {
+                    Position.y = groundLevel;
+                    VerticalVelocity = 0.0f;
+                    IsGrounded = true;
+                } else {
+                    IsGrounded = false;
+                }
             }
+            SwimInput = 0.0f;
         }
     }
 
@@ -101,7 +173,17 @@ public:
         float velocity = MovementSpeed * speedMultiplier * deltaTime;
         
         if (FPSMode) {
-            if (direction == ' ') { Jump(); return; }
+            // In water the vertical keys swim instead of jumping. Space rises,
+            // Q dives; Jump() is suppressed because there is no ground to push
+            // off and it would fling the player out of the water.
+            if (IsSwimming) {
+                if (direction == ' ') { SwimInput += 1.0f; return; }
+                if (direction == 'Q') { SwimInput -= 1.0f; return; }
+                velocity *= kSwimSpeedScale;
+            } else if (direction == ' ') {
+                Jump();
+                return;
+            }
             // FPS walking mode - movement constrained to XZ plane
             XMFLOAT3 frontXZ = XMFLOAT3(Front.x, 0.0f, Front.z);
             XMVECTOR frontXZVec = XMVector3Normalize(XMLoadFloat3(&frontXZ));

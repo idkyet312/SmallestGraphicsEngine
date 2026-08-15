@@ -11318,8 +11318,14 @@ static void ProcessInput(HWND) {
         if (GetAsyncKeyState('A') & 0x8000) scene.camera.ProcessKeyboard('A', deltaTime, movementMultiplier);
         if (GetAsyncKeyState('D') & 0x8000) scene.camera.ProcessKeyboard('D', deltaTime, movementMultiplier);
     }
-    if (!crouching && !ridingBlackHawk && (GetAsyncKeyState(VK_SPACE) & 0x8000))
+    // Space rises, crouch dives. While swimming the crouch gate is lifted:
+    // crouching underwater means "swim down", so it must not also block the
+    // ascend key the way it blocks jumping on land.
+    if (!ridingBlackHawk && (scene.camera.IsSwimming || !crouching) &&
+        (GetAsyncKeyState(VK_SPACE) & 0x8000))
         scene.camera.ProcessKeyboard(' ', deltaTime);
+    if (!ridingBlackHawk && scene.camera.IsSwimming && controlDown)
+        scene.camera.ProcessKeyboard('Q', deltaTime);
 
     // Auto-fire: while the mouse is held (and not interacting with the UI),
     // keep shooting on a fixed interval instead of one shot per click.
@@ -12472,6 +12478,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 terrainParams, scene.camera.Position.x, scene.camera.Position.z);
         } else {
             scene.camera.FloorY = 0.0f;
+        }
+
+        // Hand the camera the local sea surface so it can decide whether the
+        // player is swimming. Riding a vehicle or planning deployment keeps the
+        // player dry regardless of where they are, so the surface is parked
+        // out of reach in those cases rather than special-cased in the camera.
+        if (!g_emptyLevelMode && !ridingBlackHawk && !deploymentPlanning &&
+            !g_game.vehicles.insertionBoatCarryingPlayer && !g_drivingHumvee) {
+            scene.camera.WaterSurfaceY =
+                g_ocean.GetSurfaceY() +
+                g_ocean.WaveHeightAt(scene.camera.Position.x,
+                                     scene.camera.Position.z);
+        } else {
+            scene.camera.WaterSurfaceY = Camera::NoWater;
         }
 
         // Resolve wall/roof collision BEFORE gravity runs (scene.Update ->
