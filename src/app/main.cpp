@@ -1958,25 +1958,48 @@ static bool HitSecondaryHelicopterSegment(const XMFLOAT3& start,
 // The AA gun as a hit target. Sphere centred on the mount rather than the base
 // plate, so shots at the gun itself connect and rounds into the dirt at its feet
 // do not. Radius covers the pedestal and the traversing mount together.
+// Reports which emplacement the segment struck, so damage lands on the turret
+// that was actually shot rather than on whichever one happens to be first.
 static bool HitAATurretSegment(const XMFLOAT3& start, const XMFLOAT3& end,
-                               float radius, XMFLOAT3& hit) {
+                               float radius, XMFLOAT3& hit,
+                               size_t& turretIndex) {
     const VehicleSystem& vehicles = g_game.vehicles;
-    if (!vehicles.AATurretActive()) return false;
-    const XMFLOAT3 center{
-        vehicles.aaTurretPosition.x,
-        vehicles.aaTurretPosition.y + VehicleSystem::AATurretMountHeight * 0.6f,
-        vehicles.aaTurretPosition.z };
-    return HitSphereAtSegment(center, 2.0f, start, end, radius, hit);
+    float bestDistanceSq = FLT_MAX;
+    bool found = false;
+    for (size_t i = 0; i < vehicles.aaTurrets.size(); ++i) {
+        const VehicleSystem::AATurret& turret = vehicles.aaTurrets[i];
+        if (!turret.Active()) continue;
+        const XMFLOAT3 center{
+            turret.position.x,
+            turret.position.y + VehicleSystem::AATurretMountHeight * 0.6f,
+            turret.position.z };
+        XMFLOAT3 candidate;
+        if (!HitSphereAtSegment(center, 2.0f, start, end, radius, candidate))
+            continue;
+        // Nearest to the segment start wins: a shot passing two emplacements
+        // hits the one in front, not the one behind it.
+        const float dx = candidate.x - start.x;
+        const float dy = candidate.y - start.y;
+        const float dz = candidate.z - start.z;
+        const float distanceSq = dx * dx + dy * dy + dz * dz;
+        if (distanceSq >= bestDistanceSq) continue;
+        bestDistanceSq = distanceSq;
+        hit = candidate;
+        turretIndex = i;
+        found = true;
+    }
+    return found;
 }
 
 // Wrecks the emplacement: cooks off the ammo boxes and leaves it burning.
-static void DamageAATurret(float damage, const XMFLOAT3& hit) {
+static void DamageAATurret(size_t turretIndex, float damage,
+                           const XMFLOAT3& hit) {
     const VehicleSystem::DamageResult result =
-        g_game.vehicles.DamageAATurret(damage);
+        g_game.vehicles.DamageAATurret(turretIndex, damage);
     if (!result.applied) return;
     scene.SpawnSmokeBurst(hit, 0.24f, 0.12f);
     if (!result.destroyed) return;
-    const XMFLOAT3& base = g_game.vehicles.aaTurretPosition;
+    const XMFLOAT3 base = result.position;
     const XMFLOAT3 center{ base.x,
         base.y + VehicleSystem::AATurretMountHeight, base.z };
     scene.SpawnExplosionFX(center, 6.5f, 1.0f);
@@ -3856,15 +3879,16 @@ static void DetonateBarrel(size_t firstBarrel) {
         }
         // Blast takes the emplacement too, so C4 or a rocket is a valid answer
         // to it rather than the gun being immune to everything but bullets.
-        if (g_game.vehicles.AATurretActive()) {
-            const XMFLOAT3& turret = g_game.vehicles.aaTurretPosition;
+        for (size_t i = 0; i < g_game.vehicles.aaTurrets.size(); ++i) {
+            if (!g_game.vehicles.aaTurrets[i].Active()) continue;
+            const XMFLOAT3 turret = g_game.vehicles.aaTurrets[i].position;
             const float hx = turret.x - center.x;
             const float hy = turret.y - center.y;
             const float hz = turret.z - center.z;
             const float distance = std::sqrt(hx*hx + hy*hy + hz*hz);
             const float reach = 9.0f;
             if (distance < reach)
-                DamageAATurret(320.0f * (1.0f - distance / reach), turret);
+                DamageAATurret(i, 320.0f * (1.0f - distance / reach), turret);
         }
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.ApplyExplosion(center, 5.0f, 3.0f, 180.0f);
@@ -6216,7 +6240,340 @@ static std::shared_ptr<SceneNode> CreateAATurretModel() {
     return root;
 }
 
+// Authored AA turret, replacing the box-built one above.
+//
+// PoseAATurretModel drives the mount by finding a direct child of the root named
+// "Gun" and writing its local transform, so the loaded hierarchy has to present
+// that contract. The GLB's traverse node is called "Y-Rotation" and sits several
+// levels down (Spaceship-Turrent > .001 > master > Y-Rotation), so this lifts it
+// out and reparents it as "Gun" with the rest of the model kept as the static
+// base. Nothing about the firing code changes.
+//
+// Returns null if anything is missing, and the caller falls back to the box
+// model rather than drawing nothing.
+static std::shared_ptr<SceneNode> LoadAATurretModel() {
+    auto loaded = GLBImporter::LoadGLB("Content/Models/Turret/Turret.glb",
+                                       g_dx12.device, g_dx12.commandList);
+    if (!loaded) {
+        SGE_LOG("LogGameplay", EngineLog::Level::Warning,
+            "AA turret model missing, using the built-in box turret");
+        return nullptr;
+    }
+
+    // Scale so the model's traverse ring lands at AATurretMountHeight. That
+    // constant is not cosmetic -- the firing code uses it for the shell origin
+    // and for the aim solution -- so matching it matters more than matching the
+    // old model's footprint width, which ends up 4.9 m against the box turret's
+    // 4.3 m and reads as a slightly heavier emplacement.
+    constexpr float kAuthoredMountHeight = 1.16f;  // "Y-Rotation" node height
+    constexpr float kModelScale =
+        VehicleSystem::AATurretMountHeight / kAuthoredMountHeight;
+
+    // Depth-first search for the traverse node.
+    std::function<std::shared_ptr<SceneNode>(const std::shared_ptr<SceneNode>&)>
+        findTraverse = [&](const std::shared_ptr<SceneNode>& node)
+        -> std::shared_ptr<SceneNode> {
+        if (!node) return nullptr;
+        if (node->name == "Y-Rotation") return node;
+        for (const std::shared_ptr<SceneNode>& child : node->children)
+            if (auto found = findTraverse(child)) return found;
+        return nullptr;
+    };
+    std::shared_ptr<SceneNode> traverse = findTraverse(loaded);
+    if (!traverse) {
+        SGE_LOG("LogGameplay", EngineLog::Level::Warning,
+            "AA turret model has no Y-Rotation node, using the box turret");
+        return nullptr;
+    }
+
+    // Detach the traverse subtree from wherever it sits, so it can be posed
+    // independently of the base instead of inheriting the base's transform.
+    std::function<bool(const std::shared_ptr<SceneNode>&)> detach =
+        [&](const std::shared_ptr<SceneNode>& node) -> bool {
+        if (!node) return false;
+        auto found = std::find(node->children.begin(), node->children.end(),
+                               traverse);
+        if (found != node->children.end()) {
+            node->children.erase(found);
+            return true;
+        }
+        for (const std::shared_ptr<SceneNode>& child : node->children)
+            if (detach(child)) return true;
+        return false;
+    };
+    detach(loaded);
+
+    auto root = std::make_shared<SceneNode>("AA Turret");
+
+    // Barrel fallback.
+    //
+    // Earlier exports of this model had no barrel geometry: in Blender the
+    // barrels come from an Array modifier on "Gun barrel 200 cal.016", and while
+    // that node was an Empty the exporter wrote the node and nothing else. The
+    // current asset has them baked, so this normally does nothing.
+    //
+    // Kept, and gated on the barrel node actually carrying a mesh, so a
+    // re-export that loses them again leaves a usable gun rather than a mount
+    // with no barrels -- and so the generated tubes can never double up on top
+    // of real ones.
+    bool hasAuthoredBarrels = false;
+    {
+        std::function<void(const std::shared_ptr<SceneNode>&)> findBarrels =
+            [&](const std::shared_ptr<SceneNode>& node) {
+            if (!node || hasAuthoredBarrels) return;
+            // Match the authored barrel node by name, and require real geometry:
+            // the node existing is not enough, which is exactly how the missing
+            // barrels slipped through before.
+            if (node->name.rfind("Gun barrel", 0) == 0 && node->mesh &&
+                !node->mesh->primitives.empty()) {
+                hasAuthoredBarrels = true;
+                return;
+            }
+            for (const std::shared_ptr<SceneNode>& child : node->children)
+                findBarrels(child);
+        };
+        findBarrels(loaded);
+    }
+
+    if (traverse && !hasAuthoredBarrels) {
+        // Find "spin-ey": the rings hang off it, so building in its space puts
+        // the barrels through them without recomputing the 120-degree rotation
+        // that orients the whole assembly.
+        std::function<std::shared_ptr<SceneNode>(const std::shared_ptr<SceneNode>&)>
+            findSpin = [&](const std::shared_ptr<SceneNode>& node)
+            -> std::shared_ptr<SceneNode> {
+            if (!node) return nullptr;
+            if (node->name == "spin-ey") return node;
+            for (const std::shared_ptr<SceneNode>& child : node->children)
+                if (auto found = findSpin(child)) return found;
+            return nullptr;
+        };
+
+        if (std::shared_ptr<SceneNode> spin = findSpin(traverse)) {
+            // Borrow the metal material off a ring so the barrels match the rest
+            // of the gun instead of needing their own texture.
+            std::shared_ptr<SceneMaterial> barrelMaterial;
+            for (const std::shared_ptr<SceneNode>& child : spin->children) {
+                if (!child || !child->mesh) continue;
+                for (const MeshPrimitive& primitive : child->mesh->primitives)
+                    if (primitive.material) { barrelMaterial = primitive.material; break; }
+                if (barrelMaterial) break;
+            }
+
+            auto barrels = std::make_shared<SceneNode>("Barrels");
+            barrels->mesh = std::make_shared<SceneMesh>();
+            MeshPrimitive tubes;
+            tubes.material = barrelMaterial;
+
+            // Four tubes on the same 0.223 m circle the collars use, quartered
+            // so each sits where a barrel passes through the ring.
+            constexpr int kBarrelCount = 4;
+            constexpr int kSides = 10;          // sides per tube
+            constexpr float kRingRadius = 0.223f;
+            constexpr float kBarrelRadius = 0.052f;
+            constexpr float kStart = 0.35f;     // just inside the breech
+            constexpr float kEnd = 2.15f;       // past the outermost collar
+            for (int barrel = 0; barrel < kBarrelCount; ++barrel) {
+                const float spin_ = XM_2PI * static_cast<float>(barrel) /
+                                    kBarrelCount + XM_PIDIV4;
+                const float cx = std::cos(spin_) * kRingRadius;
+                const float cz = std::sin(spin_) * kRingRadius;
+                const UINT base = static_cast<UINT>(tubes.vertices.size() / 12u);
+                for (int side = 0; side <= kSides; ++side) {
+                    const float angle = XM_2PI * static_cast<float>(side) / kSides;
+                    const float nx = std::cos(angle);
+                    const float nz = std::sin(angle);
+                    // Local +Y is the forward axis in spin-ey space (verified
+                    // against the collar spacing), so the tube runs along Y.
+                    for (int end = 0; end < 2; ++end) {
+                        const float y = end == 0 ? kStart : kEnd;
+                        const float vertex[12] = {
+                            cx + nx * kBarrelRadius, y, cz + nz * kBarrelRadius,
+                            nx, 0.0f, nz,
+                            static_cast<float>(side) / kSides,
+                            static_cast<float>(end),
+                            0.0f, 1.0f, 0.0f, 1.0f
+                        };
+                        tubes.vertices.insert(tubes.vertices.end(),
+                                              vertex, vertex + 12);
+                    }
+                }
+                for (int side = 0; side < kSides; ++side) {
+                    const UINT a = base + side * 2u;
+                    tubes.indices.insert(tubes.indices.end(),
+                        { a, a + 1u, a + 2u, a + 1u, a + 3u, a + 2u });
+                }
+            }
+            // Same finalisation the box turret's boxes go through: without the
+            // meshlet/GPU data the primitive carries vertices but never draws.
+            if (GLBImporter::BuildMeshletData(tubes, g_dx12.device.Get(), false)) {
+                barrels->mesh->primitives.push_back(std::move(tubes));
+                spin->AddChild(barrels);
+                SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                    "AA turret barrels generated: the model has none");
+            } else {
+                SGE_LOG("LogGameplay", EngineLog::Level::Warning,
+                    "AA turret barrel geometry failed to build");
+            }
+        }
+    }
+
+    // Scale is set through the TRS fields, not by writing localTransform:
+    // UpdateGlobalTransform calls UpdateLocalTransform first, which rebuilds
+    // localTransform from translation/rotation/scale and would discard anything
+    // written directly into the matrix.
+    const auto setScale = [](const std::shared_ptr<SceneNode>& node, float s) {
+        node->scale = { s, s, s };
+        node->UpdateLocalTransform();
+    };
+
+    // One material in the GLB ("Gun Metal.003", on the mount's centre block) is
+    // left untextured with a yellow base colour of [0.60, 0.44, 0.00], while the
+    // other four share a metal basecolour map. That renders as a bright yellow
+    // slab in the middle of a dark grey emplacement, so give it the same texture
+    // its siblings use and drop it to gunmetal.
+    //
+    // Both subtrees have to be walked: `traverse` was detached from `loaded`
+    // above, and the yellow part (TurrentCenter) lives inside the detached gun.
+    // Walking only `loaded` -- as this did at first -- silently missed it and
+    // left the block yellow.
+    {
+        ComPtr<ID3D12Resource> sharedBaseColor;
+        std::function<void(const std::shared_ptr<SceneNode>&)> collect =
+            [&](const std::shared_ptr<SceneNode>& node) {
+            if (!node || sharedBaseColor) return;
+            if (node->mesh)
+                for (const MeshPrimitive& primitive : node->mesh->primitives)
+                    if (primitive.material &&
+                        primitive.material->baseColorTexture) {
+                        sharedBaseColor = primitive.material->baseColorTexture;
+                        return;
+                    }
+            for (const std::shared_ptr<SceneNode>& child : node->children)
+                collect(child);
+        };
+        collect(loaded);
+        collect(traverse);
+
+        // Dark, slightly blued steel. Applied as the base colour factor, which
+        // multiplies the borrowed texture, so the part keeps the surrounding
+        // metal's surface detail instead of becoming a flat grey block.
+        constexpr float kGunmetal[3] = { 0.30f, 0.32f, 0.35f };
+        std::function<void(const std::shared_ptr<SceneNode>&)> retint =
+            [&](const std::shared_ptr<SceneNode>& node) {
+            if (!node) return;
+            if (node->mesh)
+                for (MeshPrimitive& primitive : node->mesh->primitives) {
+                    if (!primitive.material) continue;
+                    // Only the untextured offender. Anything already carrying a
+                    // basecolour map is authored correctly and is left alone.
+                    if (primitive.material->baseColorTexture) continue;
+                    if (sharedBaseColor)
+                        primitive.material->baseColorTexture = sharedBaseColor;
+                    primitive.material->baseColorFactor = XMFLOAT4(
+                        kGunmetal[0], kGunmetal[1], kGunmetal[2], 1.0f);
+                    // Read as metal rather than painted plastic.
+                    primitive.material->metallicFactor = 0.90f;
+                    primitive.material->roughnessFactor = 0.42f;
+                }
+            for (const std::shared_ptr<SceneNode>& child : node->children)
+                retint(child);
+        };
+        retint(loaded);
+        retint(traverse);
+    }
+
+    // Static base: everything the GLB has left after the gun was removed.
+    auto base = std::make_shared<SceneNode>("Base");
+    setScale(base, kModelScale);
+    base->AddChild(loaded);
+    root->AddChild(base);
+
+    // The posed mount. PoseAATurretModel writes this node's localTransform every
+    // frame, so the scale has to live on a node underneath rather than here --
+    // the pose would otherwise replace it and the gun would snap back to model
+    // units while the base stayed scaled.
+    auto gun = std::make_shared<SceneNode>("Gun");
+    auto gunScale = std::make_shared<SceneNode>("GunScale");
+    setScale(gunScale, kModelScale);
+
+    // Zero the traverse node's own placement before reparenting it.
+    //
+    // "Y-Rotation" sits 1.161 m up inside the GLB, and the "Gun" node above it
+    // is translated to AATurretMountHeight as well -- keeping both stacked the
+    // two lifts and floated the barrels about 1.9 m above the mount, which is
+    // what put them up in the air. Its ROTATION must be preserved: the barrels
+    // are oriented by a 120-degree quaternion on the child "spin-ey" node, and
+    // the traverse node's own orientation is part of that chain.
+    traverse->translation = { 0.0f, 0.0f, 0.0f };
+    traverse->UpdateLocalTransform();
+
+    gunScale->AddChild(traverse);
+    gun->AddChild(gunScale);
+    root->AddChild(gun);
+
+    XMFLOAT4X4 identity;
+    XMStoreFloat4x4(&identity, XMMatrixIdentity());
+    root->UpdateGlobalTransform(identity);
+    return root;
+}
+
 static std::shared_ptr<SceneNode> g_aaTurretModel;
+// One posed copy per emplacement. Each turret aims independently, and a single
+// SceneNode can only hold one "Gun" transform, so sharing the model made every
+// drawn barrel copy whichever turret was updated last.
+//
+// The clone duplicates node structure only -- mesh and material pointers are
+// shared with the source -- so an extra turret costs a handful of small node
+// allocations and no GPU memory at all.
+static std::vector<std::shared_ptr<SceneNode>> g_aaTurretModelInstances;
+
+// Aims one turret model. Defined next to the render path that drives it; the
+// gameplay update no longer poses anything, because each drawn gun follows its
+// own emplacement rather than a single shared attitude.
+static void PoseAATurretModelInstance(const std::shared_ptr<SceneNode>& model,
+                                      float pitch, float yaw) {
+    if (!model) return;
+    for (const std::shared_ptr<SceneNode>& child : model->children) {
+        if (!child || child->name != "Gun") continue;
+        // Pitch about X first (barrels elevate about the trunnion), then yaw
+        // about Y (the whole mount traverses), then lift to the trunnion height.
+        // Negated pitch: the model points down +Z, where a positive rotation
+        // about X would depress the barrels rather than raise them.
+        //
+        // Written through the TRS fields rather than straight into
+        // localTransform: UpdateGlobalTransform calls UpdateLocalTransform,
+        // which rebuilds the matrix from translation/rotation/scale and discards
+        // a directly written one.
+        const XMVECTOR orientation =
+            XMQuaternionRotationRollPitchYaw(-pitch, yaw, 0.0f);
+        XMStoreFloat4(&child->rotation, orientation);
+        child->translation = {
+            0.0f, VehicleSystem::AATurretMountHeight, 0.0f };
+        child->UpdateLocalTransform();
+        break;
+    }
+    XMFLOAT4X4 identity;
+    XMStoreFloat4x4(&identity, XMMatrixIdentity());
+    model->UpdateGlobalTransform(identity);
+}
+
+static std::shared_ptr<SceneNode> CloneSceneNodeShallow(
+        const std::shared_ptr<SceneNode>& source) {
+    if (!source) return nullptr;
+    auto copy = std::make_shared<SceneNode>(source->name);
+    copy->translation = source->translation;
+    copy->rotation = source->rotation;
+    copy->scale = source->scale;
+    copy->localTransform = source->localTransform;
+    copy->globalTransform = source->globalTransform;
+    // Shared on purpose: the geometry is identical for every emplacement and
+    // duplicating it would upload the same vertex buffers again per turret.
+    copy->mesh = source->mesh;
+    for (const std::shared_ptr<SceneNode>& child : source->children)
+        copy->AddChild(CloneSceneNodeShallow(child));
+    return copy;
+}
 // Synthetic entity id for the emplacement. The gun is placed by gameplay rather
 // than authored in the level, so it has no LevelEntity id of its own; this lets
 // the render batch and the weapon hit path still refer to it. "AATURRET" packed
@@ -6260,6 +6617,29 @@ static void RebuildPrefabRenderBatches() {
         const bool castShadow = components.contains("staticMesh")
             ? components.at("staticMesh").value("castShadow", prefab->castShadow)
             : prefab->castShadow;
+
+        // A prefab carrying "aaTurret" becomes a live emplacement rather than
+        // scenery: it tracks aircraft and shoots, exactly like the one placed
+        // beside the comm tower. Both feed the same vector, so a level can have
+        // the scripted gun plus any the designer drops in.
+        //
+        // Checked here, before the render batch below, because the turret render
+        // path draws the model itself -- emitting the prefab batch as well would
+        // draw the gun twice, once static and once tracking.
+        if (components.contains("aaTurret")) {
+            skipRenderBatch = true;
+            // The shared `origin` below is computed after the render batch, so
+            // take the placement straight off the world matrix here.
+            XMFLOAT3 turretOrigin;
+            XMStoreFloat3(&turretOrigin,
+                          XMVector3TransformCoord(XMVectorZero(), world));
+            if (g_game.vehicles.PlaceAATurret(turretOrigin) >=
+                    VehicleSystem::kMaxAATurrets) {
+                SGE_LOG("LogGameplay", EngineLog::Level::Warning,
+                    "AA turret prefab ignored: at the turret cap");
+            }
+        }
+
         if (!skipRenderBatch) {
             const std::string batchKey =
                 prefabId + (castShadow ? "#shadow" : "#noshadow");
@@ -6397,27 +6777,53 @@ static void RebuildPrefabRenderBatches() {
         addInstance(addInstance, prefabId, world, entity.id, entity.overrides, 0,
                     towerDrawnByDestruction);
     }
-    // AA emplacement. Drawn from a code-built model rather than a prefab batch
-    // per entity, because it is placed by gameplay (beside the comm tower) and
-    // is not a level entity at all.
-    if (g_game.vehicles.aaTurretPresent) {
+    // AA emplacements. Drawn from a code-built model rather than a prefab batch
+    // per entity, because they are placed by gameplay (beside the comm tower,
+    // and from the editor's turret prefab) and are not level entities.
+    //
+    // Each emplacement gets its own batch and its own posed model clone, so a
+    // gun tracking the helicopter and one tracking the player visibly point in
+    // different directions. A batch carries a single model pointer, so sharing
+    // one clone across several transforms would necessarily share the aim too.
+    if (!g_game.vehicles.aaTurrets.empty()) {
         const bool createTurret = !g_aaTurretModel;
-        if (createTurret) g_aaTurretModel = CreateAATurretModel();
+        // Authored model first; the box-built one is the fallback if the asset
+        // is missing or does not carry the traverse node the pose code needs.
+        if (createTurret) {
+            g_aaTurretModel = LoadAATurretModel();
+            if (!g_aaTurretModel) g_aaTurretModel = CreateAATurretModel();
+        }
         if (createTurret && g_aaTurretModel)
             FlushStaticBufferUploadsDX12(g_dx12.commandList.Get());
         if (g_aaTurretModel) {
-            PrefabRenderBatch batch;
-            batch.prefabId = "__aa_turret";
-            batch.model = g_aaTurretModel;
-            batch.baseModel = g_aaTurretModel;
-            const XMMATRIX world = XMMatrixTranslation(
-                g_game.vehicles.aaTurretPosition.x,
-                g_game.vehicles.aaTurretPosition.y,
-                g_game.vehicles.aaTurretPosition.z);
-            batch.baseTransforms.push_back(world);
-            batch.transforms.push_back(world);
-            batch.entityIds.push_back(kAATurretEntityId);
-            g_prefabRenderBatches.push_back(std::move(batch));
+            // Clones are made once and then reused: they are rebuilt only when
+            // the turret count changes, not every frame.
+            while (g_aaTurretModelInstances.size() <
+                   g_game.vehicles.aaTurrets.size()) {
+                g_aaTurretModelInstances.push_back(
+                    CloneSceneNodeShallow(g_aaTurretModel));
+            }
+            for (size_t i = 0; i < g_game.vehicles.aaTurrets.size(); ++i) {
+                const VehicleSystem::AATurret& turret =
+                    g_game.vehicles.aaTurrets[i];
+                const std::shared_ptr<SceneNode>& instance =
+                    g_aaTurretModelInstances[i];
+                if (!instance) continue;
+                // Pose this clone to this turret's own solution.
+                PoseAATurretModelInstance(instance, turret.pitch, turret.yaw);
+                PrefabRenderBatch batch;
+                batch.prefabId = "__aa_turret_" + std::to_string(i);
+                batch.model = instance;
+                batch.baseModel = instance;
+                const XMMATRIX world = XMMatrixTranslation(
+                    turret.position.x, turret.position.y, turret.position.z);
+                batch.baseTransforms.push_back(world);
+                batch.transforms.push_back(world);
+                // Distinct id per emplacement so hit attribution can tell them
+                // apart; the base constant keeps them out of level entity ids.
+                batch.entityIds.push_back(kAATurretEntityId + i);
+                g_prefabRenderBatches.push_back(std::move(batch));
+            }
         }
     }
     if (g_ddgiCornellTestMode) {
@@ -7135,9 +7541,10 @@ static bool HitGrenadeCollision(const Projectile& grenade, float radius,
         accept(candidate, radialNormal(candidate, g_secondaryHelicopterPosition));
     if (HitBoatSegment(start, end, radius, candidate))
         accept(candidate, radialNormal(candidate, g_boatPosition));
-    if (HitAATurretSegment(start, end, radius, candidate))
+    size_t hitTurretIndex = 0;
+    if (HitAATurretSegment(start, end, radius, candidate, hitTurretIndex))
         accept(candidate, radialNormal(
-            candidate, g_game.vehicles.aaTurretPosition));
+            candidate, g_game.vehicles.aaTurrets[hitTurretIndex].position));
 
     size_t barrelIndex = 0;
     if (HitExplosiveBarrelSegment(
@@ -7453,43 +7860,22 @@ static void PlaceAATurretNearCommTower() {
 // an anti-air gun, and the inbound BlackHawk is the threat it exists to answer
 // -- then the player, but only while they are airborne. A player on foot is not
 // a target: walking up to the emplacement is how it is meant to be silenced.
-// Points the drawn gun where the logical turret is aiming. Separate from the
-// firing update because the mount must keep tracking visually even on frames it
-// does not shoot, and a dead gun must stop dead rather than snap back to zero.
-static void PoseAATurretModel() {
-    if (!g_aaTurretModel) return;
-    const VehicleSystem& vehicles = g_game.vehicles;
-    for (const std::shared_ptr<SceneNode>& child : g_aaTurretModel->children) {
-        if (!child || child->name != "Gun") continue;
-        // Pitch about X first (barrels elevate about the trunnion), then yaw
-        // about Y (the whole mount traverses), then lift to the trunnion height.
-        // Negated pitch: the model points down +Z, where a positive rotation
-        // about X would depress the barrels rather than raise them.
-        const XMMATRIX pose =
-            XMMatrixRotationX(-vehicles.aaTurretPitch) *
-            XMMatrixRotationY(vehicles.aaTurretYaw) *
-            XMMatrixTranslation(0.0f, VehicleSystem::AATurretMountHeight, 0.0f);
-        XMStoreFloat4x4(&child->localTransform, pose);
-        break;
-    }
-    XMFLOAT4X4 identity;
-    XMStoreFloat4x4(&identity, XMMatrixIdentity());
-    g_aaTurretModel->UpdateGlobalTransform(identity);
-}
-
-static void UpdateAATurret(float deltaTime) {
+//
+// Runs one emplacement: target selection, slew and firing. Each turret solves
+// independently, so several can engage the same helicopter or split between it
+// and an airborne player.
+static void UpdateOneAATurret(size_t turretIndex, float deltaTime) {
     VehicleSystem& vehicles = g_game.vehicles;
-    if (!vehicles.AATurretActive()) {
-        PoseAATurretModel();
-        return;
-    }
+    if (turretIndex >= vehicles.aaTurrets.size()) return;
+    VehicleSystem::AATurret& emplacement = vehicles.aaTurrets[turretIndex];
+    if (!emplacement.Active()) return;
 
     XMFLOAT3 target{};
     XMFLOAT3 velocity{};
     bool hasTarget = false;
     bool targetIsAircraft = false;
 
-    const XMFLOAT3& turret = vehicles.aaTurretPosition;
+    const XMFLOAT3 turret = emplacement.position;
     const auto rangeSq = [&turret](const XMFLOAT3& p) {
         const float dx = p.x - turret.x, dy = p.y - turret.y, dz = p.z - turret.z;
         return dx * dx + dy * dy + dz * dz;
@@ -7551,16 +7937,15 @@ static void UpdateAATurret(float deltaTime) {
     const float shellSpeed =
         scene.projectileSpeed * VehicleSystem::AATurretShellSpeed;
     const XMFLOAT3 aim = hasTarget
-        ? vehicles.AATurretLeadPoint(target, velocity, shellSpeed)
+        ? vehicles.AATurretLeadPoint(emplacement, target, velocity, shellSpeed)
         : XMFLOAT3{};
 
-    const bool fired = vehicles.UpdateAATurret(deltaTime, aim, hasTarget);
-    // Pose after the slew, so the drawn barrels match the angles just solved.
-    PoseAATurretModel();
+    const bool fired =
+        vehicles.UpdateAATurret(emplacement, deltaTime, aim, hasTarget);
     if (!fired) return;
 
     // A shell left the barrel this frame.
-    const XMFLOAT3 muzzle = vehicles.AATurretMuzzle();
+    const XMFLOAT3 muzzle = emplacement.Muzzle();
     XMVECTOR direction = XMLoadFloat3(&aim) - XMLoadFloat3(&muzzle);
     if (XMVectorGetX(XMVector3LengthSq(direction)) < 0.001f) return;
     // Dispersion, so a burst walks around the target instead of stacking four
@@ -7588,6 +7973,13 @@ static void UpdateAATurret(float deltaTime) {
     const float volume = (std::max)(0.12f,
         0.85f * (1.0f - distance / VehicleSystem::AATurretAirRange));
     g_gunAudio.Play(volume, 0.62f + ((float)std::rand() / RAND_MAX) * 0.06f);
+}
+
+static void UpdateAATurret(float deltaTime) {
+    for (size_t i = 0; i < g_game.vehicles.aaTurrets.size(); ++i)
+        UpdateOneAATurret(i, deltaTime);
+    // No posing here: each turret's model clone is aimed where the render
+    // batches are built, from that turret's own pitch and yaw.
 }
 
 // The comm-tower entity whose mast contains `position`, or 0 for none. Used to
@@ -8084,6 +8476,9 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_grass.ClearRuntimeExclusions();
     g_game.ResetLevelState();
     g_enemySystem.ResetLevelCounters();
+    // ResetLevelState cleared the turret list; drop the posed clones with it so
+    // a level with fewer emplacements cannot keep drawing the last one's.
+    g_aaTurretModelInstances.clear();
     g_emptyLevelMode = emptyLevel;
     g_stressTestMode = stressTest && !emptyLevel;
     const bool modeAssetsLoaded = g_emptyLevelMode
@@ -13668,9 +14063,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                         // to the gun itself did nothing. C4 is a demolition and
                         // one is enough, while a frag still only chips the
                         // mount -- same split the comm tower uses below.
-                        if (g_game.vehicles.AATurretActive()) {
-                            const XMFLOAT3& turret =
-                                g_game.vehicles.aaTurretPosition;
+                        for (size_t ti = 0;
+                             ti < g_game.vehicles.aaTurrets.size(); ++ti) {
+                            if (!g_game.vehicles.aaTurrets[ti].Active()) continue;
+                            const XMFLOAT3 turret =
+                                g_game.vehicles.aaTurrets[ti].position;
                             const float tx = turret.x - center.x;
                             const float ty = turret.y - center.y;
                             const float tz = turret.z - center.z;
@@ -13697,7 +14094,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                     : (c4Blast
                                            ? VehicleSystem::AATurretMaxHealth
                                            : enemyDamage) * falloff;
-                                DamageAATurret(damage, turret);
+                                DamageAATurret(ti, damage, turret);
                             }
                         }
                         // Grenades hurt the player too. Previously only enemies
@@ -14031,9 +14428,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     continue;
                 }
                 XMFLOAT3 turretHit;
+                size_t shotTurretIndex = 0;
                 if (!projectile.hostile && HitAATurretSegment(
                         projectile.previousPosition, projectile.position,
-                        bulletRadius, turretHit)) {
+                        bulletRadius, turretHit, shotTurretIndex)) {
                     recordAccuracyHit();
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
@@ -14041,7 +14439,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                     scene.SpawnBulletImpact(turretHit, normal);
                     // Armoured mount: rings like the comm tower's lattice.
                     PlayMetalHitAudio(turretHit, 0.9f);
-                    DamageAATurret(34.0f * projectile.damageMultiplier, turretHit);
+                    DamageAATurret(shotTurretIndex,
+                                   34.0f * projectile.damageMultiplier, turretHit);
                     if (projectile.laser) scene.StopLaserBeamAt(turretHit);
                     if (projectile.harpoon) scene.ShowHarpoonTether(turretHit);
                     stopProjectileAt(turretHit);
@@ -15474,6 +15873,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 hdrTarget, rainMSAA, g_dx12.frameIndex);
         }
 
+        if (nvgWorldAmbientBoosted)
+            scene.ambientLightingIntensity =
+                authoredAmbientLightingIntensity;
+
         const bool visibilityValidation = visibilityParityValidation;
         // Shared post-render pass. Normal forward composites to the resolved
         // swapchain target. Visibility and parity-forward composite to HDR.
@@ -15551,13 +15954,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
 
         if (scene.enableFXAA && fxaa.initialized && !visibilityValidation &&
-            !bentGTAODiagnosticActive) {
+            !bentGTAODiagnosticActive && g_nightVisionBlend <= 0.001f) {
             ProfilerDX12::Scope profile(g_profiler, "FXAA", g_dx12.commandList.Get());
             fxaa.Apply(g_dx12.commandList.Get());
         }
 
-        // Night vision, after FXAA so the goggles intensify the finished image
-        // and before ImGui so the HUD stays legible through them.
+        // Night vision runs before ImGui so the HUD stays legible through it.
+        // FXAA is deliberately bypassed while the tube is visible: its grain
+        // hides small edge stair-steps, while prefiltering the source destroyed
+        // the fine silhouettes and surface detail the goggles are meant to find.
         //
         // The ramp is driven here rather than in ProcessInput because that
         // function returns early while the UI has the keyboard or the camera is
@@ -15577,6 +15982,66 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 std::clamp(target - g_nightVisionBlend,
                            -rampRate * deltaTime, rampRate * deltaTime);
             g_nightVisionBlend = std::clamp(g_nightVisionBlend, 0.0f, 1.0f);
+
+            // Automatic gain control. A real intensifier constantly retunes its
+            // amplification to the light reaching it, over roughly a second --
+            // it is why goggles bloom out when you step into a lit room and then
+            // settle, and why they wind up to maximum in true darkness.
+            //
+            // Driven from the scene's own lighting rather than a GPU luminance
+            // readback: a readback would cost a compute pass and land a frame or
+            // more late, and the ambient level plus the directional sun is
+            // already exactly the quantity the tube would be responding to.
+            {
+                // Scene brightness as the tube sees it. The directional term is
+                // weighted down because at night the sun is below the horizon
+                // and contributes almost nothing, while ambient is what actually
+                // fills the scene.
+                float sceneBrightness =
+                    scene.ambientLightingIntensity +
+                    scene.directionalLightIntensity * 0.04f;
+                // A muzzle flash is a genuine light source going off in the
+                // player's face. Real goggles bloom hard off their own weapon,
+                // and the AGC ducks for a moment afterwards.
+                if (scene.muzzleFlashTime > 0.0f) sceneBrightness += 0.55f;
+
+                // Target gain: wide open in darkness, stopped down in light.
+                // The curve is inverse rather than linear because the tube is
+                // compensating for brightness, so halving the light roughly
+                // doubles the gain until it hits the tube's ceiling.
+                // Calibrated against the authored presets, whose brightness by
+                // this measure is Night 0.005, Dusk 0.68, Afternoon 0.91,
+                // Noon 1.10. The constant sets where the curve sits: too small
+                // and even Night stops down below the old fixed 7.5, making
+                // nights darker than before the AGC existed.
+                constexpr float kMaxGain = 11.0f;
+                constexpr float kMinGain = 1.35f;
+                const float targetGain = std::clamp(
+                    0.115f / (sceneBrightness + 0.008f), kMinGain, kMaxGain);
+                // Asymmetric time constant, like the real thing: protecting the
+                // tube from a sudden bright source is fast, recovering
+                // sensitivity afterwards is slow. That asymmetry is what makes
+                // walking out of a lit area leave you briefly blind.
+                const float agcRate =
+                    targetGain < g_nightVisionGain ? 6.5f : 1.15f;
+                g_nightVisionGain +=
+                    (targetGain - g_nightVisionGain) *
+                    (std::min)(1.0f, agcRate * deltaTime);
+
+                // Overload: how far past the tube's usable range the scene is.
+                // Daylight drives this toward 1 and washes the image out.
+                // Onset sits above Dusk (0.68) so twilight is degraded but still
+                // usable -- dusk is when goggles start earning their place, and
+                // washing them out there would be backwards. Full overload lands
+                // past Afternoon, so only real daylight makes them useless,
+                // which is what the deployment briefing promises.
+                constexpr float kOverloadOnset = 0.72f;
+                constexpr float kOverloadFull = 1.05f;
+                g_nightVisionOverload = std::clamp(
+                    (sceneBrightness - kOverloadOnset) /
+                        (kOverloadFull - kOverloadOnset),
+                    0.0f, 1.0f);
+            }
 
             if (g_nightVisionBlend > 0.001f && nightVision.initialized &&
                 !visibilityValidation && !bentGTAODiagnosticActive) {

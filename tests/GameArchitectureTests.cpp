@@ -483,7 +483,8 @@ int main() {
     player.UpdateReload(10.0f);
     CHECK(player.magazine[0] == 5);
     CHECK(player.reserve[0] == 0);
-    CHECK(PlayerState::kWeaponSlots == 8);
+    // 9 since the suppressed SVD took slot 8.
+    CHECK(PlayerState::kWeaponSlots == 9);
     player.magazine[4] = 1;
     CHECK(player.ConsumeAmmo(4));
     CHECK(player.magazine[4] == 0);
@@ -513,39 +514,59 @@ int main() {
     // AA emplacement. The gun is only a threat if it leads a moving aircraft
     // and slews at a finite rate, so both are pinned here.
     VehicleSystem aa;
-    CHECK(!aa.AATurretActive());          // absent until a level places one
-    aa.PlaceAATurret({ 0.0f, 0.0f, 0.0f });
-    CHECK(aa.AATurretActive());
-    CHECK(std::abs(aa.AATurretHealthFraction() - 1.0f) < 0.001f);
+    CHECK(!aa.AnyAATurretActive());       // absent until a level places one
+    CHECK(aa.PlaceAATurret({ 0.0f, 0.0f, 0.0f }) == 0);
+    CHECK(aa.AnyAATurretActive());
+    CHECK(aa.aaTurrets.size() == 1);
+    CHECK(std::abs(aa.aaTurrets[0].HealthFraction() - 1.0f) < 0.001f);
 
     // Lead point sits ahead of a crossing target, along its travel.
     const DirectX::XMFLOAT3 crossing{ 0.0f, 40.0f, 90.0f };
     const DirectX::XMFLOAT3 crossingVelocity{ 25.0f, 0.0f, 0.0f };
     const DirectX::XMFLOAT3 lead =
-        aa.AATurretLeadPoint(crossing, crossingVelocity, 240.0f);
+        aa.AATurretLeadPoint(aa.aaTurrets[0], crossing, crossingVelocity, 240.0f);
     CHECK(lead.x > crossing.x);
     CHECK(std::abs(lead.z - crossing.z) < 0.001f);
     // A stationary target needs no lead at all.
     const DirectX::XMFLOAT3 still =
-        aa.AATurretLeadPoint(crossing, { 0.0f, 0.0f, 0.0f }, 240.0f);
+        aa.AATurretLeadPoint(aa.aaTurrets[0], crossing,
+                             { 0.0f, 0.0f, 0.0f }, 240.0f);
     CHECK(std::abs(still.x - crossing.x) < 0.001f);
 
     // The mount cannot snap onto a target behind it: one short tick turns it by
     // at most AATurretYawRate * dt, which is what makes flying wide of the gun
     // a real option rather than a formality.
-    aa.aaTurretYaw = 0.0f;
-    aa.UpdateAATurret(0.05f, { 0.0f, 20.0f, -80.0f }, true);
-    CHECK(std::abs(aa.aaTurretYaw) <=
+    aa.aaTurrets[0].yaw = 0.0f;
+    aa.UpdateAATurret(aa.aaTurrets[0], 0.05f, { 0.0f, 20.0f, -80.0f }, true);
+    CHECK(std::abs(aa.aaTurrets[0].yaw) <=
           VehicleSystem::AATurretYawRate * 0.05f + 0.0001f);
     // No target: the gun holds fire rather than emptying a burst into empty sky.
-    CHECK(!aa.UpdateAATurret(0.05f, {}, false));
+    CHECK(!aa.UpdateAATurret(aa.aaTurrets[0], 0.05f, {}, false));
+
+    // Several emplacements coexist and take damage independently: killing one
+    // must not disarm the rest, which is the whole point of the vector.
+    CHECK(aa.PlaceAATurret({ 40.0f, 0.0f, 0.0f }) == 1);
+    CHECK(aa.aaTurrets.size() == 2);
+    aa.DamageAATurret(0, VehicleSystem::AATurretMaxHealth);
+    CHECK(!aa.aaTurrets[0].Active());
+    CHECK(aa.aaTurrets[1].Active());
+    CHECK(aa.AnyAATurretActive());
+    // A dead gun stops shooting even with a target dead ahead.
+    CHECK(!aa.UpdateAATurret(aa.aaTurrets[0], 0.05f,
+                             { 0.0f, 20.0f, 40.0f }, true));
+    // The cap is enforced rather than growing without bound.
+    while (aa.aaTurrets.size() < VehicleSystem::kMaxAATurrets)
+        aa.PlaceAATurret({ 0.0f, 0.0f, 0.0f });
+    CHECK(aa.PlaceAATurret({ 1.0f, 0.0f, 1.0f }) ==
+          VehicleSystem::kMaxAATurrets);
+    CHECK(aa.aaTurrets.size() == VehicleSystem::kMaxAATurrets);
 
     // Elevation is clamped to the gun's arc, so it cannot fold over backwards
     // tracking something directly overhead.
     for (int i = 0; i < 200; ++i)
-        aa.UpdateAATurret(0.05f, { 0.0f, 500.0f, 0.1f }, true);
-    CHECK(aa.aaTurretPitch <= VehicleSystem::AATurretMaxPitch + 0.0001f);
-    CHECK(aa.aaTurretPitch >= VehicleSystem::AATurretMinPitch - 0.0001f);
+        aa.UpdateAATurret(aa.aaTurrets[1], 0.05f, { 0.0f, 500.0f, 0.1f }, true);
+    CHECK(aa.aaTurrets[1].pitch <= VehicleSystem::AATurretMaxPitch + 0.0001f);
+    CHECK(aa.aaTurrets[1].pitch >= VehicleSystem::AATurretMinPitch - 0.0001f);
 
     // The ground dead zone has to clear the closest deployment zone the
     // perimeter ring can produce. On the shipping island that zone sits ~6.7 m
@@ -566,18 +587,22 @@ int main() {
     CHECK(VehicleSystem::AATurretMinTargetAltitude < 10.0f);
 
     // Destroying it silences it: a dead gun never reports another shot.
-    CHECK(!aa.DamageAATurret(VehicleSystem::AATurretMaxHealth * 0.5f).destroyed);
-    CHECK(aa.DamageAATurret(VehicleSystem::AATurretMaxHealth).destroyed);
-    CHECK(!aa.AATurretActive());
-    CHECK(!aa.UpdateAATurret(0.05f, { 0.0f, 40.0f, 40.0f }, true));
+    CHECK(!aa.DamageAATurret(
+        1, VehicleSystem::AATurretMaxHealth * 0.5f).destroyed);
+    CHECK(aa.DamageAATurret(1, VehicleSystem::AATurretMaxHealth).destroyed);
+    CHECK(!aa.aaTurrets[1].Active());
+    CHECK(!aa.UpdateAATurret(aa.aaTurrets[1], 0.05f,
+                             { 0.0f, 40.0f, 40.0f }, true));
     // And a further hit on the wreck is not a second kill.
-    CHECK(!aa.DamageAATurret(100.0f).applied);
+    CHECK(!aa.DamageAATurret(1, 100.0f).applied);
+    // Damaging an index past the end is a no-op rather than a crash.
+    CHECK(!aa.DamageAATurret(aa.aaTurrets.size(), 100.0f).applied);
 
-    // ResetLevel clears the emplacement, so the next map does not inherit it.
+    // ResetLevel clears every emplacement, so the next map inherits none.
     aa.PlaceAATurret({ 5.0f, 1.0f, 5.0f });
     aa.ResetLevel();
-    CHECK(!aa.aaTurretPresent);
-    CHECK(!aa.AATurretActive());
+    CHECK(aa.aaTurrets.empty());
+    CHECK(!aa.AnyAATurretActive());
 
     const auto deploymentZones = DeploymentPlanner::BuildPerimeterZones(
         34.0f, 68.0f, 8,
@@ -903,28 +928,24 @@ int main() {
         // Night keeps a non-zero floor for silhouettes, but is authored close
         // to black so local lights and muzzle flashes define the scene.
         CHECK(night.ambientStrength > 0.0f);
-        CHECK(night.ambientLightingIntensity > 0.0f);
+        CHECK(std::abs(night.ambientLightingIntensity) < 0.0001f);
         CHECK(night.directionalLightIntensity < 0.05f);
         CHECK(night.ambientStrength < 0.002f);
         CHECK(night.ambientLightingIntensity < 0.01f);
         // ...but darker than every daylight preset, or it is not night.
         CHECK(night.ambientStrength < dusk.ambientStrength);
         CHECK(night.ambientLightingIntensity < dusk.ambientLightingIntensity);
-        // Night uses the established Afternoon fog volume. Its illumination is
-        // darkened in the fog shader rather than by changing these physical
-        // controls, so the volume behaves consistently across both presets.
-        CHECK(std::abs(night.volumetricFogDensity -
-                       afternoon.volumetricFogDensity) < 0.0001f);
-        CHECK(std::abs(night.volumetricFogAnisotropy -
-                       afternoon.volumetricFogAnisotropy) < 0.0001f);
-        CHECK(std::abs(night.volumetricFogDistance -
-                       afternoon.volumetricFogDistance) < 0.0001f);
-        CHECK(std::abs(night.volumetricFogTint.x -
-                       afternoon.volumetricFogTint.x) < 0.0001f);
-        CHECK(std::abs(night.volumetricFogTint.y -
-                       afternoon.volumetricFogTint.y) < 0.0001f);
-        CHECK(std::abs(night.volumetricFogTint.z -
-                       afternoon.volumetricFogTint.z) < 0.0001f);
+        // Night owns a denser, neutral-black ground layer. These are the exact
+        // authored values restored by the deployment screen's Reset Night fog.
+        CHECK(night.enableVolumetricFog);
+        CHECK(std::abs(night.volumetricFogDensity - 0.0116f) < 0.0001f);
+        CHECK(std::abs(night.volumetricFogAnisotropy - 0.31f) < 0.0001f);
+        CHECK(std::abs(night.volumetricFogHeightFalloff - 0.107f) < 0.0001f);
+        CHECK(std::abs(night.volumetricFogBaseHeight - 0.4f) < 0.0001f);
+        CHECK(std::abs(night.volumetricFogDistance - 800.0f) < 0.0001f);
+        CHECK(std::abs(night.volumetricFogTint.x - 5.0f / 255.0f) < 0.0001f);
+        CHECK(std::abs(night.volumetricFogTint.y - 5.0f / 255.0f) < 0.0001f);
+        CHECK(std::abs(night.volumetricFogTint.z - 5.0f / 255.0f) < 0.0001f);
 
         // Night sky is near-black, and cool rather than warm: the clear colour
         // is what shows through wherever the atmosphere does not cover.

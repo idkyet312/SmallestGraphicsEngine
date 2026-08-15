@@ -4,6 +4,7 @@
 #include <DirectXMath.h>
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 // The rappel rope is a box3d simulation, referenced here by forward-declared
 // pointer on purpose. This header is included by GameArchitectureTests, which
@@ -68,45 +69,59 @@ struct VehicleSystem {
     static constexpr float AATurretBarrelLength = 2.35f;
     static constexpr float AATurretMountHeight = 1.85f;
 
-    bool aaTurretPresent = false;
-    DirectX::XMFLOAT3 aaTurretPosition{};
-    float aaTurretYaw = 0.0f;
-    float aaTurretPitch = 0.0f;
-    float aaTurretHealth = AATurretMaxHealth;
-    bool aaTurretDead = false;
-    float aaTurretShotTimer = 0.0f;
-    int aaTurretShotsLeftInBurst = 0;
-    // Barrels spin down after firing; purely cosmetic, drives the muzzle glow.
-    float aaTurretHeat = 0.0f;
+    // One emplacement. Held in a vector rather than as loose fields on the
+    // system, so a level can carry several: the comm tower's gun plus any the
+    // designer drops in from the editor's turret prefab.
+    struct AATurret {
+        DirectX::XMFLOAT3 position{};
+        float yaw = 0.0f;
+        float pitch = 0.35f;
+        float health = AATurretMaxHealth;
+        bool dead = false;
+        float shotTimer = 0.0f;
+        int shotsLeftInBurst = 0;
+        // Barrels spin down after firing; cosmetic, drives the muzzle glow.
+        float heat = 0.0f;
 
-    // Where the shells leave the gun, following the current barrel attitude.
-    DirectX::XMFLOAT3 AATurretMuzzle() const {
-        const float horizontal = std::cos(aaTurretPitch) * AATurretBarrelLength;
-        return DirectX::XMFLOAT3{
-            aaTurretPosition.x + std::sin(aaTurretYaw) * horizontal,
-            aaTurretPosition.y + AATurretMountHeight +
-                std::sin(aaTurretPitch) * AATurretBarrelLength,
-            aaTurretPosition.z + std::cos(aaTurretYaw) * horizontal };
+        bool Active() const { return !dead; }
+
+        // Where the shells leave the gun, following the current attitude.
+        DirectX::XMFLOAT3 Muzzle() const {
+            const float horizontal = std::cos(pitch) * AATurretBarrelLength;
+            return DirectX::XMFLOAT3{
+                position.x + std::sin(yaw) * horizontal,
+                position.y + AATurretMountHeight +
+                    std::sin(pitch) * AATurretBarrelLength,
+                position.z + std::cos(yaw) * horizontal };
+        }
+
+        float HealthFraction() const {
+            return AATurretMaxHealth > 0.0f
+                ? (std::max)(0.0f, (std::min)(1.0f, health / AATurretMaxHealth))
+                : 0.0f;
+        }
+    };
+
+    // Capped: each turret costs a draw call and its own target search, so a
+    // level stuffed with them should not quietly sink the frame rate.
+    static constexpr size_t kMaxAATurrets = 8;
+    std::vector<AATurret> aaTurrets;
+
+    // Adds an emplacement and returns its index, or kMaxAATurrets when full.
+    size_t PlaceAATurret(const DirectX::XMFLOAT3& position) {
+        if (aaTurrets.size() >= kMaxAATurrets) return kMaxAATurrets;
+        AATurret turret;
+        turret.position = position;
+        aaTurrets.push_back(turret);
+        return aaTurrets.size() - 1;
     }
 
-    float AATurretHealthFraction() const {
-        return AATurretMaxHealth > 0.0f
-            ? (std::max)(0.0f, (std::min)(1.0f, aaTurretHealth / AATurretMaxHealth))
-            : 0.0f;
-    }
-
-    bool AATurretActive() const { return aaTurretPresent && !aaTurretDead; }
-
-    void PlaceAATurret(const DirectX::XMFLOAT3& position) {
-        aaTurretPresent = true;
-        aaTurretPosition = position;
-        aaTurretYaw = 0.0f;
-        aaTurretPitch = 0.35f;
-        aaTurretHealth = AATurretMaxHealth;
-        aaTurretDead = false;
-        aaTurretShotTimer = 0.0f;
-        aaTurretShotsLeftInBurst = 0;
-        aaTurretHeat = 0.0f;
+    // True while any emplacement is still standing. Callers that need a
+    // specific one index aaTurrets directly.
+    bool AnyAATurretActive() const {
+        for (const AATurret& turret : aaTurrets)
+            if (turret.Active()) return true;
+        return false;
     }
 
     // Slews the gun toward `target` and reports true on the frames a shell
@@ -115,71 +130,72 @@ struct VehicleSystem {
     // `target` is where the gun should shoot, already led by the caller -- it
     // knows the shell speed and the target's velocity, and leading a helicopter
     // is the difference between a threat and a firework display.
-    bool UpdateAATurret(float deltaTime, const DirectX::XMFLOAT3& target,
-                        bool hasTarget) {
-        if (!AATurretActive()) return false;
+    bool UpdateAATurret(AATurret& turret, float deltaTime,
+                        const DirectX::XMFLOAT3& target, bool hasTarget) {
+        if (!turret.Active()) return false;
         const float dt = (std::max)(0.0f, deltaTime);
-        aaTurretHeat = (std::max)(0.0f, aaTurretHeat - dt * 1.6f);
+        turret.heat = (std::max)(0.0f, turret.heat - dt * 1.6f);
         if (!hasTarget) {
             // Nothing to shoot: stop mid-burst rather than emptying into air.
-            aaTurretShotsLeftInBurst = 0;
+            turret.shotsLeftInBurst = 0;
             return false;
         }
 
-        const float dx = target.x - aaTurretPosition.x;
-        const float dz = target.z - aaTurretPosition.z;
-        const float dy = target.y - (aaTurretPosition.y + AATurretMountHeight);
+        const float dx = target.x - turret.position.x;
+        const float dz = target.z - turret.position.z;
+        const float dy = target.y - (turret.position.y + AATurretMountHeight);
         const float horizontal = std::sqrt(dx * dx + dz * dz);
 
         // Traverse and elevate at a finite rate. A turret that snaps to its
         // target is both trivial to dodge-check and reads as a hitscan cheat;
         // the slew is what makes flying wide of the gun a real option.
         const float desiredYaw = std::atan2(dx, dz);
-        float yawDelta = std::atan2(std::sin(desiredYaw - aaTurretYaw),
-                                    std::cos(desiredYaw - aaTurretYaw));
+        float yawDelta = std::atan2(std::sin(desiredYaw - turret.yaw),
+                                    std::cos(desiredYaw - turret.yaw));
         const float maxYawStep = AATurretYawRate * dt;
         yawDelta = (std::max)(-maxYawStep, (std::min)(maxYawStep, yawDelta));
-        aaTurretYaw += yawDelta;
+        turret.yaw += yawDelta;
 
         const float desiredPitch = std::atan2(dy, (std::max)(0.001f, horizontal));
-        float pitchDelta = desiredPitch - aaTurretPitch;
+        float pitchDelta = desiredPitch - turret.pitch;
         const float maxPitchStep = AATurretPitchRate * dt;
         pitchDelta = (std::max)(-maxPitchStep, (std::min)(maxPitchStep, pitchDelta));
-        aaTurretPitch = (std::max)(AATurretMinPitch,
-            (std::min)(AATurretMaxPitch, aaTurretPitch + pitchDelta));
+        turret.pitch = (std::max)(AATurretMinPitch,
+            (std::min)(AATurretMaxPitch, turret.pitch + pitchDelta));
 
         // Only fire once roughly on target, so the burst does not spray while
         // the mount is still swinging around.
         const bool onTarget = std::fabs(yawDelta) < 0.05f &&
-                              std::fabs(desiredPitch - aaTurretPitch) < 0.06f;
+                              std::fabs(desiredPitch - turret.pitch) < 0.06f;
 
-        aaTurretShotTimer -= dt;
-        if (aaTurretShotTimer > 0.0f) return false;
+        turret.shotTimer -= dt;
+        if (turret.shotTimer > 0.0f) return false;
         if (!onTarget) return false;
 
-        if (aaTurretShotsLeftInBurst <= 0) {
-            aaTurretShotsLeftInBurst = static_cast<int>(AATurretBurstShots);
-            aaTurretShotTimer = AATurretShotInterval;
-            --aaTurretShotsLeftInBurst;
-            aaTurretHeat = 1.0f;
+        if (turret.shotsLeftInBurst <= 0) {
+            turret.shotsLeftInBurst = static_cast<int>(AATurretBurstShots);
+            turret.shotTimer = AATurretShotInterval;
+            --turret.shotsLeftInBurst;
+            turret.heat = 1.0f;
             return true;
         }
-        --aaTurretShotsLeftInBurst;
-        aaTurretShotTimer = aaTurretShotsLeftInBurst > 0
+        --turret.shotsLeftInBurst;
+        turret.shotTimer = turret.shotsLeftInBurst > 0
             ? AATurretShotInterval : AATurretBurstPause;
-        aaTurretHeat = 1.0f;
+        turret.heat = 1.0f;
         return true;
     }
 
     // Where to aim to hit a target moving at `velocity`. Solves the intercept
     // iteratively: the flight time depends on the lead point, which depends on
     // the flight time. Two passes is plenty at these ranges and speeds.
-    DirectX::XMFLOAT3 AATurretLeadPoint(const DirectX::XMFLOAT3& target,
+    DirectX::XMFLOAT3 AATurretLeadPoint(const AATurret& turret,
+                                        const DirectX::XMFLOAT3& target,
                                         const DirectX::XMFLOAT3& velocity,
                                         float shellSpeed) const {
         DirectX::XMFLOAT3 aim = target;
         if (shellSpeed <= 0.001f) return aim;
-        const DirectX::XMFLOAT3 muzzle = AATurretMuzzle();
+        const DirectX::XMFLOAT3 muzzle = turret.Muzzle();
         for (int i = 0; i < 2; ++i) {
             const float dx = aim.x - muzzle.x;
             const float dy = aim.y - muzzle.y;
@@ -1456,14 +1472,17 @@ public:
         return result;
     }
 
-    DamageResult DamageAATurret(float damage) {
-        DamageResult result{ aaTurretPosition };
-        if (damage <= 0.0f || !aaTurretPresent || aaTurretDead) return result;
+    DamageResult DamageAATurret(size_t index, float damage) {
+        DamageResult result{};
+        if (index >= aaTurrets.size()) return result;
+        AATurret& turret = aaTurrets[index];
+        result.position = turret.position;
+        if (damage <= 0.0f || turret.dead) return result;
         result.applied = true;
-        aaTurretHealth = (std::max)(0.0f, aaTurretHealth - damage);
-        if (aaTurretHealth > 0.0f) return result;
-        aaTurretDead = true;
-        aaTurretShotsLeftInBurst = 0;
+        turret.health = (std::max)(0.0f, turret.health - damage);
+        if (turret.health > 0.0f) return result;
+        turret.dead = true;
+        turret.shotsLeftInBurst = 0;
         result.destroyed = true;
         return result;
     }
@@ -1480,17 +1499,9 @@ public:
     }
 
     void ResetLevel() {
-        // Cleared rather than re-placed: the level decides whether it has an AA
-        // gun and where, so a map without one must not inherit the last map's.
-        aaTurretPresent = false;
-        aaTurretPosition = {};
-        aaTurretYaw = 0.0f;
-        aaTurretPitch = 0.35f;
-        aaTurretHealth = AATurretMaxHealth;
-        aaTurretDead = false;
-        aaTurretShotTimer = 0.0f;
-        aaTurretShotsLeftInBurst = 0;
-        aaTurretHeat = 0.0f;
+        // Cleared rather than re-placed: the level decides whether it has AA
+        // guns and where, so a map without any must not inherit the last map's.
+        aaTurrets.clear();
 
         helicopterLevelScale = 1.0f;
         helicopterMainRotorAngle = 0.0f;
