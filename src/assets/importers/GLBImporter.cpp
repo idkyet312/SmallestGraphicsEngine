@@ -1333,7 +1333,9 @@ bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* devic
     if (!primitive.indices.empty()) {
         const UINT ibSize = (UINT)(primitive.indices.size() * sizeof(unsigned int));
         primitive.indexBuffer = CreateStaticGeometryBuffer(device, primitive.indices.data(), ibSize,
-            D3D12_RESOURCE_STATE_INDEX_BUFFER, "IndexBuffer");
+            D3D12_RESOURCE_STATE_INDEX_BUFFER |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            "IndexBuffer");
         if (!primitive.indexBuffer) return false;
         primitive.ibv.BufferLocation = primitive.indexBuffer->GetGPUVirtualAddress();
         primitive.ibv.SizeInBytes = ibSize;

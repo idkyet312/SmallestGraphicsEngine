@@ -86,55 +86,69 @@ float4 PSMain(ScreenVertex input) : SV_Target {
     // green when automatic gain is wide open.
     const float sceneLuma = Luma(saturate(sceneColor));
 
-    // Four same-resolution neighbours provide a tiny local adaptation window.
-    // It restores edge and texture contrast that tone mapping compressed, but
-    // cannot draw a world-space light volume or the geometric shapes produced by
-    // the earlier point/ambient-light workarounds.
-    const float2 dx = float2(inverseScreenSize.x, 0.0);
-    const float2 dy = float2(0.0, inverseScreenSize.y);
-    const float neighbourLuma = 0.25 * (
-        Luma(sceneTexture.Sample(linearClamp, input.uv + dx).rgb) +
-        Luma(sceneTexture.Sample(linearClamp, input.uv - dx).rgb) +
-        Luma(sceneTexture.Sample(linearClamp, input.uv + dy).rgb) +
-        Luma(sceneTexture.Sample(linearClamp, input.uv - dy).rgb));
-    const float localDetail = sceneLuma - neighbourLuma;
-    const float signal = max(sceneLuma + localDetail * 1.35 - 0.002, 0.0);
+    // Feed the resolved luminance directly into the tube. The old neighbour
+    // subtraction behaved like an unsharp-mask filter, turning every silhouette
+    // and texture boundary into a bright game-like outline.
+    const float signal = max(sceneLuma - 0.002, 0.0);
 
     const float tubeDrive = signal * gain * 1.4;
     const float kTubeCeiling = 0.70;
     float intensified = tubeDrive / (1.0 + tubeDrive / kTubeCeiling);
-    intensified += clamp(localDetail * gain * 0.48, -0.075, 0.075);
     intensified = saturate(intensified + 0.008);
+
+    // Re-expand the tube's compressed range with a gentle toe. Keep enough of
+    // the weak signal to read terrain and foliage instead of separating every
+    // surface into hard black and bright green bands.
+    const float tubeSignal = saturate(
+        (intensified - 0.010) / (kTubeCeiling - 0.010));
+    intensified = pow(tubeSignal, 1.16);
 
     // -- 2. Halo --------------------------------------------------------------
     // Blooming around a bright source is the signature intensifier artefact:
     // charge spreads sideways off the microchannel plate, so a lamp or a muzzle
     // flash grows a soft ROUND disc far larger than an ordinary render bloom.
     //
-    // Keep this local to truly hot sources. A wide two-ring kernel spread the
-    // already bright sky and fog across silhouettes, reading as lens blur over
-    // the entire image instead of tube bloom around individual lamps.
-    //
     // Halo also grows with gain: a tube running wide open in near-total darkness
     // blooms far more off the same light source than one stopped down in
     // twilight, which is why a single torch can wash out a whole dark scene.
     const float haloScale = 1.0 + gain * 0.035;
-    float halo = 0.0;
+    float nearHalo = 0.0;
+    float farHalo = 0.0;
     [unroll]
     for (int step = 0; step < 8; ++step) {
         const float angle = (step + 0.5) * 0.7853981634;
-        const float2 offset = float2(cos(angle), sin(angle)) *
-                              1.75 * haloScale * inverseScreenSize;
-        halo += max(0.0, Luma(sceneTexture.Sample(
-            linearClamp, input.uv + offset).rgb) - 0.78);
+        const float2 direction = float2(cos(angle), sin(angle));
+        const float2 nearOffset = direction *
+                                  2.5 * haloScale * inverseScreenSize;
+        const float2 farOffset = direction *
+                                 10.0 * haloScale * inverseScreenSize;
+        nearHalo += max(0.0, Luma(sceneTexture.Sample(
+            linearClamp, input.uv + nearOffset).rgb) - 0.80);
+        farHalo += max(0.0, Luma(sceneTexture.Sample(
+            linearClamp, input.uv + farOffset).rgb) - 0.88);
     }
-    intensified = saturate(intensified + halo * (0.22 / 8.0));
+    intensified = saturate(intensified +
+        nearHalo * (0.34 / 8.0) + farHalo * (0.20 / 8.0));
+
+    // Roll the hottest tube response into green instead of letting broad lit
+    // surfaces ride at the output ceiling. The knee starts above the useful
+    // midrange, preserving terrain detail while taking the white edge off the
+    // tower, weapon highlights, and bloomed light sources.
+    const float highlightKnee = smoothstep(0.52, 1.0, intensified);
+    intensified *= lerp(1.0, 0.76, highlightKnee);
 
     // -- 3. Phosphor ----------------------------------------------------------
-    // P43 image-intensifier phosphor green. Small red/blue components retain
-    // highlight shape on an RGB display without turning the image cyan or lime.
-    const float3 kPhosphor = float3(0.12, 1.0, 0.16);
-    float3 nightColor = intensified * kPhosphor;
+    // P43 image-intensifier phosphor green. Real phosphor is darker and less
+    // saturated in a weak part of the image, then shifts toward its bright green
+    // emission as signal rises. That small luminance-dependent variation keeps
+    // the picture from reading as one flat green overlay while staying visibly
+    // monochrome.
+    const float3 kPhosphorShadow = float3(0.055, 0.62, 0.080);
+    const float3 kPhosphorHighlight = float3(0.14, 1.0, 0.18);
+    const float phosphorBlend = smoothstep(0.08, 0.66, intensified);
+    const float3 phosphor = lerp(
+        kPhosphorShadow, kPhosphorHighlight, phosphorBlend);
+    float3 nightColor = intensified * phosphor;
 
     // Daylight overload. Point an intensifier at a lit scene and it does not
     // show a nice green picture -- the tube is driven far past saturation and
@@ -146,17 +160,38 @@ float4 PSMain(ScreenVertex input) : SV_Target {
         // Crush contrast toward the tube's saturated output and lift the floor,
         // so the picture goes flat and milky instead of merely bright.
         const float washed = lerp(intensified, 0.82, overload * 0.75);
-        nightColor = lerp(nightColor, washed * kPhosphor, overload);
-        nightColor += overload * 0.16 * kPhosphor;
+        nightColor = lerp(
+            nightColor, washed * kPhosphorHighlight, overload);
+        nightColor += overload * 0.16 * kPhosphorHighlight;
     }
 
     // -- 4. Tube artefacts ----------------------------------------------------
     // Noise scales with darkness: amplifying a weak signal amplifies its noise
     // too, so shadows are grainy while well-lit areas are relatively clean.
-    const float2 noiseUV = input.uv * float2(1920.0, 1080.0);
-    const float grain =
-        Hash(floor(noiseUV) + frac(time) * 137.0) - 0.5;
-    nightColor += grain * 0.065 * (1.0 - intensified * 0.72);
+    const float2 noiseUV = input.uv / max(inverseScreenSize, 1e-6);
+    // Updating in discrete steps gives the grain the restless crawl of an
+    // intensifier tube without dissolving into smooth shimmer at high FPS.
+    const float noiseFrame = floor(time * 24.0);
+    const float2 frameOffset = float2(
+        noiseFrame * 17.0, noiseFrame * 47.0);
+    const float fineGrain =
+        Hash(floor(noiseUV) + frameOffset) - 0.5;
+    const float mediumGrain =
+        Hash(floor(noiseUV * 0.50) - frameOffset * 0.37) - 0.5;
+    const float coarseGrain =
+        Hash(floor(noiseUV * 0.18) + frameOffset * 0.11) - 0.5;
+    const float grain = fineGrain * 0.45 +
+                        mediumGrain * 0.35 + coarseGrain * 0.20;
+    const float grainStrength = lerp(0.135, 0.045, intensified);
+    nightColor += grain * grainStrength * kPhosphorHighlight;
+
+    // Real phosphor screens also have a faint fixed unevenness beneath the
+    // moving sensor noise. Large cells make that texture survive downsampling
+    // in screenshots without reading as a second scanline pattern.
+    const float fixedPattern = Hash(
+        floor(noiseUV * 0.22) + float2(19.0, 73.0)) - 0.5;
+    nightColor *= 1.0 + fixedPattern * 0.11 *
+                  (1.0 - intensified * 0.35);
 
     // Scanlines: a subtle horizontal ripple, kept shallow so it reads as tube
     // texture instead of a CRT filter.

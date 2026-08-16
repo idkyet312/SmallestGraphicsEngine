@@ -514,7 +514,9 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
         const uint64_t indexBytes =
             uint64_t(source.indexCount) * source.indexElementSize;
         if (!CreateStaticBufferDX12(device.Get(), indexData, indexBytes,
-                D3D12_RESOURCE_STATE_INDEX_BUFFER, primitive.indexBuffer,
+                D3D12_RESOURCE_STATE_INDEX_BUFFER |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                primitive.indexBuffer,
                 "CookedIndexBuffer")) {
             if (error) *error = "failed to create cooked index buffer";
             return {};

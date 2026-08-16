@@ -42,6 +42,7 @@ struct RetiredUploadBatch {
 inline std::mutex mutex;
 inline std::vector<PendingUpload> pending;
 inline std::array<std::vector<ComPtr<ID3D12Resource>>, FRAME_COUNT> retired;
+inline std::array<uint64_t, FRAME_COUNT> retiredEpoch = {};
 inline std::array<ComPtr<ID3D12CommandAllocator>, FRAME_COUNT> copyAllocators;
 inline ComPtr<ID3D12GraphicsCommandList> copyCommandList;
 inline std::array<uint64_t, FRAME_COUNT> copyAllocatorFenceValues = {};
@@ -150,6 +151,20 @@ inline uint32_t FlushStaticBufferUploadsDX12(ID3D12GraphicsCommandList* commandL
             }),
         StaticBufferDetailDX12::copyRetired.end());
     const UINT slot = g_dx12.frameIndex % FRAME_COUNT;
+    // The copy queue can finish before the direct command list that transitions
+    // these destinations has even been submitted.  A discarded model (for
+    // example, an authored asset rejected in favour of a fallback) may then have
+    // no owner other than copyRetired, so collecting it on the copy fence alone
+    // deletes resources still referenced by the open direct list.  Keep one
+    // extra reference in the frame slot until that slot is reused; frame pacing
+    // has retired its previous direct list by then.  lastDirectFenceValue is
+    // stable for every flush within one frame, unlike fenceValues[slot], which a
+    // rare in-frame drain may advance before EndFrame submits the list.
+    const uint64_t directEpoch = g_dx12.lastDirectFenceValue;
+    if (StaticBufferDetailDX12::retiredEpoch[slot] != directEpoch) {
+        StaticBufferDetailDX12::retired[slot].clear();
+        StaticBufferDetailDX12::retiredEpoch[slot] = directEpoch;
+    }
     WaitForFenceCPU(g_dx12.copyFence.Get(),
         StaticBufferDetailDX12::copyAllocatorFenceValues[slot]);
     ThrowIfFailed(StaticBufferDetailDX12::copyAllocators[slot]->Reset());
@@ -173,7 +188,8 @@ inline uint32_t FlushStaticBufferUploadsDX12(ID3D12GraphicsCommandList* commandL
         barriers.push_back(barrier);
         retirement.resources.push_back(std::move(upload.staging));
         // Copies to resources superseded by a later merge are still present in
-        // this command list. Keep those destinations alive until fence retirement.
+        // this command list. Keep those destinations alive through both queues.
+        StaticBufferDetailDX12::retired[slot].push_back(upload.destination);
         retirement.resources.push_back(std::move(upload.destination));
     }
     ThrowIfFailed(StaticBufferDetailDX12::copyCommandList->Close());

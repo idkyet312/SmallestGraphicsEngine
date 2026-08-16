@@ -132,4 +132,23 @@ inline WeatherSettings MakeWeatherSettings(WeatherState state) {
     return settings;
 }
 
+// Storm at night. The daylight storm presets above carry a pale blue-grey fog
+// tint that reads as an overcast sky lit from above; at night there is nothing
+// lighting it, so that same tint turns the ground layer into a bright haze that
+// washes out the silhouettes night is built around -- and it hides the lightning
+// flash, which is the one thing that should light the scene.
+//
+// Applied on top of the weather preset rather than folded into it because
+// weather and time of day are chosen independently, and only this pairing needs
+// the correction.
+inline void ApplyNightWeatherFog(WeatherSettings& settings, WeatherState state) {
+    if (state != WeatherState::Storm && state != WeatherState::Rain) return;
+    // Near-black, matching the authored Night fog rather than the storm's.
+    settings.fogTint = { 10.0f / 255.0f, 10.0f / 255.0f, 10.0f / 255.0f };
+    // Night's own falloff: a tighter, denser ground layer than the daylight
+    // storm, so the murk stays low and distance still reads as darkness.
+    settings.fogHeightFalloff = 0.107f;
+    settings.fogAnisotropy = 0.31f;
+}
+
 #endif

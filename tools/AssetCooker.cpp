@@ -1263,7 +1263,52 @@ bool Cook(const fs::path& source, const fs::path& destination) {
 
 void Usage() {
     std::cerr << "AssetCooker <input.fbx|glb|gltf> <output.sgeasset>\n"
-                 "AssetCooker --all <content-root> --out <cooked-root>\n";
+                 "AssetCooker --all <content-root> --out <cooked-root>\n"
+                 "            [--only <list-file>]\n"
+                 "\n"
+                 "  --only  Cook only sources under the content-relative paths\n"
+                 "          named in <list-file>, one per line ('#' comments\n"
+                 "          and blank lines ignored). Written by\n"
+                 "          scripts/Find-AssetReferences.ps1 so the cook covers\n"
+                 "          the same set the package ships. Without it, every\n"
+                 "          model under the root is cooked, including art that\n"
+                 "          nothing loads.\n";
+}
+
+// Content-relative directory prefixes to restrict the cook to. Empty means
+// "cook everything", preserving the old --all behaviour.
+std::vector<std::string> LoadOnlyList(const fs::path& file) {
+    std::vector<std::string> prefixes;
+    std::ifstream input(file);
+    if (!input) throw std::runtime_error(
+        "Unable to open --only list: " + file.string());
+    std::string line;
+    while (std::getline(input, line)) {
+        // Trim whitespace and CR, so a CRLF list written by PowerShell works.
+        const size_t first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        const size_t last = line.find_last_not_of(" \t\r\n");
+        line = line.substr(first, last - first + 1);
+        if (line.empty() || line[0] == '#') continue;
+        for (char& c : line) if (c == '\\') c = '/';
+        prefixes.push_back(line);
+    }
+    return prefixes;
+}
+
+// True when `relative` sits under any listed prefix. Compared segment-wise
+// rather than by raw string prefix so "grass" does not also match "grass2".
+bool MatchesOnlyList(const fs::path& relative,
+                     const std::vector<std::string>& prefixes) {
+    if (prefixes.empty()) return true;
+    const std::string path = relative.generic_string();
+    for (const std::string& prefix : prefixes) {
+        if (path.size() < prefix.size()) continue;
+        if (path.compare(0, prefix.size(), prefix) != 0) continue;
+        if (path.size() == prefix.size()) return true;
+        if (path[prefix.size()] == '/') return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -1282,12 +1327,20 @@ int main(int argc, char** argv) {
             }
             return Cook(fs::path(argv[1]), fs::path(argv[2])) ? 0 : 1;
         }
-        if (argc == 5 && std::string(argv[1]) == "--all" &&
+        if ((argc == 5 || argc == 7) && std::string(argv[1]) == "--all" &&
             std::string(argv[3]) == "--out") {
             const fs::path root = fs::absolute(argv[2]).lexically_normal();
             const fs::path output = fs::absolute(argv[4]).lexically_normal();
+            std::vector<std::string> only;
+            if (argc == 7) {
+                if (std::string(argv[5]) != "--only") { Usage(); return 2; }
+                only = LoadOnlyList(fs::path(argv[6]));
+                std::cout << "Restricting cook to " << only.size()
+                          << " referenced path(s)\n";
+            }
             uint32_t cooked = 0;
             uint32_t failed = 0;
+            uint32_t skipped = 0;
             for (const fs::directory_entry& entry :
                  fs::recursive_directory_iterator(root)) {
                 if (!entry.is_regular_file() || !IsModel(entry.path())) continue;
@@ -1297,12 +1350,15 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 fs::path relative = fs::relative(entry.path(), root);
+                if (!MatchesOnlyList(relative, only)) { ++skipped; continue; }
                 relative.replace_extension(".sgeasset");
                 if (Cook(entry.path(), output / relative)) ++cooked;
                 else ++failed;
             }
             std::cout << "Cook complete: " << cooked << " succeeded, "
-                      << failed << " failed\n";
+                      << failed << " failed";
+            if (skipped) std::cout << ", " << skipped << " unreferenced";
+            std::cout << "\n";
             return failed ? 1 : 0;
         }
         Usage();

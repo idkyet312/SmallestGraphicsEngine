@@ -205,6 +205,11 @@ struct PrefabModelCacheEntry {
     XMFLOAT3 boundsMaximum{};
 };
 static std::unordered_map<std::string, PrefabModelCacheEntry> g_prefabModelCache;
+// A source model can be rejected after its importer has already recorded GPU
+// uploads (the authored AA turret's missing pose node is one example). Keep such
+// models alive until the cold-load fence drain instead of deleting resources
+// still referenced by the open command list.
+static std::vector<std::shared_ptr<SceneNode>> g_rejectedUploadModels;
 struct RetiredPrefabResources {
     std::vector<PrefabRenderBatch> renderBatches;
     std::unordered_map<std::string, PrefabModelCacheEntry> models;
@@ -2305,6 +2310,8 @@ static void UpdateHelicopter(float dt) {
 // Both defined with the other spawn helpers, below.
 static float RandomUnit();
 static bool SpawnDropshipBandit(const XMFLOAT3& position);
+// Defined with the lightning state, below.
+static void ResetLightning();
 
 static void UpdateEnemyVisionForCurrentConditions() {
     TimeOfDaySettings applied = MakeTimeOfDaySettings(g_selectedTimeOfDay);
@@ -2319,7 +2326,26 @@ static void UpdateEnemyVisionForCurrentConditions() {
 // kept with the selected time so switching the sun away and back does not
 // silently replace the chosen weather with that time's previous fog override.
 void ApplyLiveWeatherState(WeatherState state) {
+    // Arm lightning on the transition into Storm, not on every apply.
+    // ApplyTimeOfDay re-applies the current weather whenever the sun moves, so
+    // resetting unconditionally would push the next strike back to the start of
+    // its cooldown each time the player changed the time of day.
+    const bool enteringStorm = state == WeatherState::Storm &&
+                               scene.weatherState != WeatherState::Storm;
     scene.ApplyWeatherPreset(state);
+    if (enteringStorm) ResetLightning();
+    // Night rain/storm keeps night's near-black fog instead of the preset's
+    // daylight blue-grey, which would otherwise light the ground layer with a
+    // sky that is not there. Runs after the preset, before the per-time copy
+    // below, so the corrected values are what get stored and shown in the UI.
+    if (state != WeatherState::Custom &&
+        g_selectedTimeOfDay == TimeOfDay::Night) {
+        WeatherSettings nightWeather = MakeWeatherSettings(state);
+        ApplyNightWeatherFog(nightWeather, state);
+        scene.volumetricFogTint = nightWeather.fogTint;
+        scene.volumetricFogHeightFalloff = nightWeather.fogHeightFalloff;
+        scene.volumetricFogAnisotropy = nightWeather.fogAnisotropy;
+    }
     if (state != WeatherState::Custom) {
         VolumetricFogSettings& fog =
             VolumetricFogFor(g_selectedTimeOfDay);
@@ -4533,9 +4559,131 @@ static float                g_nightVisionBlend = 0.0f;
 // Automatic gain control state, carried between frames because adaptation is a
 // temporal effect the per-pixel shader has no memory to run itself. Starts wide
 // open, which is where a tube sits before it has seen any light.
+// Transient light the tube has to answer for: explosions, flares, lightning.
+// Decays on its own, and any source can push it up without knowing about the
+// others -- the AGC only sees a total. Separate from the scene's steady ambient
+// because these are events, not a light level.
+static float                g_nightVisionLightSpike = 0.0f;
+// World position of the brightest recent flash, so the spike can fall off with
+// distance rather than blinding the player from across the island.
+static XMFLOAT3             g_nightVisionSpikeOrigin{};
 static float                g_nightVisionGain = 9.0f;
 // 0 in usable darkness, 1 when the scene is bright enough to wash the tube out.
 static float                g_nightVisionOverload = 0.0f;
+
+// Lightning. Only runs in Storm weather, and only drives light -- the strike
+// itself is off-screen above the cloud deck, which is what most lightning looks
+// like from under a storm.
+static float                g_lightningCooldown = 4.0f;
+// Current flash brightness, 0..1. Decays fast; a strike can re-trigger it while
+// it is still falling, which is what produces the stutter of a multi-stroke
+// flash rather than one clean pulse.
+static float                g_lightningFlash = 0.0f;
+static int                  g_lightningStrokesLeft = 0;
+static float                g_lightningStrokeTimer = 0.0f;
+// Ambient the storm flash adds to the scene, before the goggles see it.
+static float                g_lightningAmbient = 0.0f;
+
+// Puts lightning back to "storm just started". Called when a storm is selected
+// and on level restart, because the state above is global and otherwise carries
+// whatever the previous run stranded: a run that ended mid-flash leaves
+// g_lightningStrokesLeft > 0, and the strike scheduler below refuses to arm
+// while that is set, so the storm goes permanently silent.
+//
+// The first cooldown is short and fixed rather than the usual 5..16 s roll --
+// picking Storm should produce lightning soon enough to confirm it is working.
+static void ResetLightning() {
+    g_lightningCooldown = 2.0f;
+    g_lightningFlash = 0.0f;
+    g_lightningStrokesLeft = 0;
+    g_lightningStrokeTimer = 0.0f;
+    g_lightningAmbient = 0.0f;
+}
+
+// Reports a flash of light at a world position. `brightness` is in the same
+// units as the scene's ambient level, so 1.0 is roughly full daylight arriving
+// at once.
+//
+// Kept as one entry point so explosions, muzzle flashes and lightning all reach
+// the goggles the same way, and so a source only has to say how bright it is and
+// where -- the falloff and the decay live here.
+static void ReportNightVisionLightFlash(const XMFLOAT3& position,
+                                        float brightness) {
+    if (brightness <= 0.0f) return;
+    // Brightest wins rather than summing: two grenades going off together are
+    // not twice as blinding as one, and summing would let a firefight pin the
+    // tube shut permanently.
+    if (brightness <= g_nightVisionLightSpike) return;
+    g_nightVisionLightSpike = brightness;
+    g_nightVisionSpikeOrigin = position;
+}
+
+// Storm lightning: schedules strikes, runs the multi-stroke flicker, and
+// publishes the light it throws.
+//
+// The flash is a light event rather than geometry -- no bolt is drawn. Under a
+// full storm deck the channel is usually hidden in cloud anyway, and what sells
+// it is the world going briefly bright and the thunder arriving late.
+static void UpdateLightning(float deltaTime) {
+    // Storm only. Any other weather winds the state down rather than freezing
+    // it, so switching away mid-flash does not leave the scene lit.
+    if (scene.weatherState != WeatherState::Storm) {
+        g_lightningFlash = (std::max)(0.0f, g_lightningFlash - deltaTime * 4.0f);
+        g_lightningStrokesLeft = 0;
+        g_lightningStrokeTimer = 0.0f;
+        g_lightningAmbient = g_lightningFlash * 0.35f;
+        return;
+    }
+
+    // Between strikes. Interval is deliberately wide: evenly spaced lightning
+    // reads as a strobe, and the wait is what makes each one land.
+    g_lightningCooldown -= deltaTime;
+    if (g_lightningCooldown <= 0.0f && g_lightningStrokesLeft <= 0) {
+        g_lightningCooldown = 5.0f + RandomUnit() * 11.0f;
+        // Two to four strokes, the way a real flash flickers rather than
+        // pulsing once.
+        g_lightningStrokesLeft = 2 + static_cast<int>(RandomUnit() * 3.0f);
+        g_lightningStrokeTimer = 0.0f;
+
+        // Thunder: one crack per flash, on the frame the flash begins.
+        //
+        // Queued here rather than per stroke -- a three-stroke flash fired
+        // three overlapping thunderclaps, which read as a stutter rather than
+        // one strike. Zero delay, because the strike is meant to be overhead:
+        // the earlier speed-of-sound delay put the sound up to 2.6 s after the
+        // light, long enough that the two stopped reading as the same event.
+        g_pendingExplosionAudio.push_back({
+            0.0f, 0.85f, 0.55f + RandomUnit() * 0.12f, false });
+    }
+
+    // Stroke sequence.
+    if (g_lightningStrokesLeft > 0) {
+        g_lightningStrokeTimer -= deltaTime;
+        if (g_lightningStrokeTimer <= 0.0f) {
+            --g_lightningStrokesLeft;
+            g_lightningStrokeTimer = 0.04f + RandomUnit() * 0.09f;
+            // Each stroke varies, so the flicker is uneven.
+            g_lightningFlash = (std::max)(g_lightningFlash,
+                                          0.55f + RandomUnit() * 0.45f);
+
+            // The goggles take the full brunt. Reported at the camera rather
+            // than a strike position: the flash lights the whole sky, so there
+            // is no direction for it to fall off from, and a distance falloff
+            // would wrongly spare a player standing in the open.
+            //
+            // This is what "brightens it up too much" means in practice -- a
+            // storm at night repeatedly whites the tube out, so NVGs become a
+            // liability in the weather they would otherwise be most useful in.
+            ReportNightVisionLightFlash(scene.camera.Position,
+                                        1.5f + RandomUnit() * 1.3f);
+        }
+    }
+
+    // Decay. Fast enough to read as a flash rather than a light being switched
+    // on, but slow enough that the eye catches it.
+    g_lightningFlash = (std::max)(0.0f, g_lightningFlash - deltaTime * 5.5f);
+    g_lightningAmbient = g_lightningFlash * 0.35f;
+}
 static VolumetricFogDX12    volumetricFog;
 static LightShaftsDX12      lightShafts;
 static ScreenSpaceAODX12    screenSpaceAO;
@@ -6283,6 +6431,7 @@ static std::shared_ptr<SceneNode> LoadAATurretModel() {
     if (!traverse) {
         SGE_LOG("LogGameplay", EngineLog::Level::Warning,
             "AA turret model has no Y-Rotation node, using the box turret");
+        g_rejectedUploadModels.push_back(std::move(loaded));
         return nullptr;
     }
 
@@ -8563,6 +8712,27 @@ static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path) {
     }
     g_mainMenuLevelStatus.clear();
     StartLevelOne(hwnd, true, false, false, &loaded.level);
+}
+
+static std::filesystem::path StartupLevelPath(const char* commandLine) {
+    if (!commandLine) return {};
+    std::string argument(commandLine);
+    const size_t first = argument.find_first_not_of(" \t");
+    if (first == std::string::npos) return {};
+    argument.erase(0, first);
+
+    constexpr const char* prefix = "--level";
+    if (argument.rfind(prefix, 0) != 0) return {};
+    argument.erase(0, std::strlen(prefix));
+    const size_t value = argument.find_first_not_of(" \t=");
+    if (value == std::string::npos) return {};
+    argument.erase(0, value);
+
+    if (argument.size() >= 2 && argument.front() == '"' &&
+        argument.back() == '"') {
+        argument = argument.substr(1, argument.size() - 2);
+    }
+    return std::filesystem::path(argument);
 }
 
 static void StartDDGICornellTest(HWND hwnd) {
@@ -12277,7 +12447,7 @@ void BootStep(const char* label) {
 
 } // namespace
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdShow) {
     SetUnhandledExceptionFilter(WriteCrashDump);
     // std::rand() defaults to seed 1, so every launch replayed the identical
     // sequence: the BlackHawk's first insertion always drew the same roll and
@@ -12375,6 +12545,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         "Content/Audio/Destruction/impact_03_wood.ogg");
     scene.explosionAudioCallback = [](const XMFLOAT3& position, float size,
                                       bool grenade) {
+        // Every explosion is also a light source. Routed through the audio
+        // callback because it is the one hook that already fires for all of
+        // them -- grenades, barrels, vehicles, the AA gun going up -- with the
+        // position and size the flash needs.
+        //
+        // Scaled by size so a grenade is a bright pop and a fuel-air blast
+        // whites the tube out completely.
+        ReportNightVisionLightFlash(position,
+                                    0.55f + (std::min)(2.6f, size * 0.30f));
         const float dx = position.x - scene.camera.Position.x;
         const float dy = position.y - scene.camera.Position.y;
         const float dz = position.z - scene.camera.Position.z;
@@ -12720,6 +12899,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     std::cout << "Controls: WASD, Mouse, TAB=UI, F11=Fullscreen, ESC=Exit\n";
 
+    const std::filesystem::path startupLevel = StartupLevelPath(commandLine);
+    if (!startupLevel.empty()) StartCustomLevel(hwnd, startupLevel);
+
     // Deterministic renderer smoke path for GPU validation and crash dumps.
     bool visibilityTestPending = false;
     UINT visibilityTestForwardFrames = 0;
@@ -12937,6 +13119,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             WaitForGPU();
             g_bandits.clear();
             g_heldBandit = nullptr;
+            // Lightning ticks only while alive and off the loading screen, so a
+            // run that ended mid-flash freezes its stroke counter and the next
+            // storm never schedules a strike. Restart clears it either way.
+            ResetLightning();
             if (!g_emptyLevelMode) g_water.ResetSurface();
             if (!g_emptyLevelMode) g_ocean.ResetSurface();
             if (!g_emptyLevelMode && g_trees.IsInitialized()) ResetPalmTrees();
@@ -13033,6 +13219,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // Held grenades follow the final collision-resolved camera pose. Scene
         // still advances their fuse below, so waiting too long remains lethal.
         UpdateHeldGrenade();
+        // Before scene.Update, so the ambient lift below is in place for the
+        // frame the flash is drawn on rather than one frame late.
+        UpdateLightning(deltaTime);
         scene.Update(deltaTime, now);
         scene.burningTargets.clear();
         if (molotovSmokeTest && !molotovSmokeInjected && IsSceneScreen() &&
@@ -15521,6 +15710,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_terrain.ReleaseUploadHeaps();
             ReleaseMaterialUploadHeaps(crateModel);
             ReleaseMaterialUploadHeaps(wallModel);
+            g_rejectedUploadModels.clear();
             DumpDX12DebugMessages();
             // First Level 1 load is complete. Start timing after load/GPU waits,
             // not from menu click.
@@ -15558,8 +15748,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         // NVG needs some real pre-tonemap surface signal to amplify. Temporarily
         // add the requested world-ambient boost while goggles are raised,
-        // ramped with the eyepiece transition. Night uses 0.3; the brighter
-        // presets use 0.2. Restore the authored value before volumetric fog so
+        // ramped with the eyepiece transition. Keep the lift restrained at 0.02
+        // for every time-of-day preset. Restore the authored value before fog so
         // the extra fill reveals geometry without lighting a screen-sized slab
         // of atmosphere.
         const float authoredAmbientLightingIntensity =
@@ -15572,13 +15762,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (nvgWorldAmbientBoosted) {
             const float ambientBoostBlend = (std::max)(
                 g_nightVisionBlend, g_nightVisionActive ? 0.18f : 0.0f);
-            // Night has no authored base ambient, so its larger boost is the
-            // entire indirect signal available to the intensifier.
-            const float ambientBoost =
-                g_selectedTimeOfDay == TimeOfDay::Night ? 0.3f : 0.2f;
+            constexpr float ambientBoost = 0.02f;
             scene.ambientLightingIntensity +=
                 ambientBoost * ambientBoostBlend;
         }
+        // Lightning lights the world for everyone, goggles or not. Added after
+        // the NVG boost and restored by the same path below, so the two stack
+        // without either needing to know about the other.
+        const bool lightningLit = g_lightningAmbient > 0.0005f;
+        if (lightningLit)
+            scene.ambientLightingIntensity += g_lightningAmbient;
 
         XMMATRIX fogLightSpace = XMMatrixIdentity();
         ID3D12Resource* fogShadowResource = nullptr;
@@ -15873,7 +16066,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 hdrTarget, rainMSAA, g_dx12.frameIndex);
         }
 
-        if (nvgWorldAmbientBoosted)
+        // Restore whenever either lift was applied -- gating this on the NVG
+        // flag alone would leave a lightning flash permanently baked into the
+        // scene's ambient on any frame the goggles were stowed.
+        if (nvgWorldAmbientBoosted || lightningLit)
             scene.ambientLightingIntensity =
                 authoredAmbientLightingIntensity;
 
@@ -16004,6 +16200,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 // player's face. Real goggles bloom hard off their own weapon,
                 // and the AGC ducks for a moment afterwards.
                 if (scene.muzzleFlashTime > 0.0f) sceneBrightness += 0.55f;
+
+                // Transient flashes -- explosions, lightning -- decay fast.
+                // Faster than the AGC recovers, so the tube is still stopped
+                // down for a moment after the light itself has gone, which is
+                // the after-image that makes a blast actually cost you.
+                g_nightVisionLightSpike = (std::max)(0.0f,
+                    g_nightVisionLightSpike - deltaTime * 3.2f);
+                if (g_nightVisionLightSpike > 0.0f) {
+                    // Inverse-square falloff, floored so a distant flash still
+                    // registers faintly rather than snapping to nothing.
+                    const float fx =
+                        g_nightVisionSpikeOrigin.x - scene.camera.Position.x;
+                    const float fy =
+                        g_nightVisionSpikeOrigin.y - scene.camera.Position.y;
+                    const float fz =
+                        g_nightVisionSpikeOrigin.z - scene.camera.Position.z;
+                    const float distanceSq = fx * fx + fy * fy + fz * fz;
+                    // 8 m rather than a wider reference: at 18 m a grenade
+                    // going off 40 m away still pinned the tube shut as hard as
+                    // one at your feet, because the flash is bright enough to
+                    // saturate the gain curve well past the falloff. Tight
+                    // enough that a blast across the compound dims the image
+                    // instead of blinding you.
+                    constexpr float kReferenceRange = 8.0f;
+                    const float falloff = kReferenceRange * kReferenceRange /
+                        (kReferenceRange * kReferenceRange + distanceSq);
+                    sceneBrightness += g_nightVisionLightSpike * falloff;
+                }
 
                 // Target gain: wide open in darkness, stopped down in light.
                 // The curve is inverse rather than linear because the tube is
