@@ -1,6 +1,7 @@
 #pragma once
 
 #include <xaudio2.h>
+#include <xaudio2fx.h>
 #include <x3daudio.h>
 #include <algorithm>
 #include <cmath>
@@ -22,6 +23,26 @@
 // and the voices playing them.
 //
 // Everything is left-handed to match the rest of the engine.
+//
+// ---- Bus graph -------------------------------------------------------------
+//
+//   source voices --> category submix --> mastering voice
+//                 \-> reverb submix   -/
+//
+// Category buses (weapons / voices / ambience / UI) exist so a whole class of
+// sound can be mixed, ducked or muted without touching call sites, and so a
+// master volume has one place to live. The reverb submix is what makes
+// X3DAUDIO_CALCULATE_REVERB meaningful: it computes a send level, which needs
+// somewhere to send to. Without this graph both that flag and CALCULATE_DELAY
+// produce numbers nothing reads.
+enum class AudioBus : int {
+    Weapons = 0,   // gunfire, explosions, impacts
+    Voices,        // enemy shouts, pain, death
+    Ambience,      // footsteps, fire loops, rotor wash
+    UI,            // menu and HUD feedback; never spatialised
+    Count
+};
+
 class AudioDevice {
 public:
     // Brought up on the first Initialize; safe to call repeatedly.
@@ -45,6 +66,7 @@ public:
             X3DAudioInitialize(mask, X3DAUDIO_SPEED_OF_SOUND, s.handle);
             s.handleReady = true;
         }
+        BuildBuses(s);
         return true;
     }
 
@@ -53,6 +75,48 @@ public:
     static bool SpatialReady() { return Get().handleReady && Get().listenerValid; }
     static const X3DAUDIO_HANDLE& Handle() { return Get().handle; }
     static const X3DAUDIO_LISTENER& Listener() { return Get().listener; }
+
+    static IXAudio2SubmixVoice* BusVoice(AudioBus bus) {
+        const int index = static_cast<int>(bus);
+        if (index < 0 || index >= static_cast<int>(AudioBus::Count))
+            return nullptr;
+        return Get().buses[index];
+    }
+    static IXAudio2SubmixVoice* ReverbVoice() { return Get().reverb; }
+    static bool ReverbReady() { return Get().reverb != nullptr; }
+
+    // ---- Mix control -------------------------------------------------------
+    //
+    // Master rides the mastering voice, so it scales everything including the
+    // reverb tail. Per-bus volumes are independent of it and of each other.
+    static void SetMasterVolume(float volume) {
+        State& s = Get();
+        s.masterVolume = Clamp01(volume);
+        if (s.master) s.master->SetVolume(s.masterVolume);
+    }
+    static float MasterVolume() { return Get().masterVolume; }
+
+    static void SetBusVolume(AudioBus bus, float volume) {
+        const int index = static_cast<int>(bus);
+        if (index < 0 || index >= static_cast<int>(AudioBus::Count)) return;
+        State& s = Get();
+        s.busVolume[index] = Clamp01(volume);
+        if (s.buses[index]) s.buses[index]->SetVolume(s.busVolume[index]);
+    }
+    static float BusVolume(AudioBus bus) {
+        const int index = static_cast<int>(bus);
+        if (index < 0 || index >= static_cast<int>(AudioBus::Count)) return 0.0f;
+        return Get().busVolume[index];
+    }
+
+    // Wet level of the reverb return. 0 leaves the graph intact but silent, so
+    // reverb can be switched off without rebuilding anything.
+    static void SetReverbVolume(float volume) {
+        State& s = Get();
+        s.reverbVolume = Clamp01(volume);
+        if (s.reverb) s.reverb->SetVolume(s.reverbVolume);
+    }
+    static float ReverbVolume() { return Get().reverbVolume; }
 
     // Written once per frame from the camera.
     static void SetListener(const float position[3], const float front[3],
@@ -69,8 +133,17 @@ public:
     }
 
     // Called once at shutdown, after every GunAudio has released its voices.
+    //
+    // Order matters and is the reverse of construction: source voices are gone
+    // by now, then the submixes that fed the master, then the master, then the
+    // engine. Destroying a submix while something still routes to it is a
+    // use-after-free inside XAudio2's mixer thread.
     static void Shutdown() {
         State& s = Get();
+        for (IXAudio2SubmixVoice*& bus : s.buses) {
+            if (bus) { bus->DestroyVoice(); bus = nullptr; }
+        }
+        if (s.reverb) { s.reverb->DestroyVoice(); s.reverb = nullptr; }
         if (s.master) { s.master->DestroyVoice(); s.master = nullptr; }
         if (s.engine) { s.engine->Release(); s.engine = nullptr; }
         s.handleReady = false;
@@ -79,17 +152,80 @@ public:
     }
 
 private:
+    static float Clamp01(float v) {
+        return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    }
+
     struct State {
         IXAudio2* engine = nullptr;
         IXAudio2MasteringVoice* master = nullptr;
+        IXAudio2SubmixVoice* buses[static_cast<int>(AudioBus::Count)] = {};
+        IXAudio2SubmixVoice* reverb = nullptr;
         X3DAUDIO_HANDLE handle = {};
         X3DAUDIO_LISTENER listener = {};
         UINT32 outputChannels = 0;
+        float masterVolume = 1.0f;
+        float busVolume[static_cast<int>(AudioBus::Count)] = {
+            1.0f, 1.0f, 1.0f, 1.0f };
+        // Conservative default: enough to place sounds in a space, not enough
+        // to smear a rifle crack into a cathedral.
+        float reverbVolume = 0.22f;
         bool handleReady = false;
         bool listenerValid = false;
         bool failed = false;
     };
     static State& Get() { static State state; return state; }
+
+    // Reverb submix first, then the category buses. Built once, from Ensure.
+    static void BuildBuses(State& s) {
+        // The reverb submix runs at the mastering voice's channel count so its
+        // output needs no rematrixing. ProcessingStage 1 puts it after the
+        // category buses (stage 0), which is required: XAudio2 processes stages
+        // in ascending order, and a reverb fed from a bus processed later would
+        // be a frame behind its own input.
+        if (SUCCEEDED(s.engine->CreateSubmixVoice(
+                &s.reverb, s.outputChannels, 44100, 0, 1, nullptr, nullptr))) {
+            XAUDIO2_EFFECT_DESCRIPTOR effect = {};
+            IUnknown* reverbEffect = nullptr;
+            if (SUCCEEDED(XAudio2CreateReverb(&reverbEffect, 0))) {
+                effect.pEffect = reverbEffect;
+                effect.InitialState = TRUE;
+                effect.OutputChannels = s.outputChannels;
+                XAUDIO2_EFFECT_CHAIN chain = {};
+                chain.EffectCount = 1;
+                chain.pEffectDescriptors = &effect;
+                if (SUCCEEDED(s.reverb->SetEffectChain(&chain))) {
+                    // A mid-sized outdoor-ish space. The island is mostly open,
+                    // so a short decay reads as air rather than as a room.
+                    XAUDIO2FX_REVERB_PARAMETERS params = {};
+                    XAUDIO2FX_REVERB_I3DL2_PARAMETERS i3dl2 =
+                        XAUDIO2FX_I3DL2_PRESET_STONECORRIDOR;
+                    ReverbConvertI3DL2ToNative(&i3dl2, &params);
+                    s.reverb->SetEffectParameters(0, &params, sizeof(params));
+                }
+                // SetEffectChain AddRefs the effect; release our reference
+                // whether or not it was accepted.
+                reverbEffect->Release();
+            }
+            s.reverb->SetVolume(s.reverbVolume);
+        }
+
+        // Category buses feed the master directly, and additionally send to the
+        // reverb when it exists. Each source voice picks its bus at creation.
+        for (int i = 0; i < static_cast<int>(AudioBus::Count); ++i) {
+            IXAudio2SubmixVoice* bus = nullptr;
+            if (FAILED(s.engine->CreateSubmixVoice(
+                    &bus, s.outputChannels, 44100, 0, 0, nullptr, nullptr)))
+                continue;
+            // Category buses stay DRY -- they feed the master only. The reverb
+            // send is made per source voice instead (see CreateRoutedVoice),
+            // because X3DAudio computes a different wet level for every emitter
+            // based on its distance. Sending the whole bus as well would apply
+            // reverb twice and flatten that per-source difference.
+            bus->SetVolume(s.busVolume[i]);
+            s.buses[i] = bus;
+        }
+    }
 };
 
 #define STB_VORBIS_HEADER_ONLY
@@ -102,7 +238,11 @@ class GunAudio {
 public:
     ~GunAudio() { Shutdown(); }
 
-    bool Initialize(const std::string& relativePath) {
+    // `bus` decides which category submix this effect's voices feed, and so
+    // which volume slider moves it. Weapons is the default because most of the
+    // effects in this game are gunfire, impacts and explosions.
+    bool Initialize(const std::string& relativePath,
+                    AudioBus bus = AudioBus::Weapons) {
         Shutdown();
         const std::string path = Resolve(relativePath);
         if (!LoadAudio(path)) {
@@ -113,16 +253,16 @@ public:
             Shutdown();
             return false;
         }
+        bus_ = bus;
         std::cout << "Audio loaded: " << path << "\n";
         return true;
     }
 
     void Play(float volume = 1.0f, float pitch = 1.0f) {
-        IXAudio2* engine = AudioDevice::Engine();
-        if (!engine || samples_.empty()) return;
+        if (!AudioDevice::Engine() || samples_.empty()) return;
         ReclaimFinished();
-        IXAudio2SourceVoice* voice = nullptr;
-        if (FAILED(engine->CreateSourceVoice(&voice, &format_, 0, 2.0f))) return;
+        IXAudio2SourceVoice* voice = CreateRoutedVoice(0);
+        if (!voice) return;
 
         XAUDIO2_BUFFER buffer = {};
         buffer.Flags = XAUDIO2_END_OF_STREAM;
@@ -159,12 +299,15 @@ public:
             return;
         }
         ReclaimFinished();
-        IXAudio2SourceVoice* voice = nullptr;
+        // Whether this voice carries a reverb send has to be decided before it
+        // is created -- XAUDIO2_VOICE_SENDS is fixed at creation.
+        const bool wetPath = AudioDevice::ReverbReady() &&
+                             AudioDevice::BusVoice(bus_) != nullptr;
         // USEFILTER is required for the low-pass X3DAudio computes below; a
         // voice created without it silently ignores SetFilterParameters.
-        if (FAILED(engine->CreateSourceVoice(&voice, &format_,
-                                             XAUDIO2_VOICE_USEFILTER, 2.0f)))
-            return;
+        IXAudio2SourceVoice* voice =
+            CreateRoutedVoice(XAUDIO2_VOICE_USEFILTER, wetPath);
+        if (!voice) return;
 
         X3DAUDIO_EMITTER emitter = {};
         emitter.ChannelCount = 1;   // treated as a point source regardless of
@@ -211,13 +354,18 @@ public:
         //                  head shadows sounds arriving from behind. X3DAudio
         //                  returns a cutoff coefficient for both, so a shot
         //                  across the map goes dull instead of just quiet.
+        //   REVERB      -- send level into the reverb submix, rising with
+        //                  distance so far sources sit back in the space
+        //                  instead of sitting on top of the listener. This is
+        //                  only meaningful now that a reverb bus exists to
+        //                  receive it.
         //
-        // REVERB and DELAY are deliberately NOT requested. Each only produces a
-        // number for a submix to consume -- a reverb send level and an
-        // interaural delay pair -- and this engine has no submix graph. Asking
-        // for them would compute values nothing reads.
-        const UINT32 calculateFlags = X3DAUDIO_CALCULATE_MATRIX |
-                                      X3DAUDIO_CALCULATE_LPF_DIRECT;
+        // DELAY is still not requested: it yields an interaural delay pair that
+        // needs a per-voice delay effect to consume, which this graph does not
+        // have. The matrix already carries the level difference between ears.
+        UINT32 calculateFlags = X3DAUDIO_CALCULATE_MATRIX |
+                                X3DAUDIO_CALCULATE_LPF_DIRECT;
+        if (wetPath) calculateFlags |= X3DAUDIO_CALCULATE_REVERB;
         X3DAudioCalculate(AudioDevice::Handle(), &AudioDevice::Listener(),
                           &emitter, calculateFlags, &dsp);
 
@@ -243,8 +391,21 @@ public:
         voice->SetFilterParameters(&filter);
 
         // The panning matrix is what places the sound; it carries the distance
-        // attenuation from the curve above as well.
-        voice->SetOutputMatrix(nullptr, 1, channels, matrix);
+        // attenuation from the curve above as well. Send 0 is the dry path into
+        // the category bus (see CreateRoutedVoice).
+        voice->SetOutputMatrix(AudioDevice::BusVoice(bus_), 1, channels, matrix);
+
+        // Send 1 is the reverb. ReverbLevel rises with distance, so a far shot
+        // arrives mostly as room rather than as direct sound. Applied as a flat
+        // per-channel gain -- the reverb submix does its own spatial smearing,
+        // and panning the wet signal as well would undo that.
+        if (wetPath) {
+            float wetMatrix[8] = {};
+            const float wet = (std::max)(0.0f, (std::min)(1.0f, dsp.ReverbLevel));
+            for (UINT32 c = 0; c < channels; ++c) wetMatrix[c] = wet;
+            voice->SetOutputMatrix(AudioDevice::ReverbVoice(), 1, channels,
+                                   wetMatrix);
+        }
         if (FAILED(voice->SubmitSourceBuffer(&buffer)) || FAILED(voice->Start())) {
             voice->DestroyVoice();
             return;
@@ -259,10 +420,8 @@ public:
             return;
         }
         if (!loopVoice_) {
-            if (FAILED(engine->CreateSourceVoice(&loopVoice_, &format_, 0, 2.0f))) {
-                loopVoice_ = nullptr;
-                return;
-            }
+            loopVoice_ = CreateRoutedVoice(0);
+            if (!loopVoice_) return;
             XAUDIO2_BUFFER buffer = {};
             buffer.Flags = XAUDIO2_END_OF_STREAM;
             buffer.AudioBytes = static_cast<UINT32>(samples_.size());
@@ -300,6 +459,37 @@ public:
     }
 
 private:
+    // Creates a source voice already routed to this effect's category bus.
+    // Every voice in this class goes through here so nothing can accidentally
+    // bypass the graph and play straight into the master.
+    // `wet` adds a direct send to the reverb submix alongside the category bus,
+    // so PlayAt can drive the per-source reverb level X3DAudio computes. A dry
+    // voice routes to its bus only.
+    IXAudio2SourceVoice* CreateRoutedVoice(UINT32 flags, bool wet = false) const {
+        IXAudio2* engine = AudioDevice::Engine();
+        if (!engine) return nullptr;
+        IXAudio2SourceVoice* voice = nullptr;
+        IXAudio2SubmixVoice* bus = AudioDevice::BusVoice(bus_);
+        if (bus) {
+            // Send 0 is the dry path, send 1 the reverb. PlayAt sets the level
+            // on send 1 by index, so this order is part of the contract.
+            XAUDIO2_SEND_DESCRIPTOR sends[2] = {
+                { 0, bus }, { 0, AudioDevice::ReverbVoice() } };
+            const UINT32 sendCount =
+                (wet && AudioDevice::ReverbReady()) ? 2u : 1u;
+            XAUDIO2_VOICE_SENDS sendList = { sendCount, sends };
+            if (FAILED(engine->CreateSourceVoice(&voice, &format_, flags, 2.0f,
+                                                 nullptr, &sendList)))
+                return nullptr;
+            return voice;
+        }
+        // No bus (device came up before the graph, or creation failed): fall
+        // back to the default routing rather than dropping the sound.
+        if (FAILED(engine->CreateSourceVoice(&voice, &format_, flags, 2.0f)))
+            return nullptr;
+        return voice;
+    }
+
     static std::string Resolve(const std::string& relative) {
         for (const std::string& path : { relative, "build/" + relative,
                                         "../" + relative, "../../build/" + relative })
@@ -416,6 +606,7 @@ private:
     }
 
     WAVEFORMATEX format_ = {};
+    AudioBus bus_ = AudioBus::Weapons;
     std::vector<uint8_t> samples_;
     std::vector<IXAudio2SourceVoice*> voices_;
     IXAudio2SourceVoice* loopVoice_ = nullptr;

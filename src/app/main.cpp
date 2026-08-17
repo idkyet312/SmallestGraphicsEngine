@@ -13369,8 +13369,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     g_reloadAudio.Initialize("Content/Audio/dragon-studio-gun-reload-2-504027.mp3");
     g_explosionAudio.Initialize("Content/Audio/RocketExplosion3.mp3");
     g_grenadeExplosionAudio.Initialize("Content/Audio/explosion.ogg");
-    g_fireLoopAudio.Initialize("Content/Audio/Fire/fireplace_loop.wav");
-    g_fireIgnitionAudio.Initialize("Content/Audio/Fire/ignition.ogg");
+    g_fireLoopAudio.Initialize("Content/Audio/Fire/fireplace_loop.wav",
+                               AudioBus::Ambience);
+    g_fireIgnitionAudio.Initialize("Content/Audio/Fire/ignition.ogg",
+                                   AudioBus::Ambience);
     g_destructionBreakAudio[0].Initialize(
         "Content/Audio/Destruction/impact_03_wood.ogg");
     g_destructionBreakAudio[1].Initialize(
@@ -13421,18 +13423,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     g_hitAudio.Initialize("Content/Audio/bullet_flesh_hit.mp3");
     g_metalHitAudio.Initialize(
         "Content/Audio/Bullet/floraphonic-metal-hit-95-200424.mp3");
-    g_banditSpottedAudio1.Initialize("Content/Audio/bandit_spotted_01.wav");
-    g_banditSpottedAudio2.Initialize("Content/Audio/bandit_spotted_02.wav");
-    g_banditAttackAudio.Initialize("Content/Audio/bandit_attack.wav");
-    g_banditDeathAudio.Initialize("Content/Audio/bandit_death.wav");
-    g_banditHitVoiceAudio.Initialize("Content/Audio/bandit_hit_voice.wav");
-    g_helicopterHoverAudio.Initialize("Content/Audio/helicopter_hover_loop.mp3");
+    // Enemy vocals ride the Voices bus so they can be mixed against gunfire --
+    // a shout that is buried under a firefight is a cue the player never gets.
+    g_banditSpottedAudio1.Initialize("Content/Audio/bandit_spotted_01.wav",
+                                     AudioBus::Voices);
+    g_banditSpottedAudio2.Initialize("Content/Audio/bandit_spotted_02.wav",
+                                     AudioBus::Voices);
+    g_banditAttackAudio.Initialize("Content/Audio/bandit_attack.wav",
+                                   AudioBus::Voices);
+    g_banditDeathAudio.Initialize("Content/Audio/bandit_death.wav",
+                                  AudioBus::Voices);
+    g_banditHitVoiceAudio.Initialize("Content/Audio/bandit_hit_voice.wav",
+                                     AudioBus::Voices);
+    g_helicopterHoverAudio.Initialize("Content/Audio/helicopter_hover_loop.mp3",
+                                      AudioBus::Ambience);
     g_blackHawkAlarmAudio.Initialize(
         "Content/Audio/freesound_community-siren-alert-96052.mp3");
     // Grass footsteps. Add a Grass03.wav and bump kFootstepVariantCount to
     // widen the set -- PlayFootstep picks across whatever is loaded here.
-    g_footstepAudio[0].Initialize("Content/Audio/Footsteps/Grass01.wav");
-    g_footstepAudio[1].Initialize("Content/Audio/Footsteps/Grass02.wav");
+    g_footstepAudio[0].Initialize("Content/Audio/Footsteps/Grass01.wav",
+                                  AudioBus::Ambience);
+    g_footstepAudio[1].Initialize("Content/Audio/Footsteps/Grass02.wav",
+                                  AudioBus::Ambience);
 
     // ImGui
     D3D12_DESCRIPTOR_HEAP_DESC ihd = {};

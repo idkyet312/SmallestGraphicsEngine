@@ -12,6 +12,7 @@
 #include "StaticBufferDX12.h"
 #include "GunModel.h"   // SelectedWeapon() -- indexes the HUD ammo readout
 #include "ArmsModel.h"  // arms placement controls, tuned against the weapon
+#include "GunAudio.h"   // AudioDevice/AudioBus -- the Audio Mix sliders
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -1204,6 +1205,37 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat("Far",  &scene.cameraFar,  1.0f, 10.0f, 2000.0f);
         ImGui::DragFloat("Speed", &scene.camera.MovementSpeed, 0.1f, 0.1f, 50.0f);
         ImGui::Checkbox("FPS Walking Mode", &scene.camera.FPSMode);
+    }
+
+    // -- Audio mix --
+    // One slider per bus in the submix graph, plus the master and the reverb
+    // return. These write straight through to the live voices, so the effect is
+    // audible while dragging rather than on the next sound played.
+    if (ImGui::CollapsingHeader("Audio Mix")) {
+        float master = AudioDevice::MasterVolume();
+        if (ImGui::SliderFloat("Master", &master, 0.0f, 1.0f, "%.2f"))
+            AudioDevice::SetMasterVolume(master);
+
+        struct BusRow { const char* label; AudioBus bus; };
+        static constexpr BusRow kRows[] = {
+            { "Weapons",  AudioBus::Weapons },
+            { "Voices",   AudioBus::Voices },
+            { "Ambience", AudioBus::Ambience },
+            { "UI",       AudioBus::UI },
+        };
+        for (const BusRow& row : kRows) {
+            float value = AudioDevice::BusVolume(row.bus);
+            if (ImGui::SliderFloat(row.label, &value, 0.0f, 1.0f, "%.2f"))
+                AudioDevice::SetBusVolume(row.bus, value);
+        }
+
+        float reverb = AudioDevice::ReverbVolume();
+        if (ImGui::SliderFloat("Reverb Return", &reverb, 0.0f, 1.0f, "%.2f"))
+            AudioDevice::SetReverbVolume(reverb);
+        if (!AudioDevice::ReverbReady())
+            ImGui::TextDisabled("Reverb submix unavailable");
+        else
+            ImGui::TextDisabled("Wet level per sound comes from X3DAudio distance");
     }
 
     // -- Light --
