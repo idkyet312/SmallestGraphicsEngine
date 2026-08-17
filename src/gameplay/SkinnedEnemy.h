@@ -112,6 +112,13 @@ public:
     // so a squad does not lob in unison.
     float             grenadeCooldown = 8.0f;
     int               spawnSlot = -1;
+    // Metres walked since this actor's last footstep sound. Lives on the actor
+    // rather than in a side table keyed by pointer or index: the bandit list is
+    // compacted as actors die, so any external key would eventually hand one
+    // enemy's stride phase to whoever took its slot.
+    float             stepDistance = 0.0f;
+    DirectX::XMFLOAT3 lastStepPosition{ 0.0f, 0.0f, 0.0f };
+    bool              stepTrackingStarted = false;
     bool              turretGunner = false;
     int               mountedVehicleIndex = 0;
     int               burstShotsRemaining = 0;

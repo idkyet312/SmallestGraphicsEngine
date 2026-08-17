@@ -301,6 +301,26 @@ public:
         explosionTrauma_ = (std::min)(0.72f, explosionTrauma_ + amount);
     }
 
+    // Small kick from firing. Same shake channel again, with a much lower cap
+    // than either a blast or a hit: sustained automatic fire adds a tap per
+    // round, and without its own ceiling a held trigger would ramp the view up
+    // to grenade-level shake within a second.
+    //
+    // Deliberately capped BELOW where the shake gets disorienting rather than
+    // scaled per shot, because the trauma curve is squared -- at 0.22 the shake
+    // is a tremor, and letting it stack to 0.5 would be four times that.
+    //
+    // The cap only limits what firing itself may ADD. Trauma already above it
+    // (a grenade just went off, the player was just shot) is left alone rather
+    // than clamped down -- otherwise pulling the trigger during a blast would
+    // cancel the blast's shake, which is backwards.
+    void AddFireTrauma(float amount) {
+        constexpr float kFireTraumaCeiling = 0.22f;
+        if (explosionTrauma_ >= kFireTraumaCeiling) return;
+        explosionTrauma_ =
+            (std::min)(kFireTraumaCeiling, explosionTrauma_ + amount);
+    }
+
     float ExplosionFovKick() const { return explosionFovKick_; }
 
     void Jump() {

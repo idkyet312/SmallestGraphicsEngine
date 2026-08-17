@@ -302,13 +302,16 @@ struct VehicleSystem {
     // no inbound lane to sit under, and an exfil boat on the water from the
     // opening second would advertise the ending before the mission has one.
     static constexpr float EscapeBoatBoardRadius = 6.5f;
-    // How far out along the dropship's approach bearing the boat waits.
+    // How far out from the island centre the boat waits.
     //
-    // 42 m sits just past where the terrain drops under the waterline: sampling
-    // the beach profile gives y = +0.04 at 40 m and y = -0.21 at 42 m, so this
-    // is the near edge of genuinely floating water rather than wet sand. Closer
-    // than this and the hull grounds on the beach shelf.
-    static constexpr float EscapeBoatShoreDistance = 42.0f;
+    // The beach profile crosses the waterline around 43 m (y = +0.04 at 40 m,
+    // y = -0.21 at 42 m), and the seabed finishes sloping to full depth at 88 m.
+    // 50 m sits clear of the shelf in genuinely deep water with the whole outer
+    // slope still beyond it, so the hull never grounds and the swim out is a
+    // real leg of the run rather than a step off the sand.
+    //
+    // Was 42 m, which floated the boat on the very edge of the shelf.
+    static constexpr float EscapeBoatShoreDistance = 50.0f;
 
     bool escapeBoatActive = false;
     DirectX::XMFLOAT3 escapeBoatPosition{};
@@ -318,15 +321,20 @@ struct VehicleSystem {
 
     bool EscapeBoatReady() const { return escapeBoatActive; }
 
-    // Anchors the boat on the bearing the dropship flies in along. Idempotent:
-    // later waves do not move an exfil the player may already be swimming for.
-    void PlaceEscapeBoatOnDropshipLane(float waterY) {
+    // Places the exfil on an explicit compass bearing, measured the same way the
+    // dropship's is (+Z = 0, turning through +X).
+    //
+    // The bearing is chosen by the caller, which owns the run's RNG -- the boat
+    // now sits somewhere different every run rather than always on the lane the
+    // first reinforcement wave flew in along. A fixed exfil meant the way out
+    // was known before the mission started; a rolled one has to be found.
+    //
+    // Idempotent: later waves must not move an exfil the player may already be
+    // swimming toward.
+    void PlaceEscapeBoatOnBearing(float bearingRadians, float waterY) {
         if (escapeBoatActive) return;
-        const float dx = dropshipEntryPoint.x - dropshipDropPoint.x;
-        const float dz = dropshipEntryPoint.z - dropshipDropPoint.z;
-        const float length = std::sqrt(dx * dx + dz * dz);
-        if (length < 0.001f) return;
-        const float nx = dx / length, nz = dz / length;
+        const float nx = std::sin(bearingRadians);
+        const float nz = std::cos(bearingRadians);
         escapeBoatPosition = {
             nx * EscapeBoatShoreDistance, waterY, nz * EscapeBoatShoreDistance };
         // Bow pointed out to sea, the way it would leave.

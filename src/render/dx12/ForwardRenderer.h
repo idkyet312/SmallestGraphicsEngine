@@ -55,6 +55,9 @@ extern std::shared_ptr<SceneNode> g_boatShadowModel;
 extern std::shared_ptr<SceneNode> g_blackHawkModel;
 extern std::shared_ptr<SceneNode> g_blackHawkShadowModel;
 extern std::shared_ptr<SceneNode> g_helicopterModel;
+// Reinforcement dropship's own airframe: shares geometry with the above, owns
+// its rotor node transforms so both aircraft can spin their blades separately.
+extern std::shared_ptr<SceneNode> g_secondaryHelicopterModel;
 struct DandelionInstance {
     DirectX::XMFLOAT4X4 transform;
     DirectX::XMFLOAT3 center;
@@ -1692,8 +1695,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         g_useMeshShader = false;
         DrawSceneNode(g_helicopterModel, shader, HelicopterWorldMatrix(),
                       view, proj, lightSpace, visibilityExtensionsOnly);
+        // Its own clone, so its rotors are posed independently of the patrol
+        // gunship's. Falls back to the shared model if the clone failed.
         if (SecondaryHelicopterVisible())
-            DrawSceneNode(g_helicopterModel, shader, SecondaryHelicopterWorldMatrix(),
+            DrawSceneNode(g_secondaryHelicopterModel ? g_secondaryHelicopterModel
+                                                     : g_helicopterModel,
+                          shader, SecondaryHelicopterWorldMatrix(),
                           view, proj, lightSpace, visibilityExtensionsOnly);
         g_useMeshShader = meshShadersWereEnabled;
     }
@@ -1727,6 +1734,42 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                                      0.68f, 0.28f, nullptr, nullptr, nullptr);
             DrawCapsule(geo);
             shader.NextDrawCall();
+        }
+    }
+
+    // Walk-over weapon pickups, drawn with the same mesh the player will hold.
+    // Hovering and slowly turning: a launcher lying flat in grass beside a
+    // Humvee reads as scenery, and the motion is what says "collectable".
+    //
+    // Not submitted to staticBatches -- the transform changes every frame, and
+    // the batcher is for geometry that does not move.
+    if (!g_emptyLevelMode) {
+        for (const WeaponPickup& pickup : scene.weaponPickups) {
+            if (!pickup.active || pickup.collected) continue;
+            const std::shared_ptr<SceneMesh>& pickupMesh =
+                pickup.weapon == 2 ? GunModel::RPGMesh() : GunModel::Mesh();
+            if (!pickupMesh) continue;
+
+            const float bob = std::sin(pickup.bobPhase * 1.9f) * 0.09f;
+            const float spin = pickup.bobPhase * 0.85f;
+            // GunModel::Orient normalises every weapon to barrel-along-+Z with
+            // the origin at the REAR of the mesh, not its centre -- the body
+            // occupies Z = 0..kBarrelLength. So the model must be pulled back by
+            // half its length before spinning, or it orbits the pickup point on
+            // a 1.5 m arm instead of turning in place.
+            //
+            // The launcher lies flat and level: no X rotation. An earlier version
+            // pitched it 90 degrees, which mapped the barrel to -Y and buried the
+            // whole body under the terrain.
+            constexpr float kPickupMeshLength = 1.48f;   // RPG Orient() target
+            const XMMATRIX pickupTransform =
+                XMMatrixTranslation(0.0f, 0.0f, -kPickupMeshLength * 0.5f) *
+                XMMatrixRotationY(spin) *
+                XMMatrixTranslation(pickup.position.x,
+                                    pickup.position.y + bob,
+                                    pickup.position.z);
+            DrawMeshAt(pickupMesh, shader, pickupTransform, view, proj,
+                       lightSpace, false, visibilityExtensionsOnly);
         }
     }
 

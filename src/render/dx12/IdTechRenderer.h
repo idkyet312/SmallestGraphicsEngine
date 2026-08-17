@@ -341,7 +341,9 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items
     if (!g_emptyLevelMode && g_helicopterModel && scene.showHelicopter) {
         AppendOpaqueSceneNodeDrawItems(g_helicopterModel, HelicopterWorldMatrix(), items);
         if (SecondaryHelicopterVisible())
-            AppendOpaqueSceneNodeDrawItems(g_helicopterModel,
+            AppendOpaqueSceneNodeDrawItems(
+                g_secondaryHelicopterModel ? g_secondaryHelicopterModel
+                                           : g_helicopterModel,
                 SecondaryHelicopterWorldMatrix(), items);
     }
 

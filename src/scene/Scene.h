@@ -174,6 +174,28 @@ struct ExplosiveBarrel {
     float fireFxCooldown = 0.0f;
 };
 
+// A weapon lying in the world, collected by walking over it. The pickup swaps
+// itself into whichever slot the player is currently holding, so it costs a
+// weapon rather than adding a third -- the loadout stays two wide all run.
+//
+// One-shot: `collected` latches and is only cleared by a level reset, so a
+// pickup cannot be farmed by walking back and forth over it.
+struct WeaponPickup {
+    XMFLOAT3 position = { 0.0f, 0.0f, 0.0f };
+    float yawRadians = 0.0f;
+    int weapon = 2;             // GunModel weapon id; 2 = RPG-7
+    // Magazine + reserve handed over on collection. Independent of PlayerState's
+    // per-slot maxima so a pickup can be a partial resupply.
+    int magazine = 1;
+    int reserve = 4;
+    float radius = 2.0f;        // horizontal collection distance, metres
+    float verticalRange = 3.0f; // vertical tolerance, so a pickup is not
+                                // collectable from a rooftop directly above it
+    float bobPhase = 0.0f;      // drives the idle hover/spin so it reads as loot
+    bool active = false;
+    bool collected = false;
+};
+
 struct GunViewModel {
     bool     visible  = true;   // AK47 view model is on by default
     XMFLOAT3 color    = { 0.3f, 0.3f, 0.35f };
@@ -279,6 +301,7 @@ struct Scene {
     std::function<void(const XMFLOAT3&, float, bool)> explosionAudioCallback;
     std::function<void(const XMFLOAT3&)> fireIgnitionAudioCallback;
     std::vector<ExplosiveBarrel> explosiveBarrels;
+    std::vector<WeaponPickup> weaponPickups;      // walk-over weapon crates
     float projectileSpeed    = 300.0f;
     float projectileLifetime = 3.0f;
     XMFLOAT3 projectileColor = { 1.0f, 1.0f, 1.0f };
@@ -298,6 +321,46 @@ struct Scene {
     float gunRecoilKick      = 0.0f;    // viewmodel pitch, degrees
     float recoilPitch        = 0.55f;   // camera climb per shot, degrees
     float recoilYaw          = 0.22f;   // random horizontal camera kick
+    // How far the four crosshair arms sit from centre, in pixels beyond their
+    // resting gap. Driven by movement, firing and recoil, then eased back down
+    // -- the reticle opening up is the readout for "your shots are not going
+    // where this is pointing".
+    //
+    // Held here rather than computed in the HUD because the inputs live in
+    // different places (the movement tracker is app-side, recoil is here) and
+    // the HUD draw must not be the thing that decides gameplay feel.
+    float crosshairSpread    = 0.0f;
+    // Where the spread is heading this frame, written by the app each tick from
+    // movement + firing state. The eased `crosshairSpread` chases it, so a
+    // burst blooms the reticle fast and it settles slowly.
+    float crosshairSpreadTarget = 0.0f;
+
+    // Trailing "chip" health, in the same units as player.health. Follows the
+    // real value down after a delay, so the HUD can show a pale ghost of the
+    // damage just taken draining away behind the live bar. That is what makes a
+    // hit legible as an amount rather than a bar that is simply shorter now.
+    // Snaps up instantly on healing so regen never shows a ghost.
+    float healthChip = -1.0f;      // <0 = uninitialised, latched on first update
+    float healthChipDelay = 0.0f;  // grace before the ghost starts draining
+
+    // Hit marker: the four diagonal ticks that flick over the crosshair when a
+    // shot connects. Counts down to zero; the HUD fades and shrinks it in.
+    float hitMarkerTime = 0.0f;
+    float hitMarkerDuration = 0.32f;
+    // A killing blow draws the marker in red and holds it longer, so "hit" and
+    // "dropped him" are distinguishable without reading a counter.
+    bool hitMarkerLethal = false;
+
+    void TriggerHitMarker(bool lethal = false) {
+        // A lethal marker outranks a plain one already on screen, but a plain
+        // hit landing after a kill must not downgrade it mid-flash -- bursts
+        // routinely land another round on a body the same frame it dies.
+        if (lethal) hitMarkerLethal = true;
+        else if (hitMarkerTime > 0.0f && hitMarkerLethal) return;
+        else hitMarkerLethal = false;
+        hitMarkerDuration = lethal ? 0.45f : 0.32f;
+        hitMarkerTime = hitMarkerDuration;
+    }
     PlayerState player;
 
     bool AmmoEnforced() const { return player.AmmoEnforced(); }
@@ -653,12 +716,26 @@ struct Scene {
             {{ 4.6f, 3.25f, -4.6f}},
             {{-4.6f, 3.25f, -4.6f}},
         };
+        // Dropped rather than re-armed: the level load that follows re-places
+        // whatever pickups the map authors, and keeping stale ones here would
+        // leave a collected rocket floating on a map that never had one.
+        weaponPickups.clear();
         fireCooldown = 0.0f;
         muzzleFlashTime = 0.0f;
         muzzleFlashScale = 1.0f;
         muzzleFlashRotation = 0.0f;
         gunRecoilBack = 0.0f;
         gunRecoilKick = 0.0f;
+        // Or the reticle would start a fresh run still blown open from the last
+        // burst of the previous one.
+        crosshairSpread = 0.0f;
+        crosshairSpreadTarget = 0.0f;
+        hitMarkerTime = 0.0f;
+        hitMarkerLethal = false;
+        // Re-latches to full health on the next update rather than ghosting the
+        // previous run's last hit down from wherever it stopped.
+        healthChip = -1.0f;
+        healthChipDelay = 0.0f;
         grenadeCooldown = 0.0f;
         molotovDamageCooldown = 0.0f;
         playerBurnTime = 0.0f;
@@ -693,6 +770,10 @@ struct Scene {
         // Bigger hits flash longer as well as harder.
         player.damageFlash = (std::max)(player.damageFlash,
                                         0.22f + severity * 0.30f);
+        // Hold the chip bar at its pre-hit length for a moment. Re-armed on
+        // every hit, so sustained fire keeps the ghost visible instead of it
+        // draining between rounds.
+        healthChipDelay = 0.32f;
 
         // Camera kick, scaled the same way. Reuses the explosion trauma channel
         // the shake already reads, so a hit physically jolts the view instead of
@@ -834,6 +915,43 @@ struct Scene {
         // so automatic fire climbs unless the player actively compensates.
         gunRecoilBack = (std::max)(0.0f, gunRecoilBack - 1.45f * dt);
         gunRecoilKick = (std::max)(0.0f, gunRecoilKick - 95.0f * dt);
+
+        // Crosshair bloom chases its target asymmetrically: opening is nearly
+        // instant so the first shot of a burst is visible, closing is slow so
+        // the player has to actually wait out the recovery rather than tapping
+        // through it. Exponential easing keeps both frame-rate independent.
+        {
+            const float rate = crosshairSpreadTarget > crosshairSpread
+                ? 22.0f     // bloom
+                : 5.5f;     // recover
+            const float blend = 1.0f - std::exp(-rate * (std::max)(0.0f, dt));
+            crosshairSpread += (crosshairSpreadTarget - crosshairSpread) * blend;
+            if (crosshairSpread < 0.01f) crosshairSpread = 0.0f;
+        }
+
+        if (hitMarkerTime > 0.0f) {
+            hitMarkerTime = (std::max)(0.0f, hitMarkerTime - dt);
+            if (hitMarkerTime <= 0.0f) hitMarkerLethal = false;
+        }
+
+        // Chip health. Holds at the pre-hit value briefly so the eye can catch
+        // how much was lost, then drains to meet the real bar.
+        if (healthChip < 0.0f) {
+            healthChip = player.health;      // first frame: no ghost
+        } else if (player.health >= healthChip) {
+            healthChip = player.health;      // healing/regen: no ghost
+            healthChipDelay = 0.0f;
+        } else {
+            if (healthChipDelay > 0.0f) {
+                healthChipDelay = (std::max)(0.0f, healthChipDelay - dt);
+            } else {
+                // Proportional drain with a floor, so a small chip still
+                // finishes promptly and a large one does not crawl.
+                const float speed =
+                    (std::max)(18.0f, (healthChip - player.health) * 3.2f);
+                healthChip = (std::max)(player.health, healthChip - speed * dt);
+            }
+        }
 
         // Animate demo lights
         if (animateDemoLights) {
@@ -1320,15 +1438,55 @@ struct Scene {
                                   impactParticles.begin() + droplets);
     }
 
+    // Half-angle, in radians, that the current crosshair bloom stands for. The
+    // reticle is the promise; this is what makes it true -- both read the same
+    // `crosshairSpread`, so an arm pushed N pixels out and the cone a bullet can
+    // land in cannot drift apart.
+    //
+    // Tuned against the reticle's own 15 px cap: full bloom is ~0.030 rad, a bit
+    // over half the shotgun's fixed 0.055 pellet spread. A sprinting rifle burst
+    // should be bad, not useless.
+    float CurrentShotSpreadRadians() const {
+        constexpr float kRadiansPerPixel = 0.0020f;
+        return (std::max)(0.0f, crosshairSpread) * kRadiansPerPixel;
+    }
+
+    // Scatters a direction inside the cone the reticle is currently showing.
+    // Square distribution rather than a disc: it matches the crosshair, which is
+    // four arms on two axes, not a ring.
+    XMFLOAT3 ApplyShotSpread(const XMFLOAT3& direction) const {
+        const float spread = CurrentShotSpreadRadians();
+        if (spread <= 0.0001f) return direction;
+        const XMVECTOR forward = XMVector3Normalize(XMLoadFloat3(&direction));
+        const XMVECTOR up = XMLoadFloat3(&camera.Up);
+        XMVECTOR right = XMVector3Cross(up, forward);
+        // Looking straight up or down collapses the cross product; fall back to
+        // a world axis so the shot still scatters instead of going NaN.
+        if (XMVectorGetX(XMVector3LengthSq(right)) < 1e-6f)
+            right = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+        right = XMVector3Normalize(right);
+        const XMVECTOR trueUp = XMVector3Normalize(XMVector3Cross(forward, right));
+        const float sideways = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) * spread;
+        const float vertical = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) * spread;
+        XMFLOAT3 result;
+        XMStoreFloat3(&result, XMVector3Normalize(
+            forward + right * sideways + trueUp * vertical));
+        return result;
+    }
+
     void ShootProjectile() {
-        // Bullets already travel exactly along the view axis, so sights cannot
-        // tighten grouping. What they buy is recoil control: sighted fire is
-        // almost perfectly flat, so holding the sights on a target is the way
-        // to land sustained fire, and hipfire is the spray option.
+        // Bullets leave inside the cone the reticle is showing, so sights
+        // tighten grouping in two ways: the bloom itself collapses under ADS,
+        // and sighted fire is almost perfectly flat. Holding the sights on a
+        // target is the way to land sustained fire; hipfire is the spray option.
         const float recoilScale = 1.0f - 0.90f * adsBlend;
         const float randomYaw = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) *
                                 recoilYaw * recoilScale;
         camera.ApplyRecoil(recoilPitch * recoilScale, randomYaw);
+        // Carbine tap. Scaled by the same recoilScale the aim kick uses, so
+        // sighted fire shakes as little as it climbs -- bracing the weapon
+        // steadies the view too, not just the muzzle.
+        camera.AddFireTrauma(0.045f * recoilScale);
         gunRecoilBack = (std::min)(0.12f, gunRecoilBack + 0.075f);
         gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 4.2f * recoilScale);
         TriggerMuzzleFlash(1.0f, 1.0f);
@@ -1337,7 +1495,7 @@ struct Scene {
         Projectile p;
         p.position  = GetMuzzleWorldPosition();
         p.previousPosition = p.position;
-        p.direction = camera.Front;
+        p.direction = ApplyShotSpread(camera.Front);
         p.speed     = projectileSpeed;
         p.lifetime  = projectileLifetime;
         p.active    = true;
@@ -1373,6 +1531,9 @@ struct Scene {
 
     void ShootHarpoonProjectile() {
         camera.ApplyRecoil(recoilPitch * 1.8f, 0.0f);
+        // Harpoon gun: a spring-driven launch rather than a powder charge, so
+        // it thumps rather than cracks.
+        camera.AddFireTrauma(0.06f);
         gunRecoilBack = (std::min)(0.14f, gunRecoilBack + 0.11f);
         gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 3.2f);
         TriggerMuzzleFlash(0.9f, 0.72f);
@@ -1576,8 +1737,17 @@ struct Scene {
     // both the flash and part of the kick. Damage and velocity are untouched --
     // the suppressed rifle hits exactly as hard as the bare one.
     void ShootSniperProjectile(bool suppressed = false) {
+        // No spread, ever. The SVD puts its round exactly where the crosshair
+        // sits regardless of stance or movement -- a marksman rifle whose shot
+        // wanders is not one, and the 5x damage multiplier only means something
+        // if the shot is trusted. The reticle may bloom while moving; this
+        // weapon deliberately does not honour it.
         const XMFLOAT3 aimDirection = camera.Front;
         camera.ApplyRecoil(recoilPitch * (suppressed ? 3.6f : 4.2f), 0.0f);
+        // Marksman rifle. A shade less than the shotgun despite the bigger aim
+        // kick: this weapon is fired from a scope, where a shaking view is far
+        // more disruptive than it is at the hip.
+        camera.AddFireTrauma(suppressed ? 0.085f : 0.10f);
         gunRecoilBack = (std::min)(0.16f, gunRecoilBack + 0.12f);
         gunRecoilKick = (std::min)(12.0f, gunRecoilKick + 7.0f);
         // A suppressed muzzle still flares, just far less. Killing it outright
@@ -1600,6 +1770,10 @@ struct Scene {
 
     void ShootRocket() {
         camera.ApplyRecoil(recoilPitch * 4.0f, 0.0f);
+        // Launcher backblast: the hardest shove of any weapon here, and the one
+        // shot where a real jolt is expected. Still under the firing ceiling --
+        // the rocket's own detonation supplies the big shake a moment later.
+        camera.AddFireTrauma(0.19f);
         gunRecoilBack = (std::min)(0.20f, gunRecoilBack + 0.16f);
         gunRecoilKick = (std::min)(14.0f, gunRecoilKick + 9.0f);
         TriggerMuzzleFlash(1.8f, 1.75f);
@@ -1835,6 +2009,9 @@ struct Scene {
         const float randomYaw = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) *
                                 recoilYaw * 2.2f;
         camera.ApplyRecoil(recoilPitch * 2.8f, randomYaw);
+        // Shotgun: heaviest per-shot kick in the rack, and slow enough between
+        // shots that the shake fully decays rather than stacking.
+        camera.AddFireTrauma(0.13f);
         gunRecoilBack = (std::min)(0.16f, gunRecoilBack + 0.13f);
         gunRecoilKick = (std::min)(11.0f, gunRecoilKick + 7.5f);
         TriggerMuzzleFlash(1.35f, 1.45f);
@@ -1846,7 +2023,11 @@ struct Scene {
         const XMVECTOR cameraRight = XMVector3Normalize(
             XMVector3Cross(cameraUp, cameraFront));
         constexpr int pelletCount = 8;
-        constexpr float spread = 0.055f;
+        // The buckshot pattern is a property of the barrel, so it stays fixed --
+        // the reticle bloom widens it rather than replacing it. Half weight,
+        // because a weapon whose whole identity is a wide pattern gains less
+        // from an unsteady stance than a rifle loses.
+        const float spread = 0.055f + CurrentShotSpreadRadians() * 0.5f;
         for (int pellet = 0; pellet < pelletCount; ++pellet) {
             const float right = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) * spread;
             const float up = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) * spread;

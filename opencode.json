@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "flash": {
+      "description": "Fast DeepSeek V4 Flash subagent for quick, mechanical tasks.",
+      "mode": "subagent",
+      "model": "opencode/deepseek-v4-flash"
+    }
+  }
+}

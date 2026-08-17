@@ -20,6 +20,8 @@
 struct RaytracingContext;
 extern RaytracingContext g_rt;
 extern ProfilerDX12 g_profiler;
+// Shift-sprint state for the HUD's sprint indicator. Owned by main.cpp.
+extern bool g_playerSprinting;
 extern UINT g_forwardDrawCalls;
 extern UINT g_shadowDrawCalls;
 extern UINT g_visibilityDrawCalls;
@@ -165,54 +167,148 @@ inline void RenderPlayerHUD(const Scene& scene) {
                       "Enemy vision cones: ON  (N to toggle)");
     }
 
-    // Comm-tower objective readout, centred at the top. Only drawn on levels that
-    // carry a tower, and hidden behind the sniper scope like the rest of the HUD
-    // so it cannot sit on top of the reticle.
+    // ---- Compass strip -----------------------------------------------------
+    //
+    // A sliding heading tape across the top: cardinals every 45 degrees, numeric
+    // ticks every 15, all scrolling past a fixed centre mark that reads the
+    // camera's yaw. Ends fade out so the tape looks continuous rather than
+    // clipped, which is what sells it as a strip rather than a list.
+    //
+    // Camera::Yaw is degrees, 0 along +X and increasing counter-clockwise, while
+    // a compass runs clockwise from north. ScreenHeading below converts once so
+    // every tick after it is plain compass degrees.
+    if (scene.player.health > 0.0f && scene.sniperScopeBlend < 0.25f) {
+        constexpr float kStripWidth = 420.0f;
+        constexpr float kDegreesAcross = 120.0f;   // span visible end to end
+        const float pixelsPerDegree = kStripWidth / kDegreesAcross;
+        const float centerX = io.DisplaySize.x * 0.5f;
+        const float stripLeft = centerX - kStripWidth * 0.5f;
+        const float stripRight = centerX + kStripWidth * 0.5f;
+        constexpr float kStripY = 26.0f;
+
+        // Camera yaw -> compass heading. +Z is north here, matching the way
+        // VehicleSystem measures its bearings (see PlaceEscapeBoatOnBearing).
+        float heading = 90.0f - scene.camera.Yaw;
+        heading = std::fmod(heading, 360.0f);
+        if (heading < 0.0f) heading += 360.0f;
+
+        // Alpha falls off toward both ends. Everything on the tape multiplies by
+        // this, so a tick never pops in at full brightness at the edge.
+        const auto edgeFade = [&](float x) {
+            const float distance = std::abs(x - centerX) / (kStripWidth * 0.5f);
+            const float t = 1.0f - (std::max)(0.0f, (std::min)(1.0f, distance));
+            return (std::min)(1.0f, t * 2.6f);   // flat in the middle, fast at ends
+        };
+
+        static constexpr const char* kCardinals[8] = {
+            "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
+
+        // Walk 15-degree steps across the visible span. Rounded outward by one
+        // step on each side so a label sliding in is drawn before its centre
+        // reaches the edge.
+        const int firstStep =
+            static_cast<int>(std::floor((heading - kDegreesAcross * 0.5f) / 15.0f));
+        const int lastStep =
+            static_cast<int>(std::ceil((heading + kDegreesAcross * 0.5f) / 15.0f));
+        for (int step = firstStep; step <= lastStep; ++step) {
+            const float tickHeading = static_cast<float>(step) * 15.0f;
+            // Shortest signed angle from the current heading, so the tape wraps
+            // through 360 without the ticks jumping the width of the strip.
+            float delta = tickHeading - heading;
+            delta = std::fmod(delta + 540.0f, 360.0f) - 180.0f;
+            const float x = centerX + delta * pixelsPerDegree;
+            if (x < stripLeft - 20.0f || x > stripRight + 20.0f) continue;
+
+            const float fade = edgeFade(x);
+            if (fade <= 0.01f) continue;
+
+            // A cardinal every 45 degrees; plain degree numbers between.
+            const int normalized = ((step * 15) % 360 + 360) % 360;
+            const bool isCardinal = (normalized % 45) == 0;
+            if (isCardinal) {
+                const char* label = kCardinals[(normalized / 45) % 8];
+                const ImVec2 size = ImGui::CalcTextSize(label);
+                // The cardinal nearest the centre is picked out in amber -- the
+                // one piece of colour on the tape, so "which way am I facing"
+                // resolves without reading any number.
+                const bool focused = std::abs(delta) < 22.5f;
+                const ImU32 tint = focused
+                    ? IM_COL32(255, 186, 62, static_cast<int>(255.0f * fade))
+                    : IM_COL32(236, 240, 242, static_cast<int>(235.0f * fade));
+                draw->AddText(ImVec2(x - size.x * 0.5f, kStripY), tint, label);
+                draw->AddLine(ImVec2(x, kStripY + size.y + 1.0f),
+                              ImVec2(x, kStripY + size.y + 6.0f),
+                              tint, 1.4f);
+            } else {
+                char label[8];
+                snprintf(label, sizeof(label), "%d", normalized);
+                const ImVec2 size = ImGui::CalcTextSize(label);
+                const ImU32 tint =
+                    IM_COL32(176, 186, 192, static_cast<int>(200.0f * fade));
+                draw->AddText(ImVec2(x - size.x * 0.5f, kStripY + 1.0f),
+                              tint, label);
+                draw->AddLine(ImVec2(x, kStripY + size.y + 2.0f),
+                              ImVec2(x, kStripY + size.y + 5.0f), tint, 1.0f);
+            }
+        }
+    }
+
+    // ---- Objective ---------------------------------------------------------
+    //
+    // Two parts: a task line under the compass saying what to do, and a marker
+    // block in the top-left corner naming it as the primary objective. Only
+    // drawn on levels that carry a tower, and hidden behind the sniper scope
+    // like the rest of the HUD so it cannot sit on top of the reticle.
     {
         float towerHealth = 0.0f, towerMaxHealth = 0.0f;
         if (scene.sniperScopeBlend < 0.25f &&
             CommTowerObjectiveStatus(towerHealth, towerMaxHealth)) {
             const float towerFraction = (std::max)(0.0f, (std::min)(1.0f,
                 towerHealth / (std::max)(1.0f, towerMaxHealth)));
-            constexpr float barWidth = 260.0f;
-            constexpr float barHeight = 16.0f;
-            const ImVec2 barMin((io.DisplaySize.x - barWidth) * 0.5f, 22.0f);
+
+            // The task, centred under the compass. An instruction rather than a
+            // label: "REACH THE COMMS TOWER" tells a new player what to do,
+            // where "OBJECTIVE :: COMM TOWER" only named a thing.
+            const char* task = "REACH THE COMMS TOWER";
+            const ImVec2 taskSize = ImGui::CalcTextSize(task);
+            const float taskY = 62.0f;
+            draw->AddText(ImVec2((io.DisplaySize.x - taskSize.x) * 0.5f, taskY),
+                          IM_COL32(226, 232, 236, 235), task);
+
+            // Slim progress rule beneath, spanning a fixed width so it reads as
+            // a gauge rather than as an underline of the text.
+            constexpr float barWidth = 300.0f;
+            constexpr float barHeight = 3.0f;
+            const ImVec2 barMin((io.DisplaySize.x - barWidth) * 0.5f,
+                                taskY + taskSize.y + 5.0f);
             const ImVec2 barMax(barMin.x + barWidth, barMin.y + barHeight);
-            const ImVec2 barFill(
-                barMin.x + barWidth * towerFraction, barMax.y);
-
-            const char* title = "COMM TOWER";
-            const ImVec2 titleSize = ImGui::CalcTextSize(title);
-            draw->AddText(
-                ImVec2(barMin.x + (barWidth - titleSize.x) * 0.5f,
-                       barMin.y - titleSize.y - 3.0f),
-                IM_COL32(226, 234, 225, 235), title);
-
-            draw->AddRectFilled(ImVec2(barMin.x - 3.0f, barMin.y - 3.0f),
-                                ImVec2(barMax.x + 3.0f, barMax.y + 3.0f),
-                                IM_COL32(8, 12, 10, 180), 3.0f);
-            // Amber-to-red as it comes apart: distinct from the player's green
-            // health bar so the two are never confused at a glance.
-            const int towerRed = 226;
-            const int towerGreen = (int)(58.0f + 128.0f * towerFraction);
+            draw->AddRectFilled(barMin, barMax, IM_COL32(255, 255, 255, 40), 1.5f);
             if (towerFraction > 0.0f)
-                draw->AddRectFilled(barMin, barFill,
-                                    IM_COL32(towerRed, towerGreen, 46, 225), 1.5f);
-            draw->AddRect(barMin, barMax, IM_COL32(176, 196, 181, 185),
-                          1.5f, 0, 1.0f);
+                draw->AddRectFilled(barMin,
+                    ImVec2(barMin.x + barWidth * towerFraction, barMax.y),
+                    IM_COL32(236, 240, 242, 225), 1.5f);
 
-            // Percentage, not the raw health pair: 2400 is an authored tuning
-            // number that means nothing on screen, and since a demolition charge
-            // deals far more than the tower's total health, the pair only ever
-            // reads "2400 / 2400" or "0 / 2400" -- never anything between.
-            char towerLabel[48];
-            snprintf(towerLabel, sizeof(towerLabel), "%.0f%%",
-                     towerFraction * 100.0f);
-            const ImVec2 towerTextSize = ImGui::CalcTextSize(towerLabel);
-            draw->AddText(
-                ImVec2(barMin.x + (barWidth - towerTextSize.x) * 0.5f,
-                       barMin.y + (barHeight - towerTextSize.y) * 0.5f),
-                IM_COL32(226, 234, 225, 245), towerLabel);
+            // Top-left marker. Amber diamond + "PRIMARY OBJECTIVE" over the
+            // task restated in sentence case, matching the reference layout.
+            const ImU32 amber = IM_COL32(255, 186, 62, 245);
+            constexpr float kMarkerX = 30.0f;
+            constexpr float kMarkerY = 84.0f;
+            const float diamond = 6.0f;
+            const ImVec2 centre(kMarkerX + diamond, kMarkerY + 7.0f);
+            // Hollow diamond, drawn as a rotated square outline.
+            const ImVec2 points[4] = {
+                ImVec2(centre.x, centre.y - diamond),
+                ImVec2(centre.x + diamond, centre.y),
+                ImVec2(centre.x, centre.y + diamond),
+                ImVec2(centre.x - diamond, centre.y) };
+            draw->AddPolyline(points, 4, amber, ImDrawFlags_Closed, 1.6f);
+            draw->AddCircleFilled(centre, 1.8f, amber, 8);
+
+            draw->AddText(ImVec2(kMarkerX + diamond * 2.0f + 10.0f, kMarkerY),
+                          amber, "PRIMARY OBJECTIVE");
+            draw->AddText(ImVec2(kMarkerX, kMarkerY + 20.0f),
+                          IM_COL32(226, 232, 236, 235),
+                          "Reach the comms tower");
         }
     }
 
@@ -241,11 +337,14 @@ inline void RenderPlayerHUD(const Scene& scene) {
 
         const int lineAlpha = static_cast<int>(235.0f * blend);
         const ImU32 reticleShadow = IM_COL32(0, 0, 0, lineAlpha);
-        const ImU32 reticleGlow = IM_COL32(145, 255, 170, lineAlpha);
+        // Off-white rather than the old green phosphor tint, matching the rest
+        // of the HUD. The black underlay beneath every line is what keeps it
+        // readable against sky and sand, not the colour.
+        const ImU32 reticleGlow = IM_COL32(238, 242, 236, lineAlpha);
         draw->AddCircle(center, radius, IM_COL32(12, 18, 13, shadeAlpha),
                         segments, 7.0f);
         draw->AddCircle(center, radius - 5.0f,
-                        IM_COL32(165, 190, 170, lineAlpha), segments, 1.2f);
+                        IM_COL32(196, 204, 196, lineAlpha), segments, 1.2f);
 
         const float edge = radius - 10.0f;
         const float gap = 4.0f;
@@ -294,20 +393,29 @@ inline void RenderPlayerHUD(const Scene& scene) {
         const ImVec2 labelSize = ImGui::CalcTextSize(zoomLabel);
         draw->AddText(ImVec2(center.x + radius * 0.46f - labelSize.x * 0.5f,
                              center.y + radius * 0.74f),
-                      IM_COL32(145, 255, 170, lineAlpha), zoomLabel);
+                      IM_COL32(238, 242, 236, lineAlpha), zoomLabel);
     }
 
     if (scene.player.godMode) {
         const char* god = "GOD MODE";
         const ImVec2 size = ImGui::CalcTextSize(god);
-        draw->AddText(ImVec2((io.DisplaySize.x - size.x) * 0.5f, 24.0f),
-                      IM_COL32(255, 220, 65, 245), god);
+        const float godX = (io.DisplaySize.x - size.x) * 0.5f;
+        // Clear of the centred stack above it: compass tape at y = 26..45, the
+        // objective task line at y = 62 and its progress rule just under. All
+        // three are centred, so this has to sit below the lot.
+        const float godY = 92.0f;
+        draw->AddText(ImVec2(godX, godY), IM_COL32(255, 220, 65, 245), god);
     }
 
     if (scene.player.health > 0.0f && scene.sniperScopeBlend < 0.25f) {
         const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
-        constexpr float gap = 3.0f;
+        // Four independent arms around a fixed centre. The resting gap is the
+        // floor; scene.crosshairSpread pushes all four outward together as
+        // movement, firing and recoil degrade the shot (see the bloom target in
+        // the frame update). A still, crouched player sees the tight cross.
+        constexpr float restGap = 3.0f;
         constexpr float arm = 5.0f;
+        const float gap = restGap + (std::max)(0.0f, scene.crosshairSpread);
         // Fade the reticle out as the sights come up: the weapon's own sights
         // become the aiming reference, and leaving a crosshair floating over
         // them reads as a double sight picture.
@@ -326,6 +434,47 @@ inline void RenderPlayerHUD(const Scene& scene) {
             draw->AddLine(segment[0], segment[1], outline, 3.0f);
         for (const auto& segment : segments)
             draw->AddLine(segment[0], segment[1], reticle, 1.0f);
+    }
+
+    // Hit marker: four diagonal ticks forming an X over the crosshair. Drawn
+    // outside the reticle block above and without its ADS fade -- a confirmed
+    // hit has to register while scoped, which is exactly when the crosshair
+    // itself is gone.
+    if (scene.hitMarkerTime > 0.0f && scene.hitMarkerDuration > 0.0f) {
+        const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+        // 1 at the moment of the hit, falling to 0. Quadratic so the flash is
+        // bright immediately and spends its life fading rather than sitting.
+        const float life = (std::min)(1.0f,
+            scene.hitMarkerTime / scene.hitMarkerDuration);
+        const float fade = life * life;
+        // Snaps in tight then relaxes outward as it fades, which reads as an
+        // impact rather than a static overlay.
+        const float inner = 4.0f + (1.0f - life) * 3.0f;
+        const float outer = inner + 5.0f;
+
+        const int markerAlpha = static_cast<int>(255.0f * fade);
+        const int shadowAlpha = static_cast<int>(200.0f * fade);
+        const ImU32 markerColor = scene.hitMarkerLethal
+            ? IM_COL32(255, 70, 60, markerAlpha)      // kill
+            : IM_COL32(255, 255, 255, markerAlpha);   // hit
+        const ImU32 markerShadow = IM_COL32(0, 0, 0, shadowAlpha);
+
+        // Four diagonals, one per quadrant -- an X, so it never overdraws the
+        // crosshair's own horizontal and vertical arms.
+        const ImVec2 ticks[4][2] = {
+            { ImVec2(center.x - outer, center.y - outer),
+              ImVec2(center.x - inner, center.y - inner) },
+            { ImVec2(center.x + inner, center.y - inner),
+              ImVec2(center.x + outer, center.y - outer) },
+            { ImVec2(center.x - outer, center.y + outer),
+              ImVec2(center.x - inner, center.y + inner) },
+            { ImVec2(center.x + inner, center.y + inner),
+              ImVec2(center.x + outer, center.y + outer) }
+        };
+        for (const auto& tick : ticks)
+            draw->AddLine(tick[0], tick[1], markerShadow, 3.6f);
+        for (const auto& tick : ticks)
+            draw->AddLine(tick[0], tick[1], markerColor, 1.8f);
     }
 
     // Hit feedback. Drawn before the HUD so the bar and reticle stay readable
@@ -449,104 +598,292 @@ inline void RenderPlayerHUD(const Scene& scene) {
         }
     }
 
+    // ---- Bottom HUD band ---------------------------------------------------
+    //
+    // Health left, ammo right, both sitting on one baseline with a shared
+    // margin. The old bar centred "HP 100 / 100" inside its own fill, which
+    // meant the number sat on a colour that changed underneath it and became
+    // unreadable around half health. Label and value now live above the bar, on
+    // the plate, where nothing moves behind them.
+    constexpr float kHudMargin = 28.0f;
+    constexpr float kBarWidth = 232.0f;
+    constexpr float kBarHeight = 7.0f;
+    const float baseline = io.DisplaySize.y - 34.0f;
+
     const float maxHealth = (std::max)(1.0f, scene.player.maxHealth);
     const float fraction = (std::max)(
         0.0f, (std::min)(1.0f, scene.player.health / maxHealth));
-    const ImVec2 min(24.0f, io.DisplaySize.y - 42.0f);
-    const ImVec2 max(min.x + 208.0f, min.y + 18.0f);
-    const ImVec2 fillMax(min.x + (max.x - min.x) * fraction, max.y);
+    const float chipValue = scene.healthChip < 0.0f
+        ? scene.player.health : scene.healthChip;
+    const float chipFraction = (std::max)(fraction, (std::min)(1.0f,
+        chipValue / maxHealth));
 
-    draw->AddRectFilled(ImVec2(min.x - 3.0f, min.y - 3.0f),
-                        ImVec2(max.x + 3.0f, max.y + 3.0f),
-                        IM_COL32(8, 12, 10, 180), 3.0f);
-    const int red = (int)(210.0f * (1.0f - fraction) + 38.0f * fraction);
-    const int green = (int)(72.0f * (1.0f - fraction) + 178.0f * fraction);
-    if (fraction > 0.0f)
-        draw->AddRectFilled(min, fillMax, IM_COL32(red, green, 82, 225), 1.5f);
-    draw->AddRect(min, max, IM_COL32(176, 196, 181, 185), 1.5f, 0, 1.0f);
+    const ImVec2 barMin(kHudMargin, baseline);
+    const ImVec2 barMax(barMin.x + kBarWidth, barMin.y + kBarHeight);
 
-    char label[48];
-    snprintf(label, sizeof(label), "HP  %.0f / %.0f",
-             scene.player.health, maxHealth);
-    const ImVec2 textSize = ImGui::CalcTextSize(label);
-    draw->AddText(ImVec2(min.x + ((max.x - min.x) - textSize.x) * 0.5f,
-                         min.y + ((max.y - min.y) - textSize.y) * 0.5f),
-                  IM_COL32(226, 234, 225, 245), label);
+    // The hudPlate lambda that used to sit here is gone with the panels it
+    // backed: this layout puts bright text and bars straight onto the scene, the
+    // way the reference does. Contrast now comes from each element's own weight
+    // -- the bar's dark track, the oversized figures -- rather than from a wash
+    // behind everything.
 
-    // Ammo readout, bottom-right corner, mirroring the health bar's inset so the
-    // two read as one HUD band. Right-aligned: the text grows leftward, keeping
-    // the corner margin fixed as the digit count changes. God mode has no ammo
-    // to show, so the HUD stays exactly as it was there.
-    if (scene.AmmoEnforced()) {
-        const int slot = GunModel::SelectedWeapon();
-        const int inMag = scene.player.magazine[slot];
-        const int spare = scene.player.reserve[slot];
-        char ammo[64];
-        if (scene.Reloading())
-            snprintf(ammo, sizeof(ammo), "RELOADING...");
-        else
-            snprintf(ammo, sizeof(ammo), "%d / %d", inMag, spare);
-        // Red when the magazine is dry, amber at a quarter left, else white.
-        const int magSize = (std::max)(1, scene.player.magazineSize[slot]);
-        ImU32 tint = IM_COL32(255, 255, 255, 255);
-        if (!scene.Reloading() && inMag == 0)
-            tint = IM_COL32(255, 70, 55, 255);
-        else if (!scene.Reloading() && inMag * 4 <= magSize)
-            tint = IM_COL32(255, 200, 60, 255);
+    // Label row above the bar. "HEALTH" in dim caps, the number in bright
+    // right-aligned figures -- a hierarchy the old single centred string had no
+    // room to express.
+    const ImU32 dimText = IM_COL32(131, 146, 135, 235);
+    const ImU32 brightText = IM_COL32(226, 234, 225, 250);
 
-        const ImVec2 ammoSize = ImGui::CalcTextSize(ammo);
-        // 24 px from the right edge = the health bar's left inset, and the same
-        // vertical band, so both sit on one line across the bottom.
-        const float ammoRight = io.DisplaySize.x - 24.0f;
-        const ImVec2 ammoPos(ammoRight - ammoSize.x,
-                             min.y + ((max.y - min.y) - ammoSize.y) * 0.5f);
-        draw->AddRectFilled(ImVec2(ammoPos.x - 8.0f, min.y - 3.0f),
-                            ImVec2(ammoRight + 8.0f, max.y + 3.0f),
-                            IM_COL32(8, 12, 10, 180), 3.0f);
-        draw->AddText(ammoPos, tint, ammo);
+    // Medical cross + value on one row above the bar. The cross is what makes
+    // the block readable without a "HEALTH" caption -- an icon carries the
+    // meaning in less space and in any language.
+    {
+        const float crossY = baseline - 26.0f;
+        const float armThickness = 4.0f;
+        const float armLength = 14.0f;
+        const ImVec2 crossCentre(barMin.x + armLength * 0.5f,
+                                 crossY + armLength * 0.5f);
+        const ImU32 crossTint = fraction <= 0.30f
+            ? IM_COL32(255, 92, 76, 255) : IM_COL32(238, 244, 246, 250);
+        draw->AddRectFilled(
+            ImVec2(crossCentre.x - armLength * 0.5f,
+                   crossCentre.y - armThickness * 0.5f),
+            ImVec2(crossCentre.x + armLength * 0.5f,
+                   crossCentre.y + armThickness * 0.5f), crossTint, 1.0f);
+        draw->AddRectFilled(
+            ImVec2(crossCentre.x - armThickness * 0.5f,
+                   crossCentre.y - armLength * 0.5f),
+            ImVec2(crossCentre.x + armThickness * 0.5f,
+                   crossCentre.y + armLength * 0.5f), crossTint, 1.0f);
 
-        if (!scene.Reloading() && inMag == 0 && spare > 0) {
-            const char* hint = "PRESS R";
-            const ImVec2 hintSize = ImGui::CalcTextSize(hint);
-            draw->AddText(ImVec2(ammoRight - hintSize.x, min.y - 22.0f),
-                          IM_COL32(255, 200, 60, 235), hint);
+        // The value at 1.5x, left-aligned beside the cross rather than
+        // right-aligned over the bar: it is a status figure, not a gauge label.
+        char healthValue[32];
+        snprintf(healthValue, sizeof(healthValue), "%.0f", scene.player.health);
+        constexpr float kHealthFontScale = 1.5f;
+        const float healthFontSize = ImGui::GetFontSize() * kHealthFontScale;
+        const ImVec2 healthBase = ImGui::CalcTextSize(healthValue);
+        draw->AddText(ImGui::GetFont(), healthFontSize,
+                      ImVec2(barMin.x + armLength + 12.0f,
+                             crossY + armLength * 0.5f -
+                                 healthBase.y * kHealthFontScale * 0.5f),
+                      crossTint, healthValue);
+    }
+
+    // Track, then the draining chip, then the live fill. Order matters: the
+    // chip must sit under the fill so the two never disagree at the seam.
+    //
+    // No backplate on this block: the reference HUD lets the bar and figure sit
+    // directly on the scene, and the bar's own dark track already gives the fill
+    // something to read against.
+    draw->AddRectFilled(ImVec2(barMin.x - 1.0f, barMin.y - 1.0f),
+                        ImVec2(barMax.x + 1.0f, barMax.y + 1.0f),
+                        IM_COL32(2, 4, 3, 165), 3.0f);
+    // The chip stays a muted red -- it is the one thing on the bar that has to
+    // read as "damage just taken" rather than "current state", and a white ghost
+    // behind a white fill would be invisible.
+    if (chipFraction > fraction) {
+        draw->AddRectFilled(barMin,
+            ImVec2(barMin.x + kBarWidth * chipFraction, barMax.y),
+            IM_COL32(198, 86, 72, 150), 2.5f);
+    }
+    // Plain off-white fill. The old green-to-red gradient carried the same
+    // information the bar's own length already does, and it made the HUD read as
+    // a status widget rather than an overlay. Danger is signalled by the number
+    // going red and by the low-health vignette, both of which are already there.
+    if (fraction > 0.0f) {
+        draw->AddRectFilled(barMin,
+            ImVec2(barMin.x + kBarWidth * fraction, barMax.y),
+            IM_COL32(238, 242, 236, 245), 2.5f);
+    }
+
+    // Sprint row: a runner glyph and three segments under the health bar, lit
+    // while shift-sprint is actually moving the player.
+    //
+    // There is no stamina system in this engine -- sprint is unlimited -- so
+    // these segments are a state light, not a meter. They are drawn as segments
+    // anyway because that is what the layout calls for, and if a stamina budget
+    // is ever added this is where it plugs in without moving anything.
+    {
+        const float sprintY = barMax.y + 7.0f;
+        const bool sprinting = g_playerSprinting && scene.player.health > 0.0f;
+        const ImU32 litTint = IM_COL32(126, 186, 214, 235);
+        const ImU32 dimTint = IM_COL32(255, 255, 255, 38);
+
+        // Small runner: head, torso, and two legs mid-stride.
+        const float glyphX = barMin.x + 2.0f;
+        const ImU32 glyphTint = sprinting
+            ? litTint : IM_COL32(255, 255, 255, 70);
+        draw->AddCircleFilled(ImVec2(glyphX + 3.0f, sprintY + 1.0f), 2.0f,
+                              glyphTint, 8);
+        draw->AddLine(ImVec2(glyphX + 3.0f, sprintY + 3.5f),
+                      ImVec2(glyphX + 2.0f, sprintY + 8.0f), glyphTint, 1.6f);
+        draw->AddLine(ImVec2(glyphX + 2.0f, sprintY + 8.0f),
+                      ImVec2(glyphX + 6.0f, sprintY + 11.0f), glyphTint, 1.4f);
+        draw->AddLine(ImVec2(glyphX + 2.0f, sprintY + 8.0f),
+                      ImVec2(glyphX - 2.0f, sprintY + 11.0f), glyphTint, 1.4f);
+
+        constexpr int kSegments = 3;
+        constexpr float kSegmentGap = 4.0f;
+        const float segmentsLeft = barMin.x + 20.0f;
+        const float segmentWidth =
+            (kBarWidth * 0.62f - kSegmentGap * (kSegments - 1)) / kSegments;
+        for (int i = 0; i < kSegments; ++i) {
+            const float segX = segmentsLeft + (segmentWidth + kSegmentGap) * i;
+            draw->AddRectFilled(ImVec2(segX, sprintY + 3.0f),
+                                ImVec2(segX + segmentWidth, sprintY + 6.0f),
+                                sprinting ? litTint : dimTint, 1.5f);
         }
     }
 
-    if (scene.player.health > 0.0f) {
-        const char* grenade = "FRAG";
-        if (scene.selectedGrenade == GrenadeType::Molotov) grenade = "MOLOTOV";
-        else if (scene.selectedGrenade == GrenadeType::Vortex) grenade = "VORTEX";
-        char grenadeLabel[64];
-        if (scene.player.godMode)
-            snprintf(grenadeLabel, sizeof(grenadeLabel),
-                     "GRENADE: %s   [B] SWITCH   [G] THROW", grenade);
-        else
-            snprintf(grenadeLabel, sizeof(grenadeLabel),
-                     "GRENADE: %s   [G] THROW", grenade);
-        const ImVec2 grenadeSize = ImGui::CalcTextSize(grenadeLabel);
-        const ImVec2 grenadePos(
-            (io.DisplaySize.x - grenadeSize.x) * 0.5f,
-            io.DisplaySize.y - 39.0f);
-        draw->AddRectFilled(
-            ImVec2(grenadePos.x - 8.0f, grenadePos.y - 4.0f),
-            ImVec2(grenadePos.x + grenadeSize.x + 8.0f,
-                   grenadePos.y + grenadeSize.y + 4.0f),
-            IM_COL32(8, 12, 10, 180), 3.0f);
-        ImU32 grenadeTint = IM_COL32(220, 230, 215, 245);
-        if (scene.selectedGrenade == GrenadeType::Molotov)
-            grenadeTint = IM_COL32(255, 155, 55, 245);
-        else if (scene.selectedGrenade == GrenadeType::Vortex)
-            grenadeTint = IM_COL32(105, 205, 255, 245);
-        draw->AddText(grenadePos, grenadeTint, grenadeLabel);
+    // ---- Weapon readout ----------------------------------------------------
+    //
+    // Bottom-right, borderless: weapon name on top, the magazine count as one
+    // oversized figure with the reserve beside it behind a thin divider, and a
+    // status row underneath carrying fire mode and equipment.
+    //
+    // No panel box. An earlier pass drew a bordered frame here; the reference
+    // layout lets the figures sit directly on the scene, which reads as lighter
+    // and stops the corner from looking like a separate application window. The
+    // text is bright enough, and short enough, to hold on its own.
+    {
+        const int slot = GunModel::SelectedWeapon();
+        const float right = io.DisplaySize.x - kHudMargin;
+        const float rowY = baseline - 26.0f;   // shares the health row's baseline
+
+        // --- Weapon name, above everything, right-aligned ---
+        const char* weaponName = GunModel::WeaponName(slot);
+        const ImVec2 nameSize = ImGui::CalcTextSize(weaponName);
+        draw->AddText(ImVec2(right - nameSize.x, rowY - 18.0f),
+                      IM_COL32(226, 234, 238, 240), weaponName);
+
+        if (scene.AmmoEnforced()) {
+            const int inMag = scene.player.magazine[slot];
+            const int spare = scene.player.reserve[slot];
+            const int magSize = (std::max)(1, scene.player.magazineSize[slot]);
+
+            ImU32 magTint = IM_COL32(240, 245, 247, 255);
+            if (inMag == 0) magTint = IM_COL32(255, 70, 55, 255);
+            else if (inMag * 4 <= magSize) magTint = IM_COL32(255, 200, 60, 255);
+
+            // Reserve first, so the magazine figure can be positioned relative
+            // to it -- the big number grows leftward as digits are added, and
+            // the reserve column has to stay put while it does.
+            char spareText[24];
+            snprintf(spareText, sizeof(spareText), "%d", spare);
+            const ImVec2 spareSize = ImGui::CalcTextSize(spareText);
+            const float spareX = right - spareSize.x;
+
+            // Thin divider between magazine and reserve, standing in for the
+            // reference's "|" separator without depending on glyph metrics.
+            const float dividerX = spareX - 12.0f;
+
+            char magText[16];
+            snprintf(magText, sizeof(magText), "%d", inMag);
+            constexpr float kMagFontScale = 2.6f;
+            const float magFontSize = ImGui::GetFontSize() * kMagFontScale;
+            const ImVec2 magBase = ImGui::CalcTextSize(magText);
+            const float magWidth = magBase.x * kMagFontScale;
+            const float magHeight = magBase.y * kMagFontScale;
+            const float magY = rowY - magHeight * 0.32f;
+            draw->AddText(ImGui::GetFont(), magFontSize,
+                          ImVec2(dividerX - 12.0f - magWidth, magY),
+                          magTint, magText);
+
+            draw->AddLine(ImVec2(dividerX, magY + magHeight * 0.30f),
+                          ImVec2(dividerX, magY + magHeight * 0.78f),
+                          IM_COL32(150, 164, 170, 160), 1.2f);
+            draw->AddText(
+                ImVec2(spareX, magY + magHeight * 0.44f),
+                IM_COL32(160, 172, 178, 235), spareText);
+
+            // Reload sweeps a rule directly under the figures. Kept off the
+            // numbers themselves so the counts never disappear mid-reload.
+            if (scene.Reloading()) {
+                const float reloadTotal = (std::max)(0.01f,
+                    scene.player.reloadTime[(std::max)(0,
+                        scene.player.reloadingSlot)]);
+                const float progress = 1.0f - (std::max)(0.0f, (std::min)(1.0f,
+                    scene.player.reloadTimer / reloadTotal));
+                const float ruleY = magY + magHeight + 1.0f;
+                const float ruleLeft = right - 150.0f;
+                draw->AddRectFilled(ImVec2(ruleLeft, ruleY),
+                                    ImVec2(right, ruleY + 2.0f),
+                                    IM_COL32(255, 255, 255, 40), 1.0f);
+                draw->AddRectFilled(
+                    ImVec2(ruleLeft, ruleY),
+                    ImVec2(ruleLeft + (right - ruleLeft) * progress, ruleY + 2.0f),
+                    IM_COL32(255, 200, 60, 245), 1.0f);
+            }
+        }
+
+        // --- Status row: fire mode, then carried equipment ---
+        // Right-aligned and built right-to-left, so each entry keeps its place
+        // as the ones beside it change width.
+        {
+            const float statusY = baseline + kBarHeight - 4.0f;
+            const ImU32 statusDim = IM_COL32(150, 164, 170, 225);
+            const ImU32 statusLit = IM_COL32(226, 234, 238, 245);
+            float cursorX = right;
+
+            // C4 is carried on top of the two chosen weapons, so it is shown as
+            // an equipment entry rather than a weapon. Lit when it is in hand.
+            const bool c4Held = slot == GunModel::kRemoteChargeWeapon;
+            const char* c4Label = "C4";
+            const ImVec2 c4Size = ImGui::CalcTextSize(c4Label);
+            cursorX -= c4Size.x;
+            draw->AddText(ImVec2(cursorX, statusY),
+                          c4Held ? statusLit : statusDim, c4Label);
+            // Marker dot, filled when held.
+            cursorX -= 12.0f;
+            draw->AddCircleFilled(ImVec2(cursorX + 3.0f, statusY + 7.0f), 2.6f,
+                                  c4Held ? statusLit : statusDim, 10);
+
+            // Selected grenade. Grenades are cooldown-gated rather than counted
+            // in this engine, so this shows readiness, not a stock number --
+            // dim while the throw cooldown is still running.
+            const char* grenadeLabel =
+                scene.selectedGrenade == GrenadeType::Molotov ? "MOLOTOV" :
+                scene.selectedGrenade == GrenadeType::Vortex ? "VORTEX" : "FRAG";
+            const bool grenadeReady = scene.grenadeCooldown <= 0.0f;
+            const ImVec2 grenadeSize = ImGui::CalcTextSize(grenadeLabel);
+            cursorX -= grenadeSize.x + 10.0f;
+            draw->AddText(ImVec2(cursorX, statusY),
+                          grenadeReady ? statusLit : statusDim, grenadeLabel);
+            cursorX -= 12.0f;
+            draw->AddCircleFilled(ImVec2(cursorX + 3.0f, statusY + 7.0f), 2.6f,
+                                  grenadeReady ? statusLit : statusDim, 10);
+
+            // Fire mode, furthest left. Only the AK is automatic; everything
+            // else in the rack fires one round per pull.
+            const char* fireMode = (slot == 0 || slot == 6) ? "AUTO" : "SEMI";
+            const ImVec2 modeSize = ImGui::CalcTextSize(fireMode);
+            cursorX -= modeSize.x + 12.0f;
+            draw->AddText(ImVec2(cursorX, statusY), statusDim, fireMode);
+        }
     }
 
+    // The centred grenade chip that used to sit here is gone: the weapon panel's
+    // equipment row now carries the selected grenade alongside the rest of the
+    // loadout, so a separate readout in the middle of the screen was saying the
+    // same thing twice and taking the centre of the view to do it.
+
     if (scene.player.health <= 0.0f) {
+        // Banded across the full width rather than floating unbacked: at 1x font
+        // scale the bare string was small and easy to miss against a busy scene.
         const char* dead = "YOU DIED";
         const ImVec2 deadSize = ImGui::CalcTextSize(dead);
-        draw->AddText(ImVec2((io.DisplaySize.x - deadSize.x) * 0.5f,
-                             io.DisplaySize.y * 0.42f),
-                      IM_COL32(255, 55, 40, 255), dead);
+        const float bandY = io.DisplaySize.y * 0.42f;
+        draw->AddRectFilled(ImVec2(0.0f, bandY - 22.0f),
+                            ImVec2(io.DisplaySize.x, bandY + deadSize.y + 22.0f),
+                            IM_COL32(10, 4, 4, 190));
+        draw->AddLine(ImVec2(0.0f, bandY - 22.0f),
+                      ImVec2(io.DisplaySize.x, bandY - 22.0f),
+                      IM_COL32(196, 44, 32, 190), 1.5f);
+        draw->AddLine(ImVec2(0.0f, bandY + deadSize.y + 22.0f),
+                      ImVec2(io.DisplaySize.x, bandY + deadSize.y + 22.0f),
+                      IM_COL32(196, 44, 32, 190), 1.5f);
+        draw->AddText(ImVec2((io.DisplaySize.x - deadSize.x) * 0.5f, bandY),
+                      IM_COL32(255, 78, 62, 255), dead);
     }
 }
 

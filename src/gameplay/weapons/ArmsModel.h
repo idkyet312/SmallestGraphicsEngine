@@ -195,13 +195,20 @@ public:
     // Idle remains the base pose. Run supplies only motion relative to its first
     // frame, blended smoothly by player speed.
     static void Update(float deltaTime, float playerHorizontalSpeed = 0.0f,
-                       float adsBlend = 0.0f) {
+                       float adsBlend = 0.0f, bool sprinting = false) {
         if (!Loaded()) return;
         UpdateRunBlend(deltaTime, playerHorizontalSpeed);
         if (Animate()) {
             Animation().Advance(deltaTime);
-            if (RunAnimation().clip && RunBlendWeight() > 0.0001f)
-                RunAnimation().Advance(deltaTime);
+            // Sprinting doubles the run cycle; jogging plays it at authored
+            // speed. Only the run clip is scaled -- the idle underneath keeps
+            // real time, so breathing and sway do not speed up with the legs.
+            // Scaling the advance rather than the clip leaves the authored data
+            // untouched and keeps the loop blend working on its own duration.
+            if (RunAnimation().clip && RunBlendWeight() > 0.0001f) {
+                const float rate = sprinting ? kSprintPlaybackRate : 1.0f;
+                RunAnimation().Advance(deltaTime * rate);
+            }
         } else {
             // Re-sampling every frame costs little and keeps the pose live while
             // PoseTime is dragged in the UI.
@@ -590,6 +597,11 @@ private:
     // reads correctly against the weapon.
     static constexpr float kArmLength = 0.72f;
     static constexpr float kProceduralRunStrength = 1.0f / 3.0f;
+    // Run cycle rate while sprinting (shift held). Matches the sprint movement
+    // multiplier in the input path -- the legs have to turn over at the same
+    // ratio the camera actually moves, or the stride slides against the ground.
+    // Change the two together. Normal running keeps the authored 1x.
+    static constexpr float kSprintPlaybackRate = 1.5f;
     // ADS keeps only 20% of breathing-idle displacement around frame zero.
     static constexpr float kAdsIdleMotionRange = 0.2f;
     static std::string Resolve(const std::string& rel) { return ResolvePath(rel); }

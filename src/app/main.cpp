@@ -232,6 +232,18 @@ static constexpr float      g_ddgiCornellLightIntensity = 24.0f;
 static std::shared_ptr<SceneNode> g_ddgiCornellModel;
 std::shared_ptr<SceneNode>  g_helicopterMainRotorNode;
 std::shared_ptr<SceneNode>  g_helicopterTailRotorNode;
+// The reinforcement dropship gets its own copy of the airframe, so its rotors
+// turn on their own angle instead of borrowing the patrol gunship's nodes. A
+// shallow clone shares every vertex buffer and material with the original --
+// only the node transforms are independent, which is exactly the difference
+// that matters. Without this, one dead helicopter froze BOTH sets of blades,
+// because a single pair of rotor nodes was being posed for two aircraft.
+std::shared_ptr<SceneNode>  g_secondaryHelicopterModel;
+std::shared_ptr<SceneNode>  g_secondaryHelicopterMainRotorNode;
+std::shared_ptr<SceneNode>  g_secondaryHelicopterTailRotorNode;
+static float                g_secondaryHelicopterRotorSpeedScale = 1.0f;
+static float                g_secondaryHelicopterMainRotorAngle = 0.0f;
+static float                g_secondaryHelicopterTailRotorAngle = 0.0f;
 std::shared_ptr<SceneNode>  g_humveeTurretNode;
 static XMFLOAT3&            g_humveeModelCenter = g_game.vehicles.humveeModelCenter;
 static float&               g_humveeModelMinY = g_game.vehicles.humveeModelMinY;
@@ -444,6 +456,27 @@ GunAudio                    g_helicopterHoverAudio;
 // Cockpit alarm on the insertion BlackHawk, looped while it is critically
 // damaged so the player hears the failure before they see the ground.
 GunAudio                    g_blackHawkAlarmAudio;
+// Footstep variations, one GunAudio per sample. A GunAudio owns exactly one
+// decoded buffer, so alternation has to come from picking between instances
+// rather than from one instance holding a set.
+//
+// Two recordings is few enough that a plain random pick would audibly repeat
+// the same file back to back; PlayFootstep below avoids that, and layers a
+// pitch jitter on top so even a repeat is not identical.
+constexpr int               kFootstepVariantCount = 2;
+GunAudio                    g_footstepAudio[kFootstepVariantCount];
+// Which variant played last, so the next step can avoid it.
+static int                  g_lastFootstepVariant = -1;
+// Distance walked since the last step sound. A stride-length accumulator rather
+// than a timer, so footfalls stay locked to actual movement: a timer keeps
+// ticking when the player walks into a wall, and desyncs the moment sprint
+// changes their speed. Enemies carry their own copy of this on the actor (see
+// SkinnedEnemy::stepDistance), which cannot go stale when the list is compacted.
+static float                g_playerStepDistance = 0.0f;
+// Metres between footfalls. Sprinting lengthens the stride but raises the
+// cadence more, so the interval shortens.
+static constexpr float      kStepStrideWalk = 2.1f;
+static constexpr float      kStepStrideSprint = 2.6f;
 static float&               g_banditVoiceCooldown = g_enemySystem.voiceCooldown;
 static float&               g_banditPainCooldown = g_enemySystem.painCooldown;
 // Lockout on the player's own hit sound, so a burst lands as one impact rather
@@ -464,6 +497,14 @@ bool                        g_emptyLevelMode = false;
 // everywhere else. F10 turns the walk mode on when traversal needs testing
 // one-handed.
 bool                        g_mouseWalkTestMode = false;
+// Whether shift-sprint was held on the last input poll. Read by the viewmodel
+// so the run animation can turn over at sprint cadence, and by the HUD's sprint
+// indicator. Kept as state rather than re-polling the key at those call sites:
+// they would then be sampled a frame apart, and the movement multiplier, the leg
+// speed and the readout must all come from the same press to stay in step.
+//
+// Non-static so EngineUI.h can read it; see the extern there.
+bool                        g_playerSprinting = false;
 NavigationSystem            g_navigation;
 static LevelEditor          g_levelEditor;
 static Camera               g_editorCameraSnapshot;
@@ -791,6 +832,10 @@ XMMATRIX SecondaryHelicopterWorldMatrix() {
 // SecondaryHelicopterPresent(), which the gameplay-side gates use -- kept as a
 // separate non-static symbol because the renderer headers reach it by extern.
 bool SecondaryHelicopterVisible() {
+    // Mirrors SecondaryHelicopterPresent: a shot-down craft keeps being drawn
+    // while it falls and where it lands, even though UpdateDropship has already
+    // released the slot back to Idle.
+    if (g_secondaryHelicopterDead) return scene.showHelicopter;
     return g_stressTestMode || g_game.vehicles.DropshipActive();
 }
 
@@ -1892,6 +1937,12 @@ static void DamageHelicopter(float damage, const XMFLOAT3& hit) {
 // an inbound reinforcement dropship. Both are shootable; a wave can be turned
 // back by killing the craft before it unloads.
 static bool SecondaryHelicopterPresent() {
+    // A downed craft stays present until it has hit the ground, and its wreck
+    // stays after that. UpdateDropship sets the state to Idle the instant the
+    // airframe dies, so without the crash terms here the falling helicopter
+    // would stop being drawn on the very frame it was destroyed.
+    if (g_secondaryHelicopterDead)
+        return g_helicopterModel != nullptr && scene.showHelicopter;
     return g_stressTestMode || g_game.vehicles.DropshipActive();
 }
 
@@ -2135,11 +2186,19 @@ static void UpdateHelicopterRotorKills() {
         g_helicopterTailRotorNode, XMVectorSet(1, 0, 0, 0), 1.10f,
         HelicopterWorldMatrix(), g_helicopterDead);
     if (SecondaryHelicopterPresent()) {
+        // This craft's own rotor nodes -- they sit at a different angle than the
+        // patrol gunship's, so the swept arc must be read from the clone.
+        const std::shared_ptr<SceneNode>& secondaryMain =
+            g_secondaryHelicopterMainRotorNode ? g_secondaryHelicopterMainRotorNode
+                                               : g_helicopterMainRotorNode;
+        const std::shared_ptr<SceneNode>& secondaryTail =
+            g_secondaryHelicopterTailRotorNode ? g_secondaryHelicopterTailRotorNode
+                                               : g_helicopterTailRotorNode;
         killed |= KillBanditsTouchingRotor(
-            g_helicopterMainRotorNode, XMVectorSet(0, 1, 0, 0), 4.75f,
+            secondaryMain, XMVectorSet(0, 1, 0, 0), 4.75f,
             SecondaryHelicopterWorldMatrix(), g_secondaryHelicopterDead);
         killed |= KillBanditsTouchingRotor(
-            g_helicopterTailRotorNode, XMVectorSet(1, 0, 0, 0), 1.10f,
+            secondaryTail, XMVectorSet(1, 0, 0, 0), 1.10f,
             SecondaryHelicopterWorldMatrix(), g_secondaryHelicopterDead);
     }
     if (killed) PlayBanditDeathEvents();
@@ -2175,7 +2234,9 @@ static void UpdateEnemyHelicopterDamageSmoke(float deltaTime) {
     trail(vehicles.HelicopterDamageSeverity(), g_helicopterCrashed,
           primaryTimer, g_helicopterPosition, g_helicopterYaw);
 
-    if (g_stressTestMode) {
+    // Any time the second airframe is in play -- stress-test patrol, an inbound
+    // reinforcement wave, or a crash still falling -- a damaged one trails smoke.
+    if (SecondaryHelicopterPresent()) {
         static float secondaryTimer = 0.0f;
         trail(vehicles.SecondaryHelicopterDamageSeverity(),
               g_secondaryHelicopterCrashed, secondaryTimer,
@@ -2301,9 +2362,8 @@ static void UpdateHelicopter(float dt) {
     XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
     scene.SpawnHostileProjectile(muzzle, shotDirection);
     scene.SpawnWeaponSmoke(muzzle, shotDirection, 0.8f);
-    const float distance = std::sqrt(distanceSq);
-    const float volume = (std::max)(0.10f, 0.68f * (1.0f - distance / 90.0f));
-    g_gunAudio.Play(volume, 0.82f + ((float)std::rand() / RAND_MAX) * 0.08f);
+    g_gunAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 0.68f,
+                      0.82f + ((float)std::rand() / RAND_MAX) * 0.08f, 120.0f);
     g_helicopterFireCooldown = 0.10f;
 }
 
@@ -2439,12 +2499,73 @@ static void CallInReinforcementWave() {
     constexpr float kEntryDistance = 210.0f;
 
     const XMFLOAT3 player = scene.camera.Position;
-    const float dropX = player.x + std::sin(bearing) * kDropDistance;
-    const float dropZ = player.z + std::cos(bearing) * kDropDistance;
+    float dropX = player.x + std::sin(bearing) * kDropDistance;
+    float dropZ = player.z + std::cos(bearing) * kDropDistance;
+    float laneX = std::sin(bearing);
+    float laneZ = std::cos(bearing);
+
+    // Once the exfil is on the water, reinforcements are dropped between the
+    // player and the boat instead of on a random bearing: the garrison's job at
+    // that point is to stand between the player and the way off the island, and
+    // a squad landing behind them is not doing it.
+    //
+    // They cannot be put AT the boat -- it floats 42 m offshore and troops
+    // rappel onto terrain (see SpawnDropshipBandit), so a drop over open water
+    // would rope a squad into the sea. Instead, walk inward from the boat along
+    // its own bearing and take the first point that is genuinely dry land. That
+    // lands the blocking force on the beach the player has to cross.
+    if (vehicles.EscapeBoatReady()) {
+        const XMFLOAT3& boat = vehicles.escapeBoatPosition;
+        const float toBoatX = boat.x - player.x;
+        const float toBoatZ = boat.z - player.z;
+        const float toBoatLength =
+            std::sqrt(toBoatX * toBoatX + toBoatZ * toBoatZ);
+        if (toBoatLength > 0.001f) {
+            laneX = toBoatX / toBoatLength;
+            laneZ = toBoatZ / toBoatLength;
+
+            // Step in from the boat until the ground clears the waterline. The
+            // island falloff works in per-axis normalised space, so a fixed
+            // world offset would miss the beach on a stretched island -- this
+            // samples the real height instead of assuming a shore radius.
+            constexpr float kMinBeachHeight = 0.6f;
+            constexpr float kSearchStep = 4.0f;
+            constexpr int kMaxSearchSteps = 14;
+            // Never land them on top of the player, however far in dry land
+            // turns out to start.
+            constexpr float kMinPlayerClearance = 18.0f;
+
+            bool foundShore = false;
+            for (int step = 0; step <= kMaxSearchSteps; ++step) {
+                const float distanceFromBoat =
+                    static_cast<float>(step) * kSearchStep;
+                if (distanceFromBoat >= toBoatLength - kMinPlayerClearance)
+                    break;
+                const float candidateX = boat.x - laneX * distanceFromBoat;
+                const float candidateZ = boat.z - laneZ * distanceFromBoat;
+                if (GroundHeightAt(candidateX, candidateZ) < kMinBeachHeight)
+                    continue;
+                dropX = candidateX;
+                dropZ = candidateZ;
+                foundShore = true;
+                break;
+            }
+            // No dry ground between the two (the player is already at the
+            // water's edge, or swimming). Fall back to the standard offset
+            // along the boat lane so the wave still arrives from that side.
+            if (!foundShore) {
+                dropX = player.x + laneX * kDropDistance;
+                dropZ = player.z + laneZ * kDropDistance;
+            }
+        }
+    }
+
     const XMFLOAT3 drop{ dropX, GroundHeightAt(dropX, dropZ), dropZ };
 
-    const float entryX = player.x + std::sin(bearing) * kEntryDistance;
-    const float entryZ = player.z + std::cos(bearing) * kEntryDistance;
+    // Fly in from beyond the drop, along the same lane, so the craft crosses the
+    // water the player is heading for rather than appearing inland behind them.
+    const float entryX = dropX + laneX * kEntryDistance;
+    const float entryZ = dropZ + laneZ * kEntryDistance;
     const XMFLOAT3 entry{ entryX,
                           GroundHeightAt(entryX, entryZ) +
                               VehicleSystem::DropshipHoverHeight + 14.0f,
@@ -2452,10 +2573,14 @@ static void CallInReinforcementWave() {
 
     const int troops = DropshipWaveTroopCount(vehicles.dropshipWavesCalled);
     vehicles.BeginDropshipRun(entry, drop, troops);
-    // Exfil appears with the first wave, out along the lane the aircraft just
-    // came in on. Ocean surface is y = 0 -- see the g_ocean.Initialize call
-    // (centre -kSeaDepth/2, height kSeaDepth).
-    vehicles.PlaceEscapeBoatOnDropshipLane(0.0f);
+    // Exfil appears with the FIRST wave, on its own rolled bearing rather than
+    // the lane that wave flew in on -- the way out should not be deducible from
+    // where the enemy came from. Idempotent, so later waves leave it where it
+    // is. At this point EscapeBoatReady() was still false above, so this wave
+    // used the random drop bearing; every later wave sees the boat and drops on
+    // the shore in front of it instead. Ocean surface is y = 0; see the
+    // g_ocean.Initialize call (centre -kSeaDepth/2, height kSeaDepth).
+    vehicles.PlaceEscapeBoatOnBearing(RandomUnit() * XM_2PI, 0.0f);
     SGE_LOG("LogGameplay", EngineLog::Level::Display,
         "Reinforcement wave " + std::to_string(vehicles.dropshipWavesCalled) +
         " inbound with " + std::to_string(troops) + " troops");
@@ -2512,10 +2637,46 @@ static void UpdateReinforcementDropship(float dt) {
 }
 
 static void UpdateSecondaryHelicopter(float dt) {
+    if (!g_helicopterModel || !scene.showHelicopter) return;
+
+    // Spin this airframe's own blades. Runs before the DropshipActive bail-out
+    // below, because the dropship steers the craft's POSITION but nothing else
+    // turns its rotors -- and on its own clone, so a dead patrol gunship no
+    // longer stops the reinforcement helicopter's blades along with its own.
+    if (SecondaryHelicopterPresent()) {
+        g_secondaryHelicopterRotorSpeedScale =
+            VehicleSystem::StepHelicopterRotorSpeed(
+                g_secondaryHelicopterRotorSpeedScale,
+                !g_secondaryHelicopterDead, dt);
+        g_secondaryHelicopterMainRotorAngle = std::fmod(
+            g_secondaryHelicopterMainRotorAngle +
+                dt * 24.0f * g_secondaryHelicopterRotorSpeedScale, XM_2PI);
+        g_secondaryHelicopterTailRotorAngle = std::fmod(
+            g_secondaryHelicopterTailRotorAngle +
+                dt * 38.0f * g_secondaryHelicopterRotorSpeedScale, XM_2PI);
+        if (g_secondaryHelicopterMainRotorNode)
+            XMStoreFloat4(&g_secondaryHelicopterMainRotorNode->rotation,
+                XMQuaternionRotationAxis(XMVectorSet(0, 1, 0, 0),
+                                         g_secondaryHelicopterMainRotorAngle));
+        if (g_secondaryHelicopterTailRotorNode)
+            XMStoreFloat4(&g_secondaryHelicopterTailRotorNode->rotation,
+                XMQuaternionRotationAxis(XMVectorSet(1, 0, 0, 0),
+                                         g_secondaryHelicopterTailRotorAngle));
+        if (g_secondaryHelicopterModel) {
+            XMFLOAT4X4 identity;
+            XMStoreFloat4x4(&identity, XMMatrixIdentity());
+            g_secondaryHelicopterModel->UpdateGlobalTransform(identity);
+        }
+    }
+
     // The dropship owns the airframe while a wave is in the air, so the patrol
     // path must not fight it for the same position fields.
     if (g_game.vehicles.DropshipActive()) return;
-    if (!g_stressTestMode || !g_helicopterModel || !scene.showHelicopter) return;
+    // A downed airframe falls wherever it was shot down, stress test or not.
+    // UpdateDropship drops straight to Idle the moment the craft dies, so
+    // outside the stress test this crash is the ONLY thing still simulating it
+    // -- gating the whole function on g_stressTestMode (as it once was) made a
+    // shot-down reinforcement helicopter freeze mid-air and then vanish.
     if (g_secondaryHelicopterDead) {
         if (g_secondaryHelicopterCrashed) return;
         g_secondaryHelicopterCrashVelocity.y -= 9.81f * dt;
@@ -2549,6 +2710,10 @@ static void UpdateSecondaryHelicopter(float dt) {
         }
         return;
     }
+
+    // Only the stress test flies a second live patrol. Otherwise this airframe
+    // exists solely as the reinforcement dropship, which UpdateDropship steers.
+    if (!g_stressTestMode) return;
 
     g_secondaryHelicopterHoverTime += dt;
     const float patrolPhase = g_secondaryHelicopterHoverTime * 0.105f + XM_PI;
@@ -2614,9 +2779,8 @@ static void UpdateSecondaryHelicopter(float dt) {
     XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
     scene.SpawnHostileProjectile(muzzle, shotDirection);
     scene.SpawnWeaponSmoke(muzzle, shotDirection, 0.8f);
-    const float distance = std::sqrt(distanceSq);
-    g_gunAudio.Play((std::max)(0.10f, 0.68f * (1.0f - distance / 90.0f)),
-                    0.82f + ((float)std::rand() / RAND_MAX) * 0.08f);
+    g_gunAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 0.68f,
+                      0.82f + ((float)std::rand() / RAND_MAX) * 0.08f, 120.0f);
     g_secondaryHelicopterFireCooldown = 0.10f;
 }
 
@@ -2864,6 +3028,11 @@ static void ApplyBanditLoadout(SkinnedEnemy& bandit) {
     }
 }
 
+// Distance at which an enemy voice fades out. Matches the 38 m the old manual
+// falloff used, so voices carry exactly as far as they always did -- only the
+// direction is new.
+static constexpr float kBanditVoiceRange = 38.0f;
+
 static float BanditVoiceVolume(const XMFLOAT3& position, float peak = 0.78f) {
     const float dx = position.x - scene.camera.Position.x;
     const float dy = position.y - scene.camera.Position.y;
@@ -2876,7 +3045,9 @@ static void PlayBanditDeathEvents() {
     for (auto& bandit : g_bandits) {
         if (!bandit || !bandit->ConsumeDeathEvent()) continue;
         const float pitch = 0.94f + ((float)std::rand() / RAND_MAX) * 0.10f;
-        g_banditDeathAudio.Play(BanditVoiceVolume(bandit->position, 0.9f), pitch);
+        g_banditDeathAudio.PlayAt(bandit->position.x, bandit->position.y,
+                                  bandit->position.z, 0.9f, pitch,
+                                  kBanditVoiceRange);
     }
 }
 
@@ -8118,10 +8289,9 @@ static void UpdateOneAATurret(size_t turretIndex, float deltaTime) {
     scene.SpawnExplosionFX(muzzle, 0.9f, 0.09f);
     scene.SpawnWeaponSmoke(muzzle, shotDirection, 1.1f);
 
-    const float distance = std::sqrt(rangeSq(scene.camera.Position));
-    const float volume = (std::max)(0.12f,
-        0.85f * (1.0f - distance / VehicleSystem::AATurretAirRange));
-    g_gunAudio.Play(volume, 0.62f + ((float)std::rand() / RAND_MAX) * 0.06f);
+    g_gunAudio.PlayAt(muzzle.x, muzzle.y, muzzle.z, 0.85f,
+                      0.62f + ((float)std::rand() / RAND_MAX) * 0.06f,
+                      VehicleSystem::AATurretAirRange);
 }
 
 static void UpdateAATurret(float deltaTime) {
@@ -8534,12 +8704,48 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
                                             transform.position[1],
                                             transform.position[2] }});
     }
+    scene.weaponPickups.clear();
     if (plan.humveeSpawn) {
         const Transform& humvee = *plan.humveeSpawn;
         g_primaryHumveeSpawn = { humvee.position[0],
                                  humvee.position[1],
                                  humvee.position[2] };
         g_primaryHumveeYaw = humvee.rotation[1];
+
+        // An RPG lying beside the Humvee, collected by walking over it. Offset
+        // along the vehicle's right flank rather than a world axis, so it sits
+        // next to the door whichever way the Humvee was authored to face -- and
+        // clear of the 2.6x1.5 m chassis obstacle pushed into the nav grid.
+        const float humveeYaw = XMConvertToRadians(g_primaryHumveeYaw);
+        const float rightX = std::cos(humveeYaw);
+        const float rightZ = -std::sin(humveeYaw);
+        constexpr float kFlankOffset = 4.6f;
+        const float pickupX = g_primaryHumveeSpawn.x + rightX * kFlankOffset;
+        const float pickupZ = g_primaryHumveeSpawn.z + rightZ * kFlankOffset;
+
+        // Ground it on the terrain instead of the Humvee's own Y: the vehicle
+        // spawn sits at chassis centre, which would float the rocket at waist
+        // height and put it outside the pickup's vertical range on a slope.
+        //
+        // Sculpt stamps are pushed into the terrain later in this same load (see
+        // the SetSculptStamps call below), and HeightAt reads them from a static.
+        // Passing the level's stamps explicitly samples the ground the player
+        // will actually walk on rather than the unsculpted surface.
+        auto terrainParams = CurrentTerrainParams();
+        terrainParams.heightScale = scene.terrainHeightScale;
+        const float groundY = TerrainRendererDX12::HeightAt(
+            terrainParams, pickupX, pickupZ, g_game.world.TerrainSculpt());
+
+        WeaponPickup rocket;
+        // Hovers at roughly knee height. The mesh is centred on its own Y, so
+        // this is the centreline of the launcher, not its underside.
+        rocket.position = { pickupX, groundY + 0.85f, pickupZ };
+        rocket.yawRadians = humveeYaw;
+        rocket.weapon = 2;      // RPG-7
+        rocket.magazine = 1;    // one loaded, matching the launcher's mag size
+        rocket.reserve = 4;
+        rocket.active = true;
+        scene.weaponPickups.push_back(rocket);
     }
     if (plan.helicopterSpawn) {
         const Transform& helicopter = *plan.helicopterSpawn;
@@ -8818,59 +9024,233 @@ static void RestartActiveLevel(HWND hwnd) {
 
 static void RenderLoadingScreen();
 
+// ---- Shared UI theme -------------------------------------------------------
+//
+// The HUD is hand-drawn with ImDrawList in a dark plate + pale text palette
+// (see RenderPlayerHUD), while every menu ran on stock StyleColorsDark. The two
+// did not look like the same game. These constants are the HUD's own colours
+// promoted to a shared vocabulary, and ApplyEngineUITheme pushes them into
+// ImGui so windows, buttons and sliders inherit them.
+//
+// Kept as ImVec4 rather than IM_COL32 because ImGuiStyle stores floats; the
+// HUD's integer literals are the same values over 255.
+namespace UITheme {
+// Near-black with a green cast, matching the HUD's IM_COL32(8, 12, 10, 180)
+// backing plates.
+inline const ImVec4 kPanel        = ImVec4(0.031f, 0.047f, 0.039f, 0.960f);
+inline const ImVec4 kPanelRaised  = ImVec4(0.055f, 0.075f, 0.063f, 1.000f);
+inline const ImVec4 kControl      = ImVec4(0.086f, 0.114f, 0.098f, 1.000f);
+inline const ImVec4 kControlHover = ImVec4(0.137f, 0.180f, 0.153f, 1.000f);
+inline const ImVec4 kControlHeld  = ImVec4(0.196f, 0.255f, 0.216f, 1.000f);
+// The HUD's healthy-green, used as the single accent so a highlighted control
+// and a full health bar are recognisably the same colour.
+inline const ImVec4 kAccent       = ImVec4(0.149f, 0.698f, 0.322f, 1.000f);
+inline const ImVec4 kAccentDim    = ImVec4(0.110f, 0.463f, 0.227f, 1.000f);
+inline const ImVec4 kText         = ImVec4(0.886f, 0.918f, 0.882f, 1.000f);
+inline const ImVec4 kTextDim      = ImVec4(0.514f, 0.573f, 0.529f, 1.000f);
+inline const ImVec4 kBorder       = ImVec4(0.259f, 0.318f, 0.278f, 0.725f);
+inline const ImVec4 kWarning      = ImVec4(1.000f, 0.784f, 0.235f, 1.000f);
+} // namespace UITheme
+
+// Applies the theme above to the global ImGui style. Called once at init.
+static void ApplyEngineUITheme() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImGui::StyleColorsDark(&style);
+
+    // Geometry first. Softer corners and a consistent rhythm of padding do more
+    // for "modern" than any colour change -- stock ImGui's 0-radius frames and
+    // tight 4 px spacing are what read as a debug tool.
+    style.WindowRounding    = 8.0f;
+    style.ChildRounding     = 6.0f;
+    style.FrameRounding     = 5.0f;
+    style.PopupRounding     = 6.0f;
+    style.ScrollbarRounding = 6.0f;
+    style.GrabRounding      = 5.0f;
+    style.TabRounding       = 5.0f;
+
+    style.WindowPadding     = ImVec2(18.0f, 16.0f);
+    style.FramePadding      = ImVec2(12.0f, 7.0f);
+    style.ItemSpacing       = ImVec2(10.0f, 9.0f);
+    style.ItemInnerSpacing  = ImVec2(8.0f, 6.0f);
+    style.ScrollbarSize     = 12.0f;
+    style.GrabMinSize       = 11.0f;
+
+    // Hairline borders. A 1 px edge on panels separates them from the scene
+    // behind without the heavy frames stock ImGui draws.
+    style.WindowBorderSize  = 1.0f;
+    style.FrameBorderSize   = 1.0f;
+    style.PopupBorderSize   = 1.0f;
+    style.ChildBorderSize   = 1.0f;
+
+    // Titles and most labels centre in these panels, which are all fixed-size
+    // and centred themselves.
+    style.WindowTitleAlign  = ImVec2(0.5f, 0.5f);
+    style.ButtonTextAlign   = ImVec2(0.5f, 0.5f);
+
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_WindowBg]             = UITheme::kPanel;
+    colors[ImGuiCol_ChildBg]              = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    colors[ImGuiCol_PopupBg]              = UITheme::kPanelRaised;
+    colors[ImGuiCol_Border]               = UITheme::kBorder;
+    colors[ImGuiCol_BorderShadow]         = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    colors[ImGuiCol_Text]                 = UITheme::kText;
+    colors[ImGuiCol_TextDisabled]         = UITheme::kTextDim;
+
+    colors[ImGuiCol_FrameBg]              = UITheme::kControl;
+    colors[ImGuiCol_FrameBgHovered]       = UITheme::kControlHover;
+    colors[ImGuiCol_FrameBgActive]        = UITheme::kControlHeld;
+
+    colors[ImGuiCol_TitleBg]              = UITheme::kPanel;
+    colors[ImGuiCol_TitleBgActive]        = UITheme::kPanelRaised;
+    colors[ImGuiCol_TitleBgCollapsed]     = UITheme::kPanel;
+    colors[ImGuiCol_MenuBarBg]            = UITheme::kPanelRaised;
+
+    colors[ImGuiCol_Button]               = UITheme::kControl;
+    colors[ImGuiCol_ButtonHovered]        = UITheme::kControlHover;
+    colors[ImGuiCol_ButtonActive]         = UITheme::kControlHeld;
+
+    colors[ImGuiCol_Header]               = UITheme::kAccentDim;
+    colors[ImGuiCol_HeaderHovered]        = UITheme::kControlHover;
+    colors[ImGuiCol_HeaderActive]         = UITheme::kAccent;
+
+    colors[ImGuiCol_CheckMark]            = UITheme::kAccent;
+    colors[ImGuiCol_SliderGrab]           = UITheme::kAccentDim;
+    colors[ImGuiCol_SliderGrabActive]     = UITheme::kAccent;
+
+    colors[ImGuiCol_Separator]            = UITheme::kBorder;
+    colors[ImGuiCol_SeparatorHovered]     = UITheme::kAccentDim;
+    colors[ImGuiCol_SeparatorActive]      = UITheme::kAccent;
+
+    colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.024f, 0.035f, 0.031f, 0.6f);
+    colors[ImGuiCol_ScrollbarGrab]        = UITheme::kControlHover;
+    colors[ImGuiCol_ScrollbarGrabHovered] = UITheme::kControlHeld;
+    colors[ImGuiCol_ScrollbarGrabActive]  = UITheme::kAccentDim;
+
+    colors[ImGuiCol_Tab]                  = UITheme::kControl;
+    colors[ImGuiCol_TabHovered]           = UITheme::kControlHover;
+    colors[ImGuiCol_ResizeGrip]           = UITheme::kBorder;
+    colors[ImGuiCol_ResizeGripHovered]    = UITheme::kAccentDim;
+    colors[ImGuiCol_ResizeGripActive]     = UITheme::kAccent;
+
+    colors[ImGuiCol_PlotHistogram]        = UITheme::kAccent;
+    colors[ImGuiCol_PlotHistogramHovered] = UITheme::kWarning;
+}
+
+// A centred section label with a hairline rule either side -- the menus' one
+// piece of structure, so groups of buttons stop reading as an undifferentiated
+// stack. Width is the content region, so it tracks whatever panel it is in.
+static void UISectionLabel(const char* label) {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float startX = ImGui::GetCursorScreenPos().x;
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    const float y = ImGui::GetCursorScreenPos().y + textSize.y * 0.5f;
+    const float sideWidth =
+        (std::max)(0.0f, (width - textSize.x) * 0.5f - 10.0f);
+    const ImU32 rule = ImGui::GetColorU32(UITheme::kBorder);
+    if (sideWidth > 4.0f) {
+        draw->AddLine(ImVec2(startX, y),
+                      ImVec2(startX + sideWidth, y), rule, 1.0f);
+        draw->AddLine(ImVec2(startX + width - sideWidth, y),
+                      ImVec2(startX + width, y), rule, 1.0f);
+    }
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (width - textSize.x) * 0.5f);
+    ImGui::TextColored(UITheme::kTextDim, "%s", label);
+}
+
+// Full-width button that keeps the menus on one rhythm instead of every call
+// site repeating a hand-computed SetCursorPosX and a magic width.
+static bool UIMenuButton(const char* label, float height = 46.0f) {
+    return ImGui::Button(label, ImVec2(ImGui::GetContentRegionAvail().x, height));
+}
+
+// As above, but drawn in the accent colour for the one primary action on a
+// screen. Exactly one per panel -- if everything is emphasised, nothing is.
+static bool UIPrimaryButton(const char* label, float height = 52.0f) {
+    ImGui::PushStyleColor(ImGuiCol_Button, UITheme::kAccentDim);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccent);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, UITheme::kAccent);
+    const bool pressed = UIMenuButton(label, height);
+    ImGui::PopStyleColor(3);
+    return pressed;
+}
+
 static void RenderMainMenu(HWND hwnd) {
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     ImGui::GetBackgroundDrawList()->AddRectFilled(
         ImVec2(0, 0), display, IM_COL32(5, 9, 12, 225));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    const float menuHeight = (std::min)(730.0f, display.y - 24.0f);
-    ImGui::SetNextWindowSize(ImVec2(430.0f, menuHeight), ImGuiCond_Always);
+    const float menuHeight = (std::min)(700.0f, display.y - 24.0f);
+    ImGui::SetNextWindowSize(ImVec2(400.0f, menuHeight), ImGuiCond_Always);
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse;
     ImGui::Begin("Main Menu", nullptr, flags);
-    ImGui::Dummy(ImVec2(0.0f, 20.0f));
-    const char* title = "SMALLEST GRAPHICS ENGINE";
-    ImGui::SetCursorPosX((430.0f - ImGui::CalcTextSize(title).x) * 0.5f);
-    ImGui::TextUnformatted(title);
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    const char* subtitle = "LEVEL SELECT";
-    ImGui::SetCursorPosX((430.0f - ImGui::CalcTextSize(subtitle).x) * 0.5f);
-    ImGui::TextDisabled("%s", subtitle);
-    ImGui::Dummy(ImVec2(0.0f, 22.0f));
-    ImGui::SetCursorPosX(65.0f);
-    if (ImGui::Button("LEVEL 1", ImVec2(300.0f, 58.0f)))
+
+    // Title block. The accent rule under the wordmark is the one piece of colour
+    // on the screen, which is what makes the primary action below read as
+    // belonging to it.
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    const float contentWidth = ImGui::GetContentRegionAvail().x;
+    const char* title = "SMALLEST";
+    const char* titleTail = "GRAPHICS ENGINE";
+    const ImVec2 titleSize = ImGui::CalcTextSize(title);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                         (contentWidth - titleSize.x) * 0.5f);
+    ImGui::TextColored(UITheme::kAccent, "%s", title);
+    const ImVec2 tailSize = ImGui::CalcTextSize(titleTail);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                         (contentWidth - tailSize.x) * 0.5f);
+    ImGui::TextUnformatted(titleTail);
+
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    {
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const ImVec2 cursor = ImGui::GetCursorScreenPos();
+        constexpr float ruleWidth = 56.0f;
+        const float ruleX = cursor.x + (contentWidth - ruleWidth) * 0.5f;
+        draw->AddRectFilled(ImVec2(ruleX, cursor.y),
+                            ImVec2(ruleX + ruleWidth, cursor.y + 2.0f),
+                            ImGui::GetColorU32(UITheme::kAccent), 1.0f);
+    }
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+
+    // Play: the one thing most sessions start with, so it carries the accent and
+    // extra height. Everything below is a secondary route.
+    UISectionLabel("DEPLOY");
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
+    if (UIPrimaryButton("LEVEL 1"))
         StartLevelOne(hwnd, false);
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::SetCursorPosX(65.0f);
-    if (ImGui::Button("LEVEL 1 - GOD MODE", ImVec2(300.0f, 58.0f)))
-        StartLevelOne(hwnd, true, false, false, nullptr, true);
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::SetCursorPosX(65.0f);
-    if (ImGui::Button("LEVEL EDITOR", ImVec2(300.0f, 58.0f)))
-        StartLevelEditor(hwnd);
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::SetCursorPosX(65.0f);
-    if (ImGui::Button("DXR DDGI CORNELL BOX", ImVec2(300.0f, 58.0f)))
-        StartDDGICornellTest(hwnd);
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::SetCursorPosX(65.0f);
-    if (ImGui::Button("CUSTOM LEVELS", ImVec2(300.0f, 58.0f)))
+    if (UIMenuButton("CUSTOM LEVELS"))
         BrowseAndStartCustomLevel(hwnd);
     if (!g_mainMenuLevelStatus.empty())
         ImGui::TextWrapped("%s", g_mainMenuLevelStatus.c_str());
+
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::SetCursorPosX(65.0f);
-    if (ImGui::Button("EMPTY", ImVec2(300.0f, 58.0f)))
+    UISectionLabel("TOOLS");
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
+    if (UIMenuButton("LEVEL EDITOR"))
+        StartLevelEditor(hwnd);
+
+    // Everything below is a development entry point rather than a way to play.
+    // Grouping them under their own heading keeps the top of the menu about the
+    // game without hiding the tools.
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    UISectionLabel("SANDBOX");
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
+    if (UIMenuButton("LEVEL 1 - GOD MODE", 38.0f))
+        StartLevelOne(hwnd, true, false, false, nullptr, true);
+    if (UIMenuButton("DXR DDGI CORNELL BOX", 38.0f))
+        StartDDGICornellTest(hwnd);
+    if (UIMenuButton("EMPTY", 38.0f))
         StartLevelOne(hwnd, true, false, true);
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::SetCursorPosX(65.0f);
-    if (ImGui::Button("STRESS TEST", ImVec2(300.0f, 58.0f)))
+    if (UIMenuButton("STRESS TEST", 38.0f))
         StartLevelOne(hwnd, true, true);
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    ImGui::SetCursorPosX(65.0f);
-    if (ImGui::Button("QUIT", ImVec2(300.0f, 42.0f)))
+
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
+    if (UIMenuButton("QUIT", 36.0f))
         PostQuitMessage(0);
     ImGui::End();
     if (g_game.loading.Active()) RenderLoadingScreen();
@@ -8985,22 +9365,33 @@ static void RenderDeathScreen(HWND hwnd) {
         ImVec2(0, 0), display, IM_COL32(25, 0, 0, 190));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(390.0f, 235.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(380.0f, 230.0f), ImGuiCond_Always);
     ImGui::Begin("Death Screen", nullptr, ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse);
-    ImGui::Dummy(ImVec2(0.0f, 15.0f));
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
     const char* died = "YOU DIED";
-    ImGui::SetCursorPosX((390.0f - ImGui::CalcTextSize(died).x) * 0.5f);
-    ImGui::TextColored(ImVec4(1.0f, 0.12f, 0.08f, 1.0f), "%s", died);
-    ImGui::Dummy(ImVec2(0.0f, 20.0f));
-    ImGui::SetCursorPosX(45.0f);
-    if (ImGui::Button(g_activeCustomLevelName.empty() ? "RESTART LEVEL 1" :
-            "RESTART CUSTOM LEVEL", ImVec2(300.0f, 55.0f)))
+    const float deathWidth = ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                         (deathWidth - ImGui::CalcTextSize(died).x) * 0.5f);
+    ImGui::TextColored(ImVec4(1.0f, 0.28f, 0.22f, 1.0f), "%s", died);
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    {
+        ImDrawList* deathDraw = ImGui::GetWindowDrawList();
+        const ImVec2 cursor = ImGui::GetCursorScreenPos();
+        constexpr float ruleWidth = 44.0f;
+        const float ruleX = cursor.x + (deathWidth - ruleWidth) * 0.5f;
+        deathDraw->AddRectFilled(ImVec2(ruleX, cursor.y),
+                                 ImVec2(ruleX + ruleWidth, cursor.y + 2.0f),
+                                 IM_COL32(224, 62, 48, 235), 1.0f);
+    }
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+    // Restart carries the accent: on a death screen it is what the player
+    // almost always wants, and making them find it among equals costs a beat.
+    if (UIPrimaryButton(g_activeCustomLevelName.empty() ? "RESTART LEVEL 1" :
+            "RESTART CUSTOM LEVEL"))
         RestartActiveLevel(hwnd);
-    ImGui::Dummy(ImVec2(0.0f, 9.0f));
-    ImGui::SetCursorPosX(45.0f);
-    if (ImGui::Button("MAIN MENU", ImVec2(300.0f, 45.0f)))
+    if (UIMenuButton("MAIN MENU", 40.0f))
         OpenMainMenu();
     ImGui::End();
 }
@@ -9295,10 +9686,10 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     const auto timeButton = [&](TimeOfDay time, float width) {
         const bool selected = g_selectedTimeOfDay == time;
         if (selected) {
-            ImGui::PushStyleColor(
-                ImGuiCol_Button, ImVec4(0.12f, 0.48f, 0.22f, 1.0f));
-            ImGui::PushStyleColor(
-                ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.58f, 0.28f, 1.0f));
+            // Theme accent, so "this option is chosen" looks the same here as it
+            // does everywhere else in the UI.
+            ImGui::PushStyleColor(ImGuiCol_Button, UITheme::kAccentDim);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccent);
         }
         if (ImGui::Button(TimeOfDayName(time), ImVec2(width, 30.0f)) &&
             !selected) {
@@ -9484,7 +9875,14 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                            "Selected weapon asset is unavailable");
     ImGui::BeginDisabled(g_selectedDeploymentZone < 0 || !weaponsReady);
     ImGui::SetCursorPosX(45.0f);
-    if (ImGui::Button("DEPLOY", ImVec2(340.0f, 48.0f))) {
+    // The one action this whole screen exists to reach, so it carries the accent
+    // colour. Every other control here only edits the plan.
+    ImGui::PushStyleColor(ImGuiCol_Button, UITheme::kAccentDim);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccent);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, UITheme::kAccent);
+    const bool deployPressed = ImGui::Button("DEPLOY", ImVec2(340.0f, 48.0f));
+    ImGui::PopStyleColor(3);
+    if (deployPressed) {
         if (scene.player.godMode) {
             GunModel::DisableLoadoutRestriction();
             GunModel::SelectedWeapon() = loadout.weapons[0];
@@ -9533,8 +9931,8 @@ static void RenderWinScreen(HWND hwnd) {
         ImVec2(0, 0), display, IM_COL32(0, 22, 12, 215));
     ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    const float panelHeight = (std::min)(620.0f, display.y - 20.0f);
-    ImGui::SetNextWindowSize(ImVec2(540.0f, panelHeight), ImGuiCond_Always);
+    const float panelHeight = (std::min)(640.0f, display.y - 20.0f);
+    ImGui::SetNextWindowSize(ImVec2(580.0f, panelHeight), ImGuiCond_Always);
     ImGui::Begin("Win Screen", nullptr, ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse);
@@ -9547,17 +9945,47 @@ static void RenderWinScreen(HWND hwnd) {
     const bool primaryFailed = report.primaryObjectivePresent &&
                                !report.primaryObjectiveComplete;
     const char* won = primaryFailed ? "OBJECTIVE FAILED" : "MISSION COMPLETE";
-    ImGui::SetCursorPosX((540.0f - ImGui::CalcTextSize(won).x) * 0.5f);
+    const float winWidth = ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                         (winWidth - ImGui::CalcTextSize(won).x) * 0.5f);
     ImGui::TextColored(primaryFailed ? ImVec4(1.0f, 0.42f, 0.20f, 1.0f)
-                                     : ImVec4(0.25f, 1.0f, 0.42f, 1.0f),
+                                     : UITheme::kAccent,
                        "%s", won);
+
+    // Rank as the hero element, with the score as a filled track beneath it.
+    // The bar is what turns "68 / 100" into something readable at a glance --
+    // the number alone gave no sense of how close the next grade was.
     const char* rank = MissionRankName(report.rank);
-    ImGui::SetWindowFontScale(2.2f);
-    ImGui::SetCursorPosX((540.0f - ImGui::CalcTextSize(rank).x) * 0.5f);
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    ImGui::SetWindowFontScale(2.6f);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                         (winWidth - ImGui::CalcTextSize(rank).x) * 0.5f);
     ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.24f, 1.0f), "%s", rank);
     ImGui::SetWindowFontScale(1.0f);
-    ImGui::SetCursorPosX(195.0f);
-    ImGui::Text("%d / 100", report.totalScore);
+
+    {
+        char scoreText[32];
+        snprintf(scoreText, sizeof(scoreText), "%d / 100", report.totalScore);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             (winWidth - ImGui::CalcTextSize(scoreText).x) * 0.5f);
+        ImGui::TextUnformatted(scoreText);
+
+        ImDrawList* winDraw = ImGui::GetWindowDrawList();
+        const ImVec2 cursor = ImGui::GetCursorScreenPos();
+        const float trackWidth = winWidth * 0.62f;
+        const float trackX = cursor.x + (winWidth - trackWidth) * 0.5f;
+        const float scoreFraction = (std::max)(0.0f, (std::min)(1.0f,
+            static_cast<float>(report.totalScore) / 100.0f));
+        winDraw->AddRectFilled(ImVec2(trackX, cursor.y + 3.0f),
+                               ImVec2(trackX + trackWidth, cursor.y + 9.0f),
+                               IM_COL32(6, 10, 8, 215), 3.0f);
+        if (scoreFraction > 0.0f)
+            winDraw->AddRectFilled(
+                ImVec2(trackX, cursor.y + 3.0f),
+                ImVec2(trackX + trackWidth * scoreFraction, cursor.y + 9.0f),
+                IM_COL32(255, 209, 61, 245), 3.0f);
+        ImGui::Dummy(ImVec2(0.0f, 14.0f));
+    }
 
     ImGui::SeparatorText("DEPLOYMENT");
     ImGui::Text("%s + %s", GunModel::WeaponName(loadout.weapons[0]),
@@ -9572,28 +10000,39 @@ static void RenderWinScreen(HWND hwnd) {
     const int seconds = (totalMilliseconds / 1000) % 60;
     const int milliseconds = totalMilliseconds % 1000;
     ImGui::SeparatorText("SCORE BREAKDOWN");
+    // Right-aligns the "N / M" column against the panel edge. The old fixed
+    // SameLine(410) was measured for one exact window width and padding, so any
+    // change to either left the column floating mid-row.
+    const auto scoreColumn = [](int earned, int available) {
+        char text[24];
+        snprintf(text, sizeof(text), "%d / %d", earned, available);
+        const float textWidth = ImGui::CalcTextSize(text).x;
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - textWidth);
+        // Dim a category that scored nothing, so the ones worth improving stand
+        // out from the ones already banked.
+        if (earned <= 0) ImGui::TextDisabled("%s", text);
+        else ImGui::TextUnformatted(text);
+    };
     ImGui::Text("Time             %02d:%02d.%03d", minutes, seconds, milliseconds);
-    ImGui::SameLine(410.0f); ImGui::Text("%2d / 15", report.timeScore);
+    scoreColumn(report.timeScore, 15);
     ImGui::Text("Accuracy         %.1f%%  (%u / %u)", report.accuracyPercent,
                 stats.shotsHit, stats.shotsFired);
-    ImGui::SameLine(410.0f); ImGui::Text("%2d / 20", report.accuracyScore);
+    scoreColumn(report.accuracyScore, 20);
     ImGui::Text("Casualties       %u / %u", report.casualties,
                 stats.friendliesDeployed);
-    ImGui::SameLine(410.0f); ImGui::Text("%2d / 15", report.casualtyScore);
+    scoreColumn(report.casualtyScore, 15);
     ImGui::Text("Optional         %u / %u", report.optionalObjectivesCompleted,
                 report.optionalObjectivesTotal);
-    ImGui::SameLine(410.0f); ImGui::Text("%2d / 15", report.optionalScore);
+    scoreColumn(report.optionalScore, 15);
     ImGui::Text("Destruction      %u events", report.destructionEvents);
-    ImGui::SameLine(410.0f); ImGui::Text("%2d / 10", report.destructionScore);
+    scoreColumn(report.destructionScore, 10);
     if (report.primaryObjectivePresent) {
         ImGui::Text("Comm towers      %u / %u down", report.commTowersDestroyed,
                     report.commTowersTotal);
     } else {
         ImGui::Text("Comm towers      none on this map");
     }
-    ImGui::SameLine(410.0f);
-    ImGui::Text("%2d / %d", report.primaryScore,
-                MissionSystem::kPrimaryObjectiveScore);
+    scoreColumn(report.primaryScore, MissionSystem::kPrimaryObjectiveScore);
 
     const auto objective = [](bool complete, const char* label) {
         ImGui::TextColored(complete
@@ -9612,14 +10051,26 @@ static void RenderWinScreen(HWND hwnd) {
     objective(report.usedSelectedGrenade, "Grenadier - throw selected grenade");
     objective(report.demolitionObjective, "Demolition - cause 5 destruction events");
 
-    ImGui::Dummy(ImVec2(0.0f, 8.0f));
-    ImGui::SetCursorPosX(45.0f);
-    if (ImGui::Button(g_activeCustomLevelName.empty() ? "REPLAY LEVEL 1" :
-            "REPLAY CUSTOM LEVEL", ImVec2(215.0f, 45.0f)))
-        RestartActiveLevel(hwnd);
-    ImGui::SameLine();
-    if (ImGui::Button("MAIN MENU", ImVec2(215.0f, 45.0f)))
-        OpenMainMenu();
+    ImGui::Dummy(ImVec2(0.0f, 12.0f));
+    // Split the row from the live content width instead of two 215 px halves at
+    // a hardcoded inset, so the pair stays centred if the panel is ever resized.
+    {
+        const float rowWidth = ImGui::GetContentRegionAvail().x;
+        const float halfWidth =
+            (rowWidth - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        ImGui::PushStyleColor(ImGuiCol_Button, UITheme::kAccentDim);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccent);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, UITheme::kAccent);
+        const bool replay = ImGui::Button(
+            g_activeCustomLevelName.empty() ? "REPLAY LEVEL 1"
+                                            : "REPLAY CUSTOM LEVEL",
+            ImVec2(halfWidth, 44.0f));
+        ImGui::PopStyleColor(3);
+        if (replay) RestartActiveLevel(hwnd);
+        ImGui::SameLine();
+        if (ImGui::Button("MAIN MENU", ImVec2(halfWidth, 44.0f)))
+            OpenMainMenu();
+    }
     ImGui::End();
 }
 
@@ -10273,6 +10724,117 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
             }
             return poly;
         };
+
+        // Roughen the cell outline so the seams read as a material tearing
+        // rather than as clean geometric cuts.
+        //
+        // The clipped polygon above is exact: every edge is a straight bisector
+        // segment, which is why an intact board's break lines look machined. This
+        // subdivides each edge and pushes the intermediate points sideways.
+        //
+        // THE CONSTRAINT THAT SHAPES THIS: adjacent cells share an edge, and the
+        // two cells compute that edge independently (each from its own clip). So
+        // the displacement cannot depend on the cell, the site, or the direction
+        // the edge happens to be walked -- if it did, neighbours would tear apart
+        // and leave visible gaps in an unbroken board. Instead it is hashed from
+        // the midpoint's QUANTISED POSITION, which both cells arrive at
+        // identically, and applied along the edge normal, which both compute as
+        // the same line. Two cells sharing an edge therefore produce the same
+        // wiggle and stay flush.
+        //
+        // Board-boundary edges are left straight: a plank's outer rectangle is
+        // its actual silhouette, and roughening it would make flush boards look
+        // gap-toothed while still assembled.
+        auto roughenCell = [&](std::vector<P2>& poly) {
+            if (poly.size() < 3) return;
+            // Position hash -> [-1, 1]. Quantised to 1 mm so both cells agree
+            // despite their clip arithmetic differing in the last few bits.
+            auto edgeNoise = [&](float mx, float my, int salt) {
+                const int qx = (int)std::lround(mx * 1000.0f);
+                const int qy = (int)std::lround(my * 1000.0f);
+                uint32_t h = (uint32_t)(qx * 73856093) ^ (uint32_t)(qy * 19349663)
+                           ^ (uint32_t)(salt * 83492791);
+                h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+                return ((h & 0xffffu) / 32767.5f) - 1.0f;
+            };
+            // Amplitude scales with the board so a stud and a wall panel get
+            // proportionate roughness. Glass shards stay crisper -- a fractured
+            // pane splits along clean lines, it does not fray.
+            const float span = (std::min)(l1 - l0, h1 - h0);
+            const float amplitude = span * (shatter ? 0.10f : 0.26f);
+            if (amplitude < 0.0008f) return;
+            constexpr float kEdgeEpsilon = 0.0015f;
+            const auto onBoundary = [&](const P2& p) {
+                return p.x <= l0 + kEdgeEpsilon || p.x >= l1 - kEdgeEpsilon ||
+                       p.y <= h0 + kEdgeEpsilon || p.y >= h1 - kEdgeEpsilon;
+            };
+
+            std::vector<P2> rough;
+            rough.reserve(poly.size() * 3);
+            for (size_t i = 0; i < poly.size(); ++i) {
+                const P2 a = poly[i], b = poly[(i + 1) % poly.size()];
+                rough.push_back(a);
+                // An edge with both ends on the board rectangle is a silhouette
+                // edge, not a fracture seam.
+                if (onBoundary(a) && onBoundary(b)) continue;
+                const float ex = b.x - a.x, ey = b.y - a.y;
+                const float len = std::sqrt(ex * ex + ey * ey);
+                if (len < 0.006f) continue;
+
+                // CANONICAL EDGE ORDER. The two cells sharing this edge walk it
+                // in opposite directions, so subdividing from each cell's own
+                // start point puts cut 1 at opposite ends and the two hash
+                // different midpoints -- which tore the cells apart. Sort the
+                // endpoints into a fixed order first, so both cells subdivide
+                // the identical parametrisation.
+                const bool flipped = (b.x < a.x) || (b.x == a.x && b.y < a.y);
+                const P2 e0 = flipped ? b : a;
+                const P2 e1 = flipped ? a : b;
+                const float dx = e1.x - e0.x, dy = e1.y - e0.y;
+                // Unit normal from the canonical direction, so both cells also
+                // agree on which way the displacement points.
+                const float nx = -dy / len, ny = dx / len;
+                // More cuts on longer edges, so roughness stays even in scale.
+                // Denser than a gentle wave needs: a splintering seam wants
+                // several direction changes along its length, not one bulge.
+                constexpr int kMaxCuts = 7;
+                const int cuts = (std::min)(kMaxCuts, (std::max)(2,
+                    (int)std::lround(len / 0.075f)));
+                // Built in canonical order, then reversed if this cell walks the
+                // edge the other way -- the polygon must stay correctly wound.
+                P2 pending[kMaxCuts];
+                for (int c = 1; c <= cuts; ++c) {
+                    const float t = (float)c / (float)(cuts + 1);
+                    const float px = e0.x + dx * t, py = e0.y + dy * t;
+                    // Taper toward the endpoints: the corners are where three
+                    // cells meet, and moving them would break that junction.
+                    // Square-rooted so the taper opens up fast and most of the
+                    // edge gets near-full amplitude -- a plain sine spent most
+                    // of its length near zero and read as a smooth bow.
+                    const float taper = std::sqrt(std::sin(t * 3.14159265f));
+                    // Alternating sign is what makes this a zigzag rather than a
+                    // wander: consecutive cuts are pushed to OPPOSITE sides of
+                    // the edge, so the seam reverses direction at every step and
+                    // leaves the sharp corners a split follows. The magnitude
+                    // still comes from the position hash, so no two seams share
+                    // a rhythm, and both cells agree because `c` is indexed in
+                    // canonical order.
+                    const float side = (c & 1) ? 1.0f : -1.0f;
+                    // Kept off zero so an unlucky hash cannot flatten a step.
+                    const float magnitude =
+                        0.45f + 0.55f * std::fabs(edgeNoise(px, py, c));
+                    const float offset = side * magnitude * amplitude * taper;
+                    P2 q{ px + nx * offset, py + ny * offset };
+                    // Never push a point outside the board rectangle.
+                    q.x = (std::max)(l0, (std::min)(l1, q.x));
+                    q.y = (std::max)(h0, (std::min)(h1, q.y));
+                    pending[c - 1] = q;
+                }
+                for (int c = 0; c < cuts; ++c)
+                    rough.push_back(pending[flipped ? (cuts - 1 - c) : c]);
+            }
+            if (rough.size() >= 3) poly.swap(rough);
+        };
         auto toWorld = [&](const P2& p, float t) {
             float w[3]; w[lAxis] = p.x; w[hAxis] = p.y; w[tAxis] = t;
             return XMFLOAT3(w[0], w[1], w[2]);
@@ -10282,7 +10844,12 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
                             axis == 2 ? 1.0f : 0.0f);
         };
         for (size_t s = 0; s < sites.size(); ++s) {
-            const std::vector<P2> poly = clipCell(s);
+            std::vector<P2> poly = clipCell(s);
+            if (poly.size() < 3) continue;
+            // Jagged the seams. Amplitude is small relative to the cell, and
+            // tapered to zero at the corners, so the result stays star-shaped
+            // about its centroid -- which the cap fan below depends on.
+            roughenCell(poly);
             if (poly.size() < 3) continue;
             auto node = std::make_shared<SceneNode>(name);
             node->mesh = std::make_shared<SceneMesh>();
@@ -11621,6 +12188,267 @@ static void ToggleHumveeDriving() {
     XMStoreFloat3(&scene.camera.Position, exitPosition);
 }
 
+// Advances the idle hover/spin on every live pickup. Collection itself is on E
+// (see CollectNearbyWeaponPickup) -- walking over one does nothing, so a pickup
+// can be walked past without silently costing the weapon in hand.
+//
+// Skipped while driving: the camera is the chase camera out behind the chassis,
+// so proximity would measure from the vehicle rather than the player.
+// Picks a footstep variant, avoiding an immediate repeat of the last one, and
+// plays it with a randomised pitch.
+//
+// `positional` is false for the player: their steps originate at the listener,
+// where panning is meaningless and the rolloff curve would put them at full
+// volume anyway.
+//
+// Pitch jitter is what makes two samples sound like many. +/-12% is wide enough
+// to disguise a repeat without the step sounding like a different surface or a
+// different-sized person.
+static void PlayFootstep(float volume, bool positional,
+                         const XMFLOAT3& position = {}, float range = 22.0f) {
+    int variant = std::rand() % kFootstepVariantCount;
+    // One retry rather than a loop: with two samples a single nudge is enough to
+    // break a repeat, and a while-loop here could spin on a degenerate rand.
+    if (variant == g_lastFootstepVariant)
+        variant = (variant + 1) % kFootstepVariantCount;
+    g_lastFootstepVariant = variant;
+
+    const float pitch = 0.88f + ((float)std::rand() / RAND_MAX) * 0.24f;
+    // Small per-step gain wobble too, so an unvarying stride does not read as a
+    // metronome even at a constant walking speed.
+    const float gain = volume * (0.88f + ((float)std::rand() / RAND_MAX) * 0.24f);
+    if (positional)
+        g_footstepAudio[variant].PlayAt(position.x, position.y, position.z,
+                                        gain, pitch, range);
+    else
+        g_footstepAudio[variant].Play(gain, pitch);
+}
+
+// Footsteps for the player and every live enemy.
+//
+// Driven by distance travelled rather than a timer, so a footfall always
+// corresponds to a step actually taken: walking into a wall makes no sound, and
+// sprinting raises the cadence for free because the distance accumulates faster.
+//
+// The player's own steps are deliberately NOT spatialised -- they come from the
+// listener's own position, where panning is meaningless and X3DAudio's rolloff
+// would put them at full volume anyway. Enemy steps are positional, which is the
+// point: hearing a patrol move behind a building is the cue the stealth systems
+// have been missing.
+static void UpdateFootsteps(float dt) {
+    if (dt <= 0.0f || g_emptyLevelMode) return;
+    if (g_game.session.Screen() != GameScreen::Level1 && !IsEditorPlaying())
+        return;
+
+    // --- Player ---
+    // Skipped while riding or driving anything: the camera moves without the
+    // player taking a step, exactly as with the sprint animation.
+    const bool onFoot = !g_drivingHumvee &&
+                        !g_game.vehicles.blackHawkCarryingPlayer &&
+                        !g_insertionChoicePending &&
+                        scene.camera.FPSMode &&
+                        scene.player.health > 0.0f;
+    if (onFoot && scene.camera.IsGrounded) {
+        const float speed = g_game.playerMovement.HorizontalSpeed();
+        // Below a slow walk there is no step to place; this also stops a
+        // stationary player from creeping over the threshold on drift alone.
+        if (speed > 0.9f) {
+            g_playerStepDistance += speed * dt;
+            const float stride = g_playerSprinting ? kStepStrideSprint
+                                                   : kStepStrideWalk;
+            const float crouchScale = scene.camera.IsCrouching ? 1.6f : 1.0f;
+            if (g_playerStepDistance >= stride * crouchScale) {
+                g_playerStepDistance = 0.0f;
+                // Crouching is near-silent, sprinting is heavier. This is the
+                // player's own boot, so it is not spatialised.
+                const float volume = scene.camera.IsCrouching ? 0.22f
+                                   : (g_playerSprinting ? 0.55f : 0.40f);
+                PlayFootstep(volume, false);
+            }
+        } else {
+            // Bleed the accumulator away when stopped so the next step after a
+            // pause lands on a fresh stride rather than immediately.
+            g_playerStepDistance =
+                (std::max)(0.0f, g_playerStepDistance - dt * 1.5f);
+        }
+    }
+
+    // --- Enemies ---
+    if (!g_banditLoaded) return;
+    for (auto& bandit : g_bandits) {
+        if (!bandit || bandit->Dead()) continue;
+        // Rappelling and mounted actors are not walking.
+        if (bandit->Rappelling() || bandit->turretGunner) continue;
+
+        const XMFLOAT3 position = bandit->position;
+        if (!bandit->stepTrackingStarted) {
+            bandit->lastStepPosition = position;
+            bandit->stepTrackingStarted = true;
+            continue;
+        }
+        const float dx = position.x - bandit->lastStepPosition.x;
+        const float dz = position.z - bandit->lastStepPosition.z;
+        bandit->lastStepPosition = position;
+        const float moved = std::sqrt(dx * dx + dz * dz);
+        // A spawn or a teleport is not a stride. Anything past a sprint's worth
+        // of movement in one frame is discarded rather than counted.
+        if (moved > 1.2f) continue;
+        bandit->stepDistance += moved;
+        if (bandit->stepDistance < kStepStrideWalk) continue;
+        bandit->stepDistance = 0.0f;
+
+        // Shorter range than gunfire: a footstep should be a close-quarters
+        // tell, not something heard across the island.
+        //
+        // Six times quieter than the player's own boots. Their steps are at the
+        // listener and should dominate; another man's are a faint scuff that
+        // has to be listened for, which is what makes them worth listening for.
+        // Positional, so that scuff also says which side he is on.
+        PlayFootstep(0.11f, true, position, 22.0f);
+    }
+}
+
+static void UpdateWeaponPickups(float dt) {
+    if (scene.weaponPickups.empty()) return;
+    for (WeaponPickup& pickup : scene.weaponPickups) {
+        if (!pickup.active || pickup.collected) continue;
+        pickup.bobPhase += dt;
+    }
+}
+
+// The pickup the player is standing close enough to take, or null. Nearest wins
+// when two overlap, so the prompt and the E handler can never disagree about
+// which one is being offered.
+static WeaponPickup* NearbyWeaponPickup() {
+    if (scene.weaponPickups.empty() || g_drivingHumvee) return nullptr;
+    if (g_game.session.Screen() != GameScreen::Level1 && !IsEditorPlaying())
+        return nullptr;
+
+    const XMFLOAT3& camera = scene.camera.Position;
+    WeaponPickup* best = nullptr;
+    float bestDistanceSq = FLT_MAX;
+    for (WeaponPickup& pickup : scene.weaponPickups) {
+        if (!pickup.active || pickup.collected) continue;
+        // The launcher model has to be loaded before the weapon can be selected:
+        // GunModel::PlayerMesh() would otherwise fall through to the AK and the
+        // player would hold the wrong gun while firing rockets.
+        if (!GunModel::WeaponLoaded(pickup.weapon)) continue;
+
+        const float dx = camera.x - pickup.position.x;
+        const float dz = camera.z - pickup.position.z;
+        // Camera sits at eye height, so compare against the pickup's own Y with a
+        // generous band rather than expecting the two to coincide.
+        const float dy = camera.y - pickup.position.y;
+        const float distanceSq = dx * dx + dz * dz;
+        if (distanceSq > pickup.radius * pickup.radius) continue;
+        if (std::abs(dy) > pickup.verticalRange) continue;
+        if (distanceSq >= bestDistanceSq) continue;
+        bestDistanceSq = distanceSq;
+        best = &pickup;
+    }
+    return best;
+}
+
+// Takes the nearby pickup on E. Returns false when there was nothing to take,
+// so the E handler can fall through to its other jobs.
+//
+// The swap is a true exchange: the weapon leaving the player's hands is left
+// lying where the rocket was, with the ammo it still had. Nothing is destroyed,
+// so a player who takes the rocket by mistake can walk back and trade it in.
+static bool CollectNearbyWeaponPickup() {
+    WeaponPickup* pickup = NearbyWeaponPickup();
+    if (!pickup) return false;
+
+    const int held = GunModel::SelectedWeapon();
+    if (held == pickup->weapon) return false;   // already holding it
+
+    // C4 rides along outside the two chosen slots, so swapping into it would
+    // silently delete a loadout weapon instead of the charge.
+    auto& carried = GunModel::LoadoutWeapons();
+    size_t target = 0;
+    if (carried[1] == held) target = 1;
+    else if (carried[0] != held) target = 0;
+    // Never let the swap produce two identical slots -- CycleWeapon would then
+    // stall between duplicates.
+    const size_t other = target == 0 ? 1 : 0;
+    if (carried[other] == pickup->weapon) return false;
+
+    const int dropped = carried[target];
+    PlayerState& player = scene.player;
+
+    // Snapshot the outgoing weapon's ammo before the incoming weapon overwrites
+    // anything, so the dropped launcher carries its real remaining rounds.
+    int droppedMagazine = 0;
+    int droppedReserve = 0;
+    if (dropped >= 0 && dropped < PlayerState::kWeaponSlots) {
+        droppedMagazine = player.magazine[dropped];
+        droppedReserve = player.reserve[dropped];
+    }
+
+    carried[target] = pickup->weapon;
+    GunModel::SelectedWeapon() = pickup->weapon;
+
+    // Hand over the ammo. Clamped to the slot's authored capacity so a pickup
+    // cannot push the reserve past what the HUD and reload path expect.
+    if (pickup->weapon >= 0 && pickup->weapon < PlayerState::kWeaponSlots) {
+        player.magazine[pickup->weapon] = (std::min)(
+            pickup->magazine, player.magazineSize[pickup->weapon]);
+        player.reserve[pickup->weapon] = (std::min)(
+            pickup->reserve, player.maxReserve[pickup->weapon]);
+    }
+    // A reload in flight belonged to the weapon just swapped out; leaving it
+    // running would top up the wrong slot when it completes.
+    player.reloadTimer = 0.0f;
+    player.reloadingSlot = -1;
+
+    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+        std::string("Picked up ") + GunModel::WeaponName(pickup->weapon) +
+        ", dropped " + GunModel::WeaponName(dropped));
+
+    // The pickup becomes the weapon just given up, in place. Reusing the slot
+    // rather than pushing a new one keeps the count stable across a run.
+    pickup->weapon = dropped;
+    pickup->magazine = droppedMagazine;
+    pickup->reserve = droppedReserve;
+    pickup->bobPhase = 0.0f;
+    g_reloadAudio.Play(0.9f, 0.85f);
+    return true;
+}
+
+// "[E] TAKE <weapon>" over the pickup the player is standing at. Driven by the
+// same NearbyWeaponPickup query the E handler uses, so the prompt appears
+// exactly when the key will work.
+static void DrawWeaponPickupPrompt(CXMMATRIX view, CXMMATRIX projection) {
+    const WeaponPickup* pickup = NearbyWeaponPickup();
+    if (!pickup) return;
+    if (GunModel::SelectedWeapon() == pickup->weapon) return;
+
+    const XMFLOAT3 anchor{ pickup->position.x,
+                           pickup->position.y + 0.55f,
+                           pickup->position.z };
+    const XMVECTOR clip = XMVector3Transform(
+        XMLoadFloat3(&anchor), view * projection);
+    const float w = XMVectorGetW(clip);
+    if (w <= 0.01f) return;   // behind the camera
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const ImVec2 screen{
+        (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+        (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y };
+
+    char label[96];
+    std::snprintf(label, sizeof(label), "[E] TAKE %s",
+                  GunModel::WeaponName(pickup->weapon));
+    const ImVec2 size = ImGui::CalcTextSize(label);
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    const ImU32 amber = IM_COL32(255, 205, 105, 245);
+    draw->AddRectFilled(
+        ImVec2(screen.x - size.x * 0.5f - 6.0f, screen.y - 4.0f),
+        ImVec2(screen.x + size.x * 0.5f + 6.0f, screen.y + 4.0f + size.y),
+        IM_COL32(14, 12, 6, 185), 3.0f);
+    draw->AddText(ImVec2(screen.x - size.x * 0.5f, screen.y), amber, label);
+}
+
 static void UpdateHumveeChaseCamera(float dt) {
     if (!g_drivingHumvee) return;
     XMFLOAT4X4 pose;
@@ -11993,8 +12821,16 @@ static void ProcessInput(HWND) {
 
     const bool crouching = controlDown || scene.camera.IsSliding;
     scene.camera.SetCrouching(crouching, deltaTime);
+    // Sprint is 1.5x walk (7.5 m/s against a 5.0 m/s Camera::MovementSpeed).
+    // Was 2.0x, which outran the traversal the island is built for.
+    constexpr float kSprintMovementScale = 1.5f;
     const float movementMultiplier = crouching ? 0.55f :
-        (sprinting ? 2.0f : 1.0f);
+        (sprinting ? kSprintMovementScale : 1.0f);
+    // Only a sprint that is actually moving the player faster counts for the
+    // viewmodel. Crouching wins over shift here (0.55x), so shift held while
+    // crouched must NOT speed the legs up -- the multiplier above is the
+    // authority on whether this is a sprint, not the key state alone.
+    g_playerSprinting = sprinting && !crouching;
     if (!scene.camera.IsSliding && !ridingBlackHawk) {
         if ((GetAsyncKeyState('W') & 0x8000) || mouseWalkForward)
             scene.camera.ProcessKeyboard('W', deltaTime, movementMultiplier);
@@ -12289,9 +13125,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                  !(lParam & 0x40000000)) {
             // Riding an insertion vehicle takes priority: E jumps out. Only one
             // can be carrying the player, so the chain short-circuits on it.
-            // Otherwise E keeps its usual job of getting in/out of the Humvee.
+            // A weapon pickup underfoot comes next -- a rocket is often left
+            // beside the Humvee, and reaching for it should not put the player
+            // in the driver's seat. Otherwise E keeps its usual job of getting
+            // in/out of the Humvee.
             if (!g_game.vehicles.BailOutOfBlackHawk() &&
-                !g_game.vehicles.BailOutOfInsertionBoat())
+                !g_game.vehicles.BailOutOfInsertionBoat() &&
+                !CollectNearbyWeaponPickup())
                 ToggleHumveeDriving();
         }
         // Bit 30 = key was already down (autorepeat); toggle once per press.
@@ -12589,6 +13429,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     g_helicopterHoverAudio.Initialize("Content/Audio/helicopter_hover_loop.mp3");
     g_blackHawkAlarmAudio.Initialize(
         "Content/Audio/freesound_community-siren-alert-96052.mp3");
+    // Grass footsteps. Add a Grass03.wav and bump kFootstepVariantCount to
+    // widen the set -- PlayFootstep picks across whatever is loaded here.
+    g_footstepAudio[0].Initialize("Content/Audio/Footsteps/Grass01.wav");
+    g_footstepAudio[1].Initialize("Content/Audio/Footsteps/Grass02.wav");
 
     // ImGui
     D3D12_DESCRIPTOR_HEAP_DESC ihd = {};
@@ -12600,7 +13444,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    ImGui::StyleColorsDark();
+    // Replaces the bare StyleColorsDark that used to sit here, so every menu,
+    // popup and editor panel inherits the HUD's palette instead of ImGui's
+    // default grey.
+    ApplyEngineUITheme();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX12_Init(g_dx12.device.Get(), FRAME_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM,
         imguiSrvHeap.Get(),
@@ -13311,7 +14158,41 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         const float playerHorizontalSpeed = g_game.playerMovement.Update(
             scene.ViewmodelAnchorPosition(), deltaTime,
             !nonLocomotionCameraMotion);
-        ArmsModel::Update(deltaTime, playerHorizontalSpeed, scene.adsBlend);
+        // Sprint is suppressed alongside the speed reading: riding a vehicle or
+        // the deployment fly-through moves the camera without the player taking
+        // a step, and a held shift there would otherwise sprint the legs.
+        ArmsModel::Update(deltaTime, playerHorizontalSpeed, scene.adsBlend,
+                          g_playerSprinting && !nonLocomotionCameraMotion);
+
+        // Crosshair bloom target. Three contributions, summed then capped:
+        //
+        //   movement -- scaled by measured speed against sprint pace, so walking
+        //               opens it a little and sprinting opens it a lot;
+        //   recoil   -- gunRecoilKick is already the per-shot impulse decaying
+        //               back to zero, which is exactly the shape wanted here, so
+        //               firing needs no separate timer;
+        //   crouch   -- a bonus, not a penalty: bracing tightens the group.
+        //
+        // Aiming down sights collapses it entirely. The reticle is faded out at
+        // that point anyway, and a bloom underneath the weapon's own sights
+        // would be describing a spread the sighted shot does not have.
+        {
+            constexpr float kMaxSpread = 15.0f;
+            constexpr float kSprintReferenceSpeed = 7.5f;  // sprint m/s
+            const float speedFraction = nonLocomotionCameraMotion ? 0.0f :
+                (std::min)(1.0f, playerHorizontalSpeed / kSprintReferenceSpeed);
+            float target = speedFraction * 8.5f;
+            // gunRecoilKick is in degrees of viewmodel pitch; 0.85 px per degree
+            // puts a rifle burst near the movement contribution rather than
+            // swamping it.
+            target += scene.gunRecoilKick * 0.85f;
+            if (scene.camera.IsCrouching) target *= 0.55f;
+            const float sighted =
+                (std::max)(0.0f, (std::min)(1.0f, scene.adsBlend));
+            target *= (1.0f - sighted);
+            scene.crosshairSpreadTarget =
+                (std::min)(kMaxSpread, (std::max)(0.0f, target));
+        }
         if (!g_emptyLevelMode) {
             UpdateHelicopter(deltaTime);
             // Before the patrol update, which yields the airframe while a
@@ -13392,8 +14273,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // rather than one that is already a frame stale.
             UpdateAATurret(deltaTime);
         }
+        // Listener follows the camera, so every PlayAt this frame pans against
+        // where the player actually is. Written before any audio is triggered
+        // below, or a shot fired this frame would be placed against last
+        // frame's listener -- audible as a lag when turning quickly.
+        {
+            const float listenerPos[3] = { scene.camera.Position.x,
+                                           scene.camera.Position.y,
+                                           scene.camera.Position.z };
+            const float listenerFront[3] = { scene.camera.Front.x,
+                                             scene.camera.Front.y,
+                                             scene.camera.Front.z };
+            const float listenerUp[3] = { scene.camera.Up.x,
+                                          scene.camera.Up.y,
+                                          scene.camera.Up.z };
+            AudioDevice::SetListener(listenerPos, listenerFront, listenerUp);
+        }
         g_gunAudio.Update();
         g_rpgFireAudio.Update();
+        for (GunAudio& step : g_footstepAudio) step.Update();
         g_reloadAudio.Update();
         for (PendingExplosionAudio& sound : g_pendingExplosionAudio)
             sound.delay -= deltaTime;
@@ -13729,16 +14627,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     bandit->TryFireAt(
                         deltaTime, target, hasLineOfSight,
                         shotOrigin, shotDirection);
+                // Spotted/attack shouts are positional: hearing which direction
+                // you were called out from is the whole point of the cue.
                 if (bandit->ConsumeSpottedEvent() && g_banditVoiceCooldown <= 0.0f) {
-                    const float volume = BanditVoiceVolume(bandit->position);
+                    const XMFLOAT3& p = bandit->position;
                     const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
-                    if (std::rand() & 1) g_banditSpottedAudio1.Play(volume, pitch);
-                    else g_banditSpottedAudio2.Play(volume, pitch);
+                    if (std::rand() & 1)
+                        g_banditSpottedAudio1.PlayAt(p.x, p.y, p.z, 0.78f, pitch,
+                                                     kBanditVoiceRange);
+                    else
+                        g_banditSpottedAudio2.PlayAt(p.x, p.y, p.z, 0.78f, pitch,
+                                                     kBanditVoiceRange);
                     g_banditVoiceCooldown = 3.5f;
                 }
                 if (bandit->ConsumeAttackEvent() && g_banditVoiceCooldown <= 0.0f) {
+                    const XMFLOAT3& p = bandit->position;
                     const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
-                    g_banditAttackAudio.Play(BanditVoiceVolume(bandit->position), pitch);
+                    g_banditAttackAudio.PlayAt(p.x, p.y, p.z, 0.78f, pitch,
+                                               kBanditVoiceRange);
                     g_banditVoiceCooldown = 4.5f;
                 }
                 if (fired) {
@@ -13786,15 +14692,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // when a firefight starts nearby.
                     g_enemyNoiseEvents.push_back(
                         { shotOrigin, SkinnedEnemy::AlertBroadcastRadius() });
-                    const float dx = shotOrigin.x - scene.camera.Position.x;
-                    const float dy = shotOrigin.y - scene.camera.Position.y;
-                    const float dz = shotOrigin.z - scene.camera.Position.z;
-                    const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
-                    const float volume =
-                        (std::max)(0.08f, 0.58f * (1.0f - distance / 45.0f));
+                    // Positional: an enemy shooting from the left is heard on
+                    // the left. The distance falloff that used to be computed
+                    // here by hand now comes from the emitter's rolloff curve.
+                    //
+                    // Half volume: several enemies firing at once stacked into a
+                    // wall of sound that buried the player's own weapon and the
+                    // voice cues. Quieter enemy fire keeps a firefight legible.
                     const float pitch =
                         0.88f + ((float)std::rand() / RAND_MAX) * 0.08f;
-                    g_gunAudio.Play(volume, pitch);
+                    g_gunAudio.PlayAt(shotOrigin.x, shotOrigin.y, shotOrigin.z,
+                                      0.29f, pitch, 70.0f);
                 }
             }
             if (burnedBanditDied) PlayBanditDeathEvents();
@@ -13866,6 +14774,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 UpdateHumveeImpacts(deltaTime);
                 UpdateHumveeChaseCamera(deltaTime);
                 UpdateHumveeTurretAim(deltaTime);
+                UpdateWeaponPickups(deltaTime);
+                UpdateFootsteps(deltaTime);
             }
             if (!g_emptyLevelMode && g_banditLoaded) {
                 const std::vector<DestructionDebrisHazard> debris =
@@ -13898,13 +14808,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
             for (const EnemyShot& shot : g_destruction.DrainEnemyShots()) {
                 scene.SpawnHostileProjectile(shot.origin, shot.direction);
-                const float dx = shot.origin.x - scene.camera.Position.x;
-                const float dy = shot.origin.y - scene.camera.Position.y;
-                const float dz = shot.origin.z - scene.camera.Position.z;
-                const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
-                const float volume = (std::max)(0.06f, 0.55f * (1.0f - distance / 45.0f));
+                // Half volume, matching the infantry fire above -- these are the
+                // same enemies shooting, just routed through the destruction
+                // system's shot queue.
                 const float pitch = 0.88f + ((float)std::rand() / RAND_MAX) * 0.08f;
-                g_gunAudio.Play(volume, pitch);
+                g_gunAudio.PlayAt(shot.origin.x, shot.origin.y, shot.origin.z,
+                                  0.275f, pitch, 70.0f);
             }
             // Smoke and a rate-limited break sound at actual fracture points.
             const auto breakPoints = g_destruction.DrainBreakPoints();
@@ -14461,6 +15370,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 }
                 if (!banditHits.empty()) {
                     recordAccuracyHit();
+                    // Hit marker, red if this round put someone down. One
+                    // projectile can strike several bodies (a harpoon skewers a
+                    // line of them), so a kill anywhere in the group makes the
+                    // whole flash lethal.
+                    if (projectile.playerOwned) {
+                        bool lethal = false;
+                        for (const BanditProjectileHit& banditHit : banditHits)
+                            lethal = lethal || banditHit.killed;
+                        scene.TriggerHitMarker(lethal);
+                    }
                     for (BanditProjectileHit& banditHit : banditHits) {
                         if (projectile.laser)
                             scene.StopLaserBeamAt(banditHit.position);
@@ -14588,6 +15507,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         projectile.previousPosition, projectile.position,
                         bulletRadius, helicopterHit)) {
                     recordAccuracyHit();
+                    // Hardware hits get the plain marker. Never the lethal one:
+                    // an airframe dies to accumulated damage rather than a
+                    // single killing round, so red here would fire on whichever
+                    // bullet happened to be last and read as arbitrary.
+                    if (projectile.playerOwned) scene.TriggerHitMarker(false);
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
@@ -14604,6 +15528,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         projectile.previousPosition, projectile.position,
                         bulletRadius, helicopterHit)) {
                     recordAccuracyHit();
+                    if (projectile.playerOwned) scene.TriggerHitMarker(false);
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
@@ -14622,6 +15547,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         projectile.previousPosition, projectile.position,
                         bulletRadius, turretHit, shotTurretIndex)) {
                     recordAccuracyHit();
+                    if (projectile.playerOwned) scene.TriggerHitMarker(false);
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
@@ -14640,6 +15566,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         projectile.previousPosition, projectile.position,
                         bulletRadius, boatHit)) {
                     recordAccuracyHit();
+                    if (projectile.playerOwned) scene.TriggerHitMarker(false);
                     const XMFLOAT3 normal(-projectile.direction.x,
                                           -projectile.direction.y,
                                           -projectile.direction.z);
@@ -14907,13 +15834,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // so there the boat is a straight way out.
         if (g_game.session.Screen() == GameScreen::Level1 &&
             !g_emptyLevelMode && g_game.session.TimerRunning() &&
-            g_game.vehicles.EscapeBoatReady() &&
             scene.player.health > 0.0f) {
-            g_game.vehicles.UpdateEscapeBoat(deltaTime);
             const bool objectiveMet =
                 g_game.mission.Stats().commTowersTotal == 0 ||
                 g_game.mission.CommTowerObjectiveComplete();
-            if (objectiveMet &&
+            // Guarantee an exfil exists the moment the run becomes winnable.
+            // The boat normally rides in with the first reinforcement wave, but
+            // that wave only launches when a comm tower falls on a level that
+            // authored a helicopter -- and the boat is now the ONLY way to end a
+            // mission. Without this, a towerless map would strand the player on
+            // a cleared island with no way to finish.
+            // Rolled here rather than at level load so a towerless map's exfil
+            // is as unpredictable as a wave-spawned one. PlaceEscapeBoatOnBearing
+            // is idempotent, so the roll only takes effect on the first frame
+            // this fires -- every later frame is a no-op and the boat stays put.
+            if (objectiveMet && !g_game.vehicles.EscapeBoatReady())
+                g_game.vehicles.PlaceEscapeBoatOnBearing(
+                    RandomUnit() * XM_2PI, 0.0f);
+            g_game.vehicles.UpdateEscapeBoat(deltaTime);
+            if (objectiveMet && g_game.vehicles.EscapeBoatReady() &&
                 g_game.vehicles.PlayerCanBoardEscapeBoat(scene.camera.Position)) {
                 SGE_LOG("LogGameplay", EngineLog::Level::Display,
                     "Player reached the escape boat -- exfil complete");
@@ -14921,16 +15860,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
         }
 
-        if (g_game.session.Screen() == GameScreen::Level1 &&
-            !g_emptyLevelMode && g_banditLoaded &&
-            !g_game.commands.Pending(GameCommand::RespawnTurretGunner) &&
-            !g_game.commands.Pending(GameCommand::RespawnBoatGunner) &&
-            LiveBanditCount() == 0 && g_helicopterDead &&
-            (!g_stressTestMode || g_secondaryHelicopterDead) &&
-            // A wave still in the air is troops not yet on the ground, so the
-            // field is not actually clear until it has unloaded or gone down.
-            !g_game.vehicles.DropshipActive())
-            OpenWinScreen();
+        // Clearing the field no longer ends the run on its own. The boat is the
+        // only way out: killing every bandit and downing the helicopter leaves
+        // the player standing on a quiet island that still has to be left. That
+        // makes the exfil run the last act of every mission rather than an
+        // optional flourish, and it is why the escape boat is spawned with the
+        // first reinforcement wave instead of at the end.
         }
         }
 
@@ -15523,6 +16458,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         g_helicopterMainRotorNode = child;
                     else if (child->name == "OH1TailRotor")
                         g_helicopterTailRotorNode = child;
+                }
+                // Second airframe for the reinforcement dropship. Shares all
+                // geometry with the original (see CloneSceneNodeShallow) and
+                // costs only the node tree, but owns its own rotor transforms
+                // so the two aircraft spin independently.
+                g_secondaryHelicopterModel =
+                    CloneSceneNodeShallow(g_helicopterModel);
+                if (g_secondaryHelicopterModel) {
+                    for (const auto& child :
+                             g_secondaryHelicopterModel->children) {
+                        if (!child) continue;
+                        if (child->name == "OH1MainRotor")
+                            g_secondaryHelicopterMainRotorNode = child;
+                        else if (child->name == "OH1TailRotor")
+                            g_secondaryHelicopterTailRotorNode = child;
+                    }
                 }
                 ConfigureHelicopterBounds();
                 std::cout << "OH-1 helicopter ready above center\n";
@@ -16392,6 +17343,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 RenderPlayerHUD(scene);
                 DrawEscapeBoatMarker(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
+                DrawWeaponPickupPrompt(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawEnemyVisionCones(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
             }
@@ -16620,7 +17573,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     g_explosionAudio.Shutdown();
     g_reloadAudio.Shutdown();
     g_rpgFireAudio.Shutdown();
+    for (GunAudio& step : g_footstepAudio) step.Shutdown();
     g_gunAudio.Shutdown();
+    // Last: every effect above shares this one device, so it can only be torn
+    // down once they have all released their voices.
+    AudioDevice::Shutdown();
     g_profiler.Shutdown();
     CleanupDX12();
     return (int)msg.wParam;

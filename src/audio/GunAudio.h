@@ -1,14 +1,96 @@
 #pragma once
 
 #include <xaudio2.h>
+#include <x3daudio.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+
+// One XAudio2 device, mastering voice and X3DAudio handle for the whole
+// process, plus the listener every positional sound is mixed against.
+//
+// Each GunAudio used to create its own engine and mastering voice -- 16 devices
+// for 16 sound effects, each with its own mixer thread and its own submix of the
+// same output. They now all share this one. A GunAudio is just decoded samples
+// and the voices playing them.
+//
+// Everything is left-handed to match the rest of the engine.
+class AudioDevice {
+public:
+    // Brought up on the first Initialize; safe to call repeatedly.
+    static bool Ensure() {
+        State& s = Get();
+        if (s.engine) return true;
+        if (s.failed) return false;
+        if (FAILED(XAudio2Create(&s.engine)) ||
+            FAILED(s.engine->CreateMasteringVoice(&s.master))) {
+            if (s.engine) { s.engine->Release(); s.engine = nullptr; }
+            s.master = nullptr;
+            s.failed = true;
+            std::cerr << "XAudio2 initialization failed\n";
+            return false;
+        }
+        XAUDIO2_VOICE_DETAILS details = {};
+        s.master->GetVoiceDetails(&details);
+        s.outputChannels = details.InputChannels;
+        DWORD mask = 0;
+        if (SUCCEEDED(s.master->GetChannelMask(&mask)) && mask != 0) {
+            X3DAudioInitialize(mask, X3DAUDIO_SPEED_OF_SOUND, s.handle);
+            s.handleReady = true;
+        }
+        return true;
+    }
+
+    static IXAudio2* Engine() { return Get().engine; }
+    static UINT32 OutputChannels() { return Get().outputChannels; }
+    static bool SpatialReady() { return Get().handleReady && Get().listenerValid; }
+    static const X3DAUDIO_HANDLE& Handle() { return Get().handle; }
+    static const X3DAUDIO_LISTENER& Listener() { return Get().listener; }
+
+    // Written once per frame from the camera.
+    static void SetListener(const float position[3], const float front[3],
+                            const float up[3]) {
+        State& s = Get();
+        s.listener.Position = { position[0], position[1], position[2] };
+        s.listener.OrientFront = { front[0], front[1], front[2] };
+        s.listener.OrientTop = { up[0], up[1], up[2] };
+        // Velocity stays zero: doppler on a walking player is inaudible, and a
+        // teleporting camera (level load, leaving a vehicle) would produce a
+        // violent pitch sweep if it were derived from position deltas.
+        s.listener.Velocity = { 0.0f, 0.0f, 0.0f };
+        s.listenerValid = true;
+    }
+
+    // Called once at shutdown, after every GunAudio has released its voices.
+    static void Shutdown() {
+        State& s = Get();
+        if (s.master) { s.master->DestroyVoice(); s.master = nullptr; }
+        if (s.engine) { s.engine->Release(); s.engine = nullptr; }
+        s.handleReady = false;
+        s.listenerValid = false;
+        s.outputChannels = 0;
+    }
+
+private:
+    struct State {
+        IXAudio2* engine = nullptr;
+        IXAudio2MasteringVoice* master = nullptr;
+        X3DAUDIO_HANDLE handle = {};
+        X3DAUDIO_LISTENER listener = {};
+        UINT32 outputChannels = 0;
+        bool handleReady = false;
+        bool listenerValid = false;
+        bool failed = false;
+    };
+    static State& Get() { static State state; return state; }
+};
 
 #define STB_VORBIS_HEADER_ONLY
 #include "../../thirdparty/stb/stb_vorbis.c"
@@ -27,10 +109,8 @@ public:
             std::cerr << "Audio unavailable: " << path << "\n";
             return false;
         }
-        HRESULT hr = XAudio2Create(&engine_);
-        if (FAILED(hr) || FAILED(engine_->CreateMasteringVoice(&master_))) {
+        if (!AudioDevice::Ensure()) {
             Shutdown();
-            std::cerr << "XAudio2 initialization failed\n";
             return false;
         }
         std::cout << "Audio loaded: " << path << "\n";
@@ -38,10 +118,11 @@ public:
     }
 
     void Play(float volume = 1.0f, float pitch = 1.0f) {
-        if (!engine_ || samples_.empty()) return;
+        IXAudio2* engine = AudioDevice::Engine();
+        if (!engine || samples_.empty()) return;
         ReclaimFinished();
         IXAudio2SourceVoice* voice = nullptr;
-        if (FAILED(engine_->CreateSourceVoice(&voice, &format_, 0, 2.0f))) return;
+        if (FAILED(engine->CreateSourceVoice(&voice, &format_, 0, 2.0f))) return;
 
         XAUDIO2_BUFFER buffer = {};
         buffer.Flags = XAUDIO2_END_OF_STREAM;
@@ -56,13 +137,129 @@ public:
         voices_.push_back(voice);
     }
 
+    // Positional one-shot. `x/y/z` is the world position of the sound; the
+    // listener is whatever AudioListener was last given.
+    //
+    // `volume` is a pre-attenuation gain, so existing per-event mixing (a
+    // silenced rifle being quieter than a loud one) still applies on top of the
+    // distance falloff X3DAudio computes.
+    //
+    // `maxDistance` is where the sound reaches silence. X3DAudio's default curve
+    // is inverse-square from the CurveDistanceScaler, which drops off far too
+    // fast for gunfire meant to be heard across a firefight, so a custom linear
+    // rolloff is supplied instead -- see kRolloff below.
+    void PlayAt(float x, float y, float z, float volume = 1.0f,
+                float pitch = 1.0f, float maxDistance = 60.0f) {
+        IXAudio2* engine = AudioDevice::Engine();
+        if (!engine || samples_.empty()) return;
+        // No listener yet (menu, level load): fall back to a flat 2D play so a
+        // sound is never silently dropped.
+        if (!AudioDevice::SpatialReady() || AudioDevice::OutputChannels() == 0) {
+            Play(volume, pitch);
+            return;
+        }
+        ReclaimFinished();
+        IXAudio2SourceVoice* voice = nullptr;
+        // USEFILTER is required for the low-pass X3DAudio computes below; a
+        // voice created without it silently ignores SetFilterParameters.
+        if (FAILED(engine->CreateSourceVoice(&voice, &format_,
+                                             XAUDIO2_VOICE_USEFILTER, 2.0f)))
+            return;
+
+        X3DAUDIO_EMITTER emitter = {};
+        emitter.ChannelCount = 1;   // treated as a point source regardless of
+                                    // the asset's own channel count
+        emitter.CurveDistanceScaler = (std::max)(1.0f, maxDistance);
+        emitter.DopplerScaler = 0.0f;
+        emitter.Position = { x, y, z };
+        emitter.OrientFront = { 0.0f, 0.0f, 1.0f };
+        emitter.OrientTop = { 0.0f, 1.0f, 0.0f };
+        emitter.Velocity = { 0.0f, 0.0f, 0.0f };
+        // Without an inner radius X3DAudio treats the source as an infinitely
+        // small point, and a sound passing near the listener snaps hard from one
+        // speaker to the other. A small radius makes the pan sweep smoothly
+        // through the middle instead, which is most of what "more 3D" means for
+        // sources that move past you.
+        emitter.InnerRadius = 2.0f;
+        emitter.InnerRadiusAngle = X3DAUDIO_PI / 4.0f;
+        // Linear-ish rolloff: full volume very close, then a steady fade to zero
+        // at the scaler distance. Gunfire that vanished at 15 m made a firefight
+        // feel small, which is what the default inverse-square curve produced.
+        static const X3DAUDIO_DISTANCE_CURVE_POINT kRolloffPoints[] = {
+            { 0.0f, 1.0f }, { 0.12f, 0.85f }, { 0.35f, 0.5f },
+            { 0.7f, 0.18f }, { 1.0f, 0.0f }
+        };
+        static X3DAUDIO_DISTANCE_CURVE kRolloff = {
+            const_cast<X3DAUDIO_DISTANCE_CURVE_POINT*>(kRolloffPoints),
+            static_cast<UINT32>(std::size(kRolloffPoints))
+        };
+        emitter.pVolumeCurve = &kRolloff;
+
+        // Matrix is [emitter channels] x [output channels]; emitter is mono.
+        float matrix[8] = {};
+        const UINT32 channels = (std::min)(AudioDevice::OutputChannels(), 8u);
+        X3DAUDIO_DSP_SETTINGS dsp = {};
+        dsp.SrcChannelCount = 1;
+        dsp.DstChannelCount = channels;
+        dsp.pMatrixCoefficients = matrix;
+
+        // MATRIX alone only pans and attenuates, which is why distant sounds
+        // read as "the same sound, quieter" rather than as far away. The extra
+        // flags are what make a position audible:
+        //
+        //   LPF_DIRECT  -- air absorbs high frequencies over distance, and the
+        //                  head shadows sounds arriving from behind. X3DAudio
+        //                  returns a cutoff coefficient for both, so a shot
+        //                  across the map goes dull instead of just quiet.
+        //
+        // REVERB and DELAY are deliberately NOT requested. Each only produces a
+        // number for a submix to consume -- a reverb send level and an
+        // interaural delay pair -- and this engine has no submix graph. Asking
+        // for them would compute values nothing reads.
+        const UINT32 calculateFlags = X3DAUDIO_CALCULATE_MATRIX |
+                                      X3DAUDIO_CALCULATE_LPF_DIRECT;
+        X3DAudioCalculate(AudioDevice::Handle(), &AudioDevice::Listener(),
+                          &emitter, calculateFlags, &dsp);
+
+        XAUDIO2_BUFFER buffer = {};
+        buffer.Flags = XAUDIO2_END_OF_STREAM;
+        buffer.AudioBytes = static_cast<UINT32>(samples_.size());
+        buffer.pAudioData = samples_.data();
+        voice->SetVolume((std::max)(0.0f, (std::min)(1.0f, volume)));
+        voice->SetFrequencyRatio((std::max)(0.5f, (std::min)(2.0f, pitch)));
+
+        // Distance/direction low-pass. LPFDirectCoefficient is 1 for a source
+        // right on top of the listener and falls toward 0 as it recedes or moves
+        // behind, which is exactly the cutoff a one-pole filter wants.
+        //
+        // Floored so a distant sound goes muffled rather than inaudible -- the
+        // raw coefficient approaches zero at the edge of the curve, which
+        // filters the sound out entirely instead of just dulling it.
+        XAUDIO2_FILTER_PARAMETERS filter = {};
+        filter.Type = LowPassFilter;
+        filter.Frequency =
+            (std::max)(0.28f, (std::min)(1.0f, dsp.LPFDirectCoefficient));
+        filter.OneOverQ = 1.0f;
+        voice->SetFilterParameters(&filter);
+
+        // The panning matrix is what places the sound; it carries the distance
+        // attenuation from the curve above as well.
+        voice->SetOutputMatrix(nullptr, 1, channels, matrix);
+        if (FAILED(voice->SubmitSourceBuffer(&buffer)) || FAILED(voice->Start())) {
+            voice->DestroyVoice();
+            return;
+        }
+        voices_.push_back(voice);
+    }
+
     void SetLoop(bool enabled, float volume = 1.0f, float pitch = 1.0f) {
-        if (!enabled || !engine_ || samples_.empty()) {
+        IXAudio2* engine = AudioDevice::Engine();
+        if (!enabled || !engine || samples_.empty()) {
             StopLoop();
             return;
         }
         if (!loopVoice_) {
-            if (FAILED(engine_->CreateSourceVoice(&loopVoice_, &format_, 0, 2.0f))) {
+            if (FAILED(engine->CreateSourceVoice(&loopVoice_, &format_, 0, 2.0f))) {
                 loopVoice_ = nullptr;
                 return;
             }
@@ -91,12 +288,13 @@ public:
 
     void Update() { ReclaimFinished(); }
 
+    // Releases this effect's voices only. The device itself is shared, so it
+    // outlives any single GunAudio -- AudioDevice::Shutdown tears it down once,
+    // after every effect has been shut down.
     void Shutdown() {
         StopLoop();
         for (IXAudio2SourceVoice* voice : voices_) voice->DestroyVoice();
         voices_.clear();
-        if (master_) { master_->DestroyVoice(); master_ = nullptr; }
-        if (engine_) { engine_->Release(); engine_ = nullptr; }
         samples_.clear();
         format_ = {};
     }
@@ -217,8 +415,6 @@ private:
         }
     }
 
-    IXAudio2* engine_ = nullptr;
-    IXAudio2MasteringVoice* master_ = nullptr;
     WAVEFORMATEX format_ = {};
     std::vector<uint8_t> samples_;
     std::vector<IXAudio2SourceVoice*> voices_;
