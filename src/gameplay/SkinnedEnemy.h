@@ -870,9 +870,14 @@ public:
                preparingShot_ && stationaryAimTime_ >= AimUpSeconds();
     }
 
+    // targetVelocity lets the shot be led: the aim point becomes where the
+    // target will be when the round lands, not where it is now. Defaults to
+    // zero, which reproduces the old aim-at-the-current-position behaviour.
     bool TryFireAt(float dt, const DirectX::XMFLOAT3& target,
                    bool hasLineOfSight,
-                   DirectX::XMFLOAT3& origin, DirectX::XMFLOAT3& direction) {
+                   DirectX::XMFLOAT3& origin, DirectX::XMFLOAT3& direction,
+                   const DirectX::XMFLOAT3& targetVelocity = { 0.0f, 0.0f, 0.0f },
+                   float projectileSpeed = 0.0f) {
         using namespace DirectX;
         if (awareness_ != AwarenessState::Combat && !turretGunner) return false;
         if (dead_ || held_ || rappelling_ || !visible || !HasGunPose())
@@ -954,7 +959,34 @@ public:
         }
 
         origin = AimRayOrigin();
-        XMVECTOR aim = XMLoadFloat3(&target) - XMLoadFloat3(&origin);
+
+        // Lead the target so the round arrives where it is going. Two
+        // fixed-point iterations; the flight time barely shifts once the aim
+        // point moves, so this settles immediately.
+        //
+        // The sniper's laser is deliberately excluded: laserTarget_ above stays
+        // glued to the real position, and the beam showing one point while the
+        // round flies at another would break the telegraph that is the entire
+        // counterplay to that shot.
+        DirectX::XMFLOAT3 aimPoint = target;
+        // Snipers fire at 2.2x, matching the speedMultiplier the caller passes
+        // to SpawnHostileProjectile for that archetype -- a faster round needs
+        // proportionally less lead.
+        const float leadSpeed = projectileSpeed * (IsSniper() ? 2.2f : 1.0f);
+        if (leadSpeed > 0.001f) {
+            for (int i = 0; i < 2; ++i) {
+                const float dx = aimPoint.x - origin.x;
+                const float dy = aimPoint.y - origin.y;
+                const float dz = aimPoint.z - origin.z;
+                const float t =
+                    std::sqrt(dx * dx + dy * dy + dz * dz) / leadSpeed;
+                aimPoint = { target.x + targetVelocity.x * t,
+                             target.y + targetVelocity.y * t,
+                             target.z + targetVelocity.z * t };
+            }
+        }
+
+        XMVECTOR aim = XMLoadFloat3(&aimPoint) - XMLoadFloat3(&origin);
         if (XMVectorGetX(XMVector3LengthSq(aim)) < 1e-5f) return false;
 
         auto randomSigned = [] {

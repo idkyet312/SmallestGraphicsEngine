@@ -560,6 +560,13 @@ struct DestructionDX12::Impl {
     std::vector<EnemyShot> pendingEnemyShots;
     XMFLOAT3 enemyTarget = {};
     bool enemyTargetValid = false;
+    // Player velocity, differenced from successive enemyTarget positions so the
+    // caller only has to keep handing us a point. Smoothed hard: the raw frame
+    // delta is noisy enough that unfiltered lead makes shots jitter around the
+    // player instead of tracking them.
+    XMFLOAT3 enemyTargetVelocity = {};
+    XMFLOAT3 previousEnemyTarget = {};
+    bool previousEnemyTargetValid = false;
     mutable int lastRagdollHit = -1;
     mutable uint32_t lastHitChunk = InvalidIndex;
     TkFramework* framework = nullptr;
@@ -905,6 +912,36 @@ struct DestructionDX12::Impl {
         }
     }
 
+    // Difference the target point into a velocity. Called once per frame from
+    // Update, where dt is the real frame time -- SetEnemyTarget has no dt of
+    // its own, so the tracking has to live here rather than at the setter.
+    void UpdateEnemyTargetVelocity(float dt) {
+        if (!enemyTargetValid || dt <= 0.0f) return;
+        if (!previousEnemyTargetValid) {
+            previousEnemyTarget = enemyTarget;
+            previousEnemyTargetValid = true;
+            return;
+        }
+        const XMFLOAT3 raw{ (enemyTarget.x - previousEnemyTarget.x) / dt,
+                            (enemyTarget.y - previousEnemyTarget.y) / dt,
+                            (enemyTarget.z - previousEnemyTarget.z) / dt };
+        previousEnemyTarget = enemyTarget;
+        // A teleport (level load, respawn, vehicle exit) shows up as an absurd
+        // one-frame velocity. Drop it rather than firing at a point far off the
+        // map. 45 m/s is well above sprint but below any real jump in position.
+        const float speedSq = raw.x * raw.x + raw.y * raw.y + raw.z * raw.z;
+        if (speedSq > 45.0f * 45.0f) {
+            enemyTargetVelocity = {};
+            return;
+        }
+        // Exponential smoothing, ~0.16 s time constant. Frame-rate independent
+        // so the lead behaves the same at 60 and 144 fps.
+        const float blend = 1.0f - std::exp(-dt / 0.16f);
+        enemyTargetVelocity.x += (raw.x - enemyTargetVelocity.x) * blend;
+        enemyTargetVelocity.y += (raw.y - enemyTargetVelocity.y) * blend;
+        enemyTargetVelocity.z += (raw.z - enemyTargetVelocity.z) * blend;
+    }
+
     void UpdateEnemyFire(float dt) {
         if (!enemyTargetValid) return;
         for (HoverEnemy& enemy : hoverEnemies) {
@@ -945,6 +982,26 @@ struct DestructionDX12::Impl {
                 enemy.fireCooldown = 0.0625f;
                 continue;
             }
+
+            // Lead the target: aim where the player will be when the round
+            // arrives, not where they are now. Rounds are real projectiles at
+            // Scene::projectileSpeed (300 m/s), so flight time over the 40 m
+            // engage range tops out near 0.13 s -- small, but enough that a
+            // strafing player used to walk out of every burst untouched.
+            //
+            // One iteration of the standard fixed-point solve. The flight time
+            // shifts only slightly once the aim point moves, so a second pass
+            // buys nothing at these ranges.
+            constexpr float kProjectileSpeed = 300.0f;
+            const XMVECTOR targetVelocity = XMLoadFloat3(&enemyTargetVelocity);
+            const XMVECTOR led =
+                to + targetVelocity * (distance / kProjectileSpeed);
+            XMVECTOR leadDir = led - from;
+            // Degenerate only if the lead lands on the muzzle; keep the
+            // unled direction in that case rather than normalising a zero.
+            if (XMVectorGetX(XMVector3LengthSq(leadDir)) > 1e-6f)
+                dir = leadDir;
+
             dir = XMVector3Normalize(dir);
             // Small inaccuracy keeps sustained fire dangerous but dodgeable.
             const float jx = ((float)std::rand() / RAND_MAX * 2.0f - 1.0f) * 0.018f;
@@ -3223,6 +3280,7 @@ void DestructionDX12::Update(float dt) {
     }
     const bool debrisBudgetChanged = maintenanceDue &&
         m->EnforceDebrisBudget();
+    m->UpdateEnemyTargetVelocity(dt);
     m->UpdateEnemyFire(dt);
 
     // Only rebuild when something could actually have moved. An intact house is

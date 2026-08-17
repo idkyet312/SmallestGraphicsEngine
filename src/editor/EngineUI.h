@@ -289,9 +289,9 @@ inline void RenderPlayerHUD(const Scene& scene) {
                     ImVec2(barMin.x + barWidth * towerFraction, barMax.y),
                     IM_COL32(236, 240, 242, 225), 1.5f);
 
-            // Top-left marker. Amber diamond + "PRIMARY OBJECTIVE" over the
+            // Top-left marker. Off-white diamond + "PRIMARY OBJECTIVE" over the
             // task restated in sentence case, matching the reference layout.
-            const ImU32 amber = IM_COL32(255, 186, 62, 245);
+            const ImU32 markerColour = IM_COL32(236, 240, 242, 245);
             constexpr float kMarkerX = 30.0f;
             constexpr float kMarkerY = 84.0f;
             const float diamond = 6.0f;
@@ -302,11 +302,11 @@ inline void RenderPlayerHUD(const Scene& scene) {
                 ImVec2(centre.x + diamond, centre.y),
                 ImVec2(centre.x, centre.y + diamond),
                 ImVec2(centre.x - diamond, centre.y) };
-            draw->AddPolyline(points, 4, amber, ImDrawFlags_Closed, 1.6f);
-            draw->AddCircleFilled(centre, 1.8f, amber, 8);
+            draw->AddPolyline(points, 4, markerColour, ImDrawFlags_Closed, 1.6f);
+            draw->AddCircleFilled(centre, 1.8f, markerColour, 8);
 
             draw->AddText(ImVec2(kMarkerX + diamond * 2.0f + 10.0f, kMarkerY),
-                          amber, "PRIMARY OBJECTIVE");
+                          markerColour, "PRIMARY OBJECTIVE");
             draw->AddText(ImVec2(kMarkerX, kMarkerY + 20.0f),
                           IM_COL32(226, 232, 236, 235),
                           "Reach the comms tower");

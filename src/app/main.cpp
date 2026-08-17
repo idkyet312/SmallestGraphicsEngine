@@ -714,6 +714,64 @@ static bool OccupiedInsertionVehicleTarget(XMFLOAT3& target) {
     return false;
 }
 
+// Player velocity in full 3D, differenced from the camera position each frame.
+// Camera::VerticalVelocity covers only the Y axis, and the AA turret's lead
+// solver already wanted a horizontal component it had no way to get -- so the
+// strafe/run velocity is tracked here once and shared by every hostile gun.
+static DirectX::XMFLOAT3 g_playerVelocity{};
+static DirectX::XMFLOAT3 g_previousPlayerPosition{};
+static bool g_playerVelocityValid = false;
+
+static void UpdatePlayerVelocity(const DirectX::XMFLOAT3& position, float dt) {
+    if (dt <= 0.0f) return;
+    if (!g_playerVelocityValid) {
+        g_previousPlayerPosition = position;
+        g_playerVelocityValid = true;
+        return;
+    }
+    const DirectX::XMFLOAT3 raw{ (position.x - g_previousPlayerPosition.x) / dt,
+                                 (position.y - g_previousPlayerPosition.y) / dt,
+                                 (position.z - g_previousPlayerPosition.z) / dt };
+    g_previousPlayerPosition = position;
+    // A teleport -- level load, respawn, entering or leaving a vehicle -- reads
+    // as an enormous one-frame velocity. Discard it instead of leading a shot
+    // at a point far off the map. 45 m/s sits above any sprint or fall speed
+    // but below a genuine jump in position.
+    const float speedSq = raw.x * raw.x + raw.y * raw.y + raw.z * raw.z;
+    if (speedSq > 45.0f * 45.0f) {
+        g_playerVelocity = {};
+        return;
+    }
+    // Exponential smoothing, ~0.16s time constant, frame-rate independent. Raw
+    // per-frame deltas are noisy enough that unfiltered lead makes shots jitter
+    // around the player rather than track them.
+    const float blend = 1.0f - std::exp(-dt / 0.16f);
+    g_playerVelocity.x += (raw.x - g_playerVelocity.x) * blend;
+    g_playerVelocity.y += (raw.y - g_playerVelocity.y) * blend;
+    g_playerVelocity.z += (raw.z - g_playerVelocity.z) * blend;
+}
+
+// Aim point that puts a round on `target` given where it is heading. Two
+// fixed-point iterations, matching VehicleSystem::AATurretLeadPoint: the flight
+// time barely moves once the aim point shifts, so this converges immediately.
+static DirectX::XMFLOAT3 LeadTargetPoint(const DirectX::XMFLOAT3& muzzle,
+                                         const DirectX::XMFLOAT3& target,
+                                         const DirectX::XMFLOAT3& velocity,
+                                         float projectileSpeed) {
+    DirectX::XMFLOAT3 aim = target;
+    if (projectileSpeed <= 0.001f) return aim;
+    for (int i = 0; i < 2; ++i) {
+        const float dx = aim.x - muzzle.x;
+        const float dy = aim.y - muzzle.y;
+        const float dz = aim.z - muzzle.z;
+        const float t = std::sqrt(dx * dx + dy * dy + dz * dz) / projectileSpeed;
+        aim = { target.x + velocity.x * t,
+                target.y + velocity.y * t,
+                target.z + velocity.z * t };
+    }
+    return aim;
+}
+
 // Nearest position this actor should perceive/aim/shoot at: bandits target the
 // nearest of {player, each live marine}; marines target the nearest live bandit
 // and never the player. Ties favor the player so behavior is unchanged when no
@@ -2354,6 +2412,13 @@ static void UpdateHelicopter(float dt) {
         g_helicopterFireCooldown = 0.10f;
         return;
     }
+    // Lead the player rather than firing at where they stand. The door gun
+    // engages out to kHelicopterEngagementRange, far enough that flight time is
+    // what let a running player walk out from under a burst untouched.
+    const XMFLOAT3 helicopterAim = LeadTargetPoint(
+        muzzle, scene.camera.Position, g_playerVelocity, scene.projectileSpeed);
+    direction = XMLoadFloat3(&helicopterAim) - XMLoadFloat3(&muzzle);
+    if (XMVectorGetX(XMVector3LengthSq(direction)) < 1e-5f) return;
     const float randomX = ((float)std::rand() / RAND_MAX - 0.5f) * 0.018f;
     const float randomY = ((float)std::rand() / RAND_MAX - 0.5f) * 0.012f;
     const float randomZ = ((float)std::rand() / RAND_MAX - 0.5f) * 0.018f;
@@ -2771,6 +2836,11 @@ static void UpdateSecondaryHelicopter(float dt) {
         g_secondaryHelicopterFireCooldown = 0.10f;
         return;
     }
+    // Same lead as the primary door gun above.
+    const XMFLOAT3 secondaryAim = LeadTargetPoint(
+        muzzle, scene.camera.Position, g_playerVelocity, scene.projectileSpeed);
+    direction = XMLoadFloat3(&secondaryAim) - XMLoadFloat3(&muzzle);
+    if (XMVectorGetX(XMVector3LengthSq(direction)) < 1e-5f) return;
     direction = XMVector3Normalize(direction) + XMVectorSet(
         ((float)std::rand() / RAND_MAX - 0.5f) * 0.018f,
         ((float)std::rand() / RAND_MAX - 0.5f) * 0.012f,
@@ -8248,7 +8318,12 @@ static void UpdateOneAATurret(size_t turretIndex, float deltaTime) {
             // Lead the fall/ride rather than the last position: a player under
             // canopy or on a rope is moving, and a gun that aims where they
             // were would never connect.
-            velocity = { 0.0f, scene.camera.VerticalVelocity, 0.0f };
+            //
+            // Full 3D velocity. This was vertical-only because the camera
+            // exposes just VerticalVelocity, which meant a player drifting
+            // sideways under canopy -- or riding the BlackHawk across the
+            // gun's front -- was led straight down and never sideways.
+            velocity = g_playerVelocity;
             hasTarget = true;
             targetIsAircraft = true;
         }
@@ -14634,11 +14709,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         }
                     }
                 }
+                // Only the player's velocity is tracked, so lead only the shots
+                // actually aimed at the player. NearestHostileTarget also
+                // returns marine and bandit positions, and the insertion craft
+                // is a separate target again -- leading those with the player's
+                // velocity would push the aim somewhere meaningless.
+                const bool targetIsPlayer =
+                    !attackingInsertionVehicle &&
+                    target.x == scene.camera.Position.x &&
+                    target.y == scene.camera.Position.y &&
+                    target.z == scene.camera.Position.z;
+                const XMFLOAT3 leadVelocity =
+                    targetIsPlayer ? g_playerVelocity : XMFLOAT3{ 0.0f, 0.0f, 0.0f };
                 const bool fired = !(g_drivingHumvee && bandit->turretGunner &&
                                      bandit->mountedVehicleIndex == 0) &&
                     bandit->TryFireAt(
                         deltaTime, target, hasLineOfSight,
-                        shotOrigin, shotDirection);
+                        shotOrigin, shotDirection,
+                        leadVelocity, scene.projectileSpeed);
                 // Spotted/attack shouts are positional: hearing which direction
                 // you were called out from is the whole point of the cue.
                 if (bandit->ConsumeSpottedEvent() && g_banditVoiceCooldown <= 0.0f) {
@@ -14761,6 +14849,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             primaryHelicopterActive || secondaryHelicopterActive);
         g_grass.Update(deltaTime);
         }
+        UpdatePlayerVelocity(scene.camera.Position, deltaTime);
         if (scene.useDestruction && g_destruction.IsInitialized()) {
             g_destruction.SetEnemyTarget(scene.camera.Position);
             // Enemy throws happen after Scene::Update. Capture them before this
