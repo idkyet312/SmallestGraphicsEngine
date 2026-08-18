@@ -32,13 +32,53 @@
 using namespace DirectX;
 using namespace Nv::Blast;
 
+std::function<void(const std::shared_ptr<SceneNode>&)>
+    g_releaseVisibilityGeometry;
+
 namespace {
 constexpr uint32_t InvalidIndex = 0xFFFFFFFFu;
 constexpr uint32_t DestructionTriangleNamespace = 0x44535452u; // "DSTR"
-constexpr uint32_t MaxAwakeDebrisBodies = 256;
+// Halved from 256. Awake debris is the dominant per-frame destruction cost:
+// every awake body is solved, collided and walked again by RebuildRenderItems,
+// so this number scales CPU time almost linearly. 128 still leaves a collapse
+// looking like a collapse -- the cap only bites once a scene is already past a
+// hundred simultaneously tumbling pieces, and the pieces it puts to sleep are
+// the oldest and slowest ones, which are the least likely to be watched.
+constexpr uint32_t MaxAwakeDebrisBodies = 128;
 constexpr float StructuralSolverStep = 1.0f / 15.0f;
 constexpr double StructuralSolverBudgetMs = 0.35;
 constexpr uint32_t MaxStructuresPerSolverSlice = 2;
+// ---- Adaptive destruction quality --------------------------------------
+//
+// Destruction is cheap at rest (measured under 0.01 ms) but spikes hard when a
+// structure collapses: up to 17.5 ms in a single Destruction Update. A fixed
+// wall-clock cap alone was not enough, because the cost of ONE physics step can
+// exceed the whole budget -- the cap is only tested between steps, so a single
+// expensive step still lands in full.
+//
+// So instead of only truncating work, scale the work down. `qualityScale` runs
+// from 1 (full fidelity) to 0 (cheapest), moves down fast when frames run long
+// and recovers slowly when they do not, and feeds three levers:
+//
+//   * solver substeps  -- accuracy per step (interpenetration, joint stiffness)
+//   * physics step size -- 60 Hz at full quality, down to 20 Hz when loaded
+//   * awake debris cap  -- how many pieces may tumble at once
+//
+// The result degrades gracefully: a big collapse gets softer physics for a
+// fraction of a second rather than dropping a frame, and quality is back to
+// full within about a second of the load easing.
+constexpr double DestructionBudgetMs = 4.0;
+// Above this the scale falls; below it, the scale recovers. The gap between
+// them is deliberate hysteresis -- a single threshold makes the quality
+// oscillate frame to frame, which is more visible than either level alone.
+constexpr double DestructionRecoverMs = 2.5;
+// Per-frame rates. Falling ~8x faster than it recovers: a spike must be caught
+// on the frame it appears, while recovery can afford to be gradual and
+// unnoticeable.
+constexpr float DestructionQualityFallRate = 0.34f;
+constexpr float DestructionQualityRiseRate = 0.04f;
+// Never degrade past this -- below it, debris visibly sinks through floors.
+constexpr float DestructionMinQuality = 0.0f;
 constexpr float DebrisCollisionLodAge = 3.0f;
 constexpr float DebrisCollisionLodVolume = 0.035f;
 constexpr float TinyDebrisMaxExtent = 0.20f;
@@ -493,6 +533,21 @@ struct DestructionDX12::Impl {
         SpatialCellKeyHash> spatialBatchCache;
     std::array<std::vector<std::shared_ptr<SceneNode>>, FRAME_COUNT> retiredBatchNodes;
     std::array<UINT64, FRAME_COUNT> retiredBatchEpoch = {};
+
+    // Retire a frame slot's merged nodes, telling the renderer to reclaim the
+    // visibility-buffer mesh slots they held first. Every batch rebuild
+    // produces brand-new MeshPrimitives, so without this the visibility buffer
+    // hands out a fresh permanent slot per fracture and eventually runs out --
+    // at which point registration fails and the chunks stop drawing.
+    void ClearRetiredBatchNodes(UINT slot) {
+        std::vector<std::shared_ptr<SceneNode>>& retired =
+            retiredBatchNodes[slot];
+        if (retired.empty()) return;
+        if (g_releaseVisibilityGeometry)
+            for (const std::shared_ptr<SceneNode>& node : retired)
+                g_releaseVisibilityGeometry(node);
+        retired.clear();
+    }
     std::future<BatchBuildResult> batchBuildFuture;
     bool batchBuildInFlight = false;
     std::future<SpatialBatchBuildResult> spatialBatchBuildFuture;
@@ -501,7 +556,13 @@ struct DestructionDX12::Impl {
     uint64_t nextActorRenderId = 1;
     uint64_t renderItemRebuildCount = 0;
     uint64_t batchGeometryRebuildCount = 0;
-    static constexpr float SpatialBatchCellSize = 4.0f;
+    // Settled debris is merged per spatial cell. 4 m produced a very large
+    // number of small batches on the stress island (916 chunks over 173
+    // batches), and each batch is a separate node walk and draw. 12 m merges
+    // the same geometry into far fewer, larger batches; the cost is a coarser
+    // cull granularity, which is acceptable because these are settled pieces
+    // that no longer move between cells.
+    static constexpr float SpatialBatchCellSize = 12.0f;
     // True once the render items have been rebuilt at a moment when nothing was
     // moving -- i.e. they are up to date and can be left alone until something
     // changes. Cleared by anything that alters the scene (a break, a split, a new
@@ -595,6 +656,15 @@ struct DestructionDX12::Impl {
     std::vector<TinyDebrisParticle> tinyDebrisParticles;
     float accumulator = 0.0f;
     float maintenanceAccumulator = 0.0f;
+    // 1 = full fidelity, 0 = cheapest. Persists across frames so a sustained
+    // collapse stays degraded instead of re-spiking every frame.
+    float qualityScale = 1.0f;
+    // External ceiling from the adaptive Forward Extensions tier. 1.0 = no cap,
+    // which is the state whenever adaptive quality is off.
+    float adaptiveQualityCeiling = 1.0f;
+    // Cost of the previous Update, used to steer qualityScale. Seeded at 0 so a
+    // fresh level starts at full quality.
+    double lastUpdateMilliseconds = 0.0;
     std::unordered_set<uint32_t> bulletWeakenedChunks;
     float structuralAccumulator = 0.0f;
     float structuralClock = 0.0f;
@@ -1923,6 +1993,23 @@ struct DestructionDX12::Impl {
         return hash;
     }
 
+    // Merged batch geometry is rebuilt whenever a fracture changes an actor's
+    // chunk set, so its primitives must be recyclable in the visibility buffer
+    // rather than consuming a permanent mesh slot each time.
+    //
+    // MergeSceneGeometry returns a single flat node owning freshly built
+    // primitives -- the source chunk nodes are not reparented into it -- so
+    // this only ever marks geometry the batch itself owns. Recursing anyway
+    // keeps it correct if merging ever starts emitting a hierarchy.
+    static void MarkBatchGeometryTransient(const std::shared_ptr<SceneNode>& node) {
+        if (!node) return;
+        if (node->mesh)
+            for (MeshPrimitive& primitive : node->mesh->primitives)
+                primitive.transientGeometry = true;
+        for (const std::shared_ptr<SceneNode>& child : node->children)
+            MarkBatchGeometryTransient(child);
+    }
+
     static BatchBuildResult BuildActorBatch(
         ID3D12Device* batchDevice, uint64_t actorId, uint64_t chunkHash,
         std::vector<std::shared_ptr<SceneNode>> nodes,
@@ -1947,6 +2034,8 @@ struct DestructionDX12::Impl {
             });
         result.colourNode = GLBImporter::MergeSceneByMaterial(root, deviceRef);
         result.shadowNode = shadowFuture.get();
+        MarkBatchGeometryTransient(result.colourNode);
+        MarkBatchGeometryTransient(result.shadowNode);
         return result;
     }
 
@@ -1994,6 +2083,8 @@ struct DestructionDX12::Impl {
             });
         result.colourNode = GLBImporter::MergeSceneByMaterial(root, noDevice);
         result.shadowNode = shadowFuture.get();
+        MarkBatchGeometryTransient(result.colourNode);
+        MarkBatchGeometryTransient(result.shadowNode);
         return result;
     }
 
@@ -2086,7 +2177,7 @@ struct DestructionDX12::Impl {
         const UINT retireSlot = g_dx12.frameIndex % FRAME_COUNT;
         const UINT64 retireEpoch = g_dx12.fenceValues[retireSlot];
         if (retiredBatchEpoch[retireSlot] != retireEpoch) {
-            retiredBatchNodes[retireSlot].clear();
+            ClearRetiredBatchNodes(retireSlot);
             retiredBatchEpoch[retireSlot] = retireEpoch;
         }
         BatchCacheEntry& cache = batchCache[runtime];
@@ -2114,7 +2205,7 @@ struct DestructionDX12::Impl {
         const UINT retireSlot = g_dx12.frameIndex % FRAME_COUNT;
         const UINT64 retireEpoch = g_dx12.fenceValues[retireSlot];
         if (retiredBatchEpoch[retireSlot] != retireEpoch) {
-            retiredBatchNodes[retireSlot].clear();
+            ClearRetiredBatchNodes(retireSlot);
             retiredBatchEpoch[retireSlot] = retireEpoch;
         }
         SpatialBatchCacheEntry& cache = spatialBatchCache[result.key];
@@ -2165,7 +2256,7 @@ struct DestructionDX12::Impl {
         const UINT retireSlot = g_dx12.frameIndex % FRAME_COUNT;
         const UINT64 retireEpoch = g_dx12.fenceValues[retireSlot];
         if (retiredBatchEpoch[retireSlot] != retireEpoch) {
-            retiredBatchNodes[retireSlot].clear();
+            ClearRetiredBatchNodes(retireSlot);
             retiredBatchEpoch[retireSlot] = retireEpoch;
         }
         auto retireBatch = [&](BatchCacheEntry& entry) {
@@ -2589,7 +2680,20 @@ struct DestructionDX12::Impl {
         }
     }
 
+    // Scales the substep count chosen below by the current quality level. The
+    // floor of 2 is where joints still hold together; at 1 ragdolls visibly
+    // come apart, so the degradation stops short of that.
+    int ScaleSubsteps(int substeps) const {
+        if (qualityScale >= 0.999f) return substeps;
+        const int scaled = static_cast<int>(std::lround(
+            static_cast<float>(substeps) * (0.35f + 0.65f * qualityScale)));
+        return (std::max)(2, (std::min)(substeps, scaled));
+    }
+
     int RagdollSolverSubsteps() const {
+        // Harpooned ragdolls keep their full substep count regardless of load:
+        // they are attached to a joint the player is actively holding, and
+        // softening that reads as the harpoon slipping.
         if (!harpoonRagdolls.empty()) return 8;
         for (const PinnedHarpoonRagdoll& pin : pinnedHarpoonRagdolls) {
             if (pin.partIndex < ragdollParts.size() &&
@@ -2599,14 +2703,14 @@ struct DestructionDX12::Impl {
         for (const RagdollPart& part : ragdollParts) {
             if (part.authoredId == InvalidIndex || B3_IS_NULL(part.body) ||
                 !b3Body_IsAwake(part.body)) continue;
-            if (!enemyTargetValid) return 6;
+            if (!enemyTargetValid) return ScaleSubsteps(6);
             const b3Pos p = b3Body_GetPosition(part.body);
             const float dx = (float)p.x - enemyTarget.x;
             const float dy = (float)p.y - enemyTarget.y;
             const float dz = (float)p.z - enemyTarget.z;
-            if (dx*dx + dy*dy + dz*dz <= 25.0f*25.0f) return 6;
+            if (dx*dx + dy*dy + dz*dz <= 25.0f*25.0f) return ScaleSubsteps(6);
         }
-        return 4;
+        return ScaleSubsteps(4);
     }
 
     bool ChunkWorldPosition(uint32_t chunkIndex, XMFLOAT3& position) const {
@@ -2878,8 +2982,15 @@ struct DestructionDX12::Impl {
                 return a->debrisAge > b->debrisAge;
             });
         bool changed = false;
+        // Third quality lever: under load the cap tightens toward a third of
+        // its normal value, putting the oldest and slowest debris to sleep
+        // sooner. Those are the pieces least likely to be under the player's
+        // eye, so this is the least visible of the three levers.
+        const uint32_t awakeCap = static_cast<uint32_t>((std::max)(1.0f,
+            static_cast<float>(MaxAwakeDebrisBodies) *
+            (0.33f + 0.67f * qualityScale)));
         for (ActorRuntime* runtime : slowAwake) {
-            if (awakeCount <= MaxAwakeDebrisBodies) break;
+            if (awakeCount <= awakeCap) break;
             b3Body_SetAwake(runtime->body, false);
             runtime->restTime = 0.0f;
             --awakeCount;
@@ -2946,7 +3057,8 @@ void DestructionDX12::Shutdown() {
     m->grenadeBodies.clear(); m->grenadeContactEvents.clear();
     m->burningChunks.clear(); m->harpoonRagdolls.clear();
     m->pinnedHarpoonRagdolls.clear();
-    for (auto& retired : m->retiredBatchNodes) retired.clear();
+    for (UINT slot = 0; slot < FRAME_COUNT; ++slot)
+        m->ClearRetiredBatchNodes(slot);
     m->authoredRagdolls.clear();
     m->ragdollRenderItems.clear(); m->initialized = false;
 }
@@ -3125,12 +3237,22 @@ void DestructionDX12::Update(float dt) {
     }
     for (auto it = m->actors.begin(); maintenanceDue && it != m->actors.end();) {
         Impl::ActorRuntime& runtime = **it;
+        // Cheap flag rejects before the hash lookup. An intact structure is
+        // entirely static, so nearly every actor fails one of these two tests
+        // -- and the batchCache probe that used to run first hashed a pointer
+        // and walked a bucket for each of ~1200 chunks every maintenance pass,
+        // only for the result to be discarded on the next line. Same decision
+        // and same effects, one lookup for the survivors instead of all N.
+        if (!runtime.dynamic || !runtime.debrisCleanupEligible) {
+            ++it;
+            continue;
+        }
         const bool renderedAsBatch =
             m->batchCache.find(&runtime) != m->batchCache.end();
         // Age still drives cheaper collision for old debris. Visual geometry is
         // never scaled or expired.
-        if (!runtime.dynamic || !runtime.debrisCleanupEligible || renderedAsBatch) {
-            if (renderedAsBatch) runtime.debrisAge = 0.0f;
+        if (renderedAsBatch) {
+            runtime.debrisAge = 0.0f;
             ++it;
             continue;
         }
@@ -3146,8 +3268,16 @@ void DestructionDX12::Update(float dt) {
     // expensive. Heavy destruction scenes use a stable 30 Hz fixed step;
     // rendering remains frame-rate independent and awake debris still receives
     // every accumulated step.
-    const float step = heavyDestructionScene
+    // Step size widens as quality falls: 60 Hz at full quality, 30 Hz for a
+    // heavy scene, and down to 20 Hz once loaded. A larger step is both cheaper
+    // per second of simulated time and drains the accumulator faster, so it
+    // attacks the backlog from both directions.
+    const float baseStep = heavyDestructionScene
         ? (1.0f / 30.0f) : (1.0f / 60.0f);
+    const float step = m->qualityScale >= 0.999f
+        ? baseStep
+        : (std::min)(1.0f / 20.0f,
+                     baseStep * (1.0f + (1.0f - m->qualityScale) * 1.0f));
     bool anyImpactBroke = false;
     bool physicsStepped = false;
     const auto physicsBegin = std::chrono::steady_clock::now();
@@ -3227,6 +3357,17 @@ void DestructionDX12::Update(float dt) {
                 m->MarkStructureDirty(m->lastBrokenStructure);
             }
         }
+        // Stop once this frame's simulation budget is spent, and throw the
+        // backlog away instead of carrying it. Keeping it would hand the next
+        // frame an even bigger queue -- the runaway this budget exists to stop.
+        // This is the hard floor; qualityScale below is what normally keeps the
+        // cost under it, so reaching this line should be rare.
+        if (std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - physicsBegin).count() >=
+            DestructionBudgetMs) {
+            m->accumulator = 0.0f;
+            break;
+        }
     }
     const double physicsMilliseconds = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - physicsBegin).count();
@@ -3235,8 +3376,12 @@ void DestructionDX12::Update(float dt) {
     // to sleep so they enter spatial render batches. Any later contact/impulse
     // wakes the body normally and removes it from its cached cell next rebuild.
     bool sleepStateChanged = false;
-    for (const auto& runtime : m->actors) {
-        if (!maintenanceDue) break;
+    // Hoisted out of the loop body. The test is loop-invariant, and checking it
+    // per actor meant a throttled frame still set up the iteration and broke on
+    // the first element -- doing partial work on actor 0 and none on the rest.
+    for (auto it = m->actors.begin(); maintenanceDue && it != m->actors.end();
+         ++it) {
+        const auto& runtime = *it;
         if (!runtime->dynamic || B3_IS_NULL(runtime->body)) {
             runtime->restTime = 0.0f;
             continue;
@@ -3347,6 +3492,43 @@ void DestructionDX12::Update(float dt) {
             (m->stressStats.elapsedSeconds >= 1.0f && awake == 0))
             m->stressStats.running = false;
     }
+
+    // ---- Adaptive quality controller ------------------------------------
+    //
+    // Measured at the very end so it sees everything this Update cost --
+    // physics, maintenance and the render-item rebuild alike, which is the
+    // number the profiler reports as "Destruction Update".
+    //
+    // Deliberately asymmetric. Over budget, quality falls immediately and in
+    // proportion to the overshoot, so one bad frame is enough to react. Under
+    // the recover threshold it climbs back slowly, so quality does not pump up
+    // and down while a collapse is still settling. Between the two thresholds
+    // it holds -- that dead band is what stops the oscillation.
+    m->lastUpdateMilliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - updateBegin).count();
+    if (m->lastUpdateMilliseconds > DestructionBudgetMs) {
+        const float overshoot = static_cast<float>(
+            (std::min)(4.0, m->lastUpdateMilliseconds / DestructionBudgetMs));
+        m->qualityScale -= DestructionQualityFallRate * overshoot;
+    } else if (m->lastUpdateMilliseconds < DestructionRecoverMs) {
+        m->qualityScale += DestructionQualityRiseRate;
+    }
+    // The adaptive Forward Extensions tier acts as an external ceiling on top of
+    // this controller's own decision. It only ever lowers quality: the internal
+    // controller still runs, so destruction can be below the ceiling on its own
+    // account, but never above it while the renderer is over budget.
+    m->qualityScale = (std::max)(DestructionMinQuality,
+                                 (std::min)(1.0f, m->qualityScale));
+    m->qualityScale = (std::min)(m->qualityScale, m->adaptiveQualityCeiling);
+}
+
+void DestructionDX12::SetAdaptiveQualityCeiling(float ceiling) {
+    if (!m) return;
+    m->adaptiveQualityCeiling = (std::max)(0.0f, (std::min)(1.0f, ceiling));
+}
+
+float DestructionDX12::GetQualityScale() const {
+    return m ? m->qualityScale : 1.0f;
 }
 
 void DestructionDX12::SetEnemyTarget(const XMFLOAT3& target) {

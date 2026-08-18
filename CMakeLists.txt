@@ -233,6 +233,14 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMENT "Compiling HDR triplanar terrain PBR pixel shader"
     )
     add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/terrain_visibility_ps.cso
+        COMMAND ${DXC_EXECUTABLE} -T ps_6_5 -E main
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_visibility_ps.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/terrain_visibility_ps.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/terrain_visibility_ps.hlsl
+        COMMENT "Compiling terrain visibility-ID pixel shader"
+    )
+    add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/wire_green_ps.cso
         COMMAND ${DXC_EXECUTABLE} -T ps_6_5 -E main
                 ${CMAKE_SOURCE_DIR}/shaders/wire_green_ps.hlsl
@@ -292,6 +300,7 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         ${CMAKE_BINARY_DIR}/terrain_ms.cso
         ${CMAKE_BINARY_DIR}/terrain_ps.cso
         ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso
+        ${CMAKE_BINARY_DIR}/terrain_visibility_ps.cso
         ${CMAKE_BINARY_DIR}/wire_green_ps.cso
         ${CMAKE_BINARY_DIR}/water_vs.cso
         ${CMAKE_BINARY_DIR}/water_ps_hdr.cso
@@ -461,6 +470,10 @@ if(BUILD_TESTING)
     target_link_libraries(BindlessHeapTests PRIVATE SGEProjectHeaders)
     add_test(NAME BindlessHeapTests COMMAND BindlessHeapTests)
 
+    add_executable(VisibilityGeometryPoolTests tests/VisibilityGeometryPoolTests.cpp)
+    target_link_libraries(VisibilityGeometryPoolTests PRIVATE SGEProjectHeaders)
+    add_test(NAME VisibilityGeometryPoolTests COMMAND VisibilityGeometryPoolTests)
+
     add_executable(RagdollAssetTests tests/RagdollAssetTests.cpp)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
     target_compile_definitions(RagdollAssetTests PRIVATE
@@ -542,6 +555,7 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ms.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ms.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_ps_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_ps_hdr.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/terrain_visibility_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/terrain_visibility_ps.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/wire_green_ps.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/wire_green_ps.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/water_vs.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/water_vs.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/water_ps_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/water_ps_hdr.cso

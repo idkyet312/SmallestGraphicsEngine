@@ -37,6 +37,12 @@ extern UINT g_destructionCulledThisFrame;
 extern bool g_inlineRaytracingSupported;
 extern bool g_bindlessMaterialsReady;
 extern bool g_bindlessMaterialsActive;
+// True while terrain is being shaded through the visibility resolve this
+// frame rather than the forward pass. Defined in main.cpp.
+extern bool g_terrainInVisibilityBuffer;
+// True while destruction chunks are shaded by the visibility resolve rather
+// than redrawn in the forward extensions pass. Defined in main.cpp.
+extern bool g_destructionInVisibilityBuffer;
 extern UINT g_dxrDDGIProbeCount;
 extern UINT g_dxrDDGICellCount;
 extern float g_dxrDDGICellSize;
@@ -1143,6 +1149,55 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 g_destructionBatchesThisFrame,
                 g_destructionChunksSubmittedThisFrame,
                 g_destructionCulledThisFrame);
+    // One-shot capture: samples the destruction counters and the FE/Destruction
+    // GPU time for 120 frames, then writes deltas to destruction_probe.log.
+    // Rebuild counts are cumulative, so the per-frame delta is what says whether
+    // merged geometry is being rebuilt continuously or only on real fracture.
+    {
+        static bool probing = false;
+        static int probeFrames = 0;
+        static uint64_t lastItemRebuilds = 0;
+        static uint64_t lastGeoRebuilds = 0;
+        static std::string probeLog;
+        if (ImGui::Button("Probe destruction (120 frames)") && !probing) {
+            probing = true;
+            probeFrames = 0;
+            probeLog.clear();
+            lastItemRebuilds = g_destruction.GetRenderItemRebuildCount();
+            lastGeoRebuilds = g_destruction.GetBatchGeometryRebuildCount();
+        }
+        if (probing) {
+            const uint64_t itemRebuilds = g_destruction.GetRenderItemRebuildCount();
+            const uint64_t geoRebuilds = g_destruction.GetBatchGeometryRebuildCount();
+            char line[256];
+            snprintf(line, sizeof(line),
+                     "%3d batches=%u/%u culledBatches=%u zeroRadius=%u "
+                     "maxRadius=%.2f chunks=%u culled=%u "
+                     "itemRebuild+=%llu geoRebuild+=%llu feDestructionMs=%.3f\n",
+                     probeFrames,
+                     g_destructionBatchesThisFrame,
+                     g_destructionBatchCount,
+                     g_destructionCulledBatchesThisFrame,
+                     g_destructionZeroRadiusBatches,
+                     g_destructionMaxBatchRadius,
+                     g_destructionChunksSubmittedThisFrame,
+                     g_destructionCulledThisFrame,
+                     static_cast<unsigned long long>(itemRebuilds - lastItemRebuilds),
+                     static_cast<unsigned long long>(geoRebuilds - lastGeoRebuilds),
+                     g_profiler.GpuScopeMs("FE/Destruction"));
+            probeLog += line;
+            lastItemRebuilds = itemRebuilds;
+            lastGeoRebuilds = geoRebuilds;
+            if (++probeFrames >= 120) {
+                probing = false;
+                if (FILE* f = fopen("destruction_probe.log", "w")) {
+                    fwrite(probeLog.data(), 1, probeLog.size(), f);
+                    fclose(f);
+                }
+            }
+        }
+        if (probing) ImGui::SameLine(), ImGui::Text("probing %d/120", probeFrames);
+    }
     ImGui::Text("Destruction cache: item rebuilds %llu  geometry rebuilds %llu",
                 static_cast<unsigned long long>(
                     g_destruction.GetRenderItemRebuildCount()),
@@ -1162,7 +1217,25 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 staticStats.resources, staticStats.bytes / (1024.0 * 1024.0),
                 staticStats.pendingUploads);
     if (ImGui::CollapsingHeader("CPU / GPU Profiler", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Adaptive Forward Extensions quality. Off by default: while disabled
+        // the tier is pinned to Full and nothing about the frame changes.
+        {
+            bool adaptive = g_forwardQuality.Enabled();
+            if (ImGui::Checkbox("Adaptive Forward Quality", &adaptive))
+                g_forwardQuality.SetEnabled(adaptive);
+            if (adaptive)
+                ImGui::Text("  Tier: %s   smoothed FE: %.2f ms   destruction q: %.2f",
+                            ForwardQualityController::TierName(g_forwardQuality.Tier()),
+                            g_forwardQuality.SmoothedMs(),
+                            g_destruction.GetQualityScale());
+        }
         ImGui::Text("CPU frame: %.2f ms", g_profiler.CpuFrameMs());
+        // Palms drive Forward Extensions' pixel cost, so show how many survive
+        // the frustum test next to the timings that they move.
+        ImGui::Text("Palms drawn: %d / %d",
+                    g_palmDrawStats.drawn, g_palmDrawStats.considered);
+        ImGui::Text("Prefabs drawn: %d / %d",
+                    g_prefabDrawStats.drawn, g_prefabDrawStats.considered);
         for (const auto& sample : g_profiler.CpuSamples())
             ImGui::BulletText("%s: %.3f ms", sample.name.c_str(), sample.milliseconds);
         ImGui::Separator();
@@ -1170,8 +1243,41 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::Text("GPU frame: %.2f ms", g_profiler.GpuFrameMs());
             ImGui::Text("GPU p95 (%zu/300): %.2f ms",
                         g_profiler.GpuHistorySize(), g_profiler.GpuFrameP95Ms());
+            // FE/* scopes nest inside Forward Extensions, so indent them and
+            // show their share of it -- their times are already counted in the
+            // parent and must not be added to the frame total again.
+            float forwardExtensionsMs = 0.0f;
             for (const auto& sample : g_profiler.GpuSamples())
-                ImGui::BulletText("%s: %.3f ms", sample.name.c_str(), sample.milliseconds);
+                if (sample.name == "Forward Extensions")
+                    forwardExtensionsMs = sample.milliseconds;
+            float feAccounted = 0.0f;
+            for (const auto& sample : g_profiler.GpuSamples()) {
+                const bool nested = sample.name.rfind("FE/", 0) == 0 ||
+                                    sample.name == "Terrain";
+                if (!nested) {
+                    ImGui::BulletText("%s: %.3f ms", sample.name.c_str(),
+                                      sample.milliseconds);
+                    continue;
+                }
+                feAccounted += sample.milliseconds;
+                ImGui::Indent(16.0f);
+                if (forwardExtensionsMs > 0.0001f)
+                    ImGui::BulletText("%s: %.3f ms  (%.0f%%)", sample.name.c_str(),
+                                      sample.milliseconds,
+                                      100.0f * sample.milliseconds / forwardExtensionsMs);
+                else
+                    ImGui::BulletText("%s: %.3f ms", sample.name.c_str(),
+                                      sample.milliseconds);
+                ImGui::Unindent(16.0f);
+            }
+            if (forwardExtensionsMs > 0.0001f) {
+                ImGui::Indent(16.0f);
+                // What the sub-scopes do not explain: the viewmodel, ropes,
+                // helicopters, muzzle/beam effects and per-pass state changes.
+                ImGui::TextDisabled("FE/unscoped: %.3f ms",
+                                    forwardExtensionsMs - feAccounted);
+                ImGui::Unindent(16.0f);
+            }
             ImGui::TextDisabled("GPU results delayed by frames in flight");
         } else {
             ImGui::TextDisabled("GPU timestamp queries unavailable");
@@ -1545,6 +1651,27 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     vb.currentDrawCall, vb.persistentVertexCount);
                 ImGui::Text("  Persistent meshes: %u",
                     static_cast<UINT>(vb.meshes.size()));
+                // Geometry pool occupancy. Destruction recycles its merged
+                // batches through here, so a climbing "used" with no free
+                // ranges is what running out looks like -- and running out is
+                // silent otherwise: registration just fails and the chunks stop
+                // drawing.
+                {
+                    const float vertexUse = 100.0f *
+                        static_cast<float>(vb.persistentVertexCount) /
+                        static_cast<float>(VB_MAX_VERTICES);
+                    ImGui::Text("  Geometry pool: %u/%u verts (%.1f%%)  "
+                        "free %zu  quarantined %zu",
+                        vb.persistentVertexCount, VB_MAX_VERTICES, vertexUse,
+                        vb.geometryPool.FreeRangeCount(),
+                        vb.geometryPool.QuarantinedRangeCount());
+                    if (vb.GeometryRegistrationFailures())
+                        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                            "  Geometry pool FULL: %llu registrations dropped "
+                            "(geometry missing from visibility pass)",
+                            static_cast<unsigned long long>(
+                                vb.GeometryRegistrationFailures()));
+                }
                 // Texture-array occupancy: the fixed materialTextures[64] array
                 // is the wall a bindless heap would remove, so show how close
                 // this scene actually is to it rather than guessing.
@@ -1779,6 +1906,53 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::Checkbox("Edge AA (N=2)", &vb.edgeAAEnabled);
             ImGui::Checkbox("Extension Motion Vectors",
                             &vb.extensionMotionVectors);
+            // Terrain rasterizes IDs into the visibility buffer and is shaded
+            // in the resolve instead of the forward pass. On by default; turn
+            // it off to fall back to the forward terrain path, which remains
+            // the parity reference.
+            {
+                bool terrainInVB = vb.TerrainVisibilityRequested();
+                if (ImGui::Checkbox("Terrain in Visibility Buffer",
+                                    &terrainInVB))
+                    vb.SetTerrainVisibilityRequested(terrainInVB);
+                if (terrainInVB) {
+                    // Every resolve tier has a terrain PSO, so this only trips
+                    // when that tier's PSO failed to build or terrain has not
+                    // published its layer arrays yet.
+                    if (!vb.TerrainVisibilityReady())
+                        ImGui::TextDisabled(
+                            "  unavailable (no terrain PSO for this resolve "
+                            "tier)");
+                    else if (!g_terrainInVisibilityBuffer)
+                        ImGui::TextDisabled("  waiting for terrain draw");
+                    else
+                        ImGui::TextDisabled("  terrain shaded in VB Resolve");
+                }
+            }
+            // Destruction chunks are always registered into the visibility
+            // buffer; this decides whether the forward extensions pass also
+            // redraws them. That redraw measured 6.9 ms -- 84% of the pass --
+            // so it is on by default.
+            {
+                bool destructionInVB = vb.DestructionVisibilityRequested();
+                if (ImGui::Checkbox("Destruction Chunks in Visibility Buffer",
+                                    &destructionInVB))
+                    vb.SetDestructionVisibilityRequested(destructionInVB);
+                if (destructionInVB) {
+                    if (!g_destructionInVisibilityBuffer)
+                        ImGui::TextDisabled(
+                            "  forward redraw still active (chunks not fully "
+                            "registered)");
+                    else
+                        ImGui::TextDisabled("  chunks shaded in VB Resolve");
+                }
+                // The direct measurement: in hybrid mode with the toggle on,
+                // "forward drawn" should read 0.
+                ImGui::TextDisabled("  chunk primitives: %u forward drawn, "
+                                    "%u owned by VB",
+                                    g_destructionForwardPrimitivesDrawn,
+                                    g_destructionVisibilityOwnedPrimitives);
+            }
             if (vb.temporalEffectsEnabled) {
                 ImGui::SliderFloat("TAA History Weight", &vb.taaFeedback,
                                    0.70f, 0.95f, "%.2f");

@@ -127,6 +127,12 @@ struct MeshPrimitive {
     // Set only after visibility geometry registration succeeds. Forward hybrid
     // filtering checks this so capacity failures never make geometry disappear.
     UINT visibilityMeshID = UINT_MAX;
+    // Geometry that is rebuilt during play rather than living for the whole
+    // level -- destruction re-merges its chunk batches on every fracture. The
+    // visibility buffer recycles these mesh slots when the primitive is
+    // retired; permanent geometry keeps its slot, since a stale draw call
+    // pointing at a reused permanent slot would sample the wrong vertices.
+    bool transientGeometry = false;
     // CPU-side local bounds retained for conservative culling when this
     // primitive must use the conventional IA raster fallback.
     DirectX::XMFLOAT3 boundsMin = {};

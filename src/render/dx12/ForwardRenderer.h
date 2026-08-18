@@ -34,6 +34,26 @@ extern ImpactParticleRendererDX12 g_particleRenderer;
 // GPU-safe clamps). Defined in main.cpp; declared here so the terrain draw
 // uses the same params as foliage/collision/GI instead of a stale default.
 TerrainRendererDX12::Params CurrentTerrainParams();
+// Set each frame by the visibility raster pass: true only once terrain has
+// actually been rasterized into the visibility buffer, meaning the resolve will
+// shade it. The forward terrain draw is skipped only then, so any failure on
+// the visibility side leaves terrain drawing exactly as it always did.
+extern bool g_terrainInVisibilityBuffer;
+// True while destruction chunks are shaded through the visibility resolve this
+// frame rather than redrawn in the forward extensions pass. Defined in main.cpp
+// and set by the visibility raster pass, same contract as the terrain flag
+// above: only ever true once the chunks really did register visibility IDs.
+extern bool g_destructionInVisibilityBuffer;
+// Destruction primitives that actually rasterised in the forward pass. In
+// hybrid mode this should sit at zero: the visibility buffer owns those chunks,
+// so re-drawing them here is pure overdraw. A non-zero value is the direct
+// measurement of how much of the FE/Destruction cost is redundant.
+inline UINT g_destructionForwardPrimitivesDrawn = 0;
+// Destruction primitives skipped because the visibility buffer owns them.
+inline UINT g_destructionVisibilityOwnedPrimitives = 0;
+// Set while drawing destruction geometry so the shared node/mesh draw helpers
+// can attribute their per-primitive decisions to destruction.
+inline bool g_countingDestructionPrimitives = false;
 extern bool g_showH2Model;
 extern WaterVolume g_water;
 extern WaterVolume g_ocean;   // sea ringing the island
@@ -610,6 +630,16 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
         const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
             !transparent && !alphaCutout && !prim.skinBuffer &&
             !prim.vertices.empty();
+        if (g_countingDestructionPrimitives) {
+
+            if (visibilityExtensionsOnly && visibilityOwned)
+
+                ++g_destructionVisibilityOwnedPrimitives;
+
+            else ++g_destructionForwardPrimitivesDrawn;
+
+        }
+
         if (visibilityExtensionsOnly && visibilityOwned) continue;
         if (prim.material) {
             if (transparent) shader.UseTransparent(); else shader.Use(false);
@@ -689,6 +719,108 @@ inline bool RasterPrimitiveIntersectsFrustum(const MeshPrimitive& primitive,
              outsideNear || outsideFar);
 }
 
+// Whole-model local bounds, unioned over every primitive in the node tree with
+// each node's own global transform folded in. DrawSceneNode already culls per
+// primitive, but only on the raster fallback -- mesh-shader draws defer to the
+// amplification shader, so an off-screen instance still pays the full node walk
+// and per-primitive state before the GPU rejects it. One test up front skips
+// the whole instance instead.
+struct ModelBoundsCacheEntry {
+    std::weak_ptr<SceneNode> root;
+    XMFLOAT3 boundsMin{};
+    XMFLOAT3 boundsMax{};
+    bool valid = false;
+};
+
+inline std::unordered_map<const SceneNode*, ModelBoundsCacheEntry>
+    g_modelBoundsCache;
+
+inline void AccumulateModelBounds(const SceneNode* node, XMFLOAT3& lo,
+                                  XMFLOAT3& hi, bool& any) {
+    if (!node) return;
+    if (node->mesh) {
+        const XMMATRIX global = XMLoadFloat4x4(&node->globalTransform);
+        for (const MeshPrimitive& prim : node->mesh->primitives) {
+            if (!prim.boundsValid) continue;
+            for (UINT corner = 0; corner < 8; ++corner) {
+                const XMVECTOR local = XMVectorSet(
+                    (corner & 1) ? prim.boundsMax.x : prim.boundsMin.x,
+                    (corner & 2) ? prim.boundsMax.y : prim.boundsMin.y,
+                    (corner & 4) ? prim.boundsMax.z : prim.boundsMin.z,
+                    1.0f);
+                XMFLOAT3 p;
+                XMStoreFloat3(&p, XMVector3Transform(local, global));
+                if (!any) { lo = hi = p; any = true; continue; }
+                lo.x = (std::min)(lo.x, p.x); hi.x = (std::max)(hi.x, p.x);
+                lo.y = (std::min)(lo.y, p.y); hi.y = (std::max)(hi.y, p.y);
+                lo.z = (std::min)(lo.z, p.z); hi.z = (std::max)(hi.z, p.z);
+            }
+        }
+    }
+    for (const std::shared_ptr<SceneNode>& child : node->children)
+        AccumulateModelBounds(child.get(), lo, hi, any);
+}
+
+inline const ModelBoundsCacheEntry& GetModelBounds(
+    const std::shared_ptr<SceneNode>& node) {
+    static const ModelBoundsCacheEntry empty;
+    if (!node) return empty;
+    auto found = g_modelBoundsCache.find(node.get());
+    if (found != g_modelBoundsCache.end()) {
+        std::shared_ptr<SceneNode> cached = found->second.root.lock();
+        if (cached.get() == node.get()) return found->second;
+        g_modelBoundsCache.erase(found);
+    }
+    ModelBoundsCacheEntry entry;
+    entry.root = node;
+    AccumulateModelBounds(node.get(), entry.boundsMin, entry.boundsMax,
+                          entry.valid);
+    auto inserted = g_modelBoundsCache.emplace(node.get(), std::move(entry));
+    if ((g_modelBoundsCache.size() & 511u) == 0u) {
+        for (auto it = g_modelBoundsCache.begin();
+             it != g_modelBoundsCache.end();) {
+            if (it->second.root.expired()) it = g_modelBoundsCache.erase(it);
+            else ++it;
+        }
+    }
+    return inserted.first->second;
+}
+
+// Clip-space AABB test, same conservative rules as the per-primitive version:
+// anything crossing the camera plane is kept rather than risking near-camera pop.
+inline bool ModelBoundsVisible(const ModelBoundsCacheEntry& bounds,
+                               const XMMATRIX& modelViewProjection) {
+    if (!bounds.valid) return true;
+    bool outsideLeft = true, outsideRight = true;
+    bool outsideBottom = true, outsideTop = true;
+    bool outsideNear = true, outsideFar = true;
+    for (UINT corner = 0; corner < 8; ++corner) {
+        const XMVECTOR local = XMVectorSet(
+            (corner & 1) ? bounds.boundsMax.x : bounds.boundsMin.x,
+            (corner & 2) ? bounds.boundsMax.y : bounds.boundsMin.y,
+            (corner & 4) ? bounds.boundsMax.z : bounds.boundsMin.z,
+            1.0f);
+        XMFLOAT4 clip;
+        XMStoreFloat4(&clip, XMVector4Transform(local, modelViewProjection));
+        if (clip.w <= 0.0f) return true;
+        outsideLeft &= clip.x < -clip.w;
+        outsideRight &= clip.x > clip.w;
+        outsideBottom &= clip.y < -clip.w;
+        outsideTop &= clip.y > clip.w;
+        outsideNear &= clip.z < 0.0f;
+        outsideFar &= clip.z > clip.w;
+    }
+    return !(outsideLeft || outsideRight || outsideBottom || outsideTop ||
+             outsideNear || outsideFar);
+}
+
+// Per-frame prefab instance cull counters, shown next to the pass timings.
+struct PrefabDrawStats {
+    int considered = 0;
+    int drawn = 0;
+};
+inline PrefabDrawStats g_prefabDrawStats;
+
 struct ForwardExtensionListCacheEntry {
     std::weak_ptr<SceneNode> root;
     std::vector<SceneNode*> nodes;
@@ -766,6 +898,16 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
             const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
                 !transparent && !alphaCutout && !prim.skinBuffer &&
                 !prim.vertices.empty();
+            if (g_countingDestructionPrimitives) {
+
+                if (visibilityExtensionsOnly && visibilityOwned)
+
+                    ++g_destructionVisibilityOwnedPrimitives;
+
+                else ++g_destructionForwardPrimitivesDrawn;
+
+            }
+
             if (visibilityExtensionsOnly && visibilityOwned) continue;
             const D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress = prim.meshletDescBuffer
                 ? prim.meshletDescBuffer->GetGPUVirtualAddress() : 0;
@@ -1036,6 +1178,19 @@ public:
 // Gribb-Hartmann plane extraction from the CPU-side (row-vector) view*proj.
 // Planes come out unnormalised with inward-facing normals; SphereVisible scales
 // the radius test by the plane length instead of normalising here.
+// Palm crown half-extent in normalised model units. The crown is the widest
+// slice, so using it for every slice keeps trunk spheres conservative rather
+// than clipping a trunk that is still on screen.
+inline constexpr float kPalmSliceExtent = 1.5f;
+
+// Per-frame palm cull counters, for confirming that the Forward Extensions GPU
+// cost tracks how many palms actually survive the frustum test.
+struct PalmDrawStats {
+    int considered = 0;
+    int drawn = 0;
+};
+inline PalmDrawStats g_palmDrawStats;
+
 inline void BuildFrustumPlanes(const XMMATRIX& viewProj, XMFLOAT4 planes[6]) {
     XMFLOAT4X4 m; XMStoreFloat4x4(&m, viewProj);
     const auto set = [&](int i, float a, float b, float c, float d) {
@@ -1052,6 +1207,12 @@ inline void BuildFrustumPlanes(const XMMATRIX& viewProj, XMFLOAT4 planes[6]) {
 // Diagnostic: chunks skipped by the frustum cull in the last recorded frame.
 inline UINT g_destructionCulledThisFrame = 0;
 inline UINT g_destructionBatchesThisFrame = 0;
+// Cull diagnostics: distinguishes "radius never set" from "radius too large" --
+// the culled count alone cannot tell those apart.
+inline UINT g_destructionZeroRadiusBatches = 0;
+inline UINT g_destructionCulledBatchesThisFrame = 0;
+inline UINT g_destructionBatchCount = 0;
+inline float g_destructionMaxBatchRadius = 0.0f;
 inline UINT g_destructionChunksSubmittedThisFrame = 0;
 
 inline bool SphereVisible(const XMFLOAT4 planes[6], const XMFLOAT3& c, float r) {
@@ -1258,10 +1419,15 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     g_terrain.wireframe = scene.meshletWireframe;
     ForwardStaticBatchQueueDX12 staticBatches;
 
-    // Floor: visibility owns the flat floor in hybrid mode. Mesh terrain remains
-    // on its amplification/mesh path until it emits visibility IDs directly.
+    // Floor: visibility owns the flat floor in hybrid mode. Mesh terrain rides
+    // this pass too, unless it emitted visibility IDs itself this frame -- then
+    // the resolve shades it and drawing it again here would be pure overdraw.
+    const bool terrainOwnedByVisibility =
+        visibilityExtensionsOnly && g_terrainInVisibilityBuffer;
     XMMATRIX model = XMMatrixIdentity();
-    if (!visibilityExtensionsOnly || (scene.useMeshTerrain && g_terrain.supported)) {
+    if (!visibilityExtensionsOnly ||
+        (scene.useMeshTerrain && g_terrain.supported &&
+         !terrainOwnedByVisibility)) {
     model = (!scene.useMeshTerrain || !g_terrain.supported) &&
         g_stressTestMode
         ? XMMatrixScaling(6.4f, 1.0f, 6.4f)
@@ -1322,19 +1488,45 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     // Separate destructible brick wall beside the house.
     g_destructionCulledThisFrame = 0;
+    g_destructionCulledBatchesThisFrame = 0;
     g_destructionBatchesThisFrame = 0;
     g_destructionChunksSubmittedThisFrame = 0;
+    g_destructionForwardPrimitivesDrawn = 0;
+    g_destructionVisibilityOwnedPrimitives = 0;
+    // Chunk geometry is skipped wholesale when the visibility resolve owns it.
+    // The ragdoll, rope and debris draws further down have no visibility
+    // representation, so they still run either way.
+    const bool destructionChunksOwnedByVisibility =
+        visibilityExtensionsOnly && g_destructionInVisibilityBuffer;
     if (scene.useDestruction && g_destruction.IsInitialized()) {
+        // Sub-scope: destruction chunks are the largest draw-count block in this
+        // pass when both houses stand (~588 chunks before the frustum test).
+        ProfilerDX12::Scope destructionScope(
+            g_profiler, "FE/Destruction", g_dx12.commandList.Get());
         // ~588 chunk draws when both houses stand; the frustum test drops the
         // ones behind the camera before any CBV write or draw is recorded.
         XMFLOAT4 frustum[6];
         BuildFrustumPlanes(view * proj, frustum);
+        // Attribute per-primitive draw/skip decisions below to destruction.
+        // Cleared before the ragdoll and rope draws that follow, which have no
+        // visibility-buffer representation and legitimately belong here.
+        g_countingDestructionPrimitives = true;
         const auto& batches = g_destruction.GetRenderBatches();
-        if (!batches.empty()) {
+        g_destructionZeroRadiusBatches = 0;
+        g_destructionMaxBatchRadius = 0.0f;
+        g_destructionBatchCount = static_cast<UINT>(batches.size());
+        if (!batches.empty() && !destructionChunksOwnedByVisibility) {
             for (const DestructionRenderBatch& batch : batches) {
+                // Diagnostic: a zero radius silently disables the test below, and
+                // an oversized radius makes it always pass. Both look identical
+                // from the culled counter alone.
+                if (batch.sphereRadius <= 0.0f) ++g_destructionZeroRadiusBatches;
+                g_destructionMaxBatchRadius =
+                    (std::max)(g_destructionMaxBatchRadius, batch.sphereRadius);
                 if (batch.sphereRadius > 0.0f &&
                     !SphereVisible(frustum, batch.sphereCenter, batch.sphereRadius)) {
                     g_destructionCulledThisFrame += batch.chunkCount;
+                    ++g_destructionCulledBatchesThisFrame;
                     continue;
                 }
                 DrawSceneNode(batch.colourNode, shader,
@@ -1344,7 +1536,11 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 g_destructionChunksSubmittedThisFrame += batch.chunkCount;
             }
         }
-        for (const DestructionRenderItem& item : g_destruction.GetRenderItems()) {
+        static const std::vector<DestructionRenderItem> kNoChunkItems;
+        for (const DestructionRenderItem& item :
+                 destructionChunksOwnedByVisibility
+                     ? kNoChunkItems
+                     : g_destruction.GetRenderItems()) {
                 if (item.sphereRadius > 0.0f &&
                     !SphereVisible(frustum, item.sphereCenter, item.sphereRadius)) {
                     ++g_destructionCulledThisFrame;
@@ -1355,6 +1551,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 ++g_destructionBatchesThisFrame;
                 ++g_destructionChunksSubmittedThisFrame;
         }
+        g_countingDestructionPrimitives = false;
         shader.Use(scene.wireframeMode);
         for (const RagdollRenderItem& item : g_destruction.GetRagdollRenderItems()) {
             if (item.sphereRadius > 0.0f &&
@@ -1415,10 +1612,35 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Palm trees: trunk sections and fronds are boxes driven by physics bodies,
     // standing or toppling, so they all draw through the ordinary cube path.
     if (!g_emptyLevelMode && g_trees.IsInitialized()) {
+        ProfilerDX12::Scope palmScope(
+            g_profiler, "FE/Palms", g_dx12.commandList.Get());
         shader.Use(scene.wireframeMode);
+        // Palms used to draw unconditionally, so a grove behind the camera still
+        // paid full pixel cost -- alpha-tested crowns overdraw hard when they do
+        // land on screen, which reads as a view-dependent spike in this pass.
+        // Cull per item the way the dandelion block below already does.
+        XMFLOAT4 palmFrustum[6];
+        BuildFrustumPlanes(view * proj, palmFrustum);
+        g_palmDrawStats.considered = 0;
+        g_palmDrawStats.drawn = 0;
         for (const TreeItem& item : g_trees.GetItems()) {
             if (item.crown && !includeGrass) continue;
             const XMMATRIX xf = XMLoadFloat4x4(&item.transform);
+            ++g_palmDrawStats.considered;
+            // Bounding sphere from the item's world transform: translation is the
+            // slice centre, and the longest basis-row length is its world scale.
+            // modelScale alone is wrong for toppling logs, whose transform also
+            // carries the physics rotation.
+            XMFLOAT4X4 xfm; XMStoreFloat4x4(&xfm, xf);
+            const XMFLOAT3 centre(xfm._41, xfm._42, xfm._43);
+            const float sx = std::sqrt(xfm._11 * xfm._11 + xfm._12 * xfm._12 + xfm._13 * xfm._13);
+            const float sy = std::sqrt(xfm._21 * xfm._21 + xfm._22 * xfm._22 + xfm._23 * xfm._23);
+            const float sz = std::sqrt(xfm._31 * xfm._31 + xfm._32 * xfm._32 + xfm._33 * xfm._33);
+            // Slice meshes are normalised to roughly unit height, so the longest
+            // world-space axis scaled by the crown's half-extent bounds any slice.
+            const float radius = (std::max)(sx, (std::max)(sy, sz)) * kPalmSliceExtent;
+            if (!SphereVisible(palmFrustum, centre, radius)) continue;
+            ++g_palmDrawStats.drawn;
             // If the real palm model loaded, each physics box carries the identity
             // of a model slice (a trunk segment or the crown); draw that slice's
             // geometry at the box's transform. Otherwise the item is a plain box.
@@ -1450,6 +1672,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // one mesh-shader dispatch. CPU work is limited to cheap distance/frustum
     // tests; no draw call is emitted per plant when mesh shaders are enabled.
     if (!g_emptyLevelMode && g_dandelionModel && !g_dandelionInstances.empty()) {
+        ProfilerDX12::Scope dandelionScope(
+            g_profiler, "FE/Dandelions", g_dx12.commandList.Get());
         XMFLOAT4 dandelionFrustum[6];
         BuildFrustumPlanes(view * proj, dandelionFrustum);
         static std::vector<XMMATRIX> visibleDandelions;
@@ -1489,6 +1713,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Blades are built in world space, hence the identity model matrix. Opaque, so
     // this lands before the transparent water below or it would sort wrong.
     if (includeGrass && !g_emptyLevelMode && g_grass.IsInitialized() && shader.GetGrassPipelineState()) {
+        // Distinct from the separate "Grass 4x MSAA" pass in the frame list --
+        // this is the in-pass instanced blade submission.
+        ProfilerDX12::Scope grassScope(
+            g_profiler, "FE/Grass", g_dx12.commandList.Get());
         // The shader fades blades with distance, and the cull below needs it too.
         g_grass.SetViewer(scene.camera.Position);
 
@@ -1677,12 +1905,27 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
     }
 
+    g_prefabDrawStats.considered = 0;
+    g_prefabDrawStats.drawn = 0;
+    {
+    ProfilerDX12::Scope prefabScope(
+        g_profiler, "FE/Prefabs", g_dx12.commandList.Get());
     for (const PrefabRenderBatch& batch : prefabRenderBatches) {
         if (!batch.model) continue;
-        for (const XMMATRIX& transform : batch.transforms)
+        // One whole-model test per instance. Without it an off-screen prefab
+        // still walked its node tree and recorded per-primitive state before
+        // the GPU meshlet cull threw the work away.
+        const ModelBoundsCacheEntry& bounds = GetModelBounds(batch.model);
+        const XMMATRIX viewProj = view * proj;
+        for (const XMMATRIX& transform : batch.transforms) {
+            ++g_prefabDrawStats.considered;
+            if (!ModelBoundsVisible(bounds, transform * viewProj)) continue;
+            ++g_prefabDrawStats.drawn;
             DrawSceneNode(batch.model, shader, transform,
                           view, proj, lightSpace, visibilityExtensionsOnly);
+        }
         shader.Use(scene.wireframeMode);
+    }
     }
 
     if (!g_emptyLevelMode && g_helicopterModel && scene.showHelicopter) {
@@ -2379,7 +2622,13 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             shader.NextDrawCall();
         }
     }
-    staticBatches.Flush(shader, view, proj, lightSpace);
+    {
+        // Everything Submit()ed above lands here as merged instanced draws, so
+        // this scope carries the barrels, humvees and boat, not just the flush.
+        ProfilerDX12::Scope staticScope(
+            g_profiler, "FE/StaticBatches", g_dx12.commandList.Get());
+        staticBatches.Flush(shader, view, proj, lightSpace);
+    }
 
 
         // The CC0 flash is rotated per shot and drawn in two additive layers:

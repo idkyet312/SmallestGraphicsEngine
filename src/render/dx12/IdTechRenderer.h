@@ -69,6 +69,10 @@ struct IdTechDrawItem {
     bool alphaCutout = false;
     bool alphaFromLuminance = false;
     XMFLOAT4 palmWindRoot{};
+    // Destruction chunk geometry. Tracked so the pass can tell whether those
+    // chunks actually registered visibility IDs this frame, which is what lets
+    // the forward pass skip redrawing them.
+    bool destructionChunk = false;
 };
 
 struct FrustumPlanes {
@@ -289,12 +293,17 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items
         AppendOpaqueSceneNodeDrawItems(importedScene, XMMatrixIdentity(), items);
 
     if (!g_emptyLevelMode && scene.useDestruction && g_destruction.IsInitialized()) {
+        const size_t destructionBegin = items.size();
         for (const DestructionRenderBatch& batch : g_destruction.GetRenderBatches())
             AppendOpaqueSceneNodeDrawItems(batch.colourNode,
                 XMLoadFloat4x4(&batch.transform), items);
         for (const DestructionRenderItem& item : g_destruction.GetRenderItems())
             AppendOpaqueSceneNodeDrawItems(item.node,
                 XMLoadFloat4x4(&item.transform), items);
+        // Tagged in bulk rather than threaded through the append helpers, which
+        // are shared with every other geometry source in this function.
+        for (size_t i = destructionBegin; i < items.size(); ++i)
+            items[i].destructionChunk = true;
     }
 
     if (!g_emptyLevelMode && g_trees.IsInitialized()) {
@@ -703,11 +712,21 @@ inline void FillFrameMatrixBufferForIndirect(ShaderDX12& matrixShader,
                                         D3D12_GPU_VIRTUAL_ADDRESS& outCBV) {
     UINT bufferIndex = g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME;
 
-    MatrixBufferDX12 data;
+    // Zero-initialised: the visibility VS only reads model/view/projection, but
+    // terrain's amplification shader shares this CBV and culls against
+    // modelViewProjection. Leaving the struct uninitialised fed it garbage
+    // frustum planes, and the resulting DispatchMesh count hung the GPU.
+    MatrixBufferDX12 data = {};
     data.model = XMMatrixIdentity();
     data.view = XMMatrixTranspose(view);
     data.projection = XMMatrixTranspose(proj);
     data.lightSpaceMatrix = XMMatrixTranspose(lightSpace);
+    // model is identity here, so modelView/MVP are just view and view*proj.
+    data.modelView = XMMatrixTranspose(view);
+    data.modelViewProjection = XMMatrixTranspose(view * proj);
+    data.previousViewProjection =
+        XMMatrixTranspose(matrixShader.previousViewProjection);
+    data.previousModel = XMMatrixIdentity();
     data.palmWind = matrixShader.palmWindFrame.wind;
     data.palmPrimary = matrixShader.palmWindFrame.primary;
     data.palmSecondary = matrixShader.palmWindFrame.secondary;
@@ -775,11 +794,19 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     registeredItems.clear();
     registeredItems.reserve(drawItems.size());
 
+    // Destruction chunks may only be skipped by the forward pass if every one
+    // of them registered. A partial registration -- the pool filling up, say --
+    // must leave the forward redraw in place, or the unregistered chunks would
+    // be drawn by neither pass and simply vanish.
+    UINT destructionChunksSeen = 0;
+    UINT destructionChunksRegistered = 0;
     for (IdTechDrawItem item : drawItems) {
+        if (item.destructionChunk) ++destructionChunksSeen;
         item.visibilityMeshID = item.primitive
             ? vb.RegisterPrimitive(item.primitive)
             : (item.isCube ? cubeMesh : planeMesh);
         if (item.visibilityMeshID == VB_INVALID_MESH) continue;
+        if (item.destructionChunk) ++destructionChunksRegistered;
         if (item.instanceKey)
             item.instanceKey ^= static_cast<uint64_t>(item.visibilityMeshID + 1u) *
                 0x9e3779b97f4a7c15ull;
@@ -937,6 +964,70 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
                 g_dx12.commandList->DrawInstanced(vertexCount, 1, 0, 0);
             }
     }
+
+    // Terrain rasterizes into the visibility buffer before the pass ends, using
+    // the same amplification/mesh shaders the forward path uses -- so the
+    // clipmap, culling and LOD are unchanged, and only the pixel shader
+    // differs. It goes last because it switches to the mesh pipeline and binds
+    // its own root tables, which would disturb the IA draws above.
+    //
+    // terrainVisibilityActiveThisFrame is what the resolve keys off, and what
+    // ForwardRenderer reads to decide whether to skip the forward terrain draw.
+    // It is set only after the draw is actually recorded, so a failure anywhere
+    // here leaves terrain on the forward path rather than dropping it.
+    vb.terrainVisibilityActiveThisFrame = false;
+    // Publish terrain's textures and material parameters BEFORE the readiness
+    // test, not inside it. TerrainVisibilityReady() requires the layer arrays
+    // to be non-null, so setting them inside the gate they gate is a deadlock:
+    // the arrays never arrive, the toggle reports unavailable forever.
+    if (scene.useMeshTerrain && g_terrain.supported) {
+        // Mirrors SetTerrainMaterial: terrain scans are OpenGL normal maps, and
+        // the authored footpaths are built-in levels only.
+        vb.SetTerrainMaterialParams(g_customLevelMode ? 0.0f : 3.0f, -1.0f);
+        vb.SetTerrainTextures(g_terrain.terrainAlbedoArray.Get(),
+                              g_terrain.terrainNormalArray.Get(),
+                              g_terrain.terrainRoughnessArray.Get());
+    }
+    if (scene.useMeshTerrain && g_terrain.VisibilitySupported() &&
+        vb.TerrainVisibilityReady()) {
+        ProfilerDX12::Scope terrainScope(
+            g_profiler, "VB Terrain", g_dx12.commandList.Get());
+        TerrainRendererDX12::Params terrainParams = CurrentTerrainParams();
+        terrainParams.heightScale = scene.terrainHeightScale;
+        // DrawVisibility switches to the main graphics root signature, so
+        // matrices and camera are (re)bound here against that signature rather
+        // than inherited from the visibility pass. Both matter to the AS:
+        // modelViewProjection drives its frustum cull, and viewPos is what
+        // every clipmap ring origin snaps to.
+        if (g_terrain.PrepareVisibilityRootSignature(shader)) {
+            // Terrain rasterizes with the SAME projection as every other
+            // visibility-pass draw. It shares one depth buffer with them, and
+            // the resolve rebuilds world position from that depth through a
+            // single invViewProj -- so a projection of its own would make the
+            // reconstructed surface swing against the camera. The forward
+            // extensions pass drawing unjittered over jittered depth is a
+            // pre-existing, accepted sub-pixel tradeoff; it is not terrain's to
+            // correct here.
+            shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
+            shader.SetCamera(scene.camera.Position);
+            vb.SetTerrainProjection(proj);
+        }
+        if (g_terrain.DrawVisibility(shader, terrainParams))
+            vb.terrainVisibilityActiveThisFrame = true;
+        // No pipeline restore here. Terrain is the last draw in the pass, and
+        // binding an IA pipeline built for the main root signature while the
+        // visibility render target is still set would leave the command list
+        // in a mismatched state for no benefit. The next pass sets its own
+        // root signature and PSO before it draws anything.
+    }
+    g_terrainInVisibilityBuffer = vb.terrainVisibilityActiveThisFrame;
+    // Only claim the chunks for the resolve when the toggle is on AND every
+    // chunk this frame registered. Either condition failing leaves the forward
+    // pass responsible for all of them, which is the safe direction: chunks
+    // drawn twice cost performance, chunks drawn by nobody are invisible.
+    g_destructionInVisibilityBuffer = vb.DestructionVisibilityRequested() &&
+        destructionChunksSeen > 0 &&
+        destructionChunksRegistered == destructionChunksSeen;
 
     vb.EndVisibilityPass(g_dx12.commandList.Get());
     }

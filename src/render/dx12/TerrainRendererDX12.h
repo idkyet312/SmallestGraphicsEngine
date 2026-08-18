@@ -59,6 +59,9 @@ public:
     ComPtr<ID3D12PipelineState> psoWireframeMSAA;
     ComPtr<ID3D12PipelineState> psoHDR;
     ComPtr<ID3D12PipelineState> psoWireframeHDR;
+    // Writes terrain IDs into the R32G32_UINT visibility buffer instead of
+    // shading. Optional: if this PSO is missing the forward path still runs.
+    ComPtr<ID3D12PipelineState> psoVisibility;
     ComPtr<ID3D12GraphicsCommandList6> commandList6;
     ComPtr<ID3D12Resource> terrainAlbedoArray;
     ComPtr<ID3D12Resource> terrainNormalArray;
@@ -149,6 +152,28 @@ public:
         stream.sample.value.Count = 1;
         stream.raster.value.MultisampleEnable = FALSE;
 
+        // Visibility variant: same AS/MS, a pixel shader that writes only IDs,
+        // and the R32G32_UINT visibility target. Built last among the solid
+        // PSOs so the raster/depth state above is still the default one.
+        // Failure is non-fatal -- terrain then simply stays on the forward path.
+        {
+            ComPtr<ID3DBlob> visPs;
+            if (SUCCEEDED(ReadCompiledShaderDX12(
+                    L"shaders/terrain_visibility_ps.cso", &visPs))) {
+                stream.ps.value = { visPs->GetBufferPointer(),
+                                    visPs->GetBufferSize() };
+                stream.rt.value.RTFormats[0] = DXGI_FORMAT_R32G32_UINT;
+                if (FAILED(device2->CreatePipelineState(
+                        &streamDesc, IID_PPV_ARGS(&psoVisibility)))) {
+                    std::cerr << "Terrain visibility PSO creation failed "
+                                 "(non-fatal; terrain stays forward)\n";
+                    psoVisibility.Reset();
+                }
+            }
+            stream.ps.value = { ps->GetBufferPointer(), ps->GetBufferSize() };
+            stream.rt.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
+
         stream.raster.value.FillMode = D3D12_FILL_MODE_WIREFRAME;
         ComPtr<ID3DBlob> wirePs;
         if (SUCCEEDED(ReadCompiledShaderDX12(L"shaders/wire_green_ps.cso", &wirePs))) {
@@ -199,6 +224,21 @@ public:
     }
 
     void SetHDRTargetEnabled(bool enabled) { hdrTargetEnabled = enabled; }
+
+    // terrainStyle is a bit field, not an enum:
+    //   bit 0 (1) = stress island layout (warped coast, bay, headland, pads)
+    //   bit 1 (2) = clipmap topology (tilesX = ring grid G, tilesZ = ring count)
+    // These are independent, so a stress island drawn as a clipmap is style 3.
+    // Equality tests against 1 silently dropped the coastline the moment the
+    // clipmap bit was set; always test the bit.
+    static constexpr UINT kStyleStressIsland = 1u;
+    static constexpr UINT kStyleClipmap = 2u;
+    static bool IsStressIsland(UINT terrainStyle) {
+        return (terrainStyle & kStyleStressIsland) != 0u;
+    }
+    static bool IsClipmap(UINT terrainStyle) {
+        return (terrainStyle & kStyleClipmap) != 0u;
+    }
 
     // CPU mirror of terrain_ms.hlsl's height function (hash21/noise2/fbm/
     // TerrainHeight), used for walking collision. Keep the two in sync - any
@@ -308,7 +348,7 @@ public:
             t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
             return 1.0f - t * t * (3.0f - 2.0f * t);
         };
-        if (params.terrainStyle == 1u && maxScale > 1.5f) {
+        if (IsStressIsland(params.terrainStyle) && maxScale > 1.5f) {
             const float warpedX = nx + sinf(nz * 0.055f) * 7.0f +
                 sinf((nx + nz) * 0.025f) * 4.0f;
             const float warpedZ = nz + sinf(nx * 0.047f) * 6.0f -
@@ -355,7 +395,7 @@ public:
             { 42.0f,  42.0f }, {-42.0f,  42.0f },
             {  0.0f, -42.0f }, { 42.0f, -42.0f }
         };
-        const int padCount = (params.terrainStyle == 1u && maxScale > 1.5f) ? 8 : 1;
+        const int padCount = (IsStressIsland(params.terrainStyle) && maxScale > 1.5f) ? 8 : 1;
         for (int i = 0; i < padCount; ++i) {
             float dpx = x - padCenters[i][0], dpz = z - padCenters[i][1];
             float dpad = sqrtf(dpx * dpx + dpz * dpz);
@@ -779,19 +819,64 @@ public:
         commandList6->SetGraphicsRoot32BitConstants(8, 15, &drawParams, 0);
         commandList6->SetGraphicsRootShaderResourceView(
             13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
-        // Clipmap (terrainStyle bit 1): tilesX=ring grid G, tilesZ=ring count R.
-        // Total tiles = ring0 (G*G) + (R-1) hollow rings (G*G - (G/2)^2 each).
-        UINT tileCount;
+        commandList6->DispatchMesh((TileCount(params) + 31) / 32, 1, 1);
+    }
+
+    bool VisibilitySupported() const {
+        return supported && psoVisibility;
+    }
+
+    // Rasterizes terrain into the visibility buffer: same amplification/mesh
+    // shaders and therefore the same clipmap, culling and LOD as Draw(), but
+    // the pixel shader writes a reserved ID plus the packed geometric normal
+    // instead of shading. The resolve rebuilds the surface from that and depth.
+    //
+    // Returns false when the visibility PSO is unavailable, which is the signal
+    // to fall back to the forward terrain draw for this frame.
+    // Switches the command list to the main graphics root signature, which the
+    // terrain AS/MS need and the visibility pass does not use.
+    //
+    // The visibility pass runs under visPassRootSig: four root parameters, no
+    // camera, no terrain params, no sculpt buffer. Terrain writes slots 7, 8
+    // and 13, which do not exist there -- an out-of-range root write, and what
+    // hung the GPU. The caller binds matrices/camera after this returns, so
+    // those land against the signature that actually declares them.
+    bool PrepareVisibilityRootSignature(ShaderDX12& shader) {
+        if (!VisibilitySupported() || !shader.rootSignature) return false;
+        commandList6->SetGraphicsRootSignature(shader.rootSignature.Get());
+        return true;
+    }
+
+    bool DrawVisibility(ShaderDX12& shader, const Params& params) {
+        if (!VisibilitySupported() || !shader.rootSignature) return false;
+        // The visibility pixel shader samples nothing, but the amplification and
+        // mesh shaders still read the matrix/camera/sculpt bindings through the
+        // shared root signature, so the same tables Draw() needs are bound here.
+        shader.RebindGraphicsResourceTables();
+        commandList6->SetGraphicsRootDescriptorTable(7, terrainTextureTable);
+        commandList6->SetPipelineState(psoVisibility.Get());
+        Params drawParams = params;
+        drawParams.sculptCount = static_cast<UINT>(s_sculptStamps.size());
+        drawParams.sculptMaxDisplacement = m_sculptMaxDisplacement;
+        UploadSculptStamps(g_dx12.frameIndex);
+        commandList6->SetGraphicsRoot32BitConstants(8, 15, &drawParams, 0);
+        commandList6->SetGraphicsRootShaderResourceView(
+            13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
+        commandList6->DispatchMesh((TileCount(params) + 31) / 32, 1, 1);
+        return true;
+    }
+
+    // Clipmap (terrainStyle bit 1): tilesX=ring grid G, tilesZ=ring count R.
+    // Total tiles = ring0 (G*G) + (R-1) hollow rings (G*G - (G/2)^2 each).
+    static UINT TileCount(const Params& params) {
         constexpr UINT kClipmapFlag = 2u;
         if ((params.terrainStyle & kClipmapFlag) != 0u) {
             const UINT G = params.tilesX, R = params.tilesZ;
             const UINT ring0 = G * G;
             const UINT ringN = ring0 - (G / 2) * (G / 2);
-            tileCount = ring0 + (R > 0 ? (R - 1) * ringN : 0);
-        } else {
-            tileCount = params.tilesX * params.tilesZ;
+            return ring0 + (R > 0 ? (R - 1) * ringN : 0);
         }
-        commandList6->DispatchMesh((tileCount + 31) / 32, 1, 1);
+        return params.tilesX * params.tilesZ;
     }
 
 private:

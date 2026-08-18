@@ -42,6 +42,7 @@
 #include "Scene.h"
 #include "TimeOfDay.h"
 #include "ForwardRenderer.h"
+#include "ForwardQualityDX12.h"
 #include "IdTechRenderer.h"
 #include "RaytracingDX12.h"
 #include "DXRDDGIRenderer.h"
@@ -95,6 +96,7 @@
 #include "AssetRegistry.h"
 #include "AssetWatcher.h"
 #include "PrefabThumbnailGenerator.h"
+#include "GameSettings.h"
 
 using namespace DirectX;
 
@@ -509,6 +511,12 @@ NavigationSystem            g_navigation;
 static LevelEditor          g_levelEditor;
 static Camera               g_editorCameraSnapshot;
 bool                        g_customLevelMode = false;
+bool                        g_terrainInVisibilityBuffer = false;
+bool                        g_destructionInVisibilityBuffer = false;
+// Set when a runtime crater or gouge changes the terrain height field. The
+// visibility resolve reads terrain history across frames, so it must drop that
+// history once the surface underneath it moves. Consumed in the render loop.
+bool                        g_terrainDeformedThisFrame = false;
 // Editor fly-camera speed multiplier, adjusted with the mouse wheel (Unreal
 // style). Persists across frames; clamped to a sane range.
 static float                g_editorCameraSpeed = 1.0f;
@@ -557,11 +565,31 @@ static size_t ActiveBanditSlotCount() {
 TerrainRendererDX12::Params CurrentTerrainParams() {
     TerrainRendererDX12::Params params;
     if (g_stressTestMode) {
-        params.tilesX = 32;
-        params.tilesZ = 32;
         params.islandScaleX = 2.0f;
         params.islandScaleZ = 2.0f;
-        params.terrainStyle = 1;   // warped coast + bay/headland + 8 house pads
+        params.terrainStyle = TerrainRendererDX12::kStyleStressIsland;
+        const ForwardExtensionQualityTier tier = g_forwardQuality.Tier();
+        if (tier == ForwardExtensionQualityTier::Full) {
+            // 32x32 uniform grid: 1024 tiles over +/-128 m.
+            params.tilesX = 32;
+            params.tilesZ = 32;
+        } else {
+            // Same +/-128 m coverage as the uniform grid, but as a camera-centred
+            // clipmap: ring 0 is 8x8 at 8 m, and each outer ring doubles tile
+            // size, so 3 rings reach 128 m. 160 tiles instead of 1024, with the
+            // height function untouched -- only the sampling topology changes.
+            params.terrainStyle |= TerrainRendererDX12::kStyleClipmap;
+            params.tilesX = 8u;   // G: ring grid
+            params.tilesZ = 3u;   // R: ring count
+            params.tileSize = 8.0f;
+            if (tier == ForwardExtensionQualityTier::Balanced) {
+                params.lodNear = 20.0f;
+                params.lodStep = 24.0f;
+            } else {
+                params.lodNear = 12.0f;
+                params.lodStep = 18.0f;
+            }
+        }
     } else {
         // Camera-centred geoclipmap: concentric LOD rings. Ring 0 is fine tiles
         // around the camera; each outer ring doubles the tile size, so the map
@@ -595,6 +623,23 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
         params.tilesZ = rings;                  // R: ring count
         params.originTileX = 0;
         params.originTileZ = 0;
+        // Adaptive quality on the ordinary level. The ring count is derived from
+        // the island size above and must not be reduced -- dropping a ring pulls
+        // the outermost tiles inside the shore and leaves a visible hole where
+        // the seabed should be. Tessellation is the safe lever: tightening the
+        // LOD thresholds makes each ring step down to coarser tessellation
+        // sooner, which cuts mesh-shader output without changing coverage.
+        switch (g_forwardQuality.Tier()) {
+            case ForwardExtensionQualityTier::Balanced:
+                params.lodNear = 20.0f;
+                params.lodStep = 24.0f;
+                break;
+            case ForwardExtensionQualityTier::Performance:
+                params.lodNear = 12.0f;
+                params.lodStep = 18.0f;
+                break;
+            default: break;   // Full: keep the 24 m / 28 m defaults
+        }
     }
     return params;
 }
@@ -627,6 +672,7 @@ static void AddExplosionTerrainCrater(const XMFLOAT3& impact) {
     // from the front too, so CPU collision and the GPU buffer stay in sync.
     g_game.world.AddRuntimeTerrainStamp(crater);
     g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
+    g_terrainDeformedThisFrame = true;
     const float foliageRadius = crater.radius * 0.5f;
     g_grass.AddRuntimeExclusion(impact.x, impact.z, foliageRadius);
     g_trees.ApplyExplosion(impact, foliageRadius);
@@ -679,6 +725,7 @@ static void AddBlackHawkCrashCraters(const XMFLOAT3& impact, float yaw) {
     }
     // One upload for all three, rather than re-syncing per stamp.
     g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
+    g_terrainDeformedThisFrame = true;
 }
 
 static size_t LiveBanditCount() {
@@ -712,6 +759,23 @@ static bool OccupiedInsertionVehicleTarget(XMFLOAT3& target) {
         return true;
     }
     return false;
+}
+
+// Player settings, loaded once at startup and rewritten whenever the player
+// changes one. Whether the settings panel is currently open is UI state rather
+// than a setting, so it is not persisted.
+static GameSettings g_settings;
+static bool g_showSettingsMenu = false;
+
+// Push the settings into the systems that actually consume them.
+//
+// Camera::MouseSensitivity is a member of the camera object, and the camera is
+// wholesale-replaced on level load and editor entry (`scene.camera = Camera(...)`),
+// which resets it to the constructor default. So this cannot be a one-time
+// assignment at startup -- it has to be reapplied after anything that rebuilds
+// the camera, or the player's sensitivity silently reverts when a level loads.
+static void ApplyGameSettings() {
+    scene.camera.MouseSensitivity = g_settings.mouseSensitivity;
 }
 
 // Player velocity in full 3D, differenced from the camera position each frame.
@@ -8738,6 +8802,9 @@ static void OpenMainMenu() {
     g_prefabAudioPlayers.clear();
     g_game.session.SetScreen(GameScreen::MainMenu);
     g_game.session.StopTimer();
+    // Always return to the menu's root rather than whatever sub-panel was open
+    // when the player last left it.
+    g_showSettingsMenu = false;
     g_insertionChoicePending = false;
     g_deploymentZones.clear();
     g_selectedDeploymentZone = -1;
@@ -8839,6 +8906,9 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
                                     player.position[2] });
             scene.camera.Yaw = player.rotation[1] - 90.0f;
             scene.camera.Pitch = player.rotation[0];
+            // The new camera carries the constructor's default sensitivity;
+            // restore the player's choice before any input reaches it.
+            ApplyGameSettings();
             scene.camera.ProcessMouseMovement(0.0f, 0.0f);
     }
 }
@@ -8928,6 +8998,8 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     if (g_emptyLevelMode)
         GunModel::DisableLoadoutRestriction();
     scene.camera = Camera(XMFLOAT3(0.0f, 5.0f, 10.0f));
+    // Fresh camera, so the player's sensitivity has to be pushed back in.
+    ApplyGameSettings();
     scene.gun.visible = true;
     scene.showHelicopter = !g_emptyLevelMode;
     ApplyRuntimeLevelBasics(true);
@@ -8993,6 +9065,33 @@ static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path) {
     }
     g_mainMenuLevelStatus.clear();
     StartLevelOne(hwnd, true, false, false, &loaded.level);
+}
+
+// Island 1 -- the campaign map, authored as Islandv10.json. The menu name and
+// the file name differ on purpose: the file keeps its authoring history (v10 is
+// the tenth revision of the island) while the player sees a level name.
+//
+// The path is searched rather than hardcoded because the two layouts differ:
+// the repo and the packaged build both carry Content/Levels, but the packager
+// also stages a flat levels/ copy, and a build/ run resolves against
+// build/Content/Levels. Trying each in turn keeps one button working in all of
+// them instead of only wherever it was last tested.
+static void StartIsland1(HWND hwnd) {
+    static constexpr const char* kCandidates[] = {
+        "Content/Levels/Islandv10.json",
+        "levels/Islandv10.json",
+        "build/Content/Levels/Islandv10.json",
+    };
+    std::error_code error;
+    for (const char* candidate : kCandidates) {
+        if (!std::filesystem::exists(candidate, error)) continue;
+        StartCustomLevel(hwnd, std::filesystem::path(candidate));
+        return;
+    }
+    // Say which file is missing rather than failing silently: a menu button
+    // that does nothing when clicked gives the player nothing to act on.
+    g_mainMenuLevelStatus =
+        "Island 1 not found (Islandv10.json missing from Content/Levels).";
 }
 
 static std::filesystem::path StartupLevelPath(const char* commandLine) {
@@ -9251,6 +9350,57 @@ static bool UIPrimaryButton(const char* label, float height = 52.0f) {
     return pressed;
 }
 
+// Settings panel. Drawn instead of the menu body rather than as a popup over
+// it, so the one column of controls stays the whole screen's subject.
+//
+// Every control writes the INI on release rather than on every frame the value
+// changes: dragging a slider produces a value per frame, and rewriting the file
+// at that rate would be pointless disk churn for a value the player has not
+// settled on yet.
+static void RenderSettingsMenu() {
+    UISectionLabel("MOUSE");
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+    ImGui::TextColored(UITheme::kTextDim, "SENSITIVITY");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+    // Logarithmic: the useful range is bunched at the low end, where a linear
+    // slider would put every usable value in its first fifth and make fine
+    // adjustment impossible.
+    if (ImGui::SliderFloat("##sensitivity", &g_settings.mouseSensitivity,
+                           GameSettings::kMinSensitivity,
+                           GameSettings::kMaxSensitivity,
+                           "%.3f", ImGuiSliderFlags_Logarithmic)) {
+        // Apply live so the player can feel the change while dragging, which
+        // is the only way to judge a sensitivity.
+        ApplyGameSettings();
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::TextColored(UITheme::kTextDim,
+                       "Lower is slower and steadier. Default %.2f.",
+                       GameSettings::kDefaultSensitivity);
+
+    ImGui::Dummy(ImVec2(0.0f, 16.0f));
+    if (UIMenuButton("RESET TO DEFAULTS", 38.0f)) {
+        g_settings.ResetToDefaults();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    // Saving already happened at the point of change, so backing out is not a
+    // "cancel" -- say BACK rather than implying unsaved edits are being kept.
+    if (UIPrimaryButton("BACK", 44.0f)) {
+        SaveGameSettings(g_settings);
+        g_showSettingsMenu = false;
+    }
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+    ImGui::TextColored(UITheme::kTextDim, "Saved to %s", GameSettingsPath());
+}
+
 static void RenderMainMenu(HWND hwnd) {
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     ImGui::GetBackgroundDrawList()->AddRectFilled(
@@ -9292,13 +9442,26 @@ static void RenderMainMenu(HWND hwnd) {
     }
     ImGui::Dummy(ImVec2(0.0f, 18.0f));
 
-    // Play: the one thing most sessions start with, so it carries the accent and
-    // extra height. Everything below is a secondary route.
+    // Settings replace the menu body below the title, keeping the wordmark and
+    // accent rule in place so it reads as the same screen rather than a
+    // separate one the player has navigated to.
+    if (g_showSettingsMenu) {
+        RenderSettingsMenu();
+        ImGui::End();
+        if (g_game.loading.Active()) RenderLoadingScreen();
+        return;
+    }
+
+    // Island1 is the game; Custom Game opens any other authored level through a
+    // file browser. The remaining dev entry points (god mode, Cornell box,
+    // empty, stress test) are still reachable -- the editor loads any level and
+    // --level=<path> starts one directly -- but they are not what this menu is
+    // for.
     UISectionLabel("DEPLOY");
     ImGui::Dummy(ImVec2(0.0f, 2.0f));
-    if (UIPrimaryButton("LEVEL 1"))
-        StartLevelOne(hwnd, false);
-    if (UIMenuButton("CUSTOM LEVELS"))
+    if (UIPrimaryButton("ISLAND 1"))
+        StartIsland1(hwnd);
+    if (UIMenuButton("CUSTOM GAME"))
         BrowseAndStartCustomLevel(hwnd);
     if (!g_mainMenuLevelStatus.empty())
         ImGui::TextWrapped("%s", g_mainMenuLevelStatus.c_str());
@@ -9308,24 +9471,11 @@ static void RenderMainMenu(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 2.0f));
     if (UIMenuButton("LEVEL EDITOR"))
         StartLevelEditor(hwnd);
-
-    // Everything below is a development entry point rather than a way to play.
-    // Grouping them under their own heading keeps the top of the menu about the
-    // game without hiding the tools.
-    ImGui::Dummy(ImVec2(0.0f, 10.0f));
-    UISectionLabel("SANDBOX");
-    ImGui::Dummy(ImVec2(0.0f, 2.0f));
-    if (UIMenuButton("LEVEL 1 - GOD MODE", 38.0f))
-        StartLevelOne(hwnd, true, false, false, nullptr, true);
-    if (UIMenuButton("DXR DDGI CORNELL BOX", 38.0f))
-        StartDDGICornellTest(hwnd);
-    if (UIMenuButton("EMPTY", 38.0f))
-        StartLevelOne(hwnd, true, false, true);
-    if (UIMenuButton("STRESS TEST", 38.0f))
-        StartLevelOne(hwnd, true, true);
+    if (UIMenuButton("SETTINGS"))
+        g_showSettingsMenu = true;
 
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
-    if (UIMenuButton("QUIT", 36.0f))
+    if (UIMenuButton("EXIT", 36.0f))
         PostQuitMessage(0);
     ImGui::End();
     if (g_game.loading.Active()) RenderLoadingScreen();
@@ -10757,8 +10907,15 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
         std::vector<P2> sites;
         if (shatter) {
             // Glass: 2D grid of jittered sites -> many small angular shards.
-            const int cols = std::max(3, std::min(6, (int)std::lround(length / 0.35f)));
-            const int rows = std::max(2, std::min(4, (int)std::lround((h1 - h0) / 0.4f)));
+            //
+            // Piece counts halved to cut destruction CPU time: every shard is a
+            // rigid body that gets solved, collided and walked by the render
+            // rebuild, so this count multiplies straight into per-frame cost.
+            // The cell sizes double alongside the caps (0.35 -> 0.70,
+            // 0.4 -> 0.8) so a pane still fills with shards rather than
+            // producing a few large ones sitting in a mostly-intact frame.
+            const int cols = std::max(2, std::min(3, (int)std::lround(length / 0.70f)));
+            const int rows = std::max(1, std::min(2, (int)std::lround((h1 - h0) / 0.8f)));
             const float cw = length / cols, ch = (h1 - h0) / rows;
             for (int r = 0; r < rows; ++r) for (int i = 0; i < cols; ++i) {
                 const float jx = (((i * 37 + r * 53 + seed * 17 + 3) % 13) / 12.0f - 0.5f) * cw * 0.9f;
@@ -10766,7 +10923,10 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
                 sites.push_back({ l0 + (i + 0.5f) * cw + jx, h0 + (r + 0.5f) * ch + jy });
             }
         } else {
-            const int cols = std::max(3, std::min(8, (int)std::lround(length / 1.2f)));
+            // Boards: same halving as the glass above. Wider cells (1.2 -> 2.4)
+            // keep a wall spanned by planks instead of leaving gaps between a
+            // handful of narrow ones.
+            const int cols = std::max(2, std::min(4, (int)std::lround(length / 2.4f)));
             const float cellW = length / cols;
             for (int i = 0; i < cols; ++i) {
                 const float jx = (((i * 37 + seed * 17 + 3) % 13) / 12.0f - 0.5f) * cellW * 0.9f;
@@ -11809,6 +11969,9 @@ static void StopEditorPlaytest() {
     scene.camera.FPSMode = false;
     scene.camera = g_editorCameraSnapshot;
     scene.camera.FPSMode = false;
+    // Snapshot predates any sensitivity change made while playing, so reapply
+    // rather than restoring whatever the camera had when it was captured.
+    ApplyGameSettings();
     cameraLocked = true;
     ReleaseCapture();
     SetCursorVisible(true);
@@ -13535,6 +13698,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // popup and editor panel inherits the HUD's palette instead of ImGui's
     // default grey.
     ApplyEngineUITheme();
+    // Player settings before anything reads them. A missing file is the normal
+    // first run: the defaults already in g_settings stand, and the file appears
+    // the first time a setting is changed.
+    LoadGameSettings(g_settings);
+    ApplyGameSettings();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX12_Init(g_dx12.device.Get(), FRAME_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM,
         imguiSrvHeap.Get(),
@@ -13768,6 +13936,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     } else {
         visBuffer.UpdateEnvironmentMap(
             g_specularEnvironmentResource, g_brdfIntegrationResource);
+        // Reclaim mesh slots as destruction retires merged batch nodes.
+        // Registration is upload-once, so without this every fracture rebuild
+        // consumed fresh geometry storage until the pool ran dry and chunks
+        // silently stopped rasterising into the visibility buffer.
+        g_releaseVisibilityGeometry =
+            [](const std::shared_ptr<SceneNode>& node) {
+                if (!node || !node->mesh) return;
+                for (MeshPrimitive& primitive : node->mesh->primitives)
+                    visBuffer.ReleasePrimitive(&primitive);
+            };
         std::cout << "Visibility Buffer ready\n";
     }
     g_bindlessMaterialsReady = bindlessHeapReady && mainShader.BindlessReady() &&
@@ -14859,8 +15037,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 ProfilerDX12::CpuScope profile(g_profiler, "Destruction Update");
                 g_game.physicsClock.Accumulate(deltaTime);
                 float physicsStep = 0.0f;
-                while (g_game.physicsClock.Consume(physicsStep))
+                // physicsClock hands out up to 4 steps after a long frame, and
+                // each Update() already scales its own cost down under load,
+                // so without a ceiling here a single hitch could still stack
+                // four of them into one frame. This caps the whole scope --
+                // the number the profiler reports as "Destruction Update", and
+                // the one measured at up to 17.5 ms before any of this.
+                //
+                // The adaptive quality inside Update() is what normally keeps
+                // the total under this, so hitting the cap should be rare;
+                // it exists so the very first spike of a collapse cannot land
+                // in full before the controller has seen it.
+                const auto destructionBegin = std::chrono::steady_clock::now();
+                constexpr double kDestructionFrameBudgetMs = 6.0;
+                while (g_game.physicsClock.Consume(physicsStep)) {
                     g_destruction.Update(physicsStep);
+                    if (std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() -
+                            destructionBegin).count() >=
+                        kDestructionFrameBudgetMs) {
+                        // Drop the rest of the backlog rather than deferring
+                        // it into the next frame, which is what turns one slow
+                        // frame into a run of them.
+                        g_game.physicsClock.Reset();
+                        break;
+                    }
+                }
             }
             SyncGrenadePhysicsBodies(true);
             const std::vector<uint32_t> grenadeContactEvents =
@@ -16137,6 +16339,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (IsSceneScreen()) UpdatePrefabAudio();
         if (IsSceneScreen()) UpdatePrefabLods();
         occlusionDepth.FinalizeCapture(g_dx12.commandList.Get());
+        // Adaptive Forward Extensions quality. Driven from the delayed GPU
+        // timestamp resolved for an earlier frame, which is the only measurement
+        // of the pass that exists -- the current frame has not run yet. Feeds
+        // the destruction controller as a ceiling; terrain reads the tier where
+        // it builds its params.
+        g_forwardQuality.Update(g_profiler.GpuScopeMs("Forward Extensions"));
+        {
+            float ceiling = 1.0f;
+            switch (g_forwardQuality.Tier()) {
+                case ForwardExtensionQualityTier::Balanced:    ceiling = 0.55f; break;
+                case ForwardExtensionQualityTier::Performance: ceiling = 0.15f; break;
+                default: break;
+            }
+            g_destruction.SetAdaptiveQualityCeiling(ceiling);
+        }
         g_profiler.BeginGpuFrame(g_dx12.frameIndex, g_dx12.commandList.Get());
 
         float cc[4] = { scene.clearColor.x, scene.clearColor.y, scene.clearColor.z, 1.0f };
@@ -16155,6 +16372,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 std::cerr << "VISIBILITY_TEST: toggled after 120 forward frames\n";
                 std::ofstream("visibility_smoke.log", std::ios::app)
                     << "toggled\n";
+                // Terrain and destruction both route through the visibility
+                // buffer by default now. These two variables force the forward
+                // fallback instead, so the parity path stays reachable in an
+                // unattended run -- the toggles are otherwise UI-only.
+                if (GetEnvironmentVariableA("SGE_VISIBILITY_NO_TERRAIN",
+                                            nullptr, 0) > 0) {
+                    visBuffer.SetTerrainVisibilityRequested(false);
+                    std::ofstream("visibility_smoke.log", std::ios::app)
+                        << "terrain-vb-disabled\n";
+                }
+                if (GetEnvironmentVariableA("SGE_VISIBILITY_NO_DESTRUCTION",
+                                            nullptr, 0) > 0) {
+                    visBuffer.SetDestructionVisibilityRequested(false);
+                    std::ofstream("visibility_smoke.log", std::ios::app)
+                        << "destruction-vb-disabled\n";
+                }
             }
         }
         const RenderPath renderPath = RenderCoordinator::Choose({
@@ -16166,6 +16399,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         const bool usingRaytracing = renderPath == RenderPath::Raytracing;
         const bool usingVisibility =
             renderPath == RenderPath::VisibilityBuffer;
+        // Only the visibility path writes this flag, so clear it on every other
+        // path. Left stale at true, the forward renderer would skip its terrain
+        // draw on a frame where nothing rasterized terrain at all.
+        if (!usingVisibility) g_terrainInVisibilityBuffer = false;
         visBuffer.PrepareBindlessFrame(g_dx12.frameIndex,
             scene.bindlessMaterials && g_bindlessMaterialsReady &&
             usingVisibility);
@@ -16176,6 +16413,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         g_bindlessMaterialsActive = bindlessMaterialsActive;
         mainShader.SetBindlessActive(bindlessMaterialsActive);
         visBuffer.SetBindlessActive(bindlessMaterialsActive && usingVisibility);
+        // A crater changes the height field under pixels the camera is not
+        // moving past, so reprojection alone would happily reuse history from
+        // the ground that used to be there.
+        if (g_terrainDeformedThisFrame) {
+            visBuffer.NotifyTerrainDeformed();
+            g_terrainDeformedThisFrame = false;
+        }
         visBuffer.aoTemporalMotionVectors = usingVisibility &&
             scene.enableAmbientOcclusion && scene.temporalBentNormalGTAO;
         const bool bentNormalGTAORequested = usingVisibility &&
@@ -17611,7 +17855,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                    << "destruction_low_motion="
                    << g_destruction.GetLowMotionActorCount() << '\n'
                    << "destruction_spatial_batches="
-                   << g_destruction.GetSpatialBatchCount() << '\n';
+                   << g_destruction.GetSpatialBatchCount() << '\n'
+            // Whether the forward extensions pass is still redrawing chunks the
+            // visibility resolve already shaded, and what that redraw costs.
+                   << "destruction_in_vb="
+                   << (g_destructionInVisibilityBuffer ? 1 : 0) << '\n'
+                   << "destruction_forward_primitives="
+                   << g_destructionForwardPrimitivesDrawn << '\n'
+                   << "destruction_vb_owned_primitives="
+                   << g_destructionVisibilityOwnedPrimitives << '\n'
+                   << "fe_destruction_gpu_ms="
+                   << g_profiler.GpuScopeMs("FE/Destruction") << '\n'
+                   << "forward_extensions_gpu_ms="
+                   << g_profiler.GpuScopeMs("Forward Extensions") << '\n'
+                   << "visibility_buffer_gpu_ms="
+                   << g_profiler.GpuScopeMs("Visibility Buffer") << '\n'
+                   << "gpu_frame_ms=" << g_profiler.GpuFrameMs() << '\n';
         }
 
         if (visibilityBenchmark && !visibilityBenchmarkComplete &&

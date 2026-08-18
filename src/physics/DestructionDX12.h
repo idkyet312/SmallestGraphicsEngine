@@ -10,6 +10,13 @@
 #include "SceneGraph.h"
 #include "SkinnedTypes.h"
 
+// Installed by the renderer at startup. Destruction calls it as merged batch
+// nodes are retired so their visibility-buffer mesh slots can be recycled;
+// destruction itself has no renderer dependency. Left null, batches simply
+// leak their slots, which is what happened before this existed.
+extern std::function<void(const std::shared_ptr<SceneNode>&)>
+    g_releaseVisibilityGeometry;
+
 struct DestructionRenderItem {
     std::shared_ptr<SceneNode> node;
     DirectX::XMFLOAT4X4 transform;
@@ -333,6 +340,10 @@ public:
     uint32_t GetActorCount() const;
     uint64_t GetRenderItemRebuildCount() const;
     uint64_t GetBatchGeometryRebuildCount() const;
+    // External quality ceiling driven by the adaptive Forward Extensions tier.
+    // 1.0 removes the cap and restores the unmodified controller behaviour.
+    void SetAdaptiveQualityCeiling(float ceiling);
+    float GetQualityScale() const;
     uint32_t GetAwakeActorCount() const;
     uint32_t GetLowMotionActorCount() const;
     uint32_t GetSpatialBatchCount() const;
