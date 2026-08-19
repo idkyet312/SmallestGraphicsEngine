@@ -1011,9 +1011,14 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
             shader.SetMatrices(XMMatrixIdentity(), view, proj, lightSpace);
             shader.SetCamera(scene.camera.Position);
             vb.SetTerrainProjection(proj);
+            if (g_terrain.DrawVisibility(shader, terrainParams))
+                vb.terrainVisibilityActiveThisFrame = true;
+            // SetMatrices writes the shader's current per-draw upload slot.
+            // Keep later forward-extension draws from overwriting that memory
+            // before this command list executes; a destruction chunk transform
+            // here rotates/translates the entire procedural terrain.
+            shader.NextDrawCall();
         }
-        if (g_terrain.DrawVisibility(shader, terrainParams))
-            vb.terrainVisibilityActiveThisFrame = true;
         // No pipeline restore here. Terrain is the last draw in the pass, and
         // binding an IA pipeline built for the main root signature while the
         // visibility render target is still set would leave the command list
@@ -1021,12 +1026,19 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
         // root signature and PSO before it draws anything.
     }
     g_terrainInVisibilityBuffer = vb.terrainVisibilityActiveThisFrame;
-    // Only claim the chunks for the resolve when the toggle is on AND every
-    // chunk this frame registered. Either condition failing leaves the forward
-    // pass responsible for all of them, which is the safe direction: chunks
-    // drawn twice cost performance, chunks drawn by nobody are invisible.
+    // Only claim the chunks for the resolve when the toggle is on AND no chunk
+    // this frame failed to register. A registration failure leaves the forward
+    // pass responsible, which is the safe direction: chunks drawn twice cost
+    // performance, chunks drawn by nobody are invisible.
+    //
+    // Deliberately NOT conditioned on "some chunks were seen". A frame where
+    // every chunk is culled or the batch list is momentarily empty says nothing
+    // about ownership, and flipping the flag on those frames hands the chunks
+    // back and forth between the two passes. Both write the shared depth
+    // buffer, and the toggle invalidates temporal history, so the oscillation
+    // destabilises everything the resolve shades from that depth -- terrain
+    // most visibly, since it covers the screen.
     g_destructionInVisibilityBuffer = vb.DestructionVisibilityRequested() &&
-        destructionChunksSeen > 0 &&
         destructionChunksRegistered == destructionChunksSeen;
 
     vb.EndVisibilityPass(g_dx12.commandList.Get());

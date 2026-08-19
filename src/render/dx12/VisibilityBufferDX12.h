@@ -550,6 +550,12 @@ public:
     VisibilityGeometryPool geometryPool{ VB_MAX_VERTICES, VB_MAX_INDICES,
                                          VB_MAX_TRIANGLES, FRAME_COUNT };
     std::vector<UINT> freeMeshSlots;
+    // Slot indices released this frame. Held back one frame before joining
+    // freeMeshSlots, for the same reason the geometry ranges are quarantined:
+    // releases happen during the update phase, so an index handed straight back
+    // could be claimed by a different primitive while draw calls recorded for
+    // the previous frame still reference it.
+    std::vector<UINT> retiredMeshSlots;
     // Meshes registered as transient, so ReleasePrimitive knows a slot is
     // recyclable and UploadBuffers knows the geometry can change in place.
     std::unordered_set<UINT> transientMeshSlots;
@@ -729,6 +735,14 @@ public:
         // Returns quarantined geometry ranges to the free list once every
         // in-flight frame has finished reading them.
         geometryPool.BeginFrame();
+        // Slot indices released during the last frame's update are safe to
+        // reuse now: this frame's draw calls have not been recorded yet, and
+        // the previous frame's are done referencing them.
+        if (!retiredMeshSlots.empty()) {
+            freeMeshSlots.insert(freeMeshSlots.end(),
+                retiredMeshSlots.begin(), retiredMeshSlots.end());
+            retiredMeshSlots.clear();
+        }
         terrainProjectionValid = false;
         if (previousModelByInstance.size() >
             static_cast<size_t>(VB_MAX_DRAW_CALLS) * 4u)
@@ -1192,7 +1206,13 @@ public:
         // Zero the record so a draw call that survives one frame too long
         // renders nothing rather than reading a half-overwritten range.
         meshes[meshID] = VBMeshData{};
-        freeMeshSlots.push_back(meshID);
+        // The slot INDEX needs the same quarantine as the storage range. This
+        // runs from destruction's update, which is before the frame's
+        // BeginFrame -- handing the index straight back would let a different
+        // primitive claim it this frame while draw calls recorded for the
+        // previous frame still name it, so their geometry would swap under the
+        // GPU. Released here, reusable a full frame later.
+        retiredMeshSlots.push_back(meshID);
     }
 
     UINT64 GeometryRegistrationFailures() const {
@@ -1245,11 +1265,19 @@ public:
     // MeshPrimitive::vertexBuffer while the resolve reads the global packed
     // buffers addressed by these offsets, so a ray hit needs this to reach the
     // same triangle. Safe to snapshot at acceleration-structure build time
-    // because RegisterMesh is upload-once -- these offsets never move for the
-    // lifetime of a mesh.
+    // because RegisterMesh is upload-once for permanent geometry -- those
+    // offsets never move for the lifetime of a mesh.
+    //
+    // Transient meshes are explicitly refused. Destruction recycles their slots
+    // and storage as fractures rebuild the merged batches, so an offset
+    // snapshotted here would go stale and point a ray hit at whatever geometry
+    // later claimed the range. Those rays keep the sky approximation instead,
+    // which is the same fallback a not-yet-registered primitive already gets.
     bool MeshGeometryBinding(UINT meshID, UINT& vertexOffset,
                              UINT& indexOffset, UINT& hasIndices) const {
         if (meshID == VB_INVALID_MESH || meshID >= meshes.size()) return false;
+        if (transientMeshSlots.find(meshID) != transientMeshSlots.end())
+            return false;
         const VBMeshData& mesh = meshes[meshID];
         vertexOffset = mesh.vertexOffset;
         indexOffset = mesh.indexOffset;
