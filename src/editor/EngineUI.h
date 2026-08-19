@@ -961,6 +961,90 @@ inline void ToggleAllRTEffects(Scene& scene, VisibilityBufferDX12& vb,
     }
 }
 
+// Profiler lives in its own window rather than inside Scene Controls. Persists
+// for the session so it survives UI rebuilds.
+inline bool g_showProfilerWindow = false;
+
+// The CPU/GPU profiler readout. Lives in its own function so it can render
+// either inline in Scene Controls or as a standalone window -- comparing pass
+// timings while changing settings is hard when both fight for the same panel.
+inline void ProfilerPanelBody() {
+    // Adaptive Forward Extensions quality. Off by default: while disabled
+    // the tier is pinned to Full and nothing about the frame changes.
+    {
+        bool adaptive = g_forwardQuality.Enabled();
+        if (ImGui::Checkbox("Adaptive Forward Quality", &adaptive))
+            g_forwardQuality.SetEnabled(adaptive);
+        if (adaptive)
+            ImGui::Text("  Tier: %s   smoothed FE: %.2f ms   destruction q: %.2f",
+                        ForwardQualityController::TierName(g_forwardQuality.Tier()),
+                        g_forwardQuality.SmoothedMs(),
+                        g_destruction.GetQualityScale());
+    }
+    ImGui::Text("CPU frame: %.2f ms", g_profiler.CpuFrameMs());
+    // Palms drive Forward Extensions' pixel cost, so show how many survive
+    // the frustum test next to the timings that they move.
+    ImGui::Text("Palms drawn: %d / %d",
+                g_palmDrawStats.drawn, g_palmDrawStats.considered);
+    ImGui::Text("Prefabs drawn: %d / %d",
+                g_prefabDrawStats.drawn, g_prefabDrawStats.considered);
+    for (const auto& sample : g_profiler.CpuSamples())
+        ImGui::BulletText("%s: %.3f ms", sample.name.c_str(), sample.milliseconds);
+    ImGui::Separator();
+    if (g_profiler.IsInitialized()) {
+        ImGui::Text("GPU frame: %.2f ms", g_profiler.GpuFrameMs());
+        ImGui::Text("GPU p95 (%zu/300): %.2f ms",
+                    g_profiler.GpuHistorySize(), g_profiler.GpuFrameP95Ms());
+        // FE/* scopes nest inside Forward Extensions, so indent them and
+        // show their share of it -- their times are already counted in the
+        // parent and must not be added to the frame total again.
+        float forwardExtensionsMs = 0.0f;
+        for (const auto& sample : g_profiler.GpuSamples())
+            if (sample.name == "Forward Extensions")
+                forwardExtensionsMs = sample.milliseconds;
+        float feAccounted = 0.0f;
+        for (const auto& sample : g_profiler.GpuSamples()) {
+            const bool nested = sample.name.rfind("FE/", 0) == 0 ||
+                                sample.name == "Terrain";
+            if (!nested) {
+                ImGui::BulletText("%s: %.3f ms", sample.name.c_str(),
+                                  sample.milliseconds);
+                continue;
+            }
+            feAccounted += sample.milliseconds;
+            ImGui::Indent(16.0f);
+            if (forwardExtensionsMs > 0.0001f)
+                ImGui::BulletText("%s: %.3f ms  (%.0f%%)", sample.name.c_str(),
+                                  sample.milliseconds,
+                                  100.0f * sample.milliseconds / forwardExtensionsMs);
+            else
+                ImGui::BulletText("%s: %.3f ms", sample.name.c_str(),
+                                  sample.milliseconds);
+            ImGui::Unindent(16.0f);
+        }
+        if (forwardExtensionsMs > 0.0001f) {
+            ImGui::Indent(16.0f);
+            // What the sub-scopes do not explain: the viewmodel, ropes,
+            // helicopters, muzzle/beam effects and per-pass state changes.
+            ImGui::TextDisabled("FE/unscoped: %.3f ms",
+                                forwardExtensionsMs - feAccounted);
+            ImGui::Unindent(16.0f);
+        }
+        ImGui::TextDisabled("GPU results delayed by frames in flight");
+    } else {
+        ImGui::TextDisabled("GPU timestamp queries unavailable");
+    }
+}
+
+// Standalone profiler window. Toggled by g_showProfilerWindow.
+inline void DrawProfilerWindow() {
+    if (!g_showProfilerWindow) return;
+    ImGui::SetNextWindowSize(ImVec2(460.0f, 620.0f), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Profiler", &g_showProfilerWindow))
+        ProfilerPanelBody();
+    ImGui::End();
+}
+
 inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     struct RTDebugSettings {
         bool active = false;
@@ -1129,6 +1213,15 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     RenderMovementPad();
 
     ImGui::Begin("Scene Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    // First control in the panel: move the profiler out to its own window so
+    // timings stay visible while scrolling this one.
+    ImGui::Checkbox("Profiler in separate window", &g_showProfilerWindow);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Show the CPU/GPU profiler as its own panel instead of a "
+            "section of this one. Useful when watching a pass timing "
+            "while toggling the settings that change it.");
+    ImGui::Separator();
 
     // Frame cost, front and centre: the CPU-side systems here (water waves, grass
     // wind) are easy to scale past what the frame can pay for, and without a
@@ -1216,72 +1309,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::Text("GPU-local static buffers: %u  %.1f MiB  Pending: %u",
                 staticStats.resources, staticStats.bytes / (1024.0 * 1024.0),
                 staticStats.pendingUploads);
-    if (ImGui::CollapsingHeader("CPU / GPU Profiler", ImGuiTreeNodeFlags_DefaultOpen)) {
-        // Adaptive Forward Extensions quality. Off by default: while disabled
-        // the tier is pinned to Full and nothing about the frame changes.
-        {
-            bool adaptive = g_forwardQuality.Enabled();
-            if (ImGui::Checkbox("Adaptive Forward Quality", &adaptive))
-                g_forwardQuality.SetEnabled(adaptive);
-            if (adaptive)
-                ImGui::Text("  Tier: %s   smoothed FE: %.2f ms   destruction q: %.2f",
-                            ForwardQualityController::TierName(g_forwardQuality.Tier()),
-                            g_forwardQuality.SmoothedMs(),
-                            g_destruction.GetQualityScale());
-        }
-        ImGui::Text("CPU frame: %.2f ms", g_profiler.CpuFrameMs());
-        // Palms drive Forward Extensions' pixel cost, so show how many survive
-        // the frustum test next to the timings that they move.
-        ImGui::Text("Palms drawn: %d / %d",
-                    g_palmDrawStats.drawn, g_palmDrawStats.considered);
-        ImGui::Text("Prefabs drawn: %d / %d",
-                    g_prefabDrawStats.drawn, g_prefabDrawStats.considered);
-        for (const auto& sample : g_profiler.CpuSamples())
-            ImGui::BulletText("%s: %.3f ms", sample.name.c_str(), sample.milliseconds);
-        ImGui::Separator();
-        if (g_profiler.IsInitialized()) {
-            ImGui::Text("GPU frame: %.2f ms", g_profiler.GpuFrameMs());
-            ImGui::Text("GPU p95 (%zu/300): %.2f ms",
-                        g_profiler.GpuHistorySize(), g_profiler.GpuFrameP95Ms());
-            // FE/* scopes nest inside Forward Extensions, so indent them and
-            // show their share of it -- their times are already counted in the
-            // parent and must not be added to the frame total again.
-            float forwardExtensionsMs = 0.0f;
-            for (const auto& sample : g_profiler.GpuSamples())
-                if (sample.name == "Forward Extensions")
-                    forwardExtensionsMs = sample.milliseconds;
-            float feAccounted = 0.0f;
-            for (const auto& sample : g_profiler.GpuSamples()) {
-                const bool nested = sample.name.rfind("FE/", 0) == 0 ||
-                                    sample.name == "Terrain";
-                if (!nested) {
-                    ImGui::BulletText("%s: %.3f ms", sample.name.c_str(),
-                                      sample.milliseconds);
-                    continue;
-                }
-                feAccounted += sample.milliseconds;
-                ImGui::Indent(16.0f);
-                if (forwardExtensionsMs > 0.0001f)
-                    ImGui::BulletText("%s: %.3f ms  (%.0f%%)", sample.name.c_str(),
-                                      sample.milliseconds,
-                                      100.0f * sample.milliseconds / forwardExtensionsMs);
-                else
-                    ImGui::BulletText("%s: %.3f ms", sample.name.c_str(),
-                                      sample.milliseconds);
-                ImGui::Unindent(16.0f);
-            }
-            if (forwardExtensionsMs > 0.0001f) {
-                ImGui::Indent(16.0f);
-                // What the sub-scopes do not explain: the viewmodel, ropes,
-                // helicopters, muzzle/beam effects and per-pass state changes.
-                ImGui::TextDisabled("FE/unscoped: %.3f ms",
-                                    forwardExtensionsMs - feAccounted);
-                ImGui::Unindent(16.0f);
-            }
-            ImGui::TextDisabled("GPU results delayed by frames in flight");
-        } else {
-            ImGui::TextDisabled("GPU timestamp queries unavailable");
-        }
+    // Rendered here only while the standalone Profiler window is closed, so
+    // the readout exists in exactly one place at a time.
+    if (!g_showProfilerWindow &&
+        ImGui::CollapsingHeader("CPU / GPU Profiler",
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        ProfilerPanelBody();
     }
     BanditDebugText();
     ImGui::Separator();
@@ -2038,6 +2071,33 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         }
         ImGui::Checkbox("GTAO + Contact Shadows", &scene.enableAmbientOcclusion);
         if (scene.enableAmbientOcclusion) {
+            ImGui::Checkbox("  Optimized AO Shader",
+                            &scene.optimizedAmbientOcclusion);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "A/B the GTAO/contact-shadow arithmetic optimizations.\n"
+                    "Off compiles the original pre-optimization shader\n"
+                    "(bit-identical bytecode); on uses hoisted loop\n"
+                    "invariants, multiply chains for pow(), and rsqrt\n"
+                    "distance math. Both should look the same -- watch the\n"
+                    "'GTAO + Contact Shadows' GPU timer above for the cost.");
+            ImGui::TextDisabled(
+                scene.optimizedAmbientOcclusion
+                    ? "  Optimized shader variant"
+                    : "  Original (pre-optimization) shader variant");
+            ImGui::Checkbox("  Half-Resolution AO Trace",
+                            &scene.halfResolutionAO);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Trace AO at half resolution (quarter the pixels) and\n"
+                    "upsample in the full-res bilateral composite.\n"
+                    "This is the real win: the trace is bound by scattered\n"
+                    "depth fetches, so quartering them cuts the pass cost.\n"
+                    "Ignored while temporal bent-normal GTAO is on, which\n"
+                    "keeps a full-resolution history.");
+            if (scene.halfResolutionAO && scene.temporalBentNormalGTAO)
+                ImGui::TextDisabled(
+                    "  Half-res ignored: temporal bent normals are on");
             ImGui::DragFloat("AO Radius", &scene.ambientOcclusionRadius,
                              0.01f, 0.01f, 4.0f, "%.2f m");
             ImGui::SliderFloat("AO Strength", &scene.ambientOcclusionStrength,
@@ -2440,6 +2500,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::Text("Renderer: DirectX 12 (%s)", renderer);
 
     ImGui::End();
+
+    // Outside Scene Controls' Begin/End so it is a real sibling window.
+    DrawProfilerWindow();
 }
 
 #endif // ENGINE_UI_H

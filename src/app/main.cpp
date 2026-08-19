@@ -14065,6 +14065,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (temporalGTAOSmokeTest) {
             scene.enableAmbientOcclusion = true;
             scene.temporalBentNormalGTAO = true;
+            // SGE_AO_BASELINE=1 runs the pre-optimization shader variant so an
+            // automated A/B can measure both without driving the UI.
+            if (GetEnvironmentVariableA("SGE_AO_BASELINE", nullptr, 0) > 0)
+                scene.optimizedAmbientOcclusion = false;
+            // SGE_AO_HALF_RES=1 traces AO at half resolution. Half res applies
+            // to the scalar path only, so drop temporal bent normals with it --
+            // that is the configuration the toggle is meant to measure.
+            if (GetEnvironmentVariableA("SGE_AO_HALF_RES", nullptr, 0) > 0) {
+                scene.halfResolutionAO = true;
+                scene.temporalBentNormalGTAO = false;
+            }
             char bentDebugMode[8] = {};
             if (GetEnvironmentVariableA(
                     "SGE_BENT_GTAO_DEBUG", bentDebugMode,
@@ -16200,6 +16211,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
         }
 
+        // Toggling half-resolution AO resizes the trace target, which releases
+        // a texture that frames still in flight may be sampling. Drain here for
+        // the same reason as the sky swap above: this sits in the frame loop,
+        // so the frame that follows re-syncs the fence through its own
+        // MoveToNextFrame() -- the precondition WaitForGPUAllFrames requires.
+        if (screenSpaceAO.TraceResolutionChangePending()) {
+            WaitForGPUAllFrames();
+            screenSpaceAO.ApplyTraceResolutionChange();
+        }
+
         // ?? begin frame ??
         try { BeginFrame(); }
         catch (const std::exception& e) {
@@ -17870,6 +17891,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                    << g_profiler.GpuScopeMs("Forward Extensions") << '\n'
                    << "visibility_buffer_gpu_ms="
                    << g_profiler.GpuScopeMs("Visibility Buffer") << '\n'
+                   << "gtao_contact_shadows_gpu_ms="
+                   << g_profiler.GpuScopeMs("GTAO + Contact Shadows") << '\n'
                    << "gpu_frame_ms=" << g_profiler.GpuFrameMs() << '\n';
         }
 

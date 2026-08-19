@@ -8,7 +8,37 @@ cbuffer AOConstants : register(b0)
     float4 screenParams;  // width, height, inv width, inv height
     float4 filterParams;  // static depth, surface buffer
     float4 contactParams; // grass, direct contact, noise frame, ambient in resolve
+    // Resolution of the AO trace target: width, height, 1/width, 1/height.
+    // Equals screenParams at full res. When the trace runs at half res these
+    // differ, and the distinction matters in two separate places:
+    //
+    //   * scattering AO taps and stepping finite differences is a TRACE-space
+    //     operation and must use traceParams.zw, or the sampling footprint
+    //     silently doubles;
+    //   * addressing the depth/normal textures is a SOURCE-space operation and
+    //     must keep using screenParams.xy, because those textures are always
+    //     full resolution.
+    //
+    // Conflating the two is what produced the horizontal banding in the
+    // earlier half-res attempt: with a half-res screenParams a trace pixel
+    // centre (j+0.5)/540 maps to source row 1.0, 3.0, 5.0 -- exactly on texel
+    // BOUNDARIES rather than centres. A point sampler there resolves to one of
+    // two adjacent texels depending on float rounding, so whole scanlines
+    // snapped one way and their neighbours the other. The bands were wrong
+    // occlusion, which is why they scaled with AO strength, and why rebasing
+    // the rotation dither never touched them. TraceUVToSourceUV below re-centres
+    // the sample onto a source texel centre and removes the tie entirely.
+    float4 traceParams;
 };
+
+// Map a trace-space UV to the source-resolution UV whose texel centre it sits
+// in. At full res this is the identity. At half res it shifts the sample by
+// half a source texel so point-sampled depth/normal fetches land unambiguously
+// inside one texel instead of on the boundary between two.
+float2 TraceUVToSourceUV(float2 uv)
+{
+    return uv + 0.5 * (screenParams.zw - traceParams.zw);
+}
 
 Texture2D<float> sceneDepth : register(t0);
 Texture2DMS<float, 4> sceneDepthMS : register(t1);
@@ -53,6 +83,7 @@ float3 ReconstructWorld(float2 uv, float depth)
     return world.xyz / max(abs(world.w), 1e-5);
 }
 
+// uv is SOURCE-space here. Trace-space callers pass TraceUVToSourceUV(uv).
 float SampleDepth(float2 uv, bool multisampled)
 {
     if (!multisampled)
@@ -164,6 +195,21 @@ float4 HorizonSignal(float2 uv, float deviceDepth, bool multisampled)
     float3 openTangentSum = 0.0;
     float openWeightSum = 0.0;
 
+#if SGE_AO_OPTIMIZED
+    // The per-step jitter depends only on the pixel and the step index, not on
+    // the slice. Recomputing it inside the slice loop evaluated the same four
+    // values eight times over; lift them into a per-step table instead.
+    float stepScales[4];
+    [unroll]
+    for (uint jitterStep = 1; jitterStep <= 4; ++jitterStep) {
+        stepScales[jitterStep - 1] = (jitterStep - 0.35 + InterleavedNoise(
+            uv * screenParams.xy + jitterStep * 17.0 +
+            contactParams.z * float2(11.0, 31.0))) / 4.0;
+    }
+    float inverseRadius = 1.0 / max(radius, 1e-3);
+    float maxSampleDistance = radius * 2.0;
+#endif
+
     [unroll]
     for (uint slice = 0; slice < 8; ++slice) {
         float angle = (slice + 0.5) * (6.2831853 / 8.0);
@@ -171,21 +217,40 @@ float4 HorizonSignal(float2 uv, float deviceDepth, bool multisampled)
         float horizon = 0.0;
         [unroll]
         for (uint step = 1; step <= 4; ++step) {
+#if SGE_AO_OPTIMIZED
+            float stepScale = stepScales[step - 1];
+#else
             float stepScale = (step - 0.35 + InterleavedNoise(
                 uv * screenParams.xy + step * 17.0 +
                 contactParams.z * float2(11.0, 31.0))) / 4.0;
+#endif
             float2 sampleUV =
                 uv + direction * pixelRadius * stepScale * screenParams.zw;
             if (any(sampleUV <= 0.0) || any(sampleUV >= 1.0)) continue;
             float sampleDepth = SampleDepth(sampleUV, multisampled);
             if (sampleDepth >= 0.99999) continue;
             float3 delta = ReconstructWorld(sampleUV, sampleDepth) - center;
+#if SGE_AO_OPTIMIZED
+            float squaredDistance = dot(delta, delta);
+            // Compare against the squared limit so taps outside the radius
+            // never pay for a sqrt, then take the reciprocal length once and
+            // reuse it for both the cosine and the falloff.
+            if (squaredDistance < 1e-8 ||
+                squaredDistance > maxSampleDistance * maxSampleDistance)
+                continue;
+            float inverseDistance = rsqrt(squaredDistance);
+            float distanceToSample = squaredDistance * inverseDistance;
+            float cosine = dot(normal, delta * inverseDistance);
+            float distanceFalloff =
+                saturate(1.0 - distanceToSample * inverseRadius);
+#else
             float distanceToSample = length(delta);
             if (distanceToSample < 1e-4 || distanceToSample > radius * 2.0)
                 continue;
             float cosine = dot(normal, delta / distanceToSample);
             float distanceFalloff =
                 saturate(1.0 - distanceToSample / max(radius, 1e-3));
+#endif
             horizon = max(horizon,
                 saturate(cosine - aoParams.z) * distanceFalloff);
         }
@@ -227,13 +292,20 @@ float4 HorizonSignal(float2 uv, float deviceDepth, bool multisampled)
 float HorizonVisibility(float2 uv, float deviceDepth, bool multisampled)
 {
     if (deviceDepth >= 0.99999) return 1.0;
-    float3 center = ReconstructWorld(uv, deviceDepth);
-    float3 normal = ReconstructNormal(uv, deviceDepth, multisampled);
+    // Re-centre onto a source texel so the point-sampled depth/normal fetches
+    // below are unambiguous at half res (see TraceUVToSourceUV).
+    float2 sourceUV = TraceUVToSourceUV(uv);
+    float3 center = ReconstructWorld(sourceUV, deviceDepth);
+    float3 normal = ReconstructNormal(sourceUV, deviceDepth, multisampled);
     float centerDepth = LinearDepth(deviceDepth);
     float radius = aoParams.x;
-    float pixelRadius = clamp(radius * screenParams.y /
+    // Radius in TRACE pixels: the taps are stepped with traceParams.zw, so the
+    // pixel count and the step size must agree or the world-space footprint
+    // changes with trace resolution.
+    float pixelRadius = clamp(radius * traceParams.y /
         max(centerDepth * 1.15, 0.1), 3.0, 56.0);
-    float rotation = InterleavedNoise(uv * screenParams.xy) * 6.2831853;
+    // Dither on source pixel coordinates so the pattern is resolution-stable.
+    float rotation = InterleavedNoise(sourceUV * screenParams.xy) * 6.2831853;
     float2x2 rotate = float2x2(cos(rotation), -sin(rotation),
                                sin(rotation), cos(rotation));
     float occlusion = 0.0;
@@ -246,9 +318,10 @@ float HorizonVisibility(float2 uv, float deviceDepth, bool multisampled)
         [unroll]
         for (uint step = 1; step <= 4; ++step) {
             float stepScale = (step - 0.35 +
-                InterleavedNoise(uv * screenParams.xy + step * 17.0)) / 4.0;
-            float2 sampleUV =
-                uv + direction * pixelRadius * stepScale * screenParams.zw;
+                InterleavedNoise(sourceUV * screenParams.xy + step * 17.0)) / 4.0;
+            // Step in trace space, then resolve to a source texel centre.
+            float2 sampleUV = TraceUVToSourceUV(
+                uv + direction * pixelRadius * stepScale * traceParams.zw);
             if (any(sampleUV <= 0.0) || any(sampleUV >= 1.0)) continue;
             float sampleDepth = SampleDepth(sampleUV, multisampled);
             if (sampleDepth >= 0.99999) continue;
@@ -347,14 +420,26 @@ float ContactVisibility(float2 uv, float deviceDepth, bool multisampled,
         previousLinearDepthGap =
             projectedOrigin.w - LinearDepth(deviceDepth);
     }
+#if SGE_AO_OPTIMIZED
+    // Animate only when temporal accumulation is active (the CPU leaves
+    // the frame value at zero otherwise). The stable per-pixel component
+    // breaks coherent marching bands; the frame component lets TAA
+    // converge those samples instead of preserving a fixed stipple.
+    // Loop-invariant: every operand is fixed for the pixel, so this produced
+    // an identical value on all ten iterations. Hoisted out of the march.
+    float rayJitter = InterleavedNoise(
+        uv * screenParams.xy + contactParams.z * float2(19.0, 47.0));
+#endif
     [unroll]
     for (uint step = 1; step <= 10; ++step) {
+#if !SGE_AO_OPTIMIZED
         // Animate only when temporal accumulation is active (the CPU leaves
         // the frame value at zero otherwise). The stable per-pixel component
         // breaks coherent marching bands; the frame component lets TAA
         // converge those samples instead of preserving a fixed stipple.
         float rayJitter = InterleavedNoise(
             uv * screenParams.xy + contactParams.z * float2(19.0, 47.0));
+#endif
         float t = maxDistance * ((step - 0.45 + rayJitter * 0.9) / 10.0);
         float4 projected =
             mul(float4(world + rayDirection * t, 1.0), viewProjection);
@@ -434,7 +519,12 @@ float BilateralAO(float2 uv, float centerDepth, float3 centerNormal,
         [unroll]
         for (int x = -2; x <= 2; ++x) {
             float2 offset = float2(x, y);
-            float2 sampleUV = uv + offset * screenParams.zw;
+            // Step the filter across TRACE texels. At half res a
+            // screenParams-spaced 5x5 would span only 2.5 AO samples and blur
+            // the signal into mush; trace spacing keeps one tap per AO sample.
+            // Depth and normal are still fetched at full resolution, so the
+            // bilateral edge test stays as sharp as the composite target.
+            float2 sampleUV = uv + offset * traceParams.zw;
             float sampleDeviceDepth = SampleDepth(sampleUV, multisampled);
             float sampleLinearDepth = LinearDepth(sampleDeviceDepth);
             float3 sampleNormal =
@@ -445,6 +535,7 @@ float BilateralAO(float2 uv, float centerDepth, float3 centerNormal,
             float normalWeight =
                 pow(saturate(dot(centerNormal, sampleNormal)), 8.0);
             float weight = spatial * depthWeight * normalWeight;
+            // Linear sampler: this is the half-res -> full-res upsample.
             sum += rawAO.SampleLevel(linearClamp, sampleUV, 0.0) * weight;
             weightSum += weight;
         }
@@ -458,6 +549,10 @@ float4 BilateralSignal(float2 uv, float centerDepth, float3 centerNormal,
     float visibilitySum = 0.0;
     float3 bentSum = 0.0;
     float weightSum = 0.0;
+#if SGE_AO_OPTIMIZED
+    // Loop-invariant: one divide instead of twenty-five.
+    float depthWeightScale = 18.0 / max(centerDepth, 0.25);
+#endif
     [unroll]
     for (int y = -2; y <= 2; ++y) {
         [unroll]
@@ -469,15 +564,32 @@ float4 BilateralSignal(float2 uv, float centerDepth, float3 centerNormal,
             float3 sampleNormal =
                 ReconstructNormal(sampleUV, sampleDeviceDepth, multisampled);
             float spatial = exp(-dot(offset, offset) * 0.32);
+#if SGE_AO_OPTIMIZED
+            float depthWeight = exp(-abs(sampleLinearDepth - centerDepth) *
+                                    depthWeightScale);
+            // x^8 and x^2 as multiply chains. pow() lowers to exp2(log2(x)*n)
+            // on a transcendental unit; squaring is exact here and the operand
+            // is already saturated, so the result is bit-identical.
+            float normalDot = saturate(dot(centerNormal, sampleNormal));
+            float normalDot2 = normalDot * normalDot;
+            float normalDot4 = normalDot2 * normalDot2;
+            float normalWeight = normalDot4 * normalDot4;
+#else
             float depthWeight = exp(-abs(sampleLinearDepth - centerDepth) *
                                     18.0 / max(centerDepth, 0.25));
             float normalWeight =
                 pow(saturate(dot(centerNormal, sampleNormal)), 8.0);
+#endif
             float4 sampleSignal =
                 bentAO.SampleLevel(linearClamp, sampleUV, 0.0);
             float3 sampleBent = DecodeBentNormal(sampleSignal.xy);
+#if SGE_AO_OPTIMIZED
+            float bentDot = saturate(dot(centerNormal, sampleBent));
+            float bentWeight = bentDot * bentDot;
+#else
             float bentWeight = pow(
                 saturate(dot(centerNormal, sampleBent)), 2.0);
+#endif
             float weight = spatial * depthWeight * normalWeight * bentWeight;
             visibilitySum += sampleSignal.z * weight;
             bentSum += sampleBent * weight;
@@ -491,15 +603,18 @@ float4 BilateralSignal(float2 uv, float centerDepth, float3 centerNormal,
                   visibilitySum * inverseWeight, centerDepth);
 }
 
+// input.uv is TRACE space (this target may be half res). The centre depth is a
+// source-texture read, so it is re-centred; HorizonVisibility keeps the trace
+// uv because it steps its taps in trace space.
 float4 PSGTAO(VSOutput input) : SV_TARGET
 {
-    float depth = SampleDepth(input.uv, false);
+    float depth = SampleDepth(TraceUVToSourceUV(input.uv), false);
     return HorizonVisibility(input.uv, depth, false).xxxx;
 }
 
 float4 PSGTAOMSAA(VSOutput input) : SV_TARGET
 {
-    float depth = SampleDepth(input.uv, true);
+    float depth = SampleDepth(TraceUVToSourceUV(input.uv), true);
     return HorizonVisibility(input.uv, depth, true).xxxx;
 }
 

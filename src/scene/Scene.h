@@ -523,6 +523,29 @@ struct Scene {
     // Accumulate directional GTAO through motion/depth/normal history. Off by
     // default so the established single-frame path remains the baseline.
     bool  temporalBentNormalGTAO = false;
+    // A/B switch for the GTAO/contact-shadow arithmetic optimizations: hoisted
+    // loop invariants, multiply chains in place of pow(), and rsqrt-based
+    // distance math. Both variants are compiled from the same source behind
+    // SGE_AO_OPTIMIZED, so this swaps pipelines rather than recompiling.
+    //
+    // The optimizations are output-preserving in intent, so the two paths
+    // should look identical while differing only in cost. Kept as a toggle
+    // because an offline A/B on the smoke-test scene could not separate them
+    // from run-to-run noise: the pass is dominated by scattered depth fetches,
+    // not arithmetic. Measure it on a real view via the profiler overlay.
+    bool  optimizedAmbientOcclusion = true;
+    // Trace ambient occlusion at half resolution and upsample in the existing
+    // bilateral composite, which keeps running at full resolution. Quarters the
+    // AO trace's pixel count -- the dominant cost of the pass, since it is
+    // bound by scattered depth fetches rather than arithmetic.
+    //
+    // A previous attempt at this was reverted for horizontal banding. That was
+    // a texel-addressing bug, not an inherent limitation: half-res pixel
+    // centres land exactly on full-res texel boundaries, where a point sampler
+    // picks between two neighbours by float rounding. The shader now re-centres
+    // source fetches (TraceUVToSourceUV) so each lands mid-texel. Off by
+    // default so the full-res image stays the baseline until compared.
+    bool  halfResolutionAO = false;
     // The independently resolved 4x grass depth can drive GTAO/contact so grass
     // receives and casts the screen-space effect. On by default: grass that is
     // absent from the AO depth neither occludes nor is occluded, so blades sit
