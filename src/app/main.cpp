@@ -17897,6 +17897,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                    << g_destructionChunksSeenThisFrame << '\n'
                    << "destruction_chunks_registered="
                    << g_destructionChunksRegisteredThisFrame << '\n'
+                   << "destruction_frustum_only_commands="
+                   << g_destructionFrustumOnlyCommands << '\n'
             // Leading indicator for the geometry-pool leak: non-zero means the
             // pool ran dry and chunks stopped registering.
                    << "vb_geometry_reg_failures="

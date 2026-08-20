@@ -26,7 +26,11 @@ struct CullInput {
     int baseVertexLocation;
     uint startInstanceLocation;
     float4 worldBounds;
+    uint cullFlags;
+    uint3 cullPadding;
 };
+
+static const uint CULL_FLAG_FRUSTUM_ONLY = 1u << 0u;
 
 StructuredBuffer<CullInput> inputCommands : register(t0);
 Texture2D<float> previousDepth : register(t1);
@@ -101,11 +105,19 @@ void main(uint3 threadID : SV_DispatchThreadID) {
     float radius = command.worldBounds.w;
     if (!FrustumVisible(center, radius)) return;
 
-    float distanceToCamera = max(length(center - cameraPosition), 0.001);
-    float projectedRadius = radius * projectionScaleY / distanceToCamera
-                          * screenSize.y * 0.5;
-    if (projectedRadius * 2.0 < lodPixelThreshold) return;
-    if (Occluded(center, radius)) return;
+    // Moving destruction chunks and closed house shells cannot safely use the
+    // previous frame as an occlusion oracle. Their CPU material policy already
+    // requests frustum-only culling; honour it here and keep tiny fragments
+    // from blinking at the projected-size threshold as they move or settle.
+    const bool frustumOnly =
+        (command.cullFlags & CULL_FLAG_FRUSTUM_ONLY) != 0u;
+    if (!frustumOnly) {
+        float distanceToCamera = max(length(center - cameraPosition), 0.001);
+        float projectedRadius = radius * projectionScaleY / distanceToCamera
+                              * screenSize.y * 0.5;
+        if (projectedRadius * 2.0 < lodPixelThreshold) return;
+        if (Occluded(center, radius)) return;
+    }
 
     uint outputIndex;
     visibleCount.InterlockedAdd(0, 1, outputIndex);

@@ -44,6 +44,8 @@ int main(int argc, char** argv) {
     const std::string shaderPath = sourceDir + "/shaders/visbuf_resolve_cs.hlsl";
     const std::string postShaderPath =
         sourceDir + "/shaders/visbuf_post_cs.hlsl";
+    const std::string cullShaderPath =
+        sourceDir + "/shaders/visibility_cull_cs.hlsl";
     const std::string goldenPath =
         sourceDir + "/tests/golden/visbuf_resolve_cs.fxc.size";
 
@@ -139,6 +141,59 @@ int main(int argc, char** argv) {
         CHECK(SUCCEEDED(postConstantBuffer->GetDesc(&postConstants)));
         CHECK(postConstants.Size == 80u);
     }
+
+    // The visibility culler is compiled through the runtime FXC path rather
+    // than CMake. Compile and reflect it here so a C++/HLSL input-contract edit
+    // cannot ship with a typo or a shifted resource binding that appears only
+    // when the application first reaches the visibility path.
+    std::ifstream cullShaderFile(cullShaderPath);
+    if (!cullShaderFile.is_open()) {
+        std::cerr << "Failed to open " << cullShaderPath << "\n";
+        return 1;
+    }
+    std::stringstream cullShaderStream;
+    cullShaderStream << cullShaderFile.rdbuf();
+    const std::string cullCode = cullShaderStream.str();
+
+    ComPtr<ID3DBlob> cullBlob;
+    errors.Reset();
+    const HRESULT cullHr = D3DCompile(
+        cullCode.c_str(), cullCode.size(), cullShaderPath.c_str(), nullptr,
+        D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0", compileFlags, 0,
+        &cullBlob, &errors);
+    if (FAILED(cullHr)) {
+        std::cerr << "Visibility cull shader failed to compile: "
+                  << (errors ? (const char*)errors->GetBufferPointer()
+                             : "unknown")
+                  << "\n";
+        return 1;
+    }
+
+    ComPtr<ID3D11ShaderReflection> cullReflection;
+    const HRESULT cullReflectHr = D3DReflect(
+        cullBlob->GetBufferPointer(), cullBlob->GetBufferSize(),
+        __uuidof(ID3D11ShaderReflection),
+        reinterpret_cast<void**>(cullReflection.GetAddressOf()));
+    if (FAILED(cullReflectHr)) {
+        std::cerr << "Failed to reflect visibility cull shader\n";
+        return 1;
+    }
+    auto checkCullBinding = [&](const char* name, D3D_SHADER_INPUT_TYPE type,
+                                UINT bindPoint) {
+        D3D11_SHADER_INPUT_BIND_DESC binding = {};
+        const HRESULT bindingHr =
+            cullReflection->GetResourceBindingDescByName(name, &binding);
+        CHECK(SUCCEEDED(bindingHr));
+        if (SUCCEEDED(bindingHr)) {
+            CHECK(binding.Type == type);
+            CHECK(binding.BindPoint == bindPoint);
+            CHECK(binding.BindCount == 1u);
+        }
+    };
+    checkCullBinding("inputCommands", D3D_SIT_STRUCTURED, 0u);
+    checkCullBinding("previousDepth", D3D_SIT_TEXTURE, 1u);
+    checkCullBinding("visibleCommands", D3D_SIT_UAV_RWBYTEADDRESS, 0u);
+    checkCullBinding("visibleCount", D3D_SIT_UAV_RWBYTEADDRESS, 1u);
 
     // The golden file stores the DXBC itself, so this catches a change that
     // happens to preserve the length -- reordered arithmetic usually does.

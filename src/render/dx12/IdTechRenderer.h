@@ -21,6 +21,7 @@
 #include "ForwardRenderer.h"
 #include <array>
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 
 // Defined in main.cpp, which includes this header before that definition.
@@ -73,6 +74,10 @@ struct IdTechDrawItem {
     // chunks actually registered visibility IDs this frame, which is what lets
     // the forward pass skip redrawing them.
     bool destructionChunk = false;
+    // Skip previous-frame HZB and projected-size LOD rejection. Frustum culling
+    // remains active. Destruction geometry needs this because its closed chunk
+    // shells and moving transforms make temporal occlusion unsafe.
+    bool frustumOnly = false;
 };
 
 struct FrustumPlanes {
@@ -201,6 +206,7 @@ inline void AppendOpaquePrimitiveDrawItem(MeshPrimitive& primitive,
     item.alphaCutout = material && material->alphaCutout &&
         material->baseColorTexture != nullptr;
     item.alphaFromLuminance = material && material->alphaFromLuminance;
+    item.frustumOnly = material && material->disableOcclusionCulling;
     item.palmWindRoot = palmWindRoot;
     if (palmWindRoot.z > 0.5f) {
         const int rootX = static_cast<int>(palmWindRoot.x * 100.0f);
@@ -302,8 +308,14 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<IdTechDrawItem>& items
                 XMLoadFloat4x4(&item.transform), items);
         // Tagged in bulk rather than threaded through the append helpers, which
         // are shared with every other geometry source in this function.
-        for (size_t i = destructionBegin; i < items.size(); ++i)
+        for (size_t i = destructionBegin; i < items.size(); ++i) {
             items[i].destructionChunk = true;
+            // Every representation of a house chunk -- individual, actor
+            // batch, or settled spatial batch -- is conservative. Material
+            // merges preserve the opt-out too, but the destruction tag is the
+            // ownership-level guarantee if a fallback material is introduced.
+            items[i].frustumOnly = true;
+        }
     }
 
     if (!g_emptyLevelMode && g_trees.IsInitialized()) {
@@ -402,14 +414,24 @@ struct VisIndexedIndirectCommand {
 struct GPUVisibilityCullInput {
     VisIndexedIndirectCommand command;
     XMFLOAT4 worldBounds;
+    UINT cullFlags;
+    UINT padding[3];
 };
 #pragma pack(pop)
+
+enum GPUVisibilityCullFlags : UINT {
+    GPU_VISIBILITY_CULL_FRUSTUM_ONLY = 1u << 0u
+};
 
 static_assert(sizeof(VisIndexedIndirectCommand) == sizeof(D3D12_VERTEX_BUFFER_VIEW) +
     sizeof(D3D12_INDEX_BUFFER_VIEW) + sizeof(D3D12_GPU_VIRTUAL_ADDRESS) +
     sizeof(UINT) + sizeof(D3D12_DRAW_INDEXED_ARGUMENTS),
     "VisIndexedIndirectCommand must be tightly packed for ExecuteIndirect.");
-static_assert(sizeof(GPUVisibilityCullInput) == 80,
+static_assert(offsetof(GPUVisibilityCullInput, worldBounds) == 64,
+    "GPU cull bounds offset must match visibility_cull_cs.hlsl.");
+static_assert(offsetof(GPUVisibilityCullInput, cullFlags) == 80,
+    "GPU cull flags offset must match visibility_cull_cs.hlsl.");
+static_assert(sizeof(GPUVisibilityCullInput) == 96,
     "GPU cull input must match visibility_cull_cs.hlsl.");
 
 struct alignas(256) GPUVisibilityCullConstants {
@@ -800,6 +822,7 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     // be drawn by neither pass and simply vanish.
     UINT destructionChunksSeen = 0;
     UINT destructionChunksRegistered = 0;
+    g_destructionFrustumOnlyCommands = 0;
     for (IdTechDrawItem item : drawItems) {
         if (item.destructionChunk) ++destructionChunksSeen;
         item.visibilityMeshID = item.primitive
@@ -882,6 +905,10 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
                 0x9e3779b97f4a7c15ull;
             inputKey ^= static_cast<uint64_t>(
                 drawItems[i].primitive->indexCount) << 32;
+            staticInput.cullFlags = drawItems[i].frustumOnly
+                ? GPU_VISIBILITY_CULL_FRUSTUM_ONLY : 0u;
+            inputKey ^= static_cast<uint64_t>(staticInput.cullFlags + 1u) *
+                0xd6e8feb86659fd93ull;
             XMFLOAT4X4 modelForHash;
             XMStoreFloat4x4(&modelForHash, drawItems[i].model);
             const uint32_t* modelWords =
@@ -891,6 +918,8 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
                 inputKey *= 1099511628211ull;
             }
             const UINT inputIndex = batchCount++;
+            if (drawItems[i].destructionChunk && drawItems[i].frustumOnly)
+                ++g_destructionFrustumOnlyCommands;
             if (context.NeedsInput(inputIndex, inputKey))
                 staticInput.worldBounds = ComputeDrawItemBounds(drawItems[i]);
             GPUVisibilityCullInput& input = context.PrepareInput(

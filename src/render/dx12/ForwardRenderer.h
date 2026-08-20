@@ -63,6 +63,10 @@ inline UINT g_destructionRegistrationFailFrames = 0;
 // Chunks seen/registered on the most recent frame, for reading alongside a flip.
 inline UINT g_destructionChunksSeenThisFrame = 0;
 inline UINT g_destructionChunksRegisteredThisFrame = 0;
+// Destruction draw commands sent through frustum-only GPU culling this frame.
+// This should match the registered indirect destruction command count: any
+// lower value means temporal HZB/LOD rejection can still punch holes in a house.
+inline UINT g_destructionFrustumOnlyCommands = 0;
 extern bool g_showH2Model;
 extern WaterVolume g_water;
 extern WaterVolume g_ocean;   // sea ringing the island
