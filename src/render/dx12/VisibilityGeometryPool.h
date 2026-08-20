@@ -32,6 +32,14 @@ struct VBGeometryRange {
 
 class VisibilityGeometryPool {
 public:
+    // Smallest remainder worth carving off a recycled range. Below this a
+    // split would only produce an entry no mesh can use, so the allocating
+    // mesh keeps the slack instead. Tunable: watch FreeRangeCount() for
+    // fragmentation and the high-water marks for stranding.
+    static const unsigned int kMinSplitVertices = 64;
+    static const unsigned int kMinSplitIndices = kMinSplitVertices * 3;
+    static const unsigned int kMinSplitTriangles = kMinSplitVertices;
+
     VisibilityGeometryPool(unsigned int maxVertices, unsigned int maxIndices,
                            unsigned int maxTriangles, unsigned int frameCount)
         : maxVertices_(maxVertices), maxIndices_(maxIndices),
@@ -57,11 +65,49 @@ public:
                 best = i;
         }
         if (best != free_.size()) {
-            out = free_[best];
-            out.retiredFrame = 0;
-            // The mesh keeps the whole range. Splitting off the remainder would
-            // shed slivers too small for any later mesh to use.
+            const VBGeometryRange range = free_[best];
             free_.erase(free_.begin() + static_cast<ptrdiff_t>(best));
+
+            out = range;
+            out.retiredFrame = 0;
+
+            // Carve the remainder off when it is big enough to serve a later
+            // mesh, and keep it otherwise. Splitting unconditionally sheds
+            // slivers too small for anything to use; never splitting strands
+            // the tail permanently, which is what bled the pool dry: a small
+            // destruction chunk claiming a large retired house range kept the
+            // whole thing, and the high-water mark ratcheted until Allocate
+            // failed and the chunks stopped rasterising.
+            //
+            // All three dimensions must clear the threshold. A tail that is
+            // useless in any one of them is useless outright, since Allocate
+            // requires vertices, indices and triangles to fit together.
+            const unsigned int vertexRemainder = range.vertexCapacity - vertexCount;
+            const unsigned int indexRemainder = range.indexCapacity - indexCount;
+            const unsigned int triangleRemainder =
+                range.triangleCapacity - triangleCount;
+            if (vertexRemainder >= kMinSplitVertices &&
+                indexRemainder >= kMinSplitIndices &&
+                triangleRemainder >= kMinSplitTriangles) {
+                // The head keeps the original offsets. An allocated range's
+                // offsets must never move while a mesh holds them -- the DXR
+                // hit path and in-flight draws snapshot them.
+                out.vertexCapacity = vertexCount;
+                out.indexCapacity = indexCount;
+                out.triangleCapacity = triangleCount;
+
+                VBGeometryRange tail;
+                tail.vertexOffset = range.vertexOffset + vertexCount;
+                tail.vertexCapacity = vertexRemainder;
+                tail.indexOffset = range.indexOffset + indexCount;
+                tail.indexCapacity = indexRemainder;
+                tail.triangleOffset = range.triangleOffset + triangleCount;
+                tail.triangleCapacity = triangleRemainder;
+                // Straight to free_, never retired_: this storage was never
+                // handed to the GPU, so it needs no quarantine.
+                tail.retiredFrame = 0;
+                free_.push_back(tail);
+            }
             return true;
         }
 
@@ -96,15 +142,18 @@ public:
     void BeginFrame() {
         ++frame_;
         if (retired_.empty()) return;
+        bool released = false;
         auto stillQuarantined = std::remove_if(retired_.begin(), retired_.end(),
             [&](const VBGeometryRange& range) {
                 if (frame_ - range.retiredFrame <=
                     static_cast<uint64_t>(frameCount_))
                     return false;
                 free_.push_back(range);
+                released = true;
                 return true;
             });
         retired_.erase(stillQuarantined, retired_.end());
+        if (released) CoalesceFree();
     }
 
     unsigned int VertexHighWater() const { return vertexHighWater_; }
@@ -123,6 +172,41 @@ public:
     }
 
 private:
+    // Merge free ranges that are contiguous in all three arrays back into one
+    // entry. Splitting makes the free list fragment over a long session, and a
+    // pool holding the right total capacity in pieces too small to use fails
+    // allocations just as surely as an empty one.
+    //
+    // A merge is only valid when the ranges abut in vertices, indices AND
+    // triangles. Ranges are carved from the high-water marks in lockstep, so
+    // neighbours normally do abut in all three, but a pair that abuts in only
+    // one array describes disjoint storage and must be left alone.
+    void CoalesceFree() {
+        if (free_.size() < 2) return;
+        std::sort(free_.begin(), free_.end(),
+            [](const VBGeometryRange& a, const VBGeometryRange& b) {
+                return a.vertexOffset < b.vertexOffset;
+            });
+        std::vector<VBGeometryRange> merged;
+        merged.reserve(free_.size());
+        merged.push_back(free_.front());
+        for (size_t i = 1; i < free_.size(); ++i) {
+            VBGeometryRange& back = merged.back();
+            const VBGeometryRange& next = free_[i];
+            if (back.vertexOffset + back.vertexCapacity == next.vertexOffset &&
+                back.indexOffset + back.indexCapacity == next.indexOffset &&
+                back.triangleOffset + back.triangleCapacity ==
+                    next.triangleOffset) {
+                back.vertexCapacity += next.vertexCapacity;
+                back.indexCapacity += next.indexCapacity;
+                back.triangleCapacity += next.triangleCapacity;
+                continue;
+            }
+            merged.push_back(next);
+        }
+        free_.swap(merged);
+    }
+
     std::vector<VBGeometryRange> free_;
     std::vector<VBGeometryRange> retired_;
     unsigned int maxVertices_ = 0;

@@ -54,6 +54,15 @@ inline UINT g_destructionVisibilityOwnedPrimitives = 0;
 // Set while drawing destruction geometry so the shared node/mesh draw helpers
 // can attribute their per-primitive decisions to destruction.
 inline bool g_countingDestructionPrimitives = false;
+// Flicker diagnostics. A chunk goes missing for a frame whenever ownership
+// changes hands, so these count the transitions rather than the steady state.
+inline UINT g_destructionOwnershipFlips = 0;
+// Frames where the visibility pass wanted the chunks but at least one failed to
+// register, which is what forces ownership back to the forward pass.
+inline UINT g_destructionRegistrationFailFrames = 0;
+// Chunks seen/registered on the most recent frame, for reading alongside a flip.
+inline UINT g_destructionChunksSeenThisFrame = 0;
+inline UINT g_destructionChunksRegisteredThisFrame = 0;
 extern bool g_showH2Model;
 extern WaterVolume g_water;
 extern WaterVolume g_ocean;   // sea ringing the island
@@ -627,7 +636,17 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
 
         const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
         const bool alphaCutout = prim.material && prim.material->alphaCutout;
+        // visibilityMeshID persists on the primitive from whenever it last
+        // registered; it is NOT recomputed per frame. A chunk that registered
+        // once and then failed to register this frame (geometry pool churn as
+        // fractures rebuild merged batches) keeps a stale non-invalid ID, so
+        // this skip would drop it while the visibility buffer is not drawing
+        // it either -- the house flickers out for those frames. For chunk
+        // draws, defer to the frame-accurate ownership flag instead.
+        const bool chunkOwnershipThisFrame = !g_countingDestructionPrimitives ||
+            g_destructionInVisibilityBuffer;
         const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
+            chunkOwnershipThisFrame &&
             !transparent && !alphaCutout && !prim.skinBuffer &&
             !prim.vertices.empty();
         if (g_countingDestructionPrimitives) {
@@ -895,7 +914,14 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
 
             const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
             const bool alphaCutout = prim.material && prim.material->alphaCutout;
+            // Same stale-ID hazard as DrawMeshAt above: visibilityMeshID is
+            // whatever the primitive last registered, not this frame's answer.
+            // Defer to the frame-accurate ownership flag for chunk draws so a
+            // failed re-registration cannot leave a chunk drawn by nobody.
+            const bool chunkOwnershipThisFrame = !g_countingDestructionPrimitives ||
+                g_destructionInVisibilityBuffer;
             const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
+                chunkOwnershipThisFrame &&
                 !transparent && !alphaCutout && !prim.skinBuffer &&
                 !prim.vertices.empty();
             if (g_countingDestructionPrimitives) {

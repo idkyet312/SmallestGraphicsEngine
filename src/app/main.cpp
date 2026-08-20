@@ -17885,6 +17885,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                    << g_destructionForwardPrimitivesDrawn << '\n'
                    << "destruction_vb_owned_primitives="
                    << g_destructionVisibilityOwnedPrimitives << '\n'
+            // Chunk-flicker diagnostics. An ownership flip hands the whole
+            // house between the visibility and forward passes and wipes
+            // temporal history, so a rising count is the flicker itself.
+            // Registration failures are what force those flips.
+                   << "destruction_ownership_flips="
+                   << g_destructionOwnershipFlips << '\n'
+                   << "destruction_reg_fail_frames="
+                   << g_destructionRegistrationFailFrames << '\n'
+                   << "destruction_chunks_seen="
+                   << g_destructionChunksSeenThisFrame << '\n'
+                   << "destruction_chunks_registered="
+                   << g_destructionChunksRegisteredThisFrame << '\n'
+            // Leading indicator for the geometry-pool leak: non-zero means the
+            // pool ran dry and chunks stopped registering.
+                   << "vb_geometry_reg_failures="
+                   << visBuffer.GeometryRegistrationFailures() << '\n'
+                   << "vb_geometry_vertex_high_water="
+                   << visBuffer.GeometryVertexHighWater() << '\n'
+                   << "vb_geometry_free_ranges="
+                   << visBuffer.GeometryFreeRangeCount() << '\n'
                    << "fe_destruction_gpu_ms="
                    << g_profiler.GpuScopeMs("FE/Destruction") << '\n'
                    << "forward_extensions_gpu_ms="

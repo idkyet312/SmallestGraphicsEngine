@@ -1219,6 +1219,17 @@ public:
         return geometryRegistrationFailures;
     }
 
+    // Pool occupancy, for diagnosing registration failures. Storage that keeps
+    // climbing across destruction rebuilds means ranges are being stranded
+    // rather than recycled; a free-range count that climbs alongside it means
+    // fragmentation instead.
+    UINT GeometryVertexHighWater() const {
+        return geometryPool.VertexHighWater();
+    }
+    size_t GeometryFreeRangeCount() const {
+        return geometryPool.FreeRangeCount();
+    }
+
     // Drop a primitive's registration and recycle its storage. Called by the
     // destruction system when it retires a merged batch node.
     void ReleasePrimitive(MeshPrimitive* primitive) {

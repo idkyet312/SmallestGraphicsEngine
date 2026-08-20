@@ -806,7 +806,6 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
             ? vb.RegisterPrimitive(item.primitive)
             : (item.isCube ? cubeMesh : planeMesh);
         if (item.visibilityMeshID == VB_INVALID_MESH) continue;
-        if (item.destructionChunk) ++destructionChunksRegistered;
         if (item.instanceKey)
             item.instanceKey ^= static_cast<uint64_t>(item.visibilityMeshID + 1u) *
                 0x9e3779b97f4a7c15ull;
@@ -820,6 +819,12 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
             item.model, item.color, 0.0f, 0.5f, materialID, flags,
             item.instanceKey, item.palmWindRoot);
         if (dc == UINT_MAX) continue;
+        // Count the chunk only once it has BOTH a mesh slot and a draw call.
+        // Counting at the mesh-slot check above treated a chunk whose instance
+        // registration failed (draw-call pool full) as visibility-owned, so the
+        // forward pass skipped it and nothing drew it -- the house flickered
+        // out for exactly the frames the pool was saturated.
+        if (item.destructionChunk) ++destructionChunksRegistered;
         item.materialId = materialID;
         registeredItems.push_back(item);
         dcIDs.push_back(dc);
@@ -1038,8 +1043,18 @@ inline void RenderIdTech(Scene& scene, ShaderDX12& shader,
     // buffer, and the toggle invalidates temporal history, so the oscillation
     // destabilises everything the resolve shades from that depth -- terrain
     // most visibly, since it covers the screen.
-    g_destructionInVisibilityBuffer = vb.DestructionVisibilityRequested() &&
+    const bool destructionOwnedNow = vb.DestructionVisibilityRequested() &&
         destructionChunksRegistered == destructionChunksSeen;
+    // Diagnostics for the chunk-flicker investigation: count how often the
+    // owner changes and how often a registration failure is what forced it.
+    if (destructionOwnedNow != g_destructionInVisibilityBuffer)
+        ++g_destructionOwnershipFlips;
+    if (vb.DestructionVisibilityRequested() &&
+        destructionChunksRegistered != destructionChunksSeen)
+        ++g_destructionRegistrationFailFrames;
+    g_destructionChunksSeenThisFrame = destructionChunksSeen;
+    g_destructionChunksRegisteredThisFrame = destructionChunksRegistered;
+    g_destructionInVisibilityBuffer = destructionOwnedNow;
 
     vb.EndVisibilityPass(g_dx12.commandList.Get());
     }
