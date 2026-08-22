@@ -1,0 +1,224 @@
+{
+  "schemaVersion": 1,
+  "name": "Training Range",
+  "insertionMode": "player_choice",
+  "terrain": {
+    "heightScale": 0.0,
+    "tilesX": 4,
+    "tilesZ": 4,
+    "islandScaleX": 0.6,
+    "islandScaleZ": 0.6,
+    "originTileX": 0,
+    "originTileZ": 0,
+    "sculpt": []
+  },
+  "lighting": {
+    "dxrDDGI": {
+      "enabled": false,
+      "surfaceSpacing": 3.0,
+      "surfaceOffset": 0.35,
+      "maxProbes": 200,
+      "raysPerProbe": 64,
+      "probesPerFrame": 16,
+      "maxRayDistance": 24.0,
+      "intensity": 1.0,
+      "normalBias": 0.18,
+      "viewBias": 0.05,
+      "hysteresis": 0.95,
+      "multiBounceStrength": 0.35,
+      "showProbes": false
+    }
+  },
+  "entities": [
+    {
+      "id": 1,
+      "type": "player_spawn",
+      "name": "Insertion Point",
+      "enabled": true,
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          34.0
+        ],
+        "rotation": [
+          0.0,
+          180.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": 10,
+      "type": "prefab",
+      "prefab": "props/comm_tower",
+      "name": "Communication Tower",
+      "enabled": true,
+      "overrides": {
+        "destructible": {
+          "health": 2400.0
+        }
+      },
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          -30.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": 20,
+      "type": "enemy_spawn",
+      "name": "Tower Guard",
+      "enabled": true,
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          180.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": 21,
+      "type": "rock",
+      "name": "Guard Cover",
+      "enabled": true,
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          3.0
+        ],
+        "rotation": [
+          0.0,
+          25.0,
+          0.0
+        ],
+        "scale": [
+          1.6,
+          1.4,
+          1.6
+        ]
+      }
+    },
+    {
+      "id": 30,
+      "type": "metal_house",
+      "name": "Range Shed",
+      "enabled": true,
+      "transform": {
+        "position": [
+          -12.0,
+          0.0,
+          -6.0
+        ],
+        "rotation": [
+          0.0,
+          90.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": 31,
+      "type": "explosive_barrel",
+      "name": "Demo Barrel",
+      "enabled": true,
+      "transform": {
+        "position": [
+          -9.0,
+          0.0,
+          -10.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": 40,
+      "type": "palm",
+      "name": "Landmark Palm West",
+      "enabled": true,
+      "transform": {
+        "position": [
+          -16.0,
+          0.0,
+          18.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          11.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": 41,
+      "type": "palm",
+      "name": "Landmark Palm East",
+      "enabled": true,
+      "transform": {
+        "position": [
+          15.0,
+          0.0,
+          20.0
+        ],
+        "rotation": [
+          0.0,
+          40.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          12.0,
+          1.0
+        ]
+      }
+    }
+  ]
+}

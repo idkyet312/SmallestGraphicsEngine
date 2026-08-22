@@ -11,13 +11,14 @@
 #include <DirectXPackedVector.h>
 #include <algorithm>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-// Defined in main.cpp. Same pattern as ForwardRenderer.h / IdTechRenderer.h:
+// Defined in main.cpp. Same pattern as ForwardRenderer.h / VBDrawRenderer.h:
 // the SVGF passes time themselves, and this header is included before the
 // definition.
 extern ProfilerDX12 g_profiler;
@@ -411,7 +412,7 @@ public:
     // On by default now that ray hits shade from real geometry: before that a
     // traced bounce returned dimmed sky and was not worth the ray. Falls back
     // to the probe grid wherever the acceleration structure has no binding.
-    bool enhancedProbeMissGIActive = true;
+    bool enhancedProbeMissGIActive = false;
     // 0 = fill probe misses only (cheapest, rays only where the grid failed),
     // 1 = full RT GI (every pixel traces, probes unused).
     // How much of the GI comes from rays rather than probes. 0 traces only
@@ -1726,6 +1727,14 @@ public:
                 bentNormalHistoryActive ? bentNormalGTAOHistory : nullptr);
         }
         bentNormalGTAOAppliedLastResolve = bentNormalHistoryActive;
+        // Everything from here to the first dispatch: resource transitions for
+        // the resolve's inputs and outputs, plus the frame-constant upload.
+        // Scoped because these barriers force the depth buffer out of
+        // DEPTH_WRITE and several render targets into UAV, which on a tiled GPU
+        // means a real flush -- cost that otherwise showed up only as the gap
+        // between "VB Resolve" and the dispatches nested inside it.
+        std::optional<ProfilerDX12::Scope> setupScope;
+        setupScope.emplace(g_profiler, "VB Resolve Setup", cmdList);
         if (bentNormalHistoryActive) {
             D3D12_RESOURCE_BARRIER historyBarrier = {};
             historyBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1985,6 +1994,10 @@ public:
                 << " enhanced=" << (useEnhanced ? 1 : 0) << "\n";
         }
 
+        // Setup ends here: everything after this point is dispatch work that
+        // has a scope of its own.
+        setupScope.reset();
+
         if (useTileClassification) {
             ProfilerDX12::Scope classifyScope(
                 g_profiler, "VB Tile Classify", cmdList);
@@ -2075,19 +2088,29 @@ public:
             selectedPSO = tiledGenericPSO;
         }
 
-        if (useTileClassification) {
-            // Generic half over its own tile list: record 0 of the args buffer,
-            // and the list it names bound at t90.
-            cmdList->SetComputeRootShaderResourceView(2,
-                genericTileListBuffer->GetGPUVirtualAddress());
-            cmdList->SetPipelineState(selectedPSO);
-            cmdList->ExecuteIndirect(resolveDispatchSignature.Get(), 1,
-                                     classifiedDispatchArgsBuffer.Get(), 0,
-                                     nullptr, 0);
-        } else if (resolveDispatchSignature && resolveDispatchArgsBuffer) {
-            cmdList->ExecuteIndirect(resolveDispatchSignature.Get(), 1, resolveDispatchArgsBuffer.Get(), 0, nullptr, 0);
-        } else {
-            cmdList->Dispatch(groupsX, groupsY, 1);
+        {
+            // The generic half is the resolve's single most expensive dispatch:
+            // it decodes the visibility ID, refetches and interpolates vertex
+            // attributes, samples every material texture, and runs the full
+            // lighting/shadow/IBL chain. Scoped on its own so its share is
+            // visible against the terrain half and the SVGF passes rather than
+            // hiding inside one aggregate "VB Resolve" number.
+            ProfilerDX12::Scope genericResolveScope(
+                g_profiler, "VB Shade Generic", cmdList);
+            if (useTileClassification) {
+                // Generic half over its own tile list: record 0 of the args
+                // buffer, and the list it names bound at t90.
+                cmdList->SetComputeRootShaderResourceView(2,
+                    genericTileListBuffer->GetGPUVirtualAddress());
+                cmdList->SetPipelineState(selectedPSO);
+                cmdList->ExecuteIndirect(resolveDispatchSignature.Get(), 1,
+                                         classifiedDispatchArgsBuffer.Get(), 0,
+                                         nullptr, 0);
+            } else if (resolveDispatchSignature && resolveDispatchArgsBuffer) {
+                cmdList->ExecuteIndirect(resolveDispatchSignature.Get(), 1, resolveDispatchArgsBuffer.Get(), 0, nullptr, 0);
+            } else {
+                cmdList->Dispatch(groupsX, groupsY, 1);
+            }
         }
 
         // Terrain half of the split. Same root signature, same heap, same
@@ -2619,6 +2642,11 @@ public:
         // Preserve visibility depth before forward-only animated/alpha-tested
         // geometry modifies it. Post uses the difference as a reactive mask.
         {
+            // A full-screen depth CopyResource plus four transitions. Small per
+            // pixel but not free at high resolution, and it ran inside the
+            // aggregate "VB Resolve" with no scope of its own.
+            ProfilerDX12::Scope depthCopyScope(
+                g_profiler, "VB Depth Snapshot", cmdList);
             D3D12_RESOURCE_BARRIER barriers[3] = {};
             barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             barriers[0].Transition.pResource = g_dx12.depthStencilBuffer.Get();

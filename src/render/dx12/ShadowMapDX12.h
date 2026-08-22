@@ -694,7 +694,7 @@ public:
             depthShader.NextDrawCall();
         }
 
-        if (!g_emptyLevelMode && g_humveeModel) {
+        if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel) {
             std::vector<XMMATRIX> humveeTransforms = { HumveeWorldMatrix() };
             if (g_stressTestMode)
                 humveeTransforms.push_back(SecondaryHumveeWorldMatrix());
@@ -703,7 +703,7 @@ public:
                 depthShader, humveeTransforms, lightSpace);
         }
 
-        if (!g_emptyLevelMode && g_boatModel) {
+        if (!g_emptyLevelMode && !g_trainingRangeMode && g_boatModel) {
             std::vector<XMMATRIX> boatTransforms = { BoatWorldMatrix() };
             DrawSceneNodeShadowInstances(
                 g_boatShadowModel ? g_boatShadowModel : g_boatModel,

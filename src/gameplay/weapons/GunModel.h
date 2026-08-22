@@ -139,7 +139,7 @@ public:
             { 0.020f, -0.030f, -0.330f }, // RPG forward grip
             { 0.030f, -0.060f, -0.490f }, // SVD handguard
             { 0.015f, -0.080f, -0.390f }, // laser emitter
-            { 0.000f, -0.080f, -0.180f }, // C4 pack
+            {-0.035f,  0.055f,  0.215f }, // C4 pack (authored brick)
             { 0.030f, -0.095f, -0.330f }, // flamethrower nozzle
             { 0.020f, -0.085f, -0.305f }, // harpoon barrel
             // Same mesh and so the same grip as the standard SVD. The
@@ -152,6 +152,29 @@ public:
     }
     static XMFLOAT3& PlayerOffset() {
         return WeaponOffset(SelectedWeapon());
+    }
+    // Per-weapon fit rotation, in degrees (pitch/yaw/roll). The offset above
+    // only slides a mesh along the hands; an imported model whose authored
+    // forward axis differs from the engine's also has to be turned before it
+    // sits in them, which is what this carries. Zero for the weapons whose
+    // meshes already arrive correctly oriented.
+    static XMFLOAT3& WeaponFitRotation(int weapon) {
+        static std::array<XMFLOAT3, kMaxWeapon + 1> rotations = {{
+            { 0.0f, 0.0f, 0.0f },   // AK47
+            { 0.0f, 0.0f, 0.0f },   // Mossberg
+            { 0.0f, 0.0f, 0.0f },   // RPG
+            { 0.0f, 0.0f, 0.0f },   // SVD
+            { 0.0f, 0.0f, 0.0f },   // laser
+            { 7.0f, 247.0f, 63.0f },// C4: turns the brick into the held pose
+            { 0.0f, 0.0f, 0.0f },   // flamethrower
+            { 0.0f, 0.0f, 0.0f },   // harpoon
+            { 0.0f, 0.0f, 0.0f },   // SVD suppressed
+        }};
+        const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
+        return rotations[static_cast<size_t>(slot)];
+    }
+    static XMFLOAT3& PlayerFitRotation() {
+        return WeaponFitRotation(SelectedWeapon());
     }
     static bool PlayerLoaded() {
         return C4Selected() || FlamethrowerSelected() || HarpoonSelected() ||

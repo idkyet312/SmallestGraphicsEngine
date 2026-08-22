@@ -77,6 +77,7 @@ extern ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 extern ComPtr<ID3D12Resource> g_fireTexture;
 extern ComPtr<ID3D12Resource> g_explosionTexture;   // 4x4 flipbook explosion sheet
 extern ComPtr<ID3D12Resource> g_explosionCoreTexture; // 8x8 white-hot core sheet
+extern std::shared_ptr<SceneNode> g_c4Model;
 extern std::shared_ptr<SceneNode> g_explosiveBarrelModel;
 extern std::shared_ptr<SceneNode> g_explosiveBarrelShadowModel;
 extern std::shared_ptr<SceneNode> g_humveeModel;
@@ -113,6 +114,7 @@ extern float g_dxrDDGICellSize;
 extern DDGIRendererDX12 g_ddgiRenderer;
 extern bool g_stressTestMode;
 extern bool g_emptyLevelMode;
+extern bool g_trainingRangeMode;
 DirectX::XMMATRIX HumveeWorldMatrix();
 DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
 DirectX::XMMATRIX HelicopterWorldMatrix();
@@ -1825,7 +1827,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.NextDrawCall();
     }
 
-    if (!g_emptyLevelMode && g_humveeModel) {
+    if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel) {
         if (visibilityExtensionsOnly) {
             DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
                 view, proj, lightSpace, true);
@@ -1842,7 +1844,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
     }
 
-    if (!g_emptyLevelMode && g_boatModel) {
+    if (!g_emptyLevelMode && !g_trainingRangeMode && g_boatModel) {
         if (visibilityExtensionsOnly) {
             DrawSceneNode(g_boatModel, shader, BoatWorldMatrix(),
                 view, proj, lightSpace, true);
@@ -2171,23 +2173,38 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Armed remote charges remain visible on their impact surfaces. Red status
     // LED blinks until right-click detonation.
     for (const RemoteCharge& charge : scene.remoteCharges) {
-        model = XMMatrixScaling(0.30f, 0.08f, 0.42f) *
-                XMMatrixTranslation(charge.position.x, charge.position.y,
-                                    charge.position.z);
-        shader.SetMatrices(model, view, proj, lightSpace);
-        shader.SetObjectMaterial(XMFLOAT3(0.055f, 0.065f, 0.045f), false, false,
-                                 0.82f, 0.18f, nullptr, nullptr, nullptr);
-        DrawCube(geo);
-        shader.NextDrawCall();
+        // Authored brick where it loaded, procedural box where it did not, so a
+        // missing asset still leaves a visible, defusable charge.
+        if (g_c4Model) {
+            model = XMMatrixTranslation(charge.position.x, charge.position.y,
+                                        charge.position.z);
+            DrawSceneNode(g_c4Model, shader, model, view, proj, lightSpace);
+            shader.Use(scene.wireframeMode);
+        } else {
+            model = XMMatrixScaling(0.30f, 0.08f, 0.42f) *
+                    XMMatrixTranslation(charge.position.x, charge.position.y,
+                                        charge.position.z);
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetObjectMaterial(XMFLOAT3(0.055f, 0.065f, 0.045f), false,
+                                     false, 0.82f, 0.18f, nullptr, nullptr,
+                                     nullptr);
+            DrawCube(geo);
+            shader.NextDrawCall();
+        }
 
-        model = XMMatrixScaling(0.055f, 0.055f, 0.055f) *
-                XMMatrixTranslation(charge.position.x, charge.position.y + 0.07f,
-                                    charge.position.z);
-        shader.UseAdditive();
-        shader.SetMatrices(model, view, proj, lightSpace);
-        shader.SetEmissiveMaterial(XMFLOAT3(8.0f, 0.03f, 0.01f), 0.82f);
-        DrawCube(geo);
-        shader.NextDrawCall();
+        // Status LED only for the procedural box. The authored brick carries
+        // its own panel, so the extra glowing cube just floats above it.
+        if (!g_c4Model) {
+            model = XMMatrixScaling(0.055f, 0.055f, 0.055f) *
+                    XMMatrixTranslation(charge.position.x,
+                                        charge.position.y + 0.07f,
+                                        charge.position.z);
+            shader.UseAdditive();
+            shader.SetMatrices(model, view, proj, lightSpace);
+            shader.SetEmissiveMaterial(XMFLOAT3(8.0f, 0.03f, 0.01f), 0.82f);
+            DrawCube(geo);
+            shader.NextDrawCall();
+        }
         shader.Use(scene.wireframeMode);
     }
 
@@ -2202,13 +2219,22 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         if (!p.active) continue;
         if (p.laser) continue; // laser owns its full-length beam above
         if (p.remoteCharge) {
-            model = XMMatrixScaling(0.24f, 0.10f, 0.34f) *
-                    XMMatrixTranslation(p.position.x, p.position.y, p.position.z);
-            shader.SetMatrices(model, view, proj, lightSpace);
-            shader.SetObjectMaterial(XMFLOAT3(0.06f, 0.07f, 0.045f), false, false,
-                                     0.82f, 0.16f, nullptr, nullptr, nullptr);
-            DrawCube(geo);
-            shader.NextDrawCall();
+            if (g_c4Model) {
+                model = XMMatrixTranslation(p.position.x, p.position.y,
+                                            p.position.z);
+                DrawSceneNode(g_c4Model, shader, model, view, proj, lightSpace);
+                shader.Use(scene.wireframeMode);
+            } else {
+                model = XMMatrixScaling(0.24f, 0.10f, 0.34f) *
+                        XMMatrixTranslation(p.position.x, p.position.y,
+                                            p.position.z);
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetObjectMaterial(XMFLOAT3(0.06f, 0.07f, 0.045f), false,
+                                         false, 0.82f, 0.16f, nullptr, nullptr,
+                                         nullptr);
+                DrawCube(geo);
+                shader.NextDrawCall();
+            }
             continue;
         }
         if (p.flame) {
@@ -2467,7 +2493,16 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // Base placement: the pocket of screen space the weapon was tuned
             // in, before any hand motion is added.
             const XMFLOAT3& weaponOffset = GunModel::PlayerOffset();
+            // Fit rotation turns the mesh in its own space, so it happens before
+            // the scale and the slide into the hands -- rotating afterwards
+            // would swing the weapon around the hand rather than spinning it in
+            // place.
+            const XMFLOAT3& weaponFitRot = GunModel::PlayerFitRotation();
             const XMMATRIX weaponPlacement =
+                XMMatrixRotationRollPitchYaw(
+                    XMConvertToRadians(weaponFitRot.x),
+                    XMConvertToRadians(weaponFitRot.y),
+                    XMConvertToRadians(weaponFitRot.z)) *
                 XMMatrixScaling(S, S, S) *
                 XMMatrixTranslation(weaponOffset.x * S,
                                     weaponOffset.y * S,
@@ -2552,20 +2587,36 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
             if (GunModel::C4Selected()) {
                 const XMFLOAT3 c4Body(0.055f, 0.070f, 0.040f);
-                model = XMMatrixScaling(0.34f, 0.18f, 0.46f) *
-                        XMMatrixTranslation(0.0f, -0.02f, 0.28f) * xf;
-                shader.SetMatrices(model, view, proj, lightSpace);
-                shader.SetObjectMaterial(c4Body, false, false, 0.88f, 0.12f,
-                                         nullptr, nullptr, nullptr);
-                DrawCube(geo);
-                shader.NextDrawCall();
-                model = XMMatrixScaling(0.07f, 0.035f, 0.09f) *
-                        XMMatrixTranslation(0.0f, 0.09f, 0.29f) * xf;
-                shader.UseAdditive();
-                shader.SetMatrices(model, view, proj, lightSpace);
-                shader.SetEmissiveMaterial(XMFLOAT3(8.0f, 0.04f, 0.01f), 0.9f);
-                DrawCube(geo);
-                shader.NextDrawCall();
+                if (g_c4Model) {
+                    // Placed entirely by the tuned per-weapon fit values: xf
+                    // already carries the weapon offset, the fit rotation and
+                    // the hand follow. A hardcoded transform here would stack on
+                    // top of those and fight the sliders that set them.
+                    model = xf;
+                    DrawSceneNode(g_c4Model, shader, model, view, proj,
+                                  lightSpace);
+                    shader.Use(scene.wireframeMode);
+                } else {
+                    model = XMMatrixScaling(0.34f, 0.18f, 0.46f) *
+                            XMMatrixTranslation(0.0f, -0.02f, 0.28f) * xf;
+                    shader.SetMatrices(model, view, proj, lightSpace);
+                    shader.SetObjectMaterial(c4Body, false, false, 0.88f, 0.12f,
+                                             nullptr, nullptr, nullptr);
+                    DrawCube(geo);
+                    shader.NextDrawCall();
+                }
+                // No emissive status block: the authored brick models its own
+                // keypad and display, and the old glowing cube was a stand-in
+                // for detail the procedural box did not have.
+                if (!g_c4Model) {
+                    model = XMMatrixScaling(0.07f, 0.035f, 0.09f) *
+                            XMMatrixTranslation(0.0f, 0.09f, 0.29f) * xf;
+                    shader.UseAdditive();
+                    shader.SetMatrices(model, view, proj, lightSpace);
+                    shader.SetEmissiveMaterial(XMFLOAT3(8.0f, 0.04f, 0.01f), 0.9f);
+                    DrawCube(geo);
+                    shader.NextDrawCall();
+                }
                 shader.Use(scene.wireframeMode);
             } else if (GunModel::FlamethrowerSelected()) {
                 const struct FlamePart {

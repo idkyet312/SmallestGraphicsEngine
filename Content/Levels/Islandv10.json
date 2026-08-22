@@ -1047,7 +1047,7 @@
   "insertionMode": "player_choice",
   "lighting": {
     "dxrDDGI": {
-      "enabled": true,
+      "enabled": false,
       "hysteresis": 0.949999988079071,
       "intensity": 1.0570000410079956,
       "maxProbes": 200,

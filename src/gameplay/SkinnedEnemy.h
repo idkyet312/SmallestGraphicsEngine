@@ -72,6 +72,11 @@ public:
     bool              visible = true;
     bool              castsShadow = true;
     float             health = 100.0f;
+    // Highest health this enemy has held, tracked as a high-water mark rather
+    // than snapshotted at spawn: per-weapon health is assigned after
+    // construction (shotgunners 130, snipers 80), so any single capture point
+    // would miss one of them. Anything below this means the enemy has been hit.
+    float             peakHealth = 0.0f;
     float             moveSpeed = 1.8f;
     // Asset-space orientation and ground offset.
     // Assimp preserves this UE asset's Z-up skeleton. Rotate +Z onto engine +Y.
@@ -495,12 +500,22 @@ public:
         // length. A marine that did it would retreat from every bandit it
         // spots (vision range 28 is inside the 30 backoff range), never
         // closing to engage -- allies push in and orbit instead.
-        const bool evasiveRetreat = !hasCoverTarget_ &&
+        // Track the peak before comparing, so an undamaged enemy always reads as
+        // full and the very first frame cannot register as a hit.
+        if (health > peakHealth) peakHealth = health;
+        // Only a wounded bandit gives ground. At full health he stands and
+        // fights, so backing off reads as a reaction to being hit rather than
+        // the default opening move.
+        const bool damaged = health < peakHealth;
+        const bool evasiveRetreat = !hasCoverTarget_ && damaged &&
             faction == Faction::Bandit && distance < safeDistance;
         // Bandits hold at their safe distance; marines always close on the
-        // target so they can actually orbit and shoot it.
+        // target so they can actually orbit and shoot it. An unhurt bandit is
+        // excluded: this flag suppresses the whole movement branch below, so
+        // holding it while he no longer retreats would freeze him on the spot
+        // instead of letting him orbit and fight.
         const bool holdingSafeRange = !hasCoverTarget_ && !evasiveRetreat &&
-            faction == Faction::Bandit;
+            damaged && faction == Faction::Bandit;
         if ((distance > 0.1f || movingToCover) && !rooted && !inCover_ &&
             !holdingSafeRange) {
             const float inv = distance > 0.001f ? 1.0f / distance : 0.0f;

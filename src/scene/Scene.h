@@ -319,6 +319,45 @@ struct Scene {
     bool c4DetonateHeld = false;
     float gunRecoilBack      = 0.0f;    // viewmodel translation, local metres
     float gunRecoilKick      = 0.0f;    // viewmodel pitch, degrees
+    // Weapon sway: the gun lags behind the camera when the player turns, then
+    // settles back to centre. Degrees of trailing rotation, signed against the
+    // turn direction. Previous angles are the only way to recover turn rate --
+    // the camera exposes orientation, not angular velocity.
+    float gunSwayYaw         = 0.0f;
+    float gunSwayPitch       = 0.0f;
+    float gunSwayPrevYaw     = 0.0f;
+    float gunSwayPrevPitch   = 0.0f;
+    bool  gunSwayPrimed      = false;   // skip the first frame's bogus delta
+    // Jump/land muzzle pitch, in degrees. A spring: the barrel tips up as the
+    // player leaves the ground and noses down on impact, then oscillates back to
+    // rest. This rotates the weapon mesh only -- camera aim is never touched, so
+    // where the player is actually shooting does not move.
+    float gunJumpPitch       = 0.0f;
+    float gunJumpVelocity    = 0.0f;
+    // The camera zeroes VerticalVelocity the instant it lands, so the speed of
+    // impact only exists on the frame before. Keep it to scale the landing dip.
+    float gunPrevVerticalVel = 0.0f;
+    bool  gunPrevGrounded    = true;
+    // Degrees of gun rotation per degree of view turn, the ceiling that keeps a
+    // flick from throwing the weapon off screen, and how fast it recentres.
+    static constexpr float kGunSwayAmount     = 0.11f;
+    static constexpr float kGunSwayMaxDegrees = 0.9f;
+    static constexpr float kGunSwayReturnRate = 9.0f;
+    // Jump/land spring, working in degrees of muzzle pitch. Stiffness and
+    // damping settle it in roughly a third of a second without a second visible
+    // bounce. Launch tips the barrel up; landing noses it down harder, scaled by
+    // impact speed so a long drop hits more than a hop.
+    static constexpr float kGunJumpStiffness   = 150.0f;
+    static constexpr float kGunJumpDamping     = 16.0f;
+    static constexpr float kGunJumpLaunchKick  = 78.0f;   // deg/s impulse, up
+    static constexpr float kGunJumpLandKick    = 132.0f;  // deg/s impulse, down
+    static constexpr float kGunJumpMaxDegrees  = 15.0f;
+    // Impact speed that produces a full-strength dip; faster hits are clamped.
+    static constexpr float kGunJumpRefLandSpeed = 9.0f;
+    // Upward speed that separates a real jump from merely leaving the ground.
+    // Camera::JumpStrength is 5 m/s, so half of it clears a genuine push off
+    // while a walk-off ledge (starting near zero) never reaches it.
+    static constexpr float kGunJumpMinLaunchSpeed = 2.5f;
     float recoilPitch        = 0.55f;   // camera climb per shot, degrees
     float recoilYaw          = 0.22f;   // random horizontal camera kick
     // How far the four crosshair arms sit from centre, in pixels beyond their
@@ -502,7 +541,7 @@ struct Scene {
     }
     bool  enableAmbientOcclusion = true;
     float ambientOcclusionRadius = 0.69f;
-    float ambientOcclusionStrength = 1.50f;
+    float ambientOcclusionStrength = 2.80f;
     float ambientOcclusionBias = 0.035f;
     float contactShadowStrength = 0.65f;
     // Test the contact-shadow occluder slab in linear depth instead of device
@@ -543,9 +582,9 @@ struct Scene {
     // a texel-addressing bug, not an inherent limitation: half-res pixel
     // centres land exactly on full-res texel boundaries, where a point sampler
     // picks between two neighbours by float rounding. The shader now re-centres
-    // source fetches (TraceUVToSourceUV) so each lands mid-texel. Off by
-    // default so the full-res image stays the baseline until compared.
-    bool  halfResolutionAO = false;
+    // source fetches (TraceUVToSourceUV) so each lands mid-texel. On by
+    // default: the trace is the pass bottleneck and half res cuts it ~52%.
+    bool  halfResolutionAO = true;
     // The independently resolved 4x grass depth can drive GTAO/contact so grass
     // receives and casts the screen-space effect. On by default: grass that is
     // absent from the AO depth neither occludes nor is occluded, so blades sit
@@ -609,15 +648,18 @@ struct Scene {
     // everything": screen-space, probes and temporal history resolve most
     // pixels, and rays are spent only where those report low confidence. See
     // enhancedRayFraction for what that costs in practice.
-    bool enhancedVisuals     = true;
+    // Off by default: the same state F5 leaves the game in. RT is opt-in, so a
+    // fresh launch runs the raster path and the ray cost is only paid once the
+    // player asks for it.
+    bool enhancedVisuals     = false;
     // Sub-toggles, so the expensive parts can be bisected when profiling. Each
     // is a no-op unless enhancedVisuals is on.
-    bool enhancedRTShadows   = true;   // RayQuery sun shadows, replaces CSM
+    bool enhancedRTShadows   = false;  // RayQuery sun shadows, replaces CSM
     bool enhancedRayClassify = true;   // Spend rays only on low-confidence pixels
     // Stochastic RT reflections: one GGX ray per pixel per frame. Enabled for
     // the current SVGF tuning pass; the raw signal is noisy on purpose and
     // wants the temporal denoiser to resolve it.
-    bool enhancedRTReflections = true;
+    bool enhancedRTReflections = false;
     // Refit the TLAS instance transforms every frame, so moving actors are
     // traced where they are rather than where they stood when the acceleration
     // structure was first built.
@@ -749,6 +791,14 @@ struct Scene {
         muzzleFlashRotation = 0.0f;
         gunRecoilBack = 0.0f;
         gunRecoilKick = 0.0f;
+        gunSwayYaw = gunSwayPitch = 0.0f;
+        gunJumpPitch = gunJumpVelocity = 0.0f;
+        gunPrevVerticalVel = 0.0f;
+        // Assume grounded: a fresh spawn must not read as a landing.
+        gunPrevGrounded = true;
+        // Re-prime: the camera is about to be re-placed, and that jump must not
+        // register as a turn the player made.
+        gunSwayPrimed = false;
         // Or the reticle would start a fresh run still blown open from the last
         // burst of the previous one.
         crosshairSpread = 0.0f;
@@ -938,6 +988,87 @@ struct Scene {
         // so automatic fire climbs unless the player actively compensates.
         gunRecoilBack = (std::max)(0.0f, gunRecoilBack - 1.45f * dt);
         gunRecoilKick = (std::max)(0.0f, gunRecoilKick - 95.0f * dt);
+
+        // Weapon sway. Turning the camera leaves the gun behind for a moment,
+        // then it eases back to centre -- weight, not a wobble. The offset is
+        // driven by how far the view turned this frame, not by a clock, so it
+        // only appears when the player actually moves the mouse.
+        {
+            float deltaYaw = camera.Yaw - gunSwayPrevYaw;
+            // Yaw is unbounded and wraps; a wrap would otherwise read as one
+            // enormous turn and slam the gun to its clamp.
+            while (deltaYaw >  180.0f) deltaYaw -= 360.0f;
+            while (deltaYaw < -180.0f) deltaYaw += 360.0f;
+            const float deltaPitch = camera.Pitch - gunSwayPrevPitch;
+            gunSwayPrevYaw   = camera.Yaw;
+            gunSwayPrevPitch = camera.Pitch;
+
+            if (!gunSwayPrimed) {
+                // First frame after a load or teleport: the previous angles were
+                // never valid, so adopt them without swaying.
+                gunSwayPrimed = true;
+            } else if (dt > 0.0f) {
+                // Aiming tightens the weapon against the shoulder, so sway all
+                // but disappears down the sights where it would hurt most.
+                const float sighted =
+                    (std::min)(1.0f, (std::max)(0.0f, adsBlend));
+                const float amount = kGunSwayAmount * (1.0f - 0.82f * sighted);
+                gunSwayYaw   -= deltaYaw   * amount;
+                gunSwayPitch -= deltaPitch * amount;
+                // Clamp before the return so a fast flick cannot fling the gun
+                // out of frame, and the recovery always starts from a sane pose.
+                gunSwayYaw   = (std::min)(kGunSwayMaxDegrees,
+                               (std::max)(-kGunSwayMaxDegrees, gunSwayYaw));
+                gunSwayPitch = (std::min)(kGunSwayMaxDegrees,
+                               (std::max)(-kGunSwayMaxDegrees, gunSwayPitch));
+                // Exponential return keeps the settle frame-rate independent.
+                const float settle = std::exp(-kGunSwayReturnRate * dt);
+                gunSwayYaw   *= settle;
+                gunSwayPitch *= settle;
+            }
+        }
+
+        // Jump and land. Leaving the ground kicks the weapon up as the player's
+        // hands trail the launch; hitting the ground drives it down under the
+        // impact, harder the faster the fall. Between the two it is a damped
+        // spring, so the motion carries through instead of snapping to rest.
+        {
+            const bool grounded = camera.IsGrounded;
+            if (gunPrevGrounded && !grounded) {
+                // Only a real push off the ground kicks the gun up. Walking off
+                // a kerb or a single frame of physics jitter also clears
+                // IsGrounded, but leaves with no upward speed -- treating those
+                // as jumps flicked the weapon at random while just walking.
+                if (camera.VerticalVelocity > kGunJumpMinLaunchSpeed)
+                    gunJumpVelocity += kGunJumpLaunchKick;
+            } else if (!gunPrevGrounded && grounded) {
+                // Land: downward, scaled by how fast the player was falling on
+                // the frame before touchdown -- the camera has already cleared
+                // VerticalVelocity by now. A step down barely registers; a roof
+                // drop drives the gun to its stop.
+                const float impact =
+                    (std::min)(1.0f, (std::max)(0.0f, -gunPrevVerticalVel) /
+                                         kGunJumpRefLandSpeed);
+                gunJumpVelocity -= kGunJumpLandKick * impact;
+            }
+            gunPrevGrounded = grounded;
+            gunPrevVerticalVel = camera.VerticalVelocity;
+
+            if (dt > 0.0f) {
+                // Semi-implicit Euler: velocity first, then position, so the
+                // spring stays stable at the frame rates the game actually runs.
+                gunJumpVelocity += (-kGunJumpStiffness * gunJumpPitch -
+                                    kGunJumpDamping * gunJumpVelocity) * dt;
+                gunJumpPitch += gunJumpVelocity * dt;
+                if (gunJumpPitch > kGunJumpMaxDegrees) {
+                    gunJumpPitch = kGunJumpMaxDegrees;
+                    if (gunJumpVelocity > 0.0f) gunJumpVelocity = 0.0f;
+                } else if (gunJumpPitch < -kGunJumpMaxDegrees) {
+                    gunJumpPitch = -kGunJumpMaxDegrees;
+                    if (gunJumpVelocity < 0.0f) gunJumpVelocity = 0.0f;
+                }
+            }
+        }
 
         // Crosshair bloom chases its target asymmetrically: opening is nearly
         // instant so the first shot of a burst is visible, closing is slow so
@@ -1999,7 +2130,22 @@ struct Scene {
         basis.r[1] = XMVectorSetW(camUp, 0.0f);
         basis.r[2] = XMVectorSetW(camFront, 0.0f);
         basis.r[3] = XMVectorSetW(gp, 1.0f);
-        return XMMatrixRotationX(XMConvertToRadians(-gunRecoilKick)) * basis;
+        // Sway rotates in the camera's own frame, so it composes with recoil
+        // before the basis takes the whole thing into world space. Yaw drags the
+        // muzzle across the screen, pitch trails vertical aim; a touch of roll
+        // on the yaw sells the weight without needing its own state.
+        const XMMATRIX sway =
+            XMMatrixRotationZ(XMConvertToRadians(gunSwayYaw * -0.35f)) *
+            XMMatrixRotationX(XMConvertToRadians(gunSwayPitch)) *
+            XMMatrixRotationY(XMConvertToRadians(gunSwayYaw));
+        // Jump pitch tips the mesh only. Aiming pins the weapon to the shoulder,
+        // so it is mostly damped out down the sights for the same reason sway
+        // is. Negative X rotates the muzzle up, matching the recoil convention
+        // directly above, so a positive spring value reads as barrel-up.
+        const float jumpVisible = gunJumpPitch * (1.0f - 0.75f * hipToSights);
+        return XMMatrixRotationX(
+                   XMConvertToRadians(-gunRecoilKick - jumpVisible)) *
+               sway * basis;
     }
 
     void SpawnHostileProjectile(const XMFLOAT3& origin, const XMFLOAT3& direction,

@@ -40,6 +40,7 @@ enum class AudioBus : int {
     Voices,        // enemy shouts, pain, death
     Ambience,      // footsteps, fire loops, rotor wash
     UI,            // menu and HUD feedback; never spatialised
+    Music,         // menu and deployment score; never spatialised
     Count
 };
 
@@ -165,8 +166,11 @@ private:
         X3DAUDIO_LISTENER listener = {};
         UINT32 outputChannels = 0;
         float masterVolume = 1.0f;
+        // One entry per AudioBus, in enum order. Music sits under the rest by
+        // default: a score that competes with gunfire and callouts is a score
+        // the player turns off.
         float busVolume[static_cast<int>(AudioBus::Count)] = {
-            1.0f, 1.0f, 1.0f, 1.0f };
+            1.0f, 1.0f, 1.0f, 1.0f, 0.55f };
         // Conservative default: enough to place sounds in a space, not enough
         // to smear a rifle crack into a cathedral.
         float reverbVolume = 0.22f;
@@ -236,6 +240,10 @@ private:
 // Small overlapping-voice player for short PCM/float WAV effects.
 class GunAudio {
 public:
+    // Upper bound on Play()'s gain. Unity is the normal ceiling; values above
+    // it amplify, for sources authored quieter than the rest of the mix.
+    static constexpr float kMaxPlayGain = 4.0f;
+
     ~GunAudio() { Shutdown(); }
 
     // `bus` decides which category submix this effect's voices feed, and so
@@ -268,7 +276,11 @@ public:
         buffer.Flags = XAUDIO2_END_OF_STREAM;
         buffer.AudioBytes = static_cast<UINT32>(samples_.size());
         buffer.pAudioData = samples_.data();
-        voice->SetVolume((std::max)(0.0f, (std::min)(1.0f, volume)));
+        // Ceiling above unity so a quiet source can be lifted deliberately.
+        // XAudio2 treats gain > 1 as amplification, which clips if the sample
+        // already peaks near full scale -- kMaxPlayGain keeps that within a
+        // range quiet dialogue survives rather than leaving it unbounded.
+        voice->SetVolume((std::max)(0.0f, (std::min)(kMaxPlayGain, volume)));
         voice->SetFrequencyRatio((std::max)(0.5f, (std::min)(2.0f, pitch)));
         if (FAILED(voice->SubmitSourceBuffer(&buffer)) || FAILED(voice->Start())) {
             voice->DestroyVoice();

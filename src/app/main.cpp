@@ -43,7 +43,7 @@
 #include "TimeOfDay.h"
 #include "ForwardRenderer.h"
 #include "ForwardQualityDX12.h"
-#include "IdTechRenderer.h"
+#include "VBDrawRenderer.h"
 #include "RaytracingDX12.h"
 #include "DXRDDGIRenderer.h"
 #include "VirtualInput.h"
@@ -127,6 +127,9 @@ static std::vector<std::unique_ptr<SkinnedEnemy>>& g_bandits =
     g_enemySystem.actors;
 static SkinnedEnemy*&       g_heldBandit = g_enemySystem.held;
 static size_t&              g_heldBarrelIndex = g_game.combat.heldBarrelIndex;
+// Authored C4 brick, replacing the procedural boxes the charge used to be
+// drawn as. Shared by the viewmodel, the thrown charge and the placed one.
+std::shared_ptr<SceneNode>  g_c4Model;
 std::shared_ptr<SceneNode>  g_explosiveBarrelModel;
 std::shared_ptr<SceneNode>  g_explosiveBarrelShadowModel;
 std::shared_ptr<SceneNode>  g_humveeModel;
@@ -451,6 +454,48 @@ static constexpr float      kMetalHitPitchMin = 0.80f;
 static constexpr float      kMetalHitPitchMax = 1.00f;
 GunAudio                    g_banditSpottedAudio1;
 GunAudio                    g_banditSpottedAudio2;
+// Commander callout on the deployment planning screen. Voices bus, so the
+// dialogue slider moves it, and 2D: it is radio chatter, not a world sound.
+GunAudio                    g_readyToDropAudio;
+bool                        g_readyToDropPlayed = false;
+// Background score for the front end: the main menu and the deployment planning
+// screen. Looped rather than one-shot so it covers however long the player
+// spends on either, and stopped the moment play begins.
+GunAudio                    g_menuMusicAudio;
+bool                        g_menuMusicPlaying = false;
+constexpr float             kMenuMusicVolume = 0.5f;
+// Under gameplay the score sits back so it does not crowd the mix.
+constexpr float             kInGameMusicVolume = 0.4f;
+// Gain currently applied to the loop, so a change can be detected while the
+// track is already running. Negative means nothing has been set yet.
+float                       g_menuMusicLevel = -1.0f;
+// Set when the deployment callout fires, so the score restarts from the top
+// alongside it rather than on a screen edge the player never hears.
+bool                        g_menuMusicRestartRequested = false;
+// Set once the comm tower comes down: the score opens up to full for the rest
+// of the run.
+bool                        g_commTowerMusicSwell = false;
+// Commander's next order, played on the training range once the guard is down.
+// 2D like the deployment callout: it is radio, not a voice in the world.
+GunAudio                    g_plantC4TowerAudio;
+// Commander confirming the ride is on station. Watches the escape boat's own
+// active flag rather than hooking the two placement call sites, so no path that
+// spawns an exfil can bring one in silently.
+GunAudio                    g_exfilHereAudio;
+// Queued when the comm tower falls rather than when the boat appears: the ride
+// is called in as a consequence of the objective, so the line lands on the
+// collapse instead of waiting for the player to notice a hull offshore.
+// Negative means nothing is queued.
+float                       g_exfilHereDelay = -1.0f;
+constexpr float             kExfilHereDelay = 6.0f;
+// Sign-off on the win screen. OpenWinScreen is the one way in, so it plays
+// there rather than off a per-frame screen test that would retrigger.
+GunAudio                    g_greatJobAudio;
+bool                        g_plantC4Played = false;
+// A beat between the kill and the order, so the callout does not step on the
+// death itself. Negative means nothing is queued.
+float                       g_plantC4TowerDelay = -1.0f;
+constexpr float             kPlantC4TowerDelay = 1.0f;
 GunAudio                    g_banditAttackAudio;
 GunAudio                    g_banditDeathAudio;
 GunAudio                    g_banditHitVoiceAudio;
@@ -490,6 +535,11 @@ static bool&                g_suppressFireUntilMouseRelease =
     g_game.combat.suppressFireUntilMouseRelease;
 bool                        g_stressTestMode = false;
 bool                        g_emptyLevelMode = false;
+// The training range is a bare range: no Humvee, no patrol boat. Both vehicles
+// are persistent world fixtures rather than level entities -- the Humvee falls
+// back to a hardcoded spawn at the origin when a level authors none -- so
+// leaving them out of the level file is not enough to keep them off the map.
+bool                        g_trainingRangeMode = false;
 // Mouse-walk test mode (F10). Holding the right mouse button walks the player
 // forward, and aiming down sights is suppressed for as long as the mode is on --
 // the same button cannot both drive and aim. WASD still works; this is an extra
@@ -1101,7 +1151,7 @@ static void AppendDropshipRope(const XMFLOAT3& top, const XMFLOAT3& bottom) {
         const float t = (static_cast<float>(i) + 0.5f) / static_cast<float>(links);
         RopeItem item;
         item.color = kRopeColor;
-        item.shape = 0;   // box: the IdTech path only draws cubes anyway
+        item.shape = 0;   // box: the VBDraw path only draws cubes anyway
         const XMMATRIX world =
             XMMatrixScaling(kLinkHalfThickness, linkHalfLength, kLinkHalfThickness) *
             basis *
@@ -1456,12 +1506,76 @@ static void BeginDeploymentPlanning() {
     g_playerInsertionChoice = authored;
     scene.selectedGrenade = g_game.mission.Loadout().grenade;
     g_insertionChoicePending = true;
+    // Re-arm the commander callout for this deployment; the screen itself plays
+    // it once it is actually visible.
+    g_readyToDropPlayed = false;
     g_game.session.StopTimer();
     scene.camera.FPSMode = false;
     // Open the planning fly-through in the light the last choice selected, so
     // restarting a night mission does not put the player back over a sunlit
     // island with NIGHT still highlighted.
     ApplyTimeOfDay(g_selectedTimeOfDay);
+}
+
+// The front-end score follows screen state rather than being started and
+// stopped at every transition that leads into or out of a menu. One place
+// decides, so a path nobody thought of -- quitting to menu, restarting, backing
+// out of deployment -- cannot leave the music running under gameplay or drop it
+// on a screen that should have it.
+static void UpdateMenuMusic() {
+    // The score runs under play on every map now, not just the range.
+    const bool inLevel = g_game.session.Screen() == GameScreen::Level1;
+    // Plays through the loading screen too: the score carries across the gap
+    // rather than cutting out and back in around it.
+    const bool wanted =
+        g_game.session.Screen() == GameScreen::MainMenu ||
+        g_insertionChoicePending ||
+        inLevel;
+    // Three levels. The front end carries the track on its own so it sits
+    // forward; under gameplay it drops back to leave room for gunfire and
+    // callouts; felling the comm tower opens it up to full.
+    //
+    // Tracked as its own value rather than folded into the start/stop test
+    // below, because the volume changes while the music is already playing --
+    // the early-out on an unchanged play state would otherwise never apply it.
+    // The swell is scoped to the run that earned it: the flag survives until the
+    // next level load, so without the screen test a tower felled on any map
+    // would follow the player back to the main menu and play it at full.
+    const float target =
+        (g_commTowerMusicSwell && inLevel) ? 1.0f
+        : inLevel                          ? kInGameMusicVolume
+                                           : kMenuMusicVolume;
+    // The deployment callout takes the track back to the top, so the planning
+    // screen opens on the intro under the commander's voice rather than
+    // wherever the menu loop had wandered to. StopLoop first: SetLoop on a live
+    // voice only retargets its gain -- the buffer is resubmitted solely when the
+    // voice does not exist, so without destroying it the track would carry on
+    // from where it was.
+    const bool restartNow = g_menuMusicRestartRequested;
+    g_menuMusicRestartRequested = false;
+    if (wanted && restartNow) {
+        g_menuMusicAudio.StopLoop();
+        g_menuMusicAudio.SetLoop(true, target);
+        g_menuMusicLevel = target;
+        g_menuMusicPlaying = true;
+        return;
+    }
+    if (wanted == g_menuMusicPlaying) {
+        // SetLoop on a live voice retargets its gain without restarting it, so
+        // the swell rides the track rather than cutting it back to the top.
+        if (wanted && target != g_menuMusicLevel) {
+            g_menuMusicAudio.SetLoop(true, target);
+            g_menuMusicLevel = target;
+        }
+        return;
+    }
+    // kMenuMusicVolume is the authored level for this track. It is the source
+    // gain, not the Music bus, so the player's music slider still scales from
+    // here rather than fighting a level baked into the mix.
+    if (wanted) g_menuMusicAudio.SetLoop(true, target);
+    else        g_menuMusicAudio.StopLoop();
+    g_menuMusicLevel = target;
+    g_menuMusicPlaying = wanted;
 }
 
 static void UpdateDeploymentPlanningCamera(float deltaTime) {
@@ -3182,6 +3296,13 @@ static void PlayBanditDeathEvents() {
         g_banditDeathAudio.PlayAt(bandit->position.x, bandit->position.y,
                                   bandit->position.z, 0.9f, pitch,
                                   kBanditVoiceRange);
+        // Training range: the guard is the whole exercise, so his death is the
+        // cue for the next order. Guarded so a map that later gains more enemies
+        // does not stack the callout once per kill.
+        if (g_trainingRangeMode && !g_plantC4Played) {
+            g_plantC4TowerDelay = kPlantC4TowerDelay;
+            g_plantC4Played = true;
+        }
     }
 }
 
@@ -3508,6 +3629,9 @@ static unsigned int RandomizeDeployment(unsigned int seed = 0) {
 }
 
 static bool SpawnHumveeTurretGunner(int vehicleIndex) {
+    // No Humvee on the training range means no turret to man; without this the
+    // gunner still spawns and stands in mid-air where the vehicle would be.
+    if (g_trainingRangeMode) return false;
     if (!g_banditModel.valid || !g_humveeModel) return false;
     for (const auto& existing : g_bandits)
         if (existing && !existing->Dead() && existing->turretGunner &&
@@ -3537,6 +3661,9 @@ static bool SpawnHumveeTurretGunner(int vehicleIndex) {
 // Mounted gunner riding the patrol boat. Uses vehicle index 2 so it never
 // collides with the humvee's turret indices (0 primary, 1 secondary).
 static bool SpawnBoatTurretGunner() {
+    // No patrol boat on the training range, so no gunner to ride it -- the boat
+    // model is hidden there, and without this he is left firing from open water.
+    if (g_trainingRangeMode) return false;
     if (!g_banditModel.valid || !g_boatModel) return false;
     for (const auto& existing : g_bandits)
         if (existing && !existing->Dead() && existing->turretGunner &&
@@ -8363,11 +8490,17 @@ static void UpdateOneAATurret(size_t turretIndex, float deltaTime) {
         // come off before the remainder reads as clearance above the terrain.
         const float altitude = p.y - scene.camera.PlayerHeight -
                                GroundHeightAt(p.x, p.z);
+        // Swimming is never airborne, whatever the numbers say. The camera
+        // clears IsGrounded in water (nothing to stand on), and altitude is
+        // measured against the seabed -- so a swimmer over deep water reads as
+        // high above ground and would draw fire from a gun whose whole premise
+        // is that it cannot depress onto someone at surface level.
         const bool playerAirborne =
-            vehicles.blackHawkCarryingPlayer ||
-            vehicles.BlackHawkIsRappelling() ||
-            (!scene.camera.IsGrounded &&
-             altitude >= VehicleSystem::AATurretMinTargetAltitude);
+            !scene.camera.IsSwimming &&
+            (vehicles.blackHawkCarryingPlayer ||
+             vehicles.BlackHawkIsRappelling() ||
+             (!scene.camera.IsGrounded &&
+              altitude >= VehicleSystem::AATurretMinTargetAltitude));
         // Engaged out to the same 85 m it always used against the player. The
         // gun reaches much further against aircraft, but a player -- airborne
         // or not -- is a small target, and the shorter range keeps the
@@ -8403,9 +8536,21 @@ static void UpdateOneAATurret(size_t turretIndex, float deltaTime) {
         vehicles.UpdateAATurret(emplacement, deltaTime, aim, hasTarget);
     if (!fired) return;
 
-    // A shell left the barrel this frame.
+    // A shell left the barrel this frame, and it leaves along the barrel.
+    //
+    // Firing at the lead point instead let the shot and the model disagree: the
+    // mount slews at a finite rate and is allowed to fire while still slightly
+    // off (see the onTarget tolerance), so a round aimed at the solution came
+    // out at an angle to the visible barrel -- most obvious as the gun swings
+    // onto a new target. Deriving the direction from the turret's own yaw and
+    // pitch keeps what it hits and where it points the same thing; the slew
+    // limit now genuinely governs accuracy rather than only the animation.
     const XMFLOAT3 muzzle = emplacement.Muzzle();
-    XMVECTOR direction = XMLoadFloat3(&aim) - XMLoadFloat3(&muzzle);
+    const float barrelHorizontal = std::cos(emplacement.pitch);
+    XMVECTOR direction = XMVectorSet(
+        std::sin(emplacement.yaw) * barrelHorizontal,
+        std::sin(emplacement.pitch),
+        std::cos(emplacement.yaw) * barrelHorizontal, 0.0f);
     if (XMVectorGetX(XMVector3LengthSq(direction)) < 0.001f) return;
     // Dispersion, so a burst walks around the target instead of stacking four
     // rounds on the same point. Wider against aircraft, where the lead solution
@@ -8528,6 +8673,12 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
                 CallInReinforcementWave();
             }
         }
+        // Tower down: the score opens up to full and stays there, and the
+        // commander calls the ride in a beat later.
+        if (isCommTower) {
+            g_commTowerMusicSwell = true;
+            g_exfilHereDelay = kExfilHereDelay;
+        }
         if (isCommTower) CollapseCommTower(towerBase);
         else scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
         g_prefabRebuildRequested = true;
@@ -8554,6 +8705,8 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
                 g_game.mission.RecordCommTowerDestroyed();
                 CallInReinforcementWave();
             }
+            g_commTowerMusicSwell = true;
+            g_exfilHereDelay = kExfilHereDelay;
             CollapseCommTower(towerBase);
             g_prefabRebuildRequested = true;
             continue;
@@ -8922,6 +9075,7 @@ static void OpenWinScreen() {
         g_game.session.ElapsedSeconds(), static_cast<uint32_t>(LiveMarineCount()));
     g_game.session.StopTimer();
     g_game.session.SetScreen(GameScreen::WinScreen);
+    g_greatJobAudio.Play(2.0f);
     showUI = false;
     cameraLocked = true;
     ReleaseCapture();
@@ -8981,6 +9135,12 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_aaTurretModelInstances.clear();
     g_emptyLevelMode = emptyLevel;
     g_stressTestMode = stressTest && !emptyLevel;
+    g_trainingRangeMode = g_activeCustomLevelName == "Training Range";
+    // Re-arm the callout so a restart of the range plays it again.
+    g_plantC4Played = false;
+    g_commTowerMusicSwell = false;
+    g_plantC4TowerDelay = -1.0f;
+    g_exfilHereDelay = -1.0f;
     const bool modeAssetsLoaded = g_emptyLevelMode
         ? emptyLevelAssetsLoaded : fullLevelAssetsLoaded;
     if (modeAssetsLoaded)
@@ -9092,6 +9252,24 @@ static void StartIsland1(HWND hwnd) {
     // that does nothing when clicked gives the player nothing to act on.
     g_mainMenuLevelStatus =
         "Island 1 not found (Islandv10.json missing from Content/Levels).";
+}
+
+// Same candidate walk as StartIsland1: the repo, the packaged flat levels/ copy
+// and a build/ run all resolve the training map from one button.
+static void StartTrainingRange(HWND hwnd) {
+    static constexpr const char* kCandidates[] = {
+        "Content/Levels/TrainingRange.json",
+        "levels/TrainingRange.json",
+        "build/Content/Levels/TrainingRange.json",
+    };
+    std::error_code error;
+    for (const char* candidate : kCandidates) {
+        if (!std::filesystem::exists(candidate, error)) continue;
+        StartCustomLevel(hwnd, std::filesystem::path(candidate));
+        return;
+    }
+    g_mainMenuLevelStatus =
+        "Training Range not found (TrainingRange.json missing from Content/Levels).";
 }
 
 static std::filesystem::path StartupLevelPath(const char* commandLine) {
@@ -9461,6 +9639,8 @@ static void RenderMainMenu(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 2.0f));
     if (UIPrimaryButton("ISLAND 1"))
         StartIsland1(hwnd);
+    if (UIMenuButton("TRAINING RANGE"))
+        StartTrainingRange(hwnd);
     if (UIMenuButton("CUSTOM GAME"))
         BrowseAndStartCustomLevel(hwnd);
     if (!g_mainMenuLevelStatus.empty())
@@ -9631,6 +9811,15 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         ReleaseCapture();
         SetCursorVisible(true);
         g_insertionChoiceCursorReleased = true;
+    }
+    // Commander callout, fired here rather than where the planning state is set:
+    // that happens behind the loading screen, so the line would play to nobody
+    // and be half over by the time the screen appeared. The guard keeps it to
+    // one play per deployment no matter how long the player spends planning.
+    if (!g_readyToDropPlayed) {
+        g_readyToDropAudio.Play(1.0f);
+        g_readyToDropPlayed = true;
+        g_menuMusicRestartRequested = true;
     }
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     ImGui::GetBackgroundDrawList()->AddRectFilled(
@@ -13667,6 +13856,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                      AudioBus::Voices);
     g_banditSpottedAudio2.Initialize("Content/Audio/bandit_spotted_02.wav",
                                      AudioBus::Voices);
+    g_readyToDropAudio.Initialize(
+        "Content/Audio/Voicelines/Commander/ReadyToDrop.mp3", AudioBus::Voices);
+    g_menuMusicAudio.Initialize("Content/Audio/Music/testbackground.wav",
+                                AudioBus::Music);
+    g_exfilHereAudio.Initialize(
+        "Content/Audio/Voicelines/Commander/ExfilsHere.mp3", AudioBus::Voices);
+    g_greatJobAudio.Initialize(
+        "Content/Audio/Voicelines/Commander/GreatJobSoldier.mp3",
+        AudioBus::Voices);
+    g_plantC4TowerAudio.Initialize(
+        "Content/Audio/Voicelines/Commander/Plantc4CommTower.mp3",
+        AudioBus::Voices);
     g_banditAttackAudio.Initialize("Content/Audio/bandit_attack.wav",
                                    AudioBus::Voices);
     g_banditDeathAudio.Initialize("Content/Audio/bandit_death.wav",
@@ -14233,6 +14434,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         {
         ProfilerDX12::CpuScope updateProfile(g_profiler, "Update");
 
+        // Front-end score runs outside the gameplay gate below: the main menu is
+        // not a gameplay screen, so anything inside that branch never ticks
+        // there and the music would only ever start once a level was running.
+        g_menuMusicAudio.Update();
+        // Outside the gameplay gate below: the win screen is not a gameplay
+        // screen, so a voice started there would never be reclaimed.
+        g_greatJobAudio.Update();
+        UpdateMenuMusic();
+
         if (IsGameplayScreen() && !g_game.loading.Active() &&
             (scene.player.godMode || scene.player.health > 0.0f)) {
 
@@ -14595,6 +14805,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         g_metalHitAudio.Update();
         g_banditSpottedAudio1.Update();
         g_banditSpottedAudio2.Update();
+        g_readyToDropAudio.Update();
+        g_plantC4TowerAudio.Update();
+        g_exfilHereAudio.Update();
+        // Fires once, then parks at -1 so it cannot retrigger.
+        if (g_exfilHereDelay >= 0.0f) {
+            g_exfilHereDelay -= deltaTime;
+            if (g_exfilHereDelay <= 0.0f) {
+                g_exfilHereAudio.Play(2.0f);
+                g_exfilHereDelay = -1.0f;
+            }
+        }
+        // Fires once, then parks at -1 so it cannot retrigger.
+        if (g_plantC4TowerDelay >= 0.0f) {
+            g_plantC4TowerDelay -= deltaTime;
+            if (g_plantC4TowerDelay <= 0.0f) {
+                // 2x gain: this line is authored quieter than the other
+                // commander callouts, so unity leaves it buried under them.
+                g_plantC4TowerAudio.Play(2.0f);
+                g_plantC4TowerDelay = -1.0f;
+            }
+        }
         g_banditAttackAudio.Update();
         g_banditDeathAudio.Update();
         g_banditHitVoiceAudio.Update();
@@ -14630,9 +14861,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_destruction.SetSplashCallback([](float x, float z, float s) {
                     g_water.Splash(x, z, s);
                 });
-                g_destruction.InitializeVehicle(g_customLevelMode
-                    ? g_primaryHumveeSpawn : XMFLOAT3{ 0.0f, 3.45f, 0.0f },
-                    g_customLevelMode ? XMConvertToRadians(g_primaryHumveeYaw) : 0.0f);
+                // Skipped on the training range: the Humvee is hidden there, and
+                // a physics body without a model is collision the player cannot
+                // see and cannot explain.
+                if (!g_trainingRangeMode)
+                    g_destruction.InitializeVehicle(g_customLevelMode
+                        ? g_primaryHumveeSpawn : XMFLOAT3{ 0.0f, 3.45f, 0.0f },
+                        g_customLevelMode ? XMConvertToRadians(g_primaryHumveeYaw) : 0.0f);
             }
         }
         // Dead Bandits stay attached to their ragdolls. No mid-level respawns.
@@ -16689,9 +16924,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_destruction.SetSplashCallback([](float x, float z, float s) {
                     g_water.Splash(x, z, s);
                 });
-                g_destruction.InitializeVehicle(g_customLevelMode
-                    ? g_primaryHumveeSpawn : XMFLOAT3{ 0.0f, 3.45f, 0.0f },
-                    g_customLevelMode ? XMConvertToRadians(g_primaryHumveeYaw) : 0.0f);
+                // Skipped on the training range: the Humvee is hidden there, and
+                // a physics body without a model is collision the player cannot
+                // see and cannot explain.
+                if (!g_trainingRangeMode)
+                    g_destruction.InitializeVehicle(g_customLevelMode
+                        ? g_primaryHumveeSpawn : XMFLOAT3{ 0.0f, 3.45f, 0.0f },
+                        g_customLevelMode ? XMConvertToRadians(g_primaryHumveeYaw) : 0.0f);
 
                 // Palm grove ringing the pool. Shoot through a trunk and the tree
                 // snaps at that height and topples away from you.
@@ -16782,6 +17021,52 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     std::cout << "Explosive barrel FBX ready\n";
                 } else
                     std::cerr << "Explosive barrel FBX failed; using procedural fallback\n";
+
+                // C4 brick. The GLB carries its own PBR maps (colour, normal,
+                // metallic-roughness) embedded, unlike the FBX beside it, which
+                // declares material slots but binds no textures at all and so
+                // loads as untextured white.
+                //
+                // Geometry is authored in metres -- 0.268 x 0.083 x 0.189 m,
+                // a real charge lying flat -- with no node scaling, so it needs
+                // no conversion and no scale of its own.
+                g_c4Model = GLBImporter::LoadGLB(
+                    "Content/Models/C4/C4_bomb/source/c4.glb",
+                    g_dx12.device, g_dx12.commandList);
+                if (g_c4Model) {
+                    XMFLOAT4X4 c4Identity;
+                    XMStoreFloat4x4(&c4Identity, XMMatrixIdentity());
+                    g_c4Model->UpdateGlobalTransform(c4Identity);
+
+                    // Pin the material to fully opaque plastic. The asset omits
+                    // baseColorFactor and alphaMode entirely, so those come from
+                    // whatever the importer left in place -- and any alpha below
+                    // 0.999 routes the brick through the transparent pipeline,
+                    // which is what made it read as blue glass. The GLB also
+                    // ships normalTexture.scale = 0, so its normal map
+                    // contributes nothing and only tints the shading.
+                    const auto fixC4Material = [&](const auto& self,
+                                                   const std::shared_ptr<SceneNode>& node)
+                        -> void {
+                        if (!node) return;
+                        if (node->mesh) for (auto& primitive : node->mesh->primitives) {
+                            if (!primitive.material) continue;
+                            auto& m = primitive.material;
+                            m->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+                            m->alphaCutout = false;
+                            m->alphaFromLuminance = false;
+                            // Moulded plastic case: dielectric, fairly rough.
+                            m->metallicFactor = 0.0f;
+                            m->roughnessFactor = 0.85f;
+                            m->roughnessOnlyTexture = false;
+                        }
+                        for (const auto& child : node->children) self(self, child);
+                    };
+                    fixC4Material(fixC4Material, g_c4Model);
+                    std::cout << "C4 model ready" << std::endl;
+                } else
+                    std::cerr << "C4 GLB failed; using procedural fallback"
+                              << std::endl;
 
                 AdvanceLevelLoading(LevelLoadStage::Humvee,
                     "Humvee model, bounds and shadow mesh",
@@ -17121,7 +17406,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
             {
                 ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
-                RenderIdTech(scene, mainShader, visBuffer, geo, packed,
+                RenderVBDraw(scene, mainShader, visBuffer, geo, packed,
                     lightSpace, shadowResource, &occlusionDepth,
                     hzbHistoryUsable, previousHZBViewProjection, floorMaterial,
                     (!g_emptyLevelMode && g_showH2Model) ? crateModel : nullptr);
@@ -17970,6 +18255,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     g_banditHitVoiceAudio.Shutdown();
     g_banditDeathAudio.Shutdown();
     g_banditAttackAudio.Shutdown();
+    g_greatJobAudio.Shutdown();
+    g_exfilHereAudio.Shutdown();
+    g_plantC4TowerAudio.Shutdown();
+    g_menuMusicAudio.Shutdown();
+    g_readyToDropAudio.Shutdown();
     g_banditSpottedAudio2.Shutdown();
     g_banditSpottedAudio1.Shutdown();
     g_metalHitAudio.Shutdown();

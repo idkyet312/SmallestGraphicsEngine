@@ -1361,6 +1361,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             { "Voices",   AudioBus::Voices },
             { "Ambience", AudioBus::Ambience },
             { "UI",       AudioBus::UI },
+            { "Music",    AudioBus::Music },
         };
         for (const BusRow& row : kRows) {
             float value = AudioDevice::BusVolume(row.bus);
@@ -2101,7 +2102,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::DragFloat("AO Radius", &scene.ambientOcclusionRadius,
                              0.01f, 0.01f, 4.0f, "%.2f m");
             ImGui::SliderFloat("AO Strength", &scene.ambientOcclusionStrength,
-                               0.0f, 2.5f, "%.2f");
+                               0.0f, 5.0f, "%.2f");
             ImGui::SliderFloat("Contact Shadows", &scene.contactShadowStrength,
                                0.0f, 1.0f, "%.2f");
             ImGui::Checkbox("  Linear-Depth Occluder Test",
@@ -2303,6 +2304,11 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::Text("Fit: %s", GunModel::SelectedWeaponName());
         ImGui::DragFloat3("Weapon Fit Offset",
                           &GunModel::PlayerOffset().x, 0.005f);
+        // Degrees, and per weapon like the offset above it: an imported mesh
+        // whose authored forward axis differs from the engine's needs turning
+        // before it sits in the hands, not just sliding.
+        ImGui::DragFloat3("Weapon Fit Rot",
+                          &GunModel::PlayerFitRotation().x, 1.0f);
         ImGui::Checkbox("Auto Fire", &scene.autoFire);
         ImGui::DragFloat("Fire Interval", &scene.fireInterval, 0.005f, 0.02f, 1.0f, "%.3f s");
 

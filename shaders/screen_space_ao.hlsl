@@ -349,9 +349,27 @@ bool IsViewModelDepth(float deviceDepth)
            LinearDepth(deviceDepth) < kViewModelMaxDepth;
 }
 
-float SampleContactCasterDepth(float2 uv, bool multisampled)
+float SampleContactCasterDepth(float2 uv, bool multisampled,
+                               bool grassOnly)
 {
     float currentDepth = SampleDepth(uv, multisampled);
+    // Grass-only mode: the depth texture is grass UNION scene, and
+    // staticCasterDepth is the pre-grass snapshot. A texel is a blade only
+    // where the union is nearer than the snapshot and coverage is non-zero.
+    // Non-blade texels return a NEGATIVE sentinel, which the march skips
+    // outright. Returning far (1.0) instead would be read as a real occluder
+    // sample at 800 m and corrupt the crossing bookkeeping; opaque casters
+    // must not participate here at all, since the VB resolve already applied
+    // them to the direct-sun term.
+    if (grassOnly) {
+        float blade = staticCasterDepth.SampleLevel(pointClamp,
+                                                    saturate(uv), 0.0);
+        float cover = grassCoverage.SampleLevel(pointClamp, uv, 0.0);
+        float tol = max(0.025, LinearDepth(blade) * 0.003);
+        bool isBlade = (LinearDepth(blade) - LinearDepth(currentDepth)) > tol
+                       && cover > 0.001;
+        return isBlade ? currentDepth : -1.0;
+    }
     // Do not let first-person gun depth cast into the world.
     if (IsViewModelDepth(currentDepth))
         currentDepth = 1.0;
@@ -370,7 +388,7 @@ float SampleContactCasterDepth(float2 uv, bool multisampled)
 // for the bilateral filter. Recomputing it here repeated that work for an
 // identical result.
 float ContactVisibility(float2 uv, float deviceDepth, bool multisampled,
-                        float3 surfaceNormal)
+                        float3 surfaceNormal, bool grassOnly)
 {
     if (deviceDepth >= 0.99999 || lightDirection.w <= 0.0 ||
         IsViewModelDepth(deviceDepth)) return 1.0;
@@ -448,7 +466,12 @@ float ContactVisibility(float2 uv, float deviceDepth, bool multisampled,
         float2 rayUV = ndc.xy * float2(0.5, -0.5) + 0.5;
         if (any(rayUV <= 0.0) || any(rayUV >= 1.0)) break;
         float sampledDepth =
-            SampleContactCasterDepth(rayUV, multisampled);
+            SampleContactCasterDepth(rayUV, multisampled, grassOnly);
+        // Non-blade texel in grass-only mode. Skip before the gap bookkeeping
+        // below so previousLinearDepthGap/previousLinearT still describe the
+        // last real blade sample; a sentinel written into them would fake a
+        // crossing on the next tap.
+        if (grassOnly && sampledDepth < 0.0) continue;
         if (IsViewModelDepth(sampledDepth)) continue;
         bool occluded;
         float shadowT = t;
@@ -469,8 +492,13 @@ float ContactVisibility(float2 uv, float deviceDepth, bool multisampled,
             // the current step. The old test used this interval backwards -- it
             // rejected nearby crossings and accepted gaps up to maxDistance,
             // turning unrelated foreground depth into the dotted shadow bands.
-            float slabThickness = max(
-                originOffset * 2.0, linearRayDepthStride * 1.25);
+            // Grass blades are thin casters sampled sparsely: at the default
+            // 0.69 m radius the opaque slab is only ~4 cm, so a blade a
+            // handful of centimetres off the tap is rejected outright. Widen
+            // it for the grass-only ray; the opaque path keeps its tuning.
+            float slabThickness = grassOnly
+                ? max(originOffset * 8.0, linearRayDepthStride * 2.0)
+                : max(originOffset * 2.0, linearRayDepthStride * 1.25);
             bool crossedSurface = previousLinearDepthGap <= surfaceBias &&
                                   depthGap > surfaceBias;
             occluded = crossedSurface && depthGap < slabThickness;
@@ -732,8 +760,23 @@ float ApplyCoverageAndContact(float2 uv, float depth, bool multisampled,
     // Avoid paying for a second ten-step ray on visibility-resolved pixels;
     // contactWeight is zero there because direct lighting already owns it.
     if (contactWeight > 0.001) {
-        float contact = ContactVisibility(uv, depth, multisampled, normal);
+        float contact = ContactVisibility(
+            uv, depth, multisampled, normal, false);
         visibility *= lerp(1.0, contact, contactWeight);
+    }
+    // Independent of the ray above, not an alternative to it. Terrain takes its
+    // contact shadow in the VB resolve, which marches depth captured BEFORE
+    // grass composites -- so grass could never occlude it there, and the
+    // contribution is missing rather than doubled. Gated to non-grass receivers
+    // (1 - grassSurface): a grass pixel already saw blades through the opaque
+    // ray's min(casterDepth, currentDepth), so darkening it again would double.
+    float grassCastWeight = (1.0 - grassSurface) *
+        step(0.5, contactParams.y) * step(0.5, contactParams.x) *
+        step(0.5, filterParams.x);
+    if (grassCastWeight > 0.001) {
+        float grassContact = ContactVisibility(
+            uv, depth, multisampled, normal, true);
+        visibility *= lerp(1.0, grassContact, grassCastWeight);
     }
     return visibility;
 }
@@ -775,8 +818,23 @@ float4 Composite(float2 uv, bool multisampled)
     // Avoid paying for a second ten-step ray on visibility-resolved pixels;
     // contactWeight is zero there because direct lighting already owns it.
     if (contactWeight > 0.001) {
-        float contact = ContactVisibility(uv, depth, multisampled, normal);
+        float contact = ContactVisibility(
+            uv, depth, multisampled, normal, false);
         visibility *= lerp(1.0, contact, contactWeight);
+    }
+    // Independent of the ray above, not an alternative to it. Terrain takes its
+    // contact shadow in the VB resolve, which marches depth captured BEFORE
+    // grass composites -- so grass could never occlude it there, and the
+    // contribution is missing rather than doubled. Gated to non-grass receivers
+    // (1 - grassSurface): a grass pixel already saw blades through the opaque
+    // ray's min(casterDepth, currentDepth), so darkening it again would double.
+    float grassCastWeight = (1.0 - grassSurface) *
+        step(0.5, contactParams.y) * step(0.5, contactParams.x) *
+        step(0.5, filterParams.x);
+    if (grassCastWeight > 0.001) {
+        float grassContact = ContactVisibility(
+            uv, depth, multisampled, normal, true);
+        visibility *= lerp(1.0, grassContact, grassCastWeight);
     }
     return float4(visibility.xxx, 1.0);
 }

@@ -235,10 +235,27 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
         return nullptr;
     }
 
-    // Prepare base-level data (force RGBA)
+    // Prepare base-level data (force 8-bit RGBA).
+    //
+    // Bit depth first: a 16-bit PNG decodes to two bytes per channel, and the
+    // texture below is R8G8B8A8. Copying that through unconverted reads the low
+    // half of one channel as the high half of the next, which scrambles the
+    // colours -- a tan albedo comes out saturated blue. Take the high byte of
+    // each sample, which is the 8-bit value.
     std::vector<unsigned char> rgba;
     const unsigned char* pSource = image.image.data();
-    if (image.component == 3) {
+    std::vector<unsigned char> narrowed;
+    const int channels = image.component > 0 ? image.component : 4;
+    if (image.bits == 16) {
+        const size_t samples = (size_t)baseW * baseH * channels;
+        narrowed.resize(samples);
+        for (size_t i = 0; i < samples; ++i) {
+            // Little-endian in tinygltf's decoded buffer: high byte is second.
+            narrowed[i] = pSource[i * 2 + 1];
+        }
+        pSource = narrowed.data();
+    }
+    if (channels == 3) {
         rgba.resize((size_t)baseW * baseH * 4);
         for (size_t i = 0; i < (size_t)baseW * baseH; i++) {
             rgba[i * 4 + 0] = pSource[i * 3 + 0];
