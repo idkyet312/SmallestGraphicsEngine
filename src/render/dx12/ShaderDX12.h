@@ -609,7 +609,7 @@ public:
         rootParams[8].Constants.RegisterSpace = 0;
         // 15 DWORDs: grass uploads 13, terrain 15 (per-axis island scale + a
         // terrain-style flag over the original 13). Both fit within this size.
-        rootParams[8].Constants.Num32BitValues = 15;
+        rootParams[8].Constants.Num32BitValues = 16;
         rootParams[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         rootParams[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[9].Descriptor.ShaderRegister = 6;
@@ -1596,7 +1596,12 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
     }
 
-    void SetTerrainMaterial(bool showAuthoredPaths = false) {
+    // `detailRelief` turns on the macro normal perturbation in terrain_pbr.
+    // It rides materialType because the terrain constant buffer is not visible
+    // to the pixel shader: 0/3 are the existing ordinary/authored-path values,
+    // and +4 sets the relief bit on either of them.
+    void SetTerrainMaterial(bool showAuthoredPaths = false,
+                            bool detailRelief = false) {
         ActivateMaterialBinding(false);
         const UINT bufferIndex = GetDrawCallIndex();
         ObjectBufferDX12 data = {};
@@ -1608,7 +1613,8 @@ public:
         // Terrain scans use OpenGL normal maps. DX12 texture coordinates use
         // the opposite V direction, so flip tangent-space green.
         data.normalYSign = -1.0f;
-        data.materialType = showAuthoredPaths ? 3.0f : 0.0f;
+        data.materialType = (showAuthoredPaths ? 3.0f : 0.0f) +
+                            (detailRelief ? 4.0f : 0.0f);
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(
             3, objectBuffer.GetGPUAddress(bufferIndex));

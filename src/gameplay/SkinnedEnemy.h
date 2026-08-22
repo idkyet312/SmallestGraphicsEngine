@@ -132,6 +132,10 @@ public:
     BanditWeapon      weapon = BanditWeapon::Rifle;
     // Default keeps every existing bandit spawn/call site correct unchanged.
     Faction           faction = Faction::Bandit;
+    // Squad callsign, shown on the friendly nameplate. Assigned once at spawn
+    // so it stays with this ally for the run rather than being re-rolled every
+    // frame the marker is drawn.
+    std::string       callsign;
     // When set, Patrol/Alert wandering (UpdatePatrolWaypoint) circles this
     // point instead of the actor's own spawn position -- lets a marine loiter
     // near the player instead of near wherever it was placed. Left unset

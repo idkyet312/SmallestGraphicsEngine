@@ -120,7 +120,7 @@ struct LevelDefinition {
     // Which insertion delivers the player. PlayerChoice puts the map's arrival
     // up to the player; the other modes settle it in the level file.
     LevelInsertionMode insertionMode = LevelInsertionMode::Helicopter;
-    float terrainHeightScale = 5.0f;
+    float terrainHeightScale = 3.057f;
     // Island builder: terrain drawn extent (tile grid) and coastline scale. The
     // ocean is procedurally ringed around the land, so growing tiles + island
     // scale together makes a bigger island with more open water around it.

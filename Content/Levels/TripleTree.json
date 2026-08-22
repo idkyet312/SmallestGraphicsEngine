@@ -627,7 +627,7 @@
       "name": "Tree 28",
       "transform": {
         "position": [
-          18.024246215820313,
+          18.024246215820312,
           5.105289459228516,
           24.535446166992188
         ],
@@ -694,6 +694,6 @@
   "name": "Level 1 Copy",
   "schemaVersion": 1,
   "terrain": {
-    "heightScale": 5.0
+    "heightScale": 3.057
   }
 }

@@ -22,9 +22,13 @@ public:
         UINT tilesX = 16;
         UINT tilesZ = 16;
         float tileSize = 8.0f;
-        float heightScale = 5.0f;
-        float lodNear = 24.0f;
-        float lodStep = 28.0f;
+        float heightScale = 3.057f;
+        // Distance at which tessellation starts dropping. Must sit past the
+        // half-span of ring 0 (G/2 * tileSize = 32 m at the 8-tile/8 m default)
+        // or the finest ring is already coarsening before the next ring takes
+        // over, which reads as detail vanishing a few metres from the camera.
+        float lodNear = 44.0f;
+        float lodStep = 34.0f;
         float skirtDepth = 1.0f;
         float flattenRadius = 14.0f;
         float islandScaleX = 1.0f;   // per-axis coastline stretch (X)
@@ -39,11 +43,17 @@ public:
         // building pads). Those features use fixed world positions that fragment
         // when the coast is stretched, so they are stress-mode only.
         UINT terrainStyle = 0;
+        // Extra relief detail: a low-frequency octave for broad landforms and a
+        // high-frequency one for close-up break-up, plus macro normal
+        // perturbation in the terrain shader. 0 = the original single-scale
+        // noise. Off by default so existing levels keep the exact heightfield
+        // they were authored and collided against.
+        UINT detailRelief = 1;
     };
-    // Root param 8 is 15 DWORDs; Draw uploads 15. Keep the struct exactly that
+    // Root param 8 is 16 DWORDs; Draw uploads 16. Keep the struct exactly that
     // size so the upload never reads past it or shifts the cbuffer layout.
-    static_assert(sizeof(Params) == 15 * sizeof(UINT),
-                  "TerrainParams must be exactly 15 DWORDs (matches root const upload)");
+    static_assert(sizeof(Params) == 16 * sizeof(UINT),
+                  "TerrainParams must be exactly 16 DWORDs (matches root const upload)");
 
     struct SculptGPU {
         float x, z, radius;
@@ -306,6 +316,13 @@ public:
             amp *= 0.5f;
         }
         float h = sum * params.heightScale;
+        // Must match terrain_ms.hlsl's TerrainHeight: collision is sampled from
+        // here while the visible surface is displaced there, so any divergence
+        // puts the player above or inside the ground.
+        if (params.detailRelief != 0) {
+            h += noise2(x * 0.015f, z * 0.015f) * params.heightScale * 1.55f;
+            h += noise2(x * 0.42f, z * 0.42f) * params.heightScale * 0.075f;
+        }
 
         float dist = sqrtf(x * x + z * z);
         float t = (dist - params.flattenRadius) / params.flattenRadius; // (b-a)==flattenRadius
@@ -816,7 +833,7 @@ public:
         drawParams.sculptCount = static_cast<UINT>(s_sculptStamps.size());
         drawParams.sculptMaxDisplacement = m_sculptMaxDisplacement;
         UploadSculptStamps(g_dx12.frameIndex);
-        commandList6->SetGraphicsRoot32BitConstants(8, 15, &drawParams, 0);
+        commandList6->SetGraphicsRoot32BitConstants(8, 16, &drawParams, 0);
         commandList6->SetGraphicsRootShaderResourceView(
             13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
         commandList6->DispatchMesh((TileCount(params) + 31) / 32, 1, 1);
@@ -859,7 +876,7 @@ public:
         drawParams.sculptCount = static_cast<UINT>(s_sculptStamps.size());
         drawParams.sculptMaxDisplacement = m_sculptMaxDisplacement;
         UploadSculptStamps(g_dx12.frameIndex);
-        commandList6->SetGraphicsRoot32BitConstants(8, 15, &drawParams, 0);
+        commandList6->SetGraphicsRoot32BitConstants(8, 16, &drawParams, 0);
         commandList6->SetGraphicsRootShaderResourceView(
             13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
         commandList6->DispatchMesh((TileCount(params) + 31) / 32, 1, 1);

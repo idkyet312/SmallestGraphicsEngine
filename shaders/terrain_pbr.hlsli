@@ -41,7 +41,7 @@ float4 TerrainLayerWeights(float3 worldPos, float3 geometricNormal) {
     // Default compound has four deliberate footpaths between central clearing
     // and house entrances. materialType=3 is set only for built-in levels, so
     // custom maps keep full control over their ground composition.
-    if (materialType > 2.5) {
+    if (fmod(materialType, 4.0) > 2.5) {
         float axisDistance = min(abs(worldPos.x), abs(worldPos.z));
         float pathReach = max(abs(worldPos.x), abs(worldPos.z));
         float path = (1.0 - smoothstep(0.72, 1.28, axisDistance)) *
@@ -249,6 +249,17 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
             MatVarNoise(float3(worldPos.xz * 3.1 + 2.0, 1.0)) - 0.5,
             MatVarNoise(float3(worldPos.zx * 3.1 + 7.0, 1.0)) - 0.5) *
             0.26 * detailFade;
+        result.normal = normalize(result.normal);
+    }
+
+    // Macro normal perturbation. The close-range wobble above is gone by 40 m,
+    // so mid and far ground lights as one uniform slope. This varies over tens
+    // of metres -- well below the texture frequency, above the detail fade --
+    // and holds out to the horizon, which is what gives distant terrain shape.
+    if (materialType >= 3.5) {
+        const float m1 = MatVarNoise(float3(worldPos.xz * 0.055 + 41.0, 2.3));
+        const float m2 = MatVarNoise(float3(worldPos.zx * 0.021 - 13.0, 8.1));
+        result.normal.xz += float2(m1 - 0.5, m2 - 0.5) * 0.34;
         result.normal = normalize(result.normal);
     }
 

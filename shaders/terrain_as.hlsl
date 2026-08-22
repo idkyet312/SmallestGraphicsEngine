@@ -33,6 +33,7 @@ cbuffer TerrainParams : register(b6) {
     int originTileX;   // grid min-corner offset in tiles (0 = centered)
     int originTileZ;
     uint terrainStyle; // 0 = smooth radial coast, 1 = stress island layout
+    uint detailRelief; // 1 = extra low/high frequency relief octaves
 };
 
 // Payload carries each visible tile's world origin (min corner) + tile size

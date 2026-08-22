@@ -705,11 +705,16 @@ struct Scene {
 
     // Mesh-shader tessellated terrain (replaces the flat floor plane when on)
     bool  useMeshTerrain     = true;
-    float terrainHeightScale = 5.0f;
+    float terrainHeightScale = 3.057f;
     // Island builder extent, driven by the level definition. tilesX*tileSize is
     // the drawn ground width; island scale grows the coastline so ocean rings it.
     uint32_t terrainTilesX   = 16;
     uint32_t terrainTilesZ   = 16;
+    // Extra terrain relief: a low-frequency octave for broad landforms, a
+    // high-frequency one for surface break-up, and macro normal perturbation
+    // that survives past the close-range detail fade. Off by default -- it
+    // changes the heightfield, and collision is sampled from the same function.
+    bool  terrainDetailRelief = true;
     float terrainIslandScaleX = 1.0f;   // per-axis coastline stretch
     float terrainIslandScaleZ = 1.0f;
     // Grid min-corner offset in tiles; 0 = centered on origin (legacy).

@@ -309,6 +309,10 @@ static XMFLOAT3&            g_blackHawkModelCenter = g_game.vehicles.blackHawkMo
 static float&               g_blackHawkModelMinY = g_game.vehicles.blackHawkModelMinY;
 static float&               g_blackHawkModelScale = g_game.vehicles.blackHawkModelScale;
 static XMFLOAT3&            g_blackHawkPosition = g_game.vehicles.blackHawkPosition;
+// Height above the drop-off below which the insertion's rotor wash reaches the
+// ground. Slightly above the 7 m touchdown hover, so the grass is already
+// flattening as it settles rather than snapping flat on arrival.
+constexpr float             kBlackHawkWashHeight = 26.0f;
 static float&               g_blackHawkYaw = g_game.vehicles.blackHawkYaw;
 static float&               g_blackHawkRotorSpin = g_game.vehicles.blackHawkRotorSpin;
 static XMFLOAT3&            g_boatPosition = g_game.vehicles.boatPosition;
@@ -614,6 +618,7 @@ static size_t ActiveBanditSlotCount() {
 
 TerrainRendererDX12::Params CurrentTerrainParams() {
     TerrainRendererDX12::Params params;
+    params.detailRelief = scene.terrainDetailRelief ? 1u : 0u;
     if (g_stressTestMode) {
         params.islandScaleX = 2.0f;
         params.islandScaleZ = 2.0f;
@@ -653,7 +658,11 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
         params.islandScaleZ = (std::max)(0.5f,
             (std::min)(scene.terrainIslandScaleZ, 12.0f));
         params.tileSize = 8.0f;                 // base ring tile size (full detail)
-        constexpr UINT kRingGrid = 8u;          // G: tiles per side of each ring
+        // 12 tiles per side puts ring 0's half-span at 12/2 * 8 = 48 m, so the
+        // full-detail ring covers the ~40 m the player actually looks at before
+        // the first tile-size doubling. At 8 it reached only 32 m, and the LOD
+        // ramp began inside that.
+        constexpr UINT kRingGrid = 12u;         // G: tiles per side of each ring
         params.tilesX = kRingGrid;
         // Enough rings so the outermost reaches past the island shore. Ring r
         // half-span = G/2 * base * 2^r. Need it to cover kShoreOuter*scale + margin.
@@ -681,14 +690,14 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
         // sooner, which cuts mesh-shader output without changing coverage.
         switch (g_forwardQuality.Tier()) {
             case ForwardExtensionQualityTier::Balanced:
-                params.lodNear = 20.0f;
-                params.lodStep = 24.0f;
+                params.lodNear = 36.0f;
+                params.lodStep = 26.0f;
                 break;
             case ForwardExtensionQualityTier::Performance:
-                params.lodNear = 12.0f;
-                params.lodStep = 18.0f;
+                params.lodNear = 26.0f;
+                params.lodStep = 20.0f;
                 break;
-            default: break;   // Full: keep the 24 m / 28 m defaults
+            default: break;   // Full: keep the 44 m / 34 m defaults
         }
     }
     return params;
@@ -1434,12 +1443,16 @@ static void RidePlayerInBlackHawk() {
         const float rightX = std::cos(vehicles.blackHawkYaw);
         const float rightZ = -std::sin(vehicles.blackHawkYaw);
         constexpr float exitDistance = 5.0f;
+        // Released at the airframe's own height, not teleported to the ground:
+        // the bird holds a hover well above the deck, so stepping out is a drop.
+        // Gravity owns the rest -- leaving IsGrounded set would have the player
+        // walk on air until something else cleared it.
         scene.camera.Position = {
             vehicles.blackHawkDropOff.x + rightX * exitDistance,
-            vehicles.blackHawkGroundY + scene.camera.PlayerHeight,
+            vehicles.blackHawkPosition.y + scene.camera.PlayerHeight,
             vehicles.blackHawkDropOff.z + rightZ * exitDistance };
         scene.camera.VerticalVelocity = 0.0f;
-        scene.camera.IsGrounded = true;
+        scene.camera.IsGrounded = false;
     }
 }
 
@@ -3415,6 +3428,17 @@ static bool SpawnMarine(const XMFLOAT3& position, float yaw) {
     auto marine = std::make_unique<SkinnedEnemy>();
     if (!marine->Init(g_marineModel)) return false;
     marine->faction = Faction::Marine;
+    // Fireteam callsign, numbered in spawn order: Bravo-1, Bravo-2, ...
+    // Counted from the marines already alive rather than a static counter, so a
+    // level restart starts again at Bravo-1 instead of climbing every reload.
+    {
+        int squadNumber = 1;
+        for (const auto& existing : g_bandits)
+            if (existing && existing->faction == Faction::Marine) ++squadNumber;
+        char callsign[32];
+        std::snprintf(callsign, sizeof(callsign), "Bravo-%d", squadNumber);
+        marine->callsign = callsign;
+    }
     marine->position = position;
     marine->yaw = yaw;
     marine->leftArmReach = g_banditLeftArmReach;
@@ -5688,6 +5712,83 @@ static void DrawEscapeBoatMarker(CXMMATRIX view, CXMMATRIX projection) {
         IM_COL32(6, 18, 12, 170), 3.0f);
     draw->AddText(ImVec2(screen.x - size.x * 0.5f, screen.y + 19.0f),
                   green, label);
+}
+
+// Friendly marker. Marines wear the same fatigues as the bandits they are
+// fighting, so at a glance in tall grass there is nothing to tell them apart.
+// A small dot over the head is enough: it reads instantly without covering the
+// body the player is trying to shoot past.
+static void DrawMarineFriendlyMarkers(CXMMATRIX view, CXMMATRIX projection) {
+    if (g_bandits.empty()) return;
+    if (g_game.session.Screen() != GameScreen::Level1) return;
+    const XMMATRIX viewProjection = view * projection;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    for (const auto& marine : g_bandits) {
+        if (!marine || marine->faction != Faction::Marine) continue;
+        // Dead allies are no longer a friendly-fire hazard, and a dot hovering
+        // over a corpse just clutters the fight.
+        if (marine->Dead() || !marine->visible) continue;
+        // Just clear of the head: the gun sits at footOffset + 1.48, so this is
+        // roughly a head-height above that.
+        const XMFLOAT3 anchor{ marine->position.x,
+                               marine->position.y + marine->footOffset + 2.05f,
+                               marine->position.z };
+        const XMVECTOR clip = XMVector3Transform(
+            XMLoadFloat3(&anchor), viewProjection);
+        const float w = XMVectorGetW(clip);
+        if (w <= 0.01f) continue;   // behind the camera
+        const ImVec2 screen{
+            (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+            (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y };
+        // Shrink with distance so a squad far off does not read as a row of
+        // big blobs, with a floor so it never disappears entirely.
+        const float dx = marine->position.x - scene.camera.Position.x;
+        const float dy = marine->position.y - scene.camera.Position.y;
+        const float dz = marine->position.z - scene.camera.Position.z;
+        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const float radius = (std::max)(2.0f, 5.0f - distance * 0.03f);
+
+        // Friendly blue, with a hard dark edge under everything: what makes a
+        // marker read as bright is the contrast beneath it, not the fill.
+        const ImU32 tint    = IM_COL32(120, 195, 255, 255);
+        const ImU32 shadow  = IM_COL32(0, 0, 0, 235);
+
+        // Nameplate: callsign on top, range under it, dot below both -- the
+        // dot stays on the anchor so it still points at the head.
+        char range[24];
+        std::snprintf(range, sizeof(range), "%.0f m", distance);
+        const ImVec2 nameSize = ImGui::CalcTextSize(marine->callsign.c_str());
+        const ImVec2 rangeSize = ImGui::CalcTextSize(range);
+
+        const float nameY = screen.y - radius - 34.0f;
+        const float rangeY = nameY + nameSize.y + 1.0f;
+        const ImVec2 namePos(screen.x - nameSize.x * 0.5f, nameY);
+        const ImVec2 rangePos(screen.x - rangeSize.x * 0.5f, rangeY);
+
+        // Offset drop shadow rather than an outline pass: one extra draw per
+        // string, and enough to hold the text against sky or grass.
+        draw->AddText(ImVec2(namePos.x + 1.0f, namePos.y + 1.0f), shadow,
+                      marine->callsign.c_str());
+        draw->AddText(namePos, tint, marine->callsign.c_str());
+        draw->AddText(ImVec2(rangePos.x + 1.0f, rangePos.y + 1.0f), shadow,
+                      range);
+        draw->AddText(rangePos, tint, range);
+
+        // Downward triangle pointing at the head. Drawn twice: an outset black
+        // copy first as the hard edge, then the blue on top.
+        const float half = radius + 1.6f;          // half-width at the top edge
+        const float drop = (radius + 1.6f) * 1.7f; // apex below that edge
+        const auto triangle = [&](float grow, ImU32 colour) {
+            draw->AddTriangleFilled(
+                ImVec2(screen.x - half - grow, screen.y - drop * 0.5f - grow),
+                ImVec2(screen.x + half + grow, screen.y - drop * 0.5f - grow),
+                ImVec2(screen.x, screen.y + drop * 0.5f + grow),
+                colour);
+        };
+        triangle(2.0f, IM_COL32(0, 0, 0, 255));
+        triangle(0.0f, tint);
+    }
 }
 
 // Debug overlay: each enemy's vision cone (facing direction, FOV, range),
@@ -15248,29 +15349,59 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         const bool secondaryHelicopterActive =
             scene.showHelicopter && SecondaryHelicopterPresent() &&
             !g_secondaryHelicopterDead && !g_secondaryHelicopterCrashed;
+        // The insertion BlackHawk is the one that actually comes down onto the
+        // island; the attack birds hold altitude. Gated on height so the
+        // high-altitude run in does not drag a wash across everything under its
+        // flight path.
+        const bool blackHawkWashActive =
+            g_game.vehicles.blackHawkVisible &&
+            (g_game.vehicles.blackHawkPosition.y -
+             g_game.vehicles.blackHawkGroundY) <= kBlackHawkWashHeight;
+        // Palms carry two wash sources. While the BlackHawk is low it takes the
+        // secondary slot: it is the closest rotor to the trees by a wide margin,
+        // and the second attack bird is usually elsewhere on the map.
+        const bool palmSecondaryIsBlackHawk =
+            blackHawkWashActive && !secondaryHelicopterActive;
         g_trees.SetHelicopterWind(
             g_helicopterPosition, primaryHelicopterActive,
-            g_secondaryHelicopterPosition, secondaryHelicopterActive);
+            palmSecondaryIsBlackHawk ? g_game.vehicles.blackHawkPosition
+                                     : g_secondaryHelicopterPosition,
+            palmSecondaryIsBlackHawk || secondaryHelicopterActive);
         g_trees.Update(deltaTime);
         for (const XMFLOAT3& firePosition : g_trees.GetBurningPositions()) {
             if (scene.burningTargets.size() >= 48) break;
             scene.burningTargets.push_back(
                 { firePosition, 2.2f, 1.0f, now });
         }
+        // Grass takes one wash source, so pick whichever downdraft the player
+        // is standing closest to.
+        const XMVECTOR camera = XMLoadFloat3(&scene.camera.Position);
+        const auto distanceTo = [&camera](const XMFLOAT3& p) {
+            return XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&p) - camera));
+        };
         XMFLOAT3 grassHelicopter = g_helicopterPosition;
+        float grassHelicopterDistance = primaryHelicopterActive
+            ? distanceTo(g_helicopterPosition) : FLT_MAX;
         if (secondaryHelicopterActive) {
-            const XMVECTOR camera = XMLoadFloat3(&scene.camera.Position);
-            const float primaryDistance = primaryHelicopterActive
-                ? XMVectorGetX(XMVector3LengthSq(
-                    XMLoadFloat3(&g_helicopterPosition) - camera)) : FLT_MAX;
-            const float secondaryDistance = XMVectorGetX(XMVector3LengthSq(
-                XMLoadFloat3(&g_secondaryHelicopterPosition) - camera));
-            if (secondaryDistance < primaryDistance)
+            const float secondaryDistance =
+                distanceTo(g_secondaryHelicopterPosition);
+            if (secondaryDistance < grassHelicopterDistance) {
                 grassHelicopter = g_secondaryHelicopterPosition;
+                grassHelicopterDistance = secondaryDistance;
+            }
+        }
+        if (blackHawkWashActive) {
+            const float blackHawkDistance =
+                distanceTo(g_game.vehicles.blackHawkPosition);
+            if (blackHawkDistance < grassHelicopterDistance) {
+                grassHelicopter = g_game.vehicles.blackHawkPosition;
+                grassHelicopterDistance = blackHawkDistance;
+            }
         }
         g_grass.SetHelicopterWind(
             grassHelicopter,
-            primaryHelicopterActive || secondaryHelicopterActive);
+            primaryHelicopterActive || secondaryHelicopterActive ||
+            blackHawkWashActive);
         g_grass.Update(deltaTime);
         }
         UpdatePlayerVelocity(scene.camera.Position, deltaTime);
@@ -17993,6 +18124,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             if (!g_insertionChoicePending) {
                 RenderPlayerHUD(scene);
                 DrawEscapeBoatMarker(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
+                DrawMarineFriendlyMarkers(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawWeaponPickupPrompt(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());

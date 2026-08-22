@@ -1466,7 +1466,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         : XMMatrixIdentity();
     shader.SetMatrices(model, view, proj, lightSpace);
     if (scene.useMeshTerrain && g_terrain.supported) {
-        shader.SetTerrainMaterial(!g_customLevelMode);
+        shader.SetTerrainMaterial(!g_customLevelMode,
+                                  scene.terrainDetailRelief);
     } else if (floorMaterial && floorMaterial->baseColorTexture) {
         shader.SetObjectMaterial(scene.floor.color,
                                  true,

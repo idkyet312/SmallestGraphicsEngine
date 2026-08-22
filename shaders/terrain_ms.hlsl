@@ -27,6 +27,7 @@ cbuffer TerrainParams : register(b6) {
     int originTileX;   // grid min-corner offset in tiles (0 = centered)
     int originTileZ;
     uint terrainStyle; // 0 = smooth radial coast, 1 = stress island layout
+    uint detailRelief; // 1 = extra low/high frequency relief octaves
 };
 
 struct TerrainSculptStamp {
@@ -137,6 +138,14 @@ static const float2 kStressPadCenters[8] = {
 
 float TerrainHeight(float2 xz) {
     float h = fbm(xz * 0.08) * heightScale;
+    // Optional relief detail. The base fbm runs at a single 0.08 frequency, so
+    // everything varies at one scale -- no broad landforms and no fine surface
+    // break-up. A low octave adds hills the base cannot express; a high one
+    // roughens the surface underfoot. Must match TerrainRendererDX12::HeightAt.
+    if (detailRelief != 0u) {
+        h += noise2(xz * 0.015) * heightScale * 1.55;
+        h += noise2(xz * 0.42) * heightScale * 0.075;
+    }
     // Level pad around the origin so the house sits on flat ground.
     float mask = smoothstep(flattenRadius, flattenRadius * 2.0, length(xz));
     h *= mask;

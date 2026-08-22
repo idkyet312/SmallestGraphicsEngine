@@ -908,6 +908,11 @@ public:
     static constexpr float BlackHawkApproachSpeed = 42.0f;
     static constexpr float BlackHawkFastSpeedMultiplier = 2.0f;
     static constexpr float BlackHawkRappelHoverHeight = 14.0f;
+    // The insertion never fully sets down: it flares to a low hover and the
+    // player steps off from there. Kept as an offset above blackHawkGroundY
+    // rather than baked into that value, because the departure climb and the
+    // crash impact both measure against the real terrain height.
+    static constexpr float BlackHawkTouchdownHoverHeight = 7.0f;
     static constexpr float BlackHawkRappelTime = 2.25f;
     // Radius inside which the approach is considered finished and the descent
     // takes over.
@@ -915,6 +920,16 @@ public:
     // Seconds spent on the ground with the doors open before lifting off.
     static constexpr float BlackHawkUnloadTime = 3.0f;
     static constexpr float BlackHawkDepartSpeed = 18.0f;
+    // Departure profile. A helicopter leaving a landing zone does not go
+    // straight up: it lifts a little, noses over to build forward speed, and
+    // only then climbs away. Vertical is a fraction of the cruise speed for
+    // that reason, and the ramp is long enough that the transition is visible
+    // rather than instant.
+    static constexpr float BlackHawkDepartClimbRate = 0.34f;
+    static constexpr float BlackHawkDepartRampHeight = 55.0f;
+    // How much of the climb passes before it starts translating forward. Below
+    // this it is still coming light on the skids.
+    static constexpr float BlackHawkDepartNoseOverStart = 0.16f;
     // Height above the drop-off point at which the bird stops being drawn.
     static constexpr float BlackHawkDepartHeight = 140.0f;
 
@@ -1183,7 +1198,11 @@ public:
             break;
         }
         case BlackHawkPhase::Descending: {
-            const float remaining = blackHawkPosition.y - blackHawkGroundY;
+            // Stops a metre up rather than on the skids, so the drop-off reads
+            // as a hover the player jumps down from.
+            const float hoverY =
+                blackHawkGroundY + BlackHawkTouchdownHoverHeight;
+            const float remaining = blackHawkPosition.y - hoverY;
             if (remaining <= 0.01f) {
                 TouchDown();
                 break;
@@ -1192,8 +1211,8 @@ public:
             const float flare = (std::min)(1.0f, remaining / 12.0f);
             const float speed = BlackHawkDescentSpeed * (0.12f + 0.88f * flare);
             blackHawkPosition.y =
-                (std::max)(blackHawkGroundY, blackHawkPosition.y - speed * dt);
-            if (blackHawkPosition.y <= blackHawkGroundY + 0.01f) TouchDown();
+                (std::max)(hoverY, blackHawkPosition.y - speed * dt);
+            if (blackHawkPosition.y <= hoverY + 0.01f) TouchDown();
             break;
         }
         case BlackHawkPhase::Rappelling: {
@@ -1226,18 +1245,35 @@ public:
             break;
         }
         case BlackHawkPhase::Departing: {
-            // Climb out along the heading it arrived on, nose up and banking.
+            // Climb out along the heading it arrived on. The airframe lifts
+            // first, noses over into forward flight, then settles into a climbing
+            // cruise -- rather than rising and accelerating on one shared curve.
             const float climbed = blackHawkPosition.y - blackHawkGroundY;
-            const float ramp = (std::min)(1.0f, climbed / 20.0f);
+            const float ramp =
+                (std::min)(1.0f, climbed / BlackHawkDepartRampHeight);
+            // Ease the ramp so the transition is smooth at both ends instead of
+            // snapping to full speed the moment the height is reached.
+            const float eased = ramp * ramp * (3.0f - 2.0f * ramp);
             const float speedScale = blackHawkFastRappel
                 ? BlackHawkFastSpeedMultiplier : 1.0f;
+            // Vertical is a modest fraction of cruise: it gains most of its
+            // speed going forward, not straight up.
             blackHawkPosition.y += BlackHawkDepartSpeed * speedScale *
-                (0.35f + 0.65f * ramp) * dt;
-            const float forward = BlackHawkDepartSpeed * speedScale * ramp * dt;
+                BlackHawkDepartClimbRate * (0.45f + 0.55f * eased) * dt;
+            // Forward only after the initial lift, so it clears the LZ before
+            // translating away rather than sliding off sideways at once.
+            const float noseOver = (std::max)(0.0f,
+                (eased - BlackHawkDepartNoseOverStart)) /
+                (1.0f - BlackHawkDepartNoseOverStart);
+            const float forward =
+                BlackHawkDepartSpeed * speedScale * noseOver * dt;
             blackHawkPosition.x += std::sin(blackHawkYaw) * forward;
             blackHawkPosition.z += std::cos(blackHawkYaw) * forward;
-            blackHawkPitch = 0.20f * ramp;
-            blackHawkRoll = 0.18f * ramp;
+            // Nose down into the acceleration, not up: the negative pitch is
+            // what a helicopter does to translate forward. It levels off as the
+            // climb settles.
+            blackHawkPitch = -0.16f * noseOver * (1.0f - 0.45f * eased);
+            blackHawkRoll = 0.10f * noseOver;
             if (climbed >= BlackHawkDepartHeight) {
                 blackHawkPhase = BlackHawkPhase::Gone;
                 blackHawkVisible = false;
@@ -1389,7 +1425,8 @@ public:
 
 private:
     void TouchDown() {
-        blackHawkPosition.y = blackHawkGroundY;
+        blackHawkPosition.y =
+            blackHawkGroundY + BlackHawkTouchdownHoverHeight;
         blackHawkPitch = 0.0f;
         blackHawkRoll = 0.0f;
         blackHawkLanded = true;

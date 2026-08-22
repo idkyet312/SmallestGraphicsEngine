@@ -781,7 +781,7 @@
   "name": "Level 1 Copy",
   "schemaVersion": 1,
   "terrain": {
-    "heightScale": 5.0,
+    "heightScale": 3.057,
     "sculpt": []
   }
 }

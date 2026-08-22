@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
 
 // Forward declare raytracing context
 struct RaytracingContext;
@@ -1045,6 +1046,37 @@ inline void DrawProfilerWindow() {
     ImGui::End();
 }
 
+// -- Settings search --------------------------------------------------------
+// The panel has grown past a dozen collapsing sections, so finding one slider
+// means remembering which header it lives under. The filter matches section
+// titles and, inside a matching section, leaves the contents untouched -- so a
+// hit still gives the control with its usual neighbours and context.
+inline char g_uiSearch[64] = "";
+
+inline std::string UILowerCopy(const char* text) {
+    std::string out(text ? text : "");
+    for (char& c : out) c = (char)tolower((unsigned char)c);
+    return out;
+}
+
+inline bool UISearchActive() { return g_uiSearch[0] != 0; }
+
+inline bool UISearchMatches(const char* label) {
+    if (!UISearchActive()) return true;
+    return UILowerCopy(label).find(UILowerCopy(g_uiSearch)) != std::string::npos;
+}
+
+// Collapsing header that honours the search box: hidden when it does not match,
+// and forced open when it does, so a hit is visible without another click.
+inline bool UISearchHeader(const char* label,
+                           ImGuiTreeNodeFlags flags = 0) {
+    if (UISearchActive()) {
+        if (!UISearchMatches(label)) return false;
+        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+    }
+    return ImGui::CollapsingHeader(label, flags);
+}
+
 inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     struct RTDebugSettings {
         bool active = false;
@@ -1300,6 +1332,17 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 g_destruction.GetRenderBatches().size(),
                 g_destruction.GetRenderItems().size(),
                 g_destruction.IsBatchBuildPending() ? "building" : "idle");
+    // Section search. Sits at the top of the panel so it is the first thing
+    // reached, and filters the collapsing sections below by title.
+    ImGui::SetNextItemWidth(-90.0f);
+    ImGui::InputTextWithHint("##uisearch", "Search settings...",
+                             g_uiSearch, IM_ARRAYSIZE(g_uiSearch));
+    ImGui::SameLine();
+    if (ImGui::Button("Clear##uisearch")) g_uiSearch[0] = 0;
+    if (UISearchActive())
+        ImGui::TextDisabled("Filtering sections by \"%s\"", g_uiSearch);
+    ImGui::Separator();
+
     ImGui::Checkbox("God Mode", &scene.player.godMode);
     if (ImGui::Button(scene.showRagdollPhysicsShapes
             ? "Hide Ragdoll Physics Shapes"
@@ -1337,7 +1380,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::Separator();
 
     // -- Camera --
-    if (ImGui::CollapsingHeader("Camera Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (UISearchHeader("Camera Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::DragFloat3("Camera Position", &scene.camera.Position.x, 0.1f);
         ImGui::DragFloat("FOV",  &scene.cameraFOV,  0.5f, 1.0f, 120.0f);
         ImGui::DragFloat("Near", &scene.cameraNear, 0.01f, 0.01f, 10.0f);
@@ -1350,7 +1393,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     // One slider per bus in the submix graph, plus the master and the reverb
     // return. These write straight through to the live voices, so the effect is
     // audible while dragging rather than on the next sound played.
-    if (ImGui::CollapsingHeader("Audio Mix")) {
+    if (UISearchHeader("Audio Mix")) {
         float master = AudioDevice::MasterVolume();
         if (ImGui::SliderFloat("Master", &master, 0.0f, 1.0f, "%.2f"))
             AudioDevice::SetMasterVolume(master);
@@ -1379,7 +1422,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     // -- Light --
-    if (ImGui::CollapsingHeader("Light Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (UISearchHeader("Light Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::DragFloat3("Light Position", &scene.lightPos.x, 0.1f);
         ImGui::ColorEdit3("Light Color", &scene.lightColor.x);
         ImGui::SliderFloat("Directional Intensity",
@@ -1392,7 +1435,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     // -- Cube 1 --
-    if (ImGui::CollapsingHeader("Cube 1 Settings")) {
+    if (UISearchHeader("Cube 1 Settings")) {
         ImGui::DragFloat3("Position##c1", &scene.cube1.position.x, 0.1f);
         ImGui::DragFloat3("Rotation##c1", &scene.cube1.rotation.x, 1.0f);
         ImGui::DragFloat3("Scale##c1",    &scene.cube1.scale.x,    0.1f, 0.1f, 10.0f);
@@ -1401,7 +1444,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     // -- Cube 2 --
-    if (ImGui::CollapsingHeader("Cube 2 Settings")) {
+    if (UISearchHeader("Cube 2 Settings")) {
         ImGui::Checkbox("Show Second Cube", &scene.cube2.visible);
         if (scene.cube2.visible) {
             ImGui::DragFloat3("Position##c2", &scene.cube2.position.x, 0.1f);
@@ -1412,13 +1455,21 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     // -- Rendering --
-    if (ImGui::CollapsingHeader("Rendering Settings")) {
+    if (UISearchHeader("Rendering Settings")) {
         ImGui::ColorEdit3("Floor Color", &scene.floor.color.x);
         ImGui::ColorEdit3("Clear Color", &scene.clearColor.x);
         ImGui::Checkbox("Wireframe Mode", &scene.wireframeMode);
         ImGui::Checkbox("Mesh Shader Terrain", &scene.useMeshTerrain);
         if (scene.useMeshTerrain) {
             ImGui::SliderFloat("Terrain Height", &scene.terrainHeightScale, 0.0f, 15.0f);
+            ImGui::Checkbox("Terrain Detail Relief",
+                            &scene.terrainDetailRelief);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Low-frequency octave for broad landforms, high-frequency "
+                    "for surface break-up, plus macro normal perturbation that "
+                    "holds past the close-range detail fade. "
+                    "Changes the heightfield, so collision moves with it.");
         }
         ImGui::DragFloat("Specular", &scene.specularStrength, 0.01f, 0.0f, 1.0f);
 
@@ -2295,7 +2346,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     // -- Gun --
-    if (ImGui::CollapsingHeader("Viewmodel (Gun)")) {
+    if (UISearchHeader("Viewmodel (Gun)")) {
         ImGui::Checkbox("Show Gun",    &scene.gun.visible);
         ImGui::ColorEdit3("Gun Color", &scene.gun.color.x);
         ImGui::DragFloat3("Offset",    &scene.gun.offset.x,   0.01f);
@@ -2406,7 +2457,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     // -- Grass / wind --
-    if (g_grass.IsInitialized() && ImGui::CollapsingHeader("Grass & Wind")) {
+    if (g_grass.IsInitialized() && UISearchHeader("Grass & Wind")) {
         ImGui::SeparatorText("Material");
         bool foliageMaterialChanged =
             ImGui::ColorEdit3("Grass Albedo", &g_grass.Albedo().x);
@@ -2445,7 +2496,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat("Draw Distance", &g_grass.DrawDistance(), 0.5f, 8.0f, 40.0f);
     }
 
-    if (ImGui::CollapsingHeader("Destruction", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (UISearchHeader("Destruction", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("Enable Destructible Wall", &scene.useDestruction);
         ImGui::DragFloat("Damage Radius", &scene.destructionDamageRadius, 0.1f, 0.25f, 8.0f);
         ImGui::DragFloat("Damage", &scene.destructionDamage, 0.1f, 0.1f, 10.0f);
@@ -2481,7 +2532,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         }
     }
 
-    if (ImGui::CollapsingHeader("Palm Trees", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (UISearchHeader("Palm Trees", ImGuiTreeNodeFlags_DefaultOpen)) {
         // Absolute damage vs a section's 30 health: 15 => 2 hits to sever.
         ImGui::DragFloat("Tree Damage/Shot", &scene.treeDamagePerShot, 0.5f, 1.0f, 60.0f);
         ImGui::Text("Shoot a trunk to fell the tree above the hit.");
