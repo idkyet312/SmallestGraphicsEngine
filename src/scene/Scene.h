@@ -601,7 +601,7 @@ struct Scene {
     int   destructionGridY = 3;
     int   destructionGridZ = 4;
     float destructionDamageRadius = 0.9f;   // tight blast so hits stay local
-    float destructionDamage = 0.5f;         // bullets weaken once, then break on second hit
+    float destructionDamage = 0.5f;         // bullets weaken twice, then break on third hit
     float destructionBulletImpulse = 260.0f;
     bool  rebuildDestructionRequested = false;
     bool  showDestructionDebug = false;
@@ -1531,6 +1531,46 @@ struct Scene {
 
         if (impactParticles.size() > 800)
             impactParticles.erase(impactParticles.begin(), impactParticles.begin() + spawned);
+    }
+
+    // Thin smoke curling out of a fresh bullet hole. Deliberately not
+    // SpawnSmokeBurst: that seeds a sphere and rolls outward for an explosion,
+    // which at hole scale reads as a puff of dust in mid-air. This drifts off
+    // the surface along its normal and rises, so it stays attached to the mark.
+    void SpawnBulletHoleSmoke(const XMFLOAT3& position, const XMFLOAT3& normal,
+                              float intensity = 1.0f) {
+        auto rnd = [&]() { return (float)std::rand() / RAND_MAX * 2.0f - 1.0f; };
+        auto unit = [&]() { return (float)std::rand() / RAND_MAX; };
+        const int puffs = (std::max)(1, (int)(3.0f * intensity));
+        int spawned = 0;
+        for (int i = 0; i < puffs; ++i) {
+            ImpactParticle sp;
+            // Start just off the surface, jittered across the hole's mouth
+            // rather than around a sphere.
+            constexpr float kMouth = 0.035f;
+            sp.position = {
+                position.x + normal.x * 0.02f + rnd() * kMouth,
+                position.y + normal.y * 0.02f + rnd() * kMouth,
+                position.z + normal.z * 0.02f + rnd() * kMouth };
+            // Mostly straight out of the hole, with buoyancy taking over as it
+            // leaves. Slow: fast wisps look like steam jets.
+            const float out = 0.22f + unit() * 0.28f;
+            sp.velocity = { normal.x * out + rnd() * 0.06f,
+                            normal.y * out + 0.20f + unit() * 0.18f,
+                            normal.z * out + rnd() * 0.06f };
+            sp.maxLife = sp.life = 0.55f + unit() * 0.75f;
+            sp.size    = 0.018f + unit() * 0.022f;
+            sp.growth  = 0.25f + unit() * 0.35f;
+            // Pale grey: burnt propellant, lighter than the sooty explosion
+            // smoke so it stays visible against dark walls.
+            const float g = 0.34f + unit() * 0.22f;
+            sp.color = { g, g, g };
+            sp.spark = false;
+            impactParticles.push_back(sp); ++spawned;
+        }
+        if (impactParticles.size() > 800)
+            impactParticles.erase(impactParticles.begin(),
+                                  impactParticles.begin() + spawned);
     }
 
     void TriggerMuzzleFlash(float durationScale, float sizeScale) {

@@ -665,7 +665,7 @@ struct DestructionDX12::Impl {
     // Cost of the previous Update, used to steer qualityScale. Seeded at 0 so a
     // fresh level starts at full quality.
     double lastUpdateMilliseconds = 0.0;
-    std::unordered_set<uint32_t> bulletWeakenedChunks;
+    std::unordered_map<uint32_t, uint8_t> bulletHitCounts;
     float structuralAccumulator = 0.0f;
     float structuralClock = 0.0f;
     struct DirtyStructure { uint32_t id = 0; float readyTime = 0.0f; };
@@ -3857,15 +3857,51 @@ bool DestructionDX12::IsProtectedChunkAt(const XMFLOAT3& worldPosition) const {
     return hitChunk < m->chunks.size() && m->chunks[hitChunk].protectedChunk;
 }
 
+bool DestructionDX12::CaptureLastHitAttachment(
+    const XMFLOAT3& worldPosition, const XMFLOAT3& worldNormal,
+    DestructionChunkAttachment& attachment) const {
+    if (!m || !m->initialized || m->lastHitChunk == InvalidIndex ||
+        m->lastHitChunk >= m->chunks.size()) return false;
+    const Impl::ActorRuntime* owner = m->FindChunkOwner(m->lastHitChunk);
+    if (!owner || B3_IS_NULL(owner->body)) return false;
+
+    const XMMATRIX world = BoxTransform(owner->body, owner->center);
+    const XMMATRIX model = XMMatrixInverse(nullptr, world);
+    attachment.chunkIndex = m->lastHitChunk;
+    XMStoreFloat3(&attachment.modelPosition, XMVector3TransformCoord(
+        XMLoadFloat3(&worldPosition), model));
+    XMStoreFloat3(&attachment.modelNormal, XMVector3Normalize(
+        XMVector3TransformNormal(XMLoadFloat3(&worldNormal), model)));
+    return true;
+}
+
+bool DestructionDX12::ResolveAttachment(
+    const DestructionChunkAttachment& attachment, XMFLOAT3& worldPosition,
+    XMFLOAT3& worldNormal) const {
+    if (!m || !m->initialized || !attachment.IsValid() ||
+        attachment.chunkIndex >= m->chunks.size()) return false;
+    const Impl::ActorRuntime* owner =
+        m->FindChunkOwner(attachment.chunkIndex);
+    if (!owner || B3_IS_NULL(owner->body)) return false;
+
+    const XMMATRIX world = BoxTransform(owner->body, owner->center);
+    XMStoreFloat3(&worldPosition, XMVector3TransformCoord(
+        XMLoadFloat3(&attachment.modelPosition), world));
+    XMStoreFloat3(&worldNormal, XMVector3Normalize(
+        XMVector3TransformNormal(XMLoadFloat3(&attachment.modelNormal), world)));
+    return true;
+}
+
 void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float radius,
                                         float damage, bool sparesProtected) {
     if (!m->initialized) return;
+    (void)damage;  // hit count, not weapon damage, controls bullet breakage
     // Bullet struck a person, not a Blast chunk. Preserve building bonds.
     if (m->lastRagdollHit >= 0) return;
     m->lastDamagePosition = worldPosition;
     m->lastDamageRadius = radius;
-    // Ordinary bullets chip a cell first, then a second hit severs it. High-energy
-    // rounds (sniper and laser) cut the nearest cell immediately.
+    // Bullet-like radial hits chip a cell twice; the third hit severs it.
+    // Explosions and lasers use their dedicated immediate-destruction paths.
     Impl::ActorRuntime* hitActor = nullptr;
     uint32_t hitChunk = InvalidIndex;
     if (!m->FindNearestBreakableCell(worldPosition, hitActor, hitChunk)) return;
@@ -3873,12 +3909,14 @@ void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float rad
     // geometry alone; a direct player hit does not pass this flag.
     if (sparesProtected && hitChunk < m->chunks.size() &&
         m->chunks[hitChunk].protectedChunk) return;
-    const bool highEnergy = damage >= 2.0f;
-    if (!highEnergy && m->bulletWeakenedChunks.insert(hitChunk).second) {
-        std::cout << "Blast hit: chunk weakened\n";
+    uint8_t& hitCount = m->bulletHitCounts[hitChunk];
+    ++hitCount;
+    if (hitCount < 3) {
+        std::cout << "Blast hit: chunk weakened " << (int)hitCount
+                  << "/3\n";
         return;
     }
-    m->bulletWeakenedChunks.erase(hitChunk);
+    m->bulletHitCounts.erase(hitChunk);
     const uint32_t actorsBefore = (uint32_t)m->actors.size();
     m->BreakNearestCell(worldPosition);
     m->MarkStructureDirty(m->lastBrokenStructure);
@@ -4045,7 +4083,7 @@ void DestructionDX12::DestroyChunkAt(const XMFLOAT3& worldPosition, float radius
     if (!m->FindNearestBreakableCell(
             worldPosition, hitActor, hitChunk, true, true,
             allowProtected)) return;
-    m->bulletWeakenedChunks.erase(hitChunk);
+    m->bulletHitCounts.erase(hitChunk);
     const uint32_t structureId = m->chunks[hitChunk].structureId;
 
     if (hitActor->chunks.size() == 1) {

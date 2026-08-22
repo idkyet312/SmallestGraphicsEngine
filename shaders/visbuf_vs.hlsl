@@ -55,6 +55,9 @@ struct VS_INPUT {
 struct VS_OUTPUT {
     float4 position : SV_POSITION;
     float2 texCoord : TEXCOORD0;
+#ifdef SGE_BINDLESS_MATERIALS
+    float3 worldPos : TEXCOORD1;
+#endif
 };
 
 VS_OUTPUT main(VS_INPUT input) {
@@ -68,6 +71,9 @@ VS_OUTPUT main(VS_INPUT input) {
     float4 viewPos  = mul(worldPos, view);
     output.position = mul(viewPos, projection);
     output.texCoord = input.texCoord;
+#ifdef SGE_BINDLESS_MATERIALS
+    output.worldPos = worldPos.xyz;
+#endif
     
     return output;
 }

@@ -67,6 +67,41 @@ cbuffer PointLightsBuffer : register(b4) {
     PointLightData pointLights[64];
 };
 
+#ifdef SGE_BINDLESS_MATERIALS
+struct ImpactDecalData {
+    float3 position;
+    float radius;
+    float3 normal;
+    float strength;
+};
+
+cbuffer ImpactDecalsBuffer : register(b10) {
+    int numImpactDecals;
+    float impactCutoutsEnabled;
+    float2 impactDecalPadding;
+    ImpactDecalData impactDecals[64];
+};
+
+bool ImpactDecalCutsSurface(float3 worldPos) {
+    if (impactCutoutsEnabled < 0.5) return false;
+
+    [loop]
+    for (int i = 0; i < numImpactDecals; ++i) {
+        ImpactDecalData decal = impactDecals[i];
+        if (decal.strength <= 0.001) continue;
+        const float3 offset = worldPos - decal.position;
+        const float alongNormal = abs(dot(offset, decal.normal));
+        const float acrossPlaneSq =
+            max(0.0, dot(offset, offset) - alongNormal * alongNormal);
+        const float holeRadius = decal.radius * 0.38;
+        if (alongNormal <= decal.radius * 1.5 &&
+            acrossPlaneSq <= holeRadius * holeRadius)
+            return true;
+    }
+    return false;
+}
+#endif
+
 cbuffer DDGIBuffer : register(b5) {
     float3 probeGridOrigin;
     float probeSpacing;
@@ -703,6 +738,11 @@ float4 main(PS_INPUT input) : SV_TARGET
             1.0, lerp(0.88, 1.10, variation), variationStrength);
         albedo = saturate(albedo * tint * brightness);
     }
+#ifdef SGE_BINDLESS_MATERIALS
+    if (numImpactDecals > 0 && !isFoliage &&
+        ImpactDecalCutsSurface(input.fragPos))
+        discard;
+#endif
     float metal = metalness;
     float rough = roughness;
     float ambientOcclusion = 1.0;

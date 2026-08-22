@@ -881,6 +881,14 @@ public:
 
         for (auto& p : scene.projectiles) {
             if (!p.active) continue;
+            // Bullets and tracers are far too small for a shadow to read as
+            // anything but noise: at projectileScale they resolve to a pixel or
+            // two of shadow-map coverage, which flickers across the map as they
+            // fly. Only the objects big enough to cast a shadow a player can
+            // recognise are drawn -- grenades, rockets, charges and spears.
+            const bool castsShadow = p.grenade || p.molotov || p.vortex ||
+                                     p.rocket || p.remoteCharge || p.harpoon;
+            if (!castsShadow) continue;
             XMMATRIX model = XMMatrixScaling(scene.projectileScale, scene.projectileScale, scene.projectileScale);
             model = model * XMMatrixTranslation(p.position.x, p.position.y, p.position.z);
             depthShader.SetMatrices(model, lightSpace);

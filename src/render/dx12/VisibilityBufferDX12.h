@@ -613,6 +613,9 @@ public:
     float exposureAdaptation = 0.05f;
     float motionBlurStrength = 0.0f;
     PalmWindFrameDX12 palmWindFrame{};
+    // Impact cutout volumes for the bindless primary-visibility pass.
+    UploadBuffer<ImpactDecalsBufferDX12> impactDecalsBuffer;
+    ImpactDecalsBufferDX12 impactDecalsCPU{};
     float focusDistance = 8.0f;
     float aperture = 0.0f;
     float currentNearPlane = 0.1f;
@@ -716,6 +719,7 @@ public:
         if (!require(CreateExposurePipeline(), "exposure shaders")) return false;
 
         if (!require(frameConstantBuffer.Create(FRAME_COUNT), "frame constants")) return false;
+        if (!require(impactDecalsBuffer.Create(FRAME_COUNT), "impact decals")) return false;
         if (!require(postConstantBuffer.Create(FRAME_COUNT), "post constants")) return false;
         if (!require(exposureConstantBuffer.Create(FRAME_COUNT), "exposure constants")) return false;
 
@@ -1557,6 +1561,7 @@ public:
         cmdList->SetDescriptorHeaps(1, heaps);
         cmdList->SetGraphicsRootSignature(useBindless
             ? bindlessVisPassRootSig.Get() : visPassRootSig.Get());
+        BindImpactDecalCutouts(cmdList);
         cmdList->SetGraphicsRootShaderResourceView(3,
             drawCallBuffer->GetGPUVirtualAddress());
         D3D12_GPU_DESCRIPTOR_HANDLE defaultTexture = useBindless
@@ -1608,6 +1613,21 @@ public:
                            : visPassAlphaPSO.Get())
             : (doubleSided ? visPassDoubleSidedPSO.Get()
                            : visPassPSO.Get()));
+    }
+
+    void SetImpactDecals(const std::vector<ImpactDecalDataDX12>& decals,
+                         bool cutoutsEnabled) {
+        const int count = (int)((decals.size() < 64) ? decals.size() : 64);
+        impactDecalsCPU.numDecals = count;
+        impactDecalsCPU.cutoutsEnabled = cutoutsEnabled ? 1.0f : 0.0f;
+        for (int i = 0; i < count; ++i) impactDecalsCPU.decals[i] = decals[i];
+    }
+
+    void BindImpactDecalCutouts(ID3D12GraphicsCommandList* cmdList) {
+        if (!impactDecalsBuffer.resource) return;
+        impactDecalsBuffer.CopyData(g_dx12.frameIndex, impactDecalsCPU);
+        cmdList->SetGraphicsRootConstantBufferView(
+            4, impactDecalsBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
 
     void SetPalmWindFrame(const PalmWindFrameDX12& frame) {
@@ -3767,7 +3787,8 @@ private:
         // 1: Root constants - draw/material flags (b1), 4 UINT values
         // 2: Alpha-test base colour (t0)
         // 3: Persistent per-instance data (t1); VS reads model by drawCallID
-        D3D12_ROOT_PARAMETER visParams[4] = {};
+        // 4: Impact decal cutout volumes (b10)
+        D3D12_ROOT_PARAMETER visParams[5] = {};
 
         visParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         visParams[0].Descriptor.ShaderRegister = 0;
@@ -3795,6 +3816,11 @@ private:
         visParams[3].Descriptor.RegisterSpace = 0;
         visParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
+        visParams[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        visParams[4].Descriptor.ShaderRegister = 10;
+        visParams[4].Descriptor.RegisterSpace = 0;
+        visParams[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
         D3D12_STATIC_SAMPLER_DESC alphaSampler = {};
         alphaSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         alphaSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -3805,7 +3831,9 @@ private:
         alphaSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC visRootSigDesc = {};
-        visRootSigDesc.NumParameters = 4;
+        // b10 is an inert compatibility slot for legacy and is read only by
+        // the bindless cutout shader. Both paths keep the same parameter map.
+        visRootSigDesc.NumParameters = 5;
         visRootSigDesc.pParameters = visParams;
         visRootSigDesc.NumStaticSamplers = 1;
         visRootSigDesc.pStaticSamplers = &alphaSampler;
@@ -3886,6 +3914,8 @@ private:
             ShaderCacheDX12::DxcAvailable()) {
             const std::wstring shaderDirectory =
                 ShaderCacheDX12::ExecutableDirectory() + L"shaders";
+            const std::string bindlessVS =
+                "#define SGE_BINDLESS_MATERIALS 1\n" + vsCode;
             const std::string bindlessPS =
                 "#define SGE_BINDLESS_MATERIALS 1\n" + psCode;
             ComPtr<ID3DBlob> bindlessVSBlob, bindlessPSBlob,
@@ -3893,7 +3923,7 @@ private:
             std::string errors;
             const bool shadersReady =
                 ShaderCacheDX12::CompileCachedDXC(
-                    vsCode, L"visbuf_vs.hlsl", L"main", L"vs_6_6",
+                    bindlessVS, L"visbuf_vs.hlsl", L"main", L"vs_6_6",
                     shaderDirectory, &bindlessVSBlob, &errors) &&
                 ShaderCacheDX12::CompileCachedDXC(
                     bindlessPS, L"visbuf_ps.hlsl", L"main", L"ps_6_6",
@@ -4052,8 +4082,6 @@ private:
         }
 
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        // Three: the shared resolveParams array carries the t90 tile-list root
-        // SRV alongside the CBV and the descriptor table.
         rootSigDesc.NumParameters = 3;
         rootSigDesc.pParameters = params;
         rootSigDesc.NumStaticSamplers = 2;
@@ -4371,6 +4399,8 @@ private:
         params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
+        // Three: the shared resolveParams array carries the t90 tile-list root
+        // SRV alongside the CBV and the descriptor table.
         rootSigDesc.NumParameters = 3;
         rootSigDesc.pParameters = params;
         rootSigDesc.NumStaticSamplers = 2;

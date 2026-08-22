@@ -328,7 +328,12 @@ inline void RenderPlayerHUD(const Scene& scene) {
             io.DisplaySize.x * io.DisplaySize.x + io.DisplaySize.y * io.DisplaySize.y);
         const int shadeAlpha = static_cast<int>(255.0f * blend);
         const ImU32 shade = IM_COL32(0, 0, 0, shadeAlpha);
-        constexpr int segments = 128;
+        constexpr int segments = 160;
+
+        // Everything outside the lens is solid black, with no falloff. Looking
+        // through a real scope the tube wall is simply opaque -- the eye sees
+        // the bright circle of glass and nothing else, so a soft vignette or a
+        // grey surround reads as a HUD overlay instead of an optic.
         for (int i = 0; i < segments; ++i) {
             const float a0 = 6.2831853f * static_cast<float>(i) / segments;
             const float a1 = 6.2831853f * static_cast<float>(i + 1) / segments;
@@ -343,65 +348,85 @@ inline void RenderPlayerHUD(const Scene& scene) {
             draw->AddQuadFilled(inner0, outer0, outer1, inner1, shade);
         }
 
-        const int lineAlpha = static_cast<int>(235.0f * blend);
-        const ImU32 reticleShadow = IM_COL32(0, 0, 0, lineAlpha);
-        // Off-white rather than the old green phosphor tint, matching the rest
-        // of the HUD. The black underlay beneath every line is what keeps it
-        // readable against sky and sand, not the colour.
-        const ImU32 reticleGlow = IM_COL32(238, 242, 236, lineAlpha);
-        draw->AddCircle(center, radius, IM_COL32(12, 18, 13, shadeAlpha),
-                        segments, 7.0f);
-        draw->AddCircle(center, radius - 5.0f,
-                        IM_COL32(196, 204, 196, lineAlpha), segments, 1.2f);
-
-        const float edge = radius - 10.0f;
-        const float gap = 4.0f;
-        const ImVec2 horizontal[2][2] = {
-            { ImVec2(center.x - edge, center.y), ImVec2(center.x - gap, center.y) },
-            { ImVec2(center.x + gap, center.y), ImVec2(center.x + edge, center.y) }
-        };
-        const ImVec2 vertical[2][2] = {
-            { ImVec2(center.x, center.y - edge), ImVec2(center.x, center.y - gap) },
-            { ImVec2(center.x, center.y + gap), ImVec2(center.x, center.y + edge) }
-        };
-        for (const auto& line : horizontal) {
-            draw->AddLine(line[0], line[1], reticleShadow, 3.0f);
-            draw->AddLine(line[0], line[1], reticleGlow, 1.0f);
-        }
-        for (const auto& line : vertical) {
-            draw->AddLine(line[0], line[1], reticleShadow, 3.0f);
-            draw->AddLine(line[0], line[1], reticleGlow, 1.0f);
-        }
-        draw->AddCircleFilled(center, 2.2f, reticleShadow, 16);
-        draw->AddCircleFilled(center, 1.0f, reticleGlow, 12);
-
-        for (int mark = 1; mark <= 5; ++mark) {
-            const float offset = radius * 0.105f * mark;
-            const float halfWidth = mark % 2 ? 5.0f : 9.0f;
-            draw->AddLine(ImVec2(center.x - halfWidth, center.y + offset),
-                          ImVec2(center.x + halfWidth, center.y + offset),
-                          reticleShadow, 3.0f);
-            draw->AddLine(ImVec2(center.x - halfWidth, center.y + offset),
-                          ImVec2(center.x + halfWidth, center.y + offset),
-                          reticleGlow, 1.0f);
-        }
-        for (int mark = 1; mark <= 4; ++mark) {
-            const float offset = radius * 0.13f * mark;
-            const float halfHeight = mark % 2 ? 4.0f : 7.0f;
-            for (float side : { -1.0f, 1.0f }) {
-                const float x = center.x + side * offset;
-                draw->AddLine(ImVec2(x, center.y - halfHeight),
-                              ImVec2(x, center.y + halfHeight), reticleShadow, 3.0f);
-                draw->AddLine(ImVec2(x, center.y - halfHeight),
-                              ImVec2(x, center.y + halfHeight), reticleGlow, 1.0f);
+        // Only a slight darkening right at the glass edge, over the last few
+        // percent of the radius. Enough to round the transition into the tube
+        // without washing the image the way a broad gradient does.
+        constexpr int kEdgeBands = 6;
+        const float edgeStart = radius * 0.93f;
+        for (int band = 0; band < kEdgeBands; ++band) {
+            const float t0 = (float)band / kEdgeBands;
+            const float t1 = (float)(band + 1) / kEdgeBands;
+            const float r0 = edgeStart + (radius - edgeStart) * t0;
+            const float r1 = edgeStart + (radius - edgeStart) * t1;
+            const int bandAlpha = (int)(170.0f * t1 * t1 * blend);
+            if (bandAlpha <= 1) continue;
+            for (int i = 0; i < segments; ++i) {
+                const float a0 = 6.2831853f * (float)i / segments;
+                const float a1 = 6.2831853f * (float)(i + 1) / segments;
+                draw->AddQuadFilled(
+                    ImVec2(center.x + std::cos(a0) * r0,
+                           center.y + std::sin(a0) * r0),
+                    ImVec2(center.x + std::cos(a0) * r1,
+                           center.y + std::sin(a0) * r1),
+                    ImVec2(center.x + std::cos(a1) * r1,
+                           center.y + std::sin(a1) * r1),
+                    ImVec2(center.x + std::cos(a1) * r0,
+                           center.y + std::sin(a1) * r0),
+                    IM_COL32(0, 0, 0, bandAlpha));
             }
         }
 
-        const char* zoomLabel = "SVD  4x";
-        const ImVec2 labelSize = ImGui::CalcTextSize(zoomLabel);
-        draw->AddText(ImVec2(center.x + radius * 0.46f - labelSize.x * 0.5f,
-                             center.y + radius * 0.74f),
-                      IM_COL32(238, 242, 236, lineAlpha), zoomLabel);
+        // Tube edge: a hard dark rim with a faint lit lip inside it, which is
+        // all the housing that is actually visible down the eyepiece.
+        draw->AddCircle(center, radius, IM_COL32(6, 7, 8, shadeAlpha),
+                        segments, 6.0f);
+        draw->AddCircle(center, radius - 3.5f,
+                        IM_COL32(120, 126, 130,
+                                 static_cast<int>(110.0f * blend)),
+                        segments, 1.4f);
+
+        const int lineAlpha = static_cast<int>(225.0f * blend);
+        const ImU32 reticleShadow = IM_COL32(0, 0, 0,
+                                             static_cast<int>(150.0f * blend));
+        const ImU32 reticleLine = IM_COL32(26, 28, 30, lineAlpha);
+
+        // Clipped to the glass so no line runs out over the tube.
+        draw->PushClipRect(
+            ImVec2(center.x - radius, center.y - radius),
+            ImVec2(center.x + radius, center.y + radius), true);
+
+        // Plain crosshair: two thin dark hairlines spanning the full lens,
+        // uninterrupted through the middle. Etched glass reads as fine dark
+        // lines against the image, not bright ones -- the pale reticle and
+        // thick duplex posts this replaces looked like a drawn-on HUD.
+        const float span = radius;
+        draw->AddLine(ImVec2(center.x - span, center.y + 1.0f),
+                      ImVec2(center.x + span, center.y + 1.0f),
+                      reticleShadow, 2.2f);
+        draw->AddLine(ImVec2(center.x + 1.0f, center.y - span),
+                      ImVec2(center.x + 1.0f, center.y + span),
+                      reticleShadow, 2.2f);
+        draw->AddLine(ImVec2(center.x - span, center.y),
+                      ImVec2(center.x + span, center.y), reticleLine, 1.3f);
+        draw->AddLine(ImVec2(center.x, center.y - span),
+                      ImVec2(center.x, center.y + span), reticleLine, 1.3f);
+
+        // Sparse graduation ticks along both hairlines, short and unlabelled.
+        for (int mark = 1; mark <= 6; ++mark) {
+            const float offset = radius * 0.13f * mark;
+            const float tick = (mark % 2) ? 3.5f : 6.0f;
+            for (int sidei = 0; sidei < 2; ++sidei) {
+                const float side = sidei ? 1.0f : -1.0f;
+                const float x = center.x + side * offset;
+                draw->AddLine(ImVec2(x, center.y - tick),
+                              ImVec2(x, center.y + tick), reticleLine, 1.2f);
+                const float y = center.y + side * offset;
+                draw->AddLine(ImVec2(center.x - tick, y),
+                              ImVec2(center.x + tick, y), reticleLine, 1.2f);
+            }
+        }
+
+        draw->PopClipRect();
     }
 
     if (scene.player.godMode) {

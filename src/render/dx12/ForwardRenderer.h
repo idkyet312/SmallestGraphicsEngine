@@ -115,6 +115,20 @@ extern DDGIRendererDX12 g_ddgiRenderer;
 extern bool g_stressTestMode;
 extern bool g_emptyLevelMode;
 extern bool g_trainingRangeMode;
+// Impact decal store, defined in main.cpp. Uploaded once per frame alongside
+// the point lights.
+struct ImpactDecal {
+    DirectX::XMFLOAT3 position;
+    DirectX::XMFLOAT3 normal;
+    float radius;
+    float age;
+    DestructionChunkAttachment parent;
+};
+extern std::vector<ImpactDecal> g_impactDecals;
+std::vector<ImpactDecalDataDX12> BuildImpactDecalGPUList();
+extern const float kImpactDecalLifetime;
+extern bool g_impactDecalsEnabled;
+extern bool g_impactDecalCutouts;
 DirectX::XMMATRIX HumveeWorldMatrix();
 DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
 DirectX::XMMATRIX HelicopterWorldMatrix();
@@ -695,6 +709,12 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
         } else {
             shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
         }
+
+        // This helper only draws static IA meshes. The b9 root constant
+        // persists across draws, so a skinned enemy/weapon rendered earlier can
+        // otherwise make palm crowns consume its stale palette and explode
+        // into long triangles.
+        shader.SetSkinningEnabled(false);
 
         // Palm slices are IA meshes (no meshlet data), so always take the VS/PS path.
         g_dx12.commandList->SetPipelineState(
@@ -1418,6 +1438,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         ++fireLightCount;
     }
     shader.SetPointLights((int)lightData.size(), lightData);
+    // Impact marks. Strength carries the fade so the shader needs no clock:
+    // full for the first three quarters of the life, easing to zero after.
+    shader.SetImpactDecals(BuildImpactDecalGPUList(),
+                           g_impactDecalsEnabled && g_impactDecalCutouts);
     shader.SetDDGI(scene.useDDGI, scene.giIntensity, scene.normalBias,
         scene.probeSpacing, g_dxrDDGIProbeCount, g_dxrDDGICellCount,
         g_dxrDDGICellSize);
@@ -1865,7 +1889,6 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     }
 
     if (DeploymentPlanningActive()) {
-        shader.SetSkinningEnabled(false);
         g_dx12.commandList->SetPipelineState(shader.GetPipelineState(false));
         const auto& zones = DeploymentZonePositions();
         const int selectedZone = SelectedDeploymentZoneIndex();
@@ -1881,6 +1904,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 selected ? XMFLOAT3(0.08f, 8.0f, 0.25f)
                          : XMFLOAT3(0.04f, 3.5f, 0.12f),
                 selected ? 1.0f : 0.72f);
+            // SetEmissiveMaterial selects the legacy material root signature.
+            // Clear b9 afterwards so these static spheres cannot inherit a
+            // skinned draw's palette and stretch into map-wide green strips.
+            shader.SetSkinningEnabled(false);
             DrawSphere(geo);
             shader.NextDrawCall();
         }

@@ -349,6 +349,17 @@ float                       g_banditGunRearGripDrop = -0.18f;
 float                       g_banditGunForeGripLateral = 0.253f;
 float                       g_banditGunForeGripRise = -0.206f;
 bool                        g_showEnemyVisionCones = false;
+// Impact decal debug. The marks are a per-pixel volume test with no geometry of
+// their own, so when one lands wrong there is nothing to inspect -- this draws
+// the discs the shader is actually testing against.
+bool                        g_showDecalDebug = false;
+// Bullet-hole rendering is experimental and bindless-only. Keep it opt-in so
+// the normal bindless material path does not depend on the decal resources.
+bool                        g_impactDecalsEnabled = false;
+bool                        g_impactDecalCutouts = false;
+// Freeze ageing so a mark can be walked around and inspected without it fading
+// out mid-investigation.
+bool                        g_freezeDecalAging = false;
 // Enemy scatter test mode. When on, every bandit is moved to a random walkable
 // point on the navmesh once the squad is spawned and before the player deploys,
 // so a run does not always open against the same authored EnemySpawn layout.
@@ -429,6 +440,87 @@ static void ApplyVolumetricFogSettings(const VolumetricFogSettings& fog) {
 // before committing to a zone.
 bool                        g_showEnemyDotsOnDeployScreen = true;
 static uint32_t&            g_banditSpawnSerial = g_enemySystem.spawnSerial;
+// Impact decals: bullet holes and scorch marks, oldest evicted once the buffer
+// is full. 64 matches the shader's array, and the whole list is re-uploaded each
+// frame -- at this size that is cheaper than tracking dirty ranges.
+// ImpactDecal itself is declared in ForwardRenderer.h, which uploads the list.
+std::vector<ImpactDecal>    g_impactDecals;
+constexpr size_t            kMaxImpactDecals = 64;
+// Marks stay for a firefight, then fade over the last quarter of their life so
+// they disappear without popping. Non-constexpr so the renderer can extern it.
+extern const float          kImpactDecalLifetime;
+const float                 kImpactDecalLifetime = 45.0f;
+
+static void SpawnImpactDecal(const XMFLOAT3& position, const XMFLOAT3& normal,
+                             float radius, float collisionRadius = 0.0f,
+                             bool attachToDestructible = false) {
+    if (!g_impactDecalsEnabled) return;
+    const float lengthSq = normal.x * normal.x + normal.y * normal.y +
+                           normal.z * normal.z;
+    if (lengthSq < 1e-6f) return;   // no surface to project onto
+    const float inv = 1.0f / std::sqrt(lengthSq);
+    ImpactDecal decal;
+    // The swept-sphere collision reports the projectile centre when its radius
+    // first touches the inflated chunk bounds. Advance by that radius to reach
+    // the visible surface, then bias the decal volume slightly into it.
+    const float surfaceOffset = collisionRadius + 0.005f;
+    decal.position = { position.x - normal.x * inv * surfaceOffset,
+                       position.y - normal.y * inv * surfaceOffset,
+                       position.z - normal.z * inv * surfaceOffset };
+    decal.normal = { normal.x * inv, normal.y * inv, normal.z * inv };
+    decal.radius = radius;
+    decal.age = 0.0f;
+    if (attachToDestructible)
+        g_destruction.CaptureLastHitAttachment(
+            decal.position, decal.normal, decal.parent);
+    if (g_impactDecals.size() >= kMaxImpactDecals)
+        g_impactDecals.erase(g_impactDecals.begin());
+    g_impactDecals.push_back(decal);
+}
+
+// One place builds the GPU list; the forward path and the visibility resolve
+// both upload the same thing, so a mark never appears in one renderer only.
+std::vector<ImpactDecalDataDX12> BuildImpactDecalGPUList() {
+    std::vector<ImpactDecalDataDX12> out;
+    if (!g_impactDecalsEnabled) return out;
+    out.reserve(g_impactDecals.size());
+    for (const ImpactDecal& decal : g_impactDecals) {
+        const float life = decal.age / kImpactDecalLifetime;
+        const float strength = life < 0.75f
+            ? 1.0f : 1.0f - (life - 0.75f) / 0.25f;
+        if (strength <= 0.001f) continue;
+        ImpactDecalDataDX12 gpu;
+        gpu.position = decal.position;
+        gpu.radius = decal.radius;
+        gpu.normal = decal.normal;
+        gpu.strength = strength;
+        out.push_back(gpu);
+    }
+    return out;
+}
+
+static void UpdateImpactDecals(float dt) {
+    if (!g_impactDecalsEnabled) {
+        g_impactDecals.clear();
+        return;
+    }
+    for (ImpactDecal& decal : g_impactDecals) {
+        if (decal.parent.IsValid() &&
+            !g_destruction.ResolveAttachment(
+                decal.parent, decal.position, decal.normal)) {
+            // The owning chunk was removed (for example by a hard laser cut),
+            // so the mark leaves with it rather than hanging in mid-air.
+            decal.age = kImpactDecalLifetime;
+            continue;
+        }
+        if (!g_freezeDecalAging) decal.age += dt;
+    }
+    g_impactDecals.erase(
+        std::remove_if(g_impactDecals.begin(), g_impactDecals.end(),
+            [](const ImpactDecal& d) { return d.age >= kImpactDecalLifetime; }),
+        g_impactDecals.end());
+}
+
 GunAudio                    g_gunAudio;
 GunAudio                    g_rpgFireAudio;
 GunAudio                    g_reloadAudio;
@@ -1281,6 +1373,16 @@ static int g_selectedDeploymentZone = -1;
 static XMFLOAT3 g_deploymentTarget{};
 static bool g_deploymentTargetValid = false;
 static float g_deploymentFlythroughTime = 0.0f;
+
+static void CancelDeploymentPlanning() {
+    g_insertionChoicePending = false;
+    g_insertionChoiceCursorReleased = false;
+    g_deploymentZones.clear();
+    g_selectedDeploymentZone = -1;
+    g_deploymentTarget = {};
+    g_deploymentTargetValid = false;
+    g_deploymentFlythroughTime = 0.0f;
+}
 
 bool DeploymentPlanningActive() { return g_insertionChoicePending; }
 const std::vector<XMFLOAT3>& DeploymentZonePositions() {
@@ -4807,6 +4909,71 @@ void BanditDebugText() {
         }
     }
     ImGui::Checkbox("Show enemy vision cones", &g_showEnemyVisionCones);
+    if (ImGui::CollapsingHeader("Impact Holes")) {
+        if (ImGui::Checkbox("Enable bullet holes",
+                            &g_impactDecalsEnabled) &&
+            !g_impactDecalsEnabled) {
+            g_impactDecals.clear();
+            g_impactDecalCutouts = false;
+            g_showDecalDebug = false;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("cutout only; off by default");
+        ImGui::BeginDisabled(!g_impactDecalsEnabled);
+        ImGui::Text("Active: %d / %d", (int)g_impactDecals.size(),
+                    (int)kMaxImpactDecals);
+        // The buffer evicts oldest-first, so a full list means marks are being
+        // dropped -- worth seeing before wondering why an old one vanished.
+        if (g_impactDecals.size() >= kMaxImpactDecals)
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                               "Full: oldest marks are being evicted");
+        ImGui::Checkbox("Draw decal volumes", &g_showDecalDebug);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Green disc = the surface plane the shader tests against, "
+                "drawn in world space so orientation errors are visible. "
+                "Blue line = projection normal, at the 0.6 x radius depth "
+                "band. Amber = already fading.");
+        ImGui::Checkbox("Cut holes through surfaces", &g_impactDecalCutouts);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Experimental visual cutout. Removes primary visibility but "
+                "does not change collision or ray-tracing geometry.");
+        ImGui::Checkbox("Freeze aging", &g_freezeDecalAging);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Stops the 45 s lifetime so a mark can be walked around "
+                "and inspected without fading mid-investigation.");
+        if (ImGui::Button("Clear all holes")) g_impactDecals.clear();
+        ImGui::SameLine();
+        // Spawns one straight ahead: reproduces a mark without needing a
+        // weapon, ammo, or a surface the destruction system reports a hit on.
+        if (ImGui::Button("Spawn test hole")) {
+            const XMFLOAT3 origin = scene.camera.Position;
+            const XMFLOAT3 forward = scene.camera.Front;
+            const XMFLOAT3 spot{ origin.x + forward.x * 2.0f,
+                                 origin.y + forward.y * 2.0f,
+                                 origin.z + forward.z * 2.0f };
+            SpawnImpactDecal(spot,
+                             XMFLOAT3(-forward.x, -forward.y, -forward.z),
+                             0.12f);
+        }
+        if (!g_impactDecals.empty() &&
+            ImGui::TreeNode("Hole list")) {
+            int index = 0;
+            for (const ImpactDecal& decal : g_impactDecals) {
+                ImGui::Text("%2d  pos %.2f %.2f %.2f  n %.2f %.2f %.2f",
+                            index, decal.position.x, decal.position.y,
+                            decal.position.z, decal.normal.x, decal.normal.y,
+                            decal.normal.z);
+                ImGui::SameLine();
+                ImGui::TextDisabled("r%.3f  %.1fs", decal.radius, decal.age);
+                ++index;
+            }
+            ImGui::TreePop();
+        }
+        ImGui::EndDisabled();
+    }
     if (ImGui::CollapsingHeader("Enemy Scatter (test mode)")) {
         ImGui::Checkbox("Randomize enemies on navmesh",
                         &g_scatterEnemiesOnNavmesh);
@@ -5788,6 +5955,89 @@ static void DrawMarineFriendlyMarkers(CXMMATRIX view, CXMMATRIX projection) {
         };
         triangle(2.0f, IM_COL32(0, 0, 0, 255));
         triangle(0.0f, tint);
+    }
+}
+
+// Debug overlay for impact decals. They are a per-pixel volume test with no
+// geometry, so a mark that lands on the wrong face or the wrong size leaves
+// nothing to inspect in a capture. This draws what the shader is testing:
+// the disc in its own surface plane, the normal it was projected along, and
+// the depth band either side of that plane.
+static void DrawImpactDecalDebug(CXMMATRIX view, CXMMATRIX projection) {
+    if (!g_showDecalDebug || g_impactDecals.empty()) return;
+    const XMMATRIX viewProjection = view * projection;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    auto project = [&](const XMFLOAT3& world, ImVec2& out) -> bool {
+        const XMVECTOR clip =
+            XMVector3Transform(XMLoadFloat3(&world), viewProjection);
+        const float w = XMVectorGetW(clip);
+        if (w <= 0.01f) return false;
+        out.x = (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x;
+        out.y = (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y;
+        return true;
+    };
+
+    int index = 0;
+    for (const ImpactDecal& decal : g_impactDecals) {
+        const float life = decal.age / kImpactDecalLifetime;
+        const float strength = life < 0.75f
+            ? 1.0f : 1.0f - (life - 0.75f) / 0.25f;
+        // Green while at full strength, amber once it starts fading out, so a
+        // mark that vanished early is distinguishable from one that never
+        // spawned.
+        const ImU32 colour = strength > 0.999f
+            ? IM_COL32(90, 230, 120, 220)
+            : IM_COL32(245, 190, 60, 220);
+
+        const XMVECTOR n = XMLoadFloat3(&decal.normal);
+        // Any vector not parallel to the normal gives a basis for the disc.
+        XMVECTOR reference = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+        if (std::fabs(decal.normal.y) > 0.9f)
+            reference = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+        const XMVECTOR tangent =
+            XMVector3Normalize(XMVector3Cross(reference, n));
+        const XMVECTOR bitangent = XMVector3Cross(n, tangent);
+
+        // The disc itself, drawn in the surface plane rather than as a screen
+        // circle: a screen circle would hide exactly the orientation bugs this
+        // is meant to expose.
+        constexpr int kSegments = 20;
+        ImVec2 previous;
+        bool havePrevious = false;
+        bool anyVisible = false;
+        for (int i = 0; i <= kSegments; ++i) {
+            const float angle = (float)i / kSegments * XM_2PI;
+            const XMVECTOR offset = tangent * (std::cos(angle) * decal.radius) +
+                                    bitangent * (std::sin(angle) * decal.radius);
+            XMFLOAT3 point;
+            XMStoreFloat3(&point, XMLoadFloat3(&decal.position) + offset);
+            ImVec2 screen;
+            if (!project(point, screen)) { havePrevious = false; continue; }
+            if (havePrevious) draw->AddLine(previous, screen, colour, 1.5f);
+            previous = screen;
+            havePrevious = true;
+            anyVisible = true;
+        }
+        if (!anyVisible) { ++index; continue; }
+
+        // Normal, at the same 0.6 * radius the shader uses for its depth band,
+        // so the line length shows the volume a pixel has to fall inside.
+        const float band = decal.radius * 0.6f;
+        XMFLOAT3 tip;
+        XMStoreFloat3(&tip, XMLoadFloat3(&decal.position) + n * band);
+        ImVec2 centreScreen, tipScreen;
+        if (project(decal.position, centreScreen) && project(tip, tipScreen)) {
+            draw->AddLine(centreScreen, tipScreen,
+                          IM_COL32(120, 195, 255, 235), 2.0f);
+            draw->AddCircleFilled(tipScreen, 3.0f, IM_COL32(120, 195, 255, 235));
+            char label[48];
+            std::snprintf(label, sizeof(label), "%d  r%.3f  s%.2f",
+                          index, decal.radius, strength);
+            draw->AddText(ImVec2(centreScreen.x + 6.0f, centreScreen.y - 6.0f),
+                          colour, label);
+        }
+        ++index;
     }
 }
 
@@ -9239,6 +9489,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_trainingRangeMode = g_activeCustomLevelName == "Training Range";
     // Re-arm the callout so a restart of the range plays it again.
     g_plantC4Played = false;
+    g_impactDecals.clear();
     g_commTowerMusicSwell = false;
     g_plantC4TowerDelay = -1.0f;
     g_exfilHereDelay = -1.0f;
@@ -12211,6 +12462,10 @@ static void SynchronizeEditorRuntime(bool play) {
 static void StartLevelEditor(HWND hwnd) {
     g_levelEditor.NewFromLevelOne();
     StartLevelOne(hwnd, true);
+    // StartLevelOne opens the mission deployment planner. The editor has no
+    // deployment screen, so carrying that state across would keep its orbit
+    // camera and make ProcessInput reject every playtest movement command.
+    CancelDeploymentPlanning();
     g_game.session.SetScreen(GameScreen::LevelEditor);
     g_customLevelMode = true;
     g_game.world.ReplaceFromEditor(g_levelEditor.Level());
@@ -12229,6 +12484,9 @@ static void BeginEditorPlaytest(HWND hwnd) {
         g_levelEditor.IsPlaying()) return;
     g_editorCameraSnapshot = scene.camera;
     g_levelEditor.BeginPlay();
+    // A playtest always begins at the authored PlayerSpawn. Do not allow a
+    // stale mission-planning flag to take camera ownership or block input.
+    CancelDeploymentPlanning();
     g_game.world.Prefabs().ResetGameplayState();
     scene.ResetLevelRuntimeState();
     SynchronizeEditorRuntime(true);
@@ -16421,6 +16679,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     // One small dust puff right at the hit; the bigger cloud
                     // comes from the actual fracture (DrainBreakPoints).
                     scene.SpawnSmokeBurst(hit, 0.3f, 0.1f);
+                    // The mark the puff used to stand in for. Small and varied
+                    // so a burst into one wall does not read as a row of
+                    // identical discs.
+                    SpawnImpactDecal(hit, normal,
+                                     0.05f + RandomUnit() * 0.035f,
+                                     bulletRadius,
+                                     /*attachToDestructible=*/true);
+                    // A wisp curling out of the fresh hole. Separate from the
+                    // dust puff above: that fires once at the impact, this
+                    // keeps the mark alive for a beat afterwards.
+                    scene.SpawnBulletHoleSmoke(hit, normal, 1.0f);
                     if (projectile.laser) {
                         scene.StopLaserBeamAt(hit);
                         scene.SpawnSmokeBurst(hit, 0.46f, 0.22f);
@@ -16741,6 +17010,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
             g_destruction.SetAdaptiveQualityCeiling(ceiling);
         }
+        // Resolve decal parents after physics and projectile hits so their
+        // world-space volumes use the same pose the chunk renders with.
+        UpdateImpactDecals(deltaTime);
+        visBuffer.SetImpactDecals(BuildImpactDecalGPUList(),
+                                  g_impactDecalsEnabled &&
+                                      g_impactDecalCutouts);
         g_profiler.BeginGpuFrame(g_dx12.frameIndex, g_dx12.commandList.Get());
 
         float cc[4] = { scene.clearColor.x, scene.clearColor.y, scene.clearColor.z, 1.0f };
@@ -18126,6 +18401,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 DrawEscapeBoatMarker(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawMarineFriendlyMarkers(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
+                DrawImpactDecalDebug(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());
                 DrawWeaponPickupPrompt(
                     scene.GetViewMatrix(), scene.GetProjectionMatrix());

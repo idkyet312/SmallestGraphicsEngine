@@ -45,6 +45,16 @@ struct DestructionDebrisHazard {
     bool lethalImpact = false;
 };
 
+// Stable attachment to authored chunk/model space. Blast may replace the
+// owning actor and Box3D body when bonds split, but the chunk index survives.
+struct DestructionChunkAttachment {
+    uint32_t chunkIndex = UINT32_MAX;
+    DirectX::XMFLOAT3 modelPosition = {};
+    DirectX::XMFLOAT3 modelNormal = { 0.0f, 1.0f, 0.0f };
+
+    bool IsValid() const { return chunkIndex != UINT32_MAX; }
+};
+
 struct TinyDebrisParticle {
     DirectX::XMFLOAT3 position = {};
     DirectX::XMFLOAT3 velocity = {};
@@ -212,6 +222,16 @@ public:
     // caller routes the damage to the owning prefab's health instead, so the
     // structure only comes apart once that health is spent.
     bool IsProtectedChunkAt(const DirectX::XMFLOAT3& worldPosition) const;
+    // Captures a point against the chunk selected by the most recent segment
+    // hit, then resolves it through whichever actor owns that chunk later.
+    bool CaptureLastHitAttachment(
+        const DirectX::XMFLOAT3& worldPosition,
+        const DirectX::XMFLOAT3& worldNormal,
+        DestructionChunkAttachment& attachment) const;
+    bool ResolveAttachment(
+        const DestructionChunkAttachment& attachment,
+        DirectX::XMFLOAT3& worldPosition,
+        DirectX::XMFLOAT3& worldNormal) const;
     // `sparesProtected` marks the damage as indirect (spreading fire, debris
     // impact), which leaves ProtectedChunkMarker geometry untouched. A direct
     // player hit leaves it false so the player can still cut those chunks.

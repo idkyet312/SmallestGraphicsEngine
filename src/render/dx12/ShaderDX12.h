@@ -111,6 +111,24 @@ struct alignas(256) PointLightsBufferDX12 {
     PointLightDataDX12 lights[64];
 };
 
+// Projected impact decal: bullet holes and scorch marks stamped onto whatever
+// the round hit. Oriented by the surface normal, so the projection is a disc in
+// the surface plane rather than an axis-aligned box.
+struct ImpactDecalDataDX12 {
+    XMFLOAT3 position;
+    float radius;
+    XMFLOAT3 normal;
+    // 0..1. Fades the cutout near the end of its lifetime.
+    float strength;
+};
+
+struct alignas(256) ImpactDecalsBufferDX12 {
+    int numDecals;
+    float cutoutsEnabled;
+    XMFLOAT2 decalPadding;
+    ImpactDecalDataDX12 decals[64];
+};
+
 struct alignas(256) DDGIBufferDX12 {
     XMFLOAT3 probeGridOrigin;
     float probeSpacing;
@@ -328,6 +346,7 @@ public:
     UploadBuffer<LightBufferDX12> lightBuffer;
     UploadBuffer<CameraBufferDX12> cameraBuffer;
     UploadBuffer<PointLightsBufferDX12> pointLightsBuffer;
+    UploadBuffer<ImpactDecalsBufferDX12> impactDecalsBuffer;
     UploadBuffer<DDGIBufferDX12> ddgiBuffer;
     UploadBuffer<SHBufferDX12> shBuffer;
     UploadBuffer<ShadowCascadeBufferDX12> shadowCascadeBuffer;
@@ -520,7 +539,7 @@ public:
         // 6: Descriptor table - Global SRVs (t0, t2, t3)
         // 7: Descriptor table - Material SRVs (t1, t4, t5)
         
-        D3D12_ROOT_PARAMETER rootParams[22] = {};
+        D3D12_ROOT_PARAMETER rootParams[23] = {};
         
         // CBVs (root descriptors)
         for (int i = 0; i < 6; i++) {
@@ -685,6 +704,13 @@ public:
         rootParams[21].Constants.Num32BitValues = 1;
         rootParams[21].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+        // Impact decals (b10). A CBV rather than 32-bit constants: the list is
+        // up to 64 entries and is rewritten whenever one is spawned or ages out.
+        rootParams[22].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        rootParams[22].Descriptor.ShaderRegister = 10;
+        rootParams[22].Descriptor.RegisterSpace = 0;
+        rootParams[22].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
         // Static samplers
         D3D12_STATIC_SAMPLER_DESC staticSamplers[2] = {};
         
@@ -716,7 +742,10 @@ public:
         staticSamplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-        rootSigDesc.NumParameters = 22;
+        // Keep the parameter layout identical for legacy and bindless. The
+        // legacy shader never reads b10, but retaining the inert slot prevents
+        // material-path switches from changing every later root argument.
+        rootSigDesc.NumParameters = 23;
         rootSigDesc.pParameters = rootParams;
         rootSigDesc.NumStaticSamplers = 2;
         rootSigDesc.pStaticSamplers = staticSamplers;
@@ -1131,6 +1160,7 @@ public:
         if (!lightBuffer.Create(FRAME_COUNT)) return false;
         if (!cameraBuffer.Create(FRAME_COUNT)) return false;
         if (!pointLightsBuffer.Create(FRAME_COUNT)) return false;
+        if (!impactDecalsBuffer.Create(FRAME_COUNT)) return false;
         if (!ddgiBuffer.Create(FRAME_COUNT)) return false;
         if (!shBuffer.Create(FRAME_COUNT)) return false;
         if (!shadowCascadeBuffer.Create(FRAME_COUNT)) return false;
@@ -1338,6 +1368,10 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(g_dx12.frameIndex));
         g_dx12.commandList->SetGraphicsRootConstantBufferView(20,
             shadowCascadeBuffer.GetGPUAddress(g_dx12.frameIndex));
+        // b10 exists in both layouts. It remains inert in legacy shaders and
+        // is consumed only by the bindless cutout variants.
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(
+            22, impactDecalsBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
 
     // Toggles GPU skinning for the conventional IA vertex shader (b9). Every IA
@@ -1871,6 +1905,16 @@ public:
         g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
     
+    void SetImpactDecals(const std::vector<ImpactDecalDataDX12>& decals,
+                         bool cutoutsEnabled) {
+        ImpactDecalsBufferDX12 data = {};
+        const int count = (int)((decals.size() < 64) ? decals.size() : 64);
+        data.numDecals = count;
+        data.cutoutsEnabled = cutoutsEnabled ? 1.0f : 0.0f;
+        for (int i = 0; i < count; ++i) data.decals[i] = decals[i];
+        impactDecalsBuffer.CopyData(g_dx12.frameIndex, data);
+    }
+
     void SetDDGI(bool enabled, float gi_intensity, float normal_bias,
                  float probe_spacing, UINT sparseProbeCount = 0,
                  UINT sparseCellCount = 0, float sparseCellSize = 0.0f) {

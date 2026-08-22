@@ -46,6 +46,10 @@ int main(int argc, char** argv) {
         sourceDir + "/shaders/visbuf_post_cs.hlsl";
     const std::string cullShaderPath =
         sourceDir + "/shaders/visibility_cull_cs.hlsl";
+    const std::string visVertexShaderPath =
+        sourceDir + "/shaders/visbuf_vs.hlsl";
+    const std::string visPixelShaderPath =
+        sourceDir + "/shaders/visbuf_ps.hlsl";
     const std::string goldenPath =
         sourceDir + "/tests/golden/visbuf_resolve_cs.fxc.size";
 
@@ -194,6 +198,63 @@ int main(int argc, char** argv) {
     checkCullBinding("previousDepth", D3D_SIT_TEXTURE, 1u);
     checkCullBinding("visibleCommands", D3D_SIT_UAV_RWBYTEADDRESS, 0u);
     checkCullBinding("visibleCount", D3D_SIT_UAV_RWBYTEADDRESS, 1u);
+
+    // Primary visibility shaders are also runtime FXC inputs. Decals are
+    // bindless-only, so the legacy entries must compile without reading the
+    // inert b10 compatibility slot shared by both root layouts.
+    auto readShader = [](const std::string& path, std::string& source) {
+        std::ifstream file(path);
+        if (!file.is_open()) return false;
+        std::stringstream stream;
+        stream << file.rdbuf();
+        source = stream.str();
+        return true;
+    };
+    std::string visVertexCode;
+    std::string visPixelCode;
+    CHECK(readShader(visVertexShaderPath, visVertexCode));
+    CHECK(readShader(visPixelShaderPath, visPixelCode));
+
+    ComPtr<ID3DBlob> visVertexBlob;
+    errors.Reset();
+    const HRESULT visVertexHr = D3DCompile(
+        visVertexCode.c_str(), visVertexCode.size(), visVertexShaderPath.c_str(),
+        nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "vs_5_0",
+        compileFlags, 0, &visVertexBlob, &errors);
+    if (FAILED(visVertexHr)) {
+        std::cerr << "Visibility vertex shader failed to compile: "
+                  << (errors ? (const char*)errors->GetBufferPointer()
+                             : "unknown") << "\n";
+        return 1;
+    }
+
+    for (const char* entry : { "main", "mainAlpha" }) {
+        ComPtr<ID3DBlob> visPixelBlob;
+        errors.Reset();
+        const HRESULT visPixelHr = D3DCompile(
+            visPixelCode.c_str(), visPixelCode.size(),
+            visPixelShaderPath.c_str(), nullptr,
+            D3D_COMPILE_STANDARD_FILE_INCLUDE, entry, "ps_5_0", compileFlags,
+            0, &visPixelBlob, &errors);
+        if (FAILED(visPixelHr)) {
+            std::cerr << "Visibility pixel shader " << entry
+                      << " failed to compile: "
+                      << (errors ? (const char*)errors->GetBufferPointer()
+                                 : "unknown") << "\n";
+            return 1;
+        }
+
+        ComPtr<ID3D11ShaderReflection> visPixelReflection;
+        CHECK(SUCCEEDED(D3DReflect(
+            visPixelBlob->GetBufferPointer(), visPixelBlob->GetBufferSize(),
+            __uuidof(ID3D11ShaderReflection),
+            reinterpret_cast<void**>(visPixelReflection.GetAddressOf()))));
+        if (visPixelReflection) {
+            D3D11_SHADER_INPUT_BIND_DESC decalsBinding = {};
+            CHECK(FAILED(visPixelReflection->GetResourceBindingDescByName(
+                "ImpactDecalsBuffer", &decalsBinding)));
+        }
+    }
 
     // The golden file stores the DXBC itself, so this catches a change that
     // happens to preserve the length -- reordered arithmetic usually does.
