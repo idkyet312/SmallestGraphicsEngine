@@ -26,7 +26,7 @@ public:
         float tileSize = 8.0f;
         float heightScale = 3.057f;
         // Distance at which tessellation starts dropping. Must sit past the
-        // half-span of ring 0 (G/2 * tileSize = 24 m at the 12-tile/4 m clipmap
+        // half-span of ring 0 (G/2 * tileSize = 10 m at the 20-tile/1 m clipmap
         // default) or the finest ring is already coarsening before the next ring
         // takes over, which reads as detail vanishing a few metres from the
         // camera.

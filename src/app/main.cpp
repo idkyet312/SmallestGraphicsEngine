@@ -752,25 +752,27 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
             (std::min)(scene.terrainIslandScaleX, 12.0f));
         params.islandScaleZ = (std::max)(0.5f,
             (std::min)(scene.terrainIslandScaleZ, 12.0f));
-        // 4 m base tiles at the mesh shader's 8 quads per side = 0.5 m per
-        // vertex in ring 0, twice the old 8 m/1 m sampling. Authored heightmap
-        // stamps carry detail far finer than 1 m, and at 1 vert/m the terrain
-        // simply could not represent it -- ridges came out as blobs.
+        // 1 m base tiles at the mesh shader's 8 quads per side = 0.125 m per
+        // vertex in ring 0. Authored heightmap stamps carry detail far finer
+        // than the terrain could represent at 0.5 m, so stamped ridges still
+        // came out rounded no matter how large the stamp atlas got.
         //
         // n cannot go the other way instead: 8 quads per side is already 192
         // primitives, and D3D12 caps mesh shader output at 256 per group, so
         // the density has to come from smaller tiles rather than denser ones.
-        params.tileSize = 4.0f;                 // base ring tile size (full detail)
-        // G stays at 12. Ring 0 now covers 12/2 * 4 = 24 m at 0.5 m/vertex and
-        // ring 1 covers out to 48 m at 8 m tiles -- which is exactly the old
-        // ring 0. So near detail doubles inside 24 m and nothing beyond it gets
-        // worse; the ring loop below just adds one ring to reach the shore
-        // (432 -> 576 tiles on a 1x island).
         //
-        // Raising G to 24 to keep ring 0 at a 48 m half-span was the obvious
-        // move and the wrong one: ring cost is G^2, so it quadrupled the tile
-        // count (432 -> 1728) to buy detail at 40 m that nobody looks at.
-        constexpr UINT kRingGrid = 12u;         // G: tiles per side of each ring
+        // Shrinking the base tile also shrinks every ring, so the loop below
+        // adds two rings to still reach the shore -- 1200 -> 2000 tiles (1.7x).
+        // Resolution is better or equal at EVERY distance, never worse: 0.125 m
+        // inside 10 m, and by 40 m the rings have doubled back to the same
+        // 0.5 m the old ring 0 gave at point-blank range.
+        params.tileSize = 1.0f;                 // base ring tile size (full detail)
+        // G=20 puts ring 0's half-span at 10 m of 0.125 m/vertex ground, with
+        // each outer ring doubling the tile size from there. The clipmap hole
+        // occupies the middle half of every outer ring, so G must stay
+        // divisible by four -- raising G is also the expensive lever, since
+        // ring cost is G^2 while adding a ring is only linear.
+        constexpr UINT kRingGrid = 20u;         // G: tiles per side of each ring
         params.tilesX = kRingGrid;
         // Enough rings so the outermost reaches past the island shore. Ring r
         // half-span = G/2 * base * 2^r. Need it to cover kShoreOuter*scale + margin.
