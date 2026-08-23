@@ -632,7 +632,24 @@ public:
             terrainShader->Use(false);
             terrainShader->SetMatrices(XMMatrixIdentity(), XMMatrixIdentity(),
                                        lightSpace, lightSpace);
-            g_terrain.DrawShadow(*terrainShader, CurrentTerrainParams());
+            TerrainRendererDX12::Params shadowParams = CurrentTerrainParams();
+            // Spot casters only. This pass never rebinds viewPos to the lamp,
+            // so an unpinned clipmap would centre its tiling on the player and
+            // shift the terrain in the shadow map every time the camera crossed
+            // a snap cell -- the beam's shadow changing as the player moved.
+            // The sun cascades keep the camera-centred origin: they cover the
+            // whole view, so their tiling has to follow it.
+            //
+            // Gated on IsClipmap: the uniform-grid path has no snap origin to
+            // pin, and terrain_ms.hlsl tests `terrainStyle == 1` by equality
+            // for the stress island's warped coast. Setting the bit on that
+            // path (style 1 -> 9) would fail that test and drop the coastline
+            // from the shadow map while the forward pass still drew it.
+            if (spotCull &&
+                TerrainRendererDX12::IsClipmap(shadowParams.terrainStyle))
+                shadowParams.terrainStyle |=
+                    TerrainRendererDX12::kStylePinnedClipmapOrigin;
+            g_terrain.DrawShadow(*terrainShader, shadowParams);
         }
         depthShader.Use();
 

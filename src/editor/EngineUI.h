@@ -1525,6 +1525,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                         local.x, local.z, local.y);
             ImGui::Text("  world: %.2f, %.2f, %.2f", ride.x, ride.y, ride.z);
         }
+        ImGui::Checkbox("Single Humvee Headlight", &scene.singleHumveeHeadlight);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "On: one centre-line lamp (default).\n"
+                "Off: the original left/right pair, which share one"
+                " shadow frustum and cost an extra light each.");
         ImGui::Checkbox("Enable Shadows", &scene.enableShadows);
         if (scene.enableShadows) {
             ImGui::DragFloat("Shadow Bias", &scene.shadowBias, 0.0005f, 0.0f, 0.05f, "%.4f");

@@ -241,7 +241,8 @@ DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
 // vehicle -- switched on at noon they wash out the paintwork and light nothing.
 extern TimeOfDay g_selectedTimeOfDay;
 
-// Headlights for one Humvee, as a pair of forward spotlights.
+// Headlights for one Humvee: a single centre-line spotlight by default, or the
+// original left/right pair when Scene::singleHumveeHeadlight is off.
 //
 // The vehicle's world matrix already carries where it sits and which way it
 // faces, so the lamps come straight off its basis rather than a second set of
@@ -253,57 +254,71 @@ extern TimeOfDay g_selectedTimeOfDay;
 // Returns how many lights were appended, so the caller can pop exactly that
 // many back off at the end of the frame.
 inline int AddHumveeHeadlights(Scene& scene, const DirectX::XMMATRIX& body) {
-    if (scene.clusteredRenderer.lights.size() + 2 > 64) return 0;
+    const bool singleLamp = scene.singleHumveeHeadlight;
+    const int lampCount = singleLamp ? 1 : 2;
+    if (scene.clusteredRenderer.lights.size() + lampCount > 64) return 0;
     const XMVECTOR right = XMVector3Normalize(body.r[0]);
     const XMVECTOR forward = XMVector3Normalize(body.r[2]);
     const XMVECTOR origin = body.r[3];
-    // One frustum for both lamps. They sit 1.56 m apart on a shared forward
-    // axis, so a single wider cone from the centre line reproduces the
-    // occlusion either would compute alone -- at half the depth passes. Only
-    // the shadow lookup is shared; the lamps stay separate lights, so the pair
-    // of pools still reads as two beams.
-    int shadowIndex = SPOT_SHADOW_NONE;
-    if (g_spotShadowCasters.size() < SPOT_SHADOW_COUNT) {
-        const XMVECTOR headlightHeight = XMVectorSet(0.0f, 1.05f, 0.0f, 0.0f);
-        const XMVECTOR aim = XMVector3Normalize(
-            XMVectorAdd(forward, XMVectorSet(0.0f, -0.18f, 0.0f, 0.0f)));
-        // Pulled back behind the bumper so the frustum's near plane clears the
-        // vehicle's own nose: started at the lamp, the Humvee body sits inside
-        // the near plane and punches a hole in its own beam.
-        const XMVECTOR shadowOrigin = XMVectorAdd(
-            XMVectorAdd(origin, headlightHeight),
-            XMVectorScale(forward, 1.2f));
-        // 40 degrees against the lamps' 34: wide enough to cover both cones
-        // plus the lateral offset of the outer lamp from this centre origin.
-        shadowIndex = static_cast<int>(g_spotShadowCasters.size());
-        g_spotShadowCasters.push_back(
-            MakeSpotShadowCaster(shadowOrigin, aim, 40.0f, 38.0f));
-    }
-    // Lamp height and track width off the model's own floor position.
-    const XMVECTOR headlightHeight = XMVectorSet(0.0f, 1.05f, 0.0f, 0.0f);
+    // Lamp placement comes from the humvee model's measured bounds.
+    // ConfigureHumveeBounds normalises the longest horizontal axis to 4.8 m and
+    // puts the model floor at y=0, so in the vehicle's own basis the body spans
+    // 2.40 m forward of centre, 1.92 m to each side, and 0 -> 1.05 m in height.
+    //
+    // Everything here must sit OUTSIDE that box. Anything inside it is
+    // embedded in the bodywork: the shadow frustum then starts within solid
+    // geometry and the vehicle occludes its own beam, which reads as the
+    // headlight cutting out.
+    const XMVECTOR lampHeight = XMVectorSet(0.0f, 0.75f, 0.0f, 0.0f);
     // Aimed slightly down: level beams throw the hotspot at the horizon and
     // leave the road right in front of the bumper dark.
     const XMVECTOR aim = XMVector3Normalize(
         XMVectorAdd(forward, XMVectorSet(0.0f, -0.18f, 0.0f, 0.0f)));
+    // 2.9 m clears the 2.40 m nose by half a metre, so the near plane opens in
+    // free air ahead of the bumper. The previous value put both the lamp
+    // (2.35 m) and the frustum origin (1.20 m) inside the body.
+    const XMVECTOR lamp = XMVectorAdd(
+        XMVectorAdd(origin, lampHeight),
+        XMVectorScale(forward, 2.9f));
+
+    int shadowIndex = SPOT_SHADOW_NONE;
+    if (g_spotShadowCasters.size() < SPOT_SHADOW_COUNT) {
+        // One frustum either way, from the centre line. With a single lamp it
+        // shares the light's exact origin, so the shadow sees precisely what
+        // the beam lights and 30 degrees covers the 26-degree cone with margin.
+        // The pair straddles that origin, so it needs the wider 40 to take in
+        // the outer lamp's lateral offset as well.
+        shadowIndex = static_cast<int>(g_spotShadowCasters.size());
+        g_spotShadowCasters.push_back(MakeSpotShadowCaster(
+            lamp, aim, singleLamp ? 30.0f : 40.0f, 38.0f));
+    }
+    // Default is the single centre-line lamp: the pair shared this one shadow
+    // frustum anyway, so the second light only added an overlapping pool and
+    // another entry in the 64-light budget. Scene::singleHumveeHeadlight (UI:
+    // "Single Humvee Headlight") switches back to the original pair.
     int added = 0;
-    for (int side = -1; side <= 1; side += 2) {
-        const XMVECTOR lamp = XMVectorAdd(
-            XMVectorAdd(origin, headlightHeight),
-            XMVectorAdd(XMVectorScale(right, 0.78f * static_cast<float>(side)),
-                        XMVectorScale(forward, 2.35f)));
+    for (int i = 0; i < lampCount; ++i) {
+        // Single lamp sits on the centre line; the pair straddles it by the
+        // model's own track half-width.
+        const float side = singleLamp ? 0.0f : (i == 0 ? -0.78f : 0.78f);
+        const XMVECTOR lampPosition = XMVectorAdd(
+            lamp, XMVectorScale(right, side));
         PointLightDX12 headlight;
-        XMStoreFloat3(&headlight.position, lamp);
+        XMStoreFloat3(&headlight.position, lampPosition);
         XMStoreFloat3(&headlight.spotDirection, aim);
         headlight.radius = 34.0f;
         // Colder than the torch: sealed-beam headlamps read blue-white next to
         // a filament hand light.
         headlight.color = XMFLOAT3(0.92f, 0.95f, 1.0f);
-        headlight.intensity = 3.0f;
-        // Wider than the flashlight, and a broader soft edge, so the two pools
-        // overlap into one spread instead of two separate discs.
-        headlight.spotCosInner = std::cos(XMConvertToRadians(19.0f));
-        headlight.spotCosOuter = std::cos(XMConvertToRadians(34.0f));
-        // Both lamps read the same slice; see the caster comment above.
+        // One lamp carries the throw the two used to split between them.
+        headlight.intensity = singleLamp ? 4.5f : 3.0f;
+        // The pair needs the broader soft edge so its two offset discs blend
+        // into one spread; a single cone does not.
+        headlight.spotCosInner = std::cos(
+            XMConvertToRadians(singleLamp ? 15.0f : 19.0f));
+        headlight.spotCosOuter = std::cos(
+            XMConvertToRadians(singleLamp ? 26.0f : 34.0f));
+        // Every lamp reads the same slice; see the caster comment above.
         headlight.spotShadowIndex = shadowIndex;
         scene.clusteredRenderer.lights.push_back(headlight);
         ++added;
@@ -334,14 +349,70 @@ inline void RemoveVehicleHeadlights(Scene& scene, int added) {
 DirectX::XMMATRIX HelicopterWorldMatrix();
 DirectX::XMMATRIX SecondaryHelicopterWorldMatrix();
 bool SecondaryHelicopterVisible();
-DirectX::XMFLOAT3 PrimaryHelicopterWeaponAimPoint();
-DirectX::XMFLOAT3 SecondaryHelicopterWeaponAimPoint();
+// Destroyed, as opposed to not drawn: a downed gunship keeps being rendered
+// through its fall and as a wreck afterwards, so the *Visible tests stay true.
+bool PrimaryHelicopterDestroyed();
+bool SecondaryHelicopterDestroyed();
+
+struct HelicopterSearchlightTracking {
+    DirectX::XMFLOAT3 direction = DirectX::XMFLOAT3(0.0f, 0.0f, 0.0f);
+    bool initialized = false;
+};
+
+inline HelicopterSearchlightTracking g_primarySearchlightTracking;
+inline HelicopterSearchlightTracking g_secondarySearchlightTracking;
+
+// Keeps the beam readable as a sweep instead of snapping onto every change in
+// player position. The angular cap also stops a frame hitch from jumping the
+// shadow frustum across the world in one update.
+inline DirectX::XMVECTOR TrackSearchlightDirection(
+        HelicopterSearchlightTracking& tracking,
+        DirectX::FXMVECTOR desiredDirection, float deltaTime) {
+    using namespace DirectX;
+    const XMVECTOR desired = XMVector3Normalize(desiredDirection);
+    if (!tracking.initialized ||
+        XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&tracking.direction))) <
+            1e-5f) {
+        XMStoreFloat3(&tracking.direction, desired);
+        tracking.initialized = true;
+        return desired;
+    }
+
+    const XMVECTOR current = XMVector3Normalize(
+        XMLoadFloat3(&tracking.direction));
+    const float dot = (std::max)(-1.0f, (std::min)(1.0f,
+        XMVectorGetX(XMVector3Dot(current, desired))));
+    const float angle = std::acos(dot);
+    constexpr float kTurnRateRadians = XM_PI / 10.0f; // 18 degrees/second.
+    const float step = (std::min)(
+        angle, kTurnRateRadians * (std::max)(0.0f, (std::min)(deltaTime, 0.1f)));
+    if (angle <= 1e-5f || step >= angle) {
+        XMStoreFloat3(&tracking.direction, desired);
+        return desired;
+    }
+
+    XMVECTOR tangent = XMVectorSubtract(
+        desired, XMVectorScale(current, dot));
+    if (XMVectorGetX(XMVector3LengthSq(tangent)) < 1e-5f) {
+        tangent = XMVector3Cross(XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f),
+                                 current);
+        if (XMVectorGetX(XMVector3LengthSq(tangent)) < 1e-5f)
+            tangent = XMVector3Cross(
+                XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f), current);
+    }
+    tangent = XMVector3Normalize(tangent);
+    const XMVECTOR tracked = XMVector3Normalize(XMVectorAdd(
+        XMVectorScale(current, std::cos(step)),
+        XMVectorScale(tangent, std::sin(step))));
+    XMStoreFloat3(&tracking.direction, tracked);
+    return tracked;
+}
 
 // Searchlight slung under one enemy helicopter.
 //
-// Mounted from the airframe basis, then aimed at the same velocity-led point as
-// the gun. The mounting therefore banks with the helicopter while the beam and
-// projectile stream converge on the same place in world space.
+// Mounted from the airframe basis, then turned slowly toward the player. The
+// gun keeps its velocity lead independently: coupling the two made the whole
+// volumetric shaft snap whenever the weapon aim changed.
 //
 // Casts, unlike the player's flashlight: it shines DOWN from above, so without
 // an occlusion term the cone pours straight through rooftops and lights
@@ -352,31 +423,73 @@ DirectX::XMFLOAT3 SecondaryHelicopterWeaponAimPoint();
 // ground is the player's cue that a gunship is overhead and where it is
 // looking. Deliberately not a detection mechanic -- being caught in the beam
 // costs nothing on its own, so it stays a telegraph rather than a punishment.
-inline int AddHelicopterSearchlight(Scene& scene, const DirectX::XMMATRIX& body,
-                                    const DirectX::XMFLOAT3& weaponAimPoint) {
+inline int AddHelicopterSearchlight(
+        Scene& scene, const DirectX::XMMATRIX& body,
+        HelicopterSearchlightTracking& tracking, float deltaTime) {
     if (scene.clusteredRenderer.lights.size() >= 64) return 0;
 
     const XMVECTOR forward = XMVector3Normalize(body.r[2]);
     const XMVECTOR up = XMVector3Normalize(body.r[1]);
     const XMVECTOR origin = body.r[3];
 
-    // Under the nose: forward of the cabin and below the belly, so the lamp
-    // clears its own airframe rather than lighting the fuselage it is bolted
-    // to. Both offsets follow the aircraft basis, so they stay put as it banks.
+    // Ahead of the nose and clear of the belly, so the lamp lights the ground
+    // rather than the fuselage it is bolted to. Both offsets follow the
+    // aircraft basis, so they stay put as it banks.
+    //
+    // The numbers come from the OH-1's measured bounds. ConfigureHelicopterBounds
+    // normalises the longest horizontal axis to 10 m about the model centre, which
+    // puts the nose 5.0 m along forward and the belly skin at -0.85 m on up. A lamp
+    // inside those bounds sits in solid geometry: the shadow frustum then starts
+    // within the hull, the hull occludes its own beam, and the cone reads as dead
+    // from below -- the helicopter blocking its own light.
+    //
+    // 5.6 m clears the 5.0 m nose by 0.6 m; 1.35 m clears the -0.85 m belly by
+    // 0.5 m. Keep both offsets outside those extents if the airframe is ever
+    // swapped or rescaled.
     const XMVECTOR lamp = XMVectorAdd(
         origin,
-        XMVectorAdd(XMVectorScale(forward, 2.6f),
-                    XMVectorScale(up, -0.85f)));
-    // Converge on the gun's velocity-led target rather than following a fixed
-    // downward tilt. The projectile muzzle is slightly forward of this lamp,
-    // but sharing its world-space aim point makes the beam show where the burst
-    // will land. Do not copy the per-round random spread: that would shake the
-    // whole volumetric shaft at ten hertz.
+        XMVectorAdd(XMVectorScale(forward, 5.6f),
+                    XMVectorScale(up, -1.35f)));
+    // Track the player directly rather than inheriting the gun's velocity lead.
+    // This keeps the searchlight readable as a deliberate sweep while the
+    // projectiles remain free to lead a running target.
     XMVECTOR aimVector = XMVectorSubtract(
-        XMLoadFloat3(&weaponAimPoint), lamp);
+        XMLoadFloat3(&scene.camera.Position), lamp);
     if (XMVectorGetX(XMVector3LengthSq(aimVector)) < 1e-5f)
         aimVector = forward;
-    const XMVECTOR aim = XMVector3Normalize(aimVector);
+    const XMVECTOR aim = TrackSearchlightDirection(
+        tracking, aimVector, deltaTime);
+
+    // Reach 10 m past the player rather than stopping short of them.
+    //
+    // The radius alone never did this. Attenuation is
+    //   1 / (1 + (4.5/R) d + (75/R^2) d^2)
+    // falling off inside a smoothstep cutoff over [0.75R, R], so at the fixed
+    // R = 110 the quadratic term had already taken the beam to 23% of full at
+    // 20 m and 5% at 50 m: the light "ended" tens of metres before its radius.
+    // Shrinking R to (distance + 10) makes that worse, not better -- the
+    // quadratic scales as 75/R^2, so a tighter radius is a steeper curve.
+    //
+    // So keep R generous enough that the 0.75R cutoff never reaches the player
+    // (110 m covers the 90 m engagement range; the max() only matters if the
+    // gunship is ever flown further out), and compensate the falloff with
+    // intensity instead. kSearchlightAtPlayer is what the beam used to deliver
+    // directly overhead, so the pool looks unchanged there and simply stops
+    // dimming as the helicopter pulls away.
+    const float lampToPlayer = XMVectorGetX(XMVector3Length(
+        XMVectorSubtract(XMLoadFloat3(&scene.camera.Position), lamp)));
+    // +10: the beam carries past the player, not up to them.
+    const float radius = (std::max)(110.0f, lampToPlayer + 10.0f);
+    const float falloff = 1.0f /
+        (1.0f + (4.5f / radius) * lampToPlayer +
+         (75.0f / (radius * radius)) * lampToPlayer * lampToPlayer);
+    // Matches the delivered brightness of the old 5.5 at hover height.
+    constexpr float kSearchlightAtPlayer = 2.2f;
+    // Floor at the original 5.5 so a close pass is never dimmer than before;
+    // ceiling because full compensation at 90 m wants ~158, which would blow
+    // out the volumetric shaft and sear anything the beam crossed on the way.
+    const float compensated = (std::min)((std::max)(
+        kSearchlightAtPlayer / (std::max)(falloff, 1e-4f), 5.5f), 28.0f);
 
     int shadowIndex = SPOT_SHADOW_NONE;
     if (g_spotShadowCasters.size() < SPOT_SHADOW_COUNT) {
@@ -387,19 +500,22 @@ inline int AddHelicopterSearchlight(Scene& scene, const DirectX::XMMATRIX& body,
         // which is what makes the shadows inside the pool coarse.
         //
         // Longer throw than a headlight: it works from hover height, so the
-        // ground it lights is tens of metres below the lamp.
-        g_spotShadowCasters.push_back(
-            MakeSpotShadowCaster(lamp, aim, 15.0f, 120.0f));
+        // ground it lights is tens of metres below the lamp. The far plane
+        // tracks the light's own radius (plus margin) so geometry between the
+        // lamp and the far end of the beam still casts once the reach grows
+        // past the old fixed 120 m.
+        g_spotShadowCasters.push_back(MakeSpotShadowCaster(
+            lamp, aim, 15.0f, (std::max)(120.0f, radius + 10.0f)));
     }
 
     PointLightDX12 searchlight;
     XMStoreFloat3(&searchlight.position, lamp);
     XMStoreFloat3(&searchlight.spotDirection, aim);
-    searchlight.radius = 110.0f;
+    searchlight.radius = radius;
     // Bright and slightly cool, like a xenon searchlight rather than the
     // Humvee's sealed beams.
     searchlight.color = XMFLOAT3(0.88f, 0.93f, 1.0f);
-    searchlight.intensity = 5.5f;
+    searchlight.intensity = compensated;
     // Much tighter than the headlights: a searchlight is a defined disc of
     // light tracking across the ground, not a wash. Narrow enough that from
     // under it the pool reads as a searched spot rather than general
@@ -418,17 +534,43 @@ inline int AddHelicopterSearchlight(Scene& scene, const DirectX::XMMATRIX& body,
 //
 // Mirrors the draw conditions in RenderForward, so an aircraft that is not on
 // the map does not light the ground under where it would have been.
-inline int AddEnemyHelicopterSearchlights(Scene& scene) {
-    if (!TimeOfDayIsDark(g_selectedTimeOfDay)) return 0;
-    if (g_emptyLevelMode) return 0;
+inline int AddEnemyHelicopterSearchlights(Scene& scene, float deltaTime) {
+    // SGE_NO_HELI_SEARCHLIGHT=1 takes the helicopters out of the spot-shadow
+    // budget entirely, leaving the Humvee headlights as the only claimants.
+    // Diagnostic for the flashing-headlight fault: with only one claimant for
+    // three slices there is no contention, so if the flash persists the cause
+    // is not slice starvation.
+    static const bool suppressSearchlights =
+        GetEnvironmentVariableA("SGE_NO_HELI_SEARCHLIGHT", nullptr, 0) > 0;
+    if (suppressSearchlights) {
+        g_primarySearchlightTracking.initialized = false;
+        g_secondarySearchlightTracking.initialized = false;
+        return 0;
+    }
+    if (!TimeOfDayIsDark(g_selectedTimeOfDay) || g_emptyLevelMode) {
+        g_primarySearchlightTracking.initialized = false;
+        g_secondarySearchlightTracking.initialized = false;
+        return 0;
+    }
+    // Destroyed gunships go dark. The airframe is still drawn -- it has to be,
+    // it is falling and then lying on the ground as a wreck -- so the visibility
+    // tests alone would keep a dead helicopter sweeping its beam across the
+    // island. Clearing the tracking as well means a replacement aircraft starts
+    // its sweep from wherever it actually is, rather than resuming the dead
+    // one's aim.
     int added = 0;
-    if (scene.showHelicopter)
+    if (scene.showHelicopter && !PrimaryHelicopterDestroyed())
         added += AddHelicopterSearchlight(
-            scene, HelicopterWorldMatrix(), PrimaryHelicopterWeaponAimPoint());
-    if (SecondaryHelicopterVisible())
+            scene, HelicopterWorldMatrix(), g_primarySearchlightTracking,
+            deltaTime);
+    else
+        g_primarySearchlightTracking.initialized = false;
+    if (SecondaryHelicopterVisible() && !SecondaryHelicopterDestroyed())
         added += AddHelicopterSearchlight(
             scene, SecondaryHelicopterWorldMatrix(),
-            SecondaryHelicopterWeaponAimPoint());
+            g_secondarySearchlightTracking, deltaTime);
+    else
+        g_secondarySearchlightTracking.initialized = false;
     return added;
 }
 

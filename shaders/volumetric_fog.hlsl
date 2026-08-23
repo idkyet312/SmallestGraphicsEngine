@@ -473,11 +473,23 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // Each froxel takes a single shadow sample, so a shaft edge that falls
     // mid-slice snaps to the froxel boundary and the shaft reads as stepped.
     // Raising the grid resolution shrinks those steps but never removes them.
-    // Offsetting the sample position within the slice, by a per-pixel amount
-    // that also changes each frame, turns the hard step into noise that the
-    // accumulation and frame-to-frame persistence average into a smooth edge.
-    float sliceJitter = frac(
-        InterleavedGradientNoise(float2(id.xy)) + float(volumeDims.w) * 0.618034);
+    // Offsetting the sample position within the slice by a per-pixel amount
+    // turns that hard step into noise spread across neighbouring froxels.
+    //
+    // The offset is deliberately NOT advanced per frame. This pass has no
+    // history volume and no reprojection (see the cloud-noise comment below),
+    // so a frame-varying jitter has nothing to converge against: every frame
+    // re-randomises where inside its slice each froxel samples. While the
+    // camera is still that reads as mild shimmer, but under rotation the
+    // froxel grid is simultaneously remapped onto new world positions, and the
+    // two together made the beam change far more than the camera motion
+    // justified -- most visible pitching up and down through a headlight shaft.
+    //
+    // Frozen per pixel, the dither stays a fixed spatial pattern: still enough
+    // to break the slice boundary into a ramp, but stable from frame to frame.
+    // If a history volume is ever added, restore the frame term -- it is only
+    // useful once something averages it.
+    float sliceJitter = InterleavedGradientNoise(float2(id.xy));
 
     [loop]
     for (uint z = 0; z < volumeDims.z; ++z)

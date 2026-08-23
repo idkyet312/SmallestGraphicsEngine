@@ -51,6 +51,8 @@ struct TerrainPayload {
 //   tilesZ = ring count R
 //   tileSize = base (innermost) tile size
 static const uint kClipmapFlag = 2u;
+// Matches TerrainRendererDX12::kStylePinnedClipmapOrigin.
+static const uint kPinnedOriginFlag = 8u;
 
 groupshared TerrainPayload payloadData;
 groupshared uint visibleCount;
@@ -145,7 +147,15 @@ bool ResolveClipmapTile(uint id, uint G, uint R, float base,
     // hole on common tile lines -- verified gap-free and overlap-free for
     // R = 2..8 at random camera positions.
     float snapGrid = base * (float)(1u << (R - 1));
-    float2 snapped = floor(viewPos.xz / snapGrid) * snapGrid;
+    // kStylePinnedClipmapOrigin: snap to the world origin rather than the
+    // camera. The spot shadow pass sets this because it never rebinds viewPos
+    // to the light, so an unpinned origin would follow the player and make the
+    // terrain under the beam jump a whole coarse tile each time the camera
+    // crossed a snap cell. The ring layout is unchanged -- every ring still
+    // shares ONE origin, which is what keeps the boundaries seam-free.
+    const bool pinnedOrigin = (terrainStyle & kPinnedOriginFlag) != 0u;
+    float2 snapCentre = pinnedOrigin ? float2(0.0, 0.0) : viewPos.xz;
+    float2 snapped = floor(snapCentre / snapGrid) * snapGrid;
     originXZ = snapped + (float2(lx, lz) - (float)(G / 2)) * t;
     sizeOut = t;
     return true;

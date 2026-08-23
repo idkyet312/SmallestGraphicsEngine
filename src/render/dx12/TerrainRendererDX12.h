@@ -349,6 +349,21 @@ public:
     // a style bit because Params is pinned to 16 DWORDs by the root-constant
     // upload and has no spare slot for another field.
     static constexpr UINT kStyleFlat = 4u;
+    // bit 3 (8) = pin the clipmap snap origin to the world grid instead of the
+    // camera. Set only for the spot shadow pass: that pass leaves viewPos at
+    // the player camera (SetCamera is never called with a light position), so
+    // the ring origins were snapping to floor(camera.xz / snapGrid), and every
+    // time the camera crossed a snap cell the terrain in the shadow map jumped
+    // a whole coarse tile -- the beam's shadow visibly changing as the player
+    // moved and looked around. Pinning costs the shadow pass its camera-centred
+    // tiling, which it never needed: the tiles it keeps are chosen by the
+    // light's own frustum test, not by proximity to the viewer.
+    //
+    // LOD deliberately still follows viewPos. Matching the forward pass's
+    // tessellation is what keeps the shadow surface aligned with the drawn
+    // surface; recentring LOD on the lamp would change the terrain silhouette
+    // between the two passes and trade this pop for shadow acne.
+    static constexpr UINT kStylePinnedClipmapOrigin = 8u;
     static bool IsFlat(UINT terrainStyle) {
         return (terrainStyle & kStyleFlat) != 0u;
     }

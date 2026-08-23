@@ -1196,6 +1196,19 @@ bool SecondaryHelicopterVisible() {
     return g_stressTestMode || g_game.vehicles.DropshipActive();
 }
 
+// Renderer-facing destroyed state for the two gunships.
+//
+// Deliberately separate from the *Visible tests: a downed airframe keeps being
+// drawn all the way through its fall and then sits on the ground as a wreck, so
+// visibility stays true long after the aircraft stops working. Anything that
+// should die WITH the helicopter rather than with its model -- the searchlight
+// -- has to ask this instead.
+//
+// Reads the dead flag, not crashed: the light goes out when the craft is shot
+// down, not when it finally hits the ground.
+bool PrimaryHelicopterDestroyed() { return g_helicopterDead; }
+bool SecondaryHelicopterDestroyed() { return g_secondaryHelicopterDead; }
+
 static void ConfigureHelicopterBounds() {
     if (!g_helicopterModel || !g_helicopterModel->mesh) return;
     XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
@@ -14993,6 +15006,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // diagnostic afterwards so unattended tests exercise the intended view.
         if (requestedVisibilityDebugMode >= 0)
             visBuffer.debugViewMode = requestedVisibilityDebugMode;
+        // SGE_FORCE_NIGHT=1 pins the run to the only dark preset. Headlights
+        // and searchlights early-out unless TimeOfDayIsDark, so a smoke test
+        // that lands on the Afternoon default exercises none of that code.
+        // Applied after StartLevelOne for the same reason as the line above.
+        if (GetEnvironmentVariableA("SGE_FORCE_NIGHT", nullptr, 0) > 0) {
+            g_selectedTimeOfDay = TimeOfDay::Night;
+            ApplyTimeOfDay(g_selectedTimeOfDay);
+        }
         if (GetEnvironmentVariableA("SGE_PREFAB_SMOKE_TEST", nullptr, 0) > 0) {
             g_prefabRuntimeSmokeEnabled = true;
             LevelEntity rock;
@@ -18279,7 +18300,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         g_spotShadowCasters.clear();
         const bool flashlightInLightList = AddPlayerFlashlight(scene);
         const int headlightsInLightList = AddVehicleHeadlights(scene);
-        const int searchlightsInLightList = AddEnemyHelicopterSearchlights(scene);
+        const int searchlightsInLightList =
+            AddEnemyHelicopterSearchlights(scene, deltaTime);
         if (IsSceneScreen() && !g_game.loading.Active() &&
             usingRaytracing) {
             ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());

@@ -459,6 +459,11 @@ struct Scene {
     // NVIDIA Blast + Box3D destructible house
     bool  useDestruction = true;
     bool  showHelicopter = true;   // draw + simulate the hovering attack heli
+    // One centre-line headlight per Humvee rather than a left/right pair. The
+    // pair shared a single shadow frustum, so the second lamp only added an
+    // overlapping pool and another entry in the 64-light budget; the single
+    // lamp is the default. Turn this off to get the original two-lamp look.
+    bool  singleHumveeHeadlight = true;
     bool  enableMSAA = true;
     bool  enableGrassMSAA = true;
     bool  enableFXAA = false;
