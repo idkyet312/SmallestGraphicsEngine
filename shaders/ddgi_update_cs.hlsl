@@ -31,14 +31,22 @@ struct PointLightData {
     float radius;
     float3 color;
     float intensity;
+    // Cone axis, unit length; zero for a plain omnidirectional point light.
+    float3 spotDirection;
+    float spotCosInner;
+    float spotCosOuter;
+    int spotShadowIndex;
+    float2 spotPadding;
 };
 
 cbuffer PointLightsBuffer : register(b1) {
     int numPointLights;
-    float plPadding1;
+    // Live spot atlas slices this frame; see PointLightsBufferDX12.
+    int spotShadowCount;
     float plPadding2;
     float plPadding3;
     PointLightData pointLights[64];
+    float4x4 spotShadowMatrices[3];
 };
 
 cbuffer MainLightBuffer : register(b2) {

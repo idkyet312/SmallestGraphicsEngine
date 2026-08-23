@@ -50,6 +50,24 @@ int main(int argc, char** argv) {
         sourceDir + "/shaders/visbuf_vs.hlsl";
     const std::string visPixelShaderPath =
         sourceDir + "/shaders/visbuf_ps.hlsl";
+    const std::string grassVertexShaderPath =
+        sourceDir + "/shaders/grass_vs.hlsl";
+    const std::string grassShadowShaderPath =
+        sourceDir + "/shaders/grass_shadow_vs.hlsl";
+    const std::string clusteredPixelShaderPath =
+        sourceDir + "/shaders/clustered_dx12_ps.hlsl";
+    const std::string clusteredVertexShaderPath =
+        sourceDir + "/shaders/clustered_dx12_vs.hlsl";
+    const std::string fallbackPixelShaderPath =
+        sourceDir + "/shaders/clustered_ps.hlsl";
+    const std::string fallbackVertexShaderPath =
+        sourceDir + "/shaders/clustered_vs.hlsl";
+    const std::string simplePixelShaderPath =
+        sourceDir + "/shaders/simple_ps.hlsl";
+    const std::string ddgiShaderPath =
+        sourceDir + "/shaders/ddgi_update_cs.hlsl";
+    const std::string volumetricFogShaderPath =
+        sourceDir + "/shaders/volumetric_fog.hlsl";
     const std::string goldenPath =
         sourceDir + "/tests/golden/visbuf_resolve_cs.fxc.size";
 
@@ -80,6 +98,26 @@ int main(int argc, char** argv) {
     if (FAILED(hr)) {
         std::cerr << "Default resolve failed to compile: "
                   << (errors ? (const char*)errors->GetBufferPointer() : "unknown")
+                  << "\n";
+        return 1;
+    }
+
+    // Full levels select the terrain twin lazily; the empty-level smoke test
+    // and the golden default variant above never compile this branch. Keep the
+    // runtime FXC contract covered so an error cannot first appear at the final
+    // loading-screen stage.
+    const std::string terrainCode =
+        "#define SGE_TERRAIN_VISIBILITY 1\n" + code;
+    ComPtr<ID3DBlob> terrainBlob;
+    errors.Reset();
+    const HRESULT terrainHr = D3DCompile(
+        terrainCode.c_str(), terrainCode.size(), shaderPath.c_str(), nullptr,
+        D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_1", compileFlags, 0,
+        &terrainBlob, &errors);
+    if (FAILED(terrainHr)) {
+        std::cerr << "Terrain resolve failed to compile: "
+                  << (errors ? (const char*)errors->GetBufferPointer()
+                             : "unknown")
                   << "\n";
         return 1;
     }
@@ -253,6 +291,134 @@ int main(int argc, char** argv) {
             D3D11_SHADER_INPUT_BIND_DESC decalsBinding = {};
             CHECK(FAILED(visPixelReflection->GetResourceBindingDescByName(
                 "ImpactDecalsBuffer", &decalsBinding)));
+        }
+    }
+
+    // Grass is runtime FXC too. Its interaction constants are root constants,
+    // so both shaders can compile while silently disagreeing with the C++ count;
+    // reflect the shared b6 contract and its instance SRV in both variants.
+    for (const std::string& grassPath : {
+             grassVertexShaderPath, grassShadowShaderPath }) {
+        std::string grassCode;
+        CHECK(readShader(grassPath, grassCode));
+        if (grassCode.empty()) continue;
+
+        ComPtr<ID3DBlob> grassBlob;
+        errors.Reset();
+        const HRESULT grassHr = D3DCompile(
+            grassCode.c_str(), grassCode.size(), grassPath.c_str(), nullptr,
+            D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "vs_5_0",
+            compileFlags, 0, &grassBlob, &errors);
+        if (FAILED(grassHr)) {
+            std::cerr << "Grass vertex shader failed to compile: "
+                      << (errors ? (const char*)errors->GetBufferPointer()
+                                 : "unknown") << "\n";
+            ++failures;
+            continue;
+        }
+
+        ComPtr<ID3D11ShaderReflection> grassReflection;
+        CHECK(SUCCEEDED(D3DReflect(
+            grassBlob->GetBufferPointer(), grassBlob->GetBufferSize(),
+            __uuidof(ID3D11ShaderReflection),
+            reinterpret_cast<void**>(grassReflection.GetAddressOf()))));
+        if (!grassReflection) continue;
+
+        D3D11_SHADER_INPUT_BIND_DESC grassParamsBinding = {};
+        CHECK(SUCCEEDED(grassReflection->GetResourceBindingDescByName(
+            "GrassParams", &grassParamsBinding)));
+        CHECK(grassParamsBinding.Type == D3D_SIT_CBUFFER);
+        CHECK(grassParamsBinding.BindPoint == 6u);
+
+        D3D11_SHADER_INPUT_BIND_DESC bladesBinding = {};
+        CHECK(SUCCEEDED(grassReflection->GetResourceBindingDescByName(
+            "blades", &bladesBinding)));
+        CHECK(bladesBinding.Type == D3D_SIT_STRUCTURED);
+        CHECK(bladesBinding.BindPoint == 6u);
+
+        ID3D11ShaderReflectionConstantBuffer* grassParams =
+            grassReflection->GetConstantBufferByName("GrassParams");
+        CHECK(grassParams != nullptr);
+        if (grassParams) {
+            D3D11_SHADER_BUFFER_DESC grassParamsDesc = {};
+            CHECK(SUCCEEDED(grassParams->GetDesc(&grassParamsDesc)));
+            // Nineteen DWORDs occupy five 16-byte HLSL registers.
+            CHECK(grassParamsDesc.Size == 80u);
+        }
+    }
+
+    // These are edited together when clustered/volumetric lights change, but
+    // most are runtime-only FXC inputs. DXC accepting the offline SM6 variants
+    // does not guarantee that the startup SM5 shaders still compile.
+    struct RuntimeShaderCase {
+        const std::string* path;
+        const char* entry;
+        const char* target;
+        const D3D_SHADER_MACRO* defines;
+    };
+    const D3D_SHADER_MACRO hdrDefines[] = {
+        { "SGE_HDR_TARGET", "1" }, { nullptr, nullptr }
+    };
+    const D3D_SHADER_MACRO motionDefines[] = {
+        { "SGE_HDR_TARGET", "1" },
+        { "SGE_EXTENSION_MOTION", "1" },
+        { nullptr, nullptr }
+    };
+    const D3D_SHADER_MACRO cloudDefines[] = {
+        { "SGE_WORLD_CLOUDS", "1" }, { nullptr, nullptr }
+    };
+    const RuntimeShaderCase runtimeShaders[] = {
+        { &clusteredVertexShaderPath, "main", "vs_5_0", nullptr },
+        { &fallbackVertexShaderPath, "main", "vs_5_0", nullptr },
+        { &clusteredPixelShaderPath, "main", "ps_5_0", nullptr },
+        { &clusteredPixelShaderPath, "main", "ps_5_0", hdrDefines },
+        { &clusteredPixelShaderPath, "main", "ps_5_0", motionDefines },
+        { &fallbackPixelShaderPath, "main", "ps_5_0", nullptr },
+        { &fallbackPixelShaderPath, "main", "ps_5_0", hdrDefines },
+        { &fallbackPixelShaderPath, "main", "ps_5_0", motionDefines },
+        { &simplePixelShaderPath, "main", "ps_5_0", nullptr },
+        { &ddgiShaderPath, "CSMain", "cs_5_0", nullptr },
+        { &volumetricFogShaderPath, "CSMain", "cs_5_0", nullptr },
+        { &volumetricFogShaderPath, "CSMain", "cs_5_0", cloudDefines },
+        { &volumetricFogShaderPath, "VSMain", "vs_5_0", nullptr },
+        { &volumetricFogShaderPath, "PSMain", "ps_5_0", nullptr },
+        { &volumetricFogShaderPath, "PSMain", "ps_5_0", cloudDefines },
+        { &volumetricFogShaderPath, "PSMainMSAA", "ps_5_0", nullptr },
+        { &volumetricFogShaderPath, "PSMainMSAA", "ps_5_0", cloudDefines },
+    };
+    for (const RuntimeShaderCase& shader : runtimeShaders) {
+        std::string source;
+        CHECK(readShader(*shader.path, source));
+        if (source.empty()) continue;
+
+        ComPtr<ID3DBlob> runtimeBlob;
+        errors.Reset();
+        const HRESULT runtimeHr = D3DCompile(
+            source.c_str(), source.size(), shader.path->c_str(), shader.defines,
+            D3D_COMPILE_STANDARD_FILE_INCLUDE, shader.entry, shader.target,
+            compileFlags, 0, &runtimeBlob, &errors);
+        if (FAILED(runtimeHr)) {
+            std::cerr << *shader.path << " (" << shader.entry << "/"
+                      << shader.target << ") failed to compile:\n"
+                      << (errors ? (const char*)errors->GetBufferPointer()
+                                 : "unknown") << "\n";
+            ++failures;
+        } else if (shader.defines == nullptr &&
+                   (shader.path == &clusteredPixelShaderPath ||
+                    shader.path == &fallbackPixelShaderPath)) {
+            ComPtr<ID3D11ShaderReflection> runtimeReflection;
+            CHECK(SUCCEEDED(D3DReflect(
+                runtimeBlob->GetBufferPointer(), runtimeBlob->GetBufferSize(),
+                __uuidof(ID3D11ShaderReflection),
+                reinterpret_cast<void**>(runtimeReflection.GetAddressOf()))));
+            if (runtimeReflection) {
+                D3D11_SHADER_INPUT_BIND_DESC spotAtlasBinding = {};
+                CHECK(SUCCEEDED(
+                    runtimeReflection->GetResourceBindingDescByName(
+                        "spotShadowAtlas", &spotAtlasBinding)));
+                CHECK(spotAtlasBinding.Type == D3D_SIT_TEXTURE);
+                CHECK(spotAtlasBinding.BindPoint == 21u);
+            }
         }
     }
 

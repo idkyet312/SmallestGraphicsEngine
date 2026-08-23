@@ -44,7 +44,7 @@ inline std::vector<PendingUpload> pending;
 inline std::array<std::vector<ComPtr<ID3D12Resource>>, FRAME_COUNT> retired;
 inline std::array<uint64_t, FRAME_COUNT> retiredEpoch = {};
 inline std::array<ComPtr<ID3D12CommandAllocator>, FRAME_COUNT> copyAllocators;
-inline ComPtr<ID3D12GraphicsCommandList> copyCommandList;
+inline std::array<ComPtr<ID3D12GraphicsCommandList>, FRAME_COUNT> copyCommandLists;
 inline std::array<uint64_t, FRAME_COUNT> copyAllocatorFenceValues = {};
 inline std::vector<RetiredUploadBatch> copyRetired;
 inline std::atomic<uint64_t> nextSerial{1};
@@ -131,16 +131,21 @@ inline uint32_t FlushStaticBufferUploadsDX12(ID3D12GraphicsCommandList* commandL
     // Static buffers use the COPY queue. Direct queue waits entirely on-GPU,
     // then performs final state transitions before any draw consumes them.
     // Dedicated allocators avoid collision with occlusion readback copy work.
-    if (!StaticBufferDetailDX12::copyCommandList) {
-        for (UINT i = 0; i < FRAME_COUNT; ++i)
+    // The lists are per-frame too: Reset is illegal while an earlier execution
+    // of that same list is pending, even when the new Reset uses another
+    // allocator. Full loads enqueue helicopter/bandit skin buffers on adjacent
+    // frames, which is exactly where one shared list used to alias itself.
+    if (!StaticBufferDetailDX12::copyCommandLists[0]) {
+        for (UINT i = 0; i < FRAME_COUNT; ++i) {
             ThrowIfFailed(g_dx12.device->CreateCommandAllocator(
                 D3D12_COMMAND_LIST_TYPE_COPY,
                 IID_PPV_ARGS(&StaticBufferDetailDX12::copyAllocators[i])));
-        ThrowIfFailed(g_dx12.device->CreateCommandList(0,
-            D3D12_COMMAND_LIST_TYPE_COPY,
-            StaticBufferDetailDX12::copyAllocators[0].Get(), nullptr,
-            IID_PPV_ARGS(&StaticBufferDetailDX12::copyCommandList)));
-        ThrowIfFailed(StaticBufferDetailDX12::copyCommandList->Close());
+            ThrowIfFailed(g_dx12.device->CreateCommandList(0,
+                D3D12_COMMAND_LIST_TYPE_COPY,
+                StaticBufferDetailDX12::copyAllocators[i].Get(), nullptr,
+                IID_PPV_ARGS(&StaticBufferDetailDX12::copyCommandLists[i])));
+            ThrowIfFailed(StaticBufferDetailDX12::copyCommandLists[i]->Close());
+        }
     }
     const uint64_t completedCopy = g_dx12.copyFence->GetCompletedValue();
     StaticBufferDetailDX12::copyRetired.erase(
@@ -168,7 +173,9 @@ inline uint32_t FlushStaticBufferUploadsDX12(ID3D12GraphicsCommandList* commandL
     WaitForFenceCPU(g_dx12.copyFence.Get(),
         StaticBufferDetailDX12::copyAllocatorFenceValues[slot]);
     ThrowIfFailed(StaticBufferDetailDX12::copyAllocators[slot]->Reset());
-    ThrowIfFailed(StaticBufferDetailDX12::copyCommandList->Reset(
+    ID3D12GraphicsCommandList* copyCommandList =
+        StaticBufferDetailDX12::copyCommandLists[slot].Get();
+    ThrowIfFailed(copyCommandList->Reset(
         StaticBufferDetailDX12::copyAllocators[slot].Get(), nullptr));
 
     StaticBufferDetailDX12::RetiredUploadBatch retirement;
@@ -176,7 +183,7 @@ inline uint32_t FlushStaticBufferUploadsDX12(ID3D12GraphicsCommandList* commandL
     std::vector<D3D12_RESOURCE_BARRIER> barriers;
     barriers.reserve(uploads.size());
     for (auto& upload : uploads) {
-        StaticBufferDetailDX12::copyCommandList->CopyBufferRegion(
+        copyCommandList->CopyBufferRegion(
             upload.destination.Get(), 0,
             upload.staging.Get(), 0, upload.destination->GetDesc().Width);
         D3D12_RESOURCE_BARRIER barrier = {};
@@ -192,9 +199,8 @@ inline uint32_t FlushStaticBufferUploadsDX12(ID3D12GraphicsCommandList* commandL
         StaticBufferDetailDX12::retired[slot].push_back(upload.destination);
         retirement.resources.push_back(std::move(upload.destination));
     }
-    ThrowIfFailed(StaticBufferDetailDX12::copyCommandList->Close());
-    ID3D12CommandList* copyLists[] = {
-        StaticBufferDetailDX12::copyCommandList.Get() };
+    ThrowIfFailed(copyCommandList->Close());
+    ID3D12CommandList* copyLists[] = { copyCommandList };
     g_dx12.copyQueue->ExecuteCommandLists(1, copyLists);
     const uint64_t copyFenceValue = ++g_dx12.copyFenceValue;
     ThrowIfFailed(g_dx12.copyQueue->Signal(

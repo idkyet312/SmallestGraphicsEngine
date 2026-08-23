@@ -2517,10 +2517,18 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::SeparatorText("Wind & Performance");
         ImGui::DragFloat("Wind Strength", &g_grass.WindStrength(), 0.01f, 0.0f, 1.0f);
         ImGui::DragFloat("Wind Speed",    &g_grass.WindSpeed(),    0.05f, 0.0f, 6.0f);
+        ImGui::SeparatorText("Foliage Interaction");
+        ImGui::Checkbox("Player Grass Interaction", &g_grass.PlayerPushEnabled());
+        ImGui::BeginDisabled(!g_grass.PlayerPushEnabled());
+        ImGui::DragFloat("Push Strength", &g_grass.PlayerPushStrength(),
+                         0.02f, 0.0f, 1.5f, "%.2f");
+        ImGui::DragFloat("Push Radius", &g_grass.PlayerPushRadius(),
+                         0.05f, 0.25f, 3.0f, "%.2f m");
+        ImGui::EndDisabled();
         // Perf dials: density trims blades per cell (whole tufts, no rebuild);
         // distance shrinks the drawn ring. ~0.6 / 22 is a good perf preset.
         ImGui::SliderFloat("Density", &g_grass.Density(), 0.05f, 1.0f);
-        ImGui::DragFloat("Draw Distance", &g_grass.DrawDistance(), 0.5f, 8.0f, 40.0f);
+        ImGui::DragFloat("Draw Distance", &g_grass.DrawDistance(), 0.5f, 8.0f, 80.0f);
     }
 
     if (UISearchHeader("Destruction", ImGuiTreeNodeFlags_DefaultOpen)) {

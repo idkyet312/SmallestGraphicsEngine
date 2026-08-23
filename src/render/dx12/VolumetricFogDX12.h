@@ -150,7 +150,9 @@ private:
         ClusteredRendererDX12::CLUSTER_Y *
         ClusteredRendererDX12::CLUSTER_Z;
     static constexpr UINT MaxLights = ClusteredRendererDX12::MAX_LIGHTS;
-    static constexpr UINT ConstantsSize = 512;
+    // 768, not 512: the spot shadow matrices pushed FogConstants to 672 bytes.
+    // Must stay a multiple of the 256-byte CBV alignment.
+    static constexpr UINT ConstantsSize = 768;
 
     struct GPUCluster {
         UINT lightCount;
@@ -161,7 +163,21 @@ private:
         float radius;
         XMFLOAT3 color;
         float intensity;
+        // Cone, matching FogPointLight in volumetric_fog.hlsl. A zero direction
+        // scatters in all directions, which is what every other light writes.
+        XMFLOAT3 spotDirection;
+        float spotCosInner;
+        float spotCosOuter;
+        // Spot shadow atlas slice, or -1. Shafts from a shadowed headlight are
+        // cut where the beam is blocked, so the light does not fog through
+        // walls the shading pass already occludes.
+        int spotShadowIndex;
+        XMFLOAT2 spotPadding;
     };
+    // StructuredBuffer stride: must equal FogPointLight in volumetric_fog.hlsl,
+    // or every light after the first is read from the wrong offset.
+    static_assert(sizeof(GPULight) == 64,
+                  "GPULight must match FogPointLight in volumetric_fog.hlsl");
     struct FogConstants {
         XMFLOAT4X4 inverseViewProjection;
         XMFLOAT4X4 shadowCascadeMatrices[SHADOW_CASCADE_COUNT];
@@ -182,6 +198,14 @@ private:
         // base height, thickness, density, coverage. Density <= 0 disables the
         // layer, so the branch costs nothing when the feature is off.
         XMFLOAT4 flyableCloudParams;
+        // Spot shadow atlas transforms, matching the shading passes. Without
+        // these a shadowed headlight would still fog straight through a wall:
+        // the beam is drawn by lit froxels along it, and a froxel behind an
+        // occluder has to be cut here as well as in the surface shading.
+        XMFLOAT4X4 spotShadowMatrices[SPOT_SHADOW_COUNT];
+        // x = live slice count; yzw unused. A float4 rather than a bare int so
+        // the following data stays on a 16-byte boundary.
+        XMUINT4 spotShadowCount;
     };
     static_assert(sizeof(FogConstants) <= ConstantsSize, "Fog constants exceed one CBV page");
 
@@ -201,7 +225,7 @@ private:
     }
 
     bool CreateRootSignature() {
-        D3D12_DESCRIPTOR_RANGE ranges[6] = {};
+        D3D12_DESCRIPTOR_RANGE ranges[7] = {};
         ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2, 0, 0 };
         ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0 };
         ranges[2] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3, 0, 0 };
@@ -210,14 +234,16 @@ private:
         // Append the immutable shape/detail pair. Existing root indices remain
         // unchanged; both SRVs are one contiguous table at t6-t7.
         ranges[5] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 6, 0, 0 };
-        D3D12_ROOT_PARAMETER roots[9] = {};
+        // t8 spot shadow atlas, appended last for the same reason.
+        ranges[6] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 8, 0, 0 };
+        D3D12_ROOT_PARAMETER roots[10] = {};
         roots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         roots[0].Descriptor.ShaderRegister = 0;
         roots[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         roots[1].Descriptor.ShaderRegister = 0;
         roots[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         roots[2].Descriptor.ShaderRegister = 1;
-        for (UINT i = 0; i < 6; ++i) {
+        for (UINT i = 0; i < _countof(ranges); ++i) {
             roots[3 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
             roots[3 + i].DescriptorTable.NumDescriptorRanges = 1;
             roots[3 + i].DescriptorTable.pDescriptorRanges = &ranges[i];
@@ -318,7 +344,8 @@ private:
     bool CreateHeapAndVolume() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 7;
+        // 8: the seven original views plus the spot shadow atlas at slot 7.
+        heapDesc.NumDescriptors = 8;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_dx12.device->CreateDescriptorHeap(
                 &heapDesc, IID_PPV_ARGS(&descriptorHeap_)))) return false;
@@ -442,6 +469,11 @@ private:
             scene.volumetricFogTint.z,
             fogTime_ };
         constants.shadowCascadeSplits = g_shadowCascadeSplits;
+        // Transposed like every other matrix crossing into HLSL.
+        for (UINT s = 0; s < SPOT_SHADOW_COUNT; ++s)
+            XMStoreFloat4x4(&constants.spotShadowMatrices[s],
+                            XMMatrixTranspose(g_spotShadowMatrices[s]));
+        constants.spotShadowCount = { g_spotShadowActiveCount, 0u, 0u, 0u };
         constants.clusterDimsLightCount = {
             ClusteredRendererDX12::CLUSTER_X,
             ClusteredRendererDX12::CLUSTER_Y,
@@ -506,7 +538,10 @@ private:
         for (UINT i = 0; i < lightCount; ++i) {
             const auto& source = scene.clusteredRenderer.lights[i];
             gpuLights[i] = { source.position, source.radius, source.color,
-                             source.active ? source.intensity : 0.0f };
+                             source.active ? source.intensity : 0.0f,
+                             source.spotDirection, source.spotCosInner,
+                             source.spotCosOuter, source.spotShadowIndex,
+                             XMFLOAT2(0.0f, 0.0f) };
         }
 
         D3D12_SHADER_RESOURCE_VIEW_DESC shadowSrv = {};
@@ -516,6 +551,17 @@ private:
         shadowSrv.Texture2DArray.MipLevels = 1;
         shadowSrv.Texture2DArray.ArraySize = SHADOW_CASCADE_COUNT;
         g_dx12.device->CreateShaderResourceView(shadowResource, &shadowSrv, CpuHandle(0));
+        // [7] t8 spot shadow atlas. Rewritten each frame alongside the cascade
+        // view; a null resource still gets a valid view, since the root
+        // signature declares the range whether or not anything is casting.
+        D3D12_SHADER_RESOURCE_VIEW_DESC spotSrv = {};
+        spotSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        spotSrv.Format = DXGI_FORMAT_R32_FLOAT;
+        spotSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        spotSrv.Texture2DArray.MipLevels = 1;
+        spotSrv.Texture2DArray.ArraySize = SPOT_SHADOW_COUNT;
+        g_dx12.device->CreateShaderResourceView(
+            g_spotShadowAtlasResource, &spotSrv, CpuHandle(7));
         D3D12_SHADER_RESOURCE_VIEW_DESC depthSrv = {};
         depthSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         depthSrv.Format = DXGI_FORMAT_R32_FLOAT;
@@ -548,6 +594,8 @@ private:
         for (UINT i = 0; i < 5; ++i)
             list->SetComputeRootDescriptorTable(3 + i, GpuHandle(i));
         list->SetComputeRootDescriptorTable(8, GpuHandle(5));
+        // Root 9 = ranges[6], the t8 spot atlas at heap slot 7.
+        list->SetComputeRootDescriptorTable(9, GpuHandle(7));
     }
     void BindGraphicsRoots(ID3D12GraphicsCommandList* list) {
         list->SetGraphicsRootConstantBufferView(0,
@@ -559,6 +607,7 @@ private:
         for (UINT i = 0; i < 5; ++i)
             list->SetGraphicsRootDescriptorTable(3 + i, GpuHandle(i));
         list->SetGraphicsRootDescriptorTable(8, GpuHandle(5));
+        list->SetGraphicsRootDescriptorTable(9, GpuHandle(7));
     }
 
     D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle(UINT index) const {

@@ -26,6 +26,38 @@ inline XMFLOAT4 g_shadowCascadeSplits = { 18.0f, 55.0f, 180.0f, 0.0f };
 inline XMFLOAT4 g_shadowCascadeTexelWorld = { 0.05f, 0.05f, 0.05f, 0.0f };
 inline XMFLOAT4 g_shadowCascadeDepthRange = { 300.0f, 300.0f, 300.0f, 0.0f };
 
+// Spot shadow atlas, filled by ShadowMapDX12::RenderSpotShadows each frame.
+//
+// Declared here rather than in ShadowMapDX12.h because that header includes
+// ForwardRenderer.h, and the light-add functions there have to tag lights with
+// an atlas slice. Putting the constants in the header both already include
+// keeps the dependency one-directional.
+//
+// Vehicle headlights and the enemy dropship's searchlight cast; the player's
+// own flashlight does not -- it sits at the eye, so everything it lights is
+// already facing the camera and its shadows would fall almost entirely behind
+// the geometry casting them, paying a full depth pass for a few edge pixels.
+//
+// One slice per CASTER, not per lamp: a Humvee's two headlights sit 1.5 m
+// apart on a shared forward axis, so one frustum covering both reproduces the
+// occlusion either would compute alone. Slices: 0 primary Humvee, 1 secondary
+// Humvee, 2 dropship searchlight -- assigned in arrival order, so a level
+// without the second Humvee gives its slice to whatever registers next.
+inline constexpr UINT SPOT_SHADOW_COUNT = 3;
+// 2048 against the sun's 4096: these frusta cover a ~40 m cone rather than the
+// whole cascade box, so a texel already lands far denser on world geometry.
+// Costs 3 x 2048^2 x 4 = 48 MB.
+inline constexpr UINT SPOT_SHADOW_SIZE = 2048;
+// Written into PointLightData::spotShadowIndex for a light that casts nothing.
+// Shaders test against this before touching the atlas.
+inline constexpr int SPOT_SHADOW_NONE = -1;
+inline std::array<XMMATRIX, SPOT_SHADOW_COUNT> g_spotShadowMatrices = {
+    XMMatrixIdentity(), XMMatrixIdentity(), XMMatrixIdentity()
+};
+// How many slices actually hold a caster this frame. Slices past this are
+// stale depth from an earlier frame, so shaders must not sample them.
+inline UINT g_spotShadowActiveCount = 0;
+
 // Constant buffer structures (must be 256-byte aligned for DX12)
 struct alignas(256) MatrixBufferDX12 {
     XMMATRIX model;
@@ -96,19 +128,47 @@ struct alignas(256) ObjectBufferDX12 {
     };
 };
 
+// A light in the punctual list. Spotlights ride the same array rather than a
+// buffer of their own: the flashlight is the only one, and a second cbuffer
+// would mean a root-signature slot plus a matching struct in all five shaders
+// that read this one. An all-zero spotDirection means "omnidirectional", which
+// is what every existing light already writes by zero-initialising.
 struct PointLightDataDX12 {
     XMFLOAT3 position;
     float radius;
     XMFLOAT3 color;
     float intensity;
+    // Cone axis, unit length. Zero for a plain point light.
+    XMFLOAT3 spotDirection;
+    // cos of the half-angle where the cone reaches full brightness...
+    float spotCosInner;
+    // ...and where it falls to nothing. Ignored while spotDirection is zero.
+    float spotCosOuter;
+    // Atlas slice this light samples for occlusion, or -1 for no shadow. Taken
+    // out of the old spotPadding, so the 64-byte layout below is unchanged.
+    int spotShadowIndex;
+    XMFLOAT2 spotPadding;
 };
+// Four float4 rows. HLSL packs cbuffer arrays on 16-byte boundaries, so this
+// must stay a multiple of 16 or every light past the first reads shifted data
+// in all five shaders that declare a matching PointLightData.
+static_assert(sizeof(PointLightDataDX12) == 64,
+              "PointLightData must match the HLSL copies in clustered_dx12_ps, "
+              "clustered_ps, simple_ps, ddgi_update_cs and visbuf_resolve_cs");
 
 struct alignas(256) PointLightsBufferDX12 {
     int numPointLights;
-    float padding1;
+    // How many spot atlas slices hold live depth this frame. Lights carrying a
+    // spotShadowIndex at or above this are sampling a stale slice, so shaders
+    // treat them as unshadowed rather than reading last frame's depth.
+    int spotShadowCount;
     float padding2;
     float padding3;
     PointLightDataDX12 lights[64];
+    // World -> light clip for each atlas slice, transposed on upload like every
+    // other matrix that crosses into HLSL. Trails the light array so the
+    // existing offsets of numPointLights and lights[] are unchanged.
+    XMMATRIX spotShadowMatrices[SPOT_SHADOW_COUNT];
 };
 
 // Projected impact decal: bullet holes and scorch marks stamped onto whatever
@@ -550,7 +610,7 @@ public:
         }
         
         // SRV descriptor table for global textures
-        D3D12_DESCRIPTOR_RANGE globalSrvRanges[8] = {};
+        D3D12_DESCRIPTOR_RANGE globalSrvRanges[9] = {};
         // t0 - shadowMap
         globalSrvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         globalSrvRanges[0].NumDescriptors = 1;
@@ -591,8 +651,17 @@ public:
             globalSrvRanges[5 + i].OffsetInDescriptorsFromTableStart = 5 + i;
         }
         
+        // t21 - spot shadow atlas, for shadow-casting headlights and the enemy
+        // helicopter searchlights. Appended last so no existing table offset
+        // moves.
+        globalSrvRanges[8].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        globalSrvRanges[8].NumDescriptors = 1;
+        globalSrvRanges[8].BaseShaderRegister = 21;
+        globalSrvRanges[8].RegisterSpace = 0;
+        globalSrvRanges[8].OffsetInDescriptorsFromTableStart = 8;
+
         rootParams[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rootParams[6].DescriptorTable.NumDescriptorRanges = 8;
+        rootParams[6].DescriptorTable.NumDescriptorRanges = _countof(globalSrvRanges);
         rootParams[6].DescriptorTable.pDescriptorRanges = globalSrvRanges;
         rootParams[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
@@ -626,9 +695,9 @@ public:
         rootParams[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         rootParams[8].Constants.ShaderRegister = 6;
         rootParams[8].Constants.RegisterSpace = 0;
-        // 15 DWORDs: grass uploads 13, terrain 15 (per-axis island scale + a
-        // terrain-style flag over the original 13). Both fit within this size.
-        rootParams[8].Constants.Num32BitValues = 16;
+        // Grass uploads 19 (the 13 wind/fade fields plus the player interaction
+        // capsule); terrain uploads 16. Sized for the larger of the two.
+        rootParams[8].Constants.Num32BitValues = 19;
         rootParams[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         rootParams[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[9].Descriptor.ShaderRegister = 6;
@@ -1411,7 +1480,8 @@ public:
                              ID3D12Resource* sparseIndices = nullptr,
                              UINT sparseProbeCount = 0,
                              UINT sparseCellCount = 0,
-                             UINT sparseIndexCount = 0) {
+                             UINT sparseIndexCount = 0,
+                             ID3D12Resource* spotShadowAtlas = nullptr) {
         UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
 
@@ -1481,12 +1551,27 @@ public:
             cpuHandle.ptr += descriptorSize;
         }
 
+        // [8] t21 - spot shadow atlas. A null resource still needs a real view:
+        // the range is declared in the root signature, and a bound table with
+        // an uninitialised slot is invalid even when nothing samples it.
+        D3D12_SHADER_RESOURCE_VIEW_DESC spotDesc = {};
+        spotDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        spotDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        spotDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        spotDesc.Texture2DArray.MipLevels = 1;
+        spotDesc.Texture2DArray.ArraySize = SPOT_SHADOW_COUNT;
+        g_dx12.device->CreateShaderResourceView(
+            spotShadowAtlas, &spotDesc, cpuHandle);
+        cpuHandle.ptr += descriptorSize;
+
         bindlessGlobalTableBase = BINDLESS_INVALID_INDEX;
         if (bindlessRequested && bindlessHeap && bindlessHeap->Initialized()) {
-            D3D12_CPU_DESCRIPTOR_HANDLE sources[8] = {};
+            // Must match globalSrvRanges: the table copies every declared slot,
+            // and stopping short leaves the last range reading a stale entry.
+            D3D12_CPU_DESCRIPTOR_HANDLE sources[9] = {};
             D3D12_CPU_DESCRIPTOR_HANDLE source =
                 g_dx12.cbvSrvUavHeap->GetCPUDescriptorHandleForHeapStart();
-            for (UINT i = 0; i < 8; ++i) {
+            for (UINT i = 0; i < _countof(sources); ++i) {
                 sources[i] = source;
                 source.ptr += descriptorSize;
             }
@@ -1901,6 +1986,9 @@ public:
         for (int i = 0; i < count; i++) {
             data.lights[i] = lights[i];
         }
+        data.spotShadowCount = static_cast<int>(g_spotShadowActiveCount);
+        for (UINT s = 0; s < SPOT_SHADOW_COUNT; ++s)
+            data.spotShadowMatrices[s] = XMMatrixTranspose(g_spotShadowMatrices[s]);
         pointLightsBuffer.CopyData(g_dx12.frameIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
     }
@@ -1963,4 +2051,3 @@ public:
 };
 
 #endif // SHADER_DX12_H
-

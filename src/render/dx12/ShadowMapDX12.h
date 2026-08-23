@@ -25,6 +25,7 @@
 static const UINT SHADOW_MAP_SIZE = 4096;
 static const UINT SHADOW_MAX_DRAWS = 12288;
 static const UINT SHADOW_MAX_INSTANCES = 12288;
+
 static constexpr D3D12_RESOURCE_STATES SHADOW_SHADER_READ_STATE =
     static_cast<D3D12_RESOURCE_STATES>(
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
@@ -97,7 +98,7 @@ public:
         rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         rootParams[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         rootParams[4].Constants.ShaderRegister = 6;
-        rootParams[4].Constants.Num32BitValues = 13;
+        rootParams[4].Constants.Num32BitValues = 19;
         rootParams[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
         rootParams[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[5].Descriptor.ShaderRegister = 6;
@@ -362,7 +363,7 @@ public:
 
     void SetGrass(const GrassField::Params& params,
                   D3D12_GPU_VIRTUAL_ADDRESS instances) {
-        g_dx12.commandList->SetGraphicsRoot32BitConstants(4, 13, &params, 0);
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(4, 19, &params, 0);
         g_dx12.commandList->SetGraphicsRootShaderResourceView(5, instances);
     }
 
@@ -482,6 +483,10 @@ class ShadowMapDX12 {
 public:
     ComPtr<ID3D12Resource> shadowMap;
     ComPtr<ID3D12DescriptorHeap> dsvHeap;
+    // Spot atlas: its own texture and DSV heap so the sun cascades' resource,
+    // views and barriers are untouched by this feature.
+    ComPtr<ID3D12Resource> spotShadowMap;
+    ComPtr<ID3D12DescriptorHeap> spotDsvHeap;
     DepthOnlyShaderDX12 depthShader;
     UINT size = SHADOW_MAP_SIZE;
     bool initialized = false;
@@ -489,6 +494,7 @@ public:
     bool Init(UINT mapSize = SHADOW_MAP_SIZE) {
         size = mapSize;
         if (!CreateShadowMap()) return false;
+        if (!CreateSpotShadowMap()) return false;
         if (!depthShader.Load("shaders/depth_vs.hlsl")) return false;
         initialized = true;
         std::cout << "Shadow map ready (" << size << "x" << size << ")" << std::endl;
@@ -497,6 +503,10 @@ public:
 
     ID3D12Resource* GetResource() const {
         return shadowMap.Get();
+    }
+
+    ID3D12Resource* GetSpotResource() const {
+        return spotShadowMap.Get();
     }
 
     XMMATRIX ComputeLightSpace(const Scene& scene) const {
@@ -595,45 +605,35 @@ public:
         return result;
     }
 
-    XMMATRIX Render(Scene& scene,
-                    const GeometryBuffers& geo,
-                    const std::vector<PrefabRenderBatch>& prefabRenderBatches,
-                    const std::shared_ptr<SceneNode>& crateModel,
-                    const std::vector<std::unique_ptr<SkinnedEnemy>>* bandits = nullptr) {
-        const auto cascadeMatrices = ComputeCascadeMatrices(scene);
-        g_shadowCascadeMatrices = cascadeMatrices;
-        XMMATRIX lightSpace = cascadeMatrices[0];
-        if (!initialized || scene.lightType != 0) return lightSpace;
-
-        depthShader.BeginFrame();
-        depthShader.SetPalmWindFrame(g_trees.GetWindFrame());
-
-        D3D12_RESOURCE_BARRIER barrier = {};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = shadowMap.Get();
-        barrier.Transition.StateBefore = SHADOW_SHADER_READ_STATE;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        g_dx12.commandList->ResourceBarrier(1, &barrier);
-
-        D3D12_VIEWPORT shadowViewport = {};
-        shadowViewport.Width = (float)size;
-        shadowViewport.Height = (float)size;
-        shadowViewport.MinDepth = 0.0f;
-        shadowViewport.MaxDepth = 1.0f;
-        D3D12_RECT shadowScissor = { 0, 0, (LONG)size, (LONG)size };
-        g_dx12.commandList->RSSetViewports(1, &shadowViewport);
-        g_dx12.commandList->RSSetScissorRects(1, &shadowScissor);
-
-        const UINT dsvStride = g_dx12.device->GetDescriptorHandleIncrementSize(
-            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        for (UINT cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
-        lightSpace = cascadeMatrices[cascade];
-        D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv = dsvHeap->GetCPUDescriptorHandleForHeapStart();
-        shadowDsv.ptr += static_cast<SIZE_T>(cascade) * dsvStride;
-        g_dx12.commandList->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-        g_dx12.commandList->OMSetRenderTargets(0, nullptr, FALSE, &shadowDsv);
-
+    // The shadow scene, recorded once per light-space matrix.
+    //
+    // Shared by the sun cascades and the spot casters so a caster can never
+    // drift out of step with what the cascades consider a shadow caster: one
+    // list of draws, two projections. spotCull switches the frustum test
+    // between the orthographic cascade box and a perspective cone.
+    void DrawShadowScene(Scene& scene,
+                         const GeometryBuffers& geo,
+                         const std::vector<PrefabRenderBatch>& prefabRenderBatches,
+                         const std::shared_ptr<SceneNode>& crateModel,
+                         const std::vector<std::unique_ptr<SkinnedEnemy>>* bandits,
+                         const XMMATRIX& lightSpace,
+                         bool spotCull,
+                         ShaderDX12* terrainShader = nullptr) {
+        // Terrain first, while the main graphics root signature can still be
+        // bound: it runs on the mesh-shader pipeline and needs slots that
+        // DepthOnlyShaderDX12 does not declare. depthShader.Use() below then
+        // takes the signature back for every other caster.
+        if (terrainShader && g_terrain.supported && !g_emptyLevelMode) {
+            // The previous caster leaves DepthOnlyShaderDX12's root signature
+            // bound. ShaderDX12 caches its binding state, so invalidate that
+            // cache before switching back; otherwise cascade 1 writes main-root
+            // parameters through the depth root signature inside the driver.
+            terrainShader->InvalidateGraphicsRootBinding();
+            terrainShader->Use(false);
+            terrainShader->SetMatrices(XMMatrixIdentity(), XMMatrixIdentity(),
+                                       lightSpace, lightSpace);
+            g_terrain.DrawShadow(*terrainShader, CurrentTerrainParams());
+        }
         depthShader.Use();
 
         if (crateModel) {
@@ -648,9 +648,11 @@ public:
 
         // Detached chunks keep casting shadows from their live physics poses.
         if (scene.useDestruction && g_destruction.IsInitialized()) {
-            // Anything outside the light's ortho box cannot land in the shadow
-            // map; skip it before recording the draw. lightSpace is orthographic
-            // so w stays 1 and the NDC test needs no divide.
+            // Anything outside the light's frustum cannot land in the shadow
+            // map; skip it before recording the draw. Handles both projections:
+            // the sun cascades are orthographic (w stays 1, so the divide is a
+            // no-op) while the spot casters are perspective, where w is the
+            // view depth and the divide is what makes the test correct.
             const float ortho = (std::max)(scene.shadowOrthoSize, 1.0f);
             const float distance = (std::max)(scene.shadowDistance, 1.0f);
             const float depthRange =
@@ -660,11 +662,19 @@ public:
                 XMFLOAT4 ndc;
                 XMStoreFloat4(&ndc, XMVector4Transform(
                     XMVectorSet(c.x, c.y, c.z, 1.0f), lightSpace));
-                const float rx = r / ortho;
-                const float rz = r / depthRange;
-                return std::fabs(ndc.x) <= 1.0f + rx &&
-                       std::fabs(ndc.y) <= 1.0f + rx &&
-                       ndc.z + rz >= 0.0f && ndc.z - rz <= 1.0f;
+                // Behind the light entirely: for a perspective frustum w <= 0
+                // means the sphere centre is at or behind the eye, and the
+                // radius is the only thing that can still reach into view.
+                if (ndc.w <= 0.0f) return spotCull && r > -ndc.w;
+                const float invW = spotCull ? 1.0f / ndc.w : 1.0f;
+                const float rx = spotCull ? (r / ndc.w) : (r / ortho);
+                const float rz = spotCull ? (r / ndc.w) : (r / depthRange);
+                const float x = ndc.x * invW;
+                const float y = ndc.y * invW;
+                const float z = ndc.z * invW;
+                return std::fabs(x) <= 1.0f + rx &&
+                       std::fabs(y) <= 1.0f + rx &&
+                       z + rz >= 0.0f && z - rz <= 1.0f;
             };
             const auto& batches = g_destruction.GetRenderBatches();
             if (!batches.empty()) {
@@ -734,6 +744,20 @@ public:
             // rather than the instanced fast path.
             DrawSceneNodeShadow(g_blackHawkModel, depthShader,
                 BlackHawkWorldMatrix(), lightSpace, UploadBlackHawkPalette());
+        }
+
+        // Enemy gunships. Previously absent from this pass entirely, so an
+        // aircraft cast nothing -- most obviously under its own searchlight,
+        // which lit the ground straight through the fuselage carrying it.
+        // Mirrors the draw gates in RenderForward.
+        if (!g_emptyLevelMode && g_helicopterModel && scene.showHelicopter) {
+            DrawSceneNodeShadow(g_helicopterModel, depthShader,
+                HelicopterWorldMatrix(), lightSpace);
+            if (SecondaryHelicopterVisible())
+                DrawSceneNodeShadow(
+                    g_secondaryHelicopterModel ? g_secondaryHelicopterModel
+                                               : g_helicopterModel,
+                    depthShader, SecondaryHelicopterWorldMatrix(), lightSpace);
         }
 
         for (const PrefabRenderBatch& batch : prefabRenderBatches) {
@@ -896,6 +920,139 @@ public:
             DrawCube(geo);
             depthShader.NextDrawCall();
         }
+    }
+
+    // Depth for every registered spot caster, one atlas slice each.
+    //
+    // Runs after the cascades and reuses their depth-only shader and draw
+    // list, so anything that casts a sun shadow casts a headlight shadow too.
+    // The casters were registered earlier this frame by the light-add
+    // functions in ForwardRenderer, which is what guarantees slice N here is
+    // the same frustum the lights tagged with spotShadowIndex N.
+    void RenderSpotShadows(
+            Scene& scene,
+            const GeometryBuffers& geo,
+            const std::vector<PrefabRenderBatch>& prefabRenderBatches,
+            const std::shared_ptr<SceneNode>& crateModel,
+            const std::vector<std::unique_ptr<SkinnedEnemy>>* bandits,
+            ShaderDX12* terrainShader) {
+        const UINT casterCount = (std::min)(
+            static_cast<UINT>(g_spotShadowCasters.size()), SPOT_SHADOW_COUNT);
+        // Published before the early-out: with no casters this frame the
+        // shaders must see zero, or they keep sampling last frame's depth for
+        // a vehicle that has since been destroyed or driven out of the level.
+        g_spotShadowActiveCount = casterCount;
+        for (UINT slice = 0; slice < casterCount; ++slice)
+            g_spotShadowMatrices[slice] = g_spotShadowCasters[slice].viewProjection;
+        if (!casterCount || !spotShadowMap) return;
+
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = spotShadowMap.Get();
+        barrier.Transition.StateBefore = SHADOW_SHADER_READ_STATE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_dx12.commandList->ResourceBarrier(1, &barrier);
+
+        D3D12_VIEWPORT spotViewport = {};
+        spotViewport.Width = static_cast<float>(SPOT_SHADOW_SIZE);
+        spotViewport.Height = static_cast<float>(SPOT_SHADOW_SIZE);
+        spotViewport.MinDepth = 0.0f;
+        spotViewport.MaxDepth = 1.0f;
+        D3D12_RECT spotScissor = {
+            0, 0, (LONG)SPOT_SHADOW_SIZE, (LONG)SPOT_SHADOW_SIZE };
+        g_dx12.commandList->RSSetViewports(1, &spotViewport);
+        g_dx12.commandList->RSSetScissorRects(1, &spotScissor);
+
+        const UINT dsvStride = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        for (UINT slice = 0; slice < casterCount; ++slice) {
+            D3D12_CPU_DESCRIPTOR_HANDLE spotDsv =
+                spotDsvHeap->GetCPUDescriptorHandleForHeapStart();
+            spotDsv.ptr += static_cast<SIZE_T>(slice) * dsvStride;
+            g_dx12.commandList->ClearDepthStencilView(
+                spotDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            g_dx12.commandList->OMSetRenderTargets(0, nullptr, FALSE, &spotDsv);
+            DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
+                            bandits, g_spotShadowCasters[slice].viewProjection,
+                            true, terrainShader);
+        }
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        barrier.Transition.StateAfter = SHADOW_SHADER_READ_STATE;
+        g_dx12.commandList->ResourceBarrier(1, &barrier);
+    }
+
+    XMMATRIX Render(Scene& scene,
+                    const GeometryBuffers& geo,
+                    const std::vector<PrefabRenderBatch>& prefabRenderBatches,
+                    const std::shared_ptr<SceneNode>& crateModel,
+                    const std::vector<std::unique_ptr<SkinnedEnemy>>* bandits = nullptr,
+                    ShaderDX12* terrainShader = nullptr) {
+        const auto cascadeMatrices = ComputeCascadeMatrices(scene);
+        g_shadowCascadeMatrices = cascadeMatrices;
+        XMMATRIX lightSpace = cascadeMatrices[0];
+        // Spot casters do not depend on the sun: a headlight or a searchlight
+        // still needs its depth even when the level runs a non-directional
+        // light type, which skips the cascade pass entirely below. Rendered
+        // before that early-out so the atlas is filled either way.
+        if (initialized) {
+            depthShader.BeginFrame();
+            depthShader.SetPalmWindFrame(g_trees.GetWindFrame());
+            RenderSpotShadows(scene, geo, prefabRenderBatches, crateModel,
+                              bandits, terrainShader);
+        }
+        if (!initialized || scene.lightType != 0) {
+            // The spot pass above left its own atlas-sized viewport and a null
+            // render target bound. The cascade path restores both on its way
+            // out; this early return has to do the same, or the frame draws
+            // into a 2048-square corner of the screen.
+            if (initialized) {
+                D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetCPUDescriptorHandle(
+                    g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize,
+                    g_dx12.frameIndex);
+                D3D12_CPU_DESCRIPTOR_HANDLE dsv =
+                    g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+                g_dx12.commandList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+                g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
+                g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+            }
+            if (terrainShader)
+                terrainShader->InvalidateGraphicsRootBinding();
+            return lightSpace;
+        }
+
+        depthShader.BeginFrame();
+        depthShader.SetPalmWindFrame(g_trees.GetWindFrame());
+
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = shadowMap.Get();
+        barrier.Transition.StateBefore = SHADOW_SHADER_READ_STATE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_dx12.commandList->ResourceBarrier(1, &barrier);
+
+        D3D12_VIEWPORT shadowViewport = {};
+        shadowViewport.Width = (float)size;
+        shadowViewport.Height = (float)size;
+        shadowViewport.MinDepth = 0.0f;
+        shadowViewport.MaxDepth = 1.0f;
+        D3D12_RECT shadowScissor = { 0, 0, (LONG)size, (LONG)size };
+        g_dx12.commandList->RSSetViewports(1, &shadowViewport);
+        g_dx12.commandList->RSSetScissorRects(1, &shadowScissor);
+
+        const UINT dsvStride = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        for (UINT cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+        lightSpace = cascadeMatrices[cascade];
+        D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv = dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        shadowDsv.ptr += static_cast<SIZE_T>(cascade) * dsvStride;
+        g_dx12.commandList->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        g_dx12.commandList->OMSetRenderTargets(0, nullptr, FALSE, &shadowDsv);
+
+        DrawShadowScene(scene, geo, prefabRenderBatches, crateModel, bandits,
+                        lightSpace, false, terrainShader);
         }
         lightSpace = cascadeMatrices[0];
 
@@ -909,6 +1066,10 @@ public:
         g_dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
         g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
         g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+        // DrawShadowScene finishes on the depth-only root signature. Make the
+        // main shader rebind before the forward/visibility extension pass.
+        if (terrainShader)
+            terrainShader->InvalidateGraphicsRootBinding();
 
         return lightSpace;
     }
@@ -958,6 +1119,61 @@ private:
         for (UINT cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
             dsvDesc.Texture2DArray.FirstArraySlice = cascade;
             g_dx12.device->CreateDepthStencilView(shadowMap.Get(), &dsvDesc, dsv);
+            dsv.ptr += dsvStride;
+        }
+
+        return true;
+    }
+
+    // Spot atlas. Same format and states as the cascades so both can share the
+    // depth-only shader and the comparison sampler already bound at s0.
+    bool CreateSpotShadowMap() {
+        D3D12_HEAP_PROPERTIES heapProps = {};
+        heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC texDesc = {};
+        texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texDesc.Width = SPOT_SHADOW_SIZE;
+        texDesc.Height = SPOT_SHADOW_SIZE;
+        texDesc.DepthOrArraySize = static_cast<UINT16>(SPOT_SHADOW_COUNT);
+        texDesc.MipLevels = 1;
+        texDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+        texDesc.SampleDesc.Count = 1;
+        texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+        D3D12_CLEAR_VALUE clearValue = {};
+        clearValue.Format = DXGI_FORMAT_D32_FLOAT;
+        clearValue.DepthStencil.Depth = 1.0f;
+        clearValue.DepthStencil.Stencil = 0;
+
+        HRESULT hr = g_dx12.device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &texDesc,
+            SHADOW_SHADER_READ_STATE, &clearValue,
+            IID_PPV_ARGS(&spotShadowMap));
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create spot shadow atlas" << std::endl;
+            return false;
+        }
+
+        D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
+        dsvHeapDesc.NumDescriptors = SPOT_SHADOW_COUNT;
+        dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        hr = g_dx12.device->CreateDescriptorHeap(
+            &dsvHeapDesc, IID_PPV_ARGS(&spotDsvHeap));
+        if (FAILED(hr)) return false;
+
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+        dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
+        dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        dsvDesc.Texture2DArray.ArraySize = 1;
+        const UINT dsvStride = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv =
+            spotDsvHeap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT slice = 0; slice < SPOT_SHADOW_COUNT; ++slice) {
+            dsvDesc.Texture2DArray.FirstArraySlice = slice;
+            g_dx12.device->CreateDepthStencilView(
+                spotShadowMap.Get(), &dsvDesc, dsv);
             dsv.ptr += dsvStride;
         }
 

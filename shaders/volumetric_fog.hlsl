@@ -10,6 +10,12 @@ struct FogPointLight
     float radius;
     float3 color;
     float intensity;
+    // Cone axis, unit length; zero scatters in all directions.
+    float3 spotDirection;
+    float spotCosInner;
+    float spotCosOuter;
+    int spotShadowIndex;
+    float2 spotPadding;
 };
 
 cbuffer FogConstants : register(b0)
@@ -32,7 +38,15 @@ cbuffer FogConstants : register(b0)
     uint4 maxVolumeDims;          // allocated froxel volume size (>= volumeDims)
 #ifdef SGE_WORLD_CLOUDS
     float4 flyableCloudParams;    // base height, thickness, density, coverage
+#else
+    // The C++ FogConstants declares this unconditionally. Keeping a placeholder
+    // here means everything after it sits at the same offset in both builds --
+    // without it the spot matrices below would read the cloud params instead.
+    float4 flyableCloudParamsUnused;
 #endif
+    // Spot shadow atlas transforms; see FogConstants in VolumetricFogDX12.h.
+    float4x4 spotShadowMatrices[3];
+    uint4 spotShadowCount;        // x = live slices, yzw unused
 };
 
 StructuredBuffer<FogCluster> clusters : register(t0);
@@ -45,6 +59,11 @@ Texture2DMS<float, 4> sceneDepthMS : register(t5);
 Texture3D<float4> cloudShapeVolume : register(t6);
 Texture3D<float4> cloudDetailVolume : register(t7);
 #endif
+// Spot shadow atlas: one slice per shadow-casting spot light (vehicle
+// headlights, enemy helicopter searchlights). Not the player flashlight.
+// Outside the cloud guard: the root signature declares it either way, so a
+// build without world clouds must still bind the same register.
+Texture2DArray<float> spotShadowAtlas : register(t8);
 RWTexture3D<float4> fogVolumeOut : register(u0);
 
 SamplerComparisonState shadowSampler : register(s0);
@@ -113,6 +132,37 @@ float SunVisibility(float3 worldPosition, float rotation)
             float3(uv + mul(kTaps[i], rotate) * radius, cascade),
             projected.z - 0.0025);
     return visibility * 0.2;
+}
+
+// Occlusion for a shadow-casting spot light, at a point in the air.
+//
+// Same atlas and transforms as the surface shading, but this samples FROXELS
+// rather than geometry: a beam is visible because the air along it scatters,
+// so a froxel sitting behind a wall has to be cut here too, or the shaft draws
+// straight through the wall the surface pass correctly darkened.
+//
+// Single tap, no PCF. The froxel grid is far coarser than the screen, so the
+// soft edge a kernel would buy is well below what this volume can resolve.
+float SpotShadowVisibilityFog(int shadowIndex, float3 worldPosition)
+{
+    if (shadowIndex < 0 || shadowIndex >= (int)spotShadowCount.x)
+        return 1.0;
+
+    float4 lightClip = mul(float4(worldPosition, 1.0),
+                           spotShadowMatrices[shadowIndex]);
+    if (lightClip.w <= 0.0)
+        return 1.0;
+    float3 proj = lightClip.xyz / lightClip.w;
+    if (any(abs(proj.xy) > 1.0) || proj.z < 0.0 || proj.z > 1.0)
+        return 1.0;
+
+    float2 uv = proj.xy * float2(0.5, -0.5) + 0.5;
+    // Looser than the surface bias: a froxel centre can sit a metre or more
+    // from the surface that occludes it, and a tight bias makes the shaft
+    // flicker as froxels cross the depth boundary between frames.
+    float bias = 0.004 + 0.006 * saturate(lightClip.w / 40.0);
+    return spotShadowAtlas.SampleCmpLevelZero(
+        shadowSampler, float3(uv, (float)shadowIndex), proj.z - bias);
 }
 
 float HenyeyGreenstein(float cosineTheta, float g)
@@ -613,7 +663,27 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             float3 toLight = light.position - worldPosition;
             float distanceToLight = length(toLight);
             float range = saturate(1.0 - distanceToLight / max(light.radius, 0.001));
-            lighting += light.color * light.intensity * range * range * 0.10;
+            float cone = 1.0;
+            if (dot(light.spotDirection, light.spotDirection) > 0.0001)
+            {
+                // Lit froxels inside the cone are what draw the beam itself --
+                // the shaft is visible because the air along it scatters, not
+                // because anything solid is being lit.
+                float3 fromLight = -toLight / max(distanceToLight, 1e-4);
+                float cosAngle = dot(fromLight, normalize(light.spotDirection));
+                cone = smoothstep(light.spotCosOuter, light.spotCosInner, cosAngle);
+                // Forward scattering: a torch beam is far brighter looked into
+                // than across, which is what separates a shaft in the air from
+                // a uniformly glowing cone.
+                float forwardPhase = saturate(dot(-ray, fromLight));
+                cone *= 1.0 + 2.5 * forwardPhase * forwardPhase;
+                // Cut the shaft where the beam is blocked, so a shadowed
+                // headlight does not fog through the wall it is pointed at.
+                if (cone > 0.0)
+                    cone *= SpotShadowVisibilityFog(light.spotShadowIndex,
+                                                    worldPosition);
+            }
+            lighting += light.color * light.intensity * range * range * cone * 0.10;
         }
 
         float3 segmentScattering = lighting * (1.0 - segmentTransmittance);

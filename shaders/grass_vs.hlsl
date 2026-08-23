@@ -43,7 +43,36 @@ cbuffer GrassParams : register(b6) {
     float gHelicopterWindRadius;
     float gHelicopterWindStrength;
     float gPixelWorldScale;
+    float gPlayerX;
+    float gPlayerZ;
+    float gPlayerPushStrength;   // 0 disables the push entirely
+    float gPlayerPushRadius;
+    float gPlayerTrailX;
+    float gPlayerTrailZ;
 };
+
+// Distance to the player's recent ground-plane path makes a swept capsule rather
+// than a rigid circle. The trailing endpoint eases toward the player on the CPU,
+// leaving a short wake that closes naturally after they pass.
+float2 PlayerPush(float2 root) {
+    if (gPlayerPushStrength <= 0.0) return float2(0.0, 0.0);
+    const float2 player = float2(gPlayerX, gPlayerZ);
+    const float2 segment = float2(gPlayerTrailX, gPlayerTrailZ) - player;
+    const float segmentLengthSq = dot(segment, segment);
+    const float along = segmentLengthSq > 1e-6
+        ? saturate(dot(root - player, segment) / segmentLengthSq) : 0.0;
+    const float2 away = root - (player + segment * along);
+    const float distance = length(away);
+    const float contact = saturate(
+        1.0 - distance / max(gPlayerPushRadius, 1e-3));
+    const float falloff = contact * contact * (3.0 - 2.0 * contact);
+    const float force = falloff * gPlayerPushStrength;
+    const float bend = force / (0.5 + force);
+    const float2 perpendicular = segmentLengthSq > 1e-6
+        ? normalize(float2(-segment.y, segment.x)) : float2(1.0, 0.0);
+    const float2 direction = distance > 1e-3 ? away / distance : perpendicular;
+    return direction * bend;
+}
 
 // One blade. Matches GrassField::BladeInstance exactly.
 struct BladeInstance {
@@ -126,8 +155,14 @@ VS_OUTPUT main(VS_INPUT input) {
     // the wind pushing along the prevailing direction. Clamped, because a tip that
     // travels further than the blade is long has nowhere to bend to, and the droop
     // term below would fold it through its own root.
-    float2 tip = b.lean + windDir * bend + helicopterDirection *
-        (helicopterFalloff * gHelicopterWindStrength * rotorPulse);
+    const float2 playerPush = PlayerPush(b.root.xz);
+    // Contact dominates the broad wind close to the body, so the field parts
+    // around the path instead of occasionally being blown back through it.
+    const float contactInfluence = saturate(dot(playerPush, playerPush) * 2.0);
+    float2 tip = b.lean + windDir * bend * (1.0 - contactInfluence * 0.8) +
+        helicopterDirection *
+        (helicopterFalloff * gHelicopterWindStrength * rotorPulse) +
+        playerPush;
     const float tipLen = length(tip);
     const float kMaxBend = 0.97;
     if (tipLen > kMaxBend) tip *= kMaxBend / tipLen;

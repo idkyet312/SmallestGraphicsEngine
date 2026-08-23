@@ -189,11 +189,17 @@ struct alignas(256) VBExposureConstants {
 
 class VisibilityBufferDX12 {
 public:
-    // Descriptor-table sizes include the final t91 terrain splatmap slot.
+    // Descriptor-table sizes include the final t92 spot shadow atlas slot.
     // Keep allocation and copy counts tied to these values: omitting the last
     // descriptor makes bindless sample an uninitialized heap entry.
-    static constexpr UINT kResolveDescriptorCount = 91;
-    static constexpr UINT kEnhancedResolveDescriptorCount = 104;
+    static constexpr UINT kResolveDescriptorCount = 92;
+    static constexpr UINT kEnhancedResolveDescriptorCount = 105;
+    // Heap index of the spot shadow atlas (t92). Sits one past the terrain
+    // splatmap, which was the previous last slot.
+    static constexpr UINT kSpotShadowAtlasSlot = 91;
+    // Set once at startup from ShadowMapDX12's atlas; the resource is created
+    // there and lives for the process, so this never needs re-pointing.
+    ID3D12Resource* spotShadowAtlasResource = nullptr;
 
     // Full-width instance and primitive IDs (R32G32_UINT).
     ComPtr<ID3D12Resource> visBufferRT;
@@ -3253,6 +3259,26 @@ private:
         g_dx12.device->CreateShaderResourceView(terrainSplatMap, &srv, handle);
     }
 
+    // Writes the t92 spot shadow atlas descriptor. A null resource still needs
+    // a valid view: the root signature declares the range, and the debug layer
+    // rejects a bound table with an uninitialised slot even when the shader
+    // never samples it (which is the case whenever nothing is casting).
+    void WriteSpotShadowAtlasDescriptor(ID3D12DescriptorHeap* heap, UINT slot) {
+        if (!heap) return;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = DXGI_FORMAT_R32_FLOAT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2DArray.MipLevels = 1;
+        srv.Texture2DArray.ArraySize = SPOT_SHADOW_COUNT;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle =
+            heap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(
+            g_dx12.cbvSrvUavDescriptorSize) * slot;
+        g_dx12.device->CreateShaderResourceView(
+            spotShadowAtlasResource, &srv, handle);
+    }
+
     void WriteBentNormalHistoryDescriptor(ID3D12DescriptorHeap* heap,
                                           UINT slot,
                                           ID3D12Resource* history) {
@@ -4359,7 +4385,7 @@ private:
         //   [97]     u7       current stable surfaces
         //   [98]     t85      raytracing hit geometry bindings
         //   [99]     t86      bent-normal GTAO history
-        D3D12_DESCRIPTOR_RANGE ranges[19] = {};
+        D3D12_DESCRIPTOR_RANGE ranges[20] = {};
         ranges[0] = baseRanges[0];                          // t0..t78
         ranges[1] = baseRanges[1];                          // u0..u2 @ 79
         ranges[2] = baseRanges[2];                          // b1..b4 @ 82
@@ -4461,6 +4487,13 @@ private:
         ranges[18].BaseShaderRegister = 91;
         ranges[18].RegisterSpace = 0;
         ranges[18].OffsetInDescriptorsFromTableStart = 103;
+
+        //   [104] t92 spot shadow atlas
+        ranges[19].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[19].NumDescriptors = 1;
+        ranges[19].BaseShaderRegister = 92;
+        ranges[19].RegisterSpace = 0;
+        ranges[19].OffsetInDescriptorsFromTableStart = 104;
 
         D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -5243,6 +5276,8 @@ private:
         // never takes the terrain branch, but its root signature declares the
         // range, so the slots still have to hold valid descriptors.
         WriteTerrainDescriptors(enhancedHeap, 100);
+        // [104] t92 spot shadow atlas, one past the splatmap at [103].
+        WriteSpotShadowAtlasDescriptor(enhancedHeap, 104);
 
         // [86] t79 - TLAS. The slot must hold a valid descriptor even when
         // there is no acceleration structure yet: the runtime requires every
@@ -5824,7 +5859,7 @@ private:
         //   [8] b1 - light buffer CBV
         //   [9] b2 - point lights CBV
 
-        D3D12_DESCRIPTOR_RANGE ranges[6] = {};
+        D3D12_DESCRIPTOR_RANGE ranges[7] = {};
         // SRVs t0..t78: frame/geometry, materials, IBL, DDGI, sparse lookup.
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[0].NumDescriptors = 79;
@@ -5872,6 +5907,13 @@ private:
         ranges[5].BaseShaderRegister = 91;
         ranges[5].RegisterSpace = 0;
         ranges[5].OffsetInDescriptorsFromTableStart = 90;
+
+        // [91] t92 spot shadow atlas. Appended again for the same reason.
+        ranges[6].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[6].NumDescriptors = 1;
+        ranges[6].BaseShaderRegister = 92;
+        ranges[6].RegisterSpace = 0;
+        ranges[6].OffsetInDescriptorsFromTableStart = kSpotShadowAtlasSlot;
 
         D3D12_ROOT_PARAMETER resolveParams[3] = {};
 
@@ -7031,7 +7073,14 @@ public:
     // Update the shadow map SRV in the compute descriptor heap
     void UpdateShadowMapDescriptor(ID3D12Resource* shadowMapResource) {
         if (!computeDescHeap) return;
-        
+
+        // Spot atlas rides along on the same per-frame call. The resource
+        // itself never changes once ShadowMapDX12 has created it, but this is
+        // the first point each frame where the heap is known to exist, and
+        // rewriting a descriptor to the same resource costs nothing.
+        WriteSpotShadowAtlasDescriptor(computeDescHeap.Get(),
+                                       kSpotShadowAtlasSlot);
+
         UINT descSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
         cpuHandle.ptr += 2 * descSize; // slot [2] = t2

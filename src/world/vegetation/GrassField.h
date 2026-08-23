@@ -159,7 +159,42 @@ public:
         }
     }
 
-    void Update(float dt) { m_time += dt; }
+    void Update(float dt) {
+        m_time += dt;
+
+        const XMFLOAT2 player(m_playerPosition.x, m_playerPosition.z);
+        if (!PlayerPushActive()) {
+            m_playerTrailPosition = player;
+            m_playerTrailInitialized = false;
+            return;
+        }
+        if (!m_playerTrailInitialized) {
+            m_playerTrailPosition = player;
+            m_playerTrailInitialized = true;
+            return;
+        }
+
+        // A lagging interaction point turns the circular footprint into a short
+        // swept capsule. When movement stops it catches up exponentially, so the
+        // wake closes smoothly instead of every passed blade snapping upright.
+        const float follow = 1.0f - std::exp(
+            -(std::max)(dt, 0.0f) * 4.0f);
+        m_playerTrailPosition.x +=
+            (player.x - m_playerTrailPosition.x) * follow;
+        m_playerTrailPosition.y +=
+            (player.y - m_playerTrailPosition.y) * follow;
+
+        // A hitch or teleport must not leave a field-wide interaction segment.
+        const float dx = player.x - m_playerTrailPosition.x;
+        const float dz = player.y - m_playerTrailPosition.y;
+        const float distance = std::sqrt(dx * dx + dz * dz);
+        const float maxTrail = (std::max)(m_playerPushRadius * 0.85f, 0.25f);
+        if (distance > maxTrail) {
+            const float scale = maxTrail / distance;
+            m_playerTrailPosition.x = player.x - dx * scale;
+            m_playerTrailPosition.y = player.y - dz * scale;
+        }
+    }
 
     // Where the camera is. Feeds the shader's distance fade and the cell cull.
     void SetViewer(const XMFLOAT3& eye) { m_eye = eye; }
@@ -219,7 +254,7 @@ public:
         return false;
     }
 
-    // The 12 root constants (b6) the grass vertex shader reads. Laid out to match
+    // The 19 root constants (b6) the grass vertex shader reads. Laid out to match
     // grass_vs.hlsl's GrassParams exactly.
     struct Params {
         float time;
@@ -240,6 +275,21 @@ public:
         // World-space height of one screen pixel per unit of view distance.
         // Keeps distant moving blades rasterizable instead of subpixel flicker.
         float pixelWorldScale;
+        // The player, as a wash source that shoves blades radially outward.
+        // Kept separate from the helicopter slot: the two overlap constantly
+        // (the player runs under the insertion bird), and folding them into one
+        // source would make whichever is nearer snap the field back and forth.
+        float playerX;
+        float playerZ;
+        // Tip offset, in blade-height units, applied at the player's feet.
+        // Zero disables the push, which is how the CPU switches it off while
+        // the player is airborne or standing above the field.
+        float playerPushStrength;
+        float playerPushRadius;
+        // The trailing end of the swept interaction capsule. It follows the
+        // player with a short delay so passed vegetation recovers gradually.
+        float playerTrailX;
+        float playerTrailZ;
     };
     Params GetParams(float verticalFovDegrees, float viewportHeight) const {
         Params p;
@@ -258,6 +308,14 @@ public:
         p.pixelWorldScale = 2.0f * std::tan(
             XMConvertToRadians(verticalFovDegrees) * 0.5f) /
             (std::max)(viewportHeight, 1.0f);
+        p.playerX = m_playerPosition.x;
+        p.playerZ = m_playerPosition.z;
+        p.playerPushStrength = PlayerPushActive() ? m_playerPushStrength : 0.0f;
+        p.playerPushRadius = m_playerPushRadius;
+        p.playerTrailX = m_playerTrailInitialized
+            ? m_playerTrailPosition.x : m_playerPosition.x;
+        p.playerTrailZ = m_playerTrailInitialized
+            ? m_playerTrailPosition.y : m_playerPosition.z;
         return p;
     }
     bool IsInitialized() const { return m_ready; }
@@ -276,6 +334,73 @@ public:
         m_helicopterPosition = position;
         m_helicopterWindStrength = enabled ? 1.8f : 0.0f;
     }
+    // Blades near the player bend away from them. Pass the player's FEET, not
+    // the eye: the push is a ground-plane effect and the eye sits a body-height
+    // above the blades being parted. `enabled` is the caller's grounded test: a
+    // player mid-jump or on a rooftop is not touching the field under them.
+    void SetPlayerPush(const XMFLOAT3& feetPosition, bool enabled) {
+        m_playerPosition = feetPosition;
+        m_playerPushActive = enabled;
+    }
+    // Interaction toggle and push shape, surfaced alongside the wind controls.
+    bool& PlayerPushEnabled()    { return m_playerPushEnabled; }
+    float& PlayerPushRadius()   { return m_playerPushRadius; }
+    float& PlayerPushStrength() { return m_playerPushStrength; }
+
+    // The same push the grass shaders apply, evaluated on the CPU so the other
+    // ground foliage can lean with it. Dandelions are single instanced models
+    // whose only per-plant data is a world matrix, so they bend by tilting that
+    // matrix rather than by a vertex shader of their own -- and this is the one
+    // definition both paths read, so they cannot drift apart.
+    //
+    // Returns a tip offset in PLANT-HEIGHT units, pointing away from the player.
+    // Mirrors PlayerPush in grass_vs.hlsl.
+    XMFLOAT2 PlayerPushAt(float x, float z) const {
+        if (!PlayerPushActive())
+            return XMFLOAT2(0.0f, 0.0f);
+        const float trailX = m_playerTrailInitialized
+            ? m_playerTrailPosition.x : m_playerPosition.x;
+        const float trailZ = m_playerTrailInitialized
+            ? m_playerTrailPosition.y : m_playerPosition.z;
+        const float segmentX = trailX - m_playerPosition.x;
+        const float segmentZ = trailZ - m_playerPosition.z;
+        const float segmentLengthSq =
+            segmentX * segmentX + segmentZ * segmentZ;
+        const float fromPlayerX = x - m_playerPosition.x;
+        const float fromPlayerZ = z - m_playerPosition.z;
+        const float along = segmentLengthSq > 1e-6f
+            ? std::clamp((fromPlayerX * segmentX + fromPlayerZ * segmentZ) /
+                         segmentLengthSq, 0.0f, 1.0f)
+            : 0.0f;
+        const float nearestX = m_playerPosition.x + segmentX * along;
+        const float nearestZ = m_playerPosition.z + segmentZ * along;
+        const float ax = x - nearestX;
+        const float az = z - nearestZ;
+        const float distance = std::sqrt(ax * ax + az * az);
+        const float radius = (std::max)(m_playerPushRadius, 1e-3f);
+        if (distance >= radius) return XMFLOAT2(0.0f, 0.0f);
+        const float contact = 1.0f - distance / radius;
+        const float falloff = contact * contact * (3.0f - 2.0f * contact);
+        // Convert authored force to a bounded bend. This keeps strong settings
+        // from flattening a large, perfectly uniform disc of vegetation.
+        const float force = falloff * m_playerPushStrength;
+        const float scale = force / (0.5f + force);
+        if (distance <= 1e-3f) {
+            if (segmentLengthSq <= 1e-6f) return XMFLOAT2(scale, 0.0f);
+            const float inverseLength = 1.0f / std::sqrt(segmentLengthSq);
+            return XMFLOAT2(-segmentZ * inverseLength * scale,
+                            segmentX * inverseLength * scale);
+        }
+        return XMFLOAT2(ax / distance * scale, az / distance * scale);
+    }
+    // True while the push is doing anything at all, so callers can skip the
+    // per-instance work entirely on the frames it cannot matter.
+    bool PlayerPushActive() const {
+        return m_playerPushEnabled && m_playerPushActive &&
+               m_playerPushStrength > 0.0f;
+    }
+    const XMFLOAT3& PlayerPushPosition() const { return m_playerPosition; }
+    float PlayerPushRadiusValue() const { return m_playerPushRadius; }
     // Perf controls, surfaced to the UI. Density trims instances per cell;
     // draw distance feeds both the cell cull and the shader's fade.
     float& Density()      { return m_density; }
@@ -904,11 +1029,20 @@ private:
 
     float m_time = 0.0f;
     float m_waterY = 0.0f;
-    float m_windStrength = 0.28f;
-    float m_windSpeed = 1.6f;
+    float m_windStrength = 0.85f;
+    float m_windSpeed = 1.1f;
     XMFLOAT3 m_helicopterPosition{};
     float m_helicopterWindRadius = 22.0f;
     float m_helicopterWindStrength = 0.0f;
+    // Player interaction fills b6 to 19 DWORDs; both raster and shadow root
+    // signatures carry the same complete constants block.
+    XMFLOAT3 m_playerPosition{};
+    XMFLOAT2 m_playerTrailPosition{};
+    float m_playerPushRadius = 2.30f;
+    float m_playerPushStrength = 1.5f;
+    bool  m_playerPushEnabled = true;
+    bool  m_playerPushActive = false;
+    bool  m_playerTrailInitialized = false;
     bool  m_ready = false;
 };
 

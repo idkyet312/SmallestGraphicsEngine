@@ -11,6 +11,9 @@
 #include "DDGI_DX12.h"
 #include "Scene.h"
 #include "SceneGraph.h"
+// Headlights are night-only, so this header needs the preset test itself rather
+// than relying on main.cpp happening to include it first.
+#include "TimeOfDay.h"
 #include "MeshShaderDX12.h"
 #include "TerrainRendererDX12.h"
 #include "DestructionDX12.h"
@@ -103,6 +106,9 @@ extern ID3D12Resource* g_skyEnvironmentResource;
 extern ID3D12Resource* g_specularEnvironmentResource;
 extern ID3D12Resource* g_brdfIntegrationResource;
 extern ID3D12Resource* g_ddgiIrradianceResource;
+// Spot shadow atlas from ShadowMapDX12, bound as t21 for the forward path.
+// Set once at startup; null until then, which binds a valid null view.
+extern ID3D12Resource* g_spotShadowAtlasResource;
 extern ID3D12Resource* g_ddgiVisibilityResource;
 extern ID3D12Resource* g_dxrDDGIProbeResource;
 extern ID3D12Resource* g_dxrDDGICellResource;
@@ -133,8 +139,304 @@ std::vector<ImpactDecalDataDX12> BuildImpactDecalGPUList();
 extern const float kImpactDecalLifetime;
 extern bool g_impactDecalsEnabled;
 extern bool g_impactDecalCutouts;
+// Weapon light, switched with J when the flashlight fills the gear slot.
+extern bool g_flashlightActive;
+
+// One shadow-casting spot frustum. The light-add functions and the depth pass
+// both build their view of the world from this same list, so a lamp can never
+// sample an atlas slice that was rendered from a different pose.
+struct SpotShadowCaster {
+    DirectX::XMMATRIX viewProjection = DirectX::XMMatrixIdentity();
+    DirectX::XMFLOAT3 origin = DirectX::XMFLOAT3(0.0f, 0.0f, 0.0f);
+    DirectX::XMFLOAT3 direction = DirectX::XMFLOAT3(0.0f, 0.0f, 1.0f);
+    float range = 40.0f;
+};
+
+// Casters live for one frame. Rebuilt at the top of the frame, before the
+// lights are added, and read again by the depth pass.
+inline std::vector<SpotShadowCaster> g_spotShadowCasters;
+
+// Builds the frustum for one caster.
+//
+// halfAngleDegrees is the light's OUTER cone widened a little: a frustum cut
+// exactly at the cone edge leaves the outermost ring of lit pixels sampling
+// outside the depth that was rendered, which reads as an unshadowed rim around
+// every beam.
+inline SpotShadowCaster MakeSpotShadowCaster(DirectX::FXMVECTOR origin,
+                                             DirectX::FXMVECTOR direction,
+                                             float halfAngleDegrees,
+                                             float range) {
+    using namespace DirectX;
+    SpotShadowCaster caster;
+    const XMVECTOR dir = XMVector3Normalize(direction);
+    XMStoreFloat3(&caster.origin, origin);
+    XMStoreFloat3(&caster.direction, dir);
+    caster.range = range;
+
+    // Any up vector works except one parallel to the beam; a headlight aimed
+    // straight down would make the world up degenerate.
+    XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+    if (std::fabs(XMVectorGetX(XMVector3Dot(dir, up))) > 0.95f)
+        up = XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
+
+    // Near plane at 0.35 m rather than something tiny: the depth precision a
+    // perspective shadow map has at range is set by the near/far ratio, and a
+    // 0.05 near would spend most of the buffer on the metre in front of the
+    // lamp where nothing casts anything.
+    const XMMATRIX view = XMMatrixLookToLH(origin, dir, up);
+    const XMMATRIX proj = XMMatrixPerspectiveFovLH(
+        XMConvertToRadians(halfAngleDegrees * 2.0f), 1.0f, 0.35f, range);
+    caster.viewProjection = view * proj;
+    return caster;
+}
+// The torch, as a clustered spotlight.
+//
+// It has to live in scene.clusteredRenderer.lights for the whole frame rather
+// than being handed to each pass: the visibility-buffer resolve and the
+// volumetric fog both shade from the CLUSTER light lists that cullLights()
+// builds out of that vector, so a light that is not in it when the cull runs
+// gets no cluster index and lights nothing, and one removed before the fog pass
+// leaves the fog holding an index past the end of the list.
+//
+// So AddPlayerFlashlight runs once per frame before the cull, and
+// RemovePlayerFlashlight once after the last consumer -- the list is the
+// scene's persistent lighting, and leaving the torch in would stack another
+// copy every frame until it hit the cap.
+inline bool AddPlayerFlashlight(Scene& scene) {
+    if (!g_flashlightActive || scene.player.health <= 0.0f) return false;
+    // Capped at 64, not MAX_LIGHTS: the GPU light buffers hold 64 and the
+    // shaders ignore any index past that, so a light beyond it would be culled
+    // into cluster lists and then silently skipped while shading.
+    if (scene.clusteredRenderer.lights.size() >= 64) return false;
+    const XMVECTOR forward = XMVector3Normalize(
+        XMLoadFloat3(&scene.camera.Front));
+    const XMFLOAT3 muzzle = scene.GetMuzzleWorldPosition();
+    // Dropped below the barrel and pushed forward: mounted on top, the lamp sat
+    // in the bullet's path and the tracer geometry cut the beam every shot.
+    const XMVECTOR origin = XMVectorAdd(
+        XMLoadFloat3(&muzzle),
+        XMVectorAdd(XMVectorScale(forward, 0.15f),
+                    XMVectorSet(0.0f, -0.12f, 0.0f, 0.0f)));
+    PointLightDX12 weaponLight;
+    XMStoreFloat3(&weaponLight.position, origin);
+    XMStoreFloat3(&weaponLight.spotDirection, forward);
+    weaponLight.radius = 30.0f;
+    weaponLight.color = XMFLOAT3(1.0f, 0.96f, 0.88f);
+    weaponLight.intensity = 3.4f;
+    weaponLight.spotCosInner = std::cos(XMConvertToRadians(14.0f));
+    weaponLight.spotCosOuter = std::cos(XMConvertToRadians(26.0f));
+    scene.clusteredRenderer.lights.push_back(weaponLight);
+    return true;
+}
+
+inline void RemovePlayerFlashlight(Scene& scene, bool added) {
+    if (added && !scene.clusteredRenderer.lights.empty())
+        scene.clusteredRenderer.lights.pop_back();
+}
 DirectX::XMMATRIX HumveeWorldMatrix();
 DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
+
+// Which time-of-day preset the run was started on. Headlights read it so they
+// only burn at night, when they are the difference between a parked shape and a
+// vehicle -- switched on at noon they wash out the paintwork and light nothing.
+extern TimeOfDay g_selectedTimeOfDay;
+
+// Headlights for one Humvee, as a pair of forward spotlights.
+//
+// The vehicle's world matrix already carries where it sits and which way it
+// faces, so the lamps come straight off its basis rather than a second set of
+// tracked values that could drift out of step with the body: row 2 is its
+// forward axis, row 0 its right, row 3 its position. The model is authored
+// facing -X (hence the -PI/2 yaw baked into HumveeWorldMatrix), which is why
+// forward is taken from the matrix rather than assumed.
+//
+// Returns how many lights were appended, so the caller can pop exactly that
+// many back off at the end of the frame.
+inline int AddHumveeHeadlights(Scene& scene, const DirectX::XMMATRIX& body) {
+    if (scene.clusteredRenderer.lights.size() + 2 > 64) return 0;
+    const XMVECTOR right = XMVector3Normalize(body.r[0]);
+    const XMVECTOR forward = XMVector3Normalize(body.r[2]);
+    const XMVECTOR origin = body.r[3];
+    // One frustum for both lamps. They sit 1.56 m apart on a shared forward
+    // axis, so a single wider cone from the centre line reproduces the
+    // occlusion either would compute alone -- at half the depth passes. Only
+    // the shadow lookup is shared; the lamps stay separate lights, so the pair
+    // of pools still reads as two beams.
+    int shadowIndex = SPOT_SHADOW_NONE;
+    if (g_spotShadowCasters.size() < SPOT_SHADOW_COUNT) {
+        const XMVECTOR headlightHeight = XMVectorSet(0.0f, 1.05f, 0.0f, 0.0f);
+        const XMVECTOR aim = XMVector3Normalize(
+            XMVectorAdd(forward, XMVectorSet(0.0f, -0.18f, 0.0f, 0.0f)));
+        // Pulled back behind the bumper so the frustum's near plane clears the
+        // vehicle's own nose: started at the lamp, the Humvee body sits inside
+        // the near plane and punches a hole in its own beam.
+        const XMVECTOR shadowOrigin = XMVectorAdd(
+            XMVectorAdd(origin, headlightHeight),
+            XMVectorScale(forward, 1.2f));
+        // 40 degrees against the lamps' 34: wide enough to cover both cones
+        // plus the lateral offset of the outer lamp from this centre origin.
+        shadowIndex = static_cast<int>(g_spotShadowCasters.size());
+        g_spotShadowCasters.push_back(
+            MakeSpotShadowCaster(shadowOrigin, aim, 40.0f, 38.0f));
+    }
+    // Lamp height and track width off the model's own floor position.
+    const XMVECTOR headlightHeight = XMVectorSet(0.0f, 1.05f, 0.0f, 0.0f);
+    // Aimed slightly down: level beams throw the hotspot at the horizon and
+    // leave the road right in front of the bumper dark.
+    const XMVECTOR aim = XMVector3Normalize(
+        XMVectorAdd(forward, XMVectorSet(0.0f, -0.18f, 0.0f, 0.0f)));
+    int added = 0;
+    for (int side = -1; side <= 1; side += 2) {
+        const XMVECTOR lamp = XMVectorAdd(
+            XMVectorAdd(origin, headlightHeight),
+            XMVectorAdd(XMVectorScale(right, 0.78f * static_cast<float>(side)),
+                        XMVectorScale(forward, 2.35f)));
+        PointLightDX12 headlight;
+        XMStoreFloat3(&headlight.position, lamp);
+        XMStoreFloat3(&headlight.spotDirection, aim);
+        headlight.radius = 34.0f;
+        // Colder than the torch: sealed-beam headlamps read blue-white next to
+        // a filament hand light.
+        headlight.color = XMFLOAT3(0.92f, 0.95f, 1.0f);
+        headlight.intensity = 3.0f;
+        // Wider than the flashlight, and a broader soft edge, so the two pools
+        // overlap into one spread instead of two separate discs.
+        headlight.spotCosInner = std::cos(XMConvertToRadians(19.0f));
+        headlight.spotCosOuter = std::cos(XMConvertToRadians(34.0f));
+        // Both lamps read the same slice; see the caster comment above.
+        headlight.spotShadowIndex = shadowIndex;
+        scene.clusteredRenderer.lights.push_back(headlight);
+        ++added;
+    }
+    return added;
+}
+
+// Every Humvee the level actually placed. Mirrors the draw conditions in
+// RenderForward, so a vehicle that is not on the map does not light the ground
+// where it would have been.
+inline int AddVehicleHeadlights(Scene& scene) {
+    if (!TimeOfDayIsDark(g_selectedTimeOfDay)) return 0;
+    if (g_emptyLevelMode || g_trainingRangeMode || !g_levelPlacesHumvee)
+        return 0;
+    int added = AddHumveeHeadlights(scene, HumveeWorldMatrix());
+    if (g_stressTestMode)
+        added += AddHumveeHeadlights(scene, SecondaryHumveeWorldMatrix());
+    return added;
+}
+
+inline void RemoveVehicleHeadlights(Scene& scene, int added) {
+    for (int i = 0; i < added && !scene.clusteredRenderer.lights.empty(); ++i)
+        scene.clusteredRenderer.lights.pop_back();
+}
+
+// Declared again below with the other aircraft entry points; the searchlights
+// need them here, ahead of that block.
+DirectX::XMMATRIX HelicopterWorldMatrix();
+DirectX::XMMATRIX SecondaryHelicopterWorldMatrix();
+bool SecondaryHelicopterVisible();
+DirectX::XMFLOAT3 PrimaryHelicopterWeaponAimPoint();
+DirectX::XMFLOAT3 SecondaryHelicopterWeaponAimPoint();
+
+// Searchlight slung under one enemy helicopter.
+//
+// Mounted from the airframe basis, then aimed at the same velocity-led point as
+// the gun. The mounting therefore banks with the helicopter while the beam and
+// projectile stream converge on the same place in world space.
+//
+// Casts, unlike the player's flashlight: it shines DOWN from above, so without
+// an occlusion term the cone pours straight through rooftops and lights
+// building interiors from the sky -- by far the most visible failure of these
+// lights, which is why it takes an atlas slice when one is free.
+//
+// Hostile, and meant to read that way: a moving pool of light sweeping the
+// ground is the player's cue that a gunship is overhead and where it is
+// looking. Deliberately not a detection mechanic -- being caught in the beam
+// costs nothing on its own, so it stays a telegraph rather than a punishment.
+inline int AddHelicopterSearchlight(Scene& scene, const DirectX::XMMATRIX& body,
+                                    const DirectX::XMFLOAT3& weaponAimPoint) {
+    if (scene.clusteredRenderer.lights.size() >= 64) return 0;
+
+    const XMVECTOR forward = XMVector3Normalize(body.r[2]);
+    const XMVECTOR up = XMVector3Normalize(body.r[1]);
+    const XMVECTOR origin = body.r[3];
+
+    // Under the nose: forward of the cabin and below the belly, so the lamp
+    // clears its own airframe rather than lighting the fuselage it is bolted
+    // to. Both offsets follow the aircraft basis, so they stay put as it banks.
+    const XMVECTOR lamp = XMVectorAdd(
+        origin,
+        XMVectorAdd(XMVectorScale(forward, 2.6f),
+                    XMVectorScale(up, -0.85f)));
+    // Converge on the gun's velocity-led target rather than following a fixed
+    // downward tilt. The projectile muzzle is slightly forward of this lamp,
+    // but sharing its world-space aim point makes the beam show where the burst
+    // will land. Do not copy the per-round random spread: that would shake the
+    // whole volumetric shaft at ten hertz.
+    XMVECTOR aimVector = XMVectorSubtract(
+        XMLoadFloat3(&weaponAimPoint), lamp);
+    if (XMVectorGetX(XMVector3LengthSq(aimVector)) < 1e-5f)
+        aimVector = forward;
+    const XMVECTOR aim = XMVector3Normalize(aimVector);
+
+    int shadowIndex = SPOT_SHADOW_NONE;
+    if (g_spotShadowCasters.size() < SPOT_SHADOW_COUNT) {
+        shadowIndex = static_cast<int>(g_spotShadowCasters.size());
+        // 15 against the beam's 11: wide enough to cover the cone with margin
+        // at the edge, and no wider. A frustum much broader than the beam
+        // spends most of its 2048 texels on world the light never reaches,
+        // which is what makes the shadows inside the pool coarse.
+        //
+        // Longer throw than a headlight: it works from hover height, so the
+        // ground it lights is tens of metres below the lamp.
+        g_spotShadowCasters.push_back(
+            MakeSpotShadowCaster(lamp, aim, 15.0f, 120.0f));
+    }
+
+    PointLightDX12 searchlight;
+    XMStoreFloat3(&searchlight.position, lamp);
+    XMStoreFloat3(&searchlight.spotDirection, aim);
+    searchlight.radius = 110.0f;
+    // Bright and slightly cool, like a xenon searchlight rather than the
+    // Humvee's sealed beams.
+    searchlight.color = XMFLOAT3(0.88f, 0.93f, 1.0f);
+    searchlight.intensity = 5.5f;
+    // Much tighter than the headlights: a searchlight is a defined disc of
+    // light tracking across the ground, not a wash. Narrow enough that from
+    // under it the pool reads as a searched spot rather than general
+    // illumination, which is what makes it a telegraph the player can read.
+    searchlight.spotCosInner = std::cos(XMConvertToRadians(6.0f));
+    searchlight.spotCosOuter = std::cos(XMConvertToRadians(11.0f));
+    searchlight.spotShadowIndex = shadowIndex;
+    scene.clusteredRenderer.lights.push_back(searchlight);
+    return 1;
+}
+
+// Every enemy helicopter currently up: the patrol gunship, and the
+// reinforcement dropship while a wave is flying in. Night only, on the same
+// preset test the headlights use -- a searchlight burning at noon lights
+// nothing and just washes out the airframe carrying it.
+//
+// Mirrors the draw conditions in RenderForward, so an aircraft that is not on
+// the map does not light the ground under where it would have been.
+inline int AddEnemyHelicopterSearchlights(Scene& scene) {
+    if (!TimeOfDayIsDark(g_selectedTimeOfDay)) return 0;
+    if (g_emptyLevelMode) return 0;
+    int added = 0;
+    if (scene.showHelicopter)
+        added += AddHelicopterSearchlight(
+            scene, HelicopterWorldMatrix(), PrimaryHelicopterWeaponAimPoint());
+    if (SecondaryHelicopterVisible())
+        added += AddHelicopterSearchlight(
+            scene, SecondaryHelicopterWorldMatrix(),
+            SecondaryHelicopterWeaponAimPoint());
+    return added;
+}
+
+inline void RemoveEnemyHelicopterSearchlights(Scene& scene, int added) {
+    for (int i = 0; i < added && !scene.clusteredRenderer.lights.empty(); ++i)
+        scene.clusteredRenderer.lights.pop_back();
+}
+
 DirectX::XMMATRIX HelicopterWorldMatrix();
 DirectX::XMMATRIX SecondaryHelicopterWorldMatrix();
 // True when the second airframe should be drawn: the stress-test patrol
@@ -1301,7 +1603,8 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
         g_specularEnvironmentResource, g_brdfIntegrationResource,
         g_dxrDDGIProbeResource, g_dxrDDGICellResource,
         g_dxrDDGIIndexResource, g_dxrDDGIProbeCount,
-        g_dxrDDGICellCount, g_dxrDDGIIndexCount);
+        g_dxrDDGICellCount, g_dxrDDGIIndexCount,
+        g_spotShadowAtlasResource);
 
     if (g_grass.IsInitialized()) {
         g_grass.SetViewer(scene.camera.Position);
@@ -1322,9 +1625,9 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
 
             GrassField::Params gp = g_grass.GetParams(
                 scene.EffectiveCameraFOV(), static_cast<float>(g_dx12.screenHeight));
-            static_assert(sizeof(GrassField::Params) == 13 * sizeof(UINT),
-                          "GrassParams must match the 13 root constants at b6");
-            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 13, &gp, 0);
+            static_assert(sizeof(GrassField::Params) == 19 * sizeof(UINT),
+                          "GrassParams must match the 19 root constants at b6");
+            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 19, &gp, 0);
             g_dx12.commandList->SetGraphicsRootShaderResourceView(9, ginst);
             g_dx12.commandList->SetPipelineState(grassPipeline);
             g_dx12.commandList->IASetVertexBuffers(0, 1, &gvbv);
@@ -1381,7 +1684,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         g_specularEnvironmentResource, g_brdfIntegrationResource,
         g_dxrDDGIProbeResource, g_dxrDDGICellResource,
         g_dxrDDGIIndexResource, g_dxrDDGIProbeCount,
-        g_dxrDDGICellCount, g_dxrDDGIIndexCount);
+        g_dxrDDGICellCount, g_dxrDDGIIndexCount,
+        g_spotShadowAtlasResource);
 
     shader.SetLight(scene.lightPos, scene.lightType,
                     scene.EffectiveLightColor(),
@@ -1410,6 +1714,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         flashLight.intensity = 15.0f * (scene.muzzleFlashTime / scene.muzzleFlashDuration);
         lightData.push_back(flashLight);
     }
+    // The weapon light is not added here: AddPlayerFlashlight already put it in
+    // the clustered list for this frame, so getPointLightData() above returned
+    // it along with the scene's own lights.
     for (const ExplosionFX& fx : scene.explosionFX) {
         if (lightData.size() >= 64) break;
         const float t = (std::min)(1.0f, fx.age / fx.duration);
@@ -1472,7 +1779,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             g_specularEnvironmentResource, g_brdfIntegrationResource,
             g_dxrDDGIProbeResource, g_dxrDDGICellResource,
             g_dxrDDGIIndexResource, g_dxrDDGIProbeCount,
-            g_dxrDDGICellCount, g_dxrDDGIIndexCount);
+            g_dxrDDGICellCount, g_dxrDDGIIndexCount,
+        g_spotShadowAtlasResource);
     }
 
     g_meshShader.wireframe = scene.meshletWireframe;
@@ -1751,7 +2059,27 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 g_grass.RuntimeExcluded(
                     dandelion.center.x, dandelion.center.z,
                     dandelion.radius)) continue;
-            visibleDandelions.push_back(XMLoadFloat4x4(&dandelion.transform));
+            XMMATRIX dandelionTransform = XMLoadFloat4x4(&dandelion.transform);
+            // Plants the player is standing in lean away from them, matching the
+            // grass they grow among -- a field that parts around your feet while
+            // the flowers in it stay bolt upright reads worse than neither
+            // moving. Shear rather than rotate: the stem stays rooted where it
+            // was planted and the head swings over, which is the same hinged
+            // bend grass_vs.hlsl applies, and it composes with the authored
+            // scale/rotation without having to decompose the matrix.
+            const XMFLOAT2 push =
+                g_grass.PlayerPushAt(dandelion.center.x, dandelion.center.z);
+            if (push.x != 0.0f || push.y != 0.0f) {
+                XMMATRIX lean = XMMatrixIdentity();
+                lean.r[1] = XMVectorSet(push.x, 1.0f, push.y, 0.0f);
+                // Applied about the plant's base, so the root stays put: undo
+                // the placement translation, shear, then put it back.
+                const XMVECTOR base = dandelionTransform.r[3];
+                dandelionTransform.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
+                dandelionTransform = dandelionTransform * lean;
+                dandelionTransform.r[3] = base;
+            }
+            visibleDandelions.push_back(dandelionTransform);
         }
         DrawSceneNodeInstances(g_dandelionModel, shader, visibleDandelions,
                                view, proj, lightSpace);
@@ -1809,9 +2137,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // same call, so sharing the slots is safe.)
             GrassField::Params gp = g_grass.GetParams(
                 scene.EffectiveCameraFOV(), static_cast<float>(g_dx12.screenHeight));
-            static_assert(sizeof(GrassField::Params) == 13 * sizeof(UINT),
-                          "GrassParams must match the 13 root constants at b6");
-            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 13, &gp, 0);
+            static_assert(sizeof(GrassField::Params) == 19 * sizeof(UINT),
+                          "GrassParams must match the 19 root constants at b6");
+            g_dx12.commandList->SetGraphicsRoot32BitConstants(8, 19, &gp, 0);
             g_dx12.commandList->SetGraphicsRootShaderResourceView(9, ginst);
 
             g_dx12.commandList->SetPipelineState(
@@ -2900,20 +3228,6 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         }
     }
 
-    // Light spheres
-    for (int i = 0; i < scene.clusteredRenderer.getTotalLightCount(); i++) {
-        PointLightDX12* light = scene.clusteredRenderer.getLight(i);
-        if (!light || !light->active) continue;
-        model = XMMatrixScaling(0.2f, 0.2f, 0.2f);
-        model = model * XMMatrixTranslation(light->position.x, light->position.y, light->position.z);
-        shader.SetMatrices(model, view, proj, lightSpace);
-        XMFLOAT3 lc(light->color.x * light->intensity,
-                     light->color.y * light->intensity,
-                     light->color.z * light->intensity);
-        shader.SetObjectColor(lc);
-        DrawCube(geo);
-        shader.NextDrawCall();
-    }
 }
 
 #endif // FORWARD_RENDERER_H

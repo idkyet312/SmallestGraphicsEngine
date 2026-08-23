@@ -22,11 +22,12 @@ inline const char* GrenadeTypeName(GrenadeType type) {
 // Equipment carried in the gear slot, separate from the two weapon slots and
 // the grenade. None is a real choice rather than an empty default: the slot
 // exists to be deliberately left open as often as it is filled.
-enum class GearType : uint8_t { None = 0, NightVisionGoggles = 1 };
+enum class GearType : uint8_t { None = 0, NightVisionGoggles = 1, Flashlight = 2 };
 
 inline const char* GearTypeName(GearType gear) {
     switch (gear) {
     case GearType::NightVisionGoggles: return "NVG";
+    case GearType::Flashlight: return "Flashlight";
     default: return "None";
     }
 }

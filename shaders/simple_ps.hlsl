@@ -30,14 +30,22 @@ struct PointLightData {
     float radius;
     float3 color;
     float intensity;
+    // Cone axis, unit length; zero for a plain omnidirectional point light.
+    float3 spotDirection;
+    float spotCosInner;
+    float spotCosOuter;
+    int spotShadowIndex;
+    float2 spotPadding;
 };
 
 cbuffer PointLightsBuffer : register(b4) {
     int numPointLights;
-    float plPadding1;
+    // Live spot atlas slices this frame; see PointLightsBufferDX12.
+    int spotShadowCount;
     float plPadding2;
     float plPadding3;
     PointLightData pointLights[64];
+    float4x4 spotShadowMatrices[3];
 };
 
 struct PS_INPUT {
@@ -64,6 +72,14 @@ float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 view
     float falloff = 1.0 - smoothstep(lightRadius * 0.75, lightRadius, distance);
     attenuation *= falloff;
     
+    // Spotlight cone; a zero direction keeps this an ordinary point light.
+    float3 spotDir = pointLights[index].spotDirection;
+    if (dot(spotDir, spotDir) > 0.0001) {
+        float cosAngle = dot(-lightDir, normalize(spotDir));
+        attenuation *= smoothstep(pointLights[index].spotCosOuter,
+                                  pointLights[index].spotCosInner, cosAngle);
+    }
+
     float diff = max(dot(normal, lightDir), 0.0);
     float3 diffuse = diff * lightCol * lightIntensity;
     
@@ -100,4 +116,3 @@ float4 main(PS_INPUT input) : SV_TARGET {
     
     return float4(result, 1.0);
 }
-

@@ -39,6 +39,7 @@
 #include "DDGI_DX12.h"
 #include "VisibilityBufferDX12.h"
 #include "StaticBufferDX12.h"
+#include "TextureUploadArenaDX12.h"
 #include "Scene.h"
 #include "TimeOfDay.h"
 #include "ForwardRenderer.h"
@@ -1055,14 +1056,43 @@ static DirectX::XMFLOAT3 NearestHostileTarget(const SkinnedEnemy& actor,
     return best;
 }
 
-static void ReleaseMaterialUploadHeaps(const std::shared_ptr<SceneNode>& node) {
-    if (!node) return;
+struct UploadHeapReleaseState {
+    bool prepared = false;
+    size_t totalChunks = 0;
+    uint64_t usedBytes = 0;
+    std::vector<std::shared_ptr<SceneMaterial>> materials;
+
+    void Reset() {
+        prepared = false;
+        totalChunks = 0;
+        usedBytes = 0;
+        materials.clear();
+    }
+};
+static UploadHeapReleaseState g_uploadHeapRelease;
+
+static void CollectMaterialUploadHeaps(
+    const std::shared_ptr<SceneNode>& node,
+    std::unordered_set<const SceneNode*>& visitedNodes,
+    std::unordered_set<const SceneMaterial*>& visitedMaterials) {
+    if (!node || !visitedNodes.insert(node.get()).second) return;
     if (node->mesh) {
-        for (MeshPrimitive& primitive : node->mesh->primitives)
-            if (primitive.material) primitive.material->uploadHeaps.clear();
+        for (const MeshPrimitive& primitive : node->mesh->primitives) {
+            const auto& material = primitive.material;
+            if (!material || !visitedMaterials.insert(material.get()).second)
+                continue;
+            g_uploadHeapRelease.materials.push_back(material);
+        }
     }
     for (const auto& child : node->children)
-        ReleaseMaterialUploadHeaps(child);
+        CollectMaterialUploadHeaps(child, visitedNodes, visitedMaterials);
+}
+
+static void CollectMaterialUploadHeaps(
+    const std::shared_ptr<SceneMaterial>& material,
+    std::unordered_set<const SceneMaterial*>& visitedMaterials) {
+    if (!material || !visitedMaterials.insert(material.get()).second) return;
+    g_uploadHeapRelease.materials.push_back(material);
 }
 
 static size_t LiveRespawningBanditCount() {
@@ -1129,6 +1159,29 @@ XMMATRIX SecondaryHelicopterWorldMatrix() {
            XMMatrixTranslation(g_secondaryHelicopterPosition.x,
                                g_secondaryHelicopterPosition.y,
                                g_secondaryHelicopterPosition.z);
+}
+
+XMFLOAT3 PrimaryHelicopterWeaponAimPoint() {
+    const XMFLOAT3 forward{
+        std::sin(g_helicopterYaw), 0.0f, std::cos(g_helicopterYaw) };
+    const XMFLOAT3 muzzle{
+        g_helicopterPosition.x + forward.x * 3.75f,
+        g_helicopterPosition.y - 0.65f,
+        g_helicopterPosition.z + forward.z * 3.75f };
+    return LeadTargetPoint(
+        muzzle, scene.camera.Position, g_playerVelocity, scene.projectileSpeed);
+}
+
+XMFLOAT3 SecondaryHelicopterWeaponAimPoint() {
+    const XMFLOAT3 forward{
+        std::sin(g_secondaryHelicopterYaw), 0.0f,
+        std::cos(g_secondaryHelicopterYaw) };
+    const XMFLOAT3 muzzle{
+        g_secondaryHelicopterPosition.x + forward.x * 3.75f,
+        g_secondaryHelicopterPosition.y - 0.65f,
+        g_secondaryHelicopterPosition.z + forward.z * 3.75f };
+    return LeadTargetPoint(
+        muzzle, scene.camera.Position, g_playerVelocity, scene.projectileSpeed);
 }
 
 // Renderer-facing: the second airframe is drawn when the stress-test patrol is
@@ -2739,8 +2792,7 @@ static void UpdateHelicopter(float dt) {
     // Lead the player rather than firing at where they stand. The door gun
     // engages out to kHelicopterEngagementRange, far enough that flight time is
     // what let a running player walk out from under a burst untouched.
-    const XMFLOAT3 helicopterAim = LeadTargetPoint(
-        muzzle, scene.camera.Position, g_playerVelocity, scene.projectileSpeed);
+    const XMFLOAT3 helicopterAim = PrimaryHelicopterWeaponAimPoint();
     direction = XMLoadFloat3(&helicopterAim) - XMLoadFloat3(&muzzle);
     if (XMVectorGetX(XMVector3LengthSq(direction)) < 1e-5f) return;
     const float randomX = ((float)std::rand() / RAND_MAX - 0.5f) * 0.018f;
@@ -3161,8 +3213,7 @@ static void UpdateSecondaryHelicopter(float dt) {
         return;
     }
     // Same lead as the primary door gun above.
-    const XMFLOAT3 secondaryAim = LeadTargetPoint(
-        muzzle, scene.camera.Position, g_playerVelocity, scene.projectileSpeed);
+    const XMFLOAT3 secondaryAim = SecondaryHelicopterWeaponAimPoint();
     direction = XMLoadFloat3(&secondaryAim) - XMLoadFloat3(&muzzle);
     if (XMVectorGetX(XMVector3LengthSq(direction)) < 1e-5f) return;
     direction = XMVector3Normalize(direction) + XMVectorSet(
@@ -5187,6 +5238,7 @@ static void ApplyTimeOfDaySkyEnvironment(TimeOfDay time) {
         std::string("Sky environment swapped to ") + environment);
 }
 ID3D12Resource*             g_ddgiIrradianceResource = nullptr;
+ID3D12Resource*             g_spotShadowAtlasResource = nullptr;
 ID3D12Resource*             g_ddgiVisibilityResource = nullptr;
 ID3D12Resource*             g_dxrDDGIProbeResource = nullptr;
 ID3D12Resource*             g_dxrDDGICellResource = nullptr;
@@ -5210,6 +5262,10 @@ static NightVisionDX12      nightVision;
 // green reads as a filter being applied rather than equipment being used.
 static bool                 g_nightVisionActive = false;
 static float                g_nightVisionBlend = 0.0f;
+// Weapon light on/off, toggled with J when the flashlight is in the gear slot.
+// Shares the key with the goggles without conflicting: the gear slot holds one
+// item, so only one of the two can ever be equipped on a given run.
+bool                        g_flashlightActive = false;
 // Automatic gain control state, carried between frames because adaptation is a
 // temporal effect the per-pixel shader has no memory to run itself. Starts wide
 // open, which is where a tube sits before it has seen any light.
@@ -6225,12 +6281,22 @@ static void UpdateIRLaser() {
 }
 
 static void BeginLevelLoading() {
+    g_uploadHeapRelease.Reset();
     g_game.loading.Begin({
-        g_emptyLevelMode ? 5u : 11u,
+        g_emptyLevelMode ? 6u : 12u,
         g_emptyLevelMode ? "Terrain material"
                          : "Terrain material and crate model",
         g_emptyLevelMode ? "floor material" : "Content/Models/h2.glb"
     });
+    if (!BeginTextureUploadArenaDX12()) {
+        g_game.loading.SetCurrent(
+            "Unable to begin pooled texture staging",
+            "texture upload arena is still owned by an earlier load");
+        g_game.loading.Complete(false);
+        SGE_LOG("LogRender", EngineLog::Level::Error,
+            "Level load aborted: texture upload arena was not idle");
+        return;
+    }
     levelLoadingUploadBaseline = GetStaticBufferStatsDX12();
 }
 
@@ -10553,13 +10619,19 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // than a placeholder.
     int gear = static_cast<int>(loadout.gear);
     static constexpr const char* gearNames[] = {
-        "None", "NVG (Night Vision Goggles)"
+        "None", "NVG (Night Vision Goggles)", "Flashlight (weapon light)"
     };
     if (ImGui::Combo("Gear", &gear, gearNames,
                      static_cast<int>(std::size(gearNames))))
         loadout.gear = static_cast<GearType>(gear);
     if (loadout.gear == GearType::NightVisionGoggles) {
         ImGui::TextDisabled("Press J in the field to raise or lower goggles.");
+        if (!TimeOfDayIsDark(g_selectedTimeOfDay))
+            ImGui::TextDisabled("Little use at this time of day.");
+    }
+    if (loadout.gear == GearType::Flashlight) {
+        ImGui::TextDisabled("Press J in the field to switch the weapon light.");
+        ImGui::TextDisabled("Lights where you aim -- and shows enemies where you are.");
         if (!TimeOfDayIsDark(g_selectedTimeOfDay))
             ImGui::TextDisabled("Little use at this time of day.");
     }
@@ -14090,12 +14162,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (wParam == 'N' && !(lParam & 0x40000000)) {
             g_showEnemyVisionCones = !g_showEnemyVisionCones;
         }
-        // J raises and lowers the goggles, but only when they were actually
-        // brought on the mission: the gear slot is the whole point of the
-        // choice, so night vision cannot be conjured mid-run without it.
+        // J works the gear slot's item, but only when it was actually brought
+        // on the mission: the slot is the whole point of the choice, so neither
+        // goggles nor a weapon light can be conjured mid-run without it. One
+        // key serves both because the slot only ever holds one of them.
         else if (wParam == 'J' && !(lParam & 0x40000000)) {
-            if (g_game.mission.Loadout().gear == GearType::NightVisionGoggles)
+            const GearType equippedGear = g_game.mission.Loadout().gear;
+            if (equippedGear == GearType::NightVisionGoggles)
                 g_nightVisionActive = !g_nightVisionActive;
+            else if (equippedGear == GearType::Flashlight)
+                g_flashlightActive = !g_flashlightActive;
         }
         // F5: flip every RT effect at once. Shares ToggleAllRTEffects with the
         // "All RT Effects" checkbox, so the two agree on the saved
@@ -14186,6 +14262,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // so a crash leaves a debuggable artifact instead of just an event-log entry.
 static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* info) {
     CreateDirectoryA("dumps", nullptr);
+    HANDLE report = CreateFileA("dumps/crash.txt", GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (report != INVALID_HANDLE_VALUE) {
+        const DWORD exceptionCode = info && info->ExceptionRecord
+            ? info->ExceptionRecord->ExceptionCode : 0;
+        const void* exceptionAddress = info && info->ExceptionRecord
+            ? info->ExceptionRecord->ExceptionAddress : nullptr;
+        char line[256] = {};
+        const int length = _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "thread=%lu exception=0x%08lX address=%p\r\n",
+            GetCurrentThreadId(), exceptionCode, exceptionAddress);
+        DWORD written = 0;
+        if (length > 0)
+            WriteFile(report, line, static_cast<DWORD>(length), &written, nullptr);
+        CloseHandle(report);
+    }
+
     HANDLE file = CreateFileA("dumps/crash.dmp", GENERIC_WRITE, 0, nullptr,
                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file != INVALID_HANDLE_VALUE) {
@@ -14193,12 +14286,13 @@ static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* info) {
         mei.ThreadId = GetCurrentThreadId();
         mei.ExceptionPointers = info;
         mei.ClientPointers = FALSE;
-        // Capture full thread stacks + data so the crash is analyzable offline
-        // (the indirectly-referenced flavour omitted stacks, leaving no usable
-        // call stack). WithFullMemory is large but these crashes are rare.
+        // A normal minidump already includes thread contexts and stack memory.
+        // Full-memory capture made a 5.5-GiB process write a 6.45-GiB dump, so a
+        // crash looked like an indefinite loading hang before it finally exited.
         const MINIDUMP_TYPE dumpType = static_cast<MINIDUMP_TYPE>(
-            MiniDumpWithFullMemory | MiniDumpWithThreadInfo |
-            MiniDumpWithProcessThreadData | MiniDumpWithModuleHeaders);
+            MiniDumpNormal | MiniDumpWithThreadInfo |
+            MiniDumpWithUnloadedModules | MiniDumpWithProcessThreadData |
+            MiniDumpWithModuleHeaders);
         MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
                           dumpType, &mei, nullptr, nullptr);
         CloseHandle(file);
@@ -14754,6 +14848,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         std::cerr << "Shadow map init failed (non-fatal)\n";
         scene.enableShadows = false;
     }
+    // Hand the spot atlas to the passes that sample it: t92 in the visibility
+    // resolve, t20 in the forward path. Null when shadow init failed, which
+    // both descriptor writers handle by leaving a valid null view in the slot.
+    visBuffer.spotShadowAtlasResource = shadowMap.GetSpotResource();
+    g_spotShadowAtlasResource = shadowMap.GetSpotResource();
 
     BootStep("Initializing DDGI probes...");
     if (!g_ddgiRenderer.init(g_dx12.device.Get())) {
@@ -15898,6 +15997,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             grassHelicopter,
             primaryHelicopterActive || secondaryHelicopterActive ||
             blackHawkWashActive);
+        // Grass parts around the player's FEET, not the camera: the eye sits a
+        // body-height above the blades being pushed, and feeding it in would
+        // drag the parted ring along whenever the player looks around while
+        // crouching. Grounded alone is not enough: it is also true on roofs and
+        // vehicle decks, so require the feet to be close to the terrain itself.
+        const XMFLOAT3 playerFeetPosition(
+            scene.camera.Position.x,
+            scene.camera.Position.y - scene.camera.PlayerHeight,
+            scene.camera.Position.z);
+        const float playerTerrainY = GroundHeightAt(
+            playerFeetPosition.x, playerFeetPosition.z);
+        const bool playerTouchesTerrain =
+            scene.camera.FPSMode && scene.camera.IsGrounded &&
+            !scene.camera.IsSwimming &&
+            std::abs(playerFeetPosition.y - playerTerrainY) <= 0.45f;
+        g_grass.SetPlayerPush(playerFeetPosition,
+                              playerTouchesTerrain);
         g_grass.Update(deltaTime);
         }
         UpdatePlayerVelocity(scene.camera.Position, deltaTime);
@@ -17924,66 +18040,154 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // immediately instead of silently corrupting later frames.
             // Earlier stages were submitted as ordinary loading-screen frames.
             // Drain them before mip generation and staging-resource release.
-            WaitForGPUAllFrames();
+            WaitForDirectQueueIdleIsolated();
             g_mipGen.FlushPending();
             // Mip handoff is submitted by FlushPending. Wait once, then free
             // texture staging resources retained by imported scene materials.
-            WaitForGPUAllFrames();
+            WaitForDirectQueueIdleIsolated();
+            AdvanceLevelLoading(LevelLoadStage::SubmitUploads,
+                "Submit final staging copies",
+                "direct command list");
+        } else if (g_game.loading.Stage() == LevelLoadStage::SubmitUploads) {
+            // Do not release anything in this frame. Static/texture uploads are
+            // flushed below the loading state machine, and EndFrame is what
+            // actually submits this command list. A fence wait here cannot see
+            // commands that have only been recorded, so releasing their upload
+            // heaps now leaves CopyTextureRegion holding freed GPU addresses.
+            // Advance only; the next frame performs the drain and release.
             AdvanceLevelLoading(LevelLoadStage::ReleaseUploads,
                 "Release staging heaps and validate DX12 device",
                 "material upload heaps");
         } else if (g_game.loading.Stage() == LevelLoadStage::ReleaseUploads) {
-            // The WaitForGPU in GPUFinalize drained the frame *before* this one,
-            // but each load stage runs in its own frame: a whole loading-screen
-            // frame was begun, submitted and presented in between, and its
-            // command list can still carry texture CopyTextureRegion work that
-            // reads these staging heaps. Freeing them while that copy is in
-            // flight page-faults the GPU (DEVICE_HUNG, DRED page fault on a
-            // recently freed allocation). Drain again so nothing references them.
-            //
-            // Must drain ALL frame slots: WaitForGPU() only proves the current
-            // slot is idle, and the loading-screen frame carrying those copies
-            // may have been submitted from the other slot.
-            WaitForGPUAllFrames();
-            ReleaseMaterialUploadHeaps(g_helicopterModel);
-            ReleaseMaterialUploadHeaps(g_humveeModel);
-            ReleaseMaterialUploadHeaps(g_boatModel);
-            ReleaseMaterialUploadHeaps(g_insertionBoatModel);
-            ReleaseMaterialUploadHeaps(g_blackHawkModel);
-            ReleaseMaterialUploadHeaps(g_explosiveBarrelModel);
-            ReleaseMaterialUploadHeaps(g_dandelionModel);
-            for (const auto& entry : g_prefabModelCache)
-                ReleaseMaterialUploadHeaps(entry.second.model);
-            ReleaseMaterialUploadHeaps(g_banditModel.node);
-            for (const auto& material : g_banditModel.materialKeepAlive)
-                if (material) material->uploadHeaps.clear();
-            ArmsModel::ReleaseUploadHeaps();
-            g_terrain.ReleaseUploadHeaps();
-            ReleaseMaterialUploadHeaps(crateModel);
-            ReleaseMaterialUploadHeaps(wallModel);
-            g_rejectedUploadModels.clear();
-            DumpDX12DebugMessages();
-            // First Level 1 load is complete. Start timing after load/GPU waits,
-            // not from menu click.
-            if (g_emptyLevelMode) {
-                emptyLevelAssetsLoaded = true;
-            } else {
-                fullLevelAssetsLoaded = true;
-                emptyLevelAssetsLoaded = true;
+            if (!g_uploadHeapRelease.prepared) {
+                // SubmitUploads spent a whole frame submitting the last copy
+                // batch. Drain all earlier direct-queue work once before
+                // releasing the arena, without changing frame-slot fences.
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: waiting for isolated direct queue drain");
+                WaitForDirectQueueIdleIsolated();
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: isolated direct queue drain complete");
+
+                std::unordered_set<const SceneNode*> visitedNodes;
+                std::unordered_set<const SceneMaterial*> visitedMaterials;
+                const auto collectNode = [&](const std::shared_ptr<SceneNode>& node) {
+                    CollectMaterialUploadHeaps(
+                        node, visitedNodes, visitedMaterials);
+                };
+                collectNode(g_helicopterModel);
+                collectNode(g_humveeModel);
+                collectNode(g_boatModel);
+                collectNode(g_insertionBoatModel);
+                collectNode(g_blackHawkModel);
+                collectNode(g_explosiveBarrelModel);
+                collectNode(g_dandelionModel);
+                for (const auto& entry : g_prefabModelCache)
+                    collectNode(entry.second.model);
+                collectNode(g_banditModel.node);
+                for (const auto& material : g_banditModel.materialKeepAlive)
+                    CollectMaterialUploadHeaps(material, visitedMaterials);
+                collectNode(crateModel);
+                collectNode(wallModel);
+                for (const auto& rejected : g_rejectedUploadModels)
+                    collectNode(rejected);
+
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: clearing " +
+                    std::to_string(g_uploadHeapRelease.materials.size()) +
+                    " compatibility material owners");
+
+                // Pooled level uploads are owned by the arena, so these clears
+                // only discard compatibility references. Keeping the arena
+                // alive until after every owner is empty ensures none of the
+                // backing resources can final-release in this loop.
+                for (const auto& material : g_uploadHeapRelease.materials)
+                    material->uploadHeaps.clear();
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: material owners cleared");
+                ArmsModel::ReleaseUploadHeaps();
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: arms owners cleared");
+                g_terrain.ReleaseUploadHeaps();
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: terrain owners cleared");
+                g_rejectedUploadModels.clear();
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: rejected models cleared");
+
+                const TextureUploadArenaStatsDX12 stats =
+                    GetTextureUploadArenaStatsDX12();
+                g_uploadHeapRelease.totalChunks = stats.chunkCount;
+                g_uploadHeapRelease.usedBytes = stats.usedBytes;
+                BeginTextureUploadArenaReleaseDX12();
+                g_uploadHeapRelease.prepared = true;
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: arena contains " +
+                    std::to_string(stats.chunkCount) + " chunks, " +
+                    std::to_string(stats.usedBytes) + " requested bytes");
             }
-            CompleteLevelLoading(g_dx12.device &&
-                g_dx12.device->GetDeviceRemovedReason() == S_OK);
-            // Build the sparse probe layout now the level's geometry exists.
-            // Every rebuild path was editor- or button-driven, so a level
-            // loaded through normal play never built one: sparseProbeCount
-            // stayed 0, SampleDDGIIrradiance fell back to the legacy grid, and
-            // the DXR probe pass never dispatched despite every island level
-            // setting dxrDDGI.enabled = true. The request is a no-op when the
-            // level has it disabled or DXR is unsupported.
-            if (!g_emptyLevelMode && g_game.world.Level().dxrDDGI.enabled)
-                RequestLiveDXRDDGIRebuild();
-            g_game.session.StartTimer();
-            lastTime = gameTimer.GetElapsed();
+
+            // One final COM release per rendered frame keeps Windows messages
+            // and the loading UI moving even if the driver spends time
+            // returning a large pooled allocation to the OS.
+            const TextureUploadArenaStatsDX12 beforeRelease =
+                GetTextureUploadArenaStatsDX12();
+            SGE_LOG("LogDX12", EngineLog::Level::Display,
+                "Texture upload release: releasing chunk " +
+                std::to_string(beforeRelease.releasedChunks + 1) + " / " +
+                std::to_string(g_uploadHeapRelease.totalChunks));
+            ReleaseOneTextureUploadArenaChunkDX12();
+            SGE_LOG("LogDX12", EngineLog::Level::Display,
+                "Texture upload release: chunk released");
+            if (!TextureUploadArenaReleaseCompleteDX12()) {
+                const TextureUploadArenaStatsDX12 stats =
+                    GetTextureUploadArenaStatsDX12();
+                const size_t released = g_uploadHeapRelease.totalChunks -
+                    stats.chunkCount;
+                g_game.loading.SetCurrent(
+                    "Release staging heaps and validate DX12 device",
+                    std::to_string(released) + " / " +
+                    std::to_string(g_uploadHeapRelease.totalChunks) +
+                    " pooled chunks | " +
+                    std::to_string(g_uploadHeapRelease.usedBytes / (1024 * 1024)) +
+                    " MiB staged");
+            } else {
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: finalizing empty arena");
+                EndTextureUploadArenaReleaseDX12();
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: arena reset complete");
+                DumpDX12DebugMessages();
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: debug messages drained");
+                // First Level 1 load is complete. Start timing after load/GPU
+                // waits and staging cleanup, not from the menu click.
+                if (g_emptyLevelMode) {
+                    emptyLevelAssetsLoaded = true;
+                } else {
+                    fullLevelAssetsLoaded = true;
+                    emptyLevelAssetsLoaded = true;
+                }
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: querying device health");
+                const HRESULT deviceStatus = g_dx12.device
+                    ? g_dx12.device->GetDeviceRemovedReason()
+                    : E_POINTER;
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: device health query returned " +
+                    std::to_string(static_cast<long>(deviceStatus)));
+                CompleteLevelLoading(deviceStatus == S_OK);
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: loading marked complete");
+                g_uploadHeapRelease.Reset();
+                SGE_LOG("LogDX12", EngineLog::Level::Display,
+                    "Texture upload release: compatibility state reset");
+                // Build the sparse probe layout now the level's geometry exists.
+                if (!g_emptyLevelMode && g_game.world.Level().dxrDDGI.enabled)
+                    RequestLiveDXRDDGIRebuild();
+                g_game.session.StartTimer();
+                lastTime = gameTimer.GetElapsed();
+            }
         }
         }
 
@@ -18065,6 +18269,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         XMMATRIX fogLightSpace = XMMatrixIdentity();
         ID3D12Resource* fogShadowResource = nullptr;
         bool renderedScene = false;
+        // Added before any pass culls lights, dropped once the last one that
+        // reads the clustered list (the fog) has run. See AddPlayerFlashlight.
+        //
+        // Casters are cleared first and refilled by the two shadowed adds
+        // below, so the slice a light is tagged with this frame always refers
+        // to a frustum built from this frame's vehicle poses. The shadow pass
+        // runs after these calls and before the lights are removed.
+        g_spotShadowCasters.clear();
+        const bool flashlightInLightList = AddPlayerFlashlight(scene);
+        const int headlightsInLightList = AddVehicleHeadlights(scene);
+        const int searchlightsInLightList = AddEnemyHelicopterSearchlights(scene);
         if (IsSceneScreen() && !g_game.loading.Active() &&
             usingRaytracing) {
             ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());
@@ -18088,7 +18303,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     (!g_emptyLevelMode && g_showH2Model)
                         ? (crateShadowModel ? crateShadowModel : crateModel)
                         : nullptr,
-                    (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr);
+                    (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr,
+                    &mainShader);
                 shadowResource = shadowMap.GetResource();
             }
             {
@@ -18131,7 +18347,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     (!g_emptyLevelMode && g_showH2Model)
                         ? (crateShadowModel ? crateShadowModel : crateModel)
                         : nullptr,
-                    (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr);
+                    (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr,
+                    &mainShader);
                 shadowResource = shadowMap.GetResource();
             }
             fogLightSpace = lightSpace;
@@ -18425,6 +18642,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             lightShafts.Render(scene, g_dx12.commandList.Get(), shaftDepth,
                 visBuffer.GetOutputRTV(), shaftDepthReadable);
         }
+        // Every pass that reads the clustered light list has now run. Removed
+        // in reverse order of insertion: both pop off the back, so taking the
+        // flashlight first would discard a headlight instead.
+        RemoveEnemyHelicopterSearchlights(scene, searchlightsInLightList);
+        RemoveVehicleHeadlights(scene, headlightsInLightList);
+        RemovePlayerFlashlight(scene, flashlightInLightList);
 
         if (commonHDRValidationTarget) {
             ProfilerDX12::Scope profile(
@@ -18476,6 +18699,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // rather than leaving the screen green.
             if (!nvgEquipped || scene.player.health <= 0.0f)
                 g_nightVisionActive = false;
+            // Same for the weapon light: a dead player's rifle should not go on
+            // lighting the ground it fell on.
+            if (g_game.mission.Loadout().gear != GearType::Flashlight ||
+                scene.player.health <= 0.0f)
+                g_flashlightActive = false;
             const float rampRate = g_nightVisionActive ? 4.0f : 7.0f;
             const float target = g_nightVisionActive ? 1.0f : 0.0f;
             g_nightVisionBlend +=

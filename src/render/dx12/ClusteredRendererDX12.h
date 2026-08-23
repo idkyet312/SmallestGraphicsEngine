@@ -23,9 +23,23 @@ struct PointLightDX12 {
     float linear;
     float quadratic;
     bool active;
-    
+    // Spotlight cone, carried through to PointLightDataDX12 on upload. A zero
+    // direction is an ordinary omnidirectional light, which is what the default
+    // constructor leaves behind. Culling treats a spot as its bounding sphere:
+    // conservative, and the shader's cone test rejects the rest per pixel.
+    XMFLOAT3 spotDirection;
+    float spotCosInner;
+    float spotCosOuter;
+    // Slice of the spot shadow atlas this light samples, or -1 for a light
+    // that is not shadowed at all (every ordinary point light, and the
+    // player's flashlight). Several lights may share a slice: a vehicle's two
+    // headlights are cast from one frustum covering both.
+    int spotShadowIndex;
+
     PointLightDX12() : position(XMFLOAT3(0,0,0)), radius(10.0f), color(XMFLOAT3(1,1,1)), intensity(1.0f),
-                       constant(1.0f), linear(0.09f), quadratic(0.032f), active(true) {}
+                       constant(1.0f), linear(0.09f), quadratic(0.032f), active(true),
+                       spotDirection(XMFLOAT3(0,0,0)), spotCosInner(0.0f), spotCosOuter(0.0f),
+                       spotShadowIndex(-1) {}
 };
 
 class ClusteredRendererDX12 {
@@ -258,6 +272,10 @@ public:
             pld.radius = light.radius;
             pld.color = light.color;
             pld.intensity = light.intensity;
+            pld.spotDirection = light.spotDirection;
+            pld.spotCosInner = light.spotCosInner;
+            pld.spotCosOuter = light.spotCosOuter;
+            pld.spotShadowIndex = light.spotShadowIndex;
             data.push_back(pld);
         }
         return data;
@@ -301,6 +319,10 @@ public:
             pld.radius = light.radius;
             pld.color = light.color;
             pld.intensity = light.intensity;
+            pld.spotDirection = light.spotDirection;
+            pld.spotCosInner = light.spotCosInner;
+            pld.spotCosOuter = light.spotCosOuter;
+            pld.spotShadowIndex = light.spotShadowIndex;
             outLights.push_back(pld);
         }
     }

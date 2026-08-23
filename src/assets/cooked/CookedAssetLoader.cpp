@@ -2,6 +2,7 @@
 
 #include "CookedAssetFormat.h"
 #include "StaticBufferDX12.h"
+#include "TextureUploadArenaDX12.h"
 
 #include <Windows.h>
 #include <algorithm>
@@ -166,28 +167,38 @@ ComPtr<ID3D12Resource> CreateTexture(
     device->GetCopyableFootprints(&description, 0, source.mipCount, 0,
         footprints.data(), rowCounts.data(), rowSizes.data(), &uploadSize);
 
-    D3D12_RESOURCE_DESC uploadDescription = {};
-    uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    uploadDescription.Width = uploadSize;
-    uploadDescription.Height = 1;
-    uploadDescription.DepthOrArraySize = 1;
-    uploadDescription.MipLevels = 1;
-    uploadDescription.SampleDesc.Count = 1;
-    uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    D3D12_HEAP_PROPERTIES uploadHeap = {};
-    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
     ComPtr<ID3D12Resource> upload;
-    if (FAILED(device->CreateCommittedResource(
-            &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDescription,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-            IID_PPV_ARGS(&upload))))
-        return {};
-
+    ID3D12Resource* uploadResource = nullptr;
     uint8_t* mapped = nullptr;
-    const D3D12_RANGE noRead = {0, 0};
-    if (FAILED(upload->Map(0, &noRead,
-                           reinterpret_cast<void**>(&mapped))))
-        return {};
+    uint64_t pooledOffset = 0;
+    const bool pooled = IsTextureUploadArenaActiveDX12();
+    if (pooled) {
+        const TextureUploadAllocationDX12 allocation =
+            AllocateTextureUploadDX12(device, uploadSize);
+        if (!allocation) return {};
+        uploadResource = allocation.resource;
+        mapped = allocation.cpuAddress;
+        pooledOffset = allocation.offset;
+    } else {
+        D3D12_RESOURCE_DESC uploadDescription = {};
+        uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDescription.Width = uploadSize;
+        uploadDescription.Height = 1;
+        uploadDescription.DepthOrArraySize = 1;
+        uploadDescription.MipLevels = 1;
+        uploadDescription.SampleDesc.Count = 1;
+        uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES uploadHeap = {};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        if (FAILED(device->CreateCommittedResource(
+                &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDescription,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&upload)))) return {};
+        const D3D12_RANGE noRead = { 0, 0 };
+        if (FAILED(upload->Map(0, &noRead,
+                reinterpret_cast<void**>(&mapped)))) return {};
+        uploadResource = upload.Get();
+    }
     bool valid = true;
     for (uint32_t mip = 0; mip < source.mipCount; ++mip) {
         if (source.mipOffsets[mip] > source.dataSize ||
@@ -217,17 +228,14 @@ ComPtr<ID3D12Resource> CreateTexture(
                 sourceData + static_cast<size_t>(row) * sourceRowBytes,
                 sourceRowBytes);
     }
-    upload->Unmap(0, nullptr);
-    // Park the upload heap in the caller's keep-alive list BEFORE the validity
-    // bailout. Bailing out here used to return with `upload` still local, so the
-    // ComPtr released the heap immediately -- while CopyTextureRegion commands
-    // already recorded into this same still-in-flight command list continued to
-    // reference it. The GPU then read freed memory and the driver reset
-    // (DEVICE_HUNG; DRED page fault on a recently freed allocation).
-    //
-    // Retaining it costs one staging buffer until the normal post-load release,
-    // which is exactly what the success path already does.
-    uploads.push_back(upload);
+    if (pooled) {
+        for (auto& footprint : footprints) footprint.Offset += pooledOffset;
+    } else {
+        upload->Unmap(0, nullptr);
+    }
+    // Outside a pooled level load, park the heap before the validity bailout.
+    // The arena already owns pooled ranges through the final queue drain.
+    if (!pooled) uploads.push_back(upload);
     if (!valid) return {};
 
     for (uint32_t mip = 0; mip < source.mipCount; ++mip) {
@@ -236,7 +244,7 @@ ComPtr<ID3D12Resource> CreateTexture(
         destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         destination.SubresourceIndex = mip;
         D3D12_TEXTURE_COPY_LOCATION origin = {};
-        origin.pResource = upload.Get();
+        origin.pResource = uploadResource;
         origin.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         origin.PlacedFootprint = footprints[mip];
         commandList->CopyTextureRegion(

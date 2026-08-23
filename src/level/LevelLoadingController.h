@@ -20,6 +20,7 @@ enum class LevelLoadStage {
     BanditModel,
     BanditSpawn,
     GPUFinalize,
+    SubmitUploads,
     ReleaseUploads,
     Complete
 };

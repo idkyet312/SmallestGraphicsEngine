@@ -10,6 +10,7 @@
 #include "CookedAssetLoader.h"
 #include "MipGenerator.h"
 #include "StaticBufferDX12.h"
+#include "TextureUploadArenaDX12.h"
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -270,39 +271,49 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
     device->GetCopyableFootprints(&textureDesc, 0, 1, 0, &footprint, nullptr, nullptr, &uploadBufferSize);
 
-    D3D12_HEAP_PROPERTIES uploadHeapProps = {};
-    uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-    D3D12_RESOURCE_DESC uploadDesc = {};
-    uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    uploadDesc.Width = uploadBufferSize;
-    uploadDesc.Height = 1;
-    uploadDesc.DepthOrArraySize = 1;
-    uploadDesc.MipLevels = 1;
-    uploadDesc.Format = DXGI_FORMAT_UNKNOWN;
-    uploadDesc.SampleDesc.Count = 1;
-    uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    uploadDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
     ComPtr<ID3D12Resource> uploadHeap;
-    if (FAILED(device->CreateCommittedResource(
-        &uploadHeapProps, D3D12_HEAP_FLAG_NONE, &uploadDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-        IID_PPV_ARGS(&uploadHeap)))) {
-        return nullptr;
+    ID3D12Resource* uploadResource = nullptr;
+    BYTE* pData = nullptr;
+    const bool pooled = IsTextureUploadArenaActiveDX12();
+    if (pooled) {
+        const TextureUploadAllocationDX12 allocation =
+            AllocateTextureUploadDX12(device, uploadBufferSize);
+        if (!allocation) return nullptr;
+        uploadResource = allocation.resource;
+        pData = allocation.cpuAddress;
+        footprint.Offset += allocation.offset;
+    } else {
+        D3D12_HEAP_PROPERTIES uploadHeapProps = {};
+        uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC uploadDesc = {};
+        uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDesc.Width = uploadBufferSize;
+        uploadDesc.Height = 1;
+        uploadDesc.DepthOrArraySize = 1;
+        uploadDesc.MipLevels = 1;
+        uploadDesc.Format = DXGI_FORMAT_UNKNOWN;
+        uploadDesc.SampleDesc.Count = 1;
+        uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        uploadDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (FAILED(device->CreateCommittedResource(
+                &uploadHeapProps, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&uploadHeap)))) return nullptr;
+        if (FAILED(uploadHeap->Map(0, nullptr,
+                reinterpret_cast<void**>(&pData)))) return nullptr;
+        uploadResource = uploadHeap.Get();
     }
 
-    uploadHeaps.push_back(uploadHeap);
-
-    BYTE* pData;
-    uploadHeap->Map(0, nullptr, (void**)&pData);
-    BYTE* pDest = pData + footprint.Offset;
+    BYTE* pDest = pData;
     for (UINT h = 0; h < baseH; ++h) {
         memcpy(pDest + h * footprint.Footprint.RowPitch,
             pSource + (size_t)h * baseW * 4,
             (size_t)baseW * 4);
     }
-    uploadHeap->Unmap(0, nullptr);
+    if (!pooled) {
+        uploadHeap->Unmap(0, nullptr);
+        uploadHeaps.push_back(uploadHeap);
+    }
 
     D3D12_TEXTURE_COPY_LOCATION dst = {};
     dst.pResource = texture.Get();
@@ -310,7 +321,7 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
     dst.SubresourceIndex = 0;
 
     D3D12_TEXTURE_COPY_LOCATION src = {};
-    src.pResource = uploadHeap.Get();
+    src.pResource = uploadResource;
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src.PlacedFootprint = footprint;
 
@@ -611,30 +622,38 @@ ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& fi
     device->GetCopyableFootprints(&textureDesc, 0, mipLevels, 0,
         footprints.data(), numRows.data(), rowSizes.data(), &uploadBufferSize);
 
-    D3D12_HEAP_PROPERTIES uploadHeapProps = {};
-    uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-    D3D12_RESOURCE_DESC uploadDesc = {};
-    uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    uploadDesc.Width = uploadBufferSize;
-    uploadDesc.Height = 1;
-    uploadDesc.DepthOrArraySize = 1;
-    uploadDesc.MipLevels = 1;
-    uploadDesc.Format = DXGI_FORMAT_UNKNOWN;
-    uploadDesc.SampleDesc.Count = 1;
-    uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
     ComPtr<ID3D12Resource> uploadHeap;
-    if (FAILED(device->CreateCommittedResource(
-        &uploadHeapProps, D3D12_HEAP_FLAG_NONE, &uploadDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-        IID_PPV_ARGS(&uploadHeap)))) {
-        return nullptr;
+    ID3D12Resource* uploadResource = nullptr;
+    BYTE* pData = nullptr;
+    uint64_t pooledOffset = 0;
+    const bool pooled = IsTextureUploadArenaActiveDX12();
+    if (pooled) {
+        const TextureUploadAllocationDX12 allocation =
+            AllocateTextureUploadDX12(device.Get(), uploadBufferSize);
+        if (!allocation) return nullptr;
+        uploadResource = allocation.resource;
+        pData = allocation.cpuAddress;
+        pooledOffset = allocation.offset;
+    } else {
+        D3D12_HEAP_PROPERTIES uploadHeapProps = {};
+        uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC uploadDesc = {};
+        uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDesc.Width = uploadBufferSize;
+        uploadDesc.Height = 1;
+        uploadDesc.DepthOrArraySize = 1;
+        uploadDesc.MipLevels = 1;
+        uploadDesc.Format = DXGI_FORMAT_UNKNOWN;
+        uploadDesc.SampleDesc.Count = 1;
+        uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(
+                &uploadHeapProps, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&uploadHeap)))) return nullptr;
+        if (FAILED(uploadHeap->Map(0, nullptr,
+                reinterpret_cast<void**>(&pData)))) return nullptr;
+        uploadResource = uploadHeap.Get();
     }
-    uploadHeaps.push_back(uploadHeap);
-
-    BYTE* pData;
-    uploadHeap->Map(0, nullptr, (void**)&pData);
     for (UINT16 level = 0; level < mipLevels; ++level) {
         const size_t srcRowBytes = (size_t)mipW[level] * 4 * sizeof(float);
         BYTE* pDest = pData + footprints[level].Offset;
@@ -644,7 +663,12 @@ ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& fi
                 srcRowBytes);
         }
     }
-    uploadHeap->Unmap(0, nullptr);
+    if (pooled) {
+        for (auto& footprint : footprints) footprint.Offset += pooledOffset;
+    } else {
+        uploadHeap->Unmap(0, nullptr);
+        uploadHeaps.push_back(uploadHeap);
+    }
 
     for (UINT16 level = 0; level < mipLevels; ++level) {
         D3D12_TEXTURE_COPY_LOCATION dst = {};
@@ -653,7 +677,7 @@ ComPtr<ID3D12Resource> GLBImporter::LoadEXRTextureFromFile(const std::string& fi
         dst.SubresourceIndex = level;
 
         D3D12_TEXTURE_COPY_LOCATION src = {};
-        src.pResource = uploadHeap.Get();
+        src.pResource = uploadResource;
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint = footprints[level];
 

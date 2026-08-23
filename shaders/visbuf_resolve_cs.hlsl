@@ -76,14 +76,22 @@ struct PointLightData {
     float  radius;
     float3 color;
     float  intensity;
+    // Cone axis, unit length; zero for a plain omnidirectional point light.
+    float3 spotDirection;
+    float  spotCosInner;
+    float  spotCosOuter;
+    int spotShadowIndex;
+    float2 spotPadding;
 };
 
 cbuffer PointLightsBuffer : register(b2) {
     int            numPointLights;
-    float          plPad1;
+    // Live spot atlas slices this frame; see PointLightsBufferDX12.
+    int            spotShadowCount;
     float          plPad2;
     float          plPad3;
     PointLightData pointLights[64];
+    float4x4       spotShadowMatrices[3];
 };
 
 // ---- Per-draw-call data ----
@@ -215,6 +223,13 @@ StructuredBuffer<uint> sparseProbeIndices : register(t78);
 // visibility, and linear depth. This is common to default and enhanced resolve
 // variants; their descriptor tables place t86 at different heap offsets.
 Texture2D<float4> bentNormalGTAOHistory : register(t86);
+
+// Spot shadow atlas: one slice per shadow-casting spot light (vehicle
+// headlights, enemy helicopter searchlights). Not the player flashlight.
+// Outside the terrain guard on purpose: the root signature declares t92 on
+// every tier, and the point-light shading that samples it is not part of the
+// terrain branch.
+Texture2DArray<float> spotShadowAtlas : register(t92);
 
 #if SGE_TERRAIN_VISIBILITY
 // Triplanar terrain layer arrays (grass, dirt, sand, rock), shared with the
@@ -375,6 +390,54 @@ StructuredBuffer<HitGeometry> hitGeometry : register(t85);
 
 SamplerState              texSampler    : register(s0);
 SamplerComparisonState    shadowSampler : register(s1);
+
+// Occlusion for one shadow-casting spot light.
+//
+// Returns 1 where the light reaches and 0 where something blocks it. A light
+// with no slice, or one pointing at a slice that holds stale depth this frame,
+// returns 1 so it simply behaves as the unshadowed light it was before.
+//
+// The frustum here is perspective, unlike the sun cascades, so the projective
+// divide is real work rather than a no-op: w carries distance from the lamp.
+float SpotShadowVisibility(int shadowIndex, float3 worldPos) {
+    if (shadowIndex < 0 || shadowIndex >= spotShadowCount) return 1.0;
+
+    float4 lightClip = mul(float4(worldPos, 1.0), spotShadowMatrices[shadowIndex]);
+    if (lightClip.w <= 0.0) return 1.0;
+    float3 proj = lightClip.xyz / lightClip.w;
+    // Outside the rendered cone: the caster frustum is deliberately wider than
+    // the lit cone, so anything landing out here is past the beam edge anyway
+    // and the cone falloff has already taken it to zero.
+    if (any(abs(proj.xy) > 1.0) || proj.z < 0.0 || proj.z > 1.0) return 1.0;
+
+    float2 uv = proj.xy * float2(0.5, -0.5) + 0.5;
+
+    // Slope-independent constant bias scaled by distance from the lamp. A flat
+    // constant that clears acne on the ground right under a headlight leaves
+    // peter-panning at the far end of the beam, where one texel covers far more
+    // world; tying it to w spreads that cost across the range instead.
+    float bias = 0.0015 + 0.0025 * saturate(lightClip.w / 40.0);
+
+    uint atlasWidth, atlasHeight, atlasSlices;
+    spotShadowAtlas.GetDimensions(atlasWidth, atlasHeight, atlasSlices);
+    float2 texel = 1.0 / float2(atlasWidth, atlasHeight);
+
+    // 2x2 rotated-grid PCF. Cheaper than the sun's kernel on purpose: these are
+    // small local pools, and a headlight edge that is a little crisp reads as a
+    // headlight rather than as an error.
+    float visibility = 0.0;
+    [unroll]
+    for (int y = -1; y <= 1; y += 2) {
+        [unroll]
+        for (int x = -1; x <= 1; x += 2) {
+            float2 offset = float2(x, y) * texel * 0.75;
+            visibility += spotShadowAtlas.SampleCmpLevelZero(
+                shadowSampler, float3(uv + offset, (float)shadowIndex),
+                proj.z - bias);
+        }
+    }
+    return visibility * 0.25;
+}
 
 // ---- Helpers ----
 
@@ -1870,13 +1933,20 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
     // across all four. A pixel covered by a single layer pays one extra fetch
     // and takes the identity path through TerrainVBHeightBlend.
     float4 layerHeights = 0.0;
+    // FXC cannot lower a dynamically indexed float4 component used as an
+    // l-value here. Keep one compact loop for reasonable compile time, but route
+    // the sampled scalar through statically addressable components.
     [unroll] for (uint heightLayer = 0; heightLayer < 4; ++heightLayer) {
         if (layerWeights[heightLayer] <= kLayerEpsilon) continue;
         const TerrainVBGrads heightGrads =
             TerrainVBTriplanarGrads(worldDx, worldDy, scales[heightLayer]);
-        layerHeights[heightLayer] = SampleTerrainVBArray(
+        const float sampledHeight = SampleTerrainVBArray(
             terrainMetalRoughArray, worldPos, projectionWeights, heightLayer,
             scales[heightLayer], heightGrads).r;
+        if (heightLayer == 0) layerHeights.x = sampledHeight;
+        else if (heightLayer == 1) layerHeights.y = sampledHeight;
+        else if (heightLayer == 2) layerHeights.z = sampledHeight;
+        else layerHeights.w = sampledHeight;
     }
     const float4 blendWeights =
         TerrainVBHeightBlend(layerWeights, layerHeights);
@@ -1994,7 +2064,22 @@ float3 calculatePointLight(int index, float3 fragPos, float3 normal,
     float attenuation = 1.0 / (1.0 + (4.5 / lightRadius) * distance +
         (75.0 / (lightRadius * lightRadius)) * distance * distance);
     attenuation *= 1.0 - smoothstep(lightRadius * 0.75, lightRadius, distance);
-    
+
+    // Spotlight cone; a zero direction keeps this an ordinary point light.
+    // Must match clustered_dx12_ps, or the flashlight would light visibility
+    // buffer geometry and forward geometry to different shapes.
+    float3 spotDir = pointLights[index].spotDirection;
+    if (dot(spotDir, spotDir) > 0.0001) {
+        float cosAngle = dot(-lightDir, normalize(spotDir));
+        attenuation *= smoothstep(pointLights[index].spotCosOuter,
+                                  pointLights[index].spotCosInner, cosAngle);
+        // Occlusion for the casters that hold an atlas slice. Inside the cone
+        // test so the taps are only paid where the beam still contributes.
+        if (attenuation > 0.0)
+            attenuation *= SpotShadowVisibility(
+                pointLights[index].spotShadowIndex, fragPos);
+    }
+
     float diff = max(dot(normal, lightDir), 0.0);
     float3 radiance = pointLights[index].color * pointLights[index].intensity;
     float3 halfDir = normalize(lightDir + viewDir);

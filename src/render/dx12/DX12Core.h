@@ -203,6 +203,28 @@ inline void WaitForGPUAllFrames() {
         g_dx12.fenceValues[i] = target + 1;
 }
 
+// Drain the direct queue without touching the swap-chain frame-fence timeline.
+// Use this for multi-frame loading/cleanup sequences: WaitForGPUAllFrames leaves
+// every frame slot holding an unsignalled value and therefore requires an
+// immediate MoveToNextFrame handoff. A loading stage that keeps rendering for
+// several more frames eventually rotates onto one of those values and waits
+// forever. The private fence proves all earlier queue work completed while
+// leaving ordinary frame pacing byte-for-byte unchanged.
+inline void WaitForDirectQueueIdleIsolated() {
+    if (!g_dx12.device || !g_dx12.commandQueue) return;
+
+    ComPtr<ID3D12Fence> drainFence;
+    ThrowIfFailed(g_dx12.device->CreateFence(
+        0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&drainFence)));
+    constexpr UINT64 drainValue = 1;
+    ThrowIfFailed(g_dx12.commandQueue->Signal(drainFence.Get(), drainValue));
+    if (drainFence->GetCompletedValue() < drainValue) {
+        ThrowIfFailed(drainFence->SetEventOnCompletion(
+            drainValue, g_dx12.fenceEvent));
+        WaitForSingleObjectEx(g_dx12.fenceEvent, INFINITE, FALSE);
+    }
+}
+
 inline void WaitForFenceCPU(ID3D12Fence* fence, UINT64 value) {
     if (!fence || value == 0 || fence->GetCompletedValue() >= value) return;
     ThrowIfFailed(fence->SetEventOnCompletion(value, g_dx12.fenceEvent));

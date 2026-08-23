@@ -474,6 +474,10 @@ if(BUILD_TESTING)
     target_link_libraries(VisibilityGeometryPoolTests PRIVATE SGEProjectHeaders)
     add_test(NAME VisibilityGeometryPoolTests COMMAND VisibilityGeometryPoolTests)
 
+    add_executable(TextureUploadArenaTests tests/TextureUploadArenaTests.cpp)
+    target_link_libraries(TextureUploadArenaTests PRIVATE SGEProjectHeaders d3d12)
+    add_test(NAME TextureUploadArenaTests COMMAND TextureUploadArenaTests)
+
     add_executable(RagdollAssetTests tests/RagdollAssetTests.cpp)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
     target_compile_definitions(RagdollAssetTests PRIVATE

@@ -5,6 +5,7 @@
 #include "GLBImporter.h"
 #include "LevelDefinition.h"
 #include "TerrainStampLibrary.h"
+#include "TextureUploadArenaDX12.h"
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -80,6 +81,12 @@ public:
     // Writes terrain IDs into the R32G32_UINT visibility buffer instead of
     // shading. Optional: if this PSO is missing the forward path still runs.
     ComPtr<ID3D12PipelineState> psoVisibility;
+    // Depth only, no pixel shader and no render target, for the shadow passes.
+    // Terrain was previously absent from shadow rendering entirely, so hills
+    // blocked nothing -- barely noticeable for the sun, which comes in at a
+    // shallow angle, but obvious under a searchlight pointed straight down.
+    // Optional like the visibility PSO: without it terrain simply casts none.
+    ComPtr<ID3D12PipelineState> psoShadow;
     ComPtr<ID3D12GraphicsCommandList6> commandList6;
     ComPtr<ID3D12Resource> terrainAlbedoArray;
     ComPtr<ID3D12Resource> terrainNormalArray;
@@ -105,6 +112,7 @@ public:
     std::vector<RetiredSplat> retiredSplatMaps_;
     std::array<ComPtr<ID3D12Resource>, FRAME_COUNT> sculptBuffers;
     std::array<ComPtr<ID3D12Resource>, FRAME_COUNT> stampAtlasBuffers;
+    std::array<uint64_t, FRAME_COUNT> uploadedSculptRevision_{};
     std::array<uint64_t, FRAME_COUNT> uploadedStampAtlasRevision_{};
     std::array<ComPtr<ID3D12Resource>, 3> terrainUploads;
     D3D12_GPU_DESCRIPTOR_HANDLE terrainTextureTable{};
@@ -213,6 +221,29 @@ public:
             stream.rt.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         }
 
+        // Depth-only shadow PSO: same AS/MS, no pixel shader, no render target.
+        // Depth bias matches DepthOnlyShaderDX12's so terrain acne behaves the
+        // same as every other caster's.
+        {
+            const D3D12_SHADER_BYTECODE noPixelShader = {};
+            stream.ps.value = noPixelShader;
+            stream.rt.value.NumRenderTargets = 0;
+            stream.rt.value.RTFormats[0] = DXGI_FORMAT_UNKNOWN;
+            stream.raster.value.DepthBias = 1000;
+            stream.raster.value.SlopeScaledDepthBias = 1.0f;
+            if (FAILED(device2->CreatePipelineState(
+                    &streamDesc, IID_PPV_ARGS(&psoShadow)))) {
+                std::cerr << "Terrain shadow PSO creation failed "
+                             "(non-fatal; terrain casts no shadow)\n";
+                psoShadow.Reset();
+            }
+            stream.raster.value.DepthBias = 0;
+            stream.raster.value.SlopeScaledDepthBias = 0.0f;
+            stream.rt.value.NumRenderTargets = 1;
+            stream.ps.value = { ps->GetBufferPointer(), ps->GetBufferSize() };
+            stream.rt.value.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
+
         stream.raster.value.FillMode = D3D12_FILL_MODE_WIREFRAME;
         ComPtr<ID3DBlob> wirePs;
         if (SUCCEEDED(ReadCompiledShaderDX12(L"shaders/wire_green_ps.cso", &wirePs))) {
@@ -296,6 +327,7 @@ public:
                 m_sculptMaxDisplacement = (std::max)(m_sculptMaxDisplacement,
                     std::abs(stamp.value) + 12.0f);
         }
+        ++s_sculptRevision;
     }
 
     void SetMSAAEnabled(bool enabled) {
@@ -574,7 +606,8 @@ public:
     }
 
     void UploadSculptStamps(UINT frame) {
-        if (frame >= FRAME_COUNT || !sculptBuffers[frame]) return;
+        if (frame >= FRAME_COUNT || !sculptBuffers[frame] ||
+            uploadedSculptRevision_[frame] == s_sculptRevision) return;
         SculptGPU* destination = nullptr;
         if (FAILED(sculptBuffers[frame]->Map(0, nullptr,
                 reinterpret_cast<void**>(&destination)))) return;
@@ -587,6 +620,7 @@ public:
                 source.replace, source.baseHeight };
         }
         sculptBuffers[frame]->Unmap(0, nullptr);
+        uploadedSculptRevision_[frame] = s_sculptRevision;
     }
 
     void UploadStampAtlas(UINT frame) {
@@ -635,24 +669,37 @@ public:
         g_dx12.device->GetCopyableFootprints(
             &desc, 0, subresourceCount, 0, layouts.data(), rows.data(),
             rowBytes.data(), &uploadBytes);
-        D3D12_RESOURCE_DESC uploadDesc = {};
-        uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        uploadDesc.Width = uploadBytes;
-        uploadDesc.Height = 1;
-        uploadDesc.DepthOrArraySize = 1;
-        uploadDesc.MipLevels = 1;
-        uploadDesc.SampleDesc.Count = 1;
-        uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        D3D12_HEAP_PROPERTIES uploadHeap = {};
-        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-        if (FAILED(g_dx12.device->CreateCommittedResource(
-                &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
-                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                IID_PPV_ARGS(&upload)))) return false;
-
+        ID3D12Resource* uploadResource = nullptr;
         uint8_t* mapped = nullptr;
-        if (FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))))
-            return false;
+        uint64_t pooledOffset = 0;
+        const bool pooled = IsTextureUploadArenaActiveDX12();
+        if (pooled) {
+            const TextureUploadAllocationDX12 allocation =
+                AllocateTextureUploadDX12(g_dx12.device.Get(), uploadBytes);
+            if (!allocation) return false;
+            uploadResource = allocation.resource;
+            mapped = allocation.cpuAddress;
+            pooledOffset = allocation.offset;
+            upload.Reset();
+        } else {
+            D3D12_RESOURCE_DESC uploadDesc = {};
+            uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            uploadDesc.Width = uploadBytes;
+            uploadDesc.Height = 1;
+            uploadDesc.DepthOrArraySize = 1;
+            uploadDesc.MipLevels = 1;
+            uploadDesc.SampleDesc.Count = 1;
+            uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            D3D12_HEAP_PROPERTIES uploadHeap = {};
+            uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+            if (FAILED(g_dx12.device->CreateCommittedResource(
+                    &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    IID_PPV_ARGS(&upload)))) return false;
+            if (FAILED(upload->Map(
+                    0, nullptr, reinterpret_cast<void**>(&mapped)))) return false;
+            uploadResource = upload.Get();
+        }
         const size_t sourceLayerPitch = static_cast<size_t>(side) * side * 4;
         std::vector<std::vector<uint8_t>> mipData(subresourceCount);
         for (UINT layer = 0; layer < layers; ++layer) {
@@ -691,7 +738,11 @@ public:
                     source + static_cast<size_t>(row) * sourceRowPitch,
                     sourceRowPitch);
         }
-        upload->Unmap(0, nullptr);
+        if (pooled) {
+            for (auto& layout : layouts) layout.Offset += pooledOffset;
+        } else {
+            upload->Unmap(0, nullptr);
+        }
 
         for (UINT subresource = 0; subresource < subresourceCount; ++subresource) {
             D3D12_TEXTURE_COPY_LOCATION destination = {};
@@ -699,7 +750,7 @@ public:
             destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             destination.SubresourceIndex = subresource;
             D3D12_TEXTURE_COPY_LOCATION source = {};
-            source.pResource = upload.Get();
+            source.pResource = uploadResource;
             source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             source.PlacedFootprint = layouts[subresource];
             g_dx12.commandList->CopyTextureRegion(
@@ -1151,6 +1202,37 @@ public:
         return true;
     }
 
+    // Depth-only terrain for a shadow pass.
+    //
+    // Runs under the main graphics root signature, not DepthOnlyShaderDX12's:
+    // the terrain amplification and mesh shaders read the camera, terrain
+    // params and sculpt buffers through slots that only exist there. The
+    // caller therefore binds matrices with lightSpace as the view-projection
+    // through ShaderDX12 before calling this, and must restore the depth
+    // shader's root signature afterwards for the remaining casters.
+    //
+    // Culling still runs against whatever the AS was given, so a light-space
+    // matrix here culls tiles to the light's frustum, which is what makes the
+    // pass affordable for a spot caster covering a small cone.
+    bool DrawShadow(ShaderDX12& shader, const Params& params) {
+        if (!supported || !psoShadow || !shader.rootSignature) return false;
+        shader.RebindGraphicsResourceTables();
+        commandList6->SetGraphicsRootDescriptorTable(7, terrainTextureTable);
+        commandList6->SetPipelineState(psoShadow.Get());
+        Params drawParams = params;
+        drawParams.sculptCount = static_cast<UINT>(s_sculptStamps.size());
+        drawParams.sculptMaxDisplacement = m_sculptMaxDisplacement;
+        UploadSculptStamps(g_dx12.frameIndex);
+        UploadStampAtlas(g_dx12.frameIndex);
+        commandList6->SetGraphicsRoot32BitConstants(8, 16, &drawParams, 0);
+        commandList6->SetGraphicsRootShaderResourceView(
+            13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
+        commandList6->SetGraphicsRootShaderResourceView(
+            14, stampAtlasBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
+        commandList6->DispatchMesh((TileCount(params) + 31) / 32, 1, 1);
+        return true;
+    }
+
     bool DrawVisibility(ShaderDX12& shader, const Params& params) {
         if (!VisibilitySupported() || !shader.rootSignature) return false;
         // The visibility pixel shader samples nothing, but the amplification and
@@ -1315,6 +1397,7 @@ private:
     inline static std::vector<std::string> s_stampNames;
     inline static std::vector<uint8_t> s_stampLoadState;
     inline static std::vector<uint16_t> s_stampAtlas;
+    inline static uint64_t s_sculptRevision = 1;
     inline static uint64_t s_stampAtlasRevision = 1;
     float m_sculptMaxDisplacement = 0.0f;
 };

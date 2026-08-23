@@ -1112,7 +1112,17 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
             plb.lights[i].color = sourceLights[i].color;
             plb.lights[i].intensity = sourceLights[i].active
                 ? sourceLights[i].intensity : 0.0f;
+            // Indices here must line up with the ones cullLights() wrote into
+            // the cluster lists, so this copies every light in order -- inactive
+            // ones included, zeroed by intensity rather than skipped.
+            plb.lights[i].spotDirection = sourceLights[i].spotDirection;
+            plb.lights[i].spotCosInner = sourceLights[i].spotCosInner;
+            plb.lights[i].spotCosOuter = sourceLights[i].spotCosOuter;
+            plb.lights[i].spotShadowIndex = sourceLights[i].spotShadowIndex;
         }
+        plb.spotShadowCount = static_cast<int>(g_spotShadowActiveCount);
+        for (UINT s = 0; s < SPOT_SHADOW_COUNT; ++s)
+            plb.spotShadowMatrices[s] = XMMatrixTranspose(g_spotShadowMatrices[s]);
         shader.pointLightsBuffer.CopyData(g_dx12.frameIndex, plb);
     }
 
