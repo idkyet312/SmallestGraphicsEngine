@@ -999,9 +999,24 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         // Mirrors SetTerrainMaterial: terrain scans are OpenGL normal maps, and
         // the authored footpaths are built-in levels only.
         vb.SetTerrainMaterialParams(g_customLevelMode ? 0.0f : 3.0f, -1.0f);
+        // Any paint staged since the last frame is copied here, where the
+        // command list is open, and before SetTerrainTextures reads the
+        // resource pointer so a new texture is picked up the same frame.
+        g_terrain.FlushPendingSplatUpload();
         vb.SetTerrainTextures(g_terrain.terrainAlbedoArray.Get(),
                               g_terrain.terrainNormalArray.Get(),
-                              g_terrain.terrainRoughnessArray.Get());
+                              g_terrain.terrainRoughnessArray.Get(),
+                              g_terrain.terrainSplatMap.Get());
+        // Splat UVs cover the island exactly once. kShoreOuter (88) is the
+        // coastline radius in terrain_ms.hlsl, scaled per axis; the coastline
+        // warp distorts the shore within this frame, not the frame itself, so
+        // the plain mapping stays invertible for the editor's world->UV.
+        {
+            const TerrainRendererDX12::Params sp = CurrentTerrainParams();
+            constexpr float kShoreOuter = 88.0f;
+            vb.SetTerrainSplatExtent(kShoreOuter * sp.islandScaleX,
+                                     kShoreOuter * sp.islandScaleZ);
+        }
     }
     if (scene.useMeshTerrain && g_terrain.VisibilitySupported() &&
         vb.TerrainVisibilityReady()) {

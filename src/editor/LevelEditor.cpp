@@ -539,6 +539,14 @@ void LevelEditor::OnKeyDown(unsigned key, bool controlDown) {
 }
 
 bool LevelEditor::FoliageChanged(const LevelDefinition& before) const {
+    // Cleared areas change what the scatter produces, so they must trigger the
+    // same rebuild as adding or removing a foliage entity.
+    if (before.foliageClear.size() != level_.foliageClear.size()) return true;
+    for (size_t i = 0; i < before.foliageClear.size(); ++i) {
+        const FoliageClearStamp& a = before.foliageClear[i];
+        const FoliageClearStamp& b = level_.foliageClear[i];
+        if (a.x != b.x || a.z != b.z || a.radius != b.radius) return true;
+    }
     const auto collect = [](const LevelDefinition& level) {
         std::vector<const LevelEntity*> result;
         for (const LevelEntity& entity : level.entities)
@@ -565,6 +573,11 @@ bool LevelEditor::TerrainChanged(const LevelDefinition& before) const {
         before.terrainIslandScaleZ != level_.terrainIslandScaleZ ||
         before.terrainOriginTileX != level_.terrainOriginTileX ||
         before.terrainOriginTileZ != level_.terrainOriginTileZ ||
+        // Revision, not the pixel buffer: this runs per frame, and comparing a
+        // megabyte of splat texels here would cost more than the paint itself.
+        // The counter rides through undo snapshots like any other field.
+        before.terrainSplatRevision != level_.terrainSplatRevision ||
+        before.terrainSplatResolution != level_.terrainSplatResolution ||
         before.terrainSculpt.size() != level_.terrainSculpt.size()) return true;
     for (size_t i = 0; i < before.terrainSculpt.size(); ++i) {
         const TerrainSculptStamp& a = before.terrainSculpt[i];
@@ -654,8 +667,35 @@ void LevelEditor::PaintFoliage(CXMMATRIX view, CXMMATRIX projection,
             (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y);
     }
     if (ringCount > 1) draw->AddPolyline(ring, ringCount,
-        foliageTool_ == 1 ? IM_COL32(90, 255, 90, 230) : IM_COL32(255, 80, 60, 230),
+        foliageTool_ == 1 ? IM_COL32(90, 255, 90, 230) :
+        (foliageTool_ == 3 ? IM_COL32(235, 170, 60, 230)
+                           : IM_COL32(255, 80, 60, 230)),
         ImDrawFlags_None, 2.0f);
+    // Show what is already cleared while the tool is active, so the user can
+    // see coverage rather than guessing where they have been.
+    if (foliageTool_ == 3) {
+        const ImVec2 display = ImGui::GetIO().DisplaySize;
+        for (const FoliageClearStamp& stamp : level_.foliageClear) {
+            ImVec2 disc[25];
+            int discCount = 0;
+            for (int i = 0; i <= 24; ++i) {
+                const float angle = XM_2PI * static_cast<float>(i) / 24.0f;
+                const float px = stamp.x + std::cos(angle) * stamp.radius;
+                const float pz = stamp.z + std::sin(angle) * stamp.radius;
+                const XMVECTOR clip = XMVector3Transform(
+                    XMVectorSet(px, terrainHeight(px, pz) + 0.04f, pz, 1.0f),
+                    viewProjection);
+                const float w = XMVectorGetW(clip);
+                if (w <= 0.01f) continue;
+                disc[discCount++] = ImVec2(
+                    (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+                    (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y);
+            }
+            if (discCount > 1)
+                draw->AddPolyline(disc, discCount, IM_COL32(235, 170, 60, 110),
+                                  ImDrawFlags_None, 1.5f);
+        }
+    }
 
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) return;
     if (!foliageStrokeActive_) {
@@ -671,6 +711,42 @@ void LevelEditor::PaintFoliage(CXMMATRIX view, CXMMATRIX projection,
 
     const LevelEntityType type = foliageType_ == 0 ? LevelEntityType::GrassPatch :
         (foliageType_ == 1 ? LevelEntityType::Dandelion : LevelEntityType::Palm);
+    // Tool 3: suppress the auto-scattered ground cover. Unlike Erase, which
+    // deletes placed entities, this records a persistent circle that the
+    // scatter honours -- procedural grass has no entities to delete.
+    if (foliageTool_ == 3) {
+        // Merge into an existing stamp when the brush is dragged over ground
+        // already cleared, instead of stacking hundreds of overlapping circles
+        // that would all be tested per blade.
+        for (FoliageClearStamp& stamp : level_.foliageClear) {
+            const float dx = stamp.x - hit.x;
+            const float dz = stamp.z - hit.z;
+            const float distance = std::sqrt(dx * dx + dz * dz);
+            if (distance + brushRadius_ <= stamp.radius) return;  // covered
+            if (distance <= stamp.radius) {
+                const float grown = distance + brushRadius_;
+                if (grown > stamp.radius) {
+                    stamp.radius = grown;
+                    foliageStrokeChanged_ = true;
+                }
+                return;
+            }
+        }
+        if (level_.foliageClear.size() >= kMaxFoliageClearStamps) {
+            status_ = "Ground cover clear limit reached (" +
+                std::to_string(kMaxFoliageClearStamps) +
+                "). Undo or Restore Ground Cover.";
+            return;
+        }
+        FoliageClearStamp stamp;
+        stamp.x = hit.x;
+        stamp.z = hit.z;
+        stamp.radius = brushRadius_;
+        level_.foliageClear.push_back(stamp);
+        foliageStrokeChanged_ = true;
+        return;
+    }
+
     if (foliageTool_ == 2) {
         const size_t oldSize = level_.entities.size();
         level_.entities.erase(std::remove_if(level_.entities.begin(), level_.entities.end(),
@@ -869,8 +945,10 @@ void LevelEditor::SculptTerrain(CXMMATRIX view, CXMMATRIX projection,
         terrainStrokeActive_ = false;
         terrainStrokeChanged_ = false;
     }
-    // Tools: 1 raise, 2 lower, 3 flatten. 0 select and 4 grow don't sculpt.
-    if (terrainTool_ == 0 || terrainTool_ == 4 ||
+    // Tools: 1 raise, 2 lower, 3 flatten. An allowlist, not a denylist: 0
+    // select, 4 grow and 5 paint must not sculpt, and a denylist would let any
+    // tool added later silently start pushing height stamps.
+    if ((terrainTool_ != 1 && terrainTool_ != 2 && terrainTool_ != 3) ||
         ImGui::GetIO().WantCaptureMouse || ImGuizmo::IsOver())
         return;
     XMFLOAT3 hit;
@@ -935,6 +1013,161 @@ void LevelEditor::SculptTerrain(CXMMATRIX view, CXMMATRIX projection,
     }
     level_.terrainSculpt.push_back(stamp);
     terrainStrokeChanged_ = true;
+}
+
+bool LevelEditor::EnsureTerrainSplatMap() {
+    // 512 across the island is ~0.35 m per texel on the default radius: finer
+    // than the triplanar blend can resolve, and only 1 MB per undo snapshot.
+    constexpr uint32_t kSplatResolution = 512;
+    const size_t expected =
+        static_cast<size_t>(kSplatResolution) * kSplatResolution * 4u;
+    if (level_.terrainSplatResolution == kSplatResolution &&
+        level_.terrainSplatRGBA.size() == expected)
+        return true;
+    // Zero-filled: every texel starts "unpainted", which the resolve reads as
+    // "use the procedural weights". Painting is purely additive from there.
+    level_.terrainSplatRGBA.assign(expected, 0u);
+    level_.terrainSplatResolution = kSplatResolution;
+    return true;
+}
+
+void LevelEditor::PaintTerrain(CXMMATRIX view, CXMMATRIX projection,
+    const std::function<float(float, float)>& terrainHeight,
+    float islandHalfExtentX, float islandHalfExtentZ) {
+    // Stroke end and undo sit above the tool gate, mirroring SculptTerrain: a
+    // stroke that ends after the user switches tools must still be committed.
+    const bool released = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
+    if (released && terrainStrokeActive_) {
+        if (terrainStrokeChanged_) {
+            PushUndo(terrainStrokeBefore_);
+            dirty_ = true;
+            runtimeDirty_ = true;
+            terrainRuntimeDirty_ = true;
+            // Painting changes surface appearance only -- no height, no
+            // occlusion -- so unlike sculpting it does not invalidate the DDGI
+            // probe layout. Re-lighting the level on every brush stroke would
+            // be a heavy and pointless rebuild.
+        }
+        terrainStrokeActive_ = false;
+        terrainStrokeChanged_ = false;
+    }
+    if (terrainTool_ != 5 || ImGui::GetIO().WantCaptureMouse ||
+        ImGuizmo::IsOver())
+        return;
+    if (islandHalfExtentX <= 1e-4f || islandHalfExtentZ <= 1e-4f) return;
+
+    XMFLOAT3 hit;
+    if (!TerrainPointUnderMouse(view, projection, terrainHeight, hit)) return;
+
+    // Brush ring, tinted by the layer being painted so the target material is
+    // readable without consulting the panel.
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    const XMMATRIX viewProjection = view * projection;
+    ImVec2 ring[33];
+    int ringCount = 0;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    for (int i = 0; i <= 32; ++i) {
+        const float angle = XM_2PI * static_cast<float>(i) / 32.0f;
+        const float px = hit.x + std::cos(angle) * terrainBrushRadius_;
+        const float pz = hit.z + std::sin(angle) * terrainBrushRadius_;
+        const float py = terrainHeight(px, pz) + 0.06f;
+        const XMVECTOR clip = XMVector3Transform(
+            XMVectorSet(px, py, pz, 1.0f), viewProjection);
+        const float w = XMVectorGetW(clip);
+        if (w <= 0.01f) continue;
+        ring[ringCount++] = ImVec2((XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+            (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y);
+    }
+    if (ringCount > 1) {
+        static const ImU32 kLayerColors[4] = {
+            IM_COL32( 90, 210,  90, 235),   // grass
+            IM_COL32(200, 130,  60, 235),   // dirt
+            IM_COL32(230, 215, 140, 235),   // sand
+            IM_COL32(225, 225, 235, 235)    // rock
+        };
+        draw->AddPolyline(ring, ringCount,
+            kLayerColors[terrainPaintLayer_ & 3], ImDrawFlags_None, 2.0f);
+    }
+
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) return;
+    if (!terrainStrokeActive_) {
+        terrainStrokeActive_ = true;
+        terrainStrokeChanged_ = false;
+        terrainStrokeBefore_ = level_;
+        lastTerrainStamp_ = { 100000.0f, 0.0f, 100000.0f };
+    }
+    // Squared-distance spacing against the sentinel start, exactly as sculpt
+    // does, so the first stamp of a stroke always lands.
+    const float dx = hit.x - lastTerrainStamp_.x;
+    const float dz = hit.z - lastTerrainStamp_.z;
+    if (dx * dx + dz * dz < terrainBrushSpacing_ * terrainBrushSpacing_) return;
+    if (!EnsureTerrainSplatMap()) return;
+    lastTerrainStamp_ = hit;
+
+    const int resolution = static_cast<int>(level_.terrainSplatResolution);
+    // Same world->UV frame as the resolve: u = x / (2 * halfExtent) + 0.5.
+    const float invExtentX = 0.5f / islandHalfExtentX;
+    const float invExtentZ = 0.5f / islandHalfExtentZ;
+    const float centerU = hit.x * invExtentX + 0.5f;
+    const float centerV = hit.z * invExtentZ + 0.5f;
+    // The brush is a world-space circle, so its texel radius differs per axis
+    // whenever the island is stretched (islandScaleX != islandScaleZ).
+    const float radiusU = terrainBrushRadius_ * invExtentX * resolution;
+    const float radiusV = terrainBrushRadius_ * invExtentZ * resolution;
+    if (radiusU < 0.01f || radiusV < 0.01f) return;
+
+    const int minX = (std::max)(0, static_cast<int>(std::floor(
+        centerU * resolution - radiusU)));
+    const int maxX = (std::min)(resolution - 1, static_cast<int>(std::ceil(
+        centerU * resolution + radiusU)));
+    const int minY = (std::max)(0, static_cast<int>(std::floor(
+        centerV * resolution - radiusV)));
+    const int maxY = (std::min)(resolution - 1, static_cast<int>(std::ceil(
+        centerV * resolution + radiusV)));
+
+    const int layer = terrainPaintLayer_ & 3;
+    bool wrote = false;
+    for (int y = minY; y <= maxY; ++y) {
+        for (int x = minX; x <= maxX; ++x) {
+            // Normalised elliptical distance, so a stretched island still gets
+            // a round brush in world space.
+            const float ndx = ((x + 0.5f) - centerU * resolution) / radiusU;
+            const float ndy = ((y + 0.5f) - centerV * resolution) / radiusV;
+            const float distance = std::sqrt(ndx * ndx + ndy * ndy);
+            if (distance > 1.0f) continue;
+            // Smooth falloff to the rim. The resolve derives coverage from the
+            // painted channels, so a feathered edge blends back into the
+            // procedural weights rather than cutting a hard boundary.
+            const float falloff = 1.0f - distance * distance;
+            const float deposit = terrainPaintStrength_ * falloff;
+            if (deposit <= 0.0f) continue;
+            uint8_t* texel = &level_.terrainSplatRGBA[
+                (static_cast<size_t>(y) * resolution + x) * 4u];
+            const int target = static_cast<int>(deposit * 255.0f + 0.5f);
+            // Accumulate toward the target rather than overwriting, so repeated
+            // passes build up like a real brush and a light touch never erases
+            // heavier paint already laid down.
+            if (target > texel[layer]) {
+                texel[layer] = static_cast<uint8_t>(target);
+                wrote = true;
+            }
+            // The painted channels are normalised in the shader, so competing
+            // layers must be pulled down or the blend would just average them.
+            for (int other = 0; other < 4; ++other) {
+                if (other == layer) continue;
+                const int reduced = static_cast<int>(
+                    texel[other] * (1.0f - deposit));
+                if (reduced < texel[other]) {
+                    texel[other] = static_cast<uint8_t>(reduced);
+                    wrote = true;
+                }
+            }
+        }
+    }
+    if (wrote) {
+        ++level_.terrainSplatRevision;
+        terrainStrokeChanged_ = true;
+    }
 }
 
 void LevelEditor::SelectFromViewport(CXMMATRIX view, CXMMATRIX projection) {
@@ -1633,6 +1866,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     if (ImGui::RadioButton("Paint (B)", &foliageTool_, 1)) terrainTool_ = 0;
     ImGui::SameLine();
     if (ImGui::RadioButton("Erase", &foliageTool_, 2)) terrainTool_ = 0;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Clear Cover", &foliageTool_, 3)) terrainTool_ = 0;
     const char* foliageTypes[] = { "Grass", "Dandelion", "Trees" };
     ImGui::Combo("Foliage", &foliageType_, foliageTypes, IM_ARRAYSIZE(foliageTypes));
     ImGui::SliderFloat("Radius", &brushRadius_, 0.5f, 12.0f, "%.1f m");
@@ -1642,6 +1877,24 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         0.01f, 0.2f, 3.0f, "%.2f", "%.2f");
     foliageScaleMax_ = (std::max)(foliageScaleMin_, foliageScaleMax_);
     ImGui::TextWrapped("Hold LMB on terrain. Erase affects selected foliage type. Trees use destructible palms.");
+
+    if (foliageTool_ == 3) {
+        ImGui::SeparatorText("Ground Cover");
+        ImGui::Text("Cleared areas: %zu / %zu", level_.foliageClear.size(),
+                    kMaxFoliageClearStamps);
+        ImGui::BeginDisabled(level_.foliageClear.empty());
+        if (ImGui::Button("Restore Ground Cover")) {
+            const LevelDefinition before = level_;
+            level_.foliageClear.clear();
+            MarkChanged(before);
+            foliageRuntimeDirty_ = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::TextWrapped(
+            "Removes the automatically scattered grass and dandelions, which "
+            "are not entities and so cannot be deleted with Erase. Overlapping "
+            "strokes merge. Saved with the level.");
+    }
     ImGui::End();
 
     ImGui::SetNextWindowPos(ImVec2(305, 325), ImGuiCond_FirstUseEver);
@@ -1655,6 +1908,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     if (ImGui::RadioButton("Flatten", &terrainTool_, 3)) foliageTool_ = 0;
     ImGui::SameLine();
     if (ImGui::RadioButton("Grow", &terrainTool_, 4)) foliageTool_ = 0;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Paint", &terrainTool_, 5)) foliageTool_ = 0;
     ImGui::SliderFloat("Brush radius", &terrainBrushRadius_, 0.5f, 15.0f, "%.1f m");
     ImGui::SliderFloat("Strength", &terrainBrushStrength_, 0.05f, 2.0f, "%.2f");
     ImGui::SliderFloat("Stroke spacing", &terrainBrushSpacing_, 0.2f, 8.0f, "%.2f m");
@@ -1668,6 +1923,33 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     }
     ImGui::EndDisabled();
     ImGui::TextWrapped("Hold LMB on terrain. Flatten uses height where stroke starts.");
+
+    if (terrainTool_ == 5) {
+        ImGui::SeparatorText("Material Paint");
+        const char* kLayers[] = { "Grass", "Dirt", "Sand", "Rock" };
+        ImGui::Combo("Layer", &terrainPaintLayer_, kLayers,
+                     IM_ARRAYSIZE(kLayers));
+        ImGui::SliderFloat("Paint opacity", &terrainPaintStrength_, 0.05f, 1.0f,
+                           "%.2f");
+        if (level_.terrainSplatResolution > 0)
+            ImGui::Text("Splatmap: %ux%u", level_.terrainSplatResolution,
+                        level_.terrainSplatResolution);
+        else
+            ImGui::TextDisabled("Splatmap: none (created on first stroke)");
+        ImGui::BeginDisabled(level_.terrainSplatResolution == 0);
+        if (ImGui::Button("Clear Painting")) {
+            const LevelDefinition before = level_;
+            level_.terrainSplatRGBA.clear();
+            level_.terrainSplatResolution = 0;
+            ++level_.terrainSplatRevision;
+            MarkChanged(before);
+        }
+        ImGui::EndDisabled();
+        ImGui::TextWrapped(
+            "Painted weights override the procedural slope/height blend. "
+            "Unpainted ground keeps its automatic materials. Saved beside the "
+            "level as <name>_splat.png.");
+    }
 
     ImGui::SeparatorText("Island Builder");
     // Island size = the land radius. The tile grid auto-grows to fit it (see
@@ -1954,6 +2236,16 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     }
 
     SculptTerrain(view, projection, terrainHeight);
+    // Must match the resolve's world->UV frame exactly (see RenderVBDraw's
+    // SetTerrainSplatExtent call): kShoreOuter is the coastline radius from
+    // terrain_ms.hlsl, scaled per axis. If these two drift apart, paint lands
+    // in one place in the editor and renders in another.
+    {
+        constexpr float kShoreOuter = 88.0f;
+        PaintTerrain(view, projection, terrainHeight,
+                     kShoreOuter * level_.terrainIslandScaleX,
+                     kShoreOuter * level_.terrainIslandScaleZ);
+    }
     ExtendTerrainInteraction(view, projection);
     PaintFoliage(view, projection, terrainHeight);
     if (foliageTool_ == 0 && terrainTool_ == 0)

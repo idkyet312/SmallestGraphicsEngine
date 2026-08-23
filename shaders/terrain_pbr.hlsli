@@ -60,7 +60,61 @@ float4 TerrainLayerWeights(float3 worldPos, float3 geometricNormal) {
     // four-way soup. Mild contrast preserves soft natural boundaries while each
     // scan keeps its authored colour and normal response.
     weights = pow(weights, 1.35);
-    return weights / dot(weights, 1.0);
+    weights = weights / dot(weights, 1.0);
+
+    // Splatmap painting is implemented in the visibility resolve only. The
+    // forward path shares rootParams[7] with every material in the engine, so
+    // binding a fourth terrain SRV here would change the descriptor stride for
+    // every draw; that plumbing is deliberately deferred.
+    //
+    // This block mirrors TerrainVBLayerWeights in visbuf_resolve_cs.hlsl so the
+    // two copies stay readable as one algorithm. Keep them in sync.
+#if SGE_TERRAIN_FORWARD_SPLAT
+    if (terrainSplatEnabled != 0) {
+        float2 splatUV = worldPos.xz * terrainSplatInvExtent + 0.5;
+        float4 painted =
+            terrainSplatMap.SampleLevel(terrainSplatSampler, splatUV, 0);
+        float coverage = max(max(painted.x, painted.y),
+                             max(painted.z, painted.w));
+        if (coverage > 0.001) {
+            float4 paintedNorm = painted / max(dot(painted, 1.0), 1e-4);
+            weights = lerp(weights, paintedNorm, saturate(coverage));
+        }
+    }
+#endif
+    return weights;
+}
+
+// Height-based blending. Linear weights cross-fade two layers by averaging
+// their colours, which reads as a soft muddy band wherever rock meets grass --
+// real ground does not do that. Instead the LOUDER material wins per-texel:
+// rock standing proud in its own height map pokes through the grass, and grass
+// fills the crevices between the stones, so the boundary becomes an interlock
+// rather than a gradient.
+//
+// `heights` are the per-layer displacement proxies -- the packed PBR .r channel,
+// which these scans store as occlusion: high on raised stone, low in the gaps.
+// The standard formulation is
+//     raised_i = weight_i + height_i * contrast
+// keeping only layers within `contrast` of the tallest, then renormalising.
+// Contrast 0 degenerates exactly to the linear blend, and a layer whose weight
+// is already 0 can never be revived by a tall height value.
+static const float kTerrainHeightBlendContrast = 0.28;
+
+float4 TerrainHeightBlend(float4 weights, float4 heights) {
+    float4 raised = weights + heights * kTerrainHeightBlendContrast;
+    // sign/saturate is a component-wise 0-or-1 mask. Unlike a vector ternary,
+    // it compiles in both the offline DXC terrain PS and runtime FXC resolve.
+    raised *= saturate(sign(weights));
+    const float peak = max(max(raised.x, raised.y), max(raised.z, raised.w));
+    // Layers within one contrast band of the tallest still blend; anything
+    // below it is fully occluded by the material standing over it.
+    float4 blended =
+        max(raised - (peak - kTerrainHeightBlendContrast), 0.0) * weights;
+    const float total = dot(blended, 1.0);
+    // A degenerate band (every layer cut) falls back to the linear weights
+    // rather than producing a black texel.
+    return total > 1e-5 ? blended / total : weights;
 }
 
 float3 TerrainProjectionWeights(float3 normal) {
@@ -177,8 +231,27 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     // Skipping a layer whose weight is below 8-bit resolution leaves the blend
     // visually identical.
     const float kLayerEpsilon = 0.002;
+
+    // Height-blend pre-pass. The packed map's .r channel is this layer's height
+    // proxy, and it must be known for EVERY contributing layer before any of
+    // them are weighted -- which layer wins at this texel is a comparison
+    // across all four. Only layers that already pass the epsilon test are
+    // fetched, so a pixel covered by a single layer pays one extra sample and
+    // takes the identity path through TerrainHeightBlend.
+    float4 layerHeights = 0.0;
+    [unroll] for (uint heightLayer = 0; heightLayer < 4; ++heightLayer) {
+        const TriplanarGrads heightGrads =
+            TerrainTriplanarGrads(worldPos, scales[heightLayer]);
+        if (layerWeights[heightLayer] <= kLayerEpsilon) continue;
+        layerHeights[heightLayer] = SampleTerrainArray(
+            metalRoughMap, worldPos, projectionWeights, heightLayer,
+            scales[heightLayer], heightGrads).r;
+    }
+    const float4 blendWeights =
+        TerrainHeightBlend(layerWeights, layerHeights);
+
     [unroll] for (uint layer = 0; layer < 4; ++layer) {
-        const float weight = layerWeights[layer];
+        const float weight = blendWeights[layer];
         // Gradients are taken before the weight test so every lane in the quad
         // evaluates them, keeping the derivative uniform even when neighbouring
         // pixels skip different layers.
@@ -211,11 +284,11 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     result.albedo *= lerp(coolMacro, warmMacro,
                           saturate(macroA * 0.58 + macroB * 0.42));
     result.albedo *= lerp(1.0.xxx, float3(0.88, 1.04, 0.78),
-                          layerWeights.x * 0.34);
+                          blendWeights.x * 0.34);
 
     // Damp sand around the waterline. Darker, smoother wet sand gives the coast
     // a readable transition before the ocean/foam pass.
-    const float wetSand = layerWeights.z *
+    const float wetSand = blendWeights.z *
         (1.0 - smoothstep(0.05, 0.45, worldPos.y));
     result.albedo *= lerp(1.0, 0.76, wetSand);
     // Invalid/unbound SRVs return zero. Keep terrain readable and make binding
@@ -228,12 +301,12 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     };
     float3 fallbackAlbedo = 0.0;
     [unroll] for (uint fallbackLayer = 0; fallbackLayer < 4; ++fallbackLayer)
-        fallbackAlbedo += fallbackColors[fallbackLayer] * layerWeights[fallbackLayer];
+        fallbackAlbedo += fallbackColors[fallbackLayer] * blendWeights[fallbackLayer];
     if (dot(result.albedo, float3(0.2126, 0.7152, 0.0722)) < 0.002)
         result.albedo = fallbackAlbedo;
     // Darken only turf-covered terrain so it sits beneath the grass blades.
     // Weighting preserves seamless transitions into dirt, sand, and rock.
-    result.albedo *= lerp(1.0, 0.88, layerWeights.x);
+    result.albedo *= lerp(1.0, 0.88, blendWeights.x);
     // Close-range detail: a high-frequency albedo modulation + normal
     // perturbation that fades out with distance. Breaks up the tiling repeat and
     // adds crispness underfoot without new textures. Fades to nothing by ~40 m
@@ -263,7 +336,7 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
         result.normal = normalize(result.normal);
     }
 
-    const float grassResponse = layerWeights.x;
+    const float grassResponse = blendWeights.x;
     const float normalDistanceFade =
         1.0 - smoothstep(24.0, 90.0, cameraDistance);
     const float nearNormalStrength = lerp(0.62, 0.92, grassResponse);
@@ -276,7 +349,7 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     // micro-variation above physically plausible layer floors, then allow only
     // the waterline sand to become moderately smoother.
     const float4 roughnessFloors = float4(0.84, 0.89, 0.76, 0.82);
-    float layerRoughness = dot(layerWeights, roughnessFloors);
+    float layerRoughness = dot(blendWeights, roughnessFloors);
     layerRoughness += (macroA - 0.5) * 0.055;
     const float dryRoughness =
         max(saturate(result.roughness), layerRoughness);
@@ -290,7 +363,7 @@ TerrainPBR SampleTerrainPBR(float3 worldPos, float3 geometricNormal,
     // double-darkening it through both albedo and ambient occlusion.
     result.occlusion = lerp(
         result.occlusion, max(result.occlusion, 0.68),
-        layerWeights.z * 0.82);
+        blendWeights.z * 0.82);
     return result;
 }
 

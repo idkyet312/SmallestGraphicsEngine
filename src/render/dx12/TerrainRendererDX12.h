@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <vector>
 
 // Procedural heightfield terrain drawn entirely on the GPU through the
@@ -76,6 +77,25 @@ public:
     ComPtr<ID3D12Resource> terrainAlbedoArray;
     ComPtr<ID3D12Resource> terrainNormalArray;
     ComPtr<ID3D12Resource> terrainRoughnessArray;
+    // Per-level painted layer weights (RGBA = grass/dirt/sand/rock). Null until
+    // a level supplies one, which is the common case; the resolve then keeps
+    // using purely procedural weights.
+    ComPtr<ID3D12Resource> terrainSplatMap;
+    ComPtr<ID3D12Resource> terrainSplatUpload;
+    UINT terrainSplatResolution = 0;
+    // Staged paint waiting for a frame to record its copy. See
+    // StageTerrainSplatMap for why the upload cannot happen at call time.
+    std::vector<uint8_t> pendingSplatPixels_;
+    UINT pendingSplatResolution_ = 0;
+    bool splatUploadPending_ = false;
+    // Replaced splat textures awaiting the GPU to finish with them. Released
+    // once no in-flight frame can still reference them.
+    struct RetiredSplat {
+        ComPtr<ID3D12Resource> texture;
+        ComPtr<ID3D12Resource> upload;
+        UINT framesRemaining;
+    };
+    std::vector<RetiredSplat> retiredSplatMaps_;
     std::array<ComPtr<ID3D12Resource>, FRAME_COUNT> sculptBuffers;
     std::array<ComPtr<ID3D12Resource>, 3> terrainUploads;
     D3D12_GPU_DESCRIPTOR_HANDLE terrainTextureTable{};
@@ -209,6 +229,36 @@ public:
         }
 
         if (!CreateTerrainTextureArrays(shader) || !CreateSculptBuffers()) return false;
+
+        // SGE_SPLAT_TEST=1 uploads a rock/grass checkerboard covering the whole
+        // island. It exists to validate the world->UV mapping independently of
+        // the editor brush, so "wrong UVs" and "wrong brush" stay
+        // distinguishable. Off unless the variable is set.
+        if (GetEnvironmentVariableA("SGE_SPLAT_TEST", nullptr, 0) > 0) {
+            constexpr UINT kTestRes = 512;
+            // 32 squares across a ~176 m island is ~5.5 m per square: several
+            // are visible at once from eye height. 8 was one square per 22 m,
+            // which reads as a stray terrain edge rather than a grid.
+            constexpr UINT kSquares = 32;
+            std::vector<uint8_t> pattern(
+                static_cast<size_t>(kTestRes) * kTestRes * 4, 0);
+            for (UINT y = 0; y < kTestRes; ++y) {
+                for (UINT x = 0; x < kTestRes; ++x) {
+                    const UINT cx = x * kSquares / kTestRes;
+                    const UINT cy = y * kSquares / kTestRes;
+                    uint8_t* texel =
+                        &pattern[(static_cast<size_t>(y) * kTestRes + x) * 4];
+                    // Rock vs sand, not rock vs grass: most of this island is
+                    // procedurally grass already, so grass squares would be
+                    // invisible and only half the checker would show.
+                    if (((cx + cy) & 1) != 0) texel[3] = 255;  // rock
+                    else                      texel[2] = 255;  // sand
+                }
+            }
+            if (!UploadTerrainSplatMap(pattern.data(), kTestRes))
+                std::cerr << "Terrain splat: test pattern upload failed\n";
+        }
+
         supported = true;
         return true;
     }
@@ -581,6 +631,159 @@ public:
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         g_dx12.commandList->ResourceBarrier(1, &barrier);
+        return true;
+    }
+
+    // Stages a level's painted layer weights for upload. The GPU copy itself is
+    // deferred to FlushPendingSplatUpload(), which runs during frame recording.
+    //
+    // Callers reach this from the editor sync, which is *not* inside the
+    // frame's command-list recording; issuing CopyTextureRegion there would
+    // record into a closed or foreign list, and WaitForGPU() mid-frame would
+    // stall on work that has not been submitted. Sculpting has the same
+    // constraint and solves it the same way -- SetSculptStamps only touches CPU
+    // state and the GPU work happens later in the frame.
+    void StageTerrainSplatMap(const uint8_t* rgba, UINT resolution) {
+        if (!rgba || resolution == 0) {
+            pendingSplatPixels_.clear();
+            pendingSplatResolution_ = 0;
+        } else {
+            pendingSplatPixels_.assign(
+                rgba, rgba + static_cast<size_t>(resolution) * resolution * 4u);
+            pendingSplatResolution_ = resolution;
+        }
+        splatUploadPending_ = true;
+    }
+
+    // Performs any staged splat upload. Safe to call once per frame while the
+    // command list is open; a no-op when nothing is pending.
+    void FlushPendingSplatUpload() {
+        // Age out replaced textures first: this runs once per frame regardless
+        // of whether new paint arrived, so retirement makes progress even when
+        // the user stops painting.
+        for (size_t i = retiredSplatMaps_.size(); i-- > 0;) {
+            if (--retiredSplatMaps_[i].framesRemaining == 0)
+                retiredSplatMaps_.erase(retiredSplatMaps_.begin() + i);
+        }
+        if (!splatUploadPending_) return;
+        splatUploadPending_ = false;
+        UploadTerrainSplatMap(
+            pendingSplatResolution_ ? pendingSplatPixels_.data() : nullptr,
+            pendingSplatResolution_);
+        // The staged copy has served its purpose; the pixels also live in the
+        // LevelDefinition, so holding a second megabyte here is waste.
+        pendingSplatPixels_.clear();
+        pendingSplatPixels_.shrink_to_fit();
+    }
+
+    // Uploads a level's painted layer weights. Single mip and single slice:
+    // the resolve reads it with SampleLevel(..., 0) at roughly one texel per
+    // 0.35 m, so mips would only blur brush edges that are already feathered.
+    //
+    // Called once per stroke end rather than per stamp. It flushes, because the
+    // previous texture may still be referenced by in-flight frames; recreating
+    // rather than updating in place keeps that simple, and strokes are rare.
+    bool UploadTerrainSplatMap(const uint8_t* rgba, UINT resolution) {
+        // The previous texture may still be referenced by frames in flight, so
+        // it is parked in a retirement list rather than released here. This runs
+        // during command-list recording, where WaitForGPU() would signal the
+        // queue and corrupt the frame's fence bookkeeping; the list is drained
+        // FRAME_COUNT frames later, by which point no frame can still read it.
+        if (terrainSplatMap) {
+            retiredSplatMaps_.push_back(
+                { terrainSplatMap, terrainSplatUpload, FRAME_COUNT + 1u });
+        }
+        terrainSplatMap.Reset();
+        terrainSplatUpload.Reset();
+
+        if (!rgba || resolution == 0) {
+            // Dropping the map returns the level to purely procedural weights.
+            terrainSplatResolution = 0;
+            return true;
+        }
+
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = resolution;
+        desc.Height = resolution;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        // UNORM, never sRGB: these are blend weights, not colour.
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+
+        D3D12_HEAP_PROPERTIES defaultHeap = {};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&terrainSplatMap))))
+            return false;
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
+        UINT rows = 0;
+        UINT64 rowBytes = 0, uploadBytes = 0;
+        g_dx12.device->GetCopyableFootprints(&desc, 0, 1, 0, &layout, &rows,
+                                             &rowBytes, &uploadBytes);
+
+        D3D12_RESOURCE_DESC uploadDesc = {};
+        uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDesc.Width = uploadBytes;
+        uploadDesc.Height = 1;
+        uploadDesc.DepthOrArraySize = 1;
+        uploadDesc.MipLevels = 1;
+        uploadDesc.SampleDesc.Count = 1;
+        uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES uploadHeap = {};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&terrainSplatUpload)))) {
+            terrainSplatMap.Reset();
+            return false;
+        }
+
+        uint8_t* mapped = nullptr;
+        if (FAILED(terrainSplatUpload->Map(
+                0, nullptr, reinterpret_cast<void**>(&mapped)))) {
+            terrainSplatMap.Reset();
+            terrainSplatUpload.Reset();
+            return false;
+        }
+        // Row pitch is 256-aligned by D3D12, so this copies row by row rather
+        // than as one block.
+        const size_t sourceRowPitch = static_cast<size_t>(resolution) * 4;
+        for (UINT row = 0; row < rows; ++row)
+            std::memcpy(mapped + static_cast<size_t>(row) *
+                            layout.Footprint.RowPitch,
+                        rgba + static_cast<size_t>(row) * sourceRowPitch,
+                        sourceRowPitch);
+        terrainSplatUpload->Unmap(0, nullptr);
+
+        D3D12_TEXTURE_COPY_LOCATION destination = {};
+        destination.pResource = terrainSplatMap.Get();
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION source = {};
+        source.pResource = terrainSplatUpload.Get();
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = layout;
+        g_dx12.commandList->CopyTextureRegion(&destination, 0, 0, 0, &source,
+                                              nullptr);
+
+        // The resolve is a compute shader, so this lands in NON_PIXEL unlike
+        // the forward-sampled layer arrays above.
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = terrainSplatMap.Get();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_dx12.commandList->ResourceBarrier(1, &barrier);
+
+        terrainSplatResolution = resolution;
         return true;
     }
 

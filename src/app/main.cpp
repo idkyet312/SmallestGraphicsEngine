@@ -6749,10 +6749,16 @@ static void ScatterDandelions(
         rng = rng * 1664525u + 1013904223u;
         return static_cast<float>(rng >> 8) * (1.0f / 16777216.0f);
     };
+    // Mirrors GrassField::Excluded, including the optional circular test, so
+    // painted clearings remove dandelions and grass over the same shape.
     const auto excluded = [&](float x, float z) {
-        for (const auto& e : exclusions)
-            if (x >= e.minX && x <= e.maxX && z >= e.minZ && z <= e.maxZ)
-                return true;
+        for (const auto& e : exclusions) {
+            if (x < e.minX || x > e.maxX || z < e.minZ || z > e.maxZ) continue;
+            if (e.radius <= 0.0f) return true;
+            const float dx = x - e.centerX;
+            const float dz = z - e.centerZ;
+            if (dx * dx + dz * dz <= e.radius * e.radius) return true;
+        }
         return false;
     };
     const int clusterCount = g_stressTestMode ? 420 : 180;
@@ -9083,6 +9089,15 @@ static void RebuildScalableEnvironment() {
     };
     std::vector<GrassField::Exclusion> grassExclusions;
     std::vector<GrassField::AuthoredPatch> grassPatches;
+    // Painted clearings apply to built-in levels too, so they are gathered
+    // outside the custom-level branch below.
+    for (const FoliageClearStamp& stamp : g_game.world.Level().foliageClear) {
+        if (stamp.radius <= 0.0f) continue;
+        grassExclusions.push_back({
+            stamp.x - stamp.radius, stamp.z - stamp.radius,
+            stamp.x + stamp.radius, stamp.z + stamp.radius,
+            stamp.x, stamp.z, stamp.radius });
+    }
     if (g_customLevelMode) {
         obstacles.clear();
         obstacles.push_back({-29.0f, -27.0f, -15.0f, -13.0f});
@@ -9194,6 +9209,27 @@ static void RebuildScalableEnvironment() {
             -extent, extent, obstacles))
         std::cerr << "Recast navigation build failed; Bandits use direct steering\n";
 
+    // Painted ground steers the scatter: paint rock or sand and grass stops
+    // growing there. Must use the same world->UV frame as the resolve and the
+    // paint brush (kShoreOuter scaled per axis) or paint lands in one place and
+    // grass thins out in another. An unpainted level supplies nothing here and
+    // keeps the purely procedural scatter.
+    {
+        const LevelDefinition& grassLevel = g_game.world.Level();
+        constexpr float kShoreOuter = 88.0f;
+        const size_t expectedSplatBytes =
+            static_cast<size_t>(grassLevel.terrainSplatResolution) *
+            grassLevel.terrainSplatResolution * 4u;
+        if (grassLevel.terrainSplatResolution > 0 &&
+            grassLevel.terrainSplatRGBA.size() == expectedSplatBytes) {
+            g_grass.SetSplatMap(grassLevel.terrainSplatRGBA.data(),
+                                grassLevel.terrainSplatResolution,
+                                kShoreOuter * grassLevel.terrainIslandScaleX,
+                                kShoreOuter * grassLevel.terrainIslandScaleZ);
+        } else {
+            g_grass.SetSplatMap(nullptr, 0, 0.0f, 0.0f);
+        }
+    }
     g_grass.Initialize(terrainSampler,
         g_stressTestMode ? 200.0f : 100.0f,
         g_stressTestMode ? 1600000 : 400000, 0.0f, grassExclusions, grassPatches);
@@ -9418,6 +9454,7 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
 }
 
 static void SynchronizeEditorRuntime(bool play);
+static void ApplyTerrainSplatMap(const LevelDefinition& level);
 static void StartLevelEditor(HWND hwnd);
 static void StopEditorPlaytest();
 
@@ -9478,6 +9515,9 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
                               : RuntimeTerrainSource::Empty);
     }
     g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
+    // Built-in levels carry no sidecar, so this clears any map left over from a
+    // painted custom level rather than letting it bleed across a level change.
+    ApplyTerrainSplatMap(customLevel ? *customLevel : LevelDefinition{});
     g_grass.ClearRuntimeExclusions();
     g_game.ResetLevelState();
     g_enemySystem.ResetLevelCounters();
@@ -12373,6 +12413,40 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
 // prefab render batches - no registry refresh, no model reload, no GPU rebuild,
 // no WaitForGPU. Deliberately does NOT clear runtimeDirty_, so the full
 // SynchronizeEditorRuntime runs once when the interaction settles.
+// Pushes a level's painted terrain weights to the GPU, skipping the upload when
+// nothing changed. UploadTerrainSplatMap recreates the texture and drains the
+// GPU, so calling it on every editor sync would stall a frame per sync; the
+// revision counter makes a repeat call free.
+//
+// Resolution is part of the identity check because clearing a level's painting
+// leaves the revision alone but drops the resolution to zero.
+static void ApplyTerrainSplatMap(const LevelDefinition& level) {
+    // SGE_SPLAT_TEST owns the splatmap for the whole session; letting a level
+    // load overwrite its checkerboard would defeat the diagnostic.
+    static const bool splatTestActive =
+        GetEnvironmentVariableA("SGE_SPLAT_TEST", nullptr, 0) > 0;
+    if (splatTestActive) return;
+    static uint32_t appliedRevision = 0;
+    static uint32_t appliedResolution = 0;
+    static bool appliedOnce = false;
+    const size_t expected = static_cast<size_t>(level.terrainSplatResolution) *
+                            level.terrainSplatResolution * 4u;
+    const bool usable = level.terrainSplatResolution > 0 &&
+                        level.terrainSplatRGBA.size() == expected;
+    const uint32_t revision = usable ? level.terrainSplatRevision : 0u;
+    const uint32_t resolution = usable ? level.terrainSplatResolution : 0u;
+    if (appliedOnce && revision == appliedRevision &&
+        resolution == appliedResolution)
+        return;
+    appliedOnce = true;
+    appliedRevision = revision;
+    appliedResolution = resolution;
+    // Staged, not uploaded: this runs outside the frame's command-list
+    // recording, so the GPU copy is deferred to FlushPendingSplatUpload().
+    g_terrain.StageTerrainSplatMap(
+        usable ? level.terrainSplatRGBA.data() : nullptr, resolution);
+}
+
 static void SynchronizeEditorRuntimeLight() {
     if (g_game.session.Screen() != GameScreen::LevelEditor) return;
     const LevelDefinition& edited = g_levelEditor.Level();
@@ -12409,6 +12483,7 @@ static void SynchronizeEditorRuntime(bool play) {
     const bool terrainChanged = g_levelEditor.TerrainRuntimeDirty();
     g_game.world.ReplaceFromEditor(g_levelEditor.Level());
     g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
+    ApplyTerrainSplatMap(g_levelEditor.Level());
     g_grass.ClearRuntimeExclusions();
     g_customLevelMode = true;
     g_assetRegistry.Refresh();
@@ -14616,9 +14691,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         std::ofstream("visibility_smoke.log", std::ios::trunc)
             << "starting\n";
         char visibilityDebugMode[8] = {};
+        int requestedVisibilityDebugMode = -1;
         if (GetEnvironmentVariableA("SGE_VISIBILITY_DEBUG", visibilityDebugMode,
                 static_cast<DWORD>(sizeof(visibilityDebugMode))) > 0) {
-            visBuffer.debugViewMode = (std::max)(0, (std::min)(3,
+            requestedVisibilityDebugMode = (std::max)(0, (std::min)(7,
                 atoi(visibilityDebugMode)));
         }
         scene.useVisibilityBuffer = false;
@@ -14661,6 +14737,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             GetEnvironmentVariableA("SGE_VISIBILITY_TEST_GODMODE", nullptr, 0) > 0;
         StartLevelOne(hwnd, true, stressVisibilityTest, emptyVisibilityTest,
                       nullptr, godModeUI);
+        // Level startup may restore renderer defaults. Apply the requested
+        // diagnostic afterwards so unattended tests exercise the intended view.
+        if (requestedVisibilityDebugMode >= 0)
+            visBuffer.debugViewMode = requestedVisibilityDebugMode;
         if (GetEnvironmentVariableA("SGE_PREFAB_SMOKE_TEST", nullptr, 0) > 0) {
             g_prefabRuntimeSmokeEnabled = true;
             LevelEntity rock;

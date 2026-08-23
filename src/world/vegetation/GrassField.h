@@ -63,6 +63,13 @@ public:
         float minZ = 0.0f;
         float maxX = 0.0f;
         float maxZ = 0.0f;
+        // Optional circular test. Zero keeps the plain rectangle used by
+        // building footprints; a positive radius makes the rect a bounding box
+        // and the circle the real shape, so a painted brush clears a disc
+        // instead of the square around it.
+        float centerX = 0.0f;
+        float centerZ = 0.0f;
+        float radius = 0.0f;
     };
 
     struct AuthoredPatch {
@@ -92,6 +99,32 @@ public:
         XMFLOAT2 pad{};
     };
     static_assert(sizeof(BladeInstance) == 48, "must match the HLSL BladeInstance");
+
+    // The level's painted terrain splatmap, so scatter follows what the artist
+    // painted instead of only sine waves and slope.
+    //
+    // The map is the same RGBA the terrain resolve samples: channels are
+    // (grass, dirt, sand, rock) and an untouched texel is (0,0,0,0). That zero
+    // is what keeps unpainted levels bit-identical -- coverage is 0 there, so
+    // SplatDensity returns 1 and the procedural scatter passes through
+    // unchanged. Where the artist HAS painted, the grass channel's share of the
+    // painted total becomes the density multiplier: paint rock and grass stops.
+    //
+    // Set before Initialize; the scatter is baked once, so repainting requires
+    // an environment rebuild, exactly as moving a building exclusion does.
+    void SetSplatMap(const uint8_t* rgba, uint32_t resolution,
+                     float halfExtentX, float halfExtentZ) {
+        m_splat.clear();
+        m_splatResolution = 0;
+        if (!rgba || resolution == 0 ||
+            halfExtentX <= 0.0f || halfExtentZ <= 0.0f)
+            return;
+        m_splat.assign(rgba, rgba + static_cast<size_t>(resolution) *
+                                        resolution * 4u);
+        m_splatResolution = resolution;
+        m_splatHalfExtentX = halfExtentX;
+        m_splatHalfExtentZ = halfExtentZ;
+    }
 
     // Scatter blades across a square of terrain centred on the origin.
     // `sampler` returns terrain height at (x, z); `waterY` is the sea level that
@@ -341,6 +374,54 @@ private:
     // Can a tuft grow here? Rejects the sea, the wet sand at the waterline, and
     // any face too steep to hold grass (slope from a central difference on the
     // same sampler the terrain is drawn from, so the test matches what you see).
+    // Density multiplier from the painted splatmap at (x, z), in [0, 1].
+    //
+    // Uses the same world->UV frame as the terrain resolve and the paint brush:
+    // u = x / (2 * halfExtent) + 0.5. Bilinear, because the brush lays down a
+    // feathered edge and point sampling would turn that gradient into a
+    // 512-texel staircase along every painted boundary.
+    float SplatDensity(float x, float z) const {
+        if (m_splatResolution == 0) return 1.0f;
+        const float u = (x / (2.0f * m_splatHalfExtentX) + 0.5f) *
+                        m_splatResolution - 0.5f;
+        const float v = (z / (2.0f * m_splatHalfExtentZ) + 0.5f) *
+                        m_splatResolution - 0.5f;
+        const int last = static_cast<int>(m_splatResolution) - 1;
+        const int x0 = std::clamp(static_cast<int>(std::floor(u)), 0, last);
+        const int z0 = std::clamp(static_cast<int>(std::floor(v)), 0, last);
+        const int x1 = std::clamp(x0 + 1, 0, last);
+        const int z1 = std::clamp(z0 + 1, 0, last);
+        const float fx = std::clamp(u - std::floor(u), 0.0f, 1.0f);
+        const float fz = std::clamp(v - std::floor(v), 0.0f, 1.0f);
+
+        // Bilinear over the density each corner implies, rather than over raw
+        // channels: the ratio below is non-linear, so filtering the inputs and
+        // filtering the results are not the same thing, and interpolating the
+        // final density is what keeps a feathered edge reading as a ramp.
+        const auto texelDensity = [&](int tx, int tz) {
+            const uint8_t* texel = &m_splat[
+                (static_cast<size_t>(tz) * m_splatResolution + tx) * 4u];
+            const float grass = texel[0] * (1.0f / 255.0f);
+            const float dirt  = texel[1] * (1.0f / 255.0f);
+            const float sand  = texel[2] * (1.0f / 255.0f);
+            const float rock  = texel[3] * (1.0f / 255.0f);
+            const float total = grass + dirt + sand + rock;
+            // Unpainted texel: no opinion, keep the procedural scatter.
+            if (total <= kSplatCoverageEpsilon) return 1.0f;
+            const float coverage = std::min(1.0f,
+                std::max(std::max(grass, dirt), std::max(sand, rock)));
+            // Blend from "procedural" to "what was painted" by how strongly the
+            // texel was painted, matching how the resolve lerps its weights.
+            return 1.0f + (grass / total - 1.0f) * coverage;
+        };
+        const float d00 = texelDensity(x0, z0), d10 = texelDensity(x1, z0);
+        const float d01 = texelDensity(x0, z1), d11 = texelDensity(x1, z1);
+        return std::clamp(
+            (d00 + (d10 - d00) * fx) +
+            ((d01 + (d11 - d01) * fx) - (d00 + (d10 - d00) * fx)) * fz,
+            0.0f, 1.0f);
+    }
+
     bool Plantable(float x, float z) const {
         if (Excluded(x, z)) return false;
         const float y = m_terrain(x, z);
@@ -353,10 +434,19 @@ private:
     }
 
     bool Excluded(float x, float z) const {
-        for (const Exclusion& exclusion : m_exclusions)
-            if (x >= exclusion.minX && x <= exclusion.maxX &&
-                z >= exclusion.minZ && z <= exclusion.maxZ)
+        for (const Exclusion& exclusion : m_exclusions) {
+            // The rect is tested first either way: for a circular exclusion it
+            // is the bounding box, so this rejects most blades before the
+            // distance test runs.
+            if (x < exclusion.minX || x > exclusion.maxX ||
+                z < exclusion.minZ || z > exclusion.maxZ)
+                continue;
+            if (exclusion.radius <= 0.0f) return true;
+            const float dx = x - exclusion.centerX;
+            const float dz = z - exclusion.centerZ;
+            if (dx * dx + dz * dz <= exclusion.radius * exclusion.radius)
                 return true;
+        }
         return false;
     }
 
@@ -398,7 +488,12 @@ private:
             const float macroDensity = 0.76f + 0.24f *
                 (densityShape * densityShape *
                  (3.0f - 2.0f * densityShape));
-            if (Rand(seed) > radialDensity * macroDensity) continue;
+            // The painted map multiplies the procedural density rather than
+            // replacing it, so painting rock thins grass out to nothing while
+            // painted grass still respects slope, waterline and exclusions.
+            const float paintedDensity = SplatDensity(cx, cz);
+            if (Rand(seed) > radialDensity * macroDensity * paintedDensity)
+                continue;
 
             // Test the CLUMP's centre once, not every blade: if the middle of the
             // tuft is in the sea or on a cliff, the whole tuft is rejected.
@@ -411,6 +506,11 @@ private:
                 const float x = cx + std::cos(a) * r;
                 const float z = cz + std::sin(a) * r;
                 if (Excluded(x, z)) continue;
+                // A tuft is ~0.35 m across, wide enough to straddle a painted
+                // boundary. Re-testing per blade keeps the edge of a painted
+                // rock patch crisp instead of leaving whole tufts hanging over
+                // it because their centre happened to land on grass.
+                if (Rand(seed) > SplatDensity(x, z)) continue;
                 const float y = m_terrain(x, z);
                 if (y < m_waterY + kShoreMargin) continue;
 
@@ -631,6 +731,9 @@ private:
     static constexpr float kShoreMargin = 2.35f;
     // Steepest ground grass will grow on (rise over run).
     static constexpr float kMaxSlope = 1.10f;
+    // Below this painted total a splat texel counts as untouched, so the
+    // procedural scatter passes through. One 8-bit step is 1/255 ~= 0.0039.
+    static constexpr float kSplatCoverageEpsilon = 0.002f;
     // Blades are clumped into tufts rather than scattered evenly -- see BuildBlades.
     static constexpr int   kBladesPerTuft = 8;
     static constexpr float kTuftRadius    = 0.18f;   // metres
@@ -675,6 +778,13 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_instances;
 
     XMFLOAT3 m_eye{};          // camera position, for the shader's distance fade
+
+    // Painted terrain splatmap (RGBA = grass/dirt/sand/rock), empty when the
+    // level has none. Read only during the scatter, never per frame.
+    std::vector<uint8_t> m_splat;
+    uint32_t m_splatResolution = 0;
+    float m_splatHalfExtentX = 1.0f;
+    float m_splatHalfExtentZ = 1.0f;
 
     float m_time = 0.0f;
     float m_waterY = 0.0f;

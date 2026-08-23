@@ -38,12 +38,17 @@ cbuffer FrameConstants : register(b0) {
     float  terrainMaterialType;
     float  terrainNormalYSign;
     uint   terrainVisibilityEnabled;
-    uint   terrainPadding;
+    // Was terrainPadding. Non-zero only when this level supplied a splatmap.
+    uint   terrainSplatEnabled;
     // Terrain rasterizes with the projection the forward extensions pass uses
     // (unjittered unless extension motion vectors are on) because they share
     // the depth buffer, so its world position must be rebuilt with the matching
     // inverse rather than the jittered invViewProj the draw-call path uses.
     matrix terrainInvViewProj;
+    // 1 / full island extent per axis. Maps world XZ to splat UV; appended
+    // after the matrix so the matrix keeps its 16-byte alignment.
+    float2 terrainSplatInvExtent;
+    float2 terrainSplatPad;
 #endif
 };
 
@@ -218,6 +223,13 @@ Texture2D<float4> bentNormalGTAOHistory : register(t86);
 Texture2DArray<float4> terrainAlbedoArray     : register(t87);
 Texture2DArray<float4> terrainNormalArray     : register(t88);
 Texture2DArray<float4> terrainMetalRoughArray : register(t89);
+
+// Per-level painted layer weights, RGBA = grass/dirt/sand/rock. t91, not t90:
+// t90 is the classified tile list, bound as a root SRV on every tier.
+// Unpainted texels are (0,0,0,0), which reads as "use the procedural result".
+Texture2D<float4> terrainSplatMap : register(t91);
+// s2 clamps. s0 wraps, which would repeat paint across the island edge.
+SamplerState terrainSplatSampler : register(s2);
 
 // Reserved visibility ID. The visibility buffer stores drawCallID + 1 in .x, so
 // real geometry occupies 1..0xFFFFFFFE. Terrain claims the top of the range
@@ -1719,7 +1731,47 @@ float4 TerrainVBLayerWeights(float3 worldPos, float3 geometricNormal) {
     float4 weights = float4(grass, dirt, sand, rock);
     weights += 0.0001;
     weights = pow(weights, 1.35);
-    return weights / dot(weights, 1.0);
+    weights = weights / dot(weights, 1.0);
+
+    // Painted weights override the procedural result, applied after the
+    // contrast curve above -- re-contrasting a painted weight would fight the
+    // brush and harden its feathered edges.
+    //
+    // Coverage is derived from the painted channels rather than stored in a
+    // fifth one: an untouched texel is (0,0,0,0), so coverage is 0 and the
+    // procedural result passes through bit-identically. That is what keeps
+    // every existing level unchanged without a per-level migration.
+    if (terrainSplatEnabled != 0) {
+        float2 splatUV = worldPos.xz * terrainSplatInvExtent + 0.5;
+        float4 painted =
+            terrainSplatMap.SampleLevel(terrainSplatSampler, splatUV, 0);
+        float coverage = max(max(painted.x, painted.y),
+                             max(painted.z, painted.w));
+        if (coverage > 0.001) {
+            float4 paintedNorm = painted / max(dot(painted, 1.0), 1e-4);
+            weights = lerp(weights, paintedNorm, saturate(coverage));
+        }
+    }
+    return weights;
+}
+
+// Height-based blending. Mirrors TerrainHeightBlend in terrain_pbr.hlsli --
+// keep the two in sync. Linear weights cross-fade two layers by averaging their
+// colours, which reads as a soft muddy band wherever rock meets grass. Instead
+// the louder material wins per-texel, so rock standing proud in its own height
+// map pokes through the grass and grass fills the crevices between the stones.
+static const float kTerrainVBHeightBlendContrast = 0.28;
+
+float4 TerrainVBHeightBlend(float4 weights, float4 heights) {
+    float4 raised = weights + heights * kTerrainVBHeightBlendContrast;
+    // Keep the active-layer mask compatible with both FXC and DXC. A vector
+    // ternary is rejected by the offline terrain shader's current DXC mode.
+    raised *= saturate(sign(weights));
+    const float peak = max(max(raised.x, raised.y), max(raised.z, raised.w));
+    float4 blended =
+        max(raised - (peak - kTerrainVBHeightBlendContrast), 0.0) * weights;
+    const float total = dot(blended, 1.0);
+    return total > 1e-5 ? blended / total : weights;
 }
 
 float3 TerrainVBProjectionWeights(float3 normal) {
@@ -1812,8 +1864,25 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
     // No quad-derivative constraint here, so the weight test can gate the
     // gradient computation as well -- unlike the forward path, which must
     // evaluate gradients unconditionally to keep ddx/ddy uniform across a quad.
+    // Height-blend pre-pass. The packed map's .r channel is this layer's height
+    // proxy, and it must be known for every contributing layer before any of
+    // them are weighted -- which layer wins at this texel is a comparison
+    // across all four. A pixel covered by a single layer pays one extra fetch
+    // and takes the identity path through TerrainVBHeightBlend.
+    float4 layerHeights = 0.0;
+    [unroll] for (uint heightLayer = 0; heightLayer < 4; ++heightLayer) {
+        if (layerWeights[heightLayer] <= kLayerEpsilon) continue;
+        const TerrainVBGrads heightGrads =
+            TerrainVBTriplanarGrads(worldDx, worldDy, scales[heightLayer]);
+        layerHeights[heightLayer] = SampleTerrainVBArray(
+            terrainMetalRoughArray, worldPos, projectionWeights, heightLayer,
+            scales[heightLayer], heightGrads).r;
+    }
+    const float4 blendWeights =
+        TerrainVBHeightBlend(layerWeights, layerHeights);
+
     [unroll] for (uint layer = 0; layer < 4; ++layer) {
-        const float weight = layerWeights[layer];
+        const float weight = blendWeights[layer];
         if (weight <= kLayerEpsilon) continue;
         const TerrainVBGrads grads =
             TerrainVBTriplanarGrads(worldDx, worldDy, scales[layer]);
@@ -1839,9 +1908,9 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
     result.albedo *= lerp(coolMacro, warmMacro,
                           saturate(macroA * 0.58 + macroB * 0.42));
     result.albedo *= lerp(1.0.xxx, float3(0.88, 1.04, 0.78),
-                          layerWeights.x * 0.34);
+                          blendWeights.x * 0.34);
 
-    const float wetSand = layerWeights.z *
+    const float wetSand = blendWeights.z *
         (1.0 - smoothstep(0.05, 0.45, worldPos.y));
     result.albedo *= lerp(1.0, 0.76, wetSand);
     const float3 fallbackColors[4] = {
@@ -1853,10 +1922,10 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
     float3 fallbackAlbedo = 0.0;
     [unroll] for (uint fallbackLayer = 0; fallbackLayer < 4; ++fallbackLayer)
         fallbackAlbedo +=
-            fallbackColors[fallbackLayer] * layerWeights[fallbackLayer];
+            fallbackColors[fallbackLayer] * blendWeights[fallbackLayer];
     if (dot(result.albedo, float3(0.2126, 0.7152, 0.0722)) < 0.002)
         result.albedo = fallbackAlbedo;
-    result.albedo *= lerp(1.0, 0.88, layerWeights.x);
+    result.albedo *= lerp(1.0, 0.88, blendWeights.x);
 
     const float detailFade = 1.0 - smoothstep(10.0, 40.0, cameraDistance);
     if (detailFade > 0.001) {
@@ -1871,7 +1940,7 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
         result.normal = normalize(result.normal);
     }
 
-    const float grassResponse = layerWeights.x;
+    const float grassResponse = blendWeights.x;
     const float normalDistanceFade =
         1.0 - smoothstep(24.0, 90.0, cameraDistance);
     const float nearNormalStrength = lerp(0.62, 0.92, grassResponse);
@@ -1879,7 +1948,7 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
         geometricNormal, normalize(result.normal),
         lerp(0.26, nearNormalStrength, normalDistanceFade)));
     const float4 roughnessFloors = float4(0.84, 0.89, 0.76, 0.82);
-    float layerRoughness = dot(layerWeights, roughnessFloors);
+    float layerRoughness = dot(blendWeights, roughnessFloors);
     layerRoughness += (macroA - 0.5) * 0.055;
     const float dryRoughness =
         max(saturate(result.roughness), layerRoughness);
@@ -1890,7 +1959,7 @@ TerrainVBPBR SampleTerrainVBPBR(uint2 pixel, float3 worldPos,
     result.occlusion = saturate(result.occlusion);
     result.occlusion = lerp(
         result.occlusion, max(result.occlusion, 0.68),
-        layerWeights.z * 0.82);
+        blendWeights.z * 0.82);
     return result;
 }
 
@@ -2827,6 +2896,25 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID,
 
         TerrainVBPBR terrainPBR = SampleTerrainVBPBR(
             pixel, terrainWorldPos, terrainGeoNormal, terrainCameraDistance);
+
+        // debugViewMode 7: terrain layer weights as flat colour, bypassing all
+        // lighting and texturing. Material weights are hard to read through lit
+        // triplanar shading, so this shows the blend result directly:
+        //   green = grass, red = dirt, blue = sand, white = rock.
+        // Painted texels appear as flat blocks against the noisy procedural
+        // background, which is what makes a world->UV error obvious.
+        if (debugViewMode == 7u) {
+            const float4 w = TerrainVBLayerWeights(terrainWorldPos,
+                                                   terrainGeoNormal);
+            float3 debugSplat = w.x * float3(0.15, 0.85, 0.15) +   // grass
+                                w.y * float3(0.75, 0.35, 0.10) +   // dirt
+                                w.z * float3(0.20, 0.45, 1.00) +   // sand
+                                w.w * float3(1.00, 1.00, 1.00);    // rock
+            outputColor[pixel] = float4(debugSplat, 1.0);
+            outputNormalRoughness[pixel] = float4(0.0, 0.0, 0.0, 1.0);
+            if (enableMotionVectors != 0u) outputMotion[pixel] = 0.0;
+            return;
+        }
 
         Surface terrainSurface = (Surface)0;
         terrainSurface.fragPos = terrainWorldPos;

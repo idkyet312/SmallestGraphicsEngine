@@ -144,12 +144,18 @@ struct alignas(256) VBFrameConstants {
     float    terrainMaterialType;
     float    terrainNormalYSign;
     UINT     terrainVisibilityEnabled;
-    UINT     terrainPadding;
+    // Was terrainPadding. Non-zero only when the level supplied a splatmap, so
+    // a level without one costs a branch rather than a texture fetch.
+    UINT     terrainSplatEnabled;
     // Terrain rasterizes with the projection the forward extensions pass uses
     // (unjittered unless extensionMotionVectors is on), because they share the
     // depth buffer. Its world position must therefore be reconstructed with the
     // matching inverse, not the jittered invViewProj the draw-call path needs.
     XMMATRIX terrainInvViewProj;
+    // 1 / full island extent per axis, mapping world XZ to splat UV. Appended
+    // after the matrix so its 16-byte alignment is preserved.
+    XMFLOAT2 terrainSplatInvExtent;
+    XMFLOAT2 terrainSplatPad;
 };
 
 struct alignas(256) VBPostConstants {
@@ -183,6 +189,12 @@ struct alignas(256) VBExposureConstants {
 
 class VisibilityBufferDX12 {
 public:
+    // Descriptor-table sizes include the final t91 terrain splatmap slot.
+    // Keep allocation and copy counts tied to these values: omitting the last
+    // descriptor makes bindless sample an uninitialized heap entry.
+    static constexpr UINT kResolveDescriptorCount = 91;
+    static constexpr UINT kEnhancedResolveDescriptorCount = 104;
+
     // Full-width instance and primitive IDs (R32G32_UINT).
     ComPtr<ID3D12Resource> visBufferRT;
     bool surfaceHistoryValid = false;
@@ -226,6 +238,15 @@ public:
     ID3D12Resource* terrainAlbedoArray = nullptr;
     ID3D12Resource* terrainNormalArray = nullptr;
     ID3D12Resource* terrainMetalRoughArray = nullptr;
+    // Per-level painted layer weights, also owned by TerrainRendererDX12. Null
+    // on every level that has no sidecar, which is the common case; the t91
+    // slot then holds a null SRV and the shader takes the procedural path.
+    ID3D12Resource* terrainSplatMap = nullptr;
+    // Half the island's full XZ extent per axis, from the terrain params. The
+    // shader needs the reciprocal; it is computed at upload rather than here so
+    // a zero scale cannot divide by zero mid-frame.
+    float terrainSplatExtentX = 0.0f;
+    float terrainSplatExtentZ = 0.0f;
     bool terrainDescriptorsWritten = false;
     // Projection terrain rasterized with this frame, and whether it was set.
     // Invalid on any frame terrain did not draw, in which case Resolve falls
@@ -620,7 +641,7 @@ public:
     float aperture = 0.0f;
     float currentNearPlane = 0.1f;
     float currentFarPlane = 1000.0f;
-    int debugViewMode = 0; // 0=lit, 1=instance/primitive IDs, 2=depth, 3=edge mask
+    int debugViewMode = 0; // 0=lit; 1..7 are the UI diagnostic views.
     bool validationMode = false;
     UINT bloomMipCount = 1;
     UINT bloomWidth = 1;
@@ -938,8 +959,11 @@ public:
         bindlessTransientOverflowLastFrame = false;
         if (!enabled || !bindlessHeap || !bindlessHeap->Initialized())
             return false;
+        // Reserve for the largest resolve tier; BuildBindlessResolveTable then
+        // copies either the standard or enhanced prefix into this range.
         bindlessResolveTableBases[slot] =
-            bindlessHeap->Allocator().AllocateTransient(103u);
+            bindlessHeap->Allocator().AllocateTransient(
+                kEnhancedResolveDescriptorCount);
         bindlessTransientOverflowLastFrame =
             bindlessResolveTableBases[slot] == BINDLESS_INVALID_INDEX;
         return !bindlessTransientOverflowLastFrame;
@@ -1011,14 +1035,25 @@ public:
     // written once and reused; the arrays are created at load and never
     // reallocated, so there is no per-frame descriptor work here.
     void SetTerrainTextures(ID3D12Resource* albedo, ID3D12Resource* normal,
-                            ID3D12Resource* metalRough) {
+                            ID3D12Resource* metalRough,
+                            ID3D12Resource* splat = nullptr) {
         if (terrainAlbedoArray == albedo && terrainNormalArray == normal &&
-            terrainMetalRoughArray == metalRough)
+            terrainMetalRoughArray == metalRough && terrainSplatMap == splat)
             return;
         terrainAlbedoArray = albedo;
         terrainNormalArray = normal;
         terrainMetalRoughArray = metalRough;
+        terrainSplatMap = splat;
         terrainDescriptorsWritten = false;
+    }
+
+    // Half the island's XZ extent, matching the terrain mesh. Kept separate
+    // from the texture setter because it changes with terrain params rather
+    // than with the painted texture, and it must not force a descriptor
+    // rewrite: descriptors describe the resource, not the world mapping.
+    void SetTerrainSplatExtent(float halfExtentX, float halfExtentZ) {
+        terrainSplatExtentX = halfExtentX;
+        terrainSplatExtentZ = halfExtentZ;
     }
 
     void SetTerrainMaterialParams(float materialType, float normalYSign) {
@@ -1842,7 +1877,15 @@ public:
         fc.terrainNormalYSign = terrainNormalYSign;
         fc.terrainVisibilityEnabled =
             terrainVisibilityActiveThisFrame ? 1u : 0u;
-        fc.terrainPadding = 0u;
+        // Painted weights only apply where a splatmap exists and the island has
+        // a real extent; a zero extent would map every texel to the same UV.
+        const bool splatUsable = terrainSplatMap != nullptr &&
+            terrainSplatExtentX > 1e-4f && terrainSplatExtentZ > 1e-4f;
+        fc.terrainSplatEnabled = splatUsable ? 1u : 0u;
+        fc.terrainSplatInvExtent = splatUsable
+            ? XMFLOAT2(0.5f / terrainSplatExtentX, 0.5f / terrainSplatExtentZ)
+            : XMFLOAT2(0.0f, 0.0f);
+        fc.terrainSplatPad = XMFLOAT2(0.0f, 0.0f);
         frameConstantBuffer.CopyData(g_dx12.frameIndex, fc);
 
         // A toggle can leave old history describing samples from a different
@@ -1904,7 +1947,9 @@ public:
         if (useBindless) {
             bindlessTableBase = BuildBindlessResolveTable(
                 useEnhanced ? enhancedDescHeap : standardDescHeap,
-                useEnhanced ? 103u : 90u, frameSlot);
+                useEnhanced ? kEnhancedResolveDescriptorCount
+                            : kResolveDescriptorCount,
+                frameSlot);
             if (bindlessTableBase == BINDLESS_INVALID_INDEX) {
                 bindlessTransientOverflowLastFrame = true;
             } else {
@@ -3181,6 +3226,26 @@ private:
             g_dx12.device->CreateShaderResourceView(arrays[i], &srv, handle);
             handle.ptr += g_dx12.cbvSrvUavDescriptorSize;
         }
+
+        // The splatmap slot sits three above the layer arrays on every tier
+        // (default 87->90, enhanced 100->103), so it is written from the same
+        // running handle. It must hold a valid descriptor even when no level
+        // has painted terrain: a bound table with an untouched slot is
+        // undefined behaviour, not a null read. A null SRV with a real
+        // Format/ViewDimension is the documented way to express "no texture",
+        // and it samples as zero -- which the shader reads as "unpainted".
+        WriteTerrainSplatDescriptor(handle);
+    }
+
+    // Writes the t91 splatmap descriptor at an already-offset handle. UNORM,
+    // not sRGB: these are blend weights, and an sRGB view would curve them.
+    void WriteTerrainSplatDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        g_dx12.device->CreateShaderResourceView(terrainSplatMap, &srv, handle);
     }
 
     void WriteBentNormalHistoryDescriptor(ID3D12DescriptorHeap* heap,
@@ -3707,7 +3772,9 @@ private:
 
     bool CreateComputeDescriptorHeap() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-        heapDesc.NumDescriptors = 90;
+        // [90] t91 terrain splatmap. Slot 90 is the first free index: t90 is a
+        // root SRV, not a table entry, so it consumes no heap slot.
+        heapDesc.NumDescriptors = kResolveDescriptorCount;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         HRESULT hr = g_dx12.device->CreateDescriptorHeap(
@@ -4084,7 +4151,7 @@ private:
         D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
         rootSigDesc.NumParameters = 3;
         rootSigDesc.pParameters = params;
-        rootSigDesc.NumStaticSamplers = 2;
+        rootSigDesc.NumStaticSamplers = 3;  // s0 wrap, s1 shadow cmp, s2 clamp (terrain splat)
         rootSigDesc.pStaticSamplers = samplers;
         rootSigDesc.Flags =
             D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
@@ -4287,7 +4354,7 @@ private:
         //   [97]     u7       current stable surfaces
         //   [98]     t85      raytracing hit geometry bindings
         //   [99]     t86      bent-normal GTAO history
-        D3D12_DESCRIPTOR_RANGE ranges[18] = {};
+        D3D12_DESCRIPTOR_RANGE ranges[19] = {};
         ranges[0] = baseRanges[0];                          // t0..t78
         ranges[1] = baseRanges[1];                          // u0..u2 @ 79
         ranges[2] = baseRanges[2];                          // b1..b4 @ 82
@@ -4383,6 +4450,13 @@ private:
         ranges[17].RegisterSpace = 0;
         ranges[17].OffsetInDescriptorsFromTableStart = 100;
 
+        //   [103] t91 terrain splatmap
+        ranges[18].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[18].NumDescriptors = 1;
+        ranges[18].BaseShaderRegister = 91;
+        ranges[18].RegisterSpace = 0;
+        ranges[18].OffsetInDescriptorsFromTableStart = 103;
+
         D3D12_ROOT_PARAMETER params[3] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[0].Descriptor.ShaderRegister = 0;
@@ -4403,7 +4477,7 @@ private:
         // SRV alongside the CBV and the descriptor table.
         rootSigDesc.NumParameters = 3;
         rootSigDesc.pParameters = params;
-        rootSigDesc.NumStaticSamplers = 2;
+        rootSigDesc.NumStaticSamplers = 3;  // s0 wrap, s1 shadow cmp, s2 clamp (terrain splat)
         rootSigDesc.pStaticSamplers = samplers;
         // The flag that makes ResourceDescriptorHeap[] legal in the shader.
         // Samplers stay static, so SAMPLER_HEAP_DIRECTLY_INDEXED is not needed.
@@ -5136,7 +5210,8 @@ private:
         if (!enhancedComputeDescHeaps[frameSlot]) {
             D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
             heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            heapDesc.NumDescriptors = 103;
+            // [103] t91 terrain splatmap, appended above the terrain arrays.
+            heapDesc.NumDescriptors = kEnhancedResolveDescriptorCount;
             heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             if (FAILED(g_dx12.device->CreateDescriptorHeap(
                     &heapDesc,
@@ -5744,7 +5819,7 @@ private:
         //   [8] b1 - light buffer CBV
         //   [9] b2 - point lights CBV
 
-        D3D12_DESCRIPTOR_RANGE ranges[5] = {};
+        D3D12_DESCRIPTOR_RANGE ranges[6] = {};
         // SRVs t0..t78: frame/geometry, materials, IBL, DDGI, sparse lookup.
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[0].NumDescriptors = 79;
@@ -5785,6 +5860,14 @@ private:
         ranges[4].RegisterSpace = 0;
         ranges[4].OffsetInDescriptorsFromTableStart = 87;
 
+        // [90] t91 terrain splatmap. Appended after t87..t89 so no existing
+        // table offset moves. t90 is a root SRV and occupies no heap slot.
+        ranges[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[5].NumDescriptors = 1;
+        ranges[5].BaseShaderRegister = 91;
+        ranges[5].RegisterSpace = 0;
+        ranges[5].OffsetInDescriptorsFromTableStart = 90;
+
         D3D12_ROOT_PARAMETER resolveParams[3] = {};
 
         // b0 - frame constants (root CBV)
@@ -5795,7 +5878,7 @@ private:
 
         // Descriptor table
         resolveParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        resolveParams[1].DescriptorTable.NumDescriptorRanges = 5;
+        resolveParams[1].DescriptorTable.NumDescriptorRanges = _countof(ranges);
         resolveParams[1].DescriptorTable.pDescriptorRanges = ranges;
         resolveParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
@@ -5814,7 +5897,7 @@ private:
         resolveParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         // Static samplers
-        D3D12_STATIC_SAMPLER_DESC staticSamplers[2] = {};
+        D3D12_STATIC_SAMPLER_DESC staticSamplers[3] = {};
 
         // Regular sampler s0
         staticSamplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -5839,10 +5922,24 @@ private:
         staticSamplers[1].RegisterSpace = 0;
         staticSamplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+        // Clamp sampler s2, for the terrain splatmap. s0 wraps, which would
+        // repeat painted weights across the map edge at the coastline; the
+        // splatmap covers the island exactly once and must clamp.
+        staticSamplers[2].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        staticSamplers[2].MipLODBias = 0.0f;
+        staticSamplers[2].MinLOD = 0.0f;
+        staticSamplers[2].MaxLOD = D3D12_FLOAT32_MAX;
+        staticSamplers[2].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[2].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[2].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSamplers[2].ShaderRegister = 2;
+        staticSamplers[2].RegisterSpace = 0;
+        staticSamplers[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
         D3D12_ROOT_SIGNATURE_DESC resolveRootSigDesc = {};
         resolveRootSigDesc.NumParameters = 3;
         resolveRootSigDesc.pParameters = resolveParams;
-        resolveRootSigDesc.NumStaticSamplers = 2;
+        resolveRootSigDesc.NumStaticSamplers = _countof(staticSamplers);
         resolveRootSigDesc.pStaticSamplers = staticSamplers;
 
         ComPtr<ID3DBlob> sigBlob;
@@ -6290,10 +6387,10 @@ private:
         // overwrites this null descriptor only while valid history is active.
         WriteBentNormalHistoryDescriptor(computeDescHeap.Get(), 86, nullptr);
 
-        // [87..89] t87..t89 - terrain triplanar layer arrays. The root
-        // signature declares this range unconditionally, so the slots must hold
-        // valid descriptors from the start; terrain overwrites them with the
-        // real arrays on its first frame.
+        // [87..89] t87..t89 - terrain triplanar layer arrays, plus [90] t91
+        // splatmap. The root signature declares these ranges unconditionally,
+        // so the slots must hold valid descriptors from the start; terrain
+        // overwrites them with the real arrays on its first frame.
         WriteTerrainDescriptors(computeDescHeap.Get(), 87);
     }
 

@@ -122,6 +122,16 @@ private:
     bool TerrainChanged(const LevelDefinition& before) const;
     void SculptTerrain(DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
         const std::function<float(float, float)>& terrainHeight);
+    // Terrain tool 5: paint layer weights into the level's splatmap. Shares the
+    // sculpt brush's stroke/undo/spacing machinery but writes texels instead of
+    // height stamps. islandHalfExtent is the same world->UV frame the resolve
+    // uses, so the editor and the shader cannot disagree about where paint lands.
+    void PaintTerrain(DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
+        const std::function<float(float, float)>& terrainHeight,
+        float islandHalfExtentX, float islandHalfExtentZ);
+    // Allocates the splatmap on first paint. Returns false if the level has no
+    // usable island extent to map against.
+    bool EnsureTerrainSplatMap();
     // Grow the terrain tile grid by one row/column on a side (0=+X,1=-X,2=+Z,
     // 3=-Z), shifting the grid origin so the new tiles land on that side.
     void ExtendTerrain(int direction);
@@ -168,6 +178,10 @@ private:
     float terrainBrushStrength_ = 0.45f;
     float terrainBrushSpacing_ = 1.0f;
     float terrainFlattenHeight_ = 0.0f;
+    // Which layer the paint brush writes: 0 grass, 1 dirt, 2 sand, 3 rock.
+    int terrainPaintLayer_ = 3;
+    // 0..1 weight deposited at the brush centre, feathering to 0 at the rim.
+    float terrainPaintStrength_ = 1.0f;
     bool terrainStrokeActive_ = false;
     bool terrainStrokeChanged_ = false;
     DirectX::XMFLOAT3 lastTerrainStamp_ = { 100000.0f, 0.0f, 100000.0f };

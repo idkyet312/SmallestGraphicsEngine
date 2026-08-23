@@ -57,6 +57,21 @@ struct TerrainSculptStamp {
     float strength = 1.0f;
 };
 
+// A circle where the automatically scattered ground cover is suppressed.
+//
+// Procedural grass and dandelions are not level entities -- they are generated
+// at environment build from a density function -- so the foliage Erase tool,
+// which deletes entities, cannot touch them. These stamps are the only way to
+// clear auto-scattered cover, and they persist with the level.
+struct FoliageClearStamp {
+    float x = 0.0f;
+    float z = 0.0f;
+    float radius = 3.0f;
+};
+
+// Bounds the exclusion test, which is linear per blade at scatter time.
+inline constexpr size_t kMaxFoliageClearStamps = 512;
+
 // Hard cap on live sculpt stamps. Bounds the GPU upload buffer
 // (kMaxTerrainSculptStamps * 32B) and, more importantly, the per-sample cost:
 // both TerrainRendererDX12::HeightAt and terrain_ms.hlsl's TerrainHeight loop
@@ -138,6 +153,23 @@ struct LevelDefinition {
     int32_t terrainOriginTileX = 0;
     int32_t terrainOriginTileZ = 0;
     std::vector<TerrainSculptStamp> terrainSculpt;
+    // Circles where auto-scattered grass and dandelions are suppressed. Empty
+    // on every existing level, which therefore scatters exactly as before.
+    std::vector<FoliageClearStamp> foliageClear;
+    // Hand-painted terrain layer weights, stored as an RGBA8 PNG sidecar beside
+    // the level JSON (<Name>_splat.png). Channels are grass/dirt/sand/rock; an
+    // all-zero texel means "use the procedural weights", so a level without a
+    // sidecar renders exactly as it did before this feature existed.
+    //
+    // 0 = no splatmap. The pixels live in memory as well as on disk because the
+    // editor's undo snapshots the whole LevelDefinition; at 512x512 that is 1 MB
+    // per undo entry.
+    uint32_t terrainSplatResolution = 0;
+    std::vector<uint8_t> terrainSplatRGBA;
+    // Bumped on every painted stroke. TerrainChanged() compares this instead of
+    // the pixel buffer so the per-frame equality check stays O(1) rather than a
+    // megabyte memcmp, and it survives undo snapshots like any other field.
+    uint32_t terrainSplatRevision = 0;
     LevelDXRDDGISettings dxrDDGI;
     std::vector<LevelEntity> entities;
 };
@@ -167,5 +199,11 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level);
 LevelLoadResult LoadLevel(const std::filesystem::path& path);
 LevelSaveResult SaveLevel(const LevelDefinition& level,
                           const std::filesystem::path& path);
+
+// Where a level's painted terrain weights live: the level path with its
+// extension replaced by "_splat.png". Exposed so the editor can report and
+// delete the sidecar without duplicating the naming rule.
+std::filesystem::path TerrainSplatSidecarPath(
+    const std::filesystem::path& levelPath);
 
 #endif

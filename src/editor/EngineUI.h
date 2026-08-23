@@ -1808,10 +1808,16 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 const char* debugViews[] = {
                     "Lit resolve", "Instance / primitive IDs", "Raw depth",
                     "Edge mask", "RT reflection rays", "SVGF denoiser",
-                    "SVGF a-trous output"
+                    "SVGF a-trous output", "Terrain layer weights"
                 };
                 ImGui::Combo("VB Debug View", &vb.debugViewMode,
                     debugViews, IM_ARRAYSIZE(debugViews));
+                if (vb.debugViewMode == 7) {
+                    ImGui::TextDisabled(
+                        "  green=grass  orange=dirt  blue=sand  white=rock");
+                    ImGui::TextDisabled(
+                        "  Terrain pixels only; needs the terrain resolve.");
+                }
                 if (vb.debugViewMode == 3 && vb.EnhancedVisualsReady())
                     ImGui::Text("  Edge fraction: %.1f%% of sampled pixels",
                                 vb.EnhancedRayFraction() * 100.0f);

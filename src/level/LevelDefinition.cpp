@@ -5,6 +5,11 @@
 #include <sstream>
 #include <unordered_set>
 #include <nlohmann/json.hpp>
+// Decoding the splat sidecar. stb_image_write's implementation lives in
+// GLBImporter.cpp; only the header is pulled in here so there is never a second
+// definition of it in the link.
+#include "../assets/importers/GLBImporter.h"
+#include <stb_image_write.h>
 #ifdef _WIN32
 #include <Windows.h>
 #endif
@@ -342,6 +347,19 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
                 level.terrainSculpt.push_back(stamp);
             }
         }
+        // Absent on every level saved before foliage clearing existed, which
+        // simply keeps their full procedural scatter.
+        if (terrain.contains("foliageClear")) {
+            if (!terrain.at("foliageClear").is_array())
+                throw std::runtime_error("terrain foliageClear must be an array");
+            for (const json& source : terrain.at("foliageClear")) {
+                FoliageClearStamp stamp;
+                stamp.x = source.at("x").get<float>();
+                stamp.z = source.at("z").get<float>();
+                stamp.radius = source.at("radius").get<float>();
+                level.foliageClear.push_back(stamp);
+            }
+        }
         const json& entities = root.at("entities");
         if (!entities.is_array()) throw std::runtime_error("entities must be an array");
         for (const json& source : entities) {
@@ -361,6 +379,27 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
                 throw std::runtime_error("entity transform must contain finite vec3 values");
             level.entities.push_back(std::move(entity));
         }
+        // Painted terrain weights, if this level has a sidecar. A missing file
+        // is the normal case and not an error. A malformed or non-square one is
+        // also non-fatal: the level still loads and simply falls back to purely
+        // procedural terrain, which is strictly better than refusing to open a
+        // map because its paint data is damaged.
+        {
+            const std::filesystem::path splatPath =
+                TerrainSplatSidecarPath(path);
+            std::error_code ignored;
+            if (std::filesystem::exists(splatPath, ignored)) {
+                std::vector<unsigned char> pixels;
+                int width = 0, height = 0;
+                if (GLBImporter::LoadPixelsRGBA(splatPath.string(), pixels,
+                                                width, height) &&
+                    width > 0 && width == height &&
+                    pixels.size() == static_cast<size_t>(width) * height * 4u) {
+                    level.terrainSplatResolution = static_cast<uint32_t>(width);
+                    level.terrainSplatRGBA = std::move(pixels);
+                }
+            }
+        }
         LevelValidationResult validation = ValidateLevel(level);
         if (!validation.ok) throw std::runtime_error(JoinErrors(validation.errors));
         result.level = std::move(level);
@@ -369,6 +408,14 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         result.error = path.string() + ": " + error.what();
     }
     return result;
+}
+
+std::filesystem::path TerrainSplatSidecarPath(
+    const std::filesystem::path& levelPath) {
+    std::filesystem::path sidecar = levelPath;
+    sidecar.replace_extension();
+    sidecar += "_splat.png";
+    return sidecar;
 }
 
 LevelSaveResult SaveLevel(const LevelDefinition& level,
@@ -404,6 +451,12 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
                 {"value", stamp.value}, {"strength", stamp.strength}
             });
         }
+        json foliageClear = json::array();
+        for (const FoliageClearStamp& stamp : level.foliageClear) {
+            foliageClear.push_back({
+                {"x", stamp.x}, {"z", stamp.z}, {"radius", stamp.radius}
+            });
+        }
         const json root = {
             {"schemaVersion", level.schemaVersion}, {"name", level.name},
             {"insertionMode", LevelInsertionModeName(level.insertionMode)},
@@ -414,7 +467,8 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
                          {"islandScaleZ", level.terrainIslandScaleZ},
                          {"originTileX", level.terrainOriginTileX},
                          {"originTileZ", level.terrainOriginTileZ},
-                         {"sculpt", std::move(sculpt)}}},
+                         {"sculpt", std::move(sculpt)},
+                         {"foliageClear", std::move(foliageClear)}}},
             {"lighting", {{"dxrDDGI", {
                 {"enabled", level.dxrDDGI.enabled},
                 {"surfaceSpacing", level.dxrDDGI.surfaceSpacing},
@@ -449,6 +503,30 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
 #else
         std::filesystem::rename(temporary, path);
 #endif
+
+        // Painted terrain weights, written only after the JSON has landed so a
+        // failed save never leaves an orphaned sidecar describing a level that
+        // was not written. A level with no painting deletes any stale sidecar
+        // instead of leaving one behind for the next load to pick up.
+        const std::filesystem::path splatPath = TerrainSplatSidecarPath(path);
+        const size_t expectedSplatBytes =
+            static_cast<size_t>(level.terrainSplatResolution) *
+            level.terrainSplatResolution * 4u;
+        if (level.terrainSplatResolution > 0 &&
+            level.terrainSplatRGBA.size() == expectedSplatBytes) {
+            const int written = stbi_write_png(
+                splatPath.string().c_str(),
+                static_cast<int>(level.terrainSplatResolution),
+                static_cast<int>(level.terrainSplatResolution), 4,
+                level.terrainSplatRGBA.data(),
+                static_cast<int>(level.terrainSplatResolution) * 4);
+            if (!written)
+                throw std::runtime_error("cannot write terrain splat sidecar");
+        } else {
+            std::error_code ignored;
+            std::filesystem::remove(splatPath, ignored);
+        }
+
         result.ok = true;
     } catch (const std::exception& error) {
         result.error = path.string() + ": " + error.what();
