@@ -13765,6 +13765,15 @@ static void ProcessInput(HWND) {
 
 // ?? window proc ??????????????????????????????????????????????????????????????
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // RMB over the editor viewport means "return control to the scene". A
+    // focused InputText/slider leaves ActiveId set and therefore keeps
+    // WantCaptureKeyboard true even after mouse-look starts. Removing ImGui
+    // window focus clears that active widget; clicks over panels stay owned by
+    // ImGui so their context menus and editing behaviour are unchanged.
+    if (msg == WM_RBUTTONDOWN && IsEditorEditing() &&
+        ImGui::GetCurrentContext() && !ImGui::GetIO().WantCaptureMouse)
+        ImGui::SetWindowFocus(nullptr);
+
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam)) return true;
 
     // ImGui gets first chance to consume menu clicks. Any unconsumed gameplay
