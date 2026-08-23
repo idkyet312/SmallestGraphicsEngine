@@ -914,6 +914,11 @@ public:
             record.textureIndices[0] = material->bindlessAlbedoIndex;
             record.textureIndices[1] = material->bindlessNormalIndex;
             record.textureIndices[2] = material->bindlessMetalRoughIndex;
+            // This is material state too, not immutable texture identity. Every
+            // frame slot needs it: leaving a newly visited slot at zero makes a
+            // packed roughness-only map's B=0 channel erase metallic for that
+            // frame, so the surface alternates between metallic and diffuse.
+            record.textureIndices[3] = material->roughnessOnlyTexture ? 1u : 0u;
             return found->second;
         }
 
