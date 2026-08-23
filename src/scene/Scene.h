@@ -80,6 +80,18 @@ struct LaserBeamFX {
     float maxLife = 0.085f;
 };
 
+// IR aiming laser. Unlike LaserBeamFX this is not a weapon effect with a
+// lifetime -- it is a continuous beam that exists for as long as the goggles are
+// up, so the CPU rewrites start/end every frame and `visible` gates the draw.
+struct IRLaserFX {
+    XMFLOAT3 start = {};
+    XMFLOAT3 end = {};
+    // Goggle ramp, 0..1. Also the beam's opacity: an IR designator is only
+    // visible through an intensifier, so this fades with the NVG blend.
+    float visibility = 0.0f;
+    bool visible = false;
+};
+
 struct HarpoonTetherFX {
     XMFLOAT3 start = {};
     XMFLOAT3 end = {};
@@ -289,6 +301,7 @@ struct Scene {
     GunViewModel gun;
     std::vector<Projectile> projectiles;
     LaserBeamFX laserBeam;
+    IRLaserFX irLaser;
     HarpoonTetherFX harpoonTether;
     std::vector<PinnedHarpoonFX> pinnedHarpoons;
     std::vector<RemoteCharge> remoteCharges;

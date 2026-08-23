@@ -334,19 +334,15 @@ inline void RenderPlayerHUD(const Scene& scene) {
         // through a real scope the tube wall is simply opaque -- the eye sees
         // the bright circle of glass and nothing else, so a soft vignette or a
         // grey surround reads as a HUD overlay instead of an optic.
-        for (int i = 0; i < segments; ++i) {
-            const float a0 = 6.2831853f * static_cast<float>(i) / segments;
-            const float a1 = 6.2831853f * static_cast<float>(i + 1) / segments;
-            const ImVec2 inner0(center.x + std::cos(a0) * radius,
-                                center.y + std::sin(a0) * radius);
-            const ImVec2 inner1(center.x + std::cos(a1) * radius,
-                                center.y + std::sin(a1) * radius);
-            const ImVec2 outer0(center.x + std::cos(a0) * outerRadius,
-                                center.y + std::sin(a0) * outerRadius);
-            const ImVec2 outer1(center.x + std::cos(a1) * outerRadius,
-                                center.y + std::sin(a1) * outerRadius);
-            draw->AddQuadFilled(inner0, outer0, outer1, inner1, shade);
-        }
+        //
+        // Drawn as ONE thick stroked ring rather than a fan of quads from the
+        // lens edge out to the corners. Each quad in such a fan carries its own
+        // anti-aliased edge, and the shared edges between neighbours do not
+        // cancel: they leave 160 faint radial seams seen as streaks seemingly
+        // radiating out of the scope. A single polyline has no interior edges.
+        const float ringRadius = (radius + outerRadius) * 0.5f;
+        const float ringThickness = outerRadius - radius;
+        draw->AddCircle(center, ringRadius, shade, segments, ringThickness);
 
         // Only a slight darkening right at the glass edge, over the last few
         // percent of the radius. Enough to round the transition into the tube

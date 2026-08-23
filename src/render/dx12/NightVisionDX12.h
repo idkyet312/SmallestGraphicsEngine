@@ -44,9 +44,13 @@ public:
             return false;
         }
 
+        // t0 scene copy, t1 scene depth. Depth is what lets the IR illuminator
+        // be a real spotlight: without a distance per pixel the lamp can only be
+        // a screen-space vignette, lighting a far wall exactly as hard as a near
+        // one.
         D3D12_DESCRIPTOR_RANGE textureRange = {};
         textureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        textureRange.NumDescriptors = 1;
+        textureRange.NumDescriptors = 2;
         textureRange.BaseShaderRegister = 0;
 
         D3D12_ROOT_PARAMETER roots[2] = {};
@@ -54,7 +58,8 @@ public:
         roots[0].DescriptorTable.NumDescriptorRanges = 1;
         roots[0].DescriptorTable.pDescriptorRanges = &textureRange;
         roots[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        // float2 inverseScreenSize + float time + float strength.
+        // inverseScreenSize, time, strength, gain, overload, then the depth
+        // linearisation pair (near, far) the illuminator needs.
         roots[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         roots[1].Constants.ShaderRegister = 0;
         roots[1].Constants.Num32BitValues = 8;
@@ -110,7 +115,7 @@ public:
 
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 1;
+        heapDesc.NumDescriptors = 2;   // scene copy + depth
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_dx12.device->CreateDescriptorHeap(
                 &heapDesc, IID_PPV_ARGS(&srvHeap_))))
@@ -135,7 +140,8 @@ public:
     // past what it can handle -- 0 in proper darkness, rising toward 1 in
     // daylight, where it washes the image out the way real goggles do.
     void Apply(ID3D12GraphicsCommandList* commandList, float time,
-               float strength, float gain, float overload) {
+               float strength, float gain, float overload,
+               float nearPlane, float farPlane) {
         if (!initialized || !commandList || !sceneCopy_) return;
         if (strength <= 0.0f) return;
         ID3D12Resource* backBuffer =
@@ -149,6 +155,14 @@ public:
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Transition(commandList, backBuffer,
             D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        // Depth was written earlier this frame and is still in DEPTH_WRITE.
+        // Read it as a texture for the illuminator, then hand it back.
+        ID3D12Resource* depthBuffer = g_dx12.depthStencilBuffer.Get();
+        if (depthBuffer)
+            Transition(commandList, depthBuffer,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetCPUDescriptorHandle(
             g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize, g_dx12.frameIndex);
@@ -168,8 +182,8 @@ public:
             strength,
             gain,
             overload,
-            0.0f,
-            0.0f
+            nearPlane,
+            farPlane
         };
         commandList->SetGraphicsRoot32BitConstants(1, 8, constants, 0);
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -178,6 +192,10 @@ public:
         Transition(commandList, sceneCopy_.Get(),
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_COPY_DEST);
+        if (depthBuffer)
+            Transition(commandList, depthBuffer,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE);
     }
 
 private:
@@ -220,6 +238,22 @@ private:
         g_dx12.device->CreateShaderResourceView(
             sceneCopy_.Get(), &srv,
             srvHeap_->GetCPUDescriptorHandleForHeapStart());
+
+        // Depth in slot 1, read as R32_FLOAT (the buffer is D32_FLOAT). Created
+        // here rather than per-frame so Apply only has to transition it.
+        D3D12_CPU_DESCRIPTOR_HANDLE depthHandle =
+            srvHeap_->GetCPUDescriptorHandleForHeapStart();
+        depthHandle.ptr += g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_SHADER_RESOURCE_VIEW_DESC depthSRV = {};
+        depthSRV.Shader4ComponentMapping =
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        depthSRV.Format = DXGI_FORMAT_R32_FLOAT;
+        depthSRV.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        depthSRV.Texture2D.MipLevels = 1;
+        if (g_dx12.depthStencilBuffer)
+            g_dx12.device->CreateShaderResourceView(
+                g_dx12.depthStencilBuffer.Get(), &depthSRV, depthHandle);
         return true;
     }
 

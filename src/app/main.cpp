@@ -636,12 +636,15 @@ bool                        g_emptyLevelMode = false;
 // back to a hardcoded spawn at the origin when a level authors none -- so
 // leaving them out of the level file is not enough to keep them off the map.
 bool                        g_trainingRangeMode = false;
-// Whether the active custom level actually places a Humvee. Without this the
-// vehicle spawns anyway: primaryHumveeSpawn keeps its {0, 3.45, 0} default when
-// a level defines no Humvee entity, so InitializeVehicle drops one at the origin
-// of every level that never asked for one. Only meaningful in custom levels --
-// the built-in Level 1 always has its Humvee.
-bool                        g_customLevelHasHumvee = false;
+// Whether the loaded level places a Humvee entity. The vehicle is authored
+// content like any prop: no level gets one unless it asks for one.
+//
+// Previously the Humvee spawned unconditionally, and primaryHumveeSpawn keeps
+// its {0, 3.45, 0} struct default when no entity sets it -- so every level
+// without one still got a Humvee at the world origin, complete with physics, a
+// shadow and a nav obstacle. Level 1's template authors its own, so it is
+// unaffected.
+bool                        g_levelPlacesHumvee = false;
 // Mouse-walk test mode (F10). Holding the right mouse button walks the player
 // forward, and aiming down sights is suppressed for as long as the mode is on --
 // the same button cannot both drive and aim. WASD still works; this is an extra
@@ -6120,6 +6123,107 @@ static void DrawEnemyVisionCones(CXMMATRIX view, CXMMATRIX projection) {
     }
 }
 
+// IR aiming laser, visible only through night vision.
+//
+// A real IR designator emits outside the visible band: to the naked eye there is
+// nothing there at all, and through an intensifier the beam is a hard white line
+// because the tube's phosphor output is monochrome regardless of input
+// wavelength. So this draws only while the goggles are up, and draws white
+// rather than the red of a visible-light laser.
+//
+// The line runs from the muzzle to the point the weapon would actually hit,
+// found with the same segment cast the shot itself uses. Drawing it from the
+// camera instead would be easier and wrong -- the offset between eye and muzzle
+// is exactly what makes a laser useful at close range.
+static void UpdateIRLaser() {
+    scene.irLaser.visible = false;
+    // Fades with the goggle ramp so raising and lowering them carries the beam
+    // with it rather than popping it on at full strength.
+    const float visibility = (std::min)(1.0f, g_nightVisionBlend);
+    if (visibility <= 0.01f) return;
+    if (!scene.gun.visible || scene.player.health <= 0.0f) return;
+    // Thrown and placed equipment has no barrel to bolt a designator to.
+    if (GunModel::C4Selected() || GunModel::HarpoonSelected()) return;
+    // The scope's own reticle is the aiming reference when glassing; a beam
+    // across the lens would only obscure it.
+    if (scene.sniperScopeBlend > 0.25f) return;
+
+    // Origin rides the gun; direction comes from the camera. A designator is
+    // zeroed to point of aim, so the dot belongs on the crosshair.
+    //
+    // Casting along the gun's own forward axis instead is the physically
+    // literal reading and plays badly: the view model sways hard when strafing,
+    // so holding right swung the barrel left and threw the dot metres off the
+    // crosshair at any distance. The sway is a view-model flourish, not real
+    // weapon movement -- the bullets ignore it too, since spread is centred on
+    // the camera axis. Following it would make the laser disagree with both the
+    // crosshair and the shot.
+    const XMFLOAT3 muzzle = scene.GetMuzzleWorldPosition();
+    const XMFLOAT3 origin = scene.camera.Position;
+    constexpr float kRange = 260.0f;
+
+    // Carry the weapon's idle sway into the cast direction, so the far end
+    // drifts with the same rhythm the muzzle does and the beam translates as one
+    // rigid line. Aiming straight down the camera axis instead pinned the far
+    // end still while the near end rode the sway, which made the beam pivot
+    // about the dot -- the opposite of how a rail-mounted designator behaves.
+    //
+    // Rotated in the camera's own frame (yaw about its up, pitch about its
+    // right) rather than about world axes, so the drift stays consistent when
+    // looking up or down. The sway is capped at +/-0.9 degrees, so the dot stays
+    // within a whisker of the crosshair at any usable range.
+    const XMVECTOR camFront = XMVector3Normalize(
+        XMLoadFloat3(&scene.camera.Front));
+    const XMVECTOR camUp = XMVector3Normalize(XMLoadFloat3(&scene.camera.Up));
+    XMVECTOR camRight = XMVector3Cross(camUp, camFront);
+    if (XMVectorGetX(XMVector3LengthSq(camRight)) < 1e-6f)
+        camRight = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+    camRight = XMVector3Normalize(camRight);
+    const XMMATRIX swayRotation =
+        XMMatrixRotationAxis(camUp, XMConvertToRadians(scene.gunSwayYaw)) *
+        XMMatrixRotationAxis(camRight, XMConvertToRadians(scene.gunSwayPitch));
+    XMFLOAT3 aimDirection;
+    XMStoreFloat3(&aimDirection,
+        XMVector3Normalize(XMVector3TransformNormal(camFront, swayRotation)));
+
+    const XMFLOAT3 end{ origin.x + aimDirection.x * kRange,
+                        origin.y + aimDirection.y * kRange,
+                        origin.z + aimDirection.z * kRange };
+    XMFLOAT3 target = end;
+    float closestDistanceSq = FLT_MAX;
+    auto accept = [&](const XMFLOAT3& hit) {
+        const float dx = hit.x - origin.x, dy = hit.y - origin.y,
+                    dz = hit.z - origin.z;
+        const float distanceSq = dx * dx + dy * dy + dz * dz;
+        if (distanceSq < closestDistanceSq) {
+            closestDistanceSq = distanceSq;
+            target = hit;
+        }
+    };
+    XMFLOAT3 hit;
+    if (scene.useDestruction && g_destruction.IsInitialized() &&
+        g_destruction.HitTestSegment(origin, end, 0.03f, hit)) accept(hit);
+    if (HitTerrainSegment(origin, end, 0.03f, hit)) accept(hit);
+
+    // Published for ForwardRenderer to draw as world geometry rather than a HUD
+    // overlay, so the depth buffer clips it against the scene.
+    //
+    // Start a little ahead of the muzzle: the emitter sits within a few
+    // centimetres of the near clip plane, and geometry straddling that plane
+    // gets sliced open -- the beam would flare into a wedge across the bottom of
+    // the screen. Slid along the muzzle-to-target line so it moves down the beam
+    // rather than nudging it off-line.
+    const XMVECTOR beamDirection = XMVector3Normalize(
+        XMLoadFloat3(&target) - XMLoadFloat3(&muzzle));
+    XMFLOAT3 beamStart;
+    XMStoreFloat3(&beamStart,
+                  XMLoadFloat3(&muzzle) + beamDirection * 0.35f);
+    scene.irLaser.start = beamStart;
+    scene.irLaser.end = target;
+    scene.irLaser.visibility = visibility;
+    scene.irLaser.visible = true;
+}
+
 static void BeginLevelLoading() {
     g_game.loading.Begin({
         g_emptyLevelMode ? 5u : 11u,
@@ -9421,7 +9525,7 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
     scene.weaponPickups.clear();
     // Recorded per level load, so a level without a Humvee entity does not
     // inherit the previous level's vehicle (or the struct default at origin).
-    g_customLevelHasHumvee = plan.humveeSpawn.has_value();
+    g_levelPlacesHumvee = plan.humveeSpawn.has_value();
     if (plan.humveeSpawn) {
         const Transform& humvee = *plan.humveeSpawn;
         g_primaryHumveeSpawn = { humvee.position[0],
@@ -9549,6 +9653,11 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
             g_customLevelMode ? RuntimeTerrainSource::Authored
                               : RuntimeTerrainSource::Empty);
     }
+    // Derived from the level that was just installed, so it is correct on every
+    // path: custom levels, the built-in Level 1 template, stress and empty
+    // modes alike. ApplyRuntimeLevelBasics sets it too, but early-returns for
+    // non-custom levels, so relying on that alone would hide Level 1's Humvee.
+    g_levelPlacesHumvee = FirstRuntimeEntity(LevelEntityType::Humvee) != nullptr;
     g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
     // Built-in levels carry no sidecar, so this clears any map left over from a
     // painted custom level rather than letting it bleed across a level change.
@@ -15352,8 +15461,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // primaryHumveeSpawn keeps its {0, 3.45, 0} default in that
                 // case, so without this check every such level got an
                 // unrequested Humvee sitting at the world origin.
-                if (!g_trainingRangeMode &&
-                    (!g_customLevelMode || g_customLevelHasHumvee))
+                if (!g_trainingRangeMode && g_levelPlacesHumvee)
                     g_destruction.InitializeVehicle(g_customLevelMode
                         ? g_primaryHumveeSpawn : XMFLOAT3{ 0.0f, 3.45f, 0.0f },
                         g_customLevelMode ? XMConvertToRadians(g_primaryHumveeYaw) : 0.0f);
@@ -17468,8 +17576,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // primaryHumveeSpawn keeps its {0, 3.45, 0} default in that
                 // case, so without this check every such level got an
                 // unrequested Humvee sitting at the world origin.
-                if (!g_trainingRangeMode &&
-                    (!g_customLevelMode || g_customLevelHasHumvee))
+                if (!g_trainingRangeMode && g_levelPlacesHumvee)
                     g_destruction.InitializeVehicle(g_customLevelMode
                         ? g_primaryHumveeSpawn : XMFLOAT3{ 0.0f, 3.45f, 0.0f },
                         g_customLevelMode ? XMConvertToRadians(g_primaryHumveeYaw) : 0.0f);
@@ -17880,6 +17987,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         }
         }
 
+        // Recast the IR designator from the settled camera and weapon pose.
+        //
+        // Must be here, before any render pass. It used to sit down with the
+        // night-vision gain block, which runs AFTER RenderForward has already
+        // drawn the frame -- so the beam published each frame was not consumed
+        // until the next one, and it visibly trailed the muzzle whenever the
+        // player moved. The gun itself is posed inside the render pass from
+        // GetGunBaseMatrix, so the beam has to be computed before that too.
+        UpdateIRLaser();
+
         // ?? render ??
         // Main menu draws only sky plus UI. Level geometry, weapons, enemies,
         // shadows, and particles are never submitted behind the menu.
@@ -17916,6 +18033,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         const bool lightningLit = g_lightningAmbient > 0.0005f;
         if (lightningLit)
             scene.ambientLightingIntensity += g_lightningAmbient;
+
+        // Goggles see through most of the fog. Volumetric fog is lit atmosphere,
+        // and the intensifier's gain amplifies that slab far more than the
+        // surfaces behind it -- a haze that reads as light depth by eye becomes
+        // a bright wall through the tube, flattening the image into a flat green
+        // field. Near-IR also scatters far less in air than visible light, which
+        // is why intensifiers see through haze better than the naked eye.
+        //
+        // A remnant is kept rather than cutting to zero: with no fog at all the
+        // scene loses its aerial depth cue entirely and distant terrain sits as
+        // flat as the near ground, which reads as a rendering bug rather than as
+        // clear air.
+        //
+        // Scaled by the goggle ramp so the fog returns as they come down,
+        // rather than snapping back the instant the blend leaves 1.
+        const float authoredVolumetricFogDensity = scene.volumetricFogDensity;
+        const bool nvgFogThinned = nvgWorldAmbientBoosted;
+        if (nvgFogThinned) {
+            // 0.06, not 0.18: at 0.18 the remaining slab was still enough for
+            // the tube gain to pull it into a visible wedge of brightening in
+            // front of the muzzle, which is worse than having no fog at all.
+            // This is a trace, just enough for distance to fall off.
+            constexpr float kNVGFogRetained = 0.06f;
+            const float thinBlend = (std::max)(
+                g_nightVisionBlend, g_nightVisionActive ? 0.18f : 0.0f);
+            scene.volumetricFogDensity *=
+                1.0f - (1.0f - kNVGFogRetained) * thinBlend;
+        }
 
         XMMATRIX fogLightSpace = XMMatrixIdentity();
         ID3D12Resource* fogShadowResource = nullptr;
@@ -18220,10 +18365,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         const bool visibilityValidation = visibilityParityValidation;
         // Shared post-render pass. Normal forward composites to the resolved
         // swapchain target. Visibility and parity-forward composite to HDR.
+        // Light shafts are suppressed under the goggles. A shaft is a cone of
+        // lit atmosphere, and the tube gain amplifies it far harder than the
+        // surfaces around it -- it came through as a bright wedge hanging in
+        // front of the muzzle rather than as a god ray. Thinning the fog alone
+        // did not fix it because the shaft pass has its own scattering term.
+        const bool nvgSuppressShafts = nvgWorldAmbientBoosted &&
+            g_nightVisionBlend > 0.35f;
         const bool volumetricShafts =
-            scene.lightShaftMode == Scene::LightShaftMode::Volumetric;
+            scene.lightShaftMode == Scene::LightShaftMode::Volumetric &&
+            !nvgSuppressShafts;
         const bool fauxShafts =
-            scene.lightShaftMode == Scene::LightShaftMode::Faux;
+            scene.lightShaftMode == Scene::LightShaftMode::Faux &&
+            !nvgSuppressShafts;
         const bool renderFroxelVolume =
             (scene.enableVolumetricFog && volumetricShafts) ||
             scene.enableFlyableClouds;
@@ -18248,6 +18402,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                           : D3D12_CPU_DESCRIPTOR_HANDLE{},
                 commonHDRValidationTarget, fogDepthAlreadyReadable);
         }
+        // Restore the authored density now the fog pass has consumed it. Must be
+        // after volumetricFog.Render, not beside the ambient restore above --
+        // that runs before this point, so restoring there put the full density
+        // back before the fog ever read the thinned value.
+        if (nvgFogThinned)
+            scene.volumetricFogDensity = authoredVolumetricFogDensity;
         // Faux shafts need the HDR target: they read the scene colour they are
         // about to add onto, so the visibility buffer's output is both source
         // and destination. Only run on the HDR path where that texture exists.
@@ -18421,7 +18581,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     std::fmod(gameTimer.GetElapsed(), 1000.0f);
                 nightVision.Apply(g_dx12.commandList.Get(), noiseTime,
                                   g_nightVisionBlend, g_nightVisionGain,
-                                  g_nightVisionOverload);
+                                  g_nightVisionOverload,
+                                  scene.cameraNear, scene.cameraFar);
             }
         }
 

@@ -115,10 +115,10 @@ extern DDGIRendererDX12 g_ddgiRenderer;
 extern bool g_stressTestMode;
 extern bool g_emptyLevelMode;
 extern bool g_trainingRangeMode;
-// Whether the active custom level places a Humvee entity. Custom levels that do
-// not must not draw one: the spawn point keeps its default and the vehicle would
-// otherwise appear at the world origin.
-extern bool g_customLevelHasHumvee;
+// Whether the loaded level places a Humvee entity. The vehicle is authored
+// content: a level that does not place one must not draw one, or it appears at
+// the world origin where primaryHumveeSpawn's default leaves it.
+extern bool g_levelPlacesHumvee;
 // Impact decal store, defined in main.cpp. Uploaded once per frame alongside
 // the point lights.
 struct ImpactDecal {
@@ -1857,7 +1857,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     }
 
     if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel &&
-        (!g_customLevelMode || g_customLevelHasHumvee)) {
+        g_levelPlacesHumvee) {
         if (visibilityExtensionsOnly) {
             DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
                 view, proj, lightSpace, true);
@@ -2122,6 +2122,104 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             shader.SetEmissiveMaterial(XMFLOAT3(1.5f, 7.0f, 11.0f), 0.72f * fade);
             DrawSphere(geo);
             shader.NextDrawCall();
+            shader.Use(scene.wireframeMode);
+        }
+    }
+
+    // IR aiming laser. World geometry rather than a HUD line so the depth buffer
+    // clips it: the beam disappears behind rocks, grass and walls the way a real
+    // one does, instead of being painted over the top of the scene.
+    //
+    // Drawn white and additive because that is what an intensifier does with it.
+    // The tube is monochrome downstream of the photocathode, so an IR emitter --
+    // invisible to the naked eye -- comes through as a hard white line regardless
+    // of its actual wavelength.
+    if (scene.irLaser.visible && scene.irLaser.visibility > 0.01f) {
+        const XMVECTOR start = XMLoadFloat3(&scene.irLaser.start);
+        const XMVECTOR end = XMLoadFloat3(&scene.irLaser.end);
+        XMVECTOR fwd = end - start;
+        const float len = XMVectorGetX(XMVector3Length(fwd));
+        if (len > 0.01f) {
+            fwd = XMVector3Normalize(fwd);
+            const XMVECTOR up0 = fabsf(XMVectorGetY(fwd)) > 0.95f
+                ? XMVectorSet(1, 0, 0, 0) : XMVectorSet(0, 1, 0, 0);
+            const XMVECTOR right = XMVector3Normalize(XMVector3Cross(up0, fwd));
+            const XMVECTOR up = XMVector3Cross(fwd, right);
+            XMMATRIX basis = XMMatrixIdentity();
+            basis.r[0] = XMVectorSetW(right, 0.0f);
+            basis.r[1] = XMVectorSetW(up, 0.0f);
+            basis.r[2] = XMVectorSetW(fwd, 0.0f);
+            basis.r[3] = XMVectorSetW((start + end) * 0.5f, 1.0f);
+            const float fade = scene.irLaser.visibility;
+
+            shader.UseAdditive();
+            // A single thin round shaft at flat LDR white. Deliberately has no
+            // glow of any kind: both a wide additive sheath and HDR emissive
+            // colour were tried, and each spread brightness outward around the
+            // beam under NVG rather than reading as scatter.
+            //
+            // The capsule mesh is built Y-up with radius 0.25 and unit length,
+            // so rotate its axis onto the basis Z and scale by 4x the wanted
+            // radius. A cube would give the shaft a square cross-section that
+            // flickers between wide and thin as the view rotates around it.
+            const XMMATRIX axisToBeam = XMMatrixRotationX(XM_PIDIV2);
+            constexpr float kBeamRadius = 0.0075f;
+            model = XMMatrixScaling(kBeamRadius * 4.0f, len,
+                                    kBeamRadius * 4.0f) *
+                    axisToBeam * basis;
+            shader.SetMatrices(model, view, proj, lightSpace);
+            // Plain LDR white, nothing above 1.0. HDR emissive values here
+            // spilled outward into a cone of brightening around the beam
+            // instead of staying inside the shaft's own silhouette, so the
+            // colour is clamped to a flat line that cannot glow at all.
+            shader.SetEmissiveMaterial(XMFLOAT3(1.0f, 1.0f, 1.0f), 0.85f * fade);
+            DrawCapsule(geo);
+            shader.NextDrawCall();
+
+            // The dot on the target: the part actually aimed with, and through
+            // an intensifier the brightest thing in the picture. Built as three
+            // concentric additive shells rather than one sphere, so it blooms
+            // outward the way a real IR dot does instead of ending at a hard
+            // edge.
+            //
+            // Safe here where it was not on the shaft: the halo that spilled
+            // into a visible cone earlier came from stretching bright geometry
+            // along tens of metres of beam. These shells are a couple of
+            // centimetres across and localised on the impact point, so the
+            // additive falloff stays a dot. Still all LDR -- the bloom comes
+            // from stacking translucent shells, not from exceeding white.
+            struct DotShell { float radius; float opacity; };
+            static constexpr DotShell kDotShells[] = {
+                { 0.105f, 0.10f },   // wide outer halo
+                { 0.062f, 0.20f },   // outer haze
+                { 0.034f, 0.42f },   // mid bloom
+                { 0.014f, 1.00f },   // hot core
+            };
+            // Grow the dot with distance so it holds a readable size downrange.
+            // At a fixed world size the core falls under a pixel past ~60 m and
+            // the dot quietly disappears exactly where the beam is most useful.
+            // Partial compensation, not full: it still shrinks with range, just
+            // not into nothing.
+            // Camera position from the scene, not view.r[3] -- the view
+            // matrix's translation row is the negated, rotated eye, not the
+            // world-space camera position.
+            const float dotDistance = XMVectorGetX(XMVector3Length(
+                XMLoadFloat3(&scene.irLaser.end) -
+                XMLoadFloat3(&scene.camera.Position)));
+            const float dotScale = 1.0f +
+                (std::min)(6.0f, dotDistance * 0.045f);
+            for (const DotShell& shell : kDotShells) {
+                const float radius = shell.radius * dotScale;
+                model = XMMatrixScaling(radius, radius, radius) *
+                        XMMatrixTranslation(scene.irLaser.end.x,
+                                            scene.irLaser.end.y,
+                                            scene.irLaser.end.z);
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetEmissiveMaterial(XMFLOAT3(1.0f, 1.0f, 1.0f),
+                                           shell.opacity * fade);
+                DrawSphere(geo);
+                shader.NextDrawCall();
+            }
             shader.Use(scene.wireframeMode);
         }
     }

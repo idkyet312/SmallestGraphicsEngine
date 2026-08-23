@@ -354,7 +354,8 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<VBDrawItem>& items,
         items.push_back({ XMLoadFloat4x4(&link.transform), link.color,
             true, MAT_CUBE, false });
 
-    if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel) {
+    if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel &&
+        g_levelPlacesHumvee) {
         AppendOpaqueSceneNodeDrawItems(g_humveeModel, HumveeWorldMatrix(), items);
         if (g_stressTestMode)
             AppendOpaqueSceneNodeDrawItems(g_humveeModel,

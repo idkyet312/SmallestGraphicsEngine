@@ -695,7 +695,7 @@ public:
         }
 
         if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel &&
-            (!g_customLevelMode || g_customLevelHasHumvee)) {
+            g_levelPlacesHumvee) {
             std::vector<XMMATRIX> humveeTransforms = { HumveeWorldMatrix() };
             if (g_stressTestMode)
                 humveeTransforms.push_back(SecondaryHumveeWorldMatrix());

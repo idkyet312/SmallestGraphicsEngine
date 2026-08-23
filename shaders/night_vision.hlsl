@@ -14,6 +14,7 @@
 //   4. Tube artefacts. Sensor noise (visible because the gain amplifies it),
 //      scanlines, and the vignette of looking down a cylindrical eyepiece.
 Texture2D sceneTexture : register(t0);
+Texture2D<float> sceneDepth : register(t1);
 SamplerState linearClamp : register(s0);
 
 cbuffer NightVisionConstants : register(b0) {
@@ -34,7 +35,10 @@ cbuffer NightVisionConstants : register(b0) {
     // darkness; rises toward 1 in daylight, where an intensifier washes out into
     // a bright featureless field rather than showing a usable image.
     float  overload;
-    float2 nightVisionPadding;
+    // Camera near/far, used to linearise the depth buffer so the IR illuminator
+    // can fall off with real world distance.
+    float  cameraNear;
+    float  cameraFar;
 };
 
 struct ScreenVertex {
@@ -91,8 +95,15 @@ float4 PSMain(ScreenVertex input) : SV_Target {
     // and texture boundary into a bright game-like outline.
     const float signal = max(sceneLuma - 0.002, 0.0);
 
-    const float tubeDrive = signal * gain * 1.4;
-    const float kTubeCeiling = 0.70;
+    // Lower drive into a higher ceiling. The old 1.4 drive against a 0.70
+    // ceiling put every lit surface deep into the compression knee: a 16x range
+    // of scene luminance (0.05 to 0.80) came out spanning barely 2.5x, and
+    // above ~0.35 the curve was flat enough that ground, walls and foliage all
+    // resolved to the same pale value. Driving the tube less hard and letting it
+    // run closer to full scale keeps the midtones on the linear part of the
+    // response, which is where the picture's contrast lives.
+    const float tubeDrive = signal * gain * 0.8;
+    const float kTubeCeiling = 0.95;
     float intensified = tubeDrive / (1.0 + tubeDrive / kTubeCeiling);
     intensified = saturate(intensified + 0.008);
 
@@ -101,7 +112,65 @@ float4 PSMain(ScreenVertex input) : SV_Target {
     // surface into hard black and bright green bands.
     const float tubeSignal = saturate(
         (intensified - 0.010) / (kTubeCeiling - 0.010));
-    intensified = pow(tubeSignal, 1.16);
+    intensified = pow(tubeSignal, 1.10);
+
+    // -- 1b. IR illuminator ---------------------------------------------------
+    // The goggles' own IR lamp. It is bore-sighted with the tube and rides the
+    // head, so whatever you look at is what it lights -- which in screen space
+    // is simply a bright pool at the centre falling off toward the edges. That
+    // is why an illuminator does not help you scan: the lit patch follows your
+    // gaze rather than staying put in the world.
+    //
+    // Applied to the tube signal, before the phosphor, so the extra light goes
+    // through the same response curve the rest of the image does instead of
+    // being pasted on as a white overlay.
+    //
+    // Multiplicative on existing signal rather than additive: a lamp reveals
+    // surfaces that are already there. Adding a flat term would light empty sky
+    // and distant nothing just as strongly as a wall a metre away.
+    {
+        // Cone angle: full strength through the middle of the beam, feathering
+        // out well before the eyepiece vignette so the two do not fight.
+        float2 lampUV = input.uv - 0.5;
+        // Aspect-correct so the cone stays round rather than stretching into an
+        // oval on a widescreen target.
+        lampUV.x *= inverseScreenSize.y / max(inverseScreenSize.x, 1e-6);
+        const float lampAngle = 1.0 - smoothstep(0.08, 0.36, length(lampUV));
+
+        // Distance falloff -- what makes this a spotlight rather than a
+        // vignette. Reverse-Z aware: whichever end of the depth range is near,
+        // linearise to a world distance in metres.
+        const float rawDepth = sceneDepth.Sample(linearClamp, input.uv).r;
+        const float n = max(cameraNear, 1e-4);
+        const float f = max(cameraFar, n + 1e-3);
+        // Standard LH perspective depth inverse. Guard the denominator so a
+        // cleared depth texel (1.0 = far plane, nothing drawn) resolves to the
+        // far plane instead of dividing by zero.
+        const float denom = max(f - rawDepth * (f - n), 1e-4);
+        float viewDistance = (n * f) / denom;
+        if (rawDepth >= 0.9999) viewDistance = f;   // sky: unlit
+
+        // Inverse-square with a soft near clamp, cut off past the lamp's useful
+        // throw. A real illuminator lights the first several metres hard and is
+        // useless well before the far plane, which is exactly why it gives away
+        // position without helping you see distance.
+        const float kLampRange = 26.0;       // metres to effective cutoff
+        const float kLampReference = 6.0;    // distance at which gain is 1.0
+        const float distanceTerm =
+            (kLampReference * kLampReference) /
+            max(viewDistance * viewDistance, kLampReference * kLampReference);
+        const float rangeCutoff = 1.0 - smoothstep(kLampRange * 0.55,
+                                                   kLampRange, viewDistance);
+
+        // Weakest where the tube is already saturated. A lamp adds nothing to a
+        // surface bright enough to bloom on its own, and pushing there only
+        // flattens the highlights the contrast curve above recovered.
+        const float lampHeadroom = 1.0 - smoothstep(0.35, 0.85, intensified);
+        const float kIlluminatorGain = 1.15;
+        intensified = saturate(intensified *
+            (1.0 + kIlluminatorGain * lampAngle * distanceTerm *
+                   rangeCutoff * lampHeadroom));
+    }
 
     // -- 2. Halo --------------------------------------------------------------
     // Blooming around a bright source is the signature intensifier artefact:
@@ -134,8 +203,12 @@ float4 PSMain(ScreenVertex input) : SV_Target {
     // surfaces ride at the output ceiling. The knee starts above the useful
     // midrange, preserving terrain detail while taking the white edge off the
     // tower, weapon highlights, and bloomed light sources.
-    const float highlightKnee = smoothstep(0.52, 1.0, intensified);
-    intensified *= lerp(1.0, 0.76, highlightKnee);
+    // Gentle roll-off only. An earlier, much harder knee (0.34 start, 0.58 cut)
+    // was tuned against a saturated-green highlight that looked hot; the pale
+    // mint highlight below carries brightness far better, so cutting the top end
+    // that hard now just makes the image muddy instead of bright and washed.
+    const float highlightKnee = smoothstep(0.60, 1.0, intensified);
+    intensified *= lerp(1.0, 0.86, highlightKnee);
 
     // -- 3. Phosphor ----------------------------------------------------------
     // P43 image-intensifier phosphor green. Real phosphor is darker and less
@@ -143,9 +216,20 @@ float4 PSMain(ScreenVertex input) : SV_Target {
     // emission as signal rises. That small luminance-dependent variation keeps
     // the picture from reading as one flat green overlay while staying visibly
     // monochrome.
-    const float3 kPhosphorShadow = float3(0.055, 0.62, 0.080);
-    const float3 kPhosphorHighlight = float3(0.14, 1.0, 0.18);
-    const float phosphorBlend = smoothstep(0.08, 0.66, intensified);
+    // Blue-green tube rather than the traditional P43 green: shadows sit in a
+    // deep teal and the bright end washes to a pale cyan-white. Modern white
+    // phosphor and digital intensifiers read far closer to this than to the
+    // saturated green of older tubes, and the cooler cast keeps foliage and
+    // terrain separable instead of collapsing everything into one hue.
+    //
+    // Blue leads green at the top end while green leads at the bottom, so the
+    // image shifts cooler as it brightens rather than simply getting lighter.
+    const float3 kPhosphorShadow = float3(0.10, 0.34, 0.38);
+    const float3 kPhosphorHighlight = float3(0.60, 0.92, 1.00);
+    // Widened to the full range. Saturating the shadow-to-highlight blend at
+    // 0.66 meant everything above that shared one colour, so the brightest
+    // two-thirds of the picture stopped varying in hue as well as in level.
+    const float phosphorBlend = smoothstep(0.04, 0.95, intensified);
     const float3 phosphor = lerp(
         kPhosphorShadow, kPhosphorHighlight, phosphorBlend);
     float3 nightColor = intensified * phosphor;
@@ -208,7 +292,11 @@ float4 PSMain(ScreenVertex input) : SV_Target {
     // rectangle. Keep the central 76% of the screen height clear, then feather
     // to black at a radius of half the screen height. Aspect correction above
     // keeps that boundary physically round on ultrawide and 16:9 displays.
-    const float vignette = 1.0 - smoothstep(0.38, 0.50, radius);
+    // Tighter circle with a harder edge: an eyepiece shows a well-defined disc
+    // of image inside an opaque tube wall, not a broad gradual falloff. The old
+    // 0.38-0.50 feather spent a quarter of the radius fading, which reads as a
+    // soft screen-space vignette rather than the edge of an optic.
+    const float vignette = 1.0 - smoothstep(0.34, 0.42, radius);
     nightColor *= vignette;
 
     nightColor = saturate(nightColor);
