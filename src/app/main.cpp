@@ -636,6 +636,12 @@ bool                        g_emptyLevelMode = false;
 // back to a hardcoded spawn at the origin when a level authors none -- so
 // leaving them out of the level file is not enough to keep them off the map.
 bool                        g_trainingRangeMode = false;
+// Whether the active custom level actually places a Humvee. Without this the
+// vehicle spawns anyway: primaryHumveeSpawn keeps its {0, 3.45, 0} default when
+// a level defines no Humvee entity, so InitializeVehicle drops one at the origin
+// of every level that never asked for one. Only meaningful in custom levels --
+// the built-in Level 1 always has its Humvee.
+bool                        g_customLevelHasHumvee = false;
 // Mouse-walk test mode (F10). Holding the right mouse button walks the player
 // forward, and aiming down sights is suppressed for as long as the mode is on --
 // the same button cannot both drive and aim. WASD still works; this is an extra
@@ -9413,6 +9419,9 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
                                             transform.position[2] }});
     }
     scene.weaponPickups.clear();
+    // Recorded per level load, so a level without a Humvee entity does not
+    // inherit the previous level's vehicle (or the struct default at origin).
+    g_customLevelHasHumvee = plan.humveeSpawn.has_value();
     if (plan.humveeSpawn) {
         const Transform& humvee = *plan.humveeSpawn;
         g_primaryHumveeSpawn = { humvee.position[0],
@@ -15338,7 +15347,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // Skipped on the training range: the Humvee is hidden there, and
                 // a physics body without a model is collision the player cannot
                 // see and cannot explain.
-                if (!g_trainingRangeMode)
+                //
+                // Also skipped in a custom level that places no Humvee entity.
+                // primaryHumveeSpawn keeps its {0, 3.45, 0} default in that
+                // case, so without this check every such level got an
+                // unrequested Humvee sitting at the world origin.
+                if (!g_trainingRangeMode &&
+                    (!g_customLevelMode || g_customLevelHasHumvee))
                     g_destruction.InitializeVehicle(g_customLevelMode
                         ? g_primaryHumveeSpawn : XMFLOAT3{ 0.0f, 3.45f, 0.0f },
                         g_customLevelMode ? XMConvertToRadians(g_primaryHumveeYaw) : 0.0f);
@@ -17448,7 +17463,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // Skipped on the training range: the Humvee is hidden there, and
                 // a physics body without a model is collision the player cannot
                 // see and cannot explain.
-                if (!g_trainingRangeMode)
+                //
+                // Also skipped in a custom level that places no Humvee entity.
+                // primaryHumveeSpawn keeps its {0, 3.45, 0} default in that
+                // case, so without this check every such level got an
+                // unrequested Humvee sitting at the world origin.
+                if (!g_trainingRangeMode &&
+                    (!g_customLevelMode || g_customLevelHasHumvee))
                     g_destruction.InitializeVehicle(g_customLevelMode
                         ? g_primaryHumveeSpawn : XMFLOAT3{ 0.0f, 3.45f, 0.0f },
                         g_customLevelMode ? XMConvertToRadians(g_primaryHumveeYaw) : 0.0f);

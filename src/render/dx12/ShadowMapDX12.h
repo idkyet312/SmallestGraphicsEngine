@@ -694,7 +694,8 @@ public:
             depthShader.NextDrawCall();
         }
 
-        if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel) {
+        if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel &&
+            (!g_customLevelMode || g_customLevelHasHumvee)) {
             std::vector<XMMATRIX> humveeTransforms = { HumveeWorldMatrix() };
             if (g_stressTestMode)
                 humveeTransforms.push_back(SecondaryHumveeWorldMatrix());

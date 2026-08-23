@@ -115,6 +115,10 @@ extern DDGIRendererDX12 g_ddgiRenderer;
 extern bool g_stressTestMode;
 extern bool g_emptyLevelMode;
 extern bool g_trainingRangeMode;
+// Whether the active custom level places a Humvee entity. Custom levels that do
+// not must not draw one: the spawn point keeps its default and the vehicle would
+// otherwise appear at the world origin.
+extern bool g_customLevelHasHumvee;
 // Impact decal store, defined in main.cpp. Uploaded once per frame alongside
 // the point lights.
 struct ImpactDecal {
@@ -1852,7 +1856,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.NextDrawCall();
     }
 
-    if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel) {
+    if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel &&
+        (!g_customLevelMode || g_customLevelHasHumvee)) {
         if (visibilityExtensionsOnly) {
             DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
                 view, proj, lightSpace, true);
