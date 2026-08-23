@@ -1,8 +1,10 @@
 #include "LevelEditor.h"
 
 #include "CameraDX12.h"
+#include "TerrainStampLibrary.h"
 #include <imgui.h>
 #include <ImGuizmo.h>
+#include <stb_image.h>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -28,6 +30,60 @@ namespace {
 // content browser's Prefabs tab came up empty and no prefab could be placed.
 const std::filesystem::path kPrefabRoot = "Content/Prefabs";
 const std::filesystem::path kModelRoot = "Content/Models";
+
+// Cells per side of the heightmap preview drawn inside the placement square.
+// 64 matches the 0.5 m/vertex the clipmap's innermost ring renders across a
+// 32 m stamp, so the preview shows the relief the terrain will actually
+// produce rather than a smoother blob. ~4k quads on the foreground draw list,
+// still negligible next to the editor's entity gizmos.
+constexpr int kStampPreviewGrid = 64;
+
+// Decodes a stamp PNG down to a kStampPreviewGrid^2 grid of 0..1 heights.
+//
+// Deliberately separate from TerrainRendererDX12's 256^2 atlas: that lives on
+// the render side behind DX12 headers, and the editor only needs a coarse grid
+// for the on-screen preview. Box-filtered rather than point-sampled so a thin
+// ridge in a 4K source does not vanish between preview taps.
+bool LoadStampPreview(const std::string& filename, std::vector<float>& out) {
+    out.assign(static_cast<size_t>(kStampPreviewGrid) * kStampPreviewGrid, 0.5f);
+    if (!IsTerrainStampFilename(filename)) return false;
+    const std::string path = (TerrainStampDirectory() / filename).string();
+    int width = 0, height = 0, components = 0;
+    // 16-bit for the authored heightmaps; stb widens 8-bit sources for free, so
+    // a stamp exported at 8 bits still previews instead of showing nothing.
+    stbi_us* pixels = stbi_load_16(path.c_str(), &width, &height,
+                                   &components, 1);
+    if (!pixels || width <= 0 || height <= 0) {
+        if (pixels) stbi_image_free(pixels);
+        return false;
+    }
+    for (int y = 0; y < kStampPreviewGrid; ++y) {
+        const int y0 = static_cast<int>(static_cast<int64_t>(y) * height /
+                                        kStampPreviewGrid);
+        const int y1 = (std::max)(y0 + 1,
+            static_cast<int>(static_cast<int64_t>(y + 1) * height /
+                             kStampPreviewGrid));
+        for (int x = 0; x < kStampPreviewGrid; ++x) {
+            const int x0 = static_cast<int>(static_cast<int64_t>(x) * width /
+                                            kStampPreviewGrid);
+            const int x1 = (std::max)(x0 + 1,
+                static_cast<int>(static_cast<int64_t>(x + 1) * width /
+                                 kStampPreviewGrid));
+            uint64_t sum = 0;
+            uint32_t count = 0;
+            for (int sy = y0; sy < y1 && sy < height; ++sy) {
+                for (int sx = x0; sx < x1 && sx < width; ++sx) {
+                    sum += pixels[static_cast<size_t>(sy) * width + sx];
+                    ++count;
+                }
+            }
+            out[static_cast<size_t>(y) * kStampPreviewGrid + x] =
+                count ? static_cast<float>(sum) / count / 65535.0f : 0.5f;
+        }
+    }
+    stbi_image_free(pixels);
+    return true;
+}
 
 XMMATRIX EntityMatrix(const LevelEntity& entity) {
     const auto& t = entity.transform;
@@ -188,6 +244,23 @@ void LevelEditor::NewFromLevelOne() {
     terrainRuntimeDirty_ = true; dxrDDGIRuntimeDirty_ = true;
     dxrDDGILayoutDirty_ = true; playing_ = false;
     status_ = "New level created from Level 1";
+    RefreshLevelFiles();
+    prefabRegistry_.Refresh(kPrefabRoot, kModelRoot);
+    assetRegistry_.Refresh();
+}
+
+void LevelEditor::NewFlat() {
+    level_ = MakeFlatLevelTemplate();
+    strncpy_s(levelName_, level_.name.c_str(), _TRUNCATE);
+    selectedId_ = level_.entities.empty() ? 0 : level_.entities.front().id;
+    nextId_ = 1;
+    for (const auto& entity : level_.entities)
+        nextId_ = (std::max)(nextId_, entity.id + 1);
+    undo_.clear(); redo_.clear(); currentPath_.clear();
+    dirty_ = false; runtimeDirty_ = true; foliageRuntimeDirty_ = true;
+    terrainRuntimeDirty_ = true; dxrDDGIRuntimeDirty_ = true;
+    dxrDDGILayoutDirty_ = true; playing_ = false;
+    status_ = "New flat level created";
     RefreshLevelFiles();
     prefabRegistry_.Refresh(kPrefabRoot, kModelRoot);
     assetRegistry_.Refresh();
@@ -567,6 +640,7 @@ bool LevelEditor::FoliageChanged(const LevelDefinition& before) const {
 
 bool LevelEditor::TerrainChanged(const LevelDefinition& before) const {
     if (before.terrainHeightScale != level_.terrainHeightScale ||
+        before.terrainFlat != level_.terrainFlat ||
         before.terrainTilesX != level_.terrainTilesX ||
         before.terrainTilesZ != level_.terrainTilesZ ||
         before.terrainIslandScaleX != level_.terrainIslandScaleX ||
@@ -584,7 +658,9 @@ bool LevelEditor::TerrainChanged(const LevelDefinition& before) const {
         const TerrainSculptStamp& b = level_.terrainSculpt[i];
         if (a.x != b.x || a.z != b.z || a.radius != b.radius ||
             a.operation != b.operation || a.value != b.value ||
-            a.strength != b.strength) return true;
+            a.strength != b.strength || a.texture != b.texture ||
+            a.rotation != b.rotation || a.replace != b.replace ||
+            a.baseHeight != b.baseHeight) return true;
     }
     return false;
 }
@@ -945,10 +1021,10 @@ void LevelEditor::SculptTerrain(CXMMATRIX view, CXMMATRIX projection,
         terrainStrokeActive_ = false;
         terrainStrokeChanged_ = false;
     }
-    // Tools: 1 raise, 2 lower, 3 flatten. An allowlist, not a denylist: 0
-    // select, 4 grow and 5 paint must not sculpt, and a denylist would let any
-    // tool added later silently start pushing height stamps.
-    if ((terrainTool_ != 1 && terrainTool_ != 2 && terrainTool_ != 3) ||
+    // Tools: 1 raise, 2 lower, 3 flatten, 6 heightmap stamp. An allowlist, not
+    // a denylist: select/grow/paint must not silently push height stamps.
+    if ((terrainTool_ != 1 && terrainTool_ != 2 && terrainTool_ != 3 &&
+         terrainTool_ != 6) ||
         ImGui::GetIO().WantCaptureMouse || ImGuizmo::IsOver())
         return;
     XMFLOAT3 hit;
@@ -956,26 +1032,214 @@ void LevelEditor::SculptTerrain(CXMMATRIX view, CXMMATRIX projection,
 
     ImDrawList* draw = ImGui::GetForegroundDrawList();
     const XMMATRIX viewProjection = view * projection;
-    ImVec2 ring[33];
-    int ringCount = 0;
     const ImVec2 display = ImGui::GetIO().DisplaySize;
-    for (int i = 0; i <= 32; ++i) {
-        const float angle = XM_2PI * static_cast<float>(i) / 32.0f;
-        const float px = hit.x + std::cos(angle) * terrainBrushRadius_;
-        const float pz = hit.z + std::sin(angle) * terrainBrushRadius_;
+    const auto project = [&](float px, float pz, ImVec2& screen) {
         const float py = terrainHeight(px, pz) + 0.06f;
         const XMVECTOR clip = XMVector3Transform(
             XMVectorSet(px, py, pz, 1.0f), viewProjection);
         const float w = XMVectorGetW(clip);
-        if (w <= 0.01f) continue;
-        ring[ringCount++] = ImVec2((XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+        if (w <= 0.01f) return false;
+        screen = ImVec2((XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
             (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y);
+        return true;
+    };
+    if (terrainTool_ == 6) {
+        const float angle = XMConvertToRadians(terrainStampRotation_);
+        const float cosine = std::cos(angle), sine = std::sin(angle);
+        // Decode the selected stamp once, not per frame: the cursor moves every
+        // frame but the shape only changes when the combo does.
+        if (!terrainStampNames_.empty()) {
+            const std::string& selected =
+                terrainStampNames_[terrainStampSelection_];
+            if (selected != stampPreviewName_) {
+                stampPreviewName_ = selected;
+                stampPreviewValid_ =
+                    LoadStampPreview(selected, stampPreviewHeights_);
+            }
+        } else {
+            stampPreviewValid_ = false;
+        }
+
+        // Stamp-local (u, v) in 0..1 -> world XZ, sharing the rotation and
+        // extent that SampleHeightStamp uses so what is drawn is where the
+        // relief actually lands.
+        const auto stampToWorld = [&](float u, float v, float& px, float& pz) {
+            const float localX = (u * 2.0f - 1.0f) * terrainStampRadius_;
+            const float localZ = (v * 2.0f - 1.0f) * terrainStampRadius_;
+            px = hit.x + localX * cosine - localZ * sine;
+            pz = hit.z + localX * sine + localZ * cosine;
+        };
+        // Same edge feather as the sculpt sampler, so the preview fades out
+        // exactly where the stamp stops affecting the ground.
+        const auto edgeAt = [&](float u, float v) {
+            float e = ((std::max)(std::abs(u * 2.0f - 1.0f),
+                                  std::abs(v * 2.0f - 1.0f)) - 0.82f) / 0.18f;
+            e = e < 0.0f ? 0.0f : (e > 1.0f ? 1.0f : e);
+            return 1.0f - e * e * (3.0f - 2.0f * e);
+        };
+
+        if (stampPreviewValid_) {
+            // The preview is drawn at the height the stamp would produce, not
+            // flat on the ground: a crater reads as a crater only if the sheet
+            // actually dips. Projecting the sculpted height needs its own
+            // projector, since `project` deliberately hugs the terrain.
+            const auto projectAt = [&](float px, float pz, float py,
+                                       ImVec2& screen) {
+                const XMVECTOR clip = XMVector3Transform(
+                    XMVectorSet(px, py, pz, 1.0f), viewProjection);
+                const float w = XMVectorGetW(clip);
+                if (w <= 0.01f) return false;
+                screen = ImVec2(
+                    (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+                    (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y);
+                return true;
+            };
+            const int grid = kStampPreviewGrid;
+            // One height + screen position per grid corner, shared by the four
+            // quads that meet there.
+            const int stride = grid + 1;
+            std::vector<ImVec2> points(static_cast<size_t>(stride) * stride);
+            std::vector<uint8_t> valid(points.size(), 0);
+            std::vector<float> relief(points.size(), 0.0f);
+            for (int gy = 0; gy <= grid; ++gy) {
+                for (int gx = 0; gx <= grid; ++gx) {
+                    const float u = static_cast<float>(gx) / grid;
+                    const float v = static_cast<float>(gy) / grid;
+                    float px = 0.0f, pz = 0.0f;
+                    stampToWorld(u, v, px, pz);
+                    // Cell centres hold the samples; clamp so the outer ring of
+                    // corners reuses the nearest cell instead of reading out.
+                    const int cx = (std::min)(grid - 1, gx);
+                    const int cy = (std::min)(grid - 1, gy);
+                    const float normalized = stampPreviewHeights_[
+                        static_cast<size_t>(cy) * grid + cx] * 2.0f - 1.0f;
+                    const float edge = edgeAt(u, v);
+                    const float displacement =
+                        normalized * terrainStampHeight_ * edge;
+                    const float ground = terrainHeight(px, pz);
+                    // Mirror the sculpt blend so the preview shows replace mode
+                    // levelling the ground, not just relief floating over it.
+                    const float blend = edge * terrainStampReplace_;
+                    const float base = hit.y + terrainStampBaseOffset_;
+                    const float y = ground + displacement +
+                                    (base - ground) * blend;
+                    const size_t index =
+                        static_cast<size_t>(gy) * stride + gx;
+                    relief[index] = y - ground;
+                    valid[index] = projectAt(px, pz, y + 0.05f,
+                                             points[index]) ? 1u : 0u;
+                }
+            }
+            // Cut-away (below ground) reads red, built-up reads green, and the
+            // untouched middle stays the panel's purple, so the sign of the
+            // stamp is visible before it is committed.
+            const auto shade = [&](float delta) {
+                const float scale = (std::max)(1.0f,
+                    std::abs(terrainStampHeight_));
+                float t = delta / scale;
+                t = t < -1.0f ? -1.0f : (t > 1.0f ? 1.0f : t);
+                const float up = t > 0.0f ? t : 0.0f;
+                const float down = t < 0.0f ? -t : 0.0f;
+                return IM_COL32(
+                    static_cast<int>(150.0f + 90.0f * down - 60.0f * up),
+                    static_cast<int>(95.0f + 150.0f * up - 40.0f * down),
+                    static_cast<int>(235.0f - 150.0f * (up + down)),
+                    110);
+            };
+            for (int gy = 0; gy < grid; ++gy) {
+                for (int gx = 0; gx < grid; ++gx) {
+                    const size_t a = static_cast<size_t>(gy) * stride + gx;
+                    const size_t b = a + 1;
+                    const size_t c = a + stride + 1;
+                    const size_t d = a + stride;
+                    if (!valid[a] || !valid[b] || !valid[c] || !valid[d])
+                        continue;
+                    const float average = (relief[a] + relief[b] + relief[c] +
+                                           relief[d]) * 0.25f;
+                    draw->AddQuadFilled(points[a], points[b], points[c],
+                                        points[d], shade(average));
+                }
+            }
+            // Wireframe over the fill: flat regions have no shading gradient to
+            // read, and the lines are what make the surface legible there.
+            // Fixed line count, not a fixed step: at grid 64 a step of 3 would
+            // draw 22 lines per axis and read as a solid haze over the fill.
+            const int wireStep = (std::max)(1, grid / 8);
+            for (int g = 0; g <= grid; g += wireStep) {
+                for (int step = 0; step < grid; ++step) {
+                    const size_t rowA =
+                        static_cast<size_t>(g) * stride + step;
+                    if (valid[rowA] && valid[rowA + 1])
+                        draw->AddLine(points[rowA], points[rowA + 1],
+                                      IM_COL32(210, 175, 255, 90), 1.0f);
+                    const size_t colA =
+                        static_cast<size_t>(step) * stride + g;
+                    if (valid[colA] && valid[colA + stride])
+                        draw->AddLine(points[colA], points[colA + stride],
+                                      IM_COL32(210, 175, 255, 90), 1.0f);
+                }
+            }
+        }
+
+        static constexpr float corners[5][2] = {
+            {-1.0f, -1.0f}, {1.0f, -1.0f}, {1.0f, 1.0f},
+            {-1.0f, 1.0f}, {-1.0f, -1.0f}
+        };
+        ImVec2 outline[5];
+        int outlineCount = 0;
+        for (const auto& corner : corners) {
+            const float localX = corner[0] * terrainStampRadius_;
+            const float localZ = corner[1] * terrainStampRadius_;
+            const float px = hit.x + localX * cosine - localZ * sine;
+            const float pz = hit.z + localX * sine + localZ * cosine;
+            if (project(px, pz, outline[outlineCount])) ++outlineCount;
+        }
+        if (outlineCount > 1)
+            draw->AddPolyline(outline, outlineCount,
+                IM_COL32(185, 110, 255, 235), ImDrawFlags_None, 2.0f);
+    } else {
+        ImVec2 ring[33];
+        int ringCount = 0;
+        for (int i = 0; i <= 32; ++i) {
+            const float angle = XM_2PI * static_cast<float>(i) / 32.0f;
+            const float px = hit.x + std::cos(angle) * terrainBrushRadius_;
+            const float pz = hit.z + std::sin(angle) * terrainBrushRadius_;
+            if (project(px, pz, ring[ringCount])) ++ringCount;
+        }
+        if (ringCount > 1) draw->AddPolyline(ring, ringCount,
+            terrainTool_ == 2 ? IM_COL32(255, 95, 70, 235) :
+            (terrainTool_ == 3 ? IM_COL32(80, 180, 255, 235) :
+                                IM_COL32(230, 190, 70, 235)),
+            ImDrawFlags_None, 2.0f);
     }
-    if (ringCount > 1) draw->AddPolyline(ring, ringCount,
-        terrainTool_ == 2 ? IM_COL32(255, 95, 70, 235) :
-        (terrainTool_ == 3 ? IM_COL32(80, 180, 255, 235) :
-                            IM_COL32(230, 190, 70, 235)),
-        ImDrawFlags_None, 2.0f);
+
+    if (terrainTool_ == 6) {
+        if (!ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+            terrainStampNames_.empty()) return;
+        if (level_.terrainSculpt.size() >= kMaxTerrainSculptStamps) {
+            status_ = "Terrain sculpt limit reached (" +
+                std::to_string(kMaxTerrainSculptStamps) +
+                " stamps). Undo or Clear Sculpt.";
+            return;
+        }
+        terrainStrokeActive_ = true;
+        terrainStrokeChanged_ = true;
+        terrainStrokeBefore_ = level_;
+        TerrainSculptStamp stamp;
+        stamp.x = hit.x;
+        stamp.z = hit.z;
+        stamp.radius = terrainStampRadius_;
+        stamp.operation = TerrainSculptOperation::Heightmap;
+        stamp.value = terrainStampHeight_;
+        stamp.texture = terrainStampNames_[terrainStampSelection_];
+        stamp.rotation = terrainStampRotation_;
+        stamp.replace = terrainStampReplace_;
+        // Snapshot the ground under the cursor now. Recomputing it later would
+        // fold in whatever stamps land afterwards and make this one drift.
+        stamp.baseHeight = hit.y + terrainStampBaseOffset_;
+        level_.terrainSculpt.push_back(std::move(stamp));
+        return;
+    }
 
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) return;
     if (!terrainStrokeActive_) {
@@ -1252,6 +1516,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::Begin("Level Editor Toolbar", nullptr, ImGuiWindowFlags_NoCollapse);
     if (ImGui::Button("New From Level 1")) ImGui::OpenPopup("Confirm New Level");
     ImGui::SameLine();
+    if (ImGui::Button("New Flat")) ImGui::OpenPopup("Confirm Flat Level");
+    ImGui::SameLine();
     if (ImGui::Button("Save")) {
         if (currentPath_.empty()) BrowseSaveAs();
         else SaveTo(currentPath_);
@@ -1284,6 +1550,23 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted(dirty_ ? "Discard unsaved changes?" : "Create fresh Level 1 copy?");
         if (ImGui::Button("Create")) { NewFromLevelOne(); actions.levelChanged = true; ImGui::CloseCurrentPopup(); }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    if (ImGui::BeginPopupModal("Confirm Flat Level", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted(dirty_
+            ? "Discard unsaved changes and start a flat level?"
+            : "Start an empty flat level?");
+        ImGui::TextDisabled(
+            "Level plane at ground height. No island, coast, pool or props --\n"
+            "just a player spawn to sculpt around.");
+        if (ImGui::Button("Create")) {
+            NewFlat();
+            actions.levelChanged = true;
+            ImGui::CloseCurrentPopup();
+        }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
@@ -1898,8 +2181,14 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::End();
 
     ImGui::SetNextWindowPos(ImVec2(305, 325), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(285, 225), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(320, 430), ImGuiCond_FirstUseEver);
     ImGui::Begin("Terrain Sculpt");
+    if (!terrainStampLibraryScanned_) {
+        terrainStampNames_ = DiscoverTerrainStampNames();
+        terrainStampSelection_ = (std::min)(terrainStampSelection_,
+            (std::max)(0, static_cast<int>(terrainStampNames_.size()) - 1));
+        terrainStampLibraryScanned_ = true;
+    }
     if (ImGui::RadioButton("Select##terrain", &terrainTool_, 0)) foliageTool_ = 0;
     ImGui::SameLine();
     if (ImGui::RadioButton("Raise", &terrainTool_, 1)) foliageTool_ = 0;
@@ -1910,9 +2199,99 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     if (ImGui::RadioButton("Grow", &terrainTool_, 4)) foliageTool_ = 0;
     ImGui::SameLine();
     if (ImGui::RadioButton("Paint", &terrainTool_, 5)) foliageTool_ = 0;
-    ImGui::SliderFloat("Brush radius", &terrainBrushRadius_, 0.5f, 15.0f, "%.1f m");
-    ImGui::SliderFloat("Strength", &terrainBrushStrength_, 0.05f, 2.0f, "%.2f");
-    ImGui::SliderFloat("Stroke spacing", &terrainBrushSpacing_, 0.2f, 8.0f, "%.2f m");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Stamp", &terrainTool_, 6)) foliageTool_ = 0;
+    if (terrainTool_ != 6) {
+        ImGui::SliderFloat("Brush radius", &terrainBrushRadius_, 0.5f, 15.0f, "%.1f m");
+        ImGui::SliderFloat("Strength", &terrainBrushStrength_, 0.05f, 2.0f, "%.2f");
+        ImGui::SliderFloat("Stroke spacing", &terrainBrushSpacing_, 0.2f, 8.0f, "%.2f m");
+    } else {
+        ImGui::SeparatorText("Heightmap Stamp");
+        const std::string previewName = terrainStampNames_.empty() ?
+            "No stamps found" :
+            TerrainStampDisplayName(terrainStampNames_[terrainStampSelection_]);
+        if (ImGui::BeginCombo("Shape", previewName.c_str())) {
+            for (int i = 0; i < static_cast<int>(terrainStampNames_.size()); ++i) {
+                const bool selected = i == terrainStampSelection_;
+                const std::string label = TerrainStampDisplayName(terrainStampNames_[i]);
+                if (ImGui::Selectable(label.c_str(), selected))
+                    terrainStampSelection_ = i;
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::Button("Refresh Stamps")) terrainStampLibraryScanned_ = false;
+        ImGui::SameLine();
+        ImGui::TextDisabled("%zu found", terrainStampNames_.size());
+        // Flat 2D read of the same grid drawn in the viewport. The in-world
+        // preview is the one that matters for placement, but it is only visible
+        // while the cursor is over terrain -- this stays up while picking.
+        if (!terrainStampNames_.empty()) {
+            const std::string& selected =
+                terrainStampNames_[terrainStampSelection_];
+            if (selected != stampPreviewName_) {
+                stampPreviewName_ = selected;
+                stampPreviewValid_ =
+                    LoadStampPreview(selected, stampPreviewHeights_);
+            }
+        }
+        if (stampPreviewValid_) {
+            const float side = (std::min)(120.0f,
+                ImGui::GetContentRegionAvail().x);
+            const ImVec2 origin = ImGui::GetCursorScreenPos();
+            ImDrawList* panel = ImGui::GetWindowDrawList();
+            // The thumbnail is ~120 px wide, so drawing all 64 rows would make
+            // every cell sub-pixel. Step down to whole pixels and sample the
+            // grid, rather than emitting rects the panel cannot show.
+            const int thumbStep = (std::max)(1,
+                kStampPreviewGrid / (std::max)(1, static_cast<int>(side / 3.0f)));
+            const int thumbCells = kStampPreviewGrid / thumbStep;
+            const float cell = side / thumbCells;
+            for (int ty = 0; ty < thumbCells; ++ty) {
+                for (int tx = 0; tx < thumbCells; ++tx) {
+                    const int gy = ty * thumbStep, gx = tx * thumbStep;
+                    const float level = stampPreviewHeights_[
+                        static_cast<size_t>(gy) * kStampPreviewGrid + gx];
+                    const int tone = static_cast<int>(level * 255.0f);
+                    panel->AddRectFilled(
+                        ImVec2(origin.x + tx * cell, origin.y + ty * cell),
+                        ImVec2(origin.x + (tx + 1) * cell,
+                               origin.y + (ty + 1) * cell),
+                        IM_COL32(tone, tone, tone, 255));
+                }
+            }
+            panel->AddRect(origin, ImVec2(origin.x + side, origin.y + side),
+                           IM_COL32(185, 110, 255, 235));
+            ImGui::Dummy(ImVec2(side, side));
+        } else if (!terrainStampNames_.empty()) {
+            ImGui::TextDisabled("Preview unavailable for this stamp.");
+        }
+        ImGui::SliderFloat("Stamp radius", &terrainStampRadius_, 1.0f, 64.0f, "%.1f m");
+        ImGui::SliderFloat("Stamp height", &terrainStampHeight_, -32.0f, 32.0f, "%.1f m");
+        ImGui::SliderFloat("Rotation", &terrainStampRotation_, 0.0f, 360.0f, "%.0f deg");
+
+        // Additive vs replace. Two presets plus the raw slider: full replace and
+        // pure additive are what get used, but the in-between blend is genuinely
+        // useful for calming procedural noise without erasing it.
+        ImGui::SeparatorText("Blend");
+        if (ImGui::RadioButton("Additive", terrainStampReplace_ <= 0.0f))
+            terrainStampReplace_ = 0.0f;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Replace", terrainStampReplace_ >= 1.0f))
+            terrainStampReplace_ = 1.0f;
+        ImGui::SliderFloat("Replace amount", &terrainStampReplace_, 0.0f, 1.0f,
+                           "%.2f");
+        ImGui::BeginDisabled(terrainStampReplace_ <= 0.0f);
+        ImGui::SliderFloat("Base offset", &terrainStampBaseOffset_,
+                           -32.0f, 32.0f, "%.1f m");
+        ImGui::EndDisabled();
+        ImGui::TextWrapped(terrainStampReplace_ > 0.0f
+            ? "Click terrain to place one 16-bit heightmap stamp. Replace "
+              "overwrites the ground inside the square with the stamp, built "
+              "around the height under the cursor plus Base offset."
+            : "Click terrain to place one 16-bit heightmap stamp. Additive "
+              "lays the stamp's relief on top of the existing ground.");
+    }
     ImGui::Text("Stamps: %zu / %zu", level_.terrainSculpt.size(),
                 kMaxTerrainSculptStamps);
     ImGui::BeginDisabled(level_.terrainSculpt.empty());
@@ -1922,7 +2301,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         MarkChanged(before);
     }
     ImGui::EndDisabled();
-    ImGui::TextWrapped("Hold LMB on terrain. Flatten uses height where stroke starts.");
+    if (terrainTool_ != 6)
+        ImGui::TextWrapped("Hold LMB on terrain. Flatten uses height where stroke starts.");
 
     if (terrainTool_ == 5) {
         ImGui::SeparatorText("Material Paint");
@@ -1952,6 +2332,15 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     }
 
     ImGui::SeparatorText("Island Builder");
+    {
+        const LevelDefinition before = level_;
+        if (ImGui::Checkbox("Flat plane", &level_.terrainFlat))
+            MarkChanged(before);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Replace the procedural island with a level "
+                              "plane.\nNo relief, pool or coastline -- sculpt "
+                              "stamps only.");
+    }
     // Island size = the land radius. The tile grid auto-grows to fit it (see
     // CurrentTerrainParams), so this one slider stretches the whole island and
     // the ground + surrounding ocean follow. Manual Extend buttons below add

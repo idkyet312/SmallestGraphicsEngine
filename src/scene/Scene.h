@@ -715,6 +715,9 @@ struct Scene {
     // that survives past the close-range detail fade. Off by default -- it
     // changes the heightfield, and collision is sampled from the same function.
     bool  terrainDetailRelief = true;
+    // Flat authoring plane: no fbm relief, no pool basin, no coast falloff.
+    // Driven by the level definition's terrainFlat.
+    bool  terrainFlat         = false;
     float terrainIslandScaleX = 1.0f;   // per-axis coastline stretch
     float terrainIslandScaleZ = 1.0f;
     // Grid min-corner offset in tiles; 0 = centered on origin (legacy).

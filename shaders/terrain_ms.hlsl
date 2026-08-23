@@ -30,14 +30,62 @@ cbuffer TerrainParams : register(b6) {
     uint detailRelief; // 1 = extra low/high frequency relief octaves
 };
 
+// Must match SculptGPU in TerrainRendererDX12.h (40 bytes).
 struct TerrainSculptStamp {
     float3 centerRadius;
     uint operation;
     float value;
     float strength;
-    float2 padding;
+    uint textureIndex;
+    float rotation;
+    float replace;     // 0 = additive relief, 1 = overwrite ground
+    float baseHeight;  // world height a replace stamp is built around
 };
 StructuredBuffer<TerrainSculptStamp> terrainSculpt : register(t10);
+ByteAddressBuffer terrainStampAtlas : register(t11);
+
+// Must match TerrainStampLibrary.h -- these index the same atlas buffer, and a
+// mismatch reads every layer but the first at the wrong offset.
+static const uint kTerrainStampResolution = 512;
+static const uint kMaxTerrainStampTextures = 64;
+
+float LoadTerrainStamp(uint layer, uint2 texel) {
+    uint element = layer * kTerrainStampResolution * kTerrainStampResolution +
+        texel.y * kTerrainStampResolution + texel.x;
+    uint packed = terrainStampAtlas.Load((element >> 1) * 4);
+    uint value = (element & 1) != 0 ? packed >> 16 : packed & 0xffff;
+    return value * (1.0 / 65535.0);
+}
+
+// Returns the stamp's displacement in metres (x) and its coverage (y): 1 in
+// the middle, feathering to 0 at the border. Replace mode needs coverage
+// separately -- flat parts of a heightmap still have to overwrite the ground
+// under them, and they carry no relief to signal that.
+float2 SampleTerrainStamp(TerrainSculptStamp stamp, float2 xz) {
+    if (stamp.textureIndex >= kMaxTerrainStampTextures) return 0.0;
+    float sine, cosine;
+    sincos(radians(stamp.rotation), sine, cosine);
+    float2 delta = xz - stamp.centerRadius.xy;
+    float2 local = float2(delta.x * cosine + delta.y * sine,
+                          -delta.x * sine + delta.y * cosine);
+    float2 uv = local / (stamp.centerRadius.z * 2.0) + 0.5;
+    if (any(uv < 0.0) || any(uv > 1.0)) return 0.0;
+
+
+    float2 samplePosition = uv * (kTerrainStampResolution - 1);
+    uint2 p0 = uint2(samplePosition);
+    uint2 p1 = min(p0 + 1, kTerrainStampResolution - 1);
+    float2 blend = frac(samplePosition);
+    float upper = lerp(LoadTerrainStamp(stamp.textureIndex, p0),
+                       LoadTerrainStamp(stamp.textureIndex, uint2(p1.x, p0.y)),
+                       blend.x);
+    float lower = lerp(LoadTerrainStamp(stamp.textureIndex, uint2(p0.x, p1.y)),
+                       LoadTerrainStamp(stamp.textureIndex, p1), blend.x);
+    float height = lerp(upper, lower, blend.y) * 2.0 - 1.0;
+    float edge = 1.0 - smoothstep(0.82, 1.0,
+        max(abs(local.x), abs(local.y)) / stamp.centerRadius.z);
+    return float2(height * stamp.value * edge, edge);
+}
 
 struct TerrainPayload {
     float2 originXZ[32];   // world min-corner of the tile
@@ -136,7 +184,36 @@ static const float2 kStressPadCenters[8] = {
     float2(  0.0, -42.0), float2(42.0, -42.0)
 };
 
+// Applies every live sculpt stamp to an already-shaped ground height. Shared by
+// the procedural island and the flat authoring plane so the two cannot drift.
+// Must match the sculpt loop in TerrainRendererDX12::HeightAt.
+float ApplySculpt(float h, float2 xz) {
+    for (uint stampIndex = 0; stampIndex < sculptCount; ++stampIndex) {
+        TerrainSculptStamp stamp = terrainSculpt[stampIndex];
+        if (stamp.operation == 2) {
+            // Additive gives h + relief, replace gives baseHeight + relief, and
+            // `replace` cross-fades between them under the same edge feather.
+            float2 sampled = SampleTerrainStamp(stamp, xz);
+            h += sampled.x + (stamp.baseHeight - h) * (sampled.y * stamp.replace);
+            continue;
+        }
+        float weight = saturate(1.0 -
+            length(xz - stamp.centerRadius.xy) / stamp.centerRadius.z);
+        weight = weight * weight * (3.0 - 2.0 * weight);
+        if (stamp.operation == 0)
+            h += stamp.value * weight;
+        else
+            h = lerp(h, stamp.value, saturate(stamp.strength * weight));
+    }
+    return h;
+}
+
 float TerrainHeight(float2 xz) {
+    // Flat authoring plane (style bit 2). Returns before the relief, the pool
+    // basin and the coast falloff, so the only thing that can move the ground
+    // is a sculpt stamp. kLandLift keeps it at the island's natural ground
+    // level, which is where the building pads and spawns already sit.
+    if ((terrainStyle & 4u) != 0u) return ApplySculpt(kLandLift, xz);
     float h = fbm(xz * 0.08) * heightScale;
     // Optional relief detail. The base fbm runs at a single 0.08 frequency, so
     // everything varies at one scale -- no broad landforms and no fine surface
@@ -196,17 +273,7 @@ float TerrainHeight(float2 xz) {
             kPadRadius, kPadFade, length(xz - kStressPadCenters[i]));
         h = lerp(h, kPadHeight, pad);
     }
-    for (uint stampIndex = 0; stampIndex < sculptCount; ++stampIndex) {
-        TerrainSculptStamp stamp = terrainSculpt[stampIndex];
-        float weight = saturate(1.0 -
-            length(xz - stamp.centerRadius.xy) / stamp.centerRadius.z);
-        weight = weight * weight * (3.0 - 2.0 * weight);
-        if (stamp.operation == 0)
-            h += stamp.value * weight;
-        else
-            h = lerp(h, stamp.value, saturate(stamp.strength * weight));
-    }
-    return h;
+    return ApplySculpt(h, xz);
 }
 
 // k-th vertex along the tile perimeter, counterclockwise, k in [0, 4n).

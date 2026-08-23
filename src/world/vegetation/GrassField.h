@@ -105,10 +105,9 @@ public:
     //
     // The map is the same RGBA the terrain resolve samples: channels are
     // (grass, dirt, sand, rock) and an untouched texel is (0,0,0,0). That zero
-    // is what keeps unpainted levels bit-identical -- coverage is 0 there, so
-    // SplatDensity returns 1 and the procedural scatter passes through
-    // unchanged. Where the artist HAS painted, the grass channel's share of the
-    // painted total becomes the density multiplier: paint rock and grass stops.
+    // is what lets the procedural terrain weights pass through unchanged. Where
+    // the artist HAS painted, those weights blend toward the authored channels:
+    // paint rock and foliage stops growing there.
     //
     // Set before Initialize; the scatter is baked once, so repainting requires
     // an environment rebuild, exactly as moving a building exclusion does.
@@ -132,13 +131,15 @@ public:
     void Initialize(std::function<float(float, float)> sampler,
                     float span = 90.0f, int count = 12000, float waterY = 0.0f,
                     const std::vector<Exclusion>& exclusions = {},
-                    const std::vector<AuthoredPatch>& authoredPatches = {}) {
+                    const std::vector<AuthoredPatch>& authoredPatches = {},
+                    bool showAuthoredPaths = false) {
         Shutdown();
         if (!sampler) return;
         m_terrain = std::move(sampler);
         m_waterY = waterY;
         m_exclusions = exclusions;
         m_authoredPatches = authoredPatches;
+        m_showAuthoredPaths = showAuthoredPaths;
 
         BuildBlades(span, count);
         if (m_blades.empty()) return;
@@ -261,6 +262,13 @@ public:
     }
     bool IsInitialized() const { return m_ready; }
 
+    // Density is non-zero only where grass is the dominant rendered terrain
+    // layer. Dandelions share this query so every kind of ground foliage obeys
+    // the same terrain-material boundary as the blade scatter.
+    float TerrainGrassDensity(float x, float z) const {
+        return m_terrain ? GrassTerrainDensity(x, z) : 0.0f;
+    }
+
     // Wind controls, surfaced to the UI.
     float& WindStrength() { return m_windStrength; }
     float& WindSpeed()    { return m_windSpeed; }
@@ -371,17 +379,69 @@ private:
         return (float)((s >> 8) & 0xFFFFFF) / (float)0x1000000;
     }
 
-    // Can a tuft grow here? Rejects the sea, the wet sand at the waterline, and
-    // any face too steep to hold grass (slope from a central difference on the
-    // same sampler the terrain is drawn from, so the test matches what you see).
-    // Density multiplier from the painted splatmap at (x, z), in [0, 1].
-    //
-    // Uses the same world->UV frame as the terrain resolve and the paint brush:
-    // u = x / (2 * halfExtent) + 0.5. Bilinear, because the brush lays down a
-    // feathered edge and point sampling would turn that gradient into a
-    // 512-texel staircase along every painted boundary.
-    float SplatDensity(float x, float z) const {
-        if (m_splatResolution == 0) return 1.0f;
+    static float SmoothStep(float edge0, float edge1, float value) {
+        const float t = std::clamp(
+            (value - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    // CPU copy of MatVarNoise/TerrainBlendNoise. Foliage is baked at load time,
+    // so matching the terrain's deterministic layer noise avoids a texture
+    // read or per-frame material test for every blade.
+    static uint32_t MatVarHashUint(uint32_t value) {
+        value ^= value >> 16;
+        value *= 0x7feb352du;
+        value ^= value >> 15;
+        value *= 0x846ca68bu;
+        value ^= value >> 16;
+        return value;
+    }
+
+    static float MatVarHash(int32_t x, int32_t y, int32_t z) {
+        const uint32_t yz = MatVarHashUint(
+            static_cast<uint32_t>(y) +
+            MatVarHashUint(static_cast<uint32_t>(z)));
+        const uint32_t value = MatVarHashUint(
+            static_cast<uint32_t>(x) ^ (yz + 0x9e3779b9u));
+        return static_cast<float>(value & 0x00ffffffu) *
+               (1.0f / 16777216.0f);
+    }
+
+    static float MatVarNoise(float x, float y, float z) {
+        const int32_t ix = static_cast<int32_t>(std::floor(x));
+        const int32_t iy = static_cast<int32_t>(std::floor(y));
+        const int32_t iz = static_cast<int32_t>(std::floor(z));
+        float fx = x - std::floor(x);
+        float fy = y - std::floor(y);
+        float fz = z - std::floor(z);
+        fx = fx * fx * (3.0f - 2.0f * fx);
+        fy = fy * fy * (3.0f - 2.0f * fy);
+        fz = fz * fz * (3.0f - 2.0f * fz);
+        const float n00 = MatVarHash(ix, iy, iz) +
+            (MatVarHash(ix + 1, iy, iz) - MatVarHash(ix, iy, iz)) * fx;
+        const float n10 = MatVarHash(ix, iy + 1, iz) +
+            (MatVarHash(ix + 1, iy + 1, iz) - MatVarHash(ix, iy + 1, iz)) * fx;
+        const float n01 = MatVarHash(ix, iy, iz + 1) +
+            (MatVarHash(ix + 1, iy, iz + 1) - MatVarHash(ix, iy, iz + 1)) * fx;
+        const float n11 = MatVarHash(ix, iy + 1, iz + 1) +
+            (MatVarHash(ix + 1, iy + 1, iz + 1) -
+             MatVarHash(ix, iy + 1, iz + 1)) * fx;
+        const float nearNoise = n00 + (n10 - n00) * fy;
+        const float farNoise = n01 + (n11 - n01) * fy;
+        return nearNoise + (farNoise - nearNoise) * fz;
+    }
+
+    static float TerrainBlendNoise(float x, float z) {
+        const float low = MatVarNoise(x * 0.075f, z * 0.075f, 3.17f);
+        const float high = MatVarNoise(x * 0.23f, z * 0.23f, 11.4f);
+        return low * 0.72f + high * 0.28f;
+    }
+
+    // Bilinearly samples the raw UNORM channels before applying the painted
+    // override, matching the clamp sampler and lerp in TerrainVBLayerWeights.
+    void ApplyPaintedWeights(float x, float z, float& grass, float& dirt,
+                             float& sand, float& rock) const {
+        if (m_splatResolution == 0) return;
         const float u = (x / (2.0f * m_splatHalfExtentX) + 0.5f) *
                         m_splatResolution - 0.5f;
         const float v = (z / (2.0f * m_splatHalfExtentZ) + 0.5f) *
@@ -394,34 +454,91 @@ private:
         const float fx = std::clamp(u - std::floor(u), 0.0f, 1.0f);
         const float fz = std::clamp(v - std::floor(v), 0.0f, 1.0f);
 
-        // Bilinear over the density each corner implies, rather than over raw
-        // channels: the ratio below is non-linear, so filtering the inputs and
-        // filtering the results are not the same thing, and interpolating the
-        // final density is what keeps a feathered edge reading as a ramp.
-        const auto texelDensity = [&](int tx, int tz) {
-            const uint8_t* texel = &m_splat[
-                (static_cast<size_t>(tz) * m_splatResolution + tx) * 4u];
-            const float grass = texel[0] * (1.0f / 255.0f);
-            const float dirt  = texel[1] * (1.0f / 255.0f);
-            const float sand  = texel[2] * (1.0f / 255.0f);
-            const float rock  = texel[3] * (1.0f / 255.0f);
-            const float total = grass + dirt + sand + rock;
-            // Unpainted texel: no opinion, keep the procedural scatter.
-            if (total <= kSplatCoverageEpsilon) return 1.0f;
-            const float coverage = std::min(1.0f,
-                std::max(std::max(grass, dirt), std::max(sand, rock)));
-            // Blend from "procedural" to "what was painted" by how strongly the
-            // texel was painted, matching how the resolve lerps its weights.
-            return 1.0f + (grass / total - 1.0f) * coverage;
+        const auto channel = [&](int tx, int tz, size_t component) {
+            return m_splat[(static_cast<size_t>(tz) * m_splatResolution + tx) *
+                           4u + component] * (1.0f / 255.0f);
         };
-        const float d00 = texelDensity(x0, z0), d10 = texelDensity(x1, z0);
-        const float d01 = texelDensity(x0, z1), d11 = texelDensity(x1, z1);
-        return std::clamp(
-            (d00 + (d10 - d00) * fx) +
-            ((d01 + (d11 - d01) * fx) - (d00 + (d10 - d00) * fx)) * fz,
-            0.0f, 1.0f);
+        const auto sample = [&](size_t component) {
+            const float top = channel(x0, z0, component) +
+                (channel(x1, z0, component) - channel(x0, z0, component)) * fx;
+            const float bottom = channel(x0, z1, component) +
+                (channel(x1, z1, component) - channel(x0, z1, component)) * fx;
+            return top + (bottom - top) * fz;
+        };
+        const float paintedGrass = sample(0);
+        const float paintedDirt = sample(1);
+        const float paintedSand = sample(2);
+        const float paintedRock = sample(3);
+        const float total = paintedGrass + paintedDirt + paintedSand + paintedRock;
+        const float coverage = (std::max)({
+            paintedGrass, paintedDirt, paintedSand, paintedRock });
+        if (coverage <= kSplatCoverageEpsilon || total <= 0.0f) return;
+        const float blend = std::clamp(coverage, 0.0f, 1.0f);
+        grass += (paintedGrass / total - grass) * blend;
+        dirt += (paintedDirt / total - dirt) * blend;
+        sand += (paintedSand / total - sand) * blend;
+        rock += (paintedRock / total - rock) * blend;
     }
 
+    // Mirrors TerrainLayerWeights/TerrainVBLayerWeights through the normalized
+    // layer weights. Height-blend texture samples are deliberately excluded:
+    // they add centimetre-scale interlock inside the same material region and
+    // are not a stable place to decide whether a plant can grow.
+    float GrassTerrainDensity(float x, float z) const {
+        constexpr float e = 0.35f;
+        const float y = m_terrain(x, z);
+        const float nx = m_terrain(x - e, z) - m_terrain(x + e, z);
+        const float ny = 2.0f * e;
+        const float nz = m_terrain(x, z - e) - m_terrain(x, z + e);
+        const float normalY = ny / std::sqrt(nx * nx + ny * ny + nz * nz);
+        const float slope = 1.0f - std::clamp(std::abs(normalY), 0.0f, 1.0f);
+        const float noise = TerrainBlendNoise(x, z);
+        const float noisyHeight = y + (noise - 0.5f) * 1.5f;
+
+        float rock = SmoothStep(0.30f, 0.68f,
+            slope + (noise - 0.5f) * 0.12f);
+        const float flat = 1.0f - SmoothStep(0.18f, 0.52f, slope);
+        const float beachCore =
+            (1.0f - SmoothStep(0.80f, 1.20f, y)) * flat;
+        const float beachTransition =
+            (1.0f - SmoothStep(0.75f, 2.25f, noisyHeight)) * flat;
+        float sand = (std::max)(beachCore, beachTransition);
+        float grass = SmoothStep(1.45f, 2.35f, noisyHeight) * flat;
+        float dirt = 0.08f + SmoothStep(0.58f, 0.79f, noise) * 0.40f * flat +
+                     SmoothStep(0.12f, 0.46f, slope) * 0.32f;
+
+        if (m_showAuthoredPaths) {
+            const float axisDistance = (std::min)(std::abs(x), std::abs(z));
+            const float pathReach = (std::max)(std::abs(x), std::abs(z));
+            float path = (1.0f - SmoothStep(0.72f, 1.28f, axisDistance)) *
+                         (1.0f - SmoothStep(13.2f, 15.5f, pathReach));
+            path *= 0.82f + TerrainBlendNoise(
+                x * 1.8f + 29.0f, z * 1.8f + 29.0f) * 0.18f;
+            grass *= 1.0f - path * 0.92f;
+            dirt += path * 2.6f;
+        }
+
+        sand *= 1.0f - rock;
+        dirt *= (1.0f - rock) * (1.0f - sand);
+        grass *= (1.0f - rock) * (1.0f - sand);
+        grass = std::pow(grass + 0.0001f, 1.35f);
+        dirt = std::pow(dirt + 0.0001f, 1.35f);
+        sand = std::pow(sand + 0.0001f, 1.35f);
+        rock = std::pow(rock + 0.0001f, 1.35f);
+        const float total = grass + dirt + sand + rock;
+        grass /= total;
+        dirt /= total;
+        sand /= total;
+        rock /= total;
+        ApplyPaintedWeights(x, z, grass, dirt, sand, rock);
+
+        const float nonGrass = (std::max)({ dirt, sand, rock });
+        return grass > nonGrass ? std::clamp(grass, 0.0f, 1.0f) : 0.0f;
+    }
+
+    // Can a tuft grow here? Rejects the sea, the wet sand at the waterline, and
+    // any face too steep to hold grass (slope from a central difference on the
+    // same sampler the terrain is drawn from, so the test matches what you see).
     bool Plantable(float x, float z) const {
         if (Excluded(x, z)) return false;
         const float y = m_terrain(x, z);
@@ -488,11 +605,8 @@ private:
             const float macroDensity = 0.76f + 0.24f *
                 (densityShape * densityShape *
                  (3.0f - 2.0f * densityShape));
-            // The painted map multiplies the procedural density rather than
-            // replacing it, so painting rock thins grass out to nothing while
-            // painted grass still respects slope, waterline and exclusions.
-            const float paintedDensity = SplatDensity(cx, cz);
-            if (Rand(seed) > radialDensity * macroDensity * paintedDensity)
+            const float terrainDensity = GrassTerrainDensity(cx, cz);
+            if (Rand(seed) > radialDensity * macroDensity * terrainDensity)
                 continue;
 
             // Test the CLUMP's centre once, not every blade: if the middle of the
@@ -506,11 +620,10 @@ private:
                 const float x = cx + std::cos(a) * r;
                 const float z = cz + std::sin(a) * r;
                 if (Excluded(x, z)) continue;
-                // A tuft is ~0.35 m across, wide enough to straddle a painted
-                // boundary. Re-testing per blade keeps the edge of a painted
-                // rock patch crisp instead of leaving whole tufts hanging over
-                // it because their centre happened to land on grass.
-                if (Rand(seed) > SplatDensity(x, z)) continue;
+                // A tuft is ~0.35 m across, wide enough to straddle a material
+                // boundary. Re-testing per blade keeps dirt, sand, and rock
+                // clean instead of leaving the whole tuft on the grass side.
+                if (Rand(seed) > GrassTerrainDensity(x, z)) continue;
                 const float y = m_terrain(x, z);
                 if (y < m_waterY + kShoreMargin) continue;
 
@@ -560,6 +673,7 @@ private:
                 const float clusterRadius = std::sqrt(Rand(patchSeed)) * radius;
                 const float cx = patch.x + std::cos(clusterAngle) * clusterRadius;
                 const float cz = patch.z + std::sin(clusterAngle) * clusterRadius;
+                if (Rand(patchSeed) > GrassTerrainDensity(cx, cz)) continue;
                 if (!Plantable(cx, cz)) continue;
                 for (int i = 0; i < kBladesPerTuft; ++i) {
                     const float angle = Rand(patchSeed) * XM_2PI;
@@ -567,6 +681,7 @@ private:
                     const float x = cx + std::cos(angle) * r;
                     const float z = cz + std::sin(angle) * r;
                     if (Excluded(x, z)) continue;
+                    if (Rand(patchSeed) > GrassTerrainDensity(x, z)) continue;
                     const float y = m_terrain(x, z);
                     if (y < m_waterY + kShoreMargin) continue;
                     Blade blade;
@@ -741,12 +856,12 @@ private:
     // no pixels and the field has no hard edge. Enforced in the vertex shader --
     // the geometry is static, so there is nothing to cull on the CPU. Runtime-
     // tunable (with kFadeBand and density) via the UI perf sliders.
-    float m_drawDistance = 32.0f;
+    float m_drawDistance = 60.0f;
     // Width of that shrink, so the fade edge does not read as a ring of grass
     // popping in and out as the player walks.
     float m_fadeBand = 6.0f;
     // Fraction of each cell's blades actually drawn (1 = all).
-    float m_density = 0.92f;
+    float m_density = 1.0f;
     // Sparse grass casters still produce visible cascade/cell bands across the
     // terrain. Keep blade lighting, but leave terrain shadowing to solid props.
     float m_shadowDensity = 0.28f;
@@ -785,6 +900,7 @@ private:
     uint32_t m_splatResolution = 0;
     float m_splatHalfExtentX = 1.0f;
     float m_splatHalfExtentZ = 1.0f;
+    bool m_showAuthoredPaths = false;
 
     float m_time = 0.0f;
     float m_waterY = 0.0f;

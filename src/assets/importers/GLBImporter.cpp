@@ -454,6 +454,25 @@ bool GLBImporter::LoadPixelsRGBA(const std::string& filepath,
     return true;
 }
 
+bool GLBImporter::LoadPixelsGray16(const std::string& filepath,
+    std::vector<uint16_t>& outGray, int& outWidth, int& outHeight) {
+    if (!stbi_is_16_bit(filepath.c_str())) {
+        std::cerr << "Heightmap is not 16-bit: " << filepath << std::endl;
+        return false;
+    }
+    int components = 0;
+    stbi_us* pixels = stbi_load_16(filepath.c_str(), &outWidth, &outHeight,
+                                   &components, 1);
+    if (!pixels) {
+        std::cerr << "Failed to load 16-bit heightmap: " << filepath << std::endl;
+        return false;
+    }
+    outGray.assign(pixels,
+        pixels + static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight));
+    stbi_image_free(pixels);
+    return true;
+}
+
 ComPtr<ID3D12Resource> GLBImporter::CreateTextureFromRGBA(ID3D12Device* device,
     ID3D12GraphicsCommandList* commandList, const std::vector<unsigned char>& rgba,
     int width, int height, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps) {

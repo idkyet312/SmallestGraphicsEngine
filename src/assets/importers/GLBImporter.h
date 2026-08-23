@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <memory>
 #include <vector>
@@ -97,6 +98,12 @@ public:
     static bool LoadPixelsRGBA(const std::string& filepath,
                                std::vector<unsigned char>& outRGBA,
                                int& outWidth, int& outHeight);
+
+    // Decodes a heightmap without quantising its authored 16-bit grayscale
+    // values through the normal RGBA8 texture path.
+    static bool LoadPixelsGray16(const std::string& filepath,
+                                 std::vector<uint16_t>& outGray,
+                                 int& outWidth, int& outHeight);
 
     // Same, for an encoded image already in memory -- e.g. a texture embedded
     // inside an FBX, whose authored path points at the exporter's machine and

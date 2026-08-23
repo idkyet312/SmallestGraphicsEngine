@@ -4,6 +4,7 @@
 #include "MeshShaderDX12.h" // MeshPSOSubobjectDX12 template + ShaderDX12
 #include "GLBImporter.h"
 #include "LevelDefinition.h"
+#include "TerrainStampLibrary.h"
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -25,9 +26,10 @@ public:
         float tileSize = 8.0f;
         float heightScale = 3.057f;
         // Distance at which tessellation starts dropping. Must sit past the
-        // half-span of ring 0 (G/2 * tileSize = 32 m at the 8-tile/8 m default)
-        // or the finest ring is already coarsening before the next ring takes
-        // over, which reads as detail vanishing a few metres from the camera.
+        // half-span of ring 0 (G/2 * tileSize = 24 m at the 12-tile/4 m clipmap
+        // default) or the finest ring is already coarsening before the next ring
+        // takes over, which reads as detail vanishing a few metres from the
+        // camera.
         float lodNear = 44.0f;
         float lodStep = 34.0f;
         float skirtDepth = 1.0f;
@@ -60,9 +62,14 @@ public:
         float x, z, radius;
         UINT operation;
         float value, strength;
-        float padding[2] = {};
+        UINT textureIndex = UINT_MAX;
+        float rotation = 0.0f;
+        float replace = 0.0f;
+        float baseHeight = 0.0f;
     };
-    static_assert(sizeof(SculptGPU) == 32);
+    // Must match TerrainSculptStamp in terrain_ms.hlsl -- a StructuredBuffer
+    // read with a mismatched stride silently shears every stamp after the first.
+    static_assert(sizeof(SculptGPU) == 40);
 
     ComPtr<ID3D12PipelineState> pso;
     ComPtr<ID3D12PipelineState> psoWireframe;
@@ -97,6 +104,8 @@ public:
     };
     std::vector<RetiredSplat> retiredSplatMaps_;
     std::array<ComPtr<ID3D12Resource>, FRAME_COUNT> sculptBuffers;
+    std::array<ComPtr<ID3D12Resource>, FRAME_COUNT> stampAtlasBuffers;
+    std::array<uint64_t, FRAME_COUNT> uploadedStampAtlasRevision_{};
     std::array<ComPtr<ID3D12Resource>, 3> terrainUploads;
     D3D12_GPU_DESCRIPTOR_HANDLE terrainTextureTable{};
     bool supported = false;
@@ -269,10 +278,20 @@ public:
         // explosion always leaves a hole instead of silently doing nothing.
         const size_t keep = (std::min)(stamps.size(), kMaxTerrainSculptStamps);
         s_sculptStamps.assign(stamps.end() - keep, stamps.end());
+        for (const TerrainSculptStamp& stamp : s_sculptStamps)
+            if (stamp.operation == TerrainSculptOperation::Heightmap)
+                EnsureHeightStampLoaded(stamp.texture);
         m_sculptMaxDisplacement = 0.0f;
         for (const TerrainSculptStamp& stamp : s_sculptStamps) {
-            if (stamp.operation == TerrainSculptOperation::Add)
+            if (stamp.operation == TerrainSculptOperation::Add ||
+                (stamp.operation == TerrainSculptOperation::Heightmap &&
+                 stamp.replace <= 0.0f))
                 m_sculptMaxDisplacement += std::abs(stamp.value);
+            else if (stamp.operation == TerrainSculptOperation::Heightmap)
+                // A replace stamp pulls the ground all the way to baseHeight,
+                // so its reach is that offset plus the relief, not just value.
+                m_sculptMaxDisplacement = (std::max)(m_sculptMaxDisplacement,
+                    std::abs(stamp.baseHeight) + std::abs(stamp.value) + 12.0f);
             else
                 m_sculptMaxDisplacement = (std::max)(m_sculptMaxDisplacement,
                     std::abs(stamp.value) + 12.0f);
@@ -293,6 +312,14 @@ public:
     // clipmap bit was set; always test the bit.
     static constexpr UINT kStyleStressIsland = 1u;
     static constexpr UINT kStyleClipmap = 2u;
+    // bit 2 (4) = flat authoring plane: skip the fbm relief, the pool basin and
+    // the coast falloff so the ground is a level plane to sculpt on. Packed as
+    // a style bit because Params is pinned to 16 DWORDs by the root-constant
+    // upload and has no spare slot for another field.
+    static constexpr UINT kStyleFlat = 4u;
+    static bool IsFlat(UINT terrainStyle) {
+        return (terrainStyle & kStyleFlat) != 0u;
+    }
     static bool IsStressIsland(UINT terrainStyle) {
         return (terrainStyle & kStyleStressIsland) != 0u;
     }
@@ -355,6 +382,14 @@ public:
             const float maxZ = minZ + params.tilesZ * params.tileSize;
             if (x < minX || x >= maxX || z < minZ || z >= maxZ) return 0.0f;
         }
+
+        // Flat authoring plane: skip every procedural landform and let the
+        // sculpt stamps be the only thing that shapes the ground. Mirrors the
+        // early-out in terrain_ms.hlsl's TerrainHeight -- collision is sampled
+        // from here while the surface is displaced there, so the two branches
+        // have to appear at the same point in the chain.
+        if (IsFlat(params.terrainStyle))
+            return ApplySculpt(2.5f /* landLift */, x, z, sculpt);
 
         float px = x * 0.08f, py = z * 0.08f;
         float sum = 0.0f, amp = 0.5f;
@@ -471,7 +506,26 @@ public:
             float pad = 1.0f - pt * pt * (3.0f - 2.0f * pt);
             h = h + (padHeight - h) * pad;
         }
+        return ApplySculpt(h, x, z, sculpt);
+    }
+
+    // Applies every live sculpt stamp to an already-shaped ground height.
+    // Shared by the procedural island and the flat authoring plane so the two
+    // cannot drift. Must match ApplySculpt in terrain_ms.hlsl.
+    static float ApplySculpt(float h, float x, float z,
+        const std::vector<TerrainSculptStamp>& sculpt) {
         for (const TerrainSculptStamp& stamp : sculpt) {
+            if (stamp.operation == TerrainSculptOperation::Heightmap) {
+                float relief = 0.0f, coverage = 0.0f;
+                SampleHeightStamp(stamp, x, z, relief, coverage);
+                // Additive adds relief on top of the ground; replace swaps the
+                // ground for baseHeight + relief. Both fade out with the same
+                // edge coverage, so a replace stamp blends into the terrain
+                // around it instead of leaving a cliff at its border.
+                const float blend = coverage * stamp.replace;
+                h = h + relief + (stamp.baseHeight - h) * blend;
+                continue;
+            }
             const float dx = x - stamp.x;
             const float dz = z - stamp.z;
             const float distance = sqrtf(dx * dx + dz * dz);
@@ -489,6 +543,7 @@ public:
     }
 
     bool CreateSculptBuffers() {
+        EnsureStampLibrary();
         D3D12_HEAP_PROPERTIES heap = {};
         heap.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC desc = {};
@@ -506,6 +561,15 @@ public:
                     IID_PPV_ARGS(&sculptBuffers[frame])))) return false;
             UploadSculptStamps(frame);
         }
+        desc.Width = static_cast<UINT64>(kMaxTerrainStampTextures) *
+            kTerrainStampResolution * kTerrainStampResolution * sizeof(uint16_t);
+        for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
+            if (FAILED(g_dx12.device->CreateCommittedResource(&heap,
+                    D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    IID_PPV_ARGS(&stampAtlasBuffers[frame])))) return false;
+            UploadStampAtlas(frame);
+        }
         return true;
     }
 
@@ -518,9 +582,26 @@ public:
         for (size_t i = 0; i < s_sculptStamps.size(); ++i) {
             const TerrainSculptStamp& source = s_sculptStamps[i];
             destination[i] = { source.x, source.z, source.radius,
-                static_cast<UINT>(source.operation), source.value, source.strength };
+                static_cast<UINT>(source.operation), source.value, source.strength,
+                FindHeightStampLayer(source.texture), source.rotation,
+                source.replace, source.baseHeight };
         }
         sculptBuffers[frame]->Unmap(0, nullptr);
+    }
+
+    void UploadStampAtlas(UINT frame) {
+        if (frame >= FRAME_COUNT || !stampAtlasBuffers[frame] ||
+            uploadedStampAtlasRevision_[frame] == s_stampAtlasRevision)
+            return;
+        void* destination = nullptr;
+        D3D12_RANGE readRange{ 0, 0 };
+        if (FAILED(stampAtlasBuffers[frame]->Map(0, &readRange, &destination)))
+            return;
+        const size_t bytes = s_stampAtlas.size() * sizeof(uint16_t);
+        std::memcpy(destination, s_stampAtlas.data(), bytes);
+        D3D12_RANGE writtenRange{ 0, bytes };
+        stampAtlasBuffers[frame]->Unmap(0, &writtenRange);
+        uploadedStampAtlasRevision_[frame] = s_stampAtlasRevision;
     }
 
     bool CreateTextureArray(const std::vector<uint8_t>& pixels, UINT side,
@@ -1036,9 +1117,12 @@ public:
         drawParams.sculptCount = static_cast<UINT>(s_sculptStamps.size());
         drawParams.sculptMaxDisplacement = m_sculptMaxDisplacement;
         UploadSculptStamps(g_dx12.frameIndex);
+        UploadStampAtlas(g_dx12.frameIndex);
         commandList6->SetGraphicsRoot32BitConstants(8, 16, &drawParams, 0);
         commandList6->SetGraphicsRootShaderResourceView(
             13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
+        commandList6->SetGraphicsRootShaderResourceView(
+            14, stampAtlasBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
         commandList6->DispatchMesh((TileCount(params) + 31) / 32, 1, 1);
     }
 
@@ -1079,9 +1163,12 @@ public:
         drawParams.sculptCount = static_cast<UINT>(s_sculptStamps.size());
         drawParams.sculptMaxDisplacement = m_sculptMaxDisplacement;
         UploadSculptStamps(g_dx12.frameIndex);
+        UploadStampAtlas(g_dx12.frameIndex);
         commandList6->SetGraphicsRoot32BitConstants(8, 16, &drawParams, 0);
         commandList6->SetGraphicsRootShaderResourceView(
             13, sculptBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
+        commandList6->SetGraphicsRootShaderResourceView(
+            14, stampAtlasBuffers[g_dx12.frameIndex]->GetGPUVirtualAddress());
         commandList6->DispatchMesh((TileCount(params) + 31) / 32, 1, 1);
         return true;
     }
@@ -1100,7 +1187,135 @@ public:
     }
 
 private:
+    static void EnsureStampLibrary() {
+        if (!s_stampNames.empty() || !s_stampAtlas.empty()) return;
+        s_stampNames = DiscoverTerrainStampNames();
+        s_stampLoadState.assign(s_stampNames.size(), 0u);
+        s_stampAtlas.assign(static_cast<size_t>(kMaxTerrainStampTextures) *
+            kTerrainStampResolution * kTerrainStampResolution, 32768u);
+    }
+
+    static UINT FindHeightStampLayer(const std::string& texture) {
+        EnsureStampLibrary();
+        const auto found = std::lower_bound(
+            s_stampNames.begin(), s_stampNames.end(), texture);
+        if (found == s_stampNames.end() || *found != texture)
+            return UINT_MAX;
+        const size_t layer = static_cast<size_t>(found - s_stampNames.begin());
+        return s_stampLoadState[layer] == 1u ? static_cast<UINT>(layer) : UINT_MAX;
+    }
+
+    static UINT EnsureHeightStampLoaded(const std::string& texture) {
+        EnsureStampLibrary();
+        if (!IsTerrainStampFilename(texture)) return UINT_MAX;
+        const auto found = std::lower_bound(
+            s_stampNames.begin(), s_stampNames.end(), texture);
+        if (found == s_stampNames.end() || *found != texture) return UINT_MAX;
+        const size_t layer = static_cast<size_t>(found - s_stampNames.begin());
+        if (s_stampLoadState[layer] == 1u) return static_cast<UINT>(layer);
+        if (s_stampLoadState[layer] == 2u) return UINT_MAX;
+
+        std::vector<uint16_t> source;
+        int width = 0, height = 0;
+        const std::filesystem::path path = TerrainStampDirectory() / texture;
+        if (!GLBImporter::LoadPixelsGray16(path.string(), source, width, height) ||
+            width <= 0 || height <= 0) {
+            s_stampLoadState[layer] = 2u;
+            return UINT_MAX;
+        }
+
+        const size_t layerOffset = layer * kTerrainStampResolution *
+            kTerrainStampResolution;
+        // Box filter over each output texel's exact source footprint. This used
+        // to take a fixed 4x4 stratified tap, which was sized for 4096->256; at
+        // 512 that covers a quarter of the 8x8 footprint and starts aliasing
+        // again. Averaging the real footprint stays correct whatever the source
+        // dimensions and atlas resolution are, and first use of a stamp reads
+        // each source texel exactly once.
+        for (uint32_t y = 0; y < kTerrainStampResolution; ++y) {
+            const int y0 = static_cast<int>(static_cast<uint64_t>(y) * height /
+                                            kTerrainStampResolution);
+            const int y1 = (std::max)(y0 + 1,
+                static_cast<int>(static_cast<uint64_t>(y + 1) * height /
+                                 kTerrainStampResolution));
+            for (uint32_t x = 0; x < kTerrainStampResolution; ++x) {
+                const int x0 = static_cast<int>(static_cast<uint64_t>(x) * width /
+                                                kTerrainStampResolution);
+                const int x1 = (std::max)(x0 + 1,
+                    static_cast<int>(static_cast<uint64_t>(x + 1) * width /
+                                     kTerrainStampResolution));
+                uint64_t sum = 0;
+                uint32_t count = 0;
+                for (int sy = y0; sy < y1 && sy < height; ++sy) {
+                    for (int sx = x0; sx < x1 && sx < width; ++sx) {
+                        sum += source[static_cast<size_t>(sy) * width + sx];
+                        ++count;
+                    }
+                }
+                s_stampAtlas[layerOffset +
+                    static_cast<size_t>(y) * kTerrainStampResolution + x] =
+                    count ? static_cast<uint16_t>((sum + count / 2) / count)
+                          : uint16_t{ 32768u };
+            }
+        }
+        s_stampLoadState[layer] = 1u;
+        ++s_stampAtlasRevision;
+        return static_cast<UINT>(layer);
+    }
+
+    // outRelief is the stamp's displacement in metres; outCoverage is how much
+    // of the square this point is inside (1 in the middle, feathering to 0 at
+    // the border). Replace mode needs the coverage separately -- it has to know
+    // where the stamp *is*, not just how tall it is, so flat parts of a
+    // heightmap still overwrite the ground under them.
+    static void SampleHeightStamp(const TerrainSculptStamp& stamp,
+                                  float x, float z,
+                                  float& outRelief, float& outCoverage) {
+        outRelief = 0.0f;
+        outCoverage = 0.0f;
+        const UINT layer = FindHeightStampLayer(stamp.texture);
+        if (layer == UINT_MAX || stamp.radius <= 0.0f) return;
+        const float angle = DirectX::XMConvertToRadians(stamp.rotation);
+        const float cosine = cosf(angle), sine = sinf(angle);
+        const float dx = x - stamp.x, dz = z - stamp.z;
+        const float localX = dx * cosine + dz * sine;
+        const float localZ = -dx * sine + dz * cosine;
+        const float u = localX / (stamp.radius * 2.0f) + 0.5f;
+        const float v = localZ / (stamp.radius * 2.0f) + 0.5f;
+        if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) return;
+
+        const float fx = u * (kTerrainStampResolution - 1u);
+        const float fy = v * (kTerrainStampResolution - 1u);
+        const uint32_t x0 = static_cast<uint32_t>(fx);
+        const uint32_t y0 = static_cast<uint32_t>(fy);
+        const uint32_t x1 = (std::min)(x0 + 1u, kTerrainStampResolution - 1u);
+        const uint32_t y1 = (std::min)(y0 + 1u, kTerrainStampResolution - 1u);
+        const size_t base = static_cast<size_t>(layer) *
+            kTerrainStampResolution * kTerrainStampResolution;
+        const auto texel = [&](uint32_t tx, uint32_t ty) {
+            return static_cast<float>(s_stampAtlas[base +
+                static_cast<size_t>(ty) * kTerrainStampResolution + tx]);
+        };
+        const float tx = fx - x0, ty = fy - y0;
+        const float upper = texel(x0, y0) +
+            (texel(x1, y0) - texel(x0, y0)) * tx;
+        const float lower = texel(x0, y1) +
+            (texel(x1, y1) - texel(x0, y1)) * tx;
+        const float normalized = (upper + (lower - upper) * ty) /
+            65535.0f * 2.0f - 1.0f;
+        float edge = ((std::max)(std::abs(localX), std::abs(localZ)) /
+                      stamp.radius - 0.82f) / 0.18f;
+        edge = edge < 0.0f ? 0.0f : (edge > 1.0f ? 1.0f : edge);
+        edge = 1.0f - edge * edge * (3.0f - 2.0f * edge);
+        outCoverage = edge;
+        outRelief = normalized * stamp.value * edge;
+    }
+
     inline static std::vector<TerrainSculptStamp> s_sculptStamps;
+    inline static std::vector<std::string> s_stampNames;
+    inline static std::vector<uint8_t> s_stampLoadState;
+    inline static std::vector<uint16_t> s_stampAtlas;
+    inline static uint64_t s_stampAtlasRevision = 1;
     float m_sculptMaxDisplacement = 0.0f;
 };
 

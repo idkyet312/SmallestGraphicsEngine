@@ -711,6 +711,9 @@ static size_t ActiveBanditSlotCount() {
 TerrainRendererDX12::Params CurrentTerrainParams() {
     TerrainRendererDX12::Params params;
     params.detailRelief = scene.terrainDetailRelief ? 1u : 0u;
+    // Flat mode also silences the detail octaves: they are scaled by
+    // heightScale, but leaving them on would still ride any future relief.
+    if (scene.terrainFlat) params.detailRelief = 0u;
     if (g_stressTestMode) {
         params.islandScaleX = 2.0f;
         params.islandScaleZ = 2.0f;
@@ -749,11 +752,24 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
             (std::min)(scene.terrainIslandScaleX, 12.0f));
         params.islandScaleZ = (std::max)(0.5f,
             (std::min)(scene.terrainIslandScaleZ, 12.0f));
-        params.tileSize = 8.0f;                 // base ring tile size (full detail)
-        // 12 tiles per side puts ring 0's half-span at 12/2 * 8 = 48 m, so the
-        // full-detail ring covers the ~40 m the player actually looks at before
-        // the first tile-size doubling. At 8 it reached only 32 m, and the LOD
-        // ramp began inside that.
+        // 4 m base tiles at the mesh shader's 8 quads per side = 0.5 m per
+        // vertex in ring 0, twice the old 8 m/1 m sampling. Authored heightmap
+        // stamps carry detail far finer than 1 m, and at 1 vert/m the terrain
+        // simply could not represent it -- ridges came out as blobs.
+        //
+        // n cannot go the other way instead: 8 quads per side is already 192
+        // primitives, and D3D12 caps mesh shader output at 256 per group, so
+        // the density has to come from smaller tiles rather than denser ones.
+        params.tileSize = 4.0f;                 // base ring tile size (full detail)
+        // G stays at 12. Ring 0 now covers 12/2 * 4 = 24 m at 0.5 m/vertex and
+        // ring 1 covers out to 48 m at 8 m tiles -- which is exactly the old
+        // ring 0. So near detail doubles inside 24 m and nothing beyond it gets
+        // worse; the ring loop below just adds one ring to reach the shore
+        // (432 -> 576 tiles on a 1x island).
+        //
+        // Raising G to 24 to keep ring 0 at a 48 m half-span was the obvious
+        // move and the wrong one: ring cost is G^2, so it quadrupled the tile
+        // count (432 -> 1728) to buy detail at 40 m that nobody looks at.
         constexpr UINT kRingGrid = 12u;         // G: tiles per side of each ring
         params.tilesX = kRingGrid;
         // Enough rings so the outermost reaches past the island shore. Ring r
@@ -792,6 +808,10 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
             default: break;   // Full: keep the 44 m / 34 m defaults
         }
     }
+    // Applied after both branches: flat mode is orthogonal to island style and
+    // to the clipmap topology, so it ORs onto whichever they selected.
+    if (scene.terrainFlat)
+        params.terrainStyle |= TerrainRendererDX12::kStyleFlat;
     return params;
 }
 
@@ -6783,6 +6803,7 @@ static void ScatterDandelions(
             const float x = cx + std::cos(angle) * distance;
             const float z = cz + std::sin(angle) * distance;
             if (excluded(x, z)) continue;
+            if (random01() > g_grass.TerrainGrassDensity(x, z)) continue;
             const float y = terrainSampler(x, z);
             if (y < 0.22f) continue;
             const float hx = terrainSampler(x + 0.35f, z) -
@@ -6815,6 +6836,7 @@ static void ScatterDandelions(
                 entity.type != LevelEntityType::Dandelion) continue;
             const float x = entity.transform.position[0];
             const float z = entity.transform.position[2];
+            if (g_grass.TerrainGrassDensity(x, z) <= 0.0f) continue;
             const float y = terrainSampler(x, z);
             const float authoredScale = (std::max)(0.05f, entity.transform.scale[1]);
             const float targetHeight = 0.75f * authoredScale;
@@ -9232,7 +9254,8 @@ static void RebuildScalableEnvironment() {
     }
     g_grass.Initialize(terrainSampler,
         g_stressTestMode ? 200.0f : 100.0f,
-        g_stressTestMode ? 1600000 : 400000, 0.0f, grassExclusions, grassPatches);
+        g_stressTestMode ? 1600000 : 400000, 0.0f, grassExclusions, grassPatches,
+        !g_customLevelMode);
     ScatterDandelions(terrainSampler, grassExclusions);
     g_environmentInitialized = true;
     g_environmentStressMode = g_stressTestMode;
@@ -9367,6 +9390,7 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
     const RuntimeLevelPlan plan =
         LevelRuntimeBuilder::Build(g_game.world.Level());
     scene.terrainHeightScale = plan.terrainHeightScale;
+    scene.terrainFlat = plan.terrainFlat;
     scene.terrainTilesX = plan.terrainTilesX;
     scene.terrainTilesZ = plan.terrainTilesZ;
     scene.terrainIslandScaleX = plan.terrainIslandScaleX;

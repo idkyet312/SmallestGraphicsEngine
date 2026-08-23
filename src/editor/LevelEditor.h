@@ -39,6 +39,8 @@ struct LevelDXRDDGIStatus {
 class LevelEditor {
 public:
     void NewFromLevelOne();
+    // Discards the current level for an empty flat plane with one spawn.
+    void NewFlat();
     void BeginPlay();
     void StopPlay();
     bool IsPlaying() const { return playing_; }
@@ -178,6 +180,23 @@ private:
     float terrainBrushStrength_ = 0.45f;
     float terrainBrushSpacing_ = 1.0f;
     float terrainFlattenHeight_ = 0.0f;
+    std::vector<std::string> terrainStampNames_;
+    bool terrainStampLibraryScanned_ = false;
+    int terrainStampSelection_ = 0;
+    float terrainStampRadius_ = 16.0f;
+    float terrainStampHeight_ = 6.0f;
+    float terrainStampRotation_ = 0.0f;
+    // 0 = the stamp's relief is added to the ground, 1 = it replaces it.
+    float terrainStampReplace_ = 0.0f;
+    // Lifts or sinks a replace stamp's target plane relative to the ground the
+    // cursor is on, so a plateau can sit above the terrain it overwrites.
+    float terrainStampBaseOffset_ = 0.0f;
+    // Downsampled grayscale of the selected stamp, used to draw the heightmap
+    // inside the placement square. Cached by filename: decoding a 4K 16-bit PNG
+    // every frame the cursor moves would stall the editor.
+    std::string stampPreviewName_;
+    std::vector<float> stampPreviewHeights_;  // kStampPreviewGrid^2, 0..1
+    bool stampPreviewValid_ = false;
     // Which layer the paint brush writes: 0 grass, 1 dirt, 2 sand, 3 rock.
     int terrainPaintLayer_ = 3;
     // 0..1 weight deposited at the brush centre, feathering to 0 at the rim.

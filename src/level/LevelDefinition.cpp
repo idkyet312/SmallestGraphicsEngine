@@ -1,4 +1,5 @@
 #include "LevelDefinition.h"
+#include "TerrainStampLibrary.h"
 
 #include <cmath>
 #include <fstream>
@@ -117,6 +118,20 @@ bool ParseLevelInsertionMode(const std::string& text, LevelInsertionMode& mode) 
     return false;
 }
 
+LevelDefinition MakeFlatLevelTemplate() {
+    LevelDefinition level;
+    level.name = "Flat Level";
+    level.terrainFlat = true;
+    // The plane is level regardless, but zeroing the scale keeps the Inspector
+    // honest -- a non-zero Terrain Height on flat ground reads as a bug.
+    level.terrainHeightScale = 0.0f;
+    // One spawn and nothing else. A level with no PlayerSpawn fails validation,
+    // and there is nowhere to stand otherwise.
+    level.entities.push_back(MakeEntity(1, LevelEntityType::PlayerSpawn,
+        "Player Spawn", 0.0f, 5.0f, 0.0f, 0.0f));
+    return level;
+}
+
 LevelDefinition MakeLevelOneTemplate() {
     LevelDefinition level;
     level.name = "Level 1 Copy";
@@ -222,11 +237,17 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
     for (const TerrainSculptStamp& stamp : level.terrainSculpt) {
         if (!std::isfinite(stamp.x) || !std::isfinite(stamp.z) ||
             !std::isfinite(stamp.radius) || !std::isfinite(stamp.value) ||
-            !std::isfinite(stamp.strength) || stamp.radius < 0.1f ||
+            !std::isfinite(stamp.strength) || !std::isfinite(stamp.rotation) ||
+            !std::isfinite(stamp.replace) || !std::isfinite(stamp.baseHeight) ||
+            stamp.replace < 0.0f || stamp.replace > 1.0f ||
+            stamp.radius < 0.1f ||
             stamp.radius > 64.0f || stamp.strength < 0.0f ||
             stamp.strength > 10.0f ||
             (stamp.operation != TerrainSculptOperation::Add &&
-             stamp.operation != TerrainSculptOperation::Flatten))
+             stamp.operation != TerrainSculptOperation::Flatten &&
+             stamp.operation != TerrainSculptOperation::Heightmap) ||
+            (stamp.operation == TerrainSculptOperation::Heightmap &&
+             !IsTerrainStampFilename(stamp.texture)))
             result.errors.push_back("terrain contains an invalid sculpt stamp");
     }
     std::unordered_set<uint64_t> ids;
@@ -291,6 +312,9 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         level.terrainHeightScale = root.at("terrain").at("heightScale").get<float>();
         {
             const json& terrainRoot = root.at("terrain");
+            // Absent on every level authored before flat mode existed, and
+            // false is exactly the procedural island they were built as.
+            level.terrainFlat = terrainRoot.value("flat", false);
             level.terrainTilesX = terrainRoot.value("tilesX", 16u);
             level.terrainTilesZ = terrainRoot.value("tilesZ", 16u);
             // Back-compat: old files stored a single "islandScale"; use it as
@@ -341,9 +365,17 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
                 if (operation == "add") stamp.operation = TerrainSculptOperation::Add;
                 else if (operation == "flatten")
                     stamp.operation = TerrainSculptOperation::Flatten;
+                else if (operation == "stamp")
+                    stamp.operation = TerrainSculptOperation::Heightmap;
                 else throw std::runtime_error("unknown terrain sculpt operation: " + operation);
                 stamp.value = source.at("value").get<float>();
                 stamp.strength = source.value("strength", 1.0f);
+                stamp.texture = source.value("texture", std::string{});
+                stamp.rotation = source.value("rotation", 0.0f);
+                // Absent on levels saved before replace mode existed; those
+                // stamps were all additive, which is exactly what 0 means.
+                stamp.replace = source.value("replace", 0.0f);
+                stamp.baseHeight = source.value("baseHeight", 0.0f);
                 level.terrainSculpt.push_back(stamp);
             }
         }
@@ -444,12 +476,20 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
         }
         json sculpt = json::array();
         for (const TerrainSculptStamp& stamp : level.terrainSculpt) {
-            sculpt.push_back({
+            json saved = {
                 {"x", stamp.x}, {"z", stamp.z}, {"radius", stamp.radius},
                 {"operation", stamp.operation == TerrainSculptOperation::Flatten
-                    ? "flatten" : "add"},
+                    ? "flatten" : (stamp.operation == TerrainSculptOperation::Heightmap
+                        ? "stamp" : "add")},
                 {"value", stamp.value}, {"strength", stamp.strength}
-            });
+            };
+            if (stamp.operation == TerrainSculptOperation::Heightmap) {
+                saved["texture"] = stamp.texture;
+                saved["rotation"] = stamp.rotation;
+                saved["replace"] = stamp.replace;
+                saved["baseHeight"] = stamp.baseHeight;
+            }
+            sculpt.push_back(std::move(saved));
         }
         json foliageClear = json::array();
         for (const FoliageClearStamp& stamp : level.foliageClear) {
@@ -461,6 +501,7 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
             {"schemaVersion", level.schemaVersion}, {"name", level.name},
             {"insertionMode", LevelInsertionModeName(level.insertionMode)},
             {"terrain", {{"heightScale", level.terrainHeightScale},
+                         {"flat", level.terrainFlat},
                          {"tilesX", level.terrainTilesX},
                          {"tilesZ", level.terrainTilesZ},
                          {"islandScaleX", level.terrainIslandScaleX},

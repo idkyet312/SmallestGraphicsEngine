@@ -45,7 +45,8 @@ struct LevelEntity {
 
 enum class TerrainSculptOperation : uint32_t {
     Add = 0,
-    Flatten = 1
+    Flatten = 1,
+    Heightmap = 2
 };
 
 struct TerrainSculptStamp {
@@ -55,6 +56,20 @@ struct TerrainSculptStamp {
     TerrainSculptOperation operation = TerrainSculptOperation::Add;
     float value = 0.0f;
     float strength = 1.0f;
+    // Filename within TerrainStampDirectory. Kept relative so authored levels
+    // remain portable between the source tree and packaged Content folder.
+    std::string texture;
+    float rotation = 0.0f;
+    // Heightmap stamps only. 0 = additive (the stamp's relief is added on top
+    // of whatever ground is already there), 1 = replace (inside the stamp the
+    // ground *becomes* baseHeight + relief, erasing the procedural terrain).
+    // Values between cross-fade, so a half-replace stamp flattens the noise
+    // without fully cutting the island out.
+    float replace = 0.0f;
+    // World height the replace target is built around: the terrain height
+    // sampled where the stamp was placed. Stored rather than recomputed so a
+    // replace stamp stays put when a later stamp changes the ground under it.
+    float baseHeight = 0.0f;
 };
 
 // A circle where the automatically scattered ground cover is suppressed.
@@ -136,6 +151,14 @@ struct LevelDefinition {
     // up to the player; the other modes settle it in the level file.
     LevelInsertionMode insertionMode = LevelInsertionMode::Helicopter;
     float terrainHeightScale = 3.057f;
+    // Flat authoring mode: suppress every procedural landform -- the fbm relief,
+    // the pool basin carved near the origin, and the beach/seabed coast falloff
+    // -- leaving a level plane at kLandLift for sculpting from scratch.
+    //
+    // A separate flag rather than just terrainHeightScale = 0 because the pool
+    // and the coastline are not scaled by it: zeroing the height alone still
+    // leaves a 3 m crater near spawn and an island-shaped drop-off at the shore.
+    bool terrainFlat = false;
     // Island builder: terrain drawn extent (tile grid) and coastline scale. The
     // ocean is procedurally ringed around the land, so growing tiles + island
     // scale together makes a bigger island with more open water around it.
@@ -195,6 +218,8 @@ bool ParseLevelEntityType(const std::string& text, LevelEntityType& type);
 const char* LevelInsertionModeName(LevelInsertionMode mode);
 bool ParseLevelInsertionMode(const std::string& text, LevelInsertionMode& mode);
 LevelDefinition MakeLevelOneTemplate();
+// Empty level on a flat plane: one player spawn, no island and no props.
+LevelDefinition MakeFlatLevelTemplate();
 LevelValidationResult ValidateLevel(const LevelDefinition& level);
 LevelLoadResult LoadLevel(const std::filesystem::path& path);
 LevelSaveResult SaveLevel(const LevelDefinition& level,

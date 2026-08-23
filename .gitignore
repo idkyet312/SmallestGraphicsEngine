@@ -109,3 +109,10 @@ GPU*-screenshot.png
 # rebuildable from the script, and must never enter history.
 dist/
 dist-test/
+
+# Source heightmap stamps for the terrain Stamp tool: 52 4096x4096 16-bit PNGs,
+# ~825 MB. They are a third-party library, not engine source, and the loader
+# degrades gracefully when the folder is absent (DiscoverTerrainStampNames
+# returns empty and the Stamp tool reports "No stamps found"). Supply your own
+# copy under this path to author with them.
+Content/Textures/Stamps/

@@ -10,6 +10,20 @@ static int failures = 0;
     ++failures; } } while (false)
 
 int main() {
+    // The flat template must be a valid, spawnable level on its own: it is what
+    // the editor's "New Flat" button drops the user into.
+    {
+        const LevelDefinition flat = MakeFlatLevelTemplate();
+        CHECK(ValidateLevel(flat).ok);
+        CHECK(flat.terrainFlat);
+        CHECK(flat.entities.size() == 1);
+        CHECK(flat.entities.front().type == LevelEntityType::PlayerSpawn);
+        CHECK(flat.terrainSculpt.empty());
+    }
+    // Procedural levels must stay procedural: terrainFlat defaults off, so a
+    // level saved before the flag existed still loads as its island.
+    CHECK(!MakeLevelOneTemplate().terrainFlat);
+
     LevelDefinition level = MakeLevelOneTemplate();
     CHECK(ValidateLevel(level).ok);
     CHECK(level.entities.size() == 27);
@@ -43,6 +57,20 @@ int main() {
         TerrainSculptOperation::Add, 0.75f, 1.0f });
     level.terrainSculpt.push_back({ 0.0f, 1.0f, 4.0f,
         TerrainSculptOperation::Flatten, 2.5f, 0.6f });
+    TerrainSculptStamp heightmapStamp;
+    heightmapStamp.x = -7.0f;
+    heightmapStamp.z = 9.0f;
+    heightmapStamp.radius = 12.0f;
+    heightmapStamp.operation = TerrainSculptOperation::Heightmap;
+    heightmapStamp.value = 5.0f;
+    heightmapStamp.texture = "HM_Craters_01_Ex.PNG";
+    heightmapStamp.rotation = 35.0f;
+    heightmapStamp.replace = 0.75f;
+    heightmapStamp.baseHeight = 3.25f;
+    level.terrainSculpt.push_back(heightmapStamp);
+    // Flip off the default so the round-trip below actually proves the flag is
+    // written and read back, rather than comparing false to false.
+    level.terrainFlat = true;
     level.dxrDDGI.enabled = true;
     level.dxrDDGI.surfaceSpacing = 2.5f;
     level.dxrDDGI.surfaceOffset = 0.4f;
@@ -72,9 +100,19 @@ int main() {
     CHECK(ParseLevelEntityType("fern", legacyFoliage));
     CHECK(legacyFoliage == LevelEntityType::Dandelion);
     CHECK(std::string(LevelEntityTypeName(legacyFoliage)) == "dandelion");
-    CHECK(loaded.level.terrainSculpt.size() == 2);
+    CHECK(loaded.level.terrainSculpt.size() == 3);
     CHECK(loaded.level.terrainSculpt[1].operation ==
           TerrainSculptOperation::Flatten);
+    CHECK(loaded.level.terrainSculpt[2].operation ==
+          TerrainSculptOperation::Heightmap);
+    CHECK(loaded.level.terrainSculpt[2].texture == "HM_Craters_01_Ex.PNG");
+    CHECK(loaded.level.terrainSculpt[2].rotation == 35.0f);
+    CHECK(loaded.level.terrainFlat);
+    CHECK(loaded.level.terrainSculpt[2].replace == 0.75f);
+    CHECK(loaded.level.terrainSculpt[2].baseHeight == 3.25f);
+    // Additive is the default, so a stamp saved before replace mode existed
+    // must still load as the additive stamp it was authored as.
+    CHECK(loaded.level.terrainSculpt[0].replace == 0.0f);
     CHECK(loaded.level.dxrDDGI.enabled);
     CHECK(loaded.level.dxrDDGI.surfaceSpacing == 2.5f);
     CHECK(loaded.level.dxrDDGI.surfaceOffset == 0.4f);
@@ -107,6 +145,9 @@ int main() {
     LevelDefinition invalidSculpt = level;
     invalidSculpt.terrainSculpt[0].radius = 0.0f;
     CHECK(!ValidateLevel(invalidSculpt).ok);
+    LevelDefinition missingStampTexture = level;
+    missingStampTexture.terrainSculpt[2].texture.clear();
+    CHECK(!ValidateLevel(missingStampTexture).ok);
     LevelDefinition missingPrefabId = level;
     missingPrefabId.entities.back().prefabId.clear();
     CHECK(!ValidateLevel(missingPrefabId).ok);
