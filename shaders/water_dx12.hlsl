@@ -7,7 +7,7 @@ cbuffer WaterConstants : register(b0)
     float4 previousCameraTime;
     float4 screenParams;
     float4 volume0;       // center.x, surfaceY, center.z, isOcean
-    float4 volume1;       // halfX, halfZ, oceanHalfSpan, quality
+    float4 volume1;       // halfX, halfZ, deployment mode (2 = depth debug), quality
     float4 clipmapParams; // snappedCenter.xz, micro strength, roughness
     float4 opticalParams; // foam depth, crest threshold, max refraction px, SSR strength
     float4 absorption;
@@ -101,17 +101,29 @@ VSOutput VSMain(VSInput input)
     if (volume0.w > 0.5) {
         float2 currentXZ = input.position.xz + clipmapParams.xy;
         float2 previousXZ = input.position.xz + previousCameraTime.xy;
-        EvaluateOcean(currentXZ, cameraTime.w, currentPosition,
-                      currentNormal, currentCrest);
-        EvaluateOcean(previousXZ, previousCameraTime.w, previousPosition,
-                      previousNormal, previousCrest);
+        if (volume1.z > 0.5) {
+            // The deployment grid spans the whole ocean and stays geometrically
+            // flat. Its normals and foam crest are evaluated per pixel below,
+            // so no coarse displaced triangle can appear as an LOD ring.
+            currentPosition = float3(currentXZ.x, volume0.y, currentXZ.y);
+            previousPosition =
+                float3(previousXZ.x, volume0.y, previousXZ.y);
+            currentNormal = float3(0.0, 1.0, 0.0);
+            previousNormal = currentNormal;
+            currentCrest = 0.0;
+            previousCrest = 0.0;
+        } else {
+            EvaluateOcean(currentXZ, cameraTime.w, currentPosition,
+                          currentNormal, currentCrest);
+            EvaluateOcean(previousXZ, previousCameraTime.w, previousPosition,
+                          previousNormal, previousCrest);
+        }
 
-        // The last clipmap ring spans 128..420 m, far more per triangle than
-        // every inner ring. Preserve the exact inner-edge waves, then ease their
-        // geometric displacement out across that ring so coarse interpolation
-        // cannot reveal its square boundary. Per-pixel micro normals already
+        // The coarse ocean rings begin past 128 m. Preserve the exact inner-edge
+        // waves, then ease their geometric displacement out so interpolation
+        // cannot reveal a square ring boundary. Per-pixel micro normals already
         // perform their own footprint fade below.
-        if (input.tangent.w > 4.5) {
+        if (input.tangent.w > 4.5 && volume1.z < 0.5) {
             const float ringDistance = max(
                 abs(input.position.x), abs(input.position.z));
             const float waveFade =
@@ -292,16 +304,63 @@ PSOutput PSMain(VSOutput input)
     float2 uv = input.position.xy * screenParams.zw;
     float opaqueDepth = LoadOpaqueDepth(uv);
 
-    // Manual depth test permits sampling the same opaque depth surface while
-    // keeping water out of the main depth buffer.
-    clip(opaqueDepth - input.position.z - 0.00001);
     if (volume0.w > 0.5) {
         float2 fromCenter = abs(input.worldPosition.xz - volume0.xz);
         clip(volume1.xy - fromCenter);
     }
 
+    const bool deploymentOcean = volume0.w > 0.5 && volume1.z > 0.5;
+    const bool hasOpaqueDepth = opaqueDepth < 0.99999;
+    float deploymentDepthSeparation = 0.0;
+    if (deploymentOcean && hasOpaqueDepth) {
+        const float3 opaqueWorld = ReconstructWorld(uv, opaqueDepth);
+        deploymentDepthSeparation =
+            length(opaqueWorld - cameraTime.xyz) -
+            length(input.worldPosition - cameraTime.xyz);
+    }
+
+    if (deploymentOcean && volume1.z > 1.5) {
+        // Green is submerged terrain behind the ocean surface, red is dry land
+        // in front of it, and magenta has no opaque depth. This runs before the
+        // manual depth rejection so the diagnostic can show the pixels that
+        // would otherwise disappear.
+        output.color = !hasOpaqueDepth
+            ? float4(1.0, 0.02, 0.85, 1.0)
+            : deploymentDepthSeparation > 0.01
+                ? float4(0.05, 1.0, 0.12, 1.0)
+                : float4(1.0, 0.08, 0.02, 1.0);
+#ifdef WATER_MOTION_OUTPUT
+        output.motion = 0.0;
+#endif
+        return output;
+    }
+
+    // The ordinary view keeps its established nonlinear depth test. In the
+    // high deployment view, a 1e-5 device-depth bias spans metres across the
+    // shallow shelf and rejects water until the seabed is deep. Compare linear
+    // camera distances there so the tolerance remains one centimetre at every
+    // overview distance.
+    if (deploymentOcean) {
+        if (hasOpaqueDepth)
+            clip(deploymentDepthSeparation - 0.01);
+    } else {
+        clip(opaqueDepth - input.position.z - 0.00001);
+    }
+
     float3 viewDirection = normalize(cameraTime.xyz - input.worldPosition);
     float3 normal = normalize(input.normal);
+    float crest = input.crest;
+
+    // Deployment views cover the complete ocean from a high camera. Rebuild
+    // the analytic wave normal and crest per pixel there so outer clipmap
+    // triangles retain the same wave detail as ring 0 instead of interpolating
+    // one coarse vertex normal over many screen pixels. Gameplay keeps the
+    // cheaper vertex result and its distance fade.
+    if (volume0.w > 0.5 && volume1.z > 0.5) {
+        float3 evaluatedPosition;
+        EvaluateOcean(input.worldPosition.xz, cameraTime.w,
+                      evaluatedPosition, normal, crest);
+    }
 
     // Derivative-filtered capillary detail. Fine octaves disappear before they
     // alias, leaving stable broad swell toward the horizon.
@@ -448,7 +507,7 @@ PSOutput PSMain(VSOutput input)
     float shorelineBand = exp(
         -pow((thickness - 0.13) / max(opticalParams.x * 0.18, 0.07), 2.0));
     float crestFoam = smoothstep(
-        opticalParams.y, opticalParams.y + 0.28, input.crest) *
+        opticalParams.y, opticalParams.y + 0.28, crest) *
         foamNoise;
     float foam = saturate(
         shorelineBand * foamNoise * 0.72 + crestFoam * 0.58);

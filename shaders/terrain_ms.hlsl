@@ -242,7 +242,7 @@ float TerrainHeight(float2 xz) {
     float2 n = xz / float2(max(0.01, islandScaleX), max(0.01, islandScaleZ));
     float maxScale = max(islandScaleX, islandScaleZ);
     float coastDistance = length(n);
-    if (terrainStyle == 1 && maxScale > 1.5) {
+    if ((terrainStyle & 1u) != 0u && maxScale > 1.5) {
         float2 warped = n + float2(
             sin(n.y * 0.055) * 7.0 + sin((n.x + n.y) * 0.025) * 4.0,
             sin(n.x * 0.047) * 6.0 - sin((n.x - n.y) * 0.031) * 3.0);
@@ -267,7 +267,7 @@ float TerrainHeight(float2 xz) {
     // Building pad, applied LAST so nothing else can dent it. The pool rim was
     // biting into the house footprint and dropping one corner ~2 m; forcing the
     // pad flat here means the houses always sit on genuinely level ground.
-    uint padCount = (terrainStyle == 1 && maxScale > 1.5) ? 8 : 1;
+    uint padCount = ((terrainStyle & 1u) != 0u && maxScale > 1.5) ? 8 : 1;
     for (uint i = 0; i < padCount; ++i) {
         float pad = 1.0 - smoothstep(
             kPadRadius, kPadFade, length(xz - kStressPadCenters[i]));

@@ -144,12 +144,19 @@ enum class LevelInsertionMode : uint32_t {
     PlayerChoice = 3
 };
 
+inline constexpr float kDefaultDeploymentRadius = 34.0f;
+inline constexpr float kMinDeploymentRadius = 5.0f;
+inline constexpr float kMaxDeploymentRadius = 600.0f;
+
 struct LevelDefinition {
     uint32_t schemaVersion = 1;
     std::string name = "Untitled Level";
     // Which insertion delivers the player. PlayerChoice puts the map's arrival
     // up to the player; the other modes settle it in the level file.
     LevelInsertionMode insertionMode = LevelInsertionMode::Helicopter;
+    // World-space radius of the selectable insertion/drop-off ring. It is not
+    // multiplied by island scale: an authored 120 m radius stays exactly 120 m.
+    float deploymentRadius = kDefaultDeploymentRadius;
     float terrainHeightScale = 3.057f;
     // Flat authoring mode: suppress every procedural landform -- the fbm relief,
     // the pool basin carved near the origin, and the beach/seabed coast falloff

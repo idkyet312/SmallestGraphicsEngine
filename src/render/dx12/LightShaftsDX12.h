@@ -193,7 +193,7 @@ public:
             sunU, sunV, scene.lightShaftIntensity, onScreen ? 1.0f : 0.0f,
             scene.lightShaftDensity, scene.lightShaftDecay,
             scene.lightShaftWeight, scene.lightShaftExposure,
-            scene.cameraNear, scene.cameraFar, 0.0f, 0.0f,
+            scene.cameraNear, scene.EffectiveCameraFarPlane(), 0.0f, 0.0f,
             scene.lightColor.x, scene.lightColor.y, scene.lightColor.z, 0.0f
         };
         commandList->SetGraphicsRoot32BitConstants(1, 16, constants, 0);

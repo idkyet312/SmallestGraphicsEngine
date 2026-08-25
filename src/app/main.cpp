@@ -718,6 +718,8 @@ static size_t ActiveBanditSlotCount() {
     return g_stressTestMode ? kStressBanditCount : 4 * kEnemiesPerSpawner;
 }
 
+bool DeploymentPlanningActive();
+
 TerrainRendererDX12::Params CurrentTerrainParams() {
     TerrainRendererDX12::Params params;
     params.detailRelief = scene.terrainDetailRelief ? 1u : 0u;
@@ -782,24 +784,20 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
         // occupies the middle half of every outer ring, so G must stay
         // divisible by four -- raising G is also the expensive lever, since
         // ring cost is G^2 while adding a ring is only linear.
-        constexpr UINT kRingGrid = 20u;         // G: tiles per side of each ring
-        params.tilesX = kRingGrid;
-        // Enough rings so the outermost reaches past the island shore. Ring r
-        // half-span = G/2 * base * 2^r. Need it to cover kShoreOuter*scale + margin.
-        // Matches terrain_ms.hlsl's kShoreOuter, so the rings still reach past
-        // the point where the seabed finishes sloping down.
+        constexpr UINT kGameplayRingGrid = 20u;
+        params.tilesX = kGameplayRingGrid;
+        // Enough rings so the outermost reaches past the island shore. The
+        // deployment overview can request a broader apron around its selectable
+        // drop-off ring. Ring r half-span = G/2 * base * 2^r.
+        // kShoreOuter matches terrain_ms.hlsl, so the ordinary view still reaches
+        // past the point where the seabed finishes sloping down.
         constexpr float kShoreOuter = 88.0f;
         constexpr float kOceanMargin = 40.0f;
         const float maxScale = (std::max)(params.islandScaleX, params.islandScaleZ);
         const float need = kShoreOuter * maxScale + kOceanMargin;
-        UINT rings = 1;
-        while (rings < 8) {
-            const float halfSpan = (kRingGrid * 0.5f) * params.tileSize *
-                static_cast<float>(1u << (rings - 1));
-            if (halfSpan >= need) break;
-            ++rings;
-        }
-        params.tilesZ = rings;                  // R: ring count
+        params.tilesZ = DeploymentPlanner::TerrainRingCount(
+            need, kGameplayRingGrid, params.tileSize,
+            DeploymentPlanner::MaxTerrainClipmapRings);
         params.originTileX = 0;
         params.originTileZ = 0;
         // Adaptive quality on the ordinary level. The ring count is derived from
@@ -819,6 +817,38 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
                 break;
             default: break;   // Full: keep the 44 m / 34 m defaults
         }
+    }
+
+    if (DeploymentPlanningActive()) {
+        constexpr float kShoreOuter = 88.0f;
+        constexpr float kOceanMargin = 40.0f;
+        const float maxScale = (std::max)(params.islandScaleX,
+                                          params.islandScaleZ);
+        const float islandRadius = 43.0f * maxScale;
+        const float deploymentRadius = g_customLevelMode
+            ? g_game.world.Level().deploymentRadius
+            : kDefaultDeploymentRadius;
+        const DeploymentPlanner::CameraFrame frame =
+            DeploymentPlanner::BuildCameraFrame(
+                islandRadius, deploymentRadius);
+        const float requiredRadius = (std::max)(
+            kShoreOuter * maxScale + kOceanMargin,
+            frame.terrainViewRadius);
+
+        // A deployment overview is not a clipmap. Every tile is eight metres
+        // wide and the mesh shader emits its complete 8x8 surface grid, giving
+        // one-metre terrain vertices from the island centre through the entire
+        // requested apron. This is a distinct topology from gameplay and does
+        // not inherit exponentially larger outer-ring tiles.
+        params.terrainStyle &= ~TerrainRendererDX12::kStyleClipmap;
+        params.terrainStyle |=
+            TerrainRendererDX12::kStyleDeploymentOverview;
+        params.tileSize = DeploymentPlanner::DeploymentTerrainTileSize;
+        params.tilesX = DeploymentPlanner::DeploymentTerrainGridSide(
+            requiredRadius);
+        params.tilesZ = params.tilesX;
+        params.originTileX = 0;
+        params.originTileZ = 0;
     }
     // Applied after both branches: flat mode is orthogonal to island style and
     // to the clipmap topology, so it ORs onto whichever they selected.
@@ -1119,6 +1149,40 @@ XMMATRIX HumveeWorldMatrix() {
            XMMatrixTranslation(g_primaryHumveeSpawn.x,
                                g_primaryHumveeSpawn.y - 0.95f,
                                g_primaryHumveeSpawn.z);
+}
+
+void PrimaryHumveeHeadlightPose(XMFLOAT3& position, XMFLOAT3& direction) {
+    XMFLOAT4X4 poseStorage{};
+    XMFLOAT3 chassisPosition{};
+    XMFLOAT3 chassisForward{};
+    XMMATRIX pose;
+    if (g_destruction.GetVehicleTransform(
+            poseStorage, &chassisPosition, &chassisForward)) {
+        pose = XMLoadFloat4x4(&poseStorage);
+    } else {
+        pose = XMMatrixRotationY(XMConvertToRadians(g_primaryHumveeYaw)) *
+               XMMatrixTranslation(g_primaryHumveeSpawn.x,
+                                   g_primaryHumveeSpawn.y,
+                                   g_primaryHumveeSpawn.z);
+        chassisPosition = g_primaryHumveeSpawn;
+        XMStoreFloat3(&chassisForward, XMVector3Normalize(pose.r[0]));
+    }
+
+    // The FBX is rotated -PI/2 when attached to the physics pose, leaving the
+    // rendered nose opposite the chassis +X basis returned above.
+    const XMVECTOR forward = XMVectorNegate(XMVector3Normalize(
+        XMLoadFloat3(&chassisForward)));
+    const XMVECTOR up = XMVector3Normalize(pose.r[1]);
+    // Put the centre lamp just beyond the rendered front face so the Humvee
+    // cannot shadow itself.
+    const XMVECTOR lamp = XMVectorAdd(
+        XMLoadFloat3(&chassisPosition),
+        XMVectorAdd(XMVectorScale(forward, 2.30f),
+                    XMVectorScale(up, 0.10f)));
+    const XMVECTOR aim = XMVector3Normalize(
+        XMVectorSubtract(forward, XMVectorScale(up, 0.18f)));
+    XMStoreFloat3(&position, lamp);
+    XMStoreFloat3(&direction, aim);
 }
 
 XMMATRIX SecondaryHumveeWorldMatrix() {
@@ -1470,6 +1534,71 @@ static int g_selectedDeploymentZone = -1;
 static XMFLOAT3 g_deploymentTarget{};
 static bool g_deploymentTargetValid = false;
 static float g_deploymentFlythroughTime = 0.0f;
+// Mouse-wheel zoom on the deployment overview, as a multiplier on the orbit
+// rig BuildCameraFrame composes. Applied to radius and height together so the
+// framing scales instead of skewing: pulling in low over the island would
+// otherwise flatten the view into a horizon shot.
+//
+// 1.0 is the authored composition. The range keeps the whole island on screen
+// at the far end and stops the near end from pushing the camera through the
+// terrain.
+static float g_deploymentZoom = 1.0f;
+static constexpr float kDeploymentZoomMin = 0.45f;
+static constexpr float kDeploymentZoomMax = 2.2f;
+// Manual orbit: right-drag turns the map, and the automatic rotation resumes
+// after a pause once the button is released.
+//
+// The auto orbit reads its angle from g_deploymentFlythroughTime, so a manual
+// turn is stored as an offset onto that rather than by writing the time back.
+// Rewriting the time would make the resume jump, since the drag and the clock
+// advance at unrelated rates.
+// Driven from ImGui, not from Win32 capture. The deployment screen releases the
+// pointer so its panels and zone markers stay clickable, and the ImGui backend
+// takes capture for itself on any button press -- between them the capture
+// changed hands the instant a drag began, and a WM_CAPTURECHANGED handler that
+// treated that as "drag cancelled" tore the drag down before a single
+// WM_MOUSEMOVE could act on it. Measured: RBUTTONDOWN was always immediately
+// followed by CAPTURECHANGED with no MOUSEMOVE in between.
+//
+// ImGui already owns the pointer on this screen and tracks the drag itself, so
+// reading it there sidesteps the capture fight entirely and keeps one owner.
+static bool g_deploymentOrbitDragging = false;
+static float g_deploymentOrbitOffset = 0.0f;
+static float g_deploymentOrbitResumeDelay = 0.0f;
+// Horizontal drag banked by the UI pass for the camera update to consume. The
+// UI runs after ImGui::NewFrame (where MouseDelta becomes valid) and the camera
+// update runs before it, so the value is handed across the frame boundary
+// rather than read twice.
+static float g_deploymentOrbitPendingDrag = 0.0f;
+// Flick momentum. Releasing mid-drag hands the map the speed it was turning at
+// and lets friction bleed it off, so the globe carries on and coasts to a stop
+// rather than freezing the instant the button comes up.
+static float g_deploymentOrbitVelocity = 0.0f;
+// Seconds of stillness after the spin has died before the map turns itself
+// again.
+static constexpr float kDeploymentOrbitResumeSeconds = 3.0f;
+// Radians of orbit per pixel dragged. A full turn is a little over a
+// screen-width of travel at 1080p.
+static constexpr float kDeploymentOrbitRadiansPerPixel = 0.0032f;
+// Friction on the flick, as the fraction of speed kept per second. 0.12 leaves
+// a hard flick coasting for roughly two seconds before it falls under the stop
+// threshold -- long enough to read as weight, short enough not to fight a
+// player trying to line up a zone.
+static constexpr float kDeploymentOrbitDamping = 0.12f;
+// Below this the spin is imperceptible; stopping there is what lets the resume
+// countdown start instead of trailing an infinitely small drift.
+static constexpr float kDeploymentOrbitMinSpin = 0.04f;
+// Ceiling on a flick, so a fast swipe across the screen cannot launch the map
+// into a blur that takes seconds to settle.
+static constexpr float kDeploymentOrbitMaxSpin = 6.0f;
+// Deployment-only diagnostics. They never mutate the authored weather or
+// renderer settings, so leaving the planning screen restores gameplay simply
+// by making DeploymentPlanningActive() false.
+static bool g_deploymentDebugHideWater = false;
+static bool g_deploymentDebugHideAtmosphere = false;
+static bool g_deploymentDebugForceForward = false;
+static bool g_deploymentDebugWaterDepth = false;
+static bool g_deploymentDebugCoverageGuides = false;
 
 static void CancelDeploymentPlanning() {
     g_insertionChoicePending = false;
@@ -1479,9 +1608,18 @@ static void CancelDeploymentPlanning() {
     g_deploymentTarget = {};
     g_deploymentTargetValid = false;
     g_deploymentFlythroughTime = 0.0f;
+    g_deploymentZoom = 1.0f;
+    g_deploymentOrbitDragging = false;
+    g_deploymentOrbitOffset = 0.0f;
+    g_deploymentOrbitResumeDelay = 0.0f;
+    g_deploymentOrbitVelocity = 0.0f;
+    g_deploymentOrbitPendingDrag = 0.0f;
 }
 
 bool DeploymentPlanningActive() { return g_insertionChoicePending; }
+int DeploymentWaterDebugMode() {
+    return g_insertionChoicePending && g_deploymentDebugWaterDepth ? 1 : 0;
+}
 const std::vector<XMFLOAT3>& DeploymentZonePositions() {
     return g_deploymentZones;
 }
@@ -1688,20 +1826,17 @@ static void RequestTimeOfDaySkyEnvironment(TimeOfDay time);
 static void BeginDeploymentPlanning() {
     auto params = CurrentTerrainParams();
     params.heightScale = scene.terrainHeightScale;
-    constexpr float deploymentRadius = 34.0f;
+    const float deploymentRadius = g_customLevelMode
+        ? g_game.world.Level().deploymentRadius
+        : kDefaultDeploymentRadius;
     // 20 points around the ring rather than 8, so the coast offers a real choice
     // of approach instead of eight fixed doors.
     //
-    // 20 is the measured ceiling, not a guess. Projecting the ring through the
-    // planning flythrough's own camera (orbit 95, height 62, 60 deg FOV) and
-    // sweeping the full orbit, the closest any two markers ever come on a 1080p
-    // screen is 51.9px at 20 zones -- still clear of the 48px needed for the
-    // 24px pick radius to be unambiguous. 24 zones drops that to 43.3px and the
-    // click targets start to overlap.
+    // The planning camera scales with this ring, keeping marker spacing stable
+    // when an editor-authored radius is much larger than the historical 34 m.
     constexpr uint32_t deploymentZoneCount = 20;
     g_deploymentZones = DeploymentPlanner::BuildPerimeterZones(
-        deploymentRadius * params.islandScaleX,
-        deploymentRadius * params.islandScaleZ, deploymentZoneCount,
+        deploymentRadius, deploymentRadius, deploymentZoneCount,
         [&](float x, float z) {
             return (std::max)(0.0f,
                 TerrainRendererDX12::HeightAt(params, x, z));
@@ -1791,17 +1926,79 @@ static void UpdateMenuMusic() {
 }
 
 static void UpdateDeploymentPlanningCamera(float deltaTime) {
-    if (!g_insertionChoicePending || g_game.loading.Active()) return;
-    g_deploymentFlythroughTime += (std::max)(0.0f, deltaTime);
+    if (!g_insertionChoicePending) {
+        scene.cameraFarOverride = 0.0f;
+        return;
+    }
+    if (g_game.loading.Active()) {
+        scene.cameraFarOverride = 0.0f;
+        return;
+    }
+    // The automatic orbit only advances when the player is not steering it, the
+    // flick has coasted to a stop, and the pause after that has run out.
+    // Holding the clock still (rather than letting it run and snapping back) is
+    // what makes the resume continue from wherever the map was left.
+    const float step = (std::max)(0.0f, deltaTime);
+    // Banked by RenderInsertionChoiceScreen last frame; applied whether or not
+    // the button is still down so the final sliver of a drag is never dropped.
+    const float dragged = g_deploymentOrbitPendingDrag;
+    g_deploymentOrbitPendingDrag = 0.0f;
+    if (dragged != 0.0f) {
+        g_deploymentOrbitOffset =
+            std::fmod(g_deploymentOrbitOffset + dragged, XM_2PI);
+    }
+    if (g_deploymentOrbitDragging) {
+        // Turn this frame's travel into a speed for the flick.
+        if (step > 1e-5f) {
+            const float sampled = dragged / step;
+            // Smoothed so the release picks up the gesture's speed rather than
+            // whatever the final frame happened to catch -- a flick that eases
+            // off in its last few milliseconds should still throw the map.
+            g_deploymentOrbitVelocity +=
+                (sampled - g_deploymentOrbitVelocity) * 0.35f;
+            g_deploymentOrbitVelocity = std::clamp(
+                g_deploymentOrbitVelocity,
+                -kDeploymentOrbitMaxSpin, kDeploymentOrbitMaxSpin);
+        }
+        g_deploymentOrbitResumeDelay = kDeploymentOrbitResumeSeconds;
+    } else if (std::fabs(g_deploymentOrbitVelocity) >
+               kDeploymentOrbitMinSpin) {
+        // Coasting. Exponential decay so the slowdown is framerate independent
+        // -- a linear subtraction would stop sooner on a fast machine.
+        g_deploymentOrbitOffset += g_deploymentOrbitVelocity * step;
+        g_deploymentOrbitVelocity *=
+            std::pow(kDeploymentOrbitDamping, step);
+        g_deploymentOrbitOffset = std::fmod(g_deploymentOrbitOffset, XM_2PI);
+        // The wait starts once the map is still, not at the moment of release,
+        // so a long spin is not eaten by the countdown running underneath it.
+        g_deploymentOrbitResumeDelay = kDeploymentOrbitResumeSeconds;
+    } else if (g_deploymentOrbitResumeDelay > 0.0f) {
+        g_deploymentOrbitVelocity = 0.0f;
+        g_deploymentOrbitResumeDelay =
+            (std::max)(0.0f, g_deploymentOrbitResumeDelay - step);
+    } else {
+        g_deploymentFlythroughTime += step;
+    }
     auto params = CurrentTerrainParams();
     const float islandRadius = 43.0f * (std::max)(
         params.islandScaleX, params.islandScaleZ);
-    const float orbitRadius = (std::max)(95.0f, islandRadius * 1.75f);
-    const float angle = g_deploymentFlythroughTime * 0.13f;
+    const float deploymentRadius = g_customLevelMode
+        ? g_game.world.Level().deploymentRadius
+        : kDefaultDeploymentRadius;
+    const DeploymentPlanner::CameraFrame frame =
+        DeploymentPlanner::BuildCameraFrame(islandRadius, deploymentRadius);
+    // Scroll zoom rides on top of the authored rig. The far plane is derived
+    // from the unzoomed orbit, so scale it by the same factor when pulling out
+    // or the ocean and the far shore start clipping at the back of the frame.
+    const float zoom = std::clamp(g_deploymentZoom,
+                                  kDeploymentZoomMin, kDeploymentZoomMax);
+    scene.cameraFarOverride = frame.farPlane * (std::max)(1.0f, zoom);
+    const float angle =
+        g_deploymentFlythroughTime * 0.13f + g_deploymentOrbitOffset;
     scene.camera.Position = {
-        std::sin(angle) * orbitRadius,
-        (std::max)(62.0f, islandRadius * 0.78f),
-        std::cos(angle) * orbitRadius };
+        std::sin(angle) * frame.orbitRadius * zoom,
+        frame.height * zoom,
+        std::cos(angle) * frame.orbitRadius * zoom };
     const XMFLOAT3 toCenter{
         -scene.camera.Position.x,
         4.0f - scene.camera.Position.y,
@@ -9443,9 +9640,34 @@ static void RebuildScalableEnvironment() {
             g_grass.SetSplatMap(nullptr, 0, 0.0f, 0.0f);
         }
     }
-    g_grass.Initialize(terrainSampler,
-        g_stressTestMode ? 200.0f : 100.0f,
-        g_stressTestMode ? 1600000 : 400000, 0.0f, grassExclusions, grassPatches,
+    // Scatter span follows the island the level actually authored, rather than
+    // a fixed 100 m. The playable ground is kShoreOuter (88 m) scaled per axis,
+    // and islands are stretched independently: islandv3 runs scaleZ = 1.38, so
+    // it reaches +/-121 m on Z while a 100 m span only scattered to +/-50 -- the
+    // far half of the map came out bare no matter what the splatmap painted.
+    //
+    // Square span covering the LONGER axis, since BuildBlades scatters a square
+    // and the per-tuft material test rejects whatever falls off the island.
+    float grassSpan = g_stressTestMode ? 200.0f : 100.0f;
+    int grassCount = g_stressTestMode ? 1600000 : 400000;
+    if (!g_stressTestMode) {
+        const LevelDefinition& spanLevel = g_game.world.Level();
+        constexpr float kShoreOuter = 88.0f;
+        const float islandSpan = 2.0f * kShoreOuter * (std::max)(
+            spanLevel.terrainIslandScaleX, spanLevel.terrainIslandScaleZ);
+        if (islandSpan > grassSpan) {
+            // Hold tuft density roughly constant as the area grows, so a long
+            // island is not covered by the same budget stretched thin. Capped
+            // so a very large authored island cannot blow up the vertex count.
+            const float areaRatio = (islandSpan * islandSpan) /
+                                    (grassSpan * grassSpan);
+            grassCount = static_cast<int>((std::min)(
+                static_cast<float>(grassCount) * areaRatio, 1600000.0f));
+            grassSpan = islandSpan;
+        }
+    }
+    g_grass.Initialize(terrainSampler, grassSpan, grassCount,
+        0.0f, grassExclusions, grassPatches,
         !g_customLevelMode);
     ScatterDandelions(terrainSampler, grassExclusions);
     g_environmentInitialized = true;
@@ -10450,6 +10672,35 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // hardcoded screen-edge margin did not.
     const bool selectClick = ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                              !ImGui::GetIO().WantCaptureMouse;
+
+    // Right-drag turns the map by hand. Read here rather than in WndProc: the
+    // ImGui backend takes Win32 capture on any button press and this screen
+    // releases it every frame for its own panels, so a raw-capture drag was
+    // cancelled the moment it started (see g_deploymentOrbitDragging).
+    //
+    // Gated on the same WantCaptureMouse test the marker pick above uses, so a
+    // drag that begins on a side panel belongs to that panel's widgets and
+    // never turns the map. ImGui latches the drag once it starts, so crossing
+    // over a panel mid-drag keeps turning.
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        const bool overPanel = io.WantCaptureMouse;
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !overPanel) {
+            g_deploymentOrbitDragging = true;
+            // Grabbing a coasting map stops it dead, the way catching a spun
+            // globe does.
+            g_deploymentOrbitVelocity = 0.0f;
+            g_deploymentOrbitPendingDrag = 0.0f;
+        }
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Right))
+            g_deploymentOrbitDragging = false;
+        if (g_deploymentOrbitDragging) {
+            // MouseDelta is already a per-frame value, which is exactly what
+            // the flick needs -- no per-message accumulation to reconcile.
+            g_deploymentOrbitPendingDrag +=
+                io.MouseDelta.x * kDeploymentOrbitRadiansPerPixel;
+        }
+    }
     for (size_t index = 0; index < g_deploymentZones.size(); ++index) {
         XMFLOAT3 marker = g_deploymentZones[index];
         marker.y += 1.3f;
@@ -10518,6 +10769,76 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             foreground->AddCircleFilled(enemyScreen, 3.0f,
                                         IM_COL32(232, 48, 48, 235));
         }
+    }
+
+    if (g_deploymentDebugCoverageGuides) {
+        const TerrainRendererDX12::Params guideParams =
+            CurrentTerrainParams();
+        const auto projectGuidePoint = [&](float x, float z,
+                                           ImVec2& screen) {
+            const XMFLOAT3 world{
+                x, TerrainRendererDX12::HeightAt(guideParams, x, z) + 1.5f, z };
+            const XMVECTOR clip = XMVector3Transform(
+                XMLoadFloat3(&world), viewProjection);
+            const float w = XMVectorGetW(clip);
+            if (w <= 0.01f) return false;
+            screen = {
+                (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+                (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) *
+                    display.y };
+            return true;
+        };
+        const auto drawEllipse = [&](float radiusX, float radiusZ,
+                                     ImU32 color) {
+            constexpr int segments = 128;
+            ImVec2 previous{};
+            bool previousVisible = false;
+            for (int segment = 0; segment <= segments; ++segment) {
+                const float angle = XM_2PI *
+                    static_cast<float>(segment) / segments;
+                ImVec2 current{};
+                const bool currentVisible = projectGuidePoint(
+                    std::cos(angle) * radiusX,
+                    std::sin(angle) * radiusZ, current);
+                if (previousVisible && currentVisible)
+                    foreground->AddLine(previous, current, color, 2.0f);
+                previous = current;
+                previousVisible = currentVisible;
+            }
+        };
+        const auto drawCoverageSquare = [&](float halfSpan, ImU32 color) {
+            const XMFLOAT2 corners[4] = {
+                {-halfSpan, -halfSpan}, { halfSpan, -halfSpan},
+                { halfSpan,  halfSpan}, {-halfSpan,  halfSpan} };
+            constexpr int edgeSegments = 32;
+            for (int edge = 0; edge < 4; ++edge) {
+                const XMFLOAT2 a = corners[edge];
+                const XMFLOAT2 b = corners[(edge + 1) & 3];
+                ImVec2 previous{};
+                bool previousVisible = false;
+                for (int segment = 0; segment <= edgeSegments; ++segment) {
+                    const float t = static_cast<float>(segment) / edgeSegments;
+                    ImVec2 current{};
+                    const bool currentVisible = projectGuidePoint(
+                        a.x + (b.x - a.x) * t,
+                        a.y + (b.y - a.y) * t, current);
+                    if (previousVisible && currentVisible)
+                        foreground->AddLine(previous, current, color, 2.0f);
+                    previous = current;
+                    previousVisible = currentVisible;
+                }
+            }
+        };
+
+        drawEllipse(43.0f * guideParams.islandScaleX,
+                    43.0f * guideParams.islandScaleZ,
+                    IM_COL32(255, 208, 64, 245));
+        drawEllipse(88.0f * guideParams.islandScaleX,
+                    88.0f * guideParams.islandScaleZ,
+                    IM_COL32(64, 224, 255, 245));
+        drawCoverageSquare(
+            guideParams.tilesX * guideParams.tileSize * 0.5f,
+            IM_COL32(255, 80, 215, 245));
     }
 
     const char* instruction =
@@ -10600,6 +10921,54 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.25f, 1.0f),
             "Click a zone marker on the map");
     ImGui::Dummy(ImVec2(0.0f, 7.0f));
+
+    if (ImGui::CollapsingHeader(
+            "RENDER DIAGNOSTICS", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Hide water", &g_deploymentDebugHideWater);
+        ImGui::Checkbox("Hide fog and clouds",
+                        &g_deploymentDebugHideAtmosphere);
+        ImGui::Checkbox("Force Forward renderer",
+                        &g_deploymentDebugForceForward);
+        if (ImGui::Checkbox("Water depth diagnostic",
+                            &g_deploymentDebugWaterDepth) &&
+            g_deploymentDebugWaterDepth) {
+            g_deploymentDebugHideWater = false;
+        }
+        ImGui::Checkbox("Show terrain coverage guides",
+                        &g_deploymentDebugCoverageGuides);
+        if (ImGui::Button("Reset diagnostics")) {
+            g_deploymentDebugHideWater = false;
+            g_deploymentDebugHideAtmosphere = false;
+            g_deploymentDebugForceForward = false;
+            g_deploymentDebugWaterDepth = false;
+            g_deploymentDebugCoverageGuides = false;
+        }
+
+        const TerrainRendererDX12::Params diagnosticTerrain =
+            CurrentTerrainParams();
+        const float coverage = diagnosticTerrain.tilesX *
+            diagnosticTerrain.tileSize * 0.5f;
+        const float vertexSpacing = diagnosticTerrain.tileSize / 8.0f;
+        const double maximumSurfaceTriangles =
+            static_cast<double>(diagnosticTerrain.tilesX) *
+            diagnosticTerrain.tilesZ * 128.0;
+        ImGui::Text("Terrain: %ux%u tiles, %.1f m each",
+                    diagnosticTerrain.tilesX, diagnosticTerrain.tilesZ,
+                    diagnosticTerrain.tileSize);
+        ImGui::Text("Uniform LOD 0: %.2f m vertices, +/-%.0f m coverage",
+                    vertexSpacing, coverage);
+        ImGui::Text("Maximum surface geometry: %.2f M triangles",
+                    maximumSurfaceTriangles / 1000000.0);
+        ImGui::Text("Camera far plane: %.0f m", scene.EffectiveCameraFarPlane());
+        ImGui::TextDisabled(
+            "Depth debug: green=submerged, red=dry, magenta=no depth.");
+        ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.25f, 1.0f),
+                           "Yellow: waterline (43 m reference)");
+        ImGui::TextColored(ImVec4(0.25f, 0.88f, 1.0f, 1.0f),
+                           "Cyan: full-depth seabed (88 m reference)");
+        ImGui::TextColored(ImVec4(1.0f, 0.32f, 0.86f, 1.0f),
+                           "Pink: actual terrain grid edge");
+    }
 
     MissionLoadout& loadout = g_game.mission.Loadout();
     static constexpr const char* weaponNames[MissionLoadout::kWeaponCount] = {
@@ -14032,11 +14401,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_MOUSEWHEEL:
-        // Editor camera-speed scrolling is handled earlier; here it only cycles
-        // the weapon during gameplay.
+        // Editor camera-speed scrolling is handled earlier; here it zooms the
+        // deployment overview, and otherwise cycles the weapon during gameplay.
         if (!ImGui::GetIO().WantCaptureMouse) {
-            GunModel::CycleWeapon(GET_WHEEL_DELTA_WPARAM(wParam));
-            scene.fireCooldown = 0.0f;
+            const int wheel = GET_WHEEL_DELTA_WPARAM(wParam);
+            if (DeploymentPlanningActive()) {
+                // Multiplicative so each notch covers the same proportion of
+                // the range whether pulled in or out; scrolling up moves the
+                // camera closer, matching every map view.
+                const float notches =
+                    static_cast<float>(wheel) / static_cast<float>(WHEEL_DELTA);
+                g_deploymentZoom = std::clamp(
+                    g_deploymentZoom * std::pow(1.0f / 1.12f, notches),
+                    kDeploymentZoomMin, kDeploymentZoomMax);
+            } else {
+                GunModel::CycleWeapon(wheel);
+                scene.fireCooldown = 0.0f;
+            }
         }
         return 0;
 
@@ -14077,6 +14458,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_RBUTTONDOWN:
+        // The deployment overview's own right-drag is handled in
+        // RenderInsertionChoiceScreen, from ImGui rather than from Win32
+        // capture; see g_deploymentOrbitDragging.
         if (IsEditorEditing() && !ImGui::GetIO().WantCaptureMouse) {
             cameraLocked = false;
             SetCapture(hwnd);
@@ -17427,9 +17811,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 }
             }
         }
+        const bool deploymentForceForward =
+            DeploymentPlanningActive() && g_deploymentDebugForceForward;
+        const bool deploymentHideAtmosphere =
+            DeploymentPlanningActive() && g_deploymentDebugHideAtmosphere;
         const RenderPath renderPath = RenderCoordinator::Choose({
-            scene.useRaytracing,
-            scene.useVisibilityBuffer,
+            scene.useRaytracing && !deploymentForceForward,
+            scene.useVisibilityBuffer && !deploymentForceForward,
             g_rt.initialized,
             visBuffer.initialized
         });
@@ -17543,7 +17931,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 visBuffer.BeginHDRBackground(g_dx12.commandList.Get());
                 skyRenderer.SetHDRTargetEnabled(true);
             }
-            const XMFLOAT4 skyCloudParams = scene.enableFlyableClouds
+            const XMFLOAT4 skyCloudParams = deploymentHideAtmosphere
+                ? XMFLOAT4(0.0f, 0.0f,
+                           scene.atmosphereCloudBaseHeight,
+                           scene.atmosphereCloudThickness)
+                : scene.enableFlyableClouds
                 ? XMFLOAT4(0.0f, 0.0f,
                            scene.atmosphereCloudBaseHeight,
                            scene.atmosphereCloudThickness)
@@ -17554,7 +17946,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             skyRenderer.Render(
                 scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now,
                 scene.enablePhysicalAtmosphere,
-                scene.enableVolumetricClouds,
+                scene.enableVolumetricClouds && !deploymentHideAtmosphere,
                 XMFLOAT4(scene.atmosphereRayleighStrength,
                          scene.atmosphereMieStrength,
                          scene.atmosphereMieAnisotropy,
@@ -17686,7 +18078,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // far past the terrain grid so it runs to the horizon in every
                 // direction. No terrain sampler: nothing floats in it, so it gets
                 // the cheap flat tank rather than a heightfield basin.
-                constexpr float kSeaSpan = 600.0f;
+                // At the editor's maximum insertion radius the deployment
+                // camera orbits 1.33 km from the island. A +/-1.6 km ocean left
+                // its edge only a few hundred metres behind that camera and the
+                // square boundary entered the view. +/-4.096 km covers the
+                // complete deployment far plane at every supported radius.
+                constexpr float kSeaSpan = 8192.0f;
                 constexpr float kSeaDepth = 12.0f;
                 // Near-shore reflections and wave/terrain intersections need
                 // enough vertices to avoid exposing individual ocean triangles.
@@ -18290,18 +18687,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         XMMATRIX fogLightSpace = XMMatrixIdentity();
         ID3D12Resource* fogShadowResource = nullptr;
         bool renderedScene = false;
-        // Added before any pass culls lights, dropped once the last one that
-        // reads the clustered list (the fog) has run. See AddPlayerFlashlight.
-        //
-        // Casters are cleared first and refilled by the two shadowed adds
-        // below, so the slice a light is tagged with this frame always refers
-        // to a frustum built from this frame's vehicle poses. The shadow pass
-        // runs after these calls and before the lights are removed.
+        // The Humvee spotlight is added before clustered-light culling and
+        // removed after the last consumer. Its caster list is rebuilt from the
+        // current vehicle pose before the depth pass, leaving no player or
+        // helicopter spotlight in the frame.
         g_spotShadowCasters.clear();
-        const bool flashlightInLightList = AddPlayerFlashlight(scene);
         const int headlightsInLightList = AddVehicleHeadlights(scene);
-        const int searchlightsInLightList =
-            AddEnemyHelicopterSearchlights(scene, deltaTime);
         if (IsSceneScreen() && !g_game.loading.Active() &&
             usingRaytracing) {
             ProfilerDX12::Scope profile(g_profiler, "Raytracing", g_dx12.commandList.Get());
@@ -18318,7 +18709,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // next scope is constructed.
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
-            if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
+            if (scene.enableShadows && shadowMap.initialized &&
+                (scene.lightType == 0 || !g_spotShadowCasters.empty())) {
                 ProfilerDX12::Scope profile(g_profiler, "Shadow", g_dx12.commandList.Get());
                 lightSpace = shadowMap.Render(
                     scene, geo, g_prefabRenderBatches,
@@ -18362,7 +18754,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         } else if (IsSceneScreen() && !g_game.loading.Active()) {
             XMMATRIX lightSpace = XMMatrixIdentity();
             ID3D12Resource* shadowResource = nullptr;
-            if (scene.enableShadows && shadowMap.initialized && scene.lightType == 0) {
+            if (scene.enableShadows && shadowMap.initialized &&
+                (scene.lightType == 0 || !g_spotShadowCasters.empty())) {
                 ProfilerDX12::Scope profile(g_profiler, "Shadow", g_dx12.commandList.Get());
                 lightSpace = shadowMap.Render(
                     scene, geo, g_prefabRenderBatches,
@@ -18513,7 +18906,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         }
 
         if (renderedScene && !bentGTAODiagnosticActive && !usingRaytracing &&
-            !g_emptyLevelMode && waterRenderer.initialized) {
+            !g_emptyLevelMode && waterRenderer.initialized &&
+            !(DeploymentPlanningActive() && g_deploymentDebugHideWater)) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Tropical Water",
                 g_dx12.commandList.Get());
@@ -18621,6 +19015,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             (scene.enableVolumetricFog && volumetricShafts) ||
             scene.enableFlyableClouds;
         if (renderedScene && !bentGTAODiagnosticActive &&
+            !deploymentHideAtmosphere &&
             renderFroxelVolume && volumetricFog.initialized) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Volumetric Fog / Clouds",
@@ -18664,12 +19059,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             lightShafts.Render(scene, g_dx12.commandList.Get(), shaftDepth,
                 visBuffer.GetOutputRTV(), shaftDepthReadable);
         }
-        // Every pass that reads the clustered light list has now run. Removed
-        // in reverse order of insertion: both pop off the back, so taking the
-        // flashlight first would discard a headlight instead.
-        RemoveEnemyHelicopterSearchlights(scene, searchlightsInLightList);
+        // Every pass that reads the clustered light list has now run.
         RemoveVehicleHeadlights(scene, headlightsInLightList);
-        RemovePlayerFlashlight(scene, flashlightInLightList);
 
         if (commonHDRValidationTarget) {
             ProfilerDX12::Scope profile(
@@ -18832,7 +19223,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 nightVision.Apply(g_dx12.commandList.Get(), noiseTime,
                                   g_nightVisionBlend, g_nightVisionGain,
                                   g_nightVisionOverload,
-                                  scene.cameraNear, scene.cameraFar);
+                                  scene.cameraNear,
+                                  scene.EffectiveCameraFarPlane());
             }
         }
 

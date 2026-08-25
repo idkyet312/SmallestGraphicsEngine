@@ -225,6 +225,7 @@ inline bool AddPlayerFlashlight(Scene& scene) {
     weaponLight.intensity = 3.4f;
     weaponLight.spotCosInner = std::cos(XMConvertToRadians(14.0f));
     weaponLight.spotCosOuter = std::cos(XMConvertToRadians(26.0f));
+    weaponLight.volumetric = scene.spotlightVolumetric;
     scene.clusteredRenderer.lights.push_back(weaponLight);
     return true;
 }
@@ -235,95 +236,48 @@ inline void RemovePlayerFlashlight(Scene& scene, bool added) {
 }
 DirectX::XMMATRIX HumveeWorldMatrix();
 DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
+void PrimaryHumveeHeadlightPose(DirectX::XMFLOAT3& position,
+                                DirectX::XMFLOAT3& direction);
 
 // Which time-of-day preset the run was started on. Headlights read it so they
 // only burn at night, when they are the difference between a parked shape and a
 // vehicle -- switched on at noon they wash out the paintwork and light nothing.
 extern TimeOfDay g_selectedTimeOfDay;
 
-// Headlights for one Humvee: a single centre-line spotlight by default, or the
-// original left/right pair when Scene::singleHumveeHeadlight is off.
+// One centre-line spotlight for the primary Humvee.
 //
-// The vehicle's world matrix already carries where it sits and which way it
-// faces, so the lamps come straight off its basis rather than a second set of
-// tracked values that could drift out of step with the body: row 2 is its
-// forward axis, row 0 its right, row 3 its position. The model is authored
-// facing -X (hence the -PI/2 yaw baked into HumveeWorldMatrix), which is why
-// forward is taken from the matrix rather than assumed.
+// The lamp pose comes from the physics chassis rather than HumveeWorldMatrix.
+// That matrix also contains model centring, scaling and the FBX's -PI/2
+// correction, so reading its rows as a vehicle pose points the shadow camera
+// along a model-space axis and offsets it from the chassis.
 //
 // Returns how many lights were appended, so the caller can pop exactly that
 // many back off at the end of the frame.
-inline int AddHumveeHeadlights(Scene& scene, const DirectX::XMMATRIX& body) {
-    const bool singleLamp = scene.singleHumveeHeadlight;
-    const int lampCount = singleLamp ? 1 : 2;
-    if (scene.clusteredRenderer.lights.size() + lampCount > 64) return 0;
-    const XMVECTOR right = XMVector3Normalize(body.r[0]);
-    const XMVECTOR forward = XMVector3Normalize(body.r[2]);
-    const XMVECTOR origin = body.r[3];
-    // Lamp placement comes from the humvee model's measured bounds.
-    // ConfigureHumveeBounds normalises the longest horizontal axis to 4.8 m and
-    // puts the model floor at y=0, so in the vehicle's own basis the body spans
-    // 2.40 m forward of centre, 1.92 m to each side, and 0 -> 1.05 m in height.
-    //
-    // Everything here must sit OUTSIDE that box. Anything inside it is
-    // embedded in the bodywork: the shadow frustum then starts within solid
-    // geometry and the vehicle occludes its own beam, which reads as the
-    // headlight cutting out.
-    const XMVECTOR lampHeight = XMVectorSet(0.0f, 0.75f, 0.0f, 0.0f);
-    // Aimed slightly down: level beams throw the hotspot at the horizon and
-    // leave the road right in front of the bumper dark.
-    const XMVECTOR aim = XMVector3Normalize(
-        XMVectorAdd(forward, XMVectorSet(0.0f, -0.18f, 0.0f, 0.0f)));
-    // 2.9 m clears the 2.40 m nose by half a metre, so the near plane opens in
-    // free air ahead of the bumper. The previous value put both the lamp
-    // (2.35 m) and the frustum origin (1.20 m) inside the body.
-    const XMVECTOR lamp = XMVectorAdd(
-        XMVectorAdd(origin, lampHeight),
-        XMVectorScale(forward, 2.9f));
+inline int AddHumveeHeadlights(Scene& scene) {
+    if (scene.clusteredRenderer.lights.size() >= 64) return 0;
+    PointLightDX12 headlight;
+    PrimaryHumveeHeadlightPose(headlight.position,
+                               headlight.spotDirection);
+    headlight.radius = 34.0f;
+    headlight.color = XMFLOAT3(0.92f, 0.95f, 1.0f);
+    headlight.intensity = 4.5f;
+    headlight.spotCosInner = std::cos(XMConvertToRadians(15.0f));
+    headlight.spotCosOuter = std::cos(XMConvertToRadians(26.0f));
 
+    // Register depth from the values actually assigned to the light. The
+    // caster and the visible cone therefore cannot drift to different origins
+    // or axes even if the vehicle model transform changes again.
     int shadowIndex = SPOT_SHADOW_NONE;
     if (g_spotShadowCasters.size() < SPOT_SHADOW_COUNT) {
-        // One frustum either way, from the centre line. With a single lamp it
-        // shares the light's exact origin, so the shadow sees precisely what
-        // the beam lights and 30 degrees covers the 26-degree cone with margin.
-        // The pair straddles that origin, so it needs the wider 40 to take in
-        // the outer lamp's lateral offset as well.
         shadowIndex = static_cast<int>(g_spotShadowCasters.size());
         g_spotShadowCasters.push_back(MakeSpotShadowCaster(
-            lamp, aim, singleLamp ? 30.0f : 40.0f, 38.0f));
+            XMLoadFloat3(&headlight.position),
+            XMLoadFloat3(&headlight.spotDirection), 30.0f, 38.0f));
     }
-    // Default is the single centre-line lamp: the pair shared this one shadow
-    // frustum anyway, so the second light only added an overlapping pool and
-    // another entry in the 64-light budget. Scene::singleHumveeHeadlight (UI:
-    // "Single Humvee Headlight") switches back to the original pair.
-    int added = 0;
-    for (int i = 0; i < lampCount; ++i) {
-        // Single lamp sits on the centre line; the pair straddles it by the
-        // model's own track half-width.
-        const float side = singleLamp ? 0.0f : (i == 0 ? -0.78f : 0.78f);
-        const XMVECTOR lampPosition = XMVectorAdd(
-            lamp, XMVectorScale(right, side));
-        PointLightDX12 headlight;
-        XMStoreFloat3(&headlight.position, lampPosition);
-        XMStoreFloat3(&headlight.spotDirection, aim);
-        headlight.radius = 34.0f;
-        // Colder than the torch: sealed-beam headlamps read blue-white next to
-        // a filament hand light.
-        headlight.color = XMFLOAT3(0.92f, 0.95f, 1.0f);
-        // One lamp carries the throw the two used to split between them.
-        headlight.intensity = singleLamp ? 4.5f : 3.0f;
-        // The pair needs the broader soft edge so its two offset discs blend
-        // into one spread; a single cone does not.
-        headlight.spotCosInner = std::cos(
-            XMConvertToRadians(singleLamp ? 15.0f : 19.0f));
-        headlight.spotCosOuter = std::cos(
-            XMConvertToRadians(singleLamp ? 26.0f : 34.0f));
-        // Every lamp reads the same slice; see the caster comment above.
-        headlight.spotShadowIndex = shadowIndex;
-        scene.clusteredRenderer.lights.push_back(headlight);
-        ++added;
-    }
-    return added;
+    headlight.spotShadowIndex = shadowIndex;
+    headlight.volumetric = scene.spotlightVolumetric;
+    scene.clusteredRenderer.lights.push_back(headlight);
+    return 1;
 }
 
 // Every Humvee the level actually placed. Mirrors the draw conditions in
@@ -333,10 +287,7 @@ inline int AddVehicleHeadlights(Scene& scene) {
     if (!TimeOfDayIsDark(g_selectedTimeOfDay)) return 0;
     if (g_emptyLevelMode || g_trainingRangeMode || !g_levelPlacesHumvee)
         return 0;
-    int added = AddHumveeHeadlights(scene, HumveeWorldMatrix());
-    if (g_stressTestMode)
-        added += AddHumveeHeadlights(scene, SecondaryHumveeWorldMatrix());
-    return added;
+    return AddHumveeHeadlights(scene);
 }
 
 inline void RemoveVehicleHeadlights(Scene& scene, int added) {
@@ -523,6 +474,10 @@ inline int AddHelicopterSearchlight(
     searchlight.spotCosInner = std::cos(XMConvertToRadians(6.0f));
     searchlight.spotCosOuter = std::cos(XMConvertToRadians(11.0f));
     searchlight.spotShadowIndex = shadowIndex;
+    // See Scene::spotlightVolumetric: the compensated intensity above is sized
+    // for surface reach, and the fog would multiply that same value into a
+    // blown-out shaft.
+    searchlight.volumetric = scene.spotlightVolumetric;
     scene.clusteredRenderer.lights.push_back(searchlight);
     return 1;
 }
@@ -1749,6 +1704,33 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
         g_spotShadowAtlasResource);
 
     if (g_grass.IsInitialized()) {
+        // The deployment overview orbits the whole island from far outside it:
+        // on a 1.38-scaled map the camera sits ~157 m from the centre and ~278 m
+        // from the far shore, while grass draws to 60 m. Every cell failed the
+        // cull, so the overview showed bare terrain no matter what was planted.
+        //
+        // Raised for the duration of this submit and put back immediately after,
+        // so the gameplay draw distance (and the UI slider that owns it) is
+        // untouched. The cell cull and the shader's distance fade both read this
+        // one value, so setting it here covers both.
+        const float authoredGrassDistance = g_grass.DrawDistance();
+        const bool deploymentGrass = DeploymentPlanningActive();
+        if (deploymentGrass) {
+            const float maxScale = (std::max)(scene.terrainIslandScaleX,
+                                              scene.terrainIslandScaleZ);
+            // Island half-span plus the camera's own standoff, so the far shore
+            // is inside the radius rather than exactly on it. Measured from the
+            // camera rather than assumed: scroll zoom pulls the overview back to
+            // 2.2x, which at a fixed radius put the far shore outside it again
+            // and faded the grass out exactly where this override exists to
+            // keep it.
+            const float eyeDistance = std::sqrt(
+                scene.camera.Position.x * scene.camera.Position.x +
+                scene.camera.Position.y * scene.camera.Position.y +
+                scene.camera.Position.z * scene.camera.Position.z);
+            g_grass.DrawDistance() =
+                eyeDistance + 88.0f * maxScale + 40.0f;
+        }
         g_grass.SetViewer(scene.camera.Position);
         static std::vector<GrassField::DrawRange> grassRanges;
         g_grass.GetVisible(grassRanges);
@@ -1784,6 +1766,10 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
             }
             shader.NextDrawCall();
         }
+        // Hand the authored distance back before anything else reads it --
+        // the dandelion cull below sizes itself from g_grass.DrawDistance().
+        if (deploymentGrass)
+            g_grass.DrawDistance() = authoredGrassDistance;
     }
 
     // Palm crowns are alpha-cut foliage too. Draw them into this same 4x HDR
@@ -1844,7 +1830,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Clustered light cull
     scene.clusteredRenderer.setScreenSize((float)g_dx12.screenWidth, (float)g_dx12.screenHeight);
     scene.clusteredRenderer.setCamera(scene.EffectiveCameraFOV(), scene.cameraNear,
-                                      scene.cameraFar, view, proj);
+                                      scene.EffectiveCameraFarPlane(), view, proj);
     scene.clusteredRenderer.cullLights();
 
     auto lightData = scene.clusteredRenderer.getPointLightData();

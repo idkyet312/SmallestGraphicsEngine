@@ -618,6 +618,57 @@ int main() {
     CHECK(std::abs(westwardHeading + DirectX::XM_PIDIV2) < 0.001f);
     CHECK(std::abs(std::sin(westwardHeading) + 1.0f) < 0.001f);
     CHECK(std::abs(std::cos(westwardHeading)) < 0.001f);
+    const DeploymentPlanner::CameraFrame defaultDeploymentFrame =
+        DeploymentPlanner::BuildCameraFrame(43.0f, 34.0f);
+    CHECK(std::abs(defaultDeploymentFrame.orbitRadius - 95.0f) < 0.001f);
+    CHECK(std::abs(defaultDeploymentFrame.height - 62.0f) < 0.001f);
+    CHECK(defaultDeploymentFrame.terrainViewRadius > 250.0f);
+    const auto farthestOceanCorner = [](const DeploymentPlanner::CameraFrame& frame,
+                                        float oceanHalfSpan) {
+        return std::sqrt(
+            2.0f * oceanHalfSpan * oceanHalfSpan +
+            frame.orbitRadius * frame.orbitRadius +
+            2.0f * std::sqrt(2.0f) * oceanHalfSpan * frame.orbitRadius +
+            frame.height * frame.height);
+    };
+    CHECK(defaultDeploymentFrame.farPlane >
+          farthestOceanCorner(defaultDeploymentFrame, 4096.0f));
+    const DeploymentPlanner::CameraFrame largeDeploymentFrame =
+        DeploymentPlanner::BuildCameraFrame(180.0f, 240.0f);
+    CHECK(largeDeploymentFrame.orbitRadius > defaultDeploymentFrame.orbitRadius);
+    CHECK(largeDeploymentFrame.height > defaultDeploymentFrame.height);
+    CHECK(largeDeploymentFrame.terrainViewRadius >
+          defaultDeploymentFrame.terrainViewRadius);
+    CHECK(largeDeploymentFrame.farPlane > defaultDeploymentFrame.farPlane);
+    const float largeDeploymentFarthestTerrain = std::sqrt(
+        std::pow(largeDeploymentFrame.orbitRadius +
+                 largeDeploymentFrame.terrainViewRadius, 2.0f) +
+        std::pow(largeDeploymentFrame.height, 2.0f));
+    CHECK(largeDeploymentFrame.farPlane > largeDeploymentFarthestTerrain);
+    for (const float deploymentRadius : {34.0f, 126.8f, 600.0f}) {
+        const DeploymentPlanner::CameraFrame oceanFrame =
+            DeploymentPlanner::BuildCameraFrame(
+                43.0f, deploymentRadius, 4096.0f);
+        CHECK(oceanFrame.farPlane >
+              farthestOceanCorner(oceanFrame, 4096.0f));
+    }
+
+    const DeploymentPlanner::CameraFrame maximumDeploymentFrame =
+        DeploymentPlanner::BuildCameraFrame(43.0f * 12.0f, 600.0f);
+    const float maximumTerrainRadius = (std::max)(
+        88.0f * 12.0f + 40.0f,
+        maximumDeploymentFrame.terrainViewRadius);
+    const uint32_t maximumDeploymentGrid =
+        DeploymentPlanner::DeploymentTerrainGridSide(
+            maximumTerrainRadius);
+    CHECK((maximumDeploymentGrid & 1u) == 0u);
+    CHECK(DeploymentPlanner::DeploymentTerrainHalfSpan(
+              maximumDeploymentGrid) >= maximumTerrainRadius);
+    CHECK(DeploymentPlanner::DeploymentTerrainHalfSpan(
+              maximumDeploymentGrid - 2u) < maximumTerrainRadius);
+    CHECK(std::abs(
+        DeploymentPlanner::DeploymentTerrainTileSize / 8.0f - 1.0f) <
+        0.001f);
 
     DeferredReleaseQueue<int> releases;
     releases.Retire(4, 10);

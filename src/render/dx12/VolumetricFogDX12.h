@@ -172,7 +172,10 @@ private:
         // cut where the beam is blocked, so the light does not fog through
         // walls the shading pass already occludes.
         int spotShadowIndex;
-        XMFLOAT2 spotPadding;
+        // x: 1 draws a shaft in the fog, 0 lights surfaces only. Claimed from
+        // the old padding so the struct size and alignment are unchanged.
+        float volumetric;
+        float spotPadding;
     };
     // StructuredBuffer stride: must equal FogPointLight in volumetric_fog.hlsl,
     // or every light after the first is read from the wrong offset.
@@ -446,7 +449,7 @@ private:
         constants.cameraPositionNear = { scene.camera.Position.x, scene.camera.Position.y,
             scene.camera.Position.z, scene.cameraNear };
         constants.cameraForwardFar = { scene.camera.Front.x, scene.camera.Front.y,
-            scene.camera.Front.z, scene.cameraFar };
+            scene.camera.Front.z, scene.EffectiveCameraFarPlane() };
         XMVECTOR sun = XMVector3Normalize(XMLoadFloat3(&scene.lightPos));
         XMFLOAT3 sunDirection;
         XMStoreFloat3(&sunDirection, sun);
@@ -541,7 +544,7 @@ private:
                              source.active ? source.intensity : 0.0f,
                              source.spotDirection, source.spotCosInner,
                              source.spotCosOuter, source.spotShadowIndex,
-                             XMFLOAT2(0.0f, 0.0f) };
+                             source.volumetric ? 1.0f : 0.0f, 0.0f };
         }
 
         D3D12_SHADER_RESOURCE_VIEW_DESC shadowSrv = {};

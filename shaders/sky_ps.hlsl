@@ -96,12 +96,12 @@ float4 DistantIslandSilhouettes(float3 ray, float3 skyColor) {
     profile = max(profile, DistantIslandProfile(
         azimuth,  2.12, 0.22, 0.033, 9.7));
 
-    // Match the visible edge of main.cpp's 600 m square ocean. Camera elevation
+    // Match the visible edge of main.cpp's 8192 m square ocean. Camera elevation
     // pushes that edge downward in the view; a fixed y mask made islands float
     // whenever the player climbed a hill.
     const float2 oceanDirection =
         ray.xz / max(length(ray.xz), 0.0001);
-    const float oceanHalfSpan = 300.0;
+    const float oceanHalfSpan = 4096.0;
     const float edgeX = oceanDirection.x >= 0.0
         ? oceanHalfSpan - cameraPosition.x
         : -oceanHalfSpan - cameraPosition.x;

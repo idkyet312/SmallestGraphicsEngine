@@ -51,8 +51,8 @@ struct TerrainPayload {
 //   tilesZ = ring count R
 //   tileSize = base (innermost) tile size
 static const uint kClipmapFlag = 2u;
-// Matches TerrainRendererDX12::kStylePinnedClipmapOrigin.
-static const uint kPinnedOriginFlag = 8u;
+// Matches TerrainRendererDX12::kStyleDeploymentOverview.
+static const uint kDeploymentOverviewFlag = 8u;
 
 groupshared TerrainPayload payloadData;
 groupshared uint visibleCount;
@@ -147,15 +147,14 @@ bool ResolveClipmapTile(uint id, uint G, uint R, float base,
     // hole on common tile lines -- verified gap-free and overlap-free for
     // R = 2..8 at random camera positions.
     float snapGrid = base * (float)(1u << (R - 1));
-    // kStylePinnedClipmapOrigin: snap to the world origin rather than the
-    // camera. The spot shadow pass sets this because it never rebinds viewPos
-    // to the light, so an unpinned origin would follow the player and make the
-    // terrain under the beam jump a whole coarse tile each time the camera
-    // crossed a snap cell. The ring layout is unchanged -- every ring still
-    // shares ONE origin, which is what keeps the boundaries seam-free.
-    const bool pinnedOrigin = (terrainStyle & kPinnedOriginFlag) != 0u;
-    float2 snapCentre = pinnedOrigin ? float2(0.0, 0.0) : viewPos.xz;
-    float2 snapped = floor(snapCentre / snapGrid) * snapGrid;
+    // Normal rendering follows its bound viewpoint. The deployment overview
+    // instead pins every terrain pass to the island: its camera can sit
+    // kilometres away, and following it would waste the fine rings on empty
+    // air while also giving the colour and shadow passes different coverage.
+    const bool islandCentered =
+        (terrainStyle & kDeploymentOverviewFlag) != 0u;
+    float2 clipmapCenter = islandCentered ? float2(0.0, 0.0) : viewPos.xz;
+    float2 snapped = floor(clipmapCenter / snapGrid) * snapGrid;
     originXZ = snapped + (float2(lx, lz) - (float)(G / 2)) * t;
     sizeOut = t;
     return true;
@@ -207,12 +206,16 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
             // In clipmap mode each ring already sets its resolution by tile
             // size, so keep near tiles at full tessellation; still drop LOD for
             // the coarse outer rings to save triangles.
-            float lodF = clamp((dist - lodNear) / lodStep, 0.0, 3.0);
-            uint lod = (uint)lodF;
+            const bool deploymentOverview =
+                (terrainStyle & kDeploymentOverviewFlag) != 0u;
+            float lodF = deploymentOverview
+                ? 0.0 : clamp((dist - lodNear) / lodStep, 0.0, 3.0);
+            uint lod = deploymentOverview ? 0u : (uint)lodF;
             // Geomorph: as the tile nears the threshold to the next-coarser LOD,
             // morph rises 0->1 over the last 30% of the band so fine vertices
             // slide onto the coarse grid instead of popping.
-            float morph = smoothstep(0.7, 1.0, frac(lodF));
+            float morph = deploymentOverview
+                ? 0.0 : smoothstep(0.7, 1.0, frac(lodF));
 
             uint slot;
             InterlockedAdd(visibleCount, 1, slot);

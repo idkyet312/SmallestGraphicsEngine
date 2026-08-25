@@ -785,7 +785,7 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
 
     scene.clusteredRenderer.setScreenSize((float)g_dx12.screenWidth, (float)g_dx12.screenHeight);
     scene.clusteredRenderer.setCamera(scene.EffectiveCameraFOV(), scene.cameraNear,
-        scene.cameraFar, view, proj);
+        scene.EffectiveCameraFarPlane(), view, proj);
     scene.clusteredRenderer.cullLights();
 
     // Register immutable meshes once. Frames upload instance/material records only.
@@ -1162,7 +1162,8 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
             g_profiler, "VB Resolve", g_dx12.commandList.Get());
         vb.Resolve(g_dx12.commandList.Get(), view, proj, lightSpace,
             previousViewProjection,
-            scene.camera.Position, scene.cameraNear, scene.cameraFar,
+            scene.camera.Position, scene.cameraNear,
+            scene.EffectiveCameraFarPlane(),
             scene.contactShadowStrength, scene.ambientOcclusionRadius,
             scene.contactShadowLinearDepth,
             dummyLB, dummyPL);

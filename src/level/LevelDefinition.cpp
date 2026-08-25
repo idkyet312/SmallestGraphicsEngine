@@ -199,6 +199,10 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         result.errors.push_back("unsupported schemaVersion " +
                                 std::to_string(level.schemaVersion));
     if (level.name.empty()) result.errors.push_back("level name is empty");
+    if (!std::isfinite(level.deploymentRadius) ||
+        level.deploymentRadius < kMinDeploymentRadius ||
+        level.deploymentRadius > kMaxDeploymentRadius)
+        result.errors.push_back("deployment radius must be between 5 and 600");
     if (!std::isfinite(level.terrainHeightScale) ||
         level.terrainHeightScale < 0.0f || level.terrainHeightScale > 50.0f)
         result.errors.push_back("terrain heightScale must be between 0 and 50");
@@ -309,6 +313,9 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
                 throw std::runtime_error("unknown insertionMode '" +
                                          mode.get<std::string>() + "'");
         }
+        // Old levels used the historical 34 m ring and did not save this key.
+        level.deploymentRadius = root.value(
+            "deploymentRadius", kDefaultDeploymentRadius);
         level.terrainHeightScale = root.at("terrain").at("heightScale").get<float>();
         {
             const json& terrainRoot = root.at("terrain");
@@ -500,6 +507,7 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
         const json root = {
             {"schemaVersion", level.schemaVersion}, {"name", level.name},
             {"insertionMode", LevelInsertionModeName(level.insertionMode)},
+            {"deploymentRadius", level.deploymentRadius},
             {"terrain", {{"heightScale", level.terrainHeightScale},
                          {"flat", level.terrainFlat},
                          {"tilesX", level.terrainTilesX},

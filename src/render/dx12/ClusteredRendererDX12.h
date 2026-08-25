@@ -30,16 +30,24 @@ struct PointLightDX12 {
     XMFLOAT3 spotDirection;
     float spotCosInner;
     float spotCosOuter;
-    // Slice of the spot shadow atlas this light samples, or -1 for a light
-    // that is not shadowed at all (every ordinary point light, and the
-    // player's flashlight). Several lights may share a slice: a vehicle's two
-    // headlights are cast from one frustum covering both.
+    // Slice of the spot shadow atlas this light samples, or -1 for an ordinary
+    // point light or unshadowed spot. The Humvee light owns its slice because
+    // perspective depth has to be captured from that lamp's exact origin.
     int spotShadowIndex;
+    // Whether this light draws a shaft in the volumetric fog. Surfaces are lit
+    // either way -- this only controls the glow in the air.
+    //
+    // The fog multiplies the light's intensity directly, so a light whose
+    // intensity is scaled for reach (the helicopter searchlight compensates
+    // distance falloff up to 28) blooms in the air even though the surface it
+    // is aimed at looks right. Turning the shaft off keeps that reach without
+    // the bloom.
+    bool volumetric;
 
     PointLightDX12() : position(XMFLOAT3(0,0,0)), radius(10.0f), color(XMFLOAT3(1,1,1)), intensity(1.0f),
                        constant(1.0f), linear(0.09f), quadratic(0.032f), active(true),
                        spotDirection(XMFLOAT3(0,0,0)), spotCosInner(0.0f), spotCosOuter(0.0f),
-                       spotShadowIndex(-1) {}
+                       spotShadowIndex(-1), volumetric(true) {}
 };
 
 class ClusteredRendererDX12 {
@@ -329,4 +337,3 @@ public:
 };
 
 #endif // CLUSTERED_RENDERER_DX12_H
-

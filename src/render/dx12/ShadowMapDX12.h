@@ -532,7 +532,7 @@ public:
     std::array<XMMATRIX, SHADOW_CASCADE_COUNT> ComputeCascadeMatrices(
         const Scene& scene) const {
         const float nearDepth = (std::max)(scene.cameraNear, 0.05f);
-        const float farDepth = (std::min)(scene.cameraFar,
+        const float farDepth = (std::min)(scene.EffectiveCameraFarPlane(),
             (std::max)(180.0f, scene.shadowFarPlane * 2.0f));
         constexpr float splitLambda = 0.65f;
         float splits[SHADOW_CASCADE_COUNT] = {};
@@ -632,24 +632,14 @@ public:
             terrainShader->Use(false);
             terrainShader->SetMatrices(XMMatrixIdentity(), XMMatrixIdentity(),
                                        lightSpace, lightSpace);
-            TerrainRendererDX12::Params shadowParams = CurrentTerrainParams();
-            // Spot casters only. This pass never rebinds viewPos to the lamp,
-            // so an unpinned clipmap would centre its tiling on the player and
-            // shift the terrain in the shadow map every time the camera crossed
-            // a snap cell -- the beam's shadow changing as the player moved.
-            // The sun cascades keep the camera-centred origin: they cover the
-            // whole view, so their tiling has to follow it.
-            //
-            // Gated on IsClipmap: the uniform-grid path has no snap origin to
-            // pin, and terrain_ms.hlsl tests `terrainStyle == 1` by equality
-            // for the stress island's warped coast. Setting the bit on that
-            // path (style 1 -> 9) would fail that test and drop the coastline
-            // from the shadow map while the forward pass still drew it.
-            if (spotCull &&
-                TerrainRendererDX12::IsClipmap(shadowParams.terrainStyle))
-                shadowParams.terrainStyle |=
-                    TerrainRendererDX12::kStylePinnedClipmapOrigin;
-            g_terrain.DrawShadow(*terrainShader, shadowParams);
+            // NOTE: do not call SetCamera here to re-centre the clipmap on the
+            // lamp. cameraBuffer is sized FRAME_COUNT -- ONE slot per frame,
+            // unlike matrixBuffer's per-draw-call slots -- so writing it mid
+            // frame overwrites the value every other pass in the same frame
+            // reads once the GPU runs the list, including the final shading.
+            // Centring the shadow clipmap on the light needs a per-draw camera
+            // slot (or the origin passed through TerrainParams) first.
+            g_terrain.DrawShadow(*terrainShader, CurrentTerrainParams());
         }
         depthShader.Use();
 
@@ -1171,6 +1161,7 @@ private:
             std::cerr << "Failed to create spot shadow atlas" << std::endl;
             return false;
         }
+        spotShadowMap->SetName(L"Humvee Spotlight Shadow Depth");
 
         D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
         dsvHeapDesc.NumDescriptors = SPOT_SHADOW_COUNT;
@@ -1178,6 +1169,7 @@ private:
         hr = g_dx12.device->CreateDescriptorHeap(
             &dsvHeapDesc, IID_PPV_ARGS(&spotDsvHeap));
         if (FAILED(hr)) return false;
+        spotDsvHeap->SetName(L"Humvee Spotlight Shadow DSVs");
 
         D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
         dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;

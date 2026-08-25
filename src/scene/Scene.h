@@ -246,9 +246,12 @@ struct Scene {
     float adsOffsetZ = 0.30f;
     bool   sniperScopeActive = false;
     float  cameraNear  = 0.1f;
-    // Far enough to see the sea run out to the horizon; the ocean plane alone is
-    // 600 m across, and a 100 m far plane sliced it off in plain view.
+    // Far enough for the ordinary camera to see uninterrupted sea to its
+    // horizon; the deployment view temporarily extends this when it pulls back.
     float  cameraFar   = 800.0f;
+    // Temporary projection extension for views such as deployment planning.
+    // Zero preserves the authored gameplay far plane and its depth precision.
+    float  cameraFarOverride = 0.0f;
     // Sub-pixel projection offset used by visibility-buffer TAA. Zero for
     // forward, raytracing, menus, and validation captures.
     XMFLOAT2 temporalJitterPixels = { 0.0f, 0.0f };
@@ -459,11 +462,9 @@ struct Scene {
     // NVIDIA Blast + Box3D destructible house
     bool  useDestruction = true;
     bool  showHelicopter = true;   // draw + simulate the hovering attack heli
-    // One centre-line headlight per Humvee rather than a left/right pair. The
-    // pair shared a single shadow frustum, so the second lamp only added an
-    // overlapping pool and another entry in the 64-light budget; the single
-    // lamp is the default. Turn this off to get the original two-lamp look.
-    bool  singleHumveeHeadlight = true;
+    // Whether the Humvee spotlight draws a shaft in the volumetric fog.
+    // Surfaces are lit either way; this only controls the glow in the air.
+    bool  spotlightVolumetric = false;
     bool  enableMSAA = true;
     bool  enableGrassMSAA = true;
     bool  enableFXAA = false;
@@ -526,8 +527,8 @@ struct Scene {
     float flyableCloudThickness = 30.0f;
     float flyableCloudDensity = 2.250f;
     float flyableCloudCoverage = 1.960f;
-    // Match the camera far plane so the volume reaches every edge and corner of
-    // the 600 m ocean instead of ending in a visible ring inside the map.
+    // Match the ordinary camera far plane so the volume does not end in a
+    // visible ring inside the playable view.
     float volumetricFogDistance = 800.0f;
     XMFLOAT3 volumetricFogTint = {
         168.0f / 255.0f, 181.0f / 255.0f, 176.0f / 255.0f
@@ -2049,6 +2050,9 @@ struct Scene {
         // at the sight picture feels the same as at the hip.
         return (1.0f - 0.72f * sniperScopeBlend) * (1.0f - 0.30f * adsBlend);
     }
+    float EffectiveCameraFarPlane() const {
+        return (std::max)(cameraFar, cameraFarOverride);
+    }
     XMMATRIX GetViewMatrix()       const { return const_cast<Camera&>(camera).GetViewMatrix(); }
     XMMATRIX GetProjectionMatrix() const {
         XMMATRIX projection = GetUnjitteredProjectionMatrix();
@@ -2078,7 +2082,7 @@ struct Scene {
         return XMMatrixPerspectiveFovLH(
             XMConvertToRadians(EffectiveCameraFOV()),
             (float)g_dx12.screenWidth / (float)g_dx12.screenHeight,
-            cameraNear, cameraFar);
+            cameraNear, EffectiveCameraFarPlane());
     }
 
     // -- Ejected free camera (Unreal's F8) --------------------------------------

@@ -1509,6 +1509,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGuizmo::BeginFrame();
     ImGuizmo::SetOrthographic(false);
     const ImVec2 display = ImGui::GetIO().DisplaySize;
+    bool showInsertionRadiusPreview = false;
     ImGuizmo::SetRect(0.0f, 0.0f, display.x, display.y);
 
     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_FirstUseEver);
@@ -2079,6 +2080,17 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             level_.insertionMode = static_cast<LevelInsertionMode>(mode);
         TrackItemEdit(insertionBefore, insertionChanged);
     }
+    {
+        const LevelDefinition insertionBefore = level_;
+        const bool insertionChanged = ImGui::SliderFloat(
+            "Insertion radius", &level_.deploymentRadius,
+            kMinDeploymentRadius, kMaxDeploymentRadius, "%.1f m");
+        TrackItemEdit(insertionBefore, insertionChanged);
+        showInsertionRadiusPreview = ImGui::IsItemActive();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Distance from island centre to every selectable "
+                              "deployment/drop-off point.");
+    }
     ImGui::Separator();
     LevelEntity* entity = Selected();
     if (entity) {
@@ -2641,6 +2653,62 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         SelectFromViewport(view, projection);
     ImDrawList* draw = ImGui::GetForegroundDrawList();
     XMMATRIX viewProjection = view * projection;
+    if (showInsertionRadiusPreview && terrainHeight) {
+        constexpr int ringSegments = 96;
+        ImVec2 ring[ringSegments + 1];
+        bool visible[ringSegments + 1] = {};
+        const auto projectInsertionPoint = [&](float x, float z,
+                                               ImVec2& screen) {
+            const float y = terrainHeight(x, z) + 0.15f;
+            const XMVECTOR clip = XMVector3Transform(
+                XMVectorSet(x, y, z, 1.0f), viewProjection);
+            const float w = XMVectorGetW(clip);
+            if (w <= 0.01f) return false;
+            const float sx = (XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x;
+            const float sy =
+                (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y;
+            if (!std::isfinite(sx) || !std::isfinite(sy)) return false;
+            screen = ImVec2(sx, sy);
+            return true;
+        };
+
+        for (int i = 0; i <= ringSegments; ++i) {
+            const float angle = XM_2PI * static_cast<float>(i) /
+                                static_cast<float>(ringSegments);
+            const float x = std::sin(angle) * level_.deploymentRadius;
+            const float z = std::cos(angle) * level_.deploymentRadius;
+            visible[i] = projectInsertionPoint(x, z, ring[i]);
+        }
+        const ImU32 ringColour = IM_COL32(70, 220, 255, 235);
+        for (int i = 0; i < ringSegments; ++i)
+            if (visible[i] && visible[i + 1])
+                draw->AddLine(ring[i], ring[i + 1], ringColour, 2.5f);
+
+        ImVec2 labelPoint{};
+        bool haveLabelPoint = false;
+        constexpr int deploymentZoneCount = 20;
+        for (int i = 0; i < deploymentZoneCount; ++i) {
+            const float angle = XM_2PI * static_cast<float>(i) /
+                                static_cast<float>(deploymentZoneCount);
+            ImVec2 point;
+            if (!projectInsertionPoint(
+                    std::sin(angle) * level_.deploymentRadius,
+                    std::cos(angle) * level_.deploymentRadius, point))
+                continue;
+            draw->AddCircleFilled(point, 4.5f, IM_COL32(255, 205, 70, 245));
+            if (!haveLabelPoint) {
+                labelPoint = point;
+                haveLabelPoint = true;
+            }
+        }
+        if (haveLabelPoint) {
+            char label[64] = {};
+            std::snprintf(label, sizeof(label), "Insertion radius %.1f m",
+                          level_.deploymentRadius);
+            draw->AddText(ImVec2(labelPoint.x + 8.0f, labelPoint.y - 18.0f),
+                          IM_COL32(210, 245, 255, 255), label);
+        }
+    }
     for (const LevelEntity& marker : level_.entities) {
         if (!marker.enabled) continue;
         XMVECTOR clip = XMVector3Transform(XMVectorSet(marker.transform.position[0],

@@ -13,6 +13,9 @@
 #include <sstream>
 #include <vector>
 
+bool DeploymentPlanningActive();
+int DeploymentWaterDebugMode();
+
 class WaterRendererDX12 {
 public:
     bool initialized = false;
@@ -67,6 +70,8 @@ public:
         ldrMSAADepthPSO_.Reset();
         clipVertexBuffer_.Reset();
         clipIndexBuffer_.Reset();
+        deploymentClipVertexBuffer_.Reset();
+        deploymentClipIndexBuffer_.Reset();
         hdrSceneCopy_.Reset();
         ldrSceneCopy_.Reset();
         descriptorHeap_.Reset();
@@ -78,7 +83,11 @@ public:
         clipVertexView_ = {};
         clipIndexView_ = {};
         clipIndexCount_ = 0;
+        deploymentClipVertexView_ = {};
+        deploymentClipIndexView_ = {};
+        deploymentClipIndexCount_ = 0;
         hasHistory_ = false;
+        previousDeploymentPlanning_ = false;
     }
 
     void Render(const Scene& scene,
@@ -144,11 +153,16 @@ public:
         const XMMATRIX view = scene.GetViewMatrix();
         const XMMATRIX projection = scene.GetProjectionMatrix();
         const XMMATRIX viewProjection = view * projection;
+        const bool deploymentPlanning = DeploymentPlanningActive();
         const float snap = 0.25f;
-        const XMFLOAT2 clipCenter = {
-            std::floor(scene.camera.Position.x / snap) * snap,
-            std::floor(scene.camera.Position.z / snap) * snap
-        };
+        const XMFLOAT2 clipCenter = deploymentPlanning
+            ? XMFLOAT2{ 0.0f, 0.0f }
+            : XMFLOAT2{
+                std::floor(scene.camera.Position.x / snap) * snap,
+                std::floor(scene.camera.Position.z / snap) * snap
+            };
+        if (deploymentPlanning != previousDeploymentPlanning_)
+            hasHistory_ = false;
         if (!hasHistory_) {
             previousViewProjection_ = viewProjection;
             previousClipCenter_ = clipCenter;
@@ -159,11 +173,17 @@ public:
             Constants constants = BuildConstants(
                 scene, ocean, viewProjection, clipCenter, true);
             BindConstants(constants, 0);
-            list->IASetVertexBuffers(0, 1, &clipVertexView_);
-            list->IASetIndexBuffer(&clipIndexView_);
+            const D3D12_VERTEX_BUFFER_VIEW& oceanVB = deploymentPlanning
+                ? deploymentClipVertexView_ : clipVertexView_;
+            const D3D12_INDEX_BUFFER_VIEW& oceanIB = deploymentPlanning
+                ? deploymentClipIndexView_ : clipIndexView_;
+            const UINT oceanIndexCount = deploymentPlanning
+                ? deploymentClipIndexCount_ : clipIndexCount_;
+            list->IASetVertexBuffers(0, 1, &oceanVB);
+            list->IASetIndexBuffer(&oceanIB);
             list->IASetPrimitiveTopology(
                 D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            list->DrawIndexedInstanced(clipIndexCount_, 1, 0, 0, 0);
+            list->DrawIndexedInstanced(oceanIndexCount, 1, 0, 0, 0);
         }
 
         if (pool.IsInitialized()) {
@@ -196,6 +216,7 @@ public:
         previousViewProjection_ = viewProjection;
         previousClipCenter_ = clipCenter;
         previousOceanTime_ = ocean.GetTime();
+        previousDeploymentPlanning_ = deploymentPlanning;
         hasHistory_ = true;
     }
 
@@ -381,17 +402,100 @@ private:
     }
 
     bool CreateClipmap() {
-        constexpr int gridCells = 64;
-        constexpr int halfCells = gridCells / 2;
-        constexpr int holeHalfCells = gridCells / 4;
-        const float outerExtents[6] = {
-            8.0f, 16.0f, 32.0f, 64.0f, 128.0f, 420.0f
-        };
+        static constexpr std::array<float, 6> gameplayExtents = {
+            8.0f, 16.0f, 32.0f, 64.0f, 128.0f, 4096.0f };
+        // Deployment evaluates its wave normal and crest per pixel. A flat
+        // full-span grid therefore has no geometric LOD rings to reveal as the
+        // camera orbits, while its subdivisions keep homogeneous clipping
+        // reliable near the ocean horizon.
+        return CreateClipmapMesh(
+                   64, gameplayExtents, clipVertexBuffer_, clipIndexBuffer_,
+                   clipVertexView_, clipIndexView_, clipIndexCount_) &&
+               CreateGridMesh(
+                   128, 4096.0f,
+                   deploymentClipVertexBuffer_, deploymentClipIndexBuffer_,
+                   deploymentClipVertexView_, deploymentClipIndexView_,
+                   deploymentClipIndexCount_);
+    }
+
+    bool CreateGridMesh(
+        int gridCells,
+        float halfSpan,
+        ComPtr<ID3D12Resource>& vertexBuffer,
+        ComPtr<ID3D12Resource>& indexBuffer,
+        D3D12_VERTEX_BUFFER_VIEW& vertexView,
+        D3D12_INDEX_BUFFER_VIEW& indexView,
+        UINT& indexCount) {
         std::vector<ClipVertex> vertices;
         std::vector<uint32_t> indices;
-        vertices.reserve(6 * (gridCells + 1) * (gridCells + 1));
+        vertices.reserve(static_cast<size_t>(gridCells + 1) *
+                         static_cast<size_t>(gridCells + 1));
+        indices.reserve(static_cast<size_t>(gridCells) * gridCells * 6);
 
-        for (int level = 0; level < 6; ++level) {
+        for (int z = 0; z <= gridCells; ++z) {
+            for (int x = 0; x <= gridCells; ++x) {
+                const float u = static_cast<float>(x) / gridCells;
+                const float v = static_cast<float>(z) / gridCells;
+                ClipVertex vertex = {};
+                vertex.position = {
+                    (u * 2.0f - 1.0f) * halfSpan,
+                    0.0f,
+                    (v * 2.0f - 1.0f) * halfSpan
+                };
+                vertex.normal = { 0.0f, 1.0f, 0.0f };
+                vertex.texCoord = { u, v };
+                vertex.tangent = { 1.0f, 0.0f, 0.0f, 0.0f };
+                vertices.push_back(vertex);
+            }
+        }
+        for (int z = 0; z < gridCells; ++z) {
+            for (int x = 0; x < gridCells; ++x) {
+                const uint32_t a =
+                    static_cast<uint32_t>(z * (gridCells + 1) + x);
+                const uint32_t b = a + 1;
+                const uint32_t c = a + gridCells + 1;
+                const uint32_t d = c + 1;
+                indices.insert(indices.end(), {a, c, b, b, c, d});
+            }
+        }
+
+        if (!CreateUploadBuffer(
+                vertices.data(),
+                static_cast<UINT>(vertices.size() * sizeof(ClipVertex)),
+                vertexBuffer)) return false;
+        if (!CreateUploadBuffer(
+                indices.data(),
+                static_cast<UINT>(indices.size() * sizeof(uint32_t)),
+                indexBuffer)) return false;
+        vertexView.BufferLocation = vertexBuffer->GetGPUVirtualAddress();
+        vertexView.SizeInBytes =
+            static_cast<UINT>(vertices.size() * sizeof(ClipVertex));
+        vertexView.StrideInBytes = sizeof(ClipVertex);
+        indexView.BufferLocation = indexBuffer->GetGPUVirtualAddress();
+        indexView.SizeInBytes =
+            static_cast<UINT>(indices.size() * sizeof(uint32_t));
+        indexView.Format = DXGI_FORMAT_R32_UINT;
+        indexCount = static_cast<UINT>(indices.size());
+        return true;
+    }
+
+    template <size_t LevelCount>
+    bool CreateClipmapMesh(
+        int gridCells,
+        const std::array<float, LevelCount>& outerExtents,
+        ComPtr<ID3D12Resource>& vertexBuffer,
+        ComPtr<ID3D12Resource>& indexBuffer,
+        D3D12_VERTEX_BUFFER_VIEW& vertexView,
+        D3D12_INDEX_BUFFER_VIEW& indexView,
+        UINT& indexCount) {
+        const int halfCells = gridCells / 2;
+        const int holeHalfCells = gridCells / 4;
+        std::vector<ClipVertex> vertices;
+        std::vector<uint32_t> indices;
+        vertices.reserve(
+            LevelCount * static_cast<size_t>(gridCells + 1) * (gridCells + 1));
+
+        for (size_t level = 0; level < LevelCount; ++level) {
             const float outer = outerExtents[level];
             const float inner = level == 0 ? 0.0f : outerExtents[level - 1];
             const uint32_t baseVertex =
@@ -450,22 +554,22 @@ private:
         if (!CreateUploadBuffer(
                 vertices.data(),
                 static_cast<UINT>(vertices.size() * sizeof(ClipVertex)),
-                clipVertexBuffer_)) return false;
+                vertexBuffer)) return false;
         if (!CreateUploadBuffer(
                 indices.data(),
                 static_cast<UINT>(indices.size() * sizeof(uint32_t)),
-                clipIndexBuffer_)) return false;
-        clipVertexView_.BufferLocation =
-            clipVertexBuffer_->GetGPUVirtualAddress();
-        clipVertexView_.SizeInBytes =
+                indexBuffer)) return false;
+        vertexView.BufferLocation =
+            vertexBuffer->GetGPUVirtualAddress();
+        vertexView.SizeInBytes =
             static_cast<UINT>(vertices.size() * sizeof(ClipVertex));
-        clipVertexView_.StrideInBytes = sizeof(ClipVertex);
-        clipIndexView_.BufferLocation =
-            clipIndexBuffer_->GetGPUVirtualAddress();
-        clipIndexView_.SizeInBytes =
+        vertexView.StrideInBytes = sizeof(ClipVertex);
+        indexView.BufferLocation =
+            indexBuffer->GetGPUVirtualAddress();
+        indexView.SizeInBytes =
             static_cast<UINT>(indices.size() * sizeof(uint32_t));
-        clipIndexView_.Format = DXGI_FORMAT_R32_UINT;
-        clipIndexCount_ = static_cast<UINT>(indices.size());
+        indexView.Format = DXGI_FORMAT_R32_UINT;
+        indexCount = static_cast<UINT>(indices.size());
         return true;
     }
 
@@ -636,7 +740,9 @@ private:
         };
         constants.volume1 = {
             extents.x * 0.5f, extents.z * 0.5f,
-            ocean ? extents.x * 0.5f : 0.0f,
+            ocean && DeploymentPlanningActive()
+                ? 1.0f + static_cast<float>(DeploymentWaterDebugMode())
+                : 0.0f,
             scene.waterQuality == WaterQuality::High ? 1.0f : 0.0f
         };
 
@@ -747,6 +853,7 @@ private:
     UINT descriptorSize_ = 0;
     UINT constantStride_ = 0;
     UINT clipIndexCount_ = 0;
+    UINT deploymentClipIndexCount_ = 0;
     std::string shaderSource_;
     ComPtr<ID3D12RootSignature> rootSignature_;
     ComPtr<ID3D12PipelineState> hdrMotionPSO_;
@@ -755,14 +862,19 @@ private:
     ComPtr<ID3D12PipelineState> ldrMSAADepthPSO_;
     ComPtr<ID3D12Resource> clipVertexBuffer_;
     ComPtr<ID3D12Resource> clipIndexBuffer_;
+    ComPtr<ID3D12Resource> deploymentClipVertexBuffer_;
+    ComPtr<ID3D12Resource> deploymentClipIndexBuffer_;
     D3D12_VERTEX_BUFFER_VIEW clipVertexView_ = {};
     D3D12_INDEX_BUFFER_VIEW clipIndexView_ = {};
+    D3D12_VERTEX_BUFFER_VIEW deploymentClipVertexView_ = {};
+    D3D12_INDEX_BUFFER_VIEW deploymentClipIndexView_ = {};
     ComPtr<ID3D12Resource> hdrSceneCopy_;
     ComPtr<ID3D12Resource> ldrSceneCopy_;
     ComPtr<ID3D12DescriptorHeap> descriptorHeap_;
     ComPtr<ID3D12Resource> constantBuffer_;
     uint8_t* mappedConstants_ = nullptr;
     bool hasHistory_ = false;
+    bool previousDeploymentPlanning_ = false;
     XMMATRIX previousViewProjection_ = XMMatrixIdentity();
     XMFLOAT2 previousClipCenter_ = { 0.0f, 0.0f };
     float previousOceanTime_ = 0.0f;

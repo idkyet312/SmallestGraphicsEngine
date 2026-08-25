@@ -80,6 +80,7 @@ int main() {
     level.dxrDDGI.maxRayDistance = 42.0f;
     level.dxrDDGI.hysteresis = 0.9f;
     level.insertionMode = LevelInsertionMode::PlayerChoice;
+    level.deploymentRadius = 137.5f;
 
     const auto root = std::filesystem::temp_directory_path() /
                       "smallest-graphics-engine-level-tests";
@@ -122,6 +123,7 @@ int main() {
     CHECK(loaded.level.dxrDDGI.maxRayDistance == 42.0f);
     CHECK(loaded.level.dxrDDGI.hysteresis == 0.9f);
     CHECK(loaded.level.insertionMode == LevelInsertionMode::PlayerChoice);
+    CHECK(loaded.level.deploymentRadius == 137.5f);
     LevelInsertionMode insertion = LevelInsertionMode::Helicopter;
     CHECK(ParseLevelInsertionMode("boat", insertion));
     CHECK(insertion == LevelInsertionMode::Boat);
@@ -160,6 +162,9 @@ int main() {
     LevelDefinition boundaryGI = level;
     boundaryGI.dxrDDGI.maxProbes = kMaxDDGIProbes;
     CHECK(ValidateLevel(boundaryGI).ok);
+    LevelDefinition invalidDeployment = level;
+    invalidDeployment.deploymentRadius = kMaxDeploymentRadius + 1.0f;
+    CHECK(!ValidateLevel(invalidDeployment).ok);
 
     std::filesystem::create_directories(root);
     const auto malformed = root / "malformed.json";
@@ -181,6 +186,7 @@ int main() {
     CHECK(!legacyLoaded.level.dxrDDGI.enabled);
     // Files saved before insertion modes existed all arrived by helicopter.
     CHECK(legacyLoaded.level.insertionMode == LevelInsertionMode::Helicopter);
+    CHECK(legacyLoaded.level.deploymentRadius == kDefaultDeploymentRadius);
 
     // An unknown mode is rejected rather than silently falling back, so a typo
     // in a hand-edited level is caught at load.

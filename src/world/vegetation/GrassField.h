@@ -708,12 +708,20 @@ private:
             const float cx = (Rand(seed) * 2.0f - 1.0f) * half;
             const float cz = (Rand(seed) * 2.0f - 1.0f) * half;
 
-            // Keep the playable centre dense, then progressively thin the large
-            // stress-test island. At 120 m and beyond only 15% of generated
-            // tufts remain. Authored patches below intentionally bypass this.
+            // Keep the playable centre dense, then progressively thin the far
+            // edge. Authored patches below intentionally bypass this.
+            //
+            // Tied to the scatter span rather than a fixed 90 m: on an island
+            // long enough to need a wider span (islandv3 reaches +/-121 m on Z)
+            // a fixed radius thinned the outer half of the map to 15% even
+            // though the splatmap painted grass all the way out. Starting the
+            // falloff at 90% of the half-span keeps the original behaviour at
+            // the default 100 m span and scales it with anything larger.
             const float radialDistance = std::sqrt(cx * cx + cz * cz);
+            const float falloffStart = half * 0.9f;
+            const float falloffRange = (std::max)(half * 0.3f, 1.0f);
             const float falloffT = std::clamp(
-                (radialDistance - 90.0f) / 30.0f, 0.0f, 1.0f);
+                (radialDistance - falloffStart) / falloffRange, 0.0f, 1.0f);
             const float smoothFalloff =
                 falloffT * falloffT * (3.0f - 2.0f * falloffT);
             const float radialDensity = 1.0f - smoothFalloff * 0.85f;

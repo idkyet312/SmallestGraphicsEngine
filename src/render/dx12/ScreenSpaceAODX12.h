@@ -643,7 +643,7 @@ private:
             scene.contactShadowStrength };
         constants.aoParams = {
             scene.ambientOcclusionRadius, scene.ambientOcclusionStrength,
-            scene.ambientOcclusionBias, scene.cameraFar };
+            scene.ambientOcclusionBias, scene.EffectiveCameraFarPlane() };
         constants.screenParams = {
             static_cast<float>(g_dx12.screenWidth),
             static_cast<float>(g_dx12.screenHeight),

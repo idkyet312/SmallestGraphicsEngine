@@ -15,7 +15,10 @@ struct FogPointLight
     float spotCosInner;
     float spotCosOuter;
     int spotShadowIndex;
-    float2 spotPadding;
+    // 1 draws a shaft in the fog, 0 lights surfaces only. Must match GPULight
+    // in VolumetricFogDX12.h.
+    float volumetric;
+    float spotPadding;
 };
 
 cbuffer FogConstants : register(b0)
@@ -672,6 +675,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             if (lightIndex >= clusterDimsLightCount.w)
                 continue;
             FogPointLight light = pointLights[lightIndex];
+            // Lights flagged non-volumetric light surfaces but draw no shaft.
+            if (light.volumetric < 0.5)
+                continue;
             float3 toLight = light.position - worldPosition;
             float distanceToLight = length(toLight);
             float range = saturate(1.0 - distanceToLight / max(light.radius, 0.001));
