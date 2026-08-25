@@ -207,15 +207,54 @@ public:
     bool ShootSurface(const XMFLOAT3& start, const XMFLOAT3& end,
                       XMFLOAT3& hit, float strength = 0.38f) {
         if (!IsInitialized()) return false;
-        const float startSurface = m_surfaceY + WaveHeightAt(start.x, start.z);
-        const float endSurface = m_surfaceY + WaveHeightAt(end.x, end.z);
-        const float d0 = start.y - startSurface;
-        const float d1 = end.y - endSurface;
-        if (d0 * d1 > 0.0f || std::abs(d0 - d1) < 1e-6f) return false;
 
-        const float t = (std::max)(0.0f, (std::min)(1.0f, d0 / (d0 - d1)));
-        const float x = start.x + (end.x - start.x) * t;
-        const float z = start.z + (end.z - start.z) * t;
+        // March the segment instead of only testing its endpoints. A round at
+        // 300 m/s covers ~5 m per frame; on a shallow, long-range shot both
+        // endpoints can sit above the surface while the middle of the segment
+        // passes through a wave crest, and a pure endpoint-sign test misses
+        // that entirely -- which is why splashes only appeared on steep or
+        // close shots. Sampling along the span catches the crossing wherever
+        // it happens. Same shape as the terrain sweep: step, then bisect.
+        const float dx = end.x - start.x;
+        const float dy = end.y - start.y;
+        const float dz = end.z - start.z;
+        const float length = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (length < 1e-6f) return false;
+        const int steps = (std::max)(4, (std::min)(32,
+            static_cast<int>(std::ceil(length / 0.35f))));
+
+        auto signedDepth = [&](float t) {
+            const float px = start.x + dx * t;
+            const float py = start.y + dy * t;
+            const float pz = start.z + dz * t;
+            return py - (m_surfaceY + WaveHeightAt(px, pz));
+        };
+
+        float previousT = 0.0f;
+        float d0 = signedDepth(0.0f);
+        float crossLo = -1.0f, crossHi = -1.0f;
+        for (int step = 1; step <= steps; ++step) {
+            const float t = static_cast<float>(step) / static_cast<float>(steps);
+            const float d = signedDepth(t);
+            if (d0 * d <= 0.0f && std::abs(d0 - d) > 1e-6f) {
+                crossLo = previousT;
+                crossHi = t;
+                break;
+            }
+            previousT = t;
+            d0 = d;
+        }
+        if (crossHi < 0.0f) return false;   // never broke the surface
+
+        // Bisect the bracketed span down to the actual crossing point.
+        for (int refine = 0; refine < 6; ++refine) {
+            const float mid = (crossLo + crossHi) * 0.5f;
+            if (signedDepth(crossLo) * signedDepth(mid) <= 0.0f) crossHi = mid;
+            else crossLo = mid;
+        }
+        const float t = (crossLo + crossHi) * 0.5f;
+        const float x = start.x + dx * t;
+        const float z = start.z + dz * t;
         const float halfX = m_extents.x * 0.5f;
         const float halfZ = m_extents.z * 0.5f;
         if (x < m_center.x - halfX || x > m_center.x + halfX ||

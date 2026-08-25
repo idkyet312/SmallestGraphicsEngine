@@ -2978,6 +2978,15 @@ static void UpdateHelicopter(float dt) {
     XMStoreFloat4x4(&identity, XMMatrixIdentity());
     g_helicopterModel->UpdateGlobalTransform(identity);
 
+    // The airframe keeps flying on the deployment screen -- it is part of the
+    // map read -- but it must not engage. The player body is parked at the
+    // insertion point while the zone is being chosen and cannot fight back,
+    // so acquiring it there is a free kill before the run has started.
+    if (DeploymentPlanningActive()) {
+        g_helicopterFireCooldown = 0.0f;
+        return;
+    }
+
     g_helicopterFireCycleTime = std::fmod(
         g_helicopterFireCycleTime + dt, 7.0f);
     if (g_helicopterFireCycleTime >= 2.0f) {
@@ -3396,6 +3405,12 @@ static void UpdateSecondaryHelicopter(float dt) {
         (desiredRoll - g_secondaryHelicopterRoll) * attitudeLerp;
     g_secondaryHelicopterPitch +=
         (desiredPitch - g_secondaryHelicopterPitch) * attitudeLerp;
+
+    // Held to the same rule as the primary airframe: flies, does not engage.
+    if (DeploymentPlanningActive()) {
+        g_secondaryHelicopterFireCooldown = 0.0f;
+        return;
+    }
 
     g_secondaryHelicopterFireCycleTime = std::fmod(
         g_secondaryHelicopterFireCycleTime + dt, 7.0f);
@@ -17023,6 +17038,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 const float bulletRadius = projectile.flame
                     ? 0.24f
                     : std::max(0.12f, scene.projectileScale * 0.5f);
+                // Water no longer stops a round: it only marks where the round
+                // went in. Detected up front, outside the impact chain, so a
+                // surface crossing never consumes the frame's collision test --
+                // the shot still goes on to hit the seabed, a submerged target
+                // or the player underneath. Harpoons are the one exception and
+                // anchor at the entry point; the chain below handles that.
+                XMFLOAT3 waterEntry{};
+                bool waterEntryValid = false;
+                if (!g_emptyLevelMode) {
+                    if (g_water.ShootSurface(projectile.previousPosition,
+                                             projectile.position, waterEntry)) {
+                        waterEntryValid = true;
+                    } else if (g_ocean.ShootSurface(projectile.previousPosition,
+                                                    projectile.position,
+                                                    waterEntry, 0.28f)) {
+                        waterEntryValid = true;
+                    }
+                    if (waterEntryValid) {
+                        // ShootSurface already rings the surface sim itself, so
+                        // no Splash() call here -- that would double the wave.
+                        // This is the visible spray on top of it.
+                        scene.SpawnWaterSplash(waterEntry, 1.0f);
+                    }
+                }
+
                 struct BanditProjectileHit {
                     SkinnedEnemy* enemy = nullptr;
                     XMFLOAT3 position = {};
@@ -17492,25 +17532,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         g_trees.IgniteNear(treeHit, 0.85f);
                     }
                     stopProjectileAt(treeHit);
-                } else if (XMFLOAT3 waterHit;
-                           !g_emptyLevelMode && g_water.ShootSurface(projectile.previousPosition,
-                                                projectile.position, waterHit)) {
-                    projectile.position = waterHit;
-                    if (projectile.laser) scene.StopLaserBeamAt(waterHit);
-                    if (projectile.harpoon) scene.ShowHarpoonTether(waterHit);
-                    stopProjectileAt(waterHit);
-                } else if (XMFLOAT3 oceanHit;
-                           !g_emptyLevelMode && g_ocean.ShootSurface(projectile.previousPosition,
-                                                projectile.position, oceanHit, 0.28f)) {
-                    projectile.position = oceanHit;
-                    if (projectile.laser) scene.StopLaserBeamAt(oceanHit);
-                    if (projectile.harpoon) scene.ShowHarpoonTether(oceanHit);
-                    stopProjectileAt(oceanHit);
+                } else if (waterEntryValid && projectile.harpoon) {
+                    // Tether weapons still anchor at the surface: a harpoon
+                    // line has to start somewhere the rope can attach.
+                    projectile.position = waterEntry;
+                    scene.ShowHarpoonTether(waterEntry);
+                    stopProjectileAt(waterEntry);
                 } else if (XMFLOAT3 terrainHit;
                            HitTerrainSegment(projectile.previousPosition,
                                              projectile.position,
                                              bulletRadius, terrainHit)) {
                     projectile.position = terrainHit;
+                    // Dirt kicks up where a round lands. Same small burst the
+                    // tree branch uses, so ground hits read at the same weight
+                    // as every other world impact instead of landing silently.
+                    // Player fire only: incoming rounds already telegraph
+                    // themselves, and smoking every one of them would fog the
+                    // ground during a firefight and cost fill for nothing.
+                    if (!projectile.hostile) {
+                        scene.SpawnSmokeBurst(terrainHit, 0.25f, 0.1f);
+                    }
                     if (projectile.laser) scene.StopLaserBeamAt(terrainHit);
                     if (projectile.harpoon) scene.ShowHarpoonTether(terrainHit);
                     if (projectile.flame) scene.SpawnCarriedFire(terrainHit);

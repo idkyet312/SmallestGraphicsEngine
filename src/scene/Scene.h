@@ -1631,6 +1631,83 @@ struct Scene {
         }
     }
 
+    // A round breaking the surface throws water up. The ring wave the water
+    // sim raises is a flat deformation -- correct, but it reads as nothing at
+    // a distance -- so the visible part is here: a narrow column of droplets
+    // kicked straight up, plus a low outward crown around the entry point.
+    //
+    // Droplets are spawned as sparks. Not for the brightness, but for the
+    // motion: the spark branch of the particle integrator is the only one with
+    // real gravity (-22) and near-zero drag, which is exactly the ballistic arc
+    // water needs. The colour makes it read as water rather than embers.
+    void SpawnWaterSplash(const XMFLOAT3& point, float strength = 1.0f) {
+        auto rnd = [&]() { return (float)std::rand() / RAND_MAX * 2.0f - 1.0f; };
+        int spawned = 0;
+
+        // Droplets are small in world units, so a splash 150 m out lands well
+        // under a pixel and reads as nothing. Grow them with distance to hold
+        // a roughly constant on-screen size -- the splash stays legible at
+        // range without looking oversized underfoot. Capped so a shot at the
+        // horizon does not throw a house-sized plume.
+        const float ddx = point.x - camera.Position.x;
+        const float ddy = point.y - camera.Position.y;
+        const float ddz = point.z - camera.Position.z;
+        const float distance = std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+        const float sizeScale =
+            (std::min)(6.0f, (std::max)(1.0f, distance / 18.0f));
+
+        // Central column: fast, near-vertical, the part that carries height.
+        const int jets = (std::max)(3, (int)(7 * strength));
+        for (int i = 0; i < jets; ++i) {
+            ImpactParticle drop;
+            drop.position = { point.x + rnd() * 0.10f,
+                              point.y + 0.04f,
+                              point.z + rnd() * 0.10f };
+            // Height scales with distance for the same reason size does: the
+            // column has to subtend a usable angle to be seen at all. Square
+            // root so it grows more gently than the droplets themselves.
+            const float reach = std::sqrt(sizeScale);
+            const float up = (3.4f + std::abs(rnd()) * 2.6f) * strength * reach;
+            drop.velocity = { rnd() * 0.9f * reach, up, rnd() * 0.9f * reach };
+            drop.maxLife = drop.life = (0.45f + std::abs(rnd()) * 0.35f) * reach;
+            drop.size = (0.05f + std::abs(rnd()) * 0.05f) * sizeScale;
+            drop.growth = -drop.size * 0.35f;
+            // Pale blue-white: foam, not clear water.
+            const float w = 0.72f + std::abs(rnd()) * 0.28f;
+            drop.color = { w * 0.80f, w * 0.92f, w };
+            drop.spark = true;
+            impactParticles.push_back(drop); ++spawned;
+        }
+
+        // Crown: slower, thrown outward and low, so the splash has a base
+        // instead of being a bare vertical line.
+        const int crown = (std::max)(4, (int)(9 * strength));
+        for (int i = 0; i < crown; ++i) {
+            const float angle = XM_2PI * ((float)i + 0.4f * rnd()) / (float)crown;
+            const float out = (1.5f + std::abs(rnd()) * 1.4f) * strength *
+                              std::sqrt(sizeScale);
+            ImpactParticle drop;
+            drop.position = { point.x + std::cos(angle) * 0.12f,
+                              point.y + 0.03f,
+                              point.z + std::sin(angle) * 0.12f };
+            drop.velocity = { std::cos(angle) * out,
+                              1.1f + std::abs(rnd()) * 1.3f,
+                              std::sin(angle) * out };
+            drop.maxLife = drop.life =
+                (0.35f + std::abs(rnd()) * 0.30f) * std::sqrt(sizeScale);
+            drop.size = (0.04f + std::abs(rnd()) * 0.04f) * sizeScale;
+            drop.growth = -drop.size * 0.30f;
+            const float w = 0.70f + std::abs(rnd()) * 0.30f;
+            drop.color = { w * 0.78f, w * 0.90f, w };
+            drop.spark = true;
+            impactParticles.push_back(drop); ++spawned;
+        }
+
+        if (impactParticles.size() > 1000)
+            impactParticles.erase(impactParticles.begin(),
+                impactParticles.begin() + spawned);
+    }
+
     void SpawnBloodBurst(const XMFLOAT3& point, const XMFLOAT3& normal) {
         auto rnd = [&]() { return (float)std::rand() / RAND_MAX * 2.0f - 1.0f; };
         constexpr int droplets = 8;
@@ -1698,15 +1775,14 @@ struct Scene {
     void ShootProjectile() {
         // Bullets leave inside the cone the reticle is showing, so sights
         // tighten grouping in two ways: the bloom itself collapses under ADS,
-        // and sighted fire is almost perfectly flat. Holding the sights on a
-        // target is the way to land sustained fire; hipfire is the spray option.
-        const float recoilScale = 1.0f - 0.90f * adsBlend;
+        // and the kick halves. Sighted fire is steadier but still climbs -- the
+        // recoil has to be fought either way, just less hard down the sights.
+        const float recoilScale = 1.0f - 0.50f * adsBlend;
         const float randomYaw = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) *
                                 recoilYaw * recoilScale;
         camera.ApplyRecoil(recoilPitch * recoilScale, randomYaw);
         // Carbine tap. Scaled by the same recoilScale the aim kick uses, so
-        // sighted fire shakes as little as it climbs -- bracing the weapon
-        // steadies the view too, not just the muzzle.
+        // the shake tracks the climb whatever that scale ends up being.
         camera.AddFireTrauma(0.045f * recoilScale);
         gunRecoilBack = (std::min)(0.12f, gunRecoilBack + 0.075f);
         gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 4.2f * recoilScale);
