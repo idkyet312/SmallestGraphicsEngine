@@ -20120,6 +20120,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                cached->second.collisionMesh &&
                                !cached->second.collisionMesh->Empty();
             bool hit = false;
+            // World-space height of the surface the segment helper finds, reused
+            // below as the capsule probe's footing.
+            float probeFloorY = 0.0f;
             if (built) {
                 const CollisionMesh& mesh = *cached->second.collisionMesh;
                 const CollisionMesh::Node& root = mesh.nodes[0];
@@ -20171,6 +20174,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             normal.z * normal.z);
                         helperAgrees = length > 0.5f &&
                                        point.y < placed->worldBoundsMax.y - 0.001f;
+                        probeFloorY = point.y;
                         SGE_LOG("LogPrefab", EngineLog::Level::Display,
                             "Segment helper hit entity " + std::to_string(entity) +
                             " at y=" + std::to_string(point.y) +
@@ -20204,11 +20208,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     [&](const CollisionMeshInstance& value) {
                         return value.mesh == cached->second.collisionMesh.get();
                     });
-                // Feet exactly on the surface the raycast above found, which is
-                // where the ground snap would leave a standing player.
+                // Feet on whatever surface the downward cast just found, rather
+                // than a hardcoded height: the source model can be re-exported
+                // at a different elevation, and a fixed probe would silently
+                // start testing thin air.
                 const XMFLOAT3 probe(
                     (placed->worldBoundsMin.x + placed->worldBoundsMax.x) * 0.5f,
-                    -0.244928f,
+                    probeFloorY,
                     (placed->worldBoundsMin.z + placed->worldBoundsMax.z) * 0.5f);
                 const CollisionMeshPushout stand =
                     CollisionMeshInstanceResolveCapsule(*placed, probe, 0.35f,
