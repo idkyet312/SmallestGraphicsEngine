@@ -29,6 +29,8 @@ extern UINT g_shadowDrawCalls;
 extern UINT g_visibilityDrawCalls;
 extern UINT g_shadowBatches;
 extern UINT g_shadowBatchInstances;
+extern UINT g_shadowCachedFarCascades;
+extern UINT g_shadowRefreshedFarCascades;
 extern UINT g_destructionBatchesThisFrame;
 extern UINT g_destructionChunksSubmittedThisFrame;
 extern UINT g_destructionCulledThisFrame;
@@ -991,6 +993,36 @@ inline bool g_showProfilerWindow = false;
 // either inline in Scene Controls or as a standalone window -- comparing pass
 // timings while changing settings is hard when both fight for the same panel.
 inline void ProfilerPanelBody() {
+    // The four numbers you actually read first, before any per-pass detail:
+    // how fast the frame is, how long it took wall-clock, and how that splits
+    // across the two timelines. Frame ms is ImGui's own delta rather than
+    // CPU+GPU: the two overlap by design (the GPU works a frame behind), so
+    // adding them would overstate the frame, and neither alone accounts for
+    // present or vsync wait. Which of CPU/GPU sits nearest the frame total is
+    // what tells you which side is the limiter.
+    {
+        const ImGuiIO& io = ImGui::GetIO();
+        const double cpuMs = g_profiler.CpuFrameMs();
+        const double gpuMs = g_profiler.IsInitialized()
+            ? g_profiler.GpuFrameMs() : 0.0;
+
+        // Scene Controls already prints FPS and frame ms just above its
+        // inline copy of this panel, so those two rows are the standalone
+        // window's job only -- otherwise the same numbers appear twice a
+        // few lines apart.
+        if (g_showProfilerWindow) {
+            ImGui::Text("FPS      %6.1f", io.Framerate);
+            ImGui::Text("Frame    %6.2f ms",
+                        io.Framerate > 0.0f ? 1000.0f / io.Framerate : 0.0f);
+        }
+        ImGui::Text("CPU      %6.2f ms", cpuMs);
+        if (g_profiler.IsInitialized())
+            ImGui::Text("GPU      %6.2f ms", gpuMs);
+        else
+            ImGui::TextDisabled("GPU         -- ms");
+    }
+    ImGui::Separator();
+
     // Adaptive Forward Extensions quality. Off by default: while disabled
     // the tier is pinned to Full and nothing about the frame changes.
     {
@@ -1003,7 +1035,7 @@ inline void ProfilerPanelBody() {
                         g_forwardQuality.SmoothedMs(),
                         g_destruction.GetQualityScale());
     }
-    ImGui::Text("CPU frame: %.2f ms", g_profiler.CpuFrameMs());
+    // CPU frame total is in the header block above.
     // Palms drive Forward Extensions' pixel cost, so show how many survive
     // the frustum test next to the timings that they move.
     ImGui::Text("Palms drawn: %d / %d",
@@ -1014,7 +1046,8 @@ inline void ProfilerPanelBody() {
         ImGui::BulletText("%s: %.3f ms", sample.name.c_str(), sample.milliseconds);
     ImGui::Separator();
     if (g_profiler.IsInitialized()) {
-        ImGui::Text("GPU frame: %.2f ms", g_profiler.GpuFrameMs());
+        // GPU frame total is in the header block above; p95 stays here next
+        // to the per-pass breakdown it helps explain.
         ImGui::Text("GPU p95 (%zu/300): %.2f ms",
                     g_profiler.GpuHistorySize(), g_profiler.GpuFrameP95Ms());
         // FE/* scopes nest inside Forward Extensions, so indent them and
@@ -1291,6 +1324,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 g_meshShader.instancesThisFrame, g_meshShader.meshletsThisFrame);
     ImGui::Text("Shadow instance batches: %u  Instances: %u",
                 g_shadowBatches, g_shadowBatchInstances);
+    ImGui::Text("Far shadow cache: %u reused  %u refreshed",
+                g_shadowCachedFarCascades, g_shadowRefreshedFarCascades);
     ImGui::Text("Destruction batches: %u  Chunks: %u  Culled: %u",
                 g_destructionBatchesThisFrame,
                 g_destructionChunksSubmittedThisFrame,
@@ -1532,6 +1567,11 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 "Off (default): it lights surfaces only.");
         ImGui::Checkbox("Enable Shadows", &scene.enableShadows);
         if (scene.enableShadows) {
+            ImGui::Checkbox("Cache Far Cascades",
+                            &scene.cacheFarShadowCascades);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Keeps cascades 2-3 cached while cascade 1 "
+                                  "and moving shadow casters remain dynamic.");
             ImGui::DragFloat("Shadow Bias", &scene.shadowBias, 0.0005f, 0.0f, 0.05f, "%.4f");
             ImGui::DragFloat3("Shadow Center", &scene.shadowCenter.x, 0.1f);
             ImGui::DragFloat("Shadow Size", &scene.shadowOrthoSize, 0.5f, 5.0f, 80.0f);

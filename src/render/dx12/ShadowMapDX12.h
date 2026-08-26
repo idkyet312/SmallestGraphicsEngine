@@ -424,6 +424,12 @@ inline bool SceneNodeSupportsShadowInstancing(const std::shared_ptr<SceneNode>& 
     return true;
 }
 
+enum class ShadowScenePart {
+    All,
+    Static,
+    Dynamic
+};
+
 inline void DrawSceneNodeShadowInstances(const std::shared_ptr<SceneNode>& node,
                                          DepthOnlyShaderDX12& shader,
                                          const std::vector<XMMATRIX>& worlds,
@@ -483,6 +489,8 @@ class ShadowMapDX12 {
 public:
     ComPtr<ID3D12Resource> shadowMap;
     ComPtr<ID3D12DescriptorHeap> dsvHeap;
+    ComPtr<ID3D12Resource> cachedFarShadowMap;
+    ComPtr<ID3D12DescriptorHeap> cachedFarDsvHeap;
     // Spot atlas: its own texture and DSV heap so the sun cascades' resource,
     // views and barriers are untouched by this feature.
     ComPtr<ID3D12Resource> spotShadowMap;
@@ -490,6 +498,13 @@ public:
     DepthOnlyShaderDX12 depthShader;
     UINT size = SHADOW_MAP_SIZE;
     bool initialized = false;
+    UINT cachedCascadesThisFrame = 0;
+    UINT refreshedCascadesThisFrame = 0;
+
+    void InvalidateCachedCascades() {
+        farCacheValid.fill(false);
+        cacheViewValid = false;
+    }
 
     bool Init(UINT mapSize = SHADOW_MAP_SIZE) {
         size = mapSize;
@@ -507,6 +522,11 @@ public:
 
     ID3D12Resource* GetSpotResource() const {
         return spotShadowMap.Get();
+    }
+
+    UINT CachedCascadesThisFrame() const { return cachedCascadesThisFrame; }
+    UINT RefreshedCascadesThisFrame() const {
+        return refreshedCascadesThisFrame;
     }
 
     XMMATRIX ComputeLightSpace(const Scene& scene) const {
@@ -618,12 +638,16 @@ public:
                          const std::vector<std::unique_ptr<SkinnedEnemy>>* bandits,
                          const XMMATRIX& lightSpace,
                          bool spotCull,
-                         ShaderDX12* terrainShader = nullptr) {
+                         ShaderDX12* terrainShader = nullptr,
+                         ShadowScenePart part = ShadowScenePart::All) {
+        const bool drawStatic = part != ShadowScenePart::Dynamic;
+        const bool drawDynamic = part != ShadowScenePart::Static;
         // Terrain first, while the main graphics root signature can still be
         // bound: it runs on the mesh-shader pipeline and needs slots that
         // DepthOnlyShaderDX12 does not declare. depthShader.Use() below then
         // takes the signature back for every other caster.
-        if (terrainShader && g_terrain.supported && !g_emptyLevelMode) {
+        if (drawStatic && terrainShader && g_terrain.supported &&
+            !g_emptyLevelMode) {
             // The previous caster leaves DepthOnlyShaderDX12's root signature
             // bound. ShaderDX12 caches its binding state, so invalidate that
             // cache before switching back; otherwise cascade 1 writes main-root
@@ -643,10 +667,10 @@ public:
         }
         depthShader.Use();
 
-        if (crateModel) {
+        if (drawStatic && crateModel) {
             DrawSceneNodeShadow(crateModel, depthShader, XMMatrixIdentity(), lightSpace);
         }
-        if (!crateModel && !g_destruction.IsInitialized()) {
+        if (drawStatic && !crateModel && !g_destruction.IsInitialized()) {
             XMMATRIX model = scene.cube1.GetModelMatrix();
             depthShader.SetMatrices(model, lightSpace);
             DrawCube(geo);
@@ -654,7 +678,8 @@ public:
         }
 
         // Detached chunks keep casting shadows from their live physics poses.
-        if (scene.useDestruction && g_destruction.IsInitialized()) {
+        if (drawDynamic && scene.useDestruction &&
+            g_destruction.IsInitialized()) {
             // Anything outside the light's frustum cannot land in the shadow
             // map; skip it before recording the draw. Handles both projections:
             // the sun cascades are orthographic (w stays 1, so the divide is a
@@ -704,14 +729,15 @@ public:
             }
         }
 
-        if (!g_emptyLevelMode && scene.cube2.visible) {
+        if (drawDynamic && !g_emptyLevelMode && scene.cube2.visible) {
             XMMATRIX model = scene.cube2.GetModelMatrix();
             depthShader.SetMatrices(model, lightSpace);
             DrawCube(geo);
             depthShader.NextDrawCall();
         }
 
-        if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel &&
+        if (drawDynamic && !g_emptyLevelMode && !g_trainingRangeMode &&
+            g_humveeModel &&
             g_levelPlacesHumvee) {
             for (size_t index = 0; index < LevelHumveeCount(); ++index) {
                 PrepareHumveeModelForRender(index);
@@ -727,14 +753,16 @@ public:
             }
         }
 
-        if (!g_emptyLevelMode && !g_trainingRangeMode && g_boatModel) {
+        if (drawDynamic && !g_emptyLevelMode && !g_trainingRangeMode &&
+            g_boatModel) {
             std::vector<XMMATRIX> boatTransforms = { BoatWorldMatrix() };
             DrawSceneNodeShadowInstances(
                 g_boatShadowModel ? g_boatShadowModel : g_boatModel,
                 depthShader, boatTransforms, lightSpace);
         }
 
-        if (!g_emptyLevelMode && g_insertionBoatModel && InsertionBoatVisible()) {
+        if (drawDynamic && !g_emptyLevelMode && g_insertionBoatModel &&
+            InsertionBoatVisible()) {
             std::vector<XMMATRIX> insertionBoatTransforms = {
                 InsertionBoatWorldMatrix() };
             DrawSceneNodeShadowInstances(
@@ -743,7 +771,8 @@ public:
                 depthShader, insertionBoatTransforms, lightSpace);
         }
 
-        if (!g_emptyLevelMode && g_insertionBoatModel && EscapeBoatVisible()) {
+        if (drawDynamic && !g_emptyLevelMode && g_insertionBoatModel &&
+            EscapeBoatVisible()) {
             std::vector<XMMATRIX> escapeBoatTransforms = {
                 EscapeBoatWorldMatrix() };
             DrawSceneNodeShadowInstances(
@@ -752,7 +781,8 @@ public:
                 depthShader, escapeBoatTransforms, lightSpace);
         }
 
-        if (!g_emptyLevelMode && g_blackHawkModel && BlackHawkVisible()) {
+        if (drawDynamic && !g_emptyLevelMode && g_blackHawkModel &&
+            BlackHawkVisible()) {
             // Skinned, so it takes the per-node path with the rotor palette
             // rather than the instanced fast path.
             DrawSceneNodeShadow(g_blackHawkModel, depthShader,
@@ -763,7 +793,8 @@ public:
         // aircraft cast nothing -- most obviously under its own searchlight,
         // which lit the ground straight through the fuselage carrying it.
         // Mirrors the draw gates in RenderForward.
-        if (!g_emptyLevelMode && g_helicopterModel && scene.showHelicopter) {
+        if (drawDynamic && !g_emptyLevelMode && g_helicopterModel &&
+            scene.showHelicopter) {
             DrawSceneNodeShadow(g_helicopterModel, depthShader,
                 HelicopterWorldMatrix(), lightSpace);
             if (SecondaryHelicopterVisible())
@@ -773,7 +804,7 @@ public:
                     depthShader, SecondaryHelicopterWorldMatrix(), lightSpace);
         }
 
-        for (const PrefabRenderBatch& batch : prefabRenderBatches) {
+        if (drawStatic) for (const PrefabRenderBatch& batch : prefabRenderBatches) {
             if (batch.model && batch.castShadow && !batch.transforms.empty())
                 DrawSceneNodeShadowInstances(batch.model, depthShader,
                     batch.transforms, lightSpace);
@@ -781,7 +812,7 @@ public:
 
         // Palm shadows use the same GPU wind as the visible mesh. Leaf cards run
         // an alpha-tested depth pass so fronds cast silhouettes, not solid quads.
-        if (!g_emptyLevelMode && g_trees.IsInitialized()) {
+        if (drawDynamic && !g_emptyLevelMode && g_trees.IsInitialized()) {
             for (const TreeItem& item : g_trees.GetItems()) {
                 std::shared_ptr<SceneMesh> slice = item.meshOverride;
                 if (!slice) {
@@ -833,7 +864,8 @@ public:
         // without repeating the full-density 400k-blade forward pass. The grass
         // shadow VS strides through each range so these are distributed tufts,
         // not a contiguous prefix that forms bands.
-        if (!g_emptyLevelMode && g_grass.IsInitialized() && g_grass.CastShadows() &&
+        if (drawDynamic && !g_emptyLevelMode && g_grass.IsInitialized() &&
+            g_grass.CastShadows() &&
             g_grass.ShadowDensity() > 0.0f && depthShader.grassPipelineState) {
             g_grass.SetViewer(scene.camera.Position);
             static std::vector<GrassField::DrawRange> grassShadowRanges;
@@ -871,7 +903,7 @@ public:
             }
         }
 
-        if (!g_emptyLevelMode && g_explosiveBarrelModel) {
+        if (drawDynamic && !g_emptyLevelMode && g_explosiveBarrelModel) {
             std::vector<XMMATRIX> barrelTransforms;
             barrelTransforms.reserve(scene.explosiveBarrels.size());
             for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
@@ -884,7 +916,8 @@ public:
                 g_explosiveBarrelShadowModel
                     ? g_explosiveBarrelShadowModel : g_explosiveBarrelModel,
                 depthShader, barrelTransforms, lightSpace);
-        } else if (!g_emptyLevelMode) for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
+        } else if (drawDynamic && !g_emptyLevelMode) for (
+            const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
             if (barrel.active) {
                 const XMMATRIX model = XMMatrixScaling(1.6f, 1.5f, 1.6f) *
                     XMMatrixTranslation(barrel.position.x, barrel.position.y,
@@ -895,7 +928,7 @@ public:
             }
         }
 
-        if (bandits) for (const auto& banditOwner : *bandits) {
+        if (drawDynamic && bandits) for (const auto& banditOwner : *bandits) {
             SkinnedEnemy* bandit = banditOwner.get();
             if (!bandit || (!bandit->castsShadow && !bandit->Dead()) || !bandit->CanRender())
                 continue;
@@ -917,7 +950,7 @@ public:
             }
         }
 
-        for (auto& p : scene.projectiles) {
+        if (drawDynamic) for (auto& p : scene.projectiles) {
             if (!p.active) continue;
             // Bullets and tracers are far too small for a shadow to read as
             // anything but noise: at projectileScale they resolve to a pixel or
@@ -1002,7 +1035,88 @@ public:
                     const std::shared_ptr<SceneNode>& crateModel,
                     const std::vector<std::unique_ptr<SkinnedEnemy>>* bandits = nullptr,
                     ShaderDX12* terrainShader = nullptr) {
-        const auto cascadeMatrices = ComputeCascadeMatrices(scene);
+        const auto candidateMatrices = ComputeCascadeMatrices(scene);
+        const XMFLOAT4 candidateTexelWorld = g_shadowCascadeTexelWorld;
+        const XMFLOAT4 candidateDepthRange = g_shadowCascadeDepthRange;
+        std::array<XMMATRIX, SHADOW_CASCADE_COUNT> cascadeMatrices =
+            candidateMatrices;
+        std::array<bool, SHADOW_CASCADE_COUNT> refreshCascade = {};
+        cachedCascadesThisFrame = 0;
+        refreshedCascadesThisFrame = 0;
+
+        const bool useFarCache = scene.cacheFarShadowCascades &&
+            EnsureFarCascadeCache();
+        if (useFarCache) {
+            const float aspect = static_cast<float>(g_dx12.screenWidth) /
+                (std::max)(1.0f, static_cast<float>(g_dx12.screenHeight));
+            const float cameraFar = scene.EffectiveCameraFarPlane();
+            XMFLOAT3 lightDirection;
+            XMStoreFloat3(&lightDirection, XMVector3Normalize(
+                XMLoadFloat3(&scene.lightPos)));
+            const bool projectionChanged = !cacheViewValid ||
+                std::abs(cachedFov - scene.EffectiveCameraFOV()) > 0.001f ||
+                std::abs(cachedAspect - aspect) > 0.0001f ||
+                std::abs(cachedNear - scene.cameraNear) > 0.0001f ||
+                std::abs(cachedFar - cameraFar) > 0.01f ||
+                XMVectorGetX(XMVector3Dot(
+                    XMLoadFloat3(&cachedLightDirection),
+                    XMLoadFloat3(&lightDirection))) < 0.999999f;
+            if (projectionChanged) farCacheValid.fill(false);
+            cachedFov = scene.EffectiveCameraFOV();
+            cachedAspect = aspect;
+            cachedNear = scene.cameraNear;
+            cachedFar = cameraFar;
+            cachedLightDirection = lightDirection;
+            cacheViewValid = true;
+
+            const XMVECTOR cameraPosition =
+                XMLoadFloat3(&scene.camera.Position);
+            const XMVECTOR cameraFront = XMVector3Normalize(
+                XMLoadFloat3(&scene.camera.Front));
+            for (UINT cascade = 1; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+                const UINT cacheIndex = cascade - 1;
+                if (farCacheValid[cacheIndex]) {
+                    const XMVECTOR positionDelta = cameraPosition -
+                        XMLoadFloat3(&farCacheCameraPosition[cacheIndex]);
+                    const float movement = XMVectorGetX(
+                        XMVector3Length(positionDelta));
+                    const float cascadeWidth =
+                        (&candidateTexelWorld.x)[cascade] * size;
+                    const float movementLimit = cascadeWidth *
+                        (cascade == 1 ? 0.025f : 0.035f);
+                    const float directionDot = XMVectorGetX(XMVector3Dot(
+                        cameraFront,
+                        XMLoadFloat3(&farCacheCameraFront[cacheIndex])));
+                    const float rotationLimit = std::cos(XMConvertToRadians(
+                        cascade == 1 ? 1.0f : 2.0f));
+                    if (movement > movementLimit ||
+                        directionDot < rotationLimit)
+                        farCacheValid[cacheIndex] = false;
+                }
+                if (!farCacheValid[cacheIndex]) {
+                    refreshCascade[cascade] = true;
+                    farCacheMatrices[cacheIndex] = candidateMatrices[cascade];
+                    farCacheCameraPosition[cacheIndex] = scene.camera.Position;
+                    farCacheCameraFront[cacheIndex] = scene.camera.Front;
+                    farCacheTexelWorld[cacheIndex] =
+                        (&candidateTexelWorld.x)[cascade];
+                    farCacheDepthRange[cacheIndex] =
+                        (&candidateDepthRange.x)[cascade];
+                } else {
+                    cascadeMatrices[cascade] = farCacheMatrices[cacheIndex];
+                    (&g_shadowCascadeTexelWorld.x)[cascade] =
+                        farCacheTexelWorld[cacheIndex];
+                    (&g_shadowCascadeDepthRange.x)[cascade] =
+                        farCacheDepthRange[cacheIndex];
+                    ++cachedCascadesThisFrame;
+                }
+            }
+        } else {
+            // Re-entering the opt-in path must never reuse depth produced while
+            // caching was disabled and scene changes were not tracked.
+            farCacheValid.fill(false);
+            cacheViewValid = false;
+        }
         g_shadowCascadeMatrices = cascadeMatrices;
         XMMATRIX lightSpace = cascadeMatrices[0];
         // Spot casters do not depend on the sun: a headlight or a searchlight
@@ -1038,14 +1152,6 @@ public:
         depthShader.BeginFrame();
         depthShader.SetPalmWindFrame(g_trees.GetWindFrame());
 
-        D3D12_RESOURCE_BARRIER barrier = {};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = shadowMap.Get();
-        barrier.Transition.StateBefore = SHADOW_SHADER_READ_STATE;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        g_dx12.commandList->ResourceBarrier(1, &barrier);
-
         D3D12_VIEWPORT shadowViewport = {};
         shadowViewport.Width = (float)size;
         shadowViewport.Height = (float)size;
@@ -1057,21 +1163,109 @@ public:
 
         const UINT dsvStride = g_dx12.device->GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        for (UINT cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
-        lightSpace = cascadeMatrices[cascade];
-        D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv = dsvHeap->GetCPUDescriptorHandleForHeapStart();
-        shadowDsv.ptr += static_cast<SIZE_T>(cascade) * dsvStride;
-        g_dx12.commandList->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-        g_dx12.commandList->OMSetRenderTargets(0, nullptr, FALSE, &shadowDsv);
 
-        DrawShadowScene(scene, geo, prefabRenderBatches, crateModel, bandits,
-                        lightSpace, false, terrainShader);
+        auto transition = [](ID3D12Resource* resource,
+                             D3D12_RESOURCE_STATES before,
+                             D3D12_RESOURCE_STATES after,
+                             UINT subresource) {
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = resource;
+            barrier.Transition.StateBefore = before;
+            barrier.Transition.StateAfter = after;
+            barrier.Transition.Subresource = subresource;
+            g_dx12.commandList->ResourceBarrier(1, &barrier);
+        };
+
+        if (!useFarCache) {
+            transition(shadowMap.Get(), SHADOW_SHADER_READ_STATE,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+            for (UINT cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+                lightSpace = cascadeMatrices[cascade];
+                D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv =
+                    dsvHeap->GetCPUDescriptorHandleForHeapStart();
+                shadowDsv.ptr += static_cast<SIZE_T>(cascade) * dsvStride;
+                g_dx12.commandList->ClearDepthStencilView(
+                    shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+                g_dx12.commandList->OMSetRenderTargets(
+                    0, nullptr, FALSE, &shadowDsv);
+                DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
+                    bandits, lightSpace, false, terrainShader);
+            }
+            transition(shadowMap.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                SHADOW_SHADER_READ_STATE,
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+        } else {
+            const UINT cacheDsvStride =
+                g_dx12.device->GetDescriptorHandleIncrementSize(
+                    D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            for (UINT cascade = 1; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+                if (!refreshCascade[cascade]) continue;
+                const UINT cacheIndex = cascade - 1;
+                transition(cachedFarShadowMap.Get(),
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE, cacheIndex);
+                D3D12_CPU_DESCRIPTOR_HANDLE cacheDsv =
+                    cachedFarDsvHeap->GetCPUDescriptorHandleForHeapStart();
+                cacheDsv.ptr +=
+                    static_cast<SIZE_T>(cacheIndex) * cacheDsvStride;
+                g_dx12.commandList->ClearDepthStencilView(
+                    cacheDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+                g_dx12.commandList->OMSetRenderTargets(
+                    0, nullptr, FALSE, &cacheDsv);
+                DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
+                    bandits, farCacheMatrices[cacheIndex], false,
+                    terrainShader, ShadowScenePart::Static);
+                transition(cachedFarShadowMap.Get(),
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE, cacheIndex);
+                farCacheValid[cacheIndex] = true;
+                ++refreshedCascadesThisFrame;
+            }
+
+            transition(shadowMap.Get(), SHADOW_SHADER_READ_STATE,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE, 0);
+            D3D12_CPU_DESCRIPTOR_HANDLE nearDsv =
+                dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            g_dx12.commandList->ClearDepthStencilView(
+                nearDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            g_dx12.commandList->OMSetRenderTargets(
+                0, nullptr, FALSE, &nearDsv);
+            DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
+                bandits, cascadeMatrices[0], false, terrainShader);
+
+            for (UINT cascade = 1; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+                const UINT cacheIndex = cascade - 1;
+                transition(shadowMap.Get(), SHADOW_SHADER_READ_STATE,
+                    D3D12_RESOURCE_STATE_COPY_DEST, cascade);
+                D3D12_TEXTURE_COPY_LOCATION destination = {};
+                destination.pResource = shadowMap.Get();
+                destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                destination.SubresourceIndex = cascade;
+                D3D12_TEXTURE_COPY_LOCATION source = {};
+                source.pResource = cachedFarShadowMap.Get();
+                source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                source.SubresourceIndex = cacheIndex;
+                g_dx12.commandList->CopyTextureRegion(
+                    &destination, 0, 0, 0, &source, nullptr);
+                transition(shadowMap.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE, cascade);
+                D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv =
+                    dsvHeap->GetCPUDescriptorHandleForHeapStart();
+                shadowDsv.ptr += static_cast<SIZE_T>(cascade) * dsvStride;
+                g_dx12.commandList->OMSetRenderTargets(
+                    0, nullptr, FALSE, &shadowDsv);
+                DrawShadowScene(scene, geo, prefabRenderBatches, crateModel,
+                    bandits, cascadeMatrices[cascade], false, terrainShader,
+                    ShadowScenePart::Dynamic);
+            }
+            for (UINT cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade)
+                transition(shadowMap.Get(),
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    SHADOW_SHADER_READ_STATE, cascade);
         }
         lightSpace = cascadeMatrices[0];
-
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        barrier.Transition.StateAfter = SHADOW_SHADER_READ_STATE;
-        g_dx12.commandList->ResourceBarrier(1, &barrier);
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = GetCPUDescriptorHandle(
             g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize, g_dx12.frameIndex);
@@ -1088,6 +1282,78 @@ public:
     }
 
 private:
+    static constexpr UINT FAR_CASCADE_CACHE_COUNT =
+        SHADOW_CASCADE_COUNT - 1;
+    std::array<bool, FAR_CASCADE_CACHE_COUNT> farCacheValid = {};
+    std::array<XMMATRIX, FAR_CASCADE_CACHE_COUNT> farCacheMatrices = {};
+    std::array<XMFLOAT3, FAR_CASCADE_CACHE_COUNT> farCacheCameraPosition = {};
+    std::array<XMFLOAT3, FAR_CASCADE_CACHE_COUNT> farCacheCameraFront = {};
+    std::array<float, FAR_CASCADE_CACHE_COUNT> farCacheTexelWorld = {};
+    std::array<float, FAR_CASCADE_CACHE_COUNT> farCacheDepthRange = {};
+    XMFLOAT3 cachedLightDirection = {};
+    float cachedFov = 0.0f;
+    float cachedAspect = 0.0f;
+    float cachedNear = 0.0f;
+    float cachedFar = 0.0f;
+    bool cacheViewValid = false;
+
+    bool EnsureFarCascadeCache() {
+        if (cachedFarShadowMap && cachedFarDsvHeap) return true;
+
+        D3D12_HEAP_PROPERTIES heapProps = {};
+        heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC texDesc = {};
+        texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texDesc.Width = size;
+        texDesc.Height = size;
+        texDesc.DepthOrArraySize = FAR_CASCADE_CACHE_COUNT;
+        texDesc.MipLevels = 1;
+        texDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+        texDesc.SampleDesc.Count = 1;
+        texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE clearValue = {};
+        clearValue.Format = DXGI_FORMAT_D32_FLOAT;
+        clearValue.DepthStencil.Depth = 1.0f;
+
+        HRESULT hr = g_dx12.device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &texDesc,
+            D3D12_RESOURCE_STATE_COPY_SOURCE, &clearValue,
+            IID_PPV_ARGS(&cachedFarShadowMap));
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create far cascade shadow cache\n";
+            return false;
+        }
+        cachedFarShadowMap->SetName(L"Cached Far Cascade Shadow Depth");
+
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = FAR_CASCADE_CACHE_COUNT;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        hr = g_dx12.device->CreateDescriptorHeap(
+            &heapDesc, IID_PPV_ARGS(&cachedFarDsvHeap));
+        if (FAILED(hr)) {
+            cachedFarShadowMap.Reset();
+            return false;
+        }
+
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+        dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
+        dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        dsvDesc.Texture2DArray.ArraySize = 1;
+        const UINT stride = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv =
+            cachedFarDsvHeap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT cacheIndex = 0; cacheIndex < FAR_CASCADE_CACHE_COUNT;
+             ++cacheIndex) {
+            dsvDesc.Texture2DArray.FirstArraySlice = cacheIndex;
+            g_dx12.device->CreateDepthStencilView(
+                cachedFarShadowMap.Get(), &dsvDesc, dsv);
+            dsv.ptr += stride;
+        }
+        InvalidateCachedCascades();
+        return true;
+    }
+
     bool CreateShadowMap() {
         D3D12_HEAP_PROPERTIES heapProps = {};
         heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;

@@ -118,6 +118,8 @@ UINT                        g_shadowDrawCalls = 0;
 UINT                        g_visibilityDrawCalls = 0;
 UINT                        g_shadowBatches = 0;
 UINT                        g_shadowBatchInstances = 0;
+UINT                        g_shadowCachedFarCascades = 0;
+UINT                        g_shadowRefreshedFarCascades = 0;
 MeshShaderDX12              g_meshShader;
 bool                        g_useMeshShader = false;
 TerrainRendererDX12         g_terrain;
@@ -365,7 +367,7 @@ bool                        g_freezeDecalAging = false;
 // point on the navmesh once the squad is spawned and before the player deploys,
 // so a run does not always open against the same authored EnemySpawn layout.
 // Off by default: it deliberately ignores level authoring.
-bool                        g_scatterEnemiesOnNavmesh = true;   // TEMP verify
+bool                        g_scatterEnemiesOnNavmesh = false;
 // 0 = reseed from the clock on every scatter. Any other value is used verbatim,
 // so a layout that produced an interesting run can be replayed exactly.
 unsigned int                g_scatterEnemiesSeed = 0;
@@ -4119,7 +4121,16 @@ static unsigned int RandomizeDeployment(unsigned int seed = 0) {
     std::uniform_int_distribution<unsigned int> pickScatter(
         1u, 0xfffffffeu);
     g_scatterEnemiesSeed = pickScatter(generator);
-    ScatterEnemiesOnNavmesh();
+    // Force the scatter for this roll regardless of the persistent test toggle,
+    // which is off by default so a fresh map opens on its authored layout.
+    // Pressing randomize is an explicit request for a new layout, so it has to
+    // move enemies even though entering the map does not.
+    {
+        const bool wasEnabled = g_scatterEnemiesOnNavmesh;
+        g_scatterEnemiesOnNavmesh = true;
+        ScatterEnemiesOnNavmesh();
+        g_scatterEnemiesOnNavmesh = wasEnabled;
+    }
 
     SGE_LOG("LogGameplay", EngineLog::Level::Display,
         std::string("Deployment randomized (seed ") + std::to_string(seed) +
@@ -8308,6 +8319,7 @@ static void RebuildPrefabRenderBatches() {
         }
     }
     g_prefabRebuildRequested = false;
+    shadowMap.InvalidateCachedCascades();
     if (g_customLevelMode) g_pendingEnvironmentRebuild = true;
 }
 
@@ -8327,8 +8339,10 @@ static void UpdatePrefabAudio() {
 }
 
 static void UpdatePrefabLods() {
+    bool shadowGeometryChanged = false;
     for (PrefabRenderBatch& batch : g_prefabRenderBatches) {
         if (batch.lods.empty() || !batch.baseModel) continue;
+        const std::shared_ptr<SceneNode> previousModel = batch.model;
         float nearest = FLT_MAX;
         for (const XMMATRIX& transform : batch.baseTransforms) {
             XMFLOAT4X4 matrix;
@@ -8342,7 +8356,10 @@ static void UpdatePrefabLods() {
         batch.model = batch.baseModel;
         for (const PrefabRenderBatch::LodModel& lod : batch.lods)
             if (nearest >= lod.distance) batch.model = lod.model;
+        shadowGeometryChanged |= batch.castShadow &&
+            batch.model != previousModel;
     }
+    if (shadowGeometryChanged) shadowMap.InvalidateCachedCascades();
 }
 
 // World-space collision triangles baked from the wreck's mesh. The airframe is
@@ -10089,6 +10106,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
             g_customLevelMode ? RuntimeTerrainSource::Authored
                               : RuntimeTerrainSource::Empty);
     }
+    shadowMap.InvalidateCachedCascades();
     // ApplyRuntimeLevelBasics early-returns for non-custom levels, so refresh
     // vehicle placement here as well to clear parked instances between maps.
     const RuntimeLevelPlan levelPlan =
@@ -13216,12 +13234,14 @@ static void SynchronizeEditorRuntimeLight() {
             if (j < batch.transforms.size()) batch.transforms[j] = world;
         }
     }
+    shadowMap.InvalidateCachedCascades();
 }
 
 static void SynchronizeEditorRuntime(bool play) {
     if (g_game.session.Screen() != GameScreen::LevelEditor) return;
     const bool foliageChanged = g_levelEditor.FoliageRuntimeDirty();
     const bool terrainChanged = g_levelEditor.TerrainRuntimeDirty();
+    shadowMap.InvalidateCachedCascades();
     g_game.world.ReplaceFromEditor(g_levelEditor.Level());
     g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
     ApplyTerrainSplatMap(g_levelEditor.Level());
@@ -15055,6 +15075,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
     g_profileDumpEnabled =
         GetEnvironmentVariableA("SGE_PROFILE_DUMP", nullptr, 0) > 0;
+    scene.cacheFarShadowCascades =
+        GetEnvironmentVariableA("SGE_CACHE_FAR_SHADOWS", nullptr, 0) > 0;
     g_gunAudio.Initialize("Content/Audio/rifle_shot.wav");
     g_rpgFireAudio.Initialize("Content/Audio/rpg_fire.wav");
     // Lives under build/Sounds like the RPG explosion above, not models/audio --
@@ -18074,6 +18096,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // the ground that used to be there.
         if (g_terrainDeformedThisFrame) {
             visBuffer.NotifyTerrainDeformed();
+            shadowMap.InvalidateCachedCascades();
             g_terrainDeformedThisFrame = false;
         }
         visBuffer.aoTemporalMotionVectors = usingVisibility &&
@@ -19485,6 +19508,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             ? shadowMap.depthShader.batchesThisFrame : 0;
         g_shadowBatchInstances = g_shadowDrawCalls
             ? shadowMap.depthShader.instancesThisFrame : 0;
+        g_shadowCachedFarCascades = (!usingRaytracing &&
+            scene.enableShadows && scene.lightType == 0)
+            ? shadowMap.CachedCascadesThisFrame() : 0;
+        g_shadowRefreshedFarCascades = (!usingRaytracing &&
+            scene.enableShadows && scene.lightType == 0)
+            ? shadowMap.RefreshedCascadesThisFrame() : 0;
         g_visibilityDrawCalls = usingVisibility ? visBuffer.currentDrawCall : 0;
         if (visibilitySmokeEnabled && usingVisibility &&
             !visibilitySmokeReported &&

@@ -274,6 +274,7 @@ struct Scene {
     int   specularShininess = 32;
     float shadowBias        = 0.005f;
     bool  enableShadows     = true;
+    bool  cacheFarShadowCascades = false;
     XMFLOAT3 shadowCenter    = { 0.0f, 3.0f, 0.0f };
     float shadowOrthoSize    = 30.0f;
 
