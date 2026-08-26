@@ -8,6 +8,7 @@
 #include "ProfilerDX12.h"
 #include "ShaderDX12.h"
 #include "ImpactParticleRendererDX12.h"
+#include "CollisionDebugRendererDX12.h"
 #include "DDGI_DX12.h"
 #include "Scene.h"
 #include "SceneGraph.h"
@@ -33,6 +34,12 @@ extern bool g_useMeshShader;
 extern TerrainRendererDX12 g_terrain;
 extern ProfilerDX12 g_profiler;
 extern ImpactParticleRendererDX12 g_particleRenderer;
+extern CollisionDebugRendererDX12 g_collisionDebugRenderer;
+extern bool g_showCollisionDebug;
+// Fills the overlay's line list from the prefab colliders. Defined in main.cpp
+// because those collections are deliberately translation-unit-local aliases of
+// RuntimeWorld state; this header only submits what that function queued.
+void BuildCollisionDebugLines();
 // Shared island-builder terrain params (island size, extent, origin offset,
 // GPU-safe clamps). Defined in main.cpp; declared here so the terrain draw
 // uses the same params as foliage/collision/GI instead of a stale default.

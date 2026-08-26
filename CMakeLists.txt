@@ -142,6 +142,8 @@ set(SGE_RUNTIME_SOURCES
     src/gameplay/weapons/ArmsTextures.cpp
     src/level/LevelDefinition.cpp
     src/navigation/NavigationSystem.cpp
+    src/physics/CollisionMesh.cpp
+    src/physics/CollisionMeshCache.cpp
     src/physics/DestructionDX12.cpp
     src/world/vegetation/PalmMeshCutter.cpp
 )
@@ -477,6 +479,15 @@ if(BUILD_TESTING)
     add_executable(TextureUploadArenaTests tests/TextureUploadArenaTests.cpp)
     target_link_libraries(TextureUploadArenaTests PRIVATE SGEProjectHeaders d3d12)
     add_test(NAME TextureUploadArenaTests COMMAND TextureUploadArenaTests)
+
+    # Per-triangle collision BVH. Pure CPU: CollisionMesh takes raw float
+    # arrays and never sees the scene graph or a device, so the build and the
+    # traversal are testable without a GPU or any game content.
+    add_executable(CollisionMeshTests
+        tests/CollisionMeshTests.cpp
+        src/physics/CollisionMesh.cpp)
+    target_link_libraries(CollisionMeshTests PRIVATE SGEProjectHeaders)
+    add_test(NAME CollisionMeshTests COMMAND CollisionMeshTests)
 
     add_executable(RagdollAssetTests tests/RagdollAssetTests.cpp)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)

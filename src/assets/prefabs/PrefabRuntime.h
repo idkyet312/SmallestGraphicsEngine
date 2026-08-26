@@ -1,6 +1,7 @@
 #ifndef PREFAB_RUNTIME_H
 #define PREFAB_RUNTIME_H
 
+#include "CollisionMesh.h"
 #include "PrefabColliders.h"
 #include "SceneGraph.h"
 #include <DirectXMath.h>
@@ -61,6 +62,11 @@ struct PrefabDestructibleInstance {
 struct PrefabRuntimeState {
     std::vector<PrefabRenderBatch> renderBatches;
     std::vector<PrefabCollider> colliders;
+    // Per-triangle colliders, emitted alongside the bounds box rather than
+    // instead of it: consumers that deliberately keep the conservative box
+    // (fire spread, navmesh) then need no changes at all, and prefabs without
+    // mesh collision behave exactly as before.
+    std::vector<CollisionMeshInstance> meshColliders;
     std::vector<PrefabLightInstance> lights;
     std::vector<PrefabAudioEmitter> audioEmitters;
     std::vector<PrefabSpawnPoint> spawnPoints;
@@ -70,6 +76,7 @@ struct PrefabRuntimeState {
     void ClearDerived() {
         renderBatches.clear();
         colliders.clear();
+        meshColliders.clear();
         lights.clear();
         audioEmitters.clear();
         spawnPoints.clear();

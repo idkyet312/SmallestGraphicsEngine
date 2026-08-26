@@ -66,6 +66,8 @@
 #include "ScreenSpaceReflectionsDX12.h"
 #include "MSAADX12.h"
 #include "GrassMSAADX12.h"
+#include "CollisionMesh.h"
+#include "CollisionMeshCache.h"
 #include "DestructionDX12.h"
 #include "FBXImporter.h"
 #include "SkinnedFBXImporter.h"
@@ -109,6 +111,10 @@ static Scene               scene;
 static ShaderDX12           mainShader;
 ImpactParticleRendererDX12  g_particleRenderer;
 RainRendererDX12            g_rainRenderer;
+CollisionDebugRendererDX12  g_collisionDebugRenderer;
+// Draws the volumes ResolvePlayerPrefabCollisions actually pushes the player out
+// of. Off by default; toggled from the debug UI.
+bool                        g_showCollisionDebug = false;
 ProfilerDX12                g_profiler;
 static bool                 g_profileDumpEnabled = false;
 static bool                 g_profileDumpWritten = false;
@@ -175,6 +181,15 @@ static std::vector<PrefabRenderBatch>& g_prefabRenderBatches =
     g_game.world.Prefabs().renderBatches;
 static std::vector<PrefabCollider>& g_prefabColliders =
     g_game.world.Prefabs().colliders;
+static std::vector<CollisionMeshInstance>& g_prefabMeshColliders =
+    g_game.world.Prefabs().meshColliders;
+// Entities that own a mesh collider. Both colliders are emitted per entity, so
+// the bounds box would otherwise shadow the geometry it wraps: the box is hit at
+// or before the true surface, and nearest-wins would stop every shot at the
+// airport's outer shell. Segment queries skip the box for these entities;
+// fire spread and the navmesh deliberately do not, which is how they keep the
+// conservative volume they want.
+static std::unordered_set<uint64_t> g_meshCollisionEntities;
 static std::vector<PrefabLightInstance>& g_prefabLightInstances =
     g_game.world.Prefabs().lights;
 static std::vector<PrefabAudioEmitter>& g_prefabAudioEmitters =
@@ -211,6 +226,11 @@ struct PrefabModelCacheEntry {
     std::shared_ptr<SceneNode> model;
     XMFLOAT3 boundsMinimum{};
     XMFLOAT3 boundsMaximum{};
+    // Per-triangle collision, built only for prefabs whose collision shape is
+    // "mesh". Held by shared_ptr because RetiredPrefabResources moves this whole
+    // map into a deferred-release queue: instances borrow a raw pointer into the
+    // tree and must stay valid across that retire.
+    std::shared_ptr<CollisionMesh> collisionMesh;
 };
 static std::unordered_map<std::string, PrefabModelCacheEntry> g_prefabModelCache;
 // A source model can be rejected after its importer has already recorded GPU
@@ -228,6 +248,11 @@ static std::unordered_set<std::string> g_prefabMeshFallbackWarnings;
 static bool                 g_prefabRebuildRequested = true;
 static bool                 g_prefabRuntimeSmokeEnabled = false;
 static bool                 g_prefabRuntimeSmokeChecked = false;
+// SGE_COLLISION_TEST: load the Training Range, report the airport's collision
+// tree once the prefab rebuild settles, then quit. The interesting numbers are
+// logged by LoadPrefabModel itself; this only decides when to stop.
+static bool                 g_collisionSmokeEnabled = false;
+static bool                 g_collisionSmokeChecked = false;
 static bool                 g_ddgiCornellTestMode = false;
 static bool                 g_ddgiCornellPreviousTemporalEffects = false;
 static bool                 g_ddgiCornellPreviousAnimateDemoLights = true;
@@ -4374,10 +4399,14 @@ static bool HitTerrainSegment(const XMFLOAT3& start, const XMFLOAT3& end,
     return false;
 }
 
+// hitNormal is last and defaulted so the call sites that do not want a surface
+// normal compile unchanged. It is written only for triangle-mesh hits; a bounds
+// box has no meaningful normal, so callers keep their own fallback.
 static bool HitPrefabColliderSegment(const XMFLOAT3& start,
                                      const XMFLOAT3& end, float radius,
                                      XMFLOAT3& hit,
-                                     uint64_t* hitEntityId = nullptr);
+                                     uint64_t* hitEntityId = nullptr,
+                                     XMFLOAT3* hitNormal = nullptr);
 
 static bool BanditHasLineOfSight(const SkinnedEnemy& shooter,
                                  const XMFLOAT3& target) {
@@ -5197,6 +5226,12 @@ static void UpdateMolotovFireDamage() {
                 fire.structureDamageCooldown = 1.25f;
             }
             g_trees.IgniteNear(fire.position, reach + 0.8f);
+            // Deliberately the bounds box, not the triangle mesh, and so this
+            // loop does not filter g_meshCollisionEntities. Per-triangle
+            // proximity would cost a tree walk per fire per tick to decide
+            // whether a fire near a wall is "close enough" to spread -- a
+            // question the coarse volume already answers well enough to look
+            // right.
             for (const PrefabCollider& collider : g_prefabColliders) {
                 if (destructibleIds.find(collider.entityId) ==
                     destructibleIds.end()) continue;
@@ -7385,6 +7420,80 @@ static bool ComputePrefabModelBounds(const std::shared_ptr<SceneNode>& model,
     return minimum.x != FLT_MAX;
 }
 
+// Flattens the model's triangles into the 9-floats-per-triangle soup
+// BuildCollisionMesh consumes, in the same space ComputePrefabModelBounds
+// measures.
+//
+// Must be called at exactly the same point as that function: LoadPrefabModel's
+// targetSize normalization mutates the root TRS and every globalTransform before
+// bounds are taken, so extracting earlier would silently bake a differently
+// scaled tree (R1). The stage-2 bounds assertion exists to catch a reordering.
+//
+// Returns false when no primitive carried CPU-side vertices -- a GPU-only
+// optimization upstream would otherwise yield a silently empty tree (R2).
+static bool ExtractPrefabCollisionTriangles(const std::shared_ptr<SceneNode>& model,
+                                            std::vector<float>& triangles,
+                                            std::string* emptyPrimitives = nullptr) {
+    triangles.clear();
+    size_t primitiveCount = 0;
+    size_t emptyCount = 0;
+    std::string emptyNames;
+
+    const auto visit = [&](const auto& self,
+                           const std::shared_ptr<SceneNode>& node) -> void {
+        if (!node) return;
+        const XMMATRIX nodeWorld = XMLoadFloat4x4(&node->globalTransform);
+        if (node->mesh) for (const MeshPrimitive& primitive : node->mesh->primitives) {
+            ++primitiveCount;
+            const size_t vertexCount = primitive.vertices.size() / 12;
+            if (vertexCount == 0) {
+                ++emptyCount;
+                if (emptyNames.size() < 200) {
+                    if (!emptyNames.empty()) emptyNames += ", ";
+                    emptyNames += node->name;
+                }
+                continue;
+            }
+
+            // Position is the first 3 of the 12 interleaved floats per vertex,
+            // matching ComputePrefabModelBounds.
+            const auto transformed = [&](size_t vertex, XMFLOAT3& out) {
+                const size_t base = vertex * 12;
+                XMStoreFloat3(&out, XMVector3TransformCoord(XMVectorSet(
+                    primitive.vertices[base], primitive.vertices[base + 1],
+                    primitive.vertices[base + 2], 1.0f), nodeWorld));
+            };
+            const auto append = [&](size_t a, size_t b, size_t c) {
+                if (a >= vertexCount || b >= vertexCount || c >= vertexCount) return;
+                XMFLOAT3 v0, v1, v2;
+                transformed(a, v0); transformed(b, v1); transformed(c, v2);
+                const float values[9] = { v0.x, v0.y, v0.z, v1.x, v1.y, v1.z,
+                                          v2.x, v2.y, v2.z };
+                triangles.insert(triangles.end(), values, values + 9);
+            };
+
+            if (!primitive.indices.empty()) {
+                for (size_t i = 0; i + 2 < primitive.indices.size(); i += 3)
+                    append(primitive.indices[i], primitive.indices[i + 1],
+                           primitive.indices[i + 2]);
+            } else {
+                // Non-indexed primitives are drawn as sequential triples.
+                for (size_t i = 0; i + 2 < vertexCount; i += 3)
+                    append(i, i + 1, i + 2);
+            }
+        }
+        for (const auto& child : node->children) self(self, child);
+    };
+    visit(visit, model);
+
+    if (emptyPrimitives && emptyCount > 0) {
+        *emptyPrimitives = std::to_string(emptyCount) + " of " +
+            std::to_string(primitiveCount) + " primitives had no CPU vertices (" +
+            emptyNames + ")";
+    }
+    return !triangles.empty();
+}
+
 static void ApplyPrefabMaterialOverrides(const PrefabAsset& prefab,
                                          const std::shared_ptr<SceneNode>& model) {
     for (const PrefabMaterialOverride& overrideValue : prefab.materialOverrides) {
@@ -7507,6 +7616,121 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
         SGE_LOG("LogPrefab", EngineLog::Level::Warning,
             "Model has no renderable bounds; using unit box: " + prefab.id);
     }
+
+    // Per-triangle collision, built here so it shares the post-normalization
+    // space the bounds above were measured in. Only prefabs that ask for it pay
+    // the build; everything else keeps the bounds box and is untouched.
+    if (prefab.collision == "mesh") {
+        // The cache is keyed on the source model plus the transform the tree was
+        // baked in, so a targetSize edit or a re-export invalidates it without
+        // any manual cleanup.
+        const CollisionMeshBuildParams buildParams;
+        CollisionCache::Key cacheKey;
+        cacheKey.sourcePath = prefab.modelPath;
+        cacheKey.prefabId = prefab.id;
+        cacheKey.transformHash = CollisionCache::HashTransform(
+            prefab.targetSize, model->scale, model->translation);
+        cacheKey.buildParamsHash = CollisionCache::HashBuildParams(buildParams);
+
+        auto collisionMesh = std::make_shared<CollisionMesh>();
+        std::string cacheError;
+        const auto loadStarted = std::chrono::steady_clock::now();
+        if (CollisionCache::Load(cacheKey, *collisionMesh, &cacheError)) {
+            const double loadMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - loadStarted).count();
+            SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                "Collision mesh " + prefab.id + ": loaded " +
+                std::to_string(collisionMesh->TriangleCount()) + " tris, " +
+                std::to_string(collisionMesh->nodes.size()) + " nodes from cache in " +
+                std::to_string(static_cast<int>(loadMs)) + " ms, " +
+                std::to_string(collisionMesh->MemoryBytes() / (1024 * 1024)) + " MB");
+            entry.collisionMesh = std::move(collisionMesh);
+        } else {
+        SGE_LOG("LogPrefab", EngineLog::Level::Display,
+            "Collision mesh " + prefab.id + ": building (" + cacheError + ")");
+        std::vector<float> triangles;
+        std::string emptyPrimitives;
+        const auto extractStarted = std::chrono::steady_clock::now();
+        const bool extracted =
+            ExtractPrefabCollisionTriangles(model, triangles, &emptyPrimitives);
+        const double extractMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - extractStarted).count();
+
+        if (!extracted) {
+            // Never build an empty tree silently: that would look like "the
+            // airport has no collision" rather than "the vertices went away".
+            SGE_LOG("LogPrefab", EngineLog::Level::Error,
+                "Mesh collision requested but no CPU vertices available: " +
+                prefab.id + (emptyPrimitives.empty() ? "" : " -- " + emptyPrimitives));
+        } else {
+            if (!emptyPrimitives.empty()) {
+                SGE_LOG("LogPrefab", EngineLog::Level::Warning,
+                    "Mesh collision skipped some primitives: " + prefab.id +
+                    " -- " + emptyPrimitives);
+            }
+
+            // The soup's own AABB must match the bounds computed from the same
+            // traversal. A mismatch means the two ran in different spaces, which
+            // is the wrong-space failure (R1) and would put collision geometry
+            // somewhere other than the visible model.
+            XMFLOAT3 soupMinimum(FLT_MAX, FLT_MAX, FLT_MAX);
+            XMFLOAT3 soupMaximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            for (size_t i = 0; i + 2 < triangles.size(); i += 3) {
+                soupMinimum.x = (std::min)(soupMinimum.x, triangles[i]);
+                soupMinimum.y = (std::min)(soupMinimum.y, triangles[i + 1]);
+                soupMinimum.z = (std::min)(soupMinimum.z, triangles[i + 2]);
+                soupMaximum.x = (std::max)(soupMaximum.x, triangles[i]);
+                soupMaximum.y = (std::max)(soupMaximum.y, triangles[i + 1]);
+                soupMaximum.z = (std::max)(soupMaximum.z, triangles[i + 2]);
+            }
+            const float boundsDrift = (std::max)({
+                std::abs(soupMinimum.x - entry.boundsMinimum.x),
+                std::abs(soupMinimum.y - entry.boundsMinimum.y),
+                std::abs(soupMinimum.z - entry.boundsMinimum.z),
+                std::abs(soupMaximum.x - entry.boundsMaximum.x),
+                std::abs(soupMaximum.y - entry.boundsMaximum.y),
+                std::abs(soupMaximum.z - entry.boundsMaximum.z) });
+            if (boundsDrift > 1e-3f) {
+                SGE_LOG("LogPrefab", EngineLog::Level::Error,
+                    "Collision soup bounds differ from model bounds by " +
+                    std::to_string(boundsDrift) + " for " + prefab.id +
+                    " -- extraction ran in the wrong space");
+            }
+
+            CollisionMeshBuildStats stats;
+            const size_t sourceTriangles = triangles.size() / 9;
+            if (BuildCollisionMesh(std::move(triangles), *collisionMesh,
+                                   buildParams, &stats)) {
+                std::string saveError;
+                if (!CollisionCache::Save(cacheKey, *collisionMesh, &saveError)) {
+                    // A cache that cannot be written is a slow next start, not a
+                    // broken one: the tree in hand is still correct.
+                    SGE_LOG("LogPrefab", EngineLog::Level::Warning,
+                        "Collision mesh not cached for " + prefab.id + ": " +
+                        saveError);
+                }
+                entry.collisionMesh = std::move(collisionMesh);
+                SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                    "Collision mesh " + prefab.id + ": " +
+                    std::to_string(stats.triangleCount) + " tris (" +
+                    std::to_string(stats.degenerateSkipped) + " degenerate of " +
+                    std::to_string(sourceTriangles) + "), " +
+                    std::to_string(stats.nodeCount) + " nodes, " +
+                    std::to_string(stats.leafCount) + " leaves, depth " +
+                    std::to_string(stats.maxDepth) + ", max leaf " +
+                    std::to_string(stats.maxLeafTriangles) + ", extract " +
+                    std::to_string(static_cast<int>(extractMs)) + " ms, build " +
+                    std::to_string(static_cast<int>(stats.buildMilliseconds)) +
+                    " ms, " + std::to_string(entry.collisionMesh->MemoryBytes() /
+                                             (1024 * 1024)) + " MB");
+            } else {
+                SGE_LOG("LogPrefab", EngineLog::Level::Error,
+                    "Collision mesh build produced no usable triangles: " + prefab.id);
+            }
+        }
+        }
+    }
+
     auto inserted = g_prefabModelCache.emplace(prefab.id, std::move(entry));
     SGE_LOG("LogPrefab", EngineLog::Level::Display,
         "Loaded " + prefab.id + " from " + prefab.modelPath.string());
@@ -8038,6 +8262,10 @@ static constexpr uint64_t kAATurretEntityId = 0x4141545552524554ull;
 
 static void RebuildPrefabRenderBatches() {
     g_game.world.Prefabs().ClearDerived();
+    // Tracks the same instances ClearDerived just dropped; entity ids are reused
+    // across levels, so a stale entry here would silently disable the bounds box
+    // for an unrelated prefab.
+    g_meshCollisionEntities.clear();
     g_assetRegistry.Refresh();
     g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
     g_prefabAudioPlayers.clear();
@@ -8132,10 +8360,22 @@ static void RebuildPrefabRenderBatches() {
         // too, as chunk geometry. Adding the prefab's bounds box on top would
         // put a second, coarser collider around the same mast.
         if (collision != "none" && !skipRenderBatch) {
-            if (collision == "mesh" &&
-                g_prefabMeshFallbackWarnings.insert(prefabId).second) {
-                SGE_LOG("LogPrefab", EngineLog::Level::Warning,
-                    "Mesh collision unavailable; using bounds box: " + prefabId);
+            if (collision == "mesh") {
+                if (cachedModel->collisionMesh &&
+                    !cachedModel->collisionMesh->Empty()) {
+                    CollisionMeshInstance instance;
+                    instance.entityId = entityId;
+                    InitializeCollisionMeshInstance(
+                        instance, *cachedModel->collisionMesh, world);
+                    g_prefabMeshColliders.push_back(instance);
+                    g_meshCollisionEntities.insert(entityId);
+                } else if (g_prefabMeshFallbackWarnings.insert(prefabId).second) {
+                    // The tree failed to build or the prefab was loaded before
+                    // mesh collision was requested. The bounds box below still
+                    // applies, so the instance is collidable, just coarsely.
+                    SGE_LOG("LogPrefab", EngineLog::Level::Warning,
+                        "Mesh collision unavailable; using bounds box: " + prefabId);
+                }
             }
             const XMFLOAT3& minimum = cachedModel->boundsMinimum;
             const XMFLOAT3& maximum = cachedModel->boundsMaximum;
@@ -8833,11 +9073,36 @@ static void ResolvePlayerWorldObjectCollisions(
     position.z = g_boatPosition.z - localX * sinYaw + localZ * cosYaw;
 }
 
-static void ResolvePlayerPrefabCollisions(XMFLOAT3& position, float radius,
-                                          float playerHeight) {
+// How far above the feet a walkable surface still counts as floor to step onto
+// rather than a wall to be blocked by. Sized for a doorway sill and a kerb; much
+// larger and the player climbs walls, much smaller and they catch on thresholds.
+static constexpr float kPlayerStepHeight = 0.45f;
+
+static void ResolvePlayerPrefabCollisions(XMFLOAT3& position, float& floorY,
+                                          float radius, float playerHeight) {
     if (!scene.camera.FPSMode) return;
     const float feet = position.y - playerHeight;
+
+    // Per-triangle geometry first, so the player can walk into a hangar rather
+    // than being stopped by the box that wraps the whole airport.
+    for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
+        const XMFLOAT3 base(position.x, feet, position.z);
+        const CollisionMeshPushout pushout = CollisionMeshInstanceResolveCapsule(
+            instance, base, radius, playerHeight, kPlayerStepHeight);
+        if (!pushout.touched) continue;
+        position.x += pushout.displacement.x;
+        position.y += pushout.displacement.y;
+        position.z += pushout.displacement.z;
+        // Raising floorY is what stands the player on an interior floor; the
+        // ground snap later in the same frame reads it.
+        if (pushout.hasFloor) floorY = (std::max)(floorY, pushout.floorY);
+    }
+
     for (const PrefabCollider& collider : g_prefabColliders) {
+        // Entities with a triangle mesh were just resolved against it. Applying
+        // the bounds box on top would immediately shove the player back out of
+        // the building they just walked into.
+        if (g_meshCollisionEntities.count(collider.entityId)) continue;
         if (feet >= collider.center.y + collider.halfExtents.y ||
             position.y <= collider.center.y - collider.halfExtents.y) continue;
         const float yaw = collider.yawRadians;
@@ -8862,12 +9127,49 @@ static void ResolvePlayerPrefabCollisions(XMFLOAT3& position, float radius,
     }
 }
 
+// Queues the player-collision volumes for the wireframe overlay.
+//
+// Deliberately reads the same collections ResolvePlayerPrefabCollisions walks,
+// rather than re-deriving boxes from prefab bounds: a debug view that computes
+// its own geometry can agree with the renderer while disagreeing with the
+// collision system, which is exactly the bug it would be used to find.
+void BuildCollisionDebugLines() {
+    g_collisionDebugRenderer.Clear();
+    if (!g_showCollisionDebug) return;
+
+    for (const PrefabCollider& collider : g_prefabColliders) {
+        // Amber for a box that is genuinely what gets queried; dim grey when a
+        // triangle mesh supersedes it for segment tests, so a shot passing
+        // "through" the grey box is expected rather than alarming.
+        const bool superseded = g_meshCollisionEntities.count(collider.entityId) > 0;
+        const XMFLOAT4 color = superseded ? XMFLOAT4(0.45f, 0.45f, 0.5f, 0.35f)
+                                          : XMFLOAT4(1.0f, 0.72f, 0.2f, 0.9f);
+        g_collisionDebugRenderer.AddBox(collider.center, collider.halfExtents,
+                                        collider.yawRadians, color);
+    }
+
+    // Mesh colliders draw their world bounds in green -- the broadphase volume a
+    // query must enter before any triangle is tested. The triangles themselves
+    // are not drawn: at 835k for the airport alone they would bury the scene.
+    for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
+        g_collisionDebugRenderer.AddBounds(instance.worldBoundsMin,
+                                           instance.worldBoundsMax,
+                                           XMFLOAT4(0.3f, 1.0f, 0.45f, 0.8f));
+    }
+}
+
 static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
                                      float radius, XMFLOAT3& hit,
-                                     uint64_t* hitEntityId) {
+                                     uint64_t* hitEntityId,
+                                     XMFLOAT3* hitNormal) {
     float closestDistanceSquared = FLT_MAX;
     bool struck = false;
     for (const PrefabCollider& collider : g_prefabColliders) {
+        // Skip the bounds box of anything that also has a triangle mesh. The box
+        // always encloses the geometry, so its hit is at or before the real
+        // surface and nearest-wins would let it shadow every mesh hit -- shots
+        // would stop at an invisible plane across the hangar doorway.
+        if (g_meshCollisionEntities.count(collider.entityId)) continue;
         XMFLOAT3 candidate;
         if (!PrefabColliderIntersectsSegment(collider, start, end, radius,
                                              &candidate)) continue;
@@ -8879,6 +9181,25 @@ static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
             closestDistanceSquared = distanceSquared;
             hit = candidate;
             if (hitEntityId) *hitEntityId = collider.entityId;
+            // Box hits carry no surface normal. Leave the caller's value alone
+            // so its existing fallback (reversed velocity, or the negated shot
+            // direction) still applies.
+            struck = true;
+        }
+    }
+    for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
+        CollisionMeshRayHit meshHit;
+        if (!CollisionMeshInstanceRaycast(instance, start, end, radius, meshHit))
+            continue;
+        const float dx = meshHit.point.x - start.x;
+        const float dy = meshHit.point.y - start.y;
+        const float dz = meshHit.point.z - start.z;
+        const float distanceSquared = dx * dx + dy * dy + dz * dz;
+        if (distanceSquared < closestDistanceSquared) {
+            closestDistanceSquared = distanceSquared;
+            hit = meshHit.point;
+            if (hitEntityId) *hitEntityId = instance.entityId;
+            if (hitNormal) *hitNormal = meshHit.normal;
             struck = true;
         }
     }
@@ -9019,8 +9340,14 @@ static bool HitGrenadeCollision(const Projectile& grenade, float radius,
         accept(candidate, fallback);
     if (g_trees.BlocksSegment(start, end, radius))
         accept(start, fallback);
-    if (HitPrefabColliderSegment(start, end, radius, candidate))
-        accept(candidate, fallback);
+    // Seeded with the reversed-velocity fallback: a bounds-box hit leaves it
+    // untouched and behaves exactly as before, while a triangle hit overwrites
+    // it with the real surface normal so the grenade bounces off a hangar wall
+    // the way it does off terrain.
+    XMFLOAT3 prefabNormal = fallback;
+    if (HitPrefabColliderSegment(start, end, radius, candidate, nullptr,
+                                 &prefabNormal))
+        accept(candidate, prefabNormal);
     if (includePhysicsWorld &&
         HitTerrainSegment(start, end, radius, candidate)) {
         auto params = CurrentTerrainParams();
@@ -9663,6 +9990,14 @@ static void RebuildScalableEnvironment() {
                     static_cast<uint32_t>(entity.id) });
             } else if (entity.type == LevelEntityType::Prefab ||
                        entity.type == LevelEntityType::Rock) {
+                // Navigation obstacles are axis-aligned rectangles, so a
+                // mesh-collision prefab still contributes its bounds box here
+                // and this loop does not filter g_meshCollisionEntities.
+                // Consequence for the airport: enemies will not path inside it
+                // and grass is excluded across its whole footprint. Turning the
+                // triangle mesh into walkable navmesh needs rectangle
+                // decomposition, which is deferred follow-up work -- this is
+                // the behaviour that already shipped, not a regression.
                 for (const PrefabCollider& collider : g_prefabColliders) {
                     if (collider.entityId != entity.id) continue;
                     const float c = std::abs(std::cos(collider.yawRadians));
@@ -9887,6 +10222,7 @@ static void SetCursorVisible(bool visible) {
 
 static void OpenMainMenu() {
     g_game.world.Prefabs().ClearDerived();
+    g_meshCollisionEntities.clear();
     g_game.world.Prefabs().ResetGameplayState();
     g_prefabAudioPlayers.clear();
     g_game.session.SetScreen(GameScreen::MainMenu);
@@ -15242,6 +15578,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         std::cerr << "GPU particle renderer unavailable; using draw fallback\n";
     if (!g_rainRenderer.Init())
         std::cerr << "Rain renderer unavailable (non-fatal)\n";
+    if (!g_collisionDebugRenderer.Init())
+        std::cerr << "Collision debug overlay unavailable (non-fatal)\n";
 
     BootStep("Initializing mesh shader pipeline...");
     g_useMeshShader = g_meshShader.Init(mainShader);
@@ -15624,6 +15962,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 "Prefab smoke test injected rock instance");
         }
     }
+    // SGE_COLLISION_TEST=1 loads the Training Range, which places the airport
+    // prefab, and exits once its collision tree has been built. The BVH stats
+    // land in the log during LoadPrefabModel, so this measures the real model
+    // without needing anyone to sit at the menu.
+    if (GetEnvironmentVariableA("SGE_COLLISION_TEST", nullptr, 0) > 0) {
+        g_collisionSmokeEnabled = true;
+        StartTrainingRange(hwnd);
+        SGE_LOG("LogPrefab", EngineLog::Level::Display,
+            "Collision smoke test started (Training Range)");
+    }
     if (GetEnvironmentVariableA("SGE_PREFAB_EDITOR_TEST", nullptr, 0) > 0) {
         g_prefabEditorSmokeEnabled = true;
         StartLevelEditor(hwnd);
@@ -15849,7 +16197,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             ResolvePlayerWorldObjectCollisions(
                 scene.camera.Position, scene.camera.FloorY,
                 0.35f, scene.camera.PlayerHeight);
-            ResolvePlayerPrefabCollisions(scene.camera.Position, 0.35f,
+            ResolvePlayerPrefabCollisions(scene.camera.Position,
+                                          scene.camera.FloorY, 0.35f,
                                           scene.camera.PlayerHeight);
             if (!g_emptyLevelMode)
                 ResolvePlayerBlackHawkCollision(
@@ -17583,13 +17932,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     continue;
                 }
                 uint64_t prefabEntityId = 0;
+                // Seeded with the negated shot direction, which is what every
+                // prefab impact used before triangle collision existed. A mesh
+                // hit replaces it with the real surface normal, so decals lie
+                // flat on an angled hangar wall instead of facing the shooter.
+                XMFLOAT3 normal(-projectile.direction.x,
+                                -projectile.direction.y,
+                                -projectile.direction.z);
                 if (HitPrefabColliderSegment(projectile.previousPosition,
                         projectile.position, bulletRadius, hit,
-                        &prefabEntityId)) {
+                        &prefabEntityId, &normal)) {
                     projectile.position = hit;
-                    const XMFLOAT3 normal(-projectile.direction.x,
-                                          -projectile.direction.y,
-                                          -projectile.direction.z);
                     scene.SpawnBulletImpact(hit, normal);
                     if (projectile.laser) scene.StopLaserBeamAt(hit);
                     if (projectile.harpoon) scene.ShowHarpoonTether(hit);
@@ -19088,6 +19441,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             RenderImpactBillboards(scene, mainShader, geo, fogLightSpace);
         }
 
+        // Collision wireframe last among the scene passes: it is an overlay, so
+        // it should sit on top of everything solid while still depth-testing
+        // against it.
+        if (renderedScene && g_showCollisionDebug &&
+            g_collisionDebugRenderer.initialized) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "Collision Debug", g_dx12.commandList.Get());
+            BuildCollisionDebugLines();
+            if (g_collisionDebugRenderer.Render(scene,
+                    mainShader.hdrTargetEnabled, mainShader.msaaEnabled)) {
+                // Own root signature and heap bindings, as with the particle
+                // renderer: whatever draws next must rebind the main ones.
+                mainShader.InvalidateGraphicsRootBinding();
+                mainShader.Use(scene.wireframeMode);
+            }
+        }
+
         if (renderedScene && !bentGTAODiagnosticActive && grassMSAAActive) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Grass 4x MSAA", g_dx12.commandList.Get());
@@ -19737,6 +20107,128 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                           << "forward_draws=" << g_forwardDrawCalls << '\n';
                 PostQuitMessage(0);
             }
+        }
+        // Stage-2 gate. The BVH statistics are logged by LoadPrefabModel; what
+        // is checked here is that the tree actually reached the cache and that
+        // a ray fired straight down through the airport's own bounds hits
+        // geometry, which is the cheapest proof the triangles landed in the
+        // right space.
+        if (g_collisionSmokeEnabled && !g_collisionSmokeChecked &&
+            !g_prefabRebuildRequested) {
+            const auto cached = g_prefabModelCache.find("props/airport");
+            const bool built = cached != g_prefabModelCache.end() &&
+                               cached->second.collisionMesh &&
+                               !cached->second.collisionMesh->Empty();
+            bool hit = false;
+            if (built) {
+                const CollisionMesh& mesh = *cached->second.collisionMesh;
+                const CollisionMesh::Node& root = mesh.nodes[0];
+                // Straight down the middle of the model, from above the roof to
+                // below the floor: any closed structure must be struck.
+                const XMFLOAT3 start(
+                    (root.boundsMin[0] + root.boundsMax[0]) * 0.5f,
+                    root.boundsMax[1] + 1.0f,
+                    (root.boundsMin[2] + root.boundsMax[2]) * 0.5f);
+                const XMFLOAT3 end(start.x, root.boundsMin[1] - 1.0f, start.z);
+                CollisionMeshRayHit result;
+                hit = CollisionMeshRaycast(mesh, start, end, 0.0f, result);
+                if (hit) {
+                    SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                        "Collision probe hit at y=" + std::to_string(result.point.y) +
+                        " normal y=" + std::to_string(result.normal.y) +
+                        " tri=" + std::to_string(result.triangle));
+                }
+            }
+            // R9: the same cast through the shared segment helper, which is the
+            // path bullets take. If the bounds box still shadowed the mesh, this
+            // would report a hit on the box's flat top rather than on geometry,
+            // so compare the two against each other.
+            bool helperAgrees = false;
+            bool instanced = false;
+            if (built) {
+                const auto placed = std::find_if(g_prefabMeshColliders.begin(),
+                    g_prefabMeshColliders.end(),
+                    [&](const CollisionMeshInstance& value) {
+                        return value.mesh == cached->second.collisionMesh.get();
+                    });
+                instanced = placed != g_prefabMeshColliders.end();
+                if (instanced) {
+                    const XMFLOAT3 start(
+                        (placed->worldBoundsMin.x + placed->worldBoundsMax.x) * 0.5f,
+                        placed->worldBoundsMax.y + 5.0f,
+                        (placed->worldBoundsMin.z + placed->worldBoundsMax.z) * 0.5f);
+                    const XMFLOAT3 end(start.x, placed->worldBoundsMin.y - 5.0f,
+                                       start.z);
+                    XMFLOAT3 point{};
+                    XMFLOAT3 normal(0.0f, 0.0f, 0.0f);
+                    uint64_t entity = 0;
+                    if (HitPrefabColliderSegment(start, end, 0.02f, point,
+                                                 &entity, &normal)) {
+                        // A box hit leaves the seeded normal untouched; only the
+                        // triangle path writes one.
+                        const float length = std::sqrt(
+                            normal.x * normal.x + normal.y * normal.y +
+                            normal.z * normal.z);
+                        helperAgrees = length > 0.5f &&
+                                       point.y < placed->worldBoundsMax.y - 0.001f;
+                        SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                            "Segment helper hit entity " + std::to_string(entity) +
+                            " at y=" + std::to_string(point.y) +
+                            " (box top y=" + std::to_string(placed->worldBoundsMax.y) +
+                            ") normal length " + std::to_string(length));
+                    }
+                }
+            }
+            // Exercise the debug overlay's line builder here too: it reads the
+            // same collections, so a smoke run confirms it produces geometry
+            // without needing someone to tick the checkbox by hand.
+            {
+                const bool previous = g_showCollisionDebug;
+                g_showCollisionDebug = true;
+                BuildCollisionDebugLines();
+                SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                    "Collision debug overlay queued " +
+                    std::to_string(g_collisionDebugRenderer.LineCount()) +
+                    " lines for " + std::to_string(g_prefabColliders.size()) +
+                    " boxes and " + std::to_string(g_prefabMeshColliders.size()) +
+                    " mesh instances");
+                g_showCollisionDebug = previous;
+                g_collisionDebugRenderer.Clear();
+            }
+            // Player capsule against the real airport: dropping onto the model
+            // from above must report a floor to stand on rather than sliding
+            // off sideways, which is what walking inside depends on.
+            if (built && instanced) {
+                const auto placed = std::find_if(g_prefabMeshColliders.begin(),
+                    g_prefabMeshColliders.end(),
+                    [&](const CollisionMeshInstance& value) {
+                        return value.mesh == cached->second.collisionMesh.get();
+                    });
+                // Feet exactly on the surface the raycast above found, which is
+                // where the ground snap would leave a standing player.
+                const XMFLOAT3 probe(
+                    (placed->worldBoundsMin.x + placed->worldBoundsMax.x) * 0.5f,
+                    -0.244928f,
+                    (placed->worldBoundsMin.z + placed->worldBoundsMax.z) * 0.5f);
+                const CollisionMeshPushout stand =
+                    CollisionMeshInstanceResolveCapsule(*placed, probe, 0.35f,
+                                                        1.8f, kPlayerStepHeight);
+                SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                    std::string("Player capsule probe: touched=") +
+                    (stand.touched ? "yes" : "no") + " floor=" +
+                    (stand.hasFloor ? std::to_string(stand.floorY) : "none") +
+                    " push=(" + std::to_string(stand.displacement.x) + ", " +
+                    std::to_string(stand.displacement.y) + ", " +
+                    std::to_string(stand.displacement.z) + ")");
+            }
+            const bool passed = built && hit && instanced && helperAgrees;
+            SGE_LOG("LogPrefab", passed ? EngineLog::Level::Display
+                                        : EngineLog::Level::Error,
+                passed ? "Collision smoke passed: airport BVH built, instanced, "
+                         "queryable, and not shadowed by its bounds box"
+                       : "Collision smoke failed");
+            g_collisionSmokeChecked = true;
+            PostQuitMessage(passed ? 0 : 4);
         }
         if (g_prefabEditorSmokeEnabled && !g_prefabEditorSmokeFinished) {
             for (auto& [id, thumbnail] : g_prefabThumbnails) {

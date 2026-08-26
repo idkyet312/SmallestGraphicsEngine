@@ -30,4 +30,16 @@ public:
         const Skeleton& skeleton,
         std::vector<AnimationClip>& clips,
         std::string* error = nullptr);
+
+    // FNV-1a over a buffer, and over a file's contents. Exposed because the
+    // collision-mesh cache keys its trees on exactly the same source hash this
+    // loader uses, and two implementations that must agree byte-for-byte should
+    // not be written twice.
+    //
+    // Both pump the window's message queue as they go: hashing a 233 MB GLB
+    // synchronously is long enough for Windows to classify the process as hung
+    // and terminate it before the first level-load task finishes.
+    static uint64_t HashBytes(const void* data, size_t size,
+                              uint64_t hash = 1469598103934665603ull);
+    static uint64_t HashFile(const std::filesystem::path& path);
 };

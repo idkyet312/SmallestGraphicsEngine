@@ -31,6 +31,17 @@ namespace {
 const std::filesystem::path kPrefabRoot = "Content/Prefabs";
 const std::filesystem::path kModelRoot = "Content/Models";
 
+// The complete set of collision shapes the runtime understands. Shared by the
+// prefab authoring panel and the per-entity override row so the two can never
+// drift, and so neither offers a value the loader would reject.
+const char* const kCollisionShapes[] = { "none", "box", "mesh" };
+
+int CollisionShapeIndex(const std::string& shape) {
+    for (int i = 0; i < IM_ARRAYSIZE(kCollisionShapes); ++i)
+        if (shape == kCollisionShapes[i]) return i;
+    return 0;
+}
+
 // Cells per side of the heightmap preview drawn inside the placement square.
 // 64 matches the 0.5 m/vertex the clipmap's innermost ring renders across a
 // 32 m stamp, so the preview shows the relief the terrain will actually
@@ -155,11 +166,26 @@ bool DrawPrefabOverrides(LevelEntity& entity, const PrefabAsset& prefab) {
     bool changed = false;
     const nlohmann::json merged = MergePrefabComponents(prefab.components,
                                                         entity.overrides);
+    // collision.shape is always offered, even when the prefab defines no
+    // collision component. Every other property describes something the prefab
+    // already has, but collision is the one an entity may want to *add*: a
+    // prefab authored without it could otherwise never be given per-triangle
+    // collision from the level editor, because the row that enables it would
+    // never be drawn. The synthesized default matches what the runtime assumes
+    // for a prefab with no collision component.
+    nlohmann::json effective = merged;
+    if (!effective.contains("collision") ||
+        !effective.at("collision").is_object() ||
+        !effective.at("collision").contains("shape")) {
+        effective["collision"]["shape"] =
+            prefab.collision.empty() ? std::string("none") : prefab.collision;
+    }
+
     const char* currentComponent = nullptr;
     for (const PrefabPropertyDescriptor& property : PrefabPropertyMetadata()) {
-        if (!merged.contains(property.component) ||
-            !merged.at(property.component).is_object() ||
-            !merged.at(property.component).contains(property.field)) continue;
+        if (!effective.contains(property.component) ||
+            !effective.at(property.component).is_object() ||
+            !effective.at(property.component).contains(property.field)) continue;
         if (!currentComponent || std::strcmp(currentComponent,
                                               property.component) != 0) {
             currentComponent = property.component;
@@ -173,7 +199,7 @@ bool DrawPrefabOverrides(LevelEntity& entity, const PrefabAsset& prefab) {
         if (ImGui::Checkbox("##override", &overridden)) {
             if (overridden)
                 entity.overrides[property.component][property.field] =
-                    merged.at(property.component).at(property.field);
+                    effective.at(property.component).at(property.field);
             else {
                 entity.overrides[property.component].erase(property.field);
                 if (entity.overrides[property.component].empty())
@@ -186,7 +212,7 @@ bool DrawPrefabOverrides(LevelEntity& entity, const PrefabAsset& prefab) {
         nlohmann::json& value = overridden
             ? entity.overrides[property.component][property.field]
             : const_cast<nlohmann::json&>(
-                merged.at(property.component).at(property.field));
+                effective.at(property.component).at(property.field));
         try {
             if (property.type == PrefabPropertyType::Boolean) {
                 bool edited = value.get<bool>();
@@ -211,6 +237,17 @@ bool DrawPrefabOverrides(LevelEntity& entity, const PrefabAsset& prefab) {
                     value.at(1).get<float>(), value.at(2).get<float>() };
                 if (ImGui::ColorEdit3(property.field, edited) && overridden) {
                     value = { edited[0], edited[1], edited[2] }; changed = true;
+                }
+            } else if (std::strcmp(property.component, "collision") == 0 &&
+                       std::strcmp(property.field, "shape") == 0) {
+                // A three-value enum typed by hand invites silent typos: the
+                // loader falls back to the bounds box for anything it does not
+                // recognise, so "Mesh" or "mesh " would look like mesh collision
+                // simply failing to work.
+                int index = CollisionShapeIndex(value.get<std::string>());
+                if (ImGui::Combo(property.field, &index, kCollisionShapes,
+                                 IM_ARRAYSIZE(kCollisionShapes)) && overridden) {
+                    value = kCollisionShapes[index]; changed = true;
                 }
             } else {
                 char edited[260] = {};
@@ -1734,12 +1771,10 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                               0.01f, 100.0f);
             ImGui::Checkbox("Cast shadow", &prefabDraft_.castShadow);
             ImGui::Checkbox("Use materials", &prefabDraft_.useMaterials);
-            const char* collisionShapes[] = { "none", "box", "mesh" };
-            int collisionIndex = prefabDraft_.collision == "box" ? 1 :
-                (prefabDraft_.collision == "mesh" ? 2 : 0);
-            if (ImGui::Combo("Collision", &collisionIndex, collisionShapes,
-                             IM_ARRAYSIZE(collisionShapes)))
-                prefabDraft_.collision = collisionShapes[collisionIndex];
+            int collisionIndex = CollisionShapeIndex(prefabDraft_.collision);
+            if (ImGui::Combo("Collision", &collisionIndex, kCollisionShapes,
+                             IM_ARRAYSIZE(kCollisionShapes)))
+                prefabDraft_.collision = kCollisionShapes[collisionIndex];
 
             ImGui::SeparatorText("Components");
             ImGui::Checkbox("Light", &prefabDraft_.light.enabled);

@@ -86,30 +86,16 @@ void PumpPendingWindowMessages() {
     pumpRange(WM_SIZE + 1, (std::numeric_limits<UINT>::max)());
 }
 
+// Local spellings kept so the many call sites below read unchanged; the bodies
+// now live on CookedAssetLoader so the collision cache can key its trees on the
+// identical hash.
 uint64_t HashBytes(const void* data, size_t size,
                    uint64_t hash = 1469598103934665603ull) {
-    const auto* bytes = static_cast<const uint8_t*>(data);
-    for (size_t i = 0; i < size; ++i) {
-        hash ^= bytes[i];
-        hash *= 1099511628211ull;
-        if ((i & ((4u * 1024u * 1024u) - 1u)) == 0u && i != 0u)
-            PumpPendingWindowMessages();
-    }
-    return hash;
+    return CookedAssetLoader::HashBytes(data, size, hash);
 }
 
 uint64_t HashFile(const fs::path& path) {
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream) return 0;
-    std::array<char, 64 * 1024> block{};
-    uint64_t hash = 1469598103934665603ull;
-    while (stream) {
-        stream.read(block.data(), block.size());
-        hash = HashBytes(block.data(),
-            static_cast<size_t>(stream.gcount()), hash);
-        PumpPendingWindowMessages();
-    }
-    return hash;
+    return CookedAssetLoader::HashFile(path);
 }
 
 const char* GetString(const MappedFile& map, const Cooked::Header& header,
@@ -295,6 +281,32 @@ ComPtr<ID3D12Resource> StaticBuffer(
 }
 
 } // namespace
+
+uint64_t CookedAssetLoader::HashBytes(const void* data, size_t size,
+                                      uint64_t hash) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+        if ((i & ((4u * 1024u * 1024u) - 1u)) == 0u && i != 0u)
+            PumpPendingWindowMessages();
+    }
+    return hash;
+}
+
+uint64_t CookedAssetLoader::HashFile(const fs::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) return 0;
+    std::array<char, 64 * 1024> block{};
+    uint64_t hash = 1469598103934665603ull;
+    while (stream) {
+        stream.read(block.data(), block.size());
+        hash = CookedAssetLoader::HashBytes(block.data(),
+            static_cast<size_t>(stream.gcount()), hash);
+        PumpPendingWindowMessages();
+    }
+    return hash;
+}
 
 fs::path CookedAssetLoader::FindForSource(const fs::path& source) {
     if (source.extension() == ".sgeasset" && fs::exists(source))

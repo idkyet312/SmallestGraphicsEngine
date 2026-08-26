@@ -24,6 +24,8 @@ extern RaytracingContext g_rt;
 extern ProfilerDX12 g_profiler;
 // Shift-sprint state for the HUD's sprint indicator. Owned by main.cpp.
 extern bool g_playerSprinting;
+// Wireframe overlay for the prefab volumes the player collides against.
+extern bool g_showCollisionDebug;
 extern UINT g_forwardDrawCalls;
 extern UINT g_shadowDrawCalls;
 extern UINT g_visibilityDrawCalls;
@@ -1515,6 +1517,15 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::ColorEdit3("Floor Color", &scene.floor.color.x);
         ImGui::ColorEdit3("Clear Color", &scene.clearColor.x);
         ImGui::Checkbox("Wireframe Mode", &scene.wireframeMode);
+        ImGui::Checkbox("Player Collision Volumes", &g_showCollisionDebug);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Wireframe overlay of the prefab volumes the player collides "
+                "against.\n"
+                "Amber: bounds box, and it is what segment queries hit.\n"
+                "Grey: bounds box superseded by a triangle mesh for those "
+                "queries.\n"
+                "Green: world bounds of a triangle mesh (its broadphase).");
         ImGui::Checkbox("Mesh Shader Terrain", &scene.useMeshTerrain);
         if (scene.useMeshTerrain) {
             ImGui::SliderFloat("Terrain Height", &scene.terrainHeightScale, 0.0f, 15.0f);
