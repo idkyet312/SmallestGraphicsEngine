@@ -71,6 +71,7 @@ cmake_install.cmake
 Makefile
 *.cmake
 !CMakeLists.txt
+!cmake/SyncRuntimeContent.cmake
 
 # IDE
 .vscode/

@@ -637,11 +637,14 @@ struct DestructionDX12::Impl {
     b3WorldId world = b3_nullWorldId;
     b3BodyId ground = b3_nullBodyId;
     b3HeightFieldData* terrainHeightField = nullptr;
-    b3BodyId vehicleChassis = b3_nullBodyId;
-    std::array<b3BodyId, 4> vehicleWheels = {
-        b3_nullBodyId, b3_nullBodyId, b3_nullBodyId, b3_nullBodyId };
-    std::array<b3JointId, 4> vehicleJoints = {
-        b3_nullJointId, b3_nullJointId, b3_nullJointId, b3_nullJointId };
+    struct VehicleRuntime {
+        b3BodyId chassis = b3_nullBodyId;
+        std::array<b3BodyId, 4> wheels = {
+            b3_nullBodyId, b3_nullBodyId, b3_nullBodyId, b3_nullBodyId };
+        std::array<b3JointId, 4> joints = {
+            b3_nullJointId, b3_nullJointId, b3_nullJointId, b3_nullJointId };
+    };
+    std::vector<VehicleRuntime> vehicles;
     // Optional terrain-height sampler. When set, the ground is a static
     // heightfield matching the drawn terrain, so debris rests on the real hills
     // and rolls into the basin instead of hovering on a flat plane.
@@ -3036,6 +3039,7 @@ void DestructionDX12::Shutdown() {
     }
     if (!B3_IS_NULL(m->world)) b3DestroyWorld(m->world);
     m->world = b3_nullWorldId;
+    m->vehicles.clear();
     if (m->terrainHeightField) {
         b3DestroyHeightField(m->terrainHeightField);
         m->terrainHeightField = nullptr;
@@ -3072,24 +3076,45 @@ void DestructionDX12::Reset() {
     Initialize(source, device, x, y, z);
 }
 
-bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter,
+void DestructionDX12::ClearVehicles() {
+    if (!m) return;
+    if (!B3_IS_NULL(m->world)) {
+        for (Impl::VehicleRuntime& vehicle : m->vehicles) {
+            for (b3BodyId& wheel : vehicle.wheels) {
+                if (!B3_IS_NULL(wheel)) {
+                    b3DestroyBody(wheel);
+                    wheel = b3_nullBodyId;
+                }
+            }
+            if (!B3_IS_NULL(vehicle.chassis)) {
+                b3DestroyBody(vehicle.chassis);
+                vehicle.chassis = b3_nullBodyId;
+            }
+        }
+    }
+    m->vehicles.clear();
+}
+
+bool DestructionDX12::InitializeVehicle(size_t vehicleIndex,
+                                        const XMFLOAT3& chassisCenter,
                                         float yawRadians) {
     if (!m || !m->initialized || B3_IS_NULL(m->world)) return false;
 
-    // Re-spawning replaces the existing vehicle rather than being refused.
-    // The editor re-runs this whenever the Humvee entity is moved, and the
-    // old early-return meant the second call silently did nothing: the
-    // vehicle stayed at its first position and the move looked ignored.
-    // Destroying the body drops its joints with it.
-    if (!B3_IS_NULL(m->vehicleChassis)) {
-        for (b3BodyId& wheel : m->vehicleWheels) {
+    if (vehicleIndex >= m->vehicles.size())
+        m->vehicles.resize(vehicleIndex + 1);
+    Impl::VehicleRuntime& vehicle = m->vehicles[vehicleIndex];
+
+    // The editor can replace one authored vehicle without disturbing the
+    // suspension and momentum of every other live vehicle.
+    if (!B3_IS_NULL(vehicle.chassis)) {
+        for (b3BodyId& wheel : vehicle.wheels) {
             if (!B3_IS_NULL(wheel)) {
                 b3DestroyBody(wheel);
                 wheel = b3_nullBodyId;
             }
         }
-        b3DestroyBody(m->vehicleChassis);
-        m->vehicleChassis = b3_nullBodyId;
+        b3DestroyBody(vehicle.chassis);
+        vehicle.chassis = b3_nullBodyId;
     }
 
     b3BodyDef chassisDef = b3DefaultBodyDef();
@@ -3100,7 +3125,7 @@ bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter,
     chassisDef.rotation = yawRotation;
     chassisDef.linearDamping = 0.12f;
     chassisDef.angularDamping = 0.65f;
-    m->vehicleChassis = b3CreateBody(m->world, &chassisDef);
+    vehicle.chassis = b3CreateBody(m->world, &chassisDef);
     b3ShapeDef chassisShape = b3DefaultShapeDef();
     chassisShape.density = 110.0f;
     chassisShape.baseMaterial.friction = 0.75f;
@@ -3109,14 +3134,14 @@ bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter,
     chassisShape.filter.categoryBits = CollisionCategoryVehicle;
     chassisShape.filter.maskBits = UINT64_MAX;
     b3BoxHull chassisHull = b3MakeBoxHull(2.20f, 0.55f, 1.0f);
-    b3CreateHullShape(m->vehicleChassis, &chassisShape, &chassisHull.base);
+    b3CreateHullShape(vehicle.chassis, &chassisShape, &chassisHull.base);
 
     // A soft parallel constraint resists catastrophic rollovers while still
     // allowing pitch/roll from suspension and terrain.
     if (!B3_IS_NULL(m->ground)) {
         b3ParallelJointDef upright = b3DefaultParallelJointDef();
         upright.base.bodyIdA = m->ground;
-        upright.base.bodyIdB = m->vehicleChassis;
+        upright.base.bodyIdB = vehicle.chassis;
         upright.base.localFrameA.q =
             b3ComputeQuatBetweenUnitVectors(b3Vec3_axisZ, b3Vec3_axisY);
         upright.base.localFrameB.q =
@@ -3141,7 +3166,7 @@ bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter,
     b3Sphere wheelSphere = { b3Vec3_zero, 0.48f };
 
     b3WheelJointDef joint = b3DefaultWheelJointDef();
-    joint.base.bodyIdA = m->vehicleChassis;
+    joint.base.bodyIdA = vehicle.chassis;
     joint.base.localFrameA.q =
         b3ComputeQuatBetweenUnitVectors(b3Vec3_axisX, b3Vec3_axisY);
     joint.base.localFrameB.q =
@@ -3163,7 +3188,7 @@ bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter,
         { 1.55f, -0.58f,  0.92f }, { 1.55f, -0.58f, -0.92f },
         {-1.55f, -0.58f,  0.92f }, {-1.55f, -0.58f, -0.92f },
     };
-    for (size_t i = 0; i < m->vehicleWheels.size(); ++i) {
+    for (size_t i = 0; i < vehicle.wheels.size(); ++i) {
         const XMFLOAT3& offset = wheelOffsets[i];
         const b3Vec3 rotatedOffset = b3RotateVector(yawRotation,
             { offset.x, offset.y, offset.z });
@@ -3171,47 +3196,51 @@ bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter,
             chassisCenter.x + rotatedOffset.x,
             chassisCenter.y + rotatedOffset.y,
             chassisCenter.z + rotatedOffset.z };
-        m->vehicleWheels[i] = b3CreateBody(m->world, &wheelBodyDef);
-        b3CreateSphereShape(m->vehicleWheels[i], &wheelShape, &wheelSphere);
-        joint.base.bodyIdB = m->vehicleWheels[i];
+        vehicle.wheels[i] = b3CreateBody(m->world, &wheelBodyDef);
+        b3CreateSphereShape(vehicle.wheels[i], &wheelShape, &wheelSphere);
+        joint.base.bodyIdB = vehicle.wheels[i];
         joint.base.localFrameA.p = { offset.x, offset.y, offset.z };
         joint.enableSteering = i < 2;
         joint.enableSpinMotor = true;
         joint.maxSpinTorque = 520.0f;
         joint.spinSpeed = 0.0f;
         joint.targetSteeringAngle = 0.0f;
-        m->vehicleJoints[i] = b3CreateWheelJoint(m->world, &joint);
+        vehicle.joints[i] = b3CreateWheelJoint(m->world, &joint);
     }
     return true;
 }
 
-void DestructionDX12::SetVehicleInput(float throttle, float steering, bool brake) {
-    if (!VehicleReady()) return;
+void DestructionDX12::SetVehicleInput(size_t vehicleIndex, float throttle,
+                                      float steering, bool brake) {
+    if (!VehicleReady(vehicleIndex)) return;
+    Impl::VehicleRuntime& vehicle = m->vehicles[vehicleIndex];
     throttle = (std::max)(-1.0f, (std::min)(1.0f, throttle));
     steering = (std::max)(-1.0f, (std::min)(1.0f, steering));
-    b3Body_SetAwake(m->vehicleChassis, true);
+    b3Body_SetAwake(vehicle.chassis, true);
 
     const float steeringAngle = steering * 0.42f;
     for (size_t i = 0; i < 4; ++i) {
         if (i < 2)
-            b3WheelJoint_SetTargetSteeringAngle(m->vehicleJoints[i], steeringAngle);
-        b3WheelJoint_EnableSpinMotor(m->vehicleJoints[i], true);
+            b3WheelJoint_SetTargetSteeringAngle(vehicle.joints[i], steeringAngle);
+        b3WheelJoint_EnableSpinMotor(vehicle.joints[i], true);
         b3WheelJoint_SetSpinMotorSpeed(
-            m->vehicleJoints[i], brake ? 0.0f : 20.0f * throttle);
+            vehicle.joints[i], brake ? 0.0f : 20.0f * throttle);
         const float torque = brake ? 1400.0f :
             (std::abs(throttle) > 0.01f ? 520.0f : 95.0f);
-        b3WheelJoint_SetMaxSpinTorque(m->vehicleJoints[i], torque);
+        b3WheelJoint_SetMaxSpinTorque(vehicle.joints[i], torque);
     }
 }
 
-bool DestructionDX12::GetVehicleTransform(XMFLOAT4X4& transform,
+bool DestructionDX12::GetVehicleTransform(size_t vehicleIndex,
+                                          XMFLOAT4X4& transform,
                                           XMFLOAT3* position,
                                           XMFLOAT3* forward,
                                           XMFLOAT3* linearVelocity) const {
-    if (!VehicleReady()) return false;
-    const XMMATRIX world = BoxTransform(m->vehicleChassis, { 0.0f, 0.0f, 0.0f });
+    if (!VehicleReady(vehicleIndex)) return false;
+    const Impl::VehicleRuntime& vehicle = m->vehicles[vehicleIndex];
+    const XMMATRIX world = BoxTransform(vehicle.chassis, { 0.0f, 0.0f, 0.0f });
     XMStoreFloat4x4(&transform, world);
-    const b3Pos p = b3Body_GetPosition(m->vehicleChassis);
+    const b3Pos p = b3Body_GetPosition(vehicle.chassis);
     if (position) *position = { (float)p.x, (float)p.y, (float)p.z };
     if (forward) {
         XMVECTOR direction = XMVector3Normalize(XMVector3TransformNormal(
@@ -3219,14 +3248,19 @@ bool DestructionDX12::GetVehicleTransform(XMFLOAT4X4& transform,
         XMStoreFloat3(forward, direction);
     }
     if (linearVelocity) {
-        const b3Vec3 velocity = b3Body_GetLinearVelocity(m->vehicleChassis);
+        const b3Vec3 velocity = b3Body_GetLinearVelocity(vehicle.chassis);
         *linearVelocity = { velocity.x, velocity.y, velocity.z };
     }
     return true;
 }
 
-bool DestructionDX12::VehicleReady() const {
-    return m && m->initialized && !B3_IS_NULL(m->vehicleChassis);
+bool DestructionDX12::VehicleReady(size_t vehicleIndex) const {
+    return m && m->initialized && vehicleIndex < m->vehicles.size() &&
+           !B3_IS_NULL(m->vehicles[vehicleIndex].chassis);
+}
+
+size_t DestructionDX12::VehicleCount() const {
+    return m && m->initialized ? m->vehicles.size() : 0;
 }
 
 void DestructionDX12::Update(float dt) {
@@ -4839,7 +4873,7 @@ std::vector<TinyDebrisParticle> DestructionDX12::DrainTinyDebrisParticles() {
 
 void DestructionDX12::ResolvePlayerCollision(XMFLOAT3& eyePosition, float& floorY,
                                              float radius, float height,
-                                             bool collideVehicle) {
+                                             size_t ignoredVehicleIndex) {
     if (!m->initialized) return;
     const float feet = eyePosition.y - height;
     constexpr float kStepHeight = 1.0f / 3.0f;   // max ledge the player can step up onto
@@ -4914,8 +4948,12 @@ void DestructionDX12::ResolvePlayerCollision(XMFLOAT3& eyePosition, float& floor
     // player walks straight through the parked humvee. Its chassis hull is
     // yaw-driven, so sweep the oriented corners into a world AABB rather than
     // assuming an axis-aligned box.
-    if (collideVehicle && VehicleReady()) {
-        const XMMATRIX chassis = BoxTransform(m->vehicleChassis, { 0.0f, 0.0f, 0.0f });
+    for (size_t vehicleIndex = 0; vehicleIndex < m->vehicles.size();
+         ++vehicleIndex) {
+        if (vehicleIndex == ignoredVehicleIndex || !VehicleReady(vehicleIndex))
+            continue;
+        const Impl::VehicleRuntime& vehicle = m->vehicles[vehicleIndex];
+        const XMMATRIX chassis = BoxTransform(vehicle.chassis, { 0.0f, 0.0f, 0.0f });
         constexpr float kChassisHalfX = 2.20f;
         constexpr float kChassisHalfY = 0.55f;
         constexpr float kChassisHalfZ = 1.0f;
@@ -4930,7 +4968,7 @@ void DestructionDX12::ResolvePlayerCollision(XMFLOAT3& eyePosition, float& floor
             lo.y = (std::min)(lo.y, corner.y); hi.y = (std::max)(hi.y, corner.y);
             lo.z = (std::min)(lo.z, corner.z); hi.z = (std::max)(hi.z, corner.z);
         }
-        resolveBox(lo, hi, m->vehicleChassis, true);
+        resolveBox(lo, hi, vehicle.chassis, true);
     }
 }
 

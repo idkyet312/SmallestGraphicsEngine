@@ -328,9 +328,18 @@ int main() {
     LevelDefinition level = MakeLevelOneTemplate();
     RuntimeLevelPlan plan = LevelRuntimeBuilder::Build(level);
     CHECK(plan.playerSpawn.has_value());
-    CHECK(plan.humveeSpawn.has_value());
+    CHECK(plan.humveeSpawns.size() == 1);
     CHECK(plan.helicopterSpawn.has_value());
     CHECK(!plan.explosiveBarrels.empty());
+
+    LevelEntity parkedHumvee = level.entities.back();
+    parkedHumvee.id = 1000;
+    parkedHumvee.type = LevelEntityType::Humvee;
+    parkedHumvee.transform.position[0] = 24.0f;
+    level.entities.push_back(parkedHumvee);
+    plan = LevelRuntimeBuilder::Build(level);
+    CHECK(plan.humveeSpawns.size() == 2);
+    CHECK(plan.humveeSpawns[1].position[0] == 24.0f);
 
     level.entities.front().enabled = false;
     plan = LevelRuntimeBuilder::Build(level);

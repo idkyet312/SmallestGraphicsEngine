@@ -681,6 +681,18 @@ static std::string          g_activeCustomLevelName;
 static std::string          g_mainMenuLevelStatus;
 static XMFLOAT3&            g_primaryHumveeSpawn = g_game.vehicles.primaryHumveeSpawn;
 static float&               g_primaryHumveeYaw = g_game.vehicles.primaryHumveeYaw;
+static std::vector<Transform> g_levelHumveeSpawns;
+static constexpr size_t kNoHumvee = SIZE_MAX;
+static size_t g_activeHumveeIndex = kNoHumvee;
+struct HumveeGameplayState {
+    XMFLOAT3 previousPosition{};
+    bool previousPositionValid = false;
+    float houseImpactCooldown = 0.0f;
+    XMFLOAT3 aimPoint{};
+    float turretYaw = 0.0f;
+    float turretFireCooldown = 0.0f;
+};
+static std::vector<HumveeGameplayState> g_humveeGameplay;
 static std::shared_ptr<SceneNode> g_houseTemplate;
 
 static constexpr size_t kEnemiesPerSpawner = 2;
@@ -1132,7 +1144,9 @@ static size_t LiveRespawningBanditCount() {
     return count;
 }
 
-XMMATRIX HumveeWorldMatrix() {
+size_t LevelHumveeCount() { return g_levelHumveeSpawns.size(); }
+
+XMMATRIX HumveeWorldMatrix(size_t index) {
     const XMMATRIX model =
         XMMatrixTranslation(-g_humveeModelCenter.x, -g_humveeModelMinY,
                             -g_humveeModelCenter.z) *
@@ -1140,31 +1154,54 @@ XMMATRIX HumveeWorldMatrix() {
                         g_humveeModelScale) *
         XMMatrixRotationY(-XM_PIDIV2);
     XMFLOAT4X4 physicsPose;
-    if (g_destruction.GetVehicleTransform(physicsPose)) {
+    if (g_destruction.GetVehicleTransform(index, physicsPose)) {
         // Model floor sits 0.95 m below chassis center.
         return model * XMMatrixTranslation(0.0f, -0.95f, 0.0f) *
                XMLoadFloat4x4(&physicsPose);
     }
-    return model * XMMatrixRotationY(XMConvertToRadians(g_primaryHumveeYaw)) *
-           XMMatrixTranslation(g_primaryHumveeSpawn.x,
-                               g_primaryHumveeSpawn.y - 0.95f,
-                               g_primaryHumveeSpawn.z);
+    if (index >= g_levelHumveeSpawns.size()) return XMMatrixIdentity();
+    const Transform& humvee = g_levelHumveeSpawns[index];
+    return model *
+           XMMatrixRotationY(XMConvertToRadians(humvee.rotation[1])) *
+           XMMatrixTranslation(humvee.position[0],
+                               humvee.position[1] - 0.95f,
+                               humvee.position[2]);
 }
 
-void PrimaryHumveeHeadlightPose(XMFLOAT3& position, XMFLOAT3& direction) {
+XMMATRIX HumveeWorldMatrix() { return HumveeWorldMatrix(0); }
+
+void PrepareHumveeModelForRender(size_t index) {
+    if (!g_humveeModel || !g_humveeTurretNode) return;
+    const float yaw = index < g_humveeGameplay.size()
+        ? g_humveeGameplay[index].turretYaw : 0.0f;
+    XMStoreFloat4(&g_humveeTurretNode->rotation,
+        XMQuaternionRotationAxis(XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f), yaw));
+    XMFLOAT4X4 identity;
+    XMStoreFloat4x4(&identity, XMMatrixIdentity());
+    g_humveeModel->UpdateGlobalTransform(identity);
+}
+
+void HumveeHeadlightPose(size_t index, XMFLOAT3& position,
+                         XMFLOAT3& direction) {
     XMFLOAT4X4 poseStorage{};
     XMFLOAT3 chassisPosition{};
     XMFLOAT3 chassisForward{};
     XMMATRIX pose;
     if (g_destruction.GetVehicleTransform(
-            poseStorage, &chassisPosition, &chassisForward)) {
+            index, poseStorage, &chassisPosition, &chassisForward)) {
         pose = XMLoadFloat4x4(&poseStorage);
     } else {
-        pose = XMMatrixRotationY(XMConvertToRadians(g_primaryHumveeYaw)) *
-               XMMatrixTranslation(g_primaryHumveeSpawn.x,
-                                   g_primaryHumveeSpawn.y,
-                                   g_primaryHumveeSpawn.z);
-        chassisPosition = g_primaryHumveeSpawn;
+        if (index >= g_levelHumveeSpawns.size()) {
+            position = {};
+            direction = { 1.0f, 0.0f, 0.0f };
+            return;
+        }
+        const Transform& humvee = g_levelHumveeSpawns[index];
+        pose = XMMatrixRotationY(XMConvertToRadians(humvee.rotation[1])) *
+               XMMatrixTranslation(humvee.position[0], humvee.position[1],
+                                   humvee.position[2]);
+        chassisPosition = { humvee.position[0], humvee.position[1],
+                            humvee.position[2] };
         XMStoreFloat3(&chassisForward, XMVector3Normalize(pose.r[0]));
     }
 
@@ -1545,8 +1582,8 @@ static float g_deploymentFlythroughTime = 0.0f;
 static float g_deploymentZoom = 1.0f;
 static constexpr float kDeploymentZoomMin = 0.45f;
 static constexpr float kDeploymentZoomMax = 2.2f;
-// Manual orbit: right-drag turns the map, and the automatic rotation resumes
-// after a pause once the button is released.
+// Manual orbit: right-drag turns and tilts the map, and the automatic rotation
+// resumes after a pause once the button is released.
 //
 // The auto orbit reads its angle from g_deploymentFlythroughTime, so a manual
 // turn is stored as an offset onto that rather than by writing the time back.
@@ -1557,19 +1594,19 @@ static constexpr float kDeploymentZoomMax = 2.2f;
 // takes capture for itself on any button press -- between them the capture
 // changed hands the instant a drag began, and a WM_CAPTURECHANGED handler that
 // treated that as "drag cancelled" tore the drag down before a single
-// WM_MOUSEMOVE could act on it. Measured: RBUTTONDOWN was always immediately
-// followed by CAPTURECHANGED with no MOUSEMOVE in between.
+// WM_MOUSEMOVE could act on it.
 //
 // ImGui already owns the pointer on this screen and tracks the drag itself, so
 // reading it there sidesteps the capture fight entirely and keeps one owner.
 static bool g_deploymentOrbitDragging = false;
 static float g_deploymentOrbitOffset = 0.0f;
+static float g_deploymentOrbitElevationOffset = 0.0f;
 static float g_deploymentOrbitResumeDelay = 0.0f;
-// Horizontal drag banked by the UI pass for the camera update to consume. The
-// UI runs after ImGui::NewFrame (where MouseDelta becomes valid) and the camera
-// update runs before it, so the value is handed across the frame boundary
-// rather than read twice.
+// Drag deltas banked by the UI pass for the camera update to consume. The UI
+// runs after ImGui::NewFrame (where MouseDelta becomes valid) and the camera
+// update runs before it, so the values cross the frame boundary here.
 static float g_deploymentOrbitPendingDrag = 0.0f;
+static float g_deploymentOrbitPendingTilt = 0.0f;
 // Flick momentum. Releasing mid-drag hands the map the speed it was turning at
 // and lets friction bleed it off, so the globe carries on and coasts to a stop
 // rather than freezing the instant the button comes up.
@@ -1580,6 +1617,9 @@ static constexpr float kDeploymentOrbitResumeSeconds = 3.0f;
 // Radians of orbit per pixel dragged. A full turn is a little over a
 // screen-width of travel at 1080p.
 static constexpr float kDeploymentOrbitRadiansPerPixel = 0.0032f;
+static constexpr float kDeploymentOrbitElevationRadiansPerPixel = 0.0024f;
+static constexpr float kDeploymentOrbitMinElevation = 1.0f * XM_PI / 180.0f;
+static constexpr float kDeploymentOrbitMaxElevation = 78.0f * XM_PI / 180.0f;
 // Friction on the flick, as the fraction of speed kept per second. 0.12 leaves
 // a hard flick coasting for roughly two seconds before it falls under the stop
 // threshold -- long enough to read as weight, short enough not to fight a
@@ -1611,9 +1651,11 @@ static void CancelDeploymentPlanning() {
     g_deploymentZoom = 1.0f;
     g_deploymentOrbitDragging = false;
     g_deploymentOrbitOffset = 0.0f;
+    g_deploymentOrbitElevationOffset = 0.0f;
     g_deploymentOrbitResumeDelay = 0.0f;
     g_deploymentOrbitVelocity = 0.0f;
     g_deploymentOrbitPendingDrag = 0.0f;
+    g_deploymentOrbitPendingTilt = 0.0f;
 }
 
 bool DeploymentPlanningActive() { return g_insertionChoicePending; }
@@ -1943,10 +1985,13 @@ static void UpdateDeploymentPlanningCamera(float deltaTime) {
     // the button is still down so the final sliver of a drag is never dropped.
     const float dragged = g_deploymentOrbitPendingDrag;
     g_deploymentOrbitPendingDrag = 0.0f;
+    const float tilted = g_deploymentOrbitPendingTilt;
+    g_deploymentOrbitPendingTilt = 0.0f;
     if (dragged != 0.0f) {
         g_deploymentOrbitOffset =
             std::fmod(g_deploymentOrbitOffset + dragged, XM_2PI);
     }
+    g_deploymentOrbitElevationOffset += tilted;
     if (g_deploymentOrbitDragging) {
         // Turn this frame's travel into a speed for the flick.
         if (step > 1e-5f) {
@@ -1995,13 +2040,26 @@ static void UpdateDeploymentPlanningCamera(float deltaTime) {
     scene.cameraFarOverride = frame.farPlane * (std::max)(1.0f, zoom);
     const float angle =
         g_deploymentFlythroughTime * 0.13f + g_deploymentOrbitOffset;
+    constexpr float lookAtHeight = 4.0f;
+    const float baseHorizontal = frame.orbitRadius * zoom;
+    const float baseVertical = frame.height * zoom - lookAtHeight;
+    const float orbitDistance = std::sqrt(
+        baseHorizontal * baseHorizontal + baseVertical * baseVertical);
+    const float defaultElevation = std::atan2(baseVertical, baseHorizontal);
+    g_deploymentOrbitElevationOffset = std::clamp(
+        g_deploymentOrbitElevationOffset,
+        kDeploymentOrbitMinElevation - defaultElevation,
+        kDeploymentOrbitMaxElevation - defaultElevation);
+    const float elevation =
+        defaultElevation + g_deploymentOrbitElevationOffset;
+    const float horizontalRadius = std::cos(elevation) * orbitDistance;
     scene.camera.Position = {
-        std::sin(angle) * frame.orbitRadius * zoom,
-        frame.height * zoom,
-        std::cos(angle) * frame.orbitRadius * zoom };
+        std::sin(angle) * horizontalRadius,
+        lookAtHeight + std::sin(elevation) * orbitDistance,
+        std::cos(angle) * horizontalRadius };
     const XMFLOAT3 toCenter{
         -scene.camera.Position.x,
-        4.0f - scene.camera.Position.y,
+        lookAtHeight - scene.camera.Position.y,
         -scene.camera.Position.z };
     const float horizontal = std::sqrt(
         toCenter.x * toCenter.x + toCenter.z * toCenter.z);
@@ -3498,6 +3556,9 @@ static void TransformWithBoat(XMFLOAT3& position,
     position.y += BoatDeckY(newPose) - BoatDeckY(oldPose);
 }
 
+static constexpr int kBoatGunnerMount = -1;
+static constexpr int kStressHumveeGunnerMount = -2;
+
 static void CarryBoatOccupants(const BoatPlatformPose& oldPose) {
     const BoatPlatformPose newPose = CurrentBoatPlatformPose();
     const float yawDelta = std::atan2(
@@ -3520,7 +3581,8 @@ static void CarryBoatOccupants(const BoatPlatformPose& oldPose) {
 
     for (const auto& bandit : g_bandits) {
         if (!bandit || bandit->Dead() || bandit.get() == g_heldBandit) continue;
-        if (bandit->turretGunner && bandit->mountedVehicleIndex == 2) {
+        if (bandit->turretGunner &&
+            bandit->mountedVehicleIndex == kBoatGunnerMount) {
             bandit->position = BoatTurretMountWorld();
             continue;
         }
@@ -3577,12 +3639,16 @@ static void UpdateBoat(float dt) {
     CarryBoatOccupants(oldPose);
 }
 
-static XMFLOAT3 HumveeTurretMountWorld() {
+static XMFLOAT3 HumveeTurretMountWorld(size_t vehicleIndex) {
     XMFLOAT4X4 physicsPose;
-    if (!g_destruction.GetVehicleTransform(physicsPose))
-        return { g_humveeTurretLocal.x,
-                 g_humveeTurretLocal.y + 3.45f,
-                 g_humveeTurretLocal.z };
+    if (!g_destruction.GetVehicleTransform(vehicleIndex, physicsPose)) {
+        if (vehicleIndex >= g_levelHumveeSpawns.size()) return {};
+        const Transform& humvee = g_levelHumveeSpawns[vehicleIndex];
+        XMStoreFloat4x4(&physicsPose,
+            XMMatrixRotationY(XMConvertToRadians(humvee.rotation[1])) *
+            XMMatrixTranslation(humvee.position[0], humvee.position[1],
+                                humvee.position[2]));
+    }
     XMFLOAT3 result;
     XMStoreFloat3(&result, XMVector3TransformCoord(
         XMLoadFloat3(&g_humveeTurretLocal), XMLoadFloat4x4(&physicsPose)));
@@ -4066,6 +4132,11 @@ static bool SpawnHumveeTurretGunner(int vehicleIndex) {
     // gunner still spawns and stands in mid-air where the vehicle would be.
     if (g_trainingRangeMode) return false;
     if (!g_banditModel.valid || !g_humveeModel) return false;
+    const bool authoredVehicle = vehicleIndex >= 0 &&
+        static_cast<size_t>(vehicleIndex) < LevelHumveeCount();
+    const bool stressVehicle = vehicleIndex == kStressHumveeGunnerMount &&
+        g_stressTestMode;
+    if (!authoredVehicle && !stressVehicle) return false;
     for (const auto& existing : g_bandits)
         if (existing && !existing->Dead() && existing->turretGunner &&
             existing->mountedVehicleIndex == vehicleIndex)
@@ -4076,8 +4147,8 @@ static bool SpawnHumveeTurretGunner(int vehicleIndex) {
     // spawning together does not throw its opening volley in lockstep.
     bandit->grenadeCooldown = kBanditGrenadeCooldownMin +
         RandomUnit() * (kBanditGrenadeCooldownMax - kBanditGrenadeCooldownMin);
-    bandit->position = vehicleIndex == 0
-        ? HumveeTurretMountWorld()
+    bandit->position = authoredVehicle
+        ? HumveeTurretMountWorld(static_cast<size_t>(vehicleIndex))
         : XMFLOAT3{ g_secondaryHumveePosition.x + g_humveeTurretLocal.x,
                     g_humveeTurretLocal.y + 3.45f,
                     g_secondaryHumveePosition.z + g_humveeTurretLocal.z };
@@ -4091,8 +4162,17 @@ static bool SpawnHumveeTurretGunner(int vehicleIndex) {
     return true;
 }
 
-// Mounted gunner riding the patrol boat. Uses vehicle index 2 so it never
-// collides with the humvee's turret indices (0 primary, 1 secondary).
+static bool SpawnLevelHumveeTurretGunners() {
+    bool allReady = true;
+    for (size_t index = 0; index < LevelHumveeCount(); ++index)
+        allReady = SpawnHumveeTurretGunner(static_cast<int>(index)) && allReady;
+    if (g_stressTestMode)
+        allReady = SpawnHumveeTurretGunner(kStressHumveeGunnerMount) && allReady;
+    return allReady;
+}
+
+// The patrol boat uses a reserved negative mount ID, leaving every non-negative
+// value available for an authored Humvee index.
 static bool SpawnBoatTurretGunner() {
     // No patrol boat on the training range, so no gunner to ride it -- the boat
     // model is hidden there, and without this he is left firing from open water.
@@ -4100,7 +4180,7 @@ static bool SpawnBoatTurretGunner() {
     if (!g_banditModel.valid || !g_boatModel) return false;
     for (const auto& existing : g_bandits)
         if (existing && !existing->Dead() && existing->turretGunner &&
-            existing->mountedVehicleIndex == 2)
+            existing->mountedVehicleIndex == kBoatGunnerMount)
             return true;
     auto bandit = std::make_unique<SkinnedEnemy>();
     if (!bandit->Init(g_banditModel)) return false;
@@ -4108,7 +4188,7 @@ static bool SpawnBoatTurretGunner() {
         RandomUnit() * (kBanditGrenadeCooldownMax - kBanditGrenadeCooldownMin);
     bandit->position = BoatTurretMountWorld();
     bandit->turretGunner = true;
-    bandit->mountedVehicleIndex = 2;
+    bandit->mountedVehicleIndex = kBoatGunnerMount;
     bandit->spawnSlot = -1;
     bandit->leftArmReach = g_banditLeftArmReach;
     bandit->fireCooldown = 1.4f;
@@ -9827,6 +9907,34 @@ static float CurrentPhysicsTerrainExtent() {
     return extent;
 }
 
+static void ApplyHumveeLevelPlan(const RuntimeLevelPlan& plan) {
+    g_levelPlacesHumvee = !plan.humveeSpawns.empty();
+    g_levelHumveeSpawns = plan.humveeSpawns;
+    g_humveeGameplay.assign(g_levelHumveeSpawns.size(), {});
+    g_activeHumveeIndex = kNoHumvee;
+    g_drivingHumvee = false;
+    if (plan.humveeSpawns.empty()) return;
+
+    const Transform& primary = plan.humveeSpawns.front();
+    g_primaryHumveeSpawn = { primary.position[0],
+                             primary.position[1],
+                             primary.position[2] };
+    g_primaryHumveeYaw = primary.rotation[1];
+}
+
+static void InitializeLevelHumveePhysics() {
+    g_destruction.ClearVehicles();
+    if (g_emptyLevelMode || g_trainingRangeMode || !g_levelPlacesHumvee)
+        return;
+    for (size_t index = 0; index < g_levelHumveeSpawns.size(); ++index) {
+        const Transform& humvee = g_levelHumveeSpawns[index];
+        g_destruction.InitializeVehicle(
+            index,
+            { humvee.position[0], humvee.position[1], humvee.position[2] },
+            XMConvertToRadians(humvee.rotation[1]));
+    }
+}
+
 static void ApplyRuntimeLevelBasics(bool movePlayer) {
     if (!g_customLevelMode) return;
     const RuntimeLevelPlan plan =
@@ -9855,13 +9963,9 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
     scene.weaponPickups.clear();
     // Recorded per level load, so a level without a Humvee entity does not
     // inherit the previous level's vehicle (or the struct default at origin).
-    g_levelPlacesHumvee = plan.humveeSpawn.has_value();
-    if (plan.humveeSpawn) {
-        const Transform& humvee = *plan.humveeSpawn;
-        g_primaryHumveeSpawn = { humvee.position[0],
-                                 humvee.position[1],
-                                 humvee.position[2] };
-        g_primaryHumveeYaw = humvee.rotation[1];
+    ApplyHumveeLevelPlan(plan);
+    if (!plan.humveeSpawns.empty()) {
+        const Transform& humvee = plan.humveeSpawns.front();
 
         // An RPG lying beside the Humvee, collected by walking over it. Offset
         // along the vehicle's right flank rather than a world axis, so it sits
@@ -9983,11 +10087,9 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
             g_customLevelMode ? RuntimeTerrainSource::Authored
                               : RuntimeTerrainSource::Empty);
     }
-    // Derived from the level that was just installed, so it is correct on every
-    // path: custom levels, the built-in Level 1 template, stress and empty
-    // modes alike. ApplyRuntimeLevelBasics sets it too, but early-returns for
-    // non-custom levels, so relying on that alone would hide Level 1's Humvee.
-    g_levelPlacesHumvee = FirstRuntimeEntity(LevelEntityType::Humvee) != nullptr;
+    // ApplyRuntimeLevelBasics early-returns for non-custom levels, so refresh
+    // vehicle placement here as well to clear parked instances between maps.
+    ApplyHumveeLevelPlan(LevelRuntimeBuilder::Build(g_game.world.Level()));
     g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
     // Built-in levels carry no sidecar, so this clears any map left over from a
     // painted custom level rather than letting it bleed across a level change.
@@ -10702,8 +10804,9 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     const bool selectClick = ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                              !ImGui::GetIO().WantCaptureMouse;
 
-    // Right-drag turns the map by hand. Read here rather than in WndProc: the
-    // ImGui backend takes Win32 capture on any button press and this screen
+    // Right-drag turns and tilts the map by hand. Read here rather than in
+    // WndProc: the ImGui backend takes Win32 capture on any button press and
+    // this screen
     // releases it every frame for its own panels, so a raw-capture drag was
     // cancelled the moment it started (see g_deploymentOrbitDragging).
     //
@@ -10720,14 +10823,20 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             // globe does.
             g_deploymentOrbitVelocity = 0.0f;
             g_deploymentOrbitPendingDrag = 0.0f;
+            g_deploymentOrbitPendingTilt = 0.0f;
         }
         if (!ImGui::IsMouseDown(ImGuiMouseButton_Right))
             g_deploymentOrbitDragging = false;
-        if (g_deploymentOrbitDragging) {
+        if (g_deploymentOrbitDragging &&
+            ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
             // MouseDelta is already a per-frame value, which is exactly what
             // the flick needs -- no per-message accumulation to reconcile.
             g_deploymentOrbitPendingDrag +=
                 io.MouseDelta.x * kDeploymentOrbitRadiansPerPixel;
+            // Dragging down lowers the camera toward the horizon. Elevation has
+            // no flick momentum so releasing always leaves the chosen framing.
+            g_deploymentOrbitPendingTilt -=
+                io.MouseDelta.y * kDeploymentOrbitElevationRadiansPerPixel;
         }
     }
     for (size_t index = 0; index < g_deploymentZones.size(); ++index) {
@@ -13152,23 +13261,7 @@ static void SynchronizeEditorRuntime(bool play) {
         g_destruction.SetTerrainSampler([tp](float x, float z) {
             return TerrainRendererDX12::HeightAt(tp, x, z);
         }, CurrentPhysicsTerrainExtent());
-        // Read the placement back off the entity rather than trusting the
-        // globals: g_primaryHumveeSpawn is written only by the level *load*
-        // path, so a Humvee placed or moved in the editor since that load is
-        // not reflected there. Without this, a freshly placed vehicle either
-        // spawned at the previous level's coordinates or, on a level that had
-        // never carried one, at the {0, 3.45, 0} struct default -- which reads
-        // as "it did not spawn at all".
-        if (const LevelEntity* humvee =
-                FirstRuntimeEntity(LevelEntityType::Humvee)) {
-            g_primaryHumveeSpawn = { humvee->transform.position[0],
-                                     humvee->transform.position[1],
-                                     humvee->transform.position[2] };
-            g_primaryHumveeYaw = humvee->transform.rotation[1];
-            g_levelPlacesHumvee = true;
-            g_destruction.InitializeVehicle(g_primaryHumveeSpawn,
-                XMConvertToRadians(g_primaryHumveeYaw));
-        }
+        InitializeLevelHumveePhysics();
     }
     g_levelEditor.MarkRuntimeSynchronized();
     g_levelEditor.MarkFoliageRuntimeSynchronized();
@@ -13665,12 +13758,24 @@ VirtualInput virtualInput;
 static void ToggleHumveeDriving() {
     XMFLOAT4X4 pose;
     XMFLOAT3 position, forward;
-    if (!g_destruction.GetVehicleTransform(pose, &position, &forward)) return;
 
     if (!g_drivingHumvee) {
-        const XMVECTOR offset = XMLoadFloat3(&scene.camera.Position) -
-                               XMLoadFloat3(&position);
-        if (XMVectorGetX(XMVector3LengthSq(offset)) > 25.0f) return;
+        float nearestDistanceSq = 25.0f;
+        size_t nearestIndex = kNoHumvee;
+        for (size_t index = 0; index < g_destruction.VehicleCount(); ++index) {
+            XMFLOAT3 candidatePosition;
+            if (!g_destruction.GetVehicleTransform(
+                    index, pose, &candidatePosition, &forward)) continue;
+            const XMVECTOR offset = XMLoadFloat3(&scene.camera.Position) -
+                                    XMLoadFloat3(&candidatePosition);
+            const float distanceSq = XMVectorGetX(XMVector3LengthSq(offset));
+            if (distanceSq > nearestDistanceSq) continue;
+            nearestDistanceSq = distanceSq;
+            nearestIndex = index;
+            position = candidatePosition;
+        }
+        if (nearestIndex == kNoHumvee) return;
+        g_activeHumveeIndex = nearestIndex;
         g_drivingHumvee = true;
         g_savedGunVisible = scene.gun.visible;
         scene.gun.visible = false;
@@ -13679,7 +13784,11 @@ static void ToggleHumveeDriving() {
         return;
     }
 
+    if (!g_destruction.GetVehicleTransform(
+            g_activeHumveeIndex, pose, &position, &forward)) return;
+
     g_drivingHumvee = false;
+    g_destruction.SetVehicleInput(g_activeHumveeIndex, 0.0f, 0.0f, true);
     scene.gun.visible = g_savedGunVisible;
     scene.camera.FPSMode = true;
     const XMVECTOR forwardVector = XMLoadFloat3(&forward);
@@ -13688,6 +13797,7 @@ static void ToggleHumveeDriving() {
     XMVECTOR exitPosition = XMLoadFloat3(&position) + right * 2.3f;
     exitPosition = XMVectorSetY(exitPosition, XMVectorGetY(exitPosition) + 1.3f);
     XMStoreFloat3(&scene.camera.Position, exitPosition);
+    g_activeHumveeIndex = kNoHumvee;
 }
 
 // Advances the idle hover/spin on every live pickup. Collection itself is on E
@@ -13952,10 +14062,11 @@ static void DrawWeaponPickupPrompt(CXMMATRIX view, CXMMATRIX projection) {
 }
 
 static void UpdateHumveeChaseCamera(float dt) {
-    if (!g_drivingHumvee) return;
+    if (!g_drivingHumvee || g_activeHumveeIndex == kNoHumvee) return;
     XMFLOAT4X4 pose;
     XMFLOAT3 position, forward;
-    if (!g_destruction.GetVehicleTransform(pose, &position, &forward)) return;
+    if (!g_destruction.GetVehicleTransform(
+            g_activeHumveeIndex, pose, &position, &forward)) return;
 
     const XMVECTOR target = XMLoadFloat3(&position) +
         XMVectorSet(0.0f, 1.65f, 0.0f, 0.0f);
@@ -13998,170 +14109,190 @@ static XMFLOAT3 HumveeScreenCenterAimPoint() {
     return closest;
 }
 
-static void UpdateHumveeTurretAim(float dt) {
-    if (!g_humveeModel || !g_humveeTurretNode) return;
-    g_humveeAimPoint = g_drivingHumvee
-        ? HumveeScreenCenterAimPoint()
-        : scene.camera.Position;
-    const XMMATRIX modelWorld = HumveeWorldMatrix();
+static void UpdateHumveeTurretAimAt(size_t vehicleIndex,
+                                    const XMFLOAT3& aimPoint, float dt) {
+    if (vehicleIndex >= g_humveeGameplay.size() || !g_humveeModel ||
+        !g_humveeTurretNode) return;
+    HumveeGameplayState& state = g_humveeGameplay[vehicleIndex];
+    state.aimPoint = aimPoint;
+    const XMMATRIX modelWorld = HumveeWorldMatrix(vehicleIndex);
     const XMMATRIX inverseModel = XMMatrixInverse(nullptr, modelWorld);
     XMFLOAT3 localTarget;
     XMStoreFloat3(&localTarget, XMVector3TransformCoord(
-        XMLoadFloat3(&g_humveeAimPoint), inverseModel));
+        XMLoadFloat3(&state.aimPoint), inverseModel));
     const float dx = localTarget.x - g_humveeTurretNode->translation.x;
     const float dz = localTarget.z - g_humveeTurretNode->translation.z;
     if (dx * dx + dz * dz < 0.001f) return;
     const float desiredYaw = std::atan2(dx, dz);
     const float yawDelta = std::atan2(
-        std::sin(desiredYaw - g_humveeTurretYaw),
-        std::cos(desiredYaw - g_humveeTurretYaw));
+        std::sin(desiredYaw - state.turretYaw),
+        std::cos(desiredYaw - state.turretYaw));
     const float maxTraverse = 1.35f * (std::max)(0.0f, dt);
-    g_humveeTurretYaw += (std::max)(-maxTraverse,
+    state.turretYaw += (std::max)(-maxTraverse,
         (std::min)(maxTraverse, yawDelta));
-    XMStoreFloat4(&g_humveeTurretNode->rotation,
-        XMQuaternionRotationAxis(XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f),
-                                 g_humveeTurretYaw));
-    XMFLOAT4X4 identity;
-    XMStoreFloat4x4(&identity, XMMatrixIdentity());
-    g_humveeModel->UpdateGlobalTransform(identity);
+    PrepareHumveeModelForRender(vehicleIndex);
+}
+
+static void UpdateHumveeTurretAim(float dt) {
+    if (!g_drivingHumvee || g_activeHumveeIndex == kNoHumvee) return;
+    UpdateHumveeTurretAimAt(
+        g_activeHumveeIndex, HumveeScreenCenterAimPoint(), dt);
 }
 
 static void FireHumveeTurret() {
-    if (!g_drivingHumvee || !g_humveeTurretNode ||
-        g_humveeTurretFireCooldown > 0.0f) return;
-    g_humveeAimPoint = HumveeScreenCenterAimPoint();
+    if (!g_drivingHumvee || g_activeHumveeIndex >= g_humveeGameplay.size() ||
+        !g_humveeTurretNode) return;
+    HumveeGameplayState& state = g_humveeGameplay[g_activeHumveeIndex];
+    if (state.turretFireCooldown > 0.0f) return;
+    state.aimPoint = HumveeScreenCenterAimPoint();
+    PrepareHumveeModelForRender(g_activeHumveeIndex);
     const XMMATRIX turretWorld =
         XMLoadFloat4x4(&g_humveeTurretNode->globalTransform) *
-        HumveeWorldMatrix();
+        HumveeWorldMatrix(g_activeHumveeIndex);
     XMFLOAT3 muzzle;
     XMStoreFloat3(&muzzle, XMVector3TransformCoord(
         XMVectorSet(0.0f, 72.0f, 338.0f, 1.0f), turretWorld));
-    XMVECTOR direction = XMLoadFloat3(&g_humveeAimPoint) - XMLoadFloat3(&muzzle);
+    XMVECTOR direction = XMLoadFloat3(&state.aimPoint) - XMLoadFloat3(&muzzle);
     if (XMVectorGetX(XMVector3LengthSq(direction)) < 0.01f) return;
     XMFLOAT3 shotDirection;
     XMStoreFloat3(&shotDirection, XMVector3Normalize(direction));
     scene.SpawnPlayerProjectile(muzzle, shotDirection, 1.35f);
     scene.SpawnWeaponSmoke(muzzle, shotDirection, 1.15f);
     g_gunAudio.Play(0.72f, 0.90f + ((float)std::rand() / RAND_MAX) * 0.06f);
-    g_humveeTurretFireCooldown = 0.12f;
+    state.turretFireCooldown = 0.12f;
 }
 
 static void UpdateHumveeImpacts(float dt) {
-    XMFLOAT4X4 pose;
-    XMFLOAT3 position, forward, velocity;
-    if (!g_destruction.GetVehicleTransform(
-            pose, &position, &forward, &velocity)) return;
+    for (size_t vehicleIndex = 0;
+         vehicleIndex < g_humveeGameplay.size(); ++vehicleIndex) {
+        XMFLOAT4X4 pose;
+        XMFLOAT3 position, forward, velocity;
+        if (!g_destruction.GetVehicleTransform(
+                vehicleIndex, pose, &position, &forward, &velocity)) continue;
+        HumveeGameplayState& state = g_humveeGameplay[vehicleIndex];
 
-    g_humveeHouseImpactCooldown =
-        (std::max)(0.0f, g_humveeHouseImpactCooldown - dt);
-    const float speed = std::sqrt(
-        velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z);
-    if (!g_previousHumveePositionValid) {
-        g_previousHumveePosition = position;
-        g_previousHumveePositionValid = true;
-        return;
-    }
-    const float travelX = position.x - g_previousHumveePosition.x;
-    const float travelY = position.y - g_previousHumveePosition.y;
-    const float travelZ = position.z - g_previousHumveePosition.z;
-    if (travelX * travelX + travelY * travelY + travelZ * travelZ > 100.0f) {
-        g_previousHumveePosition = position;
-        return;
-    }
+        state.houseImpactCooldown =
+            (std::max)(0.0f, state.houseImpactCooldown - dt);
+        const float speed = std::sqrt(
+            velocity.x * velocity.x + velocity.y * velocity.y +
+            velocity.z * velocity.z);
+        if (!state.previousPositionValid) {
+            state.previousPosition = position;
+            state.previousPositionValid = true;
+            continue;
+        }
+        const float travelX = position.x - state.previousPosition.x;
+        const float travelY = position.y - state.previousPosition.y;
+        const float travelZ = position.z - state.previousPosition.z;
+        if (travelX * travelX + travelY * travelY + travelZ * travelZ >
+            100.0f) {
+            state.previousPosition = position;
+            continue;
+        }
 
-    if (speed >= 3.5f && g_banditLoaded) {
-        XMFLOAT3 worldMin(FLT_MAX, FLT_MAX, FLT_MAX);
-        XMFLOAT3 worldMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
-        const XMMATRIX world = XMLoadFloat4x4(&pose);
-        for (float x : { -2.25f, 2.25f })
-        for (float y : { -0.7f, 0.7f })
-        for (float z : { -1.05f, 1.05f }) {
-            XMFLOAT3 corner;
-            XMStoreFloat3(&corner, XMVector3TransformCoord(
-                XMVectorSet(x, y, z, 1.0f), world));
-            worldMin.x = (std::min)(worldMin.x, corner.x);
-            worldMin.y = (std::min)(worldMin.y, corner.y);
-            worldMin.z = (std::min)(worldMin.z, corner.z);
-            worldMax.x = (std::max)(worldMax.x, corner.x);
-            worldMax.y = (std::max)(worldMax.y, corner.y);
-            worldMax.z = (std::max)(worldMax.z, corner.z);
+        if (speed >= 3.5f && g_banditLoaded) {
+            XMFLOAT3 worldMin(FLT_MAX, FLT_MAX, FLT_MAX);
+            XMFLOAT3 worldMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            const XMMATRIX world = XMLoadFloat4x4(&pose);
+            for (float x : { -2.25f, 2.25f })
+            for (float y : { -0.7f, 0.7f })
+            for (float z : { -1.05f, 1.05f }) {
+                XMFLOAT3 corner;
+                XMStoreFloat3(&corner, XMVector3TransformCoord(
+                    XMVectorSet(x, y, z, 1.0f), world));
+                worldMin.x = (std::min)(worldMin.x, corner.x);
+                worldMin.y = (std::min)(worldMin.y, corner.y);
+                worldMin.z = (std::min)(worldMin.z, corner.z);
+                worldMax.x = (std::max)(worldMax.x, corner.x);
+                worldMax.y = (std::max)(worldMax.y, corner.y);
+                worldMax.z = (std::max)(worldMax.z, corner.z);
+            }
+            const DestructionDebrisHazard vehicleImpact = {
+                worldMin, worldMax, position, velocity, 1200.0f,
+                speed >= 7.0f };
+            for (auto& bandit : g_bandits) {
+                if (!bandit || bandit->Dead() || bandit->turretGunner) continue;
+                XMFLOAT3 impact;
+                if (!bandit->ApplyDebrisImpact(vehicleImpact, &impact)) continue;
+                XMFLOAT3 normal;
+                XMStoreFloat3(&normal,
+                    XMVector3Normalize(-XMLoadFloat3(&velocity)));
+                scene.SpawnBloodBurst(impact, normal);
+                g_hitAudio.Play(0.34f,
+                    0.88f + ((float)std::rand() / RAND_MAX) * 0.18f);
+            }
         }
-        const DestructionDebrisHazard vehicleImpact = {
-            worldMin, worldMax, position, velocity, 1200.0f, speed >= 7.0f };
-        for (auto& bandit : g_bandits) {
-            if (!bandit || bandit->Dead() || bandit->turretGunner) continue;
-            XMFLOAT3 impact;
-            if (!bandit->ApplyDebrisImpact(vehicleImpact, &impact)) continue;
-            XMFLOAT3 normal;
-            XMStoreFloat3(&normal, XMVector3Normalize(-XMLoadFloat3(&velocity)));
-            scene.SpawnBloodBurst(impact, normal);
-            g_hitAudio.Play(0.34f, 0.88f + ((float)std::rand() / RAND_MAX) * 0.18f);
-        }
-    }
 
-    if (speed >= 4.5f && g_humveeHouseImpactCooldown <= 0.0f) {
-        XMFLOAT3 impactDirection = { velocity.x, 0.0f, velocity.z };
-        XMVECTOR impactVector = XMLoadFloat3(&impactDirection);
-        if (XMVectorGetX(XMVector3LengthSq(impactVector)) < 0.01f)
-            impactVector = XMLoadFloat3(&forward);
-        XMStoreFloat3(&impactDirection, XMVector3Normalize(impactVector));
-        const XMFLOAT3 start = {
-            g_previousHumveePosition.x + impactDirection.x * 2.1f,
-            g_previousHumveePosition.y,
-            g_previousHumveePosition.z + impactDirection.z * 2.1f };
-        const XMFLOAT3 end = {
-            position.x + impactDirection.x * 2.65f,
-            position.y,
-            position.z + impactDirection.z * 2.65f };
-        XMFLOAT3 hit;
-        if (g_destruction.HitTestSegment(start, end, 0.75f, hit)) {
-            const float impactStrength = (std::min)(320.0f, 80.0f + speed * 24.0f);
-            g_destruction.ApplyExplosion(
-                hit, (std::min)(3.2f, 1.4f + speed * 0.16f),
-                impactStrength, impactStrength);
-            scene.SpawnSmokeBurst(hit, 0.65f, 0.7f);
-            g_humveeHouseImpactCooldown = 0.4f;
+        if (speed >= 4.5f && state.houseImpactCooldown <= 0.0f) {
+            XMFLOAT3 impactDirection = { velocity.x, 0.0f, velocity.z };
+            XMVECTOR impactVector = XMLoadFloat3(&impactDirection);
+            if (XMVectorGetX(XMVector3LengthSq(impactVector)) < 0.01f)
+                impactVector = XMLoadFloat3(&forward);
+            XMStoreFloat3(&impactDirection, XMVector3Normalize(impactVector));
+            const XMFLOAT3 start = {
+                state.previousPosition.x + impactDirection.x * 2.1f,
+                state.previousPosition.y,
+                state.previousPosition.z + impactDirection.z * 2.1f };
+            const XMFLOAT3 end = {
+                position.x + impactDirection.x * 2.65f,
+                position.y,
+                position.z + impactDirection.z * 2.65f };
+            XMFLOAT3 hit;
+            if (g_destruction.HitTestSegment(start, end, 0.75f, hit)) {
+                const float impactStrength =
+                    (std::min)(320.0f, 80.0f + speed * 24.0f);
+                g_destruction.ApplyExplosion(
+                    hit, (std::min)(3.2f, 1.4f + speed * 0.16f),
+                    impactStrength, impactStrength);
+                scene.SpawnSmokeBurst(hit, 0.65f, 0.7f);
+                state.houseImpactCooldown = 0.4f;
+            }
         }
+        state.previousPosition = position;
     }
-    g_previousHumveePosition = position;
 }
 
 static bool ResolveBanditHumveeCollision(SkinnedEnemy& bandit) {
     if (bandit.Dead() || bandit.Held() || bandit.turretGunner) return false;
-    XMFLOAT4X4 pose;
-    if (!g_destruction.GetVehicleTransform(pose)) return false;
+    for (size_t vehicleIndex = 0;
+         vehicleIndex < g_destruction.VehicleCount(); ++vehicleIndex) {
+        XMFLOAT4X4 pose;
+        if (!g_destruction.GetVehicleTransform(vehicleIndex, pose)) continue;
 
-    const XMMATRIX vehicleWorld = XMLoadFloat4x4(&pose);
-    const XMMATRIX vehicleLocal = XMMatrixInverse(nullptr, vehicleWorld);
-    const XMVECTOR bodyCenter = XMVectorSet(
-        bandit.position.x,
-        bandit.position.y + bandit.footOffset + 1.0f,
-        bandit.position.z, 1.0f);
-    XMFLOAT3 local;
-    XMStoreFloat3(&local, XMVector3TransformCoord(bodyCenter, vehicleLocal));
+        const XMMATRIX vehicleWorld = XMLoadFloat4x4(&pose);
+        const XMMATRIX vehicleLocal = XMMatrixInverse(nullptr, vehicleWorld);
+        const XMVECTOR bodyCenter = XMVectorSet(
+            bandit.position.x,
+            bandit.position.y + bandit.footOffset + 1.0f,
+            bandit.position.z, 1.0f);
+        XMFLOAT3 local;
+        XMStoreFloat3(&local,
+            XMVector3TransformCoord(bodyCenter, vehicleLocal));
 
-    constexpr float enemyRadius = 0.58f;
-    constexpr float halfX = 2.25f + enemyRadius;
-    constexpr float halfZ = 1.05f + enemyRadius;
-    if (local.y < -0.85f || local.y > 1.15f ||
-        std::abs(local.x) >= halfX || std::abs(local.z) >= halfZ)
-        return false;
+        constexpr float enemyRadius = 0.58f;
+        constexpr float halfX = 2.25f + enemyRadius;
+        constexpr float halfZ = 1.05f + enemyRadius;
+        if (local.y < -0.85f || local.y > 1.15f ||
+            std::abs(local.x) >= halfX || std::abs(local.z) >= halfZ)
+            continue;
 
-    const float penetrationX = halfX - std::abs(local.x);
-    const float penetrationZ = halfZ - std::abs(local.z);
-    if (penetrationX < penetrationZ)
-        local.x = std::copysign(halfX + 0.02f,
-            std::abs(local.x) > 0.001f ? local.x : 1.0f);
-    else
-        local.z = std::copysign(halfZ + 0.02f,
-            std::abs(local.z) > 0.001f ? local.z : 1.0f);
+        const float penetrationX = halfX - std::abs(local.x);
+        const float penetrationZ = halfZ - std::abs(local.z);
+        if (penetrationX < penetrationZ)
+            local.x = std::copysign(halfX + 0.02f,
+                std::abs(local.x) > 0.001f ? local.x : 1.0f);
+        else
+            local.z = std::copysign(halfZ + 0.02f,
+                std::abs(local.z) > 0.001f ? local.z : 1.0f);
 
-    XMFLOAT3 corrected;
-    XMStoreFloat3(&corrected, XMVector3TransformCoord(
-        XMLoadFloat3(&local), vehicleWorld));
-    bandit.position.x += corrected.x - XMVectorGetX(bodyCenter);
-    bandit.position.z += corrected.z - XMVectorGetZ(bodyCenter);
-    return true;
+        XMFLOAT3 corrected;
+        XMStoreFloat3(&corrected, XMVector3TransformCoord(
+            XMLoadFloat3(&local), vehicleWorld));
+        bandit.position.x += corrected.x - XMVectorGetX(bodyCenter);
+        bandit.position.z += corrected.z - XMVectorGetZ(bodyCenter);
+        return true;
+    }
+    return false;
 }
 
 static void ApplyVirtualInput() {
@@ -14253,8 +14384,14 @@ static void ProcessInput(HWND) {
     }
 
     if (g_drivingHumvee) {
-        g_humveeTurretFireCooldown = (std::max)(
-            0.0f, g_humveeTurretFireCooldown - deltaTime);
+        if (g_activeHumveeIndex >= g_humveeGameplay.size()) {
+            g_drivingHumvee = false;
+            g_activeHumveeIndex = kNoHumvee;
+            return;
+        }
+        HumveeGameplayState& state = g_humveeGameplay[g_activeHumveeIndex];
+        state.turretFireCooldown = (std::max)(
+            0.0f, state.turretFireCooldown - deltaTime);
         const float throttle =
             ((GetAsyncKeyState('W') & 0x8000) ? 1.0f : 0.0f) -
             ((GetAsyncKeyState('S') & 0x8000) ? 1.0f : 0.0f);
@@ -14265,7 +14402,7 @@ static void ProcessInput(HWND) {
         XMFLOAT4X4 vehiclePose;
         XMFLOAT3 vehicleForward;
         if (g_destruction.GetVehicleTransform(
-                vehiclePose, nullptr, &vehicleForward)) {
+                g_activeHumveeIndex, vehiclePose, nullptr, &vehicleForward)) {
             XMVECTOR desiredVector = XMVectorSet(
                 scene.camera.Front.x, 0.0f, scene.camera.Front.z, 0.0f);
             XMVECTOR vehicleVector = XMVectorSet(
@@ -14284,13 +14421,18 @@ static void ProcessInput(HWND) {
         }
         steering = (std::max)(-1.0f, (std::min)(1.0f, steering));
         g_destruction.SetVehicleInput(
-            throttle, steering, (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0);
+            g_activeHumveeIndex, throttle, steering,
+            (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0);
+        for (size_t index = 0; index < g_destruction.VehicleCount(); ++index)
+            if (index != g_activeHumveeIndex)
+                g_destruction.SetVehicleInput(index, 0.0f, 0.0f, true);
         if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) &&
             !ImGui::GetIO().WantCaptureMouse)
             FireHumveeTurret();
         return;
     }
-    g_destruction.SetVehicleInput(0.0f, 0.0f, true);
+    for (size_t index = 0; index < g_destruction.VehicleCount(); ++index)
+        g_destruction.SetVehicleInput(index, 0.0f, 0.0f, true);
     // Riding the insertion helicopter in: the seat owns the camera position, so
     // walking, crouching, sliding and jumping stay disabled until the drop-off.
     // Looking and the weapon block below keep running, so the player can fire
@@ -14501,9 +14643,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_RBUTTONDOWN:
-        // The deployment overview's own right-drag is handled in
-        // RenderInsertionChoiceScreen, from ImGui rather than from Win32
-        // capture; see g_deploymentOrbitDragging.
+        // Deployment right-drag is read from ImGui in
+        // RenderInsertionChoiceScreen; Win32 capture remains editor-only.
         if (IsEditorEditing() && !ImGui::GetIO().WantCaptureMouse) {
             cameraLocked = false;
             SetCapture(hwnd);
@@ -15675,7 +15816,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             if (scene.useDestruction && g_destruction.IsInitialized()) {
                 g_destruction.ResolvePlayerCollision(scene.camera.Position,
                     scene.camera.FloorY, 0.35f, scene.camera.PlayerHeight,
-                    !g_drivingHumvee);
+                    g_drivingHumvee ? g_activeHumveeIndex : kNoHumvee);
             }
             ResolvePlayerWorldObjectCollisions(
                 scene.camera.Position, scene.camera.FloorY,
@@ -16008,10 +16149,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // primaryHumveeSpawn keeps its {0, 3.45, 0} default in that
                 // case, so without this check every such level got an
                 // unrequested Humvee sitting at the world origin.
-                if (!g_trainingRangeMode && g_levelPlacesHumvee)
-                    g_destruction.InitializeVehicle(g_customLevelMode
-                        ? g_primaryHumveeSpawn : XMFLOAT3{ 0.0f, 3.45f, 0.0f },
-                        g_customLevelMode ? XMConvertToRadians(g_primaryHumveeYaw) : 0.0f);
+                InitializeLevelHumveePhysics();
             }
         }
         // Dead Bandits stay attached to their ragdolls. No mid-level respawns.
@@ -16019,11 +16157,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             !g_insertionChoicePending) {
             ProfilerDX12::CpuScope banditProfile(g_profiler, "Bandit Update");
             if (g_game.commands.Pending(GameCommand::RespawnTurretGunner)) {
-                const bool firstReady = SpawnHumveeTurretGunner(0);
-                const bool secondReady = !g_stressTestMode ||
-                    SpawnHumveeTurretGunner(1);
                 g_game.commands.Set(GameCommand::RespawnTurretGunner,
-                    !(firstReady && secondReady));
+                    !SpawnLevelHumveeTurretGunners());
             }
             if (g_game.commands.Pending(GameCommand::RespawnBoatGunner)) {
                 g_game.commands.Set(GameCommand::RespawnBoatGunner,
@@ -16183,18 +16318,35 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     coverQuerySpent = true;
                 }
                 if (updateBandit && bandit->turretGunner) {
-                    const XMFLOAT3 mount = bandit->mountedVehicleIndex == 0
-                        ? HumveeTurretMountWorld()
-                        : bandit->mountedVehicleIndex == 2
-                        ? BoatTurretMountWorld()
-                        : XMFLOAT3{
+                    XMFLOAT3 mount{};
+                    if (bandit->mountedVehicleIndex == kBoatGunnerMount) {
+                        mount = BoatTurretMountWorld();
+                    } else if (bandit->mountedVehicleIndex ==
+                               kStressHumveeGunnerMount) {
+                        mount = {
                             g_secondaryHumveePosition.x + g_humveeTurretLocal.x,
                             g_humveeTurretLocal.y + 3.45f,
                             g_secondaryHumveePosition.z + g_humveeTurretLocal.z };
+                    } else {
+                        mount = HumveeTurretMountWorld(
+                            static_cast<size_t>(bandit->mountedVehicleIndex));
+                    }
+                    const bool playerControlsTurret = g_drivingHumvee &&
+                        bandit->mountedVehicleIndex >= 0 &&
+                        g_activeHumveeIndex == static_cast<size_t>(
+                            bandit->mountedVehicleIndex);
+                    if (!playerControlsTurret &&
+                        bandit->mountedVehicleIndex >= 0) {
+                        UpdateHumveeTurretAimAt(
+                            static_cast<size_t>(bandit->mountedVehicleIndex),
+                            target, banditDeltaTime);
+                    }
                     bandit->UpdateMounted(
                         banditDeltaTime, mount,
-                        (g_drivingHumvee && bandit->mountedVehicleIndex == 0)
-                            ? g_humveeAimPoint : target);
+                        playerControlsTurret &&
+                        g_activeHumveeIndex < g_humveeGameplay.size()
+                            ? g_humveeGameplay[g_activeHumveeIndex].aimPoint
+                            : target);
                 } else if (updateBandit && bandit->Rappelling()) {
                     // On the dropship rope: descend toward the terrain under the
                     // actor and skip the ground AI entirely until it lands.
@@ -16289,8 +16441,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     target.z == scene.camera.Position.z;
                 const XMFLOAT3 leadVelocity =
                     targetIsPlayer ? g_playerVelocity : XMFLOAT3{ 0.0f, 0.0f, 0.0f };
-                const bool fired = !(g_drivingHumvee && bandit->turretGunner &&
-                                     bandit->mountedVehicleIndex == 0) &&
+                const bool playerControlsMountedTurret = g_drivingHumvee &&
+                    bandit->turretGunner &&
+                    bandit->mountedVehicleIndex >= 0 &&
+                    g_activeHumveeIndex == static_cast<size_t>(
+                        bandit->mountedVehicleIndex);
+                const bool fired = !playerControlsMountedTurret &&
                     bandit->TryFireAt(
                         deltaTime, target, hasLineOfSight,
                         shotOrigin, shotDirection,
@@ -18180,10 +18336,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // primaryHumveeSpawn keeps its {0, 3.45, 0} default in that
                 // case, so without this check every such level got an
                 // unrequested Humvee sitting at the world origin.
-                if (!g_trainingRangeMode && g_levelPlacesHumvee)
-                    g_destruction.InitializeVehicle(g_customLevelMode
-                        ? g_primaryHumveeSpawn : XMFLOAT3{ 0.0f, 3.45f, 0.0f },
-                        g_customLevelMode ? XMConvertToRadians(g_primaryHumveeYaw) : 0.0f);
+                InitializeLevelHumveePhysics();
 
                 // Palm grove ringing the pool. Shoot through a trunk and the tree
                 // snaps at that height and topples away from you.
@@ -18496,14 +18649,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             AdvanceLevelLoading(LevelLoadStage::BanditSpawn,
                 "Spawn squad and turret gunners",
                 g_stressTestMode ? "stress squad: enemies + 2 gunners"
-                                 : "level squad: enemies + gunner",
+                                 : "level squad: enemies + Humvee gunners",
                 g_banditModel.valid);
         } else if (g_game.loading.Stage() == LevelLoadStage::BanditSpawn) {
             if (g_banditModel.valid) {
                 for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
                     if (!SpawnBandit()) break;
-                SpawnHumveeTurretGunner(0);
-                if (g_stressTestMode) SpawnHumveeTurretGunner(1);
+                SpawnLevelHumveeTurretGunners();
                 SpawnBoatTurretGunner();
                 // Before the player deploys: the squad exists and the navmesh
                 // is built, so this is the last point at which the opening

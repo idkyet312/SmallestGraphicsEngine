@@ -414,13 +414,14 @@ void LevelEditor::AddEntity(LevelEntityType type) {
     if (type == LevelEntityType::GrassPatch) {
         entity.transform.scale[0] = entity.transform.scale[2] = 2.5f;
     }
-    if (type == LevelEntityType::PlayerSpawn || type == LevelEntityType::Humvee ||
+    if (type == LevelEntityType::PlayerSpawn ||
         type == LevelEntityType::Helicopter) {
         for (auto& existing : level_.entities)
             if (existing.type == type) existing.enabled = false;
         if (type == LevelEntityType::PlayerSpawn) entity.transform.position[1] = 5.0f;
-        else if (type == LevelEntityType::Humvee) entity.transform.position[1] = 3.45f;
         else entity.transform.position[1] = 14.0f;
+    } else if (type == LevelEntityType::Humvee) {
+        entity.transform.position[1] = 3.45f;
     }
     level_.entities.push_back(entity);
     selectedId_ = entity.id;
@@ -451,7 +452,6 @@ void LevelEditor::AddPrefab(const PrefabAsset& prefab, const Camera& camera,
 void LevelEditor::DuplicateSelected() {
     LevelEntity* source = Selected();
     if (!source || source->type == LevelEntityType::PlayerSpawn ||
-        source->type == LevelEntityType::Humvee ||
         source->type == LevelEntityType::Helicopter) return;
     const LevelDefinition before = level_;
     LevelEntity copy = *source;
@@ -2047,7 +2047,6 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::Separator();
     const bool cannotDuplicate = !Selected() ||
         Selected()->type == LevelEntityType::PlayerSpawn ||
-        Selected()->type == LevelEntityType::Humvee ||
         Selected()->type == LevelEntityType::Helicopter;
     ImGui::BeginDisabled(cannotDuplicate);
     if (ImGui::Button("Duplicate")) DuplicateSelected();

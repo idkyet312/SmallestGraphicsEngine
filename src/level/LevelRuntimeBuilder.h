@@ -17,7 +17,7 @@ struct RuntimeLevelPlan {
     int32_t terrainOriginTileZ = 0;
     LevelDXRDDGISettings dxrDDGI;
     std::optional<Transform> playerSpawn;
-    std::optional<Transform> humveeSpawn;
+    std::vector<Transform> humveeSpawns;
     std::optional<Transform> helicopterSpawn;
     std::vector<Transform> explosiveBarrels;
 };
@@ -43,7 +43,7 @@ public:
                 if (!plan.playerSpawn) plan.playerSpawn = entity.transform;
                 break;
             case LevelEntityType::Humvee:
-                if (!plan.humveeSpawn) plan.humveeSpawn = entity.transform;
+                plan.humveeSpawns.push_back(entity.transform);
                 break;
             case LevelEntityType::Helicopter:
                 if (!plan.helicopterSpawn)

@@ -573,26 +573,19 @@ if(USE_DX12 AND DXC_EXECUTABLE)
 endif()
 
 # Content (Unreal-style asset root: Models, Audio, Textures, Levels, Prefabs)
-# totals roughly 1.5 GiB. A POST_BUILD copy made every code-only link spend over
-# a minute copying it, twice, to the same build directory. This stamped target
-# syncs only when an asset is added or modified.
-#
-# CONFIGURE_DEPENDS re-globs at build time, so newly added assets are picked up
-# without a manual re-run of cmake -- but only for files under Content/. Assets
-# dropped anywhere else still need a reconfigure to be seen.
-file(GLOB_RECURSE RUNTIME_CONTENT_FILES CONFIGURE_DEPENDS LIST_DIRECTORIES false
-    "${CMAKE_SOURCE_DIR}/Content/*")
-set(CONTENT_SYNC_STAMP "${CMAKE_BINARY_DIR}/.content-synced")
-add_custom_command(
-    OUTPUT "${CONTENT_SYNC_STAMP}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/Content"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
-            "${CMAKE_SOURCE_DIR}/Content" "${CMAKE_BINARY_DIR}/Content"
-    COMMAND ${CMAKE_COMMAND} -E touch "${CONTENT_SYNC_STAMP}"
-    DEPENDS ${RUNTIME_CONTENT_FILES}
+# is several GiB. Compare a small source metadata manifest on every build so a
+# changed asset does not force CMake to read the entire source and destination
+# trees byte-for-byte.
+set(CONTENT_SYNC_MANIFEST "${CMAKE_BINARY_DIR}/.content-manifest")
+add_custom_target(RuntimeContent
+    COMMAND ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=${CMAKE_SOURCE_DIR}/Content"
+            "-DDESTINATION_DIR=${CMAKE_BINARY_DIR}/Content"
+            "-DMANIFEST_PATH=${CONTENT_SYNC_MANIFEST}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/SyncRuntimeContent.cmake"
+    BYPRODUCTS "${CONTENT_SYNC_MANIFEST}"
     COMMENT "Syncing changed runtime content"
     VERBATIM
 )
-add_custom_target(RuntimeContent DEPENDS "${CONTENT_SYNC_STAMP}")
 add_dependencies(GraphicEngine RuntimeContent)
 

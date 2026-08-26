@@ -713,12 +713,18 @@ public:
 
         if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel &&
             g_levelPlacesHumvee) {
-            std::vector<XMMATRIX> humveeTransforms = { HumveeWorldMatrix() };
-            if (g_stressTestMode)
-                humveeTransforms.push_back(SecondaryHumveeWorldMatrix());
-            DrawSceneNodeShadowInstances(
-                g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,
-                depthShader, humveeTransforms, lightSpace);
+            for (size_t index = 0; index < LevelHumveeCount(); ++index) {
+                PrepareHumveeModelForRender(index);
+                DrawSceneNodeShadow(
+                    g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,
+                    depthShader, HumveeWorldMatrix(index), lightSpace);
+            }
+            if (g_stressTestMode) {
+                PrepareHumveeModelForRender(0);
+                DrawSceneNodeShadow(
+                    g_humveeShadowModel ? g_humveeShadowModel : g_humveeModel,
+                    depthShader, SecondaryHumveeWorldMatrix(), lightSpace);
+            }
         }
 
         if (!g_emptyLevelMode && !g_trainingRangeMode && g_boatModel) {

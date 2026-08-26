@@ -235,16 +235,19 @@ inline void RemovePlayerFlashlight(Scene& scene, bool added) {
         scene.clusteredRenderer.lights.pop_back();
 }
 DirectX::XMMATRIX HumveeWorldMatrix();
+DirectX::XMMATRIX HumveeWorldMatrix(size_t index);
 DirectX::XMMATRIX SecondaryHumveeWorldMatrix();
-void PrimaryHumveeHeadlightPose(DirectX::XMFLOAT3& position,
-                                DirectX::XMFLOAT3& direction);
+size_t LevelHumveeCount();
+void PrepareHumveeModelForRender(size_t index);
+void HumveeHeadlightPose(size_t index, DirectX::XMFLOAT3& position,
+                         DirectX::XMFLOAT3& direction);
 
 // Which time-of-day preset the run was started on. Headlights read it so they
 // only burn at night, when they are the difference between a parked shape and a
 // vehicle -- switched on at noon they wash out the paintwork and light nothing.
 extern TimeOfDay g_selectedTimeOfDay;
 
-// One centre-line spotlight for the primary Humvee.
+// One centre-line spotlight for each authored Humvee.
 //
 // The lamp pose comes from the physics chassis rather than HumveeWorldMatrix.
 // That matrix also contains model centring, scaling and the FBX's -PI/2
@@ -254,30 +257,31 @@ extern TimeOfDay g_selectedTimeOfDay;
 // Returns how many lights were appended, so the caller can pop exactly that
 // many back off at the end of the frame.
 inline int AddHumveeHeadlights(Scene& scene) {
-    if (scene.clusteredRenderer.lights.size() >= 64) return 0;
-    PointLightDX12 headlight;
-    PrimaryHumveeHeadlightPose(headlight.position,
-                               headlight.spotDirection);
-    headlight.radius = 34.0f;
-    headlight.color = XMFLOAT3(0.92f, 0.95f, 1.0f);
-    headlight.intensity = 4.5f;
-    headlight.spotCosInner = std::cos(XMConvertToRadians(15.0f));
-    headlight.spotCosOuter = std::cos(XMConvertToRadians(26.0f));
+    int added = 0;
+    for (size_t index = 0; index < LevelHumveeCount() &&
+         scene.clusteredRenderer.lights.size() < 64; ++index) {
+        PointLightDX12 headlight;
+        HumveeHeadlightPose(index, headlight.position,
+                            headlight.spotDirection);
+        headlight.radius = 34.0f;
+        headlight.color = XMFLOAT3(0.92f, 0.95f, 1.0f);
+        headlight.intensity = 4.5f;
+        headlight.spotCosInner = std::cos(XMConvertToRadians(15.0f));
+        headlight.spotCosOuter = std::cos(XMConvertToRadians(26.0f));
 
-    // Register depth from the values actually assigned to the light. The
-    // caster and the visible cone therefore cannot drift to different origins
-    // or axes even if the vehicle model transform changes again.
-    int shadowIndex = SPOT_SHADOW_NONE;
-    if (g_spotShadowCasters.size() < SPOT_SHADOW_COUNT) {
-        shadowIndex = static_cast<int>(g_spotShadowCasters.size());
-        g_spotShadowCasters.push_back(MakeSpotShadowCaster(
-            XMLoadFloat3(&headlight.position),
-            XMLoadFloat3(&headlight.spotDirection), 30.0f, 38.0f));
+        int shadowIndex = SPOT_SHADOW_NONE;
+        if (g_spotShadowCasters.size() < SPOT_SHADOW_COUNT) {
+            shadowIndex = static_cast<int>(g_spotShadowCasters.size());
+            g_spotShadowCasters.push_back(MakeSpotShadowCaster(
+                XMLoadFloat3(&headlight.position),
+                XMLoadFloat3(&headlight.spotDirection), 30.0f, 38.0f));
+        }
+        headlight.spotShadowIndex = shadowIndex;
+        headlight.volumetric = scene.spotlightVolumetric;
+        scene.clusteredRenderer.lights.push_back(headlight);
+        ++added;
     }
-    headlight.spotShadowIndex = shadowIndex;
-    headlight.volumetric = scene.spotlightVolumetric;
-    scene.clusteredRenderer.lights.push_back(headlight);
-    return 1;
+    return added;
 }
 
 // Every Humvee the level actually placed. Mirrors the draw conditions in
@@ -2314,13 +2318,18 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
 
     if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel &&
         g_levelPlacesHumvee) {
-        if (visibilityExtensionsOnly) {
-            DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
-                view, proj, lightSpace, true);
-        } else if (!staticBatches.Submit(g_humveeModel, HumveeWorldMatrix()))
-            DrawSceneNode(g_humveeModel, shader, HumveeWorldMatrix(),
-                view, proj, lightSpace);
+        for (size_t index = 0; index < LevelHumveeCount(); ++index) {
+            PrepareHumveeModelForRender(index);
+            const XMMATRIX world = HumveeWorldMatrix(index);
+            if (visibilityExtensionsOnly)
+                DrawSceneNode(g_humveeModel, shader, world,
+                    view, proj, lightSpace, true);
+            else if (!staticBatches.Submit(g_humveeModel, world))
+                DrawSceneNode(g_humveeModel, shader, world,
+                    view, proj, lightSpace);
+        }
         if (g_stressTestMode) {
+            PrepareHumveeModelForRender(0);
             if (visibilityExtensionsOnly)
                 DrawSceneNode(g_humveeModel, shader, SecondaryHumveeWorldMatrix(),
                     view, proj, lightSpace, true);

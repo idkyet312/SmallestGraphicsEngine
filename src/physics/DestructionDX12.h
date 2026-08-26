@@ -2,6 +2,7 @@
 
 #include <DirectXMath.h>
 #include <d3d12.h>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -187,14 +188,19 @@ public:
     void Shutdown();
     void Reset();
     void Update(float dt);
-    bool InitializeVehicle(const DirectX::XMFLOAT3& chassisCenter,
+    void ClearVehicles();
+    bool InitializeVehicle(size_t vehicleIndex,
+                           const DirectX::XMFLOAT3& chassisCenter,
                            float yawRadians = 0.0f);
-    void SetVehicleInput(float throttle, float steering, bool brake);
-    bool GetVehicleTransform(DirectX::XMFLOAT4X4& transform,
+    void SetVehicleInput(size_t vehicleIndex, float throttle, float steering,
+                         bool brake);
+    bool GetVehicleTransform(size_t vehicleIndex,
+                             DirectX::XMFLOAT4X4& transform,
                              DirectX::XMFLOAT3* position = nullptr,
                              DirectX::XMFLOAT3* forward = nullptr,
                              DirectX::XMFLOAT3* linearVelocity = nullptr) const;
-    bool VehicleReady() const;
+    bool VehicleReady(size_t vehicleIndex) const;
+    size_t VehicleCount() const;
     void SetEnemyTarget(const DirectX::XMFLOAT3& target);
     std::vector<EnemyShot> DrainEnemyShots();
     uint32_t SpawnAuthoredRagdoll(const std::vector<AuthoredRagdollBody>& bodies,
@@ -325,11 +331,11 @@ public:
     // Resolves the player against destruction/ragdoll boxes. Walls push the eye
     // out horizontally; low boxes the player is standing over raise `floorY` (so
     // the caller can stand the player on top) instead of shoving them sideways.
-    // `collideVehicle` blocks the player against the humvee chassis; pass false
-    // while driving, when the camera legitimately sits inside that hull.
+    // Every Humvee chassis blocks the player except `ignoredVehicleIndex`, which
+    // lets the driving camera remain inside its occupied hull.
     void ResolvePlayerCollision(DirectX::XMFLOAT3& eyePosition, float& floorY,
                                 float radius = 0.35f, float height = 1.7f,
-                                bool collideVehicle = true);
+                                size_t ignoredVehicleIndex = SIZE_MAX);
     // Define a water region (AABB, with the surface at max.y). Dynamic
     // fragments knocked into it get buoyancy so house debris floats.
     void SetWaterRegion(const DirectX::XMFLOAT3& minCorner,

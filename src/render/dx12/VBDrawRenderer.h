@@ -356,10 +356,16 @@ inline void BuildSceneDrawItems(Scene& scene, std::vector<VBDrawItem>& items,
 
     if (!g_emptyLevelMode && !g_trainingRangeMode && g_humveeModel &&
         g_levelPlacesHumvee) {
-        AppendOpaqueSceneNodeDrawItems(g_humveeModel, HumveeWorldMatrix(), items);
-        if (g_stressTestMode)
+        for (size_t index = 0; index < LevelHumveeCount(); ++index) {
+            PrepareHumveeModelForRender(index);
+            AppendOpaqueSceneNodeDrawItems(
+                g_humveeModel, HumveeWorldMatrix(index), items);
+        }
+        if (g_stressTestMode) {
+            PrepareHumveeModelForRender(0);
             AppendOpaqueSceneNodeDrawItems(g_humveeModel,
                 SecondaryHumveeWorldMatrix(), items);
+        }
     }
 
     if (!g_emptyLevelMode && g_helicopterModel && scene.showHelicopter) {
