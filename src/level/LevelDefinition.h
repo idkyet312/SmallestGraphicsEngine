@@ -157,6 +157,9 @@ struct LevelDefinition {
     // World-space radius of the selectable insertion/drop-off ring. It is not
     // multiplied by island scale: an authored 120 m radius stays exactly 120 m.
     float deploymentRadius = kDefaultDeploymentRadius;
+    // The autonomous armed patrol boat is level scenery/gameplay, separate from
+    // the insertion and extraction boats selected by mission flow.
+    bool patrolBoatEnabled = true;
     float terrainHeightScale = 3.057f;
     // Flat authoring mode: suppress every procedural landform -- the fbm relief,
     // the pool basin carved near the origin, and the beach/seabed coast falloff

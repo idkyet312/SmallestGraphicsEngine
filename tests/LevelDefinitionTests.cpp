@@ -81,6 +81,7 @@ int main() {
     level.dxrDDGI.hysteresis = 0.9f;
     level.insertionMode = LevelInsertionMode::PlayerChoice;
     level.deploymentRadius = 137.5f;
+    level.patrolBoatEnabled = false;
 
     const auto root = std::filesystem::temp_directory_path() /
                       "smallest-graphics-engine-level-tests";
@@ -124,6 +125,7 @@ int main() {
     CHECK(loaded.level.dxrDDGI.hysteresis == 0.9f);
     CHECK(loaded.level.insertionMode == LevelInsertionMode::PlayerChoice);
     CHECK(loaded.level.deploymentRadius == 137.5f);
+    CHECK(!loaded.level.patrolBoatEnabled);
     LevelInsertionMode insertion = LevelInsertionMode::Helicopter;
     CHECK(ParseLevelInsertionMode("boat", insertion));
     CHECK(insertion == LevelInsertionMode::Boat);
@@ -187,6 +189,7 @@ int main() {
     // Files saved before insertion modes existed all arrived by helicopter.
     CHECK(legacyLoaded.level.insertionMode == LevelInsertionMode::Helicopter);
     CHECK(legacyLoaded.level.deploymentRadius == kDefaultDeploymentRadius);
+    CHECK(legacyLoaded.level.patrolBoatEnabled);
 
     // An unknown mode is rejected rather than silently falling back, so a typo
     // in a hand-edited level is caught at load.

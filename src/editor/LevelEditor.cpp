@@ -2090,6 +2090,12 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             ImGui::SetTooltip("Distance from island centre to every selectable "
                               "deployment/drop-off point.");
     }
+    {
+        const LevelDefinition boatBefore = level_;
+        const bool boatChanged = ImGui::Checkbox(
+            "Patrol boat", &level_.patrolBoatEnabled);
+        TrackItemEdit(boatBefore, boatChanged);
+    }
     ImGui::Separator();
     LevelEntity* entity = Selected();
     if (entity) {

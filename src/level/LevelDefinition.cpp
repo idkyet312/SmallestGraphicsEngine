@@ -316,6 +316,9 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
         // Old levels used the historical 34 m ring and did not save this key.
         level.deploymentRadius = root.value(
             "deploymentRadius", kDefaultDeploymentRadius);
+        // Older maps all shipped with the patrol boat, so absence preserves
+        // their existing behavior.
+        level.patrolBoatEnabled = root.value("patrolBoatEnabled", true);
         level.terrainHeightScale = root.at("terrain").at("heightScale").get<float>();
         {
             const json& terrainRoot = root.at("terrain");
@@ -508,6 +511,7 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
             {"schemaVersion", level.schemaVersion}, {"name", level.name},
             {"insertionMode", LevelInsertionModeName(level.insertionMode)},
             {"deploymentRadius", level.deploymentRadius},
+            {"patrolBoatEnabled", level.patrolBoatEnabled},
             {"terrain", {{"heightScale", level.terrainHeightScale},
                          {"flat", level.terrainFlat},
                          {"tilesX", level.terrainTilesX},

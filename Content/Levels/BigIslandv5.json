@@ -1,5 +1,6 @@
 {
   "deploymentRadius": 126.80000305175781,
+  "patrolBoatEnabled": false,
   "entities": [
     {
       "enabled": true,

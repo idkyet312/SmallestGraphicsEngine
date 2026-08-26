@@ -9,6 +9,7 @@
 struct RuntimeLevelPlan {
     float terrainHeightScale = 5.0f;
     bool terrainFlat = false;
+    bool patrolBoatEnabled = true;
     uint32_t terrainTilesX = 16;
     uint32_t terrainTilesZ = 16;
     float terrainIslandScaleX = 1.0f;
@@ -28,6 +29,7 @@ public:
         RuntimeLevelPlan plan;
         plan.terrainHeightScale = level.terrainHeightScale;
         plan.terrainFlat = level.terrainFlat;
+        plan.patrolBoatEnabled = level.patrolBoatEnabled;
         plan.terrainTilesX = level.terrainTilesX;
         plan.terrainTilesZ = level.terrainTilesZ;
         plan.terrainIslandScaleX = level.terrainIslandScaleX;

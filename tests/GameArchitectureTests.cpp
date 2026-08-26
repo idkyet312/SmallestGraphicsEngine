@@ -331,6 +331,11 @@ int main() {
     CHECK(plan.humveeSpawns.size() == 1);
     CHECK(plan.helicopterSpawn.has_value());
     CHECK(!plan.explosiveBarrels.empty());
+    CHECK(plan.patrolBoatEnabled);
+
+    level.patrolBoatEnabled = false;
+    plan = LevelRuntimeBuilder::Build(level);
+    CHECK(!plan.patrolBoatEnabled);
 
     LevelEntity parkedHumvee = level.entities.back();
     parkedHumvee.id = 1000;

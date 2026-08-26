@@ -646,6 +646,7 @@ bool                        g_trainingRangeMode = false;
 // shadow and a nav obstacle. Level 1's template authors its own, so it is
 // unaffected.
 bool                        g_levelPlacesHumvee = false;
+static bool                 g_levelPatrolBoatEnabled = true;
 // Mouse-walk test mode (F10). Holding the right mouse button walks the player
 // forward, and aiming down sights is suppressed for as long as the mode is on --
 // the same button cannot both drive and aim. WASD still works; this is an extra
@@ -9939,6 +9940,7 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
     if (!g_customLevelMode) return;
     const RuntimeLevelPlan plan =
         LevelRuntimeBuilder::Build(g_game.world.Level());
+    g_levelPatrolBoatEnabled = plan.patrolBoatEnabled;
     scene.terrainHeightScale = plan.terrainHeightScale;
     scene.terrainFlat = plan.terrainFlat;
     scene.terrainTilesX = plan.terrainTilesX;
@@ -10089,7 +10091,10 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     }
     // ApplyRuntimeLevelBasics early-returns for non-custom levels, so refresh
     // vehicle placement here as well to clear parked instances between maps.
-    ApplyHumveeLevelPlan(LevelRuntimeBuilder::Build(g_game.world.Level()));
+    const RuntimeLevelPlan levelPlan =
+        LevelRuntimeBuilder::Build(g_game.world.Level());
+    ApplyHumveeLevelPlan(levelPlan);
+    g_levelPatrolBoatEnabled = levelPlan.patrolBoatEnabled;
     g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
     // Built-in levels carry no sidecar, so this clears any map left over from a
     // painted custom level rather than letting it bleed across a level change.
@@ -15755,7 +15760,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_game.commands.Set(GameCommand::RespawnTurretGunner,
                     !g_customLevelMode ||
                     FirstRuntimeEntity(LevelEntityType::Humvee) != nullptr);
-                g_game.commands.Set(GameCommand::RespawnBoatGunner, true);
+                g_game.commands.Set(GameCommand::RespawnBoatGunner,
+                    g_levelPatrolBoatEnabled);
             } else {
                 g_game.commands.Set(GameCommand::RespawnTurretGunner, false);
                 g_game.commands.Set(GameCommand::RespawnBoatGunner, false);
@@ -18547,18 +18553,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 "Content/Models/MiltaryBoat/miltaryboat.glb",
                 g_helicopterModel != nullptr);
         } else if (g_game.loading.Stage() == LevelLoadStage::Boat) {
-            g_boatModel = GLBImporter::LoadGLB(
-                "Content/Models/MiltaryBoat/miltaryboat.glb",
-                g_dx12.device, g_dx12.commandList);
-            if (g_boatModel) {
-                ConfigureBoatBounds();
-                g_boatShadowModel = GLBImporter::MergeSceneForDepth(
-                    g_boatModel, g_dx12.device);
-                g_boatCenter = { 0.0f, 0.0f, 0.0f };
-                g_boatPosition = g_boatCenter;
-                std::cout << "Military boat GLB ready, patrolling island\n";
-            } else {
-                std::cerr << "Military boat GLB failed to load\n";
+            g_boatModel.reset();
+            g_boatShadowModel.reset();
+            if (g_levelPatrolBoatEnabled) {
+                g_boatModel = GLBImporter::LoadGLB(
+                    "Content/Models/MiltaryBoat/miltaryboat.glb",
+                    g_dx12.device, g_dx12.commandList);
+                if (g_boatModel) {
+                    ConfigureBoatBounds();
+                    g_boatShadowModel = GLBImporter::MergeSceneForDepth(
+                        g_boatModel, g_dx12.device);
+                    g_boatCenter = { 0.0f, 0.0f, 0.0f };
+                    g_boatPosition = g_boatCenter;
+                    std::cout << "Military boat GLB ready, patrolling island\n";
+                } else {
+                    std::cerr << "Military boat GLB failed to load\n";
+                }
             }
 
             // Insertion boat: a second instance of the same hull, posed by its
@@ -18656,7 +18666,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 for (size_t i = 0; i < ActiveBanditSlotCount(); ++i)
                     if (!SpawnBandit()) break;
                 SpawnLevelHumveeTurretGunners();
-                SpawnBoatTurretGunner();
+                if (g_levelPatrolBoatEnabled) SpawnBoatTurretGunner();
                 // Before the player deploys: the squad exists and the navmesh
                 // is built, so this is the last point at which the opening
                 // layout can still be changed.
