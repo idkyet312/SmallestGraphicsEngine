@@ -9813,6 +9813,20 @@ static const LevelEntity* FirstRuntimeEntity(LevelEntityType type) {
     return it == entities.end() ? nullptr : &*it;
 }
 
+static float CurrentPhysicsTerrainExtent() {
+    constexpr float kMinimumExtent = 60.0f;
+    constexpr float kEntityMargin = 20.0f;
+    float extent = kMinimumExtent;
+    for (const LevelEntity& entity : g_game.world.Level().entities) {
+        if (!entity.enabled) continue;
+        extent = (std::max)(extent,
+            std::abs(entity.transform.position[0]) + kEntityMargin);
+        extent = (std::max)(extent,
+            std::abs(entity.transform.position[2]) + kEntityMargin);
+    }
+    return extent;
+}
+
 static void ApplyRuntimeLevelBasics(bool movePlayer) {
     if (!g_customLevelMode) return;
     const RuntimeLevelPlan plan =
@@ -13109,7 +13123,7 @@ static void SynchronizeEditorRuntime(bool play) {
             tp.heightScale = scene.terrainHeightScale;
             g_destruction.SetTerrainSampler([tp](float x, float z) {
                 return TerrainRendererDX12::HeightAt(tp, x, z);
-            });
+            }, CurrentPhysicsTerrainExtent());
         }
         g_levelEditor.MarkRuntimeSynchronized();
         g_levelEditor.MarkTerrainRuntimeSynchronized();
@@ -13137,10 +13151,24 @@ static void SynchronizeEditorRuntime(bool play) {
         tp.heightScale = scene.terrainHeightScale;
         g_destruction.SetTerrainSampler([tp](float x, float z) {
             return TerrainRendererDX12::HeightAt(tp, x, z);
-        });
-        if (FirstRuntimeEntity(LevelEntityType::Humvee))
+        }, CurrentPhysicsTerrainExtent());
+        // Read the placement back off the entity rather than trusting the
+        // globals: g_primaryHumveeSpawn is written only by the level *load*
+        // path, so a Humvee placed or moved in the editor since that load is
+        // not reflected there. Without this, a freshly placed vehicle either
+        // spawned at the previous level's coordinates or, on a level that had
+        // never carried one, at the {0, 3.45, 0} struct default -- which reads
+        // as "it did not spawn at all".
+        if (const LevelEntity* humvee =
+                FirstRuntimeEntity(LevelEntityType::Humvee)) {
+            g_primaryHumveeSpawn = { humvee->transform.position[0],
+                                     humvee->transform.position[1],
+                                     humvee->transform.position[2] };
+            g_primaryHumveeYaw = humvee->transform.rotation[1];
+            g_levelPlacesHumvee = true;
             g_destruction.InitializeVehicle(g_primaryHumveeSpawn,
                 XMConvertToRadians(g_primaryHumveeYaw));
+        }
     }
     g_levelEditor.MarkRuntimeSynchronized();
     g_levelEditor.MarkFoliageRuntimeSynchronized();
@@ -15967,7 +15995,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             tp.heightScale = scene.terrainHeightScale;
             g_destruction.SetTerrainSampler([tp](float x, float z) {
                 return TerrainRendererDX12::HeightAt(tp, x, z);
-            });
+            }, CurrentPhysicsTerrainExtent());
             if (!g_emptyLevelMode) {
                 g_destruction.SetSplashCallback([](float x, float z, float s) {
                     g_water.Splash(x, z, s);
@@ -18086,7 +18114,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     tp.heightScale = scene.terrainHeightScale;
                     g_destruction.SetTerrainSampler([tp](float x, float z) {
                         return TerrainRendererDX12::HeightAt(tp, x, z);
-                    });
+                    }, CurrentPhysicsTerrainExtent());
                 }
                 AdvanceLevelLoading(
                     g_emptyLevelMode ? LevelLoadStage::Weapons
@@ -18138,7 +18166,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_ocean.Initialize({ 0.0f, -kSeaDepth * 0.5f, 0.0f },
                                    { kSeaSpan, kSeaDepth, kSeaSpan });
                 // House debris collides with the real terrain, not a flat plane.
-                g_destruction.SetTerrainSampler(terrainSampler);
+                g_destruction.SetTerrainSampler(
+                    terrainSampler, CurrentPhysicsTerrainExtent());
                 // Debris/ragdolls splash the pool when they break the surface.
                 g_destruction.SetSplashCallback([](float x, float z, float s) {
                     g_water.Splash(x, z, s);

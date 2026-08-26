@@ -337,7 +337,10 @@ public:
     // Supply the terrain-height sampler (CPU mirror of the terrain shader) so
     // debris collides with the real ground surface instead of a flat plane.
     // Rebuilds the static ground collider as a heightfield. Call after Initialize.
-    void SetTerrainSampler(std::function<float(float, float)> sampler);
+    // extent is the required half-size in world metres; 60 preserves the
+    // historical collider for compact levels.
+    void SetTerrainSampler(std::function<float(float, float)> sampler,
+                           float extent = 60.0f);
     // Callback invoked (x, z, strength) when a fragment or ragdoll part first
     // breaks the water surface, so the caller can spawn a splash ripple.
     void SetSplashCallback(std::function<void(float, float, float)> cb);

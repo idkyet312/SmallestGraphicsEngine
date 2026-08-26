@@ -646,6 +646,7 @@ struct DestructionDX12::Impl {
     // heightfield matching the drawn terrain, so debris rests on the real hills
     // and rolls into the basin instead of hovering on a flat plane.
     std::function<float(float, float)> terrainSampler;
+    float terrainExtent = 60.0f;
     // Called (x, z, strength) when a body first breaks the water surface, so the
     // pool can spawn a ripple/splash. Set from main.
     std::function<void(float, float, float)> splashCallback;
@@ -1780,9 +1781,10 @@ struct DestructionDX12::Impl {
         };
 
         if (terrainSampler) {
-            constexpr float extent = 60.0f;
             constexpr float cell = 0.5f;
-            constexpr int points = static_cast<int>(extent * 2.0f / cell) + 1;
+            const int halfCells = static_cast<int>(std::ceil(terrainExtent / cell));
+            const float extent = halfCells * cell;
+            const int points = halfCells * 2 + 1;
             std::vector<float> heights(static_cast<size_t>(points) * points);
             float minimumHeight = FLT_MAX;
             float maximumHeight = -FLT_MAX;
@@ -3072,8 +3074,23 @@ void DestructionDX12::Reset() {
 
 bool DestructionDX12::InitializeVehicle(const XMFLOAT3& chassisCenter,
                                         float yawRadians) {
-    if (!m || !m->initialized || B3_IS_NULL(m->world) ||
-        !B3_IS_NULL(m->vehicleChassis)) return false;
+    if (!m || !m->initialized || B3_IS_NULL(m->world)) return false;
+
+    // Re-spawning replaces the existing vehicle rather than being refused.
+    // The editor re-runs this whenever the Humvee entity is moved, and the
+    // old early-return meant the second call silently did nothing: the
+    // vehicle stayed at its first position and the move looked ignored.
+    // Destroying the body drops its joints with it.
+    if (!B3_IS_NULL(m->vehicleChassis)) {
+        for (b3BodyId& wheel : m->vehicleWheels) {
+            if (!B3_IS_NULL(wheel)) {
+                b3DestroyBody(wheel);
+                wheel = b3_nullBodyId;
+            }
+        }
+        b3DestroyBody(m->vehicleChassis);
+        m->vehicleChassis = b3_nullBodyId;
+    }
 
     b3BodyDef chassisDef = b3DefaultBodyDef();
     chassisDef.type = b3_dynamicBody;
@@ -4784,9 +4801,11 @@ void DestructionDX12::SetWaterRegion(const XMFLOAT3& minCorner, const XMFLOAT3& 
     m->waterSurfaceY = maxCorner.y;
 }
 
-void DestructionDX12::SetTerrainSampler(std::function<float(float, float)> sampler) {
+void DestructionDX12::SetTerrainSampler(
+        std::function<float(float, float)> sampler, float extent) {
     if (!m) return;
     m->terrainSampler = std::move(sampler);
+    m->terrainExtent = (std::max)(60.0f, extent);
     m->BuildGround();   // rebuild the ground collider as a terrain heightfield
 }
 
