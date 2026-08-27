@@ -1594,6 +1594,33 @@ static LevelInsertionMode& g_playerInsertionChoice =
     g_game.mission.Loadout().insertion;
 static bool g_insertionChoicePending = false;
 static bool g_insertionChoiceCursorReleased = false;
+
+// Which cabin door the player rides out of on a helicopter insertion, picked on
+// the deployment screen. The GLB authors one seat only -- "PlayerRide" measures
+// side +1.81, i.e. starboard -- so the left seat is that same point mirrored
+// across the fuselage centreline rather than a second authored empty.
+//
+// The offsets ConfigureBlackHawkRideFromModel derives are cached at load and
+// re-applied through the mirror every time an insertion is armed, so flipping
+// the seat between runs never compounds an earlier flip.
+static bool g_playerRidesLeftSeat = false;
+static float g_blackHawkRideSideBase = 0.0f;
+static float g_blackHawkRopeSideBase = 0.0f;
+// Raised when an insertion is armed, cleared on the first frame the player is
+// actually seated. Aiming the camera out of the chosen door is a one-shot: the
+// player keeps free look for the rest of the flight, so re-aiming every frame
+// would fight the mouse instead of just setting the starting view.
+static bool g_blackHawkRideFacingPending = false;
+
+// Re-derives the seat and rope offsets for the currently chosen door. Safe to
+// call repeatedly: it always starts from the cached authored values.
+static void ApplyBlackHawkSeatSide() {
+    VehicleSystem& vehicles = g_game.vehicles;
+    const float mirror = g_playerRidesLeftSeat ? -1.0f : 1.0f;
+    vehicles.blackHawkRideSide = g_blackHawkRideSideBase * mirror;
+    vehicles.blackHawkRopeSide = g_blackHawkRopeSideBase * mirror;
+}
+
 static std::vector<XMFLOAT3> g_deploymentZones;
 static int g_selectedDeploymentZone = -1;
 static XMFLOAT3 g_deploymentTarget{};
@@ -1684,6 +1711,9 @@ static void CancelDeploymentPlanning() {
     g_deploymentOrbitVelocity = 0.0f;
     g_deploymentOrbitPendingDrag = 0.0f;
     g_deploymentOrbitPendingTilt = 0.0f;
+    // A run that never reaches a helicopter seat must not leave the one-shot
+    // armed for whatever insertion comes next.
+    g_blackHawkRideFacingPending = false;
 }
 
 bool DeploymentPlanningActive() { return g_insertionChoicePending; }
@@ -1794,6 +1824,21 @@ static void RidePlayerInBlackHawk() {
         scene.camera.VerticalVelocity = 0.0f;
         scene.camera.IsGrounded = true;
         scene.camera.FloorY = scene.camera.Position.y - scene.camera.PlayerHeight;
+        // Look out of the door the player is sitting in, once, at the start of
+        // the ride. The airframe's forward is (sin, cos), so its right-hand
+        // side is (cos, -sin); camera yaw is atan2(z, x) in degrees, which
+        // makes the starboard view simply -yaw, and the port view that plus a
+        // half turn. Level the pitch too: whatever the player was looking at on
+        // the deployment map has nothing to do with where they now sit.
+        if (g_blackHawkRideFacingPending) {
+            g_blackHawkRideFacingPending = false;
+            const float facing =
+                -XMConvertToDegrees(vehicles.blackHawkYaw) +
+                (g_playerRidesLeftSeat ? 180.0f : 0.0f);
+            scene.camera.Yaw = facing;
+            scene.camera.Pitch = 0.0f;
+            scene.camera.ProcessMouseMovement(0.0f, 0.0f);
+        }
         return;
     }
     // Bailing out mid-flight leaves the player where the aircraft is, stepped
@@ -2373,6 +2418,10 @@ static void ConfigureBlackHawkRideFromModel() {
         (meshPosition.z - g_blackHawkModelCenter.z) * g_blackHawkModelScale;
     vehicles.blackHawkRideHeight =
         (meshPosition.y - g_blackHawkModelMinY) * g_blackHawkModelScale;
+    // Authored (starboard) side, kept so the left-seat mirror in
+    // ApplyBlackHawkSeatSide always folds from the model rather than from
+    // whatever the previous run left behind.
+    g_blackHawkRideSideBase = vehicles.blackHawkRideSide;
 
     g_blackHawkRideMeshPosition = meshPosition;
     std::cout << "BlackHawk PlayerRide mesh pos " << meshPosition.x << ", "
@@ -2404,6 +2453,9 @@ static void ConfigureBlackHawkRopeAnchorFromModel() {
         vehicles.blackHawkRopeForward = vehicles.blackHawkRideForward;
         vehicles.blackHawkRopeHeight = vehicles.blackHawkRideHeight;
         vehicles.blackHawkRopeAnchorValid = false;
+        // Falling back to the seat means the rope mirrors with it, so the base
+        // the seat-side flip folds from is the seat's own authored side.
+        g_blackHawkRopeSideBase = g_blackHawkRideSideBase;
         return;
     }
 
@@ -2420,6 +2472,7 @@ static void ConfigureBlackHawkRopeAnchorFromModel() {
     vehicles.blackHawkRopeHeight =
         (meshPosition.y - g_blackHawkModelMinY) * g_blackHawkModelScale;
     vehicles.blackHawkRopeAnchorValid = true;
+    g_blackHawkRopeSideBase = vehicles.blackHawkRopeSide;
 
     std::cout << "BlackHawk RopeAnchor -> side " << vehicles.blackHawkRopeSide
               << ", forward " << vehicles.blackHawkRopeForward
@@ -11192,9 +11245,11 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             // the flick needs -- no per-message accumulation to reconcile.
             g_deploymentOrbitPendingDrag +=
                 io.MouseDelta.x * kDeploymentOrbitRadiansPerPixel;
-            // Dragging down lowers the camera toward the horizon. Elevation has
-            // no flick momentum so releasing always leaves the chosen framing.
-            g_deploymentOrbitPendingTilt -=
+            // Dragging up rotates the map down toward the horizon, the way
+            // pushing the far edge of a physical model away from you tips it.
+            // Elevation has no flick momentum so releasing always leaves the
+            // chosen framing.
+            g_deploymentOrbitPendingTilt +=
                 io.MouseDelta.y * kDeploymentOrbitElevationRadiansPerPixel;
         }
     }
@@ -11713,6 +11768,33 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 3.0f));
     modeButton("BOAT INSERTION", LevelInsertionMode::Boat);
     ImGui::Dummy(ImVec2(0.0f, 5.0f));
+
+    // Door choice. Only the two helicopter runs have cabin seats, so the row is
+    // hidden on a boat insertion rather than shown greyed out -- the panel is
+    // already long and a dead control there would just be noise.
+    if (g_playerInsertionChoice == LevelInsertionMode::Helicopter ||
+        g_playerInsertionChoice == LevelInsertionMode::FastRappel) {
+        ImGui::SetCursorPosX(45.0f);
+        ImGui::TextDisabled("SEAT");
+        const auto seatButton = [&](const char* label, bool leftSeat,
+                                    bool sameLine) {
+            const bool selected = g_playerRidesLeftSeat == leftSeat;
+            if (selected) {
+                ImGui::PushStyleColor(
+                    ImGuiCol_Button, ImVec4(0.12f, 0.48f, 0.22f, 1.0f));
+                ImGui::PushStyleColor(
+                    ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.58f, 0.28f, 1.0f));
+            }
+            if (sameLine) ImGui::SameLine();
+            else ImGui::SetCursorPosX(45.0f);
+            if (ImGui::Button(label, ImVec2(166.0f, 30.0f)))
+                g_playerRidesLeftSeat = leftSeat;
+            if (selected) ImGui::PopStyleColor(2);
+        };
+        seatButton("LEFT DOOR", true, false);
+        seatButton("RIGHT DOOR", false, true);
+        ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    }
 
     if (standingTowers > 0) {
         ImGui::SeparatorText("PRIMARY OBJECTIVE");
@@ -16357,8 +16439,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_blackHawkInsertionRestartPending = false;
                 const LevelInsertionMode mode = ResolvedInsertionMode();
                 if (mode == LevelInsertionMode::Helicopter ||
-                    mode == LevelInsertionMode::FastRappel)
+                    mode == LevelInsertionMode::FastRappel) {
+                    // Before the run is aimed: the seat offset feeds both the
+                    // ride point and the rappel rope, and the rope is hung from
+                    // the pose the very first update produces.
+                    ApplyBlackHawkSeatSide();
                     StartBlackHawkInsertionAtPlayerSpawn();
+                    // Face out of the door once the seat is occupied. Deferred
+                    // rather than set here: the aircraft's yaw is settled by the
+                    // first UpdateBlackHawk, not by the call that arms the run.
+                    g_blackHawkRideFacingPending = true;
+                }
                 else
                     g_game.vehicles.DisableBlackHawkInsertion();
                 armedInsertionThisFrame = true;
