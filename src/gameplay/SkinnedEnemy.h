@@ -1512,6 +1512,11 @@ public:
             const D3D12_GPU_VIRTUAL_ADDRESS vidxA = prim.meshletVertexIndexBuffer ? prim.meshletVertexIndexBuffer->GetGPUVirtualAddress() : 0;
             const D3D12_GPU_VIRTUAL_ADDRESS triA = prim.meshletTriangleBuffer ? prim.meshletTriangleBuffer->GetGPUVirtualAddress() : 0;
             if (g_meshShader.CanDraw(prim.meshletCount, descA, boundsA, vidxA, triA)) {
+                // SetObjectMaterial may select a different root signature than
+                // the previous scene mesh used. The mesh PSO must follow that
+                // per-primitive selection or bindless texture indices are read
+                // by the legacy pixel-shader variant (and vice versa).
+                g_meshShader.SetBindlessActive(shader.BindlessDrawActive());
                 g_meshShader.Draw(prim.vbv, (UINT)(prim.vertices.size() / 12), prim.indexCount,
                     prim.meshletCount, descA, boundsA, vidxA, triA,
                     paletteAddr, prim.skinBuffer->GetGPUVirtualAddress(),

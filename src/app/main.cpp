@@ -253,6 +253,7 @@ static bool                 g_prefabRuntimeSmokeChecked = false;
 // logged by LoadPrefabModel itself; this only decides when to stop.
 static bool                 g_collisionSmokeEnabled = false;
 static bool                 g_collisionSmokeChecked = false;
+static UINT                 g_collisionBudgetFrames = 0;
 static bool                 g_ddgiCornellTestMode = false;
 static bool                 g_ddgiCornellPreviousTemporalEffects = false;
 static bool                 g_ddgiCornellPreviousAnimateDemoLights = true;
@@ -859,7 +860,14 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
         }
     }
 
-    if (DeploymentPlanningActive()) {
+    // The editor's Birdseye toggle borrows this same topology, so the branch is
+    // no longer deployment-only. Playtesting from the editor must still show
+    // the gameplay clipmap, otherwise the level is being judged on terrain the
+    // player will never be given.
+    const bool editorBirdseye =
+        g_game.session.Screen() == GameScreen::LevelEditor &&
+        !g_levelEditor.IsPlaying() && g_levelEditor.BirdseyeEnabled();
+    if (DeploymentPlanningActive() || editorBirdseye) {
         constexpr float kShoreOuter = 88.0f;
         constexpr float kOceanMargin = 40.0f;
         const float maxScale = (std::max)(params.islandScaleX,
@@ -868,12 +876,16 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
         const float deploymentRadius = g_customLevelMode
             ? g_game.world.Level().deploymentRadius
             : kDefaultDeploymentRadius;
-        const DeploymentPlanner::CameraFrame frame =
-            DeploymentPlanner::BuildCameraFrame(
-                islandRadius, deploymentRadius);
-        const float requiredRadius = (std::max)(
-            kShoreOuter * maxScale + kOceanMargin,
-            frame.terrainViewRadius);
+        // The overview's orbit framing is what sets the view radius during
+        // planning. The editor camera flies anywhere, so there is no orbit to
+        // frame against: it takes the island-and-shore radius alone, which is
+        // the same floor the planning path clamps against anyway.
+        const float requiredRadius = editorBirdseye
+            ? kShoreOuter * maxScale + kOceanMargin
+            : (std::max)(
+                  kShoreOuter * maxScale + kOceanMargin,
+                  DeploymentPlanner::BuildCameraFrame(
+                      islandRadius, deploymentRadius).terrainViewRadius);
 
         // A deployment overview is not a clipmap. Every tile is eight metres
         // wide and the mesh shader emits its complete 8x8 surface grid, giving
@@ -16050,9 +16062,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // without needing anyone to sit at the menu.
     if (GetEnvironmentVariableA("SGE_COLLISION_TEST", nullptr, 0) > 0) {
         g_collisionSmokeEnabled = true;
-        StartTrainingRange(hwnd);
-        SGE_LOG("LogPrefab", EngineLog::Level::Display,
-            "Collision smoke test started (Training Range)");
+        // SGE_COLLISION_TEST_LEVEL names a level to load instead of the Training
+        // Range, so the material budgets can be measured on a dense map rather
+        // than on the near-empty one the collision checks themselves need.
+        char levelName[260] = {};
+        if (GetEnvironmentVariableA("SGE_COLLISION_TEST_LEVEL", levelName,
+                static_cast<DWORD>(sizeof(levelName))) > 0) {
+            const std::filesystem::path level =
+                std::filesystem::path("Content/Levels") / levelName;
+            std::error_code error;
+            if (std::filesystem::exists(level, error)) {
+                StartCustomLevel(hwnd, level);
+                SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                    "Collision smoke test started (" + level.string() + ")");
+            } else {
+                SGE_LOG("LogPrefab", EngineLog::Level::Error,
+                    "Collision smoke level not found: " + level.string());
+                StartTrainingRange(hwnd);
+            }
+        } else {
+            StartTrainingRange(hwnd);
+            SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                "Collision smoke test started (Training Range)");
+        }
     }
     if (GetEnvironmentVariableA("SGE_PREFAB_EDITOR_TEST", nullptr, 0) > 0) {
         g_prefabEditorSmokeEnabled = true;
@@ -18512,6 +18544,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             DeploymentPlanningActive() && g_deploymentDebugForceForward;
         const bool deploymentHideAtmosphere =
             DeploymentPlanningActive() && g_deploymentDebugHideAtmosphere;
+        // Editor fog toggle. Suppressed at draw time rather than by clearing
+        // scene.enableVolumetricFog: that flag is copied back into the
+        // per-time-of-day store by ApplyLiveWeatherState, so writing it here
+        // would bake a view preference into the level's authored weather.
+        // Playtesting from inside the editor shows the level as shipped, so
+        // the override lifts the moment PLAY is pressed.
+        const bool editorHideFog =
+            g_game.session.Screen() == GameScreen::LevelEditor &&
+            !g_levelEditor.IsPlaying() && !g_levelEditor.FogEnabled();
         const RenderPath renderPath = RenderCoordinator::Choose({
             scene.useRaytracing && !deploymentForceForward,
             scene.useVisibilityBuffer && !deploymentForceForward,
@@ -19728,8 +19769,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             scene.lightShaftMode == Scene::LightShaftMode::Faux &&
             !nvgSuppressShafts;
         const bool renderFroxelVolume =
-            (scene.enableVolumetricFog && volumetricShafts) ||
-            scene.enableFlyableClouds;
+            ((scene.enableVolumetricFog && volumetricShafts) ||
+             scene.enableFlyableClouds) && !editorHideFog;
         if (renderedScene && !bentGTAODiagnosticActive &&
             !deploymentHideAtmosphere &&
             renderFroxelVolume && volumetricFog.initialized) {
@@ -20207,7 +20248,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         if (g_collisionSmokeEnabled && !g_collisionSmokeChecked &&
             !g_prefabRebuildRequested) {
             const auto cached = g_prefabModelCache.find("props/airport");
-            const bool built = cached != g_prefabModelCache.end() &&
+            // A level without the airport still runs the budget report below;
+            // only the airport-specific geometry checks are skipped.
+            const bool airportPresent = cached != g_prefabModelCache.end();
+            const bool built = airportPresent &&
                                cached->second.collisionMesh &&
                                !cached->second.collisionMesh->Empty();
             bool hit = false;
@@ -20318,14 +20362,45 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     std::to_string(stand.displacement.y) + ", " +
                     std::to_string(stand.displacement.z) + ")");
             }
-            const bool passed = built && hit && instanced && helperAgrees;
+            // Material and descriptor budgets with the airport loaded. Both cap
+            // silently -- material overflow falls back to id 0 and the heap to a
+            // fallback descriptor -- so a scene that quietly exceeds them looks
+            // like "other models lost their textures" rather than an error.
+            {
+                std::string budgets = "Material budget: VB materials " +
+                    std::to_string(visBuffer.BindlessMaterialCount()) + "/" +
+                    std::to_string(VB_MAX_MATERIALS) + ", rejected textures " +
+                    std::to_string(visBuffer.RejectedTextureCount());
+                if (visBuffer.bindlessHeap) {
+                    const BindlessDescriptorAllocator& allocator =
+                        visBuffer.bindlessHeap->Allocator();
+                    budgets += ", persistent descriptors " +
+                        std::to_string(allocator.PersistentCount()) + "/" +
+                        std::to_string(allocator.PersistentCapacity()) +
+                        ", overflows " +
+                        std::to_string(allocator.OverflowCount());
+                }
+                const bool overBudget =
+                    visBuffer.BindlessMaterialCount() >= VB_MAX_MATERIALS ||
+                    (visBuffer.bindlessHeap &&
+                     visBuffer.bindlessHeap->Allocator().OverflowCount() > 0);
+                SGE_LOG("LogPrefab", overBudget ? EngineLog::Level::Error
+                                                : EngineLog::Level::Display,
+                    budgets);
+            }
+            const bool passed = !airportPresent ||
+                                (built && hit && instanced && helperAgrees);
             SGE_LOG("LogPrefab", passed ? EngineLog::Level::Display
                                         : EngineLog::Level::Error,
                 passed ? "Collision smoke passed: airport BVH built, instanced, "
                          "queryable, and not shadowed by its bounds box"
                        : "Collision smoke failed");
             g_collisionSmokeChecked = true;
-            PostQuitMessage(passed ? 0 : 4);
+            // SGE_COLLISION_TEST_STAY=1 keeps the level running after the checks
+            // so counters that only fill in once geometry has actually rendered
+            // (materials, descriptors) can be read from a real frame.
+            if (GetEnvironmentVariableA("SGE_COLLISION_TEST_STAY", nullptr, 0) == 0)
+                PostQuitMessage(passed ? 0 : 4);
         }
         if (g_prefabEditorSmokeEnabled && !g_prefabEditorSmokeFinished) {
             for (auto& [id, thumbnail] : g_prefabThumbnails) {
@@ -20342,6 +20417,35 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 PostQuitMessage(saved ? 0 : 2);
                 break;
             }
+        }
+        // Budget snapshot once geometry has actually rendered, which is the only
+        // point the material and descriptor counters mean anything.
+        if (g_collisionSmokeEnabled && g_collisionSmokeChecked &&
+            ++g_collisionBudgetFrames == 240) {
+            std::string budgets = "Material budget after render: VB materials " +
+                std::to_string(visBuffer.BindlessMaterialCount()) + "/" +
+                std::to_string(VB_MAX_MATERIALS) +
+                ", legacy materials " +
+                std::to_string(visBuffer.MaterialCount()) +
+                ", legacy textures " +
+                std::to_string(visBuffer.MaterialTextureCount()) + "/" +
+                std::to_string(visBuffer.MaterialTextureCapacity()) +
+                ", rejected textures " +
+                std::to_string(visBuffer.RejectedTextureCount()) +
+                ", bindless " + (scene.bindlessMaterials ? "on" : "OFF") +
+                ", forward draw slot " +
+                std::to_string(mainShader.currentDrawCall) + "/" +
+                std::to_string(MAX_DRAW_CALLS_PER_FRAME);
+            if (visBuffer.bindlessHeap) {
+                const BindlessDescriptorAllocator& allocator =
+                    visBuffer.bindlessHeap->Allocator();
+                budgets += ", persistent descriptors " +
+                    std::to_string(allocator.PersistentCount()) + "/" +
+                    std::to_string(allocator.PersistentCapacity()) +
+                    ", overflows " + std::to_string(allocator.OverflowCount());
+            }
+            SGE_LOG("LogPrefab", EngineLog::Level::Display, budgets);
+            PostQuitMessage(0);
         }
         if (visibilitySmokeEnabled && ++visibilityCpuReportFrames >= 300) {
             visibilityCpuReportFrames = 0;

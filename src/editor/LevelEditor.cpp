@@ -1582,6 +1582,23 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         else actions.returnToMenu = true;
     }
     ImGui::SameLine();
+    ImGui::Checkbox("Fog", &fogEnabled_);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Volumetric fog in the editor viewport.\n"
+            "A view setting only -- it is not saved with the level and does\n"
+            "not change the authored weather. Turn it off to see far props\n"
+            "through a dense preset.");
+    ImGui::SameLine();
+    ImGui::Checkbox("Birdseye", &birdseyeEnabled_);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Deployment-overview terrain LOD in the editor viewport.\n"
+            "Uniform 8 m tiles at full tessellation to the horizon instead\n"
+            "of the gameplay clipmap's coarser outer rings, so distant\n"
+            "terrain reads accurately. Costs more GPU; a view setting only,\n"
+            "not saved with the level.");
+    ImGui::SameLine();
     ImGui::TextDisabled("%s%s", level_.name.c_str(), dirty_ ? " *" : "");
 
     if (ImGui::BeginPopupModal("Confirm New Level", nullptr,

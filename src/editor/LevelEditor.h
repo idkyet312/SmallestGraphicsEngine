@@ -53,6 +53,11 @@ public:
     }
     bool ImportInProgress() const { return pendingImport_.valid(); }
     void OpenAssetBrowser() { assetBrowserOpen_ = true; }
+    // Whether the editor viewport wants volumetric fog drawn. The editor does
+    // not reach into Scene itself, so the caller reads this and applies it.
+    bool FogEnabled() const { return fogEnabled_; }
+    // Whether the viewport wants the deployment overview's terrain LOD.
+    bool BirdseyeEnabled() const { return birdseyeEnabled_; }
     bool IsDirty() const { return dirty_; }
     void RefreshAssets();
     const LevelDefinition& Level() const { return level_; }
@@ -217,6 +222,18 @@ private:
     AssetRegistry assetRegistry_;
     GunAudio audioPreview_;
     bool assetBrowserOpen_ = true;
+    // Editor-only fog suppression. Volumetric fog is authored per level and per
+    // time of day, so a dense preset hides whatever is being placed at the far
+    // end of the map; turning it off is a view setting for the person editing,
+    // not a change to the level. Nothing here is serialized, and the scene flag
+    // is restored the moment the toggle goes back on.
+    bool fogEnabled_ = true;
+    // Draws the editor viewport with the deployment overview's terrain topology
+    // instead of the gameplay clipmap: uniform 8 m tiles at full tessellation
+    // all the way out, rather than exponentially coarser outer rings. Costs
+    // more than the clipmap, which is why it is opt-in, but it is the only way
+    // to judge distant terrain edits without flying the camera out to them.
+    bool birdseyeEnabled_ = false;
     int assetKindTab_ = 3;
     int selectedPrefab_ = -1;
     int prefabDraftIndex_ = -1;

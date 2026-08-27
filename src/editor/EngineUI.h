@@ -1517,6 +1517,30 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::ColorEdit3("Floor Color", &scene.floor.color.x);
         ImGui::ColorEdit3("Clear Color", &scene.clearColor.x);
         ImGui::Checkbox("Wireframe Mode", &scene.wireframeMode);
+        // Material residency, shown unconditionally rather than inside the
+        // bindless sub-panel. Every one of these caps degrades silently -- a
+        // full texture array still registers the material and just renders it
+        // untextured -- so a scene that quietly exceeds one looks like assets
+        // failing to load rather than a budget being hit. Surfacing the numbers
+        // here is what makes "the characters went white" diagnosable.
+        {
+            const UINT legacyTextures = vb.MaterialTextureCount();
+            const UINT legacyTextureCap = vb.MaterialTextureCapacity();
+            const UINT rejected = vb.RejectedTextureCount();
+            const bool texturesFull = legacyTextures >= legacyTextureCap;
+            const bool materialsFull =
+                vb.MaterialCount() >= VB_MAX_LEGACY_MATERIALS ||
+                vb.BindlessMaterialCount() >= VB_MAX_MATERIALS;
+            if (texturesFull || materialsFull || rejected > 0) {
+                ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                    "  Material budget EXHAUSTED -- surfaces render untextured");
+            }
+            ImGui::Text("  Materials: legacy %u/%u, bindless %u/%u",
+                vb.MaterialCount(), VB_MAX_LEGACY_MATERIALS,
+                vb.BindlessMaterialCount(), VB_MAX_MATERIALS);
+            ImGui::Text("  Legacy textures: %u/%u  rejected: %u",
+                legacyTextures, legacyTextureCap, rejected);
+        }
         ImGui::Checkbox("Player Collision Volumes", &g_showCollisionDebug);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(

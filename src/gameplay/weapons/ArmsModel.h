@@ -286,6 +286,10 @@ public:
                 primitive.meshletTriangleBuffer ? primitive.meshletTriangleBuffer->GetGPUVirtualAddress() : 0;
             if (g_meshShader.CanDraw(primitive.meshletCount, descAddress,
                                      boundsAddress, vertexIndexAddress, triangleAddress)) {
+                // Material setup can switch the shared root signature between
+                // legacy tables and bindless indices. Match the mesh PSO to it
+                // for every primitive instead of inheriting the last scene mesh.
+                g_meshShader.SetBindlessActive(shader.BindlessDrawActive());
                 g_meshShader.Draw(primitive.vbv,
                     static_cast<UINT>(primitive.vertices.size() / 12),
                     primitive.indexCount, primitive.meshletCount,
