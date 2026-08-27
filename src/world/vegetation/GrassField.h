@@ -128,11 +128,17 @@ public:
     // Scatter blades across a square of terrain centred on the origin.
     // `sampler` returns terrain height at (x, z); `waterY` is the sea level that
     // blades must stay above.
+    // `blocked`, when set, rejects a tuft the rectangle list cannot describe --
+    // a prefab whose real collision is a triangle mesh. Its bounds box covers
+    // the whole footprint including the open ground inside it, so excluding by
+    // box strips grass from an entire apron; this asks the mesh itself instead.
+    // Called per tuft centre during the build only, never per frame.
     void Initialize(std::function<float(float, float)> sampler,
                     float span = 90.0f, int count = 12000, float waterY = 0.0f,
                     const std::vector<Exclusion>& exclusions = {},
                     const std::vector<AuthoredPatch>& authoredPatches = {},
-                    bool showAuthoredPaths = false) {
+                    bool showAuthoredPaths = false,
+                    std::function<bool(float, float)> blocked = {}) {
         Shutdown();
         if (!sampler) return;
         m_terrain = std::move(sampler);
@@ -140,6 +146,7 @@ public:
         m_exclusions = exclusions;
         m_authoredPatches = authoredPatches;
         m_showAuthoredPaths = showAuthoredPaths;
+        m_blocked = std::move(blocked);
 
         BuildBlades(span, count);
         if (m_blades.empty()) return;
@@ -658,7 +665,17 @@ private:
         ApplyPaintedWeights(x, z, grass, dirt, sand, rock);
 
         const float nonGrass = (std::max)({ dirt, sand, rock });
-        return grass > nonGrass ? std::clamp(grass, 0.0f, 1.0f) : 0.0f;
+        if (grass <= nonGrass) return 0.0f;
+        // Where grass is the material, plant it fully. The raw weight is a
+        // blend fraction against the layers it beat, so ground the terrain
+        // draws as solid grass still returned ~0.9 and threw away a tenth of
+        // its tufts for nothing -- and near a boundary, far more. Remapping the
+        // winning margin to full density keeps the material edges exactly where
+        // the terrain shader puts them (a tuft that loses still returns 0) while
+        // making the interior actually dense. The 1.6x gain reaches full density
+        // a little inside the boundary rather than only at a pure 1.0 weight,
+        // which is what leaves a soft fringe instead of a hard mown line.
+        return std::clamp((grass - nonGrass) * 1.6f + grass * 0.35f, 0.0f, 1.0f);
     }
 
     // Can a tuft grow here? Rejects the sea, the wet sand at the waterline, and
@@ -666,6 +683,7 @@ private:
     // same sampler the terrain is drawn from, so the test matches what you see).
     bool Plantable(float x, float z) const {
         if (Excluded(x, z)) return false;
+        if (m_blocked && m_blocked(x, z)) return false;
         const float y = m_terrain(x, z);
         if (y < m_waterY + kShoreMargin) return false;
 
@@ -1011,6 +1029,7 @@ private:
     static constexpr float kCellSize      = 8.0f;
 
     std::function<float(float, float)> m_terrain;
+    std::function<bool(float, float)> m_blocked;
     std::vector<Exclusion> m_exclusions;
     std::vector<RuntimeExclusion> m_runtimeExclusions;
     std::vector<AuthoredPatch> m_authoredPatches;

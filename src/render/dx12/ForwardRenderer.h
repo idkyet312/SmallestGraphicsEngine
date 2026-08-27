@@ -1714,34 +1714,12 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
         g_dxrDDGICellCount, g_dxrDDGIIndexCount,
         g_spotShadowAtlasResource);
 
-    if (g_grass.IsInitialized()) {
-        // The deployment overview orbits the whole island from far outside it:
-        // on a 1.38-scaled map the camera sits ~157 m from the centre and ~278 m
-        // from the far shore, while grass draws to 60 m. Every cell failed the
-        // cull, so the overview showed bare terrain no matter what was planted.
-        //
-        // Raised for the duration of this submit and put back immediately after,
-        // so the gameplay draw distance (and the UI slider that owns it) is
-        // untouched. The cell cull and the shader's distance fade both read this
-        // one value, so setting it here covers both.
-        const float authoredGrassDistance = g_grass.DrawDistance();
-        const bool deploymentGrass = DeploymentPlanningActive();
-        if (deploymentGrass) {
-            const float maxScale = (std::max)(scene.terrainIslandScaleX,
-                                              scene.terrainIslandScaleZ);
-            // Island half-span plus the camera's own standoff, so the far shore
-            // is inside the radius rather than exactly on it. Measured from the
-            // camera rather than assumed: scroll zoom pulls the overview back to
-            // 2.2x, which at a fixed radius put the far shore outside it again
-            // and faded the grass out exactly where this override exists to
-            // keep it.
-            const float eyeDistance = std::sqrt(
-                scene.camera.Position.x * scene.camera.Position.x +
-                scene.camera.Position.y * scene.camera.Position.y +
-                scene.camera.Position.z * scene.camera.Position.z);
-            g_grass.DrawDistance() =
-                eyeDistance + 88.0f * maxScale + 40.0f;
-        }
+    // The deployment overview does not draw grass at all. It orbits the whole
+    // island from far outside it, so covering that view means a draw distance
+    // of a few hundred metres -- every cell in the field submitted, for blades
+    // a couple of pixels tall that only muddy the terrain the planner is there
+    // to read. The map is clearer, and much cheaper, without them.
+    if (g_grass.IsInitialized() && !DeploymentPlanningActive()) {
         g_grass.SetViewer(scene.camera.Position);
         static std::vector<GrassField::DrawRange> grassRanges;
         g_grass.GetVisible(grassRanges);
@@ -1777,10 +1755,6 @@ inline void RenderGrassForward(Scene& scene, ShaderDX12& shader,
             }
             shader.NextDrawCall();
         }
-        // Hand the authored distance back before anything else reads it --
-        // the dandelion cull below sizes itself from g_grass.DrawDistance().
-        if (deploymentGrass)
-            g_grass.DrawDistance() = authoredGrassDistance;
     }
 
     // Palm crowns are alpha-cut foliage too. Draw them into this same 4x HDR
@@ -2179,7 +2153,10 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Dandelion cards use the regular lit foliage material, but share one model and
     // one mesh-shader dispatch. CPU work is limited to cheap distance/frustum
     // tests; no draw call is emitted per plant when mesh shaders are enabled.
-    if (!g_emptyLevelMode && g_dandelionModel && !g_dandelionInstances.empty()) {
+    // Skipped on the deployment overview alongside the grass they grow in --
+    // flowers standing on ground with no blades under them read as litter.
+    if (!g_emptyLevelMode && g_dandelionModel && !g_dandelionInstances.empty() &&
+        !DeploymentPlanningActive()) {
         ProfilerDX12::Scope dandelionScope(
             g_profiler, "FE/Dandelions", g_dx12.commandList.Get());
         XMFLOAT4 dandelionFrustum[6];

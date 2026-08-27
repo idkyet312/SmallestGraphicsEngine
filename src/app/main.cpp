@@ -1706,6 +1706,10 @@ static bool g_deploymentDebugHideAtmosphere = false;
 static bool g_deploymentDebugForceForward = false;
 static bool g_deploymentDebugWaterDepth = false;
 static bool g_deploymentDebugCoverageGuides = false;
+// Skips the GTAO + contact shadow pass while planning. AO darkens creases and
+// the lee of every prop, which is exactly where a drop-off marker sits on a
+// map read from above -- turning it off makes the terrain shape itself legible.
+static bool g_deploymentDebugHideAO = false;
 
 static void CancelDeploymentPlanning() {
     g_insertionChoicePending = false;
@@ -10058,11 +10062,17 @@ static void RebuildScalableEnvironment() {
                 // Navigation obstacles are axis-aligned rectangles, so a
                 // mesh-collision prefab still contributes its bounds box here
                 // and this loop does not filter g_meshCollisionEntities.
-                // Consequence for the airport: enemies will not path inside it
-                // and grass is excluded across its whole footprint. Turning the
-                // triangle mesh into walkable navmesh needs rectangle
-                // decomposition, which is deferred follow-up work -- this is
-                // the behaviour that already shipped, not a regression.
+                // Consequence for the airport: enemies will not path inside it.
+                // Turning the triangle mesh into walkable navmesh needs
+                // rectangle decomposition, which is deferred follow-up work --
+                // this is the behaviour that already shipped, not a regression.
+                //
+                // Grass no longer follows that box. The airport's bounds span
+                // the whole apron, so excluding by box stripped grass from
+                // every metre of open ground inside it; the triangle mesh is
+                // asked directly instead, below.
+                const bool meshCollision =
+                    g_meshCollisionEntities.count(entity.id) > 0;
                 for (const PrefabCollider& collider : g_prefabColliders) {
                     if (collider.entityId != entity.id) continue;
                     const float c = std::abs(std::cos(collider.yawRadians));
@@ -10074,6 +10084,7 @@ static void RebuildScalableEnvironment() {
                     obstacles.push_back({ collider.center.x - halfX,
                         collider.center.z - halfZ, collider.center.x + halfX,
                         collider.center.z + halfZ });
+                    if (meshCollision) continue;
                     grassExclusions.push_back({ collider.center.x - halfX,
                         collider.center.z - halfZ, collider.center.x + halfX,
                         collider.center.z + halfZ });
@@ -10162,7 +10173,22 @@ static void RebuildScalableEnvironment() {
     // Square span covering the LONGER axis, since BuildBlades scatters a square
     // and the per-tuft material test rejects whatever falls off the island.
     float grassSpan = g_stressTestMode ? 200.0f : 100.0f;
-    int grassCount = g_stressTestMode ? 1600000 : 400000;
+    // 2.4M, tripled from 800k (itself doubled from the original 400k). The
+    // material gate was never what thinned the field: measured over a 100 m
+    // island, grass is the dominant layer on 88% of the land above the
+    // waterline, and since GrassTerrainDensity was remapped to saturate the
+    // interior, essentially every tuft there survives it. The gaps were always
+    // the blade budget. Coverage by budget, at 8 blades per 0.18 m tuft:
+    //
+    //   400k  ->  4.0 tufts/m2, 0.50 m apart,  40% of the ground
+    //   800k  ->  8.8 tufts/m2, 0.34 m apart,  90%
+    //   2.4M  -> 26.4 tufts/m2, 0.19 m apart, 269%
+    //
+    // Past 100% the tufts overlap, which is the point: overlap is what makes a
+    // field read as continuous turf rather than as separate clumps with ground
+    // visible between them. It costs ~110 MB of instance buffer at 48 bytes a
+    // blade, up from ~37 MB.
+    int grassCount = g_stressTestMode ? 1600000 : 2400000;
     if (!g_stressTestMode) {
         const LevelDefinition& spanLevel = g_game.world.Level();
         constexpr float kShoreOuter = 88.0f;
@@ -10172,16 +10198,49 @@ static void RebuildScalableEnvironment() {
             // Hold tuft density roughly constant as the area grows, so a long
             // island is not covered by the same budget stretched thin. Capped
             // so a very large authored island cannot blow up the vertex count.
+            //
+            // The cap scales with the tripled base, preserving the four-times
+            // headroom the original 400k/1.6M pair had. Memory is the only
+            // thing it trades, and the instance buffer is cheap per blade:
+            // 9.6M blades is ~440 MB resident, which a modern GPU carries
+            // without complaint.
+            //
+            // Note the cap governs MEMORY, not draw cost -- those are separate.
+            // The cell cull skips draw calls beyond DrawDistance (60 m), but
+            // every blade stays resident in the one static instance buffer
+            // whether it is submitted or not. On a default 100 m island the
+            // 60 m disc covers the whole field, so nothing is culled at all;
+            // culling only starts paying on larger maps (about 19% of a
+            // scale-1.38 island is inside the disc at any moment).
             const float areaRatio = (islandSpan * islandSpan) /
                                     (grassSpan * grassSpan);
             grassCount = static_cast<int>((std::min)(
-                static_cast<float>(grassCount) * areaRatio, 1600000.0f));
+                static_cast<float>(grassCount) * areaRatio, 9600000.0f));
             grassSpan = islandSpan;
         }
     }
+    // Mesh-collision prefabs are rejected by their triangles rather than their
+    // bounds box (see the exclusion loop above). A short vertical ray at the
+    // tuft centre answers the only question that matters: is there prefab
+    // geometry -- tarmac, a hangar floor, a wall -- at this spot. Concrete gets
+    // no grass; the open ground beside it does. The span is deliberately small
+    // either side of the terrain height so a roof twenty metres up does not
+    // shadow the ground beneath it.
+    auto meshBlocked = [&terrainSampler](float x, float z) {
+        if (g_prefabMeshColliders.empty()) return false;
+        const float y = terrainSampler(x, z);
+        const XMFLOAT3 start{ x, y + 1.6f, z };
+        const XMFLOAT3 end{ x, y - 0.6f, z };
+        CollisionMeshRayHit hit;
+        for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
+            if (CollisionMeshInstanceRaycast(instance, start, end, 0.0f, hit))
+                return true;
+        }
+        return false;
+    };
     g_grass.Initialize(terrainSampler, grassSpan, grassCount,
         0.0f, grassExclusions, grassPatches,
-        !g_customLevelMode);
+        !g_customLevelMode, meshBlocked);
     ScatterDandelions(terrainSampler, grassExclusions);
     g_environmentInitialized = true;
     g_environmentStressMode = g_stressTestMode;
@@ -11500,12 +11559,20 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         }
         ImGui::Checkbox("Show terrain coverage guides",
                         &g_deploymentDebugCoverageGuides);
+        ImGui::Checkbox("Hide ambient occlusion",
+                        &g_deploymentDebugHideAO);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Skips GTAO and contact shadows while planning.\n"
+                "Flattens the shading so terrain shape and zone markers\n"
+                "read clearly from above. Gameplay AO is untouched.");
         if (ImGui::Button("Reset diagnostics")) {
             g_deploymentDebugHideWater = false;
             g_deploymentDebugHideAtmosphere = false;
             g_deploymentDebugForceForward = false;
             g_deploymentDebugWaterDepth = false;
             g_deploymentDebugCoverageGuides = false;
+            g_deploymentDebugHideAO = false;
         }
 
         const TerrainRendererDX12::Params diagnosticTerrain =
@@ -19613,8 +19680,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             msaa.ResolveToBackBuffer();
         }
 
+        // Suppressed at draw time rather than by clearing
+        // scene.enableAmbientOcclusion, so the planning screen never writes a
+        // diagnostic into a setting gameplay reads back.
+        const bool deploymentHideAO =
+            DeploymentPlanningActive() && g_deploymentDebugHideAO;
         if (renderedScene && scene.enableAmbientOcclusion &&
-            screenSpaceAO.initialized) {
+            !deploymentHideAO && screenSpaceAO.initialized) {
             ProfilerDX12::Scope profile(
                 g_profiler, "GTAO + Contact Shadows", g_dx12.commandList.Get());
             ID3D12Resource* aoDepth = msaaActive
