@@ -214,6 +214,15 @@ int main() {
             CHECK(tower->targetSize > 0.0f);
             CHECK(std::filesystem::exists(tower->modelPath));
         }
+
+        const PrefabAsset* fuelSilo = shipped.Find("props/fuel_silo");
+        CHECK(fuelSilo != nullptr);
+        if (fuelSilo) {
+            CHECK(fuelSilo->error.empty());
+            CHECK(fuelSilo->collision == "mesh");
+            CHECK(fuelSilo->targetSize == 0.0f);
+            CHECK(std::filesystem::exists(fuelSilo->modelPath));
+        }
     }
 
     std::error_code ignored;
