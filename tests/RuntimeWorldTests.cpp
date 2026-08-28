@@ -1,5 +1,6 @@
 #include "RuntimeWorld.h"
 
+#include <cmath>
 #include <iostream>
 
 static int failures = 0;
@@ -60,6 +61,62 @@ int main() {
     CHECK(world.Prefabs().renderBatches.size() == 1);
     world.Prefabs().ClearDerived();
     CHECK(world.Prefabs().renderBatches.empty());
+
+    PrefabRuntimeState transformed;
+    PrefabRenderBatch batch;
+    batch.entityIds = { 17, 17 };
+    batch.baseTransforms = {
+        DirectX::XMMatrixTranslation(10.0f, 0.0f, 0.0f),
+        DirectX::XMMatrixTranslation(12.0f, 0.0f, 0.0f)
+    };
+    batch.transforms = batch.baseTransforms;
+    transformed.renderBatches.push_back(std::move(batch));
+    transformed.colliders.push_back(
+        { 17, "nested", { 12.0f, 1.0f, 0.0f }, { 2.0f, 1.0f, 3.0f }, 0.0f });
+    transformed.lights.push_back(
+        { 17, { 12.0f, 3.0f, 0.0f }, { 1.0f, 1.0f, 1.0f }, 2.0f, 8.0f });
+    transformed.audioEmitters.push_back(
+        { 17, { 11.0f, 0.0f, 0.0f }, "test.wav", true, 10.0f });
+    transformed.spawnPoints.push_back(
+        { 17, { 13.0f, 0.0f, 0.0f }, 0.0f, "bandit", 1 });
+    transformed.destructibles.push_back(
+        { 17, { 14.0f, 0.0f, 0.0f }, 100.0f });
+    const PrefabTransformUpdateResult moved = ApplyPrefabEntityTransformDelta(
+        transformed, 17, DirectX::XMMatrixTranslation(10.0f, 0.0f, 0.0f));
+    DirectX::XMFLOAT4X4 rootMatrix;
+    DirectX::XMFLOAT4X4 childMatrix;
+    DirectX::XMStoreFloat4x4(
+        &rootMatrix, transformed.renderBatches[0].baseTransforms[0]);
+    DirectX::XMStoreFloat4x4(
+        &childMatrix, transformed.renderBatches[0].baseTransforms[1]);
+    CHECK(std::abs(rootMatrix._41 - 20.0f) < 1e-5f);
+    CHECK(std::abs(childMatrix._41 - 22.0f) < 1e-5f);
+    CHECK(std::abs((childMatrix._41 - rootMatrix._41) - 2.0f) < 1e-5f);
+    CHECK(std::abs(transformed.colliders[0].center.x - 22.0f) < 1e-5f);
+    CHECK(std::abs(transformed.lights[0].position.x - 22.0f) < 1e-5f);
+    CHECK(std::abs(transformed.audioEmitters[0].position.x - 21.0f) < 1e-5f);
+    CHECK(std::abs(transformed.spawnPoints[0].position.x - 23.0f) < 1e-5f);
+    CHECK(std::abs(transformed.destructibles[0].position.x - 24.0f) < 1e-5f);
+    CHECK(moved.renderInstances == 2);
+    CHECK(moved.colliders == 1);
+    CHECK(moved.lights == 1);
+
+    PrefabRuntimeState visualOnly;
+    visualOnly.renderBatches = transformed.renderBatches;
+    visualOnly.colliders.push_back(
+        { 29, "preview", { 4.0f, 0.0f, 0.0f }, { 1.0f, 1.0f, 1.0f }, 0.0f });
+    visualOnly.lights.push_back(
+        { 29, { 4.0f, 2.0f, 0.0f }, { 1.0f, 1.0f, 1.0f }, 1.0f, 4.0f });
+    visualOnly.renderBatches[0].entityIds[0] = 29;
+    const PrefabTransformUpdateResult previewMoved =
+        ApplyPrefabEntityTransformDelta(visualOnly, 29,
+            DirectX::XMMatrixTranslation(3.0f, 0.0f, 0.0f),
+            PrefabTransformUpdateScope::VisualsOnly);
+    CHECK(previewMoved.renderInstances == 1);
+    CHECK(previewMoved.lights == 1);
+    CHECK(previewMoved.colliders == 0);
+    CHECK(std::abs(visualOnly.lights[0].position.x - 7.0f) < 1e-5f);
+    CHECK(std::abs(visualOnly.colliders[0].center.x - 4.0f) < 1e-5f);
 
     world.ReplaceLevel(MakeLevelOneTemplate(), RuntimeTerrainSource::Empty);
     CHECK(world.TerrainSculpt().empty());

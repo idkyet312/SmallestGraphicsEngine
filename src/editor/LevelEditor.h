@@ -20,6 +20,7 @@ class Camera;
 
 struct LevelEditorActions {
     bool levelChanged = false;
+    bool fullReconcile = false;
     bool beginPlay = false;
     bool stopPlay = false;
     bool returnToMenu = false;
@@ -45,11 +46,11 @@ public:
     void StopPlay();
     bool IsPlaying() const { return playing_; }
     // True while the user is mid-edit (dragging the gizmo, painting foliage, or
-    // sculpting terrain). The runtime sync (asset refresh + prefab reload + GPU
-    // rebuild) is heavy and must not run every drag frame - it lags and races
-    // GPU work. Callers defer the heavy sync until interaction settles.
+    // sculpting terrain). Edit-time synchronization is visual-only; gameplay
+    // state is reconciled at explicit Save/Play boundaries.
     bool IsInteracting() const {
-        return gizmoWasUsing_ || foliageStrokeActive_ || terrainStrokeActive_;
+        return gizmoWasUsing_ || inspectorEditing_ || foliageStrokeActive_ ||
+               terrainStrokeActive_;
     }
     bool ImportInProgress() const { return pendingImport_.valid(); }
     void OpenAssetBrowser() { assetBrowserOpen_ = true; }
@@ -62,12 +63,29 @@ public:
     void RefreshAssets();
     const LevelDefinition& Level() const { return level_; }
     LevelDefinition& Level() { return level_; }
-    void MarkRuntimeSynchronized() { runtimeDirty_ = false; }
+    void MarkRuntimeSynchronized() {
+        runtimeDirty_ = false;
+        transformRuntimeDirty_ = false;
+        transformRuntimeEntityId_ = 0;
+    }
     bool RuntimeDirty() const { return runtimeDirty_; }
+    bool TransformRuntimeDirty() const { return transformRuntimeDirty_; }
+    uint64_t TransformRuntimeEntityId() const {
+        return transformRuntimeEntityId_;
+    }
     bool FoliageRuntimeDirty() const { return foliageRuntimeDirty_; }
     void MarkFoliageRuntimeSynchronized() { foliageRuntimeDirty_ = false; }
     bool TerrainRuntimeDirty() const { return terrainRuntimeDirty_; }
     void MarkTerrainRuntimeSynchronized() { terrainRuntimeDirty_ = false; }
+    // Latched derived-state dirtiness for the next Save/Play reconciliation.
+    // Wider than FoliageRuntimeDirty(): navmesh and grass also consume houses,
+    // humvees, rocks, prefab colliders and terrain.
+    bool EnvironmentRuntimeDirty() const { return environmentRuntimeDirty_; }
+    void MarkEnvironmentRuntimeSynchronized() {
+        environmentRuntimeDirty_ = false;
+        foliageRuntimeDirty_ = false;
+        terrainRuntimeDirty_ = false;
+    }
     bool DXRDDGIRuntimeDirty() const { return dxrDDGIRuntimeDirty_; }
     bool DXRDDGILayoutDirty() const { return dxrDDGILayoutDirty_; }
     void MarkDXRDDGIRuntimeSynchronized() {
@@ -117,8 +135,11 @@ private:
     bool BrowseSaveAs();
     bool BrowseImportModel();
     void RefreshLevelFiles();
-    void MarkChanged(const LevelDefinition& before);
-    void TrackItemEdit(const LevelDefinition& before, bool changed);
+    void MarkChanged(const LevelDefinition& before,
+                     uint64_t transformEntityId = 0);
+    void TrackItemEdit(const LevelDefinition& before, bool changed,
+                       uint64_t transformEntityId = 0);
+    void MarkTransformRuntimeDirty(uint64_t entityId);
     void PaintFoliage(DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
         const std::function<float(float, float)>& terrainHeight);
     bool TerrainPointUnderMouse(DirectX::CXMMATRIX view,
@@ -127,6 +148,7 @@ private:
         DirectX::XMFLOAT3& point) const;
     bool FoliageChanged(const LevelDefinition& before) const;
     bool TerrainChanged(const LevelDefinition& before) const;
+    bool EnvironmentChanged(const LevelDefinition& before) const;
     void SculptTerrain(DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
         const std::function<float(float, float)>& terrainHeight);
     // Terrain tool 5: paint layer weights into the level's splatmap. Shares the
@@ -153,8 +175,11 @@ private:
     bool playing_ = false;
     bool dirty_ = false;
     bool runtimeDirty_ = true;
+    bool transformRuntimeDirty_ = false;
+    uint64_t transformRuntimeEntityId_ = 0;
     bool foliageRuntimeDirty_ = true;
     bool terrainRuntimeDirty_ = true;
+    bool environmentRuntimeDirty_ = true;
     bool dxrDDGIRuntimeDirty_ = true;
     bool dxrDDGILayoutDirty_ = true;
     LevelDXRDDGIStatus dxrDDGIStatus_;

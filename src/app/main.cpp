@@ -706,6 +706,9 @@ bool                        g_terrainDeformedThisFrame = false;
 // style). Persists across frames; clamped to a sane range.
 static float                g_editorCameraSpeed = 1.0f;
 static bool                 g_pendingEnvironmentRebuild = false;
+static bool                 g_editorVisualPrefabRefreshRequested = false;
+static bool                 g_editorFullReconcileRequested = false;
+static bool                 g_editorFullReconcileInFlight = false;
 static std::string          g_activeCustomLevelName;
 static std::string          g_mainMenuLevelStatus;
 static XMFLOAT3&            g_primaryHumveeSpawn = g_game.vehicles.primaryHumveeSpawn;
@@ -723,6 +726,9 @@ struct HumveeGameplayState {
 };
 static std::vector<HumveeGameplayState> g_humveeGameplay;
 static std::shared_ptr<SceneNode> g_houseTemplate;
+static std::shared_ptr<SceneNode> g_editorWoodHousePreviewModel;
+static std::shared_ptr<SceneNode> g_editorMetalHousePreviewModel;
+static bool g_editorPreviousDestructionEnabled = true;
 
 static constexpr size_t kEnemiesPerSpawner = 2;
 struct CompoundCenter { float x, z; };
@@ -1194,7 +1200,10 @@ XMMATRIX HumveeWorldMatrix(size_t index) {
                         g_humveeModelScale) *
         XMMatrixRotationY(-XM_PIDIV2);
     XMFLOAT4X4 physicsPose;
-    if (g_destruction.GetVehicleTransform(index, physicsPose)) {
+    const bool authoring =
+        g_game.session.Screen() == GameScreen::LevelEditor &&
+        !g_levelEditor.IsPlaying();
+    if (!authoring && g_destruction.GetVehicleTransform(index, physicsPose)) {
         // Model floor sits 0.95 m below chassis center.
         return model * XMMatrixTranslation(0.0f, -0.95f, 0.0f) *
                XMLoadFloat4x4(&physicsPose);
@@ -3065,7 +3074,19 @@ static void UpdateHelicopter(float dt) {
             XMQuaternionRotationAxis(XMVectorSet(1, 0, 0, 0),
                                      g_helicopterTailRotorAngle));
     if (g_helicopterDead) {
-        if (g_helicopterCrashed) return;
+        if (g_helicopterCrashed) {
+            // Flush the hierarchy before leaving. The rotor rotations above are
+            // written unconditionally, so returning straight out left those
+            // node locals newer than the global transforms built from them.
+            // The wreck's rotors are stopped, which is why this never produced
+            // a visible artefact, but the two were drifting apart every frame
+            // and anything that later read the globals would have got a pose
+            // the locals no longer described.
+            XMFLOAT4X4 restIdentity;
+            XMStoreFloat4x4(&restIdentity, XMMatrixIdentity());
+            g_helicopterModel->UpdateGlobalTransform(restIdentity);
+            return;
+        }
         g_helicopterCrashVelocity.y -= 9.81f * dt;
         g_helicopterPosition.x += g_helicopterCrashVelocity.x * dt;
         g_helicopterPosition.y += g_helicopterCrashVelocity.y * dt;
@@ -6256,6 +6277,9 @@ static bool RebuildDXRDDGIProbeLayout(bool force) {
     scene.giMaxDistance = g_game.world.Level().dxrDDGI.maxRayDistance;
     if (!g_game.world.Level().dxrDDGI.enabled) return false;
     if (!force && !g_dxrDDGI.LayoutDirty()) return true;
+    // Placed after the early-outs so the scope only covers a real rebuild; the
+    // no-op calls that return above would otherwise flood the sample with 0 ms.
+    ProfilerDX12::CpuScope probeLayoutProfile(g_profiler, "Editor/DXRProbeLayout");
     // Probe/atlas buffers may still be referenced by an older in-flight frame.
     // Drain EVERY frame slot, not just the current one: the DXR shader table
     // is persistently mapped and rewritten by the scene build below, so any
@@ -8329,7 +8353,224 @@ static std::shared_ptr<SceneNode> CloneSceneNodeShallow(
 // collide with a real (small, sequential) level entity id.
 static constexpr uint64_t kAATurretEntityId = 0x4141545552524554ull;
 
+static void RebuildRuntimePrefabLights() {
+    scene.RebuildDemoLights();
+    if (g_ddgiCornellTestMode) {
+        scene.clusteredRenderer.clearLights();
+        scene.clusteredRenderer.addLight(
+            g_ddgiCornellLightPosition, g_ddgiCornellLightColor,
+            g_ddgiCornellLightRadius, g_ddgiCornellLightIntensity);
+    }
+    for (const PrefabLightInstance& light : g_prefabLightInstances)
+        scene.clusteredRenderer.addLight(light.position, light.color,
+                                         light.radius, light.intensity);
+}
+
+// Recompile only the prefab draw list from models already retained by the
+// cache. Gameplay components deliberately remain untouched until Save/Play.
+// Loading a model is postponed to BeginFrame, where upload commands can be
+// recorded without idling or replacing resources referenced by older frames.
+static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
+    if (!IsEditorEditing()) return;
+
+    std::vector<PrefabRenderBatch> visualBatches;
+    std::vector<PrefabLightInstance> visualLights;
+    for (const PrefabRenderBatch& batch : g_prefabRenderBatches) {
+        if (batch.prefabId.rfind("__", 0) == 0 &&
+            batch.prefabId.rfind("__editor_", 0) != 0)
+            visualBatches.push_back(batch);
+    }
+    std::unordered_map<std::string, size_t> batches;
+    bool missingModel = false;
+
+    const auto addInstance = [&](const auto& self, const std::string& prefabId,
+                                 const XMMATRIX& world, uint64_t entityId,
+                                 const nlohmann::json& overrides,
+                                 unsigned depth) -> void {
+        if (depth > 16) return;
+        const PrefabAsset* prefab = g_prefabRegistry.Find(prefabId);
+        if (!prefab) return;
+        PrefabModelCacheEntry* cachedModel = nullptr;
+        const auto cached = g_prefabModelCache.find(prefab->id);
+        if (cached != g_prefabModelCache.end())
+            cachedModel = &cached->second;
+        else if (loadMissingModels)
+            cachedModel = LoadPrefabModel(*prefab);
+        if (!cachedModel) {
+            missingModel = true;
+            return;
+        }
+
+        const nlohmann::json components = MergePrefabComponents(
+            prefab->components, overrides);
+        const bool castShadow = components.contains("staticMesh")
+            ? components.at("staticMesh").value("castShadow", prefab->castShadow)
+            : prefab->castShadow;
+        const bool drawnByRuntimeSystem =
+            components.contains("aaTurret") ||
+            (prefabId == kCommTowerPrefabId && scene.useDestruction &&
+             g_destruction.IsInitialized());
+        if (!drawnByRuntimeSystem) {
+            const std::string key = prefabId +
+                (castShadow ? "#shadow" : "#noshadow");
+            size_t batchIndex = 0;
+            const auto found = batches.find(key);
+            if (found == batches.end()) {
+                batchIndex = visualBatches.size();
+                batches.emplace(key, batchIndex);
+                PrefabRenderBatch batch;
+                batch.prefabId = prefabId;
+                batch.model = cachedModel->model;
+                batch.baseModel = cachedModel->model;
+                batch.castShadow = castShadow;
+                for (size_t lodIndex = 0; lodIndex < prefab->lods.size(); ++lodIndex) {
+                    const std::string lodId = prefab->id + "#lod" +
+                        std::to_string(lodIndex);
+                    auto lodCached = g_prefabModelCache.find(lodId);
+                    if (lodCached == g_prefabModelCache.end() && loadMissingModels) {
+                        PrefabAsset lodPrefab = *prefab;
+                        lodPrefab.id = lodId;
+                        lodPrefab.modelPath = prefab->lods[lodIndex].path;
+                        lodPrefab.modelGuid = prefab->lods[lodIndex].assetGuid;
+                        lodPrefab.lods.clear();
+                        LoadPrefabModel(lodPrefab);
+                        lodCached = g_prefabModelCache.find(lodId);
+                    }
+                    if (lodCached != g_prefabModelCache.end())
+                        batch.lods.push_back({ prefab->lods[lodIndex].distance,
+                                               lodCached->second.model });
+                }
+                visualBatches.push_back(std::move(batch));
+            } else {
+                batchIndex = found->second;
+            }
+            PrefabRenderBatch& batch = visualBatches[batchIndex];
+            batch.baseTransforms.push_back(world);
+            batch.transforms.push_back(world);
+            batch.entityIds.push_back(entityId);
+        }
+
+        XMFLOAT3 origin;
+        XMStoreFloat3(&origin,
+            XMVector3TransformCoord(XMVectorZero(), world));
+        if (components.contains("light")) {
+            const auto& light = components.at("light");
+            const auto color = light.value(
+                "color", std::vector<float>{ 1.0f, 1.0f, 1.0f });
+            if (color.size() == 3) {
+                visualLights.push_back({ entityId, origin,
+                    { color[0], color[1], color[2] },
+                    light.value("intensity", 1.0f),
+                    light.value("radius", 5.0f) });
+            }
+        }
+
+        for (const PrefabChildAsset& child : prefab->children) {
+            const XMMATRIX childLocal = XMMatrixScaling(
+                child.scale[0], child.scale[1], child.scale[2]) *
+                XMMatrixRotationRollPitchYaw(
+                    XMConvertToRadians(child.rotation[0]),
+                    XMConvertToRadians(child.rotation[1]),
+                    XMConvertToRadians(child.rotation[2])) *
+                XMMatrixTranslation(child.position[0], child.position[1],
+                                    child.position[2]);
+            self(self, child.prefabId, childLocal * world, entityId,
+                 nlohmann::json::object(), depth + 1);
+        }
+    };
+
+    if (g_houseTemplate &&
+        (!g_editorWoodHousePreviewModel || !g_editorMetalHousePreviewModel)) {
+        g_editorWoodHousePreviewModel =
+            std::make_shared<SceneNode>("EditorWoodHousePreview");
+        g_editorMetalHousePreviewModel =
+            std::make_shared<SceneNode>("EditorMetalHousePreview");
+        const auto meanX = [](const std::shared_ptr<SceneNode>& node) {
+            double sum = 0.0;
+            size_t count = 0;
+            if (node && node->mesh) {
+                for (const MeshPrimitive& primitive : node->mesh->primitives) {
+                    for (size_t vertex = 0; vertex + 11 < primitive.vertices.size();
+                         vertex += 12) {
+                        sum += primitive.vertices[vertex];
+                        ++count;
+                    }
+                }
+            }
+            return count ? static_cast<float>(sum / count) : 0.0f;
+        };
+        for (const std::shared_ptr<SceneNode>& child : g_houseTemplate->children) {
+            if (!child || !child->mesh) continue;
+            (meanX(child) < 1.0f ? g_editorWoodHousePreviewModel
+                                : g_editorMetalHousePreviewModel)
+                ->AddChild(CloneSceneNodeShallow(child));
+        }
+        XMFLOAT4X4 identity;
+        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+        g_editorWoodHousePreviewModel->UpdateGlobalTransform(identity);
+        g_editorMetalHousePreviewModel->UpdateGlobalTransform(identity);
+    }
+
+    PrefabRenderBatch woodHouses;
+    woodHouses.prefabId = "__editor_wood_house";
+    woodHouses.model = g_editorWoodHousePreviewModel;
+    woodHouses.baseModel = g_editorWoodHousePreviewModel;
+    PrefabRenderBatch metalHouses;
+    metalHouses.prefabId = "__editor_metal_house";
+    metalHouses.model = g_editorMetalHousePreviewModel;
+    metalHouses.baseModel = g_editorMetalHousePreviewModel;
+
+    for (const LevelEntity& entity : g_levelEditor.Level().entities) {
+        if (!entity.enabled) continue;
+        if (entity.type == LevelEntityType::WoodHouse ||
+            entity.type == LevelEntityType::MetalHouse) {
+            PrefabRenderBatch& batch = entity.type == LevelEntityType::WoodHouse
+                ? woodHouses : metalHouses;
+            if (!batch.model) continue;
+            const float sourceX = entity.type == LevelEntityType::WoodHouse
+                ? -3.5f : 4.75f;
+            const float sourceZ = entity.type == LevelEntityType::WoodHouse
+                ? 3.5f : 3.55f;
+            const XMMATRIX world = XMMatrixTranslation(-sourceX, 0.0f, -sourceZ) *
+                XMMatrixRotationY(XMConvertToRadians(
+                    entity.transform.rotation[1])) *
+                XMMatrixTranslation(entity.transform.position[0],
+                    entity.transform.position[1], entity.transform.position[2]);
+            batch.baseTransforms.push_back(world);
+            batch.transforms.push_back(world);
+            batch.entityIds.push_back(entity.id);
+            continue;
+        }
+        std::string prefabId;
+        if (entity.type == LevelEntityType::Prefab) prefabId = entity.prefabId;
+        else if (entity.type == LevelEntityType::Rock) prefabId = "rock";
+        else continue;
+        const Transform& transform = entity.transform;
+        const XMMATRIX world = XMMatrixScaling(
+            transform.scale[0], transform.scale[1], transform.scale[2]) *
+            XMMatrixRotationRollPitchYaw(
+                XMConvertToRadians(transform.rotation[0]),
+                XMConvertToRadians(transform.rotation[1]),
+                XMConvertToRadians(transform.rotation[2])) *
+            XMMatrixTranslation(transform.position[0], transform.position[1],
+                                transform.position[2]);
+        addInstance(addInstance, prefabId, world, entity.id, entity.overrides, 0);
+    }
+
+    if (!woodHouses.transforms.empty())
+        visualBatches.push_back(std::move(woodHouses));
+    if (!metalHouses.transforms.empty())
+        visualBatches.push_back(std::move(metalHouses));
+
+    g_prefabRenderBatches = std::move(visualBatches);
+    g_prefabLightInstances = std::move(visualLights);
+    RebuildRuntimePrefabLights();
+    g_editorVisualPrefabRefreshRequested = missingModel;
+    shadowMap.InvalidateCachedCascades();
+}
+
 static void RebuildPrefabRenderBatches() {
+    ProfilerDX12::CpuScope prefabBatchProfile(g_profiler, "Editor/PrefabBatches");
     g_game.world.Prefabs().ClearDerived();
     // Tracks the same instances ClearDerived just dropped; entity ids are reused
     // across levels, so a stale entry here would silently disable the bounds box
@@ -8607,16 +8848,7 @@ static void RebuildPrefabRenderBatches() {
             g_prefabRenderBatches.push_back(std::move(batch));
         }
     }
-    scene.RebuildDemoLights();
-    if (g_ddgiCornellTestMode) {
-        scene.clusteredRenderer.clearLights();
-        scene.clusteredRenderer.addLight(
-            g_ddgiCornellLightPosition, g_ddgiCornellLightColor,
-            g_ddgiCornellLightRadius, g_ddgiCornellLightIntensity);
-    }
-    for (const PrefabLightInstance& light : g_prefabLightInstances)
-        scene.clusteredRenderer.addLight(light.position, light.color,
-                                         light.radius, light.intensity);
+    RebuildRuntimePrefabLights();
     for (size_t emitterIndex = 0; emitterIndex < g_prefabAudioEmitters.size();
          ++emitterIndex) {
         const PrefabAudioEmitter& emitter = g_prefabAudioEmitters[emitterIndex];
@@ -8628,8 +8860,18 @@ static void RebuildPrefabRenderBatches() {
         }
     }
     g_prefabRebuildRequested = false;
+    g_editorVisualPrefabRefreshRequested = false;
     shadowMap.InvalidateCachedCascades();
-    if (g_customLevelMode) g_pendingEnvironmentRebuild = true;
+    // Editing is preview-only. A full Save/Play reconciliation latches the
+    // environment request before this compile, then consumes it only after the
+    // new prefab colliders exist.
+    if (g_customLevelMode) {
+        if (!IsEditorEditing() || g_editorFullReconcileInFlight)
+            g_pendingEnvironmentRebuild = true;
+        g_editorFullReconcileInFlight = false;
+    }
+    if (IsEditorEditing())
+        RebuildEditorPrefabVisualBatches(false);
 }
 
 static void UpdatePrefabAudio() {
@@ -9997,6 +10239,7 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
 }
 
 static void RebuildScalableEnvironment() {
+    ProfilerDX12::CpuScope environmentProfile(g_profiler, "Editor/Environment");
     auto terrainParams = CurrentTerrainParams();
     terrainParams.heightScale = scene.terrainHeightScale;
     auto terrainSampler = [terrainParams](float x, float z) {
@@ -10139,9 +10382,12 @@ static void RebuildScalableEnvironment() {
     }
     const float extent = g_customLevelMode ? 122.0f :
         (g_stressTestMode ? 122.0f : 61.0f);
-    if (!g_navigation.BuildTerrain(terrainSampler, -extent, extent,
-            -extent, extent, obstacles))
-        std::cerr << "Recast navigation build failed; Bandits use direct steering\n";
+    {
+        ProfilerDX12::CpuScope navmeshProfile(g_profiler, "Editor/Navmesh");
+        if (!g_navigation.BuildTerrain(terrainSampler, -extent, extent,
+                -extent, extent, obstacles))
+            std::cerr << "Recast navigation build failed; Bandits use direct steering\n";
+    }
 
     // Painted ground steers the scatter: paint rock or sand and grass stops
     // growing there. Must use the same world->UV frame as the resolve and the
@@ -10238,9 +10484,12 @@ static void RebuildScalableEnvironment() {
         }
         return false;
     };
-    g_grass.Initialize(terrainSampler, grassSpan, grassCount,
-        0.0f, grassExclusions, grassPatches,
-        !g_customLevelMode, meshBlocked);
+    {
+        ProfilerDX12::CpuScope grassProfile(g_profiler, "Editor/GrassScatter");
+        g_grass.Initialize(terrainSampler, grassSpan, grassCount,
+            0.0f, grassExclusions, grassPatches,
+            !g_customLevelMode, meshBlocked);
+    }
     ScatterDandelions(terrainSampler, grassExclusions);
     g_environmentInitialized = true;
     g_environmentStressMode = g_stressTestMode;
@@ -13664,11 +13913,9 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
     root->UpdateGlobalTransform(identity);
 }
 
-// Cheap per-frame sync used while the user is actively dragging in the editor.
-// Updates only entity transforms already present in the runtime level and the
-// prefab render batches - no registry refresh, no model reload, no GPU rebuild,
-// no WaitForGPU. Deliberately does NOT clear runtimeDirty_, so the full
-// SynchronizeEditorRuntime runs once when the interaction settles.
+// Cheap per-frame sync used while authoring. It updates only viewport-facing
+// transforms and lights: gameplay-derived collision, audio, spawners, physics,
+// navmesh and grass remain latched dirty until Save/Play.
 // Pushes a level's painted terrain weights to the GPU, skipping the upload when
 // nothing changed. UploadTerrainSplatMap recreates the texture and drains the
 // GPU, so calling it on every editor sync would stall a frame per sync; the
@@ -13703,63 +13950,158 @@ static void ApplyTerrainSplatMap(const LevelDefinition& level) {
         usable ? level.terrainSplatRGBA.data() : nullptr, resolution);
 }
 
-static void SynchronizeEditorRuntimeLight() {
-    if (g_game.session.Screen() != GameScreen::LevelEditor) return;
+static bool SynchronizeEditorRuntimeLight(uint64_t changedEntityId = 0) {
+    if (g_game.session.Screen() != GameScreen::LevelEditor) return false;
+    ProfilerDX12::CpuScope syncLightProfile(g_profiler, "Editor/SyncLight");
     const LevelDefinition& edited = g_levelEditor.Level();
+    const LevelDefinition& runtime = g_game.world.Level();
+    if (edited.entities.size() != runtime.entities.size()) return false;
+
+    struct TransformDelta {
+        uint64_t entityId = 0;
+        LevelEntityType type = LevelEntityType::EnemySpawn;
+        XMFLOAT4X4 matrix{};
+    };
+    std::vector<TransformDelta> deltas;
+    bool refreshLevelBasics = false;
+
+    const auto matrixFor = [](const Transform& transform) {
+        return XMMatrixScaling(transform.scale[0], transform.scale[1],
+                               transform.scale[2]) *
+            XMMatrixRotationRollPitchYaw(
+                XMConvertToRadians(transform.rotation[0]),
+                XMConvertToRadians(transform.rotation[1]),
+                XMConvertToRadians(transform.rotation[2])) *
+            XMMatrixTranslation(transform.position[0], transform.position[1],
+                                transform.position[2]);
+    };
+    const auto supportsFastTransform = [](LevelEntityType type) {
+        switch (type) {
+        case LevelEntityType::PlayerSpawn:
+        case LevelEntityType::EnemySpawn:
+        case LevelEntityType::AllySpawn:
+        case LevelEntityType::ExplosiveBarrel:
+        case LevelEntityType::Humvee:
+        case LevelEntityType::Helicopter:
+        case LevelEntityType::Rock:
+        case LevelEntityType::Prefab:
+            return true;
+        default:
+            return false;
+        }
+    };
+
+    for (size_t index = 0; index < edited.entities.size(); ++index) {
+        const LevelEntity& before = runtime.entities[index];
+        const LevelEntity& after = edited.entities[index];
+        if (before.id != after.id || before.type != after.type) return false;
+        if (before.enabled != after.enabled || before.name != after.name ||
+            before.prefabId != after.prefabId || before.overrides != after.overrides)
+            return false;
+        if (std::memcmp(&before.transform, &after.transform,
+                        sizeof(Transform)) == 0)
+            continue;
+        if (changedEntityId != 0 && after.id != changedEntityId) return false;
+        if (!supportsFastTransform(after.type)) return false;
+
+        if (after.type == LevelEntityType::Prefab ||
+            after.type == LevelEntityType::Rock) {
+            bool hasRenderInstance = false;
+            for (const PrefabRenderBatch& batch : g_prefabRenderBatches) {
+                if (std::find(batch.entityIds.begin(), batch.entityIds.end(),
+                              after.id) != batch.entityIds.end()) {
+                    hasRenderInstance = true;
+                    break;
+                }
+            }
+            // Destruction-backed comm towers and AA-turret prefabs deliberately
+            // have no ordinary batch. They still need the full compile path.
+            if (!hasRenderInstance) return false;
+        } else if (after.type == LevelEntityType::ExplosiveBarrel ||
+                   after.type == LevelEntityType::Humvee ||
+                   after.type == LevelEntityType::Helicopter) {
+            refreshLevelBasics = true;
+        }
+
+        XMVECTOR determinant;
+        const XMMATRIX inverseBefore = XMMatrixInverse(
+            &determinant, matrixFor(before.transform));
+        const float determinantValue = XMVectorGetX(determinant);
+        if (!std::isfinite(determinantValue) ||
+            std::abs(determinantValue) <= 1e-8f)
+            return false;
+        TransformDelta delta;
+        delta.entityId = after.id;
+        delta.type = after.type;
+        XMStoreFloat4x4(&delta.matrix,
+            inverseBefore * matrixFor(after.transform));
+        deltas.push_back(delta);
+    }
+
+    if (changedEntityId != 0 && deltas.empty()) {
+        // A snapped drag can settle back on its starting value. It is still a
+        // valid transform-only commit and must not fall into the heavy rebuild.
+        const auto found = std::find_if(edited.entities.begin(),
+            edited.entities.end(), [&](const LevelEntity& entity) {
+                return entity.id == changedEntityId;
+            });
+        if (found == edited.entities.end() || !supportsFastTransform(found->type))
+            return false;
+    }
+
     // Structural edits require the full synchronization path. RuntimeWorld
     // validates the whole entity shape before applying any transform.
-    if (!g_game.world.SynchronizeEditorTransforms(edited)) return;
+    if (!g_game.world.SynchronizeEditorTransforms(edited)) return false;
 
-    // Rebuild the transform list of each prefab batch in place (same instances,
-    // new matrices). entityIds were captured in build order per batch.
-    for (PrefabRenderBatch& batch : g_prefabRenderBatches) {
-        for (size_t j = 0; j < batch.entityIds.size(); ++j) {
-            const uint64_t id = batch.entityIds[j];
-            const LevelEntity* e = nullptr;
-            for (const LevelEntity& candidate : g_game.world.Level().entities)
-                if (candidate.id == id) { e = &candidate; break; }
-            if (!e) continue;
-            const Transform& t = e->transform;
-            const XMMATRIX world =
-                XMMatrixScaling(t.scale[0], t.scale[1], t.scale[2]) *
-                XMMatrixRotationRollPitchYaw(
-                    XMConvertToRadians(t.rotation[0]),
-                    XMConvertToRadians(t.rotation[1]),
-                    XMConvertToRadians(t.rotation[2])) *
-                XMMatrixTranslation(t.position[0], t.position[1], t.position[2]);
-            if (j < batch.baseTransforms.size()) batch.baseTransforms[j] = world;
-            if (j < batch.transforms.size()) batch.transforms[j] = world;
-        }
+    bool prefabLightsMoved = false;
+    for (const TransformDelta& delta : deltas) {
+        if (delta.type != LevelEntityType::Prefab &&
+            delta.type != LevelEntityType::Rock)
+            continue;
+        const PrefabTransformUpdateResult result =
+            ApplyPrefabEntityTransformDelta(g_game.world.Prefabs(),
+                delta.entityId, XMLoadFloat4x4(&delta.matrix),
+                PrefabTransformUpdateScope::VisualsOnly);
+        prefabLightsMoved |= result.lights != 0;
     }
+    if (refreshLevelBasics) ApplyRuntimeLevelBasics(false);
+    if (prefabLightsMoved) RebuildRuntimePrefabLights();
+    shadowMap.InvalidateCachedCascades();
+    return true;
+}
+
+static void SynchronizeEditorRuntimeVisual() {
+    if (g_game.session.Screen() != GameScreen::LevelEditor) return;
+    ProfilerDX12::CpuScope syncVisualProfile(g_profiler, "Editor/SyncVisual");
+    g_game.world.ReplaceFromEditor(g_levelEditor.Level());
+    g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
+    ApplyTerrainSplatMap(g_levelEditor.Level());
+    ApplyRuntimeLevelBasics(false);
+    RebuildEditorPrefabVisualBatches(false);
     shadowMap.InvalidateCachedCascades();
 }
 
 static void SynchronizeEditorRuntime(bool play) {
     if (g_game.session.Screen() != GameScreen::LevelEditor) return;
-    const bool foliageChanged = g_levelEditor.FoliageRuntimeDirty();
-    const bool terrainChanged = g_levelEditor.TerrainRuntimeDirty();
+    ProfilerDX12::CpuScope syncRuntimeProfile(g_profiler, "Editor/SyncRuntime");
+    g_editorFullReconcileInFlight = true;
+    // The prefab compile must run first because navmesh/grass consume its newly
+    // compiled colliders. RebuildPrefabRenderBatches queues the environment pass
+    // for the following frame once those derived objects are ready.
+    g_pendingEnvironmentRebuild = false;
     shadowMap.InvalidateCachedCascades();
     g_game.world.ReplaceFromEditor(g_levelEditor.Level());
     g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
     ApplyTerrainSplatMap(g_levelEditor.Level());
     g_grass.ClearRuntimeExclusions();
     g_customLevelMode = true;
-    g_assetRegistry.Refresh();
-    g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
+    {
+        ProfilerDX12::CpuScope assetRefreshProfile(g_profiler, "Editor/AssetRefresh");
+        g_assetRegistry.Refresh();
+        g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
+    }
     ApplyRuntimeLevelBasics(play);
     g_prefabRebuildRequested = true;
-    if (!play && terrainChanged && !foliageChanged) {
-        if (g_destruction.IsInitialized()) {
-            auto tp = CurrentTerrainParams();
-            tp.heightScale = scene.terrainHeightScale;
-            g_destruction.SetTerrainSampler([tp](float x, float z) {
-                return TerrainRendererDX12::HeightAt(tp, x, z);
-            }, CurrentPhysicsTerrainExtent());
-        }
-        g_levelEditor.MarkRuntimeSynchronized();
-        g_levelEditor.MarkTerrainRuntimeSynchronized();
-        return;
-    }
     if (g_houseTemplate) {
         WaitForGPU();
         wallModel = CloneSceneTree(g_houseTemplate);
@@ -13768,15 +14110,6 @@ static void SynchronizeEditorRuntime(bool play) {
             g_destruction.Initialize(wallModel, g_dx12.device.Get(), 1, 1, 1);
     }
     if (g_trees.IsInitialized()) ResetPalmTrees();
-    if ((play || foliageChanged || terrainChanged) && g_environmentInitialized) {
-        // Terrain extent/island size can change mid-session in the editor. The
-        // environment rebuild samples terrain and re-uploads GPU buffers, so the
-        // GPU must be idle first or we free/replace resources still in flight
-        // (device removed / crash). Ordinary foliage edits were safe because the
-        // extent was fixed; growing the island makes this wait necessary.
-        WaitForGPU();
-        RebuildScalableEnvironment();
-    }
     if (g_destruction.IsInitialized()) {
         auto tp = CurrentTerrainParams();
         tp.heightScale = scene.terrainHeightScale;
@@ -13786,8 +14119,6 @@ static void SynchronizeEditorRuntime(bool play) {
         InitializeLevelHumveePhysics();
     }
     g_levelEditor.MarkRuntimeSynchronized();
-    g_levelEditor.MarkFoliageRuntimeSynchronized();
-    g_levelEditor.MarkTerrainRuntimeSynchronized();
 }
 
 static void StartLevelEditor(HWND hwnd) {
@@ -13799,8 +14130,13 @@ static void StartLevelEditor(HWND hwnd) {
     CancelDeploymentPlanning();
     g_game.session.SetScreen(GameScreen::LevelEditor);
     g_customLevelMode = true;
+    g_editorPreviousDestructionEnabled = scene.useDestruction;
+    scene.useDestruction = false;
     g_game.world.ReplaceFromEditor(g_levelEditor.Level());
     g_pendingEnvironmentRebuild = false;
+    g_editorFullReconcileRequested = false;
+    g_editorFullReconcileInFlight = false;
+    g_editorVisualPrefabRefreshRequested = false;
     g_game.session.StopTimer();
     showUI = false;
     cameraLocked = true;
@@ -13814,7 +14150,9 @@ static void BeginEditorPlaytest(HWND hwnd) {
     if (g_game.session.Screen() != GameScreen::LevelEditor ||
         g_levelEditor.IsPlaying()) return;
     g_editorCameraSnapshot = scene.camera;
+    g_editorFullReconcileRequested = false;
     g_levelEditor.BeginPlay();
+    scene.useDestruction = g_editorPreviousDestructionEnabled;
     // A playtest always begins at the authored PlayerSpawn. Do not allow a
     // stale mission-planning flag to take camera ownership or block input.
     CancelDeploymentPlanning();
@@ -13837,6 +14175,7 @@ static void StopEditorPlaytest() {
     // before destroying Bandits or rebuilding editor destruction resources.
     WaitForGPU();
     g_levelEditor.StopPlay();
+    scene.useDestruction = false;
     g_heldBandit = nullptr;
     g_bandits.clear();
     g_game.world.Prefabs().ResetGameplayState();
@@ -16227,7 +16566,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         }
         if (g_game.commands.Consume(GameCommand::EditorReturnToMenu)) {
             g_customLevelMode = false;
+            g_editorFullReconcileRequested = false;
+            scene.useDestruction = g_editorPreviousDestructionEnabled;
             OpenMainMenu();
+        }
+        if (g_editorFullReconcileRequested && IsEditorEditing() &&
+            !g_game.loading.Active()) {
+            g_editorFullReconcileRequested = false;
+            SynchronizeEditorRuntime(false);
         }
         if (g_pendingEnvironmentRebuild && IsSceneScreen() &&
             !g_game.loading.Active() && g_environmentInitialized) {
@@ -16235,18 +16581,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             RebuildScalableEnvironment();
             if (g_trees.IsInitialized()) ResetPalmTrees();
             g_pendingEnvironmentRebuild = false;
+            // Consume the editor's request here rather than in the prefab
+            // rebuild: the flag has to survive until the environment has
+            // actually been rebuilt, or a latched dirty bit would re-trigger
+            // the 1.3 s rebuild on every subsequent frame.
+            g_levelEditor.MarkEnvironmentRuntimeSynchronized();
         }
         if (IsEditorEditing() && !g_game.loading.Active() &&
             g_levelEditor.RuntimeDirty()) {
-            // While the user is actively dragging/painting, do only the cheap
-            // transform sync each frame so the object follows the gizmo without
-            // lag. The heavy sync (asset refresh, prefab model reload, GPU
-            // rebuild) runs once when interaction settles - running it every
-            // drag frame lagged the editor and raced GPU work into a crash.
-            if (g_levelEditor.IsInteracting())
-                SynchronizeEditorRuntimeLight();
-            else
-                SynchronizeEditorRuntime(false);
+            // Every ordinary edit is preview-only. Save/Play are the explicit
+            // boundaries that rebuild collision, destruction, navmesh, grass,
+            // audio and spawners.
+            bool synchronized = false;
+            if (g_levelEditor.TransformRuntimeDirty()) {
+                synchronized = SynchronizeEditorRuntimeLight(
+                    g_levelEditor.TransformRuntimeEntityId());
+            }
+            if (!synchronized) SynchronizeEditorRuntimeVisual();
+            g_levelEditor.MarkRuntimeSynchronized();
         }
 
         if (IsEditorEditing() && !cameraLocked &&
@@ -17115,6 +17467,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         const bool secondaryHelicopterActive =
             scene.showHelicopter && SecondaryHelicopterPresent() &&
             !g_secondaryHelicopterDead && !g_secondaryHelicopterCrashed;
+        // SGE_HELI_TRACE=1 reports what each airframe is doing once a second.
+        // The draw gates and the transforms are in different places, so a
+        // helicopter drawn somewhere it should not be is only diagnosable by
+        // reading the state that actually feeds the matrix.
+        static bool heliTrace =
+            GetEnvironmentVariableA("SGE_HELI_TRACE", nullptr, 0) > 0;
+        if (heliTrace) {
+            static float heliTraceTimer = 0.0f;
+            heliTraceTimer += deltaTime;
+            if (heliTraceTimer >= 1.0f) {
+                heliTraceTimer = 0.0f;
+                const VehicleSystem& v = g_game.vehicles;
+                std::cout
+                    << "[heli] show=" << scene.showHelicopter
+                    << " levelScale=" << g_helicopterLevelScale
+                    << " modelScale=" << g_helicopterModelScale
+                    << "\n  primary  drawn=" << (scene.showHelicopter ? 1 : 0)
+                    << " dead=" << g_helicopterDead
+                    << " crashed=" << g_helicopterCrashed
+                    << " pos=" << g_helicopterPosition.x << ","
+                    << g_helicopterPosition.y << ","
+                    << g_helicopterPosition.z
+                    << "\n  second   drawn=" << (SecondaryHelicopterVisible() ? 1 : 0)
+                    << " present=" << (SecondaryHelicopterPresent() ? 1 : 0)
+                    << " dead=" << g_secondaryHelicopterDead
+                    << " pos=" << g_secondaryHelicopterPosition.x << ","
+                    << g_secondaryHelicopterPosition.y << ","
+                    << g_secondaryHelicopterPosition.z
+                    << "\n  blackhawk vis=" << v.blackHawkVisible
+                    << " phase=" << static_cast<int>(v.blackHawkPhase)
+                    << " route=" << v.blackHawkRouteValid
+                    << " pos=" << v.blackHawkPosition.x << ","
+                    << v.blackHawkPosition.y << ","
+                    << v.blackHawkPosition.z << "\n";
+            }
+        }
         // The insertion BlackHawk is the one that actually comes down onto the
         // island; the attack birds hold altitude. Gated on height so the
         // high-altitude run in does not drag a wash across everything under its
@@ -18431,6 +18819,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_dxrDDGI.MarkLayoutDirty();
                 RebuildDXRDDGIProbeLayout(true);
             }
+        } else if (IsEditorEditing() &&
+                   g_editorVisualPrefabRefreshRequested) {
+            RebuildEditorPrefabVisualBatches(true);
         }
         // Editor buttons are processed here, before any scene pass binds the
         // old probe atlases. Rebuilding from the late ImGui phase destroyed
@@ -20145,24 +20536,35 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 ddgiStatus.raysPerFrame, ddgiStatus.gpuMemoryBytes,
                 ddgiStatus.cacheStatus
             });
-            const LevelEditorActions actions = g_levelEditor.Render(scene.camera,
-                scene.GetViewMatrix(), scene.GetProjectionMatrix(),
-                [](float x, float z) {
-                    if (!scene.useMeshTerrain || !g_terrain.supported) return 0.0f;
-                    auto params = CurrentTerrainParams();
-                    params.heightScale = scene.terrainHeightScale;
-                    return TerrainRendererDX12::HeightAt(params, x, z);
-                }, PrefabThumbnailTexture);
+            LevelEditorActions actions;
+            {
+                ProfilerDX12::CpuScope editorUIProfile(g_profiler, "Editor/UI");
+                actions = g_levelEditor.Render(scene.camera,
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix(),
+                    [](float x, float z) {
+                        if (!scene.useMeshTerrain || !g_terrain.supported) return 0.0f;
+                        auto params = CurrentTerrainParams();
+                        params.heightScale = scene.terrainHeightScale;
+                        return TerrainRendererDX12::HeightAt(params, x, z);
+                    }, PrefabThumbnailTexture);
+            }
             g_game.commands.Set(
                 GameCommand::EditorBeginPlay, actions.beginPlay);
             g_game.commands.Set(
                 GameCommand::EditorStopPlay, actions.stopPlay);
             g_game.commands.Set(
                 GameCommand::EditorReturnToMenu, actions.returnToMenu);
+            g_editorFullReconcileRequested |= actions.fullReconcile;
             if (actions.rebuildDXRDDGI)
                 g_game.commands.Request(GameCommand::RebuildDDGI);
             if (actions.resetDXRDDGIHistory)
                 g_game.commands.Request(GameCommand::ResetDDGIHistory);
+            // The editor branch never calls RenderUI(), so the profiler window
+            // it owns was unreachable while editing -- the one screen where the
+            // per-stage editor timings actually matter. F8 toggles it here.
+            if (ImGui::IsKeyPressed(ImGuiKey_F8, false))
+                g_showProfilerWindow = !g_showProfilerWindow;
+            DrawProfilerWindow();
             DrawDXRDDGIProbeDebug(
                 scene.GetViewMatrix(), scene.GetProjectionMatrix());
             if (g_levelEditor.IsPlaying()) {

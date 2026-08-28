@@ -369,6 +369,8 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(LevelDefinitionTests
         tests/LevelDefinitionTests.cpp
+        tests/GLBImporterPixelStub.cpp
+        tests/StbImageWriteImpl.cpp
         src/level/LevelDefinition.cpp)
     target_link_libraries(LevelDefinitionTests PRIVATE
         SGEProjectHeaders nlohmann_json::nlohmann_json)
@@ -376,6 +378,8 @@ if(BUILD_TESTING)
 
     add_executable(RuntimeWorldTests
         tests/RuntimeWorldTests.cpp
+        tests/GLBImporterPixelStub.cpp
+        tests/StbImageWriteImpl.cpp
         src/level/LevelDefinition.cpp)
     target_link_libraries(RuntimeWorldTests PRIVATE
         SGEProjectHeaders nlohmann_json::nlohmann_json)
@@ -383,6 +387,8 @@ if(BUILD_TESTING)
 
     add_executable(GameArchitectureTests
         tests/GameArchitectureTests.cpp
+        tests/GLBImporterPixelStub.cpp
+        tests/StbImageWriteImpl.cpp
         src/gameplay/CombatSystem.cpp
         src/level/LevelDefinition.cpp)
     target_link_libraries(GameArchitectureTests PRIVATE

@@ -278,7 +278,9 @@ void LevelEditor::NewFromLevelOne() {
     for (const auto& entity : level_.entities) nextId_ = (std::max)(nextId_, entity.id + 1);
     undo_.clear(); redo_.clear(); currentPath_.clear();
     dirty_ = false; runtimeDirty_ = true; foliageRuntimeDirty_ = true;
+    transformRuntimeDirty_ = false; transformRuntimeEntityId_ = 0;
     terrainRuntimeDirty_ = true; dxrDDGIRuntimeDirty_ = true;
+    environmentRuntimeDirty_ = true;
     dxrDDGILayoutDirty_ = true; playing_ = false;
     status_ = "New level created from Level 1";
     RefreshLevelFiles();
@@ -295,7 +297,9 @@ void LevelEditor::NewFlat() {
         nextId_ = (std::max)(nextId_, entity.id + 1);
     undo_.clear(); redo_.clear(); currentPath_.clear();
     dirty_ = false; runtimeDirty_ = true; foliageRuntimeDirty_ = true;
+    transformRuntimeDirty_ = false; transformRuntimeEntityId_ = 0;
     terrainRuntimeDirty_ = true; dxrDDGIRuntimeDirty_ = true;
+    environmentRuntimeDirty_ = true;
     dxrDDGILayoutDirty_ = true; playing_ = false;
     status_ = "New flat level created";
     RefreshLevelFiles();
@@ -326,24 +330,57 @@ void LevelEditor::PushUndo(const LevelDefinition& before) {
     redo_.clear();
 }
 
-void LevelEditor::MarkChanged(const LevelDefinition& before) {
-    PushUndo(before);
-    dirty_ = true;
-    runtimeDirty_ = true;
-    foliageRuntimeDirty_ = foliageRuntimeDirty_ || FoliageChanged(before);
-    terrainRuntimeDirty_ = terrainRuntimeDirty_ || TerrainChanged(before);
+void LevelEditor::MarkTransformRuntimeDirty(uint64_t entityId) {
+    if (entityId == 0) return;
+    if (!runtimeDirty_) {
+        runtimeDirty_ = true;
+        transformRuntimeDirty_ = true;
+        transformRuntimeEntityId_ = entityId;
+        return;
+    }
+    if (!transformRuntimeDirty_) return;
+    if (transformRuntimeEntityId_ != entityId) {
+        transformRuntimeDirty_ = false;
+        transformRuntimeEntityId_ = 0;
+    }
 }
 
-void LevelEditor::TrackItemEdit(const LevelDefinition& before, bool changed) {
+void LevelEditor::MarkChanged(const LevelDefinition& before,
+                              uint64_t transformEntityId) {
+    PushUndo(before);
+    dirty_ = true;
+    if (transformEntityId != 0) {
+        MarkTransformRuntimeDirty(transformEntityId);
+    } else {
+        runtimeDirty_ = true;
+        transformRuntimeDirty_ = false;
+        transformRuntimeEntityId_ = 0;
+    }
+    foliageRuntimeDirty_ = foliageRuntimeDirty_ || FoliageChanged(before);
+    terrainRuntimeDirty_ = terrainRuntimeDirty_ || TerrainChanged(before);
+    environmentRuntimeDirty_ =
+        environmentRuntimeDirty_ || EnvironmentChanged(before);
+}
+
+void LevelEditor::TrackItemEdit(const LevelDefinition& before, bool changed,
+                                uint64_t transformEntityId) {
     if (ImGui::IsItemActivated()) {
         inspectorBefore_ = before;
         inspectorEditing_ = true;
     }
     if (changed) {
         dirty_ = true;
-        runtimeDirty_ = true;
+        if (transformEntityId != 0) {
+            MarkTransformRuntimeDirty(transformEntityId);
+        } else {
+            runtimeDirty_ = true;
+            transformRuntimeDirty_ = false;
+            transformRuntimeEntityId_ = 0;
+        }
         foliageRuntimeDirty_ = foliageRuntimeDirty_ || FoliageChanged(before);
         terrainRuntimeDirty_ = terrainRuntimeDirty_ || TerrainChanged(before);
+        environmentRuntimeDirty_ =
+            environmentRuntimeDirty_ || EnvironmentChanged(before);
     }
     if (ImGui::IsItemDeactivatedAfterEdit()) {
         PushUndo(inspectorEditing_ ? inspectorBefore_ : before);
@@ -359,8 +396,11 @@ void LevelEditor::Undo() {
     undo_.pop_back();
     if (!Selected() && !level_.entities.empty()) selectedId_ = level_.entities.front().id;
     dirty_ = true; runtimeDirty_ = true;
+    transformRuntimeDirty_ = false; transformRuntimeEntityId_ = 0;
     foliageRuntimeDirty_ = foliageRuntimeDirty_ || FoliageChanged(before);
     terrainRuntimeDirty_ = terrainRuntimeDirty_ || TerrainChanged(before);
+    environmentRuntimeDirty_ =
+        environmentRuntimeDirty_ || EnvironmentChanged(before);
 }
 
 void LevelEditor::Redo() {
@@ -371,8 +411,11 @@ void LevelEditor::Redo() {
     redo_.pop_back();
     if (!Selected() && !level_.entities.empty()) selectedId_ = level_.entities.front().id;
     dirty_ = true; runtimeDirty_ = true;
+    transformRuntimeDirty_ = false; transformRuntimeEntityId_ = 0;
     foliageRuntimeDirty_ = foliageRuntimeDirty_ || FoliageChanged(before);
     terrainRuntimeDirty_ = terrainRuntimeDirty_ || TerrainChanged(before);
+    environmentRuntimeDirty_ =
+        environmentRuntimeDirty_ || EnvironmentChanged(before);
 }
 
 LevelEditor::AssetFileChange LevelEditor::CaptureAssetBefore(
@@ -631,6 +674,8 @@ void LevelEditor::StopPlay() {
     level_ = playSnapshot_;
     playing_ = false;
     runtimeDirty_ = true;
+    transformRuntimeDirty_ = false;
+    transformRuntimeEntityId_ = 0;
 }
 
 void LevelEditor::OnKeyDown(unsigned key, bool controlDown) {
@@ -669,6 +714,50 @@ bool LevelEditor::FoliageChanged(const LevelDefinition& before) const {
     for (size_t i = 0; i < a.size(); ++i) {
         if (a[i]->id != b[i]->id || a[i]->type != b[i]->type ||
             a[i]->enabled != b[i]->enabled ||
+            std::memcmp(&a[i]->transform, &b[i]->transform, sizeof(Transform)) != 0)
+            return true;
+    }
+    return false;
+}
+
+// True when an edit touched something RebuildScalableEnvironment reads. The bit
+// remains latched while authoring and is consumed at Save/Play; viewport preview
+// synchronization never consumes it.
+//
+// Deliberately WIDER than FoliageChanged(): the environment build also takes
+// houses, humvees, rocks and prefab colliders as navmesh obstacles and grass
+// exclusions, none of which are IsFoliage() types. Under-reporting here would
+// silently leave enemies pathing through a newly placed building, so anything
+// the rebuild reads is listed. PlayerSpawn / EnemySpawn / AllySpawn /
+// ExplosiveBarrel / Helicopter contribute nothing to it.
+bool LevelEditor::EnvironmentChanged(const LevelDefinition& before) const {
+    if (FoliageChanged(before) || TerrainChanged(before)) return true;
+
+    const auto affectsEnvironment = [](LevelEntityType type) {
+        switch (type) {
+        case LevelEntityType::WoodHouse:
+        case LevelEntityType::MetalHouse:
+        case LevelEntityType::Humvee:
+        case LevelEntityType::Rock:
+        case LevelEntityType::Prefab:
+            return true;
+        default:
+            return false;
+        }
+    };
+    const auto collect = [&](const LevelDefinition& level) {
+        std::vector<const LevelEntity*> result;
+        for (const LevelEntity& entity : level.entities)
+            if (affectsEnvironment(entity.type)) result.push_back(&entity);
+        return result;
+    };
+    const auto a = collect(before);
+    const auto b = collect(level_);
+    if (a.size() != b.size()) return true;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i]->id != b[i]->id || a[i]->type != b[i]->type ||
+            a[i]->enabled != b[i]->enabled ||
+            a[i]->prefabId != b[i]->prefabId ||
             std::memcmp(&a[i]->transform, &b[i]->transform, sizeof(Transform)) != 0)
             return true;
     }
@@ -753,7 +842,10 @@ void LevelEditor::PaintFoliage(CXMMATRIX view, CXMMATRIX projection,
             PushUndo(foliageStrokeBefore_);
             dirty_ = true;
             runtimeDirty_ = true;
+            transformRuntimeDirty_ = false;
+            transformRuntimeEntityId_ = 0;
             foliageRuntimeDirty_ = true;
+            environmentRuntimeDirty_ = true;
         }
         foliageStrokeActive_ = false;
         foliageStrokeChanged_ = false;
@@ -1051,7 +1143,10 @@ void LevelEditor::SculptTerrain(CXMMATRIX view, CXMMATRIX projection,
             PushUndo(terrainStrokeBefore_);
             dirty_ = true;
             runtimeDirty_ = true;
+            transformRuntimeDirty_ = false;
+            transformRuntimeEntityId_ = 0;
             terrainRuntimeDirty_ = true;
+            environmentRuntimeDirty_ = true;
             dxrDDGIRuntimeDirty_ = true;
             dxrDDGILayoutDirty_ = true;
         }
@@ -1343,7 +1438,13 @@ void LevelEditor::PaintTerrain(CXMMATRIX view, CXMMATRIX projection,
             PushUndo(terrainStrokeBefore_);
             dirty_ = true;
             runtimeDirty_ = true;
+            transformRuntimeDirty_ = false;
+            transformRuntimeEntityId_ = 0;
             terrainRuntimeDirty_ = true;
+            // Painted material gates the grass scatter (GrassField::SetSplatMap),
+            // so a paint stroke must still rebuild the environment even though
+            // it leaves height and DDGI alone.
+            environmentRuntimeDirty_ = true;
             // Painting changes surface appearance only -- no height, no
             // occlusion -- so unlike sculpting it does not invalidate the DDGI
             // probe layout. Re-lighting the level on every brush stroke would
@@ -1557,11 +1658,14 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     if (ImGui::Button("New Flat")) ImGui::OpenPopup("Confirm Flat Level");
     ImGui::SameLine();
     if (ImGui::Button("Save")) {
-        if (currentPath_.empty()) BrowseSaveAs();
-        else SaveTo(currentPath_);
+        const bool saved = currentPath_.empty()
+            ? BrowseSaveAs()
+            : SaveTo(currentPath_);
+        actions.fullReconcile |= saved;
     }
     ImGui::SameLine();
-    if (ImGui::Button("Save As")) BrowseSaveAs();
+    if (ImGui::Button("Save As"))
+        actions.fullReconcile |= BrowseSaveAs();
     ImGui::SameLine();
     if (ImGui::Button("Load")) { RefreshLevelFiles(); ImGui::OpenPopup("Load Level"); }
     ImGui::SameLine();
@@ -1604,7 +1708,12 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     if (ImGui::BeginPopupModal("Confirm New Level", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted(dirty_ ? "Discard unsaved changes?" : "Create fresh Level 1 copy?");
-        if (ImGui::Button("Create")) { NewFromLevelOne(); actions.levelChanged = true; ImGui::CloseCurrentPopup(); }
+        if (ImGui::Button("Create")) {
+            NewFromLevelOne();
+            actions.levelChanged = true;
+            actions.fullReconcile = true;
+            ImGui::CloseCurrentPopup();
+        }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
@@ -1620,6 +1729,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         if (ImGui::Button("Create")) {
             NewFlat();
             actions.levelChanged = true;
+            actions.fullReconcile = true;
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
@@ -1653,9 +1763,13 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                 selectedId_ = level_.entities.front().id; nextId_ = 1;
                 for (const auto& entity : level_.entities) nextId_ = (std::max)(nextId_, entity.id + 1);
                 undo_.clear(); redo_.clear(); dirty_ = false; runtimeDirty_ = true;
+                transformRuntimeDirty_ = false; transformRuntimeEntityId_ = 0;
                 foliageRuntimeDirty_ = true;
                 terrainRuntimeDirty_ = true;
-                status_ = "Loaded " + currentPath_.string(); actions.levelChanged = true;
+                environmentRuntimeDirty_ = true;
+                status_ = "Loaded " + currentPath_.string();
+                actions.levelChanged = true;
+                actions.fullReconcile = true;
                 ImGui::CloseCurrentPopup();
             } else status_ = "Load failed: " + result.error;
         }
@@ -2174,21 +2288,21 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         }
         before = level_;
         changed = ImGui::DragFloat3("Position", entity->transform.position, 0.1f);
-        TrackItemEdit(before, changed);
+        TrackItemEdit(before, changed, entity->id);
         if (entity->type == LevelEntityType::WoodHouse ||
             entity->type == LevelEntityType::MetalHouse) {
             before = level_;
             changed = ImGui::DragFloat("Yaw", &entity->transform.rotation[1], 1.0f);
-            TrackItemEdit(before, changed);
+            TrackItemEdit(before, changed, entity->id);
             ImGui::TextDisabled("House scale locked for destruction physics");
         } else {
             before = level_;
             changed = ImGui::DragFloat3("Rotation", entity->transform.rotation, 1.0f);
-            TrackItemEdit(before, changed);
+            TrackItemEdit(before, changed, entity->id);
             ImGui::BeginDisabled(!SupportsScale(entity->type));
             before = level_;
             changed = ImGui::DragFloat3("Scale", entity->transform.scale, 0.05f, 0.01f, 100.0f);
-            TrackItemEdit(before, changed);
+            TrackItemEdit(before, changed, entity->id);
             ImGui::EndDisabled();
             if (!SupportsScale(entity->type))
                 ImGui::TextDisabled("Scale locked for gameplay physics");
@@ -2240,6 +2354,7 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             level_.foliageClear.clear();
             MarkChanged(before);
             foliageRuntimeDirty_ = true;
+            environmentRuntimeDirty_ = true;
         }
         ImGui::EndDisabled();
         ImGui::TextWrapped(
@@ -2572,8 +2687,9 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                 if (SupportsScale(entity->type))
                     std::copy(scale, scale + 3, entity->transform.scale);
             }
+            MarkTransformRuntimeDirty(entity->id);
         } else if (gizmoWasUsing_) {
-            MarkChanged(gizmoBefore_);
+            MarkChanged(gizmoBefore_, entity->id);
             dxrDDGIRuntimeDirty_ = true;
             dxrDDGILayoutDirty_ = true;
         }

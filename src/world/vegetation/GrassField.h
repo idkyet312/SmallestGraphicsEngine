@@ -45,6 +45,7 @@
 
 #include <DirectXMath.h>
 #include "DX12Core.h"
+#include "ProfilerDX12.h"
 #include "StaticBufferDX12.h"
 #include <algorithm>
 #include <cmath>
@@ -53,6 +54,8 @@
 #include <cstring>
 #include <functional>
 #include <vector>
+
+extern ProfilerDX12 g_profiler;
 
 using namespace DirectX;
 
@@ -148,9 +151,18 @@ public:
         m_showAuthoredPaths = showAuthoredPaths;
         m_blocked = std::move(blocked);
 
-        BuildBlades(span, count);
+        // Split so the ~1 s rebuild can be attributed: CPU scatter (the tuft
+        // loop, exclusion tests and mesh-collider raycasts) versus the GPU
+        // instance-buffer upload. Optimising the wrong half would be guesswork.
+        {
+            ProfilerDX12::CpuScope bladesProfile(g_profiler, "Grass/BuildBlades");
+            BuildBlades(span, count);
+        }
         if (m_blades.empty()) return;
-        if (!BuildBuffers()) { Shutdown(); return; }
+        {
+            ProfilerDX12::CpuScope buffersProfile(g_profiler, "Grass/BuildBuffers");
+            if (!BuildBuffers()) { Shutdown(); return; }
+        }
         m_ready = true;
 
         // stdout stays buffered while the app runs, so record what actually got
@@ -756,8 +768,22 @@ private:
             const float macroDensity = 0.76f + 0.24f *
                 (densityShape * densityShape *
                  (3.0f - 2.0f * densityShape));
+            // GrassTerrainDensity is by far the most expensive test here: five
+            // terrain samples (each a 5-octave fbm plus the sculpt-stamp loop),
+            // noise, and four pow() calls. radialDensity and macroDensity are
+            // pure arithmetic already in hand.
+            //
+            // The accept test is `Rand < radial * macro * terrain`, and every
+            // factor is in [0,1], so `Rand >= radial * macro` can never be
+            // rescued by the terrain factor -- multiplying by it only shrinks
+            // the product further. Drawing the random number first and testing
+            // that cheap upper bound rejects those tufts without ever sampling
+            // the terrain. The draw order is unchanged, so the seed sequence
+            // and the resulting field are bit-identical to the old code.
+            const float roll = Rand(seed);
+            if (roll > radialDensity * macroDensity) continue;
             const float terrainDensity = GrassTerrainDensity(cx, cz);
-            if (Rand(seed) > radialDensity * macroDensity * terrainDensity)
+            if (roll > radialDensity * macroDensity * terrainDensity)
                 continue;
 
             // Test the CLUMP's centre once, not every blade: if the middle of the
