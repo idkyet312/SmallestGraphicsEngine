@@ -8745,23 +8745,34 @@ static void RebuildPrefabRenderBatches() {
             XMStoreFloat4x4(&plane.baseTransform, world);
             XMStoreFloat3(&plane.basePosition,
                           XMVector3TransformCoord(XMVectorZero(), world));
-            // Which way is "forward" for this model? Do not assume +Z: this
-            // asset is not modelled nose-down-Z, and assuming it made the
-            // aircraft translate sideways during its takeoff run.
+            // Which way is "forward" for this model? Authored, not inferred.
             //
-            // The fuselage is the longest horizontal axis of the mesh, so take
-            // the model's local bounds and pick whichever of local X / local Z
-            // spans further. That is measured from the geometry rather than
-            // guessed, and it keeps working if the asset is re-exported on a
-            // different axis.
-            const XMFLOAT3& lo = cachedModel->boundsMinimum;
-            const XMFLOAT3& hi = cachedModel->boundsMaximum;
-            const float spanX = hi.x - lo.x;
-            const float spanZ = hi.z - lo.z;
-            // Local forward, then rotated into world by the authored transform.
-            const XMVECTOR localForward = spanX >= spanZ
-                ? XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f)
-                : XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
+            // This was previously guessed from the mesh bounds, on the theory
+            // that the fuselage is the longest horizontal axis. That is wrong
+            // for any aircraft whose wings are broader than its body is long --
+            // measured on this asset, X spans 29.0 m (wingspan) against Z's
+            // 22.3 m (fuselage), so the guess picked the wing and the plane
+            // taxied sideways. There is no geometric rule that survives every
+            // model, so the prefab states it:
+            //
+            //   "objectivePlane": { "forwardAxis": [0, 0, 1] }
+            //
+            // Defaults to +Z when absent. Read from the merged components, so a
+            // single instance can override it without touching the prefab.
+            XMFLOAT3 authoredForward{ 0.0f, 0.0f, 1.0f };
+            if (components.contains("objectivePlane")) {
+                const nlohmann::json& settings = components.at("objectivePlane");
+                const auto axis = settings.find("forwardAxis");
+                if (axis != settings.end() && axis->is_array() &&
+                    axis->size() == 3) {
+                    authoredForward = XMFLOAT3(
+                        axis->at(0).get<float>(), axis->at(1).get<float>(),
+                        axis->at(2).get<float>());
+                }
+            }
+            XMVECTOR localForward = XMLoadFloat3(&authoredForward);
+            if (XMVectorGetX(XMVector3LengthSq(localForward)) < 1e-6f)
+                localForward = XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
             XMMATRIX orientation = world;
             orientation.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
             XMVECTOR forward = XMVector3TransformNormal(localForward, orientation);

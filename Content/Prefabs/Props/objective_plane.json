@@ -17,6 +17,10 @@
     },
     "destructible": {
       "health": 1200.0
+    },
+    "objectivePlane": {
+      "comment": "Local axis the nose points down. The takeoff run travels along this, so if the aircraft taxis sideways this is the value to change.",
+      "forwardAxis": [0.0, 0.0, 1.0]
     }
   }
 }
