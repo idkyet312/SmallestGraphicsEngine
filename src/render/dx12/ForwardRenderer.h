@@ -2374,6 +2374,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         DrawSceneNode(g_blackHawkModel, shader, BlackHawkWorldMatrix(),
             view, proj, lightSpace, visibilityExtensionsOnly,
             UploadBlackHawkPalette());
+        // Drop the rotor palette as soon as the airframe is submitted. b9
+        // persists across draws, so leaving it bound let the next static mesh
+        // skin itself against this helicopter's bones. The rappel branch below
+        // clears it again for its own reasons; this covers the common path,
+        // where no rope is out and nothing else was clearing it at all.
+        shader.SetSkinningEnabled(false);
 
         if (BlackHawkRappelActive()) {
             const XMFLOAT3 anchor = BlackHawkRideWorldPosition();
@@ -2443,6 +2449,14 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     }
 
     if (!g_emptyLevelMode && g_helicopterModel && scene.showHelicopter) {
+        // The b9 skinning constant persists across draws, and the BlackHawk
+        // above binds a rotor palette without clearing it on the common path
+        // (only its rappel-rope branch does). These gunships are static IA
+        // meshes with no palette of their own, so they consumed that stale one
+        // and skinned themselves against a helicopter somewhere else on the
+        // map -- a torn fan of triangles that tracked the camera, because the
+        // palette it was posing against was re-uploaded every frame.
+        shader.SetSkinningEnabled(false);
         // Rotor child transforms and aggressively simplified cockpit/fuselage
         // meshlets make the generic static-mesh bounds unsuitable here. A bad
         // amplification-shader reject made the loaded aircraft disappear. The
