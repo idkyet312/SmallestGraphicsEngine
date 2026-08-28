@@ -76,6 +76,12 @@ struct MissionRunStats {
     // and the primary objective is only met when the last of them falls.
     uint32_t commTowersTotal = 0;
     uint32_t commTowersDestroyed = 0;
+    // Timed aircraft objective. Counted the same way as the towers, plus an
+    // `escaped` tally: unlike a tower, this objective can be failed outright by
+    // running out of time rather than merely being left undone.
+    uint32_t objectivePlanesTotal = 0;
+    uint32_t objectivePlanesDestroyed = 0;
+    uint32_t objectivePlanesEscaped = 0;
 
     float AccuracyPercent() const {
         if (shotsFired == 0) return 0.0f;
@@ -121,6 +127,9 @@ struct MissionReport {
     bool primaryObjectivePresent = false;
     uint32_t commTowersDestroyed = 0;
     uint32_t commTowersTotal = 0;
+    uint32_t objectivePlanesDestroyed = 0;
+    uint32_t objectivePlanesTotal = 0;
+    uint32_t objectivePlanesEscaped = 0;
     int timeScore = 0;
     int accuracyScore = 0;
     int casualtyScore = 0;
@@ -167,6 +176,23 @@ public:
 
     // Called once as the run arms, with the towers the level actually spawned.
     void SetCommTowerCount(uint32_t count) { stats_.commTowersTotal = count; }
+    void SetObjectivePlaneCount(uint32_t count) {
+        stats_.objectivePlanesTotal = count;
+    }
+    void RecordObjectivePlaneDestroyed() {
+        if (stats_.objectivePlanesDestroyed < stats_.objectivePlanesTotal)
+            ++stats_.objectivePlanesDestroyed;
+    }
+    void RecordObjectivePlaneEscaped() {
+        if (stats_.objectivePlanesEscaped < stats_.objectivePlanesTotal)
+            ++stats_.objectivePlanesEscaped;
+    }
+    // Met when every authored aircraft was destroyed. A level with none is
+    // vacuously complete, matching how the tower objective treats absence.
+    bool ObjectivePlanesComplete() const {
+        return stats_.objectivePlanesTotal == 0 ||
+               stats_.objectivePlanesDestroyed >= stats_.objectivePlanesTotal;
+    }
 
     // Saturates at the authored count so a double-report (a tower felled by a
     // charge that also registers as prefab damage) cannot push the objective
@@ -208,6 +234,12 @@ public:
         report.commTowersTotal = stats.commTowersTotal;
         report.commTowersDestroyed =
             (std::min)(stats.commTowersDestroyed, stats.commTowersTotal);
+        report.objectivePlanesTotal = stats.objectivePlanesTotal;
+        report.objectivePlanesDestroyed =
+            (std::min)(stats.objectivePlanesDestroyed,
+                       stats.objectivePlanesTotal);
+        report.objectivePlanesEscaped =
+            (std::min)(stats.objectivePlanesEscaped, stats.objectivePlanesTotal);
         report.primaryObjectivePresent = stats.commTowersTotal > 0;
         report.primaryObjectiveComplete = !report.primaryObjectivePresent ||
             report.commTowersDestroyed >= report.commTowersTotal;

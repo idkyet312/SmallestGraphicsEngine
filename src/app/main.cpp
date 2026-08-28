@@ -80,6 +80,7 @@
 #include "CloudNoiseDX12.h"
 #include "PalmTrees.h"
 #include "LevelDefinition.h"
+#include "EntityTransform.h"
 #include "LevelEditor.h"
 #include "PrefabRegistry.h"
 #include "PrefabRuntime.h"
@@ -220,6 +221,52 @@ static constexpr const char* kCommTowerPrefabId = "props/comm_tower";
 // Defined with the prefab damage code further down; needed earlier by the
 // burning-material tick, which must not let fire fell a player objective.
 static bool FindCommTower(uint64_t entityId, DirectX::XMFLOAT3& base);
+
+// Timed objective: an aircraft the player has to destroy before it leaves.
+// Identified by prefab id, exactly like the comm tower, so it needs no new
+// LevelEntityType and no editor work -- drop the prefab into a level and it is
+// an objective.
+//
+// The source GLB carries no animation or skin (verified: 38 static mesh nodes,
+// zero animation channels), and GLBImporter loads meshes and skins only. The
+// takeoff is therefore driven procedurally off the batch's draw transform:
+// hold, accelerate down the runway, rotate, then climb out on a banking turn.
+static constexpr const char* kObjectivePlanePrefabId = "props/objective_plane";
+// Time from level start until the aircraft begins its roll.
+static constexpr float kObjectivePlaneHoldSeconds = 20.0f;
+// How long the roll/rotate/climb takes once started. After this it is gone.
+static constexpr float kObjectivePlaneTakeoffSeconds = 14.0f;
+static constexpr float kObjectivePlaneTaxiSpeed = 34.0f;   // m/s at rotation
+static constexpr float kObjectivePlaneClimbRate = 11.0f;   // m/s once airborne
+
+struct ObjectivePlaneState {
+    uint64_t entityId = 0;
+    // Authored placement, captured once so the flight path is relative to it and
+    // a rebuild of the render batches cannot make the aircraft jump.
+    //
+    // XMFLOAT4X4, not XMMATRIX. XMMATRIX is four __m128 and needs 16-byte
+    // alignment; putting one after a uint64_t inside a struct held in a
+    // std::vector puts it at offset 8, and the aligned SIMD load then faults.
+    // (PrefabRenderBatch gets away with std::vector<XMMATRIX> because there the
+    // matrix IS the element type, so the allocation is aligned to it.) Load with
+    // XMLoadFloat4x4 at the point of use, which is the unaligned-safe path and
+    // the convention the rest of this file already follows for stored matrices.
+    DirectX::XMFLOAT4X4 baseTransform{};
+    DirectX::XMFLOAT3 basePosition{};
+    // Unit horizontal heading the aircraft rolls along, taken from the model's
+    // own long axis rotated by the authored placement. Stored as a vector, not
+    // an angle: the takeoff translates along it directly, so there is no
+    // sin/cos reconstruction to disagree with the model's actual facing.
+    DirectX::XMFLOAT3 forward{ 0.0f, 0.0f, 1.0f };
+    float holdTimer = 0.0f;
+    float takeoffTimer = 0.0f;
+    bool rolling = false;
+    bool escaped = false;
+    bool destroyed = false;
+};
+static std::vector<ObjectivePlaneState> g_objectivePlanes;
+// Set when an aircraft clears the map, so the mission can report the failure.
+static bool g_objectivePlaneEscaped = false;
 static AssetRegistry        g_assetRegistry;
 static AssetWatcher         g_assetWatcher;
 struct PrefabModelCacheEntry {
@@ -3865,10 +3912,27 @@ static BanditWeapon PickBanditWeapon() {
     return BanditWeapon::Rifle;
 }
 
+// Per-spawner loadout, read from the entity's `overrides` blob under
+// "enemyWeapon". Absent or unrecognised means "random", which is the behaviour
+// every level had before this was authorable -- so old levels are unchanged and
+// a hand-edited typo degrades to a random pick rather than refusing to spawn.
+static std::optional<BanditWeapon> AuthoredSpawnWeapon(const LevelEntity& entity) {
+    const auto found = entity.overrides.find("enemyWeapon");
+    if (found == entity.overrides.end() || !found->is_string())
+        return std::nullopt;
+    BanditWeapon weapon = BanditWeapon::Rifle;
+    if (!ParseBanditWeapon(found->get<std::string>(), weapon))
+        return std::nullopt;
+    return weapon;
+}
+
 // Applies the loadout's movement profile. Called after the spawn code has set
 // its own orbit radius so the class choice wins.
-static void ApplyBanditLoadout(SkinnedEnemy& bandit) {
-    bandit.weapon = PickBanditWeapon();
+// `forced` pins the class (an authored spawner asked for it); std::nullopt keeps
+// the original random roll, which is what every unauthored spawn still uses.
+static void ApplyBanditLoadout(SkinnedEnemy& bandit,
+                               std::optional<BanditWeapon> forced = std::nullopt) {
+    bandit.weapon = forced ? *forced : PickBanditWeapon();
     if (bandit.weapon == BanditWeapon::Shotgun) {
         bandit.orbitRadius = kBanditShotgunOrbitRadius;
         // Aggressive closer: it only ever gets to shoot if it reaches the player.
@@ -3952,7 +4016,7 @@ static bool SpawnBandit() {
             bandit->orbitDirection = (slot & 1) ? -1.0f : 1.0f;
             bandit->fireCooldown = 0.7f +
                 ((float)std::rand() / (float)RAND_MAX) * 2.8f;
-            ApplyBanditLoadout(*bandit);
+            ApplyBanditLoadout(*bandit, AuthoredSpawnWeapon(entity));
             bandit->PlayClip("Walk");
             g_bandits.push_back(std::move(bandit));
             return true;
@@ -4035,9 +4099,16 @@ static bool SpawnMarine(const XMFLOAT3& position, float yaw) {
     marine->position = position;
     marine->yaw = yaw;
     marine->leftArmReach = g_banditLeftArmReach;
-    // 4x a bandit's 100. Allies fight outnumbered and cannot take cover as
-    // cleverly as the player, so they need the buffer to stay useful.
-    marine->health = 400.0f;
+    // 100 health like a rifle bandit, but taking a quarter damage -- so an ally
+    // soaks four bars' worth of fire while every rule tuned around a 100 max
+    // still reads correctly (the cover-hold term below, and anything comparing
+    // against peakHealth). This replaces a flat 400 health, which broke exactly
+    // those comparisons.
+    //
+    // A headshot still kills outright: the reduction is meant to keep allies
+    // alive under sustained fire, not to make them bulletproof.
+    marine->health = 100.0f;
+    marine->damageTakenScale = 0.25f;
     marine->fireCooldown = 0.7f + ((float)std::rand() / (float)RAND_MAX) * 2.8f;
     // Stagger the first grenade across the whole window so a squad spawning
     // together does not throw its opening volley in lockstep.
@@ -7469,10 +7540,7 @@ static void ScatterDandelions(
                                     -g_dandelionSourceMinY,
                                     -g_dandelionSourceCenter.z) *
                 XMMatrixScaling(scale, scale, scale) *
-                XMMatrixRotationRollPitchYaw(
-                    XMConvertToRadians(entity.transform.rotation[0]),
-                    XMConvertToRadians(entity.transform.rotation[1]),
-                    XMConvertToRadians(entity.transform.rotation[2])) *
+                EulerDegreesToMatrix(entity.transform.rotation) *
                 XMMatrixTranslation(x, y + 0.025f, z);
             DandelionInstance instance;
             XMStoreFloat4x4(&instance.transform, transform);
@@ -8450,6 +8518,7 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
             batch.entityIds.push_back(entityId);
         }
 
+
         XMFLOAT3 origin;
         XMStoreFloat3(&origin,
             XMVector3TransformCoord(XMVectorZero(), world));
@@ -8468,10 +8537,7 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
         for (const PrefabChildAsset& child : prefab->children) {
             const XMMATRIX childLocal = XMMatrixScaling(
                 child.scale[0], child.scale[1], child.scale[2]) *
-                XMMatrixRotationRollPitchYaw(
-                    XMConvertToRadians(child.rotation[0]),
-                    XMConvertToRadians(child.rotation[1]),
-                    XMConvertToRadians(child.rotation[2])) *
+                EulerDegreesToMatrix(child.rotation) *
                 XMMatrixTranslation(child.position[0], child.position[1],
                                     child.position[2]);
             self(self, child.prefabId, childLocal * world, entityId,
@@ -8546,14 +8612,7 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
         else if (entity.type == LevelEntityType::Rock) prefabId = "rock";
         else continue;
         const Transform& transform = entity.transform;
-        const XMMATRIX world = XMMatrixScaling(
-            transform.scale[0], transform.scale[1], transform.scale[2]) *
-            XMMatrixRotationRollPitchYaw(
-                XMConvertToRadians(transform.rotation[0]),
-                XMConvertToRadians(transform.rotation[1]),
-                XMConvertToRadians(transform.rotation[2])) *
-            XMMatrixTranslation(transform.position[0], transform.position[1],
-                                transform.position[2]);
+        const XMMATRIX world = EntityWorldMatrix(transform);
         addInstance(addInstance, prefabId, world, entity.id, entity.overrides, 0);
     }
 
@@ -8663,6 +8722,57 @@ static void RebuildPrefabRenderBatches() {
             g_prefabRenderBatches[index].entityIds.push_back(entityId);
         }
 
+        // Register the timed aircraft objective.
+        //
+        // This belongs in THIS builder, not RebuildEditorPrefabVisualBatches:
+        // that one only refreshes what the editor viewport draws, so a plane
+        // registered there rendered but never appeared in g_objectivePlanes
+        // during an actual run -- the takeoff simply never happened.
+        //
+        // Keyed on entity id so a rebuild (an asset edit, a prefab reload)
+        // preserves a countdown already in flight rather than restarting it.
+        if (prefabId == kObjectivePlanePrefabId) {
+            const auto existing = std::find_if(
+                g_objectivePlanes.begin(), g_objectivePlanes.end(),
+                [&](const ObjectivePlaneState& plane) {
+                    return plane.entityId == entityId;
+                });
+            ObjectivePlaneState& plane =
+                existing == g_objectivePlanes.end()
+                    ? g_objectivePlanes.emplace_back()
+                    : *existing;
+            plane.entityId = entityId;
+            XMStoreFloat4x4(&plane.baseTransform, world);
+            XMStoreFloat3(&plane.basePosition,
+                          XMVector3TransformCoord(XMVectorZero(), world));
+            // Which way is "forward" for this model? Do not assume +Z: this
+            // asset is not modelled nose-down-Z, and assuming it made the
+            // aircraft translate sideways during its takeoff run.
+            //
+            // The fuselage is the longest horizontal axis of the mesh, so take
+            // the model's local bounds and pick whichever of local X / local Z
+            // spans further. That is measured from the geometry rather than
+            // guessed, and it keeps working if the asset is re-exported on a
+            // different axis.
+            const XMFLOAT3& lo = cachedModel->boundsMinimum;
+            const XMFLOAT3& hi = cachedModel->boundsMaximum;
+            const float spanX = hi.x - lo.x;
+            const float spanZ = hi.z - lo.z;
+            // Local forward, then rotated into world by the authored transform.
+            const XMVECTOR localForward = spanX >= spanZ
+                ? XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f)
+                : XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
+            XMMATRIX orientation = world;
+            orientation.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
+            XMVECTOR forward = XMVector3TransformNormal(localForward, orientation);
+            // Flatten to horizontal: the runway run is along the ground, and a
+            // model authored with a slight nose-up would otherwise taxi upward.
+            forward = XMVectorSetY(forward, 0.0f);
+            if (XMVectorGetX(XMVector3LengthSq(forward)) < 1e-6f)
+                forward = XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
+            XMStoreFloat3(&plane.forward, XMVector3Normalize(forward));
+        }
+
         const std::string collision = components.contains("collision")
             ? components.at("collision").value("shape", prefab->collision)
             : prefab->collision;
@@ -8750,10 +8860,8 @@ static void RebuildPrefabRenderBatches() {
         }
         for (const PrefabChildAsset& child : prefab->children) {
             const XMMATRIX childLocal = XMMatrixScaling(child.scale[0], child.scale[1],
-                child.scale[2]) * XMMatrixRotationRollPitchYaw(
-                XMConvertToRadians(child.rotation[0]),
-                XMConvertToRadians(child.rotation[1]),
-                XMConvertToRadians(child.rotation[2])) * XMMatrixTranslation(
+                child.scale[2]) * EulerDegreesToMatrix(child.rotation) *
+                XMMatrixTranslation(
                 child.position[0], child.position[1], child.position[2]);
             self(self, child.prefabId, childLocal * world, entityId,
                  nlohmann::json::object(), depth + 1);
@@ -8775,10 +8883,7 @@ static void RebuildPrefabRenderBatches() {
         const bool towerDrawnByDestruction =
             prefabId == kCommTowerPrefabId && g_destruction.IsInitialized();
         const Transform& t = entity.transform;
-        const XMMATRIX world = XMMatrixScaling(t.scale[0], t.scale[1], t.scale[2]) *
-            XMMatrixRotationRollPitchYaw(XMConvertToRadians(t.rotation[0]),
-                XMConvertToRadians(t.rotation[1]), XMConvertToRadians(t.rotation[2])) *
-            XMMatrixTranslation(t.position[0], t.position[1], t.position[2]);
+        const XMMATRIX world = EntityWorldMatrix(t);
         addInstance(addInstance, prefabId, world, entity.id, entity.overrides, 0,
                     towerDrawnByDestruction);
     }
@@ -10156,6 +10261,112 @@ static bool CommTowerDamageAllowed(uint64_t entityId, bool fromRemoteCharge) {
         g_commTowersRiggedForDemolition.count(entityId) != 0;
 }
 
+// Starts (or restarts) the aircraft objective's countdown and tells the mission
+// how many are in play.
+//
+// Called from two places that must behave identically: the deployment screen in
+// the normal game, and BeginEditorPlaytest. A playtest skips deployment
+// entirely, so without the second call an authored aircraft would sit inert and
+// a designer could never see the takeoff they placed it for.
+static void ArmObjectivePlanes() {
+    g_objectivePlaneEscaped = false;
+    for (ObjectivePlaneState& plane : g_objectivePlanes) {
+        plane.holdTimer = 0.0f;
+        plane.takeoffTimer = 0.0f;
+        plane.rolling = false;
+        plane.escaped = false;
+        plane.destroyed = false;
+    }
+    g_game.mission.SetObjectivePlaneCount(
+        static_cast<uint32_t>(g_objectivePlanes.size()));
+}
+
+// Drives the aircraft objective: counts down, then flies it out.
+//
+// Motion is written into the render batch's `transforms` only. `baseTransforms`
+// keeps the authored placement, so a prefab rebuild does not teleport a plane
+// mid-climb, and the collider (built from the authored transform) stays where
+// the aircraft started -- shooting it is a ranged objective, not a dogfight.
+static void UpdateObjectivePlanes(float dt) {
+    if (g_objectivePlanes.empty() || dt <= 0.0f) return;
+    // Only while a run is actually live. The mission timer covers the normal
+    // game (it is stopped during deployment planning and after the mission
+    // ends), but an editor playtest deliberately runs with the timer stopped --
+    // gating on the timer alone left the aircraft inert in exactly the mode a
+    // designer would use to check it.
+    if (!g_game.session.TimerRunning() && !IsEditorPlaying()) return;
+
+    for (ObjectivePlaneState& plane : g_objectivePlanes) {
+        if (plane.destroyed || plane.escaped) continue;
+
+        if (!plane.rolling) {
+            plane.holdTimer += dt;
+            if (plane.holdTimer < kObjectivePlaneHoldSeconds) continue;
+            plane.rolling = true;
+            SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                "Objective aircraft beginning takeoff run");
+        }
+
+        plane.takeoffTimer += dt;
+        const float t = plane.takeoffTimer;
+        // Rotation (nose-up) is the moment the wheels leave the ground; before
+        // it the aircraft only accelerates along its heading.
+        constexpr float kRotateAt = 4.0f;
+        // Integrated rather than sampled so speed changes cannot make the
+        // aircraft jump backwards along its own runway.
+        const float distance = t <= kRotateAt
+            ? 0.5f * kObjectivePlaneTaxiSpeed * (t * t) / kRotateAt
+            : 0.5f * kObjectivePlaneTaxiSpeed * kRotateAt +
+              kObjectivePlaneTaxiSpeed * (t - kRotateAt);
+        const float airborne = (std::max)(0.0f, t - kRotateAt);
+        const float climb = kObjectivePlaneClimbRate * airborne;
+        // Ease the pitch in over two seconds so it rotates rather than snapping
+        // nose-up the instant it leaves the runway.
+        const float pitch = -0.28f * (std::min)(1.0f, airborne / 2.0f);
+        // A slow bank away once properly airborne, so it exits across the map
+        // instead of straight over the player's head.
+        const float bank = 0.35f * (std::min)(1.0f, airborne / 6.0f);
+        const float headingDrift = 0.16f * airborne;
+
+        // Travel straight down the model's own nose axis, turned by the same
+        // yaw drift the aircraft is visually banking into, so the path it flies
+        // matches the direction it is pointing. Rebuilding a heading from
+        // sin/cos of an assumed +Z nose is what sent it sideways.
+        const XMVECTOR baseForward = XMLoadFloat3(&plane.forward);
+        const XMVECTOR heading = XMVector3TransformNormal(
+            baseForward, XMMatrixRotationY(headingDrift));
+        const XMVECTOR travel = XMVectorScale(heading, distance);
+        const XMMATRIX flight =
+            XMMatrixRotationRollPitchYaw(pitch, headingDrift, -bank) *
+            XMMatrixTranslation(
+                plane.basePosition.x + XMVectorGetX(travel),
+                plane.basePosition.y + climb,
+                plane.basePosition.z + XMVectorGetZ(travel));
+        // Authored scale/orientation live in baseTransform; strip its
+        // translation and re-apply the flight pose on top so a scaled or
+        // rotated placement still flies correctly.
+        XMMATRIX oriented = XMLoadFloat4x4(&plane.baseTransform);
+        oriented.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
+        const XMMATRIX world = oriented * flight;
+
+        for (PrefabRenderBatch& batch : g_prefabRenderBatches) {
+            if (batch.prefabId != kObjectivePlanePrefabId) continue;
+            for (size_t i = 0; i < batch.entityIds.size(); ++i)
+                if (batch.entityIds[i] == plane.entityId &&
+                    i < batch.transforms.size())
+                    batch.transforms[i] = world;
+        }
+
+        if (t >= kObjectivePlaneTakeoffSeconds) {
+            plane.escaped = true;
+            g_objectivePlaneEscaped = true;
+            g_game.mission.RecordObjectivePlaneEscaped();
+            SGE_LOG("LogGameplay", EngineLog::Level::Warning,
+                "Objective aircraft escaped");
+        }
+    }
+}
+
 static void DamagePrefabEntity(uint64_t entityId, float damage,
                                const XMFLOAT3& hit, bool fromRemoteCharge) {
     if (!CommTowerDamageAllowed(entityId, fromRemoteCharge)) return;
@@ -10196,6 +10407,17 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
         if (isCommTower) {
             g_commTowerMusicSwell = true;
             g_exfilHereDelay = kExfilHereDelay;
+        }
+        // Aircraft shot down: stop its flight so it cannot keep climbing as a
+        // corpse, and mark it so the escape check ignores it.
+        for (ObjectivePlaneState& plane : g_objectivePlanes) {
+            if (plane.entityId != entityId) continue;
+            plane.destroyed = true;
+            scene.SpawnSmokeBurst(hit, 2.4f, 0.9f);
+            if (g_game.session.TimerRunning())
+                g_game.mission.RecordObjectivePlaneDestroyed();
+            SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                "Objective aircraft destroyed");
         }
         if (isCommTower) CollapseCommTower(towerBase);
         else scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
@@ -10596,6 +10818,8 @@ static void SetCursorVisible(bool visible) {
 static void OpenMainMenu() {
     g_game.world.Prefabs().ClearDerived();
     g_meshCollisionEntities.clear();
+    g_objectivePlanes.clear();
+    g_objectivePlaneEscaped = false;
     g_game.world.Prefabs().ResetGameplayState();
     g_prefabAudioPlayers.clear();
     g_game.session.SetScreen(GameScreen::MainMenu);
@@ -10756,7 +10980,8 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
 
 static void SynchronizeEditorRuntime(bool play);
 static void ApplyTerrainSplatMap(const LevelDefinition& level);
-static void StartLevelEditor(HWND hwnd);
+static void StartLevelEditor(HWND hwnd,
+                             const std::filesystem::path& levelPath = {});
 static void StopEditorPlaytest();
 
 static void OpenWinScreen() {
@@ -11025,7 +11250,12 @@ static void StartDDGICornellTest(HWND hwnd) {
     scene.gun.visible = false;
 }
 
-static void BrowseAndStartCustomLevel(HWND hwnd) {
+// Native open dialog rooted at Content/Levels. Returns false when the user
+// cancels; only a real dialog failure writes g_mainMenuLevelStatus, so a
+// deliberate cancel leaves no error text behind. Shared by "play a custom
+// level" and the editor launcher so both browse the same way.
+static bool BrowseForLevelPath(HWND hwnd, const wchar_t* title,
+                               std::filesystem::path& chosen) {
     std::error_code error;
     std::filesystem::create_directories("Content/Levels", error);
     const std::wstring initialDirectory =
@@ -11039,14 +11269,22 @@ static void BrowseAndStartCustomLevel(HWND hwnd) {
     dialog.nMaxFile = static_cast<DWORD>(std::size(selected));
     dialog.lpstrInitialDir = initialDirectory.c_str();
     dialog.lpstrDefExt = L"json";
-    dialog.lpstrTitle = L"Load Custom Level";
+    dialog.lpstrTitle = title;
     dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
         OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
     if (GetOpenFileNameW(&dialog)) {
-        StartCustomLevel(hwnd, std::filesystem::path(selected));
-    } else if (const DWORD code = CommDlgExtendedError()) {
-        g_mainMenuLevelStatus = "File browser failed: " + std::to_string(code);
+        chosen = std::filesystem::path(selected);
+        return true;
     }
+    if (const DWORD code = CommDlgExtendedError())
+        g_mainMenuLevelStatus = "File browser failed: " + std::to_string(code);
+    return false;
+}
+
+static void BrowseAndStartCustomLevel(HWND hwnd) {
+    std::filesystem::path chosen;
+    if (BrowseForLevelPath(hwnd, L"Load Custom Level", chosen))
+        StartCustomLevel(hwnd, chosen);
 }
 
 static void RestartActiveLevel(HWND hwnd) {
@@ -11350,13 +11588,49 @@ static void RenderMainMenu(HWND hwnd) {
     UISectionLabel("TOOLS");
     ImGui::Dummy(ImVec2(0.0f, 2.0f));
     if (UIMenuButton("LEVEL EDITOR"))
-        StartLevelEditor(hwnd);
+        ImGui::OpenPopup("Level Editor");
     if (UIMenuButton("SETTINGS"))
         g_showSettingsMenu = true;
 
     ImGui::Dummy(ImVec2(0.0f, 14.0f));
     if (UIMenuButton("EXIT", 36.0f))
         PostQuitMessage(0);
+
+    // Ask before entering the editor rather than always opening the Level 1
+    // template: loading was previously only reachable from inside the editor,
+    // so opening an existing level meant first sitting through a full build of
+    // a template you were about to discard.
+    const ImVec2 editorPopupCenter(ImGui::GetIO().DisplaySize.x * 0.5f,
+                                   ImGui::GetIO().DisplaySize.y * 0.5f);
+    ImGui::SetNextWindowPos(editorPopupCenter, ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Level Editor", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Start a new level, or load an existing one?");
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+        if (ImGui::Button("New", ImVec2(120.0f, 0.0f))) {
+            ImGui::CloseCurrentPopup();
+            StartLevelEditor(hwnd);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load...", ImVec2(120.0f, 0.0f))) {
+            // Close first: GetOpenFileNameW runs a nested modal message loop, so
+            // the popup would otherwise stay painted behind the file dialog and
+            // still be open when it returns.
+            ImGui::CloseCurrentPopup();
+            std::filesystem::path chosen;
+            if (BrowseForLevelPath(hwnd, L"Open Level in Editor", chosen)) {
+                g_mainMenuLevelStatus.clear();
+                StartLevelEditor(hwnd, chosen);
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)))
+            ImGui::CloseCurrentPopup();
+        if (!g_mainMenuLevelStatus.empty())
+            ImGui::TextWrapped("%s", g_mainMenuLevelStatus.c_str());
+        ImGui::EndPopup();
+    }
     ImGui::End();
     if (g_game.loading.Active()) RenderLoadingScreen();
 }
@@ -11622,6 +11896,15 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
             // Bandits only. Marines are friendly and a red dot would read as a
             // threat the player then plans around for no reason.
             if (bandit->faction != Faction::Bandit) continue;
+            // An authored Humvee's gunner is already represented by the vehicle
+            // dot below, drawn a metre away from where he stands -- two dots for
+            // one emplacement just read as two enemies. Only gunners on authored
+            // Humvees (mountedVehicleIndex >= 0) are skipped: the boat gunner
+            // (kBoatGunnerMount) and the stress-test gunner
+            // (kStressHumveeGunnerMount) use negative sentinels and have no
+            // vehicle dot standing in for them, so they keep their own.
+            if (bandit->turretGunner && bandit->mountedVehicleIndex >= 0)
+                continue;
 
             XMFLOAT3 spot = bandit->position;
             spot.y += 1.1f;
@@ -11640,6 +11923,59 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                                         IM_COL32(20, 4, 6, 200));
             foreground->AddCircleFilled(enemyScreen, 3.0f,
                                         IM_COL32(232, 48, 48, 235));
+        }
+
+        // Authored Humvees, from the level plan rather than from g_bandits.
+        // Their turret gunner is a bandit and would be dotted by the loop above,
+        // but only once it exists: the load-stage spawn can fail (the Humvee
+        // model may not be resident yet), and the retry lives behind the
+        // !g_insertionChoicePending gate in the bandit update, so it cannot run
+        // until AFTER the player has deployed. Dotting the vehicle itself is
+        // independent of that timing -- the emplacement is on the map whether or
+        // not anyone is manning it yet.
+        for (const Transform& humvee : g_levelHumveeSpawns) {
+            XMFLOAT3 spot{ humvee.position[0],
+                           humvee.position[1] + 2.2f,
+                           humvee.position[2] };
+            const XMVECTOR humveeClip = XMVector3Transform(
+                XMLoadFloat3(&spot), viewProjection);
+            const float humveeW = XMVectorGetW(humveeClip);
+            if (humveeW <= 0.01f) continue;
+            const ImVec2 humveeScreen{
+                (XMVectorGetX(humveeClip) / humveeW * 0.5f + 0.5f) * display.x,
+                (1.0f - (XMVectorGetY(humveeClip) / humveeW * 0.5f + 0.5f)) *
+                    display.y };
+            foreground->AddCircleFilled(humveeScreen, 6.0f,
+                                        IM_COL32(20, 4, 6, 200));
+            foreground->AddCircleFilled(humveeScreen, 4.0f,
+                                        IM_COL32(232, 48, 48, 235));
+            foreground->AddCircle(humveeScreen, 8.5f,
+                                  IM_COL32(232, 48, 48, 190), 12, 1.6f);
+        }
+
+        // AA emplacements are static hostiles held in their own vector rather
+        // than in g_bandits, so the loop above never saw them. They matter more
+        // to insertion planning than a foot patrol does -- they are exactly what
+        // shoots the helicopter down -- so they get the same dot, drawn slightly
+        // larger with a ring to read as an emplacement rather than a man.
+        for (const auto& turret : g_game.vehicles.aaTurrets) {
+            if (!turret.Active()) continue;
+            XMFLOAT3 spot = turret.position;
+            spot.y += 1.6f;
+            const XMVECTOR turretClip = XMVector3Transform(
+                XMLoadFloat3(&spot), viewProjection);
+            const float turretW = XMVectorGetW(turretClip);
+            if (turretW <= 0.01f) continue;
+            const ImVec2 turretScreen{
+                (XMVectorGetX(turretClip) / turretW * 0.5f + 0.5f) * display.x,
+                (1.0f - (XMVectorGetY(turretClip) / turretW * 0.5f + 0.5f)) *
+                    display.y };
+            foreground->AddCircleFilled(turretScreen, 6.0f,
+                                        IM_COL32(20, 4, 6, 200));
+            foreground->AddCircleFilled(turretScreen, 4.0f,
+                                        IM_COL32(232, 48, 48, 235));
+            foreground->AddCircle(turretScreen, 8.5f,
+                                  IM_COL32(232, 48, 48, 190), 12, 1.6f);
         }
     }
 
@@ -12224,6 +12560,10 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         // prefab edits made during planning. Must follow ResetRun, which the
         // level load already did -- doing it here means a restart re-counts.
         g_game.mission.SetCommTowerCount(standingTowers);
+        // Arm the aircraft here rather than at level load: the countdown has to
+        // start when the player actually deploys, or the whole 20 seconds would
+        // burn while they were still choosing an insertion point.
+        ArmObjectivePlanes();
         // The planning camera teleports to the selected insertion. None of the
         // fly-through's temporal lighting or visibility history is valid there.
         visBuffer.InvalidateTemporalHistory();
@@ -12337,6 +12677,17 @@ static void RenderWinScreen(HWND hwnd) {
     scoreColumn(report.optionalScore, 15);
     ImGui::Text("Destruction      %u events", report.destructionEvents);
     scoreColumn(report.destructionScore, 10);
+    if (report.objectivePlanesTotal > 0) {
+        if (report.objectivePlanesEscaped > 0)
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                "Aircraft         %u / %u downed, %u ESCAPED",
+                report.objectivePlanesDestroyed, report.objectivePlanesTotal,
+                report.objectivePlanesEscaped);
+        else
+            ImGui::Text("Aircraft         %u / %u downed",
+                        report.objectivePlanesDestroyed,
+                        report.objectivePlanesTotal);
+    }
     if (report.primaryObjectivePresent) {
         ImGui::Text("Comm towers      %u / %u down", report.commTowersDestroyed,
                     report.commTowersTotal);
@@ -13649,16 +14000,8 @@ static void AppendCommTowersToDestruction(
 
         // World transform for this instance, matching RebuildPrefabRenderBatches.
         const Transform& t = entity.transform;
-        const XMMATRIX world =
-            XMMatrixScaling(t.scale[0], t.scale[1], t.scale[2]) *
-            XMMatrixRotationRollPitchYaw(XMConvertToRadians(t.rotation[0]),
-                                         XMConvertToRadians(t.rotation[1]),
-                                         XMConvertToRadians(t.rotation[2])) *
-            XMMatrixTranslation(t.position[0], t.position[1], t.position[2]);
-        const XMMATRIX rotationOnly =
-            XMMatrixRotationRollPitchYaw(XMConvertToRadians(t.rotation[0]),
-                                         XMConvertToRadians(t.rotation[1]),
-                                         XMConvertToRadians(t.rotation[2]));
+        const XMMATRIX world = EntityWorldMatrix(t);
+        const XMMATRIX rotationOnly = EulerDegreesToMatrix(t.rotation);
 
         // Flatten the model's primitives into world space first, so band
         // assignment and the emitted chunks share one coordinate system.
@@ -13966,14 +14309,7 @@ static bool SynchronizeEditorRuntimeLight(uint64_t changedEntityId = 0) {
     bool refreshLevelBasics = false;
 
     const auto matrixFor = [](const Transform& transform) {
-        return XMMatrixScaling(transform.scale[0], transform.scale[1],
-                               transform.scale[2]) *
-            XMMatrixRotationRollPitchYaw(
-                XMConvertToRadians(transform.rotation[0]),
-                XMConvertToRadians(transform.rotation[1]),
-                XMConvertToRadians(transform.rotation[2])) *
-            XMMatrixTranslation(transform.position[0], transform.position[1],
-                                transform.position[2]);
+        return EntityWorldMatrix(transform);
     };
     const auto supportsFastTransform = [](LevelEntityType type) {
         switch (type) {
@@ -14121,8 +14457,21 @@ static void SynchronizeEditorRuntime(bool play) {
     g_levelEditor.MarkRuntimeSynchronized();
 }
 
-static void StartLevelEditor(HWND hwnd) {
-    g_levelEditor.NewFromLevelOne();
+// `levelPath` empty starts a fresh Level 1 template; otherwise the editor opens
+// on that file. Loading happens before StartLevelOne so the runtime world is
+// built from the level the user actually chose, not from the template it would
+// otherwise have to reconcile away a frame later.
+static void StartLevelEditor(HWND hwnd, const std::filesystem::path& levelPath) {
+    const bool loaded = !levelPath.empty() && g_levelEditor.LoadFrom(levelPath);
+    if (!levelPath.empty() && !loaded) {
+        // Falling back to the template silently would look like the chosen file
+        // loaded and then turned into Level 1. Say what happened; the editor's
+        // own status line carries the parser's reason.
+        SGE_LOG("LogLevel", EngineLog::Level::Warning,
+            "Editor load failed, opening template instead: " +
+            levelPath.string());
+    }
+    if (!loaded) g_levelEditor.NewFromLevelOne();
     StartLevelOne(hwnd, true);
     // StartLevelOne opens the mission deployment planner. The editor has no
     // deployment screen, so carrying that state across would keep its orbit
@@ -14162,6 +14511,11 @@ static void BeginEditorPlaytest(HWND hwnd) {
     scene.player.godMode = true;
     scene.RestorePlayerHealth();
     g_game.commands.Request(GameCommand::ResetLevelRuntime);
+    // Arm the aircraft objective for the playtest. The normal game does this at
+    // the deployment screen, which a playtest deliberately skips -- without it
+    // an authored plane would just sit on the runway and the designer could
+    // never see the takeoff they placed it for.
+    ArmObjectivePlanes();
     g_game.session.StopTimer();
     cameraLocked = false;
     scene.camera.FPSMode = true;
@@ -16494,8 +16848,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     }
     if (GetEnvironmentVariableA("SGE_PREFAB_EDITOR_TEST", nullptr, 0) > 0) {
         g_prefabEditorSmokeEnabled = true;
-        StartLevelEditor(hwnd);
-        g_levelEditor.OpenAssetBrowser();
+        // SGE_EDITOR_LEVEL=<path> opens the editor on an authored level instead
+        // of the Level 1 template. Without it there is no headless way to
+        // reproduce a bug that only happens in a specific saved map.
+        char editorLevel[MAX_PATH] = {};
+        const DWORD editorLevelLength = GetEnvironmentVariableA(
+            "SGE_EDITOR_LEVEL", editorLevel,
+            static_cast<DWORD>(std::size(editorLevel)));
+        const bool haveEditorLevel =
+            editorLevelLength > 0 && editorLevelLength < std::size(editorLevel);
+        StartLevelEditor(hwnd, haveEditorLevel
+            ? std::filesystem::path(editorLevel) : std::filesystem::path());
+        // SGE_EDITOR_PLAY=1 drops straight into a playtest, which is what arms
+        // the objective timers.
+        if (GetEnvironmentVariableA("SGE_EDITOR_PLAY", nullptr, 0) > 0)
+            g_game.commands.Request(GameCommand::EditorBeginPlay);
+        else
+            g_levelEditor.OpenAssetBrowser();
         SGE_LOG("LogPrefab", EngineLog::Level::Display,
             "Prefab editor RTT smoke test started");
     }
@@ -17218,12 +17587,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     XMFLOAT3 coverPosition;
                     if (QueryBanditCover(
                             *bandit, target, coverPosition)) {
-                        // Bandits hold longer the more hurt they are. That term
-                        // is tuned around 100 max health and goes negative for a
-                        // marine's 400, collapsing the hold onto SetCoverTarget's
-                        // 2.5s floor -- barely longer than the aim-up plus one
-                        // burst, so an ally would pop out mid-firefight. Give
-                        // marines a flat hold long enough to actually shoot from.
+                        // Bandits hold longer the more hurt they are, a term
+                        // tuned around 100 max health. Marines keep a flat hold
+                        // instead: they are outnumbered and cannot use cover as
+                        // well as the player, and 7-10s is long enough to
+                        // actually shoot from rather than popping out mid-burst.
+                        //
+                        // This used to be forced -- at the marine's old 400 max
+                        // health the scaled term went negative and collapsed
+                        // onto SetCoverTarget's 2.5s floor. Marines are 100 now,
+                        // so the bandit formula would work; the flat hold is
+                        // kept deliberately, as an ally behaviour choice rather
+                        // than a workaround.
                         const float holdTime =
                             bandit->faction == Faction::Marine
                             ? 7.0f + RandomUnit() * 3.0f
@@ -18209,14 +18584,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     bool killed = false;
                 };
                 std::vector<BanditProjectileHit> banditHits;
-                // Player shots damage any enemy. Hostile shots damage only the
-                // enemy currently used as a human shield, never squadmates.
-                if (g_banditLoaded && (!projectile.hostile || g_heldBandit)) {
+                // Player shots damage any enemy. Hostile shots damage marines
+                // and the held human shield -- never other bandits.
+                if (g_banditLoaded) {
                     for (auto& bandit : g_bandits) {
                         if (!bandit) continue;
                         if (projectile.hostile) {
-                            // Bandit-fired shot: only ever damages the held human shield.
-                            if (bandit.get() != g_heldBandit) continue;
+                            // Bandit-fired shot. Marines are valid targets: they
+                            // are who the bandits (and the Humvee gunner) are
+                            // shooting at. Previously this whole loop was gated
+                            // on g_heldBandit, so a hostile round that struck an
+                            // ally fell through to the block-only pass below --
+                            // it was consumed by the body and dealt no damage,
+                            // which made marines look invulnerable.
+                            //
+                            // Fellow bandits still only block. They fire past
+                            // each other constantly, and enabling that friendly
+                            // fire would have them wipe out their own squad.
+                            const bool shield = bandit.get() == g_heldBandit;
+                            if (!shield && bandit->faction != Faction::Marine)
+                                continue;
                         } else if (bandit->faction != Faction::Bandit) {
                             // Player- or marine-fired shot: never hits a marine
                             // (no friendly fire), only ever damages bandits.
@@ -18310,6 +18697,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     projectile.active = false;
                     continue;
                 }
+                // Bodies that stop a hostile round without taking damage. Any
+                // marine hit was already resolved above and took the projectile
+                // with it, so what reaches here is a bandit shielding another
+                // bandit: the round is absorbed, but no friendly fire.
                 if (projectile.hostile && g_banditLoaded) {
                     bool blockedByBandit = false;
                     for (const auto& bandit : g_bandits) {
@@ -18939,6 +19330,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_prefabRuntimeSmokeChecked = true;
         }
         if (IsSceneScreen()) UpdatePrefabAudio();
+        // Before UpdatePrefabLods: LOD selection reads the draw transform, so
+        // the aircraft has to be moved for this frame first or it would pick a
+        // level of detail for where it was rather than where it is.
+        if (IsSceneScreen()) UpdateObjectivePlanes(deltaTime);
         if (IsSceneScreen()) UpdatePrefabLods();
         occlusionDepth.FinalizeCapture(g_dx12.commandList.Get());
         // Adaptive Forward Extensions quality. Driven from the delayed GPU

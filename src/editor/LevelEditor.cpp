@@ -1,5 +1,6 @@
 #include "LevelEditor.h"
 
+#include "EntityTransform.h"
 #include "CameraDX12.h"
 #include "TerrainStampLibrary.h"
 #include <imgui.h>
@@ -30,6 +31,42 @@ namespace {
 // content browser's Prefabs tab came up empty and no prefab could be placed.
 const std::filesystem::path kPrefabRoot = "Content/Prefabs";
 const std::filesystem::path kModelRoot = "Content/Models";
+
+// assetKindTab_ indexes the AssetKind tab array positionally (0=Model,
+// 1=Texture, 2=Audio, 3=Prefab, 4=Level). Favourites is not an AssetKind, so
+// it takes the next index after that array.
+constexpr int kFavouritesTab = 5;
+
+// The built-in entity types offered by the Hierarchy's Create row. Listed on
+// the Favourites tab too, because these are the everyday placeables and hunting
+// for them at the bottom of the Hierarchy is the slow part of dressing a level.
+// They are engine enum values rather than data-driven prefabs, so they are
+// always present and cannot be unstarred.
+// Height a built-in type sits at above the terrain under it. Helicopter and
+// PlayerSpawn deliberately float and are excluded from terrain snapping
+// altogether (they keep whatever AddEntity gave them), which is why they are
+// absent here -- callers must test TerrainSnaps() first.
+float TerrainSnapOffset(LevelEntityType type) {
+    if (type == LevelEntityType::ExplosiveBarrel) return 0.75f;
+    if (type == LevelEntityType::Humvee) return 3.45f;
+    return 0.0f;
+}
+
+// Whether dropping/dragging this type should stick it to the ground. Mirrors
+// the gizmo's terrain-snap exclusions so a dropped entity lands exactly where
+// dragging it with the gizmo would put it.
+bool TerrainSnaps(LevelEntityType type) {
+    return type != LevelEntityType::Helicopter &&
+           type != LevelEntityType::PlayerSpawn;
+}
+
+const LevelEntityType kBuiltInSpawnTypes[] = {
+    LevelEntityType::WoodHouse, LevelEntityType::MetalHouse,
+    LevelEntityType::Palm, LevelEntityType::ExplosiveBarrel,
+    LevelEntityType::EnemySpawn, LevelEntityType::AllySpawn,
+    LevelEntityType::Humvee, LevelEntityType::Helicopter,
+    LevelEntityType::PlayerSpawn, LevelEntityType::GrassPatch,
+    LevelEntityType::Dandelion, LevelEntityType::Rock };
 
 // The complete set of collision shapes the runtime understands. Shared by the
 // prefab authoring panel and the per-entity override row so the two can never
@@ -96,13 +133,10 @@ bool LoadStampPreview(const std::string& filename, std::vector<float>& out) {
     return true;
 }
 
+// Rotation order lives in EntityTransform.h, shared with the runtime, because
+// it has to match ImGuizmo's decompose exactly -- see the note there.
 XMMATRIX EntityMatrix(const LevelEntity& entity) {
-    const auto& t = entity.transform;
-    return XMMatrixScaling(t.scale[0], t.scale[1], t.scale[2]) *
-        XMMatrixRotationRollPitchYaw(XMConvertToRadians(t.rotation[0]),
-                                     XMConvertToRadians(t.rotation[1]),
-                                     XMConvertToRadians(t.rotation[2])) *
-        XMMatrixTranslation(t.position[0], t.position[1], t.position[2]);
+    return EntityWorldMatrix(entity.transform);
 }
 
 float PickRadius(LevelEntityType type) {
@@ -310,6 +344,57 @@ void LevelEditor::NewFlat() {
 void LevelEditor::RefreshAssets() {
     assetRegistry_.Refresh();
     prefabRegistry_.Refresh(kPrefabRoot, kModelRoot);
+}
+
+bool LevelEditor::IsFavouritePrefab(const std::string& prefabId) const {
+    return std::find(favouritePrefabs_.begin(), favouritePrefabs_.end(),
+                     prefabId) != favouritePrefabs_.end();
+}
+
+void LevelEditor::ToggleFavouritePrefab(const std::string& prefabId) {
+    if (prefabId.empty()) return;
+    const auto it = std::find(favouritePrefabs_.begin(),
+                              favouritePrefabs_.end(), prefabId);
+    if (it == favouritePrefabs_.end()) favouritePrefabs_.push_back(prefabId);
+    else favouritePrefabs_.erase(it);
+    SaveFavourites();
+}
+
+// Favourites are a UI preference, not level data, so they live beside the asset
+// cache rather than in the level file -- starring a prefab must not mark the
+// level dirty or end up in someone else's level when it is shared.
+void LevelEditor::LoadFavourites() {
+    favouritePrefabs_.clear();
+    try {
+        std::ifstream stream("assetcache/favourites.json");
+        if (!stream) return;
+        nlohmann::json root;
+        stream >> root;
+        if (!root.is_object()) return;
+        const auto found = root.find("prefabs");
+        if (found == root.end() || !found->is_array()) return;
+        for (const nlohmann::json& item : *found)
+            if (item.is_string()) favouritePrefabs_.push_back(item.get<std::string>());
+    } catch (const std::exception&) {
+        // A corrupt or half-written favourites file must never stop the editor
+        // opening; losing the stars is recoverable, not being able to edit is not.
+        favouritePrefabs_.clear();
+    }
+}
+
+void LevelEditor::SaveFavourites() const {
+    try {
+        std::error_code error;
+        std::filesystem::create_directories("assetcache", error);
+        nlohmann::json root = nlohmann::json::object();
+        root["schemaVersion"] = 1u;
+        root["prefabs"] = favouritePrefabs_;
+        std::ofstream stream("assetcache/favourites.json");
+        if (stream) stream << root.dump(2);
+    } catch (const std::exception&) {
+        // Best-effort: a failed write costs the user their stars next session,
+        // which is not worth interrupting an edit over.
+    }
 }
 
 LevelEntity* LevelEditor::Selected() {
@@ -648,6 +733,34 @@ bool LevelEditor::BrowseImportModel() {
         return output;
     });
     status_ = "Importing " + source.filename().string() + " in background...";
+    return true;
+}
+
+bool LevelEditor::LoadFrom(const std::filesystem::path& path) {
+    LevelLoadResult result = LoadLevel(path);
+    if (!result.ok) {
+        status_ = "Load failed: " + result.error;
+        return false;
+    }
+    level_ = std::move(result.level);
+    currentPath_ = path;
+    strncpy_s(levelName_, level_.name.c_str(), _TRUNCATE);
+    // A level with no entities would make front() undefined behaviour. Levels
+    // always author a PlayerSpawn, but a hand-edited file need not.
+    selectedId_ = level_.entities.empty() ? 0 : level_.entities.front().id;
+    nextId_ = 1;
+    for (const auto& entity : level_.entities)
+        nextId_ = (std::max)(nextId_, entity.id + 1);
+    undo_.clear();
+    redo_.clear();
+    dirty_ = false;
+    runtimeDirty_ = true;
+    transformRuntimeDirty_ = false;
+    transformRuntimeEntityId_ = 0;
+    foliageRuntimeDirty_ = true;
+    terrainRuntimeDirty_ = true;
+    environmentRuntimeDirty_ = true;
+    status_ = "Loaded " + currentPath_.string();
     return true;
 }
 
@@ -1756,22 +1869,11 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         }
         ImGui::BeginDisabled(loadSelection_ < 0);
         if (ImGui::Button(dirty_ ? "Discard and Load" : "Load")) {
-            LevelLoadResult result = LoadLevel(levelFiles_[loadSelection_]);
-            if (result.ok) {
-                level_ = std::move(result.level); currentPath_ = levelFiles_[loadSelection_];
-                strncpy_s(levelName_, level_.name.c_str(), _TRUNCATE);
-                selectedId_ = level_.entities.front().id; nextId_ = 1;
-                for (const auto& entity : level_.entities) nextId_ = (std::max)(nextId_, entity.id + 1);
-                undo_.clear(); redo_.clear(); dirty_ = false; runtimeDirty_ = true;
-                transformRuntimeDirty_ = false; transformRuntimeEntityId_ = 0;
-                foliageRuntimeDirty_ = true;
-                terrainRuntimeDirty_ = true;
-                environmentRuntimeDirty_ = true;
-                status_ = "Loaded " + currentPath_.string();
+            if (LoadFrom(levelFiles_[loadSelection_])) {
                 actions.levelChanged = true;
                 actions.fullReconcile = true;
                 ImGui::CloseCurrentPopup();
-            } else status_ = "Load failed: " + result.error;
+            }
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
@@ -1781,6 +1883,13 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::End();
 
     if (assetBrowserOpen_) {
+        // Loaded lazily on first browser open rather than in the constructor:
+        // LevelEditor is a global, and reading a file during static init would
+        // run before the working directory is settled.
+        if (!favouritesLoaded_) {
+            LoadFavourites();
+            favouritesLoaded_ = true;
+        }
         ImGui::SetNextWindowPos(ImVec2(display.x - 430.0f, 490.0f),
                                 ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(420.0f, display.y - 500.0f),
@@ -1812,6 +1921,14 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                     assetKindTab_ = tab;
                     ImGui::EndTabItem();
                 }
+            }
+            // Appended last so the existing 0-3 tab indices keep their meaning:
+            // the prefab branch below tests == 3 and the asset branch maps 0/1/2
+            // positionally. Inserting Favourites earlier would silently
+            // repoint every one of those.
+            if (ImGui::BeginTabItem("Favourites", nullptr)) {
+                assetKindTab_ = kFavouritesTab;
+                ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
         }
@@ -1845,6 +1962,17 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                 ? (prefab.generated ? ImVec4(0.20f, 0.42f, 0.72f, 1.0f)
                                     : ImVec4(0.22f, 0.62f, 0.42f, 1.0f))
                 : ImVec4(0.75f, 0.18f, 0.14f, 1.0f);
+            const bool favourite = IsFavouritePrefab(prefab.id);
+            ImGui::PushStyleColor(ImGuiCol_Text, favourite
+                ? ImVec4(1.0f, 0.82f, 0.25f, 1.0f)
+                : ImVec4(0.45f, 0.45f, 0.45f, 1.0f));
+            if (ImGui::Button(favourite ? "*" : "-", ImVec2(22.0f, 42.0f)))
+                ToggleFavouritePrefab(prefab.id);
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(favourite ? "Remove from Favourites"
+                                            : "Add to Favourites");
+            ImGui::SameLine();
             const uint64_t thumbnail = thumbnailTexture && prefab.error.empty()
                 ? thumbnailTexture(prefab) : 0;
             if (thumbnail)
@@ -2089,6 +2217,121 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         if (!prefabRegistry_.LastError().empty())
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "%s",
                 prefabRegistry_.LastError().c_str());
+        } else if (assetKindTab_ == kFavouritesTab) {
+            std::string loweredFilter = filter;
+            std::transform(loweredFilter.begin(), loweredFilter.end(),
+                loweredFilter.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+            const auto matches = [&](const std::string& text) {
+                if (loweredFilter.empty()) return true;
+                std::string lowered = text;
+                std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                    [](unsigned char c) {
+                        return static_cast<char>(std::tolower(c));
+                    });
+                return lowered.find(loweredFilter) != std::string::npos;
+            };
+
+            ImGui::BeginChild("FavouriteRows", ImVec2(0.0f, 0.0f), false);
+            ImGui::SeparatorText("Entities");
+            // Built-in types spawn through AddEntity, not AddPrefab -- they are
+            // engine enum values with bespoke runtime handling, not data-driven
+            // assets, so there is no PrefabAsset to hand to AddPrefab here.
+            for (LevelEntityType type : kBuiltInSpawnTypes) {
+                const char* name = LevelEntityTypeName(type);
+                if (!matches(name)) continue;
+                ImGui::PushID(name);
+                // Reuses the Hierarchy's per-type colour so a type reads the
+                // same here as it does in the outliner and the viewport.
+                ImGui::ColorButton("##entityswatch",
+                    ImGui::ColorConvertU32ToFloat4(TypeColor(type, false)),
+                    ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
+                    ImVec2(28.0f, 28.0f));
+                ImGui::SameLine();
+                if (ImGui::Selectable(name, false,
+                                      ImGuiSelectableFlags_AllowDoubleClick,
+                                      ImVec2(0.0f, 28.0f))) {
+                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                        AddEntity(type);
+                }
+                // Entity types travel as their LevelEntityTypeName string, which
+                // ParseLevelEntityType turns back into the enum at the drop.
+                // A separate payload type from SGE_PREFAB_ID because the drop
+                // handler has to call AddEntity, not AddPrefab.
+                if (ImGui::BeginDragDropSource()) {
+                    ImGui::SetDragDropPayload("SGE_ENTITY_TYPE", name,
+                                              std::strlen(name) + 1);
+                    ImGui::Text("Place %s", name);
+                    ImGui::EndDragDropSource();
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Double-click or drag to place %s", name);
+                ImGui::PopID();
+            }
+
+            ImGui::SeparatorText("Prefabs");
+            const auto& prefabs = prefabRegistry_.Assets();
+            size_t shown = 0;
+            for (size_t i = 0; i < prefabs.size(); ++i) {
+                const PrefabAsset& prefab = prefabs[i];
+                if (!IsFavouritePrefab(prefab.id)) continue;
+                if (!matches(prefab.name + " " + prefab.id)) continue;
+                ++shown;
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      ImVec4(1.0f, 0.82f, 0.25f, 1.0f));
+                if (ImGui::Button("*", ImVec2(22.0f, 42.0f)))
+                    ToggleFavouritePrefab(prefab.id);
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Remove from Favourites");
+                ImGui::SameLine();
+                const uint64_t thumbnail =
+                    thumbnailTexture && prefab.error.empty()
+                        ? thumbnailTexture(prefab) : 0;
+                if (thumbnail)
+                    ImGui::Image((ImTextureID)(intptr_t)thumbnail,
+                                 ImVec2(42.0f, 42.0f));
+                else
+                    ImGui::ColorButton("##thumbnail",
+                        ImVec4(0.22f, 0.62f, 0.42f, 1.0f),
+                        ImGuiColorEditFlags_NoTooltip |
+                            ImGuiColorEditFlags_NoDragDrop,
+                        ImVec2(42.0f, 42.0f));
+                ImGui::SameLine();
+                const std::string label = prefab.error.empty()
+                    ? prefab.name : prefab.name + "  [INVALID]";
+                if (ImGui::Selectable(label.c_str(), false,
+                                      ImGuiSelectableFlags_AllowDoubleClick)) {
+                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+                        prefab.error.empty())
+                        AddPrefab(prefab, camera, terrainHeight);
+                }
+                // Same payload the Prefabs tab publishes, so a favourite can be
+                // dragged into the viewport exactly like any other prefab.
+                if (prefab.error.empty() && ImGui::BeginDragDropSource()) {
+                    ImGui::SetDragDropPayload("SGE_PREFAB_ID", prefab.id.c_str(),
+                        prefab.id.size() + 1);
+                    ImGui::Text("Place %s", prefab.name.c_str());
+                    ImGui::EndDragDropSource();
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Double-click or drag to place %s",
+                                      prefab.name.c_str());
+                ImGui::PopID();
+            }
+            // Starred ids outliving their prefab is normal (the file was deleted
+            // or renamed), so say so rather than silently showing nothing.
+            if (shown == 0) {
+                if (favouritePrefabs_.empty())
+                    ImGui::TextDisabled(
+                        "No favourite prefabs. Star one on the Prefabs tab.");
+                else
+                    ImGui::TextDisabled(
+                        "No favourite prefabs match, or the starred prefabs are missing.");
+            }
+            ImGui::EndChild();
         } else {
             const AssetKind kind = assetKindTab_ == 0 ? AssetKind::Model :
                 assetKindTab_ == 1 ? AssetKind::Texture :
@@ -2201,12 +2444,9 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         ImGui::EndDragDropTarget();
     }
     ImGui::SeparatorText("Create");
-    const LevelEntityType types[] = { LevelEntityType::WoodHouse, LevelEntityType::MetalHouse,
-        LevelEntityType::Palm, LevelEntityType::ExplosiveBarrel, LevelEntityType::EnemySpawn,
-        LevelEntityType::AllySpawn,
-        LevelEntityType::Humvee, LevelEntityType::Helicopter, LevelEntityType::PlayerSpawn,
-        LevelEntityType::GrassPatch, LevelEntityType::Dandelion, LevelEntityType::Rock };
-    for (auto type : types) {
+    // Shares kBuiltInSpawnTypes with the Content Browser's Favourites tab so the
+    // two lists cannot drift apart when a new entity type is added.
+    for (auto type : kBuiltInSpawnTypes) {
         if (ImGui::SmallButton(LevelEntityTypeName(type))) AddEntity(type);
         if (type != LevelEntityType::PlayerSpawn) ImGui::SameLine();
     }
@@ -2306,6 +2546,38 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             ImGui::EndDisabled();
             if (!SupportsScale(entity->type))
                 ImGui::TextDisabled("Scale locked for gameplay physics");
+        }
+        if (entity->type == LevelEntityType::EnemySpawn) {
+            ImGui::SeparatorText("Loadout");
+            // Index 0 is "Random", which is stored by REMOVING the override
+            // rather than writing a sentinel -- so a spawner left alone keeps an
+            // empty overrides object and the level file is unchanged.
+            // The editor stays free of the gameplay headers (SkinnedEnemy.h
+            // pulls in DX12, the FBX importer and navigation), so the loadout is
+            // handled as the plain strings the level format actually stores.
+            // kEnemyWeaponIds must match ParseBanditWeapon in SkinnedEnemy.h.
+            const char* weaponNames[] = { "Random", "Rifle", "Shotgun", "Sniper" };
+            const char* weaponIds[] = { "rifle", "shotgun", "sniper" };
+            int selection = 0;
+            const auto found = entity->overrides.find("enemyWeapon");
+            if (found != entity->overrides.end() && found->is_string()) {
+                const std::string current = found->get<std::string>();
+                for (int i = 0; i < IM_ARRAYSIZE(weaponIds); ++i)
+                    if (current == weaponIds[i]) selection = i + 1;
+            }
+            const LevelDefinition weaponBefore = level_;
+            if (ImGui::Combo("Weapon", &selection, weaponNames,
+                             IM_ARRAYSIZE(weaponNames))) {
+                if (selection == 0) entity->overrides.erase("enemyWeapon");
+                else entity->overrides["enemyWeapon"] = weaponIds[selection - 1];
+                // Not a transform edit, so no entity id: this changes what
+                // spawns, which the runtime only reads at the next spawn.
+                TrackItemEdit(weaponBefore, true);
+            }
+            ImGui::TextDisabled(
+                "Sniper: long range, laser warning, 80 hp.\n"
+                "Shotgun: closes fast, 130 hp.\n"
+                "Random: whatever the level roll gives.");
         }
         ImGui::SeparatorText("Gizmo");
         if (ImGui::RadioButton("Move (W)", gizmoOperation_ == 0)) gizmoOperation_ = 0;
@@ -2671,13 +2943,10 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             ImGuizmo::DecomposeMatrixToComponents(&world._11, translation, rotation, scale);
             std::copy(translation, translation + 3, entity->transform.position);
             if (terrainSnap_ && operation == ImGuizmo::TRANSLATE && terrainHeight &&
-                entity->type != LevelEntityType::Helicopter &&
-                entity->type != LevelEntityType::PlayerSpawn) {
-                float offset = 0.0f;
-                if (entity->type == LevelEntityType::ExplosiveBarrel) offset = 0.75f;
-                else if (entity->type == LevelEntityType::Humvee) offset = 3.45f;
+                TerrainSnaps(entity->type)) {
                 entity->transform.position[1] = terrainHeight(
-                    entity->transform.position[0], entity->transform.position[2]) + offset;
+                    entity->transform.position[0], entity->transform.position[2]) +
+                    TerrainSnapOffset(entity->type);
             }
             if (entity->type == LevelEntityType::WoodHouse ||
                 entity->type == LevelEntityType::MetalHouse) {
@@ -2697,7 +2966,9 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     }
 
     if (const ImGuiPayload* dragging = ImGui::GetDragDropPayload();
-        dragging && dragging->IsDataType("SGE_PREFAB_ID")) {
+        dragging && (dragging->IsDataType("SGE_PREFAB_ID") ||
+                     dragging->IsDataType("SGE_ENTITY_TYPE"))) {
+        const bool draggingEntityType = dragging->IsDataType("SGE_ENTITY_TYPE");
         ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
         ImGui::SetNextWindowSize(display);
         ImGui::SetNextWindowBgAlpha(0.0f);
@@ -2714,8 +2985,10 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         {
             XMFLOAT3 ghost;
             if (TerrainPointUnderMouse(view, projection, terrainHeight, ghost)) {
+                // Only a prefab payload names a prefab; an entity-type payload
+                // carries a LevelEntityTypeName, which would never resolve here.
                 const PrefabAsset* dragged = nullptr;
-                if (dragging->Data)
+                if (dragging->Data && !draggingEntityType)
                     dragged = prefabRegistry_.Find(
                         static_cast<const char*>(dragging->Data));
                 // Footprint radius from the prefab's authored size, so a tower
@@ -2775,11 +3048,13 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
 
                 // Readout of the exact drop point, so a placement can be matched
                 // to a coordinate without committing it first.
-                if (dragged && haveBase) {
+                const char* ghostName = dragged ? dragged->name.c_str()
+                    : (draggingEntityType && dragging->Data
+                        ? static_cast<const char*>(dragging->Data) : nullptr);
+                if (ghostName && haveBase) {
                     char label[128];
                     std::snprintf(label, sizeof(label), "%s  %.1f, %.1f, %.1f",
-                                  dragged->name.c_str(), ghost.x, ghost.y,
-                                  ghost.z);
+                                  ghostName, ghost.x, ghost.y, ghost.z);
                     ghostDraw->AddText(ImVec2(base.x + 10.0f, base.y + 6.0f),
                                        ghostColour, label);
                 }
@@ -2800,6 +3075,36 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
                             placed->transform.position[0] = hit.x;
                             placed->transform.position[1] = hit.y;
                             placed->transform.position[2] = hit.z;
+                        }
+                    }
+                }
+            }
+            // Built-in types dropped from the Favourites tab. AddEntity applies
+            // the type's own defaults (scale, single-instance handling for
+            // PlayerSpawn/Helicopter), then the drop point overrides XZ.
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(
+                    "SGE_ENTITY_TYPE")) {
+                LevelEntityType dropped = LevelEntityType::Rock;
+                if (payload->Data &&
+                    ParseLevelEntityType(
+                        static_cast<const char*>(payload->Data), dropped)) {
+                    XMFLOAT3 hit;
+                    const bool hasHit = TerrainPointUnderMouse(
+                        view, projection, terrainHeight, hit);
+                    AddEntity(dropped);
+                    if (hasHit) {
+                        if (LevelEntity* placed = Selected()) {
+                            placed->transform.position[0] = hit.x;
+                            placed->transform.position[2] = hit.z;
+                            // Ground-hugging types sit on the terrain with their
+                            // authored offset. Helicopter and PlayerSpawn keep
+                            // the altitude AddEntity just gave them (read off
+                            // the entity rather than duplicated here, so the two
+                            // cannot drift), matching the gizmo's snap
+                            // exclusions.
+                            if (TerrainSnaps(dropped))
+                                placed->transform.position[1] =
+                                    hit.y + TerrainSnapOffset(dropped);
                         }
                     }
                 }

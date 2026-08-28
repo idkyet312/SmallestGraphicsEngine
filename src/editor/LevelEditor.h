@@ -42,6 +42,12 @@ public:
     void NewFromLevelOne();
     // Discards the current level for an empty flat plane with one spawn.
     void NewFlat();
+    // Replaces the edited level with the one at `path`, resetting undo, ids and
+    // every derived-state dirty flag. Returns false and leaves the current level
+    // untouched if the file will not load; `status` carries the reason.
+    // Shared by the editor's own Load popup and the main menu's editor launcher
+    // so there is exactly one definition of what loading a level means.
+    bool LoadFrom(const std::filesystem::path& path);
     void BeginPlay();
     void StopPlay();
     bool IsPlaying() const { return playing_; }
@@ -149,6 +155,10 @@ private:
     bool FoliageChanged(const LevelDefinition& before) const;
     bool TerrainChanged(const LevelDefinition& before) const;
     bool EnvironmentChanged(const LevelDefinition& before) const;
+    bool IsFavouritePrefab(const std::string& prefabId) const;
+    void ToggleFavouritePrefab(const std::string& prefabId);
+    void LoadFavourites();
+    void SaveFavourites() const;
     void SculptTerrain(DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
         const std::function<float(float, float)>& terrainHeight);
     // Terrain tool 5: paint layer weights into the level's splatmap. Shares the
@@ -260,6 +270,11 @@ private:
     // to judge distant terrain edits without flying the camera out to them.
     bool birdseyeEnabled_ = false;
     int assetKindTab_ = 3;
+    // Prefab ids the user starred. Kept as ids rather than indices because the
+    // registry reorders on every Refresh -- an index would silently point at a
+    // different prefab after an import. Persisted to assetcache/favourites.json.
+    std::vector<std::string> favouritePrefabs_;
+    bool favouritesLoaded_ = false;
     int selectedPrefab_ = -1;
     int prefabDraftIndex_ = -1;
     PrefabAsset prefabDraft_;

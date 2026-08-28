@@ -2,6 +2,7 @@
 // A skinned character instance: owns the shared SkinnedModel, an animation
 // player, and a per-frame bone-palette upload buffer, and knows how to draw
 // itself through the mesh-shader path with skinning enabled.
+#include "BanditWeapon.h"
 #include "SkinnedFBXImporter.h"
 #include "AnimationRuntime.h"
 #include "MeshShaderDX12.h"
@@ -51,13 +52,8 @@ extern std::vector<EnemyNoiseEvent> g_enemyNoiseEvents;
 struct EnemyAlertEvent { DirectX::XMFLOAT3 position; float radius; };
 extern std::vector<EnemyAlertEvent> g_enemyAlertEvents;
 
-// Loadout class. Rifle is the original bandit behaviour; the other two change
-// engagement range, damage, and the shape of a shot rather than the model.
-enum class BanditWeapon {
-    Rifle,
-    Shotgun,
-    Sniper,
-};
+// BanditWeapon and its name/parse helpers live in their own header so the level
+// format and its tests can use them without pulling DX12 in behind them.
 
 enum class Faction : uint8_t { Bandit, Marine };
 
@@ -77,6 +73,13 @@ public:
     // construction (shotgunners 130, snipers 80), so any single capture point
     // would miss one of them. Anything below this means the enemy has been hit.
     float             peakHealth = 0.0f;
+    // Incoming damage multiplier. 1.0 is "takes damage as authored"; marines run
+    // 0.25 so an ally soaks four times its health bar without the inflated
+    // number, which kept tripping up code tuned around a 100 max (see the cover
+    // hold in main.cpp). Applied through ScaleIncomingDamage below rather than
+    // at each call site, so every source -- bullets, explosions, debris, fire --
+    // is reduced by the same factor.
+    float             damageTakenScale = 1.0f;
     float             moveSpeed = 1.8f;
     // Asset-space orientation and ground offset.
     // Assimp preserves this UE asset's Z-up skeleton. Rotate +Z onto engine +Y.
@@ -788,9 +791,21 @@ public:
     // logic lives in here despite the name.
     bool PerceivePlayer(const DirectX::XMFLOAT3& target) const {
         if (dead_ || held_) return false;
-        if (turretGunner) return true;
         const float dx = target.x - position.x, dz = target.z - position.z;
         const float distSq = dx * dx + dz * dz;
+        // A turret gunner used to `return true` here unconditionally, which was
+        // unlimited range: it entered combat the instant a level loaded, from
+        // anywhere on the island, through terrain. It keeps its advantages --
+        // no forward cone (the turret traverses) and a much longer reach than a
+        // man on foot, since it is elevated behind a mounted optic -- but it now
+        // has to actually be able to see you.
+        if (turretGunner) {
+            if (distSq > kTurretGunnerVisionRange * kTurretGunnerVisionRange)
+                return false;
+            if (distSq <= 1e-6f) return true;
+            return !g_enemyLineOfSightFn ||
+                   g_enemyLineOfSightFn(*this, target);
+        }
         const float sightRange = VisionRange();
         if (distSq <= sightRange * sightRange && distSq > 1e-6f) {
             const float invLen = 1.0f / std::sqrt(distSq);
@@ -1163,7 +1178,9 @@ public:
         if (headshot) *headshot = hitHead;
         // Standard rifle balance: one headshot, exactly five body hits from
         // full 100 health.
-        const float appliedDamage = hitHead && allowHeadshotKill ? health : bodyDamage;
+        const bool lethalHeadshot = hitHead && allowHeadshotKill;
+        const float appliedDamage = ScaleIncomingDamage(
+            lethalHeadshot ? health : bodyDamage, lethalHeadshot);
         health -= appliedDamage;
         RegisterThreat(appliedDamage);
         if (health <= 0.0f)
@@ -1325,7 +1342,7 @@ public:
         if (distance < 0.001f) away = XMVectorSet(0.0f, 0.4f, 1.0f, 0.0f);
         away = XMVector3Normalize(away + XMVectorSet(0.0f, 0.35f, 0.0f, 0.0f));
         const float falloff = (std::max)(0.2f, 1.0f - distance / radius);
-        const float appliedDamage = damage * falloff;
+        const float appliedDamage = ScaleIncomingDamage(damage * falloff);
         health -= appliedDamage;
         RegisterThreat(appliedDamage);
 
@@ -1387,10 +1404,12 @@ public:
             closestZ);
         if (hitPoint) *hitPoint = impact;
 
-        const float damage = debris.lethalImpact ? health :
-            (std::min)(80.0f, (std::max)(8.0f,
-                (speed - 2.5f) * 7.0f +
-                std::sqrt((std::max)(0.05f, debris.mass)) * 3.0f));
+        const float damage = ScaleIncomingDamage(
+            debris.lethalImpact ? health :
+                (std::min)(80.0f, (std::max)(8.0f,
+                    (speed - 2.5f) * 7.0f +
+                    std::sqrt((std::max)(0.05f, debris.mass)) * 3.0f)),
+            debris.lethalImpact);
         health -= damage;
         RegisterThreat(damage);
         debrisHitCooldown_ = 0.45f;
@@ -1420,7 +1439,7 @@ public:
         if (dead_ || burnTime_ <= 0.0f || dt <= 0.0f) return false;
         burnTime_ = (std::max)(0.0f, burnTime_ - dt);
         burnSpreadCooldown_ -= dt;
-        health -= (std::max)(0.0f, damagePerSecond) * dt;
+        health -= ScaleIncomingDamage((std::max)(0.0f, damagePerSecond) * dt);
         if (health > 0.0f) return false;
         const DirectX::XMFLOAT3 upward{ 0.0f, 1.0f, 0.0f };
         const DirectX::XMFLOAT3 impact{
@@ -1686,8 +1705,27 @@ private:
     DirectX::XMFLOAT3 patrolWaypoint_{ 0.0f, 0.0f, 0.0f };
     float patrolPauseTimer_ = 0.0f;
     static constexpr float kVisionRange = 28.0f;
+    // Mounted-optic reach for a turret gunner. Deliberately not scaled by
+    // g_enemyVisionScale: darkness and fog already gate the gunner through the
+    // line-of-sight check, and folding the scale in here would drop its night
+    // range below a foot bandit's daylight range, which reads as broken rather
+    // than as stealth working.
+    static constexpr float kTurretGunnerVisionRange = 70.0f;
     static constexpr float kVisionHalfFovCos = 0.173648f; // cos(80 deg): 160 deg cone
     static constexpr float kAlertBroadcastRadius = 19.0f;
+
+    // Applies damageTakenScale to an incoming hit.
+    //
+    // `guaranteedLethal` marks damage the caller computed AS the remaining
+    // health to force a kill -- a headshot, or debris flagged lethalImpact.
+    // Those must not be scaled: a quarter of "exactly enough to kill" is a
+    // survivable wound, which would turn a clean headshot into a graze. The
+    // resistance is meant to make an ally durable under fire, not immune to
+    // being shot in the head.
+    float ScaleIncomingDamage(float damage, bool guaranteedLethal = false) const {
+        if (guaranteedLethal) return damage;
+        return damage * (std::max)(0.0f, damageTakenScale);
+    }
 
     void RegisterThreat(float damage) {
         if (damage <= 0.0f || dead_) return;

@@ -1,4 +1,5 @@
 #include "LevelDefinition.h"
+#include "BanditWeapon.h"
 
 #include <filesystem>
 #include <fstream>
@@ -201,6 +202,59 @@ int main() {
       "transform":{"position":[0,1.7,0],"rotation":[0,0,0],
       "scale":[1,1,1]}}]})"; }
     CHECK(!LoadLevel(badInsertion).ok);
+
+    // Per-spawner enemy loadout. Stored in the entity's `overrides` blob, so it
+    // has to survive a save/load round trip like any other override.
+    {
+        const auto loadoutPath = root / "loadout.json";
+        { std::ofstream stream(loadoutPath); stream << R"({
+          "schemaVersion":1,"name":"Loadout",
+          "terrain":{"heightScale":5},
+          "entities":[{"id":1,"type":"player_spawn","name":"Player",
+          "transform":{"position":[0,1.7,0],"rotation":[0,0,0],
+          "scale":[1,1,1]}},
+          {"id":2,"type":"enemy_spawn","name":"Sniper Post",
+          "overrides":{"enemyWeapon":"sniper"},
+          "transform":{"position":[4,0,4],"rotation":[0,0,0],
+          "scale":[1,1,1]}}]})"; }
+        LevelLoadResult loaded = LoadLevel(loadoutPath);
+        CHECK(loaded.ok);
+        CHECK(loaded.level.entities.size() == 2);
+        const LevelEntity& spawner = loaded.level.entities[1];
+        CHECK(spawner.type == LevelEntityType::EnemySpawn);
+        CHECK(spawner.overrides.value("enemyWeapon", std::string()) == "sniper");
+
+        // Round trip: saving and reloading must not drop the override.
+        const auto resaved = root / "loadout-resaved.json";
+        CHECK(SaveLevel(loaded.level, resaved).ok);
+        LevelLoadResult reloaded = LoadLevel(resaved);
+        CHECK(reloaded.ok);
+        CHECK(reloaded.level.entities.size() == 2);
+        CHECK(reloaded.level.entities[1].overrides.value(
+                  "enemyWeapon", std::string()) == "sniper");
+
+        // A spawner with no authored loadout keeps an empty overrides object,
+        // which is what makes "Random" cost nothing in the level file.
+        CHECK(loaded.level.entities[0].overrides.empty());
+    }
+
+    // The editor writes these ids as plain strings (it deliberately does not
+    // include the gameplay headers), so the two lists can only be kept in step
+    // by pinning them here. If a name changes on one side, this fails rather
+    // than silently turning authored snipers back into riflemen.
+    {
+        BanditWeapon parsed = BanditWeapon::Rifle;
+        CHECK(ParseBanditWeapon("rifle", parsed) &&
+              parsed == BanditWeapon::Rifle);
+        CHECK(ParseBanditWeapon("shotgun", parsed) &&
+              parsed == BanditWeapon::Shotgun);
+        CHECK(ParseBanditWeapon("sniper", parsed) &&
+              parsed == BanditWeapon::Sniper);
+        CHECK(!ParseBanditWeapon("machinegun", parsed));
+        CHECK(std::string(BanditWeaponName(BanditWeapon::Rifle)) == "rifle");
+        CHECK(std::string(BanditWeaponName(BanditWeapon::Shotgun)) == "shotgun");
+        CHECK(std::string(BanditWeaponName(BanditWeapon::Sniper)) == "sniper");
+    }
 
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);

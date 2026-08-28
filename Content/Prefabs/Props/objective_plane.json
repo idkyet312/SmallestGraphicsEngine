@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 2,
+  "id": "props/objective_plane",
+  "name": "Objective Plane",
+  "components": {
+    "staticMesh": {
+      "path": "Content/Models/ObjectivePlane/ObjectivePlane.glb",
+      "defaultScale": [1.0, 1.0, 1.0],
+      "targetSize": 14.0,
+      "castShadow": true,
+      "useMaterials": true,
+      "materialAmbientScale": 1.0,
+      "materialViewFillStrength": 0.0
+    },
+    "collision": {
+      "shape": "box"
+    },
+    "destructible": {
+      "health": 1200.0
+    }
+  }
+}
