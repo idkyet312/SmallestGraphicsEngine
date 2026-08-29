@@ -1784,6 +1784,15 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::SameLine();
     if (ImGui::Button("Assets")) assetBrowserOpen_ = !assetBrowserOpen_;
     ImGui::SameLine();
+    if (ImGui::Button("Refresh")) actions.refreshVisuals = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Reload every prefab model and rebuild the viewport.\n"
+            "Use this when a placed prop is in the hierarchy but not\n"
+            "drawn: the per-edit sync skips models that were not cached\n"
+            "yet, so a house placed before its model finished loading\n"
+            "can stay invisible until something else forces a rebuild.");
+    ImGui::SameLine();
     ImGui::BeginDisabled(undo_.empty());
     if (ImGui::Button("Undo")) Undo();
     ImGui::EndDisabled();

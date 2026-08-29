@@ -21576,6 +21576,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_game.commands.Set(
                 GameCommand::EditorReturnToMenu, actions.returnToMenu);
             g_editorFullReconcileRequested |= actions.fullReconcile;
+            // Manual viewport refresh. Re-scans the prefab and asset registries
+            // so a model added on disk since the editor opened is picked up,
+            // then asks for the visual rebuild that actually loads what is not
+            // cached -- the per-edit sync path skips loading to stay cheap, and
+            // that is what leaves a freshly placed house invisible.
+            //
+            // Only the flag is set here. The rebuild itself has to run at the
+            // top of the next frame, before any pass binds the resources it
+            // replaces: doing it from this late ImGui phase destroys models the
+            // open command list still references.
+            if (actions.refreshVisuals) {
+                g_assetRegistry.Refresh();
+                g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
+                g_editorVisualPrefabRefreshRequested = true;
+            }
             if (actions.rebuildDXRDDGI)
                 g_game.commands.Request(GameCommand::RebuildDDGI);
             if (actions.resetDXRDDGIHistory)

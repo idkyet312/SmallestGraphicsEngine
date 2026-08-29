@@ -21,6 +21,15 @@ class Camera;
 struct LevelEditorActions {
     bool levelChanged = false;
     bool fullReconcile = false;
+    // Force the viewport to re-resolve every prefab model and rebuild its
+    // render batches, loading whatever is not cached yet.
+    //
+    // The per-edit sync path deliberately skips model loading to stay cheap, so
+    // a prefab placed before its .glb reached the cache draws nothing. That
+    // normally self-heals a frame later, but a placement that lands while no
+    // other rebuild is pending can leave the prop missing until an unrelated
+    // edit forces a compile. This is the manual way out.
+    bool refreshVisuals = false;
     bool beginPlay = false;
     bool stopPlay = false;
     bool returnToMenu = false;
