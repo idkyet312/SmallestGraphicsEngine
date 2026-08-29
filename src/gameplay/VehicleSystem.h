@@ -298,11 +298,12 @@ struct VehicleSystem {
     // reinforcement dropship flies in along, so the way out is the same
     // direction the enemy keeps arriving from. Reaching it finishes the level.
     //
-    // Placed once per run, the first time a wave is called: before that there is
-    // no inbound lane to sit under, and an exfil boat on the water from the
-    // opening second would advertise the ending before the mission has one.
+    // Placed once per run, when the objective aircraft is resolved: before that
+    // the mission has no ending to offer, and an exfil boat on the water from
+    // the opening second would advertise one the player has not earned.
     static constexpr float EscapeBoatBoardRadius = 6.5f;
-    // How far out from the island centre the boat waits.
+    // How far out from the island centre the boat waits, when nothing wider is
+    // asked for.
     //
     // The beach profile crosses the waterline around 43 m (y = +0.04 at 40 m,
     // y = -0.21 at 42 m), and the seabed finishes sloping to full depth at 88 m.
@@ -312,6 +313,30 @@ struct VehicleSystem {
     //
     // Was 42 m, which floated the boat on the very edge of the shelf.
     static constexpr float EscapeBoatShoreDistance = 50.0f;
+
+    // Clearance the exfil keeps outside the insertion ring.
+    //
+    // The way out has to read as further out than the way in, and the ring is
+    // the only distance the player has actually seen before the boat appears --
+    // deploying from it is the first thing a run does. A boat inside or level
+    // with it would make the exfil look like a walk back to the start rather
+    // than a leg out to sea.
+    //
+    // 16 m because the ring's 20 points sit ~10 m apart on the default 34 m
+    // radius: a smaller gap and the boat reads as just another ring point on
+    // the horizon instead of somewhere past them.
+    static constexpr float EscapeBoatRingClearance = 16.0f;
+
+    // Where the boat sits for a run whose insertion ring has this radius.
+    //
+    // The floor keeps a tight ring (authorable down to 5 m) from parking the
+    // hull on the beach shelf, and the clearance keeps a wide one (up to 600 m)
+    // from swallowing the boat inside the ring it is meant to sit beyond.
+    static constexpr float EscapeBoatDistanceForRing(float deploymentRadius) {
+        const float beyondRing = deploymentRadius + EscapeBoatRingClearance;
+        return beyondRing > EscapeBoatShoreDistance ? beyondRing
+                                                    : EscapeBoatShoreDistance;
+    }
 
     bool escapeBoatActive = false;
     DirectX::XMFLOAT3 escapeBoatPosition{};
@@ -329,14 +354,19 @@ struct VehicleSystem {
     // first reinforcement wave flew in along. A fixed exfil meant the way out
     // was known before the mission started; a rolled one has to be found.
     //
+    // `shoreDistance` is how far out along that bearing the hull sits. Pass
+    // EscapeBoatDistanceForRing(...) so the exfil clears the run's own
+    // insertion ring rather than a radius fixed at compile time.
+    //
     // Idempotent: later waves must not move an exfil the player may already be
     // swimming toward.
-    void PlaceEscapeBoatOnBearing(float bearingRadians, float waterY) {
+    void PlaceEscapeBoatOnBearing(float bearingRadians, float waterY,
+                                  float shoreDistance) {
         if (escapeBoatActive) return;
         const float nx = std::sin(bearingRadians);
         const float nz = std::cos(bearingRadians);
         escapeBoatPosition = {
-            nx * EscapeBoatShoreDistance, waterY, nz * EscapeBoatShoreDistance };
+            nx * shoreDistance, waterY, nz * shoreDistance };
         // Bow pointed out to sea, the way it would leave.
         escapeBoatYaw = std::atan2(nx, nz);
         escapeBoatBobTime = 0.0f;

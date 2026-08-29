@@ -67,6 +67,13 @@ void ApplyLiveWeatherState(WeatherState state);
 // that actually carry one. Defined in main.cpp, which owns the prefab runtime.
 bool CommTowerObjectiveStatus(float& health, float& maxHealth);
 
+// Aircraft objective status for the HUD. Unlike the tower this one moves, so it
+// reports the airframe's current world position for a tracking marker alongside
+// its health. `down` is set once it has been shot down and is crashing or
+// landed. Returns false when there is nothing to mark. Defined in main.cpp.
+bool ObjectivePlaneStatus(DirectX::XMFLOAT3& position, float& health,
+                          float& maxHealth, bool& down);
+
 // On-screen dual-stick controls: analog movement and analog camera look.
 inline void RenderMovementPad() {
     virtualInput.moveX = virtualInput.moveY = 0.0f;
@@ -321,6 +328,103 @@ inline void RenderPlayerHUD(const Scene& scene) {
             draw->AddText(ImVec2(kMarkerX, kMarkerY + 20.0f),
                           IM_COL32(226, 232, 236, 235),
                           "Reach the comms tower");
+        }
+    }
+
+    // ---- Aircraft objective ------------------------------------------------
+    //
+    // A world-space tracking marker rather than the tower's fixed corner block:
+    // the plane taxis, climbs and falls, so the marker has to follow it. Drawn
+    // as a diamond over the airframe with its health directly beneath, and
+    // clamped to the screen edge with an arrow while it is off-view -- otherwise
+    // the objective simply vanishes the moment the player looks away from it,
+    // which is most of the time on a runway approach.
+    {
+        DirectX::XMFLOAT3 planePosition{};
+        float planeHealth = 0.0f, planeMaxHealth = 0.0f;
+        bool planeDown = false;
+        if (scene.sniperScopeBlend < 0.25f &&
+            ObjectivePlaneStatus(planePosition, planeHealth, planeMaxHealth,
+                                 planeDown)) {
+            const DirectX::XMMATRIX viewProjection =
+                scene.GetViewMatrix() * scene.GetProjectionMatrix();
+            // Marker sits above the airframe so it does not cover the model.
+            DirectX::XMFLOAT3 marked = planePosition;
+            marked.y += 6.0f;
+            const DirectX::XMVECTOR clip = DirectX::XMVector3Transform(
+                DirectX::XMLoadFloat3(&marked), viewProjection);
+            const float w = DirectX::XMVectorGetW(clip);
+            // Behind the camera: w flips sign, so the projected point mirrors to
+            // the wrong side. Negate into a direction that still points the right
+            // way for the edge clamp below.
+            const bool behind = w <= 0.01f;
+            const float safeW = behind ? -w : w;
+            float sx = (DirectX::XMVectorGetX(clip) / safeW * 0.5f + 0.5f) *
+                       io.DisplaySize.x;
+            float sy = (1.0f - (DirectX::XMVectorGetY(clip) / safeW * 0.5f +
+                                0.5f)) * io.DisplaySize.y;
+            if (behind) {
+                sx = io.DisplaySize.x - sx;
+                sy = io.DisplaySize.y - sy;
+            }
+
+            constexpr float kEdgePad = 46.0f;
+            const float clampedX = (std::max)(kEdgePad,
+                (std::min)(io.DisplaySize.x - kEdgePad, sx));
+            const float clampedY = (std::max)(kEdgePad,
+                (std::min)(io.DisplaySize.y - kEdgePad, sy));
+            const bool offscreen =
+                behind || clampedX != sx || clampedY != sy;
+            const ImVec2 at(clampedX, clampedY);
+
+            // Amber while it is a live threat, dimmed once it is down: the
+            // marker stays long enough to show the wreck, but stops shouting.
+            const ImU32 colour = planeDown
+                ? IM_COL32(150, 158, 162, 200)
+                : IM_COL32(255, 196, 78, 245);
+
+            if (offscreen) {
+                // An arrow pointing off toward it, instead of a diamond sitting
+                // on the screen edge pretending to be the aircraft's position.
+                const float dx = sx - io.DisplaySize.x * 0.5f;
+                const float dy = sy - io.DisplaySize.y * 0.5f;
+                const float angle = std::atan2(dy, dx);
+                const float ca = std::cos(angle), sa = std::sin(angle);
+                constexpr float kArrow = 9.0f;
+                const ImVec2 tip(at.x + ca * kArrow, at.y + sa * kArrow);
+                const ImVec2 left(at.x + (-ca * 0.6f - sa) * kArrow,
+                                  at.y + (-sa * 0.6f + ca) * kArrow);
+                const ImVec2 right(at.x + (-ca * 0.6f + sa) * kArrow,
+                                   at.y + (-sa * 0.6f - ca) * kArrow);
+                draw->AddTriangleFilled(tip, left, right, colour);
+            } else {
+                constexpr float kDiamond = 7.0f;
+                const ImVec2 points[4] = {
+                    ImVec2(at.x, at.y - kDiamond),
+                    ImVec2(at.x + kDiamond, at.y),
+                    ImVec2(at.x, at.y + kDiamond),
+                    ImVec2(at.x - kDiamond, at.y) };
+                draw->AddPolyline(points, 4, colour, ImDrawFlags_Closed, 1.8f);
+            }
+
+            // Health bar under the marker, in the same place whether the marker
+            // is a diamond or an edge arrow, so the readout never jumps.
+            const float fraction = (std::max)(0.0f, (std::min)(1.0f,
+                planeHealth / (std::max)(1.0f, planeMaxHealth)));
+            constexpr float kBarWidth = 54.0f;
+            constexpr float kBarHeight = 3.0f;
+            const ImVec2 barMin(at.x - kBarWidth * 0.5f, at.y + 13.0f);
+            const ImVec2 barMax(barMin.x + kBarWidth, barMin.y + kBarHeight);
+            draw->AddRectFilled(barMin, barMax, IM_COL32(0, 0, 0, 130), 1.5f);
+            if (fraction > 0.0f)
+                draw->AddRectFilled(barMin,
+                    ImVec2(barMin.x + kBarWidth * fraction, barMax.y),
+                    colour, 1.5f);
+
+            const char* label = planeDown ? "AIRCRAFT DOWN" : "AIRCRAFT";
+            const ImVec2 labelSize = ImGui::CalcTextSize(label);
+            draw->AddText(ImVec2(at.x - labelSize.x * 0.5f, barMax.y + 3.0f),
+                          colour, label);
         }
     }
 

@@ -230,14 +230,24 @@ static bool FindCommTower(uint64_t entityId, DirectX::XMFLOAT3& base);
 // The source GLB carries no animation or skin (verified: 38 static mesh nodes,
 // zero animation channels), and GLBImporter loads meshes and skins only. The
 // takeoff is therefore driven procedurally off the batch's draw transform:
-// hold, accelerate down the runway, rotate, then climb out on a banking turn.
+// hold, accelerate down the runway, rotate, then climb straight out.
 static constexpr const char* kObjectivePlanePrefabId = "props/objective_plane";
 // Time from level start until the aircraft begins its roll.
-static constexpr float kObjectivePlaneHoldSeconds = 20.0f;
+static constexpr float kObjectivePlaneHoldSeconds = 90.0f;
 // How long the roll/rotate/climb takes once started. After this it is gone.
 static constexpr float kObjectivePlaneTakeoffSeconds = 14.0f;
 static constexpr float kObjectivePlaneTaxiSpeed = 34.0f;   // m/s at rotation
 static constexpr float kObjectivePlaneClimbRate = 11.0f;   // m/s once airborne
+// Crash-out, matching the Black Hawk's numbers so a downed aircraft reads the
+// same way: gravity pulls it in while it tumbles, and it is on the ground in a
+// couple of seconds rather than gliding away.
+static constexpr float kObjectivePlaneCrashGravity = 9.81f;
+static constexpr float kObjectivePlaneCrashPitchRate = 0.42f;
+static constexpr float kObjectivePlaneCrashRollRate = 0.78f;
+static constexpr float kObjectivePlaneCrashYawRate = 0.55f;
+// Bleed off forward speed on the way down so it plants near where it was hit
+// instead of carrying its full takeoff velocity across the map.
+static constexpr float kObjectivePlaneCrashDrag = 0.6f;
 
 struct ObjectivePlaneState {
     uint64_t entityId = 0;
@@ -263,6 +273,34 @@ struct ObjectivePlaneState {
     bool rolling = false;
     bool escaped = false;
     bool destroyed = false;
+    // Crash state, mirroring the Black Hawk's: once hit the airframe keeps its
+    // last pose and falls under gravity along the velocity it was carrying,
+    // tumbling, until it reaches the terrain under it.
+    bool crashing = false;
+    bool crashed = false;
+    DirectX::XMFLOAT3 crashPosition{};
+    DirectX::XMFLOAT3 crashVelocity{};
+    float crashPitch = 0.0f;
+    float crashRoll = 0.0f;
+    float crashYaw = 0.0f;
+    float crashGroundY = 0.0f;
+    // Half the model's larger horizontal extent, in world units. The wreck
+    // settles this far above the terrain instead of dropping its origin onto it:
+    // the origin sits inside the fuselage, so resting it on the ground buried
+    // the airframe up to the wings.
+    float groundClearance = 1.0f;
+    // How far the airframe reaches horizontally from its origin, in world units,
+    // and how far it reaches vertically.
+    //
+    // Explosives are tested against these rather than against the origin alone.
+    // The generic blast path (CombatSystem::DamagePrefabsInRadius) measures
+    // centre-to-entity-origin, which works for a crate but not for an aircraft:
+    // this asset spans 29.0 m across the wings and 22.3 m down the fuselage, so
+    // the skin is up to ~14.5 m from the origin while a C4 blast reaches 5.4 m.
+    // A charge stuck to a wing or the tail therefore missed the test entirely
+    // and the plane shrugged off a demolition charge planted directly on it.
+    float blastReachHorizontal = 7.0f;
+    float blastReachVertical = 4.0f;
 };
 static std::vector<ObjectivePlaneState> g_objectivePlanes;
 // Set when an aircraft clears the map, so the mission can report the failure.
@@ -1797,6 +1835,23 @@ const std::vector<XMFLOAT3>& DeploymentZonePositions() {
 }
 int SelectedDeploymentZoneIndex() { return g_selectedDeploymentZone; }
 
+// Radius of the insertion ring this run deployed from. A custom level authors
+// its own; the stock island uses the historical 34 m.
+//
+// The exfil is placed against this rather than a fixed distance, so the way out
+// always sits outside the ring the player came in on however wide it was
+// authored (see VehicleSystem::EscapeBoatDistanceForRing).
+static float CurrentDeploymentRadius() {
+    return g_customLevelMode ? g_game.world.Level().deploymentRadius
+                             : kDefaultDeploymentRadius;
+}
+
+// Where this run's exfil sits: out past its own insertion ring, never inside
+// the shelf the beach slopes down.
+static float CurrentEscapeBoatDistance() {
+    return VehicleSystem::EscapeBoatDistanceForRing(CurrentDeploymentRadius());
+}
+
 // Sends the BlackHawk on an insertion run that ends at the player's spawn. It
 // runs in from behind the direction the player is facing, so the approach
 // crosses their view before it flares and sets down on top of them.
@@ -3253,6 +3308,9 @@ static void UpdateHelicopter(float dt) {
 // Both defined with the other spawn helpers, below.
 static float RandomUnit();
 static bool SpawnDropshipBandit(const XMFLOAT3& position);
+// Defined with the aircraft objective, below. Needed up here by the burning-
+// material tick, which must not set fire to a player-only objective.
+static bool IsObjectivePlaneEntity(uint64_t entityId);
 // Defined with the lightning state, below.
 static void ResetLightning();
 
@@ -3456,17 +3514,94 @@ static void CallInReinforcementWave() {
 
     const int troops = DropshipWaveTroopCount(vehicles.dropshipWavesCalled);
     vehicles.BeginDropshipRun(entry, drop, troops);
-    // Exfil appears with the FIRST wave, on its own rolled bearing rather than
-    // the lane that wave flew in on -- the way out should not be deducible from
-    // where the enemy came from. Idempotent, so later waves leave it where it
-    // is. At this point EscapeBoatReady() was still false above, so this wave
-    // used the random drop bearing; every later wave sees the boat and drops on
-    // the shore in front of it instead. Ocean surface is y = 0; see the
-    // g_ocean.Initialize call (centre -kSeaDepth/2, height kSeaDepth).
-    vehicles.PlaceEscapeBoatOnBearing(RandomUnit() * XM_2PI, 0.0f);
+    // No exfil is placed here. The boat used to ride in with the first wave,
+    // which put the way out on the water while the aircraft -- the thing the
+    // run is actually about -- was still on the ground. It now appears only
+    // once that aircraft is resolved (see OnObjectivePlaneResolved), so a wave
+    // called by a falling comm tower escalates the fight without also handing
+    // the player the exit.
+    //
+    // Waves called after the aircraft goes down still see an active boat above
+    // and drop their squad on the shore in front of it.
     SGE_LOG("LogGameplay", EngineLog::Level::Display,
         "Reinforcement wave " + std::to_string(vehicles.dropshipWavesCalled) +
         " inbound with " + std::to_string(troops) + " troops");
+}
+
+// Resolving the aircraft -- shot down, or gone -- brings the ride home and the
+// garrison's answer to it, both onto the insertion ring the player deployed
+// from. This is the ONLY thing that puts an exfil on the water on a level that
+// authored an aircraft: until the run's objective has an outcome, there is no
+// way off the island.
+//
+// The ring, not a free bearing: those points are already known to be reachable
+// coast (the planner samples terrain height to build them), and landing the
+// response where the player came ashore is the readable version of "they know
+// where you came in".
+//
+// Rolled once per call and shared by both, so the wave lands on the same stretch
+// of coast the boat is waiting off -- the garrison stands between the player and
+// the way out rather than somewhere unrelated.
+//
+// Called for an escaped aircraft as well as a downed one. A failed intercept is
+// a worse run, not an unfinishable one, and the boat is the only way to end a
+// mission -- without this an escape would strand the player on the island with
+// nothing left to shoot and no exit. Idempotent through
+// PlaceEscapeBoatOnBearing, so a second aircraft resolving later leaves the
+// first one's boat where it is.
+static void OnObjectivePlaneResolved() {
+    VehicleSystem& vehicles = g_game.vehicles;
+    // Nothing to do once the exfil is out there: the boat would not move
+    // anyway, and re-running this would call in a wave per aircraft.
+    if (vehicles.EscapeBoatReady()) return;
+    // The live ring when a normal run has one. An editor playtest skips
+    // deployment planning entirely (CancelDeploymentPlanning clears the zones),
+    // so rebuild the same ring geometry here rather than degrading to a free
+    // bearing -- a playtest is exactly where this gets checked, and it should
+    // behave like the real thing.
+    std::vector<XMFLOAT3> rebuilt;
+    const std::vector<XMFLOAT3>* zones = &DeploymentZonePositions();
+    if (zones->empty()) {
+        auto params = CurrentTerrainParams();
+        params.heightScale = scene.terrainHeightScale;
+        const float deploymentRadius = CurrentDeploymentRadius();
+        rebuilt = DeploymentPlanner::BuildPerimeterZones(
+            deploymentRadius, deploymentRadius, 20,
+            [&](float x, float z) {
+                return (std::max)(0.0f,
+                    TerrainRendererDX12::HeightAt(params, x, z));
+            });
+        zones = &rebuilt;
+    }
+    // Nothing to place against at all: still owe the run an exfil, so fall back
+    // to the free bearing the rest of the game uses.
+    if (zones->empty()) {
+        vehicles.PlaceEscapeBoatOnBearing(RandomUnit() * XM_2PI, 0.0f,
+                                          CurrentEscapeBoatDistance());
+        CallInReinforcementWave();
+        return;
+    }
+
+    const size_t pick = static_cast<size_t>(
+        RandomUnit() * static_cast<float>(zones->size())) % zones->size();
+    const XMFLOAT3& zone = (*zones)[pick];
+    // The ring point's own compass bearing, measured the way the boat placer
+    // expects (+Z = 0, turning through +X). The boat sits on that bearing but
+    // further out than the ring point itself, so the exfil is a leg beyond the
+    // coast the player inserted onto rather than a return to it -- and it stays
+    // in deep water however wide the deployment ring was authored.
+    const float bearing = std::atan2(zone.x, zone.z);
+    vehicles.PlaceEscapeBoatOnBearing(bearing, 0.0f,
+                                      CurrentEscapeBoatDistance());
+
+    // Called after the boat is placed, so the wave's own shore-search sees an
+    // active exfil and drops the squad on the beach in front of it -- the
+    // blocking position -- instead of on a fresh random bearing.
+    CallInReinforcementWave();
+
+    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+        "Aircraft resolved -- exfil and reinforcements on insertion zone " +
+        std::to_string(pick));
 }
 
 // Flies the reinforcement dropship and spawns whatever it releases this frame.
@@ -5306,9 +5441,12 @@ static void UpdateMolotovFireDamage() {
         // Fire spreads and burns unattended, so it is not a player action even
         // when the player lit it. The comm tower is a player-only objective and
         // must not burn down on its own; stop tracking it as a burning material.
+        // The aircraft objective is player-only for the same reason and must not
+        // burn down unattended either.
         {
             XMFLOAT3 ignoredBase{};
-            if (FindCommTower(material->entityId, ignoredBase)) {
+            if (FindCommTower(material->entityId, ignoredBase) ||
+                IsObjectivePlaneEntity(material->entityId)) {
                 material = scene.burningMaterials.erase(material);
                 continue;
             }
@@ -8639,6 +8777,9 @@ static void RebuildPrefabRenderBatches() {
     g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
     g_prefabAudioPlayers.clear();
     std::unordered_map<std::string, size_t> batches;
+    // Entity ids of the aircraft this pass actually registered, so the ones it
+    // did not can be pruned afterwards.
+    std::unordered_set<uint64_t> seenObjectivePlanes;
     // `skipRenderBatch` suppresses only the drawing of an instance, leaving its
     // collision, light, audio, destructible and spawner components registered
     // like any other prefab's. The comm tower needs exactly that: it is drawn
@@ -8732,6 +8873,7 @@ static void RebuildPrefabRenderBatches() {
         // Keyed on entity id so a rebuild (an asset edit, a prefab reload)
         // preserves a countdown already in flight rather than restarting it.
         if (prefabId == kObjectivePlanePrefabId) {
+            seenObjectivePlanes.insert(entityId);
             const auto existing = std::find_if(
                 g_objectivePlanes.begin(), g_objectivePlanes.end(),
                 [&](const ObjectivePlaneState& plane) {
@@ -8742,6 +8884,40 @@ static void RebuildPrefabRenderBatches() {
                     ? g_objectivePlanes.emplace_back()
                     : *existing;
             plane.entityId = entityId;
+            // How far the airframe reaches from its origin, used to rest the
+            // wreck on the terrain instead of sinking the origin into it. Taken
+            // from the vertical extent below the origin, scaled by the authored
+            // placement, and floored so a model whose origin already sits at the
+            // belly still clears the ground.
+            {
+                const XMFLOAT3& minimum = cachedModel->boundsMinimum;
+                const float scaleY = XMVectorGetX(XMVector3Length(world.r[1]));
+                plane.groundClearance =
+                    (std::max)(0.5f, std::abs(minimum.y) * scaleY);
+
+                // Blast reach, from the same bounds. The largest distance the
+                // skin sits from the origin on each axis, scaled by the authored
+                // placement -- so an explosive that lands anywhere on the
+                // airframe counts as a hit on it (see ExplosionHitsObjectivePlane).
+                //
+                // Max of |min| and |max| per axis rather than half the span:
+                // the origin is not necessarily centred in the bounds, and the
+                // far side is the one that has to stay reachable.
+                const XMFLOAT3& maximum = cachedModel->boundsMaximum;
+                const float scaleX = XMVectorGetX(XMVector3Length(world.r[0]));
+                const float scaleZ = XMVectorGetX(XMVector3Length(world.r[2]));
+                const float reachX =
+                    (std::max)(std::abs(minimum.x), std::abs(maximum.x)) * scaleX;
+                const float reachZ =
+                    (std::max)(std::abs(minimum.z), std::abs(maximum.z)) * scaleZ;
+                // One horizontal reach for both axes: the placement may be
+                // rotated to any heading, and tracking an oriented box here
+                // would buy precision the blast test does not need.
+                plane.blastReachHorizontal =
+                    (std::max)(1.0f, (std::max)(reachX, reachZ));
+                plane.blastReachVertical = (std::max)(1.0f,
+                    (std::max)(std::abs(minimum.y), std::abs(maximum.y)) * scaleY);
+            }
             XMStoreFloat4x4(&plane.baseTransform, world);
             XMStoreFloat3(&plane.basePosition,
                           XMVector3TransformCoord(XMVectorZero(), world));
@@ -8898,6 +9074,20 @@ static void RebuildPrefabRenderBatches() {
         addInstance(addInstance, prefabId, world, entity.id, entity.overrides, 0,
                     towerDrawnByDestruction);
     }
+    // Drop aircraft whose entity no longer exists in this level.
+    //
+    // The registration above is keyed on entity id so an in-flight countdown
+    // survives a rebuild, but nothing removed entries -- and entity ids are
+    // reused across levels. A wreck left in this vector from a previous level
+    // therefore kept writing its crash transform into whatever instance now
+    // held its id, which is how a broken plane ended up welded to the screen.
+    // Anything not re-registered by the pass above is gone.
+    g_objectivePlanes.erase(
+        std::remove_if(g_objectivePlanes.begin(), g_objectivePlanes.end(),
+                       [&](const ObjectivePlaneState& plane) {
+                           return !seenObjectivePlanes.count(plane.entityId);
+                       }),
+        g_objectivePlanes.end());
     // AA emplacements. Drawn from a code-built model rather than a prefab batch
     // per entity, because they are placed by gameplay (beside the comm tower,
     // and from the editor's turret prefab) and are not level entities.
@@ -10029,6 +10219,64 @@ bool CommTowerObjectiveStatus(float& health, float& maxHealth) {
     return false;
 }
 
+// Where one aircraft is being drawn this frame.
+//
+// A crashing or landed airframe carries its own position; one still on its
+// takeoff run is re-derived from the same integration UpdateObjectivePlanes
+// uses, so this never disagrees with what the player sees.
+//
+// Shared by the HUD marker and the explosive hit test -- a blast has to be
+// measured against where the plane actually is, not where it was authored,
+// or a charge thrown at a taxiing aircraft would test against the apron.
+static XMFLOAT3 ObjectivePlaneLivePosition(const ObjectivePlaneState& plane) {
+    if (plane.crashing || plane.crashed) return plane.crashPosition;
+    const float t = plane.takeoffTimer;
+    constexpr float kRotateAt = 4.0f;
+    const float distance = t <= kRotateAt
+        ? 0.5f * kObjectivePlaneTaxiSpeed * (t * t) / kRotateAt
+        : 0.5f * kObjectivePlaneTaxiSpeed * kRotateAt +
+          kObjectivePlaneTaxiSpeed * (t - kRotateAt);
+    const float airborne = (std::max)(0.0f, t - kRotateAt);
+    const XMVECTOR travel =
+        XMVectorScale(XMLoadFloat3(&plane.forward), distance);
+    return { plane.basePosition.x + XMVectorGetX(travel),
+             plane.basePosition.y + kObjectivePlaneClimbRate * airborne,
+             plane.basePosition.z + XMVectorGetZ(travel) };
+}
+
+// Live aircraft-objective state for the HUD marker.
+//
+// Reports the first plane still worth marking -- one that has neither escaped
+// nor already hit the ground -- and where it is right now. Unlike the tower's
+// fixed corner block this has to be a world-space marker, because the aircraft
+// moves: the position returned is the airframe's current draw position, taken
+// from the same crash/flight state that drives its transform, so the marker
+// tracks it down the runway and through the crash.
+//
+// False when there is nothing to mark, so a level without an aircraft, and a
+// run where it is already down, draw no marker.
+bool ObjectivePlaneStatus(XMFLOAT3& position, float& health, float& maxHealth,
+                          bool& down) {
+    const PrefabRuntimeState& prefabs = g_game.world.Prefabs();
+    for (const ObjectivePlaneState& plane : g_objectivePlanes) {
+        if (plane.escaped) continue;
+        const auto definition = std::find_if(
+            prefabs.destructibles.begin(), prefabs.destructibles.end(),
+            [&plane](const PrefabDestructibleInstance& value) {
+                return value.entityId == plane.entityId;
+            });
+        if (definition == prefabs.destructibles.end()) continue;
+        maxHealth = definition->health;
+        const auto live = prefabs.health.find(plane.entityId);
+        health = live != prefabs.health.end() ? live->second : definition->health;
+        health = (std::max)(0.0f, health);
+        down = plane.crashing || plane.crashed;
+        position = ObjectivePlaneLivePosition(plane);
+        return true;
+    }
+    return false;
+}
+
 // Comm towers standing on the level right now. The deployment briefing reads it
 // to state the objective, and the run arms the mission counter from it -- so a
 // map that authors two towers grades against two without anything being hardcoded.
@@ -10272,6 +10520,133 @@ static bool CommTowerDamageAllowed(uint64_t entityId, bool fromRemoteCharge) {
         g_commTowersRiggedForDemolition.count(entityId) != 0;
 }
 
+// True when this entity is an aircraft objective still in play.
+static bool IsObjectivePlaneEntity(uint64_t entityId) {
+    return std::any_of(g_objectivePlanes.begin(), g_objectivePlanes.end(),
+                       [entityId](const ObjectivePlaneState& plane) {
+                           return plane.entityId == entityId;
+                       });
+}
+
+// The aircraft is a player objective, exactly like the comm tower: bringing it
+// down has to be the player's doing. Every damage source funnels through the
+// prefab-damage entry points, so an enemy burst that happened to be walking
+// across the runway, a stray grenade, or a fire could otherwise shoot down the
+// plane and credit the player with a kill they never made.
+static bool ObjectivePlaneDamageAllowed(uint64_t entityId, bool fromPlayer) {
+    if (!IsObjectivePlaneEntity(entityId)) return true;   // not an aircraft
+    return fromPlayer;
+}
+
+// Aircraft whose airframe an explosion at `center` actually touches, given a
+// blast of `radius`. Returns 0 when the blast misses every plane.
+//
+// Exists because the generic blast path measures centre-to-entity-origin, and
+// an aircraft is far too big for that to mean anything: this asset spans 29.0 m
+// across the wings against a 5.4 m C4 blast, so a charge planted on a wing sat
+// three times outside the test and the plane ignored a demolition charge stuck
+// to it. Rockets hit the same wall -- they share the grenade blast radius.
+//
+// Same shape of fix the comm tower needed, and for the same reason: a prop whose
+// geometry is much larger than the blast has to be tested as a volume rather
+// than a point. Modelled as an upright cylinder around the live position --
+// generous, but the alternative is an explosive that visibly detonates against
+// the fuselage and does nothing.
+static uint64_t ObjectivePlaneHitByExplosion(const XMFLOAT3& center,
+                                             float radius) {
+    for (const ObjectivePlaneState& plane : g_objectivePlanes) {
+        // A wreck on the ground and a plane that already left are not targets.
+        if (plane.escaped || plane.crashing || plane.crashed) continue;
+        const XMFLOAT3 position = ObjectivePlaneLivePosition(plane);
+        const float dx = center.x - position.x;
+        const float dz = center.z - position.z;
+        const float reach = plane.blastReachHorizontal + radius;
+        if (dx * dx + dz * dz > reach * reach) continue;
+        const float dy = center.y - position.y;
+        if (std::abs(dy) > plane.blastReachVertical + radius) continue;
+        return plane.entityId;
+    }
+    return 0;
+}
+
+// What one rocket takes off an aircraft: half its authored health, so two bring
+// it down however the prefab is tuned. Mirrors kRocketHelicopterDamage rather
+// than hardcoding a number against whatever the prefab currently authors.
+static float ObjectivePlaneRocketDamage(uint64_t entityId) {
+    const PrefabRuntimeState& prefabs = g_game.world.Prefabs();
+    const auto definition = std::find_if(
+        prefabs.destructibles.begin(), prefabs.destructibles.end(),
+        [entityId](const PrefabDestructibleInstance& value) {
+            return value.entityId == entityId;
+        });
+    // No authored destructible to read: fall back to a proportion of the
+    // authored default, rather than silently doing nothing.
+    if (definition == prefabs.destructibles.end()) return 1800.0f;
+    return definition->health * 0.5f;
+}
+
+// Ray test against an aircraft where it actually is this frame.
+//
+// Needed because prefab colliders are baked from the authored placement and
+// never move: the moment the plane starts its takeoff run it slides out of its
+// own collider, so rounds passed straight through an airframe that was visibly
+// right there. Shooting one down in the air was impossible for that reason, not
+// because anything forbade it.
+//
+// A sphere around the live position rather than an oriented box: the airframe is
+// banking and tumbling through this, and a sphere sized to the real bounds is
+// both cheaper and more forgiving than chasing the pose. Slightly generous
+// against a distant, fast-moving target, which is the right way to be wrong.
+//
+// Returns the entity and the point on the sphere the segment first crosses, so
+// the impact effect lands on the hull instead of at its centre.
+static uint64_t HitObjectivePlaneSegment(const XMFLOAT3& start,
+                                         const XMFLOAT3& end, float radius,
+                                         XMFLOAT3& hit) {
+    uint64_t bestEntity = 0;
+    float bestDistanceSquared = FLT_MAX;
+    for (const ObjectivePlaneState& plane : g_objectivePlanes) {
+        // A wreck and a plane that already left are not targets. The wreck keeps
+        // its authored collider, so rounds still stop on it the normal way.
+        if (plane.escaped || plane.crashing || plane.crashed) continue;
+        const XMFLOAT3 center = ObjectivePlaneLivePosition(plane);
+        // Horizontal reach is the wingspan half-extent; that is the radius that
+        // matters for a plane presenting its planform to a shooter below.
+        const float sphereRadius = plane.blastReachHorizontal + radius;
+
+        const XMVECTOR origin = XMLoadFloat3(&start);
+        const XMVECTOR segment = XMLoadFloat3(&end) - origin;
+        const XMVECTOR toCenter = XMLoadFloat3(&center) - origin;
+        const float segmentLengthSquared =
+            XMVectorGetX(XMVector3LengthSq(segment));
+        if (segmentLengthSquared < 1e-6f) continue;
+        // Closest approach of the segment to the sphere centre, clamped to the
+        // segment so a shot that stops short does not register a hit.
+        float t = XMVectorGetX(XMVector3Dot(toCenter, segment)) /
+                  segmentLengthSquared;
+        t = (std::min)(1.0f, (std::max)(0.0f, t));
+        const XMVECTOR closest = origin + XMVectorScale(segment, t);
+        const XMVECTOR offset = closest - XMLoadFloat3(&center);
+        if (XMVectorGetX(XMVector3LengthSq(offset)) >
+            sphereRadius * sphereRadius) continue;
+
+        const float distanceSquared =
+            XMVectorGetX(XMVector3LengthSq(closest - origin));
+        if (distanceSquared >= bestDistanceSquared) continue;
+        bestDistanceSquared = distanceSquared;
+        bestEntity = plane.entityId;
+        // Pull the reported impact back onto the hull surface so the effect does
+        // not spawn inside the fuselage.
+        XMVECTOR surface = closest;
+        const float offsetLength = XMVectorGetX(XMVector3Length(offset));
+        if (offsetLength > 1e-4f)
+            surface = XMLoadFloat3(&center) +
+                      XMVectorScale(offset, sphereRadius / offsetLength);
+        XMStoreFloat3(&hit, surface);
+    }
+    return bestEntity;
+}
+
 // Starts (or restarts) the aircraft objective's countdown and tells the mission
 // how many are in play.
 //
@@ -10287,9 +10662,96 @@ static void ArmObjectivePlanes() {
         plane.rolling = false;
         plane.escaped = false;
         plane.destroyed = false;
+        plane.crashing = false;
+        plane.crashed = false;
+        plane.crashVelocity = { 0.0f, 0.0f, 0.0f };
+        plane.crashPitch = 0.0f;
+        plane.crashRoll = 0.0f;
+        plane.crashYaw = 0.0f;
     }
+    // An aircraft flies its own wreck down, so it has to survive its own death:
+    // a destructible is normally disabled the moment it dies, and the next
+    // prefab rebuild would drop the falling airframe out of the render batch.
+    g_game.combat.keepEnabledOnDestroy = [](uint64_t entityId) {
+        return std::any_of(g_objectivePlanes.begin(), g_objectivePlanes.end(),
+                           [entityId](const ObjectivePlaneState& plane) {
+                               return plane.entityId == entityId;
+                           });
+    };
     g_game.mission.SetObjectivePlaneCount(
         static_cast<uint32_t>(g_objectivePlanes.size()));
+}
+
+// Pushes one aircraft's world matrix into every batch instance that draws it.
+//
+// The batch is rebuilt whenever a prefab changes, so the entity has to be
+// re-found by id each frame rather than caching an index into `transforms`.
+static void WriteObjectivePlaneTransform(const ObjectivePlaneState& plane,
+                                         const XMMATRIX& world) {
+    for (PrefabRenderBatch& batch : g_prefabRenderBatches) {
+        if (batch.prefabId != kObjectivePlanePrefabId) continue;
+        for (size_t i = 0; i < batch.entityIds.size(); ++i)
+            if (batch.entityIds[i] == plane.entityId &&
+                i < batch.transforms.size())
+                batch.transforms[i] = world;
+    }
+}
+
+// Composes the tumbling wreck pose: authored scale/orientation, then the crash
+// rotation, then the falling position.
+static void WriteObjectivePlaneCrashTransform(const ObjectivePlaneState& plane) {
+    const XMMATRIX fall =
+        XMMatrixRotationRollPitchYaw(plane.crashPitch, plane.crashYaw,
+                                     plane.crashRoll) *
+        XMMatrixTranslation(plane.crashPosition.x, plane.crashPosition.y,
+                            plane.crashPosition.z);
+    XMMATRIX oriented = XMLoadFloat4x4(&plane.baseTransform);
+    oriented.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
+    WriteObjectivePlaneTransform(plane, oriented * fall);
+}
+
+// Takes an aircraft out of its takeoff and drops it, seeded with the position
+// and velocity it was carrying so the wreck continues along its flight path
+// rather than stopping dead in the air and falling straight down.
+static void BeginObjectivePlaneCrash(ObjectivePlaneState& plane) {
+    if (plane.crashing || plane.crashed) return;
+    plane.destroyed = true;
+    plane.crashing = true;
+
+    // Re-derive where the takeoff had it, using the same integration
+    // UpdateObjectivePlanes runs, so the wreck starts exactly where the
+    // airframe was being drawn on the frame it was hit.
+    const float t = plane.takeoffTimer;
+    constexpr float kRotateAt = 4.0f;
+    const float distance = t <= kRotateAt
+        ? 0.5f * kObjectivePlaneTaxiSpeed * (t * t) / kRotateAt
+        : 0.5f * kObjectivePlaneTaxiSpeed * kRotateAt +
+          kObjectivePlaneTaxiSpeed * (t - kRotateAt);
+    const float airborne = (std::max)(0.0f, t - kRotateAt);
+    const XMVECTOR heading = XMLoadFloat3(&plane.forward);
+    const XMVECTOR travel = XMVectorScale(heading, distance);
+    plane.crashPosition = {
+        plane.basePosition.x + XMVectorGetX(travel),
+        plane.basePosition.y + kObjectivePlaneClimbRate * airborne,
+        plane.basePosition.z + XMVectorGetZ(travel) };
+
+    // Speed along the runway is the derivative of that same distance curve;
+    // vertical speed is the climb rate only once it has actually rotated.
+    const float speed = t <= kRotateAt
+        ? kObjectivePlaneTaxiSpeed * (t / kRotateAt)
+        : kObjectivePlaneTaxiSpeed;
+    plane.crashVelocity = {
+        XMVectorGetX(heading) * speed,
+        airborne > 0.0f ? kObjectivePlaneClimbRate : 0.0f,
+        XMVectorGetZ(heading) * speed };
+
+    // Carry the pitch it was holding into the tumble so the nose does not snap
+    // level at the moment it is hit.
+    plane.crashPitch = -0.28f * (std::min)(1.0f, airborne / 2.0f);
+    plane.crashRoll = 0.0f;
+    plane.crashYaw = 0.0f;
+    plane.crashGroundY =
+        GroundHeightAt(plane.crashPosition.x, plane.crashPosition.z);
 }
 
 // Drives the aircraft objective: counts down, then flies it out.
@@ -10308,7 +10770,60 @@ static void UpdateObjectivePlanes(float dt) {
     if (!g_game.session.TimerRunning() && !IsEditorPlaying()) return;
 
     for (ObjectivePlaneState& plane : g_objectivePlanes) {
-        if (plane.destroyed || plane.escaped) continue;
+        if (plane.escaped) continue;
+
+        // Shot down: fall on the last pose it was flying, tumbling, until it
+        // meets the terrain. Runs ahead of the escape/takeoff logic and skips
+        // it entirely -- a downed aircraft neither climbs nor escapes.
+        if (plane.crashing) {
+            plane.crashVelocity.y -= kObjectivePlaneCrashGravity * dt;
+            const float drag =
+                (std::max)(0.0f, 1.0f - kObjectivePlaneCrashDrag * dt);
+            plane.crashVelocity.x *= drag;
+            plane.crashVelocity.z *= drag;
+            plane.crashPosition.x += plane.crashVelocity.x * dt;
+            plane.crashPosition.y += plane.crashVelocity.y * dt;
+            plane.crashPosition.z += plane.crashVelocity.z * dt;
+            // Tumble, but bounded. The Black Hawk uses these same rates and gets
+            // away with them because it falls from a low hover; this aircraft
+            // can be hit at 110 m, and measured against that fall the unclamped
+            // tumble reached 128 deg of pitch and 267 deg of roll by impact --
+            // the airframe landed inverted and nose-buried. Clamping to a steep
+            // but survivable-looking attitude keeps the wreck readable however
+            // far it fell. Yaw is left free: spinning about the vertical axis
+            // looks right at any angle.
+            constexpr float kMaxCrashPitch = 1.05f;  // ~60 deg nose-down
+            constexpr float kMaxCrashRoll = 1.22f;   // ~70 deg
+            plane.crashPitch = (std::min)(kMaxCrashPitch,
+                plane.crashPitch + kObjectivePlaneCrashPitchRate * dt);
+            plane.crashRoll = (std::min)(kMaxCrashRoll,
+                plane.crashRoll + kObjectivePlaneCrashRollRate * dt);
+            plane.crashYaw += kObjectivePlaneCrashYawRate * dt;
+            // Sampled every frame rather than once at the hit: the wreck drifts
+            // while it falls, so the impact height belongs to where it lands.
+            // Offset by the airframe's own reach so it comes to rest ON the
+            // terrain -- dropping the origin onto it buried the fuselage.
+            plane.crashGroundY =
+                GroundHeightAt(plane.crashPosition.x, plane.crashPosition.z) +
+                plane.groundClearance;
+            if (plane.crashPosition.y <= plane.crashGroundY) {
+                plane.crashPosition.y = plane.crashGroundY;
+                plane.crashing = false;
+                plane.crashed = true;
+                plane.crashVelocity = { 0.0f, 0.0f, 0.0f };
+                scene.SpawnSmokeBurst(plane.crashPosition, 3.2f, 1.4f);
+                SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                    "Objective aircraft hit the ground");
+            }
+            WriteObjectivePlaneCrashTransform(plane);
+            continue;
+        }
+        // Already down and settled: leave the wreck exactly where it landed.
+        if (plane.crashed) {
+            WriteObjectivePlaneCrashTransform(plane);
+            continue;
+        }
+        if (plane.destroyed) continue;
 
         if (!plane.rolling) {
             plane.holdTimer += dt;
@@ -10334,21 +10849,15 @@ static void UpdateObjectivePlanes(float dt) {
         // Ease the pitch in over two seconds so it rotates rather than snapping
         // nose-up the instant it leaves the runway.
         const float pitch = -0.28f * (std::min)(1.0f, airborne / 2.0f);
-        // A slow bank away once properly airborne, so it exits across the map
-        // instead of straight over the player's head.
-        const float bank = 0.35f * (std::min)(1.0f, airborne / 6.0f);
-        const float headingDrift = 0.16f * airborne;
+        // No bank, no yaw drift: it departs wings-level straight off the
+        // runway on the heading it was authored with.
 
-        // Travel straight down the model's own nose axis, turned by the same
-        // yaw drift the aircraft is visually banking into, so the path it flies
-        // matches the direction it is pointing. Rebuilding a heading from
-        // sin/cos of an assumed +Z nose is what sent it sideways.
-        const XMVECTOR baseForward = XMLoadFloat3(&plane.forward);
-        const XMVECTOR heading = XMVector3TransformNormal(
-            baseForward, XMMatrixRotationY(headingDrift));
+        // Travel straight down the model's own nose axis. Rebuilding a heading
+        // from sin/cos of an assumed +Z nose is what sent it sideways.
+        const XMVECTOR heading = XMLoadFloat3(&plane.forward);
         const XMVECTOR travel = XMVectorScale(heading, distance);
         const XMMATRIX flight =
-            XMMatrixRotationRollPitchYaw(pitch, headingDrift, -bank) *
+            XMMatrixRotationRollPitchYaw(pitch, 0.0f, 0.0f) *
             XMMatrixTranslation(
                 plane.basePosition.x + XMVectorGetX(travel),
                 plane.basePosition.y + climb,
@@ -10359,14 +10868,7 @@ static void UpdateObjectivePlanes(float dt) {
         XMMATRIX oriented = XMLoadFloat4x4(&plane.baseTransform);
         oriented.r[3] = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
         const XMMATRIX world = oriented * flight;
-
-        for (PrefabRenderBatch& batch : g_prefabRenderBatches) {
-            if (batch.prefabId != kObjectivePlanePrefabId) continue;
-            for (size_t i = 0; i < batch.entityIds.size(); ++i)
-                if (batch.entityIds[i] == plane.entityId &&
-                    i < batch.transforms.size())
-                    batch.transforms[i] = world;
-        }
+        WriteObjectivePlaneTransform(plane, world);
 
         if (t >= kObjectivePlaneTakeoffSeconds) {
             plane.escaped = true;
@@ -10374,13 +10876,26 @@ static void UpdateObjectivePlanes(float dt) {
             g_game.mission.RecordObjectivePlaneEscaped();
             SGE_LOG("LogGameplay", EngineLog::Level::Warning,
                 "Objective aircraft escaped");
+            // An escape resolves the aircraft too. The mission is failed on
+            // that count and the report says so, but the boat still has to come
+            // -- it is the only way to end a run, and letting the plane go must
+            // not leave the player stranded with nothing to do.
+            OnObjectivePlaneResolved();
         }
     }
 }
 
+// `fromPlayer` distinguishes the player's own fire from everything else that
+// reaches this entry point (enemy rounds, blasts, spreading fire). It gates the
+// aircraft objective and drives its hitmarker; it defaults true so the many
+// existing world-damage callers keep their behaviour for ordinary props, which
+// are damageable by anything.
 static void DamagePrefabEntity(uint64_t entityId, float damage,
-                               const XMFLOAT3& hit, bool fromRemoteCharge) {
+                               const XMFLOAT3& hit, bool fromRemoteCharge,
+                               bool fromPlayer = true) {
     if (!CommTowerDamageAllowed(entityId, fromRemoteCharge)) return;
+    if (!ObjectivePlaneDamageAllowed(entityId, fromPlayer)) return;
+    const bool isObjectivePlane = IsObjectivePlaneEntity(entityId);
     XMFLOAT3 towerBase{};
     const bool isCommTower = FindCommTower(entityId, towerBase);
     const CombatSystem::PrefabDamageResult result =
@@ -10403,6 +10918,14 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
             ", destroyed=" + std::to_string(result.destroyed) + ")");
     // Steel lattice: every round that lands on it rings, destroyed or not.
     if (isCommTower && result.applied) PlayMetalHitAudio(hit, 0.9f);
+    // Aircraft skin is metal too, and an objective the player is deliberately
+    // shooting owes them feedback: the marker confirms the round connected, and
+    // reads lethal on the hit that finally brings it down. Gated on `applied`
+    // so rounds into an already-downed wreck (health <= 0) do not keep marking.
+    if (isObjectivePlane && result.applied) {
+        PlayMetalHitAudio(hit, 1.05f);
+        scene.TriggerHitMarker(result.destroyed);
+    }
     if (result.destroyed) {
         if (g_game.session.TimerRunning()) {
             g_game.mission.RecordDestruction();
@@ -10419,33 +10942,47 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
             g_commTowerMusicSwell = true;
             g_exfilHereDelay = kExfilHereDelay;
         }
-        // Aircraft shot down: stop its flight so it cannot keep climbing as a
-        // corpse, and mark it so the escape check ignores it.
+        // Aircraft shot down: hand it to the crash path, which flies it into the
+        // ground from wherever it was, and mark it so the escape check ignores
+        // it. Deliberately no prefab rebuild here -- the wreck keeps drawing out
+        // of the existing batch, and rebuilding mid-kill is what stalled the
+        // frame.
+        bool downedPlane = false;
         for (ObjectivePlaneState& plane : g_objectivePlanes) {
             if (plane.entityId != entityId) continue;
-            plane.destroyed = true;
+            downedPlane = true;
+            BeginObjectivePlaneCrash(plane);
             scene.SpawnSmokeBurst(hit, 2.4f, 0.9f);
             if (g_game.session.TimerRunning())
                 g_game.mission.RecordObjectivePlaneDestroyed();
             SGE_LOG("LogGameplay", EngineLog::Level::Display,
                 "Objective aircraft destroyed");
         }
+        // Outside the loop: the response to the aircraft going down is called
+        // once, not once per matching plane.
+        if (downedPlane) OnObjectivePlaneResolved();
         if (isCommTower) CollapseCommTower(towerBase);
-        else scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
-        g_prefabRebuildRequested = true;
+        else if (!downedPlane) scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
+        if (!downedPlane) g_prefabRebuildRequested = true;
         SGE_LOG("LogPrefab", EngineLog::Level::Display,
             "Destroyed prefab entity " + std::to_string(entityId));
     }
 }
 
 static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
-                                  float damage, bool fromRemoteCharge) {
+                                  float damage, bool fromRemoteCharge,
+                                  bool fromPlayer = true) {
     const auto results = g_game.combat.DamagePrefabsInRadius(
         g_game.world, center, radius, damage,
-        [fromRemoteCharge](uint64_t entityId) {
-            return CommTowerDamageAllowed(entityId, fromRemoteCharge);
+        [fromRemoteCharge, fromPlayer](uint64_t entityId) {
+            return CommTowerDamageAllowed(entityId, fromRemoteCharge) &&
+                   ObjectivePlaneDamageAllowed(entityId, fromPlayer);
         });
     for (const CombatSystem::PrefabDamageResult& result : results) {
+        // Marked before the destroyed-only skip below, so a blast that damages
+        // the aircraft without downing it still confirms the hit.
+        if (result.applied && IsObjectivePlaneEntity(result.entityId))
+            scene.TriggerHitMarker(result.destroyed);
         if (!result.destroyed) continue;
         // A tower felled through the radius path still needs its collapse, not
         // the generic puff of smoke every other prefab gets.
@@ -10464,6 +11001,23 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
         }
         if (g_game.session.TimerRunning())
             g_game.mission.RecordDestruction();
+        // An aircraft caught in a blast goes down the same way one shot out of
+        // the sky does: crash it rather than rebuilding it out of existence.
+        bool downedPlane = false;
+        for (ObjectivePlaneState& plane : g_objectivePlanes) {
+            if (plane.entityId != result.entityId) continue;
+            downedPlane = true;
+            BeginObjectivePlaneCrash(plane);
+            scene.SpawnSmokeBurst(result.effectPosition, 2.4f, 0.9f);
+            if (g_game.session.TimerRunning())
+                g_game.mission.RecordObjectivePlaneDestroyed();
+            SGE_LOG("LogGameplay", EngineLog::Level::Display,
+                "Objective aircraft destroyed");
+        }
+        if (downedPlane) {
+            OnObjectivePlaneResolved();
+            continue;
+        }
         scene.SpawnSmokeBurst(result.effectPosition, 1.2f, 0.45f);
         g_prefabRebuildRequested = true;
         SGE_LOG("LogPrefab", EngineLog::Level::Display,
@@ -18318,7 +18872,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             // Vortex is not a demolition charge: it tears
                             // ordinary props apart but leaves the tower alone.
                             DamagePrefabsInRadius(
-                                center, scene.vortexRadius, 1000000.0f, false);
+                                center, scene.vortexRadius, 1000000.0f, false,
+                                !projectile.hostile);
                             projectile.active = false;
                             projectile.detonate = false;
                             continue;
@@ -18469,7 +19024,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         // Only a remote charge can fell the comm tower; frag
                         // grenades and rockets leave it standing.
                         DamagePrefabsInRadius(
-                            center, blastRadius, blastDamage, c4Blast);
+                            center, blastRadius, blastDamage, c4Blast,
+                            !projectile.hostile);
                         // A charge stuck to the mast is a demolition, and one
                         // charge is enough. The radius pass above cannot do it:
                         // it measures to the entity origin, which for a 26 m
@@ -18483,6 +19039,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             if (riggedTower != 0)
                                 DamagePrefabEntity(riggedTower, blastDamage,
                                                    center, true);
+                        }
+                        // The aircraft needs the same volume treatment, and for
+                        // the same reason: the radius pass measures to the
+                        // origin, and this airframe reaches ~14.5 m from it
+                        // against a 5.4 m C4 blast, so explosives that visibly
+                        // went off against a wing did nothing at all.
+                        //
+                        // C4 destroys it outright, the way a planted charge
+                        // fells a rigged tower. A rocket takes half its health,
+                        // matching what one does to the helicopter -- so two
+                        // rockets bring the plane down and it stays a target
+                        // worth carrying a launcher for, rather than a one-shot.
+                        // Frag grenades are deliberately left out: they carry
+                        // per-bond damage meant for soft props and should not
+                        // chip away at an objective airframe.
+                        if (c4Blast || projectile.rocket) {
+                            const uint64_t hitPlane =
+                                ObjectivePlaneHitByExplosion(center, blastRadius);
+                            if (hitPlane != 0) {
+                                const float planeDamage = c4Blast
+                                    ? 1000000.0f
+                                    : ObjectivePlaneRocketDamage(hitPlane);
+                                DamagePrefabEntity(hitPlane, planeDamage, center,
+                                                   c4Blast, !projectile.hostile);
+                            }
                         }
                         projectile.active = false;
                         projectile.detonate = false;
@@ -18911,7 +19492,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     stopProjectileAt(barrelHit);
                     continue;
                 }
-                uint64_t prefabEntityId = 0;
                 // Seeded with the negated shot direction, which is what every
                 // prefab impact used before triangle collision existed. A mesh
                 // hit replaces it with the real surface normal, so decals lie
@@ -18919,6 +19499,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 XMFLOAT3 normal(-projectile.direction.x,
                                 -projectile.direction.y,
                                 -projectile.direction.z);
+                // A taxiing or airborne aircraft first, because its authored
+                // collider stayed on the apron when it rolled: without this the
+                // round tests against empty ground and flies through the plane.
+                // Checked ahead of the static colliders so the airframe wins
+                // over whatever it happens to be flying above.
+                {
+                    XMFLOAT3 planeHit;
+                    const uint64_t flyingPlane = HitObjectivePlaneSegment(
+                        projectile.previousPosition, projectile.position,
+                        bulletRadius, planeHit);
+                    if (flyingPlane != 0) {
+                        projectile.position = planeHit;
+                        scene.SpawnBulletImpact(planeHit, normal);
+                        if (projectile.laser) scene.StopLaserBeamAt(planeHit);
+                        if (projectile.harpoon) scene.ShowHarpoonTether(planeHit);
+                        // Fire does not stick to it: the aircraft is a player
+                        // objective and IgniteMaterial is filtered against it in
+                        // the burning-material tick anyway.
+                        if (!projectile.harpoon ||
+                            projectile.harpoonPiercedCount == 0)
+                            DamagePrefabEntity(flyingPlane,
+                                34.0f * projectile.damageMultiplier, planeHit,
+                                projectile.remoteCharge, projectile.playerOwned);
+                        stopProjectileAt(planeHit);
+                        continue;
+                    }
+                }
+                uint64_t prefabEntityId = 0;
                 if (HitPrefabColliderSegment(projectile.previousPosition,
                         projectile.position, bulletRadius, hit,
                         &prefabEntityId, &normal)) {
@@ -18939,7 +19547,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         projectile.harpoonPiercedCount == 0)
                         DamagePrefabEntity(prefabEntityId,
                             34.0f * projectile.damageMultiplier, hit,
-                            projectile.remoteCharge);
+                            projectile.remoteCharge, projectile.playerOwned);
                     stopProjectileAt(hit);
                     continue;
                 }
@@ -19122,29 +19730,36 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
         }
         // Exfil. Reaching the boat ends the run, but only once the mission is
-        // actually done -- otherwise the boat that appears with the first
-        // reinforcement wave would be a way to skip the objective it was meant
-        // to make harder. Levels with no tower authored have nothing to gate on,
-        // so there the boat is a straight way out.
+        // actually done -- otherwise the boat would be a way to skip the
+        // objective it was meant to make harder. Levels with no tower authored
+        // have nothing to gate on, so there the boat is a straight way out.
         if (g_game.session.Screen() == GameScreen::Level1 &&
             !g_emptyLevelMode && g_game.session.TimerRunning() &&
             scene.player.health > 0.0f) {
             const bool objectiveMet =
                 g_game.mission.Stats().commTowersTotal == 0 ||
                 g_game.mission.CommTowerObjectiveComplete();
-            // Guarantee an exfil exists the moment the run becomes winnable.
-            // The boat normally rides in with the first reinforcement wave, but
-            // that wave only launches when a comm tower falls on a level that
-            // authored a helicopter -- and the boat is now the ONLY way to end a
-            // mission. Without this, a towerless map would strand the player on
-            // a cleared island with no way to finish.
-            // Rolled here rather than at level load so a towerless map's exfil
-            // is as unpredictable as a wave-spawned one. PlaceEscapeBoatOnBearing
-            // is idempotent, so the roll only takes effect on the first frame
-            // this fires -- every later frame is a no-op and the boat stays put.
-            if (objectiveMet && !g_game.vehicles.EscapeBoatReady())
+            // Guarantee an exfil exists the moment the run becomes winnable --
+            // but ONLY on a level that authored no aircraft.
+            //
+            // Where there is an aircraft, resolving it is what calls the boat
+            // in (OnObjectivePlaneResolved), and the exfil must not exist before
+            // then: that is the whole point of tying the way out to the run's
+            // objective. A level with no aircraft has nothing to tie it to and
+            // the boat is the ONLY way to end a mission, so without this such a
+            // map would strand the player on a cleared island with no finish.
+            //
+            // Rolled here rather than at level load so a planeless map's exfil
+            // is as unpredictable as an aircraft-summoned one.
+            // PlaceEscapeBoatOnBearing is idempotent, so the roll only takes
+            // effect on the first frame this fires -- every later frame is a
+            // no-op and the boat stays put.
+            const bool levelHasAircraft =
+                g_game.mission.Stats().objectivePlanesTotal > 0;
+            if (objectiveMet && !levelHasAircraft &&
+                !g_game.vehicles.EscapeBoatReady())
                 g_game.vehicles.PlaceEscapeBoatOnBearing(
-                    RandomUnit() * XM_2PI, 0.0f);
+                    RandomUnit() * XM_2PI, 0.0f, CurrentEscapeBoatDistance());
             g_game.vehicles.UpdateEscapeBoat(deltaTime);
             if (objectiveMet && g_game.vehicles.EscapeBoatReady() &&
                 g_game.vehicles.PlayerCanBoardEscapeBoat(scene.camera.Position)) {

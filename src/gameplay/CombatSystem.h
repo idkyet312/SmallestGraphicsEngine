@@ -27,6 +27,14 @@ struct CombatSystem {
         suppressFireUntilMouseRelease = true;
     }
 
+    // Entities whose destruction is animated rather than instant -- the
+    // objective aircraft, which flies its own wreck into the ground -- must stay
+    // enabled after they die, or the next prefab rebuild drops them from the
+    // render batch and the wreck pops out of existence mid-fall. Set this to
+    // return true for those; they still report `destroyed`, so the caller can
+    // start the animation, but keep their LevelEntity live and drawing.
+    std::function<bool(uint64_t)> keepEnabledOnDestroy;
+
     PrefabDamageResult DamagePrefab(
         RuntimeWorld& world, uint64_t entityId, float damage,
         const DirectX::XMFLOAT3& effectPosition);

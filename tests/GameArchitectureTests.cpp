@@ -841,23 +841,21 @@ int main() {
     }
 
     // ---- Escape boat ---------------------------------------------------------
-    // Exfil sits offshore under the lane the dropship flies in along, so the way
-    // out points back along the direction the enemy keeps arriving from.
+    // Exfil sits offshore on a bearing the caller rolls, out past the insertion
+    // ring the player deployed from -- the way out is a leg further to sea than
+    // the way in, never a walk back to the start.
     {
         VehicleSystem vehicles;
         CHECK(!vehicles.EscapeBoatReady());
 
-        // No wave called yet: there is no lane to sit under, so nothing places.
-        vehicles.PlaceEscapeBoatOnDropshipLane(0.0f);
-        CHECK(!vehicles.EscapeBoatReady());
-
-        // Drop at the origin, aircraft entering from +X: the boat belongs out
-        // along +X, on the water.
-        vehicles.BeginDropshipRun({ 200.0f, 30.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, 3);
-        vehicles.PlaceEscapeBoatOnDropshipLane(0.0f);
+        // Placed on an explicit bearing. +X is bearing pi/2 the way the boat
+        // measures it (+Z = 0, turning through +X).
+        const float defaultDistance =
+            VehicleSystem::EscapeBoatDistanceForRing(34.0f);
+        vehicles.PlaceEscapeBoatOnBearing(3.14159265f * 0.5f, 0.0f,
+                                          defaultDistance);
         CHECK(vehicles.EscapeBoatReady());
-        CHECK(std::abs(vehicles.escapeBoatPosition.x -
-                       VehicleSystem::EscapeBoatShoreDistance) < 0.001f);
+        CHECK(std::abs(vehicles.escapeBoatPosition.x - defaultDistance) < 0.001f);
         CHECK(std::abs(vehicles.escapeBoatPosition.z) < 0.001f);
         CHECK(std::abs(vehicles.escapeBoatPosition.y) < 0.001f);
         // On water, not on the beach. The terrain profile crosses the waterline
@@ -867,12 +865,28 @@ int main() {
         CHECK(VehicleSystem::EscapeBoatShoreDistance >= 41.0f);
         CHECK(VehicleSystem::EscapeBoatShoreDistance < 70.0f);
 
-        // Idempotent: a later wave must not move an exfil the player may
+        // Always outside the insertion ring, at every authorable radius. This is
+        // the whole point of deriving the distance: the exfil must never sit on
+        // or inside the ring the player inserted from.
+        for (float ringRadius : { 5.0f, 20.0f, 34.0f, 100.0f, 600.0f }) {
+            const float distance =
+                VehicleSystem::EscapeBoatDistanceForRing(ringRadius);
+            CHECK(distance > ringRadius);
+            // Never inside the beach shelf, however tight the ring was authored.
+            CHECK(distance >= VehicleSystem::EscapeBoatShoreDistance);
+        }
+        // A wide ring pushes the boat out with it rather than leaving it
+        // stranded inside; the default ring keeps the historical deep-water
+        // distance because the shelf floor dominates there.
+        CHECK(std::abs(VehicleSystem::EscapeBoatDistanceForRing(600.0f) -
+                       (600.0f + VehicleSystem::EscapeBoatRingClearance)) < 0.001f);
+        CHECK(std::abs(VehicleSystem::EscapeBoatDistanceForRing(34.0f) -
+                       VehicleSystem::EscapeBoatShoreDistance) < 0.001f);
+
+        // Idempotent: a later placement must not move an exfil the player may
         // already be swimming toward.
         const float placedX = vehicles.escapeBoatPosition.x;
-        vehicles.dropshipState = VehicleSystem::DropshipState::Idle;
-        vehicles.BeginDropshipRun({ 0.0f, 30.0f, -200.0f }, { 0.0f, 0.0f, 0.0f }, 3);
-        vehicles.PlaceEscapeBoatOnDropshipLane(0.0f);
+        vehicles.PlaceEscapeBoatOnBearing(3.14159265f, 0.0f, defaultDistance);
         CHECK(std::abs(vehicles.escapeBoatPosition.x - placedX) < 0.001f);
 
         // Boarding is a horizontal test: the player may be swimming or on deck,

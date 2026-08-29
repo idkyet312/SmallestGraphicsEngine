@@ -20,15 +20,28 @@ CombatSystem::PrefabDamageResult CombatSystem::DamagePrefab(
         });
     if (definition == prefabs.destructibles.end()) return result;
 
-    result.applied = true;
     float& health = prefabs.health.try_emplace(
         entityId, definition->health).first->second;
+    // Already dead. Only reachable for an entity kept enabled through its own
+    // death animation (see below): a normal destructible is disabled on death
+    // and its LevelEntity never matches again. Reporting `destroyed` a second
+    // time would re-run the kill -- counting the same aircraft twice in the
+    // mission tally -- so the corpse simply stops absorbing fire.
+    if (health <= 0.0f) return result;
+
+    result.applied = true;
     health -= damage;
     if (health > 0.0f) return result;
 
+    // Disabling the entity is what removes it from the world: the prefab batch
+    // builder skips disabled entities, so the next rebuild stops drawing it.
+    // An entity that animates its own death needs to outlive that, so it reports
+    // destroyed but stays enabled.
+    const bool keepEnabled =
+        keepEnabledOnDestroy && keepEnabledOnDestroy(entityId);
     for (LevelEntity& entity : world.Level().entities) {
         if (entity.id != entityId || !entity.enabled) continue;
-        entity.enabled = false;
+        if (!keepEnabled) entity.enabled = false;
         result.destroyed = true;
         break;
     }
