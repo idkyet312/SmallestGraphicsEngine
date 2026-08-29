@@ -7845,8 +7845,10 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
                 g_dx12.commandList, 1.0f, false, prefab.useMaterials, false,
                 true);
         } else {
+            // Editor refreshes can import after the staged GPU mip flush, so
+            // upload their complete mip chains on this direct command list.
             model = GLBImporter::LoadGLB(prefab.modelPath.string(),
-                g_dx12.device, g_dx12.commandList);
+                g_dx12.device, g_dx12.commandList, IsEditorEditing());
         }
     }
     if (!model) {
@@ -7865,6 +7867,18 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
             for (const auto& child : node->children) self(self, child);
         };
         stripMaterials(stripMaterials, model);
+    }
+    if (prefab.forceDoubleSided) {
+        const auto forceDoubleSided = [](const auto& self,
+                                         const std::shared_ptr<SceneNode>& node) -> void {
+            if (!node) return;
+            if (node->mesh) {
+                for (MeshPrimitive& primitive : node->mesh->primitives)
+                    if (primitive.material) primitive.material->doubleSided = true;
+            }
+            for (const auto& child : node->children) self(self, child);
+        };
+        forceDoubleSided(forceDoubleSided, model);
     }
     if (prefab.materialAmbientScale != 1.0f ||
         prefab.materialViewFillStrength != 0.0f) {

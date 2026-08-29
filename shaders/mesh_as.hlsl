@@ -22,7 +22,9 @@ cbuffer MeshDrawBuffer : register(b6) {
     uint indexed;
     uint firstMeshlet;
     uint meshletCount;
-    uint occlusionEnabled;
+    // Bit 0 enables HZB occlusion. Bit 1 disables cone backface rejection so
+    // a runtime material override cannot be undone before rasterization.
+    uint cullingFlags;
     uint screenWidth;
     uint screenHeight;
     // 0 = static, 1 = skinned (bounds are bind-pose, so only the coarse frustum
@@ -96,7 +98,7 @@ bool IsBackfacing(MeshletBounds bounds, float4x4 drawModel, float drawScale) {
 
 bool IsOccluded(MeshletBounds bounds, float4x4 drawModel,
                 float4x4 drawModelView, float drawScale) {
-    if (!occlusionEnabled) return false;
+    if ((cullingFlags & 1u) == 0u) return false;
     float4 localCenter = float4(bounds.sphereCenter, 1);
     float4 viewCenter = mul(localCenter, drawModelView);
     float4 worldCenter = mul(localCenter, drawModel);
@@ -168,7 +170,8 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
             : (skinningEnabled
                 ? IntersectsFrustum(bounds, drawMVP, drawScale)
                 : (IntersectsFrustum(bounds, drawMVP, drawScale) &&
-                   !IsBackfacing(bounds, drawModel, drawScale) &&
+                   ((cullingFlags & 2u) != 0u ||
+                    !IsBackfacing(bounds, drawModel, drawScale)) &&
                    !IsOccluded(bounds, drawModel, drawModelView, drawScale)));
         if (visible) {
             uint slot;

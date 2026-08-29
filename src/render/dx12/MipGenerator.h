@@ -168,6 +168,9 @@ public:
     void FlushPending() {
         if (!loaded || pending.empty()) return;
         ID3D12GraphicsCommandList* cmdList = BeginComputeCommands();
+        // BeginComputeCommands waits for the previous batch, so its descriptor
+        // slices are no longer in flight and the fixed heap can be reused.
+        nextDescriptorSlot = 0;
         for (const PendingMip& request : pending)
             RecordMips(cmdList, request.texture.Get(), request.width,
                        request.height, request.mipLevels);

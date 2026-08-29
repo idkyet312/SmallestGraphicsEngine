@@ -434,7 +434,8 @@ public:
             MeshDrawBufferDX12 data = {
                 vertexCount, indexCount, indexCount ? 1u : 0u,
                 firstMeshlet, totalMeshlets,
-                (occlusionEnabled && allowOcclusion) ? 1u : 0u,
+                ((occlusionEnabled && allowOcclusion) ? 1u : 0u) |
+                    (doubleSided ? 2u : 0u),
                 g_dx12.screenWidth, g_dx12.screenHeight,
                 skinning, occlusionMipCount, g_currentModelMaxScale,
                 1u, 0u
@@ -522,7 +523,8 @@ public:
             MeshDrawBufferDX12 data = {
                 vertexCount, indexCount, indexCount ? 1u : 0u,
                 firstWorkItem, totalMeshlets,
-                (occlusionEnabled && allowOcclusion) ? 1u : 0u,
+                ((occlusionEnabled && allowOcclusion) ? 1u : 0u) |
+                    (doubleSided ? 2u : 0u),
                 g_dx12.screenWidth, g_dx12.screenHeight,
                 0u, occlusionMipCount, 1.0f,
                 instanceCount, 1u

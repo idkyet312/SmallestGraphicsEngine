@@ -230,13 +230,15 @@ struct alignas(256) MeshDrawBufferDX12 {
     UINT indexed;
     UINT firstMeshlet;
     UINT meshletCount;
-    UINT occlusionEnabled;
+    // Bit 0 enables HZB occlusion; bit 1 disables meshlet-cone backface
+    // rejection for a double-sided draw. Packing both here preserves the
+    // 13-root-constant contract shared with the grass mesh path.
+    UINT cullingFlags;
     UINT screenWidth;
     UINT screenHeight;
     // 0 static draw, 1 apply bone palette (t12) + skin (t13), 2 skinned AND
     // exempt from meshlet culling -- see mesh_as.hlsl. Packed into this field
-    // rather than added as a new one because b6 is shared with the grass pass,
-    // which static_asserts its 13 root constants.
+    // rather than added as a new one because b6 is shared with the grass pass.
     UINT skinningEnabled;
     UINT occlusionMipCount;
     float modelMaxScale;

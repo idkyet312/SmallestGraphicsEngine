@@ -46,6 +46,7 @@ int main() {
         crate.defaultScale[0] = crate.defaultScale[1] = crate.defaultScale[2] = 2.0f;
         crate.targetSize = 1.5f;
         crate.useMaterials = false;
+        crate.forceDoubleSided = true;
         crate.materialAmbientScale = 1.25f;
         crate.materialViewFillStrength = 0.1f;
         crate.collision = "box";
@@ -67,6 +68,9 @@ int main() {
             CHECK(loaded->modelPath == std::filesystem::path("models/crate.glb"));
             CHECK(loaded->targetSize == 1.5f);
             CHECK(!loaded->useMaterials);
+            CHECK(loaded->forceDoubleSided);
+            CHECK(loaded->components.at("staticMesh")
+                .at("forceDoubleSided") == true);
             CHECK(loaded->materialAmbientScale == 1.25f);
             CHECK(loaded->materialViewFillStrength == 0.1f);
             CHECK(loaded->collision == "box");
@@ -147,6 +151,7 @@ int main() {
         if (variant) {
             CHECK(variant->modelPath == std::filesystem::path("models/crate.glb"));
             CHECK(variant->collision == "mesh");
+            CHECK(variant->forceDoubleSided);
             CHECK(variant->light.enabled);
             CHECK(variant->children.size() == 1);
             CHECK(variant->children[0].prefabId == "test/legacy");

@@ -4,13 +4,18 @@
   "name": "Fuel Silo",
   "components": {
     "staticMesh": {
-      "path": "Content/Models/FuelSilo/FuelSilo.glb",
-      "defaultScale": [1.0, 1.0, 1.0],
-      "targetSize": 0.0,
+      "path": "Content/Models/FuelSilo/FuelSilo2.glb",
+      "defaultScale": [
+        1,
+        1,
+        1
+      ],
+      "targetSize": 0,
       "castShadow": true,
       "useMaterials": true,
-      "materialAmbientScale": 1.0,
-      "materialViewFillStrength": 0.0
+      "materialAmbientScale": 1,
+      "materialViewFillStrength": 0,
+      "forceDoubleSided": true
     },
     "collision": {
       "shape": "mesh"

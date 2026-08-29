@@ -19,7 +19,11 @@ struct HDRISunLight {
 
 class GLBImporter {
 public:
-    static std::shared_ptr<SceneNode> LoadGLB(const std::string& filepath, Microsoft::WRL::ComPtr<ID3D12Device> device, Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList);
+    static std::shared_ptr<SceneNode> LoadGLB(
+        const std::string& filepath,
+        Microsoft::WRL::ComPtr<ID3D12Device> device,
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
+        bool immediateMipUpload = false);
 
     // Same load, but also fills a Skeleton from the file's first glTF skin (bone
     // names, parents, inverse-bind matrices and bind-pose locals). Primitives
@@ -119,5 +123,5 @@ private:
         const std::string& filepath,
         Microsoft::WRL::ComPtr<ID3D12Device> device,
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList,
-        Skeleton* outSkeleton);
+        Skeleton* outSkeleton, bool immediateMipUpload);
 };

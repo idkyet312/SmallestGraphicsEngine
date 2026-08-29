@@ -238,6 +238,7 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
                 prefab.modelGuid = GuidForAssetPath(prefab.modelPath);
             prefab.castShadow = mesh.value("castShadow", true);
             prefab.useMaterials = mesh.value("useMaterials", true);
+            prefab.forceDoubleSided = mesh.value("forceDoubleSided", false);
             prefab.targetSize = mesh.value("targetSize", 0.0f);
             prefab.materialAmbientScale = mesh.value("materialAmbientScale", 1.0f);
             prefab.materialViewFillStrength = mesh.value(
@@ -367,6 +368,7 @@ const std::vector<PrefabPropertyDescriptor>& PrefabPropertyMetadata() {
     static const std::vector<PrefabPropertyDescriptor> properties = {
         {"staticMesh", "castShadow", PrefabPropertyType::Boolean},
         {"staticMesh", "useMaterials", PrefabPropertyType::Boolean},
+        {"staticMesh", "forceDoubleSided", PrefabPropertyType::Boolean},
         {"staticMesh", "targetSize", PrefabPropertyType::Number, 0.0f, 10000.0f},
         {"collision", "shape", PrefabPropertyType::String},
         {"light", "color", PrefabPropertyType::Color3, 0.0f, 1.0f},
@@ -495,6 +497,7 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
                 merged.modelGuid = local.modelGuid;
                 merged.castShadow = local.castShadow;
                 merged.useMaterials = local.useMaterials;
+                merged.forceDoubleSided = local.forceDoubleSided;
                 merged.targetSize = local.targetSize;
                 merged.materialAmbientScale = local.materialAmbientScale;
                 merged.materialViewFillStrength = local.materialViewFillStrength;
@@ -658,6 +661,8 @@ PrefabSaveResult PrefabRegistry::Save(const PrefabAsset& prefab,
             mesh["targetSize"] = prefab.targetSize;
             mesh["castShadow"] = prefab.castShadow;
             mesh["useMaterials"] = prefab.useMaterials;
+            if (prefab.forceDoubleSided)
+                mesh["forceDoubleSided"] = true;
             mesh["materialAmbientScale"] = prefab.materialAmbientScale;
             mesh["materialViewFillStrength"] = prefab.materialViewFillStrength;
         }

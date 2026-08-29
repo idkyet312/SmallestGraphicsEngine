@@ -203,7 +203,7 @@ static void GenerateTangents(const std::vector<DirectX::XMFLOAT3>& positions,
 // has no built-in equivalent of DX11's GenerateMips.
 ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList,
     const tinygltf::Image& image, std::vector<ComPtr<ID3D12Resource>>& uploadHeaps,
-    bool generateMips = true) {
+    bool generateMips = true, bool immediateMipUpload = false) {
     if (image.width == 0 || image.height == 0) return nullptr;
 
     UINT baseW = (UINT)image.width;
@@ -217,7 +217,7 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
     textureDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     textureDesc.Width = baseW;
     textureDesc.Height = baseH;
-    textureDesc.Flags = generateMips
+    textureDesc.Flags = generateMips && !immediateMipUpload
         ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
         : D3D12_RESOURCE_FLAG_NONE;
     textureDesc.DepthOrArraySize = 1;
@@ -265,6 +265,123 @@ ComPtr<ID3D12Resource> CreateTexture(ID3D12Device* device, ID3D12GraphicsCommand
             rgba[i * 4 + 3] = 255;
         }
         pSource = rgba.data();
+    }
+
+    // Editor asset refreshes happen after the level-load GPU mip flush. Build
+    // those rare late-load chains on the CPU and copy every level on the direct
+    // list that already owns mip 0; otherwise distant sampling reaches queued,
+    // uninitialized levels while close-up sampling still looks correct.
+    if (generateMips && immediateMipUpload) {
+        std::vector<std::vector<unsigned char>> mips(mipLevels);
+        std::vector<UINT> mipWidths(mipLevels), mipHeights(mipLevels);
+        mipWidths[0] = baseW;
+        mipHeights[0] = baseH;
+        mips[0].assign(pSource, pSource + (size_t)baseW * baseH * 4);
+        for (UINT16 level = 1; level < mipLevels; ++level) {
+            const UINT sourceWidth = mipWidths[level - 1];
+            const UINT sourceHeight = mipHeights[level - 1];
+            const UINT destinationWidth = (std::max)(1u, sourceWidth / 2);
+            const UINT destinationHeight = (std::max)(1u, sourceHeight / 2);
+            mipWidths[level] = destinationWidth;
+            mipHeights[level] = destinationHeight;
+            mips[level].resize((size_t)destinationWidth * destinationHeight * 4);
+            for (UINT y = 0; y < destinationHeight; ++y) {
+                const UINT y0 = (std::min)(y * 2, sourceHeight - 1);
+                const UINT y1 = (std::min)(y * 2 + 1, sourceHeight - 1);
+                for (UINT x = 0; x < destinationWidth; ++x) {
+                    const UINT x0 = (std::min)(x * 2, sourceWidth - 1);
+                    const UINT x1 = (std::min)(x * 2 + 1, sourceWidth - 1);
+                    for (UINT channel = 0; channel < 4; ++channel) {
+                        const auto sample = [&](UINT sx, UINT sy) {
+                            return mips[level - 1][
+                                ((size_t)sy * sourceWidth + sx) * 4 + channel];
+                        };
+                        const UINT sum = sample(x0, y0) + sample(x1, y0) +
+                            sample(x0, y1) + sample(x1, y1);
+                        mips[level][((size_t)y * destinationWidth + x) * 4 +
+                            channel] = static_cast<unsigned char>((sum + 2u) / 4u);
+                    }
+                }
+            }
+        }
+
+        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mipLevels);
+        std::vector<UINT> rowCounts(mipLevels);
+        UINT64 uploadBufferSize = 0;
+        device->GetCopyableFootprints(&textureDesc, 0, mipLevels, 0,
+            footprints.data(), rowCounts.data(), nullptr,
+            &uploadBufferSize);
+
+        ComPtr<ID3D12Resource> uploadHeap;
+        ID3D12Resource* uploadResource = nullptr;
+        BYTE* mapped = nullptr;
+        uint64_t pooledOffset = 0;
+        const bool pooled = IsTextureUploadArenaActiveDX12();
+        if (pooled) {
+            const TextureUploadAllocationDX12 allocation =
+                AllocateTextureUploadDX12(device, uploadBufferSize);
+            if (!allocation) return nullptr;
+            uploadResource = allocation.resource;
+            mapped = allocation.cpuAddress;
+            pooledOffset = allocation.offset;
+        } else {
+            D3D12_HEAP_PROPERTIES uploadHeapProperties = {};
+            uploadHeapProperties.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC uploadDescription = {};
+            uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            uploadDescription.Width = uploadBufferSize;
+            uploadDescription.Height = 1;
+            uploadDescription.DepthOrArraySize = 1;
+            uploadDescription.MipLevels = 1;
+            uploadDescription.Format = DXGI_FORMAT_UNKNOWN;
+            uploadDescription.SampleDesc.Count = 1;
+            uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(device->CreateCommittedResource(
+                    &uploadHeapProperties, D3D12_HEAP_FLAG_NONE,
+                    &uploadDescription, D3D12_RESOURCE_STATE_GENERIC_READ,
+                    nullptr, IID_PPV_ARGS(&uploadHeap)))) return nullptr;
+            if (FAILED(uploadHeap->Map(0, nullptr,
+                    reinterpret_cast<void**>(&mapped)))) return nullptr;
+            uploadResource = uploadHeap.Get();
+        }
+
+        for (UINT16 level = 0; level < mipLevels; ++level) {
+            const size_t sourceRowBytes = (size_t)mipWidths[level] * 4;
+            BYTE* destination = mapped + footprints[level].Offset;
+            for (UINT row = 0; row < rowCounts[level]; ++row) {
+                memcpy(destination + (size_t)row *
+                        footprints[level].Footprint.RowPitch,
+                    mips[level].data() + (size_t)row * sourceRowBytes,
+                    sourceRowBytes);
+            }
+        }
+        if (pooled) {
+            for (auto& footprint : footprints) footprint.Offset += pooledOffset;
+        } else {
+            uploadHeap->Unmap(0, nullptr);
+            uploadHeaps.push_back(uploadHeap);
+        }
+
+        for (UINT16 level = 0; level < mipLevels; ++level) {
+            D3D12_TEXTURE_COPY_LOCATION destination = {};
+            destination.pResource = texture.Get();
+            destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            destination.SubresourceIndex = level;
+            D3D12_TEXTURE_COPY_LOCATION source = {};
+            source.pResource = uploadResource;
+            source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            source.PlacedFootprint = footprints[level];
+            cmdList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        }
+
+        D3D12_RESOURCE_BARRIER ready = {};
+        ready.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        ready.Transition.pResource = texture.Get();
+        ready.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        ready.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        ready.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &ready);
+        return texture;
     }
 
     UINT64 uploadBufferSize = 0;
@@ -1218,16 +1335,20 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLBSkinned(
     const std::string& filepath, ComPtr<ID3D12Device> device,
     ComPtr<ID3D12GraphicsCommandList> commandList, Skeleton& outSkeleton) {
     outSkeleton = Skeleton{};
-    return LoadGLBInternal(filepath, device, commandList, &outSkeleton);
+    return LoadGLBInternal(filepath, device, commandList, &outSkeleton, false);
 }
 
-std::shared_ptr<SceneNode> GLBImporter::LoadGLB(const std::string& filepath, ComPtr<ID3D12Device> device, ComPtr<ID3D12GraphicsCommandList> commandList) {
-    return LoadGLBInternal(filepath, device, commandList, nullptr);
+std::shared_ptr<SceneNode> GLBImporter::LoadGLB(
+    const std::string& filepath, ComPtr<ID3D12Device> device,
+    ComPtr<ID3D12GraphicsCommandList> commandList, bool immediateMipUpload) {
+    return LoadGLBInternal(
+        filepath, device, commandList, nullptr, immediateMipUpload);
 }
 
 std::shared_ptr<SceneNode> GLBImporter::LoadGLBInternal(
     const std::string& filepath, ComPtr<ID3D12Device> device,
-    ComPtr<ID3D12GraphicsCommandList> commandList, Skeleton* outSkeleton) {
+    ComPtr<ID3D12GraphicsCommandList> commandList, Skeleton* outSkeleton,
+    bool immediateMipUpload) {
     // The cooked cache stores baked static geometry only, so a caller asking
     // for a skeleton has to go through the source glTF.
     if (device && !outSkeleton) {
@@ -1273,7 +1394,9 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLBInternal(
         if (baseColorIdx >= 0) {
             int imgIdx = model.textures[baseColorIdx].source;
             if (imgIdx >= 0 && imgIdx < model.images.size())
-                sceneMat->baseColorTexture = CreateTexture(device.Get(), commandList.Get(), model.images[imgIdx], sceneMat->uploadHeaps);
+                sceneMat->baseColorTexture = CreateTexture(device.Get(),
+                    commandList.Get(), model.images[imgIdx],
+                    sceneMat->uploadHeaps, true, immediateMipUpload);
         }
 
         // Metallic Roughness
@@ -1281,7 +1404,9 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLBInternal(
         if (mrIdx >= 0) {
             int imgIdx = model.textures[mrIdx].source;
             if (imgIdx >= 0 && imgIdx < model.images.size())
-                sceneMat->metallicRoughnessTexture = CreateTexture(device.Get(), commandList.Get(), model.images[imgIdx], sceneMat->uploadHeaps);
+                sceneMat->metallicRoughnessTexture = CreateTexture(device.Get(),
+                    commandList.Get(), model.images[imgIdx],
+                    sceneMat->uploadHeaps, true, immediateMipUpload);
         }
 
         // Normal
@@ -1289,7 +1414,9 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLBInternal(
         if (nIdx >= 0) {
             int imgIdx = model.textures[nIdx].source;
             if (imgIdx >= 0 && imgIdx < model.images.size())
-                sceneMat->normalTexture = CreateTexture(device.Get(), commandList.Get(), model.images[imgIdx], sceneMat->uploadHeaps);
+                sceneMat->normalTexture = CreateTexture(device.Get(),
+                    commandList.Get(), model.images[imgIdx],
+                    sceneMat->uploadHeaps, true, immediateMipUpload);
         }
 
         materials.push_back(sceneMat);

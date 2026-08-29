@@ -22,7 +22,7 @@ cbuffer MeshDrawBuffer : register(b6) {
     uint indexed;
     uint firstMeshlet;
     uint meshletCount;
-    uint occlusionEnabled;
+    uint cullingFlags;      // bit 0 HZB occlusion, bit 1 double-sided draw
     uint screenWidth;
     uint screenHeight;
     uint skinningEnabled;   // 0 static, 1 skinned, 2 skinned view model (both skin)

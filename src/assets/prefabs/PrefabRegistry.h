@@ -80,6 +80,11 @@ struct PrefabAsset {
     float targetSize = 0.0f;
     bool castShadow = true;
     bool useMaterials = true;
+    // Opt-in import override. Open-shell models (single-sided sheet geometry
+    // with no wall thickness) disappear when back-face culled from the inside,
+    // so they can request double-sided rendering regardless of the material
+    // flags the source file shipped with.
+    bool forceDoubleSided = false;
     float materialAmbientScale = 1.0f;
     float materialViewFillStrength = 0.0f;
     std::string collision = "none";
