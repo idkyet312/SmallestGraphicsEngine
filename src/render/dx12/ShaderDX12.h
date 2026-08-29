@@ -414,8 +414,12 @@ public:
     float pendingSkyIntensity = 1.0f;
     bool skyIrradianceValid = false;
     
-    // Current draw call index within frame
+    // Material/object data advances per primitive, while a scene node can share
+    // one matrix across several primitives. Keep the matrix slot independent so
+    // a material root-signature switch restores the matrix that was actually
+    // written instead of an unwritten slot at currentDrawCall.
     UINT currentDrawCall = 0;
+    UINT activeMatrixDrawCall = 0;
     UINT currentSrvOffset = 0; // For material descriptors
 
     // The shared CBV/SRV/UAV heap is carved into three regions:
@@ -1374,9 +1378,11 @@ public:
         g_dx12.commandList->SetGraphicsRootSignature(currentDrawBindless
             ? bindlessRootSignature.Get() : rootSignature.Get());
         BindFrameConstants();
-        if (currentDrawCall < MAX_DRAW_CALLS_PER_FRAME)
+        if (activeMatrixDrawCall < MAX_DRAW_CALLS_PER_FRAME)
             g_dx12.commandList->SetGraphicsRootConstantBufferView(
-                0, matrixBuffer.GetGPUAddress(GetDrawCallIndex()));
+                0, matrixBuffer.GetGPUAddress(
+                    g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME +
+                    activeMatrixDrawCall));
         if (currentDrawBindless && bindlessHeap) {
             if (bindlessGlobalTableBase != BINDLESS_INVALID_INDEX)
                 g_dx12.commandList->SetGraphicsRootDescriptorTable(
@@ -1592,6 +1598,7 @@ public:
         srvCreatesThisFrame = 0;
         srvCacheHitsThisFrame = 0;
         currentDrawCall = 0;
+        activeMatrixDrawCall = 0;
         graphicsRootBound = false;
         currentDrawBindless = false;
         bindlessGlobalTableBase = BINDLESS_INVALID_INDEX;
@@ -1612,6 +1619,7 @@ public:
                      XMFLOAT4 palmRoot = {},
                      const XMMATRIX& previousModel = XMMATRIX{}) {
         UINT bufferIndex = GetDrawCallIndex();
+        activeMatrixDrawCall = currentDrawCall;
         
         MatrixBufferDX12 data;
         data.model = XMMatrixTranspose(model);

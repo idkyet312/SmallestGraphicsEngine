@@ -954,6 +954,10 @@ public:
     void SetBindlessHeap(BindlessHeapDX12* heap) { bindlessHeap = heap; }
     void SetBindlessActive(bool active) { bindlessActive = active; }
     bool BindlessActive() const { return bindlessActive; }
+    bool BindlessVisPassActive() const {
+        return bindlessActive && BindlessResolveReady() && bindlessHeap &&
+               bindlessHeap->Initialized();
+    }
     bool BindlessResolveReady() const {
         return bindlessResolveReady && bindlessVisPassReady;
     }
@@ -1599,8 +1603,7 @@ public:
         cmdList->RSSetScissorRects(1, &g_dx12.scissorRect);
 
         // Set pipeline
-        const bool useBindless = bindlessActive && BindlessResolveReady() &&
-            bindlessHeap && bindlessHeap->Initialized();
+        const bool useBindless = BindlessVisPassActive();
         ID3D12DescriptorHeap* heaps[] = {
             useBindless ? bindlessHeap->Heap() : computeDescHeap.Get()
         };
@@ -1624,8 +1627,7 @@ public:
     void SetVisPassDraw(ID3D12GraphicsCommandList* cmdList, UINT drawCallID,
                         UINT materialID, bool doubleSided, bool alphaCutout,
                         bool alphaFromLuminance) {
-        const bool useBindless = bindlessActive && BindlessResolveReady() &&
-            bindlessHeap && bindlessHeap->Initialized();
+        const bool useBindless = BindlessVisPassActive();
         UINT albedoIndex = BINDLESS_FALLBACK_WHITE;
         if (useBindless && materialID < bindlessMaterialCount) {
             const UINT recordIndex =

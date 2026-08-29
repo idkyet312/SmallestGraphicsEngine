@@ -466,6 +466,7 @@ struct GPUDrivenVisibilityContext {
     bool initialized = false;
     UINT maxCommands = MAX_DRAW_CALLS_PER_FRAME;
     ComPtr<ID3D12CommandSignature> commandSignature;
+    ComPtr<ID3D12CommandSignature> bindlessCommandSignature;
     ComPtr<ID3D12Resource> inputBuffer;
     ComPtr<ID3D12Resource> visibleCommandBuffer;
     ComPtr<ID3D12Resource> visibleCountBuffer;
@@ -475,7 +476,8 @@ struct GPUDrivenVisibilityContext {
     GPUVisibilityCullInput* mappedInputs = nullptr;
     UploadBuffer<GPUVisibilityCullConstants> constants;
 
-    bool Init(ID3D12RootSignature* visRootSig) {
+    bool Init(ID3D12RootSignature* visRootSig,
+              ID3D12RootSignature* bindlessVisRootSig) {
         if (initialized) return true;
 
         D3D12_INDIRECT_ARGUMENT_DESC args[5] = {};
@@ -497,6 +499,11 @@ struct GPUDrivenVisibilityContext {
 
         HRESULT hr = g_dx12.device->CreateCommandSignature(&sigDesc, visRootSig, IID_PPV_ARGS(&commandSignature));
         if (FAILED(hr)) return false;
+        if (bindlessVisRootSig) {
+            hr = g_dx12.device->CreateCommandSignature(&sigDesc,
+                bindlessVisRootSig, IID_PPV_ARGS(&bindlessCommandSignature));
+            if (FAILED(hr)) bindlessCommandSignature.Reset();
+        }
 
         if (!CreateBuffers()) return false;
         if (!CreateCullPipeline()) return false;
@@ -724,9 +731,16 @@ struct GPUDrivenVisibilityContext {
         cmd->ResourceBarrier(2, barriers);
     }
 
-    void Execute(ID3D12GraphicsCommandList* cmd, UINT submittedCount) {
-        if (!initialized || submittedCount == 0) return;
-        cmd->ExecuteIndirect(commandSignature.Get(), submittedCount,
+    bool CanExecute(bool bindless) const {
+        return initialized && (!bindless || bindlessCommandSignature != nullptr);
+    }
+
+    void Execute(ID3D12GraphicsCommandList* cmd, UINT submittedCount,
+                 bool bindless) {
+        ID3D12CommandSignature* signature = bindless
+            ? bindlessCommandSignature.Get() : commandSignature.Get();
+        if (!initialized || !signature || submittedCount == 0) return;
+        cmd->ExecuteIndirect(signature, submittedCount,
             visibleCommandBuffer.Get(), 0, visibleCountBuffer.Get(), 0);
     }
 };
@@ -865,9 +879,14 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
     // draws retain direct submission because each batch needs its own texture SRV.
     static GPUDrivenVisibilityContext gpuCulled;
     static GPUDrivenVisibilityContext gpuDoubleSided;
-    if (!gpuCulled.initialized) gpuCulled.Init(vb.visPassRootSig.Get());
-    if (!gpuDoubleSided.initialized) gpuDoubleSided.Init(vb.visPassRootSig.Get());
-    const bool useGPUDriven = gpuCulled.initialized && gpuDoubleSided.initialized;
+    if (!gpuCulled.initialized)
+        gpuCulled.Init(vb.visPassRootSig.Get(), vb.bindlessVisPassRootSig.Get());
+    if (!gpuDoubleSided.initialized)
+        gpuDoubleSided.Init(vb.visPassRootSig.Get(),
+            vb.bindlessVisPassRootSig.Get());
+    const bool useBindlessVisPass = vb.BindlessVisPassActive();
+    const bool useGPUDriven = gpuCulled.CanExecute(useBindlessVisPass) &&
+        gpuDoubleSided.CanExecute(useBindlessVisPass);
 
     UINT drawCount = (UINT)drawItems.size();
     if (drawCount > gpuCulled.maxCommands) drawCount = gpuCulled.maxCommands;
@@ -960,12 +979,18 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
     g_dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if (culledCount > 0) {
         vb.SetVisPassDraw(g_dx12.commandList.Get(), 0, 0, false, false, false);
-        gpuCulled.Execute(g_dx12.commandList.Get(), culledCount);
+        gpuCulled.Execute(g_dx12.commandList.Get(), culledCount,
+            useBindlessVisPass);
     }
     if (doubleSidedCount > 0) {
         vb.SetVisPassDraw(g_dx12.commandList.Get(), 0, 0, true, false, false);
-        gpuDoubleSided.Execute(g_dx12.commandList.Get(), doubleSidedCount);
+        gpuDoubleSided.Execute(g_dx12.commandList.Get(), doubleSidedCount,
+            useBindlessVisPass);
     }
+    // ExecuteIndirect clears the root arguments it changes. Direct draws share
+    // this frame CBV, so restore it after the indirect batches reset slot 0.
+    if (!directDraws.empty())
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(0, frameMatrixCBV);
     for (UINT i : directDraws) {
             D3D12_VERTEX_BUFFER_VIEW vbv = drawItems[i].primitive
                 ? drawItems[i].primitive->vbv
