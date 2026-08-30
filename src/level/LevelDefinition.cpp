@@ -239,13 +239,16 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
         gi.multiBounceStrength < 0.0f || gi.multiBounceStrength > 1.0f)
         result.errors.push_back("lighting.dxrDDGI contains invalid settings");
     for (const TerrainSculptStamp& stamp : level.terrainSculpt) {
+        const float maxStampRadius =
+            stamp.operation == TerrainSculptOperation::Heightmap
+                ? kMaxBakedTerrainStampRadius : 64.0f;
         if (!std::isfinite(stamp.x) || !std::isfinite(stamp.z) ||
             !std::isfinite(stamp.radius) || !std::isfinite(stamp.value) ||
             !std::isfinite(stamp.strength) || !std::isfinite(stamp.rotation) ||
             !std::isfinite(stamp.replace) || !std::isfinite(stamp.baseHeight) ||
             stamp.replace < 0.0f || stamp.replace > 1.0f ||
             stamp.radius < 0.1f ||
-            stamp.radius > 64.0f || stamp.strength < 0.0f ||
+            stamp.radius > maxStampRadius || stamp.strength < 0.0f ||
             stamp.strength > 10.0f ||
             (stamp.operation != TerrainSculptOperation::Add &&
              stamp.operation != TerrainSculptOperation::Flatten &&

@@ -1277,13 +1277,15 @@ private:
         if (!s_stampNames.empty() || !s_stampAtlas.empty()) return;
         s_stampNames = DiscoverTerrainStampNames();
         s_stampLoadState.assign(s_stampNames.size(), 0u);
+        s_stampWriteTimes.assign(
+            s_stampNames.size(), std::filesystem::file_time_type{});
         s_stampAtlas.assign(static_cast<size_t>(kMaxTerrainStampTextures) *
             kTerrainStampResolution * kTerrainStampResolution, 32768u);
     }
 
     static UINT FindHeightStampLayer(const std::string& texture) {
         EnsureStampLibrary();
-        const auto found = std::lower_bound(
+        const auto found = std::find(
             s_stampNames.begin(), s_stampNames.end(), texture);
         if (found == s_stampNames.end() || *found != texture)
             return UINT_MAX;
@@ -1294,19 +1296,40 @@ private:
     static UINT EnsureHeightStampLoaded(const std::string& texture) {
         EnsureStampLibrary();
         if (!IsTerrainStampFilename(texture)) return UINT_MAX;
-        const auto found = std::lower_bound(
+        auto found = std::find(
             s_stampNames.begin(), s_stampNames.end(), texture);
-        if (found == s_stampNames.end() || *found != texture) return UINT_MAX;
+        if (found == s_stampNames.end()) {
+            // Editor bakes are written after the startup directory scan. Keep
+            // existing layer indices stable and append the new file instead of
+            // sorting it into the middle of the already-populated GPU atlas.
+            if (s_stampNames.size() >= kMaxTerrainStampTextures)
+                return UINT_MAX;
+            s_stampNames.push_back(texture);
+            s_stampLoadState.push_back(0u);
+            s_stampWriteTimes.push_back(
+                std::filesystem::file_time_type{});
+            found = s_stampNames.end() - 1;
+        }
         const size_t layer = static_cast<size_t>(found - s_stampNames.begin());
-        if (s_stampLoadState[layer] == 1u) return static_cast<UINT>(layer);
-        if (s_stampLoadState[layer] == 2u) return UINT_MAX;
+        const std::filesystem::path path = TerrainStampDirectory() / texture;
+        std::error_code writeTimeError;
+        const std::filesystem::file_time_type writeTime =
+            std::filesystem::last_write_time(path, writeTimeError);
+        const bool unchanged = !writeTimeError &&
+            s_stampWriteTimes[layer] == writeTime;
+        if (s_stampLoadState[layer] == 1u &&
+            (unchanged || writeTimeError))
+            return static_cast<UINT>(layer);
+        if (s_stampLoadState[layer] == 2u &&
+            (unchanged || writeTimeError))
+            return UINT_MAX;
 
         std::vector<uint16_t> source;
         int width = 0, height = 0;
-        const std::filesystem::path path = TerrainStampDirectory() / texture;
         if (!GLBImporter::LoadPixelsGray16(path.string(), source, width, height) ||
             width <= 0 || height <= 0) {
             s_stampLoadState[layer] = 2u;
+            if (!writeTimeError) s_stampWriteTimes[layer] = writeTime;
             return UINT_MAX;
         }
 
@@ -1345,6 +1368,7 @@ private:
             }
         }
         s_stampLoadState[layer] = 1u;
+        if (!writeTimeError) s_stampWriteTimes[layer] = writeTime;
         ++s_stampAtlasRevision;
         return static_cast<UINT>(layer);
     }
@@ -1400,6 +1424,8 @@ private:
     inline static std::vector<TerrainSculptStamp> s_sculptStamps;
     inline static std::vector<std::string> s_stampNames;
     inline static std::vector<uint8_t> s_stampLoadState;
+    inline static std::vector<std::filesystem::file_time_type>
+        s_stampWriteTimes;
     inline static std::vector<uint16_t> s_stampAtlas;
     inline static uint64_t s_sculptRevision = 1;
     inline static uint64_t s_stampAtlasRevision = 1;

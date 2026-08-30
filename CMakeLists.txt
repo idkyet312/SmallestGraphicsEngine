@@ -145,6 +145,7 @@ set(SGE_RUNTIME_SOURCES
     src/physics/CollisionMesh.cpp
     src/physics/CollisionMeshCache.cpp
     src/physics/DestructionDX12.cpp
+    src/world/terrain/TerrainStampBake.cpp
     src/world/vegetation/PalmMeshCutter.cpp
 )
 

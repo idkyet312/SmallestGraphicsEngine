@@ -262,6 +262,7 @@ private:
     char levelName_[128] = "Level 1 Copy";
     char saveName_[128] = "level_1_copy";
     std::string status_;
+    std::vector<std::string> validationErrors_;
     PrefabRegistry prefabRegistry_;
     AssetRegistry assetRegistry_;
     GunAudio audioPreview_;

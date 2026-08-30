@@ -153,6 +153,24 @@ int main() {
     LevelDefinition missingStampTexture = level;
     missingStampTexture.terrainSculpt[2].texture.clear();
     CHECK(!ValidateLevel(missingStampTexture).ok);
+    LevelDefinition bakedTerrain = level;
+    bakedTerrain.terrainSculpt.assign(1, heightmapStamp);
+    bakedTerrain.terrainSculpt[0].radius = 512.0f;
+    bakedTerrain.terrainSculpt[0].replace = 1.0f;
+    CHECK(ValidateLevel(bakedTerrain).ok);
+    const auto bakedTerrainPath = root / "baked-terrain.json";
+    CHECK(SaveLevel(bakedTerrain, bakedTerrainPath).ok);
+    const LevelLoadResult bakedTerrainLoaded = LoadLevel(bakedTerrainPath);
+    CHECK(bakedTerrainLoaded.ok);
+    CHECK(bakedTerrainLoaded.level.terrainSculpt.size() == 1);
+    CHECK(bakedTerrainLoaded.level.terrainSculpt[0].radius == 512.0f);
+    LevelDefinition oversizedBrush = level;
+    oversizedBrush.terrainSculpt[0].radius = 512.0f;
+    CHECK(!ValidateLevel(oversizedBrush).ok);
+    LevelDefinition oversizedBake = bakedTerrain;
+    oversizedBake.terrainSculpt[0].radius =
+        kMaxBakedTerrainStampRadius + 1.0f;
+    CHECK(!ValidateLevel(oversizedBake).ok);
     LevelDefinition missingPrefabId = level;
     missingPrefabId.entities.back().prefabId.clear();
     CHECK(!ValidateLevel(missingPrefabId).ok);

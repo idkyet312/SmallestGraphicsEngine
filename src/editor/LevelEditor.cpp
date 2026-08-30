@@ -3,9 +3,16 @@
 #include "EntityTransform.h"
 #include "CameraDX12.h"
 #include "TerrainStampLibrary.h"
+#include "TerrainStampBake.h"
 #include <imgui.h>
 #include <ImGuizmo.h>
 #include <stb_image.h>
+// stb_image_write declares stbi_zlib_compress only alongside its implementation,
+// which lives in GLBImporter.cpp. The terrain bake needs the deflate step for
+// its 16-bit PNG, so declare the symbol rather than instantiating a second copy
+// of the library here.
+extern "C" unsigned char* stbi_zlib_compress(
+    unsigned char* data, int data_len, int* out_len, int quality);
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -1780,6 +1787,20 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     if (ImGui::Button("Save As"))
         actions.fullReconcile |= BrowseSaveAs();
     ImGui::SameLine();
+    if (ImGui::Button("Validate Map")) {
+        LevelDefinition candidate = level_;
+        candidate.name = levelName_;
+        LevelValidationResult validation = ValidateLevel(candidate);
+        validationErrors_ = std::move(validation.errors);
+        status_ = validation.ok
+            ? "Map validation passed."
+            : "Map validation failed with " +
+                std::to_string(validationErrors_.size()) + " issue(s).";
+        ImGui::OpenPopup("Map Validation");
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Check whether the current map can be saved and loaded.");
+    ImGui::SameLine();
     if (ImGui::Button("Load")) { RefreshLevelFiles(); ImGui::OpenPopup("Load Level"); }
     ImGui::SameLine();
     if (ImGui::Button("Assets")) assetBrowserOpen_ = !assetBrowserOpen_;
@@ -1885,6 +1906,32 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         ImGui::EndDisabled();
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    if (!validationErrors_.empty())
+        ImGui::SetNextWindowSize(ImVec2(620.0f, 400.0f), ImGuiCond_Appearing);
+    const ImGuiWindowFlags validationWindowFlags = validationErrors_.empty()
+        ? ImGuiWindowFlags_AlwaysAutoResize : ImGuiWindowFlags_None;
+    if (ImGui::BeginPopupModal("Map Validation", nullptr,
+                               validationWindowFlags)) {
+        if (validationErrors_.empty()) {
+            ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.45f, 1.0f),
+                               "Map is valid and ready to save.");
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
+                               "Map has %zu validation issue(s):",
+                               validationErrors_.size());
+            ImGui::Separator();
+            ImGui::BeginChild("##MapValidationErrors", ImVec2(0.0f, -38.0f),
+                              true);
+            for (const std::string& error : validationErrors_) {
+                ImGui::Bullet();
+                ImGui::SameLine();
+                ImGui::TextWrapped("%s", error.c_str());
+            }
+            ImGui::EndChild();
+        }
+        if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
     ImGui::End();
@@ -2763,6 +2810,49 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         level_.terrainSculpt.clear();
         MarkChanged(before);
     }
+    ImGui::SameLine();
+    // Every stamp is evaluated per terrain vertex, five times over (height plus
+    // four finite-difference normal samples), so the sculpt loop grows with the
+    // stack and dominates the terrain raster once it is deep. Baking resolves
+    // the stack once into a single heightmap stamp: the terrain looks the same
+    // and the loop runs one iteration.
+    if (ImGui::Button("Bake to One Stamp")) {
+        const LevelDefinition before = level_;
+        // One bake target per level, so baking two levels does not have the
+        // second overwrite the first's heightmap. Stamp filenames must be
+        // simple names inside the stamp directory (IsTerrainStampFilename),
+        // so anything unusual in the level name is folded to an underscore.
+        std::string safeLevel;
+        for (char c : level_.name) {
+            const unsigned char u = static_cast<unsigned char>(c);
+            safeLevel.push_back(
+                (std::isalnum(u) || c == '-' || c == '_') ? c : '_');
+        }
+        if (safeLevel.empty()) safeLevel = "level";
+        if (safeLevel.size() > 64) safeLevel.resize(64);
+        const std::string bakeName = "HM_Baked_" + safeLevel + ".png";
+        TerrainSculptStamp baked;
+        const TerrainBakeResult result = BakeTerrainSculptToStamp(
+            level_.terrainSculpt, terrainHeight,
+            bakeName, &stbi_zlib_compress, baked);
+        if (!result.ok) {
+            status_ = "Bake failed: " + result.error;
+        } else {
+            level_.terrainSculpt.assign(1, baked);
+            MarkChanged(before);
+            char message[192];
+            std::snprintf(message, sizeof(message),
+                "Baked %zu stamps into %s (%.2f m/texel). Undo to restore them.",
+                result.bakedStamps, result.texture.c_str(),
+                result.metresPerTexel);
+            status_ = message;
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Replace every sculpt stamp with one baked heightmap covering the\n"
+            "same ground. Detail finer than the bake's metres-per-texel is\n"
+            "averaged away; the stamps stay in the undo stack.");
     ImGui::EndDisabled();
     if (terrainTool_ != 6)
         ImGui::TextWrapped("Hold LMB on terrain. Flatten uses height where stroke starts.");

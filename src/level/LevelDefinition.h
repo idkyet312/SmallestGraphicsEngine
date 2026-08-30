@@ -94,6 +94,11 @@ inline constexpr size_t kMaxFoliageClearStamps = 512;
 // this scales that loop linearly -- 1024 stamps is ~8x the Level-1 budget and
 // still only a 32 KB buffer.
 inline constexpr size_t kMaxTerrainSculptStamps = 1024;
+// Interactive radial/heightmap brushes are capped at 64 m in the editor, but a
+// baked heightmap encloses the complete sculpt stack and can legitimately span
+// a whole island. The shader stores radius as a float and supports this larger
+// footprint without increasing the per-vertex loop cost.
+inline constexpr float kMaxBakedTerrainStampRadius = 4096.0f;
 
 // Upper bound on the DDGI probe count a level may request.
 //
