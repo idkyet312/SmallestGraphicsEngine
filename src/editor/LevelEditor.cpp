@@ -2045,6 +2045,28 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             "terrain reads accurately. Costs more GPU; a view setting only,\n"
             "not saved with the level.");
     ImGui::SameLine();
+    ImGui::Checkbox("Navmesh", &navmeshEnabled_);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Walkable navmesh overlay: where enemies can path.\n"
+            "Props punch holes in it, so this is how to check that a\n"
+            "container or barrack actually blocks the route you think.\n"
+            "Shows the mesh as of the last Save, Play or Rebuild -- ordinary\n"
+            "edits are preview-only and do not rebuild it.\n"
+            "A view setting only; it is not saved with the level.");
+    if (navmeshEnabled_) {
+        ImGui::SameLine();
+        // Reuses the full reconcile the Save/Play boundaries already run: the
+        // navmesh has no rebuild of its own, and its obstacle list is gathered
+        // from the prefab colliders that reconcile refreshes.
+        if (ImGui::Button("Rebuild Navmesh")) actions.fullReconcile = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Rebuilds the navmesh so it picks up the props you just moved.\n"
+                "This is the full environment reconcile (~1.3 s): navmesh, grass\n"
+                "and trees all rebuild, not the navmesh alone.");
+    }
+    ImGui::SameLine();
     ImGui::TextDisabled("%s%s", level_.name.c_str(), dirty_ ? " *" : "");
 
     if (ImGui::BeginPopupModal("Confirm New Level", nullptr,

@@ -11164,6 +11164,9 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
     }
 }
 
+// Defined below; the navmesh extent needs it before that point.
+static float CurrentPhysicsTerrainExtent();
+
 static void RebuildScalableEnvironment() {
     ProfilerDX12::CpuScope environmentProfile(g_profiler, "Editor/Environment");
     auto terrainParams = CurrentTerrainParams();
@@ -11306,8 +11309,23 @@ static void RebuildScalableEnvironment() {
                   palm.x + 0.55f, palm.z + 0.55f });
     }
     }
-    const float extent = g_customLevelMode ? 122.0f :
-        (g_stressTestMode ? 122.0f : 61.0f);
+    // A custom island is authored at its own scale, so a fixed extent cannot
+    // cover it: BigIslandv22 stretches to islandScale 3.9 and places props out
+    // to |Z| 135 m, well past the 122 m this used to build. Everything beyond
+    // the edge simply had no navmesh under it, so enemies fell back to direct
+    // steering there and the editor overlay showed bare ground.
+    //
+    // Follow the island the way the ocean and crater sizing already do
+    // (kShoreOuter * islandScale), and take whichever is larger: the island
+    // itself, or the spread of the placed entities plus a margin.
+    float extent = g_stressTestMode ? 122.0f : 61.0f;
+    if (g_customLevelMode) {
+        constexpr float kShoreOuter = 88.0f;
+        const float islandScale = (std::max)(1.0f,
+            (std::max)(terrainParams.islandScaleX, terrainParams.islandScaleZ));
+        extent = (std::max)({ 122.0f, kShoreOuter * islandScale,
+                              CurrentPhysicsTerrainExtent() });
+    }
     {
         ProfilerDX12::CpuScope navmeshProfile(g_profiler, "Editor/Navmesh");
         if (!g_navigation.BuildTerrain(terrainSampler, -extent, extent,
@@ -15286,6 +15304,78 @@ static void StopEditorPlaytest() {
     ReleaseCapture();
     SetCursorVisible(true);
     SynchronizeEditorRuntime(false);
+}
+
+// Draw the walkable navmesh as a translucent overlay, so the holes props punch
+// in it are visible while authoring. Same approach as the destruction overlay:
+// project to screen and use ImGui's foreground draw list, no new pipeline.
+//
+// The foreground list does not depth test, so this paints over props standing in
+// front of it. That is acceptable for reading blocked ground from above, which is
+// what the overlay is for.
+static void DrawNavmeshDebug(const XMMATRIX& view, const XMMATRIX& projection) {
+    if (!g_navigation.Ready()) return;
+
+    // Rebuilt only at reconcile boundaries, so this is not per-frame work in the
+    // usual case -- but the vector is reused across frames regardless.
+    static std::vector<XMFLOAT3> triangles;
+    g_navigation.DebugWalkableTriangles(triangles);
+    if (triangles.size() < 3) return;
+
+    const XMMATRIX viewProj = view * projection;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float w = io.DisplaySize.x, h = io.DisplaySize.y;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+    auto project = [&](const XMFLOAT3& p, ImVec2& out) -> bool {
+        XMVECTOR clip = XMVector3Transform(XMLoadFloat3(&p), viewProj);
+        const float cw = XMVectorGetW(clip);
+        if (cw <= 0.0001f) return false;
+        const float ndcX = XMVectorGetX(clip) / cw, ndcY = XMVectorGetY(clip) / cw;
+        out = ImVec2((ndcX * 0.5f + 0.5f) * w, (1.0f - (ndcY * 0.5f + 0.5f)) * h);
+        return true;
+    };
+
+    // The detail mesh multiplies the polygon count, and every triangle here is
+    // six unbatched ImGui vertices. Cap the work so a large island cannot stall
+    // the editor; the cap is generous enough for the 122 m levels in practice.
+    constexpr size_t kMaxTriangles = 120000;
+    const size_t availableTriangles = triangles.size() / 3;
+    const size_t triangleCount = (std::min)(availableTriangles, kMaxTriangles);
+    // Say so when the cap bites: a silently truncated overlay looks exactly
+    // like a navmesh that does not cover the island, which is the bug this
+    // overlay exists to reveal.
+    if (availableTriangles > kMaxTriangles) {
+        static size_t warnedFor = 0;
+        if (warnedFor != availableTriangles) {
+            warnedFor = availableTriangles;
+            SGE_LOG("LogNav", EngineLog::Level::Warning,
+                "Navmesh overlay truncated: drawing " +
+                std::to_string(kMaxTriangles) + " of " +
+                std::to_string(availableTriangles) + " triangles");
+        }
+    }
+
+    // Lifted slightly so the overlay reads as sitting on the ground rather than
+    // fighting the terrain it was built from.
+    constexpr float kLift = 0.05f;
+    const ImU32 fill = IM_COL32(60, 220, 90, 40);
+    const ImU32 edge = IM_COL32(70, 240, 105, 110);
+
+    for (size_t i = 0; i < triangleCount; ++i) {
+        ImVec2 corner[3];
+        bool visible = true;
+        for (int c = 0; c < 3; ++c) {
+            XMFLOAT3 p = triangles[i * 3 + c];
+            p.y += kLift;
+            visible = project(p, corner[c]) && visible;
+        }
+        // All-or-nothing, matching the destruction overlay's boxes: a partially
+        // projected triangle would smear across the screen.
+        if (!visible) continue;
+        dl->AddTriangleFilled(corner[0], corner[1], corner[2], fill);
+        dl->AddTriangle(corner[0], corner[1], corner[2], edge);
+    }
 }
 
 // Draw Blast/Box3D destruction state as a 2D overlay using ImGui's foreground
@@ -21890,6 +21980,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             DrawProfilerWindow();
             DrawDXRDDGIProbeDebug(
                 scene.GetViewMatrix(), scene.GetProjectionMatrix());
+            // Authoring aid, so it is hidden during a playtest: that view has to
+            // show the level the way the player will get it.
+            if (!g_levelEditor.IsPlaying() && g_levelEditor.NavmeshEnabled())
+                DrawNavmeshDebug(
+                    scene.GetViewMatrix(), scene.GetProjectionMatrix());
             if (g_levelEditor.IsPlaying()) {
                 RenderPlayerHUD(scene);
                 DrawEnemyVisionCones(scene.GetViewMatrix(), scene.GetProjectionMatrix());

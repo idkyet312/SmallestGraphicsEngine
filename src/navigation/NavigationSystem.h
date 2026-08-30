@@ -48,6 +48,16 @@ public:
                          const std::function<bool(const DirectX::XMFLOAT3&)>&
                              accept = {}) const;
     bool Ready() const { return navMesh_ != nullptr && query_ != nullptr; }
+    // The walkable surface as world-space triangles, three vertices per triangle,
+    // for debug visualisation. This is the detail mesh rather than the coarse
+    // polygons, so it follows the terrain the way the navmesh actually does.
+    //
+    // Obstacles are subtracted before Recast rasterizes, so the holes a prop
+    // punches in the walkable area are genuinely absent here rather than
+    // something the caller has to filter out. Clears `outTriangles` first, and
+    // leaves it empty when no navmesh is built.
+    void DebugWalkableTriangles(
+        std::vector<DirectX::XMFLOAT3>& outTriangles) const;
     void Reset();
 
 private:

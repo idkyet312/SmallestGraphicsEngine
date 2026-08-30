@@ -74,6 +74,8 @@ public:
     bool FogEnabled() const { return fogEnabled_; }
     // Whether the viewport wants the deployment overview's terrain LOD.
     bool BirdseyeEnabled() const { return birdseyeEnabled_; }
+    // Whether the viewport wants the walkable navmesh drawn over the ground.
+    bool NavmeshEnabled() const { return navmeshEnabled_; }
     bool IsDirty() const { return dirty_; }
     void RefreshAssets();
     const LevelDefinition& Level() const { return level_; }
@@ -307,6 +309,10 @@ private:
     // more than the clipmap, which is why it is opt-in, but it is the only way
     // to judge distant terrain edits without flying the camera out to them.
     bool birdseyeEnabled_ = false;
+    // Draws the walkable navmesh over the terrain so the holes props punch in it
+    // are visible while authoring. Off by default: it is an authoring aid, and
+    // the fills are opaque enough to obscure the level underneath.
+    bool navmeshEnabled_ = false;
     int assetKindTab_ = 3;
     // Prefab ids the user starred. Kept as ids rather than indices because the
     // registry reorders on every Refresh -- an index would silently point at a

@@ -21,6 +21,51 @@ void NavigationSystem::Reset() {
     if (navMesh_) { dtFreeNavMesh(navMesh_); navMesh_ = nullptr; }
 }
 
+void NavigationSystem::DebugWalkableTriangles(
+        std::vector<DirectX::XMFLOAT3>& outTriangles) const {
+    outTriangles.clear();
+    if (!navMesh_) return;
+
+    // Through a const pointer: dtNavMesh also declares a private non-const
+    // getTile overload, and a non-const navMesh_ selects that one.
+    const dtNavMesh* navMesh = navMesh_;
+
+    // BuildTerrain creates a single tile, but iterate anyway so this keeps
+    // working if that ever becomes a tiled build.
+    for (int tileIndex = 0; tileIndex < navMesh->getMaxTiles(); ++tileIndex) {
+        const dtMeshTile* tile = navMesh->getTile(tileIndex);
+        // An unused slot in the tile array has no header, which is how Detour
+        // marks it free -- not an error.
+        if (!tile || !tile->header) continue;
+
+        for (int polyIndex = 0; polyIndex < tile->header->polyCount; ++polyIndex) {
+            const dtPoly& poly = tile->polys[polyIndex];
+            // Off-mesh connections are a two-vertex link, not a surface.
+            if (poly.getType() == DT_POLYTYPE_OFFMESH_CONNECTION) continue;
+            const dtPolyDetail& detail = tile->detailMeshes[polyIndex];
+
+            for (int triangle = 0; triangle < detail.triCount; ++triangle) {
+                // Stride 4: three vertex indices plus an edge-flags byte.
+                const unsigned char* indices =
+                    &tile->detailTris[(detail.triBase + triangle) * 4];
+                for (int corner = 0; corner < 3; ++corner) {
+                    // Indices below the polygon's own vertex count address the
+                    // tile's shared vertices; the rest are vertices unique to
+                    // the detail mesh, stored separately.
+                    const float* position =
+                        indices[corner] < poly.vertCount
+                            ? &tile->verts[poly.verts[indices[corner]] * 3]
+                            : &tile->detailVerts[
+                                  (detail.vertBase +
+                                   (indices[corner] - poly.vertCount)) * 3];
+                    outTriangles.push_back(
+                        DirectX::XMFLOAT3(position[0], position[1], position[2]));
+                }
+            }
+        }
+    }
+}
+
 bool NavigationSystem::BuildTerrain(
     const std::function<float(float, float)>& heightAt,
     float minX, float maxX, float minZ, float maxZ,

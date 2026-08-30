@@ -161,6 +161,80 @@ int main() {
         CHECK(point.x == 42.0f);   // untouched
     }
 
+    // ---- Debug triangle extraction ------------------------------------------
+    // Backs the editor navmesh overlay. The property that matters is that an
+    // obstacle actually removes surface: the overlay exists so a level author
+    // can see that a prop blocks the route, and a extractor that ignored
+    // obstacles would draw an unbroken sheet over a blocked area.
+    {
+        std::vector<DirectX::XMFLOAT3> open;
+        navigation.DebugWalkableTriangles(open);
+        // Three vertices per triangle, and a 80x80 m field is not empty.
+        CHECK(!open.empty());
+        CHECK(open.size() % 3 == 0);
+
+        // Every vertex must sit inside the built extent; a vertex far outside
+        // it means the tile/detail indexing is wrong and the overlay would
+        // smear triangles across the level.
+        bool inBounds = true;
+        for (const DirectX::XMFLOAT3& vertex : open) {
+            if (std::abs(vertex.x) > kExtent + 2.0f ||
+                std::abs(vertex.z) > kExtent + 2.0f ||
+                std::abs(vertex.y) > 2.0f) inBounds = false;
+        }
+        CHECK(inBounds);
+
+        // Same ground, but with a big obstacle over the middle. Fewer walkable
+        // triangles must come back, and none may fall inside the blocked rect.
+        NavigationSystem blocked;
+        const NavigationObstacle middle{ -10.0f, -10.0f, 10.0f, 10.0f };
+        CHECK(blocked.BuildTerrain(flatGround, -kExtent, kExtent,
+                                   -kExtent, kExtent, { middle }));
+        std::vector<DirectX::XMFLOAT3> holed;
+        blocked.DebugWalkableTriangles(holed);
+        CHECK(!holed.empty());
+        // Not a triangle-count comparison: punching a hole in a flat sheet
+        // splits it into MORE polygons around the rim (measured: 17 -> 28).
+        // Surface area is the honest measure of "less walkable ground".
+        const auto walkableArea = [](const std::vector<DirectX::XMFLOAT3>& tris) {
+            double area = 0.0;
+            for (size_t i = 0; i + 2 < tris.size(); i += 3) {
+                // Projected onto XZ, which is the area an actor can stand on.
+                const double ax = tris[i+1].x - tris[i].x;
+                const double az = tris[i+1].z - tris[i].z;
+                const double bx = tris[i+2].x - tris[i].x;
+                const double bz = tris[i+2].z - tris[i].z;
+                area += std::abs(ax * bz - az * bx) * 0.5;
+            }
+            return area;
+        };
+        const double openArea = walkableArea(open);
+        const double holedArea = walkableArea(holed);
+        CHECK(openArea > 0.0);
+        // The 20x20 m obstacle must remove roughly its own footprint.
+        CHECK(holedArea < openArea - 300.0);
+
+        // Sample triangle centres rather than vertices: Recast keeps vertices
+        // on the hole boundary, so a centre is the honest test of whether any
+        // surface survived inside the obstacle.
+        int centresInsideObstacle = 0;
+        for (size_t i = 0; i + 2 < holed.size(); i += 3) {
+            const float cx = (holed[i].x + holed[i+1].x + holed[i+2].x) / 3.0f;
+            const float cz = (holed[i].z + holed[i+1].z + holed[i+2].z) / 3.0f;
+            if (cx > middle.minX && cx < middle.maxX &&
+                cz > middle.minZ && cz < middle.maxZ) ++centresInsideObstacle;
+        }
+        CHECK(centresInsideObstacle == 0);
+
+        // An unbuilt system yields nothing, and clears what the caller passed
+        // in -- the overlay reuses one vector across frames, so a stale mesh
+        // would otherwise keep drawing after a level teardown.
+        NavigationSystem unbuilt;
+        std::vector<DirectX::XMFLOAT3> stale = open;
+        unbuilt.DebugWalkableTriangles(stale);
+        CHECK(stale.empty());
+    }
+
     // Reset returns the system to the unbuilt state, so a level teardown cannot
     // leave a stale mesh behind for the next level's scatter.
     navigation.Reset();
