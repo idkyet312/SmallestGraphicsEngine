@@ -286,6 +286,30 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMENT "Compiling MSAA-depth tropical water pixel shader"
     )
     add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/ultra_water_spectrum_cs.cso
+        COMMAND ${DXC_EXECUTABLE} -T cs_6_5 -E SpectrumCS
+                ${CMAKE_SOURCE_DIR}/shaders/ultra_water_cs.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/ultra_water_spectrum_cs.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/ultra_water_cs.hlsl
+        COMMENT "Compiling Ultra water spectral simulation"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/ultra_water_coast_cs.cso
+        COMMAND ${DXC_EXECUTABLE} -T cs_6_5 -E CoastCS
+                ${CMAKE_SOURCE_DIR}/shaders/ultra_water_cs.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/ultra_water_coast_cs.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/ultra_water_cs.hlsl
+        COMMENT "Compiling Ultra water coastal simulation"
+    )
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/ultra_water_height_query_cs.cso
+        COMMAND ${DXC_EXECUTABLE} -T cs_6_5 -E HeightQueryCS
+                ${CMAKE_SOURCE_DIR}/shaders/ultra_water_cs.hlsl
+                -Fo ${CMAKE_BINARY_DIR}/ultra_water_height_query_cs.cso
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/ultra_water_cs.hlsl
+        COMMENT "Compiling Ultra water height queries"
+    )
+    add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/dxr_ddgi.cso
         COMMAND ${DXC_EXECUTABLE} -T lib_6_3
                 ${CMAKE_SOURCE_DIR}/shaders/dxr_ddgi.hlsl
@@ -309,6 +333,9 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         ${CMAKE_BINARY_DIR}/water_ps_hdr.cso
         ${CMAKE_BINARY_DIR}/water_ps_ldr.cso
         ${CMAKE_BINARY_DIR}/water_ps_ldr_msaa.cso
+        ${CMAKE_BINARY_DIR}/ultra_water_spectrum_cs.cso
+        ${CMAKE_BINARY_DIR}/ultra_water_coast_cs.cso
+        ${CMAKE_BINARY_DIR}/ultra_water_height_query_cs.cso
         ${CMAKE_BINARY_DIR}/dxr_ddgi.cso)
 else()
     message(STATUS "DXC not found; mesh shader path will use raster fallback")
@@ -487,6 +514,10 @@ if(BUILD_TESTING)
     target_link_libraries(TextureUploadArenaTests PRIVATE SGEProjectHeaders d3d12)
     add_test(NAME TextureUploadArenaTests COMMAND TextureUploadArenaTests)
 
+    add_executable(UltraWaterSimulationTests tests/UltraWaterSimulationTests.cpp)
+    target_link_libraries(UltraWaterSimulationTests PRIVATE SGEProjectHeaders)
+    add_test(NAME UltraWaterSimulationTests COMMAND UltraWaterSimulationTests)
+
     # Per-triangle collision BVH. Pure CPU: CollisionMesh takes raw float
     # arrays and never sees the scene graph or a device, so the build and the
     # traversal are testable without a GPU or any game content.
@@ -583,6 +614,9 @@ if(USE_DX12 AND DXC_EXECUTABLE)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/water_ps_hdr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/water_ps_hdr.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/water_ps_ldr.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/water_ps_ldr.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/water_ps_ldr_msaa.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/water_ps_ldr_msaa.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/ultra_water_spectrum_cs.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/ultra_water_spectrum_cs.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/ultra_water_coast_cs.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/ultra_water_coast_cs.cso
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/ultra_water_height_query_cs.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/ultra_water_height_query_cs.cso
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/dxr_ddgi.cso $<TARGET_FILE_DIR:GraphicEngine>/shaders/dxr_ddgi.cso
     )
     if(DXC_EXECUTABLE)

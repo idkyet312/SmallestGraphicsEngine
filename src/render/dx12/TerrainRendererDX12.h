@@ -363,6 +363,8 @@ public:
         return (terrainStyle & kStyleClipmap) != 0u;
     }
 
+    static uint64_t SculptRevision() { return s_sculptRevision; }
+
     // CPU mirror of terrain_ms.hlsl's height function (hash21/noise2/fbm/
     // TerrainHeight), used for walking collision. Keep the two in sync - any
     // drift puts the camera above or inside the rendered ground.
