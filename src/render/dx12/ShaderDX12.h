@@ -343,6 +343,11 @@ public:
     ComPtr<ID3D12PipelineState> wireframePipelineState;
     ComPtr<ID3D12PipelineState> transparentPipelineState;
     ComPtr<ID3D12PipelineState> additivePipelineState;
+    // Additive, depth-bound but always passing: the first-person muzzle flash
+    // belongs to the viewmodel and must not be occluded by world geometry the
+    // weapon is standing in.
+    ComPtr<ID3D12PipelineState> muzzleFlashPipelineState;
+    ComPtr<ID3D12PipelineState> hdrMuzzleFlashPipelineState;
     ComPtr<ID3D12PipelineState> msaaPipelineState;
     ComPtr<ID3D12PipelineState> msaaWireframePipelineState;
     ComPtr<ID3D12PipelineState> msaaTransparentPipelineState;
@@ -956,6 +961,32 @@ public:
         psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         if (msaaSupported && !createMSAAPipeline(msaaAdditivePipelineState))
             msaaSupported = false;
+
+        // Muzzle flash. The gun is a viewmodel but its flash is a world-space
+        // quad at the muzzle, so grass between the eye and the barrel wins the
+        // depth test and swallows it. DepthFunc ALWAYS lets the flash through
+        // without moving it toward the camera -- the quad is ~0.6 m across and
+        // sits ~0.7 m from the eye, so pulling it in inflates it across the
+        // screen instead of fixing anything.
+        {
+            const D3D12_COMPARISON_FUNC savedFunc =
+                psoDesc.DepthStencilState.DepthFunc;
+            psoDesc.DepthStencilState.DepthFunc =
+                D3D12_COMPARISON_FUNC_ALWAYS;
+            if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                    &psoDesc, IID_PPV_ARGS(&muzzleFlashPipelineState))))
+                muzzleFlashPipelineState.Reset();
+            psoDesc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            psoDesc.PS = { hdrPsBlob->GetBufferPointer(),
+                           hdrPsBlob->GetBufferSize() };
+            if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                    &psoDesc, IID_PPV_ARGS(&hdrMuzzleFlashPipelineState))))
+                hdrMuzzleFlashPipelineState.Reset();
+            psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
+            psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            psoDesc.DepthStencilState.DepthFunc = savedFunc;
+        }
+
         psoDesc.BlendState.RenderTarget[0].BlendEnable = FALSE;
         psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         
@@ -1476,6 +1507,24 @@ public:
         EnsureGraphicsRootBound();
         if (GetAdditivePipelineState())
             g_dx12.commandList->SetPipelineState(GetAdditivePipelineState());
+    }
+
+    // Additive with the depth test always passing, for the viewmodel's muzzle
+    // flash. MSAA and bindless keep the ordinary additive PSO: those paths have
+    // their own variant families and the flash is brief enough that being
+    // occluded there is better than widening every one of them.
+    void UseMuzzleFlash() {
+        if (!loaded) return;
+        drawPipelineKind = DrawPipelineKind::Additive;
+        drawWireframe = false;
+        EnsureGraphicsRootBound();
+        ID3D12PipelineState* pso = nullptr;
+        if (!msaaEnabled && !currentDrawBindless) {
+            pso = hdrTargetEnabled ? hdrMuzzleFlashPipelineState.Get()
+                                   : muzzleFlashPipelineState.Get();
+        }
+        if (!pso) pso = GetAdditivePipelineState();
+        if (pso) g_dx12.commandList->SetPipelineState(pso);
     }
 
     void BindGlobalResources(ID3D12Resource* shadowMap,

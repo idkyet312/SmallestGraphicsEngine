@@ -3650,7 +3650,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 camUp * rotationCos - camRight * rotationSin;
             model = XMMATRIX(flashRight * size, flashUp * size, camFwd * size,
                              XMVectorSetW(pos, 1.0f));
-            shader.UseAdditive();
+            shader.UseMuzzleFlash();
             shader.SetMatrices(model, view, proj, lightSpace);
             shader.SetSmokeMaterial(XMFLOAT3(2.8f, 0.82f, 0.08f), fade * 0.82f,
                                     g_muzzleFlashTexture.Get());
