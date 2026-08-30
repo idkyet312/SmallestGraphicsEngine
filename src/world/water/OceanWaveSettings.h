@@ -22,6 +22,16 @@ struct OceanWaveSettings {
     float foamDepth = 0.72f;
     float foamCrest = 0.18f;
 
+    // Live High-path sliders, applied on top of the authored spectrum above.
+    // They live here rather than only in Scene so the CPU buoyancy query and
+    // the GPU surface scale by the same numbers: the renderer folds these into
+    // the uploaded wave constants, and EvaluateHeightAndSlope applies them
+    // directly. A slider that moved only one of the two would float boats above
+    // or below the water being drawn.
+    float heightScale = 1.0f;
+    float lengthScale = 1.0f;
+    float speedScale = 1.0f;
+
     static OceanWaveSettings CalmTropical() {
         OceanWaveSettings result;
         result.waves = {{
@@ -33,12 +43,21 @@ struct OceanWaveSettings {
         return result;
     }
 
+    // Linear directional waves, as the High path has always used: each
+    // component sweeps across the world on its authored bearing. Bathymetric
+    // refraction and shoaling live in the Ultra path, which has real bed data
+    // to drive them; approximating either here made the surface worse, not
+    // better. The slider scales are applied so buoyancy tracks the drawn
+    // surface exactly.
     float EvaluateHeightAndSlope(float x, float z, float time,
                                  float& dhdx, float& dhdz) const {
         constexpr float gravity = 9.81f;
         dhdx = 0.0f;
         dhdz = 0.0f;
         float height = 0.0f;
+        const float safeHeight = (std::max)(0.0f, heightScale);
+        const float safeLength = (std::max)(0.05f, lengthScale);
+        const float scaledTime = time * speedScale;
         for (const OceanWave& wave : waves) {
             const float dirLength = std::sqrt(
                 wave.direction.x * wave.direction.x +
@@ -46,14 +65,16 @@ struct OceanWaveSettings {
             const float invLength = dirLength > 1e-5f ? 1.0f / dirLength : 0.0f;
             const float dx = wave.direction.x * invLength;
             const float dz = wave.direction.y * invLength;
-            const float k =
-                DirectX::XM_2PI / (std::max)(wave.wavelength, 0.1f);
+            const float wavelength =
+                (std::max)(wave.wavelength * safeLength, 0.1f);
+            const float amplitude = wave.amplitude * safeHeight;
+            const float k = DirectX::XM_2PI / wavelength;
             const float omega = std::sqrt(gravity * k);
-            const float phase = k * (dx * x + dz * z) - omega * time;
+            const float phase = k * (dx * x + dz * z) - omega * scaledTime;
             const float sine = std::sin(phase);
             const float cosine = std::cos(phase);
-            height += wave.amplitude * sine;
-            const float derivative = wave.amplitude * k * cosine;
+            height += amplitude * sine;
+            const float derivative = amplitude * k * cosine;
             dhdx += derivative * dx;
             dhdz += derivative * dz;
         }

@@ -2454,11 +2454,99 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                              &scene.screenSpaceReflectionThickness,
                              0.005f, 0.01f, 0.5f, "%.3f m");
         }
-        bool highWater =
-            scene.waterQuality == WaterQuality::High;
-        if (ImGui::Checkbox("High Quality Tropical Water", &highWater))
-            scene.waterQuality = highWater
-                ? WaterQuality::High : WaterQuality::Low;
+        const char* waterQualityNames[] = { "Low", "High", "Ultra" };
+        int waterQuality = static_cast<int>(scene.waterQuality);
+        if (ImGui::Combo("Tropical Water Quality", &waterQuality,
+                         waterQualityNames, _countof(waterQualityNames)))
+            scene.waterQuality = static_cast<WaterQuality>(waterQuality);
+        if (scene.waterQuality == WaterQuality::High) {
+            ImGui::TextDisabled(
+                "High: analytic shoreward swell with swash and shoaling surf");
+            if (ImGui::TreeNodeEx("High Wave Controls",
+                                  ImGuiTreeNodeFlags_DefaultOpen)) {
+                // Multipliers over the authored spectrum, so the relative shape
+                // of swell against chop survives every slider position.
+                ImGui::SliderFloat("Wave Height",
+                    &scene.highWaterWaveHeight, 0.0f, 3.0f, "%.2fx");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Scales every wave's amplitude. Steepness is clamped\n"
+                        "automatically so tall waves sharpen rather than\n"
+                        "folding through themselves.");
+                ImGui::SliderFloat("Wave Scale",
+                    &scene.highWaterWaveScale, 0.35f, 2.5f, "%.2fx");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Stretches wavelengths. Longer waves also travel\n"
+                        "faster, because deep-water speed follows sqrt(g/k).");
+                ImGui::SliderFloat("Wave Speed",
+                    &scene.highWaterWaveSpeed, 0.0f, 2.5f, "%.2fx");
+                ImGui::SliderFloat("Choppiness",
+                    &scene.highWaterChoppiness, 0.0f, 2.0f, "%.2f");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Gerstner steepness: how far crests pinch toward\n"
+                        "peaks. Clamped against the wave height above.");
+                ImGui::SliderFloat("Micro Detail",
+                    &scene.highWaterMicroDetail, 0.0f, 3.0f, "%.2fx");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Per-pixel capillary ripples. Fades with distance on\n"
+                        "its own so raising this cannot alias the horizon.");
+                ImGui::SliderFloat("Foam Strength",
+                    &scene.highWaterFoamStrength, 0.0f, 2.5f, "%.2f");
+                if (ImGui::Button("Reset High Waves")) {
+                    scene.highWaterWaveHeight = 1.0f;
+                    scene.highWaterWaveScale = 1.0f;
+                    scene.highWaterWaveSpeed = 1.0f;
+                    scene.highWaterChoppiness = 1.0f;
+                    scene.highWaterMicroDetail = 1.0f;
+                    scene.highWaterFoamStrength = 1.0f;
+                }
+                ImGui::TreePop();
+            }
+        }
+        if (scene.waterQuality == WaterQuality::Ultra) {
+            ImGui::TextDisabled(
+                "Ultra: spectral swell, terrain-aware surf and underwater medium");
+            if (ImGui::TreeNodeEx("Ultra Wave Controls",
+                                  ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::SliderFloat("Wave Height",
+                    &scene.ultraWaterWaveHeight, 0.0f, 3.0f, "%.2fx");
+                ImGui::SliderFloat("Wave Scale",
+                    &scene.ultraWaterWaveScale, 0.35f, 2.5f, "%.2fx");
+                ImGui::SliderFloat("Wave Speed",
+                    &scene.ultraWaterWaveSpeed, 0.0f, 2.5f, "%.2fx");
+                ImGui::SliderAngle("Wave Direction",
+                    &scene.ultraWaterDirection, -180.0f, 180.0f);
+                ImGui::SliderFloat("Choppiness",
+                    &scene.ultraWaterChoppiness, 0.0f, 2.0f, "%.2f");
+                ImGui::SliderFloat("Surf Strength",
+                    &scene.ultraWaterSurfStrength, 0.0f, 2.5f, "%.2f");
+                ImGui::SliderFloat("Foam Strength",
+                    &scene.ultraWaterFoamStrength, 0.0f, 2.5f, "%.2f");
+                ImGui::SliderFloat("Coast Damping",
+                    &scene.ultraWaterCoastDamping, 0.25f, 3.0f, "%.2f");
+                if (ImGui::Button("Reset Ultra Waves")) {
+                    scene.ultraWaterWaveHeight = 1.0f;
+                    scene.ultraWaterWaveScale = 1.0f;
+                    scene.ultraWaterWaveSpeed = 1.0f;
+                    scene.ultraWaterDirection = 0.0f;
+                    scene.ultraWaterChoppiness = 1.0f;
+                    scene.ultraWaterSurfStrength = 1.0f;
+                    scene.ultraWaterFoamStrength = 1.0f;
+                    scene.ultraWaterCoastDamping = 1.0f;
+                    scene.ultraWaterRefreshRequested = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Refresh Ultra Water"))
+                    scene.ultraWaterRefreshRequested = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Reload terrain bathymetry and restart surf/foam state");
+                ImGui::TreePop();
+            }
+        }
         const char* shaftModes[] = { "Volumetric", "Faux (screen-space)", "Off" };
         int shaftMode = static_cast<int>(scene.lightShaftMode);
         if (ImGui::Combo("Light Shafts", &shaftMode, shaftModes, 3))

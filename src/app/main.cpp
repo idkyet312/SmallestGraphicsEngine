@@ -233,7 +233,7 @@ static bool FindCommTower(uint64_t entityId, DirectX::XMFLOAT3& base);
 // hold, accelerate down the runway, rotate, then climb straight out.
 static constexpr const char* kObjectivePlanePrefabId = "props/objective_plane";
 // Time from level start until the aircraft begins its roll.
-static constexpr float kObjectivePlaneHoldSeconds = 90.0f;
+static constexpr float kObjectivePlaneHoldSeconds = 120.0f;
 // How long the roll/rotate/climb takes once started. After this it is gone.
 static constexpr float kObjectivePlaneTakeoffSeconds = 14.0f;
 static constexpr float kObjectivePlaneTaxiSpeed = 34.0f;   // m/s at rotation
@@ -553,6 +553,9 @@ static void ApplyVolumetricFogSettings(const VolumetricFogSettings& fog) {
 // the point of randomising the squad is being able to see what you rolled
 // before committing to a zone.
 bool                        g_showEnemyDotsOnDeployScreen = true;
+// Friendly marines, as blue dots. Separate from the hostile toggle: turning off
+// the enemy intel to plan a blind insertion should not also hide your own squad.
+bool                        g_showAllyDotsOnDeployScreen = true;
 static uint32_t&            g_banditSpawnSerial = g_enemySystem.spawnSerial;
 // Impact decals: bullet holes and scorch marks, oldest evicted once the buffer
 // is full. 64 matches the shader's array, and the whole list is re-uploaded each
@@ -6077,6 +6080,34 @@ static LightShaftsDX12      lightShafts;
 static ScreenSpaceAODX12    screenSpaceAO;
 static ScreenSpaceReflectionsDX12 screenSpaceReflections;
 static WaterRendererDX12    waterRenderer;
+
+static void QueueWaterBathymetry() {
+    if (scene.waterQuality == WaterQuality::Low ||
+        !waterRenderer.UltraAvailable()) return;
+    const TerrainRendererDX12::Params terrain = CurrentTerrainParams();
+    constexpr float kShoreOuter = 88.0f;
+    constexpr float kOceanMargin = 40.0f;
+    const float halfX = kShoreOuter * terrain.islandScaleX + kOceanMargin;
+    const float halfZ = kShoreOuter * terrain.islandScaleZ + kOceanMargin;
+    WaterBathymetryDesc desc;
+    desc.minimumXZ = {-halfX, -halfZ};
+    desc.maximumXZ = {halfX, halfZ};
+    desc.resolution = SelectBathymetryResolution(halfX * 2.0f, halfZ * 2.0f);
+    const uint64_t scaleX = static_cast<uint64_t>(
+        std::lround(terrain.islandScaleX * 1000.0f));
+    const uint64_t scaleZ = static_cast<uint64_t>(
+        std::lround(terrain.islandScaleZ * 1000.0f));
+    const float waterSurfaceY = g_ocean.GetSurfaceY();
+    const uint64_t surfaceRevision = static_cast<uint64_t>(
+        static_cast<int64_t>(std::lround(waterSurfaceY * 1000.0f)));
+    desc.terrainRevision = TerrainRendererDX12::SculptRevision() ^
+        (scaleX << 32) ^ (scaleZ << 16) ^ terrain.terrainStyle ^
+        (surfaceRevision * 0x9e3779b97f4a7c15ull);
+    desc.heightAt = [terrain, waterSurfaceY](float x, float z) {
+        return TerrainRendererDX12::HeightAt(terrain, x, z) - waterSurfaceY;
+    };
+    waterRenderer.QueueBathymetryRebuild(desc);
+}
 static MSAADX12             msaa;
 static GrassMSAADX12        grassMSAA;
 static bool                 msaaUsedLastFrame = false;
@@ -12734,6 +12765,35 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         }
     }
 
+    // Friendly marines, in blue. Drawn after the hostiles so a marine standing
+    // near a bandit reads as present rather than being buried under the red
+    // dot -- knowing where your own squad already is matters most exactly where
+    // the fighting is. Same projection, and no depth test for the same reason:
+    // a friendly hidden behind a hill is still a friendly you planned around.
+    if (g_showAllyDotsOnDeployScreen) {
+        for (const auto& marine : g_bandits) {
+            if (!marine || marine->Dead()) continue;
+            if (marine->faction != Faction::Marine) continue;
+
+            XMFLOAT3 spot = marine->position;
+            spot.y += 1.1f;
+            const XMVECTOR allyClip = XMVector3Transform(
+                XMLoadFloat3(&spot), viewProjection);
+            const float allyW = XMVectorGetW(allyClip);
+            if (allyW <= 0.01f) continue;
+            const ImVec2 allyScreen{
+                (XMVectorGetX(allyClip) / allyW * 0.5f + 0.5f) * display.x,
+                (1.0f - (XMVectorGetY(allyClip) / allyW * 0.5f + 0.5f)) *
+                    display.y };
+            // Dark outline first, as the hostile dots do: the blue would
+            // otherwise disappear into the water the perimeter ring crosses.
+            foreground->AddCircleFilled(allyScreen, 4.5f,
+                                        IM_COL32(4, 10, 24, 200));
+            foreground->AddCircleFilled(allyScreen, 3.0f,
+                                        IM_COL32(70, 150, 255, 235));
+        }
+    }
+
     if (g_deploymentDebugCoverageGuides) {
         const TerrainRendererDX12::Params guideParams =
             CurrentTerrainParams();
@@ -13249,6 +13309,13 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     else
         ImGui::TextDisabled("Locating hostiles...");
     ImGui::Checkbox("Show hostiles on map", &g_showEnemyDotsOnDeployScreen);
+    // Only offer the friendly toggle when there is a squad to show. A level
+    // with no marines would otherwise carry a checkbox that changes nothing.
+    if (const size_t liveMarines = LiveMarineCount()) {
+        ImGui::Text("%zu friendly marine%s", liveMarines,
+                    liveMarines == 1 ? "" : "s");
+        ImGui::Checkbox("Show marines on map", &g_showAllyDotsOnDeployScreen);
+    }
     // Randomising before the squad exists would move nothing and still report a
     // seed, which reads as a scatter that silently did nothing.
     ImGui::BeginDisabled(!squadReady || !g_navigation.Ready());
@@ -17475,7 +17542,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     BootStep("Initializing water renderer...");
     if (!waterRenderer.Init(SCR_WIDTH, SCR_HEIGHT)) {
         std::cerr << "Tropical water renderer init failed (non-fatal)\n";
+    } else if (!waterRenderer.UltraAvailable()) {
+        std::cerr << "Ultra water unavailable: "
+                  << waterRenderer.UltraFailureReason()
+                  << "; High quality remains active\n";
     }
+    char ultraWaterDebug[8] = {};
+    if (GetEnvironmentVariableA(
+            "SGE_WATER_DEBUG", ultraWaterDebug,
+            static_cast<DWORD>(sizeof(ultraWaterDebug))) > 0)
+        waterRenderer.SetUltraDiagnosticMode(
+            static_cast<UINT>(std::strtoul(ultraWaterDebug, nullptr, 10)));
     BootStep("Initializing MSAA...");
     const bool msaaPipelinesReady =
         mainShader.msaaSupported &&
@@ -18208,10 +18285,46 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 armedBoatRunThisFrame = true;
             }
             if (g_insertionBoatModel) {
+                constexpr uint64_t kInsertionBoatWaterQueryId =
+                    0x494e53455254424full;
+                if (scene.waterQuality == WaterQuality::Ultra &&
+                    g_game.vehicles.insertionBoatVisible) {
+                    WaterHeightResult surface;
+                    if (waterRenderer.TryGetHeightResult(
+                            kInsertionBoatWaterQueryId, surface))
+                        g_game.vehicles.insertionBoatWaterY = surface.height;
+                    WaterHeightQuery query;
+                    query.objectId = kInsertionBoatWaterQueryId;
+                    query.worldXZ = {
+                        g_game.vehicles.insertionBoatPosition.x,
+                        g_game.vehicles.insertionBoatPosition.z};
+                    waterRenderer.QueueHeightQuery(query);
+                }
+                const XMFLOAT3 previousBoatPosition =
+                    g_game.vehicles.insertionBoatPosition;
                 g_game.vehicles.UpdateInsertionBoat(
                     armedBoatRunThisFrame ? 0.0f : deltaTime);
                 RidePlayerInInsertionBoat();
                 UpdateInsertionBoatDamageEffects(deltaTime);
+                if (scene.waterQuality == WaterQuality::Ultra &&
+                    g_game.vehicles.insertionBoatVisible &&
+                    deltaTime > 1e-4f) {
+                    const XMFLOAT3& boat =
+                        g_game.vehicles.insertionBoatPosition;
+                    const float vx =
+                        (boat.x - previousBoatPosition.x) / deltaTime;
+                    const float vz =
+                        (boat.z - previousBoatPosition.z) / deltaTime;
+                    if (vx * vx + vz * vz > 0.04f) {
+                        WaterInteraction wake;
+                        wake.worldXZ = {boat.x, boat.z};
+                        wake.radius = 1.35f;
+                        wake.heightImpulse = 0.018f;
+                        wake.velocityImpulse = {-vx * 0.012f, -vz * 0.012f};
+                        wake.type = WaterInteractionType::Wake;
+                        waterRenderer.QueueInteraction(wake);
+                    }
+                }
             }
             UpdateExplosiveBarrels(deltaTime);
             // After the aircraft update, so the gun leads this frame's pose
@@ -19513,6 +19626,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 // anchor at the entry point; the chain below handles that.
                 XMFLOAT3 waterEntry{};
                 bool waterEntryValid = false;
+                bool oceanEntry = false;
                 if (!g_emptyLevelMode) {
                     if (g_water.ShootSurface(projectile.previousPosition,
                                              projectile.position, waterEntry)) {
@@ -19521,12 +19635,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                                     projectile.position,
                                                     waterEntry, 0.28f)) {
                         waterEntryValid = true;
+                        oceanEntry = true;
                     }
                     if (waterEntryValid) {
                         // ShootSurface already rings the surface sim itself, so
                         // no Splash() call here -- that would double the wave.
                         // This is the visible spray on top of it.
                         scene.SpawnWaterSplash(waterEntry, 1.0f);
+                        if (oceanEntry &&
+                            scene.waterQuality == WaterQuality::Ultra) {
+                            WaterInteraction event;
+                            event.worldXZ = {waterEntry.x, waterEntry.z};
+                            event.radius = 0.42f;
+                            event.heightImpulse = 0.065f;
+                            event.velocityImpulse = {
+                                projectile.direction.x * 0.08f,
+                                projectile.direction.z * 0.08f};
+                            event.type = WaterInteractionType::Splash;
+                            waterRenderer.QueueInteraction(event);
+                        }
                     }
                 }
 
@@ -21589,6 +21716,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 waterDepthState =
                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             }
+            if (scene.ultraWaterRefreshRequested) {
+                waterRenderer.RefreshUltraWater();
+                scene.ultraWaterRefreshRequested = false;
+            }
+            // Push the High-path wave sliders into the ocean volume before it
+            // is drawn or queried. They live on the settings rather than being
+            // read straight from Scene by the renderer so that buoyancy, which
+            // samples the same settings on the CPU, cannot drift from the
+            // surface being drawn.
+            {
+                OceanWaveSettings oceanWaves = g_ocean.GetOceanWaveSettings();
+                if (oceanWaves.heightScale != scene.highWaterWaveHeight ||
+                    oceanWaves.lengthScale != scene.highWaterWaveScale ||
+                    oceanWaves.speedScale != scene.highWaterWaveSpeed) {
+                    oceanWaves.heightScale = scene.highWaterWaveHeight;
+                    oceanWaves.lengthScale = scene.highWaterWaveScale;
+                    oceanWaves.speedScale = scene.highWaterWaveSpeed;
+                    g_ocean.SetOceanWaveSettings(oceanWaves);
+                }
+            }
+            QueueWaterBathymetry();
             waterRenderer.Render(
                 scene, g_ocean, g_water,
                 waterTarget, waterRTV, waterDepth,
@@ -21598,7 +21746,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 : nullptr,
                 usingVisibility ? visBuffer.GetMotionRTV()
                                 : D3D12_CPU_DESCRIPTOR_HANDLE{},
-                waterDepthState);
+                waterDepthState, usingVisibility ? &g_profiler : nullptr);
         }
 
         if (renderedScene && WaterTransparencySplitActiveDX12()) {
@@ -21742,6 +21890,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
             lightShafts.Render(scene, g_dx12.commandList.Get(), shaftDepth,
                 visBuffer.GetOutputRTV(), shaftDepthReadable);
+        }
+        if (renderedScene && usingVisibility &&
+            !bentGTAODiagnosticActive &&
+            scene.waterQuality == WaterQuality::Ultra) {
+            ProfilerDX12::Scope profile(
+                g_profiler, "Water Underwater Composite",
+                g_dx12.commandList.Get());
+            ID3D12Resource* underwaterDepth =
+                g_dx12.depthStencilBuffer.Get();
+            D3D12_RESOURCE_STATES underwaterDepthState =
+                D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            if (grassMSAAActive && grassMSAA.GetCombinedDepthResource()) {
+                underwaterDepth = grassMSAA.GetCombinedDepthResource();
+                underwaterDepthState =
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            }
+            waterRenderer.RenderUnderwater(
+                scene, g_ocean, visBuffer.GetOutputResource(),
+                visBuffer.GetOutputRTV(), underwaterDepth,
+                g_specularEnvironmentResource, underwaterDepthState);
         }
         // Every pass that reads the clustered light list has now run.
         RemoveVehicleHeadlights(scene, headlightsInLightList);

@@ -218,7 +218,8 @@ struct GunViewModel {
 
 enum class WaterQuality : uint32_t {
     Low = 0,
-    High = 1
+    High = 1,
+    Ultra = 2
 };
 
 // All mutable scene state lives here
@@ -617,6 +618,26 @@ struct Scene {
     float screenSpaceReflectionDistance = 55.0f;
     float screenSpaceReflectionThickness = 0.08f;
     WaterQuality waterQuality = WaterQuality::High;
+    // High-path wave controls. Multipliers over the authored CalmTropical
+    // spectrum rather than absolute metres, so the relative shape of the swell
+    // and its shorter components is preserved as the sliders move. They are
+    // applied where the wave constants are uploaded, which happens every frame,
+    // so edits show up live without rebuilding the water volume.
+    float highWaterWaveHeight = 1.0f;
+    float highWaterWaveScale = 1.0f;
+    float highWaterWaveSpeed = 1.0f;
+    float highWaterChoppiness = 1.0f;
+    float highWaterMicroDetail = 1.0f;
+    float highWaterFoamStrength = 1.0f;
+    float ultraWaterWaveHeight = 1.0f;
+    float ultraWaterWaveScale = 1.0f;
+    float ultraWaterWaveSpeed = 1.0f;
+    float ultraWaterDirection = 0.0f;
+    float ultraWaterChoppiness = 1.0f;
+    float ultraWaterSurfStrength = 1.0f;
+    float ultraWaterFoamStrength = 1.0f;
+    float ultraWaterCoastDamping = 1.0f;
+    bool  ultraWaterRefreshRequested = false;
     int   destructionGridX = 4;
     int   destructionGridY = 3;
     int   destructionGridZ = 4;
