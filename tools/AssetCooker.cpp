@@ -659,9 +659,11 @@ void ExtractMaterials(CookContext& context) {
         source->Get(AI_MATKEY_TWOSIDED, twoSided);
         if (twoSided) material.flags |= Cooked::DoubleSided;
         aiString alphaMode;
-        if (source->Get(AI_MATKEY_GLTF_ALPHAMODE, alphaMode) == AI_SUCCESS &&
-            std::string(alphaMode.C_Str()) != "OPAQUE")
-            material.flags |= Cooked::AlphaCutout;
+        if (source->Get(AI_MATKEY_GLTF_ALPHAMODE, alphaMode) == AI_SUCCESS) {
+            const std::string mode = alphaMode.C_Str();
+            if (mode == "MASK") material.flags |= Cooked::AlphaCutout;
+            else if (mode == "BLEND") material.flags |= Cooked::AlphaBlend;
+        }
         material.baseColorTexture = context.MaterialTexture(source,
             { aiTextureType_BASE_COLOR, aiTextureType_DIFFUSE },
             Cooked::TextureFormat::BC3);
@@ -808,7 +810,7 @@ void ExtractLegacyMaterials(CookContext& context, const ufbx_scene& scene) {
         if (source->features.double_sided.enabled)
             material.flags |= Cooked::DoubleSided;
         if (material.baseColor[3] < 0.999f)
-            material.flags |= Cooked::AlphaCutout;
+            material.flags |= Cooked::AlphaBlend;
 
         const ufbx_material_map& baseMap =
             source->pbr.base_color.texture

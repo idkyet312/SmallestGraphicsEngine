@@ -105,6 +105,7 @@ enum MaterialFlags : uint32_t {
     DoubleSided = 1u << 0,
     RoughnessOnly = 1u << 1,
     AlphaCutout = 1u << 2,
+    AlphaBlend = 1u << 3,
 };
 
 struct Material {

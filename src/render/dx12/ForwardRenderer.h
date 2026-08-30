@@ -87,6 +87,190 @@ extern ComPtr<ID3D12Resource> g_muzzleFlashTexture;
 extern ComPtr<ID3D12Resource> g_fireTexture;
 extern ComPtr<ID3D12Resource> g_explosionTexture;   // 4x4 flipbook explosion sheet
 extern ComPtr<ID3D12Resource> g_explosionCoreTexture; // 8x8 white-hot core sheet
+
+enum class WaterTransparencyPhaseDX12 {
+    All,
+    BeforeWater,
+    AfterWater
+};
+
+struct WaterTransparentDrawDX12 {
+    D3D12_VERTEX_BUFFER_VIEW vbv = {};
+    D3D12_INDEX_BUFFER_VIEW ibv = {};
+    UINT indexCount = 0;
+    UINT vertexCount = 0;
+    std::shared_ptr<SceneMaterial> material;
+    XMMATRIX model = XMMatrixIdentity();
+    XMMATRIX view = XMMatrixIdentity();
+    XMMATRIX projection = XMMatrixIdentity();
+    XMMATRIX lightSpace = XMMatrixIdentity();
+    XMFLOAT4 palmWindRoot = {};
+    D3D12_GPU_VIRTUAL_ADDRESS bonePalette = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS previousBonePalette = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS skinBuffer = 0;
+    XMFLOAT3 worldCenter = {};
+    float distanceSquared = 0.0f;
+    float specularScale = 1.0f;
+    bool colorNormalOnly = false;
+    bool extendedMaterialParameters = false;
+};
+
+inline bool g_waterTransparencySplitActive = false;
+inline XMFLOAT3 g_waterTransparencyCamera = {};
+inline std::vector<WaterTransparentDrawDX12>
+    g_beforeWaterTransparentDraws;
+inline std::vector<WaterTransparentDrawDX12>
+    g_afterWaterTransparentDraws;
+
+inline bool WaterVolumeCoversXZDX12(const WaterVolume& volume,
+                                    float x, float z) {
+    if (!volume.IsInitialized()) return false;
+    const XMFLOAT3 center = volume.GetCenter();
+    const XMFLOAT3 extents = volume.GetExtents();
+    return std::abs(x - center.x) <= extents.x * 0.5f &&
+           std::abs(z - center.z) <= extents.z * 0.5f;
+}
+
+inline const WaterVolume* TransparencyWaterAtDX12(float x, float z) {
+    // The pool is the more specific volume when its footprint overlaps the
+    // broad ocean volume.
+    if (WaterVolumeCoversXZDX12(g_water, x, z)) return &g_water;
+    if (WaterVolumeCoversXZDX12(g_ocean, x, z)) return &g_ocean;
+    return nullptr;
+}
+
+inline bool TransparencyRendersAfterWaterDX12(const XMFLOAT3& position) {
+    const WaterVolume* volume = TransparencyWaterAtDX12(
+        position.x, position.z);
+    if (!volume) return true;
+
+    const float objectSurface = volume->GetSurfaceY() +
+        volume->WaveHeightAt(position.x, position.z);
+    const float cameraSurface = volume->GetSurfaceY() +
+        volume->WaveHeightAt(
+            g_waterTransparencyCamera.x, g_waterTransparencyCamera.z);
+    constexpr float kSurfaceTolerance = 0.03f;
+    const bool objectAbove = position.y >= objectSurface - kSurfaceTolerance;
+    const bool cameraAbove =
+        g_waterTransparencyCamera.y >= cameraSurface - kSurfaceTolerance;
+    return objectAbove == cameraAbove;
+}
+
+inline void BeginWaterTransparencySplitDX12(const Scene& scene,
+                                             bool enabled) {
+    g_beforeWaterTransparentDraws.clear();
+    g_afterWaterTransparentDraws.clear();
+    g_waterTransparencyCamera = scene.camera.Position;
+    g_waterTransparencySplitActive = enabled;
+}
+
+inline bool WaterTransparencySplitActiveDX12() {
+    return g_waterTransparencySplitActive;
+}
+
+inline bool TransparencyPhaseIncludesPositionDX12(
+    const XMFLOAT3& position, WaterTransparencyPhaseDX12 phase) {
+    if (phase == WaterTransparencyPhaseDX12::All) return true;
+    const bool afterWater = TransparencyRendersAfterWaterDX12(position);
+    return afterWater ==
+        (phase == WaterTransparencyPhaseDX12::AfterWater);
+}
+
+inline bool TransparencyPhaseIncludesEffectDX12(
+    const XMFLOAT3& position, float verticalExtent,
+    WaterTransparencyPhaseDX12 phase) {
+    if (phase == WaterTransparencyPhaseDX12::All) return true;
+
+    const WaterVolume* volume = TransparencyWaterAtDX12(
+        position.x, position.z);
+    if (!volume)
+        return phase == WaterTransparencyPhaseDX12::AfterWater;
+
+    const float objectSurface = volume->GetSurfaceY() +
+        volume->WaveHeightAt(position.x, position.z);
+    const float cameraSurface = volume->GetSurfaceY() +
+        volume->WaveHeightAt(
+            g_waterTransparencyCamera.x, g_waterTransparencyCamera.z);
+    constexpr float kSurfaceTolerance = 0.03f;
+    const float extent = (std::max)(verticalExtent, 0.0f);
+    const bool crossesSurface =
+        position.y + extent >= objectSurface - kSurfaceTolerance &&
+        position.y - extent <= objectSurface + kSurfaceTolerance;
+
+    // A large smoke/fire card straddling the ocean silhouette cannot be split
+    // per pixel by two ordered alpha passes. Keep the whole effect on the
+    // camera side; otherwise the water clips a perfectly straight horizon
+    // through dry-land smoke whose origin lies below the nominal ocean plane.
+    const bool cameraAbove =
+        g_waterTransparencyCamera.y >= cameraSurface - kSurfaceTolerance;
+    const bool effectAfterWater = crossesSurface ||
+        ((position.y >= objectSurface - kSurfaceTolerance) == cameraAbove);
+    return effectAfterWater ==
+        (phase == WaterTransparencyPhaseDX12::AfterWater);
+}
+
+inline XMFLOAT3 TransparentPrimitiveWorldCenterDX12(
+    const MeshPrimitive& primitive, const XMMATRIX& model) {
+    XMVECTOR localCenter = XMVectorZero();
+    if (primitive.boundsValid) {
+        localCenter = XMVectorSet(
+            (primitive.boundsMin.x + primitive.boundsMax.x) * 0.5f,
+            (primitive.boundsMin.y + primitive.boundsMax.y) * 0.5f,
+            (primitive.boundsMin.z + primitive.boundsMax.z) * 0.5f,
+            1.0f);
+    } else {
+        localCenter = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+    XMFLOAT3 center;
+    XMStoreFloat3(&center, XMVector3Transform(localCenter, model));
+    return center;
+}
+
+inline void QueueWaterTransparentDrawDX12(
+    const MeshPrimitive& primitive, const XMMATRIX& model,
+    const XMMATRIX& view, const XMMATRIX& projection,
+    const XMMATRIX& lightSpace, D3D12_GPU_VIRTUAL_ADDRESS bonePalette,
+    D3D12_GPU_VIRTUAL_ADDRESS previousBonePalette,
+    bool extendedMaterialParameters, bool colorNormalOnly = false,
+    XMFLOAT4 palmWindRoot = {}, float specularScale = 1.0f) {
+    WaterTransparentDrawDX12 draw;
+    draw.vbv = primitive.vbv;
+    draw.ibv = primitive.ibv;
+    draw.indexCount = primitive.indexCount;
+    draw.vertexCount = static_cast<UINT>(primitive.vertices.size() / 12);
+    draw.material = primitive.material;
+    draw.model = model;
+    draw.view = view;
+    draw.projection = projection;
+    draw.lightSpace = lightSpace;
+    draw.palmWindRoot = palmWindRoot;
+    draw.bonePalette = bonePalette;
+    draw.previousBonePalette = previousBonePalette;
+    draw.skinBuffer = primitive.skinBuffer
+        ? primitive.skinBuffer->GetGPUVirtualAddress() : 0;
+    draw.worldCenter = TransparentPrimitiveWorldCenterDX12(primitive, model);
+    const float dx = draw.worldCenter.x - g_waterTransparencyCamera.x;
+    const float dy = draw.worldCenter.y - g_waterTransparencyCamera.y;
+    const float dz = draw.worldCenter.z - g_waterTransparencyCamera.z;
+    draw.distanceSquared = dx * dx + dy * dy + dz * dz;
+    draw.colorNormalOnly = colorNormalOnly;
+    draw.extendedMaterialParameters = extendedMaterialParameters;
+    draw.specularScale = specularScale;
+
+    bool renderAfterWater =
+        TransparencyRendersAfterWaterDX12(draw.worldCenter);
+    if (draw.material) {
+        if (draw.material->waterTransparency ==
+            WaterTransparencyMode::AfterWater)
+            renderAfterWater = true;
+        else if (draw.material->waterTransparency ==
+                 WaterTransparencyMode::BeforeWater)
+            renderAfterWater = false;
+    }
+    (renderAfterWater
+        ? g_afterWaterTransparentDraws
+        : g_beforeWaterTransparentDraws).push_back(std::move(draw));
+}
 extern std::shared_ptr<SceneNode> g_c4Model;
 extern std::shared_ptr<SceneNode> g_explosiveBarrelModel;
 extern std::shared_ptr<SceneNode> g_explosiveBarrelShadowModel;
@@ -708,18 +892,29 @@ inline void DrawCapsule(const GeometryBuffers& geo) {
 // hidden while smoke in front blends over it.
 inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
                                    const GeometryBuffers& geo,
-                                   const XMMATRIX& lightSpace) {
+                                   const XMMATRIX& lightSpace,
+                                   WaterTransparencyPhaseDX12 phase =
+                                       WaterTransparencyPhaseDX12::All) {
     const XMMATRIX view = scene.GetViewMatrix();
     const XMMATRIX proj = scene.GetProjectionMatrix();
     const XMMATRIX invRot = XMMatrixTranspose(view);
     const XMVECTOR camRight = XMVectorSetW(invRot.r[0], 0.0f);
     const XMVECTOR camUp = XMVectorSetW(invRot.r[1], 0.0f);
     const XMVECTOR camFwd = XMVectorSetW(invRot.r[2], 0.0f);
+    const auto includeEffect = [phase](const XMFLOAT3& position,
+                                       float verticalExtent = 0.0f) {
+        return TransparencyPhaseIncludesEffectDX12(
+            position, verticalExtent, phase);
+    };
 
     shader.UseTransparent();
     if (g_particleRenderer.initialized) {
         g_particleRenderer.Render(scene, g_smokeTexture.Get(),
-            g_bloodTexture.Get(), shader.hdrTargetEnabled, shader.msaaEnabled);
+            g_bloodTexture.Get(), shader.hdrTargetEnabled, shader.msaaEnabled,
+            [phase](const ImpactParticle& particle) {
+                return TransparencyPhaseIncludesEffectDX12(
+                    particle.position, particle.size, phase);
+            });
         // Dedicated particle root signature/heap invalidates cached main bindings.
         shader.InvalidateGraphicsRootBinding();
         shader.UseTransparent();
@@ -727,7 +922,8 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
     std::vector<const ImpactParticle*> transparentParticles;
     transparentParticles.reserve(scene.impactParticles.size());
     for (const ImpactParticle& particle : scene.impactParticles)
-        if (!particle.spark) transparentParticles.push_back(&particle);
+        if (!particle.spark && includeEffect(particle.position, particle.size))
+            transparentParticles.push_back(&particle);
     const XMFLOAT3 cameraPosition = scene.camera.Position;
     std::sort(transparentParticles.begin(), transparentParticles.end(),
         [&](const ImpactParticle* a, const ImpactParticle* b) {
@@ -774,6 +970,7 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
     // Very short pressure shell and white flash. These are geometry, not another
     // camera-facing card, so the blast reads as volume from every angle.
     for (const ExplosionFX& fx : scene.explosionFX) {
+        if (!includeEffect(fx.position, fx.size)) continue;
         const float flashT = fx.age / 0.065f;
         const float shockDuration = (std::min)(0.24f, fx.duration * 0.30f);
         const float shockT = fx.age / shockDuration;
@@ -811,6 +1008,7 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
     if (!scene.vortexFX.empty()) {
         shader.UseAdditive();
         for (const VortexFX& fx : scene.vortexFX) {
+            if (!includeEffect(fx.position, fx.radius)) continue;
             const float t = (std::min)(1.0f, fx.age / fx.duration);
             const float fade = (std::min)(1.0f, (1.0f - t) * 8.0f);
             const float pulse = 0.42f + std::sin(fx.age * 13.0f) * 0.08f;
@@ -875,6 +1073,7 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
     if (g_explosionCoreTexture && geo.explosionCoreVBV.BufferLocation) {
         shader.UseAdditive();
         for (const ExplosionFX& fx : scene.explosionFX) {
+            if (!includeEffect(fx.position, fx.size)) continue;
             const float coreDuration = fx.duration * 0.62f;
             const float t = (std::min)(1.0f, fx.age / coreDuration);
             if (t >= 1.0f) continue;
@@ -905,6 +1104,7 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
     if (g_explosionTexture && geo.explosionVBV.BufferLocation) {
         shader.UseTransparent();
         for (const ExplosionFX& fx : scene.explosionFX) {
+            if (!includeEffect(fx.position, fx.size)) continue;
             const float t = (std::min)(1.0f, fx.age / fx.duration);
             const UINT frame = (std::min)(15u, (UINT)(t * 16.0f));
             // Fast pressure bloom, slight overshoot, then smoke collapse.
@@ -931,6 +1131,7 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
         shader.UseAdditive();
         for (const ExplosiveBarrel& barrel : scene.explosiveBarrels) {
             if (!barrel.active || !barrel.burning) continue;
+            if (!includeEffect(barrel.position, 1.64f)) continue;
             const float age = 3.0f - barrel.fuse;
             const UINT frame = static_cast<UINT>((std::max)(0.0f, age) * 20.0f) % 25;
             const XMVECTOR pos = XMVectorSet(
@@ -946,6 +1147,7 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
         }
         for (const FirePatch& fire : scene.firePatches) {
             if (fire.life <= 0.0f) continue;
+            if (!includeEffect(fire.position, fire.radius * 2.96f)) continue;
             const float age = fire.maxLife - fire.life;
             const UINT frame = static_cast<UINT>(age * 20.0f) % 25;
             const float fade = (std::min)(1.0f, fire.life / 0.7f);
@@ -963,6 +1165,7 @@ inline void RenderImpactBillboards(Scene& scene, ShaderDX12& shader,
             shader.NextDrawCall();
         }
         for (const BurningTargetFX& target : scene.burningTargets) {
+            if (!includeEffect(target.position, target.size * 2.0f)) continue;
             const UINT frame = static_cast<UINT>(
                 (std::max)(0.0f, target.animationTime) * 27.0f +
                 std::abs(target.position.x * 2.1f)) % 25;
@@ -1068,7 +1271,7 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
     for (const auto& prim : mesh->primitives) {
         if (prim.vbv.BufferLocation == 0) continue;
 
-        const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
+        const bool transparent = prim.material && prim.material->IsTransparent();
         const bool alphaCutout = prim.material && prim.material->alphaCutout;
         // visibilityMeshID persists on the primitive from whenever it last
         // registered; it is NOT recomputed per frame. A chunk that registered
@@ -1094,6 +1297,12 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
         }
 
         if (visibilityExtensionsOnly && visibilityOwned) continue;
+        if (transparent && g_waterTransparencySplitActive) {
+            QueueWaterTransparentDrawDX12(
+                prim, model, view, proj, lightSpace, 0, 0, true,
+                colorNormalOnly, palmWindRoot, specularScale);
+            continue;
+        }
         if (prim.material) {
             if (transparent) shader.UseTransparent(); else shader.Use(false);
             if (pipelineOverride && !transparent)
@@ -1295,7 +1504,7 @@ inline void CollectForwardExtensionNodes(const std::shared_ptr<SceneNode>& node,
     if (node->mesh) for (const MeshPrimitive& prim : node->mesh->primitives) {
         if (prim.vbv.BufferLocation == 0) continue;
         const bool transparent = prim.material &&
-            prim.material->baseColorFactor.w < 0.999f;
+            prim.material->IsTransparent();
         const bool alphaCutout = prim.material && prim.material->alphaCutout;
         const bool visibilityOwned = prim.visibilityMeshID != UINT_MAX &&
             !transparent && !alphaCutout && !prim.skinBuffer && !prim.vertices.empty();
@@ -1352,7 +1561,7 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
         for (const auto& prim : node->mesh->primitives) {
             if (prim.vbv.BufferLocation == 0) continue;
 
-            const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
+            const bool transparent = prim.material && prim.material->IsTransparent();
             const bool alphaCutout = prim.material && prim.material->alphaCutout;
             // Same stale-ID hazard as DrawMeshAt above: visibilityMeshID is
             // whatever the primitive last registered, not this frame's answer.
@@ -1389,6 +1598,12 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
             if (!meshShaderDraw && !transparent && !prim.skinBuffer &&
                 !RasterPrimitiveIntersectsFrustum(prim, model * view * proj))
                 continue;
+            if (transparent && g_waterTransparencySplitActive) {
+                QueueWaterTransparentDrawDX12(
+                    prim, model, view, proj, lightSpace, bonePalette,
+                    previousBonePalette, false);
+                continue;
+            }
 
             if (prim.material) {
                 if (transparent) shader.UseTransparent(); else shader.Use(false);
@@ -1496,6 +1711,114 @@ inline void DrawSceneNode(const std::shared_ptr<SceneNode>& node,
             false, bonePalette, previousBonePalette);
 }
 
+inline void RenderWaterTransparencyPhaseDX12(
+    Scene& scene, ShaderDX12& shader, WaterTransparencyPhaseDX12 phase,
+    ID3D12Resource* shadowMap) {
+    std::vector<WaterTransparentDrawDX12>& draws =
+        phase == WaterTransparencyPhaseDX12::BeforeWater
+            ? g_beforeWaterTransparentDraws
+            : g_afterWaterTransparentDraws;
+    if (draws.empty()) return;
+
+    std::sort(draws.begin(), draws.end(),
+        [](const WaterTransparentDrawDX12& a,
+           const WaterTransparentDrawDX12& b) {
+            return a.distanceSquared > b.distanceSquared;
+        });
+
+    // Water and screen-space passes bind private root signatures/heaps. Rebuild
+    // the forward global table before replaying either transparent phase.
+    shader.InvalidateGraphicsRootBinding();
+    shader.UseTransparent();
+    shader.BindGlobalResources(shadowMap, g_ddgiIrradianceResource,
+        g_ddgiVisibilityResource, g_specularEnvironmentResource,
+        g_brdfIntegrationResource, g_dxrDDGIProbeResource,
+        g_dxrDDGICellResource, g_dxrDDGIIndexResource,
+        g_dxrDDGIProbeCount, g_dxrDDGICellCount, g_dxrDDGIIndexCount,
+        g_spotShadowAtlasResource);
+
+    for (const WaterTransparentDrawDX12& draw : draws) {
+        if (!draw.material || !draw.vbv.BufferLocation) continue;
+        shader.SetMatrices(draw.model, draw.view, draw.projection,
+            draw.lightSpace, draw.palmWindRoot);
+        const XMFLOAT3 color(
+            draw.material->baseColorFactor.x,
+            draw.material->baseColorFactor.y,
+            draw.material->baseColorFactor.z);
+        if (draw.extendedMaterialParameters) {
+            shader.SetObjectMaterial(
+                color,
+                draw.material->baseColorTexture != nullptr,
+                draw.material->normalTexture != nullptr,
+                draw.colorNormalOnly ? 0.0f : draw.material->metallicFactor,
+                draw.colorNormalOnly ? 0.58f : draw.material->roughnessFactor,
+                draw.material->baseColorTexture.Get(),
+                draw.material->normalTexture.Get(),
+                draw.colorNormalOnly
+                    ? nullptr : draw.material->metallicRoughnessTexture.Get(),
+                draw.colorNormalOnly
+                    ? false : draw.material->roughnessOnlyTexture,
+                draw.material->baseColorFactor.w,
+                draw.material->alphaCutout,
+                draw.material.get(),
+                draw.material->alphaFromLuminance,
+                draw.material->ambientScale,
+                draw.material->occlusionStrength,
+                draw.material->normalYSign,
+                draw.material->viewFillStrength,
+                draw.specularScale);
+        } else {
+            shader.SetObjectMaterial(
+                color,
+                draw.material->baseColorTexture != nullptr,
+                draw.material->normalTexture != nullptr,
+                draw.material->metallicFactor,
+                draw.material->roughnessFactor,
+                draw.material->baseColorTexture.Get(),
+                draw.material->normalTexture.Get(),
+                draw.material->metallicRoughnessTexture.Get(),
+                draw.material->roughnessOnlyTexture,
+                draw.material->baseColorFactor.w,
+                draw.material->alphaCutout,
+                draw.material.get());
+        }
+
+        const bool skinned = draw.bonePalette && draw.skinBuffer;
+        shader.SetSkinningEnabled(skinned);
+        if (skinned) {
+            g_dx12.commandList->SetGraphicsRootShaderResourceView(
+                16, draw.bonePalette);
+            g_dx12.commandList->SetGraphicsRootShaderResourceView(
+                17, draw.skinBuffer);
+            g_dx12.commandList->SetGraphicsRootShaderResourceView(
+                19, draw.previousBonePalette
+                    ? draw.previousBonePalette : draw.bonePalette);
+        }
+        g_dx12.commandList->SetPipelineState(
+            shader.GetTransparentPipelineState());
+        g_dx12.commandList->IASetVertexBuffers(0, 1, &draw.vbv);
+        g_dx12.commandList->IASetPrimitiveTopology(
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if (draw.ibv.BufferLocation) {
+            g_dx12.commandList->IASetIndexBuffer(&draw.ibv);
+            g_dx12.commandList->DrawIndexedInstanced(
+                draw.indexCount, 1, 0, 0, 0);
+        } else {
+            g_dx12.commandList->DrawInstanced(
+                draw.vertexCount, 1, 0, 0);
+        }
+        shader.NextDrawCall();
+    }
+    draws.clear();
+    shader.Use(scene.wireframeMode);
+}
+
+inline void EndWaterTransparencySplitDX12() {
+    g_beforeWaterTransparentDraws.clear();
+    g_afterWaterTransparentDraws.clear();
+    g_waterTransparencySplitActive = false;
+}
+
 // Spear.glb is authored two metres long on +Z, with its point at z=0.7973 and
 // its mesh node lifted by 0.0385. Rebase that point onto the projectile impact
 // position represented by `basis`; the shaft then extends back along -Z.
@@ -1506,7 +1829,7 @@ inline XMMATRIX HarpoonSpearModelMatrix(const XMMATRIX& basis) {
 inline bool SceneNodeSupportsMeshInstancing(const std::shared_ptr<SceneNode>& node) {
     if (!node) return false;
     if (node->mesh) for (const auto& prim : node->mesh->primitives) {
-        const bool transparent = prim.material && prim.material->baseColorFactor.w < 0.999f;
+        const bool transparent = prim.material && prim.material->IsTransparent();
         const D3D12_GPU_VIRTUAL_ADDRESS desc = prim.meshletDescBuffer
             ? prim.meshletDescBuffer->GetGPUVirtualAddress() : 0;
         const D3D12_GPU_VIRTUAL_ADDRESS bounds = prim.meshletBoundsBuffer

@@ -67,78 +67,6 @@ float CloudNoise(float2 p) {
     return result;
 }
 
-float WrappedAngle(float angle) {
-    return atan2(sin(angle), cos(angle));
-}
-
-float DistantIslandProfile(float azimuth, float center, float width,
-                           float height, float seed) {
-    const float local = WrappedAngle(azimuth - center) / width;
-    const float footprint = 1.0 - smoothstep(0.0, 1.0, abs(local));
-    const float broad = ValueNoise(float2(local * 2.8 + seed, seed * 1.73));
-    const float detail = ValueNoise(float2(local * 8.5 - seed, seed * 4.11));
-    const float ridge = 0.50 + broad * 0.34 + detail * 0.16;
-    return height * footprint * ridge;
-}
-
-float4 DistantIslandSilhouettes(float3 ray, float3 skyColor) {
-    // Fixed world azimuths keep the islands stable while the player turns.
-    // Different widths/heights avoid a repeated billboard look around the
-    // horizon. Heights are angular because this pass works from view rays.
-    const float azimuth = atan2(ray.z, ray.x);
-    float profile = 0.0;
-    profile = max(profile, DistantIslandProfile(
-        azimuth, -2.62, 0.27, 0.044, 2.1));
-    profile = max(profile, DistantIslandProfile(
-        azimuth, -1.08, 0.18, 0.026, 7.4));
-    profile = max(profile, DistantIslandProfile(
-        azimuth,  0.68, 0.31, 0.052, 4.8));
-    profile = max(profile, DistantIslandProfile(
-        azimuth,  2.12, 0.22, 0.033, 9.7));
-
-    // Match the visible edge of main.cpp's 8192 m square ocean. Camera elevation
-    // pushes that edge downward in the view; a fixed y mask made islands float
-    // whenever the player climbed a hill.
-    const float2 oceanDirection =
-        ray.xz / max(length(ray.xz), 0.0001);
-    const float oceanHalfSpan = 4096.0;
-    const float edgeX = oceanDirection.x >= 0.0
-        ? oceanHalfSpan - cameraPosition.x
-        : -oceanHalfSpan - cameraPosition.x;
-    const float edgeZ = oceanDirection.y >= 0.0
-        ? oceanHalfSpan - cameraPosition.z
-        : -oceanHalfSpan - cameraPosition.z;
-    const float distanceX = abs(oceanDirection.x) > 0.0001
-        ? edgeX / oceanDirection.x : 100000.0;
-    const float distanceZ = abs(oceanDirection.y) > 0.0001
-        ? edgeZ / oceanDirection.y : 100000.0;
-    const float oceanEdgeDistance = max(min(distanceX, distanceZ), 1.0);
-    const float seaLevelDelta = -cameraPosition.y;
-    const float horizonY = seaLevelDelta / sqrt(
-        oceanEdgeDistance * oceanEdgeDistance +
-        seaLevelDelta * seaLevelDelta);
-
-    const float edgeWidth = max(fwidth(ray.y) * 1.4, 0.00035);
-    // Slight overlap lets the ocean hide the base without exposing a gap.
-    const float islandY = ray.y - horizonY + 0.0035;
-    const float aboveWater = smoothstep(
-        horizonY - 0.010, horizonY + 0.001, ray.y);
-    const float belowRidge =
-        1.0 - smoothstep(profile - edgeWidth, profile + edgeWidth, islandY);
-    const float footprint = smoothstep(0.001, 0.004, profile);
-    const float mask = aboveWater * belowRidge * footprint;
-
-    // Atmospheric blue-grey keeps these distant, while a warm trace preserves
-    // sunset coherence. Sky contribution prevents a pasted-on black cutout.
-    const float daylight = saturate(sunDirection.y * 3.0 + 0.20);
-    const float3 silhouetteTint = lerp(
-        float3(0.105, 0.058, 0.040),
-        float3(0.045, 0.074, 0.084), daylight);
-    const float3 islandColor =
-        silhouetteTint + min(skyColor, 0.55) * 0.045;
-    return float4(islandColor, mask);
-}
-
 float3 PhysicalSky(float3 ray, float3 source) {
     const float rayleighStrength = atmosphereParams.x;
     if (rayleighStrength <= 0.001)
@@ -385,14 +313,50 @@ float4 RaymarchVolumetricClouds(float3 ray) {
     return float4(accumulated, saturate(1.0 - transmittance));
 }
 
+// Lowest ray the slab math is allowed to use. Both march paths intersect the
+// cloud layer by dividing by ray.y, so this also bounds how far the near/far
+// distances can stretch as the ray flattens.
+static const float kCloudMinRayY = 0.003;
+// Visible cloud extent below the mathematical horizon. Cannot simply be the
+// cutoff: a negative ray.y never reaches a layer above the camera, so these
+// pixels are projected onto kCloudMinRayY instead and faded out across the
+// band rather than being marched with their own direction.
+static const float kCloudHorizonFadeY = -0.1;
+
+float4 RaymarchClouds2D(float3 ray);
+
 float4 RaymarchClouds(float3 ray) {
-    if (atmosphereParams.x <= 0.001 || ray.y <= 0.015 ||
+    if (atmosphereParams.x <= 0.001 || ray.y <= kCloudHorizonFadeY ||
         cloudParams.x <= 0.001 || cloudParams.y <= 0.001)
         return 0.0;
 
-    if (cloudVolumetric > 0.5)
-        return RaymarchVolumetricClouds(ray);
+    // Below-horizon rays diverge or point away from the layer, so march the
+    // lowest valid ray instead and let the fade hide the substitution. The
+    // horizontal components are renormalised so the substituted ray keeps this
+    // pixel's azimuth -- reusing the direction wholesale would swing the cloud
+    // pattern sideways as ray.y crosses the threshold.
+    float3 marchRay = ray;
+    if (ray.y < kCloudMinRayY) {
+        const float horizontal = length(ray.xz);
+        const float scale = horizontal > 1e-5
+            ? sqrt(max(1.0 - kCloudMinRayY * kCloudMinRayY, 0.0)) / horizontal
+            : 0.0;
+        marchRay = float3(ray.x * scale, kCloudMinRayY, ray.z * scale);
+    }
 
+    // Fade across the band below the horizon so the layer thins out instead of
+    // ending on a hard line. Rays at or above kCloudMinRayY are unaffected.
+    const float horizonFade =
+        smoothstep(kCloudHorizonFadeY, kCloudMinRayY, ray.y);
+    if (horizonFade <= 0.0) return 0.0;
+
+    const float4 clouds = cloudVolumetric > 0.5
+        ? RaymarchVolumetricClouds(marchRay)
+        : RaymarchClouds2D(marchRay);
+    return clouds * horizonFade;
+}
+
+float4 RaymarchClouds2D(float3 ray) {
     const float baseHeight = max(cloudParams.z, cameraPosition.y + 20.0);
     const float thickness = max(cloudParams.w, 50.0);
     float nearT = max((baseHeight - cameraPosition.y) / ray.y, 0.0);
@@ -468,8 +432,6 @@ float4 main(PSInput input) : SV_Target {
     hdr = PhysicalSky(ray, hdr);
     float4 clouds = RaymarchClouds(ray);
     hdr = hdr * (1.0 - clouds.a * 0.72) + clouds.rgb;
-    const float4 distantIslands = DistantIslandSilhouettes(ray, hdr);
-    hdr = lerp(hdr, distantIslands.rgb, distantIslands.a);
 
     // The night EXR contains a photographic horizon many stops brighter than
     // its star field. Exposure alone cannot tame it reliably because that band

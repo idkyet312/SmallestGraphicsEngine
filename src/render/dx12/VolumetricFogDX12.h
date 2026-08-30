@@ -141,6 +141,12 @@ private:
     static constexpr UINT MaxGridY = GridY * 2;
     static constexpr UINT MaxGridZ = GridZ * 2;
 
+    // Half-extent of the water clipmap's outermost, visual-only ring (see
+    // WaterRendererDX12::CreateClipmap). The ocean surface is drawn out to
+    // here, so the fog's ocean-depth substitution has to reach the same
+    // distance or it stops short of the horizon.
+    static constexpr float kOceanHorizonHalfExtent = 1048576.0f;
+
     UINT gridX_ = GridX;
     UINT gridY_ = GridY;
     UINT gridZ_ = GridZ;
@@ -516,8 +522,21 @@ private:
             oceanCenter.x, ocean.GetSurfaceY(), oceanCenter.z,
             ocean.IsInitialized() ? 1.0f : 0.0f
         };
+        // The gameplay volume is only a few kilometres across, but the water
+        // clipmap's outer ring is visual horizon coverage that reaches far past
+        // it, so the surface is still drawn well beyond these bounds. Clipping
+        // the fog's ocean substitution to the gameplay footprint left every
+        // pixel between that edge and the true horizon composited as sky, which
+        // reads as a bright band cutting the ocean off short of the horizon.
+        // Extend the footprint used here to the drawn extent; the soft edge
+        // falls outside any reachable view, so the smoothstep below keeps its
+        // original behaviour everywhere the player can actually see.
+        const float oceanVisualHalfX =
+            (std::max)(oceanHalfX, kOceanHorizonHalfExtent);
+        const float oceanVisualHalfZ =
+            (std::max)(oceanHalfZ, kOceanHorizonHalfExtent);
         constants.oceanBounds1 = {
-            oceanHalfX, oceanHalfZ,
+            oceanVisualHalfX, oceanVisualHalfZ,
             (std::min)(16.0f, (std::max)(2.0f,
                 (std::min)(oceanHalfX, oceanHalfZ) * 0.04f)),
             0.0f

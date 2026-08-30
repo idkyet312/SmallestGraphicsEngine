@@ -19,6 +19,11 @@ cbuffer WaterConstants : register(b0)
     float4 waveExtra[4];  // steepness, unused...
 };
 
+// How far the distant ocean may be blended toward the fogged sky behind it.
+// Strictly below 1 so the horizon band keeps some water shading instead of
+// resolving to the sky texture, which reads as a gap above the waterline.
+static const float kHorizonBlendCeiling = 0.82;
+
 Texture2D<float4> sceneColor : register(t0);
 #ifdef WATER_DEPTH_MSAA
 Texture2DMS<float> sceneDepth : register(t1);
@@ -119,15 +124,19 @@ VSOutput VSMain(VSInput input)
                           previousNormal, previousCrest);
         }
 
-        // The coarse ocean rings begin past 128 m. Preserve the exact inner-edge
-        // waves, then ease their geometric displacement out so interpolation
-        // cannot reveal a square ring boundary. Per-pixel micro normals already
-        // perform their own footprint fade below.
-        if (input.tangent.w > 4.5 && volume1.z < 0.5) {
+        // Ease the geometric wave displacement out on the coarse rings so
+        // vertex interpolation cannot reveal a square ring boundary. Keyed on
+        // distance rather than a ring index: the index moves whenever the
+        // clipmap gains rings, and what actually matters is the cell size at
+        // this position. The fade now runs out to the last subdivided ring
+        // instead of stopping at 320 m, since the rings between there and
+        // 4 km can carry real waves. Per-pixel micro normals still perform
+        // their own footprint fade below.
+        if (volume1.z < 0.5) {
             const float ringDistance = max(
                 abs(input.position.x), abs(input.position.z));
             const float waveFade =
-                1.0 - smoothstep(128.0, 320.0, ringDistance);
+                1.0 - smoothstep(2048.0, 4096.0, ringDistance);
             currentPosition = lerp(
                 float3(currentXZ.x, volume0.y, currentXZ.y),
                 currentPosition, waveFade);
@@ -158,6 +167,13 @@ VSOutput VSMain(VSInput input)
     output.previousClip =
         mul(float4(previousPosition, 1.0), previousViewProjection);
     output.position = output.currentClip;
+    if (volume0.w > 0.5 && volume1.z < 0.5 && output.position.w > 0.0) {
+        // Gameplay uses an 800 m far plane for useful depth precision. Clamp
+        // only the ocean inside it so the visual horizon ring survives far
+        // clipping; its world position remains untouched for stable shading.
+        output.position.z = min(
+            output.position.z, output.position.w * 0.99998);
+    }
     return output;
 }
 
@@ -304,7 +320,7 @@ PSOutput PSMain(VSOutput input)
     float2 uv = input.position.xy * screenParams.zw;
     float opaqueDepth = LoadOpaqueDepth(uv);
 
-    if (volume0.w > 0.5) {
+    if (volume0.w > 0.5 && volume1.z > 0.5) {
         float2 fromCenter = abs(input.worldPosition.xz - volume0.xz);
         clip(volume1.xy - fromCenter);
     }
@@ -529,6 +545,26 @@ PSOutput PSMain(VSOutput input)
 #ifndef WATER_HDR_TARGET
     color = ToneMapWater(color);
 #endif
+    if (volume0.w > 0.5 && opaqueDepth >= 0.99999) {
+        // The water pass runs after atmospheric fog, so an uncorrected ocean
+        // remains darker than the already-fogged sky at grazing angles. Fade
+        // the far surface into the exact scene-copy pixel it meets. This is the
+        // far-mesh treatment used by large-ocean renderers, without bending the
+        // plane upward into a bowl that becomes obvious from aircraft.
+        const float distanceFade = smoothstep(280.0, 1200.0, waterDistance);
+        const float grazingFade =
+            1.0 - smoothstep(0.018, 0.115, nDotV);
+        // Capped below 1. Matching the fogged sky is only meant to remove the
+        // brightness step at the horizon, but an uncapped blend reached 1.0
+        // around 5 km out and replaced the ocean with the sky texture outright,
+        // leaving a washed-out band between the waterline and the horizon. The
+        // residual keeps the surface reading as water all the way out.
+        const float horizonBlend =
+            distanceFade * grazingFade * kHorizonBlendCeiling;
+        const float3 horizonColor = sceneColor.SampleLevel(
+            linearClamp, uv, 0.0).rgb;
+        color = lerp(color, horizonColor, horizonBlend);
+    }
     output.color = float4(color, 1.0);
 #ifdef WATER_MOTION_OUTPUT
     float2 currentUV = (input.currentClip.xy / input.currentClip.w) *

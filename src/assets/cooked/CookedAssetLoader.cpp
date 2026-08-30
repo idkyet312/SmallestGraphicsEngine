@@ -459,6 +459,8 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
             (source.flags & Cooked::RoughnessOnly) != 0;
         material->alphaCutout =
             (source.flags & Cooked::AlphaCutout) != 0;
+        material->alphaBlend =
+            (source.flags & Cooked::AlphaBlend) != 0;
         if (source.baseColorTexture < textures.size())
             material->baseColorTexture = textures[source.baseColorTexture];
         if (source.normalTexture < textures.size())

@@ -85,6 +85,10 @@ struct PrefabAsset {
     // so they can request double-sided rendering regardless of the material
     // flags the source file shipped with.
     bool forceDoubleSided = false;
+    // auto | beforeWater | afterWater. Auto handles ordinary props from their
+    // bounds; an explicit phase is for large transparent meshes spanning a
+    // shoreline or water plane.
+    std::string transparencyPass = "auto";
     float materialAmbientScale = 1.0f;
     float materialViewFillStrength = 0.0f;
     std::string collision = "none";

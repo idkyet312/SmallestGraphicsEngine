@@ -779,6 +779,23 @@ float4 FogAtViewDepth(float2 uv, float viewDepth)
     return FadeFogAtRange(fog, viewDepth, fogFar);
 }
 
+// As FogAtViewDepth, but holds the volume's far-range value instead of fading
+// to neutral past it. The fade exists so terrain emerging from the end of the
+// froxel grid does not show a band, which relies on that geometry being far
+// enough away to be hidden. A flat sea has no such luxury: "beyond the fog
+// volume" is a single view angle, so the fade draws a hard horizontal line
+// across the water with haze on one side and none on the other.
+float4 FogAtViewDepthSustained(float2 uv, float viewDepth)
+{
+    float nearZ = cameraPositionNear.w;
+    float fogFar = min(cameraForwardFar.w, fogParams.z);
+    float clampedDepth = min(viewDepth, fogFar);
+    float slice = log(max(clampedDepth, nearZ) / nearZ) /
+                  log(fogFar / nearZ);
+    return fogVolume.SampleLevel(
+        linearClampSampler, FogVolumeUVW(uv, saturate(slice)), 0.0);
+}
+
 float OceanSurfaceViewDepth(float2 uv, out float coverage)
 {
     coverage = 0.0;
@@ -835,7 +852,7 @@ float4 CompositeFog(float2 uv, float deviceDepth)
         (hasOpaqueDepth && oceanViewDepth >= opaqueViewDepth))
         return opaqueFog;
 
-    float4 oceanFog = FogAtViewDepth(uv, oceanViewDepth);
+    float4 oceanFog = FogAtViewDepthSustained(uv, oceanViewDepth);
     return lerp(opaqueFog, oceanFog, oceanCoverage);
 }
 

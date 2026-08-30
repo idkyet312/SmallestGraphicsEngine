@@ -5,6 +5,7 @@
 #include "Scene.h"
 #include <array>
 #include <fstream>
+#include <functional>
 #include <sstream>
 
 struct ImpactParticleInstanceDX12 {
@@ -121,7 +122,8 @@ public:
     }
 
     UINT Render(const Scene& scene, ID3D12Resource* smokeTexture,
-                ID3D12Resource* bloodTexture, bool hdrTarget, bool msaaTarget) {
+                ID3D12Resource* bloodTexture, bool hdrTarget, bool msaaTarget,
+                const std::function<bool(const ImpactParticle&)>& include = {}) {
         drawCallsThisFrame_ = 0;
         if (!initialized || !smokeTexture) return 0;
         if (!bloodTexture) bloodTexture = smokeTexture;
@@ -135,6 +137,7 @@ public:
         sparks.reserve(scene.impactParticles.size());
         for (const ImpactParticle& particle : scene.impactParticles) {
             if (particle.life <= 0.0f || particle.size <= 0.0f) continue;
+            if (include && !include(particle)) continue;
             if (particle.spark) sparks.push_back(&particle);
             else if (particle.blood) blood.push_back(&particle);
             else smoke.push_back(&particle);

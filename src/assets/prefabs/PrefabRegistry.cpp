@@ -239,6 +239,12 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
             prefab.castShadow = mesh.value("castShadow", true);
             prefab.useMaterials = mesh.value("useMaterials", true);
             prefab.forceDoubleSided = mesh.value("forceDoubleSided", false);
+            prefab.transparencyPass = mesh.value("transparencyPass", "auto");
+            if (prefab.transparencyPass != "auto" &&
+                prefab.transparencyPass != "beforeWater" &&
+                prefab.transparencyPass != "afterWater")
+                throw std::runtime_error(
+                    "staticMesh.transparencyPass must be auto, beforeWater, or afterWater");
             prefab.targetSize = mesh.value("targetSize", 0.0f);
             prefab.materialAmbientScale = mesh.value("materialAmbientScale", 1.0f);
             prefab.materialViewFillStrength = mesh.value(
@@ -369,6 +375,7 @@ const std::vector<PrefabPropertyDescriptor>& PrefabPropertyMetadata() {
         {"staticMesh", "castShadow", PrefabPropertyType::Boolean},
         {"staticMesh", "useMaterials", PrefabPropertyType::Boolean},
         {"staticMesh", "forceDoubleSided", PrefabPropertyType::Boolean},
+        {"staticMesh", "transparencyPass", PrefabPropertyType::String},
         {"staticMesh", "targetSize", PrefabPropertyType::Number, 0.0f, 10000.0f},
         {"collision", "shape", PrefabPropertyType::String},
         {"light", "color", PrefabPropertyType::Color3, 0.0f, 1.0f},
@@ -498,6 +505,7 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
                 merged.castShadow = local.castShadow;
                 merged.useMaterials = local.useMaterials;
                 merged.forceDoubleSided = local.forceDoubleSided;
+                merged.transparencyPass = local.transparencyPass;
                 merged.targetSize = local.targetSize;
                 merged.materialAmbientScale = local.materialAmbientScale;
                 merged.materialViewFillStrength = local.materialViewFillStrength;
@@ -663,6 +671,10 @@ PrefabSaveResult PrefabRegistry::Save(const PrefabAsset& prefab,
             mesh["useMaterials"] = prefab.useMaterials;
             if (prefab.forceDoubleSided)
                 mesh["forceDoubleSided"] = true;
+            if (prefab.transparencyPass != "auto")
+                mesh["transparencyPass"] = prefab.transparencyPass;
+            else
+                mesh.erase("transparencyPass");
             mesh["materialAmbientScale"] = prefab.materialAmbientScale;
             mesh["materialViewFillStrength"] = prefab.materialViewFillStrength;
         }

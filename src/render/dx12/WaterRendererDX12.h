@@ -402,8 +402,19 @@ private:
     }
 
     bool CreateClipmap() {
-        static constexpr std::array<float, 6> gameplayExtents = {
-            8.0f, 16.0f, 32.0f, 64.0f, 128.0f, 4096.0f };
+        // The final ring is visual-only horizon coverage. Its vertices are
+        // pinned inside the far clip in water_dx12.hlsl, so the ordinary 800 m
+        // camera far plane can retain its depth precision without exposing a
+        // strip of sky between the finite ocean and the geometric horizon.
+        // Ring extents roughly double until the visual horizon ring. The old
+        // set jumped straight from 128 m to 4096 m, so one ring's cells went
+        // from ~2 m to ~124 m and a single interpolated vertex normal covered
+        // the whole midfield -- flat, featureless water from a few hundred
+        // metres out. The inserted rings keep the progression geometric so
+        // wave detail degrades gradually instead of collapsing in one step.
+        static constexpr std::array<float, 11> gameplayExtents = {
+            8.0f, 16.0f, 32.0f, 64.0f, 128.0f, 256.0f, 512.0f,
+            1024.0f, 2048.0f, 4096.0f, 1048576.0f };
         // Deployment evaluates its wave normal and crest per pixel. A flat
         // full-span grid therefore has no geometric LOD rings to reveal as the
         // camera orbits, while its subdivisions keep homogeneous clipping

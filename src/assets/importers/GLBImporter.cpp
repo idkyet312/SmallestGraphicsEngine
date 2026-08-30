@@ -1387,6 +1387,8 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLBInternal(
         sceneMat->roughnessFactor = (float)mat.pbrMetallicRoughness.roughnessFactor;
         sceneMat->metallicFactor = (float)mat.pbrMetallicRoughness.metallicFactor;
         sceneMat->doubleSided = mat.doubleSided;
+        sceneMat->alphaCutout = mat.alphaMode == "MASK";
+        sceneMat->alphaBlend = mat.alphaMode == "BLEND";
 
         // Emissive, premultiplied by KHR_materials_emissive_strength. Authoring
         // tools export beacons and panel lights as a low emissiveFactor with a

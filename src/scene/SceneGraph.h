@@ -27,6 +27,12 @@ struct MeshletDescDX12 {
     UINT triangleCount;
 };
 
+enum class WaterTransparencyMode {
+    Automatic,
+    BeforeWater,
+    AfterWater
+};
+
 struct SceneMaterial {
     std::string name;
     
@@ -38,15 +44,27 @@ struct SceneMaterial {
     float metallicFactor = 1.0f;
     float roughnessFactor = 1.0f;
     bool doubleSided = false;
+    // Automatic compares the primitive and camera against the local water
+    // surface. The explicit modes are escape hatches for large meshes that
+    // straddle a shoreline and cannot be classified from one bounds centre.
+    WaterTransparencyMode waterTransparency =
+        WaterTransparencyMode::Automatic;
     // Closed fracture prisms and layered shells can self-occlude against the
     // previous-frame HZB. Keep frustum culling, but skip HZB for those materials.
     bool disableOcclusionCulling = false;
     // Alpha-tested cutout (foliage cards): the pixel shader clips texels whose
     // texture alpha is below threshold. Opt-in because clip() costs early-Z.
     bool alphaCutout = false;
+    // glTF alphaMode=BLEND. Kept separate from alphaCutout so texture-driven
+    // glass can use blending even when baseColorFactor alpha itself is 1.
+    bool alphaBlend = false;
     // Hair/eyelash atlases ship as opaque RGB with white strands on black.
     // Clip from luminance instead of alpha for those cards.
     bool alphaFromLuminance = false;
+
+    bool IsTransparent() const {
+        return alphaBlend || baseColorFactor.w < 0.999f;
+    }
     float ambientScale = 1.0f;
     float occlusionStrength = 0.0f;
     float normalYSign = 1.0f;

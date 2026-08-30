@@ -2292,21 +2292,29 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::SliderFloat("Aerial Perspective",
                                &scene.atmosphereAerialDensity,
                                0.0f, 2.0f, "%.2f");
+            // Sky clouds and world clouds are separate systems with their own
+            // base heights. Group each under its own header so the two bases
+            // are visibly distinct rather than reading as one "Cloud Base".
+            ImGui::SeparatorText("Sky Clouds (distant, painted on the sky)");
             bool weatherChanged = ImGui::SliderFloat(
-                "Cloud Coverage", &scene.atmosphereCloudCoverage,
+                "Sky Cloud Coverage", &scene.atmosphereCloudCoverage,
                 0.0f, 1.0f, "%.2f");
             weatherChanged |= ImGui::SliderFloat(
-                "Cloud Density", &scene.atmosphereCloudDensity,
+                "Sky Cloud Density", &scene.atmosphereCloudDensity,
                 0.0f, 1.5f, "%.2f");
             weatherChanged |= ImGui::DragFloat(
-                "Cloud Base", &scene.atmosphereCloudBaseHeight,
+                "Sky Cloud Base", &scene.atmosphereCloudBaseHeight,
                 10.0f, 50.0f, 5000.0f, "%.0f m");
             weatherChanged |= ImGui::DragFloat(
-                "Cloud Thickness", &scene.atmosphereCloudThickness,
+                "Sky Cloud Thickness", &scene.atmosphereCloudThickness,
                 10.0f, 50.0f, 5000.0f, "%.0f m");
+            if (scene.enableFlyableClouds)
+                ImGui::TextDisabled(
+                    "Suppressed while World Volumetric Clouds is on");
             if (weatherChanged)
                 ApplyLiveWeatherState(WeatherState::Custom);
         }
+        ImGui::SeparatorText("World Clouds (volumetric, fly-through)");
         if (ImGui::Checkbox("World Volumetric Clouds",
                             &scene.enableFlyableClouds))
             ApplyLiveWeatherState(WeatherState::Custom);
@@ -2331,6 +2339,26 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             if (scene.camera.Position.y >= scene.flyableCloudBaseHeight &&
                 scene.camera.Position.y <= cloudTop)
                 ImGui::TextDisabled("Camera is inside the cloud volume");
+        }
+        // The low haze that hugs the horizon is height fog, not a cloud layer,
+        // so neither cloud base moves it. Its controls live in the fog section
+        // further down; mirror the two that shape the horizon band here so all
+        // three layer bases can be dialled from one place.
+        ImGui::SeparatorText("Ground Haze (height fog, hugs the horizon)");
+        {
+            bool hazeChanged = ImGui::DragFloat(
+                "Haze Base Height", &scene.volumetricFogBaseHeight,
+                0.5f, -5.0f, 2000.0f, "%.1f m");
+            hazeChanged |= ImGui::SliderFloat(
+                "Haze Height Falloff", &scene.volumetricFogHeightFalloff,
+                0.001f, 0.25f, "%.3f");
+            hazeChanged |= ImGui::DragFloat(
+                "Haze Density", &scene.volumetricFogDensity,
+                0.0005f, 0.0001f, 0.05f, "%.4f");
+            if (!scene.enableVolumetricFog)
+                ImGui::TextDisabled("Volumetric Fog is off");
+            if (hazeChanged)
+                ApplyLiveWeatherState(WeatherState::Custom);
         }
         ImGui::Checkbox("GTAO + Contact Shadows", &scene.enableAmbientOcclusion);
         if (scene.enableAmbientOcclusion) {
@@ -2487,10 +2515,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 "Fog Tint", &scene.volumetricFogTint.x);
             weatherChanged |= ImGui::SliderFloat(
                 "Fog Height Falloff", &scene.volumetricFogHeightFalloff,
-                0.01f, 0.25f, "%.3f");
+                0.001f, 0.25f, "%.3f");
+            // Ranges match the mirrored haze sliders in the cloud section, so
+            // the same value is reachable from either place.
             weatherChanged |= ImGui::DragFloat(
                 "Fog Base Height", &scene.volumetricFogBaseHeight,
-                0.1f, -5.0f, 30.0f, "%.1f m");
+                0.5f, -5.0f, 2000.0f, "%.1f m");
             weatherChanged |= ImGui::DragFloat(
                 "Fog Distance", &scene.volumetricFogDistance,
                 5.0f, 20.0f, scene.cameraFar, "%.0f m");

@@ -182,7 +182,7 @@ inline void AppendOpaquePrimitiveDrawItem(MeshPrimitive& primitive,
     const XMMATRIX& model, std::vector<VBDrawItem>& items,
     XMFLOAT4 palmWindRoot = {}) {
     const std::shared_ptr<SceneMaterial>& material = primitive.material;
-    const bool transparent = material && material->baseColorFactor.w < 0.999f;
+    const bool transparent = material && material->IsTransparent();
     // Alpha-tested cards need their material texture bound per draw. Keep them
     // in forward extensions with transparent/skinned geometry instead of
     // claiming them for the opaque visibility batch.

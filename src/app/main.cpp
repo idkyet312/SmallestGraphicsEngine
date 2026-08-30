@@ -7907,6 +7907,23 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
         };
         forceDoubleSided(forceDoubleSided, model);
     }
+    if (prefab.transparencyPass != "auto") {
+        const WaterTransparencyMode waterMode =
+            prefab.transparencyPass == "afterWater"
+                ? WaterTransparencyMode::AfterWater
+                : WaterTransparencyMode::BeforeWater;
+        const auto setWaterTransparency = [waterMode](
+            const auto& self, const std::shared_ptr<SceneNode>& node) -> void {
+            if (!node) return;
+            if (node->mesh) {
+                for (MeshPrimitive& primitive : node->mesh->primitives)
+                    if (primitive.material)
+                        primitive.material->waterTransparency = waterMode;
+            }
+            for (const auto& child : node->children) self(self, child);
+        };
+        setWaterTransparency(setWaterTransparency, model);
+    }
     if (prefab.materialAmbientScale != 1.0f ||
         prefab.materialViewFillStrength != 0.0f) {
         const auto tuneMaterials = [&](const auto& self,
@@ -13929,6 +13946,7 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     // forward rendering accidentally overwrote glass with later opaque draws.
     matGlass->baseColorFactor = XMFLOAT4(0.58f, 0.76f, 0.86f, 0.04f);
     matGlass->metallicFactor = 0.0f; matGlass->roughnessFactor = 0.04f;
+    matGlass->waterTransparency = WaterTransparencyMode::AfterWater;
 
     // Emit one axis-aligned solid box as a chunk child. `wrap` stretches the
     // texture to span the whole piece (UV 0..1 per face) so a single-board wood
@@ -20291,6 +20309,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             !bentGTAODiagnosticActive &&
             scene.enableGrassMSAA && grassMSAA.initialized &&
             mainShader.GetHDRMSAAGrassPipelineState() != nullptr;
+        const bool waterPassEnabled = !usingRaytracing &&
+            !g_emptyLevelMode && waterRenderer.initialized &&
+            (g_ocean.IsInitialized() || g_water.IsInitialized()) &&
+            !(DeploymentPlanningActive() && g_deploymentDebugHideWater);
+        // The MSAA forward path resolves before its single-sample water pass,
+        // so it cannot resume depth-tested MSAA transparency afterwards. Keep
+        // its established ordering; the default HDR visibility path and the
+        // non-MSAA forward path use the split below.
+        const bool splitWaterTransparency =
+            waterPassEnabled && !msaaActive && !bentGTAODiagnosticActive;
+        BeginWaterTransparencySplitDX12(scene, false);
         mainShader.SetMSAAEnabled(msaaActive);
         g_meshShader.SetMSAAEnabled(msaaActive);
         g_terrain.SetMSAAEnabled(msaaActive);
@@ -21117,6 +21146,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             mainShader.SetExtensionMotionEnabled(false);
             g_meshShader.SetExtensionMotionEnabled(false);
             if (!visibilityDebugActive && !bentGTAODiagnosticActive) {
+                BeginWaterTransparencySplitDX12(
+                    scene, splitWaterTransparency);
                 ProfilerDX12::Scope extensions(
                     g_profiler, "Forward Extensions", g_dx12.commandList.Get());
                 RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
@@ -21155,6 +21186,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_meshShader.SetExtensionMotionEnabled(false);
             }
             {
+                BeginWaterTransparencySplitDX12(
+                    scene, splitWaterTransparency);
                 ProfilerDX12::Scope profile(g_profiler, "Forward", g_dx12.commandList.Get());
                 RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
                     crateModel, floorMaterial, lightSpace, shadowResource);
@@ -21200,7 +21233,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_meshShader.SetExtensionMotionEnabled(false);
             mainShader.Use(scene.wireframeMode);
         }
-        if (renderedScene && !bentGTAODiagnosticActive) {
+        if (renderedScene && !bentGTAODiagnosticActive &&
+            !WaterTransparencySplitActiveDX12()) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Impact Particles", g_dx12.commandList.Get());
             RenderImpactBillboards(scene, mainShader, geo, fogLightSpace);
@@ -21300,9 +21334,45 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 : nullptr);
         }
 
-        if (renderedScene && !bentGTAODiagnosticActive && !usingRaytracing &&
-            !g_emptyLevelMode && waterRenderer.initialized &&
-            !(DeploymentPlanningActive() && g_deploymentDebugHideWater)) {
+        const auto bindSplitTransparencyTarget = [&]() {
+            D3D12_CPU_DESCRIPTOR_HANDLE transparencyRTV =
+                commonHDRValidationTarget
+                    ? visBuffer.GetOutputRTV()
+                    : GetCPUDescriptorHandle(
+                        g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize,
+                        g_dx12.frameIndex);
+            D3D12_CPU_DESCRIPTOR_HANDLE transparencyDSV =
+                g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            g_dx12.commandList->OMSetRenderTargets(
+                1, &transparencyRTV, FALSE, &transparencyDSV);
+            g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
+            g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+        };
+
+        if (renderedScene && WaterTransparencySplitActiveDX12()) {
+            bindSplitTransparencyTarget();
+            {
+                ProfilerDX12::Scope profile(
+                    g_profiler, "Transparency Before Water",
+                    g_dx12.commandList.Get());
+                RenderWaterTransparencyPhaseDX12(
+                    scene, mainShader,
+                    WaterTransparencyPhaseDX12::BeforeWater,
+                    fogShadowResource);
+            }
+            {
+                ProfilerDX12::Scope profile(
+                    g_profiler, "Impact Particles Before Water",
+                    g_dx12.commandList.Get());
+                mainShader.InvalidateGraphicsRootBinding();
+                RenderImpactBillboards(
+                    scene, mainShader, geo, fogLightSpace,
+                    WaterTransparencyPhaseDX12::BeforeWater);
+            }
+        }
+
+        if (renderedScene && !bentGTAODiagnosticActive &&
+            waterPassEnabled) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Tropical Water",
                 g_dx12.commandList.Get());
@@ -21337,6 +21407,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 usingVisibility ? visBuffer.GetMotionRTV()
                                 : D3D12_CPU_DESCRIPTOR_HANDLE{},
                 waterDepthState);
+        }
+
+        if (renderedScene && WaterTransparencySplitActiveDX12()) {
+            bindSplitTransparencyTarget();
+            {
+                ProfilerDX12::Scope profile(
+                    g_profiler, "Transparency After Water",
+                    g_dx12.commandList.Get());
+                RenderWaterTransparencyPhaseDX12(
+                    scene, mainShader,
+                    WaterTransparencyPhaseDX12::AfterWater,
+                    fogShadowResource);
+            }
+            {
+                // The matching same-side half. Opposite-side particles were
+                // included in the water scene copy above and are refracted;
+                // these remain sharp because no water lies between them and
+                // the camera.
+                ProfilerDX12::Scope profile(
+                    g_profiler, "Impact Particles After Water",
+                    g_dx12.commandList.Get());
+                mainShader.InvalidateGraphicsRootBinding();
+                RenderImpactBillboards(
+                    scene, mainShader, geo, fogLightSpace,
+                    WaterTransparencyPhaseDX12::AfterWater);
+            }
+            EndWaterTransparencySplitDX12();
         }
 
         // Rain. After the opaque scene and the water so it depth-tests against
