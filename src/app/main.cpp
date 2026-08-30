@@ -16295,6 +16295,69 @@ static void UpdateHumveeImpacts(float dt) {
     }
 }
 
+// Pushes an actor out of the props it is standing inside, the same way
+// ResolvePlayerPrefabCollisions does for the player.
+//
+// The navmesh is only advice: an actor steers toward its next waypoint, but
+// falls back to walking straight at its target whenever FindPath returns
+// nothing -- which is common for a marine following a player who is standing on
+// or beside a prop. Nothing enforced the geometry at the movement step, so any
+// actor on that fallback walked straight through containers and barracks.
+// Resolving position here fixes it regardless of why the path was missing.
+static void ResolveBanditPrefabCollisions(SkinnedEnemy& bandit) {
+    if (bandit.Dead() || bandit.Held() || bandit.turretGunner) return;
+
+    constexpr float kActorRadius = 0.42f;
+    constexpr float kActorHeight = 1.75f;
+    const float feet = bandit.position.y + bandit.footOffset;
+
+    // Per-triangle geometry first, so an actor can walk through a doorway
+    // instead of being stopped by the box wrapping the whole building.
+    for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
+        const XMFLOAT3 base(bandit.position.x, feet, bandit.position.z);
+        const CollisionMeshPushout pushout = CollisionMeshInstanceResolveCapsule(
+            instance, base, kActorRadius, kActorHeight, kBanditMaxStepDown);
+        if (!pushout.touched) continue;
+        bandit.position.x += pushout.displacement.x;
+        bandit.position.z += pushout.displacement.z;
+    }
+
+    for (const PrefabCollider& collider : g_prefabColliders) {
+        // Entities with a triangle mesh were just resolved against it; the
+        // bounds box on top would shove the actor back out of the building it
+        // just walked into.
+        if (g_meshCollisionEntities.count(collider.entityId)) continue;
+        // Vertical overlap only: a container the actor is standing on top of,
+        // or one it is walking under, must not drag it sideways.
+        if (feet >= collider.center.y + collider.halfExtents.y ||
+            feet + kActorHeight <= collider.center.y - collider.halfExtents.y)
+            continue;
+
+        const XMFLOAT3 local =
+            PrefabColliderToLocal(collider, bandit.position);
+        float localX = local.x;
+        float localZ = local.z;
+        const float halfX = collider.halfExtents.x + kActorRadius;
+        const float halfZ = collider.halfExtents.z + kActorRadius;
+        if (std::abs(localX) >= halfX || std::abs(localZ) >= halfZ) continue;
+
+        // Leave along the shallower axis, which is the nearest way out.
+        const float penetrationX = halfX - std::abs(localX);
+        const float penetrationZ = halfZ - std::abs(localZ);
+        if (penetrationX < penetrationZ)
+            localX = std::copysign(halfX, std::abs(localX) > 0.001f ? localX : 1.0f);
+        else
+            localZ = std::copysign(halfZ, std::abs(localZ) > 0.001f ? localZ : 1.0f);
+
+        const float worldCosine = std::cos(collider.yawRadians);
+        const float worldSine = std::sin(collider.yawRadians);
+        bandit.position.x = collider.center.x +
+                            localX * worldCosine - localZ * worldSine;
+        bandit.position.z = collider.center.z +
+                            localX * worldSine + localZ * worldCosine;
+    }
+}
+
 static bool ResolveBanditHumveeCollision(SkinnedEnemy& bandit) {
     if (bandit.Dead() || bandit.Held() || bandit.turretGunner) return false;
     for (size_t vehicleIndex = 0;
@@ -18526,6 +18589,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             bandit->position.y = prefabSurfaceY;
                         }
                     }
+                    // After the ledge check, so standing on a prop is decided
+                    // before the walls of that same prop push sideways.
+                    ResolveBanditPrefabCollisions(*bandit);
                     ResolveBanditHumveeCollision(*bandit);
                 }
                 XMFLOAT3 shotOrigin, shotDirection;
