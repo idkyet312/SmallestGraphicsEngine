@@ -1316,6 +1316,11 @@ struct DestructionDX12::Impl {
                     if (index >= chunks.size()) break;
                     for (MeshPrimitive& primitive : chunks[index].node->mesh->primitives) {
                         if (!GLBImporter::BuildMeshletData(primitive, device)) {
+                            // The only failure inside BuildChunks that depends on
+                            // GPU state rather than the source mesh, so say which
+                            // chunk lost it instead of failing the whole load mute.
+                            std::cerr << "Destruction: meshlet build failed for chunk "
+                                      << index << " of " << chunks.size() << "\n";
                             succeeded.store(false, std::memory_order_relaxed);
                             break;
                         }
@@ -1755,7 +1760,11 @@ struct DestructionDX12::Impl {
         world = b3CreateWorld(&worldDef);
         if (B3_IS_NULL(world)) return false;
         BuildGround();
-        CreateBody(*actors.front(), false, nullptr);
+        // A level with no destructible geometry still needs the world and the
+        // ground collider: explosive barrels, grenades, vehicles and ragdolls
+        // all live here and are unrelated to Blast chunks. Only the root
+        // fracture actor is skipped, since there is nothing to fracture.
+        if (!actors.empty()) CreateBody(*actors.front(), false, nullptr);
         // Flying prototype enemies disabled. Skinned Bandit is active test enemy.
         return true;
     }
@@ -3015,15 +3024,46 @@ bool DestructionDX12::Initialize(const std::shared_ptr<SceneNode>& mergedModel,
     m = std::make_unique<Impl>(); m->owner = this;
     m->source = mergedModel; m->device = device;
     m->gridX = std::max(1, gridX); m->gridY = std::max(1, gridY); m->gridZ = std::max(1, gridZ);
-    if (!m->BuildChunks() || !m->BuildBlast() || !m->BuildPhysics()) {
-        std::cerr << "Destruction initialization failed\n";
+    // A level with nothing destructible in it is a valid level, not a failure.
+    // Custom levels only feed wood/metal houses and comm towers into this
+    // system, so a map built purely from prefabs hands us an empty source, and
+    // chunking it used to fail the whole load stage.
+    //
+    // The physics world still has to come up in that case. Explosive barrels,
+    // grenades, vehicles and ragdolls all live in it and have nothing to do
+    // with Blast chunks, and every one of those gates on IsInitialized(): a
+    // level that skipped this could not be shot at or collided with at all.
+    // Children are the pre-fractured pieces; a bare root mesh is still valid
+    // input, since BuildChunks grid-fractures that itself.
+    const bool haveGeometry =
+        mergedModel && (!mergedModel->children.empty() || mergedModel->mesh);
+
+    const char* failedStage = nullptr;
+    if (!haveGeometry) {
+        std::cout << "Destruction: no destructible geometry in this level, "
+                     "physics world only\n";
+        if (!m->BuildPhysics()) failedStage = "BuildPhysics";
+    }
+    // Name the stage that failed. All three return a bare bool, so a single
+    // combined message left no way to tell a chunking failure (bad source mesh,
+    // meshlet build) from a Blast or Box3D one when this fires in the field.
+    else if (!m->BuildChunks()) failedStage = "BuildChunks";
+    else if (!m->BuildBlast()) failedStage = "BuildBlast";
+    else if (!m->BuildPhysics()) failedStage = "BuildPhysics";
+    if (failedStage) {
+        std::cerr << "Destruction initialization failed in " << failedStage
+                  << " (chunks=" << m->chunks.size()
+                  << ", source=" << (m->source ? "yes" : "null")
+                  << ", device=" << (m->device ? "yes" : "null") << ")\n";
         Shutdown(); return false;
     }
     m->initialized = true;
     m->RebuildRenderItems();
     m->initialBatchBuild = false;
+    // No Blast asset exists on the geometry-free path, so read the bond count
+    // only when there is one to read.
     std::cout << "Destruction ready: " << m->chunks.size() << " chunks, "
-              << m->asset->getBondCount() << " bonds\n";
+              << (m->asset ? m->asset->getBondCount() : 0u) << " bonds\n";
     return true;
 }
 
