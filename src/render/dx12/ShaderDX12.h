@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <array>
 #include <algorithm>
+#include <cstddef>
 
 inline constexpr UINT SHADOW_CASCADE_COUNT = 3;
 inline std::array<XMMATRIX, SHADOW_CASCADE_COUNT> g_shadowCascadeMatrices = {
@@ -110,7 +111,9 @@ struct alignas(256) ObjectBufferDX12 {
     float metalRoughMode;  // 0=none, 1=glTF packed, 2=roughness-only
     float opacity;
     float smokeMode = 0.0f; // > 0.5: unlit soft sprite (alpha = opacity*texAlpha)
-    float alphaCut = 0.0f;  // 1: alpha cutout, 2: luminance cutout (hair cards)
+    float alphaCut = 0.0f;  // 1: foliage cutout, 2: luminance (hair), 3: hard-surface cutout
+    // Clip threshold for alphaCut modes 1 and 3.
+    float alphaCutoff = 0.20f;
     float ambientScale = 1.0f;
     float occlusionStrength = 0.0f;
     float normalYSign = 1.0f;
@@ -122,11 +125,18 @@ struct alignas(256) ObjectBufferDX12 {
     float specularScale = 1.0f;
     float materialType = 0.0f; // 0=ordinary, 1=pool water, 2=ocean
     float materialTime = 0.0f; // animated procedural materials
+    // HLSL starts uint4 values on a fresh 16-byte cbuffer register. Adding
+    // alphaCutoff moved materialTime to byte 80, so the bindless indices now
+    // begin at byte 96 rather than immediately after it.
+    float bindlessPadding[3] = {};
     UINT bindlessTextureIndices[4] = {
         BINDLESS_FALLBACK_WHITE, BINDLESS_FALLBACK_NORMAL,
         BINDLESS_FALLBACK_METALROUGH, BINDLESS_FALLBACK_BLACK
     };
 };
+
+static_assert(offsetof(ObjectBufferDX12, bindlessTextureIndices) == 96,
+              "ObjectBufferDX12 must match the bindless HLSL cbuffer layout");
 
 // A light in the punctual list. Spotlights ride the same array rather than a
 // buffer of their own: the flashlight is the only one, and a second cbuffer
@@ -1847,7 +1857,14 @@ public:
         data.roughness = rough;
         data.metalRoughMode = metalRough ? (roughnessOnly ? 2.0f : 1.0f) : 0.0f;
         data.opacity = opacity;
-        data.alphaCut = alphaFromLuminance ? 2.0f : (alphaCut ? 1.0f : 0.0f);
+        // Cutout style and threshold come from the owning material, so callers
+        // need not thread two more positional arguments through every draw
+        // path. Foliage keeps mode 1 (edge bleed + dark-texel lift); anything
+        // else alpha-tested is mode 3 and clips at its authored cutoff.
+        const bool foliageShading = !cacheOwner || cacheOwner->foliageShading;
+        data.alphaCut = alphaFromLuminance ? 2.0f
+                        : (alphaCut ? (foliageShading ? 1.0f : 3.0f) : 0.0f);
+        data.alphaCutoff = cacheOwner ? cacheOwner->alphaCutoff : 0.20f;
         data.ambientScale = ambientScale;
         data.occlusionStrength = occlusionStrength;
         data.normalYSign = normalYSign;

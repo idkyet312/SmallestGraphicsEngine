@@ -1389,6 +1389,10 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLBInternal(
         sceneMat->doubleSided = mat.doubleSided;
         sceneMat->alphaCutout = mat.alphaMode == "MASK";
         sceneMat->alphaBlend = mat.alphaMode == "BLEND";
+        // Honour the authored threshold instead of the foliage default. Fence
+        // and grating atlases ship ~0.33; clipping them lower leaves the
+        // semi-transparent mip skirt around every wire.
+        sceneMat->alphaCutoff = (float)mat.alphaCutoff;
 
         // Emissive, premultiplied by KHR_materials_emissive_strength. Authoring
         // tools export beacons and panel lights as a low emissiveFactor with a

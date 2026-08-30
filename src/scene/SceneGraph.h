@@ -55,6 +55,14 @@ struct SceneMaterial {
     // Alpha-tested cutout (foliage cards): the pixel shader clips texels whose
     // texture alpha is below threshold. Opt-in because clip() costs early-Z.
     bool alphaCutout = false;
+    // glTF alphaCutoff for alphaMode=MASK. Chain-link and grating atlases author
+    // a higher threshold than the foliage default; clipping them at the foliage
+    // value keeps mip-blurred wire edges and reads as a milky haze at distance.
+    float alphaCutoff = 0.5f;
+    // Leaf/frond cards opt into the foliage-only extras (edge colour bleed and
+    // the dark-texel green lift). Hard-surface cutouts such as fence mesh must
+    // not, or they pick up a green tint along every clipped edge.
+    bool foliageShading = false;
     // glTF alphaMode=BLEND. Kept separate from alphaCutout so texture-driven
     // glass can use blending even when baseColorFactor alpha itself is 1.
     bool alphaBlend = false;

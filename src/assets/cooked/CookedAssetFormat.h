@@ -118,7 +118,12 @@ struct Material {
     float baseColor[4] = { 1, 1, 1, 1 };
     float metallic = 1.0f;
     float roughness = 1.0f;
-    float reserved1[2] = {};
+    // glTF alphaCutoff for AlphaCutout materials. Claimed from the reserved
+    // tail, so the struct keeps its size and existing caches stay readable: a
+    // file cooked before this field wrote zero here, which the loader treats
+    // as "unspecified" and replaces with the glTF default.
+    float alphaCutoff = 0.0f;
+    float reserved1 = 0.0f;
 };
 
 struct Texture {

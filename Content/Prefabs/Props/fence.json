@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 2,
+  "id": "props/fence",
+  "name": "Chain-link Fence",
+  "components": {
+    "staticMesh": {
+      "path": "Content/Models/cfence/CFence.glb",
+      "defaultScale": [1.0, 1.0, 1.0],
+      "targetSize": 0.0,
+      "castShadow": true,
+      "useMaterials": true,
+      "materialAmbientScale": 1.0,
+      "materialViewFillStrength": 0.0,
+      "forceDoubleSided": false
+    },
+    "collision": {
+      "shape": "mesh"
+    }
+  }
+}

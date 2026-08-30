@@ -7527,6 +7527,9 @@ static bool LoadDandelionModel() {
     material->roughnessFactor = 1.0f;
     material->doubleSided = true;
     material->alphaCutout = true;
+    // Leaf card: keep the foliage edge bleed and dark-texel lift.
+    material->foliageShading = true;
+    material->alphaCutoff = 0.20f;
     material->disableOcclusionCulling = true;
 
     std::vector<unsigned char> albedo;

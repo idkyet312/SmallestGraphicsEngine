@@ -661,7 +661,15 @@ void ExtractMaterials(CookContext& context) {
         aiString alphaMode;
         if (source->Get(AI_MATKEY_GLTF_ALPHAMODE, alphaMode) == AI_SUCCESS) {
             const std::string mode = alphaMode.C_Str();
-            if (mode == "MASK") material.flags |= Cooked::AlphaCutout;
+            if (mode == "MASK") {
+                material.flags |= Cooked::AlphaCutout;
+                // Carry the authored threshold. Chain-link and grating atlases
+                // cut well above the foliage default, and clipping them low
+                // leaves a mip-blurred skirt around every wire.
+                float cutoff = 0.5f;
+                source->Get(AI_MATKEY_GLTF_ALPHACUTOFF, cutoff);
+                material.alphaCutoff = cutoff;
+            }
             else if (mode == "BLEND") material.flags |= Cooked::AlphaBlend;
         }
         material.baseColorTexture = context.MaterialTexture(source,

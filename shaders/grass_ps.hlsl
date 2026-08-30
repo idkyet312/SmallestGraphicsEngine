@@ -45,6 +45,7 @@ cbuffer ObjectBuffer : register(b3) {
     float opacity;
     float smokeMode;
     float alphaCut;
+    float alphaCutoff;
     float ambientScale;
     float occlusionStrength;
     float normalYSign;

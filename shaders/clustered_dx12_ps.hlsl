@@ -37,7 +37,8 @@ cbuffer ObjectBuffer : register(b3) {
     float metalRoughMode;
     float opacity;
     float smokeMode;         // > 0.5: unlit soft sprite, alpha = opacity * texAlpha
-    float alphaCut;          // 1: alpha cutout; 2: luminance cutout for hair
+    float alphaCut;          // 1: foliage cutout; 2: luminance (hair); 3: hard-surface cutout
+    float alphaCutoff;       // clip threshold for modes 1 and 3
     float ambientScale;
     float occlusionStrength;
     float normalYSign;
@@ -734,6 +735,8 @@ float4 main(PS_INPUT input) : SV_TARGET
 
     float3 normal = normalize(input.normal);
     float3 viewDir = normalize(viewPos - input.fragPos);
+    // Mode 1 only. Mode 3 (hard-surface cutout) must not pick up the leaf
+    // edge-colour bleed or the dark-texel green lift.
     const bool isFoliage = alphaCut > 0.5 && alphaCut < 1.5;
     float foliageCoverage = 1.0;
 
@@ -754,10 +757,14 @@ float4 main(PS_INPUT input) : SV_TARGET
         // Bandit hair atlas stores bright strands on black. A low threshold
         // keeps grey mip-filtered background and turns eyelash cards into solid
         // black strips across the face, so retain only authored strand coverage.
-        if (alphaCut > 1.5) clip(max(texColor.r, max(texColor.g, texColor.b)) - 0.62);
-        // Preserve thin palm rachises and leaflet stems. Higher cutoff detached
-        // opaque leaf clusters from their nearly transparent connecting pixels.
-        else if (alphaCut > 0.5) clip(texColor.a - 0.20);
+        if (alphaCut > 1.5 && alphaCut < 2.5)
+            clip(max(texColor.r, max(texColor.g, texColor.b)) - 0.62);
+        // Foliage keeps its low threshold to preserve thin palm rachises and
+        // leaflet stems; a higher cutoff detached opaque leaf clusters from
+        // their nearly transparent connecting pixels. Hard-surface cutouts
+        // (mode 3) clip at the threshold the asset authored instead, so
+        // chain-link wire stays crisp rather than haloed by mip-blurred alpha.
+        else if (alphaCut > 0.5) clip(texColor.a - alphaCutoff);
         if (isFoliage) {
             foliageCoverage = texColor.a;
             uint texWidth, texHeight, texLevels;

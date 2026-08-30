@@ -1,8 +1,10 @@
 #ifndef LEVEL_DEFINITION_H
 #define LEVEL_DEFINITION_H
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
@@ -41,6 +43,36 @@ struct LevelEntity {
     nlohmann::json overrides = nlohmann::json::object();
     Transform transform;
     bool enabled = true;
+};
+
+// One authored control point of a spline. Stored in world space, like every
+// other authored position in the level.
+struct LevelSplinePoint {
+    float position[3] = { 0.0f, 0.0f, 0.0f };
+};
+
+// A run of prefab instances placed along a curve (fences, walls, barricades).
+// The control points are what gets saved, not the segments they produce, so the
+// run stays re-editable after a save/load round trip and the level file holds a
+// handful of points instead of hundreds of entities. Segments are regenerated
+// from these on load; see BakeSplineEntities.
+struct LevelSplinePath {
+    uint64_t id = 0;
+    std::string name;
+    // Registry ID of the prefab repeated along the curve.
+    std::string prefabId;
+    // Metres between consecutive segments, measured along the curve. Defaults to
+    // the chain-link fence's 3.108 m footprint; other props override it.
+    float spacing = 3.108f;
+    // Degrees added to the tangent yaw, for assets not modelled along +X.
+    float yawOffset = 0.0f;
+    bool alignToPath = true;
+    bool conformToTerrain = true;
+    // Tilt each segment to match the ground slope so a solid base hugs the
+    // terrain instead of stepping. Wrong for free-standing posts, hence a flag.
+    bool pitchToSlope = true;
+    bool closed = false;
+    std::vector<LevelSplinePoint> points;
 };
 
 enum class TerrainSculptOperation : uint32_t {
@@ -210,6 +242,9 @@ struct LevelDefinition {
     uint32_t terrainSplatRevision = 0;
     LevelDXRDDGISettings dxrDDGI;
     std::vector<LevelEntity> entities;
+    // Authored prefab runs. Empty on every existing level, which therefore
+    // loads and saves exactly as before.
+    std::vector<LevelSplinePath> splines;
 };
 
 struct LevelValidationResult {
@@ -245,5 +280,49 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
 // delete the sidecar without duplicating the naming rule.
 std::filesystem::path TerrainSplatSidecarPath(
     const std::filesystem::path& levelPath);
+
+// Samples a Catmull-Rom curve through a spline's control points. Interpolating,
+// so the authored points lie exactly on the curve. Returns an empty vector for
+// fewer than two points.
+//
+// samplesPerSpan controls only the resolution of the polyline used for drawing
+// and for measuring arc length; it is not the segment spacing.
+std::vector<std::array<float, 3>> SampleSplineCurve(const LevelSplinePath& spline,
+                                                    int samplesPerSpan = 16);
+
+// One prefab instance the spline wants placed: where it goes, how it is turned,
+// and the small along-path fit needed for its far end to meet the next one.
+// Angles are degrees, matching Transform.
+struct SplineSegmentPlacement {
+    float position[3] = { 0.0f, 0.0f, 0.0f };
+    float yawDegrees = 0.0f;
+    float pitchDegrees = 0.0f;
+    float lengthScale = 1.0f;
+};
+
+// Divides the curve into approximately spline.spacing-long runs and returns one
+// placement per segment. Adjacent placements share exact endpoints; lengthScale
+// fits an asset whose local +X footprint equals spacing to the sampled chord.
+//
+// Spacing is measured by arc length rather than curve parameter: sampling a
+// Catmull-Rom at uniform t bunches points on tight turns and stretches them on
+// straights, which shows up as fence segments overlapping and then gapping.
+//
+// terrainHeight may be null, in which case the control points' own heights are
+// interpolated and conformToTerrain/pitchToSlope have no effect.
+std::vector<SplineSegmentPlacement> EvaluateSplineSegments(
+    const LevelSplinePath& spline,
+    const std::function<float(float, float)>& terrainHeight);
+
+// Key under which a baked segment records the spline that produced it, so a
+// re-bake can replace exactly its own segments and leave hand-placed props
+// alone.
+inline constexpr const char* kSplineOwnerKey = "splineOwner";
+
+// Regenerates every spline's segments into level.entities: drops entities
+// previously baked from splines, then appends fresh ones. Hand-placed entities
+// are untouched. nextId is advanced past the ids it hands out.
+void BakeSplineEntities(LevelDefinition& level, uint64_t& nextId,
+                        const std::function<float(float, float)>& terrainHeight);
 
 #endif

@@ -1,6 +1,8 @@
 #include "LevelDefinition.h"
 #include "BanditWeapon.h"
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -272,6 +274,159 @@ int main() {
         CHECK(std::string(BanditWeaponName(BanditWeapon::Rifle)) == "rifle");
         CHECK(std::string(BanditWeaponName(BanditWeapon::Shotgun)) == "shotgun");
         CHECK(std::string(BanditWeaponName(BanditWeapon::Sniper)) == "sniper");
+    }
+
+    // Spline runs. The chain-link fence prefab starts at its origin and measures
+    // 3.108 m along +X, so fitted pieces must share endpoints all the way around
+    // a run instead of leaving a remainder gap at its end or closed seam.
+    {
+        LevelSplinePath spline;
+        spline.id = 5001;
+        spline.name = "Fence Run";
+        spline.prefabId = "props/fence";
+        spline.spacing = 3.108f;
+        spline.conformToTerrain = false;
+        spline.pitchToSlope = false;
+        spline.points.push_back({ { 0.0f, 0.0f, 0.0f } });
+        spline.points.push_back({ { 30.0f, 0.0f, 0.0f } });
+        const std::vector<SplineSegmentPlacement> segments =
+            EvaluateSplineSegments(spline, nullptr);
+        CHECK(segments.size() == 10);
+        CHECK(std::fabs(segments.front().position[0]) < 1e-3f);
+        // Modelled along +X, so a run heading +X needs no yaw.
+        CHECK(std::fabs(segments.front().yawDegrees) < 0.5f);
+        const auto segmentEnd = [&](const SplineSegmentPlacement& segment) {
+            const float yaw = segment.yawDegrees * 0.0174532925199433f;
+            const float pitch = segment.pitchDegrees * 0.0174532925199433f;
+            const float length = spline.spacing * segment.lengthScale;
+            const float horizontal = length * std::cos(pitch);
+            return std::array<float, 3>{
+                segment.position[0] + horizontal * std::cos(yaw),
+                segment.position[1] - length * std::sin(pitch),
+                segment.position[2] - horizontal * std::sin(yaw)
+            };
+        };
+        float worst = 0.0f;
+        for (size_t i = 1; i < segments.size(); ++i) {
+            const std::array<float, 3> end = segmentEnd(segments[i - 1]);
+            const float dx = segments[i].position[0] - end[0];
+            const float dz = segments[i].position[2] - end[2];
+            worst = std::max(worst, std::sqrt(dx * dx + dz * dz));
+        }
+        CHECK(worst < 1e-3f);
+        CHECK(std::fabs(segmentEnd(segments.back())[0] - 30.0f) < 1e-3f);
+
+        // Arc-length stepping must hold spacing around a corner too: sampling
+        // the curve at uniform t instead bunches segments on the turn.
+        LevelSplinePath corner = spline;
+        corner.id = 5002;
+        corner.points.clear();
+        corner.points.push_back({ { 0.0f, 0.0f, 0.0f } });
+        corner.points.push_back({ { 20.0f, 0.0f, 0.0f } });
+        corner.points.push_back({ { 20.0f, 0.0f, 20.0f } });
+        const std::vector<SplineSegmentPlacement> turned =
+            EvaluateSplineSegments(corner, nullptr);
+        CHECK(turned.size() > 10);
+        worst = 0.0f;
+        for (size_t i = 1; i < turned.size(); ++i) {
+            const std::array<float, 3> end = segmentEnd(turned[i - 1]);
+            const float dx = turned[i].position[0] - end[0];
+            const float dz = turned[i].position[2] - end[2];
+            worst = std::max(worst, std::sqrt(dx * dx + dz * dz));
+        }
+        CHECK(worst < 1e-3f);
+        const std::array<float, 3> cornerEnd = segmentEnd(turned.back());
+        CHECK(std::fabs(cornerEnd[0] - 20.0f) < 1e-3f);
+        CHECK(std::fabs(cornerEnd[2] - 20.0f) < 1e-3f);
+
+        LevelSplinePath loop = spline;
+        loop.id = 5003;
+        loop.closed = true;
+        loop.points.clear();
+        loop.points.push_back({ { 0.0f, 0.0f, 0.0f } });
+        loop.points.push_back({ { 15.0f, 0.0f, 0.0f } });
+        loop.points.push_back({ { 15.0f, 0.0f, 15.0f } });
+        loop.points.push_back({ { 0.0f, 0.0f, 15.0f } });
+        const std::vector<SplineSegmentPlacement> closed =
+            EvaluateSplineSegments(loop, nullptr);
+        CHECK(!closed.empty());
+        worst = 0.0f;
+        for (size_t i = 0; i < closed.size(); ++i) {
+            const std::array<float, 3> end = segmentEnd(closed[i]);
+            const SplineSegmentPlacement& next = closed[(i + 1) % closed.size()];
+            const float dx = next.position[0] - end[0];
+            const float dz = next.position[2] - end[2];
+            worst = std::max(worst, std::sqrt(dx * dx + dz * dz));
+        }
+        CHECK(worst < 1e-3f);
+
+        // Degenerate input must not hang or emit nonsense.
+        LevelSplinePath lone;
+        lone.points.push_back({ { 0.0f, 0.0f, 0.0f } });
+        CHECK(EvaluateSplineSegments(lone, nullptr).empty());
+        LevelSplinePath zeroSpacing = spline;
+        zeroSpacing.spacing = 0.0f;
+        CHECK(EvaluateSplineSegments(zeroSpacing, nullptr).empty());
+        LevelSplinePath duplicate = spline;
+        duplicate.points.clear();
+        duplicate.points.push_back({ { 5.0f, 1.0f, 5.0f } });
+        duplicate.points.push_back({ { 5.0f, 1.0f, 5.0f } });
+        CHECK(EvaluateSplineSegments(duplicate, nullptr).size() <= 1);
+    }
+
+    // Splines round-trip as control points, and their baked segments are
+    // regenerated rather than saved -- otherwise every save/load would
+    // duplicate the whole run.
+    {
+        LevelDefinition splined = MakeFlatLevelTemplate();
+        LevelSplinePath spline;
+        spline.id = 6001;
+        spline.name = "Perimeter";
+        spline.prefabId = "props/fence";
+        spline.conformToTerrain = false;
+        spline.pitchToSlope = false;
+        spline.points.push_back({ { 0.0f, 0.0f, 0.0f } });
+        spline.points.push_back({ { 12.0f, 0.0f, 0.0f } });
+        splined.splines.push_back(spline);
+        CHECK(ValidateLevel(splined).ok);
+
+        uint64_t nextId = 9000;
+        const size_t authored = splined.entities.size();
+        BakeSplineEntities(splined, nextId, nullptr);
+        const size_t baked = splined.entities.size() - authored;
+        CHECK(baked > 0);
+        CHECK(splined.entities[authored].transform.scale[0] < 1.0f);
+        // Re-baking replaces its own segments instead of stacking them, and
+        // leaves the hand-placed player spawn alone.
+        BakeSplineEntities(splined, nextId, nullptr);
+        CHECK(splined.entities.size() == authored + baked);
+
+        const std::filesystem::path splinePath = root / "spline.json";
+        CHECK(SaveLevel(splined, splinePath).ok);
+        const LevelLoadResult reloaded = LoadLevel(splinePath);
+        CHECK(reloaded.ok);
+        CHECK(reloaded.level.splines.size() == 1);
+        CHECK(reloaded.level.splines.front().id == 6001);
+        CHECK(reloaded.level.splines.front().prefabId == "props/fence");
+        CHECK(reloaded.level.splines.front().points.size() == 2);
+        // Segments were not persisted, so the reloaded level holds only the
+        // authored entities until it is baked again.
+        CHECK(reloaded.level.entities.size() == authored);
+    }
+
+    // A level saved before splines existed must still load.
+    {
+        const std::filesystem::path legacyPath = root / "legacy.json";
+        CHECK(SaveLevel(MakeFlatLevelTemplate(), legacyPath).ok);
+        std::ifstream legacyIn(legacyPath);
+        const std::string text((std::istreambuf_iterator<char>(legacyIn)),
+                               std::istreambuf_iterator<char>());
+        legacyIn.close();
+        // No splines authored, so the key must not even be written.
+        CHECK(text.find("splines") == std::string::npos);
+        const LevelLoadResult legacy = LoadLevel(legacyPath);
+        CHECK(legacy.ok);
+        CHECK(legacy.level.splines.empty());
     }
 
     std::error_code ignored;

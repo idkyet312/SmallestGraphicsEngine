@@ -225,6 +225,18 @@ int main() {
             CHECK(std::filesystem::exists(tower->modelPath));
         }
 
+        // The chain-link fence is the spline tool default. It keeps real-world
+        // scale (targetSize 0) because the run pitch is its measured 3.108 m
+        // footprint, and needs per-triangle collision so shots hit the posts.
+        const PrefabAsset* fence = shipped.Find("props/fence");
+        CHECK(fence != nullptr);
+        if (fence) {
+            CHECK(fence->error.empty());
+            CHECK(fence->collision == "mesh");
+            CHECK(fence->targetSize == 0.0f);
+            CHECK(std::filesystem::exists(fence->modelPath));
+        }
+
         const PrefabAsset* fuelSilo = shipped.Find("props/fuel_silo");
         CHECK(fuelSilo != nullptr);
         if (fuelSilo) {

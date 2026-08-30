@@ -65,7 +65,7 @@ public:
     // state is reconciled at explicit Save/Play boundaries.
     bool IsInteracting() const {
         return gizmoWasUsing_ || inspectorEditing_ || foliageStrokeActive_ ||
-               terrainStrokeActive_;
+               terrainStrokeActive_ || splineDragActive_;
     }
     bool ImportInProgress() const { return pendingImport_.valid(); }
     void OpenAssetBrowser() { assetBrowserOpen_ = true; }
@@ -157,6 +157,13 @@ private:
     void MarkTransformRuntimeDirty(uint64_t entityId);
     void PaintFoliage(DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
         const std::function<float(float, float)>& terrainHeight);
+    void SplineTool(DirectX::CXMMATRIX view, DirectX::CXMMATRIX projection,
+        const std::function<float(float, float)>& terrainHeight);
+    // Regenerates every spline run and refreshes the derived-state flags.
+    // Called after any edit that moves control points or retunes a run.
+    void RebuildSplines(const std::function<float(float, float)>& terrainHeight);
+    LevelSplinePath* ActiveSpline();
+    const LevelSplinePath* ActiveSpline() const;
     bool TerrainPointUnderMouse(DirectX::CXMMATRIX view,
         DirectX::CXMMATRIX projection,
         const std::function<float(float, float)>& terrainHeight,
@@ -224,6 +231,27 @@ private:
     DirectX::XMFLOAT3 lastFoliageStamp_ = { 100000.0f, 0.0f, 100000.0f };
     LevelDefinition foliageStrokeBefore_;
     uint32_t foliageRandom_ = 0x52a7d91bu;
+    // Spline runs. 0 select, 1 draw (append points), 2 edit (drag points).
+    int splineTool_ = 0;
+    // Prefab repeated along new runs, stored by id rather than registry index:
+    // PrefabRegistry::Refresh reorders its vector, so an index silently points
+    // at a different asset after any content change.
+    std::string splinePrefabId_;
+    uint64_t activeSplineId_ = 0;
+    // Control point being dragged, and the snapshot taken when the drag began
+    // so the whole drag collapses into one undo entry.
+    int splineDragPoint_ = -1;
+    bool splineDragActive_ = false;
+    // Set when splines arrive without a terrain sampler to bake against (level
+    // load, undo/redo). Render owns the sampler, so the bake happens there.
+    bool splinesNeedBake_ = false;
+    LevelDefinition splineDragBefore_;
+    float splineSpacing_ = 3.108f;
+    float splineYawOffset_ = 0.0f;
+    bool splineAlignToPath_ = true;
+    bool splineConformToTerrain_ = true;
+    bool splinePitchToSlope_ = true;
+    bool splineClosed_ = false;
     int terrainTool_ = 0;
     float terrainBrushRadius_ = 3.0f;
     float terrainBrushStrength_ = 0.45f;

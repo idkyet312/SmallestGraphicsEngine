@@ -368,6 +368,9 @@ private:
         leaf->doubleSided = true;
         // The leaf sheet shapes the cards through its alpha channel.
         leaf->alphaCutout = true;
+        // Frond card: preserve the tuned foliage threshold and extras.
+        leaf->foliageShading = true;
+        leaf->alphaCutoff = 0.20f;
 
         for (MeshPrimitive& p : prims) {
             float minY = FLT_MAX;

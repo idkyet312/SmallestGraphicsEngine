@@ -26,10 +26,12 @@ extern ProfilerDX12 g_profiler;
 // Instance IDs occupy a full uint in the visibility target. Keep this aligned
 // with ShaderDX12's per-frame matrix capacity.
 static const UINT VB_MAX_DRAW_CALLS = MAX_DRAW_CALLS_PER_FRAME;
-// Maximum total vertices across all draw calls
-static const UINT VB_MAX_VERTICES = 1024 * 1024;
+// Persistent imported geometry now exceeds the original 1M-vertex budget on
+// the airport levels. Keep enough headroom for their props and destruction
+// batches so registration cannot fall through to a missing visibility draw.
+static const UINT VB_MAX_VERTICES = 2 * 1024 * 1024;
 // Maximum total indices across all draw calls
-static const UINT VB_MAX_INDICES = 1024 * 1024 * 3;
+static const UINT VB_MAX_INDICES = VB_MAX_VERTICES * 3;
 static const UINT VB_MAX_TRIANGLES = VB_MAX_INDICES / 3;
 static const UINT VB_CLUSTER_X = 16;
 static const UINT VB_CLUSTER_Y = 9;

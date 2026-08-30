@@ -317,12 +317,15 @@ void LevelEditor::NewFromLevelOne() {
     selectedId_ = level_.entities.empty() ? 0 : level_.entities.front().id;
     nextId_ = 1;
     for (const auto& entity : level_.entities) nextId_ = (std::max)(nextId_, entity.id + 1);
+    for (const auto& spline : level_.splines)
+        nextId_ = (std::max)(nextId_, spline.id + 1);
     undo_.clear(); redo_.clear(); currentPath_.clear();
     dirty_ = false; runtimeDirty_ = true; foliageRuntimeDirty_ = true;
     transformRuntimeDirty_ = false; transformRuntimeEntityId_ = 0;
     terrainRuntimeDirty_ = true; dxrDDGIRuntimeDirty_ = true;
     environmentRuntimeDirty_ = true;
     dxrDDGILayoutDirty_ = true; playing_ = false;
+    splinesNeedBake_ = true;
     status_ = "New level created from Level 1";
     RefreshLevelFiles();
     prefabRegistry_.Refresh(kPrefabRoot, kModelRoot);
@@ -336,12 +339,17 @@ void LevelEditor::NewFlat() {
     nextId_ = 1;
     for (const auto& entity : level_.entities)
         nextId_ = (std::max)(nextId_, entity.id + 1);
+    // Spline ids share the entity id space: a baked segment records its
+    // owner id, so a collision would make a re-bake delete the wrong run.
+    for (const auto& spline : level_.splines)
+        nextId_ = (std::max)(nextId_, spline.id + 1);
     undo_.clear(); redo_.clear(); currentPath_.clear();
     dirty_ = false; runtimeDirty_ = true; foliageRuntimeDirty_ = true;
     transformRuntimeDirty_ = false; transformRuntimeEntityId_ = 0;
     terrainRuntimeDirty_ = true; dxrDDGIRuntimeDirty_ = true;
     environmentRuntimeDirty_ = true;
     dxrDDGILayoutDirty_ = true; playing_ = false;
+    splinesNeedBake_ = true;
     status_ = "New flat level created";
     RefreshLevelFiles();
     prefabRegistry_.Refresh(kPrefabRoot, kModelRoot);
@@ -758,6 +766,10 @@ bool LevelEditor::LoadFrom(const std::filesystem::path& path) {
     nextId_ = 1;
     for (const auto& entity : level_.entities)
         nextId_ = (std::max)(nextId_, entity.id + 1);
+    // Spline ids share the entity id space: a baked segment records its
+    // owner id, so a collision would make a re-bake delete the wrong run.
+    for (const auto& spline : level_.splines)
+        nextId_ = (std::max)(nextId_, spline.id + 1);
     undo_.clear();
     redo_.clear();
     dirty_ = false;
@@ -767,6 +779,9 @@ bool LevelEditor::LoadFrom(const std::filesystem::path& path) {
     foliageRuntimeDirty_ = true;
     terrainRuntimeDirty_ = true;
     environmentRuntimeDirty_ = true;
+    // Segments are not persisted; regenerate them once Render supplies a
+    // terrain sampler.
+    splinesNeedBake_ = true;
     status_ = "Loaded " + currentPath_.string();
     return true;
 }
@@ -1128,6 +1143,186 @@ void LevelEditor::PaintFoliage(CXMMATRIX view, CXMMATRIX projection,
         level_.entities.push_back(std::move(entity));
     }
     foliageStrokeChanged_ = true;
+}
+
+LevelSplinePath* LevelEditor::ActiveSpline() {
+    for (LevelSplinePath& spline : level_.splines)
+        if (spline.id == activeSplineId_) return &spline;
+    return nullptr;
+}
+
+const LevelSplinePath* LevelEditor::ActiveSpline() const {
+    for (const LevelSplinePath& spline : level_.splines)
+        if (spline.id == activeSplineId_) return &spline;
+    return nullptr;
+}
+
+void LevelEditor::RebuildSplines(
+        const std::function<float(float, float)>& terrainHeight) {
+    BakeSplineEntities(level_, nextId_, terrainHeight);
+    // A fence run is world geometry, so the same derived state a terrain edit
+    // invalidates has to be rebuilt here too.
+    runtimeDirty_ = true;
+    environmentRuntimeDirty_ = true;
+    dxrDDGIRuntimeDirty_ = true;
+    dxrDDGILayoutDirty_ = true;
+    transformRuntimeDirty_ = false;
+    transformRuntimeEntityId_ = 0;
+}
+
+void LevelEditor::SplineTool(CXMMATRIX view, CXMMATRIX projection,
+    const std::function<float(float, float)>& terrainHeight) {
+    // Commit a control-point drag as one undo entry, matching the foliage and
+    // terrain stroke pattern.
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && splineDragActive_) {
+        PushUndo(splineDragBefore_);
+        dirty_ = true;
+        RebuildSplines(terrainHeight);
+        splineDragActive_ = false;
+        splineDragPoint_ = -1;
+    }
+    if (splineTool_ == 0 || foliageTool_ != 0 || terrainTool_ != 0) return;
+
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    const XMMATRIX viewProjection = view * projection;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    // World to screen. Returns false behind the camera, where the projected
+    // point would mirror to the wrong side of the screen.
+    const auto project = [&](float x, float y, float z, ImVec2& out) {
+        const XMVECTOR clip =
+            XMVector3Transform(XMVectorSet(x, y, z, 1.0f), viewProjection);
+        const float w = XMVectorGetW(clip);
+        if (w <= 0.01f) return false;
+        out = ImVec2((XMVectorGetX(clip) / w * 0.5f + 0.5f) * display.x,
+                     (1.0f - (XMVectorGetY(clip) / w * 0.5f + 0.5f)) * display.y);
+        return true;
+    };
+
+    // Draw every run, highlighting the active one.
+    for (const LevelSplinePath& spline : level_.splines) {
+        const bool active = spline.id == activeSplineId_;
+        const std::vector<std::array<float, 3>> curve =
+            SampleSplineCurve(spline, 12);
+        std::vector<ImVec2> screen;
+        screen.reserve(curve.size());
+        for (const std::array<float, 3>& point : curve) {
+            // Lift the overlay off the ground so it stays readable against the
+            // terrain, as the foliage brush ring does.
+            const float y = (spline.conformToTerrain && terrainHeight)
+                ? terrainHeight(point[0], point[2]) + 0.06f
+                : point[1] + 0.06f;
+            ImVec2 projected;
+            if (project(point[0], y, point[2], projected))
+                screen.push_back(projected);
+        }
+        if (screen.size() > 1)
+            draw->AddPolyline(screen.data(), (int)screen.size(),
+                active ? IM_COL32(90, 200, 255, 235)
+                       : IM_COL32(150, 150, 160, 160),
+                ImDrawFlags_None, active ? 2.5f : 1.5f);
+        for (size_t i = 0; i < spline.points.size(); ++i) {
+            const float* position = spline.points[i].position;
+            const float y = (spline.conformToTerrain && terrainHeight)
+                ? terrainHeight(position[0], position[2]) + 0.06f
+                : position[1] + 0.06f;
+            ImVec2 projected;
+            if (!project(position[0], y, position[2], projected)) continue;
+            const bool dragging = active && (int)i == splineDragPoint_;
+            draw->AddCircleFilled(projected, dragging ? 7.0f : 5.0f,
+                active ? IM_COL32(255, 220, 90, 245)
+                       : IM_COL32(140, 140, 150, 170));
+            draw->AddCircle(projected, dragging ? 7.0f : 5.0f,
+                            IM_COL32(20, 20, 20, 200));
+        }
+    }
+
+    if (ImGui::GetIO().WantCaptureMouse || ImGuizmo::IsOver()) return;
+
+    XMFLOAT3 hit;
+    const bool overTerrain =
+        TerrainPointUnderMouse(view, projection, terrainHeight, hit);
+
+    if (splineTool_ == 1) {
+        // Draw: each click appends a control point to the active run, creating
+        // one on the first click.
+        if (overTerrain) {
+            ImVec2 preview;
+            if (project(hit.x, hit.y + 0.06f, hit.z, preview))
+                draw->AddCircle(preview, 6.0f, IM_COL32(90, 255, 140, 230), 0, 2.0f);
+        }
+        if (overTerrain && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const LevelDefinition before = level_;
+            LevelSplinePath* spline = ActiveSpline();
+            if (!spline) {
+                LevelSplinePath created;
+                created.id = nextId_++;
+                created.name =
+                    "Spline " + std::to_string(level_.splines.size() + 1);
+                created.prefabId = splinePrefabId_;
+                created.spacing = splineSpacing_;
+                created.yawOffset = splineYawOffset_;
+                created.alignToPath = splineAlignToPath_;
+                created.conformToTerrain = splineConformToTerrain_;
+                created.pitchToSlope = splinePitchToSlope_;
+                created.closed = splineClosed_;
+                level_.splines.push_back(std::move(created));
+                activeSplineId_ = level_.splines.back().id;
+                spline = &level_.splines.back();
+            }
+            LevelSplinePoint point;
+            point.position[0] = hit.x;
+            point.position[1] = hit.y;
+            point.position[2] = hit.z;
+            spline->points.push_back(point);
+            const size_t placed = spline->points.size();
+            PushUndo(before);
+            dirty_ = true;
+            RebuildSplines(terrainHeight);
+            status_ = "Spline points: " + std::to_string(placed);
+        }
+        return;
+    }
+
+    // Edit: grab the nearest control point of the active run and drag it.
+    LevelSplinePath* spline = ActiveSpline();
+    if (!spline) return;
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        float bestDistance = 14.0f;  // pixels; generous enough to grab easily
+        int best = -1;
+        for (size_t i = 0; i < spline->points.size(); ++i) {
+            const float* position = spline->points[i].position;
+            const float y = (spline->conformToTerrain && terrainHeight)
+                ? terrainHeight(position[0], position[2]) + 0.06f
+                : position[1] + 0.06f;
+            ImVec2 projected;
+            if (!project(position[0], y, position[2], projected)) continue;
+            const float dx = projected.x - mouse.x;
+            const float dy = projected.y - mouse.y;
+            const float distance = std::sqrt(dx * dx + dy * dy);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = (int)i;
+            }
+        }
+        if (best >= 0) {
+            splineDragPoint_ = best;
+            splineDragActive_ = true;
+            splineDragBefore_ = level_;
+        }
+    }
+    if (splineDragActive_ && splineDragPoint_ >= 0 &&
+        splineDragPoint_ < (int)spline->points.size() && overTerrain &&
+        ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        float* position = spline->points[(size_t)splineDragPoint_].position;
+        position[0] = hit.x;
+        position[1] = hit.y;
+        position[2] = hit.z;
+        // Re-bake live so the run follows the point being dragged. The undo
+        // entry was captured once, at drag start.
+        BakeSplineEntities(level_, nextId_, terrainHeight);
+        runtimeDirty_ = true;
+    }
 }
 
 namespace {
@@ -1728,6 +1923,12 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     const std::function<float(float, float)>& terrainHeight,
     const std::function<uint64_t(const PrefabAsset&)>& thumbnailTexture) {
     LevelEditorActions actions;
+    // Levels store spline control points, not the segments they produce, so a
+    // freshly loaded level has to bake them before anything reads entities.
+    if (splinesNeedBake_) {
+        splinesNeedBake_ = false;
+        if (!level_.splines.empty()) RebuildSplines(terrainHeight);
+    }
     if (pendingImport_.valid() && pendingImport_.wait_for(
             std::chrono::seconds(0)) == std::future_status::ready) {
         PendingImportResult imported = pendingImport_.get();
@@ -2653,13 +2854,21 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     ImGui::SetNextWindowPos(ImVec2(305, 70), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(285, 245), ImGuiCond_FirstUseEver);
     ImGui::Begin("Foliage Painter");
-    if (ImGui::RadioButton("Select", &foliageTool_, 0)) terrainTool_ = 0;
+    if (ImGui::RadioButton("Select", &foliageTool_, 0)) {
+        terrainTool_ = 0; splineTool_ = 0;
+    }
     ImGui::SameLine();
-    if (ImGui::RadioButton("Paint (B)", &foliageTool_, 1)) terrainTool_ = 0;
+    if (ImGui::RadioButton("Paint (B)", &foliageTool_, 1)) {
+        terrainTool_ = 0; splineTool_ = 0;
+    }
     ImGui::SameLine();
-    if (ImGui::RadioButton("Erase", &foliageTool_, 2)) terrainTool_ = 0;
+    if (ImGui::RadioButton("Erase", &foliageTool_, 2)) {
+        terrainTool_ = 0; splineTool_ = 0;
+    }
     ImGui::SameLine();
-    if (ImGui::RadioButton("Clear Cover", &foliageTool_, 3)) terrainTool_ = 0;
+    if (ImGui::RadioButton("Clear Cover", &foliageTool_, 3)) {
+        terrainTool_ = 0; splineTool_ = 0;
+    }
     const char* foliageTypes[] = { "Grass", "Dandelion", "Trees" };
     ImGui::Combo("Foliage", &foliageType_, foliageTypes, IM_ARRAYSIZE(foliageTypes));
     ImGui::SliderFloat("Radius", &brushRadius_, 0.5f, 12.0f, "%.1f m");
@@ -2690,6 +2899,116 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     }
     ImGui::End();
 
+    ImGui::SetNextWindowPos(ImVec2(600, 70), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(300, 380), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Spline Tool");
+    if (ImGui::RadioButton("Select##spline", &splineTool_, 0)) {
+        foliageTool_ = 0; terrainTool_ = 0;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Draw", &splineTool_, 1)) {
+        foliageTool_ = 0; terrainTool_ = 0;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Edit Points", &splineTool_, 2)) {
+        foliageTool_ = 0; terrainTool_ = 0;
+    }
+
+    // Prefab repeated along the run. Listed by id so the choice survives a
+    // registry refresh reordering its vector.
+    {
+        const std::vector<PrefabAsset>& assets = prefabRegistry_.Assets();
+        std::string preview = splinePrefabId_.empty() ? "(none)" : splinePrefabId_;
+        for (const PrefabAsset& asset : assets)
+            if (asset.id == splinePrefabId_) { preview = asset.name; break; }
+        if (ImGui::BeginCombo("Prefab", preview.c_str())) {
+            for (const PrefabAsset& asset : assets) {
+                if (!asset.error.empty()) continue;
+                const bool chosen = asset.id == splinePrefabId_;
+                if (ImGui::Selectable(asset.name.c_str(), chosen))
+                    splinePrefabId_ = asset.id;
+                if (chosen) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+    }
+
+    // Defaults for runs created from here on. An existing run is retuned
+    // below, against its own stored values.
+    ImGui::SliderFloat("Spacing", &splineSpacing_, 0.25f, 25.0f, "%.3f m");
+    ImGui::SliderFloat("Yaw offset", &splineYawOffset_, -180.0f, 180.0f, "%.1f deg");
+    ImGui::Checkbox("Align to path", &splineAlignToPath_);
+    ImGui::Checkbox("Conform to terrain", &splineConformToTerrain_);
+    ImGui::Checkbox("Pitch to slope", &splinePitchToSlope_);
+    ImGui::Checkbox("Closed loop", &splineClosed_);
+
+    ImGui::SeparatorText("Runs");
+    if (level_.splines.empty()) {
+        ImGui::TextDisabled("None yet");
+    } else {
+        for (LevelSplinePath& spline : level_.splines) {
+            ImGui::PushID((int)spline.id);
+            const bool active = spline.id == activeSplineId_;
+            if (ImGui::RadioButton("##active", active)) activeSplineId_ = spline.id;
+            ImGui::SameLine();
+            ImGui::Text("%s (%zu pts)", spline.name.c_str(), spline.points.size());
+            ImGui::PopID();
+        }
+    }
+
+    LevelSplinePath* active = ActiveSpline();
+    if (active) {
+        ImGui::SeparatorText("Active Run");
+        const LevelDefinition before = level_;
+        bool changed = false;
+        changed |= ImGui::SliderFloat("Segment pitch", &active->spacing,
+                                      0.25f, 25.0f, "%.3f m");
+        changed |= ImGui::SliderFloat("Run yaw", &active->yawOffset,
+                                      -180.0f, 180.0f, "%.1f deg");
+        changed |= ImGui::Checkbox("Align##run", &active->alignToPath);
+        changed |= ImGui::Checkbox("Conform##run", &active->conformToTerrain);
+        changed |= ImGui::Checkbox("Pitch##run", &active->pitchToSlope);
+        changed |= ImGui::Checkbox("Closed##run", &active->closed);
+        // Coalesces a slider drag into one undo entry.
+        TrackItemEdit(before, changed);
+        if (changed) RebuildSplines(terrainHeight);
+
+        if (ImGui::Button("Remove Last Point") && !active->points.empty()) {
+            const LevelDefinition removeBefore = level_;
+            active->points.pop_back();
+            PushUndo(removeBefore);
+            dirty_ = true;
+            RebuildSplines(terrainHeight);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Delete Run")) {
+            const LevelDefinition deleteBefore = level_;
+            const uint64_t doomed = activeSplineId_;
+            level_.splines.erase(
+                std::remove_if(level_.splines.begin(), level_.splines.end(),
+                               [doomed](const LevelSplinePath& spline) {
+                                   return spline.id == doomed;
+                               }),
+                level_.splines.end());
+            activeSplineId_ = 0;
+            PushUndo(deleteBefore);
+            dirty_ = true;
+            RebuildSplines(terrainHeight);
+        }
+    }
+    if (ImGui::Button("New Run")) {
+        // Clearing the active id makes the next Draw click start a fresh run.
+        activeSplineId_ = 0;
+        splineTool_ = 1;
+        foliageTool_ = 0;
+        terrainTool_ = 0;
+    }
+    ImGui::TextWrapped(
+        "Draw: click the ground to add points. Edit Points: drag a point to "
+        "reshape the run. Segments are regenerated from the points, so the "
+        "curve stays editable after saving.");
+    ImGui::End();
+
     ImGui::SetNextWindowPos(ImVec2(305, 325), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(320, 430), ImGuiCond_FirstUseEver);
     ImGui::Begin("Terrain Sculpt");
@@ -2699,18 +3018,18 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             (std::max)(0, static_cast<int>(terrainStampNames_.size()) - 1));
         terrainStampLibraryScanned_ = true;
     }
-    if (ImGui::RadioButton("Select##terrain", &terrainTool_, 0)) foliageTool_ = 0;
+    if (ImGui::RadioButton("Select##terrain", &terrainTool_, 0)) { foliageTool_ = 0; splineTool_ = 0; }
     ImGui::SameLine();
-    if (ImGui::RadioButton("Raise", &terrainTool_, 1)) foliageTool_ = 0;
+    if (ImGui::RadioButton("Raise", &terrainTool_, 1)) { foliageTool_ = 0; splineTool_ = 0; }
     ImGui::SameLine();
-    if (ImGui::RadioButton("Lower", &terrainTool_, 2)) foliageTool_ = 0;
-    if (ImGui::RadioButton("Flatten", &terrainTool_, 3)) foliageTool_ = 0;
+    if (ImGui::RadioButton("Lower", &terrainTool_, 2)) { foliageTool_ = 0; splineTool_ = 0; }
+    if (ImGui::RadioButton("Flatten", &terrainTool_, 3)) { foliageTool_ = 0; splineTool_ = 0; }
     ImGui::SameLine();
-    if (ImGui::RadioButton("Grow", &terrainTool_, 4)) foliageTool_ = 0;
+    if (ImGui::RadioButton("Grow", &terrainTool_, 4)) { foliageTool_ = 0; splineTool_ = 0; }
     ImGui::SameLine();
-    if (ImGui::RadioButton("Paint", &terrainTool_, 5)) foliageTool_ = 0;
+    if (ImGui::RadioButton("Paint", &terrainTool_, 5)) { foliageTool_ = 0; splineTool_ = 0; }
     ImGui::SameLine();
-    if (ImGui::RadioButton("Stamp", &terrainTool_, 6)) foliageTool_ = 0;
+    if (ImGui::RadioButton("Stamp", &terrainTool_, 6)) { foliageTool_ = 0; splineTool_ = 0; }
     if (terrainTool_ != 6) {
         ImGui::SliderFloat("Brush radius", &terrainBrushRadius_, 0.5f, 15.0f, "%.1f m");
         ImGui::SliderFloat("Strength", &terrainBrushStrength_, 0.05f, 2.0f, "%.2f");
@@ -3224,7 +3543,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     }
     ExtendTerrainInteraction(view, projection);
     PaintFoliage(view, projection, terrainHeight);
-    if (foliageTool_ == 0 && terrainTool_ == 0)
+    SplineTool(view, projection, terrainHeight);
+    if (foliageTool_ == 0 && terrainTool_ == 0 && splineTool_ == 0)
         SelectFromViewport(view, projection);
     ImDrawList* draw = ImGui::GetForegroundDrawList();
     XMMATRIX viewProjection = view * projection;
