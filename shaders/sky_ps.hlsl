@@ -430,7 +430,14 @@ float4 main(PSInput input) : SV_Target {
     float lod = clamp(log2(max(uTexelsPerPixel, 1.0)), 0.0, (float)(mipCount - 1));
     float3 hdr = skyEquirectangular.SampleLevel(skySampler, skyUV, lod).rgb;
     hdr = PhysicalSky(ray, hdr);
-    float4 clouds = RaymarchClouds(ray);
+    // Extend the lowest cloud layer below the mathematical horizon without
+    // feeding a negative Y direction into the slab intersection. The projected
+    // horizon sample fades to zero at -0.1 as requested, so it can cover the
+    // ocean join without becoming a solid lower-sky wall.
+    const float cloudHorizonFade = smoothstep(-0.1, 0.0, ray.y);
+    const float3 cloudRay = normalize(float3(
+        ray.x, max(ray.y, 0.0035), ray.z));
+    float4 clouds = RaymarchClouds(cloudRay) * cloudHorizonFade;
     hdr = hdr * (1.0 - clouds.a * 0.72) + clouds.rgb;
 
     // The night EXR contains a photographic horizon many stops brighter than
