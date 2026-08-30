@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 2,
+  "id": "props/metal_barrack",
+  "name": "Metal Barrack",
+  "components": {
+    "staticMesh": {
+      "path": "Content/Models/MetalBarrack/MetalBarrack1.glb",
+      "defaultScale": [1.0, 1.0, 1.0],
+      "targetSize": 0.0,
+      "castShadow": true,
+      "useMaterials": true,
+      "materialAmbientScale": 1.0,
+      "materialViewFillStrength": 0.0,
+      "forceDoubleSided": true
+    },
+    "collision": {
+      "shape": "mesh"
+    }
+  }
+}

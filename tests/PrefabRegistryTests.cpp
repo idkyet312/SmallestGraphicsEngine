@@ -245,6 +245,18 @@ int main() {
             CHECK(fuelSilo->targetSize == 0.0f);
             CHECK(std::filesystem::exists(fuelSilo->modelPath));
         }
+
+        // The barrack is a building the player walks into, so it keeps its
+        // authored real-world size (measured 5.9 x 4.7 x 19.7 m) and needs
+        // per-triangle collision: a box would seal the doorway shut.
+        const PrefabAsset* barrack = shipped.Find("props/metal_barrack");
+        CHECK(barrack != nullptr);
+        if (barrack) {
+            CHECK(barrack->error.empty());
+            CHECK(barrack->collision == "mesh");
+            CHECK(barrack->targetSize == 0.0f);
+            CHECK(std::filesystem::exists(barrack->modelPath));
+        }
     }
 
     std::error_code ignored;
