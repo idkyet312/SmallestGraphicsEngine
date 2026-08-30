@@ -11682,6 +11682,38 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
     }
 }
 
+// Spline control points are the serialized source of truth; their generated
+// prefab entities are deliberately omitted from level JSON. Recreate them only
+// after ApplyRuntimeLevelBasics has installed this level's terrain parameters,
+// otherwise a custom island's fence would be sampled against the previous map.
+static void BakeRuntimeSplineEntities() {
+    LevelDefinition& level = g_game.world.Level();
+    if (level.splines.empty()) return;
+
+    uint64_t nextId = 1;
+    size_t authoredEntityCount = 0;
+    for (const LevelEntity& entity : level.entities) {
+        if (!entity.overrides.contains(kSplineOwnerKey)) {
+            ++authoredEntityCount;
+            nextId = (std::max)(nextId, entity.id + 1);
+        }
+    }
+    for (const LevelSplinePath& spline : level.splines)
+        nextId = (std::max)(nextId, spline.id + 1);
+
+    auto terrainParams = CurrentTerrainParams();
+    terrainParams.heightScale = scene.terrainHeightScale;
+    BakeSplineEntities(level, nextId,
+        [terrainParams](float x, float z) {
+            return TerrainRendererDX12::HeightAt(
+                terrainParams, x, z, g_game.world.TerrainSculpt());
+        });
+    SGE_LOG("LogLevel", EngineLog::Level::Display,
+        "Baked " + std::to_string(level.entities.size() - authoredEntityCount) +
+        " prefab entities from " + std::to_string(level.splines.size()) +
+        " spline run(s)");
+}
+
 static void SynchronizeEditorRuntime(bool play);
 static void ApplyTerrainSplatMap(const LevelDefinition& level);
 static void StartLevelEditor(HWND hwnd,
@@ -11792,6 +11824,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     scene.gun.visible = true;
     scene.showHelicopter = !g_emptyLevelMode;
     ApplyRuntimeLevelBasics(true);
+    BakeRuntimeSplineEntities();
     if (modeAssetsLoaded)
         scene.rebuildDestructionRequested = true;
     // Re-aim the insertion at the spawn the player actually got. ResetLevelState

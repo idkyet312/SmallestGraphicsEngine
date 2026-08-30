@@ -412,6 +412,19 @@ int main() {
         // Segments were not persisted, so the reloaded level holds only the
         // authored entities until it is baked again.
         CHECK(reloaded.level.entities.size() == authored);
+        uint64_t runtimeNextId = 1;
+        for (const LevelEntity& entity : reloaded.level.entities)
+            runtimeNextId = (std::max)(runtimeNextId, entity.id + 1);
+        for (const LevelSplinePath& loadedSpline : reloaded.level.splines)
+            runtimeNextId = (std::max)(runtimeNextId, loadedSpline.id + 1);
+        LevelDefinition runtime = reloaded.level;
+        runtime.splines.front().conformToTerrain = true;
+        BakeSplineEntities(runtime, runtimeNextId,
+            [](float, float) { return 2.25f; });
+        CHECK(runtime.entities.size() == authored + baked);
+        CHECK(runtime.entities[authored].prefabId == "props/fence");
+        CHECK(std::fabs(runtime.entities[authored].transform.position[1] -
+                        2.25f) < 1e-3f);
     }
 
     // A level saved before splines existed must still load.
