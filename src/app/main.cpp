@@ -791,7 +791,7 @@ bool                        g_terrainDeformedThisFrame = false;
 // style). Persists across frames; clamped to a sane range.
 static float                g_editorCameraSpeed = 1.0f;
 static bool                 g_pendingEnvironmentRebuild = false;
-static bool                 g_editorVisualPrefabRefreshRequested = false;
+static bool                 g_editorVisualRefreshRequested = false;
 static bool                 g_editorFullReconcileRequested = false;
 static bool                 g_editorFullReconcileInFlight = false;
 static std::string          g_activeCustomLevelName;
@@ -3311,6 +3311,24 @@ static bool SpawnDropshipBandit(const XMFLOAT3& position);
 // Defined with the aircraft objective, below. Needed up here by the burning-
 // material tick, which must not set fire to a player-only objective.
 static bool IsObjectivePlaneEntity(uint64_t entityId);
+static bool PrefabSurfaceSupports(const DirectX::XMFLOAT3& position,
+                                  float feetY, float maxDrop, float& surfaceY);
+
+// A spawn point authored above a prop is placed by eye, so the actor can start
+// well clear of the surface it is meant to stand on -- further than the
+// steady-state probe reaches. Search this far down once at spawn to settle it
+// onto the deck instead of dropping it to terrain on the first update.
+static constexpr float kBanditPrefabSpawnDrop = 40.0f;
+
+// Ledge test for an actor already standing on a prop. Probes deeper than the
+// support drop so a real ledge reports the height it would fall to rather than
+// simply finding nothing, which lets a stair tread be told from a sheer edge.
+static constexpr float kBanditLedgeProbeDrop = 6.0f;
+
+// Largest height difference an actor will step down on a prop. Above this the
+// move is cancelled and it holds the ledge. Matches the player's step height,
+// so a bandit negotiates the same stairs the player can.
+static constexpr float kBanditMaxStepDown = 0.45f;
 // Defined with the lightning state, below.
 static void ResetLightning();
 
@@ -4143,6 +4161,15 @@ static bool SpawnBandit() {
             bandit->position = { entity.transform.position[0],
                                  entity.transform.position[1],
                                  entity.transform.position[2] };
+            // Settle an elevated spawn onto the prop beneath it, so a bandit
+            // authored above a watchtower deck stands on the deck rather than
+            // being snapped to terrain by its first update.
+            float spawnSurfaceY = 0.0f;
+            if (PrefabSurfaceSupports(bandit->position, bandit->position.y,
+                                      kBanditPrefabSpawnDrop, spawnSurfaceY) &&
+                spawnSurfaceY > GroundHeightAt(bandit->position.x,
+                                               bandit->position.z))
+                bandit->position.y = spawnSurfaceY;
             bandit->yaw = XMConvertToRadians(entity.transform.rotation[1]);
             bandit->modelScale *= entity.transform.scale[0];
             bandit->spawnSlot = static_cast<int>(slot);
@@ -8601,7 +8628,7 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
             visualBatches.push_back(batch);
     }
     std::unordered_map<std::string, size_t> batches;
-    bool missingModel = false;
+    bool missingVisual = false;
 
     const auto addInstance = [&](const auto& self, const std::string& prefabId,
                                  const XMMATRIX& world, uint64_t entityId,
@@ -8617,7 +8644,7 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
         else if (loadMissingModels)
             cachedModel = LoadPrefabModel(*prefab);
         if (!cachedModel) {
-            missingModel = true;
+            missingVisual = true;
             return;
         }
 
@@ -8699,10 +8726,6 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
 
     if (g_houseTemplate &&
         (!g_editorWoodHousePreviewModel || !g_editorMetalHousePreviewModel)) {
-        g_editorWoodHousePreviewModel =
-            std::make_shared<SceneNode>("EditorWoodHousePreview");
-        g_editorMetalHousePreviewModel =
-            std::make_shared<SceneNode>("EditorMetalHousePreview");
         const auto meanX = [](const std::shared_ptr<SceneNode>& node) {
             double sum = 0.0;
             size_t count = 0;
@@ -8717,16 +8740,47 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
             }
             return count ? static_cast<float>(sum / count) : 0.0f;
         };
+
+        auto woodSource =
+            std::make_shared<SceneNode>("EditorWoodHousePreviewSource");
+        auto metalSource =
+            std::make_shared<SceneNode>("EditorMetalHousePreviewSource");
         for (const std::shared_ptr<SceneNode>& child : g_houseTemplate->children) {
             if (!child || !child->mesh) continue;
-            (meanX(child) < 1.0f ? g_editorWoodHousePreviewModel
-                                : g_editorMetalHousePreviewModel)
+            (meanX(child) < 1.0f ? woodSource : metalSource)
                 ->AddChild(CloneSceneNodeShallow(child));
         }
         XMFLOAT4X4 identity;
         XMStoreFloat4x4(&identity, XMMatrixIdentity());
-        g_editorWoodHousePreviewModel->UpdateGlobalTransform(identity);
-        g_editorMetalHousePreviewModel->UpdateGlobalTransform(identity);
+        woodSource->UpdateGlobalTransform(identity);
+        metalSource->UpdateGlobalTransform(identity);
+
+        // The house template is authored for Blast and contains CPU geometry;
+        // DestructionDX12 uploads private render batches without filling these
+        // SceneMesh buffer views. Merge once here to create the ordinary GPU
+        // mesh that the editor's forward-extension path can actually draw.
+        const auto gpuReady = [](const std::shared_ptr<SceneNode>& model) {
+            if (!model || !model->mesh || model->mesh->primitives.empty())
+                return false;
+            return std::all_of(model->mesh->primitives.begin(),
+                model->mesh->primitives.end(), [](const MeshPrimitive& primitive) {
+                    return primitive.vbv.BufferLocation != 0 &&
+                           primitive.ibv.BufferLocation != 0 &&
+                           primitive.indexCount != 0;
+                });
+        };
+        if (!g_editorWoodHousePreviewModel) {
+            auto candidate = GLBImporter::MergeSceneByMaterial(
+                woodSource, g_dx12.device);
+            if (gpuReady(candidate))
+                g_editorWoodHousePreviewModel = std::move(candidate);
+        }
+        if (!g_editorMetalHousePreviewModel) {
+            auto candidate = GLBImporter::MergeSceneByMaterial(
+                metalSource, g_dx12.device);
+            if (gpuReady(candidate))
+                g_editorMetalHousePreviewModel = std::move(candidate);
+        }
     }
 
     PrefabRenderBatch woodHouses;
@@ -8744,7 +8798,14 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
             entity.type == LevelEntityType::MetalHouse) {
             PrefabRenderBatch& batch = entity.type == LevelEntityType::WoodHouse
                 ? woodHouses : metalHouses;
-            if (!batch.model) continue;
+            if (!batch.model) {
+                // House previews come from the destructible house template,
+                // which finishes loading after the editor itself opens. Keep a
+                // manual refresh armed until that template is available just
+                // as we do for an uncached prefab model above.
+                missingVisual = true;
+                continue;
+            }
             const float sourceX = entity.type == LevelEntityType::WoodHouse
                 ? -3.5f : 4.75f;
             const float sourceZ = entity.type == LevelEntityType::WoodHouse
@@ -8776,7 +8837,7 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
     g_prefabRenderBatches = std::move(visualBatches);
     g_prefabLightInstances = std::move(visualLights);
     RebuildRuntimePrefabLights();
-    g_editorVisualPrefabRefreshRequested = missingModel;
+    g_editorVisualRefreshRequested = missingVisual;
     shadowMap.InvalidateCachedCascades();
 }
 
@@ -9180,7 +9241,7 @@ static void RebuildPrefabRenderBatches() {
         }
     }
     g_prefabRebuildRequested = false;
-    g_editorVisualPrefabRefreshRequested = false;
+    g_editorVisualRefreshRequested = false;
     shadowMap.InvalidateCachedCascades();
     // Editing is preview-only. A full Save/Play reconciliation latches the
     // environment request before this compile, then consumes it only after the
@@ -9708,6 +9769,50 @@ static void ResolvePlayerWorldObjectCollisions(
 // rather than a wall to be blocked by. Sized for a doorway sill and a kerb; much
 // larger and the player climbs walls, much smaller and they catch on thresholds.
 static constexpr float kPlayerStepHeight = 0.45f;
+
+// How far below its feet a bandit still finds prefab ground. Covers the drop
+// through a deck's own thickness plus a step down, without letting an actor
+// that genuinely walked off a tower hang in the air for a frame.
+static constexpr float kBanditPrefabSupportDrop = 0.9f;
+
+// Highest walkable prefab surface under an actor, for standing on props the
+// terrain heightfield knows nothing about -- a watchtower deck, a container
+// roof, a walkway. Returns false when nothing supports the actor, leaving the
+// caller on terrain height.
+//
+// Cast from a little above the feet so an actor already resting exactly on the
+// surface still hits it, down to `maxDrop` below. Walkability is the surface
+// normal, matching CollisionMeshResolveCapsule's floor test: a wall face
+// registers a hit but must not read as ground.
+//
+// A raycast rather than a capsule resolve because only the floor height is
+// wanted here; horizontal blocking for bandits stays with the existing box
+// pushout.
+static bool PrefabSurfaceSupports(const XMFLOAT3& position, float feetY,
+                                  float maxDrop, float& surfaceY) {
+    // Cosine of the steepest slope that still counts as standable (~46 deg),
+    // the same threshold the capsule resolve uses for floorY.
+    constexpr float kWalkableNormalY = 0.7f;
+    constexpr float kProbeRise = 0.6f;
+    const XMFLOAT3 start(position.x, feetY + kProbeRise, position.z);
+    const XMFLOAT3 end(position.x, feetY - maxDrop, position.z);
+    bool supported = false;
+    float best = 0.0f;
+    for (const CollisionMeshInstance& instance : g_prefabMeshColliders) {
+        CollisionMeshRayHit hit;
+        if (!CollisionMeshInstanceRaycast(instance, start, end, 0.0f, hit))
+            continue;
+        // Normals are pre-flipped to oppose the ray, so a floor under a
+        // downward cast always reads +Y regardless of source winding.
+        if (hit.normal.y < kWalkableNormalY) continue;
+        if (!supported || hit.point.y > best) {
+            best = hit.point.y;
+            supported = true;
+        }
+    }
+    if (supported) surfaceY = best;
+    return supported;
+}
 
 static void ResolvePlayerPrefabCollisions(XMFLOAT3& position, float& floorY,
                                           float radius, float playerHeight) {
@@ -14985,14 +15090,14 @@ static bool SynchronizeEditorRuntimeLight(uint64_t changedEntityId = 0) {
     return true;
 }
 
-static void SynchronizeEditorRuntimeVisual() {
+static void SynchronizeEditorRuntimeVisual(bool loadMissingModels = false) {
     if (g_game.session.Screen() != GameScreen::LevelEditor) return;
     ProfilerDX12::CpuScope syncVisualProfile(g_profiler, "Editor/SyncVisual");
     g_game.world.ReplaceFromEditor(g_levelEditor.Level());
     g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
     ApplyTerrainSplatMap(g_levelEditor.Level());
     ApplyRuntimeLevelBasics(false);
-    RebuildEditorPrefabVisualBatches(false);
+    RebuildEditorPrefabVisualBatches(loadMissingModels);
     shadowMap.InvalidateCachedCascades();
 }
 
@@ -15064,7 +15169,7 @@ static void StartLevelEditor(HWND hwnd, const std::filesystem::path& levelPath) 
     g_pendingEnvironmentRebuild = false;
     g_editorFullReconcileRequested = false;
     g_editorFullReconcileInFlight = false;
-    g_editorVisualPrefabRefreshRequested = false;
+    g_editorVisualRefreshRequested = false;
     g_game.session.StopTimer();
     showUI = false;
     cameraLocked = true;
@@ -18244,7 +18349,39 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 boatPose, 0.20f, 0.48f))
                             groundY = (std::max)(groundY, BoatDeckY(boatPose));
                     }
+                    // Prefab surfaces the heightfield cannot describe: a
+                    // watchtower deck, a container roof, a walkway. Only ever
+                    // raises the ground, so an actor on open terrain is
+                    // unaffected.
+                    float prefabSurfaceY = 0.0f;
+                    const bool onPrefabSurface = PrefabSurfaceSupports(
+                        bandit->position, bandit->position.y,
+                        kBanditPrefabSupportDrop, prefabSurfaceY);
+                    if (onPrefabSurface)
+                        groundY = (std::max)(groundY, prefabSurfaceY);
+                    const XMFLOAT3 preMovePosition = bandit->position;
                     bandit->Update(banditDeltaTime, target, groundY);
+                    // Keep an actor on the platform it started the frame on.
+                    // The navmesh is terrain-only, so steering happily walks a
+                    // bandit off a watchtower deck; without this it would path
+                    // straight over the edge and fall. Cancelling the move
+                    // leaves it at the ledge facing the player rather than
+                    // teleporting it back to the middle.
+                    if (onPrefabSurface && !bandit->Dead() && !bandit->Held()) {
+                        float steppedSurfaceY = 0.0f;
+                        const bool stillSupported = PrefabSurfaceSupports(
+                            bandit->position, prefabSurfaceY,
+                            kBanditLedgeProbeDrop, steppedSurfaceY);
+                        // A drop larger than a step down is a ledge, not a
+                        // ramp or a stair tread.
+                        if (!stillSupported ||
+                            prefabSurfaceY - steppedSurfaceY >
+                                kBanditMaxStepDown) {
+                            bandit->position.x = preMovePosition.x;
+                            bandit->position.z = preMovePosition.z;
+                            bandit->position.y = prefabSurfaceY;
+                        }
+                    }
                     ResolveBanditHumveeCollision(*bandit);
                 }
                 XMFLOAT3 shotOrigin, shotDirection;
@@ -19850,9 +19987,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 g_dxrDDGI.MarkLayoutDirty();
                 RebuildDXRDDGIProbeLayout(true);
             }
-        } else if (IsEditorEditing() &&
-                   g_editorVisualPrefabRefreshRequested) {
-            RebuildEditorPrefabVisualBatches(true);
+        } else if (IsEditorEditing() && !g_game.loading.Active() &&
+                   g_editorVisualRefreshRequested) {
+            // Use the same lightweight whole-viewport sync as an ordinary
+            // structural edit. This refreshes built-in editor visuals such as
+            // houses, barrels and vehicles as well as loading missing prefabs.
+            SynchronizeEditorRuntimeVisual(true);
         }
         // Editor buttons are processed here, before any scene pass binds the
         // old probe atlases. Rebuilding from the late ImGui phase destroyed
@@ -21603,7 +21743,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             if (actions.refreshVisuals) {
                 g_assetRegistry.Refresh();
                 g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
-                g_editorVisualPrefabRefreshRequested = true;
+                g_editorVisualRefreshRequested = true;
             }
             if (actions.rebuildDXRDDGI)
                 g_game.commands.Request(GameCommand::RebuildDDGI);

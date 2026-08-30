@@ -21,8 +21,8 @@ class Camera;
 struct LevelEditorActions {
     bool levelChanged = false;
     bool fullReconcile = false;
-    // Force the viewport to re-resolve every prefab model and rebuild its
-    // render batches, loading whatever is not cached yet.
+    // Force the viewport to rebuild its built-in and prefab visuals, loading
+    // whatever is not cached yet.
     //
     // The per-edit sync path deliberately skips model loading to stay cheap, so
     // a prefab placed before its .glb reached the cache draws nothing. That

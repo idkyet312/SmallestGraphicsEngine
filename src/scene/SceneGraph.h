@@ -31,6 +31,10 @@ struct SceneMaterial {
     std::string name;
     
     DirectX::XMFLOAT4 baseColorFactor = { 1.0f, 1.0f, 1.0f, 1.0f };
+    // glTF emissiveFactor premultiplied by KHR_materials_emissive_strength.
+    // Added to the lit result, so it stays visible in shadow (beacons, panel
+    // lights). Black by default, which is a no-op in the resolve.
+    DirectX::XMFLOAT3 emissiveFactor = { 0.0f, 0.0f, 0.0f };
     float metallicFactor = 1.0f;
     float roughnessFactor = 1.0f;
     bool doubleSided = false;

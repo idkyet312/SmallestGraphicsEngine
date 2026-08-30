@@ -797,6 +797,9 @@ public:
         if (!material) return 0;
         const auto updateParameters = [material](VBMaterialData& data) {
             data.baseColorFactor = material->baseColorFactor;
+            data.emissiveOcclusion.x = material->emissiveFactor.x;
+            data.emissiveOcclusion.y = material->emissiveFactor.y;
+            data.emissiveOcclusion.z = material->emissiveFactor.z;
             data.emissiveOcclusion.w = material->occlusionStrength;
             data.pbrParams = XMFLOAT4(material->metallicFactor,
                 material->roughnessFactor, material->normalYSign, 1.0f);
@@ -875,6 +878,9 @@ public:
 
         const auto updateParameters = [material](VBMaterialData& data) {
             data.baseColorFactor = material->baseColorFactor;
+            data.emissiveOcclusion.x = material->emissiveFactor.x;
+            data.emissiveOcclusion.y = material->emissiveFactor.y;
+            data.emissiveOcclusion.z = material->emissiveFactor.z;
             data.emissiveOcclusion.w = material->occlusionStrength;
             data.pbrParams = XMFLOAT4(material->metallicFactor,
                 material->roughnessFactor, material->normalYSign, 1.0f);
@@ -3966,7 +3972,11 @@ private:
 
         psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
-        psoDesc.RasterizerState.FrontCounterClockwise = FALSE;
+        // Imported glTF/FBX geometry is CCW-outward (glTF spec), matching the
+        // mesh-shader path. Culling with the DX12 default (CW front) would
+        // discard front faces and keep back faces, so solid props render
+        // inside-out. Inherited by the bindless vis PSOs created below.
+        psoDesc.RasterizerState.FrontCounterClockwise = TRUE;
         psoDesc.RasterizerState.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
         psoDesc.RasterizerState.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
         psoDesc.RasterizerState.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;

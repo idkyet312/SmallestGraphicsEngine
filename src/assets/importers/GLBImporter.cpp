@@ -1388,6 +1388,26 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLBInternal(
         sceneMat->metallicFactor = (float)mat.pbrMetallicRoughness.metallicFactor;
         sceneMat->doubleSided = mat.doubleSided;
 
+        // Emissive, premultiplied by KHR_materials_emissive_strength. Authoring
+        // tools export beacons and panel lights as a low emissiveFactor with a
+        // large strength multiplier, so dropping the extension renders them
+        // nearly black.
+        if (mat.emissiveFactor.size() == 3) {
+            float strength = 1.0f;
+            const auto emissiveExt =
+                mat.extensions.find("KHR_materials_emissive_strength");
+            if (emissiveExt != mat.extensions.end() &&
+                emissiveExt->second.Has("emissiveStrength")) {
+                const auto& value = emissiveExt->second.Get("emissiveStrength");
+                if (value.IsNumber())
+                    strength = (float)value.GetNumberAsDouble();
+            }
+            sceneMat->emissiveFactor = XMFLOAT3(
+                (float)mat.emissiveFactor[0] * strength,
+                (float)mat.emissiveFactor[1] * strength,
+                (float)mat.emissiveFactor[2] * strength);
+        }
+
         // Textures
         // Base Color
         int baseColorIdx = mat.pbrMetallicRoughness.baseColorTexture.index;
