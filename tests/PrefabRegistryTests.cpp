@@ -257,6 +257,23 @@ int main() {
             CHECK(barrack->targetSize == 0.0f);
             CHECK(std::filesystem::exists(barrack->modelPath));
         }
+
+        // The car park is a surface the player walks and drives on top of
+        // (measured 28.2 x 1.0 x 52.1 m, 2142 triangles), so it keeps its
+        // authored size and takes per-triangle collision: a box would bury the
+        // deck under its own bounding volume. It is also an open shell -- 1574
+        // up-facing triangles and no underside at all -- so it needs
+        // forceDoubleSided; without it the no-cull forward pass shades the slab
+        // inside-out.
+        const PrefabAsset* carpark = shipped.Find("props/carpark_asphalt");
+        CHECK(carpark != nullptr);
+        if (carpark) {
+            CHECK(carpark->error.empty());
+            CHECK(carpark->collision == "mesh");
+            CHECK(carpark->targetSize == 0.0f);
+            CHECK(carpark->forceDoubleSided);
+            CHECK(std::filesystem::exists(carpark->modelPath));
+        }
     }
 
     std::error_code ignored;
