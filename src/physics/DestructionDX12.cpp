@@ -4017,7 +4017,10 @@ void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float rad
 
 void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius,
                                      float damage, float impulse) {
-    if (!m->initialized) return;
+    // A level with no destructible geometry initializes the physics world
+    // without a Blast group, so there is nothing to fracture and the
+    // unconditional group->process() below would dereference null.
+    if (!m->initialized || !m->group) return;
     (void)damage;  // explosion fully severs pieces in range rather than chipping
     m->lastDamagePosition = worldPosition;
     m->lastDamageRadius = radius;
@@ -4106,7 +4109,9 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
 
 void DestructionDX12::ReleaseProtectedChunks(const XMFLOAT3& worldPosition,
                                              float radius) {
-    if (!m->initialized) return;
+    // As ApplyExplosion: no Blast group means no chunks to release, and the
+    // group->process() below is unconditional.
+    if (!m->initialized || !m->group) return;
     const float radiusSquared = radius * radius;
 
     // Pass 1: strip protection in world space. Chunk bounds live in destruction
