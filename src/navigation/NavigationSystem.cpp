@@ -129,20 +129,30 @@ bool NavigationSystem::BuildTerrain(
     rcMarkWalkableTriangles(&context, cfg.walkableSlopeAngle, vertices.data(),
                             static_cast<int>(vertices.size() / 3), triangles.data(),
                             triangleCount, areas.data());
+    // Which obstacles actually removed ground. An obstacle that clears nothing
+    // is either smaller than the sample spacing or sitting off the terrain, and
+    // either way the prop it stands for will not block pathing -- worth saying
+    // out loud rather than leaving as a navmesh that silently runs through it.
+    std::vector<int> clearedPerObstacle(obstacles.size(), 0);
     for (int i = 0; i < triangleCount; ++i) {
         const int* tri = triangles.data() + i * 3;
         const float centerX = (vertices[tri[0]*3] + vertices[tri[1]*3] +
                                vertices[tri[2]*3]) / 3.0f;
         const float centerZ = (vertices[tri[0]*3+2] + vertices[tri[1]*3+2] +
                                vertices[tri[2]*3+2]) / 3.0f;
-        for (const NavigationObstacle& obstacle : obstacles) {
+        for (size_t o = 0; o < obstacles.size(); ++o) {
+            const NavigationObstacle& obstacle = obstacles[o];
             if (centerX >= obstacle.minX && centerX <= obstacle.maxX &&
                 centerZ >= obstacle.minZ && centerZ <= obstacle.maxZ) {
                 areas[i] = RC_NULL_AREA;
+                ++clearedPerObstacle[o];
                 break;
             }
         }
     }
+    int ineffectiveObstacles = 0;
+    for (const int cleared : clearedPerObstacle)
+        if (cleared == 0) ++ineffectiveObstacles;
     if (!rcRasterizeTriangles(&context, vertices.data(),
                               static_cast<int>(vertices.size() / 3), triangles.data(),
                               areas.data(), triangleCount, *solid, cfg.walkableClimb)) return false;
@@ -210,7 +220,11 @@ bool NavigationSystem::BuildTerrain(
         return false;
     }
     std::cout << "Navigation ready: " << mesh->npolys << " polygons, "
-              << obstacles.size() << " blocked regions\n";
+              << obstacles.size() << " blocked regions";
+    if (ineffectiveObstacles > 0)
+        std::cout << " (" << ineffectiveObstacles
+                  << " cleared no ground; those props will not block pathing)";
+    std::cout << "\n";
     return true;
 }
 
