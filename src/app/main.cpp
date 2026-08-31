@@ -120,6 +120,7 @@ ProfilerDX12                g_profiler;
 static bool                 g_profileDumpEnabled = false;
 static bool                 g_profileDumpWritten = false;
 static UINT                 g_profileDumpFrame = 0;
+static bool                 g_forceTerrainErrorLOD = false;
 UINT                        g_forwardDrawCalls = 0;
 UINT                        g_shadowDrawCalls = 0;
 UINT                        g_visibilityDrawCalls = 0;
@@ -331,6 +332,11 @@ static DeferredReleaseQueue<RetiredPrefabResources>
     g_retiredPrefabResources;
 static std::unordered_set<std::string> g_prefabMeshFallbackWarnings;
 static bool                 g_prefabRebuildRequested = true;
+// Which call site last asked for a rebuild. A full rebuild reloads every model
+// and re-inits every audio player, so when one shows up in a frame spike the
+// first question is always who asked for it -- and the flag alone cannot say.
+// Points at a string literal; never freed.
+static const char*          g_prefabRebuildReason = "startup";
 static bool                 g_prefabRuntimeSmokeEnabled = false;
 static bool                 g_prefabRuntimeSmokeChecked = false;
 // SGE_COLLISION_TEST: load the Training Range, report the airport's collision
@@ -1000,6 +1006,20 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
     // to the clipmap topology, so it ORs onto whichever they selected.
     if (scene.terrainFlat)
         params.terrainStyle |= TerrainRendererDX12::kStyleFlat;
+    const bool deploymentOverview =
+        (params.terrainStyle & TerrainRendererDX12::kStyleDeploymentOverview) != 0u;
+    if (!deploymentOverview &&
+        (scene.terrainErrorLOD || g_forceTerrainErrorLOD)) {
+        params.terrainStyle |= TerrainRendererDX12::kStyleErrorLOD;
+        switch (g_forwardQuality.Tier()) {
+            case ForwardExtensionQualityTier::Balanced:    params.lodNear = 3.0f; break;
+            case ForwardExtensionQualityTier::Performance: params.lodNear = 6.0f; break;
+            default:                                       params.lodNear = 1.5f; break;
+        }
+        // Error mode combines this viewport height with projection[1][1] to
+        // convert the measured world-space deviation into screen pixels.
+        params.lodStep = static_cast<float>((std::max)(1u, SCR_HEIGHT));
+    }
     return params;
 }
 
@@ -1029,12 +1049,23 @@ static void AddExplosionTerrainCrater(const XMFLOAT3& impact) {
     // At capacity, drop the OLDEST crater rather than rejecting the new one --
     // a barrel that explodes must always leave a hole. SetSculptStamps trims
     // from the front too, so CPU collision and the GPU buffer stay in sync.
-    g_game.world.AddRuntimeTerrainStamp(crater);
-    g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
+    {
+        ProfilerDX12::CpuScope craterStampProfile(g_profiler, "Crater/Stamp");
+        g_game.world.AddRuntimeTerrainStamp(crater);
+        // Incremental: pushing the whole set back would re-walk every heightmap
+        // stamp's residency, which on a baked level is what stalled the
+        // explosion. Both sides trim the oldest at capacity, so they stay in
+        // step.
+        g_terrain.AddRuntimeSculptStamp(crater);
+    }
     g_terrainDeformedThisFrame = true;
     const float foliageRadius = crater.radius * 0.5f;
-    g_grass.AddRuntimeExclusion(impact.x, impact.z, foliageRadius);
-    g_trees.ApplyExplosion(impact, foliageRadius);
+    {
+        ProfilerDX12::CpuScope craterFoliageProfile(
+            g_profiler, "Crater/Foliage");
+        g_grass.AddRuntimeExclusion(impact.x, impact.z, foliageRadius);
+        g_trees.ApplyExplosion(impact, foliageRadius);
+    }
 }
 
 // Gouges the ground where the BlackHawk went in. Three overlapping stamps laid
@@ -1075,6 +1106,7 @@ static void AddBlackHawkCrashCraters(const XMFLOAT3& impact, float yaw) {
         stamp.value = gouge.depth * scale;
         stamp.strength = 1.0f;
         g_game.world.AddRuntimeTerrainStamp(stamp);
+        g_terrain.AddRuntimeSculptStamp(stamp);
 
         // Scrub foliage out of the furrow so grass and palms are not left
         // standing in a trench the helicopter just carved.
@@ -1082,8 +1114,8 @@ static void AddBlackHawkCrashCraters(const XMFLOAT3& impact, float yaw) {
         g_trees.ApplyExplosion({ stamp.x, impact.y, stamp.z },
                                stamp.radius * 0.6f);
     }
-    // One upload for all three, rather than re-syncing per stamp.
-    g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
+    // The three gouges went in above via AddRuntimeSculptStamp, which bumps the
+    // revision each time; the buffer uploads once for the frame regardless.
     g_terrainDeformedThisFrame = true;
 }
 
@@ -5493,6 +5525,7 @@ static void UpdateMolotovFireDamage() {
         if (result.destroyed) {
             scene.SpawnSmokeBurst(material->position, 1.35f, 0.55f);
             g_prefabRebuildRequested = true;
+            g_prefabRebuildReason = "fire destroyed prefab";
             SGE_LOG("LogPrefab", EngineLog::Level::Display,
                 "Fire destroyed prefab entity " +
                 std::to_string(material->entityId));
@@ -6100,7 +6133,10 @@ static void QueueWaterBathymetry() {
     const float waterSurfaceY = g_ocean.GetSurfaceY();
     const uint64_t surfaceRevision = static_cast<uint64_t>(
         static_cast<int64_t>(std::lround(waterSurfaceY * 1000.0f)));
-    desc.terrainRevision = TerrainRendererDX12::SculptRevision() ^
+    // Runtime crater/gouge stamps update the terrain buffer but deliberately do
+    // not advance this revision. Re-running the full shoreline distance solve
+    // for a local blast dimple caused the multi-second grenade hitch.
+    desc.terrainRevision = TerrainRendererDX12::BathymetryRevision() ^
         (scaleX << 32) ^ (scaleZ << 16) ^ terrain.terrainStyle ^
         (surfaceRevision * 0x9e3779b97f4a7c15ull);
     desc.heightAt = [terrain, waterSurfaceY](float x, float z) {
@@ -8651,6 +8687,83 @@ static std::shared_ptr<SceneNode> CloneSceneNodeShallow(
 // collide with a real (small, sequential) level entity id.
 static constexpr uint64_t kAATurretEntityId = 0x4141545552524554ull;
 
+static void RebuildRuntimePrefabLights();
+
+// Drops one destroyed entity out of the prefab runtime lists in place.
+//
+// A blast that destroys a prop used to set g_prefabRebuildRequested, which runs
+// RebuildPrefabRenderBatches: it reloads every prefab model, re-derives every
+// collider and re-initializes every audio player for the whole level. Measured
+// at 385 ms and, in one case, 19 s -- the entire cost of the grenade hitch.
+//
+// Nothing about that work is needed to stop drawing a single prop. Every prefab
+// runtime list is keyed by entityId, so the entity is removed directly. Batches
+// keep transforms and ids as parallel arrays, so the erase has to hit both at
+// the same index or instances would render with another entity's transform.
+//
+// Returns true if anything was actually removed, so callers can tell a
+// no-op (an entity that was never batched) from a real removal.
+static bool RemovePrefabEntityFromRuntime(uint64_t entityId) {
+    bool removed = false;
+    for (PrefabRenderBatch& batch : g_prefabRenderBatches) {
+        for (size_t i = batch.entityIds.size(); i-- > 0;) {
+            if (batch.entityIds[i] != entityId) continue;
+            batch.entityIds.erase(batch.entityIds.begin() + i);
+            // transforms and baseTransforms are parallel to entityIds, but a
+            // batch can legitimately carry fewer of them (the Cornell box seeds
+            // one transform with a synthetic id), so guard each.
+            if (i < batch.transforms.size())
+                batch.transforms.erase(batch.transforms.begin() + i);
+            if (i < batch.baseTransforms.size())
+                batch.baseTransforms.erase(batch.baseTransforms.begin() + i);
+            removed = true;
+        }
+    }
+    const auto dropById = [&](auto& container) {
+        const size_t before = container.size();
+        container.erase(
+            std::remove_if(container.begin(), container.end(),
+                [entityId](const auto& item) {
+                    return item.entityId == entityId;
+                }),
+            container.end());
+        if (container.size() != before) removed = true;
+    };
+    dropById(g_prefabColliders);
+    dropById(g_prefabMeshColliders);
+    dropById(g_prefabLightInstances);
+    dropById(g_prefabDestructibles);
+    dropById(g_prefabSpawnPoints);
+    g_meshCollisionEntities.erase(entityId);
+    g_prefabHealth.erase(entityId);
+
+    // Audio players index into g_prefabAudioEmitters, so the emitters cannot be
+    // erased without invalidating those indices. Stop and drop this entity's
+    // players first, then erase the emitters back to front and fix up the
+    // indices that shifted.
+    for (size_t emitterIndex = g_prefabAudioEmitters.size();
+         emitterIndex-- > 0;) {
+        if (g_prefabAudioEmitters[emitterIndex].entityId != entityId) continue;
+        g_prefabAudioPlayers.erase(
+            std::remove_if(g_prefabAudioPlayers.begin(),
+                g_prefabAudioPlayers.end(),
+                [emitterIndex](const PrefabAudioPlayer& player) {
+                    return player.emitterIndex == emitterIndex;
+                }),
+            g_prefabAudioPlayers.end());
+        g_prefabAudioEmitters.erase(
+            g_prefabAudioEmitters.begin() + emitterIndex);
+        for (PrefabAudioPlayer& player : g_prefabAudioPlayers)
+            if (player.emitterIndex > emitterIndex) --player.emitterIndex;
+        removed = true;
+    }
+
+    // The lights list feeds the clustered renderer, which is only refreshed by
+    // a rebuild. Re-push what is left rather than leaving a dead light lit.
+    if (removed) RebuildRuntimePrefabLights();
+    return removed;
+}
+
 static void RebuildRuntimePrefabLights() {
     scene.RebuildDemoLights();
     if (g_ddgiCornellTestMode) {
@@ -8929,7 +9042,12 @@ static void RebuildPrefabRenderBatches() {
                 "Level entity references missing prefab: " + prefabId);
             return;
         }
-        PrefabModelCacheEntry* cachedModel = LoadPrefabModel(*prefab);
+        PrefabModelCacheEntry* cachedModel = nullptr;
+        {
+            ProfilerDX12::CpuScope modelLoadProfile(
+                g_profiler, "PrefabRebuild/ModelLoad");
+            cachedModel = LoadPrefabModel(*prefab);
+        }
         if (!cachedModel) return;
         const nlohmann::json components = MergePrefabComponents(
             prefab->components, overrides);
@@ -9098,6 +9216,8 @@ static void RebuildPrefabRenderBatches() {
                     !cachedModel->collisionMesh->Empty()) {
                     CollisionMeshInstance instance;
                     instance.entityId = entityId;
+                    ProfilerDX12::CpuScope collisionInitProfile(
+                        g_profiler, "PrefabRebuild/CollisionInit");
                     InitializeCollisionMeshInstance(
                         instance, *cachedModel->collisionMesh, world);
                     g_prefabMeshColliders.push_back(instance);
@@ -9180,6 +9300,8 @@ static void RebuildPrefabRenderBatches() {
                  nlohmann::json::object(), depth + 1);
         }
     };
+    std::optional<ProfilerDX12::CpuScope> entityLoopProfile;
+    entityLoopProfile.emplace(g_profiler, "PrefabRebuild/Entities");
     for (const LevelEntity& entity : g_game.world.Level().entities) {
         if (!entity.enabled) continue;
         std::string prefabId;
@@ -9280,15 +9402,26 @@ static void RebuildPrefabRenderBatches() {
             g_prefabRenderBatches.push_back(std::move(batch));
         }
     }
-    RebuildRuntimePrefabLights();
-    for (size_t emitterIndex = 0; emitterIndex < g_prefabAudioEmitters.size();
-         ++emitterIndex) {
-        const PrefabAudioEmitter& emitter = g_prefabAudioEmitters[emitterIndex];
-        auto player = std::make_unique<GunAudio>();
-        if (player->Initialize(emitter.path)) {
-            if (emitter.loop) player->SetLoop(true, 0.0f);
-            else player->Play(0.7f);
-            g_prefabAudioPlayers.push_back({ emitterIndex, std::move(player) });
+    entityLoopProfile.reset();
+    {
+        ProfilerDX12::CpuScope lightsProfile(
+            g_profiler, "PrefabRebuild/Lights");
+        RebuildRuntimePrefabLights();
+    }
+    {
+        ProfilerDX12::CpuScope audioProfile(
+            g_profiler, "PrefabRebuild/Audio");
+        for (size_t emitterIndex = 0;
+             emitterIndex < g_prefabAudioEmitters.size(); ++emitterIndex) {
+            const PrefabAudioEmitter& emitter =
+                g_prefabAudioEmitters[emitterIndex];
+            auto player = std::make_unique<GunAudio>();
+            if (player->Initialize(emitter.path)) {
+                if (emitter.loop) player->SetLoop(true, 0.0f);
+                else player->Play(0.7f);
+                g_prefabAudioPlayers.push_back(
+                    { emitterIndex, std::move(player) });
+            }
         }
     }
     g_prefabRebuildRequested = false;
@@ -11133,7 +11266,17 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
         if (downedPlane) OnObjectivePlaneResolved();
         if (isCommTower) CollapseCommTower(towerBase);
         else if (!downedPlane) scene.SpawnSmokeBurst(hit, 1.2f, 0.45f);
-        if (!downedPlane) g_prefabRebuildRequested = true;
+        // Same targeted removal as the radius path: a felled comm tower still
+        // needs the full rebuild, since its geometry is handed to the
+        // destruction model, but an ordinary prop only has to stop drawing.
+        if (!downedPlane) {
+            if (isCommTower || !RemovePrefabEntityFromRuntime(entityId)) {
+                g_prefabRebuildRequested = true;
+                g_prefabRebuildReason = isCommTower
+                    ? "comm tower felled (direct)"
+                    : "prefab destroyed (direct, removal missed)";
+            }
+        }
         SGE_LOG("LogPrefab", EngineLog::Level::Display,
             "Destroyed prefab entity " + std::to_string(entityId));
     }
@@ -11167,6 +11310,7 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
             g_exfilHereDelay = kExfilHereDelay;
             CollapseCommTower(towerBase);
             g_prefabRebuildRequested = true;
+            g_prefabRebuildReason = "comm tower felled (radius)";
             continue;
         }
         if (g_game.session.TimerRunning())
@@ -11189,7 +11333,16 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
             continue;
         }
         scene.SpawnSmokeBurst(result.effectPosition, 1.2f, 0.45f);
-        g_prefabRebuildRequested = true;
+        // Remove just this entity instead of requesting a full rebuild. The
+        // rebuild reloads every model and re-inits every audio player in the
+        // level -- hundreds of ms to seconds -- to accomplish what erasing one
+        // entry does. Fall back to the rebuild only if the entity was not found
+        // in the runtime lists, so anything the targeted path cannot express
+        // still resolves correctly rather than leaving a ghost prop.
+        if (!RemovePrefabEntityFromRuntime(result.entityId)) {
+            g_prefabRebuildRequested = true;
+            g_prefabRebuildReason = "prefab destroyed (radius, removal missed)";
+        }
         SGE_LOG("LogPrefab", EngineLog::Level::Display,
             "Destroyed prefab entity " + std::to_string(result.entityId));
     }
@@ -11926,6 +12079,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     lastY = (float)(rect.bottom - rect.top) * 0.5f;
     firstMouse = true;
     g_prefabRebuildRequested = true;
+    g_prefabRebuildReason = "level start";
 }
 
 static void StartCustomLevel(HWND hwnd, const std::filesystem::path& path) {
@@ -15232,6 +15386,10 @@ static bool SynchronizeEditorRuntimeLight(uint64_t changedEntityId = 0) {
 static void SynchronizeEditorRuntimeVisual(bool loadMissingModels = false) {
     if (g_game.session.Screen() != GameScreen::LevelEditor) return;
     ProfilerDX12::CpuScope syncVisualProfile(g_profiler, "Editor/SyncVisual");
+    // Only the editor writes stamp PNGs while running, so it is the only place
+    // that needs the on-disk re-check. In play that check is a filesystem stat
+    // per stamp on every crater.
+    TerrainRendererDX12::SetStampHotReloadEnabled(true);
     g_game.world.ReplaceFromEditor(g_levelEditor.Level());
     g_terrain.SetSculptStamps(g_game.world.TerrainSculpt());
     ApplyTerrainSplatMap(g_levelEditor.Level());
@@ -15243,6 +15401,10 @@ static void SynchronizeEditorRuntimeVisual(bool loadMissingModels = false) {
 static void SynchronizeEditorRuntime(bool play) {
     if (g_game.session.Screen() != GameScreen::LevelEditor) return;
     ProfilerDX12::CpuScope syncRuntimeProfile(g_profiler, "Editor/SyncRuntime");
+    // See SynchronizeEditorRuntimeVisual: authoring re-checks stamps on disk,
+    // play does not. Testing a level from the editor keeps it on, which is
+    // what makes a re-bake show up without leaving the editor.
+    TerrainRendererDX12::SetStampHotReloadEnabled(true);
     g_editorFullReconcileInFlight = true;
     // The prefab compile must run first because navmesh/grass consume its newly
     // compiled colliders. RebuildPrefabRenderBatches queues the environment pass
@@ -15261,6 +15423,7 @@ static void SynchronizeEditorRuntime(bool play) {
     }
     ApplyRuntimeLevelBasics(play);
     g_prefabRebuildRequested = true;
+    g_prefabRebuildReason = "editor runtime sync";
     if (g_houseTemplate) {
         WaitForGPU();
         wallModel = CloneSceneTree(g_houseTemplate);
@@ -15316,6 +15479,7 @@ static void StartLevelEditor(HWND hwnd, const std::filesystem::path& levelPath) 
     ReleaseCapture();
     SetCursorVisible(true);
     g_prefabRebuildRequested = true;
+    g_prefabRebuildReason = "editor stop play";
 }
 
 static void BeginEditorPlaytest(HWND hwnd) {
@@ -15707,7 +15871,10 @@ static void LogFrameSpike(float deltaTimeSeconds) {
                 return a.milliseconds > b.milliseconds;
             });
         log << " " << label << "=[";
-        for (size_t i = 0; i < sorted.size() && i < 5; ++i) {
+        // 5 was too few to attribute a spike: a nested scope's own phases sort
+        // below the outer scope plus the always-present ImGui/post entries, so
+        // the breakdown that explains the cost is exactly what got cut.
+        for (size_t i = 0; i < sorted.size() && i < 12; ++i) {
             if (i) log << ", ";
             log << sorted[i].name << ":" << std::setprecision(2) << sorted[i].milliseconds << "ms";
         }
@@ -17223,6 +17390,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         std::cerr << "GPU profiler unavailable; CPU profiling remains active\n";
     g_profileDumpEnabled =
         GetEnvironmentVariableA("SGE_PROFILE_DUMP", nullptr, 0) > 0;
+    g_forceTerrainErrorLOD =
+        GetEnvironmentVariableA("SGE_TERRAIN_ERROR_LOD", nullptr, 0) > 0;
     scene.cacheFarShadowCascades =
         GetEnvironmentVariableA("SGE_CACHE_FAR_SHADOWS", nullptr, 0) > 0;
     g_gunAudio.Initialize("Content/Audio/rifle_shot.wav");
@@ -17693,6 +17862,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     UINT particleBenchmarkSamples = 0;
     double particleBenchmarkCpuMs = 0.0;
     double particleBenchmarkGpuMs = 0.0;
+    const bool terrainLODBenchmark =
+        GetEnvironmentVariableA("SGE_TERRAIN_LOD_BENCHMARK", nullptr, 0) > 0;
+    UINT terrainLODBenchmarkFrames = 0;
+    bool terrainLODBenchmarkComplete = false;
+    std::vector<double> terrainLODScopeSamples;
+    std::vector<double> terrainLODFrameSamples;
+    std::vector<double> terrainLODShadowSamples;
     const bool molotovSmokeTest =
         GetEnvironmentVariableA("SGE_MOLOTOV_TEST", nullptr, 0) > 0;
     bool molotovSmokeInjected = false;
@@ -17780,6 +17956,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             rock.transform.position[2] = 6.0f;
             g_game.world.Level().entities.push_back(std::move(rock));
             g_prefabRebuildRequested = true;
+            g_prefabRebuildReason = "prefab smoke test";
             SGE_LOG("LogPrefab", EngineLog::Level::Display,
                 "Prefab smoke test injected rock instance");
         }
@@ -17890,6 +18067,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     g_dx12.lastDirectFenceValue, std::move(retired));
                 g_game.world.Prefabs().ClearDerived();
                 g_prefabRebuildRequested = true;
+                g_prefabRebuildReason = "asset change detected";
                 SGE_LOG("LogPrefab", EngineLog::Level::Display,
                     "Asset change detected; prefab cache reloading");
             }
@@ -19354,10 +19532,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         }
                         if (projectile.grenade)
                             AddExplosionTerrainCrater(center);
-                        scene.SpawnExplosionFX(
-                            { center.x, center.y + 0.6f, center.z },
-                            blastRadius * 1.6f, c4Blast ? 1.05f : 0.9f,
-                            projectile.grenade);
+                        {
+                            ProfilerDX12::CpuScope blastFXProfile(
+                                g_profiler, "Blast/FX");
+                            scene.SpawnExplosionFX(
+                                { center.x, center.y + 0.6f, center.z },
+                                blastRadius * 1.6f, c4Blast ? 1.05f : 0.9f,
+                                projectile.grenade);
+                        }
                         if (!g_emptyLevelMode)
                         for (size_t i = 0; i < scene.explosiveBarrels.size(); ++i) {
                             const ExplosiveBarrel& barrel = scene.explosiveBarrels[i];
@@ -19492,14 +19674,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         // ragdolls now, so same blast launches their limbs too.
                         g_destruction.ApplyExplosion(
                             center, blastRadius, blastDamage, blastImpulse);
-                        g_destruction.ApplyRagdollExplosion(
-                            center, enemyRadius,
-                            c4Blast ? 175.0f : scene.grenadeEnemyImpulse);
+                        {
+                            ProfilerDX12::CpuScope ragdollProfile(
+                                g_profiler, "Blast/Ragdoll");
+                            g_destruction.ApplyRagdollExplosion(
+                                center, enemyRadius,
+                                c4Blast ? 175.0f : scene.grenadeEnemyImpulse);
+                        }
                         // Only a remote charge can fell the comm tower; frag
                         // grenades and rockets leave it standing.
-                        DamagePrefabsInRadius(
-                            center, blastRadius, blastDamage, c4Blast,
-                            !projectile.hostile);
+                        {
+                            ProfilerDX12::CpuScope prefabDamageProfile(
+                                g_profiler, "Blast/PrefabDamage");
+                            DamagePrefabsInRadius(
+                                center, blastRadius, blastDamage, c4Blast,
+                                !projectile.hostile);
+                        }
                         // A charge stuck to the mast is a demolition, and one
                         // charge is enough. The radius pass above cannot do it:
                         // it measures to the entity origin, which for a 26 m
@@ -20318,8 +20508,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // driver dereferences freed memory (access violation deep in the
             // D3D12/driver DLL) - exactly the crash seen when duplicating a rock.
             // Idle the GPU first so nothing in flight points at what we replace.
-            WaitForGPU();
-            RebuildPrefabRenderBatches();
+            {
+                ProfilerDX12::CpuScope rebuildWaitProfile(
+                    g_profiler, "PrefabRebuild/WaitGPU");
+                WaitForGPU();
+            }
+            SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                std::string("Prefab rebuild running, requested by: ") +
+                    (g_prefabRebuildReason ? g_prefabRebuildReason
+                                           : "unknown"));
+            {
+                ProfilerDX12::CpuScope rebuildProfile(
+                    g_profiler, "PrefabRebuild/Batches");
+                RebuildPrefabRenderBatches();
+            }
             if (g_ddgiCornellTestMode) {
                 g_dxrDDGI.MarkLayoutDirty();
                 RebuildDXRDDGIProbeLayout(true);
@@ -20551,7 +20753,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // the ground that used to be there.
         if (g_terrainDeformedThisFrame) {
             visBuffer.NotifyTerrainDeformed();
-            shadowMap.InvalidateCachedCascades();
+            // Staggered: dropping every cached cascade in the same frame as the
+            // explosion is a measured multi-hundred-ms GPU spike, and a crater
+            // does not need the distant cascades updated on that exact frame.
+            shadowMap.InvalidateCachedCascadesStaggered();
             g_terrainDeformedThisFrame = false;
         }
         visBuffer.aoTemporalMotionVectors = usingVisibility &&
@@ -20839,6 +21044,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 ResetPalmTrees();
 
                 LoadDandelionModel();
+                g_prefabRebuildReason = "island scale changed";
                 g_prefabRebuildRequested = true;
                 RebuildScalableEnvironment();
             }
@@ -22148,6 +22354,51 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 }
                 dump << "--- sum of passes: " << total << " ms ---\n";
                 g_profileDumpWritten = true;
+            }
+        }
+        // Repeatable terrain A/B: run the same settled Level-1 view once with
+        // SGE_TERRAIN_ERROR_LOD absent and once with it set. Separate launches
+        // avoid changing topology inside an in-flight frame, while identical
+        // warm-up/sample counts keep shader caches and GPU clocks comparable.
+        if (terrainLODBenchmark && !terrainLODBenchmarkComplete &&
+            g_game.session.Screen() == GameScreen::Level1 &&
+            !g_game.loading.Active()) {
+            ++terrainLODBenchmarkFrames;
+            if (terrainLODBenchmarkFrames > 240) {
+                const double vbTerrain = g_profiler.GpuScopeMs("VB Terrain");
+                const double forwardTerrain = g_profiler.GpuScopeMs("Terrain");
+                const double terrainMs = vbTerrain > 0.0 ? vbTerrain : forwardTerrain;
+                if (terrainMs > 0.0 && g_profiler.GpuFrameMs() > 0.0) {
+                    terrainLODScopeSamples.push_back(terrainMs);
+                    terrainLODFrameSamples.push_back(g_profiler.GpuFrameMs());
+                    terrainLODShadowSamples.push_back(
+                        g_profiler.GpuScopeMs("Shadow"));
+                }
+            }
+            if (terrainLODScopeSamples.size() >= 300) {
+                const char* filename = g_forceTerrainErrorLOD
+                    ? "terrain_lod_adaptive.log" : "terrain_lod_baseline.log";
+                std::ofstream log(filename, std::ios::trunc);
+                log << "mode=" << (g_forceTerrainErrorLOD ? "adaptive" : "baseline")
+                    << '\n' << "samples=" << terrainLODScopeSamples.size() << '\n';
+                auto writeStats = [&log](const char* label,
+                                         const std::vector<double>& source) {
+                    std::vector<double> values = source;
+                    std::sort(values.begin(), values.end());
+                    double sum = 0.0;
+                    for (double value : values) sum += value;
+                    const size_t p50 = (values.size() - 1) / 2;
+                    const size_t p95 = static_cast<size_t>(
+                        static_cast<double>(values.size() - 1) * 0.95);
+                    log << label << "_avg_ms=" << sum / values.size() << '\n'
+                        << label << "_p50_ms=" << values[p50] << '\n'
+                        << label << "_p95_ms=" << values[p95] << '\n';
+                };
+                writeStats("terrain", terrainLODScopeSamples);
+                writeStats("frame", terrainLODFrameSamples);
+                writeStats("shadow", terrainLODShadowSamples);
+                terrainLODBenchmarkComplete = true;
+                PostQuitMessage(0);
             }
         }
         ImGui_ImplDX12_NewFrame();

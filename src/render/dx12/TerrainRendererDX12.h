@@ -67,10 +67,11 @@ public:
         float rotation = 0.0f;
         float replace = 0.0f;
         float baseHeight = 0.0f;
+        float edgeFalloff = 0.82f;
     };
     // Must match TerrainSculptStamp in terrain_ms.hlsl -- a StructuredBuffer
     // read with a mismatched stride silently shears every stamp after the first.
-    static_assert(sizeof(SculptGPU) == 40);
+    static_assert(sizeof(SculptGPU) == 44);
 
     ComPtr<ID3D12PipelineState> pso;
     ComPtr<ID3D12PipelineState> psoWireframe;
@@ -114,6 +115,12 @@ public:
     std::array<ComPtr<ID3D12Resource>, FRAME_COUNT> stampAtlasBuffers;
     std::array<uint64_t, FRAME_COUNT> uploadedSculptRevision_{};
     std::array<uint64_t, FRAME_COUNT> uploadedStampAtlasRevision_{};
+    // Texel span of s_stampAtlas each frame buffer still has to pick up, as an
+    // inclusive [first, last]. Held per frame because frames upload at
+    // different times and so miss different loads. Static to match the loader,
+    // which is static and has no instance to reach. Starts inverted (empty).
+    inline static std::array<size_t, FRAME_COUNT> dirtyAtlasFirst_{};
+    inline static std::array<size_t, FRAME_COUNT> dirtyAtlasLast_{};
     std::array<ComPtr<ID3D12Resource>, 3> terrainUploads;
     D3D12_GPU_DESCRIPTOR_HANDLE terrainTextureTable{};
     bool supported = false;
@@ -312,6 +319,39 @@ public:
         for (const TerrainSculptStamp& stamp : s_sculptStamps)
             if (stamp.operation == TerrainSculptOperation::Heightmap)
                 EnsureHeightStampLoaded(stamp.texture);
+        RefreshSculptDisplacement(true);
+    }
+
+    // Adds one runtime stamp without re-running the heightmap residency sweep.
+    //
+    // Craters are Add stamps and never name a texture, so SetSculptStamps'
+    // EnsureHeightStampLoaded loop can only find textures that are already
+    // resident -- but it still walks every heightmap stamp to discover that, and
+    // it runs on every explosion. With a baked level that sweep reaches the bake
+    // slot's load path, which is where the 1-2 s stall came from.
+    void AddRuntimeSculptStamp(const TerrainSculptStamp& stamp) {
+        if (s_sculptStamps.size() >= kMaxTerrainSculptStamps)
+            s_sculptStamps.erase(s_sculptStamps.begin());
+        // A heightmap stamp added at runtime would still need its texture
+        // resident; nothing does that today, but route it correctly if it ever
+        // does rather than silently drawing nothing.
+        if (stamp.operation == TerrainSculptOperation::Heightmap)
+            EnsureHeightStampLoaded(stamp.texture);
+        s_sculptStamps.push_back(stamp);
+        // Runtime Add stamps are local blast/crash dimples. Rebuilding the
+        // ocean's whole shoreline distance field for one of them costs seconds
+        // and cannot change the authored coastline in a meaningful way. A
+        // future runtime replace/heightmap still takes the conservative path.
+        RefreshSculptDisplacement(
+            stamp.operation != TerrainSculptOperation::Add);
+    }
+
+private:
+    // Recomputes the vertical reach terrain_as.hlsl culls against, then bumps
+    // the revision so the GPU buffer re-uploads. Bathymetry has a separate
+    // revision because its full shoreline solve is far too expensive for small
+    // transient crater stamps.
+    void RefreshSculptDisplacement(bool affectsBathymetry) {
         m_sculptMaxDisplacement = 0.0f;
         for (const TerrainSculptStamp& stamp : s_sculptStamps) {
             if (stamp.operation == TerrainSculptOperation::Add ||
@@ -328,8 +368,10 @@ public:
                     std::abs(stamp.value) + 12.0f);
         }
         ++s_sculptRevision;
+        if (affectsBathymetry) ++s_bathymetryRevision;
     }
 
+public:
     void SetMSAAEnabled(bool enabled) {
         msaaEnabled = enabled && msaaSupported;
     }
@@ -353,6 +395,10 @@ public:
     // LOD 0 and morph 0. CurrentTerrainParams also selects a uniform-density
     // grid for this mode, so "LOD 0" cannot still conceal larger outer tiles.
     static constexpr UINT kStyleDeploymentOverview = 8u;
+    // bit 4 (16) = opt-in projected-error LOD with stitched internal edges.
+    // lodNear is target pixel error and lodStep is viewport height in this mode;
+    // the legacy path retains their distance-band meanings.
+    static constexpr UINT kStyleErrorLOD = 16u;
     static bool IsFlat(UINT terrainStyle) {
         return (terrainStyle & kStyleFlat) != 0u;
     }
@@ -364,6 +410,7 @@ public:
     }
 
     static uint64_t SculptRevision() { return s_sculptRevision; }
+    static uint64_t BathymetryRevision() { return s_bathymetryRevision; }
 
     // CPU mirror of terrain_ms.hlsl's height function (hash21/noise2/fbm/
     // TerrainHeight), used for walking collision. Keep the two in sync - any
@@ -599,8 +646,9 @@ public:
                     IID_PPV_ARGS(&sculptBuffers[frame])))) return false;
             UploadSculptStamps(frame);
         }
-        desc.Width = static_cast<UINT64>(kMaxTerrainStampTextures) *
-            kTerrainStampResolution * kTerrainStampResolution * sizeof(uint16_t);
+        // Atlas layers plus the appended high-resolution bake slot.
+        desc.Width = static_cast<UINT64>(kTerrainStampAtlasTexels) *
+            sizeof(uint16_t);
         for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
             if (FAILED(g_dx12.device->CreateCommittedResource(&heap,
                     D3D12_HEAP_FLAG_NONE, &desc,
@@ -623,7 +671,7 @@ public:
             destination[i] = { source.x, source.z, source.radius,
                 static_cast<UINT>(source.operation), source.value, source.strength,
                 FindHeightStampLayer(source.texture), source.rotation,
-                source.replace, source.baseHeight };
+                source.replace, source.baseHeight, source.edgeFalloff };
         }
         sculptBuffers[frame]->Unmap(0, nullptr);
         uploadedSculptRevision_[frame] = s_sculptRevision;
@@ -633,15 +681,54 @@ public:
         if (frame >= FRAME_COUNT || !stampAtlasBuffers[frame] ||
             uploadedStampAtlasRevision_[frame] == s_stampAtlasRevision)
             return;
+        // Copy only the texels that actually changed. The atlas is 67 MB once
+        // the 4K bake slot is included, and a stamp load dirties one 512 layer
+        // (0.5 MB) or the bake slot; copying the whole buffer per frame-in-
+        // flight on every load was most of the cost of touching a stamp.
+        //
+        // The dirty span is tracked per frame because each frame buffer may
+        // have missed a different set of loads. A frame that has never uploaded
+        // (revision 0) takes the whole buffer.
+        size_t firstTexel = 0;
+        size_t lastTexel = s_stampAtlas.size();
+        if (uploadedStampAtlasRevision_[frame] != 0 &&
+            dirtyAtlasFirst_[frame] <= dirtyAtlasLast_[frame]) {
+            firstTexel = dirtyAtlasFirst_[frame];
+            lastTexel = dirtyAtlasLast_[frame] + 1;
+        }
+        if (firstTexel >= lastTexel) {
+            uploadedStampAtlasRevision_[frame] = s_stampAtlasRevision;
+            return;
+        }
         void* destination = nullptr;
+        // Map with an empty read range: this is an upload heap and nothing
+        // reads back, so the driver must not fault the old contents in.
         D3D12_RANGE readRange{ 0, 0 };
         if (FAILED(stampAtlasBuffers[frame]->Map(0, &readRange, &destination)))
             return;
-        const size_t bytes = s_stampAtlas.size() * sizeof(uint16_t);
-        std::memcpy(destination, s_stampAtlas.data(), bytes);
-        D3D12_RANGE writtenRange{ 0, bytes };
+        const size_t offset = firstTexel * sizeof(uint16_t);
+        const size_t bytes = (lastTexel - firstTexel) * sizeof(uint16_t);
+        std::memcpy(static_cast<uint8_t*>(destination) + offset,
+                    s_stampAtlas.data() + firstTexel, bytes);
+        D3D12_RANGE writtenRange{ offset, offset + bytes };
         stampAtlasBuffers[frame]->Unmap(0, &writtenRange);
         uploadedStampAtlasRevision_[frame] = s_stampAtlasRevision;
+        // This frame is current, so its pending span is empty again. Left as an
+        // inverted range, which is what the check above reads as "nothing".
+        dirtyAtlasFirst_[frame] = s_stampAtlas.size();
+        dirtyAtlasLast_[frame] = 0;
+    }
+
+    // Widens every frame's pending dirty span to cover a region just written
+    // into s_stampAtlas.
+    static void MarkStampAtlasDirty(size_t firstTexel, size_t texelCount) {
+        if (texelCount == 0) return;
+        const size_t last = firstTexel + texelCount - 1;
+        for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
+            dirtyAtlasFirst_[frame] =
+                (std::min)(dirtyAtlasFirst_[frame], firstTexel);
+            dirtyAtlasLast_[frame] = (std::max)(dirtyAtlasLast_[frame], last);
+        }
     }
 
     bool CreateTextureArray(const std::vector<uint8_t>& pixels, UINT side,
@@ -1281,12 +1368,16 @@ private:
         s_stampLoadState.assign(s_stampNames.size(), 0u);
         s_stampWriteTimes.assign(
             s_stampNames.size(), std::filesystem::file_time_type{});
-        s_stampAtlas.assign(static_cast<size_t>(kMaxTerrainStampTextures) *
-            kTerrainStampResolution * kTerrainStampResolution, 32768u);
+        s_stampAtlas.assign(kTerrainStampAtlasTexels, 32768u);
     }
 
     static UINT FindHeightStampLayer(const std::string& texture) {
         EnsureStampLibrary();
+        // Bakes are not in s_stampNames; they occupy the dedicated slot.
+        if (IsTerrainStampBakeFilename(texture)) {
+            return (s_bakeName == texture && s_bakeLoadState == 1u)
+                ? static_cast<UINT>(kTerrainStampBakeLayer) : UINT_MAX;
+        }
         const auto found = std::find(
             s_stampNames.begin(), s_stampNames.end(), texture);
         if (found == s_stampNames.end() || *found != texture)
@@ -1298,6 +1389,21 @@ private:
     static UINT EnsureHeightStampLoaded(const std::string& texture) {
         EnsureStampLibrary();
         if (!IsTerrainStampFilename(texture)) return UINT_MAX;
+        // Bakes live in the single dedicated slot, so they never consume one of
+        // the 64 atlas layers. One bake is resident at a time: loading a second
+        // overwrites the first, which is correct because a level carries at
+        // most one baked stamp and switching levels should not keep the old
+        // one's 33.5 MB pinned.
+        if (IsTerrainStampBakeFilename(texture)) {
+            if (s_bakeName != texture) {
+                s_bakeLoadState = 0u;
+                s_bakeWriteTime = std::filesystem::file_time_type{};
+                s_bakeName = texture;
+            }
+            return EnsureStampSlotLoaded(
+                texture, kTerrainStampBakeLayer, s_bakeLoadState,
+                s_bakeWriteTime);
+        }
         auto found = std::find(
             s_stampNames.begin(), s_stampNames.end(), texture);
         if (found == s_stampNames.end()) {
@@ -1313,48 +1419,77 @@ private:
             found = s_stampNames.end() - 1;
         }
         const size_t layer = static_cast<size_t>(found - s_stampNames.begin());
+        return EnsureStampSlotLoaded(texture, layer, s_stampLoadState[layer],
+                                     s_stampWriteTimes[layer]);
+    }
+
+    // Loads one stamp PNG into the region `layer` names, resampling it to that
+    // region's resolution. Shared by the 64 atlas layers and the bake slot,
+    // which differ only in resolution and base offset; `loadState` and
+    // `writeTime` are the caller's residency record for the slot.
+    static UINT EnsureStampSlotLoaded(
+            const std::string& texture, size_t layer, uint8_t& loadState,
+            std::filesystem::file_time_type& writeTimeRecord) {
+        // Resolved slots return without touching the disk.
+        //
+        // SetSculptStamps calls this for every heightmap stamp, and it runs on
+        // every runtime crater -- so a stat() here is a filesystem hit per
+        // stamp per explosion, on the game thread. The hot-reload check that
+        // stat feeds only matters while authoring, so it is gated to the
+        // editor: in play the stamp on disk cannot change under us.
+        if (loadState == 1u && !s_stampHotReloadEnabled)
+            return static_cast<UINT>(layer);
+        if (loadState == 2u && !s_stampHotReloadEnabled)
+            return UINT_MAX;
         const std::filesystem::path path = TerrainStampDirectory() / texture;
         std::error_code writeTimeError;
         const std::filesystem::file_time_type writeTime =
             std::filesystem::last_write_time(path, writeTimeError);
         const bool unchanged = !writeTimeError &&
-            s_stampWriteTimes[layer] == writeTime;
-        if (s_stampLoadState[layer] == 1u &&
-            (unchanged || writeTimeError))
+            writeTimeRecord == writeTime;
+        if (loadState == 1u && (unchanged || writeTimeError))
             return static_cast<UINT>(layer);
-        if (s_stampLoadState[layer] == 2u &&
-            (unchanged || writeTimeError))
+        if (loadState == 2u && (unchanged || writeTimeError))
             return UINT_MAX;
 
         std::vector<uint16_t> source;
         int width = 0, height = 0;
         if (!GLBImporter::LoadPixelsGray16(path.string(), source, width, height) ||
             width <= 0 || height <= 0) {
-            s_stampLoadState[layer] = 2u;
-            if (!writeTimeError) s_stampWriteTimes[layer] = writeTime;
+            loadState = 2u;
+            if (!writeTimeError) writeTimeRecord = writeTime;
             return UINT_MAX;
         }
 
-        const size_t layerOffset = layer * kTerrainStampResolution *
-            kTerrainStampResolution;
+        // A bake covers the whole sculpted level, so it resolves into the
+        // dedicated 4K region past the atlas rather than being box-filtered
+        // down to a 512 layer like a hand-placed stamp.
+        const bool isBake = layer == kTerrainStampBakeLayer;
+        const uint32_t side = isBake
+            ? kTerrainStampBakeResolution : kTerrainStampResolution;
+        const size_t layerOffset = isBake
+            ? static_cast<size_t>(kMaxTerrainStampTextures) *
+                  kTerrainStampResolution * kTerrainStampResolution
+            : layer * static_cast<size_t>(kTerrainStampResolution) *
+                  kTerrainStampResolution;
         // Box filter over each output texel's exact source footprint. This used
         // to take a fixed 4x4 stratified tap, which was sized for 4096->256; at
         // 512 that covers a quarter of the 8x8 footprint and starts aliasing
         // again. Averaging the real footprint stays correct whatever the source
         // dimensions and atlas resolution are, and first use of a stamp reads
         // each source texel exactly once.
-        for (uint32_t y = 0; y < kTerrainStampResolution; ++y) {
+        for (uint32_t y = 0; y < side; ++y) {
             const int y0 = static_cast<int>(static_cast<uint64_t>(y) * height /
-                                            kTerrainStampResolution);
+                                            side);
             const int y1 = (std::max)(y0 + 1,
                 static_cast<int>(static_cast<uint64_t>(y + 1) * height /
-                                 kTerrainStampResolution));
-            for (uint32_t x = 0; x < kTerrainStampResolution; ++x) {
+                                 side));
+            for (uint32_t x = 0; x < side; ++x) {
                 const int x0 = static_cast<int>(static_cast<uint64_t>(x) * width /
-                                                kTerrainStampResolution);
+                                                side);
                 const int x1 = (std::max)(x0 + 1,
                     static_cast<int>(static_cast<uint64_t>(x + 1) * width /
-                                     kTerrainStampResolution));
+                                     side));
                 uint64_t sum = 0;
                 uint32_t count = 0;
                 for (int sy = y0; sy < y1 && sy < height; ++sy) {
@@ -1364,13 +1499,15 @@ private:
                     }
                 }
                 s_stampAtlas[layerOffset +
-                    static_cast<size_t>(y) * kTerrainStampResolution + x] =
+                    static_cast<size_t>(y) * side + x] =
                     count ? static_cast<uint16_t>((sum + count / 2) / count)
                           : uint16_t{ 32768u };
             }
         }
-        s_stampLoadState[layer] = 1u;
-        if (!writeTimeError) s_stampWriteTimes[layer] = writeTime;
+        loadState = 1u;
+        if (!writeTimeError) writeTimeRecord = writeTime;
+        // Only this region changed, so the upload copies just it.
+        MarkStampAtlasDirty(layerOffset, static_cast<size_t>(side) * side);
         ++s_stampAtlasRevision;
         return static_cast<UINT>(layer);
     }
@@ -1396,17 +1533,28 @@ private:
         const float v = localZ / (stamp.radius * 2.0f) + 0.5f;
         if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) return;
 
-        const float fx = u * (kTerrainStampResolution - 1u);
-        const float fy = v * (kTerrainStampResolution - 1u);
+        // Must mirror SampleTerrainStamp in terrain_ms.hlsl: the bake slot is a
+        // larger region appended after the atlas, so both the stride and the
+        // base offset depend on which region the layer names. CPU heights feed
+        // physics and placement, so a mismatch here walks collision off the
+        // visible ground.
+        const bool isBake = layer == kTerrainStampBakeLayer;
+        const uint32_t side = isBake
+            ? kTerrainStampBakeResolution : kTerrainStampResolution;
+        const float fx = u * (side - 1u);
+        const float fy = v * (side - 1u);
         const uint32_t x0 = static_cast<uint32_t>(fx);
         const uint32_t y0 = static_cast<uint32_t>(fy);
-        const uint32_t x1 = (std::min)(x0 + 1u, kTerrainStampResolution - 1u);
-        const uint32_t y1 = (std::min)(y0 + 1u, kTerrainStampResolution - 1u);
-        const size_t base = static_cast<size_t>(layer) *
-            kTerrainStampResolution * kTerrainStampResolution;
+        const uint32_t x1 = (std::min)(x0 + 1u, side - 1u);
+        const uint32_t y1 = (std::min)(y0 + 1u, side - 1u);
+        const size_t base = isBake
+            ? static_cast<size_t>(kMaxTerrainStampTextures) *
+                  kTerrainStampResolution * kTerrainStampResolution
+            : static_cast<size_t>(layer) *
+                  kTerrainStampResolution * kTerrainStampResolution;
         const auto texel = [&](uint32_t tx, uint32_t ty) {
             return static_cast<float>(s_stampAtlas[base +
-                static_cast<size_t>(ty) * kTerrainStampResolution + tx]);
+                static_cast<size_t>(ty) * side + tx]);
         };
         const float tx = fx - x0, ty = fy - y0;
         const float upper = texel(x0, y0) +
@@ -1415,8 +1563,12 @@ private:
             (texel(x1, y1) - texel(x0, y1)) * tx;
         const float normalized = (upper + (lower - upper) * ty) /
             65535.0f * 2.0f - 1.0f;
+        // Mirrors the feather in SampleTerrainStamp: same clamp on the start,
+        // same smoothstep, so CPU heights agree with what the mesh shader draws.
+        const float falloffStart =
+            (std::min)((std::max)(stamp.edgeFalloff, 0.0f), 0.999f);
         float edge = ((std::max)(std::abs(localX), std::abs(localZ)) /
-                      stamp.radius - 0.82f) / 0.18f;
+                      stamp.radius - falloffStart) / (1.0f - falloffStart);
         edge = edge < 0.0f ? 0.0f : (edge > 1.0f ? 1.0f : edge);
         edge = 1.0f - edge * edge * (3.0f - 2.0f * edge);
         outCoverage = edge;
@@ -1429,7 +1581,24 @@ private:
     inline static std::vector<std::filesystem::file_time_type>
         s_stampWriteTimes;
     inline static std::vector<uint16_t> s_stampAtlas;
+    // Residency of the single bake slot, mirroring s_stampLoadState /
+    // s_stampWriteTimes for the atlas layers. s_bakeName is which bake is
+    // currently resident, so switching levels reloads rather than showing the
+    // previous level's terrain.
+    // Whether a resolved stamp re-stats its file to catch edits. Only the
+    // editor writes stamps while running, so play leaves this off and keeps
+    // the per-crater SetSculptStamps sweep off the filesystem entirely.
+    inline static bool s_stampHotReloadEnabled = false;
+public:
+    static void SetStampHotReloadEnabled(bool enabled) {
+        s_stampHotReloadEnabled = enabled;
+    }
+private:
+    inline static std::string s_bakeName;
+    inline static uint8_t s_bakeLoadState = 0u;
+    inline static std::filesystem::file_time_type s_bakeWriteTime;
     inline static uint64_t s_sculptRevision = 1;
+    inline static uint64_t s_bathymetryRevision = 1;
     inline static uint64_t s_stampAtlasRevision = 1;
     float m_sculptMaxDisplacement = 0.0f;
 };

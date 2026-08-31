@@ -506,6 +506,29 @@ public:
         cacheViewValid = false;
     }
 
+    // Same invalidation, but spread over the next few frames instead of landing
+    // in one.
+    //
+    // The far cascades exist to be cached: normally they refresh only when the
+    // camera has moved far enough, so their cost is spread out. Dropping all of
+    // them at once puts every cascade's full re-render into a single frame on
+    // top of cascade 0, which is a measured GPU spike (163 ms in a light scene,
+    // and seconds in a heavy one) -- the terrain is drawn into the shadow pass,
+    // so each cascade is a real cost.
+    //
+    // A crater is a local, low-contrast change to ground that is already mostly
+    // self-shadowed, so refreshing the distant cascades one frame apart is not
+    // perceptible, while the stall is. Cascade 0 is uncached and still updates
+    // immediately, so the shadow right under the explosion is correct at once.
+    // cacheViewValid is deliberately left alone: clearing it sets
+    // projectionChanged, which fills farCacheValid with false and would put the
+    // whole refresh back into one frame. The camera projection has not changed
+    // here -- only the terrain under it -- so the cached view stays valid.
+    void InvalidateCachedCascadesStaggered() {
+        staggeredInvalidationPending = true;
+        staggeredInvalidationNext = 0;
+    }
+
     bool Init(UINT mapSize = SHADOW_MAP_SIZE) {
         size = mapSize;
         if (!CreateShadowMap()) return false;
@@ -1069,6 +1092,18 @@ public:
             cachedLightDirection = lightDirection;
             cacheViewValid = true;
 
+            // Retire one pending staggered invalidation per frame, so a crater
+            // costs at most one extra cascade refresh in any single frame
+            // rather than all of them at once.
+            if (staggeredInvalidationPending) {
+                if (staggeredInvalidationNext < FAR_CASCADE_CACHE_COUNT) {
+                    farCacheValid[staggeredInvalidationNext] = false;
+                    ++staggeredInvalidationNext;
+                } else {
+                    staggeredInvalidationPending = false;
+                }
+            }
+
             const XMVECTOR cameraPosition =
                 XMLoadFloat3(&scene.camera.Position);
             const XMVECTOR cameraFront = XMVector3Normalize(
@@ -1285,6 +1320,10 @@ private:
     static constexpr UINT FAR_CASCADE_CACHE_COUNT =
         SHADOW_CASCADE_COUNT - 1;
     std::array<bool, FAR_CASCADE_CACHE_COUNT> farCacheValid = {};
+    // Drives InvalidateCachedCascadesStaggered: which cached cascade to drop
+    // next, and whether a staggered pass is still in progress.
+    bool staggeredInvalidationPending = false;
+    UINT staggeredInvalidationNext = 0;
     std::array<XMMATRIX, FAR_CASCADE_CACHE_COUNT> farCacheMatrices = {};
     std::array<XMFLOAT3, FAR_CASCADE_CACHE_COUNT> farCacheCameraPosition = {};
     std::array<XMFLOAT3, FAR_CASCADE_CACHE_COUNT> farCacheCameraFront = {};

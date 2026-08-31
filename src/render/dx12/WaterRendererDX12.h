@@ -369,8 +369,9 @@ private:
         XMFLOAT4 ultraSimulation;
         XMFLOAT4 ultraDebug;
         XMFLOAT4 highWaveParams;
+        XMFLOAT4 highShoreParams;
     };
-    static_assert(sizeof(Constants) == 576,
+    static_assert(sizeof(Constants) == 720,
                   "WaterConstants must match water_dx12.hlsl exactly");
 
     static UINT AlignConstantSize(UINT size) {
@@ -561,15 +562,28 @@ private:
         // pinned inside the far clip in water_dx12.hlsl, so the ordinary 800 m
         // camera far plane can retain its depth precision without exposing a
         // strip of sky between the finite ocean and the geometric horizon.
-        // Ring extents roughly double until the visual horizon ring. The old
-        // set jumped straight from 128 m to 4096 m, so one ring's cells went
-        // from ~2 m to ~124 m and a single interpolated vertex normal covered
-        // the whole midfield -- flat, featureless water from a few hundred
-        // metres out. The inserted rings keep the progression geometric so
-        // wave detail degrades gradually instead of collapsing in one step.
-        static constexpr std::array<float, 11> gameplayExtents = {
-            8.0f, 16.0f, 32.0f, 64.0f, 128.0f, 256.0f, 512.0f,
-            1024.0f, 2048.0f, 4096.0f, 1048576.0f };
+        // Ring extents, tuned so wave geometry survives into the midfield.
+        //
+        // Straight doubling put the 31 m swell -- the longest authored train --
+        // beyond its 4-cells-per-wavelength limit at 128 m, and the 4.5 m chop
+        // at 32 m, so everything past a couple of hundred metres flattened to
+        // interpolated glass no matter how the waves themselves were authored.
+        // Widening ring 0 does not fix that: with a geometric progression the
+        // ring where cells reach a given size is fixed, so pushing the start
+        // out just trades near detail for far (measured: identical 128 m reach).
+        //
+        // What actually moves it is growing more slowly through the band that
+        // matters. Rings 3-11 ramp at about 1.6-1.75x instead of 2x, which puts
+        // three extra rings between 56 m and 700 m and carries the swell to
+        // 260 m and the 11 m components to 96 m -- roughly double the reach for
+        // 27% more vertices. Denser rings buy the same thing at 2.2x the cost.
+        //
+        // Past 4 km the progression opens up hard: the wave fade in
+        // water_dx12.hlsl has already flattened the surface by then, so those
+        // rings are horizon coverage and their cell size does not matter.
+        static constexpr std::array<float, 14> gameplayExtents = {
+            8.0f, 16.0f, 32.0f, 56.0f, 96.0f, 160.0f, 260.0f, 420.0f,
+            700.0f, 1200.0f, 2100.0f, 4096.0f, 16384.0f, 1048576.0f };
         // Deployment evaluates its wave normal and crest per pixel. A flat
         // full-span grid therefore has no geometric LOD rings to reveal as the
         // camera orbits, while its subdivisions keep homogeneous clipping
@@ -1146,7 +1160,17 @@ private:
             ocean ? (std::max)(0.0f, settings.speedScale) : 1.0f,
             ocean ? (std::max)(0.0f, scene.highWaterMicroDetail) : 1.0f,
             ocean ? (std::max)(0.0f, scene.highWaterFoamStrength) : 1.0f,
-            0.0f };
+            // Bearing half: how far waves turn toward the coast, plus the
+            // wavefront irregularity that keeps the bent crests from reading
+            // as concentric arcs. Pools have no bed to refract against.
+            ocean ? std::clamp(scene.highWaterShoreRefraction, 0.0f, 1.0f)
+                  : 0.0f };
+        // Height half: wavelength compression, shoaling gain, steepening and
+        // the breaker cap. Pools have no bed to shoal over, so they keep their
+        // authored amplitude.
+        constants.highShoreParams = {
+            ocean ? std::clamp(scene.highWaterShoreFlatten, 0.0f, 1.0f) : 0.0f,
+            0.0f, 0.0f, 0.0f };
         return constants;
     }
 

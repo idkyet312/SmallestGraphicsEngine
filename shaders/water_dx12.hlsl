@@ -15,8 +15,8 @@ cbuffer WaterConstants : register(b0)
     float4 deepScatter;
     float4 lightDirection; // xyz direction, w night reflection intensity
     float4 lightColor;     // rgb direct light, w night water intensity
-    float4 waves[4];      // direction.xy, amplitude, wavelength
-    float4 waveExtra[4];  // steepness, unused...
+    float4 waves[8];      // direction.xy, amplitude, wavelength
+    float4 waveExtra[8];  // steepness, unused...
     float4 ultraBounds;     // minimum xz, maximum xz
     float4 ultraSimulation; // coast resolution, bathy resolution, bathy ready, Ultra active
     float4 ultraDebug;      // diagnostic mode and reserved values
@@ -24,8 +24,15 @@ cbuffer WaterConstants : register(b0)
     // uploaded wave constants on the CPU; these are the two that cannot be,
     // because they scale the time fed to the wave field and the per-pixel
     // capillary detail rather than the spectrum itself.
-    float4 highWaveParams;  // speed, micro detail, foam strength, unused
+    float4 highWaveParams;  // speed, micro detail, foam strength, shore model
+    // High-path shore shallowing: x = flatten weight (0 off, 1 full shoaling
+    // and breaker cap). yzw reserved.
+    float4 highShoreParams;
 };
+
+// Number of Gerstner trains. Must match OceanWaveSettings::WaveCount; the
+// static_assert on the C++ Constants struct catches a mismatch at build time.
+static const uint OceanWaveCount = 8;
 
 // How far the distant ocean may be blended toward the fogged sky behind it.
 // Strictly below 1 so the horizon band keeps some water shading instead of
@@ -65,6 +72,7 @@ struct VSOutput
     float4 currentClip : TEXCOORD3;
     float4 previousClip : TEXCOORD4;
     float2 clipmapData : TEXCOORD5; // ring level, radial morph coordinate
+    float2 oceanBaseXZ : TEXCOORD6;
 };
 
 float Hash21(float2 p)
@@ -96,18 +104,26 @@ float WavePhaseNoise(float2 worldXZ)
     return n * 2.0 - 1.0;
 }
 
+// Is the bathymetry field resident and does this point fall inside it? True on
+// High as well as Ultra -- the texture is uploaded for both. What each quality
+// level does with it differs; see WaterUltraQuality below.
 bool WaterBathymetryUV(float2 worldXZ, out float2 uv)
 {
     const float2 span = ultraBounds.zw - ultraBounds.xy;
     uv = (worldXZ - ultraBounds.xy) / max(span, 0.001);
-    // .w gates on the quality level, not just on the bathymetry being resident.
-    // The texture is uploaded for High as well -- the underwater medium and the
-    // wet-sand shading want it -- so testing readiness alone silently gave the
-    // High surface Ultra's signed-distance refraction, which is meant to be an
-    // Ultra-only feature.
-    return ultraSimulation.z > 0.5 && ultraSimulation.w > 0.5 &&
+    return ultraSimulation.z > 0.5 &&
         all(uv >= 0.0) && all(uv <= 1.0);
 }
+
+// Ultra takes the full treatment: phase driven by distance to the shoreline, so
+// crests become contours of the coast, plus finite-depth dispersion, shoaling
+// and breaking. High only borrows the direction -- each train is turned part of
+// the way toward the measured shore normal, so waves visibly answer to the
+// coastline while still sweeping across the world on their authored bearings.
+// How far is the Shore Refraction slider (highWaveParams.w): 0 keeps the
+// authored bearings exactly, 1 locks crests fully onto the coast contours.
+// Ultra ignores it and always refracts fully.
+bool WaterUltraQuality() { return ultraSimulation.w > 0.5; }
 
 void EvaluateOcean(float2 baseXZ, float time, out float3 position,
                    out float3 normal, out float crest)
@@ -164,53 +180,164 @@ void EvaluateOcean(float2 baseXZ, float time, out float3 position,
     const float2 alongShore = float2(-shoreward.y, shoreward.x);
     const float bearing = atan2(shoreward.y, shoreward.x);
 
-    // Ultra alone breaks its wavefronts up with noise, so its crests arrive
-    // ragged along their length instead of as clean arcs. The High path takes
-    // its phase straight from the authored bearing, exactly as before.
+    // Ultra runs the full shoreline-contour phase. High keeps a dominant
+    // offshore swell: out at sea every train holds the bearing it was authored
+    // with, and the coast only asserts itself as the water shallows. Making the
+    // whole ocean trace the island was the thing that looked wrong -- concentric
+    // rings out to the horizon, all eight trains converging on one heading.
+    //
+    // Everything below hangs off one depth ramp, because in reality they are
+    // the same phenomenon: a wave starts feeling the bed at roughly half its
+    // wavelength, and from that point on it refracts, shortens, steepens and
+    // eventually breaks together. Sharing the ramp keeps them in step instead
+    // of fading in at unrelated depths.
+    //
+    // Two independent weights over that one depth ramp. Shore Refraction owns
+    // what the waves point at -- bending toward the coast, and the wavefront
+    // irregularity that stops the bent crests reading as concentric arcs. Shore
+    // Flatten owns how tall they are -- wavelength compression, shoaling gain,
+    // steepening and the breaker cap. They are split because they fail
+    // differently: refraction is what decorrelates CPU buoyancy (a boat sits on
+    // a surface whose crests point elsewhere), while flattening only ever lowers
+    // the surface, and only in shallows. So the height half can be left on by
+    // default while the bearing half stays opt-in.
+    const bool ultraQuality = WaterUltraQuality();
+    const float refractStrength = saturate(highWaveParams.w);
+    const float flattenStrength = saturate(highShoreParams.x);
+    const bool ultraWaveModel = haveBathymetry && ultraQuality;
+    // High needs its own irregularity now that it refracts: without it the
+    // shoaling crests arrive as clean parallel arcs, which is the concentric
+    // look again in a smaller radius. Ultra keeps using it as before.
     const float phaseNoise = haveBathymetry
         ? WavePhaseNoise(baseXZ) : 0.0;
     float breakingEnergy = 0.0;
 
     [unroll]
-    for (uint i = 0; i < 4; ++i) {
-        float2 authored = normalize(waves[i].xy);
-        const float spread = authored.y * 0.35;
-        // Ultra turns each train toward the measured shore normal; High keeps
-        // the bearing the wave was authored with.
-        float2 direction = haveBathymetry
-            ? normalize(shoreward + alongShore * spread)
-            : authored;
+    for (uint i = 0; i < OceanWaveCount; ++i) {
+        const float2 authored = normalize(waves[i].xy);
         const float deepAmplitude = waves[i].z;
         const float deepWavelength = max(waves[i].w, 0.1);
-        float steepness = waveExtra[i].x;
         const float deepK = 6.28318530718 / deepWavelength;
+        // Frequency is the invariant: a wave train entering shallow water keeps
+        // its period and pays for it by shortening and slowing down. So omega is
+        // computed once from the deep-water dispersion relation and never
+        // touched again.
         const float omega = sqrt(gravity * deepK);
-        // Finite-depth dispersion: frequency stays fixed while c=sqrt(g/k *
-        // tanh(kh)) falls toward shore. The resulting local k shortens the
-        // wavelength along the signed-distance contours.
-        const float dispersion = haveBathymetry
-            ? sqrt(max(tanh(deepK * restDepth), 0.01)) : 1.0;
+        float steepness = waveExtra[i].x;
+
+        // How much this train feels the bed. Deep water is depth > wavelength/2,
+        // the standard cutoff; from there it ramps to fully shoaling as the
+        // depth runs out. Per-train, so the long swell starts responding far
+        // offshore while short chop stays deep-water until it is nearly ashore
+        // -- which is why a real coast sorts its waves by period as they come
+        // in, long ones turning first.
+        const float feelDepth = max(deepWavelength * 0.5, 1.0);
+        // One ramp, two weights off it, so both halves fade in at the same
+        // depths for a given train and cannot drift out of step.
+        const float bedInfluence = haveBathymetry
+            ? 1.0 - smoothstep(0.0, feelDepth, restDepth) : 0.0;
+        const float refractMix = bedInfluence * refractStrength;
+        const float flattenMix = bedInfluence * flattenStrength;
+
+        // Refraction. Offshore the train keeps its authored bearing; as it
+        // shoals it turns toward the shore normal. The fan spreads the trains
+        // either side of that normal so they converge without collapsing into
+        // one parallel front -- keyed on wavelength, since the authored array is
+        // not sorted by period and index keying would hand the widest angle to
+        // whichever train happened to sit last. Long swell ends up nearest the
+        // normal, short chop stays angled.
+        const float periodMix = saturate(
+            (log2(deepWavelength) - log2(1.5)) / (log2(32.0) - log2(1.5)));
+        const float fanSide = (i & 1) ? -1.0 : 1.0;
+        const float spread = fanSide * lerp(0.95, 0.18, periodMix);
+        const float2 shoreDirection = normalize(shoreward + alongShore * spread);
+        float2 direction = authored;
+        if (refractMix > 0.001) {
+            // Rotate along the shortest arc, not a vector lerp. Lerping two
+            // near-opposed unit vectors passes through the degenerate midpoint
+            // and sends the train the long way round -- measured swings of
+            // -135 and +157 degrees on trains authored pointing away from the
+            // beach, which reads as waves whipping round rather than bending
+            // in. Taking the signed angle and wrapping it to [-pi, pi] means
+            // every train turns the short way and no path is degenerate.
+            const float authoredAngle = atan2(authored.y, authored.x);
+            const float shoreAngle =
+                atan2(shoreDirection.y, shoreDirection.x);
+            float delta = shoreAngle - authoredAngle;
+            delta -= 6.28318530718 * floor(delta / 6.28318530718 + 0.5);
+            // Refraction bends a train toward the normal; it never spins one
+            // that is heading out to sea around to face the beach. A train
+            // authored offshore has a genuine shortest path of ~135 degrees to
+            // shore-normal, and following it looked like waves whipping round.
+            // Snell only ever reduces the angle of incidence, so cap the turn
+            // at a right angle: trains already heading roughly shoreward bend
+            // fully in, oblique ones bend as far as physics allows and no
+            // further, and offshore trains are left to run out to sea as they
+            // should.
+            const float maxTurn = 1.57079632679;
+            delta = clamp(delta, -maxTurn, maxTurn);
+            const float turned = authoredAngle + delta * refractMix;
+            direction = float2(cos(turned), sin(turned));
+        }
+
+        // Wavelength compression. Finite-depth dispersion holds omega fixed
+        // while the phase speed falls as sqrt(tanh(kh)), so the local wavenumber
+        // rises and crests bunch up toward the beach. Ultra runs this from its
+        // solver; High now gets the same relation, faded in by flattenMix so deep
+        // water is untouched.
+        const float tanhTerm = sqrt(max(tanh(deepK * max(restDepth, 0.02)), 0.01));
+        const float dispersion = ultraWaveModel
+            ? tanhTerm
+            : lerp(1.0, tanhTerm, flattenMix);
         const float k = deepK / dispersion;
         const float wavelength = 6.28318530718 / k;
         const float phaseSpeed = omega / k;
-        const float kh = k * restDepth;
+
+        // Shoaling. Energy flux c_g * A^2 is conserved as the group slows, so
+        // amplitude rises by sqrt(c_g_deep / c_g_local) -- the reason waves stand
+        // up before they break. Clamped: the relation runs away as depth goes to
+        // zero, and the breaker limit below is what should end the wave, not a
+        // singularity here.
+        const float kh = k * max(restDepth, 0.02);
         const float groupFactor = 0.5 *
             (1.0 + 2.0 * kh / max(sinh(2.0 * kh), 1e-3));
         const float deepGroupSpeed = 0.5 * omega / deepK;
         const float localGroupSpeed = phaseSpeed * groupFactor;
-        const float shoaling = haveBathymetry
-            ? clamp(sqrt(deepGroupSpeed /
-                         max(localGroupSpeed, 0.05)), 0.85, 1.8)
-            : 1.0;
+        const float shoalGain = clamp(
+            sqrt(deepGroupSpeed / max(localGroupSpeed, 0.05)), 0.85, 1.8);
+        const float shoaling = ultraWaveModel
+            ? shoalGain : lerp(1.0, shoalGain, flattenMix);
         const float shoaledAmplitude = deepAmplitude * shoaling;
-        const float breakerLimit = 0.39 * restDepth;
-        float amplitude = haveBathymetry
-            ? min(shoaledAmplitude, max(breakerLimit, 0.01))
-            : deepAmplitude;
-        breakingEnergy += haveBathymetry
-            ? saturate((shoaledAmplitude - breakerLimit) /
-                       max(deepAmplitude, 0.01))
-            : 0.0;
+
+        // Breaking. A wave cannot stand taller than roughly 0.39 of the water
+        // depth; past that it spills. Capping here is also what stops the
+        // shallows creasing into hard polygonal facets -- unbounded amplitude in
+        // ankle-deep water folds neighbouring crests through each other and
+        // makes the clipmap tessellation visible.
+        const float breakerLimit = 0.39 * max(restDepth, 0.02);
+        const float breakerCap = max(breakerLimit, 0.01);
+        float amplitude;
+        if (ultraWaveModel) {
+            amplitude = min(shoaledAmplitude, breakerCap);
+        } else {
+            // Only let the cap bite where the train is actually shoaling, so a
+            // deep-water train is never touched by it.
+            const float capped = min(shoaledAmplitude, breakerCap);
+            amplitude = lerp(shoaledAmplitude, capped, flattenMix);
+        }
+        // Steepness rises with shoaling too: crests sharpen and troughs flatten
+        // as a wave stands up. The existing CPU clamp keeps the sum inside the
+        // Gerstner loop threshold, and this stays modest so it cannot breach it.
+        steepness *= lerp(1.0, 1.35, flattenMix);
+        // How far past the breaker limit this train is trying to stand. Feeds
+        // the crest term, which drives foam. High gets it at a reduced weight:
+        // it has a real shoaling model now, so it earns a surf line, but not the
+        // full whitewater Ultra's solver is tuned for.
+        const float overLimit = saturate(
+            (shoaledAmplitude - breakerLimit) / max(deepAmplitude, 0.01));
+        breakingEnergy += ultraWaveModel
+            ? overLimit
+            : overLimit * flattenMix * 0.55;
 
         // Ultra runs the phase on distance to the shoreline, so crests are
         // contours of the coast marching inward, shifted by the wander and
@@ -218,7 +345,7 @@ void EvaluateOcean(float2 baseXZ, float time, out float3 position,
         // the classic projection onto the authored bearing: parallel crests
         // sweeping across the world, travelling with the wave direction.
         float phase;
-        if (haveBathymetry) {
+        if (ultraWaveModel) {
             const float wander = wavelength * 0.85 *
                 sin(bearing * (2.0 + float(i)) + authored.x * 3.1);
             // Noise displaces the crest line by a fraction of a wavelength, so
@@ -229,7 +356,20 @@ void EvaluateOcean(float2 baseXZ, float time, out float3 position,
             phase = k * (travelDistance + wander * spread * 3.0 +
                          noiseOffset) + omega * time;
         } else {
-            phase = k * dot(direction, baseXZ) - omega * time;
+            // Travelling along the refracted bearing, so as `direction` turns
+            // shoreward the crests advance inward rather than being pushed back
+            // out to sea. `shoreward` is the uphill bed gradient and the bed is
+            // negative in water, so +direction is genuinely toward the beach.
+            //
+            // The noise offset is what keeps this from reading as concentric
+            // rings: it displaces the crest line by a fraction of a wavelength
+            // along its length, so successive fronts arrive slightly ragged and
+            // out of step instead of as clean arcs. Scaled by wavelength, and by
+            // refractMix so the offshore swell stays clean and only the shoaling
+            // near-shore trains break up.
+            const float irregular =
+                phaseNoise * wavelength * 0.30 * refractMix;
+            phase = k * (dot(direction, baseXZ) + irregular) - omega * time;
         }
         float sine = sin(phase);
         float cosine = cos(phase);
@@ -301,6 +441,7 @@ VSOutput VSMain(VSInput input)
     if (volume0.w > 0.5) {
         float2 currentXZ = input.position.xz + clipmapParams.xy;
         float2 previousXZ = input.position.xz + previousCameraTime.xy;
+        output.oceanBaseXZ = currentXZ;
         if (volume1.w > 1.5 && volume1.z < 0.5) {
             const float4 currentSurface =
                 SampleUltraSurface(currentXZ, false);
@@ -350,26 +491,61 @@ VSOutput VSMain(VSInput input)
         // 4 km can carry real waves. Per-pixel micro normals still perform
         // their own footprint fade below.
         if (volume1.z < 0.5) {
+            // Retire the geometric displacement on cell size rather than on
+            // raw distance, because cell size is what actually decides whether
+            // the mesh can carry a wave.
+            //
+            // A quad only reproduces a wave it has several vertices across.
+            // Measured against this spectrum (1.37 m crest to trough), linear
+            // interpolation across one cell is off by 0.14 m at 2.5 m cells,
+            // 0.40 m at 6.25 m, 0.60 m at 10 m and 0.93 m at 17.5 m -- past
+            // ring 6 the error exceeds a third of the entire wave range, and
+            // the surface visibly steps from quad to quad. That is the hard
+            // faceted grid, and no amount of per-pixel shading hides it,
+            // because the silhouette itself is wrong.
+            //
+            // So displacement fades out between 2 and 6.5 metre cells. Beyond
+            // that the surface goes geometrically flat -- which is honest, and
+            // invisible, because the per-pixel normal path below rebuilds the
+            // full analytic wave normal there. Distant water keeps its wave
+            // shading and loses only a vertical displacement it could never
+            // represent without stepping.
+            //
+            // Keyed on distance, NOT on the ring index. Ring level is constant
+            // across a whole ring, so fading on it makes the fade constant per
+            // ring too and every ring boundary becomes a hard step -- measured
+            // jumps of 0.38 and 0.57 in the fade weight at the ring 4/5 and 5/6
+            // boundaries. The displacement step alone is subtle, but foam runs
+            // it through a narrow smoothstep(0.18, 0.46) threshold, which turns
+            // each step into a visible edge and the rings into a checkerboard
+            // of foamy and foamless quads. That is why the grid disappeared
+            // when foam strength went to zero.
+            //
+            // Distance is continuous, so the fade is too, and ring boundaries
+            // stop existing as far as shading is concerned. Ring extents track
+            // distance closely enough (cell size is roughly distance/24 across
+            // the whole clipmap) that this still retires the displacement in
+            // the same place -- around 150 m, where cells reach ~6 m -- without
+            // any of the stepping.
             const float ringDistance = max(
                 abs(input.position.x), abs(input.position.z));
             const float waveFade =
-                1.0 - smoothstep(2048.0, 4096.0, ringDistance);
+                1.0 - smoothstep(60.0, 175.0, ringDistance);
             currentPosition = lerp(
                 float3(currentXZ.x, volume0.y, currentXZ.y),
                 currentPosition, waveFade);
             previousPosition = lerp(
                 float3(previousXZ.x, volume0.y, previousXZ.y),
                 previousPosition, waveFade);
-            currentNormal = normalize(lerp(
-                float3(0.0, 1.0, 0.0), currentNormal, waveFade));
-            previousNormal = normalize(lerp(
-                float3(0.0, 1.0, 0.0), previousNormal, waveFade));
-            currentCrest *= waveFade;
-            previousCrest *= waveFade;
+            // Normals and crest are NOT faded here. The pixel shader rebuilds
+            // them analytically wherever the displacement has gone, so fading
+            // them too would flatten the shading along with the geometry and
+            // hand back the featureless water this is meant to avoid.
         }
     } else {
         currentPosition = input.position;
         previousPosition = input.position;
+        output.oceanBaseXZ = input.position.xz;
         currentNormal = normalize(input.normal);
         previousNormal = currentNormal;
         currentCrest = saturate(
@@ -655,15 +831,48 @@ PSOutput PSMain(VSOutput input)
         return output;
     }
 
-    // Deployment views cover the complete ocean from a high camera. Rebuild
-    // the analytic wave normal and crest per pixel there so outer clipmap
-    // triangles retain the same wave detail as ring 0 instead of interpolating
-    // one coarse vertex normal over many screen pixels. Gameplay keeps the
-    // cheaper vertex result and its distance fade.
-    if (volume0.w > 0.5 && volume1.z > 0.5) {
-        float3 evaluatedPosition;
-        EvaluateOcean(p, cameraTime.w * highWaveParams.x,
-                      evaluatedPosition, normal, crest);
+    // Rebuild the analytic wave normal per pixel rather than interpolating one
+    // vertex normal across a clipmap triangle.
+    //
+    // Deployment always did this. Gameplay did not, and that is what breaks the
+    // midfield into flat quadrilateral facets with hard seams along the triangle
+    // edges: measured against the 14-ring clipmap, a 22 m swell has 8.8 cells
+    // per wavelength at ring 4 but only 3.5 by ring 6 and 2.2 by ring 7, so from
+    // roughly 160 m out a single interpolated normal is being stretched over
+    // most of a wave. No ring layout fixes that -- doubling the ring count only
+    // moves where it starts -- because the artifact is the interpolation itself,
+    // not the ring boundaries.
+    //
+    // Ramped in on pixel footprint, so near water keeps the cheaper vertex path
+    // and everything beyond it is analytic. There is no upper cutoff: the
+    // vertex displacement has been faded out by then, so this is the only thing
+    // still carrying wave detail, and dropping it would leave flat glass. The
+    // capillary term below does its own fade and handles aliasing.
+    const bool highOcean = volume0.w > 0.5 &&
+                           volume1.w > 0.5 && volume1.w < 1.5;
+    if (highOcean) {
+        const float pixelNormalWeight = volume1.z > 0.5
+            ? 1.0
+            : smoothstep(0.05, 0.30, footprint);
+        if (pixelNormalWeight > 0.001) {
+            float3 evaluatedPosition;
+            float3 evaluatedNormal;
+            float evaluatedCrest;
+            // Evaluate on the undisplaced clipmap plane. worldPosition.xz has
+            // already been displaced at the vertices, so using it here feeds a
+            // piecewise-linear triangle approximation back into the analytic
+            // wave field and stamps that topology into the foam.
+            EvaluateOcean(input.oceanBaseXZ,
+                          cameraTime.w * highWaveParams.x,
+                          evaluatedPosition, evaluatedNormal, evaluatedCrest);
+            normal = normalize(
+                lerp(normal, evaluatedNormal, pixelNormalWeight));
+            // Foam applies a narrow threshold to crest. Blending the analytic
+            // value with the interpolated vertex value preserves the very
+            // facets this path exists to remove, so switch crest outright once
+            // the coarse rings need per-pixel evaluation.
+            crest = evaluatedCrest;
+        }
     }
 
     // Derivative-filtered capillary detail. Fine octaves disappear before they
@@ -797,26 +1006,55 @@ PSOutput PSMain(VSOutput input)
         max(3.14159265 * denominator * denominator, 1e-5);
     float sunFresnel = dielectricF0 +
         (1.0 - dielectricF0) * pow(1.0 - vDotH, 5.0);
-    float sunVisibility =
-        nDotV / max(nDotV * (1.0 - roughness) + roughness, 1e-4);
+    // Height-correlated Smith visibility (Heitz 2014). This is V, not G: the
+    // Cook-Torrance 1/(4 nDotL nDotV) denominator is folded in, so the product
+    // D * F * V * nDotL below is the complete specular BRDF with no free scale
+    // factor. The previous form was a G term with that denominator missing,
+    // which overshot by orders of magnitude and needed a hand-tuned dimmer to
+    // compensate.
+    float lambdaV = nDotL * sqrt(
+        nDotV * nDotV * (1.0 - alpha2) + alpha2);
+    float lambdaL = nDotV * sqrt(
+        nDotL * nDotL * (1.0 - alpha2) + alpha2);
+    float sunVisibility = 0.5 / max(lambdaV + lambdaL, 1e-5);
     float3 sunSpecular = lightColor.rgb *
-        distribution * sunFresnel * sunVisibility * nDotL *
-        lerp(0.018, 0.075, 1.0 - shallowWater);
+        distribution * sunFresnel * sunVisibility * nDotL;
 
     float foamNoise = SmoothNoise(
         p * 0.47 + float2(cameraTime.w * 0.055, -cameraTime.w * 0.038));
     foamNoise = smoothstep(0.48, 0.78, foamNoise);
 
-    // Foam is a narrow broken line where the water is only centimetres deep,
-    // not a white coating over the full shallow shelf.
-    float shorelineBand = exp(
-        -pow((thickness - 0.13) / max(opticalParams.x * 0.18, 0.07), 2.0));
+    // Foam is whitecaps on the open water only, reaching in to 20 m from the
+    // shore and leaving the beach itself clear.
+    //
+    // Gated on distance from the shoreline rather than from the camera, so the
+    // clear band hugs bays and headlands instead of following the player
+    // around. The bathymetry texture stores a bed height derived from signed
+    // shoreline distance -- 0.20 land slope, 0.35 offshore, shifted 30 m
+    // seaward -- so undo that encoding to recover the distance, exactly as
+    // EvaluateOcean does. The 30.0 below must track kShoreOffsetMetres in
+    // UltraWaterSimulation.h; it is the encoding offset, not the foam
+    // distance, so it stays put when the gate below moves.
+    //
+    // Without bathymetry there is no shoreline to measure against, so foam
+    // falls back to open-ocean behaviour rather than vanishing entirely.
+    float offshoreGate = 1.0;
+    float2 foamBathyUV;
+    if (WaterBathymetryUV(input.worldPosition.xz, foamBathyUV)) {
+        const float foamBed = ultraBathymetry.SampleLevel(
+            linearClamp, foamBathyUV, 0.0);
+        const float shoreDistance =
+            -((foamBed >= 0.0 ? foamBed / 0.20 : foamBed / 0.35) - 30.0);
+        // Ramp over 20-35 m so the band has a soft inner edge instead of a
+        // hard ring, which would read as another contour line in the water.
+        // Foam is fully absent shoreward of 20 m and fully present by 35 m.
+        offshoreGate = smoothstep(20.0, 35.0, shoreDistance);
+    }
     float crestFoam = smoothstep(
         opticalParams.y, opticalParams.y + 0.28, crest) *
         foamNoise;
     float foam = saturate(
-        (shorelineBand * foamNoise * 0.72 + crestFoam * 0.58) *
-        highWaveParams.z);
+        crestFoam * 0.58 * offshoreGate * highWaveParams.z);
     // Ultra's solver produces its own surf and foam from the coastal
     // simulation, so the High multiplier above does not apply to it.
     if (insideUltraCoast)

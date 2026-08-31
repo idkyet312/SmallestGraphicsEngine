@@ -426,6 +426,8 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
             !std::isfinite(stamp.radius) || !std::isfinite(stamp.value) ||
             !std::isfinite(stamp.strength) || !std::isfinite(stamp.rotation) ||
             !std::isfinite(stamp.replace) || !std::isfinite(stamp.baseHeight) ||
+            !std::isfinite(stamp.edgeFalloff) ||
+            stamp.edgeFalloff < 0.0f || stamp.edgeFalloff > 1.0f ||
             stamp.replace < 0.0f || stamp.replace > 1.0f ||
             stamp.radius < 0.1f ||
             stamp.radius > maxStampRadius || stamp.strength < 0.0f ||
@@ -611,6 +613,9 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
                 // stamps were all additive, which is exactly what 0 means.
                 stamp.replace = source.value("replace", 0.0f);
                 stamp.baseHeight = source.value("baseHeight", 0.0f);
+                // Absent before the feather was tunable; 0.82 is the width it
+                // was hardcoded to, so those levels render exactly as before.
+                stamp.edgeFalloff = source.value("edgeFalloff", 0.82f);
                 level.terrainSculpt.push_back(stamp);
             }
         }
@@ -756,6 +761,7 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
                 saved["rotation"] = stamp.rotation;
                 saved["replace"] = stamp.replace;
                 saved["baseHeight"] = stamp.baseHeight;
+                saved["edgeFalloff"] = stamp.edgeFalloff;
             }
             sculpt.push_back(std::move(saved));
         }

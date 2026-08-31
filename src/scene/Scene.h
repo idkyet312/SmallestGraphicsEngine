@@ -629,6 +629,42 @@ struct Scene {
     float highWaterChoppiness = 1.0f;
     float highWaterMicroDetail = 1.0f;
     float highWaterFoamStrength = 1.0f;
+    // Master strength for High's near-shore wave model. The ocean keeps a
+    // dominant offshore swell -- every train holds its authored bearing in deep
+    // water -- and the coast only asserts itself as the bed shallows. Each
+    // train starts responding at roughly half its own wavelength of depth, so
+    // long swell turns first and short chop stays deep-water until it is nearly
+    // ashore.
+    //
+    // One weight drives the whole set, because physically they are one
+    // phenomenon: refraction toward the shore normal, wavelength compression
+    // from finite-depth dispersion, shoaling amplitude gain, phase irregularity
+    // so fronts arrive ragged rather than as concentric arcs, and breaking at
+    // the 0.39 * depth limit. 0 restores the pure authored spectrum.
+    //
+    // Rendering-only. The bathymetry lives in a GPU texture the CPU buoyancy
+    // query cannot sample, so above zero the drawn surface and the one floating
+    // objects sit on decorrelate -- measured at ~85% of wave height by 7 degrees
+    // of rotation, since two sine fields on different bearings share no crests.
+    // The decorrelation is confined to the shoaling band now rather than the
+    // whole ocean, but it is still there: keep it low where a boat has to float
+    // convincingly, or use Ultra, which reads its heights back from the GPU.
+    float highWaterShoreRefraction = 0.0f;
+    // Height half of the same near-shore model, on the same per-train depth
+    // ramp. Wavelength compression from finite-depth dispersion, shoaling
+    // amplitude gain, crest steepening, and the 0.39 * depth breaker cap.
+    //
+    // Separate from the bearing half above because the two fail differently.
+    // Refraction rotates crests, which is what decorrelates CPU buoyancy -- a
+    // boat ends up on a surface whose waves point somewhere else. Flattening
+    // only ever lowers the surface, and only where the bed is shallow enough
+    // that a boat is aground anyway, so it is safe to leave on. It is also what
+    // keeps unbounded amplitude out of ankle-deep water, where neighbouring
+    // crests fold through each other.
+    //
+    // Default 0.30 rather than full: enough to calm the shallows without
+    // flattening the shorebreak, which is where the surf actually reads.
+    float highWaterShoreFlatten = 0.30f;
     float ultraWaterWaveHeight = 1.0f;
     float ultraWaterWaveScale = 1.0f;
     float ultraWaterWaveSpeed = 1.0f;
@@ -756,6 +792,9 @@ struct Scene {
     // that survives past the close-range detail fade. Off by default -- it
     // changes the heightfield, and collision is sampled from the same function.
     bool  terrainDetailRelief = true;
+    // Hollow-inspired projected-error tessellation and stitched tile edges.
+    // Opt-in so the legacy distance LOD remains the default rendering path.
+    bool  terrainErrorLOD      = false;
     // Flat authoring plane: no fbm relief, no pool basin, no coast falloff.
     // Driven by the level definition's terrainFlat.
     bool  terrainFlat         = false;

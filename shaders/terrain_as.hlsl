@@ -16,25 +16,7 @@ cbuffer CameraBuffer : register(b2) {
     float cameraPadding;
 };
 
-// Root param 8 (8 x 32-bit constants at b6), repurposed for terrain params.
-cbuffer TerrainParams : register(b6) {
-    uint tilesX;
-    uint tilesZ;
-    float tileSize;
-    float heightScale;
-    float lodNear;        // distance where LOD starts to drop
-    float lodStep;        // distance per LOD level after lodNear
-    float skirtDepth;
-    float flattenRadius;  // level pad around origin for the house
-    float islandScaleX;   // per-axis coastline stretch
-    float islandScaleZ;
-    uint sculptCount;
-    float sculptMaxDisplacement;
-    int originTileX;   // grid min-corner offset in tiles (0 = centered)
-    int originTileZ;
-    uint terrainStyle; // 0 = smooth radial coast, 1 = stress island layout
-    uint detailRelief; // 1 = extra low/high frequency relief octaves
-};
+#include "terrain_height.hlsli"
 
 // Payload carries each visible tile's world origin (min corner) + tile size
 // directly, so the mesh shader is agnostic to whether the tile came from the
@@ -44,6 +26,7 @@ struct TerrainPayload {
     float  size[32];       // tile world size (metres)
     uint   lod[32];        // tessellation level 0..3
     float  morph[32];      // 0..1 blend toward the next-coarser LOD (geomorph)
+    uint   topology[32];   // seam exponents + exposed outer-edge mask
 };
 
 // Clipmap is enabled by terrainStyle bit 1 (value & 2). In that mode:
@@ -53,6 +36,7 @@ struct TerrainPayload {
 static const uint kClipmapFlag = 2u;
 // Matches TerrainRendererDX12::kStyleDeploymentOverview.
 static const uint kDeploymentOverviewFlag = 8u;
+static const uint kErrorLODFlag = 16u;
 
 groupshared TerrainPayload payloadData;
 groupshared uint visibleCount;
@@ -101,8 +85,10 @@ bool TileIntersectsFrustum(float3 center, float radius) {
 // G/2 x G/2 region is covered by the finer ring inside it). Ring origins snap
 // to their own tile grid so tiles stay stable as the camera moves.
 bool ResolveClipmapTile(uint id, uint G, uint R, float base,
-                        out float2 originXZ, out float sizeOut) {
+                        out float2 originXZ, out float sizeOut,
+                        out uint ringOut, out uint lxOut, out uint lzOut) {
     originXZ = float2(0, 0); sizeOut = base;
+    ringOut = lxOut = lzOut = 0;
     uint ring0 = G * G;
     uint ringN = ring0 - (G / 2) * (G / 2);   // hollow ring tile count
     // Which ring does this id fall in?
@@ -157,7 +143,205 @@ bool ResolveClipmapTile(uint id, uint G, uint R, float base,
     float2 snapped = floor(clipmapCenter / snapGrid) * snapGrid;
     originXZ = snapped + (float2(lx, lz) - (float)(G / 2)) * t;
     sizeOut = t;
+    ringOut = ring;
+    lxOut = lx;
+    lzOut = lz;
     return true;
+}
+
+// Finds the selected clipmap tile immediately across an edge. The search is
+// fine-to-coarse, so points in an outer ring's central hole resolve to the finer
+// ring that actually covers them.
+bool ResolveClipmapTileAt(float2 samplePoint, uint G, uint R, float base,
+                          out float2 originXZ, out float sizeOut,
+                          out uint ringOut, out uint lxOut, out uint lzOut) {
+    float snapGrid = base * (float)(1u << (R - 1));
+    const bool islandCentered =
+        (terrainStyle & kDeploymentOverviewFlag) != 0u;
+    float2 clipmapCenter = islandCentered ? float2(0.0, 0.0) : viewPos.xz;
+    float2 snapped = floor(clipmapCenter / snapGrid) * snapGrid;
+
+    [loop]
+    for (uint ring = 0; ring < R; ++ring) {
+        float t = base * (float)(1u << ring);
+        float2 lower = snapped - (float)(G / 2) * t;
+        int2 cell = int2(floor((samplePoint - lower) / t));
+        if (any(cell < 0) || any(cell >= (int)G)) continue;
+        if (ring > 0) {
+            uint q0 = G / 4, q1 = G - q0;
+            if (cell.x >= (int)q0 && cell.x < (int)q1 &&
+                cell.y >= (int)q0 && cell.y < (int)q1)
+                continue;
+        }
+        originXZ = lower + float2(cell) * t;
+        sizeOut = t;
+        ringOut = ring;
+        lxOut = (uint)cell.x;
+        lzOut = (uint)cell.y;
+        return true;
+    }
+    originXZ = 0.0; sizeOut = base;
+    ringOut = lxOut = lzOut = 0;
+    return false;
+}
+
+bool ResolveTerrainTileAt(float2 samplePoint, out float2 originXZ,
+                          out float sizeOut, out uint ringOut,
+                          out uint lxOut, out uint lzOut) {
+    if ((terrainStyle & kClipmapFlag) != 0u)
+        return ResolveClipmapTileAt(samplePoint, tilesX, tilesZ, tileSize,
+                                    originXZ, sizeOut, ringOut, lxOut, lzOut);
+
+    float2 lower = float2(
+        ((float)originTileX - (float)tilesX * 0.5) * tileSize,
+        ((float)originTileZ - (float)tilesZ * 0.5) * tileSize);
+    int2 cell = int2(floor((samplePoint - lower) / tileSize));
+    if (any(cell < 0) || cell.x >= (int)tilesX || cell.y >= (int)tilesZ) {
+        originXZ = 0.0; sizeOut = tileSize;
+        ringOut = lxOut = lzOut = 0;
+        return false;
+    }
+    originXZ = lower + float2(cell) * tileSize;
+    sizeOut = tileSize;
+    ringOut = 0;
+    lxOut = (uint)cell.x;
+    lzOut = (uint)cell.y;
+    return true;
+}
+
+bool TouchesFinerRing(uint ring, uint lx, uint lz, uint G) {
+    if (ring == 0) return false;
+    uint q0 = G / 4, q1 = G - q0;
+    bool vertical = (lx == q0 - 1 || lx == q1) && lz >= q0 && lz < q1;
+    bool horizontal = (lz == q0 - 1 || lz == q1) && lx >= q0 && lx < q1;
+    return vertical || horizontal;
+}
+
+// Four cross-sections of the actual live height field estimate how much the
+// 8x8 surface would deviate after each 2x reduction. Additive/replace stamps
+// also contribute a conservative bound so a small crater between sample lines
+// cannot disappear into a coarse tile.
+float3 TerrainTileErrors(float2 originXZ, float sizeOut) {
+    float3 errors = 0.0;
+    [unroll]
+    for (uint lineIndex = 0; lineIndex < 4; ++lineIndex) {
+        float samples[9];
+        [unroll]
+        for (uint i = 0; i <= 8; ++i) {
+            float along = (float)i * (1.0 / 8.0);
+            float across = (lineIndex & 1u) != 0u ? 0.75 : 0.25;
+            float2 uv = lineIndex < 2u ? float2(along, across)
+                                  : float2(across, along);
+            samples[i] = TerrainHeight(originXZ + uv * sizeOut);
+        }
+        [unroll]
+        for (uint level = 1; level <= 3; ++level) {
+            uint stride = 1u << level;
+            [unroll]
+            for (uint i = 1; i < 8; ++i) {
+                if ((i % stride) == 0u) continue;
+                uint lo = (i / stride) * stride;
+                uint hi = min(8u, lo + stride);
+                float t = (float)(i - lo) / (float)(hi - lo);
+                float deviation = abs(samples[i] - lerp(samples[lo], samples[hi], t));
+                errors[level - 1] = max(errors[level - 1], deviation);
+            }
+        }
+    }
+
+    float2 tileMin = originXZ;
+    float2 tileMax = originXZ + sizeOut;
+    float sculptError = 0.0;
+    for (uint stampIndex = 0; stampIndex < sculptCount; ++stampIndex) {
+        TerrainSculptStamp stamp = terrainSculpt[stampIndex];
+        float radius = stamp.centerRadius.z * (stamp.operation == 2u ? 1.4143 : 1.0);
+        float2 nearest = clamp(stamp.centerRadius.xy, tileMin, tileMax);
+        if (length(nearest - stamp.centerRadius.xy) > radius) continue;
+        float candidate = stamp.operation == 0u
+            ? abs(stamp.value)
+            : (stamp.operation == 1u
+                ? sculptMaxDisplacement
+                : abs(stamp.value) + abs(stamp.baseHeight) * stamp.replace);
+        sculptError = max(sculptError, candidate);
+    }
+    errors = max(errors, sculptError.xxx);
+
+    // The four lines deliberately under-sample the highest procedural octave.
+    // This small analytic floor prevents diagonal fine relief from aliasing away
+    // without forcing the broad, flat seabed to remain dense.
+    float detailFloor = heightScale * (detailRelief != 0u ? 0.012 : 0.006);
+    errors = max(errors, detailFloor * float3(0.5, 1.0, 2.0));
+    return errors;
+}
+
+float MorphForRejectedLOD(float projectedError) {
+    float threshold = max(0.25, lodNear);
+    return 1.0 - saturate((projectedError - threshold) / (threshold * 0.5));
+}
+
+uint SelectErrorLOD(float2 originXZ, float sizeOut, uint ring,
+                    uint lx, uint lz, out float morphOut) {
+    float3 errors = TerrainTileErrors(originXZ, sizeOut);
+    float2 center = originXZ + sizeOut * 0.5;
+    float distanceToTile = max(sizeOut * 0.5, length(center - viewPos.xz));
+    float pixelsPerMetre = abs(projection[1][1]) * max(1.0, lodStep) * 0.5 /
+                           distanceToTile;
+    float3 projected = errors * pixelsPerMetre;
+    float threshold = max(0.25, lodNear);
+    uint maxLOD = ((terrainStyle & kClipmapFlag) != 0u &&
+                   TouchesFinerRing(ring, lx, lz, tilesX)) ? 2u : 3u;
+
+    morphOut = 0.0;
+    if (maxLOD >= 3u && projected.z <= threshold) return 3u;
+    if (maxLOD >= 2u && projected.y <= threshold) {
+        if (maxLOD >= 3u) morphOut = MorphForRejectedLOD(projected.z);
+        return 2u;
+    }
+    if (projected.x <= threshold) {
+        morphOut = MorphForRejectedLOD(projected.y);
+        return 1u;
+    }
+    morphOut = MorphForRejectedLOD(projected.x);
+    return 0u;
+}
+
+uint SeamExponent(float thisSpacing, float neighbourSpacing) {
+    if (neighbourSpacing <= thisSpacing * 1.01) return 0u;
+    uint ratio = max(1u, (uint)round(neighbourSpacing / thisSpacing));
+    uint exponent = 0u;
+    [unroll]
+    while (exponent < 3u && (1u << exponent) < ratio) ++exponent;
+    return exponent;
+}
+
+uint BuildTileTopology(float2 originXZ, float sizeOut, uint lod) {
+    static const float2 directions[4] = {
+        float2(1, 0), float2(-1, 0), float2(0, 1), float2(0, -1)
+    };
+    float2 center = originXZ + sizeOut * 0.5;
+    float thisSpacing = sizeOut / (float)(8u >> lod);
+    float epsilon = max(0.0001, tileSize * 0.001);
+    uint packed = 0u;
+    uint outerMask = 0u;
+    [unroll]
+    for (uint edge = 0; edge < 4; ++edge) {
+        float2 neighbourOrigin;
+        float neighbourSize;
+        uint neighbourRing, neighbourX, neighbourZ;
+        float2 samplePoint = center + directions[edge] * (sizeOut * 0.5 + epsilon);
+        if (!ResolveTerrainTileAt(samplePoint, neighbourOrigin, neighbourSize,
+                                  neighbourRing, neighbourX, neighbourZ)) {
+            outerMask |= 1u << edge;
+            continue;
+        }
+        float neighbourMorph;
+        uint neighbourLOD = SelectErrorLOD(neighbourOrigin, neighbourSize,
+                                           neighbourRing, neighbourX, neighbourZ,
+                                           neighbourMorph);
+        float neighbourSpacing = neighbourSize / (float)(8u >> neighbourLOD);
+        packed |= SeamExponent(thisSpacing, neighbourSpacing) << (edge * 4u);
+    }
+    return packed | (outerMask << 16u);
 }
 
 [numthreads(32, 1, 1)]
@@ -169,9 +353,10 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
     const bool clipmap = (terrainStyle & kClipmapFlag) != 0u;
 
     float2 originXZ; float tsize; bool valid = false;
+    uint ring = 0, tileX = 0, tileZ = 0;
     if (clipmap) {
         valid = ResolveClipmapTile(tileId, tilesX, tilesZ, tileSize,
-                                   originXZ, tsize);
+                                   originXZ, tsize, ring, tileX, tileZ);
     } else {
         uint tileCount = tilesX * tilesZ;
         if (tileId < tileCount) {
@@ -181,6 +366,8 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
                 ((float)tx + (float)originTileX - (float)tilesX * 0.5) * tileSize,
                 ((float)tz + (float)originTileZ - (float)tilesZ * 0.5) * tileSize);
             tsize = tileSize;
+            tileX = tx;
+            tileZ = tz;
             valid = true;
         }
     }
@@ -208,14 +395,20 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
             // the coarse outer rings to save triangles.
             const bool deploymentOverview =
                 (terrainStyle & kDeploymentOverviewFlag) != 0u;
-            float lodF = deploymentOverview
+            const bool errorLOD =
+                !deploymentOverview && (terrainStyle & kErrorLODFlag) != 0u;
+            float lodF = deploymentOverview || errorLOD
                 ? 0.0 : clamp((dist - lodNear) / lodStep, 0.0, 3.0);
-            uint lod = deploymentOverview ? 0u : (uint)lodF;
+            float morph = 0.0;
+            uint lod = deploymentOverview ? 0u
+                : (errorLOD
+                    ? SelectErrorLOD(originXZ, tsize, ring, tileX, tileZ, morph)
+                    : (uint)lodF);
             // Geomorph: as the tile nears the threshold to the next-coarser LOD,
             // morph rises 0->1 over the last 30% of the band so fine vertices
             // slide onto the coarse grid instead of popping.
-            float morph = deploymentOverview
-                ? 0.0 : smoothstep(0.7, 1.0, frac(lodF));
+            if (!deploymentOverview && !errorLOD)
+                morph = smoothstep(0.7, 1.0, frac(lodF));
 
             uint slot;
             InterlockedAdd(visibleCount, 1, slot);
@@ -223,6 +416,8 @@ void ASMain(uint threadID : SV_GroupThreadID, uint3 groupID : SV_GroupID) {
             payloadData.size[slot] = tsize;
             payloadData.lod[slot] = lod;
             payloadData.morph[slot] = morph;
+            payloadData.topology[slot] = errorLOD
+                ? BuildTileTopology(originXZ, tsize, lod) : 0u;
         }
     }
 

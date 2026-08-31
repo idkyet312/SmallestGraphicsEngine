@@ -205,6 +205,7 @@ if(USE_DX12 AND DXC_EXECUTABLE)
                 ${CMAKE_SOURCE_DIR}/shaders/terrain_as.hlsl
                 -Fo ${CMAKE_BINARY_DIR}/terrain_as.cso
         DEPENDS ${CMAKE_SOURCE_DIR}/shaders/terrain_as.hlsl
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_height.hlsli
         COMMENT "Compiling terrain amplification shader"
     )
     add_custom_command(
@@ -213,6 +214,7 @@ if(USE_DX12 AND DXC_EXECUTABLE)
                 ${CMAKE_SOURCE_DIR}/shaders/terrain_ms.hlsl
                 -Fo ${CMAKE_BINARY_DIR}/terrain_ms.cso
         DEPENDS ${CMAKE_SOURCE_DIR}/shaders/terrain_ms.hlsl
+                ${CMAKE_SOURCE_DIR}/shaders/terrain_height.hlsli
         COMMENT "Compiling terrain mesh shader"
     )
     add_custom_command(

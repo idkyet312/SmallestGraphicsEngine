@@ -1680,6 +1680,7 @@ void LevelEditor::SculptTerrain(CXMMATRIX view, CXMMATRIX projection,
         stamp.value = terrainStampHeight_;
         stamp.texture = terrainStampNames_[terrainStampSelection_];
         stamp.rotation = terrainStampRotation_;
+        stamp.edgeFalloff = terrainStampEdgeFalloff_;
         stamp.replace = terrainStampReplace_;
         // Snapshot the ground under the cursor now. Recomputing it later would
         // fold in whatever stamps land afterwards and make this one drift.
@@ -3120,6 +3121,14 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         ImGui::SliderFloat("Stamp radius", &terrainStampRadius_, 1.0f, 64.0f, "%.1f m");
         ImGui::SliderFloat("Stamp height", &terrainStampHeight_, -32.0f, 32.0f, "%.1f m");
         ImGui::SliderFloat("Rotation", &terrainStampRotation_, 0.0f, 360.0f, "%.0f deg");
+        ImGui::SliderFloat("Edge falloff", &terrainStampEdgeFalloff_,
+                           0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Where the border feather starts, as a fraction of the stamp's\n"
+                "half-width. 0.82 feathers the outer 18%%. Lower it when a\n"
+                "stamp cuts a straight line into the terrain -- the relief then\n"
+                "has more ground to fall off over. 1.00 is a hard square edge.");
 
         // Additive vs replace. Two presets plus the raw slider: full replace and
         // pure additive are what get used, but the in-between blend is genuinely
@@ -3171,7 +3180,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
         }
         if (safeLevel.empty()) safeLevel = "level";
         if (safeLevel.size() > 64) safeLevel.resize(64);
-        const std::string bakeName = "HM_Baked_" + safeLevel + ".png";
+        const std::string bakeName =
+            std::string(kTerrainStampBakePrefix) + safeLevel + ".png";
         TerrainSculptStamp baked;
         const TerrainBakeResult result = BakeTerrainSculptToStamp(
             level_.terrainSculpt, terrainHeight,
@@ -3192,8 +3202,9 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
             "Replace every sculpt stamp with one baked heightmap covering the\n"
-            "same ground. Detail finer than the bake's metres-per-texel is\n"
-            "averaged away; the stamps stay in the undo stack.");
+            "same ground. Bakes at 4096 into a dedicated slot, so the result\n"
+            "stays finer than the terrain can draw at normal level sizes;\n"
+            "the stamps stay in the undo stack.");
     ImGui::EndDisabled();
     if (terrainTool_ != 6)
         ImGui::TextWrapped("Hold LMB on terrain. Flatten uses height where stroke starts.");

@@ -1665,6 +1665,13 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     "for surface break-up, plus macro normal perturbation that "
                     "holds past the close-range detail fade. "
                     "Changes the heightfield, so collision moves with it.");
+            ImGui::Checkbox("Terrain Error LOD", &scene.terrainErrorLOD);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Opt-in projected geometric-error LOD. Keeps visible relief "
+                    "and craters dense while coarsening flat ground, and stitches "
+                    "fine tile edges to coarser neighbours instead of hiding "
+                    "internal cracks with skirts.");
         }
         ImGui::DragFloat("Specular", &scene.specularStrength, 0.01f, 0.0f, 1.0f);
 
@@ -2495,6 +2502,39 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                         "its own so raising this cannot alias the horizon.");
                 ImGui::SliderFloat("Foam Strength",
                     &scene.highWaterFoamStrength, 0.0f, 2.5f, "%.2f");
+                ImGui::SliderFloat("Shore Refraction",
+                    &scene.highWaterShoreRefraction, 0.0f, 1.0f, "%.2f");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "How far waves turn to face the coast, over the same\n"
+                        "signed-distance bathymetry Ultra refracts against.\n"
+                        "The open ocean keeps its offshore swell direction:\n"
+                        "each train only starts bending once the depth drops\n"
+                        "below about half its own wavelength, so long swell\n"
+                        "turns first and short chop stays deep-water until it\n"
+                        "is nearly ashore. Carries the wavefront irregularity\n"
+                        "too, so the bent crests arrive ragged rather than as\n"
+                        "concentric arcs.\n\n"
+                        "Visual only: CPU buoyancy cannot sample the GPU\n"
+                        "bathymetry, so in the shoaling band floating objects\n"
+                        "sit on the unrefracted surface. Keep it low where a\n"
+                        "boat has to look right, or use Ultra, which reads its\n"
+                        "heights back from the GPU.");
+                ImGui::SliderFloat("Shore Flatten",
+                    &scene.highWaterShoreFlatten, 0.0f, 1.0f, "%.2f");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "How the waves shoal as the bed rises, on the same\n"
+                        "per-train depth ramp: wavelengths compress, crests\n"
+                        "steepen and gain height, then cap at the 0.39 x depth\n"
+                        "breaker limit so swell cannot run into the beach at\n"
+                        "full deep-water height.\n\n"
+                        "Safe to leave on. Unlike refraction this only lowers\n"
+                        "the surface, and only in shallows. It is also what\n"
+                        "stops the shallows showing hard polygonal facets --\n"
+                        "neighbouring crests folding through each other where\n"
+                        "the water is too shallow to hold them, which makes\n"
+                        "the clipmap triangles visible.");
                 if (ImGui::Button("Reset High Waves")) {
                     scene.highWaterWaveHeight = 1.0f;
                     scene.highWaterWaveScale = 1.0f;
@@ -2502,6 +2542,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                     scene.highWaterChoppiness = 1.0f;
                     scene.highWaterMicroDetail = 1.0f;
                     scene.highWaterFoamStrength = 1.0f;
+                    scene.highWaterShoreRefraction = 0.0f;
+                    scene.highWaterShoreFlatten = 0.30f;
                 }
                 ImGui::TreePop();
             }

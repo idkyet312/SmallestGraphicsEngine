@@ -102,6 +102,15 @@ struct TerrainSculptStamp {
     // sampled where the stamp was placed. Stored rather than recomputed so a
     // replace stamp stays put when a later stamp changes the ground under it.
     float baseHeight = 0.0f;
+    // Where the border feather starts, as a fraction of the half-width: 0.82
+    // means the outer 18% ramps the stamp's influence to nothing. Lower values
+    // spread that ramp inward over more ground, which is what stops a stamp
+    // whose relief is still tall at its border from cutting a straight edge
+    // into the terrain. 1 disables the feather entirely (a hard square edge).
+    //
+    // Defaulted to the value that used to be hardcoded, so levels authored
+    // before this was tunable load and render unchanged.
+    float edgeFalloff = 0.82f;
 };
 
 // A circle where the automatically scattered ground cover is suppressed.

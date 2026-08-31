@@ -740,10 +740,12 @@ public:
         rootParams[12].ShaderVisibility = D3D12_SHADER_VISIBILITY_AMPLIFICATION;
         rootParams[13].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[13].Descriptor.ShaderRegister = 10;
-        rootParams[13].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
+        // Error-based terrain LOD measures the same live sculpted height field
+        // in the amplification shader before the mesh shader consumes it.
+        rootParams[13].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         rootParams[14].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         rootParams[14].Descriptor.ShaderRegister = 11;
-        rootParams[14].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
+        rootParams[14].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         // Sky irradiance SH coefficients (b7) - diffuse IBL ambient term
         rootParams[15].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;

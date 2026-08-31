@@ -265,6 +265,9 @@ private:
     float terrainStampRadius_ = 16.0f;
     float terrainStampHeight_ = 6.0f;
     float terrainStampRotation_ = 0.0f;
+    // Matches TerrainSculptStamp::edgeFalloff's default, which is the width the
+    // border feather was hardcoded to before it became tunable.
+    float terrainStampEdgeFalloff_ = 0.82f;
     // 0 = the stamp's relief is added to the ground, 1 = it replaces it.
     float terrainStampReplace_ = 0.0f;
     // Lifts or sinks a replace stamp's target plane relative to the ground the

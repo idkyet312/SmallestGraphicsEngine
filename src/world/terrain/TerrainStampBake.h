@@ -127,7 +127,11 @@ TerrainBakeResult BakeTerrainSculptToStamp(
     const float halfSpan = (std::max)((std::max)(spanX, spanZ) * 0.5f, 0.5f) *
         1.02f;
 
-    const uint32_t resolution = kTerrainStampResolution;
+    // A bake spans the whole sculpt stack, not the ~64 m of a hand-placed
+    // stamp, so it writes at the dedicated slot's resolution. At 512 a level
+    // sculpted across 500 m resolved to ~1 m/texel and averaged its own detail
+    // away; 4096 puts that at ~12 cm, finer than the clipmap can draw.
+    const uint32_t resolution = kTerrainStampBakeResolution;
     std::vector<uint16_t> gray(static_cast<size_t>(resolution) * resolution, 0);
 
     // Sample the stack, tracking the range so the 16-bit codomain is used fully
@@ -188,6 +192,11 @@ TerrainBakeResult BakeTerrainSculptToStamp(
     // sampled from, so adding it on top would apply that ground twice.
     outStamp.replace = 1.0f;
     outStamp.baseHeight = midHeight;
+    // No second feather. Every source stamp's own edge falloff is already in
+    // the sampled heights, and the bounds carry 2% of margin, so the border is
+    // empty ground either way. Feathering again would fade that border toward
+    // baseHeight and ring the whole bake.
+    outStamp.edgeFalloff = 1.0f;
 
     result.ok = true;
     result.texture = outputName;
