@@ -70,6 +70,10 @@ struct Projectile {
     uint32_t grenadePhysicsHandle = 0; // live Box3D rigid body after throw
     XMFLOAT4 rotation = { 0, 0, 0, 1 };
     bool     detonate = false;         // set the frame it should explode
+    // Explodes on first contact instead of bouncing and burning its fuse. A
+    // thrown frag is meant to be bounced around cover, but a missile called in
+    // on a map coordinate has to burst where it was aimed.
+    bool     impactFuse = false;
     float    fxCooldown = 0.0f;
 };
 
@@ -1245,13 +1249,13 @@ struct Scene {
                     const float bounceY = surfaceY + grenadeGroundY;
                     if (p.position.y < bounceY) {
                         p.position.y = bounceY;
-                        if (p.molotov || p.vortex) {
+                        if (p.molotov || p.vortex || p.impactFuse) {
                             p.detonate = true;
                             p.active = false;
                         } else if (p.velocity.y < 0.0f) {
                             p.velocity.y = -p.velocity.y * 0.4f;
                         }
-                        if (!p.molotov && !p.vortex) {
+                        if (!p.molotov && !p.vortex && !p.impactFuse) {
                             p.velocity.x *= 0.7f;
                             p.velocity.z *= 0.7f;
                         }

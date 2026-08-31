@@ -1767,6 +1767,10 @@ static int g_selectedDeploymentZone = -1;
 static XMFLOAT3 g_deploymentTarget{};
 static bool g_deploymentTargetValid = false;
 static float g_deploymentFlythroughTime = 0.0f;
+// Missile strike armed from the deployment map. While armed, a click on the
+// map picks the impact point instead of a landing zone, so the two picking
+// modes never compete for the same click.
+static bool g_missileStrikeArmed = false;
 // Mouse-wheel zoom on the deployment overview, as a multiplier on the orbit
 // rig BuildCameraFrame composes. Applied to radius and height together so the
 // framing scales instead of skewing: pulling in low over the island would
@@ -4883,6 +4887,56 @@ static void BanditThrowGrenade(const SkinnedEnemy& bandit,
                          verticalSpeed,
                          dz * inverseHorizontal * horizontalSpeed };
     scene.projectiles.push_back(grenade);
+}
+
+// Fires an impact-fused round from the deployment camera to a map coordinate.
+//
+// It launches from where the player is looking from and flies to where they
+// clicked, so the shot reads as coming off the screen rather than materialising
+// overhead. The camera orbits high above the island, so this is a steep
+// descending flight rather than a lobbed throw.
+//
+// Flight time is fixed rather than derived from a launch speed: given a start,
+// an end and a duration, the required velocity is exact, so the round lands on
+// the clicked point regardless of how far the camera happens to be orbiting.
+// Solving for an angle instead would miss whenever the target was out of range.
+static void LaunchMissileStrike(const XMFLOAT3& origin,
+                                const XMFLOAT3& target) {
+    // Long enough to watch it travel, short enough not to leave the player
+    // waiting on the planning screen.
+    constexpr float kFlightSeconds = 1.6f;
+    const float gravity = 9.81f * scene.grenadeGravityScale;
+
+    Projectile missile = {};
+    missile.position = missile.previousPosition = origin;
+    missile.grenade = true;
+    missile.hostile = false;
+    missile.active = true;
+    // Impact-fused: it bursts on first contact instead of bouncing like a
+    // thrown frag. The fuse is only a failsafe for a round that somehow
+    // contacts nothing.
+    missile.impactFuse = true;
+    missile.fuse = kFlightSeconds + 8.0f;
+    // Launched from the camera, which is where the player's own body would be
+    // -- without the grace period the round detonates on its own launch point.
+    missile.grenadeCollisionGrace = 0.18f;
+
+    // Displacement under constant gravity: d = v*t + 0.5*g*t^2, so the velocity
+    // that puts it exactly on target at t is v = (d - 0.5*g*t^2) / t. The
+    // vertical term carries the gravity correction; horizontal is just d/t.
+    const float dx = target.x - origin.x;
+    const float dy = target.y - origin.y;
+    const float dz = target.z - origin.z;
+    missile.velocity = {
+        dx / kFlightSeconds,
+        dy / kFlightSeconds + 0.5f * gravity * kFlightSeconds,
+        dz / kFlightSeconds };
+
+    const float horizontal = std::sqrt(dx * dx + dz * dz);
+    missile.direction = horizontal > 0.01f
+        ? XMFLOAT3{ dx / horizontal, 0.0f, dz / horizontal }
+        : XMFLOAT3{ 0.0f, -1.0f, 0.0f };
+    scene.projectiles.push_back(missile);
 }
 
 // Red targeting beam a charging sniper paints on the player. Drawn as a thin
@@ -12787,6 +12841,48 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                 io.MouseDelta.y * kDeploymentOrbitElevationRadiansPerPixel;
         }
     }
+
+    // Missile targeting takes the click while armed, so it never competes with
+    // zone selection. Unproject the cursor through the same view-projection the
+    // markers are drawn with, then walk the ray into the terrain with the sweep
+    // the projectile system already uses -- picking against the real height
+    // field rather than a flat plane, so a strike called on a hillside lands on
+    // the slope instead of punching through it.
+    bool missileClickConsumed = false;
+    if (g_missileStrikeArmed && selectClick) {
+        XMVECTOR determinant;
+        const XMMATRIX inverseViewProjection =
+            XMMatrixInverse(&determinant, viewProjection);
+        if (!XMVector4Equal(determinant, XMVectorZero())) {
+            const float ndcX = (mouse.x / display.x) * 2.0f - 1.0f;
+            const float ndcY = 1.0f - (mouse.y / display.y) * 2.0f;
+            const XMVECTOR nearClip = XMVectorSet(ndcX, ndcY, 0.0f, 1.0f);
+            const XMVECTOR farClip = XMVectorSet(ndcX, ndcY, 1.0f, 1.0f);
+            XMVECTOR nearWorld =
+                XMVector4Transform(nearClip, inverseViewProjection);
+            XMVECTOR farWorld =
+                XMVector4Transform(farClip, inverseViewProjection);
+            const float nearW = XMVectorGetW(nearWorld);
+            const float farW = XMVectorGetW(farWorld);
+            if (std::abs(nearW) > 1e-6f && std::abs(farW) > 1e-6f) {
+                nearWorld = XMVectorScale(nearWorld, 1.0f / nearW);
+                farWorld = XMVectorScale(farWorld, 1.0f / farW);
+                XMFLOAT3 rayStart, rayEnd;
+                XMStoreFloat3(&rayStart, nearWorld);
+                XMStoreFloat3(&rayEnd, farWorld);
+                XMFLOAT3 impact;
+                if (HitTerrainSegment(rayStart, rayEnd, 0.0f, impact)) {
+                    // Fired from the camera itself, so the round leaves from
+                    // the viewpoint the player is looking through and flies out
+                    // to where they clicked.
+                    LaunchMissileStrike(scene.camera.Position, impact);
+                    g_missileStrikeArmed = false;
+                    missileClickConsumed = true;
+                }
+            }
+        }
+    }
+
     for (size_t index = 0; index < g_deploymentZones.size(); ++index) {
         XMFLOAT3 marker = g_deploymentZones[index];
         marker.y += 1.3f;
@@ -12804,7 +12900,8 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         const float dy = mouse.y - screen.y;
         // 24px stays comfortable at 20 zones: the tightest the markers ever get
         // on screen is 51.9px apart, so no two pick areas can overlap.
-        if (selectClick && dx * dx + dy * dy <= 24.0f * 24.0f) {
+        if (selectClick && !missileClickConsumed &&
+            dx * dx + dy * dy <= 24.0f * 24.0f) {
             g_selectedDeploymentZone = static_cast<int>(index);
         }
         // White markers. Selection reads as full white against a dimmer grey
@@ -13496,6 +13593,30 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     if (!weaponsReady)
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.2f, 1.0f),
                            "Selected weapon asset is unavailable");
+    // Fire support. Outside the DEPLOY disable block on purpose: calling in a
+    // strike does not need a landing zone picked or a valid loadout, and
+    // greying it out with DEPLOY would read as though the two were one action.
+    ImGui::SetCursorPosX(45.0f);
+    if (g_missileStrikeArmed) {
+        ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(150, 45, 30, 255));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(190, 60, 40, 255));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(210, 70, 45, 255));
+        if (ImGui::Button("CANCEL STRIKE", ImVec2(340.0f, 32.0f)))
+            g_missileStrikeArmed = false;
+        ImGui::PopStyleColor(3);
+        ImGui::SetCursorPosX(45.0f);
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
+                           "Click the map to set the impact point");
+    } else {
+        if (ImGui::Button("LAUNCH MISSILE", ImVec2(340.0f, 32.0f)))
+            g_missileStrikeArmed = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Call in an impact-fused round. Arms targeting; the next\n"
+                "click on the map is the impact point, not a zone pick.");
+    }
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
     ImGui::BeginDisabled(g_selectedDeploymentZone < 0 || !weaponsReady);
     ImGui::SetCursorPosX(45.0f);
     // The one action this whole screen exists to reach, so it carries the accent
@@ -19336,7 +19457,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     }
                 };
                 if (projectile.grenade && projectile.active && !projectile.held) {
-                    if ((projectile.molotov || projectile.vortex) &&
+                    if ((projectile.molotov || projectile.vortex ||
+                         projectile.impactFuse) &&
                         std::find(grenadeContactEvents.begin(),
                                   grenadeContactEvents.end(),
                                   projectile.grenadePhysicsHandle) !=
@@ -19349,7 +19471,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     if (projectile.active && HitGrenadeCollision(
                             projectile, 0.11f, impact, normal,
                             projectile.grenadePhysicsHandle == 0)) {
-                        if (projectile.molotov || projectile.vortex) {
+                        if (projectile.molotov || projectile.vortex ||
+                            projectile.impactFuse) {
                             projectile.position = impact;
                             projectile.active = false;
                             projectile.detonate = true;
