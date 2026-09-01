@@ -143,6 +143,50 @@ static const float2 kStressPadCenters[8] = {
     float2(  0.0, -42.0), float2(42.0, -42.0)
 };
 
+// Boolean-style crater: subtracts a bowl shape from the ground instead of
+// easing it down. Three bands out from the centre:
+//
+//   floor  (0 .. floorFrac)   flat at rimHeight - depth, so the crater has a
+//                             readable bottom rather than a single low point
+//   wall   (floorFrac .. 1)   climbs back to the surface; sharpness bends this
+//                             toward vertical, which is what makes it read as
+//                             a cut face rather than a slope
+//   lip    (just past 1)      a small raised ring of ejecta
+//
+// The floor is levelled against rimHeight (the ground height sampled when the
+// blast happened) rather than the local height, so the bottom comes out flat
+// even on a hillside -- a subtracted shape, not a dent that follows the slope.
+// max() against the existing ground keeps overlapping craters from stacking
+// into a pit: the deepest one wins, exactly as a union of cuts would.
+float ApplyCraterCut(float h, float distance, float radius, float depth,
+                     float sharpness, float floorFrac, float rimHeight) {
+    if (distance > radius * 1.18) return h;
+
+    float t = saturate(distance / max(radius, 0.0001));
+    float floorEnd = clamp(floorFrac, 0.05, 0.9);
+
+    float carved;
+    if (t <= floorEnd) {
+        carved = rimHeight - depth;
+    } else {
+        // Normalised position across the wall, steepened by sharpness. A high
+        // exponent holds the floor level almost to the rim then turns up hard.
+        float wall = saturate((t - floorEnd) / max(1.0 - floorEnd, 0.0001));
+        float shaped = pow(wall, max(sharpness, 0.05));
+        carved = lerp(rimHeight - depth, rimHeight, shaped);
+    }
+
+    // Only ever cut downward, and never fill a hole that is already deeper.
+    float cut = min(h, carved);
+
+    // Ejecta lip: a thin raised ring straddling the rim, tapering to nothing.
+    // Scaled off depth so a bigger blast throws up a bigger berm.
+    float lipWidth = 0.18;
+    float lip = 1.0 - saturate(abs(t - 1.0) / lipWidth);
+    lip = lip * lip * (3.0 - 2.0 * lip);
+    return cut + lip * depth * 0.075;
+}
+
 float ApplySculpt(float h, float2 xz) {
     for (uint stampIndex = 0; stampIndex < sculptCount; ++stampIndex) {
         TerrainSculptStamp stamp = terrainSculpt[stampIndex];
@@ -151,8 +195,14 @@ float ApplySculpt(float h, float2 xz) {
             h += sampled.x + (stamp.baseHeight - h) * (sampled.y * stamp.replace);
             continue;
         }
-        float weight = saturate(1.0 -
-            length(xz - stamp.centerRadius.xy) / stamp.centerRadius.z);
+        float distance = length(xz - stamp.centerRadius.xy);
+        if (stamp.operation == 3) {
+            h = ApplyCraterCut(h, distance, stamp.centerRadius.z, stamp.value,
+                               stamp.strength, stamp.edgeFalloff,
+                               stamp.baseHeight);
+            continue;
+        }
+        float weight = saturate(1.0 - distance / stamp.centerRadius.z);
         weight = weight * weight * (3.0 - 2.0 * weight);
         if (stamp.operation == 0)
             h += stamp.value * weight;

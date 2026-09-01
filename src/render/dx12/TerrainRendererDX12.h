@@ -338,12 +338,16 @@ public:
         if (stamp.operation == TerrainSculptOperation::Heightmap)
             EnsureHeightStampLoaded(stamp.texture);
         s_sculptStamps.push_back(stamp);
-        // Runtime Add stamps are local blast/crash dimples. Rebuilding the
-        // ocean's whole shoreline distance field for one of them costs seconds
-        // and cannot change the authored coastline in a meaningful way. A
-        // future runtime replace/heightmap still takes the conservative path.
+        // Runtime blast/crash deformation is local. Rebuilding the ocean's
+        // whole shoreline distance field for one of them costs seconds and
+        // cannot change the authored coastline in a meaningful way; only a
+        // heightmap/replace stamp can actually move the coast.
+        //
+        // Tested positively for Heightmap rather than as "!= Add": the old form
+        // silently opted every newly added operation into the seconds-long
+        // rebuild, which is exactly what the Crater op did when it landed.
         RefreshSculptDisplacement(
-            stamp.operation != TerrainSculptOperation::Add);
+            stamp.operation == TerrainSculptOperation::Heightmap);
     }
 
 private:
@@ -594,6 +598,41 @@ public:
         return ApplySculpt(h, x, z, sculpt);
     }
 
+    // Boolean-style crater cut: flat floor, steep wall, raised ejecta lip, so
+    // the blast reads as a shape subtracted from the ground rather than a
+    // smooth dent. Must match ApplyCraterCut in terrain_height.hlsli -- this is
+    // the copy collision and navmesh query, so any drift puts the player's feet
+    // somewhere other than the crater they can see.
+    static float ApplyCraterCut(float h, float distance, float radius,
+                                float depth, float sharpness, float floorFrac,
+                                float rimHeight) {
+        if (distance > radius * 1.18f) return h;
+
+        const float t = (std::min)(1.0f,
+            distance / (std::max)(radius, 0.0001f));
+        const float floorEnd = (std::min)(0.9f, (std::max)(0.05f, floorFrac));
+
+        float carved;
+        if (t <= floorEnd) {
+            carved = rimHeight - depth;
+        } else {
+            const float wall = (std::min)(1.0f, (t - floorEnd) /
+                (std::max)(1.0f - floorEnd, 0.0001f));
+            const float shaped = powf(wall, (std::max)(sharpness, 0.05f));
+            carved = (rimHeight - depth) + (rimHeight - (rimHeight - depth)) *
+                shaped;
+        }
+
+        // Deepest cut wins, and a crater never fills ground back in.
+        const float cut = (std::min)(h, carved);
+
+        const float lipWidth = 0.18f;
+        float lip = 1.0f - (std::min)(1.0f, fabsf(t - 1.0f) / lipWidth);
+        lip = lip < 0.0f ? 0.0f : lip;
+        lip = lip * lip * (3.0f - 2.0f * lip);
+        return cut + lip * depth * 0.075f;
+    }
+
     // Applies every live sculpt stamp to an already-shaped ground height.
     // Shared by the procedural island and the flat authoring plane so the two
     // cannot drift. Must match ApplySculpt in terrain_ms.hlsl.
@@ -614,6 +653,12 @@ public:
             const float dx = x - stamp.x;
             const float dz = z - stamp.z;
             const float distance = sqrtf(dx * dx + dz * dz);
+            if (stamp.operation == TerrainSculptOperation::Crater) {
+                h = ApplyCraterCut(h, distance, stamp.radius, stamp.value,
+                                   stamp.strength, stamp.edgeFalloff,
+                                   stamp.baseHeight);
+                continue;
+            }
             float weight = 1.0f - distance / stamp.radius;
             weight = weight < 0.0f ? 0.0f : (weight > 1.0f ? 1.0f : weight);
             weight = weight * weight * (3.0f - 2.0f * weight);

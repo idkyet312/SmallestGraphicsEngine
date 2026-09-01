@@ -1023,7 +1023,10 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
     return params;
 }
 
-static void AddExplosionTerrainCrater(const XMFLOAT3& impact) {
+// blastScale widens the hole for oversized blasts (a called-in missile strike);
+// ordinary explosions leave it at 1 and dig the usual grenade-sized crater.
+static void AddExplosionTerrainCrater(const XMFLOAT3& impact,
+                                      float blastScale = 1.0f) {
     if (!scene.useMeshTerrain || !g_terrain.supported) return;
 
     // Craters must land on any island size. The sculpt evaluator works in raw
@@ -1042,10 +1045,29 @@ static void AddExplosionTerrainCrater(const XMFLOAT3& impact) {
     TerrainSculptStamp crater;
     crater.x = impact.x;
     crater.z = impact.z;
-    crater.radius = scene.grenadeBlastRadius * craterScale;
-    crater.operation = TerrainSculptOperation::Add;
-    crater.value = -1.0f * craterScale;
-    crater.strength = 1.0f;
+    crater.radius = scene.explosionBlastRadius * craterScale * blastScale;
+    // Boolean-style cut rather than a smooth dent: flat floor, steep wall and
+    // an ejecta lip, so the hole reads as a shape subtracted from the ground.
+    crater.operation = TerrainSculptOperation::Crater;
+    // Depth in metres, positive (the Crater op subtracts it). Follows the
+    // square root of the width so a strike four times wider digs twice as
+    // deep, keeping a big crater a bowl instead of a shaft.
+    crater.value = scene.craterDepth * craterScale * sqrtf(blastScale);
+    // Wall exponent: >1 holds the floor flat then turns up hard at the rim.
+    crater.strength = scene.craterWallSharpness;
+    // Fraction of the radius that stays flat floor before the wall starts.
+    crater.edgeFalloff = scene.craterFloorFraction;
+    // The height the floor is levelled against and the wall climbs back to.
+    // Sampled once here rather than per-vertex so the floor comes out flat
+    // even when the blast lands on a slope -- that flatness is what makes it
+    // read as a cut shape instead of a dent following the hillside.
+    // heightScale is applied here rather than taken from CurrentTerrainParams,
+    // which leaves it at its default -- sampling without it would level the
+    // floor against the wrong height and float or bury the crater.
+    TerrainRendererDX12::Params heightParams = terrainParams;
+    heightParams.heightScale = scene.terrainHeightScale;
+    crater.baseHeight = TerrainRendererDX12::HeightAt(
+        heightParams, impact.x, impact.z);
     // At capacity, drop the OLDEST crater rather than rejecting the new one --
     // a barrel that explodes must always leave a hole. SetSculptStamps trims
     // from the front too, so CPU collision and the GPU buffer stay in sync.
@@ -1059,12 +1081,36 @@ static void AddExplosionTerrainCrater(const XMFLOAT3& impact) {
         g_terrain.AddRuntimeSculptStamp(crater);
     }
     g_terrainDeformedThisFrame = true;
-    const float foliageRadius = crater.radius * 0.5f;
+    {
+        // Without this the Box3D heightfield keeps the pre-blast ground and
+        // debris rests on a surface that is no longer there. Only the crater's
+        // own cells are re-sampled; the lip reaches past the radius, so the
+        // patch window matches the 1.18x the cut actually spans.
+        ProfilerDX12::CpuScope craterPhysicsProfile(
+            g_profiler, "Crater/Physics");
+        g_destruction.RefreshTerrainRegion(impact.x, impact.z,
+                                           crater.radius * 1.18f);
+        // Drop any brick foundation the hole just undermined. The crater floor
+        // is the new ground under it, and the flat part of the cut is what
+        // actually removes support -- past that the wall climbs back to grade,
+        // so a slab out there still has ground beneath it.
+        g_destruction.UndermineSupports(
+            impact, crater.radius * scene.craterFloorFraction,
+            crater.baseHeight - crater.value);
+    }
+    // Clear foliage across the whole cut, not half of it. At 0.5x the grass
+    // stopped well inside the visible hole and blades were left standing in the
+    // open crater; 1.18x is the crater's true extent (the ejecta lip reaches
+    // past the radius), and the grass exclusion test is a nearest-point circle
+    // against 8 m cells, so it needs to cover the hole rather than sit inside it.
+    const float foliageRadius = crater.radius * 1.18f;
     {
         ProfilerDX12::CpuScope craterFoliageProfile(
             g_profiler, "Crater/Foliage");
         g_grass.AddRuntimeExclusion(impact.x, impact.z, foliageRadius);
-        g_trees.ApplyExplosion(impact, foliageRadius);
+        // Trees keep the tighter radius: felling every palm out to the lip
+        // clears far more than the blast visibly disturbed.
+        g_trees.ApplyExplosion(impact, crater.radius * 0.5f);
     }
 }
 
@@ -1117,6 +1163,19 @@ static void AddBlackHawkCrashCraters(const XMFLOAT3& impact, float yaw) {
     // The three gouges went in above via AddRuntimeSculptStamp, which bumps the
     // revision each time; the buffer uploads once for the frame regardless.
     g_terrainDeformedThisFrame = true;
+    {
+        // One patch spanning the whole furrow rather than one per gouge: each
+        // call rebuilds the collision shape, so three would pay that three
+        // times over a region they largely share.
+        ProfilerDX12::CpuScope gougePhysicsProfile(
+            g_profiler, "Crater/Physics");
+        float furthest = 0.0f;
+        for (const Gouge& gouge : kGouges) {
+            furthest = (std::max)(furthest,
+                std::abs(gouge.along) * scale + gouge.radius * scale);
+        }
+        g_destruction.RefreshTerrainRegion(impact.x, impact.z, furthest);
+    }
 }
 
 static size_t LiveBanditCount() {
@@ -4916,6 +4975,7 @@ static void LaunchMissileStrike(const XMFLOAT3& origin,
     // thrown frag. The fuse is only a failsafe for a round that somehow
     // contacts nothing.
     missile.impactFuse = true;
+    missile.missile = true;
     missile.fuse = kFlightSeconds + 8.0f;
     // Launched from the camera, which is where the player's own body would be
     // -- without the grace period the round detonates on its own launch point.
@@ -13615,6 +13675,29 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
                 "Call in an impact-fused round. Arms targeting; the next\n"
                 "click on the map is the impact point, not a zone pick.");
     }
+
+    // Blast size. Applies to the called-in strike only, so widening it does not
+    // turn every hand grenade into an airstrike. Editable while armed -- the
+    // scale is read at detonation, so a change still lands on a round already
+    // in flight.
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
+    ImGui::SetCursorPosX(45.0f);
+    ImGui::SetNextItemWidth(340.0f);
+    ImGui::SliderFloat("##MissileBlastScale", &scene.missileBlastScale,
+                       0.5f, 8.0f, "Blast x%.2f");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Scales the strike's blast: debris, enemy reach, explosion\n"
+            "FX and the terrain crater all widen together.");
+    {
+        // The multiplier alone says nothing about how much ground the strike
+        // covers, so quote the radius that actually kills.
+        const float lethalRadius =
+            scene.grenadeEnemyRadius * scene.missileBlastScale;
+        ImGui::SetCursorPosX(45.0f);
+        ImGui::TextColored(ImVec4(0.62f, 0.66f, 0.72f, 1.0f),
+                           "%.1f m lethal radius", lethalRadius);
+    }
     ImGui::Dummy(ImVec2(0.0f, 6.0f));
 
     ImGui::BeginDisabled(g_selectedDeploymentZone < 0 || !weaponsReady);
@@ -14722,9 +14805,49 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
         }
     };
 
-    // --- Foundation: single anchored slab spanning the footprint. ---
-    addBox("Support:Foundation", matFoundation, minX, maxX,
-        floorY - foundationEmbed, floorY + wall, minZ, maxZ);
+    // Lays an anchored floor as a grid of tiles rather than one slab, so a
+    // crater can take out the part it actually undermined and leave the rest
+    // standing. As a single 7x5 m chunk the floor was all-or-nothing: anything
+    // that freed it dropped the entire storey at once. Every tile is still
+    // "Support:", so the building is just as solidly anchored until something
+    // digs the ground out from under a specific tile.
+    //
+    // ~1.2 m tiles: small enough that a 3.5 m grenade crater takes a believable
+    // bite, large enough to keep the chunk count (and the bond graph the
+    // structural solver walks) modest.
+    // Group ids for the tiled floors. Kept well clear of the per-board ids the
+    // walls and roof allocate from `pieceId` below, so no floor ever shares a
+    // group with a cladding plank.
+    constexpr int kWoodFloorGroup = 9000;
+    constexpr int kMetalFloorGroup = 9001;
+    // All tiles of one floor share a single "@<id>" group. That group id is
+    // what makes the floor behave as one thing: undermine any tile and the
+    // whole floor is released together, so a hole under one corner drops the
+    // storey instead of leaving the rest of the bricks hanging over open air
+    // on the strength of their neighbours.
+    const auto addTiledFoundation = [&](const char* prefix, int groupId,
+                                        float x0, float x1, float y0, float y1,
+                                        float z0, float z1) {
+        constexpr float kTileTarget = 1.2f;
+        const int tilesX = (std::max)(1, (int)std::lround((x1 - x0) / kTileTarget));
+        const int tilesZ = (std::max)(1, (int)std::lround((z1 - z0) / kTileTarget));
+        const float tileX = (x1 - x0) / tilesX;
+        const float tileZ = (z1 - z0) / tilesZ;
+        for (int tz = 0; tz < tilesZ; ++tz)
+        for (int tx = 0; tx < tilesX; ++tx) {
+            // "<name>@<id>": the chunk builder parses the numeric suffix into
+            // plankGroup, and every tile of this floor carries the same one.
+            const std::string tileName =
+                std::string(prefix) + "@" + std::to_string(groupId);
+            addBox(tileName.c_str(), matFoundation,
+                   x0 + tx * tileX, x0 + (tx + 1) * tileX, y0, y1,
+                   z0 + tz * tileZ, z0 + (tz + 1) * tileZ);
+        }
+    };
+
+    // --- Foundation: anchored brick floor, tiled across the footprint. ---
+    addTiledFoundation("Support:FoundationTile", kWoodFloorGroup, minX, maxX,
+                       floorY - foundationEmbed, floorY + wall, minZ, maxZ);
 
     // --- Studded wall: vertical studs + outer cladding along one edge. The
     // bottom row of studs is anchored (the sill plate), so the wall stands. ---
@@ -14937,8 +15060,8 @@ static std::shared_ptr<SceneNode> CreateDestructibleWallModel() {
     const float eaveY = sy0 + 2.85f;
     const float metalT = 0.06f;
     const float panelW = 0.42f;
-    addBox("Support:MetalFoundation", matFoundation, sx0, sx1,
-        sy0 - foundationEmbed, slabTop, sz0, sz1);
+    addTiledFoundation("Support:MetalFoundationTile", kMetalFloorGroup, sx0, sx1,
+                       sy0 - foundationEmbed, slabTop, sz0, sz1);
     auto addMetalPanel = [&](float x0, float x1, float y0, float y1, float z0, float z1) {
         const int id = pieceId++;
         addVoronoiBoard(("MetalWall@" + std::to_string(id)).c_str(), matMetalWall,
@@ -19578,10 +19701,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             projectile.grenadePhysicsHandle = 0;
                         }
                         const bool c4Blast = projectile.remoteCharge;
+                        // A called-in strike is the same blast as a frag, just
+                        // scaled up: one dial widens debris, enemy reach, FX
+                        // and crater together so the explosion stays coherent.
+                        // Every explosion is the default radius times its own
+                        // factor: a called-in strike scales up, a thrown frag
+                        // scales down. C4 keeps its authored absolute radius.
+                        const float blastScale = projectile.missile
+                            ? (std::max)(0.1f, scene.missileBlastScale)
+                            : (std::max)(0.1f, scene.grenadeBlastScale);
                         const float blastRadius = c4Blast
-                            ? 5.4f : scene.grenadeBlastRadius;
+                            ? 5.4f : scene.explosionBlastRadius * blastScale;
+                        // Kill radius is its own tunable and is NOT scaled by
+                        // the visual factor -- shrinking a grenade's burst must
+                        // not quietly shrink what it kills.
                         const float enemyRadius = c4Blast
-                            ? 8.5f : scene.grenadeEnemyRadius;
+                            ? 8.5f : scene.grenadeEnemyRadius *
+                                (projectile.missile ? blastScale : 1.0f);
                         const float enemyDamage = c4Blast
                             ? 650.0f : scene.grenadeEnemyDamage;
                         const float enemyPush = c4Blast
@@ -19654,7 +19790,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             continue;
                         }
                         if (projectile.grenade)
-                            AddExplosionTerrainCrater(center);
+                            AddExplosionTerrainCrater(center, blastScale);
                         {
                             ProfilerDX12::CpuScope blastFXProfile(
                                 g_profiler, "Blast/FX");

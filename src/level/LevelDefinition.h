@@ -78,7 +78,13 @@ struct LevelSplinePath {
 enum class TerrainSculptOperation : uint32_t {
     Add = 0,
     Flatten = 1,
-    Heightmap = 2
+    Heightmap = 2,
+    // Boolean-style cut: the ground inside the radius is replaced by a bowl
+    // (flat floor, steep wall, raised lip) rather than eased down by a smooth
+    // falloff the way Add does. Reads as a shape subtracted from the terrain,
+    // which is what an explosion crater should look like. edgeFalloff sets the
+    // floor's share of the radius; strength sharpens the wall.
+    Crater = 3
 };
 
 struct TerrainSculptStamp {
@@ -273,6 +279,7 @@ struct LevelSaveResult {
 };
 
 const char* LevelEntityTypeName(LevelEntityType type);
+const char* TerrainSculptOperationName(TerrainSculptOperation operation);
 bool ParseLevelEntityType(const std::string& text, LevelEntityType& type);
 const char* LevelInsertionModeName(LevelInsertionMode mode);
 bool ParseLevelInsertionMode(const std::string& text, LevelInsertionMode& mode);

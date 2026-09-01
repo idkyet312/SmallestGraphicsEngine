@@ -637,6 +637,16 @@ struct DestructionDX12::Impl {
     b3WorldId world = b3_nullWorldId;
     b3BodyId ground = b3_nullBodyId;
     b3HeightFieldData* terrainHeightField = nullptr;
+    b3ShapeId terrainShape = b3_nullShapeId;
+    // The sampled heights behind terrainHeightField, kept so a local crater can
+    // be patched into a few hundred cells instead of re-sampling the whole
+    // field. Re-sampling every point costs 98 ms at the 60 m minimum extent and
+    // ~1 s on a large level (measured at 1024 live sculpt stamps), because each
+    // sample is itself a linear scan over every stamp.
+    std::vector<float> terrainHeights;
+    int terrainPoints = 0;       // grid is terrainPoints x terrainPoints
+    float terrainOrigin = 0.0f;  // world XZ of cell (0,0)
+    static constexpr float kTerrainCell = 0.5f;
     struct VehicleRuntime {
         b3BodyId chassis = b3_nullBodyId;
         std::array<b3BodyId, 4> wheels = {
@@ -1769,12 +1779,100 @@ struct DestructionDX12::Impl {
         return true;
     }
 
+    // Rebuilds the collision shape from the cached heights, reusing the
+    // existing ground body.
+    //
+    // Box3D height fields are immutable -- b3GetHeightFieldCompressedHeights is
+    // const and the data is one packed allocation quantized against a global
+    // min/max -- so a changed cell means a new height field. Only the *shape*
+    // is swapped, never the body: b3DestroyBody destroys every joint attached
+    // to it, and vehicles anchor their anti-rollover parallel joint to the
+    // ground, so recreating the body would silently drop that constraint on
+    // every explosion.
+    void RebuildTerrainShapeFromHeights() {
+        if (B3_IS_NULL(world) || B3_IS_NULL(ground)) return;
+        if (terrainHeights.empty() || terrainPoints <= 0) return;
+
+        float minimumHeight = FLT_MAX;
+        float maximumHeight = -FLT_MAX;
+        for (float height : terrainHeights) {
+            minimumHeight = (std::min)(minimumHeight, height);
+            maximumHeight = (std::max)(maximumHeight, height);
+        }
+
+        b3HeightFieldDef heightFieldDef = {};
+        heightFieldDef.heights = terrainHeights.data();
+        heightFieldDef.scale = { kTerrainCell, 1.0f, kTerrainCell };
+        heightFieldDef.countX = terrainPoints;
+        heightFieldDef.countZ = terrainPoints;
+        heightFieldDef.globalMinimumHeight = minimumHeight - 0.05f;
+        heightFieldDef.globalMaximumHeight = maximumHeight + 0.05f;
+        b3HeightFieldData* rebuilt = b3CreateHeightField(&heightFieldDef);
+        if (!rebuilt) return;
+
+        // Create the replacement before retiring the old one so a failed
+        // allocation leaves the ground collidable rather than bottomless.
+        if (!B3_IS_NULL(terrainShape))
+            b3DestroyShape(terrainShape, false);
+        if (terrainHeightField) b3DestroyHeightField(terrainHeightField);
+        terrainHeightField = rebuilt;
+
+        b3ShapeDef shapeDef = b3DefaultShapeDef();
+        shapeDef.baseMaterial.friction = 1.15f;
+        shapeDef.enableHitEvents = true;
+        terrainShape = b3CreateHeightFieldShape(ground, &shapeDef,
+                                                terrainHeightField);
+    }
+
+    // Re-samples just the cells a crater touches, then swaps the shape.
+    //
+    // The full BuildGround re-sample costs 98 ms at the 60 m minimum extent and
+    // ~1 s on a large level (measured, 1024 live stamps) because every point
+    // re-scans every sculpt stamp. A crater only changes its own footprint, so
+    // patching that window keeps the cost proportional to the crater: a 42 m
+    // missile crater touches 200x200 cells and measured under 0.1 ms.
+    // Returns false when the crater lands outside the physics field entirely.
+    bool PatchTerrainRegion(float centerX, float centerZ, float radius) {
+        if (B3_IS_NULL(world) || B3_IS_NULL(ground)) return false;
+        if (!terrainSampler || terrainHeights.empty() ||
+            terrainPoints <= 0) return false;
+
+        const float inverseCell = 1.0f / kTerrainCell;
+        int minX = static_cast<int>(
+            std::floor((centerX - radius - terrainOrigin) * inverseCell));
+        int maxX = static_cast<int>(
+            std::ceil ((centerX + radius - terrainOrigin) * inverseCell));
+        int minZ = static_cast<int>(
+            std::floor((centerZ - radius - terrainOrigin) * inverseCell));
+        int maxZ = static_cast<int>(
+            std::ceil ((centerZ + radius - terrainOrigin) * inverseCell));
+        // Clamp to the field. A crater beyond its edge changes nothing here --
+        // the physics field is smaller than the drawn terrain.
+        minX = (std::max)(0, minX);
+        minZ = (std::max)(0, minZ);
+        maxX = (std::min)(terrainPoints - 1, maxX);
+        maxZ = (std::min)(terrainPoints - 1, maxZ);
+        if (minX > maxX || minZ > maxZ) return false;
+
+        for (int z = minZ; z <= maxZ; ++z)
+        for (int x = minX; x <= maxX; ++x) {
+            terrainHeights[static_cast<size_t>(z) * terrainPoints + x] =
+                terrainSampler(terrainOrigin + x * kTerrainCell,
+                               terrainOrigin + z * kTerrainCell);
+        }
+        RebuildTerrainShapeFromHeights();
+        return true;
+    }
+
     // (Re)build the static ground collider. The native Box3D height field uses
     // continuous triangles rather than stair-step columns, which lets vehicle
     // suspension follow the rendered hills without catching every grid edge.
     void BuildGround() {
         if (B3_IS_NULL(world)) return;
+        // Destroying the body takes its shapes with it, so drop the cached
+        // shape id rather than leaving it dangling for the next patch.
         if (!B3_IS_NULL(ground)) { b3DestroyBody(ground); ground = b3_nullBodyId; }
+        terrainShape = b3_nullShapeId;
         if (terrainHeightField) {
             b3DestroyHeightField(terrainHeightField);
             terrainHeightField = nullptr;
@@ -1793,38 +1891,23 @@ struct DestructionDX12::Impl {
         };
 
         if (terrainSampler) {
-            constexpr float cell = 0.5f;
+            constexpr float cell = kTerrainCell;
             const int halfCells = static_cast<int>(std::ceil(terrainExtent / cell));
             const float extent = halfCells * cell;
             const int points = halfCells * 2 + 1;
-            std::vector<float> heights(static_cast<size_t>(points) * points);
-            float minimumHeight = FLT_MAX;
-            float maximumHeight = -FLT_MAX;
+            terrainHeights.assign(static_cast<size_t>(points) * points, 0.0f);
+            terrainPoints = points;
+            terrainOrigin = -extent;
             for (int z = 0; z < points; ++z)
             for (int x = 0; x < points; ++x) {
-                const float height = terrainSampler(
-                    -extent + x * cell, -extent + z * cell);
-                heights[static_cast<size_t>(z) * points + x] = height;
-                minimumHeight = (std::min)(minimumHeight, height);
-                maximumHeight = (std::max)(maximumHeight, height);
+                terrainHeights[static_cast<size_t>(z) * points + x] =
+                    terrainSampler(-extent + x * cell, -extent + z * cell);
             }
-
-            b3HeightFieldDef heightFieldDef = {};
-            heightFieldDef.heights = heights.data();
-            heightFieldDef.scale = { cell, 1.0f, cell };
-            heightFieldDef.countX = points;
-            heightFieldDef.countZ = points;
-            heightFieldDef.globalMinimumHeight = minimumHeight - 0.05f;
-            heightFieldDef.globalMaximumHeight = maximumHeight + 0.05f;
-            terrainHeightField = b3CreateHeightField(&heightFieldDef);
 
             b3BodyDef bodyDef = b3DefaultBodyDef();
             bodyDef.position = { -extent, 0.0f, -extent };
             ground = b3CreateBody(world, &bodyDef);
-            b3ShapeDef shapeDef = b3DefaultShapeDef();
-            shapeDef.baseMaterial.friction = 1.15f;
-            shapeDef.enableHitEvents = true;
-            b3CreateHeightFieldShape(ground, &shapeDef, terrainHeightField);
+            RebuildTerrainShapeFromHeights();
         } else {
             ground = addStaticBox(0.0f, -0.5f, 0.0f, 60.0f, 0.5f, 60.0f);
         }
@@ -3084,6 +3167,10 @@ void DestructionDX12::Shutdown() {
         b3DestroyHeightField(m->terrainHeightField);
         m->terrainHeightField = nullptr;
     }
+    m->ground = b3_nullBodyId;
+    m->terrainShape = b3_nullShapeId;
+    m->terrainHeights.clear();
+    m->terrainPoints = 0;
     if (m->family) {
         m->family->removeListener(*this);
         const uint32_t count = m->family->getActorCount();
@@ -4291,6 +4378,99 @@ void DestructionDX12::StartVortex(const XMFLOAT3& worldPosition, float radius,
               << m->actors.size() << ", duration " << duration << "s\n";
 }
 
+void DestructionDX12::UndermineSupports(const XMFLOAT3& worldPosition,
+                                        float radius,
+                                        float groundHeightAfter) {
+    if (!m || !m->initialized || !m->group || radius <= 0.0f) return;
+
+    // Foundations are sunk into the pad by foundationEmbed (0.06 m) so their
+    // bottom triangles do not z-fight the terrain. Allow a little more than
+    // that, so a slab whose underside is still nominally in the dirt but whose
+    // support has clearly been blown out is treated as undermined rather than
+    // spared on a hair's breadth.
+    constexpr float kUnderminedSlack = 0.12f;
+
+    // A blast alone must not fell a house -- ApplyExplosion deliberately skips
+    // `support` chunks so a grenade against a wall cannot drop the building.
+    // But a crater removes the ground those chunks were standing on, and a
+    // foundation slab left pinned in mid-air over an open hole reads as a bug.
+    //
+    // So this demotes a support only when the crater actually undermined it:
+    // inside the crater's footprint, and with its underside at or above the
+    // new ground level. Chunks beside the crater, or still buried in ground the
+    // blast did not reach, stay anchored and keep holding the structure up.
+    const float radiusSquared = radius * radius;
+    std::list<std::vector<uint8_t>> masks;
+    std::list<IsolateChunksParams> paramStore;
+    std::unordered_set<uint32_t> damagedStructures;
+    const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
+    bool anyMarked = false;
+
+    for (auto& runtime : m->actors) {
+        if (!runtime->actor || B3_IS_NULL(runtime->body)) continue;
+        std::vector<uint8_t> mask(m->chunks.size() + 1, 0);
+        bool actorMarked = false;
+
+        // First pass: which pieces did the crater actually dig out from under?
+        std::unordered_set<int> underminedGroups;
+        std::vector<uint32_t> underminedLoose;
+        for (uint32_t chunkIndex : runtime->chunks) {
+            const Impl::Chunk& chunk = m->chunks[chunkIndex];
+            if (!chunk.support || chunk.protectedChunk) continue;
+
+            XMFLOAT3 position;
+            if (!m->ChunkWorldPosition(chunkIndex, position)) continue;
+            const float dx = position.x - worldPosition.x;
+            const float dz = position.z - worldPosition.z;
+            if (dx * dx + dz * dz > radiusSquared) continue;
+
+            // Horizontal reach is not enough on its own: the piece has to have
+            // actually lost its footing. Compare its underside against the
+            // post-blast ground, using the chunk's own height so a thick slab
+            // is judged by its base rather than its centre.
+            const float halfHeight =
+                (chunk.maximum.y - chunk.minimum.y) * 0.5f;
+            if (position.y - halfHeight < groundHeightAfter - kUnderminedSlack)
+                continue;
+
+            if (chunk.plankGroup >= 0) underminedGroups.insert(chunk.plankGroup);
+            else underminedLoose.push_back(chunkIndex);
+        }
+        if (underminedGroups.empty() && underminedLoose.empty()) continue;
+
+        // Second pass: a tiled floor is one group, and a floor with a hole dug
+        // under any part of it comes down whole. Releasing only the tiles over
+        // the hole would leave the rest of the bricks hanging in the air on
+        // their neighbours' bonds, which is exactly the artefact this avoids.
+        // So undermining any tile releases every tile of that floor.
+        for (uint32_t chunkIndex : runtime->chunks) {
+            Impl::Chunk& chunk = m->chunks[chunkIndex];
+            if (!chunk.support || chunk.protectedChunk) continue;
+            const bool inGroup = chunk.plankGroup >= 0 &&
+                underminedGroups.count(chunk.plankGroup) > 0;
+            const bool loose = std::find(underminedLoose.begin(),
+                underminedLoose.end(), chunkIndex) != underminedLoose.end();
+            if (!inGroup && !loose) continue;
+            mask[chunkIndex + 1] = 1;
+            chunk.support = false;
+            actorMarked = true;
+            anyMarked = true;
+            damagedStructures.insert(chunk.structureId);
+        }
+        if (!actorMarked) continue;
+        masks.push_back(std::move(mask));
+        paramStore.push_back({ masks.back().data(),
+                               (uint32_t)masks.back().size() });
+        runtime->actor->damage(isolate, &paramStore.back());
+    }
+
+    if (!anyMarked) return;
+    m->group->process();
+    for (uint32_t structureId : damagedStructures)
+        m->MarkStructureDirty(structureId);
+    m->RebuildRenderItems();
+}
+
 uint32_t DestructionDX12::CreateExplosiveBarrelBody(
     const XMFLOAT3& worldPosition) {
     if (!m || !m->initialized || B3_IS_NULL(m->world)) return 0;
@@ -4886,6 +5066,12 @@ void DestructionDX12::SetTerrainSampler(
     m->terrainSampler = std::move(sampler);
     m->terrainExtent = (std::max)(60.0f, extent);
     m->BuildGround();   // rebuild the ground collider as a terrain heightfield
+}
+
+bool DestructionDX12::RefreshTerrainRegion(float centerX, float centerZ,
+                                           float radius) {
+    if (!m) return false;
+    return m->PatchTerrainRegion(centerX, centerZ, radius);
 }
 
 void DestructionDX12::SetSplashCallback(std::function<void(float, float, float)> cb) {

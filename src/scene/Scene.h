@@ -74,6 +74,10 @@ struct Projectile {
     // thrown frag is meant to be bounced around cover, but a missile called in
     // on a map coordinate has to burst where it was aimed.
     bool     impactFuse = false;
+    // Called-in strike rather than a thrown frag. It shares the grenade blast
+    // path but scales every radius by missileBlastScale, so the strike can be
+    // tuned without moving what a hand grenade does.
+    bool     missile = false;
     float    fxCooldown = 0.0f;
 };
 
@@ -437,7 +441,14 @@ struct Scene {
     float grenadeGravityScale  = 1.0f;
     float grenadeGroundY       = 0.15f;  // bounce height
     float grenadeFuse          = 2.0f;   // timer-only detonation
-    float grenadeBlastRadius   = 3.5f;   // original debris radius
+    // The default explosion radius every blast is measured against: debris, FX
+    // and crater -- NOT the kill radius, which is grenadeEnemyRadius below.
+    // Each explosion type scales this by its own factor (see grenadeBlastScale
+    // and missileBlastScale), so retuning the base moves them all together
+    // instead of needing one edit per weapon.
+    float explosionBlastRadius = 3.5f;
+    // A thrown frag is the small end of the scale: half the default.
+    float grenadeBlastScale    = 0.5f;
     float grenadeDamage        = 1.5f;   // per-bond damage in the blast
     float grenadeImpulse       = 120.0f; // original debris impulse
     float grenadeEnemyRadius   = 7.0f;
@@ -448,6 +459,19 @@ struct Scene {
     // grenadeEnemyRadius. Enemies lob these, so a direct hit should hurt badly
     // without being an instant kill from full health.
     float grenadePlayerDamage  = 75.0f;
+    // Multiplies every radius of a called-in missile strike's blast: debris,
+    // enemy reach, FX and terrain crater. 1.0 is the default explosion radius
+    // above; the deployment-screen slider drives this.
+    float missileBlastScale    = 2.0f;
+    // Crater cut shape. The stamp is a boolean-style subtraction rather than a
+    // smooth dent, so these describe an actual profile: how deep the floor
+    // sits, how much of the radius stays flat before the wall starts, and how
+    // abruptly that wall turns up (>1 = sharper, closer to a vertical face).
+    float craterDepth          = 1.6f;   // metres at the floor
+    // Share of the radius that is flat floor: the inner (floor) radius is
+    // exactly half the outer, so the wall occupies the outer half.
+    float craterFloorFraction  = 0.5f;
+    float craterWallSharpness  = 2.6f;   // wall exponent
     float grenadeCooldown      = 0.0f;   // input debounce
     GrenadeType selectedGrenade = GrenadeType::Frag;
     float molotovFireDuration = 9.0f;

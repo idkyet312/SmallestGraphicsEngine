@@ -281,6 +281,15 @@ public:
     // At expiry the orbit velocity is released with an outward/upward kick.
     void StartVortex(const DirectX::XMFLOAT3& worldPosition,
                      float radius, float duration = 3.0f);
+    // Releases anchored (Support:) chunks a crater has dug out from under, so a
+    // brick foundation left spanning an open hole collapses into it instead of
+    // hanging in mid-air. ApplyExplosion deliberately spares supports -- a
+    // grenade against a wall must not fell the house -- so this is the separate,
+    // narrower trigger: only supports inside `radius` whose underside now sits
+    // at or above `groundHeightAfter` (the post-crater terrain height) are
+    // freed. Objective geometry is never released.
+    void UndermineSupports(const DirectX::XMFLOAT3& worldPosition,
+                           float radius, float groundHeightAfter);
     uint32_t CreateExplosiveBarrelBody(
         const DirectX::XMFLOAT3& worldPosition);
     bool GetExplosiveBarrelPose(uint32_t handle,
@@ -347,6 +356,13 @@ public:
     // historical collider for compact levels.
     void SetTerrainSampler(std::function<float(float, float)> sampler,
                            float extent = 60.0f);
+    // Re-samples the collision heightfield inside one XZ circle, for a crater
+    // that just deformed the ground. Far cheaper than SetTerrainSampler, which
+    // re-samples every point (measured 98 ms at the 60 m minimum extent, ~1 s
+    // on a large level, since each sample re-scans every sculpt stamp); a
+    // crater-sized window measured under 0.1 ms. Returns false when the region
+    // falls outside the physics field, which is smaller than the drawn terrain.
+    bool RefreshTerrainRegion(float centerX, float centerZ, float radius);
     // Callback invoked (x, z, strength) when a fragment or ragdoll part first
     // breaks the water surface, so the caller can spawn a splash ripple.
     void SetSplashCallback(std::function<void(float, float, float)> cb);

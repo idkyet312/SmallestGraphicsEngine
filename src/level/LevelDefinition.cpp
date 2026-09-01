@@ -241,6 +241,16 @@ void BakeSplineEntities(LevelDefinition& level, uint64_t& nextId,
     }
 }
 
+const char* TerrainSculptOperationName(TerrainSculptOperation operation) {
+    switch (operation) {
+    case TerrainSculptOperation::Add: return "add";
+    case TerrainSculptOperation::Flatten: return "flatten";
+    case TerrainSculptOperation::Heightmap: return "stamp";
+    case TerrainSculptOperation::Crater: return "crater";
+    }
+    return "add";
+}
+
 const char* LevelEntityTypeName(LevelEntityType type) {
     switch (type) {
     case LevelEntityType::PlayerSpawn: return "player_spawn";
@@ -434,7 +444,8 @@ LevelValidationResult ValidateLevel(const LevelDefinition& level) {
             stamp.strength > 10.0f ||
             (stamp.operation != TerrainSculptOperation::Add &&
              stamp.operation != TerrainSculptOperation::Flatten &&
-             stamp.operation != TerrainSculptOperation::Heightmap) ||
+             stamp.operation != TerrainSculptOperation::Heightmap &&
+             stamp.operation != TerrainSculptOperation::Crater) ||
             (stamp.operation == TerrainSculptOperation::Heightmap &&
              !IsTerrainStampFilename(stamp.texture)))
             result.errors.push_back("terrain contains an invalid sculpt stamp");
@@ -604,6 +615,8 @@ LevelLoadResult LoadLevel(const std::filesystem::path& path) {
                     stamp.operation = TerrainSculptOperation::Flatten;
                 else if (operation == "stamp")
                     stamp.operation = TerrainSculptOperation::Heightmap;
+                else if (operation == "crater")
+                    stamp.operation = TerrainSculptOperation::Crater;
                 else throw std::runtime_error("unknown terrain sculpt operation: " + operation);
                 stamp.value = source.at("value").get<float>();
                 stamp.strength = source.value("strength", 1.0f);
@@ -751,9 +764,7 @@ LevelSaveResult SaveLevel(const LevelDefinition& level,
         for (const TerrainSculptStamp& stamp : level.terrainSculpt) {
             json saved = {
                 {"x", stamp.x}, {"z", stamp.z}, {"radius", stamp.radius},
-                {"operation", stamp.operation == TerrainSculptOperation::Flatten
-                    ? "flatten" : (stamp.operation == TerrainSculptOperation::Heightmap
-                        ? "stamp" : "add")},
+                {"operation", TerrainSculptOperationName(stamp.operation)},
                 {"value", stamp.value}, {"strength", stamp.strength}
             };
             if (stamp.operation == TerrainSculptOperation::Heightmap) {

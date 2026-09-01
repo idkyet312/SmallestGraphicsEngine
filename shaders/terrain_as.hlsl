@@ -254,14 +254,25 @@ float3 TerrainTileErrors(float2 originXZ, float sizeOut) {
     float sculptError = 0.0;
     for (uint stampIndex = 0; stampIndex < sculptCount; ++stampIndex) {
         TerrainSculptStamp stamp = terrainSculpt[stampIndex];
-        float radius = stamp.centerRadius.z * (stamp.operation == 2u ? 1.4143 : 1.0);
+        // A crater cut reaches past its radius for the ejecta lip (1.18), so it
+        // needs the wider test -- culling it at the radius would leave the rim
+        // tiles un-subdivided and notch the lip.
+        float radiusScale = 1.0;
+        if (stamp.operation == 2u) radiusScale = 1.4143;
+        else if (stamp.operation == 3u) radiusScale = 1.18;
+        float radius = stamp.centerRadius.z * radiusScale;
         float2 nearest = clamp(stamp.centerRadius.xy, tileMin, tileMax);
         if (length(nearest - stamp.centerRadius.xy) > radius) continue;
-        float candidate = stamp.operation == 0u
-            ? abs(stamp.value)
-            : (stamp.operation == 1u
-                ? sculptMaxDisplacement
-                : abs(stamp.value) + abs(stamp.baseHeight) * stamp.replace);
+        float candidate;
+        if (stamp.operation == 0u) candidate = abs(stamp.value);
+        else if (stamp.operation == 1u) candidate = sculptMaxDisplacement;
+        else if (stamp.operation == 3u)
+            // The wall spans the full depth over a short distance, so the tile
+            // has to carry that whole drop as its error or the cut face gets
+            // tessellated into a smooth ramp and stops reading as a cut.
+            candidate = abs(stamp.value) + abs(stamp.baseHeight);
+        else
+            candidate = abs(stamp.value) + abs(stamp.baseHeight) * stamp.replace;
         sculptError = max(sculptError, candidate);
     }
     errors = max(errors, sculptError.xxx);
