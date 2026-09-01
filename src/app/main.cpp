@@ -219,6 +219,19 @@ static const std::filesystem::path kModelRoot = "Content/Models";
 // down is a landmark event rather than a puff of dust. Identified by prefab id so
 // no new entity type or engine plumbing is needed.
 static constexpr const char* kCommTowerPrefabId = "props/comm_tower";
+static constexpr const char* kWatchTowerPrefabId = "props/watchtower";
+static constexpr const char* kFencePrefabId = "props/fence";
+static constexpr const char* kFencePanelPrefabId = "props/fence_panel";
+// Both fence assets are single authored panels of the same size and build, so
+// they share the runtime-cut break path rather than the banded tower one.
+static bool IsFencePrefab(const std::string& prefabId) {
+    return prefabId == kFencePrefabId || prefabId == kFencePanelPrefabId;
+}
+static bool IsNvBlastStructurePrefab(const std::string& prefabId) {
+    return prefabId == kCommTowerPrefabId ||
+           prefabId == kWatchTowerPrefabId ||
+           IsFencePrefab(prefabId);
+}
 // Defined with the prefab damage code further down; needed earlier by the
 // burning-material tick, which must not let fire fell a player objective.
 static bool FindCommTower(uint64_t entityId, DirectX::XMFLOAT3& base);
@@ -8933,7 +8946,7 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
             : prefab->castShadow;
         const bool drawnByRuntimeSystem =
             components.contains("aaTurret") ||
-            (prefabId == kCommTowerPrefabId && scene.useDestruction &&
+            (IsNvBlastStructurePrefab(prefabId) && scene.useDestruction &&
              g_destruction.IsInitialized());
         if (!drawnByRuntimeSystem) {
             const std::string key = prefabId +
@@ -9422,19 +9435,15 @@ static void RebuildPrefabRenderBatches() {
         if (entity.type == LevelEntityType::Prefab) prefabId = entity.prefabId;
         else if (entity.type == LevelEntityType::Rock) prefabId = "rock";
         else continue;
-        // Comm towers are baked into the destruction model instead
-        // (AppendCommTowersToDestruction), which draws their chunks. Emitting a
-        // prefab batch as well would render the mast twice -- and the intact
-        // copy would still be standing after the fractured one fell. Suppress
-        // only the drawing: skipping the instance outright also skipped its
-        // "destructible" registration, so the tower never entered the health map
-        // and DamagePrefab could not find it to damage at all.
-        const bool towerDrawnByDestruction =
-            prefabId == kCommTowerPrefabId && g_destruction.IsInitialized();
+        // Prefabs baked into the destruction model draw and collide from their
+        // NvBlast chunks. Suppress the intact copy while retaining other
+        // components; the comm tower still needs its objective health.
+        const bool drawnByDestruction =
+            IsNvBlastStructurePrefab(prefabId) && g_destruction.IsInitialized();
         const Transform& t = entity.transform;
         const XMMATRIX world = EntityWorldMatrix(t);
         addInstance(addInstance, prefabId, world, entity.id, entity.overrides, 0,
-                    towerDrawnByDestruction);
+                    drawnByDestruction);
     }
     // Drop aircraft whose entity no longer exists in this level.
     //
@@ -15187,33 +15196,35 @@ static std::shared_ptr<SceneNode> CloneSceneTree(
     return clone;
 }
 
-// Bakes every enabled comm-tower prefab into the destruction model so NvBlast
-// fractures it for real, instead of the mesh vanishing with a smoke puff.
+// Bakes enabled structural prefabs into the destruction model so NvBlast
+// fractures them for real instead of the mesh vanishing with a smoke puff.
 //
 // The GLB is one node with one mesh, so it carries none of the "Support:" /
 // "<piece>@<id>" structure BuildChunks reads from authored houses. This slices it
 // into horizontal bands by triangle centroid and names them to that convention:
 // the bottom band becomes Support: (anchored, holding the mast up) and each band
 // above is its own bonded group. Shoot the base out and the sections above lose
-// their support chain and come down -- a mast toppling rather than a box popping.
+// their support chain and come down -- a structure toppling rather than popping.
 //
 // Called with the world-space vertex bake already applied, exactly like addHouse,
 // because chunk bounds are read in destruction-model space.
-static void AppendCommTowersToDestruction(
+static void AppendNvBlastPrefabsToDestruction(
         const std::shared_ptr<SceneNode>& root, int groupOffset) {
     if (!root) return;
 
-    // Slicing a 26 m mast into bands ~2.2 m tall reads as sections without
-    // handing Blast an unreasonable chunk count.
-    constexpr int kBandCount = 12;
-
     for (const LevelEntity& entity : g_game.world.Level().entities) {
         if (!entity.enabled || entity.type != LevelEntityType::Prefab ||
-            entity.prefabId != kCommTowerPrefabId) continue;
+            !IsNvBlastStructurePrefab(entity.prefabId)) continue;
+
+        const bool objectiveTower = entity.prefabId == kCommTowerPrefabId;
+        const bool fence = IsFencePrefab(entity.prefabId);
+        // Both tower assets are split into roughly two-metre sections: twelve
+        // for the 26 m communications mast and eight for the 15.7 m watchtower.
+        const int bandCount = objectiveTower ? 12 : 8;
 
         // Same model the renderer uses, so the fractured geometry matches what
         // was standing there a frame earlier.
-        const PrefabAsset* prefab = g_prefabRegistry.Find(kCommTowerPrefabId);
+        const PrefabAsset* prefab = g_prefabRegistry.Find(entity.prefabId);
         if (!prefab) continue;
         PrefabModelCacheEntry* cached = LoadPrefabModel(*prefab);
         if (!cached || !cached->model) continue;
@@ -15287,19 +15298,49 @@ static void AppendCommTowersToDestruction(
         gather(model, XMMatrixIdentity());
         if (flattened.empty() || maxY <= minY) continue;
 
+        if (fence) {
+            // Keep the complete panel as one anchored Blast chunk. Its two
+            // debris chunks are cut from these triangles only when an
+            // explosion reaches this panel, avoiding per-panel split assets,
+            // meshlets, and GPU buffers during level loading.
+            auto chunk = std::make_shared<SceneNode>(
+                "Support:FencePanel#" + std::to_string(groupOffset));
+            chunk->mesh = std::make_shared<SceneMesh>();
+            for (WorldPrimitive& source : flattened) {
+                MeshPrimitive primitive;
+                primitive.vertices = std::move(source.vertices);
+                primitive.indices = std::move(source.indices);
+                primitive.material = std::move(source.material);
+                primitive.materialIndex = source.materialIndex;
+                chunk->mesh->primitives.push_back(std::move(primitive));
+            }
+            root->AddChild(chunk);
+            groupOffset += 1000000;
+            continue;
+        }
+
         // One child node per band, each carrying that band's triangles.
-        const float bandHeight = (maxY - minY) / (float)kBandCount;
-        for (int band = 0; band < kBandCount; ++band) {
-            // Bottom band anchors the mast; the rest are ordinary bonded pieces.
-            // Every band carries ProtectedChunkMarker so indirect damage -- the
-            // enemy helicopter crashing inside its patrol box, a barrel chain
-            // next door, spreading fire -- cannot fell a player objective.
-            const std::string marker = DestructionDX12::ProtectedChunkMarker;
-            const std::string name = band == 0
-                ? ("Support:CommTowerBase" + marker + "@" +
-                   std::to_string(groupOffset))
-                : ("CommTower" + marker + "@" +
-                   std::to_string(groupOffset + band));
+        const float bandHeight = (maxY - minY) / (float)bandCount;
+        for (int band = 0; band < bandCount; ++band) {
+            // Bottom band anchors the structure; the rest are ordinary bonded
+            // pieces. Only the comm-tower objective is protected from indirect
+            // damage; the watchtower behaves like ordinary NvBlast geometry.
+            const std::string marker = objectiveTower
+                ? DestructionDX12::ProtectedChunkMarker : "";
+            // @<number> means plank group to BuildChunks. The watchtower uses a
+            // separate #<structure>:<piece> identity so its bands bond as one
+            // structure without triggering plank-isolation rules.
+            const std::string name = objectiveTower
+                ? (band == 0
+                    ? "Support:CommTowerBase" + marker + "@" +
+                        std::to_string(groupOffset)
+                    : "CommTower" + marker + "@" +
+                        std::to_string(groupOffset + band))
+                : (band == 0
+                    ? "Support:WatchTowerBase#" +
+                        std::to_string(groupOffset) + ":0"
+                    : "WatchTower#" + std::to_string(groupOffset) + ":" +
+                        std::to_string(band));
             auto chunk = std::make_shared<SceneNode>(name);
             chunk->mesh = std::make_shared<SceneMesh>();
             bool any = false;
@@ -15318,7 +15359,7 @@ static void AppendCommTowersToDestruction(
                                       source.vertices[(size_t)i1 * 12 + 1] +
                                       source.vertices[(size_t)i2 * 12 + 1]) / 3.0f;
                     int owner = (int)((cy - minY) / (std::max)(0.0001f, bandHeight));
-                    owner = (std::max)(0, (std::min)(kBandCount - 1, owner));
+                    owner = (std::max)(0, (std::min)(bandCount - 1, owner));
                     if (owner != band) continue;
                     for (UINT sourceIndex : { i0, i1, i2 }) {
                         const UINT newIndex =
@@ -15443,7 +15484,7 @@ static void ArrangeHousesInCross(const std::shared_ptr<SceneNode>& root,
                 XMConvertToRadians(entity.transform.rotation[1]), groupOffset);
             groupOffset += 1000000;
         }
-        AppendCommTowersToDestruction(root, groupOffset);
+        AppendNvBlastPrefabsToDestruction(root, groupOffset);
         XMFLOAT4X4 identity;
         XMStoreFloat4x4(&identity, XMMatrixIdentity());
         root->UpdateGlobalTransform(identity);
@@ -19724,6 +19765,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             ? 14.0f : scene.grenadeEnemyPush;
                         const float blastDamage = c4Blast
                             ? 1000000.0f : scene.grenadeDamage;
+                        // Structural fence health uses real weapon damage. A
+                        // standard frag reaches its 500-health transition in
+                        // one direct blast; legacy house fracture still uses
+                        // the existing all-or-nothing explosion path.
+                        const float destructionBlastDamage = c4Blast
+                            ? blastDamage : enemyDamage;
                         const float blastImpulse = c4Blast
                             ? 230.0f : scene.grenadeImpulse;
                         if (projectile.molotov) {
@@ -19932,7 +19979,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         // Run after Bandit damage. Newly killed enemies have
                         // ragdolls now, so same blast launches their limbs too.
                         g_destruction.ApplyExplosion(
-                            center, blastRadius, blastDamage, blastImpulse);
+                            center, blastRadius, destructionBlastDamage,
+                            blastImpulse);
                         {
                             ProfilerDX12::CpuScope ragdollProfile(
                                 g_profiler, "Blast/Ragdoll");
@@ -20539,7 +20587,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         g_destruction.ApplyRadialDamage(
                             hit, scene.destructionDamageRadius,
                             projectile.harpoon ? 2.5f :
-                            scene.destructionDamage * projectile.damageMultiplier);
+                            34.0f * projectile.damageMultiplier);
                     }
                     if (protectedHit) {
                         // Nothing to pull or shove: see above.

@@ -2298,11 +2298,6 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     g_destructionChunksSubmittedThisFrame = 0;
     g_destructionForwardPrimitivesDrawn = 0;
     g_destructionVisibilityOwnedPrimitives = 0;
-    // Chunk geometry is skipped wholesale when the visibility resolve owns it.
-    // The ragdoll, rope and debris draws further down have no visibility
-    // representation, so they still run either way.
-    const bool destructionChunksOwnedByVisibility =
-        visibilityExtensionsOnly && g_destructionInVisibilityBuffer;
     if (scene.useDestruction && g_destruction.IsInitialized()) {
         // Sub-scope: destruction chunks are the largest draw-count block in this
         // pass when both houses stand (~588 chunks before the frustum test).
@@ -2320,7 +2315,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         g_destructionZeroRadiusBatches = 0;
         g_destructionMaxBatchRadius = 0.0f;
         g_destructionBatchCount = static_cast<UINT>(batches.size());
-        if (!batches.empty() && !destructionChunksOwnedByVisibility) {
+        if (!batches.empty()) {
             for (const DestructionRenderBatch& batch : batches) {
                 // Diagnostic: a zero radius silently disables the test below, and
                 // an oversized radius makes it always pass. Both look identical
@@ -2341,11 +2336,12 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 g_destructionChunksSubmittedThisFrame += batch.chunkCount;
             }
         }
-        static const std::vector<DestructionRenderItem> kNoChunkItems;
+        // DrawSceneNode's extension-only mode rejects opaque primitives already
+        // owned by visibility while retaining alpha-tested materials. Skipping
+        // the whole destruction node here made chain-link, grating, and other
+        // cutout parts vanish even though their opaque frames remained.
         for (const DestructionRenderItem& item :
-                 destructionChunksOwnedByVisibility
-                     ? kNoChunkItems
-                     : g_destruction.GetRenderItems()) {
+                 g_destruction.GetRenderItems()) {
                 if (item.sphereRadius > 0.0f &&
                     !SphereVisible(frustum, item.sphereCenter, item.sphereRadius)) {
                     ++g_destructionCulledThisFrame;

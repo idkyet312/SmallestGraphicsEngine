@@ -109,6 +109,9 @@ constexpr uint64_t CollisionCategoryGrenade = PhysicsImpactPolicy::Grenade;
 // Uniform starting health for every bond/chunk. A bullet's per-hit damage is a
 // fraction of this, so a joint takes several hits before it lets go.
 constexpr float kBondHealth = 1.0f;
+// Fence panels remain intact until accumulated weapon damage reaches this
+// threshold, then transition once into their runtime-cut NvBlast debris.
+constexpr float kFencePanelHealth = 500.0f;
 // Starting health for bonds and chunks of objective geometry (the comm tower).
 // Deliberately enormous relative to kBondHealth: no accumulation of stray rifle
 // fire, blast fractions or debris impacts can ever drain it, while the authored
@@ -175,6 +178,47 @@ void IsolateGraphShader(NvBlastFractureBuffers* commands,
             fracture.health = FLT_MAX;  // sever completely
         }
     }
+}
+
+// Removes an intact support chunk from its original asset. Fence panels use
+// this only after their replacement two-piece asset has been built in
+// memory; chunk fracture is what makes a standalone panel disappear even when
+// it has no bonds to sever.
+void DestroyChunksGraphShader(NvBlastFractureBuffers* commands,
+                              const NvBlastGraphShaderActor* actor,
+                              const void* rawParams) {
+    const auto& params = *static_cast<const IsolateChunksParams*>(rawParams);
+    const uint32_t capacity = commands->chunkFractureCount;
+    commands->bondFractureCount = 0;
+    commands->chunkFractureCount = 0;
+    for (uint32_t node = actor->firstGraphNodeIndex; node != InvalidIndex;
+         node = actor->graphNodeIndexLinks[node]) {
+        const uint32_t chunkIndex = actor->chunkIndices[node];
+        if (chunkIndex >= params.chunkCount || !params.breakChunk[chunkIndex] ||
+            commands->chunkFractureCount >= capacity) continue;
+        NvBlastChunkFractureData& fracture =
+            commands->chunkFractures[commands->chunkFractureCount++];
+        fracture.userdata = actor->assetChunks[chunkIndex].userData;
+        fracture.chunkIndex = chunkIndex;
+        fracture.health = FLT_MAX;
+    }
+}
+
+void DestroyChunksSubgraphShader(NvBlastFractureBuffers* commands,
+                                 const NvBlastSubgraphShaderActor* actor,
+                                 const void* rawParams) {
+    const auto& params = *static_cast<const IsolateChunksParams*>(rawParams);
+    const uint32_t capacity = commands->chunkFractureCount;
+    commands->bondFractureCount = 0;
+    commands->chunkFractureCount = 0;
+    const uint32_t chunkIndex = actor->chunkIndex;
+    if (capacity == 0 || chunkIndex >= params.chunkCount ||
+        !params.breakChunk[chunkIndex]) return;
+    NvBlastChunkFractureData& fracture = commands->chunkFractures[0];
+    fracture.userdata = actor->assetChunks[chunkIndex].userData;
+    fracture.chunkIndex = chunkIndex;
+    fracture.health = FLT_MAX;
+    commands->chunkFractureCount = 1;
 }
 
 // Sever only the bonds that cross OUT of one plank group: a bond breaks when
@@ -362,6 +406,24 @@ struct DestructionDX12::Impl {
         int plankGroup = -1;
         bool glass = false;    // window pane cell: any hit shatters the whole pane
         bool sheet = false;    // corrugated roof sheet: a hit tears the whole sheet off
+        // #<id>:<piece> identifies authored parts of one structural prefab.
+        // Their geometry may interpenetrate at braces or mesh/frame overlaps,
+        // so they need explicit bonds without inheriting plank behavior.
+        int structuralGroup = -1;
+        // Intact fence panels and their runtime-cut debris are lazily uploaded:
+        // standing runs use one merged batch, and only an exploded panel needs
+        // individual GPU resources.
+        bool fencePiece = false;
+        bool breakableSupport = false;
+        bool lazyRenderResources = false;
+        float health = 0.0f;
+        // Runtime-cut fence halves are terminal debris: they keep rendering,
+        // collision and impulse response but never enter another damage pass.
+        bool persistentFenceFragment = false;
+        // Runtime replacement geometry owns rendering and collision after a
+        // fence explosion. Blast may still report the dead source chunk in a
+        // split event, but it must never be adopted by another runtime actor.
+        bool retired = false;
         // Objective geometry (the comm tower): immune to *indirect* damage, so a
         // helicopter crashing beside it or a barrel chain going off cannot bring
         // it down. Only an explicit DestroyChunkAt/ApplyRadialDamage from the
@@ -373,6 +435,13 @@ struct DestructionDX12::Impl {
     struct ActorRuntime {
         TkActor* actor = nullptr;
         std::vector<uint32_t> chunks;
+        // Blast indices are asset-local. The shipped level asset uses the
+        // historical globalIndex+1 identity mapping; small assets generated at
+        // runtime carry an explicit root/leaf-to-global map shared by all of
+        // their split children.
+        bool identityAssetMapping = true;
+        uint32_t assetChunkCount = 0;
+        std::shared_ptr<const std::vector<uint32_t>> assetChunkToGlobal;
         b3BodyId body = b3_nullBodyId;
         XMFLOAT3 center = {};
         bool dynamic = false;
@@ -633,6 +702,11 @@ struct DestructionDX12::Impl {
     TkFramework* framework = nullptr;
     TkAsset* asset = nullptr;
     TkFamily* family = nullptr;
+    struct RuntimeBlastAsset {
+        TkAsset* asset = nullptr;
+        TkFamily* family = nullptr;
+    };
+    std::vector<RuntimeBlastAsset> runtimeBlastAssets;
     TkGroup* group = nullptr;
     b3WorldId world = b3_nullWorldId;
     b3BodyId ground = b3_nullBodyId;
@@ -1324,6 +1398,7 @@ struct DestructionDX12::Impl {
                     const size_t index = nextChunk.fetch_add(1,
                         std::memory_order_relaxed);
                     if (index >= chunks.size()) break;
+                    if (chunks[index].lazyRenderResources) continue;
                     for (MeshPrimitive& primitive : chunks[index].node->mesh->primitives) {
                         if (!GLBImporter::BuildMeshletData(primitive, device)) {
                             // The only failure inside BuildChunks that depends on
@@ -1380,6 +1455,21 @@ struct DestructionDX12::Impl {
                 }
                 chunk.glass = sourceChunk->name.rfind("Glass@", 0) == 0;
                 chunk.sheet = sourceChunk->name.rfind("Roof@", 0) == 0;
+                chunk.fencePiece =
+                    sourceChunk->name.find("FencePanel#") != std::string::npos;
+                chunk.breakableSupport = chunk.fencePiece && chunk.support;
+                chunk.lazyRenderResources = chunk.fencePiece;
+                if (chunk.fencePiece) chunk.health = kFencePanelHealth;
+                const size_t hash = sourceChunk->name.find('#');
+                if (hash != std::string::npos) {
+                    const char* groupText = sourceChunk->name.c_str() + hash + 1;
+                    char* groupEnd = nullptr;
+                    const long parsedGroup = std::strtol(
+                        groupText, &groupEnd, 10);
+                    if (groupEnd != groupText &&
+                        (*groupEnd == ':' || *groupEnd == '\0'))
+                        chunk.structuralGroup = static_cast<int>(parsedGroup);
+                }
                 // Objective pieces opt out of indirect damage by name. The
                 // prefix survives the Support:/@group decorations above, so a
                 // protected support chunk still reads as both.
@@ -1620,14 +1710,13 @@ struct DestructionDX12::Impl {
             // stubs and cladding edges framing the window). Normal and area are
             // nominal: these bonds are only ever severed outright and bond
             // healths are uniform anyway.
-            // Objective geometry (the comm-tower mast) is sliced into stacked
-            // bands, and its long diagonal lattice braces stretch each band's
-            // AABB past its own slice. Neighbouring bands therefore interpenetrate
-            // instead of meeting flush, and the seam test below rejects them --
-            // leaving mast sections with no bonds at all. Bond protected chunks
-            // that touch, on the same reasoning as the same-plank case above.
+            // Structural prefab pieces deliberately share a private group. A
+            // watchtower's braces and a fence's chain/frame overlap rather than
+            // meeting flush, so the generic seam test cannot connect them.
             if ((ca.plankGroup >= 0 && ca.plankGroup == cb.plankGroup) ||
                 ca.glass || cb.glass ||
+                (ca.structuralGroup >= 0 &&
+                 ca.structuralGroup == cb.structuralGroup) ||
                 (ca.protectedChunk && cb.protectedChunk)) {
                 float nx = cb.center.x - ca.center.x, ny = cb.center.y - ca.center.y,
                       nz = cb.center.z - ca.center.z;
@@ -1753,10 +1842,294 @@ struct DestructionDX12::Impl {
         runtime->actor = actor;
         runtime->renderId = nextActorRenderId++;
         runtime->structureId = chunks.empty() ? 0 : chunks.front().structureId;
+        runtime->identityAssetMapping = true;
+        runtime->assetChunkCount = static_cast<uint32_t>(chunks.size() + 1);
         runtime->chunks.resize(chunks.size());
         for (uint32_t i = 0; i < chunks.size(); ++i) runtime->chunks[i] = i;
         actor->userData = runtime.get();
         actors.push_back(std::move(runtime));
+        return true;
+    }
+
+    bool CreateFenceFragmentAsset(uint32_t panelChunkIndex) {
+        if (!framework || !group || panelChunkIndex >= chunks.size()) return false;
+        const Chunk& panel = chunks[panelChunkIndex];
+        if (!panel.node || !panel.node->mesh ||
+            panel.node->mesh->primitives.empty()) return false;
+        const uint32_t panelStructureId = panel.structureId;
+        const int panelStructuralGroup = panel.structuralGroup;
+
+        // Cut the intact mesh across one randomized, pitched line. Keeping the
+        // cut within the middle 30% avoids unusably thin top/bottom slivers;
+        // pitch is capped at 30 degrees and reduced near the limits so the
+        // plane still crosses the complete panel.
+        const float axisMinimum = panel.minimum.y;
+        const float axisLength = panel.maximum.y - panel.minimum.y;
+        if (axisLength <= 0.001f) return false;
+        const float randomUnit = static_cast<float>(std::rand()) /
+                                 static_cast<float>(RAND_MAX);
+        const float cutHeight = axisMinimum + axisLength *
+            (0.35f + randomUnit * 0.30f);
+        const bool longAxisX = panel.maximum.x - panel.minimum.x >=
+                               panel.maximum.z - panel.minimum.z;
+        const float longMinimum = longAxisX ? panel.minimum.x : panel.minimum.z;
+        const float longMaximum = longAxisX ? panel.maximum.x : panel.maximum.z;
+        const float longCenter = (longMinimum + longMaximum) * 0.5f;
+        const float longHalfExtent = (longMaximum - longMinimum) * 0.5f;
+        const float verticalClearance = (std::min)(
+            cutHeight - panel.minimum.y, panel.maximum.y - cutHeight);
+        const float geometryLimit = longHalfExtent > 0.001f
+            ? std::atan(verticalClearance / longHalfExtent)
+            : XM_PIDIV2;
+        const float maximumPitch = (std::min)(XMConvertToRadians(30.0f),
+                                               geometryLimit);
+        const float pitchRandom = static_cast<float>(std::rand()) /
+                                  static_cast<float>(RAND_MAX);
+        const float pitch = (pitchRandom * 2.0f - 1.0f) * maximumPitch;
+        const float pitchCosine = std::cos(pitch);
+        const float pitchSine = std::sin(pitch);
+        const auto planeDistance = [&](const std::array<float, 12>& vertex) {
+            const float alongPanel =
+                (longAxisX ? vertex[0] : vertex[2]) - longCenter;
+            return (vertex[1] - cutHeight) * pitchCosine +
+                   alongPanel * pitchSine;
+        };
+
+        std::array<Chunk, 2> pieces;
+        for (uint32_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
+            Chunk& piece = pieces[pieceIndex];
+            piece.minimum = { FLT_MAX, FLT_MAX, FLT_MAX };
+            piece.maximum = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+            piece.structuralGroup = panelStructuralGroup;
+            piece.structureId = panelStructureId;
+            piece.lazyRenderResources = true;
+            piece.persistentFenceFragment = true;
+            piece.node = std::make_shared<SceneNode>(
+                "RuntimeFenceFragment#" + std::to_string(panelStructuralGroup) +
+                ":" + std::to_string(pieceIndex));
+            piece.node->mesh = std::make_shared<SceneMesh>();
+        }
+
+        for (const MeshPrimitive& sourcePrimitive : panel.node->mesh->primitives) {
+            if (sourcePrimitive.indices.empty()) continue;
+            std::array<MeshPrimitive, 2> outputs;
+            std::array<bool, 2> used = {};
+            for (uint32_t pieceIndex = 0; pieceIndex < outputs.size(); ++pieceIndex) {
+                outputs[pieceIndex].material = sourcePrimitive.material;
+                outputs[pieceIndex].materialIndex = sourcePrimitive.materialIndex;
+                outputs[pieceIndex].stableTriangleNamespace =
+                    sourcePrimitive.stableTriangleNamespace;
+            }
+            for (size_t triangle = 0; triangle + 2 < sourcePrimitive.indices.size();
+                 triangle += 3) {
+                const UINT i0 = sourcePrimitive.indices[triangle];
+                const UINT i1 = sourcePrimitive.indices[triangle + 1];
+                const UINT i2 = sourcePrimitive.indices[triangle + 2];
+                if ((size_t)i0 * 12 + 11 >= sourcePrimitive.vertices.size() ||
+                    (size_t)i1 * 12 + 11 >= sourcePrimitive.vertices.size() ||
+                    (size_t)i2 * 12 + 11 >= sourcePrimitive.vertices.size()) continue;
+                using PackedVertex = std::array<float, 12>;
+                std::array<PackedVertex, 3> sourceVertices;
+                uint32_t sourceVertex = 0;
+                for (UINT sourceIndex : { i0, i1, i2 }) {
+                    const size_t begin = (size_t)sourceIndex * 12;
+                    std::copy_n(sourcePrimitive.vertices.begin() + begin, 12,
+                                sourceVertices[sourceVertex++].begin());
+                }
+                const size_t sourceTriangle = triangle / 3;
+                const uint32_t sourceStableId =
+                    sourceTriangle < sourcePrimitive.stableTriangleIDs.size()
+                        ? sourcePrimitive.stableTriangleIDs[sourceTriangle]
+                        : static_cast<uint32_t>(sourceTriangle);
+                for (uint32_t pieceIndex = 0; pieceIndex < 2; ++pieceIndex) {
+                    const bool lowerPiece = pieceIndex == 0;
+                    std::vector<PackedVertex> polygon(
+                        sourceVertices.begin(), sourceVertices.end());
+                    std::vector<PackedVertex> clipped;
+                    clipped.reserve(4);
+                    for (size_t currentIndex = 0;
+                         currentIndex < polygon.size(); ++currentIndex) {
+                        const PackedVertex& previous = polygon[
+                            (currentIndex + polygon.size() - 1) % polygon.size()];
+                        const PackedVertex& current = polygon[currentIndex];
+                        const float previousDistance = planeDistance(previous);
+                        const float currentDistance = planeDistance(current);
+                        const bool previousInside = lowerPiece
+                            ? previousDistance <= 0.0f : previousDistance >= 0.0f;
+                        const bool currentInside = lowerPiece
+                            ? currentDistance <= 0.0f : currentDistance >= 0.0f;
+                        if (previousInside != currentInside) {
+                            const float denominator =
+                                currentDistance - previousDistance;
+                            const float t = std::abs(denominator) > 0.000001f
+                                ? -previousDistance / denominator : 0.0f;
+                            PackedVertex intersection;
+                            for (size_t component = 0; component < intersection.size();
+                                 ++component)
+                                intersection[component] = previous[component] +
+                                    (current[component] - previous[component]) * t;
+                            clipped.push_back(intersection);
+                        }
+                        if (currentInside) clipped.push_back(current);
+                    }
+                    if (clipped.size() < 3) continue;
+                    MeshPrimitive& output = outputs[pieceIndex];
+                    for (size_t fan = 1; fan + 1 < clipped.size(); ++fan) {
+                        const UINT base = static_cast<UINT>(
+                            output.vertices.size() / 12);
+                        for (const PackedVertex* vertex :
+                             { &clipped[0], &clipped[fan], &clipped[fan + 1] })
+                            output.vertices.insert(output.vertices.end(),
+                                vertex->begin(), vertex->end());
+                        output.indices.insert(output.indices.end(),
+                            { base, base + 1, base + 2 });
+                        // One source triangle may become two triangles on each
+                        // side of the plane, so include side and fan in its
+                        // persistent identity.
+                        uint32_t stableId = sourceStableId;
+                        stableId ^= 0x9e3779b9u + pieceIndex * 0x85ebca6bu +
+                            static_cast<uint32_t>(fan) * 0xc2b2ae35u;
+                        output.stableTriangleIDs.push_back(stableId);
+                    }
+                    used[pieceIndex] = true;
+                }
+            }
+            for (uint32_t pieceIndex = 0; pieceIndex < outputs.size(); ++pieceIndex)
+                if (used[pieceIndex])
+                    pieces[pieceIndex].node->mesh->primitives.push_back(
+                        std::move(outputs[pieceIndex]));
+        }
+
+        for (Chunk& piece : pieces) {
+            for (const MeshPrimitive& primitive : piece.node->mesh->primitives)
+                for (size_t vertex = 0; vertex + 11 < primitive.vertices.size();
+                     vertex += 12) {
+                    const XMFLOAT3 point{ primitive.vertices[vertex],
+                        primitive.vertices[vertex + 1], primitive.vertices[vertex + 2] };
+                    piece.minimum.x = (std::min)(piece.minimum.x, point.x);
+                    piece.minimum.y = (std::min)(piece.minimum.y, point.y);
+                    piece.minimum.z = (std::min)(piece.minimum.z, point.z);
+                    piece.maximum.x = (std::max)(piece.maximum.x, point.x);
+                    piece.maximum.y = (std::max)(piece.maximum.y, point.y);
+                    piece.maximum.z = (std::max)(piece.maximum.z, point.z);
+                }
+            if (piece.minimum.x == FLT_MAX) return false;
+            piece.center = { (piece.minimum.x + piece.maximum.x) * 0.5f,
+                             (piece.minimum.y + piece.maximum.y) * 0.5f,
+                             (piece.minimum.z + piece.maximum.z) * 0.5f };
+            // A stable box is preferable to a huge convex cook for bent wire
+            // triangles, and keeps the two freshly-created bodies upright.
+            for (float x : { piece.minimum.x, piece.maximum.x })
+            for (float y : { piece.minimum.y, piece.maximum.y })
+            for (float z : { piece.minimum.z, piece.maximum.z })
+                piece.collisionPoints.push_back({ x, y, z });
+        }
+
+        const uint32_t firstGlobalChunk = static_cast<uint32_t>(chunks.size());
+        for (Chunk& piece : pieces) chunks.push_back(std::move(piece));
+
+        std::array<NvBlastChunkDesc, 3> chunkDescs = {};
+        float rootVolume = 0.0f;
+        XMFLOAT3 rootCenter = {};
+        chunkDescs[0].parentChunkDescIndex = InvalidIndex;
+        chunkDescs[0].flags = NvBlastChunkDesc::NoFlags;
+        chunkDescs[0].userData = InvalidIndex;
+        for (uint32_t pieceIndex = 0; pieceIndex < 2; ++pieceIndex) {
+            const Chunk& piece = chunks[firstGlobalChunk + pieceIndex];
+            const float volume = (std::max)(0.001f,
+                (piece.maximum.x - piece.minimum.x) *
+                (piece.maximum.y - piece.minimum.y) *
+                (piece.maximum.z - piece.minimum.z));
+            NvBlastChunkDesc& desc = chunkDescs[pieceIndex + 1];
+            desc.centroid[0] = piece.center.x;
+            desc.centroid[1] = piece.center.y;
+            desc.centroid[2] = piece.center.z;
+            desc.volume = volume;
+            desc.parentChunkDescIndex = 0;
+            desc.flags = NvBlastChunkDesc::SupportFlag;
+            desc.userData = firstGlobalChunk + pieceIndex;
+            rootCenter.x += piece.center.x * volume;
+            rootCenter.y += piece.center.y * volume;
+            rootCenter.z += piece.center.z * volume;
+            rootVolume += volume;
+        }
+        rootCenter.x /= rootVolume;
+        rootCenter.y /= rootVolume;
+        rootCenter.z /= rootVolume;
+        chunkDescs[0].centroid[0] = rootCenter.x;
+        chunkDescs[0].centroid[1] = rootCenter.y;
+        chunkDescs[0].centroid[2] = rootCenter.z;
+        chunkDescs[0].volume = rootVolume;
+
+        std::array<NvBlastBondDesc, 1> bonds = {};
+        for (uint32_t bondIndex = 0; bondIndex < bonds.size(); ++bondIndex) {
+            NvBlastBondDesc& bond = bonds[bondIndex];
+            bond.chunkIndices[0] = bondIndex + 1;
+            bond.chunkIndices[1] = bondIndex + 2;
+            bond.bond.normal[1] = 1.0f;
+            const Chunk& a = chunks[firstGlobalChunk + bondIndex];
+            const Chunk& b = chunks[firstGlobalChunk + bondIndex + 1];
+            bond.bond.centroid[0] = (a.center.x + b.center.x) * 0.5f;
+            bond.bond.centroid[1] = (a.center.y + b.center.y) * 0.5f;
+            bond.bond.centroid[2] = (a.center.z + b.center.z) * 0.5f;
+            bond.bond.area = 1.0f;
+            bond.bond.userData = bondIndex;
+        }
+
+        TkAssetDesc assetDesc;
+        assetDesc.chunkCount = static_cast<uint32_t>(chunkDescs.size());
+        assetDesc.chunkDescs = chunkDescs.data();
+        assetDesc.bondCount = static_cast<uint32_t>(bonds.size());
+        assetDesc.bondDescs = bonds.data();
+        TkAsset* fragmentAsset = framework->createAsset(assetDesc);
+        if (!fragmentAsset) {
+            chunks.resize(firstGlobalChunk);
+            return false;
+        }
+        std::array<float, 1> bondHealths = { kBondHealth };
+        std::array<float, 2> chunkHealths = { kBondHealth, kBondHealth };
+        TkActorDesc actorDesc(fragmentAsset);
+        actorDesc.initialBondHealths = bondHealths.data();
+        actorDesc.initialSupportChunkHealths = chunkHealths.data();
+        TkActor* actor = framework->createActor(actorDesc);
+        if (!actor) {
+            fragmentAsset->release();
+            chunks.resize(firstGlobalChunk);
+            return false;
+        }
+        TkFamily* fragmentFamily = &actor->getFamily();
+        fragmentFamily->addListener(*owner);
+        if (!group->addActor(*actor)) {
+            fragmentFamily->removeListener(*owner);
+            fragmentFamily->release();
+            fragmentAsset->release();
+            chunks.resize(firstGlobalChunk);
+            return false;
+        }
+        runtimeBlastAssets.push_back({ fragmentAsset, fragmentFamily });
+
+        auto mapping = std::make_shared<std::vector<uint32_t>>(3, InvalidIndex);
+        for (uint32_t pieceIndex = 0; pieceIndex < 2; ++pieceIndex)
+            (*mapping)[pieceIndex + 1] = firstGlobalChunk + pieceIndex;
+        auto runtime = std::make_unique<ActorRuntime>();
+        runtime->actor = actor;
+        runtime->renderId = nextActorRenderId++;
+        runtime->structureId = panelStructureId;
+        runtime->identityAssetMapping = false;
+        runtime->assetChunkCount = 3;
+        runtime->assetChunkToGlobal = mapping;
+        runtime->chunks = { firstGlobalChunk, firstGlobalChunk + 1 };
+        runtime->center = rootCenter;
+        CreateBody(*runtime, true, nullptr);
+        actor->userData = runtime.get();
+        actors.push_back(std::move(runtime));
+
+        std::array<uint8_t, 3> splitMask = { 0, 1, 1 };
+        IsolateChunksParams splitParams{ splitMask.data(),
+            static_cast<uint32_t>(splitMask.size()) };
+        const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
+        actor->damage(isolate, &splitParams);
+        group->process();
         return true;
     }
 
@@ -2118,21 +2491,24 @@ struct DestructionDX12::Impl {
         result.chunkHash = chunkHash;
         auto root = std::make_shared<SceneNode>("DestructionActorBatch");
         root->children = std::move(nodes);
-        // Shared chunk nodes retain their authored local transforms. Do not
-        // recursively rewrite their globals while building a background batch.
-        ComPtr<ID3D12Device> deviceRef = background
-            ? ComPtr<ID3D12Device>() : ComPtr<ID3D12Device>(batchDevice);
-        auto shadowFuture = std::async(std::launch::async,
-            [root, deviceRef, background]() {
-                if (background)
-                    SetThreadPriority(GetCurrentThread(),
-                        THREAD_PRIORITY_BELOW_NORMAL);
-                return GLBImporter::MergeSceneForDepth(root, deviceRef);
-            });
-        result.colourNode = GLBImporter::MergeSceneByMaterial(root, deviceRef);
-        result.shadowNode = shadowFuture.get();
+        // Merge CPU-only, then upload vertex/index buffers without rebuilding
+        // meshlets. A long spline fence becomes one enormous material bucket;
+        // meshopt's temporary arrays for that bucket reached ~10 GiB and made
+        // level loading appear hung. Destruction batches already render through
+        // the non-meshlet path (as spatial batches do below), so those buffers
+        // were pure load-time cost. Keep colour/depth merges sequential as well
+        // to avoid holding both sets of merge scratch at peak size.
+        ComPtr<ID3D12Device> noDevice;
+        result.colourNode = GLBImporter::MergeSceneByMaterial(root, noDevice);
+        result.shadowNode = GLBImporter::MergeSceneForDepth(root, noDevice);
         MarkBatchGeometryTransient(result.colourNode);
         MarkBatchGeometryTransient(result.shadowNode);
+        if (!background &&
+            (!UploadMergedNode(result.colourNode, batchDevice) ||
+             !UploadMergedNode(result.shadowNode, batchDevice))) {
+            result.colourNode.reset();
+            result.shadowNode.reset();
+        }
         return result;
     }
 
@@ -2444,28 +2820,32 @@ struct DestructionDX12::Impl {
                 batchMax.z = (std::max)(batchMax.z, worldCenter.z + radius);
             }
 
-            // Initial intact structure gets one actor batch. Post-split stable
-            // pieces use small spatial cells; huge actor-wide merges cause
-            // memory spikes and make fracture transitions visually coarse.
-            const bool eligible = initialBatchBuild &&
+            // Initial intact structure gets one actor batch. Lazy fence chunks
+            // also stay actor-batched after a split so the standing run never
+            // falls back to hundreds of individual GPU allocations. Other
+            // post-split stable pieces still use small spatial cells below.
+            const bool hasLazyChunks = std::any_of(
+                runtime->chunks.begin(), runtime->chunks.end(),
+                [&](uint32_t chunk) {
+                    return chunks[chunk].lazyRenderResources;
+                });
+            const bool eligible = (initialBatchBuild || hasLazyChunks) &&
                 runtime->chunks.size() > 1 && runtime->failedBatchHash != hash;
             if (cacheIt == batchCache.end() && eligible) {
                 std::vector<std::shared_ptr<SceneNode>> nodes;
                 nodes.reserve(runtime->chunks.size());
                 for (uint32_t chunk : runtime->chunks)
                     nodes.push_back(chunks[chunk].node);
-                if (initialBatchBuild) {
-                    BatchBuildResult result = BuildActorBatch(
-                        device, runtime->renderId, hash, std::move(nodes));
-                    if (result.colourNode && result.shadowNode) {
-                        batchCache[runtime.get()] = { hash,
-                            std::move(result.colourNode),
-                            std::move(result.shadowNode) };
-                        ++batchGeometryRebuildCount;
-                        cacheIt = batchCache.find(runtime.get());
-                    } else {
-                        runtime->failedBatchHash = hash;
-                    }
+                BatchBuildResult result = BuildActorBatch(
+                    device, runtime->renderId, hash, std::move(nodes));
+                if (result.colourNode && result.shadowNode) {
+                    batchCache[runtime.get()] = { hash,
+                        std::move(result.colourNode),
+                        std::move(result.shadowNode) };
+                    ++batchGeometryRebuildCount;
+                    cacheIt = batchCache.find(runtime.get());
+                } else {
+                    runtime->failedBatchHash = hash;
                 }
             }
 
@@ -2479,7 +2859,19 @@ struct DestructionDX12::Impl {
                     runtime->batchRadius,
                     static_cast<uint32_t>(runtime->chunks.size()) });
             } else {
-                renderItems.insert(renderItems.end(), actorItems.begin(), actorItems.end());
+                // Lazy fence chunks reach this path only after being freed (or
+                // if a merged batch failed). Upload just the geometry that now
+                // needs an individual draw; intact panels never allocate these
+                // per-chunk buffers during level load.
+                bool resourcesReady = true;
+                for (uint32_t chunk : runtime->chunks)
+                    resourcesReady &= UploadMergedNode(chunks[chunk].node, device);
+                if (resourcesReady) {
+                    renderItems.insert(renderItems.end(), actorItems.begin(),
+                        actorItems.end());
+                } else {
+                    std::cerr << "Destruction: deferred chunk upload failed\n";
+                }
             }
         }
 
@@ -2522,9 +2914,14 @@ struct DestructionDX12::Impl {
                     identity, entry.center, entry.radius, entry.chunkCount });
             } else {
                 // Allocation/build failure must not hide geometry.
-                for (const SpatialBatchSource& source : build.sources)
-                    renderItems.push_back({ source.node, source.transform,
-                        source.center, source.radius });
+                for (const SpatialBatchSource& source : build.sources) {
+                    if (UploadMergedNode(source.node, device)) {
+                        renderItems.push_back({ source.node, source.transform,
+                            source.center, source.radius });
+                    } else {
+                        std::cerr << "Destruction: deferred spatial chunk upload failed\n";
+                    }
+                }
             }
         }
         for (auto it = spatialBatchCache.begin();
@@ -2613,6 +3010,46 @@ struct DestructionDX12::Impl {
         }
     }
 
+    uint32_t AssetChunkForGlobal(const ActorRuntime& runtime,
+                                 uint32_t globalChunk) const {
+        if (runtime.identityAssetMapping) {
+            const uint32_t assetChunk = globalChunk + 1;
+            return assetChunk < runtime.assetChunkCount
+                ? assetChunk : InvalidIndex;
+        }
+        if (!runtime.assetChunkToGlobal) return InvalidIndex;
+        for (uint32_t assetChunk = 1;
+             assetChunk < runtime.assetChunkToGlobal->size(); ++assetChunk) {
+            if ((*runtime.assetChunkToGlobal)[assetChunk] == globalChunk)
+                return assetChunk;
+        }
+        return InvalidIndex;
+    }
+
+    uint32_t GlobalChunkForAsset(const ActorRuntime& runtime,
+                                 uint32_t assetChunk) const {
+        if (assetChunk == 0 || assetChunk >= runtime.assetChunkCount)
+            return InvalidIndex;
+        if (runtime.identityAssetMapping) return assetChunk - 1;
+        if (!runtime.assetChunkToGlobal ||
+            assetChunk >= runtime.assetChunkToGlobal->size())
+            return InvalidIndex;
+        return (*runtime.assetChunkToGlobal)[assetChunk];
+    }
+
+    std::vector<uint8_t> MakeActorChunkMask(const ActorRuntime& runtime) const {
+        return std::vector<uint8_t>(runtime.assetChunkCount, 0);
+    }
+
+    bool MarkActorChunk(std::vector<uint8_t>& mask,
+                        const ActorRuntime& runtime,
+                        uint32_t globalChunk) const {
+        const uint32_t assetChunk = AssetChunkForGlobal(runtime, globalChunk);
+        if (assetChunk == InvalidIndex || assetChunk >= mask.size()) return false;
+        mask[assetChunk] = 1;
+        return true;
+    }
+
     // `includeProtected` is the opt-out for objective geometry. It defaults to
     // false so that every path -- including ones added later -- spares protected
     // chunks unless it deliberately says otherwise. Note this is the opposite
@@ -2636,6 +3073,7 @@ struct DestructionDX12::Impl {
                                     local.z + runtime->center.z);
             for (uint32_t chunkIndex : runtime->chunks) {
                 const Chunk& chunk = chunks[chunkIndex];
+                if (chunk.persistentFenceFragment) continue;
                 // Skipped *during* the search rather than rejected after it, so
                 // objective geometry is transparent to indirect damage: an impact
                 // beside the comm tower still fractures the house behind it. Post-
@@ -2660,8 +3098,99 @@ struct DestructionDX12::Impl {
             }
         }
         if (!hitActor || !hitActor->actor || hitChunk == InvalidIndex) return false;
-        if (!includeSupport && chunks[hitChunk].support) return false;
-        if (!includeSingle && hitActor->chunks.size() <= 1) return false;
+        const Chunk& selected = chunks[hitChunk];
+        if (!includeSupport && selected.support && !selected.breakableSupport)
+            return false;
+        if (!includeSingle && hitActor->chunks.size() <= 1 &&
+            !selected.breakableSupport) return false;
+        return true;
+    }
+
+    bool RemoveSingleChunkActor(ActorRuntime* target) {
+        if (!target || target->chunks.size() != 1) return false;
+        const uint32_t chunkIndex = target->chunks.front();
+        XMFLOAT3 breakPoint = chunks[chunkIndex].center;
+        ChunkWorldPosition(chunkIndex, breakPoint);
+        const auto runtime = std::find_if(
+            actors.begin(), actors.end(),
+            [target](const std::unique_ptr<ActorRuntime>& value) {
+                return value.get() == target;
+            });
+        if (runtime == actors.end()) return false;
+        if (!B3_IS_NULL((*runtime)->body)) b3DestroyBody((*runtime)->body);
+        if ((*runtime)->actor) {
+            (*runtime)->actor->removeFromGroup();
+            (*runtime)->actor->release();
+        }
+        actors.erase(runtime);
+        breakPoints.push_back(breakPoint);
+        return true;
+    }
+
+    void RetireChunkFromRuntime(ActorRuntime& runtime, uint32_t chunkIndex) {
+        const auto found = std::find(runtime.chunks.begin(),
+                                     runtime.chunks.end(), chunkIndex);
+        if (found == runtime.chunks.end()) return;
+        BodySeed seed;
+        if (!B3_IS_NULL(runtime.body)) {
+            seed.valid = true;
+            seed.modelCenter = runtime.center;
+            seed.position = b3Body_GetPosition(runtime.body);
+            seed.rotation = b3Body_GetRotation(runtime.body);
+            seed.linearVelocity = b3Body_GetLinearVelocity(runtime.body);
+            seed.angularVelocity = b3Body_GetAngularVelocity(runtime.body);
+        }
+        runtime.chunks.erase(found);
+        runtime.batchBoundsValid = false;
+        if (runtime.chunks.empty()) {
+            if (!B3_IS_NULL(runtime.body)) b3DestroyBody(runtime.body);
+            runtime.body = b3_nullBodyId;
+            return;
+        }
+        CreateBody(runtime, runtime.dynamic, seed.valid ? &seed : nullptr);
+    }
+
+    bool TransitionFencePanel(ActorRuntime* target, uint32_t chunkIndex) {
+        if (!target || !target->actor || !group || chunkIndex >= chunks.size())
+            return false;
+        Chunk& panel = chunks[chunkIndex];
+        if (!panel.fencePiece || panel.retired) return false;
+
+        std::vector<uint8_t> mask = MakeActorChunkMask(*target);
+        if (!MarkActorChunk(mask, *target, chunkIndex)) return false;
+        IsolateChunksParams params{ mask.data(),
+            static_cast<uint32_t>(mask.size()) };
+        const NvBlastDamageProgram destroyPanel = {
+            DestroyChunksGraphShader, DestroyChunksSubgraphShader };
+        TkActor* blastActor = target->actor;
+        blastActor->damage(destroyPanel, &params);
+
+        const uint32_t structureId = panel.structureId;
+        panel.support = false;
+        panel.retired = true;
+        // Drop the intact panel's render and collision ownership before Blast
+        // emits its split event. Only the generated halves may replace it.
+        RetireChunkFromRuntime(*target, chunkIndex);
+        group->process();
+
+        // A destroyed one-chunk actor may produce no visible child, leaving an
+        // empty runtime for us to retire explicitly.
+        for (auto runtime = actors.begin(); runtime != actors.end();) {
+            if (!(*runtime)->chunks.empty()) {
+                ++runtime;
+                continue;
+            }
+            if (!B3_IS_NULL((*runtime)->body)) b3DestroyBody((*runtime)->body);
+            if ((*runtime)->actor) {
+                (*runtime)->actor->removeFromGroup();
+                (*runtime)->actor->release();
+            }
+            runtime = actors.erase(runtime);
+        }
+        if (!CreateFenceFragmentAsset(chunkIndex))
+            std::cerr << "Destruction: failed to create runtime fence fragments\n";
+        MarkStructureDirty(structureId);
+        RebuildRenderItems();
         return true;
     }
 
@@ -2677,6 +3206,11 @@ struct DestructionDX12::Impl {
                 worldPosition, hitActor, hitChunk, includeSupport,
                 /*includeSingle=*/false, includeProtected)) return false;
         lastBrokenStructure = chunks[hitChunk].structureId;
+        if (chunks[hitChunk].breakableSupport) {
+            chunks[hitChunk].support = false;
+            if (hitActor->chunks.size() == 1)
+                return RemoveSingleChunkActor(hitActor);
+        }
         if (hitActor->debrisCleanupEligible) {
             WakeDebris(*hitActor);
         }
@@ -2699,17 +3233,18 @@ struct DestructionDX12::Impl {
                 return true;
             }
         }
-        std::vector<uint8_t> mask(chunks.size() + 1, 0);  // asset chunk index; 0 = root
+        std::vector<uint8_t> mask = MakeActorChunkMask(*hitActor);
         if (chunks[hitChunk].glass) {
             // Glass breaks like glass: one hit severs every cell of the pane so
             // the whole window bursts into individual shards at once.
             const int pane = chunks[hitChunk].plankGroup;
             for (uint32_t ci : hitActor->chunks)
-                if (chunks[ci].plankGroup == pane) mask[ci + 1] = 1;
+                if (chunks[ci].plankGroup == pane)
+                    MarkActorChunk(mask, *hitActor, ci);
         } else {
             // Wood: break just the struck Voronoi cell -- a local jagged hole
             // rather than a whole straight-edged board.
-            mask[hitChunk + 1] = 1;
+            MarkActorChunk(mask, *hitActor, hitChunk);
         }
         IsolateChunksParams isolateParams{ mask.data(), (uint32_t)mask.size() };
         const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
@@ -2937,6 +3472,10 @@ struct DestructionDX12::Impl {
             std::list<IsolateGroupParams> groupParamStore;
             for (auto& runtime : actors) {
                 if (!runtime->actor) continue;
+                // Runtime fence assets are born already split and have their
+                // own two-bond graph; the structural relaxation tables below
+                // describe only the shipped level asset.
+                if (!runtime->identityAssetMapping) continue;
                 const NvBlastActor* ll = runtime->actor->getActorLL();
                 if (!ll) continue;
                 const float* bondHealths = NvBlastActorGetBondHealths(ll, nullptr);
@@ -2993,7 +3532,7 @@ struct DestructionDX12::Impl {
                     anyMarked = true;
                 }
 
-                std::vector<uint8_t> mask(chunks.size() + 1, 0);  // asset chunk index; 0 = root
+                std::vector<uint8_t> mask = MakeActorChunkMask(*runtime);
                 bool actorMarked = false;
                 for (uint32_t chunkIndex : runtime->chunks) {
                     if (chunks[chunkIndex].structureId != structureId) continue;
@@ -3001,8 +3540,7 @@ struct DestructionDX12::Impl {
                     if (chunks[chunkIndex].plankGroup >= 0) continue;  // plank sub-pieces break only on a hit, not by the low-bond rule
                     if (runtime->chunks.size() <= 1) continue;         // already a loose single piece
                     if (liveBonds[chunkIndex] < kMinBonds) {
-                        mask[chunkIndex + 1] = 1;                       // asset chunk index = 0-based + 1
-                        actorMarked = true;
+                        actorMarked |= MarkActorChunk(mask, *runtime, chunkIndex);
                     }
                 }
                 if (actorMarked) {
@@ -3171,6 +3709,18 @@ void DestructionDX12::Shutdown() {
     m->terrainShape = b3_nullShapeId;
     m->terrainHeights.clear();
     m->terrainPoints = 0;
+    for (Impl::RuntimeBlastAsset& runtimeAsset : m->runtimeBlastAssets) {
+        if (runtimeAsset.family) {
+            runtimeAsset.family->removeListener(*this);
+            runtimeAsset.family->release();
+            runtimeAsset.family = nullptr;
+        }
+        if (runtimeAsset.asset) {
+            runtimeAsset.asset->release();
+            runtimeAsset.asset = nullptr;
+        }
+    }
+    m->runtimeBlastAssets.clear();
     if (m->family) {
         m->family->removeListener(*this);
         const uint32_t count = m->family->getActorCount();
@@ -4073,7 +4623,6 @@ bool DestructionDX12::ResolveAttachment(
 void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float radius,
                                         float damage, bool sparesProtected) {
     if (!m->initialized) return;
-    (void)damage;  // hit count, not weapon damage, controls bullet breakage
     // Bullet struck a person, not a Blast chunk. Preserve building bonds.
     if (m->lastRagdollHit >= 0) return;
     m->lastDamagePosition = worldPosition;
@@ -4087,6 +4636,22 @@ void DestructionDX12::ApplyRadialDamage(const XMFLOAT3& worldPosition, float rad
     // geometry alone; a direct player hit does not pass this flag.
     if (sparesProtected && hitChunk < m->chunks.size() &&
         m->chunks[hitChunk].protectedChunk) return;
+    Impl::Chunk& selected = m->chunks[hitChunk];
+    if (selected.fencePiece) {
+        // Fire and indirect physics damage use sparesProtected. Fence steel
+        // only accumulates deliberate weapon hits.
+        if (sparesProtected) return;
+        selected.health = (std::max)(0.0f,
+            selected.health - (std::max)(0.0f, damage));
+        if (selected.health > 0.0f) {
+            std::cout << "Fence hit: " << selected.health << "/"
+                      << kFencePanelHealth << " health\n";
+            return;
+        }
+        m->bulletHitCounts.erase(hitChunk);
+        m->TransitionFencePanel(hitActor, hitChunk);
+        return;
+    }
     uint8_t& hitCount = m->bulletHitCounts[hitChunk];
     ++hitCount;
     if (hitCount < 3) {
@@ -4108,10 +4673,52 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
     // without a Blast group, so there is nothing to fracture and the
     // unconditional group->process() below would dereference null.
     if (!m->initialized || !m->group) return;
-    (void)damage;  // explosion fully severs pieces in range rather than chipping
     m->lastDamagePosition = worldPosition;
     m->lastDamageRadius = radius;
     const float radiusSquared = radius * radius;
+
+    // Fence panels are shorter than common C4 blast radii, so a plain sphere
+    // test would release the neighbours too. Resolve one closest authored panel
+    // up front; non-fence destruction remains fully radial below.
+    uint32_t explodedFenceChunk = InvalidIndex;
+    Impl::ActorRuntime* explodedFenceActor = nullptr;
+    float closestFenceDistanceSquared = radiusSquared;
+    for (const auto& runtime : m->actors) {
+        if (!runtime->actor || B3_IS_NULL(runtime->body)) continue;
+        const b3Vec3 local = b3Body_GetLocalPoint(runtime->body,
+            { worldPosition.x, worldPosition.y, worldPosition.z });
+        const XMFLOAT3 modelHit(local.x + runtime->center.x,
+                                local.y + runtime->center.y,
+                                local.z + runtime->center.z);
+        for (uint32_t chunkIndex : runtime->chunks) {
+            const Impl::Chunk& chunk = m->chunks[chunkIndex];
+            if (!chunk.fencePiece || chunk.structuralGroup < 0 ||
+                chunk.protectedChunk) continue;
+            const float dx = chunk.center.x - modelHit.x;
+            const float dy = chunk.center.y - modelHit.y;
+            const float dz = chunk.center.z - modelHit.z;
+            const float distanceSquared = dx * dx + dy * dy + dz * dz;
+            if (distanceSquared <= closestFenceDistanceSquared) {
+                closestFenceDistanceSquared = distanceSquared;
+                explodedFenceChunk = chunkIndex;
+                explodedFenceActor = runtime.get();
+            }
+        }
+    }
+
+    // Damage only the closest struck panel. Adjacent spline panels remain
+    // static even when their bounds also touch a broad explosion radius.
+    if (explodedFenceActor && explodedFenceChunk < m->chunks.size()) {
+        Impl::Chunk& panel = m->chunks[explodedFenceChunk];
+        panel.health = (std::max)(0.0f,
+            panel.health - (std::max)(0.0f, damage));
+        if (panel.health <= 0.0f) {
+            m->TransitionFencePanel(explodedFenceActor, explodedFenceChunk);
+        } else {
+            std::cout << "Fence blast: " << panel.health << "/"
+                      << kFencePanelHealth << " health\n";
+        }
+    }
 
     // Mark every chunk whose centre lies within the blast radius (in that
     // actor's model space) and sever all its bonds, so the whole sphere of the
@@ -4127,22 +4734,22 @@ void DestructionDX12::ApplyExplosion(const XMFLOAT3& worldPosition, float radius
         const XMFLOAT3 modelHit(local.x + runtime->center.x,
                                 local.y + runtime->center.y,
                                 local.z + runtime->center.z);
-        std::vector<uint8_t> mask(m->chunks.size() + 1, 0);  // asset chunk index; 0 = root
+        std::vector<uint8_t> mask = m->MakeActorChunkMask(*runtime);
         bool marked = false;
         for (uint32_t chunkIndex : runtime->chunks) {
-            const Impl::Chunk& chunk = m->chunks[chunkIndex];
-            if (chunk.support) continue;  // anchored pieces resist the blast
+            Impl::Chunk& chunk = m->chunks[chunkIndex];
             // Objective geometry ignores blasts entirely: a helicopter crashing
             // at its feet or a barrel chain next to it must not fell it.
             if (chunk.protectedChunk) continue;
             const float dx = chunk.center.x - modelHit.x;
             const float dy = chunk.center.y - modelHit.y;
             const float dz = chunk.center.z - modelHit.z;
-            if (dx * dx + dy * dy + dz * dz <= radiusSquared) {
-                mask[chunkIndex + 1] = 1;
-                marked = true;
-                damagedStructures.insert(chunk.structureId);
-            }
+            if (dx * dx + dy * dy + dz * dz > radiusSquared) continue;
+            if (chunk.fencePiece) continue;
+            if (chunk.persistentFenceFragment) continue;
+            if (chunk.support) continue;  // ordinary anchors resist the blast
+            marked |= m->MarkActorChunk(mask, *runtime, chunkIndex);
+            damagedStructures.insert(chunk.structureId);
         }
         if (marked) {
             masks.push_back(std::move(mask));
@@ -4231,12 +4838,11 @@ void DestructionDX12::ReleaseProtectedChunks(const XMFLOAT3& worldPosition,
     const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
     for (auto& runtime : m->actors) {
         if (!runtime->actor) continue;
-        std::vector<uint8_t> mask(m->chunks.size() + 1, 0);  // asset chunk index; 0 = root
+        std::vector<uint8_t> mask = m->MakeActorChunkMask(*runtime);
         bool marked = false;
         for (uint32_t chunkIndex : runtime->chunks) {
             if (released.count(chunkIndex) == 0) continue;
-            mask[chunkIndex + 1] = 1;
-            marked = true;
+            marked |= m->MarkActorChunk(mask, *runtime, chunkIndex);
             damagedStructures.insert(m->chunks[chunkIndex].structureId);
         }
         if (marked) {
@@ -4337,7 +4943,7 @@ void DestructionDX12::StartVortex(const XMFLOAT3& worldPosition, float radius,
         const XMFLOAT3 modelCenter(local.x + runtime->center.x,
                                    local.y + runtime->center.y,
                                    local.z + runtime->center.z);
-        std::vector<uint8_t> mask(m->chunks.size() + 1, 0);
+        std::vector<uint8_t> mask = m->MakeActorChunkMask(*runtime);
         bool actorMarked = false;
         for (uint32_t chunkIndex : runtime->chunks) {
             Impl::Chunk& chunk = m->chunks[chunkIndex];
@@ -4349,7 +4955,7 @@ void DestructionDX12::StartVortex(const XMFLOAT3& worldPosition, float radius,
             if (chunk.protectedChunk) continue;
             if (!SphereAabb(modelCenter, radius,
                             chunk.minimum, chunk.maximum)) continue;
-            mask[chunkIndex + 1] = 1;
+            m->MarkActorChunk(mask, *runtime, chunkIndex);
             chunk.support = false;
             actorMarked = true;
             anyMarked = true;
@@ -4408,7 +5014,7 @@ void DestructionDX12::UndermineSupports(const XMFLOAT3& worldPosition,
 
     for (auto& runtime : m->actors) {
         if (!runtime->actor || B3_IS_NULL(runtime->body)) continue;
-        std::vector<uint8_t> mask(m->chunks.size() + 1, 0);
+        std::vector<uint8_t> mask = m->MakeActorChunkMask(*runtime);
         bool actorMarked = false;
 
         // First pass: which pieces did the crater actually dig out from under?
@@ -4451,7 +5057,7 @@ void DestructionDX12::UndermineSupports(const XMFLOAT3& worldPosition,
             const bool loose = std::find(underminedLoose.begin(),
                 underminedLoose.end(), chunkIndex) != underminedLoose.end();
             if (!inGroup && !loose) continue;
-            mask[chunkIndex + 1] = 1;
+            m->MarkActorChunk(mask, *runtime, chunkIndex);
             chunk.support = false;
             actorMarked = true;
             anyMarked = true;
@@ -5218,6 +5824,12 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
                 return runtime.get() == candidate;
             });
         Impl::ActorRuntime* parent = parentIt != m->actors.end() ? parentIt->get() : nullptr;
+        const bool identityAssetMapping = parent
+            ? parent->identityAssetMapping : true;
+        const uint32_t assetChunkCount = parent
+            ? parent->assetChunkCount : 0;
+        const std::shared_ptr<const std::vector<uint32_t>> assetChunkToGlobal =
+            parent ? parent->assetChunkToGlobal : nullptr;
         Impl::BodySeed seed;
         if (parent && !B3_IS_NULL(parent->body)) {
             seed.valid = true;
@@ -5238,16 +5850,25 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
             auto runtime = std::make_unique<Impl::ActorRuntime>();
             runtime->actor = child;
             runtime->renderId = m->nextActorRenderId++;
+            runtime->identityAssetMapping = identityAssetMapping;
+            runtime->assetChunkCount = assetChunkCount;
+            runtime->assetChunkToGlobal = assetChunkToGlobal;
             // Destroyed actors never enter batch construction. Rendering remains
             // immediately available through their individual chunk geometry.
             const uint32_t visibleCount = child->getVisibleChunkCount();
             std::vector<uint32_t> visible(visibleCount);
             child->getVisibleChunkIndices(visible.data(), visibleCount);
             for (uint32_t assetChunk : visible) {
-                if (assetChunk > 0 && assetChunk <= m->chunks.size())
-                    runtime->chunks.push_back(assetChunk - 1);
+                const uint32_t globalChunk =
+                    m->GlobalChunkForAsset(*runtime, assetChunk);
+                if (globalChunk != InvalidIndex && globalChunk < m->chunks.size() &&
+                    !m->chunks[globalChunk].retired)
+                    runtime->chunks.push_back(globalChunk);
             }
-            if (runtime->chunks.empty()) continue;
+            if (runtime->chunks.empty()) {
+                child->removeFromGroup();
+                continue;
+            }
             runtime->structureId = m->chunks[runtime->chunks.front()].structureId;
             for (uint32_t chunkIndex : runtime->chunks) {
                 runtime->center.x += m->chunks[chunkIndex].center.x;
@@ -5267,6 +5888,7 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
                 if (m->chunks[chunkIndex].support) { islandSupported = true; break; }
             }
             if (!islandSupported && runtime->chunks.size() == 1 &&
+                !m->chunks[runtime->chunks.front()].persistentFenceFragment &&
                 m->ActorMaxExtent(*runtime) <= TinyDebrisMaxExtent) {
                 child->userData = nullptr;
                 child->removeFromGroup();
@@ -5277,7 +5899,11 @@ void DestructionDX12::receive(const TkEvent* events, uint32_t eventCount) {
             m->CreateBody(*runtime, !islandSupported, islandSupported ? nullptr : &seed);
             // This is the zero-health transition. Start a fresh inactivity
             // timer; later impacts reset it instead of inheriting old age.
-            runtime->debrisCleanupEligible = runtime->dynamic;
+            runtime->debrisCleanupEligible = runtime->dynamic &&
+                std::none_of(runtime->chunks.begin(), runtime->chunks.end(),
+                    [this](uint32_t chunkIndex) {
+                        return m->chunks[chunkIndex].persistentFenceFragment;
+                    });
             runtime->debrisAge = 0.0f;
             // A freed (unsupported) island is a real break -> mark its spot for
             // a puff of smoke at the fracture.

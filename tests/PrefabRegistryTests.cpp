@@ -234,7 +234,34 @@ int main() {
             CHECK(fence->error.empty());
             CHECK(fence->collision == "mesh");
             CHECK(fence->targetSize == 0.0f);
+            // Fence panels are authored-piece NvBlast structures. Generic
+            // prefab health would give explosions a second destruction owner.
+            CHECK(!fence->destructible.enabled);
             CHECK(std::filesystem::exists(fence->modelPath));
+        }
+
+        // The second fence asset breaks exactly like props/fence: one authored
+        // panel cut into halves at runtime. It must match that prefab's
+        // settings, or it would fall back to the generic destructible path.
+        const PrefabAsset* fencePanel = shipped.Find("props/fence_panel");
+        CHECK(fencePanel != nullptr);
+        if (fencePanel) {
+            CHECK(fencePanel->error.empty());
+            CHECK(fencePanel->collision == "mesh");
+            CHECK(fencePanel->targetSize == 0.0f);
+            CHECK(!fencePanel->destructible.enabled);
+            CHECK(std::filesystem::exists(fencePanel->modelPath));
+        }
+
+        const PrefabAsset* watchtower = shipped.Find("props/watchtower");
+        CHECK(watchtower != nullptr);
+        if (watchtower) {
+            CHECK(watchtower->error.empty());
+            CHECK(watchtower->collision == "mesh");
+            // The watchtower is fractured by NvBlast. Registering generic
+            // prefab health as well would give explosions two owners.
+            CHECK(!watchtower->destructible.enabled);
+            CHECK(std::filesystem::exists(watchtower->modelPath));
         }
 
         const PrefabAsset* fuelSilo = shipped.Find("props/fuel_silo");
