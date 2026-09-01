@@ -1,10 +1,10 @@
 {
   "schemaVersion": 2,
-  "id": "props/fence_panel",
-  "name": "Fence Panel",
+  "id": "props/drain_pipes",
+  "name": "Drain Pipe Stack",
   "components": {
     "staticMesh": {
-      "path": "Content/Models/Fence2/Fence_6.glb",
+      "path": "Content/Models/DrainPipes/DrainPipe_2_Stack.glb",
       "defaultScale": [1.0, 1.0, 1.0],
       "targetSize": 0.0,
       "castShadow": true,
@@ -14,7 +14,7 @@
       "forceDoubleSided": true
     },
     "collision": {
-      "shape": "box"
+      "shape": "mesh"
     }
   }
 }

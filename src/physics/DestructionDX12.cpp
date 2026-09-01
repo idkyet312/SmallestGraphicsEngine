@@ -3,6 +3,7 @@
 
 #include "GLBImporter.h"
 #include "DX12Core.h"
+#include "RuntimeCutPlane.h"
 #include "NvBlast.h"
 #include "NvBlastTkActor.h"
 #include "NvBlastTkAsset.h"
@@ -414,6 +415,10 @@ struct DestructionDX12::Impl {
         // standing runs use one merged batch, and only an exploded panel needs
         // individual GPU resources.
         bool fencePiece = false;
+        // Cut into four on destruction (one horizontal plus one vertical plane)
+        // instead of the two halves a fence panel splits into. The watchtower is
+        // a tall box rather than a flat panel, so stacked slabs read wrong.
+        bool crossCutFragments = false;
         bool breakableSupport = false;
         bool lazyRenderResources = false;
         float health = 0.0f;
@@ -1455,8 +1460,15 @@ struct DestructionDX12::Impl {
                 }
                 chunk.glass = sourceChunk->name.rfind("Glass@", 0) == 0;
                 chunk.sheet = sourceChunk->name.rfind("Roof@", 0) == 0;
-                chunk.fencePiece =
+                // Authored panels stay intact until their health is spent, then
+                // are cut apart at runtime. A flat fence panel splits in two;
+                // naming a chunk "CrossCutPanel#" instead adds the crossing
+                // vertical cuts that bring a deep box down in eight.
+                const bool crossCutPiece =
+                    sourceChunk->name.find("CrossCutPanel#") != std::string::npos;
+                chunk.fencePiece = crossCutPiece ||
                     sourceChunk->name.find("FencePanel#") != std::string::npos;
+                chunk.crossCutFragments = crossCutPiece;
                 chunk.breakableSupport = chunk.fencePiece && chunk.support;
                 chunk.lazyRenderResources = chunk.fencePiece;
                 if (chunk.fencePiece) chunk.health = kFencePanelHealth;
@@ -1851,6 +1863,10 @@ struct DestructionDX12::Impl {
         return true;
     }
 
+    // Cuts a chunk into 2^planes.size() fragments. A fence panel passes one
+    // horizontal plane; the watchtower passes a horizontal and a vertical one
+    // and so comes apart in four. Fragments that end up empty (a plane that
+    // misses part of the mesh) are dropped rather than registered.
     bool CreateFenceFragmentAsset(uint32_t panelChunkIndex) {
         if (!framework || !group || panelChunkIndex >= chunks.size()) return false;
         const Chunk& panel = chunks[panelChunkIndex];
@@ -1858,45 +1874,84 @@ struct DestructionDX12::Impl {
             panel.node->mesh->primitives.empty()) return false;
         const uint32_t panelStructureId = panel.structureId;
         const int panelStructuralGroup = panel.structuralGroup;
+        const bool crossCut = panel.crossCutFragments;
 
-        // Cut the intact mesh across one randomized, pitched line. Keeping the
-        // cut within the middle 30% avoids unusably thin top/bottom slivers;
-        // pitch is capped at 30 degrees and reduced near the limits so the
-        // plane still crosses the complete panel.
-        const float axisMinimum = panel.minimum.y;
         const float axisLength = panel.maximum.y - panel.minimum.y;
         if (axisLength <= 0.001f) return false;
-        const float randomUnit = static_cast<float>(std::rand()) /
-                                 static_cast<float>(RAND_MAX);
-        const float cutHeight = axisMinimum + axisLength *
-            (0.35f + randomUnit * 0.30f);
+        const auto randomUnit = []() {
+            return static_cast<float>(std::rand()) /
+                   static_cast<float>(RAND_MAX);
+        };
         const bool longAxisX = panel.maximum.x - panel.minimum.x >=
                                panel.maximum.z - panel.minimum.z;
-        const float longMinimum = longAxisX ? panel.minimum.x : panel.minimum.z;
-        const float longMaximum = longAxisX ? panel.maximum.x : panel.maximum.z;
-        const float longCenter = (longMinimum + longMaximum) * 0.5f;
-        const float longHalfExtent = (longMaximum - longMinimum) * 0.5f;
-        const float verticalClearance = (std::min)(
-            cutHeight - panel.minimum.y, panel.maximum.y - cutHeight);
-        const float geometryLimit = longHalfExtent > 0.001f
-            ? std::atan(verticalClearance / longHalfExtent)
-            : XM_PIDIV2;
-        const float maximumPitch = (std::min)(XMConvertToRadians(30.0f),
-                                               geometryLimit);
-        const float pitchRandom = static_cast<float>(std::rand()) /
-                                  static_cast<float>(RAND_MAX);
-        const float pitch = (pitchRandom * 2.0f - 1.0f) * maximumPitch;
-        const float pitchCosine = std::cos(pitch);
-        const float pitchSine = std::sin(pitch);
-        const auto planeDistance = [&](const std::array<float, 12>& vertex) {
-            const float alongPanel =
-                (longAxisX ? vertex[0] : vertex[2]) - longCenter;
-            return (vertex[1] - cutHeight) * pitchCosine +
-                   alongPanel * pitchSine;
-        };
 
-        std::array<Chunk, 2> pieces;
-        for (uint32_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
+        std::vector<SGE::RuntimeCutPlane> planes;
+
+        // Horizontal cut across one randomized, pitched line. Keeping the cut
+        // within the middle 30% avoids unusably thin top/bottom slivers; pitch
+        // is capped at 30 degrees and reduced near the limits so the plane
+        // still crosses the complete mesh.
+        {
+            SGE::RuntimeCutPlane plane;
+            plane.horizontal = true;
+            plane.alongAxisX = longAxisX;
+            plane.offset = panel.minimum.y + axisLength *
+                (0.35f + randomUnit() * 0.30f);
+            const float longMinimum = longAxisX ? panel.minimum.x : panel.minimum.z;
+            const float longMaximum = longAxisX ? panel.maximum.x : panel.maximum.z;
+            plane.centre = (longMinimum + longMaximum) * 0.5f;
+            const float longHalfExtent = (longMaximum - longMinimum) * 0.5f;
+            const float verticalClearance = (std::min)(
+                plane.offset - panel.minimum.y, panel.maximum.y - plane.offset);
+            const float geometryLimit = longHalfExtent > 0.001f
+                ? std::atan(verticalClearance / longHalfExtent)
+                : XM_PIDIV2;
+            const float maximumPitch = (std::min)(XMConvertToRadians(30.0f),
+                                                   geometryLimit);
+            const float pitch = (randomUnit() * 2.0f - 1.0f) * maximumPitch;
+            plane.tiltCosine = std::cos(pitch);
+            plane.tiltSine = std::sin(pitch);
+            planes.push_back(plane);
+        }
+
+        // Two vertical cuts, one along each horizontal axis, crossing the
+        // horizontal plane above. Together they bring the structure down in
+        // eight pieces rather than stacked slabs. Each tilts about the vertical
+        // axis by the same capped amount, so the seams lean instead of reading
+        // as laser-straight saw lines.
+        if (crossCut) {
+            for (const bool alongAxisX : { true, false }) {
+                SGE::RuntimeCutPlane plane;
+                plane.horizontal = false;
+                plane.alongAxisX = alongAxisX;
+                const float cutMinimum = alongAxisX ? panel.minimum.x : panel.minimum.z;
+                const float cutMaximum = alongAxisX ? panel.maximum.x : panel.maximum.z;
+                const float cutLength = cutMaximum - cutMinimum;
+                // A panel with no depth gets only the cut it can support.
+                if (cutLength <= 0.001f) continue;
+                plane.offset = cutMinimum + cutLength *
+                    (0.35f + randomUnit() * 0.30f);
+                plane.centre = (panel.minimum.y + panel.maximum.y) * 0.5f;
+                // Tilt is measured against height here, so clearance and extent
+                // swap roles relative to the horizontal plane above.
+                const float halfHeight = axisLength * 0.5f;
+                const float clearance = (std::min)(
+                    plane.offset - cutMinimum, cutMaximum - plane.offset);
+                const float geometryLimit = halfHeight > 0.001f
+                    ? std::atan(clearance / halfHeight)
+                    : XM_PIDIV2;
+                const float maximumTilt = (std::min)(XMConvertToRadians(30.0f),
+                                                      geometryLimit);
+                const float tilt = (randomUnit() * 2.0f - 1.0f) * maximumTilt;
+                plane.tiltCosine = std::cos(tilt);
+                plane.tiltSine = std::sin(tilt);
+                planes.push_back(plane);
+            }
+        }
+
+        const uint32_t pieceCount = 1u << planes.size();
+        std::vector<Chunk> pieces(pieceCount);
+        for (uint32_t pieceIndex = 0; pieceIndex < pieceCount; ++pieceIndex) {
             Chunk& piece = pieces[pieceIndex];
             piece.minimum = { FLT_MAX, FLT_MAX, FLT_MAX };
             piece.maximum = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
@@ -1912,8 +1967,8 @@ struct DestructionDX12::Impl {
 
         for (const MeshPrimitive& sourcePrimitive : panel.node->mesh->primitives) {
             if (sourcePrimitive.indices.empty()) continue;
-            std::array<MeshPrimitive, 2> outputs;
-            std::array<bool, 2> used = {};
+            std::vector<MeshPrimitive> outputs(pieceCount);
+            std::vector<bool> used(pieceCount, false);
             for (uint32_t pieceIndex = 0; pieceIndex < outputs.size(); ++pieceIndex) {
                 outputs[pieceIndex].material = sourcePrimitive.material;
                 outputs[pieceIndex].materialIndex = sourcePrimitive.materialIndex;
@@ -1941,36 +1996,43 @@ struct DestructionDX12::Impl {
                     sourceTriangle < sourcePrimitive.stableTriangleIDs.size()
                         ? sourcePrimitive.stableTriangleIDs[sourceTriangle]
                         : static_cast<uint32_t>(sourceTriangle);
-                for (uint32_t pieceIndex = 0; pieceIndex < 2; ++pieceIndex) {
-                    const bool lowerPiece = pieceIndex == 0;
-                    std::vector<PackedVertex> polygon(
+                for (uint32_t pieceIndex = 0; pieceIndex < pieceCount; ++pieceIndex) {
+                    // Bit N of pieceIndex selects which side of plane N this
+                    // fragment keeps, so the pieces tile the source exactly.
+                    std::vector<PackedVertex> clipped(
                         sourceVertices.begin(), sourceVertices.end());
-                    std::vector<PackedVertex> clipped;
-                    clipped.reserve(4);
-                    for (size_t currentIndex = 0;
-                         currentIndex < polygon.size(); ++currentIndex) {
-                        const PackedVertex& previous = polygon[
-                            (currentIndex + polygon.size() - 1) % polygon.size()];
-                        const PackedVertex& current = polygon[currentIndex];
-                        const float previousDistance = planeDistance(previous);
-                        const float currentDistance = planeDistance(current);
-                        const bool previousInside = lowerPiece
-                            ? previousDistance <= 0.0f : previousDistance >= 0.0f;
-                        const bool currentInside = lowerPiece
-                            ? currentDistance <= 0.0f : currentDistance >= 0.0f;
-                        if (previousInside != currentInside) {
-                            const float denominator =
-                                currentDistance - previousDistance;
-                            const float t = std::abs(denominator) > 0.000001f
-                                ? -previousDistance / denominator : 0.0f;
-                            PackedVertex intersection;
-                            for (size_t component = 0; component < intersection.size();
-                                 ++component)
-                                intersection[component] = previous[component] +
-                                    (current[component] - previous[component]) * t;
-                            clipped.push_back(intersection);
+                    for (size_t planeIndex = 0;
+                         planeIndex < planes.size() && clipped.size() >= 3;
+                         ++planeIndex) {
+                        const SGE::RuntimeCutPlane& plane = planes[planeIndex];
+                        const bool keepBelow =
+                            ((pieceIndex >> planeIndex) & 1u) == 0u;
+                        std::vector<PackedVertex> polygon;
+                        polygon.swap(clipped);
+                        clipped.reserve(polygon.size() + 1);
+                        for (size_t currentIndex = 0;
+                             currentIndex < polygon.size(); ++currentIndex) {
+                            const PackedVertex& previous = polygon[
+                                (currentIndex + polygon.size() - 1) % polygon.size()];
+                            const PackedVertex& current = polygon[currentIndex];
+                            const float previousDistance = plane.Distance(previous);
+                            const float currentDistance = plane.Distance(current);
+                            const bool previousInside = plane.Keeps(previous, keepBelow);
+                            const bool currentInside = plane.Keeps(current, keepBelow);
+                            if (previousInside != currentInside) {
+                                const float denominator =
+                                    currentDistance - previousDistance;
+                                const float t = std::abs(denominator) > 0.000001f
+                                    ? -previousDistance / denominator : 0.0f;
+                                PackedVertex intersection;
+                                for (size_t component = 0;
+                                     component < intersection.size(); ++component)
+                                    intersection[component] = previous[component] +
+                                        (current[component] - previous[component]) * t;
+                                clipped.push_back(intersection);
+                            }
+                            if (currentInside) clipped.push_back(current);
                         }
-                        if (currentInside) clipped.push_back(current);
                     }
                     if (clipped.size() < 3) continue;
                     MeshPrimitive& output = outputs[pieceIndex];
@@ -2013,28 +2075,37 @@ struct DestructionDX12::Impl {
                     piece.maximum.y = (std::max)(piece.maximum.y, point.y);
                     piece.maximum.z = (std::max)(piece.maximum.z, point.z);
                 }
-            if (piece.minimum.x == FLT_MAX) return false;
+            if (piece.minimum.x == FLT_MAX) continue;  // plane missed this cell
             piece.center = { (piece.minimum.x + piece.maximum.x) * 0.5f,
                              (piece.minimum.y + piece.maximum.y) * 0.5f,
                              (piece.minimum.z + piece.maximum.z) * 0.5f };
             // A stable box is preferable to a huge convex cook for bent wire
-            // triangles, and keeps the two freshly-created bodies upright.
+            // triangles, and keeps the freshly-created bodies upright.
             for (float x : { piece.minimum.x, piece.maximum.x })
             for (float y : { piece.minimum.y, piece.maximum.y })
             for (float z : { piece.minimum.z, piece.maximum.z })
                 piece.collisionPoints.push_back({ x, y, z });
         }
 
+        // A quarter cut can leave a cell empty where the mesh does not reach.
+        // Keep only the fragments that actually carry geometry; two survivors
+        // are still a valid break, but one means nothing was cut at all.
+        pieces.erase(std::remove_if(pieces.begin(), pieces.end(),
+            [](const Chunk& piece) { return piece.minimum.x == FLT_MAX; }),
+            pieces.end());
+        if (pieces.size() < 2) return false;
+
         const uint32_t firstGlobalChunk = static_cast<uint32_t>(chunks.size());
+        const uint32_t fragmentCount = static_cast<uint32_t>(pieces.size());
         for (Chunk& piece : pieces) chunks.push_back(std::move(piece));
 
-        std::array<NvBlastChunkDesc, 3> chunkDescs = {};
+        std::vector<NvBlastChunkDesc> chunkDescs(fragmentCount + 1);
         float rootVolume = 0.0f;
         XMFLOAT3 rootCenter = {};
         chunkDescs[0].parentChunkDescIndex = InvalidIndex;
         chunkDescs[0].flags = NvBlastChunkDesc::NoFlags;
         chunkDescs[0].userData = InvalidIndex;
-        for (uint32_t pieceIndex = 0; pieceIndex < 2; ++pieceIndex) {
+        for (uint32_t pieceIndex = 0; pieceIndex < fragmentCount; ++pieceIndex) {
             const Chunk& piece = chunks[firstGlobalChunk + pieceIndex];
             const float volume = (std::max)(0.001f,
                 (piece.maximum.x - piece.minimum.x) *
@@ -2061,7 +2132,9 @@ struct DestructionDX12::Impl {
         chunkDescs[0].centroid[2] = rootCenter.z;
         chunkDescs[0].volume = rootVolume;
 
-        std::array<NvBlastBondDesc, 1> bonds = {};
+        // Chain the fragments so the graph is connected: with four quarters
+        // that is three bonds, and the single-plane fence case still yields one.
+        std::vector<NvBlastBondDesc> bonds(fragmentCount - 1);
         for (uint32_t bondIndex = 0; bondIndex < bonds.size(); ++bondIndex) {
             NvBlastBondDesc& bond = bonds[bondIndex];
             bond.chunkIndices[0] = bondIndex + 1;
@@ -2086,8 +2159,8 @@ struct DestructionDX12::Impl {
             chunks.resize(firstGlobalChunk);
             return false;
         }
-        std::array<float, 1> bondHealths = { kBondHealth };
-        std::array<float, 2> chunkHealths = { kBondHealth, kBondHealth };
+        std::vector<float> bondHealths(bonds.size(), kBondHealth);
+        std::vector<float> chunkHealths(fragmentCount, kBondHealth);
         TkActorDesc actorDesc(fragmentAsset);
         actorDesc.initialBondHealths = bondHealths.data();
         actorDesc.initialSupportChunkHealths = chunkHealths.data();
@@ -2108,23 +2181,29 @@ struct DestructionDX12::Impl {
         }
         runtimeBlastAssets.push_back({ fragmentAsset, fragmentFamily });
 
-        auto mapping = std::make_shared<std::vector<uint32_t>>(3, InvalidIndex);
-        for (uint32_t pieceIndex = 0; pieceIndex < 2; ++pieceIndex)
+        auto mapping = std::make_shared<std::vector<uint32_t>>(
+            fragmentCount + 1, InvalidIndex);
+        for (uint32_t pieceIndex = 0; pieceIndex < fragmentCount; ++pieceIndex)
             (*mapping)[pieceIndex + 1] = firstGlobalChunk + pieceIndex;
         auto runtime = std::make_unique<ActorRuntime>();
         runtime->actor = actor;
         runtime->renderId = nextActorRenderId++;
         runtime->structureId = panelStructureId;
         runtime->identityAssetMapping = false;
-        runtime->assetChunkCount = 3;
+        runtime->assetChunkCount = fragmentCount + 1;
         runtime->assetChunkToGlobal = mapping;
-        runtime->chunks = { firstGlobalChunk, firstGlobalChunk + 1 };
+        runtime->chunks.resize(fragmentCount);
+        for (uint32_t pieceIndex = 0; pieceIndex < fragmentCount; ++pieceIndex)
+            runtime->chunks[pieceIndex] = firstGlobalChunk + pieceIndex;
         runtime->center = rootCenter;
         CreateBody(*runtime, true, nullptr);
         actor->userData = runtime.get();
         actors.push_back(std::move(runtime));
 
-        std::array<uint8_t, 3> splitMask = { 0, 1, 1 };
+        // Mark every fragment (asset chunk 0 is the root) so the newly created
+        // actor immediately separates into its individual pieces.
+        std::vector<uint8_t> splitMask(fragmentCount + 1, 1);
+        splitMask[0] = 0;
         IsolateChunksParams splitParams{ splitMask.data(),
             static_cast<uint32_t>(splitMask.size()) };
         const NvBlastDamageProgram isolate = { IsolateGraphShader, nullptr };
@@ -3169,7 +3248,7 @@ struct DestructionDX12::Impl {
         panel.support = false;
         panel.retired = true;
         // Drop the intact panel's render and collision ownership before Blast
-        // emits its split event. Only the generated halves may replace it.
+        // emits its split event. Only the generated fragments may replace it.
         RetireChunkFromRuntime(*target, chunkIndex);
         group->process();
 

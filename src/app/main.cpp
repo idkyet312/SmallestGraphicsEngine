@@ -219,7 +219,6 @@ static const std::filesystem::path kModelRoot = "Content/Models";
 // down is a landmark event rather than a puff of dust. Identified by prefab id so
 // no new entity type or engine plumbing is needed.
 static constexpr const char* kCommTowerPrefabId = "props/comm_tower";
-static constexpr const char* kWatchTowerPrefabId = "props/watchtower";
 static constexpr const char* kFencePrefabId = "props/fence";
 static constexpr const char* kFencePanelPrefabId = "props/fence_panel";
 // Both fence assets are single authored panels of the same size and build, so
@@ -227,10 +226,11 @@ static constexpr const char* kFencePanelPrefabId = "props/fence_panel";
 static bool IsFencePrefab(const std::string& prefabId) {
     return prefabId == kFencePrefabId || prefabId == kFencePanelPrefabId;
 }
+// The watchtower is deliberately absent: it is a fixed piece of level
+// architecture that stays standing, so it draws and collides as an ordinary
+// static prefab rather than entering the destruction model at all.
 static bool IsNvBlastStructurePrefab(const std::string& prefabId) {
-    return prefabId == kCommTowerPrefabId ||
-           prefabId == kWatchTowerPrefabId ||
-           IsFencePrefab(prefabId);
+    return prefabId == kCommTowerPrefabId || IsFencePrefab(prefabId);
 }
 // Defined with the prefab damage code further down; needed earlier by the
 // burning-material tick, which must not let fire fell a player objective.
@@ -15216,11 +15216,12 @@ static void AppendNvBlastPrefabsToDestruction(
         if (!entity.enabled || entity.type != LevelEntityType::Prefab ||
             !IsNvBlastStructurePrefab(entity.prefabId)) continue;
 
-        const bool objectiveTower = entity.prefabId == kCommTowerPrefabId;
-        const bool fence = IsFencePrefab(entity.prefabId);
-        // Both tower assets are split into roughly two-metre sections: twelve
-        // for the 26 m communications mast and eight for the 15.7 m watchtower.
-        const int bandCount = objectiveTower ? 12 : 8;
+        // Fence panels stay one authored chunk and are cut apart at runtime;
+        // the comm-tower objective is pre-sliced into bands, so it can lose its
+        // base and topple section by section.
+        const bool wholePanel = IsFencePrefab(entity.prefabId);
+        // The 26 m mast becomes twelve roughly two-metre sections.
+        const int bandCount = 12;
 
         // Same model the renderer uses, so the fractured geometry matches what
         // was standing there a frame earlier.
@@ -15298,11 +15299,11 @@ static void AppendNvBlastPrefabsToDestruction(
         gather(model, XMMatrixIdentity());
         if (flattened.empty() || maxY <= minY) continue;
 
-        if (fence) {
-            // Keep the complete panel as one anchored Blast chunk. Its two
-            // debris chunks are cut from these triangles only when an
-            // explosion reaches this panel, avoiding per-panel split assets,
-            // meshlets, and GPU buffers during level loading.
+        if (wholePanel) {
+            // Keep the complete structure as one anchored Blast chunk. Its
+            // debris chunks are cut from these triangles only when an explosion
+            // reaches it, avoiding per-instance split assets, meshlets, and GPU
+            // buffers during level loading.
             auto chunk = std::make_shared<SceneNode>(
                 "Support:FencePanel#" + std::to_string(groupOffset));
             chunk->mesh = std::make_shared<SceneMesh>();
@@ -15322,25 +15323,16 @@ static void AppendNvBlastPrefabsToDestruction(
         // One child node per band, each carrying that band's triangles.
         const float bandHeight = (maxY - minY) / (float)bandCount;
         for (int band = 0; band < bandCount; ++band) {
-            // Bottom band anchors the structure; the rest are ordinary bonded
-            // pieces. Only the comm-tower objective is protected from indirect
-            // damage; the watchtower behaves like ordinary NvBlast geometry.
-            const std::string marker = objectiveTower
-                ? DestructionDX12::ProtectedChunkMarker : "";
-            // @<number> means plank group to BuildChunks. The watchtower uses a
-            // separate #<structure>:<piece> identity so its bands bond as one
-            // structure without triggering plank-isolation rules.
-            const std::string name = objectiveTower
-                ? (band == 0
-                    ? "Support:CommTowerBase" + marker + "@" +
-                        std::to_string(groupOffset)
-                    : "CommTower" + marker + "@" +
-                        std::to_string(groupOffset + band))
-                : (band == 0
-                    ? "Support:WatchTowerBase#" +
-                        std::to_string(groupOffset) + ":0"
-                    : "WatchTower#" + std::to_string(groupOffset) + ":" +
-                        std::to_string(band));
+            // Only the comm-tower objective reaches this banded path, and every
+            // band carries ProtectedChunkMarker so indirect damage -- a
+            // helicopter crashing nearby, a barrel chain, spreading fire --
+            // cannot fell a player objective. The bottom band anchors the mast.
+            const std::string marker = DestructionDX12::ProtectedChunkMarker;
+            const std::string name = band == 0
+                ? "Support:CommTowerBase" + marker + "@" +
+                    std::to_string(groupOffset)
+                : "CommTower" + marker + "@" +
+                    std::to_string(groupOffset + band);
             auto chunk = std::make_shared<SceneNode>(name);
             chunk->mesh = std::make_shared<SceneMesh>();
             bool any = false;

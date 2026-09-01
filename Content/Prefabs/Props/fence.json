@@ -14,7 +14,7 @@
       "forceDoubleSided": false
     },
     "collision": {
-      "shape": "mesh"
+      "shape": "box"
     }
   }
 }

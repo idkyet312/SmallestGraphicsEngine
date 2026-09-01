@@ -1,10 +1,10 @@
 {
   "schemaVersion": 2,
-  "id": "props/fence_panel",
-  "name": "Fence Panel",
+  "id": "props/military_building_1",
+  "name": "Military Building 1",
   "components": {
     "staticMesh": {
-      "path": "Content/Models/Fence2/Fence_6.glb",
+      "path": "Content/Models/MilBuilding1/MilitaryBuilding1.glb",
       "defaultScale": [1.0, 1.0, 1.0],
       "targetSize": 0.0,
       "castShadow": true,
@@ -14,7 +14,7 @@
       "forceDoubleSided": true
     },
     "collision": {
-      "shape": "box"
+      "shape": "mesh"
     }
   }
 }

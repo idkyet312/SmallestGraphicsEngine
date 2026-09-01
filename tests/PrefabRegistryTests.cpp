@@ -227,12 +227,15 @@ int main() {
 
         // The chain-link fence is the spline tool default. It keeps real-world
         // scale (targetSize 0) because the run pitch is its measured 3.108 m
-        // footprint, and needs per-triangle collision so shots hit the posts.
+        // footprint. Collision is the bounds box: the panel measures
+        // 3.108 x 2.9 x 0.6 m, so the box is already a thin slab that hugs the
+        // mesh, and a run of them costs one collider each instead of a
+        // per-triangle tree.
         const PrefabAsset* fence = shipped.Find("props/fence");
         CHECK(fence != nullptr);
         if (fence) {
             CHECK(fence->error.empty());
-            CHECK(fence->collision == "mesh");
+            CHECK(fence->collision == "box");
             CHECK(fence->targetSize == 0.0f);
             // Fence panels are authored-piece NvBlast structures. Generic
             // prefab health would give explosions a second destruction owner.
@@ -247,7 +250,7 @@ int main() {
         CHECK(fencePanel != nullptr);
         if (fencePanel) {
             CHECK(fencePanel->error.empty());
-            CHECK(fencePanel->collision == "mesh");
+            CHECK(fencePanel->collision == "box");
             CHECK(fencePanel->targetSize == 0.0f);
             CHECK(!fencePanel->destructible.enabled);
             CHECK(std::filesystem::exists(fencePanel->modelPath));
@@ -258,8 +261,9 @@ int main() {
         if (watchtower) {
             CHECK(watchtower->error.empty());
             CHECK(watchtower->collision == "mesh");
-            // The watchtower is fractured by NvBlast. Registering generic
-            // prefab health as well would give explosions two owners.
+            // The watchtower is fixed level architecture: it is deliberately
+            // kept out of the destruction model, and registering generic prefab
+            // health would make explosions able to remove it anyway.
             CHECK(!watchtower->destructible.enabled);
             CHECK(std::filesystem::exists(watchtower->modelPath));
         }
@@ -283,6 +287,46 @@ int main() {
             CHECK(barrack->collision == "mesh");
             CHECK(barrack->targetSize == 0.0f);
             CHECK(std::filesystem::exists(barrack->modelPath));
+        }
+
+        // Same reasoning as the barrack: a walk-in structure measuring
+        // 15.2 x 5.1 x 10.3 m, so it keeps real-world scale and takes
+        // per-triangle collision rather than a box across its doorways.
+        const PrefabAsset* milBuilding =
+            shipped.Find("props/military_building_1");
+        CHECK(milBuilding != nullptr);
+        if (milBuilding) {
+            CHECK(milBuilding->error.empty());
+            CHECK(milBuilding->collision == "mesh");
+            CHECK(milBuilding->targetSize == 0.0f);
+            CHECK(std::filesystem::exists(milBuilding->modelPath));
+        }
+
+        // Sandbags are a solid 3.25 x 1.03 x 0.70 m mound with no opening to
+        // preserve, so the bounds box already hugs the mesh and costs one
+        // collider instead of a per-triangle tree along a defensive line.
+        const PrefabAsset* sandbags = shipped.Find("props/sandbag_barrier");
+        CHECK(sandbags != nullptr);
+        if (sandbags) {
+            CHECK(sandbags->error.empty());
+            CHECK(sandbags->collision == "box");
+            CHECK(sandbags->targetSize == 0.0f);
+            CHECK(std::filesystem::exists(sandbags->modelPath));
+        }
+
+        // The remaining three keep per-triangle collision: the helideck is a
+        // 36 m platform walked on and under, the pipe stack is hollow bores,
+        // and the gate's whole point is the opening a box would seal.
+        for (const char* id : { "props/helipad", "props/drain_pipes",
+                                "props/building_gate" }) {
+            const PrefabAsset* prefab = shipped.Find(id);
+            CHECK(prefab != nullptr);
+            if (prefab) {
+                CHECK(prefab->error.empty());
+                CHECK(prefab->collision == "mesh");
+                CHECK(prefab->targetSize == 0.0f);
+                CHECK(std::filesystem::exists(prefab->modelPath));
+            }
         }
 
         // The car park is a surface the player walks and drives on top of

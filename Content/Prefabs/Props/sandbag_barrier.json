@@ -1,10 +1,10 @@
 {
   "schemaVersion": 2,
-  "id": "props/fence_panel",
-  "name": "Fence Panel",
+  "id": "props/sandbag_barrier",
+  "name": "Sandbag Barrier",
   "components": {
     "staticMesh": {
-      "path": "Content/Models/Fence2/Fence_6.glb",
+      "path": "Content/Models/Sandbags1/SandBarrier_01.glb",
       "defaultScale": [1.0, 1.0, 1.0],
       "targetSize": 0.0,
       "castShadow": true,

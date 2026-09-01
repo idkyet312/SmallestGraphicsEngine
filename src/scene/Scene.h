@@ -819,7 +819,7 @@ struct Scene {
     // high-frequency one for surface break-up, and macro normal perturbation
     // that survives past the close-range detail fade. Off by default -- it
     // changes the heightfield, and collision is sampled from the same function.
-    bool  terrainDetailRelief = true;
+    bool  terrainDetailRelief = false;
     // Hollow-inspired projected-error tessellation and stitched tile edges.
     // Opt-in so the legacy distance LOD remains the default rendering path.
     bool  terrainErrorLOD      = false;

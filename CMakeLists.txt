@@ -529,6 +529,13 @@ if(BUILD_TESTING)
     target_link_libraries(CollisionMeshTests PRIVATE SGEProjectHeaders)
     add_test(NAME CollisionMeshTests COMMAND CollisionMeshTests)
 
+    # Runtime fracture planes. Pure geometry: the cut math is split into its own
+    # header precisely so the fragment partition can be checked without a device,
+    # a Blast framework or any level content.
+    add_executable(RuntimeCutPlaneTests tests/RuntimeCutPlaneTests.cpp)
+    target_link_libraries(RuntimeCutPlaneTests PRIVATE SGEProjectHeaders)
+    add_test(NAME RuntimeCutPlaneTests COMMAND RuntimeCutPlaneTests)
+
     add_executable(RagdollAssetTests tests/RagdollAssetTests.cpp)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)
     target_compile_definitions(RagdollAssetTests PRIVATE
