@@ -33,7 +33,7 @@ inline const char* GearTypeName(GearType gear) {
 }
 
 struct MissionLoadout {
-    static constexpr int kWeaponCount = 9;
+    static constexpr int kWeaponCount = 10;
     static constexpr size_t kWeaponSlotCount = 2;
 
     std::array<int, kWeaponSlotCount> weapons{{ 0, 1 }};

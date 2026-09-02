@@ -13680,7 +13680,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     static constexpr const char* weaponNames[MissionLoadout::kWeaponCount] = {
         "AK47", "Mossberg 590A1", "RPG-7", "SVD Sniper",
         "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
-        "Mako Harpoon Gun", "SVD Suppressed"
+        "Mako Harpoon Gun", "SVD Suppressed", "M4A1"
     };
     ImGui::SeparatorText("LOADOUT");
     int primary = loadout.weapons[0];
@@ -19067,6 +19067,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         const float playerHorizontalSpeed = g_game.playerMovement.Update(
             scene.ViewmodelAnchorPosition(), deltaTime,
             !nonLocomotionCameraMotion);
+        // Each weapon can carry its own nudge on top of the shared grip point,
+        // so the body offset is re-solved when the selection changes. A weapon
+        // whose nudge is still zero resolves to exactly the shared value, which
+        // is why switching does not move the arms until one is tuned.
+        ArmsModel::SetGripWeapon(GunModel::SelectedWeapon());
         // Sprint is suppressed alongside the speed reading: riding a vehicle or
         // the deployment fly-through moves the camera without the player taking
         // a step, and a held shift there would otherwise sprint the legs.

@@ -78,6 +78,20 @@ public:
     }
     static bool HarpoonGunLoaded() { return HarpoonGunMesh() != nullptr; }
 
+    static std::shared_ptr<SceneMesh>& M4Mesh() {
+        static std::shared_ptr<SceneMesh> mesh;
+        return mesh;
+    }
+    static bool M4Loaded() { return M4Mesh() != nullptr; }
+
+    // The M4's iron sights, split from the body at load. Drawn only when no
+    // optic is fitted: a red dot mounts directly over them, and the rear leaf
+    // would otherwise stand up through the sight body.
+    static std::shared_ptr<SceneMesh>& M4IronSightMesh() {
+        static std::shared_ptr<SceneMesh> mesh;
+        return mesh;
+    }
+
     static std::shared_ptr<SceneNode>& HarpoonSpearModel() {
         static std::shared_ptr<SceneNode> model;
         return model;
@@ -90,11 +104,11 @@ public:
 
     // Highest valid weapon id. Several parallel tables are sized to this, so
     // adding a weapon means extending every one of them.
-    static constexpr int kMaxWeapon = 8;
+    static constexpr int kMaxWeapon = 9;
 
     static int& SelectedWeapon() {
         // 0 AK, 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame, 7 harpoon,
-        // 8 suppressed SVD
+        // 8 suppressed SVD, 9 M4A1
         static int weapon = 0;
         return weapon;
     }
@@ -102,7 +116,7 @@ public:
         static constexpr const char* names[kMaxWeapon + 1] = {
             "AK47", "Mossberg 590A1", "RPG-7", "SVD Sniper",
             "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
-            "Mako Harpoon Gun", "SVD Suppressed"
+            "Mako Harpoon Gun", "SVD Suppressed", "M4A1"
         };
         return names[(std::max)(0, (std::min)(weapon, kMaxWeapon))];
     }
@@ -121,6 +135,7 @@ public:
     static bool C4Selected() { return SelectedWeapon() == 5; }
     static bool FlamethrowerSelected() { return SelectedWeapon() == 6; }
     static bool HarpoonSelected() { return SelectedWeapon() == 7; }
+    static bool M4Selected() { return SelectedWeapon() == 9 && M4Loaded(); }
     static const char* SelectedWeaponName() {
         return WeaponName(SelectedWeapon());
     }
@@ -130,6 +145,7 @@ public:
                 (ShotgunLoaded() ? ShotgunMesh() : Mesh());
         if (FlamethrowerSelected())
             return ShotgunLoaded() ? ShotgunMesh() : Mesh();
+        if (M4Selected()) return M4Mesh();
         if (SVDSelected()) return SVDMesh();
         if (RPGSelected()) return RPGMesh();
         return ShotgunSelected() ? ShotgunMesh() : Mesh();
@@ -151,6 +167,10 @@ public:
             // suppressor hangs off the muzzle, forward of the support hand,
             // and does not move where the rifle is held.
             { 0.030f, -0.060f, -0.490f }, // SVD suppressed handguard
+            // Sits further back and lower than the AK: Orient normalises both
+            // to the same barrel length, but the M4's rear bound is closer to
+            // its grip, so the same pocket would push it through the hands.
+            { 0.000f, -0.130f, -0.250f }, // M4A1 handguard
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -174,6 +194,7 @@ public:
             { 0.0f, 0.0f, 0.0f },   // flamethrower
             { 0.0f, 0.0f, 0.0f },   // harpoon
             { 0.0f, 0.0f, 0.0f },   // SVD suppressed
+            { 0.0f, 0.0f, 0.0f },   // M4A1
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return rotations[static_cast<size_t>(slot)];
@@ -189,19 +210,25 @@ public:
     // is why one shared mount cannot serve every weapon.
     static XMFLOAT3& WeaponOpticOffset(int weapon) {
         static std::array<XMFLOAT3, kMaxWeapon + 1> offsets = {{
-            { 0.012f, 0.140f, 0.376f }, // AK47 rear receiver rail
-            { 0.012f, 0.140f, 0.376f }, // Mossberg receiver rail
+            { 0.012f, 0.154f, 0.376f }, // AK47 rear receiver rail
+            { 0.012f, 0.154f, 0.376f }, // Mossberg receiver rail
             // Only the AK and Mossberg accept an optic today (the red dot's
             // compatibility mask in WeaponCustomization.h). The rest carry the
             // same starting pose rather than a stale one, so widening that mask
             // gives a sight roughly on the rail instead of floating in space.
-            { 0.012f, 0.140f, 0.376f }, // RPG
-            { 0.012f, 0.140f, 0.376f }, // SVD
-            { 0.012f, 0.140f, 0.376f }, // laser
-            { 0.012f, 0.140f, 0.376f }, // C4
-            { 0.012f, 0.140f, 0.376f }, // flamethrower
-            { 0.012f, 0.140f, 0.376f }, // harpoon
-            { 0.012f, 0.140f, 0.376f }, // SVD suppressed
+            { 0.012f, 0.154f, 0.376f }, // RPG
+            { 0.012f, 0.154f, 0.376f }, // SVD
+            { 0.012f, 0.154f, 0.376f }, // laser
+            { 0.012f, 0.154f, 0.376f }, // C4
+            { 0.012f, 0.154f, 0.376f }, // flamethrower
+            { 0.012f, 0.154f, 0.376f }, // harpoon
+            { 0.012f, 0.154f, 0.376f }, // SVD suppressed
+            // Further forward and lower than the AK: the M4's flat-top rail
+            // runs the length of the receiver, so the optic sits ahead of where
+            // the AK's dust-cover mount puts it. Paired with the 3.18 scale
+            // below -- this rifle imports smaller against the shared viewmodel
+            // length, so both the position and the size differ.
+            { 0.009f, 0.114f, 0.470f }, // M4A1 flat-top rail
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -214,7 +241,19 @@ public:
     // asset is authored long on +X, and the renderer's own quarter turn down
     // the barrel is separate from this -- zero here means "as mounted".
     static XMFLOAT3& WeaponOpticRotation(int weapon) {
-        static std::array<XMFLOAT3, kMaxWeapon + 1> rotations{};
+        static std::array<XMFLOAT3, kMaxWeapon + 1> rotations = {{
+            { 0.0f,  0.0f, 0.0f }, // AK47
+            { 0.0f,  0.0f, 0.0f }, // Mossberg
+            { 0.0f,  0.0f, 0.0f }, // RPG
+            { 0.0f,  0.0f, 0.0f }, // SVD
+            { 0.0f,  0.0f, 0.0f }, // laser
+            { 0.0f,  0.0f, 0.0f }, // C4
+            { 0.0f,  0.0f, 0.0f }, // flamethrower
+            { 0.0f,  0.0f, 0.0f }, // harpoon
+            { 0.0f,  0.0f, 0.0f }, // SVD suppressed
+            // Small correction for the rail's own pitch and cant.
+            {-5.0f, -1.0f, 0.0f }, // M4A1
+        }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return rotations[static_cast<size_t>(slot)];
     }
@@ -225,7 +264,11 @@ public:
     // rifle, so it is per weapon like the offset above it.
     static float& WeaponOpticScale(int weapon) {
         static std::array<float, kMaxWeapon + 1> scales = {{
-            1.42f, 1.42f, 1.42f, 1.42f, 1.42f, 1.42f, 1.42f, 1.42f, 1.42f
+            1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,
+            // The M4 imports smaller relative to the shared viewmodel length
+            // than the AK does, so the same sight needs scaling up to stay a
+            // believable size on its rail.
+            3.18f // M4A1
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return scales[static_cast<size_t>(slot)];
@@ -238,15 +281,16 @@ public:
     // centre, and it has to stay on the crosshair when the body is nudged.
     static XMFLOAT3& WeaponReticleOffset(int weapon) {
         static std::array<XMFLOAT3, kMaxWeapon + 1> offsets = {{
-            { 0.000f, 0.182f, -0.600f }, // AK47
-            { 0.000f, 0.182f, -0.600f }, // Mossberg
-            { 0.000f, 0.182f, -0.600f }, // RPG
-            { 0.000f, 0.182f, -0.600f }, // SVD
-            { 0.000f, 0.182f, -0.600f }, // laser
-            { 0.000f, 0.182f, -0.600f }, // C4
-            { 0.000f, 0.182f, -0.600f }, // flamethrower
-            { 0.000f, 0.182f, -0.600f }, // harpoon
-            { 0.000f, 0.182f, -0.600f }, // SVD suppressed
+            { 0.000f, -1.000f, -0.600f }, // AK47
+            { 0.000f, -1.000f, -0.600f }, // Mossberg
+            { 0.000f, -1.000f, -0.600f }, // RPG
+            { 0.000f, -1.000f, -0.600f }, // SVD
+            { 0.000f, -1.000f, -0.600f }, // laser
+            { 0.000f, -1.000f, -0.600f }, // C4
+            { 0.000f, -1.000f, -0.600f }, // flamethrower
+            { 0.000f, -1.000f, -0.600f }, // harpoon
+            { 0.000f, -1.000f, -0.600f }, // SVD suppressed
+            { 0.163f, -1.000f, -0.600f }, // M4A1
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -276,6 +320,7 @@ public:
         case 6: return true;
         case 7: return true;
         case 8: return SVDLoaded(); // suppressed variant of the same rifle
+        case 9: return M4Loaded();
         default: return false;
         }
     }
@@ -333,9 +378,14 @@ public:
             return;
         }
         const int step = direction < 0 ? -1 : 1;
+        // Bounded by the table, not a literal: this was hardcoded to 8 while
+        // nine weapons existed, so the suppressed SVD in slot 8 could never be
+        // reached by scrolling. Any weapon added past the end was equally
+        // invisible.
+        constexpr int kWeaponSlots = kMaxWeapon + 1;
         int candidate = SelectedWeapon();
-        for (int attempt = 0; attempt < 8; ++attempt) {
-            candidate = (candidate + step + 8) % 8;
+        for (int attempt = 0; attempt < kWeaponSlots; ++attempt) {
+            candidate = (candidate + step + kWeaponSlots) % kWeaponSlots;
             if (WeaponLoaded(candidate)) {
                 SelectedWeapon() = candidate;
                 return;
@@ -354,6 +404,7 @@ public:
         LoadHarpoonGun();
         LoadHarpoonSpear();
         LoadRedDotSight();
+        LoadM4();
 
         const std::string path = Resolve("Content/Models/ak47/AK47.FBX");
         std::cout << "Loading AK47 " << path << "...\n";
@@ -548,6 +599,112 @@ private:
                   << " primitive(s)\n";
     }
 
+    static void LoadM4() {
+        const std::string path = Resolve(
+            "Content/Models/MainPlayer/Guns/m4/m4A1.glb");
+        auto root = GLBImporter::LoadGLB(
+            path, g_dx12.device, g_dx12.commandList);
+        if (!root) {
+            std::cerr << "M4A1 GLB unavailable; weapon slot stays empty\n";
+            return;
+        }
+
+        // Authored as eighteen separate parts (body, barrel, magazine, iron
+        // sights) at 0.01 node scale with per-part rotations. Flattening bakes
+        // each node's transform into its vertices, so the hierarchy stops
+        // mattering and Orient can treat the result as one rifle.
+        //
+        // The iron sights are kept in the same list through Orient rather than
+        // flattened separately: Orient derives its rotation and scale from the
+        // bounding box of whatever it is given, so sights measured on their own
+        // would be normalised against their own extents and land at the wrong
+        // size and place. Split afterwards, once the whole rifle shares one
+        // frame. The count is recorded first so the split knows where they are.
+        std::vector<MeshPrimitive> primitives;
+        XMFLOAT4X4 identity;
+        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+        root->UpdateGlobalTransform(identity);
+        std::vector<size_t> ironSightIndices;
+        FlattenTaggingIronSights(root, primitives, ironSightIndices);
+        if (primitives.empty()) {
+            std::cerr << "M4A1 GLB had no geometry\n";
+            return;
+        }
+
+        // Same grip-local frame as every other weapon: rear at z=0, barrel down
+        // +Z, normalised to the standard viewmodel length. Measured from the
+        // bounds rather than hand-fitted, which is what makes the asset's own
+        // scale and axis convention irrelevant.
+        Orient(primitives);
+
+        // Split the sights out now that everything shares the rifle's frame.
+        // Walked back-to-front so each erase cannot shift an index still to be
+        // removed.
+        std::vector<MeshPrimitive> ironSights;
+        for (size_t i = ironSightIndices.size(); i-- > 0;) {
+            const size_t index = ironSightIndices[i];
+            if (index >= primitives.size()) continue;
+            ironSights.push_back(std::move(primitives[index]));
+            primitives.erase(primitives.begin() +
+                             static_cast<std::ptrdiff_t>(index));
+        }
+
+        const auto finish = [](std::vector<MeshPrimitive>&& prims) {
+            auto built = std::make_shared<SceneMesh>();
+            built->primitives = std::move(prims);
+            for (MeshPrimitive& primitive : built->primitives) {
+                if (primitive.material)
+                    primitive.material->disableOcclusionCulling = true;
+                GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get());
+            }
+            return built;
+        };
+
+        auto mesh = finish(std::move(primitives));
+        M4Mesh() = mesh;
+        if (!ironSights.empty())
+            M4IronSightMesh() = finish(std::move(ironSights));
+        std::cout << "M4A1 GLB ready: " << mesh->primitives.size()
+                  << " primitive(s), " << ironSightIndices.size()
+                  << " iron sight primitive(s) split\n";
+    }
+
+    // Flatten, recording which primitives came from the M4's iron sight nodes.
+    // Those are drawn only when no optic is fitted -- a red dot sits directly
+    // over them, and the rear leaf pokes through the sight body otherwise.
+    static void FlattenTaggingIronSights(
+        const std::shared_ptr<SceneNode>& node,
+        std::vector<MeshPrimitive>& out,
+        std::vector<size_t>& ironSightIndices,
+        bool insideIronSight = false) {
+        if (!node) return;
+        std::string nodeName = node->name;
+        std::transform(nodeName.begin(), nodeName.end(), nodeName.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        // Matches "Aiming Module back" and "Aiming module iron site" (the
+        // asset's own spelling). Substring rather than exact so a re-export
+        // that tidies the names still hits.
+        insideIronSight = insideIronSight ||
+            nodeName.find("aiming module") != std::string::npos ||
+            nodeName.find("aiming modul") != std::string::npos;
+
+        if (node->mesh) {
+            const size_t before = out.size();
+            // Reuse the shared flatten for the vertex work by handing it a
+            // single-node view: it bakes globalTransform, which is already
+            // resolved on this node.
+            FlattenSingleNode(node, out);
+            if (insideIronSight)
+                for (size_t i = before; i < out.size(); ++i)
+                    ironSightIndices.push_back(i);
+        }
+        for (const auto& child : node->children)
+            FlattenTaggingIronSights(child, out, ironSightIndices,
+                                     insideIronSight);
+    }
+
     static void LoadShotgun() {
         const std::string path = Resolve("Content/Models/shotgun_fbx/Mossberg 590A1.fbx");
         std::cout << "Loading Mossberg 590A1 " << path << "...\n";
@@ -708,6 +865,40 @@ private:
     }
 
     // Collapse the node tree into world-space primitives (same as PalmModel).
+    // Bake one node's mesh into world space and append it. Split out of Flatten
+    // so a caller that needs to know which node each primitive came from can
+    // walk the tree itself without duplicating the vertex transform.
+    static void FlattenSingleNode(const std::shared_ptr<SceneNode>& node,
+                                  std::vector<MeshPrimitive>& target) {
+        if (!node || !node->mesh) return;
+        const XMMATRIX world = XMLoadFloat4x4(&node->globalTransform);
+        const XMMATRIX nrm = XMMatrixTranspose(XMMatrixInverse(nullptr, world));
+        for (const MeshPrimitive& src : node->mesh->primitives) {
+            MeshPrimitive p = src;
+            // Strip GPU handles: these are CPU-side working copies.
+            p.vbv = {}; p.ibv = {};
+            p.vertexBuffer.Reset(); p.indexBuffer.Reset();
+            p.meshletDescBuffer.Reset(); p.meshletBoundsBuffer.Reset();
+            p.meshletVertexIndexBuffer.Reset(); p.meshletTriangleBuffer.Reset();
+            p.meshletCount = 0;
+
+            for (size_t v = 0; v + 11 < p.vertices.size(); v += 12) {
+                XMVECTOR pos = XMVectorSet(p.vertices[v], p.vertices[v+1], p.vertices[v+2], 1);
+                XMVECTOR n   = XMVectorSet(p.vertices[v+3], p.vertices[v+4], p.vertices[v+5], 0);
+                XMVECTOR t   = XMVectorSet(p.vertices[v+8], p.vertices[v+9], p.vertices[v+10], 0);
+                pos = XMVector3TransformCoord(pos, world);
+                n   = XMVector3Normalize(XMVector3TransformNormal(n, nrm));
+                t   = XMVector3Normalize(XMVector3TransformNormal(t, world));
+                XMFLOAT3 pf, nf, tf;
+                XMStoreFloat3(&pf, pos); XMStoreFloat3(&nf, n); XMStoreFloat3(&tf, t);
+                p.vertices[v]=pf.x;   p.vertices[v+1]=pf.y;  p.vertices[v+2]=pf.z;
+                p.vertices[v+3]=nf.x; p.vertices[v+4]=nf.y;  p.vertices[v+5]=nf.z;
+                p.vertices[v+8]=tf.x; p.vertices[v+9]=tf.y;  p.vertices[v+10]=tf.z;
+            }
+            target.push_back(std::move(p));
+        }
+    }
+
     static void Flatten(const std::shared_ptr<SceneNode>& node,
                         std::vector<MeshPrimitive>& out,
                         std::vector<MeshPrimitive>* separatedRockets = nullptr,
@@ -719,34 +910,7 @@ private:
         insideRocket = insideRocket || nodeName.find("rocket") != std::string::npos;
         std::vector<MeshPrimitive>& target =
             separatedRockets && insideRocket ? *separatedRockets : out;
-        if (node->mesh) {
-            const XMMATRIX world = XMLoadFloat4x4(&node->globalTransform);
-            const XMMATRIX nrm = XMMatrixTranspose(XMMatrixInverse(nullptr, world));
-            for (const MeshPrimitive& src : node->mesh->primitives) {
-                MeshPrimitive p = src;
-                // Strip GPU handles: these are CPU-side working copies.
-                p.vbv = {}; p.ibv = {};
-                p.vertexBuffer.Reset(); p.indexBuffer.Reset();
-                p.meshletDescBuffer.Reset(); p.meshletBoundsBuffer.Reset();
-                p.meshletVertexIndexBuffer.Reset(); p.meshletTriangleBuffer.Reset();
-                p.meshletCount = 0;
-
-                for (size_t v = 0; v + 11 < p.vertices.size(); v += 12) {
-                    XMVECTOR pos = XMVectorSet(p.vertices[v], p.vertices[v+1], p.vertices[v+2], 1);
-                    XMVECTOR n   = XMVectorSet(p.vertices[v+3], p.vertices[v+4], p.vertices[v+5], 0);
-                    XMVECTOR t   = XMVectorSet(p.vertices[v+8], p.vertices[v+9], p.vertices[v+10], 0);
-                    pos = XMVector3TransformCoord(pos, world);
-                    n   = XMVector3Normalize(XMVector3TransformNormal(n, nrm));
-                    t   = XMVector3Normalize(XMVector3TransformNormal(t, world));
-                    XMFLOAT3 pf, nf, tf;
-                    XMStoreFloat3(&pf, pos); XMStoreFloat3(&nf, n); XMStoreFloat3(&tf, t);
-                    p.vertices[v]=pf.x;   p.vertices[v+1]=pf.y;  p.vertices[v+2]=pf.z;
-                    p.vertices[v+3]=nf.x; p.vertices[v+4]=nf.y;  p.vertices[v+5]=nf.z;
-                    p.vertices[v+8]=tf.x; p.vertices[v+9]=tf.y;  p.vertices[v+10]=tf.z;
-                }
-                target.push_back(std::move(p));
-            }
-        }
+        FlattenSingleNode(node, target);
         for (const auto& child : node->children)
             Flatten(child, out, separatedRockets, insideRocket);
     }

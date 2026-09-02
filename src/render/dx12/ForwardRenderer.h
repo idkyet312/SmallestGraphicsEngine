@@ -3444,6 +3444,13 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             if (!GunModel::C4Selected() && GunModel::PlayerMesh())
                 DrawMeshAt(
                     GunModel::PlayerMesh(), shader, xf, view, proj, lightSpace);
+            // The M4's iron sights are a separate mesh so an optic can replace
+            // them. A red dot mounts directly over the rail, and the rear leaf
+            // would stand up through the sight body if both were drawn.
+            if (GunModel::M4Selected() && !weaponStats.redDotSight &&
+                GunModel::M4IronSightMesh())
+                DrawMeshAt(GunModel::M4IronSightMesh(), shader, xf, view, proj,
+                           lightSpace);
             shader.Use(scene.wireframeMode);
 
             // Attachment visuals use the same normalised weapon-local frame as

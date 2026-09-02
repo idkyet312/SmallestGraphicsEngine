@@ -1631,6 +1631,13 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::SliderFloat("Base Ambient",
                            &scene.ambientLightingIntensity,
                            0.0f, 2.0f, "%.3f");
+        // Scales every authored emissive map in the scene at once -- optic
+        // reticles, panel legends, beacon lenses. 1.0 is as-authored; 0 turns
+        // them off entirely. Materials keep their own emissiveFactor, so this
+        // shifts the whole set against the frame's exposure without flattening
+        // the relative brightness between them.
+        ImGui::SliderFloat("Emissive Intensity", &g_emissiveIntensity,
+                           0.0f, 8.0f, "%.2fx");
         ImGui::Checkbox("Animate Light", &scene.animateLight);
     }
 
@@ -2775,6 +2782,34 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // are per weapon because each host mesh carries its rail at a different
         // height. Shown only when an optic is actually fitted -- there is
         // nothing on screen to move otherwise.
+        // Attachments for the weapon actually in hand. The deployment screen
+        // can only fit the two loadout slots, so a weapon reached by scrolling
+        // in the sandbox had no way to mount anything without this.
+        ImGui::SeparatorText("Attachments");
+        {
+            const int heldWeapon = GunModel::SelectedWeapon();
+            bool anyRail = false;
+            for (const SGE::AttachmentDefinition& attachment :
+                 scene.player.weapons.Attachments()) {
+                if (!attachment.CompatibleWith(heldWeapon)) continue;
+                anyRail = true;
+                bool equipped = scene.player.weapons.AttachmentInstalled(
+                    heldWeapon, attachment.id);
+                ImGui::PushID(attachment.id.c_str());
+                if (ImGui::Checkbox(attachment.displayName.c_str(), &equipped)) {
+                    if (equipped)
+                        scene.player.weapons.EquipAttachment(
+                            heldWeapon, attachment.id);
+                    else
+                        scene.player.weapons.RemoveAttachment(
+                            heldWeapon, attachment.slot);
+                }
+                ImGui::PopID();
+            }
+            if (!anyRail)
+                ImGui::TextDisabled("No attachment rails on this weapon.");
+        }
+
         const SGE::ResolvedWeaponStats viewWeaponStats =
             scene.player.ResolveWeaponStats(GunModel::SelectedWeapon());
         if (viewWeaponStats.redDotSight) {
@@ -2791,9 +2826,11 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                               1.0f, -180.0f, 180.0f, "%.1f deg");
             // The emissive dot is placed apart from the sight body, so moving
             // the mount leaves it behind until it is re-centred in the glass.
+            // Y sits at -1.0 in the tuned pose, so the floor is well below it:
+            // a slider pinned at its own minimum cannot be taken any further.
             ImGui::SliderFloat3("Reticle Pos",
                                 &GunModel::PlayerReticleOffset().x,
-                                -1.00f, 1.00f, "%.3f");
+                                -2.00f, 2.00f, "%.3f");
             // The tuned dot sits near the bottom of this range, so the floor is
             // well below it -- a slider pinned at its own minimum cannot be
             // taken any finer.
@@ -2801,12 +2838,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                                0.0002f, 0.05f, "%.4f");
             if (ImGui::Button("Reset Sight##optic")) {
                 GunModel::PlayerOpticOffset() =
-                    DirectX::XMFLOAT3(0.012f, 0.140f, 0.376f);
+                    DirectX::XMFLOAT3(0.012f, 0.154f, 0.376f);
                 GunModel::PlayerOpticRotation() =
                     DirectX::XMFLOAT3(0.0f, 0.0f, 0.0f);
-                GunModel::PlayerOpticScale() = 1.42f;
+                GunModel::PlayerOpticScale() = 1.00f;
                 GunModel::PlayerReticleOffset() =
-                    DirectX::XMFLOAT3(0.0f, 0.182f, -0.600f);
+                    DirectX::XMFLOAT3(0.0f, -1.000f, -0.600f);
                 GunModel::ReticleSize() = 0.001f;
             }
             ImGui::SameLine();
@@ -2892,8 +2929,21 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             // this re-solves immediately, so the hand can be walked along the
             // rifle until it sits on the handguard properly.
             ImGui::SeparatorText("Weapon Grip Point");
+            // Shared baseline: moves every weapon together.
             if (ImGui::DragFloat3("Grip Target", &ArmsModel::WeaponGrip().x, 0.005f))
                 ArmsModel::RealignHandsToWeapon();
+            // Added on top for the held weapon only, and zero by default, so
+            // this starts as a no-op and each rifle is corrected from the shared
+            // pose rather than positioned from scratch. No re-solve on edit:
+            // it applies as a delta in ModelToGunLocal and takes effect on the
+            // next frame, where re-solving would move the body independently of
+            // the value being dragged.
+            ImGui::Text("Grip Nudge for: %s", GunModel::SelectedWeaponName());
+            ImGui::DragFloat3("Grip Nudge",
+                              &ArmsModel::PlayerGripOffset().x, 0.005f);
+            ImGui::SameLine();
+            if (ImGui::Button("Reset##gripnudge"))
+                ArmsModel::PlayerGripOffset() = DirectX::XMFLOAT3(0, 0, 0);
             if (ImGui::Button("Snap Hands To Weapon"))
                 ArmsModel::RealignHandsToWeapon();
 

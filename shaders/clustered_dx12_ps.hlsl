@@ -21,6 +21,7 @@ cbuffer LightBuffer : register(b1) {
     int enableShadows;
     float shadowTexelSize;   // 1/shadow-map-size, precomputed on the CPU
     float ambientLightingIntensity;
+    float emissiveIntensity; // global multiplier on authored emissive maps
 };
 
 cbuffer CameraBuffer : register(b2) {
@@ -1179,7 +1180,7 @@ float4 main(PS_INPUT input) : SV_TARGET
     if (useEmissiveMap > 0.5) {
         float4 emissiveSample = SGE_MATERIAL_EMISSIVE.Sample(
             texSampler, input.texCoord);
-        result += emissiveSample.rgb * emissiveFactor;
+        result += emissiveSample.rgb * emissiveFactor * emissiveIntensity;
         // A blended surface would otherwise fade its own markings out with the
         // glass they sit on: the emissive is light leaving the lens, not part of
         // what is being seen through it.

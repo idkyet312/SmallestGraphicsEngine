@@ -106,7 +106,7 @@ struct ResolvedWeaponStats {
 
 class WeaponCustomizationSystem {
 public:
-    static constexpr int kWeaponCount = 9;
+    static constexpr int kWeaponCount = 10;
     static constexpr size_t kAttachmentCount = 3;
 
     WeaponCustomizationSystem() {
@@ -148,22 +148,31 @@ public:
               1.05f, 5.0f, 650.0f, 1.98f, 0.0f, 1.0f, 1.0f, 0.25f,
               0.55f, 0.35f, 0.7f, 15.0f, true,
               "Content/Models/SVD_v1.3/Models/SVD.FBX", "" },
+            // The carbine against the AK's battle rifle: it cycles faster
+            // (0.075s vs 0.10) and climbs less (0.42/0.18 vs 0.55/0.22) for
+            // slightly less damage per shot, so the two are a real choice at
+            // range rather than one being strictly better.
+            { "m4a1", "M4A1", 9, 30, 120, 240, 1.45f, 0.075f, 0.9f,
+              320.0f, 0.42f, 0.18f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+              1.0f, 42.0f, false,
+              "Content/Models/MainPlayer/Guns/m4/m4A1.glb", "" },
         }};
 
         const uint32_t ak = 1u << 0;
         const uint32_t shotgun = 1u << 1;
         const uint32_t svd = 1u << 3;
+        const uint32_t m4 = 1u << 9;
         attachments_ = {{
             { "silencer", "Silencer", AttachmentSlot::Muzzle, 10,
-              ak | svd,
+              ak | svd | m4,
               { 0.86f, 1.0f, 1.0f, 0.25f, 0.55f, 0.35f, 0.60f, 0.0f },
               true, false, false, "procedural/attachments/silencer" },
             { "red_dot", "Red Dot Sight", AttachmentSlot::Optic, 20,
-              ak | shotgun,
+              ak | shotgun | m4,
               { 1.0f, 1.0f, 0.55f, 1.0f, 1.0f, 1.0f, 1.0f, -6.0f },
               false, true, false, "procedural/attachments/red_dot" },
             { "laser", "Visible Laser", AttachmentSlot::SideRail, 30,
-              ak | shotgun | svd,
+              ak | shotgun | svd | m4,
               { 1.0f, 0.72f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f },
               false, false, true, "procedural/attachments/visible_laser" },
         }};

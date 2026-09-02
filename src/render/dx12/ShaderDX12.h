@@ -80,6 +80,13 @@ struct alignas(256) MatrixBufferDX12 {
 
 inline float g_currentModelMaxScale = 1.0f;
 
+// Global multiplier on every authored emissive map, driven from the editor's
+// Lighting panel. A single global rather than a per-material field: it exists to
+// balance emissive against the rest of the frame's exposure, which is a scene
+// decision, and materials keep their own emissiveFactor for relative brightness.
+// 1.0 leaves assets exactly as authored.
+inline float g_emissiveIntensity = 1.0f;
+
 struct alignas(256) LightBufferDX12 {
     XMFLOAT3 lightPos;
     int lightType;
@@ -95,6 +102,10 @@ struct alignas(256) LightBufferDX12 {
     // 1/shadow-map-size, so the PCF loop needn't call GetDimensions per pixel.
     float shadowTexelSize;
     float ambientLightingIntensity;
+    // Scales every authored emissive map in the scene. Lives on the per-frame
+    // light buffer rather than the per-draw object buffer because it is one
+    // global knob, not a material property -- see g_emissiveIntensity.
+    float emissiveIntensity;
 };
 
 struct alignas(256) CameraBufferDX12 {
@@ -1778,6 +1789,9 @@ public:
         data.quadratic = quadratic;
         data.ambientStrength = ambient;
         data.ambientLightingIntensity = ambientIntensity;
+        // Read from the global rather than taken as a parameter: this signature
+        // already carries fourteen, and every caller would pass the same value.
+        data.emissiveIntensity = g_emissiveIntensity;
         data.specularStrength = specular;
         data.shininess = shininess;
         data.shadowBias = shadowBias;

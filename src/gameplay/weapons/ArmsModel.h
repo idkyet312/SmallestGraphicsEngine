@@ -36,6 +36,7 @@
 #include "SkinnedFBXImporter.h"
 #include <DirectXMath.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -135,12 +136,17 @@ public:
         const float scale = Scale() * NormaliseScale();
         const float mirror = MirrorX() ? -1.0f : 1.0f;
         const float runBack = RunBlendWeight() * RunBackOffset();
+        // Per-weapon nudge rides here rather than in the alignment solve: this
+        // is a pure delta on the already-tuned offset, so a weapon left at zero
+        // produces exactly the transform it did before the table existed.
+        const XMFLOAT3& grip = PlayerGripOffset();
         return XMMatrixTranslation(-Pivot().x, -Pivot().y, -Pivot().z) *
                XMMatrixRotationRollPitchYaw(XMConvertToRadians(rotation.x),
                                             XMConvertToRadians(rotation.y),
                                             XMConvertToRadians(rotation.z)) *
                XMMatrixScaling(scale * mirror, scale, scale) *
-               XMMatrixTranslation(offset.x, offset.y, offset.z - runBack);
+               XMMatrixTranslation(offset.x + grip.x, offset.y + grip.y,
+                                   offset.z + grip.z - runBack);
     }
 
     // Hide the character's own head. The camera sits at the eyes, so the skull
@@ -477,12 +483,66 @@ public:
         return grip;
     }
 
+    // Highest weapon id the per-weapon table covers. Mirrors GunModel's
+    // kMaxWeapon, spelled out rather than included: ArmsModel is deliberately
+    // unaware of GunModel, so the weapon index is passed in from outside.
+    static constexpr int kMaxGripWeapon = 9;
+
+    // Per-weapon nudge ADDED to the shared grip point above, in gun-local
+    // units. Zero means "sits exactly where the shared value puts it", which is
+    // every weapon that has not needed correcting -- the shared point stays the
+    // baseline for all of them, and this only carries the difference a
+    // particular rifle needs.
+    //
+    // With GripUsesLeftHand (the default) this adjusts the LEFT arm.
+    static XMFLOAT3& WeaponGripOffset(int weapon) {
+        static std::array<XMFLOAT3, kMaxGripWeapon + 1> offsets = {{
+            { 0.000f,  0.000f, 0.0f }, // AK47
+            { 0.000f,  0.000f, 0.0f }, // Mossberg
+            { 0.000f,  0.000f, 0.0f }, // RPG
+            { 0.000f,  0.000f, 0.0f }, // SVD
+            { 0.000f,  0.000f, 0.0f }, // laser
+            { 0.000f,  0.000f, 0.0f }, // C4
+            { 0.000f,  0.000f, 0.0f }, // flamethrower
+            { 0.000f,  0.000f, 0.0f }, // harpoon
+            { 0.000f,  0.000f, 0.0f }, // SVD suppressed
+            // The M4's handguard is shorter and sits lower than the AK's, so
+            // the shared grip point leaves the support hand off the rail.
+            {-0.030f, -0.030f, 0.0f }, // M4A1
+        }};
+        const int slot = (std::max)(0, (std::min)(weapon, kMaxGripWeapon));
+        return offsets[static_cast<size_t>(slot)];
+    }
+
+    // Which weapon the per-weapon nudge is read for. Pushed in by the caller as
+    // the selection changes, so this file need not know what a weapon is.
+    static int& GripWeapon() {
+        static int weapon = 0;
+        return weapon;
+    }
+    static XMFLOAT3& PlayerGripOffset() {
+        return WeaponGripOffset(GripWeapon());
+    }
+
+
     // Re-solve the body offset so the aligned hand sits on the weapon's grip
     // point. Exposed for the debug UI: after scrubbing to a different frame of
     // the idle, or moving the grip target, this snaps the body back onto the gun.
     static void RealignHandsToWeapon() {
         AlignHandsToWeapon();
         BindGlobals() = PoseGlobals();
+    }
+
+    // Point the grip table at a different weapon.
+    //
+    // Deliberately does NOT re-solve the alignment. AlignHandsToWeapon measures
+    // the hand in the CURRENT animated frame, so calling it while the idle plays
+    // solves against a different hand position than the one the tuned Offset()
+    // was derived from -- the body then jumps, whether or not this weapon
+    // carries a nudge. The nudge is applied as a delta in ModelToGunLocal
+    // instead, which leaves the tuned placement exactly as it is.
+    static void SetGripWeapon(int weapon) {
+        GripWeapon() = weapon;
     }
 
     // Let the weapon ride the hand instead of hanging at a fixed spot.

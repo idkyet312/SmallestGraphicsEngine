@@ -69,6 +69,7 @@ cbuffer LightBuffer : register(b1) {
     int    enableShadows;
     float  lbPadding;
     float  ambientLightingIntensity;
+    float  emissiveIntensity; // global multiplier; matches LightBufferDX12
 };
 
 struct PointLightData {
@@ -2699,7 +2700,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
         result += ambientStrength * diffuseAlbedo * ambientScale *
                   ambientOcclusion * ambientLightingIntensity;
     }
-    result += surface.material.emissiveOcclusion.rgb;
+    result += surface.material.emissiveOcclusion.rgb * emissiveIntensity;
     
     float3 numerator = NDF * G * F;
     float denominator = 4.0 * NdotV * NdotL + 0.0001;
