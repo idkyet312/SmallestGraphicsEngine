@@ -79,8 +79,9 @@ public:
     // animation isn't needed, to cut draw-call count for the Colour Pass.
     static std::shared_ptr<SceneNode> MergeSceneByMaterial(const std::shared_ptr<SceneNode>& modelRoot, Microsoft::WRL::ComPtr<ID3D12Device> device);
 
-    // Flattens all primitives into one depth-only mesh. Colour material boundaries
-    // are irrelevant to the current shadow shader and would only add draw calls.
+    // Flattens opaque primitives into one depth-only draw while retaining
+    // alpha-bearing material buckets so the shadow pass can reproduce their
+    // authored coverage.
     static std::shared_ptr<SceneNode> MergeSceneForDepth(const std::shared_ptr<SceneNode>& modelRoot, Microsoft::WRL::ComPtr<ID3D12Device> device);
 
     // Uploads conventional vertex/index buffers and builds meshoptimizer

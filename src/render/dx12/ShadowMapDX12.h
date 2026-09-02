@@ -35,6 +35,7 @@ class DepthOnlyShaderDX12 {
 public:
     ComPtr<ID3D12RootSignature> rootSignature;
     ComPtr<ID3D12PipelineState> pipelineState;
+    ComPtr<ID3D12PipelineState> alphaPipelineState;
     ComPtr<ID3D12PipelineState> grassPipelineState;
     ComPtr<ID3D12PipelineState> palmPipelineState;
     ComPtr<ID3D12PipelineState> palmAlphaPipelineState;
@@ -82,7 +83,7 @@ public:
         palmTextureRange.NumDescriptors = 1;
         palmTextureRange.BaseShaderRegister = 0;
 
-        D3D12_ROOT_PARAMETER rootParams[9] = {};
+        D3D12_ROOT_PARAMETER rootParams[10] = {};
         rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         rootParams[0].Descriptor.ShaderRegister = 0;
         rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -114,6 +115,10 @@ public:
         rootParams[8].DescriptorTable.NumDescriptorRanges = 1;
         rootParams[8].DescriptorTable.pDescriptorRanges = &palmTextureRange;
         rootParams[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        rootParams[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rootParams[9].Constants.ShaderRegister = 8;
+        rootParams[9].Constants.Num32BitValues = 4;
+        rootParams[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_STATIC_SAMPLER_DESC palmSampler = {};
         palmSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -146,7 +151,10 @@ public:
         if (FAILED(hr)) return false;
 
         D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
-            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
         };
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
@@ -177,6 +185,31 @@ public:
             std::cerr << "Failed to create shadow PSO, HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
             return false;
         }
+
+        std::ifstream alphaPsFile("shaders/alpha_shadow_ps.hlsl");
+        if (!alphaPsFile.is_open()) return false;
+        std::stringstream alphaPsStream;
+        alphaPsStream << alphaPsFile.rdbuf();
+        const std::string alphaPsCode = alphaPsStream.str();
+        ComPtr<ID3DBlob> alphaPsBlob;
+        errorBlob.Reset();
+        hr = ShaderCacheDX12::CompileCached(
+            alphaPsCode.c_str(), alphaPsCode.length(),
+            "shaders/alpha_shadow_ps.hlsl", nullptr,
+            D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "ps_5_0",
+            compileFlags, 0, &alphaPsBlob, &errorBlob);
+        if (FAILED(hr)) {
+            if (errorBlob) std::cerr << "Alpha shadow PS error: "
+                                     << (char*)errorBlob->GetBufferPointer() << std::endl;
+            return false;
+        }
+        psoDesc.PS = {
+            alphaPsBlob->GetBufferPointer(), alphaPsBlob->GetBufferSize()
+        };
+        hr = g_dx12.device->CreateGraphicsPipelineState(
+            &psoDesc, IID_PPV_ARGS(&alphaPipelineState));
+        if (FAILED(hr)) return false;
+        psoDesc.PS = {};
 
         std::ifstream grassVsFile("shaders/grass_shadow_vs.hlsl");
         if (!grassVsFile.is_open()) return false;
@@ -266,6 +299,47 @@ public:
     void Use() {
         g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
         g_dx12.commandList->SetPipelineState(pipelineState.Get());
+    }
+
+    bool UseMaterial(const SceneMaterial* material) {
+        if (!material) {
+            g_dx12.commandList->SetPipelineState(pipelineState.Get());
+            return true;
+        }
+
+        const bool cutout = material->alphaCutout;
+        const bool blended = material->IsTransparent();
+        if (!cutout && !blended) {
+            g_dx12.commandList->SetPipelineState(pipelineState.Get());
+            return true;
+        }
+
+        const float opacity = (std::max)(0.0f,
+            (std::min)(1.0f, material->baseColorFactor.w));
+        ID3D12Resource* texture = material->baseColorTexture.Get();
+        if (!texture && cutout && opacity < material->alphaCutoff) return false;
+        if (!texture && blended && opacity <= 0.0f) return false;
+        if (!texture && blended && opacity >= 0.999f) {
+            g_dx12.commandList->SetPipelineState(pipelineState.Get());
+            return true;
+        }
+
+        struct AlphaShadowConstants {
+            float opacity;
+            float alphaCutoff;
+            UINT alphaMode;
+            UINT hasTexture;
+        } constants = {
+            opacity,
+            material->alphaCutoff,
+            material->alphaFromLuminance ? 3u : (cutout ? 1u : 2u),
+            texture ? 1u : 0u
+        };
+        g_dx12.commandList->SetPipelineState(alphaPipelineState.Get());
+        g_dx12.commandList->SetGraphicsRoot32BitConstants(
+            9, 4, &constants, 0);
+        if (texture) SetPalmTexture(texture);
+        return true;
     }
 
     void SetMatrices(const XMMATRIX& model, const XMMATRIX& lightSpace,
@@ -385,7 +459,7 @@ inline void DrawSceneNodeShadow(const std::shared_ptr<SceneNode>& node,
 
         for (const auto& prim : node->mesh->primitives) {
             if (prim.vbv.BufferLocation == 0) continue;
-            if (prim.material && prim.material->baseColorFactor.w < 0.5f) continue;
+            if (!shader.UseMaterial(prim.material.get())) continue;
 
             // Pose the shadow from the same palette as the colour pass, so a
             // spinning rotor casts a spinning shadow instead of a frozen one.
@@ -416,8 +490,7 @@ inline void DrawSceneNodeShadow(const std::shared_ptr<SceneNode>& node,
 inline bool SceneNodeSupportsShadowInstancing(const std::shared_ptr<SceneNode>& node) {
     if (!node) return false;
     if (node->mesh) for (const auto& prim : node->mesh->primitives) {
-        if (!prim.vbv.BufferLocation || prim.skinBuffer ||
-            (prim.material && prim.material->baseColorFactor.w < 0.5f)) return false;
+        if (!prim.vbv.BufferLocation || prim.skinBuffer) return false;
     }
     for (const auto& child : node->children)
         if (!SceneNodeSupportsShadowInstancing(child)) return false;
@@ -447,6 +520,7 @@ inline void DrawSceneNodeShadowInstances(const std::shared_ptr<SceneNode>& node,
         const XMMATRIX local = XMLoadFloat4x4(&node->globalTransform);
         for (const XMMATRIX& world : worlds) models.push_back(local * world);
         for (const auto& prim : node->mesh->primitives) {
+            if (!shader.UseMaterial(prim.material.get())) continue;
             shader.SetMatrices(XMMatrixIdentity(), lightSpace);
             if (!shader.SetInstances(models)) {
                 for (const XMMATRIX& model : models) {

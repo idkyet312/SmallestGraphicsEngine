@@ -672,6 +672,11 @@ void ExtractMaterials(CookContext& context) {
             }
             else if (mode == "BLEND") material.flags |= Cooked::AlphaBlend;
         }
+        // OPAQUE alpha is not coverage in glTF. Persisting an exporter-provided
+        // value below one would make the runtime's legacy factor fallback blend
+        // a material whose alphaMode explicitly says not to.
+        if ((material.flags & (Cooked::AlphaCutout | Cooked::AlphaBlend)) == 0)
+            material.baseColor[3] = 1.0f;
         material.baseColorTexture = context.MaterialTexture(source,
             { aiTextureType_BASE_COLOR, aiTextureType_DIFFUSE },
             Cooked::TextureFormat::BC3);

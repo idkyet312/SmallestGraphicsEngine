@@ -12,6 +12,7 @@
 #include "LevelLoadingController.h"
 #include "LevelRuntimeBuilder.h"
 #include "PlayerState.h"
+#include "WeaponCustomization.h"
 #include "TimeOfDay.h"
 #include "Weather.h"
 #include "PlayerMovementTracker.h"
@@ -214,15 +215,57 @@ int main() {
     // Ammo tables must cover it, or firing it reads uninitialised memory.
     CHECK(PlayerState::kWeaponSlots > kSuppressedSVD);
     PlayerState stealthAmmo;
-    CHECK(stealthAmmo.magazineSize[kSuppressedSVD] > 0);
-    CHECK(stealthAmmo.maxReserve[kSuppressedSVD] > 0);
-    CHECK(stealthAmmo.reloadTime[kSuppressedSVD] > 0.0f);
+    CHECK(stealthAmmo.MagazineSize(kSuppressedSVD) > 0);
+    CHECK(stealthAmmo.MaxReserve(kSuppressedSVD) > 0);
+    CHECK(stealthAmmo.ReloadTime(kSuppressedSVD) > 0.0f);
     // Quiet is the advantage, so it must not also carry more than the loud
     // rifle it shares a round with.
-    CHECK(stealthAmmo.magazineSize[kSuppressedSVD] <=
-          stealthAmmo.magazineSize[3]);
-    CHECK(stealthAmmo.maxReserve[kSuppressedSVD] <
-          stealthAmmo.maxReserve[3]);
+    CHECK(stealthAmmo.MagazineSize(kSuppressedSVD) <=
+          stealthAmmo.MagazineSize(3));
+    CHECK(stealthAmmo.MaxReserve(kSuppressedSVD) <
+          stealthAmmo.MaxReserve(3));
+
+    // ---- Weapon customisation ----------------------------------------------
+    SGE::WeaponCustomizationSystem customisation;
+    CHECK(customisation.FindWeapon("ak47") != nullptr);
+    CHECK(customisation.FindWeapon("ak47")->legacyWeaponId == 0);
+    CHECK(customisation.FindAttachment("silencer") != nullptr);
+    CHECK(customisation.FindAttachment("red_dot") != nullptr);
+    CHECK(customisation.FindAttachment("laser") != nullptr);
+    // The RPG has no attachment mounts; compatibility is enforced in the data
+    // layer rather than relying on the deployment UI to hide an invalid choice.
+    CHECK(!customisation.EquipAttachment(2, "silencer"));
+    CHECK(customisation.EquipAttachment(0, "laser"));
+    CHECK(customisation.EquipAttachment(0, "red_dot"));
+    CHECK(customisation.EquipAttachment(0, "silencer"));
+    const SGE::ResolvedWeaponStats customisedAK = customisation.Resolve(0);
+    CHECK(customisedAK.suppressed);
+    CHECK(customisedAK.redDotSight);
+    CHECK(customisedAK.laserSight);
+    CHECK(customisedAK.noiseRadiusMultiplier < 1.0f);
+    CHECK(customisedAK.recoilPitchDegrees < 0.55f);
+    CHECK(customisedAK.adsSpreadMultiplier < 1.0f);
+    CHECK(customisedAK.hipSpreadMultiplier < 1.0f);
+    CHECK(customisedAK.adsFovDegrees < 42.0f);
+
+    // Equipping in another order resolves identically because modifiers are
+    // sorted by their authored order (and stable ID as the tie-breaker).
+    SGE::WeaponCustomizationSystem reversedCustomisation;
+    CHECK(reversedCustomisation.EquipAttachment(0, "silencer"));
+    CHECK(reversedCustomisation.EquipAttachment(0, "red_dot"));
+    CHECK(reversedCustomisation.EquipAttachment(0, "laser"));
+    const SGE::ResolvedWeaponStats reversedAK =
+        reversedCustomisation.Resolve(0);
+    CHECK(std::abs(customisedAK.recoilPitchDegrees -
+                   reversedAK.recoilPitchDegrees) < 0.0001f);
+    CHECK(std::abs(customisedAK.hipSpreadMultiplier -
+                   reversedAK.hipSpreadMultiplier) < 0.0001f);
+
+    SGE::WeaponInstance worldRifle =
+        customisation.CreateInstance(0, 11, 37);
+    CHECK(worldRifle.weaponId == "ak47");
+    CHECK(worldRifle.magazine == 11);
+    CHECK(worldRifle.reserve == 37);
     // Weapon-used tracking is a bitmask; slot 8 has to fit in it.
     CHECK((1u << kSuppressedSVD) != 0u);
 
@@ -488,42 +531,40 @@ int main() {
     CHECK(std::abs(player.HealthRegenPerSecond() - 50.0f) < 0.0001f);
     CHECK(std::abs(player.HealthRegenPerSecond() * player.regenDuration -
                    player.maxHealth) < 0.0001f);
-    player.magazine[0] = 1;
+    CHECK(player.SetAmmo(0, 1, 0));
     CHECK(player.ConsumeAmmo(0));
-    CHECK(player.magazine[0] == 0);
+    CHECK(player.Magazine(0) == 0);
     CHECK(!player.ConsumeAmmo(0));
-    player.reserve[0] = 5;
+    CHECK(player.SetAmmo(0, 0, 5));
     CHECK(player.BeginReload(0));
     player.UpdateReload(10.0f);
-    CHECK(player.magazine[0] == 5);
-    CHECK(player.reserve[0] == 0);
+    CHECK(player.Magazine(0) == 5);
+    CHECK(player.Reserve(0) == 0);
     // 9 since the suppressed SVD took slot 8.
     CHECK(PlayerState::kWeaponSlots == 9);
-    player.magazine[4] = 1;
+    CHECK(player.SetAmmo(4, 1, 0));
     CHECK(player.ConsumeAmmo(4));
-    CHECK(player.magazine[4] == 0);
-    player.reserve[4] = 7;
+    CHECK(player.Magazine(4) == 0);
+    CHECK(player.SetAmmo(4, 0, 7));
     CHECK(player.BeginReload(4));
     player.UpdateReload(10.0f);
-    CHECK(player.magazine[4] == 7);
-    CHECK(player.reserve[4] == 0);
-    CHECK(player.magazineSize[7] == 1);
+    CHECK(player.Magazine(4) == 7);
+    CHECK(player.Reserve(4) == 0);
+    CHECK(player.MagazineSize(7) == 1);
 
     PlayerState fastRappelLoadout;
-    fastRappelLoadout.magazine[0] = 5;
-    fastRappelLoadout.reserve[0] = 9;
-    fastRappelLoadout.magazine[2] = 1;
-    fastRappelLoadout.reserve[2] = 5;
+    CHECK(fastRappelLoadout.SetAmmo(0, 5, 9));
+    CHECK(fastRappelLoadout.SetAmmo(2, 1, 5));
     fastRappelLoadout.reloadTimer = 1.0f;
     fastRappelLoadout.reloadingSlot = 0;
     fastRappelLoadout.HalveAmmo();
-    CHECK(fastRappelLoadout.magazine[0] == 2);
-    CHECK(fastRappelLoadout.reserve[0] == 4);
-    CHECK(fastRappelLoadout.magazine[2] == 0);
-    CHECK(fastRappelLoadout.reserve[2] == 2);
+    CHECK(fastRappelLoadout.Magazine(0) == 2);
+    CHECK(fastRappelLoadout.Reserve(0) == 4);
+    CHECK(fastRappelLoadout.Magazine(2) == 0);
+    CHECK(fastRappelLoadout.Reserve(2) == 2);
     CHECK(!fastRappelLoadout.Reloading());
     CHECK(fastRappelLoadout.reloadingSlot == -1);
-    CHECK(player.maxReserve[7] == 24);
+    CHECK(player.MaxReserve(7) == 24);
 
     // AA emplacement. The gun is only a threat if it leads a moving aircraft
     // and slews at a finite rate, so both are pinned here.

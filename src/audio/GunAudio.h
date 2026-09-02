@@ -242,7 +242,13 @@ class GunAudio {
 public:
     // Upper bound on Play()'s gain. Unity is the normal ceiling; values above
     // it amplify, for sources authored quieter than the rest of the mix.
-    static constexpr float kMaxPlayGain = 4.0f;
+    //
+    // 6.0 rather than the original 4.0: the exhaustion breathing peaks at 1636
+    // of 32767, roughly 20x below the shipped effects, and 4.0 was not enough
+    // to bring it into the mix. A source needing more than this is mastered too
+    // quietly and should be re-encoded rather than amplified further -- the
+    // ceiling exists so a bad call site cannot blow out an already-loud sample.
+    static constexpr float kMaxPlayGain = 6.0f;
 
     ~GunAudio() { Shutdown(); }
 

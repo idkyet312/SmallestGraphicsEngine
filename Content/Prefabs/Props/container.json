@@ -14,7 +14,10 @@
       "forceDoubleSided": true
     },
     "collision": {
-      "shape": "mesh"
+      "shape": "box"
+    },
+    "rigidBody": {
+      "density": 64.0
     }
   }
 }

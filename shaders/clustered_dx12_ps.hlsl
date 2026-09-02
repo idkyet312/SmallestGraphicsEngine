@@ -37,7 +37,7 @@ cbuffer ObjectBuffer : register(b3) {
     float metalRoughMode;
     float opacity;
     float smokeMode;         // > 0.5: unlit soft sprite, alpha = opacity * texAlpha
-    float alphaCut;          // 1: foliage cutout; 2: luminance (hair); 3: hard-surface cutout
+    float alphaCut;          // -1: alpha blend; 1: foliage; 2: luminance; 3: hard cutout
     float alphaCutoff;       // clip threshold for modes 1 and 3
     float ambientScale;
     float occlusionStrength;
@@ -48,9 +48,18 @@ cbuffer ObjectBuffer : register(b3) {
     float specularScale;     // per-draw highlight control; viewmodels use less
     float materialType;      // 0=ordinary, 1=pool water, 2=ocean
     float materialTime;      // seconds; used by procedural water detail
+    float useEmissiveMap;    // > 0.5: add emissiveMap * emissiveFactor
+    // The CPU struct reserves these two floats so the uint4 below starts on its
+    // 16-byte register at byte 96. Declared in both configurations, since the
+    // fields that follow them must land at the same offset either way.
+    float2 bindlessPadding;
 #ifdef SGE_BINDLESS_MATERIALS
     uint4 bindlessTextureIndices;
+#else
+    uint4 bindlessTextureUnused;
 #endif
+    float3 emissiveFactor;   // tint/intensity for emissiveMap
+    float emissivePadding;
 };
 
 struct PointLightData {
@@ -165,6 +174,14 @@ Texture2DArray metalRoughMap : register(t5);
 Texture2D normalMap : register(t4);
 Texture2D metalRoughMap : register(t5);
 #endif
+// Authored emissive markings (optic reticles, panel legends, beacon lenses).
+// Plain 2D in every configuration: the terrain array path has no emissive maps,
+// and the materials that do carry one are ordinary imported meshes.
+//
+// t22 because t0-t21 are fully taken -- several by root SRVs that live in the
+// root signature rather than being declared in this file, so the free-looking
+// gaps here are not actually free. See matSrvRanges[3] in ShaderDX12.h.
+Texture2D emissiveMap : register(t22);
 Texture2DArray<float> shadowMap : register(t0);
 Texture2D<float4> environmentMap : register(t15);
 Texture2D<float2> brdfIntegrationLUT : register(t16);
@@ -698,13 +715,17 @@ float4 main(PS_INPUT input) : SV_TARGET
         NonUniformResourceIndex(bindlessTextureIndices.y)];
     Texture2D<float4> bindlessMetalRoughMap = ResourceDescriptorHeap[
         NonUniformResourceIndex(bindlessTextureIndices.z)];
+    Texture2D<float4> bindlessEmissiveMap = ResourceDescriptorHeap[
+        NonUniformResourceIndex(bindlessTextureIndices.w)];
 #define SGE_MATERIAL_ALBEDO bindlessAlbedoMap
 #define SGE_MATERIAL_NORMAL bindlessNormalMap
 #define SGE_MATERIAL_METAL_ROUGH bindlessMetalRoughMap
+#define SGE_MATERIAL_EMISSIVE bindlessEmissiveMap
 #else
 #define SGE_MATERIAL_ALBEDO albedoMap
 #define SGE_MATERIAL_NORMAL normalMap
 #define SGE_MATERIAL_METAL_ROUGH metalRoughMap
+#define SGE_MATERIAL_EMISSIVE emissiveMap
 #endif
     // Solid unlit emissive geometry. Additive PSO turns opacity into glow weight.
     if (smokeMode > 1.5) {
@@ -737,8 +758,10 @@ float4 main(PS_INPUT input) : SV_TARGET
     float3 viewDir = normalize(viewPos - input.fragPos);
     // Mode 1 only. Mode 3 (hard-surface cutout) must not pick up the leaf
     // edge-colour bleed or the dark-texel green lift.
+    const bool isAlphaBlended = alphaCut < -0.5;
     const bool isFoliage = alphaCut > 0.5 && alphaCut < 1.5;
     float foliageCoverage = 1.0;
+    float materialTextureAlpha = 1.0;
 
     // Sample textures
     float3 albedo = objectColor;
@@ -750,6 +773,7 @@ float4 main(PS_INPUT input) : SV_TARGET
 #else
     if (useTexture > 0.5) {
         float4 texColor = SGE_MATERIAL_ALBEDO.Sample(texSampler, input.texCoord);
+        materialTextureAlpha = texColor.a;
         // Alpha cutout for foliage cards (palm fronds), opt-in per material.
         // clip() disables early-Z for the draw, which is expensive scene-wide --
         // an unconditional clip here once pushed heavy-overdraw frames past the
@@ -764,7 +788,7 @@ float4 main(PS_INPUT input) : SV_TARGET
         // their nearly transparent connecting pixels. Hard-surface cutouts
         // (mode 3) clip at the threshold the asset authored instead, so
         // chain-link wire stays crisp rather than haloed by mip-blurred alpha.
-        else if (alphaCut > 0.5) clip(texColor.a - alphaCutoff);
+        else if (alphaCut > 0.5) clip(texColor.a * opacity - alphaCutoff);
         if (isFoliage) {
             foliageCoverage = texColor.a;
             uint texWidth, texHeight, texLevels;
@@ -805,6 +829,12 @@ float4 main(PS_INPUT input) : SV_TARGET
             // fixed bright green that overrides the grass-matching controls.
             albedo = lerp(albedo, objectColor * 0.72, dark * 0.72);
         }
+    }
+    else if ((alphaCut > 0.5 && alphaCut < 1.5) || alphaCut > 2.5) {
+        // A MASK material may be authored with factor alpha alone. Textureless
+        // masks still apply the same factor-times-texture rule with texture
+        // alpha implicitly equal to one.
+        clip(opacity - alphaCutoff);
     }
 #endif
     if (isFoliage) {
@@ -929,7 +959,11 @@ float4 main(PS_INPUT input) : SV_TARGET
     const bool isWater = materialType > 0.5 && materialType < 2.5;
     const bool isOcean = materialType > 1.5 && materialType < 2.5;
     float waterFoam = 0.0;
-    float surfaceOpacity = opacity;
+    // glTF BLEND coverage is the product of baseColorFactor alpha and the
+    // sampled base-colour alpha. OPAQUE textures may carry incidental alpha,
+    // so only the explicit blend mode consumes it.
+    float surfaceOpacity = opacity *
+        (isAlphaBlended ? materialTextureAlpha : 1.0);
     if (isWater) {
         // Directional, animated capillary waves add detail below the CPU mesh
         // scale. Four incommensurate directions avoid a stationary cross-hatch.
@@ -1139,11 +1173,24 @@ float4 main(PS_INPUT input) : SV_TARGET
               ambientOcclusion * surfaceSpecularScale *
               ambientLightingIntensity;
 
+    // Authored emissive markings. Added after lighting so they keep their shape
+    // in shadow and at night, but before tone mapping so they sit on the same
+    // curve as everything else rather than clipping flat.
+    if (useEmissiveMap > 0.5) {
+        float4 emissiveSample = SGE_MATERIAL_EMISSIVE.Sample(
+            texSampler, input.texCoord);
+        result += emissiveSample.rgb * emissiveFactor;
+        // A blended surface would otherwise fade its own markings out with the
+        // glass they sit on: the emissive is light leaving the lens, not part of
+        // what is being seen through it.
+        surfaceOpacity = saturate(
+            surfaceOpacity + dot(emissiveSample.rgb, float3(0.299, 0.587, 0.114)) *
+            emissiveSample.a);
+    }
+
     // AgX (Punchy) tone mapping; returns display-encoded sRGB.
     result = FinalizeOutput(result);
     RETURN_COLOR(result, surfaceOpacity);
 }
-
-
 
 

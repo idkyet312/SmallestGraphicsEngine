@@ -461,16 +461,18 @@ std::shared_ptr<SceneNode> CookedAssetLoader::Load(
             (source.flags & Cooked::AlphaCutout) != 0;
         material->alphaBlend =
             (source.flags & Cooked::AlphaBlend) != 0;
+        // Old cooked caches can contain a sub-one factor on an OPAQUE glTF
+        // material. Apply the same normalization as the live importer.
+        if (!material->alphaCutout && !material->alphaBlend)
+            material->baseColorFactor.w = 1.0f;
         // Caches cooked before alphaCutoff existed store zero; fall back to the
         // glTF default rather than clipping everything away.
         material->alphaCutoff =
             source.alphaCutoff > 0.0f ? source.alphaCutoff : 0.5f;
-        // Cooked cutouts are foliage in every shipped asset (palm, fern,
-        // dandelion), and the 0.20 clip plus the edge-bleed and dark-texel lift
-        // were tuned against them. Keep that path until a cooked hard-surface
-        // cutout needs otherwise.
-        material->foliageShading = material->alphaCutout;
-        if (material->foliageShading) material->alphaCutoff = 0.20f;
+        // Foliage is an engine shading choice, not a glTF MASK semantic. Palm
+        // and procedural foliage opt in where their materials are prepared;
+        // cooked hard-surface masks retain the threshold authored in the asset.
+        material->foliageShading = false;
         if (source.baseColorTexture < textures.size())
             material->baseColorTexture = textures[source.baseColorTexture];
         if (source.normalTexture < textures.size())

@@ -111,7 +111,7 @@ struct alignas(256) ObjectBufferDX12 {
     float metalRoughMode;  // 0=none, 1=glTF packed, 2=roughness-only
     float opacity;
     float smokeMode = 0.0f; // > 0.5: unlit soft sprite (alpha = opacity*texAlpha)
-    float alphaCut = 0.0f;  // 1: foliage cutout, 2: luminance (hair), 3: hard-surface cutout
+    float alphaCut = 0.0f;  // -1: alpha blend, 1: foliage, 2: luminance, 3: hard cutout
     // Clip threshold for alphaCut modes 1 and 3.
     float alphaCutoff = 0.20f;
     float ambientScale = 1.0f;
@@ -125,18 +125,30 @@ struct alignas(256) ObjectBufferDX12 {
     float specularScale = 1.0f;
     float materialType = 0.0f; // 0=ordinary, 1=pool water, 2=ocean
     float materialTime = 0.0f; // animated procedural materials
+    // > 0.5: add emissiveMap * emissiveFactor after lighting. Takes one of the
+    // three padding floats that filled the gap below, so the uint4 that follows
+    // keeps its byte-96 start.
+    float useEmissiveMap = 0.0f;
     // HLSL starts uint4 values on a fresh 16-byte cbuffer register. Adding
     // alphaCutoff moved materialTime to byte 80, so the bindless indices now
     // begin at byte 96 rather than immediately after it.
-    float bindlessPadding[3] = {};
+    float bindlessPadding[2] = {};
     UINT bindlessTextureIndices[4] = {
         BINDLESS_FALLBACK_WHITE, BINDLESS_FALLBACK_NORMAL,
         BINDLESS_FALLBACK_METALROUGH, BINDLESS_FALLBACK_BLACK
     };
+    // Tint and intensity for the emissive map. After the uint4 rather than
+    // before it: only three floats were free ahead of byte 96, and splitting a
+    // float3 across the boundary would have shifted the indices the shader
+    // reads at a fixed offset.
+    XMFLOAT3 emissiveFactor = { 0.0f, 0.0f, 0.0f };
+    float emissivePadding = 0.0f;
 };
 
 static_assert(offsetof(ObjectBufferDX12, bindlessTextureIndices) == 96,
               "ObjectBufferDX12 must match the bindless HLSL cbuffer layout");
+static_assert(offsetof(ObjectBufferDX12, emissiveFactor) == 112,
+              "emissiveFactor must follow the bindless indices in the HLSL cbuffer");
 
 // A light in the punctual list. Spotlights ride the same array rather than a
 // buffer of their own: the flashlight is the only one, and a second cbuffer
@@ -336,6 +348,12 @@ public:
     }
 };
 
+// Descriptors in one material's SRV table: albedo (t1), normal (t4),
+// metal-rough (t5), emissive (t6), in that order. The reservation functions, the
+// root-signature range count and the SRV creation block all derive from this --
+// they must agree exactly, or materials sample each other's textures.
+inline constexpr UINT MATERIAL_SRV_COUNT = 4;
+
 // Maximum draw calls per frame (for per-object constant buffers). Must cover
 // every destruction chunk (the Voronoi house alone is ~360 pieces) plus scene
 // objects, projectiles and particles -- overflowing clamps draws to one shared
@@ -451,7 +469,7 @@ public:
     // bit identical each time. Now each material takes a slot here on its first
     // draw and reuses it forever.
     static constexpr UINT kPersistentSrvBegin = 64;
-    static constexpr UINT kPersistentSrvEnd   = 4096;   // room for ~1,344 materials
+    static constexpr UINT kPersistentSrvEnd   = 4096;   // room for ~1,008 materials
     UINT persistentSrvOffset = kPersistentSrvBegin;
 
     // Handles for descriptor slot `index` in the shared heap.
@@ -465,25 +483,28 @@ public:
         gpuHandle.ptr += (UINT64)index * descriptorSize;
     }
 
-    // Claim 3 consecutive PERSISTENT descriptors for a material. Returns ~0u when
-    // that region is full, in which case the caller falls back to the per-frame
-    // path and simply pays the old cost.
+    // Claim MATERIAL_SRV_COUNT consecutive PERSISTENT descriptors for a material.
+    // Returns ~0u when that region is full, in which case the caller falls back
+    // to the per-frame path and simply pays the old cost.
     UINT ReservePersistentMaterialSrvs() {
-        if (persistentSrvOffset + 3 > kPersistentSrvEnd) return ~0u;
+        if (persistentSrvOffset + MATERIAL_SRV_COUNT > kPersistentSrvEnd)
+            return ~0u;
         const UINT slot = persistentSrvOffset;
-        persistentSrvOffset += 3;
+        persistentSrvOffset += MATERIAL_SRV_COUNT;
         return slot;
     }
 
-    // Reserve 3 consecutive material descriptors (albedo/normal/metal-rough) from
-    // the per-frame scratch region. Returns false when the frame has used them all
-    // -- writing past the heap corrupts unrelated allocations (it used to clobber
-    // ImGui's font descriptor, making the UI vanish once enough smoke was alive).
+    // Reserve one material's descriptors (albedo/normal/metal-rough/emissive)
+    // from the per-frame scratch region. Returns false when the frame has used
+    // them all -- writing past the heap corrupts unrelated allocations (it used
+    // to clobber ImGui's font descriptor, making the UI vanish once enough smoke
+    // was alive).
     bool ReserveMaterialSrvs(D3D12_CPU_DESCRIPTOR_HANDLE& cpuHandle,
                              D3D12_GPU_DESCRIPTOR_HANDLE& gpuHandle) {
-        if (currentSrvOffset + 3 > CBV_SRV_UAV_HEAP_SIZE) return false;
+        if (currentSrvOffset + MATERIAL_SRV_COUNT > CBV_SRV_UAV_HEAP_SIZE)
+            return false;
         SrvHandlesAt(currentSrvOffset, cpuHandle, gpuHandle);
-        currentSrvOffset += 3;
+        currentSrvOffset += MATERIAL_SRV_COUNT;
         return true;
     }
 
@@ -687,7 +708,7 @@ public:
         rootParams[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         // SRV descriptor table for material textures
-        D3D12_DESCRIPTOR_RANGE matSrvRanges[3] = {};
+        D3D12_DESCRIPTOR_RANGE matSrvRanges[MATERIAL_SRV_COUNT] = {};
         // t1 - Albedo
         matSrvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         matSrvRanges[0].NumDescriptors = 1;
@@ -706,9 +727,22 @@ public:
         matSrvRanges[2].BaseShaderRegister = 5;
         matSrvRanges[2].RegisterSpace = 0;
         matSrvRanges[2].OffsetInDescriptorsFromTableStart = 2;
-        
+        // t22 - Emissive. Appended last so no existing table offset moves.
+        //
+        // t22 rather than the next number after t5: this signature already fills
+        // t0-t21 with no gaps, and several of those are ROOT SRVs declared here
+        // rather than textures declared in the pixel shader (t6/t7/t8 are
+        // rootParams[9]/[10]/[11]). Reading only the shader's own register
+        // declarations makes t6 look free; it is not, and binding here collides
+        // at D3D12SerializeRootSignature, which fails every shader at boot.
+        matSrvRanges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        matSrvRanges[3].NumDescriptors = 1;
+        matSrvRanges[3].BaseShaderRegister = 22;
+        matSrvRanges[3].RegisterSpace = 0;
+        matSrvRanges[3].OffsetInDescriptorsFromTableStart = 3;
+
         rootParams[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rootParams[7].DescriptorTable.NumDescriptorRanges = 3;
+        rootParams[7].DescriptorTable.NumDescriptorRanges = _countof(matSrvRanges);
         rootParams[7].DescriptorTable.pDescriptorRanges = matSrvRanges;
         rootParams[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
@@ -1865,7 +1899,9 @@ public:
         // else alpha-tested is mode 3 and clips at its authored cutoff.
         const bool foliageShading = !cacheOwner || cacheOwner->foliageShading;
         data.alphaCut = alphaFromLuminance ? 2.0f
-                        : (alphaCut ? (foliageShading ? 1.0f : 3.0f) : 0.0f);
+                        : (alphaCut ? (foliageShading ? 1.0f : 3.0f)
+                                    : (cacheOwner && cacheOwner->alphaBlend
+                                        ? -1.0f : 0.0f));
         data.alphaCutoff = cacheOwner ? cacheOwner->alphaCutoff : 0.20f;
         data.ambientScale = ambientScale;
         data.occlusionStrength = occlusionStrength;
@@ -1878,6 +1914,21 @@ public:
             const D3D12_RESOURCE_DESC nd = normal->GetDesc();
             data.normalTexW = (float)nd.Width;
             data.normalTexH = (float)nd.Height;
+        }
+
+        // Emissive comes off the material rather than the argument list -- this
+        // signature already carries twenty parameters, and every caller that
+        // could supply one already passes a cacheOwner.
+        ID3D12Resource* const emissive =
+            cacheOwner ? cacheOwner->emissiveTexture.Get() : nullptr;
+        if (emissive) {
+            data.useEmissiveMap = 1.0f;
+            // glTF leaves emissiveFactor at black when a model ships an emissive
+            // map but no factor. Treat that as "show the map as authored"
+            // instead of multiplying it away to nothing.
+            const XMFLOAT3& e = cacheOwner->emissiveFactor;
+            const bool factorSet = e.x > 0.0f || e.y > 0.0f || e.z > 0.0f;
+            data.emissiveFactor = factorSet ? e : XMFLOAT3(1.0f, 1.0f, 1.0f);
         }
 
         const bool allowBindless = cacheOwner && !forceLegacyNextMaterial;
@@ -1898,11 +1949,17 @@ public:
                     bindlessHeap->RegisterTexture(
                         cacheOwner->metallicRoughnessTexture.Get(),
                         BINDLESS_FALLBACK_METALROUGH);
+                // Black is the additive no-op, so a material without an emissive
+                // map resolves to adding nothing.
+                cacheOwner->bindlessEmissiveIndex =
+                    bindlessHeap->RegisterTexture(
+                        cacheOwner->emissiveTexture.Get(),
+                        BINDLESS_FALLBACK_BLACK);
             }
             data.bindlessTextureIndices[0] = cacheOwner->bindlessAlbedoIndex;
             data.bindlessTextureIndices[1] = cacheOwner->bindlessNormalIndex;
             data.bindlessTextureIndices[2] = cacheOwner->bindlessMetalRoughIndex;
-            data.bindlessTextureIndices[3] = BINDLESS_FALLBACK_BLACK;
+            data.bindlessTextureIndices[3] = cacheOwner->bindlessEmissiveIndex;
         }
 
         ActivateMaterialBinding(allowBindless);
@@ -1912,8 +1969,10 @@ public:
 
         if (currentDrawBindless) return;
 
-        // Textures
-        if (useTex || useNorm) {
+        // Textures. Emissive joins the gate: a material carrying only an
+        // emissive map still needs its table bound, or the reticle-style
+        // markings that motivated it would never be sampled.
+        if (useTex || useNorm || emissive) {
              UINT descriptorSize = g_dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
              D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
@@ -1928,7 +1987,7 @@ public:
                  ++srvCacheHitsThisFrame;
                  return;
              }
-             srvCreatesThisFrame += 3;
+             srvCreatesThisFrame += MATERIAL_SRV_COUNT;
 
              if (cacheOwner) {
                  // First draw of this material: claim a permanent slot and build its
@@ -1980,7 +2039,21 @@ public:
                  nullDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
                  g_dx12.device->CreateShaderResourceView(nullptr, &nullDesc, cpuHandle);
              }
-             
+             cpuHandle.ptr += descriptorSize;
+
+             // Emissive (t6). Almost every material leaves this null; the shader
+             // gates on useEmissiveMap, so the descriptor is only ever sampled
+             // when one was actually bound.
+             if (emissive) {
+                 g_dx12.device->CreateShaderResourceView(emissive, nullptr, cpuHandle);
+             } else {
+                 D3D12_SHADER_RESOURCE_VIEW_DESC nullDesc = {};
+                 nullDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                 nullDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                 nullDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                 g_dx12.device->CreateShaderResourceView(nullptr, &nullDesc, cpuHandle);
+             }
+
              // Bind table
              g_dx12.commandList->SetGraphicsRootDescriptorTable(7, gpuHandle);
         }

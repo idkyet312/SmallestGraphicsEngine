@@ -321,6 +321,14 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
                 !std::isfinite(prefab.destructible.health))
                 throw std::runtime_error("destructible.health must be positive");
         }
+        if (components.contains("rigidBody")) {
+            prefab.rigidBody.enabled = true;
+            prefab.rigidBody.density = components.at("rigidBody").value(
+                "density", 64.0f);
+            if (prefab.rigidBody.density <= 0.0f ||
+                !std::isfinite(prefab.rigidBody.density))
+                throw std::runtime_error("rigidBody.density must be positive");
+        }
         if (components.contains("spawner")) {
             const json& spawner = components.at("spawner");
             prefab.spawner.enabled = true;
@@ -385,6 +393,7 @@ const std::vector<PrefabPropertyDescriptor>& PrefabPropertyMetadata() {
         {"audio", "loop", PrefabPropertyType::Boolean},
         {"audio", "radius", PrefabPropertyType::Number, 0.01f, 10000.0f},
         {"destructible", "health", PrefabPropertyType::Number, 0.01f, 1000000.0f},
+        {"rigidBody", "density", PrefabPropertyType::Number, 0.01f, 100000.0f},
         {"spawner", "enemyType", PrefabPropertyType::String},
         {"spawner", "count", PrefabPropertyType::Integer, 1.0f, 1024.0f}
     };
@@ -520,6 +529,8 @@ bool PrefabRegistry::Refresh(const std::filesystem::path& prefabRoot,
             if (local.components.contains("audio")) merged.audio = local.audio;
             if (local.components.contains("destructible"))
                 merged.destructible = local.destructible;
+            if (local.components.contains("rigidBody"))
+                merged.rigidBody = local.rigidBody;
             if (local.components.contains("spawner")) merged.spawner = local.spawner;
             if (local.components.contains("script"))
                 merged.scriptPath = local.scriptPath;
@@ -726,6 +737,12 @@ PrefabSaveResult PrefabRegistry::Save(const PrefabAsset& prefab,
             destructible["health"] = prefab.destructible.health;
         }
         else components.erase("destructible");
+        if (prefab.rigidBody.enabled) {
+            json& rigidBody = components["rigidBody"];
+            if (!rigidBody.is_object()) rigidBody = json::object();
+            rigidBody["density"] = prefab.rigidBody.density;
+        }
+        else components.erase("rigidBody");
         if (prefab.spawner.enabled) {
             json& spawner = components["spawner"];
             if (!spawner.is_object()) spawner = json::object();

@@ -107,6 +107,7 @@ uint32_t StableDestructionTriangleID(uint32_t ownerNamespace,
     return hash != 0u ? hash : 1u;
 }
 constexpr uint64_t CollisionCategoryGrenade = PhysicsImpactPolicy::Grenade;
+constexpr uint64_t CollisionCategoryProp = PhysicsImpactPolicy::Prop;
 // Uniform starting health for every bond/chunk. A bullet's per-hit damage is a
 // fraction of this, so a joint takes several hits before it lets go.
 constexpr float kBondHealth = 1.0f;
@@ -479,6 +480,11 @@ struct DestructionDX12::Impl {
         b3BodyId body = b3_nullBodyId;
     };
 
+    struct PropRuntime {
+        uint32_t handle = 0;
+        b3BodyId body = b3_nullBodyId;
+    };
+
     struct GrenadeRuntime {
         uint32_t handle = 0;
         b3BodyId body = b3_nullBodyId;
@@ -542,6 +548,8 @@ struct DestructionDX12::Impl {
     std::vector<BarrelRuntime> barrelBodies;
     std::vector<uint32_t> barrelImpactEvents;
     uint32_t nextBarrelHandle = 1;
+    std::vector<PropRuntime> propBodies;
+    uint32_t nextPropHandle = 1;
     std::vector<GrenadeRuntime> grenadeBodies;
     std::vector<uint32_t> grenadeContactEvents;
     uint32_t nextGrenadeHandle = 1;
@@ -3817,6 +3825,7 @@ void DestructionDX12::Shutdown() {
     m->batchCache.clear(); m->spatialBatchCache.clear(); m->ragdollParts.clear();
     m->barrelBodies.clear(); m->barrelImpactEvents.clear(); m->vortices.clear();
     m->grenadeBodies.clear(); m->grenadeContactEvents.clear();
+    m->propBodies.clear();
     m->burningChunks.clear(); m->harpoonRagdolls.clear();
     m->pinnedHarpoonRagdolls.clear();
     for (UINT slot = 0; slot < FRAME_COUNT; ++slot)
@@ -5243,6 +5252,99 @@ std::vector<uint32_t> DestructionDX12::DrainExplosiveBarrelImpactEvents() {
     std::vector<uint32_t> events;
     events.swap(m->barrelImpactEvents);
     return events;
+}
+
+// A prefab prop simulated as a rigid body. The hull is the placement's own
+// measured half extents, so the simulated box is the same box the static
+// collider used and the prop does not change size the moment it wakes up.
+//
+// Yaw only, matching PrefabCollider: prefab placements are authored upright and
+// rotated about Y, and the collider they replace stores a single yaw. The body
+// is free to tumble on every axis once it is moving -- that restriction is on
+// the spawn pose, not the simulation.
+uint32_t DestructionDX12::CreatePropBody(
+    const XMFLOAT3& worldPosition, const XMFLOAT3& halfExtents,
+    float yawRadians, float density) {
+    if (!m || !m->initialized || B3_IS_NULL(m->world)) return 0;
+    // A degenerate hull would make Box3D's inertia tensor non-finite and take
+    // the whole solver down with it, so a bad placement declines the body and
+    // keeps its static collider instead of spawning a broken one.
+    const float halfX = halfExtents.x, halfY = halfExtents.y,
+                halfZ = halfExtents.z;
+    if (!(halfX > 1e-3f) || !(halfY > 1e-3f) || !(halfZ > 1e-3f) ||
+        !std::isfinite(halfX) || !std::isfinite(halfY) ||
+        !std::isfinite(halfZ) || !(density > 0.0f) || !std::isfinite(density))
+        return 0;
+
+    b3BodyDef bodyDef = b3DefaultBodyDef();
+    bodyDef.type = b3_dynamicBody;
+    bodyDef.position = { worldPosition.x, worldPosition.y, worldPosition.z };
+    const float halfYaw = yawRadians * 0.5f;
+    bodyDef.rotation = { { 0.0f, std::sin(halfYaw), 0.0f }, std::cos(halfYaw) };
+    bodyDef.linearDamping = 0.10f;
+    bodyDef.angularDamping = 0.25f;
+    // A container is heavy and squat: left undamped it skates on contact
+    // jitter. Sleeping is what keeps a yard of them off the solver entirely
+    // until something actually hits one.
+    bodyDef.sleepThreshold = 0.12f;
+    bodyDef.allowFastRotation = true;
+    const b3BodyId body = b3CreateBody(m->world, &bodyDef);
+
+    b3ShapeDef shapeDef = b3DefaultShapeDef();
+    shapeDef.density = density;
+    shapeDef.baseMaterial.friction = 0.72f;
+    shapeDef.baseMaterial.restitution = 0.02f;
+    shapeDef.enableHitEvents = true;
+    shapeDef.filter.categoryBits = CollisionCategoryProp;
+    shapeDef.filter.maskBits = B3_DEFAULT_MASK_BITS;
+    b3BoxHull hull = b3MakeBoxHull(halfX, halfY, halfZ);
+    b3CreateHullShape(body, &shapeDef, &hull.base);
+
+    uint32_t handle = m->nextPropHandle++;
+    if (handle == 0) handle = m->nextPropHandle++;
+    m->propBodies.push_back({ handle, body });
+    return handle;
+}
+
+bool DestructionDX12::GetPropBodyPose(
+    uint32_t handle, DestructionBodyPose& pose) const {
+    if (!m || handle == 0) return false;
+    const auto it = std::find_if(
+        m->propBodies.begin(), m->propBodies.end(),
+        [handle](const Impl::PropRuntime& prop) {
+            return prop.handle == handle;
+        });
+    if (it == m->propBodies.end() || B3_IS_NULL(it->body)) return false;
+    const b3Pos p = b3Body_GetPosition(it->body);
+    const b3Quat q = b3Body_GetRotation(it->body);
+    const b3Vec3 v = b3Body_GetLinearVelocity(it->body);
+    pose.position = { (float)p.x, (float)p.y, (float)p.z };
+    pose.rotation = { q.v.x, q.v.y, q.v.z, q.s };
+    pose.linearVelocity = { v.x, v.y, v.z };
+    return true;
+}
+
+bool DestructionDX12::IsPropBodyAwake(uint32_t handle) const {
+    if (!m || handle == 0) return false;
+    const auto it = std::find_if(
+        m->propBodies.begin(), m->propBodies.end(),
+        [handle](const Impl::PropRuntime& prop) {
+            return prop.handle == handle;
+        });
+    if (it == m->propBodies.end() || B3_IS_NULL(it->body)) return false;
+    return b3Body_IsAwake(it->body);
+}
+
+void DestructionDX12::DestroyPropBody(uint32_t handle) {
+    if (!m || handle == 0) return;
+    const auto it = std::find_if(
+        m->propBodies.begin(), m->propBodies.end(),
+        [handle](const Impl::PropRuntime& prop) {
+            return prop.handle == handle;
+        });
+    if (it == m->propBodies.end()) return;
+    if (!B3_IS_NULL(it->body)) b3DestroyBody(it->body);
+    m->propBodies.erase(it);
 }
 
 uint32_t DestructionDX12::CreateGrenadeBody(

@@ -9,6 +9,7 @@ cbuffer MatrixBuffer : register(b0) {
 
 struct VS_INPUT {
     float3 position : POSITION;
+    float2 uv : TEXCOORD0;
 };
 
 cbuffer SkinningBuffer : register(b1) { uint skinningEnabled; };
@@ -25,6 +26,7 @@ StructuredBuffer<MeshInstanceData> meshInstances : register(t14);
 
 struct VS_OUTPUT {
     float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
 };
 
 VS_OUTPUT main(VS_INPUT input, uint vertexID : SV_VertexID,
@@ -45,6 +47,7 @@ VS_OUTPUT main(VS_INPUT input, uint vertexID : SV_VertexID,
         ? meshInstances[instanceID].model : model;
     float4 worldPos = mul(float4(position, 1.0), drawModel);
     output.position = mul(worldPos, lightSpaceMatrix);
+    output.uv = input.uv;
     
     return output;
 }

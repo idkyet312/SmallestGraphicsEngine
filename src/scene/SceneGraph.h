@@ -71,7 +71,10 @@ struct SceneMaterial {
     bool alphaFromLuminance = false;
 
     bool IsTransparent() const {
-        return alphaBlend || baseColorFactor.w < 0.999f;
+        // MASK coverage is resolved by clip() and still writes depth like an
+        // opaque surface. Legacy hand-authored materials without an explicit
+        // alpha mode retain factor-driven blending.
+        return alphaBlend || (!alphaCutout && baseColorFactor.w < 0.999f);
     }
     float ambientScale = 1.0f;
     float occlusionStrength = 0.0f;
@@ -82,10 +85,16 @@ struct SceneMaterial {
     ComPtr<ID3D12Resource> metallicRoughnessTexture;
     bool roughnessOnlyTexture = false;
     ComPtr<ID3D12Resource> normalTexture;
+    // glTF emissiveTexture, modulated by emissiveFactor above. Added to the lit
+    // result rather than multiplied into it, so authored markings -- reticles,
+    // panel legends, beacon lenses -- keep their shape in shadow. Absent on
+    // almost every material, which samples as black and costs nothing.
+    ComPtr<ID3D12Resource> emissiveTexture;
 
-    // Where this material's three texture descriptors (albedo/normal/metal-rough)
-    // live in the persistent region of the shared CBV/SRV/UAV heap. They are
-    // created the first time the material is drawn and then reused forever -- a
+    // Where this material's four texture descriptors (albedo/normal/metal-rough/
+    // emissive) live in the persistent region of the shared CBV/SRV/UAV heap.
+    // They are created the first time the material is drawn and then reused
+    // forever -- a
     // material's textures never change after load, so recreating the descriptors
     // every draw was pure waste (~1,764 CreateShaderResourceView calls a frame
     // just for the destructible house's chunks). ~0u means "not cached yet".
@@ -94,8 +103,8 @@ struct SceneMaterial {
 
     // Bindless tier: absolute indices into the separate bindless descriptor
     // heap, valid only while bindlessGeneration matches the allocator's current
-    // generation. Unlike srvHeapSlot these are three independent indices, not a
-    // 3-descriptor table base, because the bindless heap deduplicates on the
+    // generation. Unlike srvHeapSlot these are four independent indices, not a
+    // 4-descriptor table base, because the bindless heap deduplicates on the
     // texture resource -- two materials sharing an albedo share its descriptor.
     //
     // Generation-stamped rather than cleared on scene teardown: a material can
@@ -104,6 +113,7 @@ struct SceneMaterial {
     UINT bindlessAlbedoIndex = ~0u;
     UINT bindlessNormalIndex = ~0u;
     UINT bindlessMetalRoughIndex = ~0u;
+    UINT bindlessEmissiveIndex = ~0u;
     UINT bindlessGeneration = 0;
 
     // Drop every cached texture binding, legacy and bindless alike. Texture
@@ -115,6 +125,7 @@ struct SceneMaterial {
         bindlessAlbedoIndex = ~0u;
         bindlessNormalIndex = ~0u;
         bindlessMetalRoughIndex = ~0u;
+        bindlessEmissiveIndex = ~0u;
         bindlessGeneration = 0;
     }
 

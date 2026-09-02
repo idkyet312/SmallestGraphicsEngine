@@ -1,6 +1,8 @@
 #ifndef PLAYER_STATE_H
 #define PLAYER_STATE_H
 
+#include "WeaponCustomization.h"
+
 struct PlayerState {
     float maxHealth = 100.0f;
     float health = 100.0f;
@@ -37,46 +39,72 @@ struct PlayerState {
         return regenDuration > 0.0f ? maxHealth / regenDuration : maxHealth;
     }
 
-    // Slot 8 is the suppressed SVD. It carries less than the standard rifle --
-    // 5-round magazines and a thin reserve -- because the quiet is the weapon's
-    // advantage and it should not also out-supply the loud one.
-    static constexpr int kWeaponSlots = 9;
-    int magazineSize[kWeaponSlots] = { 30, 8, 1, 10, 120, 6, 100, 1, 5 };
-    int maxReserve[kWeaponSlots] = { 240, 64, 8, 80, 600, 24, 500, 24, 40 };
-    float reloadTime[kWeaponSlots] = { 1.55f, 2.4f, 2.8f, 1.75f, 2.1f, 1.8f, 2.6f, 1.35f, 2.05f };
-    int magazine[kWeaponSlots] = { 30, 8, 1, 10, 120, 6, 100, 1, 5 };
-    int reserve[kWeaponSlots] = { 120, 32, 4, 40, 360, 12, 300, 12, 20 };
+    static constexpr int kWeaponSlots = SGE::WeaponCustomizationSystem::kWeaponCount;
+    // The instance is now the one source of truth for both ammo and installed
+    // parts. A dropped weapon can therefore carry its exact configuration,
+    // instead of rebuilding attachments from the selected weapon ID.
+    SGE::WeaponCustomizationSystem weapons;
     float reloadTimer = 0.0f;
     int reloadingSlot = -1;
 
     bool AmmoEnforced() const { return !godMode; }
     bool Reloading() const { return reloadTimer > 0.0f; }
 
+    SGE::WeaponInstance* Weapon(int slot) { return weapons.Instance(slot); }
+    const SGE::WeaponInstance* Weapon(int slot) const {
+        return weapons.Instance(slot);
+    }
+    SGE::ResolvedWeaponStats ResolveWeaponStats(int slot) const {
+        return weapons.Resolve(slot);
+    }
+    int Magazine(int slot) const {
+        const SGE::WeaponInstance* instance = Weapon(slot);
+        return instance ? instance->magazine : 0;
+    }
+    int Reserve(int slot) const {
+        const SGE::WeaponInstance* instance = Weapon(slot);
+        return instance ? instance->reserve : 0;
+    }
+    int MagazineSize(int slot) const {
+        return ResolveWeaponStats(slot).magazineCapacity;
+    }
+    int MaxReserve(int slot) const {
+        return ResolveWeaponStats(slot).maximumReserve;
+    }
+    float ReloadTime(int slot) const {
+        return ResolveWeaponStats(slot).reloadSeconds;
+    }
+    bool SetAmmo(int slot, int magazine, int reserve) {
+        SGE::WeaponInstance* instance = Weapon(slot);
+        if (!instance) return false;
+        const SGE::ResolvedWeaponStats stats = ResolveWeaponStats(slot);
+        instance->magazine = std::clamp(magazine, 0, stats.magazineCapacity);
+        instance->reserve = std::clamp(reserve, 0, stats.maximumReserve);
+        return true;
+    }
+
     void RestoreAmmo() {
-        for (int i = 0; i < kWeaponSlots; ++i) {
-            magazine[i] = magazineSize[i];
-            reserve[i] = maxReserve[i];
-        }
+        weapons.RestoreAmmo();
         reloadTimer = 0.0f;
         reloadingSlot = -1;
     }
 
     void HalveAmmo() {
-        for (int i = 0; i < kWeaponSlots; ++i) {
-            magazine[i] /= 2;
-            reserve[i] /= 2;
-        }
+        weapons.HalveAmmo();
         reloadTimer = 0.0f;
         reloadingSlot = -1;
     }
 
     bool BeginReload(int slot) {
         if (!AmmoEnforced() || Reloading()) return false;
-        if (slot < 0 || slot >= kWeaponSlots) return false;
-        if (magazine[slot] >= magazineSize[slot] || reserve[slot] <= 0)
+        SGE::WeaponInstance* instance = Weapon(slot);
+        if (!instance) return false;
+        const SGE::ResolvedWeaponStats stats = ResolveWeaponStats(slot);
+        if (instance->magazine >= stats.magazineCapacity ||
+            instance->reserve <= 0)
             return false;
         reloadingSlot = slot;
-        reloadTimer = reloadTime[slot];
+        reloadTimer = stats.reloadSeconds;
         return true;
     }
 
@@ -87,18 +115,24 @@ struct PlayerState {
         reloadTimer = 0.0f;
         const int slot = reloadingSlot;
         reloadingSlot = -1;
-        if (slot < 0 || slot >= kWeaponSlots) return;
-        const int needed = magazineSize[slot] - magazine[slot];
-        const int moved = (needed < reserve[slot]) ? needed : reserve[slot];
-        magazine[slot] += moved;
-        reserve[slot] -= moved;
+        SGE::WeaponInstance* instance = Weapon(slot);
+        if (!instance) return;
+        const int needed = ResolveWeaponStats(slot).magazineCapacity -
+                           instance->magazine;
+        const int moved = (needed < instance->reserve) ?
+            needed : instance->reserve;
+        instance->magazine += moved;
+        instance->reserve -= moved;
     }
 
     bool ConsumeAmmo(int slot) {
         if (!AmmoEnforced()) return true;
-        if (slot < 0 || slot >= kWeaponSlots) return true;
-        if (Reloading() || magazine[slot] <= 0) return false;
-        --magazine[slot];
+        SGE::WeaponInstance* instance = Weapon(slot);
+        // Preserve the old invalid-slot behaviour: non-ammo utility actions
+        // outside the table are not blocked by the ammo system.
+        if (!instance) return true;
+        if (Reloading() || instance->magazine <= 0) return false;
+        --instance->magazine;
         return true;
     }
 };

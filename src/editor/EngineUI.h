@@ -24,6 +24,13 @@ extern RaytracingContext g_rt;
 extern ProfilerDX12 g_profiler;
 // Shift-sprint state for the HUD's sprint indicator. Owned by main.cpp.
 extern bool g_playerSprinting;
+// Sprint stamina for the HUD's sprint meter, all owned by main.cpp.
+// `g_staminaSeconds` counts sprint seconds remaining out of `kStaminaMaxSeconds`;
+// `g_staminaExhausted` is set when it empties and stays set until enough has
+// rebuilt to sprint again, which is what turns the meter red.
+extern float g_staminaSeconds;
+extern bool g_staminaExhausted;
+extern const float kStaminaMaxSecondsUI;
 // Wireframe overlay for the prefab volumes the player collides against.
 extern bool g_showCollisionDebug;
 extern UINT g_forwardDrawCalls;
@@ -571,6 +578,22 @@ inline void RenderPlayerHUD(const Scene& scene) {
             draw->AddLine(segment[0], segment[1], outline, 3.0f);
         for (const auto& segment : segments)
             draw->AddLine(segment[0], segment[1], reticle, 1.0f);
+
+        // The optic dot replaces the fading hip reticle as the rifle reaches
+        // the shoulder. It is projected at the point of aim so parallax from
+        // the decorative view-model sway cannot make the sight lie.
+        const SGE::ResolvedWeaponStats weaponStats =
+            scene.player.ResolveWeaponStats(GunModel::SelectedWeapon());
+        if (weaponStats.redDotSight && scene.adsBlend > 0.10f) {
+            const float fade = (std::min)(1.0f,
+                (scene.adsBlend - 0.10f) / 0.65f);
+            const int haloAlpha = static_cast<int>(70.0f * fade);
+            const int coreAlpha = static_cast<int>(245.0f * fade);
+            draw->AddCircleFilled(center, 3.6f,
+                IM_COL32(255, 25, 12, haloAlpha), 16);
+            draw->AddCircleFilled(center, 1.25f,
+                IM_COL32(255, 52, 28, coreAlpha), 12);
+        }
     }
 
     // Hit marker: four diagonal ticks forming an X over the crosshair. Drawn
@@ -833,23 +856,37 @@ inline void RenderPlayerHUD(const Scene& scene) {
             IM_COL32(238, 242, 236, 245), 2.5f);
     }
 
-    // Sprint row: a runner glyph and three segments under the health bar, lit
-    // while shift-sprint is actually moving the player.
+    // Sprint row: a runner glyph and one continuous stamina bar under the
+    // health bar.
     //
-    // There is no stamina system in this engine -- sprint is unlimited -- so
-    // these segments are a state light, not a meter. They are drawn as segments
-    // anyway because that is what the layout calls for, and if a stamina budget
-    // is ever added this is where it plugs in without moving anything.
+    // This was three segments, which read as a discrete "how many sprints do I
+    // have" gauge; stamina is a continuous budget, so one bar states that
+    // directly. It is kept visually distinct from the health bar above it by
+    // being shorter and thinner rather than by being split -- two full-width
+    // bars of the same weight would read as one control.
     {
         const float sprintY = barMax.y + 7.0f;
-        const bool sprinting = g_playerSprinting && scene.player.health > 0.0f;
+        const bool alive = scene.player.health > 0.0f;
+        const float staminaFraction = alive
+            ? (std::max)(0.0f, (std::min)(1.0f,
+                  g_staminaSeconds / (std::max)(0.01f, kStaminaMaxSecondsUI)))
+            : 0.0f;
+        const bool sprinting = g_playerSprinting && alive;
+        const bool spent = g_staminaExhausted && alive;
         const ImU32 litTint = IM_COL32(126, 186, 214, 235);
+        // Exhaustion is the one state worth colouring: the player has lost the
+        // ability to sprint and the breathing they can hear needs a matching
+        // visual, or it reads as an unexplained sound.
+        const ImU32 spentTint = IM_COL32(214, 108, 92, 235);
+        const ImU32 readyTint = IM_COL32(255, 255, 255, 96);
         const ImU32 dimTint = IM_COL32(255, 255, 255, 38);
+        const ImU32 fillTint = spent ? spentTint
+                             : (sprinting ? litTint : readyTint);
 
         // Small runner: head, torso, and two legs mid-stride.
         const float glyphX = barMin.x + 2.0f;
-        const ImU32 glyphTint = sprinting
-            ? litTint : IM_COL32(255, 255, 255, 70);
+        const ImU32 glyphTint = spent ? spentTint
+                              : (sprinting ? litTint : IM_COL32(255, 255, 255, 70));
         draw->AddCircleFilled(ImVec2(glyphX + 3.0f, sprintY + 1.0f), 2.0f,
                               glyphTint, 8);
         draw->AddLine(ImVec2(glyphX + 3.0f, sprintY + 3.5f),
@@ -859,16 +896,17 @@ inline void RenderPlayerHUD(const Scene& scene) {
         draw->AddLine(ImVec2(glyphX + 2.0f, sprintY + 8.0f),
                       ImVec2(glyphX - 2.0f, sprintY + 11.0f), glyphTint, 1.4f);
 
-        constexpr int kSegments = 3;
-        constexpr float kSegmentGap = 4.0f;
-        const float segmentsLeft = barMin.x + 20.0f;
-        const float segmentWidth =
-            (kBarWidth * 0.62f - kSegmentGap * (kSegments - 1)) / kSegments;
-        for (int i = 0; i < kSegments; ++i) {
-            const float segX = segmentsLeft + (segmentWidth + kSegmentGap) * i;
-            draw->AddRectFilled(ImVec2(segX, sprintY + 3.0f),
-                                ImVec2(segX + segmentWidth, sprintY + 6.0f),
-                                sprinting ? litTint : dimTint, 1.5f);
+        // Same left edge and overall width the three segments spanned, so the
+        // row keeps its place in the layout and nothing below it moves.
+        const float trackLeft = barMin.x + 20.0f;
+        const float trackWidth = kBarWidth * 0.62f;
+        const ImVec2 trackMin(trackLeft, sprintY + 3.0f);
+        const ImVec2 trackMax(trackLeft + trackWidth, sprintY + 6.0f);
+        draw->AddRectFilled(trackMin, trackMax, dimTint, 1.5f);
+        if (staminaFraction > 0.0f) {
+            draw->AddRectFilled(trackMin,
+                ImVec2(trackMin.x + trackWidth * staminaFraction, trackMax.y),
+                fillTint, 1.5f);
         }
     }
 
@@ -894,9 +932,9 @@ inline void RenderPlayerHUD(const Scene& scene) {
                       IM_COL32(226, 234, 238, 240), weaponName);
 
         if (scene.AmmoEnforced()) {
-            const int inMag = scene.player.magazine[slot];
-            const int spare = scene.player.reserve[slot];
-            const int magSize = (std::max)(1, scene.player.magazineSize[slot]);
+            const int inMag = scene.player.Magazine(slot);
+            const int spare = scene.player.Reserve(slot);
+            const int magSize = (std::max)(1, scene.player.MagazineSize(slot));
 
             ImU32 magTint = IM_COL32(240, 245, 247, 255);
             if (inMag == 0) magTint = IM_COL32(255, 70, 55, 255);
@@ -937,8 +975,8 @@ inline void RenderPlayerHUD(const Scene& scene) {
             // numbers themselves so the counts never disappear mid-reload.
             if (scene.Reloading()) {
                 const float reloadTotal = (std::max)(0.01f,
-                    scene.player.reloadTime[(std::max)(0,
-                        scene.player.reloadingSlot)]);
+                    scene.player.ReloadTime((std::max)(0,
+                        scene.player.reloadingSlot)));
                 const float progress = 1.0f - (std::max)(0.0f, (std::min)(1.0f,
                     scene.player.reloadTimer / reloadTotal));
                 const float ruleY = magY + magHeight + 1.0f;
@@ -2731,6 +2769,52 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // before it sits in the hands, not just sliding.
         ImGui::DragFloat3("Weapon Fit Rot",
                           &GunModel::PlayerFitRotation().x, 1.0f);
+
+        // Attachment placement. These are gun-local like the fit offsets above,
+        // not screen-relative: they walk the sight along the receiver rail, and
+        // are per weapon because each host mesh carries its rail at a different
+        // height. Shown only when an optic is actually fitted -- there is
+        // nothing on screen to move otherwise.
+        const SGE::ResolvedWeaponStats viewWeaponStats =
+            scene.player.ResolveWeaponStats(GunModel::SelectedWeapon());
+        if (viewWeaponStats.redDotSight) {
+            ImGui::SeparatorText("Red Dot Sight");
+            ImGui::SliderFloat("Sight X", &GunModel::PlayerOpticOffset().x,
+                               -0.30f, 0.30f, "%.3f");
+            ImGui::SliderFloat("Sight Y", &GunModel::PlayerOpticOffset().y,
+                               -0.20f, 0.50f, "%.3f");
+            ImGui::SliderFloat("Sight Z", &GunModel::PlayerOpticOffset().z,
+                               -1.00f, 1.00f, "%.3f");
+            ImGui::SliderFloat("Sight Scale", &GunModel::PlayerOpticScale(),
+                               0.10f, 4.00f, "%.2f");
+            ImGui::DragFloat3("Sight Rot", &GunModel::PlayerOpticRotation().x,
+                              1.0f, -180.0f, 180.0f, "%.1f deg");
+            // The emissive dot is placed apart from the sight body, so moving
+            // the mount leaves it behind until it is re-centred in the glass.
+            ImGui::SliderFloat3("Reticle Pos",
+                                &GunModel::PlayerReticleOffset().x,
+                                -1.00f, 1.00f, "%.3f");
+            // The tuned dot sits near the bottom of this range, so the floor is
+            // well below it -- a slider pinned at its own minimum cannot be
+            // taken any finer.
+            ImGui::SliderFloat("Reticle Size", &GunModel::ReticleSize(),
+                               0.0002f, 0.05f, "%.4f");
+            if (ImGui::Button("Reset Sight##optic")) {
+                GunModel::PlayerOpticOffset() =
+                    DirectX::XMFLOAT3(0.012f, 0.140f, 0.376f);
+                GunModel::PlayerOpticRotation() =
+                    DirectX::XMFLOAT3(0.0f, 0.0f, 0.0f);
+                GunModel::PlayerOpticScale() = 1.42f;
+                GunModel::PlayerReticleOffset() =
+                    DirectX::XMFLOAT3(0.0f, 0.182f, -0.600f);
+                GunModel::ReticleSize() = 0.001f;
+            }
+            ImGui::SameLine();
+            // The dot only lines up with the crosshair while aiming, so the
+            // alignment these sliders exist to fix is only visible in ADS.
+            ImGui::TextDisabled("hold RMB to check alignment");
+        }
+
         ImGui::Checkbox("Auto Fire", &scene.autoFire);
         ImGui::DragFloat("Fire Interval", &scene.fireInterval, 0.005f, 0.02f, 1.0f, "%.3f s");
 

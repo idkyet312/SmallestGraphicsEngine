@@ -94,6 +94,10 @@ struct LaserBeamFX {
 struct IRLaserFX {
     XMFLOAT3 start = {};
     XMFLOAT3 end = {};
+    // White for the existing IR/NVG designator; a visible rail laser writes
+    // red. Keeping colour on the effect lets both paths share one depth-aware
+    // world-space beam without adding another render pass.
+    XMFLOAT3 color = { 1.0f, 1.0f, 1.0f };
     // Goggle ramp, 0..1. Also the beam's opacity: an IR designator is only
     // visible through an intensifier, so this fades with the NVG blend.
     float visibility = 0.0f;
@@ -203,11 +207,9 @@ struct ExplosiveBarrel {
 struct WeaponPickup {
     XMFLOAT3 position = { 0.0f, 0.0f, 0.0f };
     float yawRadians = 0.0f;
-    int weapon = 2;             // GunModel weapon id; 2 = RPG-7
-    // Magazine + reserve handed over on collection. Independent of PlayerState's
-    // per-slot maxima so a pickup can be a partial resupply.
-    int magazine = 1;
-    int reserve = 4;
+    // Stable weapon/attachment IDs and ammo travel together when this is
+    // exchanged with the player's held instance.
+    SGE::WeaponInstance weapon;
     float radius = 2.0f;        // horizontal collection distance, metres
     float verticalRange = 3.0f; // vertical tolerance, so a pickup is not
                                 // collectable from a rooftop directly above it
@@ -241,6 +243,9 @@ struct Scene {
     // blend: that one swaps to a scope overlay and hides the viewmodel, this one
     // just pulls the gun to centre and tightens the FOV a little.
     float  adsFOV     = 42.0f;   // moderate -- ADS is for accuracy, not zoom
+    // Resolved from the selected weapon and its optic. Defaults to the legacy
+    // iron-sight value, so an uncustomised loadout follows the old projection.
+    float  weaponAdsFOV = 42.0f;
     float  adsBlend   = 0.0f;    // 0 = hip, 1 = fully sighted
     bool   adsActive  = false;
     // Sighted viewmodel offset, against a hip offset of {0.11, -0.20, 0.47}.
@@ -1841,8 +1846,10 @@ struct Scene {
     // Scatters a direction inside the cone the reticle is currently showing.
     // Square distribution rather than a disc: it matches the crosshair, which is
     // four arms on two axes, not a ring.
-    XMFLOAT3 ApplyShotSpread(const XMFLOAT3& direction) const {
-        const float spread = CurrentShotSpreadRadians();
+    XMFLOAT3 ApplyShotSpread(const XMFLOAT3& direction,
+                             float spreadMultiplier = 1.0f) const {
+        const float spread = CurrentShotSpreadRadians() *
+            (std::max)(0.0f, spreadMultiplier);
         if (spread <= 0.0001f) return direction;
         const XMVECTOR forward = XMVector3Normalize(XMLoadFloat3(&direction));
         const XMVECTOR up = XMLoadFloat3(&camera.Up);
@@ -1861,30 +1868,40 @@ struct Scene {
         return result;
     }
 
-    void ShootProjectile() {
+    void ShootProjectile(const SGE::ResolvedWeaponStats& stats) {
         // Bullets leave inside the cone the reticle is showing, so sights
         // tighten grouping in two ways: the bloom itself collapses under ADS,
         // and the kick halves. Sighted fire is steadier but still climbs -- the
         // recoil has to be fought either way, just less hard down the sights.
         const float recoilScale = 1.0f - 0.50f * adsBlend;
+        const float authoredPitchScale = stats.recoilPitchDegrees / 0.55f;
+        const float authoredYawScale = stats.recoilYawDegrees / 0.22f;
         const float randomYaw = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) *
-                                recoilYaw * recoilScale;
-        camera.ApplyRecoil(recoilPitch * recoilScale, randomYaw);
+                                recoilYaw * authoredYawScale * recoilScale;
+        camera.ApplyRecoil(recoilPitch * authoredPitchScale * recoilScale,
+                           randomYaw);
         // Carbine tap. Scaled by the same recoilScale the aim kick uses, so
         // the shake tracks the climb whatever that scale ends up being.
         camera.AddFireTrauma(0.045f * recoilScale);
         gunRecoilBack = (std::min)(0.12f, gunRecoilBack + 0.075f);
         gunRecoilKick = (std::min)(8.0f, gunRecoilKick + 4.2f * recoilScale);
-        TriggerMuzzleFlash(1.0f, 1.0f);
-        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front, 1.0f);
+        TriggerMuzzleFlash(stats.muzzleFlashDurationMultiplier,
+                           stats.muzzleFlashSizeMultiplier);
+        SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front,
+                         stats.smokeMultiplier);
 
         Projectile p;
         p.position  = GetMuzzleWorldPosition();
         p.previousPosition = p.position;
-        p.direction = ApplyShotSpread(camera.Front);
+        const float spreadMultiplier = stats.hipSpreadMultiplier +
+            (stats.adsSpreadMultiplier - stats.hipSpreadMultiplier) * adsBlend;
+        p.direction = ApplyShotSpread(camera.Front, spreadMultiplier);
+        // projectileSpeed remains live-tunable in the engine UI; the immutable
+        // definition records the authored baseline without stealing that knob.
         p.speed     = projectileSpeed;
         p.lifetime  = projectileLifetime;
         p.active    = true;
+        p.damageMultiplier = stats.damageMultiplier;
         projectiles.push_back(p);
     }
 
@@ -2122,35 +2139,36 @@ struct Scene {
     // the round: a can traps most of the muzzle blast, which is what produces
     // both the flash and part of the kick. Damage and velocity are untouched --
     // the suppressed rifle hits exactly as hard as the bare one.
-    void ShootSniperProjectile(bool suppressed = false) {
+    void ShootSniperProjectile(const SGE::ResolvedWeaponStats& stats) {
         // No spread, ever. The SVD puts its round exactly where the crosshair
         // sits regardless of stance or movement -- a marksman rifle whose shot
         // wanders is not one, and the 5x damage multiplier only means something
         // if the shot is trusted. The reticle may bloom while moving; this
         // weapon deliberately does not honour it.
         const XMFLOAT3 aimDirection = camera.Front;
-        camera.ApplyRecoil(recoilPitch * (suppressed ? 3.6f : 4.2f), 0.0f);
+        camera.ApplyRecoil(
+            recoilPitch * (stats.recoilPitchDegrees / 0.55f), 0.0f);
         // Marksman rifle. A shade less than the shotgun despite the bigger aim
         // kick: this weapon is fired from a scope, where a shaking view is far
         // more disruptive than it is at the hip.
-        camera.AddFireTrauma(suppressed ? 0.085f : 0.10f);
+        camera.AddFireTrauma(stats.suppressed ? 0.085f : 0.10f);
         gunRecoilBack = (std::min)(0.16f, gunRecoilBack + 0.12f);
         gunRecoilKick = (std::min)(12.0f, gunRecoilKick + 7.0f);
         // A suppressed muzzle still flares, just far less. Killing it outright
         // would make the rifle read as a laser rather than a firearm, and at
         // night the faint flash is a fair tell for an enemy who is looking.
-        if (suppressed) TriggerMuzzleFlash(0.55f, 0.35f);
-        else TriggerMuzzleFlash(1.35f, 1.35f);
+        TriggerMuzzleFlash(stats.muzzleFlashDurationMultiplier,
+                           stats.muzzleFlashSizeMultiplier);
         SpawnWeaponSmoke(GetMuzzleWorldPosition(), camera.Front,
-                         suppressed ? 0.7f : 1.5f);
+                         stats.smokeMultiplier);
 
         Projectile p = {};
         p.position = p.previousPosition = GetMuzzleWorldPosition();
         p.direction = aimDirection;
-        p.speed = 650.0f;
+        p.speed = stats.projectileSpeed;
         p.lifetime = 4.0f;
         p.active = true;
-        p.damageMultiplier = 5.0f;
+        p.damageMultiplier = stats.damageMultiplier;
         projectiles.push_back(p);
     }
 
@@ -2206,7 +2224,7 @@ struct Scene {
     float EffectiveCameraFOV() const {
         // Scope wins when both are somehow non-zero, since it is the narrower
         // of the two and blending them would land between the sights.
-        const float sighted = cameraFOV + (adsFOV - cameraFOV) * adsBlend;
+        const float sighted = cameraFOV + (weaponAdsFOV - cameraFOV) * adsBlend;
         return sighted + (sniperScopeFOV - sighted) * sniperScopeBlend +
                camera.ExplosionFovKick();
     }

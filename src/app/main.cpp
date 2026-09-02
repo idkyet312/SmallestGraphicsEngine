@@ -67,6 +67,7 @@
 #include "MSAADX12.h"
 #include "GrassMSAADX12.h"
 #include "CollisionMesh.h"
+#include "SphereMeshCut.h"
 #include "CollisionMeshCache.h"
 #include "DestructionDX12.h"
 #include "FBXImporter.h"
@@ -319,6 +320,33 @@ struct ObjectivePlaneState {
 static std::vector<ObjectivePlaneState> g_objectivePlanes;
 // Set when an aircraft clears the map, so the mission can report the failure.
 static bool g_objectivePlaneEscaped = false;
+
+// One prefab placement that simulates as a rigid body instead of standing
+// still, created for any prefab carrying a "rigidBody" component.
+//
+// The body owns the pose once it exists, so this keeps what the body cannot
+// rebuild for itself: the authored scale/shear that has to be re-applied on top
+// of the simulated rotation, and the entity id used to find the render instance
+// and collider again after a prefab rebuild.
+struct PrefabRigidBodyState {
+    uint64_t entityId = 0;
+    std::string prefabId;
+    uint32_t physicsHandle = 0;
+    // Authored transform with translation and yaw stripped out, so composing it
+    // under the body's pose restores the placement's scale without fighting the
+    // simulated position. Same alignment reasoning as ObjectivePlaneState.
+    DirectX::XMFLOAT4X4 scaleTransform{};
+    // Bounds centre in local space, scaled. The body is created at the centre of
+    // the collision box, but the model draws from its own origin, which for the
+    // container sits at a corner -- so the offset is carried here and undone
+    // when the pose is written back.
+    DirectX::XMFLOAT3 centerOffset{};
+    DirectX::XMFLOAT3 halfExtents{};
+    // Skips the transform write while the body sleeps, which is the common case
+    // for a yard of containers nobody has touched.
+    bool asleep = false;
+};
+static std::vector<PrefabRigidBodyState> g_prefabRigidBodies;
 static AssetRegistry        g_assetRegistry;
 static AssetWatcher         g_assetWatcher;
 struct PrefabModelCacheEntry {
@@ -756,6 +784,73 @@ static float                g_playerStepDistance = 0.0f;
 // cadence more, so the interval shortens.
 static constexpr float      kStepStrideWalk = 2.1f;
 static constexpr float      kStepStrideSprint = 2.6f;
+// Exhaustion breathing, played when the sprint meter runs dry.
+//
+// Not spatialised, for the same reason the player's own boots are not: it comes
+// from the listener's own head, where panning means nothing.
+GunAudio                    g_breathingAudio;
+// The clip measures 3.170 s (stereo, 44.1 kHz, decoded with the engine's own
+// stb_vorbis path), so a retrigger any sooner would stack a second copy over
+// the first. The gain is high because the source is quiet: it peaks at 1636 of
+// 32767, about 20x below the shipped effects, so it needs lifting to sit in the
+// mix at all. At 5.2 the peak reaches 26% of full scale, still well clear of
+// clipping -- GunAudio::kMaxPlayGain had to be raised past 4.0 to allow it.
+//
+// Pitched down so the breath reads as a heavier, more tired body. XAudio2's
+// frequency ratio also stretches the clip, so a 0.8 ratio makes the 3.170 s
+// sample play for 3.963 s; the retrigger interval below is derived from the
+// stretched length, not the raw one, or breaths would overlap.
+static constexpr float      kBreathingClipSeconds = 3.170f;
+static constexpr float      kBreathingPitch = 0.80f;
+static constexpr float      kBreathingRepeatSeconds =
+    kBreathingClipSeconds / kBreathingPitch + 0.20f;
+static constexpr float      kBreathingGain = 5.2f;
+static float                g_breathingCooldown = 0.0f;
+// --- Sprint stamina ---
+//
+// Held in seconds of meter rather than an abstract 0..100, so the constants
+// here stay directly readable. The meter holds kStaminaMaxSeconds and drains at
+// kStaminaDrainRate per second, so a continuous sprint lasts
+// kStaminaMaxSeconds / kStaminaDrainRate seconds -- 3.0 s at the current
+// values. A full refill takes kStaminaMaxSeconds / kStaminaRecoveryRate
+// seconds of not sprinting.
+static constexpr float      kStaminaMaxSeconds = 6.0f;
+// Meter-seconds spent per real second of sprinting. At 2.0 the bar empties in
+// half the time it takes to refill a comparable amount, which is what makes a
+// sprint a decision rather than a default. Raised from 1.0 (a plain dt drain).
+static constexpr float      kStaminaDrainRate = 2.0f;
+// Recovery is slower than the drain, so a chased player cannot tap shift
+// forever, but it is not so slow that a normal traversal is spent walking.
+static constexpr float      kStaminaRecoveryRate = 0.55f;
+// Grace before recovery starts, so releasing shift for a moment mid-fight does
+// not immediately refund the sprint.
+static constexpr float      kStaminaRecoveryDelay = 1.1f;
+// Once empty, sprinting is locked out until this much has been rebuilt. Without
+// it the player would flutter in and out of sprint one frame at a time the
+// instant the meter touched zero.
+static constexpr float      kStaminaRecoveredToSprint = 1.5f;
+// Breathing starts once the meter falls under half, before it is spent, so the
+// player hears the exertion building rather than only hearing the moment they
+// run dry. Expressed as a fraction of the maximum, not a duration, because it
+// is a "how much is left" question and must follow kStaminaMaxSeconds if that
+// is retuned.
+//
+// Sits above kStaminaRecoveredToSprint (1.5 s of 6.0 s, 25%), so a player
+// recovering from empty is still breathing when sprint unlocks again and the
+// sound tails off only once they are genuinely rested.
+static constexpr float      kStaminaBreathingFraction = 0.50f;
+static constexpr float      kStaminaBreathingSeconds =
+    kStaminaMaxSeconds * kStaminaBreathingFraction;
+// Not static: the HUD reads these through the externs in EngineUI.h.
+float                       g_staminaSeconds = kStaminaMaxSeconds;
+static float                g_staminaRecoveryDelay = 0.0f;
+// True from the moment the meter empties until it has recovered enough to
+// sprint again. Read by the HUD to colour the bar and by the input path to
+// refuse the sprint multiplier.
+bool                        g_staminaExhausted = false;
+// Mirrors kStaminaMaxSeconds for the HUD, which needs the denominator to draw
+// the meter as a fraction but cannot see a constant defined in this file.
+extern const float          kStaminaMaxSecondsUI = kStaminaMaxSeconds;
 static float&               g_banditVoiceCooldown = g_enemySystem.voiceCooldown;
 static float&               g_banditPainCooldown = g_enemySystem.painCooldown;
 // Lockout on the player's own hit sound, so a burst lands as one impact rather
@@ -1034,6 +1129,126 @@ TerrainRendererDX12::Params CurrentTerrainParams() {
         params.lodStep = static_cast<float>((std::max)(1u, SCR_HEIGHT));
     }
     return params;
+}
+
+// Blasts a sphere-shaped hole out of the military building when a grenade goes
+// off against it. The prefab batch shares one model across every instance, so
+// the first hit on an entity clones that mesh: without the clone, one grenade
+// would hole every copy of the building in the level.
+//
+// Keyed by entity id, and the clone is kept so later grenades cut the already
+// cratered geometry rather than starting from the pristine model.
+static constexpr const char* kBlastHolePrefabId = "props/military_building_1";
+// Radius of the bite taken out of a wall. Tuned against the building's own
+// measured 15.2 x 5.1 x 10.3 m: big enough to read as a breach from outside,
+// small enough that one grenade cannot open a whole wall.
+static constexpr float kBlastHoleRadius = 1.35f;
+static std::unordered_set<uint64_t> g_blastHoleEntities;
+
+static void AddExplosionBuildingHole(const XMFLOAT3& impact, float blastScale) {
+    const float radius = kBlastHoleRadius * (std::max)(0.35f, blastScale);
+    for (PrefabRenderBatch& batch : g_game.world.Prefabs().renderBatches) {
+        if (batch.prefabId != kBlastHolePrefabId || !batch.model) continue;
+        for (size_t i = 0; i < batch.transforms.size() &&
+                           i < batch.entityIds.size(); ++i) {
+            const uint64_t entityId = batch.entityIds[i];
+            // The cut runs in the model's own local space so a mesh can be cut
+            // again later; bring the world-space impact back through the
+            // instance transform rather than moving the geometry.
+            XMVECTOR determinant;
+            const XMMATRIX inverse =
+                XMMatrixInverse(&determinant, batch.transforms[i]);
+            if (XMVectorGetX(XMVectorAbs(determinant)) < 1e-8f) continue;
+            XMFLOAT3 local;
+            XMStoreFloat3(&local, XMVector3TransformCoord(
+                XMLoadFloat3(&impact), inverse));
+
+            // Scale the radius into local space too, or a scaled instance
+            // would take a hole of the wrong size.
+            XMFLOAT3 axis;
+            XMStoreFloat3(&axis, XMVector3TransformNormal(
+                XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f), batch.transforms[i]));
+            const float instanceScale = (std::max)(1e-4f,
+                std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z));
+
+            SGE::SphereCut sphere;
+            sphere.centreX = local.x;
+            sphere.centreY = local.y;
+            sphere.centreZ = local.z;
+            sphere.radius = radius / instanceScale;
+
+            // Clone on first damage so this instance stops sharing the cached
+            // model every other copy of the building is still drawing. The
+            // geometry hangs off child nodes -- the root carries no mesh of its
+            // own -- so this has to deep-copy the whole subtree, not just the
+            // node handed to the batch.
+            const bool alreadyCut =
+                g_blastHoleEntities.find(entityId) != g_blastHoleEntities.end();
+            std::shared_ptr<SceneNode> target = batch.model;
+            if (!alreadyCut) {
+                std::function<std::shared_ptr<SceneNode>(
+                    const std::shared_ptr<SceneNode>&)> cloneNode =
+                    [&](const std::shared_ptr<SceneNode>& source)
+                        -> std::shared_ptr<SceneNode> {
+                    if (!source) return nullptr;
+                    auto copy = std::make_shared<SceneNode>(*source);
+                    if (source->mesh)
+                        copy->mesh = std::make_shared<SceneMesh>(*source->mesh);
+                    copy->children.clear();
+                    for (const auto& child : source->children) {
+                        auto childCopy = cloneNode(child);
+                        if (childCopy) copy->AddChild(childCopy);
+                    }
+                    return copy;
+                };
+                target = cloneNode(batch.model);
+            }
+            if (!target) continue;
+
+            // Cut every mesh in the subtree, not just the first one found: a
+            // wall and its trim are separate primitives on separate nodes, and
+            // a blast that only opened one of them would leave the other
+            // hanging in the hole.
+            bool cutAnything = false;
+            std::function<void(const std::shared_ptr<SceneNode>&)> cutNode =
+                [&](const std::shared_ptr<SceneNode>& node) {
+                if (!node) return;
+                if (node->mesh) {
+                    for (MeshPrimitive& primitive : node->mesh->primitives) {
+                        std::vector<float> cutVertices;
+                        std::vector<unsigned int> cutIndices;
+                        if (!SGE::CutSphereFromMesh(primitive.vertices,
+                                primitive.indices, sphere, cutVertices,
+                                cutIndices))
+                            continue;
+                        primitive.vertices = std::move(cutVertices);
+                        primitive.indices = std::move(cutIndices);
+                        // The old GPU buffers describe the uncut geometry, and
+                        // the visibility buffer snapshots mesh offsets by slot,
+                        // so the primitive re-registers rather than patching in
+                        // place.
+                        primitive.vertexBuffer.Reset();
+                        primitive.indexBuffer.Reset();
+                        primitive.visibilityMeshID = UINT_MAX;
+                        primitive.indexCount =
+                            static_cast<UINT>(primitive.indices.size());
+                        GLBImporter::BuildMeshletData(
+                            primitive, g_dx12.device.Get());
+                        cutAnything = true;
+                    }
+                }
+                for (const auto& child : node->children) cutNode(child);
+            };
+            cutNode(target);
+            if (!cutAnything) continue;
+
+            batch.model = target;
+            batch.baseModel = target;
+            g_blastHoleEntities.insert(entityId);
+            SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                "Grenade blew a hole in " + std::string(kBlastHolePrefabId));
+        }
+    }
 }
 
 // blastScale widens the hole for oversized blasts (a called-in missile strike);
@@ -4668,11 +4883,6 @@ static bool SpawnBoatTurretGunner() {
     return true;
 }
 
-// How far a suppressed shot carries, against an unsuppressed one. A quarter of
-// the 19 m alert radius puts it under 5 m: close enough that a man beside the
-// target still reacts, far short of waking the rest of a patrol.
-static constexpr float kSuppressedNoiseScale = 0.25f;
-
 // Reload click. Pitched per weapon so the heavier guns sound heavier: the RPG
 // and shotgun drop below unity, the AK sits near it, the SVD just above.
 static void PlayReloadSound() {
@@ -4693,6 +4903,8 @@ static void PlayReloadSound() {
 // fire cooldown. Ammo is only enforced outside god mode -- see Scene::ConsumeAmmo.
 static bool ShootPlayerWeapon() {
     const int slot = GunModel::SelectedWeapon();
+    const SGE::ResolvedWeaponStats weaponStats =
+        scene.player.ResolveWeaponStats(slot);
     if (!scene.ConsumeAmmo(slot)) {
         // Dry fire: auto-reload if there are spare rounds, so the player is not
         // stuck clicking an empty gun without knowing why. BeginReload returns
@@ -4720,11 +4932,10 @@ static bool ShootPlayerWeapon() {
         // what the shot sounds like, not what it does. Quieter and pitched up:
         // a can takes the bass out of a report, leaving a flat crack rather
         // than the boom the unsuppressed rifle makes.
-        const bool suppressed = GunModel::SVDSuppressedSelected();
-        scene.ShootSniperProjectile(suppressed);
-        const float pitch = (suppressed ? 1.24f : 0.70f) +
+        scene.ShootSniperProjectile(weaponStats);
+        const float pitch = (weaponStats.suppressed ? 1.24f : 0.70f) +
             ((float)std::rand() / RAND_MAX) * 0.04f;
-        g_gunAudio.Play(suppressed ? 0.34f : 1.0f, pitch);
+        g_gunAudio.Play(weaponStats.suppressed ? 0.34f : 1.0f, pitch);
     } else if (GunModel::RPGSelected()) {
         scene.ShootRocket();
         const float pitch = 0.68f + ((float)std::rand() / RAND_MAX) * 0.05f;
@@ -4734,9 +4945,10 @@ static bool ShootPlayerWeapon() {
         const float pitch = 0.78f + ((float)std::rand() / RAND_MAX) * 0.08f;
         g_gunAudio.Play(0.96f, pitch);
     } else {
-        scene.ShootProjectile();
-        const float pitch = 0.96f + ((float)std::rand() / RAND_MAX) * 0.08f;
-        g_gunAudio.Play(0.82f, pitch);
+        scene.ShootProjectile(weaponStats);
+        const float pitch = (weaponStats.suppressed ? 1.18f : 0.96f) +
+            ((float)std::rand() / RAND_MAX) * 0.08f;
+        g_gunAudio.Play(weaponStats.suppressed ? 0.30f : 0.82f, pitch);
     }
     const uint32_t projectileCount = static_cast<uint32_t>(
         scene.projectiles.size() - projectileStart);
@@ -4759,19 +4971,18 @@ static bool ShootPlayerWeapon() {
     // notice from close by, so a man standing next to the one you drop will
     // still turn -- picking targets on the edge of a group remains the skill.
     const float noiseRadius = SkinnedEnemy::AlertBroadcastRadius() *
-        (GunModel::SVDSuppressedSelected() ? kSuppressedNoiseScale : 1.0f);
+        weaponStats.noiseRadiusMultiplier;
     g_enemyNoiseEvents.push_back({ scene.camera.Position, noiseRadius });
     return true;
 }
 
 static float PlayerFireInterval() {
-    if (GunModel::HarpoonSelected()) return 1.25f;
-    if (GunModel::C4Selected()) return 0.48f;
-    if (GunModel::FlamethrowerSelected()) return 0.075f;
-    if (GunModel::LaserSelected()) return 0.055f;
-    if (GunModel::SVDSelected()) return 1.05f;
-    if (GunModel::RPGSelected()) return 1.7f;
-    return GunModel::ShotgunSelected() ? 0.8f : scene.fireInterval;
+    const int slot = GunModel::SelectedWeapon();
+    const SGE::ResolvedWeaponStats stats =
+        scene.player.ResolveWeaponStats(slot);
+    // Keep the AK's live debug tuning authoritative when it is uncustomised;
+    // every fixed-cadence weapon is now described by its immutable definition.
+    return slot == 0 ? scene.fireInterval : stats.fireIntervalSeconds;
 }
 
 static void UpdateHarpoonAttachments() {
@@ -7054,7 +7265,9 @@ static void DrawEnemyVisionCones(CXMMATRIX view, CXMMATRIX projection) {
     }
 }
 
-// IR aiming laser, visible only through night vision.
+// Rail lasers and the existing IR/NVG designator share the same world-space
+// cast. The attachment is visible red; the equipment designator remains white
+// and only appears through the goggle ramp.
 //
 // A real IR designator emits outside the visible band: to the naked eye there is
 // nothing there at all, and through an intensifier the beam is a hard white line
@@ -7068,9 +7281,13 @@ static void DrawEnemyVisionCones(CXMMATRIX view, CXMMATRIX projection) {
 // is exactly what makes a laser useful at close range.
 static void UpdateIRLaser() {
     scene.irLaser.visible = false;
-    // Fades with the goggle ramp so raising and lowering them carries the beam
-    // with it rather than popping it on at full strength.
-    const float visibility = (std::min)(1.0f, g_nightVisionBlend);
+    const SGE::ResolvedWeaponStats weaponStats =
+        scene.player.ResolveWeaponStats(GunModel::SelectedWeapon());
+    const bool visibleRailLaser = weaponStats.laserSight;
+    // The IR beam fades with the goggle ramp. A visible laser has no such ramp
+    // and stays red even when NVG happens to be raised at the same time.
+    const float visibility = visibleRailLaser ? 1.0f :
+        (std::min)(1.0f, g_nightVisionBlend);
     if (visibility <= 0.01f) return;
     if (!scene.gun.visible || scene.player.health <= 0.0f) return;
     // Thrown and placed equipment has no barrel to bolt a designator to.
@@ -7151,6 +7368,8 @@ static void UpdateIRLaser() {
                   XMLoadFloat3(&muzzle) + beamDirection * 0.35f);
     scene.irLaser.start = beamStart;
     scene.irLaser.end = target;
+    scene.irLaser.color = visibleRailLaser ?
+        XMFLOAT3{ 1.0f, 0.025f, 0.012f } : XMFLOAT3{ 1.0f, 1.0f, 1.0f };
     scene.irLaser.visibility = visibility;
     scene.irLaser.visible = true;
 }
@@ -8857,6 +9076,12 @@ static bool RemovePrefabEntityFromRuntime(uint64_t entityId) {
         if (container.size() != before) removed = true;
     };
     dropById(g_prefabColliders);
+    // The body has to be destroyed before the state is dropped, or the handle
+    // is lost and the body simulates forever with nothing drawing it.
+    for (const PrefabRigidBodyState& state : g_prefabRigidBodies)
+        if (state.entityId == entityId)
+            g_destruction.DestroyPropBody(state.physicsHandle);
+    dropById(g_prefabRigidBodies);
     dropById(g_prefabMeshColliders);
     dropById(g_prefabLightInstances);
     dropById(g_prefabDestructibles);
@@ -9132,13 +9357,30 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
     shadowMap.InvalidateCachedCascades();
 }
 
+
+// Releases every simulated prop body and forgets the states.
+//
+// ClearDerived drops the colliders and render instances these bodies drive, so
+// the bodies have to go with them: left alive they would keep stepping in the
+// solver with nothing to move, and the next rebuild would spawn a second body
+// for the same placement.
+static void ReleasePrefabRigidBodies() {
+    for (const PrefabRigidBodyState& state : g_prefabRigidBodies)
+        g_destruction.DestroyPropBody(state.physicsHandle);
+    g_prefabRigidBodies.clear();
+}
+
 static void RebuildPrefabRenderBatches() {
     ProfilerDX12::CpuScope prefabBatchProfile(g_profiler, "Editor/PrefabBatches");
+    ReleasePrefabRigidBodies();
     g_game.world.Prefabs().ClearDerived();
     // Tracks the same instances ClearDerived just dropped; entity ids are reused
     // across levels, so a stale entry here would silently disable the bounds box
     // for an unrelated prefab.
     g_meshCollisionEntities.clear();
+    // Same reasoning: a reused entity id would otherwise make a fresh building
+    // skip its clone and cut the shared cached model every instance draws.
+    g_blastHoleEntities.clear();
     g_assetRegistry.Refresh();
     g_prefabRegistry.Refresh(kPrefabRoot, kModelRoot);
     g_prefabAudioPlayers.clear();
@@ -9385,6 +9627,46 @@ static void RebuildPrefabRenderBatches() {
                 (maximum.z - minimum.z) * 0.5f * scaleZ);
             collider.yawRadians = std::atan2(worldX.z, worldX.x);
             g_prefabColliders.push_back(std::move(collider));
+            // A prefab asking for rigid-body simulation gets one body per
+            // placement, sized from the same measured half extents the static
+            // collider above just used. The collider stays in the list: it is
+            // what the player sweep, the AI and bullet tests read, and the
+            // per-frame sync below moves it to wherever the body has got to.
+            //
+            // Mesh collision is deliberately not supported here -- a moving
+            // per-triangle tree would have to be re-fitted every frame, and the
+            // props this exists for are boxes anyway.
+            if (prefab->rigidBody.enabled && collision == "box") {
+                const XMFLOAT3 half = g_prefabColliders.back().halfExtents;
+                const uint32_t handle = g_destruction.CreatePropBody(
+                    worldCenter, half, g_prefabColliders.back().yawRadians,
+                    prefab->rigidBody.density);
+                if (handle != 0) {
+                    PrefabRigidBodyState state;
+                    state.entityId = entityId;
+                    state.prefabId = prefabId;
+                    state.physicsHandle = handle;
+                    state.halfExtents = half;
+                    // The body is positioned at the bounds centre, but the model
+                    // draws from its origin. Keep the scaled local offset so the
+                    // draw transform can subtract it back out.
+                    XMStoreFloat3(&state.centerOffset, XMVectorSet(
+                        localCenter.x * scaleX, localCenter.y * scaleY,
+                        localCenter.z * scaleZ, 0.0f));
+                    XMStoreFloat4x4(&state.scaleTransform,
+                        XMMatrixScaling(scaleX, scaleY, scaleZ));
+                    g_prefabRigidBodies.push_back(std::move(state));
+                    // One line per simulated placement, so a headless run can
+                    // confirm the bodies exist and are the size the mesh
+                    // measured rather than a default guess.
+                    SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                        "Rigid body prop: " + prefabId + " half extents " +
+                        std::to_string(half.x) + " x " +
+                        std::to_string(half.y) + " x " +
+                        std::to_string(half.z) + ", density " +
+                        std::to_string(prefab->rigidBody.density));
+                }
+            }
         }
 
         XMFLOAT3 origin;
@@ -11180,6 +11462,69 @@ static void BeginObjectivePlaneCrash(ObjectivePlaneState& plane) {
         GroundHeightAt(plane.crashPosition.x, plane.crashPosition.z);
 }
 
+// Drives every simulated prop from its rigid body: the render transform so it
+// is drawn where it has moved to, and the prefab collider so the player, the AI
+// and bullets meet it there too.
+//
+// Like the aircraft, motion is written into the batch's `transforms` and never
+// `baseTransforms`: the authored placement stays the rebuild-safe copy, so a
+// prefab rebuild re-seeds from where the container was placed rather than
+// inheriting a half-simulated pose.
+//
+// A sleeping body is skipped. Box3D puts a resting container to sleep within a
+// second or so, so a yard of them costs one IsPropBodyAwake call each per frame
+// once they have settled, not a pose read and two matrix writes.
+static void UpdatePrefabRigidBodies() {
+    if (g_prefabRigidBodies.empty()) return;
+    for (PrefabRigidBodyState& state : g_prefabRigidBodies) {
+        const bool awake = g_destruction.IsPropBodyAwake(state.physicsHandle);
+        // One final sync on the frame it falls asleep, so the resting pose is
+        // the simulated one rather than the last frame's mid-motion guess.
+        if (!awake && state.asleep) continue;
+        state.asleep = !awake;
+
+        DestructionBodyPose pose;
+        if (!g_destruction.GetPropBodyPose(state.physicsHandle, pose)) continue;
+
+        const XMVECTOR rotation = XMLoadFloat4(&pose.rotation);
+        const XMMATRIX orientation = XMMatrixRotationQuaternion(rotation);
+        // The body sits at the bounds centre; the model draws from its origin.
+        // Rotating the stored offset and subtracting it puts the origin back
+        // where the rotated box wants it, which for a corner-pivoted model like
+        // the container is the difference between resting on the ground and
+        // hovering half a container above it.
+        const XMVECTOR center = XMVectorSet(
+            pose.position.x, pose.position.y, pose.position.z, 0.0f);
+        const XMVECTOR offset = XMVector3TransformNormal(
+            XMLoadFloat3(&state.centerOffset), orientation);
+        const XMVECTOR origin = XMVectorSubtract(center, offset);
+        const XMMATRIX world = XMLoadFloat4x4(&state.scaleTransform) *
+            orientation * XMMatrixTranslationFromVector(origin);
+
+        for (PrefabRenderBatch& batch : g_prefabRenderBatches) {
+            if (batch.prefabId != state.prefabId) continue;
+            for (size_t i = 0; i < batch.entityIds.size(); ++i)
+                if (batch.entityIds[i] == state.entityId &&
+                    i < batch.transforms.size())
+                    batch.transforms[i] = world;
+        }
+
+        // The collider is an axis-aligned-in-yaw box, so a container tumbling
+        // end over end cannot be represented exactly. Track position and yaw,
+        // which is what a shoved or blast-thrown container mostly does, and
+        // accept that a fully upended one is approximated -- the alternative is
+        // rebuilding every consumer of PrefabCollider around a full rotation.
+        for (PrefabCollider& collider : g_prefabColliders) {
+            if (collider.entityId != state.entityId) continue;
+            XMStoreFloat3(&collider.center, center);
+            XMFLOAT3 axis;
+            XMStoreFloat3(&axis, XMVector3TransformNormal(
+                XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f), orientation));
+            collider.yawRadians = std::atan2(axis.z, axis.x);
+        }
+    }
+}
+
 // Drives the aircraft objective: counts down, then flies it out.
 //
 // Motion is written into the render batch's `transforms` only. `baseTransforms`
@@ -11845,6 +12190,7 @@ static void SetCursorVisible(bool visible) {
 }
 
 static void OpenMainMenu() {
+    ReleasePrefabRigidBodies();
     g_game.world.Prefabs().ClearDerived();
     g_meshCollisionEntities.clear();
     g_objectivePlanes.clear();
@@ -11977,9 +12323,9 @@ static void ApplyRuntimeLevelBasics(bool movePlayer) {
         // this is the centreline of the launcher, not its underside.
         rocket.position = { pickupX, groundY + 0.85f, pickupZ };
         rocket.yawRadians = humveeYaw;
-        rocket.weapon = 2;      // RPG-7
-        rocket.magazine = 1;    // one loaded, matching the launcher's mag size
-        rocket.reserve = 4;
+        // One loaded rocket and four spare travel with the instance, as will
+        // any attachments when customised pickups are authored later.
+        rocket.weapon = scene.player.weapons.CreateInstance(2, 1, 4);
         rocket.active = true;
         scene.weaponPickups.push_back(rocket);
     }
@@ -12057,6 +12403,14 @@ static void OpenWinScreen() {
     SetCursorVisible(true);
 }
 
+// A fresh life or a fresh playtest starts rested. Without this a run that ended
+// mid-sprint would begin the next one exhausted and breathing.
+static void ResetSprintStamina() {
+    g_staminaSeconds = kStaminaMaxSeconds;
+    g_staminaRecoveryDelay = 0.0f;
+    g_staminaExhausted = false;
+    g_breathingCooldown = 0.0f;
+}
 static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
                           bool emptyLevel = false,
                           const LevelDefinition* customLevel = nullptr,
@@ -12136,6 +12490,7 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_pendingEnvironmentRebuild = modeAssetsLoaded && g_customLevelMode;
     scene.player.godMode = godMode;
     scene.RestorePlayerHealth();
+    ResetSprintStamina();
     g_game.world.Prefabs().ResetGameplayState();
     scene.ResetLevelRuntimeState();
     // A tower rigged last run must not start the next one already demolishable.
@@ -13336,6 +13691,44 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     if (ImGui::Combo("Secondary", &secondary, weaponNames,
                      MissionLoadout::kWeaponCount))
         loadout.SelectWeapon(1, secondary);
+
+    auto drawWeaponAttachments = [&](const char* slotLabel, int weapon) {
+        ImGui::PushID(slotLabel);
+        ImGui::TextDisabled("%s attachments", slotLabel);
+        bool anyCompatible = false;
+        for (const SGE::AttachmentDefinition& attachment :
+             scene.player.weapons.Attachments()) {
+            if (!attachment.CompatibleWith(weapon)) continue;
+            anyCompatible = true;
+            bool equipped = scene.player.weapons.AttachmentInstalled(
+                weapon, attachment.id);
+            ImGui::PushID(attachment.id.c_str());
+            if (ImGui::Checkbox(attachment.displayName.c_str(), &equipped)) {
+                if (equipped)
+                    scene.player.weapons.EquipAttachment(weapon, attachment.id);
+                else
+                    scene.player.weapons.RemoveAttachment(weapon,
+                                                          attachment.slot);
+            }
+            if (ImGui::IsItemHovered()) {
+                if (attachment.suppressesWeapon)
+                    ImGui::SetTooltip(
+                        "Quieter report, smaller flash and slightly less recoil.");
+                else if (attachment.providesRedDot)
+                    ImGui::SetTooltip(
+                        "Clear red aiming point and a tighter ADS sight picture.");
+                else if (attachment.providesLaser)
+                    ImGui::SetTooltip(
+                        "Visible red designator and tighter hip-fire spread.");
+            }
+            ImGui::PopID();
+        }
+        if (!anyCompatible)
+            ImGui::TextDisabled("No attachment rails available.");
+        ImGui::PopID();
+    };
+    drawWeaponAttachments("Primary", loadout.weapons[0]);
+    drawWeaponAttachments("Secondary", loadout.weapons[1]);
     // C4 is demolition kit rather than a weapon pick, so it is carried on every
     // mission without spending a slot -- otherwise a player who chose two rifles
     // would have no way to take down a demolition objective.
@@ -15774,6 +16167,7 @@ static void BeginEditorPlaytest(HWND hwnd) {
     SynchronizeEditorRuntime(true);
     scene.player.godMode = true;
     scene.RestorePlayerHealth();
+    ResetSprintStamina();
     g_game.commands.Request(GameCommand::ResetLevelRuntime);
     // Arm the aircraft objective for the playtest. The normal game does this at
     // the deployment screen, which a playtest deliberately skips -- without it
@@ -16439,6 +16833,56 @@ static void UpdateFootsteps(float dt) {
         }
     }
 
+    // --- Sprint stamina and exhaustion breathing ---
+    //
+    // The meter drains only while the sprint is actually doing something: shift
+    // held against a wall costs nothing, which is why this repeats the same
+    // speed threshold the footsteps use rather than trusting the key state.
+    //
+    // Breathing fires when the meter empties, then keeps repeating on a
+    // cooldown for as long as the player stays exhausted. It is retriggered
+    // rather than looped so it ends on its own once they have recovered.
+    const bool drainingStamina = onFoot && g_playerSprinting &&
+                                 scene.camera.IsGrounded &&
+                                 g_game.playerMovement.HorizontalSpeed() > 0.9f;
+    g_breathingCooldown = (std::max)(0.0f, g_breathingCooldown - dt);
+    if (drainingStamina) {
+        g_staminaRecoveryDelay = kStaminaRecoveryDelay;
+        g_staminaSeconds = (std::max)(0.0f,
+            g_staminaSeconds - dt * kStaminaDrainRate);
+        if (g_staminaSeconds <= 0.0f) g_staminaExhausted = true;
+    } else {
+        // The delay only counts down once the player has stopped sprinting, so
+        // a burst of sprint-stop-sprint does not quietly refill the meter.
+        g_staminaRecoveryDelay =
+            (std::max)(0.0f, g_staminaRecoveryDelay - dt);
+        if (g_staminaRecoveryDelay <= 0.0f)
+            g_staminaSeconds = (std::min)(kStaminaMaxSeconds,
+                g_staminaSeconds + dt * kStaminaRecoveryRate);
+        // Sprint unlocks again only after a real margin has rebuilt, so the
+        // player cannot chain single-frame sprints off an empty meter.
+        if (g_staminaExhausted && g_staminaSeconds >= kStaminaRecoveredToSprint)
+            g_staminaExhausted = false;
+    }
+    // Winded: heard from the moment the meter drops under half, through empty,
+    // and all the way back up until it has recovered past half again. A player
+    // who never spent more than half their stamina is not winded.
+    //
+    // The exhausted flag is kept in the test rather than relying on the
+    // fraction alone. It clears at kStaminaRecoveredToSprint (25%), which is
+    // below this threshold, so on its own it would stop the breathing while the
+    // meter was still visibly low; together they mean "low OR still spent".
+    const bool winded = onFoot &&
+        (g_staminaExhausted || g_staminaSeconds < kStaminaBreathingSeconds);
+    if (winded && g_breathingCooldown <= 0.0f) {
+        g_breathingCooldown = kBreathingRepeatSeconds;
+        // Slight pitch jitter around the pitched-down base, so a long recovery
+        // does not repeat one identical breath. Centred on kBreathingPitch
+        // rather than on unity, or the jitter would undo the tuning above.
+        const float pitch = kBreathingPitch + (std::rand() % 100) * 0.0008f;
+        g_breathingAudio.Play(kBreathingGain, pitch);
+    }
+
     // --- Enemies ---
     if (!g_banditLoaded) return;
     for (auto& bandit : g_bandits) {
@@ -16498,7 +16942,7 @@ static WeaponPickup* NearbyWeaponPickup() {
         // The launcher model has to be loaded before the weapon can be selected:
         // GunModel::PlayerMesh() would otherwise fall through to the AK and the
         // player would hold the wrong gun while firing rockets.
-        if (!GunModel::WeaponLoaded(pickup.weapon)) continue;
+        if (!GunModel::WeaponLoaded(pickup.weapon.legacyWeaponId)) continue;
 
         const float dx = camera.x - pickup.position.x;
         const float dz = camera.z - pickup.position.z;
@@ -16526,7 +16970,8 @@ static bool CollectNearbyWeaponPickup() {
     if (!pickup) return false;
 
     const int held = GunModel::SelectedWeapon();
-    if (held == pickup->weapon) return false;   // already holding it
+    const int incoming = pickup->weapon.legacyWeaponId;
+    if (held == incoming) return false;   // already holding it
 
     // C4 rides along outside the two chosen slots, so swapping into it would
     // silently delete a loadout weapon instead of the charge.
@@ -16537,45 +16982,29 @@ static bool CollectNearbyWeaponPickup() {
     // Never let the swap produce two identical slots -- CycleWeapon would then
     // stall between duplicates.
     const size_t other = target == 0 ? 1 : 0;
-    if (carried[other] == pickup->weapon) return false;
+    if (carried[other] == incoming) return false;
 
     const int dropped = carried[target];
     PlayerState& player = scene.player;
+    SGE::WeaponInstance* droppedInstance = player.Weapon(dropped);
+    if (!droppedInstance || incoming < 0) return false;
+    const SGE::WeaponInstance droppedSnapshot = *droppedInstance;
+    if (!player.weapons.SetInstance(pickup->weapon)) return false;
 
-    // Snapshot the outgoing weapon's ammo before the incoming weapon overwrites
-    // anything, so the dropped launcher carries its real remaining rounds.
-    int droppedMagazine = 0;
-    int droppedReserve = 0;
-    if (dropped >= 0 && dropped < PlayerState::kWeaponSlots) {
-        droppedMagazine = player.magazine[dropped];
-        droppedReserve = player.reserve[dropped];
-    }
-
-    carried[target] = pickup->weapon;
-    GunModel::SelectedWeapon() = pickup->weapon;
-
-    // Hand over the ammo. Clamped to the slot's authored capacity so a pickup
-    // cannot push the reserve past what the HUD and reload path expect.
-    if (pickup->weapon >= 0 && pickup->weapon < PlayerState::kWeaponSlots) {
-        player.magazine[pickup->weapon] = (std::min)(
-            pickup->magazine, player.magazineSize[pickup->weapon]);
-        player.reserve[pickup->weapon] = (std::min)(
-            pickup->reserve, player.maxReserve[pickup->weapon]);
-    }
+    carried[target] = incoming;
+    GunModel::SelectedWeapon() = incoming;
     // A reload in flight belonged to the weapon just swapped out; leaving it
     // running would top up the wrong slot when it completes.
     player.reloadTimer = 0.0f;
     player.reloadingSlot = -1;
 
     SGE_LOG("LogGameplay", EngineLog::Level::Display,
-        std::string("Picked up ") + GunModel::WeaponName(pickup->weapon) +
+        std::string("Picked up ") + GunModel::WeaponName(incoming) +
         ", dropped " + GunModel::WeaponName(dropped));
 
     // The pickup becomes the weapon just given up, in place. Reusing the slot
     // rather than pushing a new one keeps the count stable across a run.
-    pickup->weapon = dropped;
-    pickup->magazine = droppedMagazine;
-    pickup->reserve = droppedReserve;
+    pickup->weapon = droppedSnapshot;
     pickup->bobPhase = 0.0f;
     g_reloadAudio.Play(0.9f, 0.85f);
     return true;
@@ -16587,7 +17016,7 @@ static bool CollectNearbyWeaponPickup() {
 static void DrawWeaponPickupPrompt(CXMMATRIX view, CXMMATRIX projection) {
     const WeaponPickup* pickup = NearbyWeaponPickup();
     if (!pickup) return;
-    if (GunModel::SelectedWeapon() == pickup->weapon) return;
+    if (GunModel::SelectedWeapon() == pickup->weapon.legacyWeaponId) return;
 
     const XMFLOAT3 anchor{ pickup->position.x,
                            pickup->position.y + 0.55f,
@@ -16604,7 +17033,7 @@ static void DrawWeaponPickupPrompt(CXMMATRIX view, CXMMATRIX projection) {
 
     char label[96];
     std::snprintf(label, sizeof(label), "[E] TAKE %s",
-                  GunModel::WeaponName(pickup->weapon));
+                  GunModel::WeaponName(pickup->weapon.legacyWeaponId));
     const ImVec2 size = ImGui::CalcTextSize(label);
     ImDrawList* draw = ImGui::GetForegroundDrawList();
     const ImU32 amber = IM_COL32(255, 205, 105, 245);
@@ -16942,6 +17371,8 @@ static void ApplyVirtualInput() {
 }
 
 static void ProcessInput(HWND) {
+    scene.weaponAdsFOV = scene.player.ResolveWeaponStats(
+        GunModel::SelectedWeapon()).adsFovDegrees;
     if (g_insertionChoicePending) {
         scene.c4DetonateHeld = false;
         scene.UpdateSniperScope(false, deltaTime);
@@ -17057,7 +17488,12 @@ static void ProcessInput(HWND) {
     const bool ridingBlackHawk = g_game.vehicles.blackHawkCarryingPlayer;
     const bool controlDown = !ridingBlackHawk && scene.camera.FPSMode &&
         (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+    // An exhausted player keeps the key but loses the speed: the meter has to
+    // rebuild past kStaminaRecoveredToSprint before shift means anything again.
+    // Gating here rather than at the movement call keeps one authority for
+    // "is this a sprint", which the viewmodel and the stamina drain both read.
     const bool sprinting = !ridingBlackHawk && scene.camera.FPSMode &&
+        !g_staminaExhausted &&
         (GetAsyncKeyState(VK_SHIFT) & 0x8000);
     // Mouse-walk mode: the right button reads as forward, exactly as if W were
     // held. Gated on the same UI capture the fire path uses, so dragging a debug
@@ -17767,6 +18203,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                   AudioBus::Ambience);
     g_footstepAudio[1].Initialize("Content/Audio/Footsteps/Grass02.wav",
                                   AudioBus::Ambience);
+    // Exhaustion breathing. Ambience, alongside the footsteps: it is body
+    // sound, not a weapon or a voice line.
+    g_breathingAudio.Initialize("Content/Audio/breathing_tired.ogg",
+                                AudioBus::Ambience);
 
     // ImGui
     D3D12_DESCRIPTOR_HEAP_DESC ihd = {};
@@ -18342,6 +18782,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 retired.models = std::move(g_prefabModelCache);
                 g_retiredPrefabResources.Retire(
                     g_dx12.lastDirectFenceValue, std::move(retired));
+                ReleasePrefabRigidBodies();
                 g_game.world.Prefabs().ClearDerived();
                 g_prefabRebuildRequested = true;
                 g_prefabRebuildReason = "asset change detected";
@@ -18658,6 +19099,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             const float sighted =
                 (std::max)(0.0f, (std::min)(1.0f, scene.adsBlend));
             target *= (1.0f - sighted);
+            const SGE::ResolvedWeaponStats weaponStats =
+                scene.player.ResolveWeaponStats(GunModel::SelectedWeapon());
+            target *= weaponStats.hipSpreadMultiplier +
+                (weaponStats.adsSpreadMultiplier -
+                 weaponStats.hipSpreadMultiplier) * sighted;
             scene.crosshairSpreadTarget =
                 (std::min)(kMaxSpread, (std::max)(0.0f, target));
         }
@@ -18805,6 +19251,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         g_gunAudio.Update();
         g_rpgFireAudio.Update();
         for (GunAudio& step : g_footstepAudio) step.Update();
+        g_breathingAudio.Update();
         g_reloadAudio.Update();
         for (PendingExplosionAudio& sound : g_pendingExplosionAudio)
             sound.delay -= deltaTime;
@@ -19828,8 +20275,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             projectile.detonate = false;
                             continue;
                         }
-                        if (projectile.grenade)
+                        if (projectile.grenade) {
                             AddExplosionTerrainCrater(center, blastScale);
+                            AddExplosionBuildingHole(center, blastScale);
+                        }
                         {
                             ProfilerDX12::CpuScope blastFXProfile(
                                 g_profiler, "Blast/FX");
@@ -20952,6 +21401,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // the aircraft has to be moved for this frame first or it would pick a
         // level of detail for where it was rather than where it is.
         if (IsSceneScreen()) UpdateObjectivePlanes(deltaTime);
+        // Same ordering reason as the aircraft above: a shoved container has
+        // to reach its new pose before LOD selection reads the transform.
+        if (IsSceneScreen()) UpdatePrefabRigidBodies();
         if (IsSceneScreen()) UpdatePrefabLods();
         occlusionDepth.FinalizeCapture(g_dx12.commandList.Get());
         // Adaptive Forward Extensions quality. Driven from the delayed GPU
@@ -21137,9 +21589,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             (g_ocean.IsInitialized() || g_water.IsInitialized()) &&
             !(DeploymentPlanningActive() && g_deploymentDebugHideWater);
         // The MSAA forward path resolves before its single-sample water pass,
-        // so it cannot resume depth-tested MSAA transparency afterwards. Keep
-        // its established ordering; the default HDR visibility path and the
-        // non-MSAA forward path use the split below.
+        // so its sorted transparency queue is flushed immediately before that
+        // resolve. Other paths can split the same queue around water.
         const bool splitWaterTransparency =
             waterPassEnabled && !msaaActive && !bentGTAODiagnosticActive;
         BeginWaterTransparencySplitDX12(scene, false);
@@ -21971,7 +22422,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_meshShader.SetExtensionMotionEnabled(false);
             if (!visibilityDebugActive && !bentGTAODiagnosticActive) {
                 BeginWaterTransparencySplitDX12(
-                    scene, splitWaterTransparency);
+                    scene, true, splitWaterTransparency);
                 ProfilerDX12::Scope extensions(
                     g_profiler, "Forward Extensions", g_dx12.commandList.Get());
                 RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
@@ -22011,7 +22462,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
             {
                 BeginWaterTransparencySplitDX12(
-                    scene, splitWaterTransparency);
+                    scene, true, splitWaterTransparency);
                 ProfilerDX12::Scope profile(g_profiler, "Forward", g_dx12.commandList.Get());
                 RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
                     crateModel, floorMaterial, lightSpace, shadowResource);
@@ -22058,10 +22509,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             mainShader.Use(scene.wireframeMode);
         }
         if (renderedScene && !bentGTAODiagnosticActive &&
-            !WaterTransparencySplitActiveDX12()) {
+            !TransparencyQueueActiveDX12()) {
             ProfilerDX12::Scope profile(
                 g_profiler, "Impact Particles", g_dx12.commandList.Get());
             RenderImpactBillboards(scene, mainShader, geo, fogLightSpace);
+        }
+
+        if (renderedScene && !bentGTAODiagnosticActive && msaaActive &&
+            TransparencyQueueActiveDX12()) {
+            {
+                ProfilerDX12::Scope profile(
+                    g_profiler, "Transparency", g_dx12.commandList.Get());
+                RenderWaterTransparencyPhaseDX12(
+                    scene, mainShader, WaterTransparencyPhaseDX12::All,
+                    fogShadowResource);
+            }
+            {
+                ProfilerDX12::Scope profile(
+                    g_profiler, "Impact Particles", g_dx12.commandList.Get());
+                mainShader.InvalidateGraphicsRootBinding();
+                RenderImpactBillboards(
+                    scene, mainShader, geo, fogLightSpace,
+                    WaterTransparencyPhaseDX12::All);
+            }
+            EndWaterTransparencySplitDX12();
         }
 
         // Collision wireframe last among the scene passes: it is an overlay, so
@@ -22254,15 +22725,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 waterDepthState, usingVisibility ? &g_profiler : nullptr);
         }
 
-        if (renderedScene && WaterTransparencySplitActiveDX12()) {
+        if (renderedScene && TransparencyQueueActiveDX12()) {
             bindSplitTransparencyTarget();
+            const WaterTransparencyPhaseDX12 phase =
+                WaterTransparencySplitActiveDX12()
+                    ? WaterTransparencyPhaseDX12::AfterWater
+                    : WaterTransparencyPhaseDX12::All;
             {
                 ProfilerDX12::Scope profile(
                     g_profiler, "Transparency After Water",
                     g_dx12.commandList.Get());
                 RenderWaterTransparencyPhaseDX12(
-                    scene, mainShader,
-                    WaterTransparencyPhaseDX12::AfterWater,
+                    scene, mainShader, phase,
                     fogShadowResource);
             }
             {
@@ -22276,7 +22750,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 mainShader.InvalidateGraphicsRootBinding();
                 RenderImpactBillboards(
                     scene, mainShader, geo, fogLightSpace,
-                    WaterTransparencyPhaseDX12::AfterWater);
+                    phase);
             }
             EndWaterTransparencySplitDX12();
         }
@@ -23248,6 +23722,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     g_reloadAudio.Shutdown();
     g_rpgFireAudio.Shutdown();
     for (GunAudio& step : g_footstepAudio) step.Shutdown();
+    g_breathingAudio.Shutdown();
     g_gunAudio.Shutdown();
     // Last: every effect above shares this one device, so it can only be torn
     // down once they have all released their voices.

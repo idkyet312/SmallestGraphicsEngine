@@ -26,6 +26,18 @@ struct PrefabDestructibleComponent {
     float health = 100.0f;
 };
 
+// A prop that simulates as a rigid body instead of standing still. Only
+// meaningful with box collision: the simulated hull is the prefab's measured
+// bounds, which is the same shape the static box collider uses.
+struct PrefabRigidBodyComponent {
+    bool enabled = false;
+    // kg/m^3. The default is the measured density of an empty 6.1 m shipping
+    // container: about 2300 kg over its 35.7 m^3 bounding volume. Steel is far
+    // denser, but the box is mostly air, and it is the bounding volume the
+    // hull actually occupies.
+    float density = 64.0f;
+};
+
 struct PrefabSpawnerComponent {
     bool enabled = false;
     std::string enemyType = "bandit";
@@ -95,6 +107,7 @@ struct PrefabAsset {
     PrefabLightComponent light;
     PrefabAudioComponent audio;
     PrefabDestructibleComponent destructible;
+    PrefabRigidBodyComponent rigidBody;
     PrefabSpawnerComponent spawner;
     // Original component object. Unknown component fields survive load/save and
     // provide data for generic editor overrides.

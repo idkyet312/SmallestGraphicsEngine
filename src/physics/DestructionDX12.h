@@ -299,6 +299,24 @@ public:
         const DirectX::XMFLOAT3& angularVelocity = {});
     void DestroyExplosiveBarrelBody(uint32_t handle);
     std::vector<uint32_t> DrainExplosiveBarrelImpactEvents();
+
+    // Rigid-body props: a prefab placement that simulates instead of standing
+    // still. The prefab asks for it with a "rigidBody" component; main.cpp
+    // creates one body per instance, then each frame reads the pose back to
+    // drive both the render transform and the prefab's box collider, so what
+    // the player sees, shoots and walks into stay the same object.
+    //
+    // The half extents are the prefab's measured bounds, already scaled by the
+    // placement, so the hull matches the box collider it replaces rather than
+    // a guess at the model's size.
+    uint32_t CreatePropBody(const DirectX::XMFLOAT3& worldPosition,
+                            const DirectX::XMFLOAT3& halfExtents,
+                            float yawRadians, float density);
+    bool GetPropBodyPose(uint32_t handle, DestructionBodyPose& pose) const;
+    // True while the body is still moving. A sleeping prop can keep its last
+    // pose instead of being re-read and re-uploaded every frame.
+    bool IsPropBodyAwake(uint32_t handle) const;
+    void DestroyPropBody(uint32_t handle);
     uint32_t CreateGrenadeBody(
         const DirectX::XMFLOAT3& worldPosition,
         const DirectX::XMFLOAT3& linearVelocity,

@@ -144,6 +144,56 @@ int main() {
             CHECK(merged.at("light").at("intensity") == 9.0f);
         }
 
+        // Rigid-body props. The component is optional and off by default, so a
+        // prefab that never mentions it keeps standing still; when present, an
+        // absent density falls back to the empty-container figure rather than
+        // to zero, which would give Box3D a massless body.
+        WriteText("prefabs/heavy.json", R"({
+          "schemaVersion":2,"id":"test/heavy","name":"Heavy",
+          "components":{"staticMesh":{"path":"models/crate.glb"},
+            "collision":{"shape":"box"},"rigidBody":{"density":250.0}}
+        })");
+        WriteText("prefabs/defaultmass.json", R"({
+          "schemaVersion":2,"id":"test/defaultmass","name":"Default Mass",
+          "components":{"staticMesh":{"path":"models/crate.glb"},
+            "collision":{"shape":"box"},"rigidBody":{}}
+        })");
+        // A non-positive density has to be rejected at load: it reaches Box3D as
+        // a zero-mass dynamic body and takes the solver's inertia tensor with it.
+        WriteText("prefabs/weightless.json", R"({
+          "schemaVersion":2,"id":"test/weightless","name":"Weightless",
+          "components":{"staticMesh":{"path":"models/crate.glb"},
+            "collision":{"shape":"box"},"rigidBody":{"density":0.0}}
+        })");
+        CHECK(registry.Refresh());
+        const PrefabAsset* heavy = registry.Find("test/heavy");
+        CHECK(heavy != nullptr);
+        if (heavy) {
+            CHECK(heavy->error.empty());
+            CHECK(heavy->rigidBody.enabled);
+            CHECK(heavy->rigidBody.density == 250.0f);
+        }
+        const PrefabAsset* defaultMass = registry.Find("test/defaultmass");
+        CHECK(defaultMass != nullptr);
+        if (defaultMass) {
+            CHECK(defaultMass->error.empty());
+            CHECK(defaultMass->rigidBody.enabled);
+            CHECK(defaultMass->rigidBody.density == 64.0f);
+        }
+        // A rejected prefab is not registered under its id, so it is found by
+        // scanning the asset list for the failure, the way the malformed-JSON
+        // case above does.
+        bool sawWeightlessError = false;
+        for (const PrefabAsset& asset : registry.Assets())
+            sawWeightlessError = sawWeightlessError ||
+                (!asset.error.empty() &&
+                 asset.definitionPath.filename() == "weightless.json");
+        CHECK(sawWeightlessError);
+        // The crate never asked for simulation, so it must not have acquired it.
+        const PrefabAsset* stillStatic = registry.Find("test/crate");
+        CHECK(stillStatic != nullptr);
+        if (stillStatic) CHECK(!stillStatic->rigidBody.enabled);
+
         WriteText("prefabs/variant.json", R"({
           "schemaVersion":2,"id":"test/variant","name":"Crate Variant",
           "extends":"test/crate","components":{"collision":{"shape":"mesh"}},
@@ -254,6 +304,25 @@ int main() {
             CHECK(fencePanel->targetSize == 0.0f);
             CHECK(!fencePanel->destructible.enabled);
             CHECK(std::filesystem::exists(fencePanel->modelPath));
+        }
+
+        // The shipping container is a sealed steel box, and the measured mesh
+        // says so: 2.4 x 2.4 x 6.2 m with the geometry reaching the bounds on
+        // every axis, so the box hugs it with no doorway or overhang to seal
+        // off. Its 15995 triangles bought nothing but a per-triangle tree per
+        // placement, and levels drop ten of them at a time.
+        const PrefabAsset* container = shipped.Find("props/container");
+        CHECK(container != nullptr);
+        if (container) {
+            CHECK(container->error.empty());
+            CHECK(container->collision == "box");
+            // Simulated, not static: the yard is meant to be shoved around.
+            // 64 kg/m^3 over the measured 35.7 m^3 bounds is about 2286 kg,
+            // an empty 20ft container.
+            CHECK(container->rigidBody.enabled);
+            CHECK(container->rigidBody.density == 64.0f);
+            CHECK(container->targetSize == 0.0f);
+            CHECK(std::filesystem::exists(container->modelPath));
         }
 
         const PrefabAsset* watchtower = shipped.Find("props/watchtower");

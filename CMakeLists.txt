@@ -145,6 +145,7 @@ set(SGE_RUNTIME_SOURCES
     src/physics/CollisionMesh.cpp
     src/physics/CollisionMeshCache.cpp
     src/physics/DestructionDX12.cpp
+    src/physics/SphereMeshCut.cpp
     src/world/terrain/TerrainStampBake.cpp
     src/world/vegetation/PalmMeshCutter.cpp
 )
@@ -535,6 +536,14 @@ if(BUILD_TESTING)
     add_executable(RuntimeCutPlaneTests tests/RuntimeCutPlaneTests.cpp)
     target_link_libraries(RuntimeCutPlaneTests PRIVATE SGEProjectHeaders)
     add_test(NAME RuntimeCutPlaneTests COMMAND RuntimeCutPlaneTests)
+
+    # Runtime sphere boolean, split out for the same reason: a grenade blowing a
+    # hole in a wall is arithmetic, so the crater can be checked without a
+    # device or any game content.
+    add_executable(SphereMeshCutTests
+        tests/SphereMeshCutTests.cpp src/physics/SphereMeshCut.cpp)
+    target_link_libraries(SphereMeshCutTests PRIVATE SGEProjectHeaders)
+    add_test(NAME SphereMeshCutTests COMMAND SphereMeshCutTests)
 
     add_executable(RagdollAssetTests tests/RagdollAssetTests.cpp)
     target_link_libraries(RagdollAssetTests PRIVATE SGEProjectHeaders)

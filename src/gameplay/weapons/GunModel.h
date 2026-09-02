@@ -83,6 +83,11 @@ public:
         return model;
     }
 
+    static std::shared_ptr<SceneNode>& RedDotSightModel() {
+        static std::shared_ptr<SceneNode> model;
+        return model;
+    }
+
     // Highest valid weapon id. Several parallel tables are sized to this, so
     // adding a weapon means extending every one of them.
     static constexpr int kMaxWeapon = 8;
@@ -176,6 +181,86 @@ public:
     static XMFLOAT3& PlayerFitRotation() {
         return WeaponFitRotation(SelectedWeapon());
     }
+
+    // Optic mount, per weapon and in gun-local space. The sight rides the
+    // weapon transform, so these are relative to the rifle rather than the
+    // camera: they slide it along the receiver rail, not across the screen.
+    // Each host mesh carries its rail at a different height and station, which
+    // is why one shared mount cannot serve every weapon.
+    static XMFLOAT3& WeaponOpticOffset(int weapon) {
+        static std::array<XMFLOAT3, kMaxWeapon + 1> offsets = {{
+            { 0.012f, 0.140f, 0.376f }, // AK47 rear receiver rail
+            { 0.012f, 0.140f, 0.376f }, // Mossberg receiver rail
+            // Only the AK and Mossberg accept an optic today (the red dot's
+            // compatibility mask in WeaponCustomization.h). The rest carry the
+            // same starting pose rather than a stale one, so widening that mask
+            // gives a sight roughly on the rail instead of floating in space.
+            { 0.012f, 0.140f, 0.376f }, // RPG
+            { 0.012f, 0.140f, 0.376f }, // SVD
+            { 0.012f, 0.140f, 0.376f }, // laser
+            { 0.012f, 0.140f, 0.376f }, // C4
+            { 0.012f, 0.140f, 0.376f }, // flamethrower
+            { 0.012f, 0.140f, 0.376f }, // harpoon
+            { 0.012f, 0.140f, 0.376f }, // SVD suppressed
+        }};
+        const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
+        return offsets[static_cast<size_t>(slot)];
+    }
+    static XMFLOAT3& PlayerOpticOffset() {
+        return WeaponOpticOffset(SelectedWeapon());
+    }
+    // Degrees, applied in the sight's own space before it is moved onto the
+    // rail, so it turns in place rather than swinging around the receiver. The
+    // asset is authored long on +X, and the renderer's own quarter turn down
+    // the barrel is separate from this -- zero here means "as mounted".
+    static XMFLOAT3& WeaponOpticRotation(int weapon) {
+        static std::array<XMFLOAT3, kMaxWeapon + 1> rotations{};
+        const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
+        return rotations[static_cast<size_t>(slot)];
+    }
+    static XMFLOAT3& PlayerOpticRotation() {
+        return WeaponOpticRotation(SelectedWeapon());
+    }
+    // Preserves the sight's real-world size against the normalised 1.25-unit
+    // rifle, so it is per weapon like the offset above it.
+    static float& WeaponOpticScale(int weapon) {
+        static std::array<float, kMaxWeapon + 1> scales = {{
+            1.42f, 1.42f, 1.42f, 1.42f, 1.42f, 1.42f, 1.42f, 1.42f, 1.42f
+        }};
+        const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
+        return scales[static_cast<size_t>(slot)];
+    }
+    static float& PlayerOpticScale() {
+        return WeaponOpticScale(SelectedWeapon());
+    }
+    // The collimated reticle is a separate emissive point from the sight body,
+    // so it carries its own placement: it sits behind and below the tube's
+    // centre, and it has to stay on the crosshair when the body is nudged.
+    static XMFLOAT3& WeaponReticleOffset(int weapon) {
+        static std::array<XMFLOAT3, kMaxWeapon + 1> offsets = {{
+            { 0.000f, 0.182f, -0.600f }, // AK47
+            { 0.000f, 0.182f, -0.600f }, // Mossberg
+            { 0.000f, 0.182f, -0.600f }, // RPG
+            { 0.000f, 0.182f, -0.600f }, // SVD
+            { 0.000f, 0.182f, -0.600f }, // laser
+            { 0.000f, 0.182f, -0.600f }, // C4
+            { 0.000f, 0.182f, -0.600f }, // flamethrower
+            { 0.000f, 0.182f, -0.600f }, // harpoon
+            { 0.000f, 0.182f, -0.600f }, // SVD suppressed
+        }};
+        const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
+        return offsets[static_cast<size_t>(slot)];
+    }
+    static XMFLOAT3& PlayerReticleOffset() {
+        return WeaponReticleOffset(SelectedWeapon());
+    }
+    // One dot size for every weapon: it is the apparent size of the reticle,
+    // which does not depend on which rifle is underneath it.
+    static float& ReticleSize() {
+        static float size = 0.001f;
+        return size;
+    }
+
     static bool PlayerLoaded() {
         return C4Selected() || FlamethrowerSelected() || HarpoonSelected() ||
             PlayerMesh() != nullptr;
@@ -268,6 +353,7 @@ public:
 
         LoadHarpoonGun();
         LoadHarpoonSpear();
+        LoadRedDotSight();
 
         const std::string path = Resolve("Content/Models/ak47/AK47.FBX");
         std::cout << "Loading AK47 " << path << "...\n";
@@ -351,6 +437,58 @@ private:
         for (const std::string& c : { rel, "build/" + rel, "../" + rel, "../../build/" + rel })
             if (std::filesystem::exists(c)) return c;
         return rel;
+    }
+
+    static void LoadRedDotSight() {
+        const std::string path = Resolve(
+            "Content/Models/MainPlayer/Guns/Attachment/Red+Dot+Sight.glb");
+        auto root = GLBImporter::LoadGLB(
+            path, g_dx12.device, g_dx12.commandList);
+        if (!root) {
+            std::cerr << "Red dot sight GLB unavailable; using procedural fallback\n";
+            return;
+        }
+
+        // The downloaded scene includes a large black presentation backdrop.
+        // It is not part of the attachment and would cover most of the viewmodel.
+        const auto prepare = [&](const auto& self,
+                                 const std::shared_ptr<SceneNode>& node) -> void {
+            if (!node) return;
+            node->children.erase(
+                std::remove_if(node->children.begin(), node->children.end(),
+                    [](const std::shared_ptr<SceneNode>& child) {
+                        return child && child->name == "BG";
+                    }),
+                node->children.end());
+            if (node->mesh) {
+                for (MeshPrimitive& primitive : node->mesh->primitives) {
+                    if (!primitive.material) continue;
+                    primitive.material->disableOcclusionCulling = true;
+                    // The lens carries its coverage in the glTF base-colour
+                    // texture. The shared material shader now consumes that
+                    // alpha directly, so no asset-specific opacity override is
+                    // needed here.
+                    if (primitive.material->name != "Glass") continue;
+                    // Tinted coating rather than clear plate: real reflex glass
+                    // passes most of the scene while throwing a faint cool cast,
+                    // and near-black metal here would sink the lens back to the
+                    // opaque look this is fixing.
+                    primitive.material->baseColorFactor.x = 0.58f;
+                    primitive.material->baseColorFactor.y = 0.70f;
+                    primitive.material->baseColorFactor.z = 0.78f;
+                    // Polished dielectric: sharp specular for the sky glint
+                    // across the lens, no metallic darkening underneath it.
+                    primitive.material->metallicFactor = 0.0f;
+                    primitive.material->roughnessFactor = 0.06f;
+                    // Both faces of a curved lens are visible through itself.
+                    primitive.material->doubleSided = true;
+                }
+            }
+            for (const auto& child : node->children) self(self, child);
+        };
+        prepare(prepare, root);
+        RedDotSightModel() = std::move(root);
+        std::cout << "Red dot sight GLB ready\n";
     }
 
     static void LoadHarpoonSpear() {

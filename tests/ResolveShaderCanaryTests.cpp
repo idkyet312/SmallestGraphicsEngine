@@ -54,6 +54,10 @@ int main(int argc, char** argv) {
         sourceDir + "/shaders/grass_vs.hlsl";
     const std::string grassShadowShaderPath =
         sourceDir + "/shaders/grass_shadow_vs.hlsl";
+    const std::string depthVertexShaderPath =
+        sourceDir + "/shaders/depth_vs.hlsl";
+    const std::string alphaShadowShaderPath =
+        sourceDir + "/shaders/alpha_shadow_ps.hlsl";
     const std::string clusteredPixelShaderPath =
         sourceDir + "/shaders/clustered_dx12_ps.hlsl";
     const std::string clusteredVertexShaderPath =
@@ -377,6 +381,8 @@ int main(int argc, char** argv) {
         { &fallbackPixelShaderPath, "main", "ps_5_0", hdrDefines },
         { &fallbackPixelShaderPath, "main", "ps_5_0", motionDefines },
         { &simplePixelShaderPath, "main", "ps_5_0", nullptr },
+        { &depthVertexShaderPath, "main", "vs_5_0", nullptr },
+        { &alphaShadowShaderPath, "main", "ps_5_0", nullptr },
         { &ddgiShaderPath, "CSMain", "cs_5_0", nullptr },
         { &volumetricFogShaderPath, "CSMain", "cs_5_0", nullptr },
         { &volumetricFogShaderPath, "CSMain", "cs_5_0", cloudDefines },

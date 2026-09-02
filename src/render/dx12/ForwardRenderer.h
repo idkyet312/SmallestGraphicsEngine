@@ -115,6 +115,7 @@ struct WaterTransparentDrawDX12 {
     bool extendedMaterialParameters = false;
 };
 
+inline bool g_transparencyQueueActive = false;
 inline bool g_waterTransparencySplitActive = false;
 inline XMFLOAT3 g_waterTransparencyCamera = {};
 inline std::vector<WaterTransparentDrawDX12>
@@ -157,11 +158,17 @@ inline bool TransparencyRendersAfterWaterDX12(const XMFLOAT3& position) {
 }
 
 inline void BeginWaterTransparencySplitDX12(const Scene& scene,
-                                             bool enabled) {
+                                             bool enabled,
+                                             bool splitAroundWater = false) {
     g_beforeWaterTransparentDraws.clear();
     g_afterWaterTransparentDraws.clear();
     g_waterTransparencyCamera = scene.camera.Position;
-    g_waterTransparencySplitActive = enabled;
+    g_transparencyQueueActive = enabled;
+    g_waterTransparencySplitActive = enabled && splitAroundWater;
+}
+
+inline bool TransparencyQueueActiveDX12() {
+    return g_transparencyQueueActive;
 }
 
 inline bool WaterTransparencySplitActiveDX12() {
@@ -257,9 +264,10 @@ inline void QueueWaterTransparentDrawDX12(
     draw.extendedMaterialParameters = extendedMaterialParameters;
     draw.specularScale = specularScale;
 
-    bool renderAfterWater =
-        TransparencyRendersAfterWaterDX12(draw.worldCenter);
-    if (draw.material) {
+    bool renderAfterWater = true;
+    if (g_waterTransparencySplitActive)
+        renderAfterWater = TransparencyRendersAfterWaterDX12(draw.worldCenter);
+    if (g_waterTransparencySplitActive && draw.material) {
         if (draw.material->waterTransparency ==
             WaterTransparencyMode::AfterWater)
             renderAfterWater = true;
@@ -1297,7 +1305,7 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
         }
 
         if (visibilityExtensionsOnly && visibilityOwned) continue;
-        if (transparent && g_waterTransparencySplitActive) {
+        if (transparent && g_transparencyQueueActive) {
             QueueWaterTransparentDrawDX12(
                 prim, model, view, proj, lightSpace, 0, 0, true,
                 colorNormalOnly, palmWindRoot, specularScale);
@@ -1598,7 +1606,7 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
             if (!meshShaderDraw && !transparent && !prim.skinBuffer &&
                 !RasterPrimitiveIntersectsFrustum(prim, model * view * proj))
                 continue;
-            if (transparent && g_waterTransparencySplitActive) {
+            if (transparent && g_transparencyQueueActive) {
                 QueueWaterTransparentDrawDX12(
                     prim, model, view, proj, lightSpace, bonePalette,
                     previousBonePalette, false);
@@ -1816,6 +1824,7 @@ inline void RenderWaterTransparencyPhaseDX12(
 inline void EndWaterTransparencySplitDX12() {
     g_beforeWaterTransparentDraws.clear();
     g_afterWaterTransparentDraws.clear();
+    g_transparencyQueueActive = false;
     g_waterTransparencySplitActive = false;
 }
 
@@ -2837,7 +2846,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         for (const WeaponPickup& pickup : scene.weaponPickups) {
             if (!pickup.active || pickup.collected) continue;
             const std::shared_ptr<SceneMesh>& pickupMesh =
-                pickup.weapon == 2 ? GunModel::RPGMesh() : GunModel::Mesh();
+                pickup.weapon.legacyWeaponId == 2 ?
+                    GunModel::RPGMesh() : GunModel::Mesh();
             if (!pickupMesh) continue;
 
             const float bob = std::sin(pickup.bobPhase * 1.9f) * 0.09f;
@@ -2954,7 +2964,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // spilled outward into a cone of brightening around the beam
             // instead of staying inside the shaft's own silhouette, so the
             // colour is clamped to a flat line that cannot glow at all.
-            shader.SetEmissiveMaterial(XMFLOAT3(1.0f, 1.0f, 1.0f), 0.85f * fade);
+            shader.SetEmissiveMaterial(scene.irLaser.color, 0.85f * fade);
             DrawCapsule(geo);
             shader.NextDrawCall();
 
@@ -2997,7 +3007,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                                             scene.irLaser.end.y,
                                             scene.irLaser.end.z);
                 shader.SetMatrices(model, view, proj, lightSpace);
-                shader.SetEmissiveMaterial(XMFLOAT3(1.0f, 1.0f, 1.0f),
+                shader.SetEmissiveMaterial(scene.irLaser.color,
                                            shell.opacity * fade);
                 DrawSphere(geo);
                 shader.NextDrawCall();
@@ -3391,6 +3401,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     if (scene.gun.visible && !scene.sniperScopeActive) {
         const XMMATRIX gunBase = scene.GetGunBaseMatrix();
         const float S = scene.GunModelScale();
+        const SGE::ResolvedWeaponStats weaponStats =
+            scene.player.ResolveWeaponStats(GunModel::SelectedWeapon());
 
         if (GunModel::PlayerLoaded()) {
             // The weapon sits at a fixed spot in front of the camera: the model
@@ -3433,6 +3445,112 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 DrawMeshAt(
                     GunModel::PlayerMesh(), shader, xf, view, proj, lightSpace);
             shader.Use(scene.wireframeMode);
+
+            // Attachment visuals use the same normalised weapon-local frame as
+            // the imported guns. They therefore inherit hand follow, sway, ADS
+            // and recoil without introducing attachment-specific pose state.
+            if (weaponStats.suppressed && !GunModel::C4Selected()) {
+                const XMMATRIX axisToBarrel = XMMatrixRotationX(XM_PIDIV2);
+                model = XMMatrixScaling(0.20f, 0.42f, 0.20f) *
+                    axisToBarrel * XMMatrixTranslation(0.0f, 0.01f, 1.02f) * xf;
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetObjectMaterial(XMFLOAT3(0.055f, 0.058f, 0.062f),
+                                         false, false, 0.34f, 0.92f,
+                                         nullptr, nullptr, nullptr);
+                DrawCapsule(geo);
+                shader.NextDrawCall();
+            }
+
+            if (weaponStats.redDotSight) {
+                // Mount placement is tunable from the viewmodel panel, so the
+                // sight can be walked onto the rail of a weapon it was not
+                // originally fitted against without a rebuild.
+                const XMFLOAT3& opticOffset = GunModel::PlayerOpticOffset();
+                const XMFLOAT3& opticRot = GunModel::PlayerOpticRotation();
+                const float opticScale = GunModel::PlayerOpticScale();
+                // Turning the sight in its own space happens before it slides
+                // onto the rail; doing it after would swing it around the
+                // receiver instead of spinning it in place.
+                const XMMATRIX opticTune =
+                    XMMatrixRotationRollPitchYaw(
+                        XMConvertToRadians(opticRot.x),
+                        XMConvertToRadians(opticRot.y),
+                        XMConvertToRadians(opticRot.z));
+                if (GunModel::RedDotSightModel()) {
+                    // The asset is authored long on +X with +Y up. Turn that
+                    // axis down the AK's +Z barrel, preserve its real-world
+                    // dimensions against the normalized 1.25-unit rifle, and
+                    // sit its base on the rear receiver rail.
+                    const XMMATRIX opticMount =
+                        XMMatrixScaling(opticScale, opticScale, opticScale) *
+                        XMMatrixRotationY(XM_PIDIV2) * opticTune *
+                        XMMatrixTranslation(opticOffset.x, opticOffset.y,
+                                            opticOffset.z) * xf;
+                    DrawSceneNode(GunModel::RedDotSightModel(), shader,
+                                  opticMount, view, proj, lightSpace);
+                    shader.Use(scene.wireframeMode);
+                } else {
+                    // The fallback blocks were authored around the same rail
+                    // pose as the GLB, so they are placed relative to the tuned
+                    // mount too and follow the same sliders.
+                    const XMFLOAT3 opticMetal(0.045f, 0.050f, 0.055f);
+                    const XMFLOAT3 opticParts[][2] = {
+                        {{-0.055f, 0.060f, 0.044f}, {0.025f, 0.055f, 0.075f}},
+                        {{ 0.055f, 0.060f, 0.044f}, {0.025f, 0.055f, 0.075f}},
+                        {{ 0.000f, 0.120f, 0.044f}, {0.080f, 0.020f, 0.080f}},
+                    };
+                    for (const auto& part : opticParts) {
+                        model = XMMatrixScaling(part[1].x, part[1].y, part[1].z) *
+                            opticTune *
+                            XMMatrixTranslation(
+                                part[0].x + opticOffset.x,
+                                part[0].y + opticOffset.y,
+                                part[0].z + opticOffset.z) * xf;
+                        shader.SetMatrices(model, view, proj, lightSpace);
+                        shader.SetObjectMaterial(opticMetal, false, false,
+                                                 0.30f, 0.90f,
+                                                 nullptr, nullptr, nullptr);
+                        DrawCube(geo);
+                        shader.NextDrawCall();
+                    }
+                }
+
+                // The GLB glass carries its tint and reflections; this small
+                // emissive point supplies the actual collimated red reticle.
+                // It is placed independently of the sight body so the dot can
+                // be centred in the glass after the mount has been moved.
+                const XMFLOAT3& reticle = GunModel::PlayerReticleOffset();
+                const float dot = GunModel::ReticleSize();
+                model = XMMatrixScaling(dot, dot, dot) *
+                    XMMatrixTranslation(reticle.x, reticle.y, reticle.z) * xf;
+                // A real collimated dot appears to float on the target, not
+                // inside the tube, so it must not lose the depth test to the
+                // sight's own glass and housing. This is the muzzle flash's
+                // state -- additive with DepthFunc ALWAYS -- for the same
+                // reason: the mark belongs on top of the viewmodel rather than
+                // being sorted against it.
+                shader.UseMuzzleFlash();
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetEmissiveMaterial(XMFLOAT3(5.5f, 0.025f, 0.012f),
+                                           0.92f);
+                DrawSphere(geo);
+                shader.NextDrawCall();
+                // The green circle around the dot needs no geometry: it is
+                // authored into the asset's own emissive map, which the lit path
+                // now samples and adds.
+                shader.Use(scene.wireframeMode);
+            }
+
+            if (weaponStats.laserSight) {
+                model = XMMatrixScaling(0.055f, 0.045f, 0.16f) *
+                    XMMatrixTranslation(0.095f, -0.005f, 0.48f) * xf;
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetObjectMaterial(XMFLOAT3(0.04f, 0.045f, 0.05f),
+                                         false, false, 0.38f, 0.88f,
+                                         nullptr, nullptr, nullptr);
+                DrawCube(geo);
+                shader.NextDrawCall();
+            }
 
             if (GunModel::LaserSelected()) {
                 // Procedural emitter conversion around the rifle silhouette:

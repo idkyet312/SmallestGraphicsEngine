@@ -1389,6 +1389,12 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLBInternal(
         sceneMat->doubleSided = mat.doubleSided;
         sceneMat->alphaCutout = mat.alphaMode == "MASK";
         sceneMat->alphaBlend = mat.alphaMode == "BLEND";
+        // glTF OPAQUE ignores the alpha component even when an exporter leaves
+        // a non-one value in baseColorFactor. Normalise it here so the generic
+        // SceneMaterial fallback (used by non-glTF authored materials) cannot
+        // accidentally turn an OPAQUE primitive into a blended draw.
+        if (!sceneMat->alphaCutout && !sceneMat->alphaBlend)
+            sceneMat->baseColorFactor.w = 1.0f;
         // Honour the authored threshold instead of the foliage default. Fence
         // and grating atlases ship ~0.33; clipping them lower leaves the
         // semi-transparent mip skirt around every wire.
@@ -1441,6 +1447,17 @@ std::shared_ptr<SceneNode> GLBImporter::LoadGLBInternal(
             int imgIdx = model.textures[nIdx].source;
             if (imgIdx >= 0 && imgIdx < model.images.size())
                 sceneMat->normalTexture = CreateTexture(device.Get(),
+                    commandList.Get(), model.images[imgIdx],
+                    sceneMat->uploadHeaps, true, immediateMipUpload);
+        }
+
+        // Emissive. Loaded like the other maps; the shader adds it after
+        // lighting so authored markings survive shadow.
+        int eIdx = mat.emissiveTexture.index;
+        if (eIdx >= 0) {
+            int imgIdx = model.textures[eIdx].source;
+            if (imgIdx >= 0 && imgIdx < model.images.size())
+                sceneMat->emissiveTexture = CreateTexture(device.Get(),
                     commandList.Get(), model.images[imgIdx],
                     sceneMat->uploadHeaps, true, immediateMipUpload);
         }
@@ -1640,7 +1657,7 @@ bool GLBImporter::BuildMeshletData(MeshPrimitive& primitive, ID3D12Device* devic
 
 static std::shared_ptr<SceneNode> MergeSceneGeometry(
     const std::shared_ptr<SceneNode>& modelRoot, ComPtr<ID3D12Device> device,
-    bool preserveMaterials) {
+    bool preserveMaterials, bool preserveAlphaMaterials = false) {
     if (!modelRoot) return nullptr;
 
     std::vector<std::pair<const MeshPrimitive*, XMMATRIX>> collected;
@@ -1651,8 +1668,13 @@ static std::shared_ptr<SceneNode> MergeSceneGeometry(
     std::vector<std::vector<std::pair<const MeshPrimitive*, XMMATRIX>>> buckets;
 
     for (auto& entry : collected) {
-        std::shared_ptr<SceneMaterial> mat = preserveMaterials
-            ? entry.first->material : nullptr;
+        const std::shared_ptr<SceneMaterial>& sourceMaterial =
+            entry.first->material;
+        const bool needsAlphaMaterial = preserveAlphaMaterials &&
+            sourceMaterial &&
+            (sourceMaterial->alphaCutout || sourceMaterial->IsTransparent());
+        std::shared_ptr<SceneMaterial> mat =
+            (preserveMaterials || needsAlphaMaterial) ? sourceMaterial : nullptr;
         int bucketIdx = -1;
         for (size_t i = 0; i < materialOrder.size(); i++) {
             if (materialOrder[i] == mat) { bucketIdx = (int)i; break; }
@@ -1749,10 +1771,10 @@ static std::shared_ptr<SceneNode> MergeSceneGeometry(
 
 std::shared_ptr<SceneNode> GLBImporter::MergeSceneByMaterial(
     const std::shared_ptr<SceneNode>& modelRoot, ComPtr<ID3D12Device> device) {
-    return MergeSceneGeometry(modelRoot, std::move(device), true);
+    return MergeSceneGeometry(modelRoot, std::move(device), true, false);
 }
 
 std::shared_ptr<SceneNode> GLBImporter::MergeSceneForDepth(
     const std::shared_ptr<SceneNode>& modelRoot, ComPtr<ID3D12Device> device) {
-    return MergeSceneGeometry(modelRoot, std::move(device), false);
+    return MergeSceneGeometry(modelRoot, std::move(device), false, true);
 }
