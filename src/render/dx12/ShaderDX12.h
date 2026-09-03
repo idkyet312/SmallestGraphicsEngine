@@ -140,10 +140,15 @@ struct alignas(256) ObjectBufferDX12 {
     // three padding floats that filled the gap below, so the uint4 that follows
     // keeps its byte-96 start.
     float useEmissiveMap = 0.0f;
+    // Binocular see-through for the first-person weapon. 0 leaves the draw
+    // fully opaque; above 0 the pixel shader fades it by view distance, so the
+    // parts nearest the eye clear the most. Takes the first of the two floats
+    // that padded the gap below, which keeps the uint4 on its byte-96 register.
+    float viewmodelSeeThrough = 0.0f;
     // HLSL starts uint4 values on a fresh 16-byte cbuffer register. Adding
     // alphaCutoff moved materialTime to byte 80, so the bindless indices now
     // begin at byte 96 rather than immediately after it.
-    float bindlessPadding[2] = {};
+    float bindlessPadding = 0.0f;
     UINT bindlessTextureIndices[4] = {
         BINDLESS_FALLBACK_WHITE, BINDLESS_FALLBACK_NORMAL,
         BINDLESS_FALLBACK_METALROUGH, BINDLESS_FALLBACK_BLACK
@@ -154,12 +159,23 @@ struct alignas(256) ObjectBufferDX12 {
     // reads at a fixed offset.
     XMFLOAT3 emissiveFactor = { 0.0f, 0.0f, 0.0f };
     float emissivePadding = 0.0f;
+    // Shape of the viewmodel see-through fade, live-tunable from the debug UI.
+    // Appended past the emissive tail rather than squeezed in ahead of the
+    // bindless indices: these start a fresh 16-byte register at byte 128, so
+    // neither guarded offset above can shift. Defaults match the weapon's own
+    // measured extent -- see ViewmodelSeeThroughAlpha in the pixel shader.
+    float seeThroughNear = 0.30f;   // metres; receiver at the eye
+    float seeThroughFar = 1.05f;    // metres; muzzle at arm's length
+    float seeThroughNearAlpha = 0.25f;  // coverage kept by the nearest geometry
+    float seeThroughPadding = 0.0f;
 };
 
 static_assert(offsetof(ObjectBufferDX12, bindlessTextureIndices) == 96,
               "ObjectBufferDX12 must match the bindless HLSL cbuffer layout");
 static_assert(offsetof(ObjectBufferDX12, emissiveFactor) == 112,
               "emissiveFactor must follow the bindless indices in the HLSL cbuffer");
+static_assert(offsetof(ObjectBufferDX12, seeThroughNear) == 128,
+              "see-through tuning must start its own 16-byte cbuffer register");
 
 // A light in the punctual list. Spotlights ride the same array rather than a
 // buffer of their own: the flashlight is the only one, and a second cbuffer
@@ -382,6 +398,18 @@ public:
     ComPtr<ID3D12PipelineState> wireframePipelineState;
     ComPtr<ID3D12PipelineState> transparentPipelineState;
     ComPtr<ID3D12PipelineState> additivePipelineState;
+    // Smooth viewmodel fading without temporal filtering: a depth-only pass
+    // finds the nearest weapon surface, then an EQUAL-tested alpha pass shades
+    // that surface once. This avoids both ordered-dither dots and back-face
+    // accumulation from ordinary transparent rendering.
+    ComPtr<ID3D12PipelineState> viewmodelDepthPipelineState;
+    ComPtr<ID3D12PipelineState> viewmodelBlendPipelineState;
+    ComPtr<ID3D12PipelineState> hdrViewmodelDepthPipelineState;
+    ComPtr<ID3D12PipelineState> hdrViewmodelBlendPipelineState;
+    ComPtr<ID3D12PipelineState> msaaViewmodelDepthPipelineState;
+    ComPtr<ID3D12PipelineState> msaaViewmodelBlendPipelineState;
+    ComPtr<ID3D12PipelineState> hdrMotionViewmodelDepthPipelineState;
+    ComPtr<ID3D12PipelineState> hdrMotionViewmodelBlendPipelineState;
     // Additive, depth-bound but always passing: the first-person muzzle flash
     // belongs to the viewmodel and must not be occluded by world geometry the
     // weapon is standing in.
@@ -435,6 +463,21 @@ public:
     UINT bindlessGlobalTableBase = BINDLESS_INVALID_INDEX;
     enum class DrawPipelineKind { Opaque, Transparent, Additive };
     DrawPipelineKind drawPipelineKind = DrawPipelineKind::Opaque;
+    enum class ViewmodelPass { None, Depth, Blend };
+    ViewmodelPass viewmodelPass = ViewmodelPass::None;
+    // Binocular see-through strength for the first-person weapon, applied to
+    // every material set while it is non-zero. Sticky rather than an argument
+    // on SetObjectMaterial: the viewmodel is drawn through a dozen call sites
+    // (mesh, skinned arms, procedural parts, DrawSceneNode) and several of them
+    // build their material internally, so threading a parameter would miss
+    // exactly the paths that need it. The renderer brackets the viewmodel with
+    // BeginViewmodelSeeThrough/EndViewmodelSeeThrough.
+    float viewmodelSeeThrough = 0.0f;
+    // Shape of that fade, carried alongside the strength for the same reason.
+    // Defaults mirror the shader's documented measurements.
+    float viewmodelSeeThroughNear = 0.30f;
+    float viewmodelSeeThroughFar = 1.05f;
+    float viewmodelSeeThroughNearAlpha = 0.25f;
     bool drawWireframe = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
@@ -981,6 +1024,74 @@ public:
         msaaSupported = hdrMsaaMainSupported &&
             createMSAAPipeline(msaaPipelineState);
 
+        auto createViewmodelPassPipelines = [&psoDesc](
+                ID3DBlob* pixelShader, DXGI_FORMAT colorFormat,
+                UINT renderTargetCount, UINT sampleCount,
+                ComPtr<ID3D12PipelineState>& depthTarget,
+                ComPtr<ID3D12PipelineState>& blendTarget) {
+            const D3D12_GRAPHICS_PIPELINE_STATE_DESC saved = psoDesc;
+            psoDesc.PS = { pixelShader->GetBufferPointer(),
+                           pixelShader->GetBufferSize() };
+            psoDesc.NumRenderTargets = renderTargetCount;
+            psoDesc.RTVFormats[0] = colorFormat;
+            psoDesc.SampleDesc.Count = sampleCount;
+            psoDesc.SampleDesc.Quality = 0;
+            psoDesc.RasterizerState.MultisampleEnable = sampleCount > 1;
+            psoDesc.BlendState.RenderTarget[0].BlendEnable = FALSE;
+            psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+            if (renderTargetCount > 1) {
+                psoDesc.BlendState.RenderTarget[1].BlendEnable = FALSE;
+                psoDesc.BlendState.RenderTarget[1].RenderTargetWriteMask = 0;
+            }
+            psoDesc.DepthStencilState.DepthWriteMask =
+                D3D12_DEPTH_WRITE_MASK_ALL;
+            psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+            HRESULT result = g_dx12.device->CreateGraphicsPipelineState(
+                &psoDesc, IID_PPV_ARGS(&depthTarget));
+            if (SUCCEEDED(result)) {
+                psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+                    D3D12_COLOR_WRITE_ENABLE_ALL;
+                psoDesc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+                psoDesc.BlendState.RenderTarget[0].SrcBlend =
+                    D3D12_BLEND_SRC_ALPHA;
+                psoDesc.BlendState.RenderTarget[0].DestBlend =
+                    D3D12_BLEND_INV_SRC_ALPHA;
+                psoDesc.BlendState.RenderTarget[0].BlendOp =
+                    D3D12_BLEND_OP_ADD;
+                psoDesc.BlendState.RenderTarget[0].SrcBlendAlpha =
+                    D3D12_BLEND_ONE;
+                psoDesc.BlendState.RenderTarget[0].DestBlendAlpha =
+                    D3D12_BLEND_INV_SRC_ALPHA;
+                psoDesc.BlendState.RenderTarget[0].BlendOpAlpha =
+                    D3D12_BLEND_OP_ADD;
+                if (renderTargetCount > 1)
+                    psoDesc.BlendState.RenderTarget[1].RenderTargetWriteMask =
+                        D3D12_COLOR_WRITE_ENABLE_ALL;
+                psoDesc.DepthStencilState.DepthWriteMask =
+                    D3D12_DEPTH_WRITE_MASK_ZERO;
+                psoDesc.DepthStencilState.DepthFunc =
+                    D3D12_COMPARISON_FUNC_EQUAL;
+                result = g_dx12.device->CreateGraphicsPipelineState(
+                    &psoDesc, IID_PPV_ARGS(&blendTarget));
+            }
+            psoDesc = saved;
+            return SUCCEEDED(result);
+        };
+
+        if (!createViewmodelPassPipelines(
+                psBlob.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1,
+                viewmodelDepthPipelineState, viewmodelBlendPipelineState) ||
+            !createViewmodelPassPipelines(
+                hdrPsBlob.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 1, 1,
+                hdrViewmodelDepthPipelineState,
+                hdrViewmodelBlendPipelineState)) return false;
+        if (msaaSupported && !createViewmodelPassPipelines(
+                psBlob.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 1,
+                MSAADX12::SampleCount, msaaViewmodelDepthPipelineState,
+                msaaViewmodelBlendPipelineState)) {
+            msaaSupported = false;
+        }
+
         // Alpha-blended material pass. Keep depth testing, disable depth writes
         // so glass reveals opaque geometry behind it.
         psoDesc.BlendState.RenderTarget[0].BlendEnable = TRUE;
@@ -1134,6 +1245,13 @@ public:
             if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
                     &psoDesc, IID_PPV_ARGS(&hdrMotionPipelineState))))
                 hdrMotionPipelineState.Reset();
+            if (!createViewmodelPassPipelines(
+                    motionPsBlob.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 2, 1,
+                    hdrMotionViewmodelDepthPipelineState,
+                    hdrMotionViewmodelBlendPipelineState)) {
+                hdrMotionViewmodelDepthPipelineState.Reset();
+                hdrMotionViewmodelBlendPipelineState.Reset();
+            }
 
             // Transparent motion variant
             psoDesc.BlendState.RenderTarget[0].BlendEnable = TRUE;
@@ -1355,7 +1473,37 @@ public:
     bool BindlessDrawActive() const { return currentDrawBindless; }
     void ForceLegacyNextMaterial() { forceLegacyNextMaterial = true; }
 
+    bool IsViewmodelPassActive() const {
+        return viewmodelPass != ViewmodelPass::None;
+    }
+
+    bool IsViewmodelDepthPrepass() const {
+        return viewmodelPass == ViewmodelPass::Depth;
+    }
+
+    ID3D12PipelineState* GetViewmodelPipelineState() const {
+        const bool depth = viewmodelPass == ViewmodelPass::Depth;
+        if (hdrTargetEnabled) {
+            if (extensionMotionEnabled) {
+                ID3D12PipelineState* motion = depth
+                    ? hdrMotionViewmodelDepthPipelineState.Get()
+                    : hdrMotionViewmodelBlendPipelineState.Get();
+                if (motion) return motion;
+            }
+            return depth ? hdrViewmodelDepthPipelineState.Get()
+                         : hdrViewmodelBlendPipelineState.Get();
+        }
+        if (msaaEnabled) {
+            return depth ? msaaViewmodelDepthPipelineState.Get()
+                         : msaaViewmodelBlendPipelineState.Get();
+        }
+        return depth ? viewmodelDepthPipelineState.Get()
+                     : viewmodelBlendPipelineState.Get();
+    }
+
     ID3D12PipelineState* GetPipelineState(bool wireframe = false) const {
+        if (IsViewmodelPassActive())
+            return GetViewmodelPipelineState();
         if (currentDrawBindless) {
             if (hdrTargetEnabled) {
                 if (wireframe && bindlessHDRWireframePipelineState)
@@ -1412,6 +1560,8 @@ public:
     }
 
     ID3D12PipelineState* GetAdditivePipelineState() const {
+        if (IsViewmodelPassActive())
+            return GetViewmodelPipelineState();
         if (currentDrawBindless) {
             if (hdrTargetEnabled) {
                 if (extensionMotionEnabled &&
@@ -1486,7 +1636,8 @@ public:
     void ActivateMaterialBinding(bool enableBindless) {
         const bool desired = enableBindless && bindlessRequested &&
             bindlessPipelineReady && bindlessHeap && bindlessHeap->Initialized() &&
-            bindlessGlobalTableBase != BINDLESS_INVALID_INDEX;
+            bindlessGlobalTableBase != BINDLESS_INVALID_INDEX &&
+            !IsViewmodelPassActive();
         if (desired != currentDrawBindless) {
             currentDrawBindless = desired;
             graphicsRootBound = false;
@@ -1548,6 +1699,32 @@ public:
         g_dx12.commandList->SetGraphicsRoot32BitConstants(21, 1, &value, 0);
     }
 
+    // Bracket the first-person weapon's draws to fade it by view distance.
+    // `strength` is the player's setting already scaled by the ADS raise, so 0
+    // leaves every material untouched and the weapon draws exactly as before.
+    void BeginViewmodelSeeThrough(float strength, float nearDistance = 0.30f,
+                                  float farDistance = 1.05f,
+                                  float nearAlpha = 0.25f,
+                                  bool depthPrepass = false) {
+        const float clamped =
+            (std::max)(0.0f, (std::min)(1.0f, strength));
+        viewmodelPass = clamped > 0.0f
+            ? (depthPrepass ? ViewmodelPass::Depth : ViewmodelPass::Blend)
+            : ViewmodelPass::None;
+        // The prepass must keep every opaque surface so it can select the
+        // nearest one. The second pass applies the actual distance fade.
+        viewmodelSeeThrough = depthPrepass ? 0.0f : clamped;
+        viewmodelSeeThroughNear = nearDistance;
+        viewmodelSeeThroughFar = farDistance;
+        viewmodelSeeThroughNearAlpha = nearAlpha;
+    }
+    // Must be called before anything else is drawn: the flag is sticky, and a
+    // viewmodel fade leaking into the world would fade the whole scene.
+    void EndViewmodelSeeThrough() {
+        viewmodelSeeThrough = 0.0f;
+        viewmodelPass = ViewmodelPass::None;
+    }
+
     void UseTransparent() {
         if (!loaded) return;
         drawPipelineKind = DrawPipelineKind::Transparent;
@@ -1575,6 +1752,11 @@ public:
         drawPipelineKind = DrawPipelineKind::Additive;
         drawWireframe = false;
         EnsureGraphicsRootBound();
+        if (IsViewmodelPassActive()) {
+            if (ID3D12PipelineState* pso = GetViewmodelPipelineState())
+                g_dx12.commandList->SetPipelineState(pso);
+            return;
+        }
         ID3D12PipelineState* pso = nullptr;
         if (!msaaEnabled && !currentDrawBindless) {
             pso = hdrTargetEnabled ? hdrMuzzleFlashPipelineState.Get()
@@ -1829,7 +2011,11 @@ public:
         data.useNormalMap = 0.0f;
         data.metalRoughMode = 0.0f;
         data.opacity = 1.0f;
-        
+        data.viewmodelSeeThrough = viewmodelSeeThrough;
+        data.seeThroughNear = viewmodelSeeThroughNear;
+        data.seeThroughFar = viewmodelSeeThroughFar;
+        data.seeThroughNearAlpha = viewmodelSeeThroughNearAlpha;
+
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
     }
@@ -1924,6 +2110,10 @@ public:
         data.specularScale = specularScale;
         data.materialType = materialType;
         data.materialTime = materialTime;
+        data.viewmodelSeeThrough = viewmodelSeeThrough;
+        data.seeThroughNear = viewmodelSeeThroughNear;
+        data.seeThroughFar = viewmodelSeeThroughFar;
+        data.seeThroughNearAlpha = viewmodelSeeThroughNearAlpha;
         if (useNorm && normal) {
             const D3D12_RESOURCE_DESC nd = normal->GetDesc();
             data.normalTexW = (float)nd.Width;
@@ -2131,6 +2321,10 @@ public:
         data.roughness = 1.0f;
         data.opacity = opacity;
         data.smokeMode = 2.0f;
+        data.viewmodelSeeThrough = viewmodelSeeThrough;
+        data.seeThroughNear = viewmodelSeeThroughNear;
+        data.seeThroughFar = viewmodelSeeThroughFar;
+        data.seeThroughNearAlpha = viewmodelSeeThroughNearAlpha;
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(
             3, objectBuffer.GetGPUAddress(bufferIndex));

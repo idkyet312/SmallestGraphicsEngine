@@ -259,6 +259,21 @@ struct Scene {
     float adsOffsetY = -0.075f;
     float adsOffsetZ = 0.30f;
     bool   sniperScopeActive = false;
+    // Player preference, pushed in from GameSettings. Lives on the scene
+    // because the renderer decides the viewmodel draw and cannot see the
+    // settings object, which is file-static to main.cpp.
+    bool   seeThroughWeaponWhenAiming = false;
+    float  seeThroughWeaponStrength = 1.0f;
+    // Shape of the fade, live-tunable from the debug panel. Defaults are the
+    // weapon's measured extent down the sight line: the gun origin sits at
+    // adsOffsetZ from the eye and the muzzle ~0.75m beyond it.
+    float  seeThroughNear = 0.30f;
+    float  seeThroughFar = 1.05f;
+    float  seeThroughNearAlpha = 0.25f;
+    // Draws the two ramp endpoints as planes across the view, so where the fade
+    // starts and stops is visible against the weapon instead of being inferred
+    // from two numbers. Debug only, and off by default.
+    bool   showSeeThroughPlanes = false;
     float  cameraNear  = 0.1f;
     // Far enough for the ordinary camera to see uninterrupted sea to its
     // horizon; the deployment view temporarily extends this when it pulls back.
@@ -404,6 +419,36 @@ struct Scene {
     // movement + firing state. The eased `crosshairSpread` chases it, so a
     // burst blooms the reticle fast and it settles slowly.
     float crosshairSpreadTarget = 0.0f;
+
+    // -- Optic dot (the HUD reticle drawn while aiming) ---------------------
+    //
+    // The sight's aiming mark. It is drawn in screen space at the point of aim
+    // rather than as geometry in the tube, so viewmodel sway cannot make it lie
+    // about where the barrel points. These are the live-tunable knobs for it.
+    //
+    // The competing world-space sphere inside the lens is off by default: two
+    // marks in one sight read as two sight pictures that never quite agree.
+    bool  opticWorldDotVisible = false;
+    float opticDotCoreRadius = 1.72f;   // pixels
+    float opticDotHaloRadius = 6.31f;   // pixels, the soft bloom around it
+    XMFLOAT3 opticDotColor = { 1.0f, 0.20f, 0.11f };
+    // How far the dot is allowed to drift off centre as the weapon moves, in
+    // pixels at the extremes of recoil and sway. Zero pins it dead centre.
+    float opticDotSwayPixels = 55.0f;
+    float opticDotRecoilPixels = 173.0f;
+    // Eased stand-in for gunRecoilKick, 0..1, driving the dot's climb only.
+    //
+    // The raw kick cannot be read directly: it decays at 95/sec, so a sighted
+    // rifle shot (2.10) is gone in 22ms -- about one frame at 60fps -- and the
+    // dot flicks up and back before it can be seen. This latches the peak and
+    // releases it slowly, which is what makes the climb readable. It also
+    // accumulates: each shot re-arms the peak before the last has decayed, so
+    // a burst walks the dot up and holds it there.
+    //
+    // HUD state only. The weapon's own recoil, spread and camera kick are
+    // untouched, so this changes what is drawn and nothing about how it shoots.
+    float opticDotRecoil = 0.0f;
+    float opticDotSettleRate = 4.5f;  // per second; lower hangs longer
 
     // Trailing "chip" health, in the same units as player.health. Follows the
     // real value down after a delay, so the HUD can show a pale ghost of the
@@ -912,6 +957,7 @@ struct Scene {
         muzzleFlashRotation = 0.0f;
         gunRecoilBack = 0.0f;
         gunRecoilKick = 0.0f;
+        opticDotRecoil = 0.0f;
         gunSwayYaw = gunSwayPitch = 0.0f;
         gunJumpPitch = gunJumpVelocity = 0.0f;
         gunPrevVerticalVel = 0.0f;
@@ -1108,6 +1154,19 @@ struct Scene {
         // Sharp impulse, quick mechanical return. Camera aim stays displaced,
         // so automatic fire climbs unless the player actively compensates.
         gunRecoilBack = (std::max)(0.0f, gunRecoilBack - 1.45f * dt);
+        // The optic dot latches the kick's peak BEFORE the decay below runs.
+        // Sampling after it would read a value already 95/sec into its fall,
+        // and at 60fps that is most of the impulse gone -- the reason a large
+        // pixel scale still looked like the dot was not moving.
+        {
+            constexpr float kMaxRecoilKick = 8.0f;
+            opticDotRecoil = (std::max)(opticDotRecoil,
+                                        gunRecoilKick / kMaxRecoilKick);
+            // Exponential release, so the hang is the same at any frame rate.
+            opticDotRecoil *= std::exp(-opticDotSettleRate *
+                                       (std::max)(0.0f, dt));
+            if (opticDotRecoil < 0.0005f) opticDotRecoil = 0.0f;
+        }
         gunRecoilKick = (std::max)(0.0f, gunRecoilKick - 95.0f * dt);
 
         // Weapon sway. Turning the camera leaves the gun behind for a moment,
@@ -2227,6 +2286,17 @@ struct Scene {
         const float sighted = cameraFOV + (weaponAdsFOV - cameraFOV) * adsBlend;
         return sighted + (sniperScopeFOV - sighted) * sniperScopeBlend +
                camera.ExplosionFovKick();
+    }
+    // How far the sighted weapon is faded toward see-through, 0 when off.
+    //
+    // Scaled by the ADS blend rather than the held button, so the weapon clears
+    // as the sights come up and returns to solid on the way back down, with no
+    // step at either end. The shader turns this into a per-pixel opacity that
+    // depends on distance from the eye -- see ViewmodelSeeThroughAlpha.
+    float ViewmodelSeeThroughStrength() const {
+        if (!seeThroughWeaponWhenAiming) return 0.0f;
+        const float sighted = (std::min)(1.0f, (std::max)(0.0f, adsBlend));
+        return seeThroughWeaponStrength * sighted;
     }
     float ScopeLookScale() const {
         // Sights slow the turn rate proportionally to the zoom so the sensitivity

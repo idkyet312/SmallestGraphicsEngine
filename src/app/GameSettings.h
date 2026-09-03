@@ -35,13 +35,34 @@ struct GameSettings {
 
     static constexpr float kDefaultSensitivity = 0.1f;
 
+    // Fade the sighted weapon toward see-through, approximating what the off
+    // eye gives a shooter at cheek weld. Opt-in: a solid weapon is the normal
+    // presentation, and a player who has not asked for this should never have
+    // their gun turn translucent on them.
+    bool seeThroughWeaponWhenAiming = false;
+
+    // How far the fade is taken. 1 is the tuned look; lower values keep more
+    // of the weapon, so a player who finds it distracting can dial it back
+    // without giving up the clearer sight picture entirely.
+    float seeThroughWeaponStrength = 1.0f;
+
+    static constexpr bool  kDefaultSeeThroughWeapon = false;
+    static constexpr float kDefaultSeeThroughStrength = 1.0f;
+    static constexpr float kMinSeeThroughStrength = 0.0f;
+    static constexpr float kMaxSeeThroughStrength = 1.0f;
+
     void Clamp() {
         mouseSensitivity = (std::max)(kMinSensitivity,
                            (std::min)(kMaxSensitivity, mouseSensitivity));
+        seeThroughWeaponStrength =
+            (std::max)(kMinSeeThroughStrength,
+            (std::min)(kMaxSeeThroughStrength, seeThroughWeaponStrength));
     }
 
     void ResetToDefaults() {
         mouseSensitivity = kDefaultSensitivity;
+        seeThroughWeaponWhenAiming = kDefaultSeeThroughWeapon;
+        seeThroughWeaponStrength = kDefaultSeeThroughStrength;
     }
 };
 
@@ -82,6 +103,16 @@ inline bool LoadGameSettings(GameSettings& out) {
             // rather than throwing out of a file read.
             out.mouseSensitivity = std::strtof(value.c_str(), nullptr);
         }
+        else if (key == "SeeThroughWeaponWhenAiming") {
+            // Several spellings accepted so a hand-edited file does not hinge
+            // on guessing which one the writer used. Anything else is off,
+            // which is also what a missing key gives.
+            out.seeThroughWeaponWhenAiming =
+                value == "1" || value == "true" || value == "yes";
+        }
+        else if (key == "SeeThroughWeaponStrength") {
+            out.seeThroughWeaponStrength = std::strtof(value.c_str(), nullptr);
+        }
     }
 
     // Whatever the file said, the result has to be usable.
@@ -95,6 +126,11 @@ inline bool SaveGameSettings(const GameSettings& settings) {
     file << "; Smallest Graphics Engine settings.\n"
          << "; Delete this file to restore defaults.\n"
          << "[Input]\n"
-         << "MouseSensitivity=" << settings.mouseSensitivity << "\n";
+         << "MouseSensitivity=" << settings.mouseSensitivity << "\n"
+         << "[Gameplay]\n"
+         << "SeeThroughWeaponWhenAiming="
+         << (settings.seeThroughWeaponWhenAiming ? 1 : 0) << "\n"
+         << "SeeThroughWeaponStrength="
+         << settings.seeThroughWeaponStrength << "\n";
     return file.good();
 }

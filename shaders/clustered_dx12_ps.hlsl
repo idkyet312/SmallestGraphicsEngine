@@ -50,10 +50,13 @@ cbuffer ObjectBuffer : register(b3) {
     float materialType;      // 0=ordinary, 1=pool water, 2=ocean
     float materialTime;      // seconds; used by procedural water detail
     float useEmissiveMap;    // > 0.5: add emissiveMap * emissiveFactor
-    // The CPU struct reserves these two floats so the uint4 below starts on its
+    // > 0: fade the first-person weapon by view distance, so the parts nearest
+    // the eye go the most transparent. See ViewmodelSeeThroughAlpha below.
+    float viewmodelSeeThrough;
+    // The CPU struct reserves this float so the uint4 below starts on its
     // 16-byte register at byte 96. Declared in both configurations, since the
-    // fields that follow them must land at the same offset either way.
-    float2 bindlessPadding;
+    // fields that follow it must land at the same offset either way.
+    float bindlessPadding;
 #ifdef SGE_BINDLESS_MATERIALS
     uint4 bindlessTextureIndices;
 #else
@@ -61,6 +64,12 @@ cbuffer ObjectBuffer : register(b3) {
 #endif
     float3 emissiveFactor;   // tint/intensity for emissiveMap
     float emissivePadding;
+    // Shape of the viewmodel see-through fade. Starts its own 16-byte register
+    // at byte 128, so it cannot disturb the offsets above.
+    float seeThroughNear;
+    float seeThroughFar;
+    float seeThroughNearAlpha;
+    float seeThroughPadding;
 };
 
 struct PointLightData {
@@ -683,6 +692,40 @@ float3 FinalizeOutput(float3 color) {
 #endif
 }
 
+// Binocular see-through for the sighted weapon.
+//
+// A rifle at cheek weld sits about a hand's width from the dominant eye, close
+// enough that the other eye looks straight past it; the brain suppresses the
+// blocked region, so the shooter sees the target through the receiver rather
+// than a ghost of it laid over the scene. One camera cannot reproduce that, so
+// the cue it produces is approximated instead: the nearer a surface is to the
+// eye, the further apart the two eyes' views of it are, and the more of the
+// scene behind it the off eye recovers. Opacity therefore rises with distance.
+//
+// The endpoints default to the viewmodel's own measured extent down the sight
+// line rather than to taste: with the ADS offset at 0.30m and the muzzle at
+// 0.83 local units under a 0.90 model scale, the weapon spans roughly 0.30m at
+// the receiver to 1.05m at the muzzle. So the receiver by the face clears the
+// most and the muzzle, which both eyes very nearly agree on, stays almost
+// solid. They come from the constant buffer so the debug UI can dial the shape
+// live, which is the only way to judge it.
+float ViewmodelSeeThroughAlpha(float3 fragPos, float3 eyePos, float strength) {
+    const float distance = length(eyePos - fragPos);
+    // 0 at the near end, 1 at the far end. smoothstep rather than a linear ramp
+    // so neither endpoint shows an edge where the fade starts or stops. max()
+    // guards the degenerate case: dragging the near slider past the far one
+    // would otherwise divide by zero and flash the weapon inside out.
+    const float far = max(seeThroughFar, seeThroughNear + 1e-3);
+    const float depth = smoothstep(seeThroughNear, far, distance);
+    // The nearest geometry keeps some coverage: taken to zero the weapon stops
+    // reading as an object at all, and the sights being aimed with are part of
+    // what would vanish.
+    // `strength` is the player's slider scaled by the ADS raise, so the weapon
+    // returns to solid at the hip and no seam appears mid-raise.
+    return lerp(1.0, lerp(saturate(seeThroughNearAlpha), 1.0, depth),
+                saturate(strength));
+}
+
 #ifdef SGE_EXTENSION_MOTION
 struct PS_OUTPUT {
     float4 color : SV_Target0;
@@ -730,7 +773,16 @@ float4 main(PS_INPUT input) : SV_TARGET
 #endif
     // Solid unlit emissive geometry. Additive PSO turns opacity into glow weight.
     if (smokeMode > 1.5) {
-        RETURN_COLOR(FinalizeOutput(objectColor), opacity);
+        float emissiveWeight = opacity;
+        // Glow weight, not coverage, on this PSO -- so the fade dims the
+        // emitter rather than making it see-through. That is the behaviour
+        // wanted anyway: a sight or tracer housing seen through a cleared
+        // receiver reads dimmer, not sharper.
+        if (viewmodelSeeThrough > 0.0) {
+            emissiveWeight *= ViewmodelSeeThroughAlpha(
+                input.fragPos, viewPos, viewmodelSeeThrough);
+        }
+        RETURN_COLOR(FinalizeOutput(objectColor), emissiveWeight);
     }
 
     // Unlit soft smoke sprite: sample the puff texture, tint by objectColor, and
@@ -965,6 +1017,14 @@ float4 main(PS_INPUT input) : SV_TARGET
     // so only the explicit blend mode consumes it.
     float surfaceOpacity = opacity *
         (isAlphaBlended ? materialTextureAlpha : 1.0);
+    if (viewmodelSeeThrough > 0.0) {
+        const float viewmodelAlpha = ViewmodelSeeThroughAlpha(
+            input.fragPos, viewPos, viewmodelSeeThrough);
+        // The viewmodel depth prepass has already selected the nearest opaque
+        // surface. Smooth alpha is therefore order-correct here without a
+        // screen-door pattern or temporal reconstruction.
+        surfaceOpacity *= viewmodelAlpha;
+    }
     if (isWater) {
         // Directional, animated capillary waves add detail below the CPU mesh
         // scale. Four incommensurate directions avoid a stationary cross-hatch.
@@ -1193,5 +1253,3 @@ float4 main(PS_INPUT input) : SV_TARGET
     result = FinalizeOutput(result);
     RETURN_COLOR(result, surfaceOpacity);
 }
-
-

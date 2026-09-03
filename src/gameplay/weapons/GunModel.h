@@ -170,7 +170,7 @@ public:
             // Sits further back and lower than the AK: Orient normalises both
             // to the same barrel length, but the M4's rear bound is closer to
             // its grip, so the same pocket would push it through the hands.
-            { 0.000f, -0.130f, -0.250f }, // M4A1 handguard
+            { 0.005f, -0.130f, -0.250f }, // M4A1 handguard
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -225,7 +225,7 @@ public:
             { 0.012f, 0.154f, 0.376f }, // SVD suppressed
             // Further forward and lower than the AK: the M4's flat-top rail
             // runs the length of the receiver, so the optic sits ahead of where
-            // the AK's dust-cover mount puts it. Paired with the 3.18 scale
+            // the AK's dust-cover mount puts it. Paired with the 3.07 scale
             // below -- this rifle imports smaller against the shared viewmodel
             // length, so both the position and the size differ.
             { 0.009f, 0.114f, 0.470f }, // M4A1 flat-top rail
@@ -268,7 +268,7 @@ public:
             // The M4 imports smaller relative to the shared viewmodel length
             // than the AK does, so the same sight needs scaling up to stay a
             // believable size on its rail.
-            3.18f // M4A1
+            3.07f // M4A1
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return scales[static_cast<size_t>(slot)];
@@ -290,7 +290,12 @@ public:
             { 0.000f, -1.000f, -0.600f }, // flamethrower
             { 0.000f, -1.000f, -0.600f }, // harpoon
             { 0.000f, -1.000f, -0.600f }, // SVD suppressed
-            { 0.163f, -1.000f, -0.600f }, // M4A1
+            // Unlike the others, this one is tuned rather than nominal: the
+            // M4 is the only weapon that actually mounts the sight, so its dot
+            // is centred in real glass. The sign flip against the rest follows
+            // from the mount sitting forward and high on the flat-top rail
+            // instead of back and low on a dust cover.
+            {-0.000f,  0.164f,  0.789f }, // M4A1
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -299,11 +304,41 @@ public:
         return WeaponReticleOffset(SelectedWeapon());
     }
     // One dot size for every weapon: it is the apparent size of the reticle,
-    // which does not depend on which rifle is underneath it.
+    // which does not depend on which rifle is underneath it. Tuned against the
+    // M4A1, the only weapon whose compatibility mask accepts the red dot today.
     static float& ReticleSize() {
-        static float size = 0.001f;
+        static float size = 0.0163f;
         return size;
     }
+
+    // Authored optic defaults, for the debug panel's Reset Sight.
+    //
+    // The accessors above hand out mutable references so the sliders can drive
+    // the live pose, which means the tuned starting values are gone the moment
+    // anything is dragged. These return the authored numbers by value so a
+    // reset restores the weapon actually in hand -- the reset used to hardcode
+    // the AK's mount and would overwrite the M4's with it.
+    static XMFLOAT3 DefaultOpticOffset(int weapon) {
+        // The M4's flat-top rail sits further forward and lower than the AK's
+        // dust-cover mount; every other weapon shares the AK's starting pose.
+        if (weapon == 9) return XMFLOAT3(0.009f, 0.114f, 0.470f);
+        return XMFLOAT3(0.012f, 0.154f, 0.376f);
+    }
+    static XMFLOAT3 DefaultOpticRotation(int weapon) {
+        // Small correction for the M4 rail's own pitch and cant.
+        if (weapon == 9) return XMFLOAT3(-5.0f, -1.0f, 0.0f);
+        return XMFLOAT3(0.0f, 0.0f, 0.0f);
+    }
+    static float DefaultOpticScale(int weapon) {
+        // The M4 imports smaller against the shared viewmodel length, so the
+        // same sight needs scaling up to stay a believable size on its rail.
+        return weapon == 9 ? 3.07f : 1.00f;
+    }
+    static XMFLOAT3 DefaultReticleOffset(int weapon) {
+        if (weapon == 9) return XMFLOAT3(-0.000f, 0.164f, 0.789f);
+        return XMFLOAT3(0.000f, -1.000f, -0.600f);
+    }
+    static float DefaultReticleSize() { return 0.0163f; }
 
     static bool PlayerLoaded() {
         return C4Selected() || FlamethrowerSelected() || HarpoonSelected() ||
@@ -512,14 +547,34 @@ private:
                     }),
                 node->children.end());
             if (node->mesh) {
+                // Material names here describe the product, not the parts:
+                // "RedDot" is the sight HOUSING (1905 of the asset's 2291
+                // triangles), not the reticle. Dropping it deleted the whole
+                // optic and left the ring behind -- the exact opposite of what
+                // was wanted. The painted ring lives on "Glass" instead, and is
+                // suppressed below by its texture rather than by deleting
+                // geometry the lens itself needs.
                 for (MeshPrimitive& primitive : node->mesh->primitives) {
                     if (!primitive.material) continue;
                     primitive.material->disableOcclusionCulling = true;
-                    // The lens carries its coverage in the glTF base-colour
-                    // texture. The shared material shader now consumes that
-                    // alpha directly, so no asset-specific opacity override is
-                    // needed here.
+                    // The asset also carries an authored emissive map, which
+                    // drew the glowing green ring. Nothing here wants it: the
+                    // only mark that should light up is the engine dot.
+                    primitive.material->emissiveTexture.Reset();
+                    primitive.material->emissiveFactor = { 0.0f, 0.0f, 0.0f };
                     if (primitive.material->name != "Glass") continue;
+                    // The ring is authored twice: once as the emissive glow
+                    // cleared above, and again in the lens base-colour texture,
+                    // which is what stayed visible as a faint grey circle after
+                    // the emissive went. Drop that texture as well so the glass
+                    // is a clean plate.
+                    //
+                    // It also carried the lens coverage, so the alpha has to be
+                    // supplied explicitly now -- without this the factor's 1.0
+                    // would leave an opaque disc where the glass used to be.
+                    primitive.material->baseColorTexture.Reset();
+                    primitive.material->baseColorFactor.w = 0.30f;
+                    primitive.material->alphaBlend = true;
                     // Tinted coating rather than clear plate: real reflex glass
                     // passes most of the scene while throwing a faint cool cast,
                     // and near-black metal here would sink the lens back to the

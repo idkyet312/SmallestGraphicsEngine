@@ -290,7 +290,8 @@ public:
                 primitive.meshletVertexIndexBuffer ? primitive.meshletVertexIndexBuffer->GetGPUVirtualAddress() : 0;
             const D3D12_GPU_VIRTUAL_ADDRESS triangleAddress =
                 primitive.meshletTriangleBuffer ? primitive.meshletTriangleBuffer->GetGPUVirtualAddress() : 0;
-            if (g_meshShader.CanDraw(primitive.meshletCount, descAddress,
+            if (!shader.IsViewmodelPassActive() &&
+                g_meshShader.CanDraw(primitive.meshletCount, descAddress,
                                      boundsAddress, vertexIndexAddress, triangleAddress)) {
                 // Material setup can switch the shared root signature between
                 // legacy tables and bindless indices. Match the mesh PSO to it
@@ -312,9 +313,36 @@ public:
                     // No meshlet culling: bind-pose bounds do not describe the
                     // posed view model drawn at the camera.
                     true);
+            } else if (shader.IsViewmodelPassActive()) {
+                // Smooth see-through uses matching depth-only and alpha IA
+                // PSOs. The mesh pipeline has independent fixed-function state,
+                // so using it here would bypass the nearest-surface prepass.
+                shader.SetSkinningEnabled(true);
+                g_dx12.commandList->SetGraphicsRootShaderResourceView(
+                    16, paletteAddress);
+                g_dx12.commandList->SetGraphicsRootShaderResourceView(
+                    17, primitive.skinBuffer->GetGPUVirtualAddress());
+                g_dx12.commandList->SetGraphicsRootShaderResourceView(
+                    19, paletteAddress);
+                g_dx12.commandList->SetPipelineState(
+                    shader.GetPipelineState(false));
+                g_dx12.commandList->IASetVertexBuffers(0, 1, &primitive.vbv);
+                g_dx12.commandList->IASetPrimitiveTopology(
+                    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                if (primitive.ibv.BufferLocation != 0) {
+                    g_dx12.commandList->IASetIndexBuffer(&primitive.ibv);
+                    g_dx12.commandList->DrawIndexedInstanced(
+                        primitive.indexCount, 1, 0, 0, 0);
+                } else {
+                    g_dx12.commandList->DrawInstanced(
+                        static_cast<UINT>(primitive.vertices.size() / 12),
+                        1, 0, 0);
+                }
             }
             shader.NextDrawCall();
         }
+        if (shader.IsViewmodelPassActive())
+            shader.SetSkinningEnabled(false);
     }
 
     // Load the view model. Safe to call repeatedly; only the first call does

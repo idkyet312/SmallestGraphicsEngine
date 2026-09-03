@@ -13,10 +13,14 @@
 #include "GunModel.h"   // SelectedWeapon() -- indexes the HUD ammo readout
 #include "ArmsModel.h"  // arms placement controls, tuned against the weapon
 #include "GunAudio.h"   // AudioDevice/AudioBus -- the Audio Mix sliders
+#include "UISearchFilter.h"  // settings-search text matching
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <sstream>
 #include <string>
+#include <vector>
 
 // Forward declare raytracing context
 struct RaytracingContext;
@@ -587,12 +591,50 @@ inline void RenderPlayerHUD(const Scene& scene) {
         if (weaponStats.redDotSight && scene.adsBlend > 0.10f) {
             const float fade = (std::min)(1.0f,
                 (scene.adsBlend - 0.10f) / 0.65f);
+
+            // The dot drifts with the weapon instead of being welded to the
+            // screen centre. A reflex sight's mark really does wander across
+            // the glass as the rifle moves under it, and a mark that never
+            // moves while the gun climbs through a burst reads as painted on
+            // the monitor.
+            //
+            // Each source is normalised against its own known extreme, so the
+            // pixel tunables mean what they say: "this many pixels when the
+            // weapon is as far off as it gets". Guessing a shared multiplier
+            // here would make both sliders lie about their own units.
+            //
+            // Sway is already damped hard in ADS by the scene (kGunSwayAmount
+            // is cut 82% down the sights), so this reads its residual rather
+            // than re-deriving it. Yaw moves the dot across, pitch moves it up.
+            const float swayScale = scene.opticDotSwayPixels /
+                Scene::kGunSwayMaxDegrees;
+            float offsetX = scene.gunSwayYaw * swayScale;
+            float offsetY = -scene.gunSwayPitch * swayScale;
+            // Climb comes from the eased opticDotRecoil, already normalised to
+            // 0..1 by the scene, not from gunRecoilKick directly. The raw kick
+            // decays at 95/sec and is gone in ~22ms -- roughly one frame at
+            // 60fps -- so reading it here made even a large pixel scale look
+            // like nothing was happening. Upward on screen, matching the muzzle
+            // climb the same impulse drives.
+            offsetY -= scene.opticDotRecoil * scene.opticDotRecoilPixels;
+            const ImVec2 dotCenter(center.x + offsetX, center.y + offsetY);
+
             const int haloAlpha = static_cast<int>(70.0f * fade);
             const int coreAlpha = static_cast<int>(245.0f * fade);
-            draw->AddCircleFilled(center, 3.6f,
-                IM_COL32(255, 25, 12, haloAlpha), 16);
-            draw->AddCircleFilled(center, 1.25f,
-                IM_COL32(255, 52, 28, coreAlpha), 12);
+            const ImU32 halo = IM_COL32(
+                static_cast<int>(255.0f * scene.opticDotColor.x),
+                static_cast<int>(255.0f * scene.opticDotColor.y * 0.50f),
+                static_cast<int>(255.0f * scene.opticDotColor.z * 0.55f),
+                haloAlpha);
+            const ImU32 core = IM_COL32(
+                static_cast<int>(255.0f * scene.opticDotColor.x),
+                static_cast<int>(255.0f * scene.opticDotColor.y),
+                static_cast<int>(255.0f * scene.opticDotColor.z),
+                coreAlpha);
+            draw->AddCircleFilled(dotCenter,
+                (std::max)(0.1f, scene.opticDotHaloRadius), halo, 16);
+            draw->AddCircleFilled(dotCenter,
+                (std::max)(0.1f, scene.opticDotCoreRadius), core, 12);
         }
     }
 
@@ -1246,33 +1288,100 @@ inline void DrawProfilerWindow() {
 
 // -- Settings search --------------------------------------------------------
 // The panel has grown past a dozen collapsing sections, so finding one slider
-// means remembering which header it lives under. The filter matches section
-// titles and, inside a matching section, leaves the contents untouched -- so a
-// hit still gives the control with its usual neighbours and context.
+// means remembering which header it lives under.
+//
+// Matching titles alone was not enough: the thing being looked for is almost
+// always a control, and its wording rarely appears in the header above it --
+// "sensitivity" is under "Camera Settings", "see-through" under "Viewmodel
+// (Gun)". So a section matches on its title OR on any of the keywords it
+// registers, and every term in the query has to hit something (typing more
+// words narrows rather than widens). Inside a surviving section the contents
+// are left untouched, so a hit still arrives with its usual neighbours.
 inline char g_uiSearch[64] = "";
-
-inline std::string UILowerCopy(const char* text) {
-    std::string out(text ? text : "");
-    for (char& c : out) c = (char)tolower((unsigned char)c);
-    return out;
-}
 
 inline bool UISearchActive() { return g_uiSearch[0] != 0; }
 
 inline bool UISearchMatches(const char* label) {
-    if (!UISearchActive()) return true;
-    return UILowerCopy(label).find(UILowerCopy(g_uiSearch)) != std::string::npos;
+    return UISearchTextMatches(UILowerCopy(label), g_uiSearch);
 }
+
+// How many sections the current query matched, so the panel can say "no
+// results" instead of just rendering nothing and looking broken. The headers
+// that increment the counter are drawn below the readout, so the panel shows
+// the previous frame's total and the counter is carried over at frame end.
+inline int g_uiSearchHits = 0;
+inline int g_uiSearchHitsLastFrame = 0;
 
 // Collapsing header that honours the search box: hidden when it does not match,
 // and forced open when it does, so a hit is visible without another click.
+//
+// `keywords` is a space-separated list of what this section contains, in the
+// words someone would actually type. It exists because the control labels
+// cannot be known before the section body runs -- ImGui is immediate mode, and
+// the body only executes once the header returns true.
 inline bool UISearchHeader(const char* label,
-                           ImGuiTreeNodeFlags flags = 0) {
+                           ImGuiTreeNodeFlags flags = 0,
+                           const char* keywords = nullptr) {
     if (UISearchActive()) {
-        if (!UISearchMatches(label)) return false;
+        if (!UISearchSectionMatches(label, keywords, g_uiSearch)) return false;
+        ++g_uiSearchHits;
         ImGui::SetNextItemOpen(true, ImGuiCond_Always);
     }
     return ImGui::CollapsingHeader(label, flags);
+}
+
+// Measured distance from the eye to the nearest and farthest vertex of the
+// weapon as it is actually drawn this frame.
+//
+// The see-through ramp is expressed in metres from the eye, so its endpoints
+// only mean something against this span. Deriving them from the ADS offset and
+// a nominal model scale was wrong: the fit offset, the fit rotation and the
+// per-weapon grip nudge all move the mesh, and each weapon carries its own.
+// Measuring the vertices is the only answer that survives someone dragging
+// those sliders, so it is measured rather than computed a second time.
+//
+// The transform must match ForwardRenderer's weapon draw exactly, hand follow
+// included, or the numbers describe a weapon that is not on screen.
+inline bool ViewmodelEyeDistanceRange(const Scene& scene, const SceneMesh& mesh,
+                                      float& nearest, float& farthest) {
+    using namespace DirectX;
+    const float S = scene.GunModelScale();
+    const XMFLOAT3& weaponOffset = GunModel::PlayerOffset();
+    const XMFLOAT3& weaponFitRot = GunModel::PlayerFitRotation();
+    const XMMATRIX weaponPlacement =
+        XMMatrixRotationRollPitchYaw(XMConvertToRadians(weaponFitRot.x),
+                                     XMConvertToRadians(weaponFitRot.y),
+                                     XMConvertToRadians(weaponFitRot.z)) *
+        XMMatrixScaling(S, S, S) *
+        XMMatrixTranslation(weaponOffset.x * S, weaponOffset.y * S,
+                            weaponOffset.z * S);
+    const XMMATRIX gunBase = scene.GetGunBaseMatrix();
+    XMMATRIX handFollow;
+    const XMMATRIX xf = ArmsModel::WeaponFollowTransform(handFollow, S)
+                            ? weaponPlacement * handFollow * gunBase
+                            : weaponPlacement * gunBase;
+
+    const XMVECTOR eye = XMLoadFloat3(&scene.ViewmodelAnchorPosition());
+    float minDistance = FLT_MAX, maxDistance = 0.0f;
+    // Every 12th float is a position: the interleaved layout is
+    // Pos(3) Normal(3) Tex(2) Tangent(4). Strided rather than per-primitive so
+    // a multi-material weapon is measured as one object.
+    for (const MeshPrimitive& primitive : mesh.primitives) {
+        for (size_t i = 0; i + 2 < primitive.vertices.size(); i += 12) {
+            const XMVECTOR local = XMVectorSet(primitive.vertices[i],
+                                               primitive.vertices[i + 1],
+                                               primitive.vertices[i + 2], 1.0f);
+            const XMVECTOR world = XMVector3TransformCoord(local, xf);
+            const float distance =
+                XMVectorGetX(XMVector3Length(XMVectorSubtract(world, eye)));
+            minDistance = (std::min)(minDistance, distance);
+            maxDistance = (std::max)(maxDistance, distance);
+        }
+    }
+    if (minDistance > maxDistance) return false;  // no vertices to measure
+    nearest = minDistance;
+    farthest = maxDistance;
+    return true;
 }
 
 inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
@@ -1533,14 +1642,35 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 g_destruction.GetRenderItems().size(),
                 g_destruction.IsBatchBuildPending() ? "building" : "idle");
     // Section search. Sits at the top of the panel so it is the first thing
-    // reached, and filters the collapsing sections below by title.
+    // reached, and filters the sections below by title and by the keywords each
+    // one registers -- so the wording of a control finds it, not just the
+    // header it happens to live under.
+    //
+    // The hit count is reset here rather than after the sections draw: the
+    // headers increment it as they are evaluated further down this same frame.
+    g_uiSearchHits = 0;
     ImGui::SetNextItemWidth(-90.0f);
     ImGui::InputTextWithHint("##uisearch", "Search settings...",
                              g_uiSearch, IM_ARRAYSIZE(g_uiSearch));
+    // Esc clears the box while typing in it, which is what every other search
+    // field does; without it the only way out is selecting the text by hand.
+    if (ImGui::IsItemActive() && ImGui::IsKeyPressed(ImGuiKey_Escape))
+        g_uiSearch[0] = 0;
     ImGui::SameLine();
     if (ImGui::Button("Clear##uisearch")) g_uiSearch[0] = 0;
-    if (UISearchActive())
-        ImGui::TextDisabled("Filtering sections by \"%s\"", g_uiSearch);
+    if (UISearchActive()) {
+        // Last frame's count: the sections that increment it are drawn below
+        // this line, so this frame's total does not exist yet. A frame of lag
+        // is invisible while typing, and the readout belongs above the results.
+        if (g_uiSearchHitsLastFrame == 0)
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f),
+                               "No sections match \"%s\"", g_uiSearch);
+        else
+            ImGui::TextDisabled("%d section%s matching \"%s\"",
+                                g_uiSearchHitsLastFrame,
+                                g_uiSearchHitsLastFrame == 1 ? "" : "s",
+                                g_uiSearch);
+    }
     ImGui::Separator();
 
     ImGui::Checkbox("God Mode", &scene.player.godMode);
@@ -1555,8 +1685,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     // Rendered here only while the standalone Profiler window is closed, so
     // the readout exists in exactly one place at a time.
     if (!g_showProfilerWindow &&
-        ImGui::CollapsingHeader("CPU / GPU Profiler",
-                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        UISearchHeader("CPU / GPU Profiler", ImGuiTreeNodeFlags_DefaultOpen,
+                       "performance timings frame time ms scopes gpu cpu "
+                       "profile spikes bottleneck")) {
         ProfilerPanelBody();
     }
     BanditDebugText();
@@ -1580,7 +1711,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::Separator();
 
     // -- Camera --
-    if (UISearchHeader("Camera Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (UISearchHeader("Camera Settings", ImGuiTreeNodeFlags_DefaultOpen,
+                       "position fov near far clip speed movement fps walking "
+                       "sensitivity view")) {
         ImGui::DragFloat3("Camera Position", &scene.camera.Position.x, 0.1f);
         ImGui::DragFloat("FOV",  &scene.cameraFOV,  0.5f, 1.0f, 120.0f);
         ImGui::DragFloat("Near", &scene.cameraNear, 0.01f, 0.01f, 10.0f);
@@ -1593,7 +1726,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     // One slider per bus in the submix graph, plus the master and the reverb
     // return. These write straight through to the live voices, so the effect is
     // audible while dragging rather than on the next sound played.
-    if (UISearchHeader("Audio Mix")) {
+    if (UISearchHeader("Audio Mix", 0,
+                       "volume master sound weapons voices music ambience "
+                       "reverb bus submix mute loudness")) {
         float master = AudioDevice::MasterVolume();
         if (ImGui::SliderFloat("Master", &master, 0.0f, 1.0f, "%.2f"))
             AudioDevice::SetMasterVolume(master);
@@ -1622,7 +1757,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     // -- Light --
-    if (UISearchHeader("Light Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (UISearchHeader("Light Settings", ImGuiTreeNodeFlags_DefaultOpen,
+                       "position color directional intensity ambient emissive "
+                       "brightness sun animate")) {
         ImGui::DragFloat3("Light Position", &scene.lightPos.x, 0.1f);
         ImGui::ColorEdit3("Light Color", &scene.lightColor.x);
         ImGui::SliderFloat("Directional Intensity",
@@ -1642,7 +1779,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     // -- Cube 1 --
-    if (UISearchHeader("Cube 1 Settings")) {
+    if (UISearchHeader("Cube 1 Settings", 0,
+                       "position rotation scale color animate transform")) {
         ImGui::DragFloat3("Position##c1", &scene.cube1.position.x, 0.1f);
         ImGui::DragFloat3("Rotation##c1", &scene.cube1.rotation.x, 1.0f);
         ImGui::DragFloat3("Scale##c1",    &scene.cube1.scale.x,    0.1f, 0.1f, 10.0f);
@@ -1651,7 +1789,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     // -- Cube 2 --
-    if (UISearchHeader("Cube 2 Settings")) {
+    if (UISearchHeader("Cube 2 Settings", 0,
+                       "position rotation scale color show second transform")) {
         ImGui::Checkbox("Show Second Cube", &scene.cube2.visible);
         if (scene.cube2.visible) {
             ImGui::DragFloat3("Position##c2", &scene.cube2.position.x, 0.1f);
@@ -1662,7 +1801,31 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     // -- Rendering --
-    if (UISearchHeader("Rendering Settings")) {
+    // The panel's largest section by a wide margin, so its keyword list is the
+    // one that matters most. Covers the control wording above the synonyms
+    // people actually type -- "antialiasing" for TAA/FXAA/MSAA, "ao" for GTAO,
+    // "water"/"ocean" for the wave sliders.
+    if (UISearchHeader("Rendering Settings", 0,
+                       "floor clear color wireframe collision volumes "
+                       "mesh shader terrain height detail relief error lod "
+                       "specular vsync helicopter blackhawk spotlight fog "
+                       "shadows cascades bias shadow size distance far "
+                       "raytracing rtx dxr svgf atrous denoise "
+                       "visibility buffer deferred bindless materials sm66 "
+                       "exposure eye adaptation bloom vignette film grain "
+                       "reflections roughness gi probe misses confidence "
+                       "temporal accumulation tlas refit ray classification "
+                       "taa fxaa msaa antialiasing anti-aliasing aa edge "
+                       "motion vectors history weight surface id "
+                       "weather atmosphere sky clouds volumetric rayleigh "
+                       "mie haze aerial perspective ground height fog "
+                       "gtao ao ambient occlusion radius strength contact "
+                       "bent normal ssr screen space reflections thickness "
+                       "water ocean tropical wave scale speed choppiness "
+                       "micro foam shore refraction flatten surf coast "
+                       "light shafts godrays intensity length decay "
+                       "rain ddgi irradiance normal bias probe spacing "
+                       "demo lights radius animate")) {
         ImGui::ColorEdit3("Floor Color", &scene.floor.color.x);
         ImGui::ColorEdit3("Clear Color", &scene.clearColor.x);
         ImGui::Checkbox("Wireframe Mode", &scene.wireframeMode);
@@ -2762,7 +2925,13 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     // -- Gun --
-    if (UISearchHeader("Viewmodel (Gun)")) {
+    if (UISearchHeader("Viewmodel (Gun)", 0,
+                       "weapon rifle offset scale rotation fit attachments "
+                       "optic sight red dot scope suppressor grip "
+                       "ads aim down sights fov blend recoil sway "
+                       "see-through see through transparent transparency "
+                       "opacity alpha binocular fade "
+                       "arms hands mirror head auto fire interval muzzle")) {
         ImGui::Checkbox("Show Gun",    &scene.gun.visible);
         ImGui::ColorEdit3("Gun Color", &scene.gun.color.x);
         ImGui::DragFloat3("Offset",    &scene.gun.offset.x,   0.01f);
@@ -2821,30 +2990,115 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::SliderFloat("Sight Z", &GunModel::PlayerOpticOffset().z,
                                -1.00f, 1.00f, "%.3f");
             ImGui::SliderFloat("Sight Scale", &GunModel::PlayerOpticScale(),
-                               0.10f, 4.00f, "%.2f");
+                               0.10f, 4.00f, "%.2f",
+                               ImGuiSliderFlags_AlwaysClamp);
+            // As with the reticle below: typed boxes for the mount, so a tuned
+            // pose can be entered or read back exactly rather than chased.
+            ImGui::InputFloat3("Sight X/Y/Z", &GunModel::PlayerOpticOffset().x,
+                               "%.4f");
+            ImGui::SetItemTooltip(
+                "Type exact values, or copy the tuned ones out. Same numbers "
+                "as the three sliders above.");
             ImGui::DragFloat3("Sight Rot", &GunModel::PlayerOpticRotation().x,
                               1.0f, -180.0f, 180.0f, "%.1f deg");
+            // The aiming mark itself. Screen-space and drawn at the point of
+            // aim, so it cannot be thrown off by viewmodel sway the way a dot
+            // modelled inside the tube can.
+            ImGui::SeparatorText("Optic Dot");
+            ImGui::SliderFloat("Dot Size", &scene.opticDotCoreRadius,
+                               0.2f, 8.0f, "%.2f px",
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SliderFloat("Dot Glow", &scene.opticDotHaloRadius,
+                               0.2f, 24.0f, "%.2f px",
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::ColorEdit3("Dot Color", &scene.opticDotColor.x);
+            // Travel at the extreme of each source, so the numbers are the
+            // actual pixel excursion rather than an abstract weight.
+            ImGui::SliderFloat("Dot Sway", &scene.opticDotSwayPixels,
+                               0.0f, 120.0f, "%.0f px",
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SetItemTooltip(
+                "Pixels of drift at full weapon sway. 0 pins the dot to the "
+                "screen centre.");
+            ImGui::SliderFloat("Dot Recoil", &scene.opticDotRecoilPixels,
+                               0.0f, 200.0f, "%.0f px",
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SetItemTooltip(
+                "Pixels of climb at full recoil kick. One sighted rifle shot "
+                "is about a quarter of this.");
+            ImGui::SliderFloat("Dot Settle", &scene.opticDotSettleRate,
+                               0.5f, 20.0f, "%.1f /s",
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SetItemTooltip(
+                "How fast the climb releases. Lower hangs longer; the default "
+                "4.5 settles in roughly a quarter second. The weapon's own "
+                "recoil is unaffected -- this is the dot only.");
+            ImGui::Text("dot climb %.2f", scene.opticDotRecoil);
+            ImGui::Checkbox("World Dot In Lens##optic",
+                            &scene.opticWorldDotVisible);
+            ImGui::SetItemTooltip(
+                "The older dot modelled inside the tube. Off by default: two "
+                "marks in one sight never quite agree. Its Reticle sliders "
+                "below only do anything while this is on.");
+
+            ImGui::BeginDisabled(!scene.opticWorldDotVisible);
             // The emissive dot is placed apart from the sight body, so moving
             // the mount leaves it behind until it is re-centred in the glass.
-            // Y sits at -1.0 in the tuned pose, so the floor is well below it:
-            // a slider pinned at its own minimum cannot be taken any further.
+            //
+            // Two rows for the same three numbers: the slider to hunt for the
+            // value by eye, and typed boxes underneath to enter or read one
+            // exactly. Dialling a dot onto a crosshair lands on figures like
+            // 0.164 that are painful to hit by dragging, and once found they
+            // are worth being able to copy out and paste back verbatim.
+            // AlwaysClamp so a typed number cannot put the dot somewhere the
+            // slider could never reach and then refuse to show it.
             ImGui::SliderFloat3("Reticle Pos",
                                 &GunModel::PlayerReticleOffset().x,
-                                -2.00f, 2.00f, "%.3f");
+                                -2.00f, 2.00f, "%.3f",
+                                ImGuiSliderFlags_AlwaysClamp);
+            ImGui::InputFloat3("Reticle X/Y/Z",
+                               &GunModel::PlayerReticleOffset().x, "%.4f");
+            ImGui::SetItemTooltip(
+                "Type exact values, or select and copy the tuned ones out. "
+                "Same numbers as the slider above.");
             // The tuned dot sits near the bottom of this range, so the floor is
             // well below it -- a slider pinned at its own minimum cannot be
             // taken any finer.
             ImGui::SliderFloat("Reticle Size", &GunModel::ReticleSize(),
-                               0.0002f, 0.05f, "%.4f");
+                               0.0002f, 0.05f, "%.4f",
+                               ImGuiSliderFlags_AlwaysClamp);
+            // InputFloat carries no range of its own, so a typed value is
+            // clamped here: a negative or wild size would otherwise make the
+            // dot vanish with no obvious way back short of Reset Sight.
+            if (ImGui::InputFloat("Reticle Size##exact",
+                                  &GunModel::ReticleSize(),
+                                  0.0001f, 0.001f, "%.4f"))
+                GunModel::ReticleSize() = (std::max)(
+                    0.0002f, (std::min)(0.05f, GunModel::ReticleSize()));
+            ImGui::EndDisabled();
+            // Restores the authored defaults for the weapon actually in hand,
+            // not the AK's. Hardcoding one set here meant resetting while
+            // holding the M4 threw away its tuned mount and replaced it with
+            // values belonging to a different rifle.
             if (ImGui::Button("Reset Sight##optic")) {
+                const int held = GunModel::SelectedWeapon();
                 GunModel::PlayerOpticOffset() =
-                    DirectX::XMFLOAT3(0.012f, 0.154f, 0.376f);
+                    GunModel::DefaultOpticOffset(held);
                 GunModel::PlayerOpticRotation() =
-                    DirectX::XMFLOAT3(0.0f, 0.0f, 0.0f);
-                GunModel::PlayerOpticScale() = 1.00f;
+                    GunModel::DefaultOpticRotation(held);
+                GunModel::PlayerOpticScale() = GunModel::DefaultOpticScale(held);
                 GunModel::PlayerReticleOffset() =
-                    DirectX::XMFLOAT3(0.0f, -1.000f, -0.600f);
-                GunModel::ReticleSize() = 0.001f;
+                    GunModel::DefaultReticleOffset(held);
+                GunModel::ReticleSize() = GunModel::DefaultReticleSize();
+                // The screen-space dot is the sight picture now, so a reset
+                // that left it dialled somewhere odd would not be a reset.
+                scene.opticDotCoreRadius = 1.72f;
+                scene.opticDotHaloRadius = 6.31f;
+                scene.opticDotColor = DirectX::XMFLOAT3(1.0f, 0.20f, 0.11f);
+                scene.opticDotSwayPixels = 55.0f;
+                scene.opticDotRecoilPixels = 173.0f;
+                scene.opticDotSettleRate = 4.5f;
+                scene.opticWorldDotVisible = false;
             }
             ImGui::SameLine();
             // The dot only lines up with the crosshair while aiming, so the
@@ -2865,6 +3119,98 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat("ADS FOV", &scene.adsFOV, 0.5f, 15.0f, 60.0f, "%.1f deg");
         ImGui::Text("blend %.2f%s", scene.adsBlend,
                     scene.adsActive ? "  (aiming)" : "");
+
+        // Binocular see-through. The player-facing toggle lives in the settings
+        // menu; these are the shape of the fade, here because judging them means
+        // aiming while dragging. Hold right mouse to see them take effect --
+        // everything below scales with the ADS blend, so at the hip they do
+        // nothing at all.
+        ImGui::SeparatorText("See-Through Weapon");
+        ImGui::Checkbox("See Through When Aiming",
+                         &scene.seeThroughWeaponWhenAiming);
+        ImGui::SetItemTooltip(
+            "Fades the weapon by distance from the eye, approximating what "
+            "your off eye sees past it. Persisted copy lives in Settings.");
+        ImGui::BeginDisabled(!scene.seeThroughWeaponWhenAiming);
+        ImGui::SliderFloat("See-Through Amount",
+                           &scene.seeThroughWeaponStrength, 0.0f, 1.0f, "%.2f");
+        // Near clears most, far stays solid. Dragging near past far is guarded
+        // in the shader, so a slider fight cannot produce a broken frame.
+        ImGui::DragFloat("See-Through Near", &scene.seeThroughNear, 0.005f,
+                         0.05f, 2.0f, "%.3f m");
+        ImGui::SetItemTooltip(
+            "Distance that fades the most. Default 0.30 m -- the receiver at "
+            "cheek weld.");
+        ImGui::DragFloat("See-Through Far", &scene.seeThroughFar, 0.005f,
+                         0.10f, 4.0f, "%.3f m");
+        ImGui::SetItemTooltip(
+            "Distance that stays solid. Default 1.05 m -- the muzzle, which "
+            "both eyes very nearly agree on.");
+        ImGui::SliderFloat("See-Through Floor", &scene.seeThroughNearAlpha,
+                           0.0f, 1.0f, "%.2f");
+        ImGui::SetItemTooltip(
+            "Coverage kept by the nearest geometry. At 0 the weapon vanishes "
+            "entirely, sights included.");
+
+        // The weapon's real distance from the eye, measured from the mesh the
+        // renderer is actually drawing rather than derived from the offsets.
+        // The near/far sliders are meaningless unless they straddle this range:
+        // set both below it and every pixel lands past the ramp's end, which
+        // evaluates to fully opaque and looks like the feature is broken.
+        {
+            // ~36k vertices on the M4A1, so the walk is cached and refreshed a
+            // few times a second: the numbers only need to track slider drags,
+            // not every frame.
+            const std::shared_ptr<SceneMesh>& mesh = GunModel::PlayerMesh();
+            static float nearest = 0.0f, farthest = 0.0f;
+            static bool measured = false;
+            static double lastMeasure = -1.0;
+            const double now = ImGui::GetTime();
+            if (mesh && (now - lastMeasure) > 0.1) {
+                lastMeasure = now;
+                measured = ViewmodelEyeDistanceRange(scene, *mesh, nearest,
+                                                     farthest);
+            }
+            if (mesh && measured) {
+                ImGui::Text("Weapon spans %.3f - %.3f m from the eye",
+                            nearest, farthest);
+                const bool straddles = scene.seeThroughNear < farthest &&
+                                       scene.seeThroughFar > nearest;
+                if (!straddles)
+                    ImGui::TextColored(
+                        ImVec4(1.0f, 0.55f, 0.35f, 1.0f),
+                        "Near/Far sit outside that span -- no visible fade.");
+                if (ImGui::Button("Fit To Weapon")) {
+                    scene.seeThroughNear = nearest;
+                    scene.seeThroughFar = farthest;
+                }
+                ImGui::SetItemTooltip(
+                    "Snap Near/Far onto the measured span, so the fade covers "
+                    "exactly the weapon and nothing else.");
+                ImGui::SameLine();
+            }
+        }
+        ImGui::Checkbox("Show Ramp Planes", &scene.showSeeThroughPlanes);
+        ImGui::SetItemTooltip(
+            "Draws the ramp endpoints across the view: green is Near (clears "
+            "most), red is Far (stays solid). The weapon should sit between "
+            "them.");
+        // A marker nearer than the camera near plane is clipped away and
+        // simply never appears, which reads as the toggle being broken. The
+        // fade itself still works there -- only the debug plane is invisible.
+        if (scene.showSeeThroughPlanes && scene.seeThroughNear < scene.cameraNear)
+            ImGui::TextColored(
+                ImVec4(1.0f, 0.55f, 0.35f, 1.0f),
+                "Near %.3f m is inside the %.2f m camera near plane; "
+                "the green marker is clipped and will not draw.",
+                scene.seeThroughNear, scene.cameraNear);
+        if (ImGui::Button("Reset See-Through")) {
+            scene.seeThroughWeaponStrength = 1.0f;
+            scene.seeThroughNear = 0.30f;
+            scene.seeThroughFar = 1.05f;
+            scene.seeThroughNearAlpha = 0.25f;
+        }
+        ImGui::EndDisabled();
 
         // The arms ride the weapon's transform, so these offsets are relative to
         // the gun, not the camera: they position the hands ON the weapon.
@@ -2962,7 +3308,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     }
 
     // -- Grass / wind --
-    if (g_grass.IsInitialized() && UISearchHeader("Grass & Wind")) {
+    if (g_grass.IsInitialized() && UISearchHeader("Grass & Wind", 0,
+                           "vegetation foliage wind strength speed sway "
+                           "player interaction push radius material")) {
         ImGui::SeparatorText("Material");
         bool foliageMaterialChanged =
             ImGui::ColorEdit3("Grass Albedo", &g_grass.Albedo().x);
@@ -3009,7 +3357,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         ImGui::DragFloat("Draw Distance", &g_grass.DrawDistance(), 0.5f, 8.0f, 80.0f);
     }
 
-    if (UISearchHeader("Destruction", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (UISearchHeader("Destruction", ImGuiTreeNodeFlags_DefaultOpen,
+                       "destructible wall damage radius bullet impulse "
+                       "blast debris rebuild collapse stress fracture chunks")) {
         ImGui::Checkbox("Enable Destructible Wall", &scene.useDestruction);
         ImGui::DragFloat("Damage Radius", &scene.destructionDamageRadius, 0.1f, 0.25f, 8.0f);
         ImGui::DragFloat("Damage", &scene.destructionDamage, 0.1f, 0.1f, 10.0f);
@@ -3045,7 +3395,8 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         }
     }
 
-    if (UISearchHeader("Palm Trees", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (UISearchHeader("Palm Trees", ImGuiTreeNodeFlags_DefaultOpen,
+                       "tree damage shot vegetation foliage trunk fell")) {
         // Absolute damage vs a section's 30 health: 15 => 2 hits to sever.
         ImGui::DragFloat("Tree Damage/Shot", &scene.treeDamagePerShot, 0.5f, 1.0f, 60.0f);
         ImGui::Text("Shoot a trunk to fell the tree above the hit.");
@@ -3070,6 +3421,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
     ImGui::Text("Renderer: DirectX 12 (%s)", renderer);
 
     ImGui::End();
+
+    // Every section has been evaluated by now, so this frame's tally becomes
+    // what the search readout shows at the top of the next one.
+    g_uiSearchHitsLastFrame = g_uiSearchHits;
 
     // Outside Scene Controls' Begin/End so it is a real sibling window.
     DrawProfilerWindow();

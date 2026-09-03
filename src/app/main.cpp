@@ -1454,6 +1454,11 @@ static bool g_showSettingsMenu = false;
 // the camera, or the player's sensitivity silently reverts when a level loads.
 static void ApplyGameSettings() {
     scene.camera.MouseSensitivity = g_settings.mouseSensitivity;
+    // Unlike the sensitivity above, these two survive a camera rebuild -- but
+    // they are reapplied here anyway so every path that reloads settings ends
+    // with the scene agreeing with the file.
+    scene.seeThroughWeaponWhenAiming = g_settings.seeThroughWeaponWhenAiming;
+    scene.seeThroughWeaponStrength = g_settings.seeThroughWeaponStrength;
 }
 
 // Player velocity in full 3D, differenced from the camera position each frame.
@@ -12917,6 +12922,43 @@ static void RenderSettingsMenu() {
                        "Lower is slower and steadier. Default %.2f.",
                        GameSettings::kDefaultSensitivity);
 
+    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+    UISectionLabel("WEAPON");
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+
+    if (ImGui::Checkbox("See through weapon when aiming",
+                        &g_settings.seeThroughWeaponWhenAiming)) {
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::TextColored(UITheme::kTextDim,
+                       "Approximates what your off eye sees past the gun.");
+
+    // The slider only means anything once the effect is on, so it is disabled
+    // rather than hidden -- a control that vanishes makes the checkbox above it
+    // look like it did nothing.
+    ImGui::BeginDisabled(!g_settings.seeThroughWeaponWhenAiming);
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    ImGui::TextColored(UITheme::kTextDim, "AMOUNT");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+    if (ImGui::SliderFloat("##seethrough",
+                           &g_settings.seeThroughWeaponStrength,
+                           GameSettings::kMinSeeThroughStrength,
+                           GameSettings::kMaxSeeThroughStrength, "%.2f")) {
+        // Live, like the sensitivity above: this is a look, and the only way to
+        // judge it is to aim with it.
+        ApplyGameSettings();
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        g_settings.Clamp();
+        ApplyGameSettings();
+        SaveGameSettings(g_settings);
+    }
+    ImGui::TextColored(UITheme::kTextDim,
+                       "Higher clears more of the weapon. Default %.2f.",
+                       GameSettings::kDefaultSeeThroughStrength);
+    ImGui::EndDisabled();
+
     ImGui::Dummy(ImVec2(0.0f, 16.0f));
     if (UIMenuButton("RESET TO DEFAULTS", 38.0f)) {
         g_settings.ResetToDefaults();
@@ -22634,19 +22676,40 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                                 : nullptr);
         }
 
+        const D3D12_CPU_DESCRIPTOR_HANDLE transparencyRTV =
+            commonHDRValidationTarget
+                ? visBuffer.GetOutputRTV()
+                : GetCPUDescriptorHandle(
+                    g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize,
+                    g_dx12.frameIndex);
+        bool combinedTransparencyDepthBound = false;
         const auto bindSplitTransparencyTarget = [&]() {
-            D3D12_CPU_DESCRIPTOR_HANDLE transparencyRTV =
-                commonHDRValidationTarget
-                    ? visBuffer.GetOutputRTV()
-                    : GetCPUDescriptorHandle(
-                        g_dx12.rtvHeap.Get(), g_dx12.rtvDescriptorSize,
-                        g_dx12.frameIndex);
             D3D12_CPU_DESCRIPTOR_HANDLE transparencyDSV =
                 g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            if (grassMSAAActive && grassMSAA.GetCombinedDepthResource()) {
+                const D3D12_CPU_DESCRIPTOR_HANDLE combinedDSV =
+                    grassMSAA.BeginCombinedDepthTest(
+                        g_dx12.commandList.Get());
+                if (combinedDSV.ptr) {
+                    transparencyDSV = combinedDSV;
+                    combinedTransparencyDepthBound = true;
+                }
+            }
             g_dx12.commandList->OMSetRenderTargets(
                 1, &transparencyRTV, FALSE, &transparencyDSV);
             g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
             g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+        };
+        const auto releaseSplitTransparencyDepth = [&]() {
+            if (!combinedTransparencyDepthBound) return;
+            grassMSAA.EndCombinedDepthTest(g_dx12.commandList.Get());
+            combinedTransparencyDepthBound = false;
+            // Later passes sample the combined texture, while rain and other
+            // raster extensions expect the ordinary scene DSV to be bound.
+            const D3D12_CPU_DESCRIPTOR_HANDLE sceneDSV =
+                g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            g_dx12.commandList->OMSetRenderTargets(
+                1, &transparencyRTV, FALSE, &sceneDSV);
         };
 
         if (renderedScene && WaterTransparencySplitActiveDX12()) {
@@ -22669,6 +22732,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     scene, mainShader, geo, fogLightSpace,
                     WaterTransparencyPhaseDX12::BeforeWater);
             }
+            releaseSplitTransparencyDepth();
         }
 
         if (renderedScene && !bentGTAODiagnosticActive &&
@@ -22757,6 +22821,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     scene, mainShader, geo, fogLightSpace,
                     phase);
             }
+            releaseSplitTransparencyDepth();
             EndWaterTransparencySplitDX12();
         }
 

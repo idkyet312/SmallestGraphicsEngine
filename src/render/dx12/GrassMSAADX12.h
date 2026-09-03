@@ -23,10 +23,12 @@ public:
         colorTarget_.Reset();
         depthTarget_.Reset();
         combinedDepth_.Reset();
+        combinedDepthTest_.Reset();
         coverageTarget_.Reset();
         width_ = width;
         height_ = height;
         readable_ = true;
+        combinedDepthRead_ = false;
         return CreateTargets(width, height);
     }
 
@@ -117,6 +119,31 @@ public:
         std::swap(barriers[5].Transition.StateBefore,
                   barriers[5].Transition.StateAfter);
         commandList->ResourceBarrier(4, &barriers[2]);
+
+        // A D3D12 texture cannot carry both UAV and depth-stencil flags. Keep
+        // the compute output shader-readable for AO/water/fog, and mirror the
+        // same resolved values into a persistent depth-only texture for late
+        // transparent raster draws.
+        D3D12_RESOURCE_BARRIER copyBarriers[2] = {};
+        copyBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        copyBarriers[0].Transition.pResource = combinedDepth_.Get();
+        copyBarriers[0].Transition.StateBefore =
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        copyBarriers[0].Transition.StateAfter =
+            D3D12_RESOURCE_STATE_COPY_SOURCE;
+        copyBarriers[0].Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        copyBarriers[1] = copyBarriers[0];
+        copyBarriers[1].Transition.pResource = combinedDepthTest_.Get();
+        copyBarriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_READ;
+        copyBarriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        commandList->ResourceBarrier(2, copyBarriers);
+        commandList->CopyResource(combinedDepthTest_.Get(), combinedDepth_.Get());
+        std::swap(copyBarriers[0].Transition.StateBefore,
+                  copyBarriers[0].Transition.StateAfter);
+        std::swap(copyBarriers[1].Transition.StateBefore,
+                  copyBarriers[1].Transition.StateAfter);
+        commandList->ResourceBarrier(2, copyBarriers);
     }
 
     ID3D12Resource* GetCombinedDepthResource() const {
@@ -125,6 +152,22 @@ public:
 
     ID3D12Resource* GetCoverageResource() const {
         return coverageTarget_.Get();
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE BeginCombinedDepthTest(
+            ID3D12GraphicsCommandList* commandList) {
+        D3D12_CPU_DESCRIPTOR_HANDLE handle = {};
+        if (!initialized || !combinedDepthTest_ || !commandList) return handle;
+        combinedDepthRead_ = true;
+        handle = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        return handle;
+    }
+
+    void EndCombinedDepthTest(ID3D12GraphicsCommandList* commandList) {
+        if (!combinedDepthRead_ || !commandList) return;
+        combinedDepthRead_ = false;
     }
 
 private:
@@ -136,6 +179,7 @@ private:
                 &rtv, IID_PPV_ARGS(&rtvHeap_)))) return false;
         D3D12_DESCRIPTOR_HEAP_DESC dsv = rtv;
         dsv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        dsv.NumDescriptors = 2;
         if (FAILED(g_dx12.device->CreateDescriptorHeap(
                 &dsv, IID_PPV_ARGS(&dsvHeap_)))) return false;
         D3D12_DESCRIPTOR_HEAP_DESC descriptors = {};
@@ -204,12 +248,29 @@ private:
                 &heap, D3D12_HEAP_FLAG_NONE, &desc,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
                 IID_PPV_ARGS(&combinedDepth_)))) return false;
+
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_DEPTH_READ, &depthClear,
+                IID_PPV_ARGS(&combinedDepthTest_)))) return false;
+        dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        dsv.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+        D3D12_CPU_DESCRIPTOR_HANDLE combinedDsv =
+            dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+        combinedDsv.ptr += g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        g_dx12.device->CreateDepthStencilView(
+            combinedDepthTest_.Get(), &dsv, combinedDsv);
         desc.Format = DXGI_FORMAT_R8_UNORM;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (FAILED(g_dx12.device->CreateCommittedResource(
                 &heap, D3D12_HEAP_FLAG_NONE, &desc,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
                 IID_PPV_ARGS(&coverageTarget_)))) return false;
         readable_ = true;
+        combinedDepthRead_ = false;
         return true;
     }
 
@@ -304,9 +365,11 @@ private:
     UINT width_ = 0;
     UINT height_ = 0;
     bool readable_ = true;
+    bool combinedDepthRead_ = false;
     ComPtr<ID3D12Resource> colorTarget_;
     ComPtr<ID3D12Resource> depthTarget_;
     ComPtr<ID3D12Resource> combinedDepth_;
+    ComPtr<ID3D12Resource> combinedDepthTest_;
     ComPtr<ID3D12Resource> coverageTarget_;
     ComPtr<ID3D12DescriptorHeap> rtvHeap_;
     ComPtr<ID3D12DescriptorHeap> dsvHeap_;

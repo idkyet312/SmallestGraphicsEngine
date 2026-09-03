@@ -35,6 +35,14 @@ public:
     // dispatches once the GPU actually ran them.
     static const UINT MAX_DESCRIPTORS = 4096;
 
+    // A whole level can enqueue thousands of mip dispatches. Keeping them in
+    // one command list gives the driver no short completion boundary and can
+    // trip Windows' GPU watchdog on content-heavy levels. The texel limit caps
+    // shader work while the dispatch limit also bounds command-list length.
+    static constexpr UINT MAX_BATCH_DISPATCHES = 128;
+    static constexpr UINT64 MAX_BATCH_DESTINATION_TEXELS =
+        16ull * 1024ull * 1024ull;
+
     bool Init() {
         std::ifstream csFile("shaders/generate_mips_cs.hlsl");
         if (!csFile.is_open()) {
@@ -167,14 +175,49 @@ public:
     // wait on its fence, while CPU initialization continues.
     void FlushPending() {
         if (!loaded || pending.empty()) return;
-        ID3D12GraphicsCommandList* cmdList = BeginComputeCommands();
-        // BeginComputeCommands waits for the previous batch, so its descriptor
-        // slices are no longer in flight and the fixed heap can be reused.
-        nextDescriptorSlot = 0;
-        for (const PendingMip& request : pending)
-            RecordMips(cmdList, request.texture.Get(), request.width,
-                       request.height, request.mipLevels);
-        SubmitComputeCommands();
+
+        size_t batchBegin = 0;
+        size_t batchCount = 0;
+        while (batchBegin < pending.size()) {
+            size_t batchEnd = batchBegin;
+            UINT batchDispatches = 0;
+            UINT64 batchDestinationTexels = 0;
+            while (batchEnd < pending.size()) {
+                const PendingMip& request = pending[batchEnd];
+                const UINT requestDispatches = request.mipLevels - 1;
+                const UINT64 requestDestinationTexels =
+                    EstimateDestinationTexels(request);
+                const bool batchHasWork = batchEnd != batchBegin;
+                const bool exceedsLimit = batchHasWork &&
+                    (batchDispatches + requestDispatches >
+                         MAX_BATCH_DISPATCHES ||
+                     static_cast<UINT64>(batchDispatches +
+                         requestDispatches) * 2ull > MAX_DESCRIPTORS ||
+                     batchDestinationTexels + requestDestinationTexels >
+                         MAX_BATCH_DESTINATION_TEXELS);
+                if (exceedsLimit) break;
+
+                batchDispatches += requestDispatches;
+                batchDestinationTexels += requestDestinationTexels;
+                ++batchEnd;
+            }
+
+            ID3D12GraphicsCommandList* cmdList = BeginComputeCommands();
+            // BeginComputeCommands waits for the preceding batch, so descriptor
+            // slices are no longer in flight and the fixed heap can be reused.
+            nextDescriptorSlot = 0;
+            for (size_t i = batchBegin; i < batchEnd; ++i) {
+                const PendingMip& request = pending[i];
+                RecordMips(cmdList, request.texture.Get(), request.width,
+                           request.height, request.mipLevels);
+            }
+            SubmitComputeCommands();
+            batchBegin = batchEnd;
+            ++batchCount;
+        }
+
+        std::cout << "MipGenerator: " << pending.size() << " textures in "
+                  << batchCount << " compute batches\n";
 
         // Compute queues cannot transition to PIXEL_SHADER_RESOURCE. Perform
         // that final ownership/state handoff on a small direct command list.
@@ -199,6 +242,18 @@ public:
     }
 
 private:
+    static UINT64 EstimateDestinationTexels(const PendingMip& request) {
+        UINT width = request.width;
+        UINT height = request.height;
+        UINT64 texels = 0;
+        for (UINT16 level = 1; level < request.mipLevels; ++level) {
+            width = (std::max)(1u, width / 2);
+            height = (std::max)(1u, height / 2);
+            texels += static_cast<UINT64>(width) * height;
+        }
+        return texels;
+    }
+
     void RecordMips(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* texture,
                     UINT width, UINT height, UINT16 mipLevels) {
 

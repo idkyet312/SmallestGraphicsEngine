@@ -407,6 +407,15 @@ if(BUILD_TESTING)
         SGEProjectHeaders nlohmann_json::nlohmann_json)
     add_test(NAME LevelDefinitionTests COMMAND LevelDefinitionTests)
 
+    # Header-only and free of any device, so they need nothing but the headers.
+    add_executable(GameSettingsTests tests/GameSettingsTests.cpp)
+    target_link_libraries(GameSettingsTests PRIVATE SGEProjectHeaders)
+    add_test(NAME GameSettingsTests COMMAND GameSettingsTests)
+
+    add_executable(UISearchFilterTests tests/UISearchFilterTests.cpp)
+    target_link_libraries(UISearchFilterTests PRIVATE SGEProjectHeaders)
+    add_test(NAME UISearchFilterTests COMMAND UISearchFilterTests)
+
     add_executable(RuntimeWorldTests
         tests/RuntimeWorldTests.cpp
         tests/GLBImporterPixelStub.cpp

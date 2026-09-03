@@ -1305,7 +1305,13 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
         }
 
         if (visibilityExtensionsOnly && visibilityOwned) continue;
-        if (transparent && g_transparencyQueueActive) {
+        // Authored glass must not become an opaque depth occluder in the
+        // viewmodel prepass. It draws normally in the following blend pass.
+        if (transparent && shader.IsViewmodelDepthPrepass()) continue;
+        // A fading viewmodel must draw now while its sticky tuning is active.
+        // World transparency can be replayed later.
+        if (transparent && g_transparencyQueueActive &&
+            !shader.IsViewmodelPassActive()) {
             QueueWaterTransparentDrawDX12(
                 prim, model, view, proj, lightSpace, 0, 0, true,
                 colorNormalOnly, palmWindRoot, specularScale);
@@ -1592,6 +1598,7 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
             }
 
             if (visibilityExtensionsOnly && visibilityOwned) continue;
+            if (transparent && shader.IsViewmodelDepthPrepass()) continue;
             const D3D12_GPU_VIRTUAL_ADDRESS meshletDescAddress = prim.meshletDescBuffer
                 ? prim.meshletDescBuffer->GetGPUVirtualAddress() : 0;
             const D3D12_GPU_VIRTUAL_ADDRESS boundsAddress = prim.meshletBoundsBuffer
@@ -1600,13 +1607,17 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
                 ? prim.meshletVertexIndexBuffer->GetGPUVirtualAddress() : 0;
             const D3D12_GPU_VIRTUAL_ADDRESS triangleAddress = prim.meshletTriangleBuffer
                 ? prim.meshletTriangleBuffer->GetGPUVirtualAddress() : 0;
+            // The smooth two-pass viewmodel PSOs are conventional IA PSOs.
+            // Keep these few meshes on the matching path while the fade runs.
             const bool meshShaderDraw = !transparent && g_useMeshShader &&
+                !shader.IsViewmodelPassActive() &&
                 g_meshShader.CanDraw(prim.meshletCount, meshletDescAddress,
                     boundsAddress, vertexIndexAddress, triangleAddress);
             if (!meshShaderDraw && !transparent && !prim.skinBuffer &&
                 !RasterPrimitiveIntersectsFrustum(prim, model * view * proj))
                 continue;
-            if (transparent && g_transparencyQueueActive) {
+            if (transparent && g_transparencyQueueActive &&
+                !shader.IsViewmodelPassActive()) {
                 QueueWaterTransparentDrawDX12(
                     prim, model, view, proj, lightSpace, bonePalette,
                     previousBonePalette, false);
@@ -3401,6 +3412,19 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     if (scene.gun.visible && !scene.sniperScopeActive) {
         const XMMATRIX gunBase = scene.GetGunBaseMatrix();
         const float S = scene.GunModelScale();
+        // Binocular see-through, if the player opted in. Set once around the
+        // whole viewmodel so every path below picks it up -- the AK mesh, the
+        // skinned arms, the procedural weapon parts and DrawSceneNode alike --
+        // and cleared at the end of the block so it cannot leak into the world.
+        // Zero when off or at the hip, which leaves every material untouched.
+        const float seeThrough = scene.ViewmodelSeeThroughStrength();
+        auto drawViewmodelPass = [&](bool depthPrepass) {
+        shader.BeginViewmodelSeeThrough(
+            seeThrough, scene.seeThroughNear, scene.seeThroughFar,
+            scene.seeThroughNearAlpha, depthPrepass);
+        // With see-through active this body runs twice: color writes are
+        // disabled while the first pass selects the nearest weapon surface,
+        // then smooth alpha shades that exact depth in the second pass.
         const SGE::ResolvedWeaponStats weaponStats =
             scene.player.ResolveWeaponStats(GunModel::SelectedWeapon());
 
@@ -3522,29 +3546,30 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                     }
                 }
 
-                // The GLB glass carries its tint and reflections; this small
-                // emissive point supplies the actual collimated red reticle.
-                // It is placed independently of the sight body so the dot can
-                // be centred in the glass after the mount has been moved.
-                const XMFLOAT3& reticle = GunModel::PlayerReticleOffset();
-                const float dot = GunModel::ReticleSize();
-                model = XMMatrixScaling(dot, dot, dot) *
-                    XMMatrixTranslation(reticle.x, reticle.y, reticle.z) * xf;
-                // A real collimated dot appears to float on the target, not
-                // inside the tube, so it must not lose the depth test to the
-                // sight's own glass and housing. This is the muzzle flash's
-                // state -- additive with DepthFunc ALWAYS -- for the same
-                // reason: the mark belongs on top of the viewmodel rather than
-                // being sorted against it.
-                shader.UseMuzzleFlash();
-                shader.SetMatrices(model, view, proj, lightSpace);
-                shader.SetEmissiveMaterial(XMFLOAT3(5.5f, 0.025f, 0.012f),
-                                           0.92f);
-                DrawSphere(geo);
-                shader.NextDrawCall();
-                // The green circle around the dot needs no geometry: it is
-                // authored into the asset's own emissive map, which the lit path
-                // now samples and adds.
+                // Optional world-space dot inside the lens. Off by default:
+                // the aiming mark is now the screen-space dot the HUD draws at
+                // the point of aim, and a second mark sitting in the glass
+                // beside it reads as two sight pictures that never agree. Kept
+                // behind a toggle rather than deleted -- it is still the honest
+                // way to see where the tube itself is pointing.
+                if (scene.opticWorldDotVisible) {
+                    const XMFLOAT3& reticle = GunModel::PlayerReticleOffset();
+                    const float dot = GunModel::ReticleSize();
+                    model = XMMatrixScaling(dot, dot, dot) *
+                        XMMatrixTranslation(reticle.x, reticle.y, reticle.z) * xf;
+                    // A real collimated dot appears to float on the target, not
+                    // inside the tube, so it must not lose the depth test to the
+                    // sight's own glass and housing. This is the muzzle flash's
+                    // state -- additive with DepthFunc ALWAYS -- for the same
+                    // reason: the mark belongs on top of the viewmodel rather
+                    // than being sorted against it.
+                    shader.UseMuzzleFlash();
+                    shader.SetMatrices(model, view, proj, lightSpace);
+                    shader.SetEmissiveMaterial(XMFLOAT3(5.5f, 0.025f, 0.012f),
+                                               0.92f);
+                    DrawSphere(geo);
+                    shader.NextDrawCall();
+                }
                 shader.Use(scene.wireframeMode);
             }
 
@@ -3737,13 +3762,81 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 shader.SetMatrices(model, view, proj, lightSpace);
                 shader.SetObjectMaterial(p.col, false, false, 0.85f, 0.35f,
                                          nullptr, nullptr, nullptr);
-            DrawCube(geo);
-            shader.NextDrawCall();
+                DrawCube(geo);
+                shader.NextDrawCall();
+            }
+        }
+
+        // Both weapon paths are done, so this runs whichever one drew. It used
+        // to sit inside the fallback branch above, where a loaded weapon mesh
+        // meant it never executed at all: the fade was never cleared (leaking
+        // the sticky flag into the world) and the debug planes never drew.
+        //
+        // Back to opaque before anything else is drawn: the flag is sticky, so
+        // leaving it set would fade the whole world behind the weapon.
+        shader.EndViewmodelSeeThrough();
+        };
+        if (seeThrough > 0.0f)
+            drawViewmodelPass(true);
+        drawViewmodelPass(false);
+        shader.Use(scene.wireframeMode);
+
+        // Debug: the ramp's two endpoints, drawn as thin slabs across the view
+        // at exactly the distances the shader uses. Placed after the fade is
+        // cleared so the markers are solid -- fading them by their own effect
+        // would make the near one nearly invisible, which is the one that
+        // matters. Green is the near end (clears most), red the far end (stays
+        // solid); the weapon should sit between them.
+        if (scene.showSeeThroughPlanes) {
+            const XMVECTOR eye = XMLoadFloat3(&scene.ViewmodelAnchorPosition());
+            const XMVECTOR front =
+                XMVector3Normalize(XMLoadFloat3(&scene.ViewmodelAnchorFront()));
+            struct RampPlane { float distance; XMFLOAT3 color; };
+            const RampPlane planes[] = {
+                { scene.seeThroughNear, { 0.1f, 0.9f, 0.2f } },
+                { scene.seeThroughFar,  { 0.9f, 0.15f, 0.1f } },
+            };
+            // Basis built from the camera's own vectors rather than from its
+            // Euler angles, for the same reason GetGunBaseMatrix does it: the
+            // vectors cannot disagree with the view matrix, and there is no
+            // sign convention to get wrong.
+            XMVECTOR planeRight =
+                XMVector3Cross(XMLoadFloat3(&scene.camera.Up), front);
+            if (XMVectorGetX(XMVector3LengthSq(planeRight)) < 1e-6f)
+                planeRight = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+            planeRight = XMVector3Normalize(planeRight);
+            const XMVECTOR planeUp =
+                XMVector3Normalize(XMVector3Cross(front, planeRight));
+            XMMATRIX planeBasis = XMMatrixIdentity();
+            planeBasis.r[0] = XMVectorSetW(planeRight, 0.0f);
+            planeBasis.r[1] = XMVectorSetW(planeUp, 0.0f);
+            planeBasis.r[2] = XMVectorSetW(front, 0.0f);
+
+            shader.UseTransparent();
+            for (const RampPlane& plane : planes) {
+                const XMVECTOR centre =
+                    XMVectorAdd(eye, XMVectorScale(front, plane.distance));
+                XMMATRIX oriented = planeBasis;
+                oriented.r[3] = XMVectorSetW(centre, 1.0f);
+                // Thin along the view axis so it reads as a plane rather than a
+                // box, and only as wide as the weapon so it does not curtain
+                // the whole view.
+                model = XMMatrixScaling(0.5f, 0.5f, 0.002f) * oriented;
+                shader.SetMatrices(model, view, proj, lightSpace);
+                shader.SetObjectMaterial(plane.color, false, false, 0.0f, 1.0f,
+                                         nullptr, nullptr, nullptr, false,
+                                         0.35f);
+                DrawCube(geo);
+                shader.NextDrawCall();
+            }
+            shader.Use(scene.wireframeMode);
         }
     }
     {
         // Everything Submit()ed above lands here as merged instanced draws, so
         // this scope carries the barrels, humvees and boat, not just the flush.
+        // The viewmodel's see-through flag is cleared before this point, so
+        // these batches are unaffected by it.
         ProfilerDX12::Scope staticScope(
             g_profiler, "FE/StaticBatches", g_dx12.commandList.Get());
         staticBatches.Flush(shader, view, proj, lightSpace);
@@ -3787,7 +3880,6 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             shader.NextDrawCall();
             shader.Use(scene.wireframeMode);
         }
-    }
 
     // Diagnostic: prove the material-descriptor cache and the destruction
     // early-out are doing what they claim. Written once, a couple of seconds in,
