@@ -54,6 +54,7 @@ cbuffer FrameConstants : register(b0) {
 
 #include "palm_wind.hlsli"
 #include "foliage_brdf.hlsli"
+#include "multiscatter_brdf.hlsli"
 
 cbuffer LightBuffer : register(b1) {
     float3 lightPos;
@@ -2618,6 +2619,9 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
 #endif
     float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
         texSampler, float2(NdotV, surface.rough), 0.0);
+    // Restores the energy GGX's single-scatter lobe drops at high roughness.
+    // Derived from the LUT sample directly above, so it costs no extra fetch.
+    float3 multiScatter = MultiScatterEnergyCompensation(F0, environmentBRDF);
     float foliageSpecularScale = surface.isFoliage ? 0.12 : 1.0;
 #if SGE_ENHANCED_VISUALS
     // Decomposed so the à-trous pass can isolate the specular contribution and
@@ -2627,7 +2631,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
     // feature off is the contract that catches silently-broken PSOs.
     float3 specularScale =
         (F0 * environmentBRDF.x + environmentBRDF.y) *
-        foliageSpecularScale;
+        foliageSpecularScale * multiScatter;
     float3 specularIBL = reflectionIBL * specularScale;
     float3 specularContrib = specularIBL * ambientOcclusion * ambientLightingIntensity;
     if (bentGTAOLightingActive) {
@@ -2683,7 +2687,7 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
 #else
     float3 specularIBL = reflectionIBL *
         (F0 * environmentBRDF.x + environmentBRDF.y) *
-        foliageSpecularScale;
+        foliageSpecularScale * multiScatter;
     if (bentGTAOLightingActive) {
         result += (diffuseIBL + diffuseGI) * diffuseAmbientOcclusion *
                   ambientLightingIntensity +
@@ -2704,7 +2708,12 @@ float3 ShadeSurface(uint2 pixel, Surface surface, float2 motion,
     
     float3 numerator = NDF * G * F;
     float denominator = 4.0 * NdotV * NdotL + 0.0001;
-    float3 specular = numerator / denominator * foliageSpecularScale;
+    // Energy compensation shares the LUT sample the IBL path already took, so
+    // the analytic lobe and the prefiltered lobe are corrected by the same
+    // factor. Correcting only one of them would make a rough metal's lit side
+    // and its reflected side disagree about the material's brightness.
+    float3 specular = numerator / denominator * foliageSpecularScale *
+        multiScatter;
     
     float shadowVisibility = CalculateShadow(surface.fragPos, surface.normal, L);
     shadowVisibility *= CalculateContactVisibility(

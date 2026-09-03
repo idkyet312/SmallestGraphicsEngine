@@ -613,6 +613,25 @@ float3 SampleEnvironment(float3 direction, float roughness)
     return environmentMap.SampleLevel(linearClamp, uv, lod).rgb;
 }
 
+// Farthest the first-person weapon reaches from the eye. The viewmodel is
+// drawn into the same opaque depth and colour buffers this trace reads, but
+// it is not world geometry: it hangs a fraction of a metre in front of the
+// camera and moves with it. A ray that hits it samples the barrel's bright
+// specular streak and paints it onto the water, at a depth that belongs to
+// nothing in the scene -- the gun appears to reflect off waves metres away.
+//
+// 1.05 m is the muzzle's measured eye distance (Scene::seeThroughFar, the
+// same figure the see-through fade is authored against), plus a small margin
+// so a weapon swayed or shouldered slightly forward is still covered. No
+// world surface the player can stand near sits inside that radius, so the
+// cutoff rejects the viewmodel without discarding real reflectors.
+//
+// Rejected as "no geometry here" rather than as a blocker: treating the gun
+// as an occluder would stop the ray dead and lose the reflection entirely,
+// which trades a wrong reflection for a missing one. Skipping lets the ray
+// continue to whatever real surface lies behind it.
+static const float kViewmodelRejectDistance = 1.35f;
+
 bool TraceWaterReflection(float3 origin, float3 direction, float roughness,
                           float2 pixel, out float2 hitUV, out float confidence)
 {
@@ -643,8 +662,17 @@ bool TraceWaterReflection(float3 origin, float3 direction, float roughness,
             continue;
         }
         float3 scenePosition = ReconstructWorld(uv, depth);
-        float delta = length(rayPosition - cameraTime.xyz) -
-                      length(scenePosition - cameraTime.xyz);
+        float sceneDistance = length(scenePosition - cameraTime.xyz);
+        // Viewmodel texels carry a depth no world surface owns. Skip them the
+        // same way the sky is skipped above: advance previousT so the ray keeps
+        // marching, and leave previousDelta untouched so the sign change that
+        // detects a real intersection is still measured against the last valid
+        // sample rather than against the gun.
+        if (sceneDistance < kViewmodelRejectDistance) {
+            previousT = t;
+            continue;
+        }
+        float delta = length(rayPosition - cameraTime.xyz) - sceneDistance;
         if (delta >= 0.0 && previousDelta < 0.0) {
             float lo = previousT;
             float hi = t;
@@ -655,13 +683,36 @@ bool TraceWaterReflection(float3 origin, float3 direction, float roughness,
                 float2 midUV = ProjectUV(midPosition);
                 float3 midScene =
                     ReconstructWorld(midUV, LoadOpaqueDepth(midUV));
-                if (length(midPosition - cameraTime.xyz) >=
-                    length(midScene - cameraTime.xyz))
-                    hi = mid;
-                else
+                float midSceneDistance = length(midScene - cameraTime.xyz);
+                // The bisection reads depth again at each step, so it can land
+                // on a viewmodel texel even when the coarse march avoided one.
+                // Its near distance would read as "the ray is already past the
+                // surface" and pull the interval toward the gun. Treat it as
+                // "no surface yet" and search the far half instead, which is
+                // where the real hit the coarse march bracketed still lies.
+                if (midSceneDistance < kViewmodelRejectDistance) {
                     lo = mid;
+                } else if (length(midPosition - cameraTime.xyz) >=
+                           midSceneDistance) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
             }
             hitUV = ProjectUV(origin + direction * hi);
+            // Last gate before the caller samples scene colour at hitUV. The
+            // two guards above keep the search off the viewmodel, but the
+            // resolved point is re-projected here and can still land on a gun
+            // texel at a silhouette edge. Sampling it would copy the barrel's
+            // highlight into the water, which is the artefact being fixed, so
+            // report a miss and let the caller keep its environment fallback.
+            float hitDistance = length(
+                ReconstructWorld(hitUV, LoadOpaqueDepth(hitUV)) -
+                cameraTime.xyz);
+            if (hitDistance < kViewmodelRejectDistance) {
+                confidence = 0.0;
+                return false;
+            }
             float edge = min(min(hitUV.x, hitUV.y),
                              min(1.0 - hitUV.x, 1.0 - hitUV.y));
             confidence = smoothstep(0.0, 0.075, edge) *

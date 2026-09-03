@@ -686,6 +686,7 @@ float3 calculatePointLight(int index, float3 fragPos, float3 normal, float3 view
 // AgX (Punchy). Shared with grass_ps and sky_ps -- see agx_tonemap.hlsli.
 #include "agx_tonemap.hlsli"
 #include "foliage_brdf.hlsli"
+#include "multiscatter_brdf.hlsli"
 
 float3 FinalizeOutput(float3 color) {
 #ifdef SGE_HDR_TARGET
@@ -1024,13 +1025,17 @@ float4 main(PS_INPUT input) : SV_TARGET
     // so only the explicit blend mode consumes it.
     float surfaceOpacity = opacity *
         (isAlphaBlended ? materialTextureAlpha : 1.0);
+    float viewmodelCoverage = 1.0;
+    float glassFresnel = 0.0;
+    float glassAbsorption = 0.0;
+    float3 glassCoatingTint = float3(1.0, 1.0, 1.0);
     if (viewmodelSeeThrough > 0.0) {
-        const float viewmodelAlpha = ViewmodelSeeThroughAlpha(
+        viewmodelCoverage = ViewmodelSeeThroughAlpha(
             input.fragPos, viewPos, viewmodelSeeThrough);
         // The viewmodel depth prepass has already selected the nearest opaque
         // surface. Smooth alpha is therefore order-correct here without a
         // screen-door pattern or temporal reconstruction.
-        surfaceOpacity *= viewmodelAlpha;
+        surfaceOpacity *= viewmodelCoverage;
     }
     if (isWater) {
         // Directional, animated capillary waves add detail below the CPU mesh
@@ -1110,14 +1115,49 @@ float4 main(PS_INPUT input) : SV_TARGET
     // is water's index of refraction and would under-reflect glass.
     if (isGlass) {
         const float nDotVGlass = saturate(dot(normal, viewDir));
-        const float fresnelGlass =
+        const float baseFresnel =
             0.04 + (1.0 - 0.04) * pow(1.0 - nDotVGlass, 5.0);
+        // The source lens is a nearly flat low-poly plate, so its geometric
+        // normal cannot produce the curved highlight a real moulded lens has
+        // around its silhouette. Its UVs do preserve that boundary; use only
+        // the outer strip to recover the missing change in incidence angle.
+        // The source lens occupies this sub-rectangle of its discarded colour
+        // atlas. Remap in the shader because the importer has already uploaded
+        // the original vertex buffer by the time the material is identified.
+        const float2 glassUV = saturate(
+            (input.texCoord - float2(0.0488, 0.1473)) /
+            float2(0.4773, 0.3816));
+        const float edgeDistance = min(
+            min(glassUV.x, 1.0 - glassUV.x),
+            min(glassUV.y, 1.0 - glassUV.y));
+        const float edgeWidth = max(fwidth(edgeDistance) * 2.0, 0.06);
+        const float glassEdge =
+            1.0 - smoothstep(0.0, edgeWidth, edgeDistance);
+        glassFresnel = saturate(
+            baseFresnel + glassEdge * 0.18 * (1.0 - baseFresnel));
+
+        // Reflex optics use a faint anti-reflective coating. Keeping the shift
+        // on reflected light avoids painting the transmitted scene uniformly
+        // blue, while the angle dependence gives the lens some depth in motion.
+        const float coatingAngle = saturate(
+            pow(1.0 - nDotVGlass, 2.0) + glassEdge * 0.35);
+        glassCoatingTint = lerp(
+            float3(0.92, 0.98, 1.04),
+            float3(0.58, 0.90, 1.20), coatingAngle);
         // The authored alpha still scales the result, so the material's own
         // baseColorFactor.w remains the overall density control and the two
         // tunables shape the curve between them.
         const float clarity = saturate(glassClarity);
         const float grazing = saturate(glassGrazing);
-        surfaceOpacity = lerp(clarity, grazing, saturate(fresnelGlass * 4.0));
+        glassAbsorption = surfaceOpacity * lerp(
+            clarity, grazing,
+            saturate(baseFresnel * 4.0 + glassEdge * 0.40));
+        // Reflection is coverage too. Folding it into alpha lets the centre
+        // transmit almost untouched while a glancing edge can become a proper
+        // environment reflection instead of a uniformly tinted overlay.
+        const float reflectionCoverage = glassFresnel * viewmodelCoverage;
+        surfaceOpacity = saturate(
+            glassAbsorption + reflectionCoverage * (1.0 - glassAbsorption));
     }
 
     if (!isWater && metal < 0.25) {
@@ -1132,7 +1172,9 @@ float4 main(PS_INPUT input) : SV_TARGET
     rough = clamp(sqrt(rough * rough + min(normalVariance * 0.25, 0.25)), 0.045, 1.0);
 
     // Base ambient
-    float3 diffuseAlbedo = albedo * (1.0 - metal);
+    float3 diffuseAlbedo = isGlass
+        ? float3(0.0, 0.0, 0.0)
+        : albedo * (1.0 - metal);
     float3 ambient = ambientStrength * diffuseAlbedo * ambientScale;
     
     // Add DDGI global illumination
@@ -1199,7 +1241,12 @@ float4 main(PS_INPUT input) : SV_TARGET
     float3 kS = F;
     float3 kD = float3(1.0, 1.0, 1.0) - kS;
     kD *= 1.0 - metal;
-    
+    // Hoisted above the analytic lobe so direct light and IBL share one LUT
+    // fetch and one compensation factor. Correcting only the IBL side would
+    // make a rough metal's lit and reflected halves disagree in brightness.
+    float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
+        texSampler, float2(NdotV, rough), 0.0);
+    float3 multiScatter = MultiScatterEnergyCompensation(F0, environmentBRDF);
     float3 numerator = NDF * G * F;
     float denominator = max(4.0 * NdotV * NdotL, 0.001);
     // Skinned enemy outfits share a positive view-fill tag. Their mostly
@@ -1210,7 +1257,8 @@ float4 main(PS_INPUT input) : SV_TARGET
     float surfaceSpecularScale =
         (isFoliage ? 0.12 : characterSpecularScale) *
         max(specularScale, 0.0);
-    float3 specular = numerator / denominator * surfaceSpecularScale;
+    float3 specular = numerator / denominator * surfaceSpecularScale *
+        multiScatter;
     
     // Combine
     float shadowVisibility = CalculateShadow(input.fragPos, normal, lightDir);
@@ -1225,7 +1273,10 @@ float4 main(PS_INPUT input) : SV_TARGET
     result += diffuseAlbedo *
               (isFoliage ? 0.0 : max(viewFillStrength, 0.0)) * frontFill *
               ambientLightingIntensity;
-    float3 Lo = (kD * albedo / 3.14159265 + specular) * lightColor * NdotL * attenuation * shadowVisibility; // No light intensity? lightColor should allow > 1.
+    float3 directDiffuse = isGlass
+        ? float3(0.0, 0.0, 0.0)
+        : kD * albedo / 3.14159265;
+    float3 Lo = (directDiffuse + specular) * lightColor * NdotL * attenuation * shadowVisibility; // No light intensity? lightColor should allow > 1.
 
     result += Lo * (isFoliage ? max(occlusionStrength, 0.0) : 1.0);
 
@@ -1244,22 +1295,36 @@ float4 main(PS_INPUT input) : SV_TARGET
 
     // Point lights contribution (clustered forward)
     // Need to PBR-ify this too
-    for (int i = 0; i < numPointLights && i < 64; i++) {
-        // result += calculatePointLight(i, input.fragPos, normal, viewDir) * objectColor;
-        // Skip for now to save instruction count or update calculatePointLight to PBR
-        // Just use simple Blinn for point lights for performance?
-        result += calculatePointLight(i, input.fragPos, normal, viewDir, rough) * albedo;
+    if (!isGlass) {
+        for (int i = 0; i < numPointLights && i < 64; i++) {
+            // result += calculatePointLight(i, input.fragPos, normal, viewDir) * objectColor;
+            // Skip for now to save instruction count or update calculatePointLight to PBR
+            // Just use simple Blinn for point lights for performance?
+            result += calculatePointLight(i, input.fragPos, normal, viewDir, rough) * albedo;
+        }
     }
 
     float3 reflectionDir = reflect(-viewDir, normal);
     // Split-sum specular IBL: GGX-prefiltered HDRI radiance multiplied by the
     // preintegrated Fresnel/visibility response for this NdotV and roughness.
     float3 probeColor = sampleReflectionProbe(reflectionDir, rough);
-    float2 environmentBRDF = brdfIntegrationLUT.SampleLevel(
-        texSampler, float2(NdotV, rough), 0.0);
     result += probeColor * (F0 * environmentBRDF.x + environmentBRDF.y) *
-              ambientOcclusion * surfaceSpecularScale *
+              ambientOcclusion * surfaceSpecularScale * multiScatter *
               ambientLightingIntensity;
+
+    if (isGlass) {
+        // The transparent PSO uses straight alpha. Specular terms already carry
+        // their Fresnel weight, so letting blending multiply them by alpha again
+        // made every reflection vanish. Convert the glass result to the source
+        // colour whose blend reconstructs that pre-weighted reflection, plus a
+        // very small absorption tint from the coating itself.
+        const float3 premultipliedReflection =
+            result * viewmodelCoverage * glassCoatingTint;
+        const float3 premultipliedAbsorption =
+            albedo * glassAbsorption * 0.10;
+        result = (premultipliedReflection + premultipliedAbsorption) /
+            max(surfaceOpacity, 0.001);
+    }
 
     // Authored emissive markings. Added after lighting so they keep their shape
     // in shadow and at night, but before tone mapping so they sit on the same

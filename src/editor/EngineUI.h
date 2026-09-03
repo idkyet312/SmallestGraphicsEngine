@@ -1392,6 +1392,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         bool enableFXAA = false;
         float bloomStrength = 0.16f;
         float grainStrength = 0.012f;
+        bool sunLensEnabled = false;
+        float lensDirtStrength = 0.01f;
+        float chromaticAberration = 0.08f;
+        float lensFlareStrength = 0.33f;
         float motionBlurStrength = 0.0f;
         int debugViewMode = 0;
     };
@@ -1428,6 +1432,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         rtDebug.enableFXAA = scene.enableFXAA;
         rtDebug.bloomStrength = vb.bloomStrength;
         rtDebug.grainStrength = vb.grainStrength;
+        rtDebug.sunLensEnabled = scene.enableSunLens;
+        rtDebug.lensDirtStrength = vb.lensDirtStrength;
+        rtDebug.chromaticAberration = vb.chromaticAberration;
+        rtDebug.lensFlareStrength = vb.lensFlareStrength;
         rtDebug.motionBlurStrength = vb.motionBlurStrength;
         rtDebug.debugViewMode = vb.debugViewMode;
     };
@@ -1451,6 +1459,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         scene.enableFXAA = false;
         vb.bloomStrength = 0.0f;
         vb.grainStrength = 0.0f;
+        // Lens artefacts are display-side embellishment; they would obscure the
+        // ray-traced signal this mode exists to inspect.
+        scene.enableSunLens = false;
+        vb.lensDirtStrength = 0.0f;
+        vb.chromaticAberration = 0.0f;
+        vb.lensFlareStrength = 0.0f;
         vb.motionBlurStrength = 0.0f;
     };
 
@@ -1475,6 +1489,10 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         scene.enableFXAA = rtDebug.enableFXAA;
         vb.bloomStrength = rtDebug.bloomStrength;
         vb.grainStrength = rtDebug.grainStrength;
+        scene.enableSunLens = rtDebug.sunLensEnabled;
+        vb.lensDirtStrength = rtDebug.lensDirtStrength;
+        vb.chromaticAberration = rtDebug.chromaticAberration;
+        vb.lensFlareStrength = rtDebug.lensFlareStrength;
         vb.motionBlurStrength = rtDebug.motionBlurStrength;
         vb.debugViewMode = rtDebug.debugViewMode;
     };
@@ -1801,6 +1819,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                        "raytracing rtx dxr svgf atrous denoise "
                        "visibility buffer deferred bindless materials sm66 "
                        "exposure eye adaptation bloom vignette film grain "
+                       "sun lens dirt flare ghosts chromatic anamorphic "
                        "reflections roughness gi probe misses confidence "
                        "temporal accumulation tlas refit ray classification "
                        "taa fxaa msaa antialiasing anti-aliasing aa edge "
@@ -2230,6 +2249,55 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 ImGui::SliderFloat("VB Bloom", &vb.bloomStrength, 0.0f, 1.0f, "%.2f");
                 ImGui::SliderFloat("VB Vignette", &vb.vignetteStrength, 0.0f, 1.0f, "%.2f");
                 ImGui::SliderFloat("VB Film Grain", &vb.grainStrength, 0.0f, 0.08f, "%.3f");
+                if (ImGui::TreeNode("Sun / Lens")) {
+                    ImGui::Checkbox("Enable Sun Lens",
+                                    &scene.enableSunLens);
+                    if (scene.enableSunLens) {
+                        ImGui::SliderFloat("Sun Angular Radius",
+                            &scene.sunAngularRadiusDegrees,
+                            0.10f, 1.00f, "%.2f deg");
+                        ImGui::SliderFloat("Sun Disc HDR",
+                            &scene.sunDiscIntensity, 0.0f, 80.0f, "%.1f");
+                        ImGui::SliderFloat("Sun Halo",
+                            &scene.sunHaloIntensity, 0.0f, 4.0f, "%.2f");
+                        ImGui::SliderFloat("Lens Dirt", &vb.lensDirtStrength,
+                                           0.0f, 2.0f, "%.2f");
+                        ImGui::SliderFloat("Dirt Scale", &vb.lensDirtScale,
+                                           0.5f, 3.0f, "%.2f");
+                        ImGui::SliderFloat("Chromatic Aberration",
+                                           &vb.chromaticAberration, 0.0f, 3.0f,
+                                           "%.2f");
+                        ImGui::SliderFloat("Lens Flare", &vb.lensFlareStrength,
+                                           0.0f, 2.0f, "%.2f");
+                        ImGui::TextDisabled(
+                            "Master for the flare pass; the six below shape it");
+                        ImGui::SliderFloat("Anamorphic Streak",
+                                           &vb.flareStreakIntensity, 0.0f, 2.0f,
+                                           "%.2f");
+                        ImGui::SliderFloat("Streak Length",
+                                           &vb.flareStreakLength, 0.02f, 0.45f,
+                                           "%.3f");
+                        ImGui::SliderFloat("Ghost Intensity",
+                                           &vb.flareGhostIntensity, 0.0f, 2.0f,
+                                           "%.2f");
+                        ImGui::SliderFloat("Ghost Dispersion",
+                                           &vb.flareGhostDispersion, 0.0f, 0.20f,
+                                           "%.3f");
+                        ImGui::SliderFloat("Halo Intensity",
+                                           &vb.flareHaloIntensity, 0.0f, 2.0f,
+                                           "%.2f");
+                        ImGui::SliderFloat("Starburst",
+                                           &vb.flareStarburstIntensity, 0.0f,
+                                           2.0f, "%.2f");
+                        ImGui::TextDisabled(
+                            "Flare is depth-occluded and fades off-frame; "
+                            "dirt is lit by bloom and by the streak");
+                    } else {
+                        ImGui::TextDisabled(
+                            "Opt-in: the established frame stays unchanged");
+                    }
+                    ImGui::TreePop();
+                }
             }
             // Ray-traced tier on top of the visibility buffer. Reports why it
             // is unavailable rather than silently doing nothing -- the two
@@ -2656,6 +2724,61 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::DragFloat("SSR Thickness",
                              &scene.screenSpaceReflectionThickness,
                              0.005f, 0.01f, 0.5f, "%.3f m");
+            ImGui::Checkbox("Screen-Space RT (NGLighting)",
+                            &scene.screenSpaceRTEnabled);
+            if (scene.screenSpaceRTEnabled) {
+                // Each contribution is separate because they differ in how
+                // noisy they are, not just in cost. Specular is one ray in a
+                // direction the surface determines, so it resolves cleanly;
+                // GI and AO are random hemisphere rays and are visibly grainy
+                // until many are averaged.
+                ImGui::Checkbox("SSRT Specular (clean)",
+                                &scene.screenSpaceRTSpecular);
+                ImGui::Checkbox("SSRT Indirect Bounce (noisy)",
+                                &scene.screenSpaceRTGI);
+                if (scene.screenSpaceRTGI)
+                    ImGui::SliderFloat("SSRT GI Strength",
+                                       &scene.screenSpaceRTGIStrength,
+                                       0.0f, 2.0f, "%.2f");
+                ImGui::Checkbox("SSRT Occlusion (noisy)",
+                                &scene.screenSpaceRTAO);
+                if (scene.screenSpaceRTAO) {
+                    ImGui::SliderFloat("SSRT AO",
+                                       &scene.screenSpaceRTAOStrength,
+                                       0.0f, 1.0f, "%.2f");
+                    ImGui::SliderFloat("SSRT AO Radius",
+                                       &scene.screenSpaceRTAORadius,
+                                       0.25f, 20.0f, "%.2f m");
+                }
+                const bool ssrtHemisphere =
+                    scene.screenSpaceRTGI || scene.screenSpaceRTAO;
+                if (ssrtHemisphere) {
+                    ImGui::SliderInt("SSRT Rays",
+                                     &scene.screenSpaceRTRaySteps, 1, 64);
+                    ImGui::TextDisabled(
+                        "  Rays only affect the two noisy options.");
+                    ImGui::TextDisabled(
+                        "  Grain is the sampling itself: raise rays or");
+                    ImGui::TextDisabled(
+                        "  accumulation to trade it for cost or smearing.");
+                }
+                ImGui::SliderFloat("SSRT Step Growth",
+                                   &scene.screenSpaceRTRayGrowth,
+                                   1.0f, 1.3f, "%.3f");
+                ImGui::SliderFloat("SSRT Accumulation",
+                                   &scene.screenSpaceRTAccumulation,
+                                   0.0f, 0.98f, "%.2f");
+                ImGui::TextDisabled(
+                    "  Accumulation denoises; high values smear on motion.");
+                // Measured at 1080p on the test level, so the cost is visible
+                // before the box is ticked.
+                if (ssrtHemisphere)
+                    ImGui::TextDisabled(
+                        "  Costly: ~1.1 ms per ray (0.14 ms for plain SSR).");
+                else if (scene.screenSpaceRTSpecular)
+                    ImGui::TextDisabled(
+                        "  Specular only: one ray per pixel.");
+            }
         }
         const char* waterQualityNames[] = { "Low", "High", "Ultra" };
         int waterQuality = static_cast<int>(scene.waterQuality);

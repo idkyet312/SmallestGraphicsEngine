@@ -177,6 +177,14 @@ int main(int argc, char** argv) {
     checkBinding("stableSurfaceHistory", D3D_SIT_TEXTURE, 9u);
     checkBinding("drawCalls", D3D_SIT_STRUCTURED, 10u);
     checkBinding("stableTriangleIDs", D3D_SIT_STRUCTURED, 11u);
+    checkBinding("lensDirtTexture", D3D_SIT_TEXTURE, 12u);
+    // t13 sun flare and t14 ghost profile are no longer referenced by post:
+    // ghosts, halo, starburst and the streak moved to the dedicated flare pass
+    // (visbuf_flare_cs.hlsl), which samples the ghost profile itself. FXC drops
+    // unreferenced bindings, so reflecting for them here would fail. The post
+    // descriptor table still writes all three slots to keep t15 where the
+    // shader expects it.
+    checkBinding("flareInput", D3D_SIT_TEXTURE, 15u);
     checkBinding("stableSurfaceOutput", D3D_SIT_UAV_RWTYPED, 2u);
 
     D3D11_SHADER_BUFFER_DESC postConstants = {};
@@ -185,7 +193,9 @@ int main(int argc, char** argv) {
     CHECK(postConstantBuffer != nullptr);
     if (postConstantBuffer) {
         CHECK(SUCCEEDED(postConstantBuffer->GetDesc(&postConstants)));
-        CHECK(postConstants.Size == 80u);
+        CHECK(postConstants.Size == 128u);  // anamorphicStrength removed; the
+                                            // float4s that follow keep the
+                                            // total on its 16-byte boundary
     }
 
     // The visibility culler is compiled through the runtime FXC path rather

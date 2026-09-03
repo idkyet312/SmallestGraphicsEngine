@@ -9,3 +9,26 @@ https://www.cgtrader.com/designers/alexskyrex-5de5f7?utm_source=credit&utm_sourc
 mil tent
 
 https://www.cgtrader.com/designers/zamannasar408?utm_source=credit&utm_source=credit_item_page
+
+lens dirt mask (Content/Textures/Lens/lens_dirt_mask.jpg)
+
+ambientCG -- Fingerprints002, Opacity map, 1K JPG
+https://ambientcg.com/view?id=Fingerprints002
+License: CC0 1.0 Universal (public domain). No attribution required;
+credited here anyway.
+
+sun flare and ghost masks (Content/Textures/Lens/sun_flare_mask.png,
+Content/Textures/Lens/lens_ghost_mask.png)
+
+Raffaele Picca -- Godot particle and VFX textures, effect_1.png and
+spotlight_7.png (1024px)
+https://github.com/RPicster/Godot-particle-and-vfx-textures
+License: CC0 1.0 Universal (public domain). No attribution required;
+credited here anyway.
+
+lens dirt pack (Content/Textures/Lens/lens_dirt_pack.png)
+
+zisongbr -- Lens dirt texture Pack - 3.png
+https://opengameart.org/content/lens-dirt-texture-pack-3png
+License: CC0 1.0 Universal (public domain). No attribution required;
+credited here anyway.

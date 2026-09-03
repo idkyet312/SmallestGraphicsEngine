@@ -9,6 +9,7 @@
 #include "ProfilerDX12.h"
 #include "VisibilityGeometryPool.h"
 #include <DirectXPackedVector.h>
+#include <stb_image.h>
 #include <algorithm>
 #include <fstream>
 #include <optional>
@@ -180,7 +181,27 @@ struct alignas(256) VBPostConstants {
     UINT surfaceHistoryValid;
     UINT historyDebugView;
     UINT surfaceIdentityEnabled;
+    float lensDirtStrength;
+    float lensDirtScale;
+    float chromaticAberration;
+    float lensFlareStrength;
+    // HLSL starts a float4 on a 16-byte boundary. The scalars above total 92
+    // bytes, so the shader pads to 96 before sunLensPosition -- without this
+    // the C++ side packs it at 92 and every sun value the flare reads is
+    // shifted one float, which renders as no flare at all rather than as an
+    // obviously wrong one. The static_asserts below pin both offsets.
+    float sunLensPadding;
+    // xy = projected sun UV (may fall outside 0..1), z = continuous presence
+    // that ramps to zero across a margin beyond the frame edge,
+    // w = elevation-scaled directional-light intensity.
+    XMFLOAT4 sunLensPosition;
+    XMFLOAT4 sunLensColor;
 };
+
+static_assert(offsetof(VBPostConstants, sunLensPosition) == 96,
+              "sunLensPosition must match the HLSL float4 boundary at 96");
+static_assert(offsetof(VBPostConstants, sunLensColor) == 112,
+              "sunLensColor must match the HLSL float4 boundary at 112");
 
 struct alignas(256) VBExposureConstants {
     UINT inputWidth;
@@ -289,6 +310,10 @@ public:
     ComPtr<ID3D12DescriptorHeap> motionRtvHeap;
     ComPtr<ID3D12Resource> normalRoughnessTexture;
     ComPtr<ID3D12Resource> bloomTexture;
+    // Two half-res targets: the flare passes ping-pong between them, because a
+    // single texture cannot be bound as SRV and UAV in the same dispatch.
+    ComPtr<ID3D12Resource> flareTexture;
+    ComPtr<ID3D12Resource> flareScratch;
     // Depth immediately after visibility resolve. Forward extensions can then
     // be detected and rejected from history when they lack motion vectors.
     ComPtr<ID3D12Resource> visibilityDepthTexture;
@@ -296,6 +321,12 @@ public:
     ComPtr<ID3D12Resource> exposureState;
     ComPtr<ID3D12Resource> colorLUT;
     ComPtr<ID3D12Resource> colorLUTUpload;
+    ComPtr<ID3D12Resource> lensDirtTexture;
+    ComPtr<ID3D12Resource> lensDirtUpload;
+    ComPtr<ID3D12Resource> sunFlareTexture;
+    ComPtr<ID3D12Resource> sunFlareUpload;
+    ComPtr<ID3D12Resource> lensGhostTexture;
+    ComPtr<ID3D12Resource> lensGhostUpload;
 
     // Visibility pass PSO + root signature
     ComPtr<ID3D12RootSignature> visPassRootSig;
@@ -523,13 +554,19 @@ public:
     ComPtr<ID3D12PipelineState> postPSO;
     ComPtr<ID3D12DescriptorHeap> postDescHeap;
     // Four immutable variants cover colour-history parity and stable-surface
-    // write parity independently. Each holds 12 SRVs and 3 UAVs.
-    static constexpr UINT kPostDescriptorsPerVariant = 15;
+    // write parity independently. Each holds 16 SRVs and 3 UAVs.
+    static constexpr UINT kPostDescriptorsPerVariant = 19;
     static constexpr UINT kPostDescriptorVariantCount = 4;
     ComPtr<ID3D12RootSignature> bloomRootSig;
     ComPtr<ID3D12PipelineState> bloomDownsamplePSO;
     ComPtr<ID3D12PipelineState> bloomUpsamplePSO;
     ComPtr<ID3D12DescriptorHeap> bloomDescHeap;
+    ComPtr<ID3D12RootSignature> flareRootSig;
+    ComPtr<ID3D12PipelineState> flareFeaturePSO;
+    ComPtr<ID3D12PipelineState> flareStreakPSO;
+    ComPtr<ID3D12PipelineState> flareBlurPSO;
+    ComPtr<ID3D12DescriptorHeap> flareDescHeap;
+    bool flarePipelineReady = false;
     ComPtr<ID3D12RootSignature> exposureRootSig;
     ComPtr<ID3D12PipelineState> exposureResetPSO;
     ComPtr<ID3D12PipelineState> exposureAccumulatePSO;
@@ -635,6 +672,20 @@ public:
     float bloomStrength = 0.16f;
     float vignetteStrength = 0.50f;
     float grainStrength = 0.0f;
+    // Lens artefacts. Dirt, streaks and flare draw energy from bloom;
+    // aberration resamples the HDR source directly. The scene-level sun-lens
+    // toggle gates all of them, independently of these authored strengths.
+    // Tuned for the sparse fullscreen CC0 mask: visible in solar glare, absent
+    // from an ordinarily exposed frame.
+    float lensDirtStrength = 0.01f;
+    float lensDirtScale = 0.50f;
+    float chromaticAberration = 0.08f;
+    // The apertures are deliberately low-opacity; strength provides the bold
+    // Battlefield-style response without turning them into painted rings.
+    float lensFlareStrength = 0.33f;
+    bool sunLensSystemEnabled = false;
+    XMFLOAT4 sunLensPosition = { 0.5f, 0.5f, 0.0f, 0.0f };
+    XMFLOAT4 sunLensColor = { 1.0f, 0.92f, 0.70f, 0.0f };
     float taaFeedback = 0.86f;
     bool temporalEffectsEnabled = false;
     bool temporalHistoryValid = false;
@@ -654,6 +705,80 @@ public:
     UINT bloomMipCount = 1;
     UINT bloomWidth = 1;
     UINT bloomHeight = 1;
+    UINT flareWidth = 1;
+    UINT flareHeight = 1;
+    // Battlefield-style flare controls, tuned against reference stills rather
+    // than toward restraint. The flare in those shots is a large, obvious
+    // feature -- a bright warm wash around the sun, a chain of big soft discs
+    // running across the frame, and a cool horizontal streak -- so defaults
+    // that keep it subliminal are simply the wrong look. The master Lens Flare
+    // slider scales all of it for anyone who wants it quieter.
+    float flareStreakIntensity = 0.85f;
+    // In UV, the half-width of the horizontal blur. 0.28 spans well over half
+    // the frame, which is where the streak stops reading as a smear and starts
+    // reading as a cylindrical front element.
+    float flareStreakLength = 0.28f;
+    float flareGhostIntensity = 1.00f;
+    // Per-channel radial split. Above roughly 0.12 the three channels separate
+    // far enough to read as three discs rather than one refracted element.
+    float flareGhostDispersion = 0.075f;
+    // Carries both the veiling wash and the ring, and the wash is the single
+    // largest feature in the reference -- hence the highest default here.
+    float flareHaloIntensity = 1.00f;
+    float flareStarburstIntensity = 0.45f;
+
+    // Updates the display-lens source without coupling this renderer to Scene.
+    // The unjittered projection matches the sky pass; TAA jitter belongs to
+    // geometry and would otherwise make the flare swim by a sub-pixel.
+    void SetSunLens(bool enabled, const XMMATRIX& viewProjection,
+                    const XMFLOAT3& cameraPosition,
+                    const XMFLOAT3& lightDirection,
+                    const XMFLOAT3& lightColor, float lightIntensity) {
+        sunLensSystemEnabled = enabled;
+        sunLensColor = {
+            lightColor.x, lightColor.y, lightColor.z, 0.0f
+        };
+        sunLensPosition = { 0.5f, 0.5f, 0.0f, 0.0f };
+        if (!enabled) return;
+
+        const XMVECTOR direction =
+            XMVector3Normalize(XMLoadFloat3(&lightDirection));
+        const XMVECTOR sunWorld = XMVectorAdd(
+            XMLoadFloat3(&cameraPosition), XMVectorScale(direction, 4000.0f));
+        XMFLOAT4 projected = {};
+        XMStoreFloat4(&projected,
+            XMVector3Transform(sunWorld, viewProjection));
+        if (projected.w <= 0.0f) return;
+
+        const float u = projected.x / projected.w * 0.5f + 0.5f;
+        const float v = -projected.y / projected.w * 0.5f + 0.5f;
+        const float elevation = XMVectorGetY(direction);
+        const float elevationT = (std::max)(0.0f, (std::min)(1.0f,
+            (elevation + 0.08f) / 0.14f));
+        const float elevationFade =
+            elevationT * elevationT * (3.0f - 2.0f * elevationT);
+        // Presence ramps down across a margin outside the frame rather than
+        // switching off at the edge. A binary on-screen test made the whole
+        // flare vanish in a single frame the moment the sun crossed a boundary,
+        // which is precisely where a real anamorphic flare is at its strongest:
+        // the streak and the ghost chain both survive the source leaving the
+        // sensor, because the light still enters the barrel.
+        //
+        // kOffScreenMargin is in UV, so 0.35 is roughly a third of a frame past
+        // the edge. Beyond that the sun is far enough off-axis that no internal
+        // reflection would reach the sensor and presence is genuinely zero.
+        // Consumers must clamp their sample UVs: this position is deliberately
+        // allowed outside [0,1].
+        constexpr float kOffScreenMargin = 0.35f;
+        const float overshoot = (std::max)({
+            0.0f, -u, u - 1.0f, -v, v - 1.0f });
+        const float edgeT = 1.0f - (std::min)(1.0f, overshoot / kOffScreenMargin);
+        const float offScreenFade = edgeT * edgeT * (3.0f - 2.0f * edgeT);
+        sunLensPosition = {
+            u, v, offScreenFade * (elevationFade > 0.0f ? 1.0f : 0.0f),
+            (std::max)(0.0f, lightIntensity) * elevationFade
+        };
+    }
 
     UINT width = 0;
     UINT height = 0;
@@ -736,6 +861,18 @@ public:
         if (!require(CreateVisBufferRT(), "visibility target")) return false;
         if (!require(CreateOutputTexture(), "output textures")) return false;
         if (!require(CreateColorLUT(), "colour LUT")) return false;
+        if (!require(CreateLensTexture(
+                "Content/Textures/Lens/lens_dirt_pack.png", "Lens dirt",
+                lensDirtTexture, lensDirtUpload), "lens dirt texture"))
+            return false;
+        if (!require(CreateLensTexture(
+                "Content/Textures/Lens/sun_flare_mask.png", "Sun flare",
+                sunFlareTexture, sunFlareUpload), "sun flare texture"))
+            return false;
+        if (!require(CreateLensTexture(
+                "Content/Textures/Lens/lens_ghost_mask.png", "Lens ghost",
+                lensGhostTexture, lensGhostUpload), "lens ghost texture"))
+            return false;
         if (!require(CreateStructuredBuffers(), "structured buffers")) return false;
         if (!require(CreateComputeDescriptorHeap(), "compute descriptors")) return false;
         if (!require(CreateVisPassPipeline(), "visibility shaders")) return false;
@@ -744,6 +881,10 @@ public:
         // correct without classification -- just full-screen.
         if (CreateTileClassifyPipeline()) CreateTileClassifyResources();
         if (!require(CreateBloomPipeline(), "bloom pyramid shaders")) return false;
+        // Best-effort: the scene renders correctly without a flare, so a
+        // missing or broken flare shader must not take the renderer down.
+        if (!CreateFlarePipeline())
+            std::cerr << "Lens flare pass unavailable (non-fatal)\n";
         if (!require(CreatePostPipeline(), "post-process shader")) return false;
         if (!require(CreateExposurePipeline(), "exposure shaders")) return false;
 
@@ -2945,8 +3086,25 @@ public:
                 enhancedResolveExecutedLastFrame),
             StableSurfaceModeSignature(
                 allowHistory, allowHistory && enhancedResolveExecutedLastFrame));
-        if (!validationMode && !preserveDebugOutput && bloomStrength > 0.0f)
+        // Every lens artefact is driven from the bloom buffer, so the bloom
+        // chain has to run whenever any of them is enabled -- not just when
+        // bloom itself is visible. Skipping it would leave the previous
+        // frame's mips in place and light the dirt from stale highlights.
+        const bool lensEffectsActive = sunLensSystemEnabled &&
+            (lensDirtStrength > 0.0f || lensFlareStrength > 0.0f);
+        const bool bloomChainRan = !validationMode && !preserveDebugOutput &&
+            (bloomStrength > 0.0f || lensEffectsActive);
+        if (bloomChainRan)
             RenderBloom(cmdList);
+        // The flare consumes the bloom pyramid, so it has to follow it. Gated
+        // on the flare strength alone: dirt and the anamorphic term in post do
+        // not need this buffer, and skipping the four dispatches is the whole
+        // saving when the lens system is off.
+        const bool flarePassRan = bloomChainRan && lensEffectsActive &&
+            lensFlareStrength > 0.0f;
+        if (flarePassRan)
+            RenderFlare(cmdList);
+        ReportFlareDiagnostics(flarePassRan, bloomChainRan);
         D3D12_RESOURCE_BARRIER barriers[2] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barriers[0].Transition.pResource = presentTexture.Get();
@@ -2992,6 +3150,25 @@ public:
         constants.historyDebugView = historyDebugView ? 1u : 0u;
         constants.surfaceIdentityEnabled =
             stableSurfaceIdentityActiveThisFrame ? 1u : 0u;
+        // Bloom-derived artefacts are only valid when the chain ran this frame.
+        constants.lensDirtStrength =
+            bloomChainRan && sunLensSystemEnabled ? lensDirtStrength : 0.0f;
+        constants.lensDirtScale = lensDirtScale;
+        // Gated on the flare pass actually having run this frame, not merely on
+        // the slider: post samples the flare buffer unconditionally, and on a
+        // frame where the passes were skipped that buffer still holds the last
+        // frame it did run, which would smear a stale flare over the image.
+        constants.lensFlareStrength = flarePassRan ? lensFlareStrength : 0.0f;
+        // Aberration resamples the HDR input directly, so it does not depend on
+        // the bloom chain -- only on being in a normal (non-parity) view.
+        constants.chromaticAberration =
+            (validationMode || preserveDebugOutput || !sunLensSystemEnabled)
+                ? 0.0f : chromaticAberration;
+        constants.sunLensPosition =
+            (validationMode || preserveDebugOutput)
+                ? XMFLOAT4(0.5f, 0.5f, 0.0f, 0.0f)
+                : sunLensPosition;
+        constants.sunLensColor = sunLensColor;
         postConstantBuffer.CopyData(g_dx12.frameIndex, constants);
 
         cmdList->SetComputeRootSignature(postRootSig.Get());
@@ -3172,6 +3349,7 @@ public:
         }
         UpdateComputeDescriptors();
         UpdateBloomDescriptors();
+        UpdateFlareDescriptors();
         UpdatePostDescriptors();
         UpdateExposureDescriptors();
     }
@@ -3571,10 +3749,46 @@ private:
         desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc.SampleDesc.Count = 1;
         desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&bloomTexture))))
+            return false;
+        // Sized from the bloom target, so it follows every resize for free.
+        return CreateFlareTextures();
+    }
+
+
+    // Half of the bloom target, so a quarter of screen area. The flare is all
+    // low-frequency -- wide blurs, soft ghosts -- so resolution buys nothing
+    // here, and the small buffer is what makes a 21-tap streak affordable.
+    //
+    // Two textures rather than one: every pass reads the previous result while
+    // writing the next, and a resource cannot be SRV and UAV in one dispatch.
+    bool CreateFlareTextures() {
+        flareWidth = (std::max)(1u, bloomWidth / 2u);
+        flareHeight = (std::max)(1u, bloomHeight / 2u);
+
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = flareWidth;
+        desc.Height = flareHeight;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc.SampleDesc.Count = 1;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(g_dx12.device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&flareTexture))))
+            return false;
         return SUCCEEDED(g_dx12.device->CreateCommittedResource(
             &heap, D3D12_HEAP_FLAG_NONE, &desc,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
-            IID_PPV_ARGS(&bloomTexture)));
+            IID_PPV_ARGS(&flareScratch)));
     }
 
     bool CreateStructuredBuffers() {
@@ -3808,6 +4022,126 @@ private:
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         g_dx12.commandList->ResourceBarrier(1, &barrier);
+        return true;
+    }
+
+
+    // Authored optical grime, loaded from Content/Textures/Lens. Replaces an
+    // earlier procedural mask whose radial sin() ridge term drew a visible
+    // concentric bullseye on screen. The sparse captured mask has no repeating
+    // structure for the eye to lock onto, which is the whole point.
+    //
+    // Single channel: the mask only ever modulates bloom, so colour would be
+    // three quarters wasted bandwidth on a full-screen fetch.
+    //
+    // A missing or unreadable file is not fatal. The texture is created either
+    // way and filled with black, which makes the dirt term contribute nothing
+    // and leaves the rest of post working -- the alternative, failing Init,
+    // would take the whole renderer down over a cosmetic asset.
+    bool CreateLensTexture(const char* relativePath, const char* label,
+                           ComPtr<ID3D12Resource>& outputTexture,
+                           ComPtr<ID3D12Resource>& outputUpload) {
+        int width = 0, height = 0, channels = 0;
+        std::string path = relativePath;
+        stbi_uc* pixels = stbi_load(path.c_str(), &width, &height, &channels, 1);
+        if (!pixels) {
+            // Try next to the executable, matching how shaders resolve: the
+            // working directory and the exe directory are not always the same.
+            const std::wstring exeDir = ShaderCacheDX12::ExecutableDirectory();
+            std::string narrow(exeDir.begin(), exeDir.end());
+            path = narrow + path;
+            pixels = stbi_load(path.c_str(), &width, &height, &channels, 1);
+        }
+        const bool loaded = pixels != nullptr;
+        if (!loaded) {
+            width = 4;
+            height = 4;
+            std::cout << label << " texture missing; effect disabled\n";
+        }
+
+        D3D12_RESOURCE_DESC texture = {};
+        texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture.Width = (UINT64)width;
+        texture.Height = (UINT)height;
+        texture.DepthOrArraySize = 1;
+        texture.MipLevels = 1;
+        texture.Format = DXGI_FORMAT_R8_UNORM;
+        texture.SampleDesc.Count = 1;
+        D3D12_HEAP_PROPERTIES defaultHeap = {};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        HRESULT hr = g_dx12.device->CreateCommittedResource(
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &texture,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&outputTexture));
+        if (FAILED(hr)) {
+            if (pixels) stbi_image_free(pixels);
+            return false;
+        }
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+        UINT rows = 0;
+        UINT64 rowSize = 0;
+        UINT64 uploadSize = 0;
+        g_dx12.device->GetCopyableFootprints(
+            &texture, 0, 1, 0, &footprint, &rows, &rowSize, &uploadSize);
+        D3D12_RESOURCE_DESC buffer = {};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = uploadSize;
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES uploadHeap = {};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        hr = g_dx12.device->CreateCommittedResource(
+            &uploadHeap, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&outputUpload));
+        if (FAILED(hr)) {
+            if (pixels) stbi_image_free(pixels);
+            return false;
+        }
+
+        BYTE* mapped = nullptr;
+        D3D12_RANGE noRead = { 0, 0 };
+        hr = outputUpload->Map(0, &noRead, reinterpret_cast<void**>(&mapped));
+        if (FAILED(hr)) {
+            if (pixels) stbi_image_free(pixels);
+            return false;
+        }
+        mapped += footprint.Offset;
+        // Row by row: the upload heap's pitch is alignment-padded and is not
+        // the source's tightly packed width.
+        for (int y = 0; y < height; ++y) {
+            BYTE* row = mapped + (SIZE_T)y * footprint.Footprint.RowPitch;
+            if (loaded) memcpy(row, pixels + (SIZE_T)y * width, (size_t)width);
+            else memset(row, 0, (size_t)width);
+        }
+        outputUpload->Unmap(0, nullptr);
+        if (pixels) stbi_image_free(pixels);
+
+        D3D12_TEXTURE_COPY_LOCATION source = {};
+        source.pResource = outputUpload.Get();
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = footprint;
+        D3D12_TEXTURE_COPY_LOCATION destination = {};
+        destination.pResource = outputTexture.Get();
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = 0;
+        g_dx12.commandList->CopyTextureRegion(
+            &destination, 0, 0, 0, &source, nullptr);
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = outputTexture.Get();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_dx12.commandList->ResourceBarrier(1, &barrier);
+        if (loaded)
+            std::cout << label << " texture: " << width << "x" << height
+                      << " from " << path << "\n";
         return true;
     }
 
@@ -6546,6 +6880,204 @@ private:
             exposureState.Get(), nullptr, &state, handle);
     }
 
+    // Root 32-bit constants rather than a constant buffer, matching the bloom
+    // pass: the flare parameters change every frame and are far cheaper to push
+    // inline than to version across frames in an upload heap.
+    //
+    // Layout must match FlareConstants in visbuf_flare_cs.hlsl exactly, field
+    // for field. HLSL packs a float3 onto its own 16-byte boundary, so sunTint
+    // is preceded by the two pad floats that fill out the register holding
+    // sunPresence and sunEnergy.
+    struct FlareDispatchConstants {
+        UINT flareWidth;
+        UINT flareHeight;
+        float sunU;
+        float sunV;
+        float sunPresence;
+        float sunEnergy;
+        float pad0;
+        float pad1;
+        float sunTint[3];
+        float ghostIntensity;
+        float ghostDispersion;
+        float haloIntensity;
+        float starburstIntensity;
+        float streakIntensity;
+        float streakLength;
+        float bloomMaxMip;
+        UINT blurDirection;
+        float aspect;
+    };
+
+    static constexpr UINT kFlareDescriptorsPerPass = 4;
+    static constexpr UINT kFlarePassCount = 4;
+
+    bool CreateFlarePipeline() {
+        flarePipelineReady = false;
+        std::ifstream csFile("shaders/visbuf_flare_cs.hlsl");
+        if (!csFile.is_open()) {
+            std::cerr << "VB flare: shaders/visbuf_flare_cs.hlsl not found\n";
+            return false;
+        }
+        std::stringstream stream;
+        stream << csFile.rdbuf();
+        const std::string source = stream.str();
+
+        const UINT flags = D3DCOMPILE_ENABLE_STRICTNESS |
+                           D3DCOMPILE_OPTIMIZATION_LEVEL3;
+        ComPtr<ID3DBlob> feature, streak, blur, errors;
+        auto compile = [&](const char* entry,
+                           ComPtr<ID3DBlob>& blob) -> bool {
+            errors.Reset();
+            HRESULT hr = ShaderCacheDX12::CompileCached(
+                source.data(), source.size(), "shaders/visbuf_flare_cs.hlsl",
+                nullptr, nullptr, entry, "cs_5_0", flags, 0, &blob, &errors);
+            if (FAILED(hr)) {
+                std::cerr << "VB flare " << entry << " error: "
+                    << (errors ? (const char*)errors->GetBufferPointer()
+                               : "unknown") << std::endl;
+                return false;
+            }
+            return true;
+        };
+        if (!compile("FeatureGenCS", feature)) return false;
+        if (!compile("StreakCS", streak)) return false;
+        if (!compile("BlurCS", blur)) return false;
+
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors = 3;   // bloom, ghost profile, previous flare
+        ranges[0].BaseShaderRegister = 0;
+        ranges[0].OffsetInDescriptorsFromTableStart = 0;
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors = 1;
+        ranges[1].BaseShaderRegister = 0;
+        ranges[1].OffsetInDescriptorsFromTableStart = 3;
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants.ShaderRegister = 0;
+        params[0].Constants.Num32BitValues =
+            sizeof(FlareDispatchConstants) / sizeof(UINT);
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable.NumDescriptorRanges = 2;
+        params[1].DescriptorTable.pDescriptorRanges = ranges;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC sampler = {};
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler.AddressU = sampler.AddressV = sampler.AddressW =
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.ShaderRegister = 0;
+        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        sampler.MinLOD = 0.0f;
+        sampler.MaxLOD = D3D12_FLOAT32_MAX;
+        D3D12_ROOT_SIGNATURE_DESC root = {};
+        root.NumParameters = 2;
+        root.pParameters = params;
+        root.NumStaticSamplers = 1;
+        root.pStaticSamplers = &sampler;
+        ComPtr<ID3DBlob> rootBlob;
+        errors.Reset();
+        HRESULT hr = D3D12SerializeRootSignature(
+            &root, D3D_ROOT_SIGNATURE_VERSION_1, &rootBlob, &errors);
+        if (FAILED(hr)) return false;
+        hr = g_dx12.device->CreateRootSignature(
+            0, rootBlob->GetBufferPointer(), rootBlob->GetBufferSize(),
+            IID_PPV_ARGS(&flareRootSig));
+        if (FAILED(hr)) return false;
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = flareRootSig.Get();
+        pso.CS = { feature->GetBufferPointer(), feature->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateComputePipelineState(
+                &pso, IID_PPV_ARGS(&flareFeaturePSO))))
+            return false;
+        pso.CS = { streak->GetBufferPointer(), streak->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateComputePipelineState(
+                &pso, IID_PPV_ARGS(&flareStreakPSO))))
+            return false;
+        pso.CS = { blur->GetBufferPointer(), blur->GetBufferSize() };
+        if (FAILED(g_dx12.device->CreateComputePipelineState(
+                &pso, IID_PPV_ARGS(&flareBlurPSO))))
+            return false;
+
+        // Four dispatches, each needing its own SRV/UAV set because the
+        // ping-pong swaps which texture is read and which is written.
+        D3D12_DESCRIPTOR_HEAP_DESC heap = {};
+        heap.NumDescriptors = kFlareDescriptorsPerPass * kFlarePassCount;
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(g_dx12.device->CreateDescriptorHeap(
+                &heap, IID_PPV_ARGS(&flareDescHeap))))
+            return false;
+        UpdateFlareDescriptors();
+        flarePipelineReady = true;
+        return true;
+    }
+
+    // One table per dispatch: {bloom, ghost profile, source flare} + {dest}.
+    // Passes alternate between the two flare targets, so pass N reads what pass
+    // N-1 wrote.
+    void UpdateFlareDescriptors() {
+        if (!flareDescHeap || !flareTexture || !flareScratch ||
+            !bloomTexture || !lensGhostTexture)
+            return;
+        const UINT descriptorSize =
+            g_dx12.device->GetDescriptorHandleIncrementSize(
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE base =
+            flareDescHeap->GetCPUDescriptorHandleForHeapStart();
+
+        for (UINT pass = 0; pass < kFlarePassCount; ++pass) {
+            D3D12_CPU_DESCRIPTOR_HANDLE handle = base;
+            handle.ptr += (SIZE_T)descriptorSize * pass *
+                          kFlareDescriptorsPerPass;
+            // Even passes write flareTexture and read flareScratch; odd passes
+            // do the reverse. FeatureGenCS (pass 0) ignores its source SRV but
+            // still needs one bound to satisfy the root signature.
+            ID3D12Resource* source =
+                (pass % 2u == 0u) ? flareScratch.Get() : flareTexture.Get();
+            ID3D12Resource* destination =
+                (pass % 2u == 0u) ? flareTexture.Get() : flareScratch.Get();
+
+            D3D12_SHADER_RESOURCE_VIEW_DESC bloomSrv = {};
+            bloomSrv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            bloomSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            bloomSrv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            bloomSrv.Texture2D.MostDetailedMip = 0;
+            bloomSrv.Texture2D.MipLevels = (std::max)(1u, bloomMipCount);
+            g_dx12.device->CreateShaderResourceView(
+                bloomTexture.Get(), &bloomSrv, handle);
+            handle.ptr += descriptorSize;
+
+            D3D12_SHADER_RESOURCE_VIEW_DESC profileSrv = {};
+            profileSrv.Format = DXGI_FORMAT_R8_UNORM;
+            profileSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            profileSrv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            profileSrv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(
+                lensGhostTexture.Get(), &profileSrv, handle);
+            handle.ptr += descriptorSize;
+
+            D3D12_SHADER_RESOURCE_VIEW_DESC flareSrv = {};
+            flareSrv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            flareSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            flareSrv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            flareSrv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(source, &flareSrv, handle);
+            handle.ptr += descriptorSize;
+
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            g_dx12.device->CreateUnorderedAccessView(
+                destination, nullptr, &uav, handle);
+        }
+    }
+
     bool CreateBloomPipeline() {
         std::ifstream csFile("shaders/visbuf_bloom_cs.hlsl");
         if (!csFile.is_open()) return false;
@@ -6685,6 +7217,138 @@ private:
         }
     }
 
+    // Four dispatches: features, streak, then a separable blur in both axes.
+    // Each writes one of the two half-res targets and reads the other, so the
+    // result of the last pass lives in flareScratch (pass 3 is odd).
+    // Why the flare is or is not on screen, printed once a second to the
+    // console. Every link in the chain is reported, because a flare that fails
+    // to appear can die at any of them -- the pipeline failing to build, the
+    // per-frame gate skipping the dispatches, the sun projecting off-axis, or
+    // the source simply having no energy -- and they are indistinguishable from
+    // a black screen. Enabled with SGE_FLARE_DEBUG=1.
+    void ReportFlareDiagnostics(bool passRan, bool bloomRan) const {
+        static bool checkedEnv = false;
+        static bool enabled = false;
+        if (!checkedEnv) {
+            checkedEnv = true;
+            enabled = GetEnvironmentVariableA("SGE_FLARE_DEBUG", nullptr, 0) > 0;
+        }
+        if (!enabled) return;
+        static ULONGLONG lastReport = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastReport < 1000) return;
+        lastReport = now;
+        std::cout
+            << "[flare] pipeline=" << (flarePipelineReady ? 1 : 0)
+            << " sunLensOn=" << (sunLensSystemEnabled ? 1 : 0)
+            << " bloomRan=" << (bloomRan ? 1 : 0)
+            << " passRan=" << (passRan ? 1 : 0)
+            << " master=" << lensFlareStrength
+            << " sunUV=(" << sunLensPosition.x << ", " << sunLensPosition.y
+            << ") presence=" << sunLensPosition.z
+            << " energy=" << sunLensPosition.w
+            << " streak=" << flareStreakIntensity
+            << " ghost=" << flareGhostIntensity
+            << " size=" << flareWidth << "x" << flareHeight
+            << " bloomMips=" << bloomMipCount
+            << std::endl;
+    }
+
+    void RenderFlare(ID3D12GraphicsCommandList* cmdList) {
+        if (!flarePipelineReady || !flareTexture || !flareScratch ||
+            !flareDescHeap || !flareRootSig)
+            return;
+
+        const UINT descriptorSize =
+            g_dx12.device->GetDescriptorHandleIncrementSize(
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        auto transition = [&](ID3D12Resource* resource,
+                              D3D12_RESOURCE_STATES before,
+                              D3D12_RESOURCE_STATES after) {
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = resource;
+            barrier.Transition.StateBefore = before;
+            barrier.Transition.StateAfter = after;
+            barrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cmdList->ResourceBarrier(1, &barrier);
+        };
+
+        FlareDispatchConstants constants = {};
+        constants.flareWidth = flareWidth;
+        constants.flareHeight = flareHeight;
+        constants.sunU = sunLensPosition.x;
+        constants.sunV = sunLensPosition.y;
+        constants.sunPresence = sunLensPosition.z;
+        // The bloom pyramid is the only source of intensity, so the flare
+        // scales with what the sky actually renders rather than with a
+        // authored constant: a sun behind cloud produces a weaker flare on its
+        // own, with no extra occlusion logic.
+        constants.sunEnergy = (std::max)(0.0f, sunLensPosition.w);
+        constants.sunTint[0] = sunLensColor.x;
+        constants.sunTint[1] = sunLensColor.y;
+        constants.sunTint[2] = sunLensColor.z;
+        constants.ghostIntensity = flareGhostIntensity * lensFlareStrength;
+        constants.ghostDispersion = flareGhostDispersion;
+        constants.haloIntensity = flareHaloIntensity * lensFlareStrength;
+        constants.starburstIntensity =
+            flareStarburstIntensity * lensFlareStrength;
+        constants.streakIntensity = flareStreakIntensity * lensFlareStrength;
+        constants.streakLength = flareStreakLength;
+        constants.bloomMaxMip =
+            static_cast<float>((std::max)(1u, bloomMipCount) - 1u);
+        constants.blurDirection = 0;
+        constants.aspect = static_cast<float>(width) /
+                           (std::max)(1.0f, static_cast<float>(height));
+
+        ID3D12DescriptorHeap* heaps[] = { flareDescHeap.Get() };
+        cmdList->SetDescriptorHeaps(1, heaps);
+        cmdList->SetComputeRootSignature(flareRootSig.Get());
+
+        const UINT groupsX = (flareWidth + 7u) / 8u;
+        const UINT groupsY = (flareHeight + 7u) / 8u;
+
+        auto dispatch = [&](UINT pass, ID3D12PipelineState* pso) {
+            // Even passes write flareTexture, odd write flareScratch -- the
+            // same alternation UpdateFlareDescriptors baked into the tables.
+            ID3D12Resource* destination =
+                (pass % 2u == 0u) ? flareTexture.Get() : flareScratch.Get();
+            transition(destination,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            cmdList->SetPipelineState(pso);
+            cmdList->SetComputeRoot32BitConstants(
+                0, sizeof(FlareDispatchConstants) / sizeof(UINT),
+                &constants, 0);
+            D3D12_GPU_DESCRIPTOR_HANDLE table =
+                flareDescHeap->GetGPUDescriptorHandleForHeapStart();
+            table.ptr += (UINT64)descriptorSize * pass *
+                         kFlareDescriptorsPerPass;
+            cmdList->SetComputeRootDescriptorTable(1, table);
+            cmdList->Dispatch(groupsX, groupsY, 1);
+            transition(destination, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        };
+
+        dispatch(0, flareFeaturePSO.Get());
+        dispatch(1, flareStreakPSO.Get());
+        constants.blurDirection = 0;
+        dispatch(2, flareBlurPSO.Get());
+        constants.blurDirection = 1;
+        dispatch(3, flareBlurPSO.Get());
+    }
+
+    // Where RenderFlare leaves its result. Four passes alternate targets
+    // starting at flareTexture, so an even pass count finishes on the odd
+    // buffer. Derived rather than hardcoded so adding or removing a pass
+    // cannot silently point post at a stale buffer.
+    ID3D12Resource* FlareResultResource() const {
+        return (kFlarePassCount % 2u == 0u) ? flareScratch.Get()
+                                            : flareTexture.Get();
+    }
+
     void RenderBloom(ID3D12GraphicsCommandList* cmdList) {
         if (!bloomTexture || !bloomDescHeap || !bloomRootSig ||
             bloomMipCount == 0) return;
@@ -6794,13 +7458,13 @@ private:
         // t0..t11: post inputs, raw visibility, previous authored identity,
         // current draw metadata, and the local-to-authored triangle map.
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 12;
+        ranges[0].NumDescriptors = 16;  // t0..t11 + 3 lens masks + flare
         ranges[0].BaseShaderRegister = 0;
         ranges[0].OffsetInDescriptorsFromTableStart = 0;
         ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         ranges[1].NumDescriptors = 3;
         ranges[1].BaseShaderRegister = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = 12;
+        ranges[1].OffsetInDescriptorsFromTableStart = 16;
 
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -6812,9 +7476,10 @@ private:
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
-        rootDesc.NumParameters = 2;
         rootDesc.pParameters = params;
-        D3D12_STATIC_SAMPLER_DESC lutSampler = {};
+        rootDesc.NumParameters = 2;
+        D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
+        D3D12_STATIC_SAMPLER_DESC& lutSampler = samplers[0];
         lutSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         lutSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         lutSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -6823,8 +7488,19 @@ private:
         lutSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         lutSampler.MinLOD = 0.0f;
         lutSampler.MaxLOD = D3D12_FLOAT32_MAX;
-        rootDesc.NumStaticSamplers = 1;
-        rootDesc.pStaticSamplers = &lutSampler;
+        // The dirt asset is composed for the whole frame; repeating it makes
+        // the dust pattern visibly synthetic when the scale is adjusted.
+        D3D12_STATIC_SAMPLER_DESC& dirtSampler = samplers[1];
+        dirtSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        dirtSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        dirtSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        dirtSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        dirtSampler.ShaderRegister = 1;
+        dirtSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        dirtSampler.MinLOD = 0.0f;
+        dirtSampler.MaxLOD = D3D12_FLOAT32_MAX;
+        rootDesc.NumStaticSamplers = 2;
+        rootDesc.pStaticSamplers = samplers;
         ComPtr<ID3DBlob> rootBlob;
         hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1,
             &rootBlob, &errorBlob);
@@ -6909,7 +7585,13 @@ private:
             bloomSrv.Shader4ComponentMapping =
                 D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             bloomSrv.Texture2D.MostDetailedMip = 0;
-            bloomSrv.Texture2D.MipLevels = 1;
+            // The whole pyramid, not just mip 0. RenderBloom builds every mip
+            // and then upsamples back down into mip 0, so pinning MipLevels to
+            // 1 threw away a ready-made set of progressively wider blurs. The
+            // coarse mips are what make wide veiling glare and a long
+            // anamorphic streak affordable -- a few fetches instead of a
+            // full-res multi-tap blur.
+            bloomSrv.Texture2D.MipLevels = (std::max)(1u, bloomMipCount);
             g_dx12.device->CreateShaderResourceView(
                 bloomTexture.Get(), &bloomSrv, handle);
             handle.ptr += descriptorSize;
@@ -6948,6 +7630,42 @@ private:
             stableTriangleSrv.Buffer.StructureByteStride = sizeof(UINT);
             g_dx12.device->CreateShaderResourceView(
                 stableTriangleDataBuffer.Get(), &stableTriangleSrv, handle);
+            handle.ptr += descriptorSize;
+
+            // t12 lens dirt. Lens SRVs stay at the end of the range so the
+            // established post inputs keep their bindings.
+            D3D12_SHADER_RESOURCE_VIEW_DESC dirtSrv = {};
+            dirtSrv.Format = DXGI_FORMAT_R8_UNORM;
+            dirtSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            dirtSrv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            dirtSrv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(
+                lensDirtTexture.Get(), &dirtSrv, handle);
+            handle.ptr += descriptorSize;
+
+            // t13 sun flare scattering mask.
+            g_dx12.device->CreateShaderResourceView(
+                sunFlareTexture.Get(), &dirtSrv, handle);
+            handle.ptr += descriptorSize;
+
+            // t14 internal-reflection profile. UAV descriptors follow the
+            // lens masks while retaining their shader registers u0..u2.
+            g_dx12.device->CreateShaderResourceView(
+                lensGhostTexture.Get(), &dirtSrv, handle);
+            handle.ptr += descriptorSize;
+
+            // t15 the assembled half-res flare. Last SRV in the range so the
+            // UAVs below keep u0..u2; FlareResultResource names whichever of
+            // the two ping-pong targets the final pass wrote.
+            D3D12_SHADER_RESOURCE_VIEW_DESC flareSrv = {};
+            flareSrv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            flareSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            flareSrv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            flareSrv.Texture2D.MipLevels = 1;
+            g_dx12.device->CreateShaderResourceView(
+                FlareResultResource(), &flareSrv, handle);
             handle.ptr += descriptorSize;
 
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};

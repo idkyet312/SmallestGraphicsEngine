@@ -299,6 +299,16 @@ struct Scene {
     XMFLOAT3 lightPos    = { 4.735f, 3.095f, -8.246f };
     XMFLOAT3 lightColor  = { 1.0f, 0.92f, 0.70f };
     float    directionalLightIntensity = 12.18f;
+    // Optical sun and camera-lens response. On by default: the look was
+    // approved in motion and these values are the ones it was approved at.
+    // Intensity is HDR radiance, not display brightness, so bloom and the tone
+    // mapper shape it naturally.
+    bool     enableSunLens = true;
+    // Compact Battlefield-style source: a white-hot core whose energy is spread
+    // by bloom and the authored radial-scattering texture.
+    float    sunAngularRadiusDegrees = 0.10f;
+    float    sunDiscIntensity = 61.9f;
+    float    sunHaloIntensity = 1.31f;
     int      lightType   = 0;
     float    lightConstant  = 1.0f;
     float    lightLinear    = 0.09f;
@@ -719,6 +729,48 @@ struct Scene {
     float screenSpaceReflectionStrength = 0.35f;
     float screenSpaceReflectionDistance = 55.0f;
     float screenSpaceReflectionThickness = 0.08f;
+    // Opt-in screen-space ray tracer, ported from the CC0 NiceGuy-Shaders
+    // (NGLighting) ReShade pack. Off by default: it replaces the mirror-only
+    // SSR trace with a stochastic one that also gathers indirect bounce light,
+    // which costs more and changes the look of every reflective surface.
+    //
+    // The difference from the default path is the ray march itself. Stock SSR
+    // walks fixed-size steps; this one grows each step geometrically, so a ray
+    // covers far more distance for the same step count, at the cost of
+    // precision far from the origin. That is what makes tracing diffuse
+    // hemisphere rays affordable at all.
+    bool  screenSpaceRTEnabled = false;
+    // The three contributions are independent, because they differ enormously
+    // in how noisy they are. Specular traces one ray along a direction the
+    // surface actually determines, so it resolves cleanly. GI and AO trace
+    // random hemisphere directions, so at low ray counts they are visibly
+    // grainy -- that grain is the stochastic sampling itself, not a bug, and
+    // only more rays or a spatial denoiser removes it. Both therefore start
+    // off: enabling the feature gives you the clean half, and the noisy halves
+    // are a deliberate choice.
+    bool  screenSpaceRTSpecular = true;
+    bool  screenSpaceRTGI = false;
+    float screenSpaceRTGIStrength = 0.7f;
+    // Rays per pixel. This is the dominant cost in the whole feature: each ray
+    // marches up to 24 steps, and every step is a dependent depth sample, so
+    // the pass scales linearly and steeply. Measured at 1080p on the test
+    // level: 24 rays cost 18.8 ms, against 0.14 ms for the default mirror-only
+    // SSR. 4 rays plus heavy temporal accumulation is the usable setting; the
+    // slider goes higher for stills and offline capture.
+    int   screenSpaceRTRaySteps = 4;
+    // Step growth per march iteration. 1.0 would be a uniform march; above 1
+    // trades far-field accuracy for range.
+    float screenSpaceRTRayGrowth = 1.08f;
+    // Darkening from nearby occluders, derived from how far each ray travelled
+    // before it hit. Cheap once rays are being traced anyway, but it inherits
+    // their noise, and the engine already has a dedicated GTAO pass -- so this
+    // is off unless you specifically want occlusion from these rays.
+    bool  screenSpaceRTAO = false;
+    float screenSpaceRTAOStrength = 0.5f;
+    float screenSpaceRTAORadius = 4.0f;
+    // Blend weight for the reprojected history. The stochastic trace is far too
+    // noisy to show raw, so this is doing most of the visible denoising work.
+    float screenSpaceRTAccumulation = 0.9f;
     WaterQuality waterQuality = WaterQuality::High;
     // High-path wave controls. Multipliers over the authored CalmTropical
     // spectrum rather than absolute metres, so the relative shape of the swell
