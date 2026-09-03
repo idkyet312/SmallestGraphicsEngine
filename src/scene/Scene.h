@@ -63,6 +63,14 @@ struct Projectile {
     bool     harpoonExpired = false;
     uint32_t harpoonId = 0;
     uint8_t  harpoonPiercedCount = 0;
+    // Penetration budget remaining on this round, seeded from the weapon's
+    // penetrationPower when it is fired. Each surface punched through spends
+    // some of it; at zero the next impact stops the round. 0 at spawn means the
+    // weapon does not penetrate, which is every weapon's default.
+    float    penetrationPower = 0.0f;
+    // How many surfaces this round has already crossed. Drives damage falloff
+    // and caps the chain so one bullet cannot walk through a whole level.
+    uint8_t  penetratedCount = 0;
     float    damageMultiplier = 1.0f;
     XMFLOAT3 velocity = { 0, 0, 0 };   // grenades integrate velocity + gravity
     float    fuse = 0.0f;              // seconds until it explodes
@@ -426,8 +434,11 @@ struct Scene {
     // rather than as geometry in the tube, so viewmodel sway cannot make it lie
     // about where the barrel points. These are the live-tunable knobs for it.
     //
-    // The competing world-space sphere inside the lens is off by default: two
-    // marks in one sight read as two sight pictures that never quite agree.
+    // The emissive sphere inside the lens follows the same aim point, so the
+    // two no longer disagree -- but they do stack into one doubled-looking
+    // mark, so it stays off by default and the screen dot is what ships. Turn
+    // it on for a dot that actually blooms: it is scene geometry, and ImGui
+    // draws after post, so the screen dot can never feed the bloom pass.
     bool  opticWorldDotVisible = false;
     float opticDotCoreRadius = 1.72f;   // pixels
     float opticDotHaloRadius = 6.31f;   // pixels, the soft bloom around it
@@ -435,7 +446,7 @@ struct Scene {
     // How far the dot is allowed to drift off centre as the weapon moves, in
     // pixels at the extremes of recoil and sway. Zero pins it dead centre.
     float opticDotSwayPixels = 55.0f;
-    float opticDotRecoilPixels = 173.0f;
+    float opticDotRecoilPixels = 63.0f;
     // Eased stand-in for gunRecoilKick, 0..1, driving the dot's climb only.
     //
     // The raw kick cannot be read directly: it decays at 95/sec, so a sighted
@@ -448,7 +459,20 @@ struct Scene {
     // HUD state only. The weapon's own recoil, spread and camera kick are
     // untouched, so this changes what is drawn and nothing about how it shoots.
     float opticDotRecoil = 0.0f;
-    float opticDotSettleRate = 4.5f;  // per second; lower hangs longer
+    float opticDotSettleRate = 7.0f;  // per second; lower hangs longer
+    // Emissive strength for the world-space dot in the lens. Values above 1
+    // are what make it bloom: the post chain thresholds on brightness, so a
+    // dot at 1.0 is merely bright red while one well above it throws a halo.
+    // The screen-space dot cannot do this -- ImGui draws to the backbuffer
+    // after post, so nothing it draws can feed the bloom pass.
+    float opticDotGlow = 5.5f;
+    // Optic glass, driving the Fresnel response in the pixel shader. Clarity is
+    // how much the lens hides looking straight through it; grazing is how
+    // opaque it goes at glancing angles, where a real lens turns into a sky
+    // reflection. Grazing stays under 1 so the glass never becomes a mirror
+    // disc with no scene behind it.
+    float glassClarity = 0.16f;
+    float glassGrazing = 0.86f;
 
     // Trailing "chip" health, in the same units as player.health. Follows the
     // real value down after a delay, so the HUD can show a pale ghost of the
@@ -1961,6 +1985,7 @@ struct Scene {
         p.lifetime  = projectileLifetime;
         p.active    = true;
         p.damageMultiplier = stats.damageMultiplier;
+        p.penetrationPower = stats.penetrationPower;
         projectiles.push_back(p);
     }
 
@@ -1992,7 +2017,12 @@ struct Scene {
     }
 
     void ShootHarpoonProjectile() {
-        camera.ApplyRecoil(recoilPitch * 1.8f, 0.0f);
+        // Harpoon, rocket and shotgun author their kick inline rather than
+        // through ResolvedWeaponStats, so the global scale has to be applied
+        // here too -- without it these three would be the only weapons left at
+        // their original recoil.
+        camera.ApplyRecoil(recoilPitch * 1.8f *
+            SGE::WeaponCustomizationSystem::kGlobalRecoilScale, 0.0f);
         // Harpoon gun: a spring-driven launch rather than a powder charge, so
         // it thumps rather than cracks.
         camera.AddFireTrauma(0.06f);
@@ -2228,11 +2258,13 @@ struct Scene {
         p.lifetime = 4.0f;
         p.active = true;
         p.damageMultiplier = stats.damageMultiplier;
+        p.penetrationPower = stats.penetrationPower;
         projectiles.push_back(p);
     }
 
     void ShootRocket() {
-        camera.ApplyRecoil(recoilPitch * 4.0f, 0.0f);
+        camera.ApplyRecoil(recoilPitch * 4.0f *
+            SGE::WeaponCustomizationSystem::kGlobalRecoilScale, 0.0f);
         // Launcher backblast: the hardest shove of any weapon here, and the one
         // shot where a real jolt is expected. Still under the firing ceiling --
         // the rocket's own detonation supplies the big shake a moment later.
@@ -2298,6 +2330,45 @@ struct Scene {
         const float sighted = (std::min)(1.0f, (std::max)(0.0f, adsBlend));
         return seeThroughWeaponStrength * sighted;
     }
+    // Where the optic dot sits this frame, as a screen-space offset in pixels
+    // from the centre. Positive X is right, positive Y is DOWN, matching the
+    // HUD's coordinates.
+    //
+    // Shared by both dots on purpose. The screen-space mark and the emissive
+    // one in the lens have to agree exactly, and they only do that if a single
+    // function decides where the aim point is -- computing the drift twice is
+    // how they silently diverged before.
+    void OpticDotScreenOffset(float& outX, float& outY) const {
+        // Each source is normalised against its own measured extreme, so the
+        // pixel tunables mean literally that many pixels at full deflection.
+        const float swayScale = opticDotSwayPixels / kGunSwayMaxDegrees;
+        outX = gunSwayYaw * swayScale;
+        outY = -gunSwayPitch * swayScale;
+        // Recoil climbs the dot upward, which is negative in screen space.
+        outY -= opticDotRecoil * opticDotRecoilPixels;
+    }
+
+    // The same offset as a world-space nudge for geometry sitting `distance`
+    // metres down the view axis, so the emissive dot in the lens lands under
+    // the screen-space one.
+    //
+    // Pixels convert through the actual vertical FOV rather than a guessed
+    // constant: at `distance`, the visible height is 2*d*tan(fov/2), so one
+    // pixel is that height divided by the screen height. This keeps the two
+    // dots aligned when the ADS FOV or the resolution changes.
+    void OpticDotWorldOffset(float distance, float& outRight,
+                             float& outUp) const {
+        float pixelX = 0.0f, pixelY = 0.0f;
+        OpticDotScreenOffset(pixelX, pixelY);
+        if (g_dx12.screenHeight <= 0) { outRight = outUp = 0.0f; return; }
+        const float halfFov = XMConvertToRadians(EffectiveCameraFOV()) * 0.5f;
+        const float worldPerPixel = (2.0f * distance * std::tan(halfFov)) /
+                                    static_cast<float>(g_dx12.screenHeight);
+        outRight = pixelX * worldPerPixel;
+        // Screen Y grows downward, world up grows the other way.
+        outUp = -pixelY * worldPerPixel;
+    }
+
     float ScopeLookScale() const {
         // Sights slow the turn rate proportionally to the zoom so the sensitivity
         // at the sight picture feels the same as at the hip.
@@ -2500,7 +2571,8 @@ struct Scene {
     void ShootShotgun() {
         const float randomYaw = (((float)std::rand() / RAND_MAX) * 2.0f - 1.0f) *
                                 recoilYaw * 2.2f;
-        camera.ApplyRecoil(recoilPitch * 2.8f, randomYaw);
+        camera.ApplyRecoil(recoilPitch * 2.8f *
+            SGE::WeaponCustomizationSystem::kGlobalRecoilScale, randomYaw);
         // Shotgun: heaviest per-shot kick in the rack, and slow enough between
         // shots that the shake fully decays rather than stacking.
         camera.AddFireTrauma(0.13f);

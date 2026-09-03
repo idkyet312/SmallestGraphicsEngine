@@ -416,6 +416,10 @@ if(BUILD_TESTING)
     target_link_libraries(UISearchFilterTests PRIVATE SGEProjectHeaders)
     add_test(NAME UISearchFilterTests COMMAND UISearchFilterTests)
 
+    add_executable(BulletPenetrationTests tests/BulletPenetrationTests.cpp)
+    target_link_libraries(BulletPenetrationTests PRIVATE SGEProjectHeaders)
+    add_test(NAME BulletPenetrationTests COMMAND BulletPenetrationTests)
+
     add_executable(RuntimeWorldTests
         tests/RuntimeWorldTests.cpp
         tests/GLBImporterPixelStub.cpp

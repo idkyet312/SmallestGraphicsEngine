@@ -38,6 +38,11 @@ struct WeaponDefinition {
     float muzzleFlashSizeMultiplier = 1.0f;
     float smokeMultiplier = 1.0f;
     float adsFovDegrees = 42.0f;
+    // How much material a round can punch through before it stops, in arbitrary
+    // budget units spent per surface. 0 stops at the first thing hit, which is
+    // what every weapon did before this existed -- so a weapon left at the
+    // default keeps its old behaviour exactly.
+    float penetrationPower = 0.0f;
     bool suppressed = false;
 
     std::string viewModelAsset;
@@ -99,6 +104,7 @@ struct ResolvedWeaponStats {
     float muzzleFlashSizeMultiplier = 1.0f;
     float smokeMultiplier = 1.0f;
     float adsFovDegrees = 42.0f;
+    float penetrationPower = 0.0f;
     bool suppressed = false;
     bool redDotSight = false;
     bool laserSight = false;
@@ -108,6 +114,12 @@ class WeaponCustomizationSystem {
 public:
     static constexpr int kWeaponCount = 10;
     static constexpr size_t kAttachmentCount = 3;
+    // Multiplies every weapon's authored aim kick. 1.0 is as-authored; 2.0 is
+    // twice the climb per shot. Scales the camera recoil -- the part that
+    // actually moves where the shots land -- so it is a difficulty knob, not a
+    // cosmetic one. The viewmodel's own punch is driven separately in Scene.h
+    // and follows this through the same recoilScale.
+    static constexpr float kGlobalRecoilScale = 2.0f;
 
     WeaponCustomizationSystem() {
         // These values mirror the existing weapon tables and firing cadence.
@@ -116,37 +128,37 @@ public:
         definitions_ = {{
             { "ak47", "AK47", 0, 30, 120, 240, 1.55f, 0.10f, 1.0f,
               300.0f, 0.55f, 0.22f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-              1.0f, 42.0f, false, "Content/Models/ak47/AK47.FBX", "" },
+              1.0f, 42.0f, 2.0f, false, "Content/Models/ak47/AK47.FBX", "" },
             { "mossberg_590a1", "Mossberg 590A1", 1, 8, 32, 64, 2.40f,
               0.80f, 1.0f, 300.0f, 1.54f, 0.484f, 1.0f, 1.0f, 1.0f,
-              1.0f, 1.0f, 1.0f, 42.0f, false,
+              1.0f, 1.0f, 1.0f, 42.0f, 0.0f, false,
               "Content/Models/shotgun_fbx/Mossberg 590A1.fbx", "" },
             { "rpg7", "RPG-7", 2, 1, 4, 8, 2.80f, 1.70f, 1.0f,
               70.0f, 2.20f, 0.0f, 1.0f, 1.0f, 1.0f, 1.8f, 1.75f,
-              2.4f, 42.0f, false, "Content/Models/RPG7/RPG72.fbx", "" },
+              2.4f, 42.0f, 0.0f, false, "Content/Models/RPG7/RPG72.fbx", "" },
             { "svd", "SVD Sniper", 3, 10, 40, 80, 1.75f, 1.05f, 5.0f,
               650.0f, 2.31f, 0.0f, 1.0f, 1.0f, 1.0f, 1.35f, 1.35f,
-              1.5f, 15.0f, false,
+              1.5f, 15.0f, 4.0f, false,
               "Content/Models/SVD_v1.3/Models/SVD.FBX", "" },
             { "arc_laser_cutter", "ARC Laser Cutter", 4, 120, 360, 600,
               2.10f, 0.055f, 6.0f, 1800.0f, 0.55f, 0.22f, 1.0f, 1.0f,
-              1.0f, 1.0f, 1.0f, 1.0f, 42.0f, false,
+              1.0f, 1.0f, 1.0f, 1.0f, 42.0f, 0.0f, false,
               "procedural/weapons/arc_laser_cutter", "" },
             { "remote_c4", "Remote C4", 5, 6, 12, 24, 1.80f, 0.48f,
               1.0f, 0.0f, 0.55f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-              1.0f, 42.0f, false,
+              1.0f, 42.0f, 0.0f, false,
               "Content/Models/C4/C4_bomb/source/c4.glb", "" },
             { "m2_flamethrower", "M2 Flamethrower", 6, 100, 300, 500,
               2.60f, 0.075f, 1.0f, 0.0f, 0.55f, 0.22f, 1.0f, 1.0f,
-              1.0f, 1.0f, 1.0f, 1.0f, 42.0f, false,
+              1.0f, 1.0f, 1.0f, 1.0f, 42.0f, 0.0f, false,
               "procedural/weapons/m2_flamethrower", "" },
             { "mako_harpoon", "Mako Harpoon Gun", 7, 1, 12, 24, 1.35f,
               1.25f, 1.0f, 0.0f, 0.55f, 0.0f, 1.0f, 1.0f, 1.0f,
-              1.0f, 1.0f, 1.0f, 42.0f, false,
+              1.0f, 1.0f, 1.0f, 42.0f, 0.0f, false,
               "Content/Models/HarpoonGun/HarpoonGun.glb", "" },
             { "svd_suppressed", "SVD Suppressed", 8, 5, 20, 40, 2.05f,
               1.05f, 5.0f, 650.0f, 1.98f, 0.0f, 1.0f, 1.0f, 0.25f,
-              0.55f, 0.35f, 0.7f, 15.0f, true,
+              0.55f, 0.35f, 0.7f, 15.0f, 4.0f, true,
               "Content/Models/SVD_v1.3/Models/SVD.FBX", "" },
             // The carbine against the AK's battle rifle: it cycles faster
             // (0.075s vs 0.10) and climbs less (0.42/0.18 vs 0.55/0.22) for
@@ -154,7 +166,7 @@ public:
             // range rather than one being strictly better.
             { "m4a1", "M4A1", 9, 30, 120, 240, 1.45f, 0.075f, 0.9f,
               320.0f, 0.42f, 0.18f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-              1.0f, 42.0f, false,
+              1.0f, 42.0f, 1.8f, false,
               "Content/Models/MainPlayer/Guns/m4/m4A1.glb", "" },
         }};
 
@@ -305,6 +317,7 @@ public:
         result.muzzleFlashSizeMultiplier = definition->muzzleFlashSizeMultiplier;
         result.smokeMultiplier = definition->smokeMultiplier;
         result.adsFovDegrees = definition->adsFovDegrees;
+        result.penetrationPower = definition->penetrationPower;
         result.suppressed = definition->suppressed;
 
         std::array<const AttachmentDefinition*,
@@ -344,6 +357,17 @@ public:
             result.laserSight = result.laserSight || attachment.providesLaser;
         }
         result.adsFovDegrees = std::clamp(result.adsFovDegrees, 15.0f, 60.0f);
+        // Global recoil scale, applied last so it multiplies the authored value
+        // *and* whatever the attachments did to it -- a compensator still cuts
+        // the same fraction, it just cuts a larger number. Applying it before
+        // the attachment loop would let a recoilMultiplier below 1 quietly
+        // cancel it out.
+        //
+        // One knob here rather than an edit per weapon: every gun resolves its
+        // stats through this function, so the scale reaches all of them,
+        // including any added later.
+        result.recoilPitchDegrees *= kGlobalRecoilScale;
+        result.recoilYawDegrees *= kGlobalRecoilScale;
         return result;
     }
 

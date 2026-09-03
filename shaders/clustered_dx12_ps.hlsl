@@ -69,7 +69,10 @@ cbuffer ObjectBuffer : register(b3) {
     float seeThroughNear;
     float seeThroughFar;
     float seeThroughNearAlpha;
-    float seeThroughPadding;
+    // Glass Fresnel response; see the isGlass branch below.
+    float glassClarity;
+    float glassGrazing;
+    float3 glassPadding;
 };
 
 struct PointLightData {
@@ -1011,6 +1014,10 @@ float4 main(PS_INPUT input) : SV_TARGET
 
     const bool isWater = materialType > 0.5 && materialType < 2.5;
     const bool isOcean = materialType > 1.5 && materialType < 2.5;
+    // 8 rather than the next free small integer: terrain packs bit flags into
+    // this same float (terrain_pbr.hlsli does fmod(materialType, 4.0), and the
+    // CPU combines 3 and 4), so 3..7 are spoken for.
+    const bool isGlass = materialType > 7.5 && materialType < 8.5;
     float waterFoam = 0.0;
     // glTF BLEND coverage is the product of baseColorFactor alpha and the
     // sampled base-colour alpha. OPAQUE textures may carry incidental alpha,
@@ -1091,6 +1098,26 @@ float4 main(PS_INPUT input) : SV_TARGET
         surfaceOpacity = lerp(
             transmissionAlpha, isOcean ? 0.998 : 0.97, fresnel);
         surfaceOpacity = lerp(surfaceOpacity, isOcean ? 0.995 : 0.96, waterFoam);
+    }
+
+    // Optic glass. Same principle as the water above -- clear head-on, more
+    // reflective toward grazing angles -- which is the cue a flat authored
+    // alpha cannot give. Without it the lens reads as tinted film, and the
+    // specular IBL added further down gets multiplied away by a constant
+    // opacity instead of showing as a sky glint across the glass.
+    //
+    // F0 is the shader's own dielectric 0.04, not water's 0.02037: that number
+    // is water's index of refraction and would under-reflect glass.
+    if (isGlass) {
+        const float nDotVGlass = saturate(dot(normal, viewDir));
+        const float fresnelGlass =
+            0.04 + (1.0 - 0.04) * pow(1.0 - nDotVGlass, 5.0);
+        // The authored alpha still scales the result, so the material's own
+        // baseColorFactor.w remains the overall density control and the two
+        // tunables shape the curve between them.
+        const float clarity = saturate(glassClarity);
+        const float grazing = saturate(glassGrazing);
+        surfaceOpacity = lerp(clarity, grazing, saturate(fresnelGlass * 4.0));
     }
 
     if (!isWater && metal < 0.25) {

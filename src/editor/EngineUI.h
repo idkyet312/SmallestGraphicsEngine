@@ -598,25 +598,13 @@ inline void RenderPlayerHUD(const Scene& scene) {
             // moves while the gun climbs through a burst reads as painted on
             // the monitor.
             //
-            // Each source is normalised against its own known extreme, so the
-            // pixel tunables mean what they say: "this many pixels when the
-            // weapon is as far off as it gets". Guessing a shared multiplier
-            // here would make both sliders lie about their own units.
-            //
-            // Sway is already damped hard in ADS by the scene (kGunSwayAmount
-            // is cut 82% down the sights), so this reads its residual rather
-            // than re-deriving it. Yaw moves the dot across, pitch moves it up.
-            const float swayScale = scene.opticDotSwayPixels /
-                Scene::kGunSwayMaxDegrees;
-            float offsetX = scene.gunSwayYaw * swayScale;
-            float offsetY = -scene.gunSwayPitch * swayScale;
-            // Climb comes from the eased opticDotRecoil, already normalised to
-            // 0..1 by the scene, not from gunRecoilKick directly. The raw kick
-            // decays at 95/sec and is gone in ~22ms -- roughly one frame at
-            // 60fps -- so reading it here made even a large pixel scale look
-            // like nothing was happening. Upward on screen, matching the muzzle
-            // climb the same impulse drives.
-            offsetY -= scene.opticDotRecoil * scene.opticDotRecoilPixels;
+            // The offset comes from the scene rather than being recomputed
+            // here, so the emissive dot in the lens lands in exactly the same
+            // place. Two copies of this arithmetic is how the two marks drifted
+            // apart before. See Scene::OpticDotScreenOffset for the normalising
+            // and for why the climb reads the eased value, not gunRecoilKick.
+            float offsetX = 0.0f, offsetY = 0.0f;
+            scene.OpticDotScreenOffset(offsetX, offsetY);
             const ImVec2 dotCenter(center.x + offsetX, center.y + offsetY);
 
             const int haloAlpha = static_cast<int>(70.0f * fade);
@@ -3031,15 +3019,42 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                                ImGuiSliderFlags_AlwaysClamp);
             ImGui::SetItemTooltip(
                 "How fast the climb releases. Lower hangs longer; the default "
-                "4.5 settles in roughly a quarter second. The weapon's own "
+                "7.0 settles in roughly 0.4 s. The weapon's own "
                 "recoil is unaffected -- this is the dot only.");
             ImGui::Text("dot climb %.2f", scene.opticDotRecoil);
             ImGui::Checkbox("World Dot In Lens##optic",
                             &scene.opticWorldDotVisible);
             ImGui::SetItemTooltip(
-                "The older dot modelled inside the tube. Off by default: two "
-                "marks in one sight never quite agree. Its Reticle sliders "
-                "below only do anything while this is on.");
+                "The emissive dot drawn as real geometry in the lens. This is "
+                "the one that glows: it follows the same aim point as the "
+                "screen dot, and being in the scene it feeds the bloom pass. "
+                "Its Reticle sliders below only do anything while this is on.");
+            ImGui::BeginDisabled(!scene.opticWorldDotVisible);
+            ImGui::SliderFloat("Lens Dot Emissive", &scene.opticDotGlow,
+                               0.0f, 20.0f, "%.2f",
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SetItemTooltip(
+                "Emissive strength. Above 1 the post chain's brightness "
+                "threshold picks it up and throws a halo; at or below 1 it is "
+                "just a bright dot with no bloom.");
+            ImGui::EndDisabled();
+
+            // Optic glass. The lens clears looking straight through and turns
+            // reflective toward grazing angles, so judging these means turning
+            // the view across a bright horizon rather than staring dead ahead.
+            ImGui::SeparatorText("Optic Glass");
+            ImGui::SliderFloat("Glass Clarity", &scene.glassClarity,
+                               0.0f, 1.0f, "%.2f",
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SetItemTooltip(
+                "How much the lens hides looking straight through it. Lower is "
+                "clearer glass.");
+            ImGui::SliderFloat("Glass Grazing", &scene.glassGrazing,
+                               0.0f, 1.0f, "%.2f",
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SetItemTooltip(
+                "Opacity at glancing angles, where a real lens becomes a sky "
+                "reflection. Keep below 1 or the glass reads as a solid disc.");
 
             ImGui::BeginDisabled(!scene.opticWorldDotVisible);
             // The emissive dot is placed apart from the sight body, so moving
@@ -3096,9 +3111,12 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 scene.opticDotHaloRadius = 6.31f;
                 scene.opticDotColor = DirectX::XMFLOAT3(1.0f, 0.20f, 0.11f);
                 scene.opticDotSwayPixels = 55.0f;
-                scene.opticDotRecoilPixels = 173.0f;
-                scene.opticDotSettleRate = 4.5f;
+                scene.opticDotRecoilPixels = 63.0f;
+                scene.opticDotSettleRate = 7.0f;
                 scene.opticWorldDotVisible = false;
+                scene.opticDotGlow = 5.5f;
+                scene.glassClarity = 0.16f;
+                scene.glassGrazing = 0.86f;
             }
             ImGui::SameLine();
             // The dot only lines up with the crosshair while aiming, so the

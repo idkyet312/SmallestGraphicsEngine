@@ -586,6 +586,11 @@ private:
                     // across the lens, no metallic darkening underneath it.
                     primitive.material->metallicFactor = 0.0f;
                     primitive.material->roughnessFactor = 0.06f;
+                    // Selects the Fresnel glass path in the pixel shader, so
+                    // the lens clears looking straight through and picks up sky
+                    // toward grazing angles. A flat authored alpha cannot do
+                    // that, which is what made it read as tinted film.
+                    primitive.material->materialType = 8.0f;  // glass
                     // Both faces of a curved lens are visible through itself.
                     primitive.material->doubleSided = true;
                 }

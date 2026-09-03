@@ -102,6 +102,7 @@
 #include "AssetWatcher.h"
 #include "PrefabThumbnailGenerator.h"
 #include "GameSettings.h"
+#include "BulletPenetration.h"
 
 using namespace DirectX;
 
@@ -10488,6 +10489,24 @@ void BuildCollisionDebugLines() {
     }
 }
 
+// Bullet penetration. The rule itself lives in BulletPenetration.h so it can be
+// tested without a scene; this adapts it to the live projectile.
+using SGE::kPenetrationCostFlesh;
+using SGE::kPenetrationFalloffFlesh;
+using SGE::kPenetrationCostSheet;
+using SGE::kPenetrationFalloffSheet;
+
+static bool TryPenetrate(Projectile& projectile, float cost, float falloff) {
+    SGE::PenetrationState state{ projectile.penetrationPower,
+                                 projectile.penetratedCount,
+                                 projectile.damageMultiplier };
+    if (!SGE::TryPenetrateState(state, cost, falloff)) return false;
+    projectile.penetrationPower = state.power;
+    projectile.penetratedCount = state.crossed;
+    projectile.damageMultiplier = state.damage;
+    return true;
+}
+
 static bool HitPrefabColliderSegment(const XMFLOAT3& start, const XMFLOAT3& end,
                                      float radius, XMFLOAT3& hit,
                                      uint64_t* hitEntityId,
@@ -20759,6 +20778,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         // Next solid impact freezes all carried ragdolls there.
                         continue;
                     }
+                    // Penetration: a round with budget left carries on through
+                    // the body instead of dying in it, so a lined-up pair takes
+                    // one bullet. Same mechanism the harpoon branch above uses
+                    // -- continue the flight rather than deactivate -- just
+                    // driven by the weapon's penetrationPower instead of being
+                    // hardcoded to one weapon.
+                    if (TryPenetrate(projectile, kPenetrationCostFlesh,
+                                     kPenetrationFalloffFlesh)) {
+                        // Deliberately no position nudge here. Bodies are
+                        // resolved from a hit list already gathered for this
+                        // segment, not re-tested, so the round cannot strike
+                        // the same enemy twice on the way through.
+                        continue;
+                    }
                     projectile.active = false;
                     continue;
                 }
@@ -21120,6 +21153,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                         scene.SpawnSmokeBurst(hit, 0.46f, 0.22f);
                     } else if (projectile.flame) {
                         scene.SpawnSmokeBurst(hit, 0.22f, 0.10f);
+                    }
+                    // Penetration, but only through thin corrugated sheeting.
+                    // Wood, rock and the rest of this path are solid, and
+                    // protected chunks are objective geometry that must never
+                    // become shoot-through -- the mast has to come down to the
+                    // charge rigged on it, not to rifle fire drilling past.
+                    //
+                    // The damage above has already landed, so a penetrating
+                    // round both chips the sheet and reaches what is behind it.
+                    if (metalSheetHit && !protectedHit &&
+                        TryPenetrate(projectile, kPenetrationCostSheet,
+                                     kPenetrationFalloffSheet)) {
+                        // Step just past the surface before flying on. Without
+                        // this the round resumes from the impact point, the
+                        // next segment test resolves the same chunk again, and
+                        // one sheet eats the entire budget in a few frames.
+                        const XMVECTOR through =
+                            XMLoadFloat3(&hit) +
+                            XMLoadFloat3(&projectile.direction) *
+                                (bulletRadius + 0.05f);
+                        XMStoreFloat3(&projectile.position, through);
+                        projectile.previousPosition = projectile.position;
+                        continue;
                     }
                     stopProjectileAt(hit, true);
                 } else if (!g_emptyLevelMode && g_water.ShootFloaters(projectile.previousPosition,

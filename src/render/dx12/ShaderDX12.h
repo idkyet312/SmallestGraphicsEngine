@@ -167,7 +167,11 @@ struct alignas(256) ObjectBufferDX12 {
     float seeThroughNear = 0.30f;   // metres; receiver at the eye
     float seeThroughFar = 1.05f;    // metres; muzzle at arm's length
     float seeThroughNearAlpha = 0.25f;  // coverage kept by the nearest geometry
-    float seeThroughPadding = 0.0f;
+    // Glass Fresnel response, used when materialType selects glass. Takes the
+    // float that padded the register above, so nothing shifts.
+    float glassClarity = 0.16f;   // opacity looking straight through
+    float glassGrazing = 0.86f;   // opacity at glancing angles; keep under 1
+    float glassPadding[3] = {};
 };
 
 static_assert(offsetof(ObjectBufferDX12, bindlessTextureIndices) == 96,
@@ -176,6 +180,8 @@ static_assert(offsetof(ObjectBufferDX12, emissiveFactor) == 112,
               "emissiveFactor must follow the bindless indices in the HLSL cbuffer");
 static_assert(offsetof(ObjectBufferDX12, seeThroughNear) == 128,
               "see-through tuning must start its own 16-byte cbuffer register");
+static_assert(offsetof(ObjectBufferDX12, glassClarity) == 140,
+              "glass tuning must follow seeThroughNearAlpha in the HLSL cbuffer");
 
 // A light in the punctual list. Spotlights ride the same array rather than a
 // buffer of their own: the flashlight is the only one, and a second cbuffer
@@ -478,6 +484,12 @@ public:
     float viewmodelSeeThroughNear = 0.30f;
     float viewmodelSeeThroughFar = 1.05f;
     float viewmodelSeeThroughNearAlpha = 0.25f;
+    // Glass Fresnel response, shared by every draw whose material selects the
+    // glass type. Sticky like the see-through tuning above: only one material
+    // uses it today, and threading two more arguments through the twenty-plus
+    // parameter SetObjectMaterial would cost every unrelated call site.
+    float glassClarity = 0.16f;
+    float glassGrazing = 0.86f;
     bool drawWireframe = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
@@ -2015,6 +2027,8 @@ public:
         data.seeThroughNear = viewmodelSeeThroughNear;
         data.seeThroughFar = viewmodelSeeThroughFar;
         data.seeThroughNearAlpha = viewmodelSeeThroughNearAlpha;
+        data.glassClarity = glassClarity;
+        data.glassGrazing = glassGrazing;
 
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
@@ -2114,6 +2128,8 @@ public:
         data.seeThroughNear = viewmodelSeeThroughNear;
         data.seeThroughFar = viewmodelSeeThroughFar;
         data.seeThroughNearAlpha = viewmodelSeeThroughNearAlpha;
+        data.glassClarity = glassClarity;
+        data.glassGrazing = glassGrazing;
         if (useNorm && normal) {
             const D3D12_RESOURCE_DESC nd = normal->GetDesc();
             data.normalTexW = (float)nd.Width;
@@ -2325,6 +2341,8 @@ public:
         data.seeThroughNear = viewmodelSeeThroughNear;
         data.seeThroughFar = viewmodelSeeThroughFar;
         data.seeThroughNearAlpha = viewmodelSeeThroughNearAlpha;
+        data.glassClarity = glassClarity;
+        data.glassGrazing = glassGrazing;
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(
             3, objectBuffer.GetGPUAddress(bufferIndex));

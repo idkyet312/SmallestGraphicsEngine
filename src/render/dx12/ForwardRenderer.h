@@ -1342,7 +1342,10 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
                 prim.material->occlusionStrength,
                 prim.material->normalYSign,
                 prim.material->viewFillStrength,
-                specularScale);   // cache its descriptors: they never change
+                specularScale,   // cache its descriptors: they never change
+                // Selects the glass shading path for the optic lens. Every
+                // other imported material leaves this at 0 and is unchanged.
+                prim.material->materialType);
         } else {
             shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
         }
@@ -1641,7 +1644,19 @@ inline void DrawSceneNodeMesh(SceneNode* node, ShaderDX12& shader,
                     prim.material->roughnessOnlyTexture,
                     prim.material->baseColorFactor.w,
                     prim.material->alphaCutout,
-                    prim.material.get());   // cache its descriptors: they never change
+                    prim.material.get(),   // cache its descriptors: they never change
+                    // Spelled out to reach materialType, which selects the
+                    // glass path for the optic lens. These carry the
+                    // material's own values rather than blind defaults, so
+                    // node-drawn meshes now honour the same fields DrawMeshAt
+                    // already passed rather than silently losing them.
+                    prim.material->alphaFromLuminance,
+                    prim.material->ambientScale,
+                    prim.material->occlusionStrength,
+                    prim.material->normalYSign,
+                    prim.material->viewFillStrength,
+                    1.0f,                          // specularScale
+                    prim.material->materialType);
             } else {
                 shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
             }
@@ -3422,6 +3437,11 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         shader.BeginViewmodelSeeThrough(
             seeThrough, scene.seeThroughNear, scene.seeThroughFar,
             scene.seeThroughNearAlpha, depthPrepass);
+        // Glass response for the optic lens, set before the sight is drawn.
+        // Only materials that select the glass type read these, so this is
+        // inert for the rest of the viewmodel.
+        shader.glassClarity = scene.glassClarity;
+        shader.glassGrazing = scene.glassGrazing;
         // With see-through active this body runs twice: color writes are
         // disabled while the first pass selects the nearest weapon surface,
         // then smooth alpha shades that exact depth in the second pass.
@@ -3557,6 +3577,41 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                     const float dot = GunModel::ReticleSize();
                     model = XMMatrixScaling(dot, dot, dot) *
                         XMMatrixTranslation(reticle.x, reticle.y, reticle.z) * xf;
+                    // Follow the screen-space dot. The mount places this in
+                    // weapon space, which is why it used to sit still while the
+                    // HUD mark drifted; the same sway and recoil offset is
+                    // applied here in world space so the two stay together.
+                    //
+                    // Converted at the dot's own measured distance from the eye
+                    // rather than a nominal one -- pixels subtend a different
+                    // world size the further out they are, so using the wrong
+                    // depth would misalign the two marks by a few pixels.
+                    {
+                        const XMVECTOR eye =
+                            XMLoadFloat3(&scene.ViewmodelAnchorPosition());
+                        const XMVECTOR dotWorld = model.r[3];
+                        const float dotDistance = XMVectorGetX(
+                            XMVector3Length(XMVectorSubtract(dotWorld, eye)));
+                        float rightOffset = 0.0f, upOffset = 0.0f;
+                        scene.OpticDotWorldOffset(dotDistance, rightOffset,
+                                                  upOffset);
+                        // Camera basis, not the weapon's: the offset is a
+                        // screen-space nudge, so it has to move across the
+                        // view, not along the barrel.
+                        const XMVECTOR front = XMVector3Normalize(
+                            XMLoadFloat3(&scene.ViewmodelAnchorFront()));
+                        XMVECTOR right = XMVector3Cross(
+                            XMLoadFloat3(&scene.camera.Up), front);
+                        if (XMVectorGetX(XMVector3LengthSq(right)) < 1e-6f)
+                            right = XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f);
+                        right = XMVector3Normalize(right);
+                        const XMVECTOR up =
+                            XMVector3Normalize(XMVector3Cross(front, right));
+                        model.r[3] = XMVectorAdd(
+                            dotWorld,
+                            XMVectorAdd(XMVectorScale(right, rightOffset),
+                                        XMVectorScale(up, upOffset)));
+                    }
                     // A real collimated dot appears to float on the target, not
                     // inside the tube, so it must not lose the depth test to the
                     // sight's own glass and housing. This is the muzzle flash's
@@ -3565,8 +3620,19 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                     // than being sorted against it.
                     shader.UseMuzzleFlash();
                     shader.SetMatrices(model, view, proj, lightSpace);
-                    shader.SetEmissiveMaterial(XMFLOAT3(5.5f, 0.025f, 0.012f),
-                                               0.92f);
+                    // Tinted by the same colour the screen-space dot uses, so
+                    // the two marks agree, and scaled past 1.0 by opticDotGlow
+                    // so the post chain's brightness threshold picks it up and
+                    // blooms it. The green and blue channels stay a fraction of
+                    // red: a pure-red emitter reads as a flat disc, while a
+                    // little bleed gives the core its hot centre.
+                    shader.SetEmissiveMaterial(
+                        XMFLOAT3(scene.opticDotColor.x * scene.opticDotGlow,
+                                 scene.opticDotColor.y * scene.opticDotGlow *
+                                     0.12f,
+                                 scene.opticDotColor.z * scene.opticDotGlow *
+                                     0.10f),
+                        0.92f);
                     DrawSphere(geo);
                     shader.NextDrawCall();
                 }
