@@ -514,7 +514,7 @@ public:
     // Highest weapon id the per-weapon table covers. Mirrors GunModel's
     // kMaxWeapon, spelled out rather than included: ArmsModel is deliberately
     // unaware of GunModel, so the weapon index is passed in from outside.
-    static constexpr int kMaxGripWeapon = 9;
+    static constexpr int kMaxGripWeapon = 10;
 
     // Per-weapon nudge ADDED to the shared grip point above, in gun-local
     // units. Zero means "sits exactly where the shared value puts it", which is
@@ -526,7 +526,9 @@ public:
     static XMFLOAT3& WeaponGripOffset(int weapon) {
         static std::array<XMFLOAT3, kMaxGripWeapon + 1> offsets = {{
             { 0.000f,  0.000f, 0.0f }, // AK47
-            { 0.000f,  0.000f, 0.0f }, // Mossberg
+            // Support hand forward onto the pump, which sits further down
+            // the barrel than the AK handguard the shared grip was set on.
+            {-0.025f, -0.010f, 0.070f }, // Remington 870
             { 0.000f,  0.000f, 0.0f }, // RPG
             { 0.000f,  0.000f, 0.0f }, // SVD
             { 0.000f,  0.000f, 0.0f }, // laser
@@ -537,9 +539,16 @@ public:
             // The M4's handguard is shorter and sits lower than the AK's, so
             // the shared grip point leaves the support hand off the rail.
             {-0.030f, -0.030f, 0.0f }, // M4A1
+            { 0.000f,  0.000f, 0.0f }, // AK-74: AK pattern, so no nudge
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxGripWeapon));
         return offsets[static_cast<size_t>(slot)];
+    }
+
+    static XMFLOAT3 DefaultWeaponGripOffset(int weapon) {
+        if (weapon == 1) return { -0.025f, -0.010f, 0.070f };
+        if (weapon == 9) return { -0.030f, -0.030f, 0.000f };
+        return { 0.0f, 0.0f, 0.0f };
     }
 
     // Which weapon the per-weapon nudge is read for. Pushed in by the caller as

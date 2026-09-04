@@ -134,7 +134,7 @@ struct alignas(256) ObjectBufferDX12 {
     float normalTexW = 1.0f;
     float normalTexH = 1.0f;
     float specularScale = 1.0f;
-    float materialType = 0.0f; // 0=ordinary, 1=pool water, 2=ocean
+    float materialType = 0.0f; // 0=ordinary, 1=pool water, 2=ocean, 8/9=glass
     float materialTime = 0.0f; // animated procedural materials
     // > 0.5: add emissiveMap * emissiveFactor after lighting. Takes one of the
     // three padding floats that filled the gap below, so the uint4 that follows

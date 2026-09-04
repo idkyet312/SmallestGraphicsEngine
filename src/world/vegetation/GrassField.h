@@ -346,6 +346,13 @@ public:
         return m_terrain ? GrassTerrainDensity(x, z) : 0.0f;
     }
 
+    bool TerrainSandDominant(float x, float z) const {
+        if (!m_terrain) return false;
+        float grass = 0.0f, dirt = 0.0f, sand = 0.0f, rock = 0.0f;
+        TerrainLayerWeights(x, z, grass, dirt, sand, rock);
+        return sand >= (std::max)({ grass, dirt, rock });
+    }
+
     // Wind controls, surfaced to the UI.
     float& WindStrength() { return m_windStrength; }
     float& WindSpeed()    { return m_windSpeed; }
@@ -624,11 +631,12 @@ private:
         rock += (paintedRock / total - rock) * blend;
     }
 
-    // Mirrors TerrainLayerWeights/TerrainVBLayerWeights through the normalized
-    // layer weights. Height-blend texture samples are deliberately excluded:
-    // they add centimetre-scale interlock inside the same material region and
-    // are not a stable place to decide whether a plant can grow.
-    float GrassTerrainDensity(float x, float z) const {
+    // CPU mirror of TerrainLayerWeights/TerrainVBLayerWeights. Height-blend
+    // texture samples are deliberately excluded: they add centimetre-scale
+    // interlock inside the same material region and are not a stable place to
+    // classify the ground under vegetation or a crater.
+    void TerrainLayerWeights(float x, float z, float& grass, float& dirt,
+                             float& sand, float& rock) const {
         constexpr float e = 0.35f;
         const float y = m_terrain(x, z);
         const float nx = m_terrain(x - e, z) - m_terrain(x + e, z);
@@ -639,17 +647,17 @@ private:
         const float noise = TerrainBlendNoise(x, z);
         const float noisyHeight = y + (noise - 0.5f) * 1.5f;
 
-        float rock = SmoothStep(0.30f, 0.68f,
+        rock = SmoothStep(0.30f, 0.68f,
             slope + (noise - 0.5f) * 0.12f);
         const float flat = 1.0f - SmoothStep(0.18f, 0.52f, slope);
         const float beachCore =
             (1.0f - SmoothStep(0.80f, 1.20f, y)) * flat;
         const float beachTransition =
             (1.0f - SmoothStep(0.75f, 2.25f, noisyHeight)) * flat;
-        float sand = (std::max)(beachCore, beachTransition);
-        float grass = SmoothStep(1.45f, 2.35f, noisyHeight) * flat;
-        float dirt = 0.08f + SmoothStep(0.58f, 0.79f, noise) * 0.40f * flat +
-                     SmoothStep(0.12f, 0.46f, slope) * 0.32f;
+        sand = (std::max)(beachCore, beachTransition);
+        grass = SmoothStep(1.45f, 2.35f, noisyHeight) * flat;
+        dirt = 0.08f + SmoothStep(0.58f, 0.79f, noise) * 0.40f * flat +
+               SmoothStep(0.12f, 0.46f, slope) * 0.32f;
 
         if (m_showAuthoredPaths) {
             const float axisDistance = (std::min)(std::abs(x), std::abs(z));
@@ -675,7 +683,11 @@ private:
         sand /= total;
         rock /= total;
         ApplyPaintedWeights(x, z, grass, dirt, sand, rock);
+    }
 
+    float GrassTerrainDensity(float x, float z) const {
+        float grass = 0.0f, dirt = 0.0f, sand = 0.0f, rock = 0.0f;
+        TerrainLayerWeights(x, z, grass, dirt, sand, rock);
         const float nonGrass = (std::max)({ dirt, sand, rock });
         if (grass <= nonGrass) return 0.0f;
         // Where grass is the material, plant it fully. The raw weight is a

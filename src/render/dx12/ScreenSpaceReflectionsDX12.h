@@ -25,10 +25,15 @@ public:
         const std::string source = stream.str();
         const UINT flags = D3DCOMPILE_ENABLE_STRICTNESS |
                            D3DCOMPILE_OPTIMIZATION_LEVEL3;
-        ComPtr<ID3DBlob> vs, ps, errors;
+        ComPtr<ID3DBlob> vs, ps, ngPs, compositePs, errors;
         if (!Compile(source, "VSMain", "vs_5_0", flags, vs, errors) ||
             !Compile(source, "PSMain", "ps_5_0", flags, ps, errors) ||
-            !CreateRootSignature() || !CreatePipeline(vs.Get(), ps.Get()) ||
+            !Compile(source, "PSTraceNG", "ps_5_0", flags, ngPs, errors) ||
+            !Compile(source, "PSCompositeNG", "ps_5_0", flags, compositePs,
+                     errors) ||
+            !CreateRootSignature() ||
+            !CreatePipeline(vs.Get(), ps.Get(), ngPs.Get(),
+                            compositePs.Get()) ||
             !CreateResources()) return false;
         initialized = true;
         return true;
@@ -42,6 +47,12 @@ public:
             !g_dx12.commandList || !EnsureSceneCopy()) return;
         Update(scene, depth, normalRoughness);
         ID3D12GraphicsCommandList* list = g_dx12.commandList.Get();
+        // With every contribution switched off there is nothing to trace, so
+        // fall back to the default mirror path rather than spending the trace
+        // and composite draws producing black.
+        const bool ngActive = scene.screenSpaceRTEnabled &&
+            (scene.screenSpaceRTSpecular || scene.screenSpaceRTGI ||
+             scene.screenSpaceRTAO);
 
         Transition(list, hdrSourceTarget, D3D12_RESOURCE_STATE_RENDER_TARGET,
                    D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -57,20 +68,70 @@ public:
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-        list->OMSetRenderTargets(1, &hdrRtv, FALSE, nullptr);
         list->RSSetViewports(1, &g_dx12.viewport);
         list->RSSetScissorRects(1, &g_dx12.scissorRect);
-        list->SetPipelineState(pipeline_.Get());
+
+        // The NG path traces once, into its own history target. That result is
+        // then composited into the scene by a second, trace-free pass. Tracing
+        // straight into the additively-blended scene target would leave nothing
+        // readable as next frame's history -- the scene target already holds
+        // the lit image -- and re-tracing to produce one would double the cost
+        // of the most expensive pass in the feature.
+        if (ngActive) {
+            // Ping-pong the two accumulation buffers: the trace reads last
+            // frame's and writes this frame's. Reading and writing one texture
+            // in a single draw is undefined, which is why there are two.
+            const UINT writeIndex = ngWriteIndex_;
+            Transition(list, ngAccum_[writeIndex].Get(),
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                       D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->SetPipelineState(ngPipeline_.Get());
+            list->SetGraphicsRootSignature(rootSignature_.Get());
+            ID3D12DescriptorHeap* ngHeaps[] = { descriptorHeap_.Get() };
+            list->SetDescriptorHeaps(1, ngHeaps);
+            list->SetGraphicsRootConstantBufferView(
+                0, constantBuffer_->GetGPUVirtualAddress() +
+                   g_dx12.frameIndex * 256u);
+            // Trace reads last frame's buffer: the variant that is not being
+            // written.
+            list->SetGraphicsRootDescriptorTable(
+                1, VariantTable(writeIndex ^ 1u));
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            D3D12_CPU_DESCRIPTOR_HANDLE accumRtv =
+                ngAccumRTV_->GetCPUDescriptorHandleForHeapStart();
+            accumRtv.ptr += static_cast<SIZE_T>(rtvSize_) * writeIndex;
+            list->OMSetRenderTargets(1, &accumRtv, FALSE, nullptr);
+            list->DrawInstanced(3, 1, 0, 0);
+            Transition(list, ngAccum_[writeIndex].Get(),
+                       D3D12_RESOURCE_STATE_RENDER_TARGET,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            ngHistoryValid_ = true;
+            ++ngFrameIndex_;
+        }
+
+        list->OMSetRenderTargets(1, &hdrRtv, FALSE, nullptr);
+        list->SetPipelineState(ngActive ? ngCompositePipeline_.Get()
+                                        : pipeline_.Get());
         list->SetGraphicsRootSignature(rootSignature_.Get());
         ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
         list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootConstantBufferView(
             0, constantBuffer_->GetGPUVirtualAddress() +
                g_dx12.frameIndex * 256u);
-        list->SetGraphicsRootDescriptorTable(
-            1, descriptorHeap_->GetGPUDescriptorHandleForHeapStart());
+        // The composite reads the buffer the trace just wrote; the default path
+        // does not use t3 at all, so either variant serves it.
+        list->SetGraphicsRootDescriptorTable(1, VariantTable(ngWriteIndex_));
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->DrawInstanced(3, 1, 0, 0);
+
+        if (ngActive) {
+            // The freshly traced result becomes next frame's history.
+            ngWriteIndex_ ^= 1u;
+        } else {
+            // History goes stale the moment the feature is switched off, so a
+            // later re-enable must not blend against a frame from minutes ago.
+            ngHistoryValid_ = false;
+        }
 
         Transition(list, sceneCopy_.Get(),
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
@@ -84,12 +145,18 @@ public:
     }
 
 private:
+    // t0 scene copy, t1 depth, t2 normal/roughness, t3 accumulation.
+    static constexpr UINT kDescriptorsPerVariant = 4;
+
     struct Constants {
         XMFLOAT4X4 inverseViewProjection;
         XMFLOAT4X4 viewProjection;
         XMFLOAT4 cameraNear;
         XMFLOAT4 screenParams;
         XMFLOAT4 ssrParams;
+        XMFLOAT4 ngParams;
+        XMFLOAT4 ngTrace;
+        XMFLOAT4 ngTemporal;
     };
 
     bool Compile(const std::string& source, const char* entry, const char* target,
@@ -106,7 +173,8 @@ private:
     bool CreateRootSignature() {
         D3D12_DESCRIPTOR_RANGE range = {};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = 3;
+        // t3 is the NGLighting accumulation history.
+        range.NumDescriptors = 4;
         range.BaseShaderRegister = 0;
         D3D12_ROOT_PARAMETER roots[2] = {};
         roots[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -142,7 +210,8 @@ private:
             IID_PPV_ARGS(&rootSignature_)));
     }
 
-    bool CreatePipeline(ID3DBlob* vs, ID3DBlob* ps) {
+    bool CreatePipeline(ID3DBlob* vs, ID3DBlob* ps, ID3DBlob* ngPs,
+                        ID3DBlob* compositePs) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
         desc.pRootSignature = rootSignature_.Get();
         desc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
@@ -168,14 +237,40 @@ private:
         desc.NumRenderTargets = 1;
         desc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc.SampleDesc.Count = 1;
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &desc, IID_PPV_ARGS(&pipeline_)))) return false;
+
+        // NG trace: writes the raw gather into the accumulation buffer. No
+        // blending, and alpha is written too -- alpha carries the depth the
+        // gather was traced against, which next frame reprojects against.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC ngDesc = desc;
+        ngDesc.PS = { ngPs->GetBufferPointer(), ngPs->GetBufferSize() };
+        ngDesc.BlendState.RenderTarget[0].BlendEnable = FALSE;
+        ngDesc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+            D3D12_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
+                &ngDesc, IID_PPV_ARGS(&ngPipeline_)))) return false;
+
+        // NG composite: adds the accumulated result into the scene. Shares the
+        // additive blend of the default path, so occlusion arrives as the
+        // negative term the trace shader already folded in.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC compositeDesc = desc;
+        compositeDesc.PS = { compositePs->GetBufferPointer(),
+                             compositePs->GetBufferSize() };
         return SUCCEEDED(g_dx12.device->CreateGraphicsPipelineState(
-            &desc, IID_PPV_ARGS(&pipeline_)));
+            &compositeDesc, IID_PPV_ARGS(&ngCompositePipeline_)));
     }
 
     bool CreateResources() {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 3;
+        // Two 4-descriptor variants. They differ only in t3: variant 0 binds
+        // accumulation buffer 0 there, variant 1 binds buffer 1. The trace
+        // selects the variant holding last frame's buffer and the composite the
+        // one holding the buffer just written, so neither has to have a
+        // descriptor rewritten mid-frame -- which would race the GPU, since
+        // recording a draw does not mean it has executed.
+        heapDesc.NumDescriptors = kDescriptorsPerVariant * 2u;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(g_dx12.device->CreateDescriptorHeap(
                 &heapDesc, IID_PPV_ARGS(&descriptorHeap_)))) return false;
@@ -225,6 +320,41 @@ private:
                 &heap, D3D12_HEAP_FLAG_NONE, &desc,
                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                 IID_PPV_ARGS(&sceneCopy_)))) return false;
+
+        // NGLighting accumulation: the gather in rgb and the depth it was
+        // traced against in alpha, which is what the next frame reprojects
+        // against. Two buffers so a frame can read one while writing the other.
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        // No clear value: the trace pass writes every pixel of the target, so
+        // it is never cleared, and ngHistoryValid_ covers the one frame where
+        // the contents are still undefined.
+        for (UINT i = 0; i < 2; ++i) {
+            ngAccum_[i].Reset();
+            if (FAILED(g_dx12.device->CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                    IID_PPV_ARGS(&ngAccum_[i])))) return false;
+        }
+        // Freshly created buffers hold garbage, so the first frame after a
+        // resize must not blend against them.
+        ngHistoryValid_ = false;
+        ngWriteIndex_ = 0;
+
+        D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = {};
+        rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rtvDesc.NumDescriptors = 2;
+        if (!ngAccumRTV_ &&
+            FAILED(g_dx12.device->CreateDescriptorHeap(
+                &rtvDesc, IID_PPV_ARGS(&ngAccumRTV_)))) return false;
+        rtvSize_ = g_dx12.device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle =
+            ngAccumRTV_->GetCPUDescriptorHandleForHeapStart();
+        for (UINT i = 0; i < 2; ++i) {
+            g_dx12.device->CreateRenderTargetView(
+                ngAccum_[i].Get(), nullptr, rtvHandle);
+            rtvHandle.ptr += rtvSize_;
+        }
         return true;
     }
 
@@ -247,25 +377,56 @@ private:
             scene.screenSpaceReflectionThickness,
             scene.screenSpaceReflectionStrength,
             normalRoughness ? 1.0f : 0.0f };
+        constants.ngParams = {
+            scene.screenSpaceRTEnabled ? 1.0f : 0.0f,
+            scene.screenSpaceRTGI ? 1.0f : 0.0f,
+            scene.screenSpaceRTGIStrength,
+            static_cast<float>(scene.screenSpaceRTRaySteps) };
+        constants.ngTrace = {
+            scene.screenSpaceRTRayGrowth,
+            scene.screenSpaceRTAO ? scene.screenSpaceRTAOStrength : 0.0f,
+            scene.screenSpaceRTAORadius,
+            static_cast<float>(ngFrameIndex_) };
+        constants.ngTemporal = {
+            scene.screenSpaceRTAccumulation,
+            ngHistoryValid_ ? 1.0f : 0.0f,
+            scene.screenSpaceRTSpecular ? 1.0f : 0.0f,
+            scene.screenSpaceRTAO ? 1.0f : 0.0f };
         std::memcpy(mappedConstants_ + g_dx12.frameIndex * 256u,
                     &constants, sizeof(constants));
 
-        auto handle = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
         srv.Shader4ComponentMapping =
             D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Texture2D.MipLevels = 1;
-        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        g_dx12.device->CreateShaderResourceView(
-            sceneCopy_.Get(), &srv, handle);
-        handle.ptr += descriptorSize_;
-        srv.Format = DXGI_FORMAT_R32_FLOAT;
-        g_dx12.device->CreateShaderResourceView(depth, &srv, handle);
-        handle.ptr += descriptorSize_;
-        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        g_dx12.device->CreateShaderResourceView(
-            normalRoughness, &srv, handle);
+        for (UINT variant = 0; variant < 2; ++variant) {
+            auto handle = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += static_cast<SIZE_T>(descriptorSize_) *
+                          kDescriptorsPerVariant * variant;
+            srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            g_dx12.device->CreateShaderResourceView(
+                sceneCopy_.Get(), &srv, handle);
+            handle.ptr += descriptorSize_;
+            srv.Format = DXGI_FORMAT_R32_FLOAT;
+            g_dx12.device->CreateShaderResourceView(depth, &srv, handle);
+            handle.ptr += descriptorSize_;
+            srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            g_dx12.device->CreateShaderResourceView(
+                normalRoughness, &srv, handle);
+            handle.ptr += descriptorSize_;
+            // t3 is this variant's accumulation buffer.
+            g_dx12.device->CreateShaderResourceView(
+                ngAccum_[variant].Get(), &srv, handle);
+        }
+    }
+
+    D3D12_GPU_DESCRIPTOR_HANDLE VariantTable(UINT variant) const {
+        D3D12_GPU_DESCRIPTOR_HANDLE table =
+            descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
+        table.ptr += static_cast<UINT64>(descriptorSize_) *
+                     kDescriptorsPerVariant * variant;
+        return table;
     }
 
     static void Transition(ID3D12GraphicsCommandList* list,
@@ -285,11 +446,18 @@ private:
     ComPtr<ID3D12RootSignature> rootSignature_;
     ComPtr<ID3D12PipelineState> pipeline_;
     ComPtr<ID3D12DescriptorHeap> descriptorHeap_;
+    ComPtr<ID3D12PipelineState> ngPipeline_, ngCompositePipeline_;
     ComPtr<ID3D12Resource> constantBuffer_, sceneCopy_;
+    ComPtr<ID3D12Resource> ngAccum_[2];
+    ComPtr<ID3D12DescriptorHeap> ngAccumRTV_;
     BYTE* mappedConstants_ = nullptr;
     UINT descriptorSize_ = 0;
+    UINT rtvSize_ = 0;
     UINT copyWidth_ = 0;
     UINT copyHeight_ = 0;
+    UINT ngFrameIndex_ = 0;
+    UINT ngWriteIndex_ = 0;
+    bool ngHistoryValid_ = false;
 };
 
 #endif

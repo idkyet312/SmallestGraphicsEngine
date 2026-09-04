@@ -37,7 +37,11 @@ struct alignas(256) SkyBufferDX12 {
     // 1 when the 3D noise volumes are bound and the shader should run the
     // volumetric march; 0 keeps it on the cheaper 2D-noise slab.
     float cloudVolumetric;
-    float cloudPadding[3];
+    float sunLensEnabled;
+    float sunAngularRadius;
+    float sunDiscIntensity;
+    // RGB is the direct-light tint; alpha is the wide atmospheric halo.
+    XMFLOAT4 sunLensColorHalo;
 };
 
 class SkyRendererDX12 {
@@ -76,6 +80,11 @@ public:
     bool msaaSupported = false;
     bool msaaEnabled = false;
     bool hdrTargetEnabled = false;
+    bool sunLensEnabled = false;
+    float sunAngularRadius = XMConvertToRadians(0.10f);
+    float sunDiscIntensity = 61.9f;
+    float sunHaloIntensity = 1.31f;
+    XMFLOAT3 sunLensColor = { 1.0f, 0.92f, 0.70f };
 
     bool Init() {
         std::ifstream vsFile("shaders/sky_vs.hlsl");
@@ -285,6 +294,17 @@ public:
 
     void SetHDRTargetEnabled(bool enabled) { hdrTargetEnabled = enabled; }
 
+    void SetSunLens(bool enabled, const XMFLOAT3& color,
+                    float angularRadiusDegrees, float discIntensity,
+                    float haloIntensity) {
+        sunLensEnabled = enabled;
+        sunLensColor = color;
+        sunAngularRadius = XMConvertToRadians(
+            (std::max)(0.05f, angularRadiusDegrees));
+        sunDiscIntensity = (std::max)(0.0f, discIntensity);
+        sunHaloIntensity = (std::max)(0.0f, haloIntensity);
+    }
+
     // Points the cloud raymarch at the baked noise volumes. Copies the views
     // into this renderer's own heap because only one CBV/SRV/UAV heap can be
     // bound at a time and the sky pass binds its own. Call once after the
@@ -350,6 +370,13 @@ public:
         // existed, which is also the fallback if noise generation failed.
         data.cloudVolumetric =
             volumetricClouds && cloudVolumesReady ? 1.0f : 0.0f;
+        data.sunLensEnabled = sunLensEnabled ? 1.0f : 0.0f;
+        data.sunAngularRadius = sunAngularRadius;
+        data.sunDiscIntensity = sunDiscIntensity;
+        data.sunLensColorHalo = {
+            sunLensColor.x, sunLensColor.y, sunLensColor.z,
+            sunHaloIntensity
+        };
         constants.CopyData(g_dx12.frameIndex, data);
 
         g_dx12.commandList->SetPipelineState(hdrTargetEnabled

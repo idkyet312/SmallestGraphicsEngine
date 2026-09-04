@@ -3056,6 +3056,14 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // before it sits in the hands, not just sliding.
         ImGui::DragFloat3("Weapon Fit Rot",
                           &GunModel::PlayerFitRotation().x, 1.0f);
+        // Size for this weapon alone, on top of the global Scale above. Every
+        // import is normalised to the same barrel length, so a carbine and a
+        // full-length rifle arrive the same size; this is where that is put
+        // right without touching any other weapon. Clamped above zero because
+        // a zero or negative scale collapses or inverts the mesh.
+        ImGui::DragFloat("Weapon Fit Scale",
+                         &GunModel::PlayerFitScale(), 0.005f, 0.05f, 5.0f,
+                         "%.3f", ImGuiSliderFlags_AlwaysClamp);
 
         // Attachment placement. These are gun-local like the fit offsets above,
         // not screen-relative: they walk the sight along the receiver rail, and
@@ -3419,9 +3427,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             // Shared baseline: moves every weapon together.
             if (ImGui::DragFloat3("Grip Target", &ArmsModel::WeaponGrip().x, 0.005f))
                 ArmsModel::RealignHandsToWeapon();
-            // Added on top for the held weapon only, and zero by default, so
-            // this starts as a no-op and each rifle is corrected from the shared
-            // pose rather than positioned from scratch. No re-solve on edit:
+            // Added on top for the held weapon only, so each rifle can be
+            // corrected from the shared pose rather than positioned from
+            // scratch. No re-solve on edit:
             // it applies as a delta in ModelToGunLocal and takes effect on the
             // next frame, where re-solving would move the body independently of
             // the value being dragged.
@@ -3430,7 +3438,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                               &ArmsModel::PlayerGripOffset().x, 0.005f);
             ImGui::SameLine();
             if (ImGui::Button("Reset##gripnudge"))
-                ArmsModel::PlayerGripOffset() = DirectX::XMFLOAT3(0, 0, 0);
+                ArmsModel::PlayerGripOffset() =
+                    ArmsModel::DefaultWeaponGripOffset(
+                        GunModel::SelectedWeapon());
             if (ImGui::Button("Snap Hands To Weapon"))
                 ArmsModel::RealignHandsToWeapon();
 

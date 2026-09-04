@@ -3467,15 +3467,21 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // would swing the weapon around the hand rather than spinning it in
             // place.
             const XMFLOAT3& weaponFitRot = GunModel::PlayerFitRotation();
+            // Per-weapon size correction folded into the shared scale rather
+            // than applied on its own: the hand offset below is expressed in
+            // the same normalised units as the mesh, so scaling the geometry
+            // without scaling the offset would slide the weapon out of the
+            // grip as soon as it was resized.
+            const float weaponS = S * GunModel::PlayerFitScale();
             const XMMATRIX weaponPlacement =
                 XMMatrixRotationRollPitchYaw(
                     XMConvertToRadians(weaponFitRot.x),
                     XMConvertToRadians(weaponFitRot.y),
                     XMConvertToRadians(weaponFitRot.z)) *
-                XMMatrixScaling(S, S, S) *
-                XMMatrixTranslation(weaponOffset.x * S,
-                                    weaponOffset.y * S,
-                                    weaponOffset.z * S);
+                XMMatrixScaling(weaponS, weaponS, weaponS) *
+                XMMatrixTranslation(weaponOffset.x * weaponS,
+                                    weaponOffset.y * weaponS,
+                                    weaponOffset.z * weaponS);
             XMMATRIX xf = weaponPlacement * gunBase;
             // With the idle playing, ride the trigger hand so the rifle stays in
             // the grip instead of hanging still while the arms breathe past it.

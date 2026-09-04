@@ -84,6 +84,15 @@ public:
     }
     static bool M4Loaded() { return M4Mesh() != nullptr; }
 
+    // AK-74: a second Kalashnikov sharing the AK47 stats, offsets and
+    // material. A variant of the same rifle rather than a new weapon class, so
+    // nothing about its handling is authored separately.
+    static std::shared_ptr<SceneMesh>& AK74Mesh() {
+        static std::shared_ptr<SceneMesh> mesh;
+        return mesh;
+    }
+    static bool AK74Loaded() { return AK74Mesh() != nullptr; }
+
     // The M4's iron sights, split from the body at load. Drawn only when no
     // optic is fitted: a red dot mounts directly over them, and the rear leaf
     // would otherwise stand up through the sight body.
@@ -104,19 +113,19 @@ public:
 
     // Highest valid weapon id. Several parallel tables are sized to this, so
     // adding a weapon means extending every one of them.
-    static constexpr int kMaxWeapon = 9;
+    static constexpr int kMaxWeapon = 10;
 
     static int& SelectedWeapon() {
         // 0 AK, 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame, 7 harpoon,
-        // 8 suppressed SVD, 9 M4A1
+        // 8 suppressed SVD, 9 M4A1, 10 AK-74
         static int weapon = 0;
         return weapon;
     }
     static const char* WeaponName(int weapon) {
         static constexpr const char* names[kMaxWeapon + 1] = {
-            "AK47", "Mossberg 590A1", "RPG-7", "SVD Sniper",
+            "AK47", "Remington 870", "RPG-7", "R700 Sniper",
             "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
-            "Mako Harpoon Gun", "SVD Suppressed", "M4A1"
+            "Mako Harpoon Gun", "R700 Suppressed", "M4A1", "AK-74"
         };
         return names[(std::max)(0, (std::min)(weapon, kMaxWeapon))];
     }
@@ -136,6 +145,7 @@ public:
     static bool FlamethrowerSelected() { return SelectedWeapon() == 6; }
     static bool HarpoonSelected() { return SelectedWeapon() == 7; }
     static bool M4Selected() { return SelectedWeapon() == 9 && M4Loaded(); }
+    static bool AK74Selected() { return SelectedWeapon() == 10 && AK74Loaded(); }
     static const char* SelectedWeaponName() {
         return WeaponName(SelectedWeapon());
     }
@@ -146,6 +156,7 @@ public:
         if (FlamethrowerSelected())
             return ShotgunLoaded() ? ShotgunMesh() : Mesh();
         if (M4Selected()) return M4Mesh();
+        if (AK74Selected()) return AK74Mesh();
         if (SVDSelected()) return SVDMesh();
         if (RPGSelected()) return RPGMesh();
         return ShotgunSelected() ? ShotgunMesh() : Mesh();
@@ -156,7 +167,9 @@ public:
     static XMFLOAT3& WeaponOffset(int weapon) {
         static std::array<XMFLOAT3, kMaxWeapon + 1> offsets = {{
             { 0.000f, -0.100f, -0.440f }, // AK47 handguard
-            { 0.045f, -0.100f, -0.290f }, // Mossberg pump
+            // Tuned in game against the Remington 870 mesh, which is shorter
+            // and sits lower in the hands than the Mossberg it replaced.
+            { 0.009f, -0.050f, -0.410f }, // Remington 870 pump
             { 0.020f, -0.030f, -0.330f }, // RPG forward grip
             { 0.030f, -0.060f, -0.490f }, // SVD handguard
             { 0.015f, -0.080f, -0.390f }, // laser emitter
@@ -171,6 +184,10 @@ public:
             // to the same barrel length, but the M4's rear bound is closer to
             // its grip, so the same pocket would push it through the hands.
             { 0.005f, -0.130f, -0.250f }, // M4A1 handguard
+            // Same values as the AK47 above: Orient normalises both rifles to
+            // the same barrel length, and the AK-74 shares the AK pattern, so
+            // the support hand lands in the same place on the handguard.
+            { 0.000f, -0.100f, -0.440f }, // AK-74 handguard
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -186,7 +203,9 @@ public:
     static XMFLOAT3& WeaponFitRotation(int weapon) {
         static std::array<XMFLOAT3, kMaxWeapon + 1> rotations = {{
             { 0.0f, 0.0f, 0.0f },   // AK47
-            { 0.0f, 0.0f, 0.0f },   // Mossberg
+            // Slight pitch: the export is not perfectly square to its own
+            // bounding box, so Orient leaves it a touch off-axis.
+            { 2.0f, 0.0f, 0.0f },   // Remington 870
             { 0.0f, 0.0f, 0.0f },   // RPG
             { 0.0f, 0.0f, 0.0f },   // SVD
             { 0.0f, 0.0f, 0.0f },   // laser
@@ -195,12 +214,43 @@ public:
             { 0.0f, 0.0f, 0.0f },   // harpoon
             { 0.0f, 0.0f, 0.0f },   // SVD suppressed
             { 0.0f, 0.0f, 0.0f },   // M4A1
+            { 0.0f, 0.0f, 0.0f },   // AK-74
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return rotations[static_cast<size_t>(slot)];
     }
     static XMFLOAT3& PlayerFitRotation() {
         return WeaponFitRotation(SelectedWeapon());
+    }
+
+    // Per-weapon size multiplier on top of the shared viewmodel scale. Orient
+    // normalises every imported gun to the same barrel length, which makes one
+    // set of hand offsets work everywhere but also throws away how big the
+    // weapon really is -- a carbine and a full-length rifle both come out
+    // 1.25 units long. This is the correction for that, kept separate from the
+    // global Scale so tuning one weapon cannot resize the whole rack.
+    static float& WeaponFitScale(int weapon) {
+        static std::array<float, kMaxWeapon + 1> scales = {{
+            1.00f, // AK47
+            // Orient normalises every gun to one barrel length, which leaves
+            // this pump-action reading small beside the rifles. Sized up to
+            // match them in hand.
+            1.35f, // Remington 870
+            1.00f, // RPG
+            1.00f, // SVD
+            1.00f, // laser
+            1.00f, // C4
+            1.00f, // flamethrower
+            1.00f, // harpoon
+            1.00f, // SVD suppressed
+            1.00f, // M4A1
+            1.00f, // AK-74
+        }};
+        const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
+        return scales[static_cast<size_t>(slot)];
+    }
+    static float& PlayerFitScale() {
+        return WeaponFitScale(SelectedWeapon());
     }
 
     // Optic mount, per weapon and in gun-local space. The sight rides the
@@ -211,8 +261,8 @@ public:
     static XMFLOAT3& WeaponOpticOffset(int weapon) {
         static std::array<XMFLOAT3, kMaxWeapon + 1> offsets = {{
             { 0.012f, 0.154f, 0.376f }, // AK47 rear receiver rail
-            { 0.012f, 0.154f, 0.376f }, // Mossberg receiver rail
-            // Only the AK and Mossberg accept an optic today (the red dot's
+            { 0.003f, 0.099f, 0.480f }, // Remington 870 receiver rail
+            // Only the AK and the shotgun accept an optic today (the red dot's
             // compatibility mask in WeaponCustomization.h). The rest carry the
             // same starting pose rather than a stale one, so widening that mask
             // gives a sight roughly on the rail instead of floating in space.
@@ -229,6 +279,7 @@ public:
             // below -- this rifle imports smaller against the shared viewmodel
             // length, so both the position and the size differ.
             { 0.009f, 0.114f, 0.470f }, // M4A1 flat-top rail
+            { 0.012f, 0.154f, 0.376f }, // AK-74 rear receiver rail
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -243,7 +294,7 @@ public:
     static XMFLOAT3& WeaponOpticRotation(int weapon) {
         static std::array<XMFLOAT3, kMaxWeapon + 1> rotations = {{
             { 0.0f,  0.0f, 0.0f }, // AK47
-            { 0.0f,  0.0f, 0.0f }, // Mossberg
+            { 0.0f,  0.0f, 0.0f }, // Remington 870
             { 0.0f,  0.0f, 0.0f }, // RPG
             { 0.0f,  0.0f, 0.0f }, // SVD
             { 0.0f,  0.0f, 0.0f }, // laser
@@ -253,6 +304,7 @@ public:
             { 0.0f,  0.0f, 0.0f }, // SVD suppressed
             // Small correction for the rail's own pitch and cant.
             {-5.0f, -1.0f, 0.0f }, // M4A1
+            { 0.0f,  0.0f, 0.0f }, // AK-74
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return rotations[static_cast<size_t>(slot)];
@@ -268,7 +320,8 @@ public:
             // The M4 imports smaller relative to the shared viewmodel length
             // than the AK does, so the same sight needs scaling up to stay a
             // believable size on its rail.
-            3.07f // M4A1
+            3.07f, // M4A1
+            1.00f  // AK-74: imports at the AK47 proportions
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return scales[static_cast<size_t>(slot)];
@@ -282,7 +335,7 @@ public:
     static XMFLOAT3& WeaponReticleOffset(int weapon) {
         static std::array<XMFLOAT3, kMaxWeapon + 1> offsets = {{
             { 0.000f, -1.000f, -0.600f }, // AK47
-            { 0.000f, -1.000f, -0.600f }, // Mossberg
+            { 0.000f, -1.000f, -0.600f }, // Remington 870
             { 0.000f, -1.000f, -0.600f }, // RPG
             { 0.000f, -1.000f, -0.600f }, // SVD
             { 0.000f, -1.000f, -0.600f }, // laser
@@ -296,6 +349,7 @@ public:
             // from the mount sitting forward and high on the flat-top rail
             // instead of back and low on a dust cover.
             {-0.000f,  0.164f,  0.789f }, // M4A1
+            { 0.000f, -1.000f, -0.600f }, // AK-74
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -319,8 +373,9 @@ public:
     // reset restores the weapon actually in hand -- the reset used to hardcode
     // the AK's mount and would overwrite the M4's with it.
     static XMFLOAT3 DefaultOpticOffset(int weapon) {
+        if (weapon == 1) return XMFLOAT3(0.003f, 0.099f, 0.480f);
         // The M4's flat-top rail sits further forward and lower than the AK's
-        // dust-cover mount; every other weapon shares the AK's starting pose.
+        // dust-cover mount; remaining weapons share the AK's starting pose.
         if (weapon == 9) return XMFLOAT3(0.009f, 0.114f, 0.470f);
         return XMFLOAT3(0.012f, 0.154f, 0.376f);
     }
@@ -356,6 +411,7 @@ public:
         case 7: return true;
         case 8: return SVDLoaded(); // suppressed variant of the same rifle
         case 9: return M4Loaded();
+        case 10: return AK74Loaded();
         default: return false;
         }
     }
@@ -504,6 +560,8 @@ public:
         LoadShotgun();
         LoadRPG();
         LoadSVD();
+        // After the AK47 above, whose material this reuses.
+        LoadAK74();
     }
 
     // Keep the material alive: its texture uploads stay referenced by the open
@@ -659,6 +717,68 @@ private:
                   << " primitive(s)\n";
     }
 
+    // Second Kalashnikov, and a GLB rather than the binary FBX it used to
+    // be: the re-export embeds the AK-74 texture set the FBX was missing,
+    // so this no longer has to borrow the AK47's material and no longer
+    // has to run after the AK47 load.
+    static void LoadAK74() {
+        const std::string path = Resolve(
+            "Content/Models/MainPlayer/Guns/Ak74/ak74.glb");
+        auto root = GLBImporter::LoadGLB(
+            path, g_dx12.device, g_dx12.commandList);
+        if (!root) {
+            std::cerr << "AK-74 GLB unavailable; weapon slot stays empty\n";
+            return;
+        }
+
+        std::vector<MeshPrimitive> prims;
+        XMFLOAT4X4 identity;
+        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+        root->UpdateGlobalTransform(identity);
+        Flatten(root, prims);
+        if (prims.empty()) {
+            std::cerr << "AK-74 GLB had no geometry\n";
+            return;
+        }
+
+        // No FlipV here, unlike the FBX this replaced: glTF already uses our
+        // UV convention. Normalises to the shared 1.25-unit barrel length,
+        // which is what makes the AK47's authored hand and optic offsets
+        // correct for this mesh too.
+        Orient(prims);
+
+        // Keeps its own material rather than borrowing the AK47's. The FBX
+        // this replaced shipped with no textures at all, which is the only
+        // reason it had to share; this export embeds the same AK-74 base
+        // colour, packed metallic-roughness and normal set directly.
+        auto mesh = std::make_shared<SceneMesh>();
+        mesh->primitives = std::move(prims);
+        for (MeshPrimitive& primitive : mesh->primitives) {
+            if (primitive.material)
+                primitive.material->disableOcclusionCulling = true;
+            GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get());
+        }
+        AK74Mesh() = mesh;
+        std::cout << "AK-74 loaded: " << mesh->primitives.size()
+                  << " primitive(s)\n";
+        if (FILE* file = std::fopen("gun_load.log", "a")) {
+            size_t triangles = 0, vertices = 0;
+            for (const MeshPrimitive& primitive : mesh->primitives) {
+                triangles += primitive.indices.size() / 3;
+                vertices += primitive.vertices.size() / 12;
+            }
+            const auto& first = mesh->primitives.front().material;
+            std::fprintf(file,
+                "ak74_loaded=1 prims=%zu verts=%zu tris=%zu"
+                " albedo=%d normal=%d packedMR=%d\n",
+                mesh->primitives.size(), vertices, triangles,
+                first && first->baseColorTexture ? 1 : 0,
+                first && first->normalTexture ? 1 : 0,
+                first && first->metallicRoughnessTexture ? 1 : 0);
+            std::fclose(file);
+        }
+    }
+
     static void LoadM4() {
         const std::string path = Resolve(
             "Content/Models/MainPlayer/Guns/m4/m4A1.glb");
@@ -765,13 +885,25 @@ private:
                                      insideIronSight);
     }
 
+    // Remington 870, the pump-action that replaced the Mossberg 590A1. A GLB
+    // rather than an FBX, so the import skips FlipV -- the glTF UV convention
+    // already matches ours -- and keeps the file's own PBR material set (two
+    // materials, base colour + metallic-roughness + normal) instead of the flat
+    // factors the Mossberg needed, which shipped without usable textures.
+    //
+    // Authored as six sibling roots (gun, mag, pump, kurok, slider, bullet)
+    // laid out along X with per-node translations and, on two of them, a 90
+    // degree rotation. Flatten bakes those transforms into the vertices, and
+    // Orient then measures the combined bounds to rebase the whole thing into
+    // the shared grip-local frame, so the asset's X-major layout needs no
+    // hand-written axis fix here.
     static void LoadShotgun() {
-        const std::string path = Resolve("Content/Models/shotgun_fbx/Mossberg 590A1.fbx");
-        std::cout << "Loading Mossberg 590A1 " << path << "...\n";
-        auto root = FBXImporter::Load(path, g_dx12.device, g_dx12.commandList,
-                                      1.0f, false, false);
+        const std::string path = Resolve(
+            "Content/Models/MainPlayer/Guns/Shotgun/remington870.glb");
+        auto root = GLBImporter::LoadGLB(
+            path, g_dx12.device, g_dx12.commandList);
         if (!root) {
-            std::cerr << "Mossberg 590A1 FBX unavailable\n";
+            std::cerr << "Remington 870 GLB unavailable\n";
             return;
         }
 
@@ -781,26 +913,26 @@ private:
         root->UpdateGlobalTransform(identity);
         Flatten(root, prims);
         if (prims.empty()) {
-            std::cerr << "Mossberg 590A1 FBX had no geometry\n";
+            std::cerr << "Remington 870 GLB had no geometry\n";
             return;
         }
 
-        FlipV(prims);
         Orient(prims);
-        auto material = std::make_shared<SceneMaterial>();
-        material->name = "mossberg_590a1";
-        material->baseColorFactor = XMFLOAT4(0.075f, 0.085f, 0.09f, 1.0f);
-        material->metallicFactor = 0.78f;
-        material->roughnessFactor = 0.36f;
-        ShotgunMaterial() = material;
-        for (MeshPrimitive& primitive : prims) primitive.material = material;
 
         auto mesh = std::make_shared<SceneMesh>();
         mesh->primitives = std::move(prims);
-        for (MeshPrimitive& primitive : mesh->primitives)
+        for (MeshPrimitive& primitive : mesh->primitives) {
+            // The model is authored double-sided and is an open shell in
+            // places, so occlusion culling against it is unreliable -- the same
+            // exemption every other viewmodel GLB takes.
+            if (primitive.material)
+                primitive.material->disableOcclusionCulling = true;
             GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get());
+        }
         ShotgunMesh() = mesh;
-        std::cout << "Mossberg 590A1 loaded: " << mesh->primitives.size()
+        if (!mesh->primitives.empty() && mesh->primitives.front().material)
+            ShotgunMaterial() = mesh->primitives.front().material;
+        std::cout << "Remington 870 loaded: " << mesh->primitives.size()
                   << " primitive(s)\n";
         if (FILE* file = std::fopen("gun_load.log", "a")) {
             size_t triangles = 0, vertices = 0;
@@ -808,8 +940,27 @@ private:
                 triangles += primitive.indices.size() / 3;
                 vertices += primitive.vertices.size() / 12;
             }
-            std::fprintf(file, "shotgun_loaded=1 prims=%zu verts=%zu tris=%zu\n",
-                         mesh->primitives.size(), vertices, triangles);
+            // Same ground truth as the AK above: stdout stays buffered, so
+            // record what the textured GLB actually produced.
+            float lo[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
+            float hi[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+            for (const MeshPrimitive& primitive : mesh->primitives)
+                for (size_t v = 0; v + 11 < primitive.vertices.size(); v += 12)
+                    for (int a = 0; a < 3; ++a) {
+                        lo[a] = (std::min)(lo[a], primitive.vertices[v + a]);
+                        hi[a] = (std::max)(hi[a], primitive.vertices[v + a]);
+                    }
+            const auto& first = mesh->primitives.front().material;
+            std::fprintf(file,
+                "shotgun_loaded=1 prims=%zu verts=%zu tris=%zu"
+                " albedo=%d normal=%d packedMR=%d\n",
+                mesh->primitives.size(), vertices, triangles,
+                first && first->baseColorTexture ? 1 : 0,
+                first && first->normalTexture ? 1 : 0,
+                first && first->metallicRoughnessTexture ? 1 : 0);
+            std::fprintf(file,
+                "shotgun_bounds x[%.3f..%.3f] y[%.3f..%.3f] z[%.3f..%.3f]\n",
+                lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
             std::fclose(file);
         }
     }
@@ -880,48 +1031,151 @@ private:
         }
     }
 
+    // Remington 700 SPS Tactical, the bolt gun that replaced the SVD in the
+    // marksman slot. A GLB, so no FlipV -- glTF already matches our UV
+    // convention -- and it keeps the SVD's 1.55 barrel length rather than the
+    // standard 1.25, because a marksman rifle is meant to read longer than the
+    // assault rifles and the ADS and optic offsets were tuned against that.
     static void LoadSVD() {
-        // Prefer the cooked blob generated from the original FBX. Runtime
-        // Assimp cannot parse this old FBX 6100 file, so retain the ufbx-made
-        // OBJ as a source fallback when cooked content is absent or stale.
-        const std::string sourcePath =
-            Resolve("Content/Models/SVD_v1.3/Models/SVD.FBX");
-        std::cout << "Loading SVD " << sourcePath << "...\n";
-        auto root = FBXImporter::Load(sourcePath, g_dx12.device,
-                                      g_dx12.commandList, 1.0f, false, false);
+        const std::string path = Resolve(
+            "Content/Models/MainPlayer/Guns/R700/"
+            "Remington_700_Sps_Tactical.glb");
+        auto root = GLBImporter::LoadGLB(
+            path, g_dx12.device, g_dx12.commandList);
         if (!root) {
-            const std::string fallbackPath =
-                Resolve("Content/Models/SVD_v1.3/Models/SVD.obj");
-            std::cout << "SVD cooked asset unavailable; using "
-                      << fallbackPath << "\n";
-            root = FBXImporter::Load(fallbackPath, g_dx12.device,
-                                     g_dx12.commandList, 1.0f, false, false);
-        }
-        if (!root) {
-            std::cerr << "SVD model unavailable\n";
+            std::cerr << "Remington 700 GLB unavailable\n";
             return;
         }
 
+        // Authored as three roots -- a loose cube, the magazine with its rounds,
+        // and the body carrying barrel, bolt, scope and stock -- with per-node
+        // scales and rotations. Flatten bakes those in so Orient can measure the
+        // whole rifle as one object.
         std::vector<MeshPrimitive> prims;
         XMFLOAT4X4 identity;
         XMStoreFloat4x4(&identity, XMMatrixIdentity());
         root->UpdateGlobalTransform(identity);
         Flatten(root, prims);
         if (prims.empty()) {
-            std::cerr << "SVD FBX had no geometry\n";
+            std::cerr << "Remington 700 GLB had no geometry\n";
             return;
         }
 
-        FlipV(prims);
         Orient(prims, 1.55f);
-        AssignSVDMaterials(prims);
+        AssignR700Materials(prims);
 
         auto mesh = std::make_shared<SceneMesh>();
         mesh->primitives = std::move(prims);
-        for (MeshPrimitive& primitive : mesh->primitives)
+        for (MeshPrimitive& primitive : mesh->primitives) {
+            if (primitive.material)
+                primitive.material->disableOcclusionCulling = true;
             GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get());
+        }
         SVDMesh() = mesh;
-        std::cout << "SVD loaded: " << mesh->primitives.size() << " primitive(s)\n";
+        std::cout << "Remington 700 loaded: " << mesh->primitives.size()
+                  << " primitive(s)\n";
+        if (FILE* file = std::fopen("gun_load.log", "a")) {
+            size_t triangles = 0, vertices = 0;
+            for (const MeshPrimitive& primitive : mesh->primitives) {
+                triangles += primitive.indices.size() / 3;
+                vertices += primitive.vertices.size() / 12;
+            }
+            std::fprintf(file, "r700_loaded=1 prims=%zu verts=%zu tris=%zu\n",
+                         mesh->primitives.size(), vertices, triangles);
+            std::fclose(file);
+        }
+    }
+
+    // The R700 export carries eleven named materials but no usable values: no
+    // images at all, and every factor left at the glTF default of white at
+    // metallic 1.0 / roughness 1.0, which renders as a featureless white rifle.
+    //
+    // That is an export limit rather than a broken asset. In Blender the look is
+    // a Mix Shader driven by Fresnel over a Diffuse BSDF and an Image Texture --
+    // a node graph glTF has no way to express, so the exporter emitted bare
+    // material slots. The names survived, though, so the look is rebuilt from
+    // them the way the SVD's was: matched by name and given real factors, keyed
+    // to how the rifle actually reads in Blender -- near-black parkerised metal,
+    // a dark mottled synthetic stock, and a Fresnel-mixed objective lens.
+    static void AssignR700Materials(std::vector<MeshPrimitive>& prims) {
+        auto make = [](const char* name, XMFLOAT4 colour,
+                       float metallic, float roughness) {
+            auto material = std::make_shared<SceneMaterial>();
+            material->name = name;
+            material->baseColorFactor = colour;
+            material->metallicFactor = metallic;
+            material->roughnessFactor = roughness;
+            return material;
+        };
+
+        auto metal  = make("r700_metal",  XMFLOAT4(0.075f, 0.078f, 0.082f, 1.0f), 0.82f, 0.35f);
+        // The barrel and scope tube read smoother and darker than the receiver.
+        auto barrel = make("r700_barrel", XMFLOAT4(0.048f, 0.050f, 0.054f, 1.0f), 0.86f, 0.24f);
+        auto scope  = make("r700_scope",  XMFLOAT4(0.045f, 0.047f, 0.050f, 1.0f), 0.78f, 0.27f);
+        // Synthetic stock: matte, barely metallic, a shade warmer than the steel.
+        auto stock  = make("r700_stock",  XMFLOAT4(0.062f, 0.060f, 0.058f, 1.0f), 0.06f, 0.72f);
+        auto wood   = make("r700_wood",   XMFLOAT4(0.070f, 0.062f, 0.056f, 1.0f), 0.06f, 0.70f);
+        // Blender's "Wood" slot is the full lower stock (Cube.000), despite
+        // the name. Rebuild its node graph with the authored black camo atlas,
+        // roughness image and stock detail normal. The shared PBR shader already
+        // performs the Fresnel-weighted diffuse/GGX mix shown in that graph.
+        const std::string textureDir =
+            "Content/Models/MainPlayer/Guns/R700/Textures/";
+        wood->baseColorTexture = GLBImporter::LoadTextureFromFile(
+            Resolve(textureDir + "Rifle_Camo_2.png"), g_dx12.device,
+            g_dx12.commandList, wood->uploadHeaps);
+        wood->normalTexture = GLBImporter::LoadTextureFromFile(
+            Resolve(textureDir + "Rifle_Stock_Normal.png"), g_dx12.device,
+            g_dx12.commandList, wood->uploadHeaps);
+        wood->metallicRoughnessTexture = GLBImporter::LoadTextureFromFile(
+            Resolve(textureDir + "Metal_Roughness.jpg"), g_dx12.device,
+            g_dx12.commandList, wood->uploadHeaps);
+        if (wood->baseColorTexture)
+            wood->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+        // The source image is a standalone roughness field, not glTF's packed
+        // G/B metallic-roughness layout. Mode 2 reads its green channel as the
+        // final roughness while the polymer stock remains dielectric.
+        wood->roughnessOnlyTexture = true;
+        wood->metallicFactor = 0.0f;
+        // The Blender material mixes pale-pink Glass (IOR 1.30, roughness 0)
+        // with white GGX Glossy (roughness 0.10), driven by Fresnel at IOR 1.45.
+        // Raster transparency stands in for the transmitted Glass lobe; type 9
+        // supplies that exact Fresnel F0 without inheriting the reflex sight's
+        // blue coating or its asset-specific UV edge treatment.
+        auto glass  = make("r700_glass",  XMFLOAT4(1.000f, 0.620f, 0.560f, 0.30f), 0.0f, 0.10f);
+        glass->alphaBlend = true;
+        glass->doubleSided = true;
+        glass->materialType = 9.0f;  // sniper glass
+        auto brass  = make("r700_brass",  XMFLOAT4(0.430f, 0.290f, 0.090f, 1.0f), 0.88f, 0.26f);
+        auto lead   = make("r700_bullet", XMFLOAT4(0.215f, 0.180f, 0.120f, 1.0f), 0.80f, 0.34f);
+        SVDMaterials() = { metal, barrel, scope, stock, wood, glass, brass, lead };
+
+        // Order matters: several names contain a shorter key ("Scope Glass" and
+        // "Scope Knobs" both hold "scope", "Bullet Primer" holds "bullet"), so
+        // the most specific test has to come first or the lens ends up in plain
+        // scope steel.
+        for (MeshPrimitive& primitive : prims) {
+            std::string name = primitive.material ? primitive.material->name : "";
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](unsigned char c) {
+                               return static_cast<char>(std::tolower(c));
+                           });
+            const auto has = [&](const char* key) {
+                return name.find(key) != std::string::npos;
+            };
+            // "Buillet Case" is the asset's own spelling, so the case test keys
+            // on "case" rather than on the misspelled word in front of it.
+            primitive.material =
+                  has("glass")  ? glass
+                : has("primer") ? brass
+                : has("case")   ? brass
+                : has("bullet") ? lead
+                : has("scope")  ? scope
+                : has("barrel") ? barrel
+                : has("wood")   ? wood
+                : has("stock")  ? stock
+                : metal;
+        }
     }
 
     // Collapse the node tree into world-space primitives (same as PalmModel).
@@ -1274,37 +1528,6 @@ private:
         for (MeshPrimitive& primitive : prims) primitive.material = mat;
     }
 
-    static void AssignSVDMaterials(std::vector<MeshPrimitive>& prims) {
-        const std::string dir = "Content/Models/SVD_v1.3/Textures/";
-        auto makeMaterial = [&](const char* name, const char* textureStem,
-                                float metallic, float roughness) {
-            auto material = std::make_shared<SceneMaterial>();
-            material->name = name;
-            material->baseColorFactor = XMFLOAT4(1, 1, 1, 1);
-            material->baseColorTexture = GLBImporter::LoadTextureFromFile(
-                Resolve(dir + textureStem + "_dif.png"), g_dx12.device,
-                g_dx12.commandList, material->uploadHeaps);
-            material->normalTexture = GLBImporter::LoadTextureFromFile(
-                Resolve(dir + textureStem + "_normal.png"), g_dx12.device,
-                g_dx12.commandList, material->uploadHeaps);
-            material->metallicFactor = metallic;
-            material->roughnessFactor = roughness;
-            return material;
-        };
-
-        auto body = makeMaterial("svd", "SVD", 0.62f, 0.42f);
-        auto optics = makeMaterial("svd_optics", "Optics", 0.52f, 0.30f);
-        auto bullet = makeMaterial("svd_bullet", "bullet", 0.78f, 0.28f);
-        SVDMaterials() = { body, optics, bullet };
-
-        for (MeshPrimitive& primitive : prims) {
-            std::string sourceName = primitive.material ? primitive.material->name : "";
-            std::transform(sourceName.begin(), sourceName.end(), sourceName.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            primitive.material = sourceName.find("optic") != std::string::npos ? optics
-                : sourceName.find("bullet") != std::string::npos ? bullet : body;
-        }
-    }
 
     // Extents of the normalised mesh in gun-local space.
     static inline XMFLOAT3 s_lo{};

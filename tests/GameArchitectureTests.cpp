@@ -232,6 +232,11 @@ int main() {
     CHECK(customisation.FindAttachment("silencer") != nullptr);
     CHECK(customisation.FindAttachment("red_dot") != nullptr);
     CHECK(customisation.FindAttachment("laser") != nullptr);
+    CHECK(customisation.AttachmentInstalled(1, "red_dot"));
+    CHECK(!customisation.AttachmentInstalled(1, "laser"));
+    const SGE::WeaponInstance defaultShotgun = customisation.CreateInstance(1);
+    CHECK(customisation.Resolve(defaultShotgun).redDotSight);
+    CHECK(!customisation.Resolve(defaultShotgun).laserSight);
     // The RPG has no attachment mounts; compatibility is enforced in the data
     // layer rather than relying on the deployment UI to hide an invalid choice.
     CHECK(!customisation.EquipAttachment(2, "silencer"));
@@ -243,7 +248,12 @@ int main() {
     CHECK(customisedAK.redDotSight);
     CHECK(customisedAK.laserSight);
     CHECK(customisedAK.noiseRadiusMultiplier < 1.0f);
-    CHECK(customisedAK.recoilPitchDegrees < 0.55f);
+    // The suppressor cuts recoil below the AK's own unmodified baseline.
+    // Compared against that baseline rather than a literal, so retuning the
+    // weapon or kGlobalRecoilScale cannot silently invalidate this check.
+    CHECK(customisedAK.recoilPitchDegrees <
+          customisation.Resolve(customisation.CreateInstance(0))
+              .recoilPitchDegrees);
     CHECK(customisedAK.adsSpreadMultiplier < 1.0f);
     CHECK(customisedAK.hipSpreadMultiplier < 1.0f);
     CHECK(customisedAK.adsFovDegrees < 42.0f);
@@ -540,8 +550,10 @@ int main() {
     player.UpdateReload(10.0f);
     CHECK(player.Magazine(0) == 5);
     CHECK(player.Reserve(0) == 0);
-    // 9 since the suppressed SVD took slot 8.
-    CHECK(PlayerState::kWeaponSlots == 9);
+    // 11: the suppressed SVD took slot 8, the M4A1 slot 9 and the AK-74
+    // slot 10. Tracks WeaponCustomizationSystem::kWeaponCount, which is what
+    // PlayerState sizes its ammo arrays from.
+    CHECK(PlayerState::kWeaponSlots == 11);
     CHECK(player.SetAmmo(4, 1, 0));
     CHECK(player.ConsumeAmmo(4));
     CHECK(player.Magazine(4) == 0);

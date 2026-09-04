@@ -12,7 +12,10 @@ cbuffer SkyBuffer : register(b0) {
     float4 atmosphereParams; // Rayleigh, Mie, Mie g, aerial density
     float4 cloudParams;      // coverage, density, base height, thickness
     float  cloudVolumetric;  // 1 = march the 3D volumes, 0 = 2D fallback
-    float3 cloudPadding;
+    float  sunLensEnabled;
+    float  sunAngularRadius;
+    float  sunDiscIntensity;
+    float4 sunLensColorHalo;  // direct-light tint, wide-halo intensity
 };
 
 Texture2D skyEquirectangular : register(t0);
@@ -125,6 +128,40 @@ float3 PhysicalSky(float3 ray, float3 source) {
     float3 physical = attenuated * extinction +
                       scattering * (2.4 + horizon * 1.8) * scatterScale;
     return lerp(attenuated, physical, physicalBlend);
+}
+
+// A finite HDR emitter rather than a white dot painted after tone mapping.
+// Its default half-angle is the real sun's ~0.27 degrees, so changing FOV
+// changes its apparent size correctly and the ordinary bloom chain can spread
+// its energy. The two halo lobes approximate glare through the atmosphere;
+// clouds composite after this and therefore attenuate the whole source.
+float3 OpticalSun(float3 ray) {
+    if (sunLensEnabled < 0.5 || sunDirection.y <= -0.08)
+        return 0.0;
+
+    const float mu = clamp(dot(ray, normalize(sunDirection)), -1.0, 1.0);
+    const float radius = max(sunAngularRadius, 0.0005);
+    const float cosRadius = cos(radius);
+    // fwidth keeps the disc edge stable when its physical radius approaches a
+    // handful of pixels at a wide camera FOV.
+    const float edgeWidth = max(fwidth(mu) * 1.5, radius * radius * 0.015);
+    const float disc = smoothstep(
+        cosRadius - edgeWidth, cosRadius + edgeWidth, mu);
+    const float angularDistance = sqrt(max(2.0 * (1.0 - mu), 0.0));
+    const float innerHalo = exp2(-angularDistance / (radius * 2.8));
+    const float wideHalo = exp2(-angularDistance / (radius * 13.0));
+
+    // Warm the source through the long optical path near the horizon, while
+    // retaining the authored direct-light tint at ordinary elevations.
+    const float sunHeight = smoothstep(-0.06, 0.30, sunDirection.y);
+    const float horizonFade = smoothstep(-0.08, 0.01, sunDirection.y);
+    const float3 horizonTint = float3(1.0, 0.24, 0.035);
+    const float3 tint = lerp(
+        horizonTint, max(sunLensColorHalo.rgb, 0.0), sunHeight);
+    const float halo =
+        innerHalo * 0.72 + wideHalo * 0.12;
+    return tint * horizonFade *
+        (disc * sunDiscIntensity + halo * sunLensColorHalo.a);
 }
 
 // -- Volumetric clouds --------------------------------------------------------
@@ -430,6 +467,8 @@ float4 main(PSInput input) : SV_Target {
     float lod = clamp(log2(max(uTexelsPerPixel, 1.0)), 0.0, (float)(mipCount - 1));
     float3 hdr = skyEquirectangular.SampleLevel(skySampler, skyUV, lod).rgb;
     hdr = PhysicalSky(ray, hdr);
+    if (sunLensEnabled >= 0.5)
+        hdr += OpticalSun(ray);
     // Extend the lowest cloud layer below the mathematical horizon without
     // feeding a negative Y direction into the slab intersection. The projected
     // horizon sample fades to zero at -0.1 as requested, so it can cover the

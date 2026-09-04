@@ -5,11 +5,21 @@ cbuffer SSRConstants : register(b0)
     float4 cameraNear;
     float4 screenParams;
     float4 ssrParams; // max distance, thickness, strength, surface buffer
+    // Screen-space ray tracing (NGLighting). x: enabled, y: GI enabled,
+    // z: GI strength, w: ray steps.
+    float4 ngParams;
+    // x: step growth per iteration, y: AO strength, z: AO radius,
+    // w: frame index, used to advance the noise sequence.
+    float4 ngTrace;
+    // x: history blend weight, y: history valid, z: specular enabled,
+    // w: AO enabled.
+    float4 ngTemporal;
 };
 
 Texture2D<float4> sceneColor : register(t0);
 Texture2D<float> sceneDepth : register(t1);
 Texture2D<float4> surfaceData : register(t2);
+Texture2D<float4> ngHistory : register(t3);
 SamplerState pointClamp : register(s0);
 SamplerState linearClamp : register(s1);
 
@@ -154,6 +164,193 @@ bool TraceReflection(float3 origin, float3 direction, float roughness,
     return false;
 }
 
+// ---- Screen-space ray tracing (NGLighting) ---------------------------------
+//
+// Ported from the CC0-licensed NiceGuy-Shaders ReShade pack. Two ideas carry
+// over; the rest is this engine's own reconstruction and hit validation.
+//
+// 1. Geometric step growth. Each march step is longer than the last, so a ray
+//    reaches across the scene in ~24 steps instead of the 48 uniform ones the
+//    mirror path uses. Precision degrades with distance, which is acceptable
+//    because distant indirect light is low-frequency anyway.
+// 2. Interleaved gradient noise for ray direction. It decorrelates neighbouring
+//    pixels well enough that the temporal pass can resolve the result, which is
+//    what makes a stochastic hemisphere gather viable in real time.
+
+// Interleaved gradient noise, animated over the frame index so the temporal
+// pass sees a new sequence each frame rather than re-averaging one pattern.
+float IGN(float2 pixel, float frame)
+{
+    float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
+    return frac(magic.z * frac(dot(pixel + frame * 5.588238, magic.xy)));
+}
+
+// Cosine-weighted hemisphere direction around `normal`. Cosine weighting means
+// the sample density already carries the N.L term, so the gather does not have
+// to multiply it back in.
+float3 CosineHemisphere(float3 normal, float2 uniformPair)
+{
+    float phi = 6.28318530718 * uniformPair.x;
+    float cosTheta = sqrt(max(0.0, 1.0 - uniformPair.y));
+    float sinTheta = sqrt(uniformPair.y);
+    float3 tangent =
+        normalize(cross(abs(normal.y) < 0.95 ? float3(0, 1, 0)
+                                             : float3(1, 0, 0), normal));
+    float3 bitangent = cross(normal, tangent);
+    return normalize(tangent * (cos(phi) * sinTheta) +
+                     bitangent * (sin(phi) * sinTheta) +
+                     normal * cosTheta);
+}
+
+// March one ray. Returns true on a hit, with the hit UV and the distance
+// travelled -- the distance is what drives ambient occlusion.
+bool TraceNGRay(float3 origin, float3 direction, float noise,
+                out float2 hitUV, out float hitDistance)
+{
+    hitUV = 0.0;
+    hitDistance = ssrParams.x;
+
+    // March steps are fixed; the ray budget in ngParams.w counts rays per
+    // pixel, which is a separate control.
+    const int maxSteps = 24;
+    const float growth = max(ngTrace.x, 1.0);
+    // Start at a fraction of the thickness so the first sample cannot land back
+    // on the originating surface, jittered so the step pattern does not band.
+    float stepLength = max(ssrParams.y, 0.02) * (1.0 + noise);
+    float travelled = 0.0;
+
+    [loop]
+    for (int i = 0; i < maxSteps; ++i) {
+        travelled += stepLength;
+        if (travelled > ssrParams.x) break;
+        float3 rayPosition = origin + direction * travelled;
+        float4 clip = mul(float4(rayPosition, 1.0), viewProjection);
+        if (clip.w <= 0.0) break;
+        float2 uv = (clip.xy / clip.w) * float2(0.5, -0.5) + 0.5;
+        if (any(uv <= 0.001) || any(uv >= 0.999)) break;
+
+        float deviceDepth = sceneDepth.SampleLevel(pointClamp, uv, 0.0);
+        // Sky writes no geometry, so it can never occlude a ray.
+        if (deviceDepth < 0.99999) {
+            float3 scenePosition = ReconstructWorld(uv, deviceDepth);
+            float rayDistance = length(rayPosition - cameraNear.xyz);
+            float sceneDistance = length(scenePosition - cameraNear.xyz);
+            float delta = rayDistance - sceneDistance;
+            // Accept only a crossing that is within the surface's assumed
+            // thickness. Without the upper bound a ray passing far behind an
+            // object would register as touching it, which fills concave corners
+            // with light from whatever happens to be behind them.
+            float thickness = max(ssrParams.y, 0.02) * 4.0 + stepLength;
+            if (delta > 0.0 && delta < thickness) {
+                hitUV = uv;
+                hitDistance = travelled;
+                return true;
+            }
+        }
+        stepLength *= growth;
+    }
+    return false;
+}
+
+// Gather indirect light and occlusion over the hemisphere. Both come out of the
+// same rays: colour from what each ray hit, occlusion from how far it got.
+void GatherNGLighting(float2 uv, float3 world, float3 normal, float roughness,
+                      float3 toCamera, float2 pixel,
+                      out float3 indirect, out float occlusion)
+{
+    indirect = 0.0;
+    occlusion = 0.0;
+
+    const float frame = ngTrace.w;
+    const bool wantSpecular = ngTemporal.z > 0.5;
+    const bool wantGI = ngParams.y > 0.5;
+    const bool wantAO = ngTemporal.w > 0.5;
+    const float aoRadius = max(ngTrace.z, 0.01);
+    const float3 origin = world + normal * max(ssrParams.y, 0.02) * 2.0;
+
+    // The specular ray follows a direction the surface itself determines, so it
+    // resolves cleanly from a single sample. The diffuse rays are random
+    // hemisphere directions, so their result is noisy until many are averaged.
+    // Keeping the two separate matters for more than cost: summing them into
+    // one accumulator and dividing by a shared weight let the diffuse rays
+    // dilute the reflection, so enabling GI visibly dimmed every mirror.
+    if (wantSpecular) {
+        float n0 = IGN(pixel, frame);
+        float n1 = IGN(pixel + 37.0, frame + 13.0);
+        float3 mirror = reflect(-toCamera, normal);
+        // Jitter by roughness, which turns a sharp reflection into a glossy one
+        // without a separate blur pass.
+        float3 scatter = CosineHemisphere(normal, float2(n0, n1));
+        float3 direction = normalize(lerp(mirror, scatter,
+                                          saturate(roughness * roughness)));
+        if (dot(direction, normal) <= 0.0) direction = mirror;
+
+        float2 rayHitUV;
+        float rayDistance;
+        if (TraceNGRay(origin, direction, n0, rayHitUV, rayDistance)) {
+            float3 sampleColor =
+                min(sceneColor.SampleLevel(linearClamp, rayHitUV, 0.0).rgb, 6.0);
+            float edge = min(min(rayHitUV.x, rayHitUV.y),
+                             min(1.0 - rayHitUV.x, 1.0 - rayHitUV.y));
+            indirect += sampleColor * smoothstep(0.0, 0.06, edge);
+            if (wantAO)
+                occlusion += saturate(1.0 - rayDistance / aoRadius);
+        }
+    }
+
+    // Diffuse hemisphere gather. Skipped entirely when neither GI nor AO wants
+    // it, so the rays are not traced at all rather than traced and discarded --
+    // this is the expensive half of the pass.
+    if (!wantGI && !wantAO) {
+        occlusion = saturate(occlusion) * ngTrace.y;
+        return;
+    }
+
+    const int rayCount = clamp((int)ngParams.w, 1, 64);
+    float3 diffuseSum = 0.0;
+    float diffuseWeight = 0.0;
+    float occlusionSum = 0.0;
+
+    [loop]
+    for (int i = 0; i < rayCount; ++i) {
+        float n0 = IGN(pixel, frame + (i + 1) * 7.0);
+        float n1 = IGN(pixel + 37.0, frame + (i + 1) * 13.0);
+        float3 direction = CosineHemisphere(normal, float2(n0, n1));
+
+        float2 rayHitUV;
+        float rayDistance;
+        if (!TraceNGRay(origin, direction, n0, rayHitUV, rayDistance)) {
+            // A ray that escapes hit nothing, so it is unoccluded. It still
+            // counts toward the average -- dropping misses makes open sky read
+            // as fully occluded and turns the whole image grey.
+            continue;
+        }
+
+        // Occlusion falls off with distance: a hit metres away barely shadows
+        // the pixel, one a few centimetres away shadows it heavily.
+        if (wantAO)
+            occlusionSum += saturate(1.0 - rayDistance / aoRadius);
+
+        if (!wantGI) continue;
+        float3 sampleColor =
+            min(sceneColor.SampleLevel(linearClamp, rayHitUV, 0.0).rgb, 6.0);
+        // Fade contributions toward the screen edge, where there is no data to
+        // trace into and the result would otherwise pop as the camera turns.
+        float edge = min(min(rayHitUV.x, rayHitUV.y),
+                         min(1.0 - rayHitUV.x, 1.0 - rayHitUV.y));
+        float weight = smoothstep(0.0, 0.06, edge);
+        diffuseSum += sampleColor * weight;
+        diffuseWeight += weight;
+    }
+
+    if (wantGI && diffuseWeight > 0.0)
+        indirect += (diffuseSum / diffuseWeight) * ngParams.z;
+    // Misses are unoccluded, so the divisor is the full ray count, not the
+    // number that hit.
+    occlusion = saturate(occlusion + occlusionSum /
+                         max((float)rayCount, 1.0)) * ngTrace.y;
+}
+
 float4 PSMain(VSOutput input) : SV_TARGET
 {
     float depth = sceneDepth.SampleLevel(pointClamp, input.uv, 0.0);
@@ -171,6 +368,7 @@ float4 PSMain(VSOutput input) : SV_TARGET
     if (ssrParams.w > 0.5 && storedValid < 0.5) return 0.0;
     float3 normal = normalize(lerp(reconstructed, stored.xyz, storedValid));
     float roughness = lerp(0.22, stored.w, storedValid);
+
     // SSR is a sharp-reflection solution. Rough materials retain their stable
     // IBL response instead of showing stretched screen-color ghosts.
     float smoothWeight = 1.0 - smoothstep(0.08, 0.50, roughness);
@@ -206,4 +404,54 @@ float4 PSMain(VSOutput input) : SV_TARGET
     float weight = ssrParams.z * smoothWeight * confidence *
                    lerp(0.35, 1.0, fresnel);
     return float4(reflected * weight, 0.0);
+}
+
+// NGLighting trace. Writes the raw gather into the accumulation buffer: rgb is
+// the indirect light minus occlusion, alpha is the depth it was traced against
+// so the next frame can tell whether this pixel still shows the same surface.
+float4 PSTraceNG(VSOutput input) : SV_TARGET
+{
+    float depth = sceneDepth.SampleLevel(pointClamp, input.uv, 0.0);
+    if (depth >= 0.99999) return float4(0.0, 0.0, 0.0, depth);
+
+    float3 world = ReconstructWorld(input.uv, depth);
+    float3 reconstructed = ReconstructNormal(input.uv, depth);
+    float4 stored = surfaceData.SampleLevel(pointClamp, input.uv, 0.0);
+    float storedValid = ssrParams.w * step(0.25, dot(stored.xyz, stored.xyz));
+    float3 normal = normalize(lerp(reconstructed, stored.xyz, storedValid));
+    float roughness = lerp(0.22, stored.w, storedValid);
+    float3 toCamera = normalize(cameraNear.xyz - world);
+
+    float3 indirect;
+    float occlusion;
+    GatherNGLighting(input.uv, world, normal, roughness, toCamera,
+                     input.uv * screenParams.xy, indirect, occlusion);
+
+    // Occlusion must attenuate light already in the frame, but the composite
+    // blends additively, so it is carried as a negative term against the
+    // pixel's own colour rather than as a multiply.
+    float3 existing = sceneColor.SampleLevel(pointClamp, input.uv, 0.0).rgb;
+    float3 current = indirect * ssrParams.z - existing * occlusion;
+
+    // Temporal accumulation. A stochastic gather this sparse is unusable raw,
+    // so history carries most of the visible signal. With no motion vectors in
+    // this pass, a depth change is the only available disocclusion test: it
+    // catches geometry changing under a pixel, but not the camera panning
+    // across a surface at constant depth, which is why the blend is capped
+    // rather than being a true exponential average.
+    if (ngTemporal.y > 0.5) {
+        float4 history = ngHistory.SampleLevel(pointClamp, input.uv, 0.0);
+        float valid = 1.0 - smoothstep(0.0002, 0.0025, abs(history.a - depth));
+        current = lerp(current, history.rgb, ngTemporal.x * valid);
+    }
+    return float4(current, depth);
+}
+
+// NGLighting composite. No tracing: it only adds the accumulated result into
+// the scene, which is why the expensive pass runs exactly once per frame.
+float4 PSCompositeNG(VSOutput input) : SV_TARGET
+{
+    float depth = sceneDepth.SampleLevel(pointClamp, input.uv, 0.0);
+    if (depth >= 0.99999) return 0.0;
+    return float4(ngHistory.SampleLevel(pointClamp, input.uv, 0.0).rgb, 0.0);
 }

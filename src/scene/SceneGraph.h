@@ -81,8 +81,9 @@ struct SceneMaterial {
     float normalYSign = 1.0f;
     float viewFillStrength = 0.0f;
     // Selects a special shading path in the pixel shader: 0 ordinary, 1 pool
-    // water, 2 ocean, 8 optic glass. 3..7 are reserved -- terrain packs bit
-    // flags into the same value. Imported materials keep 0 and are unaffected.
+    // water, 2 ocean, 8 reflex glass, 9 sniper glass. 3..7 are reserved --
+    // terrain packs bit flags into the same value. Imported materials keep 0
+    // and are unaffected.
     float materialType = 0.0f;
 
     ComPtr<ID3D12Resource> baseColorTexture;

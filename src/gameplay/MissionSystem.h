@@ -33,7 +33,12 @@ inline const char* GearTypeName(GearType gear) {
 }
 
 struct MissionLoadout {
-    static constexpr int kWeaponCount = 10;
+    // Must match WeaponCustomizationSystem::kWeaponCount and GunModel's
+    // kMaxWeapon + 1. Kept as a literal rather than derived because pulling the
+    // weapon headers in here would couple mission data to the renderer-side
+    // model tables; the loadout UI array in main.cpp is sized from this, so a
+    // mismatch fails the build rather than going unnoticed.
+    static constexpr int kWeaponCount = 11;
     static constexpr size_t kWeaponSlotCount = 2;
 
     std::array<int, kWeaponSlotCount> weapons{{ 0, 1 }};

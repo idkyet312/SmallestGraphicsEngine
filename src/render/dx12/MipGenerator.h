@@ -174,7 +174,36 @@ public:
     // Runs queued downsampling on the compute queue. Future direct submissions
     // wait on its fence, while CPU initialization continues.
     void FlushPending() {
-        if (!loaded || pending.empty()) return;
+        // Reports what mip generation actually did, because a texture that is
+        // sharp up close and black at distance means mip 0 uploaded fine and
+        // the generated levels did not -- and nothing in the normal path says
+        // which of the two happened. Enabled with SGE_MIP_DEBUG=1.
+        //
+        // To a file, not stdout: the loading path buffers console output and a
+        // run that is killed or crashes never flushes it, which is exactly when
+        // this report matters most.
+        const bool mipDebug =
+            GetEnvironmentVariableA("SGE_MIP_DEBUG", nullptr, 0) > 0;
+        std::ofstream mipLog;
+        if (mipDebug) {
+            mipLog.open("mip_debug.log", std::ios::app);
+            mipLog << "[mips] loaded=" << (loaded ? 1 : 0)
+                   << " pending=" << pending.size() << '\n';
+            for (const PendingMip& request : pending)
+                mipLog << "[mips]   " << request.width << "x"
+                       << request.height << " levels=" << request.mipLevels
+                       << " dispatches=" << (request.mipLevels - 1) << '\n';
+            mipLog.flush();
+        }
+        if (!loaded || pending.empty()) {
+            if (mipDebug) {
+                mipLog << "[mips] nothing generated: "
+                       << (!loaded ? "shader not loaded"
+                                   : "no pending textures") << '\n';
+                mipLog.flush();
+            }
+            return;
+        }
 
         size_t batchBegin = 0;
         size_t batchCount = 0;
@@ -210,6 +239,12 @@ public:
                 const PendingMip& request = pending[i];
                 RecordMips(cmdList, request.texture.Get(), request.width,
                            request.height, request.mipLevels);
+            }
+            if (mipDebug) {
+                mipLog << "[mips] batch " << batchBegin << ".." << batchEnd
+                       << " dispatches=" << batchDispatches
+                       << " destTexels=" << batchDestinationTexels << "\n";
+                mipLog.flush();
             }
             SubmitComputeCommands();
             batchBegin = batchEnd;

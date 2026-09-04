@@ -156,6 +156,24 @@ std::shared_ptr<SceneNode>  g_insertionBoatShadowModel;
 // Mirrors g_blackHawkInsertionRestartPending: aiming the run needs the settled
 // player spawn and terrain, which are not ready at model load time.
 static bool                 g_insertionBoatRestartPending = false;
+// Which airframe flies the insertion. Both helicopter runs (landing and fast
+// rappel) can use either, so this is deliberately separate from
+// LevelInsertionMode rather than doubling that enum -- the aircraft and the
+// manner of arrival are independent choices.
+enum class InsertionAirframe : int {
+    // The rigged UH-60. Its rotor is skinned to a bone and turns in flight.
+    BlackHawk = 0,
+    // The second airframe. Unrigged, so its blades stay static -- see the
+    // comment on g_blackHawkSkeleton.
+    NewBlackHawk = 1
+};
+static InsertionAirframe    g_insertionAirframe = InsertionAirframe::BlackHawk;
+// Both airframes stay resident once loaded. g_blackHawkModel below points at
+// whichever is selected, so every consumer -- the draw, the bounds, the ride
+// point, the collision bake -- keeps working through the existing pointer with
+// no per-site branching.
+std::shared_ptr<SceneNode>  g_blackHawkAirframeModel[2];
+Skeleton                    g_blackHawkAirframeSkeleton[2];
 std::shared_ptr<SceneNode>  g_blackHawkModel;
 std::shared_ptr<SceneNode>  g_blackHawkShadowModel;
 // Rig for the rotor: the GLB's skin, the id of the joint driving the blades,
@@ -1327,18 +1345,18 @@ static void AddExplosionTerrainCrater(const XMFLOAT3& impact,
             impact, crater.radius * scene.craterFloorFraction,
             crater.baseHeight - crater.value);
     }
-    // Clear foliage across the whole cut, not half of it. At 0.5x the grass
-    // stopped well inside the visible hole and blades were left standing in the
-    // open crater; 1.18x is the crater's true extent (the ejecta lip reaches
-    // past the radius), and the grass exclusion test is a nearest-point circle
-    // against 8 m cells, so it needs to cover the hole rather than sit inside it.
-    const float foliageRadius = crater.radius * 1.18f;
     {
         ProfilerDX12::CpuScope craterFoliageProfile(
             g_profiler, "Crater/Foliage");
-        g_grass.AddRuntimeExclusion(impact.x, impact.z, foliageRadius);
-        // Trees keep the tighter radius: felling every palm out to the lip
-        // clears far more than the blast visibly disturbed.
+        // Keep turf over ordinary soil cuts. Once the new crater floor reaches
+        // the sand layer (or lower), clear the full visible cut so blades are
+        // not left standing over exposed beach or submerged ground.
+        if (g_grass.TerrainSandDominant(impact.x, impact.z)) {
+            g_grass.AddRuntimeExclusion(
+                impact.x, impact.z, crater.radius * 1.18f);
+        }
+        // Trees still use a tight radius so the blast does not fell every palm
+        // out to the crater's ejecta lip.
         g_trees.ApplyExplosion(impact, crater.radius * 0.5f);
     }
 }
@@ -1383,9 +1401,12 @@ static void AddBlackHawkCrashCraters(const XMFLOAT3& impact, float yaw) {
         g_game.world.AddRuntimeTerrainStamp(stamp);
         g_terrain.AddRuntimeSculptStamp(stamp);
 
-        // Scrub foliage out of the furrow so grass and palms are not left
-        // standing in a trench the helicopter just carved.
-        g_grass.AddRuntimeExclusion(stamp.x, stamp.z, stamp.radius * 0.6f);
+        // Match ordinary craters: the gouge only strips grass if its new floor
+        // exposes the sand layer or drops below it.
+        if (g_grass.TerrainSandDominant(stamp.x, stamp.z)) {
+            g_grass.AddRuntimeExclusion(
+                stamp.x, stamp.z, stamp.radius * 0.6f);
+        }
         g_trees.ApplyExplosion({ stamp.x, impact.y, stamp.z },
                                stamp.radius * 0.6f);
     }
@@ -2045,6 +2066,51 @@ static float g_blackHawkRopeSideBase = 0.0f;
 // player keeps free look for the rest of the flight, so re-aiming every frame
 // would fight the mouse instead of just setting the starting view.
 static bool g_blackHawkRideFacingPending = false;
+// Where the riding player is standing, in the aircraft's own local frame
+// (+X starboard, +Y up, +Z forward -- the basis BlackHawkRidePosition uses).
+//
+// Tracked in cabin space rather than world space because the aircraft is
+// moving: a world-space position would need the frame's motion subtracted out
+// every tick, and any error there reads as the player sliding across the deck.
+// In cabin space the aircraft's motion is simply not part of the problem, and
+// the walls are a fixed box.
+//
+// Seeded from the authored seat offset the first time the player boards, so the
+// ride still begins in the door they picked.
+static XMFLOAT3 g_blackHawkCabinLocal{};
+static bool g_blackHawkCabinLocalValid = false;
+// Half-extents of the walkable cabin, in metres, measured from the ride point.
+// Deliberately smaller than the fuselage: the deck is narrower than the widest
+// part of the airframe, and stopping the player short of the skin keeps the
+// camera from clipping through it.
+//
+// Sized against the MH-60 at its 34 m target length, which is the airframe this
+// walk exists for. At normal walking speed a real UH-60 cabin is barely two
+// paces across, so a strictly accurate box would put the player into a wall the
+// moment they touched a key -- these are the enlarged aircraft's proportions,
+// which is the whole reason it is scaled up.
+static constexpr float kCabinHalfWidth = 1.75f;
+static constexpr float kCabinHalfLength = 2.70f;
+
+// Vertical state for the cabin walk, in cabin space. The deck is a moving
+// platform, so the player cannot use the world-space fall in CameraDX12: its
+// ground plane is the terrain far below, and gravity there would drag them
+// through the floor. This is the same integration kept in the aircraft's
+// frame instead, which is what lets the player jump on a banking deck and land
+// back on it.
+//
+// Height is an offset ABOVE the deck rather than an absolute, so it stays
+// correct as the ride height changes and reads as zero whenever standing.
+static float g_blackHawkCabinHeight = 0.0f;
+static float g_blackHawkCabinVertVel = 0.0f;
+static bool  g_blackHawkCabinGrounded = true;
+// Latches the jump key so holding Space bunny-hops no faster than tapping it,
+// matching the ground jump, which fires off a fresh keypress.
+static bool  g_blackHawkCabinJumpHeld = false;
+// How far past the deck edge the player keeps footing. Beyond this they are
+// over open air and fall out of the aircraft under their own weight, which is
+// the "walk out on my own" exit as opposed to the E bail-out.
+static constexpr float kCabinEdgeGrace = 0.15f;
 
 // Re-derives the seat and rope offsets for the currently chosen door. Safe to
 // call repeatedly: it always starts from the cached authored values.
@@ -2260,7 +2326,7 @@ D3D12_GPU_VIRTUAL_ADDRESS UploadBlackHawkPalette() {
 // on the drop-off the moment the skids touch. Gravity and ground collision are
 // suppressed while riding, otherwise the player falls straight through the floor
 // of the aircraft.
-static void RidePlayerInBlackHawk() {
+static void RidePlayerInBlackHawk(float cabinDeltaTime) {
     VehicleSystem& vehicles = g_game.vehicles;
     // A cut rope means the player is already falling under their own gravity.
     // Pinning the camera here would suspend them in mid-air and undo the cut, so
@@ -2271,17 +2337,167 @@ static void RidePlayerInBlackHawk() {
         return;
     }
     if (vehicles.blackHawkCarryingPlayer) {
+        // Rappelling owns the player's position outright -- they are on a rope
+        // outside the aircraft, not standing on its deck -- so the cabin walk
+        // is bypassed entirely while it runs.
+        if (BlackHawkRappelActive()) {
+            const XMFLOAT3 centre = BlackHawkRappelPlayerWorldPosition();
+            scene.camera.Position = { centre.x,
+                                      centre.y + scene.camera.PlayerHeight * 0.5f,
+                                      centre.z };
+            scene.camera.VerticalVelocity = 0.0f;
+            scene.camera.IsGrounded = true;
+            scene.camera.FloorY =
+                scene.camera.Position.y - scene.camera.PlayerHeight;
+            g_blackHawkCabinLocalValid = false;
+            return;
+        }
+
+        // Seed the walk from the authored seat the first time the player
+        // boards, so the ride still starts in the door they chose.
+        if (!g_blackHawkCabinLocalValid) {
+            g_blackHawkCabinLocalValid = true;
+            g_blackHawkCabinLocal = {
+                vehicles.blackHawkRideSide,
+                vehicles.blackHawkRideHeight,
+                vehicles.blackHawkRideForward };
+        }
+
+        // Walk the cabin. Input is applied in the AIRCRAFT's frame, not the
+        // world's: the camera yaw the player is looking with is a world angle,
+        // and the aircraft is turning underneath them, so moving along a world
+        // direction would drift them across the deck whenever the bird banked.
+        // Subtracting the airframe's yaw converts "forward from where I am
+        // looking" into a cabin-relative direction that stays put.
+        const float lookYaw =
+            XMConvertToRadians(scene.camera.Yaw) - vehicles.blackHawkYaw;
+        const float forwardX = std::cos(lookYaw);
+        const float forwardZ = -std::sin(lookYaw);
+        float moveX = 0.0f, moveZ = 0.0f;
+        if (GetAsyncKeyState('W') & 0x8000) { moveX += forwardX; moveZ += forwardZ; }
+        if (GetAsyncKeyState('S') & 0x8000) { moveX -= forwardX; moveZ -= forwardZ; }
+        // Strafe is the forward vector turned a quarter turn.
+        if (GetAsyncKeyState('D') & 0x8000) { moveX += forwardZ; moveZ -= forwardX; }
+        if (GetAsyncKeyState('A') & 0x8000) { moveX -= forwardZ; moveZ += forwardX; }
+        const float moveLength = std::sqrt(moveX * moveX + moveZ * moveZ);
+        if (moveLength > 1e-4f) {
+            // Normal walking, the same speed and modifiers as on the ground:
+            // Camera::MovementSpeed with the 1.5x sprint and 0.55x crouch the
+            // ground path applies. The cabin is small enough that a full sprint
+            // crosses it in under a second, but moving at a different rate in
+            // here than everywhere else is what reads as wrong.
+            const bool cabinCrouching =
+                (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool cabinSprinting =
+                (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            const float cabinMultiplier = cabinCrouching ? 0.55f
+                : (cabinSprinting ? 1.5f : 1.0f);
+            const float step = scene.camera.MovementSpeed * cabinMultiplier *
+                               cabinDeltaTime / moveLength;
+            g_blackHawkCabinLocal.x += moveX * step;
+            g_blackHawkCabinLocal.z += moveZ * step;
+        }
+        // Deck extents, measured from the authored seat rather than from the
+        // model origin, so they stay centred on the cabin whichever side the
+        // player boarded.
+        const float centreX = 0.0f;
+        const float centreZ = vehicles.blackHawkRideForward;
+
+        // Jump, in cabin space. Fires on the press rather than the hold so it
+        // matches the ground jump, and only with both feet on the deck --
+        // otherwise the player could climb the air out of the aircraft.
+        const bool jumpDown = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+        if (jumpDown && !g_blackHawkCabinJumpHeld && g_blackHawkCabinGrounded) {
+            g_blackHawkCabinVertVel = scene.camera.JumpStrength;
+            g_blackHawkCabinGrounded = false;
+        }
+        g_blackHawkCabinJumpHeld = jumpDown;
+
+        // Same gravity as the world, integrated against the deck instead of the
+        // terrain. Landing resets to a clean stand rather than leaving a tiny
+        // residual velocity that would re-trigger the fall next frame.
+        if (!g_blackHawkCabinGrounded) {
+            g_blackHawkCabinVertVel -= scene.camera.Gravity * cabinDeltaTime;
+            g_blackHawkCabinHeight += g_blackHawkCabinVertVel * cabinDeltaTime;
+            if (g_blackHawkCabinHeight <= 0.0f) {
+                g_blackHawkCabinHeight = 0.0f;
+                g_blackHawkCabinVertVel = 0.0f;
+                g_blackHawkCabinGrounded = true;
+            }
+        }
+
+        // Off the edge of the deck: step out and the aircraft stops holding the
+        // player up. This is the self-directed exit -- walking out of an open
+        // door mid-flight -- as opposed to the scripted E bail-out below, so it
+        // hands the player to the ordinary world fall exactly where they are,
+        // carrying their cabin momentum rather than teleporting them anywhere.
+        //
+        // Only checked while standing on the deck. Jumping across the cabin
+        // briefly crosses the same air, and dropping the player for that would
+        // make the deck impossible to jump on at all.
+        const bool pastSide =
+            std::fabs(g_blackHawkCabinLocal.x - centreX) >
+                kCabinHalfWidth + kCabinEdgeGrace;
+        const bool pastEnd =
+            std::fabs(g_blackHawkCabinLocal.z - centreZ) >
+                kCabinHalfLength + kCabinEdgeGrace;
+        if (g_blackHawkCabinGrounded && (pastSide || pastEnd)) {
+            // Hand over at the player's current world position, which the
+            // block below has already been computing all along, so there is no
+            // jump in the view at the moment control changes hands.
+            vehicles.BailOutOfBlackHawk();
+            vehicles.blackHawkBailedOut = false;
+            g_blackHawkCabinLocalValid = false;
+            g_blackHawkCabinHeight = 0.0f;
+            g_blackHawkCabinVertVel = 0.0f;
+            g_blackHawkCabinGrounded = true;
+            scene.camera.IsGrounded = false;
+            scene.camera.VerticalVelocity = 0.0f;
+            return;
+        }
+
+        // Hard walls just outside the walkable deck. The grace band above is
+        // what the player actually falls through; this only stops a mid-air
+        // jump from carrying them clean out through the fuselage.
+        const float wallX = kCabinHalfWidth + kCabinEdgeGrace;
+        const float wallZ = kCabinHalfLength + kCabinEdgeGrace;
+        g_blackHawkCabinLocal.x = (std::max)(centreX - wallX,
+            (std::min)(centreX + wallX, g_blackHawkCabinLocal.x));
+        g_blackHawkCabinLocal.z = (std::max)(centreZ - wallZ,
+            (std::min)(centreZ + wallZ, g_blackHawkCabinLocal.z));
+        g_blackHawkCabinLocal.y =
+            vehicles.blackHawkRideHeight + g_blackHawkCabinHeight;
+
+        // Cabin-local back to world through the same full roll/pitch/yaw the
+        // airframe is drawn with, so the player rides the bank and the nose-down
+        // rather than floating level while the aircraft tilts around them.
+        const XMVECTOR offset = XMVectorSet(g_blackHawkCabinLocal.x,
+                                            g_blackHawkCabinLocal.y,
+                                            g_blackHawkCabinLocal.z, 0.0f);
+        const XMMATRIX orientation = XMMatrixRotationRollPitchYaw(
+            vehicles.blackHawkPitch, vehicles.blackHawkYaw,
+            vehicles.blackHawkRoll);
+        XMFLOAT3 rotated{};
+        XMStoreFloat3(&rotated,
+                      XMVector3TransformNormal(offset, orientation));
+        const XMFLOAT3 centre = {
+            vehicles.blackHawkPosition.x + rotated.x,
+            vehicles.blackHawkPosition.y + rotated.y,
+            vehicles.blackHawkPosition.z + rotated.z };
+
         // The attach point is the player's centre, but the camera is the eye,
         // which rides PlayerHeight above the feet -- so lift by half a body to
         // put the middle of the player on the authored spot.
-        const XMFLOAT3 centre = BlackHawkRappelActive()
-            ? BlackHawkRappelPlayerWorldPosition()
-            : vehicles.BlackHawkRidePosition();
         scene.camera.Position = { centre.x,
                                   centre.y + scene.camera.PlayerHeight * 0.5f,
                                   centre.z };
+        // The cabin owns the vertical, so the world fall stays parked: its
+        // velocity is zeroed and the floor is kept under the feet. Grounded
+        // tracks the DECK rather than being pinned true, so a jump in here
+        // still reads as airborne to everything downstream -- the weapon bob
+        // and the landing thud key off this flag.
         scene.camera.VerticalVelocity = 0.0f;
-        scene.camera.IsGrounded = true;
+        scene.camera.IsGrounded = g_blackHawkCabinGrounded;
         scene.camera.FloorY = scene.camera.Position.y - scene.camera.PlayerHeight;
         // Look out of the door the player is sitting in, once, at the start of
         // the ride. The airframe's forward is (sin, cos), so its right-hand
@@ -2300,6 +2516,9 @@ static void RidePlayerInBlackHawk() {
         }
         return;
     }
+    // Left the aircraft: the next boarding re-seats from the authored door
+    // rather than resuming wherever this ride left the player standing.
+    g_blackHawkCabinLocalValid = false;
     // Bailing out mid-flight leaves the player where the aircraft is, stepped
     // out the right-hand door and falling. Unlike the scripted drop-off this
     // must not teleport them to the landing zone -- the whole point is to get
@@ -2837,7 +3056,15 @@ static void ConfigureBlackHawkBounds() {
     // Target the longest horizontal axis, which on this model is nose-to-tail
     // including the rotor overhang. 20 m there puts the aircraft at real UH-60
     // proportions: ~16 m rotor span and ~5 m to the rotor head.
-    g_blackHawkModelScale = 20.0f / horizontalLength;
+    //
+    // The MH-60 is deliberately oversized against that. Its cabin is meant to
+    // be walked around inside, and a real airframe normalised to 20 m has an
+    // interior barely wider than the player capsule -- the doorway alone is
+    // narrower than a walking collision radius. Scaling the whole aircraft up
+    // is what buys usable floor space without re-authoring the mesh.
+    const float targetLength =
+        g_insertionAirframe == InsertionAirframe::NewBlackHawk ? 34.0f : 20.0f;
+    g_blackHawkModelScale = targetLength / horizontalLength;
 }
 
 // Depth-first search for a node by name.
@@ -2860,17 +3087,31 @@ static std::shared_ptr<SceneNode> FindNodeByName(
 // the aircraft's local frame.
 static void ConfigureBlackHawkRideFromModel() {
     if (!g_blackHawkModel) return;
+    VehicleSystem& vehicles = g_game.vehicles;
     std::shared_ptr<SceneNode> ride =
         FindNodeByName(g_blackHawkModel, "PlayerRide");
-    if (!ride) return;
+    if (!ride) {
+        // Reset rather than return. These offsets are cached globals, so an
+        // airframe with no authored ride empty would otherwise keep whatever
+        // the previously selected aircraft measured -- seating the player
+        // beside a differently shaped fuselage, or in mid-air next to it.
+        // The authored defaults are a cabin-door seat on a 20 m airframe,
+        // which is the size every airframe is normalised to.
+        vehicles.blackHawkRideSide = 1.15f;
+        vehicles.blackHawkRideForward = 0.4f;
+        vehicles.blackHawkRideHeight = 2.1f;
+        g_blackHawkRideSideBase = vehicles.blackHawkRideSide;
+        g_blackHawkRideMeshPosition = {};
+        std::cout << "BlackHawk has no PlayerRide empty; using default seat "
+                     "offsets\n";
+        return;
+    }
 
     g_blackHawkModel->RefreshHierarchy();
     XMFLOAT3 meshPosition{};
     XMStoreFloat3(&meshPosition,
                   XMVector3TransformCoord(
                       XMVectorZero(), XMLoadFloat4x4(&ride->globalTransform)));
-
-    VehicleSystem& vehicles = g_game.vehicles;
     vehicles.blackHawkRideSide =
         (meshPosition.x - g_blackHawkModelCenter.x) * g_blackHawkModelScale;
     vehicles.blackHawkRideForward =
@@ -2999,6 +3240,46 @@ static void UpdateBlackHawkPalette() {
         // around the model origin.
         XMStoreFloat4x4(&g_blackHawkPalette[bone], XMMatrixTranspose(posed));
     }
+}
+
+// Points the insertion helicopter at one of the loaded airframes and rederives
+// everything measured from its geometry.
+//
+// The re-derivation is the whole reason this is a function rather than a
+// pointer assignment. Bounds, the ride point the player sits on, and the rope
+// anchor are all measured FROM the model at load time and cached in globals; a
+// bare swap would leave the new airframe flying with the old one's dimensions,
+// seating the player in mid-air beside it.
+//
+// Falls back to the BlackHawk when the requested airframe is not loaded, so a
+// missing optional asset costs the choice rather than the insertion.
+static void ApplyInsertionAirframe(InsertionAirframe airframe) {
+    int slot = static_cast<int>(airframe);
+    if (slot < 0 || slot > 1 || !g_blackHawkAirframeModel[slot]) slot = 0;
+    g_insertionAirframe = static_cast<InsertionAirframe>(slot);
+
+    g_blackHawkModel = g_blackHawkAirframeModel[slot];
+    g_blackHawkSkeleton = g_blackHawkAirframeSkeleton[slot];
+    if (!g_blackHawkModel) return;
+
+    // Empty for the unrigged airframe, which leaves the palette empty and the
+    // blades static -- UploadBlackHawkPalette returns 0 and the draw takes the
+    // static path.
+    g_blackHawkRotorBone = g_blackHawkSkeleton.BoneCount() > 0
+        ? g_blackHawkSkeleton.Find("Bone") : -1;
+    g_blackHawkPalette.clear();
+    if (g_blackHawkRotorBone >= 0) UpdateBlackHawkPalette();
+
+    ConfigureBlackHawkBounds();
+    ConfigureBlackHawkRideFromModel();
+    // After the ride point, which it falls back to when the model carries no
+    // dedicated rope anchor.
+    ConfigureBlackHawkRopeAnchorFromModel();
+}
+
+// True while a second airframe is actually available to pick.
+static bool InsertionAirframeChoiceAvailable() {
+    return g_blackHawkAirframeModel[0] && g_blackHawkAirframeModel[1];
 }
 
 XMMATRIX BoatWorldMatrix() {
@@ -13068,6 +13349,11 @@ static void RenderMainMenu(HWND hwnd) {
     ImGui::Dummy(ImVec2(0.0f, 2.0f));
     if (UIMenuButton("LEVEL EDITOR"))
         ImGui::OpenPopup("Level Editor");
+    // Empty terrain with no gameplay actors, foliage, houses or ocean clutter.
+    // Renderer work is what is left, so a graphics change can be looked at
+    // without a full island's content confusing what is being measured.
+    if (UIMenuButton("TEST LEVEL"))
+        StartLevelOne(hwnd, true, false, true, nullptr, true);
     if (UIMenuButton("SETTINGS"))
         g_showSettingsMenu = true;
 
@@ -13739,9 +14025,9 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
 
     MissionLoadout& loadout = g_game.mission.Loadout();
     static constexpr const char* weaponNames[MissionLoadout::kWeaponCount] = {
-        "AK47", "Mossberg 590A1", "RPG-7", "SVD Sniper",
+        "AK47", "Remington 870", "RPG-7", "R700 Sniper",
         "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
-        "Mako Harpoon Gun", "SVD Suppressed", "M4A1"
+        "Mako Harpoon Gun", "R700 Suppressed", "M4A1", "AK-74"
     };
     ImGui::SeparatorText("LOADOUT");
     int primary = loadout.weapons[0];
@@ -14027,6 +14313,33 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // already long and a dead control there would just be noise.
     if (g_playerInsertionChoice == LevelInsertionMode::Helicopter ||
         g_playerInsertionChoice == LevelInsertionMode::FastRappel) {
+        // Airframe choice, on the same guard as the seat row and for the same
+        // reason: it means nothing on a boat insertion. Hidden entirely when
+        // only one aircraft loaded, so a missing optional asset shows no
+        // control rather than a row with a single dead button.
+        if (InsertionAirframeChoiceAvailable()) {
+            ImGui::SetCursorPosX(45.0f);
+            ImGui::TextDisabled("AIRFRAME");
+            const auto airframeButton = [&](const char* label,
+                                            InsertionAirframe airframe,
+                                            bool sameLine) {
+                const bool selected = g_insertionAirframe == airframe;
+                if (selected) {
+                    ImGui::PushStyleColor(
+                        ImGuiCol_Button, ImVec4(0.12f, 0.48f, 0.22f, 1.0f));
+                    ImGui::PushStyleColor(
+                        ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.58f, 0.28f, 1.0f));
+                }
+                if (sameLine) ImGui::SameLine();
+                else ImGui::SetCursorPosX(45.0f);
+                if (ImGui::Button(label, ImVec2(166.0f, 30.0f)))
+                    ApplyInsertionAirframe(airframe);
+                if (selected) ImGui::PopStyleColor(2);
+            };
+            airframeButton("UH-60", InsertionAirframe::BlackHawk, false);
+            airframeButton("MH-60", InsertionAirframe::NewBlackHawk, true);
+            ImGui::Dummy(ImVec2(0.0f, 5.0f));
+        }
         ImGui::SetCursorPosX(45.0f);
         ImGui::TextDisabled("SEAT");
         const auto seatButton = [&](const char* label, bool leftSeat,
@@ -18723,6 +19036,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             g_selectedTimeOfDay = TimeOfDay::Night;
             ApplyTimeOfDay(g_selectedTimeOfDay);
         }
+        // SGE_SSRT=1 forces the NGLighting screen-space tracer on. It is opt-in
+        // and off by default, so an unattended run exercises none of its
+        // passes -- including the accumulation ping-pong, which only has a
+        // second buffer state to get wrong once it has run a frame.
+        if (GetEnvironmentVariableA("SGE_SSRT", nullptr, 0) > 0) {
+            scene.enableScreenSpaceReflections = true;
+            scene.screenSpaceRTEnabled = true;
+        }
+        // Allows the unattended visibility smoke to compile and execute the
+        // opt-in solar-disc, occlusion and dirt branches without changing the
+        // normal launch default.
+        if (GetEnvironmentVariableA("SGE_SUN_LENS", nullptr, 0) > 0)
+            scene.enableSunLens = true;
         if (GetEnvironmentVariableA("SGE_PREFAB_SMOKE_TEST", nullptr, 0) > 0) {
             g_prefabRuntimeSmokeEnabled = true;
             LevelEntity rock;
@@ -19236,7 +19562,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // into a 16-iteration solver on the frame the run starts.
             UpdateBlackHawkRope(armedInsertionThisFrame ? 0.0f : deltaTime);
             SpinBlackHawkRotor();
-            RidePlayerInBlackHawk();
+            RidePlayerInBlackHawk(deltaTime);
             UpdateBlackHawkCrashEffects(deltaTime);
 
             // Insertion boat, armed and stepped the same way so a load-sized
@@ -21721,6 +22047,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                            scene.atmosphereCloudDensity,
                            scene.atmosphereCloudBaseHeight,
                            scene.atmosphereCloudThickness);
+            const bool sunLensEnabled =
+                scene.enableSunLens && !deploymentHideAtmosphere;
+            skyRenderer.SetSunLens(
+                sunLensEnabled, scene.lightColor,
+                scene.sunAngularRadiusDegrees, scene.sunDiscIntensity,
+                scene.sunHaloIntensity);
+            visBuffer.SetSunLens(
+                sunLensEnabled,
+                scene.GetViewMatrix() * scene.GetUnjitteredProjectionMatrix(),
+                scene.camera.Position, scene.lightPos, scene.lightColor,
+                scene.directionalLightIntensity);
             skyRenderer.Render(
                 scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now,
                 scene.enablePhysicalAtmosphere,
@@ -22135,19 +22472,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 std::cerr << "Insertion boat GLB failed to load\n";
             }
 
-            g_blackHawkModel = GLBImporter::LoadGLBSkinned(
+            // Both airframes load here. The second is optional: a missing GLB
+            // leaves its slot null and ApplyInsertionAirframe falls back to the
+            // BlackHawk, so a content drop that omits it degrades to the
+            // historical single-aircraft behaviour instead of failing the load.
+            g_blackHawkAirframeModel[0] = GLBImporter::LoadGLBSkinned(
                 "Content/Models/BlackHawk/blackhawk.glb",
-                g_dx12.device, g_dx12.commandList, g_blackHawkSkeleton);
+                g_dx12.device, g_dx12.commandList,
+                g_blackHawkAirframeSkeleton[0]);
+            // Unrigged, so it goes through the plain loader and its skeleton
+            // slot stays empty. UploadBlackHawkPalette returns 0 for an empty
+            // palette, which puts the draw on the static path -- that is what
+            // keeps this model's blades static rather than skinned to nothing.
+            g_blackHawkAirframeModel[1] = GLBImporter::LoadGLB(
+                "Content/Models/NewBlackHawk/NewBlackHawk.glb",
+                g_dx12.device, g_dx12.commandList);
+            if (g_blackHawkAirframeModel[1])
+                std::cout << "Second insertion airframe GLB ready\n";
+            else
+                std::cerr << "Second insertion airframe GLB missing; "
+                             "only the BlackHawk will be offered\n";
+
+            ApplyInsertionAirframe(g_insertionAirframe);
             if (g_blackHawkModel) {
-                g_blackHawkRotorBone = g_blackHawkSkeleton.Find("Bone");
-                if (g_blackHawkRotorBone < 0)
-                    std::cerr << "BlackHawk rotor bone missing; blades static\n";
-                UpdateBlackHawkPalette();
-                ConfigureBlackHawkBounds();
-                ConfigureBlackHawkRideFromModel();
-                // After the ride point, which it falls back to when the model
-                // carries no dedicated rope anchor.
-                ConfigureBlackHawkRopeAnchorFromModel();
                 // No merged depth proxy: merging bakes the bind pose into flat
                 // geometry, which would leave the shadow's blades frozen while
                 // the lit ones turn. The shadow pass skins the real model.

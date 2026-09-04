@@ -112,7 +112,7 @@ struct ResolvedWeaponStats {
 
 class WeaponCustomizationSystem {
 public:
-    static constexpr int kWeaponCount = 10;
+    static constexpr int kWeaponCount = 11;
     static constexpr size_t kAttachmentCount = 3;
     // Multiplies every weapon's authored aim kick. 1.0 is as-authored; 2.0 is
     // twice the climb per shot. Scales the camera recoil -- the part that
@@ -129,17 +129,17 @@ public:
             { "ak47", "AK47", 0, 30, 120, 240, 1.55f, 0.10f, 1.0f,
               300.0f, 0.55f, 0.22f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
               1.0f, 42.0f, 2.0f, false, "Content/Models/ak47/AK47.FBX", "" },
-            { "mossberg_590a1", "Mossberg 590A1", 1, 8, 32, 64, 2.40f,
+            { "mossberg_590a1", "Remington 870", 1, 8, 32, 64, 2.40f,
               0.80f, 1.0f, 300.0f, 1.54f, 0.484f, 1.0f, 1.0f, 1.0f,
               1.0f, 1.0f, 1.0f, 42.0f, 0.0f, false,
-              "Content/Models/shotgun_fbx/Mossberg 590A1.fbx", "" },
+              "Content/Models/MainPlayer/Guns/Shotgun/remington870.glb", "" },
             { "rpg7", "RPG-7", 2, 1, 4, 8, 2.80f, 1.70f, 1.0f,
               70.0f, 2.20f, 0.0f, 1.0f, 1.0f, 1.0f, 1.8f, 1.75f,
               2.4f, 42.0f, 0.0f, false, "Content/Models/RPG7/RPG72.fbx", "" },
-            { "svd", "SVD Sniper", 3, 10, 40, 80, 1.75f, 1.05f, 5.0f,
+            { "svd", "R700 Sniper", 3, 10, 40, 80, 1.75f, 1.05f, 5.0f,
               650.0f, 2.31f, 0.0f, 1.0f, 1.0f, 1.0f, 1.35f, 1.35f,
               1.5f, 15.0f, 4.0f, false,
-              "Content/Models/SVD_v1.3/Models/SVD.FBX", "" },
+              "Content/Models/MainPlayer/Guns/R700/Remington_700_Sps_Tactical.glb", "" },
             { "arc_laser_cutter", "ARC Laser Cutter", 4, 120, 360, 600,
               2.10f, 0.055f, 6.0f, 1800.0f, 0.55f, 0.22f, 1.0f, 1.0f,
               1.0f, 1.0f, 1.0f, 1.0f, 42.0f, 0.0f, false,
@@ -156,10 +156,10 @@ public:
               1.25f, 1.0f, 0.0f, 0.55f, 0.0f, 1.0f, 1.0f, 1.0f,
               1.0f, 1.0f, 1.0f, 42.0f, 0.0f, false,
               "Content/Models/HarpoonGun/HarpoonGun.glb", "" },
-            { "svd_suppressed", "SVD Suppressed", 8, 5, 20, 40, 2.05f,
+            { "svd_suppressed", "R700 Suppressed", 8, 5, 20, 40, 2.05f,
               1.05f, 5.0f, 650.0f, 1.98f, 0.0f, 1.0f, 1.0f, 0.25f,
               0.55f, 0.35f, 0.7f, 15.0f, 4.0f, true,
-              "Content/Models/SVD_v1.3/Models/SVD.FBX", "" },
+              "Content/Models/MainPlayer/Guns/R700/Remington_700_Sps_Tactical.glb", "" },
             // The carbine against the AK's battle rifle: it cycles faster
             // (0.075s vs 0.10) and climbs less (0.42/0.18 vs 0.55/0.22) for
             // slightly less damage per shot, so the two are a real choice at
@@ -168,6 +168,13 @@ public:
               320.0f, 0.42f, 0.18f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
               1.0f, 42.0f, 1.8f, false,
               "Content/Models/MainPlayer/Guns/m4/m4A1.glb", "" },
+            // The AK47 stats verbatim -- same cartridge class, same cadence,
+            // same handling. This is a second model of the same rifle, so the
+            // two are interchangeable in everything but appearance.
+            { "ak74", "AK-74", 10, 30, 120, 240, 1.55f, 0.10f, 1.0f,
+              300.0f, 0.55f, 0.22f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+              1.0f, 42.0f, 2.0f, false,
+              "Content/Models/MainPlayer/Guns/Ak74/ak74.glb", "" },
         }};
 
         const uint32_t ak = 1u << 0;
@@ -196,6 +203,7 @@ public:
             instance.legacyWeaponId = definition.legacyWeaponId;
             instance.magazine = definition.magazineCapacity;
             instance.reserve = definition.initialReserve;
+            ApplyDefaultAttachments(instance);
         }
     }
 
@@ -247,6 +255,7 @@ public:
         instance.reserve = std::clamp(
             reserve < 0 ? definition->initialReserve : reserve,
             0, definition->maximumReserve);
+        ApplyDefaultAttachments(instance);
         return instance;
     }
 
@@ -388,6 +397,15 @@ public:
     }
 
 private:
+    static void ApplyDefaultAttachments(WeaponInstance& instance) {
+        // The Remington ships with its receiver-mounted red dot. Leave the side
+        // rail empty so the visible laser remains an opt-in attachment.
+        if (instance.legacyWeaponId == 1) {
+            instance.installedAttachmentIds[
+                static_cast<size_t>(AttachmentSlot::Optic)] = "red_dot";
+        }
+    }
+
     std::array<WeaponDefinition, kWeaponCount> definitions_{};
     std::array<AttachmentDefinition, kAttachmentCount> attachments_{};
     std::array<WeaponInstance, kWeaponCount> instances_{};

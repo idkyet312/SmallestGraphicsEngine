@@ -1093,47 +1093,57 @@ public:
                 (std::min)(1.0f, value)) * 255.0f + 0.5f);
         };
 
-        for (UINT layer = 0; layer < layers; ++layer) {
+        auto fillFallbackSlice = [&](UINT layer, bool albedo, bool normalMap,
+                                     bool roughness) {
+            if (!albedo && !normalMap && !roughness) return;
             for (UINT y = 0; y < side; ++y) for (UINT x = 0; x < side; ++x) {
                 const float h = height(static_cast<int>(x), static_cast<int>(y), layer);
-                const float dx = height(static_cast<int>(x) + 1,
-                    static_cast<int>(y), layer) - height(static_cast<int>(x) - 1,
-                    static_cast<int>(y), layer);
-                const float dy = height(static_cast<int>(x),
-                    static_cast<int>(y) + 1, layer) - height(static_cast<int>(x),
-                    static_cast<int>(y) - 1, layer);
-                const float strength = layer == 2 ? 2.0f : (layer == 3 ? 5.5f : 3.8f);
-                XMVECTOR vectorNormal = XMVector3Normalize(XMVectorSet(
-                    -dx * strength, -dy * strength, 1.0f, 0.0f));
-                XMFLOAT3 normal;
-                XMStoreFloat3(&normal, vectorNormal);
                 const size_t offset = static_cast<size_t>(layer) * layerBytes +
                     (static_cast<size_t>(y) * side + x) * bytesPerPixel;
-                const float variation = 0.76f + h * 0.43f;
-                // Pixel shader decodes albedo from sRGB. Encode procedural linear
-                // colors here; writing linear values directly caused a second
-                // gamma operation and crushed dirt/rock almost to black.
-                maps[0][offset + 0] = byte(std::pow(
-                    (std::min)(1.0f, baseColors[layer][0] * variation), 1.0f / 2.2f));
-                maps[0][offset + 1] = byte(std::pow(
-                    (std::min)(1.0f, baseColors[layer][1] * variation), 1.0f / 2.2f));
-                maps[0][offset + 2] = byte(std::pow(
-                    (std::min)(1.0f, baseColors[layer][2] * variation), 1.0f / 2.2f));
-                maps[0][offset + 3] = 255;
-                maps[1][offset + 0] = byte(normal.x * 0.5f + 0.5f);
-                maps[1][offset + 1] = byte(normal.y * 0.5f + 0.5f);
-                maps[1][offset + 2] = byte(normal.z * 0.5f + 0.5f);
-                maps[1][offset + 3] = 255;
-                const uint8_t rough = byte(
-                    baseRoughness[layer] + (h - 0.5f) * 0.12f);
-                maps[2][offset + 0] = 255;
-                maps[2][offset + 1] = rough;
-                maps[2][offset + 2] = 0;
-                maps[2][offset + 3] = 255;
+                if (albedo) {
+                    const float variation = 0.76f + h * 0.43f;
+                    // Pixel shader decodes albedo from sRGB. Encode procedural
+                    // linear colors here so the fallback is not gamma-corrected
+                    // a second time.
+                    maps[0][offset + 0] = byte(std::pow((std::min)(1.0f,
+                        baseColors[layer][0] * variation), 1.0f / 2.2f));
+                    maps[0][offset + 1] = byte(std::pow((std::min)(1.0f,
+                        baseColors[layer][1] * variation), 1.0f / 2.2f));
+                    maps[0][offset + 2] = byte(std::pow((std::min)(1.0f,
+                        baseColors[layer][2] * variation), 1.0f / 2.2f));
+                    maps[0][offset + 3] = 255;
+                }
+                if (normalMap) {
+                    const float dx = height(static_cast<int>(x) + 1,
+                        static_cast<int>(y), layer) - height(
+                        static_cast<int>(x) - 1, static_cast<int>(y), layer);
+                    const float dy = height(static_cast<int>(x),
+                        static_cast<int>(y) + 1, layer) - height(
+                        static_cast<int>(x), static_cast<int>(y) - 1, layer);
+                    const float strength = layer == 2 ? 2.0f
+                        : (layer == 3 ? 5.5f : 3.8f);
+                    XMVECTOR vectorNormal = XMVector3Normalize(XMVectorSet(
+                        -dx * strength, -dy * strength, 1.0f, 0.0f));
+                    XMFLOAT3 normal;
+                    XMStoreFloat3(&normal, vectorNormal);
+                    maps[1][offset + 0] = byte(normal.x * 0.5f + 0.5f);
+                    maps[1][offset + 1] = byte(normal.y * 0.5f + 0.5f);
+                    maps[1][offset + 2] = byte(normal.z * 0.5f + 0.5f);
+                    maps[1][offset + 3] = 255;
+                }
+                if (roughness) {
+                    maps[2][offset + 0] = 255;
+                    maps[2][offset + 1] = byte(
+                        baseRoughness[layer] + (h - 0.5f) * 0.12f);
+                    maps[2][offset + 2] = 0;
+                    maps[2][offset + 3] = 255;
+                }
             }
-        }
+        };
 
-        // Replace all generated fallback slices with Poly Haven CC0 scans.
+        // Load the Poly Haven CC0 scans first. Procedural pixels are expensive
+        // enough to make startup look hung on a busy machine, and successful
+        // loads replace every byte anyway, so generate only failed channels.
         auto resolveTerrainMap = [](const char* folder, const char* file) {
             for (const std::filesystem::path root : {
                     std::filesystem::path("Content/Models"),
@@ -1236,6 +1246,8 @@ public:
             const bool roughnessLoaded = loadTerrainSlice(
                 assets[layer].folder, assets[layer].roughness, layer,
                 maps[2], false, true);
+            fillFallbackSlice(layer, !albedoLoaded, !normalLoaded,
+                              !roughnessLoaded);
             const bool aoLoaded = !assets[layer].ambientOcclusion ||
                 loadTerrainSlice(assets[layer].folder,
                     assets[layer].ambientOcclusion, layer,

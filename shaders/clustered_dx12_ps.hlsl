@@ -1018,7 +1018,9 @@ float4 main(PS_INPUT input) : SV_TARGET
     // 8 rather than the next free small integer: terrain packs bit flags into
     // this same float (terrain_pbr.hlsli does fmod(materialType, 4.0), and the
     // CPU combines 3 and 4), so 3..7 are spoken for.
-    const bool isGlass = materialType > 7.5 && materialType < 8.5;
+    const bool isReflexGlass = materialType > 7.5 && materialType < 8.5;
+    const bool isSniperGlass = materialType > 8.5 && materialType < 9.5;
+    const bool isGlass = isReflexGlass || isSniperGlass;
     float waterFoam = 0.0;
     // glTF BLEND coverage is the product of baseColorFactor alpha and the
     // sampled base-colour alpha. OPAQUE textures may carry incidental alpha,
@@ -1111,12 +1113,13 @@ float4 main(PS_INPUT input) : SV_TARGET
     // specular IBL added further down gets multiplied away by a constant
     // opacity instead of showing as a sky glint across the glass.
     //
-    // F0 is the shader's own dielectric 0.04, not water's 0.02037: that number
-    // is water's index of refraction and would under-reflect glass.
+    // Reflex glass uses the shader's usual dielectric 0.04. Sniper glass uses
+    // ((1.45 - 1) / (1.45 + 1))^2 to match its authored Fresnel node exactly.
     if (isGlass) {
         const float nDotVGlass = saturate(dot(normal, viewDir));
+        const float glassF0 = isSniperGlass ? 0.03373594 : 0.04;
         const float baseFresnel =
-            0.04 + (1.0 - 0.04) * pow(1.0 - nDotVGlass, 5.0);
+            glassF0 + (1.0 - glassF0) * pow(1.0 - nDotVGlass, 5.0);
         // The source lens is a nearly flat low-poly plate, so its geometric
         // normal cannot produce the curved highlight a real moulded lens has
         // around its silhouette. Its UVs do preserve that boundary; use only
@@ -1124,26 +1127,30 @@ float4 main(PS_INPUT input) : SV_TARGET
         // The source lens occupies this sub-rectangle of its discarded colour
         // atlas. Remap in the shader because the importer has already uploaded
         // the original vertex buffer by the time the material is identified.
-        const float2 glassUV = saturate(
-            (input.texCoord - float2(0.0488, 0.1473)) /
-            float2(0.4773, 0.3816));
-        const float edgeDistance = min(
-            min(glassUV.x, 1.0 - glassUV.x),
-            min(glassUV.y, 1.0 - glassUV.y));
-        const float edgeWidth = max(fwidth(edgeDistance) * 2.0, 0.06);
-        const float glassEdge =
-            1.0 - smoothstep(0.0, edgeWidth, edgeDistance);
+        float glassEdge = 0.0;
+        if (isReflexGlass) {
+            const float2 glassUV = saturate(
+                (input.texCoord - float2(0.0488, 0.1473)) /
+                float2(0.4773, 0.3816));
+            const float edgeDistance = min(
+                min(glassUV.x, 1.0 - glassUV.x),
+                min(glassUV.y, 1.0 - glassUV.y));
+            const float edgeWidth = max(fwidth(edgeDistance) * 2.0, 0.06);
+            glassEdge = 1.0 - smoothstep(0.0, edgeWidth, edgeDistance);
+        }
         glassFresnel = saturate(
             baseFresnel + glassEdge * 0.18 * (1.0 - baseFresnel));
 
         // Reflex optics use a faint anti-reflective coating. Keeping the shift
         // on reflected light avoids painting the transmitted scene uniformly
         // blue, while the angle dependence gives the lens some depth in motion.
-        const float coatingAngle = saturate(
-            pow(1.0 - nDotVGlass, 2.0) + glassEdge * 0.35);
-        glassCoatingTint = lerp(
-            float3(0.92, 0.98, 1.04),
-            float3(0.58, 0.90, 1.20), coatingAngle);
+        if (isReflexGlass) {
+            const float coatingAngle = saturate(
+                pow(1.0 - nDotVGlass, 2.0) + glassEdge * 0.35);
+            glassCoatingTint = lerp(
+                float3(0.92, 0.98, 1.04),
+                float3(0.58, 0.90, 1.20), coatingAngle);
+        }
         // The authored alpha still scales the result, so the material's own
         // baseColorFactor.w remains the overall density control and the two
         // tunables shape the curve between them.
@@ -1160,7 +1167,11 @@ float4 main(PS_INPUT input) : SV_TARGET
             glassAbsorption + reflectionCoverage * (1.0 - glassAbsorption));
     }
 
-    if (!isWater && metal < 0.25) {
+    if (isSniperGlass) {
+        // The Fresnel branch selects a separate glossy BSDF authored at 0.10;
+        // material variation belongs to solids and would blur that fixed lobe.
+        rough = 0.10;
+    } else if (!isWater && metal < 0.25) {
         float materialVariation = MatVarNoise(input.fragPos * 0.35);
         rough = clamp(rough * lerp(0.88, 1.10, materialVariation), 0.045, 1.0);
     }
@@ -1217,9 +1228,9 @@ float4 main(PS_INPUT input) : SV_TARGET
     float HdotV = max(dot(H, V), 0.0);
     
     // Fresnel (Schlick)
-    float3 F0 = isWater
-        ? float3(0.02037, 0.02037, 0.02037)
-        : float3(0.04, 0.04, 0.04);
+    const float dielectricF0 = isWater ? 0.02037
+        : (isSniperGlass ? 0.03373594 : 0.04);
+    float3 F0 = float3(dielectricF0, dielectricF0, dielectricF0);
     F0 = lerp(F0, albedo, metal);
     float3 F = F0 + (1.0 - F0) * pow(1.0 - HdotV, 5.0);
     
