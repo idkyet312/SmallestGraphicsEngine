@@ -7903,8 +7903,8 @@ static void RenderSniperScopeTexture(float now) {
     // scopeUVRotation), which keeps the two bases in agreement.
     //
     // Rotating Up about Front leaves the view direction exactly where it was,
-    // so the sight still points where the rifle points -- only the horizon
-    // orientation changes.
+    // so the sight still points where the rifle points. Sampling compensates
+    // for the rotated target to keep the displayed horizon aligned.
     if (std::fabs(scene.sniperScopeCameraRollDegrees) > 0.0001f) {
         const XMVECTOR front = XMVector3Normalize(
             XMLoadFloat3(&scene.camera.Front));

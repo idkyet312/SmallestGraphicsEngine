@@ -186,7 +186,12 @@ struct alignas(256) ObjectBufferDX12 {
     // below keeps its value. Non-zero draws direction markers over the lens;
     // see the isSniperGlass branch in clustered_dx12_ps.hlsl.
     float sniperScopeDebugMode = 0.0f;
-    float sniperScopeDebugPad0 = 0.0f;
+    // Tangent of the half-angle the scope glass subtends from the eye, so the
+    // lens can map its own disc onto the whole scope target instead of assuming
+    // the glass covers exactly the scope FOV. Takes the first debug padding
+    // float, so no offset asserted above moves. Zero means "not measured" and
+    // the lens falls back to the focal-length mapping.
+    float sniperLensHalfTangent = 0.0f;
     float sniperScopeDebugPad1 = 0.0f;
     float sniperScopeDebugPad2 = 0.0f;
 };
@@ -206,6 +211,9 @@ static_assert(offsetof(ObjectBufferDX12, sniperScopeUVRotation) == 156,
 static_assert(offsetof(ObjectBufferDX12, sniperScopeDebugMode) == 160,
               "scope debug must open a new 16-byte register, not shift the "
               "glass register above it");
+static_assert(offsetof(ObjectBufferDX12, sniperLensHalfTangent) == 164,
+              "lens half-angle must take the first debug padding float so the "
+              "asserted offsets above keep their values");
 static_assert(sizeof(ObjectBufferDX12) % 16 == 0,
               "ObjectBufferDX12 must stay 16-byte aligned; HLSL re-pads to 16 "
               "and C++ does not, so a short tail silently desyncs the layout");
@@ -525,6 +533,9 @@ public:
     // Non-zero draws the lens orientation key. Set alongside the focal
     // lengths, so it follows the same sticky per-frame lifetime.
     float sniperScopeDebugMode = 0.0f;
+    // Tangent of the scope glass's half-angle from the eye. Same sticky
+    // lifetime as the focal lengths it accompanies.
+    float sniperLensHalfTangent = 0.0f;
     bool drawWireframe = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
@@ -2117,6 +2128,7 @@ public:
         data.sniperScopeFocalX = sniperScopeFocalX;
         data.sniperScopeFocalY = sniperScopeFocalY;
         data.sniperScopeDebugMode = sniperScopeDebugMode;
+        data.sniperLensHalfTangent = sniperLensHalfTangent;
         data.sniperScopeUVRotation = 0.0f;
 
         objectBuffer.CopyData(bufferIndex, data);
@@ -2223,6 +2235,7 @@ public:
         data.sniperScopeFocalX = sniperScopeFocalX;
         data.sniperScopeFocalY = sniperScopeFocalY;
         data.sniperScopeDebugMode = sniperScopeDebugMode;
+        data.sniperLensHalfTangent = sniperLensHalfTangent;
         data.sniperScopeUVRotation = scopeUVRotation;
         if (useNorm && normal) {
             const D3D12_RESOURCE_DESC nd = normal->GetDesc();
@@ -2440,6 +2453,7 @@ public:
         data.sniperScopeFocalX = sniperScopeFocalX;
         data.sniperScopeFocalY = sniperScopeFocalY;
         data.sniperScopeDebugMode = sniperScopeDebugMode;
+        data.sniperLensHalfTangent = sniperLensHalfTangent;
         data.sniperScopeUVRotation = 0.0f;
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(

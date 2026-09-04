@@ -111,6 +111,10 @@ struct WaterTransparentDrawDX12 {
     XMFLOAT3 worldCenter = {};
     float distanceSquared = 0.0f;
     float specularScale = 1.0f;
+    XMFLOAT2 scopeFocal = {};
+    float scopeUVRotation = 0.0f;
+    float scopeDebugMode = 0.0f;
+    float scopeLensHalfTangent = 0.0f;
     bool colorNormalOnly = false;
     bool extendedMaterialParameters = false;
 };
@@ -239,7 +243,10 @@ inline void QueueWaterTransparentDrawDX12(
     const XMMATRIX& lightSpace, D3D12_GPU_VIRTUAL_ADDRESS bonePalette,
     D3D12_GPU_VIRTUAL_ADDRESS previousBonePalette,
     bool extendedMaterialParameters, bool colorNormalOnly = false,
-    XMFLOAT4 palmWindRoot = {}, float specularScale = 1.0f) {
+    XMFLOAT4 palmWindRoot = {}, float specularScale = 1.0f,
+    float scopeUVRotation = 0.0f, XMFLOAT2 scopeFocal = {},
+    float scopeDebugMode = 0.0f,
+    float scopeLensHalfTangent = 0.0f) {
     WaterTransparentDrawDX12 draw;
     draw.vbv = primitive.vbv;
     draw.ibv = primitive.ibv;
@@ -263,6 +270,10 @@ inline void QueueWaterTransparentDrawDX12(
     draw.colorNormalOnly = colorNormalOnly;
     draw.extendedMaterialParameters = extendedMaterialParameters;
     draw.specularScale = specularScale;
+    draw.scopeFocal = scopeFocal;
+    draw.scopeUVRotation = scopeUVRotation;
+    draw.scopeDebugMode = scopeDebugMode;
+    draw.scopeLensHalfTangent = scopeLensHalfTangent;
 
     bool renderAfterWater = true;
     if (g_waterTransparencySplitActive)
@@ -1262,6 +1273,81 @@ inline std::vector<VertexPosNormUV> BuildCapsuleVertices(int hemiRings = 6, int 
     return verts;
 }
 
+// Tangent of the half-angle the R700's scope glass subtends from the eye.
+//
+// The lens shader needs this to map the visible disc onto the whole scope
+// target. Without it the sample coordinate is built from the scope camera's own
+// focal length, which silently assumes the glass covers exactly the scope FOV.
+// It does not: the disc is sized by the weapon mesh and where ADS holds it,
+// while the scope FOV is a zoom setting, and the two are independent. Measured
+// on the real geometry, the disc spanned a 13.6 degree half-angle against a
+// 3 degree target, so scopeUV ran to +/-4.6 and saturate() flattened roughly
+// 95% of the glass into one smeared edge texel -- which read as a hole in the
+// scope rather than a magnified image, and got worse as zoom increased.
+//
+// Measured per frame rather than authored as a constant: it moves with the ADS
+// offsets, the weapon fit sliders and the hand-follow transform, and a stale
+// constant would put the seam back.
+//
+// Returns false when there is no scope glass to measure, which leaves the
+// shader on its focal-length fallback.
+inline bool SniperLensHalfAngleTangent(const Scene& scene, float& halfTangent) {
+    const std::shared_ptr<SceneMesh>& rifle = GunModel::R700Mesh();
+    if (!rifle) return false;
+
+    const float S = scene.GunModelScale();
+    const XMFLOAT3& weaponOffset = GunModel::PlayerOffset();
+    const XMFLOAT3& weaponFitRot = GunModel::PlayerFitRotation();
+    const XMMATRIX weaponPlacement =
+        XMMatrixRotationRollPitchYaw(XMConvertToRadians(weaponFitRot.x),
+                                     XMConvertToRadians(weaponFitRot.y),
+                                     XMConvertToRadians(weaponFitRot.z)) *
+        XMMatrixScaling(S, S, S) *
+        XMMatrixTranslation(weaponOffset.x * S, weaponOffset.y * S,
+                            weaponOffset.z * S);
+    const XMMATRIX gunBase = scene.GetGunBaseMatrix();
+    XMMATRIX handFollow;
+    const XMMATRIX xf = ArmsModel::WeaponFollowTransform(handFollow, S)
+                            ? weaponPlacement * handFollow * gunBase
+                            : weaponPlacement * gunBase;
+
+    const XMVECTOR eye = XMLoadFloat3(&scene.ViewmodelAnchorPosition());
+    const XMVECTOR forward =
+        XMVector3Normalize(XMLoadFloat3(&scene.camera.Front));
+
+    // The largest off-axis tangent over the glass, which is the rim. Taking the
+    // maximum rather than an average keeps the whole disc inside the target:
+    // any vertex mapping past 1.0 is a vertex that would clamp.
+    float widest = 0.0f;
+    bool measured = false;
+    for (const MeshPrimitive& primitive : rifle->primitives) {
+        const std::shared_ptr<SceneMaterial>& material = primitive.material;
+        if (!material || material->materialType < 8.5f ||
+            material->materialType > 9.5f) continue;
+        // Same interleaved stride ViewmodelEyeDistanceRange walks:
+        // Pos(3) Normal(3) Tex(2) Tangent(4).
+        for (size_t i = 0; i + 2 < primitive.vertices.size(); i += 12) {
+            const XMVECTOR local = XMVectorSet(primitive.vertices[i],
+                                               primitive.vertices[i + 1],
+                                               primitive.vertices[i + 2], 1.0f);
+            const XMVECTOR offset = XMVectorSubtract(
+                XMVector3TransformCoord(local, xf), eye);
+            const float along = XMVectorGetX(XMVector3Dot(offset, forward));
+            // Behind or level with the eye has no meaningful angle.
+            if (along <= 1e-4f) continue;
+            const XMVECTOR perpendicular = XMVectorSubtract(
+                offset, XMVectorScale(forward, along));
+            const float lateral =
+                XMVectorGetX(XMVector3Length(perpendicular));
+            widest = (std::max)(widest, lateral / along);
+            measured = true;
+        }
+    }
+    if (!measured || widest <= 1e-4f) return false;
+    halfTangent = widest;
+    return true;
+}
+
 // Draw a standalone mesh's primitives at `model`, honouring their materials. This
 // is the per-primitive body of DrawSceneNode, pulled out so meshes that are not
 // part of a scene graph (e.g. the sliced palm) can be drawn the same way.
@@ -1315,7 +1401,10 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
             !shader.IsViewmodelPassActive()) {
             QueueWaterTransparentDrawDX12(
                 prim, model, view, proj, lightSpace, 0, 0, true,
-                colorNormalOnly, palmWindRoot, specularScale);
+                colorNormalOnly, palmWindRoot, specularScale,
+                scopeUVRotation,
+                XMFLOAT2(shader.sniperScopeFocalX, shader.sniperScopeFocalY),
+                shader.sniperScopeDebugMode, shader.sniperLensHalfTangent);
             continue;
         }
         if (prim.material) {
@@ -1774,8 +1863,18 @@ inline void RenderWaterTransparencyPhaseDX12(
         g_dxrDDGIProbeCount, g_dxrDDGICellCount, g_dxrDDGIIndexCount,
         g_spotShadowAtlasResource);
 
+    // A lens can be queued when weapon see-through is off. Replay must keep
+    // the scope state from that draw after the viewmodel's tuning has ended.
+    const XMFLOAT2 savedScopeFocal(
+        shader.sniperScopeFocalX, shader.sniperScopeFocalY);
+    const float savedScopeDebugMode = shader.sniperScopeDebugMode;
+    const float savedLensHalfTangent = shader.sniperLensHalfTangent;
     for (const WaterTransparentDrawDX12& draw : draws) {
         if (!draw.material || !draw.vbv.BufferLocation) continue;
+        shader.sniperScopeFocalX = draw.scopeFocal.x;
+        shader.sniperScopeFocalY = draw.scopeFocal.y;
+        shader.sniperScopeDebugMode = draw.scopeDebugMode;
+        shader.sniperLensHalfTangent = draw.scopeLensHalfTangent;
         shader.SetMatrices(draw.model, draw.view, draw.projection,
             draw.lightSpace, draw.palmWindRoot);
         const XMFLOAT3 color(
@@ -1803,7 +1902,10 @@ inline void RenderWaterTransparencyPhaseDX12(
                 draw.material->occlusionStrength,
                 draw.material->normalYSign,
                 draw.material->viewFillStrength,
-                draw.specularScale);
+                draw.specularScale,
+                draw.material->materialType,
+                0.0f,
+                draw.scopeUVRotation);
         } else {
             shader.SetObjectMaterial(
                 color,
@@ -1846,6 +1948,10 @@ inline void RenderWaterTransparencyPhaseDX12(
         }
         shader.NextDrawCall();
     }
+    shader.sniperScopeFocalX = savedScopeFocal.x;
+    shader.sniperScopeFocalY = savedScopeFocal.y;
+    shader.sniperScopeDebugMode = savedScopeDebugMode;
+    shader.sniperLensHalfTangent = savedLensHalfTangent;
     draws.clear();
     shader.Use(scene.wireframeMode);
 }
@@ -3471,14 +3577,21 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             scene.sniperPictureInPicture && scene.sniperScopeBlend > 0.0f;
         shader.sniperScopeFocalX = scopeFeedLive ? scopeFocal.x : 0.0f;
         shader.sniperScopeFocalY = scopeFeedLive ? scopeFocal.y : 0.0f;
+        // Map the glass disc onto the whole scope target. Measured from the
+        // real lens geometry every frame, so it tracks the ADS offsets and
+        // weapon fit rather than assuming the disc covers the scope FOV.
+        float lensHalfTangent = 0.0f;
+        shader.sniperLensHalfTangent =
+            (scopeFeedLive &&
+             SniperLensHalfAngleTangent(scene, lensHalfTangent))
+                ? lensHalfTangent : 0.0f;
         shader.sniperScopeDebugMode =
             (scopeFeedLive && scene.sniperScopeUVDebug) ? 1.0f : 0.0f;
-        // Rotates the sampling coordinate only. The scope camera itself is
-        // never rolled: the lens reconstructs its sample from the main view
-        // ray, so the two cameras must keep identical bases (see
-        // RenderSniperScopeTexture). Orientation is corrected here instead.
+        // A rolled camera changes the sampling basis, not the displayed roll.
+        // D3D's downward V axis reverses the view-space rotation sign; the
+        // shader negates this angle, so camera roll must be subtracted here.
         const float scopeUVRotation =
-            XMConvertToRadians(scene.sniperScopeUVRotationDegrees +
+            XMConvertToRadians(scene.sniperScopeUVRotationDegrees -
                                scene.sniperScopeCameraRollDegrees);
         // With see-through active this body runs twice: color writes are
         // disabled while the first pass selects the nearest weapon surface,

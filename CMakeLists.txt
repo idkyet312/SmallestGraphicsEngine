@@ -515,6 +515,13 @@ if(BUILD_TESTING)
         SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     add_test(NAME ResolveShaderCanaryTests COMMAND ResolveShaderCanaryTests)
 
+    add_executable(SniperScopeProjectionTests tests/SniperScopeProjectionTests.cpp)
+    target_link_libraries(SniperScopeProjectionTests PRIVATE
+        SGEProjectHeaders d3d11 d3dcompiler)
+    target_compile_definitions(SniperScopeProjectionTests PRIVATE
+        SGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    add_test(NAME SniperScopeProjectionTests COMMAND SniperScopeProjectionTests)
+
     # Pure CPU test for the bindless descriptor index allocator. Links no D3D
     # libraries on purpose -- BindlessHeapDX12.h keeps the range arithmetic
     # free of device calls so it can be tested without a GPU.
@@ -671,4 +678,3 @@ add_custom_target(RuntimeContent
     VERBATIM
 )
 add_dependencies(GraphicEngine RuntimeContent)
-

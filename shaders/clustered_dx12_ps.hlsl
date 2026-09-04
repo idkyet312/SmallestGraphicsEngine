@@ -79,7 +79,10 @@ float sniperScopeFocalY;
 float sniperScopeUVRotation;
     // Orientation debug key; opens its own 16-byte register at byte 160.
     float sniperScopeDebugMode;
-    float sniperScopeDebugPad0;
+    // Tangent of the half-angle the scope glass subtends from the eye. Maps the
+    // visible disc onto the whole scope target; zero falls back to the focal
+    // lengths. Takes the first debug pad float, matching ObjectBufferDX12.
+    float sniperLensHalfTangent;
     float sniperScopeDebugPad1;
     float sniperScopeDebugPad2;
 };
@@ -1348,11 +1351,10 @@ float4 main(PS_INPUT input) : SV_TARGET
         // lens locked to the world behind it as the rifle moves, so no
         // tangent-space parallax term is needed -- and that term suffered from
         // the same authored-basis dependence as the UV it accompanied.
-        // Rotated by the view matrix the same way the vertex shader does
-        // (row-vector convention, mul(vector, matrix)); w is 0 because this is
-        // a direction, so the translation column is correctly ignored.
-        const float3 lensRay = normalize(input.fragPos - viewPos);
-        const float3 rayView = mul(float4(lensRay, 0.0), view).xyz;
+        // Use the same world-to-view transform as the vertex shader, including
+        // its translated eye during camera shake. CameraBuffer's viewPos is the
+        // unshaken position and cannot reconstruct that ray consistently.
+        const float3 rayView = mul(float4(input.fragPos, 1.0), view).xyz;
         // Behind the eye is not representable in the scope's projection; fall
         // back to the lens centre rather than sampling a mirrored coordinate.
         const float rayForward = max(rayView.z, 1e-4);
@@ -1363,29 +1365,31 @@ float4 main(PS_INPUT input) : SV_TARGET
         const float2 scopeFocal = sniperScopeFocalY > 0.0
             ? float2(sniperScopeFocalX, sniperScopeFocalY)
             : float2(projection._11, projection._22);
-        const float2 scopeNDC = (rayView.xy / rayForward) * scopeFocal;
-        // Basic picture-in-picture: no lens bulge or parallax. Rotation is
-        // applied only to the completed target's sampling coordinates.
+        // Map the lens disc onto the whole scope target.
         //
-        // Measured from a screen recording of a rightward pan: the lens content
-        // tracked VERTICALLY while the world moved horizontally. The scope
-        // target's axes are transposed relative to this sampling basis, so the
-        // fix is to swap the components -- x drives v and y drives u -- rather
-        // than to rotate, which would pair the axes correctly but leave one of
-        // them reversed.
+        // scopeFocal alone assumes the glass covers exactly the scope camera's
+        // field of view. It does not: the disc's angular size comes from the
+        // weapon mesh and where ADS holds it, while the scope FOV is a zoom
+        // setting, and nothing ties the two together. Measured on the real
+        // geometry the disc spanned a 13.6 degree half-angle against a 3 degree
+        // target, so this ran to +/-4.6 and the saturate() below flattened
+        // about 95% of the glass into one smeared edge texel. That read as a
+        // hole in the scope rather than a magnified image, and every increase
+        // in zoom shrank the live region further -- more zoom looked like less.
         //
-        // Straight mapping, no transposition: view X drives u, view Y drives v.
+        // Dividing by the disc's own half-angle tangent puts the rim at +/-1
+        // whatever the zoom, so the image always fills the glass and
+        // sniperScopeFOV is left to do nothing but magnify.
+        const float2 scopeNDC = sniperLensHalfTangent > 0.0
+            ? (rayView.xy / rayForward) / sniperLensHalfTangent
+            : (rayView.xy / rayForward) * scopeFocal;
+        // Projection is independent of the imported lens UVs and weapon roll.
         //
-        // u is negated because the lens is looked THROUGH rather than at, which
-        // reverses the horizontal sense; v is negated for the usual D3D
-        // top-down texture origin. Both signs were settled against the real
-        // image rather than derived -- the earlier swap was a misreading of a
-        // horizontal mirror as an axis transposition.
+        // Keep horizontal motion aligned with the main view. Only Y flips for
+        // D3D's top-down texture origin; mirroring X reverses mouse tracking.
         //
-        // SGE_SCOPE_UV_DEBUG: set sniperScopeUVRotation to exactly 1000 to
-        // draw an orientation key over the lens instead of tuning by eye.
-        // See the marker block below.
-        const float2 scopeAxes = float2(-scopeNDC.x, -scopeNDC.y);
+        // sniperScopeDebugMode enables the orientation key below.
+        const float2 scopeAxes = float2(scopeNDC.x, -scopeNDC.y);
         float2 scopeUV = float2(0.5, 0.5) + scopeAxes * 0.5;
         float scopeSin;
         float scopeCos;
@@ -1433,8 +1437,22 @@ float4 main(PS_INPUT input) : SV_TARGET
                                           : float3(0.0, 0.0, 1.0)); // -u -v
             scopeRadiance = lerp(scopeRadiance, quadrant, 0.45);
         }
-        // The R700 scope is deliberately the simplest useful implementation:
-        // display the camera image directly with no glass/reflection blend.
+        // Sell the glass as an optic rather than a hole.
+        //
+        // The branch used to hand back the sampled image at full brightness
+        // right to the rim, so the lens edge was a hard cut straight into the
+        // surrounding world and the eye read it as a window. A real sight
+        // darkens toward the tube wall and blacks out past eye relief.
+        //
+        // Radius comes from the sample coordinate, which is now disc-relative:
+        // the rim of the glass sits at 1.0 whatever the zoom, so these
+        // thresholds hold as sniperScopeFOV changes.
+        const float lensRadius = length(scopeNDC);
+        // Gentle falloff across the outer third, then the tube itself. Both
+        // edges are smoothed: a hard cut aliases badly against a curved rim.
+        const float vignette = 1.0 - 0.55 * smoothstep(0.62, 1.0, lensRadius);
+        const float tube = 1.0 - smoothstep(0.94, 1.02, lensRadius);
+        scopeRadiance *= vignette * tube;
         result = scopeRadiance;
         surfaceOpacity = 1.0;
     } else if (isGlass) {

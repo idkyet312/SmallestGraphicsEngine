@@ -245,7 +245,16 @@ struct Scene {
     // Camera - positioned back so the imported model (a small building) is fully framed at spawn
     Camera camera{ XMFLOAT3(0.0f, 1.7f, 20.0f) };
     float  cameraFOV  = 60.0f;
-    float  sniperScopeFOV = 15.0f;
+    // Scope magnification is this against the ADS camera the lens is seen
+    // through, not against the 60 deg hip view: while scoped, adsBlend is 1 and
+    // EffectiveCameraFOV's `sighted` term is weaponAdsFOV (42 deg). At 15 deg
+    // that was only tan(21)/tan(7.5) = 2.9x, which reads as barely zoomed
+    // through a lens disc covering a small part of the screen. 6 deg gives
+    // tan(21)/tan(3) = 7.3x, the low end of a real hunting scope.
+    // Adjustable live from the Sniper Scope debug panel; this is the value the
+    // "Reset Zoom" button restores.
+    static constexpr float kR700ScopeFOVDegrees = 6.0f;
+    float  sniperScopeFOV = kR700ScopeFOVDegrees;
     float  sniperScopeBlend = 0.0f;
     // Shared ADS presentation for every weapon, including the R700. Its scope
     // camera has a separate blend because magnification belongs on the lens.
@@ -520,18 +529,14 @@ struct Scene {
     bool  showAimDebugRay = false;
     float aimDebugRayLength = 260.0f;
 
-    // Rotates only the completed render target around its UV centre. The
-    // camera feed is level by default; this remains live-tunable for checking
-    // an imported lens without baking its mesh orientation into the camera.
-    // Zero: the axis transposition is corrected in the shader by swapping the
-    // sampling components, not by rotating them (see the scopeAxes swap in
-    // clustered_dx12_ps.hlsl). Rotating as well would double-correct. This
-    // stays as a fine-tuning offset for the lens mesh's own UVs.
+    // Diagnostic image rotation. Screen-ray projection does not use the
+    // imported lens UVs, so zero keeps the image aligned with the main view
+    // regardless of the weapon mesh's orientation.
     static constexpr float kR700ScopeUVRotationDegrees = 0.0f;
     float sniperScopeUVRotationDegrees = kR700ScopeUVRotationDegrees;
 
-    // Draws the lens orientation key: coloured bars on the sampled image's
-    // four edges, so a mirror can be told from an axis swap by looking rather
+    // Draws the lens orientation key: coloured quadrants on the sampled image,
+    // so a mirror can be told from an axis swap by looking rather
     // than by trying sign combinations. Debug only, off by default.
     bool sniperScopeUVDebug = false;
 

@@ -3155,6 +3155,30 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // exactly when there is a scope image to judge.
         if (GunModel::R700Selected()) {
             ImGui::SeparatorText("Sniper Scope");
+            // Zoom is authored as the scope camera's field of view, but what
+            // the player judges is magnification, so show both. The multiplier
+            // is against the ADS camera the lens is actually seen through
+            // (weaponAdsFOV, not the 60 deg hip view) -- quoting it against the
+            // hip FOV would overstate what the eye compares it to.
+            {
+                const float adsFOV = (std::max)(1.0f, scene.weaponAdsFOV);
+                const float magnification =
+                    std::tan(DirectX::XMConvertToRadians(adsFOV) * 0.5f) /
+                    std::tan(DirectX::XMConvertToRadians(
+                        (std::max)(0.5f, scene.sniperScopeFOV)) * 0.5f);
+                ImGui::SliderFloat("Scope Zoom", &scene.sniperScopeFOV,
+                                   1.0f, 42.0f, "%.1f deg",
+                                   ImGuiSliderFlags_AlwaysClamp |
+                                   ImGuiSliderFlags_Logarithmic);
+                ImGui::SetItemTooltip(
+                    "Field of view the scope camera renders with. Lower is "
+                    "more zoom. Takes effect immediately -- the lens samples "
+                    "this same value, so image and framing stay in agreement.");
+                ImGui::SameLine();
+                ImGui::Text("%.1fx", magnification);
+                if (ImGui::SmallButton("Reset Zoom##scopefov"))
+                    scene.sniperScopeFOV = Scene::kR700ScopeFOVDegrees;
+            }
             ImGui::SliderFloat("Scope UV Rotation",
                                &scene.sniperScopeUVRotationDegrees,
                                -180.0f, 180.0f, "%.1f deg",
@@ -3174,7 +3198,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 "Rolls the scope camera about its own view axis before it "
                 "renders, and rotates the lens sampling by the same angle so "
                 "the two bases stay in agreement. The aim direction does not "
-                "move -- only the horizon orientation inside the lens.");
+                "move, and the displayed horizon stays aligned with the main view.");
             ImGui::SameLine();
             if (ImGui::SmallButton("Level Roll##scopecamroll"))
                 scene.sniperScopeCameraRollDegrees = 0.0f;
