@@ -72,7 +72,16 @@ cbuffer ObjectBuffer : register(b3) {
     // Glass Fresnel response; see the isGlass branch below.
     float glassClarity;
     float glassGrazing;
-    float3 glassPadding;
+    // The scope camera's focal lengths, 1/tan(fov/2) per axis; see the
+    // isSniperGlass branch. Zero when no scope camera rendered this frame.
+float sniperScopeFocalX;
+float sniperScopeFocalY;
+float sniperScopeUVRotation;
+    // Orientation debug key; opens its own 16-byte register at byte 160.
+    float sniperScopeDebugMode;
+    float sniperScopeDebugPad0;
+    float sniperScopeDebugPad1;
+    float sniperScopeDebugPad2;
 };
 
 struct PointLightData {
@@ -1323,7 +1332,112 @@ float4 main(PS_INPUT input) : SV_TARGET
               ambientOcclusion * surfaceSpecularScale * multiScatter *
               ambientLightingIntensity;
 
-    if (isGlass) {
+    if (isSniperGlass && useTexture > 0.5) {
+        // The R700 lens receives the secondary camera as its albedo texture.
+        //
+        // The sample coordinate comes from the fragment's own view ray, not
+        // from input.texCoord. The scope target is a camera image, so its
+        // mapping is fixed by where this fragment sits in the view -- whereas
+        // the mesh UV is the artist's unwrap of the glass disc, carrying an
+        // arbitrary rotation and handedness that showed up directly as a
+        // rotated and mirrored image inside the lens.
+        //
+        // The scope camera shares this camera's position and orientation and
+        // differs only in FOV, so projecting this ray through the scope's own
+        // focal lengths reproduces its framing exactly. That also keeps the
+        // lens locked to the world behind it as the rifle moves, so no
+        // tangent-space parallax term is needed -- and that term suffered from
+        // the same authored-basis dependence as the UV it accompanied.
+        // Rotated by the view matrix the same way the vertex shader does
+        // (row-vector convention, mul(vector, matrix)); w is 0 because this is
+        // a direction, so the translation column is correctly ignored.
+        const float3 lensRay = normalize(input.fragPos - viewPos);
+        const float3 rayView = mul(float4(lensRay, 0.0), view).xyz;
+        // Behind the eye is not representable in the scope's projection; fall
+        // back to the lens centre rather than sampling a mirrored coordinate.
+        const float rayForward = max(rayView.z, 1e-4);
+        // The scope camera's own focal lengths. It renders a square target, so
+        // these are not the main camera's -- falling back to projection._11/_22
+        // only matters if no scope pass ran, where showing the surrounding view
+        // undistorted beats showing a stretched one.
+        const float2 scopeFocal = sniperScopeFocalY > 0.0
+            ? float2(sniperScopeFocalX, sniperScopeFocalY)
+            : float2(projection._11, projection._22);
+        const float2 scopeNDC = (rayView.xy / rayForward) * scopeFocal;
+        // Basic picture-in-picture: no lens bulge or parallax. Rotation is
+        // applied only to the completed target's sampling coordinates.
+        //
+        // Measured from a screen recording of a rightward pan: the lens content
+        // tracked VERTICALLY while the world moved horizontally. The scope
+        // target's axes are transposed relative to this sampling basis, so the
+        // fix is to swap the components -- x drives v and y drives u -- rather
+        // than to rotate, which would pair the axes correctly but leave one of
+        // them reversed.
+        //
+        // Straight mapping, no transposition: view X drives u, view Y drives v.
+        //
+        // u is negated because the lens is looked THROUGH rather than at, which
+        // reverses the horizontal sense; v is negated for the usual D3D
+        // top-down texture origin. Both signs were settled against the real
+        // image rather than derived -- the earlier swap was a misreading of a
+        // horizontal mirror as an axis transposition.
+        //
+        // SGE_SCOPE_UV_DEBUG: set sniperScopeUVRotation to exactly 1000 to
+        // draw an orientation key over the lens instead of tuning by eye.
+        // See the marker block below.
+        const float2 scopeAxes = float2(-scopeNDC.x, -scopeNDC.y);
+        float2 scopeUV = float2(0.5, 0.5) + scopeAxes * 0.5;
+        float scopeSin;
+        float scopeCos;
+        sincos(-sniperScopeUVRotation, scopeSin, scopeCos);
+        const float2 scopeCenteredUV = scopeUV - float2(0.5, 0.5);
+        scopeUV = saturate(float2(0.5, 0.5) + float2(
+            scopeCenteredUV.x * scopeCos - scopeCenteredUV.y * scopeSin,
+            scopeCenteredUV.x * scopeSin + scopeCenteredUV.y * scopeCos));
+#ifdef SGE_TERRAIN_PBR
+        const float3 scopeSample =
+            albedoMap.Sample(texSampler, float3(scopeUV, 0)).rgb;
+#else
+        const float3 scopeSample =
+            SGE_MATERIAL_ALBEDO.Sample(texSampler, scopeUV).rgb;
+#endif
+        // The lens target is linear HDR already. The old pow(,2.2) undid an
+        // sRGB encoding the LDR target used to carry; applying it to linear
+        // radiance would darken the image and crush its midtones. The main
+        // view tone-maps this result once, below.
+        float3 scopeRadiance = max(scopeSample, 0.0);
+        // Orientation key. Tints the SAMPLED image by quadrant, so what you
+        // see names the axes it came from instead of having to infer them from
+        // world content. UV space has v increasing downward, so:
+        //
+        //   BLUE  = -u -v (top-left)      RED    = +u -v (top-right)
+        //   GREEN = -u +v (bottom-left)   YELLOW = +u +v (bottom-right)
+        //
+        // Red and blue exchanged means u is mirrored; the whole set rotated a
+        // quarter turn means u and v are transposed. That tells a mirror from
+        // a swap in one look, which guessing sign combinations cannot.
+        if (sniperScopeDebugMode > 0.5)
+        {
+            // Tint by quadrant rather than by edge band. The visible part of
+            // the lens only covers the middle of UV space, so edge bands at
+            // 0/1 were never sampled and the key drew nothing at all.
+            // Quadrants always cover whatever the lens does show.
+            //
+            // Blended over the image, not replacing it, so world content stays
+            // readable underneath while the axes are being judged.
+            const float3 quadrant =
+                (scopeUV.x >= 0.5)
+                    ? ((scopeUV.y >= 0.5) ? float3(1.0, 1.0, 0.0)   // +u +v
+                                          : float3(1.0, 0.0, 0.0))  // +u -v
+                    : ((scopeUV.y >= 0.5) ? float3(0.0, 1.0, 0.0)   // -u +v
+                                          : float3(0.0, 0.0, 1.0)); // -u -v
+            scopeRadiance = lerp(scopeRadiance, quadrant, 0.45);
+        }
+        // The R700 scope is deliberately the simplest useful implementation:
+        // display the camera image directly with no glass/reflection blend.
+        result = scopeRadiance;
+        surfaceOpacity = 1.0;
+    } else if (isGlass) {
         // The transparent PSO uses straight alpha. Specular terms already carry
         // their Fresnel weight, so letting blending multiply them by alpha again
         // made every reflection vanish. Convert the glass result to the source

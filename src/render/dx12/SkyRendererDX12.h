@@ -178,7 +178,10 @@ public:
         desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         desc.SampleDesc.Count = 1;
         hr = g_dx12.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipelineState));
-        if (FAILED(hr) || !constants.Create(FRAME_COUNT)) return false;
+        // Two draws can coexist in one command list: the sniper's off-screen
+        // camera and the main view. Separate upload slots prevent the later main
+        // sky constants from overwriting what the scope draw has not consumed.
+        if (FAILED(hr) || !constants.Create(FRAME_COUNT * 2)) return false;
         desc.PS = { hdrPs->GetBufferPointer(), hdrPs->GetBufferSize() };
         desc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         if (FAILED(g_dx12.device->CreateGraphicsPipelineState(
@@ -332,7 +335,8 @@ public:
                 const XMFLOAT3& lightDirection, float time,
                 bool physicalAtmosphere, bool volumetricClouds,
                 const XMFLOAT4& atmosphereParams,
-                const XMFLOAT4& cloudParams) {
+                const XMFLOAT4& cloudParams, UINT renderSlot = 0,
+                float aspectRatioOverride = 0.0f) {
         if (!initialized) return;
         // camera.Up is always world-up, not the camera's actual up. Building the
         // ray basis straight from it collapses the image plane as pitch nears
@@ -348,7 +352,9 @@ public:
         XMStoreFloat3(&data.cameraRight, right);
         XMStoreFloat3(&data.cameraUp, up);
         data.tanHalfFov = tanf(XMConvertToRadians(fovDegrees) * 0.5f);
-        data.aspectRatio = (float)g_dx12.screenWidth / (float)g_dx12.screenHeight;
+        data.aspectRatio = aspectRatioOverride > 0.0f
+            ? aspectRatioOverride
+            : (float)g_dx12.screenWidth / (float)g_dx12.screenHeight;
         data.environmentRotation = kSkyEnvironmentRotationRadians;
         XMVECTOR sun = XMVector3Normalize(XMLoadFloat3(&lightDirection));
         XMStoreFloat3(&data.sunDirection, sun);
@@ -377,7 +383,9 @@ public:
             sunLensColor.x, sunLensColor.y, sunLensColor.z,
             sunHaloIntensity
         };
-        constants.CopyData(g_dx12.frameIndex, data);
+        const UINT constantIndex = g_dx12.frameIndex * 2 +
+            (std::min)(renderSlot, 1u);
+        constants.CopyData(constantIndex, data);
 
         g_dx12.commandList->SetPipelineState(hdrTargetEnabled
             ? hdrPipelineState.Get()
@@ -385,7 +393,8 @@ public:
         g_dx12.commandList->SetGraphicsRootSignature(rootSignature.Get());
         ID3D12DescriptorHeap* heaps[] = { srvHeap.Get() };
         g_dx12.commandList->SetDescriptorHeaps(1, heaps);
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(0, constants.GetGPUAddress(g_dx12.frameIndex));
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(
+            0, constants.GetGPUAddress(constantIndex));
         g_dx12.commandList->SetGraphicsRootDescriptorTable(1, srvHeap->GetGPUDescriptorHandleForHeapStart());
         D3D12_GPU_DESCRIPTOR_HANDLE cloudTable =
             srvHeap->GetGPUDescriptorHandleForHeapStart();

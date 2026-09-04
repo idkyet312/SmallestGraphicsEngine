@@ -781,6 +781,32 @@ inline void FillFrameMatrixBufferForIndirect(ShaderDX12& matrixShader,
 // Full id Tech–style frame.
 // Pass 1: Visibility rasterisation
 // Pass 2+3 (combined in visbuf_resolve_cs): G-Buffer fill + deferred lighting
+// Per-view VB draw state.
+//
+// These were function-level statics inside RenderVBDraw, which is correct
+// while one camera renders per frame. The sniper scope runs the same function
+// a second time in the same frame against a different projection: sharing one
+// culling context would have the scope's compacted indirect stream overwrite
+// the main view's before the GPU consumed it.
+//
+// The immutable mesh IDs stay shared deliberately -- they index the one
+// geometry pool, and re-registering them per view would duplicate the pool.
+struct VBViewDrawState {
+    GPUDrivenVisibilityContext gpuCulled;
+    GPUDrivenVisibilityContext gpuDoubleSided;
+    std::vector<VBDrawItem> drawItems;
+    std::vector<UINT> dcIDs;
+    std::vector<VBDrawItem> registeredItems;
+    std::vector<UINT> directDraws;
+};
+
+// Slot 0 is the main view, slot 1 the scope. Indexed rather than passed so the
+// existing main-view call signature is unchanged.
+inline VBViewDrawState& VBDrawStateForView(UINT viewSlot) {
+    static VBViewDrawState states[2];
+    return states[viewSlot < 2 ? viewSlot : 0];
+}
+
 inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
                          VisibilityBufferDX12& vb,
                          const GeometryBuffers& geo,
@@ -791,12 +817,17 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
                          bool useHZBOcclusion,
                          const XMMATRIX& previousViewProjection,
                          const std::shared_ptr<SceneMaterial>& floorMaterial,
-                         const std::shared_ptr<SceneNode>& importedScene = nullptr) {
+                         const std::shared_ptr<SceneNode>& importedScene = nullptr,
+                         UINT viewSlot = 0) {
+    // Per-view draw state. Defaults to slot 0, so every existing call site
+    // keeps the exact buffers it had when these were function statics.
+    VBViewDrawState& viewState = VBDrawStateForView(viewSlot);
+    const bool isScopeView = viewSlot != 0;
     XMMATRIX view = scene.GetViewMatrix();
     XMMATRIX proj = scene.GetProjectionMatrix();
 
     // Build draw item list
-    static std::vector<VBDrawItem> drawItems;
+    std::vector<VBDrawItem>& drawItems = viewState.drawItems;
     BuildSceneDrawItems(scene, drawItems, floorMaterial, importedScene);
 
     // CPU retains only cheap material ordering/backface rejection. GPU decides
@@ -826,10 +857,10 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         const auto& cluster = scene.clusteredRenderer.clusters[clusterIndex];
         vb.SetCluster(clusterIndex, (UINT)cluster.lightCount, cluster.lightIndices);
     }
-    static std::vector<UINT> dcIDs;
+    std::vector<UINT>& dcIDs = viewState.dcIDs;
     dcIDs.clear();
     dcIDs.reserve(drawItems.size());
-    static std::vector<VBDrawItem> registeredItems;
+    std::vector<VBDrawItem>& registeredItems = viewState.registeredItems;
     registeredItems.clear();
     registeredItems.reserve(drawItems.size());
 
@@ -877,8 +908,8 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
     // PSO state cannot change inside ExecuteIndirect. Keep separate compacted
     // streams for culled and double-sided opaque indexed geometry. Alpha-cutout
     // draws retain direct submission because each batch needs its own texture SRV.
-    static GPUDrivenVisibilityContext gpuCulled;
-    static GPUDrivenVisibilityContext gpuDoubleSided;
+    GPUDrivenVisibilityContext& gpuCulled = viewState.gpuCulled;
+    GPUDrivenVisibilityContext& gpuDoubleSided = viewState.gpuDoubleSided;
     if (!gpuCulled.initialized)
         gpuCulled.Init(vb.visPassRootSig.Get(), vb.bindlessVisPassRootSig.Get());
     if (!gpuDoubleSided.initialized)
@@ -894,7 +925,7 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
 
     UINT culledCount = 0;
     UINT doubleSidedCount = 0;
-    static std::vector<UINT> directDraws;
+    std::vector<UINT>& directDraws = viewState.directDraws;
     directDraws.clear();
     directDraws.reserve(drawCount);
 
@@ -1087,31 +1118,38 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         // in a mismatched state for no benefit. The next pass sets its own
         // root signature and PSO before it draws anything.
     }
-    g_terrainInVisibilityBuffer = vb.terrainVisibilityActiveThisFrame;
-    // Only claim the chunks for the resolve when the toggle is on AND no chunk
-    // this frame failed to register. A registration failure leaves the forward
-    // pass responsible, which is the safe direction: chunks drawn twice cost
-    // performance, chunks drawn by nobody are invisible.
-    //
-    // Deliberately NOT conditioned on "some chunks were seen". A frame where
-    // every chunk is culled or the batch list is momentarily empty says nothing
-    // about ownership, and flipping the flag on those frames hands the chunks
-    // back and forth between the two passes. Both write the shared depth
-    // buffer, and the toggle invalidates temporal history, so the oscillation
-    // destabilises everything the resolve shades from that depth -- terrain
-    // most visibly, since it covers the screen.
-    const bool destructionOwnedNow = vb.DestructionVisibilityRequested() &&
+    // Ownership flags and their diagnostics describe which pass draws terrain
+    // and destruction chunks in the MAIN view. The scope renders the same
+    // world through its own pass; letting it write these would hand the main
+    // view's forward pass a decision made for a different frustum, and would
+    // corrupt the flicker counters the ownership investigation reads.
+    if (!isScopeView) {
+        g_terrainInVisibilityBuffer = vb.terrainVisibilityActiveThisFrame;
+        // Only claim the chunks for the resolve when the toggle is on AND no chunk
+        // this frame failed to register. A registration failure leaves the forward
+        // pass responsible, which is the safe direction: chunks drawn twice cost
+        // performance, chunks drawn by nobody are invisible.
+        //
+        // Deliberately NOT conditioned on "some chunks were seen". A frame where
+        // every chunk is culled or the batch list is momentarily empty says nothing
+        // about ownership, and flipping the flag on those frames hands the chunks
+        // back and forth between the two passes. Both write the shared depth
+        // buffer, and the toggle invalidates temporal history, so the oscillation
+        // destabilises everything the resolve shades from that depth -- terrain
+        // most visibly, since it covers the screen.
+        const bool destructionOwnedNow = vb.DestructionVisibilityRequested() &&
         destructionChunksRegistered == destructionChunksSeen;
-    // Diagnostics for the chunk-flicker investigation: count how often the
-    // owner changes and how often a registration failure is what forced it.
-    if (destructionOwnedNow != g_destructionInVisibilityBuffer)
+        // Diagnostics for the chunk-flicker investigation: count how often the
+        // owner changes and how often a registration failure is what forced it.
+        if (destructionOwnedNow != g_destructionInVisibilityBuffer)
         ++g_destructionOwnershipFlips;
-    if (vb.DestructionVisibilityRequested() &&
+        if (vb.DestructionVisibilityRequested() &&
         destructionChunksRegistered != destructionChunksSeen)
         ++g_destructionRegistrationFailFrames;
-    g_destructionChunksSeenThisFrame = destructionChunksSeen;
-    g_destructionChunksRegisteredThisFrame = destructionChunksRegistered;
-    g_destructionInVisibilityBuffer = destructionOwnedNow;
+        g_destructionChunksSeenThisFrame = destructionChunksSeen;
+        g_destructionChunksRegisteredThisFrame = destructionChunksRegistered;
+        g_destructionInVisibilityBuffer = destructionOwnedNow;
+    }
 
     vb.EndVisibilityPass(g_dx12.commandList.Get());
     }

@@ -76,9 +76,31 @@ public:
     static constexpr UINT MaxInstancesPerFrame = 4096;
     UploadBuffer<MeshInstanceDataDX12> instanceBuffer;
     UINT currentInstance = 0;
+    // Per-view instance slices. The buffer is one slice per in-flight frame,
+    // which the scope's second camera pass would otherwise share with the main
+    // view and overwrite mid-frame. Splitting the frame's slice in two keeps
+    // the total allocation unchanged.
+    static constexpr UINT kViewSlices = 2;
+    static constexpr UINT kInstancesPerView =
+        MaxInstancesPerFrame / kViewSlices;
+    UINT currentViewSlot = 0;
+
+    // Re-bases instance writes onto a view's slice. Does not reset the frame's
+    // statistics -- those accumulate across both views by design.
+    void BeginView(UINT viewSlot) {
+        currentViewSlot = (viewSlot < kViewSlices) ? viewSlot : 0;
+        currentInstance = 0;
+    }
+
+    // Base element of the active view's slice within the active frame.
+    UINT ViewInstanceBase() const {
+        return g_dx12.frameIndex * MaxInstancesPerFrame +
+               currentViewSlot * kInstancesPerView;
+    }
 
     void BeginFrame() {
         dispatchesThisFrame = 0;
+        currentViewSlot = 0;
         meshletsThisFrame = 0;
         batchesThisFrame = 0;
         instancesThisFrame = 0;
@@ -407,8 +429,7 @@ public:
         // valid fallback VA bound: some drivers may speculatively evaluate the
         // instance-buffer branch despite instancingEnabled being zero.
         commandList6->SetGraphicsRootShaderResourceView(18,
-            instanceBuffer.GetGPUAddress(
-                g_dx12.frameIndex * MaxInstancesPerFrame));
+            instanceBuffer.GetGPUAddress(ViewInstanceBase()));
         const D3D12_GPU_DESCRIPTOR_HANDLE activeOcclusionHandle =
             bindlessActive && bindlessOcclusionDepthHandle.ptr
                 ? bindlessOcclusionDepthHandle : occlusionDepthHandle;
@@ -463,9 +484,9 @@ public:
         if (models.size() < 2 || !CanDraw(totalMeshlets, meshletDescAddress,
                 meshletBoundsAddress, meshletVertexIndexAddress,
                 meshletTriangleAddress)) return false;
-        if (models.size() > MaxInstancesPerFrame - currentInstance) return false;
+        if (models.size() > kInstancesPerView - currentInstance) return false;
 
-        const UINT frameBase = g_dx12.frameIndex * MaxInstancesPerFrame;
+        const UINT frameBase = ViewInstanceBase();
         const UINT instanceBase = currentInstance;
         for (const DirectX::XMMATRIX& model : models) {
             MeshInstanceDataDX12 instance = {};

@@ -207,7 +207,7 @@ inline void RenderPlayerHUD(const Scene& scene) {
     // Camera::Yaw is degrees, 0 along +X and increasing counter-clockwise, while
     // a compass runs clockwise from north. ScreenHeading below converts once so
     // every tick after it is plain compass degrees.
-    if (scene.player.health > 0.0f && scene.sniperScopeBlend < 0.25f) {
+    if (scene.player.health > 0.0f) {
         constexpr float kStripWidth = 420.0f;
         constexpr float kDegreesAcross = 120.0f;   // span visible end to end
         const float pixelsPerDegree = kStripWidth / kDegreesAcross;
@@ -287,12 +287,10 @@ inline void RenderPlayerHUD(const Scene& scene) {
     //
     // Two parts: a task line under the compass saying what to do, and a marker
     // block in the top-left corner naming it as the primary objective. Only
-    // drawn on levels that carry a tower, and hidden behind the sniper scope
-    // like the rest of the HUD so it cannot sit on top of the reticle.
+    // drawn on levels that carry a tower.
     {
         float towerHealth = 0.0f, towerMaxHealth = 0.0f;
-        if (scene.sniperScopeBlend < 0.25f &&
-            CommTowerObjectiveStatus(towerHealth, towerMaxHealth)) {
+        if (CommTowerObjectiveStatus(towerHealth, towerMaxHealth)) {
             const float towerFraction = (std::max)(0.0f, (std::min)(1.0f,
                 towerHealth / (std::max)(1.0f, towerMaxHealth)));
 
@@ -354,8 +352,7 @@ inline void RenderPlayerHUD(const Scene& scene) {
         DirectX::XMFLOAT3 planePosition{};
         float planeHealth = 0.0f, planeMaxHealth = 0.0f;
         bool planeDown = false;
-        if (scene.sniperScopeBlend < 0.25f &&
-            ObjectivePlaneStatus(planePosition, planeHealth, planeMaxHealth,
+        if (ObjectivePlaneStatus(planePosition, planeHealth, planeMaxHealth,
                                  planeDown)) {
             const DirectX::XMMATRIX viewProjection =
                 scene.GetViewMatrix() * scene.GetProjectionMatrix();
@@ -439,111 +436,6 @@ inline void RenderPlayerHUD(const Scene& scene) {
         }
     }
 
-    if (scene.sniperScopeBlend > 0.01f) {
-        const float blend = (std::min)(1.0f, scene.sniperScopeBlend);
-        const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
-        const float radius = (std::min)(io.DisplaySize.x, io.DisplaySize.y) * 0.455f;
-        const float outerRadius = std::sqrt(
-            io.DisplaySize.x * io.DisplaySize.x + io.DisplaySize.y * io.DisplaySize.y);
-        const int shadeAlpha = static_cast<int>(255.0f * blend);
-        const ImU32 shade = IM_COL32(0, 0, 0, shadeAlpha);
-        constexpr int segments = 160;
-
-        // Everything outside the lens is solid black, with no falloff. Looking
-        // through a real scope the tube wall is simply opaque -- the eye sees
-        // the bright circle of glass and nothing else, so a soft vignette or a
-        // grey surround reads as a HUD overlay instead of an optic.
-        //
-        // Drawn as ONE thick stroked ring rather than a fan of quads from the
-        // lens edge out to the corners. Each quad in such a fan carries its own
-        // anti-aliased edge, and the shared edges between neighbours do not
-        // cancel: they leave 160 faint radial seams seen as streaks seemingly
-        // radiating out of the scope. A single polyline has no interior edges.
-        const float ringRadius = (radius + outerRadius) * 0.5f;
-        const float ringThickness = outerRadius - radius;
-        draw->AddCircle(center, ringRadius, shade, segments, ringThickness);
-
-        // Only a slight darkening right at the glass edge, over the last few
-        // percent of the radius. Enough to round the transition into the tube
-        // without washing the image the way a broad gradient does.
-        constexpr int kEdgeBands = 6;
-        const float edgeStart = radius * 0.93f;
-        for (int band = 0; band < kEdgeBands; ++band) {
-            const float t0 = (float)band / kEdgeBands;
-            const float t1 = (float)(band + 1) / kEdgeBands;
-            const float r0 = edgeStart + (radius - edgeStart) * t0;
-            const float r1 = edgeStart + (radius - edgeStart) * t1;
-            const int bandAlpha = (int)(170.0f * t1 * t1 * blend);
-            if (bandAlpha <= 1) continue;
-            for (int i = 0; i < segments; ++i) {
-                const float a0 = 6.2831853f * (float)i / segments;
-                const float a1 = 6.2831853f * (float)(i + 1) / segments;
-                draw->AddQuadFilled(
-                    ImVec2(center.x + std::cos(a0) * r0,
-                           center.y + std::sin(a0) * r0),
-                    ImVec2(center.x + std::cos(a0) * r1,
-                           center.y + std::sin(a0) * r1),
-                    ImVec2(center.x + std::cos(a1) * r1,
-                           center.y + std::sin(a1) * r1),
-                    ImVec2(center.x + std::cos(a1) * r0,
-                           center.y + std::sin(a1) * r0),
-                    IM_COL32(0, 0, 0, bandAlpha));
-            }
-        }
-
-        // Tube edge: a hard dark rim with a faint lit lip inside it, which is
-        // all the housing that is actually visible down the eyepiece.
-        draw->AddCircle(center, radius, IM_COL32(6, 7, 8, shadeAlpha),
-                        segments, 6.0f);
-        draw->AddCircle(center, radius - 3.5f,
-                        IM_COL32(120, 126, 130,
-                                 static_cast<int>(110.0f * blend)),
-                        segments, 1.4f);
-
-        const int lineAlpha = static_cast<int>(225.0f * blend);
-        const ImU32 reticleShadow = IM_COL32(0, 0, 0,
-                                             static_cast<int>(150.0f * blend));
-        const ImU32 reticleLine = IM_COL32(26, 28, 30, lineAlpha);
-
-        // Clipped to the glass so no line runs out over the tube.
-        draw->PushClipRect(
-            ImVec2(center.x - radius, center.y - radius),
-            ImVec2(center.x + radius, center.y + radius), true);
-
-        // Plain crosshair: two thin dark hairlines spanning the full lens,
-        // uninterrupted through the middle. Etched glass reads as fine dark
-        // lines against the image, not bright ones -- the pale reticle and
-        // thick duplex posts this replaces looked like a drawn-on HUD.
-        const float span = radius;
-        draw->AddLine(ImVec2(center.x - span, center.y + 1.0f),
-                      ImVec2(center.x + span, center.y + 1.0f),
-                      reticleShadow, 2.2f);
-        draw->AddLine(ImVec2(center.x + 1.0f, center.y - span),
-                      ImVec2(center.x + 1.0f, center.y + span),
-                      reticleShadow, 2.2f);
-        draw->AddLine(ImVec2(center.x - span, center.y),
-                      ImVec2(center.x + span, center.y), reticleLine, 1.3f);
-        draw->AddLine(ImVec2(center.x, center.y - span),
-                      ImVec2(center.x, center.y + span), reticleLine, 1.3f);
-
-        // Sparse graduation ticks along both hairlines, short and unlabelled.
-        for (int mark = 1; mark <= 6; ++mark) {
-            const float offset = radius * 0.13f * mark;
-            const float tick = (mark % 2) ? 3.5f : 6.0f;
-            for (int sidei = 0; sidei < 2; ++sidei) {
-                const float side = sidei ? 1.0f : -1.0f;
-                const float x = center.x + side * offset;
-                draw->AddLine(ImVec2(x, center.y - tick),
-                              ImVec2(x, center.y + tick), reticleLine, 1.2f);
-                const float y = center.y + side * offset;
-                draw->AddLine(ImVec2(center.x - tick, y),
-                              ImVec2(center.x + tick, y), reticleLine, 1.2f);
-            }
-        }
-
-        draw->PopClipRect();
-    }
-
     if (scene.player.godMode) {
         const char* god = "GOD MODE";
         const ImVec2 size = ImGui::CalcTextSize(god);
@@ -555,7 +447,7 @@ inline void RenderPlayerHUD(const Scene& scene) {
         draw->AddText(ImVec2(godX, godY), IM_COL32(255, 220, 65, 245), god);
     }
 
-    if (scene.player.health > 0.0f && scene.sniperScopeBlend < 0.25f) {
+    if (scene.player.health > 0.0f) {
         const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
         // Four independent arms around a fixed centre. The resting gap is the
         // floor; scene.crosshairSpread pushes all four outward together as
@@ -3187,6 +3079,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 "Opacity at glancing angles, where a real lens becomes a sky "
                 "reflection. Keep below 1 or the glass reads as a solid disc.");
 
+
             ImGui::BeginDisabled(!scene.opticWorldDotVisible);
             // The emissive dot is placed apart from the sight body, so moving
             // the mount leaves it behind until it is re-centred in the glass.
@@ -3254,6 +3147,71 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             // alignment these sliders exist to fix is only visible in ADS.
             ImGui::TextDisabled("hold RMB to check alignment");
         }
+
+        // Sniper scope. Deliberately outside the red-dot block above: the R700's
+        // scope is part of the rifle, not an attachment, so gating it on the
+        // red dot hid it behind an optic the weapon never mounts. Keyed to the
+        // same R700Selected() the scope pass itself uses, so the panel appears
+        // exactly when there is a scope image to judge.
+        if (GunModel::R700Selected()) {
+            ImGui::SeparatorText("Sniper Scope");
+            ImGui::SliderFloat("Scope UV Rotation",
+                               &scene.sniperScopeUVRotationDegrees,
+                               -180.0f, 180.0f, "%.1f deg",
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SetItemTooltip(
+                "Rotates the rendered scope target around its UV centre "
+                "without changing where the scope camera points.");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reset UV##scopeuvrot"))
+                scene.sniperScopeUVRotationDegrees =
+                    Scene::kR700ScopeUVRotationDegrees;
+            ImGui::SliderFloat("Scope Camera Roll",
+                               &scene.sniperScopeCameraRollDegrees,
+                               -180.0f, 180.0f, "%.1f deg",
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SetItemTooltip(
+                "Rolls the scope camera about its own view axis before it "
+                "renders, and rotates the lens sampling by the same angle so "
+                "the two bases stay in agreement. The aim direction does not "
+                "move -- only the horizon orientation inside the lens.");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Level Roll##scopecamroll"))
+                scene.sniperScopeCameraRollDegrees = 0.0f;
+            ImGui::Checkbox("Scope UV Debug Key",
+                            &scene.sniperScopeUVDebug);
+            ImGui::SetItemTooltip(
+                "Tints the sampled scope image by quadrant so the axes can be "
+                "read directly. Correct orientation looks like:\n"
+                "  BLUE  top-left       RED    top-right\n"
+                "  GREEN bottom-left    YELLOW bottom-right\n"
+                "Red and blue swapped left-to-right means u is mirrored. "
+                "Colours rotated a quarter turn means u and v are "
+                "transposed.");
+            if (!scene.sniperPictureInPicture)
+                ImGui::TextDisabled(
+                    "scope target unavailable; lens shows plain glass");
+        }
+
+        // Aim debug ray. Not gated on any weapon or attachment: the whole point
+        // is to compare the shot line against whatever sight is in use, so it
+        // has to be available with every one of them.
+        ImGui::SeparatorText("Aim Debug");
+        ImGui::Checkbox("Hold ADS", &scene.holdAimDownSights);
+        ImGui::SetItemTooltip(
+            "Keeps the weapon sighted without holding right mouse, so the "
+            "alignment sliders can be dragged while the sight picture is up. "
+            "Raises the scope too, on a rifle that has one.");
+        ImGui::Checkbox("Show Aim Ray", &scene.showAimDebugRay);
+        ImGui::SetItemTooltip(
+            "Draws a green beam down the exact line bullets travel: camera "
+            "position along camera forward, with no sway and no muzzle offset. "
+            "Where this lands is where the round goes, so any gap between it "
+            "and a sight picture is that sight's alignment error.");
+        ImGui::BeginDisabled(!scene.showAimDebugRay);
+        ImGui::DragFloat("Aim Ray Range", &scene.aimDebugRayLength,
+                         1.0f, 1.0f, 1000.0f, "%.0f m");
+        ImGui::EndDisabled();
 
         ImGui::Checkbox("Auto Fire", &scene.autoFire);
         ImGui::DragFloat("Fire Interval", &scene.fireInterval, 0.005f, 0.02f, 1.0f, "%.3f s");

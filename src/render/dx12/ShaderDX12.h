@@ -171,7 +171,24 @@ struct alignas(256) ObjectBufferDX12 {
     // float that padded the register above, so nothing shifts.
     float glassClarity = 0.16f;   // opacity looking straight through
     float glassGrazing = 0.86f;   // opacity at glancing angles; keep under 1
-    float glassPadding[3] = {};
+    // The scope camera's own focal lengths (1/tan(fov/2) per axis), so the
+    // sniper lens can project a view ray into the scope target without knowing
+    // that camera's FOV. Two values rather than one ratio because the scope
+    // renders a square target while the main view is wide: a single scale
+    // cannot be correct on both axes. Takes two of the padding floats above,
+    // so no existing offset moves. Zero means "no scope camera this frame" and
+    // the lens falls back to the main projection, showing what surrounds it.
+    float sniperScopeFocalX = 0.0f;
+    float sniperScopeFocalY = 0.0f;
+    float sniperScopeUVRotation = 0.0f;
+    // Scope orientation debug key. Opens a new 16-byte register at byte 160
+    // rather than squeezing into the one above, so every offset asserted
+    // below keeps its value. Non-zero draws direction markers over the lens;
+    // see the isSniperGlass branch in clustered_dx12_ps.hlsl.
+    float sniperScopeDebugMode = 0.0f;
+    float sniperScopeDebugPad0 = 0.0f;
+    float sniperScopeDebugPad1 = 0.0f;
+    float sniperScopeDebugPad2 = 0.0f;
 };
 
 static_assert(offsetof(ObjectBufferDX12, bindlessTextureIndices) == 96,
@@ -182,6 +199,16 @@ static_assert(offsetof(ObjectBufferDX12, seeThroughNear) == 128,
               "see-through tuning must start its own 16-byte cbuffer register");
 static_assert(offsetof(ObjectBufferDX12, glassClarity) == 140,
               "glass tuning must follow seeThroughNearAlpha in the HLSL cbuffer");
+static_assert(offsetof(ObjectBufferDX12, sniperScopeFocalX) == 148,
+              "scope focal lengths must take the first glass padding floats");
+static_assert(offsetof(ObjectBufferDX12, sniperScopeUVRotation) == 156,
+              "scope UV rotation must close the glass cbuffer register");
+static_assert(offsetof(ObjectBufferDX12, sniperScopeDebugMode) == 160,
+              "scope debug must open a new 16-byte register, not shift the "
+              "glass register above it");
+static_assert(sizeof(ObjectBufferDX12) % 16 == 0,
+              "ObjectBufferDX12 must stay 16-byte aligned; HLSL re-pads to 16 "
+              "and C++ does not, so a short tail silently desyncs the layout");
 
 // A light in the punctual list. Spotlights ride the same array rather than a
 // buffer of their own: the flashlight is the only one, and a second cbuffer
@@ -490,6 +517,14 @@ public:
     // parameter SetObjectMaterial would cost every unrelated call site.
     float glassClarity = 0.16f;
     float glassGrazing = 0.86f;
+    // The scope camera's focal lengths, for the sniper lens. Zero when no
+    // scope target was rendered this frame. Sticky for the same reason as the
+    // glass tuning above.
+    float sniperScopeFocalX = 0.0f;
+    float sniperScopeFocalY = 0.0f;
+    // Non-zero draws the lens orientation key. Set alongside the focal
+    // lengths, so it follows the same sticky per-frame lifetime.
+    float sniperScopeDebugMode = 0.0f;
     bool drawWireframe = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
@@ -521,6 +556,10 @@ public:
     // written instead of an unwritten slot at currentDrawCall.
     UINT currentDrawCall = 0;
     UINT activeMatrixDrawCall = 0;
+    // Which per-view slice draws currently record into. 0 (main) unless the
+    // scope pass has re-based it, so every existing call site is unaffected.
+    UINT currentViewSlot = 0;
+    UINT viewDrawCalls[2] = { 0, 0 };
     UINT currentSrvOffset = 0; // For material descriptors
 
     // The shared CBV/SRV/UAV heap is carved into three regions:
@@ -1630,11 +1669,12 @@ public:
         g_dx12.commandList->SetGraphicsRootSignature(currentDrawBindless
             ? bindlessRootSignature.Get() : rootSignature.Get());
         BindFrameConstants();
-        if (activeMatrixDrawCall < MAX_DRAW_CALLS_PER_FRAME)
+        if (activeMatrixDrawCall < kDrawCallsPerView)
             g_dx12.commandList->SetGraphicsRootConstantBufferView(
-                0, matrixBuffer.GetGPUAddress(
-                    g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME +
-                    activeMatrixDrawCall));
+                    0, matrixBuffer.GetGPUAddress(
+                        g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME +
+                        currentViewSlot * kDrawCallsPerView +
+                        activeMatrixDrawCall));
         if (currentDrawBindless && bindlessHeap) {
             if (bindlessGlobalTableBase != BINDLESS_INVALID_INDEX)
                 g_dx12.commandList->SetGraphicsRootDescriptorTable(
@@ -1894,6 +1934,43 @@ public:
     // draws found theirs already cached.
     UINT srvCreatesThisFrame = 0;
     UINT srvCacheHitsThisFrame = 0;
+    // --- Per-view draw slices ---
+    //
+    // matrixBuffer/objectBuffer are sized FRAME_COUNT * MAX_DRAW_CALLS_PER_FRAME
+    // and indexed by frameIndex alone. That is one slice per in-flight frame,
+    // which is correct while one camera renders per frame. The sniper scope
+    // renders a second camera into the same frame, and its draws would
+    // otherwise consume -- and overwrite -- the main view's slice while the
+    // main view's own draws are still being recorded.
+    //
+    // Each view gets its own slice within the frame. Capacity per view is
+    // MAX_DRAW_CALLS_PER_FRAME / kViewSlices so the total allocation is
+    // unchanged; the main view keeps the low half at the same base address it
+    // used before when the scope is inactive.
+    static constexpr UINT kViewSlices = 2;
+    static constexpr UINT kDrawCallsPerView =
+        MAX_DRAW_CALLS_PER_FRAME / kViewSlices;
+
+    // Selects the slice subsequent draws record into. BeginFrame resets the
+    // frame; this only re-bases within it, so it must NOT reset per-frame
+    // descriptor state -- calling the frame reset twice would hand out
+    // scratch descriptor slots already in use by the main view.
+    void BeginView(UINT viewSlot) {
+        currentViewSlot = (viewSlot < kViewSlices) ? viewSlot : 0;
+        currentDrawCall = 0;
+        activeMatrixDrawCall = 0;
+        // Root bindings are per-view: the next draw must rebind against this
+        // view's slice rather than inherit the other view's constant address.
+        graphicsRootBound = false;
+    }
+
+    UINT CurrentViewSlot() const { return currentViewSlot; }
+
+    // Draw statistics stay per-view so the scope's draws are not reported as
+    // main-view cost.
+    UINT ViewDrawCalls(UINT viewSlot) const {
+        return viewSlot < kViewSlices ? viewDrawCalls[viewSlot] : 0;
+    }
 
     // Call this at the start of each frame to reset draw call counter
     void BeginFrame() {
@@ -1905,15 +1982,23 @@ public:
         currentDrawBindless = false;
         bindlessGlobalTableBase = BINDLESS_INVALID_INDEX;
         forceLegacyNextMaterial = false;
+        // Both views start the frame empty, and the main view owns slot 0
+        // until a scope pass explicitly re-bases.
+        viewDrawCalls[0] = 0;
+        viewDrawCalls[1] = 0;
+        currentViewSlot = 0;
         // The per-frame scratch region starts ABOVE the persistent one -- resetting
         // to 64 here would hand out slots already owned by cached materials and
         // scribble over their descriptors.
         currentSrvOffset = kPersistentSrvEnd;
     }
     
-    // Get the buffer index for per-draw-call data
+    // Get the buffer index for per-draw-call data.
+    // Base is the frame's slice plus this view's sub-slice, so the two views
+    // never address the same element within a frame.
     UINT GetDrawCallIndex() const {
-        return g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME + currentDrawCall;
+        return g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME +
+               currentViewSlot * kDrawCallsPerView + currentDrawCall;
     }
     
     void SetMatrices(const XMMATRIX& model, const XMMATRIX& view,
@@ -2029,6 +2114,10 @@ public:
         data.seeThroughNearAlpha = viewmodelSeeThroughNearAlpha;
         data.glassClarity = glassClarity;
         data.glassGrazing = glassGrazing;
+        data.sniperScopeFocalX = sniperScopeFocalX;
+        data.sniperScopeFocalY = sniperScopeFocalY;
+        data.sniperScopeDebugMode = sniperScopeDebugMode;
+        data.sniperScopeUVRotation = 0.0f;
 
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(3, objectBuffer.GetGPUAddress(bufferIndex));
@@ -2094,9 +2183,10 @@ public:
                           float occlusionStrength = 0.0f,
                           float normalYSign = 1.0f,
                           float viewFillStrength = 0.0f,
-                          float specularScale = 1.0f,
-                          float materialType = 0.0f,
-                          float materialTime = 0.0f) {
+                           float specularScale = 1.0f,
+                           float materialType = 0.0f,
+                           float materialTime = 0.0f,
+                           float scopeUVRotation = 0.0f) {
         UINT bufferIndex = GetDrawCallIndex();
 
         ObjectBufferDX12 data;
@@ -2130,6 +2220,10 @@ public:
         data.seeThroughNearAlpha = viewmodelSeeThroughNearAlpha;
         data.glassClarity = glassClarity;
         data.glassGrazing = glassGrazing;
+        data.sniperScopeFocalX = sniperScopeFocalX;
+        data.sniperScopeFocalY = sniperScopeFocalY;
+        data.sniperScopeDebugMode = sniperScopeDebugMode;
+        data.sniperScopeUVRotation = scopeUVRotation;
         if (useNorm && normal) {
             const D3D12_RESOURCE_DESC nd = normal->GetDesc();
             data.normalTexW = (float)nd.Width;
@@ -2343,6 +2437,10 @@ public:
         data.seeThroughNearAlpha = viewmodelSeeThroughNearAlpha;
         data.glassClarity = glassClarity;
         data.glassGrazing = glassGrazing;
+        data.sniperScopeFocalX = sniperScopeFocalX;
+        data.sniperScopeFocalY = sniperScopeFocalY;
+        data.sniperScopeDebugMode = sniperScopeDebugMode;
+        data.sniperScopeUVRotation = 0.0f;
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(
             3, objectBuffer.GetGPUAddress(bufferIndex));
@@ -2350,9 +2448,13 @@ public:
 
     // Call this after each DrawCube/DrawPlane to advance to the next buffer slot
     void NextDrawCall() {
+        if (currentViewSlot < kViewSlices)
+            ++viewDrawCalls[currentViewSlot];
         currentDrawCall++;
-        if (currentDrawCall >= MAX_DRAW_CALLS_PER_FRAME) {
-            currentDrawCall = MAX_DRAW_CALLS_PER_FRAME - 1; // Clamp to avoid overflow
+        // Clamped to the per-view capacity, not the whole frame's: overrunning
+        // into the next slice would scribble over the other view's matrices.
+        if (currentDrawCall >= kDrawCallsPerView) {
+            currentDrawCall = kDrawCallsPerView - 1;
         }
     }
     

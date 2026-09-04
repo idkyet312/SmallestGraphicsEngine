@@ -66,6 +66,7 @@
 #include "ScreenSpaceReflectionsDX12.h"
 #include "MSAADX12.h"
 #include "GrassMSAADX12.h"
+#include "SniperScopeDX12.h"
 #include "CollisionMesh.h"
 #include "SphereMeshCut.h"
 #include "CollisionMeshCache.h"
@@ -5180,7 +5181,7 @@ static void PlayReloadSound() {
     else if (GunModel::LaserSelected())    pitch = 1.28f;
     else if (GunModel::RPGSelected())      pitch = 0.72f;
     else if (GunModel::ShotgunSelected())  pitch = 0.85f;
-    else if (GunModel::SVDSelected())      pitch = 1.06f;
+    else if (GunModel::R700Selected())     pitch = 1.06f;
     pitch += ((float)std::rand() / RAND_MAX) * 0.05f;
     g_reloadAudio.Play(0.85f, pitch);
 }
@@ -5214,7 +5215,7 @@ static bool ShootPlayerWeapon() {
         scene.ShootLaserProjectile();
         const float pitch = 1.65f + ((float)std::rand() / RAND_MAX) * 0.10f;
         g_gunAudio.Play(0.30f, pitch);
-    } else if (GunModel::SVDSelected()) {
+    } else if (GunModel::R700Selected()) {
         // Same round and the same damage either way -- the suppressor changes
         // what the shot sounds like, not what it does. Quieter and pitched up:
         // a can takes the bass out of a report, leaving a flat crack rather
@@ -6774,8 +6775,22 @@ static GrassMSAADX12        grassMSAA;
 static bool                 msaaUsedLastFrame = false;
 static BindlessHeapDX12     bindlessHeap;
 static VisibilityBufferDX12 visBuffer;
+static SniperScopeDX12      g_sniperScope;
 static ShadowMapDX12        shadowMap;
 static GeometryBuffers      geo;
+// Directional shadow state carried to the sniper scope pass.
+//
+// The scope renders early in the frame -- before the main view's shadow pass
+// has run -- so it cannot use this frame's shadow map. The brief calls for one
+// shadow render shared by both views, and the scope frustum is a subset of the
+// main one, so the map from the PREVIOUS frame is reused instead of rendering
+// a second one. Shadows lag the camera by a frame in the lens only; at scope
+// magnification, against a shadow map that is itself camera-fitted and updated
+// every frame, that is far less visible than the alternative of a scope with
+// no shadows at all.
+static XMMATRIX g_scopeShadowLightSpace = XMMatrixIdentity();
+static ID3D12Resource* g_scopeShadowResource = nullptr;
+
 static PackedGeometry       packed;
 static std::shared_ptr<SceneNode> crateModel;
 static std::shared_ptr<SceneNode> crateShadowModel;
@@ -7661,6 +7676,63 @@ static void UpdateIRLaser() {
     scene.irLaser.visible = true;
 }
 
+// Debug beam down the true shot ray, for checking that what a sight shows and
+// where the round goes are the same line.
+//
+// Deliberately NOT the IR designator above. That one starts at the muzzle and
+// carries the viewmodel's idle sway, both of which are presentation: it answers
+// "where is the gun pointing". This answers "where does the bullet go", which is
+// camera.Position along camera.Front with no sway and no muzzle offset, because
+// that is the ray ShootBullet spreads around. Keeping them separate is the whole
+// point -- if the two beams diverge, the difference is exactly the presentation
+// error, which is what makes this useful for aligning an optic.
+static void UpdateAimDebugRay() {
+    scene.aimDebugRay.visible = false;
+    if (!scene.showAimDebugRay) return;
+    if (scene.player.health <= 0.0f) return;
+
+    const XMFLOAT3 origin = scene.camera.Position;
+    const XMVECTOR camFront = XMVector3Normalize(
+        XMLoadFloat3(&scene.camera.Front));
+    XMFLOAT3 direction;
+    XMStoreFloat3(&direction, camFront);
+
+    const float range = (std::max)(1.0f, scene.aimDebugRayLength);
+    const XMFLOAT3 rayEnd{ origin.x + direction.x * range,
+                        origin.y + direction.y * range,
+                        origin.z + direction.z * range };
+
+    // Stop at the first thing hit, so the dot marks the surface a shot would
+    // strike rather than running through it.
+    XMFLOAT3 target = rayEnd;
+    float closestDistanceSq = FLT_MAX;
+    auto accept = [&](const XMFLOAT3& hit) {
+        const float dx = hit.x - origin.x, dy = hit.y - origin.y,
+                    dz = hit.z - origin.z;
+        const float distanceSq = dx * dx + dy * dy + dz * dz;
+        if (distanceSq < closestDistanceSq) {
+            closestDistanceSq = distanceSq;
+            target = hit;
+        }
+    };
+    XMFLOAT3 hit;
+    if (scene.useDestruction && g_destruction.IsInitialized() &&
+        g_destruction.HitTestSegment(origin, rayEnd, 0.03f, hit)) accept(hit);
+    if (HitTerrainSegment(origin, rayEnd, 0.03f, hit)) accept(hit);
+
+    // Pushed off the eye by more than the near plane: a beam starting exactly
+    // at the camera straddles it and smears across the screen.
+    XMFLOAT3 beamStart;
+    XMStoreFloat3(&beamStart, XMLoadFloat3(&origin) + camFront * 0.35f);
+    scene.aimDebugRay.start = beamStart;
+    scene.aimDebugRay.end = target;
+    // Green, so it reads apart from the red rail laser and the white IR beam
+    // when more than one is up at once.
+    scene.aimDebugRay.color = XMFLOAT3{ 0.10f, 1.0f, 0.20f };
+    scene.aimDebugRay.visibility = 1.0f;
+    scene.aimDebugRay.visible = true;
+}
+
 static void BeginLevelLoading() {
     g_uploadHeapRelease.Reset();
     g_game.loading.Begin({
@@ -7745,6 +7817,196 @@ static UINT g_nextImGuiTextureSlot = 1;
 static bool g_thumbnailUploadedThisFrame = false;
 static bool g_prefabEditorSmokeEnabled = false;
 static bool g_prefabEditorSmokeFinished = false;
+
+static UINT RequestedSniperScopeResolution() {
+    char value[16] = {};
+    UINT requested = 1024;
+    if (GetEnvironmentVariableA(
+            "SGE_SCOPE_RESOLUTION", value,
+            static_cast<DWORD>(sizeof(value))) > 0) {
+        const unsigned long parsed = std::strtoul(value, nullptr, 10);
+        if (parsed > 0) requested = static_cast<UINT>(parsed);
+    }
+    // Fixed power-of-two tiers keep the lens sharp without allowing an
+    // accidental environment value to allocate an unbounded render target.
+    if (requested <= 384) return 256;
+    if (requested <= 768) return 512;
+    return 1024;
+}
+
+static void BindSniperScopeMaterial() {
+    const std::shared_ptr<SceneMesh>& rifle = GunModel::R700Mesh();
+    if (!g_sniperScope.Initialized() || !g_sniperScope.HasRenderedOnce() ||
+        !g_sniperScope.Texture() || !rifle) return;
+    for (MeshPrimitive& primitive : rifle->primitives) {
+        const std::shared_ptr<SceneMaterial>& material = primitive.material;
+        if (!material || material->materialType < 8.5f ||
+            material->materialType > 9.5f) continue;
+        if (material->baseColorTexture.Get() == g_sniperScope.Texture())
+            continue;
+        material->baseColorTexture = g_sniperScope.Texture();
+        material->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+        // Kept on the blend PSO for the Fresnel response; the scope-texture
+        // branch writes alpha one when an image is present.
+        material->alphaBlend = true;
+        material->InvalidateTextureBindings();
+    }
+}
+
+// Renders the sniper scope's secondary camera into its own square HDR target.
+//
+// Runs the same visible scene stages as the main view, from an exact copy of
+// the main camera at the scope's field of view. Only the viewmodel and the HUD
+// are excluded: drawing the rifle here would put the lens inside the image it
+// is producing, and sampling the lens texture while rendering into it is a
+// feedback loop.
+//
+// The scope is deliberately kept on the Forward path even when the main view
+// uses the visibility buffer. VB's per-view resources (visibility target,
+// motion, temporal history, exposure, indirect culling output) are sized and
+// keyed for one view; giving the scope its own set is the second half of this
+// work. Forward produces the same lit world through the same shaders, so the
+// lens shows correct content either way.
+static void RenderSniperScopeTexture(float now) {
+    if (!g_sniperScope.ShouldRender(
+            scene.sniperScopeActive && IsSceneScreen() &&
+            !g_game.loading.Active())) return;
+
+    const Camera savedCamera = scene.camera;
+    const XMFLOAT2 savedJitter = scene.temporalJitterPixels;
+    const float savedWidth = scene.renderWidthOverride;
+    const float savedHeight = scene.renderHeightOverride;
+    const bool savedScopePass = scene.sniperScopeCameraPass;
+    const bool savedDrawViewmodel = scene.drawViewmodel;
+
+    // Render from an exact copy of the main camera. Rebuilding its basis here
+    // made the scope react differently near vertical aim and could change its
+    // apparent roll. Position, orientation, roll, near and far planes are all
+    // carried over; only the scope-pass FOV and the square target differ.
+    scene.camera = savedCamera;
+    scene.sniperScopeCameraPass = true;
+    // The one exclusion. Everything else the main view draws, the scope draws.
+    scene.drawViewmodel = false;
+    scene.renderWidthOverride =
+        static_cast<float>(g_sniperScope.Resolution());
+    scene.renderHeightOverride = scene.renderWidthOverride;
+    // No temporal jitter: the scope keeps no TAA history of its own, so a
+    // sub-pixel offset would have nothing to cancel it and would read as the
+    // lens image shimmering.
+    scene.temporalJitterPixels = XMFLOAT2(0.0f, 0.0f);
+    // Roll the scope camera about its own view axis.
+    //
+    // The lens shader reconstructs its sample coordinate from the MAIN
+    // camera's view ray, so rolling this camera alone would make the lens
+    // sample a direction the scope never rendered. The same angle is therefore
+    // applied to the sampling coordinate too (see ForwardRenderer's
+    // scopeUVRotation), which keeps the two bases in agreement.
+    //
+    // Rotating Up about Front leaves the view direction exactly where it was,
+    // so the sight still points where the rifle points -- only the horizon
+    // orientation changes.
+    if (std::fabs(scene.sniperScopeCameraRollDegrees) > 0.0001f) {
+        const XMVECTOR front = XMVector3Normalize(
+            XMLoadFloat3(&scene.camera.Front));
+        const XMVECTOR up = XMLoadFloat3(&scene.camera.Up);
+        const XMMATRIX roll = XMMatrixRotationAxis(
+            front, XMConvertToRadians(scene.sniperScopeCameraRollDegrees));
+        XMFLOAT3 rolledUp;
+        XMStoreFloat3(&rolledUp,
+                      XMVector3Normalize(XMVector3TransformNormal(up, roll)));
+        scene.camera.Up = rolledUp;
+    }
+
+
+    // Re-base the per-frame upload arenas onto the scope's slice. Without this
+    // the scope's draws consume -- and overwrite -- the main view's matrix and
+    // instance records while the main view is still recording its own.
+    mainShader.BeginView(1);
+    g_meshShader.BeginView(1);
+
+    g_sniperScope.Begin(g_dx12.commandList.Get());
+    {
+        ProfilerDX12::Scope profile(
+            g_profiler, "Scope/Forward", g_dx12.commandList.Get());
+        // The scope target is a single-sample linear HDR surface: no MSAA, and
+        // no HDR-target path (that one targets the VB/post chain's own render
+        // target, not this one).
+        mainShader.SetMSAAEnabled(false);
+        mainShader.SetHDRTargetEnabled(false);
+        mainShader.SetExtensionMotionEnabled(false);
+        g_meshShader.SetMSAAEnabled(false);
+        g_meshShader.SetHDRTargetEnabled(false);
+        g_meshShader.SetExtensionMotionEnabled(false);
+        g_terrain.SetMSAAEnabled(false);
+        g_terrain.SetHDRTargetEnabled(false);
+        skyRenderer.SetMSAAEnabled(false);
+        skyRenderer.SetHDRTargetEnabled(false);
+        // The sun disc and its lens artefacts are a main-camera presentation
+        // effect. Through a telescopic sight they would be drawn at the scope's
+        // magnification and dominate the lens.
+        skyRenderer.SetSunLens(false, scene.lightColor,
+            scene.sunAngularRadiusDegrees, scene.sunDiscIntensity,
+            scene.sunHaloIntensity);
+        skyRenderer.Render(
+            scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now,
+            scene.enablePhysicalAtmosphere, false,
+            XMFLOAT4(scene.atmosphereRayleighStrength,
+                     scene.atmosphereMieStrength,
+                     scene.atmosphereMieAnisotropy,
+                     scene.atmosphereAerialDensity),
+            XMFLOAT4(0.0f, 0.0f, scene.atmosphereCloudBaseHeight,
+                     scene.atmosphereCloudThickness),
+            1, 1.0f);
+
+        // World geometry, terrain, foliage and grass, lit by the shadow map
+        // the previous frame produced for the main view. The scope frustum is
+        // a subset of that view, so the map covers it.
+        RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
+            crateModel, floorMaterial,
+            g_scopeShadowLightSpace, g_scopeShadowResource,
+            false, true, false);
+
+        // Skinned actors live outside RenderForward in the primary path.
+        // Enemies are the whole point of a magnified sight, so they are drawn
+        // here with their weapons, exactly as the main view draws them.
+        if (!g_emptyLevelMode && g_banditLoaded) {
+            ProfilerDX12::Scope banditProfile(
+                g_profiler, "Scope/Bandits", g_dx12.commandList.Get());
+            const XMMATRIX view = scene.GetViewMatrix();
+            const XMMATRIX projection = scene.GetUnjitteredProjectionMatrix();
+            for (auto& bandit : g_bandits) {
+                if (!bandit) continue;
+                bandit->Draw(mainShader, view, projection,
+                             g_scopeShadowLightSpace);
+                if (bandit->HasGunPose() && GunModel::Loaded()) {
+                    mainShader.Use(false);
+                    DrawMeshAt(GunModel::Mesh(), mainShader,
+                        bandit->GunWorldMatrix(), view, projection,
+                        g_scopeShadowLightSpace, true);
+                }
+            }
+        }
+    }
+    g_sniperScope.End(g_dx12.commandList.Get());
+    // Only bound once a real image exists: a freshly created default-heap
+    // texture holds undefined contents, and the rifle is visible at the hip
+    // long before the first scope frame is drawn.
+    BindSniperScopeMaterial();
+
+    // Restore the main view's arena slice and viewport before the primary
+    // camera's own recording resumes.
+    mainShader.BeginView(0);
+    g_meshShader.BeginView(0);
+    g_dx12.commandList->RSSetViewports(1, &g_dx12.viewport);
+    g_dx12.commandList->RSSetScissorRects(1, &g_dx12.scissorRect);
+
+    scene.camera = savedCamera;
+    scene.temporalJitterPixels = savedJitter;
+    scene.renderWidthOverride = savedWidth;
+    scene.renderHeightOverride = savedHeight;
+    scene.sniperScopeCameraPass = savedScopePass;
+    scene.drawViewmodel = savedDrawViewmodel;
+}
 
 struct PrefabThumbnailPipelineDX12 {
     ComPtr<ID3D12RootSignature> rootSignature;
@@ -17753,9 +18015,9 @@ static void ProcessInput(HWND) {
         scene.UpdateAimDownSights(false, deltaTime);
         return;
     }
-    // Right mouse aims. The SVD goes to its scope overlay; every other weapon
-    // raises iron sights instead, so the button means the same thing in the
-    // player's hands regardless of what they are holding.
+    // Right mouse raises every weapon through the same ADS path. The R700 also
+    // drives its secondary scope camera, but magnification stays on the physical
+    // lens rather than replacing the player's main view.
     const bool rightMouseHeld =
         (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
     const bool c4DetonateRequested = IsGameplayScreen() &&
@@ -17780,9 +18042,12 @@ static void ProcessInput(HWND) {
         !g_drivingHumvee && !cameraLocked && !g_mouseWalkTestMode &&
         !(showUI && ImGui::GetIO().WantCaptureMouse) &&
         !GunModel::C4Selected() && rightMouseHeld;
-    const bool scopeRequested = aimRequested && GunModel::SVDSelected();
-    scene.UpdateSniperScope(scopeRequested, deltaTime);
-    scene.UpdateAimDownSights(aimRequested && !scopeRequested, deltaTime);
+    const bool scopeRequested = aimRequested && GunModel::R700Selected();
+    // The last argument lets the debug ADS hold raise the scope, but only on a
+    // rifle that actually has one.
+    scene.UpdateSniperScope(scopeRequested, deltaTime,
+                            GunModel::R700Selected());
+    scene.UpdateAimDownSights(aimRequested, deltaTime);
     // Virtual controls are ImGui widgets, so WantCaptureKeyboard/cameraLocked
     // must not suppress the input those widgets produced on the previous frame.
     if (!g_drivingHumvee) ApplyVirtualInput();
@@ -18611,7 +18876,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // the number of BootStep() calls below; it only affects the bar's scale.
     g_boot.active = true;
     g_boot.hwnd = hwnd;
-    g_boot.stepCount = 22;
+    g_boot.stepCount = 23;  // +1 for the sniper scope targets
     g_boot.startedAt = std::chrono::steady_clock::now();
 
     // Geometry
@@ -18858,6 +19123,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             };
         std::cout << "Visibility Buffer ready\n";
     }
+
+    // Scope targets are allocated after the main VB and post pipelines, not
+    // before them: the scope is a consumer of that pipeline, and allocating
+    // its targets first would let a scope-only failure sit in the middle of
+    // the main renderer's own initialization.
+    //
+    // Failure is contained to the scope. The R700 keeps ordinary ADS with its
+    // authored glass; the main renderer is never disabled or altered.
+    BootStep("Initializing sniper scope...");
+    scene.sniperPictureInPicture = g_sniperScope.Init(
+        g_dx12.device.Get(), RequestedSniperScopeResolution());
+    std::cout << (scene.sniperPictureInPicture
+        ? "Sniper picture-in-picture scope ready\n"
+        : "Sniper scope target unavailable; standard ADS remains active\n");
     g_bindlessMaterialsReady = bindlessHeapReady && mainShader.BindlessReady() &&
         visBuffer.BindlessResolveReady() &&
         (!g_useMeshShader || g_meshShader.bindlessReady);
@@ -22022,6 +22301,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // resolve. Other paths can split the same queue around water.
         const bool splitWaterTransparency =
             waterPassEnabled && !msaaActive && !bentGTAODiagnosticActive;
+        // Record the secondary view before the primary transparency queue
+        // opens, so scope-camera glass can never leak into the main replay.
+        mainShader.BeginFrame();
+        mainShader.SetPalmWindFrame(g_trees.GetWindFrame());
+        g_meshShader.BeginFrame();
+        mainShader.SetPreviousViewProjection(previousHZBViewProjection);
+        RenderSniperScopeTexture(now);
+
         BeginWaterTransparencySplitDX12(scene, false);
         mainShader.SetMSAAEnabled(msaaActive);
         g_meshShader.SetMSAAEnabled(msaaActive);
@@ -22073,14 +22360,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
         }
 
-        mainShader.BeginFrame();
-        mainShader.SetPalmWindFrame(g_trees.GetWindFrame());
-        g_meshShader.BeginFrame();
         hzbCaptureActive = IsSceneScreen() &&
             !g_game.loading.Active() && !usingRaytracing && !msaaActive &&
             (g_useMeshShader || usingVisibility);
         if (!hzbCaptureActive) occlusionDepth.InvalidateCameraHistory();
-        mainShader.SetPreviousViewProjection(previousHZBViewProjection);
         const bool hzbHistoryUsable = hzbCaptureActive &&
             occlusionDepth.CanUseHistory(
                 scene.camera.Position, scene.camera.Front) &&
@@ -22745,6 +23028,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
         // player moved. The gun itself is posed inside the render pass from
         // GetGunBaseMatrix, so the beam has to be computed before that too.
         UpdateIRLaser();
+        UpdateAimDebugRay();
 
         // ?? render ??
         // Main menu draws only sky plus UI. Level geometry, weapons, enemies,
@@ -22847,6 +23131,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr,
                     &mainShader);
                 shadowResource = shadowMap.GetResource();
+                // Handed to next frame's scope pass, which runs before this one.
+                g_scopeShadowLightSpace = lightSpace;
+                g_scopeShadowResource = shadowResource;
             }
             {
                 ProfilerDX12::Scope profile(g_profiler, "Visibility Buffer", g_dx12.commandList.Get());
@@ -22894,6 +23181,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     (!g_emptyLevelMode && g_banditLoaded) ? &g_bandits : nullptr,
                     &mainShader);
                 shadowResource = shadowMap.GetResource();
+                // Handed to next frame's scope pass, which runs before this one.
+                g_scopeShadowLightSpace = lightSpace;
+                g_scopeShadowResource = shadowResource;
             }
             fogLightSpace = lightSpace;
             fogShadowResource = shadowResource;

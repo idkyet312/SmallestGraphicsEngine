@@ -782,6 +782,51 @@ public:
 
     UINT width = 0;
     UINT height = 0;
+
+    // --- Per-view surface binding (sniper scope) ---
+    //
+    // Every camera-dependent pass below used to read the global depth buffer,
+    // DSV heap, viewport and swapchain backbuffer directly. That is correct
+    // while exactly one view renders per frame. The scope renders a second
+    // camera into its own square target, so those four reads become
+    // indirections through the currently bound surface.
+    //
+    // Default-constructed to the globals, so a caller that never binds a
+    // surface -- which is every existing main-view call site -- gets the
+    // identical resources it had before, and its submission sequence is
+    // unchanged.
+    struct ViewSurface {
+        ID3D12Resource* depthBuffer = nullptr;         // null => global
+        D3D12_CPU_DESCRIPTOR_HANDLE depthDSV{};
+        bool hasDepthDSV = false;
+        const D3D12_VIEWPORT* viewport = nullptr;      // null => global
+        const D3D12_RECT* scissor = nullptr;
+        ID3D12Resource* destination = nullptr;         // null => backbuffer
+        UINT viewWidth = 0;
+        UINT viewHeight = 0;
+        bool isScope = false;
+    };
+    ViewSurface boundSurface;
+
+    void BindViewSurface(const ViewSurface& surface) { boundSurface = surface; }
+    void UnbindViewSurface() { boundSurface = ViewSurface{}; }
+    bool ScopeSurfaceBound() const { return boundSurface.isScope; }
+
+    ID3D12Resource* ActiveDepthBuffer() const {
+        return boundSurface.depthBuffer ? boundSurface.depthBuffer
+                                        : g_dx12.depthStencilBuffer.Get();
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE ActiveDSV() const {
+        return boundSurface.hasDepthDSV
+            ? boundSurface.depthDSV
+            : g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+    }
+    const D3D12_VIEWPORT& ActiveViewport() const {
+        return boundSurface.viewport ? *boundSurface.viewport : g_dx12.viewport;
+    }
+    const D3D12_RECT& ActiveScissor() const {
+        return boundSurface.scissor ? *boundSurface.scissor : g_dx12.scissorRect;
+    }
     bool initialized = false;
     std::string initError;
 
@@ -1741,15 +1786,15 @@ public:
         cmdList->ClearRenderTargetView(rtvHandle, clearValue, 0, nullptr);
 
         // Also clear main depth
-        D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = ActiveDSV();
         cmdList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
         // Set render targets: vis buffer + main depth buffer
         cmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
 
         // Set viewport / scissor
-        cmdList->RSSetViewports(1, &g_dx12.viewport);
-        cmdList->RSSetScissorRects(1, &g_dx12.scissorRect);
+        cmdList->RSSetViewports(1, &ActiveViewport());
+        cmdList->RSSetScissorRects(1, &ActiveScissor());
 
         // Set pipeline
         const bool useBindless = BindlessVisPassActive();
@@ -1983,7 +2028,7 @@ public:
         {
             D3D12_RESOURCE_BARRIER barrier = {};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = g_dx12.depthStencilBuffer.Get();
+            barrier.Transition.pResource = ActiveDepthBuffer();
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -2502,7 +2547,7 @@ public:
                 depthSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
                 depthSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
                 depthSrv.Texture2D.MipLevels = 1;
-                g_dx12.device->CreateShaderResourceView(g_dx12.depthStencilBuffer.Get(), &depthSrv, h1);
+                g_dx12.device->CreateShaderResourceView(ActiveDepthBuffer(), &depthSrv, h1);
 
                 // [2] t2: normalRoughness
                 D3D12_CPU_DESCRIPTOR_HANDLE h2 = h; h2.ptr += (UINT64)descSize * 2;
@@ -2535,7 +2580,7 @@ public:
                     svgfAtrousScratch[0].Get(), &srv, h6);
                 D3D12_CPU_DESCRIPTOR_HANDLE h7 = h; h7.ptr += (UINT64)descSize * 7;
                 g_dx12.device->CreateShaderResourceView(
-                    g_dx12.depthStencilBuffer.Get(), &depthSrv, h7);
+                    ActiveDepthBuffer(), &depthSrv, h7);
                 D3D12_CPU_DESCRIPTOR_HANDLE h8 = h; h8.ptr += (UINT64)descSize * 8;
                 g_dx12.device->CreateShaderResourceView(
                     normalRoughnessTexture.Get(), &srv, h8);
@@ -2555,7 +2600,7 @@ public:
                     svgfAtrousScratch[1].Get(), &srv, h12);
                 D3D12_CPU_DESCRIPTOR_HANDLE h13 = h; h13.ptr += (UINT64)descSize * 13;
                 g_dx12.device->CreateShaderResourceView(
-                    g_dx12.depthStencilBuffer.Get(), &depthSrv, h13);
+                    ActiveDepthBuffer(), &depthSrv, h13);
                 D3D12_CPU_DESCRIPTOR_HANDLE h14 = h; h14.ptr += (UINT64)descSize * 14;
                 g_dx12.device->CreateShaderResourceView(
                     normalRoughnessTexture.Get(), &srv, h14);
@@ -2876,7 +2921,7 @@ public:
                 g_profiler, "VB Depth Snapshot", cmdList);
             D3D12_RESOURCE_BARRIER barriers[3] = {};
             barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barriers[0].Transition.pResource = g_dx12.depthStencilBuffer.Get();
+            barriers[0].Transition.pResource = ActiveDepthBuffer();
             barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
             barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -2886,7 +2931,7 @@ public:
             barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
             cmdList->ResourceBarrier(2, barriers);
             cmdList->CopyResource(visibilityDepthTexture.Get(),
-                                  g_dx12.depthStencilBuffer.Get());
+                                  ActiveDepthBuffer());
             barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
             barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -2962,8 +3007,8 @@ public:
         const float clearColor[4] = {};
         cmdList->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
         cmdList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        cmdList->RSSetViewports(1, &g_dx12.viewport);
-        cmdList->RSSetScissorRects(1, &g_dx12.scissorRect);
+        cmdList->RSSetViewports(1, &ActiveViewport());
+        cmdList->RSSetScissorRects(1, &ActiveScissor());
     }
 
     void EndHDRBackground(ID3D12GraphicsCommandList* cmdList) {
@@ -2986,7 +3031,7 @@ public:
         barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         barriers[1] = barriers[0];
-        barriers[1].Transition.pResource = g_dx12.depthStencilBuffer.Get();
+        barriers[1].Transition.pResource = ActiveDepthBuffer();
         barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
         if (useMotion) {
             barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3012,10 +3057,10 @@ public:
         // Default to colour-only so untouched passes keep working.
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetOutputRTV();
         D3D12_CPU_DESCRIPTOR_HANDLE dsv =
-            g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            ActiveDSV();
         cmdList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-        cmdList->RSSetViewports(1, &g_dx12.viewport);
-        cmdList->RSSetScissorRects(1, &g_dx12.scissorRect);
+        cmdList->RSSetViewports(1, &ActiveViewport());
+        cmdList->RSSetScissorRects(1, &ActiveScissor());
     }
 
     // Bind colour + motion for draws that use an extension-motion PSO. No-op
@@ -3024,7 +3069,7 @@ public:
         if (!extensionMotionVectors) return;
         D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = { GetOutputRTV(), GetMotionRTV() };
         D3D12_CPU_DESCRIPTOR_HANDLE dsv =
-            g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            ActiveDSV();
         cmdList->OMSetRenderTargets(2, rtvs, FALSE, &dsv);
     }
 
@@ -3033,7 +3078,7 @@ public:
         if (!extensionMotionVectors) return;
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetOutputRTV();
         D3D12_CPU_DESCRIPTOR_HANDLE dsv =
-            g_dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+            ActiveDSV();
         cmdList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
     }
 
@@ -3047,7 +3092,7 @@ public:
         barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         barriers[1] = barriers[0];
-        barriers[1].Transition.pResource = g_dx12.depthStencilBuffer.Get();
+        barriers[1].Transition.pResource = ActiveDepthBuffer();
         barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
         if (useMotion) {
             barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3220,7 +3265,7 @@ public:
         cmdList->ResourceBarrier(2, barriers);
         D3D12_RESOURCE_BARRIER depth = {};
         depth.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        depth.Transition.pResource = g_dx12.depthStencilBuffer.Get();
+        depth.Transition.pResource = ActiveDepthBuffer();
         depth.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         depth.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
         depth.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -3230,34 +3275,43 @@ public:
         temporalHistoryValid = temporalEffectsEnabled && !preserveDebugOutput;
     }
 
-    // Copy the resolved output to the back buffer
-    void CopyToBackBuffer(ID3D12GraphicsCommandList* cmdList) {
-        ID3D12Resource* backBuffer = g_dx12.renderTargets[g_dx12.frameIndex].Get();
+    // Generic destination copy. The scope's lens texture is not a swapchain
+    // image, so the destination and its surrounding states are parameters
+    // rather than the backbuffer's fixed RENDER_TARGET bracket.
+    void CopyToDestination(ID3D12GraphicsCommandList* cmdList,
+                           ID3D12Resource* destination,
+                           D3D12_RESOURCE_STATES destinationState) {
+        if (!destination) return;
 
-        // Back buffer is already in RENDER_TARGET state from BeginFrame
-        // Transition it to COPY_DEST
-        {
+        if (destinationState != D3D12_RESOURCE_STATE_COPY_DEST) {
             D3D12_RESOURCE_BARRIER barrier = {};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = backBuffer;
-            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.pResource = destination;
+            barrier.Transition.StateBefore = destinationState;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
             barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             cmdList->ResourceBarrier(1, &barrier);
         }
 
-        cmdList->CopyResource(backBuffer, presentTexture.Get());
+        cmdList->CopyResource(destination, presentTexture.Get());
 
-        // Transition back to RENDER_TARGET for ImGui
-        {
+        if (destinationState != D3D12_RESOURCE_STATE_COPY_DEST) {
             D3D12_RESOURCE_BARRIER barrier = {};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = backBuffer;
+            barrier.Transition.pResource = destination;
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter = destinationState;
             barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             cmdList->ResourceBarrier(1, &barrier);
         }
+    }
+
+    // Main-view wrapper. Unchanged behaviour: the backbuffer arrives in
+    // RENDER_TARGET from BeginFrame and must be returned to it for ImGui.
+    void CopyToBackBuffer(ID3D12GraphicsCommandList* cmdList) {
+        CopyToDestination(cmdList,
+                          g_dx12.renderTargets[g_dx12.frameIndex].Get(),
+                          D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
 
     void Resize(UINT newWidth, UINT newHeight) {
@@ -3633,7 +3687,7 @@ private:
         if (FAILED(hr)) return false;
 
         D3D12_RESOURCE_DESC depthSnapshotDesc =
-            g_dx12.depthStencilBuffer->GetDesc();
+            ActiveDepthBuffer()->GetDesc();
         hr = g_dx12.device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &depthSnapshotDesc,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
@@ -6589,7 +6643,7 @@ private:
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srvDesc.Texture2D.MipLevels = 1;
-            g_dx12.device->CreateShaderResourceView(g_dx12.depthStencilBuffer.Get(), &srvDesc, cpuHandle);
+            g_dx12.device->CreateShaderResourceView(ActiveDepthBuffer(), &srvDesc, cpuHandle);
             cpuHandle.ptr += descSize;
         }
 
@@ -7574,7 +7628,7 @@ private:
             depthSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             depthSrv.Texture2D.MipLevels = 1;
             g_dx12.device->CreateShaderResourceView(
-                g_dx12.depthStencilBuffer.Get(), &depthSrv, handle);
+                ActiveDepthBuffer(), &depthSrv, handle);
             handle.ptr += descriptorSize;
             g_dx12.device->CreateShaderResourceView(
                 visibilityDepthTexture.Get(), &depthSrv, handle);

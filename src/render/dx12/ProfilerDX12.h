@@ -20,10 +20,12 @@ public:
     // Overflow is silent -- BeginGpuEvent returns InvalidQuery and the scope
     // vanishes from the report rather than erroring -- so keep headroom above
     // the number of live scopes.
-    // 32 was already below the number of live scopes before the FE/* breakdown
-    // was added, so the tail of the frame was being silently dropped from the
-    // report. Keep well clear of the ~45 scopes a full frame now records.
-    static constexpr UINT MaxGpuEvents = 96;
+    // Raised from 96 for the sniper scope: a second full camera pass records
+    // its own Scope/* sibling for every pass the main view times, and an
+    // editor-heavy frame was already at 58 live scopes. Overflow is silent
+    // (BeginGpuEvent returns InvalidQuery and the scope vanishes from the
+    // report), so the headroom has to cover both views plus the editor.
+    static constexpr UINT MaxGpuEvents = 160;
     static constexpr UINT QueriesPerFrame = 2 + MaxGpuEvents * 2;
 
     bool Init(ID3D12Device* device, ID3D12CommandQueue* queue) {

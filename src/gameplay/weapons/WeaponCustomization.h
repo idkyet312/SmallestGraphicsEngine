@@ -138,7 +138,7 @@ public:
               2.4f, 42.0f, 0.0f, false, "Content/Models/RPG7/RPG72.fbx", "" },
             { "svd", "R700 Sniper", 3, 10, 40, 80, 1.75f, 1.05f, 5.0f,
               650.0f, 2.31f, 0.0f, 1.0f, 1.0f, 1.0f, 1.35f, 1.35f,
-              1.5f, 15.0f, 4.0f, false,
+              1.5f, 42.0f, 4.0f, false,
               "Content/Models/MainPlayer/Guns/R700/Remington_700_Sps_Tactical.glb", "" },
             { "arc_laser_cutter", "ARC Laser Cutter", 4, 120, 360, 600,
               2.10f, 0.055f, 6.0f, 1800.0f, 0.55f, 0.22f, 1.0f, 1.0f,
@@ -158,7 +158,7 @@ public:
               "Content/Models/HarpoonGun/HarpoonGun.glb", "" },
             { "svd_suppressed", "R700 Suppressed", 8, 5, 20, 40, 2.05f,
               1.05f, 5.0f, 650.0f, 1.98f, 0.0f, 1.0f, 1.0f, 0.25f,
-              0.55f, 0.35f, 0.7f, 15.0f, 4.0f, true,
+              0.55f, 0.35f, 0.7f, 42.0f, 4.0f, true,
               "Content/Models/MainPlayer/Guns/R700/Remington_700_Sps_Tactical.glb", "" },
             // The carbine against the AK's battle rifle: it cycles faster
             // (0.075s vs 0.10) and climbs less (0.42/0.18 vs 0.55/0.22) for

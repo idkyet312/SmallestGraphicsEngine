@@ -1272,7 +1272,8 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
                        bool visibilityExtensionsOnly = false,
                        ID3D12PipelineState* pipelineOverride = nullptr,
                        XMFLOAT4 palmWindRoot = {},
-                       float specularScale = 1.0f) {
+                       float specularScale = 1.0f,
+                       float scopeUVRotation = 0.0f) {
     if (!mesh) return;
     shader.SetMatrices(model, view, proj, lightSpace, palmWindRoot);
 
@@ -1345,7 +1346,9 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
                 specularScale,   // cache its descriptors: they never change
                 // Selects the glass shading path for the optic lens. Every
                 // other imported material leaves this at 0 and is unchanged.
-                prim.material->materialType);
+                prim.material->materialType,
+                0.0f,
+                scopeUVRotation);
         } else {
             shader.SetObjectMaterial(XMFLOAT3(1, 1, 1), false, false, 0.0f, 0.5f, nullptr, nullptr, nullptr);
         }
@@ -2171,7 +2174,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     shader.SetCamera(scene.camera.Position);
 
     // Clustered light cull
-    scene.clusteredRenderer.setScreenSize((float)g_dx12.screenWidth, (float)g_dx12.screenHeight);
+    scene.clusteredRenderer.setScreenSize(
+        scene.RenderWidth(), scene.RenderHeight());
     scene.clusteredRenderer.setCamera(scene.EffectiveCameraFOV(), scene.cameraNear,
                                       scene.EffectiveCameraFarPlane(), view, proj);
     scene.clusteredRenderer.cullLights();
@@ -2229,7 +2233,11 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         g_dxrDDGICellSize);
     shader.SetSH();
 
-    if (!visibilityExtensionsOnly && scene.useDDGI &&
+    // DDGI probe updates are once-per-frame world state, not per-view shading.
+    // The scope must not run them a second time: it would double the probe
+    // update cost and advance the irradiance history twice per frame.
+    if (!visibilityExtensionsOnly && !scene.sniperScopeCameraPass &&
+        scene.useDDGI &&
         g_dxrDDGIProbeCount == 0 &&
         g_ddgiRenderer.computeInitialized) {
         DDGIMainLightData mainLight = {};
@@ -2952,9 +2960,14 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // The tube is monochrome downstream of the photocathode, so an IR emitter --
     // invisible to the naked eye -- comes through as a hard white line regardless
     // of its actual wavelength.
-    if (scene.irLaser.visible && scene.irLaser.visibility > 0.01f) {
-        const XMVECTOR start = XMLoadFloat3(&scene.irLaser.start);
-        const XMVECTOR end = XMLoadFloat3(&scene.irLaser.end);
+    // Shared by the IR designator and the debug aim ray: same world-space,
+    // depth-clipped beam, different origin and direction. Written once so the
+    // two cannot drift apart -- the point of the debug ray is that any visible
+    // difference between them is a real aiming error, not a drawing one.
+    auto drawWorldBeam = [&](const IRLaserFX& beam) {
+    if (beam.visible && beam.visibility > 0.01f) {
+        const XMVECTOR start = XMLoadFloat3(&beam.start);
+        const XMVECTOR end = XMLoadFloat3(&beam.end);
         XMVECTOR fwd = end - start;
         const float len = XMVectorGetX(XMVector3Length(fwd));
         if (len > 0.01f) {
@@ -2968,7 +2981,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             basis.r[1] = XMVectorSetW(up, 0.0f);
             basis.r[2] = XMVectorSetW(fwd, 0.0f);
             basis.r[3] = XMVectorSetW((start + end) * 0.5f, 1.0f);
-            const float fade = scene.irLaser.visibility;
+            const float fade = beam.visibility;
 
             shader.UseAdditive();
             // A single thin round shaft at flat LDR white. Deliberately has no
@@ -2990,7 +3003,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // spilled outward into a cone of brightening around the beam
             // instead of staying inside the shaft's own silhouette, so the
             // colour is clamped to a flat line that cannot glow at all.
-            shader.SetEmissiveMaterial(scene.irLaser.color, 0.85f * fade);
+            shader.SetEmissiveMaterial(beam.color, 0.85f * fade);
             DrawCapsule(geo);
             shader.NextDrawCall();
 
@@ -3022,18 +3035,18 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // matrix's translation row is the negated, rotated eye, not the
             // world-space camera position.
             const float dotDistance = XMVectorGetX(XMVector3Length(
-                XMLoadFloat3(&scene.irLaser.end) -
+                XMLoadFloat3(&beam.end) -
                 XMLoadFloat3(&scene.camera.Position)));
             const float dotScale = 1.0f +
                 (std::min)(6.0f, dotDistance * 0.045f);
             for (const DotShell& shell : kDotShells) {
                 const float radius = shell.radius * dotScale;
                 model = XMMatrixScaling(radius, radius, radius) *
-                        XMMatrixTranslation(scene.irLaser.end.x,
-                                            scene.irLaser.end.y,
-                                            scene.irLaser.end.z);
+                        XMMatrixTranslation(beam.end.x,
+                                            beam.end.y,
+                                            beam.end.z);
                 shader.SetMatrices(model, view, proj, lightSpace);
-                shader.SetEmissiveMaterial(scene.irLaser.color,
+                shader.SetEmissiveMaterial(beam.color,
                                            shell.opacity * fade);
                 DrawSphere(geo);
                 shader.NextDrawCall();
@@ -3041,6 +3054,11 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             shader.Use(scene.wireframeMode);
         }
     }
+    };
+    drawWorldBeam(scene.irLaser);
+    // Drawn after the designator so that where the two overlap, the debug ray
+    // is the one left visible.
+    drawWorldBeam(scene.aimDebugRay);
 
     // Brief steel cable shows the harpoon connection while the impact impulse
     // yanks the target back toward the player.
@@ -3406,6 +3424,8 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Opaque sparks stay in Forward. Transparent smoke/blood runs after the
     // separate skinned-enemy pass via RenderImpactBillboards().
     shader.Use(scene.wireframeMode);
+    // Sparks are world content, not viewmodel: the scope shows them like
+    // any other camera would. Only first-person geometry is excluded.
     if (!g_particleRenderer.initialized) {
         for (auto& sp : scene.impactParticles) {
             if (!sp.spark) continue;
@@ -3424,7 +3444,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
     // Gun: the AK47 model, drawn in the gun's local space (+Z down the barrel)
     // and placed in front of the camera. If the FBX did not load, fall back to
     // the boxed carbine below so the player still sees a weapon.
-    if (scene.gun.visible && !scene.sniperScopeActive) {
+    if (scene.gun.visible && scene.ShouldDrawViewmodel()) {
         const XMMATRIX gunBase = scene.GetGunBaseMatrix();
         const float S = scene.GunModelScale();
         // Binocular see-through, if the player opted in. Set once around the
@@ -3442,6 +3462,24 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         // inert for the rest of the viewmodel.
         shader.glassClarity = scene.glassClarity;
         shader.glassGrazing = scene.glassGrazing;
+        // The sniper lens projects a view ray into the scope target, so it
+        // needs that camera's focal lengths rather than this one's. Supplied
+        // only while the picture-in-picture target actually holds an image;
+        // zero tells the shader to fall back to the main projection.
+        const XMFLOAT2 scopeFocal = scene.SniperScopeFocalLengths();
+        const bool scopeFeedLive =
+            scene.sniperPictureInPicture && scene.sniperScopeBlend > 0.0f;
+        shader.sniperScopeFocalX = scopeFeedLive ? scopeFocal.x : 0.0f;
+        shader.sniperScopeFocalY = scopeFeedLive ? scopeFocal.y : 0.0f;
+        shader.sniperScopeDebugMode =
+            (scopeFeedLive && scene.sniperScopeUVDebug) ? 1.0f : 0.0f;
+        // Rotates the sampling coordinate only. The scope camera itself is
+        // never rolled: the lens reconstructs its sample from the main view
+        // ray, so the two cameras must keep identical bases (see
+        // RenderSniperScopeTexture). Orientation is corrected here instead.
+        const float scopeUVRotation =
+            XMConvertToRadians(scene.sniperScopeUVRotationDegrees +
+                               scene.sniperScopeCameraRollDegrees);
         // With see-through active this body runs twice: color writes are
         // disabled while the first pass selects the nearest weapon surface,
         // then smooth alpha shades that exact depth in the second pass.
@@ -3482,18 +3520,44 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
                 XMMatrixTranslation(weaponOffset.x * weaponS,
                                     weaponOffset.y * weaponS,
                                     weaponOffset.z * weaponS);
-            XMMATRIX xf = weaponPlacement * gunBase;
+            XMMATRIX weaponBeforeBase = weaponPlacement;
             // With the idle playing, ride the trigger hand so the rifle stays in
             // the grip instead of hanging still while the arms breathe past it.
             // The follow transform is a delta from the reference pose, so it
             // composes on top of the tuned placement rather than replacing it.
             XMMATRIX handFollow;
             if (ArmsModel::WeaponFollowTransform(handFollow, S))
-                xf = weaponPlacement * handFollow * gunBase;
+                weaponBeforeBase = weaponPlacement * handFollow;
+
+            XMMATRIX viewmodelBase = gunBase;
+            XMFLOAT3 lensCenter;
+            if (GunModel::R700Selected() && scene.adsBlend > 0.0f &&
+                GunModel::GetR700LensCenter(lensCenter)) {
+                // Put the actual glass centre on the rendered camera axis. The
+                // correction is measured after the live weapon fit and hand
+                // follow, then converted back from view space to world space.
+                // This also removes the last few pixels of sway/recoil drift at
+                // full ADS without changing their rotation around the optic.
+                const XMVECTOR lensWorld = XMVector3TransformCoord(
+                    XMLoadFloat3(&lensCenter), weaponBeforeBase * viewmodelBase);
+                const XMVECTOR lensView = XMVector3TransformCoord(lensWorld, view);
+                const float alignment = (std::min)(
+                    1.0f, (std::max)(0.0f, scene.adsBlend));
+                const XMVECTOR correctionView = XMVectorSet(
+                    -XMVectorGetX(lensView) * alignment,
+                    -XMVectorGetY(lensView) * alignment, 0.0f, 0.0f);
+                const XMMATRIX inverseView = XMMatrixInverse(nullptr, view);
+                const XMVECTOR correctionWorld = XMVector3TransformNormal(
+                    correctionView, inverseView);
+                viewmodelBase.r[3] += XMVectorSetW(correctionWorld, 0.0f);
+            }
+
+            const XMMATRIX xf = weaponBeforeBase * viewmodelBase;
             shader.Use(scene.wireframeMode);
             if (!GunModel::C4Selected() && GunModel::PlayerMesh())
-                DrawMeshAt(
-                    GunModel::PlayerMesh(), shader, xf, view, proj, lightSpace);
+                DrawMeshAt(GunModel::PlayerMesh(), shader, xf, view, proj,
+                           lightSpace, false, false, nullptr, {}, 1.0f,
+                           scopeUVRotation);
             // The M4's iron sights are a separate mesh so an optic can replace
             // them. A red dot mounts directly over the rail, and the rear leaf
             // would stand up through the sight body if both were drawn.
@@ -3790,7 +3854,7 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // The body hangs off the same base transform as the weapon, so it
             // inherits recoil, the ADS slide and the hip offset for free. This
             // one is GPU-skinned and animating, so it owns its own draw.
-            ArmsModel::Draw(shader, gunBase, view, proj, lightSpace, S);
+            ArmsModel::Draw(shader, viewmodelBase, view, proj, lightSpace, S);
             shader.Use(scene.wireframeMode);
         } else {
             // Fallback: the old M4-style carbine, built from boxed parts.

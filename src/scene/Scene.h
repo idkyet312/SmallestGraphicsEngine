@@ -247,9 +247,8 @@ struct Scene {
     float  cameraFOV  = 60.0f;
     float  sniperScopeFOV = 15.0f;
     float  sniperScopeBlend = 0.0f;
-    // Iron-sight ADS for every non-scoped weapon. Separate from the SVD scope
-    // blend: that one swaps to a scope overlay and hides the viewmodel, this one
-    // just pulls the gun to centre and tightens the FOV a little.
+    // Shared ADS presentation for every weapon, including the R700. Its scope
+    // camera has a separate blend because magnification belongs on the lens.
     float  adsFOV     = 42.0f;   // moderate -- ADS is for accuracy, not zoom
     // Resolved from the selected weapon and its optic. Defaults to the legacy
     // iron-sight value, so an uncustomised loadout follows the old projection.
@@ -267,6 +266,27 @@ struct Scene {
     float adsOffsetY = -0.075f;
     float adsOffsetZ = 0.30f;
     bool   sniperScopeActive = false;
+    // Enabled only after the off-screen target initializes. Allocation failure
+    // leaves the R700 on ordinary ADS with its untextured authored glass.
+    bool   sniperPictureInPicture = false;
+    // Temporary secondary-camera state. It also acts as the scope culling layer:
+    // the viewmodel and feedback-prone effects are omitted from this pass.
+    bool   sniperScopeCameraPass = false;
+    // Whether the view being rendered draws first-person geometry.
+    //
+    // Replaces the broad "is this the scope pass" test at content call sites.
+    // The scope excludes the viewmodel because the lens would otherwise render
+    // the rifle carrying it and sample the texture it is drawing into -- a
+    // recursion, not a general statement that scope views show less world.
+    // Everything else (grass, particles, water, actors) belongs in the scope
+    // image exactly as it does in the main view.
+    bool   drawViewmodel = true;
+
+    bool ShouldDrawViewmodel() const {
+        return drawViewmodel && !sniperScopeCameraPass;
+    }
+    float  renderWidthOverride = 0.0f;
+    float  renderHeightOverride = 0.0f;
     // Player preference, pushed in from GameSettings. Lives on the scene
     // because the renderer decides the viewmodel draw and cannot see the
     // settings object, which is file-static to main.cpp.
@@ -353,6 +373,9 @@ struct Scene {
     std::vector<Projectile> projectiles;
     LaserBeamFX laserBeam;
     IRLaserFX irLaser;
+    // Debug aim ray, drawn through the same world-space beam path as irLaser
+    // so it is depth-clipped against the scene rather than paint on the HUD.
+    IRLaserFX aimDebugRay;
     HarpoonTetherFX harpoonTether;
     std::vector<PinnedHarpoonFX> pinnedHarpoons;
     std::vector<RemoteCharge> remoteCharges;
@@ -483,6 +506,49 @@ struct Scene {
     // disc with no scene behind it.
     float glassClarity = 0.16f;
     float glassGrazing = 0.86f;
+
+    // Debug: hold the weapon sighted without the mouse button. Aim alignment is
+    // only visible in ADS, and judging it while holding RMB means dragging
+    // sliders one-handed. Not persisted and off by default.
+    bool  holdAimDownSights = false;
+
+    // Debug aim ray. Draws the exact line bullets travel -- camera position
+    // along camera front, with no sway and no muzzle offset -- so where the
+    // shot actually goes can be compared against the crosshair and the scope
+    // image instead of inferred from where rounds land. Off by default; this is
+    // a measuring tool, not an aiming aid.
+    bool  showAimDebugRay = false;
+    float aimDebugRayLength = 260.0f;
+
+    // Rotates only the completed render target around its UV centre. The
+    // camera feed is level by default; this remains live-tunable for checking
+    // an imported lens without baking its mesh orientation into the camera.
+    // Zero: the axis transposition is corrected in the shader by swapping the
+    // sampling components, not by rotating them (see the scopeAxes swap in
+    // clustered_dx12_ps.hlsl). Rotating as well would double-correct. This
+    // stays as a fine-tuning offset for the lens mesh's own UVs.
+    static constexpr float kR700ScopeUVRotationDegrees = 0.0f;
+    float sniperScopeUVRotationDegrees = kR700ScopeUVRotationDegrees;
+
+    // Draws the lens orientation key: coloured bars on the sampled image's
+    // four edges, so a mirror can be told from an axis swap by looking rather
+    // than by trying sign combinations. Debug only, off by default.
+    bool sniperScopeUVDebug = false;
+
+    // Rolls the scope camera about its own view axis.
+    //
+    // The lens shader reconstructs its sample coordinate from the MAIN
+    // camera's view ray, so the scope camera's basis and the sampling basis
+    // must agree. Rolling only the camera makes the lens sample a direction
+    // the scope never rendered -- the image becomes the wrong part of the
+    // world rather than a rotated view of the right one.
+    //
+    // So this angle is applied in BOTH places: the scope camera's up-vector is
+    // rolled by it before rendering, and the lens sampling coordinate is
+    // rotated by the same amount. The two stay consistent, and the aim
+    // direction never moves because rolling about the forward axis leaves the
+    // view direction untouched.
+    float sniperScopeCameraRollDegrees = 0.0f;
 
     // Trailing "chip" health, in the same units as player.health. Follows the
     // real value down after a delay, so the HUD can show a pale ghost of the
@@ -2337,10 +2403,16 @@ struct Scene {
     }
 
     // Build matrices
-    void UpdateSniperScope(bool active, float dt) {
-        // The scope overlay hides the view model outright, which would defeat
-        // the point of ejecting to look at it.
+    void UpdateSniperScope(bool active, float dt, bool scopeWeaponInHand = false) {
+        // The secondary scope camera has no useful relationship to an ejected
+        // inspection camera, so disable it while the player body is parked.
         if (ejected) active = false;
+        // Same debug hold as the iron sights, so the scope image stays up while
+        // its sliders are dragged. The caller has already decided a scoped
+        // weapon is in hand -- Scene cannot see GunModel and must not learn to,
+        // so `active` arriving false for an unscoped rifle is what keeps this
+        // from raising a scope that does not exist.
+        if (holdAimDownSights && !ejected && scopeWeaponInHand) active = true;
         sniperScopeActive = active;
         const float target = active ? 1.0f : 0.0f;
         // Matches the iron-sight raise rate so swapping to the SVD does not
@@ -2349,13 +2421,18 @@ struct Scene {
         sniperScopeBlend += (target - sniperScopeBlend) * response;
         if (!active && sniperScopeBlend < 0.001f) sniperScopeBlend = 0.0f;
     }
-    // Iron sights. The two blends are mutually exclusive by construction: only
-    // the SVD ever requests the scope, so a weapon is either scoped or sighted.
+    // Shared weapon raise/accuracy blend. Scoped rifles run this alongside the
+    // lens-camera blend; the latter never changes the main camera.
     void UpdateAimDownSights(bool active, float dt) {
         // Aiming while ejected would slide the parked weapon onto a view axis
         // the player is no longer looking down, so the inspection camera always
         // sees the neutral hip pose.
         if (ejected) active = false;
+        // Debug hold: keeps the weapon sighted without the mouse button down,
+        // so sight alignment can be tuned with both hands on the sliders. The
+        // ejected check stays above it -- a parked weapon has no view axis to
+        // aim down, held or not.
+        if (holdAimDownSights && !ejected) active = true;
         adsActive = active;
         const float target = active ? 1.0f : 0.0f;
         // Snappy on purpose: ADS is used mid-fight, and a slow raise makes the
@@ -2365,11 +2442,37 @@ struct Scene {
         if (!active && adsBlend < 0.001f) adsBlend = 0.0f;
     }
     float EffectiveCameraFOV() const {
-        // Scope wins when both are somehow non-zero, since it is the narrower
-        // of the two and blending them would land between the sights.
         const float sighted = cameraFOV + (weaponAdsFOV - cameraFOV) * adsBlend;
-        return sighted + (sniperScopeFOV - sighted) * sniperScopeBlend +
+        // Sniper magnification is exclusive to the temporary lens camera. If
+        // its render target is unavailable, the main view still uses ordinary
+        // ADS instead of reviving the legacy full-screen zoom.
+        const float scopeBlend = sniperScopeCameraPass ? sniperScopeBlend : 0.0f;
+        return sighted + (sniperScopeFOV - sighted) * scopeBlend +
                camera.ExplosionFovKick();
+    }
+
+    // Focal lengths (1/tan(fov/2)) of the scope camera, which the lens shader
+    // needs to project a view ray into the scope target. Derived from
+    // EffectiveCameraFOV with the scope pass forced on, so it cannot drift from
+    // what RenderSniperScopeTexture actually rendered with. The scope target is
+    // square, so both axes share one focal length -- unlike the main camera,
+    // whose X is divided by the wide aspect.
+    XMFLOAT2 SniperScopeFocalLengths() const {
+        const bool savedPass = sniperScopeCameraPass;
+        const_cast<Scene*>(this)->sniperScopeCameraPass = true;
+        const float fov = EffectiveCameraFOV();
+        const_cast<Scene*>(this)->sniperScopeCameraPass = savedPass;
+        const float halfFov = XMConvertToRadians(fov) * 0.5f;
+        const float focal = 1.0f / (std::max)(std::tan(halfFov), 1e-4f);
+        return XMFLOAT2(focal, focal);
+    }
+    float RenderWidth() const {
+        return renderWidthOverride > 0.0f
+            ? renderWidthOverride : static_cast<float>(g_dx12.screenWidth);
+    }
+    float RenderHeight() const {
+        return renderHeightOverride > 0.0f
+            ? renderHeightOverride : static_cast<float>(g_dx12.screenHeight);
     }
     // How far the sighted weapon is faded toward see-through, 0 when off.
     //
@@ -2422,9 +2525,10 @@ struct Scene {
     }
 
     float ScopeLookScale() const {
-        // Sights slow the turn rate proportionally to the zoom so the sensitivity
-        // at the sight picture feels the same as at the hip.
-        return (1.0f - 0.72f * sniperScopeBlend) * (1.0f - 0.30f * adsBlend);
+        // The main camera follows the same moderate ADS sensitivity as every
+        // other gun; the much narrower scope-camera FOV must not slow player
+        // turning a second time.
+        return 1.0f - 0.30f * adsBlend;
     }
     float EffectiveCameraFarPlane() const {
         return (std::max)(cameraFar, cameraFarOverride);
@@ -2455,9 +2559,10 @@ struct Scene {
     // Those passes use this instead. Remove the distinction only once the
     // extensions emit real per-object motion.
     XMMATRIX GetUnjitteredProjectionMatrix() const {
+        const float height = (std::max)(1.0f, RenderHeight());
         return XMMatrixPerspectiveFovLH(
             XMConvertToRadians(EffectiveCameraFOV()),
-            (float)g_dx12.screenWidth / (float)g_dx12.screenHeight,
+            RenderWidth() / height,
             cameraNear, EffectiveCameraFarPlane());
     }
 
@@ -2560,7 +2665,8 @@ struct Scene {
         // the sights line up with the crosshair. X goes to zero (centred), Y
         // rises to eye level, Z pushes slightly forward to bring the rear sight
         // closer to the camera.
-        const float hipToSights = (std::min)(1.0f, (std::max)(0.0f, adsBlend));
+        const float hipToSights =
+            (std::min)(1.0f, (std::max)(0.0f, adsBlend));
         const float offsetX =
             gun.offset.x + (adsOffsetX - gun.offset.x) * hipToSights;
         const float offsetY = gun.offset.y + (adsOffsetY - gun.offset.y) * hipToSights;

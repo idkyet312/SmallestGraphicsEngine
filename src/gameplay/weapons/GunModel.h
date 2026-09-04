@@ -66,11 +66,21 @@ public:
         return mesh;
     }
 
-    static std::shared_ptr<SceneMesh>& SVDMesh() {
+    static std::shared_ptr<SceneMesh>& R700Mesh() {
         static std::shared_ptr<SceneMesh> mesh;
         return mesh;
     }
-    static bool SVDLoaded() { return SVDMesh() != nullptr; }
+    static bool R700Loaded() { return R700Mesh() != nullptr; }
+
+    // Centre of the authored scope glass after Orient has put the rifle into
+    // gun-local space. The renderer uses the real mesh centre to put the optic
+    // on the aim axis, so changing the import, fit rotation or scale cannot
+    // silently invalidate a hand-tuned screen-space offset.
+    static bool GetR700LensCenter(XMFLOAT3& out) {
+        if (!R700LensCenterValidStorage()) return false;
+        out = R700LensCenterStorage();
+        return true;
+    }
 
     static std::shared_ptr<SceneMesh>& HarpoonGunMesh() {
         static std::shared_ptr<SceneMesh> mesh;
@@ -131,14 +141,14 @@ public:
     }
     static bool ShotgunSelected() { return SelectedWeapon() == 1 && ShotgunLoaded(); }
     static bool RPGSelected() { return SelectedWeapon() == 2 && RPGLoaded(); }
-    // Both SVD variants share one imported mesh: the suppressor is drawn as an
+    // Both R700 variants share one imported mesh: the suppressor is drawn as an
     // extra tube rather than a separate model, so anything asking "is the
     // player holding an SVD" -- viewmodel, scope, offsets -- must accept both.
-    static bool SVDSuppressedSelected() {
-        return SelectedWeapon() == 8 && SVDLoaded();
+    static bool R700SuppressedSelected() {
+        return SelectedWeapon() == 8 && R700Loaded();
     }
-    static bool SVDSelected() {
-        return (SelectedWeapon() == 3 || SelectedWeapon() == 8) && SVDLoaded();
+    static bool R700Selected() {
+        return (SelectedWeapon() == 3 || SelectedWeapon() == 8) && R700Loaded();
     }
     static bool LaserSelected() { return SelectedWeapon() == 4; }
     static bool C4Selected() { return SelectedWeapon() == 5; }
@@ -157,7 +167,7 @@ public:
             return ShotgunLoaded() ? ShotgunMesh() : Mesh();
         if (M4Selected()) return M4Mesh();
         if (AK74Selected()) return AK74Mesh();
-        if (SVDSelected()) return SVDMesh();
+        if (R700Selected()) return R700Mesh();
         if (RPGSelected()) return RPGMesh();
         return ShotgunSelected() ? ShotgunMesh() : Mesh();
     }
@@ -404,12 +414,12 @@ public:
         case 0: return Loaded();
         case 1: return ShotgunLoaded();
         case 2: return RPGLoaded();
-        case 3: return SVDLoaded();
+        case 3: return R700Loaded();
         case 4: return true; // procedural viewmodel; no asset load required
         case 5: return true;
         case 6: return true;
         case 7: return true;
-        case 8: return SVDLoaded(); // suppressed variant of the same rifle
+        case 8: return R700Loaded(); // suppressed variant of the same rifle
         case 9: return M4Loaded();
         case 10: return AK74Loaded();
         default: return false;
@@ -509,7 +519,7 @@ public:
             std::cerr << "AK47 FBX unavailable; gun falls back to boxes\n";
             LoadShotgun();
             LoadRPG();
-            LoadSVD();
+            LoadR700();
             return;
         }
 
@@ -522,7 +532,7 @@ public:
             std::cerr << "AK47 FBX had no geometry; gun falls back to boxes\n";
             LoadShotgun();
             LoadRPG();
-            LoadSVD();
+            LoadR700();
             return;
         }
 
@@ -559,7 +569,7 @@ public:
         }
         LoadShotgun();
         LoadRPG();
-        LoadSVD();
+        LoadR700();
         // After the AK47 above, whose material this reuses.
         LoadAK74();
     }
@@ -572,6 +582,15 @@ public:
     }
 
 private:
+    static XMFLOAT3& R700LensCenterStorage() {
+        static XMFLOAT3 center{};
+        return center;
+    }
+    static bool& R700LensCenterValidStorage() {
+        static bool valid = false;
+        return valid;
+    }
+
     // Length of the normalised weapon along the barrel, in gun-local units. The
     // boxed M4 ran from about z = -0.44 to z = +0.81, so this matches its reach
     // and the view model keeps the size it always had on screen.
@@ -979,7 +998,7 @@ private:
         return material;
     }
 
-    static std::vector<std::shared_ptr<SceneMaterial>>& SVDMaterials() {
+    static std::vector<std::shared_ptr<SceneMaterial>>& R700Materials() {
         static std::vector<std::shared_ptr<SceneMaterial>> materials;
         return materials;
     }
@@ -1036,7 +1055,7 @@ private:
     // convention -- and it keeps the SVD's 1.55 barrel length rather than the
     // standard 1.25, because a marksman rifle is meant to read longer than the
     // assault rifles and the ADS and optic offsets were tuned against that.
-    static void LoadSVD() {
+    static void LoadR700() {
         const std::string path = Resolve(
             "Content/Models/MainPlayer/Guns/R700/"
             "Remington_700_Sps_Tactical.glb");
@@ -1071,7 +1090,7 @@ private:
                 primitive.material->disableOcclusionCulling = true;
             GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get());
         }
-        SVDMesh() = mesh;
+        R700Mesh() = mesh;
         std::cout << "Remington 700 loaded: " << mesh->primitives.size()
                   << " primitive(s)\n";
         if (FILE* file = std::fopen("gun_load.log", "a")) {
@@ -1148,12 +1167,15 @@ private:
         glass->materialType = 9.0f;  // sniper glass
         auto brass  = make("r700_brass",  XMFLOAT4(0.430f, 0.290f, 0.090f, 1.0f), 0.88f, 0.26f);
         auto lead   = make("r700_bullet", XMFLOAT4(0.215f, 0.180f, 0.120f, 1.0f), 0.80f, 0.34f);
-        SVDMaterials() = { metal, barrel, scope, stock, wood, glass, brass, lead };
+        R700Materials() = { metal, barrel, scope, stock, wood, glass, brass, lead };
 
         // Order matters: several names contain a shorter key ("Scope Glass" and
         // "Scope Knobs" both hold "scope", "Bullet Primer" holds "bullet"), so
         // the most specific test has to come first or the lens ends up in plain
         // scope steel.
+        XMFLOAT3 lensLo(FLT_MAX, FLT_MAX, FLT_MAX);
+        XMFLOAT3 lensHi(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        bool foundLens = false;
         for (MeshPrimitive& primitive : prims) {
             std::string name = primitive.material ? primitive.material->name : "";
             std::transform(name.begin(), name.end(), name.begin(),
@@ -1163,10 +1185,22 @@ private:
             const auto has = [&](const char* key) {
                 return name.find(key) != std::string::npos;
             };
+            const bool isScopeGlass = has("glass");
+            if (isScopeGlass) {
+                for (size_t v = 0; v + 11 < primitive.vertices.size(); v += 12) {
+                    lensLo.x = (std::min)(lensLo.x, primitive.vertices[v]);
+                    lensLo.y = (std::min)(lensLo.y, primitive.vertices[v + 1]);
+                    lensLo.z = (std::min)(lensLo.z, primitive.vertices[v + 2]);
+                    lensHi.x = (std::max)(lensHi.x, primitive.vertices[v]);
+                    lensHi.y = (std::max)(lensHi.y, primitive.vertices[v + 1]);
+                    lensHi.z = (std::max)(lensHi.z, primitive.vertices[v + 2]);
+                    foundLens = true;
+                }
+            }
             // "Buillet Case" is the asset's own spelling, so the case test keys
             // on "case" rather than on the misspelled word in front of it.
             primitive.material =
-                  has("glass")  ? glass
+                  isScopeGlass  ? glass
                 : has("primer") ? brass
                 : has("case")   ? brass
                 : has("bullet") ? lead
@@ -1175,6 +1209,13 @@ private:
                 : has("wood")   ? wood
                 : has("stock")  ? stock
                 : metal;
+        }
+        R700LensCenterValidStorage() = foundLens;
+        if (foundLens) {
+            R700LensCenterStorage() = XMFLOAT3(
+                (lensLo.x + lensHi.x) * 0.5f,
+                (lensLo.y + lensHi.y) * 0.5f,
+                (lensLo.z + lensHi.z) * 0.5f);
         }
     }
 
