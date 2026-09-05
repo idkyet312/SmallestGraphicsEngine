@@ -4492,8 +4492,19 @@ private:
         if (!pixels) {
             // Try next to the executable, matching how shaders resolve: the
             // working directory and the exe directory are not always the same.
+            // Convert through UTF-8 rather than narrowing each wchar_t: a
+            // truncating copy mangles any install path with a non-ASCII
+            // character, which turns into a silently missing texture.
             const std::wstring exeDir = ShaderCacheDX12::ExecutableDirectory();
-            std::string narrow(exeDir.begin(), exeDir.end());
+            std::string narrow;
+            const int narrowSize = WideCharToMultiByte(
+                CP_UTF8, 0, exeDir.c_str(), (int)exeDir.size(),
+                nullptr, 0, nullptr, nullptr);
+            if (narrowSize > 0) {
+                narrow.resize((size_t)narrowSize);
+                WideCharToMultiByte(CP_UTF8, 0, exeDir.c_str(), (int)exeDir.size(),
+                                    narrow.data(), narrowSize, nullptr, nullptr);
+            }
             path = narrow + path;
             pixels = stbi_load(path.c_str(), &width, &height, &channels, 1);
         }
