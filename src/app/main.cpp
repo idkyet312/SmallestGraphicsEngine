@@ -15494,6 +15494,40 @@ static std::vector<unsigned char> PinkMissingTexture(int size) {
     return pixels;
 }
 
+// Both hulls (patrol and insertion) come from this one asset.
+static constexpr const char* kBoatModelPath =
+    "Content/Models/MilitaryBoatNew/MilitaryBoatv2.glb";
+
+// MilitaryBoatv2 ships its one material as alphaMode=BLEND -- a Blender export
+// default rather than a deliberate choice. Left alone, IsTransparent() puts the
+// whole hull on the blended path, so the far gunwale shows through the near one
+// and the deck reads as glass instead of painted metal. Force it opaque and
+// double sided: the shell is a single thin surface, so back faces have to draw
+// or the interior of the hull is missing.
+//
+// The patrol boat and the insertion boat load the same GLB separately, so each
+// owns its own materials and needs its own pass.
+static void ConfigureBoatMaterials(const std::shared_ptr<SceneNode>& boat) {
+    if (!boat) return;
+    if (boat->mesh) {
+        for (MeshPrimitive& primitive : boat->mesh->primitives) {
+            if (!primitive.material) continue;
+            SceneMaterial& material = *primitive.material;
+            material.doubleSided = true;
+            material.alphaBlend = false;
+            material.alphaCutout = false;
+            // IsTransparent() also blends on a sub-unit factor alpha, so clearing
+            // the mode flag alone would not force the hull opaque.
+            material.baseColorFactor.w = 1.0f;
+        }
+    }
+    // The GLB is flat today, but an exporter change that parents the hull under
+    // a child node would silently skip the fix, so walk the whole subtree.
+    for (const std::shared_ptr<SceneNode>& child : boat->children)
+        ConfigureBoatMaterials(child);
+}
+
+
 // Island ground material: sand (Poly Haven "sand_02", CC0). The previous mud set
 // was never actually in the repo, so the terrain had been falling back to the pink
 // missing-texture placeholder.
@@ -23247,17 +23281,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
 
             AdvanceLevelLoading(LevelLoadStage::Boat,
                 "Military boat import, bounds and patrol setup",
-                "Content/Models/MiltaryBoat/miltaryboat.glb",
+                kBoatModelPath,
                 g_helicopterModel != nullptr);
         } else if (g_game.loading.Stage() == LevelLoadStage::Boat) {
             g_boatModel.reset();
             g_boatShadowModel.reset();
             if (g_levelPatrolBoatEnabled) {
                 g_boatModel = GLBImporter::LoadGLB(
-                    "Content/Models/MiltaryBoat/miltaryboat.glb",
+                    kBoatModelPath,
                     g_dx12.device, g_dx12.commandList);
                 if (g_boatModel) {
                     ConfigureBoatBounds();
+                    ConfigureBoatMaterials(g_boatModel);
                     g_boatShadowModel = GLBImporter::MergeSceneForDepth(
                         g_boatModel, g_dx12.device);
                     g_boatCenter = { 0.0f, 0.0f, 0.0f };
@@ -23272,10 +23307,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             // own run rather than the patrol circuit. Loaded separately so the
             // two never share a scene node (one transform per node).
             g_insertionBoatModel = GLBImporter::LoadGLB(
-                "Content/Models/MiltaryBoat/miltaryboat.glb",
+                kBoatModelPath,
                 g_dx12.device, g_dx12.commandList);
             if (g_insertionBoatModel) {
                 ConfigureInsertionBoatBounds();
+                ConfigureBoatMaterials(g_insertionBoatModel);
                 g_insertionBoatShadowModel = GLBImporter::MergeSceneForDepth(
                     g_insertionBoatModel, g_dx12.device);
                 g_insertionBoatRestartPending = !g_emptyLevelMode;
