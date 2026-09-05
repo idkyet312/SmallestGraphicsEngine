@@ -14,6 +14,7 @@
 #include "ArmsModel.h"  // arms placement controls, tuned against the weapon
 #include "GunAudio.h"   // AudioDevice/AudioBus -- the Audio Mix sliders
 #include "UISearchFilter.h"  // settings-search text matching
+#include "MoneySystem.h"     // wallet readout + floating payout popups
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -77,6 +78,12 @@ void ApplyLiveWeatherState(WeatherState state);
 // tower (or it has already been destroyed), so the readout only appears on maps
 // that actually carry one. Defined in main.cpp, which owns the prefab runtime.
 bool CommTowerObjectiveStatus(float& health, float& maxHealth);
+
+// The career wallet, owned by the GameRuntime in main.cpp. Handed to the HUD
+// as a reference rather than a copied balance so the readout and the payout
+// popups both read the same object -- a snapshotted int would have to be
+// re-published every time anything awarded money.
+MoneySystem& PlayerMoney();
 
 // Aircraft objective status for the HUD. Unlike the tower this one moves, so it
 // reports the airframe's current world position for a tracking marker alongside
@@ -963,6 +970,80 @@ inline void RenderPlayerHUD(const Scene& scene) {
     // equipment row now carries the selected grenade alongside the rest of the
     // loadout, so a separate readout in the middle of the screen was saying the
     // same thing twice and taking the centre of the view to do it.
+
+    // ---- Money -------------------------------------------------------------
+    //
+    // Balance above the ammo column on the right, with payouts floating up from
+    // it as they land. The awards are drained from the wallet once per frame
+    // into a local ring: the wallet is the source of truth for the amount, but
+    // the animation is pure UI state and has no business living in gameplay.
+    {
+        struct FloatingAward {
+            int amount = 0;
+            const char* label = "";
+            float age = 0.0f;
+        };
+        constexpr float kAwardLifetime = 2.2f;
+        constexpr size_t kMaxFloating = 6;
+        static std::vector<FloatingAward> floating;
+
+        MoneySystem& money = PlayerMoney();
+        for (const MoneyAward& award : money.DrainAwards()) {
+            // Oldest goes first when the list is full, so a burst of kills shows
+            // the most recent payouts rather than freezing on a stale one.
+            if (floating.size() >= kMaxFloating) floating.erase(floating.begin());
+            floating.push_back(FloatingAward{ award.amount, award.label, 0.0f });
+        }
+        // Real seconds, not the fixed step: this is presentation, and it should
+        // age at the rate the player actually sees.
+        const float awardDelta = (std::min)(0.1f, io.DeltaTime);
+        for (FloatingAward& entry : floating) entry.age += awardDelta;
+        floating.erase(
+            std::remove_if(floating.begin(), floating.end(),
+                [&](const FloatingAward& entry) {
+                    return entry.age >= kAwardLifetime;
+                }),
+            floating.end());
+
+        const float moneyRight = io.DisplaySize.x - kHudMargin;
+        const float moneyY = baseline - 74.0f;   // clear of the weapon name
+
+        char balanceText[32];
+        MoneySystem::Format(balanceText, sizeof(balanceText), money.Balance());
+        const ImVec2 balanceSize = ImGui::CalcTextSize(balanceText);
+        draw->AddText(ImVec2(moneyRight - balanceSize.x, moneyY),
+                      IM_COL32(255, 209, 61, 240), balanceText);
+
+        // Each payout rises and fades from just under the balance. Stacked by
+        // index so two awards in the same frame do not draw on top of each
+        // other, which read as one flickering number.
+        int slotIndex = 0;
+        for (const FloatingAward& entry : floating) {
+            const float t = entry.age / kAwardLifetime;
+            // Ease out: most of the travel happens early, so the eye catches the
+            // motion while the value is still at full opacity.
+            const float rise = 26.0f * (1.0f - (1.0f - t) * (1.0f - t));
+            const int alpha = static_cast<int>(
+                255.0f * (std::max)(0.0f, (std::min)(1.0f, (1.0f - t) * 2.0f)));
+            if (alpha <= 0) { ++slotIndex; continue; }
+
+            char amountText[32];
+            MoneySystem::Format(amountText, sizeof(amountText), entry.amount);
+            char line[64];
+            snprintf(line, sizeof(line), "%s%s  %s",
+                     entry.amount > 0 ? "+" : "", amountText, entry.label);
+            const ImVec2 lineSize = ImGui::CalcTextSize(line);
+            const float lineY =
+                moneyY + 18.0f + static_cast<float>(slotIndex) * 15.0f - rise;
+            // Green for income, red for the marine-lost debit: the sign alone is
+            // easy to miss on a number that is only on screen for two seconds.
+            const ImU32 tint = entry.amount > 0
+                ? IM_COL32(122, 226, 132, alpha)
+                : IM_COL32(232, 96, 78, alpha);
+            draw->AddText(ImVec2(moneyRight - lineSize.x, lineY), tint, line);
+            ++slotIndex;
+        }
+    }
 
     if (scene.player.health <= 0.0f) {
         // Banded across the full width rather than floating unbacked: at 1x font

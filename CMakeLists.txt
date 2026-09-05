@@ -412,6 +412,10 @@ if(BUILD_TESTING)
     target_link_libraries(GameSettingsTests PRIVATE SGEProjectHeaders)
     add_test(NAME GameSettingsTests COMMAND GameSettingsTests)
 
+    add_executable(MoneySystemTests tests/MoneySystemTests.cpp)
+    target_link_libraries(MoneySystemTests PRIVATE SGEProjectHeaders)
+    add_test(NAME MoneySystemTests COMMAND MoneySystemTests)
+
     add_executable(UISearchFilterTests tests/UISearchFilterTests.cpp)
     target_link_libraries(UISearchFilterTests PRIVATE SGEProjectHeaders)
     add_test(NAME UISearchFilterTests COMMAND UISearchFilterTests)

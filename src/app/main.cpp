@@ -1468,6 +1468,13 @@ static bool OccupiedInsertionVehicleTarget(XMFLOAT3& target) {
 static GameSettings g_settings;
 static bool g_showSettingsMenu = false;
 
+// Extraction payout, captured once as the win screen opens. Snapshotted rather
+// than recomputed while the screen draws, because the wallet keeps moving --
+// re-reading SessionEarned() every frame would be fine today but silently
+// wrong the moment anything awards money outside a live run.
+static int g_winScreenMissionBonus = 0;
+static int64_t g_winScreenPayout = 0;
+
 // Push the settings into the systems that actually consume them.
 //
 // Camera::MouseSensitivity is a member of the camera object, and the camera is
@@ -3591,7 +3598,10 @@ static void DamageAATurret(size_t turretIndex, float damage,
         g_destruction.ApplyRagdollExplosion(center, 6.0f, 90.0f);
     }
     g_pendingExplosionAudio.push_back({ 0.0f, 0.95f, 0.80f, false });
-    if (g_game.session.TimerRunning()) g_game.mission.RecordDestruction();
+    if (g_game.session.TimerRunning()) {
+        g_game.mission.RecordDestruction();
+        g_game.money.Award(MoneyEvent::PropDestroyed);
+    }
     SGE_LOG("LogGameplay", EngineLog::Level::Display, "AA turret destroyed");
 }
 
@@ -4729,6 +4739,14 @@ static float BanditVoiceVolume(const XMFLOAT3& position, float peak = 0.78f) {
 static void PlayBanditDeathEvents() {
     for (auto& bandit : g_bandits) {
         if (!bandit || !bandit->ConsumeDeathEvent()) continue;
+        // Payout rides on the same one-shot death event the audio uses, so a
+        // body cannot be paid for twice however it was killed -- rifle, rotor,
+        // debris and fire all funnel through here.
+        if (g_game.session.TimerRunning()) {
+            g_game.money.Award(bandit->faction == Faction::Marine
+                                   ? MoneyEvent::FriendlyLost
+                                   : MoneyEvent::EnemyKilled);
+        }
         const float pitch = 0.94f + ((float)std::rand() / RAND_MAX) * 0.10f;
         g_banditDeathAudio.PlayAt(bandit->position.x, bandit->position.y,
                                   bandit->position.z, 0.9f, pitch,
@@ -5915,8 +5933,11 @@ static void DetonateBarrel(size_t firstBarrel) {
             pending.push_back(i);
         }
     }
-    if (g_game.session.TimerRunning())
+    if (g_game.session.TimerRunning() && !pending.empty()) {
         g_game.mission.RecordDestruction(static_cast<uint32_t>(pending.size()));
+        g_game.money.Award(MoneyEvent::PropDestroyed,
+                           static_cast<int>(pending.size()));
+    }
 }
 
 static bool HitExplosiveBarrelSegment(const XMFLOAT3& start,
@@ -11532,6 +11553,11 @@ static void CollapseCommTower(const XMFLOAT3& base) {
 // Live comm-tower health for the HUD readout. Reports the first enabled tower on
 // the level; false when there is none, so maps without one show no bar and a
 // felled tower's bar disappears with it.
+// Declared in EngineUI.h. The HUD needs the live wallet, and the UI header
+// cannot include GameRuntime.h without dragging the whole runtime into every
+// panel that draws a checkbox.
+MoneySystem& PlayerMoney() { return g_game.money; }
+
 bool CommTowerObjectiveStatus(float& health, float& maxHealth) {
     const PrefabRuntimeState& prefabs = g_game.world.Prefabs();
     for (const LevelEntity& entity : g_game.world.Level().entities) {
@@ -12327,8 +12353,10 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
     if (result.destroyed) {
         if (g_game.session.TimerRunning()) {
             g_game.mission.RecordDestruction();
+            g_game.money.Award(MoneyEvent::PropDestroyed);
             if (isCommTower) {
                 g_game.mission.RecordCommTowerDestroyed();
+                g_game.money.Award(MoneyEvent::CommTowerDestroyed);
                 // Levelling the tower is what brings the reinforcements: the
                 // garrison notices the moment it goes off the air.
                 CallInReinforcementWave();
@@ -12351,8 +12379,10 @@ static void DamagePrefabEntity(uint64_t entityId, float damage,
             downedPlane = true;
             BeginObjectivePlaneCrash(plane);
             scene.SpawnSmokeBurst(hit, 2.4f, 0.9f);
-            if (g_game.session.TimerRunning())
+            if (g_game.session.TimerRunning()) {
                 g_game.mission.RecordObjectivePlaneDestroyed();
+                g_game.money.Award(MoneyEvent::ObjectivePlaneDestroyed);
+            }
             SGE_LOG("LogGameplay", EngineLog::Level::Display,
                 "Objective aircraft destroyed");
         }
@@ -12399,6 +12429,8 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
             if (g_game.session.TimerRunning()) {
                 g_game.mission.RecordDestruction();
                 g_game.mission.RecordCommTowerDestroyed();
+                g_game.money.Award(MoneyEvent::PropDestroyed);
+                g_game.money.Award(MoneyEvent::CommTowerDestroyed);
                 CallInReinforcementWave();
             }
             g_commTowerMusicSwell = true;
@@ -12408,8 +12440,10 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
             g_prefabRebuildReason = "comm tower felled (radius)";
             continue;
         }
-        if (g_game.session.TimerRunning())
+        if (g_game.session.TimerRunning()) {
             g_game.mission.RecordDestruction();
+            g_game.money.Award(MoneyEvent::PropDestroyed);
+        }
         // An aircraft caught in a blast goes down the same way one shot out of
         // the sky does: crash it rather than rebuilding it out of existence.
         bool downedPlane = false;
@@ -12418,8 +12452,10 @@ static void DamagePrefabsInRadius(const XMFLOAT3& center, float radius,
             downedPlane = true;
             BeginObjectivePlaneCrash(plane);
             scene.SpawnSmokeBurst(result.effectPosition, 2.4f, 0.9f);
-            if (g_game.session.TimerRunning())
+            if (g_game.session.TimerRunning()) {
                 g_game.mission.RecordObjectivePlaneDestroyed();
+                g_game.money.Award(MoneyEvent::ObjectivePlaneDestroyed);
+            }
             SGE_LOG("LogGameplay", EngineLog::Level::Display,
                 "Objective aircraft destroyed");
         }
@@ -12826,6 +12862,11 @@ static void OpenMainMenu() {
     g_prefabAudioPlayers.clear();
     g_game.session.SetScreen(GameScreen::MainMenu);
     g_game.session.StopTimer();
+    // Bank the wallet on the way out. Extraction already saves, but abandoning
+    // a run mid-mission reaches the menu through here instead -- without this,
+    // everything earned before quitting would be shown on the menu and then
+    // silently lost on the next launch.
+    SaveMoney(g_game.money);
     // Always return to the menu's root rather than whatever sub-panel was open
     // when the player last left it.
     g_showSettingsMenu = false;
@@ -13019,8 +13060,17 @@ static void StartLevelEditor(HWND hwnd,
 static void StopEditorPlaytest();
 
 static void OpenWinScreen() {
-    g_game.mission.Finish(
+    const MissionReport report = g_game.mission.Finish(
         g_game.session.ElapsedSeconds(), static_cast<uint32_t>(LiveMarineCount()));
+    // The grade pays out. Recorded before StopTimer only because nothing here
+    // is gated on the timer -- extraction is the one award that lands whatever
+    // the run state, and it is what turns the score into money.
+    g_winScreenMissionBonus = g_game.money.AwardMissionBonus(report.totalScore);
+    g_winScreenPayout = static_cast<int64_t>(g_game.money.SessionEarned());
+    // Banked to disk at extraction rather than per award: a career should not
+    // survive only if the player quits from the menu, and writing on every kill
+    // would put a file open/write in the middle of combat.
+    SaveMoney(g_game.money);
     g_game.session.StopTimer();
     g_game.session.SetScreen(GameScreen::WinScreen);
     g_greatJobAudio.Play(2.0f);
@@ -13638,7 +13688,27 @@ static void RenderMainMenu(HWND hwnd) {
                             ImVec2(ruleX + ruleWidth, cursor.y + 2.0f),
                             ImGui::GetColorU32(UITheme::kAccent), 1.0f);
     }
-    ImGui::Dummy(ImVec2(0.0f, 18.0f));
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
+
+    // Career balance, directly under the wordmark. Drawn above the settings
+    // early-out below so the number stays on screen while settings are open --
+    // it belongs to the frame of the menu rather than to the deploy list.
+    {
+        char balanceText[32];
+        MoneySystem::Format(balanceText, sizeof(balanceText),
+                            g_game.money.Balance());
+        const ImVec2 balanceSize = ImGui::CalcTextSize(balanceText);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             (contentWidth - balanceSize.x) * 0.5f);
+        ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.24f, 1.0f), "%s", balanceText);
+        const char* fundsLabel = "FUNDS";
+        const ImVec2 fundsSize = ImGui::CalcTextSize(fundsLabel);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             (contentWidth - fundsSize.x) * 0.5f);
+        ImGui::TextColored(UITheme::kTextDim, "%s", fundsLabel);
+    }
+
+    ImGui::Dummy(ImVec2(0.0f, 14.0f));
 
     // Settings replace the menu body below the title, keeping the wordmark and
     // accent rule in place so it reads as the same screen rather than a
@@ -14914,6 +14984,37 @@ static void RenderWinScreen(HWND hwnd) {
                 ImVec2(trackX + trackWidth * scoreFraction, cursor.y + 9.0f),
                 IM_COL32(255, 209, 61, 245), 3.0f);
         ImGui::Dummy(ImVec2(0.0f, 14.0f));
+    }
+
+    // ---- Payout ------------------------------------------------------------
+    //
+    // What the run was worth, sitting directly under the grade because the
+    // grade is what sets the bonus. Split into "earned in the field" and
+    // "bonus from the grade" so it is obvious that shooting things and scoring
+    // well are two separate income streams, then the new career balance.
+    ImGui::SeparatorText("PAYOUT");
+    {
+        const int64_t fieldEarnings = g_winScreenPayout - g_winScreenMissionBonus;
+        const auto moneyRow = [](const char* label, int64_t amount,
+                                 const ImVec4& tint) {
+            char text[32];
+            MoneySystem::Format(text, sizeof(text), amount);
+            ImGui::TextUnformatted(label);
+            const float textWidth = ImGui::CalcTextSize(text).x;
+            ImGui::SameLine(ImGui::GetContentRegionMax().x - textWidth);
+            ImGui::TextColored(tint, "%s", text);
+        };
+        moneyRow("Field earnings", fieldEarnings,
+                 ImVec4(0.86f, 0.90f, 0.88f, 1.0f));
+        char bonusLabel[64];
+        snprintf(bonusLabel, sizeof(bonusLabel), "Mission bonus (%d x %d)",
+                 report.totalScore, MoneySystem::kMissionBonusPerScorePoint);
+        moneyRow(bonusLabel, g_winScreenMissionBonus,
+                 ImVec4(0.86f, 0.90f, 0.88f, 1.0f));
+        ImGui::Separator();
+        moneyRow("TOTAL THIS RUN", g_winScreenPayout,
+                 ImVec4(1.0f, 0.82f, 0.24f, 1.0f));
+        moneyRow("Funds", g_game.money.Balance(), UITheme::kTextDim);
     }
 
     ImGui::SeparatorText("DEPLOYMENT");
@@ -18585,6 +18686,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         std::ofstream("engine_runtime_error.log", std::ios::app)
             << "WM_DESTROY\n";
+        // Last chance to bank the wallet: closing the window mid-run does not
+        // pass through extraction or the main menu, which are the other two
+        // save points.
+        SaveMoney(g_game.money);
         PostQuitMessage(0); return 0;
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -18926,6 +19031,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // the first time a setting is changed.
     LoadGameSettings(g_settings);
     ApplyGameSettings();
+    // Career wallet, same story: no file means a fresh career at zero rather
+    // than an error.
+    LoadMoney(g_game.money);
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX12_Init(g_dx12.device.Get(), FRAME_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM,
         imguiSrvHeap.Get(),
@@ -20725,9 +20833,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
             }
             // Smoke and a rate-limited break sound at actual fracture points.
             const auto breakPoints = g_destruction.DrainBreakPoints();
-            if (g_game.session.TimerRunning() && !breakPoints.empty())
+            if (g_game.session.TimerRunning() && !breakPoints.empty()) {
                 g_game.mission.RecordDestruction(
                     static_cast<uint32_t>(breakPoints.size()));
+                // One award for the whole batch rather than one per fracture:
+                // a collapsing building drains dozens of break points in a
+                // single frame, and a popup per chunk would bury the HUD.
+                g_game.money.Award(MoneyEvent::PropDestroyed,
+                                   static_cast<int>(breakPoints.size()));
+            }
             for (const XMFLOAT3& bp : breakPoints) {
                 scene.SpawnSmokeBurst(bp, 0.5f, 0.4f);
                 if (g_destructionBreakAudioCooldown <= 0.0f) {
