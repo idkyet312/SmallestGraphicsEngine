@@ -97,6 +97,7 @@
 #include "VehicleSystem.h"
 #include "RopeSwing.h"
 #include "DeploymentPlanner.h"
+#include "ArmoryCatalog.h"
 #include "GameRuntime.h"
 #include "DeferredReleaseQueue.h"
 #include "AssetRegistry.h"
@@ -2134,6 +2135,91 @@ static int g_selectedDeploymentZone = -1;
 static XMFLOAT3 g_deploymentTarget{};
 static bool g_deploymentTargetValid = false;
 static float g_deploymentFlythroughTime = 0.0f;
+
+// Armory ownership. The deploy screen is a shop: a weapon, grenade or gear item
+// is bought once and stays bought for the rest of the career, so re-picking it
+// on a later mission is free. Kept as bitmasks keyed by the same ids the
+// loadout stores, and saved alongside the wallet -- a career that spent 4200 on
+// an RPG would otherwise be charged again on the next launch.
+//
+// Attachments key by string id rather than an index because they are loaded
+// from data, so those live in a set instead of a mask.
+static uint32_t g_ownedWeapons = 0;
+static uint32_t g_ownedGrenades = 0;
+static uint32_t g_ownedGear = 0;
+static std::unordered_set<std::string> g_ownedAttachments;
+
+// An item priced at zero is standard issue, not a purchase: it is owned from
+// the first launch and never appears as something to buy.
+static bool ArmoryWeaponOwned(int weapon) {
+    if (weapon < 0 || weapon >= MissionLoadout::kWeaponCount) return true;
+    if (ArmoryCatalog::WeaponPrice(weapon) == 0) return true;
+    return (g_ownedWeapons & (1u << static_cast<uint32_t>(weapon))) != 0u;
+}
+
+static bool ArmoryGrenadeOwned(GrenadeType grenade) {
+    const int index = static_cast<int>(grenade);
+    if (index < 0 || index >= ArmoryCatalog::kGrenadeCount) return true;
+    if (ArmoryCatalog::kGrenadePrices[index] == 0) return true;
+    return (g_ownedGrenades & (1u << static_cast<uint32_t>(index))) != 0u;
+}
+
+static bool ArmoryGearOwned(GearType gear) {
+    const int index = static_cast<int>(gear);
+    if (index < 0 || index >= ArmoryCatalog::kGearCount) return true;
+    if (ArmoryCatalog::kGearPrices[index] == 0) return true;
+    return (g_ownedGear & (1u << static_cast<uint32_t>(index))) != 0u;
+}
+
+static bool ArmoryAttachmentOwned(const std::string& id) {
+    return g_ownedAttachments.find(id) != g_ownedAttachments.end();
+}
+
+// Bridges the armory globals to the wallet file. Packed rather than stored as an
+// ArmoryOwnership outright because the storefront reads ownership on every row
+// of every frame, and a bitmask test beats walking a struct's vector.
+static ArmoryOwnership ArmoryOwnershipSnapshot() {
+    ArmoryOwnership owned;
+    owned.weapons = g_ownedWeapons;
+    owned.grenades = g_ownedGrenades;
+    owned.gear = g_ownedGear;
+    owned.attachments.assign(g_ownedAttachments.begin(),
+                             g_ownedAttachments.end());
+    return owned;
+}
+
+static void ApplyArmoryOwnership(const ArmoryOwnership& owned) {
+    g_ownedWeapons = owned.weapons;
+    g_ownedGrenades = owned.grenades;
+    g_ownedGear = owned.gear;
+    g_ownedAttachments.clear();
+    g_ownedAttachments.insert(owned.attachments.begin(),
+                              owned.attachments.end());
+}
+
+// Saves the wallet together with what the career has bought. Every SaveMoney
+// call site goes through this so a purchase can never be persisted without the
+// balance it was paid from, or the other way round.
+static void SaveCareer() {
+    const ArmoryOwnership owned = ArmoryOwnershipSnapshot();
+    SaveMoney(g_game.money, &owned);
+}
+
+// Single purchase point, so every buy button in the storefront goes through the
+// same balance check. Returns false and changes nothing when the player cannot
+// afford it, which is what keeps the buttons honest -- they are disabled on the
+// same condition, and this is the backstop if that ever drifts.
+static bool ArmoryPurchase(int price) {
+    if (price <= 0) return true;
+    MoneySystem& wallet = g_game.money;
+    if (wallet.Balance() < price) return false;
+    // Spending is not a negative award: Award() would queue a HUD popup and
+    // subtract from session earnings, making a purchase look like a penalty on
+    // the extraction report. SetBalance moves the money without touching the
+    // earned totals, which is exactly what buying something is.
+    wallet.SetBalance(wallet.Balance() - price, wallet.TotalEarned());
+    return true;
+}
 // Missile strike armed from the deployment map. While armed, a click on the
 // map picks the impact point instead of a landing zone, so the two picking
 // modes never compete for the same click.
@@ -12866,7 +12952,7 @@ static void OpenMainMenu() {
     // a run mid-mission reaches the menu through here instead -- without this,
     // everything earned before quitting would be shown on the menu and then
     // silently lost on the next launch.
-    SaveMoney(g_game.money);
+    SaveCareer();
     // Always return to the menu's root rather than whatever sub-panel was open
     // when the player last left it.
     g_showSettingsMenu = false;
@@ -13070,7 +13156,7 @@ static void OpenWinScreen() {
     // Banked to disk at extraction rather than per award: a career should not
     // survive only if the player quits from the menu, and writing on every kill
     // would put a file open/write in the middle of combat.
-    SaveMoney(g_game.money);
+    SaveCareer();
     g_game.session.StopTimer();
     g_game.session.SetScreen(GameScreen::WinScreen);
     g_greatJobAudio.Play(2.0f);
@@ -14421,112 +14507,269 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
         "Mako Harpoon Gun", "R700 Suppressed", "M4A1", "AK-74"
     };
-    ImGui::SeparatorText("LOADOUT");
 
-    // The combo lists only weapons the player may actually take, so the retired
-    // AK-47 and the debug weapons disappear from it. The list is built as an
-    // id->row mapping rather than by trimming weaponNames, because a combo
-    // reports the row that was picked and the loadout stores the weapon id --
-    // collapsing the two would silently select the wrong gun.
-    int selectableIds[MissionLoadout::kWeaponCount] = {};
-    const char* selectableNames[MissionLoadout::kWeaponCount] = {};
-    int selectableCount = 0;
-    for (int weapon = 0; weapon < MissionLoadout::kWeaponCount; ++weapon) {
-        if (!GunModel::WeaponLoaded(weapon)) continue;
-        selectableIds[selectableCount] = weapon;
-        selectableNames[selectableCount] = weaponNames[weapon];
-        ++selectableCount;
+    // ---- Armory storefront -------------------------------------------------
+    // Three combo boxes used to hand out every weapon, grenade and gear item
+    // for free, which left the career balance with nothing to spend on. This is
+    // that same picker rebuilt as a shop front: one column of product rows per
+    // department, each showing what the item does and what it costs, with the
+    // wallet pinned above them.
+    //
+    // Buy and equip are deliberately the same click. A two-step shop (buy, then
+    // go back and equip) is a second inventory screen to build and a second
+    // place for the loadout to disagree with what was paid for; here a row is
+    // either owned-and-equippable or a price you can afford, and pressing it
+    // does whichever applies.
+    ImGui::SeparatorText("ARMORY");
+
+    {
+        char balanceText[32];
+        MoneySystem::Format(balanceText, sizeof(balanceText),
+                            g_game.money.Balance());
+        // Wallet header. Sits above the departments rather than beside the
+        // DEPLOY button because it is the number every price below is checked
+        // against -- a player scanning a row for affordability should not have
+        // to look to the other end of the panel.
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, UITheme::kPanelRaised);
+        ImGui::BeginChild("ArmoryWallet", ImVec2(0.0f, 42.0f), true);
+        ImGui::TextColored(UITheme::kTextDim, "OPERATING FUNDS");
+        ImGui::SameLine();
+        const float balanceWidth = ImGui::CalcTextSize(balanceText).x;
+        ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - balanceWidth);
+        ImGui::TextColored(UITheme::kWarning, "%s", balanceText);
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
     }
 
-    // Maps a stored weapon id back to its row. A loadout carrying a weapon that
-    // has since been hidden (a debug weapon left over from before the toggle
-    // was switched off) has no row, so the combo shows the first entry rather
-    // than an out-of-range index.
-    const auto rowForWeapon = [&](int weapon) {
-        for (int row = 0; row < selectableCount; ++row)
-            if (selectableIds[row] == weapon) return row;
-        return 0;
+    // One product row. Returns true when the row was activated, which the
+    // caller turns into a purchase and/or an equip.
+    //
+    // `owned` and `equipped` are passed in rather than derived here because the
+    // three departments store their selection differently -- weapons in two
+    // slots, grenade and gear as a single enum each -- and pushing that back to
+    // the caller keeps this drawing code identical for all of them.
+    const auto armoryRow = [&](const char* name, const char* blurb, int price,
+                               bool owned, bool equipped,
+                               const char* equippedNote) {
+        ImGui::PushID(name);
+        const bool affordable = owned || g_game.money.Balance() >= price;
+        // The row is one selectable spanning the full width with the text drawn
+        // over it, so the whole card is the click target rather than a button
+        // tucked at one end.
+        constexpr float kRowHeight = 46.0f;
+        const ImVec2 rowStart = ImGui::GetCursorScreenPos();
+        const float rowWidth = ImGui::GetContentRegionAvail().x;
+        ImGui::PushStyleColor(ImGuiCol_Header,
+                              equipped ? UITheme::kAccentDim
+                                       : UITheme::kControlHeld);
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, UITheme::kControlHover);
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, UITheme::kAccentDim);
+        // Equipped rows stay highlighted; unaffordable ones are inert so the
+        // player cannot commit to something the balance will refuse.
+        ImGui::BeginDisabled(!affordable);
+        const bool pressed = ImGui::Selectable("##row", equipped,
+                                               ImGuiSelectableFlags_None,
+                                               ImVec2(0.0f, kRowHeight));
+        ImGui::EndDisabled();
+        ImGui::PopStyleColor(3);
+
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const float textX = rowStart.x + 10.0f;
+        // Dim the whole card when it is out of reach, so "cannot afford" reads
+        // at a glance instead of only from the price.
+        const ImVec4& nameColor = !affordable ? UITheme::kTextDim
+                                : equipped    ? UITheme::kAccent
+                                              : UITheme::kText;
+        draw->AddText(ImVec2(textX, rowStart.y + 6.0f),
+                      ImGui::GetColorU32(nameColor), name);
+
+        // Price, right-aligned. Owned items show their status rather than a
+        // number -- the money is already spent, and repeating the price would
+        // read as a charge that is about to happen again.
+        char priceText[32];
+        const char* rightText = priceText;
+        ImVec4 rightColor = UITheme::kWarning;
+        if (equipped) {
+            rightText = "EQUIPPED";
+            rightColor = UITheme::kAccent;
+        } else if (owned) {
+            rightText = price > 0 ? "OWNED" : "ISSUED";
+            rightColor = UITheme::kTextDim;
+        } else {
+            MoneySystem::Format(priceText, sizeof(priceText), price);
+            if (!affordable) rightColor = ImVec4(0.75f, 0.32f, 0.28f, 1.0f);
+        }
+        const float rightWidth = ImGui::CalcTextSize(rightText).x;
+        draw->AddText(
+            ImVec2(rowStart.x + rowWidth - rightWidth - 10.0f,
+                   rowStart.y + 6.0f),
+            ImGui::GetColorU32(rightColor), rightText);
+
+        // Second line: the shop copy, or why the row cannot be taken. The
+        // reason displaces the blurb rather than joining it, because a player
+        // who cannot afford a row does not need to be sold on it.
+        const char* subText = blurb;
+        if (equipped && equippedNote) subText = equippedNote;
+        else if (!affordable) subText = "Insufficient funds.";
+        draw->AddText(ImVec2(textX, rowStart.y + 25.0f),
+                      ImGui::GetColorU32(UITheme::kTextDim), subText);
+
+        ImGui::PopID();
+        return pressed && affordable;
     };
 
-    if (selectableCount > 0) {
-        int primaryRow = rowForWeapon(loadout.weapons[0]);
-        if (ImGui::Combo("Primary", &primaryRow, selectableNames,
-                         selectableCount))
-            loadout.SelectWeapon(0, selectableIds[primaryRow]);
-        int secondaryRow = rowForWeapon(loadout.weapons[1]);
-        if (ImGui::Combo("Secondary", &secondaryRow, selectableNames,
-                         selectableCount))
-            loadout.SelectWeapon(1, selectableIds[secondaryRow]);
+    // ---- Weapons -----------------------------------------------------------
+    // Which slot a purchase fills. A shop row cannot know whether the player
+    // means it as their primary or their secondary, so the slot is a mode the
+    // player sets first and the rows then fill.
+    static int armorySlot = 0;
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    ImGui::TextColored(UITheme::kTextDim, "SMALL ARMS");
+    {
+        const auto slotTab = [&](const char* label, int slot) {
+            const bool active = armorySlot == slot;
+            if (active) {
+                ImGui::PushStyleColor(ImGuiCol_Button, UITheme::kAccentDim);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UITheme::kAccent);
+            }
+            char tabText[64];
+            const int weapon = loadout.weapons[static_cast<size_t>(slot)];
+            std::snprintf(tabText, sizeof(tabText), "%s: %s", label,
+                          (weapon >= 0 && weapon < MissionLoadout::kWeaponCount)
+                              ? weaponNames[weapon] : "--");
+            if (ImGui::Button(tabText, ImVec2(196.0f, 30.0f)))
+                armorySlot = slot;
+            if (active) ImGui::PopStyleColor(2);
+        };
+        slotTab("Slot 1", 0);
+        ImGui::SameLine();
+        slotTab("Slot 2", 1);
+    }
+    ImGui::TextDisabled("Buying a weapon racks it in the highlighted slot.");
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+
+    for (int weapon = 0; weapon < MissionLoadout::kWeaponCount; ++weapon) {
+        // Same gate the old combo used: hidden and debug weapons are not stock.
+        if (!GunModel::WeaponLoaded(weapon)) continue;
+        const int price = ArmoryCatalog::WeaponPrice(weapon);
+        const bool owned = ArmoryWeaponOwned(weapon);
+        // Equipped means "in the slot this shop is currently filling". A weapon
+        // held in the other slot still shows as owned and pickable, and taking
+        // it swaps the two -- SelectWeapon already does exactly that.
+        const bool equipped =
+            loadout.weapons[static_cast<size_t>(armorySlot)] == weapon;
+        const char* note = loadout.ContainsWeapon(weapon) && !equipped
+            ? "Racked in the other slot."
+            : ArmoryCatalog::WeaponBlurb(weapon);
+        if (armoryRow(weaponNames[weapon], note, price, owned, equipped,
+                      "Racked in this slot.")) {
+            if (owned || ArmoryPurchase(price)) {
+                g_ownedWeapons |= (1u << static_cast<uint32_t>(weapon));
+                loadout.SelectWeapon(static_cast<size_t>(armorySlot), weapon);
+            }
+        }
     }
 
-    // The toggle itself. Sits with the loadout because that is where its effect
-    // shows up: flipping it repopulates both combos above on the next frame.
+    // The toggle itself. Sits with the weapon department because that is where
+    // its effect shows up: flipping it repopulates the rows above next frame.
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
     bool debugWeapons = GunModel::DebugWeaponsEnabled();
     if (ImGui::Checkbox("Debug weapons (laser cutter, flamethrower, harpoon)",
                         &debugWeapons))
         GunModel::SetDebugWeaponsEnabled(debugWeapons);
     ImGui::TextDisabled(debugWeapons
-        ? "Laser cutter, flamethrower and harpoon gun are selectable."
-        : "Development weapons are hidden from the loadout and weapon cycle.");
+        ? "Laser cutter, flamethrower and harpoon gun are stocked."
+        : "Development weapons are hidden from the armory and weapon cycle.");
 
-    auto drawWeaponAttachments = [&](const char* slotLabel, int weapon) {
+    // ---- Attachments -------------------------------------------------------
+    // Priced per part and owned by attachment id: buying a suppressor once
+    // stocks it for every weapon it fits, which is how a quartermaster's shelf
+    // works and avoids charging twice for the same part.
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    ImGui::TextColored(UITheme::kTextDim, "WEAPON ATTACHMENTS");
+    const auto drawWeaponAttachments = [&](const char* slotLabel, int weapon) {
         ImGui::PushID(slotLabel);
-        ImGui::TextDisabled("%s attachments", slotLabel);
+        ImGui::TextDisabled("%s -- %s", slotLabel,
+                            (weapon >= 0 && weapon < MissionLoadout::kWeaponCount)
+                                ? weaponNames[weapon] : "--");
         bool anyCompatible = false;
         for (const SGE::AttachmentDefinition& attachment :
              scene.player.weapons.Attachments()) {
             if (!attachment.CompatibleWith(weapon)) continue;
             anyCompatible = true;
-            bool equipped = scene.player.weapons.AttachmentInstalled(
+            const int price = ArmoryCatalog::AttachmentPrice(
+                attachment.suppressesWeapon, attachment.providesRedDot,
+                attachment.providesLaser);
+            const bool owned = ArmoryAttachmentOwned(attachment.id);
+            const bool installed = scene.player.weapons.AttachmentInstalled(
                 weapon, attachment.id);
-            ImGui::PushID(attachment.id.c_str());
-            if (ImGui::Checkbox(attachment.displayName.c_str(), &equipped)) {
-                if (equipped)
-                    scene.player.weapons.EquipAttachment(weapon, attachment.id);
-                else
+            const char* blurb =
+                attachment.suppressesWeapon
+                    ? "Quieter report, smaller flash, slightly less recoil."
+                : attachment.providesRedDot
+                    ? "Clear red aiming point and a tighter sight picture."
+                : attachment.providesLaser
+                    ? "Visible designator and tighter hip-fire spread."
+                    : "Fitted accessory.";
+            if (armoryRow(attachment.displayName.c_str(), blurb, price, owned,
+                          installed, "Fitted. Select to remove.")) {
+                if (installed) {
+                    // Removal is free and does not refund: the part is owned,
+                    // and taking it off a rail is not selling it back.
                     scene.player.weapons.RemoveAttachment(weapon,
                                                           attachment.slot);
+                } else if (owned || ArmoryPurchase(price)) {
+                    g_ownedAttachments.insert(attachment.id);
+                    scene.player.weapons.EquipAttachment(weapon, attachment.id);
+                }
             }
-            if (ImGui::IsItemHovered()) {
-                if (attachment.suppressesWeapon)
-                    ImGui::SetTooltip(
-                        "Quieter report, smaller flash and slightly less recoil.");
-                else if (attachment.providesRedDot)
-                    ImGui::SetTooltip(
-                        "Clear red aiming point and a tighter ADS sight picture.");
-                else if (attachment.providesLaser)
-                    ImGui::SetTooltip(
-                        "Visible red designator and tighter hip-fire spread.");
-            }
-            ImGui::PopID();
         }
         if (!anyCompatible)
             ImGui::TextDisabled("No attachment rails available.");
         ImGui::PopID();
     };
-    drawWeaponAttachments("Primary", loadout.weapons[0]);
-    drawWeaponAttachments("Secondary", loadout.weapons[1]);
-    // C4 is demolition kit rather than a weapon pick, so it is carried on every
-    // mission without spending a slot -- otherwise a player who chose two rifles
-    // would have no way to take down a demolition objective.
-    ImGui::TextDisabled("Remote C4 is always carried (demolition charge).");
-    int grenade = static_cast<int>(loadout.grenade);
-    static constexpr const char* grenadeNames[] = { "Frag", "Molotov", "Vortex" };
-    if (ImGui::Combo("Grenade", &grenade, grenadeNames,
-                     static_cast<int>(std::size(grenadeNames)))) {
-        loadout.grenade = static_cast<GrenadeType>(grenade);
-        scene.selectedGrenade = loadout.grenade;
+    drawWeaponAttachments("Slot 1", loadout.weapons[0]);
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    drawWeaponAttachments("Slot 2", loadout.weapons[1]);
+
+    // ---- Grenades ----------------------------------------------------------
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    ImGui::TextColored(UITheme::kTextDim, "ORDNANCE");
+    for (int index = 0; index < ArmoryCatalog::kGrenadeCount; ++index) {
+        const GrenadeType type = static_cast<GrenadeType>(index);
+        const int price = ArmoryCatalog::kGrenadePrices[index];
+        const bool owned = ArmoryGrenadeOwned(type);
+        const bool equipped = loadout.grenade == type;
+        if (armoryRow(ArmoryCatalog::kGrenadeNames[index],
+                      ArmoryCatalog::kGrenadeBlurbs[index], price, owned,
+                      equipped, "Carried on this mission.")) {
+            if (owned || ArmoryPurchase(price)) {
+                g_ownedGrenades |= (1u << static_cast<uint32_t>(index));
+                loadout.grenade = type;
+                scene.selectedGrenade = type;
+            }
+        }
     }
-    // Gear slot: carried equipment that costs neither a weapon slot nor the
-    // grenade pick. Empty is a valid choice, so None is the first entry rather
-    // than a placeholder.
-    int gear = static_cast<int>(loadout.gear);
-    static constexpr const char* gearNames[] = {
-        "None", "NVG (Night Vision Goggles)", "Flashlight (weapon light)"
-    };
-    if (ImGui::Combo("Gear", &gear, gearNames,
-                     static_cast<int>(std::size(gearNames))))
-        loadout.gear = static_cast<GearType>(gear);
+
+    // ---- Gear --------------------------------------------------------------
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    ImGui::TextColored(UITheme::kTextDim, "FIELD GEAR");
+    for (int index = 0; index < ArmoryCatalog::kGearCount; ++index) {
+        const GearType type = static_cast<GearType>(index);
+        const int price = ArmoryCatalog::kGearPrices[index];
+        const bool owned = ArmoryGearOwned(type);
+        const bool equipped = loadout.gear == type;
+        if (armoryRow(ArmoryCatalog::kGearNames[index],
+                      ArmoryCatalog::kGearBlurbs[index], price, owned,
+                      equipped, "Carried on this mission.")) {
+            if (owned || ArmoryPurchase(price)) {
+                g_ownedGear |= (1u << static_cast<uint32_t>(index));
+                loadout.gear = type;
+            }
+        }
+    }
+    // Usage notes for the equipped item, kept below the shelf rather than on
+    // the row: they are about using the gear, not about buying it.
     if (loadout.gear == GearType::NightVisionGoggles) {
         ImGui::TextDisabled("Press J in the field to raise or lower goggles.");
         if (!TimeOfDayIsDark(g_selectedTimeOfDay))
@@ -14538,6 +14781,12 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         if (!TimeOfDayIsDark(g_selectedTimeOfDay))
             ImGui::TextDisabled("Little use at this time of day.");
     }
+
+    // C4 is demolition kit rather than a weapon pick, so it is carried on every
+    // mission without spending a slot or a cent -- otherwise a player who chose
+    // two rifles would have no way to take down a demolition objective.
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    ImGui::TextDisabled("Remote C4 is issued free on every mission.");
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
     ImGui::SeparatorText("DIFFICULTY");
     // Per-run choice rather than a launcher-level mode. Applied straight to the
@@ -18744,7 +18993,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Last chance to bank the wallet: closing the window mid-run does not
         // pass through extraction or the main menu, which are the other two
         // save points.
-        SaveMoney(g_game.money);
+        SaveCareer();
         PostQuitMessage(0); return 0;
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -19088,7 +19337,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     ApplyGameSettings();
     // Career wallet, same story: no file means a fresh career at zero rather
     // than an error.
-    LoadMoney(g_game.money);
+    {
+        ArmoryOwnership ownedItems;
+        LoadMoney(g_game.money, &ownedItems);
+        ApplyArmoryOwnership(ownedItems);
+    }
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX12_Init(g_dx12.device.Get(), FRAME_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM,
         imguiSrvHeap.Get(),

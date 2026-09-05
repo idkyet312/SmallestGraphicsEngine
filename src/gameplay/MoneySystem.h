@@ -203,9 +203,57 @@ private:
 
 inline const char* MoneySavePath() { return "wallet.ini"; }
 
+// Armory ownership, persisted next to the wallet. Purchases are career state
+// for the same reason the balance is: a player who spent 4200 on an RPG on
+// mission one must not be charged for it again on mission two, and the two
+// numbers only make sense read together -- a balance restored without its
+// purchases would look like the money simply vanished.
+//
+// Written as its own section of wallet.ini rather than a second file, so
+// "delete this to start a fresh career" stays one instruction.
+struct ArmoryOwnership {
+    uint32_t weapons = 0;
+    uint32_t grenades = 0;
+    uint32_t gear = 0;
+    // Attachment ids are strings loaded from data, so they are stored by name.
+    // Serialised as one comma-separated value: the set is small (a handful of
+    // rails), and a key per attachment would grow the file with every part
+    // added to the data table.
+    std::vector<std::string> attachments;
+};
+
+inline std::string EncodeAttachmentList(
+    const std::vector<std::string>& attachments) {
+    std::string encoded;
+    for (const std::string& id : attachments) {
+        // Skip an id carrying the separator rather than writing a line that
+        // would parse back as two attachments.
+        if (id.empty() || id.find(',') != std::string::npos) continue;
+        if (!encoded.empty()) encoded.push_back(',');
+        encoded += id;
+    }
+    return encoded;
+}
+
+inline std::vector<std::string> DecodeAttachmentList(const std::string& value) {
+    std::vector<std::string> ids;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t comma = value.find(',', start);
+        const size_t end = comma == std::string::npos ? value.size() : comma;
+        if (end > start) ids.push_back(value.substr(start, end - start));
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return ids;
+}
+
 // Missing file is the first career, not a failure: the caller keeps the zero
 // balance already in `out`.
-inline bool LoadMoney(MoneySystem& out) {
+// `owned` is optional so the call sites that only care about the balance (the
+// main menu's funds readout) do not have to carry a bag of purchase state they
+// will not read.
+inline bool LoadMoney(MoneySystem& out, ArmoryOwnership* owned = nullptr) {
     std::ifstream file(MoneySavePath());
     if (!file) return false;
 
@@ -234,19 +282,48 @@ inline bool LoadMoney(MoneySystem& out) {
         if (key == "Balance") balance = std::strtoll(value.c_str(), nullptr, 10);
         else if (key == "TotalEarned")
             totalEarned = std::strtoll(value.c_str(), nullptr, 10);
+        else if (owned && key == "OwnedWeapons")
+            owned->weapons = static_cast<uint32_t>(
+                std::strtoul(value.c_str(), nullptr, 10));
+        else if (owned && key == "OwnedGrenades")
+            owned->grenades = static_cast<uint32_t>(
+                std::strtoul(value.c_str(), nullptr, 10));
+        else if (owned && key == "OwnedGear")
+            owned->gear = static_cast<uint32_t>(
+                std::strtoul(value.c_str(), nullptr, 10));
+        else if (owned && key == "OwnedAttachments")
+            owned->attachments = DecodeAttachmentList(value);
     }
     out.SetBalance(balance, totalEarned);
     return true;
 }
 
-inline bool SaveMoney(const MoneySystem& money) {
+// The file is rewritten whole, so a save that was not handed the purchase state
+// would drop every OwnedX key and hand the player's armory back for free. That
+// is why `owned` is read from disk here when the caller does not supply it,
+// rather than defaulting to an empty set: a balance-only save must preserve
+// what it does not know about.
+inline bool SaveMoney(const MoneySystem& money,
+                      const ArmoryOwnership* owned = nullptr) {
+    ArmoryOwnership preserved;
+    if (!owned) {
+        MoneySystem discarded;
+        LoadMoney(discarded, &preserved);
+        owned = &preserved;
+    }
     std::ofstream file(MoneySavePath(), std::ios::trunc);
     if (!file) return false;
     file << "; Smallest Graphics Engine wallet.\n"
          << "; Delete this file to start a fresh career.\n"
          << "[Money]\n"
          << "Balance=" << money.Balance() << "\n"
-         << "TotalEarned=" << money.TotalEarned() << "\n";
+         << "TotalEarned=" << money.TotalEarned() << "\n"
+         << "\n[Armory]\n"
+         << "OwnedWeapons=" << owned->weapons << "\n"
+         << "OwnedGrenades=" << owned->grenades << "\n"
+         << "OwnedGear=" << owned->gear << "\n"
+         << "OwnedAttachments=" << EncodeAttachmentList(owned->attachments)
+         << "\n";
     return file.good();
 }
 
