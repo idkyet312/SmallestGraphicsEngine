@@ -112,7 +112,7 @@ struct ResolvedWeaponStats {
 
 class WeaponCustomizationSystem {
 public:
-    static constexpr int kWeaponCount = 11;
+    static constexpr int kWeaponCount = 12;
     static constexpr size_t kAttachmentCount = 3;
     // Multiplies every weapon's authored aim kick. 1.0 is as-authored; 2.0 is
     // twice the climb per shot. Scales the camera recoil -- the part that
@@ -175,6 +175,14 @@ public:
               300.0f, 0.55f, 0.22f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
               1.0f, 42.0f, 2.0f, false,
               "Content/Models/MainPlayer/Guns/Ak74/ak74.glb", "" },
+            // The sidearm, and the only weapon here that is not a long gun. It
+            // trades reach and magazine for the fastest draw in the armory:
+            // half the reload time of the rifles and the lowest damage, so it
+            // is a backup rather than a competitor to a primary.
+            { "m9", "M9", 11, 15, 60, 120, 1.05f, 0.12f, 0.8f,
+              240.0f, 0.62f, 0.26f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+              1.0f, 26.0f, 1.4f, false,
+              "Content/Models/MainPlayer/Guns/m9/M9.glb", "" },
         }};
 
         const uint32_t ak = 1u << 0;
@@ -186,9 +194,13 @@ public:
         // the only one in the game with no attachments at all -- the masks were
         // written when slot 0 was the rifle everyone carried.
         const uint32_t ak74 = 1u << 10;
+        // The sidearm takes a muzzle can but neither the red dot nor the side
+        // rail: both are authored against a rifle's receiver rail, and the M9
+        // has no rail to mount them on.
+        const uint32_t m9 = 1u << 11;
         attachments_ = {{
             { "silencer", "Silencer", AttachmentSlot::Muzzle, 10,
-              ak | ak74 | svd | m4,
+              ak | ak74 | svd | m4 | m9,
               { 0.86f, 1.0f, 1.0f, 0.25f, 0.55f, 0.35f, 0.60f, 0.0f },
               true, false, false, "procedural/attachments/silencer" },
             { "red_dot", "Red Dot Sight", AttachmentSlot::Optic, 20,

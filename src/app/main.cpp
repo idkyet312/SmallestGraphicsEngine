@@ -14505,7 +14505,7 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     static constexpr const char* weaponNames[MissionLoadout::kWeaponCount] = {
         "AK47", "Remington 870", "RPG-7", "R700 Sniper",
         "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
-        "Mako Harpoon Gun", "R700 Suppressed", "M4A1", "AK-74"
+        "Mako Harpoon Gun", "R700 Suppressed", "M4A1", "AK-74", "M9"
     };
 
     // ---- Armory storefront -------------------------------------------------

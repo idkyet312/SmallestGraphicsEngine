@@ -39,6 +39,7 @@ struct ArmoryCatalog {
         3000,   // 8  R700 Suppressed (retired)
         1500,   // 9  M4A1
         0,      // 10 AK-74 (standard issue)
+        700,    // 11 M9
     };
 
     // One line of shop copy per weapon. The combo box gave a bare name and left
@@ -56,6 +57,7 @@ struct ArmoryCatalog {
         "Retired from service.",
         "Carbine. Flatter recoil than the issue rifle and faster to aim.",
         "Standard issue rifle. Drawn from stores at no cost.",
+        "Sidearm. Draws and reloads faster than any rifle, and hits softer.",
     };
 
     static constexpr int kGrenadeCount = 3;

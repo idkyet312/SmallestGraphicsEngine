@@ -550,10 +550,11 @@ int main() {
     player.UpdateReload(10.0f);
     CHECK(player.Magazine(0) == 5);
     CHECK(player.Reserve(0) == 0);
-    // 11: the suppressed SVD took slot 8, the M4A1 slot 9 and the AK-74
-    // slot 10. Tracks WeaponCustomizationSystem::kWeaponCount, which is what
-    // PlayerState sizes its ammo arrays from.
-    CHECK(PlayerState::kWeaponSlots == 11);
+    // 12: the suppressed SVD took slot 8, the M4A1 slot 9, the AK-74
+    // slot 10 and the M9 slot 11. Tracks
+    // WeaponCustomizationSystem::kWeaponCount, which is what PlayerState sizes
+    // its ammo arrays from.
+    CHECK(PlayerState::kWeaponSlots == 12);
     CHECK(player.SetAmmo(4, 1, 0));
     CHECK(player.ConsumeAmmo(4));
     CHECK(player.Magazine(4) == 0);

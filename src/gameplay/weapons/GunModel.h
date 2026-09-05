@@ -108,6 +108,15 @@ public:
     }
     static bool AK74Loaded() { return AK74Mesh() != nullptr; }
 
+    // M9: the first sidearm. Not a variant of anything above it -- a pistol is
+    // its own weapon class, so it carries its own stats, its own fit scale and
+    // its own grip rather than inheriting a rifle's.
+    static std::shared_ptr<SceneMesh>& M9Mesh() {
+        static std::shared_ptr<SceneMesh> mesh;
+        return mesh;
+    }
+    static bool M9Loaded() { return M9Mesh() != nullptr; }
+
     // The M4's iron sights, split from the body at load. Drawn only when no
     // optic is fitted: a red dot mounts directly over them, and the rear leaf
     // would otherwise stand up through the sight body.
@@ -128,7 +137,7 @@ public:
 
     // Highest valid weapon id. Several parallel tables are sized to this, so
     // adding a weapon means extending every one of them.
-    static constexpr int kMaxWeapon = 10;
+    static constexpr int kMaxWeapon = 11;
 
     // The AK-74 is the standard-issue rifle. The AK-47 in slot 0 is retired
     // from selection (see kHiddenWeapon) but stays loaded, because its mesh is
@@ -179,7 +188,7 @@ public:
 
     static int& SelectedWeapon() {
         // 0 AK (hidden), 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame,
-        // 7 harpoon, 8 suppressed SVD, 9 M4A1, 10 AK-74
+        // 7 harpoon, 8 suppressed SVD, 9 M4A1, 10 AK-74, 11 M9
         static int weapon = kDefaultWeapon;
         return weapon;
     }
@@ -187,7 +196,8 @@ public:
         static constexpr const char* names[kMaxWeapon + 1] = {
             "AK47", "Remington 870", "RPG-7", "R700 Sniper",
             "ARC Laser Cutter", "Remote C4", "M2 Flamethrower",
-            "Mako Harpoon Gun", "R700 Suppressed", "M4A1", "AK-74"
+            "Mako Harpoon Gun", "R700 Suppressed", "M4A1", "AK-74",
+            "M9"
         };
         return names[(std::max)(0, (std::min)(weapon, kMaxWeapon))];
     }
@@ -208,6 +218,7 @@ public:
     static bool HarpoonSelected() { return SelectedWeapon() == 7; }
     static bool M4Selected() { return SelectedWeapon() == 9 && M4Loaded(); }
     static bool AK74Selected() { return SelectedWeapon() == 10 && AK74Loaded(); }
+    static bool M9Selected() { return SelectedWeapon() == 11 && M9Loaded(); }
     static const char* SelectedWeaponName() {
         return WeaponName(SelectedWeapon());
     }
@@ -219,6 +230,7 @@ public:
             return ShotgunLoaded() ? ShotgunMesh() : Mesh();
         if (M4Selected()) return M4Mesh();
         if (AK74Selected()) return AK74Mesh();
+        if (M9Selected()) return M9Mesh();
         if (R700Selected()) return R700Mesh();
         if (RPGSelected()) return RPGMesh();
         return ShotgunSelected() ? ShotgunMesh() : Mesh();
@@ -250,6 +262,12 @@ public:
             // the same barrel length, and the AK-74 shares the AK pattern, so
             // the support hand lands in the same place on the handguard.
             { 0.000f, -0.100f, -0.440f }, // AK-74 handguard
+            // Tuned in game against the render, not derived. The fit scale
+            // below shrinks this pistol to a quarter of the rifles' length,
+            // and the Y-flip in the fit rotation turns it to face forward --
+            // between them the mesh ends up needing a large positive Z to
+            // bring it back into frame, unlike any of the long guns.
+            { 0.345f, 0.050f, 1.895f }, // M9 grip
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -277,6 +295,11 @@ public:
             { 0.0f, 0.0f, 0.0f },   // SVD suppressed
             { 0.0f, 0.0f, 0.0f },   // M4A1
             { 0.0f, 0.0f, 0.0f },   // AK-74
+            // The export points down -Z once Orient has normalised it, so the
+            // pistol faces the camera without this half-turn. 187 rather than
+            // a clean 180: the mesh is a few degrees off square to its own
+            // bounding box, which Orient's axis fit cannot correct for.
+            { 0.0f, 187.0f, 0.0f }, // M9
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return rotations[static_cast<size_t>(slot)];
@@ -307,6 +330,11 @@ public:
             1.00f, // SVD suppressed
             1.00f, // M4A1
             1.00f, // AK-74
+            // Orient normalises every gun to the same 1.25-unit barrel, which
+            // would render this pistol the length of a rifle. A Beretta M9 is
+            // about 217mm against the AK's 870mm, so it is scaled back to that
+            // real ratio instead of being left rifle-sized in the hands.
+            0.25f, // M9
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return scales[static_cast<size_t>(slot)];
@@ -342,6 +370,10 @@ public:
             // length, so both the position and the size differ.
             { 0.009f, 0.114f, 0.470f }, // M4A1 flat-top rail
             { 0.012f, 0.154f, 0.376f }, // AK-74 rear receiver rail
+            // No optic accepts the M9 (see the compatibility masks in
+            // WeaponCustomization.h); this is the shared starting pose, kept so
+            // widening that mask later puts a sight near the slide, not adrift.
+            { 0.012f, 0.154f, 0.376f }, // M9
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -367,6 +399,7 @@ public:
             // Small correction for the rail's own pitch and cant.
             {-5.0f, -1.0f, 0.0f }, // M4A1
             { 0.0f,  0.0f, 0.0f }, // AK-74
+            { 0.0f,  0.0f, 0.0f }, // M9
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return rotations[static_cast<size_t>(slot)];
@@ -383,7 +416,8 @@ public:
             // than the AK does, so the same sight needs scaling up to stay a
             // believable size on its rail.
             3.07f, // M4A1
-            1.00f  // AK-74: imports at the AK47 proportions
+            1.00f, // AK-74: imports at the AK47 proportions
+            1.00f  // M9
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return scales[static_cast<size_t>(slot)];
@@ -412,6 +446,7 @@ public:
             // instead of back and low on a dust cover.
             {-0.000f,  0.164f,  0.789f }, // M4A1
             { 0.000f, -1.000f, -0.600f }, // AK-74
+            { 0.000f, -1.000f, -0.600f }, // M9
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -480,6 +515,7 @@ public:
         case 8: return R700Loaded(); // suppressed variant of the same rifle
         case 9: return M4Loaded();
         case 10: return AK74Loaded();
+        case 11: return M9Loaded();
         default: return false;
         }
     }
@@ -654,6 +690,7 @@ public:
         LoadR700();
         // After the AK47 above, whose material this reuses.
         LoadAK74();
+        LoadM9();
     }
 
     // Keep the material alive: its texture uploads stay referenced by the open
@@ -876,6 +913,67 @@ private:
                 first && first->baseColorTexture ? 1 : 0,
                 first && first->normalTexture ? 1 : 0,
                 first && first->metallicRoughnessTexture ? 1 : 0);
+            std::fclose(file);
+        }
+    }
+
+    // The M9 sidearm. Its GLB carries a complete PBR set of its own, so like
+    // the AK-74 it borrows no material and has no ordering dependency on the
+    // AK47 load above it.
+    static void LoadM9() {
+        const std::string path = Resolve(
+            "Content/Models/MainPlayer/Guns/m9/M9.glb");
+        auto root = GLBImporter::LoadGLB(
+            path, g_dx12.device, g_dx12.commandList);
+        if (!root) {
+            std::cerr << "M9 GLB unavailable; weapon slot stays empty\n";
+            return;
+        }
+
+        std::vector<MeshPrimitive> prims;
+        XMFLOAT4X4 identity;
+        XMStoreFloat4x4(&identity, XMMatrixIdentity());
+        root->UpdateGlobalTransform(identity);
+        Flatten(root, prims);
+        if (prims.empty()) {
+            std::cerr << "M9 GLB had no geometry\n";
+            return;
+        }
+
+        // The asset is authored standing upright -- taller (2.0) than it is
+        // long (1.31) in raw mesh space, which would make Orient read the
+        // pistol's vertical as its barrel. Its node carries a +90 degree X
+        // rotation that Flatten bakes in first, and the baked extents put Z
+        // longest (0.69 vs 0.45), so the barrel axis resolves correctly here.
+        // Measured, not assumed: change the export and re-check this.
+        Orient(prims);
+
+        auto mesh = std::make_shared<SceneMesh>();
+        mesh->primitives = std::move(prims);
+        for (MeshPrimitive& primitive : mesh->primitives) {
+            if (primitive.material)
+                primitive.material->disableOcclusionCulling = true;
+            GLBImporter::BuildMeshletData(primitive, g_dx12.device.Get());
+        }
+        M9Mesh() = mesh;
+        std::cout << "M9 loaded: " << mesh->primitives.size()
+                  << " primitive(s)\n";
+        if (FILE* file = std::fopen("gun_load.log", "a")) {
+            size_t triangles = 0, vertices = 0;
+            for (const MeshPrimitive& primitive : mesh->primitives) {
+                triangles += primitive.indices.size() / 3;
+                vertices += primitive.vertices.size() / 12;
+            }
+            const auto& first = mesh->primitives.front().material;
+            std::fprintf(file,
+                "m9_loaded=1 prims=%zu verts=%zu tris=%zu"
+                " albedo=%d normal=%d packedMR=%d\n",
+                mesh->primitives.size(), vertices, triangles,
+                first && first->baseColorTexture ? 1 : 0,
+                first && first->normalTexture ? 1 : 0,
+                first && first->metallicRoughnessTexture ? 1 : 0);
+            std::fprintf(file, "m9_bounds x[%.3f..%.3f] y[%.3f..%.3f] z[%.3f..%.3f]\n",
+                         s_lo.x, s_hi.x, s_lo.y, s_hi.y, s_lo.z, s_hi.z);
             std::fclose(file);
         }
     }
