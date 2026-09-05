@@ -165,11 +165,12 @@ static bool                 g_insertionBoatRestartPending = false;
 enum class InsertionAirframe : int {
     // The rigged UH-60. Its rotor is skinned to a bone and turns in flight.
     BlackHawk = 0,
-    // The second airframe. Unrigged, so its blades stay static -- see the
-    // comment on g_blackHawkSkeleton.
+    // The current airframe. Its rotor disc is a separate mesh parented to a
+    // 'Bone' node, so it turns by rotating that node rather than through the
+    // skinning palette -- see g_newBlackHawkRotorNode.
     NewBlackHawk = 1
 };
-static InsertionAirframe    g_insertionAirframe = InsertionAirframe::BlackHawk;
+static InsertionAirframe    g_insertionAirframe = InsertionAirframe::NewBlackHawk;
 // Both airframes stay resident once loaded. g_blackHawkModel below points at
 // whichever is selected, so every consumer -- the draw, the bounds, the ride
 // point, the collision bake -- keeps working through the existing pointer with
@@ -190,6 +191,14 @@ XMFLOAT3                    g_blackHawkRideMeshPosition{};
 static bool                 g_blackHawkInsertionRestartPending = false;
 Skeleton                    g_blackHawkSkeleton;
 static int                  g_blackHawkRotorBone = -1;
+// The NewBlackHawk's rotor. That GLB carries a skin whose single joint drives
+// nothing -- neither mesh node references the skin and no primitive has
+// JOINTS_0/WEIGHTS_0 -- so the palette path cannot turn its blades. What it does
+// have is the disc as its own mesh parented to a 'Bone' node, which is cheaper
+// anyway: one quaternion write a frame against a node the draw already reads
+// (DrawSceneNodeMesh uses globalTransform per node), versus rebuilding and
+// uploading a palette. Null for the skinned UH-60, which keeps the palette path.
+static std::shared_ptr<SceneNode> g_newBlackHawkRotorNode;
 std::vector<XMFLOAT4X4>     g_blackHawkPalette;
 static ComPtr<ID3D12Resource> g_blackHawkPaletteBuffer[FRAME_COUNT];
 static void*                g_blackHawkPaletteMapped[FRAME_COUNT] = {};
@@ -2136,6 +2145,21 @@ static XMFLOAT3 g_deploymentTarget{};
 static bool g_deploymentTargetValid = false;
 static float g_deploymentFlythroughTime = 0.0f;
 
+// Marines the player elects to bring on the transport, chosen on the deploy
+// screen. They are NOT spawned when DEPLOY is pressed: the squad rides in the
+// same aircraft or boat the player does, so it only reaches the ground if that
+// transport does. A crash or a sinking loses everyone aboard.
+static int g_deploymentMarineCount = 0;
+static constexpr int kMaxDeploymentMarines = 8;
+// Raised for one frame by the ride/release code the moment a transport sets the
+// player down intact. Consumed after both vehicle updates run, because the
+// spawn needs terrain helpers declared further down this file.
+static bool g_marineDropPending = false;
+// Where the squad steps off, banked alongside the flag: the wreck-thrown and
+// bailed-out paths move the camera, so the landing point cannot be recovered
+// from it after the fact.
+static XMFLOAT3 g_marineDropOrigin{};
+
 // Armory ownership. The deploy screen is a shop: a weapon, grenade or gear item
 // is bought once and stays bought for the rest of the career, so re-picking it
 // on a later mission is free. Kept as bitmasks keyed by the same ids the
@@ -2305,6 +2329,9 @@ static void CancelDeploymentPlanning() {
     g_deploymentTarget = {};
     g_deploymentTargetValid = false;
     g_deploymentFlythroughTime = 0.0f;
+    // A cancelled plan never puts a transport in the air, so a drop banked from
+    // a previous attempt must not survive into the next one.
+    g_marineDropPending = false;
     g_deploymentZoom = 1.0f;
     g_deploymentOrbitDragging = false;
     g_deploymentOrbitOffset = 0.0f;
@@ -2372,8 +2399,24 @@ static void StartBlackHawkInsertionAtPlayerSpawn() {
 
 static void UpdateBlackHawkPalette();
 
-// Turns the blades by reposing the rig's rotor bone.
-static void SpinBlackHawkRotor() { UpdateBlackHawkPalette(); }
+// Turns the blades to the current g_blackHawkRotorSpin angle, by whichever
+// route the loaded airframe rigged its rotor: the skinned UH-60 reposes its
+// bone through the palette, the NewBlackHawk rotates the node its disc hangs
+// from. Exactly one of the two is ever set up (see ApplyInsertionAirframe).
+static void SpinBlackHawkRotor() {
+    if (g_newBlackHawkRotorNode) {
+        // The mast is the rig's local Y, and the disc measures 13.5 x 0.7 x
+        // 13.2 about it, so Y is the axis that keeps the blades in their plane.
+        XMStoreFloat4(&g_newBlackHawkRotorNode->rotation,
+            XMQuaternionRotationAxis(XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f),
+                                     std::fmod(g_blackHawkRotorSpin, XM_2PI)));
+        // The draw reads globalTransform, not the local rotation just written,
+        // so the hierarchy has to be flushed or the disc never moves on screen.
+        if (g_blackHawkModel) g_blackHawkModel->RefreshHierarchy();
+        return;
+    }
+    UpdateBlackHawkPalette();
+}
 
 // Copies the current palette into this frame's upload buffer and hands back its
 // GPU address for the skinning root SRV at t12. One buffer per in-flight frame,
@@ -2461,18 +2504,37 @@ static void RidePlayerInBlackHawk(float cabinDeltaTime) {
         // world's: the camera yaw the player is looking with is a world angle,
         // and the aircraft is turning underneath them, so moving along a world
         // direction would drift them across the deck whenever the bird banked.
-        // Subtracting the airframe's yaw converts "forward from where I am
-        // looking" into a cabin-relative direction that stays put.
-        const float lookYaw =
-            XMConvertToRadians(scene.camera.Yaw) - vehicles.blackHawkYaw;
-        const float forwardX = std::cos(lookYaw);
-        const float forwardZ = -std::sin(lookYaw);
+        // Rotating the look direction out of the airframe's yaw converts
+        // "forward from where I am looking" into a cabin-relative direction
+        // that stays put. The airframe's +Z is world (sin, cos) and its +X is
+        // world (cos, -sin), so undoing that maps a world heading onto the
+        // deck. Take the camera's own Front rather than rebuilding it from
+        // Yaw: deriving the sines here by hand is what previously mirrored the
+        // basis about the aircraft's X axis, reversing W/S in the doorways and
+        // A/D along the nose.
+        const float heliSin = std::sin(vehicles.blackHawkYaw);
+        const float heliCos = std::cos(vehicles.blackHawkYaw);
+        const float worldFrontX = scene.camera.Front.x;
+        const float worldFrontZ = scene.camera.Front.z;
+        const float flatLength = std::sqrt(
+            worldFrontX * worldFrontX + worldFrontZ * worldFrontZ);
         float moveX = 0.0f, moveZ = 0.0f;
-        if (GetAsyncKeyState('W') & 0x8000) { moveX += forwardX; moveZ += forwardZ; }
-        if (GetAsyncKeyState('S') & 0x8000) { moveX -= forwardX; moveZ -= forwardZ; }
-        // Strafe is the forward vector turned a quarter turn.
-        if (GetAsyncKeyState('D') & 0x8000) { moveX += forwardZ; moveZ -= forwardX; }
-        if (GetAsyncKeyState('A') & 0x8000) { moveX -= forwardZ; moveZ += forwardX; }
+        // Looking straight up or down flattens to nothing, leaving no heading
+        // to walk along. Skip rather than divide by ~0 and fling the player.
+        if (flatLength > 1e-4f) {
+            const float flatX = worldFrontX / flatLength;
+            const float flatZ = worldFrontZ / flatLength;
+            const float forwardX = flatX * heliCos - flatZ * heliSin;
+            const float forwardZ = flatX * heliSin + flatZ * heliCos;
+            // Strafe matches the ground path, which walks D along
+            // -cross(front, Up); in this basis that is (forwardZ, -forwardX).
+            const float rightX = forwardZ;
+            const float rightZ = -forwardX;
+            if (GetAsyncKeyState('W') & 0x8000) { moveX += forwardX; moveZ += forwardZ; }
+            if (GetAsyncKeyState('S') & 0x8000) { moveX -= forwardX; moveZ -= forwardZ; }
+            if (GetAsyncKeyState('D') & 0x8000) { moveX += rightX; moveZ += rightZ; }
+            if (GetAsyncKeyState('A') & 0x8000) { moveX -= rightX; moveZ -= rightZ; }
+        }
         const float moveLength = std::sqrt(moveX * moveX + moveZ * moveZ);
         if (moveLength > 1e-4f) {
             // Normal walking, the same speed and modifiers as on the ground:
@@ -2652,6 +2714,13 @@ static void RidePlayerInBlackHawk(float cabinDeltaTime) {
         return;
     }
     if (vehicles.blackHawkDroppedPlayer) {
+        // The bird reached the drop-off under power, so whatever the player
+        // loaded aboard comes off with them. The crash branch above returns
+        // before this point, which is what loses the squad with the airframe.
+        g_marineDropPending = true;
+        g_marineDropOrigin = { vehicles.blackHawkDropOff.x,
+                               vehicles.blackHawkGroundY,
+                               vehicles.blackHawkDropOff.z };
         if (vehicles.blackHawkFastRappel) {
             const XMFLOAT3 anchor = vehicles.BlackHawkRidePosition();
             scene.camera.Position = {
@@ -2992,6 +3061,10 @@ static void RidePlayerInInsertionBoat() {
     const float exitZ = vehicles.insertionBoatLanding.z + forwardZ * exitDistance;
     const float shoreY = (std::max)(vehicles.insertionBoatWaterY,
         TerrainRendererDX12::HeightAt(params, exitX, exitZ));
+    // Hull made the beach, so the squad wades ashore with the player. The sunk
+    // branch above returns first, which is what drowns them with the boat.
+    g_marineDropPending = true;
+    g_marineDropOrigin = { exitX, shoreY, exitZ };
     scene.camera.Position = { exitX, shoreY + scene.camera.PlayerHeight, exitZ };
     scene.camera.VerticalVelocity = 0.0f;
     scene.camera.IsGrounded = true;
@@ -3156,8 +3229,12 @@ static void ConfigureBlackHawkBounds() {
     // interior barely wider than the player capsule -- the doorway alone is
     // narrower than a walking collision radius. Scaling the whole aircraft up
     // is what buys usable floor space without re-authoring the mesh.
+    //
+    // 27.2 m is the original 34 m brought down by a fifth. A third (22.78 m)
+    // was tried first and read as too small, so this is the shallower cut that
+    // keeps the cabin comfortably walkable.
     const float targetLength =
-        g_insertionAirframe == InsertionAirframe::NewBlackHawk ? 34.0f : 20.0f;
+        g_insertionAirframe == InsertionAirframe::NewBlackHawk ? 27.2f : 20.0f;
     g_blackHawkModelScale = targetLength / horizontalLength;
 }
 
@@ -3336,6 +3413,21 @@ static void UpdateBlackHawkPalette() {
     }
 }
 
+// True when any primitive in the model actually carries skin data. A GLB can
+// declare a skin and joints while no mesh references it -- the NewBlackHawk does
+// exactly that -- and in that case the bone palette has nothing to move, so the
+// caller must drive the rotor by node instead. Checks the geometry rather than
+// the skin list, which is what tells the two apart.
+static bool ModelHasSkinnedPrimitive(const std::shared_ptr<SceneNode>& node) {
+    if (!node) return false;
+    if (node->mesh)
+        for (const MeshPrimitive& primitive : node->mesh->primitives)
+            if (primitive.skinVertexCount > 0) return true;
+    for (const auto& child : node->children)
+        if (ModelHasSkinnedPrimitive(child)) return true;
+    return false;
+}
+
 // Points the insertion helicopter at one of the loaded airframes and rederives
 // everything measured from its geometry.
 //
@@ -3356,13 +3448,30 @@ static void ApplyInsertionAirframe(InsertionAirframe airframe) {
     g_blackHawkSkeleton = g_blackHawkAirframeSkeleton[slot];
     if (!g_blackHawkModel) return;
 
-    // Empty for the unrigged airframe, which leaves the palette empty and the
-    // blades static -- UploadBlackHawkPalette returns 0 and the draw takes the
-    // static path.
-    g_blackHawkRotorBone = g_blackHawkSkeleton.BoneCount() > 0
-        ? g_blackHawkSkeleton.Find("Bone") : -1;
+    // Two ways to turn a rotor, picked per airframe by what the asset rigged.
+    //
+    // The UH-60 skins its disc to a joint, so it goes through the palette. The
+    // NewBlackHawk ships a skin whose joint is attached to nothing (its meshes
+    // declare no skin and carry no joint/weight attributes), so asking the
+    // palette to spin it would move no vertices; its disc is instead a whole
+    // mesh under a 'Bone' node, turned by rotating that node.
+    //
+    // Resolved by looking for real skin data rather than by airframe index, so
+    // a re-export that adds or drops skinning picks the matching path.
+    g_newBlackHawkRotorNode.reset();
+    g_blackHawkRotorBone = -1;
     g_blackHawkPalette.clear();
-    if (g_blackHawkRotorBone >= 0) UpdateBlackHawkPalette();
+    if (g_blackHawkSkeleton.BoneCount() > 0 && ModelHasSkinnedPrimitive(g_blackHawkModel)) {
+        g_blackHawkRotorBone = g_blackHawkSkeleton.Find("Bone");
+        if (g_blackHawkRotorBone >= 0) UpdateBlackHawkPalette();
+    } else {
+        // Rotating the node the disc hangs from. The importer keeps glTF node
+        // names, so 'Bone' is the authored joint node with the rotor mesh as
+        // its child.
+        g_newBlackHawkRotorNode = FindNodeByName(g_blackHawkModel, "Bone");
+        if (g_newBlackHawkRotorNode)
+            std::cout << "Insertion airframe rotor node ready\n";
+    }
 
     ConfigureBlackHawkBounds();
     ConfigureBlackHawkRideFromModel();
@@ -5053,6 +5162,49 @@ static void SpawnMarinesFromLevel() {
                                  entity.transform.position[2] };
         SpawnMarine(position, XMConvertToRadians(entity.transform.rotation[1]));
     }
+}
+
+// Puts the marines the player loaded onto the transport on the ground, once
+// that transport has actually delivered them. Driven off the one-frame flag the
+// release code raises, so a crashed helicopter or a sunk boat simply never
+// reaches here and the whole squad is lost with it -- which is the entire point
+// of choosing a number on the deploy screen.
+//
+// Placed on a ring around the drop point rather than at it: the player is
+// standing there, and stacking eight actors on the same metre leaves them
+// shoving each other apart for the first few seconds of the run.
+static void DropDeploymentMarines() {
+    if (!g_marineDropPending) return;
+    g_marineDropPending = false;
+    const int requested = (std::min)(g_deploymentMarineCount,
+                                     kMaxDeploymentMarines);
+    if (requested <= 0) return;
+    if (!g_marineModel.valid) {
+        SGE_LOG("LogGameplay", EngineLog::Level::Warning,
+            "Marine drop skipped: ally model unavailable");
+        return;
+    }
+
+    // Wide enough that the ring clears the transport's own hull, tight enough
+    // that the squad still reads as having come off it together.
+    constexpr float kRingRadius = 4.5f;
+    int dropped = 0;
+    for (int index = 0; index < requested; ++index) {
+        const float angle = XM_2PI * static_cast<float>(index) /
+                            static_cast<float>(requested);
+        const float x = g_marineDropOrigin.x + std::sin(angle) * kRingRadius;
+        const float z = g_marineDropOrigin.z + std::cos(angle) * kRingRadius;
+        // Sampled per marine rather than reusing the drop-off height: the ring
+        // can straddle a slope or a shoreline, where one shared Y buries half
+        // the squad and leaves the rest hanging.
+        const XMFLOAT3 stand{ x, GroundHeightAt(x, z), z };
+        // Facing outward, away from the player and into whatever the landing
+        // zone is surrounded by.
+        if (SpawnMarine(stand, angle)) ++dropped;
+    }
+    SGE_LOG("LogGameplay", EngineLog::Level::Display,
+        "Deployment marines landed: " + std::to_string(dropped) + " of " +
+            std::to_string(requested) + " requested");
 }
 
 // Test mode: relocates every live bandit to a random walkable point on the
@@ -10684,11 +10836,18 @@ static void BakeBlackHawkCollisionMesh() {
     XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
     XMFLOAT3 maximum(-FLT_MAX, -FLT_MAX, -FLT_MAX);
 
-    // The rotor is skinned and its blades sweep 16 m; collide against the
-    // airframe only, matching what a player can actually walk into.
+    // The blades sweep >13 m; collide against the airframe only, matching what
+    // a player can actually walk into. Two ways to spot the rotor, because the
+    // two airframes rig it differently: the UH-60 gives its disc dedicated
+    // materials, while the NewBlackHawk's disc shares 'корпус'/'детали' with the
+    // fuselage and is told apart only by hanging under the rotor node. Skipping
+    // that whole subtree is what keeps a 13 m spinning disc from baking into
+    // the walkable wreck.
+    const SceneNode* const rotorSubtree = g_newBlackHawkRotorNode.get();
     std::function<void(const SceneNode*, const XMMATRIX&)> collect =
         [&](const SceneNode* node, const XMMATRIX& parentToRoot) {
         if (!node) return;
+        if (rotorSubtree && node == rotorSubtree) return;
         const XMMATRIX localToRoot =
             XMLoadFloat4x4(&node->localTransform) * parentToRoot;
         if (node->mesh) {
@@ -15077,6 +15236,41 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         seatButton("RIGHT DOOR", false, true);
         ImGui::Dummy(ImVec2(0.0f, 5.0f));
     }
+
+    // Squad size. Sits under the insertion controls because that is what it
+    // depends on: the marines ride the transport chosen above, and they only
+    // reach the ground if it does.
+    ImGui::SetCursorPosX(45.0f);
+    ImGui::TextDisabled("MARINE SQUAD");
+    // Greyed out rather than hidden when the ally mesh is missing: a slider that
+    // vanishes reads as a feature that does not exist, where a dead one plus the
+    // line below says what is actually wrong.
+    const bool marinesAvailable = g_marineModel.valid;
+    ImGui::BeginDisabled(!marinesAvailable);
+    ImGui::SetCursorPosX(45.0f);
+    ImGui::SetNextItemWidth(340.0f);
+    ImGui::SliderInt("##DeploymentMarines", &g_deploymentMarineCount,
+                     0, kMaxDeploymentMarines,
+                     g_deploymentMarineCount == 1 ? "%d marine"
+                                                  : "%d marines");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Marines loaded aboard your transport. They deploy with you\n"
+            "only if it reaches the landing zone -- a downed helicopter\n"
+            "or a sunk boat takes the whole squad with it.");
+    ImGui::EndDisabled();
+    if (!marinesAvailable) {
+        ImGui::SetCursorPosX(45.0f);
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.2f, 1.0f),
+                           "Marine asset unavailable");
+    } else if (g_deploymentMarineCount > 0) {
+        ImGui::SetCursorPosX(45.0f);
+        // The risk is the mechanic, so state it on the screen rather than
+        // leaving it to a tooltip nobody hovers.
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
+                           "Lost with the transport if it goes down");
+    }
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
 
     if (standingTowers > 0) {
         ImGui::SeparatorText("PRIMARY OBJECTIVE");
@@ -20455,6 +20649,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                     }
                 }
             }
+            // After both transports, so whichever one raised the flag this
+            // frame is honoured. Outside the g_insertionBoatModel guard on
+            // purpose: a helicopter insertion must still land its squad on a
+            // build where the boat asset failed to load.
+            DropDeploymentMarines();
             UpdateExplosiveBarrels(deltaTime);
             // After the aircraft update, so the gun leads this frame's pose
             // rather than one that is already a frame stale.
@@ -23332,10 +23531,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                 "Content/Models/BlackHawk/blackhawk.glb",
                 g_dx12.device, g_dx12.commandList,
                 g_blackHawkAirframeSkeleton[0]);
-            // Unrigged, so it goes through the plain loader and its skeleton
-            // slot stays empty. UploadBlackHawkPalette returns 0 for an empty
-            // palette, which puts the draw on the static path -- that is what
-            // keeps this model's blades static rather than skinned to nothing.
+            // Plain loader: this GLB's skin binds no geometry, so the skinned
+            // path would buy an unused palette. Its node hierarchy is what
+            // matters, and LoadGLB keeps that -- ApplyInsertionAirframe finds
+            // the 'Bone' node the rotor disc hangs from and spins it there.
             g_blackHawkAirframeModel[1] = GLBImporter::LoadGLB(
                 "Content/Models/NewBlackHawk/NewBlackHawk.glb",
                 g_dx12.device, g_dx12.commandList);
