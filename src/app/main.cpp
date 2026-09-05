@@ -899,6 +899,11 @@ bool                        g_emptyLevelMode = false;
 // back to a hardcoded spawn at the origin when a level authors none -- so
 // leaving them out of the level file is not enough to keep them off the map.
 bool                        g_trainingRangeMode = false;
+// The home base: a walkable hub, not a mission. Suppresses the same world
+// fixtures the training range does, and additionally the whole deployment flow
+// -- there is no insertion to plan, no timer to run and nothing to shoot, so
+// the player simply spawns on foot and walks around.
+bool                        g_baseMode = false;
 // Whether the loaded level places a Humvee entity. The vehicle is authored
 // content like any prop: no level gets one unless it asks for one.
 //
@@ -2153,6 +2158,12 @@ static float g_deploymentFlythroughTime = 0.0f;
 // transport does. A crash or a sinking loses everyone aboard.
 static int g_deploymentMarineCount = 0;
 static constexpr int kMaxDeploymentMarines = 8;
+// What one marine costs to bring along. Unlike an armory item this is not a
+// purchase that stays bought: the squad is consumed by the mission it deploys
+// on, so the same money is spent again next time. That is the whole tension --
+// a full squad is 16000 against a 2500 comm tower, and losing the transport
+// loses the lot.
+static constexpr int kDeploymentMarinePrice = 2000;
 // Raised for one frame by the ride/release code the moment a transport sets the
 // player down intact. Consumed after both vehicle updates run, because the
 // spawn needs terrain helpers declared further down this file.
@@ -2175,7 +2186,12 @@ static uint32_t g_ownedGrenades = 0;
 static uint32_t g_ownedGear = 0;
 static std::unordered_set<std::string> g_ownedAttachments;
 
-// An item priced at zero is standard issue, not a purchase: it is owned from
+// These masks are what the player has hired FOR THIS MISSION, not what they own
+// -- see ClearMissionRentals. "Owned" is kept as the name only because the
+// storefront reads it on every row and the meaning at the point of use is the
+// same question: has this already been paid for, or does selecting it charge?
+//
+// An item priced at zero is standard issue, not a rental: it is available from
 // the first launch and never appears as something to buy.
 static bool ArmoryWeaponOwned(int weapon) {
     if (weapon < 0 || weapon >= MissionLoadout::kWeaponCount) return true;
@@ -2201,34 +2217,42 @@ static bool ArmoryAttachmentOwned(const std::string& id) {
     return g_ownedAttachments.find(id) != g_ownedAttachments.end();
 }
 
-// Bridges the armory globals to the wallet file. Packed rather than stored as an
-// ArmoryOwnership outright because the storefront reads ownership on every row
-// of every frame, and a bitmask test beats walking a struct's vector.
-static ArmoryOwnership ArmoryOwnershipSnapshot() {
-    ArmoryOwnership owned;
-    owned.weapons = g_ownedWeapons;
-    owned.grenades = g_ownedGrenades;
-    owned.gear = g_ownedGear;
-    owned.attachments.assign(g_ownedAttachments.begin(),
-                             g_ownedAttachments.end());
-    return owned;
-}
-
-static void ApplyArmoryOwnership(const ArmoryOwnership& owned) {
-    g_ownedWeapons = owned.weapons;
-    g_ownedGrenades = owned.grenades;
-    g_ownedGear = owned.gear;
+// Drops every rental, so the next trip to the armory charges for the kit again.
+// Called as the deploy screen opens rather than as a run ends: a mission that is
+// restarted from its own planning screen must not bill twice for the same
+// deployment, and opening the screen is the one point that is reached exactly
+// once per attempt at buying a loadout.
+//
+// Standard-issue items are unaffected -- they are priced at zero, so the Owned
+// helpers above return true for them without consulting these masks at all.
+static void ClearMissionRentals() {
+    g_ownedWeapons = 0;
+    g_ownedGrenades = 0;
+    g_ownedGear = 0;
     g_ownedAttachments.clear();
-    g_ownedAttachments.insert(owned.attachments.begin(),
-                              owned.attachments.end());
+    // Clearing the paid-for flags is only half of it: the loadout keeps whatever
+    // was equipped last mission, so without this the player would still be
+    // holding a weapon they no longer have a rental for and would deploy with it
+    // free. Reset to standard issue, which is the kit that costs nothing.
+    MissionLoadout& loadout = g_game.mission.Loadout();
+    loadout.weapons = { MissionLoadout::kDefaultPrimaryWeapon, 1 };
+    loadout.grenade = GrenadeType::Frag;
+    loadout.gear = GearType::None;
+    // Attachments hang off the weapon instances rather than the loadout, so
+    // they survive the reset above and have to be stripped from every rail.
+    for (int weapon = 0; weapon < MissionLoadout::kWeaponCount; ++weapon)
+        for (uint8_t slot = 0;
+             slot < static_cast<uint8_t>(SGE::AttachmentSlot::Count); ++slot)
+            scene.player.weapons.RemoveAttachment(
+                weapon, static_cast<SGE::AttachmentSlot>(slot));
 }
 
-// Saves the wallet together with what the career has bought. Every SaveMoney
-// call site goes through this so a purchase can never be persisted without the
-// balance it was paid from, or the other way round.
+// Saves the wallet. Rentals are deliberately NOT persisted: kit is hired for one
+// mission, so what was carried last time says nothing about what the player has
+// now, and writing it would make it survive the restart that is supposed to
+// clear it. The balance is the only career state.
 static void SaveCareer() {
-    const ArmoryOwnership owned = ArmoryOwnershipSnapshot();
-    SaveMoney(g_game.money, &owned);
+    SaveMoney(g_game.money);
 }
 
 // Single purchase point, so every buy button in the storefront goes through the
@@ -2803,6 +2827,13 @@ static void BeginDeploymentPlanning() {
     g_deploymentTarget = {};
     g_deploymentTargetValid = false;
     g_deploymentFlythroughTime = 0.0f;
+    // Last mission's kit does not come back. Everything in the armory is hired
+    // for one deployment, so this screen opens with nothing paid for and the
+    // storefront quotes a price on every row again.
+    ClearMissionRentals();
+    // The squad is hired the same way and cannot be inherited either, or a
+    // restart would deploy marines the player was never charged for.
+    g_deploymentMarineCount = 0;
     LevelInsertionMode authored = g_customLevelMode
         ? g_game.world.Level().insertionMode
         : LevelInsertionMode::Helicopter;
@@ -5362,7 +5393,8 @@ static unsigned int RandomizeDeployment(unsigned int seed = 0) {
 static bool SpawnHumveeTurretGunner(int vehicleIndex) {
     // No Humvee on the training range means no turret to man; without this the
     // gunner still spawns and stands in mid-air where the vehicle would be.
-    if (g_trainingRangeMode) return false;
+    // The base has no Humvee either, and no hostiles at all.
+    if (g_trainingRangeMode || g_baseMode) return false;
     if (!g_banditModel.valid || !g_humveeModel) return false;
     const bool authoredVehicle = vehicleIndex >= 0 &&
         static_cast<size_t>(vehicleIndex) < LevelHumveeCount();
@@ -5408,7 +5440,8 @@ static bool SpawnLevelHumveeTurretGunners() {
 static bool SpawnBoatTurretGunner() {
     // No patrol boat on the training range, so no gunner to ride it -- the boat
     // model is hidden there, and without this he is left firing from open water.
-    if (g_trainingRangeMode) return false;
+    // Same for the base, whose level file switches the patrol boat off.
+    if (g_trainingRangeMode || g_baseMode) return false;
     if (!g_banditModel.valid || !g_boatModel) return false;
     for (const auto& existing : g_bandits)
         if (existing && !existing->Dead() && existing->turretGunner &&
@@ -8963,7 +8996,13 @@ static void ScatterDandelions(
         }
         return false;
     };
-    const int clusterCount = g_stressTestMode ? 420 : 180;
+    // The base is a compound, not a meadow, and its flat terrain defeats both
+    // rejection tests below: the y < 0.22 waterline check and the slope check
+    // only thin a scatter where there is a coastline and relief to thin it
+    // against. On a level plane nearly every candidate survives, which measured
+    // 1227 instances against the island's ~404 and put the grass pass at 28 ms
+    // a frame. Authored Dandelion entities are still honoured below.
+    const int clusterCount = g_baseMode ? 0 : (g_stressTestMode ? 420 : 180);
     const float span = g_stressTestMode ? 196.0f : 96.0f;
     g_dandelionInstances.reserve(clusterCount * 7);
     for (int cluster = 0; cluster < clusterCount; ++cluster) {
@@ -13021,8 +13060,13 @@ static void RebuildScalableEnvironment() {
     // field read as continuous turf rather than as separate clumps with ground
     // visible between them. It costs ~110 MB of instance buffer at 48 bytes a
     // blade, up from ~37 MB.
-    int grassCount = g_stressTestMode ? 1600000 : 2400000;
-    if (!g_stressTestMode) {
+    // No turf on the base: it is a hard-standing compound, and the same flat
+    // terrain that defeats the dandelion rejection tests keeps every one of
+    // these blades alive too. Measured at 28 ms of GPU a frame in the grass
+    // pass alone, plus ~110 MB of instance buffer, for a lawn a hub does not
+    // want in the first place.
+    int grassCount = g_baseMode ? 0 : (g_stressTestMode ? 1600000 : 2400000);
+    if (!g_stressTestMode && !g_baseMode) {
         const LevelDefinition& spanLevel = g_game.world.Level();
         constexpr float kShoreOuter = 88.0f;
         const float islandSpan = 2.0f * kShoreOuter * (std::max)(
@@ -13246,7 +13290,8 @@ static void ApplyHumveeLevelPlan(const RuntimeLevelPlan& plan) {
 
 static void InitializeLevelHumveePhysics() {
     g_destruction.ClearVehicles();
-    if (g_emptyLevelMode || g_trainingRangeMode || !g_levelPlacesHumvee)
+    if (g_emptyLevelMode || g_trainingRangeMode || g_baseMode ||
+        !g_levelPlacesHumvee)
         return;
     for (size_t index = 0; index < g_levelHumveeSpawns.size(); ++index) {
         const Transform& humvee = g_levelHumveeSpawns[index];
@@ -13480,6 +13525,9 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     g_emptyLevelMode = emptyLevel;
     g_stressTestMode = stressTest && !emptyLevel;
     g_trainingRangeMode = g_activeCustomLevelName == "Training Range";
+    // Keyed off the level name like the range above, so the hub needs no new
+    // field in the level schema to identify itself.
+    g_baseMode = g_activeCustomLevelName == "Base";
     // Re-arm the callout so a restart of the range plays it again.
     g_plantC4Played = false;
     g_impactDecals.clear();
@@ -13490,7 +13538,10 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
         ? emptyLevelAssetsLoaded : fullLevelAssetsLoaded;
     if (modeAssetsLoaded)
         wallModel = g_stressTestMode ? stressWallModel : normalWallModel;
-    g_game.session.ResetTimer(modeAssetsLoaded);
+    // The base is not a run, so its clock never starts -- a mission timer
+    // ticking up while the player wanders a hub would read as a run they are
+    // already failing.
+    g_game.session.ResetTimer(modeAssetsLoaded && !g_baseMode);
     if (!modeAssetsLoaded) BeginLevelLoading();
     g_pendingEnvironmentRebuild = modeAssetsLoaded && g_customLevelMode;
     scene.player.godMode = godMode;
@@ -13517,12 +13568,15 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
     // pointed at the previous position. Deferred rather than done here because
     // on a cold load the model does not exist yet: the flag is consumed once
     // the terrain is up, which covers both the first load and every restart.
-    g_blackHawkInsertionRestartPending = !g_emptyLevelMode;
-    g_insertionBoatRestartPending = !g_emptyLevelMode;
+    // The base is walked into, not inserted into, so neither transport is armed
+    // for it -- a helicopter run would fly in and try to drop the player who is
+    // already standing in the hub.
+    g_blackHawkInsertionRestartPending = !g_emptyLevelMode && !g_baseMode;
+    g_insertionBoatRestartPending = !g_emptyLevelMode && !g_baseMode;
     // Every playable map opens on the deployment fly-through. The authored mode
     // is the initial selection, but the player can pick any of the three routes
     // and one of the perimeter zones before the run and timer begin.
-    if (!g_emptyLevelMode) {
+    if (!g_emptyLevelMode && !g_baseMode) {
         BeginDeploymentPlanning();
         g_game.vehicles.DisableBlackHawkInsertion();
         g_game.vehicles.DisableInsertionBoat();
@@ -13530,6 +13584,13 @@ static void StartLevelOne(HWND hwnd, bool godMode, bool stressTest = false,
         // map whose towers were all felled last run gets a fresh emplacement.
         PlaceAATurretNearCommTower();
     } else {
+        // Shared with the empty level: no planning screen, so the transports
+        // have to be stood down explicitly or a run armed by the previous level
+        // would still be flying.
+        if (g_baseMode) {
+            g_game.vehicles.DisableBlackHawkInsertion();
+            g_game.vehicles.DisableInsertionBoat();
+        }
         g_insertionChoicePending = false;
         g_deploymentZones.clear();
         g_selectedDeploymentZone = -1;
@@ -13618,6 +13679,37 @@ static void StartTrainingRange(HWND hwnd) {
     }
     g_mainMenuLevelStatus =
         "Training Range not found (TrainingRange.json missing from Content/Levels).";
+}
+
+// The home base: a walkable hub built around the NATO shelter, with no island,
+// no hostiles and no insertion. Same path search as the other menu levels.
+//
+// The shelter GLB is by far the largest asset in the project (129 MB against a
+// few MB for the airport), so the load is timed and the result logged -- the
+// cost of this one model is worth knowing rather than guessing at, and the log
+// line is what says whether it needs attention.
+static void StartBase(HWND hwnd) {
+    static constexpr const char* kCandidates[] = {
+        "Content/Levels/Base.json",
+        "levels/Base.json",
+        "build/Content/Levels/Base.json",
+    };
+    std::error_code error;
+    for (const char* candidate : kCandidates) {
+        if (!std::filesystem::exists(candidate, error)) continue;
+        const auto started = std::chrono::steady_clock::now();
+        StartCustomLevel(hwnd, std::filesystem::path(candidate));
+        // Measures the synchronous part only. Prefab meshes stream in through
+        // the loading screen, so the shelter's own upload is not included here
+        // -- the LogAssets timing around the model load covers that.
+        const double seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        SGE_LOG("LogGameplay", EngineLog::Level::Display,
+            "Base level start took " + std::to_string(seconds) + " s");
+        return;
+    }
+    g_mainMenuLevelStatus =
+        "Base not found (Base.json missing from Content/Levels).";
 }
 
 static std::filesystem::path StartupLevelPath(const char* commandLine) {
@@ -14063,6 +14155,15 @@ static void RenderMainMenu(HWND hwnd) {
         BrowseAndStartCustomLevel(hwnd);
     if (!g_mainMenuLevelStatus.empty())
         ImGui::TextWrapped("%s", g_mainMenuLevelStatus.c_str());
+
+    // The hub, in its own section rather than under DEPLOY: walking into the
+    // base is not starting a mission, and grouping it with the maps would read
+    // as a third place to be shot at.
+    ImGui::Dummy(ImVec2(0.0f, 10.0f));
+    UISectionLabel("BASE");
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
+    if (UIMenuButton("ENTER BASE"))
+        StartBase(hwnd);
 
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     UISectionLabel("TOOLS");
@@ -15292,24 +15393,48 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // vanishes reads as a feature that does not exist, where a dead one plus the
     // line below says what is actually wrong.
     const bool marinesAvailable = g_marineModel.valid;
-    ImGui::BeginDisabled(!marinesAvailable);
+    // The slider stops where the wallet does, so the player cannot dial up a
+    // squad they will only be told about at DEPLOY. Balance is re-read every
+    // frame because the storefront above can spend it after this point.
+    const int affordableMarines = (std::min)(
+        kMaxDeploymentMarines,
+        static_cast<int>(g_game.money.Balance() / kDeploymentMarinePrice));
+    // Clamp before drawing, not after: an armory purchase made after the squad
+    // was picked can put the count out of reach, and charging for marines the
+    // player can no longer pay for is the one outcome this must never allow.
+    g_deploymentMarineCount =
+        (std::min)(g_deploymentMarineCount, affordableMarines);
+    ImGui::BeginDisabled(!marinesAvailable || affordableMarines <= 0);
     ImGui::SetCursorPosX(45.0f);
     ImGui::SetNextItemWidth(340.0f);
     ImGui::SliderInt("##DeploymentMarines", &g_deploymentMarineCount,
-                     0, kMaxDeploymentMarines,
+                     0, (std::max)(1, affordableMarines),
                      g_deploymentMarineCount == 1 ? "%d marine"
                                                   : "%d marines");
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
-            "Marines loaded aboard your transport. They deploy with you\n"
-            "only if it reaches the landing zone -- a downed helicopter\n"
-            "or a sunk boat takes the whole squad with it.");
+            "Marines loaded aboard your transport, $2,000 each.\n"
+            "Charged when you deploy, and spent for good -- they do\n"
+            "not carry over to the next mission like a weapon does.\n"
+            "They only reach the ground if the transport does: a\n"
+            "downed helicopter or a sunk boat takes the squad with it.");
     ImGui::EndDisabled();
     if (!marinesAvailable) {
         ImGui::SetCursorPosX(45.0f);
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.2f, 1.0f),
                            "Marine asset unavailable");
+    } else if (affordableMarines <= 0) {
+        ImGui::SetCursorPosX(45.0f);
+        ImGui::TextColored(ImVec4(0.75f, 0.32f, 0.28f, 1.0f),
+                           "Cannot afford a marine ($2,000 each)");
     } else if (g_deploymentMarineCount > 0) {
+        // Quote the total rather than the unit price: the decision being made
+        // here is how big a cheque to write, not what one marine goes for.
+        char squadCost[32];
+        MoneySystem::Format(squadCost, sizeof(squadCost),
+                            g_deploymentMarineCount * kDeploymentMarinePrice);
+        ImGui::SetCursorPosX(45.0f);
+        ImGui::TextColored(UITheme::kWarning, "%s on deploy", squadCost);
         ImGui::SetCursorPosX(45.0f);
         // The risk is the mechanic, so state it on the screen rather than
         // leaving it to a tooltip nobody hovers.
@@ -15442,6 +15567,20 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     const bool deployPressed = ImGui::Button("DEPLOY", ImVec2(340.0f, 48.0f));
     ImGui::PopStyleColor(3);
     if (deployPressed) {
+        // Pay for the squad. Charged here rather than on the slider because
+        // moving a slider is the player looking at a price, not agreeing to it;
+        // this press is the commitment. ArmoryPurchase re-checks the balance,
+        // so a squad that became unaffordable between the pick and the press is
+        // dropped to nothing rather than deploying for free.
+        if (g_deploymentMarineCount > 0) {
+            const int squadPrice =
+                g_deploymentMarineCount * kDeploymentMarinePrice;
+            if (ArmoryPurchase(squadPrice)) {
+                SaveCareer();
+            } else {
+                g_deploymentMarineCount = 0;
+            }
+        }
         // Repair a loadout that still names a weapon which is no longer
         // selectable -- a debug weapon picked before the toggle was switched
         // off, or a save carrying the retired AK-47. ConfigureLoadout rejects
@@ -19647,12 +19786,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     LoadGameSettings(g_settings);
     ApplyGameSettings();
     // Career wallet, same story: no file means a fresh career at zero rather
-    // than an error.
-    {
-        ArmoryOwnership ownedItems;
-        LoadMoney(g_game.money, &ownedItems);
-        ApplyArmoryOwnership(ownedItems);
-    }
+    // than an error. Only the balance is restored -- kit is hired per mission,
+    // so there is no ownership to carry in. A wallet written by an older build
+    // still has its item section; LoadMoney simply ignores it now.
+    LoadMoney(g_game.money);
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX12_Init(g_dx12.device.Get(), FRAME_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM,
         imguiSrvHeap.Get(),

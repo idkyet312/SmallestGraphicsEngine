@@ -744,7 +744,12 @@ private:
         // at it -- the eye sees the gaps. Clumping the same budget into tufts
         // fills those gaps: each clump is dense enough to hide the ground under
         // it, and the bare earth between clumps then reads as intentional.
-        const int tufts = std::max(1, count / kBladesPerTuft);
+        // Floored at one tuft so a small budget still produces something, but
+        // only when a budget was actually asked for: count == 0 means a level
+        // that wants no scattered turf at all (the base compound), and the
+        // floor would otherwise plant a clump anyway. Authored patches below
+        // are unaffected -- those are explicit placements, not this scatter.
+        const int tufts = count > 0 ? std::max(1, count / kBladesPerTuft) : 0;
 
         for (int t = 0; t < tufts; ++t) {
             const float cx = (Rand(seed) * 2.0f - 1.0f) * half;

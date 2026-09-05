@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "name": "Base",
+  "insertionMode": "helicopter",
+  "patrolBoatEnabled": false,
+  "terrain": {
+    "flat": true,
+    "heightScale": 0.0,
+    "tilesX": 8,
+    "tilesZ": 8,
+    "islandScaleX": 1.0,
+    "islandScaleZ": 1.0,
+    "originTileX": 0,
+    "originTileZ": 0,
+    "sculpt": []
+  },
+  "lighting": {
+    "dxrDDGI": {
+      "enabled": false,
+      "surfaceSpacing": 3.0,
+      "surfaceOffset": 0.35,
+      "maxProbes": 200,
+      "raysPerProbe": 64,
+      "probesPerFrame": 16,
+      "maxRayDistance": 24.0,
+      "intensity": 1.0,
+      "normalBias": 0.18,
+      "viewBias": 0.05,
+      "hysteresis": 0.95,
+      "multiBounceStrength": 0.35,
+      "showProbes": false
+    }
+  },
+  "entities": [
+    {
+      "id": 1,
+      "type": "player_spawn",
+      "name": "Base Entrance",
+      "enabled": true,
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          25.0
+        ],
+        "rotation": [
+          0.0,
+          180.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "type": "prefab",
+      "prefab": "props/nato_shelter",
+      "name": "NATO Shelter",
+      "enabled": true,
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    }
+  ]
+}

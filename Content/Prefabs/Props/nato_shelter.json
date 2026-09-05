@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 2,
+  "id": "props/nato_shelter",
+  "name": "NATO Shelter",
+  "components": {
+    "staticMesh": {
+      "path": "Content/Models/HomeBase/NATO_Shelter_V1_PackedTextures.glb",
+      "defaultScale": [1.0, 1.0, 1.0],
+      "targetSize": 0.0,
+      "automaticLod": true,
+      "castShadow": true,
+      "useMaterials": true,
+      "materialAmbientScale": 1.0,
+      "materialViewFillStrength": 0.0
+    },
+    "collision": {
+      "shape": "mesh"
+    }
+  }
+}
