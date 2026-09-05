@@ -55,6 +55,14 @@ public:
     // whatever the run itself earned.
     static constexpr int kMissionBonusPerScorePoint = 50;
 
+    // Seed money for a new career, so the first deployment starts with
+    // something in hand rather than at nothing. This is the starting *state*,
+    // not a payout: it is never awarded, so it raises no HUD popup and is not
+    // counted as earned. A career that has legitimately been spent down to zero
+    // must not be topped back up, which is why the grant lives in the member
+    // default and is only kept when there is no wallet file to load over it.
+    static constexpr int64_t kStartingBalance = 2000;
+
     int64_t Balance() const { return balance_; }
     int64_t SessionEarned() const { return sessionEarned_; }
     int64_t TotalEarned() const { return totalEarned_; }
@@ -142,8 +150,10 @@ public:
         snprintf(out, capacity, "%s", text.c_str());
     }
 
+    // Starting over is a new career, so it comes with the same seed money a
+    // first launch gets rather than dropping the player to nothing.
     void ResetCareer() {
-        balance_ = 0;
+        balance_ = kStartingBalance;
         totalEarned_ = 0;
         sessionEarned_ = 0;
         pending_.clear();
@@ -155,7 +165,15 @@ public:
         // the windows.h min/max macros) cannot take explicit template
         // arguments, so both operands have to already agree in type.
         balance_ = (std::max)(static_cast<int64_t>(0), balance);
-        totalEarned_ = (std::max)(balance_, totalEarned);
+        // Floored against the *earned* part of the balance, not the balance
+        // itself: the starting grant is spendable money that was never earned,
+        // so a first-launch wallet legitimately holds more than it has made.
+        // Flooring at the raw balance would launder that grant into career
+        // earnings on the very first save.
+        const int64_t earnedFloor =
+            (std::max)(static_cast<int64_t>(0), balance_ - kStartingBalance);
+        totalEarned_ = (std::max)(earnedFloor,
+                                  (std::max)(static_cast<int64_t>(0), totalEarned));
     }
 
 private:
@@ -174,7 +192,10 @@ private:
         return amount;
     }
 
-    int64_t balance_ = 0;
+    // Seeded, not earned: the balance starts at the grant while totalEarned_
+    // stays at zero, so "what this career has actually made" is not inflated by
+    // money that was handed over for free.
+    int64_t balance_ = kStartingBalance;
     int64_t totalEarned_ = 0;
     int64_t sessionEarned_ = 0;
     std::vector<MoneyAward> pending_;
@@ -188,7 +209,11 @@ inline bool LoadMoney(MoneySystem& out) {
     std::ifstream file(MoneySavePath());
     if (!file) return false;
 
-    int64_t balance = 0, totalEarned = 0;
+    // Seeded from what the caller already holds, so a file that exists but is
+    // missing a key (an older build's wallet, a hand-trimmed one) keeps the
+    // starting grant rather than silently zeroing the player out. Only a key
+    // that is actually present overwrites these.
+    int64_t balance = out.Balance(), totalEarned = out.TotalEarned();
     std::string line;
     while (std::getline(file, line)) {
         const size_t comment = line.find_first_of(";#");

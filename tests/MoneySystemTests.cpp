@@ -25,13 +25,25 @@ int main() {
     std::filesystem::current_path(scratch);
     std::filesystem::remove(MoneySavePath());
 
-    // Awards accumulate, and each one is queued exactly once for the HUD.
+    // A new career starts with the seed money in hand, but has not *earned* any
+    // of it: the grant is spendable state, not a payout, so it raises no HUD
+    // popup and does not count toward career earnings.
     {
         MoneySystem money;
-        CHECK(money.Balance() == 0);
+        CHECK(money.Balance() == MoneySystem::kStartingBalance);
+        CHECK(money.TotalEarned() == 0);
+        CHECK(money.SessionEarned() == 0);
+        CHECK(money.DrainAwards().empty());
+    }
+
+    // Awards accumulate on top of the seed, and each one is queued exactly once
+    // for the HUD.
+    {
+        MoneySystem money;
         money.Award(MoneyEvent::EnemyKilled);
         money.Award(MoneyEvent::EnemyKilled);
-        CHECK(money.Balance() == MoneySystem::kEnemyKillReward * 2);
+        CHECK(money.Balance() ==
+              MoneySystem::kStartingBalance + MoneySystem::kEnemyKillReward * 2);
         CHECK(money.SessionEarned() == MoneySystem::kEnemyKillReward * 2);
 
         const std::vector<MoneyAward> drained = money.DrainAwards();
@@ -48,7 +60,8 @@ int main() {
     {
         MoneySystem money;
         money.Award(MoneyEvent::PropDestroyed, 30);
-        CHECK(money.Balance() == MoneySystem::kPropDestroyedReward * 30);
+        CHECK(money.Balance() == MoneySystem::kStartingBalance +
+                                 MoneySystem::kPropDestroyedReward * 30);
         const std::vector<MoneyAward> drained = money.DrainAwards();
         CHECK(drained.size() == 1);
         CHECK(drained[0].amount == MoneySystem::kPropDestroyedReward * 30);
@@ -59,7 +72,7 @@ int main() {
         MoneySystem money;
         CHECK(money.Award(MoneyEvent::EnemyKilled, 0) == 0);
         CHECK(money.Award(MoneyEvent::EnemyKilled, -4) == 0);
-        CHECK(money.Balance() == 0);
+        CHECK(money.Balance() == MoneySystem::kStartingBalance);
         CHECK(money.DrainAwards().empty());
     }
 
@@ -68,13 +81,28 @@ int main() {
     // amount actually taken rather than the full penalty.
     {
         MoneySystem money;
-        money.Award(MoneyEvent::EnemyKilled);   // 120 banked
+        // Spend down to a remainder smaller than one penalty, so the next loss
+        // is necessarily the one that has to be clipped. A kill is added first
+        // to guarantee the balance is not an exact multiple of the penalty --
+        // landing on exactly zero would clip nothing and prove nothing.
+        money.Award(MoneyEvent::EnemyKilled);
+        const int penalty = -MoneySystem::kFriendlyLostPenalty;
+        while (money.Balance() >= penalty)
+            money.Award(MoneyEvent::FriendlyLost);
+        const int64_t remainder = money.Balance();
+        CHECK(remainder > 0);
+        CHECK(remainder < static_cast<int64_t>(penalty));
+        money.DrainAwards();
+
+        // The penalty is clipped to whatever is actually left rather than
+        // driving the career negative, and the queued popup reports the clipped
+        // amount so it never promises a debit that was not taken.
         const int applied = money.Award(MoneyEvent::FriendlyLost);
         CHECK(money.Balance() == 0);
-        CHECK(applied == -MoneySystem::kEnemyKillReward);
+        CHECK(applied == -static_cast<int>(remainder));
         const std::vector<MoneyAward> drained = money.DrainAwards();
-        CHECK(drained.size() == 2);
-        CHECK(drained[1].amount == -MoneySystem::kEnemyKillReward);
+        CHECK(drained.size() == 1);
+        CHECK(drained[0].amount == -static_cast<int>(remainder));
 
         // Already at zero: nothing more to take, and nothing queued for a
         // payout that did not happen.
@@ -90,8 +118,9 @@ int main() {
         money.Award(MoneyEvent::CommTowerDestroyed);
         money.Award(MoneyEvent::FriendlyLost);
         CHECK(money.TotalEarned() == MoneySystem::kCommTowerReward);
-        CHECK(money.Balance() ==
-              MoneySystem::kCommTowerReward + MoneySystem::kFriendlyLostPenalty);
+        CHECK(money.Balance() == MoneySystem::kStartingBalance +
+                                 MoneySystem::kCommTowerReward +
+                                 MoneySystem::kFriendlyLostPenalty);
     }
 
     // The mission bonus is the grade times the rate, and a failed run pays
@@ -102,7 +131,8 @@ int main() {
               100 * MoneySystem::kMissionBonusPerScorePoint);
         CHECK(money.AwardMissionBonus(0) == 0);
         CHECK(money.AwardMissionBonus(-20) == 0);
-        CHECK(money.Balance() == 100 * MoneySystem::kMissionBonusPerScorePoint);
+        CHECK(money.Balance() == MoneySystem::kStartingBalance +
+                                 100 * MoneySystem::kMissionBonusPerScorePoint);
     }
 
     // BeginRun clears the per-run counter and the undrawn queue, but never the
@@ -113,7 +143,8 @@ int main() {
         money.Award(MoneyEvent::EnemyKilled);
         money.BeginRun();
         CHECK(money.SessionEarned() == 0);
-        CHECK(money.Balance() == MoneySystem::kEnemyKillReward);
+        CHECK(money.Balance() ==
+              MoneySystem::kStartingBalance + MoneySystem::kEnemyKillReward);
         CHECK(money.DrainAwards().empty());
     }
 
@@ -133,9 +164,11 @@ int main() {
     // Round-trip through the file, and a missing file is a fresh career rather
     // than a failure the caller has to handle.
     {
+        // No file is a brand new career, which keeps the starting grant.
         MoneySystem fresh;
         CHECK(!LoadMoney(fresh));
-        CHECK(fresh.Balance() == 0);
+        CHECK(fresh.Balance() == MoneySystem::kStartingBalance);
+        CHECK(fresh.TotalEarned() == 0);
 
         MoneySystem money;
         money.Award(MoneyEvent::CommTowerDestroyed);
@@ -146,6 +179,12 @@ int main() {
         CHECK(LoadMoney(loaded));
         CHECK(loaded.Balance() == money.Balance());
         CHECK(loaded.TotalEarned() == money.TotalEarned());
+        // The round trip must not launder the starting grant into career
+        // earnings: the wallet still holds more than it has ever made.
+        CHECK(loaded.TotalEarned() ==
+              MoneySystem::kCommTowerReward + MoneySystem::kEnemyKillReward * 3);
+        CHECK(loaded.Balance() ==
+              loaded.TotalEarned() + MoneySystem::kStartingBalance);
         // A loaded career starts its run counter at zero: what previous
         // launches earned is not this deployment's payout.
         CHECK(loaded.SessionEarned() == 0);
@@ -162,12 +201,43 @@ int main() {
         }
         MoneySystem loaded;
         CHECK(LoadMoney(loaded));
+        // The key was present, just unreadable -- that is a spent career worth
+        // zero, not a new one owed the grant.
         CHECK(loaded.Balance() == 0);
         CHECK(loaded.TotalEarned() >= 0);
     }
 
-    // A file claiming more spendable money than was ever earned is repaired
-    // upward rather than trusted: TotalEarned is a floor on the balance.
+    // A wallet from an older build, or one hand-trimmed to just a section
+    // header, has no Balance key at all. That must keep the starting grant
+    // rather than silently zeroing an existing player out.
+    {
+        {
+            std::ofstream file(MoneySavePath(), std::ios::trunc);
+            file << "[Money]\n; nothing else here\n";
+        }
+        MoneySystem loaded;
+        CHECK(LoadMoney(loaded));
+        CHECK(loaded.Balance() == MoneySystem::kStartingBalance);
+        CHECK(loaded.TotalEarned() == 0);
+    }
+
+    // Starting over is a new career, so it comes with the seed money again
+    // rather than dropping the player to nothing.
+    {
+        MoneySystem money;
+        money.Award(MoneyEvent::CommTowerDestroyed);
+        money.ResetCareer();
+        CHECK(money.Balance() == MoneySystem::kStartingBalance);
+        CHECK(money.TotalEarned() == 0);
+        CHECK(money.SessionEarned() == 0);
+        CHECK(money.DrainAwards().empty());
+    }
+
+    // A file claiming far more spendable money than was ever earned is repaired
+    // upward rather than trusted. The floor is the balance minus the starting
+    // grant, not the whole balance: a legitimate first-launch wallet holds the
+    // seed it never earned, and flooring at the raw balance would count that
+    // grant as earnings.
     {
         {
             std::ofstream file(MoneySavePath(), std::ios::trunc);
@@ -176,7 +246,7 @@ int main() {
         MoneySystem loaded;
         CHECK(LoadMoney(loaded));
         CHECK(loaded.Balance() == 5000);
-        CHECK(loaded.TotalEarned() == 5000);
+        CHECK(loaded.TotalEarned() == 5000 - MoneySystem::kStartingBalance);
     }
 
     std::filesystem::remove(MoneySavePath());
