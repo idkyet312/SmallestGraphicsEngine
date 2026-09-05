@@ -3155,30 +3155,7 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
         // exactly when there is a scope image to judge.
         if (GunModel::R700Selected()) {
             ImGui::SeparatorText("Sniper Scope");
-            // Zoom is authored as the scope camera's field of view, but what
-            // the player judges is magnification, so show both. The multiplier
-            // is against the ADS camera the lens is actually seen through
-            // (weaponAdsFOV, not the 60 deg hip view) -- quoting it against the
-            // hip FOV would overstate what the eye compares it to.
-            {
-                const float adsFOV = (std::max)(1.0f, scene.weaponAdsFOV);
-                const float magnification =
-                    std::tan(DirectX::XMConvertToRadians(adsFOV) * 0.5f) /
-                    std::tan(DirectX::XMConvertToRadians(
-                        (std::max)(0.5f, scene.sniperScopeFOV)) * 0.5f);
-                ImGui::SliderFloat("Scope Zoom", &scene.sniperScopeFOV,
-                                   1.0f, 42.0f, "%.1f deg",
-                                   ImGuiSliderFlags_AlwaysClamp |
-                                   ImGuiSliderFlags_Logarithmic);
-                ImGui::SetItemTooltip(
-                    "Field of view the scope camera renders with. Lower is "
-                    "more zoom. Takes effect immediately -- the lens samples "
-                    "this same value, so image and framing stay in agreement.");
-                ImGui::SameLine();
-                ImGui::Text("%.1fx", magnification);
-                if (ImGui::SmallButton("Reset Zoom##scopefov"))
-                    scene.sniperScopeFOV = Scene::kR700ScopeFOVDegrees;
-            }
+            ImGui::Text("Magnification: 6x (%.2f deg field of view)", scene.sniperScopeFOV);
             ImGui::SliderFloat("Scope UV Rotation",
                                &scene.sniperScopeUVRotationDegrees,
                                -180.0f, 180.0f, "%.1f deg",
@@ -3202,6 +3179,24 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             ImGui::SameLine();
             if (ImGui::SmallButton("Level Roll##scopecamroll"))
                 scene.sniperScopeCameraRollDegrees = 0.0f;
+            ImGui::SliderFloat("Scope Camera Forward",
+                               &scene.sniperScopeCameraForwardMetres,
+                               0.0f, 3.0f, "%.2f m",
+                               ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SetItemTooltip(
+                "Pushes the scope camera forward along its own view axis.\n\n"
+                "Zero is the correct value. The lens shader builds its sample "
+                "coordinate from the MAIN camera's view ray, and the glass "
+                "disc's half-angle is measured from the player's eye -- both "
+                "stay anchored to the eye when this moves, so the two bases "
+                "disagree and the image collapses toward the lens centre. "
+                "Measured at 1.35 m the glass filled with concentric rings and "
+                "showed no world at all.\n\n"
+                "Here to make that mismatch visible, and to give a "
+                "parallax-correct lens something to test against.");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reset##scopecamfwd"))
+                scene.sniperScopeCameraForwardMetres = 0.0f;
             ImGui::Checkbox("Scope UV Debug Key",
                             &scene.sniperScopeUVDebug);
             ImGui::SetItemTooltip(

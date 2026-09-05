@@ -749,7 +749,10 @@ inline void FillFrameMatrixBufferForIndirect(ShaderDX12& matrixShader,
                                         const XMMATRIX& view,
                                         const XMMATRIX& proj, const XMMATRIX& lightSpace,
                                         D3D12_GPU_VIRTUAL_ADDRESS& outCBV) {
-    UINT bufferIndex = g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME;
+    // Indirect draws share one camera matrix, but each camera must own its
+    // address until the frame fence retires both recorded passes.
+    UINT bufferIndex = g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME +
+        matrixShader.CurrentViewSlot() * ShaderDX12::kDrawCallsPerView;
 
     // Zero-initialised: the visibility VS only reads model/view/projection, but
     // terrain's amplification shader shares this CBV and culls against
@@ -834,7 +837,7 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
     // frustum, projected-size LOD, HZB visibility, and final indirect draw count.
     CullAndBatchDrawItems(scene, view, proj, drawItems);
 
-    scene.clusteredRenderer.setScreenSize((float)g_dx12.screenWidth, (float)g_dx12.screenHeight);
+    scene.clusteredRenderer.setScreenSize(scene.RenderWidth(), scene.RenderHeight());
     scene.clusteredRenderer.setCamera(scene.EffectiveCameraFOV(), scene.cameraNear,
         scene.EffectiveCameraFarPlane(), view, proj);
     scene.clusteredRenderer.cullLights();
@@ -1169,7 +1172,7 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         lb.shininess = scene.specularShininess;
         lb.shadowBias = scene.shadowBias;
         lb.enableShadows = scene.enableShadows ? 1 : 0;
-        shader.lightBuffer.CopyData(g_dx12.frameIndex, lb);
+        shader.lightBuffer.CopyData(shader.ViewFrameIndex(), lb);
 
         PointLightsBufferDX12 plb = {};
         const auto& sourceLights = scene.clusteredRenderer.lights;
@@ -1192,7 +1195,7 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         plb.spotShadowCount = static_cast<int>(g_spotShadowActiveCount);
         for (UINT s = 0; s < SPOT_SHADOW_COUNT; ++s)
             plb.spotShadowMatrices[s] = XMMatrixTranspose(g_spotShadowMatrices[s]);
-        shader.pointLightsBuffer.CopyData(g_dx12.frameIndex, plb);
+        shader.pointLightsBuffer.CopyData(shader.ViewFrameIndex(), plb);
     }
 
     shader.SetSH();
@@ -1200,7 +1203,8 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         (g_ddgiRenderer.computeInitialized || g_dxrDDGIProbeCount > 0),
         scene.giIntensity, scene.normalBias, scene.probeSpacing,
         g_dxrDDGIProbeCount, g_dxrDDGICellCount, g_dxrDDGICellSize);
-    if (scene.useDDGI && g_dxrDDGIProbeCount == 0 &&
+    // Probe updates belong to the frame; the scope only samples their result.
+    if (!isScopeView && scene.useDDGI && g_dxrDDGIProbeCount == 0 &&
         g_ddgiRenderer.computeInitialized) {
         DDGIMainLightData mainLight = {};
         mainLight.lightPos = scene.lightPos;
@@ -1213,15 +1217,15 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
         const int pointLightCount = (std::min)(
             (int)scene.clusteredRenderer.lights.size(), 64);
         g_ddgiRenderer.UpdateProbes(g_dx12.commandList.Get(),
-            shader.pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex),
+            shader.pointLightsBuffer.GetGPUAddress(shader.ViewFrameIndex()),
             pointLightCount,
-            shader.ddgiBuffer.GetGPUAddress(g_dx12.frameIndex), mainLight);
+            shader.ddgiBuffer.GetGPUAddress(shader.ViewFrameIndex()), mainLight);
     }
     vb.UpdateLightDescriptors(
-        shader.lightBuffer.GetGPUAddress(g_dx12.frameIndex),
-        shader.pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex),
-        shader.shBuffer.GetGPUAddress(g_dx12.frameIndex),
-        shader.ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
+        shader.lightBuffer.GetGPUAddress(shader.ViewFrameIndex()),
+        shader.pointLightsBuffer.GetGPUAddress(shader.ViewFrameIndex()),
+        shader.shBuffer.GetGPUAddress(shader.ViewFrameIndex()),
+        shader.ddgiBuffer.GetGPUAddress(shader.ViewFrameIndex()));
     vb.UpdateShadowMapDescriptor(shadowResource);
 
     LightBufferDX12 dummyLB = {};
@@ -1238,7 +1242,24 @@ inline void RenderVBDraw(Scene& scene, ShaderDX12& shader,
             dummyLB, dummyPL);
     }
 
+    // Opening the extensions pass is how this function hands outputTexture and
+    // the active depth buffer to the caller's terrain, water, foliage and
+    // viewmodel draws. It is also the only thing that returns depth to
+    // DEPTH_WRITE after Resolve moved it to an SRV state in order to read it.
     vb.BeginForwardExtensions(g_dx12.commandList.Get());
+    // The scope has no extensions pass. It goes straight from the resolve to
+    // CopyResolveOutputTo, whose barrier declares outputTexture as
+    // NON_PIXEL_SHADER_RESOURCE; leaving the pass open left it in
+    // RENDER_TARGET behind that declaration, which is a state mismatch.
+    //
+    // Closing the bracket immediately -- rather than skipping the open -- is
+    // what keeps the depth buffer correct. Resolve never restores depth on its
+    // own, so skipping would strand the scope's depth in an SRV state and next
+    // frame's ClearDepthStencilView on it, which requires DEPTH_WRITE, would
+    // be the new mismatch. The matched pair leaves both resources exactly
+    // where the copy expects them.
+    if (isScopeView)
+        vb.EndForwardExtensions(g_dx12.commandList.Get());
 }
 
 #endif // VBDRAW_RENDERER_H

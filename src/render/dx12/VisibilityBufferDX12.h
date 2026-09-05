@@ -11,6 +11,8 @@
 #include <DirectXPackedVector.h>
 #include <stb_image.h>
 #include <algorithm>
+#include <memory>
+#include <cassert>
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -589,7 +591,7 @@ public:
     ComPtr<ID3D12Resource> hitGeometryBuffer;
     UINT hitGeometryCount = 0;
     ComPtr<ID3D12Resource> clusterDataBuffer;     // StructuredBuffer<ClusterData>
-    ComPtr<ID3D12Resource> clusterDataUpload;
+    ComPtr<ID3D12Resource> clusterDataUpload[FRAME_COUNT];
     ComPtr<ID3D12Resource> materialDataBuffer;
     VBMaterialData* mappedMaterials = nullptr;
 
@@ -600,6 +602,9 @@ public:
 
     // Descriptor heap for compute pass SRVs/UAVs
     ComPtr<ID3D12DescriptorHeap> computeDescHeap;
+    ComPtr<ID3D12DescriptorHeap> rasterViewHeaps[FRAME_COUNT];
+    ComPtr<ID3D12DescriptorHeap> resolveViewHeaps[FRAME_COUNT];
+    UploadBuffer<VBMaterialData> legacyMaterialSnapshots;
 
     // CPU-side staging data
     std::vector<VBDrawCallData> cpuDrawCalls;
@@ -783,6 +788,247 @@ public:
     UINT width = 0;
     UINT height = 0;
 
+    struct ScopeViewStorage {
+        UINT width = 1024, height = 1024;
+        ComPtr<ID3D12Resource> visBufferRT;
+        ComPtr<ID3D12Resource> outputTexture;
+        ComPtr<ID3D12Resource> motionTexture;
+        ComPtr<ID3D12Resource> normalRoughnessTexture;
+        ComPtr<ID3D12Resource> rayMaskTexture;
+        ComPtr<ID3D12Resource> svgfReflectionSrc;
+        ComPtr<ID3D12Resource> svgfStableSurfaceCurrent;
+        ComPtr<ID3D12Resource> drawCallBuffer;
+        ComPtr<ID3D12Resource> clusterDataBuffer;
+        ComPtr<ID3D12DescriptorHeap> visRtvHeap;
+        ComPtr<ID3D12DescriptorHeap> outputRtvHeap;
+        ComPtr<ID3D12DescriptorHeap> computeDescHeap;
+        ComPtr<ID3D12Resource> drawCallUpload[FRAME_COUNT];
+        ComPtr<ID3D12Resource> clusterDataUpload[FRAME_COUNT];
+        ComPtr<ID3D12Resource> vertexDataUpload[FRAME_COUNT];
+        ComPtr<ID3D12Resource> indexDataUpload[FRAME_COUNT];
+        ComPtr<ID3D12Resource> stableTriangleDataUpload[FRAME_COUNT];
+        ComPtr<ID3D12DescriptorHeap> rasterViewHeaps[FRAME_COUNT];
+        ComPtr<ID3D12DescriptorHeap> resolveViewHeaps[FRAME_COUNT];
+        ComPtr<ID3D12DescriptorHeap> enhancedComputeDescHeaps[FRAME_COUNT];
+        std::vector<VBDrawCallData> cpuDrawCalls;
+        std::vector<VBClusterData> cpuClusters;
+        std::vector<XMFLOAT4X4> previousModels;
+        std::unordered_map<uint64_t, XMFLOAT4X4> previousModelByInstance;
+        UINT currentDrawCall = 0, previousDrawCount = 0;
+        UINT drawCallDirtyMin = UINT_MAX, drawCallDirtyMax = 0;
+        UINT bindlessResolveTableBases[FRAME_COUNT]{};
+        XMMATRIX terrainProjection = XMMatrixIdentity();
+        bool terrainProjectionValid = false;
+        bool terrainVisibilityActiveThisFrame = false;
+        bool terrainDescriptorsWritten = false;
+        float currentNearPlane = 0.1f, currentFarPlane = 1000.0f;
+    };
+    std::unique_ptr<ScopeViewStorage> scopeView;
+
+    UINT ViewFrameIndex() const {
+        return RenderViewFrameIndexDX12(g_dx12.frameIndex, FRAME_COUNT,
+            ScopeSurfaceBound() ? RenderViewDX12::Scope : RenderViewDX12::Main);
+    }
+    ID3D12DescriptorHeap* RasterViewHeap() const {
+        return rasterViewHeaps[g_dx12.frameIndex % FRAME_COUNT].Get();
+    }
+    ID3D12DescriptorHeap* ResolveViewHeap() const {
+        return resolveViewHeaps[g_dx12.frameIndex % FRAME_COUNT].Get();
+    }
+
+    bool InitScopeView() {
+        if (!initialized) return false;
+        auto view = std::make_unique<ScopeViewStorage>();
+        const auto buffer = [&](UINT64 bytes, D3D12_HEAP_TYPE type,
+                                ComPtr<ID3D12Resource>& out) {
+            D3D12_HEAP_PROPERTIES heap{}; heap.Type = type;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            desc.Width = bytes; desc.Height = 1;
+            desc.DepthOrArraySize = desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            return SUCCEEDED(g_dx12.device->CreateCommittedResource(&heap,
+                D3D12_HEAP_FLAG_NONE, &desc,
+                type == D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_GENERIC_READ
+                                            : D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr, IID_PPV_ARGS(&out)));
+        };
+        const auto texture = [&](DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
+                                 D3D12_RESOURCE_STATES initial,
+                                 const wchar_t* name, ComPtr<ID3D12Resource>& out) {
+            D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = view->width; desc.Height = view->height;
+            desc.DepthOrArraySize = desc.MipLevels = 1;
+            desc.Format = format; desc.SampleDesc.Count = 1; desc.Flags = flags;
+            if (FAILED(g_dx12.device->CreateCommittedResource(&heap,
+                    D3D12_HEAP_FLAG_NONE, &desc, initial, nullptr,
+                    IID_PPV_ARGS(&out)))) return false;
+            out->SetName(name);
+            return true;
+        };
+        const auto srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        const auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        const auto rt = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        const auto ua = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (!texture(DXGI_FORMAT_R32G32_UINT, rt, srv,
+                     L"Scope visibility", view->visBufferRT) ||
+            !texture(DXGI_FORMAT_R16G16B16A16_FLOAT, rt | ua, srv,
+                     L"Scope HDR world", view->outputTexture) ||
+            !texture(DXGI_FORMAT_R16G16_FLOAT, ua, srv,
+                     L"Scope motion scratch", view->motionTexture) ||
+            !texture(DXGI_FORMAT_R16G16B16A16_FLOAT, ua, srv,
+                     L"Scope surface", view->normalRoughnessTexture) ||
+            !texture(DXGI_FORMAT_R8_UINT, ua, uav,
+                     L"Scope ray classification", view->rayMaskTexture) ||
+            !texture(DXGI_FORMAT_R16G16B16A16_FLOAT, ua, uav,
+                     L"Scope reflection signal", view->svgfReflectionSrc) ||
+            !texture(DXGI_FORMAT_R32G32_UINT, ua, uav,
+                     L"Scope surface identity", view->svgfStableSurfaceCurrent)) return false;
+        if (!buffer(VB_MAX_DRAW_CALLS * sizeof(VBDrawCallData),
+                    D3D12_HEAP_TYPE_DEFAULT, view->drawCallBuffer) ||
+            !buffer(VB_CLUSTER_COUNT * sizeof(VBClusterData),
+                    D3D12_HEAP_TYPE_DEFAULT, view->clusterDataBuffer)) return false;
+        D3D12_DESCRIPTOR_HEAP_DESC desc{};
+        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; desc.NumDescriptors = 1;
+        if (FAILED(g_dx12.device->CreateDescriptorHeap(&desc,
+                IID_PPV_ARGS(&view->visRtvHeap))) ||
+            FAILED(g_dx12.device->CreateDescriptorHeap(&desc,
+                IID_PPV_ARGS(&view->outputRtvHeap)))) return false;
+        g_dx12.device->CreateRenderTargetView(view->visBufferRT.Get(), nullptr,
+            view->visRtvHeap->GetCPUDescriptorHandleForHeapStart());
+        g_dx12.device->CreateRenderTargetView(view->outputTexture.Get(), nullptr,
+            view->outputRtvHeap->GetCPUDescriptorHandleForHeapStart());
+        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        desc.NumDescriptors = kResolveDescriptorCount;
+        if (FAILED(g_dx12.device->CreateDescriptorHeap(&desc,
+                IID_PPV_ARGS(&view->computeDescHeap)))) return false;
+        for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
+            if (!buffer(VB_MAX_DRAW_CALLS * sizeof(VBDrawCallData),
+                        D3D12_HEAP_TYPE_UPLOAD, view->drawCallUpload[frame]) ||
+                !buffer(VB_CLUSTER_COUNT * sizeof(VBClusterData),
+                        D3D12_HEAP_TYPE_UPLOAD, view->clusterDataUpload[frame]) ||
+                !buffer(VB_MAX_VERTICES * sizeof(VBPackedVertex),
+                        D3D12_HEAP_TYPE_UPLOAD, view->vertexDataUpload[frame]) ||
+                !buffer(VB_MAX_INDICES * sizeof(UINT),
+                        D3D12_HEAP_TYPE_UPLOAD, view->indexDataUpload[frame]) ||
+                !buffer(VB_MAX_TRIANGLES * sizeof(UINT),
+                        D3D12_HEAP_TYPE_UPLOAD, view->stableTriangleDataUpload[frame])) return false;
+            desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+            desc.NumDescriptors = kEnhancedResolveDescriptorCount;
+            if (FAILED(g_dx12.device->CreateDescriptorHeap(&desc,
+                    IID_PPV_ARGS(&view->enhancedComputeDescHeaps[frame])))) return false;
+            desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            if (FAILED(g_dx12.device->CreateDescriptorHeap(&desc,
+                    IID_PPV_ARGS(&view->resolveViewHeaps[frame])))) return false;
+            desc.NumDescriptors = kResolveDescriptorCount;
+            if (FAILED(g_dx12.device->CreateDescriptorHeap(&desc,
+                    IID_PPV_ARGS(&view->rasterViewHeaps[frame])))) return false;
+            view->bindlessResolveTableBases[frame] = BINDLESS_INVALID_INDEX;
+        }
+        view->cpuDrawCalls.resize(VB_MAX_DRAW_CALLS);
+        view->cpuClusters.resize(VB_CLUSTER_COUNT);
+        view->previousModels.resize(VB_MAX_DRAW_CALLS);
+        scopeView = std::move(view);
+        return true;
+    }
+
+    void SwapScopeViewStorage() {
+        // Swap only view-dependent state. The large immutable geometry pools
+        // and material registry are shared by both cameras.
+        using std::swap;
+        swap(width, scopeView->width);
+        swap(height, scopeView->height);
+        swap(visBufferRT, scopeView->visBufferRT);
+        swap(outputTexture, scopeView->outputTexture);
+        swap(motionTexture, scopeView->motionTexture);
+        swap(normalRoughnessTexture, scopeView->normalRoughnessTexture);
+        swap(rayMaskTexture, scopeView->rayMaskTexture);
+        swap(svgfReflectionSrc, scopeView->svgfReflectionSrc);
+        swap(svgfStableSurfaceCurrent, scopeView->svgfStableSurfaceCurrent);
+        swap(drawCallBuffer, scopeView->drawCallBuffer);
+        swap(clusterDataBuffer, scopeView->clusterDataBuffer);
+        swap(visRtvHeap, scopeView->visRtvHeap);
+        swap(outputRtvHeap, scopeView->outputRtvHeap);
+        swap(computeDescHeap, scopeView->computeDescHeap);
+        swap(cpuDrawCalls, scopeView->cpuDrawCalls);
+        swap(cpuClusters, scopeView->cpuClusters);
+        swap(previousModels, scopeView->previousModels);
+        swap(previousModelByInstance, scopeView->previousModelByInstance);
+        swap(currentDrawCall, scopeView->currentDrawCall);
+        swap(previousDrawCount, scopeView->previousDrawCount);
+        swap(drawCallDirtyMin, scopeView->drawCallDirtyMin);
+        swap(drawCallDirtyMax, scopeView->drawCallDirtyMax);
+        swap(terrainProjection, scopeView->terrainProjection);
+        swap(terrainProjectionValid, scopeView->terrainProjectionValid);
+        swap(terrainVisibilityActiveThisFrame, scopeView->terrainVisibilityActiveThisFrame);
+        swap(terrainDescriptorsWritten, scopeView->terrainDescriptorsWritten);
+        swap(currentNearPlane, scopeView->currentNearPlane);
+        swap(currentFarPlane, scopeView->currentFarPlane);
+        for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
+            swap(drawCallUpload[frame], scopeView->drawCallUpload[frame]);
+            swap(clusterDataUpload[frame], scopeView->clusterDataUpload[frame]);
+            swap(vertexDataUpload[frame], scopeView->vertexDataUpload[frame]);
+            swap(indexDataUpload[frame], scopeView->indexDataUpload[frame]);
+            swap(stableTriangleDataUpload[frame], scopeView->stableTriangleDataUpload[frame]);
+            swap(rasterViewHeaps[frame], scopeView->rasterViewHeaps[frame]);
+            swap(resolveViewHeaps[frame], scopeView->resolveViewHeaps[frame]);
+            swap(enhancedComputeDescHeaps[frame], scopeView->enhancedComputeDescHeaps[frame]);
+            swap(bindlessResolveTableBases[frame], scopeView->bindlessResolveTableBases[frame]);
+        }
+    }
+
+    void SnapshotLegacyMaterials() {
+        const UINT first = ViewFrameIndex() * VB_MAX_MATERIALS;
+        std::memcpy(legacyMaterialSnapshots.mappedData + first, mappedMaterials,
+                    materialCount * sizeof(VBMaterialData));
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Buffer.FirstElement = first;
+        srv.Buffer.NumElements = VB_MAX_MATERIALS;
+        srv.Buffer.StructureByteStride = sizeof(VBMaterialData);
+        auto handle = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += 7ull * g_dx12.cbvSrvUavDescriptorSize;
+        g_dx12.device->CreateShaderResourceView(
+            legacyMaterialSnapshots.resource.Get(), &srv, handle);
+    }
+
+    void PatchScopeDescriptors() {
+        const auto handle = [&](UINT slot) {
+            auto result = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
+            result.ptr += static_cast<SIZE_T>(slot) * g_dx12.cbvSrvUavDescriptorSize;
+            return result;
+        };
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = 1;
+        srv.Format = DXGI_FORMAT_R32G32_UINT;
+        g_dx12.device->CreateShaderResourceView(visBufferRT.Get(), &srv, handle(0));
+        srv.Format = DXGI_FORMAT_R32_FLOAT;
+        g_dx12.device->CreateShaderResourceView(ActiveDepthBuffer(), &srv, handle(1));
+        srv = {};
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Buffer.NumElements = VB_MAX_DRAW_CALLS;
+        srv.Buffer.StructureByteStride = sizeof(VBDrawCallData);
+        g_dx12.device->CreateShaderResourceView(drawCallBuffer.Get(), &srv, handle(3));
+        srv.Buffer.NumElements = VB_CLUSTER_COUNT;
+        srv.Buffer.StructureByteStride = sizeof(VBClusterData);
+        g_dx12.device->CreateShaderResourceView(clusterDataBuffer.Get(), &srv, handle(6));
+        ID3D12Resource* outputs[] = { outputTexture.Get(), motionTexture.Get(), normalRoughnessTexture.Get() };
+        for (UINT i = 0; i < 3; ++i) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            uav.Format = outputs[i]->GetDesc().Format;
+            g_dx12.device->CreateUnorderedAccessView(outputs[i], nullptr, &uav, handle(79 + i));
+        }
+        WriteBentNormalHistoryDescriptor(computeDescHeap.Get(), 86, nullptr);
+    }
+
     // --- Per-view surface binding (sniper scope) ---
     //
     // Every camera-dependent pass below used to read the global depth buffer,
@@ -808,8 +1054,27 @@ public:
     };
     ViewSurface boundSurface;
 
-    void BindViewSurface(const ViewSurface& surface) { boundSurface = surface; }
-    void UnbindViewSurface() { boundSurface = ViewSurface{}; }
+    void BindViewSurface(const ViewSurface& surface) {
+        assert(!ScopeSurfaceBound());
+        assert(!surface.isScope || scopeView);
+        if (surface.isScope) {
+            g_dx12.device->CopyDescriptorsSimple(kResolveDescriptorCount,
+                scopeView->computeDescHeap->GetCPUDescriptorHandleForHeapStart(),
+                computeDescHeap->GetCPUDescriptorHandleForHeapStart(),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            SwapScopeViewStorage();
+        }
+        boundSurface = surface;
+        if (surface.isScope) {
+            PatchScopeDescriptors();
+            if (bindlessActive && !PrepareBindlessFrame(g_dx12.frameIndex, true))
+                bindlessActive = false;
+        }
+    }
+    void UnbindViewSurface() {
+        if (ScopeSurfaceBound()) SwapScopeViewStorage();
+        boundSurface = ViewSurface{};
+    }
     bool ScopeSurfaceBound() const { return boundSurface.isScope; }
 
     ID3D12Resource* ActiveDepthBuffer() const {
@@ -854,6 +1119,7 @@ public:
     }
 
     ID3D12Resource* StableSurfaceResource(UINT index) const {
+        if (ScopeSurfaceBound()) return svgfStableSurfaceCurrent.Get();
         return index == 0u ? svgfStableSurfaceCurrent.Get()
                            : svgfStableSurfaceHistory.Get();
     }
@@ -881,6 +1147,7 @@ public:
     }
 
     void PrepareStableSurfaceHistory(bool active, UINT modeSignature) {
+        if (ScopeSurfaceBound()) return;
         if (active != stableSurfaceIdentityActive ||
             modeSignature != stableSurfaceModeSignature) {
             surfaceHistoryValid = false;
@@ -933,8 +1200,8 @@ public:
         if (!require(CreatePostPipeline(), "post-process shader")) return false;
         if (!require(CreateExposurePipeline(), "exposure shaders")) return false;
 
-        if (!require(frameConstantBuffer.Create(FRAME_COUNT), "frame constants")) return false;
-        if (!require(impactDecalsBuffer.Create(FRAME_COUNT), "impact decals")) return false;
+        if (!require(frameConstantBuffer.Create(FRAME_COUNT * RenderViewCountDX12), "frame constants")) return false;
+        if (!require(impactDecalsBuffer.Create(FRAME_COUNT * RenderViewCountDX12), "impact decals")) return false;
         if (!require(postConstantBuffer.Create(FRAME_COUNT), "post constants")) return false;
         if (!require(exposureConstantBuffer.Create(FRAME_COUNT), "exposure constants")) return false;
 
@@ -954,7 +1221,7 @@ public:
     void BeginFrame() {
         // Returns quarantined geometry ranges to the free list once every
         // in-flight frame has finished reading them.
-        geometryPool.BeginFrame();
+        if (!ScopeSurfaceBound()) geometryPool.BeginFrame();
         // Slot indices released during the last frame's update are safe to
         // reuse now: this frame's draw calls have not been recorded yet, and
         // the previous frame's are done referencing them.
@@ -1039,6 +1306,12 @@ public:
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.Texture2D.MipLevels = resource.MipLevels;
             g_dx12.device->CreateShaderResourceView(texture, &srv, handle);
+            if (ScopeSurfaceBound()) {
+                auto primary = scopeView->computeDescHeap->GetCPUDescriptorHandleForHeapStart();
+                primary.ptr += static_cast<SIZE_T>(descriptorSize) * (8 + textureIndex);
+                g_dx12.device->CopyDescriptorsSimple(1, primary, handle,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            }
             materialTextureLookup.emplace(texture, textureIndex);
             return textureIndex;
         };
@@ -1105,7 +1378,7 @@ public:
         auto found = bindlessMaterialLookup.find(material);
         if (found != bindlessMaterialLookup.end()) {
             const UINT recordIndex =
-                (g_dx12.frameIndex % FRAME_COUNT) * VB_MAX_MATERIALS +
+                ViewFrameIndex() * VB_MAX_MATERIALS +
                 found->second;
             VBMaterialData& record = mappedBindlessMaterials[recordIndex];
             updateParameters(record);
@@ -1133,7 +1406,7 @@ public:
 
         const UINT id = bindlessMaterialCount++;
         const UINT recordIndex =
-            (g_dx12.frameIndex % FRAME_COUNT) * VB_MAX_MATERIALS + id;
+            ViewFrameIndex() * VB_MAX_MATERIALS + id;
         mappedBindlessMaterials[recordIndex] = data;
         bindlessMaterialLookup.emplace(material, id);
         return id;
@@ -1683,12 +1956,12 @@ public:
         {
             void* mapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
-            clusterDataUpload->Map(0, &readRange, &mapped);
+            clusterDataUpload[frameSlot]->Map(0, &readRange, &mapped);
             memcpy(mapped, cpuClusters.data(),
                    cpuClusters.size() * sizeof(VBClusterData));
-            clusterDataUpload->Unmap(0, nullptr);
+            clusterDataUpload[frameSlot]->Unmap(0, nullptr);
             cmdList->CopyBufferRegion(clusterDataBuffer.Get(), 0,
-                clusterDataUpload.Get(), 0,
+                clusterDataUpload[frameSlot].Get(), 0,
                 cpuClusters.size() * sizeof(VBClusterData));
         }
 
@@ -1796,10 +2069,14 @@ public:
         cmdList->RSSetViewports(1, &ActiveViewport());
         cmdList->RSSetScissorRects(1, &ActiveScissor());
 
+        g_dx12.device->CopyDescriptorsSimple(kResolveDescriptorCount,
+            RasterViewHeap()->GetCPUDescriptorHandleForHeapStart(),
+            computeDescHeap->GetCPUDescriptorHandleForHeapStart(),
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         // Set pipeline
         const bool useBindless = BindlessVisPassActive();
         ID3D12DescriptorHeap* heaps[] = {
-            useBindless ? bindlessHeap->Heap() : computeDescHeap.Get()
+            useBindless ? bindlessHeap->Heap() : RasterViewHeap()
         };
         cmdList->SetDescriptorHeaps(1, heaps);
         cmdList->SetGraphicsRootSignature(useBindless
@@ -1809,7 +2086,7 @@ public:
             drawCallBuffer->GetGPUVirtualAddress());
         D3D12_GPU_DESCRIPTOR_HANDLE defaultTexture = useBindless
             ? bindlessHeap->GpuHandleAt(BINDLESS_FALLBACK_WHITE)
-            : computeDescHeap->GetGPUDescriptorHandleForHeapStart();
+            : RasterViewHeap()->GetGPUDescriptorHandleForHeapStart();
         if (!useBindless)
             defaultTexture.ptr += static_cast<UINT64>(
                 g_dx12.cbvSrvUavDescriptorSize) * 8u;
@@ -1825,7 +2102,7 @@ public:
         UINT albedoIndex = BINDLESS_FALLBACK_WHITE;
         if (useBindless && materialID < bindlessMaterialCount) {
             const UINT recordIndex =
-                (g_dx12.frameIndex % FRAME_COUNT) * VB_MAX_MATERIALS + materialID;
+                ViewFrameIndex() * VB_MAX_MATERIALS + materialID;
             albedoIndex = mappedBindlessMaterials[recordIndex].textureIndices[0];
         }
         const UINT constants[4] = { drawCallID, alphaCutout ? 1u : 0u,
@@ -1846,7 +2123,7 @@ public:
             mappedMaterials[materialID].textureIndices[0] < VB_MAX_MATERIAL_TEXTURES)
             textureIndex = mappedMaterials[materialID].textureIndices[0];
         D3D12_GPU_DESCRIPTOR_HANDLE texture =
-            computeDescHeap->GetGPUDescriptorHandleForHeapStart();
+            RasterViewHeap()->GetGPUDescriptorHandleForHeapStart();
         texture.ptr += static_cast<UINT64>(g_dx12.cbvSrvUavDescriptorSize) *
             (8u + textureIndex);
         cmdList->SetGraphicsRootDescriptorTable(2, texture);
@@ -1867,9 +2144,9 @@ public:
 
     void BindImpactDecalCutouts(ID3D12GraphicsCommandList* cmdList) {
         if (!impactDecalsBuffer.resource) return;
-        impactDecalsBuffer.CopyData(g_dx12.frameIndex, impactDecalsCPU);
+        impactDecalsBuffer.CopyData(ViewFrameIndex(), impactDecalsCPU);
         cmdList->SetGraphicsRootConstantBufferView(
-            4, impactDecalsBuffer.GetGPUAddress(g_dx12.frameIndex));
+            4, impactDecalsBuffer.GetGPUAddress(ViewFrameIndex()));
     }
 
     void SetPalmWindFrame(const PalmWindFrameDX12& frame) {
@@ -1882,7 +2159,8 @@ public:
                             const XMMATRIX& proj, const XMMATRIX& lightSpace,
                             ShaderDX12& matrixSource, UINT drawIndex) {
         // We reuse the existing matrix buffer from ShaderDX12
-        UINT bufferIndex = g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME + drawIndex;
+        UINT bufferIndex = g_dx12.frameIndex * MAX_DRAW_CALLS_PER_FRAME +
+            matrixSource.CurrentViewSlot() * ShaderDX12::kDrawCallsPerView + drawIndex;
 
         MatrixBufferDX12 data = {};
         data.model = XMMatrixTranspose(model);
@@ -1964,6 +2242,9 @@ public:
         currentNearPlane = nearPlane;
         currentFarPlane = farPlane;
         const UINT frameSlot = g_dx12.frameIndex % FRAME_COUNT;
+        SnapshotLegacyMaterials();
+        if (enhancedVisualsActive && enhancedPipelineReady)
+            RefreshEnhancedDescriptors(frameSlot);
         ID3D12DescriptorHeap* enhancedDescHeap =
             enhancedComputeDescHeaps[frameSlot].Get();
         const bool useEnhanced = enhancedVisualsActive && enhancedPipelineReady &&
@@ -1973,7 +2254,7 @@ public:
             StableSurfaceIdentityRequired(useEnhanced),
             StableSurfaceModeSignature(true, useEnhanced));
         ID3D12DescriptorHeap* standardDescHeap = computeDescHeap.Get();
-        bool bentNormalHistoryActive = bentNormalGTAORequested &&
+        bool bentNormalHistoryActive = !ScopeSurfaceBound() && bentNormalGTAORequested &&
             bentNormalGTAOHistoryValid && bentNormalGTAOHistory &&
             !validationMode && debugViewMode == 0;
         if (bentNormalHistoryActive && !useEnhanced) {
@@ -2060,7 +2341,7 @@ public:
         svgfMotionVectorsEnabledLastFrame =
             motionVectorsRequired && enhancedVisualsActive &&
             enhancedRTReflectionsActive && svgfTemporalEnabled;
-        fc.edgeAAEnabled = edgeAAEnabled ? 1u : 0u;
+        fc.edgeAAEnabled = (edgeAAEnabled || ScopeSurfaceBound()) ? 1u : 0u;
         fc.contactShadowStrength = contactShadowStrength;
         fc.contactShadowMaxDistance = contactShadowMaxDistance;
         fc.contactShadowLinearDepth = contactShadowLinearDepth ? 1u : 0u;
@@ -2093,12 +2374,12 @@ public:
             ? XMFLOAT2(0.5f / terrainSplatExtentX, 0.5f / terrainSplatExtentZ)
             : XMFLOAT2(0.0f, 0.0f);
         fc.terrainSplatPad = XMFLOAT2(0.0f, 0.0f);
-        frameConstantBuffer.CopyData(g_dx12.frameIndex, fc);
+        frameConstantBuffer.CopyData(ViewFrameIndex(), fc);
 
         // A toggle can leave old history describing samples from a different
         // mode. Invalidate before uploading b5 so the shader sees the reset on
         // the first frame after the transition.
-        if (svgfTemporalEnabled != svgfTemporalEnabledLastFrame) {
+        if (!ScopeSurfaceBound() && svgfTemporalEnabled != svgfTemporalEnabledLastFrame) {
             svgfHistoryValid = false;
             svgfTemporalEnabledLastFrame = svgfTemporalEnabled;
         }
@@ -2110,15 +2391,42 @@ public:
         bool useBindless = bindlessActive && BindlessResolveReady() &&
                            (!useEnhanced || BindlessEnhancedResolveReady()) &&
                            bindlessHeap && bindlessHeap->Initialized();
+        // The scope must not reproject against the main view's history. The
+        // SVGF history textures are one set shared by every view, so what they
+        // hold is main-camera radiance at main-camera screen positions -- and
+        // a 15-degree frustum agrees with that camera on no pixel. Telling the
+        // shader the history is invalid makes the lens shade from scratch,
+        // which is exactly what a view with no history of its own should do.
+        //
+        // Saved and restored around the pass rather than assigned, because the
+        // main view resolves later in the same frame and its own history is
+        // still perfectly good.
+        const bool savedSVGFHistoryValid = svgfHistoryValid;
+        if (ScopeSurfaceBound()) svgfHistoryValid = false;
         if (useEnhanced) {
             UpdateEnhancedConstants(frameSlot);
         }
 
         // Debug views inspect the latest completed history without advancing
         // it. Only normal shading commits a new ping-pong side.
+        //
+        // The scope is excluded for a stronger reason. svgfHistoryPing and the
+        // history textures it selects are shared by every view and indexed by
+        // frame parity alone. The scope resolves earlier in the same frame
+        // than the main view, so letting it advance the ping-pong would flip
+        // the side the main view then reads AND fill it with radiance from the
+        // scope's frustum. Per-view history is the real fix and a larger
+        // change; until then the scope neither reads nor writes it, which
+        // costs the lens its temporal accumulation and costs the main view
+        // nothing.
         const bool svgfWillWriteHistory =
-            useEnhanced && svgfTemporalEnabled && debugViewMode == 0;
-        svgfTemporalExecutedLastFrame = svgfWillWriteHistory;
+            useEnhanced && svgfTemporalEnabled && debugViewMode == 0 &&
+            !ScopeSurfaceBound();
+        // Reports whether the temporal pass ran, for the debug panel. Left to
+        // the main view: the scope always answers false now, and the panel is
+        // asking about the view on screen.
+        if (!ScopeSurfaceBound())
+            svgfTemporalExecutedLastFrame = svgfWillWriteHistory;
         UINT svgfHistoryRead = svgfHistoryPing;
         UINT svgfHistoryWrite = svgfHistoryPing ^ 1u;
         if (svgfWillWriteHistory) {
@@ -2201,11 +2509,19 @@ public:
             }
         }
 
+        if (!useBindless) {
+            g_dx12.device->CopyDescriptorsSimple(
+                useEnhanced ? kEnhancedResolveDescriptorCount : kResolveDescriptorCount,
+                ResolveViewHeap()->GetCPUDescriptorHandleForHeapStart(),
+                (useEnhanced ? enhancedDescHeap : standardDescHeap)
+                    ->GetCPUDescriptorHandleForHeapStart(),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
         // SM 6.6 directly-indexed root signatures require the heap to be set
         // first so the driver captures the correct heap base in the signature.
         ID3D12DescriptorHeap* selectedHeap = useBindless
             ? bindlessHeap->Heap()
-            : (useEnhanced ? enhancedDescHeap : standardDescHeap);
+            : ResolveViewHeap();
         ID3D12DescriptorHeap* heaps[] = { selectedHeap };
         cmdList->SetDescriptorHeaps(1, heaps);
         cmdList->SetComputeRootSignature(selectedRoot);
@@ -2214,7 +2530,7 @@ public:
         // Bind root parameters
         // b0 - frame constants
         cmdList->SetComputeRootConstantBufferView(0,
-            frameConstantBuffer.GetGPUAddress(g_dx12.frameIndex));
+            frameConstantBuffer.GetGPUAddress(ViewFrameIndex()));
 
         // b1 - light buffer (we'll upload via a temporary inline approach)
         // Actually, we reuse the mainShader's lightBuffer
@@ -2226,13 +2542,13 @@ public:
             useBindless
                 ? bindlessHeap->GpuHandleAt(bindlessTableBase)
                 : (useEnhanced
-                    ? enhancedDescHeap->GetGPUDescriptorHandleForHeapStart()
-                    : standardDescHeap->GetGPUDescriptorHandleForHeapStart()));
+                    ? ResolveViewHeap()->GetGPUDescriptorHandleForHeapStart()
+                    : ResolveViewHeap()->GetGPUDescriptorHandleForHeapStart()));
 
         // Dispatch (GPU-driven via ExecuteIndirect)
         UINT groupsX = (width + 7) / 8;
         UINT groupsY = (height + 7) / 8;
-        if (mappedResolveDispatchArgs) {
+        if (mappedResolveDispatchArgs && !ScopeSurfaceBound()) {
             mappedResolveDispatchArgs->ThreadGroupCountX = groupsX;
             mappedResolveDispatchArgs->ThreadGroupCountY = groupsY;
             mappedResolveDispatchArgs->ThreadGroupCountZ = 1;
@@ -2248,7 +2564,7 @@ public:
         ID3D12PipelineState* tiledTerrainPSO =
             TerrainOnlyResolveTiledPSOForTier(useBindless, useEnhanced);
         const bool useTileClassification =
-            useTerrainResolve && tileClassifyReady && tiledGenericPSO &&
+            !ScopeSurfaceBound() && useTerrainResolve && tileClassifyReady && tiledGenericPSO &&
             tiledTerrainPSO && tileClassifyPSO && tileClassifyResetPSO &&
             genericTileListBuffer && terrainTileListBuffer &&
             classifiedDispatchArgsBuffer && mappedTileClassifyConstants;
@@ -2349,13 +2665,13 @@ public:
             cmdList->SetDescriptorHeaps(1, resolveHeaps);
             cmdList->SetComputeRootSignature(selectedRoot);
             cmdList->SetComputeRootConstantBufferView(0,
-                frameConstantBuffer.GetGPUAddress(g_dx12.frameIndex));
+                frameConstantBuffer.GetGPUAddress(ViewFrameIndex()));
             cmdList->SetComputeRootDescriptorTable(1,
                 useBindless
                     ? bindlessHeap->GpuHandleAt(bindlessTableBase)
                     : (useEnhanced
-                        ? enhancedDescHeap->GetGPUDescriptorHandleForHeapStart()
-                        : standardDescHeap->GetGPUDescriptorHandleForHeapStart()));
+                        ? ResolveViewHeap()->GetGPUDescriptorHandleForHeapStart()
+                        : ResolveViewHeap()->GetGPUDescriptorHandleForHeapStart()));
 
             selectedPSO = tiledGenericPSO;
         }
@@ -2378,7 +2694,7 @@ public:
                 cmdList->ExecuteIndirect(resolveDispatchSignature.Get(), 1,
                                          classifiedDispatchArgsBuffer.Get(), 0,
                                          nullptr, 0);
-            } else if (resolveDispatchSignature && resolveDispatchArgsBuffer) {
+            } else if (!ScopeSurfaceBound() && resolveDispatchSignature && resolveDispatchArgsBuffer) {
                 cmdList->ExecuteIndirect(resolveDispatchSignature.Get(), 1, resolveDispatchArgsBuffer.Get(), 0, nullptr, 0);
             } else {
                 cmdList->Dispatch(groupsX, groupsY, 1);
@@ -2411,7 +2727,7 @@ public:
                     sizeof(D3D12_DISPATCH_ARGUMENTS), nullptr, 0);
             } else {
                 cmdList->SetPipelineState(terrainOnlyPSO);
-                if (resolveDispatchSignature && resolveDispatchArgsBuffer) {
+                if (!ScopeSurfaceBound() && resolveDispatchSignature && resolveDispatchArgsBuffer) {
                     cmdList->ExecuteIndirect(resolveDispatchSignature.Get(), 1,
                                              resolveDispatchArgsBuffer.Get(), 0,
                                              nullptr, 0);
@@ -2464,7 +2780,7 @@ public:
 
         // Sample how much of the screen went to RT. Only meaningful when the
         // enhanced resolve actually wrote the mask this frame.
-        if (useEnhanced) UpdateRayMaskStatistic(cmdList);
+        if (useEnhanced && !ScopeSurfaceBound()) UpdateRayMaskStatistic(cmdList);
 
         // Transition SVGF colour/moment history back to SRV for next frame.
         // Stable-surface roles remain unchanged until post has read the same
@@ -2499,7 +2815,7 @@ public:
         ID3D12DescriptorHeap* compositeDescHeap =
             svgfCompositeDescHeaps[frameSlot].Get();
         const bool atrousRan =
-            useEnhanced && svgfTemporalEnabled && svgfAtrousEnabled &&
+            !ScopeSurfaceBound() && useEnhanced && svgfTemporalEnabled && svgfAtrousEnabled &&
             (debugViewMode == 0 || debugViewMode == 6) &&
             svgfAtrousPipelineReady && svgfAtrousPSO && svgfAtrousRootSig &&
             atrousDescHeap && svgfCompositePSO && svgfCompositeRootSig &&
@@ -2911,9 +3227,8 @@ public:
             cmdList->ResourceBarrier(3, barriers);
         }
 
-        // Preserve visibility depth before forward-only animated/alpha-tested
-        // geometry modifies it. Post uses the difference as a reactive mask.
-        {
+        // Preserve primary depth for the post reactive mask.
+        if (!ScopeSurfaceBound()) {
             // A full-screen depth CopyResource plus four transitions. Small per
             // pixel but not free at high resolution, and it ran inside the
             // aggregate "VB Resolve" with no scope of its own.
@@ -2939,6 +3254,11 @@ public:
             cmdList->ResourceBarrier(2, barriers);
         }
 
+        // Hand the main view back its history flag. The scope forced it false
+        // for its own shading above and, having written no history, has no
+        // opinion on whether the shared textures are valid -- only the view
+        // that fills them does.
+        if (ScopeSurfaceBound()) svgfHistoryValid = savedSVGFHistoryValid;
     }
 
     void UpdateExposure(ID3D12GraphicsCommandList* cmdList) {
@@ -3022,7 +3342,7 @@ public:
     }
 
     void BeginForwardExtensions(ID3D12GraphicsCommandList* cmdList) {
-        const bool useMotion = extensionMotionVectors;
+        const bool useMotion = extensionMotionVectors && !ScopeSurfaceBound();
         UINT barrierCount = useMotion ? 3u : 2u;
         D3D12_RESOURCE_BARRIER barriers[3] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3066,7 +3386,7 @@ public:
     // Bind colour + motion for draws that use an extension-motion PSO. No-op
     // when the toggle is off, so callers can bracket unconditionally.
     void BeginMotionDraws(ID3D12GraphicsCommandList* cmdList) {
-        if (!extensionMotionVectors) return;
+        if (!extensionMotionVectors || ScopeSurfaceBound()) return;
         D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = { GetOutputRTV(), GetMotionRTV() };
         D3D12_CPU_DESCRIPTOR_HANDLE dsv =
             ActiveDSV();
@@ -3075,7 +3395,7 @@ public:
 
     // Restore colour-only for the single-RT passes that follow.
     void EndMotionDraws(ID3D12GraphicsCommandList* cmdList) {
-        if (!extensionMotionVectors) return;
+        if (!extensionMotionVectors || ScopeSurfaceBound()) return;
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetOutputRTV();
         D3D12_CPU_DESCRIPTOR_HANDLE dsv =
             ActiveDSV();
@@ -3083,7 +3403,7 @@ public:
     }
 
     void EndForwardExtensions(ID3D12GraphicsCommandList* cmdList) {
-        const bool useMotion = extensionMotionVectors;
+        const bool useMotion = extensionMotionVectors && !ScopeSurfaceBound();
         UINT barrierCount = useMotion ? 3u : 2u;
         D3D12_RESOURCE_BARRIER barriers[3] = {};
         barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3306,6 +3626,72 @@ public:
         }
     }
 
+    // Copies the resolve output -- linear radiance, before any post -- into an
+    // external target.
+    //
+    // The sniper scope uses this instead of CopyToDestination. Post is a
+    // main-camera presentation layer (flare, dirt, exposure adaptation, tone
+    // map) and applying it per-view made the lens disagree with the frame that
+    // contains it. Taking the image at the resolve leaves the scope with the
+    // full visibility-buffer lighting and lets the main view's single tone map
+    // cover the lens as well.
+    //
+    // outputTexture lives in NON_PIXEL_SHADER_RESOURCE between passes, so
+    // unlike presentTexture it has to be walked to COPY_SOURCE and back.
+    void CopyResolveOutputTo(ID3D12GraphicsCommandList* cmdList,
+                             ID3D12Resource* destination,
+                             D3D12_RESOURCE_STATES destinationState) {
+        if (!destination || !outputTexture) return;
+
+        D3D12_RESOURCE_BARRIER toCopy[2] = {};
+        UINT barrierCount = 0;
+        toCopy[barrierCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toCopy[barrierCount].Transition.pResource = outputTexture.Get();
+        toCopy[barrierCount].Transition.StateBefore =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        toCopy[barrierCount].Transition.StateAfter =
+            D3D12_RESOURCE_STATE_COPY_SOURCE;
+        toCopy[barrierCount].Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ++barrierCount;
+        if (destinationState != D3D12_RESOURCE_STATE_COPY_DEST) {
+            toCopy[barrierCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toCopy[barrierCount].Transition.pResource = destination;
+            toCopy[barrierCount].Transition.StateBefore = destinationState;
+            toCopy[barrierCount].Transition.StateAfter =
+                D3D12_RESOURCE_STATE_COPY_DEST;
+            toCopy[barrierCount].Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            ++barrierCount;
+        }
+        cmdList->ResourceBarrier(barrierCount, toCopy);
+
+        cmdList->CopyResource(destination, outputTexture.Get());
+
+        D3D12_RESOURCE_BARRIER fromCopy[2] = {};
+        barrierCount = 0;
+        fromCopy[barrierCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        fromCopy[barrierCount].Transition.pResource = outputTexture.Get();
+        fromCopy[barrierCount].Transition.StateBefore =
+            D3D12_RESOURCE_STATE_COPY_SOURCE;
+        fromCopy[barrierCount].Transition.StateAfter =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        fromCopy[barrierCount].Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ++barrierCount;
+        if (destinationState != D3D12_RESOURCE_STATE_COPY_DEST) {
+            fromCopy[barrierCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            fromCopy[barrierCount].Transition.pResource = destination;
+            fromCopy[barrierCount].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_COPY_DEST;
+            fromCopy[barrierCount].Transition.StateAfter = destinationState;
+            fromCopy[barrierCount].Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            ++barrierCount;
+        }
+        cmdList->ResourceBarrier(barrierCount, fromCopy);
+    }
+
     // Main-view wrapper. Unchanged behaviour: the backbuffer arrives in
     // RENDER_TARGET from BeginFrame and must be returned to it for ImGui.
     void CopyToBackBuffer(ID3D12GraphicsCommandList* cmdList) {
@@ -3433,7 +3819,7 @@ private:
         materials.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         materials.Shader4ComponentMapping =
             D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        materials.Buffer.FirstElement = frameSlot * VB_MAX_MATERIALS;
+        materials.Buffer.FirstElement = ViewFrameIndex() * VB_MAX_MATERIALS;
         materials.Buffer.NumElements = VB_MAX_MATERIALS;
         materials.Buffer.StructureByteStride = sizeof(VBMaterialData);
         g_dx12.device->CreateShaderResourceView(
@@ -3556,6 +3942,7 @@ private:
     }
 
     bool MotionVectorsRequired() const {
+        if (ScopeSurfaceBound()) return false;
         // TAA owns post-process history, but SVGF independently needs the
         // visibility motion buffer to reproject reflection history. Capture
         // mode deliberately disables TAA, so tying this data to the TAA switch
@@ -3925,8 +4312,12 @@ private:
         }
 
         if (!CreateDefaultAndUpload(VB_CLUSTER_COUNT * sizeof(VBClusterData),
-                                     clusterDataBuffer, clusterDataUpload))
+                                     clusterDataBuffer, clusterDataUpload[0]))
             return false;
+
+        for (UINT frame = 1; frame < FRAME_COUNT; ++frame)
+            if (!CreateUpload(VB_CLUSTER_COUNT * sizeof(VBClusterData),
+                              clusterDataUpload[frame])) return false;
 
         // Hit-geometry bindings for the raytracing hit path. Upload heap only:
         // it is written on acceleration rebuilds, never per frame, so the extra
@@ -3980,7 +4371,7 @@ private:
         // toggling bindless at runtime
         // never has to create a resource mid-frame.
         D3D12_RESOURCE_DESC bindlessMaterialDesc = materialDesc;
-        bindlessMaterialDesc.Width = static_cast<UINT64>(FRAME_COUNT) *
+        bindlessMaterialDesc.Width = static_cast<UINT64>(FRAME_COUNT * RenderViewCountDX12) *
             VB_MAX_MATERIALS * sizeof(VBMaterialData);
         hr = g_dx12.device->CreateCommittedResource(
             &materialHeap, D3D12_HEAP_FLAG_NONE, &bindlessMaterialDesc,
@@ -3990,7 +4381,7 @@ private:
         hr = bindlessMaterialDataBuffer->Map(0, &noRead,
             reinterpret_cast<void**>(&mappedBindlessMaterials));
         if (FAILED(hr)) return false;
-        for (UINT frame = 0; frame < FRAME_COUNT; ++frame)
+        for (UINT frame = 0; frame < FRAME_COUNT * RenderViewCountDX12; ++frame)
             mappedBindlessMaterials[frame * VB_MAX_MATERIALS] =
                 VBMaterialData{};
 
@@ -4205,7 +4596,7 @@ private:
         // root SRV, not a table entry, so it consumes no heap slot.
         heapDesc.NumDescriptors = kResolveDescriptorCount;
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         HRESULT hr = g_dx12.device->CreateDescriptorHeap(
             &heapDesc, IID_PPV_ARGS(&computeDescHeap));
         if (FAILED(hr)) {
@@ -4219,6 +4610,17 @@ private:
                 std::cerr << "Failed to create bent-normal resolve heap\n";
                 return false;
             }
+        }
+        if (!legacyMaterialSnapshots.Create(FRAME_COUNT * RenderViewCountDX12 * VB_MAX_MATERIALS))
+            return false;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        for (UINT frame = 0; frame < FRAME_COUNT; ++frame) {
+            heapDesc.NumDescriptors = kResolveDescriptorCount;
+            if (FAILED(g_dx12.device->CreateDescriptorHeap(&heapDesc,
+                    IID_PPV_ARGS(&rasterViewHeaps[frame])))) return false;
+            heapDesc.NumDescriptors = kEnhancedResolveDescriptorCount;
+            if (FAILED(g_dx12.device->CreateDescriptorHeap(&heapDesc,
+                    IID_PPV_ARGS(&resolveViewHeaps[frame])))) return false;
         }
         UpdateComputeDescriptors();
         return true;
@@ -4521,14 +4923,14 @@ private:
         constants.reflectionRoughnessCut = enhancedReflectionRoughnessCut;
         // Rotates the sampling sequence so consecutive frames draw different
         // samples; this is the variance a temporal denoiser resolves.
-        constants.frameIndex = enhancedReflectionFrameCounter++;
+        constants.frameIndex = (ScopeSurfaceBound() ? enhancedReflectionFrameCounter : enhancedReflectionFrameCounter++);
         constants.reflectionOcclusion = enhancedReflectionOcclusion;
         constants.reflectionClassify = enhancedReflectionClassifyActive ? 1u : 0u;
         constants.reflectionConfidenceCut = enhancedReflectionConfidenceCut;
         constants.probeMissGI = enhancedProbeMissGIActive ? 1u : 0u;
-        constants.svgfTemporalEnable = svgfTemporalEnabled ? 1u : 0u;
+        constants.svgfTemporalEnable = (svgfTemporalEnabled && !ScopeSurfaceBound()) ? 1u : 0u;
         constants.svgfMaxAccum = svgfMaxAccumFrames;
-        constants.svgfAtrousEnable = svgfAtrousEnabled ? 1u : 0u;
+        constants.svgfAtrousEnable = (svgfAtrousEnabled && !ScopeSurfaceBound()) ? 1u : 0u;
         constants.svgfAtrousIters = std::clamp(
             svgfAtrousIterations, 1u, kSVGFAtrousMaxIterations);
         constants.svgfHistoryValid = svgfHistoryValid ? 1u : 0u;
@@ -4536,7 +4938,7 @@ private:
         constants.hitGeometryCount = hitGeometryCount;
         constants.svgfPad2 = 0u;
         const UINT64 constantOffset =
-            static_cast<UINT64>(frameSlot) * 256ull;
+            static_cast<UINT64>(ViewFrameIndex()) * 256ull;
         memcpy(static_cast<BYTE*>(enhancedConstantMapped) + constantOffset,
                &constants, sizeof(constants));
     }
@@ -5562,7 +5964,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 89;
             g_dx12.device->CreateShaderResourceView(
-                svgfHistoryColor[readIndex].Get(), &srv, h);
+                (ScopeSurfaceBound() ? nullptr : svgfHistoryColor[readIndex].Get()), &srv, h);
         }
 
         // [90] t81 - svgf history moments read
@@ -5575,7 +5977,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 90;
             g_dx12.device->CreateShaderResourceView(
-                svgfHistoryMoments[readIndex].Get(), &srv, h);
+                (ScopeSurfaceBound() ? nullptr : svgfHistoryMoments[readIndex].Get()), &srv, h);
         }
 
         // [91] t82 - obsolete raw-ID history binding kept null so the enhanced
@@ -5599,7 +6001,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 92;
             g_dx12.device->CreateUnorderedAccessView(
-                svgfHistoryColor[writeIndex].Get(), nullptr, &uav, h);
+                (ScopeSurfaceBound() ? nullptr : svgfHistoryColor[writeIndex].Get()), nullptr, &uav, h);
         }
 
         // [93] u5 - svgf moments write
@@ -5610,7 +6012,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 93;
             g_dx12.device->CreateUnorderedAccessView(
-                svgfHistoryMoments[writeIndex].Get(), nullptr, &uav, h);
+                (ScopeSurfaceBound() ? nullptr : svgfHistoryMoments[writeIndex].Get()), nullptr, &uav, h);
         }
 
         // [96]/[97] - the same previous/current authored identity pair post
@@ -5625,7 +6027,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 96;
             g_dx12.device->CreateShaderResourceView(
-                StableSurfaceResource(stableSurfaceWriteIndex ^ 1u), &srv, h);
+                (ScopeSurfaceBound() ? nullptr : StableSurfaceResource(stableSurfaceWriteIndex ^ 1u)), &srv, h);
         }
         {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
@@ -5652,7 +6054,7 @@ private:
             heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
             // [103] t91 terrain splatmap, appended above the terrain arrays.
             heapDesc.NumDescriptors = kEnhancedResolveDescriptorCount;
-            heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
             if (FAILED(g_dx12.device->CreateDescriptorHeap(
                     &heapDesc,
                     IID_PPV_ARGS(&enhancedComputeDescHeaps[frameSlot]))))
@@ -5712,7 +6114,7 @@ private:
             D3D12_CONSTANT_BUFFER_VIEW_DESC cbv = {};
             cbv.BufferLocation =
                 enhancedConstantBuffer->GetGPUVirtualAddress() +
-                static_cast<UINT64>(frameSlot) * 256ull;
+                static_cast<UINT64>(ViewFrameIndex()) * 256ull;
             cbv.SizeInBytes = 256;
             D3D12_CPU_DESCRIPTOR_HANDLE cbvHandle = handle;
             cbvHandle.ptr += (UINT64)descSize * 88;
@@ -5729,7 +6131,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 89;
             g_dx12.device->CreateShaderResourceView(
-                svgfHistoryColor[svgfHistoryPing].Get(), &srv, h);
+                (ScopeSurfaceBound() ? nullptr : svgfHistoryColor[svgfHistoryPing].Get()), &srv, h);
         }
 
         // [90] t81 - svgf history moments (SRV, read side of ping-pong)
@@ -5742,7 +6144,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 90;
             g_dx12.device->CreateShaderResourceView(
-                svgfHistoryMoments[svgfHistoryPing].Get(), &srv, h);
+                (ScopeSurfaceBound() ? nullptr : svgfHistoryMoments[svgfHistoryPing].Get()), &srv, h);
         }
 
         // [91] t82 - obsolete raw-ID history binding, intentionally null.
@@ -5765,7 +6167,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 92;
             g_dx12.device->CreateUnorderedAccessView(
-                svgfHistoryColor[svgfHistoryPing ^ 1u].Get(), nullptr, &uav, h);
+                (ScopeSurfaceBound() ? nullptr : svgfHistoryColor[svgfHistoryPing ^ 1u].Get()), nullptr, &uav, h);
         }
 
         // [93] u5 - svgf moments write (UAV, write side of ping-pong)
@@ -5776,7 +6178,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 93;
             g_dx12.device->CreateUnorderedAccessView(
-                svgfHistoryMoments[svgfHistoryPing ^ 1u].Get(), nullptr, &uav, h);
+                (ScopeSurfaceBound() ? nullptr : svgfHistoryMoments[svgfHistoryPing ^ 1u].Get()), nullptr, &uav, h);
         }
 
         // [94] u6 - reflection source (UAV, specular IBL from resolve)
@@ -5815,7 +6217,7 @@ private:
             D3D12_CPU_DESCRIPTOR_HANDLE h = handle;
             h.ptr += (UINT64)descSize * 96;
             g_dx12.device->CreateShaderResourceView(
-                StableSurfaceResource(stableSurfaceWriteIndex ^ 1u), &srv, h);
+                (ScopeSurfaceBound() ? nullptr : StableSurfaceResource(stableSurfaceWriteIndex ^ 1u)), &srv, h);
         }
 
         // [97] u7 - stable key emitted by this enhanced resolve.
@@ -6830,7 +7232,13 @@ private:
         // [83] b2 - point lights CBV
         // [84] b3 - sky SH CBV
         // [85] b4 - DDGI CBV
-        // These will be created in UpdateLightDescriptors
+        // Null CBVs are replaced by UpdateLightDescriptors before resolve.
+        for (UINT slot = 82; slot < 86; ++slot) {
+            auto handle = computeDescHeap->GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += static_cast<SIZE_T>(descSize) * slot;
+            g_dx12.device->CreateConstantBufferView(nullptr, handle);
+        }
+        WriteSpotShadowAtlasDescriptor(computeDescHeap.Get(), kSpotShadowAtlasSlot);
 
         // [86] t86 - bent-normal GTAO history. The per-frame resolve heap
         // overwrites this null descriptor only while valid history is active.

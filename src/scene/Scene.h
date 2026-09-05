@@ -255,6 +255,8 @@ struct Scene {
     // "Reset Zoom" button restores.
     static constexpr float kR700ScopeFOVDegrees = 6.0f;
     float  sniperScopeFOV = kR700ScopeFOVDegrees;
+    bool sniperScopeFeedReady = false;
+    XMMATRIX sniperScopeView = XMMatrixIdentity();
     float  sniperScopeBlend = 0.0f;
     // Shared ADS presentation for every weapon, including the R700. Its scope
     // camera has a separate blend because magnification belongs on the lens.
@@ -554,6 +556,22 @@ struct Scene {
     // direction never moves because rolling about the forward axis leaves the
     // view direction untouched.
     float sniperScopeCameraRollDegrees = 0.0f;
+
+    // Pushes the scope camera forward along its own view axis, in metres.
+    //
+    // Live-tunable because the correct value is not obvious and the failure is
+    // visual. Zero -- the camera sharing the eye position exactly -- is the
+    // only value the lens sampling is currently built for: the shader
+    // reconstructs its coordinate from the MAIN camera's view ray, and
+    // SniperLensHalfAngleTangent measures the glass disc's half-angle from the
+    // player's eye. Both stay anchored to the eye when this moves, so the two
+    // bases disagree and the image collapses toward the lens centre.
+    //
+    // Measured at 1.35 m: the glass filled with concentric rings and lost the
+    // world entirely. Kept as a slider so that mismatch can be seen and dialled
+    // rather than rediscovered, and so a future parallax-correct lens has a
+    // control to test against. Leave at 0 for a correct image.
+    float sniperScopeCameraForwardMetres = 0.0f;
 
     // Trailing "chip" health, in the same units as player.health. Follows the
     // real value down after a delay, so the HUD can show a pale ghost of the
@@ -2451,9 +2469,8 @@ struct Scene {
         // Sniper magnification is exclusive to the temporary lens camera. If
         // its render target is unavailable, the main view still uses ordinary
         // ADS instead of reviving the legacy full-screen zoom.
-        const float scopeBlend = sniperScopeCameraPass ? sniperScopeBlend : 0.0f;
-        return sighted + (sniperScopeFOV - sighted) * scopeBlend +
-               camera.ExplosionFovKick();
+        if (sniperScopeCameraPass) return sniperScopeFOV;
+        return sighted + camera.ExplosionFovKick();
     }
 
     // Focal lengths (1/tan(fov/2)) of the scope camera, which the lens shader
@@ -2463,12 +2480,8 @@ struct Scene {
     // square, so both axes share one focal length -- unlike the main camera,
     // whose X is divided by the wide aspect.
     XMFLOAT2 SniperScopeFocalLengths() const {
-        const bool savedPass = sniperScopeCameraPass;
-        const_cast<Scene*>(this)->sniperScopeCameraPass = true;
-        const float fov = EffectiveCameraFOV();
-        const_cast<Scene*>(this)->sniperScopeCameraPass = savedPass;
-        const float halfFov = XMConvertToRadians(fov) * 0.5f;
-        const float focal = 1.0f / (std::max)(std::tan(halfFov), 1e-4f);
+        const float focal = 1.0f / (std::max)(
+            std::tan(XMConvertToRadians(sniperScopeFOV) * 0.5f), 1e-4f);
         return XMFLOAT2(focal, focal);
     }
     float RenderWidth() const {
@@ -2538,7 +2551,10 @@ struct Scene {
     float EffectiveCameraFarPlane() const {
         return (std::max)(cameraFar, cameraFarOverride);
     }
-    XMMATRIX GetViewMatrix()       const { return const_cast<Camera&>(camera).GetViewMatrix(); }
+    XMMATRIX GetViewMatrix() const {
+        if (sniperScopeCameraPass) return sniperScopeView;
+        return const_cast<Camera&>(camera).GetViewMatrix();
+    }
     XMMATRIX GetProjectionMatrix() const {
         XMMATRIX projection = GetUnjitteredProjectionMatrix();
         if (g_dx12.screenWidth > 0 && g_dx12.screenHeight > 0) {

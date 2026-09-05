@@ -12,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include "../src/render/dx12/SniperScopeOptics.h"
 
 using namespace DirectX;
 using Microsoft::WRL::ComPtr;
@@ -27,7 +28,7 @@ int main() try {
     text << file.rdbuf();
     const std::string source = text.str();
     const size_t begin = source.find("const float3 rayView =", source.find(
-        "if (isSniperGlass && useTexture > 0.5)"));
+        "if (isSniperGlass && useTexture > 0.5 && sniperScopeFocalY > 0.0)"));
     const size_t end = source.find("#ifdef SGE_TERRAIN_PBR", begin);
     if (begin == std::string::npos || end == std::string::npos)
         throw std::runtime_error("Cannot find the production scope projection");
@@ -38,6 +39,7 @@ cbuffer Params : register(b0) {
     float3 fragmentPosition; float padding;
     float sniperScopeFocalX; float sniperScopeFocalY;
     float sniperScopeUVRotation; float sniperLensHalfTangent;
+    float2 sniperAimTangent; float2 aimPadding;
 };
 RWStructuredBuffer<float2> result : register(u0);
 [numthreads(1, 1, 1)] void main() {
@@ -64,8 +66,9 @@ RWStructuredBuffer<float2> result : register(u0);
         XMFLOAT4X4 view, projection;
         XMFLOAT3 fragmentPosition; float padding = 0;
         float focalX, focalY, rotation, lensHalfTangent = 0;
+        XMFLOAT2 aimTangent{}, aimPadding{};
     } constants{};
-    static_assert(sizeof(Constants) == 160, "Match the test HLSL cbuffer");
+    static_assert(sizeof(Constants) == 176, "Match the test HLSL cbuffer");
     D3D11_BUFFER_DESC desc{};
     desc.ByteWidth = sizeof(Constants);
     desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
@@ -183,6 +186,10 @@ RWStructuredBuffer<float2> result : register(u0);
         XMStoreFloat4x4(&constants.view, XMMatrixTranspose(view));
         const XMMATRIX inverseView = XMMatrixInverse(nullptr, view);
 
+        // An off-centre firing ray must remain at the crosshair, including
+        // while the viewmodel is still moving into its ADS position.
+        for (const XMFLOAT2 aim : { XMFLOAT2{}, XMFLOAT2(0.08f, -0.04f) }) {
+        constants.aimTangent = aim;
         // Walk the rim and the centre. Zoom must not move where either lands.
         for (const float scopeFOV : { 4.0f, 6.0f, 15.0f }) {
             const XMMATRIX zoomed = XMMatrixPerspectiveFovLH(
@@ -196,7 +203,7 @@ RWStructuredBuffer<float2> result : register(u0);
                     Probe{ 0.0f, lensHalfTangent, 0.5f, 0.0f, "top rim" },
                     Probe{ 0.0f, -lensHalfTangent, 0.5f, 1.0f, "bottom rim" } }) {
                 const XMVECTOR world = XMVector3TransformCoord(
-                    XMVectorSet(probe.x, probe.y, 1, 1), inverseView);
+                    XMVectorSet(probe.x + aim.x, probe.y + aim.y, 1, 1), inverseView);
                 XMStoreFloat3(&constants.fragmentPosition, world);
                 context->UpdateSubresource(params.Get(), 0, nullptr,
                                            &constants, 0, 0);
@@ -218,7 +225,15 @@ RWStructuredBuffer<float2> result : register(u0);
                 ++checks;
             }
         }
-        std::cout << "Lens disc maps edge-to-edge at every zoom\n";
+        }
+        constants.aimTangent = {};
+        const float opticalFOV = SniperScopeOptics::FieldOfViewDegrees(lensHalfTangent);
+        const float measuredZoom = lensHalfTangent /
+            std::tan(XMConvertToRadians(opticalFOV) * 0.5f);
+        if (std::fabs(measuredZoom - 6.0f) > 1e-4f)
+            throw std::runtime_error("Aperture-derived scope must magnify 6x");
+        std::cout << "Lens disc maps edge-to-edge at every zoom; optical magnification "
+                  << measuredZoom << "x\n";
         constants.lensHalfTangent = 0.0f;
     }
 

@@ -7818,59 +7818,26 @@ static bool g_thumbnailUploadedThisFrame = false;
 static bool g_prefabEditorSmokeEnabled = false;
 static bool g_prefabEditorSmokeFinished = false;
 
-static UINT RequestedSniperScopeResolution() {
-    char value[16] = {};
-    UINT requested = 1024;
-    if (GetEnvironmentVariableA(
-            "SGE_SCOPE_RESOLUTION", value,
-            static_cast<DWORD>(sizeof(value))) > 0) {
-        const unsigned long parsed = std::strtoul(value, nullptr, 10);
-        if (parsed > 0) requested = static_cast<UINT>(parsed);
-    }
-    // Fixed power-of-two tiers keep the lens sharp without allowing an
-    // accidental environment value to allocate an unbounded render target.
-    if (requested <= 384) return 256;
-    if (requested <= 768) return 512;
-    return 1024;
-}
-
 static void BindSniperScopeMaterial() {
-    const std::shared_ptr<SceneMesh>& rifle = GunModel::R700Mesh();
-    if (!g_sniperScope.Initialized() || !g_sniperScope.HasRenderedOnce() ||
-        !g_sniperScope.Texture() || !rifle) return;
-    for (MeshPrimitive& primitive : rifle->primitives) {
-        const std::shared_ptr<SceneMaterial>& material = primitive.material;
-        if (!material || material->materialType < 8.5f ||
-            material->materialType > 9.5f) continue;
-        if (material->baseColorTexture.Get() == g_sniperScope.Texture())
+    const auto& aperture = GunModel::R700ScopeAperture();
+    if (!g_sniperScope.HasRenderedOnce() || !aperture) return;
+    for (auto& primitive : aperture->primitives) {
+        auto& material = primitive.material;
+        if (!material || material->baseColorTexture.Get() == g_sniperScope.Texture())
             continue;
         material->baseColorTexture = g_sniperScope.Texture();
-        material->baseColorFactor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
-        // Kept on the blend PSO for the Fresnel response; the scope-texture
-        // branch writes alpha one when an image is present.
-        material->alphaBlend = true;
         material->InvalidateTextureBindings();
     }
 }
 
-// Renders the sniper scope's secondary camera into its own square HDR target.
-//
-// Runs the same visible scene stages as the main view, from an exact copy of
-// the main camera at the scope's field of view. Only the viewmodel and the HUD
-// are excluded: drawing the rifle here would put the lens inside the image it
-// is producing, and sampling the lens texture while rendering into it is a
-// feedback loop.
-//
-// The scope is deliberately kept on the Forward path even when the main view
-// uses the visibility buffer. VB's per-view resources (visibility target,
-// motion, temporal history, exposure, indirect culling output) are sized and
-// keyed for one view; giving the scope its own set is the second half of this
-// work. Forward produces the same lit world through the same shaders, so the
-// lens shows correct content either way.
+// The scope uses its own view storage and a square HDR feed. Presentation
+// effects and temporal history belong to the main camera.
 static void RenderSniperScopeTexture(float now) {
+    scene.sniperScopeFeedReady = false;
+    const bool frameReady = PrepareR700ScopeFrame(scene);
     if (!g_sniperScope.ShouldRender(
-            scene.sniperScopeActive && IsSceneScreen() &&
-            !g_game.loading.Active())) return;
+            frameReady && scene.sniperPictureInPicture && scene.sniperScopeActive &&
+            IsSceneScreen() && !g_game.loading.Active())) return;
 
     const Camera savedCamera = scene.camera;
     const XMFLOAT2 savedJitter = scene.temporalJitterPixels;
@@ -7879,44 +7846,16 @@ static void RenderSniperScopeTexture(float now) {
     const bool savedScopePass = scene.sniperScopeCameraPass;
     const bool savedDrawViewmodel = scene.drawViewmodel;
 
-    // Render from an exact copy of the main camera. Rebuilding its basis here
-    // made the scope react differently near vertical aim and could change its
-    // apparent roll. Position, orientation, roll, near and far planes are all
-    // carried over; only the scope-pass FOV and the square target differ.
-    scene.camera = savedCamera;
+    // Keep sky and lighting position consistent with the explicit scope view.
+    const XMMATRIX scopeBasis = XMMatrixInverse(nullptr, scene.sniperScopeView);
+    XMStoreFloat3(&scene.camera.Position, scopeBasis.r[3]);
+    XMStoreFloat3(&scene.camera.Front, scopeBasis.r[2]);
+    XMStoreFloat3(&scene.camera.Up, scopeBasis.r[1]);
     scene.sniperScopeCameraPass = true;
-    // The one exclusion. Everything else the main view draws, the scope draws.
     scene.drawViewmodel = false;
-    scene.renderWidthOverride =
-        static_cast<float>(g_sniperScope.Resolution());
-    scene.renderHeightOverride = scene.renderWidthOverride;
-    // No temporal jitter: the scope keeps no TAA history of its own, so a
-    // sub-pixel offset would have nothing to cancel it and would read as the
-    // lens image shimmering.
+    scene.renderWidthOverride = static_cast<float>(g_sniperScope.Width());
+    scene.renderHeightOverride = static_cast<float>(g_sniperScope.Height());
     scene.temporalJitterPixels = XMFLOAT2(0.0f, 0.0f);
-    // Roll the scope camera about its own view axis.
-    //
-    // The lens shader reconstructs its sample coordinate from the MAIN
-    // camera's view ray, so rolling this camera alone would make the lens
-    // sample a direction the scope never rendered. The same angle is therefore
-    // applied to the sampling coordinate too (see ForwardRenderer's
-    // scopeUVRotation), which keeps the two bases in agreement.
-    //
-    // Rotating Up about Front leaves the view direction exactly where it was,
-    // so the sight still points where the rifle points. Sampling compensates
-    // for the rotated target to keep the displayed horizon aligned.
-    if (std::fabs(scene.sniperScopeCameraRollDegrees) > 0.0001f) {
-        const XMVECTOR front = XMVector3Normalize(
-            XMLoadFloat3(&scene.camera.Front));
-        const XMVECTOR up = XMLoadFloat3(&scene.camera.Up);
-        const XMMATRIX roll = XMMatrixRotationAxis(
-            front, XMConvertToRadians(scene.sniperScopeCameraRollDegrees));
-        XMFLOAT3 rolledUp;
-        XMStoreFloat3(&rolledUp,
-                      XMVector3Normalize(XMVector3TransformNormal(up, roll)));
-        scene.camera.Up = rolledUp;
-    }
-
 
     // Re-base the per-frame upload arenas onto the scope's slice. Without this
     // the scope's draws consume -- and overwrite -- the main view's matrix and
@@ -7924,29 +7863,78 @@ static void RenderSniperScopeTexture(float now) {
     mainShader.BeginView(1);
     g_meshShader.BeginView(1);
 
+    // The scope renders through the same visibility buffer the main view uses,
+    // pointed at the scope's own depth buffer, viewport and target by
+    // BindViewSurface. One instance rather than two: a second would duplicate
+    // the fixed-size CPU geometry pools (tens of MB, independent of the scope's
+    // resolution), recompile every PSO, and interleave two claims on the one
+    // bindless transient ring, whose per-frame reset does not expect them.
+    //
+    // Bound before anything that could recreate the visibility depth snapshot,
+    // which takes its dimensions from ActiveDepthBuffer().
+    const bool scopeUsesVisibilityBuffer =
+        scene.useVisibilityBuffer && visBuffer.initialized && visBuffer.scopeView;
+    if (scopeUsesVisibilityBuffer) {
+        VisibilityBufferDX12::ViewSurface surface;
+        surface.depthBuffer = g_sniperScope.Depth();
+        surface.depthDSV = g_sniperScope.DSV();
+        surface.hasDepthDSV = true;
+        surface.viewport = &g_sniperScope.Viewport();
+        surface.scissor = &g_sniperScope.Scissor();
+        surface.destination = g_sniperScope.Texture();
+        surface.viewWidth = g_sniperScope.Width();
+        surface.viewHeight = g_sniperScope.Height();
+        surface.isScope = true;
+        visBuffer.BindViewSurface(surface);
+    }
+
     g_sniperScope.Begin(g_dx12.commandList.Get());
     {
         ProfilerDX12::Scope profile(
             g_profiler, "Scope/Forward", g_dx12.commandList.Get());
-        // The scope target is a single-sample linear HDR surface: no MSAA, and
-        // no HDR-target path (that one targets the VB/post chain's own render
-        // target, not this one).
+        // No MSAA either way. HDR follows the path: the visibility buffer works
+        // in linear radiance and the lens keeps it that way for the main view's
+        // tone map, while the Forward fallback writes straight into the lens
+        // texture and has to tone map as it goes.
+        const bool scopeHDR = true;
         mainShader.SetMSAAEnabled(false);
-        mainShader.SetHDRTargetEnabled(false);
+        mainShader.SetHDRTargetEnabled(scopeHDR);
         mainShader.SetExtensionMotionEnabled(false);
         g_meshShader.SetMSAAEnabled(false);
-        g_meshShader.SetHDRTargetEnabled(false);
+        g_meshShader.SetHDRTargetEnabled(scopeHDR);
         g_meshShader.SetExtensionMotionEnabled(false);
         g_terrain.SetMSAAEnabled(false);
-        g_terrain.SetHDRTargetEnabled(false);
+        g_terrain.SetHDRTargetEnabled(scopeHDR);
         skyRenderer.SetMSAAEnabled(false);
-        skyRenderer.SetHDRTargetEnabled(false);
+        skyRenderer.SetHDRTargetEnabled(scopeHDR);
         // The sun disc and its lens artefacts are a main-camera presentation
         // effect. Through a telescopic sight they would be drawn at the scope's
         // magnification and dominate the lens.
         skyRenderer.SetSunLens(false, scene.lightColor,
             scene.sunAngularRadiusDegrees, scene.sunDiscIntensity,
             scene.sunHaloIntensity);
+        // The same bracket the main view puts around its own sky, and not
+        // optional here -- for the reason written on BeginHDRBackground
+        // itself. The resolve compute shader leaves outputColor untouched
+        // wherever the visibility buffer holds no geometry, on the contract
+        // that a cleared target already carries this view's sky.
+        //
+        // The scope used to draw its sky into g_sniperScope's own render
+        // target, which the CopyResource below then overwrote, so it satisfied
+        // neither half of that contract: no clear, and no sky in the surface
+        // the resolve preserves. Every background pixel of the lens therefore
+        // kept whatever the MAIN view left in outputTexture last frame --
+        // including its forward-extensions pass, which is where the viewmodel
+        // is drawn. The player saw their own rifle and hands through the
+        // scope, one frame stale, while the scope's own sky was discarded.
+        //
+        // Bracketing here fixes both halves at once: the clear removes the
+        // stale main-view image, and the sky lands in the surface that
+        // CopyResolveOutputTo actually reads. It must follow BindViewSurface
+        // above, because the clear and the draw take the scope's viewport
+        // through ActiveViewport().
+        if (scopeUsesVisibilityBuffer)
+            visBuffer.BeginHDRBackground(g_dx12.commandList.Get());
         skyRenderer.Render(
             scene.camera, scene.EffectiveCameraFOV(), scene.lightPos, now,
             scene.enablePhysicalAtmosphere, false,
@@ -7957,14 +7945,42 @@ static void RenderSniperScopeTexture(float now) {
             XMFLOAT4(0.0f, 0.0f, scene.atmosphereCloudBaseHeight,
                      scene.atmosphereCloudThickness),
             1, 1.0f);
+        if (scopeUsesVisibilityBuffer)
+            visBuffer.EndHDRBackground(g_dx12.commandList.Get());
 
         // World geometry, terrain, foliage and grass, lit by the shadow map
         // the previous frame produced for the main view. The scope frustum is
         // a subset of that view, so the map covers it.
-        RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
-            crateModel, floorMaterial,
-            g_scopeShadowLightSpace, g_scopeShadowResource,
-            false, true, false);
+        if (scopeUsesVisibilityBuffer) {
+            // View slot 1. RenderVBDraw keeps its culling context and compacted
+            // indirect stream per slot, so the scope cannot overwrite the main
+            // view's before the GPU has consumed it, and its isScopeView branch
+            // leaves the main view's terrain and destruction ownership flags
+            // alone -- those describe a decision made for the other frustum.
+            //
+            // No HZB: occlusion history belongs to the main camera, and the
+            // scope's frustum would reproject against it wrongly.
+            RenderVBDraw(scene, mainShader, visBuffer, geo, packed,
+                g_scopeShadowLightSpace, g_scopeShadowResource,
+                nullptr, false, XMMatrixIdentity(), floorMaterial,
+                (!g_emptyLevelMode && g_showH2Model) ? crateModel : nullptr,
+                /*viewSlot=*/1);
+        } else {
+            RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
+                crateModel, floorMaterial,
+                g_scopeShadowLightSpace, g_scopeShadowResource,
+                false, true, false);
+        }
+
+        if (scopeUsesVisibilityBuffer) {
+            visBuffer.BeginForwardExtensions(g_dx12.commandList.Get());
+            const bool mainTerrainOwned = g_terrainInVisibilityBuffer;
+            g_terrainInVisibilityBuffer = visBuffer.terrainVisibilityActiveThisFrame;
+            RenderForward(scene, mainShader, geo, g_prefabRenderBatches,
+                crateModel, floorMaterial, g_scopeShadowLightSpace,
+                g_scopeShadowResource, true, true, false);
+            g_terrainInVisibilityBuffer = mainTerrainOwned;
+        }
 
         // Skinned actors live outside RenderForward in the primary path.
         // Enemies are the whole point of a magnified sight, so they are drawn
@@ -7987,11 +8003,55 @@ static void RenderSniperScopeTexture(float now) {
             }
         }
     }
-    g_sniperScope.End(g_dx12.commandList.Get());
+    if (scopeUsesVisibilityBuffer) {
+        visBuffer.EndForwardExtensions(g_dx12.commandList.Get());
+        ProfilerDX12::Scope profile(
+            g_profiler, "Scope/Resolve Copy", g_dx12.commandList.Get());
+        // The scope takes the visibility buffer's resolve output and stops
+        // there. Its post chain is NOT run for the lens.
+        //
+        // Post is a main-camera presentation layer: the lens flare and lens
+        // dirt describe artefacts in the player's own optics, and running them
+        // for a telescopic sight drew them at scope magnification, filling the
+        // glass with concentric rings centred on the lens -- the same reason
+        // the sun disc is disabled for this pass above. Exposure has the same
+        // problem in slower form: a second histogram adapting to the magnified
+        // framing would drift away from the main view until the lens and the
+        // world disagreed about how bright the same wall is.
+        //
+        // So the lens receives linear radiance and the main view's single
+        // tone-map covers it too, exactly as it did on the Forward path. What
+        // the visibility buffer adds here is the lighting and material work up
+        // to the resolve, which is what made the lens disagree with the world.
+        //
+        // The lens texture is still the render target Begin() bound, so hand it
+        // over as a copy destination first.
+        g_sniperScope.TransitionForCopyDestination(g_dx12.commandList.Get());
+        visBuffer.CopyResolveOutputTo(g_dx12.commandList.Get(),
+                                      g_sniperScope.Texture(),
+                                      D3D12_RESOURCE_STATE_COPY_DEST);
+        g_sniperScope.TransitionToShaderResource(
+            g_dx12.commandList.Get(), D3D12_RESOURCE_STATE_COPY_DEST);
+        visBuffer.UnbindViewSurface();
+    } else {
+        g_sniperScope.End(g_dx12.commandList.Get());
+    }
     // Only bound once a real image exists: a freshly created default-heap
     // texture holds undefined contents, and the rifle is visible at the hip
     // long before the first scope frame is drawn.
     BindSniperScopeMaterial();
+    scene.sniperScopeFeedReady = true;
+
+    if (GetEnvironmentVariableA("SGE_R700_TEST", nullptr, 0) > 0) {
+        static UINT scopeTestFrames = 0;
+        if ((scopeTestFrames++ % 120) == 0)
+            std::ofstream("r700_scope_smoke.log", std::ios::app)
+                << "frame=" << scopeTestFrames << " weapon=" << GunModel::SelectedWeapon()
+                << " vb=" << scopeUsesVisibilityBuffer << " ready=" << scene.sniperScopeFeedReady
+                << " size=" << g_sniperScope.Width() << 'x' << g_sniperScope.Height()
+                << " fov=" << scene.sniperScopeFOV << " aperture=" << g_r700ScopeFrame.halfTangent
+                << " ads=" << scene.adsBlend << '\n';
+    }
 
     // Restore the main view's arena slice and viewport before the primary
     // camera's own recording resumes.
@@ -19133,7 +19193,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // authored glass; the main renderer is never disabled or altered.
     BootStep("Initializing sniper scope...");
     scene.sniperPictureInPicture = g_sniperScope.Init(
-        g_dx12.device.Get(), RequestedSniperScopeResolution());
+        g_dx12.device.Get(), SniperScopeOptics::Resolution, SniperScopeOptics::Resolution);
+    if (scene.sniperPictureInPicture && visibilityBufferReady && !visBuffer.InitScopeView()) {
+        scene.sniperPictureInPicture = false;
+        std::cerr << "Scope visibility resources unavailable; standard ADS remains active\n";
+    }
     std::cout << (scene.sniperPictureInPicture
         ? "Sniper picture-in-picture scope ready\n"
         : "Sniper scope target unavailable; standard ADS remains active\n");
@@ -19348,6 +19412,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
     // prefab, and exits once its collision tree has been built. The BVH stats
     // land in the log during LoadPrefabModel, so this measures the real model
     // without needing anyone to sit at the menu.
+    char r700Test[8]{};
+    if (GetEnvironmentVariableA("SGE_R700_TEST", r700Test, sizeof(r700Test)) > 0) {
+        GunModel::SelectedWeapon() = std::atoi(r700Test) == 8 ? 8 : 3;
+        scene.holdAimDownSights = true;
+    }
+
     if (GetEnvironmentVariableA("SGE_COLLISION_TEST", nullptr, 0) > 0) {
         g_collisionSmokeEnabled = true;
         // SGE_COLLISION_TEST_LEVEL names a level to load instead of the Training

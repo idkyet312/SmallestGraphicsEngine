@@ -83,8 +83,8 @@ float sniperScopeUVRotation;
     // visible disc onto the whole scope target; zero falls back to the focal
     // lengths. Takes the first debug pad float, matching ObjectBufferDX12.
     float sniperLensHalfTangent;
-    float sniperScopeDebugPad1;
-    float sniperScopeDebugPad2;
+    float2 sniperAimTangent;
+    float4 sniperLensAperture;
 };
 
 struct PointLightData {
@@ -1335,7 +1335,7 @@ float4 main(PS_INPUT input) : SV_TARGET
               ambientOcclusion * surfaceSpecularScale * multiScatter *
               ambientLightingIntensity;
 
-    if (isSniperGlass && useTexture > 0.5) {
+    if (isSniperGlass && useTexture > 0.5 && sniperScopeFocalY > 0.0) {
         // The R700 lens receives the secondary camera as its albedo texture.
         //
         // The sample coordinate comes from the fragment's own view ray, not
@@ -1381,7 +1381,7 @@ float4 main(PS_INPUT input) : SV_TARGET
         // whatever the zoom, so the image always fills the glass and
         // sniperScopeFOV is left to do nothing but magnify.
         const float2 scopeNDC = sniperLensHalfTangent > 0.0
-            ? (rayView.xy / rayForward) / sniperLensHalfTangent
+            ? (rayView.xy / rayForward - sniperAimTangent) / sniperLensHalfTangent
             : (rayView.xy / rayForward) * scopeFocal;
         // Projection is independent of the imported lens UVs and weapon roll.
         //
@@ -1405,10 +1405,11 @@ float4 main(PS_INPUT input) : SV_TARGET
         const float3 scopeSample =
             SGE_MATERIAL_ALBEDO.Sample(texSampler, scopeUV).rgb;
 #endif
-        // The lens target is linear HDR already. The old pow(,2.2) undid an
-        // sRGB encoding the LDR target used to carry; applying it to linear
-        // radiance would darken the image and crush its midtones. The main
-        // view tone-maps this result once, below.
+        // The lens target is linear HDR: the scope renders through the
+        // visibility buffer but takes its image at the resolve, before any
+        // post. The old pow(,2.2) undid an sRGB encoding the LDR target used to
+        // carry; applying it to linear radiance would darken the image and
+        // crush its midtones. The main view tone-maps this result once, below.
         float3 scopeRadiance = max(scopeSample, 0.0);
         // Orientation key. Tints the SAMPLED image by quadrant, so what you
         // see names the axes it came from instead of having to infer them from
@@ -1437,24 +1438,18 @@ float4 main(PS_INPUT input) : SV_TARGET
                                           : float3(0.0, 0.0, 1.0)); // -u -v
             scopeRadiance = lerp(scopeRadiance, quadrant, 0.45);
         }
-        // Sell the glass as an optic rather than a hole.
-        //
-        // The branch used to hand back the sampled image at full brightness
-        // right to the rim, so the lens edge was a hard cut straight into the
-        // surrounding world and the eye read it as a window. A real sight
-        // darkens toward the tube wall and blacks out past eye relief.
-        //
-        // Radius comes from the sample coordinate, which is now disc-relative:
-        // the rim of the glass sits at 1.0 whatever the zoom, so these
-        // thresholds hold as sniperScopeFOV changes.
-        const float lensRadius = length(scopeNDC);
-        // Gentle falloff across the outer third, then the tube itself. Both
-        // edges are smoothed: a hard cut aliases badly against a curved rim.
-        const float vignette = 1.0 - 0.55 * smoothstep(0.62, 1.0, lensRadius);
-        const float tube = 1.0 - smoothstep(0.94, 1.02, lensRadius);
-        scopeRadiance *= vignette * tube;
-        result = scopeRadiance;
-        surfaceOpacity = 1.0;
+        const float2 apertureNDC = (rayView.xy / rayForward -
+            sniperLensAperture.xy) / max(sniperLensHalfTangent, 1e-4);
+        const float lensRadius = length(apertureNDC);
+        const float vignette = 1.0 - 0.30 * smoothstep(0.72, 1.0, lensRadius);
+        const float tube = 1.0 - smoothstep(0.97, 1.01, lensRadius);
+        // Derivatives keep the etched crosshair about one screen pixel thick
+        // at every resolution, independent of scope zoom and imported UVs.
+        const float2 lineDistance = abs(scopeNDC) / max(fwidth(scopeNDC), 1e-5);
+        const float crosshair = 1.0 - smoothstep(0.35, 1.15,
+            min(lineDistance.x, lineDistance.y));
+        result = scopeRadiance * vignette * tube * (1.0 - crosshair);
+        surfaceOpacity = sniperLensAperture.z;
     } else if (isGlass) {
         // The transparent PSO uses straight alpha. Specular terms already carry
         // their Fresnel weight, so letting blending multiply them by alpha again
@@ -1472,7 +1467,7 @@ float4 main(PS_INPUT input) : SV_TARGET
     // Authored emissive markings. Added after lighting so they keep their shape
     // in shadow and at night, but before tone mapping so they sit on the same
     // curve as everything else rather than clipping flat.
-    if (useEmissiveMap > 0.5) {
+    if (useEmissiveMap > 0.5 && !(isSniperGlass && sniperScopeFocalY > 0.0)) {
         float4 emissiveSample = SGE_MATERIAL_EMISSIVE.Sample(
             texSampler, input.texCoord);
         result += emissiveSample.rgb * emissiveFactor * emissiveIntensity;

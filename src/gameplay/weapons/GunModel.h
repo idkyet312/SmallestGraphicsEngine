@@ -71,6 +71,11 @@ public:
         return mesh;
     }
     static bool R700Loaded() { return R700Mesh() != nullptr; }
+    static std::shared_ptr<SceneMesh>& R700ScopeAperture() {
+        static std::shared_ptr<SceneMesh> aperture;
+        return aperture;
+    }
+
 
     // Centre of the authored scope glass after Orient has put the rifle into
     // gun-local space. The renderer uses the real mesh centre to put the optic
@@ -1210,12 +1215,64 @@ private:
                 : has("stock")  ? stock
                 : metal;
         }
-        R700LensCenterValidStorage() = foundLens;
+        R700LensCenterValidStorage() = false;
         if (foundLens) {
-            R700LensCenterStorage() = XMFLOAT3(
-                (lensLo.x + lensHi.x) * 0.5f,
-                (lensLo.y + lensHi.y) * 0.5f,
-                (lensLo.z + lensHi.z) * 0.5f);
+            // The export combines front and rear glass in one primitive. Find
+            // the empty interval between them along the normalized barrel (+Z).
+            std::vector<float> depths;
+            for (const auto& primitive : prims) if (primitive.material == glass)
+                for (size_t v = 0; v + 11 < primitive.vertices.size(); v += 12)
+                    depths.push_back(primitive.vertices[v + 2]);
+            std::sort(depths.begin(), depths.end());
+            float split = lensHi.z + 1.0f;
+            float gap = 0.0f;
+            for (size_t i = 1; i < depths.size(); ++i) {
+                const float candidate = depths[i] - depths[i - 1];
+                if (candidate > gap) {
+                    gap = candidate;
+                    split = (depths[i] + depths[i - 1]) * 0.5f;
+                }
+            }
+            // A single continuous lens needs no split.
+            if (gap < (lensHi.z - lensLo.z) * 0.25f) split = lensHi.z + 1.0f;
+            MeshPrimitive rear;
+            rear.material = make("r700_live_rear_lens", XMFLOAT4(1, 1, 1, 1), 0, 1);
+            rear.material->materialType = 9.0f;
+            rear.material->doubleSided = true;
+            rear.material->alphaBlend = true;
+            rear.material->disableOcclusionCulling = true;
+            XMFLOAT3 lo(FLT_MAX, FLT_MAX, FLT_MAX), hi(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+            for (const auto& primitive : prims) {
+                if (primitive.material != glass) continue;
+                const size_t count = primitive.indices.empty()
+                    ? primitive.vertices.size() / 12 : primitive.indices.size();
+                for (size_t triangle = 0; triangle + 2 < count; triangle += 3) {
+                    UINT index[3];
+                    for (UINT corner = 0; corner < 3; ++corner)
+                        index[corner] = primitive.indices.empty()
+                            ? static_cast<UINT>(triangle + corner)
+                            : primitive.indices[triangle + corner];
+                    if (primitive.vertices[index[0] * 12 + 2] > split ||
+                        primitive.vertices[index[1] * 12 + 2] > split ||
+                        primitive.vertices[index[2] * 12 + 2] > split) continue;
+                    for (UINT corner = 0; corner < 3; ++corner) {
+                        const float* v = primitive.vertices.data() + index[corner] * 12;
+                        rear.indices.push_back(static_cast<UINT>(rear.vertices.size() / 12));
+                        rear.vertices.insert(rear.vertices.end(), v, v + 12);
+                        lo.x = (std::min)(lo.x, v[0]); hi.x = (std::max)(hi.x, v[0]);
+                        lo.y = (std::min)(lo.y, v[1]); hi.y = (std::max)(hi.y, v[1]);
+                        lo.z = (std::min)(lo.z, v[2]); hi.z = (std::max)(hi.z, v[2]);
+                    }
+                }
+            }
+            if (!rear.indices.empty() && GLBImporter::BuildMeshletData(rear, g_dx12.device.Get())) {
+                auto aperture = std::make_shared<SceneMesh>();
+                aperture->primitives.push_back(std::move(rear));
+                R700ScopeAperture() = std::move(aperture);
+                R700LensCenterStorage() = XMFLOAT3(
+                    (lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f, (lo.z + hi.z) * 0.5f);
+                R700LensCenterValidStorage() = true;
+            }
         }
     }
 

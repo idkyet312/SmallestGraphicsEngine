@@ -7,6 +7,7 @@
 #include "DX12Core.h"
 #include "ProfilerDX12.h"
 #include "ShaderDX12.h"
+#include "SniperScopeOptics.h"
 #include "ImpactParticleRendererDX12.h"
 #include "CollisionDebugRendererDX12.h"
 #include "DDGI_DX12.h"
@@ -1273,78 +1274,77 @@ inline std::vector<VertexPosNormUV> BuildCapsuleVertices(int hemiRings = 6, int 
     return verts;
 }
 
-// Tangent of the half-angle the R700's scope glass subtends from the eye.
-//
-// The lens shader needs this to map the visible disc onto the whole scope
-// target. Without it the sample coordinate is built from the scope camera's own
-// focal length, which silently assumes the glass covers exactly the scope FOV.
-// It does not: the disc is sized by the weapon mesh and where ADS holds it,
-// while the scope FOV is a zoom setting, and the two are independent. Measured
-// on the real geometry, the disc spanned a 13.6 degree half-angle against a
-// 3 degree target, so scopeUV ran to +/-4.6 and saturate() flattened roughly
-// 95% of the glass into one smeared edge texel -- which read as a hole in the
-// scope rather than a magnified image, and got worse as zoom increased.
-//
-// Measured per frame rather than authored as a constant: it moves with the ADS
-// offsets, the weapon fit sliders and the hand-follow transform, and a stale
-// constant would put the seam back.
-//
-// Returns false when there is no scope glass to measure, which leaves the
-// shader on its focal-length fallback.
-inline bool SniperLensHalfAngleTangent(const Scene& scene, float& halfTangent) {
-    const std::shared_ptr<SceneMesh>& rifle = GunModel::R700Mesh();
-    if (!rifle) return false;
+struct R700ScopeFrameDX12 {
+    XMMATRIX weapon = XMMatrixIdentity();
+    XMFLOAT2 aimTangent{}, lensTangent{};
+    float halfTangent = 0.0f;
+    bool valid = false;
+};
+inline R700ScopeFrameDX12 g_r700ScopeFrame;
 
-    const float S = scene.GunModelScale();
-    const XMFLOAT3& weaponOffset = GunModel::PlayerOffset();
-    const XMFLOAT3& weaponFitRot = GunModel::PlayerFitRotation();
-    const XMMATRIX weaponPlacement =
-        XMMatrixRotationRollPitchYaw(XMConvertToRadians(weaponFitRot.x),
-                                     XMConvertToRadians(weaponFitRot.y),
-                                     XMConvertToRadians(weaponFitRot.z)) *
-        XMMatrixScaling(S, S, S) *
-        XMMatrixTranslation(weaponOffset.x * S, weaponOffset.y * S,
-                            weaponOffset.z * S);
-    const XMMATRIX gunBase = scene.GetGunBaseMatrix();
-    XMMATRIX handFollow;
-    const XMMATRIX xf = ArmsModel::WeaponFollowTransform(handFollow, S)
-                            ? weaponPlacement * handFollow * gunBase
-                            : weaponPlacement * gunBase;
+inline XMMATRIX PlayerWeaponTransform(const Scene& scene, FXMMATRIX view,
+                                      bool alignSight = true) {
+    const float scale = scene.GunModelScale() * GunModel::PlayerFitScale();
+    const XMFLOAT3& offset = GunModel::PlayerOffset();
+    const XMFLOAT3& rotation = GunModel::PlayerFitRotation();
+    XMMATRIX placement = XMMatrixRotationRollPitchYaw(
+        XMConvertToRadians(rotation.x), XMConvertToRadians(rotation.y),
+        XMConvertToRadians(rotation.z)) * XMMatrixScaling(scale, scale, scale) *
+        XMMatrixTranslation(offset.x * scale, offset.y * scale, offset.z * scale);
+    XMMATRIX follow;
+    if (ArmsModel::WeaponFollowTransform(follow, scene.GunModelScale()))
+        placement = placement * follow;
+    XMMATRIX weapon = placement * scene.GetGunBaseMatrix();
+    XMFLOAT3 lens;
+    if (alignSight && GunModel::R700Selected() && scene.adsBlend > 0.0f &&
+        GunModel::GetR700LensCenter(lens)) {
+        const XMFLOAT2 aim = SniperScopeOptics::ProjectTangent(
+            XMVector3TransformNormal(XMLoadFloat3(&scene.camera.Front), view));
+        weapon = SniperScopeOptics::AlignWeapon(weapon, view, lens, aim, scene.adsBlend);
+    }
+    return weapon;
+}
 
-    const XMVECTOR eye = XMLoadFloat3(&scene.ViewmodelAnchorPosition());
-    const XMVECTOR forward =
-        XMVector3Normalize(XMLoadFloat3(&scene.camera.Front));
-
-    // The largest off-axis tangent over the glass, which is the rim. Taking the
-    // maximum rather than an average keeps the whole disc inside the target:
-    // any vertex mapping past 1.0 is a vertex that would clamp.
-    float widest = 0.0f;
-    bool measured = false;
-    for (const MeshPrimitive& primitive : rifle->primitives) {
-        const std::shared_ptr<SceneMaterial>& material = primitive.material;
-        if (!material || material->materialType < 8.5f ||
-            material->materialType > 9.5f) continue;
-        // Same interleaved stride ViewmodelEyeDistanceRange walks:
-        // Pos(3) Normal(3) Tex(2) Tangent(4).
-        for (size_t i = 0; i + 2 < primitive.vertices.size(); i += 12) {
-            const XMVECTOR local = XMVectorSet(primitive.vertices[i],
-                                               primitive.vertices[i + 1],
-                                               primitive.vertices[i + 2], 1.0f);
-            const XMVECTOR offset = XMVectorSubtract(
-                XMVector3TransformCoord(local, xf), eye);
-            const float along = XMVectorGetX(XMVector3Dot(offset, forward));
-            // Behind or level with the eye has no meaningful angle.
-            if (along <= 1e-4f) continue;
-            const XMVECTOR perpendicular = XMVectorSubtract(
-                offset, XMVectorScale(forward, along));
-            const float lateral =
-                XMVectorGetX(XMVector3Length(perpendicular));
-            widest = (std::max)(widest, lateral / along);
-            measured = true;
+inline bool PrepareR700ScopeFrame(Scene& scene) {
+    g_r700ScopeFrame.valid = false;
+    const auto& aperture = GunModel::R700ScopeAperture();
+    XMFLOAT3 lens;
+    if (!GunModel::R700Selected() || !aperture || !GunModel::GetR700LensCenter(lens))
+        return false;
+    const XMMATRIX view = scene.GetViewMatrix();
+    g_r700ScopeFrame.weapon = PlayerWeaponTransform(scene, view);
+    const XMMATRIX weaponView = g_r700ScopeFrame.weapon * view;
+    const XMVECTOR lensView = XMVector3TransformCoord(XMLoadFloat3(&lens), weaponView);
+    if (XMVectorGetZ(lensView) <= scene.cameraNear) return false;
+    g_r700ScopeFrame.lensTangent = SniperScopeOptics::ProjectTangent(lensView);
+    g_r700ScopeFrame.aimTangent = SniperScopeOptics::ProjectTangent(
+        XMVector3TransformNormal(XMLoadFloat3(&scene.camera.Front), view));
+    float radius = 0.0f;
+    for (const auto& primitive : aperture->primitives) {
+        for (size_t i = 0; i + 11 < primitive.vertices.size(); i += 12) {
+            const XMVECTOR vertex = XMVector3TransformCoord(XMVectorSet(
+                primitive.vertices[i], primitive.vertices[i + 1],
+                primitive.vertices[i + 2], 1), weaponView);
+            if (XMVectorGetZ(vertex) <= 1e-4f) return false;
+            const XMFLOAT2 tangent = SniperScopeOptics::ProjectTangent(vertex);
+            const float dx = tangent.x - g_r700ScopeFrame.lensTangent.x;
+            const float dy = tangent.y - g_r700ScopeFrame.lensTangent.y;
+            radius = (std::max)(radius, std::sqrt(dx * dx + dy * dy));
         }
     }
-    if (!measured || widest <= 1e-4f) return false;
-    halfTangent = widest;
+    if (!std::isfinite(radius) || radius < 1e-4f) return false;
+    g_r700ScopeFrame.halfTangent = radius;
+    g_r700ScopeFrame.valid = true;
+    scene.sniperScopeFOV = SniperScopeOptics::FieldOfViewDegrees(radius);
+    // Use the rendered eye (including positional shake), but sight along the
+    // firing direction. The crosshair is therefore an aiming reference even
+    // during recoil, rather than a decorative mark on a shaken camera axis.
+    const XMMATRIX inverseView = XMMatrixInverse(nullptr, view);
+    const XMVECTOR forward = XMVector3Normalize(XMLoadFloat3(&scene.camera.Front));
+    const XMVECTOR eye = inverseView.r[3] + forward * scene.sniperScopeCameraForwardMetres;
+    const XMVECTOR up = XMVector3TransformNormal(inverseView.r[1],
+        XMMatrixRotationAxis(forward, XMConvertToRadians(scene.sniperScopeCameraRollDegrees)));
+    scene.sniperScopeView = XMMatrixLookAtLH(eye, eye + forward, up);
     return true;
 }
 
@@ -1365,6 +1365,9 @@ inline void DrawMeshAt(const std::shared_ptr<SceneMesh>& mesh, ShaderDX12& shade
 
     for (const auto& prim : mesh->primitives) {
         if (prim.vbv.BufferLocation == 0) continue;
+        if (mesh == GunModel::R700Mesh() && shader.sniperScopeFocalY > 0.0f &&
+            prim.material && prim.material->materialType > 8.5f &&
+            prim.material->materialType < 9.5f) continue;
 
         const bool transparent = prim.material && prim.material->IsTransparent();
         const bool alphaCutout = prim.material && prim.material->alphaCutout;
@@ -2355,9 +2358,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         mainLight.shadowBias = scene.shadowBias;
         mainLight.enableShadows = scene.enableShadows && shadowMap ? 1 : 0;
         g_ddgiRenderer.UpdateProbes(g_dx12.commandList.Get(),
-            shader.pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex),
+            shader.pointLightsBuffer.GetGPUAddress(shader.ViewFrameIndex()),
             (int)lightData.size(),
-            shader.ddgiBuffer.GetGPUAddress(g_dx12.frameIndex), mainLight);
+            shader.ddgiBuffer.GetGPUAddress(shader.ViewFrameIndex()), mainLight);
         // Probe update binds its private heap. Restore forward global table.
         shader.BindGlobalResources(shadowMap, g_ddgiIrradianceResource,
             g_ddgiVisibilityResource,
@@ -3574,17 +3577,18 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
         // zero tells the shader to fall back to the main projection.
         const XMFLOAT2 scopeFocal = scene.SniperScopeFocalLengths();
         const bool scopeFeedLive =
-            scene.sniperPictureInPicture && scene.sniperScopeBlend > 0.0f;
+            scene.sniperPictureInPicture && scene.sniperScopeFeedReady &&
+            g_r700ScopeFrame.valid;
         shader.sniperScopeFocalX = scopeFeedLive ? scopeFocal.x : 0.0f;
         shader.sniperScopeFocalY = scopeFeedLive ? scopeFocal.y : 0.0f;
         // Map the glass disc onto the whole scope target. Measured from the
         // real lens geometry every frame, so it tracks the ADS offsets and
         // weapon fit rather than assuming the disc covers the scope FOV.
-        float lensHalfTangent = 0.0f;
-        shader.sniperLensHalfTangent =
-            (scopeFeedLive &&
-             SniperLensHalfAngleTangent(scene, lensHalfTangent))
-                ? lensHalfTangent : 0.0f;
+        shader.sniperLensHalfTangent = scopeFeedLive ? g_r700ScopeFrame.halfTangent : 0.0f;
+        shader.sniperAimTangent = scopeFeedLive ? g_r700ScopeFrame.aimTangent : XMFLOAT2{};
+        shader.sniperLensAperture = XMFLOAT4(
+            g_r700ScopeFrame.lensTangent.x, g_r700ScopeFrame.lensTangent.y,
+            scopeFeedLive ? std::clamp(scene.adsBlend * 2.0f, 0.0f, 1.0f) : 0.0f, 0.0f);
         shader.sniperScopeDebugMode =
             (scopeFeedLive && scene.sniperScopeUVDebug) ? 1.0f : 0.0f;
         // A rolled camera changes the sampling basis, not the displayed roll.
@@ -3600,75 +3604,15 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             scene.player.ResolveWeaponStats(GunModel::SelectedWeapon());
 
         if (GunModel::PlayerLoaded()) {
-            // The weapon sits at a fixed spot in front of the camera: the model
-            // is normalised with its origin at the rear of the weapon, so shift
-            // it back and down into the same pocket of screen space the boxed M4
-            // occupied, then scale to the gun's on-screen size.
-            //
-            // The weapon deliberately does NOT ride the character's hand bone.
-            // Hanging it off the hand meant any error in the body's placement
-            // moved the gun too, so the one thing that was framed correctly
-            // stopped being so. Keeping the gun fixed makes it the reference the
-            // arms are aligned against, rather than the other way round.
-            // Base placement: the pocket of screen space the weapon was tuned
-            // in, before any hand motion is added.
-            const XMFLOAT3& weaponOffset = GunModel::PlayerOffset();
-            // Fit rotation turns the mesh in its own space, so it happens before
-            // the scale and the slide into the hands -- rotating afterwards
-            // would swing the weapon around the hand rather than spinning it in
-            // place.
-            const XMFLOAT3& weaponFitRot = GunModel::PlayerFitRotation();
-            // Per-weapon size correction folded into the shared scale rather
-            // than applied on its own: the hand offset below is expressed in
-            // the same normalised units as the mesh, so scaling the geometry
-            // without scaling the offset would slide the weapon out of the
-            // grip as soon as it was resized.
-            const float weaponS = S * GunModel::PlayerFitScale();
-            const XMMATRIX weaponPlacement =
-                XMMatrixRotationRollPitchYaw(
-                    XMConvertToRadians(weaponFitRot.x),
-                    XMConvertToRadians(weaponFitRot.y),
-                    XMConvertToRadians(weaponFitRot.z)) *
-                XMMatrixScaling(weaponS, weaponS, weaponS) *
-                XMMatrixTranslation(weaponOffset.x * weaponS,
-                                    weaponOffset.y * weaponS,
-                                    weaponOffset.z * weaponS);
-            XMMATRIX weaponBeforeBase = weaponPlacement;
-            // With the idle playing, ride the trigger hand so the rifle stays in
-            // the grip instead of hanging still while the arms breathe past it.
-            // The follow transform is a delta from the reference pose, so it
-            // composes on top of the tuned placement rather than replacing it.
-            XMMATRIX handFollow;
-            if (ArmsModel::WeaponFollowTransform(handFollow, S))
-                weaponBeforeBase = weaponPlacement * handFollow;
-
-            XMMATRIX viewmodelBase = gunBase;
-            XMFLOAT3 lensCenter;
-            if (GunModel::R700Selected() && scene.adsBlend > 0.0f &&
-                GunModel::GetR700LensCenter(lensCenter)) {
-                // Put the actual glass centre on the rendered camera axis. The
-                // correction is measured after the live weapon fit and hand
-                // follow, then converted back from view space to world space.
-                // This also removes the last few pixels of sway/recoil drift at
-                // full ADS without changing their rotation around the optic.
-                const XMVECTOR lensWorld = XMVector3TransformCoord(
-                    XMLoadFloat3(&lensCenter), weaponBeforeBase * viewmodelBase);
-                const XMVECTOR lensView = XMVector3TransformCoord(lensWorld, view);
-                const float alignment = (std::min)(
-                    1.0f, (std::max)(0.0f, scene.adsBlend));
-                const XMVECTOR correctionView = XMVectorSet(
-                    -XMVectorGetX(lensView) * alignment,
-                    -XMVectorGetY(lensView) * alignment, 0.0f, 0.0f);
-                const XMMATRIX inverseView = XMMatrixInverse(nullptr, view);
-                const XMVECTOR correctionWorld = XMVector3TransformNormal(
-                    correctionView, inverseView);
-                viewmodelBase.r[3] += XMVectorSetW(correctionWorld, 0.0f);
-            }
-
-            const XMMATRIX xf = weaponBeforeBase * viewmodelBase;
+            const XMMATRIX xf = GunModel::R700Selected() && g_r700ScopeFrame.valid
+                ? g_r700ScopeFrame.weapon : PlayerWeaponTransform(scene, view);
             shader.Use(scene.wireframeMode);
             if (!GunModel::C4Selected() && GunModel::PlayerMesh())
                 DrawMeshAt(GunModel::PlayerMesh(), shader, xf, view, proj,
+                           lightSpace, false, false, nullptr, {}, 1.0f,
+                           scopeUVRotation);
+            if (GunModel::R700Selected() && scopeFeedLive)
+                DrawMeshAt(GunModel::R700ScopeAperture(), shader, xf, view, proj,
                            lightSpace, false, false, nullptr, {}, 1.0f,
                            scopeUVRotation);
             // The M4's iron sights are a separate mesh so an optic can replace
@@ -3967,6 +3911,9 @@ inline void RenderForward(Scene& scene, ShaderDX12& shader, const GeometryBuffer
             // The body hangs off the same base transform as the weapon, so it
             // inherits recoil, the ADS slide and the hip offset for free. This
             // one is GPU-skinned and animating, so it owns its own draw.
+            XMMATRIX viewmodelBase = scene.GetGunBaseMatrix();
+            if (GunModel::R700Selected())
+                viewmodelBase.r[3] += xf.r[3] - PlayerWeaponTransform(scene, view, false).r[3];
             ArmsModel::Draw(shader, viewmodelBase, view, proj, lightSpace, S);
             shader.Use(scene.wireframeMode);
         } else {

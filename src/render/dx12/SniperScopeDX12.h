@@ -21,23 +21,33 @@ using Microsoft::WRL::ComPtr;
 // resource is created or resized per frame.
 class SniperScopeDX12 {
 public:
-    bool Init(ID3D12Device* device, UINT resolution) {
-        if (!device || resolution == 0) return false;
+    // `width` and `height` size the colour and depth targets. The visibility
+    // buffer path needs them to match its own render targets exactly: it copies
+    // its finished present image in with CopyResource, which requires identical
+    // dimensions and format. The square-target tiers this class used to take
+    // only apply to the Forward fallback.
+    bool Init(ID3D12Device* device, UINT width, UINT height) {
+        if (!device || width == 0 || height == 0) return false;
 
-        resolution_ = resolution;
+        width_ = width;
+        height_ = height;
+        resolution_ = width;
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-        // Linear HDR, not display-encoded LDR. The lens is sampled BEFORE the
-        // main view tone-map, so an LDR scope image would be tone-mapped a
-        // second time along with the frame that contains it -- crushing the
-        // scope highlights and shifting its colour away from the same content
-        // viewed outside the lens. Keeping the lens linear lets the single
-        // main-view tone-map do the whole job.
+        // Linear HDR, matching the visibility buffer's resolve output.
+        //
+        // The scope renders through the visibility buffer but stops at the
+        // resolve: its post chain is deliberately not run, because those are
+        // main-camera presentation effects and at scope magnification the flare
+        // alone filled the glass with concentric rings. So this target receives
+        // outputTexture, which is linear radiance, and the main view's single
+        // tone-map does the whole job for the lens as well. Matching
+        // outputTexture's format is also what lets CopyResource move it at all.
         D3D12_RESOURCE_DESC colourDesc{};
         colourDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        colourDesc.Width = resolution;
-        colourDesc.Height = resolution;
+        colourDesc.Width = width;
+        colourDesc.Height = height;
         colourDesc.DepthOrArraySize = 1;
         colourDesc.MipLevels = 1;
         colourDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -69,8 +79,8 @@ public:
         // then read, and the two projections agree on no pixel.
         D3D12_RESOURCE_DESC depthDesc{};
         depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        depthDesc.Width = resolution;
-        depthDesc.Height = resolution;
+        depthDesc.Width = width;
+        depthDesc.Height = height;
         depthDesc.DepthOrArraySize = 1;
         depthDesc.MipLevels = 1;
         depthDesc.Format = DXGI_FORMAT_D32_FLOAT;
@@ -93,13 +103,13 @@ public:
         device->CreateDepthStencilView(
             depth_.Get(), nullptr, dsvHeap_->GetCPUDescriptorHandleForHeapStart());
 
-        colour_->SetName(L"Sniper scope colour (linear HDR)");
+        colour_->SetName(L"Sniper scope colour");
         depth_->SetName(L"Sniper scope depth");
 
-        viewport_ = { 0.0f, 0.0f, static_cast<float>(resolution_),
-                      static_cast<float>(resolution_), 0.0f, 1.0f };
-        scissor_ = { 0, 0, static_cast<LONG>(resolution_),
-                     static_cast<LONG>(resolution_) };
+        viewport_ = { 0.0f, 0.0f, static_cast<float>(width_),
+                      static_cast<float>(height_), 0.0f, 1.0f };
+        scissor_ = { 0, 0, static_cast<LONG>(width_),
+                     static_cast<LONG>(height_) };
         initialized_ = true;
         return true;
     }
@@ -151,6 +161,15 @@ public:
         hasRenderedOnce_ = true;
     }
 
+    // Hands the lens image over as a copy destination. Begin() left it as a
+    // render target; the visibility-buffer path fills it with a CopyResource
+    // from its own present texture rather than drawing into it directly.
+    void TransitionForCopyDestination(ID3D12GraphicsCommandList* list) {
+        if (!initialized_ || !list) return;
+        Transition(list, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                   D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+
     // Transitions the lens image to a shader-readable state without assuming
     // this class last wrote it -- the VB path copies its post output straight
     // into the target instead of rendering through Begin/End.
@@ -167,6 +186,8 @@ public:
     // first clear, and the rifle is visible at the hip long before that.
     bool HasRenderedOnce() const { return hasRenderedOnce_; }
     UINT Resolution() const { return resolution_; }
+    UINT Width() const { return width_; }
+    UINT Height() const { return height_; }
     ID3D12Resource* Texture() const { return colour_.Get(); }
     ID3D12Resource* Depth() const { return depth_.Get(); }
     const D3D12_VIEWPORT& Viewport() const { return viewport_; }
@@ -199,6 +220,8 @@ private:
     D3D12_VIEWPORT viewport_{};
     D3D12_RECT scissor_{};
     UINT resolution_ = 0;
+    UINT width_ = 0;
+    UINT height_ = 0;
     bool initialized_ = false;
     bool wasActive_ = false;
     bool hasRenderedOnce_ = false;

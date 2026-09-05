@@ -1,6 +1,8 @@
 #ifndef SHADER_DX12_H
 #define SHADER_DX12_H
 
+#include "RenderViewDX12.h"
+
 #include "ShaderCacheDX12.h"
 #include "DX12Core.h"
 #include "BindlessHeapDeviceDX12.h"
@@ -192,8 +194,8 @@ struct alignas(256) ObjectBufferDX12 {
     // float, so no offset asserted above moves. Zero means "not measured" and
     // the lens falls back to the focal-length mapping.
     float sniperLensHalfTangent = 0.0f;
-    float sniperScopeDebugPad1 = 0.0f;
-    float sniperScopeDebugPad2 = 0.0f;
+    XMFLOAT2 sniperAimTangent{};
+    XMFLOAT4 sniperLensAperture{}; // centre tangent.xy, live opacity, reserved
 };
 
 static_assert(offsetof(ObjectBufferDX12, bindlessTextureIndices) == 96,
@@ -536,6 +538,8 @@ public:
     // Tangent of the scope glass's half-angle from the eye. Same sticky
     // lifetime as the focal lengths it accompanies.
     float sniperLensHalfTangent = 0.0f;
+    XMFLOAT2 sniperAimTangent{};
+    XMFLOAT4 sniperLensAperture{};
     bool drawWireframe = false;
     bool msaaSupported = false;
     bool msaaEnabled = false;
@@ -1500,13 +1504,13 @@ public:
         if (!objectBuffer.Create(FRAME_COUNT * MAX_DRAW_CALLS_PER_FRAME)) return false;
         
         // Per-frame buffers only need FRAME_COUNT slots
-        if (!lightBuffer.Create(FRAME_COUNT)) return false;
-        if (!cameraBuffer.Create(FRAME_COUNT)) return false;
-        if (!pointLightsBuffer.Create(FRAME_COUNT)) return false;
-        if (!impactDecalsBuffer.Create(FRAME_COUNT)) return false;
-        if (!ddgiBuffer.Create(FRAME_COUNT)) return false;
-        if (!shBuffer.Create(FRAME_COUNT)) return false;
-        if (!shadowCascadeBuffer.Create(FRAME_COUNT)) return false;
+        if (!lightBuffer.Create(FRAME_COUNT * RenderViewCountDX12)) return false;
+        if (!cameraBuffer.Create(FRAME_COUNT * RenderViewCountDX12)) return false;
+        if (!pointLightsBuffer.Create(FRAME_COUNT * RenderViewCountDX12)) return false;
+        if (!impactDecalsBuffer.Create(FRAME_COUNT * RenderViewCountDX12)) return false;
+        if (!ddgiBuffer.Create(FRAME_COUNT * RenderViewCountDX12)) return false;
+        if (!shBuffer.Create(FRAME_COUNT * RenderViewCountDX12)) return false;
+        if (!shadowCascadeBuffer.Create(FRAME_COUNT * RenderViewCountDX12)) return false;
         
         loaded = true;
         if (!msaaSupported) {
@@ -1740,17 +1744,17 @@ public:
     }
 
     void BindFrameConstants() {
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(1, lightBuffer.GetGPUAddress(g_dx12.frameIndex));
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(2, cameraBuffer.GetGPUAddress(g_dx12.frameIndex));
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(g_dx12.frameIndex));
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(1, lightBuffer.GetGPUAddress(ViewFrameIndex()));
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(2, cameraBuffer.GetGPUAddress(ViewFrameIndex()));
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(ViewFrameIndex()));
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(ViewFrameIndex()));
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(ViewFrameIndex()));
         g_dx12.commandList->SetGraphicsRootConstantBufferView(20,
-            shadowCascadeBuffer.GetGPUAddress(g_dx12.frameIndex));
+            shadowCascadeBuffer.GetGPUAddress(ViewFrameIndex()));
         // b10 exists in both layouts. It remains inert in legacy shaders and
         // is consumed only by the bindless cutout variants.
         g_dx12.commandList->SetGraphicsRootConstantBufferView(
-            22, impactDecalsBuffer.GetGPUAddress(g_dx12.frameIndex));
+            22, impactDecalsBuffer.GetGPUAddress(ViewFrameIndex()));
     }
 
     // Toggles GPU skinning for the conventional IA vertex shader (b9). Every IA
@@ -1966,6 +1970,11 @@ public:
     // frame; this only re-bases within it, so it must NOT reset per-frame
     // descriptor state -- calling the frame reset twice would hand out
     // scratch descriptor slots already in use by the main view.
+    UINT ViewFrameIndex() const {
+        return RenderViewFrameIndexDX12(g_dx12.frameIndex, FRAME_COUNT,
+            currentViewSlot == 0 ? RenderViewDX12::Main : RenderViewDX12::Scope);
+    }
+
     void BeginView(UINT viewSlot) {
         currentViewSlot = (viewSlot < kViewSlices) ? viewSlot : 0;
         currentDrawCall = 0;
@@ -2087,24 +2096,24 @@ public:
         data.shadowBias = shadowBias;
         data.enableShadows = enableShadows ? 1 : 0;
         data.shadowTexelSize = shadowTexelSize;
-        lightBuffer.CopyData(g_dx12.frameIndex, data);
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(1, lightBuffer.GetGPUAddress(g_dx12.frameIndex));
+        lightBuffer.CopyData(ViewFrameIndex(), data);
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(1, lightBuffer.GetGPUAddress(ViewFrameIndex()));
         ShadowCascadeBufferDX12 cascades = {};
         for (UINT i = 0; i < SHADOW_CASCADE_COUNT; ++i)
             cascades.lightViewProjection[i] = XMMatrixTranspose(g_shadowCascadeMatrices[i]);
         cascades.splitDepths = g_shadowCascadeSplits;
         cascades.texelWorld = g_shadowCascadeTexelWorld;
         cascades.depthRange = g_shadowCascadeDepthRange;
-        shadowCascadeBuffer.CopyData(g_dx12.frameIndex, cascades);
+        shadowCascadeBuffer.CopyData(ViewFrameIndex(), cascades);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(20,
-            shadowCascadeBuffer.GetGPUAddress(g_dx12.frameIndex));
+            shadowCascadeBuffer.GetGPUAddress(ViewFrameIndex()));
     }
     
     void SetCamera(const XMFLOAT3& pos) {
         CameraBufferDX12 data;
         data.viewPos = pos;
-        cameraBuffer.CopyData(g_dx12.frameIndex, data);
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(2, cameraBuffer.GetGPUAddress(g_dx12.frameIndex));
+        cameraBuffer.CopyData(ViewFrameIndex(), data);
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(2, cameraBuffer.GetGPUAddress(ViewFrameIndex()));
     }
     
     void SetObjectColor(const XMFLOAT3& color) {
@@ -2129,6 +2138,8 @@ public:
         data.sniperScopeFocalY = sniperScopeFocalY;
         data.sniperScopeDebugMode = sniperScopeDebugMode;
         data.sniperLensHalfTangent = sniperLensHalfTangent;
+        data.sniperAimTangent = sniperAimTangent;
+        data.sniperLensAperture = sniperLensAperture;
         data.sniperScopeUVRotation = 0.0f;
 
         objectBuffer.CopyData(bufferIndex, data);
@@ -2236,6 +2247,8 @@ public:
         data.sniperScopeFocalY = sniperScopeFocalY;
         data.sniperScopeDebugMode = sniperScopeDebugMode;
         data.sniperLensHalfTangent = sniperLensHalfTangent;
+        data.sniperAimTangent = sniperAimTangent;
+        data.sniperLensAperture = sniperLensAperture;
         data.sniperScopeUVRotation = scopeUVRotation;
         if (useNorm && normal) {
             const D3D12_RESOURCE_DESC nd = normal->GetDesc();
@@ -2454,6 +2467,8 @@ public:
         data.sniperScopeFocalY = sniperScopeFocalY;
         data.sniperScopeDebugMode = sniperScopeDebugMode;
         data.sniperLensHalfTangent = sniperLensHalfTangent;
+        data.sniperAimTangent = sniperAimTangent;
+        data.sniperLensAperture = sniperLensAperture;
         data.sniperScopeUVRotation = 0.0f;
         objectBuffer.CopyData(bufferIndex, data);
         g_dx12.commandList->SetGraphicsRootConstantBufferView(
@@ -2482,8 +2497,8 @@ public:
         data.spotShadowCount = static_cast<int>(g_spotShadowActiveCount);
         for (UINT s = 0; s < SPOT_SHADOW_COUNT; ++s)
             data.spotShadowMatrices[s] = XMMatrixTranspose(g_spotShadowMatrices[s]);
-        pointLightsBuffer.CopyData(g_dx12.frameIndex, data);
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(g_dx12.frameIndex));
+        pointLightsBuffer.CopyData(ViewFrameIndex(), data);
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(4, pointLightsBuffer.GetGPUAddress(ViewFrameIndex()));
     }
     
     void SetImpactDecals(const std::vector<ImpactDecalDataDX12>& decals,
@@ -2493,7 +2508,7 @@ public:
         data.numDecals = count;
         data.cutoutsEnabled = cutoutsEnabled ? 1.0f : 0.0f;
         for (int i = 0; i < count; ++i) data.decals[i] = decals[i];
-        impactDecalsBuffer.CopyData(g_dx12.frameIndex, data);
+        impactDecalsBuffer.CopyData(ViewFrameIndex(), data);
     }
 
     void SetDDGI(bool enabled, float gi_intensity, float normal_bias,
@@ -2518,8 +2533,8 @@ public:
         data.sparseProbeCount = static_cast<int>(sparseProbeCount);
         data.sparseCellCount = static_cast<int>(sparseCellCount);
         data.sparseCellSize = sparseCellSize;
-        ddgiBuffer.CopyData(g_dx12.frameIndex, data);
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(g_dx12.frameIndex));
+        ddgiBuffer.CopyData(ViewFrameIndex(), data);
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(5, ddgiBuffer.GetGPUAddress(ViewFrameIndex()));
     }
 
     // Stores the SH coefficients computed once at load from the sky HDRI.
@@ -2538,8 +2553,8 @@ public:
             data.shCoeffs[i] = XMFLOAT4(c.x, c.y, c.z, 0.0f);
         }
         data.skyIntensity = skyIrradianceValid ? pendingSkyIntensity : 0.0f;
-        shBuffer.CopyData(g_dx12.frameIndex, data);
-        g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(g_dx12.frameIndex));
+        shBuffer.CopyData(ViewFrameIndex(), data);
+        g_dx12.commandList->SetGraphicsRootConstantBufferView(15, shBuffer.GetGPUAddress(ViewFrameIndex()));
     }
 };
 
