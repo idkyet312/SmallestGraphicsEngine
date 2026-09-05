@@ -8109,6 +8109,43 @@ static void RenderSniperScopeTexture(float now) {
                 }
             }
         }
+
+        // Water, in the same place the main view draws it: inside the forward
+        // extensions bracket, after the opaque scene. The pass copies its own
+        // render target to refract and reflect through, so the sky and the
+        // resolved terrain have to be in it already -- they are, which is why
+        // this sits at the end of the bracket rather than anywhere earlier.
+        //
+        // This must stay LAST in the bracket. Render() leaves colour bound
+        // with no depth-stencil view, so anything added after it has to rebind
+        // for itself.
+        // Matches the main view's waterPassEnabled, minus its raytracing
+        // exclusion: scopeUsesVisibilityBuffer already implies the visibility
+        // path, so the ray-traced path never reaches here.
+        if (scopeUsesVisibilityBuffer && waterRenderer.initialized &&
+            !g_emptyLevelMode &&
+            (g_ocean.IsInitialized() || g_water.IsInitialized()) &&
+            !(DeploymentPlanningActive() && g_deploymentDebugHideWater)) {
+            ProfilerDX12::Scope waterProfile(
+                g_profiler, "Scope/Water", g_dx12.commandList.Get());
+            WaterRendererDX12::ViewOverride scopeView;
+            scopeView.width = g_sniperScope.Width();
+            scopeView.height = g_sniperScope.Height();
+            scopeView.viewport = g_sniperScope.Viewport();
+            scopeView.scissor = g_sniperScope.Scissor();
+            scopeView.secondaryView = true;
+            // The target is the visibility buffer's scope-sized output, not
+            // the lens texture: the resolve copy below reads that, so water
+            // drawn straight into the lens would be overwritten by it.
+            waterRenderer.Render(
+                scene, g_ocean, g_water,
+                visBuffer.GetOutputResource(), visBuffer.GetOutputRTV(),
+                g_sniperScope.Depth(), g_specularEnvironmentResource,
+                /*hdrTarget=*/true,
+                /*motionTarget=*/nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{},
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                /*profiler=*/nullptr, &scopeView);
+        }
     }
     if (scopeUsesVisibilityBuffer) {
         visBuffer.EndForwardExtensions(g_dx12.commandList.Get());

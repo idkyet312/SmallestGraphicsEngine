@@ -101,6 +101,9 @@ public:
         deploymentClipIndexBuffer_.Reset();
         hdrSceneCopy_.Reset();
         ldrSceneCopy_.Reset();
+        secondarySceneCopy_.Reset();
+        secondaryCopyWidth_ = 0;
+        secondaryCopyHeight_ = 0;
         descriptorHeap_.Reset();
         if (constantBuffer_ && mappedConstants_) {
             constantBuffer_->Unmap(0, nullptr);
@@ -119,6 +122,26 @@ public:
         ultra_.Shutdown();
     }
 
+    // Renders the water for a camera other than the main view, into an
+    // off-screen target of a different size -- the sniper scope. Everything
+    // the pass reads in screen space (the scene copy it refracts through, the
+    // opaque depth it clips against, the viewport it rasterises into) is sized
+    // to the main backbuffer by default, so a second view has to say how big
+    // it is or the shader samples a texture that does not match its pixels.
+    //
+    // secondaryView additionally means "borrow, do not advance": the ocean
+    // simulation and the reprojection history are the main camera's, stepped
+    // once per frame by its own pass, and a second stepping would corrupt them.
+    struct ViewOverride {
+        UINT width = 0;
+        UINT height = 0;
+        // Held by value. The scope's accessors return references into
+        // g_sniperScope, and copying settles any question about lifetime.
+        D3D12_VIEWPORT viewport{};
+        D3D12_RECT scissor{};
+        bool secondaryView = true;
+    };
+
     void Render(const Scene& scene,
                 WaterVolume& ocean,
                 WaterVolume& pool,
@@ -131,13 +154,22 @@ public:
                 D3D12_CPU_DESCRIPTOR_HANDLE motionRTV = {},
                 D3D12_RESOURCE_STATES depthState =
                     D3D12_RESOURCE_STATE_DEPTH_WRITE,
-                ProfilerDX12* profiler = nullptr) {
+                ProfilerDX12* profiler = nullptr,
+                const ViewOverride* view = nullptr) {
         if (!initialized || !target || !targetRTV.ptr || !opaqueDepth ||
             (!ocean.IsInitialized() && !pool.IsInitialized())) return;
 
+        // A null override is the main view, and every branch below collapses
+        // back to exactly what it did before this parameter existed.
+        const bool secondary = view && view->secondaryView;
+        const UINT viewWidth = view ? view->width : width_;
+        const UINT viewHeight = view ? view->height : height_;
+        if (!viewWidth || !viewHeight) return;
+
         const bool depthMSAA = opaqueDepth->GetDesc().SampleDesc.Count > 1;
         const bool writeMotion =
-            hdrTarget && motionTarget && motionRTV.ptr && !depthMSAA;
+            hdrTarget && motionTarget && motionRTV.ptr && !depthMSAA &&
+            !secondary;
         ID3D12PipelineState* pso = nullptr;
         if (hdrTarget)
             pso = writeMotion ? hdrMotionPSO_.Get() : hdrPSO_.Get();
@@ -145,16 +177,26 @@ public:
             pso = depthMSAA ? ldrMSAADepthPSO_.Get() : ldrPSO_.Get();
         if (!pso) return;
 
-        ID3D12Resource* sceneCopy =
-            hdrTarget ? hdrSceneCopy_.Get() : ldrSceneCopy_.Get();
+        ID3D12Resource* sceneCopy = secondary
+            ? SecondarySceneCopy(viewWidth, viewHeight)
+            : (hdrTarget ? hdrSceneCopy_.Get() : ldrSceneCopy_.Get());
         if (!sceneCopy) return;
 
         const bool ultraActive = hdrTarget &&
             scene.waterQuality == WaterQuality::Ultra &&
             ultra_.Initialized();
-        if (scene.waterQuality != WaterQuality::Low && ultra_.Initialized())
-            ultra_.PrepareBathymetry();
-        if (ultraActive) {
+        // The simulation belongs to the main camera. Update() flips the
+        // spectrum's frame parity and runs the coastal substeps, so a second
+        // call in the same frame would double the wave time-step and leave the
+        // main view reading the state this pass advanced past. The secondary
+        // view renders last frame's sim instead -- one frame stale at most,
+        // which no magnification makes visible. PrepareBathymetry is skipped
+        // for the same reason, and because it can kick off a shoreline solve.
+        if (!secondary) {
+            if (scene.waterQuality != WaterQuality::Low && ultra_.Initialized())
+                ultra_.PrepareBathymetry();
+        }
+        if (ultraActive && !secondary) {
             const float deltaTime = hasHistory_
                 ? (std::max)(0.0f, ocean.GetTime() - previousOceanTime_)
                 : 0.0f;
@@ -187,15 +229,24 @@ public:
                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                        D3D12_RESOURCE_STATE_RENDER_TARGET);
 
-        UpdateDescriptors(sceneCopy, opaqueDepth, environment, 0);
+        // Constant and descriptor slots are keyed on the frame index alone, so
+        // a second view in the same frame has to claim its own or it overwrites
+        // what the main view's draw -- recorded later in this command list, and
+        // so executed later on the GPU -- is going to read. The symptom of
+        // getting this wrong appears in the main view, not in the scope.
+        const UINT tableSlot = secondary ? kSecondaryTable : 0u;
+        const UINT oceanDrawSlot = secondary ? kSecondaryOceanDraw : 0u;
+        const UINT poolDrawSlot = secondary ? kSecondaryPoolDraw : 1u;
+
+        UpdateDescriptors(sceneCopy, opaqueDepth, environment, tableSlot);
         ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
         list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootSignature(rootSignature_.Get());
         list->SetPipelineState(pso);
         list->SetGraphicsRootDescriptorTable(
-            1, DescriptorGPU(DescriptorTableBase(0)));
-        list->RSSetViewports(1, &g_dx12.viewport);
-        list->RSSetScissorRects(1, &g_dx12.scissorRect);
+            1, DescriptorGPU(DescriptorTableBase(tableSlot)));
+        list->RSSetViewports(1, view ? &view->viewport : &g_dx12.viewport);
+        list->RSSetScissorRects(1, view ? &view->scissor : &g_dx12.scissorRect);
         if (writeMotion) {
             D3D12_CPU_DESCRIPTOR_HANDLE rtvs[] = { targetRTV, motionRTV };
             list->OMSetRenderTargets(2, rtvs, FALSE, nullptr);
@@ -203,9 +254,12 @@ public:
             list->OMSetRenderTargets(1, &targetRTV, FALSE, nullptr);
         }
 
-        const XMMATRIX view = scene.GetViewMatrix();
+        // Named viewMatrix, not view: the ViewOverride parameter owns that
+        // name now. During the scope pass the scene already returns the scope
+        // camera's matrices, so these need no plumbing of their own.
+        const XMMATRIX viewMatrix = scene.GetViewMatrix();
         const XMMATRIX projection = scene.GetProjectionMatrix();
-        const XMMATRIX viewProjection = view * projection;
+        const XMMATRIX viewProjection = viewMatrix * projection;
         const bool deploymentPlanning = DeploymentPlanningActive();
         const float snap = 0.25f;
         const XMFLOAT2 clipCenter = deploymentPlanning
@@ -214,18 +268,26 @@ public:
                 std::floor(scene.camera.Position.x / snap) * snap,
                 std::floor(scene.camera.Position.z / snap) * snap
             };
-        if (deploymentPlanning != previousDeploymentPlanning_)
-            hasHistory_ = false;
-        if (!hasHistory_) {
-            previousViewProjection_ = viewProjection;
-            previousClipCenter_ = clipCenter;
-            previousOceanTime_ = ocean.GetTime();
+        // Reprojection history describes the main camera. Seeding or resetting
+        // it from a 15-degree scope frustum, which shares no pixel with it,
+        // would have the main view reproject against the wrong matrix next
+        // frame. The secondary view writes no motion vectors, so the history
+        // values it reads here go unused.
+        if (!secondary) {
+            if (deploymentPlanning != previousDeploymentPlanning_)
+                hasHistory_ = false;
+            if (!hasHistory_) {
+                previousViewProjection_ = viewProjection;
+                previousClipCenter_ = clipCenter;
+                previousOceanTime_ = ocean.GetTime();
+            }
         }
 
         if (ocean.IsInitialized()) {
             Constants constants = BuildConstants(
-                scene, ocean, viewProjection, clipCenter, true, ultraActive);
-            BindConstants(constants, 0);
+                scene, ocean, viewProjection, clipCenter, true, ultraActive,
+                viewWidth, viewHeight);
+            BindConstants(constants, oceanDrawSlot);
             const D3D12_VERTEX_BUFFER_VIEW& oceanVB = deploymentPlanning
                 ? deploymentClipVertexView_
                 : ultraActive ? ultraClipVertexView_ : clipVertexView_;
@@ -243,14 +305,16 @@ public:
         }
 
         if (pool.IsInitialized()) {
-            const D3D12_VERTEX_BUFFER_VIEW& vbv =
-                pool.UpdateAndGetVBV(g_dx12.frameIndex);
+            const D3D12_VERTEX_BUFFER_VIEW& vbv = secondary
+                ? pool.GetCurrentVBV()
+                : pool.UpdateAndGetVBV(g_dx12.frameIndex);
             const D3D12_INDEX_BUFFER_VIEW& ibv = pool.GetIBV();
             const UINT indexCount = pool.GetIndexCount();
             if (vbv.BufferLocation && indexCount) {
                 Constants constants = BuildConstants(
-                    scene, pool, viewProjection, clipCenter, false, false);
-                BindConstants(constants, 1);
+                    scene, pool, viewProjection, clipCenter, false, false,
+                    viewWidth, viewHeight);
+                BindConstants(constants, poolDrawSlot);
                 list->IASetVertexBuffers(0, 1, &vbv);
                 list->IASetIndexBuffer(&ibv);
                 list->IASetPrimitiveTopology(
@@ -269,11 +333,13 @@ public:
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_COPY_DEST);
 
-        previousViewProjection_ = viewProjection;
-        previousClipCenter_ = clipCenter;
-        previousOceanTime_ = ocean.GetTime();
-        previousDeploymentPlanning_ = deploymentPlanning;
-        hasHistory_ = true;
+        if (!secondary) {
+            previousViewProjection_ = viewProjection;
+            previousClipCenter_ = clipCenter;
+            previousOceanTime_ = ocean.GetTime();
+            previousDeploymentPlanning_ = deploymentPlanning;
+            hasHistory_ = true;
+        }
     }
 
     void RenderUnderwater(const Scene& scene,
@@ -318,7 +384,8 @@ public:
             std::floor(scene.camera.Position.z / snap) * snap
         };
         const Constants constants = BuildConstants(
-            scene, ocean, viewProjection, clipCenter, true, true);
+            scene, ocean, viewProjection, clipCenter, true, true,
+            width_, height_);
         BindConstants(constants, 2);
         list->RSSetViewports(1, &g_dx12.viewport);
         list->RSSetScissorRects(1, &g_dx12.scissorRect);
@@ -337,8 +404,15 @@ public:
 
 private:
     static constexpr UINT kDescriptorsPerFrame = 8;
-    static constexpr UINT kDescriptorTablesPerFrame = 2;
-    static constexpr UINT kDrawsPerFrame = 3;
+    // Tables: 0 main surface, 1 underwater, 2 secondary-view surface.
+    // Draws: 0 ocean, 1 pool, 2 underwater, 3/4 the secondary view's pair.
+    // Both are indexed by frame index alone, so every view that renders in a
+    // single frame needs its own slots -- see the comment at the call sites.
+    static constexpr UINT kDescriptorTablesPerFrame = 3;
+    static constexpr UINT kDrawsPerFrame = 5;
+    static constexpr UINT kSecondaryTable = 2;
+    static constexpr UINT kSecondaryOceanDraw = 3;
+    static constexpr UINT kSecondaryPoolDraw = 4;
 
     struct ClipVertex {
         XMFLOAT3 position;
@@ -917,19 +991,45 @@ private:
 
     bool CreateSceneCopies() {
         return CreateSceneCopy(
-                   DXGI_FORMAT_R16G16B16A16_FLOAT, hdrSceneCopy_) &&
+                   DXGI_FORMAT_R16G16B16A16_FLOAT, width_, height_,
+                   hdrSceneCopy_) &&
                CreateSceneCopy(
-                   DXGI_FORMAT_R8G8B8A8_UNORM, ldrSceneCopy_);
+                   DXGI_FORMAT_R8G8B8A8_UNORM, width_, height_,
+                   ldrSceneCopy_);
     }
 
-    bool CreateSceneCopy(DXGI_FORMAT format,
+    // The refraction copy for a secondary view. CopyResource demands an exact
+    // match of size and format with the target, and the scope's target is
+    // square and much smaller than the backbuffer, so it cannot share the main
+    // view's copy. Built on the first scoped frame and kept: the scope's
+    // resolution is fixed at SniperScopeOptics::Resolution, so unlike the main
+    // copies this one does not follow a window resize.
+    ID3D12Resource* SecondarySceneCopy(UINT width, UINT height) {
+        if (secondarySceneCopy_ && secondaryCopyWidth_ == width &&
+            secondaryCopyHeight_ == height)
+            return secondarySceneCopy_.Get();
+        secondarySceneCopy_.Reset();
+        secondaryCopyWidth_ = 0;
+        secondaryCopyHeight_ = 0;
+        if (!CreateSceneCopy(DXGI_FORMAT_R16G16B16A16_FLOAT, width, height,
+                             secondarySceneCopy_)) {
+            secondarySceneCopy_.Reset();
+            return nullptr;
+        }
+        secondarySceneCopy_->SetName(L"Water secondary view scene copy");
+        secondaryCopyWidth_ = width;
+        secondaryCopyHeight_ = height;
+        return secondarySceneCopy_.Get();
+    }
+
+    bool CreateSceneCopy(DXGI_FORMAT format, UINT width, UINT height,
                          ComPtr<ID3D12Resource>& output) {
         D3D12_HEAP_PROPERTIES heap = {};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC desc = {};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        desc.Width = width_;
-        desc.Height = height_;
+        desc.Width = width;
+        desc.Height = height;
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
         desc.Format = format;
@@ -1019,7 +1119,9 @@ private:
                              const XMMATRIX& currentViewProjection,
                              const XMFLOAT2& clipCenter,
                              bool ocean,
-                             bool ultraActive) const {
+                             bool ultraActive,
+                             UINT viewWidth,
+                             UINT viewHeight) const {
         Constants constants = {};
         XMStoreFloat4x4(
             &constants.viewProjection,
@@ -1043,11 +1145,16 @@ private:
             scene.camera.Position.z,
             ocean ? previousOceanTime_ : volume.GetTime()
         };
+        // The size of the target actually being rendered into, not the
+        // backbuffer. The pixel shader derives every screen-space UV from
+        // this, and LoadOpaqueDepth turns it into an integer texel fetch --
+        // so a mismatch does not distort the water, it reads depth 0 outside
+        // the real bounds and clips the whole surface away.
         constants.screenParams = {
-            static_cast<float>(width_),
-            static_cast<float>(height_),
-            1.0f / width_,
-            1.0f / height_
+            static_cast<float>(viewWidth),
+            static_cast<float>(viewHeight),
+            1.0f / viewWidth,
+            1.0f / viewHeight
         };
         const XMFLOAT3 center = volume.GetCenter();
         const XMFLOAT3 extents = volume.GetExtents();
@@ -1247,6 +1354,9 @@ private:
     D3D12_INDEX_BUFFER_VIEW deploymentClipIndexView_ = {};
     ComPtr<ID3D12Resource> hdrSceneCopy_;
     ComPtr<ID3D12Resource> ldrSceneCopy_;
+    ComPtr<ID3D12Resource> secondarySceneCopy_;
+    UINT secondaryCopyWidth_ = 0;
+    UINT secondaryCopyHeight_ = 0;
     ComPtr<ID3D12DescriptorHeap> descriptorHeap_;
     ComPtr<ID3D12Resource> constantBuffer_;
     uint8_t* mappedConstants_ = nullptr;

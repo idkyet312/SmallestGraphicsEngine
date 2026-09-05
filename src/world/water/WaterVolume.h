@@ -189,6 +189,14 @@ public:
         return m_vbv[m_currentSlot];
     }
 
+    // The same view without the write. A second camera drawing this volume in
+    // the same frame -- the sniper scope -- must not advance the counter: doing
+    // so would rotate the slot twice per frame, turning the update interval
+    // into full rate and rewriting a buffer the main view's draw still reads.
+    const D3D12_VERTEX_BUFFER_VIEW& GetCurrentVBV() const {
+        return m_vbv[m_currentSlot];
+    }
+
     // Recompute the surface every n-th rendered frame (1 = every frame). The
     // big ocean grid is CPU-priced (16k sine evals per write); the swell moves
     // slowly enough that half rate is imperceptible.
