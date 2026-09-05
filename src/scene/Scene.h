@@ -1038,6 +1038,7 @@ struct Scene {
     // Hollow-inspired projected-error tessellation and stitched tile edges.
     // Opt-in so the legacy distance LOD remains the default rendering path.
     bool  terrainErrorLOD      = false;
+    bool  automaticPrefabLod   = false;
     // Flat authoring plane: no fbm relief, no pool basin, no coast falloff.
     // Driven by the level definition's terrainFlat.
     bool  terrainFlat         = false;

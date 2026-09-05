@@ -1842,6 +1842,9 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
                 "Grey: bounds box superseded by a triangle mesh for those "
                 "queries.\n"
                 "Green: world bounds of a triangle mesh (its broadphase).");
+        ImGui::Checkbox("Automatic prefab LOD", &scene.automaticPrefabLod);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Use generated distance LODs for opted-in static prefabs (NATO shelter). Collision stays full detail.");
         ImGui::Checkbox("Mesh Shader Terrain", &scene.useMeshTerrain);
         if (scene.useMeshTerrain) {
             ImGui::SliderFloat("Terrain Height", &scene.terrainHeightScale, 0.0f, 15.0f);

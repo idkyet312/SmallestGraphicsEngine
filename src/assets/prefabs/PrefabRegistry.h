@@ -82,6 +82,7 @@ struct PrefabAsset {
     std::vector<PrefabChildAsset> children;
     std::vector<PrefabMaterialOverride> materialOverrides;
     std::vector<PrefabLodAsset> lods;
+    bool automaticLod = false;
     std::vector<std::string> warnings;
     std::filesystem::path definitionPath;
     std::filesystem::path modelPath;

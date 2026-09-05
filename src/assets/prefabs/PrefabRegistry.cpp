@@ -268,6 +268,7 @@ PrefabAsset LoadDefinition(const std::filesystem::path& path) {
                     throw std::runtime_error("material override mesh/texture is invalid");
                 prefab.materialOverrides.push_back(std::move(overrideValue));
             }
+            prefab.automaticLod = mesh.value("automaticLod", false);
             float previousLodDistance = 0.0f;
             for (const json& item : mesh.value("lods", json::array())) {
                 PrefabLodAsset lod;
@@ -698,6 +699,7 @@ PrefabSaveResult PrefabRegistry::Save(const PrefabAsset& prefab,
             if (!materialOverrides.empty())
                 components["staticMesh"]["materialOverrides"] = materialOverrides;
             else components["staticMesh"].erase("materialOverrides");
+            components["staticMesh"]["automaticLod"] = prefab.automaticLod;
             json lods = json::array();
             for (const PrefabLodAsset& lod : prefab.lods)
                 lods.push_back({ {"path", Generic(lod.path)},

@@ -26,6 +26,9 @@ struct PrefabRenderBatch {
     std::vector<DirectX::XMMATRIX> transforms;
     std::vector<uint64_t> entityIds;
     std::vector<LodModel> lods;
+    bool automaticLod = false;
+    DirectX::XMFLOAT3 lodCenter{};
+    float lodRadius = 0.0f;
     bool castShadow = true;
 };
 

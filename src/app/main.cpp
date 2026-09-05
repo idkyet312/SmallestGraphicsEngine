@@ -86,6 +86,7 @@
 #include "LevelEditor.h"
 #include "PrefabRegistry.h"
 #include "PrefabRuntime.h"
+#include "AutomaticLod.h"
 #include "PrefabColliders.h"
 #include "RuntimeWorld.h"
 #include "GameSession.h"
@@ -380,6 +381,7 @@ static std::vector<PrefabRigidBodyState> g_prefabRigidBodies;
 static AssetRegistry        g_assetRegistry;
 static AssetWatcher         g_assetWatcher;
 struct PrefabModelCacheEntry {
+    std::vector<PrefabRenderBatch::LodModel> automaticLods;
     std::shared_ptr<SceneNode> model;
     XMFLOAT3 boundsMinimum{};
     XMFLOAT3 boundsMaximum{};
@@ -9409,6 +9411,20 @@ static PrefabModelCacheEntry* LoadPrefabModel(const PrefabAsset& prefab) {
         }
     }
 
+    if (prefab.automaticLod && prefab.lods.empty()) {
+        for (int tier = 0; tier < 2; ++tier) {
+            size_t original = 0, reduced = 0;
+            auto lod = BuildAutomaticLod(model, g_dx12.device.Get(),
+                tier == 0 ? 0.5f : 0.2f, tier == 0 ? 0.002f : 0.005f,
+                original, reduced);
+            if (lod && reduced < original) {
+                entry.automaticLods.push_back({ tier == 0 ? 40.0f : 100.0f, lod });
+                SGE_LOG("LogPrefab", EngineLog::Level::Display,
+                    "Automatic LOD " + prefab.id + " tier " + std::to_string(tier + 1) +
+                    ": " + std::to_string(original) + " -> " + std::to_string(reduced) + " triangles");
+            }
+        }
+    }
     auto inserted = g_prefabModelCache.emplace(prefab.id, std::move(entry));
     SGE_LOG("LogPrefab", EngineLog::Level::Display,
         "Loaded " + prefab.id + " from " + prefab.modelPath.string());
@@ -10091,6 +10107,12 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
                 batch.model = cachedModel->model;
                 batch.baseModel = cachedModel->model;
                 batch.castShadow = castShadow;
+                batch.automaticLod = prefab->automaticLod && prefab->lods.empty();
+                if (batch.automaticLod) batch.lods = cachedModel->automaticLods;
+                XMStoreFloat3(&batch.lodCenter, (XMLoadFloat3(&cachedModel->boundsMinimum) +
+                    XMLoadFloat3(&cachedModel->boundsMaximum)) * 0.5f);
+                batch.lodRadius = XMVectorGetX(XMVector3Length(
+                    XMLoadFloat3(&cachedModel->boundsMaximum) - XMLoadFloat3(&cachedModel->boundsMinimum))) * 0.5f;
                 for (size_t lodIndex = 0; lodIndex < prefab->lods.size(); ++lodIndex) {
                     const std::string lodId = prefab->id + "#lod" +
                         std::to_string(lodIndex);
@@ -10101,6 +10123,7 @@ static void RebuildEditorPrefabVisualBatches(bool loadMissingModels) {
                         lodPrefab.modelPath = prefab->lods[lodIndex].path;
                         lodPrefab.modelGuid = prefab->lods[lodIndex].assetGuid;
                         lodPrefab.lods.clear();
+                        lodPrefab.automaticLod = false;
                         LoadPrefabModel(lodPrefab);
                         lodCached = g_prefabModelCache.find(lodId);
                     }
@@ -10364,12 +10387,19 @@ static void RebuildPrefabRenderBatches() {
                 batch.model = cachedModel->model;
                 batch.baseModel = cachedModel->model;
                 batch.castShadow = castShadow;
+                batch.automaticLod = prefab->automaticLod && prefab->lods.empty();
+                if (batch.automaticLod) batch.lods = cachedModel->automaticLods;
+                XMStoreFloat3(&batch.lodCenter, (XMLoadFloat3(&cachedModel->boundsMinimum) +
+                    XMLoadFloat3(&cachedModel->boundsMaximum)) * 0.5f);
+                batch.lodRadius = XMVectorGetX(XMVector3Length(
+                    XMLoadFloat3(&cachedModel->boundsMaximum) - XMLoadFloat3(&cachedModel->boundsMinimum))) * 0.5f;
                 for (size_t lodIndex = 0; lodIndex < prefab->lods.size(); ++lodIndex) {
                     PrefabAsset lodPrefab = *prefab;
                     lodPrefab.id = prefab->id + "#lod" + std::to_string(lodIndex);
                     lodPrefab.modelPath = prefab->lods[lodIndex].path;
                     lodPrefab.modelGuid = prefab->lods[lodIndex].assetGuid;
                     lodPrefab.lods.clear();
+                    lodPrefab.automaticLod = false;
                     if (PrefabModelCacheEntry* lodModel = LoadPrefabModel(lodPrefab))
                         batch.lods.push_back({ prefab->lods[lodIndex].distance,
                                                lodModel->model });
@@ -10771,6 +10801,14 @@ static void UpdatePrefabLods() {
         const std::shared_ptr<SceneNode> previousModel = batch.model;
         float nearest = FLT_MAX;
         for (const XMMATRIX& transform : batch.baseTransforms) {
+            if (batch.automaticLod) {
+                const XMVECTOR center = XMVector3TransformCoord(XMLoadFloat3(&batch.lodCenter), transform);
+                const float scale = (std::max)({ XMVectorGetX(XMVector3Length(transform.r[0])),
+                    XMVectorGetX(XMVector3Length(transform.r[1])), XMVectorGetX(XMVector3Length(transform.r[2])), 0.001f });
+                const float distance = XMVectorGetX(XMVector3Length(center - XMLoadFloat3(&scene.camera.Position)));
+                nearest = (std::min)(nearest, (std::max)(0.0f, distance / scale - batch.lodRadius));
+                continue;
+            }
             XMFLOAT4X4 matrix;
             XMStoreFloat4x4(&matrix, transform);
             const float dx = matrix._41 - scene.camera.Position.x;
@@ -10780,8 +10818,16 @@ static void UpdatePrefabLods() {
                 std::sqrt(dx * dx + dy * dy + dz * dz));
         }
         batch.model = batch.baseModel;
-        for (const PrefabRenderBatch::LodModel& lod : batch.lods)
-            if (nearest >= lod.distance) batch.model = lod.model;
+        if (!batch.automaticLod || scene.automaticPrefabLod) {
+            for (const PrefabRenderBatch::LodModel& lod : batch.lods) {
+                const bool wasCoarser = batch.automaticLod &&
+                    std::any_of(batch.lods.begin(), batch.lods.end(), [&](const auto& previous) {
+                        return previous.model == previousModel && previous.distance >= lod.distance;
+                    });
+                const float threshold = lod.distance * (wasCoarser ? 0.9f : 1.0f);
+                if (nearest >= threshold) batch.model = lod.model;
+            }
+        }
         shadowGeometryChanged |= batch.castShadow &&
             batch.model != previousModel;
     }

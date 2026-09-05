@@ -44,6 +44,8 @@ int main() {
         crate.name = "Crate";
         crate.modelPath = "models/crate.glb";
         crate.defaultScale[0] = crate.defaultScale[1] = crate.defaultScale[2] = 2.0f;
+        CHECK(!crate.automaticLod);
+        crate.automaticLod = true;
         crate.targetSize = 1.5f;
         crate.useMaterials = false;
         crate.forceDoubleSided = true;
@@ -68,6 +70,7 @@ int main() {
         if (loaded) {
             CHECK(loaded->modelPath == std::filesystem::path("models/crate.glb"));
             CHECK(loaded->targetSize == 1.5f);
+            CHECK(loaded->automaticLod);
             CHECK(!loaded->useMaterials);
             CHECK(loaded->forceDoubleSided);
             CHECK(loaded->components.at("staticMesh")

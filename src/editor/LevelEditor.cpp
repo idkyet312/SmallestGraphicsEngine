@@ -2429,6 +2429,8 @@ LevelEditorActions LevelEditor::Render(Camera& camera, CXMMATRIX view,
             }
 
             ImGui::SeparatorText("LODs");
+            ImGui::Checkbox("Generate automatic LODs", &prefabDraft_.automaticLod);
+            ImGui::TextWrapped("Static models only. Generated on reload; authored LODs take priority. Enable Automatic prefab LOD in graphics settings to use them.");
             for (size_t lodIndex = 0; lodIndex < prefabDraft_.lods.size();) {
                 PrefabLodAsset& lod = prefabDraft_.lods[lodIndex];
                 ImGui::PushID(static_cast<int>(lodIndex));
