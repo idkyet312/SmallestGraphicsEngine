@@ -130,10 +130,39 @@ public:
     // adding a weapon means extending every one of them.
     static constexpr int kMaxWeapon = 10;
 
+    // The AK-74 is the standard-issue rifle. The AK-47 in slot 0 is retired
+    // from selection (see kHiddenWeapon) but stays loaded, because its mesh is
+    // still the last-resort viewmodel for weapons that have none of their own.
+    static constexpr int kDefaultWeapon = 10;
+
+    // Retired from every weapon list: not pickable in the loadout, not reachable
+    // by cycling, and not a valid default. Deliberately NOT unloaded --
+    // PlayerMesh() falls back to Mesh() for the harpoon and flamethrower, so
+    // dropping the asset would leave those holding nothing.
+    static constexpr int kHiddenWeapon = 0;
+
+    // Laser cutter and flamethrower are development toys rather than issued
+    // kit. They are hidden behind the debug-weapons toggle below so they stop
+    // appearing in the loadout and in the weapon cycle during normal play.
+    static constexpr int kLaserWeapon = 4;
+    static constexpr int kFlamethrowerWeapon = 6;
+
+    // Off by default: a normal run should never cycle into a laser cutter.
+    // Flipping it on makes both debug weapons selectable everywhere at once,
+    // since WeaponLoaded is the single gate every weapon list already consults.
+    static bool& DebugWeaponsEnabled() {
+        static bool enabled = false;
+        return enabled;
+    }
+
+    static bool IsDebugWeapon(int weapon) {
+        return weapon == kLaserWeapon || weapon == kFlamethrowerWeapon;
+    }
+
     static int& SelectedWeapon() {
-        // 0 AK, 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame, 7 harpoon,
-        // 8 suppressed SVD, 9 M4A1, 10 AK-74
-        static int weapon = 0;
+        // 0 AK (hidden), 1 shotgun, 2 RPG, 3 SVD, 4 laser, 5 C4, 6 flame,
+        // 7 harpoon, 8 suppressed SVD, 9 M4A1, 10 AK-74
+        static int weapon = kDefaultWeapon;
         return weapon;
     }
     static const char* WeaponName(int weapon) {
@@ -414,7 +443,13 @@ public:
         return C4Selected() || FlamethrowerSelected() || HarpoonSelected() ||
             PlayerMesh() != nullptr;
     }
+    // "Can the player select this?", not merely "is the asset in memory". Every
+    // weapon list -- the loadout picker, cycling, LoadoutAllows -- funnels
+    // through here, so retiring the AK-47 and gating the debug weapons in this
+    // one place covers all of them rather than needing a filter at each site.
     static bool WeaponLoaded(int weapon) {
+        if (weapon == kHiddenWeapon) return false;
+        if (IsDebugWeapon(weapon)) return DebugWeaponsEnabled();
         switch (weapon) {
         case 0: return Loaded();
         case 1: return ShotgunLoaded();
@@ -439,7 +474,7 @@ public:
     // The two chosen weapons. C4 is carried on top of these -- see
     // LoadoutAllows/CycleWeapon, which treat it as always available.
     static std::array<int, 2>& LoadoutWeapons() {
-        static std::array<int, 2> weapons{{ 0, 1 }};
+        static std::array<int, 2> weapons{{ kDefaultWeapon, 1 }};
         return weapons;
     }
     static bool& LoadoutRestricted() {
@@ -463,6 +498,30 @@ public:
         return true;
     }
     static void DisableLoadoutRestriction() { LoadoutRestricted() = false; }
+
+    // Flips the debug weapons on or off. Turning them off while one is in the
+    // player's hands has to move them somewhere valid, or they would be left
+    // holding a weapon that every list now refuses to cycle back to -- the
+    // selection would be stuck until they picked something else by hand.
+    static void SetDebugWeaponsEnabled(bool enabled) {
+        if (DebugWeaponsEnabled() == enabled) return;
+        DebugWeaponsEnabled() = enabled;
+        if (enabled || !IsDebugWeapon(SelectedWeapon())) return;
+        // Prefer whatever the mission actually issued; fall back to the first
+        // selectable weapon so this cannot leave an invalid selection even if
+        // the loadout is somehow empty.
+        const int fallback = LoadoutRestricted() ? LoadoutWeapons()[0]
+                                                 : kDefaultWeapon;
+        if (WeaponLoaded(fallback)) {
+            SelectedWeapon() = fallback;
+            return;
+        }
+        for (int candidate = 0; candidate <= kMaxWeapon; ++candidate) {
+            if (!WeaponLoaded(candidate)) continue;
+            SelectedWeapon() = candidate;
+            return;
+        }
+    }
     static void CycleWeapon(int direction) {
         if (LoadoutRestricted()) {
             // Cycle the two chosen weapons plus the always-carried charge, in a

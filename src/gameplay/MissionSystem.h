@@ -41,7 +41,13 @@ struct MissionLoadout {
     static constexpr int kWeaponCount = 11;
     static constexpr size_t kWeaponSlotCount = 2;
 
-    std::array<int, kWeaponSlotCount> weapons{{ 0, 1 }};
+    // AK-74 (10) is the standard-issue rifle. Slot 0 is the retired AK-47 and
+    // is no longer offered -- see GunModel::kHiddenWeapon. Kept as a literal
+    // for the same reason kWeaponCount is: this header does not include the
+    // weapon model tables.
+    static constexpr int kDefaultPrimaryWeapon = 10;
+
+    std::array<int, kWeaponSlotCount> weapons{{ kDefaultPrimaryWeapon, 1 }};
     GrenadeType grenade = GrenadeType::Frag;
     // Empty by default: the slot is an opt-in, and NVG is only worth a pick on
     // the dark times of day.

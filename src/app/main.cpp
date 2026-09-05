@@ -14422,14 +14422,52 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
         "Mako Harpoon Gun", "R700 Suppressed", "M4A1", "AK-74"
     };
     ImGui::SeparatorText("LOADOUT");
-    int primary = loadout.weapons[0];
-    if (ImGui::Combo("Primary", &primary, weaponNames,
-                     MissionLoadout::kWeaponCount))
-        loadout.SelectWeapon(0, primary);
-    int secondary = loadout.weapons[1];
-    if (ImGui::Combo("Secondary", &secondary, weaponNames,
-                     MissionLoadout::kWeaponCount))
-        loadout.SelectWeapon(1, secondary);
+
+    // The combo lists only weapons the player may actually take, so the retired
+    // AK-47 and the debug weapons disappear from it. The list is built as an
+    // id->row mapping rather than by trimming weaponNames, because a combo
+    // reports the row that was picked and the loadout stores the weapon id --
+    // collapsing the two would silently select the wrong gun.
+    int selectableIds[MissionLoadout::kWeaponCount] = {};
+    const char* selectableNames[MissionLoadout::kWeaponCount] = {};
+    int selectableCount = 0;
+    for (int weapon = 0; weapon < MissionLoadout::kWeaponCount; ++weapon) {
+        if (!GunModel::WeaponLoaded(weapon)) continue;
+        selectableIds[selectableCount] = weapon;
+        selectableNames[selectableCount] = weaponNames[weapon];
+        ++selectableCount;
+    }
+
+    // Maps a stored weapon id back to its row. A loadout carrying a weapon that
+    // has since been hidden (a debug weapon left over from before the toggle
+    // was switched off) has no row, so the combo shows the first entry rather
+    // than an out-of-range index.
+    const auto rowForWeapon = [&](int weapon) {
+        for (int row = 0; row < selectableCount; ++row)
+            if (selectableIds[row] == weapon) return row;
+        return 0;
+    };
+
+    if (selectableCount > 0) {
+        int primaryRow = rowForWeapon(loadout.weapons[0]);
+        if (ImGui::Combo("Primary", &primaryRow, selectableNames,
+                         selectableCount))
+            loadout.SelectWeapon(0, selectableIds[primaryRow]);
+        int secondaryRow = rowForWeapon(loadout.weapons[1]);
+        if (ImGui::Combo("Secondary", &secondaryRow, selectableNames,
+                         selectableCount))
+            loadout.SelectWeapon(1, selectableIds[secondaryRow]);
+    }
+
+    // The toggle itself. Sits with the loadout because that is where its effect
+    // shows up: flipping it repopulates both combos above on the next frame.
+    bool debugWeapons = GunModel::DebugWeaponsEnabled();
+    if (ImGui::Checkbox("Debug weapons (laser cutter, flamethrower)",
+                        &debugWeapons))
+        GunModel::SetDebugWeaponsEnabled(debugWeapons);
+    ImGui::TextDisabled(debugWeapons
+        ? "Laser cutter and flamethrower are selectable."
+        : "Development weapons are hidden from the loadout and weapon cycle.");
 
     auto drawWeaponAttachments = [&](const char* slotLabel, int weapon) {
         ImGui::PushID(slotLabel);
@@ -14878,6 +14916,23 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     const bool deployPressed = ImGui::Button("DEPLOY", ImVec2(340.0f, 48.0f));
     ImGui::PopStyleColor(3);
     if (deployPressed) {
+        // Repair a loadout that still names a weapon which is no longer
+        // selectable -- a debug weapon picked before the toggle was switched
+        // off, or a save carrying the retired AK-47. ConfigureLoadout rejects
+        // those outright, which would silently leave the previous mission's
+        // restriction in force, and the god-mode branch would hand the player a
+        // weapon with no viewmodel.
+        for (size_t slot = 0; slot < loadout.weapons.size(); ++slot) {
+            if (GunModel::WeaponLoaded(loadout.weapons[slot])) continue;
+            for (int candidate = 0; candidate <= GunModel::kMaxWeapon;
+                 ++candidate) {
+                if (!GunModel::WeaponLoaded(candidate) ||
+                    loadout.ContainsWeapon(candidate))
+                    continue;
+                loadout.SelectWeapon(slot, candidate);
+                break;
+            }
+        }
         if (scene.player.godMode) {
             GunModel::DisableLoadoutRestriction();
             GunModel::SelectedWeapon() = loadout.weapons[0];
