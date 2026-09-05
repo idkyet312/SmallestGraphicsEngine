@@ -141,11 +141,13 @@ public:
     // dropping the asset would leave those holding nothing.
     static constexpr int kHiddenWeapon = 0;
 
-    // Laser cutter and flamethrower are development toys rather than issued
-    // kit. They are hidden behind the debug-weapons toggle below so they stop
-    // appearing in the loadout and in the weapon cycle during normal play.
+    // The laser cutter, flamethrower and harpoon gun are development toys
+    // rather than issued kit. They are hidden behind the debug-weapons toggle
+    // below so they stop appearing in the loadout and in the weapon cycle
+    // during normal play.
     static constexpr int kLaserWeapon = 4;
     static constexpr int kFlamethrowerWeapon = 6;
+    static constexpr int kHarpoonWeapon = 7;
 
     // Off by default: a normal run should never cycle into a laser cutter.
     // Flipping it on makes both debug weapons selectable everywhere at once,
@@ -156,7 +158,8 @@ public:
     }
 
     static bool IsDebugWeapon(int weapon) {
-        return weapon == kLaserWeapon || weapon == kFlamethrowerWeapon;
+        return weapon == kLaserWeapon || weapon == kFlamethrowerWeapon ||
+               weapon == kHarpoonWeapon;
     }
 
     static int& SelectedWeapon() {

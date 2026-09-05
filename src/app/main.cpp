@@ -14462,11 +14462,11 @@ static void RenderInsertionChoiceScreen(HWND hwnd) {
     // The toggle itself. Sits with the loadout because that is where its effect
     // shows up: flipping it repopulates both combos above on the next frame.
     bool debugWeapons = GunModel::DebugWeaponsEnabled();
-    if (ImGui::Checkbox("Debug weapons (laser cutter, flamethrower)",
+    if (ImGui::Checkbox("Debug weapons (laser cutter, flamethrower, harpoon)",
                         &debugWeapons))
         GunModel::SetDebugWeaponsEnabled(debugWeapons);
     ImGui::TextDisabled(debugWeapons
-        ? "Laser cutter and flamethrower are selectable."
+        ? "Laser cutter, flamethrower and harpoon gun are selectable."
         : "Development weapons are hidden from the loadout and weapon cycle.");
 
     auto drawWeaponAttachments = [&](const char* slotLabel, int weapon) {
