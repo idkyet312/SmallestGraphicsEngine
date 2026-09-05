@@ -141,6 +141,21 @@ public:
     // dropping the asset would leave those holding nothing.
     static constexpr int kHiddenWeapon = 0;
 
+    // The suppressed R700 was a second copy of the same rifle occupying its own
+    // slot. Suppression is an attachment now (the "silencer" muzzle attachment,
+    // which already lists the R700 as compatible and sets the suppressed flag
+    // the audio and muzzle flash read), so the duplicate slot is retired.
+    //
+    // Retired rather than renumbered: weapon ids are baked into attachment
+    // compatibility masks and several parallel tables, so closing the gap would
+    // shift every weapon above it and silently repoint those. The id stays
+    // reserved and simply stops being offered.
+    static constexpr int kRetiredSuppressedR700 = 8;
+
+    static bool IsHiddenWeapon(int weapon) {
+        return weapon == kHiddenWeapon || weapon == kRetiredSuppressedR700;
+    }
+
     // The laser cutter, flamethrower and harpoon gun are development toys
     // rather than issued kit. They are hidden behind the debug-weapons toggle
     // below so they stop appearing in the loadout and in the weapon cycle
@@ -178,14 +193,14 @@ public:
     }
     static bool ShotgunSelected() { return SelectedWeapon() == 1 && ShotgunLoaded(); }
     static bool RPGSelected() { return SelectedWeapon() == 2 && RPGLoaded(); }
-    // Both R700 variants share one imported mesh: the suppressor is drawn as an
-    // extra tube rather than a separate model, so anything asking "is the
-    // player holding an SVD" -- viewmodel, scope, offsets -- must accept both.
-    static bool R700SuppressedSelected() {
-        return SelectedWeapon() == 8 && R700Loaded();
-    }
+    // Slot 8 was a second copy of this rifle and is retired (see
+    // kRetiredSuppressedR700); suppression is the silencer attachment now. It
+    // is still accepted here so a selection left over from before -- a saved
+    // loadout, an in-flight run -- still resolves to the R700's viewmodel,
+    // scope and offsets rather than falling through to nothing.
     static bool R700Selected() {
-        return (SelectedWeapon() == 3 || SelectedWeapon() == 8) && R700Loaded();
+        return (SelectedWeapon() == 3 ||
+                SelectedWeapon() == kRetiredSuppressedR700) && R700Loaded();
     }
     static bool LaserSelected() { return SelectedWeapon() == 4; }
     static bool C4Selected() { return SelectedWeapon() == 5; }
@@ -451,7 +466,7 @@ public:
     // through here, so retiring the AK-47 and gating the debug weapons in this
     // one place covers all of them rather than needing a filter at each site.
     static bool WeaponLoaded(int weapon) {
-        if (weapon == kHiddenWeapon) return false;
+        if (IsHiddenWeapon(weapon)) return false;
         if (IsDebugWeapon(weapon)) return DebugWeaponsEnabled();
         switch (weapon) {
         case 0: return Loaded();

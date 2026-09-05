@@ -181,17 +181,22 @@ public:
         const uint32_t shotgun = 1u << 1;
         const uint32_t svd = 1u << 3;
         const uint32_t m4 = 1u << 9;
+        // The AK-74 is the issued rifle now, so it inherits everything the
+        // retired AK-47 could take. Without this the standard weapon would be
+        // the only one in the game with no attachments at all -- the masks were
+        // written when slot 0 was the rifle everyone carried.
+        const uint32_t ak74 = 1u << 10;
         attachments_ = {{
             { "silencer", "Silencer", AttachmentSlot::Muzzle, 10,
-              ak | svd | m4,
+              ak | ak74 | svd | m4,
               { 0.86f, 1.0f, 1.0f, 0.25f, 0.55f, 0.35f, 0.60f, 0.0f },
               true, false, false, "procedural/attachments/silencer" },
             { "red_dot", "Red Dot Sight", AttachmentSlot::Optic, 20,
-              ak | shotgun | m4,
+              ak | ak74 | shotgun | m4,
               { 1.0f, 1.0f, 0.55f, 1.0f, 1.0f, 1.0f, 1.0f, -6.0f },
               false, true, false, "procedural/attachments/red_dot" },
             { "laser", "Visible Laser", AttachmentSlot::SideRail, 30,
-              ak | shotgun | svd | m4,
+              ak | ak74 | shotgun | svd | m4,
               { 1.0f, 0.72f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f },
               false, false, true, "procedural/attachments/visible_laser" },
         }};
