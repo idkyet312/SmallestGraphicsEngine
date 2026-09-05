@@ -77,8 +77,13 @@ public:
     // offsets.
     // Tuned against the render rather than derived: these are the values the
     // arms actually sit correctly at on the weapon.
+    //
+    // Named because the per-weapon fit table needs the same numbers as a
+    // constant, and a second copy of them there would silently drift the day
+    // this pose is retuned.
+    static constexpr XMFLOAT3 kSharedOffset = { -0.261f, 0.019f, -0.171f };
     static XMFLOAT3& Offset() {
-        static XMFLOAT3 offset = { -0.261f, 0.019f, -0.171f };
+        static XMFLOAT3 offset = kSharedOffset;
         return offset;
     }
     // Extra run-only pull toward the camera. Positive values move the animated
@@ -522,14 +527,21 @@ public:
     // baseline for all of them, and this only carries the difference a
     // particular rifle needs.
     //
-    // With GripUsesLeftHand (the default) this adjusts the LEFT arm.
+    // This adjusts whichever arm currently grips, so it follows
+    // GripUsesLeftHand: the LEFT arm for the two-handed weapons on the default
+    // grip, the RIGHT for those ArmsFitForWeapon flips (RPG, M9).
     static XMFLOAT3& WeaponGripOffset(int weapon) {
         static std::array<XMFLOAT3, kMaxGripWeapon + 1> offsets = {{
             { 0.000f,  0.000f, 0.0f }, // AK47
             // Support hand forward onto the pump, which sits further down
             // the barrel than the AK handguard the shared grip was set on.
             {-0.025f, -0.010f, 0.070f }, // Remington 870
-            { 0.000f,  0.000f, 0.0f }, // RPG
+            // Gripped from the right bone with the left arm hidden (see
+            // ArmsFitForWeapon), so this is placing the firing hand on the
+            // launcher's pistol grip rather than a support hand on a
+            // handguard. That grip sits well forward of where the shared point
+            // -- set on the AK -- puts it, hence the large positive Z.
+            { 0.005f, -0.050f, 0.470f }, // RPG
             { 0.000f,  0.000f, 0.0f }, // SVD
             { 0.000f,  0.000f, 0.0f }, // laser
             { 0.000f,  0.000f, 0.0f }, // C4
@@ -542,8 +554,10 @@ public:
             { 0.000f,  0.000f, 0.0f }, // AK-74: AK pattern, so no nudge
             // A pistol has no handguard for the support hand to reach, so the
             // shared grip point -- set out along a rifle's forearm -- leaves it
-            // grasping air well ahead of the weapon. Pulled back onto the grip.
-            { 0.030f,  0.020f, -0.330f }, // M9
+            // grasping air well ahead of the weapon. Pulled back onto the grip,
+            // and up into it: tuned against the M9 render together with the
+            // per-weapon arms offset and right-bone grip in WeaponArmsFit.
+            { 0.100f,  0.110f, -0.170f }, // M9
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxGripWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -551,9 +565,73 @@ public:
 
     static XMFLOAT3 DefaultWeaponGripOffset(int weapon) {
         if (weapon == 1) return { -0.025f, -0.010f, 0.070f };
+        if (weapon == 2) return { 0.005f, -0.050f, 0.470f };
         if (weapon == 9) return { -0.030f, -0.030f, 0.000f };
-        if (weapon == 11) return { 0.030f, 0.020f, -0.330f };
+        if (weapon == 11) return { 0.100f, 0.110f, -0.170f };
         return { 0.0f, 0.0f, 0.0f };
+    }
+
+    // Per-weapon body placement, for weapons the shared pose cannot hold at all.
+    //
+    // The grip nudge above walks the HAND along the weapon, which is enough for
+    // one rifle against another. A pistol is not a rifle held differently: it is
+    // held in the other hand, with the body squared up rather than bladed behind
+    // a handguard. Nudging the hand cannot express either, so those weapons
+    // carry the whole fit -- body offset and which wrist grips -- and everything
+    // else stays on the shared values it was tuned at.
+    struct WeaponArmsFit {
+        bool overrides = false;      // false = use the shared arms placement
+        XMFLOAT3 offset{};           // replaces Offset(), gun-local
+        bool gripUsesLeftHand = true;
+        // Collapse the free limb from the SHOULDER rather than the wrist.
+        // Hide Free Hand stops at the wrist, which is right for a rifle -- the
+        // support arm still reaches the handguard, so only the far hand is
+        // redundant. A one-handed weapon leaves the whole free arm hanging
+        // across the view with nothing to hold, and hiding just its hand
+        // leaves a severed forearm floating there instead.
+        bool hideFreeArm = false;
+    };
+
+    // Fit for a weapon, or a non-overriding entry when it uses the shared pose.
+    static WeaponArmsFit ArmsFitForWeapon(int weapon) {
+        // RPG: shouldered, so the firing hand is on the pistol grip under the
+        // tube and the support arm would have to reach across the launcher's
+        // body to hold anything. Gripped from the right bone with the left arm
+        // dropped, same arrangement as the M9 below.
+        //
+        // The body placement is the shared pose's own default, spelled out
+        // rather than read from SharedArmsFit(): this function must stay a pure
+        // function of the weapon id. SetGripWeapon captures its result BEFORE
+        // it writes SharedArmsFit(), so reading that here would bake in a stale
+        // offset on the way in. Only the grip hand and the hidden arm are what
+        // this weapon actually needed; no RPG-specific offset has been measured
+        // against the render, so this is a starting point, not a tuned number.
+        if (weapon == 2)
+            return { true, kSharedOffset, false, true };
+        // M9: held in the rig's right hand, body pulled left and back so the
+        // pistol sits centred in front of the eye instead of out on a rifle's
+        // firing line, and fired one-handed, so the whole left arm goes.
+        // Measured against the render, like every value here.
+        if (weapon == 11)
+            return { true, XMFLOAT3(-0.388f, -0.087f, 0.211f), false, true };
+        return {};
+    }
+
+    // Whether the currently selected weapon hides the free arm to the shoulder.
+    // Read by the bone search, which is re-run whenever this can change.
+    static bool HideFreeArmForCurrentWeapon() {
+        return ArmsFitForWeapon(GripWeapon()).hideFreeArm;
+    }
+
+    // The placement the shared pose uses, i.e. what a non-overriding weapon gets
+    // back when the player switches off an overriding one. Captured from the
+    // live values the first time an override displaces them, so tuning the arms
+    // in the debug UI still sticks for every other weapon.
+    // Seeded from the live values on first use rather than repeating the
+    // defaults, so the two cannot drift apart when the shared pose is retuned.
+    static WeaponArmsFit& SharedArmsFit() {
+        static WeaponArmsFit fit = { false, Offset(), GripUsesLeftHand() };
+        return fit;
     }
 
     // Which weapon the per-weapon nudge is read for. Pushed in by the caller as
@@ -584,7 +662,43 @@ public:
     // carries a nudge. The nudge is applied as a delta in ModelToGunLocal
     // instead, which leaves the tuned placement exactly as it is.
     static void SetGripWeapon(int weapon) {
+        if (GripWeapon() == weapon) return;
+        const WeaponArmsFit previous = ArmsFitForWeapon(GripWeapon());
         GripWeapon() = weapon;
+
+        const WeaponArmsFit fit = ArmsFitForWeapon(weapon);
+        if (!fit.overrides && !previous.overrides) return;
+
+        // Leaving an overriding weapon restores the shared placement; the value
+        // to restore is whatever the shared pose was last tuned to, not a
+        // constant, so a debug-UI edit made while a rifle is held survives a
+        // trip through the pistol. Capture it on the way OUT of the shared
+        // state, before the override writes over it.
+        if (fit.overrides && !previous.overrides)
+            SharedArmsFit() = { false, Offset(), GripUsesLeftHand() };
+
+        const WeaponArmsFit& target = fit.overrides ? fit : SharedArmsFit();
+        Offset() = target.offset;
+
+        // Rebind when the grip crosses to the other wrist, or when how much of
+        // the free limb is hidden changes. Both feed the bone search, which
+        // walks the whole skeleton, so it is not run on every switch -- but a
+        // stale bind would hide the hand now holding the gun, or leave the
+        // previous weapon's arm collapsed under this one.
+        const bool handCrosses = GripUsesLeftHand() != target.gripUsesLeftHand;
+        const bool armCutChanges = previous.hideFreeArm != fit.hideFreeArm;
+        if (handCrosses || armCutChanges) {
+            GripUsesLeftHand() = target.gripUsesLeftHand;
+            FindGripBone();
+            FindFollowBone();
+            FindHiddenBones();
+            // No CollapseHiddenBones here: Update rebuilds the palette and
+            // re-collapses from the new list every frame, so the change lands
+            // before the next draw on its own.
+            // Deliberately no AlignHandsToWeapon here, for the reason above:
+            // it would re-solve Offset() against the current animated frame and
+            // throw away the tuned placement just assigned.
+        }
     }
 
     // Let the weapon ride the hand instead of hanging at a fixed spot.
@@ -1082,8 +1196,16 @@ private:
         HiddenBones().clear();
         FreeHandBones().clear();
         const Skeleton& skeleton = Source().skeleton;
-        const char* freeWristName =
-            GripUsesLeftHand() ? "righthand" : "lefthand";
+        // Where the free limb is cut. The wrist for a two-handed weapon; the
+        // upper arm for a one-handed one, which takes the forearm and shoulder
+        // with it through the descendant walk below. The rig is Mixamo, so the
+        // chain is Shoulder -> Arm -> ForeArm -> Hand and rooting at "*arm"
+        // drops everything from the deltoid down. Matched on the exact leaf, so
+        // "leftarm" cannot also catch "leftforearm".
+        const bool wholeArm = HideFreeArmForCurrentWeapon();
+        const char* freeWristName = GripUsesLeftHand()
+            ? (wholeArm ? "rightarm" : "righthand")
+            : (wholeArm ? "leftarm" : "lefthand");
         int freeWrist = -1;
         for (size_t b = 0; b < skeleton.names.size(); ++b) {
             std::string name = skeleton.names[b];

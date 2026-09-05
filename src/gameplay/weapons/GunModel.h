@@ -267,7 +267,7 @@ public:
             // and the Y-flip in the fit rotation turns it to face forward --
             // between them the mesh ends up needing a large positive Z to
             // bring it back into frame, unlike any of the long guns.
-            { 0.345f, 0.050f, 1.895f }, // M9 grip
+            { 0.035f, -0.165f, 1.825f }, // M9 grip
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return offsets[static_cast<size_t>(slot)];
@@ -296,10 +296,11 @@ public:
             { 0.0f, 0.0f, 0.0f },   // M4A1
             { 0.0f, 0.0f, 0.0f },   // AK-74
             // The export points down -Z once Orient has normalised it, so the
-            // pistol faces the camera without this half-turn. 187 rather than
-            // a clean 180: the mesh is a few degrees off square to its own
-            // bounding box, which Orient's axis fit cannot correct for.
-            { 0.0f, 187.0f, 0.0f }, // M9
+            // pistol faces the camera without this half-turn. A clean 180: the
+            // few degrees of skew this used to carry were correcting for the
+            // body offset it was tuned alongside, not for the mesh being off
+            // square, and they read as a canted pistol once that was fixed.
+            { 0.0f, 180.0f, 0.0f }, // M9
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return rotations[static_cast<size_t>(slot)];
@@ -331,10 +332,13 @@ public:
             1.00f, // M4A1
             1.00f, // AK-74
             // Orient normalises every gun to the same 1.25-unit barrel, which
-            // would render this pistol the length of a rifle. A Beretta M9 is
-            // about 217mm against the AK's 870mm, so it is scaled back to that
-            // real ratio instead of being left rifle-sized in the hands.
-            0.25f, // M9
+            // would render this pistol the length of a rifle. The real 217mm
+            // against the AK's 870mm gives 0.25, but that is the ratio of the
+            // whole weapons, and what is normalised here is the barrel: a
+            // pistol carries far more of its length in the grip and slide, so
+            // matching barrels leaves the body too small. Tuned up against the
+            // render to 0.35, where it reads as an M9 in the hand.
+            0.350f, // M9
         }};
         const int slot = (std::max)(0, (std::min)(weapon, kMaxWeapon));
         return scales[static_cast<size_t>(slot)];

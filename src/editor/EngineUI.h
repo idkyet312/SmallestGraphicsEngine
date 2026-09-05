@@ -3442,6 +3442,17 @@ inline void RenderUI(Scene& scene, VisibilityBufferDX12& vb) {
             // this is the manual override for when the solved position is close
             // but wants a touch of adjustment.
             ImGui::DragFloat3("Arms Offset", &ArmsModel::Offset().x, 0.005f);
+            // Some weapons carry their own body placement and grip hand rather
+            // than the shared pose (a pistol is held in the other hand entirely).
+            // Say so, because dragging the two widgets above while one of those
+            // is held is tuning that weapon only, and switching away restores
+            // the shared values rather than keeping the edit.
+            if (ArmsModel::ArmsFitForWeapon(GunModel::SelectedWeapon()).overrides)
+                ImGui::TextColored(
+                    ImVec4(0.55f, 0.80f, 1.0f, 1.0f),
+                    "Arms Offset + grip hand are per-weapon for %s; edits here\n"
+                    "are lost on weapon switch unless ArmsFitForWeapon is updated.",
+                    GunModel::SelectedWeaponName());
             // Yaw/pitch/roll in degrees, applied in the model's own space. This
             // is what turns the arms to face down the barrel. Rotation and scale
             // both feed the transform the alignment measures through, so both
