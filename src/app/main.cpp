@@ -21509,7 +21509,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdSh
                             projectile.detonate = false;
                             continue;
                         }
-                        if (projectile.grenade) {
+                        // The rocket digs the same hole as a frag. It already
+                        // shares this whole blast block and the same blastScale,
+                        // so it only ever missed the ground and wall cuts
+                        // because this one gate named the grenade alone.
+                        if (projectile.grenade || projectile.rocket) {
                             AddExplosionTerrainCrater(center, blastScale);
                             AddExplosionBuildingHole(center, blastScale);
                         }
